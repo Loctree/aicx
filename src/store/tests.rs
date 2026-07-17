@@ -2366,6 +2366,54 @@ fn project_filter_bare_name_matches_org_or_repo() {
 }
 
 #[test]
+fn ownerless_project_identity_is_addressable_and_participates_in_ambiguity() {
+    let corpus = vec!["A/repo".to_string(), "_/repo".to_string()];
+
+    let ambiguous =
+        require_project_resolution(&["repo".to_string()], &corpus, ProjectMatchMode::Exact)
+            .expect_err("bare repo must fail closed across owned and ownerless buckets");
+    assert_eq!(ambiguous.candidates(), ["A/repo", "_/repo"]);
+
+    let ownerless =
+        require_project_resolution(&["_/repo".to_string()], &corpus, ProjectMatchMode::Exact)
+            .expect("explicit ownerless address must resolve");
+    assert_eq!(ownerless.selected, ["_/repo"]);
+
+    let wildcard =
+        require_project_resolution(&["/repo".to_string()], &corpus, ProjectMatchMode::Exact)
+            .expect("cross-org wildcard must include the ownerless sentinel");
+    assert_eq!(wildcard.selected, ["A/repo", "_/repo"]);
+}
+
+#[test]
+fn store_scan_surfaces_ownerless_bucket_under_virtual_sentinel() {
+    let root = migration_test_root("ownerless-scan");
+    let directory = root
+        .join(CANONICAL_STORE_DIRNAME)
+        .join("repo")
+        .join("2026_0717")
+        .join("conversations")
+        .join("codex");
+    fs::create_dir_all(&directory).unwrap();
+    fs::write(
+        directory.join(session_basename("2026-07-17", "codex", "ownerless", 1)),
+        "[project: repo | agent: codex | date: 2026-07-17]\n",
+    )
+    .unwrap();
+
+    assert_eq!(project_identities_in_store_at(&root).unwrap(), ["_/repo"]);
+    let files = scan_context_files_at(&root).unwrap();
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].project, "_/repo");
+    assert_eq!(
+        files[0].repo.as_ref().map(RepoIdentity::slug).as_deref(),
+        Some("_/repo")
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn resolve_filters_to_slugs_expands_short_name_to_canonical() {
     let root = migration_test_root("resolve-short");
     let canonical = root.join(CANONICAL_STORE_DIRNAME);

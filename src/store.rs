@@ -118,10 +118,10 @@ use paths::validated_store_project_dir;
 pub use paths::{
     CANONICAL_STORE_DIRNAME, CONTEXT_CORPUS_DIRNAME, CONTEXT_CORPUS_SCHEMA_VERSION,
     LEGACY_SALVAGE_DIRNAME, LOCT_CONTEXT_PACK_FAMILY, NON_REPOSITORY_CONTEXTS,
-    aicx_context_corpus_dir, canonical_store_dir, chunks_dir, chunks_dir_for,
-    context_corpus_root_dir, get_context_json_path, get_context_path, legacy_store_base_dir,
-    non_repository_contexts_dir, project_dir, resolve_aicx_home, store_base_dir,
-    store_base_dir_for,
+    OWNERLESS_PROJECT_ORGANIZATION, aicx_context_corpus_dir, canonical_store_dir, chunks_dir,
+    chunks_dir_for, context_corpus_root_dir, get_context_json_path, get_context_path,
+    legacy_store_base_dir, non_repository_contexts_dir, project_dir, resolve_aicx_home,
+    store_base_dir, store_base_dir_for,
 };
 use sidecar::load_sidecar_from_path;
 pub use sidecar::{is_context_corpus_sidecar, load_sidecar, sidecar_path_for_chunk};
@@ -1675,6 +1675,19 @@ fn scan_repo_store(
         }
         let organization = organization_entry.file_name().to_string_lossy().to_string();
 
+        // Pre-owner store layouts wrote `store/<repository>/<date>/...`.
+        // Keep that physical layout immutable and expose a virtual `_/repo`
+        // identity at read time so the bucket is discoverable and queryable.
+        if is_ownerless_repository_root(&organization_path)? {
+            let repo = RepoIdentity {
+                organization: OWNERLESS_PROJECT_ORGANIZATION.to_string(),
+                repository: organization,
+            };
+            let repo_slug = repo.slug();
+            scan_single_repo_store(&organization_path, ignore, &repo, &repo_slug, files)?;
+            continue;
+        }
+
         for repository_entry in read_store_dir(&organization_path)?.filter_map(|entry| entry.ok()) {
             let repository_path = repository_entry.path();
             if !repository_path.is_dir() {
@@ -1683,43 +1696,10 @@ fn scan_repo_store(
             let repository = repository_entry.file_name().to_string_lossy().to_string();
             let repo = RepoIdentity {
                 organization: organization.clone(),
-                repository: repository.clone(),
+                repository,
             };
-
-            for date_entry in read_store_dir(&repository_path)?.filter_map(|entry| entry.ok()) {
-                let date_path = date_entry.path();
-                if !date_path.is_dir() {
-                    continue;
-                }
-                let date_compact = date_entry.file_name().to_string_lossy().to_string();
-
-                for kind_entry in read_store_dir(&date_path)?.filter_map(|entry| entry.ok()) {
-                    let kind_path = kind_entry.path();
-                    if !kind_path.is_dir() {
-                        continue;
-                    }
-                    let Some(kind) = Kind::parse(&kind_entry.file_name().to_string_lossy()) else {
-                        continue;
-                    };
-
-                    for agent_entry in read_store_dir(&kind_path)?.filter_map(|entry| entry.ok()) {
-                        let agent_path = agent_entry.path();
-                        if !agent_path.is_dir() {
-                            continue;
-                        }
-                        let agent = agent_entry.file_name().to_string_lossy().to_string();
-                        let repo_slug = repo.slug();
-                        let ctx = LeafScanContext {
-                            repo: Some(repo.clone()),
-                            project: &repo_slug,
-                            date_compact: &date_compact,
-                            kind,
-                            agent: &agent,
-                        };
-                        collect_leaf_files(&agent_path, &ctx, ignore, files)?;
-                    }
-                }
-            }
+            let repo_slug = repo.slug();
+            scan_single_repo_store(&repository_path, ignore, &repo, &repo_slug, files)?;
         }
     }
 
@@ -1772,6 +1752,19 @@ pub fn project_filter_matches(organization: &str, repository: &str, filter: &str
 
     // `-p name` → cross-org match on organization OR repository
     organization.eq_ignore_ascii_case(filter) || repository.eq_ignore_ascii_case(filter)
+}
+
+/// Stable query address for a legacy bucket stored without an owner directory.
+pub fn ownerless_project_address(repository: &str) -> String {
+    format!("{OWNERLESS_PROJECT_ORGANIZATION}/{}", repository.trim())
+}
+
+pub fn is_ownerless_project_address(identity: &str) -> bool {
+    identity
+        .split_once('/')
+        .is_some_and(|(organization, repository)| {
+            organization == OWNERLESS_PROJECT_ORGANIZATION && !repository.is_empty()
+        })
 }
 
 /// Project identity matching is exact by default. Family/substring matching
@@ -2041,6 +2034,10 @@ pub fn canonical_project_identities_at(canonical_root: &Path) -> Result<Vec<Stri
             continue;
         }
         let organization = organization_entry.file_name().to_string_lossy().to_string();
+        if is_ownerless_repository_root(&organization_path)? {
+            identities.insert(ownerless_project_address(&organization));
+            continue;
+        }
         for repository_entry in read_store_dir(&organization_path)?.filter_map(|entry| entry.ok()) {
             if repository_entry.path().is_dir() {
                 identities.insert(format!(
@@ -2142,6 +2139,22 @@ fn scan_repo_store_filtered(
         }
         let organization = organization_entry.file_name().to_string_lossy().to_string();
 
+        if is_ownerless_repository_root(&organization_path)? {
+            if project_filter_matches(
+                OWNERLESS_PROJECT_ORGANIZATION,
+                &organization,
+                project_filter,
+            ) {
+                let repo = RepoIdentity {
+                    organization: OWNERLESS_PROJECT_ORGANIZATION.to_string(),
+                    repository: organization,
+                };
+                let repo_slug = repo.slug();
+                scan_single_repo_store(&organization_path, ignore, &repo, &repo_slug, files)?;
+            }
+            continue;
+        }
+
         for repository_entry in read_store_dir(&organization_path)?.filter_map(|entry| entry.ok()) {
             let repository_path = repository_entry.path();
             if !repository_path.is_dir() {
@@ -2161,6 +2174,27 @@ fn scan_repo_store_filtered(
     }
 
     Ok(())
+}
+
+/// Detect the legacy `store/<repository>/<date>/<kind>/...` shape without
+/// confusing a canonical `store/<organization>/<repository>/...` directory
+/// for an ownerless repository. A direct child containing a known `Kind`
+/// directory is the distinguishing structural signal.
+fn is_ownerless_repository_root(path: &Path) -> Result<bool> {
+    for date_entry in read_store_dir(path)?.filter_map(|entry| entry.ok()) {
+        let date_path = date_entry.path();
+        if !date_path.is_dir() {
+            continue;
+        }
+        for kind_entry in read_store_dir(&date_path)?.filter_map(|entry| entry.ok()) {
+            if kind_entry.path().is_dir()
+                && Kind::parse(&kind_entry.file_name().to_string_lossy()).is_some()
+            {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 fn scan_single_repo_store(

@@ -115,6 +115,7 @@ pub struct IntentsCompleteness {
     pub dropped_task_events: usize,
     pub matched_project_buckets: Vec<String>,
     pub skipped_project_buckets: Vec<String>,
+    pub orphaned_buckets: Vec<String>,
     pub identity_source: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub requested_limit: Option<usize>,
@@ -152,6 +153,12 @@ impl IntentExtractionStats {
         let candidate_cap_reached = self.dropped_candidates > 0 || self.dropped_task_events > 0;
         let complete =
             !candidate_cap_reached && skipped_project_buckets.is_empty() && !limit_saturated;
+        let orphaned_buckets = self
+            .matched_project_buckets
+            .iter()
+            .filter(|project| crate::store::is_ownerless_project_address(project))
+            .cloned()
+            .collect();
 
         IntentsCompleteness {
             complete,
@@ -161,6 +168,7 @@ impl IntentExtractionStats {
             dropped_task_events: self.dropped_task_events,
             matched_project_buckets: self.matched_project_buckets.clone(),
             skipped_project_buckets,
+            orphaned_buckets,
             identity_source: self.identity_source.clone(),
             requested_limit,
             available_before_limit,

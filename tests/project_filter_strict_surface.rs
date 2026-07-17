@@ -94,6 +94,35 @@ fn write_intent_chunk(root: &std::path::Path, project: &str, marker: &str, seque
     .expect("write strict-filter intent chunk");
 }
 
+fn write_ownerless_intent_chunk(
+    root: &std::path::Path,
+    repository: &str,
+    marker: &str,
+    sequence: u32,
+) {
+    let directory = root
+        .join("store")
+        .join(repository)
+        .join("2026_0717")
+        .join("conversations")
+        .join("codex");
+    fs::create_dir_all(&directory).expect("create ownerless fixture directory");
+    let filename = aicx::store::session_basename(
+        "2026-07-17",
+        "codex",
+        &format!("ownerless-{sequence}"),
+        sequence,
+    );
+    fs::write(
+        directory.join(filename),
+        format!(
+            "[project: {repository} | agent: codex | date: 2026-07-17 | frame_kind: user_msg]\n\n\
+             [signals]\nIntent:\n- Preserve ownerless project identity marker {marker}\n[/signals]\n"
+        ),
+    )
+    .expect("write ownerless intent chunk");
+}
+
 fn strict_filter_corpus() -> PathBuf {
     let root = unique_store_root("corpus");
     write_intent_chunk(&root, "LibraxisAI/vista", "TARGET", 1);
@@ -255,6 +284,13 @@ fn cli_intents(root: &std::path::Path, project: &str) -> std::process::Output {
 }
 
 fn mcp_intents_response(root: &std::path::Path, project: &str) -> Value {
+    mcp_intents_response_with_arguments(
+        root,
+        serde_json::json!({"project": project, "hours": 0, "emit": "json", "limit": 100}),
+    )
+}
+
+fn mcp_intents_response_with_arguments(root: &std::path::Path, arguments: Value) -> Value {
     let mut child = Command::new(env!("CARGO_BIN_EXE_aicx-mcp"))
         .env("AICX_HOME", root)
         .env("AICX_ALLOW_TMP", "1")
@@ -285,7 +321,7 @@ fn mcp_intents_response(root: &std::path::Path, project: &str) -> Value {
         "method": "tools/call",
         "params": {
             "name": "aicx_intents",
-            "arguments": {"project": project, "hours": 0, "emit": "json", "limit": 100}
+            "arguments": arguments
         }
     });
     for request in [initialize, initialized, call] {
@@ -334,6 +370,99 @@ fn write_legacy_chunk_without_identity(root: &std::path::Path, project: &str) {
         "[signals]\nIntent:\n- Preserve legacy fallback marker\n[/signals]\n",
     )
     .expect("write legacy chunk without persisted project");
+}
+
+fn write_f6_intent_chunk(
+    root: &std::path::Path,
+    project: &str,
+    date: &str,
+    session_id: &str,
+    sequence: u32,
+    user_line: &str,
+) {
+    let (organization, repository) = project.split_once('/').expect("F6 owner/repo project");
+    let directory = root
+        .join("store")
+        .join(organization)
+        .join(repository)
+        .join(format!(
+            "{}_{}",
+            date.get(..4).expect("F6 date year"),
+            date.get(5..).expect("F6 date month-day").replace('-', "")
+        ))
+        .join("conversations")
+        .join("codex");
+    fs::create_dir_all(&directory).expect("create F6 fixture directory");
+    let filename = aicx::store::session_basename(date, "codex", session_id, sequence);
+    fs::write(
+        directory.join(filename),
+        format!(
+            "[project: {project} | agent: codex | date: {date} | frame_kind: user_msg]\n\n\
+             [12:00:00] user: {user_line}\n"
+        ),
+    )
+    .expect("write F6 intent chunk");
+}
+
+fn cli_intents_payload_with_options(
+    root: &std::path::Path,
+    projects: &[&str],
+    limit: usize,
+    collapse_session: bool,
+) -> Value {
+    let mut args = vec!["intents".to_string()];
+    for project in projects {
+        args.extend(["-p".to_string(), (*project).to_string()]);
+    }
+    args.extend([
+        "--emit".to_string(),
+        "json".to_string(),
+        "-H".to_string(),
+        "0".to_string(),
+        "--sort".to_string(),
+        "newest".to_string(),
+        "--limit".to_string(),
+        limit.to_string(),
+    ]);
+    if collapse_session {
+        args.push("--collapse-session".to_string());
+    }
+
+    let output = Command::new(env!("CARGO_BIN_EXE_aicx"))
+        .env("AICX_HOME", root)
+        .env("AICX_ALLOW_TMP", "1")
+        .args(args)
+        .output()
+        .expect("run F6 CLI intents");
+    assert!(
+        output.status.success(),
+        "F6 CLI intents failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).expect("parse F6 CLI intents envelope")
+}
+
+fn mcp_intents_payload_with_options(
+    root: &std::path::Path,
+    projects: &[&str],
+    limit: usize,
+    collapse_session: bool,
+) -> Value {
+    let response = mcp_intents_response_with_arguments(
+        root,
+        serde_json::json!({
+            "projects": projects,
+            "hours": 0,
+            "emit": "json",
+            "sort": "newest",
+            "limit": limit,
+            "collapse_session": collapse_session
+        }),
+    );
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("F6 MCP intents result missing text: {response}"));
+    serde_json::from_str(text).expect("parse F6 MCP intents envelope")
 }
 
 #[test]
@@ -551,6 +680,79 @@ fn intents_cli_and_mcp_resolution_path_share_selected_session_set() {
 }
 
 #[test]
+fn ownerless_bucket_world_model_has_cli_mcp_addressability_and_completeness() {
+    let root = unique_store_root("ownerless-world-model");
+    write_intent_chunk(&root, "A/repo", "OWNED", 1);
+    write_ownerless_intent_chunk(&root, "repo", "ORPHANED", 2);
+
+    let corpus = aicx::store::project_identities_in_store_at(&root).expect("discover corpus");
+    assert_eq!(corpus, ["A/repo", "_/repo"]);
+
+    let ambiguous_cli = cli_intents(&root, "repo");
+    assert!(!ambiguous_cli.status.success());
+    let stderr = String::from_utf8_lossy(&ambiguous_cli.stderr);
+    assert!(stderr.contains("A/repo"), "{stderr}");
+    assert!(stderr.contains("_/repo"), "{stderr}");
+
+    let ambiguous_mcp = mcp_intents_response(&root, "repo");
+    assert_eq!(
+        ambiguous_mcp["error"]["data"]["candidates"],
+        serde_json::json!(["A/repo", "_/repo"]),
+        "{ambiguous_mcp}"
+    );
+
+    let ownerless_cli = cli_intents(&root, "_/repo");
+    assert!(
+        ownerless_cli.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ownerless_cli.stderr)
+    );
+    let ownerless_cli_payload: Value =
+        serde_json::from_slice(&ownerless_cli.stdout).expect("parse ownerless CLI payload");
+    let ownerless_mcp_payload = mcp_intents_payload(&root, "_/repo");
+    assert_eq!(payload_projects(&ownerless_cli_payload), ["_/repo"]);
+    assert_eq!(
+        payload_session_ids(&ownerless_cli_payload),
+        payload_session_ids(&ownerless_mcp_payload)
+    );
+    assert_eq!(
+        ownerless_cli_payload["completeness"]["orphaned_buckets"],
+        serde_json::json!(["_/repo"])
+    );
+    assert_eq!(
+        ownerless_mcp_payload["completeness"]["orphaned_buckets"],
+        serde_json::json!(["_/repo"])
+    );
+
+    let wildcard_cli = cli_intents(&root, "/repo");
+    assert!(
+        wildcard_cli.status.success(),
+        "{}",
+        String::from_utf8_lossy(&wildcard_cli.stderr)
+    );
+    let wildcard_cli_payload: Value =
+        serde_json::from_slice(&wildcard_cli.stdout).expect("parse wildcard CLI payload");
+    let wildcard_mcp_payload = mcp_intents_payload(&root, "/repo");
+    let mut wildcard_projects = payload_projects(&wildcard_cli_payload);
+    wildcard_projects.sort_unstable();
+    assert_eq!(wildcard_projects, ["A/repo", "_/repo"]);
+    assert_eq!(
+        payload_session_ids(&wildcard_cli_payload),
+        payload_session_ids(&wildcard_mcp_payload)
+    );
+    assert_eq!(
+        wildcard_cli_payload["completeness"]["orphaned_buckets"],
+        serde_json::json!(["_/repo"])
+    );
+    assert_eq!(
+        wildcard_cli_payload["completeness"]["scope"]["selected"],
+        serde_json::json!(["A/repo", "_/repo"])
+    );
+
+    fs::remove_dir_all(root).expect("remove ownerless world-model corpus");
+}
+
+#[test]
 fn historical_identity_survives_live_remote_rename_with_cli_mcp_parity() {
     let root = unique_store_root("immutable-rename");
     let checkout = synthetic_checkout(&root, "https://github.com/archive/old.git");
@@ -679,4 +881,113 @@ fn legacy_record_falls_back_to_path_heuristic_with_cli_mcp_parity() {
     );
 
     fs::remove_dir_all(root).expect("remove legacy fallback corpus");
+}
+
+#[test]
+fn f6_newest_and_collapse_world_model_has_cli_mcp_parity() {
+    let root = unique_store_root("f6-determinism");
+    let projects = ["alpha/repo", "beta/repo"];
+
+    // 120 sessions share the exact canonical timestamp. The newest-100 cut
+    // therefore depends entirely on the total identity/chunk tie-break order.
+    for index in 0..120 {
+        let session_id = format!("tie-{index:03}");
+        write_f6_intent_chunk(
+            &root,
+            projects[0],
+            "2026-07-17",
+            &session_id,
+            1,
+            &format!("Intent: Preserve deterministic tied session {session_id}"),
+        );
+    }
+
+    // Same session id in two project identities must remain two collapsed
+    // representatives even when their content is byte-for-byte identical.
+    for project in projects {
+        write_f6_intent_chunk(
+            &root,
+            project,
+            "2026-07-17",
+            "shared-id",
+            1,
+            "Intent: Preserve project-scoped shared session",
+        );
+    }
+
+    // New technical task noise must not become the representative when the
+    // same session contains an older substantive user intent.
+    write_f6_intent_chunk(
+        &root,
+        projects[0],
+        "2026-07-17",
+        "quality-id",
+        1,
+        "Task: Set model to Opus 4.8",
+    );
+    write_f6_intent_chunk(
+        &root,
+        projects[0],
+        "2026-07-16",
+        "quality-id",
+        2,
+        "Intent: Make newest-N deterministic across the shared CLI and MCP collector",
+    );
+
+    let cli_first = cli_intents_payload_with_options(&root, &[projects[0]], 100, false);
+    let cli_second = cli_intents_payload_with_options(&root, &[projects[0]], 100, false);
+    let mcp_first = mcp_intents_payload_with_options(&root, &[projects[0]], 100, false);
+    let mcp_second = mcp_intents_payload_with_options(&root, &[projects[0]], 100, false);
+    let cli_ids = payload_session_ids(&cli_first);
+
+    assert_eq!(cli_ids.len(), 100);
+    assert_eq!(cli_ids, payload_session_ids(&cli_second));
+    assert_eq!(cli_ids, payload_session_ids(&mcp_first));
+    assert_eq!(cli_ids, payload_session_ids(&mcp_second));
+    assert_eq!(cli_first["items"], cli_second["items"]);
+    assert_eq!(cli_first["items"], mcp_first["items"]);
+    assert_eq!(mcp_first["items"], mcp_second["items"]);
+    println!("F6_NEWEST_IDS={}", cli_ids.join(","));
+
+    let collapsed_cli = cli_intents_payload_with_options(&root, &projects, 500, true);
+    let collapsed_mcp = mcp_intents_payload_with_options(&root, &projects, 500, true);
+    assert_eq!(collapsed_cli["items"], collapsed_mcp["items"]);
+
+    let collapsed_items = collapsed_cli["items"]
+        .as_array()
+        .expect("collapsed F6 items array");
+    let shared = collapsed_items
+        .iter()
+        .filter(|item| item["session_id"] == "shared-id")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        shared.len(),
+        2,
+        "same session id across projects was merged"
+    );
+    assert_eq!(
+        shared
+            .iter()
+            .map(|item| item["project"].as_str().expect("shared project"))
+            .collect::<Vec<_>>(),
+        projects
+    );
+
+    let quality = collapsed_items
+        .iter()
+        .find(|item| item["session_id"] == "quality-id")
+        .expect("quality session representative");
+    assert_eq!(quality["kind"], "intent");
+    assert_eq!(
+        quality["summary"],
+        "Make newest-N deterministic across the shared CLI and MCP collector"
+    );
+    assert!(
+        !quality["summary"]
+            .as_str()
+            .expect("quality summary")
+            .contains("Set model")
+    );
+
+    fs::remove_dir_all(root).expect("remove F6 determinism corpus");
 }
