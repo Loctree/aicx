@@ -327,9 +327,8 @@ fn collect_chunk_files(
         }
         // Keep intents aligned with every other `-p` surface: canonical
         // owner/repo equality, explicit owner/repo wildcards, and bare-name
-        // equality. Ownerless legacy buckets remain addressable by their repo
-        // name, but an exact owner/repo filter intentionally cannot claim
-        // them (ownerless identity repair is a separate migration concern).
+        // equality. Legacy ownerless buckets use the virtual `_/repo` address;
+        // their physical store path remains unchanged.
         let persisted_project = persisted_project_from_card(&file.path)?;
         let (identity_project, identity_source) = persisted_project
             .map(|identity_project| (identity_project, PERSISTED_IDENTITY_SOURCE))

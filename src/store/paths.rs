@@ -6,6 +6,10 @@ use std::path::{Path, PathBuf};
 use crate::validation::is_valid_repo_project_slug;
 
 pub const NON_REPOSITORY_CONTEXTS: &str = "non-repository-contexts";
+/// Virtual organization used to address legacy store buckets that have no
+/// owner directory (`store/<repository>/...`). The sentinel is query-only:
+/// reading an ownerless bucket never migrates or renames its on-disk path.
+pub const OWNERLESS_PROJECT_ORGANIZATION: &str = "_";
 pub const CANONICAL_STORE_DIRNAME: &str = "store";
 pub const CONTEXT_CORPUS_DIRNAME: &str = "context-corpus";
 pub const LOCT_CONTEXT_PACK_FAMILY: &str = "loct-context-pack";
