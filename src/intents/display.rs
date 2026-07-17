@@ -3,7 +3,9 @@ use std::collections::{HashMap, HashSet};
 
 use crate::oracle::{ClaimHonesty, OracleEnvelope, OracleStatus};
 
-use super::{IntentKind, IntentRecord, cmp_dates_flexible, parse_flexible_utc};
+use super::{
+    IntentKind, IntentRecord, IntentsCompleteness, cmp_dates_flexible, parse_flexible_utc,
+};
 
 /// Sort order for `apply_display_filters`. Mirrors the CLI's `SortOrder`
 /// without importing main.rs types into the library.
@@ -47,6 +49,13 @@ pub struct IntentDisplayFilters {
     pub date_hi: Option<String>,
     pub sort: Option<IntentSortOrder>,
     pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+pub struct IntentDisplayResult {
+    pub records: Vec<IntentRecord>,
+    pub available_before_limit: usize,
+    pub requested_limit: Option<usize>,
 }
 
 fn clean_to_significant_words(text: &str) -> HashSet<String> {
@@ -208,9 +217,16 @@ fn outcome_matches_intent(outcome: &IntentRecord, intent: &IntentRecord) -> bool
 /// aggregation in `collapse_session` becomes inconsistent with the
 /// downstream filters.
 pub fn apply_display_filters(
-    mut records: Vec<IntentRecord>,
+    records: Vec<IntentRecord>,
     filters: &IntentDisplayFilters,
 ) -> Vec<IntentRecord> {
+    apply_display_filters_with_completeness(records, filters).records
+}
+
+pub fn apply_display_filters_with_completeness(
+    mut records: Vec<IntentRecord>,
+    filters: &IntentDisplayFilters,
+) -> IntentDisplayResult {
     if filters.unresolved {
         match filters.unresolved_mode {
             UnresolvedMode::Session => {
@@ -317,11 +333,16 @@ pub fn apply_display_filters(
         });
     }
 
+    let available_before_limit = records.len();
     if let Some(limit) = filters.limit {
         records.truncate(limit);
     }
 
-    records
+    IntentDisplayResult {
+        records,
+        available_before_limit,
+        requested_limit: filters.limit,
+    }
 }
 
 fn collapse_exact_daily_duplicates(records: Vec<IntentRecord>) -> Vec<IntentRecord> {
@@ -441,6 +462,30 @@ pub fn format_intents_oracle_json(
     serde_json::to_string_pretty(&OracleEnvelope {
         oracle_status,
         claim_honesty: ClaimHonesty::canonical(),
+        results: records.len(),
+        items: records,
+    })
+    .context("Failed to serialize intents oracle JSON")
+}
+
+pub fn format_intents_oracle_json_with_completeness(
+    records: &[IntentRecord],
+    oracle_status: OracleStatus,
+    completeness: IntentsCompleteness,
+) -> Result<String> {
+    #[derive(serde::Serialize)]
+    struct IntentsOracleEnvelope<'a> {
+        oracle_status: OracleStatus,
+        claim_honesty: ClaimHonesty,
+        completeness: IntentsCompleteness,
+        results: usize,
+        items: &'a [IntentRecord],
+    }
+
+    serde_json::to_string_pretty(&IntentsOracleEnvelope {
+        oracle_status,
+        claim_honesty: ClaimHonesty::canonical(),
+        completeness,
         results: records.len(),
         items: records,
     })

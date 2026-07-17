@@ -82,11 +82,63 @@ impl IntentsConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IntentExtractionStats {
     pub scanned_count: usize,
     pub candidate_count: usize,
     pub source_paths_verified: bool,
+    pub candidate_cap: usize,
+    pub dropped_candidates: usize,
+    pub dropped_task_events: usize,
+    pub matched_project_buckets: Vec<String>,
+}
+
+/// Machine-readable honesty about whether an intents payload is exhaustive.
+///
+/// This deliberately lives beside extraction stats rather than in stderr:
+/// JSON consumers (including MCP) must be able to distinguish a complete
+/// result from a cap-truncated, identity-narrowed, or limit-saturated view.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct IntentsCompleteness {
+    pub complete: bool,
+    pub candidate_cap: usize,
+    pub candidate_cap_reached: bool,
+    pub dropped_candidates: usize,
+    pub dropped_task_events: usize,
+    pub matched_project_buckets: Vec<String>,
+    pub skipped_project_buckets: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested_limit: Option<usize>,
+    pub available_before_limit: usize,
+    pub limit_saturated: bool,
+}
+
+impl IntentExtractionStats {
+    pub fn completeness(
+        &self,
+        skipped_project_buckets: Vec<String>,
+        requested_limit: Option<usize>,
+        available_before_limit: usize,
+    ) -> IntentsCompleteness {
+        let limit_saturated = requested_limit
+            .is_some_and(|limit| available_before_limit > 0 && available_before_limit >= limit);
+        let candidate_cap_reached = self.dropped_candidates > 0 || self.dropped_task_events > 0;
+        let complete =
+            !candidate_cap_reached && skipped_project_buckets.is_empty() && !limit_saturated;
+
+        IntentsCompleteness {
+            complete,
+            candidate_cap: self.candidate_cap,
+            candidate_cap_reached,
+            dropped_candidates: self.dropped_candidates,
+            dropped_task_events: self.dropped_task_events,
+            matched_project_buckets: self.matched_project_buckets.clone(),
+            skipped_project_buckets,
+            requested_limit,
+            available_before_limit,
+            limit_saturated,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

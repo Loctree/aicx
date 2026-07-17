@@ -939,6 +939,112 @@ fn intents_project_resolver_does_not_resolve_bare_unknown_to_current_repo() {
 }
 
 #[test]
+fn intents_json_envelope_reports_cap_skipped_identities_and_limit_saturation() {
+    let root = unique_test_dir("intents-completeness-envelope");
+    let _ = fs::remove_dir_all(&root);
+    write_store_chunk(&root, "one/vista", "2026_0717", "one");
+    let selected_chunk = write_store_chunk(&root, "two/vista", "2026_0717", "two");
+    write_store_chunk(&root, "three/vista", "2026_0717", "three");
+
+    // Keep resolver ambiguity behavior unchanged (F3 is a separate cut): a
+    // session display-name bridge selects one of three strict bare-name
+    // identities. F2 must make the two omitted identities visible in payload.
+    let sessions = vec![session_info("vista", "git@github.com:two/vista.git")];
+    let resolution =
+        resolve_intents_project_filters_at(&["vista".to_string()], &root, &sessions, None)
+            .expect("resolve bare-name fixture");
+    assert_eq!(resolution.projects, ["two/vista"]);
+    assert_eq!(
+        resolution.skipped_project_buckets,
+        ["one/vista", "three/vista"]
+    );
+
+    let mut body = String::from(
+        "[project: two/vista | agent: claude | date: 2026-07-17 | frame_kind: user_msg]\n\n\
+         [signals]\nIntent:\n",
+    );
+    for index in 0..5_008 {
+        body.push_str(&format!(
+            "- Preserve completeness candidate number {index:04}\n"
+        ));
+    }
+    body.push_str("[/signals]\n");
+    fs::write(&selected_chunk, body).expect("write over-cap intents fixture");
+
+    let extraction = aicx::api::Aicx::with_store_root(&root)
+        .extract_intents(&intents::IntentsConfig {
+            project: resolution.projects[0].clone(),
+            hours: 0,
+            strict: false,
+            min_confidence: None,
+            kind_filter: None,
+            frame_kind: None,
+        })
+        .expect("extract over-cap intents fixture");
+    assert!(extraction.stats.dropped_candidates > 0);
+    assert_eq!(extraction.stats.matched_project_buckets, ["two/vista"]);
+
+    let display = intents::apply_display_filters_with_completeness(
+        extraction.records,
+        &intents::IntentDisplayFilters {
+            limit: Some(100),
+            ..Default::default()
+        },
+    );
+    assert_eq!(display.records.len(), 100);
+    let oracle_status = aicx::oracle::OracleStatus::canonical_corpus_scan(
+        &root,
+        extraction.stats.scanned_count,
+        extraction.stats.candidate_count,
+        extraction.stats.source_paths_verified,
+    );
+    let completeness = extraction.stats.completeness(
+        resolution.skipped_project_buckets,
+        display.requested_limit,
+        display.available_before_limit,
+    );
+    let expected_dropped = completeness.dropped_candidates;
+    let json = intents::format_intents_oracle_json_with_completeness(
+        &display.records,
+        oracle_status,
+        completeness,
+    )
+    .expect("serialize completeness envelope");
+    let payload: serde_json::Value = serde_json::from_str(&json).expect("parse envelope");
+
+    assert_eq!(payload["oracle_status"]["backend"], "canonical_corpus");
+    assert_eq!(
+        payload["claim_honesty"]["verification_state"],
+        "not_verified_by_aicx"
+    );
+    assert_eq!(payload["completeness"]["complete"], false);
+    assert_eq!(payload["completeness"]["candidate_cap"], 5_000);
+    assert_eq!(payload["completeness"]["candidate_cap_reached"], true);
+    assert_eq!(
+        payload["completeness"]["dropped_candidates"],
+        expected_dropped
+    );
+    assert_eq!(
+        payload["completeness"]["matched_project_buckets"],
+        serde_json::json!(["two/vista"])
+    );
+    assert_eq!(
+        payload["completeness"]["skipped_project_buckets"],
+        serde_json::json!(["one/vista", "three/vista"])
+    );
+    assert_eq!(payload["completeness"]["requested_limit"], 100);
+    assert!(
+        payload["completeness"]["available_before_limit"]
+            .as_u64()
+            .is_some_and(|available| available >= 100)
+    );
+    assert_eq!(payload["completeness"]["limit_saturated"], true);
+    assert_eq!(payload["results"], 100);
+
+    fs::remove_dir_all(root).expect("remove completeness corpus");
+}
+
+#[test]
 fn intents_empty_result_hint_ranks_nearby_recent_buckets() {
     let mut counts = BTreeMap::new();
     counts.insert("vetcoders/screen_scribe_depr".to_string(), 12);

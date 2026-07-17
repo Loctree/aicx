@@ -667,7 +667,9 @@ fn default_steer_limit() -> usize {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct IntentsParams {
-    /// Optional project filter (case-insensitive substring; empty/None = all projects)
+    /// Optional strict project filter. Bare names match an exact organization
+    /// or repository token; `owner/` and `/repo` are explicit wildcards.
+    /// Empty/None scans all projects.
     #[serde(default)]
     pub project: Option<String>,
     /// Optional project filters for cross-project intent extraction.
@@ -1607,7 +1609,8 @@ impl AicxMcpServer {
             limit: Some(limit_capped),
         };
 
-        let records = intents::apply_display_filters(records, &display_filters);
+        let display = intents::apply_display_filters_with_completeness(records, &display_filters);
+        let records = display.records;
 
         let body = match params.emit.as_str() {
             "markdown" | "md" => intents::format_intents_markdown(&records),
@@ -1620,7 +1623,17 @@ impl AicxMcpServer {
                     extraction.stats.candidate_count,
                     extraction.stats.source_paths_verified,
                 );
-                intents::format_intents_oracle_json(&records, oracle_status).map_err(|e| {
+                let completeness = extraction.stats.completeness(
+                    Vec::new(),
+                    display.requested_limit,
+                    display.available_before_limit,
+                );
+                intents::format_intents_oracle_json_with_completeness(
+                    &records,
+                    oracle_status,
+                    completeness,
+                )
+                .map_err(|e| {
                     McpError::internal_error(format!("Serialize intents JSON: {e}"), None)
                 })?
             }
@@ -2321,7 +2334,7 @@ mod tests {
     }
 
     #[test]
-    fn aicx_intents_json_payload_carries_claim_honesty_frame() {
+    fn aicx_intents_json_payload_carries_claim_honesty_and_completeness() {
         // B2: the `aicx_intents` JSON branch serializes through
         // `intents::format_intents_oracle_json`; this locks the exact payload
         // the MCP tool returns so every consumer sees the honesty frame —
@@ -2350,8 +2363,26 @@ mod tests {
             true,
         );
 
-        let body = crate::intents::format_intents_oracle_json(&records, oracle_status)
-            .expect("serialize intents payload");
+        let stats = crate::intents::IntentExtractionStats {
+            scanned_count: 3,
+            candidate_count: 3,
+            source_paths_verified: true,
+            candidate_cap: 5_000,
+            dropped_candidates: 2,
+            dropped_task_events: 0,
+            matched_project_buckets: vec![
+                "one/aicx".to_string(),
+                "two/aicx".to_string(),
+                "three/aicx".to_string(),
+            ],
+        };
+        let completeness = stats.completeness(Vec::new(), Some(1), 3);
+        let body = crate::intents::format_intents_oracle_json_with_completeness(
+            &records,
+            oracle_status,
+            completeness,
+        )
+        .expect("serialize intents payload");
         let payload: serde_json::Value =
             serde_json::from_str(&body).expect("intents payload parses");
 
@@ -2368,6 +2399,18 @@ mod tests {
             payload["items"][0]["verification_state"],
             "not_verified_by_aicx"
         );
+        assert_eq!(payload["completeness"]["complete"], false);
+        assert_eq!(payload["completeness"]["candidate_cap_reached"], true);
+        assert_eq!(payload["completeness"]["dropped_candidates"], 2);
+        assert_eq!(
+            payload["completeness"]["matched_project_buckets"],
+            serde_json::json!(["one/aicx", "two/aicx", "three/aicx"])
+        );
+        assert_eq!(
+            payload["completeness"]["skipped_project_buckets"],
+            serde_json::json!([])
+        );
+        assert_eq!(payload["completeness"]["limit_saturated"], true);
     }
 
     #[test]

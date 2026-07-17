@@ -7,7 +7,7 @@
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, NaiveDate, NaiveDateTime, NaiveTime, Utc};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::chunker::{
@@ -25,16 +25,18 @@ mod schema;
 mod types;
 
 pub use self::display::{
-    IntentDisplayFilters, IntentSortOrder, UnresolvedMode, apply_display_filters,
-    format_intents_json, format_intents_markdown, format_intents_oracle_json,
+    IntentDisplayFilters, IntentDisplayResult, IntentSortOrder, UnresolvedMode,
+    apply_display_filters, apply_display_filters_with_completeness, format_intents_json,
+    format_intents_markdown, format_intents_oracle_json,
+    format_intents_oracle_json_with_completeness,
 };
 use self::types::{
     CandidateAccumulator, IntentCandidate, SignalSection, StoredChunkFile, TaskAccumulator,
     TaskEvent, TranscriptEntry,
 };
 pub use self::types::{
-    IntentExtraction, IntentExtractionStats, IntentKind, IntentRecord, IntentsConfig,
-    MigrationReport,
+    IntentExtraction, IntentExtractionStats, IntentKind, IntentRecord, IntentsCompleteness,
+    IntentsConfig, MigrationReport,
 };
 // Lane 2-5 schema anchor (MASTER Phase 2 §3). Stages land incrementally; these
 // types are the convergence point every lane stage must agree on.
@@ -99,10 +101,18 @@ pub(crate) fn extract_intents_from_root_at_with_stats(
     )?;
     let scanned_count = files.len();
     let source_paths_verified = verify_stored_chunk_paths(&files);
+    let matched_project_buckets = files
+        .iter()
+        .map(|file| file.project.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
 
     let mut candidates = Vec::new();
     let mut task_events = Vec::new();
     let mut cap_warned = false;
+    let mut dropped_candidates = 0usize;
+    let mut dropped_task_events = 0usize;
 
     for file in files {
         let content = sanitize::read_to_string_validated(&file.path)
@@ -116,13 +126,13 @@ pub(crate) fn extract_intents_from_root_at_with_stats(
         // leak into record provenance.
         let (signal_candidates, signal_tasks) =
             extract_signal_candidates(&file, &file.project, &source_chunk, &signal_lines);
-        extend_with_cap(
+        dropped_candidates += extend_with_cap(
             &mut candidates,
             signal_candidates,
             &mut cap_warned,
             "candidates",
         );
-        extend_with_cap(
+        dropped_task_events += extend_with_cap(
             &mut task_events,
             signal_tasks,
             &mut cap_warned,
@@ -131,13 +141,14 @@ pub(crate) fn extract_intents_from_root_at_with_stats(
 
         let (raw_candidates, raw_tasks) =
             extract_transcript_candidates(&file, &file.project, &source_chunk, &transcript_entries);
-        extend_with_cap(
+        dropped_candidates += extend_with_cap(
             &mut candidates,
             raw_candidates,
             &mut cap_warned,
             "candidates",
         );
-        extend_with_cap(&mut task_events, raw_tasks, &mut cap_warned, "task_events");
+        dropped_task_events +=
+            extend_with_cap(&mut task_events, raw_tasks, &mut cap_warned, "task_events");
 
         if candidates.len() >= MAX_CANDIDATES && task_events.len() >= MAX_CANDIDATES {
             // Both buckets saturated — further files cannot add anything.
@@ -168,6 +179,10 @@ pub(crate) fn extract_intents_from_root_at_with_stats(
         scanned_count,
         candidate_count: records.len(),
         source_paths_verified,
+        candidate_cap: MAX_CANDIDATES,
+        dropped_candidates,
+        dropped_task_events,
+        matched_project_buckets,
     };
 
     Ok(IntentExtraction { records, stats })
@@ -186,6 +201,9 @@ pub(crate) fn extract_intents_from_root_at_for_projects_with_stats(
     let mut records = Vec::new();
     let mut scanned_count = 0usize;
     let mut source_paths_verified = true;
+    let mut dropped_candidates = 0usize;
+    let mut dropped_task_events = 0usize;
+    let mut matched_project_buckets = BTreeSet::new();
 
     for project in projects {
         let mut scoped = config.clone();
@@ -193,6 +211,9 @@ pub(crate) fn extract_intents_from_root_at_for_projects_with_stats(
         let extraction = extract_intents_from_root_at_with_stats(&scoped, store_root, now)?;
         scanned_count += extraction.stats.scanned_count;
         source_paths_verified &= extraction.stats.source_paths_verified;
+        dropped_candidates += extraction.stats.dropped_candidates;
+        dropped_task_events += extraction.stats.dropped_task_events;
+        matched_project_buckets.extend(extraction.stats.matched_project_buckets);
         records.extend(extraction.records);
     }
 
@@ -203,6 +224,10 @@ pub(crate) fn extract_intents_from_root_at_for_projects_with_stats(
         scanned_count,
         candidate_count: records.len(),
         source_paths_verified,
+        candidate_cap: MAX_CANDIDATES,
+        dropped_candidates,
+        dropped_task_events,
+        matched_project_buckets: matched_project_buckets.into_iter().collect(),
     };
 
     Ok(IntentExtraction { records, stats })
@@ -251,11 +276,11 @@ fn extend_with_cap<T>(
     additions: Vec<T>,
     warned: &mut bool,
     bucket_name: &'static str,
-) {
+) -> usize {
     let room = MAX_CANDIDATES.saturating_sub(target.len());
     if additions.len() <= room {
         target.extend(additions);
-        return;
+        return 0;
     }
     let dropped = additions.len() - room;
     target.extend(additions.into_iter().take(room));
@@ -265,6 +290,7 @@ fn extend_with_cap<T>(
         );
         *warned = true;
     }
+    dropped
 }
 
 fn collect_chunk_files(
@@ -289,7 +315,9 @@ fn collect_chunk_files(
             .project
             .split_once('/')
             .unwrap_or(("", file.project.as_str()));
-        if !store::project_filter_matches(organization, repository, project) {
+        if !project.trim().is_empty()
+            && !store::project_filter_matches(organization, repository, project)
+        {
             continue;
         }
         let sidecar = store::load_sidecar(&file.path);
