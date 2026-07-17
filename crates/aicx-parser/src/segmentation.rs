@@ -405,16 +405,14 @@ fn infer_tiered_identity_from_text(text: &str) -> Option<TieredIdentity> {
     })
 }
 
-/// Resolve a canonical `(organization, repository)` identity from a
-/// cwd string by consulting ground-truth signals — git remote URL,
-/// then known-layout heuristics, finally URL-shape inference.
+/// Resolve identity once, while raw entries are being segmented for ingest.
 ///
-/// Returns `None` when no canonical identity can be honestly resolved.
-/// Made `pub` so `src/sources.rs::project_filter_matches_path` can use
-/// the same canonical resolver instead of the prior path-segment
-/// heuristic (which leaked cross-org per `chatgpt-codex-connector`
-/// P1 review on PR #8; see Wave F-2 follow-up commit body).
-pub fn infer_tiered_identity_from_cwd(cwd: Option<&str>) -> Option<TieredIdentity> {
+/// The live checkout is a time-local signal: its remote may be renamed or
+/// repointed after the session happened. Therefore this helper is private to
+/// the ingest segmentation module. Query surfaces must read the project bucket
+/// persisted by ingest and cannot call this function through the public parser
+/// API.
+fn infer_tiered_identity_from_cwd(cwd: Option<&str>) -> Option<TieredIdentity> {
     let cwd = cwd?.trim();
     if cwd.is_empty() || looks_like_weak_source_identifier(cwd) {
         return None;

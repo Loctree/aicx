@@ -8,6 +8,7 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use crate::chunker::{
@@ -55,6 +56,9 @@ pub use self::schema::{
 /// handful. Cap here so memory stays bounded; emit a diagnostic on stderr when
 /// the cap is hit so the operator notices truncated extraction.
 const MAX_CANDIDATES: usize = 5000;
+const CARD_HEADER_READ_LIMIT: u64 = 64 * 1024;
+pub const PERSISTED_IDENTITY_SOURCE: &str = "project-bucket-v1";
+pub const PATH_HEURISTIC_IDENTITY_SOURCE: &str = "path-heuristic";
 
 pub fn extract_intents(config: &IntentsConfig) -> Result<Vec<IntentRecord>> {
     Ok(extract_intents_with_stats(config)?.records)
@@ -107,6 +111,15 @@ pub(crate) fn extract_intents_from_root_at_with_stats(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
+    let identity_source = if files
+        .iter()
+        .any(|file| file.identity_source == PATH_HEURISTIC_IDENTITY_SOURCE)
+    {
+        PATH_HEURISTIC_IDENTITY_SOURCE
+    } else {
+        PERSISTED_IDENTITY_SOURCE
+    }
+    .to_string();
 
     let mut candidates = Vec::new();
     let mut task_events = Vec::new();
@@ -183,6 +196,7 @@ pub(crate) fn extract_intents_from_root_at_with_stats(
         dropped_candidates,
         dropped_task_events,
         matched_project_buckets,
+        identity_source,
     };
 
     Ok(IntentExtraction { records, stats })
@@ -204,6 +218,7 @@ pub(crate) fn extract_intents_from_root_at_for_projects_with_stats(
     let mut dropped_candidates = 0usize;
     let mut dropped_task_events = 0usize;
     let mut matched_project_buckets = BTreeSet::new();
+    let mut identity_source = PERSISTED_IDENTITY_SOURCE.to_string();
 
     for project in projects {
         let mut scoped = config.clone();
@@ -214,6 +229,9 @@ pub(crate) fn extract_intents_from_root_at_for_projects_with_stats(
         dropped_candidates += extraction.stats.dropped_candidates;
         dropped_task_events += extraction.stats.dropped_task_events;
         matched_project_buckets.extend(extraction.stats.matched_project_buckets);
+        if extraction.stats.identity_source == PATH_HEURISTIC_IDENTITY_SOURCE {
+            identity_source = PATH_HEURISTIC_IDENTITY_SOURCE.to_string();
+        }
         records.extend(extraction.records);
     }
 
@@ -228,6 +246,7 @@ pub(crate) fn extract_intents_from_root_at_for_projects_with_stats(
         dropped_candidates,
         dropped_task_events,
         matched_project_buckets: matched_project_buckets.into_iter().collect(),
+        identity_source,
     };
 
     Ok(IntentExtraction { records, stats })
@@ -311,10 +330,13 @@ fn collect_chunk_files(
         // equality. Ownerless legacy buckets remain addressable by their repo
         // name, but an exact owner/repo filter intentionally cannot claim
         // them (ownerless identity repair is a separate migration concern).
-        let (organization, repository) = file
-            .project
+        let persisted_project = persisted_project_from_card(&file.path)?;
+        let (identity_project, identity_source) = persisted_project
+            .map(|identity_project| (identity_project, PERSISTED_IDENTITY_SOURCE))
+            .unwrap_or_else(|| (file.project.clone(), PATH_HEURISTIC_IDENTITY_SOURCE));
+        let (organization, repository) = identity_project
             .split_once('/')
-            .unwrap_or(("", file.project.as_str()));
+            .unwrap_or(("", identity_project.as_str()));
         if !project.trim().is_empty()
             && !store::project_filter_matches(organization, repository, project)
         {
@@ -379,7 +401,8 @@ fn collect_chunk_files(
             agent: file.agent,
             date: file.date_iso,
             path: file.path,
-            project: file.project,
+            project: identity_project,
+            identity_source: identity_source.to_string(),
             sequence: file.chunk,
             timestamp,
             session_id: file.session_id,
@@ -395,6 +418,27 @@ fn collect_chunk_files(
     });
 
     Ok(files)
+}
+
+fn persisted_project_from_card(path: &Path) -> Result<Option<String>> {
+    let file = sanitize::open_file_validated(path)
+        .with_context(|| format!("Failed to open chunk header: {}", path.display()))?;
+    let mut prefix = Vec::new();
+    file.take(CARD_HEADER_READ_LIMIT)
+        .read_to_end(&mut prefix)
+        .with_context(|| format!("Failed to read chunk header: {}", path.display()))?;
+    let prefix = String::from_utf8_lossy(&prefix);
+    Ok(crate::card_header::parse_card_header(&prefix)
+        .and_then(|header| header.project)
+        .filter(|project| {
+            project
+                .split_once('/')
+                .is_some_and(|(organization, repository)| {
+                    !organization.trim().is_empty()
+                        && !repository.trim().is_empty()
+                        && !repository.contains('/')
+                })
+        }))
 }
 
 fn normalize_scan_root(store_root: &Path) -> PathBuf {
