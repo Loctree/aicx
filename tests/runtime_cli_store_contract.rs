@@ -66,11 +66,23 @@ fn write_codex_history(
 }
 
 fn write_claude_session_fixture(path: &Path, session_id: Option<&str>, text: &str) {
+    write_claude_session_fixture_with_cwd(path, session_id, "/repo", text);
+}
+
+// SYNTHETIC fixture writer (same minimal Claude JSONL shape as
+// tests/fixtures/parser_engine/claude/minimal.jsonl); cwd is the
+// discovery-filter axis under test, not captured operator material.
+fn write_claude_session_fixture_with_cwd(
+    path: &Path,
+    session_id: Option<&str>,
+    cwd: &str,
+    text: &str,
+) {
     let timestamp = chrono::Utc::now().to_rfc3339();
     let mut row = json!({
         "timestamp": timestamp,
         "type": "user",
-        "cwd": "/repo",
+        "cwd": cwd,
         "message": {"role": "user", "content": text}
     });
     if let Some(session_id) = session_id {
@@ -1395,6 +1407,126 @@ fn session_batch_returns_exit_three_when_every_session_is_quarantined() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("session ingest summary: ingested=0 skipped=1"));
     assert!(stderr.contains("all 1 selected session(s) were skipped"));
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn project_filter_narrows_batch_discovery() {
+    // O1 (`~/.aicx/aicx-problems.md` 2026-07-17 15:12 UTC): `aicx claude -p X`
+    // promises "narrows session discovery before repo segmentation", but batch
+    // discovery ignored the filter and ingested every session in the window.
+    let root = unique_test_dir("claude-batch-project-filter");
+    let home = root.join("home");
+    let alpha = home
+        .join(".claude")
+        .join("projects")
+        .join("-repo-alpha")
+        .join("44444444-4444-4444-8444-444444444444.jsonl");
+    let beta = home
+        .join(".claude")
+        .join("projects")
+        .join("-repo-beta")
+        .join("55555555-5555-4555-8555-555555555555.jsonl");
+    write_claude_session_fixture_with_cwd(
+        &alpha,
+        Some("alpha-session"),
+        "/repo/alpha",
+        "alpha prompt inside the filtered project",
+    );
+    write_claude_session_fixture_with_cwd(
+        &beta,
+        Some("beta-session"),
+        "/repo/beta",
+        "beta prompt outside the filtered project",
+    );
+
+    let output = run_aicx(
+        &home,
+        &["claude", "-H", "24", "-p", "alpha", "--emit", "json"],
+    );
+    assert_success(&output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("session ingest summary: ingested=1 skipped=0 filtered_out=1"),
+        "batch summary must expose the filtered_out counter\nstderr:\n{stderr}"
+    );
+
+    let projection_dir = home
+        .join(".aicx")
+        .join("store")
+        .join("canonical-projection-v1");
+    let manifest: Value = serde_json::from_str(
+        &fs::read_to_string(projection_dir.join("manifest.json"))
+            .expect("canonical projection manifest"),
+    )
+    .expect("valid canonical projection manifest");
+    let card_ids = manifest["card_ids"].as_array().expect("manifest card ids");
+    assert_eq!(
+        card_ids.len(),
+        1,
+        "only the session matching the -p filter may project; got {card_ids:?}"
+    );
+    let card_name = format!(
+        "{}.json",
+        card_ids[0].as_str().expect("card id").replace(':', "_")
+    );
+    let card: Value = serde_json::from_str(
+        &fs::read_to_string(projection_dir.join("cards").join(card_name)).expect("canonical card"),
+    )
+    .expect("valid canonical card");
+    assert_eq!(card["session_id"].as_str(), Some("alpha-session"));
+
+    // Sessions cut by the filter are neither ingested nor skipped: the store
+    // must contain no trace of the beta session's content.
+    let mut stack = vec![home.join(".aicx").join("store")];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if let Ok(content) = fs::read_to_string(&path) {
+                assert!(
+                    !content.contains("beta prompt outside the filtered project"),
+                    "filtered-out session leaked into store file {}",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn project_filter_cutting_everything_is_not_all_skipped() {
+    // A `-p` filter that excludes every discovered session is an empty result,
+    // not a failure: exit 0, filtered_out counted, nothing skipped.
+    let root = unique_test_dir("claude-batch-filter-all-out");
+    let home = root.join("home");
+    let beta = home
+        .join(".claude")
+        .join("projects")
+        .join("-repo-beta")
+        .join("66666666-6666-4666-8666-666666666666.jsonl");
+    write_claude_session_fixture_with_cwd(
+        &beta,
+        Some("beta-session"),
+        "/repo/beta",
+        "beta prompt outside the filtered project",
+    );
+
+    let output = run_aicx(&home, &["claude", "-H", "24", "-p", "alpha"]);
+    assert_success(&output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("session ingest summary: ingested=0 skipped=0 filtered_out=1"),
+        "all-filtered batch must not be reported as all-skipped\nstderr:\n{stderr}"
+    );
+    assert!(!stderr.contains("selected session(s) were skipped"));
 
     let _ = fs::remove_dir_all(&root);
 }

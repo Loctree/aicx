@@ -64,6 +64,10 @@ pub struct SessionExtractionBatch {
     pub ingested_session_ids: BTreeSet<String>,
     pub selected_sessions: usize,
     pub ingested_sessions: usize,
+    /// Sessions cut by the `-p/--project` discovery filter. Deliberately
+    /// outside `selected_sessions`/`skipped`: an all-filtered batch is an
+    /// empty result, not an all-skipped failure.
+    pub filtered_out_sessions: usize,
     pub skipped: Vec<SessionSkip>,
 }
 
@@ -76,6 +80,7 @@ impl SessionExtractionBatch {
             canonical_cards: Vec::new(),
             ingested_session_ids: BTreeSet::new(),
             selected_sessions: 0,
+            filtered_out_sessions: 0,
             skipped: Vec::new(),
         }
     }
@@ -110,7 +115,6 @@ pub fn extract_agent_sessions(
         .into_iter()
         .filter(|source| source_is_selected(source.fingerprint.modified_unix_nanos, config))
     {
-        batch.selected_sessions += 1;
         let parsed = crate::parser_dispatch::parse_file(
             parser_agent,
             &source.source_id,
@@ -119,6 +123,17 @@ pub fn extract_agent_sessions(
         );
         match parsed {
             Ok(session) => {
+                if !session_matches_project_filter(session.model(), &config.project_filter) {
+                    batch.filtered_out_sessions += 1;
+                    crate::diagnostics::log_describe(&format!(
+                        "session_filtered_out agent={} session_id={} path={}",
+                        agent,
+                        session.model().session_id,
+                        source.path.display()
+                    ));
+                    continue;
+                }
+                batch.selected_sessions += 1;
                 let projection = match aicx_parser::projections::project_validated_session(
                     &session,
                     &canonical_projection_config(),
@@ -146,6 +161,12 @@ pub fn extract_agent_sessions(
                     .extend(crate::output::timeline_entries_from_model(session.model()));
             }
             Err(error) => {
+                // A parse failure hides the session's cwd, so an active
+                // `-p` filter cannot prove the session is out of scope.
+                // Keep it selected + skipped: hiding parse failures inside
+                // the filtered project would be worse than surfacing a
+                // neighbour's broken session.
+                batch.selected_sessions += 1;
                 batch.skipped.push(session_skip(
                     agent,
                     &source.path,
@@ -213,6 +234,38 @@ fn session_skip(
         skip.recover
     ));
     skip
+}
+
+/// Session-level `-p/--project` discovery filter (O1, problem-log
+/// 2026-07-17 15:12 UTC): a session belongs to the requested project when
+/// ANY of its known working directories (session provenance or per-segment
+/// cwd) matches the filter, using the same word-boundary path semantics as
+/// per-entry segmentation (`project_filter_matches_path`). Fail-closed: with
+/// an active filter, a session with no known cwd cannot be shown to belong
+/// to the requested project and is filtered out (visible in `filtered_out`).
+#[cfg(feature = "app")]
+fn session_matches_project_filter(
+    model: &aicx_parser::engine::SessionModel,
+    filters: &[String],
+) -> bool {
+    if filters.is_empty() {
+        return true;
+    }
+    let provenance_cwd = match model.provenance.cwd.as_ref() {
+        aicx_parser::engine::Known::Value(cwd) => Some(cwd.as_str()),
+        aicx_parser::engine::Known::Unknown(_) => None,
+    };
+    let segment_cwds = model
+        .segments
+        .iter()
+        .filter_map(|segment| match segment.cwd.as_ref() {
+            aicx_parser::engine::Known::Value(cwd) => Some(cwd.as_str()),
+            aicx_parser::engine::Known::Unknown(_) => None,
+        });
+    provenance_cwd
+        .into_iter()
+        .chain(segment_cwds)
+        .any(|cwd| project_filter_matches_path(cwd, filters))
 }
 
 #[cfg(feature = "app")]

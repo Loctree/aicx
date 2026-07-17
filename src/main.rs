@@ -6352,12 +6352,13 @@ fn emit_session_batch_summary(agent: &str, batch: &sources::SessionExtractionBat
         );
         eprintln!("    recover: {}", skip.recover);
     }
-    if batch.selected_sessions > 0 || !batch.skipped.is_empty() {
+    if batch.selected_sessions > 0 || !batch.skipped.is_empty() || batch.filtered_out_sessions > 0 {
         eprintln!(
-            "  [{}] session ingest summary: ingested={} skipped={}",
+            "  [{}] session ingest summary: ingested={} skipped={} filtered_out={}",
             agent,
             batch.ingested_sessions,
-            batch.skipped.len()
+            batch.skipped.len(),
+            batch.filtered_out_sessions
         );
     }
 }
