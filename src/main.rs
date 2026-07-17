@@ -1859,8 +1859,10 @@ enum Commands {
 
         /// With --prune-empty-bodies, move empty-body chunks into recoverable
         /// quarantine. With --migrate-identities, execute the planned
-        /// identity renames.
-        #[arg(long, requires = "doctor_apply_target")]
+        /// identity renames. Refuses to combine with --dry-run: on a
+        /// store-mutating surface the preview flag must always win, so the
+        /// ambiguous combination is a parse error.
+        #[arg(long, requires = "doctor_apply_target", conflicts_with = "dry_run")]
         apply: bool,
 
         /// Restore files from a quarantine manifest slug.

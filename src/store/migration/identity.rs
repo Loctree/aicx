@@ -222,9 +222,12 @@ pub fn plan_identity_migration_at(base: &Path) -> Result<IdentityMigrationManife
         }
         if org_canon != org {
             org_renames.push(StoreDirRename {
+                // Canon also trims segments, so an org name carrying
+                // whitespace differs by more than casing — compute instead
+                // of assuming lowercase-only drift.
+                case_only: org.eq_ignore_ascii_case(&org_canon),
                 from: org.clone(),
                 to: org_canon,
-                case_only: true, // canon differs only by lowercasing
             });
         }
     }
@@ -543,7 +546,7 @@ fn render_identity_report(manifest: &IdentityMigrationManifest) -> String {
 
     if manifest.mode == "dry-run" {
         out.push_str(
-            "\n## Operator buttons\n\n- `aicx doctor --migrate-identities --apply` — execute the renames above\n- typo-twin merges: separate decision, not part of `--apply`\n",
+            "\n## Operator buttons\n\n- `aicx doctor --migrate-identities --apply` — execute the renames above\n- typo-twin merges: separate decision, not part of `--apply`\n\nNote: `--apply` re-plans against the store state at execution time; if the store changes between this dry-run and the apply, the executed plan may differ from this report.\n",
         );
     }
     out
@@ -818,5 +821,77 @@ mod tests {
         assert!(!edit_distance_at_most_one("vista", "vista"));
         assert!(!edit_distance_at_most_one("vista", "vista-portal"));
         assert!(!edit_distance_at_most_one("aicx", "loctree"));
+    }
+
+    // merge_move's logic is casing-independent, so exercising it on two
+    // differently-named directories covers the case-sensitive split branch
+    // on every filesystem — an actual `A/` vs `a/` pair cannot coexist on
+    // APFS, which is why the dir-level branch had no coverage before.
+    #[test]
+    fn merge_move_merges_recursively_and_records_conflicts() {
+        let base = fixture_base("merge-move");
+        let from = base.join("VetCoders-split");
+        let to = base.join("vetcoders");
+        fs::create_dir_all(from.join("nested")).unwrap();
+        fs::create_dir_all(&to).unwrap();
+        fs::write(from.join("unique.md"), "moved").unwrap();
+        fs::write(from.join("clash.md"), "source version").unwrap();
+        fs::write(from.join("nested").join("deep.md"), "moved too").unwrap();
+        fs::write(to.join("clash.md"), "target version").unwrap();
+
+        let mut conflicts = Vec::new();
+        merge_move(&from, &to, &mut conflicts).unwrap();
+
+        assert_eq!(fs::read_to_string(to.join("unique.md")).unwrap(), "moved");
+        assert_eq!(
+            fs::read_to_string(to.join("nested").join("deep.md")).unwrap(),
+            "moved too"
+        );
+        // Conflict path: target wins in place, source copy is kept, one
+        // conflict line is recorded — doctor never overwrites store data.
+        assert_eq!(
+            fs::read_to_string(to.join("clash.md")).unwrap(),
+            "target version"
+        );
+        assert_eq!(
+            fs::read_to_string(from.join("clash.md")).unwrap(),
+            "source version"
+        );
+        assert_eq!(
+            conflicts
+                .iter()
+                .filter(|c| c.contains("clash.md") && c.contains("kept both"))
+                .count(),
+            1
+        );
+        // Emptied nested source dir is removed; the non-empty root stays
+        // and that fact is surfaced as a conflict entry.
+        assert!(!from.join("nested").exists());
+        assert!(from.is_dir());
+        assert!(
+            conflicts
+                .iter()
+                .any(|c| c.contains("source dir left in place"))
+        );
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn merge_move_removes_fully_emptied_source_dir() {
+        let base = fixture_base("merge-move-clean");
+        let from = base.join("VetCoders-split");
+        let to = base.join("vetcoders");
+        fs::create_dir_all(&from).unwrap();
+        fs::write(from.join("chunk.md"), "payload").unwrap();
+
+        let mut conflicts = Vec::new();
+        merge_move(&from, &to, &mut conflicts).unwrap();
+
+        assert_eq!(fs::read_to_string(to.join("chunk.md")).unwrap(), "payload");
+        assert!(!from.exists(), "emptied source dir must be removed");
+        assert!(conflicts.is_empty(), "clean merge records no conflicts");
+
+        let _ = fs::remove_dir_all(&base);
     }
 }

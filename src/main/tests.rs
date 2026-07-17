@@ -2195,6 +2195,48 @@ fn doctor_apply_requires_prune_empty_bodies() {
 }
 
 #[test]
+fn doctor_apply_conflicts_with_dry_run() {
+    assert!(
+        Cli::try_parse_from([
+            "aicx",
+            "doctor",
+            "--dry-run",
+            "--migrate-identities",
+            "--apply"
+        ])
+        .is_err(),
+        "--dry-run must win over --apply on a store-mutating surface; the combination is a parse error"
+    );
+    assert!(
+        Cli::try_parse_from([
+            "aicx",
+            "doctor",
+            "--dry-run",
+            "--prune-empty-bodies",
+            "--apply"
+        ])
+        .is_err(),
+        "--dry-run + --prune-empty-bodies --apply is equally ambiguous and must not parse"
+    );
+    // --dry-run alone with the planning flags stays valid (plan-only path).
+    let cli = Cli::try_parse_from(["aicx", "doctor", "--dry-run", "--migrate-identities"])
+        .expect("dry-run planning combination should parse");
+    match cli.command {
+        Some(Commands::Doctor {
+            dry_run,
+            migrate_identities,
+            apply,
+            ..
+        }) => {
+            assert!(dry_run);
+            assert!(migrate_identities);
+            assert!(!apply);
+        }
+        _ => panic!("expected doctor command"),
+    }
+}
+
+#[test]
 fn store_agent_filter_is_explicit_and_includes_junie() {
     let mut cmd = Cli::command();
     let store = cmd
