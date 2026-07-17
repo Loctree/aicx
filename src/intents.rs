@@ -36,7 +36,7 @@ use self::types::{
 };
 pub use self::types::{
     IntentExtraction, IntentExtractionStats, IntentKind, IntentRecord, IntentsCompleteness,
-    IntentsConfig, MigrationReport,
+    IntentsConfig, MigrationReport, ProjectResolutionScope,
 };
 // Lane 2-5 schema anchor (MASTER Phase 2 §3). Stages land incrementally; these
 // types are the convergence point every lane stage must agree on.

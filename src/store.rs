@@ -12,7 +12,7 @@
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -1774,6 +1774,180 @@ pub fn project_filter_matches(organization: &str, repository: &str, filter: &str
     organization.eq_ignore_ascii_case(filter) || repository.eq_ignore_ascii_case(filter)
 }
 
+/// Project identity matching is exact by default. Family/substring matching
+/// exists only as an explicit opt-in mode on CLI/MCP surfaces.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectMatchMode {
+    #[default]
+    Exact,
+    Fuzzy,
+}
+
+impl ProjectMatchMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Exact => "exact",
+            Self::Fuzzy => "fuzzy",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ProjectIdentityResolution {
+    pub selected: Vec<String>,
+    pub candidates: Vec<String>,
+    pub unresolved_filters: Vec<String>,
+    pub match_mode: ProjectMatchMode,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProjectResolutionError {
+    Ambiguous {
+        filter: String,
+        candidates: Vec<String>,
+    },
+    NoMatch {
+        filters: Vec<String>,
+    },
+}
+
+impl ProjectResolutionError {
+    pub fn candidates(&self) -> &[String] {
+        match self {
+            Self::Ambiguous { candidates, .. } => candidates,
+            Self::NoMatch { .. } => &[],
+        }
+    }
+
+    pub fn filter(&self) -> Option<&str> {
+        match self {
+            Self::Ambiguous { filter, .. } => Some(filter),
+            Self::NoMatch { .. } => None,
+        }
+    }
+
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::Ambiguous { .. } => "ambiguous_project",
+            Self::NoMatch { .. } => "project_not_found",
+        }
+    }
+}
+
+impl std::fmt::Display for ProjectResolutionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ambiguous { filter, candidates } => write!(
+                formatter,
+                "project filter {filter:?} is ambiguous; candidates:\n  - {}\nUse one exact bucket with -p owner/repo.",
+                candidates.join("\n  - ")
+            ),
+            Self::NoMatch { filters } => write!(
+                formatter,
+                "no project matches filter(s): {}\n  accepted forms (case-insensitive): owner/repo (strict), owner/ (org wildcard), /repo (cross-org repo), name (unique exact org or repo); use --project-fuzzy for explicit family matching",
+                filters
+                    .iter()
+                    .map(|filter| format!("{filter:?}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ProjectResolutionError {}
+
+/// Resolve project filters against a complete, topology-independent identity
+/// corpus. Both CLI and MCP pass their discovered identities through this one
+/// function; callers do not select a bucket before ambiguity is assessed.
+///
+/// Exact-mode rules:
+/// - `owner/repo` is case-insensitive slug equality;
+/// - `owner/` and `/repo` are explicit multi-project wildcards;
+/// - a bare name must identify exactly one owner-or-repository identity;
+/// - two or more bare-name candidates fail closed with the full sorted list.
+pub fn resolve_project_identities(
+    filters: &[String],
+    corpus: &[String],
+    match_mode: ProjectMatchMode,
+) -> std::result::Result<ProjectIdentityResolution, ProjectResolutionError> {
+    let identities: Vec<String> = corpus
+        .iter()
+        .map(|identity| identity.trim())
+        .filter(|identity| !identity.is_empty())
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let mut selected = BTreeSet::new();
+    let mut candidates = BTreeSet::new();
+    let mut unresolved_filters = Vec::new();
+
+    for raw_filter in filters {
+        let filter = raw_filter.trim();
+        if filter.is_empty() {
+            unresolved_filters.push(raw_filter.clone());
+            continue;
+        }
+        let matches: Vec<String> = identities
+            .iter()
+            .filter(|identity| project_identity_matches(identity, filter, match_mode))
+            .cloned()
+            .collect();
+        candidates.extend(matches.iter().cloned());
+
+        if matches.is_empty() {
+            unresolved_filters.push(raw_filter.clone());
+            continue;
+        }
+        if match_mode == ProjectMatchMode::Exact && !filter.contains('/') && matches.len() > 1 {
+            return Err(ProjectResolutionError::Ambiguous {
+                filter: raw_filter.clone(),
+                candidates: matches,
+            });
+        }
+        selected.extend(matches);
+    }
+
+    Ok(ProjectIdentityResolution {
+        selected: selected.into_iter().collect(),
+        candidates: candidates.into_iter().collect(),
+        unresolved_filters,
+        match_mode,
+    })
+}
+
+pub fn require_project_resolution(
+    filters: &[String],
+    corpus: &[String],
+    match_mode: ProjectMatchMode,
+) -> std::result::Result<ProjectIdentityResolution, ProjectResolutionError> {
+    let resolution = resolve_project_identities(filters, corpus, match_mode)?;
+    if !filters.is_empty() && !resolution.unresolved_filters.is_empty() {
+        return Err(ProjectResolutionError::NoMatch {
+            filters: resolution.unresolved_filters,
+        });
+    }
+    Ok(resolution)
+}
+
+fn project_identity_matches(identity: &str, filter: &str, match_mode: ProjectMatchMode) -> bool {
+    let (organization, repository) = identity.split_once('/').unwrap_or(("", identity));
+    match match_mode {
+        ProjectMatchMode::Exact => project_filter_matches(organization, repository, filter),
+        ProjectMatchMode::Fuzzy => {
+            let needle = filter.trim_matches('/').trim().to_ascii_lowercase();
+            if needle.is_empty() {
+                return false;
+            }
+            identity.to_ascii_lowercase().contains(&needle)
+                || organization.to_ascii_lowercase().contains(&needle)
+                || repository.to_ascii_lowercase().contains(&needle)
+        }
+    }
+}
+
 /// Resolve user-supplied `-p` filters into canonical `<owner>/<repo>` slugs
 /// by enumerating the on-disk canonical store. Used by `aicx search` and
 /// `aicx index` so a single short name like `-p spotlight-convo-pipeline-v2`
@@ -1822,20 +1996,15 @@ pub fn resolve_filters_to_slugs_at(
             }
             let repository = repository_entry.file_name().to_string_lossy().to_string();
 
-            if filters
-                .iter()
-                .any(|filter| project_filter_matches(&organization, &repository, filter))
-            {
-                let slug = format!("{organization}/{repository}");
-                if !slugs.iter().any(|existing| existing == &slug) {
-                    slugs.push(slug);
-                }
+            let slug = format!("{organization}/{repository}");
+            if !slugs.iter().any(|existing| existing == &slug) {
+                slugs.push(slug);
             }
         }
     }
 
     slugs.sort();
-    Ok(slugs)
+    Ok(resolve_project_identities(filters, &slugs, ProjectMatchMode::Exact)?.selected)
 }
 
 pub fn resolve_filters_to_slugs_at_or_error(
@@ -1845,20 +2014,8 @@ pub fn resolve_filters_to_slugs_at_or_error(
     if filters.is_empty() {
         return Ok(Vec::new());
     }
-    let resolved = resolve_filters_to_slugs_at(canonical_root, filters)?;
-    if resolved.is_empty() {
-        anyhow::bail!(
-            "no project matches filter(s): {}\n  \
-             accepted forms (case-insensitive): owner/repo (strict), \
-             owner/ (org wildcard), /repo (cross-org repo), name (cross-org)",
-            filters
-                .iter()
-                .map(|p| format!("{p:?}"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-    }
-    Ok(resolved)
+    let corpus = canonical_project_identities_at(canonical_root)?;
+    Ok(require_project_resolution(filters, &corpus, ProjectMatchMode::Exact)?.selected)
 }
 
 pub fn resolve_filters_to_store_or_index_slugs_at_or_error(
@@ -1869,74 +2026,58 @@ pub fn resolve_filters_to_store_or_index_slugs_at_or_error(
         return Ok(Vec::new());
     }
 
-    let canonical_root = store_root.join(CANONICAL_STORE_DIRNAME);
-    let mut slugs = std::collections::BTreeSet::new();
-    for slug in resolve_filters_to_slugs_at(&canonical_root, filters)? {
-        slugs.insert(slug);
-    }
-    let indexed_root = store_root.join("indexed");
-    for slug in resolve_filters_to_index_slugs_at(&indexed_root, filters)? {
-        slugs.insert(slug);
-    }
-    if slugs.is_empty() {
-        anyhow::bail!(
-            "no project matches filter(s): {}\n  \
-             accepted forms (case-insensitive): owner/repo (strict), \
-             owner/ (org wildcard), /repo (cross-org repo), name (cross-org)",
-            filters
-                .iter()
-                .map(|p| format!("{p:?}"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-    }
-    Ok(slugs.into_iter().collect())
+    let corpus = project_identities_in_store_or_index_at(store_root)?;
+    Ok(require_project_resolution(filters, &corpus, ProjectMatchMode::Exact)?.selected)
 }
 
+pub fn canonical_project_identities_at(canonical_root: &Path) -> Result<Vec<String>> {
+    if !canonical_root.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut identities = BTreeSet::new();
+    for organization_entry in read_store_dir(canonical_root)?.filter_map(|entry| entry.ok()) {
+        let organization_path = organization_entry.path();
+        if !organization_path.is_dir() {
+            continue;
+        }
+        let organization = organization_entry.file_name().to_string_lossy().to_string();
+        for repository_entry in read_store_dir(&organization_path)?.filter_map(|entry| entry.ok()) {
+            if repository_entry.path().is_dir() {
+                identities.insert(format!(
+                    "{organization}/{}",
+                    repository_entry.file_name().to_string_lossy()
+                ));
+            }
+        }
+    }
+    Ok(identities.into_iter().collect())
+}
+
+pub fn project_identities_in_store_at(store_root: &Path) -> Result<Vec<String>> {
+    let canonical_root = store_root.join(CANONICAL_STORE_DIRNAME);
+    canonical_project_identities_at(&canonical_root)
+}
+
+pub fn project_identities_in_store_or_index_at(store_root: &Path) -> Result<Vec<String>> {
+    let mut identities: BTreeSet<String> = project_identities_in_store_at(store_root)?
+        .into_iter()
+        .collect();
+    identities.extend(project_identities_from_index_at(
+        &store_root.join("indexed"),
+    )?);
+    Ok(identities.into_iter().collect())
+}
+
+#[cfg(test)]
 fn resolve_filters_to_index_slugs_at(
     indexed_root: &Path,
     filters: &[String],
 ) -> Result<Vec<String>> {
-    if !indexed_root.exists() {
-        return Ok(Vec::new());
-    }
-
-    let mut slugs = std::collections::BTreeSet::new();
-    let mut all_bucket: Option<PathBuf> = None;
-    for entry in sanitize::read_dir_validated(indexed_root)
-        .with_context(|| format!("read indexed root {}", indexed_root.display()))?
-    {
-        let entry =
-            entry.with_context(|| format!("read indexed entry in {}", indexed_root.display()))?;
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-        let bucket = entry.file_name().to_string_lossy().to_string();
-        let index_path = path.join("embeddings.ndjson");
-        if bucket == "_all" {
-            all_bucket = Some(index_path);
-            continue;
-        }
-        for slug in project_slugs_from_index_file(&index_path, filters, true)? {
-            slugs.insert(slug);
-        }
-    }
-
-    if let Some(index_path) = all_bucket {
-        for slug in project_slugs_from_index_file(&index_path, filters, false)? {
-            slugs.insert(slug);
-        }
-    }
-
-    Ok(slugs.into_iter().collect())
+    let corpus = project_identities_from_index_at(indexed_root)?;
+    Ok(resolve_project_identities(filters, &corpus, ProjectMatchMode::Exact)?.selected)
 }
 
-fn project_slugs_from_index_file(
-    index_path: &Path,
-    filters: &[String],
-    stop_after_first_match: bool,
-) -> Result<Vec<String>> {
+fn project_slugs_from_index_file(index_path: &Path) -> Result<Vec<String>> {
     if !index_path.exists() {
         return Ok(Vec::new());
     }
@@ -1956,71 +2097,36 @@ fn project_slugs_from_index_file(
         let Some(project) = row.project else {
             continue;
         };
-        if project_slug_matches_filters(project, filters)
-            && !slugs.iter().any(|existing| existing == project)
-        {
+        if !slugs.iter().any(|existing| existing == project) {
             slugs.push(project.to_string());
-            if stop_after_first_match {
-                break;
-            }
         }
     }
     Ok(slugs)
 }
 
+fn project_identities_from_index_at(indexed_root: &Path) -> Result<Vec<String>> {
+    if !indexed_root.exists() {
+        return Ok(Vec::new());
+    }
+    let mut identities = BTreeSet::new();
+    for entry in sanitize::read_dir_validated(indexed_root)
+        .with_context(|| format!("read indexed root {}", indexed_root.display()))?
+    {
+        let entry =
+            entry.with_context(|| format!("read indexed entry in {}", indexed_root.display()))?;
+        if !entry.path().is_dir() {
+            continue;
+        }
+        identities.extend(project_slugs_from_index_file(
+            &entry.path().join("embeddings.ndjson"),
+        )?);
+    }
+    Ok(identities.into_iter().collect())
+}
+
 #[derive(Deserialize)]
 struct ProjectOnlyIndexRow<'a> {
     project: Option<&'a str>,
-}
-
-fn project_slug_matches_filters(project: &str, filters: &[String]) -> bool {
-    let Some((organization, repository)) = project.split_once('/') else {
-        return false;
-    };
-    filters
-        .iter()
-        .any(|filter| project_filter_matches(organization, repository, filter))
-}
-
-/// Detect the "bare-name" ambiguity case described in the `-p name` filter
-/// semantics: a single token like `codex` matches both as an *organization*
-/// (e.g. `codex/foo`) and as a *repository* (e.g. `openai/codex`). The CLI
-/// still resolves the union — this helper just lets the caller warn the
-/// operator so they can disambiguate with `-p name/` or `-p /name` if the
-/// match was unintended.
-///
-/// Returns:
-/// - `None` if the filter is not a bare name, or if it matches in only one
-///   role (org-only or repo-only), or in neither.
-/// - `Some((orgs, repos))` when the filter matches in BOTH roles. `orgs`
-///   are slugs whose owner component equals `filter` (case-insensitive),
-///   `repos` are slugs whose repository component equals `filter`.
-///   Both vecs are non-empty when this returns `Some`.
-pub fn detect_ambiguous_bare_filter(
-    filter: &str,
-    slugs: &[String],
-) -> Option<(Vec<String>, Vec<String>)> {
-    let trimmed = filter.trim();
-    if trimmed.is_empty() || trimmed.contains('/') {
-        return None;
-    }
-    let mut as_org: Vec<String> = Vec::new();
-    let mut as_repo: Vec<String> = Vec::new();
-    for slug in slugs {
-        let Some((org, repo)) = slug.split_once('/') else {
-            continue;
-        };
-        if org.eq_ignore_ascii_case(trimmed) {
-            as_org.push(slug.clone());
-        }
-        if repo.eq_ignore_ascii_case(trimmed) {
-            as_repo.push(slug.clone());
-        }
-    }
-    if as_org.is_empty() || as_repo.is_empty() {
-        return None;
-    }
-    Some((as_org, as_repo))
 }
 
 fn scan_repo_store_filtered(

@@ -503,11 +503,13 @@ pub struct SearchParams {
     /// Max results to return (default: 10)
     #[serde(default = "default_limit")]
     pub limit: usize,
-    /// Optional project filter (case-insensitive substring). Prefer
-    /// `projects` for cross-project search.
+    /// Optional exact project filter. A bare repo name must be unique; prefer
+    /// `projects` for explicit cross-project search.
     pub project: Option<String>,
     /// Optional project filters for cross-project search.
     pub projects: Option<Vec<String>>,
+    /// Project identity matching: `exact` (default) or explicit `fuzzy` family search.
+    pub project_match: Option<String>,
     /// Minimum score threshold (0-100)
     pub score: Option<u8>,
     /// Hours to look back (0 = all time)
@@ -560,13 +562,60 @@ fn default_true() -> bool {
 fn search_project_scopes(
     store_root: &std::path::Path,
     projects: &[String],
-) -> anyhow::Result<Vec<Option<String>>> {
+    match_mode: store::ProjectMatchMode,
+) -> Result<Vec<Option<String>>, McpError> {
     if projects.is_empty() {
         return Ok(vec![None]);
     }
-    let resolved =
-        store::resolve_filters_to_store_or_index_slugs_at_or_error(store_root, projects)?;
-    Ok(resolved.into_iter().map(Some).collect())
+    let resolution = resolve_mcp_projects(store_root, projects, match_mode, true)?;
+    Ok(resolution.selected.into_iter().map(Some).collect())
+}
+
+fn parse_project_match(value: Option<&str>) -> Result<store::ProjectMatchMode, McpError> {
+    match value
+        .unwrap_or("exact")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "exact" => Ok(store::ProjectMatchMode::Exact),
+        "fuzzy" => Ok(store::ProjectMatchMode::Fuzzy),
+        other => Err(McpError::invalid_params(
+            format!("unknown project_match {other:?}; expected exact or fuzzy"),
+            Some(serde_json::json!({
+                "ok": false,
+                "error": "invalid_project_match",
+                "project_match": other,
+                "expected": ["exact", "fuzzy"],
+            })),
+        )),
+    }
+}
+
+fn project_resolution_mcp_error(error: store::ProjectResolutionError) -> McpError {
+    let payload = serde_json::json!({
+        "ok": false,
+        "error": error.kind(),
+        "filter": error.filter(),
+        "candidates": error.candidates(),
+    });
+    McpError::invalid_params(format!("Project filter: {error}"), Some(payload))
+}
+
+fn resolve_mcp_projects(
+    store_root: &std::path::Path,
+    projects: &[String],
+    match_mode: store::ProjectMatchMode,
+    include_index: bool,
+) -> Result<store::ProjectIdentityResolution, McpError> {
+    let corpus = if include_index {
+        store::project_identities_in_store_or_index_at(store_root)
+    } else {
+        store::project_identities_in_store_at(store_root)
+    }
+    .map_err(|error| McpError::internal_error(format!("Store error: {error}"), None))?;
+    store::require_project_resolution(projects, &corpus, match_mode)
+        .map_err(project_resolution_mcp_error)
 }
 
 fn dedup_metadata_by_path(items: &mut Vec<serde_json::Value>) {
@@ -588,6 +637,8 @@ const MAX_SCORE_FILTER: u8 = 100;
 pub struct RankParams {
     /// Project name (required)
     pub project: String,
+    /// Project identity matching: `exact` (default) or explicit `fuzzy` family search.
+    pub project_match: Option<String>,
     /// Hours to look back (default: 72, 0 = all time)
     #[serde(default = "default_rank_hours")]
     pub hours: u64,
@@ -640,6 +691,8 @@ pub struct SteerParams {
     /// Optional project filters for cross-project steering. Each entry uses
     /// the same strict canonical semantics as `project`.
     pub projects: Option<Vec<String>>,
+    /// Project identity matching: `exact` (default) or explicit `fuzzy` family search.
+    pub project_match: Option<String>,
     /// Filter by date (YYYY-MM-DD, or range like 2026-03-20..2026-03-28)
     pub date: Option<String>,
     /// Max results (default: 20)
@@ -674,6 +727,8 @@ pub struct IntentsParams {
     pub project: Option<String>,
     /// Optional project filters for cross-project intent extraction.
     pub projects: Option<Vec<String>>,
+    /// Project identity matching: `exact` (default) or explicit `fuzzy` family search.
+    pub project_match: Option<String>,
     /// Hours to look back (default: 720 = 30 days, 0 = all time). Matches CLI default.
     #[serde(default = "default_intents_hours")]
     pub hours: u64,
@@ -1030,6 +1085,7 @@ impl AicxMcpServer {
         validate_string_len(params.date.as_deref(), 4096, "date")?;
         validate_string_len(params.since.as_deref(), 4096, "since")?;
         validate_string_len(params.until.as_deref(), 4096, "until")?;
+        validate_string_len(params.project_match.as_deref(), 32, "project_match")?;
         validate_string_len(params.sort.as_deref(), 4096, "sort")?;
         if let Some(projects) = &params.projects {
             for (i, p) in projects.iter().enumerate() {
@@ -1064,6 +1120,7 @@ impl AicxMcpServer {
         let query = params.query;
         let limit = params.limit.min(50);
         let strict_semantic = params.strict_semantic;
+        let project_match = parse_project_match(params.project_match.as_deref())?;
         let project = params.project;
         let owned_projects = params
             .projects
@@ -1072,8 +1129,8 @@ impl AicxMcpServer {
             .unwrap_or_else(|| project.clone().into_iter().collect());
         let store_root = store::store_base_dir()
             .map_err(|e| McpError::internal_error(format!("Store error: {e}"), None))?;
-        let project_scopes_owned = search_project_scopes(&store_root, &owned_projects)
-            .map_err(|e| McpError::invalid_params(format!("Project filter: {e}"), None))?;
+        let project_scopes_owned =
+            search_project_scopes(&store_root, &owned_projects, project_match)?;
         let project_scopes: Vec<Option<&str>> = project_scopes_owned
             .iter()
             .map(|scope| scope.as_deref())
@@ -1274,8 +1331,10 @@ impl AicxMcpServer {
         validate_string_len(params.since.as_deref(), 4096, "since")?;
         validate_string_len(params.until.as_deref(), 4096, "until")?;
         validate_string_len(params.sort.as_deref(), 4096, "sort")?;
+        validate_string_len(params.project_match.as_deref(), 32, "project_match")?;
 
-        let project = params.project;
+        let requested_project = params.project;
+        let project_match = parse_project_match(params.project_match.as_deref())?;
         let hours = params.hours;
         let strict = params.strict;
         const MAX_TOP: usize = 1000;
@@ -1287,6 +1346,14 @@ impl AicxMcpServer {
             std::time::SystemTime::now()
                 - std::time::Duration::from_secs(hours.saturating_mul(3600).min(365 * 24 * 3600))
         };
+        let store_root = store::store_base_dir()
+            .map_err(|e| McpError::internal_error(format!("Store error: {e}"), None))?;
+        let resolution = resolve_mcp_projects(
+            &store_root,
+            std::slice::from_ref(&requested_project),
+            project_match,
+            false,
+        )?;
         let mut scored = Vec::new();
 
         let (lo, hi) = if let Some(ref d) = params.since {
@@ -1295,8 +1362,15 @@ impl AicxMcpServer {
             (None, params.until.clone())
         };
 
-        let files = store::context_files_since(cutoff, Some(&project))
-            .map_err(|e| McpError::internal_error(format!("Store error: {e}"), None))?;
+        let mut files = Vec::new();
+        for project in &resolution.selected {
+            files.extend(
+                store::context_files_since(cutoff, Some(project))
+                    .map_err(|e| McpError::internal_error(format!("Store error: {e}"), None))?,
+            );
+        }
+        files.sort_by(|left, right| left.path.cmp(&right.path));
+        files.dedup_by(|left, right| left.path == right.path);
 
         for file in files {
             if file.path.extension().is_none_or(|ext| ext != "md") {
@@ -1386,7 +1460,7 @@ impl AicxMcpServer {
         }
 
         let json = serde_json::to_string(&RankResponse {
-            project,
+            project: resolution.selected.join(","),
             hours,
             strict,
             results: scored.len(),
@@ -1399,7 +1473,7 @@ impl AicxMcpServer {
 
     #[tool(
         name = "aicx_steer",
-        description = "Retrieve chunks by steering metadata. Supports project/projects (strict canonical <organization>/<repository> matching — `vista` does NOT match `vista-portal`; use `owner/repo`, `owner/`, or `/repo` wildcards for explicit scopes), run_id, prompt_id, agent, kind, frame_kind, and date filters."
+        description = "Retrieve chunks by steering metadata. project/projects are exact by default and ambiguous bare names fail with candidates; set project_match=fuzzy explicitly for family search. Supports run_id, prompt_id, agent, kind, frame_kind, and date filters."
     )]
     async fn steer(
         &self,
@@ -1415,6 +1489,7 @@ impl AicxMcpServer {
         validate_string_len(params.date.as_deref(), 4096, "date")?;
         validate_string_len(params.since.as_deref(), 4096, "since")?;
         validate_string_len(params.until.as_deref(), 4096, "until")?;
+        validate_string_len(params.project_match.as_deref(), 32, "project_match")?;
         if let Some(projects) = &params.projects {
             for (i, p) in projects.iter().enumerate() {
                 validate_string_len(Some(p), 4096, &format!("projects[{}]", i))?;
@@ -1435,10 +1510,10 @@ impl AicxMcpServer {
             .clone()
             .filter(|projects| !projects.is_empty())
             .unwrap_or_else(|| params.project.clone().into_iter().collect());
+        let project_match = parse_project_match(params.project_match.as_deref())?;
         let store_root = store::store_base_dir()
             .map_err(|e| McpError::internal_error(format!("Store error: {e}"), None))?;
-        let project_scopes = search_project_scopes(&store_root, &owned_projects)
-            .map_err(|e| McpError::invalid_params(format!("Project filter: {e}"), None))?;
+        let project_scopes = search_project_scopes(&store_root, &owned_projects, project_match)?;
         let mut metadatas = Vec::new();
 
         for project in project_scopes {
@@ -1545,6 +1620,13 @@ impl AicxMcpServer {
     ) -> Result<CallToolResult, McpError> {
         let _request_activity = self.idle_memory.begin_request();
         tracing::info!(target: "mcp.audit", tool_name = "aicx_intents", "mcp tool invoked");
+        validate_string_len(params.project.as_deref(), 4096, "project")?;
+        validate_string_len(params.project_match.as_deref(), 32, "project_match")?;
+        if let Some(projects) = &params.projects {
+            for (index, project) in projects.iter().enumerate() {
+                validate_string_len(Some(project), 4096, &format!("projects[{index}]"))?;
+            }
+        }
         let kind_filter = match params.kind.as_deref() {
             None => None,
             Some(s) => match s.to_lowercase().as_str() {
@@ -1582,9 +1664,23 @@ impl AicxMcpServer {
             .clone()
             .filter(|projects| !projects.is_empty())
             .unwrap_or_else(|| params.project.clone().into_iter().collect());
+        let project_match = parse_project_match(params.project_match.as_deref())?;
+        let store_root = store::store_base_dir()
+            .map_err(|e| McpError::internal_error(format!("Store error: {e}"), None))?;
+        let project_resolution = if owned_projects.is_empty() {
+            store::ProjectIdentityResolution {
+                selected: Vec::new(),
+                candidates: Vec::new(),
+                unresolved_filters: Vec::new(),
+                match_mode: project_match,
+            }
+        } else {
+            resolve_mcp_projects(&store_root, &owned_projects, project_match, false)?
+        };
+        let effective_projects = project_resolution.selected.clone();
 
         let config = IntentsConfig {
-            project: owned_projects.first().cloned().unwrap_or_default(),
+            project: effective_projects.first().cloned().unwrap_or_default(),
             hours: params.hours,
             strict: params.strict,
             min_confidence: params.min_confidence,
@@ -1592,8 +1688,9 @@ impl AicxMcpServer {
             frame_kind: params.frame_kind,
         };
 
-        let extraction = intents::extract_intents_with_stats_for_projects(&config, &owned_projects)
-            .map_err(|e| McpError::internal_error(format!("Extract intents: {e}"), None))?;
+        let extraction =
+            intents::extract_intents_with_stats_for_projects(&config, &effective_projects)
+                .map_err(|e| McpError::internal_error(format!("Extract intents: {e}"), None))?;
         let records = extraction.records;
 
         let limit_capped = params.limit.min(500);
@@ -1615,19 +1712,24 @@ impl AicxMcpServer {
         let body = match params.emit.as_str() {
             "markdown" | "md" => intents::format_intents_markdown(&records),
             _ => {
-                let store_root = store::store_base_dir()
-                    .map_err(|e| McpError::internal_error(format!("Store error: {e}"), None))?;
                 let oracle_status = OracleStatus::canonical_corpus_scan(
                     &store_root,
                     extraction.stats.scanned_count,
                     extraction.stats.candidate_count,
                     extraction.stats.source_paths_verified,
                 );
-                let completeness = extraction.stats.completeness(
-                    Vec::new(),
-                    display.requested_limit,
-                    display.available_before_limit,
-                );
+                let completeness = extraction
+                    .stats
+                    .completeness(
+                        Vec::new(),
+                        display.requested_limit,
+                        display.available_before_limit,
+                    )
+                    .with_project_scope(
+                        project_resolution.match_mode.as_str(),
+                        project_resolution.selected.clone(),
+                        project_resolution.candidates.clone(),
+                    );
                 intents::format_intents_oracle_json_with_completeness(
                     &records,
                     oracle_status,
@@ -1964,18 +2066,84 @@ mod tests {
         McpTransport, RankItem, RankResponse, SearchParams, SteerResponse, background_refresh_args,
         build_mcp_semantic_filters, configured_mcp_session_manager,
         inject_mcp_filter_pushdown_payload, inject_mcp_semantic_fallback_payload,
-        parse_date_filter_mcp, spawn_mcp_session_cleanup, validate_http_auth_policy,
-        validate_score_filter, validate_string_len,
+        parse_date_filter_mcp, parse_project_match, resolve_mcp_projects,
+        spawn_mcp_session_cleanup, validate_http_auth_policy, validate_score_filter,
+        validate_string_len,
     };
     use crate::auth::{AuthConfig, AuthSource};
     use crate::oracle::OracleStatus;
     use clap::ValueEnum as _;
     use rmcp::transport::streamable_http_server::session::SessionManager as _;
     use std::{
+        fs,
         net::{IpAddr, Ipv4Addr},
+        path::PathBuf,
         sync::Arc,
-        time::{Duration, Instant},
+        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
+
+    fn project_store_root(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "aicx-mcp-project-resolver-{label}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ))
+    }
+
+    #[test]
+    fn mcp_project_resolution_fails_closed_with_structured_candidates() {
+        let root = project_store_root("ambiguous");
+        for slug in ["A/vista", "B/vista", "B/vista-portal"] {
+            fs::create_dir_all(root.join("store").join(slug)).expect("create project bucket");
+        }
+
+        let error = resolve_mcp_projects(
+            &root,
+            &["vista".to_string()],
+            crate::store::ProjectMatchMode::Exact,
+            false,
+        )
+        .expect_err("MCP must reject ambiguous bare project");
+        let data = error.data.expect("structured invalid_params data");
+        assert_eq!(data["error"], "ambiguous_project");
+        assert_eq!(data["filter"], "vista");
+        assert_eq!(
+            data["candidates"],
+            serde_json::json!(["A/vista", "B/vista"])
+        );
+
+        fs::remove_dir_all(root).expect("remove MCP resolver fixture");
+    }
+
+    #[test]
+    fn mcp_project_resolution_has_explicit_fuzzy_mode() {
+        let root = project_store_root("fuzzy");
+        for slug in ["B/vista", "B/vista-portal"] {
+            fs::create_dir_all(root.join("store").join(slug)).expect("create project bucket");
+        }
+
+        let exact = resolve_mcp_projects(
+            &root,
+            &["vista".to_string()],
+            parse_project_match(None).unwrap(),
+            false,
+        )
+        .expect("default exact mode");
+        assert_eq!(exact.selected, ["B/vista"]);
+        let fuzzy = resolve_mcp_projects(
+            &root,
+            &["vista".to_string()],
+            parse_project_match(Some("fuzzy")).unwrap(),
+            false,
+        )
+        .expect("explicit fuzzy mode");
+        assert_eq!(fuzzy.selected, ["B/vista", "B/vista-portal"]);
+
+        fs::remove_dir_all(root).expect("remove MCP resolver fixture");
+    }
 
     fn minimal_search_params() -> SearchParams {
         SearchParams {
@@ -1983,6 +2151,7 @@ mod tests {
             limit: 20,
             project: None,
             projects: None,
+            project_match: None,
             score: None,
             hours: None,
             agent: None,
@@ -2376,7 +2545,13 @@ mod tests {
                 "three/aicx".to_string(),
             ],
         };
-        let completeness = stats.completeness(Vec::new(), Some(1), 3);
+        let completeness = stats
+            .completeness(Vec::new(), Some(1), 3)
+            .with_project_scope(
+                "exact",
+                vec!["two/aicx".to_string()],
+                vec!["two/aicx".to_string()],
+            );
         let body = crate::intents::format_intents_oracle_json_with_completeness(
             &records,
             oracle_status,
@@ -2411,6 +2586,15 @@ mod tests {
             serde_json::json!([])
         );
         assert_eq!(payload["completeness"]["limit_saturated"], true);
+        assert_eq!(payload["completeness"]["scope"]["match_mode"], "exact");
+        assert_eq!(
+            payload["completeness"]["scope"]["selected"],
+            serde_json::json!(["two/aicx"])
+        );
+        assert_eq!(
+            payload["completeness"]["scope"]["candidates"],
+            serde_json::json!(["two/aicx"])
+        );
     }
 
     #[test]
