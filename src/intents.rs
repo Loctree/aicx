@@ -280,11 +280,16 @@ fn collect_chunk_files(
         if file.path.extension().and_then(|ext| ext.to_str()) != Some("md") {
             continue;
         }
-        if !file
+        // Keep intents aligned with every other `-p` surface: canonical
+        // owner/repo equality, explicit owner/repo wildcards, and bare-name
+        // equality. Ownerless legacy buckets remain addressable by their repo
+        // name, but an exact owner/repo filter intentionally cannot claim
+        // them (ownerless identity repair is a separate migration concern).
+        let (organization, repository) = file
             .project
-            .to_ascii_lowercase()
-            .contains(&project.to_ascii_lowercase())
-        {
+            .split_once('/')
+            .unwrap_or(("", file.project.as_str()));
+        if !store::project_filter_matches(organization, repository, project) {
             continue;
         }
         let sidecar = store::load_sidecar(&file.path);
