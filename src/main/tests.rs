@@ -391,11 +391,24 @@ fn index_status_routes_through_index_canonical_resolver() {
         ("Vetcoders/Loctree", &["vetcoders_loctree"]),
         // org wildcard
         ("Vetcoders/", &["vetcoders_aicx", "vetcoders_loctree"]),
-        // cross-org repo
+        // cross-org repo (explicit wildcard — selects every org on purpose)
         ("/Loctree", &["sampleorg_loctree", "vetcoders_loctree"]),
-        // bare name (matches as repo name across orgs)
-        ("Loctree", &["sampleorg_loctree", "vetcoders_loctree"]),
     ];
+
+    // World-model fix (F3, P0-4): a bare name with more than one identity
+    // FAILS CLOSED with candidates — it must never fan out across orgs.
+    let bare_error =
+        aicx::store::resolve_filters_to_slugs_at(&canonical_root, &["Loctree".to_string()])
+            .expect_err("bare 'Loctree' with two identities must fail closed");
+    let bare_message = bare_error.to_string();
+    assert!(
+        bare_message.contains("ambiguous"),
+        "fail-closed error must name the ambiguity:\n{bare_message}"
+    );
+    assert!(
+        bare_message.contains("Sampleorg/Loctree") && bare_message.contains("Vetcoders/Loctree"),
+        "fail-closed error must list both candidates:\n{bare_message}"
+    );
 
     for (filter, expected_buckets) in shapes {
         // Step 1: canonical resolver (the shared chokepoint both
