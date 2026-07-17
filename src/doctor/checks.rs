@@ -120,6 +120,38 @@ pub async fn run_at(base: &Path, opts: &DoctorOptions) -> Result<DoctorReport> {
         }
     }
 
+    if opts.migrate_identities {
+        let apply_identities = opts.apply_migrate_identities;
+        match crate::store::migration::run_identity_migration_at(base, apply_identities) {
+            Ok(outcome) => {
+                let prefix = if outcome.applied { "" } else { "[dry-run] " };
+                fixes_applied.push(format!(
+                    "{prefix}identity migration: {} index key rename(s), {} store dir rename(s), {} card alias(es) [annotate-only], {} typo-twin pair(s) [report-only], {} conflict(s)",
+                    outcome.manifest.index_key_renames.len(),
+                    outcome.manifest.dir_renames.len(),
+                    outcome.manifest.card_aliases.len(),
+                    outcome.manifest.typo_twins.len(),
+                    outcome.manifest.conflicts.len(),
+                ));
+                fixes_applied.push(format!(
+                    "identity migration manifest: {}",
+                    outcome.manifest_path.display()
+                ));
+                fixes_applied.push(format!(
+                    "identity migration report: {}",
+                    outcome.report_path.display()
+                ));
+                if !apply_identities {
+                    fixes_applied.push(
+                        "run `aicx doctor --migrate-identities --apply` to execute the planned renames"
+                            .to_string(),
+                    );
+                }
+            }
+            Err(e) => fixes_applied.push(format!("identity migration skipped: {e}")),
+        }
+    }
+
     if apply_empty_bodies {
         match apply_empty_body_quarantine(base) {
             Ok(report) if report.moved_chunks == 0 && report.failures.is_empty() => {
@@ -157,7 +189,11 @@ pub async fn run_at(base: &Path, opts: &DoctorOptions) -> Result<DoctorReport> {
         }
     }
 
-    if opts.rebuild_steer_index || opts.fix_buckets || apply_empty_bodies {
+    if opts.rebuild_steer_index
+        || opts.fix_buckets
+        || apply_empty_bodies
+        || (opts.migrate_identities && opts.apply_migrate_identities)
+    {
         canonical_store = check_canonical_store(base);
         steer_lance = check_steer_lance(base).await;
         steer_bm25 = check_steer_bm25(base);

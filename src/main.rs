@@ -1808,6 +1808,11 @@ enum Commands {
     /// Exit codes: 0 on green/warning or after successful rebuild; 1 if
     /// critical issues are detected without remediation.
     #[command(display_order = 12)]
+    #[command(group(
+        clap::ArgGroup::new("doctor_apply_target")
+            .args(["prune_empty_bodies", "migrate_identities"])
+            .multiple(true)
+    ))]
     Doctor {
         /// Delete and rebuild the steer index from the canonical store
         /// when corrupted or schema-incompatible. Narrower contract than
@@ -1842,8 +1847,20 @@ enum Commands {
         #[arg(long)]
         prune_empty_bodies: bool,
 
-        /// With --prune-empty-bodies, move empty-body chunks into recoverable quarantine
-        #[arg(long, requires = "prune_empty_bodies")]
+        /// Plan the one-time project-identity migration: persisted index.json
+        /// key casing → GitHub nameWithOwner canon (lowercase, the
+        /// fresh-derivation form), store/ directory normalization,
+        /// historical-card alias map (annotate-only, cards never rewritten),
+        /// and a typo-twin bucket report. Dry-run by default — writes
+        /// migration/identity-manifest.json + identity-report.md with zero
+        /// store mutation; add --apply to execute the planned renames.
+        #[arg(long)]
+        migrate_identities: bool,
+
+        /// With --prune-empty-bodies, move empty-body chunks into recoverable
+        /// quarantine. With --migrate-identities, execute the planned
+        /// identity renames.
+        #[arg(long, requires = "doctor_apply_target")]
         apply: bool,
 
         /// Restore files from a quarantine manifest slug.
@@ -2752,6 +2769,7 @@ fn run_command(command: Option<Commands>) -> Result<()> {
             dry_run,
             rebuild_sidecars,
             prune_empty_bodies,
+            migrate_identities,
             apply,
             restore_quarantine,
             yes,
@@ -2777,6 +2795,7 @@ fn run_command(command: Option<Commands>) -> Result<()> {
                 || dry_run
                 || rebuild_sidecars
                 || prune_empty_bodies
+                || migrate_identities
                 || apply
                 || check_dedup
                 || oracle
@@ -2841,7 +2860,9 @@ fn run_command(command: Option<Commands>) -> Result<()> {
                 dry_run,
                 rebuild_sidecars,
                 prune_empty_bodies,
-                apply_prune_empty_bodies: apply,
+                apply_prune_empty_bodies: apply && prune_empty_bodies,
+                migrate_identities,
+                apply_migrate_identities: apply && migrate_identities,
                 check_dedup,
                 verbose,
                 smoke,
@@ -2916,6 +2937,8 @@ fn run_command(command: Option<Commands>) -> Result<()> {
                 rebuild_sidecars: false,
                 prune_empty_bodies: false,
                 apply_prune_empty_bodies: false,
+                migrate_identities: false,
+                apply_migrate_identities: false,
                 check_dedup: false,
                 verbose: true,
                 smoke: false,

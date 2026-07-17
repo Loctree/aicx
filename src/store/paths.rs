@@ -15,6 +15,8 @@ pub const LEGACY_SALVAGE_DIRNAME: &str = "legacy-store";
 const MIGRATION_DIRNAME: &str = "migration";
 const MIGRATION_MANIFEST_FILENAME: &str = "manifest.json";
 const MIGRATION_REPORT_FILENAME: &str = "report.md";
+const IDENTITY_MIGRATION_MANIFEST_FILENAME: &str = "identity-manifest.json";
+const IDENTITY_MIGRATION_REPORT_FILENAME: &str = "identity-report.md";
 const CONFIG_FILENAME: &str = "config.toml";
 const DEFAULT_AICX_DIRNAME: &str = ".aicx";
 
@@ -241,6 +243,14 @@ pub(super) fn migration_manifest_path(base: &Path) -> PathBuf {
 
 pub(super) fn migration_report_path(base: &Path) -> PathBuf {
     migration_dir(base).join(MIGRATION_REPORT_FILENAME)
+}
+
+pub(super) fn identity_migration_manifest_path(base: &Path) -> PathBuf {
+    migration_dir(base).join(IDENTITY_MIGRATION_MANIFEST_FILENAME)
+}
+
+pub(super) fn identity_migration_report_path(base: &Path) -> PathBuf {
+    migration_dir(base).join(IDENTITY_MIGRATION_REPORT_FILENAME)
 }
 
 /// Returns the project directory: `$AICX_HOME/store/<project>/`.

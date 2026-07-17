@@ -2174,9 +2174,23 @@ fn doctor_apply_requires_prune_empty_bodies() {
         _ => panic!("expected doctor command"),
     }
 
+    let cli = Cli::try_parse_from(["aicx", "doctor", "--migrate-identities", "--apply"])
+        .expect("doctor identity apply should parse");
+    match cli.command {
+        Some(Commands::Doctor {
+            migrate_identities,
+            apply,
+            ..
+        }) => {
+            assert!(migrate_identities);
+            assert!(apply);
+        }
+        _ => panic!("expected doctor command"),
+    }
+
     assert!(
         Cli::try_parse_from(["aicx", "doctor", "--apply"]).is_err(),
-        "--apply is only valid as a --prune-empty-bodies modifier"
+        "--apply is only valid as a --prune-empty-bodies / --migrate-identities modifier"
     );
 }
 

@@ -99,6 +99,8 @@ fn test_check_embedder_warmth_without_smoke_returns_skipped() {
         rebuild_sidecars: false,
         prune_empty_bodies: false,
         apply_prune_empty_bodies: false,
+        migrate_identities: false,
+        apply_migrate_identities: false,
         check_dedup: false,
         verbose: false,
         smoke: false,
@@ -521,6 +523,51 @@ fn empty_body_chunks_red_when_over_threshold_and_script_is_reviewable() {
 }
 
 #[test]
+fn migrate_identities_dry_run_reports_plan_without_touching_store() {
+    // SYNTHETIC store shaped after the persisted-casing drift documented in
+    // ~/.aicx/aicx-problems.md (2026-07-17 15:18 UTC).
+    let tmp = unique_test_dir("migrate-identities-dry-run");
+    let dir = tmp.join("store").join("VetCoders").join("CodeScribe");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("payload.md"), "chunk").unwrap();
+
+    let opts = DoctorOptions {
+        migrate_identities: true,
+        ..crate::doctor::cleanup::base_doctor_options(false, false)
+    };
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let report = rt.block_on(run_at(&tmp, &opts)).unwrap();
+
+    assert!(
+        report
+            .fixes_applied
+            .iter()
+            .any(|line| line.starts_with("[dry-run] identity migration:")),
+        "dry-run must be the default: {:?}",
+        report.fixes_applied
+    );
+    assert!(
+        report
+            .fixes_applied
+            .iter()
+            .any(|line| line.contains("--migrate-identities --apply")),
+        "dry-run must hand the operator the apply button: {:?}",
+        report.fixes_applied
+    );
+    // Zero store mutation: the pre-rename casing is still on disk.
+    let names: Vec<String> = std::fs::read_dir(tmp.join("store"))
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(names.contains(&"VetCoders".to_string()), "{names:?}");
+    assert!(tmp.join("migration/identity-manifest.json").is_file());
+    assert!(tmp.join("migration/identity-report.md").is_file());
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
 fn apply_prune_empty_bodies_moves_chunks_to_quarantine_and_rechecks() {
     let tmp = unique_test_dir("apply-empty-bodies");
     let dir = tmp
@@ -553,6 +600,8 @@ fn apply_prune_empty_bodies_moves_chunks_to_quarantine_and_rechecks() {
         rebuild_sidecars: false,
         prune_empty_bodies: true,
         apply_prune_empty_bodies: true,
+        migrate_identities: false,
+        apply_migrate_identities: false,
         check_dedup: false,
         verbose: false,
         smoke: false,
@@ -631,6 +680,8 @@ fn test_doctor_sidecars_and_coverage_share_check_result() {
         rebuild_sidecars: false,
         prune_empty_bodies: false,
         apply_prune_empty_bodies: false,
+        migrate_identities: false,
+        apply_migrate_identities: false,
         check_dedup: false,
         verbose: false,
         smoke: false,

@@ -22,6 +22,7 @@ use crate::timeline::TimelineEntry;
 // ============================================================================
 // Migration
 mod cards_v2;
+mod identity;
 mod report;
 mod source_locator;
 mod types;
@@ -29,6 +30,7 @@ mod types;
 pub use cards_v2::{
     CardsV2Action, CardsV2Item, CardsV2Manifest, CardsV2Totals, run_cards_v2_migration,
 };
+pub use identity::run_identity_migration_at;
 use report::{print_migration_summary, render_migration_report};
 pub(crate) use source_locator::SourceLocator;
 use source_locator::SourceLookupOutcome;

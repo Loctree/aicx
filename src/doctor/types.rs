@@ -25,6 +25,11 @@ pub struct DoctorOptions {
     pub rebuild_sidecars: bool,
     pub prune_empty_bodies: bool,
     pub apply_prune_empty_bodies: bool,
+    /// Plan the one-time project-identity migration (persisted casing +
+    /// typo-twin report). Dry-run by default; `apply_migrate_identities`
+    /// executes the planned index-key and store-directory renames.
+    pub migrate_identities: bool,
+    pub apply_migrate_identities: bool,
     pub check_dedup: bool,
     pub verbose: bool,
     pub smoke: bool,
