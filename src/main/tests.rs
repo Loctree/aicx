@@ -616,10 +616,10 @@ fn session_id_table_value_preserves_full_id() {
 }
 
 #[test]
-fn sessions_table_project_uses_canonical_repo_identity() {
-    let info = session_info("aicx", "/Users/tester/hosted/Loctree/aicx");
+fn sessions_table_project_uses_persisted_session_identity() {
+    let info = session_info("archive/old", "/Users/tester/hosted/archive/new");
 
-    assert_eq!(session_project_label(&info), "Loctree/aicx");
+    assert_eq!(session_project_label(&info), "archive/old");
 }
 
 #[test]
@@ -940,6 +940,10 @@ fn intents_json_envelope_reports_cap_skipped_identities_and_limit_saturation() {
         "not_verified_by_aicx"
     );
     assert_eq!(payload["completeness"]["complete"], false);
+    assert_eq!(
+        payload["completeness"]["identity_source"],
+        "project-bucket-v1"
+    );
     assert_eq!(payload["completeness"]["candidate_cap"], 5_000);
     assert_eq!(payload["completeness"]["candidate_cap_reached"], true);
     assert_eq!(

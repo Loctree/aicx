@@ -2544,6 +2544,7 @@ mod tests {
                 "two/aicx".to_string(),
                 "three/aicx".to_string(),
             ],
+            identity_source: crate::intents::PERSISTED_IDENTITY_SOURCE.to_string(),
         };
         let completeness = stats
             .completeness(Vec::new(), Some(1), 3)
@@ -2586,6 +2587,10 @@ mod tests {
             serde_json::json!([])
         );
         assert_eq!(payload["completeness"]["limit_saturated"], true);
+        assert_eq!(
+            payload["completeness"]["identity_source"],
+            crate::intents::PERSISTED_IDENTITY_SOURCE
+        );
         assert_eq!(payload["completeness"]["scope"]["match_mode"], "exact");
         assert_eq!(
             payload["completeness"]["scope"]["selected"],
