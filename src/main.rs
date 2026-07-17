@@ -5249,8 +5249,21 @@ fn run_conversations_batch(options: ConversationsBatchOptions) -> Result<()> {
 
     let batch = sources::extract_agent_sessions(aicx::session_catalog::AgentKind::Claude, &config)?;
     emit_session_batch_summary("claude", &batch);
-    if batch.selected_sessions > 0 && batch.ingested_sessions == 0 {
-        anyhow::bail!("all selected Claude sessions were skipped; see per-session diagnostics");
+    // Unified all-skipped contract (O4): every batch surface exits 3 when
+    // every selected session was skipped by diagnostics, with the same
+    // condition as `run_extraction`/`run_store` (`skipped == selected`;
+    // `-p`-filtered sessions live outside `selected`). An empty window
+    // stays exit 0.
+    if batch.selected_sessions > 0
+        && batch.ingested_sessions == 0
+        && batch.skipped.len() == batch.selected_sessions
+    {
+        eprintln!(
+            "all {} selected session(s) were skipped; no invalid session was ingested",
+            batch.selected_sessions
+        );
+        eprintln!("  hint: inspect the per-session recover hints above");
+        std::process::exit(3);
     }
     let entries = batch.entries;
 

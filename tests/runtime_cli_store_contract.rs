@@ -1412,6 +1412,70 @@ fn session_batch_returns_exit_three_when_every_session_is_quarantined() {
 }
 
 #[test]
+fn conversations_batch_all_skipped_exits_three_like_other_batches() {
+    // O4 (transplant P3-01): three divergent all-skipped paths — the
+    // conversations batch used a generic bail (exit 1) while extraction
+    // and store batches exit 3. One contract: all-skipped → exit 3.
+    let root = unique_test_dir("conversations-all-skipped");
+    let home = root.join("home");
+    let out_dir = root.join("out");
+    let invalid = home
+        .join(".claude")
+        .join("projects")
+        .join("project")
+        .join("77777777-7777-4777-8777-777777777777.jsonl");
+    write_claude_session_fixture(&invalid, None, "identity-free prompt");
+
+    let output = run_aicx(
+        &home,
+        &[
+            "conversations",
+            "-H",
+            "24",
+            "--out-dir",
+            out_dir.to_str().expect("utf-8 out dir"),
+        ],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "all-skipped conversations batch must exit 3\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("all 1 selected session(s) were skipped"));
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn conversations_batch_empty_window_exits_zero() {
+    // Empty discovery window is an empty result, not a failure.
+    let root = unique_test_dir("conversations-empty-window");
+    let home = root.join("home");
+    let out_dir = root.join("out");
+
+    let output = run_aicx(
+        &home,
+        &[
+            "conversations",
+            "-H",
+            "24",
+            "--out-dir",
+            out_dir.to_str().expect("utf-8 out dir"),
+        ],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "empty window must exit 0\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
 fn project_filter_narrows_batch_discovery() {
     // O1 (`~/.aicx/aicx-problems.md` 2026-07-17 15:12 UTC): `aicx claude -p X`
     // promises "narrows session discovery before repo segmentation", but batch

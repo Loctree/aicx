@@ -828,3 +828,11 @@ See: [vibecrafted.io](https://vibecrafted.io/)
 - `0` on success.
 - `1` on errors (invalid args, IO failures, runtime errors).
 - `--help` and `--version` exit `0`.
+
+### Batch ingest surfaces (`aicx claude|codex|gemini|junie|grok|all|store|conversations`)
+
+| Condition | Exit | Meaning |
+|---|---|---|
+| `selected == 0` (empty window, or every discovered session cut by `-p/--project`) | `0` | Empty result, not a failure. `-p`-filtered sessions are counted separately as `filtered_out` and never enter `selected`. |
+| `selected > 0 && ingested == 0 && skipped == selected` (all-skipped) | `3` | Every selected session was refused by per-session diagnostics; inspect the `recover:` hints. Watermarks are held so skipped sessions stay eligible for retry. |
+| `ingested > 0` (partial or full success) | `0` | Per-session skips are reported on stderr but do not fail the batch. |
