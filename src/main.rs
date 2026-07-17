@@ -4083,6 +4083,7 @@ const DEFAULT_INTENTS_PACK_LIMIT: usize = 20;
 struct IntentsProjectResolution {
     projects: Vec<String>,
     unresolved_filters: Vec<String>,
+    skipped_project_buckets: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4136,6 +4137,7 @@ fn resolve_intents_project_filters_at(
         return Ok(IntentsProjectResolution {
             projects: Vec::new(),
             unresolved_filters: Vec::new(),
+            skipped_project_buckets: Vec::new(),
         });
     }
 
@@ -4149,18 +4151,39 @@ fn resolve_intents_project_filters_at(
 
     let mut resolved = BTreeSet::new();
     let mut unresolved = Vec::new();
+    let mut skipped_project_buckets = BTreeSet::new();
     for filter in projects {
+        // Resolver ambiguity is intentionally unchanged in this cut. Measure
+        // the identities a strict bare-name/wildcard filter could address so
+        // an earlier resolver stage selecting one bucket cannot silently hide
+        // the others from the JSON completeness envelope.
+        let addressable: BTreeSet<String> = slugs
+            .iter()
+            .filter(|slug| {
+                split_slug(slug)
+                    .is_some_and(|(org, repo)| store::project_filter_matches(org, repo, filter))
+            })
+            .cloned()
+            .collect();
         let matches = resolve_single_intents_project_filter(filter, &slugs, sessions, cwd)?;
         if matches.is_empty() {
             unresolved.push(filter.clone());
         } else {
+            let selected: BTreeSet<&str> = matches.iter().map(String::as_str).collect();
+            skipped_project_buckets.extend(
+                addressable
+                    .into_iter()
+                    .filter(|slug| !selected.contains(slug.as_str())),
+            );
             resolved.extend(matches);
         }
     }
 
+    skipped_project_buckets.retain(|slug| !resolved.contains(slug));
     Ok(IntentsProjectResolution {
         projects: resolved.into_iter().collect(),
         unresolved_filters: unresolved,
+        skipped_project_buckets: skipped_project_buckets.into_iter().collect(),
     })
 }
 
@@ -4588,11 +4611,21 @@ fn run_intents(
         limit: filters.limit,
     };
 
-    let mut records = intents::apply_display_filters(records, &display_filters);
+    // Apply all narrowing except the final result limit first so the envelope
+    // can report how many records existed before truncation. This also keeps
+    // deferred `--kind + --unresolved` filtering inside the measured set.
+    let requested_limit = display_filters.limit;
+    let mut unbounded_display_filters = display_filters.clone();
+    unbounded_display_filters.limit = None;
+    let mut records = intents::apply_display_filters(records, &unbounded_display_filters);
 
     // F2: re-apply the kind filter we deferred so `--unresolved` could see Outcomes.
     if let Some(k) = post_kind {
         records.retain(|r| r.kind == k);
+    }
+    let available_before_limit = records.len();
+    if let Some(limit) = requested_limit {
+        records.truncate(limit);
     }
 
     if records.is_empty() && emit != "json" {
@@ -4620,7 +4653,16 @@ fn run_intents(
                 extraction.stats.candidate_count,
                 extraction.stats.source_paths_verified,
             );
-            let json = intents::format_intents_oracle_json(&records, oracle_status)?;
+            let completeness = extraction.stats.completeness(
+                project_resolution.skipped_project_buckets,
+                requested_limit,
+                available_before_limit,
+            );
+            let json = intents::format_intents_oracle_json_with_completeness(
+                &records,
+                oracle_status,
+                completeness,
+            )?;
             println!("{}", json);
         }
         _ => {
