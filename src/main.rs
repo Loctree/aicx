@@ -4387,7 +4387,7 @@ fn run_intents(
             );
             let completeness = extraction
                 .stats
-                .completeness(Vec::new(), requested_limit, available_before_limit)
+                .completeness(requested_limit, available_before_limit)
                 .with_project_scope(
                     project_resolution.match_mode.as_str(),
                     project_resolution.selected.clone(),

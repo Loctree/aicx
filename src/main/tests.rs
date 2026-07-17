@@ -856,10 +856,33 @@ fn intents_project_resolver_exact_and_fuzzy_modes_are_separate() {
 
     assert!(exact.to_string().contains("no project matches"));
     assert_eq!(fuzzy.selected, ["Loctree/ScreenScribe-dev"]);
+
+    let stats = intents::IntentExtractionStats {
+        scanned_count: 1,
+        candidate_count: 1,
+        source_paths_verified: true,
+        candidate_cap: 5_000,
+        dropped_candidates: 0,
+        dropped_task_events: 0,
+        matched_project_buckets: fuzzy.selected.clone(),
+        identity_source: intents::PERSISTED_IDENTITY_SOURCE.to_string(),
+        path_heuristic_records: 0,
+    };
+    let complete = stats.completeness(None, 1);
+    assert_eq!(
+        serde_json::to_value(&complete).expect("serialize empty warnings")["warnings"],
+        serde_json::json!([])
+    );
+    let fuzzy_complete = complete.with_project_scope(
+        fuzzy.match_mode.as_str(),
+        fuzzy.selected.clone(),
+        fuzzy.candidates.clone(),
+    );
+    assert_eq!(fuzzy_complete.warnings, ["fuzzy project matching active"]);
 }
 
 #[test]
-fn intents_json_envelope_reports_cap_skipped_identities_and_limit_saturation() {
+fn intents_json_envelope_reports_cap_warning_and_limit_saturation() {
     let root = unique_test_dir("intents-completeness-envelope");
     let _ = fs::remove_dir_all(&root);
     write_store_chunk(&root, "one/vista", "2026_0717", "one");
@@ -915,11 +938,7 @@ fn intents_json_envelope_reports_cap_skipped_identities_and_limit_saturation() {
     );
     let completeness = extraction
         .stats
-        .completeness(
-            Vec::new(),
-            display.requested_limit,
-            display.available_before_limit,
-        )
+        .completeness(display.requested_limit, display.available_before_limit)
         .with_project_scope(
             resolution.match_mode.as_str(),
             resolution.selected.clone(),
@@ -954,9 +973,17 @@ fn intents_json_envelope_reports_cap_skipped_identities_and_limit_saturation() {
         payload["completeness"]["matched_project_buckets"],
         serde_json::json!(["two/vista"])
     );
-    assert_eq!(
-        payload["completeness"]["skipped_project_buckets"],
-        serde_json::json!([])
+    assert!(
+        payload["completeness"]
+            .as_object()
+            .is_some_and(|value| !value.contains_key("skipped_project_buckets"))
+    );
+    assert!(
+        payload["completeness"]["warnings"]
+            .as_array()
+            .is_some_and(|warnings| warnings.iter().any(|warning| warning
+                .as_str()
+                .is_some_and(|warning| warning.starts_with("candidate cap of 5000 reached;"))))
     );
     assert_eq!(payload["completeness"]["requested_limit"], 100);
     assert!(
@@ -975,6 +1002,26 @@ fn intents_json_envelope_reports_cap_skipped_identities_and_limit_saturation() {
         serde_json::json!(["two/vista"])
     );
     assert_eq!(payload["results"], 100);
+
+    let mut legacy_completeness = payload["completeness"].clone();
+    let legacy_object = legacy_completeness
+        .as_object_mut()
+        .expect("completeness object");
+    legacy_object.insert(
+        "skipped_project_buckets".to_string(),
+        serde_json::json!(["retired/field"]),
+    );
+    legacy_object.remove("warnings");
+    let decoded: intents::IntentsCompleteness = serde_json::from_value(legacy_completeness)
+        .expect("old completeness payload remains readable");
+    assert!(decoded.warnings.is_empty());
+    let reserialized = serde_json::to_value(decoded).expect("reserialize completeness");
+    assert!(
+        reserialized
+            .as_object()
+            .is_some_and(|value| !value.contains_key("skipped_project_buckets"))
+    );
+    assert_eq!(reserialized["warnings"], serde_json::json!([]));
 
     fs::remove_dir_all(root).expect("remove completeness corpus");
 }

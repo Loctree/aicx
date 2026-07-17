@@ -120,6 +120,11 @@ pub(crate) fn extract_intents_from_root_at_with_stats(
         PERSISTED_IDENTITY_SOURCE
     }
     .to_string();
+    let path_heuristic_sources: BTreeSet<String> = files
+        .iter()
+        .filter(|file| file.identity_source == PATH_HEURISTIC_IDENTITY_SOURCE)
+        .map(|file| file.path.to_string_lossy().into_owned())
+        .collect();
 
     let mut candidates = Vec::new();
     let mut task_events = Vec::new();
@@ -187,6 +192,10 @@ pub(crate) fn extract_intents_from_root_at_with_stats(
     reconcile_session_id_with_path(&mut records);
 
     sort_intent_records(&mut records);
+    let path_heuristic_records = records
+        .iter()
+        .filter(|record| path_heuristic_sources.contains(&record.source_chunk))
+        .count();
 
     let stats = IntentExtractionStats {
         scanned_count,
@@ -197,6 +206,7 @@ pub(crate) fn extract_intents_from_root_at_with_stats(
         dropped_task_events,
         matched_project_buckets,
         identity_source,
+        path_heuristic_records,
     };
 
     Ok(IntentExtraction { records, stats })
@@ -219,6 +229,7 @@ pub(crate) fn extract_intents_from_root_at_for_projects_with_stats(
     let mut dropped_task_events = 0usize;
     let mut matched_project_buckets = BTreeSet::new();
     let mut identity_source = PERSISTED_IDENTITY_SOURCE.to_string();
+    let mut path_heuristic_records = 0usize;
 
     for project in projects {
         let mut scoped = config.clone();
@@ -229,6 +240,7 @@ pub(crate) fn extract_intents_from_root_at_for_projects_with_stats(
         dropped_candidates += extraction.stats.dropped_candidates;
         dropped_task_events += extraction.stats.dropped_task_events;
         matched_project_buckets.extend(extraction.stats.matched_project_buckets);
+        path_heuristic_records += extraction.stats.path_heuristic_records;
         if extraction.stats.identity_source == PATH_HEURISTIC_IDENTITY_SOURCE {
             identity_source = PATH_HEURISTIC_IDENTITY_SOURCE.to_string();
         }
@@ -247,6 +259,7 @@ pub(crate) fn extract_intents_from_root_at_for_projects_with_stats(
         dropped_task_events,
         matched_project_buckets: matched_project_buckets.into_iter().collect(),
         identity_source,
+        path_heuristic_records,
     };
 
     Ok(IntentExtraction { records, stats })
