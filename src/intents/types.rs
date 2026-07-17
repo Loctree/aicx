@@ -91,6 +91,7 @@ pub struct IntentExtractionStats {
     pub dropped_candidates: usize,
     pub dropped_task_events: usize,
     pub matched_project_buckets: Vec<String>,
+    pub identity_source: String,
 }
 
 /// Machine-readable honesty about whether an intents payload is exhaustive.
@@ -114,6 +115,7 @@ pub struct IntentsCompleteness {
     pub dropped_task_events: usize,
     pub matched_project_buckets: Vec<String>,
     pub skipped_project_buckets: Vec<String>,
+    pub identity_source: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub requested_limit: Option<usize>,
     pub available_before_limit: usize,
@@ -159,6 +161,7 @@ impl IntentExtractionStats {
             dropped_task_events: self.dropped_task_events,
             matched_project_buckets: self.matched_project_buckets.clone(),
             skipped_project_buckets,
+            identity_source: self.identity_source.clone(),
             requested_limit,
             available_before_limit,
             limit_saturated,
@@ -179,6 +182,7 @@ pub(super) struct StoredChunkFile {
     pub(super) date: String,
     pub(super) path: PathBuf,
     pub(super) project: String,
+    pub(super) identity_source: String,
     pub(super) sequence: u32,
     pub(super) timestamp: DateTime<Utc>,
     pub(super) session_id: String,

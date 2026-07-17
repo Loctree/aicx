@@ -3820,13 +3820,7 @@ fn session_id_table_value(id: &str) -> String {
 }
 
 fn session_project_label(session: &sessions::SessionInfo) -> String {
-    session
-        .repo_path
-        .as_deref()
-        .and_then(|path| aicx::parser::segmentation::infer_tiered_identity_from_cwd(Some(path)))
-        .map(|tiered| tiered.identity.slug())
-        .or_else(|| session.project.clone())
-        .unwrap_or_else(|| "-".to_string())
+    session.project.clone().unwrap_or_else(|| "-".to_string())
 }
 
 fn compact_repo_path(path: &str) -> String {

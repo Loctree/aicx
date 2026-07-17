@@ -13,28 +13,6 @@ fn project_filter_matches_identity(
             .any(|filter| project_filter_matches(organization, repository, filter))
 }
 
-/// Detect Windows-style absolute paths so Tier 1 canonical resolution
-/// also fires for `C:\Users\...` / `C:/Users/...` / UNC `\\server\share`
-/// shapes. Without this, Windows local checkouts where the canonical
-/// `(owner, repository)` lives only in `.git/config` (not in path
-/// segments) silently fall through to Tier 3 segment-adjacency matching
-/// and `-p owner/repo` filters cannot reach them.
-///
-/// Surfaced by `chatgpt-codex-connector` P1 on PR #8 at src/sources.rs:1069.
-pub(crate) fn is_windows_absolute_path(s: &str) -> bool {
-    let bytes = s.as_bytes();
-    // Drive-letter form: `C:\…` or `C:/…` (`X:` for any ASCII letter).
-    if bytes.len() >= 3
-        && bytes[0].is_ascii_alphabetic()
-        && bytes[1] == b':'
-        && (bytes[2] == b'\\' || bytes[2] == b'/')
-    {
-        return true;
-    }
-    // UNC form: `\\server\share…`.
-    s.starts_with("\\\\")
-}
-
 fn canonical_project_parts(value: &str) -> Option<(String, String)> {
     let trimmed = value.trim();
     if trimmed.is_empty()
@@ -61,83 +39,35 @@ fn canonical_project_parts(value: &str) -> Option<(String, String)> {
     Some((organization.to_string(), repository.to_string()))
 }
 
-/// Check if any project filter matches the given path or canonical identity.
+/// Check an ingest-time path hint or already-persisted canonical identity.
 ///
 /// Resolution tiers (in order):
 ///
-/// 1. **Canonical identity from `aicx_parser::segmentation::infer_tiered_identity_from_cwd`**
-///    — consults `cwd`'s `.git/config` remote URL, then known-layout
-///    heuristics, then URL-shape inference. This is the **ground truth**
-///    resolver, the same one `semantic_segments` uses to bucket entries.
-/// 2. **Literal `owner/repo` canonical string** — for inputs that are
+/// 1. **Literal `owner/repo` canonical string** — for inputs that are
 ///    already a slash-shaped slug (not a path).
-/// 3. **Strict adjacent path segments** — `owner/repo` requires both
+/// 2. **Strict adjacent path segments** — `owner/repo` requires both
 ///    segments to appear adjacent in the path. `owner/` matches any
 ///    occurrence of `owner`. `/repo` matches any occurrence of `repo`.
 ///    Bare `name` matches any segment equal to `name`.
 ///
-/// The previous "tier 3 relax" (path's last segment equals filter's
+/// The previous last-segment relax (path's last segment equals filter's
 /// repo, even when the owner is absent from the path) is **gone**.
 /// It caused the cross-org leak flagged by `chatgpt-codex-connector` P1
-/// on PR #8 (filter `Loctree/aicx` matched `/.../Vetcoders/aicx`).
-/// The original bug #14 workflow (`-p Loctree/aicx` against
-/// `/Users/user/Git/aicx`) now travels through Tier 1: when the local
-/// path has a `.git/config` pointing at `github.com/Loctree/aicx`, the
-/// canonical resolver returns `(Loctree, aicx)` and the filter matches
-/// honestly — by ground truth, not by path-noise heuristic. For paths
-/// with no resolvable canonical identity (no `.git`, no URL shape, no
-/// known layout), `-p owner/repo` requires strict adjacency.
+/// on PR #8 (filter `Loctree/aicx` matched `/.../Vetcoders/aicx`). Query
+/// paths do not call this helper: their ground truth is the project identity
+/// persisted when the card was ingested. In particular, this function never
+/// opens `.git/config` or re-derives historical identity from a live checkout.
 pub(crate) fn project_filter_matches_path(cwd: &str, filters: &[String]) -> bool {
     if filters.is_empty() {
         return true;
     }
 
-    // Tier 1: ground-truth canonical resolver (git remote → known layout
-    // → URL shape). Same machinery `semantic_segments` uses to bucket
-    // entries, so the filter and the bucketer cannot disagree.
-    //
-    // We only invoke Tier 1 when the cwd LOOKS LIKE A REAL CWD — an
-    // absolute path, a `~/...` home-relative path, or a URL shape. For
-    // anything else (relative path strings, encoded Claude dir names,
-    // bare segments) Tier 1's internal `discover_git_root` would walk
-    // ancestors that resolve relative to the *test runner's own cwd*,
-    // spuriously locking onto the running process's `.git` and
-    // reporting THAT remote's identity. Guarding here is cheaper and
-    // honester than patching `discover_git_root` at the parser layer.
-    let cwd_trimmed = cwd.trim();
-    // Windows-shape admission is gated behind `cfg!(windows)`. On
-    // non-Windows runners, `Path::ancestors()` over a `C:\...` string
-    // resolves the empty trailing component against the test process's
-    // own cwd and spuriously locks onto the running git remote — the
-    // same Tier-1 leak `resolvable_shape` was designed to prevent for
-    // unanchored relative paths. Gating by compile-time platform keeps
-    // Windows local-checkout matching (codex P1 src/sources.rs:1069)
-    // honest on Windows runners while non-Windows runners cleanly fall
-    // through to Tier 3 segment matching.
-    let resolvable_shape = cwd_trimmed.starts_with('/')
-        || cwd_trimmed.starts_with('~')
-        || cwd_trimmed.starts_with("http://")
-        || cwd_trimmed.starts_with("https://")
-        || cwd_trimmed.starts_with("git@")
-        || cwd_trimmed.starts_with("ssh://")
-        || cwd_trimmed.starts_with("git://")
-        || (cfg!(windows) && is_windows_absolute_path(cwd_trimmed));
-    if resolvable_shape
-        && let Some(tiered) = aicx_parser::segmentation::infer_tiered_identity_from_cwd(Some(cwd))
-    {
-        return project_filter_matches_identity(
-            &tiered.identity.organization,
-            &tiered.identity.repository,
-            filters,
-        );
-    }
-
-    // Tier 2: cwd is already a literal `owner/repo` slug (not a path).
+    // Tier 1: the caller already has a persisted `owner/repo` slug.
     if let Some((organization, repository)) = canonical_project_parts(cwd) {
         return project_filter_matches_identity(&organization, &repository, filters);
     }
 
-    // Tier 3: strict path-segment matching, no last-segment relax.
+    // Tier 2: legacy ingest path fallback, strict and filesystem-free.
     let path_segments: Vec<String> = cwd
         .split(['/', '\\'])
         .map(str::trim)
@@ -176,11 +106,9 @@ pub(crate) fn project_filter_matches_path(cwd: &str, filters: &[String]) -> bool
             if parts.next().is_some() {
                 return false;
             }
-            // Strict adjacency — no last-segment relax. Cross-org leak
-            // (filter `Loctree/aicx` matching `/.../Vetcoders/aicx`)
-            // is impossible in this branch. For a local checkout to
-            // match by canonical identity, Tier 1 must resolve it via
-            // `.git/config` remote URL.
+            // Strict adjacency — no last-segment relax. Cross-org leakage
+            // (filter `Loctree/aicx` matching `/.../Vetcoders/aicx`) is
+            // impossible and no live remote is consulted.
             return path_segments
                 .windows(2)
                 .any(|pair| pair[0] == owner && pair[1] == repo);
