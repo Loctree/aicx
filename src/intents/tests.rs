@@ -515,13 +515,57 @@ fn user_question_and_why_lines_bridge_into_main_intents_view() {
 
 #[test]
 fn md_radar_style_user_messages_surface_in_main_intents_view() {
-    let extraction = extract_demo_extraction(
-        "md-radar-natural-human-lines",
+    let root = migration_test_root("md-radar-natural-human-lines");
+    let _ = fs::remove_dir_all(&root);
+    let directory = root
+        .join("store")
+        .join("example-org")
+        .join("md-radar")
+        .join("2026_0615")
+        .join("conversations")
+        .join("codex");
+    fs::create_dir_all(&directory).expect("create canonical md-radar bucket");
+    let chunk = directory.join(crate::store::session_basename(
+        "2026-06-15",
+        "codex",
+        "md-radar-intentstest",
+        1,
+    ));
+    fs::write(
+        &chunk,
         "[project: example-org/md-radar | agent: codex | date: 2026-06-15 | frame_kind: user_msg]\n\n\
          [12:00:00] user: Proszę odpal /vc-init na tym repo i ustal, gdzie zaczęła się wcześniejsza sesja.\n\
          [12:01:00] user: Czy AICX umie wyciągać intents z JSONL?\n\
          [12:02:00] user: Usuń hardkody i ścieżki z README, bo to ma być gotowe dla świeżego repo.\n",
+    )
+    .expect("write md-radar card");
+    write_sidecar(
+        &chunk,
+        "example-org/md-radar",
+        "codex",
+        "2026-06-15",
+        "md-radar-intentstest",
+        Some(FrameKind::UserMsg),
     );
+    let extraction = extract_intents_from_root_at_with_stats(
+        &IntentsConfig {
+            project: "example-org/md-radar".to_string(),
+            hours: 24 * 365,
+            strict: false,
+            min_confidence: None,
+            kind_filter: None,
+            frame_kind: None,
+        },
+        &root,
+        DateTime::<Utc>::from_naive_utc_and_offset(
+            NaiveDate::from_ymd_opt(2026, 7, 17)
+                .expect("date")
+                .and_hms_opt(13, 0, 0)
+                .expect("time"),
+            Utc,
+        ),
+    )
+    .expect("extract md-radar intents");
 
     assert!(
         extraction.stats.scanned_count == 1,
@@ -531,6 +575,7 @@ fn md_radar_style_user_messages_surface_in_main_intents_view() {
         extraction.stats.candidate_count >= 3,
         "md-radar-style user messages produced no candidates: {extraction:?}"
     );
+    assert_eq!(extraction.stats.identity_source, PERSISTED_IDENTITY_SOURCE);
 
     let records = extraction.records;
     assert!(
@@ -556,6 +601,7 @@ fn md_radar_style_user_messages_surface_in_main_intents_view() {
         }),
         "human cleanup request disappeared from Lane 1: {records:?}"
     );
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -1485,6 +1531,7 @@ fn build_candidate_threads_sidecar_honesty_into_record() {
         date: "2026-07-02".to_string(),
         path: PathBuf::from("chunk.md"),
         project: "aicx".to_string(),
+        identity_source: PERSISTED_IDENTITY_SOURCE.to_string(),
         sequence: 1,
         timestamp: Utc::now(),
         session_id: "sess-b2".to_string(),
@@ -3379,6 +3426,7 @@ mod flexible_dates {
             date: "2026-06-12".to_string(),
             path: PathBuf::from("chunk.md"),
             project: "aicx".to_string(),
+            identity_source: PERSISTED_IDENTITY_SOURCE.to_string(),
             sequence: 1,
             timestamp: Utc::now(),
             session_id: "sess-1".to_string(),
@@ -3433,6 +3481,7 @@ mod flexible_dates {
             date: "2026-06-21".to_string(),
             path: PathBuf::from("chunk.md"),
             project: "aicx".to_string(),
+            identity_source: PERSISTED_IDENTITY_SOURCE.to_string(),
             sequence: 1,
             timestamp: Utc::now(),
             session_id: "sess-gate".to_string(),
@@ -3660,6 +3709,7 @@ Update Cargo.lock dependencies\n";
             date: "2026-06-21".to_string(),
             path: PathBuf::from("chunk.md"),
             project: "aicx".to_string(),
+            identity_source: PERSISTED_IDENTITY_SOURCE.to_string(),
             sequence: 1,
             timestamp: Utc::now(),
             session_id: "sess-code".to_string(),
@@ -3940,6 +3990,7 @@ Results:
             date: "2026-06-12".to_string(),
             path: PathBuf::from("chunk.md"),
             project: "aicx".to_string(),
+            identity_source: PERSISTED_IDENTITY_SOURCE.to_string(),
             sequence: 1,
             timestamp: Utc::now(),
             session_id: "sess-1".to_string(),
