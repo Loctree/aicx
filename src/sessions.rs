@@ -1332,22 +1332,22 @@ mod tests {
         // The project dir encodes cwd with '/'->'-'; a real hyphen (vc-workspace)
         // must NOT be mis-pruned by a lossy decode when matching --cwd.
         let root = temp_root("cwdprune");
-        let proj = root.join("-Users-me-vc-workspace-aicx");
+        let proj = root.join("-Users-tester-vc-workspace-aicx");
         fs::create_dir_all(&proj).unwrap();
         write_session(
             &proj,
             "h1.jsonl",
             &[
-                r#"{"type":"user","cwd":"/Users/me/vc-workspace/aicx","message":{"role":"user","content":"x"},"timestamp":"2026-06-08T10:00:00.000Z"}"#,
+                r#"{"type":"user","cwd":"/Users/tester/vc-workspace/aicx","message":{"role":"user","content":"x"},"timestamp":"2026-06-08T10:00:00.000Z"}"#,
             ],
         );
 
         // matching cwd (with the hyphen) keeps the session
-        let kept = discover_claude_sessions(&root, None, Some("/Users/me/vc-workspace/aicx"));
+        let kept = discover_claude_sessions(&root, None, Some("/Users/tester/vc-workspace/aicx"));
         assert_eq!(kept.len(), 1, "hyphenated cwd must not be mis-pruned");
 
         // a different repo prunes the dir without reading
-        let pruned = discover_claude_sessions(&root, None, Some("/Users/me/other-repo"));
+        let pruned = discover_claude_sessions(&root, None, Some("/Users/tester/other-repo"));
         let _ = fs::remove_dir_all(&root);
         assert_eq!(pruned.len(), 0);
     }
@@ -1429,7 +1429,7 @@ mod tests {
             &day,
             "rollout-2026-01-29T13-58-09-019c09d5.jsonl",
             &[
-                r#"{"timestamp":"2026-01-29T12:58:09.421Z","type":"session_meta","payload":{"id":"019c09d5-codex","cwd":"/Users/me/hosted/Vetcoders"}}"#,
+                r#"{"timestamp":"2026-01-29T12:58:09.421Z","type":"session_meta","payload":{"id":"019c09d5-codex","cwd":"/Users/tester/hosted/Vetcoders"}}"#,
                 r#"{"timestamp":"2026-01-29T12:58:10.000Z","type":"response_item","payload":{"type":"message","role":"developer","content":[{"text":"bootstrap"}]}}"#,
                 r#"{"timestamp":"2026-01-29T12:59:00.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"text":"zrób to"}]}}"#,
                 r#"{"timestamp":"2026-01-29T13:00:00.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"text":"robię"}]}}"#,
@@ -1481,11 +1481,11 @@ mod tests {
 
     #[test]
     fn select_sessions_filters_by_cwd_and_sorts_newest_first() {
-        let here = "/Users/me/repo-a";
+        let here = "/Users/tester/repo-a";
         let sessions = vec![
-            mk_info("aaa", Some("/Users/me/repo-a"), "2026-06-01T10:00:00Z"),
-            mk_info("bbb", Some("/Users/me/repo-a"), "2026-06-08T10:00:00Z"),
-            mk_info("ccc", Some("/Users/me/repo-b"), "2026-06-09T10:00:00Z"),
+            mk_info("aaa", Some("/Users/tester/repo-a"), "2026-06-01T10:00:00Z"),
+            mk_info("bbb", Some("/Users/tester/repo-a"), "2026-06-08T10:00:00Z"),
+            mk_info("ccc", Some("/Users/tester/repo-b"), "2026-06-09T10:00:00Z"),
         ];
 
         // cwd filter keeps only repo-a, newest first
@@ -1539,26 +1539,26 @@ mod tests {
         // A dir whose encoded name merely shares a string prefix with the
         // encoded --cwd must be pruned: `repo` is not `repository`.
         let root = temp_root("cwdprune_boundary");
-        let sibling = root.join("-Users-me-repository");
+        let sibling = root.join("-Users-tester-repository");
         fs::create_dir_all(&sibling).unwrap();
         write_session(
             &sibling,
             "x1.jsonl",
             &[
-                r#"{"type":"user","cwd":"/Users/me/repository","message":{"role":"user","content":"x"},"timestamp":"2026-06-08T10:00:00.000Z"}"#,
+                r#"{"type":"user","cwd":"/Users/tester/repository","message":{"role":"user","content":"x"},"timestamp":"2026-06-08T10:00:00.000Z"}"#,
             ],
         );
-        let nested = root.join("-Users-me-repo-sub");
+        let nested = root.join("-Users-tester-repo-sub");
         fs::create_dir_all(&nested).unwrap();
         write_session(
             &nested,
             "x2.jsonl",
             &[
-                r#"{"type":"user","cwd":"/Users/me/repo/sub","message":{"role":"user","content":"y"},"timestamp":"2026-06-08T11:00:00.000Z"}"#,
+                r#"{"type":"user","cwd":"/Users/tester/repo/sub","message":{"role":"user","content":"y"},"timestamp":"2026-06-08T11:00:00.000Z"}"#,
             ],
         );
 
-        let got = discover_claude_sessions(&root, None, Some("/Users/me/repo"));
+        let got = discover_claude_sessions(&root, None, Some("/Users/tester/repo"));
         let _ = fs::remove_dir_all(&root);
         assert_eq!(got.len(), 1, "repository pruned, repo/sub kept");
         assert_eq!(got[0].session_id, "x2");
@@ -1568,14 +1568,18 @@ mod tests {
     fn select_sessions_keeps_sessions_without_timestamp_in_since_window() {
         // "marked, never silently dated": a no-timestamp session survives
         // --since (main.rs renders it as "(no timestamp)").
-        let mut no_time = mk_info("notime", Some("/Users/me/repo-a"), "2026-06-01T10:00:00Z");
+        let mut no_time = mk_info(
+            "notime",
+            Some("/Users/tester/repo-a"),
+            "2026-06-01T10:00:00Z",
+        );
         no_time.updated_at = None;
         no_time.started_at = None;
         no_time.temporal_confidence = TemporalConfidence::None;
         let sessions = vec![
             no_time,
-            mk_info("old", Some("/Users/me/repo-a"), "2026-06-01T10:00:00Z"),
-            mk_info("new", Some("/Users/me/repo-a"), "2026-06-08T10:00:00Z"),
+            mk_info("old", Some("/Users/tester/repo-a"), "2026-06-01T10:00:00Z"),
+            mk_info("new", Some("/Users/tester/repo-a"), "2026-06-08T10:00:00Z"),
         ];
         let got = select_sessions(
             sessions,
@@ -1618,24 +1622,24 @@ mod tests {
     #[test]
     fn select_sessions_matches_inferred_repo_in_encoded_space() {
         // Inferred repo_path comes from the lossy dir decode: the real cwd
-        // /Users/me/vc-workspace/aicx decodes to /Users/me/vc/workspace/aicx.
+        // /Users/tester/vc-workspace/aicx decodes to /Users/tester/vc/workspace/aicx.
         // Encoded-space matching must still associate it with --cwd.
         let mut inferred = mk_info(
             "inf",
-            Some("/Users/me/vc/workspace/aicx"),
+            Some("/Users/tester/vc/workspace/aicx"),
             "2026-06-08T10:00:00Z",
         );
         inferred.association = Association::Inferred;
         let got = select_sessions(
             vec![inferred.clone()],
-            Some("/Users/me/vc-workspace/aicx"),
+            Some("/Users/tester/vc-workspace/aicx"),
             None,
             None,
             0,
         );
         assert_eq!(got.len(), 1, "inferred match happens in encoded space");
         // and a non-matching cwd still drops it
-        let none = select_sessions(vec![inferred], Some("/Users/me/other"), None, None, 0);
+        let none = select_sessions(vec![inferred], Some("/Users/tester/other"), None, None, 0);
         assert!(none.is_empty());
     }
 

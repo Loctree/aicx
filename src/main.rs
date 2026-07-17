@@ -80,7 +80,7 @@ fn print_intent_schema_migration_report(report: &intents::MigrationReport) {
 #[derive(Debug, Parser)]
 #[command(name = "aicx")]
 #[command(author = "(c)2026 Vetcoders")]
-#[command(version)]
+#[command(version = env!("AICX_BUILD_VERSION"))]
 #[command(verbatim_doc_comment)]
 struct Cli {
     /// Verbose diagnostics: echo per-file extractor warnings to stderr.
@@ -91,6 +91,11 @@ struct Cli {
     /// restore the pre-G-4 per-file echo for debugging individual sessions.
     #[arg(long, short = 'v', global = true)]
     verbose: bool,
+
+    /// Opt in to project-family matching. By default project filters are exact
+    /// and an ambiguous bare repository name fails closed.
+    #[arg(long, global = true)]
+    project_fuzzy: bool,
 
     #[command(subcommand)]
     command: Option<Commands>,
@@ -556,7 +561,7 @@ struct DashboardArgs {
     #[arg(long)]
     store_root: Option<PathBuf>,
 
-    /// Narrow the dashboard dataset to project/store buckets containing this string
+    /// Exact project scope. A bare repository name must resolve uniquely.
     #[arg(short, long)]
     project: Option<String>,
 
@@ -1348,8 +1353,8 @@ enum Commands {
         hours: u64,
 
         /// Strict project filter: `owner/repo`, `/repo` (cross-org repo
-        /// name), `owner/` (org wildcard), or `name` (matches org OR
-        /// repo). Substring matching is intentionally disabled — `-p vista`
+        /// name), `owner/` (org wildcard), or a unique exact `name`.
+        /// Substring matching is intentionally disabled — `-p vista`
         /// no longer leaks into `vista-portal`/`vista-datasets`.
         #[arg(short, long)]
         project: Option<String>,
@@ -1375,7 +1380,7 @@ enum Commands {
 
         /// Project filter (applies to --info as well as --reset).
         /// Supports the standard shapes: `-p owner/repo`, `-p owner/`,
-        /// `-p /repo`, or a bare `-p name` (cross-org).
+        /// `-p /repo`, or a bare `-p name` that must resolve uniquely.
         #[arg(short, long)]
         project: Option<String>,
 
@@ -1585,7 +1590,7 @@ enum Commands {
         ///   `-p owner/repo`   strict `<owner>/<repo>` slug match
         ///   `-p owner/`       all repos under that owner (org wildcard)
         ///   `-p /repo`        same repo name across every owner
-        ///   `-p name`         name matches an owner OR a repo (cross-org)
+        ///   `-p name`         unique exact owner or repo name; ambiguity fails
         ///
         /// Multiple `-p` flags or a comma list (`-p a,b`) form a union.
         /// Substring matching is intentionally not supported — `-p vista`
@@ -1655,7 +1660,7 @@ enum Commands {
         ///   `-p owner/repo`   strict `<owner>/<repo>` slug match
         ///   `-p owner/`       all repos under that owner (org wildcard)
         ///   `-p /repo`        same repo name across every owner
-        ///   `-p name`         name matches an owner OR a repo (cross-org)
+        ///   `-p name`         unique exact owner or repo name; ambiguity fails
         ///
         /// Multiple `-p` flags or a comma list (`-p a,b`) form a union.
         /// Substring matching is intentionally not supported — `-p vista`
@@ -1781,8 +1786,8 @@ enum Commands {
     #[command(name = "migrate-intent-schema")]
     MigrateIntentSchema {
         /// Strict project filter: `owner/repo`, `/repo` (cross-org repo
-        /// name), `owner/` (org wildcard), or `name` (matches org OR
-        /// repo). Omit to scan the whole store. Substring matching is
+        /// name), `owner/` (org wildcard), or a unique exact `name`.
+        /// Omit to scan the whole store. Substring matching is
         /// intentionally disabled.
         #[arg(short, long)]
         project: Option<String>,
@@ -1821,7 +1826,7 @@ enum Commands {
 
         /// Move suspicious top-level corpus buckets to $HOME/.aicx/quarantine/.
         /// Buckets that are merely CamelCase (legitimate GitHub orgs like
-        /// `LibraxisAI`, `Vetcoders`, `Loctree`, `Szowesgad`) are
+        /// `LibraxisAI`, `Vetcoders`, `Loctree`, `Sampleorg`) are
         /// canonicalized in place to lowercase instead of quarantined,
         /// merging into existing lowercase buckets if present.
         #[arg(long)]
@@ -2109,12 +2114,17 @@ fn main() -> Result<()> {
     let diagnostics_state_dir = aicx::store::store_base_dir().ok().map(|d| d.join("state"));
     let _ = aicx::diagnostics::init(cli.verbose, diagnostics_state_dir);
 
-    let result = run_command(cli.command);
+    let result = run_command(cli.command, cli.project_fuzzy);
     aicx::diagnostics::emit_summary();
     result
 }
 
-fn run_command(command: Option<Commands>) -> Result<()> {
+fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
+    let project_match = if project_fuzzy {
+        store::ProjectMatchMode::Fuzzy
+    } else {
+        store::ProjectMatchMode::Exact
+    };
     match command {
         Some(Commands::Completions { shell }) => {
             let mut command = Cli::command();
@@ -2277,8 +2287,42 @@ fn run_command(command: Option<Commands>) -> Result<()> {
         }) => {
             let json = aicx::cli::failure::want_json_envelope(false);
 
-            // Removed flag grammar: reject with a structured migration hint,
-            // never silently alias to the subcommand form.
+            // `--agent <a>` is a DEPRECATED ALIAS for the agent subcommand
+            // (restored 2026-07-16: hard removal broke fleet-wide silent
+            // consumers — hooks with `|| true` never read the migration hint).
+            // `--format` stays removed; `hours`/`include_assistant` have no
+            // new-grammar equivalent, so they still route to the hard error.
+            let alias_eligible = agent.is_some()
+                && target.is_none()
+                && format.is_none()
+                && hours.is_none()
+                && !include_assistant;
+            if alias_eligible {
+                let agent_name = agent.as_deref().unwrap_or_default();
+                if let Some(extract_agent) = ExtractAgent::from_str(agent_name) {
+                    let label = extract_agent.label();
+                    eprintln!(
+                        "note: `--agent {label}` is a deprecated alias; canonical form: `aicx extract {label} ...`"
+                    );
+                    let args = ExtractAgentArgs {
+                        redaction: RedactionArgs {
+                            redact_secrets: true,
+                        },
+                        session,
+                        file: input,
+                        output,
+                        project,
+                        user_only,
+                        max_message_chars: max_message_chars.unwrap_or(0),
+                        conversation,
+                    };
+                    run_extract_target(extract_agent, args)?;
+                    return Ok(());
+                }
+            }
+
+            // Removed flag grammar (--format, or legacy flags without a
+            // resolvable --agent): reject with a structured migration hint.
             let legacy_flags_used = agent.is_some()
                 || format.is_some()
                 || session.is_some()
@@ -2306,7 +2350,7 @@ fn run_command(command: Option<Commands>) -> Result<()> {
                     json,
                     aicx::cli::failure::StructuredFailure::new(
                         "legacy_flag_grammar",
-                        "legacy --agent/--format flag grammar was removed; the agent is a required subcommand",
+                        "legacy --format flag grammar was removed; the agent is a required subcommand (`--agent <a>` is accepted as a deprecated alias)",
                         format!("rerun as `{migration}`"),
                     )
                     .with_fallback(migration),
@@ -2507,17 +2551,17 @@ fn run_command(command: Option<Commands>) -> Result<()> {
             strict,
         }) => {
             let emit = if summary { RefsEmit::Summary } else { emit };
-            run_refs(hours, project, emit, strict)?;
+            run_refs(hours, project, emit, strict, project_match)?;
         }
         Some(Commands::State {
             reset,
             project,
             info,
         }) => {
-            run_state(reset, project, info)?;
+            run_state(reset, project, info, project_match)?;
         }
         Some(Commands::Dashboard(args)) => {
-            run_dashboard_command(args)?;
+            run_dashboard_command(args, project_match)?;
         }
         Some(Commands::Reports(args)) => {
             run_reports_command(args)?;
@@ -2563,6 +2607,7 @@ fn run_command(command: Option<Commands>) -> Result<()> {
                 &project,
                 hours,
                 filters,
+                project_match,
                 IntentsDisplayOptions {
                     emit: &emit,
                     strict,
@@ -2581,7 +2626,14 @@ fn run_command(command: Option<Commands>) -> Result<()> {
             kind,
             filters,
         }) => {
-            run_tail(&project, hours, follow, kind.as_deref(), filters)?;
+            run_tail(
+                &project,
+                hours,
+                follow,
+                kind.as_deref(),
+                filters,
+                project_match,
+            )?;
         }
         Some(Commands::Serve {
             transport,
@@ -2633,6 +2685,7 @@ fn run_command(command: Option<Commands>) -> Result<()> {
                 kind: kind.as_deref(),
                 no_semantic,
                 evidence,
+                project_match,
             })?;
         }
         Some(Commands::Eval { action }) => match action {
@@ -2682,15 +2735,16 @@ fn run_command(command: Option<Commands>) -> Result<()> {
             json,
             filters,
         }) => {
-            run_steer(
-                run_id.as_deref(),
-                prompt_id.as_deref(),
-                kind.as_deref(),
-                &project,
-                date.as_deref(),
+            run_steer(SteerRunArgs {
+                run_id: run_id.as_deref(),
+                prompt_id: prompt_id.as_deref(),
+                kind: kind.as_deref(),
+                projects: &project,
+                date: date.as_deref(),
                 json,
                 filters,
-            )?;
+                project_match,
+            })?;
         }
         Some(Commands::Migrate {
             dry_run,
@@ -3766,13 +3820,7 @@ fn session_id_table_value(id: &str) -> String {
 }
 
 fn session_project_label(session: &sessions::SessionInfo) -> String {
-    session
-        .repo_path
-        .as_deref()
-        .and_then(|path| aicx::parser::segmentation::infer_tiered_identity_from_cwd(Some(path)))
-        .map(|tiered| tiered.identity.slug())
-        .or_else(|| session.project.clone())
-        .unwrap_or_else(|| "-".to_string())
+    session.project.clone().unwrap_or_else(|| "-".to_string())
 }
 
 fn compact_repo_path(path: &str) -> String {
@@ -4021,291 +4069,41 @@ struct IntentPackKeywordHit {
 const DEFAULT_INTENTS_PACK_LIMIT: usize = 20;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct IntentsProjectResolution {
-    projects: Vec<String>,
-    unresolved_filters: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 struct BucketHint {
     slug: String,
     chunks: usize,
 }
 
-fn resolve_intents_project_filters(projects: &[String]) -> Result<IntentsProjectResolution> {
+fn resolve_intents_project_filters(
+    projects: &[String],
+    match_mode: store::ProjectMatchMode,
+) -> Result<store::ProjectIdentityResolution> {
     let store_root = store::store_base_dir()?;
-    let cwd = std::env::current_dir().ok();
-    let session_home = aicx::os_user_home();
-    resolve_intents_project_filters_with_session_home_at(
-        projects,
-        &store_root,
-        session_home.as_deref(),
-        cwd.as_deref(),
-    )
-}
-
-fn resolve_intents_project_filters_with_session_home_at(
-    projects: &[String],
-    store_root: &Path,
-    session_home: Option<&Path>,
-    cwd: Option<&Path>,
-) -> Result<IntentsProjectResolution> {
-    let sessions = discover_intents_resolution_sessions(projects, session_home);
-    resolve_intents_project_filters_at(projects, store_root, &sessions, cwd)
-}
-
-fn discover_intents_resolution_sessions(
-    projects: &[String],
-    session_home: Option<&Path>,
-) -> Vec<sessions::SessionInfo> {
-    if projects.is_empty() {
-        return Vec::new();
-    }
-    let Some(home) = session_home else {
-        return Vec::new();
-    };
-    sessions::discover_sessions_at(home, None, None, None)
+    resolve_intents_project_filters_at(projects, &store_root, match_mode)
 }
 
 fn resolve_intents_project_filters_at(
     projects: &[String],
     store_root: &Path,
-    sessions: &[sessions::SessionInfo],
-    cwd: Option<&Path>,
-) -> Result<IntentsProjectResolution> {
+    match_mode: store::ProjectMatchMode,
+) -> Result<store::ProjectIdentityResolution> {
     if projects.is_empty() {
-        return Ok(IntentsProjectResolution {
-            projects: Vec::new(),
+        return Ok(store::ProjectIdentityResolution {
+            selected: Vec::new(),
+            candidates: Vec::new(),
             unresolved_filters: Vec::new(),
+            match_mode,
         });
     }
-
-    let mut slugs: Vec<String> = store::scan_context_files_at(store_root)?
-        .into_iter()
-        .map(|file| file.project)
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect();
-    slugs.sort();
-
-    let mut resolved = BTreeSet::new();
-    let mut unresolved = Vec::new();
-    for filter in projects {
-        let matches = resolve_single_intents_project_filter(filter, &slugs, sessions, cwd)?;
-        if matches.is_empty() {
-            unresolved.push(filter.clone());
-        } else {
-            resolved.extend(matches);
-        }
-    }
-
-    Ok(IntentsProjectResolution {
-        projects: resolved.into_iter().collect(),
-        unresolved_filters: unresolved,
-    })
-}
-
-fn resolve_single_intents_project_filter(
-    filter: &str,
-    slugs: &[String],
-    sessions: &[sessions::SessionInfo],
-    cwd: Option<&Path>,
-) -> Result<Vec<String>> {
-    let filter = filter.trim();
-    if filter.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    if let Some(matches) = unique_resolution_stage(
-        filter,
-        "exact bucket",
-        slugs.iter().filter(|slug| slug.as_str() == filter).cloned(),
-    )? {
-        return Ok(matches);
-    }
-    if let Some(matches) = unique_resolution_stage(
-        filter,
-        "case-insensitive bucket",
-        slugs
-            .iter()
-            .filter(|slug| slug.eq_ignore_ascii_case(filter))
-            .cloned(),
-    )? {
-        return Ok(matches);
-    }
-
-    let session_matches = sessions
-        .iter()
-        .filter(|session| {
-            session
-                .project
-                .as_deref()
-                .is_some_and(|project| project.eq_ignore_ascii_case(filter))
-        })
-        .filter_map(|session| session.repo_path.as_deref())
-        .flat_map(|repo_path| slug_candidates_from_cwd_like(repo_path, filter, slugs));
-    if let Some(matches) =
-        unique_resolution_stage(filter, "sessions display-name", session_matches)?
-    {
-        return Ok(matches);
-    }
-
-    if let Some(cwd) = cwd.and_then(Path::to_str) {
-        let cwd_basename_matches = Path::new(cwd)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.eq_ignore_ascii_case(filter));
-        if cwd_basename_matches
-            && let Some(matches) = unique_resolution_stage(
-                filter,
-                "cwd basename",
-                slug_candidates_from_cwd_like(cwd, filter, slugs),
-            )?
-        {
-            return Ok(matches);
-        }
-    }
-
-    if let Some(remote_slug) = inferred_slug_from_cwd_like(filter)
-        && let Some(slug) = canonical_stored_slug(slugs, &remote_slug)
-    {
-        return Ok(vec![slug]);
-    }
-
-    if filter.starts_with('/') || filter.ends_with('/') {
-        let matches: Vec<String> = slugs
-            .iter()
-            .filter(|slug| {
-                split_slug(slug)
-                    .is_some_and(|(org, repo)| store::project_filter_matches(org, repo, filter))
-            })
-            .cloned()
-            .collect();
-        if !matches.is_empty() {
-            return Ok(matches);
-        }
-    }
-
-    if let Some(matches) = unique_resolution_stage(
-        filter,
-        "alias",
-        slugs
-            .iter()
-            .filter(|slug| slug_matches_project_alias(slug, filter))
-            .cloned(),
-    )? {
-        return Ok(matches);
-    }
-
-    Ok(Vec::new())
-}
-
-fn unique_resolution_stage<I>(
-    filter: &str,
-    stage: &str,
-    candidates: I,
-) -> Result<Option<Vec<String>>>
-where
-    I: IntoIterator<Item = String>,
-{
-    let matches: Vec<String> = candidates
-        .into_iter()
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect();
-    if matches.is_empty() {
-        return Ok(None);
-    }
-    if matches.len() > 1 {
-        anyhow::bail!(
-            "project filter {filter:?} is ambiguous at {stage} resolution; matched buckets:\n  - {}\nUse one exact bucket with -p owner/repo.",
-            matches.join("\n  - ")
-        );
-    }
-    Ok(Some(matches))
-}
-
-fn slug_candidates_from_cwd_like(cwd_like: &str, filter: &str, slugs: &[String]) -> Vec<String> {
-    if let Some(remote_slug) = inferred_slug_from_cwd_like(cwd_like)
-        && let Some(slug) = canonical_stored_slug(slugs, &remote_slug)
-    {
-        return vec![slug];
-    }
-
-    let mut matches = BTreeSet::new();
-    let basename = Path::new(cwd_like)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .filter(|name| name.eq_ignore_ascii_case(filter));
-    if let Some(basename) = basename {
-        matches.extend(
-            slugs
-                .iter()
-                .filter(|slug| {
-                    split_slug(slug).is_some_and(|(_, repo)| repo.eq_ignore_ascii_case(basename))
-                })
-                .cloned(),
-        );
-    }
-
-    matches.into_iter().collect()
-}
-
-fn inferred_slug_from_cwd_like(value: &str) -> Option<String> {
-    if !is_resolvable_cwd_like(value) {
-        return None;
-    }
-    let identity = aicx_parser::segmentation::infer_tiered_identity_from_cwd(Some(value))?.identity;
-    Some(identity.slug())
-}
-
-fn is_resolvable_cwd_like(value: &str) -> bool {
-    let value = value.trim();
-    value.starts_with('/')
-        || value.starts_with('~')
-        || value.starts_with("http://")
-        || value.starts_with("https://")
-        || value.starts_with("git@")
-        || value.starts_with("ssh://")
-        || value.starts_with("git://")
-        || (cfg!(windows) && is_windows_absolute_path(value))
-}
-
-fn is_windows_absolute_path(value: &str) -> bool {
-    let bytes = value.as_bytes();
-    (bytes.len() >= 3
-        && bytes[0].is_ascii_alphabetic()
-        && bytes[1] == b':'
-        && (bytes[2] == b'\\' || bytes[2] == b'/'))
-        || value.starts_with("\\\\")
-}
-
-fn canonical_stored_slug(slugs: &[String], candidate: &str) -> Option<String> {
-    slugs
-        .iter()
-        .find(|slug| slug.eq_ignore_ascii_case(candidate))
-        .cloned()
+    let corpus = store::project_identities_in_store_at(store_root)?;
+    Ok(store::require_project_resolution(
+        projects, &corpus, match_mode,
+    )?)
 }
 
 fn split_slug(slug: &str) -> Option<(&str, &str)> {
     let (org, repo) = slug.split_once('/')?;
-    if org.is_empty() || repo.is_empty() {
-        return None;
-    }
-    Some((org, repo))
-}
-
-fn slug_matches_project_alias(slug: &str, filter: &str) -> bool {
-    let filter_alias = project_alias_key(filter);
-    if filter_alias.is_empty() {
-        return false;
-    }
-    let Some((org, repo)) = split_slug(slug) else {
-        return false;
-    };
-    [slug, org, repo]
-        .into_iter()
-        .any(|candidate| project_alias_key(candidate) == filter_alias)
+    (!org.is_empty() && !repo.is_empty()).then_some((org, repo))
 }
 
 fn project_alias_key(value: &str) -> String {
@@ -4445,6 +4243,7 @@ fn run_intents(
     projects: &[String],
     hours: u64,
     filters: RetrievalFilters,
+    project_match: store::ProjectMatchMode,
     display: IntentsDisplayOptions<'_>,
 ) -> Result<()> {
     let IntentsDisplayOptions {
@@ -4471,18 +4270,8 @@ fn run_intents(
     // kind filter: extract WITHOUT it so Outcomes survive the resolution check,
     // then re-apply it after the unresolved narrowing.
     let post_kind = if unresolved { kind_filter } else { None };
-    let project_resolution = resolve_intents_project_filters(projects)?;
-    let mut effective_projects = if project_resolution.projects.is_empty() {
-        projects.to_vec()
-    } else {
-        project_resolution.projects.clone()
-    };
-    effective_projects.extend(project_resolution.unresolved_filters.iter().cloned());
-    effective_projects = effective_projects
-        .into_iter()
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect();
+    let project_resolution = resolve_intents_project_filters(projects, project_match)?;
+    let effective_projects = project_resolution.selected.clone();
 
     if should_render_intents_pack(&filters, emit, kind, unresolved, collapse_session) {
         run_intents_pack(&effective_projects, hours, &filters, strict, min_confidence)?;
@@ -4529,11 +4318,21 @@ fn run_intents(
         limit: filters.limit,
     };
 
-    let mut records = intents::apply_display_filters(records, &display_filters);
+    // Apply all narrowing except the final result limit first so the envelope
+    // can report how many records existed before truncation. This also keeps
+    // deferred `--kind + --unresolved` filtering inside the measured set.
+    let requested_limit = display_filters.limit;
+    let mut unbounded_display_filters = display_filters.clone();
+    unbounded_display_filters.limit = None;
+    let mut records = intents::apply_display_filters(records, &unbounded_display_filters);
 
     // F2: re-apply the kind filter we deferred so `--unresolved` could see Outcomes.
     if let Some(k) = post_kind {
         records.retain(|r| r.kind == k);
+    }
+    let available_before_limit = records.len();
+    if let Some(limit) = requested_limit {
+        records.truncate(limit);
     }
 
     if records.is_empty() && emit != "json" {
@@ -4561,7 +4360,19 @@ fn run_intents(
                 extraction.stats.candidate_count,
                 extraction.stats.source_paths_verified,
             );
-            let json = intents::format_intents_oracle_json(&records, oracle_status)?;
+            let completeness = extraction
+                .stats
+                .completeness(requested_limit, available_before_limit)
+                .with_project_scope(
+                    project_resolution.match_mode.as_str(),
+                    project_resolution.selected.clone(),
+                    project_resolution.candidates.clone(),
+                );
+            let json = intents::format_intents_oracle_json_with_completeness(
+                &records,
+                oracle_status,
+                completeness,
+            )?;
             println!("{}", json);
         }
         _ => {
@@ -4908,6 +4719,7 @@ fn run_tail(
     follow: bool,
     kind: Option<&str>,
     mut filters: RetrievalFilters,
+    project_match: store::ProjectMatchMode,
 ) -> Result<()> {
     if !follow {
         // One-shot mode: default to 20 when no explicit --limit was passed
@@ -4920,6 +4732,7 @@ fn run_tail(
             projects,
             hours,
             filters,
+            project_match,
             IntentsDisplayOptions {
                 emit: "markdown",
                 strict: false,
@@ -4940,8 +4753,10 @@ fn run_tail(
         _ => unreachable!("clap validates this"),
     });
 
+    let project_resolution = resolve_intents_project_filters(projects, project_match)?;
+    let effective_projects = project_resolution.selected;
     let mut config = intents::IntentsConfig {
-        project: projects.first().cloned().unwrap_or_default(),
+        project: effective_projects.first().cloned().unwrap_or_default(),
         hours,
         strict: false,
         min_confidence: None,
@@ -4952,11 +4767,12 @@ fn run_tail(
     let mut last_seen = std::collections::HashSet::new();
     eprintln!(
         "Watching for new intents in {}...",
-        project_scope_label(projects)
+        project_scope_label(&effective_projects)
     );
 
     loop {
-        if let Ok(extraction) = intents::extract_intents_with_stats_for_projects(&config, projects)
+        if let Ok(extraction) =
+            intents::extract_intents_with_stats_for_projects(&config, &effective_projects)
         {
             let mut records = extraction.records;
             // Apply filtering identical to run_intents
@@ -6353,12 +6169,22 @@ fn emit_session_batch_summary(agent: &str, batch: &sources::SessionExtractionBat
         eprintln!("    recover: {}", skip.recover);
     }
     if batch.selected_sessions > 0 || !batch.skipped.is_empty() {
-        eprintln!(
-            "  [{}] session ingest summary: ingested={} skipped={}",
-            agent,
-            batch.ingested_sessions,
-            batch.skipped.len()
-        );
+        if batch.duplicate_sources > 0 {
+            eprintln!(
+                "  [{}] session ingest summary: ingested={} skipped={} duplicate_sources={}",
+                agent,
+                batch.ingested_sessions,
+                batch.skipped.len(),
+                batch.duplicate_sources
+            );
+        } else {
+            eprintln!(
+                "  [{}] session ingest summary: ingested={} skipped={}",
+                agent,
+                batch.ingested_sessions,
+                batch.skipped.len()
+            );
+        }
     }
 }
 
@@ -7571,11 +7397,12 @@ fn project_scopes(projects: &[String]) -> Vec<Option<&str>> {
 /// `None` represents the `_all` cross-project bucket; `Some(slug)` is a
 /// canonical `<owner>/<repo>` slug exactly as `index` builds buckets for.
 fn resolve_index_scopes(projects: &[String]) -> Result<Vec<Option<String>>> {
-    let resolved = resolve_project_filters_or_error(projects)?;
-    Ok(if resolved.is_empty() {
+    let resolved =
+        resolve_project_filters_or_error(projects, store::ProjectMatchMode::Exact, true)?;
+    Ok(if resolved.selected.is_empty() {
         vec![None]
     } else {
-        resolved.into_iter().map(Some).collect()
+        resolved.selected.into_iter().map(Some).collect()
     })
 }
 
@@ -7584,30 +7411,28 @@ fn resolve_index_scopes(projects: &[String]) -> Result<Vec<Option<String>>> {
 /// it as "all projects"). Non-empty input that matches zero projects returns
 /// an error with the user-visible filter list, so search/index never silently
 /// resolve to `_all` after a typo.
-fn resolve_project_filters_or_error(projects: &[String]) -> Result<Vec<String>> {
+fn resolve_project_filters_or_error(
+    projects: &[String],
+    match_mode: store::ProjectMatchMode,
+    include_index: bool,
+) -> Result<store::ProjectIdentityResolution> {
     if projects.is_empty() {
-        return Ok(Vec::new());
+        return Ok(store::ProjectIdentityResolution {
+            selected: Vec::new(),
+            candidates: Vec::new(),
+            unresolved_filters: Vec::new(),
+            match_mode,
+        });
     }
-    let resolved = aicx::store::resolve_filters_to_slugs_or_error(projects)?;
-    // Warn (don't fail) when a bare-name filter matched both as an
-    // organization AND as a repository — operator likely wanted one or the
-    // other. Filter still resolves to the union; this is just a heads-up.
-    for filter in projects {
-        if let Some((as_org, as_repo)) =
-            aicx::store::detect_ambiguous_bare_filter(filter, &resolved)
-        {
-            let trimmed = filter.trim();
-            let org_example = as_org.first().cloned().unwrap_or_default();
-            let repo_example = as_repo.first().cloned().unwrap_or_default();
-            eprintln!(
-                "warning: filter '{trimmed}' matched as both an organization AND a repository name.\n  \
-                 as org    -> {trimmed}/* (e.g. {org_example})\n  \
-                 as repo   -> {repo_example}\n  \
-                 use -p {trimmed}/ for org-only or -p /{trimmed} for repo-only."
-            );
-        }
-    }
-    Ok(resolved)
+    let store_root = store::store_base_dir()?;
+    let corpus = if include_index {
+        store::project_identities_in_store_or_index_at(&store_root)?
+    } else {
+        store::project_identities_in_store_at(&store_root)?
+    };
+    Ok(store::require_project_resolution(
+        projects, &corpus, match_mode,
+    )?)
 }
 
 fn project_scope_label(projects: &[String]) -> String {
@@ -7631,6 +7456,7 @@ struct SearchRunArgs<'a> {
     kind: Option<&'a str>,
     no_semantic: bool,
     evidence: bool,
+    project_match: store::ProjectMatchMode,
 }
 
 fn validate_cli_search_limit(limit: usize) -> Result<()> {
@@ -7763,6 +7589,7 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
         kind,
         no_semantic,
         evidence,
+        project_match,
     } = args;
     let limit = filters.limit.unwrap_or(DEFAULT_RETRIEVAL_LIMIT);
     validate_cli_search_limit(limit)?;
@@ -7809,8 +7636,8 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
         hours_cutoff: hours_cutoff.clone(),
     };
 
-    let resolved_projects = resolve_project_filters_or_error(projects)?;
-    let scopes = project_scopes(&resolved_projects);
+    let project_resolution = resolve_project_filters_or_error(projects, project_match, true)?;
+    let scopes = project_scopes(&project_resolution.selected);
 
     let (results, scanned, semantic_status, pushdown_diagnostic, semantic_fallback) = if no_semantic
     {
@@ -8734,15 +8561,28 @@ fn run_read(reference: &str, max_chars: Option<usize>, json: bool) -> Result<()>
 }
 
 /// Retrieve chunks by steering metadata (frontmatter sidecar fields).
-fn run_steer(
-    run_id: Option<&str>,
-    prompt_id: Option<&str>,
-    kind: Option<&str>,
-    projects: &[String],
-    date: Option<&str>,
+struct SteerRunArgs<'a> {
+    run_id: Option<&'a str>,
+    prompt_id: Option<&'a str>,
+    kind: Option<&'a str>,
+    projects: &'a [String],
+    date: Option<&'a str>,
     json: bool,
     filters: RetrievalFilters,
-) -> Result<()> {
+    project_match: store::ProjectMatchMode,
+}
+
+fn run_steer(args: SteerRunArgs<'_>) -> Result<()> {
+    let SteerRunArgs {
+        run_id,
+        prompt_id,
+        kind,
+        projects,
+        date,
+        json,
+        filters,
+        project_match,
+    } = args;
     let rt = tokio::runtime::Runtime::new()?;
     let limit = filters.limit.unwrap_or(DEFAULT_RETRIEVAL_LIMIT);
 
@@ -8755,7 +8595,8 @@ fn run_steer(
     };
 
     let frame_kind = filters.frame_kind.map(Into::into);
-    let scopes = project_scopes(projects);
+    let project_resolution = resolve_project_filters_or_error(projects, project_match, true)?;
+    let scopes = project_scopes(&project_resolution.selected);
     let mut metadatas = Vec::new();
     for project in scopes {
         let filter = aicx::steer_index::SteerFilter {
@@ -8894,9 +8735,22 @@ fn refs_cutoff(hours: u64) -> std::time::SystemTime {
 }
 
 /// List chunks in the canonical store, filtered by recency.
-fn run_refs(hours: u64, project: Option<String>, emit: RefsEmit, strict: bool) -> Result<()> {
+fn run_refs(
+    hours: u64,
+    project: Option<String>,
+    emit: RefsEmit,
+    strict: bool,
+    project_match: store::ProjectMatchMode,
+) -> Result<()> {
     let cutoff = refs_cutoff(hours);
-    let mut files = store::context_files_since(cutoff, project.as_deref())?;
+    let projects = project.into_iter().collect::<Vec<_>>();
+    let resolution = resolve_project_filters_or_error(&projects, project_match, false)?;
+    let mut files = Vec::new();
+    for scope in project_scopes(&resolution.selected) {
+        files.extend(store::context_files_since(cutoff, scope)?);
+    }
+    files.sort_by(|left, right| left.path.cmp(&right.path));
+    files.dedup_by(|left, right| left.path == right.path);
     if strict {
         files.retain(|file| !is_noise_artifact(&file.path));
     }
@@ -9034,9 +8888,27 @@ fn print_refs_summary(files: &[store::StoredContextFile]) -> Result<()> {
 }
 
 /// Manage dedup state.
-fn run_state(reset: bool, project: Option<String>, info: bool) -> Result<()> {
+fn run_state(
+    reset: bool,
+    project: Option<String>,
+    info: bool,
+    project_match: store::ProjectMatchMode,
+) -> Result<()> {
     let _state_guard = aicx::locks::acquire_exclusive(aicx::locks::state_lock_path()?)?;
     let mut state = StateManager::load()?;
+
+    let project_filters = project.into_iter().collect::<Vec<_>>();
+    let corpus = state.seen_hashes.keys().cloned().collect::<Vec<_>>();
+    let project_resolution = if project_filters.is_empty() {
+        store::ProjectIdentityResolution {
+            selected: Vec::new(),
+            candidates: Vec::new(),
+            unresolved_filters: Vec::new(),
+            match_mode: project_match,
+        }
+    } else {
+        store::require_project_resolution(&project_filters, &corpus, project_match)?
+    };
 
     if info {
         // B-P1-13: honor `--project` filter on --info as well as on --reset.
@@ -9045,16 +8917,18 @@ fn run_state(reset: bool, project: Option<String>, info: bool) -> Result<()> {
         // (`<owner>/<repo>` strict, `<owner>/` org wildcard, `/<repo>` repo
         // wildcard, bare `name` cross-org). Watermarks and runs are global
         // and remain unfiltered.
-        let filter = project.as_deref().map(str::trim).filter(|s| !s.is_empty());
         eprintln!("=== State Info ===");
-        if let Some(f) = filter {
-            eprintln!("Filtered by project: {}", f);
+        if !project_resolution.selected.is_empty() {
+            eprintln!(
+                "Filtered by project: {}",
+                project_resolution.selected.join(", ")
+            );
         }
-        if let Some(f) = filter {
+        if !project_resolution.selected.is_empty() {
             let matched: Vec<(&String, &aicx::state::SeenHashSet)> = state
                 .seen_hashes
                 .iter()
-                .filter(|(bucket, _)| state_bucket_matches_project_filter(bucket, f))
+                .filter(|(bucket, _)| project_resolution.selected.contains(bucket))
                 .collect();
             let total: usize = matched.iter().map(|(_, set)| set.len()).sum();
             eprintln!("  Total hashes (filtered): {}", total);
@@ -9078,10 +8952,15 @@ fn run_state(reset: bool, project: Option<String>, info: bool) -> Result<()> {
     }
 
     if reset {
-        if let Some(ref p) = project {
-            state.reset_project(p);
+        if !project_resolution.selected.is_empty() {
+            for project in &project_resolution.selected {
+                state.reset_project(project);
+            }
             state.save()?;
-            eprintln!("Reset hashes for project: {}", p);
+            eprintln!(
+                "Reset hashes for project: {}",
+                project_resolution.selected.join(", ")
+            );
         } else {
             state.reset_all();
             state.save()?;
@@ -9092,26 +8971,6 @@ fn run_state(reset: bool, project: Option<String>, info: bool) -> Result<()> {
 
     eprintln!("Use --info to show state or --reset to clear. See --help.");
     Ok(())
-}
-
-/// Apply the canonical `project_filter_matches` resolver to a state-store
-/// bucket key. Buckets are stored as lowercase `<owner>/<repo>` (see
-/// `aicx::state::migration::canonical_state_bucket`); buckets that don't
-/// split into exactly two segments are matched against the bare filter
-/// only (cross-org name match) and never against the slug or org-wildcard
-/// shapes.
-fn state_bucket_matches_project_filter(bucket: &str, filter: &str) -> bool {
-    let mut parts = bucket.splitn(2, '/');
-    match (parts.next(), parts.next()) {
-        (Some(org), Some(repo)) if !org.is_empty() && !repo.is_empty() => {
-            store::project_filter_matches(org, repo, filter)
-        }
-        _ => {
-            // Legacy / non-slug bucket: treat the whole key as the repo
-            // side so a bare `-p <name>` still works.
-            store::project_filter_matches("", bucket, filter)
-        }
-    }
 }
 
 struct DashboardServerRunArgs {
@@ -9302,11 +9161,32 @@ fn default_dashboard_output_path() -> Result<PathBuf> {
     Ok(store::store_base_dir()?.join("aicx-dashboard.html"))
 }
 
-fn run_dashboard_command(args: DashboardArgs) -> Result<()> {
+fn run_dashboard_command(
+    mut args: DashboardArgs,
+    project_match: store::ProjectMatchMode,
+) -> Result<()> {
     if args.serve && args.generate_html {
         return Err(anyhow::anyhow!(
             "Choose either --serve or --generate-html, not both."
         ));
+    }
+
+    if let Some(filter) = args.project.as_ref() {
+        let root = args
+            .store_root
+            .clone()
+            .map(Ok)
+            .unwrap_or_else(store::store_base_dir)?;
+        let corpus = store::project_identities_in_store_at(&root)?;
+        let filters = vec![filter.clone()];
+        let resolution = store::require_project_resolution(&filters, &corpus, project_match)?;
+        if resolution.selected.len() != 1 {
+            anyhow::bail!(
+                "dashboard project scope must resolve to one project; candidates:\n  - {}",
+                resolution.selected.join("\n  - ")
+            );
+        }
+        args.project = resolution.selected.into_iter().next();
     }
 
     if args.serve {

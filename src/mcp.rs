@@ -19,7 +19,7 @@ use std::{
     error::Error,
     fmt,
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -43,6 +43,14 @@ use rmcp::transport::streamable_http_server::session::{
 const MCP_SESSION_IDLE_TTL: Duration = Duration::from_secs(30 * 60);
 const MCP_SESSION_MAX_SESSIONS: usize = 1000;
 const MCP_SESSION_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+const MCP_IDLE_MEMORY_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Default time without an MCP tool request before request-derived memory is
+/// reclaimed. Search/index/corpus data is loaded inside each request rather
+/// than cached by the server, so the reclaim pass clears the small retained
+/// lifecycle state and asks the platform allocator to return its now-empty
+/// arenas. The next request follows the normal lazy-load path.
+pub const MCP_IDLE_MEMORY_DROP_AFTER: Duration = Duration::from_secs(15 * 60);
 
 /// D-6: once the embedder fails to load (model not hydrated, cloud creds
 /// missing, ...) the MCP server short-circuits subsequent semantic search
@@ -50,6 +58,156 @@ const MCP_SESSION_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 /// embedder. 5 minutes balances "recover quickly when the operator fixes
 /// the config" against "stop hammering the same broken path".
 const MCP_EMBEDDER_NEGATIVE_TTL: Duration = Duration::from_secs(5 * 60);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct McpLifecycleConfig {
+    pub idle_memory_drop_after: Duration,
+}
+
+impl Default for McpLifecycleConfig {
+    fn default() -> Self {
+        Self {
+            idle_memory_drop_after: MCP_IDLE_MEMORY_DROP_AFTER,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct McpIdleMemoryState {
+    last_request_at: Option<Instant>,
+    active_requests: usize,
+    reclaimed_since_last_request: bool,
+    reclaim_count: u64,
+}
+
+#[derive(Debug)]
+struct McpIdleMemoryManager {
+    idle_after: Duration,
+    state: Mutex<McpIdleMemoryState>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct McpIdleMemoryDrop {
+    idle_for: Duration,
+    allocator_bytes_released: usize,
+}
+
+struct McpRequestActivity {
+    manager: Arc<McpIdleMemoryManager>,
+}
+
+impl Drop for McpRequestActivity {
+    fn drop(&mut self) {
+        self.manager.finish_request_at(Instant::now());
+    }
+}
+
+impl McpIdleMemoryManager {
+    fn new(idle_after: Duration) -> Self {
+        Self {
+            idle_after,
+            state: Mutex::new(McpIdleMemoryState {
+                last_request_at: None,
+                active_requests: 0,
+                reclaimed_since_last_request: false,
+                reclaim_count: 0,
+            }),
+        }
+    }
+
+    fn state_guard(&self) -> std::sync::MutexGuard<'_, McpIdleMemoryState> {
+        self.state.lock().expect(
+            "MCP idle-memory mutex poisoned; lifecycle state is only mutated by AicxMcpServer",
+        )
+    }
+
+    fn begin_request(self: &Arc<Self>) -> McpRequestActivity {
+        self.begin_request_at(Instant::now());
+        McpRequestActivity {
+            manager: self.clone(),
+        }
+    }
+
+    fn begin_request_at(&self, now: Instant) {
+        let mut state = self.state_guard();
+        state.last_request_at = Some(now);
+        state.active_requests += 1;
+        state.reclaimed_since_last_request = false;
+    }
+
+    fn finish_request_at(&self, now: Instant) {
+        let mut state = self.state_guard();
+        state.active_requests = state.active_requests.saturating_sub(1);
+        state.last_request_at = Some(now);
+    }
+
+    fn reclaim_if_idle(&self) -> Option<McpIdleMemoryDrop> {
+        self.reclaim_if_idle_at(Instant::now())
+    }
+
+    fn reclaim_if_idle_at(&self, now: Instant) -> Option<McpIdleMemoryDrop> {
+        let idle_for = {
+            let mut state = self.state_guard();
+            let last_request_at = state.last_request_at?;
+            let idle_for = now
+                .checked_duration_since(last_request_at)
+                .unwrap_or_default();
+            if state.active_requests != 0
+                || idle_for < self.idle_after
+                || state.reclaimed_since_last_request
+            {
+                return None;
+            }
+
+            // Request-owned corpus, index and embedding data has already
+            // dropped by this point. Mark this idle period before asking the
+            // allocator to return the empty arenas left by that working set.
+            state.reclaimed_since_last_request = true;
+            state.reclaim_count += 1;
+            idle_for
+        };
+
+        Some(McpIdleMemoryDrop {
+            idle_for,
+            allocator_bytes_released: release_idle_process_memory(),
+        })
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn release_idle_process_memory() -> usize {
+    unsafe extern "C" {
+        fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize;
+    }
+
+    // SAFETY: macOS documents a null zone as "all malloc zones" and a zero
+    // goal as maximal pressure relief. This only releases allocator-owned free
+    // pages; live Rust allocations remain untouched.
+    unsafe { malloc_zone_pressure_relief(std::ptr::null_mut(), 0) }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn release_idle_process_memory() -> usize {
+    0
+}
+
+fn spawn_mcp_idle_memory_cleanup(manager: Arc<McpIdleMemoryManager>, interval: Duration) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            ticker.tick().await;
+            if let Some(drop) = manager.reclaim_if_idle() {
+                tracing::info!(
+                    target: "mcp.lifecycle",
+                    idle_for_seconds = drop.idle_for.as_secs(),
+                    allocator_bytes_released = drop.allocator_bytes_released,
+                    "MCP idle memory reclaimed; the next request will lazy-load its working set"
+                );
+            }
+        }
+    });
+}
 
 #[derive(Debug)]
 struct AicxSessionManager {
@@ -345,11 +503,13 @@ pub struct SearchParams {
     /// Max results to return (default: 10)
     #[serde(default = "default_limit")]
     pub limit: usize,
-    /// Optional project filter (case-insensitive substring). Prefer
-    /// `projects` for cross-project search.
+    /// Optional exact project filter. A bare repo name must be unique; prefer
+    /// `projects` for explicit cross-project search.
     pub project: Option<String>,
     /// Optional project filters for cross-project search.
     pub projects: Option<Vec<String>>,
+    /// Project identity matching: `exact` (default) or explicit `fuzzy` family search.
+    pub project_match: Option<String>,
     /// Minimum score threshold (0-100)
     pub score: Option<u8>,
     /// Hours to look back (0 = all time)
@@ -402,13 +562,60 @@ fn default_true() -> bool {
 fn search_project_scopes(
     store_root: &std::path::Path,
     projects: &[String],
-) -> anyhow::Result<Vec<Option<String>>> {
+    match_mode: store::ProjectMatchMode,
+) -> Result<Vec<Option<String>>, McpError> {
     if projects.is_empty() {
         return Ok(vec![None]);
     }
-    let resolved =
-        store::resolve_filters_to_store_or_index_slugs_at_or_error(store_root, projects)?;
-    Ok(resolved.into_iter().map(Some).collect())
+    let resolution = resolve_mcp_projects(store_root, projects, match_mode, true)?;
+    Ok(resolution.selected.into_iter().map(Some).collect())
+}
+
+fn parse_project_match(value: Option<&str>) -> Result<store::ProjectMatchMode, McpError> {
+    match value
+        .unwrap_or("exact")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "exact" => Ok(store::ProjectMatchMode::Exact),
+        "fuzzy" => Ok(store::ProjectMatchMode::Fuzzy),
+        other => Err(McpError::invalid_params(
+            format!("unknown project_match {other:?}; expected exact or fuzzy"),
+            Some(serde_json::json!({
+                "ok": false,
+                "error": "invalid_project_match",
+                "project_match": other,
+                "expected": ["exact", "fuzzy"],
+            })),
+        )),
+    }
+}
+
+fn project_resolution_mcp_error(error: store::ProjectResolutionError) -> McpError {
+    let payload = serde_json::json!({
+        "ok": false,
+        "error": error.kind(),
+        "filter": error.filter(),
+        "candidates": error.candidates(),
+    });
+    McpError::invalid_params(format!("Project filter: {error}"), Some(payload))
+}
+
+fn resolve_mcp_projects(
+    store_root: &std::path::Path,
+    projects: &[String],
+    match_mode: store::ProjectMatchMode,
+    include_index: bool,
+) -> Result<store::ProjectIdentityResolution, McpError> {
+    let corpus = if include_index {
+        store::project_identities_in_store_or_index_at(store_root)
+    } else {
+        store::project_identities_in_store_at(store_root)
+    }
+    .map_err(|error| McpError::internal_error(format!("Store error: {error}"), None))?;
+    store::require_project_resolution(projects, &corpus, match_mode)
+        .map_err(project_resolution_mcp_error)
 }
 
 fn dedup_metadata_by_path(items: &mut Vec<serde_json::Value>) {
@@ -430,6 +637,8 @@ const MAX_SCORE_FILTER: u8 = 100;
 pub struct RankParams {
     /// Project name (required)
     pub project: String,
+    /// Project identity matching: `exact` (default) or explicit `fuzzy` family search.
+    pub project_match: Option<String>,
     /// Hours to look back (default: 72, 0 = all time)
     #[serde(default = "default_rank_hours")]
     pub hours: u64,
@@ -482,6 +691,8 @@ pub struct SteerParams {
     /// Optional project filters for cross-project steering. Each entry uses
     /// the same strict canonical semantics as `project`.
     pub projects: Option<Vec<String>>,
+    /// Project identity matching: `exact` (default) or explicit `fuzzy` family search.
+    pub project_match: Option<String>,
     /// Filter by date (YYYY-MM-DD, or range like 2026-03-20..2026-03-28)
     pub date: Option<String>,
     /// Max results (default: 20)
@@ -509,11 +720,15 @@ fn default_steer_limit() -> usize {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct IntentsParams {
-    /// Optional project filter (case-insensitive substring; empty/None = all projects)
+    /// Optional strict project filter. Bare names match an exact organization
+    /// or repository token; `owner/` and `/repo` are explicit wildcards.
+    /// Empty/None scans all projects.
     #[serde(default)]
     pub project: Option<String>,
     /// Optional project filters for cross-project intent extraction.
     pub projects: Option<Vec<String>>,
+    /// Project identity matching: `exact` (default) or explicit `fuzzy` family search.
+    pub project_match: Option<String>,
     /// Hours to look back (default: 720 = 30 days, 0 = all time). Matches CLI default.
     #[serde(default = "default_intents_hours")]
     pub hours: u64,
@@ -796,7 +1011,8 @@ fn render_mcp_fuzzy_fallback_payload(
 pub struct AicxMcpServer {
     #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
-    embedder_unavailable_until: Arc<std::sync::Mutex<Option<Instant>>>,
+    embedder_unavailable_until: Arc<Mutex<Option<Instant>>>,
+    idle_memory: Arc<McpIdleMemoryManager>,
 }
 
 impl Default for AicxMcpServer {
@@ -808,9 +1024,16 @@ impl Default for AicxMcpServer {
 #[tool_router]
 impl AicxMcpServer {
     pub fn new() -> Self {
+        Self::with_idle_memory(Arc::new(McpIdleMemoryManager::new(
+            MCP_IDLE_MEMORY_DROP_AFTER,
+        )))
+    }
+
+    fn with_idle_memory(idle_memory: Arc<McpIdleMemoryManager>) -> Self {
         Self {
             tool_router: Self::tool_router(),
-            embedder_unavailable_until: Arc::new(std::sync::Mutex::new(None)),
+            embedder_unavailable_until: Arc::new(Mutex::new(None)),
+            idle_memory,
         }
     }
 
@@ -838,8 +1061,7 @@ impl AicxMcpServer {
     /// D-6: arm the negative cache for `ttl` from `now`. Called after a
     /// real embedder failure so subsequent requests fail-fast.
     fn mark_embedder_unavailable(&self, now: Instant, ttl: Duration) {
-        let mut guard = self.embedder_unavailable_guard();
-        *guard = Some(now + ttl);
+        *self.embedder_unavailable_guard() = Some(now + ttl);
     }
 
     #[tool(
@@ -854,6 +1076,7 @@ impl AicxMcpServer {
         // arguments (query/project/agent/...) — they may carry PII or
         // operator secrets and the audit log is intended to be safe to
         // archive long-term.
+        let _request_activity = self.idle_memory.begin_request();
         tracing::info!(target: "mcp.audit", tool_name = "aicx_search", "mcp tool invoked");
 
         validate_string_len(Some(params.query.as_str()), 4096, "query")?;
@@ -862,6 +1085,7 @@ impl AicxMcpServer {
         validate_string_len(params.date.as_deref(), 4096, "date")?;
         validate_string_len(params.since.as_deref(), 4096, "since")?;
         validate_string_len(params.until.as_deref(), 4096, "until")?;
+        validate_string_len(params.project_match.as_deref(), 32, "project_match")?;
         validate_string_len(params.sort.as_deref(), 4096, "sort")?;
         if let Some(projects) = &params.projects {
             for (i, p) in projects.iter().enumerate() {
@@ -896,6 +1120,7 @@ impl AicxMcpServer {
         let query = params.query;
         let limit = params.limit.min(50);
         let strict_semantic = params.strict_semantic;
+        let project_match = parse_project_match(params.project_match.as_deref())?;
         let project = params.project;
         let owned_projects = params
             .projects
@@ -904,8 +1129,8 @@ impl AicxMcpServer {
             .unwrap_or_else(|| project.clone().into_iter().collect());
         let store_root = store::store_base_dir()
             .map_err(|e| McpError::internal_error(format!("Store error: {e}"), None))?;
-        let project_scopes_owned = search_project_scopes(&store_root, &owned_projects)
-            .map_err(|e| McpError::invalid_params(format!("Project filter: {e}"), None))?;
+        let project_scopes_owned =
+            search_project_scopes(&store_root, &owned_projects, project_match)?;
         let project_scopes: Vec<Option<&str>> = project_scopes_owned
             .iter()
             .map(|scope| scope.as_deref())
@@ -1081,6 +1306,7 @@ impl AicxMcpServer {
         &self,
         Parameters(params): Parameters<ReadParams>,
     ) -> Result<CallToolResult, McpError> {
+        let _request_activity = self.idle_memory.begin_request();
         tracing::info!(target: "mcp.audit", tool_name = "aicx_read", "mcp tool invoked");
         let chunk = store::read_context_chunk(&params.reference, params.max_chars)
             .map_err(|e| McpError::internal_error(format!("Read chunk: {e}"), None))?;
@@ -1098,14 +1324,17 @@ impl AicxMcpServer {
         &self,
         Parameters(params): Parameters<RankParams>,
     ) -> Result<CallToolResult, McpError> {
+        let _request_activity = self.idle_memory.begin_request();
         tracing::info!(target: "mcp.audit", tool_name = "aicx_rank", "mcp tool invoked");
         validate_string_len(Some(params.project.as_str()), 4096, "project")?;
         validate_string_len(params.agent.as_deref(), 4096, "agent")?;
         validate_string_len(params.since.as_deref(), 4096, "since")?;
         validate_string_len(params.until.as_deref(), 4096, "until")?;
         validate_string_len(params.sort.as_deref(), 4096, "sort")?;
+        validate_string_len(params.project_match.as_deref(), 32, "project_match")?;
 
-        let project = params.project;
+        let requested_project = params.project;
+        let project_match = parse_project_match(params.project_match.as_deref())?;
         let hours = params.hours;
         let strict = params.strict;
         const MAX_TOP: usize = 1000;
@@ -1117,6 +1346,14 @@ impl AicxMcpServer {
             std::time::SystemTime::now()
                 - std::time::Duration::from_secs(hours.saturating_mul(3600).min(365 * 24 * 3600))
         };
+        let store_root = store::store_base_dir()
+            .map_err(|e| McpError::internal_error(format!("Store error: {e}"), None))?;
+        let resolution = resolve_mcp_projects(
+            &store_root,
+            std::slice::from_ref(&requested_project),
+            project_match,
+            false,
+        )?;
         let mut scored = Vec::new();
 
         let (lo, hi) = if let Some(ref d) = params.since {
@@ -1125,8 +1362,15 @@ impl AicxMcpServer {
             (None, params.until.clone())
         };
 
-        let files = store::context_files_since(cutoff, Some(&project))
-            .map_err(|e| McpError::internal_error(format!("Store error: {e}"), None))?;
+        let mut files = Vec::new();
+        for project in &resolution.selected {
+            files.extend(
+                store::context_files_since(cutoff, Some(project))
+                    .map_err(|e| McpError::internal_error(format!("Store error: {e}"), None))?,
+            );
+        }
+        files.sort_by(|left, right| left.path.cmp(&right.path));
+        files.dedup_by(|left, right| left.path == right.path);
 
         for file in files {
             if file.path.extension().is_none_or(|ext| ext != "md") {
@@ -1216,7 +1460,7 @@ impl AicxMcpServer {
         }
 
         let json = serde_json::to_string(&RankResponse {
-            project,
+            project: resolution.selected.join(","),
             hours,
             strict,
             results: scored.len(),
@@ -1229,12 +1473,13 @@ impl AicxMcpServer {
 
     #[tool(
         name = "aicx_steer",
-        description = "Retrieve chunks by steering metadata. Supports project/projects (strict canonical <organization>/<repository> matching — `vista` does NOT match `vista-portal`; use `owner/repo`, `owner/`, or `/repo` wildcards for explicit scopes), run_id, prompt_id, agent, kind, frame_kind, and date filters."
+        description = "Retrieve chunks by steering metadata. project/projects are exact by default and ambiguous bare names fail with candidates; set project_match=fuzzy explicitly for family search. Supports run_id, prompt_id, agent, kind, frame_kind, and date filters."
     )]
     async fn steer(
         &self,
         Parameters(params): Parameters<SteerParams>,
     ) -> Result<CallToolResult, McpError> {
+        let _request_activity = self.idle_memory.begin_request();
         tracing::info!(target: "mcp.audit", tool_name = "aicx_steer", "mcp tool invoked");
         validate_string_len(params.run_id.as_deref(), 4096, "run_id")?;
         validate_string_len(params.prompt_id.as_deref(), 4096, "prompt_id")?;
@@ -1244,6 +1489,7 @@ impl AicxMcpServer {
         validate_string_len(params.date.as_deref(), 4096, "date")?;
         validate_string_len(params.since.as_deref(), 4096, "since")?;
         validate_string_len(params.until.as_deref(), 4096, "until")?;
+        validate_string_len(params.project_match.as_deref(), 32, "project_match")?;
         if let Some(projects) = &params.projects {
             for (i, p) in projects.iter().enumerate() {
                 validate_string_len(Some(p), 4096, &format!("projects[{}]", i))?;
@@ -1264,10 +1510,10 @@ impl AicxMcpServer {
             .clone()
             .filter(|projects| !projects.is_empty())
             .unwrap_or_else(|| params.project.clone().into_iter().collect());
+        let project_match = parse_project_match(params.project_match.as_deref())?;
         let store_root = store::store_base_dir()
             .map_err(|e| McpError::internal_error(format!("Store error: {e}"), None))?;
-        let project_scopes = search_project_scopes(&store_root, &owned_projects)
-            .map_err(|e| McpError::invalid_params(format!("Project filter: {e}"), None))?;
+        let project_scopes = search_project_scopes(&store_root, &owned_projects, project_match)?;
         let mut metadatas = Vec::new();
 
         for project in project_scopes {
@@ -1372,7 +1618,15 @@ impl AicxMcpServer {
         &self,
         Parameters(params): Parameters<IntentsParams>,
     ) -> Result<CallToolResult, McpError> {
+        let _request_activity = self.idle_memory.begin_request();
         tracing::info!(target: "mcp.audit", tool_name = "aicx_intents", "mcp tool invoked");
+        validate_string_len(params.project.as_deref(), 4096, "project")?;
+        validate_string_len(params.project_match.as_deref(), 32, "project_match")?;
+        if let Some(projects) = &params.projects {
+            for (index, project) in projects.iter().enumerate() {
+                validate_string_len(Some(project), 4096, &format!("projects[{index}]"))?;
+            }
+        }
         let kind_filter = match params.kind.as_deref() {
             None => None,
             Some(s) => match s.to_lowercase().as_str() {
@@ -1410,9 +1664,23 @@ impl AicxMcpServer {
             .clone()
             .filter(|projects| !projects.is_empty())
             .unwrap_or_else(|| params.project.clone().into_iter().collect());
+        let project_match = parse_project_match(params.project_match.as_deref())?;
+        let store_root = store::store_base_dir()
+            .map_err(|e| McpError::internal_error(format!("Store error: {e}"), None))?;
+        let project_resolution = if owned_projects.is_empty() {
+            store::ProjectIdentityResolution {
+                selected: Vec::new(),
+                candidates: Vec::new(),
+                unresolved_filters: Vec::new(),
+                match_mode: project_match,
+            }
+        } else {
+            resolve_mcp_projects(&store_root, &owned_projects, project_match, false)?
+        };
+        let effective_projects = project_resolution.selected.clone();
 
         let config = IntentsConfig {
-            project: owned_projects.first().cloned().unwrap_or_default(),
+            project: effective_projects.first().cloned().unwrap_or_default(),
             hours: params.hours,
             strict: params.strict,
             min_confidence: params.min_confidence,
@@ -1420,8 +1688,9 @@ impl AicxMcpServer {
             frame_kind: params.frame_kind,
         };
 
-        let extraction = intents::extract_intents_with_stats_for_projects(&config, &owned_projects)
-            .map_err(|e| McpError::internal_error(format!("Extract intents: {e}"), None))?;
+        let extraction =
+            intents::extract_intents_with_stats_for_projects(&config, &effective_projects)
+                .map_err(|e| McpError::internal_error(format!("Extract intents: {e}"), None))?;
         let records = extraction.records;
 
         let limit_capped = params.limit.min(500);
@@ -1437,20 +1706,32 @@ impl AicxMcpServer {
             limit: Some(limit_capped),
         };
 
-        let records = intents::apply_display_filters(records, &display_filters);
+        let display = intents::apply_display_filters_with_completeness(records, &display_filters);
+        let records = display.records;
 
         let body = match params.emit.as_str() {
             "markdown" | "md" => intents::format_intents_markdown(&records),
             _ => {
-                let store_root = store::store_base_dir()
-                    .map_err(|e| McpError::internal_error(format!("Store error: {e}"), None))?;
                 let oracle_status = OracleStatus::canonical_corpus_scan(
                     &store_root,
                     extraction.stats.scanned_count,
                     extraction.stats.candidate_count,
                     extraction.stats.source_paths_verified,
                 );
-                intents::format_intents_oracle_json(&records, oracle_status).map_err(|e| {
+                let completeness = extraction
+                    .stats
+                    .completeness(display.requested_limit, display.available_before_limit)
+                    .with_project_scope(
+                        project_resolution.match_mode.as_str(),
+                        project_resolution.selected.clone(),
+                        project_resolution.candidates.clone(),
+                    );
+                intents::format_intents_oracle_json_with_completeness(
+                    &records,
+                    oracle_status,
+                    completeness,
+                )
+                .map_err(|e| {
                     McpError::internal_error(format!("Serialize intents JSON: {e}"), None)
                 })?
             }
@@ -1467,6 +1748,7 @@ impl AicxMcpServer {
         &self,
         Parameters(params): Parameters<IndexStatusParams>,
     ) -> Result<CallToolResult, McpError> {
+        let _request_activity = self.idle_memory.begin_request();
         tracing::info!(target: "mcp.audit", tool_name = "aicx_index_status", "mcp tool invoked");
         let store_root = store::store_base_dir()
             .map_err(|e| McpError::internal_error(format!("Store error: {e}"), None))?;
@@ -1496,7 +1778,7 @@ impl rmcp::handler::server::ServerHandler for AicxMcpServer {
                 .enable_tool_list_changed()
                 .build(),
         )
-        .with_server_info(Implementation::new("aicx-mcp", env!("CARGO_PKG_VERSION")))
+        .with_server_info(Implementation::new("aicx-mcp", env!("AICX_BUILD_VERSION")))
     }
 }
 
@@ -1518,6 +1800,11 @@ pub const MCP_TOOL_SURFACE: &[&str] = &[
 
 /// Run MCP server over stdio transport.
 pub async fn run_stdio() -> anyhow::Result<()> {
+    run_stdio_with_lifecycle(McpLifecycleConfig::default()).await
+}
+
+/// Run MCP server over stdio with explicit lifecycle configuration.
+pub async fn run_stdio_with_lifecycle(lifecycle: McpLifecycleConfig) -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_writer(std::io::stderr)
@@ -1533,16 +1820,27 @@ pub async fn run_stdio() -> anyhow::Result<()> {
         "mcp server starting (stdio)"
     );
 
-    let server = AicxMcpServer::new();
-    let service = rmcp::ServiceExt::serve(server, rmcp::transport::io::stdio())
-        .await
-        .map_err(|e| anyhow::anyhow!("MCP stdio serve failed: {e}"))?;
+    let idle_memory = Arc::new(McpIdleMemoryManager::new(lifecycle.idle_memory_drop_after));
+    spawn_mcp_idle_memory_cleanup(idle_memory.clone(), MCP_IDLE_MEMORY_SWEEP_INTERVAL);
+    let server = AicxMcpServer::with_idle_memory(idle_memory);
+    let service = match rmcp::ServiceExt::serve(server, rmcp::transport::io::stdio()).await {
+        Ok(service) => service,
+        Err(rmcp::service::ServerInitializeError::ConnectionClosed(_)) => {
+            // A client is allowed to close stdin before initialize (for
+            // example, when its own startup aborts). EOF is normal stdio
+            // lifecycle, not a server failure.
+            tracing::info!(target: "mcp.lifecycle", "MCP stdio closed before initialize");
+            return Ok(());
+        }
+        Err(err) => return Err(anyhow::anyhow!("MCP stdio serve failed: {err}")),
+    };
 
     eprintln!("aicx MCP server running (stdio)");
-    service
+    let quit_reason = service
         .waiting()
         .await
         .map_err(|e| anyhow::anyhow!("MCP server error: {e}"))?;
+    tracing::info!(target: "mcp.lifecycle", ?quit_reason, "MCP stdio stopped");
     Ok(())
 }
 
@@ -1560,6 +1858,16 @@ pub async fn run_http_on(host: IpAddr, port: u16, auth_config: AuthConfig) -> an
 pub async fn run_http_config(
     http_config: McpHttpConfig,
     auth_config: AuthConfig,
+) -> anyhow::Result<()> {
+    run_http_config_with_lifecycle(http_config, auth_config, McpLifecycleConfig::default()).await
+}
+
+/// Run MCP HTTP with explicit lifecycle configuration. Unlike stdio, HTTP
+/// deliberately has no stdin/EOF shutdown path; it is a long-lived service.
+pub async fn run_http_config_with_lifecycle(
+    http_config: McpHttpConfig,
+    auth_config: AuthConfig,
+    lifecycle: McpLifecycleConfig,
 ) -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -1598,8 +1906,10 @@ pub async fn run_http_config(
     };
     let session_manager = configured_mcp_session_manager();
     spawn_mcp_session_cleanup(session_manager.clone(), MCP_SESSION_SWEEP_INTERVAL);
+    let idle_memory = Arc::new(McpIdleMemoryManager::new(lifecycle.idle_memory_drop_after));
+    spawn_mcp_idle_memory_cleanup(idle_memory.clone(), MCP_IDLE_MEMORY_SWEEP_INTERVAL);
     let service = rmcp::transport::streamable_http_server::StreamableHttpService::new(
-        || Ok(AicxMcpServer::new()),
+        move || Ok(AicxMcpServer::with_idle_memory(idle_memory.clone())),
         session_manager,
         config,
     );
@@ -1680,9 +1990,27 @@ pub async fn run_transport(
     http_config: McpHttpConfig,
     auth_config: AuthConfig,
 ) -> anyhow::Result<()> {
+    run_transport_with_lifecycle(
+        transport,
+        http_config,
+        auth_config,
+        McpLifecycleConfig::default(),
+    )
+    .await
+}
+
+/// Run the selected MCP transport with explicit lifecycle configuration.
+pub async fn run_transport_with_lifecycle(
+    transport: McpTransport,
+    http_config: McpHttpConfig,
+    auth_config: AuthConfig,
+    lifecycle: McpLifecycleConfig,
+) -> anyhow::Result<()> {
     match transport {
-        McpTransport::Stdio => run_stdio().await,
-        McpTransport::Http => run_http_config(http_config, auth_config).await,
+        McpTransport::Stdio => run_stdio_with_lifecycle(lifecycle).await,
+        McpTransport::Http => {
+            run_http_config_with_lifecycle(http_config, auth_config, lifecycle).await
+        }
     }
 }
 
@@ -1730,22 +2058,88 @@ mod tests {
     use super::{
         AicxMcpServer, AicxSessionManager, AicxSessionManagerError, MAX_SCORE_FILTER,
         MCP_EMBEDDER_NEGATIVE_TTL, MCP_SESSION_IDLE_TTL, MCP_SESSION_MAX_SESSIONS,
-        MCP_SESSION_SWEEP_INTERVAL, McpHttpConfig, McpSemanticFallbackNotice, McpTransport,
-        RankItem, RankResponse, SearchParams, SteerResponse, background_refresh_args,
+        MCP_SESSION_SWEEP_INTERVAL, McpHttpConfig, McpIdleMemoryManager, McpSemanticFallbackNotice,
+        McpTransport, RankItem, RankResponse, SearchParams, SteerResponse, background_refresh_args,
         build_mcp_semantic_filters, configured_mcp_session_manager,
         inject_mcp_filter_pushdown_payload, inject_mcp_semantic_fallback_payload,
-        parse_date_filter_mcp, spawn_mcp_session_cleanup, validate_http_auth_policy,
-        validate_score_filter, validate_string_len,
+        parse_date_filter_mcp, parse_project_match, resolve_mcp_projects,
+        spawn_mcp_session_cleanup, validate_http_auth_policy, validate_score_filter,
+        validate_string_len,
     };
     use crate::auth::{AuthConfig, AuthSource};
     use crate::oracle::OracleStatus;
     use clap::ValueEnum as _;
     use rmcp::transport::streamable_http_server::session::SessionManager as _;
     use std::{
+        fs,
         net::{IpAddr, Ipv4Addr},
+        path::PathBuf,
         sync::Arc,
-        time::{Duration, Instant},
+        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
+
+    fn project_store_root(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "aicx-mcp-project-resolver-{label}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ))
+    }
+
+    #[test]
+    fn mcp_project_resolution_fails_closed_with_structured_candidates() {
+        let root = project_store_root("ambiguous");
+        for slug in ["A/vista", "B/vista", "B/vista-portal"] {
+            fs::create_dir_all(root.join("store").join(slug)).expect("create project bucket");
+        }
+
+        let error = resolve_mcp_projects(
+            &root,
+            &["vista".to_string()],
+            crate::store::ProjectMatchMode::Exact,
+            false,
+        )
+        .expect_err("MCP must reject ambiguous bare project");
+        let data = error.data.expect("structured invalid_params data");
+        assert_eq!(data["error"], "ambiguous_project");
+        assert_eq!(data["filter"], "vista");
+        assert_eq!(
+            data["candidates"],
+            serde_json::json!(["A/vista", "B/vista"])
+        );
+
+        fs::remove_dir_all(root).expect("remove MCP resolver fixture");
+    }
+
+    #[test]
+    fn mcp_project_resolution_has_explicit_fuzzy_mode() {
+        let root = project_store_root("fuzzy");
+        for slug in ["B/vista", "B/vista-portal"] {
+            fs::create_dir_all(root.join("store").join(slug)).expect("create project bucket");
+        }
+
+        let exact = resolve_mcp_projects(
+            &root,
+            &["vista".to_string()],
+            parse_project_match(None).unwrap(),
+            false,
+        )
+        .expect("default exact mode");
+        assert_eq!(exact.selected, ["B/vista"]);
+        let fuzzy = resolve_mcp_projects(
+            &root,
+            &["vista".to_string()],
+            parse_project_match(Some("fuzzy")).unwrap(),
+            false,
+        )
+        .expect("explicit fuzzy mode");
+        assert_eq!(fuzzy.selected, ["B/vista", "B/vista-portal"]);
+
+        fs::remove_dir_all(root).expect("remove MCP resolver fixture");
+    }
 
     fn minimal_search_params() -> SearchParams {
         SearchParams {
@@ -1753,6 +2147,7 @@ mod tests {
             limit: 20,
             project: None,
             projects: None,
+            project_match: None,
             score: None,
             hours: None,
             agent: None,
@@ -2104,7 +2499,7 @@ mod tests {
     }
 
     #[test]
-    fn aicx_intents_json_payload_carries_claim_honesty_frame() {
+    fn aicx_intents_json_payload_carries_claim_honesty_and_completeness() {
         // B2: the `aicx_intents` JSON branch serializes through
         // `intents::format_intents_oracle_json`; this locks the exact payload
         // the MCP tool returns so every consumer sees the honesty frame —
@@ -2133,8 +2528,32 @@ mod tests {
             true,
         );
 
-        let body = crate::intents::format_intents_oracle_json(&records, oracle_status)
-            .expect("serialize intents payload");
+        let stats = crate::intents::IntentExtractionStats {
+            scanned_count: 3,
+            candidate_count: 3,
+            source_paths_verified: true,
+            candidate_cap: 5_000,
+            dropped_candidates: 2,
+            dropped_task_events: 0,
+            matched_project_buckets: vec![
+                "one/aicx".to_string(),
+                "two/aicx".to_string(),
+                "three/aicx".to_string(),
+            ],
+            identity_source: crate::intents::PERSISTED_IDENTITY_SOURCE.to_string(),
+            path_heuristic_records: 0,
+        };
+        let completeness = stats.completeness(Some(1), 3).with_project_scope(
+            "exact",
+            vec!["two/aicx".to_string()],
+            vec!["two/aicx".to_string()],
+        );
+        let body = crate::intents::format_intents_oracle_json_with_completeness(
+            &records,
+            oracle_status,
+            completeness,
+        )
+        .expect("serialize intents payload");
         let payload: serde_json::Value =
             serde_json::from_str(&body).expect("intents payload parses");
 
@@ -2150,6 +2569,38 @@ mod tests {
         assert_eq!(
             payload["items"][0]["verification_state"],
             "not_verified_by_aicx"
+        );
+        assert_eq!(payload["completeness"]["complete"], false);
+        assert_eq!(payload["completeness"]["candidate_cap_reached"], true);
+        assert_eq!(payload["completeness"]["dropped_candidates"], 2);
+        assert_eq!(
+            payload["completeness"]["matched_project_buckets"],
+            serde_json::json!(["one/aicx", "two/aicx", "three/aicx"])
+        );
+        assert!(
+            payload["completeness"]
+                .as_object()
+                .is_some_and(|value| !value.contains_key("skipped_project_buckets"))
+        );
+        assert_eq!(
+            payload["completeness"]["warnings"],
+            serde_json::json!([
+                "candidate cap of 5000 reached; 2 candidate(s) and 0 task event(s) dropped"
+            ])
+        );
+        assert_eq!(payload["completeness"]["limit_saturated"], true);
+        assert_eq!(
+            payload["completeness"]["identity_source"],
+            crate::intents::PERSISTED_IDENTITY_SOURCE
+        );
+        assert_eq!(payload["completeness"]["scope"]["match_mode"], "exact");
+        assert_eq!(
+            payload["completeness"]["scope"]["selected"],
+            serde_json::json!(["two/aicx"])
+        );
+        assert_eq!(
+            payload["completeness"]["scope"]["candidates"],
+            serde_json::json!(["two/aicx"])
         );
     }
 
@@ -2184,10 +2635,7 @@ mod tests {
     fn embedder_negative_cache_expires_by_ttl() {
         let server = AicxMcpServer::new();
         let now = Instant::now();
-        {
-            let mut guard = server.embedder_unavailable_guard();
-            *guard = Some(now + MCP_EMBEDDER_NEGATIVE_TTL);
-        }
+        server.mark_embedder_unavailable(now, MCP_EMBEDDER_NEGATIVE_TTL);
 
         let remaining = server
             .embedder_negative_cache_remaining(now + Duration::from_secs(10))
@@ -2201,6 +2649,53 @@ mod tests {
                 )
                 .is_none()
         );
+    }
+
+    #[test]
+    fn idle_memory_drop_waits_for_request_completion_and_rearms() {
+        let manager = McpIdleMemoryManager::new(Duration::from_millis(10));
+        let started = Instant::now();
+        manager.begin_request_at(started);
+
+        assert!(
+            manager
+                .reclaim_if_idle_at(started + Duration::from_secs(1))
+                .is_none(),
+            "active requests must never be reclaimed, even past the threshold"
+        );
+
+        let finished = started + Duration::from_secs(2);
+        manager.finish_request_at(finished);
+        assert!(
+            manager
+                .reclaim_if_idle_at(finished + Duration::from_millis(9))
+                .is_none()
+        );
+        let first_drop = manager
+            .reclaim_if_idle_at(finished + Duration::from_millis(11))
+            .expect("idle state should be reclaimed after the configured threshold");
+        assert_eq!(first_drop.idle_for, Duration::from_millis(11));
+        {
+            let state = manager.state_guard();
+            assert_eq!(state.active_requests, 0);
+            assert!(state.reclaimed_since_last_request);
+            assert_eq!(state.reclaim_count, 1);
+        }
+        assert!(
+            manager
+                .reclaim_if_idle_at(finished + Duration::from_secs(1))
+                .is_none(),
+            "one idle period must trigger only one reclaim pass"
+        );
+
+        let second_request = finished + Duration::from_secs(2);
+        manager.begin_request_at(second_request);
+        manager.finish_request_at(second_request);
+        manager
+            .reclaim_if_idle_at(second_request + Duration::from_millis(11))
+            .expect("a new request should re-arm idle reclamation");
+        let state = manager.state_guard();
+        assert_eq!(state.reclaim_count, 2);
     }
 
     #[test]

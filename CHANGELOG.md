@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
+### Changed
+
+- **Batched semantic-index embedding.** `aicx index` now embeds chunks in
+  batches through the existing `embed_batch` API instead of one HTTP
+  round-trip per chunk. For the cloud backend this collapses the dominant
+  per-chunk latency of a full build (one OpenAI-compatible POST carries an
+  `input` array of up to `batch_size` texts). Batch size is configurable
+  via `[embedder.cloud] batch_size` (default 16) with an `AICX_EMBED_BATCH`
+  env override; GGUF stays serial (`batch_size` 1) by default and opts in
+  only via the env var. A failing batch retries once, then degrades to
+  per-item embedding so one poison chunk cannot abort the run. Checkpoint,
+  resume, `--sample N`, and per-chunk progress ticks are unchanged.
+
 ## [0.11.0] - 2026-07-13
 
 Parser engine transplant — "Noc francuskiego łącznika". Full session-engine

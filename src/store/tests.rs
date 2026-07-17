@@ -2366,6 +2366,54 @@ fn project_filter_bare_name_matches_org_or_repo() {
 }
 
 #[test]
+fn ownerless_project_identity_is_addressable_and_participates_in_ambiguity() {
+    let corpus = vec!["A/repo".to_string(), "_/repo".to_string()];
+
+    let ambiguous =
+        require_project_resolution(&["repo".to_string()], &corpus, ProjectMatchMode::Exact)
+            .expect_err("bare repo must fail closed across owned and ownerless buckets");
+    assert_eq!(ambiguous.candidates(), ["A/repo", "_/repo"]);
+
+    let ownerless =
+        require_project_resolution(&["_/repo".to_string()], &corpus, ProjectMatchMode::Exact)
+            .expect("explicit ownerless address must resolve");
+    assert_eq!(ownerless.selected, ["_/repo"]);
+
+    let wildcard =
+        require_project_resolution(&["/repo".to_string()], &corpus, ProjectMatchMode::Exact)
+            .expect("cross-org wildcard must include the ownerless sentinel");
+    assert_eq!(wildcard.selected, ["A/repo", "_/repo"]);
+}
+
+#[test]
+fn store_scan_surfaces_ownerless_bucket_under_virtual_sentinel() {
+    let root = migration_test_root("ownerless-scan");
+    let directory = root
+        .join(CANONICAL_STORE_DIRNAME)
+        .join("repo")
+        .join("2026_0717")
+        .join("conversations")
+        .join("codex");
+    fs::create_dir_all(&directory).unwrap();
+    fs::write(
+        directory.join(session_basename("2026-07-17", "codex", "ownerless", 1)),
+        "[project: repo | agent: codex | date: 2026-07-17]\n",
+    )
+    .unwrap();
+
+    assert_eq!(project_identities_in_store_at(&root).unwrap(), ["_/repo"]);
+    let files = scan_context_files_at(&root).unwrap();
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].project, "_/repo");
+    assert_eq!(
+        files[0].repo.as_ref().map(RepoIdentity::slug).as_deref(),
+        Some("_/repo")
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn resolve_filters_to_slugs_expands_short_name_to_canonical() {
     let root = migration_test_root("resolve-short");
     let canonical = root.join(CANONICAL_STORE_DIRNAME);
@@ -2585,6 +2633,53 @@ fn resolve_filters_to_index_slugs_scans_all_bucket_for_unmatched_filters() {
 }
 
 #[test]
+fn bare_filter_ambiguity_is_independent_of_index_bucket_topology() {
+    let root = migration_test_root("resolve-index-silver-topology");
+    let indexed = root.join("indexed");
+    let dedicated = indexed.join("A_vista");
+    let all = indexed.join("_all");
+    fs::create_dir_all(&dedicated).unwrap();
+    fs::create_dir_all(&all).unwrap();
+    let header = serde_json::json!({
+        "schema_version": "aicx-vector-index/v1",
+        "model_id": "test-model",
+        "model_profile": "base",
+        "dimension": 2,
+        "generated_at": "2026-07-17T00:00:00Z",
+        "entry_count": 2
+    });
+    let row = |id: &str, project: &str| serde_json::json!({"id": id, "project": project, "embedding": [1.0, 0.0]});
+    fs::write(
+        dedicated.join("embeddings.ndjson"),
+        format!(
+            "{}\n{}\n",
+            serde_json::to_string(&header).unwrap(),
+            serde_json::to_string(&row("a", "A/vista")).unwrap()
+        ),
+    )
+    .unwrap();
+    fs::write(
+        all.join("embeddings.ndjson"),
+        format!(
+            "{}\n{}\n{}\n",
+            serde_json::to_string(&header).unwrap(),
+            serde_json::to_string(&row("b", "B/vista")).unwrap(),
+            serde_json::to_string(&row("portal", "B/vista-portal")).unwrap()
+        ),
+    )
+    .unwrap();
+
+    let error = resolve_filters_to_index_slugs_at(&indexed, &["vista".to_string()])
+        .expect_err("one exact bucket must not hide another identity in _all");
+    let resolution_error = error
+        .downcast_ref::<ProjectResolutionError>()
+        .expect("typed project-resolution error");
+    assert_eq!(resolution_error.candidates(), ["A/vista", "B/vista"]);
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn resolve_filters_to_index_slugs_reads_only_project_field() {
     let root = migration_test_root("resolve-index-project-only");
     let indexed_all = root.join("indexed").join("_all");
@@ -2612,12 +2707,7 @@ fn resolve_filters_to_index_slugs_reads_only_project_field() {
     )
     .unwrap();
 
-    let got = project_slugs_from_index_file(
-        &indexed_all.join("embeddings.ndjson"),
-        &["vetcoders/vista".to_string()],
-        false,
-    )
-    .unwrap();
+    let got = project_slugs_from_index_file(&indexed_all.join("embeddings.ndjson")).unwrap();
     assert_eq!(got, vec!["Vetcoders/Vista"]);
 
     let _ = fs::remove_dir_all(&root);
@@ -2637,57 +2727,55 @@ fn resolve_filters_to_slugs_empty_input_returns_empty() {
 }
 
 #[test]
-fn detect_ambiguous_bare_filter_flags_org_and_repo_collision() {
-    // `-p codex` resolves to both `codex/foo` (org match) AND
-    // `openai/codex` (repo match) — operator should be warned.
+fn bare_project_filter_fails_closed_with_all_candidates() {
     let root = migration_test_root("ambiguous-codex");
     let canonical = root.join(CANONICAL_STORE_DIRNAME);
     fs::create_dir_all(canonical.join("codex").join("some-repo")).unwrap();
     fs::create_dir_all(canonical.join("openai").join("codex")).unwrap();
     fs::create_dir_all(canonical.join("unrelated").join("lab")).unwrap();
 
-    let resolved = resolve_filters_to_slugs_at(&canonical, &["codex".to_string()]).unwrap();
-    // Filter still returns union (no behavior change).
-    assert_eq!(resolved, vec!["codex/some-repo", "openai/codex"]);
-
-    // Helper flags the ambiguity.
-    let detected =
-        detect_ambiguous_bare_filter("codex", &resolved).expect("ambiguity must be detected");
-    assert_eq!(detected.0, vec!["codex/some-repo"]);
-    assert_eq!(detected.1, vec!["openai/codex"]);
-
-    // Case-insensitive on the filter side too.
-    let detected_upper = detect_ambiguous_bare_filter("CODEX", &resolved)
-        .expect("ambiguity must be detected case-insensitively");
-    assert_eq!(detected_upper.0, vec!["codex/some-repo"]);
-    assert_eq!(detected_upper.1, vec!["openai/codex"]);
+    let err = resolve_filters_to_slugs_at(&canonical, &["codex".to_string()])
+        .expect_err("ambiguous bare filter must fail closed");
+    let resolution_error = err
+        .downcast_ref::<ProjectResolutionError>()
+        .expect("typed project-resolution error");
+    assert_eq!(
+        resolution_error.candidates(),
+        ["codex/some-repo", "openai/codex"]
+    );
 
     let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
-fn detect_ambiguous_bare_filter_skips_unambiguous_and_qualified_filters() {
-    // Org-only match → no ambiguity.
-    let slugs_org_only = vec![
-        "codex/some-repo".to_string(),
-        "codex/other-repo".to_string(),
+fn project_resolver_keeps_exact_and_fuzzy_modes_separate() {
+    let corpus = vec![
+        "B/vista".to_string(),
+        "B/vista-portal".to_string(),
+        "B/RepoScribe-dev".to_string(),
     ];
-    assert!(detect_ambiguous_bare_filter("codex", &slugs_org_only).is_none());
 
-    // Repo-only match → no ambiguity.
-    let slugs_repo_only = vec!["openai/codex".to_string(), "anthropic/codex".to_string()];
-    assert!(detect_ambiguous_bare_filter("codex", &slugs_repo_only).is_none());
+    let exact =
+        require_project_resolution(&["B/vista".to_string()], &corpus, ProjectMatchMode::Exact)
+            .unwrap();
+    assert_eq!(exact.selected, ["B/vista"]);
 
-    // Qualified filter forms (owner/, /repo, owner/repo) are never
-    // "ambiguous" — they expressed intent, so the helper short-circuits.
-    let slugs_mixed = vec!["codex/some-repo".to_string(), "openai/codex".to_string()];
-    assert!(detect_ambiguous_bare_filter("codex/", &slugs_mixed).is_none());
-    assert!(detect_ambiguous_bare_filter("/codex", &slugs_mixed).is_none());
-    assert!(detect_ambiguous_bare_filter("openai/codex", &slugs_mixed).is_none());
+    let bare = require_project_resolution(&["vista".to_string()], &corpus, ProjectMatchMode::Exact)
+        .unwrap();
+    assert_eq!(bare.selected, ["B/vista"]);
 
-    // Empty / whitespace filter → None.
-    assert!(detect_ambiguous_bare_filter("", &slugs_mixed).is_none());
-    assert!(detect_ambiguous_bare_filter("   ", &slugs_mixed).is_none());
+    let fuzzy =
+        require_project_resolution(&["vista".to_string()], &corpus, ProjectMatchMode::Fuzzy)
+            .unwrap();
+    assert_eq!(fuzzy.selected, ["B/vista", "B/vista-portal"]);
+
+    let suffix = require_project_resolution(
+        &["B/RepoScribe".to_string()],
+        &corpus,
+        ProjectMatchMode::Exact,
+    )
+    .expect_err("owner/repo exact must not match a family suffix");
+    assert_eq!(suffix.kind(), "project_not_found");
 }
 
 #[test]

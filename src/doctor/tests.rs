@@ -429,7 +429,7 @@ fn scan_passes_camelcase_dotfile_underscore_buckets_through() {
     std::fs::create_dir_all(store.join("LibraxisAI").join("vista")).unwrap();
     std::fs::create_dir_all(store.join("Vetcoders").join("Vista")).unwrap();
     std::fs::create_dir_all(store.join("Loctree").join("aicx")).unwrap();
-    std::fs::create_dir_all(store.join("Szowesgad").join("family-onko-portal")).unwrap();
+    std::fs::create_dir_all(store.join("Sampleorg").join("sample-portal")).unwrap();
 
     // Already-lowercase legacy buckets:
     std::fs::create_dir_all(store.join("vetcoders").join("aicx")).unwrap();
@@ -458,7 +458,7 @@ fn scan_passes_camelcase_dotfile_underscore_buckets_through() {
         "LibraxisAI",
         "Vetcoders",
         "Loctree",
-        "Szowesgad",
+        "Sampleorg",
         "vetcoders",
         "local",
         ".scripts",

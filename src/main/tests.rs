@@ -362,8 +362,8 @@ fn index_status_routes_through_index_canonical_resolver() {
     let bucket_slugs = [
         "Vetcoders/Loctree",
         "Vetcoders/aicx",
-        "Szowesgad/Loctree",
-        "Szowesgad/Codescribe",
+        "Sampleorg/Loctree",
+        "Sampleorg/Codescribe",
     ];
     for slug in bucket_slugs {
         fs::create_dir_all(canonical_root.join(slug)).unwrap();
@@ -373,8 +373,8 @@ fn index_status_routes_through_index_canonical_resolver() {
     for bucket in [
         "vetcoders_loctree",
         "vetcoders_aicx",
-        "szowesgad_loctree",
-        "szowesgad_codescribe",
+        "sampleorg_loctree",
+        "sampleorg_codescribe",
     ] {
         let dir = root.join("indexed").join(bucket);
         fs::create_dir_all(&dir).unwrap();
@@ -391,11 +391,24 @@ fn index_status_routes_through_index_canonical_resolver() {
         ("Vetcoders/Loctree", &["vetcoders_loctree"]),
         // org wildcard
         ("Vetcoders/", &["vetcoders_aicx", "vetcoders_loctree"]),
-        // cross-org repo
-        ("/Loctree", &["szowesgad_loctree", "vetcoders_loctree"]),
-        // bare name (matches as repo name across orgs)
-        ("Loctree", &["szowesgad_loctree", "vetcoders_loctree"]),
+        // cross-org repo (explicit wildcard — selects every org on purpose)
+        ("/Loctree", &["sampleorg_loctree", "vetcoders_loctree"]),
     ];
+
+    // World-model fix (F3, P0-4): a bare name with more than one identity
+    // FAILS CLOSED with candidates — it must never fan out across orgs.
+    let bare_error =
+        aicx::store::resolve_filters_to_slugs_at(&canonical_root, &["Loctree".to_string()])
+            .expect_err("bare 'Loctree' with two identities must fail closed");
+    let bare_message = bare_error.to_string();
+    assert!(
+        bare_message.contains("ambiguous"),
+        "fail-closed error must name the ambiguity:\n{bare_message}"
+    );
+    assert!(
+        bare_message.contains("Sampleorg/Loctree") && bare_message.contains("Vetcoders/Loctree"),
+        "fail-closed error must list both candidates:\n{bare_message}"
+    );
 
     for (filter, expected_buckets) in shapes {
         // Step 1: canonical resolver (the shared chokepoint both
@@ -580,6 +593,7 @@ fn run_search_rejects_limit_over_hard_cap_before_store_access() {
         kind: None,
         no_semantic: true,
         evidence: false,
+        project_match: store::ProjectMatchMode::Exact,
     })
     .expect_err("oversized search limit must fail before reading the store");
 
@@ -615,10 +629,10 @@ fn session_id_table_value_preserves_full_id() {
 }
 
 #[test]
-fn sessions_table_project_uses_canonical_repo_identity() {
-    let info = session_info("aicx", "/Users/me/hosted/Loctree/aicx");
+fn sessions_table_project_uses_persisted_session_identity() {
+    let info = session_info("archive/old", "/Users/tester/hosted/archive/new");
 
-    assert_eq!(session_project_label(&info), "Loctree/aicx");
+    assert_eq!(session_project_label(&info), "archive/old");
 }
 
 #[test]
@@ -782,28 +796,6 @@ fn set_mtime(path: &Path, unix_seconds: i64) {
     set_file_mtime(path, FileTime::from_unix_time(unix_seconds, 0)).unwrap();
 }
 
-fn write_store_chunk(root: &Path, slug: &str, date: &str, session: &str) -> PathBuf {
-    let path = root
-        .join("store")
-        .join(slug)
-        .join(date)
-        .join("conversations")
-        .join("claude")
-        .join(format!("{date}_claude_{session}_001.md"));
-    write_file(&path, "[signals]\n- intent: test\n");
-    path
-}
-
-fn encode_claude_project_dir(path: &Path) -> String {
-    // Claude encodes a cwd into a single project-dir component by replacing the
-    // path separators. On Windows the path is `\`-separated and drive-prefixed
-    // (`C:\Users\x\Compass`), so a `/`-only replace leaves `:` and `\` in the
-    // name — an invalid component, and `join`ing a drive-absolute string escapes
-    // the projects root entirely. Replace both separators and the drive colon so
-    // the encoded dir is valid and discoverable on every platform.
-    path.display().to_string().replace(['/', '\\', ':'], "-")
-}
-
 fn session_info(project: &str, repo_path: &str) -> sessions::SessionInfo {
     sessions::SessionInfo {
         session_id: "session-1".to_string(),
@@ -822,120 +814,229 @@ fn session_info(project: &str, repo_path: &str) -> sessions::SessionInfo {
     }
 }
 
-#[test]
-fn intents_project_resolver_discovers_session_display_bridge_in_production_path() {
-    let root = unique_test_dir("intents-project-discovered-display-store");
-    let home = unique_test_dir("intents-project-discovered-display-home");
-    let repo_parent = unique_test_dir("intents-project-discovered-display-repo");
-    let repo = repo_parent.join("Compass");
-    let _ = fs::remove_dir_all(&root);
-    let _ = fs::remove_dir_all(&home);
-    let _ = fs::remove_dir_all(&repo_parent);
-
-    write_store_chunk(&root, "vetcoders/field_ops", "2026_0612", "canonical");
-    fs::create_dir_all(&repo).unwrap();
-    let git_init = std::process::Command::new("git")
-        .arg("init")
-        .arg(&repo)
-        .output()
-        .expect("git init should run");
-    assert!(git_init.status.success());
-    let git_remote = std::process::Command::new("git")
-        .arg("-C")
-        .arg(&repo)
-        .args([
-            "remote",
-            "add",
-            "origin",
-            "git@github.com:vetcoders/field_ops.git",
-        ])
-        .output()
-        .expect("git remote add should run");
-    assert!(git_remote.status.success());
-    let encoded = encode_claude_project_dir(&repo);
-    let session_path = home
-        .join(".claude")
-        .join("projects")
-        .join(encoded)
-        .join("session-1.jsonl");
-    write_file(
-        &session_path,
-        &format!(
-            "{{\"type\":\"user\",\"timestamp\":\"2026-06-14T00:00:00Z\",\"cwd\":{:?},\"message\":{{\"role\":\"user\",\"content\":\"remember this\"}}}}\n",
-            repo.display().to_string()
-        ),
-    );
-
-    let got = resolve_intents_project_filters_with_session_home_at(
-        &["Compass".to_string()],
-        &root,
-        Some(&home),
-        None,
-    )
-    .unwrap();
-
-    let _ = fs::remove_dir_all(&root);
-    let _ = fs::remove_dir_all(&home);
-    let _ = fs::remove_dir_all(&repo_parent);
-
-    assert_eq!(got.projects, vec!["vetcoders/field_ops"]);
-    assert!(got.unresolved_filters.is_empty());
+fn write_store_chunk(root: &Path, slug: &str, date: &str, session: &str) -> PathBuf {
+    let path = root
+        .join("store")
+        .join(slug)
+        .join(date)
+        .join("conversations")
+        .join("claude")
+        .join(format!("{date}_claude_{session}_001.md"));
+    write_file(&path, "[signals]\n- intent: test\n");
+    path
 }
 
 #[test]
-fn intents_project_resolver_prefers_session_display_before_alias() {
-    let root = unique_test_dir("intents-project-display");
-    let _ = fs::remove_dir_all(&root);
-    write_store_chunk(&root, "legacy/Screenscribe", "2026_0612", "legacy");
-    write_store_chunk(
-        &root,
-        "vetcoders/screen_scribe_depr",
-        "2026_0612",
-        "canonical",
-    );
-    let sessions = vec![session_info(
-        "Screenscribe",
-        "git@github.com:vetcoders/screen_scribe_depr.git",
-    )];
-
-    let got =
-        resolve_intents_project_filters_at(&["Screenscribe".to_string()], &root, &sessions, None)
-            .unwrap();
-    let _ = fs::remove_dir_all(&root);
-
-    assert_eq!(got.projects, vec!["vetcoders/screen_scribe_depr"]);
-    assert!(got.unresolved_filters.is_empty());
-}
-
-#[test]
-fn intents_project_resolver_errors_on_ambiguous_alias() {
+fn intents_project_resolver_fails_closed_on_ambiguous_bare_slug() {
     let root = unique_test_dir("intents-project-ambiguous");
     let _ = fs::remove_dir_all(&root);
-    write_store_chunk(&root, "one/screen_scribe_depr", "2026_0612", "one");
+    write_store_chunk(&root, "one/Screenscribe", "2026_0612", "one");
     write_store_chunk(&root, "two/Screenscribe", "2026_0612", "two");
 
-    let err = resolve_intents_project_filters_at(&["Screenscribe".to_string()], &root, &[], None)
-        .expect_err("alias collision should force explicit bucket");
+    let err = resolve_intents_project_filters_at(
+        &["Screenscribe".to_string()],
+        &root,
+        store::ProjectMatchMode::Exact,
+    )
+    .expect_err("bare-name collision should force explicit bucket");
     let msg = err.to_string();
     let _ = fs::remove_dir_all(&root);
 
     assert!(msg.contains("ambiguous"));
-    assert!(msg.contains("one/screen_scribe_depr"));
+    assert!(msg.contains("one/Screenscribe"));
     assert!(msg.contains("two/Screenscribe"));
 }
 
 #[test]
-fn intents_project_resolver_does_not_resolve_bare_unknown_to_current_repo() {
-    let root = unique_test_dir("intents-project-bare-unknown");
+fn intents_project_resolver_exact_and_fuzzy_modes_are_separate() {
+    let root = unique_test_dir("intents-project-match-modes");
     let _ = fs::remove_dir_all(&root);
-    write_store_chunk(&root, "Loctree/aicx", "2026_0612", "aicx");
+    write_store_chunk(&root, "Loctree/ScreenScribe-dev", "2026_0612", "dev");
 
-    let got =
-        resolve_intents_project_filters_at(&["ScreenScrib".to_string()], &root, &[], None).unwrap();
+    let exact = resolve_intents_project_filters_at(
+        &["ScreenScribe".to_string()],
+        &root,
+        store::ProjectMatchMode::Exact,
+    )
+    .expect_err("exact mode must not match a family suffix");
+    let fuzzy = resolve_intents_project_filters_at(
+        &["ScreenScribe".to_string()],
+        &root,
+        store::ProjectMatchMode::Fuzzy,
+    )
+    .expect("explicit fuzzy mode should match the family");
     let _ = fs::remove_dir_all(&root);
 
-    assert!(got.projects.is_empty());
-    assert_eq!(got.unresolved_filters, vec!["ScreenScrib"]);
+    assert!(exact.to_string().contains("no project matches"));
+    assert_eq!(fuzzy.selected, ["Loctree/ScreenScribe-dev"]);
+
+    let stats = intents::IntentExtractionStats {
+        scanned_count: 1,
+        candidate_count: 1,
+        source_paths_verified: true,
+        candidate_cap: 5_000,
+        dropped_candidates: 0,
+        dropped_task_events: 0,
+        matched_project_buckets: fuzzy.selected.clone(),
+        identity_source: intents::PERSISTED_IDENTITY_SOURCE.to_string(),
+        path_heuristic_records: 0,
+    };
+    let complete = stats.completeness(None, 1);
+    assert_eq!(
+        serde_json::to_value(&complete).expect("serialize empty warnings")["warnings"],
+        serde_json::json!([])
+    );
+    let fuzzy_complete = complete.with_project_scope(
+        fuzzy.match_mode.as_str(),
+        fuzzy.selected.clone(),
+        fuzzy.candidates.clone(),
+    );
+    assert_eq!(fuzzy_complete.warnings, ["fuzzy project matching active"]);
+}
+
+#[test]
+fn intents_json_envelope_reports_cap_warning_and_limit_saturation() {
+    let root = unique_test_dir("intents-completeness-envelope");
+    let _ = fs::remove_dir_all(&root);
+    write_store_chunk(&root, "one/vista", "2026_0717", "one");
+    let selected_chunk = write_store_chunk(&root, "two/vista", "2026_0717", "two");
+    write_store_chunk(&root, "three/vista", "2026_0717", "three");
+
+    let resolution = resolve_intents_project_filters_at(
+        &["two/vista".to_string()],
+        &root,
+        store::ProjectMatchMode::Exact,
+    )
+    .expect("resolve exact fixture");
+    assert_eq!(resolution.selected, ["two/vista"]);
+
+    let mut body = String::from(
+        "[project: two/vista | agent: claude | date: 2026-07-17 | frame_kind: user_msg]\n\n\
+         [signals]\nIntent:\n",
+    );
+    for index in 0..5_008 {
+        body.push_str(&format!(
+            "- Preserve completeness candidate number {index:04}\n"
+        ));
+    }
+    body.push_str("[/signals]\n");
+    fs::write(&selected_chunk, body).expect("write over-cap intents fixture");
+
+    let extraction = aicx::api::Aicx::with_store_root(&root)
+        .extract_intents(&intents::IntentsConfig {
+            project: resolution.selected[0].clone(),
+            hours: 0,
+            strict: false,
+            min_confidence: None,
+            kind_filter: None,
+            frame_kind: None,
+        })
+        .expect("extract over-cap intents fixture");
+    assert!(extraction.stats.dropped_candidates > 0);
+    assert_eq!(extraction.stats.matched_project_buckets, ["two/vista"]);
+
+    let display = intents::apply_display_filters_with_completeness(
+        extraction.records,
+        &intents::IntentDisplayFilters {
+            limit: Some(100),
+            ..Default::default()
+        },
+    );
+    assert_eq!(display.records.len(), 100);
+    let oracle_status = aicx::oracle::OracleStatus::canonical_corpus_scan(
+        &root,
+        extraction.stats.scanned_count,
+        extraction.stats.candidate_count,
+        extraction.stats.source_paths_verified,
+    );
+    let completeness = extraction
+        .stats
+        .completeness(display.requested_limit, display.available_before_limit)
+        .with_project_scope(
+            resolution.match_mode.as_str(),
+            resolution.selected.clone(),
+            resolution.candidates.clone(),
+        );
+    let expected_dropped = completeness.dropped_candidates;
+    let json = intents::format_intents_oracle_json_with_completeness(
+        &display.records,
+        oracle_status,
+        completeness,
+    )
+    .expect("serialize completeness envelope");
+    let payload: serde_json::Value = serde_json::from_str(&json).expect("parse envelope");
+
+    assert_eq!(payload["oracle_status"]["backend"], "canonical_corpus");
+    assert_eq!(
+        payload["claim_honesty"]["verification_state"],
+        "not_verified_by_aicx"
+    );
+    assert_eq!(payload["completeness"]["complete"], false);
+    assert_eq!(
+        payload["completeness"]["identity_source"],
+        "project-bucket-v1"
+    );
+    assert_eq!(payload["completeness"]["candidate_cap"], 5_000);
+    assert_eq!(payload["completeness"]["candidate_cap_reached"], true);
+    assert_eq!(
+        payload["completeness"]["dropped_candidates"],
+        expected_dropped
+    );
+    assert_eq!(
+        payload["completeness"]["matched_project_buckets"],
+        serde_json::json!(["two/vista"])
+    );
+    assert!(
+        payload["completeness"]
+            .as_object()
+            .is_some_and(|value| !value.contains_key("skipped_project_buckets"))
+    );
+    assert!(
+        payload["completeness"]["warnings"]
+            .as_array()
+            .is_some_and(|warnings| warnings.iter().any(|warning| warning
+                .as_str()
+                .is_some_and(|warning| warning.starts_with("candidate cap of 5000 reached;"))))
+    );
+    assert_eq!(payload["completeness"]["requested_limit"], 100);
+    assert!(
+        payload["completeness"]["available_before_limit"]
+            .as_u64()
+            .is_some_and(|available| available >= 100)
+    );
+    assert_eq!(payload["completeness"]["limit_saturated"], true);
+    assert_eq!(payload["completeness"]["scope"]["match_mode"], "exact");
+    assert_eq!(
+        payload["completeness"]["scope"]["selected"],
+        serde_json::json!(["two/vista"])
+    );
+    assert_eq!(
+        payload["completeness"]["scope"]["candidates"],
+        serde_json::json!(["two/vista"])
+    );
+    assert_eq!(payload["results"], 100);
+
+    let mut legacy_completeness = payload["completeness"].clone();
+    let legacy_object = legacy_completeness
+        .as_object_mut()
+        .expect("completeness object");
+    legacy_object.insert(
+        "skipped_project_buckets".to_string(),
+        serde_json::json!(["retired/field"]),
+    );
+    legacy_object.remove("warnings");
+    let decoded: intents::IntentsCompleteness = serde_json::from_value(legacy_completeness)
+        .expect("old completeness payload remains readable");
+    assert!(decoded.warnings.is_empty());
+    let reserialized = serde_json::to_value(decoded).expect("reserialize completeness");
+    assert!(
+        reserialized
+            .as_object()
+            .is_some_and(|value| !value.contains_key("skipped_project_buckets"))
+    );
+    assert_eq!(reserialized["warnings"], serde_json::json!([]));
+
+    fs::remove_dir_all(root).expect("remove completeness corpus");
 }
 
 #[test]
