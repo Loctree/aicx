@@ -1667,7 +1667,7 @@ impl rmcp::handler::server::ServerHandler for AicxMcpServer {
                 .enable_tool_list_changed()
                 .build(),
         )
-        .with_server_info(Implementation::new("aicx-mcp", env!("CARGO_PKG_VERSION")))
+        .with_server_info(Implementation::new("aicx-mcp", crate::BUILD_VERSION))
     }
 }
 

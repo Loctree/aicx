@@ -24,7 +24,7 @@ use clap::Parser;
 #[derive(Parser)]
 #[command(name = "aicx-mcp")]
 #[command(author = "vetcoders (c)2026")]
-#[command(version)]
+#[command(version = env!("AICX_BUILD_VERSION"))]
 struct Args {
     /// Transport: stdio (default) or http. Legacy alias: sse.
     #[arg(long, value_enum, default_value_t = McpTransport::Stdio)]
@@ -173,6 +173,14 @@ mod tests {
     use super::*;
     use clap::CommandFactory as _;
     use std::net::Ipv4Addr;
+
+    #[test]
+    fn version_exposes_the_checkout_build_identity() {
+        assert_eq!(
+            Args::command().get_version(),
+            Some(env!("AICX_BUILD_VERSION"))
+        );
+    }
 
     #[test]
     fn http_host_defaults_to_loopback() {

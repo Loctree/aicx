@@ -305,7 +305,7 @@ pub(crate) fn check_aicx_home(base: &Path) -> CheckResult {
 /// where a long-running MCP service answers health checks while serving older
 /// search behavior. Diagnostic only — not part of `overall`.
 pub(crate) fn check_binary_pair() -> CheckResult {
-    let cli_version = env!("CARGO_PKG_VERSION");
+    let cli_version = crate::BUILD_VERSION;
     let probed = std::process::Command::new("aicx-mcp")
         .arg("--version")
         .output()

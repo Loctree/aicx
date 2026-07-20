@@ -80,7 +80,7 @@ fn print_intent_schema_migration_report(report: &intents::MigrationReport) {
 #[derive(Debug, Parser)]
 #[command(name = "aicx")]
 #[command(author = "(c)2026 Vetcoders")]
-#[command(version)]
+#[command(version = env!("AICX_BUILD_VERSION"))]
 #[command(verbatim_doc_comment)]
 struct Cli {
     /// Verbose diagnostics: echo per-file extractor warnings to stderr.

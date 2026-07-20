@@ -2945,7 +2945,16 @@ mod tests {
 
     #[test]
     fn write_chunks_to_dir_round_trips_signal_records_through_sidecar_file() {
-        let tmp = std::env::temp_dir().join("aicx-chunker-b1-signals-roundtrip");
+        // Unique per process+instant: a fixed name races with concurrent
+        // test processes (and the macOS TMPDIR cleaner) on this shared path.
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let tmp = std::env::temp_dir().join(format!(
+            "aicx-chunker-b1-signals-roundtrip-{}-{nonce}",
+            std::process::id()
+        ));
         let _ = fs::remove_dir_all(&tmp);
 
         let entries = vec![make_entry(

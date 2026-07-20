@@ -278,7 +278,7 @@ async fn get_health() -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "ok": true,
         "service": "aicx-dashboard",
-        "version": env!("CARGO_PKG_VERSION"),
+        "version": crate::BUILD_VERSION,
     }))
 }
 
@@ -420,7 +420,7 @@ async fn get_context(State(state): State<Arc<DashboardServerState>>) -> Json<ser
     let snapshot = state.snapshot.read().await;
     Json(serde_json::json!({
         "ok": true,
-        "version": env!("CARGO_PKG_VERSION"),
+        "version": crate::BUILD_VERSION,
         "store_root": state.config.store_root.display().to_string(),
         "host": state.config.host.to_string(),
         "port": state.config.port,
@@ -454,7 +454,7 @@ async fn get_manifest() -> Response {
 async fn get_service_worker() -> Response {
     let sw_js = concat!(
         "const CACHE_NAME='aicx-shell-v",
-        env!("CARGO_PKG_VERSION"),
+        env!("AICX_BUILD_VERSION"),
         "';\
 const SHELL_URLS=['/','/manifest.webmanifest'];\
 self.addEventListener('install',e=>{e.waitUntil(caches.open(CACHE_NAME)\

@@ -1732,6 +1732,14 @@ fn top_level_help_hides_retired_init_from_primary_surface() {
 }
 
 #[test]
+fn version_exposes_the_checkout_build_identity() {
+    assert_eq!(
+        Cli::command().get_version(),
+        Some(env!("AICX_BUILD_VERSION"))
+    );
+}
+
+#[test]
 fn top_level_help_does_not_advertise_dead_root_flags() {
     let mut cmd = Cli::command();
     let rendered = cmd.render_long_help().to_string();
