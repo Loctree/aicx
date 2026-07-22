@@ -2346,6 +2346,99 @@ fn doctor_apply_conflicts_with_dry_run() {
 }
 
 #[test]
+fn doctor_deep_flag_parses_and_defaults_off() {
+    let cli =
+        Cli::try_parse_from(["aicx", "doctor", "--deep"]).expect("doctor --deep should parse");
+    match cli.command {
+        Some(Commands::Doctor { deep, .. }) => assert!(deep),
+        _ => panic!("expected doctor command"),
+    }
+    let cli = Cli::try_parse_from(["aicx", "doctor"]).expect("bare doctor should parse");
+    match cli.command {
+        Some(Commands::Doctor { deep, .. }) => {
+            assert!(
+                !deep,
+                "deep must be opt-in; the default doctor pass is bounded"
+            )
+        }
+        _ => panic!("expected doctor command"),
+    }
+}
+
+#[test]
+fn doctor_deep_routing_covers_fix_scan_and_oracle_requests() {
+    // W2-04: the fast pass can neither fix nor certify — every remediation,
+    // script-rendering, full-scan, or oracle request must route deep; a
+    // plain read-only doctor/health run must stay bounded.
+    let base = aicx::doctor::DoctorOptions {
+        rebuild_steer_index: false,
+        fix_buckets: false,
+        dry_run: false,
+        rebuild_sidecars: false,
+        prune_empty_bodies: false,
+        apply_prune_empty_bodies: false,
+        migrate_identities: false,
+        apply_migrate_identities: false,
+        check_dedup: false,
+        verbose: false,
+        smoke: false,
+    };
+    assert!(
+        !doctor_needs_deep_pass(false, false, &base),
+        "read-only doctor without flags must use the bounded fast pass"
+    );
+    assert!(
+        doctor_needs_deep_pass(true, false, &base),
+        "--deep is explicit"
+    );
+    assert!(
+        doctor_needs_deep_pass(false, true, &base),
+        "--oracle is an automation gate and needs certified (deep) checks"
+    );
+    for mutate in [
+        aicx::doctor::DoctorOptions {
+            rebuild_steer_index: true,
+            ..base.clone()
+        },
+        aicx::doctor::DoctorOptions {
+            fix_buckets: true,
+            ..base.clone()
+        },
+        aicx::doctor::DoctorOptions {
+            rebuild_sidecars: true,
+            ..base.clone()
+        },
+        aicx::doctor::DoctorOptions {
+            prune_empty_bodies: true,
+            ..base.clone()
+        },
+        aicx::doctor::DoctorOptions {
+            migrate_identities: true,
+            ..base.clone()
+        },
+        aicx::doctor::DoctorOptions {
+            check_dedup: true,
+            ..base.clone()
+        },
+    ] {
+        assert!(
+            doctor_needs_deep_pass(false, false, &mutate),
+            "fix/full-scan flags must imply the deep pass: {mutate:?}"
+        );
+    }
+    // --smoke and --verbose are probe/verbosity toggles, not scan requests.
+    let probes = aicx::doctor::DoctorOptions {
+        smoke: true,
+        verbose: true,
+        ..base
+    };
+    assert!(
+        !doctor_needs_deep_pass(false, false, &probes),
+        "--smoke/--verbose must not silently trigger the recursive pass"
+    );
+}
+
+#[test]
 fn store_agent_filter_is_explicit_and_includes_junie() {
     let mut cmd = Cli::command();
     let store = cmd

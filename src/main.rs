@@ -1895,6 +1895,17 @@ enum Commands {
         #[arg(long)]
         smoke: bool,
 
+        /// Run the full forensic pass: recursive store scans, semantic-index
+        /// reconciliation, and payload-level checks. Emits progress phases
+        /// with heartbeats and an explicit estimated scope; Ctrl-C cancels
+        /// cleanly between operations. Without this flag (and without fix /
+        /// full-scan flags, which imply it) doctor answers from the bounded
+        /// fast health pass — metadata, leases, manifests, and sampled
+        /// invariants only; anything it cannot prove is reported as
+        /// `unknown`, never as healthy.
+        #[arg(long)]
+        deep: bool,
+
         /// Output format: text (default), json
         #[arg(long, default_value = "text")]
         format: String,
@@ -1915,7 +1926,13 @@ enum Commands {
         oracle: bool,
     },
 
-    /// Emit the full AICX health report as JSON for automation.
+    /// Emit the bounded AICX health report as JSON for automation.
+    ///
+    /// Fast by contract: metadata, leases, manifests, lock state, and
+    /// sampled invariants only — never a recursive store scan, never a
+    /// diagnostics write. Checks whose truth needs the recursive pass are
+    /// reported with `"severity": "unknown"` plus the exact deep command
+    /// (`aicx doctor --deep`); unknown is never upgraded to healthy.
     #[command(display_order = 11)]
     Health,
 
@@ -1926,6 +1943,21 @@ enum Commands {
         #[arg(short = 'j', long)]
         json: bool,
     },
+}
+
+/// Doctor mode routing: any remediation, script-rendering, full-scan
+/// analysis (`--check-dedup`), or oracle-readiness request needs the deep
+/// forensic pass — the fast pass can neither fix nor certify. Everything
+/// else answers from the bounded fast health pass, which reports what it
+/// cannot prove as `unknown` instead of scanning the store recursively.
+fn doctor_needs_deep_pass(deep: bool, oracle: bool, opts: &aicx::doctor::DoctorOptions) -> bool {
+    deep || oracle
+        || opts.rebuild_steer_index
+        || opts.fix_buckets
+        || opts.rebuild_sidecars
+        || opts.prune_empty_bodies
+        || opts.migrate_identities
+        || opts.check_dedup
 }
 
 /// Index of the top-level subcommand token: the first argument that is not
@@ -2833,6 +2865,7 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
             check_dedup,
             verbose,
             smoke,
+            deep,
             format,
             oracle,
         }) => {
@@ -2855,6 +2888,7 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
                 || apply
                 || check_dedup
                 || oracle
+                || deep
                 || format == "json";
             if force || yes {
                 let rt = tokio::runtime::Runtime::new()
@@ -2923,10 +2957,43 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
                 verbose,
                 smoke,
             };
+            let deep_pass = doctor_needs_deep_pass(deep, oracle, &opts);
             let rt = tokio::runtime::Runtime::new()
                 .context("Failed to start tokio runtime for doctor")?;
-            let report = match rt.block_on(aicx::doctor::run(&opts)) {
-                Ok(report) => report,
+            let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let reporter: std::sync::Arc<dyn aicx::progress::Reporter> = if deep_pass {
+                aicx::progress::select_reporter(format == "json")
+            } else {
+                std::sync::Arc::new(aicx::progress::NoopReporter)
+            };
+            if deep_pass {
+                // Cooperative cancellation: first Ctrl-C flips the flag and
+                // the run winds down cleanly between operations (read-only
+                // scans are abandoned; remediations are recoverable moves
+                // that either completed or never started).
+                let cancel_signal = cancel.clone();
+                rt.spawn(async move {
+                    if tokio::signal::ctrl_c().await.is_ok() {
+                        cancel_signal.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                });
+            }
+            let run_outcome = rt.block_on(aicx::doctor::run(
+                None,
+                &opts,
+                deep_pass,
+                reporter,
+                cancel.clone(),
+            ));
+            let report = match run_outcome {
+                Ok(Some(report)) => report,
+                Ok(None) => {
+                    eprintln!(
+                        "aicx doctor: cancelled by operator; completed phases remain valid, \
+                         quarantine moves are recoverable, nothing was left mid-write."
+                    );
+                    std::process::exit(130);
+                }
                 Err(err) => {
                     // CLI-boundary failure-as-state for doctor. Catch the
                     // historical `--prune-empty-bodies` crash class (chunk
@@ -3001,7 +3068,17 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
             };
             let rt = tokio::runtime::Runtime::new()
                 .context("Failed to start tokio runtime for health")?;
-            let report = rt.block_on(aicx::doctor::run(&opts))?;
+            // Health is the bounded fast pass by contract: read-only, no
+            // recursive scan, no diagnostics write, no cancellation surface.
+            let report = rt
+                .block_on(aicx::doctor::run(
+                    None,
+                    &opts,
+                    false,
+                    std::sync::Arc::new(aicx::progress::NoopReporter),
+                    std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                ))?
+                .expect("fast health has no cancel source");
             println!("{}", serde_json::to_string_pretty(&report)?);
             std::process::exit(match report.overall {
                 aicx::doctor::Severity::Critical => 1,

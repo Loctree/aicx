@@ -1,17 +1,33 @@
 //! Diagnostic checks and the doctor run orchestrator.
 //!
-//! `run` / `run_at` execute every integrity check, apply requested
-//! remediations (steer rebuild, bucket quarantine, empty-body
-//! quarantine), then re-check and aggregate an overall severity.
+//! `run` is the CLI entrypoint and picks between two contracts:
+//!
+//! - **fast health** (`deep = false`): bounded metadata / lease / manifest
+//!   reads plus sampled invariants under an explicit filesystem-call budget
+//!   ([`FAST_HEALTH_FS_BUDGET`]) — never a recursive payload scan, so the
+//!   first result lands well under two seconds even on a multi-gigabyte
+//!   store. Facts the fast pass cannot prove within the budget are reported
+//!   as `Unknown` together with the exact deep command; unknown is never
+//!   upgraded to healthy.
+//! - **deep forensics** (`deep = true`): every integrity check plus the
+//!   requested remediations, wrapped in progress phases with heartbeats,
+//!   an explicit estimated scope, and cooperative cancellation.
+//!
+//! `run_at` keeps the historical silent-deep contract for in-crate callers
+//! (cleanup orchestration, the API boundary, and tests).
 
 use anyhow::{Context, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
 
+use crate::progress::{Heartbeat, NoopReporter, Phase, Reporter};
 use crate::sanitize;
 use crate::steer_index;
 use crate::store;
+use crate::store::canonical_projection::StageInventoryEntry;
 use crate::validation::{is_valid_repo_bucket_name, is_valid_repo_project_slug};
 
 use super::quarantine::{
@@ -22,26 +38,226 @@ use super::quarantine::{
 use super::report::max_severity;
 use super::types::{CheckResult, DoctorOptions, DoctorReport, Severity, doctor_home_label};
 
-pub async fn run(opts: &DoctorOptions) -> Result<DoctorReport> {
-    let base = store::store_base_dir().context("Failed to resolve aicx store base directory")?;
-    run_at(&base, opts).await
+/// CLI doctor/health entrypoint (only `main.rs` calls this).
+///
+/// `deep = false` runs the bounded fast health pass; `deep = true` runs the
+/// full forensic pass with progress reported through `reporter` and
+/// cooperative cancellation via `cancel`. Returns `Ok(None)` when the run
+/// was cancelled — every completed phase remains valid, nothing was left in
+/// an unrecoverable state (deep checks are read-only; remediations are
+/// recoverable quarantine moves that either completed or did not start).
+pub async fn run(
+    base_override: Option<&Path>,
+    opts: &DoctorOptions,
+    deep: bool,
+    reporter: Arc<dyn Reporter>,
+    cancel: Arc<AtomicBool>,
+) -> Result<Option<DoctorReport>> {
+    let base = match base_override {
+        Some(base) => base.to_path_buf(),
+        None => store::store_base_dir().context("Failed to resolve aicx store base directory")?,
+    };
+    if deep {
+        run_deep_impl(&base, opts, reporter, cancel).await
+    } else {
+        let mut budget = FsBudget::new(FAST_HEALTH_FS_BUDGET);
+        Ok(Some(run_fast_impl(&base, opts, &mut budget).await))
+    }
 }
 
+/// Historical silent-deep contract: full checks, no progress surface, not
+/// cancellable. Kept stable for cleanup orchestration, `api.rs`, and tests.
 pub async fn run_at(base: &Path, opts: &DoctorOptions) -> Result<DoctorReport> {
-    let mut canonical_store = check_canonical_store(base);
+    let report = run_deep_impl(
+        base,
+        opts,
+        Arc::new(NoopReporter),
+        Arc::new(AtomicBool::new(false)),
+    )
+    .await?;
+    Ok(report.expect("doctor run without a cancel source cannot be cancelled"))
+}
+
+/// Poll-based cancellable wrapper for a blocking, read-only check. The check
+/// runs on a helper thread; on cancellation the thread is abandoned (it
+/// finishes in the background — checks never write, so abandonment cannot
+/// corrupt state) and `None` is returned immediately.
+fn run_check_cancellable<T: Send + 'static>(
+    cancel: &AtomicBool,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
+    if cancel.load(Ordering::Relaxed) {
+        return None;
+    }
+    let handle = std::thread::spawn(f);
+    loop {
+        if handle.is_finished() {
+            return match handle.join() {
+                Ok(value) => Some(value),
+                Err(panic) => std::panic::resume_unwind(panic),
+            };
+        }
+        if cancel.load(Ordering::Relaxed) {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// Bounded estimate of canonical-chunk scope from `index.json` alone (one
+/// file read, no store traversal). `None` when the manifest is missing or
+/// unreadable — callers must report "unknown", never guess.
+fn index_tuple_count(base: &Path) -> Option<usize> {
+    let raw = sanitize::read_to_string_validated(&base.join("index.json")).ok()?;
+    let index = serde_json::from_str::<store::StoreIndex>(&raw).ok()?;
+    let mut tuples = 0usize;
+    for (_, project_index) in index.projects {
+        for (_, agent_index) in project_index.agents {
+            tuples += agent_index.dates.len();
+        }
+    }
+    Some(tuples)
+}
+
+async fn run_deep_impl(
+    base: &Path,
+    opts: &DoctorOptions,
+    reporter: Arc<dyn Reporter>,
+    cancel: Arc<AtomicBool>,
+) -> Result<Option<DoctorReport>> {
+    let estimated_tuples = index_tuple_count(base);
+
+    // Local shorthand: run one blocking check inside the current phase or
+    // bail out of the whole deep run on cancellation, closing the phase and
+    // stopping its heartbeat first.
+    macro_rules! check {
+        ($phase:expr, $hb:expr, $f:expr) => {
+            match run_check_cancellable(cancel.as_ref(), $f) {
+                Some(value) => value,
+                None => {
+                    $hb.stop();
+                    $phase.finish_err("cancelled by operator", None);
+                    return Ok(None);
+                }
+            }
+        };
+    }
+
+    // ---- doctor_quick: bounded checks (no store traversal) ----
+    let phase = Phase::start(reporter.clone(), "doctor_quick", Some(9));
+    let hb = Heartbeat::spawn_with_backoff(
+        phase.clone(),
+        Duration::from_millis(500),
+        Duration::from_secs(5),
+    );
+    let aicx_home = check_aicx_home(base);
+    phase.tick(1);
+    let mut state = {
+        let base = base.to_path_buf();
+        check!(phase, hb, move || check_state(&base))
+    };
+    phase.tick(2);
+    if cancel.load(Ordering::Relaxed) {
+        hb.stop();
+        phase.finish_err("cancelled by operator", None);
+        return Ok(None);
+    }
     let mut steer_lance = check_steer_lance(base).await;
-    let mut steer_bm25 = check_steer_bm25(base);
-    let mut state = check_state(base);
-    let mut sidecars = check_sidecar_coverage(base);
-    let mut corpus_buckets = check_corpus_buckets(base);
-    let mut noise_health = check_noise_health(base);
-    let mut semantic_health = check_semantic_health(opts);
-    let mut index_freshness = check_index_freshness(base);
-    let mut index_consistency = check_index_consistency(base);
-    let mut embedder_warmth = check_embedder_warmth(opts);
-    let mut empty_body_chunks = check_empty_body_chunks(base);
+    phase.tick(3);
+    let mut steer_bm25 = {
+        let base = base.to_path_buf();
+        check!(phase, hb, move || check_steer_bm25(&base))
+    };
+    phase.tick(4);
+    let mut semantic_health = {
+        let opts = opts.clone();
+        check!(phase, hb, move || check_semantic_health(&opts))
+    };
+    phase.tick(5);
+    let mut embedder_warmth = {
+        let opts = opts.clone();
+        check!(phase, hb, move || check_embedder_warmth(&opts))
+    };
+    phase.tick(6);
+    let mut corpus_buckets = {
+        let base = base.to_path_buf();
+        check!(phase, hb, move || check_corpus_buckets(&base))
+    };
+    phase.tick(7);
+    let binary_pair = check!(phase, hb, check_binary_pair);
+    phase.tick(8);
+    let http_auth_token = check_http_auth_token();
+    phase.tick(9);
+    hb.stop();
+    phase.finish_ok("bounded checks complete");
+
+    // ---- doctor_store_scan: recursive canonical-store inventory ----
+    let scope_summary = match estimated_tuples {
+        Some(tuples) => format!("estimated scope: {tuples} chunk tuple(s) per index.json"),
+        None => "estimated scope: unknown (no readable index.json)".to_string(),
+    };
+    let phase = Phase::start(
+        reporter.clone(),
+        "doctor_store_scan",
+        estimated_tuples.map(|t| t as u64),
+    );
+    let hb = Heartbeat::spawn_with_backoff(
+        phase.clone(),
+        Duration::from_millis(500),
+        Duration::from_secs(10),
+    );
+    let mut canonical_store = {
+        let base = base.to_path_buf();
+        check!(phase, hb, move || check_canonical_store(&base))
+    };
+    hb.stop();
+    phase.finish_ok(format!("{}; {scope_summary}", canonical_store.detail));
+
+    // ---- doctor_index_scan: semantic index freshness + consistency ----
+    let phase = Phase::start(reporter.clone(), "doctor_index_scan", Some(2));
+    let hb = Heartbeat::spawn_with_backoff(
+        phase.clone(),
+        Duration::from_millis(500),
+        Duration::from_secs(10),
+    );
+    let mut index_freshness = {
+        let base = base.to_path_buf();
+        check!(phase, hb, move || check_index_freshness(&base))
+    };
+    phase.tick(1);
+    let mut index_consistency = {
+        let base = base.to_path_buf();
+        check!(phase, hb, move || check_index_consistency(&base))
+    };
+    phase.tick(2);
+    hb.stop();
+    phase.finish_ok("index scans complete");
+
+    // ---- doctor_content_scan: sidecars, noise, payload-level checks ----
+    let phase = Phase::start(reporter.clone(), "doctor_content_scan", Some(5));
+    let hb = Heartbeat::spawn_with_backoff(
+        phase.clone(),
+        Duration::from_millis(500),
+        Duration::from_secs(10),
+    );
+    let mut sidecars = {
+        let base = base.to_path_buf();
+        check!(phase, hb, move || check_sidecar_coverage(&base))
+    };
+    phase.tick(1);
+    let mut noise_health = {
+        let base = base.to_path_buf();
+        check!(phase, hb, move || check_noise_health(&base))
+    };
+    phase.tick(2);
+    let mut empty_body_chunks = {
+        let base = base.to_path_buf();
+        check!(phase, hb, move || check_empty_body_chunks(&base))
+    };
+    phase.tick(3);
     let mut content_dedup = if opts.check_dedup {
-        check_content_dedup(base)
+        let base = base.to_path_buf();
+        check!(phase, hb, move || check_content_dedup(&base))
     } else {
         CheckResult {
             name: "content_dedup".to_string(),
@@ -50,17 +266,44 @@ pub async fn run_at(base: &Path, opts: &DoctorOptions) -> Result<DoctorReport> {
             recommendation: None,
         }
     };
-    let mut context_corpus = check_context_corpus(base);
-
-    // Informational diagnostics — deliberately NOT folded into `overall`.
-    // They report where the runtime resolved its home, whether the CLI and
-    // aicx-mcp binaries match on PATH, and where the HTTP auth token comes
-    // from. Health gating stays with the canonical/index checks above.
-    let aicx_home = check_aicx_home(base);
-    let binary_pair = check_binary_pair();
-    let http_auth_token = check_http_auth_token();
-
+    phase.tick(4);
+    let mut context_corpus = {
+        let base = base.to_path_buf();
+        check!(phase, hb, move || check_context_corpus(&base))
+    };
+    phase.tick(5);
+    hb.stop();
+    phase.finish_ok("content scans complete");
     let mut fixes_applied = Vec::new();
+    let wants_fixes = opts.rebuild_steer_index
+        || opts.fix_buckets
+        || opts.migrate_identities
+        || (opts.prune_empty_bodies && opts.apply_prune_empty_bodies);
+    let mut fix_phase = if wants_fixes {
+        let phase = Phase::start(reporter.clone(), "doctor_fix", None);
+        let hb = Heartbeat::spawn_with_backoff(
+            phase.clone(),
+            Duration::from_millis(500),
+            Duration::from_secs(10),
+        );
+        Some((phase, hb))
+    } else {
+        None
+    };
+    // Cooperative cancel point between remediation blocks: each block is a
+    // recoverable quarantine/rebuild that either completed or did not start.
+    macro_rules! fix_cancel_point {
+        () => {
+            if cancel.load(Ordering::Relaxed) {
+                if let Some((phase, hb)) = fix_phase.take() {
+                    hb.stop();
+                    phase.finish_err("cancelled by operator", None);
+                }
+                return Ok(None);
+            }
+        };
+    }
+    fix_cancel_point!();
     let rebuild_sidecars_script = if opts.rebuild_sidecars {
         Some(render_rebuild_sidecars_script(base)?)
     } else {
@@ -222,29 +465,97 @@ pub async fn run_at(base: &Path, opts: &DoctorOptions) -> Result<DoctorReport> {
         }
     }
 
+    if let Some((phase, hb)) = fix_phase.take() {
+        hb.stop();
+        phase.finish_ok(format!("{} remediation line(s)", fixes_applied.len()));
+    }
+
     if opts.rebuild_steer_index
         || opts.fix_buckets
         || apply_empty_bodies
         || (opts.migrate_identities && opts.apply_migrate_identities)
     {
-        canonical_store = check_canonical_store(base);
+        let phase = Phase::start(reporter.clone(), "doctor_recheck", Some(13));
+        let hb = Heartbeat::spawn_with_backoff(
+            phase.clone(),
+            Duration::from_millis(500),
+            Duration::from_secs(10),
+        );
+        canonical_store = {
+            let base = base.to_path_buf();
+            check!(phase, hb, move || check_canonical_store(&base))
+        };
+        phase.tick(1);
+        if cancel.load(Ordering::Relaxed) {
+            hb.stop();
+            phase.finish_err("cancelled by operator", None);
+            return Ok(None);
+        }
         steer_lance = check_steer_lance(base).await;
-        steer_bm25 = check_steer_bm25(base);
-        state = check_state(base);
-        sidecars = check_sidecar_coverage(base);
-        corpus_buckets = check_corpus_buckets(base);
-        noise_health = check_noise_health(base);
-        semantic_health = check_semantic_health(opts);
-        index_freshness = check_index_freshness(base);
-        index_consistency = check_index_consistency(base);
-        embedder_warmth = check_embedder_warmth(opts);
-        empty_body_chunks = check_empty_body_chunks(base);
+        phase.tick(2);
+        steer_bm25 = {
+            let base = base.to_path_buf();
+            check!(phase, hb, move || check_steer_bm25(&base))
+        };
+        phase.tick(3);
+        state = {
+            let base = base.to_path_buf();
+            check!(phase, hb, move || check_state(&base))
+        };
+        phase.tick(4);
+        sidecars = {
+            let base = base.to_path_buf();
+            check!(phase, hb, move || check_sidecar_coverage(&base))
+        };
+        phase.tick(5);
+        corpus_buckets = {
+            let base = base.to_path_buf();
+            check!(phase, hb, move || check_corpus_buckets(&base))
+        };
+        phase.tick(6);
+        noise_health = {
+            let base = base.to_path_buf();
+            check!(phase, hb, move || check_noise_health(&base))
+        };
+        phase.tick(7);
+        semantic_health = {
+            let opts = opts.clone();
+            check!(phase, hb, move || check_semantic_health(&opts))
+        };
+        phase.tick(8);
+        index_freshness = {
+            let base = base.to_path_buf();
+            check!(phase, hb, move || check_index_freshness(&base))
+        };
+        phase.tick(9);
+        index_consistency = {
+            let base = base.to_path_buf();
+            check!(phase, hb, move || check_index_consistency(&base))
+        };
+        phase.tick(10);
+        embedder_warmth = {
+            let opts = opts.clone();
+            check!(phase, hb, move || check_embedder_warmth(&opts))
+        };
+        phase.tick(11);
+        empty_body_chunks = {
+            let base = base.to_path_buf();
+            check!(phase, hb, move || check_empty_body_chunks(&base))
+        };
+        phase.tick(12);
         content_dedup = if opts.check_dedup {
-            check_content_dedup(base)
+            let base = base.to_path_buf();
+            check!(phase, hb, move || check_content_dedup(&base))
         } else {
             content_dedup
         };
-        context_corpus = check_context_corpus(base);
+        context_corpus = {
+            let base = base.to_path_buf();
+            check!(phase, hb, move || check_context_corpus(&base))
+        };
+        phase.tick(13);
+        hb.stop();
+        phase.finish_ok("post-fix recheck complete");
     }
 
     let sidecar_coverage = sidecars.clone();
@@ -266,7 +577,7 @@ pub async fn run_at(base: &Path, opts: &DoctorOptions) -> Result<DoctorReport> {
         context_corpus.severity,
     ]);
 
-    Ok(DoctorReport {
+    Ok(Some(DoctorReport {
         schema_version: 2,
         canonical_store,
         steer_lance,
@@ -290,6 +601,425 @@ pub async fn run_at(base: &Path, opts: &DoctorOptions) -> Result<DoctorReport> {
         prune_empty_bodies_script,
         fixes_applied,
         overall,
+    }))
+}
+
+/// Filesystem-call budget for the fast health pass. Every directory listing,
+/// metadata probe, and bounded file read charges the budget; once exhausted
+/// the fast pass stops touching the filesystem and reports what it could not
+/// prove as `Unknown`. The cap is sized so a worst-case fast run stays well
+/// under the two-second latency bound on cold caches.
+pub(crate) const FAST_HEALTH_FS_BUDGET: usize = 8192;
+
+/// Sidecar sample ceiling for the fast pass when the bounded walk could not
+/// finish the whole store within budget.
+const FAST_SIDECAR_SAMPLE: usize = 64;
+
+/// Instrumented filesystem-call budget. `charge` returns `false` once the
+/// budget is exhausted so callers can stop traversing instead of scanning on.
+pub(crate) struct FsBudget {
+    used: usize,
+    limit: usize,
+}
+
+impl FsBudget {
+    pub(crate) fn new(limit: usize) -> Self {
+        Self { used: 0, limit }
+    }
+
+    fn charge(&mut self, n: usize) -> bool {
+        self.used = self.used.saturating_add(n);
+        self.used <= self.limit
+    }
+
+    fn exhausted(&self) -> bool {
+        self.used > self.limit
+    }
+
+    #[cfg(test)]
+    pub(crate) fn used(&self) -> usize {
+        self.used
+    }
+}
+
+/// Outcome of the bounded store walk: chunk files found so far and whether
+/// the walk covered the whole tree before hitting the budget.
+struct BoundedWalk {
+    chunk_files: Vec<PathBuf>,
+    complete: bool,
+}
+
+/// Budgeted, depth-capped walk over the canonical store collecting chunk
+/// files (`*.md`). Dot-prefixed directories (projection stages, hidden
+/// scratch) are skipped — stage inventory has its own bounded reader. The
+/// walk stops the moment the budget is exhausted and reports `complete =
+/// false`; it never degrades into the recursive full scan.
+fn bounded_store_walk(root: &Path, budget: &mut FsBudget) -> BoundedWalk {
+    const MAX_DEPTH: usize = 8;
+    let mut chunk_files = Vec::new();
+    if !budget.charge(1) || !root.is_dir() {
+        return BoundedWalk {
+            chunk_files,
+            complete: !budget.exhausted(),
+        };
+    }
+    let mut stack: Vec<(PathBuf, usize)> = vec![(root.to_path_buf(), 0)];
+    while let Some((dir, depth)) = stack.pop() {
+        if !budget.charge(1) {
+            return BoundedWalk {
+                chunk_files,
+                complete: false,
+            };
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if !budget.charge(1) {
+                return BoundedWalk {
+                    chunk_files,
+                    complete: false,
+                };
+            }
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let path = entry.path();
+            let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+            if is_dir {
+                if name.starts_with('.') {
+                    continue;
+                }
+                if depth < MAX_DEPTH {
+                    stack.push((path, depth + 1));
+                }
+            } else if path.extension().is_some_and(|ext| ext == "md") {
+                chunk_files.push(path);
+            }
+        }
+    }
+    BoundedWalk {
+        chunk_files,
+        complete: true,
+    }
+}
+
+/// Fast-pass placeholder for a check whose truth requires a recursive scan.
+/// Unknown is a hard floor: fast health never upgrades it to healthy, and
+/// the recommendation carries the exact deep command.
+fn unmeasured_in_fast(name: &str, what: &str) -> CheckResult {
+    CheckResult {
+        name: name.to_string(),
+        severity: Severity::Unknown,
+        detail: format!("{what} not measured by fast health (bounded run)"),
+        recommendation: Some("Run `aicx doctor --deep` for the full recursive scan".to_string()),
+    }
+}
+
+/// Bounded canonical-store check: projection-stage lease inventory (metadata
+/// only) plus a chunk inventory that is either proven by a completed bounded
+/// walk or taken from `index.json`; when neither source answers, the check
+/// reports unknown with the deep command instead of guessing.
+fn check_canonical_store_fast(
+    base: &Path,
+    walk: &BoundedWalk,
+    budget: &mut FsBudget,
+) -> CheckResult {
+    let store_root = base.join("store");
+    budget.charge(1);
+    if !store_root.exists() {
+        return CheckResult {
+            name: "canonical_store".to_string(),
+            severity: Severity::Warning,
+            detail: format!("Canonical store does not exist at {}", store_root.display()),
+            recommendation: Some("Run `aicx store -H 168` to populate".to_string()),
+        };
+    }
+    let stages = crate::store::canonical_projection::inspect_projection_stages_at(&store_root);
+    budget.charge(1 + stages.len().saturating_mul(4));
+    let (inventory, inventory_known) = if walk.complete {
+        (
+            format!(
+                "{} chunk file(s) counted by bounded walk",
+                walk.chunk_files.len()
+            ),
+            true,
+        )
+    } else {
+        budget.charge(1);
+        match index_tuple_count(base) {
+            Some(tuples) => (
+                format!(
+                    "index.json lists {tuples} project/agent/date tuple(s) (payload not scanned)"
+                ),
+                true,
+            ),
+            None => (
+                "chunk inventory unknown (bounded walk hit budget, index.json unreadable)"
+                    .to_string(),
+                false,
+            ),
+        }
+    };
+    let stage_summary = summarize_projection_stages(&stages);
+    let (severity, recommendation) = match &stage_summary {
+        Some(summary) => (summary.severity, summary.recommendation.clone()),
+        None if inventory_known => (Severity::Green, None),
+        None => (
+            Severity::Unknown,
+            Some("Run `aicx doctor --deep` for the full store scan".to_string()),
+        ),
+    };
+    let detail = match &stage_summary {
+        Some(summary) => format!(
+            "{inventory}; {} projection stage(s): {}; sample: {}",
+            summary.count, summary.breakdown, summary.sample
+        ),
+        None => inventory,
+    };
+    CheckResult {
+        name: "canonical_store".to_string(),
+        severity,
+        detail,
+        recommendation,
+    }
+}
+
+/// Bounded sidecar check: full verification when the bounded walk finished
+/// the store within budget, otherwise a sampled invariant. A missing sidecar
+/// in the sample degrades to Warning (fail-closed upward); a clean sample
+/// stays `Unknown` — a sample is not coverage proof.
+fn check_sidecars_fast(walk: &BoundedWalk, budget: &mut FsBudget) -> CheckResult {
+    let mut checked = 0usize;
+    let mut missing = 0usize;
+    let mut verification_complete = walk.complete;
+    for chunk in &walk.chunk_files {
+        if !walk.complete && checked >= FAST_SIDECAR_SAMPLE {
+            break;
+        }
+        if !budget.charge(1) {
+            verification_complete = false;
+            break;
+        }
+        checked += 1;
+        if !store::sidecar_path_for_chunk(chunk).exists() {
+            missing += 1;
+        }
+    }
+    if missing > 0 {
+        return CheckResult {
+            name: "sidecars".to_string(),
+            severity: Severity::Warning,
+            detail: format!(
+                "{missing}/{checked} sampled chunk(s) missing sidecars (fast sample)"
+            ),
+            recommendation: Some(
+                "Run `aicx doctor --deep` for full coverage, then `aicx store --full-rescan` to backfill"
+                    .to_string(),
+            ),
+        };
+    }
+    if verification_complete && checked == walk.chunk_files.len() {
+        return CheckResult {
+            name: "sidecars".to_string(),
+            severity: Severity::Green,
+            detail: if checked == 0 {
+                "no chunks to check".to_string()
+            } else {
+                format!("{checked}/{checked} chunks have sidecars (verified within fast budget)")
+            },
+            recommendation: None,
+        };
+    }
+    CheckResult {
+        name: "sidecars".to_string(),
+        severity: Severity::Unknown,
+        detail: if checked == 0 {
+            "no chunks sampled (budget exhausted before any chunk)".to_string()
+        } else {
+            format!("sampled {checked} chunk(s): all sidecars present (sample, not coverage)")
+        },
+        recommendation: Some(
+            "Run `aicx doctor --deep` for the full sidecar coverage scan".to_string(),
+        ),
+    }
+}
+
+/// Bounded context-corpus check: existence-level truth only; a populated
+/// corpus tree requires the deep batch walk.
+fn check_context_corpus_fast(base: &Path, budget: &mut FsBudget) -> CheckResult {
+    let corpus_root = base.join(store::CONTEXT_CORPUS_DIRNAME);
+    budget.charge(1);
+    if !corpus_root.exists() {
+        return CheckResult {
+            name: "context_corpus".to_string(),
+            severity: Severity::Green,
+            detail: format!(
+                "context-corpus: empty (will be created on first `aicx ingest --source loct-context-pack`) at {}",
+                corpus_root.display()
+            ),
+            recommendation: None,
+        };
+    }
+    unmeasured_in_fast("context_corpus", "context-corpus batch walk")
+}
+
+/// The bounded fast health pass. Reads metadata, leases, manifests, lock
+/// state, and sampled invariants under `budget`; never a recursive payload
+/// scan. Exposed with an explicit budget for the instrumented tests.
+pub(crate) async fn run_fast_impl(
+    base: &Path,
+    opts: &DoctorOptions,
+    budget: &mut FsBudget,
+) -> DoctorReport {
+    let store_root = base.join("store");
+    let walk = bounded_store_walk(&store_root, budget);
+
+    let canonical_store = check_canonical_store_fast(base, &walk, budget);
+    let steer_lance = check_steer_lance(base).await;
+    let steer_bm25 = check_steer_bm25(base);
+    let state = check_state(base);
+    let sidecars = check_sidecars_fast(&walk, budget);
+    let corpus_buckets = check_corpus_buckets(base);
+    let noise_health = unmeasured_in_fast("noise_health", "sidecar noise aggregation");
+    let semantic_health = check_semantic_health(opts);
+    let index_freshness = unmeasured_in_fast("index_freshness", "recursive store mtime scan");
+    let index_consistency =
+        unmeasured_in_fast("index_consistency", "index.json vs store reconciliation");
+    let embedder_warmth = check_embedder_warmth(opts);
+    let empty_body_chunks = unmeasured_in_fast("empty_body_chunks", "chunk payload scan");
+    let content_dedup = if opts.check_dedup {
+        unmeasured_in_fast("content_dedup", "content hash sweep")
+    } else {
+        CheckResult {
+            name: "content_dedup".to_string(),
+            severity: Severity::Green,
+            detail: "not requested".to_string(),
+            recommendation: None,
+        }
+    };
+    let context_corpus = check_context_corpus_fast(base, budget);
+    let aicx_home = check_aicx_home(base);
+    let binary_pair = check_binary_pair();
+    let http_auth_token = check_http_auth_token();
+
+    let sidecar_coverage = sidecars.clone();
+    let overall = max_severity(&[
+        canonical_store.severity,
+        steer_lance.severity,
+        steer_bm25.severity,
+        state.severity,
+        sidecars.severity,
+        corpus_buckets.severity,
+        noise_health.severity,
+        semantic_health.severity,
+        index_freshness.severity,
+        index_consistency.severity,
+        embedder_warmth.severity,
+        empty_body_chunks.severity,
+        content_dedup.severity,
+        context_corpus.severity,
+    ]);
+
+    DoctorReport {
+        schema_version: 2,
+        canonical_store,
+        steer_lance,
+        steer_bm25,
+        state,
+        sidecars,
+        corpus_buckets,
+        noise_health,
+        semantic_health,
+        index_freshness,
+        index_consistency,
+        sidecar_coverage,
+        embedder_warmth,
+        empty_body_chunks,
+        content_dedup,
+        context_corpus,
+        aicx_home,
+        binary_pair,
+        http_auth_token,
+        rebuild_sidecars_script: None,
+        prune_empty_bodies_script: None,
+        fixes_applied: Vec::new(),
+        overall,
+    }
+}
+
+/// Shared projection-stage rollup used by both the deep canonical-store
+/// check and the fast variant, so their severity/wording cannot drift.
+struct StageSummary {
+    severity: Severity,
+    count: usize,
+    breakdown: String,
+    sample: String,
+    recommendation: Option<String>,
+}
+
+fn summarize_projection_stages(stages: &[StageInventoryEntry]) -> Option<StageSummary> {
+    if stages.is_empty() {
+        return None;
+    }
+    let mut counts: BTreeMap<&'static str, usize> = BTreeMap::new();
+    for stage in stages {
+        *counts.entry(stage.class.as_str()).or_insert(0) += 1;
+    }
+    let breakdown = counts
+        .iter()
+        .map(|(class, count)| format!("{class}={count}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sample = stages
+        .iter()
+        .take(3)
+        .map(|stage| {
+            format!(
+                "{} [{}: {}]",
+                stage.path.display(),
+                stage.class.as_str(),
+                stage.reason
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    let quarantine_eligible = stages
+        .iter()
+        .filter(|stage| stage.class.quarantine_eligible())
+        .count();
+    let unproven = stages.iter().any(|stage| {
+        matches!(
+            stage.class,
+            crate::store::canonical_projection::StageClass::Stale
+                | crate::store::canonical_projection::StageClass::UnknownOwner
+        )
+    });
+
+    let severity = if quarantine_eligible > 0 || unproven {
+        Severity::Warning
+    } else {
+        Severity::Green
+    };
+    let recommendation = if quarantine_eligible > 0 {
+        Some(
+            "Dead/drifted canonical-projection stage(s) hold unpromoted payload. Run `aicx doctor --fix-buckets --dry-run` to preview, then `aicx doctor --fix-buckets` for a recoverable quarantine move; final deletion stays with the operator via the quarantine manifest."
+                .to_string(),
+        )
+    } else if unproven {
+        Some(
+            "Projection stage ownership is stale or cannot be proven; the stage is left in place. Inspect the stage lease (stage.json) manually before acting."
+                .to_string(),
+        )
+    } else {
+        None
+    };
+
+    Some(StageSummary {
+        severity,
+        count: stages.len(),
+        breakdown,
+        sample,
+        recommendation,
     })
 }
 
@@ -1019,77 +1749,26 @@ pub(crate) fn check_canonical_store(base: &Path) -> CheckResult {
     // lease metadata only, payload is never read. A dead stage can retain
     // tens of gigabytes with no owner — surface it, never delete it.
     let stages = crate::store::canonical_projection::inspect_projection_stages_at(&store_root);
-    if stages.is_empty() {
+    let Some(summary) = summarize_projection_stages(&stages) else {
         return CheckResult {
             name: "canonical_store".to_string(),
             severity: Severity::Green,
             detail: format!("{} chunk files indexed", files.len()),
             recommendation: None,
         };
-    }
-
-    let mut counts: BTreeMap<&'static str, usize> = BTreeMap::new();
-    for stage in &stages {
-        *counts.entry(stage.class.as_str()).or_insert(0) += 1;
-    }
-    let breakdown = counts
-        .iter()
-        .map(|(class, count)| format!("{class}={count}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let sample = stages
-        .iter()
-        .take(3)
-        .map(|stage| {
-            format!(
-                "{} [{}: {}]",
-                stage.path.display(),
-                stage.class.as_str(),
-                stage.reason
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("; ");
-    let quarantine_eligible = stages
-        .iter()
-        .filter(|stage| stage.class.quarantine_eligible())
-        .count();
-    let unproven = stages.iter().any(|stage| {
-        matches!(
-            stage.class,
-            crate::store::canonical_projection::StageClass::Stale
-                | crate::store::canonical_projection::StageClass::UnknownOwner
-        )
-    });
-
-    let severity = if quarantine_eligible > 0 || unproven {
-        Severity::Warning
-    } else {
-        Severity::Green
-    };
-    let recommendation = if quarantine_eligible > 0 {
-        Some(
-            "Dead/drifted canonical-projection stage(s) hold unpromoted payload. Run `aicx doctor --fix-buckets --dry-run` to preview, then `aicx doctor --fix-buckets` for a recoverable quarantine move; final deletion stays with the operator via the quarantine manifest."
-                .to_string(),
-        )
-    } else if unproven {
-        Some(
-            "Projection stage ownership is stale or cannot be proven; the stage is left in place. Inspect the stage lease (stage.json) manually before acting."
-                .to_string(),
-        )
-    } else {
-        None
     };
 
     CheckResult {
         name: "canonical_store".to_string(),
-        severity,
+        severity: summary.severity,
         detail: format!(
-            "{} chunk files indexed; {} projection stage(s): {breakdown}; sample: {sample}",
+            "{} chunk files indexed; {} projection stage(s): {}; sample: {}",
             files.len(),
-            stages.len(),
+            summary.count,
+            summary.breakdown,
+            summary.sample,
         ),
-        recommendation,
+        recommendation: summary.recommendation,
     }
 }
 
@@ -1649,4 +2328,122 @@ pub(crate) async fn attempt_steer_rebuild(base: &Path) -> Result<String> {
             removed.join(", ")
         }
     ))
+}
+
+#[cfg(test)]
+mod fast_health_budget_tests {
+    use super::*;
+
+    fn opts() -> DoctorOptions {
+        DoctorOptions {
+            rebuild_steer_index: false,
+            fix_buckets: false,
+            dry_run: false,
+            rebuild_sidecars: false,
+            prune_empty_bodies: false,
+            apply_prune_empty_bodies: false,
+            migrate_identities: false,
+            apply_migrate_identities: false,
+            check_dedup: false,
+            verbose: false,
+            smoke: false,
+        }
+    }
+
+    fn fixture(tag: &str, dirs: usize, files_per_dir: usize) -> PathBuf {
+        let base = std::env::temp_dir().join(format!(
+            "aicx-doctor-budget-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        for d in 0..dirs {
+            let dir = base
+                .join("store")
+                .join("sampleorg")
+                .join(format!("repo-{d}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            for f in 0..files_per_dir {
+                let chunk = dir.join(format!("chunk-{f}.md"));
+                std::fs::write(&chunk, "# chunk\n").unwrap();
+                std::fs::write(chunk.with_extension("meta.json"), "{}").unwrap();
+            }
+        }
+        base
+    }
+
+    #[test]
+    fn fast_pass_respects_the_fs_call_budget_and_degrades_to_unknown() {
+        // W2-04 red-first instrumentation: with a budget far below the tree
+        // size the fast pass must stop traversing (bounded call count) and
+        // refuse to certify — unknown, never a silent full scan.
+        let base = fixture("tiny-budget", 6, 6);
+        let limit = 10usize;
+        let mut budget = FsBudget::new(limit);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let report = rt.block_on(run_fast_impl(&base, &opts(), &mut budget));
+
+        assert!(
+            budget.used() <= limit + 8,
+            "fast pass kept charging after exhaustion: used {} vs limit {limit}",
+            budget.used()
+        );
+        assert_eq!(
+            report.canonical_store.severity,
+            Severity::Unknown,
+            "with no walk and no index.json the store inventory is unknown: {:?}",
+            report.canonical_store
+        );
+        assert!(
+            report
+                .canonical_store
+                .recommendation
+                .as_deref()
+                .is_some_and(|rec| rec.contains("aicx doctor --deep")),
+            "unknown inventory must point at the deep command"
+        );
+        assert_eq!(report.index_freshness.severity, Severity::Unknown);
+        assert_eq!(report.sidecars.severity, Severity::Unknown);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn fast_pass_fully_verifies_small_stores_within_budget() {
+        let base = fixture("small", 2, 3);
+        let mut budget = FsBudget::new(FAST_HEALTH_FS_BUDGET);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let report = rt.block_on(run_fast_impl(&base, &opts(), &mut budget));
+
+        assert_eq!(report.canonical_store.severity, Severity::Green);
+        assert!(
+            report
+                .canonical_store
+                .detail
+                .contains("6 chunk file(s) counted by bounded walk"),
+            "completed bounded walk must yield the exact chunk count: {}",
+            report.canonical_store.detail
+        );
+        assert_eq!(report.sidecars.severity, Severity::Green);
+        assert!(budget.used() <= FAST_HEALTH_FS_BUDGET);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn fast_pass_missing_sampled_sidecar_fails_closed_to_warning() {
+        let base = fixture("missing-sidecar", 1, 3);
+        // Remove one sidecar: the sampled invariant must degrade, not shrug.
+        let victim = base
+            .join("store")
+            .join("sampleorg")
+            .join("repo-0")
+            .join("chunk-1.meta.json");
+        std::fs::remove_file(&victim).unwrap();
+        let mut budget = FsBudget::new(FAST_HEALTH_FS_BUDGET);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let report = rt.block_on(run_fast_impl(&base, &opts(), &mut budget));
+        assert_eq!(report.sidecars.severity, Severity::Warning);
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }
