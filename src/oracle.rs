@@ -1,5 +1,6 @@
 //! Explicit AICX Oracle provenance for search-like surfaces.
 
+#[cfg(feature = "app")]
 use aicx_retrieve::RetrievalOutcome;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -121,6 +122,9 @@ pub struct OracleStatus {
     pub fusion_algorithm: Option<String>,
     /// Typed retrieval execution status (W1-01). One value rendered on every
     /// surface; additive key so existing JSON consumers are untouched.
+    /// App-only: the slim `loctree-consumer` profile does not link
+    /// `aicx-retrieve`, and this field is never emitted there.
+    #[cfg(feature = "app")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retrieval: Option<RetrievalOutcome>,
 }
@@ -169,6 +173,7 @@ impl OracleStatus {
             dense_count: None,
             lexical_doc_count: None,
             fusion_algorithm: None,
+            #[cfg(feature = "app")]
             retrieval: None,
         }
     }
@@ -202,6 +207,7 @@ impl OracleStatus {
             dense_count: None,
             lexical_doc_count: None,
             fusion_algorithm: None,
+            #[cfg(feature = "app")]
             retrieval: None,
         }
     }
@@ -236,6 +242,7 @@ impl OracleStatus {
             dense_count: None,
             lexical_doc_count: None,
             fusion_algorithm: None,
+            #[cfg(feature = "app")]
             retrieval: None,
         }
     }
@@ -274,6 +281,7 @@ impl OracleStatus {
             dense_count: Some(status.dense_count),
             lexical_doc_count: Some(status.lexical_doc_count),
             fusion_algorithm: Some(status.fusion_algorithm.clone()),
+            #[cfg(feature = "app")]
             retrieval: None,
         }
     }
@@ -309,6 +317,7 @@ impl OracleStatus {
             dense_count: None,
             lexical_doc_count: None,
             fusion_algorithm: None,
+            #[cfg(feature = "app")]
             retrieval: None,
         }
     }
@@ -349,6 +358,7 @@ impl OracleStatus {
             dense_count: None,
             lexical_doc_count: None,
             fusion_algorithm: None,
+            #[cfg(feature = "app")]
             retrieval: None,
         }
     }
@@ -384,6 +394,7 @@ impl OracleStatus {
             dense_count: None,
             lexical_doc_count: None,
             fusion_algorithm: None,
+            #[cfg(feature = "app")]
             retrieval: None,
         }
     }
@@ -391,6 +402,7 @@ impl OracleStatus {
     /// Attach the typed retrieval execution status. Every search-like JSON
     /// surface (CLI search/evidence, MCP search/evidence) carries this same
     /// value; renderers must not re-derive health elsewhere.
+    #[cfg(feature = "app")]
     pub fn with_retrieval(mut self, retrieval: RetrievalOutcome) -> Self {
         self.retrieval = Some(retrieval);
         self
