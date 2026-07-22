@@ -220,7 +220,9 @@ pub fn build_overlay(options: &OverlayOptions) -> Result<(OverlayDocument, Overl
             files_opened += 1 + manifest.card_ids.len();
             let mut matching: Vec<_> = projection_cards
                 .into_iter()
-                .filter(|card| card_matches_repo(card, &catalog.repo_id, &repo))
+                .filter(|card| {
+                    overlay_project_identity_matches(&card.project.slug, &catalog.repo_id)
+                })
                 .collect();
             if !matching.is_empty() {
                 revisions.insert(manifest.store_revision);
@@ -382,15 +384,12 @@ fn discover_projection_roots(root: &Path, depth: usize, found: &mut Vec<PathBuf>
     Ok(())
 }
 
-fn card_matches_repo(card: &CanonicalCard, repo_id: &str, repo: &Path) -> bool {
-    let repo_id = repo_id.to_ascii_lowercase();
-    let slug = card.project.slug.to_ascii_lowercase();
-    let repo_name = repo
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    slug == repo_id || slug == repo_name || repo_id.ends_with(&format!("/{slug}"))
+fn overlay_project_identity_matches(card_project: &str, repo_id: &str) -> bool {
+    // Overlay attribution is a publication boundary, not a query surface.
+    // Canonical owner/repo identity must therefore match exactly. In
+    // particular, a bare `repo` cannot fan out to `owner/repo`, and legacy
+    // ownerless data is addressable only through its explicit `_/repo` slug.
+    card_project.eq_ignore_ascii_case(repo_id)
 }
 
 fn combined_store_revision(revisions: &BTreeSet<String>) -> Result<String> {
@@ -1804,6 +1803,21 @@ mod tests {
         assert_ne!(revision, changed);
         assert_ne!(revision, semantic_changed);
         assert_eq!(store, format!("sr1:{}", "b".repeat(64)));
+    }
+
+    #[test]
+    fn overlay_project_identity_is_exact_and_ownerless_explicit() {
+        assert!(overlay_project_identity_matches(
+            "Loctree/aicx",
+            "loctree/AICX"
+        ));
+        assert!(overlay_project_identity_matches("_/aicx", "_/AICX"));
+        assert!(!overlay_project_identity_matches("aicx", "Loctree/aicx"));
+        assert!(!overlay_project_identity_matches(
+            "other/aicx",
+            "Loctree/aicx"
+        ));
+        assert!(!overlay_project_identity_matches("aicx", "_/aicx"));
     }
 
     #[cfg(unix)]
