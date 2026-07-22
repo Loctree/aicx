@@ -131,6 +131,53 @@ aicx-mcp --transport http --host 0.0.0.0 --allowed-host mcp.example.internal --p
 Without a matching `--allowed-host`, rmcp rejects the request before MCP tools
 run and the client sees `403 Forbidden: Host header is not allowed`.
 
+## Machine-readable runtime inspection
+
+Run the checkout binary you intend to make authoritative:
+
+```bash
+cargo run --locked --bin aicx -- config inspect --json
+```
+
+The stable `aicx.runtime_inspection.v1` object reports, without changing any
+configuration:
+
+- the exact running executable plus semver, checkout SHA, and dirty state;
+- resolved `AICX_HOME`, canonical/effective config paths, and config source;
+- every visible checkout, Cargo, local, and npm/PATH `aicx`/`aicx-mcp`
+  candidate with its resolved path, version, channel, and `match`/`drift` status;
+- the configured embedder backend/model/dimension and a credential-free endpoint
+  origin (userinfo, path, query, fragment, headers, and key values are omitted);
+- the `_all` index generation and manifest embedder identity via bounded reads of
+  `CURRENT` and `manifest.json` only—no corpus or store scan.
+
+To compare an MCP client or mux target, pass its JSON or TOML config explicitly:
+
+```bash
+aicx config inspect --json --mcp-config ~/.config/rmcp-mux/config.toml
+aicx config inspect --json --mcp-config ~/.codex/config.toml
+```
+
+Repeat `--mcp-config` for multiple clients. The inspector reports a missing,
+unreadable, stale, or matching configured executable and an operator action; it
+never rewrites the file. Wrapper commands that do not expose an identifiable
+`aicx-mcp` executable remain `unavailable` rather than being guessed.
+
+For mechanical channel comparison, run the same command through each entrypoint
+and compare `.runtime.build.version` and `.runtime.executable_path`:
+
+```bash
+./target/debug/aicx config inspect --json
+~/.cargo/bin/aicx config inspect --json
+~/.local/bin/aicx config inspect --json
+$(command -v aicx) config inspect --json
+```
+
+An npm global shim appears as channel `npm` when its visible path contains the
+npm package surface. MCP `initialize.result.serverInfo.version` is sourced from
+the same build identity as `.runtime.build.version`; disagreement means the MCP
+response came from a different running artifact or service process.
+
 ## npm Opt-in Replacement
 
 npm postinstall cannot safely prompt, so it warns by default. To let npm remove
