@@ -5,6 +5,7 @@
 //! fusion retrieval adapters plus default-on retrieval implementations.
 
 pub mod adapter_brute_force;
+pub mod adapter_mmap;
 pub mod adapter_tantivy;
 pub mod error;
 pub mod fusion_rrf;
@@ -35,5 +36,7 @@ pub use adapter_brute_force::{
     BRUTE_FORCE_KIND, BruteForceAdapter, DEFAULT_NDJSON_FILE_NAME, LoadStats, default_ndjson_path,
     load_from_ndjson,
 };
+
+pub use adapter_mmap::*;
 
 pub use adapter_tantivy::*;

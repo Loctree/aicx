@@ -11,6 +11,40 @@ use serde::{Deserialize, Serialize};
 
 use crate::ManifestError;
 
+/// Machine-readable description of the exact mmap dense artifact referenced by
+/// `Manifest::dense_kind == "exact_mmap_v1"`.
+///
+/// The binary layout is little-endian and contiguous:
+/// `header[128] | metadata_refs[count * 16] | vectors[count * dim * f32] |
+/// metadata_json`. Each reference is `(offset: u64, len: u32, reserved: u32)`
+/// relative to the metadata region. The header carries magic, schema version,
+/// endian marker, dimension, distance, count, source BLAKE3 bytes, every region
+/// offset/length, and the exact file length.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MmapDenseFormatSchema {
+    pub schema: String,
+    pub magic_ascii: String,
+    pub byte_order: String,
+    pub header_bytes: usize,
+    pub metadata_reference_bytes: usize,
+    pub vector_element: String,
+    pub layout: String,
+}
+
+impl Default for MmapDenseFormatSchema {
+    fn default() -> Self {
+        Self {
+            schema: "aicx.dense.exact_mmap.v1".to_string(),
+            magic_ascii: "AICXDMM1".to_string(),
+            byte_order: "little_endian".to_string(),
+            header_bytes: 128,
+            metadata_reference_bytes: 16,
+            vector_element: "ieee754_f32".to_string(),
+            layout: "header|metadata_refs|fixed_width_vectors|metadata_json".to_string(),
+        }
+    }
+}
+
 /// Retrieval build manifest for split lexical + dense index artifacts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Manifest {
