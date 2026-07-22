@@ -5,6 +5,9 @@
 //! opening this adapter; row metadata filters are applied before vector bytes
 //! are read. The query path keeps only metadata for the current row plus a
 //! bounded `limit` heap. It never materializes the vector payload on the heap.
+//! When no filters are set, the scan skips metadata decoding entirely and
+//! reads vector bytes straight off the map; full metadata is decoded only for
+//! the final top-`limit` rows.
 
 use std::cell::Cell;
 use std::cmp::Ordering;
@@ -31,6 +34,9 @@ const MAX_METADATA_RECORD_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MmapQueryStats {
+    /// Rows visited by the scan. Metadata bytes are decoded for these rows
+    /// only when the query carries filters; unfiltered scans visit every row
+    /// without touching the metadata region.
     pub metadata_examined: usize,
     pub vectors_scored: usize,
 }
@@ -59,6 +65,14 @@ struct MetadataRef {
 struct StoredMetadata {
     chunk_id: String,
     source_path: String,
+    metadata: serde_json::Value,
+}
+
+/// Filter-pass projection of [`StoredMetadata`]: the hot loop only needs the
+/// `metadata` object, so `chunk_id`/`source_path` string allocations are
+/// skipped while the scan decides which rows to score.
+#[derive(Debug, Deserialize)]
+struct FilterMetadata {
     metadata: serde_json::Value,
 }
 
@@ -174,7 +188,7 @@ impl MmapDenseAdapter {
         self.last_query_stats.get()
     }
 
-    fn metadata(&self, row: usize) -> Result<StoredMetadata> {
+    fn metadata_slice(&self, row: usize) -> Result<&[u8]> {
         let reference = self
             .refs
             .get(row)
@@ -185,11 +199,25 @@ impl MmapDenseAdapter {
             "metadata start",
         )?;
         let end = checked_add(start, reference.len, "metadata end")?;
-        serde_json::from_slice(&self.data[start..end])
+        Ok(&self.data[start..end])
+    }
+
+    fn metadata(&self, row: usize) -> Result<StoredMetadata> {
+        serde_json::from_slice(self.metadata_slice(row)?)
             .with_context(|| format!("parse mmap dense metadata row {row}"))
     }
 
-    fn vector_score(&self, row: usize, query: &[f32]) -> Result<f32> {
+    fn metadata_filter_value(&self, row: usize) -> Result<serde_json::Value> {
+        serde_json::from_slice::<FilterMetadata>(self.metadata_slice(row)?)
+            .map(|stored| stored.metadata)
+            .with_context(|| format!("parse mmap dense metadata row {row}"))
+    }
+
+    /// Score one stored row. Accumulation stays in the sequential order the
+    /// legacy brute-force leg uses, so scores are bit-identical across legs;
+    /// `query_norm_sq` is that same sequential self-product, hoisted out of
+    /// the scan because it does not vary per row.
+    fn vector_score(&self, row: usize, query: &[f32], query_norm_sq: f32) -> Result<f32> {
         let row_bytes = checked_mul(self.header.dim, size_of::<f32>(), "vector row bytes")?;
         let start = checked_add(
             self.header.vectors_offset,
@@ -197,35 +225,50 @@ impl MmapDenseAdapter {
             "vector start",
         )?;
         let end = checked_add(start, row_bytes, "vector end")?;
-        let bytes = &self.data[start..end];
+        let (components, remainder) = self.data[start..end].as_chunks::<4>();
+        debug_assert!(remainder.is_empty());
 
-        let mut dot = 0.0f32;
-        let mut norm_query = 0.0f32;
-        let mut norm_row = 0.0f32;
-        let mut squared_distance = 0.0f32;
-        for (component, query_component) in bytes.chunks_exact(4).zip(query.iter().copied()) {
-            let value = f32::from_le_bytes(component.try_into().expect("four-byte chunk"));
-            if !value.is_finite() || !query_component.is_finite() {
-                bail!("non-finite vector component in mmap dense row {row}");
-            }
-            dot += query_component * value;
-            norm_query += query_component * query_component;
-            norm_row += value * value;
-            let delta = query_component - value;
-            squared_distance += delta * delta;
-        }
         let score = match self.header.distance {
             Distance::Cosine => {
-                if norm_query == 0.0 || norm_row == 0.0 {
+                let mut dot = 0.0f32;
+                let mut norm_row = 0.0f32;
+                for (component, query_component) in components.iter().zip(query.iter().copied()) {
+                    let value = f32::from_le_bytes(*component);
+                    dot += query_component * value;
+                    norm_row += value * value;
+                }
+                if query_norm_sq == 0.0 || norm_row == 0.0 {
                     0.0
                 } else {
-                    dot / (norm_query.sqrt() * norm_row.sqrt())
+                    dot / (query_norm_sq.sqrt() * norm_row.sqrt())
                 }
             }
-            Distance::Dot => dot,
-            Distance::Euclidean => -squared_distance.sqrt(),
+            Distance::Dot => {
+                let mut dot = 0.0f32;
+                for (component, query_component) in components.iter().zip(query.iter().copied()) {
+                    dot += query_component * f32::from_le_bytes(*component);
+                }
+                dot
+            }
+            Distance::Euclidean => {
+                let mut squared_distance = 0.0f32;
+                for (component, query_component) in components.iter().zip(query.iter().copied()) {
+                    let delta = query_component - f32::from_le_bytes(*component);
+                    squared_distance += delta * delta;
+                }
+                -squared_distance.sqrt()
+            }
         };
         if !score.is_finite() {
+            // Fail-closed diagnostics off the hot path: a non-finite score is
+            // either a corrupt stored component or an overflow of finite
+            // inputs; distinguish them only once scoring has already failed.
+            if components
+                .iter()
+                .any(|component| !f32::from_le_bytes(*component).is_finite())
+            {
+                bail!("non-finite vector component in mmap dense row {row}");
+            }
             bail!("non-finite mmap dense score for row {row}");
         }
         Ok(score)
@@ -503,15 +546,20 @@ impl DenseIndex for MmapDenseAdapter {
             return Ok(Vec::new());
         }
 
+        let mut query_norm_sq = 0.0f32;
+        for query_component in embedding.iter().copied() {
+            query_norm_sq += query_component * query_component;
+        }
+
+        let apply_filters = !filters.values.is_empty();
         let mut stats = MmapQueryStats::default();
         let mut heap = BinaryHeap::with_capacity(limit.saturating_add(1));
         for row in 0..self.header.count {
-            let stored = self.metadata(row)?;
             stats.metadata_examined += 1;
-            if !filter_matches(&stored.metadata, filters) {
+            if apply_filters && !filter_matches(&self.metadata_filter_value(row)?, filters) {
                 continue;
             }
-            let score = self.vector_score(row, embedding)?;
+            let score = self.vector_score(row, embedding, query_norm_sq)?;
             stats.vectors_scored += 1;
             let candidate = Candidate { score, row };
             if heap.len() < limit {

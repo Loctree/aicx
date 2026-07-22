@@ -287,6 +287,140 @@ fn heap_accounting_does_not_scale_with_vector_payload() {
     assert_eq!(large_adapter.last_query_stats().vectors_scored, 1);
 }
 
+#[test]
+fn filtered_top_k_matches_legacy_on_mixed_project_corpora() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("filtered.mmap");
+    let mut rng = StdRng::seed_from_u64(0x0a1c_0011);
+    let projects = ["alpha", "beta", "gamma"];
+    let chunks: Vec<_> = (0..601)
+        .map(|index| {
+            let embedding = (0..29).map(|_| rng.gen_range(-1.0..1.0)).collect();
+            chunk(
+                format!("row-{index:04}"),
+                projects[index % projects.len()],
+                embedding,
+            )
+        })
+        .collect();
+    let query: Vec<f32> = (0..29).map(|_| rng.gen_range(-1.0..1.0)).collect();
+    let mut filters = FilterSet::default();
+    filters.values.insert("project".into(), json!("beta"));
+
+    let mut legacy = BruteForceAdapter::new(29);
+    legacy.build(&chunks).unwrap();
+    let mut mmap = MmapDenseAdapter::create(&path, 29, Distance::Cosine, SOURCE_HASH);
+    mmap.build(&chunks).unwrap();
+
+    let legacy_hits = legacy.query(&query, 13, &filters).unwrap();
+    let mmap_hits = mmap.query(&query, 13, &filters).unwrap();
+    assert_eq!(
+        mmap_hits
+            .iter()
+            .map(|hit| &hit.chunk_id)
+            .collect::<Vec<_>>(),
+        legacy_hits
+            .iter()
+            .map(|hit| &hit.chunk_id)
+            .collect::<Vec<_>>()
+    );
+    for (left, right) in mmap_hits.iter().zip(legacy_hits.iter()) {
+        assert_eq!(left.score.to_bits(), right.score.to_bits());
+    }
+    let stats = mmap.last_query_stats();
+    assert_eq!(stats.metadata_examined, 601);
+    assert_eq!(stats.vectors_scored, 200);
+}
+
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
+
+/// Manual profiling harness for the exact-scan hot loop. Mirrors the
+/// 6-project taxonomy of tools/bench_dense_migration.sh (filter hits 1 row
+/// in 6) so its numbers are comparable against the frozen budgets, and
+/// decomposes the scan into metadata-only and metadata+score passes.
+///
+/// Run (defaults 100_000 x 1024, 3 timed queries per mode):
+///   AICX_BENCH_ROWS=500000 AICX_BENCH_DIM=1024 \
+///   cargo test -p aicx-retrieve --release --test mmap_adapter -- \
+///     --ignored --nocapture profile_exact_scan_at_scale
+#[test]
+#[ignore = "manual profiling harness; see doc comment for the invocation"]
+fn profile_exact_scan_at_scale() {
+    let rows = env_usize("AICX_BENCH_ROWS", 100_000);
+    let dim = env_usize("AICX_BENCH_DIM", 1024);
+    let timed_queries = env_usize("AICX_BENCH_QUERIES", 3);
+    let top_k = env_usize("AICX_BENCH_TOP_K", 10);
+    let projects = [
+        "Loctree/aicx",
+        "loctree/AICX",
+        "aicx",
+        "loctree_aicx",
+        "Loctree/loctree",
+        "non-repository-contexts",
+    ];
+
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("profile.mmap");
+    let mut rng = StdRng::seed_from_u64(0x0a1c_0717);
+    let build_started = std::time::Instant::now();
+    let chunks: Vec<_> = (0..rows)
+        .map(|index| {
+            let embedding = (0..dim).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
+            chunk(
+                format!("bench-{index:07}"),
+                projects[index % projects.len()],
+                embedding,
+            )
+        })
+        .collect();
+    let mut adapter = MmapDenseAdapter::create(&path, dim, Distance::Cosine, SOURCE_HASH);
+    adapter.build(&chunks).expect("build profile shard");
+    drop(chunks);
+    eprintln!(
+        "profile shard rows={rows} dim={dim} mapped_bytes={} build_seconds={:.3}",
+        adapter.mapped_len(),
+        build_started.elapsed().as_secs_f64()
+    );
+
+    let query: Vec<f32> = (0..dim).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
+    let mut project_filter = FilterSet::default();
+    project_filter
+        .values
+        .insert("project".into(), json!("loctree_aicx"));
+    let mut miss_filter = FilterSet::default();
+    miss_filter
+        .values
+        .insert("project".into(), json!("no-such-project"));
+
+    // One untimed pass per mode warms the page cache the same way the
+    // shell harness measures its warm passes.
+    adapter.query(&query, top_k, &FilterSet::default()).unwrap();
+    for (mode, filters) in [
+        ("global_empty_filter", &FilterSet::default()),
+        ("project_scoped", &project_filter),
+        ("metadata_only_filter_miss", &miss_filter),
+    ] {
+        adapter.query(&query, top_k, filters).unwrap();
+        for run in 0..timed_queries {
+            let started = std::time::Instant::now();
+            let hits = adapter.query(&query, top_k, filters).unwrap();
+            let elapsed = started.elapsed().as_secs_f64();
+            let stats = adapter.last_query_stats();
+            eprintln!(
+                "profile mode={mode} run={run} seconds={elapsed:.4} hits={} metadata_examined={} vectors_scored={}",
+                hits.len(),
+                stats.metadata_examined,
+                stats.vectors_scored
+            );
+        }
+    }
+}
+
 fn read_u64(bytes: &[u8], offset: usize) -> u64 {
     u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
 }
