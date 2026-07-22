@@ -170,7 +170,7 @@ fn fresh_generation_build_creates_exactly_one_dense_payload() {
         "manifest source hash and mmap-embedded source hash share one derivation"
     );
     let dense = MmapDenseAdapter::open(
-        &generation_dir.join(MMAP_DENSE_PAYLOAD_FILE_NAME),
+        generation_dir.join(MMAP_DENSE_PAYLOAD_FILE_NAME),
         2,
         Distance::Cosine,
         Some(expected_bytes),
@@ -180,7 +180,7 @@ fn fresh_generation_build_creates_exactly_one_dense_payload() {
     drop(dense);
     assert!(
         MmapDenseAdapter::open(
-            &generation_dir.join(MMAP_DENSE_PAYLOAD_FILE_NAME),
+            generation_dir.join(MMAP_DENSE_PAYLOAD_FILE_NAME),
             2,
             Distance::Cosine,
             Some([0xAB; 32]),
