@@ -282,10 +282,23 @@ The hard budgets remain unchanged from the W4 brief:
 - exact top-k parity is 100% for equal ranking inputs
 - corrupt or interrupted generation copies must leave `CURRENT` untouched
 
+Measured verdict on 2026-07-22: **OUTCOME 2 — budgets missed**. The isolated
+500000 x 1024 run produced a 2,133,416,794 byte dense mmap payload (>=2 GiB),
+kept disk duplication low (0.0971x of the legacy pair), preserved exact top-k
+and reverse-order parity at 1.0, and left `CURRENT` untouched after corrupt and
+interrupted copies. The same run missed the warm scan budgets by a wide margin:
+global p95 317.87 s versus 8 s, project p95 55.00 s versus 2 s, with
+`/usr/bin/time -l` max RSS 55,438,983,168 bytes for the full legacy+mmap
+harness process. This is evidence for the pre-specced LanceDB / memex-search
+transplant path in `backlog/memex-search-transplant.md`; do not relax the W4
+thresholds to make the mmap exact scan look green.
+
 `--verify-only` is intentionally not production proof. It is the synchronous CI
 gate that proves the benchmark contract, byte layout, failed-copy safety checks,
 reverse-order query parity, and budget accounting still work before an operator
-runs the larger isolated corpus.
+runs the larger isolated corpus. The scale run above used one query to keep the
+foreground run bounded, so its p95 is the measured single-query latency; that is
+already far beyond the budget.
 
 ## Relationship To Roost/Rust-Memex
 

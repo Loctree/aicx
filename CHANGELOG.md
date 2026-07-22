@@ -11,7 +11,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   to build an isolated AICX_HOME-shaped corpus, compare legacy duplicate dense
   NDJSON against the mmap payload, verify failed-copy `CURRENT` safety, reverse
   query-order parity, top-k parity, disk ratio, and latency/RSS budget accounting
-  without mutating live `~/.aicx`.
+  without mutating live `~/.aicx`. The 2026-07-22 >=2 GiB isolated run falsified
+  the mmap exact-scan replacement on latency (warm global p95 317.87 s, project
+  p95 55.00 s) while preserving disk ratio 0.0971 and exact parity 1.0, so the
+  recorded verdict is OUTCOME 2 and the Lance/memex-search contingency remains
+  the next evidence path.
 - **Batched semantic-index embedding.** `aicx index` now embeds chunks in
   batches through the existing `embed_batch` API instead of one HTTP
   round-trip per chunk. For the cloud backend this collapses the dominant

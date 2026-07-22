@@ -24,8 +24,36 @@
       "warm_global_p95_max_seconds": 8.0,
       "exact_top_k_parity": 1.0
     },
+    "latest_isolated_scale_run": {
+      "date": "2026-07-22",
+      "command": "/usr/bin/time -l bash tools/bench_dense_migration.sh --rows 500000 --dim 1024 --queries 1 --top-k 10 --output W4-01_dense_full_500000x1024_q1.json",
+      "rows": 500000,
+      "dim": 1024,
+      "queries": 1,
+      "top_k": 10,
+      "dense_payload_bytes": 2133416794,
+      "legacy_duplicate_pair_bytes": 21966970064,
+      "mmap_to_legacy_duplicate_pair_ratio": 0.09711930174185901,
+      "external_time_l": {
+        "wall_seconds": 2357.7,
+        "user_cpu_seconds": 2285.99,
+        "sys_cpu_seconds": 36.92,
+        "max_rss_bytes": 55438983168
+      },
+      "warm_global_p95_seconds": 317.87143774994183,
+      "warm_project_p95_seconds": 55.00316449999809,
+      "exact_top_k_parity": 1.0,
+      "reverse_query_order_parity": 1.0,
+      "current_generation_untouched_by_failed_copies": true,
+      "outcome": "outcome_2_budgets_missed",
+      "recommendation": "trigger_memex_search_transplant_brief",
+      "limitations": [
+        "Synthetic 500000 x 1024 shape reaches a >=2 GiB dense payload but is not the exact observed 300000 x 4096 live shape.",
+        "queries=1 kept the foreground benchmark bounded; p95 equals that single measured query latency."
+      ]
+    },
     "verify_gate": "bash tools/bench_dense_migration.sh --verify-only",
-    "production_note": "--verify-only is a deterministic contract gate; production falsification must be run with a realistic isolated corpus scaled toward the observed ~300k x 4096 live shape."
+    "production_note": "--verify-only is a deterministic contract gate. The 2026-07-22 isolated >=2 GiB dense-payload run missed the warm latency budgets and triggers the Lance/memex-search contingency evidence path."
   },
   "aggregate": {
     "recall_at_5": 0.0,
