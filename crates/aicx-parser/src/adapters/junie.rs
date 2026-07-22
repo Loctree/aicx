@@ -601,6 +601,7 @@ impl<'a> Assembly<'a> {
                 boundary_flags: BoundaryFlags {
                     opaque_reasoning_present: false,
                     unsupported_visible_event: self.unsupported_visible,
+                    compaction_boundary_present: false,
                 },
                 malformed_tail_present: self.malformed_tail,
                 visible_event_lost: self.visible_lost,

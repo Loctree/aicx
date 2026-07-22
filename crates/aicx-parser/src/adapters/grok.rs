@@ -465,6 +465,7 @@ impl AgentAdapter for GrokAdapter {
                     .iter()
                     .any(|(_, v)| v.get("type").and_then(|t| t.as_str()) == Some("reasoning")),
                 unsupported_visible_event: unsupported_visible,
+                compaction_boundary_present: false,
             },
             malformed_tail_present: skipped
                 .iter()

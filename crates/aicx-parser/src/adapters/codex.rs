@@ -195,7 +195,7 @@ fn classify_raw(
     } else if let Ok(value) = parsed {
         let event_type = string_at(&value, &["type"]).unwrap_or("");
         match event_type {
-            "session_meta" | "turn_context" | "event_msg" | "response_item" => (
+            "session_meta" | "turn_context" | "event_msg" | "response_item" | "compacted" => (
                 event_type.to_owned(),
                 ClassifiedDisposition::Consumed {
                     kind: event_type.to_owned(),
@@ -249,6 +249,19 @@ fn assemble_codex(
     classified: Vec<ClassifiedUnit>,
 ) -> Result<UnvalidatedParse, AdapterError> {
     let mut state = Assembly::new(source, read);
+    // TB parity: when any response_item.message (user/assistant) exists, the
+    // matching event_msg.user_message / agent_message units are footprint-only.
+    state.have_response_item_chat = read.units.iter().any(|raw| {
+        let Ok(value) = serde_json::from_slice::<Value>(&raw.bytes) else {
+            return false;
+        };
+        string_at(&value, &["type"]) == Some("response_item")
+            && string_at(&value, &["payload", "type"]) == Some("message")
+            && matches!(
+                string_at(&value, &["payload", "role"]),
+                Some("user") | Some("assistant")
+            )
+    });
     for (raw, classified) in read.units.iter().zip(
         classified
             .iter()
@@ -297,6 +310,10 @@ struct Assembly<'a> {
     malformed_tail: bool,
     visible_lost: bool,
     session_meta_seen: bool,
+    /// True when the session contains response_item.message chat ownership.
+    have_response_item_chat: bool,
+    /// At least one compaction marker was consumed (TB context_compacted class).
+    compaction_boundary_present: bool,
 }
 
 #[derive(Clone)]
@@ -337,6 +354,8 @@ impl<'a> Assembly<'a> {
             malformed_tail: false,
             visible_lost: false,
             session_meta_seen: false,
+            have_response_item_chat: false,
+            compaction_boundary_present: false,
         }
     }
 
@@ -353,6 +372,11 @@ impl<'a> Assembly<'a> {
             "turn_context" => self.turn_context(event, timestamp),
             "event_msg" => self.event_msg(event, timestamp, evidence),
             "response_item" => self.response_item(event, timestamp, evidence),
+            // Top-level Codex compaction envelope (TB counts as context_compacted).
+            "compacted" => {
+                self.compaction_boundary_present = true;
+                Ok(())
+            }
             _ => Ok(()),
         }
     }
@@ -410,6 +434,14 @@ impl<'a> Assembly<'a> {
     ) -> Result<(), AdapterError> {
         let payload_type = string_at(event, &["payload", "type"]).unwrap_or("");
         match payload_type {
+            // Compaction marker: consumed, no visible turn, not "unsupported".
+            "context_compacted" => {
+                self.compaction_boundary_present = true;
+                Ok(())
+            }
+            // Dual-envelope: response_item.message owns chat; event_msg is footprint.
+            "user_message" if self.have_response_item_chat => Ok(()),
+            "agent_message" if self.have_response_item_chat => Ok(()),
             "user_message" => self.push_turn(
                 TurnRole::User,
                 TurnKind::UserMsg,
@@ -542,6 +574,11 @@ impl<'a> Assembly<'a> {
             "encrypted_reasoning" => {
                 self.opaque_reasoning = true;
                 self.warn(WarningKind::OpaqueReasoning, evidence.coverage_ordinal);
+                Ok(())
+            }
+            // response_item.compacted — TB footprint/context_compacted class.
+            "compacted" => {
+                self.compaction_boundary_present = true;
                 Ok(())
             }
             _ => {
@@ -825,6 +862,7 @@ impl<'a> Assembly<'a> {
             boundary_flags: BoundaryFlags {
                 opaque_reasoning_present: self.opaque_reasoning,
                 unsupported_visible_event: self.unsupported_visible,
+                compaction_boundary_present: self.compaction_boundary_present,
             },
             malformed_tail_present: self.malformed_tail,
             visible_event_lost: self.visible_lost,

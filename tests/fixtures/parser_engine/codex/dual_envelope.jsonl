@@ -1,0 +1,6 @@
+{"timestamp":"2026-07-13T00:00:00Z","type":"session_meta","payload":{"id":"22222222-2222-4222-8222-222222222222","timestamp":"2026-07-13T00:00:00Z","cwd":"/repo/dual","model":"gpt-test"}}
+{"timestamp":"2026-07-13T00:00:01Z","type":"turn_context","payload":{"turn_id":"t1","cwd":"/repo/dual","model":"gpt-test"}}
+{"timestamp":"2026-07-13T00:00:02Z","type":"event_msg","payload":{"type":"user_message","message":"Diagnose the burn site."}}
+{"timestamp":"2026-07-13T00:00:03Z","type":"event_msg","payload":{"type":"agent_message","message":"I see double turns."}}
+{"timestamp":"2026-07-13T00:00:04Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Diagnose the burn site."}]}}
+{"timestamp":"2026-07-13T00:00:05Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"I see double turns."}]}}
