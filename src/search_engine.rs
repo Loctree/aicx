@@ -19,6 +19,10 @@ use std::path::Path;
 
 use serde::Serialize;
 
+use aicx_retrieve::{
+    ExecutedPath, RequestedMode, RetrievalCompleteness, RetrievalEvidence, RetrievalOutcome,
+};
+
 use crate::rank::FuzzyResult;
 use crate::sanitize::normalize_query;
 use crate::timeline::FrameKind;
@@ -1012,6 +1016,142 @@ impl From<&aicx_retrieve::Manifest> for HybridRetrievalStatus {
     }
 }
 
+/// Map an executed semantic outcome onto the typed [`RetrievalOutcome`].
+/// Evidence-only mapping: a dense-only backend label maps to the dense leg,
+/// a hybrid manifest maps to fused execution, and a semantic success with
+/// neither (legacy vector scan) maps to explicit unknown — never healthy.
+pub fn semantic_retrieval_outcome(
+    backend_label: &str,
+    retrieval_status: Option<&HybridRetrievalStatus>,
+    examined_count: usize,
+    matched_count: usize,
+    stale_evidence: bool,
+) -> RetrievalOutcome {
+    let dense_only = backend_label.starts_with(BACKEND_SEMANTIC_DENSE_ONLY);
+    let (executed_path, fallback_reason) = if dense_only {
+        (
+            Some(ExecutedPath::DenseOnly),
+            Some(
+                "hybrid_unavailable: lexical fusion leg missing or stale; served dense-only \
+                 cosine from the committed primary index"
+                    .to_string(),
+            ),
+        )
+    } else if retrieval_status.is_some() {
+        (Some(ExecutedPath::HybridFusion), None)
+    } else {
+        (
+            None,
+            Some(format!(
+                "execution_evidence_missing: semantic backend '{backend_label}' returned no \
+                 hybrid manifest evidence"
+            )),
+        )
+    };
+    RetrievalOutcome::from_evidence(
+        RequestedMode::Hybrid,
+        RetrievalEvidence {
+            executed_path,
+            examined_count: Some(examined_count),
+            matched_count,
+            fallback_reason,
+            stale_evidence,
+        },
+    )
+}
+
+impl SemanticSearchOutcome {
+    /// Typed execution status for this outcome. See [`semantic_retrieval_outcome`].
+    pub fn retrieval_outcome(
+        &self,
+        matched_count: usize,
+        stale_evidence: bool,
+    ) -> RetrievalOutcome {
+        semantic_retrieval_outcome(
+            self.backend_label,
+            self.retrieval_status.as_ref(),
+            self.scanned,
+            matched_count,
+            stale_evidence,
+        )
+    }
+}
+
+/// Typed execution status for the lexical/filesystem leg. A present
+/// `semantic_fallback_reason` marks a degraded fallback out of a failed
+/// hybrid request; `None` marks an operator-requested lexical run.
+pub fn lexical_retrieval_outcome(
+    semantic_fallback_reason: Option<String>,
+    examined_count: usize,
+    matched_count: usize,
+    stale_evidence: bool,
+) -> RetrievalOutcome {
+    let requested_mode = if semantic_fallback_reason.is_some() {
+        RequestedMode::Hybrid
+    } else {
+        RequestedMode::Lexical
+    };
+    RetrievalOutcome::from_evidence(
+        requested_mode,
+        RetrievalEvidence {
+            executed_path: Some(ExecutedPath::LexicalOnly),
+            examined_count: Some(examined_count),
+            matched_count,
+            fallback_reason: semantic_fallback_reason,
+            stale_evidence,
+        },
+    )
+}
+
+/// Single owner mapping the typed [`RetrievalOutcome`] onto an
+/// [`crate::oracle::OracleStatus`] for every search JSON surface (CLI
+/// search/evidence, MCP search/evidence). No caller may bucket on manifest
+/// presence or backend label strings again.
+pub fn search_oracle_status_from_retrieval(
+    store_root: &Path,
+    retrieval: &RetrievalOutcome,
+    hybrid_status: Option<&HybridRetrievalStatus>,
+    candidate_count: usize,
+    source_paths_verified: bool,
+) -> crate::oracle::OracleStatus {
+    use crate::oracle::OracleStatus;
+    let fallback_reason = || {
+        retrieval
+            .fallback_reason
+            .clone()
+            .unwrap_or_else(|| aicx_retrieve::FALLBACK_REASON_EVIDENCE_MISSING.to_string())
+    };
+    let status = match (retrieval.executed_path, hybrid_status) {
+        (ExecutedPath::HybridFusion, Some(hybrid)) => {
+            OracleStatus::hybrid_rrf(store_root, hybrid, candidate_count, source_paths_verified)
+        }
+        // Fusion without manifest evidence should be unreachable; fail closed
+        // instead of synthesizing a healthy hybrid claim.
+        (ExecutedPath::HybridFusion, None) | (ExecutedPath::None, _) => {
+            OracleStatus::retrieval_unknown(
+                store_root,
+                retrieval.examined_count,
+                candidate_count,
+                fallback_reason(),
+            )
+        }
+        (ExecutedPath::DenseOnly, _) => OracleStatus::semantic_dense_only(
+            store_root,
+            retrieval.examined_count,
+            candidate_count,
+            source_paths_verified,
+            fallback_reason(),
+        ),
+        (ExecutedPath::LexicalOnly, _) => OracleStatus::filesystem_fuzzy(
+            store_root,
+            retrieval.examined_count,
+            candidate_count,
+            source_paths_verified,
+        ),
+    };
+    status.with_retrieval(retrieval.clone())
+}
+
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
 fn merge_hybrid_statuses(statuses: &[HybridRetrievalStatus]) -> Option<HybridRetrievalStatus> {
     match statuses {
@@ -1600,12 +1740,13 @@ pub(crate) fn partial_pushdown_diagnostic(
 }
 
 /// Compose the canonical `oracle_status` line emitted to stderr after a
-/// successful semantic search call.
+/// search call. Health (prefix, index, fallback, scope safety) derives ONLY
+/// from the typed [`RetrievalOutcome`]; the backend label contributes the
+/// display name and the global-scope display token, never the health.
 pub fn render_semantic_status_line(
     backend_label: &str,
-    model_id: &str,
-    result_count: usize,
-    scanned: usize,
+    model_id: Option<&str>,
+    retrieval: &RetrievalOutcome,
     retrieval_status: Option<&HybridRetrievalStatus>,
 ) -> String {
     let manifest = retrieval_status
@@ -1620,44 +1761,58 @@ pub fn render_semantic_status_line(
             )
         })
         .unwrap_or_default();
-    // The dense-only degraded path (Bug B+) must not masquerade as a healthy
-    // hybrid query: tell the operator the lexical fusion leg is unavailable
-    // and that this is a fallback, not the full stack.
-    let dense_only = backend_label.starts_with(BACKEND_SEMANTIC_DENSE_ONLY);
-    let all_bucket_fallback = backend_label.ends_with("_all_fallback");
-    let global_project_scope = backend_label.ends_with("_global_scoped");
-    let (prefix, index_label, fallback_label, scope_label) = if dense_only && all_bucket_fallback {
-        (
-            "[degraded] ",
-            "dense_only",
-            "hybrid_unavailable,all_bucket",
-            "",
-        )
-    } else if dense_only && global_project_scope {
-        (
-            "[degraded] ",
-            "dense_only",
-            "hybrid_unavailable",
-            " scope=global_project_filter",
-        )
-    } else if dense_only {
-        ("[degraded] ", "dense_only", "hybrid_unavailable", "")
-    } else if all_bucket_fallback {
-        ("", "hybrid", "all_bucket", "")
-    } else if global_project_scope {
-        ("", "hybrid", "none", " scope=global_project_filter")
+    let (prefix, completeness_label) = match retrieval.completeness {
+        RetrievalCompleteness::Complete => ("", "complete"),
+        RetrievalCompleteness::Partial => ("[partial] ", "partial"),
+        RetrievalCompleteness::Degraded => ("[degraded] ", "degraded"),
+        RetrievalCompleteness::Unknown => ("[unknown] ", "unknown"),
+    };
+    let index_label = match retrieval.executed_path {
+        ExecutedPath::HybridFusion => "hybrid",
+        ExecutedPath::DenseOnly => "dense_only",
+        ExecutedPath::LexicalOnly => "none",
+        ExecutedPath::None => "unknown",
+    };
+    // First token of the fallback reason keeps the line greppable
+    // (`hybrid_unavailable`, `execution_evidence_missing`, error kinds).
+    let fallback_label = match (&retrieval.fallback_reason, retrieval.requested_mode) {
+        (Some(reason), _) => reason
+            .split(':')
+            .next()
+            .unwrap_or("unspecified")
+            .to_string(),
+        (None, RequestedMode::Lexical) => "operator_requested".to_string(),
+        (None, _) => "none".to_string(),
+    };
+    let scope_safe = matches!(
+        retrieval.executed_path,
+        ExecutedPath::HybridFusion | ExecutedPath::DenseOnly
+    ) && !retrieval.stale_evidence;
+    let chunk_noun = if retrieval.executed_path == ExecutedPath::LexicalOnly {
+        "scanned"
     } else {
-        ("", "hybrid", "none", "")
+        "candidate"
+    };
+    let model = model_id
+        .map(|model_id| format!(" model={model_id}"))
+        .unwrap_or_default();
+    let scope_label = if backend_label.ends_with("_global_scoped") {
+        " scope=global_project_filter"
+    } else {
+        ""
     };
     format!(
-        "{}{} result(s) from {} candidate chunks. oracle_status: backend={} index={} fallback={} model={} loctree_scope_safe=true{}{}",
+        "{}{} result(s) from {} {} chunks. oracle_status: backend={} index={} fallback={} completeness={}{} loctree_scope_safe={}{}{}",
         prefix,
-        result_count,
-        scanned,
+        retrieval.matched_count,
+        retrieval.examined_count,
+        chunk_noun,
         backend_label,
         index_label,
         fallback_label,
-        model_id,
+        completeness_label,
+        model,
+        scope_safe,
         scope_label,
         manifest
     )
@@ -2024,19 +2179,31 @@ mod tests {
         assert!(err.recommendation().contains("aicx index"));
     }
 
+    /// Legacy semantic label with NO hybrid manifest evidence must render as
+    /// explicit unknown — never as a healthy `index=hybrid fallback=none`.
     #[test]
     fn semantic_status_line_marks_backend_and_index() {
+        let retrieval = semantic_retrieval_outcome("embedded_semantic", None, 11_237, 0, false);
         let line = render_semantic_status_line(
             "embedded_semantic",
-            "F2LLM-v2-0.6B.Q4_K_M.gguf",
-            0,
-            11_237,
+            Some("F2LLM-v2-0.6B.Q4_K_M.gguf"),
+            &retrieval,
             None,
         );
         assert!(line.contains("backend=embedded_semantic"));
-        assert!(line.contains("index=hybrid"));
+        assert!(
+            line.contains("index=unknown") && line.contains("completeness=unknown"),
+            "no execution evidence must render as unknown, not hybrid: {line}"
+        );
+        assert!(
+            line.contains("fallback=execution_evidence_missing"),
+            "line was: {line}"
+        );
         assert!(line.contains("model=F2LLM-v2-0.6B.Q4_K_M.gguf"));
-        assert!(line.contains("loctree_scope_safe=true"));
+        assert!(
+            line.contains("loctree_scope_safe=false"),
+            "unknown execution must not claim scope safety: {line}"
+        );
     }
 
     /// Patch 3 / Bug B+ observability: the dense-only degraded path must NOT
@@ -2044,11 +2211,11 @@ mod tests {
     /// sees the quality drop), not silently claim `index=hybrid fallback=none`.
     #[test]
     fn semantic_status_line_flags_dense_only_as_degraded() {
+        let retrieval = semantic_retrieval_outcome("semantic_dense_only", None, 227_290, 5, false);
         let line = render_semantic_status_line(
             "semantic_dense_only",
-            "qwen3-embedding-8b",
-            5,
-            227_290,
+            Some("qwen3-embedding-8b"),
+            &retrieval,
             None,
         );
         assert!(line.contains("backend=semantic_dense_only"));
@@ -2064,26 +2231,74 @@ mod tests {
             line.contains("degraded") && line.contains("fallback=hybrid_unavailable"),
             "dense-only must surface degraded status explicitly: {line}"
         );
+        assert!(line.contains("completeness=degraded"), "line was: {line}");
     }
 
     #[test]
     fn semantic_status_line_marks_hybrid_global_project_scope() {
+        let status = HybridRetrievalStatus {
+            generation_id: "g-global".to_string(),
+            source_chunk_count: 259_007,
+            dense_count: 259_007,
+            lexical_doc_count: 258_990,
+            fusion_algorithm: "rrf".to_string(),
+        };
+        let retrieval = semantic_retrieval_outcome(
+            BACKEND_HYBRID_RRF_GLOBAL_SCOPED,
+            Some(&status),
+            259_007,
+            10,
+            false,
+        );
         let line = render_semantic_status_line(
             BACKEND_HYBRID_RRF_GLOBAL_SCOPED,
-            "qwen3-embedding:8b",
-            10,
-            259_007,
-            None,
+            Some("qwen3-embedding:8b"),
+            &retrieval,
+            Some(&status),
         );
 
         assert!(line.contains("backend=hybrid_rrf_global_scoped"));
         assert!(line.contains("index=hybrid"));
         assert!(line.contains("fallback=none"));
+        assert!(line.contains("completeness=complete"));
         assert!(line.contains("scope=global_project_filter"));
         assert!(
             !line.contains("degraded"),
             "global-scoped hybrid search should not claim degraded dense-only: {line}"
         );
+    }
+
+    /// World-model contract: the typed mapping refuses to invent execution
+    /// evidence. Legacy semantic success without a manifest is unknown, the
+    /// dense-only label is degraded with a reason, hybrid+manifest is complete.
+    #[test]
+    fn semantic_retrieval_outcome_maps_evidence_not_labels_to_health() {
+        let legacy = semantic_retrieval_outcome("embedded_semantic", None, 100, 5, false);
+        assert_eq!(legacy.completeness, RetrievalCompleteness::Unknown);
+        assert_eq!(legacy.executed_path, ExecutedPath::None);
+
+        let dense = semantic_retrieval_outcome(BACKEND_SEMANTIC_DENSE_ONLY, None, 1000, 5, false);
+        assert_eq!(dense.completeness, RetrievalCompleteness::Degraded);
+        assert_eq!(dense.executed_path, ExecutedPath::DenseOnly);
+        assert!(
+            dense
+                .fallback_reason
+                .as_deref()
+                .unwrap()
+                .starts_with("hybrid_unavailable")
+        );
+
+        let status = HybridRetrievalStatus {
+            generation_id: "g".to_string(),
+            source_chunk_count: 10,
+            dense_count: 10,
+            lexical_doc_count: 10,
+            fusion_algorithm: "rrf".to_string(),
+        };
+        let hybrid = semantic_retrieval_outcome(BACKEND_HYBRID_RRF, Some(&status), 10, 3, false);
+        assert_eq!(hybrid.completeness, RetrievalCompleteness::Complete);
+        assert_eq!(hybrid.executed_path, ExecutedPath::HybridFusion);
+        assert_eq!(hybrid.fallback_reason, None);
     }
 
     /// F1 regression: project-scoped semantic search may run on a host where
@@ -2988,7 +3203,9 @@ mod tests {
             lexical_doc_count: 122,
             fusion_algorithm: "rrf".to_string(),
         };
-        let line = render_semantic_status_line("hybrid_rrf", "model", 3, 123, Some(&status));
+        let retrieval = semantic_retrieval_outcome("hybrid_rrf", Some(&status), 123, 3, false);
+        let line =
+            render_semantic_status_line("hybrid_rrf", Some("model"), &retrieval, Some(&status));
         assert!(line.contains("backend=hybrid_rrf"));
         assert!(line.contains("manifest_generation=g-test"));
         assert!(line.contains("source_chunks=123"));

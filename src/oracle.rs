@@ -1,5 +1,6 @@
 //! Explicit AICX Oracle provenance for search-like surfaces.
 
+use aicx_retrieve::RetrievalOutcome;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 
@@ -67,6 +68,12 @@ pub enum OracleBackend {
     Hybrid,
     #[serde(rename = "hybrid_rrf")]
     HybridRrf,
+    /// Dense cosine leg served without the lexical fusion leg — a degraded
+    /// hybrid execution, never a healthy semantic claim.
+    SemanticDenseOnly,
+    /// The caller produced results but carried no execution evidence; health
+    /// cannot be claimed for this surface.
+    RetrievalUnknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -112,6 +119,10 @@ pub struct OracleStatus {
     pub lexical_doc_count: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fusion_algorithm: Option<String>,
+    /// Typed retrieval execution status (W1-01). One value rendered on every
+    /// surface; additive key so existing JSON consumers are untouched.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retrieval: Option<RetrievalOutcome>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -158,6 +169,7 @@ impl OracleStatus {
             dense_count: None,
             lexical_doc_count: None,
             fusion_algorithm: None,
+            retrieval: None,
         }
     }
 
@@ -190,6 +202,7 @@ impl OracleStatus {
             dense_count: None,
             lexical_doc_count: None,
             fusion_algorithm: None,
+            retrieval: None,
         }
     }
 
@@ -223,6 +236,7 @@ impl OracleStatus {
             dense_count: None,
             lexical_doc_count: None,
             fusion_algorithm: None,
+            retrieval: None,
         }
     }
 
@@ -257,6 +271,7 @@ impl OracleStatus {
             dense_count: Some(status.dense_count),
             lexical_doc_count: Some(status.lexical_doc_count),
             fusion_algorithm: Some(status.fusion_algorithm.clone()),
+            retrieval: None,
         }
     }
 
@@ -291,7 +306,91 @@ impl OracleStatus {
             dense_count: None,
             lexical_doc_count: None,
             fusion_algorithm: None,
+            retrieval: None,
         }
+    }
+
+    /// Degraded hybrid execution: only the dense cosine leg ran (hybrid
+    /// manifest missing or stale). Always carries a fallback reason — this
+    /// status must never serialize as a healthy semantic backend.
+    pub fn semantic_dense_only(
+        store_root: &Path,
+        scanned_count: usize,
+        candidate_count: usize,
+        source_paths_verified: bool,
+        fallback_reason: String,
+    ) -> Self {
+        Self {
+            source_layer: canonical_layer(),
+            backend: OracleBackend::SemanticDenseOnly,
+            index_kind: OracleIndexKind::ContentChunks,
+            fallback_reason: Some(fallback_reason),
+            derived_view: "dense_only_cosine_over_committed_primary_index".to_string(),
+            store_root: display_path(store_root),
+            indexed_count: scanned_count,
+            scanned_count,
+            candidate_count,
+            source_paths_verified,
+            stale_or_unknown: !source_paths_verified,
+            loctree_scope_safe: source_paths_verified,
+            loctree_scope_note: if source_paths_verified {
+                "degraded_dense_only; semantically valid but lexical fusion leg is unavailable — \
+                 follow with canonical chunk read"
+                    .to_string()
+            } else {
+                "unsafe_for_scope_narrowing; dense-only index returned paths that are not all readable"
+                    .to_string()
+            },
+            manifest_generation_id: None,
+            manifest_source_chunk_count: None,
+            dense_count: None,
+            lexical_doc_count: None,
+            fusion_algorithm: None,
+            retrieval: None,
+        }
+    }
+
+    /// Results arrived without execution evidence (legacy caller, no hybrid
+    /// manifest, no dense-only marker). Fails closed: stale/unknown, never
+    /// scope-safe, never a healthy semantic claim.
+    pub fn retrieval_unknown(
+        store_root: &Path,
+        scanned_count: usize,
+        candidate_count: usize,
+        fallback_reason: String,
+    ) -> Self {
+        Self {
+            source_layer: canonical_layer(),
+            backend: OracleBackend::RetrievalUnknown,
+            index_kind: OracleIndexKind::None,
+            fallback_reason: Some(fallback_reason),
+            derived_view: "retrieval_execution_evidence_missing".to_string(),
+            store_root: display_path(store_root),
+            indexed_count: 0,
+            scanned_count,
+            candidate_count,
+            source_paths_verified: false,
+            stale_or_unknown: true,
+            loctree_scope_safe: false,
+            loctree_scope_note:
+                "unsafe_for_scope_narrowing; retrieval carried no execution evidence — \
+                 treat results as unverified routing signal"
+                    .to_string(),
+            manifest_generation_id: None,
+            manifest_source_chunk_count: None,
+            dense_count: None,
+            lexical_doc_count: None,
+            fusion_algorithm: None,
+            retrieval: None,
+        }
+    }
+
+    /// Attach the typed retrieval execution status. Every search-like JSON
+    /// surface (CLI search/evidence, MCP search/evidence) carries this same
+    /// value; renderers must not re-derive health elsewhere.
+    pub fn with_retrieval(mut self, retrieval: RetrievalOutcome) -> Self {
+        self.retrieval = Some(retrieval);
+        self
     }
 }
 

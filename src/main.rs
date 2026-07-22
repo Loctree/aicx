@@ -7755,26 +7755,44 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
         let source_paths_verified = aicx::oracle::verify_paths(
             aicx::evidence::evidence_source_paths(&report).map(Path::to_path_buf),
         );
-        let oracle_status = match semantic_status.as_ref() {
-            Some((_, _, _, Some(retrieval_status))) => aicx::oracle::OracleStatus::hybrid_rrf(
-                &root,
-                retrieval_status,
-                report.results,
-                source_paths_verified,
-            ),
-            Some((_, _, semantic_scanned, None)) => aicx::oracle::OracleStatus::content_semantic(
-                &root,
-                *semantic_scanned,
-                report.results,
-                source_paths_verified,
-            ),
-            None => aicx::oracle::OracleStatus::filesystem_fuzzy(
-                &root,
-                scanned,
-                report.results,
-                source_paths_verified,
-            ),
+        // One typed retrieval outcome (W1-01); the JSON oracle_status and the
+        // stderr status line below both render from this same value.
+        let retrieval = {
+            let base = match semantic_status.as_ref() {
+                Some((backend_label, _, semantic_scanned, retrieval_status)) => {
+                    aicx::search_engine::semantic_retrieval_outcome(
+                        backend_label,
+                        retrieval_status.as_ref(),
+                        *semantic_scanned,
+                        report.results,
+                        !source_paths_verified,
+                    )
+                }
+                None => aicx::search_engine::lexical_retrieval_outcome(
+                    semantic_fallback
+                        .as_ref()
+                        .map(|notice| format!("{}: {}", notice.kind, notice.reason)),
+                    scanned,
+                    report.results,
+                    !source_paths_verified,
+                ),
+            };
+            if pushdown_diagnostic.is_some() {
+                base.mark_partial()
+            } else {
+                base
+            }
         };
+        let hybrid_status = semantic_status
+            .as_ref()
+            .and_then(|(_, _, _, retrieval_status)| retrieval_status.as_ref());
+        let oracle_status = aicx::search_engine::search_oracle_status_from_retrieval(
+            &root,
+            &retrieval,
+            hybrid_status,
+            report.results,
+            source_paths_verified,
+        );
 
         if json {
             let rendered = aicx::evidence::render_evidence_json(&report, scanned, oracle_status)?;
@@ -7817,27 +7835,16 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
         let _ = io::stdout().flush();
 
         if io::stderr().is_terminal() {
-            let base_line = match semantic_status.as_ref() {
-                Some((semantic_backend, semantic_model_id, semantic_scanned, retrieval_status)) => {
-                    aicx::search_engine::render_semantic_status_line(
-                        semantic_backend,
-                        semantic_model_id,
-                        report.results,
-                        *semantic_scanned,
-                        retrieval_status.as_ref(),
-                    )
-                }
-                None => {
-                    let fallback = semantic_fallback
-                        .as_ref()
-                        .map(|notice| format!("semantic_unavailable kind={}", notice.kind))
-                        .unwrap_or_else(|| "operator_requested".to_string());
-                    format!(
-                        "{} evidence result(s) from {} scanned chunks. oracle_status: backend=filesystem_fuzzy index=none fallback={} loctree_scope_safe=false",
-                        report.results, scanned, fallback
-                    )
-                }
+            let (backend_label, model_id) = match semantic_status.as_ref() {
+                Some((backend_label, model_id, _, _)) => (*backend_label, Some(model_id.as_str())),
+                None => ("filesystem_fuzzy", None),
             };
+            let base_line = aicx::search_engine::render_semantic_status_line(
+                backend_label,
+                model_id,
+                &retrieval,
+                hybrid_status,
+            );
             let suffix = pushdown_diagnostic
                 .as_ref()
                 .map(|d| {
@@ -7881,37 +7888,51 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
         _ => None,
     };
 
-    if json {
-        let oracle_status = match semantic_status {
-            Some((
-                _semantic_backend,
-                _semantic_model_id,
-                _semantic_scanned,
-                Some(ref retrieval_status),
-            )) => aicx::oracle::OracleStatus::hybrid_rrf(
-                &root,
-                retrieval_status,
-                results.len(),
-                aicx::oracle::verify_paths(
-                    results
-                        .iter()
-                        .map(|result| std::path::Path::new(&result.path).to_path_buf()),
-                ),
-            ),
-            Some((_semantic_backend, _semantic_model_id, semantic_scanned, None)) => {
-                aicx::oracle::OracleStatus::content_semantic(
-                    &root,
-                    semantic_scanned,
+    // One typed retrieval outcome (W1-01); CLI JSON oracle_status and the
+    // stderr status line both render from this same value.
+    let source_paths_verified = aicx::oracle::verify_paths(
+        results
+            .iter()
+            .map(|result| std::path::Path::new(&result.path).to_path_buf()),
+    );
+    let retrieval = {
+        let base = match semantic_status.as_ref() {
+            Some((backend_label, _, semantic_scanned, retrieval_status)) => {
+                aicx::search_engine::semantic_retrieval_outcome(
+                    backend_label,
+                    retrieval_status.as_ref(),
+                    *semantic_scanned,
                     results.len(),
-                    aicx::oracle::verify_paths(
-                        results
-                            .iter()
-                            .map(|result| std::path::Path::new(&result.path).to_path_buf()),
-                    ),
+                    !source_paths_verified,
                 )
             }
-            None => rank::search_oracle_status(&root, &results, scanned),
+            None => aicx::search_engine::lexical_retrieval_outcome(
+                semantic_fallback
+                    .as_ref()
+                    .map(|notice| format!("{}: {}", notice.kind, notice.reason)),
+                scanned,
+                results.len(),
+                !source_paths_verified,
+            ),
         };
+        if pushdown_diagnostic.is_some() {
+            base.mark_partial()
+        } else {
+            base
+        }
+    };
+    let hybrid_status = semantic_status
+        .as_ref()
+        .and_then(|(_, _, _, retrieval_status)| retrieval_status.as_ref());
+
+    if json {
+        let oracle_status = aicx::search_engine::search_oracle_status_from_retrieval(
+            &root,
+            &retrieval,
+            hybrid_status,
+            results.len(),
+            source_paths_verified,
+        );
         let rendered =
             rank::render_search_json_with_oracle(&root, &results, scanned, oracle_status)?;
         let mut payload = aicx::search_engine::inject_filter_pushdown_diagnostic(
@@ -7969,29 +7990,16 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
     let _ = io::stdout().flush();
 
     if io::stderr().is_terminal() {
-        let base_line = match semantic_status {
-            Some((semantic_backend, semantic_model_id, semantic_scanned, retrieval_status)) => {
-                aicx::search_engine::render_semantic_status_line(
-                    semantic_backend,
-                    &semantic_model_id,
-                    results.len(),
-                    semantic_scanned,
-                    retrieval_status.as_ref(),
-                )
-            }
-            None => {
-                let fallback = semantic_fallback
-                    .as_ref()
-                    .map(|notice| format!("semantic_unavailable kind={}", notice.kind))
-                    .unwrap_or_else(|| "operator_requested".to_string());
-                format!(
-                    "{} result(s) from {} scanned chunks. oracle_status: backend=filesystem_fuzzy index=none fallback={} loctree_scope_safe=false",
-                    results.len(),
-                    scanned,
-                    fallback
-                )
-            }
+        let (backend_label, model_id) = match semantic_status.as_ref() {
+            Some((backend_label, model_id, _, _)) => (*backend_label, Some(model_id.as_str())),
+            None => ("filesystem_fuzzy", None),
         };
+        let base_line = aicx::search_engine::render_semantic_status_line(
+            backend_label,
+            model_id,
+            &retrieval,
+            hybrid_status,
+        );
         let suffix = pushdown_diagnostic
             .as_ref()
             .map(|d| {

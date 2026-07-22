@@ -998,7 +998,26 @@ fn render_mcp_fuzzy_fallback_payload(
     .map_err(|e| McpError::internal_error(format!("Filesystem fuzzy search: {e}"), None))?;
     let results =
         crate::search_engine::finalize_fuzzy_results(results, req.kind_filter, req.sort, req.limit);
-    let oracle_status = rank::search_oracle_status(req.store_root, &results, scanned);
+    let source_paths_verified = crate::oracle::verify_paths(
+        results
+            .iter()
+            .map(|result| std::path::Path::new(&result.path).to_path_buf()),
+    );
+    // Typed retrieval outcome (W1-01): this fallback is a degraded hybrid
+    // request served by the lexical/filesystem leg, and the status says so.
+    let retrieval = crate::search_engine::lexical_retrieval_outcome(
+        Some(format!("{}: {}", fallback.kind, fallback.reason)),
+        scanned,
+        results.len(),
+        !source_paths_verified,
+    );
+    let oracle_status = crate::search_engine::search_oracle_status_from_retrieval(
+        req.store_root,
+        &retrieval,
+        None,
+        results.len(),
+        source_paths_verified,
+    );
     let rendered =
         rank::render_search_json_with_oracle(req.store_root, &results, scanned, oracle_status)
             .map_err(|e| {
@@ -1210,6 +1229,7 @@ impl AicxMcpServer {
             diagnostic: pushdown_diagnostic,
         } = filtered;
         let scanned = outcome.scanned;
+        let backend_label = outcome.backend_label;
         let retrieval_status = outcome.retrieval_status.clone();
         let results = outcome.results;
 
@@ -1218,21 +1238,29 @@ impl AicxMcpServer {
             let source_paths_verified = crate::oracle::verify_paths(
                 crate::evidence::evidence_source_paths(&report).map(std::path::Path::to_path_buf),
             );
-            let oracle_status = if let Some(ref retrieval_status) = retrieval_status {
-                OracleStatus::hybrid_rrf(
-                    &store_root,
-                    retrieval_status,
-                    report.results,
-                    source_paths_verified,
-                )
-            } else {
-                OracleStatus::content_semantic(
-                    &store_root,
+            // Typed retrieval outcome (W1-01): oracle_status derives from
+            // execution evidence, never from manifest presence alone.
+            let retrieval = {
+                let base = crate::search_engine::semantic_retrieval_outcome(
+                    backend_label,
+                    retrieval_status.as_ref(),
                     scanned,
                     report.results,
-                    source_paths_verified,
-                )
+                    !source_paths_verified,
+                );
+                if pushdown_diagnostic.is_some() {
+                    base.mark_partial()
+                } else {
+                    base
+                }
             };
+            let oracle_status = crate::search_engine::search_oracle_status_from_retrieval(
+                &store_root,
+                &retrieval,
+                retrieval_status.as_ref(),
+                report.results,
+                source_paths_verified,
+            );
             let rendered = crate::evidence::render_evidence_json(&report, scanned, oracle_status)
                 .map_err(|e| {
                 McpError::internal_error(format!("Serialize evidence search JSON: {e}"), None)
@@ -1259,21 +1287,29 @@ impl AicxMcpServer {
                 .iter()
                 .map(|result| std::path::Path::new(&result.path).to_path_buf()),
         );
-        let oracle_status = if let Some(ref retrieval_status) = retrieval_status {
-            OracleStatus::hybrid_rrf(
-                &store_root,
-                retrieval_status,
-                results.len(),
-                source_paths_verified,
-            )
-        } else {
-            OracleStatus::content_semantic(
-                &store_root,
+        // Typed retrieval outcome (W1-01): oracle_status derives from
+        // execution evidence, never from manifest presence alone.
+        let retrieval = {
+            let base = crate::search_engine::semantic_retrieval_outcome(
+                backend_label,
+                retrieval_status.as_ref(),
                 scanned,
                 results.len(),
-                source_paths_verified,
-            )
+                !source_paths_verified,
+            );
+            if pushdown_diagnostic.is_some() {
+                base.mark_partial()
+            } else {
+                base
+            }
         };
+        let oracle_status = crate::search_engine::search_oracle_status_from_retrieval(
+            &store_root,
+            &retrieval,
+            retrieval_status.as_ref(),
+            results.len(),
+            source_paths_verified,
+        );
         let rendered =
             rank::render_search_json_with_oracle(&store_root, &results, scanned, oracle_status)
                 .map_err(|e| {

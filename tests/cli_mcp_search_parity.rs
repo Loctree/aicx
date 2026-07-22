@@ -198,3 +198,154 @@ fn cli_and_mcp_render_identical_search_items() {
 
     let _ = fs::remove_dir_all(&root);
 }
+
+/// W1-01 falsification fixture: a dense-only semantic outcome (hits exist,
+/// hybrid manifest absent → `retrieval_status: None`) must NOT serialize as a
+/// healthy `content_semantic` oracle status without a fallback_reason. This is
+/// the known JSON false-green: the CLI text surface says `[degraded]` while
+/// the CLI/MCP JSON surfaces claim a healthy semantic backend.
+#[test]
+fn dense_only_semantic_json_is_not_false_green() {
+    let outcome = aicx::search_engine::SemanticSearchOutcome {
+        results: Vec::new(),
+        scanned: 227_290,
+        backend_label: "semantic_dense_only",
+        model_id: "qwen3-embedding-8b".to_string(),
+        retrieval_status: None,
+    };
+
+    // Status construction through the single shared owner used by the CLI
+    // JSON tail (src/main.rs) and the MCP success path (src/mcp.rs).
+    let store_root = Path::new("/tmp/aicx");
+    let retrieval = outcome.retrieval_outcome(5, false);
+    let oracle_status = aicx::search_engine::search_oracle_status_from_retrieval(
+        store_root,
+        &retrieval,
+        outcome.retrieval_status.as_ref(),
+        5,
+        true,
+    );
+
+    let json = serde_json::to_value(&oracle_status).expect("serialize oracle status");
+    assert_ne!(
+        json["backend"],
+        Value::String("content_semantic".to_string()),
+        "dense-only execution must not claim the healthy content_semantic backend: {json}"
+    );
+    assert!(
+        json.get("fallback_reason").is_some_and(|r| !r.is_null()),
+        "dense-only execution is degraded and must carry a fallback_reason: {json}"
+    );
+    assert_eq!(
+        json["backend"],
+        Value::String("semantic_dense_only".to_string())
+    );
+    assert_eq!(json["retrieval"]["completeness"], "degraded");
+    assert_eq!(json["retrieval"]["executed_path"], "dense_only");
+    assert_eq!(json["retrieval"]["requested_mode"], "hybrid");
+}
+
+/// W1-01 acceptance: the six retrieval scenarios serialize distinctly, and
+/// identically across CLI and MCP — both surfaces construct `oracle_status`
+/// through the same single owner (`search_oracle_status_from_retrieval`), so
+/// one typed value yields one serialization everywhere.
+#[test]
+fn retrieval_outcome_scenarios_serialize_distinctly_across_surfaces() {
+    use aicx::search_engine::{
+        HybridRetrievalStatus, lexical_retrieval_outcome, semantic_retrieval_outcome,
+    };
+
+    let store_root = Path::new("/tmp/aicx");
+    let hybrid_status = HybridRetrievalStatus {
+        generation_id: "g-parity".to_string(),
+        source_chunk_count: 123,
+        dense_count: 123,
+        lexical_doc_count: 122,
+        fusion_algorithm: "rrf".to_string(),
+    };
+
+    let scenarios: Vec<(
+        &str,
+        aicx_retrieve::RetrievalOutcome,
+        Option<&HybridRetrievalStatus>,
+    )> = vec![
+        (
+            "dense_only",
+            semantic_retrieval_outcome("semantic_dense_only", None, 1000, 5, false),
+            None,
+        ),
+        (
+            "lexical_fallback",
+            lexical_retrieval_outcome(
+                Some("embedder_unavailable: model not hydrated".to_string()),
+                40,
+                3,
+                false,
+            ),
+            None,
+        ),
+        (
+            "hybrid",
+            semantic_retrieval_outcome("hybrid_rrf", Some(&hybrid_status), 123, 7, false),
+            Some(&hybrid_status),
+        ),
+        (
+            "partial_filter",
+            semantic_retrieval_outcome("hybrid_rrf", Some(&hybrid_status), 123, 1, false)
+                .mark_partial(),
+            Some(&hybrid_status),
+        ),
+        (
+            "empty_complete",
+            semantic_retrieval_outcome("hybrid_rrf", Some(&hybrid_status), 123, 0, false),
+            Some(&hybrid_status),
+        ),
+        (
+            "empty_unknown",
+            semantic_retrieval_outcome("embedded_semantic", None, 0, 0, false),
+            None,
+        ),
+    ];
+
+    let mut rendered: Vec<(&str, String)> = Vec::new();
+    for (name, retrieval, hybrid) in &scenarios {
+        // CLI and MCP both call this exact function; invoking it twice stands
+        // in for the two surfaces and must be deterministic.
+        let cli_status = aicx::search_engine::search_oracle_status_from_retrieval(
+            store_root,
+            retrieval,
+            *hybrid,
+            retrieval.matched_count,
+            true,
+        );
+        let mcp_status = aicx::search_engine::search_oracle_status_from_retrieval(
+            store_root,
+            retrieval,
+            *hybrid,
+            retrieval.matched_count,
+            true,
+        );
+        let cli_json = serde_json::to_string(&cli_status).expect("serialize cli status");
+        let mcp_json = serde_json::to_string(&mcp_status).expect("serialize mcp status");
+        assert_eq!(
+            cli_json, mcp_json,
+            "scenario {name} must serialize identically across surfaces"
+        );
+
+        let value: Value = serde_json::from_str(&cli_json).expect("parse status");
+        assert!(
+            value.get("retrieval").is_some(),
+            "scenario {name} must carry the typed retrieval object: {value}"
+        );
+        rendered.push((name, cli_json));
+    }
+
+    for (i, (name_a, json_a)) in rendered.iter().enumerate() {
+        for (name_b, json_b) in rendered.iter().skip(i + 1) {
+            assert_ne!(
+                json_a, json_b,
+                "scenarios {name_a} and {name_b} must serialize distinctly"
+            );
+        }
+    }
+}
