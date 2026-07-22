@@ -905,6 +905,9 @@ pub fn rollback_identity_migration_at(base: &Path) -> Result<()> {
     if !manifest_path.exists() {
         anyhow::bail!("No identity migration manifest found to rollback");
     }
+    // `base` is the CLI-owned store root, never network/request input; the
+    // manifest filename is a compile-time constant joined onto it.
+    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
     let raw = fs::read_to_string(&manifest_path)?;
     let mut manifest: IdentityMigrationManifest = serde_json::from_str(&raw)?;
 
@@ -992,6 +995,9 @@ pub fn rollback_identity_migration_at(base: &Path) -> Result<()> {
 pub fn run_identity_migration_at(base: &Path, apply: bool) -> Result<IdentityMigrationOutcome> {
     let manifest_path = identity_migration_manifest_path(base);
     let mut manifest = if apply && manifest_path.exists() {
+        // `base` is the CLI-owned store root, never network/request input; the
+        // manifest filename is a compile-time constant joined onto it.
+        // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
         let raw = fs::read_to_string(&manifest_path)?;
         if let Ok(m) = serde_json::from_str::<IdentityMigrationManifest>(&raw) {
             if !m.steps.is_empty() && (m.mode == "apply-failed" || m.mode == "dry-run") {
