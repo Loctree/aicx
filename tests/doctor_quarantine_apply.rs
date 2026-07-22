@@ -36,6 +36,38 @@ fn unique_base(label: &str) -> PathBuf {
     dir
 }
 
+fn recursive_store_digest(store: &std::path::Path) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut files = Vec::new();
+    let mut pending = vec![store.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path);
+            } else {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    let mut digest = Sha256::new();
+    for path in files {
+        digest.update(
+            path.strip_prefix(store)
+                .expect("store-relative path")
+                .to_string_lossy()
+                .as_bytes(),
+        );
+        digest.update(std::fs::read(path).expect("read store file"));
+    }
+    format!("{:x}", digest.finalize())
+}
+
 #[test]
 fn apply_empty_body_quarantine_moves_to_recoverable_dir_not_delete() {
     let base = unique_base("apply-empty-bodies");
@@ -454,6 +486,141 @@ fn doctor_quarantines_dead_projection_stage_recoverably_and_idempotently() {
     assert_eq!(
         std::fs::read(stage.join("cards").join("payload.json")).expect("read restored payload"),
         payload
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// W2-02: identity migration and projection-stage recovery are one store
+/// transaction from the operator's point of view. Exercise both against one
+/// copied home, including a pure preview followed by recoverable apply.
+#[cfg(unix)]
+#[test]
+fn doctor_store_reconciliation_composes_identity_apply_with_stage_quarantine() {
+    use aicx::store::canonical_projection::{
+        PROJECTION_STAGE_META_FILENAME, PROJECTION_STAGE_SCHEMA, ProjectionStageLease,
+    };
+
+    let base = unique_base("store-reconciliation");
+    let store_root = base.join("store");
+    let cased_bucket = store_root.join("Loctree/AICX/2026_0720/context/claude");
+    std::fs::create_dir_all(&cased_bucket).expect("create cased fixture bucket");
+    let payload = b"synthetic store-reconciliation payload";
+    std::fs::write(cased_bucket.join("session-main.md"), payload).expect("write fixture payload");
+    std::fs::write(
+        base.join("index.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "projects": {
+                "Loctree/AICX": {
+                    "agents": {
+                        "claude": {
+                            "dates": ["2026-07-20"],
+                            "total_entries": 1,
+                            "last_updated": "2026-07-20T00:00:00Z"
+                        }
+                    }
+                }
+            },
+            "last_updated": "2026-07-20T00:00:00Z"
+        }))
+        .expect("serialize fixture index"),
+    )
+    .expect("write fixture index");
+
+    let stage = store_root.join(".canonical-projection-v1.stage-500000000-20260720");
+    std::fs::create_dir_all(stage.join("cards")).expect("create abandoned stage");
+    let staged_payload = b"synthetic interrupted projection";
+    std::fs::write(stage.join("cards/interrupted.json"), staged_payload)
+        .expect("write interrupted projection payload");
+    let lease = ProjectionStageLease {
+        schema: PROJECTION_STAGE_SCHEMA.to_owned(),
+        pid: 500_000_000,
+        process_start_identity: "synthetic-dead-owner".to_owned(),
+        created_at: "2026-07-20T00:00:00+00:00".to_owned(),
+        heartbeat_at: "2026-07-20T00:00:00+00:00".to_owned(),
+        source_hash: "sha256:synthetic-interrupted-source".to_owned(),
+        target_generation: "none".to_owned(),
+        state: "staging".to_owned(),
+    };
+    std::fs::write(
+        stage.join(PROJECTION_STAGE_META_FILENAME),
+        serde_json::to_vec_pretty(&lease).expect("serialize stage lease"),
+    )
+    .expect("write stage lease");
+
+    let source_hash = recursive_store_digest(&store_root);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build current-thread runtime");
+    let preview = DoctorOptions {
+        rebuild_steer_index: false,
+        fix_buckets: true,
+        dry_run: true,
+        rebuild_sidecars: false,
+        prune_empty_bodies: false,
+        apply_prune_empty_bodies: false,
+        migrate_identities: true,
+        apply_migrate_identities: false,
+        check_dedup: false,
+        verbose: false,
+        smoke: false,
+    };
+    let preview_report = rt
+        .block_on(run_at(&base, &preview))
+        .expect("combined preview");
+    assert!(
+        preview_report
+            .fixes_applied
+            .iter()
+            .any(|line| line.contains("[dry-run] would quarantine dead-owner projection stage"))
+    );
+    assert!(
+        preview_report
+            .fixes_applied
+            .iter()
+            .any(|line| line.starts_with("[dry-run] identity migration:"))
+    );
+    assert_eq!(
+        recursive_store_digest(&store_root),
+        source_hash,
+        "combined preview must not mutate any source byte"
+    );
+    assert!(stage.exists());
+    assert!(base.join("store/Loctree/AICX").is_dir());
+
+    let apply = DoctorOptions {
+        dry_run: false,
+        apply_migrate_identities: true,
+        ..preview
+    };
+    let applied = rt.block_on(run_at(&base, &apply)).expect("combined apply");
+    assert!(base.join("store/loctree/aicx").is_dir());
+    assert!(!stage.exists());
+    let quarantine = std::fs::read_dir(base.join("quarantine"))
+        .expect("read quarantine roots")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("projection-stages-"))
+        })
+        .expect("named projection-stage quarantine");
+    assert_eq!(
+        std::fs::read(
+            quarantine
+                .join(".canonical-projection-v1.stage-500000000-20260720/cards/interrupted.json")
+        )
+        .expect("read quarantined stage payload"),
+        staged_payload
+    );
+    assert!(quarantine.join("manifest.json").is_file());
+    assert!(
+        applied
+            .fixes_applied
+            .iter()
+            .any(|line| line.starts_with("identity migration:"))
     );
 
     let _ = std::fs::remove_dir_all(&base);

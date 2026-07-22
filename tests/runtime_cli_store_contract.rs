@@ -1792,3 +1792,379 @@ fn test_identity_migration_via_doctor_cli() {
 
     let _ = fs::remove_dir_all(&root);
 }
+
+#[derive(Debug, serde::Deserialize)]
+struct ReconciliationFixture {
+    schema: String,
+    projects: Vec<ReconciliationFixtureProject>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ReconciliationFixtureProject {
+    identity: String,
+    session_id: String,
+    relative: String,
+    body: String,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+struct ReconciliationInventory {
+    file_count: usize,
+    bytes: u64,
+    logical_sessions: usize,
+    identities: Vec<String>,
+    resolvable_physical_duplicates: usize,
+    unresolved_conflicts: Vec<String>,
+}
+
+fn load_store_reconciliation_fixture() -> ReconciliationFixture {
+    serde_json::from_str(include_str!(
+        "fixtures/store_reconciliation/synthetic_store.json"
+    ))
+    .expect("valid synthetic store-reconciliation fixture")
+}
+
+fn seed_store_reconciliation_fixture(base: &Path, fixture: &ReconciliationFixture) {
+    assert_eq!(fixture.schema, "aicx.test.store_reconciliation.v1");
+    let mut projects = serde_json::Map::new();
+    for item in &fixture.projects {
+        let payload = json!({
+            "project": item.identity,
+            "session_id": item.session_id,
+            "body": item.body,
+        });
+        write_file(
+            &base.join("store").join(&item.identity).join(&item.relative),
+            &payload.to_string(),
+        );
+        projects.insert(
+            item.identity.clone(),
+            json!({
+                "agents": {
+                    "claude": {
+                        "dates": ["2026-07-20"],
+                        "total_entries": 1,
+                        "last_updated": "2026-07-20T00:00:00Z"
+                    }
+                }
+            }),
+        );
+    }
+    write_file(
+        &base.join("index.json"),
+        &json!({
+            "projects": projects,
+            "last_updated": "2026-07-20T00:00:00Z"
+        })
+        .to_string(),
+    );
+}
+
+fn reconciliation_inventory(base: &Path) -> ReconciliationInventory {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let mut payloads = Vec::new();
+    for root in [base.join("store"), base.join("quarantine")] {
+        let mut pending = vec![root];
+        while let Some(dir) = pending.pop() {
+            let Ok(entries) = fs::read_dir(dir) else {
+                continue;
+            };
+            for entry in entries.filter_map(Result::ok) {
+                let path = entry.path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else if path.extension().and_then(|value| value.to_str()) == Some("payload") {
+                    payloads.push(path);
+                }
+            }
+        }
+    }
+    payloads.sort();
+
+    let mut bytes = 0_u64;
+    let mut identities = BTreeSet::new();
+    let mut sessions: BTreeMap<String, Vec<Vec<u8>>> = BTreeMap::new();
+    for path in &payloads {
+        let raw = fs::read(path).expect("read synthetic payload");
+        bytes += raw.len() as u64;
+        let value: Value = serde_json::from_slice(&raw).expect("parse synthetic payload");
+        identities.insert(
+            value["project"]
+                .as_str()
+                .expect("project string")
+                .to_owned(),
+        );
+        sessions
+            .entry(
+                value["session_id"]
+                    .as_str()
+                    .expect("session id string")
+                    .to_owned(),
+            )
+            .or_default()
+            .push(raw);
+    }
+
+    let mut resolvable_physical_duplicates = 0;
+    let mut unresolved_conflicts = Vec::new();
+    for (session, copies) in &sessions {
+        if copies.len() < 2 {
+            continue;
+        }
+        let unique = copies.iter().collect::<BTreeSet<_>>();
+        if unique.len() == 1 {
+            resolvable_physical_duplicates += copies.len() - 1;
+        } else {
+            unresolved_conflicts.push(session.clone());
+        }
+    }
+
+    ReconciliationInventory {
+        file_count: payloads.len(),
+        bytes,
+        logical_sessions: sessions.len(),
+        identities: identities.into_iter().collect(),
+        resolvable_physical_duplicates,
+        unresolved_conflicts,
+    }
+}
+
+fn recursive_store_digest(store: &Path) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut files = Vec::new();
+    let mut pending = vec![store.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let Ok(entries) = fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path);
+            } else {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    let mut digest = Sha256::new();
+    for path in files {
+        digest.update(
+            path.strip_prefix(store)
+                .expect("store-relative path")
+                .to_string_lossy()
+                .as_bytes(),
+        );
+        digest.update(fs::read(path).expect("read store file"));
+    }
+    format!("{:x}", digest.finalize())
+}
+
+fn rollback_store_reconciliation_from_manifest(base: &Path) {
+    let manifest_path = base.join("migration/identity-manifest.json");
+    let manifest: Value = serde_json::from_str(
+        &fs::read_to_string(&manifest_path).expect("read identity manifest for rollback"),
+    )
+    .expect("parse identity manifest for rollback");
+    for step in manifest["steps"]
+        .as_array()
+        .expect("migration steps")
+        .iter()
+        .rev()
+    {
+        let operation = step["operation"].as_str().expect("operation");
+        let source = step["source_identity"].as_str().expect("source identity");
+        let target = step["target_identity"].as_str().expect("target identity");
+        match operation {
+            "rename_dir" | "quarantine_deprecated" => {
+                let current = if target.starts_with("quarantine/") {
+                    base.join(target)
+                } else {
+                    base.join("store").join(target)
+                };
+                let original = base.join("store").join(source);
+                if current.exists() {
+                    if let Some(parent) = original.parent() {
+                        fs::create_dir_all(parent).expect("create rollback parent");
+                    }
+                    let temporary = original.with_file_name(format!(
+                        ".store-reconciliation-rollback-{}",
+                        original.file_name().expect("source name").to_string_lossy()
+                    ));
+                    fs::rename(&current, &temporary).expect("rename rollback temporary");
+                    fs::rename(temporary, original).expect("restore original directory");
+                }
+            }
+            "rename_index_key" => {
+                let mut index: Value = serde_json::from_str(
+                    &fs::read_to_string(base.join("index.json")).expect("read applied index"),
+                )
+                .expect("parse applied index");
+                let projects = index["projects"].as_object_mut().expect("index projects");
+                projects.remove(target);
+                let recovery: Value = serde_json::from_str(
+                    step["recovery_reference"]
+                        .as_str()
+                        .expect("index recovery reference"),
+                )
+                .expect("parse index recovery reference");
+                projects.insert(source.to_owned(), recovery);
+                write_file(&base.join("index.json"), &index.to_string());
+            }
+            "annotate_card" => {}
+            other => panic!("unexpected migration operation {other}"),
+        }
+    }
+}
+
+#[test]
+fn store_reconciliation_preserves_logical_truth_across_lifecycle() {
+    let root = unique_test_dir("store-reconciliation-lifecycle");
+    let home = root.join("home");
+    let base = home.join(".aicx");
+    let fixture = load_store_reconciliation_fixture();
+    seed_store_reconciliation_fixture(&base, &fixture);
+
+    let before = reconciliation_inventory(&base);
+    write_file(
+        &base.join("reconciliation-before.json"),
+        &serde_json::to_string_pretty(&before).expect("serialize before manifest"),
+    );
+    assert_eq!(before.file_count, fixture.projects.len());
+    assert_eq!(before.logical_sessions, fixture.projects.len() - 1);
+    assert_eq!(before.resolvable_physical_duplicates, 0);
+    assert_eq!(before.unresolved_conflicts, ["session-divergent"]);
+
+    let source_hash = recursive_store_digest(&base.join("store"));
+    let dry_run = run_aicx(&home, &["doctor", "--migrate-identities"]);
+    assert!(
+        String::from_utf8_lossy(&dry_run.stdout).contains("[dry-run] identity migration:"),
+        "doctor may remain non-zero for unrelated health findings, but migration preview must run"
+    );
+    let manifest_path = base.join("migration/identity-manifest.json");
+    let dry_manifest: Value = serde_json::from_str(
+        &fs::read_to_string(&manifest_path).expect("read dry-run identity manifest"),
+    )
+    .expect("parse dry-run identity manifest");
+    assert_eq!(dry_manifest["mode"], "dry-run");
+    assert_eq!(
+        recursive_store_digest(&base.join("store")),
+        source_hash,
+        "recursive source hash proves dry-run purity"
+    );
+
+    let applied = run_aicx(&home, &["doctor", "--migrate-identities", "--apply"]);
+    assert!(
+        String::from_utf8_lossy(&applied.stdout).contains("identity migration:"),
+        "doctor may remain non-zero for unrelated health findings, but migration apply must run"
+    );
+    let applied_manifest: Value = serde_json::from_str(
+        &fs::read_to_string(&manifest_path).expect("read applied identity manifest"),
+    )
+    .expect("parse applied identity manifest");
+    assert_eq!(applied_manifest["mode"], "apply");
+    assert!(base.join("store/loctree/aicx").is_dir());
+    assert!(
+        base.join("store/aicx").is_dir(),
+        "ownerless bucket retained"
+    );
+    assert!(
+        base.join("store/_aicx").is_dir(),
+        "internal bucket retained"
+    );
+    assert!(
+        applied_manifest["steps"]
+            .as_array()
+            .expect("applied steps")
+            .iter()
+            .any(|step| step["operation"] == "quarantine_deprecated" && step["result"] == "success"),
+        "deprecated checkout must have a named quarantine recovery reference"
+    );
+
+    let after = reconciliation_inventory(&base);
+    write_file(
+        &base.join("reconciliation-after.json"),
+        &serde_json::to_string_pretty(&after).expect("serialize after manifest"),
+    );
+    assert_eq!(after.file_count, before.file_count);
+    assert_eq!(after.bytes, before.bytes);
+    assert_eq!(after.logical_sessions, before.logical_sessions);
+    assert_eq!(after.resolvable_physical_duplicates, 0);
+    assert_eq!(after.unresolved_conflicts, ["session-divergent"]);
+    assert!(
+        after
+            .identities
+            .iter()
+            .any(|identity| identity == "Loctree/AICX"),
+        "payload provenance remains immutable while its physical bucket is canonicalized"
+    );
+
+    rollback_store_reconciliation_from_manifest(&base);
+    assert!(base.join("store/Loctree/AICX").is_dir());
+    let rolled_back = reconciliation_inventory(&base);
+    assert_eq!(
+        rolled_back, before,
+        "rollback restores every input byte and identity"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn store_reconciliation_resumes_after_each_completed_durable_prefix() {
+    let root = unique_test_dir("store-reconciliation-resume");
+    let home = root.join("home");
+    let base = home.join(".aicx");
+    let fixture = load_store_reconciliation_fixture();
+    seed_store_reconciliation_fixture(&base, &fixture);
+    let before = reconciliation_inventory(&base);
+
+    let planned = run_aicx(&home, &["doctor", "--migrate-identities"]);
+    assert!(String::from_utf8_lossy(&planned.stdout).contains("[dry-run] identity migration:"));
+    let manifest_path = base.join("migration/identity-manifest.json");
+    let original_index = fs::read_to_string(base.join("index.json")).expect("read fixture index");
+    let mut index: Value = serde_json::from_str(&original_index).expect("parse fixture index");
+    index["projects"]["Loctree/AICX"]["agents"]["claude"]["total_entries"] = json!(99);
+    write_file(&base.join("index.json"), &index.to_string());
+
+    let interrupted = run_aicx(&home, &["doctor", "--migrate-identities", "--apply"]);
+    assert!(
+        String::from_utf8_lossy(&interrupted.stdout).contains("identity migration skipped:"),
+        "changed later phase must interrupt apply: {}",
+        String::from_utf8_lossy(&interrupted.stdout)
+    );
+    let persisted: Value = serde_json::from_str(
+        &fs::read_to_string(manifest_path).expect("read interrupted manifest"),
+    )
+    .expect("parse interrupted manifest");
+    let steps = persisted["steps"].as_array().expect("persisted steps");
+    assert!(
+        steps.iter().any(|step| step["result"] == "success"),
+        "every completed durable prefix is persisted before interruption"
+    );
+    assert!(
+        steps.iter().any(|step| step["result"]
+            .as_str()
+            .is_some_and(|value| value.starts_with("failed:"))),
+        "the interrupted phase is explicit, never silently skipped"
+    );
+
+    write_file(&base.join("index.json"), &original_index);
+    let resumed = run_aicx(&home, &["doctor", "--migrate-identities", "--apply"]);
+    assert!(String::from_utf8_lossy(&resumed.stdout).contains("identity migration:"));
+    let resumed_manifest: Value = serde_json::from_str(
+        &fs::read_to_string(base.join("migration/identity-manifest.json"))
+            .expect("read resumed manifest"),
+    )
+    .expect("parse resumed manifest");
+    assert_eq!(resumed_manifest["mode"], "apply");
+    let after = reconciliation_inventory(&base);
+    assert_eq!(after.file_count, before.file_count);
+    assert_eq!(after.bytes, before.bytes);
+    assert_eq!(after.logical_sessions, before.logical_sessions);
+    assert_eq!(after.unresolved_conflicts, ["session-divergent"]);
+
+    let _ = fs::remove_dir_all(&root);
+}

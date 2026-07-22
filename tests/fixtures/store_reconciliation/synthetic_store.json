@@ -1,0 +1,15 @@
+{
+  "schema": "aicx.test.store_reconciliation.v1",
+  "projects": [
+    {"identity": "Loctree/AICX", "session_id": "session-main", "relative": "2026_0720/context/claude/main.payload", "body": "canonical-main"},
+    {"identity": "aicx", "session_id": "session-ownerless-aicx", "relative": "2026_0720/context/codex/aicx.payload", "body": "ownerless-aicx"},
+    {"identity": "codescribe", "session_id": "session-ownerless-codescribe", "relative": "2026_0720/context/claude/codescribe.payload", "body": "ownerless-codescribe"},
+    {"identity": "vibecrafted", "session_id": "session-ownerless-vibecrafted", "relative": "2026_0720/context/codex/vibecrafted.payload", "body": "ownerless-vibecrafted"},
+    {"identity": "_aicx", "session_id": "session-internal-aicx", "relative": "2026_0720/context/system/internal.payload", "body": "internal-aicx"},
+    {"identity": "_all", "session_id": "session-internal-all", "relative": "2026_0720/context/system/all.payload", "body": "internal-all"},
+    {"identity": "VetCoders/Vista-deprecated", "session_id": "session-deprecated", "relative": "2026_0720/context/claude/deprecated.payload", "body": "deprecated-but-retained"},
+    {"identity": "loctree-suite", "session_id": "session-divergent", "relative": "2026_0720/context/claude/divergent-a.payload", "body": "divergent-copy-a"},
+    {"identity": "libraxisai_tools", "session_id": "session-divergent", "relative": "2026_0720/context/claude/divergent-b.payload", "body": "divergent-copy-b"},
+    {"identity": "vetcoders_vista", "session_id": "session-style-drift", "relative": "2026_0720/context/codex/style.payload", "body": "style-drift-retained"}
+  ]
+}

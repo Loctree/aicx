@@ -128,6 +128,34 @@ Historically, `aicx` grouped contexts under a file-centric identity (e.g., `file
 - Older stored artifacts are NOT automatically orphaned or silently broken on read. However, they will no longer be updated.
 - To maintain a single coherent history, run `aicx migrate`. This command will cleanly move your older `~/.ai-contexters` contexts into the correct repository-named directories in `~/.aicx/` and update your `index.json`.
 
+## Store reconciliation contract
+
+Identity migration and abandoned canonical-projection stages are exercised as
+one recovery workflow against a copied `AICX_HOME`; neither operation requires
+or permits mutation of the live store during verification.
+
+1. `aicx doctor --migrate-identities` inventories identity drift and writes the
+   resumable `migration/identity-manifest.json`. This is a dry run: a recursive
+   hash of `store/` must remain unchanged.
+2. `aicx doctor --fix-buckets --dry-run` inventories abandoned projection
+   stages from their `stage.json` leases without reading payloads.
+3. Apply only after reviewing both previews. Identity apply is resumable after
+   every persisted step; eligible projection stages move, never delete, into a
+   named `quarantine/projection-stages-<timestamp>/` artifact with a restore
+   manifest.
+4. Verify before/after inventories by file count, bytes, unique logical
+   sessions, identities, resolvable physical duplicates, and unresolved
+   conflicts. A non-identical pair for one logical session is an explicit
+   conflict: no freshest-wins choice is allowed. Rollback must restore the
+   original payload inventory byte-for-byte.
+
+The synthetic contract pack at
+`tests/fixtures/store_reconciliation/synthetic_store.json` mirrors casing/style
+drift, ownerless and underscore-prefixed buckets, deprecated checkouts, and a
+divergent logical-session pair without copying private session content. The E2E
+tests materialize `reconciliation-before.json` and
+`reconciliation-after.json` inside their temporary copied home.
+
 ## Repo-local Context Artifacts: `.ai-context/`
 
 While `aicx init` has been retired in favor of framework-level orchestration (`/vc-init`), the framework still produces repo-local artifacts for agent awareness:
