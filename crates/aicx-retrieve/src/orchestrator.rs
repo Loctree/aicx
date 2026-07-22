@@ -6,8 +6,9 @@ use anyhow::{Result, anyhow};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    ChunkRef, DenseChunkRef, DenseIndex, FilterSet, FusionStrategy, Hit, LexicalIndex,
-    LexicalQuery, Manifest, RetrieveError,
+    ChunkRef, DenseChunkRef, DenseIndex, ExecutedPath, FilterSet, FusionStrategy, Hit,
+    LexicalIndex, LexicalQuery, Manifest, RequestedMode, RetrievalEvidence, RetrievalOutcome,
+    RetrieveError,
 };
 
 pub struct HybridIndex {
@@ -72,6 +73,22 @@ pub struct HybridQueryInput<'a> {
     pub query_embedding: &'a [f32],
     pub filters: FilterSet,
     pub limit: usize,
+}
+
+/// Default hard ceiling for adapters that cannot prove full metadata
+/// pushdown. The orchestrator refills deterministically up to this many
+/// globally-ranked candidates; reaching the ceiling is explicit saturation,
+/// never silent empty/exhaustion.
+pub const DEFAULT_FILTER_REFILL_BUDGET: usize = 1_024;
+
+/// Hybrid query result plus the evidence needed to distinguish a complete
+/// empty result from bounded under-delivery.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HybridQueryResult {
+    pub hits: Vec<Hit>,
+    pub examined_count: usize,
+    pub exhausted: bool,
+    pub retrieval_outcome: RetrievalOutcome,
 }
 
 impl HybridIndex {
@@ -194,15 +211,177 @@ impl HybridIndex {
     }
 
     pub fn query_hybrid(&self, input: HybridQueryInput<'_>) -> Result<Vec<Hit>> {
-        let lex_hits = self.lexical.query(&LexicalQuery {
-            text: input.query_text.to_string(),
-            limit: input.limit,
-            filters: input.filters.clone(),
-        })?;
-        let dense_hits = self
-            .dense
-            .query(input.query_embedding, input.limit, &input.filters)?;
-        Ok(self.fusion.fuse(lex_hits, dense_hits, input.limit))
+        Ok(self
+            .query_hybrid_with_budget(input, DEFAULT_FILTER_REFILL_BUDGET)?
+            .hits)
+    }
+
+    /// Execute hybrid retrieval with deterministic bounded refill for the
+    /// lexical leg. Dense adapters honor the trait's filter-before-distance
+    /// contract directly. Lexical adapters are treated conservatively: with
+    /// active filters the orchestrator requests cumulative global windows,
+    /// applies every exact metadata predicate locally, and doubles the window
+    /// until the requested count, actual exhaustion, or the explicit budget.
+    pub fn query_hybrid_with_budget(
+        &self,
+        input: HybridQueryInput<'_>,
+        candidate_budget: usize,
+    ) -> Result<HybridQueryResult> {
+        self.query_hybrid_with_budget_and_filter(input, candidate_budget, false, |_| true)
+    }
+
+    /// Bounded refill variant for supported range/quality metadata predicates
+    /// that cannot be represented by [`FilterSet`]'s exact equality map.
+    pub fn query_hybrid_with_budget_and_filter<F>(
+        &self,
+        input: HybridQueryInput<'_>,
+        candidate_budget: usize,
+        extra_filter_active: bool,
+        extra_filter: F,
+    ) -> Result<HybridQueryResult>
+    where
+        F: Fn(&serde_json::Value) -> bool,
+    {
+        let limit = input.limit;
+        if limit == 0 {
+            return Ok(HybridQueryResult {
+                hits: Vec::new(),
+                examined_count: 0,
+                exhausted: true,
+                retrieval_outcome: RetrievalOutcome::from_evidence(
+                    RequestedMode::Hybrid,
+                    RetrievalEvidence {
+                        executed_path: Some(ExecutedPath::HybridFusion),
+                        examined_count: Some(0),
+                        matched_count: 0,
+                        fallback_reason: None,
+                        stale_evidence: false,
+                    },
+                ),
+            });
+        }
+
+        let filters_active = !input.filters.values.is_empty() || extra_filter_active;
+        let budget = candidate_budget.max(limit).max(1);
+        let mut window = limit.min(budget).max(1);
+        let mut lexical_hits;
+        let lexical_examined;
+        let lexical_exhausted;
+        let lexical_saturated;
+
+        loop {
+            let raw = self.lexical.query(&LexicalQuery {
+                text: input.query_text.to_string(),
+                limit: window,
+                // Do not hand an unproven adapter a filter: legacy adapters
+                // may turn it into a full-doc collection. The orchestrator's
+                // cumulative window is the bounded fallback contract.
+                filters: FilterSet::default(),
+            })?;
+            let raw_len = raw.len();
+            lexical_hits = if filters_active {
+                raw.into_iter()
+                    .filter(|hit| {
+                        metadata_matches(&hit.metadata, &input.filters)
+                            && extra_filter(&hit.metadata)
+                    })
+                    .collect()
+            } else {
+                raw
+            };
+
+            if lexical_hits.len() >= limit {
+                lexical_examined = raw_len;
+                lexical_exhausted = false;
+                lexical_saturated = false;
+                break;
+            }
+            if raw_len < window {
+                lexical_examined = raw_len;
+                lexical_exhausted = true;
+                lexical_saturated = false;
+                break;
+            }
+            if window >= budget {
+                lexical_examined = raw_len;
+                lexical_exhausted = false;
+                lexical_saturated = true;
+                break;
+            }
+            window = window.saturating_mul(2).min(budget);
+        }
+
+        lexical_hits.truncate(limit);
+        for (rank, hit) in lexical_hits.iter_mut().enumerate() {
+            hit.rank = rank;
+        }
+
+        let mut dense_window = limit.min(budget).max(1);
+        let mut dense_hits;
+        let dense_examined;
+        let dense_exhausted;
+        let dense_saturated;
+        loop {
+            let raw = self
+                .dense
+                .query(input.query_embedding, dense_window, &input.filters)?;
+            let raw_len = raw.len();
+            dense_hits = if extra_filter_active {
+                raw.into_iter()
+                    .filter(|hit| extra_filter(&hit.metadata))
+                    .collect()
+            } else {
+                raw
+            };
+            if dense_hits.len() >= limit {
+                dense_examined = raw_len;
+                dense_exhausted = false;
+                dense_saturated = false;
+                break;
+            }
+            if raw_len < dense_window {
+                dense_examined = raw_len;
+                dense_exhausted = true;
+                dense_saturated = false;
+                break;
+            }
+            if dense_window >= budget {
+                dense_examined = raw_len;
+                dense_exhausted = false;
+                dense_saturated = true;
+                break;
+            }
+            dense_window = dense_window.saturating_mul(2).min(budget);
+        }
+        dense_hits.truncate(limit);
+        for (rank, hit) in dense_hits.iter_mut().enumerate() {
+            hit.rank = rank;
+        }
+        let hits = self.fusion.fuse(lexical_hits, dense_hits, limit);
+        let under_delivered = hits.len() < limit;
+        let saturated = under_delivered && (lexical_saturated || dense_saturated);
+        let retrieval_outcome = RetrievalOutcome::from_evidence(
+            RequestedMode::Hybrid,
+            RetrievalEvidence {
+                executed_path: Some(ExecutedPath::HybridFusion),
+                examined_count: Some(lexical_examined.max(dense_examined)),
+                matched_count: hits.len(),
+                fallback_reason: None,
+                stale_evidence: false,
+            },
+        );
+        let retrieval_outcome = if saturated {
+            retrieval_outcome.mark_partial()
+        } else {
+            retrieval_outcome
+        };
+
+        Ok(HybridQueryResult {
+            hits,
+            examined_count: lexical_examined.max(dense_examined),
+            exhausted: under_delivered && lexical_exhausted && dense_exhausted,
+            retrieval_outcome,
+        })
     }
 
     pub fn manifest(&self) -> Option<&Manifest> {
@@ -218,6 +397,13 @@ impl HybridIndex {
     fn manifest_path(&self) -> PathBuf {
         self.manifest_dir.join("manifest.json")
     }
+}
+
+fn metadata_matches(metadata: &serde_json::Value, filters: &FilterSet) -> bool {
+    filters
+        .values
+        .iter()
+        .all(|(key, expected)| metadata.get(key) == Some(expected))
 }
 
 pub fn validate_live_bindings_for_refresh(
@@ -331,10 +517,114 @@ fn fusion_k(name: &str) -> u32 {
 mod tests {
     use super::*;
     use crate::{
-        BruteForceAdapter, ChunkRef, DenseChunkRef, Distance, ReciprocalRankFusion, TantivyAdapter,
+        BruteForceAdapter, ChunkRef, DenseChunkRef, Distance, LexicalCommitId,
+        ReciprocalRankFusion, TantivyAdapter,
     };
     use serde_json::json;
     use tempfile::TempDir;
+
+    struct RankedLexical {
+        hits: Vec<Hit>,
+        commit_id: LexicalCommitId,
+    }
+
+    impl LexicalIndex for RankedLexical {
+        fn schema_version(&self) -> &str {
+            "ranked-test-v1"
+        }
+
+        fn build(&mut self, _chunks: &[ChunkRef]) -> Result<LexicalCommitId> {
+            Ok(self.commit_id.clone())
+        }
+
+        fn insert(&mut self, _chunk: &ChunkRef) -> Result<()> {
+            Ok(())
+        }
+
+        fn query(&self, query: &LexicalQuery) -> Result<Vec<Hit>> {
+            Ok(self.hits.iter().take(query.limit).cloned().collect())
+        }
+
+        fn commit_id(&self) -> &LexicalCommitId {
+            &self.commit_id
+        }
+
+        fn doc_count(&self) -> usize {
+            self.hits.len()
+        }
+    }
+
+    struct EmptyDense;
+
+    impl DenseIndex for EmptyDense {
+        fn dim(&self) -> usize {
+            2
+        }
+
+        fn distance(&self) -> Distance {
+            Distance::Cosine
+        }
+
+        fn kind(&self) -> &str {
+            "empty-test-dense"
+        }
+
+        fn build(&mut self, _chunks: &[DenseChunkRef]) -> Result<()> {
+            Ok(())
+        }
+
+        fn insert(&mut self, _chunk: &DenseChunkRef) -> Result<()> {
+            Ok(())
+        }
+
+        fn query(
+            &self,
+            _embedding: &[f32],
+            _limit: usize,
+            _filters: &FilterSet,
+        ) -> Result<Vec<Hit>> {
+            Ok(Vec::new())
+        }
+
+        fn count(&self) -> usize {
+            0
+        }
+    }
+
+    fn ranked_hit(rank: usize, project: &str) -> Hit {
+        Hit {
+            chunk_id: format!("rank-{rank:03}"),
+            score: 1.0 - rank as f32 / 1_000.0,
+            rank,
+            source: "ranked-test".to_string(),
+            metadata: json!({"project": project}),
+        }
+    }
+
+    fn refill_test_index(foreign: usize, target: usize) -> HybridIndex {
+        let hits = (0..foreign)
+            .map(|rank| ranked_hit(rank, "foreign/project"))
+            .chain((0..target).map(|offset| ranked_hit(foreign + offset, "target/project")))
+            .collect();
+        HybridIndex::new(
+            Box::new(RankedLexical {
+                hits,
+                commit_id: LexicalCommitId("ranked-test-commit".to_string()),
+            }),
+            Box::new(EmptyDense),
+            Box::new(ReciprocalRankFusion::default()),
+            "/tmp/aicx-refill-test",
+            fingerprint(),
+        )
+    }
+
+    fn target_filter() -> FilterSet {
+        FilterSet {
+            values: [("project".to_string(), json!("target/project"))]
+                .into_iter()
+                .collect(),
+        }
+    }
 
     fn chunk(id: &str, text: &str) -> ChunkRef {
         ChunkRef {
@@ -472,5 +762,83 @@ mod tests {
         assert_eq!(refreshed.dense_count, 3);
         assert_eq!(refreshed.lexical_doc_count, 3);
         assert_ne!(refreshed.generation_id, initial.generation_id);
+    }
+
+    #[test]
+    fn filter_refill_recovers_project_hits_beyond_former_top_50() {
+        let index = refill_test_index(100, 5);
+        let outcome = index
+            .query_hybrid_with_budget(
+                HybridQueryInput {
+                    query_text: "needle",
+                    query_embedding: &[1.0, 0.0],
+                    filters: target_filter(),
+                    limit: 5,
+                },
+                128,
+            )
+            .expect("bounded refill should reach target-project hits");
+
+        assert_eq!(outcome.hits.len(), 5);
+        assert!(
+            outcome
+                .hits
+                .iter()
+                .all(|hit| { hit.metadata.get("project") == Some(&json!("target/project")) })
+        );
+        assert_eq!(
+            outcome.retrieval_outcome.completeness,
+            crate::RetrievalCompleteness::Complete
+        );
+    }
+
+    #[test]
+    fn tiny_refill_budget_surfaces_saturation_instead_of_empty_exhaustion() {
+        let index = refill_test_index(100, 5);
+        let outcome = index
+            .query_hybrid_with_budget(
+                HybridQueryInput {
+                    query_text: "needle",
+                    query_embedding: &[1.0, 0.0],
+                    filters: target_filter(),
+                    limit: 5,
+                },
+                50,
+            )
+            .expect("bounded refill should return typed boundary evidence");
+
+        assert!(outcome.hits.is_empty());
+        assert_eq!(outcome.examined_count, 50);
+        assert_eq!(
+            outcome.retrieval_outcome.completeness,
+            crate::RetrievalCompleteness::Partial
+        );
+        assert_eq!(outcome.retrieval_outcome.examined_count, 50);
+        assert_eq!(outcome.retrieval_outcome.matched_count, 0);
+        assert!(!outcome.exhausted);
+    }
+
+    #[test]
+    fn short_refill_pool_is_true_exhaustion_not_saturation() {
+        let index = refill_test_index(20, 0);
+        let outcome = index
+            .query_hybrid_with_budget(
+                HybridQueryInput {
+                    query_text: "needle",
+                    query_embedding: &[1.0, 0.0],
+                    filters: target_filter(),
+                    limit: 5,
+                },
+                50,
+            )
+            .expect("short pool should exhaust cleanly");
+
+        assert!(outcome.hits.is_empty());
+        assert_eq!(outcome.examined_count, 20);
+        assert_eq!(
+            outcome.retrieval_outcome.completeness,
+            crate::RetrievalCompleteness::Complete
+        );
+        assert!(outcome.exhausted);
     }
 }

@@ -50,6 +50,12 @@ pub struct SemanticSearchOutcome {
 /// Result of a semantic search call.
 pub type SemanticOutcome = SemanticSearchOutcome;
 
+#[derive(Debug, Clone, Copy, Default)]
+struct CandidateBoundary {
+    examined: usize,
+    saturated: bool,
+}
+
 const BACKEND_HYBRID_RRF: &str = "hybrid_rrf";
 const BACKEND_HYBRID_RRF_GLOBAL_SCOPED: &str = "hybrid_rrf_global_scoped";
 const BACKEND_SEMANTIC_DENSE_ONLY: &str = "semantic_dense_only";
@@ -245,6 +251,27 @@ pub fn try_semantic_search(
     frame_kind_filter: Option<FrameKind>,
     kind_filter: Option<&str>,
 ) -> std::result::Result<SemanticOutcome, SemanticError> {
+    try_semantic_search_with_boundary(
+        _store_root,
+        query,
+        limit,
+        project_filters,
+        frame_kind_filter,
+        kind_filter,
+        None,
+    )
+    .map(|(outcome, _)| outcome)
+}
+
+fn try_semantic_search_with_boundary(
+    _store_root: &Path,
+    query: &str,
+    limit: usize,
+    project_filters: &[Option<&str>],
+    frame_kind_filter: Option<FrameKind>,
+    kind_filter: Option<&str>,
+    candidate_filters: Option<&SemanticSearchFilters>,
+) -> std::result::Result<(SemanticOutcome, CandidateBoundary), SemanticError> {
     #[cfg(not(any(feature = "native-embedder", feature = "cloud-embedder")))]
     {
         let _ = (
@@ -253,6 +280,7 @@ pub fn try_semantic_search(
             project_filters,
             frame_kind_filter,
             kind_filter,
+            candidate_filters,
         );
         Err(SemanticError::EmbedderFeatureMissing {
             reason: "this aicx binary was compiled without any embedder feature".to_string(),
@@ -281,14 +309,18 @@ pub fn try_semantic_search(
         // hybrid — the degraded status must reach the CLI/MCP boundary.
         let mut any_dense_only = false;
         let mut any_global_project_scope = false;
+        let mut boundary = CandidateBoundary::default();
         for scope in scopes {
-            let mut outcome = try_semantic_search_native(
+            let (mut outcome, scope_boundary) = try_semantic_search_native(
                 query,
                 per_scope_limit,
                 scope,
                 frame_kind_filter,
                 kind_filter,
+                candidate_filters,
             )?;
+            boundary.examined = boundary.examined.saturating_add(scope_boundary.examined);
+            boundary.saturated |= scope_boundary.saturated;
             if outcome
                 .backend_label
                 .starts_with(BACKEND_SEMANTIC_DENSE_ONLY)
@@ -307,21 +339,24 @@ pub fn try_semantic_search(
         }
         merged_results.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| b.date.cmp(&a.date)));
         merged_results.truncate(limit);
-        Ok(SemanticOutcome {
-            results: merged_results,
-            scanned,
-            backend_label: if any_dense_only && any_global_project_scope {
-                BACKEND_SEMANTIC_DENSE_ONLY_GLOBAL_SCOPED
-            } else if any_dense_only {
-                BACKEND_SEMANTIC_DENSE_ONLY
-            } else if any_global_project_scope {
-                BACKEND_HYBRID_RRF_GLOBAL_SCOPED
-            } else {
-                BACKEND_HYBRID_RRF
+        Ok((
+            SemanticOutcome {
+                results: merged_results,
+                scanned,
+                backend_label: if any_dense_only && any_global_project_scope {
+                    BACKEND_SEMANTIC_DENSE_ONLY_GLOBAL_SCOPED
+                } else if any_dense_only {
+                    BACKEND_SEMANTIC_DENSE_ONLY
+                } else if any_global_project_scope {
+                    BACKEND_HYBRID_RRF_GLOBAL_SCOPED
+                } else {
+                    BACKEND_HYBRID_RRF
+                },
+                model_id: model_id.unwrap_or_else(|| "unknown".to_string()),
+                retrieval_status: merge_hybrid_statuses(&hybrid_statuses),
             },
-            model_id: model_id.unwrap_or_else(|| "unknown".to_string()),
-            retrieval_status: merge_hybrid_statuses(&hybrid_statuses),
-        })
+            boundary,
+        ))
     }
 }
 
@@ -340,6 +375,9 @@ struct SemanticRetrievalFilters<'a> {
     kind: Option<&'a str>,
     frame_kind: Option<FrameKind>,
     project: Option<&'a str>,
+    agent: Option<&'a str>,
+    date: Option<&'a str>,
+    candidate_filters: Option<&'a SemanticSearchFilters>,
 }
 
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
@@ -423,7 +461,8 @@ fn try_semantic_search_native(
     project_filter: Option<&str>,
     frame_kind_filter: Option<FrameKind>,
     kind_filter: Option<&str>,
-) -> std::result::Result<SemanticOutcome, SemanticError> {
+    candidate_filters: Option<&SemanticSearchFilters>,
+) -> std::result::Result<(SemanticOutcome, CandidateBoundary), SemanticError> {
     // Resolve + verify the committed index FIRST, BEFORE paying the
     // (potentially heavy) embedder bootstrap. On a host with no local index
     // (e.g. a read mirror, which serves semantic from a remote mesh host and
@@ -586,6 +625,9 @@ fn try_semantic_search_native(
         kind: kind_filter,
         frame_kind: frame_kind_filter,
         project: scope.retrieval_project_filter,
+        agent: candidate_filters.and_then(|filters| filters.agent.as_deref()),
+        date: candidate_filters.and_then(candidate_exact_date),
+        candidate_filters,
     };
 
     // Patch 3 / Bug B+: the hybrid (tantivy lexical + dense fusion) stack can
@@ -601,7 +643,7 @@ fn try_semantic_search_native(
             Ok(hybrid) => hybrid,
             Err(SemanticError::RetrievalManifestMissing { .. })
             | Err(SemanticError::RetrievalManifestStale { .. }) => {
-                return query_dense_only_from_primary(
+                return query_dense_only_from_primary_filtered(
                     &path,
                     &query_embedding,
                     embedder_dim,
@@ -609,7 +651,8 @@ fn try_semantic_search_native(
                     retrieval_filters,
                     &info.model_id,
                     scope.used_global_project_scope,
-                );
+                )
+                .map(|outcome| (outcome, CandidateBoundary::default()));
             }
             Err(other) => return Err(other),
         }
@@ -617,7 +660,7 @@ fn try_semantic_search_native(
         // Manifest was never committed — serve dense-only directly from the
         // primary committed index (already validated above: exists, correct
         // dimension, non-empty).
-        return query_dense_only_from_primary(
+        return query_dense_only_from_primary_filtered(
             &path,
             &query_embedding,
             embedder_dim,
@@ -625,43 +668,37 @@ fn try_semantic_search_native(
             retrieval_filters,
             &info.model_id,
             scope.used_global_project_scope,
-        );
+        )
+        .map(|outcome| (outcome, CandidateBoundary::default()));
     };
     let manifest = hybrid.manifest().cloned();
     let filters = hybrid_filters(retrieval_filters);
-    let hits = match hybrid.query_hybrid(aicx_retrieve::HybridQueryInput {
-        query_text: query,
-        query_embedding: &query_embedding,
-        filters,
-        limit,
-    }) {
-        Ok(hits) => hits,
+    let extra_filter_active = candidate_filters.is_some_and(supported_candidate_filter_active);
+    let query_result = match hybrid.query_hybrid_with_budget_and_filter(
+        aicx_retrieve::HybridQueryInput {
+            query_text: query,
+            query_embedding: &query_embedding,
+            filters,
+            limit,
+        },
+        aicx_retrieve::DEFAULT_FILTER_REFILL_BUDGET,
+        extra_filter_active,
+        |metadata| {
+            candidate_filters
+                .is_none_or(|filters| semantic_candidate_metadata_matches(metadata, filters))
+        },
+    ) {
+        Ok(result) => result,
         Err(err) => return Err(index_query_error(&path, err)),
     };
-
-    if hits.is_empty() {
-        let scanned = manifest
-            .as_ref()
-            .map(|manifest| manifest.source_chunk_count)
-            .unwrap_or(0);
-        return Err(SemanticError::NoResults {
-            path: path.clone(),
-            scanned,
-            reason: format!(
-                "hybrid index at {} produced 0 ranked hits for this query",
-                manifest_path.display()
-            ),
-            recommendation: "either the index is empty (rebuild with `aicx index`) \
-                 or your query has no semantic neighbours in the corpus — try broader phrasing"
-                .to_string(),
-        });
-    }
+    let boundary = CandidateBoundary {
+        examined: query_result.examined_count,
+        saturated: query_result.retrieval_outcome.completeness == RetrievalCompleteness::Partial,
+    };
+    let hits = query_result.hits;
 
     let retrieval_status = manifest.as_ref().map(HybridRetrievalStatus::from);
-    let scanned = retrieval_status
-        .as_ref()
-        .map(|status| status.source_chunk_count)
-        .unwrap_or(hits.len());
+    let scanned = boundary.examined;
     let results: Vec<FuzzyResult> = hits
         .into_iter()
         .take(limit)
@@ -694,17 +731,20 @@ fn try_semantic_search_native(
         })
         .collect();
 
-    Ok(SemanticOutcome {
-        results,
-        scanned,
-        backend_label: if scope.used_global_project_scope {
-            BACKEND_HYBRID_RRF_GLOBAL_SCOPED
-        } else {
-            BACKEND_HYBRID_RRF
+    Ok((
+        SemanticOutcome {
+            results,
+            scanned,
+            backend_label: if scope.used_global_project_scope {
+                BACKEND_HYBRID_RRF_GLOBAL_SCOPED
+            } else {
+                BACKEND_HYBRID_RRF
+            },
+            model_id: info.model_id,
+            retrieval_status,
         },
-        model_id: info.model_id,
-        retrieval_status,
-    })
+        boundary,
+    ))
 }
 
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
@@ -802,8 +842,29 @@ fn load_hybrid_index(
 /// explicit semantic search over real embeddings, surfaced via
 /// `backend_label = "semantic_dense_only"`. Hard-fail only when there is no
 /// valid dense artifact to serve.
-#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+#[cfg(all(any(feature = "native-embedder", feature = "cloud-embedder"), test))]
 fn query_dense_only_from_primary(
+    index_path: &std::path::Path,
+    query_embedding: &[f32],
+    dim: usize,
+    limit: usize,
+    filters: SemanticRetrievalFilters<'_>,
+    model_id: &str,
+    used_global_project_scope: bool,
+) -> std::result::Result<SemanticOutcome, SemanticError> {
+    query_dense_only_from_primary_filtered(
+        index_path,
+        query_embedding,
+        dim,
+        limit,
+        filters,
+        model_id,
+        used_global_project_scope,
+    )
+}
+
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+fn query_dense_only_from_primary_filtered(
     index_path: &std::path::Path,
     query_embedding: &[f32],
     dim: usize,
@@ -814,7 +875,7 @@ fn query_dense_only_from_primary(
 ) -> std::result::Result<SemanticOutcome, SemanticError> {
     use aicx_retrieve::{BruteForceAdapter, ChunkRef, DenseChunkRef, DenseIndex, Distance};
 
-    let (header, entries) = crate::vector_index::read_committed_index_entries_matching_project(
+    let (header, mut entries) = crate::vector_index::read_committed_index_entries_matching_project(
         index_path,
         filters.project,
     )
@@ -847,7 +908,7 @@ fn query_dense_only_from_primary(
         });
     }
 
-    if entries.is_empty() {
+    if header.entry_count == 0 {
         return Err(SemanticError::EmptyIndex {
             path: index_path.to_path_buf(),
             reason: format!(
@@ -856,6 +917,27 @@ fn query_dense_only_from_primary(
             ),
             recommendation: "run `aicx extract --all` to populate the corpus, then `aicx index`"
                 .to_string(),
+        });
+    }
+
+    if let Some(candidate_filters) = filters.candidate_filters {
+        entries.retain(|entry| {
+            let metadata = crate::vector_index::index_entry_metadata_json(entry);
+            semantic_candidate_metadata_matches(&metadata, candidate_filters)
+        });
+    }
+
+    if entries.is_empty() {
+        return Ok(SemanticOutcome {
+            results: Vec::new(),
+            scanned: 0,
+            backend_label: if used_global_project_scope {
+                BACKEND_SEMANTIC_DENSE_ONLY_GLOBAL_SCOPED
+            } else {
+                BACKEND_SEMANTIC_DENSE_ONLY
+            },
+            model_id: model_id.to_string(),
+            retrieval_status: None,
         });
     }
 
@@ -969,6 +1051,18 @@ fn hybrid_filters(filters: SemanticRetrievalFilters<'_>) -> aicx_retrieve::Filte
         set.values.insert(
             "frame_kind".to_string(),
             serde_json::Value::String(frame_kind.as_str().to_string()),
+        );
+    }
+    if let Some(agent) = filters.agent {
+        set.values.insert(
+            "agent".to_string(),
+            serde_json::Value::String(agent.to_string()),
+        );
+    }
+    if let Some(date) = filters.date {
+        set.values.insert(
+            "date".to_string(),
+            serde_json::Value::String(date.replace('-', "")),
         );
     }
     set
@@ -1260,6 +1354,58 @@ impl SemanticSearchFilters {
     }
 }
 
+fn supported_candidate_filter_active(filters: &SemanticSearchFilters) -> bool {
+    filters.agent.is_some()
+        || filters.date_lo.is_some()
+        || filters.date_hi.is_some()
+        || filters.hours_cutoff.is_some()
+}
+
+fn candidate_exact_date(filters: &SemanticSearchFilters) -> Option<&str> {
+    match (filters.date_lo.as_deref(), filters.date_hi.as_deref()) {
+        (Some(lo), Some(hi)) if lo == hi => Some(lo),
+        _ => None,
+    }
+}
+
+fn semantic_candidate_metadata_matches(
+    metadata: &serde_json::Value,
+    filters: &SemanticSearchFilters,
+) -> bool {
+    if let Some(agent) = filters.agent.as_deref()
+        && metadata.get("agent").and_then(serde_json::Value::as_str) != Some(agent)
+    {
+        return false;
+    }
+
+    let date_filter_active =
+        filters.date_lo.is_some() || filters.date_hi.is_some() || filters.hours_cutoff.is_some();
+    if !date_filter_active {
+        return true;
+    }
+    let Some(raw_date) = metadata.get("date").and_then(serde_json::Value::as_str) else {
+        return false;
+    };
+    let date = raw_date.replace('-', "");
+    let normalize = |value: &str| value.replace('-', "");
+
+    if filters.date_lo.is_some() || filters.date_hi.is_some() {
+        filters
+            .date_lo
+            .as_deref()
+            .is_none_or(|lo| date >= normalize(lo))
+            && filters
+                .date_hi
+                .as_deref()
+                .is_none_or(|hi| date <= normalize(hi))
+    } else {
+        filters
+            .hours_cutoff
+            .as_deref()
+            .is_none_or(|cutoff| date >= normalize(cutoff))
+    }
+}
+
 /// Diagnostic emitted when filter pushdown examined the full bounded
 /// pool but still failed to satisfy the user's `limit`. The presence of
 /// this payload tells the caller "we ran out of candidates inside the
@@ -1358,13 +1504,14 @@ pub fn try_semantic_search_filtered(
 ) -> std::result::Result<FilteredSemanticOutcome, SemanticError> {
     let fetch_limit = semantic_fetch_limit(user_limit, frame_kind_filter, post_filters);
 
-    let outcome = try_semantic_search(
+    let (outcome, candidate_boundary) = try_semantic_search_with_boundary(
         store_root,
         query,
         fetch_limit,
         project_filters,
         frame_kind_filter,
         kind_filter,
+        Some(post_filters),
     )?;
 
     let SemanticSearchOutcome {
@@ -1385,7 +1532,18 @@ pub fn try_semantic_search_filtered(
         matched,
         user_limit,
         fetch_limit,
-    );
+    )
+    .or_else(|| {
+        candidate_boundary
+            .saturated
+            .then_some(FilterPushdownDiagnostic {
+                kind: "filter_yielded_partial",
+                examined: candidate_boundary.examined,
+                matched,
+                requested_limit: user_limit,
+                examined_cap_ratio: FILTER_EXAMINED_CAP_RATIO,
+            })
+    });
 
     Ok(FilteredSemanticOutcome {
         outcome: SemanticSearchOutcome {
@@ -2124,6 +2282,9 @@ mod tests {
             kind: None,
             frame_kind: None,
             project,
+            agent: None,
+            date: None,
+            candidate_filters: None,
         }
     }
 
@@ -2425,6 +2586,61 @@ mod tests {
             outcome.results[0].label
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+    #[test]
+    fn dense_only_missing_project_is_true_empty_not_empty_index() {
+        use crate::vector_index::{IndexEntry, IndexHeader};
+        use std::io::Write;
+
+        let dir =
+            std::env::temp_dir().join(format!("aicx-dense-only-true-empty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let chunk_path = dir.join("other.md");
+        std::fs::write(&chunk_path, "other project").expect("write chunk");
+        let index_path = dir.join("embeddings.ndjson");
+        let header = IndexHeader {
+            schema_version: "1".to_string(),
+            model_id: "test-model".to_string(),
+            model_profile: "test".to_string(),
+            dimension: 3,
+            generated_at: "2026-07-22T00:00:00Z".to_string(),
+            entry_count: 1,
+        };
+        let entry = IndexEntry {
+            id: "other-hit".to_string(),
+            project: "foreign/project".to_string(),
+            agent: "codex".to_string(),
+            date: "20260722".to_string(),
+            path: chunk_path,
+            kind: "conversations".to_string(),
+            session_id: "session-other".to_string(),
+            frame_kind: Some("agent_reply".to_string()),
+            cwd: None,
+            embedding: vec![1.0, 0.0, 0.0],
+        };
+        {
+            let mut file = std::fs::File::create(&index_path).expect("create index");
+            writeln!(file, "{}", serde_json::to_string(&header).unwrap()).unwrap();
+            writeln!(file, "{}", serde_json::to_string(&entry).unwrap()).unwrap();
+        }
+
+        let outcome = query_dense_only_from_primary(
+            &index_path,
+            &[1.0, 0.0, 0.0],
+            3,
+            5,
+            test_semantic_filters(Some("target/project")),
+            "test-model",
+            true,
+        )
+        .expect("missing project inside a populated global index is a true empty outcome");
+
+        assert!(outcome.results.is_empty());
+        assert_eq!(outcome.scanned, 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2960,6 +3176,47 @@ mod tests {
             semantic_fetch_limit(10, Some(FrameKind::ToolCall), &filters),
             10,
             "explicit frame-kind queries should not pay the default quality-pool expansion"
+        );
+    }
+
+    #[test]
+    fn candidate_metadata_filters_compose_agent_and_date_before_ranking() {
+        let filters = SemanticSearchFilters {
+            agent: Some("codex".to_string()),
+            date_lo: Some("2026-07-20".to_string()),
+            date_hi: Some("2026-07-22".to_string()),
+            ..Default::default()
+        };
+
+        assert!(semantic_candidate_metadata_matches(
+            &serde_json::json!({"agent": "codex", "date": "20260721"}),
+            &filters,
+        ));
+        assert!(!semantic_candidate_metadata_matches(
+            &serde_json::json!({"agent": "claude", "date": "20260721"}),
+            &filters,
+        ));
+        assert!(!semantic_candidate_metadata_matches(
+            &serde_json::json!({"agent": "codex", "date": "20260723"}),
+            &filters,
+        ));
+
+        let exact = hybrid_filters(SemanticRetrievalFilters {
+            kind: Some("conversations"),
+            frame_kind: Some(FrameKind::AgentReply),
+            project: Some("target/project"),
+            agent: filters.agent.as_deref(),
+            date: Some("2026-07-21"),
+            candidate_filters: Some(&filters),
+        });
+        assert_eq!(
+            exact.values.get("project"),
+            Some(&serde_json::json!("target/project"))
+        );
+        assert_eq!(exact.values.get("agent"), Some(&serde_json::json!("codex")));
+        assert_eq!(
+            exact.values.get("date"),
+            Some(&serde_json::json!("20260721"))
         );
     }
 
