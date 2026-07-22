@@ -6230,11 +6230,16 @@ fn resolve_store_agents(agent: Option<&str>) -> Result<Vec<&'static str>> {
             "Unsupported --agent '{}'. Expected one of: claude, claude-history, codex, codex-sessions, gemini, junie, grok, codescribe, operator-md.",
             other
         )),
+        // `codex-sessions` stays a valid explicit `--agent` alias above, but
+        // must NOT ride the default list: it maps to the same
+        // `AgentKind::Codex` rollout catalog as `codex` (since the parser
+        // transplant, 25fc6ec), so a default run would ingest every codex
+        // session twice and the canonical projection fail-closes on
+        // `duplicate canonical card id` (reproduced live 2026-07-22).
         None => Ok(vec![
             "claude",
             "claude-history",
             "codex",
-            "codex-sessions",
             "gemini",
             "junie",
             "codescribe",
