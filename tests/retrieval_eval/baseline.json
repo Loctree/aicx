@@ -1,5 +1,32 @@
 {
   "metadata": "Historical baseline floor measured before live hybrid_rrf gating; default CI validates this file, live operator eval compares production hybrid_rrf against it.",
+  "migration_benchmark": {
+    "schema": "aicx.dense_migration_benchmark.v1",
+    "dispatcher_live_legacy_baseline": {
+      "unscoped": {
+        "bucket": "_all",
+        "legacy_pair_note": "15 GB NDJSON plus duplicate hybrid dense payload",
+        "max_rss_bytes": 5500000000,
+        "wall_seconds": 71.8,
+        "user_cpu_seconds": 64.0
+      },
+      "project_scoped": {
+        "bucket": "loctree_aicx",
+        "legacy_dense_bytes": 221000000,
+        "max_rss_bytes": 285000000,
+        "wall_seconds": 5.1
+      }
+    },
+    "budgets": {
+      "dense_payload_max_ratio_of_legacy_duplicate_pair": 0.6,
+      "peak_rss_max_bytes": 1342177280,
+      "warm_project_p95_max_seconds": 2.0,
+      "warm_global_p95_max_seconds": 8.0,
+      "exact_top_k_parity": 1.0
+    },
+    "verify_gate": "bash tools/bench_dense_migration.sh --verify-only",
+    "production_note": "--verify-only is a deterministic contract gate; production falsification must be run with a realistic isolated corpus scaled toward the observed ~300k x 4096 live shape."
+  },
   "aggregate": {
     "recall_at_5": 0.0,
     "ndcg_at_10": 0.0,

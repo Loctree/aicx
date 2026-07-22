@@ -7,6 +7,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **Dense migration benchmark gate.** Added `tools/bench_dense_migration.sh`
+  to build an isolated AICX_HOME-shaped corpus, compare legacy duplicate dense
+  NDJSON against the mmap payload, verify failed-copy `CURRENT` safety, reverse
+  query-order parity, top-k parity, disk ratio, and latency/RSS budget accounting
+  without mutating live `~/.aicx`.
 - **Batched semantic-index embedding.** `aicx index` now embeds chunks in
   batches through the existing `embed_batch` API instead of one HTTP
   round-trip per chunk. For the cloud backend this collapses the dominant

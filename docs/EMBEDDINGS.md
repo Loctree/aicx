@@ -252,6 +252,41 @@ Contract:
 Old generation directories accumulate until the doctor/quarantine surface
 reclaims them; this cut intentionally does not delete anything.
 
+## Dense Migration Benchmark
+
+`tools/bench_dense_migration.sh` is the W4 falsification harness for the dense
+replacement. It builds an isolated `AICX_HOME` shaped like the live store,
+including exact/case-drift/bare/underscore project identities, writes the
+legacy duplicate pair (`embeddings.ndjson` plus `hybrid/dense_brute_force.ndjson`),
+materializes a byte-compatible `dense.exact_mmap_v1.bin`, and compares both
+paths on identical global and project-filtered top-k queries.
+
+Fast contract gate:
+
+```bash
+bash tools/bench_dense_migration.sh --verify-only
+```
+
+Production-scale falsification should keep the live `~/.aicx` read-only and
+point the harness at an isolated filesystem budget, for example:
+
+```bash
+bash tools/bench_dense_migration.sh --rows 300000 --dim 4096 --queries 40 --output reports/dense-migration.json --keep
+```
+
+The hard budgets remain unchanged from the W4 brief:
+
+- dense mmap payload <= 60% of the legacy duplicate pair
+- peak RSS <= 1.25 GiB at the observed ~300k x 4096 scale
+- warm project-filter p95 <= 2 s; warm global p95 <= 8 s
+- exact top-k parity is 100% for equal ranking inputs
+- corrupt or interrupted generation copies must leave `CURRENT` untouched
+
+`--verify-only` is intentionally not production proof. It is the synchronous CI
+gate that proves the benchmark contract, byte layout, failed-copy safety checks,
+reverse-order query parity, and budget accounting still work before an operator
+runs the larger isolated corpus.
+
 ## Relationship To Roost/Rust-Memex
 
 Do not conflate config planes:
