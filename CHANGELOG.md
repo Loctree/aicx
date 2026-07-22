@@ -7,6 +7,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **Mmap exact-scan hot loop profiled and repaired — OUTCOME 1 (W4-01c).**
+  Profiling the release-mode `MmapDenseAdapter` at the same isolated
+  500000×1024 scale showed the Rust scan was never the latency culprit: warm
+  global query 0.578 s before / 0.371-0.468 s after the repair, project-scoped
+  0.241 s / 0.212-0.221 s — both far inside the frozen budgets (8 s global,
+  2 s project). The 317.87 s / 55.00 s recorded on 2026-07-22 measures the
+  pure-Python reference scan inside `tools/bench_dense_migration.sh`
+  (`run_mmap` struct-unpacks and dot-products every row in the interpreter);
+  the harness never executes the Rust adapter, debug or release. Hot-loop
+  repairs, with every contract preserved and scores bit-identical to the
+  brute-force leg: unfiltered scans skip row-metadata decoding entirely
+  (dropping a ~0.16 s/query serde_json + string-allocation tax at 500k rows),
+  filtered scans deserialize only the `metadata` object, the query
+  self-product is hoisted out of the scan, and scoring is
+  distance-specialized and branch-free with fail-closed non-finite
+  diagnostics moved off the hot path. The unmodified harness re-run at the
+  same scale reproduced its Python-scan figures (321.96 s / 55.37 s, with its
+  own pure-Python "legacy" scan at 37.9 s global) while parity 1.0, disk
+  ratio 0.0971, and failed-copy safety all held. Verdict: the mmap exact scan
+  stands; the Lance/memex-search contingency stays shelved.
 - **Dense migration benchmark gate.** Added `tools/bench_dense_migration.sh`
   to build an isolated AICX_HOME-shaped corpus, compare legacy duplicate dense
   NDJSON against the mmap payload, verify failed-copy `CURRENT` safety, reverse
