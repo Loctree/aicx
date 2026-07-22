@@ -30,7 +30,10 @@ mod types;
 pub use cards_v2::{
     CardsV2Action, CardsV2Item, CardsV2Manifest, CardsV2Totals, run_cards_v2_migration,
 };
-pub use identity::run_identity_migration_at;
+#[allow(unused_imports)]
+pub use identity::{
+    compute_store_recursive_hash, rollback_identity_migration_at, run_identity_migration_at,
+};
 use report::{print_migration_summary, render_migration_report};
 pub(crate) use source_locator::SourceLocator;
 use source_locator::SourceLookupOutcome;

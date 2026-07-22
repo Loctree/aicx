@@ -1726,3 +1726,69 @@ fn project_filter_cutting_everything_is_not_all_skipped() {
 
     let _ = fs::remove_dir_all(&root);
 }
+
+#[test]
+fn test_identity_migration_via_doctor_cli() {
+    let root = unique_test_dir("identity-migration-cli");
+    let home = root.join("home");
+    let aicx_dir = home.join(".aicx");
+    let store_dir = aicx_dir.join("store");
+
+    // 1. Seed store and index cased
+    fs::create_dir_all(store_dir.join("VetCoders/CodeScribe/2026_0717/context/claude")).unwrap();
+    fs::write(
+        store_dir.join("VetCoders/CodeScribe/2026_0717/context/claude/chunk1.md"),
+        "chunk contents",
+    )
+    .unwrap();
+
+    let index_data = json!({
+        "schema_version": 1,
+        "last_updated": chrono::Utc::now().to_rfc3339(),
+        "projects": {
+            "VetCoders/CodeScribe": {
+                "agents": {
+                    "claude": {
+                        "dates": ["2026-07-17"],
+                        "total_entries": 42,
+                        "last_updated": chrono::Utc::now().to_rfc3339()
+                    }
+                }
+            }
+        }
+    });
+    write_file(&aicx_dir.join("index.json"), &index_data.to_string());
+
+    // 2. Run dry-run doctor --migrate-identities
+    let output = run_aicx(&home, &["doctor", "--migrate-identities"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("[dry-run] identity migration:"));
+
+    // Verify manifest was written and is in dry-run mode
+    let manifest_path = aicx_dir.join("migration/identity-manifest.json");
+    assert!(manifest_path.is_file());
+    let manifest_content = fs::read_to_string(&manifest_path).unwrap();
+    assert!(manifest_content.contains("\"mode\": \"dry-run\""));
+
+    // 3. Modify a file to trigger precondition mismatch
+    fs::write(
+        store_dir.join("VetCoders/CodeScribe/2026_0717/context/claude/chunk1.md"),
+        "modified chunk contents to trigger mismatch",
+    )
+    .unwrap();
+
+    // 4. Try to apply, should fail due to changed precondition (source hash check failed)
+    let output_apply_fail = run_aicx(&home, &["doctor", "--migrate-identities", "--apply"]);
+    assert!(!output_apply_fail.status.success());
+    let stdout_apply_fail = String::from_utf8_lossy(&output_apply_fail.stdout);
+    assert!(
+        stdout_apply_fail.contains("identity migration skipped:")
+            || stdout_apply_fail.contains("Precondition failed:")
+    );
+
+    // Let's verify manifest is now in apply-failed mode
+    let manifest_content_failed = fs::read_to_string(&manifest_path).unwrap();
+    assert!(manifest_content_failed.contains("\"mode\": \"apply-failed\""));
+
+    let _ = fs::remove_dir_all(&root);
+}
