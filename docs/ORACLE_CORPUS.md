@@ -48,3 +48,25 @@ Loctree may consume AICX for scoped context only when `loctree_scope_safe = true
 and the returned chunk paths are readable. Fuzzy fallback is deliberately marked
 `loctree_scope_safe = false` even when it finds good-looking matches, because it
 does not prove semantic coverage or freshness.
+
+## Search Quality Budget
+
+`tests/retrieval_eval/search_quality_seed.toml` is the dialogue-usefulness seed
+matrix. It is separate from the 50-query backend retrieval harness and is meant
+to keep human-useful dialogue ahead of runtime exhaust.
+
+Every roadmap-critical query can declare:
+
+- an `expected_identity` anchor and `expected_frame_kind` lane that a useful
+  top-k hit must expose;
+- `budget_top_k` plus `min_useful_top_hits` as the usefulness floor;
+- `max_forbidden_noise_top_hits` and `[[questions.forbidden_noise]]` rules for
+  tool-output exhaust, system-prompt echoes, duplicated compact recall, and
+  opaque reasoning blocks;
+- `max_duplicate_hits_per_anchor` to make compact-recall inflation visible
+  instead of treating repeated copies as extra evidence.
+
+`aicx eval search-quality --strict` validates the seed contract without reading
+the live store. `aicx eval search-quality --run --strict` measures the active
+store/index and is intentionally store-dependent: a missing anchored corpus is a
+substrate failure, not permission to weaken or delete hard queries.

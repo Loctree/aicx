@@ -36,6 +36,17 @@ pub enum SearchQualityTermsMatch {
     All,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchQualityFrameLane {
+    OperatorRequest,
+    AgentDecision,
+    CodeToolExhaust,
+    SystemHook,
+    CompactDuplicate,
+    OpaqueReasoning,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SearchQualitySeed {
     pub schema: String,
@@ -57,7 +68,31 @@ pub struct SearchQualityCase {
     pub anchors_match: SearchQualityAnchorsMatch,
     #[serde(default = "default_expectation")]
     pub expectation: SearchQualityExpectation,
+    #[serde(default)]
+    pub frame_lane: Option<SearchQualityFrameLane>,
+    #[serde(default)]
+    pub expected_identity: Option<String>,
+    #[serde(default)]
+    pub expected_frame_kind: Option<String>,
+    #[serde(default = "default_budget_top_k")]
+    pub budget_top_k: usize,
+    #[serde(default = "default_usefulness_floor")]
+    pub min_useful_top_hits: usize,
+    #[serde(default)]
+    pub max_forbidden_noise_top_hits: usize,
+    #[serde(default)]
+    pub max_duplicate_hits_per_anchor: Option<usize>,
+    #[serde(default)]
+    pub forbidden_noise: Vec<SearchQualityForbiddenNoise>,
     pub anchors: Vec<SearchQualityAnchor>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SearchQualityForbiddenNoise {
+    pub class: String,
+    pub terms: Vec<String>,
+    #[serde(default = "default_terms_match")]
+    pub terms_match: SearchQualityTermsMatch,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -73,10 +108,13 @@ pub struct SearchQualityTopHit {
     pub rank: usize,
     pub evidence_score: Option<u64>,
     pub label: Option<String>,
+    pub frame_kind: Option<String>,
     pub round_id: Option<String>,
     pub path: Option<String>,
     pub matched_terms: Vec<String>,
     pub matched_anchors: Vec<String>,
+    pub useful: bool,
+    pub forbidden_noise_classes: Vec<String>,
     pub excerpt: String,
 }
 
@@ -85,14 +123,23 @@ pub struct SearchQualityCaseEvaluation {
     pub id: String,
     pub scope: String,
     pub case_type: SearchQualityCaseType,
+    pub frame_lane: Option<SearchQualityFrameLane>,
     pub query: String,
     pub projects: Vec<String>,
     pub expectation: SearchQualityExpectation,
+    pub expected_identity: Option<String>,
+    pub expected_frame_kind: Option<String>,
+    pub budget_top_k: usize,
+    pub min_useful_top_hits: usize,
+    pub max_forbidden_noise_top_hits: usize,
     pub passed: bool,
     pub reason: String,
     pub matched_terms: Vec<String>,
     pub matched_anchors: Vec<String>,
     pub supported_top_hits: usize,
+    pub useful_top_hits: usize,
+    pub forbidden_noise_top_hits: usize,
+    pub duplicate_anchor_hits: BTreeMap<String, usize>,
     pub top_hits: Vec<SearchQualityTopHit>,
 }
 
@@ -186,16 +233,20 @@ pub fn evaluate_evidence_payload(
     payload: &Value,
     top_n: usize,
 ) -> SearchQualityCaseEvaluation {
+    let evaluation_top_n = top_n.max(case.budget_top_k);
     let mut top_hits = Vec::new();
     let mut matched_terms = BTreeSet::new();
     let mut matched_anchors = BTreeSet::new();
+    let mut duplicate_anchor_hits: BTreeMap<String, usize> = BTreeMap::new();
+    let mut useful_top_hits = 0;
+    let mut forbidden_noise_top_hits = 0;
 
     for (index, item) in payload
         .get("items")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .take(top_n)
+        .take(evaluation_top_n)
         .enumerate()
     {
         let searchable = searchable_text(item);
@@ -203,6 +254,23 @@ pub fn evaluate_evidence_payload(
         let identity = identity_text(item);
         let hit_matches = matched_expected_terms(&case_expected_terms(case), &searchable);
         let hit_anchor_matches = matched_anchors_for_hit(case, &identity, &searchable);
+        let frame_kind = frame_kind_text(item);
+        let forbidden_noise_classes = forbidden_noise_classes_for_hit(case, &searchable);
+        let useful = is_useful_hit(
+            case,
+            item.get("label").and_then(Value::as_str),
+            &hit_anchor_matches,
+            frame_kind.as_deref(),
+        );
+        if useful {
+            useful_top_hits += 1;
+        }
+        if !forbidden_noise_classes.is_empty() {
+            forbidden_noise_top_hits += 1;
+        }
+        for anchor in &hit_anchor_matches {
+            *duplicate_anchor_hits.entry(anchor.clone()).or_default() += 1;
+        }
         matched_terms.extend(hit_matches.iter().cloned());
         matched_anchors.extend(hit_anchor_matches.iter().cloned());
         top_hits.push(SearchQualityTopHit {
@@ -212,6 +280,7 @@ pub fn evaluate_evidence_payload(
                 .get("label")
                 .and_then(Value::as_str)
                 .map(ToOwned::to_owned),
+            frame_kind,
             round_id: item
                 .get("metadata")
                 .and_then(|metadata| metadata.get("round_id"))
@@ -223,6 +292,8 @@ pub fn evaluate_evidence_payload(
                 .map(ToOwned::to_owned),
             matched_terms: hit_matches,
             matched_anchors: hit_anchor_matches,
+            useful,
+            forbidden_noise_classes,
             excerpt: compact_excerpt(&display_text, 240),
         });
     }
@@ -234,7 +305,7 @@ pub fn evaluate_evidence_payload(
         .filter(|hit| hit.label.as_deref() == Some("supported"))
         .count();
 
-    let (passed, reason) = match case.expectation {
+    let (base_passed, base_reason) = match case.expectation {
         SearchQualityExpectation::InCorpus => {
             evaluate_in_corpus_result(case, top_hits.len(), &matched_terms, &matched_anchors)
         }
@@ -258,19 +329,49 @@ pub fn evaluate_evidence_payload(
             }
         }
     };
+    let budget_failures = evaluate_quality_budgets(
+        case,
+        useful_top_hits,
+        forbidden_noise_top_hits,
+        &duplicate_anchor_hits,
+        &top_hits,
+    );
+    let passed = base_passed && budget_failures.is_empty();
+    let reason = if budget_failures.is_empty() {
+        format!(
+            "{base_reason}; usefulness={useful_top_hits}/{} forbidden_noise={forbidden_noise_top_hits}/{}",
+            case.min_useful_top_hits, case.max_forbidden_noise_top_hits
+        )
+    } else {
+        let mut reasons = Vec::new();
+        if !base_passed {
+            reasons.push(base_reason);
+        }
+        reasons.extend(budget_failures);
+        reasons.join("; ")
+    };
 
     SearchQualityCaseEvaluation {
         id: case.id.clone(),
         scope: case.scope.clone(),
         case_type: case.case_type,
+        frame_lane: case.frame_lane,
         query: case.query.clone(),
         projects,
         expectation: case.expectation,
+        expected_identity: case.expected_identity.clone(),
+        expected_frame_kind: case.expected_frame_kind.clone(),
+        budget_top_k: case.budget_top_k,
+        min_useful_top_hits: case.min_useful_top_hits,
+        max_forbidden_noise_top_hits: case.max_forbidden_noise_top_hits,
         passed,
         reason,
         matched_terms,
         matched_anchors,
         supported_top_hits,
+        useful_top_hits,
+        forbidden_noise_top_hits,
+        duplicate_anchor_hits,
         top_hits,
     }
 }
@@ -336,12 +437,20 @@ pub fn render_seed_cases_text(cases: &[&SearchQualityCase]) -> String {
     output.push_str("Search quality seed matrix:\n");
     for case in cases {
         output.push_str(&format!(
-            "- {} [{}] scope={} type={} query=\"{}\"\n  anchors: {}; terms: {}\n  good: {}\n",
+            "- {} [{}] scope={} type={} lane={} top{} usefulness>={} noise<={} query=\"{}\"\n  identity: {} frame_kind: {}\n  anchors: {}; terms: {}\n  good: {}\n",
             case.id,
             expectation_label(case.expectation),
             case.scope,
             case_type_label(case.case_type),
+            case.frame_lane
+                .map(frame_lane_label)
+                .unwrap_or("unspecified"),
+            case.budget_top_k,
+            case.min_useful_top_hits,
+            case.max_forbidden_noise_top_hits,
             case.query,
+            case.expected_identity.as_deref().unwrap_or("-"),
+            case.expected_frame_kind.as_deref().unwrap_or("-"),
             case.anchors
                 .iter()
                 .map(|anchor| anchor.map_id.as_str())
@@ -378,10 +487,17 @@ pub fn render_run_report_text(report: &SearchQualityRunReport) -> String {
         ));
         for hit in case.top_hits.iter().take(3) {
             output.push_str(&format!(
-                "  #{} score={:?} label={} round={} anchors={} terms={}\n",
+                "  #{} score={:?} label={} frame={} useful={} noise={} round={} anchors={} terms={}\n",
                 hit.rank,
                 hit.evidence_score,
                 hit.label.as_deref().unwrap_or("-"),
+                hit.frame_kind.as_deref().unwrap_or("-"),
+                hit.useful,
+                if hit.forbidden_noise_classes.is_empty() {
+                    "-".to_string()
+                } else {
+                    hit.forbidden_noise_classes.join(", ")
+                },
                 hit.round_id.as_deref().unwrap_or("-"),
                 if hit.matched_anchors.is_empty() {
                     "-".to_string()
@@ -417,6 +533,46 @@ fn validate_search_quality_seed(seed: &SearchQualitySeed) -> Result<()> {
         }
         if case.query.trim().is_empty() {
             bail!("search-quality case {} has an empty query", case.id);
+        }
+        if case.budget_top_k == 0 {
+            bail!("search-quality case {} has budget_top_k=0", case.id);
+        }
+        if case.frame_lane.is_some() {
+            if case
+                .expected_identity
+                .as_deref()
+                .is_none_or(|identity| identity.trim().is_empty())
+            {
+                bail!(
+                    "search-quality case {} declares frame_lane without expected_identity",
+                    case.id
+                );
+            }
+            if case
+                .expected_frame_kind
+                .as_deref()
+                .is_none_or(|frame_kind| frame_kind.trim().is_empty())
+            {
+                bail!(
+                    "search-quality case {} declares frame_lane without expected_frame_kind",
+                    case.id
+                );
+            }
+        }
+        for noise in &case.forbidden_noise {
+            if noise.class.trim().is_empty() {
+                bail!(
+                    "search-quality case {} has forbidden_noise with empty class",
+                    case.id
+                );
+            }
+            if noise.terms.is_empty() {
+                bail!(
+                    "search-quality case {} forbidden_noise {} has no terms",
+                    case.id,
+                    noise.class
+                );
+            }
         }
         if case.anchors.is_empty() && case.expectation == SearchQualityExpectation::InCorpus {
             bail!("search-quality case {} has no anchors", case.id);
@@ -569,6 +725,92 @@ fn evaluate_in_corpus_result(
     }
 }
 
+fn evaluate_quality_budgets(
+    case: &SearchQualityCase,
+    useful_top_hits: usize,
+    forbidden_noise_top_hits: usize,
+    duplicate_anchor_hits: &BTreeMap<String, usize>,
+    top_hits: &[SearchQualityTopHit],
+) -> Vec<String> {
+    let mut failures = Vec::new();
+    if useful_top_hits < case.min_useful_top_hits {
+        failures.push(format!(
+            "usefulness floor missed in top {}: useful={useful_top_hits} min={}",
+            case.budget_top_k, case.min_useful_top_hits
+        ));
+    }
+    if forbidden_noise_top_hits > case.max_forbidden_noise_top_hits {
+        failures.push(format!(
+            "forbidden noise budget exceeded in top {}: noise={forbidden_noise_top_hits} max={}",
+            case.budget_top_k, case.max_forbidden_noise_top_hits
+        ));
+    }
+    if let Some(max_hits) = case.max_duplicate_hits_per_anchor {
+        for (anchor, count) in duplicate_anchor_hits {
+            if *count > max_hits {
+                failures.push(format!(
+                    "duplicate anchor budget exceeded: duplicate anchor {anchor} appeared {count} times (max {max_hits})"
+                ));
+            }
+        }
+    }
+    if let Some(expected_frame_kind) = case.expected_frame_kind.as_deref()
+        && !top_hits
+            .iter()
+            .any(|hit| hit.useful && hit.frame_kind.as_deref() == Some(expected_frame_kind))
+    {
+        failures.push(format!(
+            "expected frame_kind {expected_frame_kind} did not produce a useful anchored top hit"
+        ));
+    }
+    if let Some(expected_identity) = case.expected_identity.as_deref()
+        && !top_hits.iter().any(|hit| {
+            hit.matched_anchors
+                .iter()
+                .any(|anchor| anchor == expected_identity)
+        })
+    {
+        failures.push(format!(
+            "expected identity {expected_identity} did not appear as an anchored top hit"
+        ));
+    }
+    failures
+}
+
+fn is_useful_hit(
+    case: &SearchQualityCase,
+    label: Option<&str>,
+    matched_anchors: &[String],
+    frame_kind: Option<&str>,
+) -> bool {
+    if label != Some("supported") {
+        return false;
+    }
+    let identity_ok = case.expected_identity.as_ref().map_or_else(
+        || !matched_anchors.is_empty(),
+        |expected| matched_anchors.iter().any(|anchor| anchor == expected),
+    );
+    let frame_ok = case
+        .expected_frame_kind
+        .as_deref()
+        .is_none_or(|expected| frame_kind == Some(expected));
+    identity_ok && frame_ok
+}
+
+fn forbidden_noise_classes_for_hit(case: &SearchQualityCase, searchable: &str) -> Vec<String> {
+    case.forbidden_noise
+        .iter()
+        .filter_map(|noise| {
+            let matched = matched_expected_terms(&noise.terms, searchable);
+            let ok = match noise.terms_match {
+                SearchQualityTermsMatch::Any => !matched.is_empty(),
+                SearchQualityTermsMatch::All => matched.len() == noise.terms.len(),
+            };
+            ok.then(|| noise.class.clone())
+        })
+        .collect()
+}
+
 fn matched_anchors_for_hit(
     case: &SearchQualityCase,
     identity: &str,
@@ -641,12 +883,25 @@ fn identity_text(item: &Value) -> String {
     let mut parts = Vec::new();
     push_string(&mut parts, item.get("path"));
     push_string(&mut parts, item.get("id"));
+    push_string(&mut parts, item.get("frame_kind"));
     if let Some(metadata) = item.get("metadata") {
         push_string(&mut parts, metadata.get("id"));
         push_string(&mut parts, metadata.get("round_id"));
         push_string(&mut parts, metadata.get("source"));
+        push_string(&mut parts, metadata.get("frame_kind"));
     }
     parts.join("\n")
+}
+
+fn frame_kind_text(item: &Value) -> Option<String> {
+    item.get("frame_kind")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            item.get("metadata")
+                .and_then(|metadata| metadata.get("frame_kind"))
+                .and_then(Value::as_str)
+        })
+        .map(ToOwned::to_owned)
 }
 
 fn push_string(parts: &mut Vec<String>, value: Option<&Value>) {
@@ -694,14 +949,23 @@ fn failure_evaluation(
         id: case.id.clone(),
         scope: case.scope.clone(),
         case_type: case.case_type,
+        frame_lane: case.frame_lane,
         query: case.query.clone(),
         projects,
         expectation: case.expectation,
+        expected_identity: case.expected_identity.clone(),
+        expected_frame_kind: case.expected_frame_kind.clone(),
+        budget_top_k: case.budget_top_k,
+        min_useful_top_hits: case.min_useful_top_hits,
+        max_forbidden_noise_top_hits: case.max_forbidden_noise_top_hits,
         passed: false,
         reason,
         matched_terms: Vec::new(),
         matched_anchors: Vec::new(),
         supported_top_hits: 0,
+        useful_top_hits: 0,
+        forbidden_noise_top_hits: 0,
+        duplicate_anchor_hits: BTreeMap::new(),
         top_hits: Vec::new(),
     }
 }
@@ -718,6 +982,14 @@ fn default_terms_match() -> SearchQualityTermsMatch {
     SearchQualityTermsMatch::Any
 }
 
+fn default_budget_top_k() -> usize {
+    5
+}
+
+fn default_usefulness_floor() -> usize {
+    0
+}
+
 fn expectation_label(expectation: SearchQualityExpectation) -> &'static str {
     match expectation {
         SearchQualityExpectation::InCorpus => "in-corpus",
@@ -732,6 +1004,17 @@ fn case_type_label(case_type: SearchQualityCaseType) -> &'static str {
     }
 }
 
+fn frame_lane_label(frame_lane: SearchQualityFrameLane) -> &'static str {
+    match frame_lane {
+        SearchQualityFrameLane::OperatorRequest => "operator_request",
+        SearchQualityFrameLane::AgentDecision => "agent_decision",
+        SearchQualityFrameLane::CodeToolExhaust => "code_tool_exhaust",
+        SearchQualityFrameLane::SystemHook => "system_hook",
+        SearchQualityFrameLane::CompactDuplicate => "compact_duplicate",
+        SearchQualityFrameLane::OpaqueReasoning => "opaque_reasoning",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -743,7 +1026,7 @@ mod tests {
         let seed = load_search_quality_seed(None).expect("default seed loads");
 
         assert_eq!(seed.schema, "aicx.search_quality_seed.v1");
-        assert_eq!(seed.cases.len(), 34);
+        assert_eq!(seed.cases.len(), 40);
         assert!(seed.cases.iter().any(|case| case.id == "aicx-all-bucket"));
     }
 
@@ -823,6 +1106,96 @@ mod tests {
     }
 
     #[test]
+    fn forbidden_tool_noise_fails_usefulness_budget() {
+        let mut case = fixture_case();
+        case.frame_lane = Some(SearchQualityFrameLane::AgentDecision);
+        case.expected_identity = Some("codex__demo__2026-06-19__abc12345".to_string());
+        case.expected_frame_kind = Some("agent_reply".to_string());
+        case.budget_top_k = 5;
+        case.min_useful_top_hits = 1;
+        case.max_forbidden_noise_top_hits = 0;
+        case.max_duplicate_hits_per_anchor = Some(1);
+        case.forbidden_noise = vec![SearchQualityForbiddenNoise {
+            class: "tool_output_exhaust".to_string(),
+            terms: vec!["tool_call_id".to_string(), "stderr".to_string()],
+            terms_match: SearchQualityTermsMatch::Any,
+        }];
+        let payload = json!({
+            "items": [
+                {
+                    "evidence_score": 99,
+                    "label": "supported",
+                    "metadata": {
+                        "round_id": "codex__demo__2026-06-19__abc12345:round:0001",
+                        "frame_kind": "tool_call"
+                    },
+                    "sections": {
+                        "evidence": "tool_call_id=abc stderr=panic cargo output Silver sztudio"
+                    }
+                },
+                {
+                    "evidence_score": 88,
+                    "label": "supported",
+                    "metadata": {
+                        "round_id": "codex__demo__2026-06-19__abc12345:round:0002",
+                        "frame_kind": "agent_reply"
+                    },
+                    "sections": {
+                        "agent_answered": "Silver ma byc operatorski, a Sztudio trzyma embedding workload."
+                    }
+                }
+            ]
+        });
+
+        let evaluation = evaluate_evidence_payload(&case, Vec::new(), &payload, 5);
+
+        assert!(!evaluation.passed, "{evaluation:#?}");
+        assert!(evaluation.reason.contains("forbidden noise"));
+    }
+
+    #[test]
+    fn duplicate_compact_recall_fails_inflation_budget() {
+        let mut case = fixture_case();
+        case.frame_lane = Some(SearchQualityFrameLane::CompactDuplicate);
+        case.expected_identity = Some("codex__demo__2026-06-19__abc12345".to_string());
+        case.expected_frame_kind = Some("agent_reply".to_string());
+        case.budget_top_k = 5;
+        case.min_useful_top_hits = 1;
+        case.max_duplicate_hits_per_anchor = Some(1);
+        let payload = json!({
+            "items": [
+                {
+                    "evidence_score": 95,
+                    "label": "supported",
+                    "metadata": {
+                        "round_id": "codex__demo__2026-06-19__abc12345:round:0001",
+                        "frame_kind": "agent_reply"
+                    },
+                    "sections": {
+                        "agent_answered": "Silver ma byc operatorski, a Sztudio trzyma embedding workload. compact recall"
+                    }
+                },
+                {
+                    "evidence_score": 94,
+                    "label": "supported",
+                    "metadata": {
+                        "round_id": "codex__demo__2026-06-19__abc12345:round:0001-copy",
+                        "frame_kind": "agent_reply"
+                    },
+                    "sections": {
+                        "agent_answered": "Silver ma byc operatorski, a Sztudio trzyma embedding workload. compact recall duplicate"
+                    }
+                }
+            ]
+        });
+
+        let evaluation = evaluate_evidence_payload(&case, Vec::new(), &payload, 5);
+
+        assert!(!evaluation.passed, "{evaluation:#?}");
+        assert!(evaluation.reason.contains("duplicate anchor"));
+    }
+
+    #[test]
     fn selecting_unknown_case_returns_error() {
         let seed = load_search_quality_seed(None).expect("default seed loads");
         let error = select_search_quality_cases(&seed, &["missing-case".to_string()])
@@ -887,6 +1260,14 @@ mod tests {
             bad_result: "wrong session".to_string(),
             anchors_match: SearchQualityAnchorsMatch::AnyOf,
             expectation: SearchQualityExpectation::InCorpus,
+            frame_lane: None,
+            expected_identity: None,
+            expected_frame_kind: None,
+            budget_top_k: default_budget_top_k(),
+            min_useful_top_hits: default_usefulness_floor(),
+            max_forbidden_noise_top_hits: 0,
+            max_duplicate_hits_per_anchor: None,
+            forbidden_noise: Vec::new(),
             anchors: vec![SearchQualityAnchor {
                 map_id: "codex__demo__2026-06-19__abc12345".to_string(),
                 expected_terms: vec!["sztudio".to_string(), "silver".to_string()],
