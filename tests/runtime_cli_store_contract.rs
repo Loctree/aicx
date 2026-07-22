@@ -1417,7 +1417,9 @@ fn session_batch_drops_duplicate_physical_source_and_counts_it() {
     assert_success(&output);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("session ingest summary: ingested=1 skipped=0 duplicate_sources=1"),
+        stderr.contains(
+            "session ingest summary: ingested=1 skipped=0 filtered_out=0 duplicate_sources=1"
+        ),
         "duplicate physical source must be dropped and counted, not skipped\nstderr:\n{stderr}"
     );
     assert!(
@@ -1439,6 +1441,83 @@ fn session_batch_drops_duplicate_physical_source_and_counts_it() {
         card_ids.len(),
         1,
         "exactly one card set may project for one logical session"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+// Focused coverage for the W0-02 conflict resolution of 6049e664: the
+// duplicate-source guard composes with the `-p` discovery filter. Order is
+// project filter first (filtered copies never reach the guard), then the
+// duplicate check; a dropped duplicate still counts as selected, never as
+// filtered_out or skipped.
+#[test]
+fn session_batch_project_filter_composes_with_duplicate_guard() {
+    let root = unique_test_dir("claude-batch-filter-plus-duplicate");
+    let home = root.join("home");
+    let projects = home.join(".claude").join("projects");
+    let fresh = projects
+        .join("-repo-alpha")
+        .join("77777777-7777-4777-8777-777777777777.jsonl");
+    let stale = projects
+        .join("-repo-alpha")
+        .join("88888888-8888-4888-8888-888888888888.jsonl");
+    let beta = projects
+        .join("-repo-beta")
+        .join("99999999-9999-4999-8999-999999999999.jsonl");
+    write_claude_session_fixture_with_cwd(
+        &fresh,
+        Some("twin-session"),
+        "/repo/alpha",
+        "fresh prompt inside the filtered project",
+    );
+    write_claude_session_fixture_with_cwd(
+        &stale,
+        Some("twin-session"),
+        "/repo/alpha",
+        "stale prompt inside the filtered project",
+    );
+    filetime::set_file_mtime(
+        &stale,
+        filetime::FileTime::from_system_time(
+            SystemTime::now() - std::time::Duration::from_secs(3600),
+        ),
+    )
+    .expect("age the stale duplicate");
+    write_claude_session_fixture_with_cwd(
+        &beta,
+        Some("beta-session"),
+        "/repo/beta",
+        "beta prompt outside the filtered project",
+    );
+
+    let output = run_aicx(
+        &home,
+        &["claude", "-H", "24", "-p", "alpha", "--emit", "json"],
+    );
+    assert_success(&output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(
+            "session ingest summary: ingested=1 skipped=0 filtered_out=1 duplicate_sources=1"
+        ),
+        "filter and duplicate guard must count independently\nstderr:\n{stderr}"
+    );
+
+    let projection_dir = home
+        .join(".aicx")
+        .join("store")
+        .join("canonical-projection-v1");
+    let manifest: Value = serde_json::from_str(
+        &fs::read_to_string(projection_dir.join("manifest.json"))
+            .expect("canonical projection manifest"),
+    )
+    .expect("valid canonical projection manifest");
+    let card_ids = manifest["card_ids"].as_array().expect("manifest card ids");
+    assert_eq!(
+        card_ids.len(),
+        1,
+        "exactly one card set may project: duplicate dropped, beta filtered; got {card_ids:?}"
     );
 
     let _ = fs::remove_dir_all(&root);
