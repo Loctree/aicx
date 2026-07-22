@@ -9,7 +9,8 @@
 //!   1. canonical store has at least one chunk (extract was previously run)
 //!   2. embedder loads via the configured backend (cloud or native GGUF)
 //!   3. `vector_index::write_index` materializes NDJSON + committed hybrid
-//!      artifacts under `~/.aicx/indexed/<bucket>/`
+//!      artifacts under `~/.aicx/indexed/<bucket>/` (one dense payload per
+//!      generation under `hybrid/generations/<id>/` + `CURRENT`)
 //!   4. `search_engine::try_semantic_search` returns at least one hybrid RRF
 //!      hit for a well-formed query, dimension-matched against the manifest
 //!   5. normalized score is in `[0, 100]` for the top hit (sanity)
@@ -19,7 +20,13 @@
 //! operator running this test sees the same diagnostic + recommendation
 //! as a real user would.
 //!
-//! Vibecrafted with AI Agents by Vetcoders (c)2026 Vetcoders
+//! Product-wide multi-agent fixture walks (extract → store → search/intents →
+//! health → MCP) for release verification use an isolated `AICX_HOME` and
+//! never mutate live `~/.aicx`. Those walks are operator evidence, not this
+//! opt-in semantic gate. Search status must remain truthful when the index
+//! or embedder is missing (`semantic_fallback` / degraded `RetrievalOutcome`).
+//!
+//! 𝚅𝚒𝚋𝚎𝚌𝚛𝚊𝚏𝚝𝚎𝚍. with AI Agents by VetCoders (c)2024-2026 LibraxisAI
 
 #![cfg(feature = "e2e-aicx")]
 

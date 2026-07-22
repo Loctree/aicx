@@ -7,6 +7,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **Product verification walk (W5-01).** Architecture and store-layout docs
+  aligned to code truth (hybrid generations, typed retrieval status, config
+  inspect, doctor/health split). `docs/EMBEDDINGS.md` records OUTCOME 1 and
+  labels the shell harness wall times as reference-model latency, never engine
+  latency. Isolated multi-agent fixture walk (extract → store → search/intents
+  → health → MCP) is evidence-only; no live `~/.aicx` mutation.
 - **Mmap exact-scan hot loop profiled and repaired — OUTCOME 1 (W4-01c).**
   Profiling the release-mode `MmapDenseAdapter` at the same isolated
   500000×1024 scale showed the Rust scan was never the latency culprit: warm
@@ -31,11 +37,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   to build an isolated AICX_HOME-shaped corpus, compare legacy duplicate dense
   NDJSON against the mmap payload, verify failed-copy `CURRENT` safety, reverse
   query-order parity, top-k parity, disk ratio, and latency/RSS budget accounting
-  without mutating live `~/.aicx`. The 2026-07-22 >=2 GiB isolated run falsified
-  the mmap exact-scan replacement on latency (warm global p95 317.87 s, project
-  p95 55.00 s) while preserving disk ratio 0.0971 and exact parity 1.0, so the
-  recorded verdict is OUTCOME 2 and the Lance/memex-search contingency remains
-  the next evidence path.
+  without mutating live `~/.aicx`. The first 2026-07-22 ≥2 GiB isolated run
+  recorded 317.87 s global / 55.00 s project as **reference-model (pure-Python)
+  latency** inside the harness's `run_mmap()` — not the Rust engine. W4-01c
+  reclassified that measurement and proved the release-mode `MmapDenseAdapter`
+  meets the frozen budgets (see OUTCOME 1 above). The harness remains the CI
+  contract for layout/parity/failed-copy; treat its wall times as reference
+  model only until a follow-up drives the real binary.
 - **Batched semantic-index embedding.** `aicx index` now embeds chunks in
   batches through the existing `embed_batch` API instead of one HTTP
   round-trip per chunk. For the cloud backend this collapses the dominant

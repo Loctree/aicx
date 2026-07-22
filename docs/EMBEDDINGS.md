@@ -282,23 +282,34 @@ The hard budgets remain unchanged from the W4 brief:
 - exact top-k parity is 100% for equal ranking inputs
 - corrupt or interrupted generation copies must leave `CURRENT` untouched
 
-Measured verdict on 2026-07-22: **OUTCOME 2 — budgets missed**. The isolated
-500000 x 1024 run produced a 2,133,416,794 byte dense mmap payload (>=2 GiB),
-kept disk duplication low (0.0971x of the legacy pair), preserved exact top-k
-and reverse-order parity at 1.0, and left `CURRENT` untouched after corrupt and
-interrupted copies. The same run missed the warm scan budgets by a wide margin:
-global p95 317.87 s versus 8 s, project p95 55.00 s versus 2 s, with
-`/usr/bin/time -l` max RSS 55,438,983,168 bytes for the full legacy+mmap
-harness process. This is evidence for the pre-specced LanceDB / memex-search
-transplant path in `backlog/memex-search-transplant.md`; do not relax the W4
-thresholds to make the mmap exact scan look green.
+Measured verdict on 2026-07-22 (W4-01c): **OUTCOME 1 — budgets met by the
+release-mode engine**. The isolated 500000×1024 corpus still produces a
+2,133,416,794 byte dense mmap payload (≥2 GiB), keeps disk duplication low
+(0.0971× of the legacy pair), preserves exact top-k and reverse-order parity at
+1.0, and leaves `CURRENT` untouched after corrupt and interrupted copies.
+
+The 317.87 s global / 55.00 s project numbers from the first W4-01 scale run are
+**reference-model latency**, not engine latency. `run_mmap()` inside
+`tools/bench_dense_migration.sh` is pure Python: it struct-unpacks and
+dot-products every row in the interpreter and never executes the Rust
+`MmapDenseAdapter` (debug or release). After the hot-loop repair (`16310b3`) the
+unmodified harness re-ran at ~321.96 s / 55.37 s — still the Python path —
+while the release-mode adapter at the same scale measured:
+
+| Path | Warm latency | Frozen budget |
+|---|---:|---:|
+| global (empty filters) | 0.371–0.468 s | 8 s |
+| project-scoped | 0.212–0.221 s | 2 s |
+
+Scores stay bit-identical to the brute-force leg. The LanceDB / memex-search
+contingency in `backlog/memex-search-transplant.md` stays shelved. Do not re-read
+the shell harness's wall times as engine miss; do not relax the frozen budgets
+in `tests/retrieval_eval/baseline.json`.
 
 `--verify-only` is intentionally not production proof. It is the synchronous CI
 gate that proves the benchmark contract, byte layout, failed-copy safety checks,
 reverse-order query parity, and budget accounting still work before an operator
-runs the larger isolated corpus. The scale run above used one query to keep the
-foreground run bounded, so its p95 is the measured single-query latency; that is
-already far beyond the budget.
+runs the larger isolated corpus.
 
 ## Relationship To Roost/Rust-Memex
 

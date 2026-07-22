@@ -103,12 +103,41 @@ It is updated on every store write.
 
 AICX exposes canonical chunks through filesystem search, steering metadata,
 dashboard search, MCP tools, and the reusable `aicx-embeddings` library. Heavy
-semantic retrieval/indexing is owned by Roost/rust-memex outside this CLI
-surface.
+premium retrieval/indexing remains owned by Roost/rust-memex outside this CLI
+surface; the portable hybrid path lives under `indexed/` (below).
 
 `~/.aicx/.aicxignore` is honored before queueing chunks for the steer index and
 should also be honored by downstream retrieval materializers that consume the
 canonical store.
+
+### Semantic / hybrid index: `$AICX_HOME/indexed/`
+
+Derived, rebuildable views — never ground truth. Layout per bucket:
+
+```
+$AICX_HOME/indexed/<bucket>/
+  embeddings.ndjson                 # committed semantic index (build source)
+  hybrid/
+    CURRENT                         # pointer naming the published generation
+    generations/<generation>/
+      tantivy_lex/                  # lexical index
+      dense.exact_mmap_v1.bin       # THE dense payload (one per generation)
+      manifest.json                 # generation authority, written last
+```
+
+Contract (W2-03 / W3-02 / W4-01c):
+
+- **One dense payload per generation.** New builds never write a twin
+  `hybrid/dense_brute_force.ndjson`; legacy copies are migration read input only.
+- **Manifest last, pointer flip publishes.** Incomplete generation directories are
+  unreferenced and may be quarantined; they never alter current resolution.
+- **Search routes through manifest-kind → `MmapDenseAdapter`** by default; the
+  `--legacy-dense` escape hatch remains for operators who need the old path.
+- **Truthful status:** when the index is missing or the embedder is unavailable,
+  search degrades to filesystem-fuzzy with an explicit `semantic_fallback` /
+  `RetrievalOutcome` payload — never a false-healthy hybrid claim.
+
+See `docs/EMBEDDINGS.md` for embedder profiles and the dense migration gate.
 
 ### Sibling: Context Corpus (`~/.aicx/context-corpus/`)
 
