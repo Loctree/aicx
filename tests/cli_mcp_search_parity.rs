@@ -163,6 +163,7 @@ fn cli_and_mcp_render_identical_search_items() {
         date_lo: None,
         date_hi: None,
         hours_cutoff: None,
+        legacy_dense: false,
     };
     let (results, scanned) = aicx::search_engine::fuzzy_search_with_post_filters(
         &store_root,
@@ -262,6 +263,7 @@ fn retrieval_outcome_scenarios_serialize_distinctly_across_surfaces() {
         dense_count: 123,
         lexical_doc_count: 122,
         fusion_algorithm: "rrf".to_string(),
+        dense_kind: aicx_retrieve::MMAP_DENSE_KIND.to_string(),
     };
 
     let scenarios: Vec<(
@@ -272,6 +274,11 @@ fn retrieval_outcome_scenarios_serialize_distinctly_across_surfaces() {
         (
             "dense_only",
             semantic_retrieval_outcome("semantic_dense_only", None, 1000, 5, false),
+            None,
+        ),
+        (
+            "legacy_dense",
+            semantic_retrieval_outcome("semantic_legacy_dense", None, 1000, 5, false),
             None,
         ),
         (

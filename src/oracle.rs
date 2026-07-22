@@ -252,7 +252,10 @@ impl OracleStatus {
             backend: OracleBackend::HybridRrf,
             index_kind: OracleIndexKind::OnionContent,
             fallback_reason: None,
-            derived_view: "hybrid_rrf_manifest_bound_lexical_dense_index".to_string(),
+            derived_view: format!(
+                "hybrid_rrf_manifest_bound_lexical_dense_index:{}",
+                status.dense_kind
+            ),
             store_root: display_path(store_root),
             indexed_count: status.source_chunk_count,
             scanned_count: status.source_chunk_count,

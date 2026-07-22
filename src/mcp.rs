@@ -892,6 +892,7 @@ fn build_mcp_semantic_filters(
             date_lo,
             date_hi,
             hours_cutoff,
+            legacy_dense: false,
         },
     }
 }

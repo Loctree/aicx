@@ -14,6 +14,12 @@
 //!
 //! Vibecrafted with AI Agents by Vetcoders (c)2026 Vetcoders
 
+std::thread_local! {
+    /// CLI-only recovery selection. The process executes one command, while
+    /// library/MCP callers pass `SemanticSearchFilters::legacy_dense` directly.
+    pub static LEGACY_DENSE_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 use std::collections::HashSet;
 use std::path::Path;
 
@@ -60,6 +66,15 @@ const BACKEND_HYBRID_RRF: &str = "hybrid_rrf";
 const BACKEND_HYBRID_RRF_GLOBAL_SCOPED: &str = "hybrid_rrf_global_scoped";
 const BACKEND_SEMANTIC_DENSE_ONLY: &str = "semantic_dense_only";
 const BACKEND_SEMANTIC_DENSE_ONLY_GLOBAL_SCOPED: &str = "semantic_dense_only_global_scoped";
+const BACKEND_SEMANTIC_LEGACY_DENSE: &str = "semantic_legacy_dense";
+const BACKEND_SEMANTIC_LEGACY_DENSE_GLOBAL_SCOPED: &str = "semantic_legacy_dense_global_scoped";
+const GLOBAL_SHARD_BUDGET: usize = 16;
+
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+fn bounded_global_shards(available: &[String]) -> (&[String], bool) {
+    let selected = &available[..available.len().min(GLOBAL_SHARD_BUDGET)];
+    (selected, available.len() > selected.len())
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HybridRetrievalStatus {
@@ -68,6 +83,7 @@ pub struct HybridRetrievalStatus {
     pub dense_count: usize,
     pub lexical_doc_count: usize,
     pub fusion_algorithm: String,
+    pub dense_kind: String,
 }
 
 /// Fail-fast typed error for semantic-search preconditions. Each variant
@@ -294,8 +310,23 @@ fn try_semantic_search_with_boundary(
 
     #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
     {
-        let scopes = if project_filters.is_empty() {
-            vec![None]
+        let available_projects = if project_filters.is_empty()
+            || (project_filters.len() == 1 && project_filters[0].is_none())
+        {
+            find_available_project_shards()?
+        } else {
+            Vec::new()
+        };
+        let global_query = project_filters.is_empty()
+            || (project_filters.len() == 1 && project_filters[0].is_none());
+        let (selected_projects, shard_budget_saturated) =
+            bounded_global_shards(&available_projects);
+        let scopes = if global_query {
+            if !available_projects.is_empty() {
+                selected_projects.iter().map(|p| Some(p.as_str())).collect()
+            } else {
+                vec![None]
+            }
         } else {
             project_filters.to_vec()
         };
@@ -308,8 +339,12 @@ fn try_semantic_search_with_boundary(
         // outcome reports the degraded backend instead of silently claiming
         // hybrid — the degraded status must reach the CLI/MCP boundary.
         let mut any_dense_only = false;
-        let mut any_global_project_scope = false;
-        let mut boundary = CandidateBoundary::default();
+        let mut any_legacy_dense = false;
+        let mut any_global_project_scope = global_query;
+        let mut boundary = CandidateBoundary {
+            examined: 0,
+            saturated: shard_budget_saturated,
+        };
         for scope in scopes {
             let (mut outcome, scope_boundary) = try_semantic_search_native(
                 query,
@@ -324,8 +359,17 @@ fn try_semantic_search_with_boundary(
             if outcome
                 .backend_label
                 .starts_with(BACKEND_SEMANTIC_DENSE_ONLY)
+                || outcome
+                    .backend_label
+                    .starts_with(BACKEND_SEMANTIC_LEGACY_DENSE)
             {
                 any_dense_only = true;
+            }
+            if outcome
+                .backend_label
+                .starts_with(BACKEND_SEMANTIC_LEGACY_DENSE)
+            {
+                any_legacy_dense = true;
             }
             if outcome.backend_label.ends_with("_global_scoped") {
                 any_global_project_scope = true;
@@ -343,7 +387,11 @@ fn try_semantic_search_with_boundary(
             SemanticOutcome {
                 results: merged_results,
                 scanned,
-                backend_label: if any_dense_only && any_global_project_scope {
+                backend_label: if any_legacy_dense && any_global_project_scope {
+                    BACKEND_SEMANTIC_LEGACY_DENSE_GLOBAL_SCOPED
+                } else if any_legacy_dense {
+                    BACKEND_SEMANTIC_LEGACY_DENSE
+                } else if any_dense_only && any_global_project_scope {
                     BACKEND_SEMANTIC_DENSE_ONLY_GLOBAL_SCOPED
                 } else if any_dense_only {
                     BACKEND_SEMANTIC_DENSE_ONLY
@@ -439,19 +487,47 @@ fn select_semantic_bucket_scope<'a>(
         });
     }
 
-    if let Some(project) = project_filter {
-        if all_index_path.exists() {
-            return Ok(SemanticBucketScope {
-                index_project: None,
-                retrieval_project_filter: Some(project),
-                index_path: all_index_path,
-                used_global_project_scope: true,
-            });
-        }
+    if project_filter.is_some() {
+        // Project-filter queries do not map unrelated project vector payloads;
+        // fail-closed if the project-specific shard does not exist.
         return Err(index_not_built_error(project_index_path, project_filter));
     }
 
+    if all_index_path.exists() {
+        return Ok(SemanticBucketScope {
+            index_project: None,
+            retrieval_project_filter: None,
+            index_path: all_index_path,
+            used_global_project_scope: true,
+        });
+    }
+
     Err(index_not_built_error(project_index_path, project_filter))
+}
+
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+fn find_available_project_shards() -> std::result::Result<Vec<String>, SemanticError> {
+    let base = crate::store::store_base_dir().map_err(|err| SemanticError::IndexNotBuilt {
+        path: std::path::PathBuf::new(),
+        reason: format!("could not resolve store base dir: {err}"),
+        recommendation: "ensure $AICX_HOME (or $HOME) is writable".to_string(),
+    })?;
+    let projects = crate::store::project_identities_in_store_or_index_at(&base).map_err(|err| {
+        SemanticError::IndexNotBuilt {
+            path: base.clone(),
+            reason: format!("could not enumerate project shards: {err}"),
+            recommendation: "run `aicx doctor` to validate the store and index catalog".to_string(),
+        }
+    })?;
+
+    Ok(projects
+        .into_iter()
+        .filter(|project| {
+            crate::vector_index::hybrid_root_dir(Some(project))
+                .map(|root| root.join("CURRENT").exists())
+                .unwrap_or(false)
+        })
+        .collect())
 }
 
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
@@ -621,6 +697,8 @@ fn try_semantic_search_native(
         }
     };
 
+    let legacy_dense = candidate_filters.map(|f| f.legacy_dense).unwrap_or(false);
+
     let retrieval_filters = SemanticRetrievalFilters {
         kind: kind_filter,
         frame_kind: frame_kind_filter,
@@ -630,32 +708,37 @@ fn try_semantic_search_native(
         candidate_filters,
     };
 
-    // Patch 3 / Bug B+: the hybrid (tantivy lexical + dense fusion) stack can
-    // be unavailable for manifest-side reasons — never committed
-    // (`RetrievalManifestMissing`) or mid-rebuild / mismatched
-    // (`RetrievalManifestStale`; e.g. `TantivyAdapter::build` wipes its dir
-    // before committing). The dense embeddings in the committed index stay a
-    // valid semantic artifact throughout, so degrade to dense-only ranking
-    // instead of hard-failing the whole query. Lexical is part of the
-    // ranking, not a precondition for semantic search.
+    // Recovery is an explicit operator choice. It bypasses the versioned
+    // hybrid generation entirely and truthfully reports the old primary
+    // NDJSON reader as a degraded dense-only execution path.
+    if legacy_dense {
+        let backend_label = if scope.used_global_project_scope {
+            BACKEND_SEMANTIC_LEGACY_DENSE_GLOBAL_SCOPED
+        } else {
+            BACKEND_SEMANTIC_LEGACY_DENSE
+        };
+        return query_dense_only_from_primary_filtered(
+            &path,
+            &query_embedding,
+            embedder_dim,
+            limit,
+            retrieval_filters,
+            &info.model_id,
+            backend_label,
+        )
+        .map(|outcome| (outcome, CandidateBoundary::default()));
+    }
+
+    // A missing manifest means no hybrid generation was ever published, so
+    // the committed primary index may serve an explicit dense-only fallback.
+    // Once a manifest exists it is authoritative: stale/corrupt generation
+    // state fails closed and never activates the old reader implicitly.
     let hybrid = if manifest_path.exists() {
-        match load_hybrid_index(scope.index_project, &path, &info, &manifest_path) {
-            Ok(hybrid) => hybrid,
-            Err(SemanticError::RetrievalManifestMissing { .. })
-            | Err(SemanticError::RetrievalManifestStale { .. }) => {
-                return query_dense_only_from_primary_filtered(
-                    &path,
-                    &query_embedding,
-                    embedder_dim,
-                    limit,
-                    retrieval_filters,
-                    &info.model_id,
-                    scope.used_global_project_scope,
-                )
-                .map(|outcome| (outcome, CandidateBoundary::default()));
-            }
-            Err(other) => return Err(other),
-        }
+        // A published manifest is authoritative. Any parse, binding, lexical,
+        // or mmap failure is corruption/staleness and must escape as a typed
+        // error; reading the old primary NDJSON here would hide a broken
+        // generation behind stale data.
+        load_hybrid_index(scope.index_project, &path, &info, &manifest_path)?
     } else {
         // Manifest was never committed — serve dense-only directly from the
         // primary committed index (already validated above: exists, correct
@@ -667,7 +750,11 @@ fn try_semantic_search_native(
             limit,
             retrieval_filters,
             &info.model_id,
-            scope.used_global_project_scope,
+            if scope.used_global_project_scope {
+                BACKEND_SEMANTIC_DENSE_ONLY_GLOBAL_SCOPED
+            } else {
+                BACKEND_SEMANTIC_DENSE_ONLY
+            },
         )
         .map(|outcome| (outcome, CandidateBoundary::default()));
     };
@@ -754,6 +841,16 @@ fn load_hybrid_index(
     info: &crate::embedder::EmbeddingModelInfo,
     manifest_path: &std::path::Path,
 ) -> std::result::Result<aicx_retrieve::HybridIndex, SemanticError> {
+    // The published manifest is the sole adapter resolver. Parse it before
+    // opening either payload so malformed metadata cannot make readers touch
+    // stale sibling artifacts.
+    let manifest = aicx_retrieve::Manifest::read_from_path(manifest_path).map_err(|err| {
+        SemanticError::RetrievalManifestStale {
+            path: manifest_path.to_path_buf(),
+            reason: format!("could not read retrieval manifest: {err}"),
+            recommendation: "run `aicx index` to rebuild the hybrid retrieval bucket".to_string(),
+        }
+    })?;
     let manifest_dir = crate::vector_index::hybrid_index_dir(project_filter).map_err(|err| {
         SemanticError::RetrievalManifestStale {
             path: manifest_path.to_path_buf(),
@@ -761,24 +858,6 @@ fn load_hybrid_index(
             recommendation: "run `aicx index` to rebuild the hybrid retrieval bucket".to_string(),
         }
     })?;
-    let dense_path = crate::vector_index::hybrid_dense_path(project_filter).map_err(|err| {
-        SemanticError::RetrievalManifestStale {
-            path: manifest_path.to_path_buf(),
-            reason: format!("could not resolve hybrid dense path: {err}"),
-            recommendation: "run `aicx index` to rebuild the hybrid retrieval bucket".to_string(),
-        }
-    })?;
-    if !dense_path.exists() {
-        return Err(SemanticError::RetrievalManifestStale {
-            path: manifest_path.to_path_buf(),
-            reason: format!(
-                "hybrid dense artifact is missing at {}",
-                dense_path.display()
-            ),
-            recommendation: "run `aicx index` to rebuild the committed hybrid artifacts"
-                .to_string(),
-        });
-    }
     let source_hash = crate::vector_index::observed_source_hash_for_index_path(source_index_path)
         .map_err(|err| SemanticError::RetrievalManifestStale {
         path: manifest_path.to_path_buf(),
@@ -795,19 +874,85 @@ fn load_hybrid_index(
             }
         })?,
     );
-    let dense = Box::new(
-        aicx_retrieve::load_from_ndjson(
-            &dense_path,
-            info.dimension,
-            aicx_retrieve::Distance::Cosine,
-        )
-        .map_err(|err| SemanticError::RetrievalManifestStale {
-            path: manifest_path.to_path_buf(),
-            reason: format!("could not open hybrid dense artifact: {err:#}"),
-            recommendation: "run `aicx index` to rebuild the committed hybrid artifacts"
-                .to_string(),
-        })?,
-    );
+
+    let dense: Box<dyn aicx_retrieve::DenseIndex> = match manifest.dense_kind.as_str() {
+        aicx_retrieve::MMAP_DENSE_KIND => {
+            let mmap_path =
+                crate::vector_index::hybrid_dense_mmap_path(project_filter).map_err(|err| {
+                    SemanticError::RetrievalManifestStale {
+                        path: manifest_path.to_path_buf(),
+                        reason: format!("could not resolve hybrid dense mmap path: {err}"),
+                        recommendation: "run `aicx index` to rebuild the hybrid retrieval bucket"
+                            .to_string(),
+                    }
+                })?;
+            if !mmap_path.exists() {
+                return Err(SemanticError::RetrievalManifestStale {
+                    path: manifest_path.to_path_buf(),
+                    reason: format!(
+                        "hybrid dense mmap artifact is missing at {}",
+                        mmap_path.display()
+                    ),
+                    recommendation: "run `aicx index` to rebuild the committed hybrid artifacts"
+                        .to_string(),
+                });
+            }
+            let expected_distance = match manifest.embedder_distance.as_str() {
+                "cosine" => aicx_retrieve::Distance::Cosine,
+                "euclidean" => aicx_retrieve::Distance::Euclidean,
+                "dot" => aicx_retrieve::Distance::Dot,
+                other => {
+                    return Err(SemanticError::RetrievalManifestStale {
+                        path: manifest_path.to_path_buf(),
+                        reason: format!("unknown embedder distance in manifest: {other}"),
+                        recommendation: "run `aicx index` to rebuild the hybrid retrieval bucket"
+                            .to_string(),
+                    });
+                }
+            };
+            let expected_hash = aicx_retrieve::decode_source_hash_blake3(
+                &manifest.source_hash_blake3,
+            )
+            .map_err(|err| SemanticError::RetrievalManifestStale {
+                path: manifest_path.to_path_buf(),
+                reason: format!("could not decode source hash: {err}"),
+                recommendation: "run `aicx index` to rebuild the hybrid retrieval bucket"
+                    .to_string(),
+            })?;
+            Box::new(
+                aicx_retrieve::MmapDenseAdapter::open(
+                    &mmap_path,
+                    info.dimension,
+                    expected_distance,
+                    Some(expected_hash),
+                )
+                .map_err(|err| SemanticError::RetrievalManifestStale {
+                    path: manifest_path.to_path_buf(),
+                    reason: format!("could not open hybrid dense mmap artifact: {err:#}"),
+                    recommendation: "run `aicx index` to rebuild the committed hybrid artifacts"
+                        .to_string(),
+                })?,
+            )
+        }
+        aicx_retrieve::BRUTE_FORCE_KIND => {
+            return Err(SemanticError::RetrievalManifestStale {
+                path: manifest_path.to_path_buf(),
+                reason: "published hybrid manifest names the retired NDJSON dense adapter"
+                    .to_string(),
+                recommendation: "run `aicx index` to publish an mmap generation, or explicitly use `aicx search --legacy-dense` for recovery"
+                    .to_string(),
+            });
+        }
+        other => {
+            return Err(SemanticError::RetrievalManifestStale {
+                path: manifest_path.to_path_buf(),
+                reason: format!("unsupported dense index kind: {other}"),
+                recommendation: "run `aicx index` to rebuild the committed hybrid artifacts"
+                    .to_string(),
+            });
+        }
+    };
+
     let fusion = Box::new(aicx_retrieve::ReciprocalRankFusion::default());
     let fingerprint = crate::vector_index::hybrid_embedder_fingerprint(info);
     aicx_retrieve::HybridIndex::load_from_manifest(
@@ -831,17 +976,13 @@ fn load_hybrid_index(
 /// (`index_path` = `vector_index::index_path`, i.e. `indexed/<bucket>/embeddings.ndjson`)
 /// directly, bypassing the hybrid manifest + tantivy lexical layer entirely.
 ///
-/// Engaged when the hybrid stack is unavailable for any manifest-side reason
-/// (`RetrievalManifestMissing` / `RetrievalManifestStale`) — e.g. the lexical
-/// index is mid-rebuild (`TantivyAdapter::build` wipes its dir) or the manifest
-/// was never committed. The dense embeddings in the committed index remain a
-/// valid semantic artifact throughout, so we degrade to dense-only cosine
-/// ranking instead of hard-failing the whole query.
+/// Engaged only when no hybrid manifest has been published, or when the
+/// operator explicitly selects `--legacy-dense`. A present but invalid
+/// generation fails closed instead of reading stale primary vectors.
 ///
 /// This is NOT the doctrinal "silent fuzzy fallback" (see module docs): it is
 /// explicit semantic search over real embeddings, surfaced via
-/// `backend_label = "semantic_dense_only"`. Hard-fail only when there is no
-/// valid dense artifact to serve.
+/// `backend_label = "semantic_dense_only"` or `"semantic_legacy_dense"`.
 #[cfg(all(any(feature = "native-embedder", feature = "cloud-embedder"), test))]
 fn query_dense_only_from_primary(
     index_path: &std::path::Path,
@@ -859,7 +1000,11 @@ fn query_dense_only_from_primary(
         limit,
         filters,
         model_id,
-        used_global_project_scope,
+        if used_global_project_scope {
+            BACKEND_SEMANTIC_DENSE_ONLY_GLOBAL_SCOPED
+        } else {
+            BACKEND_SEMANTIC_DENSE_ONLY
+        },
     )
 }
 
@@ -871,9 +1016,11 @@ fn query_dense_only_from_primary_filtered(
     limit: usize,
     filters: SemanticRetrievalFilters<'_>,
     model_id: &str,
-    used_global_project_scope: bool,
+    backend_label: &'static str,
 ) -> std::result::Result<SemanticOutcome, SemanticError> {
     use aicx_retrieve::{BruteForceAdapter, ChunkRef, DenseChunkRef, DenseIndex, Distance};
+
+    let used_global_project_scope = backend_label.ends_with("_global_scoped");
 
     let (header, mut entries) = crate::vector_index::read_committed_index_entries_matching_project(
         index_path,
@@ -931,11 +1078,7 @@ fn query_dense_only_from_primary_filtered(
         return Ok(SemanticOutcome {
             results: Vec::new(),
             scanned: 0,
-            backend_label: if used_global_project_scope {
-                BACKEND_SEMANTIC_DENSE_ONLY_GLOBAL_SCOPED
-            } else {
-                BACKEND_SEMANTIC_DENSE_ONLY
-            },
+            backend_label,
             model_id: model_id.to_string(),
             retrieval_status: None,
         });
@@ -1012,11 +1155,7 @@ fn query_dense_only_from_primary_filtered(
     Ok(SemanticOutcome {
         results,
         scanned,
-        backend_label: if used_global_project_scope {
-            BACKEND_SEMANTIC_DENSE_ONLY_GLOBAL_SCOPED
-        } else {
-            BACKEND_SEMANTIC_DENSE_ONLY
-        },
+        backend_label,
         model_id: model_id.to_string(),
         retrieval_status: None,
     })
@@ -1106,6 +1245,7 @@ impl From<&aicx_retrieve::Manifest> for HybridRetrievalStatus {
             dense_count: manifest.dense_count,
             lexical_doc_count: manifest.lexical_doc_count,
             fusion_algorithm: manifest.fusion_algorithm.clone(),
+            dense_kind: manifest.dense_kind.clone(),
         }
     }
 }
@@ -1121,8 +1261,17 @@ pub fn semantic_retrieval_outcome(
     matched_count: usize,
     stale_evidence: bool,
 ) -> RetrievalOutcome {
+    let legacy_dense = backend_label.starts_with(BACKEND_SEMANTIC_LEGACY_DENSE);
     let dense_only = backend_label.starts_with(BACKEND_SEMANTIC_DENSE_ONLY);
-    let (executed_path, fallback_reason) = if dense_only {
+    let (executed_path, fallback_reason) = if legacy_dense {
+        (
+            Some(ExecutedPath::DenseOnly),
+            Some(
+                "operator_selected_legacy_dense: served brute-force cosine from the committed primary NDJSON index"
+                    .to_string(),
+            ),
+        )
+    } else if dense_only {
         (
             Some(ExecutedPath::DenseOnly),
             Some(
@@ -1260,6 +1409,14 @@ fn merge_hybrid_statuses(statuses: &[HybridRetrievalStatus]) -> Option<HybridRet
                 .first()
                 .map(|status| status.fusion_algorithm.clone())
                 .unwrap_or_else(|| "rrf".to_string()),
+            dense_kind: if many
+                .iter()
+                .all(|status| status.dense_kind == many[0].dense_kind)
+            {
+                many[0].dense_kind.clone()
+            } else {
+                "mixed".to_string()
+            },
         }),
     }
 }
@@ -1341,6 +1498,8 @@ pub struct SemanticSearchFilters {
     /// applied only when neither `date_lo` nor `date_hi` is set so the
     /// explicit date filter wins (matching legacy precedence).
     pub hours_cutoff: Option<String>,
+    /// Use legacy NDJSON reader for dense vector search instead of versioned mmap.
+    pub legacy_dense: bool,
 }
 
 impl SemanticSearchFilters {
@@ -1910,10 +2069,11 @@ pub fn render_semantic_status_line(
     let manifest = retrieval_status
         .map(|status| {
             format!(
-                " manifest_generation={} source_chunks={} dense_count={} lexical_doc_count={} fusion={}",
+                " manifest_generation={} source_chunks={} dense_count={} dense_kind={} lexical_doc_count={} fusion={}",
                 status.generation_id,
                 status.source_chunk_count,
                 status.dense_count,
+                status.dense_kind,
                 status.lexical_doc_count,
                 status.fusion_algorithm
             )
@@ -2403,6 +2563,7 @@ mod tests {
             dense_count: 259_007,
             lexical_doc_count: 258_990,
             fusion_algorithm: "rrf".to_string(),
+            dense_kind: aicx_retrieve::MMAP_DENSE_KIND.to_string(),
         };
         let retrieval = semantic_retrieval_outcome(
             BACKEND_HYBRID_RRF_GLOBAL_SCOPED,
@@ -2455,6 +2616,7 @@ mod tests {
             dense_count: 10,
             lexical_doc_count: 10,
             fusion_algorithm: "rrf".to_string(),
+            dense_kind: aicx_retrieve::MMAP_DENSE_KIND.to_string(),
         };
         let hybrid = semantic_retrieval_outcome(BACKEND_HYBRID_RRF, Some(&status), 10, 3, false);
         assert_eq!(hybrid.completeness, RetrievalCompleteness::Complete);
@@ -2462,13 +2624,10 @@ mod tests {
         assert_eq!(hybrid.fallback_reason, None);
     }
 
-    /// F1 regression: project-scoped semantic search may run on a host where
-    /// only the cross-project `_all` bucket is materialized. In that case `_all`
-    /// is the canonical global index, and the requested project stays a strict
-    /// retrieval filter.
+    /// Direct project-filter queries must fail closed (never fall back to _all).
     #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
     #[test]
-    fn project_bucket_missing_uses_global_index_with_project_filter() {
+    fn project_bucket_missing_fails_closed_without_global_fallback() {
         let dir =
             std::env::temp_dir().join(format!("aicx-semantic-global-scope-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -2478,21 +2637,87 @@ mod tests {
         std::fs::create_dir_all(all_index_path.parent().unwrap()).expect("create all bucket");
         std::fs::write(&all_index_path, "{}\n").expect("touch all index");
 
-        let scope = select_semantic_bucket_scope(
+        let err = select_semantic_bucket_scope(
             Some("vetcoders/vista"),
             project_index_path.clone(),
             all_index_path.clone(),
         )
-        .expect("missing project bucket should use existing _all bucket");
+        .unwrap_err();
 
-        assert_eq!(scope.index_path, all_index_path);
-        assert_eq!(scope.index_project, None);
-        assert_eq!(scope.retrieval_project_filter, Some("vetcoders/vista"));
-        assert!(
-            scope.used_global_project_scope,
-            "scope should explicitly mark the global project filter path"
-        );
+        assert!(matches!(err, SemanticError::IndexNotBuilt { .. }));
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Project selection chooses the exact shard even when a global index is
+    /// also present. The foreign/global payload is never selected for mapping.
+    #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+    #[test]
+    fn project_bucket_selects_exact_shard_before_global_payload() {
+        let dir =
+            std::env::temp_dir().join(format!("aicx-project-shard-select-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let project_index_path = dir.join("target").join("embeddings.ndjson");
+        let all_index_path = dir.join("_all").join("embeddings.ndjson");
+        std::fs::create_dir_all(project_index_path.parent().unwrap()).expect("project dir");
+        std::fs::create_dir_all(all_index_path.parent().unwrap()).expect("global dir");
+        std::fs::write(&project_index_path, "target\n").expect("project index");
+        std::fs::write(&all_index_path, "foreign\n").expect("global index");
+
+        let scope = select_semantic_bucket_scope(
+            Some("vetcoders/target"),
+            project_index_path.clone(),
+            all_index_path,
+        )
+        .expect("exact project shard");
+
+        assert_eq!(scope.index_path, project_index_path);
+        assert_eq!(scope.index_project, Some("vetcoders/target"));
+        assert_eq!(scope.retrieval_project_filter, Some("vetcoders/target"));
+        assert!(!scope.used_global_project_scope);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+    #[test]
+    fn global_shard_budget_is_explicit_and_reports_saturation() {
+        let projects: Vec<String> = (0..GLOBAL_SHARD_BUDGET + 1)
+            .map(|index| format!("org/project-{index:02}"))
+            .collect();
+        let (selected, saturated) = bounded_global_shards(&projects);
+
+        assert_eq!(selected.len(), GLOBAL_SHARD_BUDGET);
+        assert!(saturated, "an omitted shard must make retrieval partial");
+        assert_eq!(selected[0], "org/project-00");
+        assert_eq!(selected[GLOBAL_SHARD_BUDGET - 1], "org/project-15");
+    }
+
+    /// A published but corrupt manifest is a typed stale-generation error.
+    /// The caller propagates this error and may only use the primary NDJSON
+    /// path when the manifest is absent or the operator chose --legacy-dense.
+    #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+    #[test]
+    fn corrupt_published_manifest_fails_before_any_adapter_is_opened() {
+        let dir = std::env::temp_dir().join(format!(
+            "aicx-corrupt-retrieval-manifest-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("tempdir");
+        let manifest_path = dir.join("manifest.json");
+        std::fs::write(&manifest_path, b"{not-json").expect("corrupt manifest");
+        let info = crate::embedder::EmbeddingModelInfo {
+            model_id: "test-model".to_string(),
+            dimension: 3,
+            backend: "test".to_string(),
+            profile: aicx_embeddings::EmbeddingProfile::Base,
+            source: aicx_embeddings::NativeEmbeddingSource::ExplicitPath(dir.join("model.gguf")),
+        };
+
+        let err = load_hybrid_index(None, &dir.join("missing.ndjson"), &info, &manifest_path)
+            .expect_err("corrupt published manifest must fail closed");
+        assert!(matches!(err, SemanticError::RetrievalManifestStale { .. }));
+        assert!(err.reason().contains("could not read retrieval manifest"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3445,6 +3670,7 @@ mod tests {
             date_hi: Some("2026-05-24".to_string()),
             // hours_cutoff is set but ignored because date_lo/hi wins.
             hours_cutoff: Some("2026-05-01".to_string()),
+            legacy_dense: false,
         };
         let filtered = apply_semantic_post_filters(pool, &filters);
         let ids: Vec<&str> = filtered.iter().map(|r| r.label.as_str()).collect();
@@ -3459,6 +3685,7 @@ mod tests {
             dense_count: 123,
             lexical_doc_count: 122,
             fusion_algorithm: "rrf".to_string(),
+            dense_kind: aicx_retrieve::MMAP_DENSE_KIND.to_string(),
         };
         let retrieval = semantic_retrieval_outcome("hybrid_rrf", Some(&status), 123, 3, false);
         let line =
@@ -3467,6 +3694,7 @@ mod tests {
         assert!(line.contains("manifest_generation=g-test"));
         assert!(line.contains("source_chunks=123"));
         assert!(line.contains("dense_count=123"));
+        assert!(line.contains("dense_kind=exact_mmap_v1"));
         assert!(line.contains("lexical_doc_count=122"));
     }
 }

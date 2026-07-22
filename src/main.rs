@@ -1627,6 +1627,10 @@ enum Commands {
         /// Emit compact JSON instead of plain text
         #[arg(short = 'j', long)]
         json: bool,
+
+        /// Use legacy NDJSON reader for dense vector search instead of versioned mmap.
+        #[arg(long)]
+        legacy_dense: bool,
     },
 
     /// Run local evaluation helpers for retrieval/search quality.
@@ -2725,7 +2729,9 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
             no_semantic,
             evidence,
             json,
+            legacy_dense,
         }) => {
+            aicx::search_engine::LEGACY_DENSE_ACTIVE.with(|active| active.set(legacy_dense));
             run_search(SearchRunArgs {
                 query: &query,
                 projects: &project,
@@ -7745,12 +7751,14 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
     } else {
         None
     };
+    let legacy_dense = aicx::search_engine::LEGACY_DENSE_ACTIVE.with(|active| active.get());
     let post_filters = aicx::search_engine::SemanticSearchFilters {
         agent: filters.agent.clone(),
         score_min: filters.score,
         date_lo: date_lo.clone(),
         date_hi: date_hi.clone(),
         hours_cutoff: hours_cutoff.clone(),
+        legacy_dense,
     };
 
     let project_resolution = resolve_project_filters_or_error(projects, project_match, true)?;
