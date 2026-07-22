@@ -208,6 +208,50 @@ Lookup paths:
 - `~/.aicx/embeddings`
 - `~/.aicx/embeddings/hub`
 
+## Hybrid Generations — One Dense Payload
+
+Since W2-03, hybrid retrieval artifacts are generation-scoped and the dense
+vectors are materialized exactly once per generation.
+
+Layout under each bucket:
+
+```text
+<AICX_HOME>/indexed/<bucket>/embeddings.ndjson        # canonical committed semantic index (build source)
+<AICX_HOME>/indexed/<bucket>/hybrid/
+├── CURRENT                                           # pointer file naming the published generation
+└── generations/<generation>/
+    ├── tantivy_lex/                                  # lexical index
+    ├── dense.exact_mmap_v1.bin                       # THE dense payload (aicx.dense.exact_mmap.v1)
+    └── manifest.json                                 # generation authority, written last
+```
+
+Contract:
+
+- **One dense payload per generation.** Vectors are written once, into the
+  versioned mmap artifact. The old `hybrid/dense_brute_force.ndjson` twin
+  (a near-copy of `embeddings.ndjson`, 15 GB + 15 GB on the live `_all`
+  bucket) is never written by new builds; existing copies remain on disk as
+  migration read input only.
+- **Manifest last, pointer flip publishes.** A build writes lexical and dense
+  payloads first, `manifest.json` after them, and only then atomically
+  renames the `CURRENT` pointer. A build killed at any earlier boundary
+  leaves an unreferenced generation directory; readers keep resolving the
+  previous complete generation. Incomplete directories are quarantinable and
+  never alter current-generation resolution.
+- **Manifest binds the payload.** `manifest.json` carries the generation id,
+  the blake3 source hash of the committed semantic index, embedder model /
+  url hash / dimension / distance, dense kind + row count, and the lexical
+  commit id + doc count. Validation rejects drift on source, model,
+  dimension, distance, lexical generation, and partial-build divergence
+  (kind or count mismatch between manifest and artifacts).
+- **Legacy stores migrate on the next full build.** A bucket without a
+  `CURRENT` pointer resolves to the legacy root layout for reads; the next
+  `aicx index` full rebuild materializes a single-payload generation and
+  publishes it. No index files are deleted by the migration.
+
+Old generation directories accumulate until the doctor/quarantine surface
+reclaims them; this cut intentionally does not delete anything.
+
 ## Relationship To Roost/Rust-Memex
 
 Do not conflate config planes:

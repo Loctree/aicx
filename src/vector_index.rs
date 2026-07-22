@@ -538,27 +538,136 @@ pub fn index_bucket_name(project: Option<&str>) -> String {
         .collect()
 }
 
-#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
-pub fn hybrid_index_dir(project: Option<&str>) -> Result<PathBuf> {
+/// Subdirectory of the hybrid root holding one directory per build generation.
+const HYBRID_GENERATIONS_DIR_NAME: &str = "generations";
+/// Pointer file at the hybrid root naming the published generation directory.
+/// Written last (tmp + atomic rename), so an interrupted build never becomes
+/// current — see [`resolve_hybrid_generation_dir`].
+const HYBRID_CURRENT_POINTER_FILE_NAME: &str = "CURRENT";
+
+/// Root of the hybrid retrieval area for a project bucket
+/// (`indexed/<bucket>/hybrid`). Generations live below it; legacy pre-W2-03
+/// stores keep their artifacts directly at this root.
+pub fn hybrid_root_dir(project: Option<&str>) -> Result<PathBuf> {
     let path = index_path(project)?;
     path.parent()
         .map(|parent| parent.join("hybrid"))
         .ok_or_else(|| anyhow::anyhow!("index path has no parent: {}", path.display()))
 }
 
-#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+/// Directory holding the published hybrid generation's artifacts
+/// (`manifest.json`, mmap dense payload, Tantivy lexical index).
+///
+/// Resolves the `CURRENT` pointer to `generations/<name>`; when the pointer is
+/// absent or invalid this falls back to the hybrid root itself, which is the
+/// legacy dual-file layout kept readable as migration input only.
+pub fn hybrid_index_dir(project: Option<&str>) -> Result<PathBuf> {
+    Ok(resolve_hybrid_generation_dir(&hybrid_root_dir(project)?))
+}
+
+/// Pure current-generation resolution over a hybrid root directory.
+///
+/// Fail-closed contract: only a pointer naming an existing, path-safe
+/// directory under `generations/` redirects readers. Every corrupt state —
+/// missing pointer, empty or traversal-shaped name, missing target — resolves
+/// to the legacy root, so a failed or interrupted build can never alter
+/// current-generation resolution.
+pub fn resolve_hybrid_generation_dir(hybrid_root: &Path) -> PathBuf {
+    let pointer = hybrid_root.join(HYBRID_CURRENT_POINTER_FILE_NAME);
+    let Ok(raw) = std::fs::read_to_string(&pointer) else {
+        return hybrid_root.to_path_buf();
+    };
+    let name = raw.trim();
+    if !is_valid_generation_dir_name(name) {
+        return hybrid_root.to_path_buf();
+    }
+    let candidate = hybrid_root.join(HYBRID_GENERATIONS_DIR_NAME).join(name);
+    if candidate.is_dir() {
+        candidate
+    } else {
+        hybrid_root.to_path_buf()
+    }
+}
+
+fn is_valid_generation_dir_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && !name.starts_with('.')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+/// Filesystem-safe directory name for a generation id (`:` is invalid on
+/// Windows; anything outside the safe set collapses to `-`).
+fn generation_dir_name(generation_id: &str) -> String {
+    let mut slug: String = generation_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    slug.truncate(96);
+    slug
+}
+
+/// Atomically flip the `CURRENT` pointer to `generation_dir`. This is the
+/// publish step: everything inside the generation directory — payloads first,
+/// manifest last — is already durable before the pointer rename lands.
+fn publish_hybrid_generation(hybrid_root: &Path, generation_dir: &Path) -> Result<()> {
+    use std::io::Write;
+
+    let name = generation_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "generation dir has no valid name: {}",
+                generation_dir.display()
+            )
+        })?;
+    let pointer = hybrid_root.join(HYBRID_CURRENT_POINTER_FILE_NAME);
+    let tmp = hybrid_root.join(format!("{HYBRID_CURRENT_POINTER_FILE_NAME}.tmp"));
+    let mut file = crate::sanitize::create_file_validated(&tmp)
+        .with_context(|| format!("create generation pointer tmp: {}", tmp.display()))?;
+    writeln!(file, "{name}")
+        .with_context(|| format!("write generation pointer tmp: {}", tmp.display()))?;
+    file.sync_all()
+        .with_context(|| format!("sync generation pointer tmp: {}", tmp.display()))?;
+    drop(file);
+    std::fs::rename(&tmp, &pointer).with_context(|| {
+        format!(
+            "publish generation pointer: {} -> {}",
+            tmp.display(),
+            pointer.display()
+        )
+    })?;
+    Ok(())
+}
+
 pub fn hybrid_manifest_path(project: Option<&str>) -> Result<PathBuf> {
     Ok(hybrid_index_dir(project)?.join("manifest.json"))
 }
 
-#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+/// Legacy NDJSON dense twin location inside the resolved generation dir.
+/// Migration read input only — new builds never write it; the single dense
+/// payload is [`hybrid_dense_mmap_path`].
 pub fn hybrid_dense_path(project: Option<&str>) -> Result<PathBuf> {
     Ok(aicx_retrieve::default_ndjson_path(&hybrid_index_dir(
         project,
     )?))
 }
 
-#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+/// The one dense vector payload of the resolved generation (versioned mmap
+/// artifact, `aicx.dense.exact_mmap.v1`).
+pub fn hybrid_dense_mmap_path(project: Option<&str>) -> Result<PathBuf> {
+    Ok(hybrid_index_dir(project)?.join(aicx_retrieve::MMAP_DENSE_PAYLOAD_FILE_NAME))
+}
+
 pub fn observed_source_hash_for_index_path(path: &Path) -> Result<String> {
     let mut file = crate::sanitize::open_file_validated(path)
         .with_context(|| format!("open {}", path.display()))?;
@@ -1359,6 +1468,7 @@ pub fn write_index_with_options(
                 &hybrid_delta_chunks,
                 total_indexed,
                 &committed_source_hash,
+                &target_path,
             ) {
                 Ok(manifest) => {
                     eprintln!(
@@ -1411,22 +1521,59 @@ fn materialize_hybrid_index(
     project: Option<&str>,
     info: &crate::embedder::EmbeddingModelInfo,
 ) -> Result<aicx_retrieve::Manifest> {
+    let fingerprint = hybrid_embedder_fingerprint(info);
+    let hybrid_root = hybrid_root_dir(project)?;
+    materialize_hybrid_generation(index_path, &hybrid_root, &fingerprint)
+}
+
+/// Map the fingerprint's distance label onto the typed adapter distance.
+/// Unknown labels fail closed rather than defaulting — implicit distance
+/// drift is exactly what the manifest contract forbids.
+fn distance_from_label(distance: &str) -> Result<aicx_retrieve::Distance> {
+    match distance {
+        "cosine" => Ok(aicx_retrieve::Distance::Cosine),
+        "dot" => Ok(aicx_retrieve::Distance::Dot),
+        "euclidean" => Ok(aicx_retrieve::Distance::Euclidean),
+        other => anyhow::bail!("unsupported dense distance label: {other}"),
+    }
+}
+
+/// Build one complete hybrid generation from the committed semantic index and
+/// publish it atomically.
+///
+/// W2-03 contract — one dense payload per generation:
+/// - vectors are materialized exactly once, into the versioned mmap artifact
+///   ([`aicx_retrieve::MMAP_DENSE_PAYLOAD_FILE_NAME`]); the legacy
+///   `dense_brute_force.ndjson` twin is never written,
+/// - all artifacts land in a fresh `generations/<id>` directory: lexical and
+///   dense payloads first, `manifest.json` last,
+/// - the `CURRENT` pointer flip is the only publish step, so a build killed at
+///   any earlier fsync/rename boundary leaves an unreferenced, quarantinable
+///   directory and readers stay on the previous complete generation.
+///
+/// Embedder-free by design (the caller supplies the fingerprint), so the
+/// generation contract is testable without a live model.
+pub fn materialize_hybrid_generation(
+    committed_index_path: &Path,
+    hybrid_root: &Path,
+    fingerprint: &aicx_retrieve::EmbedderFingerprint,
+) -> Result<aicx_retrieve::Manifest> {
     use aicx_retrieve::{
-        BruteForceAdapter, ChunkRef, DenseChunkRef, Distance, HybridIndex, ReciprocalRankFusion,
+        ChunkRef, DenseChunkRef, HybridIndex, Manifest, MmapDenseAdapter, ReciprocalRankFusion,
         TantivyAdapter,
     };
 
-    let (header, entries) = read_committed_index_entries(index_path)?;
-    if header.dimension != info.dimension {
+    let (header, entries) = read_committed_index_entries(committed_index_path)?;
+    if header.dimension != fingerprint.dim {
         anyhow::bail!(
             "hybrid build dim mismatch: committed index has {}, embedder has {}",
             header.dimension,
-            info.dimension
+            fingerprint.dim
         );
     }
+    let distance = distance_from_label(&fingerprint.distance)?;
 
-    let manifest_dir = hybrid_index_dir(project)?;
-    let source_hash = observed_source_hash_for_index_path(index_path)?;
+    let source_hash = observed_source_hash_for_index_path(committed_index_path)?;
     let mut lexical_chunks = Vec::with_capacity(entries.len());
     let mut dense_chunks = Vec::with_capacity(entries.len());
     let mut skipped_missing_source_count = 0usize;
@@ -1479,18 +1626,35 @@ fn materialize_hybrid_index(
         );
     }
 
-    let lexical = Box::new(TantivyAdapter::new(manifest_dir.clone())?);
-    let dense = Box::new(BruteForceAdapter::new(header.dimension).with_distance(Distance::Cosine));
+    // Fresh, unreferenced generation directory. Everything below writes into
+    // it; nothing is visible to readers until the pointer flip at the end.
+    let generation_dir = hybrid_root
+        .join(HYBRID_GENERATIONS_DIR_NAME)
+        .join(generation_dir_name(&Manifest::fresh_generation_id()));
+    std::fs::create_dir_all(&generation_dir)
+        .with_context(|| format!("create generation dir: {}", generation_dir.display()))?;
+
+    let lexical = Box::new(TantivyAdapter::new(generation_dir.clone())?);
+    let dense = Box::new(MmapDenseAdapter::create(
+        generation_dir.join(aicx_retrieve::MMAP_DENSE_PAYLOAD_FILE_NAME),
+        header.dimension,
+        distance,
+        aicx_retrieve::source_hash_bytes(&source_hash),
+    ));
     let fusion = Box::new(ReciprocalRankFusion::default());
-    let fingerprint = hybrid_embedder_fingerprint(info);
-    let mut hybrid = HybridIndex::new(lexical, dense, fusion, manifest_dir, fingerprint);
+    let mut hybrid = HybridIndex::new(
+        lexical,
+        dense,
+        fusion,
+        generation_dir.clone(),
+        fingerprint.clone(),
+    );
+    // build_hybrid materializes the lexical index and the single dense
+    // payload; commit writes `manifest.json` last within the generation dir.
     hybrid.build_hybrid(&lexical_chunks, &dense_chunks, &source_hash)?;
     let manifest = hybrid.commit()?.clone();
 
-    let mut dense_persist =
-        BruteForceAdapter::new(header.dimension).with_distance(Distance::Cosine);
-    aicx_retrieve::DenseIndex::build(&mut dense_persist, &dense_chunks)?;
-    dense_persist.persist_ndjson(&hybrid_dense_path(project)?)?;
+    publish_hybrid_generation(hybrid_root, &generation_dir)?;
 
     Ok(manifest)
 }
@@ -1502,34 +1666,82 @@ fn incremental_materialize_hybrid(
     delta_chunks: &[aicx_retrieve::DenseChunkRef],
     source_chunk_count: usize,
     source_hash: &str,
+    committed_index_path: &Path,
 ) -> Result<aicx_retrieve::Manifest> {
     use aicx_retrieve::{
-        DenseIndex, Distance, FusionStrategy, LexicalIndex, Manifest, ReciprocalRankFusion,
-        TantivyAdapter, validate_live_bindings_for_refresh,
+        ChunkRef, DenseChunkRef, DenseIndex, FusionStrategy, LexicalIndex, Manifest,
+        MmapDenseAdapter, ReciprocalRankFusion, TantivyAdapter, validate_live_bindings_for_refresh,
     };
 
     if delta_chunks.is_empty() {
         anyhow::bail!("incremental hybrid materialize requires at least one delta chunk");
     }
 
-    let manifest_dir = hybrid_index_dir(project)?;
-    let manifest_path = hybrid_manifest_path(project)?;
-    let dense_path = hybrid_dense_path(project)?;
+    let generation_dir = hybrid_index_dir(project)?;
+    let manifest_path = generation_dir.join("manifest.json");
+    let dense_path = generation_dir.join(aicx_retrieve::MMAP_DENSE_PAYLOAD_FILE_NAME);
     let manifest = Manifest::read_from_path(&manifest_path)?;
-    let mut lexical = TantivyAdapter::new(manifest_dir)?;
-    let mut dense = aicx_retrieve::load_from_ndjson(&dense_path, info.dimension, Distance::Cosine)?;
+    if manifest.dense_kind != aicx_retrieve::MMAP_DENSE_KIND {
+        // Legacy dual-file generations are migration read input only; the
+        // caller's fallback path performs a full rebuild that materializes
+        // the single-payload mmap generation.
+        anyhow::bail!(
+            "current generation carries legacy dense kind `{}`; full rebuild materializes the single dense payload",
+            manifest.dense_kind
+        );
+    }
+    let mut lexical = TantivyAdapter::new(generation_dir)?;
+    let distance = distance_from_label(&manifest.embedder_distance)?;
+    let expected_hash = aicx_retrieve::decode_source_hash_blake3(&manifest.source_hash_blake3)?;
+    let dense = MmapDenseAdapter::open(&dense_path, info.dimension, distance, Some(expected_hash))?;
     let fusion = ReciprocalRankFusion::default();
     let fingerprint = hybrid_embedder_fingerprint(info);
 
     validate_live_bindings_for_refresh(&manifest, &lexical, &dense, &fusion, &fingerprint)
         .map_err(|err| anyhow::anyhow!("incremental hybrid validate existing artifacts: {err}"))?;
+    // The refreshed payload embeds the NEW committed source hash, so the old
+    // mapping is rebuilt below instead of appended to; drop it before the
+    // atomic replacement (Windows cannot rename over a mapped file).
+    drop(dense);
 
     let build_started_at = Manifest::now_utc();
     for delta in delta_chunks {
         lexical.insert(&delta.chunk)?;
-        dense.insert(delta)?;
     }
-    dense.persist_ndjson(&dense_path)?;
+
+    // Rebuild the single dense payload once from the freshly committed
+    // semantic index. Vector text is not stored in the payload, so rows carry
+    // only id/source_path/metadata plus the embedding.
+    let (header, entries) = read_committed_index_entries(committed_index_path)?;
+    if header.dimension != info.dimension {
+        anyhow::bail!(
+            "incremental hybrid dim mismatch: committed index has {}, embedder has {}",
+            header.dimension,
+            info.dimension
+        );
+    }
+    let dense_chunks: Vec<DenseChunkRef> = entries
+        .into_iter()
+        .map(|entry| {
+            let metadata = index_entry_metadata_json(&entry);
+            DenseChunkRef {
+                chunk: ChunkRef {
+                    id: entry.id.clone(),
+                    source_path: entry.path.to_string_lossy().to_string(),
+                    text: String::new(),
+                    metadata,
+                },
+                embedding: entry.embedding,
+            }
+        })
+        .collect();
+    let mut dense = MmapDenseAdapter::create(
+        &dense_path,
+        info.dimension,
+        distance,
+        aicx_retrieve::source_hash_bytes(source_hash),
+    );
+    DenseIndex::build(&mut dense, &dense_chunks)?;
     let build_completed_at = Manifest::now_utc();
     let refreshed = Manifest {
         schema_version: manifest.schema_version,
@@ -1624,19 +1836,19 @@ pub(crate) fn should_skip_hybrid_rebuild(
 
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
 fn has_existing_hybrid_artifacts(project: Option<&str>) -> bool {
-    let Ok(manifest_path) = hybrid_manifest_path(project) else {
-        return false;
-    };
-    let Ok(dense_path) = hybrid_dense_path(project) else {
-        return false;
-    };
     let Ok(hybrid_dir) = hybrid_index_dir(project) else {
         return false;
     };
+    let manifest_path = hybrid_dir.join("manifest.json");
+    // Only the single-payload mmap generation counts as current-format
+    // artifacts. A legacy dual-file layout (NDJSON dense twin) reports false
+    // here so the build decision routes to a full rebuild, which migrates the
+    // store onto the generation layout.
+    let dense_mmap_path = hybrid_dir.join(aicx_retrieve::MMAP_DENSE_PAYLOAD_FILE_NAME);
     let lexical_meta = hybrid_dir
         .join(aicx_retrieve::TANTIVY_INDEX_DIR)
         .join("meta.json");
-    manifest_path.exists() && dense_path.exists() && lexical_meta.exists()
+    manifest_path.exists() && dense_mmap_path.exists() && lexical_meta.exists()
 }
 
 /// Does the committed hybrid manifest still match the CURRENT embedder?
@@ -1908,12 +2120,10 @@ fn rewrite_index_with_truthful_header(
     Ok(())
 }
 
-#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
 pub(crate) fn read_committed_index_entries(path: &Path) -> Result<(IndexHeader, Vec<IndexEntry>)> {
     read_committed_index_entries_matching_project(path, None)
 }
 
-#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
 pub(crate) fn read_committed_index_entries_matching_project(
     path: &Path,
     project_filter: Option<&str>,
@@ -1956,7 +2166,6 @@ pub(crate) fn read_committed_index_entries_matching_project(
     Ok((header, entries))
 }
 
-#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
 pub(crate) fn index_entry_metadata_json(entry: &IndexEntry) -> serde_json::Value {
     serde_json::json!({
         "source_path": entry.path.to_string_lossy(),

@@ -1025,8 +1025,15 @@ fn incremental_materialize_hybrid_refreshes_persisted_artifacts() {
         embedding: entry_c.embedding.clone(),
     };
 
-    let refreshed = incremental_materialize_hybrid(Some(project), &info, &[delta], 3, &source_hash)
-        .expect("incremental hybrid refresh");
+    let refreshed = incremental_materialize_hybrid(
+        Some(project),
+        &info,
+        &[delta],
+        3,
+        &source_hash,
+        &semantic_index,
+    )
+    .expect("incremental hybrid refresh");
     assert_eq!(refreshed.source_chunk_count, 3);
     assert_eq!(refreshed.dense_count, 3);
     assert_eq!(refreshed.lexical_doc_count, 3);
@@ -1040,13 +1047,22 @@ fn incremental_materialize_hybrid_refreshes_persisted_artifacts() {
     assert_eq!(persisted.dense_count, 3);
     assert_eq!(persisted.lexical_doc_count, 3);
 
+    // The refreshed generation still holds exactly one dense payload, bound
+    // to the refreshed manifest's source hash.
     let manifest_dir = hybrid_index_dir(Some(project)).expect("manifest dir");
+    assert!(
+        !hybrid_dense_path(Some(project))
+            .expect("legacy dense path")
+            .exists(),
+        "incremental refresh must not write the legacy NDJSON dense twin"
+    );
     let lexical = Box::new(TantivyAdapter::new(manifest_dir.clone()).expect("fresh lexical"));
     let dense = Box::new(
-        aicx_retrieve::load_from_ndjson(
-            &hybrid_dense_path(Some(project)).expect("dense path"),
+        aicx_retrieve::MmapDenseAdapter::open(
+            hybrid_dense_mmap_path(Some(project)).expect("dense payload path"),
             info.dimension,
             Distance::Cosine,
+            Some(aicx_retrieve::decode_source_hash_blake3(&persisted.source_hash_blake3).unwrap()),
         )
         .expect("fresh dense"),
     );

@@ -20,6 +20,29 @@ use crate::ManifestError;
 /// relative to the metadata region. The header carries magic, schema version,
 /// endian marker, dimension, distance, count, source BLAKE3 bytes, every region
 /// offset/length, and the exact file length.
+/// Canonical file name of the single dense vector payload inside a hybrid
+/// generation directory. One generation materializes vectors exactly once,
+/// into this artifact; the legacy `dense_brute_force.ndjson` twin is a
+/// migration read input only and is never written by new builds.
+pub const MMAP_DENSE_PAYLOAD_FILE_NAME: &str = "dense.exact_mmap_v1.bin";
+
+/// Blake3 digest bytes of an observed source hash string. The hex form of the
+/// returned bytes equals [`crate::source_hash_blake3`] for the same input, so
+/// the manifest's `source_hash_blake3` field and the 32-byte source hash
+/// embedded in the mmap dense payload share one derivation.
+pub fn source_hash_bytes(observed_source_hash: &str) -> [u8; 32] {
+    *blake3::hash(observed_source_hash.as_bytes()).as_bytes()
+}
+
+/// Decode a manifest `source_hash_blake3` hex string back into the 32-byte
+/// form the mmap dense payload embeds. Fails closed on malformed input.
+pub fn decode_source_hash_blake3(hex_hash: &str) -> Result<[u8; 32]> {
+    let decoded = hex::decode(hex_hash)
+        .with_context(|| format!("decode manifest source hash hex: {hex_hash}"))?;
+    <[u8; 32]>::try_from(decoded.as_slice())
+        .map_err(|_| anyhow::anyhow!("manifest source hash must be 32 bytes: {hex_hash}"))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MmapDenseFormatSchema {
     pub schema: String,
@@ -157,10 +180,41 @@ impl Manifest {
             });
         }
 
+        if self.embedder_distance != other.embedder_distance {
+            return Err(ManifestError::EmbedderModelDrift {
+                manifest_model: self.embedder_distance.clone(),
+                query_model: other.embedder_distance.clone(),
+            });
+        }
+
         if self.lexical_commit_id != other.lexical_commit_id {
             return Err(ManifestError::LexicalCommitMismatch {
                 expected: self.lexical_commit_id.clone(),
                 actual: other.lexical_commit_id.clone(),
+            });
+        }
+
+        // Partial-build drift: artifacts that claim the same generation must
+        // agree on payload kind and row counts, or an interrupted build could
+        // masquerade as complete.
+        if self.dense_kind != other.dense_kind {
+            return Err(ManifestError::GenerationMismatch {
+                lexical_gen: self.dense_kind.clone(),
+                dense_gen: other.dense_kind.clone(),
+            });
+        }
+
+        if self.dense_count != other.dense_count {
+            return Err(ManifestError::DenseCountMismatch {
+                expected: self.dense_count,
+                actual: other.dense_count,
+            });
+        }
+
+        if self.lexical_doc_count != other.lexical_doc_count {
+            return Err(ManifestError::LexicalDocCountMismatch {
+                expected: self.lexical_doc_count,
+                actual: other.lexical_doc_count,
             });
         }
 
