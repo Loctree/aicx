@@ -118,6 +118,39 @@ pub async fn run_at(base: &Path, opts: &DoctorOptions) -> Result<DoctorReport> {
             }
             Err(e) => fixes_applied.push(format!("{prefix}bucket scan skipped: {e}")),
         }
+
+        // Same recoverable-quarantine contract for dead canonical-projection
+        // stages: rename into `<base>/quarantine/projection-stages-<ts>/`
+        // with a restore manifest. Live/stale/unproven owners are left in
+        // place — doctor never force-kills and never deletes.
+        match super::quarantine::quarantine_projection_stages_at(base, dry) {
+            Ok(stage_report) => {
+                if stage_report.moved.is_empty()
+                    && stage_report.failures.is_empty()
+                    && stage_report.left_in_place.is_empty()
+                {
+                    fixes_applied.push("no canonical-projection stages to quarantine".to_string());
+                } else {
+                    fixes_applied.extend(stage_report.moved);
+                    for line in stage_report.left_in_place {
+                        fixes_applied.push(format!("left projection stage in place — {line}"));
+                    }
+                    for line in stage_report.failures {
+                        fixes_applied
+                            .push(format!("failed to quarantine projection stage — {line}"));
+                    }
+                    if let Some(manifest_path) = stage_report.manifest_path {
+                        fixes_applied.push(format!(
+                            "wrote projection-stage quarantine manifest {}",
+                            manifest_path.display()
+                        ));
+                    }
+                }
+            }
+            Err(e) => {
+                fixes_applied.push(format!("{prefix}projection-stage quarantine skipped: {e}"));
+            }
+        }
     }
 
     if opts.migrate_identities {
@@ -982,11 +1015,81 @@ pub(crate) fn check_canonical_store(base: &Path) -> CheckResult {
         };
     }
     let files = store::scan_context_files_at(base).unwrap_or_default();
+    // Fast inventory of in-flight/orphaned canonical-projection stages:
+    // lease metadata only, payload is never read. A dead stage can retain
+    // tens of gigabytes with no owner — surface it, never delete it.
+    let stages = crate::store::canonical_projection::inspect_projection_stages_at(&store_root);
+    if stages.is_empty() {
+        return CheckResult {
+            name: "canonical_store".to_string(),
+            severity: Severity::Green,
+            detail: format!("{} chunk files indexed", files.len()),
+            recommendation: None,
+        };
+    }
+
+    let mut counts: BTreeMap<&'static str, usize> = BTreeMap::new();
+    for stage in &stages {
+        *counts.entry(stage.class.as_str()).or_insert(0) += 1;
+    }
+    let breakdown = counts
+        .iter()
+        .map(|(class, count)| format!("{class}={count}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sample = stages
+        .iter()
+        .take(3)
+        .map(|stage| {
+            format!(
+                "{} [{}: {}]",
+                stage.path.display(),
+                stage.class.as_str(),
+                stage.reason
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    let quarantine_eligible = stages
+        .iter()
+        .filter(|stage| stage.class.quarantine_eligible())
+        .count();
+    let unproven = stages.iter().any(|stage| {
+        matches!(
+            stage.class,
+            crate::store::canonical_projection::StageClass::Stale
+                | crate::store::canonical_projection::StageClass::UnknownOwner
+        )
+    });
+
+    let severity = if quarantine_eligible > 0 || unproven {
+        Severity::Warning
+    } else {
+        Severity::Green
+    };
+    let recommendation = if quarantine_eligible > 0 {
+        Some(
+            "Dead/drifted canonical-projection stage(s) hold unpromoted payload. Run `aicx doctor --fix-buckets --dry-run` to preview, then `aicx doctor --fix-buckets` for a recoverable quarantine move; final deletion stays with the operator via the quarantine manifest."
+                .to_string(),
+        )
+    } else if unproven {
+        Some(
+            "Projection stage ownership is stale or cannot be proven; the stage is left in place. Inspect the stage lease (stage.json) manually before acting."
+                .to_string(),
+        )
+    } else {
+        None
+    };
+
     CheckResult {
         name: "canonical_store".to_string(),
-        severity: Severity::Green,
-        detail: format!("{} chunk files indexed", files.len()),
-        recommendation: None,
+        severity,
+        detail: format!(
+            "{} chunk files indexed; {} projection stage(s): {breakdown}; sample: {sample}",
+            files.len(),
+            stages.len(),
+        ),
+        recommendation,
     }
 }
 

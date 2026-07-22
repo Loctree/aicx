@@ -959,6 +959,201 @@ fn empty_body_detection_is_header_agnostic_for_frontmatter_cards() {
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
+#[cfg(unix)]
+fn write_dead_stage(store_root: &std::path::Path, suffix: &str, state: &str) -> PathBuf {
+    use crate::store::canonical_projection::{
+        PROJECTION_STAGE_META_FILENAME, PROJECTION_STAGE_SCHEMA, ProjectionStageLease,
+    };
+    // PID far above any real pid space (Linux 4194304, macOS 99998).
+    let lease = ProjectionStageLease {
+        schema: PROJECTION_STAGE_SCHEMA.to_owned(),
+        pid: 500_000_000,
+        process_start_identity: "gone".to_owned(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+        heartbeat_at: chrono::Utc::now().to_rfc3339(),
+        source_hash: "sha256:fixture".to_owned(),
+        target_generation: "none".to_owned(),
+        state: state.to_owned(),
+    };
+    let stage = store_root.join(format!(".canonical-projection-v1.stage-500000000-{suffix}"));
+    std::fs::create_dir_all(stage.join("cards")).unwrap();
+    std::fs::write(
+        stage.join("cards").join("payload.json"),
+        b"{\"payload\":true}",
+    )
+    .unwrap();
+    std::fs::write(
+        stage.join(PROJECTION_STAGE_META_FILENAME),
+        serde_json::to_vec_pretty(&lease).unwrap(),
+    )
+    .unwrap();
+    stage
+}
+
+#[cfg(unix)]
+#[test]
+fn canonical_store_check_reports_dead_projection_stage_in_fast_inventory() {
+    let tmp = unique_test_dir("stage-inventory");
+    let store_root = tmp.join("store");
+    std::fs::create_dir_all(&store_root).unwrap();
+    write_dead_stage(&store_root, "1", "staging");
+
+    let result = check_canonical_store(&tmp);
+    assert_eq!(result.severity, Severity::Warning, "{}", result.detail);
+    assert!(
+        result.detail.contains("dead-owner=1"),
+        "dead stage must be classified in the inventory: {}",
+        result.detail
+    );
+    assert!(
+        result
+            .recommendation
+            .as_ref()
+            .is_some_and(|rec| rec.contains("--fix-buckets")),
+        "recommendation must hand the operator the quarantine button: {:?}",
+        result.recommendation
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[cfg(unix)]
+#[test]
+fn fix_buckets_quarantines_dead_projection_stage_and_second_pass_is_noop() {
+    let tmp = unique_test_dir("stage-quarantine");
+    let store_root = tmp.join("store");
+    std::fs::create_dir_all(&store_root).unwrap();
+    let stage = write_dead_stage(&store_root, "1", "complete");
+
+    let opts = DoctorOptions {
+        fix_buckets: true,
+        ..crate::doctor::cleanup::base_doctor_options(false, false)
+    };
+    let rt = tokio::runtime::Runtime::new().unwrap();
+
+    // Dry-run first: nothing moves, the plan is announced.
+    let dry_opts = DoctorOptions {
+        dry_run: true,
+        ..opts.clone()
+    };
+    let dry_report = rt.block_on(run_at(&tmp, &dry_opts)).unwrap();
+    assert!(stage.exists(), "dry-run must not move the stage");
+    assert!(
+        dry_report
+            .fixes_applied
+            .iter()
+            .any(|line| line.contains("[dry-run] would quarantine complete-unpromoted")),
+        "{:?}",
+        dry_report.fixes_applied
+    );
+
+    // Apply: recoverable rename, manifest written, payload preserved.
+    let report = rt.block_on(run_at(&tmp, &opts)).unwrap();
+    assert!(!stage.exists(), "stage must be moved out of the store");
+    let quarantine_root = std::fs::read_dir(tmp.join("quarantine"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("projection-stages-"))
+        })
+        .expect("projection-stages quarantine root must exist");
+    let moved_stage = quarantine_root.join(stage.file_name().unwrap());
+    assert!(
+        moved_stage.join("cards").join("payload.json").exists(),
+        "payload must survive quarantine byte-for-byte (rename, not delete)"
+    );
+    assert!(quarantine_root.join("manifest.json").exists());
+    assert!(
+        report
+            .fixes_applied
+            .iter()
+            .any(|line| line.contains("quarantined complete-unpromoted projection stage")),
+        "{:?}",
+        report.fixes_applied
+    );
+
+    // Idempotency: a second apply pass finds nothing and does nothing.
+    let second = rt.block_on(run_at(&tmp, &opts)).unwrap();
+    assert!(
+        second
+            .fixes_applied
+            .iter()
+            .any(|line| line == "no canonical-projection stages to quarantine"),
+        "{:?}",
+        second.fixes_applied
+    );
+    let roots = std::fs::read_dir(tmp.join("quarantine"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with("projection-stages-"))
+        })
+        .count();
+    assert_eq!(roots, 1, "second pass must not mint a new quarantine root");
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[cfg(unix)]
+#[test]
+fn fix_buckets_leaves_unproven_ownership_stage_in_place() {
+    use crate::store::canonical_projection::{
+        PROJECTION_STAGE_IDENTITY_UNVERIFIABLE, PROJECTION_STAGE_META_FILENAME,
+        PROJECTION_STAGE_SCHEMA, ProjectionStageLease,
+    };
+    let tmp = unique_test_dir("stage-unknown-owner");
+    let store_root = tmp.join("store");
+    std::fs::create_dir_all(&store_root).unwrap();
+    // Live pid (ours) with an unverifiable recorded identity: ownership
+    // cannot be proven → mark unknown, leave in place.
+    let lease = ProjectionStageLease {
+        schema: PROJECTION_STAGE_SCHEMA.to_owned(),
+        pid: std::process::id(),
+        process_start_identity: PROJECTION_STAGE_IDENTITY_UNVERIFIABLE.to_owned(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+        heartbeat_at: chrono::Utc::now().to_rfc3339(),
+        source_hash: "sha256:fixture".to_owned(),
+        target_generation: "none".to_owned(),
+        state: "staging".to_owned(),
+    };
+    let stage = store_root.join(".canonical-projection-v1.stage-unknown-1");
+    std::fs::create_dir_all(&stage).unwrap();
+    std::fs::write(
+        stage.join(PROJECTION_STAGE_META_FILENAME),
+        serde_json::to_vec_pretty(&lease).unwrap(),
+    )
+    .unwrap();
+
+    let opts = DoctorOptions {
+        fix_buckets: true,
+        ..crate::doctor::cleanup::base_doctor_options(false, false)
+    };
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let report = rt.block_on(run_at(&tmp, &opts)).unwrap();
+
+    assert!(
+        stage.exists(),
+        "unproven ownership must never be quarantined"
+    );
+    assert!(
+        report
+            .fixes_applied
+            .iter()
+            .any(|line| line.contains("left projection stage in place")
+                && line.contains("unknown-owner")),
+        "{:?}",
+        report.fixes_applied
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
 fn unique_test_dir(label: &str) -> PathBuf {
     let tmp = std::env::temp_dir().join(format!(
         "aicx-doctor-{label}-{}-{}",

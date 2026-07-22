@@ -309,6 +309,156 @@ fn apply_empty_body_quarantine_accepts_non_repository_contexts() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
+/// W1-03 (projection stage lease): a killed projection writer leaves a
+/// classifiable stage; `doctor --fix-buckets` quarantines it recoverably
+/// (rename + manifest, never delete), the pass is idempotent, and restore
+/// brings the stage back byte-for-byte.
+#[cfg(unix)]
+#[test]
+fn doctor_quarantines_dead_projection_stage_recoverably_and_idempotently() {
+    use aicx::store::canonical_projection::{
+        PROJECTION_STAGE_META_FILENAME, PROJECTION_STAGE_SCHEMA, ProjectionStageLease,
+    };
+
+    let base = unique_base("projection-stage");
+    let store_root = base.join("store");
+    std::fs::create_dir_all(&store_root).expect("create store root");
+
+    // Killed-writer fixture: lease written before payload, owner pid far
+    // above any real pid space (Linux 4194304, macOS 99998) → dead.
+    let lease = ProjectionStageLease {
+        schema: PROJECTION_STAGE_SCHEMA.to_owned(),
+        pid: 500_000_000,
+        process_start_identity: "gone".to_owned(),
+        created_at: "2026-07-20T00:00:00+00:00".to_owned(),
+        heartbeat_at: "2026-07-20T00:00:00+00:00".to_owned(),
+        source_hash: "sha256:fixture".to_owned(),
+        target_generation: "none".to_owned(),
+        state: "staging".to_owned(),
+    };
+    let stage = store_root.join(".canonical-projection-v1.stage-500000000-1");
+    std::fs::create_dir_all(stage.join("cards")).expect("create stage payload dir");
+    let payload = b"{\"card\":\"unpromoted payload\"}".to_vec();
+    std::fs::write(stage.join("cards").join("payload.json"), &payload).expect("write payload");
+    std::fs::write(
+        stage.join(PROJECTION_STAGE_META_FILENAME),
+        serde_json::to_vec_pretty(&lease).expect("serialize lease"),
+    )
+    .expect("write lease");
+
+    let opts = DoctorOptions {
+        rebuild_steer_index: false,
+        fix_buckets: true,
+        dry_run: false,
+        rebuild_sidecars: false,
+        prune_empty_bodies: false,
+        apply_prune_empty_bodies: false,
+        migrate_identities: false,
+        apply_migrate_identities: false,
+        check_dedup: false,
+        verbose: false,
+        smoke: false,
+    };
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build current-thread runtime");
+
+    // The fast inventory must report the corpse even without any fix flag.
+    let inventory_only = DoctorOptions {
+        fix_buckets: false,
+        ..opts.clone()
+    };
+    let report = rt
+        .block_on(run_at(&base, &inventory_only))
+        .expect("doctor inventory run");
+    assert_eq!(
+        report.canonical_store.severity,
+        Severity::Warning,
+        "dead stage must degrade canonical_store: {}",
+        report.canonical_store.detail
+    );
+    assert!(
+        report.canonical_store.detail.contains("dead-owner=1"),
+        "inventory must classify the killed stage: {}",
+        report.canonical_store.detail
+    );
+    assert!(stage.exists(), "inventory alone must not move anything");
+
+    // Apply: recoverable rename with manifest.
+    let report = rt.block_on(run_at(&base, &opts)).expect("doctor apply run");
+    assert!(!stage.exists(), "stage must be moved out of the store");
+    let quarantine_root = std::fs::read_dir(base.join("quarantine"))
+        .expect("read quarantine dir")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("projection-stages-"))
+        })
+        .expect("projection-stages quarantine root must exist");
+    let moved_stage = quarantine_root.join(".canonical-projection-v1.stage-500000000-1");
+    assert_eq!(
+        std::fs::read(moved_stage.join("cards").join("payload.json")).expect("read moved payload"),
+        payload,
+        "payload must survive quarantine byte-for-byte (rename, not delete)"
+    );
+    assert!(
+        moved_stage.join(PROJECTION_STAGE_META_FILENAME).exists(),
+        "lease (recovery reference) must travel with the stage"
+    );
+    let manifest = quarantine_root.join("manifest.json");
+    assert!(manifest.exists(), "restore manifest must exist");
+    assert!(
+        report
+            .fixes_applied
+            .iter()
+            .any(|line| line.contains("quarantined dead-owner projection stage")),
+        "{:?}",
+        report.fixes_applied
+    );
+
+    // Idempotency: second apply is a no-op and mints no new quarantine root.
+    let second = rt.block_on(run_at(&base, &opts)).expect("second apply run");
+    assert!(
+        second
+            .fixes_applied
+            .iter()
+            .any(|line| line == "no canonical-projection stages to quarantine"),
+        "{:?}",
+        second.fixes_applied
+    );
+    let roots = std::fs::read_dir(base.join("quarantine"))
+        .expect("read quarantine dir")
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with("projection-stages-"))
+        })
+        .count();
+    assert_eq!(roots, 1, "idempotent apply must not create a second root");
+
+    // Restore: the manifest is the recovery reference; the stage returns.
+    let slug = quarantine_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("slug")
+        .to_string();
+    let restore = restore_quarantine_at(&base, &slug).expect("restore stage");
+    assert_eq!(restore.restored, 1, "failures: {:?}", restore.failures);
+    assert!(restore.failures.is_empty(), "{:?}", restore.failures);
+    assert!(stage.exists(), "stage must be restored to the store");
+    assert_eq!(
+        std::fs::read(stage.join("cards").join("payload.json")).expect("read restored payload"),
+        payload
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
 /// Regression for B-P0-02 dry-run path: `aicx doctor --prune-empty-bodies`
 /// (no `--apply`) renders a reviewable bash script. Before D1 the script
 /// rendering also crashed on `non-repository-contexts` candidates because
