@@ -5,7 +5,7 @@
 //! conversation Markdown. Loctree owns structural identity; this module joins
 //! distilled card claims to the catalog emitted by `loct anchors`.
 
-use crate::legacy_archive::{legacy_cards_dir, read_canonical_projection_at, resolve_aicx_home};
+use crate::legacy_archive::{legacy_cards_dir, read_canonical_projection_at};
 use crate::rank::{SEMANTIC_INTENT_CANDIDATE_THRESHOLD, intent_candidate_similarity};
 use aicx_parser::engine::{Known, TurnRole};
 use aicx_parser::projections::CanonicalCard;
@@ -242,7 +242,7 @@ pub fn build_overlay(options: &OverlayOptions) -> Result<(OverlayDocument, Overl
     let embedding_model = configured_embedding_model_key();
     let overlay_revision = overlay_revision(&catalog, &store_revision, &embedding_model);
     let index_root = options.index_root.clone().unwrap_or(
-        resolve_aicx_home()?
+        crate::aicx_home::resolve()?
             .join("overlay-index-v1")
             .join(short_hash(&catalog.repo_id)),
     );

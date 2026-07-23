@@ -89,7 +89,7 @@ pub fn sessions_path_for(home: &Path) -> PathBuf {
 }
 
 pub fn sessions_path() -> Result<PathBuf> {
-    Ok(sessions_path_for(&legacy_archive::resolve_aicx_home()?))
+    Ok(sessions_path_for(&crate::aicx_home::resolve()?))
 }
 
 pub fn read_entries_at(home: &Path) -> Result<Vec<CatalogEntry>> {
