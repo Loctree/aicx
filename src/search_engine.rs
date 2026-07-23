@@ -825,6 +825,9 @@ fn apply_recency_prior(results: &mut [FuzzyResult]) {
 /// Pre-filter index generations stored raw `runtime_runs` token streams in
 /// `preview_lines`. Leaving them in the result body made search look like the
 /// mill still owned the product surface even when BM25 hit the right session.
+/// When a line is an `item.completed` envelope carrying `agent_message` text,
+/// unwrap that text so ranking and display use the human answer, not the JSON
+/// wrapper (works even before the next signal-filter rebuild).
 fn sanitize_lexical_preview_lines(result: &mut FuzzyResult) {
     if result.matched_lines.is_empty() {
         return;
@@ -832,12 +835,54 @@ fn sanitize_lexical_preview_lines(result: &mut FuzzyResult) {
     let cleaned: Vec<String> = result
         .matched_lines
         .iter()
-        .filter(|line| !is_thought_token_or_event_noise_line(line))
-        .cloned()
+        .filter_map(|line| normalize_preview_line(line))
         .collect();
     if !cleaned.is_empty() {
         result.matched_lines = cleaned;
     }
+}
+
+fn normalize_preview_line(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if is_thought_token_or_event_noise_line(trimmed) {
+        return None;
+    }
+    if let Some(text) = unwrap_agent_message_event(trimmed) {
+        let text = text.trim();
+        if text.is_empty() {
+            return None;
+        }
+        return Some(text.chars().take(240).collect());
+    }
+    Some(trimmed.to_string())
+}
+
+fn unwrap_agent_message_event(line: &str) -> Option<String> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+        return None;
+    };
+    let ty = value.get("type").and_then(|v| v.as_str())?;
+    if ty == "item.completed" {
+        let item = value.get("item")?;
+        let item_ty = item.get("type").and_then(|v| v.as_str())?;
+        if matches!(item_ty, "agent_message" | "message") {
+            return item
+                .get("text")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+        }
+        return None;
+    }
+    if matches!(ty, "agent_message" | "message") {
+        return value
+            .get("text")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+    }
+    None
 }
 
 fn is_thought_token_or_event_noise_line(line: &str) -> bool {
@@ -857,6 +902,15 @@ fn is_thought_token_or_event_noise_line(line: &str) -> bool {
             || trimmed.contains("\"type\": \"thread.")
             || trimmed.contains("\"type\": \"turn.")
             || trimmed.contains("\"type\": \"item.started\""))
+    {
+        return true;
+    }
+    // item.completed error / step shells without agent_message body.
+    if trimmed.starts_with('{')
+        && (trimmed.contains("\"type\":\"item.completed\"")
+            || trimmed.contains("\"type\": \"item.completed\""))
+        && !trimmed.contains("\"agent_message\"")
+        && !trimmed.contains("\"type\":\"message\"")
     {
         return true;
     }
@@ -2832,6 +2886,18 @@ mod tests {
         sanitize_lexical_preview_lines(&mut result);
         assert_eq!(result.matched_lines.len(), 1);
         assert!(result.matched_lines[0].contains("W2-B-4c"));
+    }
+
+    #[test]
+    fn sanitize_lexical_preview_unwraps_item_completed_agent_message() {
+        let mut result = fuzzy(100, "conversations", "2026-07-22", None);
+        result.matched_lines = vec![
+            r#"{"type":"item.completed","item":{"id":"item_0","type":"error","message":"Skill descriptions were shortened"}}"#.to_string(),
+            r#"{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"Routing strzałek is W2-B-4c."}}"#.to_string(),
+        ];
+        sanitize_lexical_preview_lines(&mut result);
+        assert_eq!(result.matched_lines.len(), 1);
+        assert_eq!(result.matched_lines[0], "Routing strzałek is W2-B-4c.");
     }
 
     #[test]
