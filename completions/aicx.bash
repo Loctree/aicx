@@ -1277,13 +1277,13 @@ _aicx() {
             return 0
             ;;
         aicx__subcmd__dashboard)
-            opts="-p -H -o -v -h --serve --generate-html --store-root --project --hours --output --host --port --no-open --bg --allow-cors-origins --auth-token --require-auth --allow-no-origin --title --preview-chars --verbose --project-fuzzy --help"
+            opts="-p -H -o -v -h --serve --generate-html --aicx-home --project --hours --output --host --port --no-open --bg --allow-cors-origins --auth-token --require-auth --allow-no-origin --title --preview-chars --verbose --project-fuzzy --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi
             case "${prev}" in
-                --store-root)
+                --aicx-home)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
@@ -1347,13 +1347,13 @@ _aicx() {
             return 0
             ;;
         aicx__subcmd__dashboard__subcmd__serve)
-            opts="-v -h --store-root --host --port --no-open --artifact --title --preview-chars --verbose --project-fuzzy --help"
+            opts="-v -h --aicx-home --host --port --no-open --artifact --title --preview-chars --verbose --project-fuzzy --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi
             case "${prev}" in
-                --store-root)
+                --aicx-home)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
@@ -1497,52 +1497,12 @@ _aicx() {
             return 0
             ;;
         aicx__subcmd__extract)
-            opts="-o -p -H -v -h --agent --format --session --output --project --hours --conversation --user-only --include-assistant --max-message-chars --verbose --project-fuzzy --help codex claude gemini grok junie help"
+            opts="-v -h --verbose --project-fuzzy --help codex claude gemini grok junie help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi
             case "${prev}" in
-                --agent)
-                    COMPREPLY=($(compgen -f "${cur}"))
-                    return 0
-                    ;;
-                --format)
-                    COMPREPLY=($(compgen -f "${cur}"))
-                    return 0
-                    ;;
-                --session)
-                    COMPREPLY=($(compgen -f "${cur}"))
-                    return 0
-                    ;;
-                --output)
-                    COMPREPLY=($(compgen -f "${cur}"))
-                    return 0
-                    ;;
-                -o)
-                    COMPREPLY=($(compgen -f "${cur}"))
-                    return 0
-                    ;;
-                --project)
-                    COMPREPLY=($(compgen -f "${cur}"))
-                    return 0
-                    ;;
-                -p)
-                    COMPREPLY=($(compgen -f "${cur}"))
-                    return 0
-                    ;;
-                --hours)
-                    COMPREPLY=($(compgen -f "${cur}"))
-                    return 0
-                    ;;
-                -H)
-                    COMPREPLY=($(compgen -f "${cur}"))
-                    return 0
-                    ;;
-                --max-message-chars)
-                    COMPREPLY=($(compgen -f "${cur}"))
-                    return 0
-                    ;;
                 *)
                     COMPREPLY=()
                     ;;
@@ -3073,7 +3033,7 @@ _aicx() {
             return 0
             ;;
         aicx__subcmd__migrate)
-            opts="-v -h --dry-run --legacy-root --store-root --no-intent-schema --cards-v2 --apply --verbose --project-fuzzy --help"
+            opts="-v -h --dry-run --legacy-root --aicx-home --no-intent-schema --cards-v2 --apply --verbose --project-fuzzy --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -3083,7 +3043,7 @@ _aicx() {
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
-                --store-root)
+                --aicx-home)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
@@ -3099,7 +3059,7 @@ _aicx() {
             return 0
             ;;
         aicx__subcmd__migrate__subcmd__intent__subcmd__schema)
-            opts="-p -v -h --project --store-root --dry-run --verbose --project-fuzzy --help"
+            opts="-p -v -h --project --aicx-home --dry-run --verbose --project-fuzzy --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -3113,7 +3073,7 @@ _aicx() {
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
-                --store-root)
+                --aicx-home)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;

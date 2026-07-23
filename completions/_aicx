@@ -59,15 +59,15 @@ _arguments "${_arguments_options[@]}" : \
 '*--project=[Source cwd/project filter(s)\: narrows session discovery before repo segmentation]:PROJECT:_default' \
 '-H+[Hours to look back (default\: 48, 0 = all time)]:HOURS:_default' \
 '--hours=[Hours to look back (default\: 48, 0 = all time)]:HOURS:_default' \
-'-o+[Output directory (omit to only write to store)]:OUTPUT:_files' \
-'--output=[Output directory (omit to only write to store)]:OUTPUT:_files' \
+'-o+[Output directory for explicit report files]:OUTPUT:_files' \
+'--output=[Output directory for explicit report files]:OUTPUT:_files' \
 '-f+[Output format\: md, json, both]:FORMAT:_default' \
 '--format=[Output format\: md, json, both]:FORMAT:_default' \
 '--append-to=[Append to a single timeline file instead of creating new files]:APPEND_TO:_files' \
 '--rotate=[Keep only last N output files (0 = unlimited)]:ROTATE:_default' \
 '--project-root=[Project root for loctree snapshot (defaults to cwd)]:PROJECT_ROOT:_files' \
-'--emit=[What to print to stdout\: paths, json, none (default\: none)]:EMIT:((paths\:"Print store chunk paths (one per line)"
-json\:"Print JSON report (includes \`store_paths\` for convenience)"
+'--emit=[What to print to stdout\: paths, json, none (default\: none)]:EMIT:((paths\:"Print legacy archive chunk paths (one per line)"
+json\:"Print JSON report (includes the compatibility \`store_paths\` field)"
 none\:"Print nothing to stdout"))' \
 '--no-redact-secrets[Redact secrets (tokens/keys) from outputs before writing/syncing]' \
 '--full-rescan[Ignore the stored watermark and previously-seen hashes for this run]' \
@@ -90,15 +90,15 @@ _arguments "${_arguments_options[@]}" : \
 '*--project=[Source cwd/project filter(s)\: narrows session discovery before repo segmentation]:PROJECT:_default' \
 '-H+[Hours to look back (default\: 48, 0 = all time)]:HOURS:_default' \
 '--hours=[Hours to look back (default\: 48, 0 = all time)]:HOURS:_default' \
-'-o+[Output directory (omit to only write to store)]:OUTPUT:_files' \
-'--output=[Output directory (omit to only write to store)]:OUTPUT:_files' \
+'-o+[Output directory for explicit report files]:OUTPUT:_files' \
+'--output=[Output directory for explicit report files]:OUTPUT:_files' \
 '-f+[Output format\: md, json, both]:FORMAT:_default' \
 '--format=[Output format\: md, json, both]:FORMAT:_default' \
 '--append-to=[Append to a single timeline file]:APPEND_TO:_files' \
 '--rotate=[Keep only last N output files (0 = unlimited)]:ROTATE:_default' \
 '--project-root=[Project root for loctree snapshot]:PROJECT_ROOT:_files' \
-'--emit=[What to print to stdout\: paths, json, none (default\: none)]:EMIT:((paths\:"Print store chunk paths (one per line)"
-json\:"Print JSON report (includes \`store_paths\` for convenience)"
+'--emit=[What to print to stdout\: paths, json, none (default\: none)]:EMIT:((paths\:"Print legacy archive chunk paths (one per line)"
+json\:"Print JSON report (includes the compatibility \`store_paths\` field)"
 none\:"Print nothing to stdout"))' \
 '--no-redact-secrets[Redact secrets (tokens/keys) from outputs before writing/syncing]' \
 '--full-rescan[Ignore the stored watermark and previously-seen hashes for this run]' \
@@ -121,13 +121,13 @@ _arguments "${_arguments_options[@]}" : \
 '*--project=[Source cwd/project filter(s)\: narrows session discovery before repo segmentation]:PROJECT:_default' \
 '-H+[Hours to look back (default\: 48, 0 = all time)]:HOURS:_default' \
 '--hours=[Hours to look back (default\: 48, 0 = all time)]:HOURS:_default' \
-'-o+[Output directory (omit to only write to store)]:OUTPUT:_files' \
-'--output=[Output directory (omit to only write to store)]:OUTPUT:_files' \
+'-o+[Output directory for explicit report files]:OUTPUT:_files' \
+'--output=[Output directory for explicit report files]:OUTPUT:_files' \
 '--append-to=[Append to a single timeline file]:APPEND_TO:_files' \
 '--rotate=[Keep only last N output files (0 = unlimited)]:ROTATE:_default' \
 '--project-root=[Project root for loctree snapshot]:PROJECT_ROOT:_files' \
-'--emit=[What to print to stdout\: paths, json, none (default\: none)]:EMIT:((paths\:"Print store chunk paths (one per line)"
-json\:"Print JSON report (includes \`store_paths\` for convenience)"
+'--emit=[What to print to stdout\: paths, json, none (default\: none)]:EMIT:((paths\:"Print legacy archive chunk paths (one per line)"
+json\:"Print JSON report (includes the compatibility \`store_paths\` field)"
 none\:"Print nothing to stdout"))' \
 '--no-redact-secrets[Redact secrets (tokens/keys) from outputs before writing/syncing]' \
 '--full-rescan[Ignore the stored watermark and previously-seen hashes for this run]' \
@@ -410,8 +410,8 @@ _arguments "${_arguments_options[@]}" : \
 '-H+[Hours to look back when --since is omitted (default\: 720 = 30 days, 0 = all time)]:HOURS:_default' \
 '--hours=[Hours to look back when --since is omitted (default\: 720 = 30 days, 0 = all time)]:HOURS:_default' \
 '--since=[Lower date bound (YYYY-MM-DD or YYYY_MMDD)]:SINCE:_default' \
-'--emit=[What to print to stdout\: paths, json, none (default\: none)]:EMIT:((paths\:"Print store chunk paths (one per line)"
-json\:"Print JSON report (includes \`store_paths\` for convenience)"
+'--emit=[What to print to stdout\: paths, json, none (default\: none)]:EMIT:((paths\:"Print legacy archive chunk paths (one per line)"
+json\:"Print JSON report (includes the compatibility \`store_paths\` field)"
 none\:"Print nothing to stdout"))' \
 '--no-redact-secrets[Redact secrets (tokens/keys) from outputs before writing/syncing]' \
 '--full-rescan[Ignore the stored watermark and previously-seen hashes for this run]' \
@@ -776,7 +776,7 @@ _arguments "${_arguments_options[@]}" : \
 ;;
 (dashboard)
 _arguments "${_arguments_options[@]}" : \
-'--store-root=[Store root directory (default\: ~/.aicx)]:STORE_ROOT:_files' \
+'--aicx-home=[AICX home directory (default\: ~/.aicx)]:PATH:_files' \
 '-p+[Exact project scope. A bare repository name must resolve uniquely]:PROJECT:_default' \
 '--project=[Exact project scope. A bare repository name must resolve uniquely]:PROJECT:_default' \
 '-H+[Narrow the dashboard dataset to the last N hours (omit for all time)]:HOURS:_default' \
@@ -941,7 +941,7 @@ _arguments "${_arguments_options[@]}" : \
 ;;
 (dashboard-serve)
 _arguments "${_arguments_options[@]}" : \
-'--store-root=[Store root directory (default\: ~/.aicx)]:STORE_ROOT:_files' \
+'--aicx-home=[AICX home directory (default\: ~/.aicx)]:PATH:_files' \
 '--host=[Bind host IP address (loopback only; example\: 127.0.0.1)]:HOST:_default' \
 '--port=[Bind TCP port]:PORT:_default' \
 '--artifact=[Legacy compatibility path retained for status surfaces; not written in server mode]:ARTIFACT:_files' \
@@ -957,8 +957,8 @@ _arguments "${_arguments_options[@]}" : \
 ;;
 (intents)
 _arguments "${_arguments_options[@]}" : \
-'*-p+[Repo or store-bucket filters. Omit to scan all projects. Repeated \`-p\` flags or comma list (\`-p a,b\`) form a union]:PROJECT:_default' \
-'*--project=[Repo or store-bucket filters. Omit to scan all projects. Repeated \`-p\` flags or comma list (\`-p a,b\`) form a union]:PROJECT:_default' \
+'*-p+[Catalog project filters. Omit to scan all projects. Repeated \`-p\` flags or comma list (\`-p a,b\`) form a union]:PROJECT:_default' \
+'*--project=[Catalog project filters. Omit to scan all projects. Repeated \`-p\` flags or comma list (\`-p a,b\`) form a union]:PROJECT:_default' \
 '-H+[Hours to look back (default\: 720 = 30 days)]:HOURS:_default' \
 '--hours=[Hours to look back (default\: 720 = 30 days)]:HOURS:_default' \
 '--limit=[Maximum number of results to return. Default is command-specific\: search/steer 10, tail 20, intents unlimited (full roadmap)]:LIMIT:_default' \
@@ -984,8 +984,8 @@ _arguments "${_arguments_options[@]}" : \
 ;;
 (tail)
 _arguments "${_arguments_options[@]}" : \
-'*-p+[Repo or store-bucket filters. Omit to scan all projects. Repeated \`-p\` flags or comma list (\`-p a,b\`) form a union]:PROJECT:_default' \
-'*--project=[Repo or store-bucket filters. Omit to scan all projects. Repeated \`-p\` flags or comma list (\`-p a,b\`) form a union]:PROJECT:_default' \
+'*-p+[Catalog project filters. Omit to scan all projects. Repeated \`-p\` flags or comma list (\`-p a,b\`) form a union]:PROJECT:_default' \
+'*--project=[Catalog project filters. Omit to scan all projects. Repeated \`-p\` flags or comma list (\`-p a,b\`) form a union]:PROJECT:_default' \
 '-H+[Hours to look back (default\: 48)]:HOURS:_default' \
 '--hours=[Hours to look back (default\: 48)]:HOURS:_default' \
 '-k+[Filter by kind\: decision, intent, outcome, task]:KIND:_default' \
@@ -1321,7 +1321,7 @@ _arguments "${_arguments_options[@]}" : \
 '--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
-':reference -- Absolute path, store-relative path, file name, legacy compact ref, or `chunk\:<id>`:_default' \
+':reference -- Absolute path, archive-relative path, file name, legacy compact ref, or `chunk\:<id>`:_default' \
 && ret=0
 ;;
 (open)
@@ -1334,7 +1334,7 @@ _arguments "${_arguments_options[@]}" : \
 '--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
-':reference -- Absolute path, store-relative path, file name, legacy compact ref, or `chunk\:<id>`:_default' \
+':reference -- Absolute path, archive-relative path, file name, legacy compact ref, or `chunk\:<id>`:_default' \
 && ret=0
 ;;
 (steer)
@@ -1343,8 +1343,8 @@ _arguments "${_arguments_options[@]}" : \
 '--prompt-id=[Filter by prompt_id (exact match)]:PROMPT_ID:_default' \
 '-k+[Filter by kind\: conversations, plans, reports, other]:KIND:_default' \
 '--kind=[Filter by kind\: conversations, plans, reports, other]:KIND:_default' \
-'*-p+[Repo or store-bucket filters. Omit to search all projects. Repeated \`-p\` flags or comma list (\`-p a,b\`) form a union]:PROJECT:_default' \
-'*--project=[Repo or store-bucket filters. Omit to search all projects. Repeated \`-p\` flags or comma list (\`-p a,b\`) form a union]:PROJECT:_default' \
+'*-p+[Catalog project filters. Omit to search all projects. Repeated \`-p\` flags or comma list (\`-p a,b\`) form a union]:PROJECT:_default' \
+'*--project=[Catalog project filters. Omit to search all projects. Repeated \`-p\` flags or comma list (\`-p a,b\`) form a union]:PROJECT:_default' \
 '-d+[Filter by date\: single day (2026-03-28), range (2026-03-20..2026-03-28), or open-ended (2026-03-20.. or ..2026-03-28)]:DATE:_default' \
 '--date=[Filter by date\: single day (2026-03-28), range (2026-03-20..2026-03-28), or open-ended (2026-03-20.. or ..2026-03-28)]:DATE:_default' \
 '--limit=[Maximum number of results to return. Default is command-specific\: search/steer 10, tail 20, intents unlimited (full roadmap)]:LIMIT:_default' \
@@ -1365,11 +1365,11 @@ _arguments "${_arguments_options[@]}" : \
 ;;
 (migrate)
 _arguments "${_arguments_options[@]}" : \
-'--legacy-root=[Override legacy input store root (default\: ~/.ai-contexters)]:LEGACY_ROOT:_files' \
-'--store-root=[Override AICX store root (default\: ~/.aicx)]:STORE_ROOT:_files' \
-'--cards-v2=[Upgrade store cards v1 -> v2 in place (sidecar schema/honesty fields, bracket header -> YAML frontmatter; body bytes never change). Optional ROOT overrides the walked directory (default\: canonical store dir). Dry-run by default; pass --apply to write]::ROOT:_files' \
+'--legacy-root=[Override legacy input archive root (default\: ~/.ai-contexters)]:LEGACY_ROOT:_files' \
+'--aicx-home=[Override AICX home (default\: ~/.aicx)]:PATH:_files' \
+'--cards-v2=[Upgrade legacy archive cards v1 -> v2 in place (sidecar schema/honesty fields, bracket header -> YAML frontmatter; body bytes never change). Optional ROOT overrides the walked directory (default\: legacy archive dir). Dry-run by default; pass --apply to write]::ROOT:_files' \
 '--dry-run[Dry run\: show what would be moved without modifying files]' \
-'--no-intent-schema[Skip post-migration intent schema scan on the canonical store]' \
+'--no-intent-schema[Skip post-migration intent schema scan on the legacy archive]' \
 '(--dry-run)--apply[Write the cards-v2 migration (without it, --cards-v2 is a dry run)]' \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
@@ -1380,9 +1380,9 @@ _arguments "${_arguments_options[@]}" : \
 ;;
 (migrate-intent-schema)
 _arguments "${_arguments_options[@]}" : \
-'-p+[Strict project filter\: \`owner/repo\`, \`/repo\` (cross-org repo name), \`owner/\` (org wildcard), or a unique exact \`name\`. Omit to scan the whole store. Substring matching is intentionally disabled]:PROJECT:_default' \
-'--project=[Strict project filter\: \`owner/repo\`, \`/repo\` (cross-org repo name), \`owner/\` (org wildcard), or a unique exact \`name\`. Omit to scan the whole store. Substring matching is intentionally disabled]:PROJECT:_default' \
-'--store-root=[Override AICX store root (default\: ~/.aicx)]:STORE_ROOT:_files' \
+'-p+[Strict project filter\: \`owner/repo\`, \`/repo\` (cross-org repo name), \`owner/\` (org wildcard), or a unique exact \`name\`. Omit to scan the whole legacy archive. Substring matching is intentionally disabled]:PROJECT:_default' \
+'--project=[Strict project filter\: \`owner/repo\`, \`/repo\` (cross-org repo name), \`owner/\` (org wildcard), or a unique exact \`name\`. Omit to scan the whole legacy archive. Substring matching is intentionally disabled]:PROJECT:_default' \
+'--aicx-home=[Override AICX home (default\: ~/.aicx)]:PATH:_files' \
 '--dry-run[Dry run\: show classification counts without writing sidecars]' \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
@@ -1395,21 +1395,21 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 '--restore-quarantine=[Restore files from a quarantine manifest slug]:SLUG:_default' \
 '--format=[Output format\: text (default), json]:FORMAT:_default' \
-'--rebuild-steer-index[Delete and rebuild the steer index from the canonical store when corrupted or schema-incompatible. Narrower contract than the legacy \`--fix\` (which was a no-op for sidecars/index consistency/empty bodies — those have dedicated flags)]' \
+'--rebuild-steer-index[Delete and rebuild the steer index from available corpus material when corrupted or schema-incompatible. Narrower contract than the legacy \`--fix\` (which was a no-op for sidecars/index consistency/empty bodies — those have dedicated flags)]' \
 '--fix-buckets[Move suspicious top-level corpus buckets to \$HOME/.aicx/quarantine/. Buckets that are merely CamelCase (legitimate GitHub orgs like \`LibraxisAI\`, \`Vetcoders\`, \`Loctree\`, \`Sampleorg\`) are canonicalized in place to lowercase instead of quarantined, merging into existing lowercase buckets if present]' \
-'--dry-run[With --fix-buckets, preview the planned canonicalize/quarantine actions without modifying the filesystem. Output entries are prefixed with \`\[dry-run\]\`. Use this before running \`--fix-buckets\` against a large store to verify the classification before commit]' \
+'--dry-run[With --fix-buckets, preview the planned canonicalize/quarantine actions without modifying the filesystem. Output entries are prefixed with \`\[dry-run\]\`. Use this before running \`--fix-buckets\` against a large legacy archive to verify the classification before commit]' \
 '--rebuild-sidecars[Emit a reviewable bash script for missing sidecar backfill]' \
 '--prune-empty-bodies[Emit a reviewable bash script for moving empty-body chunks to quarantine]' \
-'--migrate-identities[Plan the one-time project-identity migration\: persisted index.json key casing → GitHub nameWithOwner canon (lowercase, the fresh-derivation form), store/ directory normalization, historical-card alias map (annotate-only, cards never rewritten), and a typo-twin bucket report. Dry-run by default — writes migration/identity-manifest.json + identity-report.md with zero store mutation; add --apply to execute the planned renames]' \
-'(--dry-run)--apply[With --prune-empty-bodies, move empty-body chunks into recoverable quarantine. With --migrate-identities, execute the planned identity renames. Refuses to combine with --dry-run\: on a store-mutating surface the preview flag must always win, so the ambiguous combination is a parse error]' \
+'--migrate-identities[Plan the one-time project-identity migration\: persisted index.json key casing → GitHub nameWithOwner canon (lowercase, the fresh-derivation form), legacy \`store/\` directory normalization, historical-card alias map (annotate-only, cards never rewritten), and a typo-twin bucket report. Dry-run by default — writes migration/identity-manifest.json + identity-report.md with zero archive mutation; add --apply to execute the planned renames]' \
+'(--dry-run)--apply[With --prune-empty-bodies, move empty-body chunks into recoverable quarantine. With --migrate-identities, execute the planned identity renames. Refuses to combine with --dry-run\: on a archive-mutating surface the preview flag must always win, so the ambiguous combination is a parse error]' \
 '-y[Assume yes on doctor cleanup prompts]' \
 '--yes[Assume yes on doctor cleanup prompts]' \
 '--force[Skip dry-run preview and prompts; intended for CI cleanup runs]' \
-'--check-dedup[Report duplicate content_sha256 groups across store and context-corpus]' \
+'--check-dedup[Report duplicate content_sha256 groups across legacy archive and context-corpus]' \
 '-v[Print recommendations for green checks too]' \
 '--verbose[Print recommendations for green checks too]' \
 '--smoke[Run actual real HTTP POST / embedder tests instead of skipping them. Doctor stays fast and cheap by default; this flag exercises the AI provider]' \
-'--deep[Run the full forensic pass\: recursive store scans, semantic-index reconciliation, and payload-level checks. Emits progress phases with heartbeats and an explicit estimated scope; Ctrl-C cancels cleanly between operations. Without this flag (and without fix / full-scan flags, which imply it) doctor answers from the bounded fast health pass — metadata, leases, manifests, and sampled invariants only; anything it cannot prove is reported as \`unknown\`, never as healthy]' \
+'--deep[Run the full forensic pass\: recursive legacy archive scans, semantic-index reconciliation, and payload-level checks. Emits progress phases with heartbeats and an explicit estimated scope; Ctrl-C cancels cleanly between operations. Without this flag (and without fix / full-scan flags, which imply it) doctor answers from the bounded fast health pass — metadata, leases, manifests, and sampled invariants only; anything it cannot prove is reported as \`unknown\`, never as healthy]' \
 '--oracle[Report AICX Oracle readiness\: ready | degraded | unsafe_for_loctree_scope.]' \
 '--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
 '-h[Print help (see more with '\''--help'\'')]' \
@@ -1834,7 +1834,7 @@ _aicx_commands() {
 'codex:Extract Codex sessions into local reports' \
 'all:Extract sessions from all supported agents into local reports' \
 'extract:Extract a single session for one agent — by session id or direct file' \
-'conversations:Batch-export conversation JSON files without writing to the canonical store' \
+'conversations:Batch-export conversation JSON files without writing per-frame card files' \
 'catalog:Rebuild the durable extract-era session catalog (no per-frame cards)' \
 'ingest:Ingest operator-owned source documents into the canonical corpus' \
 'list:List raw agent session sources on disk (pre-extraction inputs)' \
@@ -1843,10 +1843,10 @@ _aicx_commands() {
 'claims:Lane 2\: extract agent claims (audit targets) from a session' \
 'results:Lane 3\: collect repo evidence for a session'\''s claims and verify them' \
 'clarify:Lane 5\: generate at most 5 A/B/C decision questions from verified gaps' \
-'wizard:Interactive daily-driver entrypoint for corpus, doctor, intents, and store' \
-'refs:List chunks in the canonical store inventory' \
+'wizard:Interactive daily-driver entrypoint for catalog, extracts, index, and doctor' \
+'refs:List recent extract/catalog inventory under ~/.aicx/' \
 'state:Manage extraction dedup state (watermarks and hashes)' \
-'dashboard:Generate a searchable HTML dashboard from the canonical store, or serve it locally' \
+'dashboard:Generate a searchable HTML dashboard from extracts/catalog, or serve it locally' \
 'reports:Extract Vibecrafted workflow and marbles reports into a standalone HTML explorer' \
 'corpus:Audit or repair derived corpus markdown' \
 'reports-extractor:Deprecated compatibility shim for \`aicx reports\`' \
@@ -1859,12 +1859,12 @@ _aicx_commands() {
 'eval:Run local evaluation helpers for retrieval/search quality' \
 'index:Build the source-driven lexical index. Use \`--dry-run\` to preview parsing and filtering without writing extracts or publishing CURRENT' \
 'config:Manage \`\$HOME/.aicx/config.toml\` for embedders and endpoints' \
-'read:Read one canonical chunk by path, file name, or \`chunk\:<id>\` reference' \
-'open:Read one canonical chunk by path, file name, or \`chunk\:<id>\` reference' \
+'read:Read one legacy archive chunk by path, file name, or \`chunk\:<id>\` reference' \
+'open:Read one legacy archive chunk by path, file name, or \`chunk\:<id>\` reference' \
 'steer:Retrieve chunks by steering metadata (requires --features lance)' \
-'migrate:Migrate legacy ~/.ai-contexters/ data into the canonical AICX store' \
-'migrate-intent-schema:Classify stored chunks into 11-type intent entries and report counts' \
-'doctor:Diagnose and optionally repair the canonical store and steer index' \
+'migrate:Migrate legacy ~/.ai-contexters/ artifacts into the AICX legacy archive' \
+'migrate-intent-schema:Classify legacy archive chunks into 11-type intent entries and report counts' \
+'doctor:Diagnose and optionally repair AICX home health (index, state, legacy archive)' \
 'health:Emit the bounded AICX health report as JSON for automation' \
 'warmup:Warm/probe the configured local embedder before interactive search' \
 'help:Print this message or the help of the given subcommand(s)' \
@@ -2224,7 +2224,7 @@ _aicx__subcmd__help_commands() {
 'codex:Extract Codex sessions into local reports' \
 'all:Extract sessions from all supported agents into local reports' \
 'extract:Extract a single session for one agent — by session id or direct file' \
-'conversations:Batch-export conversation JSON files without writing to the canonical store' \
+'conversations:Batch-export conversation JSON files without writing per-frame card files' \
 'catalog:Rebuild the durable extract-era session catalog (no per-frame cards)' \
 'ingest:Ingest operator-owned source documents into the canonical corpus' \
 'list:List raw agent session sources on disk (pre-extraction inputs)' \
@@ -2233,10 +2233,10 @@ _aicx__subcmd__help_commands() {
 'claims:Lane 2\: extract agent claims (audit targets) from a session' \
 'results:Lane 3\: collect repo evidence for a session'\''s claims and verify them' \
 'clarify:Lane 5\: generate at most 5 A/B/C decision questions from verified gaps' \
-'wizard:Interactive daily-driver entrypoint for corpus, doctor, intents, and store' \
-'refs:List chunks in the canonical store inventory' \
+'wizard:Interactive daily-driver entrypoint for catalog, extracts, index, and doctor' \
+'refs:List recent extract/catalog inventory under ~/.aicx/' \
 'state:Manage extraction dedup state (watermarks and hashes)' \
-'dashboard:Generate a searchable HTML dashboard from the canonical store, or serve it locally' \
+'dashboard:Generate a searchable HTML dashboard from extracts/catalog, or serve it locally' \
 'reports:Extract Vibecrafted workflow and marbles reports into a standalone HTML explorer' \
 'corpus:Audit or repair derived corpus markdown' \
 'reports-extractor:Deprecated compatibility shim for \`aicx reports\`' \
@@ -2249,11 +2249,11 @@ _aicx__subcmd__help_commands() {
 'eval:Run local evaluation helpers for retrieval/search quality' \
 'index:Build the source-driven lexical index. Use \`--dry-run\` to preview parsing and filtering without writing extracts or publishing CURRENT' \
 'config:Manage \`\$HOME/.aicx/config.toml\` for embedders and endpoints' \
-'read:Read one canonical chunk by path, file name, or \`chunk\:<id>\` reference' \
+'read:Read one legacy archive chunk by path, file name, or \`chunk\:<id>\` reference' \
 'steer:Retrieve chunks by steering metadata (requires --features lance)' \
-'migrate:Migrate legacy ~/.ai-contexters/ data into the canonical AICX store' \
-'migrate-intent-schema:Classify stored chunks into 11-type intent entries and report counts' \
-'doctor:Diagnose and optionally repair the canonical store and steer index' \
+'migrate:Migrate legacy ~/.ai-contexters/ artifacts into the AICX legacy archive' \
+'migrate-intent-schema:Classify legacy archive chunks into 11-type intent entries and report counts' \
+'doctor:Diagnose and optionally repair AICX home health (index, state, legacy archive)' \
 'health:Emit the bounded AICX health report as JSON for automation' \
 'warmup:Warm/probe the configured local embedder before interactive search' \
 'help:Print this message or the help of the given subcommand(s)' \
