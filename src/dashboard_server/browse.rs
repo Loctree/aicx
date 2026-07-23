@@ -271,7 +271,7 @@ pub(super) async fn get_chunk(
     };
 
     let snapshot = state.snapshot.read().await;
-    let store_root = &state.config.store_root;
+    let aicx_home = &state.config.aicx_home;
 
     let record = if let Some(id) = params.id {
         snapshot.payload.records.iter().find(|r| r.id == id)
@@ -303,8 +303,8 @@ pub(super) async fn get_chunk(
             .into_response();
     };
 
-    let file_path = store_root.join(&record.relative_path);
-    let file_path = match resolve_bounded_path(store_root, &file_path) {
+    let file_path = aicx_home.join(&record.relative_path);
+    let file_path = match resolve_bounded_path(aicx_home, &file_path) {
         Ok(p) => p,
         Err(err) => {
             return (

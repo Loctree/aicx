@@ -43,7 +43,7 @@ const REGENERATE_HEADER_VALUE: &str = "regenerate";
 /// Runtime configuration for dashboard server mode.
 #[derive(Debug, Clone)]
 pub struct DashboardServerConfig {
-    pub store_root: PathBuf,
+    pub aicx_home: PathBuf,
     pub scope: DashboardScope,
     pub title: String,
     pub preview_chars: usize,
@@ -102,7 +102,7 @@ struct DashboardStatusResponse {
     rebuilding: bool,
     generated_at: String,
     build_count: u64,
-    store_root: String,
+    aicx_home: String,
     artifact_path: String,
     artifact_written: bool,
     title: String,
@@ -237,7 +237,7 @@ pub async fn run_dashboard_server(config: DashboardServerConfig) -> Result<()> {
     } else {
         eprintln!("  Mutation origin gate: require Origin or Referer");
     }
-    eprintln!("  AICX home: {}", config.store_root.display());
+    eprintln!("  AICX home: {}", config.aicx_home.display());
     eprintln!("  CORS: {}", config.cors_policy.label());
     if auth_enforced {
         eprintln!("  Auth: enabled on /api/* (source: {auth_source_label})");
@@ -292,7 +292,7 @@ async fn get_status(
         rebuilding: state.rebuilding.load(Ordering::SeqCst),
         generated_at: snapshot.generated_at.to_rfc3339(),
         build_count: snapshot.build_count,
-        store_root: state.config.store_root.display().to_string(),
+        aicx_home: state.config.aicx_home.display().to_string(),
         artifact_path: state.config.artifact_path.display().to_string(),
         artifact_written: false,
         title: state.config.title.clone(),
@@ -421,7 +421,7 @@ async fn get_context(State(state): State<Arc<DashboardServerState>>) -> Json<ser
     Json(serde_json::json!({
         "ok": true,
         "version": crate::BUILD_VERSION,
-        "store_root": state.config.store_root.display().to_string(),
+        "aicx_home": state.config.aicx_home.display().to_string(),
         "host": state.config.host.to_string(),
         "port": state.config.port,
         "generated_at": snapshot.generated_at.to_rfc3339(),
@@ -486,7 +486,7 @@ fn rebuild_dashboard(config: &DashboardServerConfig) -> Result<BuildOutput> {
     // The server shell HTML is pre-built once at startup; all data reaches
     // clients through the /api/* endpoints.
     let payload = dashboard::scan_legacy_archive_payload_scoped(
-        &config.store_root,
+        &config.aicx_home,
         config.preview_chars,
         &config.scope,
     )?;

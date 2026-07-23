@@ -145,14 +145,14 @@ pub(super) fn merge_project_scopes(
 }
 
 fn search_project_scopes(
-    store_root: &std::path::Path,
+    aicx_home: &std::path::Path,
     projects: &[String],
 ) -> Result<Vec<Option<String>>> {
     if projects.is_empty() {
         return Ok(vec![None]);
     }
     let resolved = crate::legacy_archive::resolve_filters_to_store_or_index_slugs_at_or_error(
-        store_root, projects,
+        aicx_home, projects,
     )?;
     Ok(resolved.into_iter().map(Some).collect())
 }
@@ -213,7 +213,7 @@ pub(super) async fn get_semantic_search(
     }
 
     let limit = params.limit.min(100);
-    let store_root = state.config.store_root.clone();
+    let aicx_home = state.config.aicx_home.clone();
     let scope = state.config.scope.normalized();
     let request_projects = merge_project_scopes(
         scope.project.as_deref(),
@@ -252,7 +252,7 @@ pub(super) async fn get_semantic_search(
     let query_clone = query.clone();
     let project_owned = request_projects.clone();
     let kind_filter_owned = kind_filter;
-    let project_scopes_owned = match search_project_scopes(&store_root, &project_owned) {
+    let project_scopes_owned = match search_project_scopes(&aicx_home, &project_owned) {
         Ok(scopes) => scopes,
         Err(error) => {
             return (
@@ -272,7 +272,7 @@ pub(super) async fn get_semantic_search(
             .map(|scope| scope.as_deref())
             .collect();
         crate::search_engine::try_semantic_search(
-            &store_root,
+            &aicx_home,
             &query_clone,
             limit,
             &project_scopes,

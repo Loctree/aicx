@@ -558,7 +558,7 @@ struct DashboardArgs {
 
     /// AICX home directory (default: ~/.aicx)
     #[arg(long = "aicx-home", value_name = "PATH")]
-    store_root: Option<PathBuf>,
+    aicx_home: Option<PathBuf>,
 
     /// Exact project scope. A bare repository name must resolve uniquely.
     #[arg(short, long)]
@@ -745,7 +745,7 @@ enum CorpusCommand {
 struct DashboardServeLegacyArgs {
     /// AICX home directory (default: ~/.aicx)
     #[arg(long = "aicx-home", value_name = "PATH")]
-    store_root: Option<PathBuf>,
+    aicx_home: Option<PathBuf>,
 
     /// Bind host IP address (loopback only; example: 127.0.0.1)
     #[arg(long, default_value = "127.0.0.1")]
@@ -2613,7 +2613,7 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
         Some(Commands::DashboardServeLegacy(args)) => {
             warn_legacy_subcommand("dashboard-serve", "dashboard --serve");
             run_dashboard_server(DashboardServerRunArgs {
-                store_root: args.store_root,
+                aicx_home: args.aicx_home,
                 scope: DashboardScope::default(),
                 host: args.host,
                 port: args.port,
@@ -8411,7 +8411,7 @@ fn run_state(
 }
 
 struct DashboardServerRunArgs {
-    store_root: Option<PathBuf>,
+    aicx_home: Option<PathBuf>,
     scope: DashboardScope,
     host: String,
     port: u16,
@@ -8428,7 +8428,7 @@ struct DashboardServerRunArgs {
 
 /// Run dashboard server mode with lightweight HTML shell and API-backed regeneration.
 fn run_dashboard_server(args: DashboardServerRunArgs) -> Result<()> {
-    let root = if let Some(path) = args.store_root {
+    let root = if let Some(path) = args.aicx_home {
         path
     } else {
         aicx::aicx_home::ensure()?
@@ -8451,7 +8451,7 @@ fn run_dashboard_server(args: DashboardServerRunArgs) -> Result<()> {
 
     if args.bg {
         return spawn_dashboard_server_background(DashboardServerBackgroundArgs {
-            store_root: root,
+            aicx_home: root,
             scope: args.scope,
             host,
             port: args.port,
@@ -8473,7 +8473,7 @@ fn run_dashboard_server(args: DashboardServerRunArgs) -> Result<()> {
     }
 
     let config = DashboardServerConfig {
-        store_root: root,
+        aicx_home: root,
         scope: args.scope,
         title: args.title,
         preview_chars: args.preview_chars,
@@ -8507,7 +8507,7 @@ fn run_dashboard_server(args: DashboardServerRunArgs) -> Result<()> {
 }
 
 struct DashboardServerBackgroundArgs<'a> {
-    store_root: PathBuf,
+    aicx_home: PathBuf,
     scope: DashboardScope,
     host: std::net::IpAddr,
     port: u16,
@@ -8531,7 +8531,7 @@ fn spawn_dashboard_server_background(args: DashboardServerBackgroundArgs<'_>) ->
         .arg("--port")
         .arg(args.port.to_string())
         .arg("--aicx-home")
-        .arg(args.store_root.as_os_str());
+        .arg(args.aicx_home.as_os_str());
 
     if let Some(project) = args.scope.project.as_deref() {
         command.arg("--project").arg(project);
@@ -8581,13 +8581,13 @@ fn spawn_dashboard_server_background(args: DashboardServerBackgroundArgs<'_>) ->
     eprintln!("✓ Dashboard server launched in background");
     eprintln!("  PID: {}", child.id());
     eprintln!("  URL: http://{}:{}", args.host, args.port);
-    eprintln!("  Store: {}", args.store_root.display());
+    eprintln!("  AICX home: {}", args.aicx_home.display());
     Ok(())
 }
 
 /// Build and write an AI context dashboard HTML file.
 struct DashboardRunArgs {
-    store_root: Option<PathBuf>,
+    aicx_home: Option<PathBuf>,
     scope: DashboardScope,
     output: PathBuf,
     title: String,
@@ -8610,7 +8610,7 @@ fn run_dashboard_command(
 
     if let Some(filter) = args.project.as_ref() {
         let root = args
-            .store_root
+            .aicx_home
             .clone()
             .map(Ok)
             .unwrap_or_else(aicx::aicx_home::ensure)?;
@@ -8635,7 +8635,7 @@ fn run_dashboard_command(
         }
 
         return run_dashboard_server(DashboardServerRunArgs {
-            store_root: args.store_root,
+            aicx_home: args.aicx_home,
             scope: DashboardScope {
                 project: args.project,
                 hours: args.hours,
@@ -8671,7 +8671,7 @@ fn run_dashboard_command(
     }
 
     run_dashboard(DashboardRunArgs {
-        store_root: args.store_root,
+        aicx_home: args.aicx_home,
         scope: DashboardScope {
             project: args.project,
             hours: args.hours,
@@ -8684,7 +8684,7 @@ fn run_dashboard_command(
 
 /// Build and write an AI context dashboard HTML file.
 fn run_dashboard(args: DashboardRunArgs) -> Result<()> {
-    let root = if let Some(path) = args.store_root {
+    let root = if let Some(path) = args.aicx_home {
         path
     } else {
         aicx::aicx_home::ensure()?
