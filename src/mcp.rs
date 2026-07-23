@@ -26,9 +26,9 @@ use std::{
 use crate::api;
 use crate::auth::{self, AuthConfig};
 use crate::intents::{self, IntentKind, IntentsConfig};
+use crate::legacy_archive;
 use crate::oracle::OracleStatus;
 use crate::rank;
-use crate::store;
 use crate::timeline::{FrameKind, Kind};
 
 use rmcp::transport::streamable_http_server::session::{
@@ -562,7 +562,7 @@ fn default_true() -> bool {
 fn search_project_scopes(
     store_root: &std::path::Path,
     projects: &[String],
-    match_mode: store::ProjectMatchMode,
+    match_mode: legacy_archive::ProjectMatchMode,
 ) -> Result<Vec<Option<String>>, McpError> {
     if projects.is_empty() {
         return Ok(vec![None]);
@@ -571,15 +571,15 @@ fn search_project_scopes(
     Ok(resolution.selected.into_iter().map(Some).collect())
 }
 
-fn parse_project_match(value: Option<&str>) -> Result<store::ProjectMatchMode, McpError> {
+fn parse_project_match(value: Option<&str>) -> Result<legacy_archive::ProjectMatchMode, McpError> {
     match value
         .unwrap_or("exact")
         .trim()
         .to_ascii_lowercase()
         .as_str()
     {
-        "exact" => Ok(store::ProjectMatchMode::Exact),
-        "fuzzy" => Ok(store::ProjectMatchMode::Fuzzy),
+        "exact" => Ok(legacy_archive::ProjectMatchMode::Exact),
+        "fuzzy" => Ok(legacy_archive::ProjectMatchMode::Fuzzy),
         other => Err(McpError::invalid_params(
             format!("unknown project_match {other:?}; expected exact or fuzzy"),
             Some(serde_json::json!({
@@ -592,7 +592,7 @@ fn parse_project_match(value: Option<&str>) -> Result<store::ProjectMatchMode, M
     }
 }
 
-fn project_resolution_mcp_error(error: store::ProjectResolutionError) -> McpError {
+fn project_resolution_mcp_error(error: legacy_archive::ProjectResolutionError) -> McpError {
     let payload = serde_json::json!({
         "ok": false,
         "error": error.kind(),
@@ -605,16 +605,16 @@ fn project_resolution_mcp_error(error: store::ProjectResolutionError) -> McpErro
 fn resolve_mcp_projects(
     store_root: &std::path::Path,
     projects: &[String],
-    match_mode: store::ProjectMatchMode,
+    match_mode: legacy_archive::ProjectMatchMode,
     include_index: bool,
-) -> Result<store::ProjectIdentityResolution, McpError> {
+) -> Result<legacy_archive::ProjectIdentityResolution, McpError> {
     let corpus = if include_index {
-        store::project_identities_for_search_at(store_root)
+        legacy_archive::project_identities_for_search_at(store_root)
     } else {
-        store::project_identities_in_store_at(store_root)
+        legacy_archive::project_identities_in_store_at(store_root)
     }
     .map_err(|error| McpError::internal_error(format!("Store error: {error}"), None))?;
-    store::require_project_resolution(projects, &corpus, match_mode)
+    legacy_archive::require_project_resolution(projects, &corpus, match_mode)
         .map_err(project_resolution_mcp_error)
 }
 
@@ -1148,7 +1148,7 @@ impl AicxMcpServer {
             .clone()
             .filter(|projects| !projects.is_empty())
             .unwrap_or_else(|| project.clone().into_iter().collect());
-        let store_root = store::store_base_dir()
+        let store_root = legacy_archive::store_base_dir()
             .map_err(|e| McpError::internal_error(format!("Store error: {e}"), None))?;
         let project_scopes_owned =
             search_project_scopes(&store_root, &owned_projects, project_match)?;
@@ -1345,7 +1345,7 @@ impl AicxMcpServer {
     ) -> Result<CallToolResult, McpError> {
         let _request_activity = self.idle_memory.begin_request();
         tracing::info!(target: "mcp.audit", tool_name = "aicx_read", "mcp tool invoked");
-        let chunk = store::read_context_chunk(&params.reference, params.max_chars)
+        let chunk = legacy_archive::read_context_chunk(&params.reference, params.max_chars)
             .map_err(|e| McpError::internal_error(format!("Read chunk: {e}"), None))?;
         let json = serde_json::to_string(&chunk)
             .map_err(|e| McpError::internal_error(format!("Serialize chunk JSON: {e}"), None))?;
@@ -1383,7 +1383,7 @@ impl AicxMcpServer {
             std::time::SystemTime::now()
                 - std::time::Duration::from_secs(hours.saturating_mul(3600).min(365 * 24 * 3600))
         };
-        let store_root = store::store_base_dir()
+        let store_root = legacy_archive::store_base_dir()
             .map_err(|e| McpError::internal_error(format!("Store error: {e}"), None))?;
         let resolution = resolve_mcp_projects(
             &store_root,
@@ -1402,7 +1402,7 @@ impl AicxMcpServer {
         let mut files = Vec::new();
         for project in &resolution.selected {
             files.extend(
-                store::context_files_since(cutoff, Some(project))
+                legacy_archive::context_files_since(cutoff, Some(project))
                     .map_err(|e| McpError::internal_error(format!("Store error: {e}"), None))?,
             );
         }
@@ -1548,7 +1548,7 @@ impl AicxMcpServer {
             .filter(|projects| !projects.is_empty())
             .unwrap_or_else(|| params.project.clone().into_iter().collect());
         let project_match = parse_project_match(params.project_match.as_deref())?;
-        let store_root = store::store_base_dir()
+        let store_root = legacy_archive::store_base_dir()
             .map_err(|e| McpError::internal_error(format!("Store error: {e}"), None))?;
         let project_scopes = search_project_scopes(&store_root, &owned_projects, project_match)?;
         let mut metadatas = Vec::new();
@@ -1604,7 +1604,7 @@ impl AicxMcpServer {
         }
         metadatas.truncate(limit);
 
-        let store_root = store::store_base_dir()
+        let store_root = legacy_archive::store_base_dir()
             .map_err(|e| McpError::internal_error(format!("Store error: {e}"), None))?;
         let oracle_status = OracleStatus::metadata_steer(
             &store_root,
@@ -1702,10 +1702,10 @@ impl AicxMcpServer {
             .filter(|projects| !projects.is_empty())
             .unwrap_or_else(|| params.project.clone().into_iter().collect());
         let project_match = parse_project_match(params.project_match.as_deref())?;
-        let store_root = store::store_base_dir()
+        let store_root = legacy_archive::store_base_dir()
             .map_err(|e| McpError::internal_error(format!("Store error: {e}"), None))?;
         let project_resolution = if owned_projects.is_empty() {
-            store::ProjectIdentityResolution {
+            legacy_archive::ProjectIdentityResolution {
                 selected: Vec::new(),
                 candidates: Vec::new(),
                 unresolved_filters: Vec::new(),
@@ -1787,7 +1787,7 @@ impl AicxMcpServer {
     ) -> Result<CallToolResult, McpError> {
         let _request_activity = self.idle_memory.begin_request();
         tracing::info!(target: "mcp.audit", tool_name = "aicx_index_status", "mcp tool invoked");
-        let store_root = store::store_base_dir()
+        let store_root = legacy_archive::store_base_dir()
             .map_err(|e| McpError::internal_error(format!("Store error: {e}"), None))?;
         let status = api::index_status_at(&store_root, params.project.as_deref())
             .map_err(|e| McpError::internal_error(format!("index status: {e}"), None))?;
@@ -2136,7 +2136,7 @@ mod tests {
         let error = resolve_mcp_projects(
             &root,
             &["vista".to_string()],
-            crate::store::ProjectMatchMode::Exact,
+            crate::legacy_archive::ProjectMatchMode::Exact,
             false,
         )
         .expect_err("MCP must reject ambiguous bare project");

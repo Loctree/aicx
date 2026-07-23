@@ -346,7 +346,7 @@ fn test_extraction_source_key_is_case_insensitive() {
 /// Bug #36 regression: prove `aicx index status -p X` and
 /// `aicx index -p X` produce the same bucket set for every canonical
 /// filter shape. Both surfaces must canonicalize through
-/// `aicx::store::resolve_filters_to_slugs` before computing bucket
+/// `aicx::legacy_archive::resolve_filters_to_slugs` before computing bucket
 /// paths, so any `-p X` that `index` would build IS the bucket set
 /// that `index status` reports on (and vice versa).
 #[test]
@@ -397,9 +397,11 @@ fn index_status_routes_through_index_canonical_resolver() {
 
     // World-model fix (F3, P0-4): a bare name with more than one identity
     // FAILS CLOSED with candidates — it must never fan out across orgs.
-    let bare_error =
-        aicx::store::resolve_filters_to_slugs_at(&canonical_root, &["Loctree".to_string()])
-            .expect_err("bare 'Loctree' with two identities must fail closed");
+    let bare_error = aicx::legacy_archive::resolve_filters_to_slugs_at(
+        &canonical_root,
+        &["Loctree".to_string()],
+    )
+    .expect_err("bare 'Loctree' with two identities must fail closed");
     let bare_message = bare_error.to_string();
     assert!(
         bare_message.contains("ambiguous"),
@@ -414,9 +416,11 @@ fn index_status_routes_through_index_canonical_resolver() {
         // Step 1: canonical resolver (the shared chokepoint both
         // `aicx index` and `aicx index status` route through after
         // bug #36 is fixed).
-        let resolved =
-            aicx::store::resolve_filters_to_slugs_at(&canonical_root, &[(*filter).to_string()])
-                .unwrap_or_else(|e| panic!("resolver failed for {filter:?}: {e}"));
+        let resolved = aicx::legacy_archive::resolve_filters_to_slugs_at(
+            &canonical_root,
+            &[(*filter).to_string()],
+        )
+        .unwrap_or_else(|e| panic!("resolver failed for {filter:?}: {e}"));
 
         assert!(
             !resolved.is_empty(),
@@ -549,7 +553,7 @@ fn run_search_rejects_limit_over_hard_cap_before_store_access() {
         no_semantic: true,
         evidence: false,
         deep: false,
-        project_match: store::ProjectMatchMode::Exact,
+        project_match: legacy_archive::ProjectMatchMode::Exact,
     })
     .expect_err("oversized search limit must fail before reading the store");
 
@@ -792,7 +796,7 @@ fn intents_project_resolver_fails_closed_on_ambiguous_bare_slug() {
     let err = resolve_intents_project_filters_at(
         &["Screenscribe".to_string()],
         &root,
-        store::ProjectMatchMode::Exact,
+        legacy_archive::ProjectMatchMode::Exact,
     )
     .expect_err("bare-name collision should force explicit bucket");
     let msg = err.to_string();
@@ -812,13 +816,13 @@ fn intents_project_resolver_exact_and_fuzzy_modes_are_separate() {
     let exact = resolve_intents_project_filters_at(
         &["ScreenScribe".to_string()],
         &root,
-        store::ProjectMatchMode::Exact,
+        legacy_archive::ProjectMatchMode::Exact,
     )
     .expect_err("exact mode must not match a family suffix");
     let fuzzy = resolve_intents_project_filters_at(
         &["ScreenScribe".to_string()],
         &root,
-        store::ProjectMatchMode::Fuzzy,
+        legacy_archive::ProjectMatchMode::Fuzzy,
     )
     .expect("explicit fuzzy mode should match the family");
     let _ = fs::remove_dir_all(&root);
@@ -861,7 +865,7 @@ fn intents_json_envelope_reports_cap_warning_and_limit_saturation() {
     let resolution = resolve_intents_project_filters_at(
         &["two/vista".to_string()],
         &root,
-        store::ProjectMatchMode::Exact,
+        legacy_archive::ProjectMatchMode::Exact,
     )
     .expect("resolve exact fixture");
     assert_eq!(resolution.selected, ["two/vista"]);
@@ -2710,7 +2714,7 @@ fn conversations_batch_writes_synthetic_sessions_without_store_path() {
             .any(|name| name.starts_with("session-two_unsafe-") && name.ends_with(".json")),
         "expected a session-two_unsafe-<hash>.json file, got {entries:?}"
     );
-    assert!(!out_dir.starts_with(aicx::store::store_base_dir().unwrap()));
+    assert!(!out_dir.starts_with(aicx::legacy_archive::store_base_dir().unwrap()));
 
     let _ = fs::remove_dir_all(&root);
 }

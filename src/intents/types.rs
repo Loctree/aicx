@@ -166,7 +166,7 @@ impl IntentExtractionStats {
         let orphaned_buckets = self
             .matched_project_buckets
             .iter()
-            .filter(|project| crate::store::is_ownerless_project_address(project))
+            .filter(|project| crate::legacy_archive::is_ownerless_project_address(project))
             .cloned()
             .collect();
         let mut warnings = Vec::new();

@@ -37,13 +37,13 @@ use aicx::dashboard::{self, DashboardConfig, DashboardScope};
 use aicx::dashboard_server::{self, DashboardCorsPolicy, DashboardServerConfig};
 use aicx::extraction::{self as sources, ExtractionConfig};
 use aicx::intents;
+use aicx::legacy_archive;
 use aicx::mcp::{self, McpHttpConfig, McpTransport};
 use aicx::output::{self, OutputConfig, OutputFormat, OutputMode, ReportMetadata};
 use aicx::rank;
 use aicx::reports_extractor::{self, ReportsExtractorConfig};
 use aicx::sessions;
 use aicx::state::StateManager;
-use aicx::store;
 use aicx::timeline;
 
 fn print_intent_schema_migration_report(report: &intents::MigrationReport) {
@@ -2153,7 +2153,9 @@ fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    let diagnostics_state_dir = aicx::store::store_base_dir().ok().map(|d| d.join("state"));
+    let diagnostics_state_dir = aicx::legacy_archive::store_base_dir()
+        .ok()
+        .map(|d| d.join("state"));
     let _ = aicx::diagnostics::init(cli.verbose, diagnostics_state_dir);
 
     let result = run_command(cli.command, cli.project_fuzzy);
@@ -2163,9 +2165,9 @@ fn main() -> Result<()> {
 
 fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
     let project_match = if project_fuzzy {
-        store::ProjectMatchMode::Fuzzy
+        legacy_archive::ProjectMatchMode::Fuzzy
     } else {
-        store::ProjectMatchMode::Exact
+        legacy_archive::ProjectMatchMode::Exact
     };
     match command {
         Some(Commands::Completions { shell }) => {
@@ -2473,7 +2475,7 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
                         std::process::exit(2);
                     }
                 };
-                let summary = store::ingest_loct_context_pack(input)?;
+                let summary = legacy_archive::ingest_loct_context_pack(input)?;
                 match emit {
                     StdoutEmit::Paths => println!("{}", summary.target_dir.display()),
                     StdoutEmit::Json => println!("{}", serde_json::to_string_pretty(&summary)?),
@@ -2804,17 +2806,21 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
                 if !cards_dry_run {
                     warn_pending_mutation("migrate --cards-v2");
                 }
-                aicx::store::run_cards_v2_migration(cards_dry_run, root)?;
+                aicx::legacy_archive::run_cards_v2_migration(cards_dry_run, root)?;
                 return Ok(());
             }
             if !dry_run {
                 warn_pending_mutation("migrate");
             }
-            let manifest =
-                aicx::store::run_migration_with_paths(dry_run, legacy_root, store_root.clone())?;
+            let manifest = aicx::legacy_archive::run_migration_with_paths(
+                dry_run,
+                legacy_root,
+                store_root.clone(),
+            )?;
             if !no_intent_schema {
                 let intent_report = intents::migrate_intent_schema_dry_run_at(
-                    &PathBuf::from(&manifest.store_root).join(store::CANONICAL_STORE_DIRNAME),
+                    &PathBuf::from(&manifest.store_root)
+                        .join(legacy_archive::CANONICAL_STORE_DIRNAME),
                     None,
                 )?;
                 print_intent_schema_migration_report(&intent_report);
@@ -2830,7 +2836,7 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
             }
             let report = if let Some(store_root) = store_root {
                 intents::migrate_intent_schema_dry_run_at(
-                    &store_root.join(store::CANONICAL_STORE_DIRNAME),
+                    &store_root.join(legacy_archive::CANONICAL_STORE_DIRNAME),
                     project.as_deref(),
                 )?
             } else {
@@ -2884,7 +2890,7 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
             if force || yes {
                 let rt = tokio::runtime::Runtime::new()
                     .context("Failed to start tokio runtime for doctor cleanup")?;
-                let base = aicx::store::store_base_dir()
+                let base = aicx::legacy_archive::store_base_dir()
                     .context("Failed to resolve aicx store base directory")?;
                 let cleanup = rt.block_on(aicx::doctor::run_automated_cleanup_at(
                     &base,
@@ -2910,7 +2916,7 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
             if !legacy_or_readonly && io::stdin().is_terminal() {
                 let rt = tokio::runtime::Runtime::new()
                     .context("Failed to start tokio runtime for doctor interactive cleanup")?;
-                let base = aicx::store::store_base_dir()
+                let base = aicx::legacy_archive::store_base_dir()
                     .context("Failed to resolve aicx store base directory")?;
                 let cleanup = rt.block_on(aicx::doctor::run_interactive_cleanup_at(
                     &base, verbose, smoke,
@@ -4169,27 +4175,27 @@ struct BucketHint {
 
 fn resolve_intents_project_filters(
     projects: &[String],
-    match_mode: store::ProjectMatchMode,
-) -> Result<store::ProjectIdentityResolution> {
-    let store_root = store::store_base_dir()?;
+    match_mode: legacy_archive::ProjectMatchMode,
+) -> Result<legacy_archive::ProjectIdentityResolution> {
+    let store_root = legacy_archive::store_base_dir()?;
     resolve_intents_project_filters_at(projects, &store_root, match_mode)
 }
 
 fn resolve_intents_project_filters_at(
     projects: &[String],
     store_root: &Path,
-    match_mode: store::ProjectMatchMode,
-) -> Result<store::ProjectIdentityResolution> {
+    match_mode: legacy_archive::ProjectMatchMode,
+) -> Result<legacy_archive::ProjectIdentityResolution> {
     if projects.is_empty() {
-        return Ok(store::ProjectIdentityResolution {
+        return Ok(legacy_archive::ProjectIdentityResolution {
             selected: Vec::new(),
             candidates: Vec::new(),
             unresolved_filters: Vec::new(),
             match_mode,
         });
     }
-    let corpus = store::project_identities_in_store_at(store_root)?;
-    Ok(store::require_project_resolution(
+    let corpus = legacy_archive::project_identities_in_store_at(store_root)?;
+    Ok(legacy_archive::require_project_resolution(
         projects, &corpus, match_mode,
     )?)
 }
@@ -4230,7 +4236,7 @@ fn collect_recent_bucket_counts(store_root: &Path, hours: u64) -> Result<BTreeMa
         Utc::now() - chrono::Duration::hours(cutoff_hours)
     };
     let mut counts = BTreeMap::new();
-    for file in store::scan_context_files_at(store_root)? {
+    for file in legacy_archive::scan_context_files_at(store_root)? {
         if file.path.extension().and_then(|ext| ext.to_str()) != Some("md") {
             continue;
         }
@@ -4316,7 +4322,7 @@ fn print_no_intents_message(
         eprintln!("{note}");
     }
 
-    let store_root = store::store_base_dir()?;
+    let store_root = legacy_archive::store_base_dir()?;
     let hints = nearby_bucket_hints(projects, &collect_recent_bucket_counts(&store_root, hours)?);
     if !hints.is_empty() {
         eprintln!("Did you mean a nearby bucket with recent data?");
@@ -4336,7 +4342,7 @@ fn run_intents(
     projects: &[String],
     hours: u64,
     filters: RetrievalFilters,
-    project_match: store::ProjectMatchMode,
+    project_match: legacy_archive::ProjectMatchMode,
     display: IntentsDisplayOptions<'_>,
 ) -> Result<()> {
     let IntentsDisplayOptions {
@@ -4446,7 +4452,7 @@ fn run_intents(
 
     match emit {
         "json" => {
-            let store_root = store::store_base_dir()?;
+            let store_root = legacy_archive::store_base_dir()?;
             let oracle_status = aicx::oracle::OracleStatus::canonical_corpus_scan(
                 &store_root,
                 extraction.stats.scanned_count,
@@ -4812,7 +4818,7 @@ fn run_tail(
     follow: bool,
     kind: Option<&str>,
     mut filters: RetrievalFilters,
-    project_match: store::ProjectMatchMode,
+    project_match: legacy_archive::ProjectMatchMode,
 ) -> Result<()> {
     if !follow {
         // One-shot mode: default to 20 when no explicit --limit was passed
@@ -4998,7 +5004,7 @@ fn safe_session_extract_stem(session_id: &str) -> String {
 }
 
 fn default_session_extract_path_for_stem(agent_label: &str, stem: &str) -> Result<PathBuf> {
-    let base = aicx::store::store_base_dir()?;
+    let base = aicx::legacy_archive::store_base_dir()?;
     Ok(base
         .join("extracts")
         .join(agent_label)
@@ -5974,7 +5980,7 @@ fn warn_pending_mutation(cmd: &str) {
 }
 
 fn mutation_warn_root_display() -> String {
-    aicx::store::resolve_aicx_home()
+    aicx::legacy_archive::resolve_aicx_home()
         .map(|path| path.display().to_string())
         .unwrap_or_else(|err| format!("<unresolved AICX_HOME: {err:#}>"))
 }
@@ -6887,7 +6893,7 @@ fn parse_date_filter(s: &str) -> Result<(Option<String>, Option<String>)> {
 }
 
 fn run_catalog_rebuild(json: bool) -> Result<()> {
-    let aicx_home = store::resolve_aicx_home()?;
+    let aicx_home = legacy_archive::resolve_aicx_home()?;
     let user_home = aicx::os_user_home().context("No home dir")?;
     let report = aicx::catalog::rebuild(&aicx_home, &user_home)?;
     if json {
@@ -6916,7 +6922,7 @@ fn run_catalog_rebuild(json: bool) -> Result<()> {
 }
 
 fn run_catalog_resolve(session: &str, json: bool) -> Result<()> {
-    let aicx_home = store::resolve_aicx_home()?;
+    let aicx_home = legacy_archive::resolve_aicx_home()?;
     match aicx::catalog::resolve_session(&aicx_home, session)? {
         Some(entry) => {
             if json {
@@ -6952,7 +6958,7 @@ fn project_scopes(projects: &[String]) -> Vec<Option<&str>> {
 /// Canonical project resolver shared by `aicx index` and `aicx index
 /// status`. Routes raw user `-p` filters through
 /// `resolve_project_filters_or_error` (and ultimately
-/// `aicx::store::project_filter_matches`) so both commands canonicalize
+/// `aicx::legacy_archive::project_filter_matches`) so both commands canonicalize
 /// the same filter the same way and therefore agree on the resulting
 /// bucket set. Without this single chokepoint, `aicx index status -p X`
 /// could compute a bucket like `_codescribe` that `aicx index -p X`
@@ -6962,7 +6968,7 @@ fn project_scopes(projects: &[String]) -> Vec<Option<&str>> {
 /// canonical `<owner>/<repo>` slug exactly as `index` builds buckets for.
 fn resolve_index_scopes(projects: &[String]) -> Result<Vec<Option<String>>> {
     let resolved =
-        resolve_project_filters_or_error(projects, store::ProjectMatchMode::Exact, true)?;
+        resolve_project_filters_or_error(projects, legacy_archive::ProjectMatchMode::Exact, true)?;
     Ok(if resolved.selected.is_empty() {
         vec![None]
     } else {
@@ -6977,30 +6983,30 @@ fn resolve_index_scopes(projects: &[String]) -> Result<Vec<Option<String>>> {
 /// resolve to `_all` after a typo.
 fn resolve_project_filters_or_error(
     projects: &[String],
-    match_mode: store::ProjectMatchMode,
+    match_mode: legacy_archive::ProjectMatchMode,
     include_index: bool,
-) -> Result<store::ProjectIdentityResolution> {
+) -> Result<legacy_archive::ProjectIdentityResolution> {
     if projects.is_empty() {
-        return Ok(store::ProjectIdentityResolution {
+        return Ok(legacy_archive::ProjectIdentityResolution {
             selected: Vec::new(),
             candidates: Vec::new(),
             unresolved_filters: Vec::new(),
             match_mode,
         });
     }
-    let store_root = store::store_base_dir()?;
+    let store_root = legacy_archive::store_base_dir()?;
     // Search doctrine: never stream retired multi-GB embeddings.ndjson for
     // `-p` resolution. Exact `owner/repo` forms pass through; bare names use
     // shallow store dirs + indexed bucket names + durable catalog.
     let corpus = if include_index {
-        store::project_identities_for_search_at(&store_root)?
+        legacy_archive::project_identities_for_search_at(&store_root)?
     } else {
-        store::project_identities_in_store_at(&store_root)?
+        legacy_archive::project_identities_in_store_at(&store_root)?
     };
     // Accept already-canonical owner/repo filters even when the local store
     // layout is empty (operator trashed cards): project is metadata on the
     // hybrid generation, not a directory precondition.
-    let mut resolution = store::resolve_project_identities(projects, &corpus, match_mode)?;
+    let mut resolution = legacy_archive::resolve_project_identities(projects, &corpus, match_mode)?;
     let mut still_unresolved = Vec::new();
     for filter in resolution.unresolved_filters.drain(..) {
         let trimmed = filter.trim();
@@ -7009,7 +7015,7 @@ fn resolve_project_filters_or_error(
             && !repo.is_empty()
             && !owner.ends_with('/')
             && !repo.contains('/')
-            && match_mode == store::ProjectMatchMode::Exact
+            && match_mode == legacy_archive::ProjectMatchMode::Exact
         {
             resolution.selected.push(trimmed.to_string());
             continue;
@@ -7018,7 +7024,7 @@ fn resolve_project_filters_or_error(
     }
     resolution.unresolved_filters = still_unresolved;
     if !projects.is_empty() && !resolution.unresolved_filters.is_empty() {
-        return Err(store::ProjectResolutionError::NoMatch {
+        return Err(legacy_archive::ProjectResolutionError::NoMatch {
             filters: resolution.unresolved_filters,
         }
         .into());
@@ -7051,7 +7057,7 @@ struct SearchRunArgs<'a> {
     no_semantic: bool,
     evidence: bool,
     deep: bool,
-    project_match: store::ProjectMatchMode,
+    project_match: legacy_archive::ProjectMatchMode,
 }
 
 fn validate_cli_search_limit(limit: usize) -> Result<()> {
@@ -7090,7 +7096,7 @@ fn run_eval_search_quality(args: SearchQualityEvalArgs) -> Result<()> {
     }
 
     let bin = aicx_bin.unwrap_or(std::env::current_exe()?);
-    let store_root = store::store_base_dir()?;
+    let store_root = legacy_archive::store_base_dir()?;
     let project_filters = aicx::search_eval::discover_projects_for_cases(&store_root, &selected)?;
     let mut evaluations = Vec::new();
 
@@ -7209,7 +7215,7 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
         query.to_string()
     };
 
-    let root = store::store_base_dir()?;
+    let root = legacy_archive::store_base_dir()?;
 
     // Build the canonical filter pushdown for the retrieval primitive.
     // The explicit date filter wins over `--hours`, matching legacy
@@ -7623,7 +7629,7 @@ fn run_index(
 ) -> Result<()> {
     let resolved_scopes = resolve_index_scopes(projects)?;
     let filters: Vec<String> = resolved_scopes.into_iter().flatten().collect();
-    let aicx_home = store::resolve_aicx_home()?;
+    let aicx_home = legacy_archive::resolve_aicx_home()?;
     let _lock = if dry_run {
         None
     } else {
@@ -7966,7 +7972,7 @@ fn run_warmup(json: bool) -> Result<()> {
 
 /// Read one canonical chunk and print metadata plus content.
 fn run_read(reference: &str, max_chars: Option<usize>, json: bool) -> Result<()> {
-    let chunk = store::read_context_chunk(reference, max_chars)?;
+    let chunk = legacy_archive::read_context_chunk(reference, max_chars)?;
 
     if json {
         println!("{}", serde_json::to_string(&chunk)?);
@@ -8006,7 +8012,7 @@ struct SteerRunArgs<'a> {
     date: Option<&'a str>,
     json: bool,
     filters: RetrievalFilters,
-    project_match: store::ProjectMatchMode,
+    project_match: legacy_archive::ProjectMatchMode,
 }
 
 fn run_steer(args: SteerRunArgs<'_>) -> Result<()> {
@@ -8076,7 +8082,7 @@ fn run_steer(args: SteerRunArgs<'_>) -> Result<()> {
     let mut out = io::BufWriter::new(stdout.lock());
     let color = stdout.is_terminal();
     let matched = metadatas.len();
-    let store_root = store::store_base_dir()?;
+    let store_root = legacy_archive::store_base_dir()?;
     let oracle_status = aicx::oracle::OracleStatus::metadata_steer(
         &store_root,
         matched,
@@ -8177,14 +8183,14 @@ fn run_refs(
     project: Option<String>,
     emit: RefsEmit,
     strict: bool,
-    project_match: store::ProjectMatchMode,
+    project_match: legacy_archive::ProjectMatchMode,
 ) -> Result<()> {
     let cutoff = refs_cutoff(hours);
     let projects = project.into_iter().collect::<Vec<_>>();
     let resolution = resolve_project_filters_or_error(&projects, project_match, false)?;
     let mut files = Vec::new();
     for scope in project_scopes(&resolution.selected) {
-        files.extend(store::context_files_since(cutoff, scope)?);
+        files.extend(legacy_archive::context_files_since(cutoff, scope)?);
     }
     files.sort_by(|left, right| left.path.cmp(&right.path));
     files.dedup_by(|left, right| left.path == right.path);
@@ -8239,7 +8245,7 @@ struct RefsProjectSummary {
     agents: BTreeMap<String, RefsAgentSummary>,
 }
 
-fn print_refs_summary(files: &[store::StoredContextFile]) -> Result<()> {
+fn print_refs_summary(files: &[legacy_archive::StoredContextFile]) -> Result<()> {
     let mut by_project: BTreeMap<String, RefsProjectSummary> = BTreeMap::new();
 
     for path in files {
@@ -8329,7 +8335,7 @@ fn run_state(
     reset: bool,
     project: Option<String>,
     info: bool,
-    project_match: store::ProjectMatchMode,
+    project_match: legacy_archive::ProjectMatchMode,
 ) -> Result<()> {
     let _state_guard = aicx::locks::acquire_exclusive(aicx::locks::state_lock_path()?)?;
     let mut state = StateManager::load()?;
@@ -8337,14 +8343,14 @@ fn run_state(
     let project_filters = project.into_iter().collect::<Vec<_>>();
     let corpus = state.seen_hashes.keys().cloned().collect::<Vec<_>>();
     let project_resolution = if project_filters.is_empty() {
-        store::ProjectIdentityResolution {
+        legacy_archive::ProjectIdentityResolution {
             selected: Vec::new(),
             candidates: Vec::new(),
             unresolved_filters: Vec::new(),
             match_mode: project_match,
         }
     } else {
-        store::require_project_resolution(&project_filters, &corpus, project_match)?
+        legacy_archive::require_project_resolution(&project_filters, &corpus, project_match)?
     };
 
     if info {
@@ -8431,7 +8437,7 @@ fn run_dashboard_server(args: DashboardServerRunArgs) -> Result<()> {
     let root = if let Some(path) = args.store_root {
         path
     } else {
-        store::store_base_dir()?
+        legacy_archive::store_base_dir()?
     };
     let host: std::net::IpAddr = args.host.parse().with_context(|| {
         format!(
@@ -8595,12 +8601,12 @@ struct DashboardRunArgs {
 }
 
 fn default_dashboard_output_path() -> Result<PathBuf> {
-    Ok(store::store_base_dir()?.join("aicx-dashboard.html"))
+    Ok(legacy_archive::store_base_dir()?.join("aicx-dashboard.html"))
 }
 
 fn run_dashboard_command(
     mut args: DashboardArgs,
-    project_match: store::ProjectMatchMode,
+    project_match: legacy_archive::ProjectMatchMode,
 ) -> Result<()> {
     if args.serve && args.generate_html {
         return Err(anyhow::anyhow!(
@@ -8613,10 +8619,11 @@ fn run_dashboard_command(
             .store_root
             .clone()
             .map(Ok)
-            .unwrap_or_else(store::store_base_dir)?;
-        let corpus = store::project_identities_in_store_at(&root)?;
+            .unwrap_or_else(legacy_archive::store_base_dir)?;
+        let corpus = legacy_archive::project_identities_in_store_at(&root)?;
         let filters = vec![filter.clone()];
-        let resolution = store::require_project_resolution(&filters, &corpus, project_match)?;
+        let resolution =
+            legacy_archive::require_project_resolution(&filters, &corpus, project_match)?;
         if resolution.selected.len() != 1 {
             anyhow::bail!(
                 "dashboard project scope must resolve to one project; candidates:\n  - {}",
@@ -8686,7 +8693,7 @@ fn run_dashboard(args: DashboardRunArgs) -> Result<()> {
     let root = if let Some(path) = args.store_root {
         path
     } else {
-        store::store_base_dir()?
+        legacy_archive::store_base_dir()?
     };
 
     let config = DashboardConfig {
@@ -8750,7 +8757,7 @@ struct ReportsExtractorRunArgs {
 }
 
 fn default_reports_output_path() -> Result<PathBuf> {
-    Ok(store::store_base_dir()?.join("aicx-reports.html"))
+    Ok(legacy_archive::store_base_dir()?.join("aicx-reports.html"))
 }
 
 fn run_reports_command(args: ReportsArgs) -> Result<()> {

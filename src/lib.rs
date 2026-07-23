@@ -112,8 +112,6 @@ pub mod state;
 pub mod steer_index;
 #[cfg(feature = "app")]
 mod steer_index_contract;
-#[doc(hidden)]
-pub use legacy_archive as store;
 #[cfg(feature = "app")]
 pub mod validation;
 #[cfg(not(feature = "app"))]
@@ -165,9 +163,9 @@ pub mod prelude {
     #[cfg(feature = "app")]
     pub use crate::doctor::{DoctorOptions, DoctorReport};
     pub use crate::intents::{IntentExtraction, IntentRecord, IntentsConfig};
+    pub use crate::legacy_archive::{ChunkRefSpec, ReadContextChunk, StoredContextFile};
     #[cfg(feature = "app")]
     pub use crate::rank::FuzzyResult;
-    pub use crate::store::{ChunkRefSpec, ReadContextChunk, StoredContextFile};
     pub use crate::timeline::TimelineEntry;
 }
 
@@ -180,8 +178,8 @@ mod loctree_consumer_contract_tests {
         fn assert_send_sync<T: Send + Sync>() {}
 
         assert_send_sync::<Aicx>();
-        assert_send_sync::<store::StoredContextFile>();
-        assert_send_sync::<store::ReadContextChunk>();
+        assert_send_sync::<legacy_archive::StoredContextFile>();
+        assert_send_sync::<legacy_archive::ReadContextChunk>();
         assert_send_sync::<sessions::SessionInfo>();
         assert_send_sync::<intents::IntentExtraction>();
 
@@ -196,8 +194,12 @@ mod loctree_consumer_contract_tests {
         assert!(client.list_chunks().expect("list chunks").is_empty());
         assert!(client.read_chunk("chunk:abcdef12", Some(16)).is_err());
 
-        let parsed = store::ChunkRefSpec::parse("chunk:abcdef12").expect("typed chunk ref");
-        assert_eq!(parsed, store::ChunkRefSpec::Id("abcdef12".to_string()));
+        let parsed =
+            legacy_archive::ChunkRefSpec::parse("chunk:abcdef12").expect("typed chunk ref");
+        assert_eq!(
+            parsed,
+            legacy_archive::ChunkRefSpec::Id("abcdef12".to_string())
+        );
 
         let config = intents::IntentsConfig {
             project: String::new(),
