@@ -10,15 +10,16 @@
 //! for most warning classes (sidecars, index consistency, empty bodies),
 //! addressing only the corrupted-steer-index case. The narrower name
 //! matches the actual contract; other remediations live behind their
-//! dedicated flags (`--prune-empty-bodies`, `--fix-buckets`,
-//! `aicx store --full-rescan`).
+//! dedicated flags (`--prune-empty-bodies`, `--fix-buckets`) or the
+//! extract-era rebuild path (`aicx catalog rebuild && aicx index --cache-extracts`).
 //!
 //! With `--fix-buckets`, suspicious top-level store buckets are moved to
 //! timestamped quarantine. With `--prune-empty-bodies --apply`, empty-body
 //! chunks and their sidecars are moved to a recoverable empty-body quarantine.
 //!
-//! The canonical store (`~/.aicx/store/`) is treated as ground truth: doctor
-//! never deletes store contents. Bucket quarantine is a rename into
+//! Legacy card mill paths under `~/.aicx/store/` may still be inspected by
+//! doctor for migration hygiene, but the live corpus is catalog + sources +
+//! optional extracts. Bucket quarantine is a rename into
 //! `~/.aicx/quarantine/<timestamp>/`, preserving the original payload.
 //!
 //! Vibecrafted with AI Agents by Vetcoders (c)2026 Vetcoders

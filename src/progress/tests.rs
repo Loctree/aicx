@@ -97,18 +97,24 @@ fn recovery_hint_for_known_phases() {
     );
     assert_eq!(
         recovery_hint_for("extract"),
-        Some("aicx store --full-rescan")
+        Some("aicx catalog rebuild && aicx index --cache-extracts")
     );
-    assert_eq!(recovery_hint_for("dedup"), Some("aicx store --full-rescan"));
+    assert_eq!(
+        recovery_hint_for("dedup"),
+        Some("aicx catalog rebuild && aicx index --cache-extracts")
+    );
     assert_eq!(
         recovery_hint_for("self_echo"),
-        Some("aicx store --full-rescan")
+        Some("aicx catalog rebuild && aicx index --cache-extracts")
     );
     assert_eq!(
         recovery_hint_for("segment"),
-        Some("aicx store --full-rescan")
+        Some("aicx catalog rebuild && aicx index --cache-extracts")
     );
-    assert_eq!(recovery_hint_for("chunk"), Some("aicx store --full-rescan"));
+    assert_eq!(
+        recovery_hint_for("chunk"),
+        Some("aicx catalog rebuild && aicx index --cache-extracts")
+    );
     assert_eq!(recovery_hint_for("unknown"), None);
 }
 

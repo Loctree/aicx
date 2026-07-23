@@ -314,8 +314,8 @@ fn render_help(frame: &mut Frame, area: Rect) {
         Line::from(
             "doctor: r refresh, f runs aicx doctor --rebuild-steer-index, b shows Plan B deferral",
         ),
-        Line::from("store: t changes range, s runs aicx store -H <range> --emit none"),
-        Line::from("store: Ctrl+C sends kill to the running subprocess"),
+        Line::from("store: s runs aicx catalog rebuild && aicx index --cache-extracts"),
+        Line::from("store: Ctrl+C cancels a long rebuild when supported"),
         Line::from("q quits when no long operation is in flight"),
     ];
     frame.render_widget(Paragraph::new(text).block(block("Help")), area);

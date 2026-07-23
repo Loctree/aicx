@@ -438,7 +438,7 @@ pub fn render_rebuild_sidecars_script(base: &Path) -> Result<String> {
     let files = store::scan_context_files_at(base).unwrap_or_default();
     let mut out = String::from("#!/usr/bin/env bash\nset -euo pipefail\n\n");
     out.push_str(
-        "# Review before running. Rebuilds missing sidecars by forcing a corpus rescan.\n",
+        "# Review before running. Card-mill sidecars are retired; rebuild identity + index.\n",
     );
     let missing = files
         .iter()
@@ -450,9 +450,11 @@ pub fn render_rebuild_sidecars_script(base: &Path) -> Result<String> {
         out.push_str("# No missing sidecars detected.\n");
     } else {
         for path in missing {
-            out.push_str(&format!("# missing: {path}\n"));
+            out.push_str(&format!("# missing (legacy card path): {path}\n"));
         }
-        out.push_str("aicx store --full-rescan\n");
+        // `aicx store` is deleted — recovery is catalog + source index.
+        out.push_str("aicx catalog rebuild\n");
+        out.push_str("aicx index --cache-extracts\n");
     }
     Ok(out)
 }
