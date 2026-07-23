@@ -96,7 +96,7 @@ fn recovery_hint_for_known_phases() {
         Some("aicx doctor --rebuild-steer-index")
     );
     assert_eq!(
-        recovery_hint_for("extract"),
+        recovery_hint_for("source_scan"),
         Some("aicx catalog rebuild && aicx index --cache-extracts")
     );
     assert_eq!(
@@ -112,7 +112,7 @@ fn recovery_hint_for_known_phases() {
         Some("aicx catalog rebuild && aicx index --cache-extracts")
     );
     assert_eq!(
-        recovery_hint_for("chunk"),
+        recovery_hint_for("render"),
         Some("aicx catalog rebuild && aicx index --cache-extracts")
     );
     assert_eq!(recovery_hint_for("unknown"), None);
@@ -120,7 +120,7 @@ fn recovery_hint_for_known_phases() {
 
 #[test]
 fn phase_label_and_detail_cover_pre_write_phases() {
-    for phase in ["extract", "dedup", "self_echo", "segment", "chunk"] {
+    for phase in ["source_scan", "dedup", "self_echo", "segment", "render"] {
         assert_ne!(phase_label(phase), "working", "label for {phase}");
         assert_ne!(
             phase_detail(phase),
@@ -131,7 +131,7 @@ fn phase_label_and_detail_cover_pre_write_phases() {
 }
 
 // NOTE: Heartbeat behavior tests (periodic ticks + floor pinning) live in
-// `tests/store_progress_markers.rs`. Keeping them out of the lib test
+// `tests/pipeline_progress_markers.rs`. Keeping them out of the lib test
 // binary avoids widening parallel-test scheduling windows around the
 // pre-existing shared `diagnostics::STATE` race exercised by extraction
 // tests and `diagnostics::tests::*`. The integration binary runs in a separate
@@ -139,7 +139,7 @@ fn phase_label_and_detail_cover_pre_write_phases() {
 #[test]
 fn heartbeat_stop_joins_thread_without_panic() {
     let reporter: Arc<dyn Reporter> = Arc::new(NoopReporter);
-    let phase = Phase::start(reporter, "extract", Some(1));
+    let phase = Phase::start(reporter, "source_scan", Some(1));
     let hb = Heartbeat::spawn(phase.clone(), Duration::from_millis(60_000));
     hb.stop();
     phase.finish_ok("done");
@@ -183,7 +183,7 @@ fn structured_reporter_does_not_panic_under_concurrent_use() {
 #[test]
 fn terminal_status_lines_are_fixed_three_line_surface() {
     let phase = Phase {
-        name: "chunk",
+        name: "render",
         started_at: Instant::now(),
         total: Some(100),
         reporter: Arc::new(NoopReporter),
@@ -192,17 +192,17 @@ fn terminal_status_lines_are_fixed_three_line_surface() {
     let lines = terminal_status_lines(&phase, 25, 0);
 
     assert_eq!(lines.len(), 3);
-    assert!(lines[0].contains("chunking canonical corpus"));
+    assert!(lines[0].contains("rendering requested reports"));
     assert!(lines[1].contains("25/100"));
     assert!(lines[1].contains("25%"));
-    assert!(lines[2].contains("writing canonical markdown chunks"));
+    assert!(lines[2].contains("writing explicit report outputs"));
 }
 
 #[test]
 fn structured_reporter_throttles_dense_ticks_but_keeps_percent_buckets() {
     let reporter = StructuredReporter::new();
     let phase = Phase {
-        name: "chunk",
+        name: "render",
         started_at: Instant::now(),
         total: Some(100),
         reporter: Arc::new(NoopReporter),
@@ -220,7 +220,7 @@ fn select_reporter_returns_structured_when_forced() {
     // We don't test TTY detection (depends on host); we test the
     // "structured" forcing path which is deterministic.
     let r = select_reporter(true);
-    let phase = Phase::start(r, "extract", None);
+    let phase = Phase::start(r, "source_scan", None);
     phase.finish_ok("0 entries");
 }
 

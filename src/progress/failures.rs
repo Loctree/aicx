@@ -70,11 +70,11 @@ fn impact_for(phase: &str) -> &'static str {
     match phase {
         "steer_sync" => "search/steer return STALE data until index is rebuilt",
         "bm25_sync" => "BM25 candidate set incomplete; semantic fallback still serves results",
-        "extract" => "no entries collected for this run; store left at previous watermark",
+        "source_scan" => "no entries collected; source snapshot left at the previous watermark",
         "dedup" => "dedup pass aborted before completion; rerun with --full-rescan to re-evaluate",
         "self_echo" => "self-echo filter aborted; rerun --full-rescan to retry cleanup",
         "segment" => "segmentation aborted; no semantic segments produced this run",
-        "chunk" => "canonical corpus not updated; downstream indexes unchanged",
+        "render" => "requested reports were not rendered; downstream artifacts are unchanged",
         _ => "downstream readers may see stale or partial data",
     }
 }

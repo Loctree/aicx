@@ -6268,8 +6268,8 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
     // Heartbeat uses exponential backoff (2s → 60s cap) so long
     // single-agent extracts emit a handful of ticks, not hundreds.
     // ──────────────────────────────────────────────────────────────────
-    let extract_phase =
-        aicx::progress::Phase::start(reporter.clone(), "extract", Some(agents.len() as u64));
+    let source_scan_phase =
+        aicx::progress::Phase::start(reporter.clone(), "source_scan", Some(agents.len() as u64));
     let mut entries = Vec::new();
     let mut selected_sessions = 0usize;
     let mut ingested_sessions = 0usize;
@@ -6277,7 +6277,7 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
     let mut agents_done: u64 = 0;
     for &agent in agents {
         let hb = aicx::progress::Heartbeat::spawn_with_backoff(
-            extract_phase.clone(),
+            source_scan_phase.clone(),
             std::time::Duration::from_secs(2),
             std::time::Duration::from_secs(60),
         );
@@ -6307,8 +6307,8 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
         let agent_batch = match agent_entries_result {
             Ok(batch) => batch,
             Err(e) => {
-                let record =
-                    extract_phase.finish_err(&e, aicx::progress::recovery_hint_for("extract"));
+                let record = source_scan_phase
+                    .finish_err(&e, aicx::progress::recovery_hint_for("source_scan"));
                 failures.record(record);
                 let _ = aicx::progress::render_failure_tail(&failures);
                 return Err(e);
@@ -6322,19 +6322,19 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
         eprintln!("  [{}] {} entries", agent, agent_entries.len());
         entries.extend(agent_entries);
         agents_done += 1;
-        extract_phase.tick(agents_done);
+        source_scan_phase.tick(agents_done);
     }
     if selected_sessions > 0 && ingested_sessions == 0 && skipped_sessions == selected_sessions {
         let error = anyhow::anyhow!(
             "all {selected_sessions} selected session(s) were skipped; no invalid session was ingested"
         );
-        let record =
-            extract_phase.finish_err(&error, Some("inspect the per-session recover hints above"));
+        let record = source_scan_phase
+            .finish_err(&error, Some("inspect the per-session recover hints above"));
         failures.record(record);
         let _ = aicx::progress::render_failure_tail(&failures);
         std::process::exit(3);
     }
-    extract_phase.finish_ok(format!(
+    source_scan_phase.finish_ok(format!(
         "{} agents → {} entries; ingested={} skipped={}",
         agents.len(),
         entries.len(),

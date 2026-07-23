@@ -4,10 +4,8 @@
 
 //! Integration coverage for the structured `[aicx][phase=...]` markers
 //! emitted by `aicx::progress` when the pipeline is asked to behave
-//! non-interactively. The chunk + steer + bm25 surface is the contract
-//! the wizard TUI and downstream parsers rely on; this test guards it
-//! without spinning the full `aicx store` pipeline (which would touch
-//! `~/.aicx/store/` and is excluded from this pass).
+//! non-interactively. The source-scan, render, steer, and bm25 surface is the
+//! contract the wizard TUI and downstream parsers rely on.
 //!
 //! Vibecrafted with AI Agents by Vetcoders (c)2024-2026 Vetcoders
 
@@ -85,11 +83,11 @@ impl Reporter for CapturingReporter {
 }
 
 #[test]
-fn store_pipeline_emits_chunk_steer_bm25_phase_markers_in_order() {
+fn rebuild_pipeline_emits_render_steer_bm25_phase_markers_in_order() {
     let reporter = Arc::new(CapturingReporter::default());
-    let chunk = Phase::start(reporter.clone(), "chunk", Some(120));
-    chunk.tick(60);
-    chunk.finish_ok("12 chunks");
+    let render = Phase::start(reporter.clone(), "render", Some(120));
+    render.tick(60);
+    render.finish_ok("12 chunks");
 
     let steer = Phase::start(reporter.clone(), "steer_sync", Some(12));
     steer.tick(12);
@@ -102,9 +100,9 @@ fn store_pipeline_emits_chunk_steer_bm25_phase_markers_in_order() {
     assert_eq!(
         events,
         vec![
-            "start:chunk".to_string(),
-            "tick:chunk:60".to_string(),
-            "finish:chunk:ok".to_string(),
+            "start:render".to_string(),
+            "tick:render:60".to_string(),
+            "finish:render:ok".to_string(),
             "start:steer_sync".to_string(),
             "tick:steer_sync:12".to_string(),
             "finish:steer_sync:ok".to_string(),
@@ -134,14 +132,14 @@ fn structured_reporter_does_not_panic_when_used_concurrently() {
 #[test]
 fn select_reporter_returns_structured_when_forced() {
     let r = select_reporter(true);
-    let phase = Phase::start(r, "chunk", None);
+    let phase = Phase::start(r, "render", None);
     phase.finish_ok("0 chunks");
 }
 
 #[test]
 fn noop_reporter_handles_full_phase_lifecycle() {
     let r: Arc<dyn Reporter> = Arc::new(NoopReporter);
-    let phase = Phase::start(r, "extract", None);
+    let phase = Phase::start(r, "source_scan", None);
     phase.tick(0);
     phase.finish_ok("");
 }
@@ -160,19 +158,19 @@ fn lance_diagnostic_filter_requires_targeted_trace() {
 }
 
 #[test]
-fn full_store_pipeline_emits_pre_write_phase_markers_before_any_chunk_tick() {
-    // The `aicx store --full-rescan -H 0` operator regression: nothing
-    // was visible for 15-20 minutes while extract/dedup/self_echo/segment
+fn full_rebuild_pipeline_emits_pre_write_phase_markers_before_any_render_tick() {
+    // The historical full-rescan regression: nothing was visible for
+    // 15-20 minutes while source_scan/dedup/self_echo/segment
     // ran silently. Lock that fix in with a reporter capture that
     // checks (1) every pre-write phase emits start+finish, (2) every
-    // pre-write phase finishes BEFORE the first `chunk` tick, and
-    // (3) the chunk phase denominator matches segment count (not entries).
+    // pre-write phase finishes BEFORE the first `render` tick, and
+    // (3) the render phase denominator matches segment count (not entries).
     let reporter = Arc::new(CapturingReporter::default());
 
-    let extract = Phase::start(reporter.clone(), "extract", Some(2));
-    extract.tick(1);
-    extract.tick(2);
-    extract.finish_ok("2 agents → 12345 entries");
+    let source_scan = Phase::start(reporter.clone(), "source_scan", Some(2));
+    source_scan.tick(1);
+    source_scan.tick(2);
+    source_scan.finish_ok("2 agents → 12345 entries");
 
     let dedup = Phase::start(reporter.clone(), "dedup", Some(12345));
     dedup.tick(500);
@@ -193,74 +191,74 @@ fn full_store_pipeline_emits_pre_write_phase_markers_before_any_chunk_tick() {
     segment.tick(1);
     segment.finish_ok("10800 entries → 420 segments");
 
-    let chunk = Phase::start(reporter.clone(), "chunk", Some(420));
-    chunk.tick(60);
-    chunk.tick(420);
-    chunk.finish_ok("420 chunks");
+    let render = Phase::start(reporter.clone(), "render", Some(420));
+    render.tick(60);
+    render.tick(420);
+    render.finish_ok("420 chunks");
 
     let events = reporter.events.lock().unwrap().clone();
 
-    // Order check — every pre-write phase finishes before the chunk
+    // Order check — every pre-write phase finishes before the render
     // phase starts emitting ticks.
-    let first_chunk_tick = events
+    let first_render_tick = events
         .iter()
-        .position(|e| e.starts_with("tick:chunk:"))
-        .expect("chunk phase must tick at least once");
+        .position(|e| e.starts_with("tick:render:"))
+        .expect("render phase must tick at least once");
     let last_segment_finish = events
         .iter()
         .rposition(|e| e == "finish:segment:ok")
         .expect("segment phase must finish");
     assert!(
-        last_segment_finish < first_chunk_tick,
-        "segment phase finished AFTER first chunk tick; pre-write progress regression"
+        last_segment_finish < first_render_tick,
+        "segment phase finished AFTER first render tick; pre-write progress regression"
     );
 
     // Every pre-write phase emits at least one tick so the operator
     // sees activity before any .md is written.
-    for phase in ["extract", "dedup", "self_echo", "segment"] {
+    for phase in ["source_scan", "dedup", "self_echo", "segment"] {
         assert!(
             reporter.tick_count(phase) >= 1,
             "phase {phase} emitted no ticks — operator would see 0/N stall"
         );
     }
 
-    // The chunk denominator path is asserted through the ordering of
-    // ticks (`tick:chunk:60` lands before `tick:chunk:420`), proving
-    // the chunk total reflects segments (420) rather than entries
+    // The render denominator path is asserted through the ordering of
+    // ticks (`tick:render:60` lands before `tick:render:420`), proving
+    // the render total reflects segments (420) rather than entries
     // (10800) — otherwise the final tick value would saturate at
     // 10800, not 420.
-    let last_chunk_tick = events
+    let last_render_tick = events
         .iter()
-        .filter_map(|e| e.strip_prefix("tick:chunk:"))
+        .filter_map(|e| e.strip_prefix("tick:render:"))
         .filter_map(|n| n.parse::<u64>().ok())
         .max()
         .unwrap_or(0);
     assert_eq!(
-        last_chunk_tick, 420,
-        "chunk phase final tick should saturate at segment count, not entry count"
+        last_render_tick, 420,
+        "render phase final tick should saturate at segment count, not entry count"
     );
 }
 
 #[test]
-fn heartbeat_keeps_extract_phase_alive_during_opaque_subcall() {
+fn heartbeat_keeps_source_scan_phase_alive_during_opaque_subcall() {
     // Operator regression: during `extract_claude` the only visible
     // event was the per-agent eprintln after the call returned. With a
-    // heartbeat we expect periodic `tick:extract:*` lines while the
+    // heartbeat we expect periodic `tick:source_scan:*` lines while the
     // (simulated) opaque sub-call runs.
     let reporter = Arc::new(CapturingReporter::default());
-    let extract = Phase::start(reporter.clone(), "extract", Some(1));
+    let source_scan = Phase::start(reporter.clone(), "source_scan", Some(1));
     {
-        let _hb = Heartbeat::spawn(extract.clone(), Duration::from_millis(200));
-        // Simulate a slow opaque extract.
+        let _hb = Heartbeat::spawn(source_scan.clone(), Duration::from_millis(200));
+        // Simulate a slow opaque source_scan.
         std::thread::sleep(Duration::from_millis(700));
     }
-    extract.tick(1);
-    extract.finish_ok("simulated");
+    source_scan.tick(1);
+    source_scan.finish_ok("simulated");
 
     assert!(
-        reporter.tick_count("extract") >= 2,
-        "expected heartbeat to keep the extract phase alive (>=2 ticks), got {}",
-        reporter.tick_count("extract")
+        reporter.tick_count("source_scan") >= 2,
+        "expected heartbeat to keep the source_scan phase alive (>=2 ticks), got {}",
+        reporter.tick_count("source_scan")
     );
 }
 
@@ -297,10 +295,10 @@ fn heartbeat_floor_pins_tick_value_to_real_progress() {
     // Floor lets real-progress jumps (e.g. an agent's extractor just
     // returned 750 entries) override the bare heartbeat counter so the
     // spinner doesn't regress to "1, 2, 3, ..." after meaningful work
-    // landed. This guards the per-agent extract loop pattern in
+    // landed. This guards the per-agent source_scan loop pattern in
     // `run_store`.
     let reporter = Arc::new(CapturingReporter::default());
-    let phase = Phase::start(reporter.clone(), "extract", Some(1000));
+    let phase = Phase::start(reporter.clone(), "source_scan", Some(1000));
     let hb = Heartbeat::spawn(phase.clone(), Duration::from_millis(150));
     hb.raise_floor(750);
     std::thread::sleep(Duration::from_millis(450));
@@ -310,7 +308,7 @@ fn heartbeat_floor_pins_tick_value_to_real_progress() {
     let events = reporter.events.lock().unwrap().clone();
     let max_tick = events
         .iter()
-        .filter_map(|e| e.strip_prefix("tick:extract:"))
+        .filter_map(|e| e.strip_prefix("tick:source_scan:"))
         .filter_map(|n| n.parse::<u64>().ok())
         .max()
         .unwrap_or(0);
@@ -328,7 +326,7 @@ fn structured_reporter_emits_phase_markers_for_every_pre_write_phase() {
     // could silently drop the operator surface back to "nothing for 15
     // minutes" mode.
     let reporter: Arc<dyn Reporter> = Arc::new(StructuredReporter::new());
-    for name in ["extract", "dedup", "self_echo", "segment", "chunk"] {
+    for name in ["source_scan", "dedup", "self_echo", "segment", "render"] {
         let phase = Phase::start(reporter.clone(), name, Some(100));
         phase.tick(50);
         phase.finish_ok("smoke");
@@ -376,10 +374,10 @@ fn unique_fixture_base(tag: &str) -> PathBuf {
     base
 }
 
-/// Synthetic canonical store: `dirs` nested repo dirs × `files_per_dir`
-/// chunk files, each with a sidecar. Deep enough that a recursive scan is
+/// Synthetic residual archive: `dirs` nested repo dirs × `files_per_dir`
+/// render files, each with a sidecar. Deep enough that a recursive scan is
 /// observable, small enough to build quickly.
-fn build_synthetic_store(base: &Path, dirs: usize, files_per_dir: usize) {
+fn build_synthetic_legacy_archive(base: &Path, dirs: usize, files_per_dir: usize) {
     for d in 0..dirs {
         let dir = base
             .join("store")
@@ -389,9 +387,13 @@ fn build_synthetic_store(base: &Path, dirs: usize, files_per_dir: usize) {
             .join("2026-07");
         std::fs::create_dir_all(&dir).unwrap();
         for f in 0..files_per_dir {
-            let chunk = dir.join(format!("chunk-{f}.md"));
-            std::fs::write(&chunk, format!("# chunk {d}/{f}\nbody\n")).unwrap();
-            std::fs::write(chunk.with_extension("meta.json"), r#"{"schema_version":1}"#).unwrap();
+            let render = dir.join(format!("render-{f}.md"));
+            std::fs::write(&render, format!("# render {d}/{f}\nbody\n")).unwrap();
+            std::fs::write(
+                render.with_extension("meta.json"),
+                r#"{"schema_version":1}"#,
+            )
+            .unwrap();
         }
     }
 }
@@ -496,7 +498,7 @@ fn fast_health_is_bounded_reports_unknown_and_leaves_the_tree_untouched() {
     // and (3) leave a recursive digest of the base — including state
     // diagnostics — byte-for-byte unchanged.
     let base = unique_fixture_base("fast");
-    build_synthetic_store(&base, 24, 50); // 1200 chunks + 1200 sidecars
+    build_synthetic_legacy_archive(&base, 24, 50); // 1200 chunks + 1200 sidecars
     std::fs::create_dir_all(base.join("state")).unwrap();
     std::fs::write(base.join("state").join("sentinel.txt"), b"untouched").unwrap();
 
@@ -539,7 +541,7 @@ fn fast_health_is_bounded_reports_unknown_and_leaves_the_tree_untouched() {
             "{name} must hand the operator the exact deep command: {check:?}"
         );
     }
-    // The bounded walk finished this store within budget, so sidecars are
+    // The bounded walk finished this archive within budget, so sidecars are
     // fully verified — bounded truth, not a recursive-scan claim.
     assert_eq!(report.sidecars.severity, aicx::doctor::Severity::Green);
     assert!(
@@ -547,7 +549,7 @@ fn fast_health_is_bounded_reports_unknown_and_leaves_the_tree_untouched() {
             .canonical_store
             .detail
             .contains("1200 chunk file(s) counted by bounded walk"),
-        "bounded walk should count the store it fully covered: {}",
+        "bounded walk should count the archive it fully covered: {}",
         report.canonical_store.detail
     );
 
@@ -562,7 +564,7 @@ fn fast_health_is_bounded_reports_unknown_and_leaves_the_tree_untouched() {
 #[test]
 fn deep_doctor_emits_phase_progress_within_two_seconds_and_in_order() {
     let base = unique_fixture_base("deep");
-    build_synthetic_store(&base, 2, 3);
+    build_synthetic_legacy_archive(&base, 2, 3);
 
     let reporter = Arc::new(TimedReporter::new(None));
     let opts = read_only_doctor_opts();
@@ -632,7 +634,7 @@ fn deep_doctor_cancels_cleanly_in_every_phase_and_leaves_the_tree_recoverable() 
     ];
     for target in read_only_phases {
         let base = unique_fixture_base("cancel");
-        build_synthetic_store(&base, 2, 3);
+        build_synthetic_legacy_archive(&base, 2, 3);
         let digest_before = recursive_tree_digest(&base);
 
         let cancel = Arc::new(AtomicBool::new(false));
@@ -684,7 +686,7 @@ fn deep_doctor_cancels_cleanly_in_every_phase_and_leaves_the_tree_recoverable() 
     // just as cleanly.
     for target in ["doctor_fix", "doctor_recheck"] {
         let base = unique_fixture_base("cancel-fix");
-        build_synthetic_store(&base, 2, 3);
+        build_synthetic_legacy_archive(&base, 2, 3);
         let digest_before = recursive_tree_digest(&base);
 
         let opts = aicx::doctor::DoctorOptions {
