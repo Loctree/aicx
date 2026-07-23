@@ -852,10 +852,10 @@ fn live_or_catalog_fingerprint(
     entry: &CatalogEntry,
     source_allow: &crate::source_path::SourceAllowlist,
 ) -> (u64, u64) {
-    if let Ok(path) = source_allow.resolve_file(entry.source_path.as_str()) {
-        if let Some(live) = crate::catalog::live_source_fingerprint(&path) {
-            return live;
-        }
+    if let Ok(path) = source_allow.resolve_file(entry.source_path.as_str())
+        && let Some(live) = crate::catalog::live_source_fingerprint(&path)
+    {
+        return live;
     }
     (
         entry.source_len.unwrap_or(0),
