@@ -75,6 +75,9 @@ pub fn read_entries_at(home: &Path) -> Result<Vec<CatalogEntry>> {
     if !path.exists() {
         return Ok(Vec::new());
     }
+    // `home` is the operator AICX root (env/home resolution), never a network
+    // request path; `path` is that root + fixed `catalog/sessions.jsonl`.
+    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
     let file = File::open(&path).with_context(|| format!("open catalog {}", path.display()))?;
     let reader = BufReader::new(file);
     let mut entries = Vec::new();
@@ -96,6 +99,8 @@ pub fn project_identities_from_catalog_at(store_root: &Path) -> Result<Vec<Strin
     if !path.exists() {
         return Ok(Vec::new());
     }
+    // Operator-owned store root + fixed catalog filename — not actix request input.
+    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
     let file = File::open(&path).with_context(|| format!("open catalog {}", path.display()))?;
     let reader = BufReader::new(file);
     let mut identities = BTreeSet::new();

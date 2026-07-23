@@ -678,12 +678,23 @@ fn try_lexical_search_native(
     };
     // Build results without per-hit store file I/O. Preview lines are filled
     // only for the truncated top set so missing-store paths cannot dominate.
+    // Timestamp (when present) drives the recency prior; fall back to date.
     let mut results: Vec<FuzzyResult> = hits
         .into_iter()
         .map(|h| {
             let path = hit_path(&h);
             let score_pct = lexical_score_pct(h.score);
             let matched_lines = hit_metadata_lines(&h, "preview_lines");
+            let date = hit_metadata_string(&h, "date");
+            let timestamp = hit_metadata_optional_string(&h, "timestamp")
+                .or_else(|| hit_metadata_optional_string(&h, "session_date"))
+                .or_else(|| {
+                    if date.is_empty() || date == "-" {
+                        None
+                    } else {
+                        Some(date.clone())
+                    }
+                });
             FuzzyResult {
                 file: path.to_string_lossy().to_string(),
                 path: path.to_string_lossy().to_string(),
@@ -691,8 +702,8 @@ fn try_lexical_search_native(
                 kind: hit_metadata_string(&h, "kind"),
                 frame_kind: hit_metadata_optional_string(&h, "frame_kind"),
                 agent: hit_metadata_string(&h, "agent"),
-                date: hit_metadata_string(&h, "date"),
-                timestamp: None,
+                date,
+                timestamp,
                 score: score_pct,
                 label: format!("{backend_label}:{}", h.chunk_id),
                 density: h.score,
@@ -706,7 +717,13 @@ fn try_lexical_search_native(
     apply_recency_prior(&mut results);
     results.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| b.date.cmp(&a.date)));
     results.truncate(limit);
+    // Prefer indexed preview metadata. Only open source files when preview is
+    // empty and the path exists — cold project-scoped searches were paying
+    // multi-hundred-ms for optional body peeks on every top hit.
     for result in &mut results {
+        if !result.matched_lines.is_empty() {
+            continue;
+        }
         if result.frame_kind.as_deref() == Some("conversation") {
             continue;
         }
@@ -757,7 +774,10 @@ fn lexical_score_pct(score: f32) -> u8 {
 
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
 fn lexical_rerank_window(limit: usize, project_scoped: bool) -> usize {
-    limit.max(if project_scoped { 100 } else { 500 })
+    // Project equality is pushed into Tantivy when the filter is exact
+    // `owner/repo`, so a modest window is enough. Global search needs a wider
+    // floor for the recency re-ranker to still surface a fresh near-match.
+    limit.max(if project_scoped { 80 } else { 500 })
 }
 
 /// Recency prior: fresh conversations win over repeated stale mentions when
@@ -2628,8 +2648,8 @@ mod tests {
     fn lexical_rerank_window_keeps_a_wide_recency_candidate_pool() {
         assert_eq!(lexical_rerank_window(1, false), 500);
         assert_eq!(lexical_rerank_window(50, false), 500);
-        assert_eq!(lexical_rerank_window(1, true), 100);
-        assert_eq!(lexical_rerank_window(50, true), 100);
+        assert_eq!(lexical_rerank_window(1, true), 80);
+        assert_eq!(lexical_rerank_window(50, true), 80);
         assert_eq!(lexical_rerank_window(750, true), 750);
     }
 

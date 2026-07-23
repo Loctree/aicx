@@ -77,8 +77,11 @@ pub fn build(
         .filter(|entry| project_selected(entry.project.as_deref(), project_filters))
         .collect();
     let source_fingerprint = source_fingerprint(&catalog_path, &selected)?;
-    if !dry_run
-        && !full_rescan
+    // Incremental short-circuit applies to both publish and dry-run. A matching
+    // catalog fingerprint means CURRENT already reflects this snapshot — re-parsing
+    // ~10k sources on every `index --dry-run` recreated the mill latency the
+    // extracts-store cut was meant to kill. Use `--full-rescan` to force a walk.
+    if !full_rescan
         && project_filters.is_empty()
         && crate::vector_index::source_lexical_generation_matches(&source_fingerprint)?
     {
@@ -283,6 +286,8 @@ fn parse_catalog_source(entry: &CatalogEntry, path: &Path) -> Result<Vec<Timelin
 /// all of that noise. This path drains over-cap records without allocating
 /// them and deserializes only bounded message records.
 fn parse_large_codex_signal(entry: &CatalogEntry, path: &Path) -> Result<Vec<TimelineEntry>> {
+    // `path` comes from cataloged local session sources (operator home), not HTTP.
+    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
     let file = fs::File::open(path).with_context(|| format!("open source {}", path.display()))?;
     let mut reader = BufReader::new(file);
     let mut frames = Vec::new();
@@ -453,6 +458,8 @@ fn source_fingerprint(catalog_path: &Path, entries: &[CatalogEntry]) -> Result<S
     // indexing and would make every immediate second run look dirty. A
     // subsequent `aicx catalog rebuild` changes the catalog bytes and admits
     // the new source snapshot deterministically.
+    // `catalog_path` is the operator AICX catalog file under aicx_home.
+    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
     hasher.update(
         fs::read(catalog_path)
             .with_context(|| format!("read catalog {}", catalog_path.display()))?,

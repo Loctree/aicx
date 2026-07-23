@@ -1042,28 +1042,18 @@ fn session_batch_quarantines_bad_claude_source_and_holds_watermark() {
     assert!(stderr.contains("session_id=22222222-2222-4222-8222-222222222222"));
     assert!(stderr.contains("recover: aicx extract claude --file"));
     assert!(stderr.contains("Watermark held: 1 skipped session(s)"));
-    assert!(stderr.contains("Canonical projection:"));
-
-    let projection_dir = home
-        .join(".aicx")
-        .join("store")
-        .join("canonical-projection-v1");
-    let manifest: Value = serde_json::from_str(
-        &fs::read_to_string(projection_dir.join("manifest.json"))
-            .expect("canonical projection manifest"),
-    )
-    .expect("valid canonical projection manifest");
-    let card_ids = manifest["card_ids"].as_array().expect("manifest card ids");
-    assert_eq!(card_ids.len(), 1, "only the healthy session may project");
-    let card_name = format!(
-        "{}.json",
-        card_ids[0].as_str().expect("card id").replace(':', "_")
+    assert!(
+        !stderr.contains("Canonical projection:"),
+        "CLI must not write or advertise the retired canonical projection mill\nstderr:\n{stderr}"
     );
-    let card: Value = serde_json::from_str(
-        &fs::read_to_string(projection_dir.join("cards").join(card_name)).expect("canonical card"),
-    )
-    .expect("valid canonical card");
-    assert_eq!(card["session_id"].as_str(), Some("healthy-session"));
+    assert!(
+        !home
+            .join(".aicx")
+            .join("store")
+            .join("canonical-projection-v1")
+            .exists(),
+        "healthy batch must not re-grow canonical-projection-v1 after extracts-store cut"
+    );
 
     let state = read_state(&home);
     assert_eq!(
@@ -1124,21 +1114,13 @@ fn session_batch_drops_duplicate_physical_source_and_counts_it() {
         !stderr.contains("Watermark held"),
         "a dropped duplicate must not hold the watermark\nstderr:\n{stderr}"
     );
-
-    let projection_dir = home
-        .join(".aicx")
-        .join("store")
-        .join("canonical-projection-v1");
-    let manifest: Value = serde_json::from_str(
-        &fs::read_to_string(projection_dir.join("manifest.json"))
-            .expect("canonical projection manifest"),
-    )
-    .expect("valid canonical projection manifest");
-    let card_ids = manifest["card_ids"].as_array().expect("manifest card ids");
-    assert_eq!(
-        card_ids.len(),
-        1,
-        "exactly one card set may project for one logical session"
+    assert!(
+        !home
+            .join(".aicx")
+            .join("store")
+            .join("canonical-projection-v1")
+            .exists(),
+        "duplicate guard must not re-grow the retired projection mill"
     );
 
     let _ = fs::remove_dir_all(&root);
@@ -1201,21 +1183,13 @@ fn session_batch_project_filter_composes_with_duplicate_guard() {
         ),
         "filter and duplicate guard must count independently\nstderr:\n{stderr}"
     );
-
-    let projection_dir = home
-        .join(".aicx")
-        .join("store")
-        .join("canonical-projection-v1");
-    let manifest: Value = serde_json::from_str(
-        &fs::read_to_string(projection_dir.join("manifest.json"))
-            .expect("canonical projection manifest"),
-    )
-    .expect("valid canonical projection manifest");
-    let card_ids = manifest["card_ids"].as_array().expect("manifest card ids");
-    assert_eq!(
-        card_ids.len(),
-        1,
-        "exactly one card set may project: duplicate dropped, beta filtered; got {card_ids:?}"
+    assert!(
+        !home
+            .join(".aicx")
+            .join("store")
+            .join("canonical-projection-v1")
+            .exists(),
+        "filtered batch must not write retired canonical-projection-v1"
     );
 
     let _ = fs::remove_dir_all(&root);
@@ -1345,34 +1319,17 @@ fn project_filter_narrows_batch_discovery() {
         stderr.contains("session ingest summary: ingested=1 skipped=0 filtered_out=1"),
         "batch summary must expose the filtered_out counter\nstderr:\n{stderr}"
     );
-
-    let projection_dir = home
-        .join(".aicx")
-        .join("store")
-        .join("canonical-projection-v1");
-    let manifest: Value = serde_json::from_str(
-        &fs::read_to_string(projection_dir.join("manifest.json"))
-            .expect("canonical projection manifest"),
-    )
-    .expect("valid canonical projection manifest");
-    let card_ids = manifest["card_ids"].as_array().expect("manifest card ids");
-    assert_eq!(
-        card_ids.len(),
-        1,
-        "only the session matching the -p filter may project; got {card_ids:?}"
+    assert!(
+        !home
+            .join(".aicx")
+            .join("store")
+            .join("canonical-projection-v1")
+            .exists(),
+        "project filter path must not re-grow retired canonical-projection-v1"
     );
-    let card_name = format!(
-        "{}.json",
-        card_ids[0].as_str().expect("card id").replace(':', "_")
-    );
-    let card: Value = serde_json::from_str(
-        &fs::read_to_string(projection_dir.join("cards").join(card_name)).expect("canonical card"),
-    )
-    .expect("valid canonical card");
-    assert_eq!(card["session_id"].as_str(), Some("alpha-session"));
 
-    // Sessions cut by the filter are neither ingested nor skipped: the store
-    // must contain no trace of the beta session's content.
+    // Sessions cut by the filter are neither ingested nor skipped: residual
+    // store files (if any legacy writers remain) must not carry beta content.
     let mut stack = vec![home.join(".aicx").join("store")];
     while let Some(dir) = stack.pop() {
         let Ok(entries) = fs::read_dir(&dir) else {

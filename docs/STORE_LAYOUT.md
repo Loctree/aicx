@@ -116,26 +116,46 @@ Derived, rebuildable views — never ground truth. Layout per bucket:
 
 ```
 $AICX_HOME/indexed/<bucket>/
-  embeddings.ndjson                 # committed semantic index (build source)
   hybrid/
     CURRENT                         # pointer naming the published generation
     generations/<generation>/
-      tantivy_lex/                  # lexical index
-      dense.exact_mmap_v1.bin       # THE dense payload (one per generation)
+      tantivy_lex/                  # lexical index (default search path)
+      dense.exact_mmap_v1.bin       # optional dense payload (re-rank via --deep)
       manifest.json                 # generation authority, written last
+  # RETIRED intermediates (safe to delete — operator button, not auto-rm):
+  # embeddings.ndjson               # legacy dense build source (~19 GB observed)
+  # hybrid/dense_brute_force.ndjson # retired brute adapter twin (~16 GB observed)
 ```
 
-Contract (W2-03 / W3-02 / W4-01c):
+Contract (W2-03 / W3-02 / W4-01c + aicx-extracts-store 2026-07-23):
 
-- **One dense payload per generation.** New builds never write a twin
-  `hybrid/dense_brute_force.ndjson`; legacy copies are migration read input only.
+- **Default search is lexical-first** against the published `_all` CURRENT
+  generation (`tantivy_lex` + recency prior). Dense mmap re-rank is opt-in
+  (`aicx search --deep`). Project (`-p`) is a metadata filter, not a per-project
+  index requirement.
+- **Index from catalog + sources** via `aicx catalog rebuild` then `aicx index`.
+  No per-frame card mill; `aicx store` is removed.
+- **One dense payload per generation when dense is built.** New default index
+  runs do not stream multi-GB NDJSON for query. Legacy
+  `hybrid/dense_brute_force.ndjson` is migration read input only.
 - **Manifest last, pointer flip publishes.** Incomplete generation directories are
   unreferenced and may be quarantined; they never alter current resolution.
-- **Search routes through manifest-kind → `MmapDenseAdapter`** by default; the
-  `--legacy-dense` escape hatch remains for operators who need the old path.
-- **Truthful status:** when the index is missing or the embedder is unavailable,
-  search degrades to filesystem-fuzzy with an explicit `semantic_fallback` /
-  `RetrievalOutcome` payload — never a false-healthy hybrid claim.
+- **Truthful status:** when the hybrid CURRENT generation is missing, search
+  fails closed with an honest error (or a bounded recency-ranked filesystem
+  fallback when that path is still enabled) — never a multi-minute NDJSON hang.
+
+#### Operator button — reclaim retired NDJSON (pre-authorized accept-dou)
+
+Workers must **not** auto-delete these. On a host still carrying the mill
+residue (~35 GB reclaim expected), measure then remove only after confirm:
+
+```bash
+du -sh ~/.aicx/indexed/_all/embeddings.ndjson \
+       ~/.aicx/indexed/_all/hybrid/dense_brute_force.ndjson
+# only after confirm:
+# rm -f ~/.aicx/indexed/_all/embeddings.ndjson \
+#       ~/.aicx/indexed/_all/hybrid/dense_brute_force.ndjson
+```
 
 See `docs/EMBEDDINGS.md` for embedder profiles and the dense migration gate.
 

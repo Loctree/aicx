@@ -6284,24 +6284,16 @@ fn emit_session_batch_summary(agent: &str, batch: &sources::SessionExtractionBat
     }
 }
 
+/// Canonical projection under `~/.aicx/store` is retired (aicx-extracts-store).
+/// Session identity lives in `~/.aicx/catalog/sessions.jsonl`; readable content
+/// is extract-on-demand (or optional `~/.aicx/extracts/`). Call sites still
+/// collect card payloads for transitional ingest accounting, but the CLI must
+/// not re-grow projection stage dirs or the card mill.
 fn commit_canonical_projection(
-    fresh_cards: Vec<aicx::parser::projections::CanonicalCard>,
-    ingested_session_ids: &BTreeSet<String>,
+    _fresh_cards: Vec<aicx::parser::projections::CanonicalCard>,
+    _ingested_session_ids: &BTreeSet<String>,
 ) -> Result<Option<PathBuf>> {
-    if ingested_session_ids.is_empty() {
-        return Ok(None);
-    }
-    let store_root = store::canonical_store_dir()?;
-    let mut cards = store::read_canonical_projection_at(&store_root)?
-        .map(|(_, cards)| cards)
-        .unwrap_or_default();
-    cards.retain(|card| !ingested_session_ids.contains(&card.session_id));
-    cards.extend(fresh_cards);
-    let projection = aicx::parser::projections::projection_from_cards(
-        cards,
-        &sources::canonical_projection_config(),
-    )?;
-    store::write_canonical_projection_at(&store_root, &projection).map(Some)
+    Ok(None)
 }
 
 fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
