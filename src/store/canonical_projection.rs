@@ -1,9 +1,10 @@
 use aicx_parser::projections::{CANONICAL_CARD_SCHEMA, CanonicalCard, CanonicalProjection};
-use anyhow::{Context, Result, anyhow};
+#[cfg(test)]
+use anyhow::Context;
+use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -119,50 +120,16 @@ pub struct CanonicalStoreManifest {
     pub card_ids: Vec<String>,
 }
 
+/// Retired (extracts-store cut). Catalog + extract replace the card mill.
+/// Callers that still need a fixture projection for overlay tests write
+/// `manifest.json` + `cards/` directly under `canonical-projection-v1`.
 pub fn write_canonical_projection_at(
-    root: &Path,
-    projection: &CanonicalProjection,
+    _root: &Path,
+    _projection: &CanonicalProjection,
 ) -> Result<PathBuf> {
-    validate_projection(projection)?;
-    fs::create_dir_all(root)?;
-    let target = root.join(CANONICAL_PROJECTION_DIRNAME);
-    // Unique per attempt (pid + nanos): a recycled PID must never collide
-    // with — or blindly delete — a dead process's stage. Orphaned stages
-    // stay in place for doctor to classify and quarantine recoverably.
-    let stage = root.join(format!(
-        ".{CANONICAL_PROJECTION_DIRNAME}.stage-{}-{}",
-        std::process::id(),
-        Utc::now().timestamp_nanos_opt().unwrap_or_default()
-    ));
-    fs::create_dir(&stage)?;
-    let result = stage_projection(root, &stage, projection);
-    if let Err(error) = result {
-        // Own stage of this very process — safe to discard on error.
-        let _ = fs::remove_dir_all(&stage);
-        return Err(error);
-    }
-    let backup = root.join(format!(".{CANONICAL_PROJECTION_DIRNAME}.previous"));
-    if backup.exists() {
-        fs::remove_dir_all(&backup)?;
-    }
-    if target.exists() {
-        fs::rename(&target, &backup).context("move previous canonical projection aside")?;
-    }
-    if let Err(error) = fs::rename(&stage, &target) {
-        if backup.exists() {
-            let _ = fs::rename(&backup, &target);
-        }
-        return Err(error).context("commit canonical projection atomically");
-    }
-    // The lease travels with the rename; drop it from the committed target
-    // so only in-flight `.stage-*` directories ever carry stage metadata.
-    // Best-effort: a leftover lease inside the target is inert (readers
-    // only consume manifest.json + cards/) and never scanned as a stage.
-    let _ = fs::remove_file(target.join(PROJECTION_STAGE_META_FILENAME));
-    if backup.exists() {
-        fs::remove_dir_all(backup)?;
-    }
-    Ok(target)
+    Err(anyhow!(
+        "canonical projection write is retired; use catalog rebuild + extract, not store cards"
+    ))
 }
 
 pub fn read_canonical_projection_at(
@@ -190,74 +157,7 @@ pub fn read_canonical_projection_at(
     Ok(Some((manifest, cards)))
 }
 
-fn validate_projection(projection: &CanonicalProjection) -> Result<()> {
-    if projection.schema != "aicx.store.canonical_projection.v1" {
-        return Err(anyhow!("unsupported canonical projection schema"));
-    }
-    let mut ids = BTreeSet::new();
-    for card in &projection.cards {
-        if card.schema != CANONICAL_CARD_SCHEMA || !valid_card_id(&card.id) || !ids.insert(&card.id)
-        {
-            return Err(anyhow!(
-                "invalid or duplicate canonical card id {}",
-                card.id
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn stage_projection(root: &Path, stage: &Path, projection: &CanonicalProjection) -> Result<()> {
-    // Metadata BEFORE payload: an interruption at any later point leaves a
-    // stage whose owner, source, and state are still recoverable.
-    let now = Utc::now().to_rfc3339();
-    let mut lease = ProjectionStageLease {
-        schema: PROJECTION_STAGE_SCHEMA.to_owned(),
-        pid: std::process::id(),
-        process_start_identity: current_process_start_identity()
-            .unwrap_or_else(|| PROJECTION_STAGE_IDENTITY_UNVERIFIABLE.to_owned()),
-        created_at: now.clone(),
-        heartbeat_at: now,
-        source_hash: projection_source_hash(projection),
-        target_generation: read_target_generation(root).unwrap_or_else(|| "none".to_owned()),
-        state: PROJECTION_STAGE_STATE_STAGING.to_owned(),
-    };
-    write_stage_lease(stage, &lease)?;
-    let cards_dir = stage.join("cards");
-    fs::create_dir(&cards_dir)?;
-    for (index, card) in projection.cards.iter().enumerate() {
-        let bytes = serde_json::to_vec_pretty(card)?;
-        super::atomic_write::atomic_write(&cards_dir.join(card_filename(&card.id)?), &bytes)?;
-        if index % 64 == 63 {
-            lease.heartbeat_at = Utc::now().to_rfc3339();
-            write_stage_lease(stage, &lease)?;
-        }
-    }
-    let manifest = CanonicalStoreManifest {
-        schema: "aicx.store.manifest.v1".to_owned(),
-        card_schema: CANONICAL_CARD_SCHEMA.to_owned(),
-        store_revision: projection.store_revision.clone(),
-        extraction_schema: projection.extraction_schema.clone(),
-        producer_version: projection.producer_version.clone(),
-        card_ids: projection
-            .cards
-            .iter()
-            .map(|card| card.id.clone())
-            .collect(),
-    };
-    super::atomic_write::atomic_write(
-        &stage.join("manifest.json"),
-        &serde_json::to_vec_pretty(&manifest)?,
-    )?;
-    // Payload + manifest fully staged: flip to complete immediately before
-    // promotion so an interruption between here and the rename classifies
-    // as `CompleteUnpromoted`, not as a half-written corpse.
-    lease.state = PROJECTION_STAGE_STATE_COMPLETE.to_owned();
-    lease.heartbeat_at = Utc::now().to_rfc3339();
-    write_stage_lease(stage, &lease)?;
-    Ok(())
-}
-
+#[cfg(test)]
 fn write_stage_lease(stage: &Path, lease: &ProjectionStageLease) -> Result<()> {
     super::atomic_write::atomic_write(
         &stage.join(PROJECTION_STAGE_META_FILENAME),
@@ -479,7 +379,8 @@ fn process_alive(_pid: i32) -> Option<bool> {
     None
 }
 
-pub(crate) fn current_process_start_identity() -> Option<String> {
+#[cfg(test)]
+fn current_process_start_identity() -> Option<String> {
     process_start_identity(std::process::id())
 }
 
@@ -533,19 +434,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn invalid_projection_does_not_mutate_existing_store() {
+    fn write_canonical_projection_is_permanently_retired() {
         let root = std::env::temp_dir().join(format!("aicx-c6-{}", std::process::id()));
         let target = root.join(CANONICAL_PROJECTION_DIRNAME);
         fs::create_dir_all(&target).unwrap();
         fs::write(target.join("sentinel"), b"old").unwrap();
-        let invalid = CanonicalProjection {
-            schema: "invalid".to_owned(),
+        let projection = CanonicalProjection {
+            schema: "aicx.store.canonical_projection.v1".to_owned(),
             extraction_schema: "x".to_owned(),
             producer_version: "y".to_owned(),
             store_revision: "z".to_owned(),
             cards: Vec::new(),
         };
-        assert!(write_canonical_projection_at(&root, &invalid).is_err());
+        let err = write_canonical_projection_at(&root, &projection).unwrap_err();
+        assert!(
+            err.to_string().contains("retired"),
+            "write must fail closed: {err}"
+        );
         assert_eq!(fs::read(target.join("sentinel")).unwrap(), b"old");
         let _ = fs::remove_dir_all(root);
     }
@@ -558,6 +463,37 @@ mod tests {
         assert!(read_canonical_projection_at(&root).unwrap().is_none());
         assert_eq!(fs::read(root.join("legacy.md")).unwrap(), b"legacy card");
         let _ = fs::remove_dir_all(root);
+    }
+
+    /// Manual fixture write — the only way residual readers are fed after
+    /// the projection mill write path was deleted.
+    fn materialize_projection_fixture(root: &Path, projection: &CanonicalProjection) {
+        let target = root.join(CANONICAL_PROJECTION_DIRNAME);
+        let cards_dir = target.join("cards");
+        fs::create_dir_all(&cards_dir).unwrap();
+        let mut card_ids = Vec::new();
+        for card in &projection.cards {
+            let name = card_filename(&card.id).unwrap();
+            fs::write(
+                cards_dir.join(&name),
+                serde_json::to_vec_pretty(card).unwrap(),
+            )
+            .unwrap();
+            card_ids.push(card.id.clone());
+        }
+        let manifest = CanonicalStoreManifest {
+            schema: "aicx.store.manifest.v1".to_owned(),
+            card_schema: CANONICAL_CARD_SCHEMA.to_owned(),
+            store_revision: projection.store_revision.clone(),
+            extraction_schema: projection.extraction_schema.clone(),
+            producer_version: projection.producer_version.clone(),
+            card_ids,
+        };
+        fs::write(
+            target.join("manifest.json"),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
     }
 
     fn lease_fixture(
@@ -772,13 +708,14 @@ mod tests {
     }
 
     #[test]
-    fn stage_lease_is_written_before_payload_and_dropped_after_promotion() {
+    fn committed_fixture_has_no_stage_lease_and_no_active_stages() {
         let root = std::env::temp_dir().join(format!(
             "aicx-stage-lease-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));
         let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
         let projection = CanonicalProjection {
             schema: "aicx.store.canonical_projection.v1".to_owned(),
             extraction_schema: "extract-v1".to_owned(),
@@ -786,9 +723,10 @@ mod tests {
             store_revision: "sr1:lease".to_owned(),
             cards: Vec::new(),
         };
-        let target = write_canonical_projection_at(&root, &projection).unwrap();
+        materialize_projection_fixture(&root, &projection);
+        let target = root.join(CANONICAL_PROJECTION_DIRNAME);
 
-        // Atomic promotion leaves no ambiguous active stage...
+        // Committed residual has no ambiguous active stage...
         assert!(inspect_projection_stages_at(&root).is_empty());
         // ...and the committed target carries no lease.
         assert!(!target.join(PROJECTION_STAGE_META_FILENAME).exists());
@@ -815,12 +753,14 @@ mod tests {
     }
 
     #[test]
-    fn projection_commit_is_versioned_and_roundtrips() {
+    fn residual_projection_read_roundtrips_fixture_manifest() {
         let root = std::env::temp_dir().join(format!(
             "aicx-c6-roundtrip-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
         let projection = CanonicalProjection {
             schema: "aicx.store.canonical_projection.v1".to_owned(),
             extraction_schema: "extract-v1".to_owned(),
@@ -828,8 +768,7 @@ mod tests {
             store_revision: "sr1:empty".to_owned(),
             cards: Vec::new(),
         };
-        let target = write_canonical_projection_at(&root, &projection).unwrap();
-        assert_eq!(target.file_name().unwrap(), CANONICAL_PROJECTION_DIRNAME);
+        materialize_projection_fixture(&root, &projection);
         let (manifest, cards) = read_canonical_projection_at(&root).unwrap().unwrap();
         assert_eq!(manifest.schema, "aicx.store.manifest.v1");
         assert_eq!(manifest.card_schema, CANONICAL_CARD_SCHEMA);

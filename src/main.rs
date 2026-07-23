@@ -6201,18 +6201,6 @@ fn emit_session_batch_summary(agent: &str, batch: &sources::SessionExtractionBat
     }
 }
 
-/// Canonical projection under `~/.aicx/store` is retired (aicx-extracts-store).
-/// Session identity lives in `~/.aicx/catalog/sessions.jsonl`; readable content
-/// is extract-on-demand (or optional `~/.aicx/extracts/`). Call sites still
-/// collect card payloads for transitional ingest accounting, but the CLI must
-/// not re-grow projection stage dirs or the card mill.
-fn commit_canonical_projection(
-    _fresh_cards: Vec<aicx::parser::projections::CanonicalCard>,
-    _ingested_session_ids: &BTreeSet<String>,
-) -> Result<Option<PathBuf>> {
-    Ok(None)
-}
-
 fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
     let ExtractionParams {
         agents,
@@ -6280,8 +6268,6 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
     let mut selected_sessions = 0usize;
     let mut ingested_sessions = 0usize;
     let mut skipped_sessions = 0usize;
-    let mut canonical_cards = Vec::new();
-    let mut ingested_session_ids = BTreeSet::new();
     let mut agents_done: u64 = 0;
     for &agent in agents {
         let hb = aicx::progress::Heartbeat::spawn_with_backoff(
@@ -6326,8 +6312,6 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
         selected_sessions += agent_batch.selected_sessions;
         ingested_sessions += agent_batch.ingested_sessions;
         skipped_sessions += agent_batch.skipped.len();
-        canonical_cards.extend(agent_batch.canonical_cards);
-        ingested_session_ids.extend(agent_batch.ingested_session_ids);
         let agent_entries = agent_batch.entries;
         eprintln!("  [{}] {} entries", agent, agent_entries.len());
         entries.extend(agent_entries);
@@ -6670,9 +6654,8 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
         }
     }
 
-    if let Some(path) = commit_canonical_projection(canonical_cards, &ingested_session_ids)? {
-        eprintln!("  Canonical projection: {}", path.display());
-    }
+    // Canonical projection under ~/.aicx/store is retired (extracts-store).
+    // Session identity lives in catalog; content is extract-on-demand.
 
     // ──────────────────────────────────────────────────────────────────
     // Watermark write (#19): advance from `raw_extract_latest` captured

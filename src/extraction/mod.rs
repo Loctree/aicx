@@ -56,11 +56,13 @@ pub struct SessionSkip {
 }
 
 /// Fail-closed per-session extraction with batch-level resilience.
+///
+/// Entries flow to extract/report output only. Per-frame store cards and
+/// canonical-projection materialization are retired (extracts-store cut).
 #[cfg(feature = "app")]
 #[derive(Debug, Default)]
 pub struct SessionExtractionBatch {
     pub entries: Vec<TimelineEntry>,
-    pub canonical_cards: Vec<aicx_parser::projections::CanonicalCard>,
     pub ingested_session_ids: BTreeSet<String>,
     pub selected_sessions: usize,
     pub ingested_sessions: usize,
@@ -81,7 +83,6 @@ impl SessionExtractionBatch {
         Self {
             ingested_sessions: usize::from(!entries.is_empty()),
             entries,
-            canonical_cards: Vec::new(),
             ingested_session_ids: BTreeSet::new(),
             selected_sessions: 0,
             filtered_out_sessions: 0,
@@ -94,8 +95,7 @@ impl SessionExtractionBatch {
 /// Freshest copy first: one logical session can be discoverable through more
 /// than one physical path (e.g. a live rollout file plus an archived copy).
 /// Parsing the most recently modified source first lets the per-batch
-/// session-id guard drop the older duplicates, so the canonical projection
-/// never sees two card sets for one session (`duplicate canonical card id`).
+/// session-id guard drop older duplicates so extract/report sees one body.
 #[cfg(feature = "app")]
 fn order_sources_freshest_first(sources: &mut [crate::session_catalog::CatalogSource]) {
     // STABLE sort on purpose (NOT sort_unstable_by): archived copies made with
@@ -167,28 +167,12 @@ pub fn extract_agent_sessions(
                     batch.duplicate_sources += 1;
                     continue;
                 }
-                let projection = match aicx_parser::projections::project_validated_session(
-                    &session,
-                    &canonical_projection_config(),
-                ) {
-                    Ok(projection) => projection,
-                    Err(error) => {
-                        batch.skipped.push(session_skip(
-                            agent,
-                            &source.path,
-                            &source.source_id,
-                            source.logical_session_id.as_deref(),
-                            source.fingerprint.modified_unix_nanos,
-                            &format!("canonical projection failed: {error}"),
-                        ));
-                        continue;
-                    }
-                };
+                // Store-era canonical card projection is retired. A successful
+                // parse is enough to emit timeline entries / extract bodies.
                 batch.ingested_sessions += 1;
                 batch
                     .ingested_session_ids
                     .insert(session.model().session_id.clone());
-                batch.canonical_cards.extend(projection.cards);
                 batch
                     .entries
                     .extend(crate::output::timeline_entries_from_model(session.model()));
@@ -219,16 +203,6 @@ pub fn extract_agent_sessions(
                 .is_none_or(|watermark| entry.timestamp > watermark)
     });
     Ok(batch)
-}
-
-#[cfg(feature = "app")]
-pub fn canonical_projection_config() -> aicx_parser::projections::ProjectionConfig {
-    aicx_parser::projections::ProjectionConfig {
-        extraction_schema: aicx_parser::engine::SESSION_MODEL_SCHEMA.to_owned(),
-        producer_version: format!("aicx-parser@{}", env!("CARGO_PKG_VERSION")),
-        attribution_version: "project-bucket-v1".to_owned(),
-        project_override: None,
-    }
 }
 
 #[cfg(feature = "app")]

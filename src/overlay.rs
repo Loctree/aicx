@@ -1565,15 +1565,14 @@ fn atomic_write_json(path: &Path, value: &impl Serialize) -> Result<()> {
 mod tests {
     use super::*;
     #[cfg(unix)]
-    use crate::store::write_canonical_projection_at;
+    use crate::store::canonical_projection::CANONICAL_PROJECTION_DIRNAME;
     #[cfg(unix)]
     use aicx_parser::engine::{
         AgentKind, BoundaryFlags, ParseStatus, TurnKind, VisibleCompleteness,
     };
     #[cfg(unix)]
     use aicx_parser::projections::{
-        CANONICAL_CARD_SCHEMA, CanonicalProjection, ProjectAttribution, ProjectBucket,
-        TimelineFrame,
+        CANONICAL_CARD_SCHEMA, CanonicalCard, ProjectAttribution, ProjectBucket, TimelineFrame,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -2143,17 +2142,34 @@ mod tests {
         }
     }
 
+    /// Residual projection fixture for overlay tests. The projection write
+    /// mill is deleted; tests materialize manifest + cards on disk directly.
     #[cfg(unix)]
     fn write_projection(root: &Path, cards: &[CanonicalCard], revision_byte: char) {
-        write_canonical_projection_at(
-            root,
-            &CanonicalProjection {
-                schema: "aicx.store.canonical_projection.v1".to_owned(),
-                extraction_schema: CANONICAL_CARD_SCHEMA.to_owned(),
-                producer_version: "aicx-parser@test".to_owned(),
-                store_revision: format!("sr1:{}", revision_byte.to_string().repeat(64)),
-                cards: cards.to_vec(),
-            },
+        let target = root.join(CANONICAL_PROJECTION_DIRNAME);
+        let cards_dir = target.join("cards");
+        fs::create_dir_all(&cards_dir).unwrap();
+        let mut card_ids = Vec::with_capacity(cards.len());
+        for card in cards {
+            let filename = format!("{}.json", card.id.replace(':', "_"));
+            fs::write(
+                cards_dir.join(&filename),
+                serde_json::to_vec_pretty(card).unwrap(),
+            )
+            .unwrap();
+            card_ids.push(card.id.clone());
+        }
+        let manifest = crate::store::CanonicalStoreManifest {
+            schema: "aicx.store.manifest.v1".to_owned(),
+            card_schema: CANONICAL_CARD_SCHEMA.to_owned(),
+            store_revision: format!("sr1:{}", revision_byte.to_string().repeat(64)),
+            extraction_schema: CANONICAL_CARD_SCHEMA.to_owned(),
+            producer_version: "aicx-parser@test".to_owned(),
+            card_ids,
+        };
+        fs::write(
+            target.join("manifest.json"),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
         )
         .unwrap();
     }

@@ -22,9 +22,10 @@ pub(crate) mod atomic_write;
 use atomic_write::atomic_write;
 
 pub mod canonical_projection;
+// Write path deleted (extracts-store). Read/inspect remain for residual
+// corpus doctor quarantine and transitional overlay consumers.
 pub use canonical_projection::{
     CANONICAL_PROJECTION_DIRNAME, CanonicalStoreManifest, read_canonical_projection_at,
-    write_canonical_projection_at,
 };
 
 use crate::chunker::{self, ChunkerConfig};
