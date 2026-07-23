@@ -115,7 +115,7 @@ fn steer_help_mentions_lance_feature_requirement() {
 }
 
 #[test]
-fn top_level_help_drops_layer_1_jargon_in_named_subcommands() {
+fn top_level_help_drops_layer_1_jargon_and_store_command() {
     let bin = ensure_aicx_binary_exists();
     let output = Command::new(&bin)
         .args(["--help"])
@@ -124,13 +124,13 @@ fn top_level_help_drops_layer_1_jargon_in_named_subcommands() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     // Top-level help shows the short description for each subcommand. The
-    // four-command set (all/claude/codex/store) must not show the bare
+    // current extraction/catalog set must not show the bare
     // "(layer 1)" jargon — they should use a plain or "canonical corpus
     // extraction" phrasing instead.
     //
     // We grep line-by-line for the subcommand row and assert no "(layer 1)"
     // suffix is present on it.
-    for cmd in ["all", "claude", "codex", "store"] {
+    for cmd in ["all", "claude", "codex", "catalog"] {
         let line = stdout
             .lines()
             .find(|line| {
@@ -148,4 +148,10 @@ fn top_level_help_drops_layer_1_jargon_in_named_subcommands() {
             "subcommand `{cmd}` row still mentions `(layer 1)` jargon: {line}"
         );
     }
+    assert!(
+        !stdout
+            .lines()
+            .any(|line| line.trim_start().starts_with("store ")),
+        "retired `store` command must not return to primary help"
+    );
 }

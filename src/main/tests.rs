@@ -487,51 +487,6 @@ fn dummy_index_status(bucket: &str) -> aicx::IndexStatus {
 }
 
 #[test]
-fn index_catch_up_plan_uses_oldest_lagging_chunk_timestamp() {
-    let mut current = dummy_index_status("current");
-    current.sessions_newer_than_chunks = 0;
-    current.newest_chunk_mtime = Some("2026-06-12T10:00:00Z".to_string());
-
-    let mut lagging_newer = dummy_index_status("lagging-newer");
-    lagging_newer.sessions_newer_than_chunks = 3;
-    lagging_newer.newest_chunk_mtime = Some("2026-06-12T09:00:00Z".to_string());
-
-    let mut lagging_older = dummy_index_status("lagging-older");
-    lagging_older.sessions_newer_than_chunks = 1;
-    lagging_older.newest_chunk_mtime = Some("2026-06-11T12:33:26Z".to_string());
-
-    let plan = index_catch_up_plan_from_statuses(&[current, lagging_newer, lagging_older]).unwrap();
-
-    assert!(plan.needed);
-    assert_eq!(
-        plan.cutoff.unwrap().to_rfc3339(),
-        "2026-06-11T12:33:26+00:00"
-    );
-}
-
-#[test]
-fn index_catch_up_plan_skips_store_when_no_chunking_lag_exists() {
-    let status = dummy_index_status("ready");
-
-    let plan = index_catch_up_plan_from_statuses(&[status]).unwrap();
-
-    assert!(!plan.needed);
-    assert!(plan.cutoff.is_none());
-}
-
-#[test]
-fn index_catch_up_plan_uses_all_time_when_lagging_status_has_no_chunks() {
-    let mut missing_chunks = dummy_index_status("missing-chunks");
-    missing_chunks.sessions_newer_than_chunks = 5;
-    missing_chunks.newest_chunk_mtime = None;
-
-    let plan = index_catch_up_plan_from_statuses(&[missing_chunks]).unwrap();
-
-    assert!(plan.needed);
-    assert!(plan.cutoff.is_none());
-}
-
-#[test]
 fn index_status_json_payload_is_always_array_for_single_scope() {
     let reports = vec![(None, dummy_index_status("_all"))];
     let payload = index_status_json_payload(&reports);
@@ -1365,28 +1320,9 @@ fn all_defaults_to_silent_stdout() {
 }
 
 #[test]
-fn store_defaults_to_silent_stdout() {
-    let cli = Cli::try_parse_from(["aicx", "store"]).expect("store command should parse");
-
-    match cli.command {
-        Some(Commands::Store { emit, .. }) => {
-            assert!(matches!(emit, StdoutEmit::None));
-        }
-        other => panic!("expected store command, got {:?}", other.map(|_| "other")),
-    }
-}
-
-#[test]
-fn store_accepts_explicit_paths_emit() {
-    let cli = Cli::try_parse_from(["aicx", "store", "--emit", "paths"])
-        .expect("store command with explicit emit should parse");
-
-    match cli.command {
-        Some(Commands::Store { emit, .. }) => {
-            assert!(matches!(emit, StdoutEmit::Paths));
-        }
-        other => panic!("expected store command, got {:?}", other.map(|_| "other")),
-    }
+fn store_command_is_removed_and_catalog_is_live() {
+    assert!(Cli::try_parse_from(["aicx", "store"]).is_err());
+    assert!(Cli::try_parse_from(["aicx", "catalog", "rebuild"]).is_ok());
 }
 
 #[test]
@@ -1856,7 +1792,7 @@ fn primary_help_does_not_expose_layer_one_jargon() {
     let mut cmd = Cli::command();
     let mut rendered = cmd.render_long_help().to_string();
 
-    for subcommand in ["claude", "codex", "all", "store", "refs", "dashboard"] {
+    for subcommand in ["claude", "codex", "all", "catalog", "refs", "dashboard"] {
         let mut subcmd = Cli::command();
         let subcmd = subcmd
             .find_subcommand_mut(subcommand)
@@ -1871,11 +1807,12 @@ fn primary_help_does_not_expose_layer_one_jargon() {
 }
 
 #[test]
-fn top_level_help_uses_semantic_index_language() {
+fn top_level_help_uses_source_driven_lexical_index_language() {
     let mut cmd = Cli::command();
     let rendered = cmd.render_long_help().to_string();
 
-    assert!(rendered.contains("Layer 2 (optional semantic index)"));
+    assert!(rendered.contains("Index: lexical-first Tantivy over extracts"));
+    assert!(rendered.contains("dense rerank is optional"));
     assert!(!rendered.contains("retrieval kernel"));
 }
 
@@ -2025,37 +1962,30 @@ fn serve_help_prefers_http_name_and_stays_compact() {
 }
 
 #[test]
-fn search_help_explains_semantic_first_with_fuzzy_fallback() {
-    // `aicx search` is semantic-first and automatically degrades to
-    // filesystem-fuzzy when semantic cannot be served. The help text must
-    // surface both legs of the contract so operators know which retrieval ran.
+fn search_help_explains_lexical_first_with_bounded_fallback() {
+    // `aicx search` is lexical-first over CURRENT. Filesystem search is a
+    // bounded recovery path only when no index exists.
     let mut cmd = Cli::command();
     let search = cmd
         .find_subcommand_mut("search")
         .expect("search subcommand should exist");
     let rendered = search.render_long_help().to_string();
 
-    // Semantic leg must be visible — this is the new default.
     assert!(
-        rendered.to_lowercase().contains("semantic"),
-        "search --help must mention semantic retrieval (the new default)"
+        rendered.to_lowercase().contains("lexical-first"),
+        "search --help must name lexical retrieval as the default"
     );
-    // Fuzzy leg must be visible too — operators need to know it is
-    // the fallback, not a hidden behaviour.
     assert!(
-        rendered.to_lowercase().contains("fuzzy"),
-        "search --help must mention fuzzy as the fallback"
+        rendered.to_lowercase().contains("filesystem"),
+        "search --help must mention the filesystem recovery path"
     );
-    // Fallback contract must be named, not implied.
     assert!(
         rendered.to_lowercase().contains("fallback"),
         "search --help must call out the fallback path explicitly"
     );
-    // Old "filesystem-only" framing must be gone — it would mislead
-    // operators about what a build with `native-embedder` actually does.
     assert!(
         !rendered.contains("filesystem-only"),
-        "search --help must not advertise the legacy filesystem-only contract"
+        "search --help must not advertise filesystem as the primary contract"
     );
 }
 
@@ -2437,53 +2367,6 @@ fn doctor_deep_routing_covers_fix_scan_and_oracle_requests() {
         !doctor_needs_deep_pass(false, false, &probes),
         "--smoke/--verbose must not silently trigger the recursive pass"
     );
-}
-
-#[test]
-fn store_agent_filter_is_explicit_and_includes_junie() {
-    let mut cmd = Cli::command();
-    let store = cmd
-        .find_subcommand_mut("store")
-        .expect("store subcommand should exist");
-    let rendered = store.render_long_help().to_string();
-
-    assert!(
-        rendered.contains("claude, codex, gemini, junie, grok")
-            || rendered.contains("claude, codex, gemini, junie")
-    );
-    assert!(rendered.contains("codescribe"));
-    assert!(rendered.contains("operator-md"));
-
-    let cli = Cli::try_parse_from(["aicx", "store", "--agent", "junie"])
-        .expect("store should accept junie agent filter");
-    match cli.command {
-        Some(Commands::Store { agent, .. }) => {
-            assert_eq!(agent.as_deref(), Some("junie"));
-        }
-        _ => panic!("expected store command"),
-    }
-
-    let cli = Cli::try_parse_from(["aicx", "store", "--agent", "codescribe"])
-        .expect("store should accept codescribe agent filter");
-    match cli.command {
-        Some(Commands::Store { agent, .. }) => {
-            assert_eq!(agent.as_deref(), Some("codescribe"));
-        }
-        _ => panic!("expected store command"),
-    }
-
-    let cli = Cli::try_parse_from(["aicx", "store", "--agent", "operator-md"])
-        .expect("store should accept operator-md agent filter");
-    match cli.command {
-        Some(Commands::Store { agent, .. }) => {
-            assert_eq!(agent.as_deref(), Some("operator-md"));
-        }
-        _ => panic!("expected store command"),
-    }
-
-    let err = Cli::try_parse_from(["aicx", "store", "--agent", "oops"])
-        .expect_err("store should reject unknown agent filters");
-    assert!(err.to_string().contains("possible values"));
 }
 
 #[test]
@@ -2969,7 +2852,7 @@ fn direct_file_boundary_rejects_directory_without_output() {
 #[test]
 fn extractor_help_states_hours_zero_is_all_time() {
     let mut cmd = Cli::command();
-    for subcommand in ["all", "claude", "codex", "store"] {
+    for subcommand in ["all", "claude", "codex"] {
         let command = cmd
             .find_subcommand_mut(subcommand)
             .expect("extractor subcommand should exist");

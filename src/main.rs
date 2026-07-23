@@ -1,13 +1,12 @@
 //! AI Contexters — the operator front door for agent session logs.
 //!
-//! `aicx` orchestrates a two-layer pipeline: canonical corpus first,
-//! optional semantic index second. Materialization is always explicit.
+//! `aicx` catalogs live agent sources, renders readable session extracts, and
+//! publishes a lexical-first retrieval index. Materialization is explicit.
 //!
-//! Two-layer architecture:
-//!   1. **Canonical corpus** (`~/.aicx/`) — deduplicated, chunked, steerable markdown.
-//!      Built by extractors (`claude`, `codex`, `all`) and `store`. This is ground truth.
-//!   2. **Optional semantic index** — local embedding-backed retrieval for builds that
-//!      opt into native embedder support. The corpus remains useful without it.
+//! Runtime architecture:
+//!   1. **Catalog** (`~/.aicx/catalog/sessions.jsonl`) — session identity and attribution.
+//!   2. **Extracts** (`~/.aicx/extracts/`) — optional readable session-level cache.
+//!   3. **Index** (`~/.aicx/indexed/_all/hybrid`) — Tantivy by default; dense is optional.
 //!
 //! Supported sources:
 //! - Claude Code: ~/.claude/projects/*/*.jsonl
@@ -71,12 +70,12 @@ fn print_intent_schema_migration_report(report: &intents::MigrationReport) {
 /// aicx — operator front door for agent session logs.
 ///
 /// Operator-driven pipeline:
-///   Canonical corpus: extract, deduplicate, and chunk agent logs into
-///     steerable markdown at ~/.aicx/. This is ground truth.
-///   Layer 2 (optional semantic index): local embedding-backed retrieval for native builds,
-///     while the canonical corpus stays portable and useful without it.
+///   Catalog: map live agent sessions to projects and source paths.
+///   Extracts: render one readable user/assistant transcript per session.
+///   Index: lexical-first Tantivy over extracts; dense rerank is optional.
 /// Quick start:
-///   aicx all -H 4                      # build canonical corpus
+///   aicx catalog rebuild
+///   aicx index
 #[derive(Debug, Parser)]
 #[command(name = "aicx")]
 #[command(author = "(c)2026 Vetcoders")]
@@ -891,10 +890,10 @@ enum Commands {
     },
 
     // ── Layer 1: Canonical corpus ─────────────────────────────────────
-    /// Extract and store Agents' sessions into the canonical corpus (canonical corpus extraction).
+    /// Extract Claude sessions into local reports.
     ///
     /// Reads claude-code session files, then
-    /// writes steerable Markdown files to a central store.
+    /// writes readable Markdown/JSON reports only when an output is requested.
     #[command(display_order = 2)]
     Claude {
         #[command(flatten)]
@@ -961,10 +960,10 @@ enum Commands {
         conversation: bool,
     },
 
-    /// Extract and store Codex sessions into the canonical corpus.
+    /// Extract Codex sessions into local reports.
     ///
     /// Reads codex session files, then
-    /// writes steerable Markdown files to a central store.
+    /// writes readable Markdown/JSON reports only when an output is requested.
     #[command(display_order = 3)]
     Codex {
         #[command(flatten)]
@@ -1031,7 +1030,7 @@ enum Commands {
         conversation: bool,
     },
 
-    /// Extract and store from all agents (Claude + Codex + Gemini + Junie + Codescribe) into the canonical corpus.
+    /// Extract sessions from all supported agents into local reports.
     ///
     /// The daily-driver command: runs each extractor, deduplicates, chunks, and
     /// writes steerable markdown to ~/.aicx/. By default, uses per-source
@@ -1203,65 +1202,6 @@ enum Commands {
     Catalog {
         #[command(subcommand)]
         action: CatalogAction,
-    },
-
-    /// Build the canonical corpus in from local agents' session files.
-    ///
-    /// **RETIRING (2026-07-23):** prefer `aicx catalog rebuild` for identity
-    /// inventory and `aicx extract` for readable session markdown. Card-mill
-    /// writes remain for one migration window so existing index paths keep
-    /// working; they are not the target architecture.
-    ///
-    /// Store-first corpus builder: extracts, deduplicates, chunks, and writes
-    /// steerable Markdown. By default, this command uses per-source watermarks
-    /// to skip previously scanned history. Use --full-rescan for backfills
-    /// and targeted re-extraction when you need to ignore the watermark.
-    ///
-    #[command(display_order = 4)]
-    Store {
-        #[command(flatten)]
-        redaction: RedactionArgs,
-
-        /// Source cwd/project filter(s): narrows session discovery before repo segmentation
-        #[arg(short, long, value_delimiter = ',')]
-        project: Vec<String>,
-
-        /// Agent filter: one of claude, codex, gemini, junie, grok, codescribe, operator-md.
-        /// Default: claude+codex+gemini+junie+grok+codescribe (operator-md is opt-in
-        /// via `--agent operator-md`).
-        #[arg(short, long, value_parser = ["claude", "codex", "gemini", "junie", "grok", "codescribe", "operator-md"])]
-        agent: Option<String>,
-
-        /// Hours to look back (default: 48, 0 = all time)
-        #[arg(short = 'H', long, default_value = "48")]
-        hours: u64,
-
-        /// Ignore the stored watermark and previously-seen hashes for this run
-        #[arg(long)]
-        full_rescan: bool,
-
-        /// Legacy no-op: incremental mode is now the default
-        #[arg(long, hide = true, conflicts_with = "full_rescan")]
-        incremental: bool,
-
-        /// Only include user messages (exclude assistant + reasoning)
-        #[arg(long)]
-        user_only: bool,
-
-        /// Include assistant messages (legacy flag; now default)
-        #[arg(long, hide = true, conflicts_with = "user_only")]
-        include_assistant: bool,
-
-        /// Disable structural-noise filter (line-numbered grep matches, tool
-        /// echoes, stray YAML delimiters). Default: filter is ON. Use this
-        /// for debugging or when raw upstream content must be preserved
-        /// verbatim in the chunk text.
-        #[arg(long)]
-        no_noise_filter: bool,
-
-        /// What to print to stdout: paths, json, none (default: none)
-        #[arg(long, value_enum, default_value_t = StdoutEmit::None)]
-        emit: StdoutEmit,
     },
 
     /// Ingest operator-owned source documents into the canonical corpus.
@@ -1611,8 +1551,9 @@ enum Commands {
         no_gitignore: bool,
     },
 
-    /// Search the canonical corpus. Semantic by default; automatic
-    /// filesystem-fuzzy fallback when semantic search is unavailable.
+    /// Search the CURRENT source/extract index. Lexical-first by default;
+    /// optional dense rerank with --deep. When no index exists, the only
+    /// fallback is a bounded recency-ranked filesystem search.
     #[command(display_order = 12)]
     Search {
         /// Search query string
@@ -1645,7 +1586,7 @@ enum Commands {
         #[command(flatten)]
         filters: RetrievalFilters,
 
-        /// Filter by canonical corpus kind: conversations, plans, reports, other.
+        /// Filter by indexed document kind: conversations, plans, reports, other.
         #[arg(long, value_parser = ["conversations", "conversation", "plans", "plan", "reports", "report", "other"])]
         kind: Option<String>,
 
@@ -1681,25 +1622,23 @@ enum Commands {
         action: EvalAction,
     },
 
-    /// Catch up the canonical corpus, then build the semantic index. Use
-    /// `--dry-run` to preview without writing.
+    /// Build the source-driven lexical index. Use `--dry-run` to preview
+    /// parsing and filtering without writing extracts or publishing CURRENT.
     ///
-    /// Default behaviour is INCREMENTAL: first materialize missing canonical
-    /// chunks from source sessions, then embed only sidecars whose mtime is
-    /// newer than the existing index `header.generated_at`; new rows are
-    /// appended to the committed index file. With no `-p`, AICX builds the
-    /// `_all` index used by global search and project-scoped `search -p`
-    /// queries. Optional per-project buckets can be derived later with
-    /// `aicx index derive -p <project>` as a local cache. Pass
-    /// `--full-rescan` to re-embed every chunk from scratch — useful when
-    /// the embedder model changes, the index file is corrupt, or an
-    /// operator wants a deterministic from-zero rebuild.
+    /// Default behaviour is incremental by source fingerprint: when the
+    /// catalog and source metadata are unchanged, AICX reuses CURRENT without
+    /// parsing session bodies. Otherwise it parses the selected sources,
+    /// filters tool/internal/system noise, and atomically publishes a fresh
+    /// Tantivy generation. With no `-p`, this is the `_all` index used by both
+    /// global search and project-scoped `search -p` queries. Dense vectors are
+    /// optional and are not built by this command.
     #[command(display_order = 14)]
     Index {
         #[command(subcommand)]
         action: Option<IndexAction>,
 
-        /// Project filter. Omit to index the global `_all` bucket.
+        /// Project filter for `--dry-run` inspection only. Persistent indexing
+        /// always publishes the global `_all` catalog; `search -p` filters it.
         ///
         /// Accepted forms (case-insensitive, repeatable):
         ///   `-p owner/repo`   strict `<owner>/<repo>` slug match
@@ -1713,7 +1652,7 @@ enum Commands {
         #[arg(short, long, value_delimiter = ',')]
         project: Vec<String>,
 
-        /// Stop after sampling this many chunks (0 = scan all)
+        /// Retired compatibility flag; source indexing always scans the selected catalog.
         #[arg(long, default_value = "0")]
         sample: usize,
 
@@ -1732,12 +1671,16 @@ enum Commands {
         )]
         dry_run: bool,
 
-        /// Force a full re-embed of every chunk. Default is incremental:
-        /// walk only sidecars newer than the existing index's
-        /// `header.generated_at` and append. Use this flag after embedder
-        /// model changes or when the committed index is suspect.
+        /// Ignore the source fingerprint and rebuild the selected lexical
+        /// generation from every cataloged source.
         #[arg(long)]
         full_rescan: bool,
+
+        /// Cache one readable conversation extract per indexed session under
+        /// `~/.aicx/extracts/`. Omit to keep content only in live sources and
+        /// Tantivy (zero filesystem content duplication).
+        #[arg(long)]
+        cache_extracts: bool,
     },
 
     /// Manage `$HOME/.aicx/config.toml` for embedders and endpoints.
@@ -2498,39 +2441,6 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
                 run_catalog_resolve(&session, json)?;
             }
         },
-        Some(Commands::Store {
-            redaction,
-            project,
-            agent,
-            hours,
-            full_rescan,
-            incremental,
-            user_only,
-            include_assistant: include_assistant_flag,
-            no_noise_filter,
-            emit,
-        }) => {
-            let include_assistant = include_assistant_flag || !user_only;
-            warn_incremental_legacy_flag(incremental);
-            warn_pending_mutation("store");
-            eprintln!(
-                "aicx store: retiring card-mill path — prefer `aicx catalog rebuild` for \
-                 identity inventory and `aicx extract` for readable sessions. Card writes \
-                 still run this window so legacy index pipelines do not break mid-migration."
-            );
-            run_store(StoreRunArgs {
-                project,
-                agent,
-                hours,
-                cutoff: None,
-                full_rescan,
-                include_assistant,
-                emit,
-                redact_secrets: redaction.redact_secrets,
-                noise_filter_enabled: !no_noise_filter,
-                operator_md_input: None,
-            })?;
-        }
         Some(Commands::Ingest {
             redaction,
             source,
@@ -2811,6 +2721,7 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
             json,
             dry_run,
             full_rescan,
+            cache_extracts,
         }) => match action {
             Some(IndexAction::Status { project, json }) => {
                 run_index_status(&project, json)?;
@@ -2826,7 +2737,7 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
                 if !dry_run {
                     warn_pending_mutation("index");
                 }
-                run_index(&project, sample, json, dry_run, full_rescan)?
+                run_index(&project, sample, json, dry_run, full_rescan, cache_extracts)?
             }
         },
         Some(Commands::Config { action }) => {
@@ -8265,249 +8176,58 @@ impl SemanticFallbackNotice {
     }
 }
 
-/// Build the `IndexEvent` -> sink fanout used by `aicx index`. Always
-/// includes a tracing adapter (for log capture / non-TTY runs); adds an
-/// `IndicatifSink` with live ETA + rate when stderr is an interactive
-/// terminal. Translates `IndexEvent` variants into `ProgressUpdate`s that
-/// drive the progress bar position, length, message, and final-state.
-#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
-fn build_index_event_fanout(
-    interactive: bool,
-) -> std::sync::Arc<aicx::progress::FanOut<aicx_progress_contracts::IndexEvent>> {
-    use aicx::progress::{FanOut, IndicatifSink, ProgressUpdate, TracingSink};
-    use aicx_progress_contracts::IndexEvent;
-
-    let render = |event: &IndexEvent| -> Option<ProgressUpdate> {
-        match event {
-            IndexEvent::RunStarted { total_items, .. } => Some(ProgressUpdate {
-                position: 0,
-                length: Some(*total_items as u64),
-                message: Some("embedding chunks".to_string()),
-                finished: false,
-            }),
-            IndexEvent::StatsTick {
-                processed,
-                total,
-                items_per_sec,
-                eta_secs,
-                failed,
-                ..
-            } => {
-                let eta_label = match eta_secs {
-                    Some(secs) if *secs >= 60.0 => {
-                        let mins = (secs / 60.0).floor();
-                        let rem = secs - mins * 60.0;
-                        format!("ETA {mins:.0}m{rem:02.0}s")
-                    }
-                    Some(secs) => format!("ETA {secs:.0}s"),
-                    None => "ETA …".to_string(),
-                };
-                let err_suffix = if *failed > 0 {
-                    format!(" · {failed} failed")
-                } else {
-                    String::new()
-                };
-                Some(ProgressUpdate {
-                    position: *processed as u64,
-                    length: Some(*total as u64),
-                    message: Some(format!("{items_per_sec:.1}/s · {eta_label}{err_suffix}")),
-                    finished: false,
-                })
-            }
-            IndexEvent::RunCompleted {
-                processed,
-                indexed,
-                failed,
-                elapsed,
-                ..
-            } => Some(ProgressUpdate {
-                position: *processed as u64,
-                length: Some(*processed as u64),
-                message: Some(format!(
-                    "done · {indexed} indexed · {failed} failed · {:.1}s",
-                    elapsed.as_secs_f64()
-                )),
-                finished: true,
-            }),
-            _ => None,
-        }
-    };
-
-    let mut fan = FanOut::<IndexEvent>::new();
-    fan.push(std::sync::Arc::new(IndicatifSink::new(
-        0,
-        interactive,
-        render,
-    )));
-    fan.push(std::sync::Arc::new(TracingSink));
-    std::sync::Arc::new(fan)
-}
-
-fn write_index_for_current_build(
-    scope: Option<&str>,
-    sample: usize,
-    interactive: bool,
-    full_rescan: bool,
-) -> Result<aicx::vector_index::IndexStats> {
-    #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
-    {
-        let fan = build_index_event_fanout(interactive);
-        let fan_for_closure = std::sync::Arc::clone(&fan);
-        let on_event = move |event: &aicx_progress_contracts::IndexEvent| {
-            use aicx::progress::EventSink;
-            fan_for_closure.on_event(event);
-        };
-        let options = aicx::vector_index::IndexBuildOptions { full_rescan };
-        aicx::vector_index::write_index_with_options(scope, sample, options, &on_event)
-    }
-
-    #[cfg(not(any(feature = "native-embedder", feature = "cloud-embedder")))]
-    {
-        let _ = (scope, sample, interactive, full_rescan);
-        anyhow::bail!(
-            "aicx index requires a semantic embedder backend; rebuild with \
-             --features native-embedder or --features cloud-embedder, or use \
-             `aicx index --dry-run` to inspect corpus/index readiness without embedding"
-        );
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct IndexCatchUpPlan {
-    needed: bool,
-    cutoff: Option<DateTime<Utc>>,
-}
-
-fn index_catch_up_plan_from_statuses(statuses: &[aicx::IndexStatus]) -> Result<IndexCatchUpPlan> {
-    let mut needed = false;
-    let mut cutoff: Option<DateTime<Utc>> = None;
-
-    for status in statuses {
-        if status.sessions_newer_than_chunks == 0 {
-            continue;
-        }
-        needed = true;
-        let Some(newest_chunk_mtime) = status.newest_chunk_mtime.as_deref() else {
-            return Ok(IndexCatchUpPlan {
-                needed: true,
-                cutoff: None,
-            });
-        };
-        let parsed = DateTime::parse_from_rfc3339(newest_chunk_mtime)
-            .with_context(|| format!("parse newest_chunk_mtime `{newest_chunk_mtime}`"))?
-            .with_timezone(&Utc);
-        cutoff = Some(cutoff.map_or(parsed, |current| current.min(parsed)));
-    }
-
-    Ok(IndexCatchUpPlan { needed, cutoff })
-}
-
-fn index_catch_up_plan(scopes: &[Option<&str>]) -> Result<IndexCatchUpPlan> {
-    let store_root = store::store_base_dir()?;
-    let statuses = scopes
-        .iter()
-        .map(|scope| aicx::api::index_status_at(&store_root, *scope))
-        .collect::<Result<Vec<_>>>()?;
-    index_catch_up_plan_from_statuses(&statuses)
-}
-
-/// Build (or preview) the vector index. `dry_run=true` probes the
-/// embedder + samples chunks for ETA. `dry_run=false` writes a
-/// persistent NDJSON-backed index (Iter 3) that subsequent `aicx search`
-/// queries against via cosine similarity.
+/// Build (or preview) the source-driven lexical index.
+///
+/// The catalog plus live sources are the corpus. The producer renders one
+/// in-memory extract per session and publishes Tantivy directly; it writes
+/// readable extract files only with `--cache-extracts`, and never materializes
+/// per-frame cards or embedding NDJSON intermediates.
 fn run_index(
     projects: &[String],
-    sample: usize,
+    _sample: usize,
     json: bool,
     dry_run: bool,
     full_rescan: bool,
+    cache_extracts: bool,
 ) -> Result<()> {
     let resolved_scopes = resolve_index_scopes(projects)?;
-    let scopes: Vec<Option<&str>> = resolved_scopes.iter().map(Option::as_deref).collect();
-
-    let interactive = std::io::IsTerminal::is_terminal(&std::io::stderr()) && !json;
-
-    if !dry_run {
-        let catch_up = index_catch_up_plan(&scopes)?;
-        if catch_up.needed {
-            eprintln!("Canonical catch-up: materializing source sessions before embedding");
-            if let Some(cutoff) = catch_up.cutoff {
-                eprintln!("  Catch-up cutoff: {}", cutoff.to_rfc3339());
-            } else {
-                eprintln!("  Catch-up cutoff: <all time>");
-            }
-            run_store(StoreRunArgs {
-                project: projects.to_vec(),
-                agent: None,
-                hours: 0,
-                cutoff: catch_up.cutoff,
-                full_rescan: true,
-                include_assistant: true,
-                emit: StdoutEmit::None,
-                redact_secrets: true,
-                noise_filter_enabled: true,
-                operator_md_input: None,
-            })?;
-        } else {
-            eprintln!("Canonical catch-up: no source sessions newer than chunks");
-        }
-    }
-
-    // G-3: announce embedder backend class so the operator can predict perf.
-    // Cloud HTTP (~2.5s/req) vs native GGUF (~50ms/req on M-series) matter
-    // for ETA expectations; suppressed in --json mode so machine readers
-    // get a clean payload.
-    if !json {
-        #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
-        if let Some(label) = aicx::vector_index::probe_backend_label() {
-            eprintln!("Backend: {}", label);
-        }
-    }
-
-    let mut reports = Vec::with_capacity(scopes.len());
-    for scope in scopes {
-        let stats = if dry_run {
-            let _lock = aicx::locks::acquire_exclusive(aicx::locks::lance_lock_path()?)?;
-            aicx::vector_index::dry_run_index(scope, sample)?
-        } else {
-            write_index_for_current_build(scope, sample, interactive, full_rescan)?
-        };
-        reports.push((scope.map(ToString::to_string), stats));
-    }
-
-    if json {
-        if reports.len() == 1 {
-            println!("{}", aicx::vector_index::render_stats_json(&reports[0].1)?);
-        } else {
-            let payload = reports
-                .iter()
-                .map(|(project, stats)| {
-                    serde_json::json!({
-                        "project": project.as_deref().unwrap_or("_all"),
-                        "stats": stats,
-                    })
-                })
-                .collect::<Vec<_>>();
-            println!("{}", serde_json::to_string(&payload)?);
-        }
+    let filters: Vec<String> = resolved_scopes.into_iter().flatten().collect();
+    let aicx_home = store::resolve_aicx_home()?;
+    let _lock = if dry_run {
+        None
     } else {
-        for (idx, (project, stats)) in reports.iter().enumerate() {
-            if reports.len() > 1 {
-                if idx > 0 {
-                    eprintln!();
-                }
-                eprintln!(
-                    "scope: {}",
-                    project
-                        .as_deref()
-                        .filter(|value| !value.is_empty())
-                        .unwrap_or("_all")
-                );
+        Some(aicx::locks::acquire_exclusive(
+            aicx::locks::lance_lock_path()?,
+        )?)
+    };
+    let report =
+        aicx::source_index::build(&aicx_home, &filters, dry_run, full_rescan, cache_extracts)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        eprintln!(
+            "aicx index: {} lexical session document(s) in {} ms{}",
+            report.lexical_docs,
+            report.wall_ms,
+            if report.unchanged {
+                " (incremental no-op)"
+            } else if dry_run {
+                " (dry run)"
+            } else {
+                ""
             }
-            eprint!("{}", aicx::vector_index::render_stats_text(stats));
-            if let Some(path) = &stats.index_path {
-                eprintln!("\n  index_path:          {}", path.display());
-            }
+        );
+        eprintln!(
+            "  sources: total={} parsed={} skipped={}",
+            report.sources_total, report.sources_parsed, report.sources_skipped
+        );
+        eprintln!(
+            "  frames: raw={} signal={} filtered={}",
+            report.raw_frames, report.signal_frames, report.filtered_frames
+        );
+        eprintln!("  extracts_written: {}", report.extracts_written);
+        if let Some(path) = &report.manifest_path {
+            eprintln!("  manifest: {path}");
         }
     }
     Ok(())

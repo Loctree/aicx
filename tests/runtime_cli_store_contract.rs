@@ -472,7 +472,7 @@ fn sources_protect_apply_creates_only_local_git_without_remote() {
 }
 
 #[test]
-fn normal_store_and_extract_do_not_initialize_source_git() {
+fn catalog_and_extract_do_not_initialize_source_git_or_create_store() {
     let root = unique_test_dir("source-normal-readonly");
     let home = root.join("home");
     let source_root = home.join(".codex");
@@ -488,14 +488,18 @@ fn normal_store_and_extract_do_not_initialize_source_git() {
         &[("user", now - 60, "private source root must stay read-only")],
     );
 
-    let store_output = run_aicx(
-        &home,
-        &["store", "--agent", "codex", "-H", "24", "--emit", "json"],
-    );
-    assert_success(&store_output);
+    let catalog_output = run_aicx(&home, &["catalog", "rebuild", "--json"]);
+    assert_success(&catalog_output);
+    let catalog = parse_stdout_json(&catalog_output);
+    assert_eq!(catalog["cards_written"].as_u64(), Some(0));
+    assert_eq!(catalog["total_sessions"].as_u64(), Some(1));
     assert!(
         !source_root.join(".git").exists(),
-        "store must not initialize git in source roots"
+        "catalog must not initialize git in source roots"
+    );
+    assert!(
+        !home.join(".aicx").join("store").exists(),
+        "catalog rebuild must not recreate the retired card store"
     );
 
     let input_arg = history.display().to_string();
@@ -523,46 +527,20 @@ fn normal_store_and_extract_do_not_initialize_source_git() {
 }
 
 #[test]
-fn store_cli_deduplicates_exact_entries_on_first_run() {
-    let root = unique_test_dir("store-exact-dedup");
+fn retired_store_subcommand_is_rejected() {
+    let root = unique_test_dir("retired-store-command");
     let home = root.join("home");
-    let repo_root = home.join("hosted").join("Vetcoders").join("aicx");
-    let history = home
-        .join(".codex")
-        .join("sessions")
-        .join("2026")
-        .join("07")
-        .join("13")
-        .join("rollout-test.jsonl");
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time before unix epoch")
-        .as_secs() as i64;
+    let output = run_aicx(&home, &["store"]);
 
-    fs::create_dir_all(repo_root.join(".git")).expect("create repo root");
-    write_codex_history(
-        &history,
-        "store-dedup-sess",
-        Some(&repo_root),
-        &[
-            ("user", now - 300, "duplicate store context"),
-            ("user", now - 300, "duplicate store context"),
-        ],
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("unrecognized subcommand 'store'"),
+        "retired command should fail at the CLI grammar boundary"
     );
-
-    let output = parse_stdout_json(&run_aicx(
-        &home,
-        &["store", "--agent", "codex", "-H", "24", "--emit", "json"],
-    ));
-    assert_eq!(output["total_entries"].as_u64(), Some(1));
-
-    let store_paths = json_paths(&output, "store_paths");
-    let combined_store = store_paths
-        .iter()
-        .map(|path| fs::read_to_string(path).expect("read store chunk"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert_eq!(combined_store.matches("duplicate store context").count(), 1);
+    assert!(
+        !home.join(".aicx").join("store").exists(),
+        "rejected command must not recreate the retired card store"
+    );
 
     let _ = fs::remove_dir_all(&root);
 }
@@ -658,96 +636,6 @@ fn store_cli_codex_emits_repo_and_non_repo_canonical_roots() {
         store_paths
             .iter()
             .all(|path| !path.to_string_lossy().contains(".codex/history.jsonl"))
-    );
-    assert!(store_paths.iter().all(|path| path.exists()));
-
-    let _ = fs::remove_dir_all(&root);
-}
-
-#[test]
-fn store_cli_store_command_emits_repo_and_non_repo_canonical_roots() {
-    let root = unique_test_dir("store-command");
-    let home = root.join("home");
-    let repo_root = home.join("hosted").join("Vetcoders").join("loctree");
-    let history = home
-        .join(".codex")
-        .join("sessions")
-        .join("2026")
-        .join("07")
-        .join("13")
-        .join("rollout-test.jsonl");
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time before unix epoch")
-        .as_secs() as i64;
-
-    fs::create_dir_all(repo_root.join(".git")).expect("create repo root");
-    write_codex_history(
-        &history,
-        "repo-store-sess",
-        Some(&repo_root),
-        &[
-            (
-                "user",
-                now - 120,
-                "Please inspect the loctree runtime contract.",
-            ),
-            ("assistant", now - 110, "Reviewing canonical emission now."),
-        ],
-    );
-    write_codex_history(
-        &history.with_file_name("rollout-unknown.jsonl"),
-        "unknown-store-sess",
-        None,
-        &[
-            ("user", now - 100, "Planning first, repository unknown."),
-            ("assistant", now - 90, "Still unresolved; keep this honest."),
-        ],
-    );
-
-    let output = run_aicx(
-        &home,
-        &["store", "--agent", "codex", "-H", "24", "--emit", "json"],
-    );
-    let payload = parse_stdout_json(&output);
-    let store_paths = json_paths(&payload, "store_paths");
-    let resolved_repositories = json_strings(&payload, "resolved_repositories");
-
-    assert!(
-        payload["total_entries"].as_u64().unwrap_or(0) >= 4,
-        "expected at least 4 entries"
-    );
-    assert!(
-        payload["total_chunks"].as_u64().unwrap_or(0) >= 2,
-        "expected at least 2 chunks"
-    );
-    assert!(payload["requested_source_filters"].is_null());
-    assert_eq!(resolved_repositories, vec!["Vetcoders/loctree".to_string()]);
-    assert_eq!(
-        payload["includes_non_repository_contexts"].as_bool(),
-        Some(true)
-    );
-    assert!(payload["resolved_store_buckets"]["Vetcoders/loctree"].is_object());
-    assert!(payload["resolved_store_buckets"]["non-repository-contexts"].is_object());
-    assert!(payload["repos"]["Vetcoders/loctree"].is_object());
-    assert!(payload["repos"].get("non-repository-contexts").is_none());
-    assert!(
-        store_paths.len() >= 2,
-        "expected at least 2 store paths, got {}",
-        store_paths.len()
-    );
-    assert!(store_paths.iter().any(|path| {
-        path.starts_with(
-            home.join(".aicx")
-                .join("store")
-                .join("Vetcoders")
-                .join("loctree"),
-        )
-    }));
-    assert!(
-        store_paths
-            .iter()
-            .any(|path| { path.starts_with(home.join(".aicx").join("non-repository-contexts")) })
     );
     assert!(store_paths.iter().all(|path| path.exists()));
 
@@ -1097,196 +985,6 @@ fn all_cli_force_ignores_watermark_like_full_rescan() {
         .filter_map(|entry| entry["message"].as_str())
         .collect::<Vec<_>>();
     assert!(forced_messages.contains(&"force late backfill inside lookback"));
-
-    let _ = fs::remove_dir_all(&root);
-}
-
-#[test]
-fn store_cli_defaults_to_incremental_and_full_rescan_recovers_backfill() {
-    let root = unique_test_dir("store-incremental-default");
-    let home = root.join("home");
-    let repo_root = home.join("hosted").join("Vetcoders").join("aicx");
-    let history = home
-        .join(".codex")
-        .join("sessions")
-        .join("2026")
-        .join("07")
-        .join("13")
-        .join("rollout-test.jsonl");
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time before unix epoch")
-        .as_secs() as i64;
-
-    fs::create_dir_all(repo_root.join(".git")).expect("create repo root");
-    write_codex_history(
-        &history,
-        "store-watermark-sess",
-        Some(&repo_root),
-        &[
-            ("user", now - 300, "store old context"),
-            ("assistant", now - 290, "store old reply"),
-        ],
-    );
-
-    let first = parse_stdout_json(&run_aicx(
-        &home,
-        &["store", "--agent", "codex", "-H", "24", "--emit", "json"],
-    ));
-    assert_eq!(first["total_entries"].as_u64(), Some(2));
-
-    append_codex_entry(
-        &history,
-        "store-watermark-sess",
-        Some(&repo_root),
-        "user",
-        now - 120,
-        "store new context",
-    );
-
-    let second = parse_stdout_json(&run_aicx(
-        &home,
-        &["store", "--agent", "codex", "-H", "24", "--emit", "json"],
-    ));
-    assert_eq!(second["total_entries"].as_u64(), Some(1));
-
-    append_codex_entry(
-        &history,
-        "store-watermark-sess",
-        Some(&repo_root),
-        "user",
-        now - 240,
-        "store late backfill",
-    );
-
-    let third = parse_stdout_json(&run_aicx(
-        &home,
-        &["store", "--agent", "codex", "-H", "24", "--emit", "json"],
-    ));
-    assert_eq!(third["total_entries"].as_u64(), Some(0));
-
-    let fourth = parse_stdout_json(&run_aicx(
-        &home,
-        &[
-            "store",
-            "--agent",
-            "codex",
-            "-H",
-            "24",
-            "--full-rescan",
-            "--emit",
-            "json",
-        ],
-    ));
-    assert_eq!(fourth["total_entries"].as_u64(), Some(4));
-
-    let store_paths = json_paths(&fourth, "store_paths");
-    let combined_store = store_paths
-        .iter()
-        .map(|path| fs::read_to_string(path).expect("read store chunk"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(combined_store.contains("store late backfill"));
-
-    let state = read_state(&home);
-    let expected_watermark = chrono::DateTime::<chrono::Utc>::from_timestamp(now - 120, 0)
-        .expect("valid timestamp")
-        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-    assert_eq!(
-        state["last_processed"]["codex:all"].as_str(),
-        Some(expected_watermark.as_str())
-    );
-
-    let _ = fs::remove_dir_all(&root);
-}
-
-#[test]
-fn store_cli_hours_zero_means_all_time() {
-    let root = unique_test_dir("store-hours-zero");
-    let home = root.join("home");
-    let repo_root = home.join("hosted").join("Vetcoders").join("aicx");
-    let history = home
-        .join(".codex")
-        .join("sessions")
-        .join("2026")
-        .join("07")
-        .join("13")
-        .join("rollout-test.jsonl");
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time before unix epoch")
-        .as_secs() as i64;
-
-    fs::create_dir_all(repo_root.join(".git")).expect("create repo root");
-    write_codex_history(
-        &history,
-        "store-all-time-sess",
-        Some(&repo_root),
-        &[(
-            "user",
-            now - (90 * 24 * 3600),
-            "store ancient context should still land with hours zero",
-        )],
-    );
-
-    let windowed = parse_stdout_json(&run_aicx(
-        &home,
-        &["store", "--agent", "codex", "-H", "48", "--emit", "json"],
-    ));
-    assert_eq!(windowed["total_entries"].as_u64(), Some(0));
-
-    let all_time = parse_stdout_json(&run_aicx(
-        &home,
-        &[
-            "store",
-            "--agent",
-            "codex",
-            "-H",
-            "0",
-            "--full-rescan",
-            "--emit",
-            "json",
-        ],
-    ));
-    assert_eq!(all_time["total_entries"].as_u64(), Some(1));
-
-    let store_paths = json_paths(&all_time, "store_paths");
-    let combined_store = store_paths
-        .iter()
-        .map(|path| fs::read_to_string(path).expect("read store chunk"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(combined_store.contains("store ancient context should still land with hours zero"));
-
-    let _ = fs::remove_dir_all(&root);
-}
-
-#[test]
-fn test_run_store_saves_state_on_empty_result() {
-    let root = unique_test_dir("store-empty-save");
-    let home = root.join("home");
-    let history = home
-        .join(".codex")
-        .join("sessions")
-        .join("2026")
-        .join("07")
-        .join("13")
-        .join("rollout-test.jsonl");
-    write_codex_history(&history, "empty-sess", None, &[]);
-
-    let output = parse_stdout_json(&run_aicx(
-        &home,
-        &["store", "--agent", "codex", "-H", "24", "--emit", "json"],
-    ));
-    assert_eq!(output["total_entries"].as_u64(), Some(0));
-
-    let state = read_state(&home);
-    let runs = state["runs"].as_array().expect("runs array in state.json");
-    assert_eq!(
-        runs.len(),
-        1,
-        "state should save run history even when no entries were extracted via store"
-    );
 
     let _ = fs::remove_dir_all(&root);
 }
