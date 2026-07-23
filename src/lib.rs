@@ -20,6 +20,7 @@ pub const BUILD_VERSION: &str = env!("AICX_BUILD_VERSION");
 pub const GIT_COMMIT: &str = env!("AICX_GIT_COMMIT");
 pub const GIT_DIRTY: bool = env!("AICX_GIT_DIRTY").as_bytes()[0] == b'1';
 
+pub mod aicx_home;
 pub mod api;
 #[cfg(feature = "app")]
 pub mod auth;

@@ -1,5 +1,4 @@
 use anyhow::{Context, Result};
-use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -21,8 +20,11 @@ const MIGRATION_MANIFEST_FILENAME: &str = "manifest.json";
 const MIGRATION_REPORT_FILENAME: &str = "report.md";
 const IDENTITY_MIGRATION_MANIFEST_FILENAME: &str = "identity-manifest.json";
 const IDENTITY_MIGRATION_REPORT_FILENAME: &str = "identity-report.md";
-const CONFIG_FILENAME: &str = "config.toml";
-const DEFAULT_AICX_DIRNAME: &str = ".aicx";
+#[cfg(test)]
+pub(crate) use crate::aicx_home::resolve_from as resolve_aicx_home_from;
+pub use crate::aicx_home::{
+    ensure as store_base_dir, resolve as resolve_aicx_home, root_for as store_base_dir_for,
+};
 
 pub(crate) fn canonical_project_slug(project: &str) -> String {
     project
@@ -57,117 +59,6 @@ fn canonical_path_segment(value: &str, label: &str) -> Result<String> {
         anyhow::bail!("invalid context corpus {label} segment: {value:?}");
     }
     Ok(cleaned)
-}
-
-/// Resolve the canonical AICX home directory.
-///
-/// Precedence:
-/// 1. `$AICX_HOME` when set and non-empty.
-/// 2. `[storage].home` in the bootstrap config at `$HOME/.aicx/config.toml`.
-/// 3. `$HOME/.aicx`.
-///
-/// The bootstrap config is fixed at `$HOME/.aicx/config.toml` on purpose:
-/// without a stable first read location, a config-driven home would be
-/// circular. Use `AICX_HOME` for one-shot overrides.
-/// Pure: no filesystem side effects, no directory creation. Use
-/// [`store_base_dir`] for the side-effecting public variant.
-pub fn resolve_aicx_home() -> Result<PathBuf> {
-    let home = crate::os_user_home().context("No home directory")?;
-    resolve_aicx_home_from(std::env::var_os("AICX_HOME"), &home)
-}
-
-pub(crate) fn resolve_aicx_home_from(
-    env_value: Option<OsString>,
-    home_dir: &Path,
-) -> Result<PathBuf> {
-    if let Some(value) = env_value.filter(|value| !value.is_empty()) {
-        return Ok(PathBuf::from(value));
-    }
-    let default_home = home_dir.join(DEFAULT_AICX_DIRNAME);
-    if let Some(configured) = configured_home_from_bootstrap_config(home_dir, &default_home)? {
-        return Ok(configured);
-    }
-    Ok(default_home)
-}
-
-fn configured_home_from_bootstrap_config(
-    home_dir: &Path,
-    default_home: &Path,
-) -> Result<Option<PathBuf>> {
-    let config_path = default_home.join(CONFIG_FILENAME);
-    if !config_path.exists() {
-        return Ok(None);
-    }
-    // Size-capped, traversal-checked, allowlist-enforced read (semgrep:
-    // tainted-path). The bootstrap config sits at a fixed location under
-    // `$HOME/.aicx/`, but it is still operator-writable input.
-    let raw = crate::sanitize::read_to_string_validated(&config_path)
-        .with_context(|| format!("failed to read bootstrap config {}", config_path.display()))?;
-    let parsed: toml::Value = toml::from_str(&raw)
-        .with_context(|| format!("failed to parse bootstrap config {}", config_path.display()))?;
-    let Some(value) = parsed
-        .get("storage")
-        .and_then(|storage| storage.get("home"))
-        .and_then(|home| home.as_str())
-    else {
-        return Ok(None);
-    };
-    // Operator-writable input: reject control characters and `..`
-    // traversal before trusting the value as the AICX home, and accept
-    // only absolute paths (or `~`/`~/...` expanded against $HOME).
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return Ok(None);
-    }
-    if trimmed.chars().any(char::is_control) {
-        anyhow::bail!(
-            "invalid [storage].home in {}: control characters are not allowed",
-            config_path.display()
-        );
-    }
-    let path = if trimmed == "~" {
-        home_dir.to_path_buf()
-    } else if let Some(rest) = trimmed.strip_prefix("~/") {
-        home_dir.join(rest)
-    } else {
-        PathBuf::from(trimmed)
-    };
-    if path
-        .components()
-        .any(|component| matches!(component, std::path::Component::ParentDir))
-    {
-        anyhow::bail!(
-            "invalid [storage].home in {}: parent-directory traversal (`..`) is not allowed, got {:?}",
-            config_path.display(),
-            value
-        );
-    }
-    if !path.is_absolute() {
-        anyhow::bail!(
-            "invalid [storage].home in {}: expected an absolute path or ~/..., got {:?}",
-            config_path.display(),
-            value
-        );
-    }
-    Ok(Some(path))
-}
-
-/// Pure: builds the AICX base directory under an explicit `home`.
-///
-/// No env reads, no filesystem creation. Use in tests to assert path-shape
-/// invariants without depending on `$AICX_HOME` or `$HOME`.
-pub fn store_base_dir_for(home: &Path) -> PathBuf {
-    home.to_path_buf()
-}
-
-/// Returns the AICX base directory: `$AICX_HOME` or `$HOME/.aicx/`.
-///
-/// Creates the directory if it does not exist.
-pub fn store_base_dir() -> Result<PathBuf> {
-    let dir = store_base_dir_for(&resolve_aicx_home()?);
-    fs::create_dir_all(&dir)
-        .with_context(|| format!("Failed to create store dir: {}", dir.display()))?;
-    Ok(dir)
 }
 
 /// Returns the canonical repo-centric store root: `$AICX_HOME/store/`.
