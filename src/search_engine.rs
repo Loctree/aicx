@@ -784,6 +784,11 @@ fn lexical_rerank_window(limit: usize, project_scoped: bool) -> usize {
 /// lexical relevance is reasonably close. The seven-day decay deliberately
 /// reflects the operator's default question: "where did we discuss this
 /// recently?"
+///
+/// Scores are intentionally allowed to exceed 100 after the boost. The old
+/// `.min(100)` clamp erased the prior whenever BM25 already sat near the
+/// display ceiling (common for short operator queries), so same-day and
+/// ten-day-old hits tied at 100 and ranking fell back to date noise.
 fn apply_recency_prior(results: &mut [FuzzyResult]) {
     let today = chrono::Utc::now().date_naive();
     for result in results.iter_mut() {
@@ -800,7 +805,9 @@ fn apply_recency_prior(results: &mut [FuzzyResult]) {
         };
         let age_days = (today - date).num_days().max(0) as f32;
         let boost = (45.0 * (-age_days / 7.0).exp()).round() as u8;
-        result.score = result.score.saturating_add(boost).min(100);
+        // Cap at 145 (100 lexical + max 45 recency) — keeps relative ranking
+        // while still fitting the historical u8 score field.
+        result.score = result.score.saturating_add(boost).min(145);
     }
 }
 
@@ -2640,6 +2647,37 @@ mod tests {
         assert!(
             results[0].score > results[1].score,
             "a current close match should beat a ten-day-old repeated mention"
+        );
+    }
+
+    #[test]
+    fn recency_prior_still_separates_when_lexical_scores_are_already_capped() {
+        // Operator repro: short queries map many BM25 hits to score=100; the
+        // prior must still prefer today's hit over a week-old repeat.
+        let today = chrono::Utc::now().date_naive();
+        let fresh_date = today.format("%Y-%m-%d").to_string();
+        let stale_date = (today - chrono::Duration::days(7))
+            .format("%Y-%m-%d")
+            .to_string();
+        let mut results = vec![
+            fuzzy(100, "conversations", &stale_date, None),
+            fuzzy(100, "conversations", &fresh_date, None),
+        ];
+
+        apply_recency_prior(&mut results);
+        results.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| b.date.cmp(&a.date)));
+
+        assert!(
+            results[0].date == fresh_date && results[0].score > results[1].score,
+            "fresh capped hit must outrank stale capped hit; got scores {} ({}), {} ({})",
+            results[0].score,
+            results[0].date,
+            results[1].score,
+            results[1].date
+        );
+        assert!(
+            results[0].score > 100,
+            "recency boost must be allowed past the old display ceiling of 100"
         );
     }
 

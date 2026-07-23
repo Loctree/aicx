@@ -411,6 +411,9 @@ struct SessionWriteSpec<'a> {
 /// - `~/.aicx/store/<project>/<date>/<time>_<agent>-context.json`
 ///
 /// Returns paths of both files.
+///
+/// When the card mill is disabled (default operator binary), returns an empty
+/// vector and creates nothing — dual-body silence for the catalog era.
 pub fn write_context(
     project: &str,
     agent: &str,
@@ -418,6 +421,9 @@ pub fn write_context(
     time: &str,
     entries: &[TimelineEntry],
 ) -> Result<Vec<PathBuf>> {
+    if !card_mill_writes_enabled() {
+        return Ok(Vec::new());
+    }
     let project = canonical_project_slug(project);
     let mut written = Vec::new();
 
@@ -457,6 +463,9 @@ pub fn write_context(
 /// Layout (legacy): `~/.aicx/store/<project>/<date>/<time>_<agent>-<seq:03>.md`
 ///
 /// Returns paths of all written chunk files.
+///
+/// When the card mill is disabled (default operator binary), returns an empty
+/// vector and creates nothing.
 pub fn write_context_chunked(
     project: &str,
     agent: &str,
@@ -465,6 +474,9 @@ pub fn write_context_chunked(
     entries: &[TimelineEntry],
     chunker_config: &ChunkerConfig,
 ) -> Result<Vec<PathBuf>> {
+    if !card_mill_writes_enabled() {
+        return Ok(vec![]);
+    }
     if entries.is_empty() {
         return Ok(vec![]);
     }
@@ -499,6 +511,10 @@ pub fn write_context_chunked(
 /// Date is derived from the source event timestamps, not from runtime.
 ///
 /// Returns paths of all written chunk files.
+///
+/// When the card mill is disabled (default operator binary), returns an empty
+/// vector and creates nothing. Migration/salvage must use
+/// [`store_semantic_segments_at_forced`] instead of this public helper.
 pub fn write_context_session_first(
     project: &str,
     agent: &str,
@@ -508,6 +524,9 @@ pub fn write_context_session_first(
     chunker_config: &ChunkerConfig,
     kind: Option<Kind>,
 ) -> Result<Vec<PathBuf>> {
+    if !card_mill_writes_enabled() {
+        return Ok(Vec::new());
+    }
     let mut sha_cache = DirShaCache::default();
     Ok(write_context_session_first_outcome_at(
         &canonical_store_dir()?,

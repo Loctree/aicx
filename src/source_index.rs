@@ -227,6 +227,13 @@ fn parse_catalog_source(entry: &CatalogEntry, path: &Path) -> Result<Vec<Timelin
     if entry.agent == "vibecrafted" {
         let body = crate::sanitize::read_to_string_validated(path)
             .with_context(|| format!("read runtime transcript {}", path.display()))?;
+        // Token-stream runtime_runs logs interleave thought fragments with
+        // visible text. Indexing the raw body made search surface
+        // `{"type":"thought","data":"The"}` spam over real operator answers.
+        let message = vibecrafted_signal_body(&body);
+        if message.trim().is_empty() {
+            return Ok(Vec::new());
+        }
         let timestamp = fs::metadata(path)
             .ok()
             .and_then(|metadata| metadata.modified().ok())
@@ -237,7 +244,7 @@ fn parse_catalog_source(entry: &CatalogEntry, path: &Path) -> Result<Vec<Timelin
             agent: entry.agent.clone(),
             session_id: entry.session_id.clone(),
             role: "assistant".to_string(),
-            message: body,
+            message,
             frame_kind: Some(FrameKind::AgentReply),
             branch: None,
             cwd: entry.cwd.clone(),
@@ -368,6 +375,66 @@ fn is_signal_frame(frame: &TimelineEntry) -> bool {
     signal_kind
         && !crate::extraction::is_harness_injected_noise(&frame.role, &frame.message)
         && !looks_like_binary_payload(&frame.message)
+}
+
+/// Collapse a vibecrafted `runtime_runs/*/transcript.log` into indexable text.
+///
+/// Keeps visible `text` tokens and nested `agent_message` bodies; drops pure
+/// `thought` token streams. Non-JSON lines (plain markdown transcripts) pass
+/// through unchanged.
+fn vibecrafted_signal_body(body: &str) -> String {
+    let mut out = String::new();
+    let mut saw_json_line = false;
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            if !saw_json_line {
+                out.push_str(line);
+                out.push('\n');
+            }
+            continue;
+        };
+        saw_json_line = true;
+        let Some(ty) = value.get("type").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        match ty {
+            "thought" => continue,
+            "text" => {
+                if let Some(data) = value.get("data").and_then(serde_json::Value::as_str) {
+                    out.push_str(data);
+                }
+            }
+            "item.completed" => {
+                if let Some(item) = value.get("item") {
+                    let item_ty = item.get("type").and_then(serde_json::Value::as_str);
+                    if matches!(item_ty, Some("agent_message") | Some("message"))
+                        && let Some(text) = item.get("text").and_then(serde_json::Value::as_str)
+                    {
+                        if !out.is_empty() && !out.ends_with('\n') {
+                            out.push('\n');
+                        }
+                        out.push_str(text);
+                        out.push('\n');
+                    }
+                }
+            }
+            "agent_message" | "message" => {
+                if let Some(text) = value.get("text").and_then(serde_json::Value::as_str) {
+                    if !out.is_empty() && !out.ends_with('\n') {
+                        out.push('\n');
+                    }
+                    out.push_str(text);
+                    out.push('\n');
+                }
+            }
+            _ => {}
+        }
+    }
+    clean_message(&out)
 }
 
 fn looks_like_binary_payload(message: &str) -> bool {
@@ -536,5 +603,37 @@ mod tests {
                 .to_string()
                 .contains("project-scoped index publishing is retired")
         );
+    }
+
+    #[test]
+    fn vibecrafted_signal_body_drops_thought_tokens_and_keeps_visible_text() {
+        let raw = r#"{"type":"thought","data":"The"}
+{"type":"thought","data":" user"}
+{"type":"text","data":"I'll"}
+{"type":"text","data":" start"}
+{"type":"text","data":" with"}
+{"type":"text","data":" catalog"}
+{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"Routing strzałek is W2-B-4c."}}
+"#;
+        let cleaned = vibecrafted_signal_body(raw);
+        assert!(
+            cleaned.contains("I'll start with catalog"),
+            "visible text tokens must reassemble; got {cleaned:?}"
+        );
+        assert!(
+            cleaned.contains("Routing strzałek is W2-B-4c."),
+            "agent_message bodies must survive; got {cleaned:?}"
+        );
+        assert!(
+            !cleaned.contains("thought") && !cleaned.contains("\"data\":\"The\""),
+            "thought token streams must not enter the index; got {cleaned:?}"
+        );
+    }
+
+    #[test]
+    fn vibecrafted_signal_body_keeps_plain_markdown_transcripts() {
+        let raw = "# implement report\n\nRouting strzałek taby landed in W2-B-4c.\n";
+        let cleaned = vibecrafted_signal_body(raw);
+        assert!(cleaned.contains("Routing strzałek taby landed in W2-B-4c."));
     }
 }

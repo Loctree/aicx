@@ -1150,7 +1150,7 @@ enum Commands {
         input: Option<PathBuf>,
     },
 
-    /// Batch-export conversation JSON files without writing to the canonical store.
+    /// Batch-export conversation JSON files without writing card-mill files.
     ///
     /// Thin wrapper around `aicx extract --conversation` semantics: scans source
     /// sessions, groups by session_id, and writes one JSON file per session.
@@ -1246,9 +1246,9 @@ enum Commands {
     // ── Layer 1: Query & inspect ──────────────────────────────────────
     /// List raw agent session sources on disk (pre-extraction inputs).
     ///
-    /// Shows Claude Code, Codex, Gemini, and Junie log paths with session counts
-    /// and sizes. This is what extractors will read from — use `refs` to
-    /// see what is already in the canonical store after extraction.
+    /// Shows Claude Code, Codex, Gemini, Junie, and Grok log paths with session
+    /// counts and sizes. This is what extractors will read from — use
+    /// `catalog resolve` / `extract` to inspect identity and readable transcripts.
     #[command(display_order = 10)]
     List,
 
@@ -1309,7 +1309,7 @@ enum Commands {
         format: String,
     },
 
-    /// Interactive daily-driver entrypoint for corpus, doctor, intents, and store.
+    /// Interactive daily-driver entrypoint for catalog, extracts, index, and doctor.
     #[command(display_order = 9)]
     Wizard {
         /// Render one frame and exit; used by automated smoke tests.
@@ -1317,9 +1317,10 @@ enum Commands {
         smoke_test: bool,
     },
 
-    /// List chunks in the canonical store inventory.
+    /// List recent extract/catalog inventory under ~/.aicx/.
     ///
-    /// Shows what extractors have already written to ~/.aicx/.
+    /// Shows what the extract-era identity path has already materialised
+    /// (extracts cache and legacy card trees if still present on disk).
     #[command(display_order = 11)]
     Refs {
         /// Hours to look back (filter by canonical chunk date)
@@ -1363,7 +1364,7 @@ enum Commands {
         info: bool,
     },
 
-    /// Generate a searchable HTML dashboard from the canonical store, or serve it locally.
+    /// Generate a searchable HTML dashboard from extracts/catalog, or serve it locally.
     Dashboard(#[command(flatten)] DashboardArgs),
 
     /// Extract Vibecrafted workflow and marbles reports into a standalone HTML explorer.
@@ -1790,14 +1791,15 @@ enum Commands {
         dry_run: bool,
     },
 
-    /// Diagnose and optionally repair the canonical store and steer index.
+    /// Diagnose and optionally repair AICX home health (index, state, residual store).
     ///
-    /// Runs integrity checks on the Lance steer DB, BM25 index, state.json,
-    /// sidecar coverage, and corpus bucket names. With
+    /// Runs integrity checks on the Lance steer DB, BM25/lexical index,
+    /// state.json, sidecar coverage, and residual corpus bucket names. With
     /// `--rebuild-steer-index`, corrupted steer indexes are deleted and
-    /// rebuilt from the canonical store (which is treated as ground truth
-    /// and never modified). Other remediations live behind dedicated flags
-    /// (`--prune-empty-bodies`, `--fix-buckets`, `aicx store --full-rescan`).
+    /// rebuilt from available corpus material (never invents cards). Other
+    /// remediations live behind dedicated flags (`--prune-empty-bodies`,
+    /// `--fix-buckets`). Prefer `aicx catalog rebuild` + `aicx index` for
+    /// the extract-era identity path.
     ///
     /// Exit codes: 0 on green/warning or after successful rebuild; 1 if
     /// critical issues are detected without remediation.
@@ -1808,7 +1810,7 @@ enum Commands {
             .multiple(true)
     ))]
     Doctor {
-        /// Delete and rebuild the steer index from the canonical store
+        /// Delete and rebuild the steer index from available corpus material
         /// when corrupted or schema-incompatible. Narrower contract than
         /// the legacy `--fix` (which was a no-op for sidecars/index
         /// consistency/empty bodies — those have dedicated flags).
