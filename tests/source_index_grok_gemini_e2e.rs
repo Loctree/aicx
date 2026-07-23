@@ -328,18 +328,16 @@ fn grok_and_gemini_catalog_index_search_and_filter_ratio() {
     let echo_stdout = String::from_utf8_lossy(&echo_search.stdout);
     let echo_stderr = String::from_utf8_lossy(&echo_search.stderr);
     let echo_blob = format!("{echo_stdout}{echo_stderr}");
-    if echo_search.status.success() {
-        if let Ok(payload) = serde_json::from_str::<Value>(&echo_stdout) {
-            if let Some(items) = payload.get("items").and_then(|v| v.as_array()) {
-                if let Some(top) = items.first() {
-                    let top_text = top.to_string();
-                    assert!(
-                        !top_text.contains(SELF_ECHO_MARKER),
-                        "self-echo marker must not rank top: {top_text}"
-                    );
-                }
-            }
-        }
+    if echo_search.status.success()
+        && let Ok(payload) = serde_json::from_str::<Value>(&echo_stdout)
+        && let Some(items) = payload.get("items").and_then(|v| v.as_array())
+        && let Some(top) = items.first()
+    {
+        let top_text = top.to_string();
+        assert!(
+            !top_text.contains(SELF_ECHO_MARKER),
+            "self-echo marker must not rank top: {top_text}"
+        );
     }
     assert!(
         !echo_blob.contains(&format!("\"text\":\"{SELF_ECHO_MARKER}\"")),
