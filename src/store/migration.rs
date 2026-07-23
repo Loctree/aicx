@@ -9,12 +9,12 @@ use std::path::{Path, PathBuf};
 
 use super::read_store_dir;
 use crate::chunker::ChunkerConfig;
-use crate::sanitize;
-use crate::store::atomic_write::atomic_write;
-use crate::store::paths::{
+use crate::legacy_archive::atomic_write::atomic_write;
+use crate::legacy_archive::paths::{
     legacy_salvage_dir, legacy_store_base_dir, migration_manifest_path, migration_report_path,
     store_base_dir,
 };
+use crate::sanitize;
 #[cfg(feature = "app")]
 use crate::timeline::ExtractionConfig;
 use crate::timeline::TimelineEntry;

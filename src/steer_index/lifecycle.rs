@@ -65,7 +65,7 @@ fn restore_if_missing(from: &Path, to: &Path) {
 
 pub(super) async fn rebuild_all_steer_index_at(
     base: &Path,
-    all_files: &[crate::store::StoredContextFile],
+    all_files: &[crate::legacy_archive::StoredContextFile],
 ) -> Result<()> {
     let next_base = base.join(STEER_NEXT_DIR);
     let prev_base = base.join(STEER_PREV_DIR);
@@ -128,7 +128,7 @@ pub(super) async fn query_steer_index_at(base: &Path) -> Result<Vec<ChromaDocume
 }
 
 pub(super) async fn bootstrap_steer_index_if_missing_at(base: &Path) -> Result<bool> {
-    let files = crate::store::scan_context_files_at(base)?;
+    let files = crate::legacy_archive::scan_context_files_at(base)?;
     if files.is_empty() {
         return Ok(false);
     }
@@ -178,7 +178,7 @@ pub(super) async fn ensure_steer_index_compatible_at(base: &Path) -> Result<()> 
             }
         }
         None => {
-            let files = crate::store::scan_context_files_at(base)?;
+            let files = crate::legacy_archive::scan_context_files_at(base)?;
             if files.is_empty() {
                 return Ok(());
             }
@@ -201,7 +201,7 @@ pub(super) async fn ensure_steer_index_compatible_for_write_at(base: &Path) -> R
                 return Err(err);
             };
 
-            let files = crate::store::scan_context_files_at(base)?;
+            let files = crate::legacy_archive::scan_context_files_at(base)?;
             if files.is_empty() {
                 tracing::info!("Clearing empty steer index after {incompatible}");
                 clear_steer_index_artifacts_at(base)?;
@@ -217,7 +217,7 @@ pub(super) async fn ensure_steer_index_compatible_for_write_at(base: &Path) -> R
 pub(super) async fn rebuild_steer_index_if_needed_at(base: &Path) -> Result<()> {
     ensure_steer_index_compatible_for_write_at(base).await?;
 
-    let all_files = crate::store::scan_context_files_at(base)?;
+    let all_files = crate::legacy_archive::scan_context_files_at(base)?;
     if all_files.is_empty() {
         clear_steer_index_artifacts_at(base)?;
         return Ok(());

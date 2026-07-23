@@ -67,7 +67,8 @@ pub(super) async fn sync_steer_index_at_with_reporter_and_filter_base(
     let storage = StorageManager::new_lance_only(&db_path.to_string_lossy()).await?;
     storage.ensure_collection().await?;
 
-    let (filtered_paths, _) = crate::store::filter_ignored_paths_at(filter_base, new_files)?;
+    let (filtered_paths, _) =
+        crate::legacy_archive::filter_ignored_paths_at(filter_base, new_files)?;
     let filtered_refs: Vec<&PathBuf> = filtered_paths.iter().collect();
     let docs = build_steer_docs(&filtered_refs);
 

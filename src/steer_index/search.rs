@@ -55,7 +55,7 @@ pub(super) fn metadata_matches(meta: &serde_json::Value, filter: &SteerFilter<'_
     let kind_lower = filter.kind.map(str::to_ascii_lowercase);
 
     // Strict canonical project filter: split the stored `<owner>/<repo>`
-    // slug and delegate to `aicx::store::project_filter_matches` so the
+    // slug and delegate to `aicx::legacy_archive::project_filter_matches` so the
     // steer-index path agrees with `aicx search`, dashboard, refs/since,
     // and rank. Substring fallback (`-p vista` matching `vista-portal`,
     // `vista-datasets`, etc.) is intentionally removed — Bug #29.
@@ -64,7 +64,8 @@ pub(super) fn metadata_matches(meta: &serde_json::Value, filter: &SteerFilter<'_
         if !needle.is_empty() {
             if let Some(stored) = meta.get("project").and_then(|v| v.as_str()) {
                 let (organization, repository) = stored.split_once('/').unwrap_or(("", stored));
-                if !crate::store::project_filter_matches(organization, repository, needle) {
+                if !crate::legacy_archive::project_filter_matches(organization, repository, needle)
+                {
                     return false;
                 }
             } else {
@@ -128,7 +129,7 @@ pub(super) fn metadata_matches(meta: &serde_json::Value, filter: &SteerFilter<'_
 }
 
 pub(super) fn build_store_scan_metadata(
-    file: &crate::store::StoredContextFile,
+    file: &crate::legacy_archive::StoredContextFile,
 ) -> serde_json::Value {
     let mut meta = serde_json::Map::new();
     meta.insert(
@@ -156,7 +157,7 @@ pub(super) fn build_store_scan_metadata(
         serde_json::Value::String(file.kind.dir_name().to_string()),
     );
 
-    if let Some(sidecar) = crate::store::load_sidecar(&file.path)
+    if let Some(sidecar) = crate::legacy_archive::load_sidecar(&file.path)
         && let Ok(val) = serde_json::to_value(sidecar)
         && let Some(obj) = val.as_object()
     {
@@ -173,7 +174,7 @@ pub(super) fn search_store_scan_at(
     filter: &SteerFilter<'_>,
     limit: usize,
 ) -> Result<Vec<serde_json::Value>> {
-    let files = crate::store::scan_context_files_at(base)?;
+    let files = crate::legacy_archive::scan_context_files_at(base)?;
     let mut results = Vec::new();
 
     for file in files.into_iter().rev() {

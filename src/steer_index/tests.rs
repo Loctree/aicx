@@ -10,7 +10,7 @@ use super::search::{build_candidate_query, build_store_scan_metadata, metadata_m
 use super::sync::sync_steer_index_at;
 use super::*;
 use crate::chunker::ChunkMetadataSidecar;
-use crate::store::Kind;
+use crate::legacy_archive::Kind;
 use crate::timeline::FrameKind;
 use rmcp_memex::storage::{ChromaDocument, StorageManager};
 use serde_json::json;
@@ -524,7 +524,7 @@ fn sync_replaces_existing_sidecar_metadata() {
     rt.block_on(sync_steer_index_at(&temp, &first_refs))
         .unwrap();
 
-    let mut updated_sidecar = crate::store::load_sidecar(&chunk_path).unwrap();
+    let mut updated_sidecar = crate::legacy_archive::load_sidecar(&chunk_path).unwrap();
     updated_sidecar.run_id = Some("mrbl-002".to_string());
     updated_sidecar.prompt_id = Some("p2".to_string());
     fs::write(
@@ -570,7 +570,7 @@ fn store_scan_metadata_falls_back_to_path_fields() {
     let chunk_path = chunk_dir.join("2026_0331_codex_sess1_001.md");
     fs::write(&chunk_path, "# chunk\n").unwrap();
 
-    let files = crate::store::scan_context_files_at(&temp).unwrap();
+    let files = crate::legacy_archive::scan_context_files_at(&temp).unwrap();
     let meta = build_store_scan_metadata(&files[0]);
     assert_eq!(
         meta.get("project").and_then(|v| v.as_str()),
@@ -602,7 +602,7 @@ fn candidate_query_uses_filter_terms() {
 fn metadata_matches_project_filter_is_strict_not_substring() {
     // Bug #29: steer-index candidate filter used to substring-match
     // `-p vista` against `vista-portal`. It now routes through the
-    // canonical `aicx::store::project_filter_matches`, so the bare
+    // canonical `aicx::legacy_archive::project_filter_matches`, so the bare
     // name `vista` must NOT match a `vetcoders/vista-portal` slug.
     let meta = json!({ "project": "vetcoders/vista-portal" });
     let filter = SteerFilter {
