@@ -182,13 +182,20 @@ impl HybridIndex {
         Ok(manifest)
     }
 
+    /// Load a published hybrid generation.
+    ///
+    /// `observed_source_hash` is optional. When present it is blake3-hashed and
+    /// compared to the manifest (build-time integrity). When `None`, source-hash
+    /// revalidation is skipped — still validating lexical commit, dense count,
+    /// dense kind, and embedder fingerprint. Search hot paths pass `None` so a
+    /// multi-GB primary NDJSON is never re-hashed on every query.
     pub fn load_from_manifest(
         lexical: Box<dyn LexicalIndex>,
         dense: Box<dyn DenseIndex>,
         fusion: Box<dyn FusionStrategy>,
         manifest_dir: impl Into<PathBuf>,
         embedder_fingerprint: EmbedderFingerprint,
-        observed_source_hash: &str,
+        observed_source_hash: Option<&str>,
     ) -> Result<Self> {
         let manifest_dir = manifest_dir.into();
         let manifest = Manifest::read_from_path(&manifest_dir.join("manifest.json"))?;
@@ -198,7 +205,7 @@ impl HybridIndex {
             dense.as_ref(),
             fusion.as_ref(),
             &embedder_fingerprint,
-            Some(observed_source_hash),
+            observed_source_hash,
         )?;
         Ok(Self {
             lexical,

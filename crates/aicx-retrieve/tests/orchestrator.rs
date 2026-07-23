@@ -112,7 +112,7 @@ fn load_index(dir: &Path, dim: usize, source_hash: &str) -> anyhow::Result<Hybri
         Box::new(ReciprocalRankFusion::default()),
         dir,
         fingerprint(dim),
-        source_hash,
+        Some(source_hash),
     )
 }
 
@@ -202,7 +202,7 @@ fn manifest_dim_mismatch_fails_fast() {
         Box::new(ReciprocalRankFusion::default()),
         temp.path(),
         fingerprint(dim + 1),
-        SOURCE_HASH,
+        Some(SOURCE_HASH),
     ));
     assert_retrieve_error(
         err,
@@ -242,7 +242,7 @@ fn manifest_embedder_drift_fails_fast() {
         Box::new(ReciprocalRankFusion::default()),
         temp.path(),
         EmbedderFingerprint::new("other-embedder", "https://embed.example/v1", dim, "cosine"),
-        SOURCE_HASH,
+        Some(SOURCE_HASH),
     ));
     assert_retrieve_error(
         err,

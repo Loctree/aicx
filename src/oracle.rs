@@ -72,6 +72,10 @@ pub enum OracleBackend {
     /// Dense cosine leg served without the lexical fusion leg — a degraded
     /// hybrid execution, never a healthy semantic claim.
     SemanticDenseOnly,
+    /// Lexical-first path against the published hybrid generation's Tantivy
+    /// artifact (default 2026-07-23). Not filesystem-fuzzy; not dense fusion.
+    #[serde(rename = "lexical_tantivy")]
+    LexicalTantivy,
     /// The caller produced results but carried no execution evidence; health
     /// cannot be claimed for this surface.
     RetrievalUnknown,
@@ -85,6 +89,8 @@ pub enum OracleIndexKind {
     CanonicalChunks,
     ContentChunks,
     OnionContent,
+    /// Published hybrid generation lexical leg (`tantivy_lex`).
+    LexicalTantivy,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -318,6 +324,54 @@ impl OracleStatus {
             lexical_doc_count: None,
             fusion_algorithm: None,
             #[cfg(feature = "app")]
+            retrieval: None,
+        }
+    }
+
+    /// Lexical-first answers from the published hybrid generation Tantivy
+    /// index. Distinct from [`Self::filesystem_fuzzy`] (last-resort card
+    /// scan when no generation exists).
+    #[cfg(feature = "app")]
+    pub fn lexical_tantivy(
+        store_root: &Path,
+        scanned_count: usize,
+        candidate_count: usize,
+        source_paths_verified: bool,
+        hybrid: Option<&crate::search_engine::HybridRetrievalStatus>,
+    ) -> Self {
+        let (indexed, generation_id, source_chunks, lexical_docs) = match hybrid {
+            Some(h) => (
+                h.lexical_doc_count.max(h.source_chunk_count),
+                Some(h.generation_id.clone()),
+                Some(h.source_chunk_count),
+                Some(h.lexical_doc_count),
+            ),
+            None => (scanned_count, None, None, None),
+        };
+        Self {
+            source_layer: canonical_layer(),
+            backend: OracleBackend::LexicalTantivy,
+            index_kind: OracleIndexKind::LexicalTantivy,
+            fallback_reason: None,
+            derived_view: "published_hybrid_generation_lexical_tantivy".to_string(),
+            store_root: display_path(store_root),
+            indexed_count: indexed,
+            scanned_count,
+            candidate_count,
+            source_paths_verified,
+            stale_or_unknown: !source_paths_verified,
+            loctree_scope_safe: source_paths_verified,
+            loctree_scope_note: if source_paths_verified {
+                "safe_for_lexical_scope_when_followed_by_canonical_chunk_read".to_string()
+            } else {
+                "unsafe_for_scope_narrowing; lexical hits must be re-read from source paths"
+                    .to_string()
+            },
+            manifest_generation_id: generation_id,
+            manifest_source_chunk_count: source_chunks,
+            dense_count: hybrid.map(|h| h.dense_count),
+            lexical_doc_count: lexical_docs,
+            fusion_algorithm: None,
             retrieval: None,
         }
     }

@@ -1073,7 +1073,7 @@ fn incremental_materialize_hybrid_refreshes_persisted_artifacts() {
         fusion,
         manifest_dir,
         hybrid_embedder_fingerprint(&info),
-        &source_hash,
+        Some(source_hash.as_str()),
     )
     .expect("fresh reload after incremental refresh");
     let manifest = reloaded.manifest().expect("reloaded manifest");

@@ -64,13 +64,17 @@ struct CandidateBoundary {
 
 const BACKEND_HYBRID_RRF: &str = "hybrid_rrf";
 const BACKEND_HYBRID_RRF_GLOBAL_SCOPED: &str = "hybrid_rrf_global_scoped";
+const BACKEND_LEXICAL: &str = "lexical_tantivy";
+const BACKEND_LEXICAL_GLOBAL_SCOPED: &str = "lexical_tantivy_global_scoped";
 const BACKEND_SEMANTIC_DENSE_ONLY: &str = "semantic_dense_only";
 const BACKEND_SEMANTIC_DENSE_ONLY_GLOBAL_SCOPED: &str = "semantic_dense_only_global_scoped";
 const BACKEND_SEMANTIC_LEGACY_DENSE: &str = "semantic_legacy_dense";
 const BACKEND_SEMANTIC_LEGACY_DENSE_GLOBAL_SCOPED: &str = "semantic_legacy_dense_global_scoped";
+/// Retired multi-shard fan-out budget (kept for regression tests only).
+#[cfg(all(test, any(feature = "native-embedder", feature = "cloud-embedder")))]
 const GLOBAL_SHARD_BUDGET: usize = 16;
 
-#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+#[cfg(all(test, any(feature = "native-embedder", feature = "cloud-embedder")))]
 fn bounded_global_shards(available: &[String]) -> (&[String], bool) {
     let selected = &available[..available.len().min(GLOBAL_SHARD_BUDGET)];
     (selected, available.len() > selected.len())
@@ -310,50 +314,49 @@ fn try_semantic_search_with_boundary(
 
     #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
     {
-        let available_projects = if project_filters.is_empty()
-            || (project_filters.len() == 1 && project_filters[0].is_none())
-        {
-            find_available_project_shards()?
-        } else {
-            Vec::new()
-        };
+        // Doctrine (2026-07-23): always query the published `_all` hybrid
+        // CURRENT generation once. Project is a metadata filter, never a
+        // separate index precondition and never a fan-out over project shards
+        // (that path hung multi-second / multi-GB).
         let global_query = project_filters.is_empty()
             || (project_filters.len() == 1 && project_filters[0].is_none());
-        let (selected_projects, shard_budget_saturated) =
-            bounded_global_shards(&available_projects);
-        let scopes = if global_query {
-            if !available_projects.is_empty() {
-                selected_projects.iter().map(|p| Some(p.as_str())).collect()
-            } else {
-                vec![None]
-            }
+        let scopes: Vec<Option<&str>> = if global_query {
+            vec![None]
         } else {
             project_filters.to_vec()
         };
         let per_scope_limit = limit.max(1);
+        let deep = candidate_filters.map(|f| f.deep).unwrap_or(false);
+        let legacy_dense = candidate_filters.map(|f| f.legacy_dense).unwrap_or(false);
         let mut merged_results = Vec::new();
         let mut scanned = 0usize;
         let mut model_id = None;
         let mut hybrid_statuses = Vec::new();
-        // Track whether any scope fell back to dense-only, so the merged
-        // outcome reports the degraded backend instead of silently claiming
-        // hybrid — the degraded status must reach the CLI/MCP boundary.
         let mut any_dense_only = false;
         let mut any_legacy_dense = false;
-        let mut any_global_project_scope = global_query;
-        let mut boundary = CandidateBoundary {
-            examined: 0,
-            saturated: shard_budget_saturated,
-        };
+        let mut any_lexical = false;
+        let mut any_global_project_scope = false;
+        let mut boundary = CandidateBoundary::default();
         for scope in scopes {
-            let (mut outcome, scope_boundary) = try_semantic_search_native(
-                query,
-                per_scope_limit,
-                scope,
-                frame_kind_filter,
-                kind_filter,
-                candidate_filters,
-            )?;
+            let (mut outcome, scope_boundary) = if deep || legacy_dense {
+                try_semantic_search_native(
+                    query,
+                    per_scope_limit,
+                    scope,
+                    frame_kind_filter,
+                    kind_filter,
+                    candidate_filters,
+                )?
+            } else {
+                try_lexical_search_native(
+                    query,
+                    per_scope_limit,
+                    scope,
+                    frame_kind_filter,
+                    kind_filter,
+                    candidate_filters,
+                )?
+            };
             boundary.examined = boundary.examined.saturating_add(scope_boundary.examined);
             boundary.saturated |= scope_boundary.saturated;
             if outcome
@@ -371,6 +374,9 @@ fn try_semantic_search_with_boundary(
             {
                 any_legacy_dense = true;
             }
+            if outcome.backend_label.starts_with(BACKEND_LEXICAL) {
+                any_lexical = true;
+            }
             if outcome.backend_label.ends_with("_global_scoped") {
                 any_global_project_scope = true;
             }
@@ -381,6 +387,7 @@ fn try_semantic_search_with_boundary(
             }
             merged_results.append(&mut outcome.results);
         }
+        apply_recency_prior(&mut merged_results);
         merged_results.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| b.date.cmp(&a.date)));
         merged_results.truncate(limit);
         Ok((
@@ -395,6 +402,10 @@ fn try_semantic_search_with_boundary(
                     BACKEND_SEMANTIC_DENSE_ONLY_GLOBAL_SCOPED
                 } else if any_dense_only {
                     BACKEND_SEMANTIC_DENSE_ONLY
+                } else if any_lexical && any_global_project_scope {
+                    BACKEND_LEXICAL_GLOBAL_SCOPED
+                } else if any_lexical {
+                    BACKEND_LEXICAL
                 } else if any_global_project_scope {
                     BACKEND_HYBRID_RRF_GLOBAL_SCOPED
                 } else {
@@ -476,58 +487,286 @@ fn select_semantic_bucket_scope<'a>(
     project_index_path: std::path::PathBuf,
     all_index_path: std::path::PathBuf,
 ) -> std::result::Result<SemanticBucketScope<'a>, SemanticError> {
+    // Prefer the global `_all` generation for every query. Project is a
+    // metadata filter on that corpus, not a separate index requirement.
+    // Optional per-project shards remain usable as a local cache when the
+    // global bucket is missing (migration / partial rollouts).
+    if all_index_path.exists() {
+        return Ok(SemanticBucketScope {
+            index_project: None,
+            retrieval_project_filter: project_filter,
+            index_path: all_index_path,
+            used_global_project_scope: project_filter.is_some(),
+        });
+    }
+
     if project_index_path.exists() {
         return Ok(SemanticBucketScope {
             index_project: project_filter,
-            // Keep project pushdown even inside a project-specific bucket as
-            // a defensive guard against stale or mixed-project artifacts.
             retrieval_project_filter: project_filter,
             index_path: project_index_path,
             used_global_project_scope: false,
         });
     }
 
-    if project_filter.is_some() {
-        // Project-filter queries do not map unrelated project vector payloads;
-        // fail-closed if the project-specific shard does not exist.
-        return Err(index_not_built_error(project_index_path, project_filter));
-    }
+    Err(index_not_built_error(
+        if project_filter.is_some() {
+            project_index_path
+        } else {
+            all_index_path
+        },
+        project_filter,
+    ))
+}
 
-    if all_index_path.exists() {
-        return Ok(SemanticBucketScope {
-            index_project: None,
-            retrieval_project_filter: None,
-            index_path: all_index_path,
-            used_global_project_scope: true,
+/// Lexical-first retrieval against the published `_all` hybrid CURRENT
+/// generation (Tantivy only). No embedder bootstrap, no dense mmap, no
+/// primary-NDJSON rehash. Project/kind/frame/agent filters are metadata
+/// pushdown. Dense re-rank lives behind `--deep` / `SemanticSearchFilters::deep`.
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+fn try_lexical_search_native(
+    query: &str,
+    limit: usize,
+    project_filter: Option<&str>,
+    frame_kind_filter: Option<FrameKind>,
+    kind_filter: Option<&str>,
+    candidate_filters: Option<&SemanticSearchFilters>,
+) -> std::result::Result<(SemanticOutcome, CandidateBoundary), SemanticError> {
+    if query.trim().is_empty() {
+        return Err(SemanticError::NoResults {
+            path: std::path::PathBuf::new(),
+            scanned: 0,
+            reason: "query is empty or whitespace-only".to_string(),
+            recommendation:
+                "pass a non-empty query, e.g. `aicx search 'how does the noise filter work'`"
+                    .to_string(),
         });
     }
 
-    Err(index_not_built_error(project_index_path, project_filter))
-}
+    // Always the global `_all` hybrid root — project is a filter, not a bucket.
+    let hybrid_root =
+        crate::vector_index::hybrid_root_dir(None).map_err(|err| SemanticError::IndexNotBuilt {
+            path: std::path::PathBuf::new(),
+            reason: format!("could not resolve hybrid root: {err}"),
+            recommendation: "ensure $AICX_HOME (or $HOME) is writable, then run `aicx index`"
+                .to_string(),
+        })?;
+    let gen_dir = crate::vector_index::resolve_hybrid_generation_dir(&hybrid_root);
+    let manifest_path = gen_dir.join("manifest.json");
+    if !manifest_path.exists() {
+        return Err(SemanticError::IndexNotBuilt {
+            path: manifest_path.clone(),
+            reason: format!(
+                "no published hybrid generation at {} (CURRENT + generations/)",
+                hybrid_root.display()
+            ),
+            recommendation: "run `aicx index` to publish a hybrid generation with tantivy_lex"
+                .to_string(),
+        });
+    }
 
-#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
-fn find_available_project_shards() -> std::result::Result<Vec<String>, SemanticError> {
-    let base = crate::store::store_base_dir().map_err(|err| SemanticError::IndexNotBuilt {
-        path: std::path::PathBuf::new(),
-        reason: format!("could not resolve store base dir: {err}"),
-        recommendation: "ensure $AICX_HOME (or $HOME) is writable".to_string(),
-    })?;
-    let projects = crate::store::project_identities_in_store_or_index_at(&base).map_err(|err| {
-        SemanticError::IndexNotBuilt {
-            path: base.clone(),
-            reason: format!("could not enumerate project shards: {err}"),
-            recommendation: "run `aicx doctor` to validate the store and index catalog".to_string(),
+    let manifest = aicx_retrieve::Manifest::read_from_path(&manifest_path).map_err(|err| {
+        SemanticError::RetrievalManifestStale {
+            path: manifest_path.clone(),
+            reason: format!("could not read retrieval manifest: {err}"),
+            recommendation: "run `aicx index` to rebuild the hybrid retrieval bucket".to_string(),
         }
     })?;
 
-    Ok(projects
+    // Fail closed when CURRENT did not resolve and the root still names the
+    // retired brute-force NDJSON dense adapter (would otherwise hang).
+    if gen_dir == hybrid_root && manifest.dense_kind == aicx_retrieve::BRUTE_FORCE_KIND {
+        return Err(SemanticError::RetrievalManifestStale {
+            path: manifest_path.clone(),
+            reason: "published hybrid manifest names the retired NDJSON dense adapter \
+                     and no CURRENT generation pointer is available"
+                .to_string(),
+            recommendation:
+                "run `aicx index` to publish an mmap generation, or pass `--legacy-dense` only for recovery"
+                    .to_string(),
+        });
+    }
+
+    let lexical = aicx_retrieve::TantivyAdapter::new(gen_dir.clone()).map_err(|err| {
+        SemanticError::RetrievalManifestStale {
+            path: manifest_path.clone(),
+            reason: format!("could not open hybrid lexical artifact: {err:#}"),
+            recommendation: "run `aicx index` to rebuild the committed hybrid artifacts"
+                .to_string(),
+        }
+    })?;
+
+    let retrieval_filters = SemanticRetrievalFilters {
+        kind: kind_filter,
+        frame_kind: frame_kind_filter,
+        project: project_filter,
+        agent: candidate_filters.and_then(|filters| filters.agent.as_deref()),
+        date: candidate_filters.and_then(candidate_exact_date),
+        candidate_filters,
+    };
+    let filters = hybrid_filters(retrieval_filters);
+    // Caller (try_semantic_search_filtered) already over-fetches for pushdown.
+    // Do not multiply again — that turned limit=50 into 500 and paid hundreds
+    // of store-file preview reads on the hot path.
+    let window = limit.max(1);
+
+    // Push project (and other equality filters) into Tantivy so BM25 ranks
+    // *inside* the project, not post-filters a global top-N (which silently
+    // emptied project-scoped queries when the project sat outside that window).
+    let mut query_filters = filters.clone();
+    // Client-side project_filter_matches still handles bare/wildcard forms;
+    // for exact owner/repo prefer the indexed project_filter field.
+    if project_filter.is_some_and(|p| p.contains('/') && !p.starts_with('/') && !p.ends_with('/')) {
+        // already in hybrid_filters
+    } else {
+        // Bare / wildcard: do not pin project_filter; client retain below.
+        query_filters.values.remove("project");
+    }
+
+    let raw = aicx_retrieve::LexicalIndex::query(
+        &lexical,
+        &aicx_retrieve::LexicalQuery {
+            text: query.to_string(),
+            limit: window,
+            filters: query_filters,
+        },
+    )
+    .map_err(|err| SemanticError::IndexCorrupt {
+        path: gen_dir.clone(),
+        reason: format!("lexical query failed: {err:#}"),
+        recommendation: "retry; if it persists rebuild with `aicx index`".to_string(),
+    })?;
+
+    let examined = raw.len();
+    let mut hits: Vec<aicx_retrieve::Hit> = raw
         .into_iter()
-        .filter(|project| {
-            crate::vector_index::hybrid_root_dir(Some(project))
-                .map(|root| root.join("CURRENT").exists())
-                .unwrap_or(false)
+        .filter(|hit| {
+            metadata_matches_filters(&hit.metadata, &filters)
+                && candidate_filters
+                    .is_none_or(|f| semantic_candidate_metadata_matches(&hit.metadata, f))
         })
-        .collect())
+        .collect();
+
+    // Project filter may be a bare name / wildcard form resolved by the CLI
+    // into a concrete slug; also accept case-insensitive equality on the
+    // stored project metadata string.
+    if let Some(project) = project_filter {
+        hits.retain(|hit| {
+            hit.metadata
+                .get("project")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|stored| {
+                    stored.eq_ignore_ascii_case(project)
+                        || crate::store::project_filter_matches(
+                            stored.split_once('/').map(|(o, _)| o).unwrap_or(""),
+                            stored.split_once('/').map(|(_, r)| r).unwrap_or(stored),
+                            project,
+                        )
+                })
+        });
+    }
+
+    let used_global = project_filter.is_some();
+    let backend_label = if used_global {
+        BACKEND_LEXICAL_GLOBAL_SCOPED
+    } else {
+        BACKEND_LEXICAL
+    };
+    // Build results without per-hit store file I/O. Preview lines are filled
+    // only for the truncated top set so missing-store paths cannot dominate.
+    let mut results: Vec<FuzzyResult> = hits
+        .into_iter()
+        .map(|h| {
+            let path = hit_path(&h);
+            let score_pct = lexical_score_pct(h.score);
+            FuzzyResult {
+                file: path.to_string_lossy().to_string(),
+                path: path.to_string_lossy().to_string(),
+                project: hit_metadata_string(&h, "project"),
+                kind: hit_metadata_string(&h, "kind"),
+                frame_kind: hit_metadata_optional_string(&h, "frame_kind"),
+                agent: hit_metadata_string(&h, "agent"),
+                date: hit_metadata_string(&h, "date"),
+                timestamp: None,
+                score: score_pct,
+                label: format!("{backend_label}:{}", h.chunk_id),
+                density: h.score,
+                matched_lines: Vec::new(),
+                session_id: hit_metadata_optional_string(&h, "session_id"),
+                cwd: hit_metadata_optional_string(&h, "cwd"),
+            }
+        })
+        .collect();
+
+    apply_recency_prior(&mut results);
+    results.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| b.date.cmp(&a.date)));
+    results.truncate(limit);
+    for result in &mut results {
+        let path = std::path::Path::new(&result.path);
+        if path.exists() {
+            result.matched_lines = semantic_preview_lines(path);
+        }
+    }
+
+    let retrieval_status = Some(HybridRetrievalStatus::from(&manifest));
+    let boundary = CandidateBoundary {
+        examined,
+        saturated: examined >= window && results.len() < limit,
+    };
+
+    Ok((
+        SemanticOutcome {
+            results,
+            scanned: examined,
+            backend_label,
+            model_id: manifest.embedder_model.clone(),
+            retrieval_status,
+        },
+        boundary,
+    ))
+}
+
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+fn metadata_matches_filters(
+    metadata: &serde_json::Value,
+    filters: &aicx_retrieve::FilterSet,
+) -> bool {
+    filters.values.iter().all(|(key, expected)| {
+        if key == "project" {
+            // Project uses richer matching in the caller.
+            return true;
+        }
+        metadata.get(key) == Some(expected)
+    })
+}
+
+/// Map a Tantivy BM25 score onto 0..=100 for operator-facing display.
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+fn lexical_score_pct(score: f32) -> u8 {
+    // BM25 commonly lands in ~0..25 for short queries; clamp generously.
+    ((score.max(0.0) / 25.0 * 100.0).round() as i32).clamp(0, 100) as u8
+}
+
+/// Recency prior: fresher dates beat stale ones when BM25/score is close.
+/// Half-life ~14 days, up to +25 score points for "today".
+fn apply_recency_prior(results: &mut [FuzzyResult]) {
+    let today = chrono::Utc::now().date_naive();
+    for result in results.iter_mut() {
+        let raw = result
+            .timestamp
+            .as_deref()
+            .map(|ts| ts.get(..10).unwrap_or(ts))
+            .unwrap_or(result.date.as_str());
+        if raw.is_empty() || raw == "-" {
+            continue;
+        }
+        let Ok(date) = chrono::NaiveDate::parse_from_str(raw, "%Y-%m-%d") else {
+            continue;
+        };
+        let age_days = (today - date).num_days().max(0) as f32;
+        let boost = (25.0 * (-age_days / 14.0).exp()).round() as u8;
+        result.score = result.score.saturating_add(boost).min(100);
+    }
 }
 
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
@@ -858,12 +1097,11 @@ fn load_hybrid_index(
             recommendation: "run `aicx index` to rebuild the hybrid retrieval bucket".to_string(),
         }
     })?;
-    let source_hash = crate::vector_index::observed_source_hash_for_index_path(source_index_path)
-        .map_err(|err| SemanticError::RetrievalManifestStale {
-        path: manifest_path.to_path_buf(),
-        reason: format!("could not hash committed source index: {err}"),
-        recommendation: "run `aicx index` to rebuild the committed hybrid artifacts".to_string(),
-    })?;
+    // Do NOT re-hash the multi-GB primary NDJSON on the search hot path —
+    // that alone made global search hang for tens of seconds. Generation
+    // bindings (lexical commit, dense count/kind, embedder fingerprint)
+    // still validate the published CURRENT generation.
+    let _ = source_index_path;
     let lexical = Box::new(
         aicx_retrieve::TantivyAdapter::new(manifest_dir.clone()).map_err(|err| {
             SemanticError::RetrievalManifestStale {
@@ -961,7 +1199,7 @@ fn load_hybrid_index(
         fusion,
         manifest_dir,
         fingerprint,
-        &source_hash,
+        None,
     )
     .map_err(|err| SemanticError::RetrievalManifestStale {
         path: manifest_path.to_path_buf(),
@@ -1263,13 +1501,15 @@ pub fn semantic_retrieval_outcome(
 ) -> RetrievalOutcome {
     let legacy_dense = backend_label.starts_with(BACKEND_SEMANTIC_LEGACY_DENSE);
     let dense_only = backend_label.starts_with(BACKEND_SEMANTIC_DENSE_ONLY);
-    let (executed_path, fallback_reason) = if legacy_dense {
+    let lexical = backend_label.starts_with(BACKEND_LEXICAL);
+    let (executed_path, fallback_reason, requested_mode) = if legacy_dense {
         (
             Some(ExecutedPath::DenseOnly),
             Some(
                 "operator_selected_legacy_dense: served brute-force cosine from the committed primary NDJSON index"
                     .to_string(),
             ),
+            RequestedMode::Hybrid,
         )
     } else if dense_only {
         (
@@ -1279,9 +1519,20 @@ pub fn semantic_retrieval_outcome(
                  cosine from the committed primary index"
                     .to_string(),
             ),
+            RequestedMode::Hybrid,
+        )
+    } else if lexical {
+        (
+            Some(ExecutedPath::LexicalOnly),
+            None,
+            RequestedMode::Lexical,
         )
     } else if retrieval_status.is_some() {
-        (Some(ExecutedPath::HybridFusion), None)
+        (
+            Some(ExecutedPath::HybridFusion),
+            None,
+            RequestedMode::Hybrid,
+        )
     } else {
         (
             None,
@@ -1289,10 +1540,11 @@ pub fn semantic_retrieval_outcome(
                 "execution_evidence_missing: semantic backend '{backend_label}' returned no \
                  hybrid manifest evidence"
             )),
+            RequestedMode::Hybrid,
         )
     };
     RetrievalOutcome::from_evidence(
-        RequestedMode::Hybrid,
+        requested_mode,
         RetrievalEvidence {
             executed_path,
             examined_count: Some(examined_count),
@@ -1385,12 +1637,39 @@ pub fn search_oracle_status_from_retrieval(
             source_paths_verified,
             fallback_reason(),
         ),
-        (ExecutedPath::LexicalOnly, _) => OracleStatus::filesystem_fuzzy(
-            store_root,
-            retrieval.examined_count,
-            candidate_count,
-            source_paths_verified,
-        ),
+        (ExecutedPath::LexicalOnly, hybrid) => {
+            // Intentional lexical-first (default) always carries a hybrid
+            // generation status when the Tantivy leg answered. True
+            // filesystem-fuzzy (no generation / semantic failed closed) has
+            // no hybrid status and usually a fallback_reason — keep that
+            // labeled fuzzy so oracle honesty is not re-written as index.
+            match hybrid {
+                Some(_) => OracleStatus::lexical_tantivy(
+                    store_root,
+                    retrieval.examined_count,
+                    candidate_count,
+                    source_paths_verified,
+                    hybrid,
+                ),
+                None if retrieval.fallback_reason.is_none()
+                    && retrieval.requested_mode == aicx_retrieve::RequestedMode::Lexical =>
+                {
+                    OracleStatus::lexical_tantivy(
+                        store_root,
+                        retrieval.examined_count,
+                        candidate_count,
+                        source_paths_verified,
+                        None,
+                    )
+                }
+                None => OracleStatus::filesystem_fuzzy(
+                    store_root,
+                    retrieval.examined_count,
+                    candidate_count,
+                    source_paths_verified,
+                ),
+            }
+        }
     };
     status.with_retrieval(retrieval.clone())
 }
@@ -1500,6 +1779,9 @@ pub struct SemanticSearchFilters {
     pub hours_cutoff: Option<String>,
     /// Use legacy NDJSON reader for dense vector search instead of versioned mmap.
     pub legacy_dense: bool,
+    /// When true, run dense re-rank (hybrid RRF). Default false is lexical-first
+    /// over the published `_all` CURRENT tantivy generation with a recency prior.
+    pub deep: bool,
 }
 
 impl SemanticSearchFilters {
@@ -2197,6 +2479,12 @@ pub fn fuzzy_search_with_post_filters(
         frame_kind,
     )?;
     apply_fuzzy_post_filters(&mut results, post_filters);
+    // Doctrine 2026-07-23: filesystem-fuzzy is the last resort when no
+    // hybrid index exists. Recency-ranked literal — not letter-soup of
+    // stale cards burying a same-day plan (operator repro: 2026-03 over
+    // 2026-07-22).
+    apply_recency_prior(&mut results);
+    results.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| b.date.cmp(&a.date)));
     Ok((results, scanned))
 }
 
@@ -2226,7 +2514,13 @@ pub fn finalize_fuzzy_results(
                 _ => t_b.cmp(t_a),
             }
         }),
-        None => results.sort_by_key(|b| std::cmp::Reverse(b.score)),
+        // Default: score first, then recency — fuzzy fallback must not bury
+        // fresh hits under letter-soup scoring of stale cards.
+        None => results.sort_by(|a, b| {
+            let t_a = a.timestamp.as_deref().unwrap_or(a.date.as_str());
+            let t_b = b.timestamp.as_deref().unwrap_or(b.date.as_str());
+            b.score.cmp(&a.score).then_with(|| t_b.cmp(t_a))
+        }),
     }
     results.into_iter().take(limit).collect()
 }
@@ -2624,10 +2918,11 @@ mod tests {
         assert_eq!(hybrid.fallback_reason, None);
     }
 
-    /// Direct project-filter queries must fail closed (never fall back to _all).
+    /// Project-filter queries use the global `_all` generation with metadata
+    /// pushdown when the project shard is absent.
     #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
     #[test]
-    fn project_bucket_missing_fails_closed_without_global_fallback() {
+    fn project_bucket_missing_falls_back_to_global_with_filter() {
         let dir =
             std::env::temp_dir().join(format!("aicx-semantic-global-scope-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -2637,23 +2932,25 @@ mod tests {
         std::fs::create_dir_all(all_index_path.parent().unwrap()).expect("create all bucket");
         std::fs::write(&all_index_path, "{}\n").expect("touch all index");
 
-        let err = select_semantic_bucket_scope(
+        let scope = select_semantic_bucket_scope(
             Some("vetcoders/vista"),
             project_index_path.clone(),
             all_index_path.clone(),
         )
-        .unwrap_err();
+        .expect("global fallback");
 
-        assert!(matches!(err, SemanticError::IndexNotBuilt { .. }));
+        assert_eq!(scope.index_path, all_index_path);
+        assert_eq!(scope.index_project, None);
+        assert_eq!(scope.retrieval_project_filter, Some("vetcoders/vista"));
+        assert!(scope.used_global_project_scope);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Project selection chooses the exact shard even when a global index is
-    /// also present. The foreign/global payload is never selected for mapping.
+    /// Global `_all` is preferred over a project shard when both exist.
     #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
     #[test]
-    fn project_bucket_selects_exact_shard_before_global_payload() {
+    fn global_bucket_preferred_over_project_shard() {
         let dir =
             std::env::temp_dir().join(format!("aicx-project-shard-select-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -2666,15 +2963,15 @@ mod tests {
 
         let scope = select_semantic_bucket_scope(
             Some("vetcoders/target"),
-            project_index_path.clone(),
-            all_index_path,
+            project_index_path,
+            all_index_path.clone(),
         )
-        .expect("exact project shard");
+        .expect("global preferred");
 
-        assert_eq!(scope.index_path, project_index_path);
-        assert_eq!(scope.index_project, Some("vetcoders/target"));
+        assert_eq!(scope.index_path, all_index_path);
+        assert_eq!(scope.index_project, None);
         assert_eq!(scope.retrieval_project_filter, Some("vetcoders/target"));
-        assert!(!scope.used_global_project_scope);
+        assert!(scope.used_global_project_scope);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3671,6 +3968,7 @@ mod tests {
             // hours_cutoff is set but ignored because date_lo/hi wins.
             hours_cutoff: Some("2026-05-01".to_string()),
             legacy_dense: false,
+            deep: false,
         };
         let filtered = apply_semantic_post_filters(pool, &filters);
         let ids: Vec<&str> = filtered.iter().map(|r| r.label.as_str()).collect();
