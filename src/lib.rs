@@ -23,6 +23,10 @@ pub const GIT_DIRTY: bool = env!("AICX_GIT_DIRTY").as_bytes()[0] == b'1';
 pub mod api;
 #[cfg(feature = "app")]
 pub mod auth;
+/// Durable extract-era session identity catalog (`~/.aicx/catalog/sessions.jsonl`).
+/// Replaces per-frame card mill for identity + project attribution.
+#[cfg(feature = "app")]
+pub mod catalog;
 #[cfg(feature = "app")]
 pub mod cli;
 #[cfg(feature = "app")]
