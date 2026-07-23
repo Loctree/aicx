@@ -16,8 +16,8 @@ use crate::chunker::{
     is_result_line, normalize_key, parse_checklist_task, truncate_signal_line,
 };
 use crate::extraction::{IntentLineModality, intent_line_modality, is_harness_injected_noise};
+use crate::legacy_archive;
 use crate::sanitize;
-use crate::store;
 use crate::timeline::FrameKind;
 use crate::types::{EntryState, EntryType, IntentEntry, Link, LinkType};
 
@@ -65,7 +65,7 @@ pub fn extract_intents(config: &IntentsConfig) -> Result<Vec<IntentRecord>> {
 }
 
 pub fn extract_intents_with_stats(config: &IntentsConfig) -> Result<IntentExtraction> {
-    let store_root = store::store_base_dir()?;
+    let store_root = legacy_archive::store_base_dir()?;
     extract_intents_from_root_at_with_stats(config, &store_root, Utc::now())
 }
 
@@ -73,7 +73,7 @@ pub fn extract_intents_with_stats_for_projects(
     config: &IntentsConfig,
     projects: &[String],
 ) -> Result<IntentExtraction> {
-    let store_root = store::store_base_dir()?;
+    let store_root = legacy_archive::store_base_dir()?;
     extract_intents_from_root_at_for_projects_with_stats(config, projects, &store_root, Utc::now())
 }
 
@@ -334,7 +334,7 @@ fn collect_chunk_files(
     let mut files = Vec::new();
     let scan_root = normalize_scan_root(store_root);
 
-    for file in store::scan_context_files_at(&scan_root)? {
+    for file in legacy_archive::scan_context_files_at(&scan_root)? {
         if file.path.extension().and_then(|ext| ext.to_str()) != Some("md") {
             continue;
         }
@@ -350,13 +350,13 @@ fn collect_chunk_files(
             .split_once('/')
             .unwrap_or(("", identity_project.as_str()));
         if !project.trim().is_empty()
-            && !store::project_filter_matches(organization, repository, project)
+            && !legacy_archive::project_filter_matches(organization, repository, project)
         {
             continue;
         }
-        let sidecar = store::load_sidecar(&file.path);
+        let sidecar = legacy_archive::load_sidecar(&file.path);
         if sidecar.as_ref().is_some_and(|sidecar| {
-            sidecar.artifact_family.as_deref() == Some(store::LOCT_CONTEXT_PACK_FAMILY)
+            sidecar.artifact_family.as_deref() == Some(legacy_archive::LOCT_CONTEXT_PACK_FAMILY)
                 || sidecar
                     .truth_status
                     .as_ref()
@@ -456,7 +456,7 @@ fn persisted_project_from_card(path: &Path) -> Result<Option<String>> {
 fn normalize_scan_root(store_root: &Path) -> PathBuf {
     if store_root
         .file_name()
-        .is_some_and(|name| name == store::CANONICAL_STORE_DIRNAME)
+        .is_some_and(|name| name == legacy_archive::CANONICAL_STORE_DIRNAME)
     {
         return store_root
             .parent()
@@ -1861,7 +1861,7 @@ fn truncate_summary_for_display(text: &str) -> String {
 
 /// Walks the dedup output and replaces `session_id` with the value parsed from
 /// the source_chunk filename when the two disagree. Filenames are produced by
-/// `store::session_basename` and treated as ground truth — that file actually
+/// `legacy_archive::session_basename` and treated as ground truth — that file actually
 /// exists and was read. A mismatched `session_id` claim is a provenance lie
 /// (it tells the operator "this is from session X" while citing a file that
 /// belongs to session Y).
@@ -3104,7 +3104,7 @@ fn link_insights_to_sources(entries: &mut [IntentEntry]) {
 // ── Migration support ───────────────────────────────────────────────
 
 pub fn migrate_intent_schema_dry_run(project_filter: Option<&str>) -> Result<MigrationReport> {
-    migrate_intent_schema_dry_run_at(&store::store_base_dir()?, project_filter)
+    migrate_intent_schema_dry_run_at(&legacy_archive::store_base_dir()?, project_filter)
 }
 
 pub fn migrate_intent_schema_dry_run_at(

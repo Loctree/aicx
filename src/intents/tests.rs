@@ -6,7 +6,7 @@ use std::fs;
 use std::path::PathBuf;
 
 fn chunk_path(root: &Path, project: &str, date: &str, name: &str) -> PathBuf {
-    let date_compact = crate::store::compact_date(date);
+    let date_compact = crate::legacy_archive::compact_date(date);
     let agent = if name.contains("_claude") || name.contains("claude") {
         "claude"
     } else if name.contains("_gemini") || name.contains("gemini") {
@@ -19,7 +19,7 @@ fn chunk_path(root: &Path, project: &str, date: &str, name: &str) -> PathBuf {
         .rsplit_once('-')
         .and_then(|(_, tail)| tail.parse::<u32>().ok())
         .unwrap_or(1);
-    let basename = crate::store::session_basename(date, agent, "intentstest01", sequence);
+    let basename = crate::legacy_archive::session_basename(date, agent, "intentstest01", sequence);
     let dir = root
         .join("store")
         .join("local")
@@ -707,7 +707,7 @@ fn md_radar_style_user_messages_surface_in_main_intents_view() {
         .join("conversations")
         .join("codex");
     fs::create_dir_all(&directory).expect("create canonical md-radar bucket");
-    let chunk = directory.join(crate::store::session_basename(
+    let chunk = directory.join(crate::legacy_archive::session_basename(
         "2026-06-15",
         "codex",
         "md-radar-intentstest",
@@ -869,8 +869,8 @@ fn write_chunk_with_session(
     sequence: u32,
     body: &str,
 ) -> PathBuf {
-    let date_compact = crate::store::compact_date(date);
-    let basename = crate::store::session_basename(date, agent, session_id, sequence);
+    let date_compact = crate::legacy_archive::compact_date(date);
+    let basename = crate::legacy_archive::session_basename(date, agent, session_id, sequence);
     let dir = root
         .join("store")
         .join("local")
@@ -912,7 +912,7 @@ fn write_sidecar(
         session_id: session_id.to_string(),
         cwd: None,
         timestamp_source: None,
-        kind: crate::store::Kind::Conversations,
+        kind: crate::legacy_archive::Kind::Conversations,
         run_id: None,
         prompt_id: None,
         frame_kind,

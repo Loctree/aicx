@@ -961,7 +961,7 @@ fn empty_body_detection_is_header_agnostic_for_frontmatter_cards() {
 
 #[cfg(unix)]
 fn write_dead_stage(store_root: &std::path::Path, suffix: &str, state: &str) -> PathBuf {
-    use crate::store::canonical_projection::{
+    use crate::legacy_archive::canonical_projection::{
         PROJECTION_STAGE_META_FILENAME, PROJECTION_STAGE_SCHEMA, ProjectionStageLease,
     };
     // PID far above any real pid space (Linux 4194304, macOS 99998).
@@ -1103,7 +1103,7 @@ fn fix_buckets_quarantines_dead_projection_stage_and_second_pass_is_noop() {
 #[cfg(unix)]
 #[test]
 fn fix_buckets_leaves_unproven_ownership_stage_in_place() {
-    use crate::store::canonical_projection::{
+    use crate::legacy_archive::canonical_projection::{
         PROJECTION_STAGE_IDENTITY_UNVERIFIABLE, PROJECTION_STAGE_META_FILENAME,
         PROJECTION_STAGE_SCHEMA, ProjectionStageLease,
     };

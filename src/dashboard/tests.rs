@@ -383,7 +383,7 @@ fn scan_store_scope_filters_by_project_and_hours() {
     .expect("beta file");
 
     // Bug #27/#28 regression: the startup scope filter is now strict
-    // (routes through `aicx::store::project_filter_matches`). The old
+    // (routes through `aicx::legacy_archive::project_filter_matches`). The old
     // assertion used `Some("alpha")` and relied on substring matching
     // against canonical slug `local/alpha-project` — that was the
     // very leak the strict filter is designed to kill. The strict
