@@ -115,13 +115,13 @@ pub fn read_entries_at(home: &Path) -> Result<Vec<CatalogEntry>> {
 }
 
 /// Project identities already attributed in the durable catalog (if any).
-pub fn project_identities_from_catalog_at(store_root: &Path) -> Result<Vec<String>> {
-    let path = sessions_path_for(store_root);
+pub fn project_identities_from_catalog_at(aicx_home: &Path) -> Result<Vec<String>> {
+    let path = sessions_path_for(aicx_home);
     if !path.exists() {
         return Ok(Vec::new());
     }
     // Containment: catalog must resolve under the AICX home allowlist.
-    let file = crate::source_path::open_under_aicx_home(store_root, &path)
+    let file = crate::source_path::open_under_aicx_home(aicx_home, &path)
         .with_context(|| format!("open catalog {}", path.display()))?;
     let reader = BufReader::new(file);
     let mut identities = BTreeSet::new();

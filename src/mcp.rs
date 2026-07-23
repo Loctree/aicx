@@ -560,14 +560,14 @@ fn default_true() -> bool {
 }
 
 fn search_project_scopes(
-    store_root: &std::path::Path,
+    aicx_home: &std::path::Path,
     projects: &[String],
     match_mode: legacy_archive::ProjectMatchMode,
 ) -> Result<Vec<Option<String>>, McpError> {
     if projects.is_empty() {
         return Ok(vec![None]);
     }
-    let resolution = resolve_mcp_projects(store_root, projects, match_mode, true)?;
+    let resolution = resolve_mcp_projects(aicx_home, projects, match_mode, true)?;
     Ok(resolution.selected.into_iter().map(Some).collect())
 }
 
@@ -603,15 +603,15 @@ fn project_resolution_mcp_error(error: legacy_archive::ProjectResolutionError) -
 }
 
 fn resolve_mcp_projects(
-    store_root: &std::path::Path,
+    aicx_home: &std::path::Path,
     projects: &[String],
     match_mode: legacy_archive::ProjectMatchMode,
     include_index: bool,
 ) -> Result<legacy_archive::ProjectIdentityResolution, McpError> {
     let corpus = if include_index {
-        legacy_archive::project_identities_for_search_at(store_root)
+        legacy_archive::project_identities_for_search_at(aicx_home)
     } else {
-        legacy_archive::project_identities_in_store_at(store_root)
+        legacy_archive::project_identities_in_store_at(aicx_home)
     }
     .map_err(|error| McpError::internal_error(format!("Store error: {error}"), None))?;
     legacy_archive::require_project_resolution(projects, &corpus, match_mode)
@@ -973,7 +973,7 @@ fn inject_mcp_semantic_fallback_payload(
 /// notice) and both fallback call sites build one value instead of threading
 /// eight positional args.
 struct McpFuzzyFallbackRequest<'a> {
-    store_root: &'a std::path::Path,
+    aicx_home: &'a std::path::Path,
     query: &'a str,
     limit: usize,
     project_scopes: &'a [Option<&'a str>],
@@ -990,7 +990,7 @@ fn render_mcp_fuzzy_fallback_payload(
     // Shared retrieval + post-filter + finalize primitives keep this MCP
     // fallback byte-identical to the CLI `aicx search` fuzzy path.
     let (results, scanned) = crate::search_engine::fuzzy_search_with_post_filters(
-        req.store_root,
+        req.aicx_home,
         req.query,
         req.limit,
         req.project_scopes,
@@ -1014,14 +1014,14 @@ fn render_mcp_fuzzy_fallback_payload(
         !source_paths_verified,
     );
     let oracle_status = crate::search_engine::search_oracle_status_from_retrieval(
-        req.store_root,
+        req.aicx_home,
         &retrieval,
         None,
         results.len(),
         source_paths_verified,
     );
     let rendered =
-        rank::render_search_json_with_oracle(req.store_root, &results, scanned, oracle_status)
+        rank::render_search_json_with_oracle(req.aicx_home, &results, scanned, oracle_status)
             .map_err(|e| {
                 McpError::internal_error(format!("Serialize fallback search JSON: {e}"), None)
             })?;
@@ -1148,10 +1148,10 @@ impl AicxMcpServer {
             .clone()
             .filter(|projects| !projects.is_empty())
             .unwrap_or_else(|| project.clone().into_iter().collect());
-        let store_root = crate::aicx_home::ensure()
+        let aicx_home = crate::aicx_home::ensure()
             .map_err(|e| McpError::internal_error(format!("AICX home error: {e}"), None))?;
         let project_scopes_owned =
-            search_project_scopes(&store_root, &owned_projects, project_match)?;
+            search_project_scopes(&aicx_home, &owned_projects, project_match)?;
         let project_scopes: Vec<Option<&str>> = project_scopes_owned
             .iter()
             .map(|scope| scope.as_deref())
@@ -1161,7 +1161,7 @@ impl AicxMcpServer {
 
         // One request value shared by both fuzzy-fallback exits below.
         let fallback_request = McpFuzzyFallbackRequest {
-            store_root: &store_root,
+            aicx_home: &aicx_home,
             query: &query,
             limit,
             project_scopes: &project_scopes,
@@ -1196,7 +1196,7 @@ impl AicxMcpServer {
         // pathology — top-N raw hits sit outside the filter window while
         // valid hits exist below — does not surface as silent-empty.
         let filtered = match crate::search_engine::try_semantic_search_filtered(
-            &store_root,
+            &aicx_home,
             &query,
             limit,
             &project_scopes,
@@ -1256,7 +1256,7 @@ impl AicxMcpServer {
                 }
             };
             let oracle_status = crate::search_engine::search_oracle_status_from_retrieval(
-                &store_root,
+                &aicx_home,
                 &retrieval,
                 retrieval_status.as_ref(),
                 report.results,
@@ -1305,14 +1305,14 @@ impl AicxMcpServer {
             }
         };
         let oracle_status = crate::search_engine::search_oracle_status_from_retrieval(
-            &store_root,
+            &aicx_home,
             &retrieval,
             retrieval_status.as_ref(),
             results.len(),
             source_paths_verified,
         );
         let rendered =
-            rank::render_search_json_with_oracle(&store_root, &results, scanned, oracle_status)
+            rank::render_search_json_with_oracle(&aicx_home, &results, scanned, oracle_status)
                 .map_err(|e| {
                     McpError::internal_error(format!("Serialize search JSON: {e}"), None)
                 })?;
@@ -1383,10 +1383,10 @@ impl AicxMcpServer {
             std::time::SystemTime::now()
                 - std::time::Duration::from_secs(hours.saturating_mul(3600).min(365 * 24 * 3600))
         };
-        let store_root = crate::aicx_home::ensure()
+        let aicx_home = crate::aicx_home::ensure()
             .map_err(|e| McpError::internal_error(format!("AICX home error: {e}"), None))?;
         let resolution = resolve_mcp_projects(
-            &store_root,
+            &aicx_home,
             std::slice::from_ref(&requested_project),
             project_match,
             false,
@@ -1548,9 +1548,9 @@ impl AicxMcpServer {
             .filter(|projects| !projects.is_empty())
             .unwrap_or_else(|| params.project.clone().into_iter().collect());
         let project_match = parse_project_match(params.project_match.as_deref())?;
-        let store_root = crate::aicx_home::ensure()
+        let aicx_home = crate::aicx_home::ensure()
             .map_err(|e| McpError::internal_error(format!("AICX home error: {e}"), None))?;
-        let project_scopes = search_project_scopes(&store_root, &owned_projects, project_match)?;
+        let project_scopes = search_project_scopes(&aicx_home, &owned_projects, project_match)?;
         let mut metadatas = Vec::new();
 
         for project in project_scopes {
@@ -1604,10 +1604,10 @@ impl AicxMcpServer {
         }
         metadatas.truncate(limit);
 
-        let store_root = crate::aicx_home::ensure()
+        let aicx_home = crate::aicx_home::ensure()
             .map_err(|e| McpError::internal_error(format!("AICX home error: {e}"), None))?;
         let oracle_status = OracleStatus::metadata_steer(
-            &store_root,
+            &aicx_home,
             metadatas.len(),
             metadatas.len(),
             crate::oracle::verify_paths(metadatas.iter().filter_map(|m| {
@@ -1702,7 +1702,7 @@ impl AicxMcpServer {
             .filter(|projects| !projects.is_empty())
             .unwrap_or_else(|| params.project.clone().into_iter().collect());
         let project_match = parse_project_match(params.project_match.as_deref())?;
-        let store_root = crate::aicx_home::ensure()
+        let aicx_home = crate::aicx_home::ensure()
             .map_err(|e| McpError::internal_error(format!("AICX home error: {e}"), None))?;
         let project_resolution = if owned_projects.is_empty() {
             legacy_archive::ProjectIdentityResolution {
@@ -1712,7 +1712,7 @@ impl AicxMcpServer {
                 match_mode: project_match,
             }
         } else {
-            resolve_mcp_projects(&store_root, &owned_projects, project_match, false)?
+            resolve_mcp_projects(&aicx_home, &owned_projects, project_match, false)?
         };
         let effective_projects = project_resolution.selected.clone();
 
@@ -1750,7 +1750,7 @@ impl AicxMcpServer {
             "markdown" | "md" => intents::format_intents_markdown(&records),
             _ => {
                 let oracle_status = OracleStatus::canonical_corpus_scan(
-                    &store_root,
+                    &aicx_home,
                     extraction.stats.scanned_count,
                     extraction.stats.candidate_count,
                     extraction.stats.source_paths_verified,
@@ -1787,9 +1787,9 @@ impl AicxMcpServer {
     ) -> Result<CallToolResult, McpError> {
         let _request_activity = self.idle_memory.begin_request();
         tracing::info!(target: "mcp.audit", tool_name = "aicx_index_status", "mcp tool invoked");
-        let store_root = crate::aicx_home::ensure()
+        let aicx_home = crate::aicx_home::ensure()
             .map_err(|e| McpError::internal_error(format!("AICX home error: {e}"), None))?;
-        let status = api::index_status_at(&store_root, params.project.as_deref())
+        let status = api::index_status_at(&aicx_home, params.project.as_deref())
             .map_err(|e| McpError::internal_error(format!("index status: {e}"), None))?;
         let json = serde_json::to_string(&status).map_err(|e| {
             McpError::internal_error(format!("Serialize index status JSON: {e}"), None)

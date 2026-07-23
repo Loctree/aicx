@@ -1884,7 +1884,7 @@ pub fn lexical_retrieval_outcome(
 /// search/evidence, MCP search/evidence). No caller may bucket on manifest
 /// presence or backend label strings again.
 pub fn search_oracle_status_from_retrieval(
-    store_root: &Path,
+    aicx_home: &Path,
     retrieval: &RetrievalOutcome,
     hybrid_status: Option<&HybridRetrievalStatus>,
     candidate_count: usize,
@@ -1899,20 +1899,20 @@ pub fn search_oracle_status_from_retrieval(
     };
     let status = match (retrieval.executed_path, hybrid_status) {
         (ExecutedPath::HybridFusion, Some(hybrid)) => {
-            OracleStatus::hybrid_rrf(store_root, hybrid, candidate_count, source_paths_verified)
+            OracleStatus::hybrid_rrf(aicx_home, hybrid, candidate_count, source_paths_verified)
         }
         // Fusion without manifest evidence should be unreachable; fail closed
         // instead of synthesizing a healthy hybrid claim.
         (ExecutedPath::HybridFusion, None) | (ExecutedPath::None, _) => {
             OracleStatus::retrieval_unknown(
-                store_root,
+                aicx_home,
                 retrieval.examined_count,
                 candidate_count,
                 fallback_reason(),
             )
         }
         (ExecutedPath::DenseOnly, _) => OracleStatus::semantic_dense_only(
-            store_root,
+            aicx_home,
             retrieval.examined_count,
             candidate_count,
             source_paths_verified,
@@ -1926,7 +1926,7 @@ pub fn search_oracle_status_from_retrieval(
             // labeled fuzzy so oracle honesty is not re-written as index.
             match hybrid {
                 Some(_) => OracleStatus::lexical_tantivy(
-                    store_root,
+                    aicx_home,
                     retrieval.examined_count,
                     candidate_count,
                     source_paths_verified,
@@ -1936,7 +1936,7 @@ pub fn search_oracle_status_from_retrieval(
                     && retrieval.requested_mode == aicx_retrieve::RequestedMode::Lexical =>
                 {
                     OracleStatus::lexical_tantivy(
-                        store_root,
+                        aicx_home,
                         retrieval.examined_count,
                         candidate_count,
                         source_paths_verified,
@@ -1944,7 +1944,7 @@ pub fn search_oracle_status_from_retrieval(
                     )
                 }
                 None => OracleStatus::filesystem_fuzzy(
-                    store_root,
+                    aicx_home,
                     retrieval.examined_count,
                     candidate_count,
                     source_paths_verified,
@@ -2216,7 +2216,7 @@ fn semantic_fetch_limit(
 /// so the caller can surface the situation to operators instead of
 /// rendering a misleading silent empty.
 pub fn try_semantic_search_filtered(
-    store_root: &Path,
+    aicx_home: &Path,
     query: &str,
     user_limit: usize,
     project_filters: &[Option<&str>],
@@ -2227,7 +2227,7 @@ pub fn try_semantic_search_filtered(
     let fetch_limit = semantic_fetch_limit(user_limit, frame_kind_filter, post_filters);
 
     let (outcome, candidate_boundary) = try_semantic_search_with_boundary(
-        store_root,
+        aicx_home,
         query,
         fetch_limit,
         project_filters,
@@ -2761,7 +2761,7 @@ fn apply_fuzzy_post_filters(
 /// pool then applies the post-filters; ordering/truncation is the caller's job
 /// via [`finalize_fuzzy_results`].
 pub fn fuzzy_search_with_post_filters(
-    store_root: &Path,
+    aicx_home: &Path,
     query: &str,
     limit: usize,
     project_scopes: &[Option<&str>],
@@ -2769,13 +2769,8 @@ pub fn fuzzy_search_with_post_filters(
     post_filters: &SemanticSearchFilters,
 ) -> anyhow::Result<(Vec<crate::rank::FuzzyResult>, usize)> {
     let fetch_limit = fuzzy_fetch_limit(limit, post_filters.is_active());
-    let (mut results, scanned) = crate::rank::fuzzy_search_store(
-        store_root,
-        query,
-        fetch_limit,
-        project_scopes,
-        frame_kind,
-    )?;
+    let (mut results, scanned) =
+        crate::rank::fuzzy_search_store(aicx_home, query, fetch_limit, project_scopes, frame_kind)?;
     apply_fuzzy_post_filters(&mut results, post_filters);
     // Doctrine 2026-07-23: filesystem-fuzzy is the last resort when no
     // hybrid index exists. Recency-ranked literal — not letter-soup of

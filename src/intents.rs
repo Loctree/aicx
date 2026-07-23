@@ -65,30 +65,30 @@ pub fn extract_intents(config: &IntentsConfig) -> Result<Vec<IntentRecord>> {
 }
 
 pub fn extract_intents_with_stats(config: &IntentsConfig) -> Result<IntentExtraction> {
-    let store_root = crate::aicx_home::ensure()?;
-    extract_intents_from_root_at_with_stats(config, &store_root, Utc::now())
+    let aicx_home = crate::aicx_home::ensure()?;
+    extract_intents_from_root_at_with_stats(config, &aicx_home, Utc::now())
 }
 
 pub fn extract_intents_with_stats_for_projects(
     config: &IntentsConfig,
     projects: &[String],
 ) -> Result<IntentExtraction> {
-    let store_root = crate::aicx_home::ensure()?;
-    extract_intents_from_root_at_for_projects_with_stats(config, projects, &store_root, Utc::now())
+    let aicx_home = crate::aicx_home::ensure()?;
+    extract_intents_from_root_at_for_projects_with_stats(config, projects, &aicx_home, Utc::now())
 }
 
 #[cfg(test)]
 fn extract_intents_from_root_at(
     config: &IntentsConfig,
-    store_root: &Path,
+    aicx_home: &Path,
     now: DateTime<Utc>,
 ) -> Result<Vec<IntentRecord>> {
-    Ok(extract_intents_from_root_at_with_stats(config, store_root, now)?.records)
+    Ok(extract_intents_from_root_at_with_stats(config, aicx_home, now)?.records)
 }
 
 pub(crate) fn extract_intents_from_root_at_with_stats(
     config: &IntentsConfig,
-    store_root: &Path,
+    aicx_home: &Path,
     now: DateTime<Utc>,
 ) -> Result<IntentExtraction> {
     let cutoff = if config.hours == 0 {
@@ -98,7 +98,7 @@ pub(crate) fn extract_intents_from_root_at_with_stats(
         now - Duration::hours(cutoff_hours)
     };
     let files = collect_chunk_files(
-        store_root,
+        aicx_home,
         &config.project,
         cutoff,
         config.effective_frame_kind(),
@@ -215,11 +215,11 @@ pub(crate) fn extract_intents_from_root_at_with_stats(
 pub(crate) fn extract_intents_from_root_at_for_projects_with_stats(
     config: &IntentsConfig,
     projects: &[String],
-    store_root: &Path,
+    aicx_home: &Path,
     now: DateTime<Utc>,
 ) -> Result<IntentExtraction> {
     if projects.is_empty() {
-        return extract_intents_from_root_at_with_stats(config, store_root, now);
+        return extract_intents_from_root_at_with_stats(config, aicx_home, now);
     }
 
     let mut records = Vec::new();
@@ -234,7 +234,7 @@ pub(crate) fn extract_intents_from_root_at_for_projects_with_stats(
     for project in projects {
         let mut scoped = config.clone();
         scoped.project = project.clone();
-        let extraction = extract_intents_from_root_at_with_stats(&scoped, store_root, now)?;
+        let extraction = extract_intents_from_root_at_with_stats(&scoped, aicx_home, now)?;
         scanned_count += extraction.stats.scanned_count;
         source_paths_verified &= extraction.stats.source_paths_verified;
         dropped_candidates += extraction.stats.dropped_candidates;
@@ -326,13 +326,13 @@ fn extend_with_cap<T>(
 }
 
 fn collect_chunk_files(
-    store_root: &Path,
+    aicx_home: &Path,
     project: &str,
     cutoff: DateTime<Utc>,
     frame_kind: FrameKind,
 ) -> Result<Vec<StoredChunkFile>> {
     let mut files = Vec::new();
-    let scan_root = normalize_scan_root(store_root);
+    let scan_root = normalize_scan_root(aicx_home);
 
     for file in legacy_archive::scan_context_files_at(&scan_root)? {
         if file.path.extension().and_then(|ext| ext.to_str()) != Some("md") {
@@ -453,18 +453,18 @@ fn persisted_project_from_card(path: &Path) -> Result<Option<String>> {
         }))
 }
 
-fn normalize_scan_root(store_root: &Path) -> PathBuf {
-    if store_root
+fn normalize_scan_root(aicx_home: &Path) -> PathBuf {
+    if aicx_home
         .file_name()
         .is_some_and(|name| name == legacy_archive::LEGACY_CARDS_DIRNAME)
     {
-        return store_root
+        return aicx_home
             .parent()
             .map(Path::to_path_buf)
-            .unwrap_or_else(|| store_root.to_path_buf());
+            .unwrap_or_else(|| aicx_home.to_path_buf());
     }
 
-    store_root.to_path_buf()
+    aicx_home.to_path_buf()
 }
 
 fn combine_date_time(date: NaiveDate, time: &str) -> Option<DateTime<Utc>> {
@@ -3108,12 +3108,12 @@ pub fn migrate_intent_schema_dry_run(project_filter: Option<&str>) -> Result<Mig
 }
 
 pub fn migrate_intent_schema_dry_run_at(
-    store_root: &Path,
+    aicx_home: &Path,
     project_filter: Option<&str>,
 ) -> Result<MigrationReport> {
     let inferred_project = project_filter.map(str::to_string);
     let files = collect_chunk_files(
-        store_root,
+        aicx_home,
         project_filter.unwrap_or(""),
         DateTime::<Utc>::from_naive_utc_and_offset(
             NaiveDate::from_ymd_opt(2020, 1, 1)

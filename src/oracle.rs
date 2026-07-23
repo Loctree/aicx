@@ -108,7 +108,7 @@ pub struct OracleStatus {
     pub index_kind: OracleIndexKind,
     pub fallback_reason: Option<String>,
     pub derived_view: String,
-    pub store_root: String,
+    pub aicx_home: String,
     pub indexed_count: usize,
     pub scanned_count: usize,
     pub candidate_count: usize,
@@ -151,7 +151,7 @@ where
 
 impl OracleStatus {
     pub fn canonical_corpus_scan(
-        store_root: &Path,
+        aicx_home: &Path,
         scanned_count: usize,
         candidate_count: usize,
         source_paths_verified: bool,
@@ -162,7 +162,7 @@ impl OracleStatus {
             index_kind: OracleIndexKind::CanonicalChunks,
             fallback_reason: None,
             derived_view: "canonical_chunk_scan_no_semantic_index".to_string(),
-            store_root: display_path(store_root),
+            aicx_home: display_path(aicx_home),
             indexed_count: 0,
             scanned_count,
             candidate_count,
@@ -185,7 +185,7 @@ impl OracleStatus {
     }
 
     pub fn filesystem_fuzzy(
-        store_root: &Path,
+        aicx_home: &Path,
         scanned_count: usize,
         candidate_count: usize,
         source_paths_verified: bool,
@@ -198,7 +198,7 @@ impl OracleStatus {
                 "fallback_filesystem_fuzzy: content index unavailable".to_string(),
             ),
             derived_view: "none_filesystem_scan".to_string(),
-            store_root: display_path(store_root),
+            aicx_home: display_path(aicx_home),
             indexed_count: 0,
             scanned_count,
             candidate_count,
@@ -219,7 +219,7 @@ impl OracleStatus {
     }
 
     pub fn content_semantic(
-        store_root: &Path,
+        aicx_home: &Path,
         indexed_count: usize,
         candidate_count: usize,
         source_paths_verified: bool,
@@ -230,7 +230,7 @@ impl OracleStatus {
             index_kind: OracleIndexKind::ContentChunks,
             fallback_reason: None,
             derived_view: "materialized_vector_index_from_canonical_chunks".to_string(),
-            store_root: display_path(store_root),
+            aicx_home: display_path(aicx_home),
             indexed_count,
             scanned_count: indexed_count,
             candidate_count,
@@ -255,7 +255,7 @@ impl OracleStatus {
 
     #[cfg(feature = "app")]
     pub fn hybrid_rrf(
-        store_root: &Path,
+        aicx_home: &Path,
         status: &crate::search_engine::HybridRetrievalStatus,
         candidate_count: usize,
         source_paths_verified: bool,
@@ -269,7 +269,7 @@ impl OracleStatus {
                 "hybrid_rrf_manifest_bound_lexical_dense_index:{}",
                 status.dense_kind
             ),
-            store_root: display_path(store_root),
+            aicx_home: display_path(aicx_home),
             indexed_count: status.source_chunk_count,
             scanned_count: status.source_chunk_count,
             candidate_count,
@@ -293,7 +293,7 @@ impl OracleStatus {
     }
 
     pub fn metadata_steer(
-        store_root: &Path,
+        aicx_home: &Path,
         indexed_count: usize,
         candidate_count: usize,
         source_paths_verified: bool,
@@ -305,7 +305,7 @@ impl OracleStatus {
             index_kind: OracleIndexKind::MetadataSteer,
             fallback_reason: None,
             derived_view: "metadata_steer_index_rebuildable_from_canonical_chunks".to_string(),
-            store_root: display_path(store_root),
+            aicx_home: display_path(aicx_home),
             indexed_count,
             scanned_count: indexed_count,
             candidate_count,
@@ -333,7 +333,7 @@ impl OracleStatus {
     /// scan when no generation exists).
     #[cfg(feature = "app")]
     pub fn lexical_tantivy(
-        store_root: &Path,
+        aicx_home: &Path,
         scanned_count: usize,
         candidate_count: usize,
         source_paths_verified: bool,
@@ -354,7 +354,7 @@ impl OracleStatus {
             index_kind: OracleIndexKind::LexicalTantivy,
             fallback_reason: None,
             derived_view: "published_hybrid_generation_lexical_tantivy".to_string(),
-            store_root: display_path(store_root),
+            aicx_home: display_path(aicx_home),
             indexed_count: indexed,
             scanned_count,
             candidate_count,
@@ -380,7 +380,7 @@ impl OracleStatus {
     /// manifest missing or stale). Always carries a fallback reason — this
     /// status must never serialize as a healthy semantic backend.
     pub fn semantic_dense_only(
-        store_root: &Path,
+        aicx_home: &Path,
         scanned_count: usize,
         candidate_count: usize,
         source_paths_verified: bool,
@@ -392,7 +392,7 @@ impl OracleStatus {
             index_kind: OracleIndexKind::ContentChunks,
             fallback_reason: Some(fallback_reason),
             derived_view: "dense_only_cosine_over_committed_primary_index".to_string(),
-            store_root: display_path(store_root),
+            aicx_home: display_path(aicx_home),
             indexed_count: scanned_count,
             scanned_count,
             candidate_count,
@@ -421,7 +421,7 @@ impl OracleStatus {
     /// manifest, no dense-only marker). Fails closed: stale/unknown, never
     /// scope-safe, never a healthy semantic claim.
     pub fn retrieval_unknown(
-        store_root: &Path,
+        aicx_home: &Path,
         scanned_count: usize,
         candidate_count: usize,
         fallback_reason: String,
@@ -432,7 +432,7 @@ impl OracleStatus {
             index_kind: OracleIndexKind::None,
             fallback_reason: Some(fallback_reason),
             derived_view: "retrieval_execution_evidence_missing".to_string(),
-            store_root: display_path(store_root),
+            aicx_home: display_path(aicx_home),
             indexed_count: 0,
             scanned_count,
             candidate_count,
