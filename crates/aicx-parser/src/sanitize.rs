@@ -1067,8 +1067,11 @@ const RETIRED_CLI_SUBCOMMANDS: &[&str] = &[
     // `aicx rank -p ...` predated the unified `intents`/`search` surface.
     "rank",
     // `aicx gemini` / `aicx junie` were single-source extractors before
-    // they were folded into `aicx all`/`aicx store --agent <name>`.
+    // they were folded into the source catalog/extract engine.
     "gemini", "junie",
+    // Removed with the per-frame card mill. Keep historical invocations
+    // classified as self-echo without advertising a live command.
+    "store",
 ];
 
 /// Canonical, kebab-case list of every `Commands::*` variant in `src/main.rs`.
@@ -1091,6 +1094,7 @@ const RETIRED_CLI_SUBCOMMANDS: &[&str] = &[
 pub const CLI_SUBCOMMAND_NAMES: &[&str] = &[
     "all",
     "claims",
+    "catalog",
     "clarify",
     "claude",
     "codex",
@@ -1125,7 +1129,6 @@ pub const CLI_SUBCOMMAND_NAMES: &[&str] = &[
     "sources",
     "state",
     "steer",
-    "store",
     "tail",
     "warmup",
     "wizard",

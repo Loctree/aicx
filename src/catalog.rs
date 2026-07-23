@@ -70,6 +70,26 @@ pub fn sessions_path() -> Result<PathBuf> {
     Ok(sessions_path_for(&store::resolve_aicx_home()?))
 }
 
+pub fn read_entries_at(home: &Path) -> Result<Vec<CatalogEntry>> {
+    let path = sessions_path_for(home);
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let file = File::open(&path).with_context(|| format!("open catalog {}", path.display()))?;
+    let reader = BufReader::new(file);
+    let mut entries = Vec::new();
+    for (line_no, line) in reader.lines().enumerate() {
+        let line = line.with_context(|| format!("read catalog line {}", line_no + 1))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        entries.push(serde_json::from_str(&line).with_context(|| {
+            format!("parse catalog line {} in {}", line_no + 1, path.display())
+        })?);
+    }
+    Ok(entries)
+}
+
 /// Project identities already attributed in the durable catalog (if any).
 pub fn project_identities_from_catalog_at(store_root: &Path) -> Result<Vec<String>> {
     let path = sessions_path_for(store_root);
@@ -128,6 +148,9 @@ pub fn rebuild(home: &Path, user_home: &Path) -> Result<RebuildReport> {
             Err(_) => continue,
         };
         for source in sources {
+            if !is_primary_catalog_source(agent, &source.path) {
+                continue;
+            }
             let entry = entry_from_source(agent, &source);
             by_id.insert((entry.agent.clone(), entry.session_id.clone()), entry);
         }
@@ -169,33 +192,45 @@ pub fn rebuild(home: &Path, user_home: &Path) -> Result<RebuildReport> {
 
 /// Resolve a session_id → source_path from the durable catalog (exact id match).
 pub fn resolve_session(home: &Path, session_id: &str) -> Result<Option<CatalogEntry>> {
-    let path = sessions_path_for(home);
-    if !path.exists() {
+    let needle = session_id.trim();
+    if needle.is_empty() {
         return Ok(None);
     }
-    let file = File::open(&path)?;
-    let reader = BufReader::new(file);
-    let needle = session_id.trim();
-    for line in reader.lines() {
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let Ok(entry) = serde_json::from_str::<CatalogEntry>(&line) else {
-            continue;
-        };
+    let entries = read_entries_at(home)?;
+    for entry in &entries {
         if entry.session_id == needle
             || entry
                 .logical_session_id
                 .as_deref()
                 .is_some_and(|id| id == needle)
-            || entry.session_id.starts_with(needle)
-            || needle.starts_with(&entry.session_id)
         {
-            return Ok(Some(entry));
+            return Ok(Some(entry.clone()));
         }
     }
-    Ok(None)
+    let mut prefixes: Vec<_> = entries
+        .into_iter()
+        .filter(|entry| {
+            entry.session_id.starts_with(needle)
+                || entry
+                    .logical_session_id
+                    .as_deref()
+                    .is_some_and(|id| id.starts_with(needle))
+        })
+        .collect();
+    prefixes.sort_by(|left, right| {
+        left.agent
+            .cmp(&right.agent)
+            .then_with(|| left.session_id.cmp(&right.session_id))
+    });
+    prefixes
+        .dedup_by(|left, right| left.agent == right.agent && left.session_id == right.session_id);
+    match prefixes.len() {
+        0 => Ok(None),
+        1 => Ok(prefixes.pop()),
+        count => anyhow::bail!(
+            "session prefix `{needle}` is ambiguous across {count} catalog entries; use the full id"
+        ),
+    }
 }
 
 fn agent_source_root(agent: AgentKind, user_home: &Path) -> PathBuf {
@@ -210,7 +245,17 @@ fn agent_source_root(agent: AgentKind, user_home: &Path) -> PathBuf {
     }
 }
 
+fn is_primary_catalog_source(agent: AgentKind, path: &Path) -> bool {
+    agent != AgentKind::Grok
+        || path.file_name().and_then(|name| name.to_str()) == Some("chat_history.jsonl")
+}
+
 fn entry_from_source(agent: AgentKind, source: &CatalogSource) -> CatalogEntry {
+    let session_id = if agent == AgentKind::Grok {
+        grok_session_id_from_path(&source.path).unwrap_or_else(|| source.source_id.clone())
+    } else {
+        source.source_id.clone()
+    };
     let cwd = infer_cwd_from_path(agent, &source.path);
     let project = cwd
         .as_deref()
@@ -226,7 +271,7 @@ fn entry_from_source(agent: AgentKind, source: &CatalogSource) -> CatalogEntry {
         });
     CatalogEntry {
         schema: CATALOG_SCHEMA.to_string(),
-        session_id: source.source_id.clone(),
+        session_id: session_id.clone(),
         agent: agent.as_str().to_string(),
         project,
         date,
@@ -234,7 +279,11 @@ fn entry_from_source(agent: AgentKind, source: &CatalogSource) -> CatalogEntry {
         source_path: source.path.display().to_string(),
         title: None,
         machine: hostname(),
-        logical_session_id: source.logical_session_id.clone(),
+        logical_session_id: if agent == AgentKind::Grok {
+            Some(session_id)
+        } else {
+            source.logical_session_id.clone()
+        },
     }
 }
 
@@ -251,14 +300,6 @@ fn enrich_from_sessions_discovery(
     let codex_root = user_home.join(".codex").join("sessions");
     if codex_root.is_dir() {
         for info in crate::sessions::discover_codex_sessions(&codex_root, None) {
-            merge_session_info(by_id, &info);
-        }
-    }
-    let grok_root = user_home.join(".grok").join("sessions");
-    if grok_root.is_dir() {
-        for info in crate::sessions::discover_codex_sessions(&grok_root, None) {
-            let mut info = info;
-            info.agent = "grok".to_string();
             merge_session_info(by_id, &info);
         }
     }
@@ -374,18 +415,55 @@ fn infer_cwd_from_path(agent: AgentKind, path: &Path) -> Option<String> {
         }
         AgentKind::Grok => {
             // ~/.grok/sessions/<cwd-encoded>/<session>/...
-            path.ancestors().find_map(|ancestor| {
-                let name = ancestor.file_name()?.to_str()?;
-                if name == "sessions" || name == "projects" {
-                    return None;
-                }
-                if name.contains('%') || name.contains('-') {
-                    Some(name.replace(['%', '-'], "/"))
-                } else {
-                    None
-                }
-            })
+            let encoded_cwd = path.ancestors().find(|ancestor| {
+                ancestor
+                    .parent()
+                    .and_then(Path::file_name)
+                    .and_then(|name| name.to_str())
+                    == Some("sessions")
+            })?;
+            encoded_cwd
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(decode_grok_cwd)
         }
+        _ => None,
+    }
+}
+
+fn decode_grok_cwd(encoded: &str) -> String {
+    let bytes = encoded.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut cursor = 0usize;
+    while cursor < bytes.len() {
+        if bytes[cursor] == b'%'
+            && cursor + 2 < bytes.len()
+            && let (Some(high), Some(low)) =
+                (hex_nibble(bytes[cursor + 1]), hex_nibble(bytes[cursor + 2]))
+        {
+            decoded.push((high << 4) | low);
+            cursor += 3;
+        } else {
+            decoded.push(bytes[cursor]);
+            cursor += 1;
+        }
+    }
+    String::from_utf8_lossy(&decoded).into_owned()
+}
+
+fn grok_session_id_from_path(path: &Path) -> Option<String> {
+    path.parent()?
+        .file_name()?
+        .to_str()
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+}
+
+const fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
         _ => None,
     }
 }
@@ -513,5 +591,58 @@ mod tests {
         let ids = project_identities_from_catalog_at(&home).unwrap();
         assert_eq!(ids, vec!["VetCoders/mlx-lm".to_string()]);
         let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn resolve_session_rejects_ambiguous_prefix() {
+        let home = test_root("ambiguous-prefix");
+        fs::create_dir_all(catalog_dir_for(&home)).unwrap();
+        let entries = ["abcdef-111", "abcdef-222"]
+            .into_iter()
+            .map(|session_id| CatalogEntry {
+                schema: CATALOG_SCHEMA.to_string(),
+                session_id: session_id.to_string(),
+                agent: "codex".to_string(),
+                project: None,
+                date: None,
+                cwd: None,
+                source_path: format!("/tmp/{session_id}.jsonl"),
+                title: None,
+                machine: None,
+                logical_session_id: None,
+            })
+            .map(|entry| serde_json::to_string(&entry).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(sessions_path_for(&home), format!("{entries}\n")).unwrap();
+        let error = resolve_session(&home, "abcdef").unwrap_err();
+        assert!(error.to_string().contains("ambiguous"));
+        assert!(resolve_session(&home, "abcdef-111").unwrap().is_some());
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn grok_catalog_keeps_chat_history_and_decodes_cwd() {
+        let path = Path::new(
+            "/Users/test/.grok/sessions/%2FVolumes%2Fvc-workspace%2Fvetcoders%2Fvibecrafted/\
+             019f5407-5b0c-7363-b210-1093f26a41f7/chat_history.jsonl",
+        );
+        assert!(is_primary_catalog_source(AgentKind::Grok, path));
+        assert!(!is_primary_catalog_source(
+            AgentKind::Grok,
+            &path.with_file_name("events.jsonl")
+        ));
+        assert_eq!(
+            infer_cwd_from_path(AgentKind::Grok, path).as_deref(),
+            Some("/Volumes/vc-workspace/vetcoders/vibecrafted")
+        );
+        assert_eq!(
+            infer_project_from_path(AgentKind::Grok, path).as_deref(),
+            Some("vetcoders/vibecrafted")
+        );
+        assert_eq!(
+            grok_session_id_from_path(path).as_deref(),
+            Some("019f5407-5b0c-7363-b210-1093f26a41f7")
+        );
     }
 }

@@ -96,6 +96,8 @@ pub mod search_eval;
 pub mod session_catalog;
 pub mod sessions;
 #[cfg(feature = "app")]
+pub mod source_index;
+#[cfg(feature = "app")]
 pub mod state;
 #[cfg(feature = "app")]
 pub mod steer_index;

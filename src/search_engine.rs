@@ -605,10 +605,13 @@ fn try_lexical_search_native(
         candidate_filters,
     };
     let filters = hybrid_filters(retrieval_filters);
-    // Caller (try_semantic_search_filtered) already over-fetches for pushdown.
-    // Do not multiply again — that turned limit=50 into 500 and paid hundreds
-    // of store-file preview reads on the hot path.
-    let window = limit.max(1);
+    // Recency is a re-ranker, so it needs a wider lexical candidate set than
+    // the final result count. This used to be expensive because every
+    // candidate triggered a store-file preview read; conversation previews
+    // now come from indexed metadata and the top set performs no source I/O.
+    // A 500-hit floor keeps the intended fresh *and* relevant July result in
+    // view without scanning the whole corpus.
+    let window = lexical_rerank_window(limit);
 
     // Push project (and other equality filters) into Tantivy so BM25 ranks
     // *inside* the project, not post-filters a global top-N (which silently
@@ -679,6 +682,7 @@ fn try_lexical_search_native(
         .map(|h| {
             let path = hit_path(&h);
             let score_pct = lexical_score_pct(h.score);
+            let matched_lines = hit_metadata_lines(&h, "preview_lines");
             FuzzyResult {
                 file: path.to_string_lossy().to_string(),
                 path: path.to_string_lossy().to_string(),
@@ -691,7 +695,7 @@ fn try_lexical_search_native(
                 score: score_pct,
                 label: format!("{backend_label}:{}", h.chunk_id),
                 density: h.score,
-                matched_lines: Vec::new(),
+                matched_lines,
                 session_id: hit_metadata_optional_string(&h, "session_id"),
                 cwd: hit_metadata_optional_string(&h, "cwd"),
             }
@@ -702,6 +706,9 @@ fn try_lexical_search_native(
     results.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| b.date.cmp(&a.date)));
     results.truncate(limit);
     for result in &mut results {
+        if result.frame_kind.as_deref() == Some("conversation") {
+            continue;
+        }
         let path = std::path::Path::new(&result.path);
         if path.exists() {
             result.matched_lines = semantic_preview_lines(path);
@@ -747,8 +754,15 @@ fn lexical_score_pct(score: f32) -> u8 {
     ((score.max(0.0) / 25.0 * 100.0).round() as i32).clamp(0, 100) as u8
 }
 
-/// Recency prior: fresher dates beat stale ones when BM25/score is close.
-/// Half-life ~14 days, up to +25 score points for "today".
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+fn lexical_rerank_window(limit: usize) -> usize {
+    limit.max(500)
+}
+
+/// Recency prior: fresh conversations win over repeated stale mentions when
+/// lexical relevance is reasonably close. The seven-day decay deliberately
+/// reflects the operator's default question: "where did we discuss this
+/// recently?"
 fn apply_recency_prior(results: &mut [FuzzyResult]) {
     let today = chrono::Utc::now().date_naive();
     for result in results.iter_mut() {
@@ -764,7 +778,7 @@ fn apply_recency_prior(results: &mut [FuzzyResult]) {
             continue;
         };
         let age_days = (today - date).num_days().max(0) as f32;
-        let boost = (25.0 * (-age_days / 14.0).exp()).round() as u8;
+        let boost = (45.0 * (-age_days / 7.0).exp()).round() as u8;
         result.score = result.score.saturating_add(boost).min(100);
     }
 }
@@ -1467,6 +1481,18 @@ fn hit_metadata_optional_string(hit: &aicx_retrieve::Hit, key: &str) -> Option<S
         serde_json::Value::Bool(value) => Some(value.to_string()),
         _ => None,
     }
+}
+
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+fn hit_metadata_lines(hit: &aicx_retrieve::Hit, key: &str) -> Vec<String> {
+    hit.metadata
+        .get(key)
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .map(str::to_string)
+        .collect()
 }
 
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
@@ -2574,6 +2600,34 @@ mod tests {
             session_id: None,
             cwd: None,
         }
+    }
+
+    #[test]
+    fn recency_prior_prefers_a_fresh_close_match_over_a_stale_repeat() {
+        let today = chrono::Utc::now().date_naive();
+        let fresh_date = today.format("%Y-%m-%d").to_string();
+        let stale_date = (today - chrono::Duration::days(10))
+            .format("%Y-%m-%d")
+            .to_string();
+        let mut results = vec![
+            fuzzy(50, "conversations", &fresh_date, None),
+            fuzzy(70, "conversations", &stale_date, None),
+        ];
+
+        apply_recency_prior(&mut results);
+
+        assert!(
+            results[0].score > results[1].score,
+            "a current close match should beat a ten-day-old repeated mention"
+        );
+    }
+
+    #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+    #[test]
+    fn lexical_rerank_window_keeps_a_wide_recency_candidate_pool() {
+        assert_eq!(lexical_rerank_window(1), 500);
+        assert_eq!(lexical_rerank_window(50), 500);
+        assert_eq!(lexical_rerank_window(750), 750);
     }
 
     #[test]

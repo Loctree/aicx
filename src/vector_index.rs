@@ -649,6 +649,85 @@ fn publish_hybrid_generation(hybrid_root: &Path, generation_dir: &Path) -> Resul
     Ok(())
 }
 
+/// Whether CURRENT already represents the same catalog/source fingerprint.
+///
+/// Only lexical-only source generations qualify. Legacy store/NDJSON
+/// generations are never mistaken for a source-driven no-op.
+pub fn source_lexical_generation_matches(source_fingerprint: &str) -> Result<bool> {
+    let path = hybrid_manifest_path(None)?;
+    if !path.is_file() {
+        return Ok(false);
+    }
+    let manifest = match aicx_retrieve::Manifest::read_from_path(&path) {
+        Ok(manifest) => manifest,
+        Err(_) => return Ok(false),
+    };
+    Ok(manifest.dense_kind == "optional_not_built"
+        && manifest.source_hash_blake3 == aicx_retrieve::source_hash_blake3(source_fingerprint))
+}
+
+pub fn current_lexical_doc_count() -> Result<Option<usize>> {
+    let path = hybrid_manifest_path(None)?;
+    if !path.is_file() {
+        return Ok(None);
+    }
+    Ok(Some(
+        aicx_retrieve::Manifest::read_from_path(&path)?.lexical_doc_count,
+    ))
+}
+
+/// Publish one lexical-only CURRENT generation directly from source extracts.
+///
+/// Dense vectors are intentionally absent: `aicx search` stays lexical-first
+/// and `--deep` fails honestly until an explicit optional dense generation is
+/// built. No embeddings NDJSON or brute-force twin is emitted.
+pub fn publish_source_lexical_generation(
+    chunks: &[aicx_retrieve::ChunkRef],
+    source_fingerprint: &str,
+) -> Result<aicx_retrieve::Manifest> {
+    use aicx_retrieve::{LexicalIndex, Manifest, TantivyAdapter};
+
+    if chunks.is_empty() {
+        anyhow::bail!("cannot publish an empty source lexical generation");
+    }
+    let hybrid_root = hybrid_root_dir(None)?;
+    let generation_dir = hybrid_root
+        .join(HYBRID_GENERATIONS_DIR_NAME)
+        .join(generation_dir_name(&Manifest::fresh_generation_id()));
+    std::fs::create_dir_all(&generation_dir)
+        .with_context(|| format!("create generation dir: {}", generation_dir.display()))?;
+
+    let started = Manifest::now_utc();
+    let mut lexical = TantivyAdapter::new(generation_dir.clone())?;
+    let commit = lexical.build(chunks)?;
+    let completed = Manifest::now_utc();
+    let manifest = Manifest {
+        schema_version: "2.0".to_string(),
+        generation_id: Manifest::fresh_generation_id(),
+        source_chunk_count: chunks.len(),
+        source_hash_blake3: aicx_retrieve::source_hash_blake3(source_fingerprint),
+        embedder_model: "optional".to_string(),
+        embedder_url_hash: "not_built".to_string(),
+        embedder_dim: 0,
+        embedder_distance: "cosine".to_string(),
+        dense_count: 0,
+        dense_kind: "optional_not_built".to_string(),
+        lexical_commit_id: commit.0,
+        lexical_doc_count: lexical.doc_count(),
+        build_started_at: started,
+        build_completed_at: completed,
+        build_wall_seconds: completed
+            .signed_duration_since(started)
+            .num_seconds()
+            .max(0) as u64,
+        fusion_algorithm: "rrf".to_string(),
+        fusion_k: aicx_retrieve::RRF_K_DEFAULT,
+    };
+    manifest.write_to_path(&generation_dir.join("manifest.json"))?;
+    publish_hybrid_generation(&hybrid_root, &generation_dir)?;
+    Ok(manifest)
+}
+
 pub fn hybrid_manifest_path(project: Option<&str>) -> Result<PathBuf> {
     Ok(hybrid_index_dir(project)?.join("manifest.json"))
 }
