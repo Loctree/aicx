@@ -861,28 +861,78 @@ fn normalize_preview_line(line: &str) -> Option<String> {
 }
 
 fn unwrap_agent_message_event(line: &str) -> Option<String> {
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-        return None;
-    };
-    let ty = value.get("type").and_then(|v| v.as_str())?;
-    if ty == "item.completed" {
-        let item = value.get("item")?;
-        let item_ty = item.get("type").and_then(|v| v.as_str())?;
-        if matches!(item_ty, "agent_message" | "message") {
-            return item
-                .get("text")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
+    // Indexed previews are often truncated to 240 chars, so full JSON parse
+    // fails on the majority of live hits. Prefer a structural parse when the
+    // line is complete; fall back to a bounded `"text":"..."` scrape that
+    // still works on truncated agent_message envelopes.
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(line) {
+        let ty = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        if ty == "item.completed" {
+            if let Some(item) = value.get("item") {
+                let item_ty = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                if matches!(item_ty, "agent_message" | "message") {
+                    if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
+                        return Some(text.to_string());
+                    }
+                }
+            }
+        } else if matches!(ty, "agent_message" | "message") {
+            if let Some(text) = value.get("text").and_then(|v| v.as_str()) {
+                return Some(text.to_string());
+            }
         }
+    }
+    scrape_agent_message_text_field(line)
+}
+
+/// Best-effort extract of the human `text` field from a (possibly truncated)
+/// vibecrafted `item.completed` / `agent_message` JSON line.
+fn scrape_agent_message_text_field(line: &str) -> Option<String> {
+    let looks_like_agent = line.contains("\"agent_message\"")
+        || line.contains("\"type\":\"message\"")
+        || line.contains("\"type\": \"message\"");
+    if !looks_like_agent {
         return None;
     }
-    if matches!(ty, "agent_message" | "message") {
-        return value
-            .get("text")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
+    // Locate `"text":"` (with optional space) and take until the next unescaped
+    // quote or end-of-line. Truncated previews rarely close the string.
+    let markers = ["\"text\":\"", "\"text\": \""];
+    let start = markers
+        .iter()
+        .find_map(|marker| line.find(marker).map(|idx| idx + marker.len()))?;
+    let rest = &line[start..];
+    let mut out = String::new();
+    let mut chars = rest.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            if let Some(next) = chars.next() {
+                match next {
+                    'n' => out.push('\n'),
+                    't' => out.push('\t'),
+                    '"' => out.push('"'),
+                    '\\' => out.push('\\'),
+                    other => {
+                        out.push('\\');
+                        out.push(other);
+                    }
+                }
+            }
+            continue;
+        }
+        if ch == '"' {
+            break;
+        }
+        out.push(ch);
+        if out.chars().count() >= 240 {
+            break;
+        }
     }
-    None
+    let trimmed = out.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 fn is_thought_token_or_event_noise_line(line: &str) -> bool {
@@ -2898,6 +2948,24 @@ mod tests {
         sanitize_lexical_preview_lines(&mut result);
         assert_eq!(result.matched_lines.len(), 1);
         assert_eq!(result.matched_lines[0], "Routing strzałek is W2-B-4c.");
+    }
+
+    #[test]
+    fn sanitize_lexical_preview_scrapes_truncated_agent_message_json() {
+        // Live CURRENT stores 240-char truncated preview lines that are not
+        // valid JSON — still must surface the human text for ranking.
+        let mut result = fuzzy(100, "conversations", "2026-07-22", None);
+        result.matched_lines = vec![
+            r#"{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"I’m using `vc-workflow` as requested, with its required `vc-init` orientation pass first. I’ll map the complete Loctree at ..."#.to_string(),
+        ];
+        sanitize_lexical_preview_lines(&mut result);
+        assert_eq!(result.matched_lines.len(), 1);
+        assert!(
+            result.matched_lines[0].starts_with("I’m using `vc-workflow`"),
+            "got {:?}",
+            result.matched_lines[0]
+        );
+        assert!(!result.matched_lines[0].contains("item.completed"));
     }
 
     #[test]
