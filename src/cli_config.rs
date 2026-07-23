@@ -128,7 +128,7 @@ timeout_secs = 30
 "#;
 
 fn canonical_config_path() -> Result<PathBuf> {
-    Ok(aicx::legacy_archive::resolve_aicx_home()
+    Ok(aicx::aicx_home::resolve()
         .context("cannot resolve AICX home for config.toml")?
         .join("config.toml"))
 }
@@ -266,7 +266,7 @@ fn run_runtime_inspection(json: bool, mcp_configs: &[PathBuf]) -> Result<()> {
 
 fn inspect_runtime(mcp_configs: &[PathBuf]) -> Result<RuntimeInspection> {
     let executable = std::env::current_exe().context("resolve running aicx executable")?;
-    let home = aicx::legacy_archive::resolve_aicx_home().context("resolve AICX_HOME")?;
+    let home = aicx::aicx_home::resolve().context("resolve AICX_HOME")?;
     let home_source = if std::env::var_os("AICX_HOME").is_some_and(|value| !value.is_empty()) {
         "env"
     } else {
@@ -920,7 +920,7 @@ fn run_config_show(json: bool) -> Result<()> {
     let cloud_set = cfg.cloud.is_some();
 
     let canonical_path = canonical_config_path().ok();
-    let resolved_aicx_home = aicx::legacy_archive::resolve_aicx_home().ok();
+    let resolved_aicx_home = aicx::aicx_home::resolve().ok();
     let effective = aicx::embedder::effective_config_source();
     let (effective_path_display, effective_branch, marker_line) =
         describe_effective_config(&effective);

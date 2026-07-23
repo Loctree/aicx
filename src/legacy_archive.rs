@@ -129,7 +129,7 @@ pub use paths::{
     LEGACY_SALVAGE_DIRNAME, LOCT_CONTEXT_PACK_FAMILY, NON_REPOSITORY_CONTEXTS,
     OWNERLESS_PROJECT_ORGANIZATION, aicx_context_corpus_dir, chunks_dir_for,
     context_corpus_root_dir, legacy_cards_dir, legacy_cards_dir_for, legacy_store_base_dir,
-    non_repository_contexts_dir, resolve_aicx_home,
+    non_repository_contexts_dir,
 };
 use sidecar::load_sidecar_from_path;
 pub use sidecar::{is_context_corpus_sidecar, load_sidecar, sidecar_path_for_chunk};

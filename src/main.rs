@@ -5974,7 +5974,7 @@ fn warn_pending_mutation(cmd: &str) {
 }
 
 fn mutation_warn_root_display() -> String {
-    aicx::legacy_archive::resolve_aicx_home()
+    aicx::aicx_home::resolve()
         .map(|path| path.display().to_string())
         .unwrap_or_else(|err| format!("<unresolved AICX_HOME: {err:#}>"))
 }
@@ -6887,7 +6887,7 @@ fn parse_date_filter(s: &str) -> Result<(Option<String>, Option<String>)> {
 }
 
 fn run_catalog_rebuild(json: bool) -> Result<()> {
-    let aicx_home = legacy_archive::resolve_aicx_home()?;
+    let aicx_home = aicx::aicx_home::resolve()?;
     let user_home = aicx::os_user_home().context("No home dir")?;
     let report = aicx::catalog::rebuild(&aicx_home, &user_home)?;
     if json {
@@ -6916,7 +6916,7 @@ fn run_catalog_rebuild(json: bool) -> Result<()> {
 }
 
 fn run_catalog_resolve(session: &str, json: bool) -> Result<()> {
-    let aicx_home = legacy_archive::resolve_aicx_home()?;
+    let aicx_home = aicx::aicx_home::resolve()?;
     match aicx::catalog::resolve_session(&aicx_home, session)? {
         Some(entry) => {
             if json {
@@ -7623,7 +7623,7 @@ fn run_index(
 ) -> Result<()> {
     let resolved_scopes = resolve_index_scopes(projects)?;
     let filters: Vec<String> = resolved_scopes.into_iter().flatten().collect();
-    let aicx_home = legacy_archive::resolve_aicx_home()?;
+    let aicx_home = aicx::aicx_home::resolve()?;
     let _lock = if dry_run {
         None
     } else {

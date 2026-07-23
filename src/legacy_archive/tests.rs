@@ -18,7 +18,7 @@ use std::{env, fs};
 //   * `aicx_home::root_for` / `chunks_dir_for` / `state_path_for`
 //     are pure functions tested with explicit paths — parallel-safe,
 //     deterministic, no env touched.
-//   * `resolve_aicx_home` is tested under a process-wide Mutex
+//   * `aicx_home::resolve` is tested under a process-wide Mutex
 //     because env reads are global; the Mutex pattern keeps the two
 //     env-touching tests serialized within `cargo test` without
 //     pulling in a `serial_test` dependency.
@@ -96,38 +96,38 @@ fn legacy_cards_dir_for_is_pure_and_does_not_regrow_archive() {
 }
 
 #[test]
-fn test_resolve_aicx_home_honors_explicit_env_var() {
+fn test_aicx_home_resolve_honors_explicit_env_var() {
     let _serial = AICX_HOME_ENV_LOCK
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
     let _guard = AicxHomeEnvGuard::capture();
     // SAFETY: lock is held; sibling env-touching tests cannot race.
     unsafe { env::set_var("AICX_HOME", "/tmp/test-aicx-resolve") };
-    let resolved = resolve_aicx_home().expect("resolve_aicx_home should succeed");
+    let resolved = crate::aicx_home::resolve().expect("aicx_home::resolve should succeed");
     assert_eq!(resolved, PathBuf::from("/tmp/test-aicx-resolve"));
 }
 
 #[test]
-fn test_resolve_aicx_home_falls_back_to_dot_aicx_when_env_unset_and_no_bootstrap_config() {
+fn test_aicx_home_resolve_falls_back_to_dot_aicx_when_env_unset_and_no_bootstrap_config() {
     let home = std::env::temp_dir().join(format!("aicx-home-default-test-{}", std::process::id()));
-    let resolved =
-        paths::resolve_aicx_home_from(None, &home).expect("resolve_aicx_home_from should succeed");
+    let resolved = crate::aicx_home::resolve_from(None, &home)
+        .expect("aicx_home::resolve_from should succeed");
     assert_eq!(resolved, home.join(".aicx"));
     let _ = fs::remove_dir_all(home);
 }
 
 #[test]
-fn test_resolve_aicx_home_treats_empty_env_var_as_unset_without_bootstrap_config() {
+fn test_aicx_home_resolve_treats_empty_env_var_as_unset_without_bootstrap_config() {
     let home =
         std::env::temp_dir().join(format!("aicx-home-empty-env-test-{}", std::process::id()));
-    let resolved = paths::resolve_aicx_home_from(Some("".into()), &home)
-        .expect("resolve_aicx_home_from should succeed");
+    let resolved = crate::aicx_home::resolve_from(Some("".into()), &home)
+        .expect("aicx_home::resolve_from should succeed");
     assert_eq!(resolved, home.join(".aicx"));
     let _ = fs::remove_dir_all(home);
 }
 
 #[test]
-fn test_resolve_aicx_home_uses_bootstrap_storage_home_when_env_unset() {
+fn test_aicx_home_resolve_uses_bootstrap_storage_home_when_env_unset() {
     let home = std::env::temp_dir().join(format!("aicx-storage-home-test-{}", std::process::id()));
     let default_home = home.join(".aicx");
     let configured = home.join("configured-aicx");
@@ -141,14 +141,14 @@ fn test_resolve_aicx_home_uses_bootstrap_storage_home_when_env_unset() {
     )
     .unwrap();
 
-    let resolved = paths::resolve_aicx_home_from(None, &home)
+    let resolved = crate::aicx_home::resolve_from(None, &home)
         .expect("bootstrap [storage].home should resolve");
     assert_eq!(resolved, configured);
     let _ = fs::remove_dir_all(home);
 }
 
 #[test]
-fn test_resolve_aicx_home_env_wins_over_bootstrap_storage_home() {
+fn test_aicx_home_resolve_env_wins_over_bootstrap_storage_home() {
     let home =
         std::env::temp_dir().join(format!("aicx-storage-env-wins-test-{}", std::process::id()));
     let default_home = home.join(".aicx");
@@ -164,14 +164,14 @@ fn test_resolve_aicx_home_env_wins_over_bootstrap_storage_home() {
     )
     .unwrap();
 
-    let resolved = paths::resolve_aicx_home_from(Some(pinned.clone().into_os_string()), &home)
+    let resolved = crate::aicx_home::resolve_from(Some(pinned.clone().into_os_string()), &home)
         .expect("env-pinned home should resolve");
     assert_eq!(resolved, pinned);
     let _ = fs::remove_dir_all(home);
 }
 
 #[test]
-fn test_resolve_aicx_home_rejects_relative_bootstrap_storage_home() {
+fn test_aicx_home_resolve_rejects_relative_bootstrap_storage_home() {
     let home =
         std::env::temp_dir().join(format!("aicx-storage-relative-test-{}", std::process::id()));
     let default_home = home.join(".aicx");
@@ -182,7 +182,7 @@ fn test_resolve_aicx_home_rejects_relative_bootstrap_storage_home() {
     )
     .unwrap();
 
-    let err = paths::resolve_aicx_home_from(None, &home)
+    let err = crate::aicx_home::resolve_from(None, &home)
         .expect_err("relative [storage].home should fail");
     assert!(
         err.to_string().contains("expected an absolute path"),
@@ -192,7 +192,7 @@ fn test_resolve_aicx_home_rejects_relative_bootstrap_storage_home() {
 }
 
 #[test]
-fn test_resolve_aicx_home_rejects_traversal_in_bootstrap_storage_home() {
+fn test_aicx_home_resolve_rejects_traversal_in_bootstrap_storage_home() {
     let home = std::env::temp_dir().join(format!(
         "aicx-storage-traversal-test-{}",
         std::process::id()
@@ -205,7 +205,7 @@ fn test_resolve_aicx_home_rejects_traversal_in_bootstrap_storage_home() {
     )
     .unwrap();
 
-    let err = paths::resolve_aicx_home_from(None, &home)
+    let err = crate::aicx_home::resolve_from(None, &home)
         .expect_err("[storage].home with `..` traversal should fail");
     assert!(
         err.to_string().contains("parent-directory traversal"),
@@ -215,7 +215,7 @@ fn test_resolve_aicx_home_rejects_traversal_in_bootstrap_storage_home() {
 }
 
 #[test]
-fn test_resolve_aicx_home_rejects_control_chars_in_bootstrap_storage_home() {
+fn test_aicx_home_resolve_rejects_control_chars_in_bootstrap_storage_home() {
     let home = std::env::temp_dir().join(format!(
         "aicx-storage-control-char-test-{}",
         std::process::id()
@@ -228,7 +228,7 @@ fn test_resolve_aicx_home_rejects_control_chars_in_bootstrap_storage_home() {
     )
     .unwrap();
 
-    let err = paths::resolve_aicx_home_from(None, &home)
+    let err = crate::aicx_home::resolve_from(None, &home)
         .expect_err("[storage].home with control characters should fail");
     assert!(
         err.to_string().contains("control characters"),
@@ -254,8 +254,8 @@ fn test_canonical_resolvers_agree_on_pinned_home() {
     unsafe { env::set_var("AICX_HOME", &pinned) };
 
     // 1. The resolver itself.
-    let resolved = resolve_aicx_home().expect("resolver should succeed");
-    assert_eq!(resolved, pinned, "resolve_aicx_home mismatch");
+    let resolved = crate::aicx_home::resolve().expect("resolver should succeed");
+    assert_eq!(resolved, pinned, "aicx_home::resolve mismatch");
 
     // 2. corpus::default_roots — first entry routes through resolver.
     let roots = crate::corpus::default_roots().expect("corpus roots should succeed");

@@ -18,9 +18,6 @@ const MIGRATION_MANIFEST_FILENAME: &str = "manifest.json";
 const MIGRATION_REPORT_FILENAME: &str = "report.md";
 const IDENTITY_MIGRATION_MANIFEST_FILENAME: &str = "identity-manifest.json";
 const IDENTITY_MIGRATION_REPORT_FILENAME: &str = "identity-report.md";
-pub use crate::aicx_home::resolve as resolve_aicx_home;
-#[cfg(test)]
-pub(crate) use crate::aicx_home::resolve_from as resolve_aicx_home_from;
 
 fn canonical_path_segment(value: &str, label: &str) -> Result<String> {
     let cleaned = value.trim().to_ascii_lowercase();
