@@ -25,7 +25,7 @@ SessionRef -> SessionCatalog/direct locator -> SourceHandle
   -> bounded RawUnitReader -> AgentAdapter classify -> AgentAdapter assemble
   -> SessionModel + CoverageReport + UsageEvent[]
   -> invariant validator -> deterministic projections
-  -> AICX canonical store -> IntentRecord/search/steer -> Loctree
+  -> catalog + optional extract + CURRENT index -> IntentRecord/search/steer -> Loctree
 ```
 
 Resolution happens before parsing. A direct file handle forbids corpus
@@ -101,7 +101,7 @@ gate.
 ## Public Loctree boundary
 
 The compatibility boundary is AICX's in-process read surface used by Loctree:
-`aicx::api::Aicx`, `IntentsConfig`, `IntentRecord`, canonical store readability,
+`aicx::api::Aicx`, `IntentsConfig`, `IntentRecord`, legacy-archive readability,
 and the `loctree-consumer` feature. Provider modules, recursive walkers,
 TimelineEntry-first normalization, and current CLI plumbing are not public
 compatibility surfaces.

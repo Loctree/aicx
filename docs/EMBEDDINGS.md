@@ -255,7 +255,7 @@ reclaims them; this cut intentionally does not delete anything.
 ## Dense Migration Benchmark
 
 `tools/bench_dense_migration.sh` is the W4 falsification harness for the dense
-replacement. It builds an isolated `AICX_HOME` shaped like the live store,
+replacement. It builds an isolated legacy-archive fixture under `AICX_HOME`,
 including exact/case-drift/bare/underscore project identities, writes the
 legacy duplicate pair (`embeddings.ndjson` plus `hybrid/dense_brute_force.ndjson`),
 materializes a byte-compatible `dense.exact_mmap_v1.bin`, and compares both

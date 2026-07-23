@@ -18,7 +18,7 @@ By default, `aicx overlay --repo <path> --format json` writes beneath:
 `side-index.json` preserves intent and semantic-group identity across
 incremental runs. Each `ov1:<revision>.json` is a complete
 `loctree.overlay.intent.v1` document. The revision binds the exact repository
-identity, canonical store revision, Loctree snapshot and anchor-catalog
+identity, legacy archive revision when present, Loctree snapshot and anchor-catalog
 revision, attribution/dedup algorithms, and configured embedding model.
 
 The v1 directory and JSON semantics are stable consumer contracts. Additive
