@@ -207,13 +207,18 @@ fn set_remote(checkout: &std::path::Path, remote: &str) {
     run_git(checkout, &["remote", "set-url", "origin", remote]);
 }
 
-fn ingest_historical_session(
+/// Seed a Codex source session under a synthetic user home and freeze topical
+/// project attribution into the durable catalog (the extract-era identity
+/// surface). Live git remotes must not rewrite that attribution.
+fn seed_codex_session_with_catalog_identity(
     root: &std::path::Path,
     checkout: &std::path::Path,
     session_id: &str,
     marker: &str,
+    historical_project: &str,
 ) -> PathBuf {
     let home = root.join("home");
+    let aicx_home = home.join(".aicx");
     let history = home
         .join(".codex")
         .join("sessions")
@@ -253,28 +258,45 @@ fn ingest_historical_session(
     )
     .expect("write Codex history fixture");
 
-    let ingest = Command::new(env!("CARGO_BIN_EXE_aicx"))
-        .env("HOME", &home)
-        .env("USERPROFILE", &home)
-        .env("AICX_ALLOW_TMP", "1")
-        // Card mill is removed from the operator binary; this fixture seeds
-        // sessions only. Project identity for intents must come from catalog.
-        .env_remove("AICX_ALLOW_CARD_MILL")
-        .env_remove("AICX_HOME")
-        .args(["codex", "-H", "0", "--emit", "json"])
-        .output()
-        .expect("run real Codex ingest");
-    assert!(
-        ingest.status.success(),
-        "Codex ingest failed: {}",
-        String::from_utf8_lossy(&ingest.stderr)
-    );
+    // Catalog is the identity store: freeze owner/repo attribution once.
+    // (cwd alone is not topical project — proven operator doctrine 2026-07-23.)
+    fs::create_dir_all(aicx::catalog::catalog_dir_for(&aicx_home))
+        .expect("create catalog directory");
+    let entry = aicx::catalog::CatalogEntry {
+        schema: aicx::catalog::CATALOG_SCHEMA.to_string(),
+        session_id: session_id.to_string(),
+        agent: "codex".to_string(),
+        project: Some(historical_project.to_string()),
+        date: Some("2026-07-17".to_string()),
+        cwd: Some(checkout.display().to_string()),
+        source_path: history.display().to_string(),
+        title: Some(format!("historical identity marker {marker}")),
+        machine: Some("strict-filter-fixture".to_string()),
+        logical_session_id: None,
+    };
+    fs::write(
+        aicx::catalog::sessions_path_for(&aicx_home),
+        format!(
+            "{}\n",
+            serde_json::to_string(&entry).expect("serialize catalog entry")
+        ),
+    )
+    .expect("write durable catalog sessions.jsonl");
+
     println!(
-        "ingest session={session_id} status={} store={}",
-        ingest.status,
-        home.join(".aicx").display()
+        "catalog-seed session={session_id} project={historical_project} aicx={}",
+        aicx_home.display()
     );
-    home.join(".aicx")
+    aicx_home
+}
+
+fn cli_catalog_resolve(aicx_home: &std::path::Path, session_id: &str) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_aicx"))
+        .env("AICX_HOME", aicx_home)
+        .env("AICX_ALLOW_TMP", "1")
+        .args(["catalog", "resolve", session_id, "--json"])
+        .output()
+        .expect("run CLI catalog resolve")
 }
 
 fn cli_intents(root: &std::path::Path, project: &str) -> std::process::Output {
@@ -805,99 +827,171 @@ fn ownerless_bucket_world_model_has_cli_mcp_addressability_and_completeness() {
 }
 
 #[test]
-fn historical_identity_survives_live_remote_rename_with_cli_mcp_parity() {
+fn historical_identity_survives_live_remote_rename_via_catalog() {
+    // Store-era cards are gone. Identity for a session is the durable catalog
+    // entry written at attribution time — live git remote renames must not
+    // rewrite it.
     let root = unique_store_root("immutable-rename");
     let checkout = synthetic_checkout(&root, "https://github.com/archive/old.git");
-    let store = ingest_historical_session(&root, &checkout, "rename-session", "RENAME");
+    let aicx_home = seed_codex_session_with_catalog_identity(
+        &root,
+        &checkout,
+        "rename-session",
+        "RENAME",
+        "archive/old",
+    );
 
     set_remote(&checkout, "https://github.com/archive/new.git");
 
-    let cli_old = cli_intents(&store, "archive/old");
+    let entry = aicx::catalog::resolve_session(&aicx_home, "rename-session")
+        .expect("resolve catalog session")
+        .expect("rename-session must remain in durable catalog");
+    assert_eq!(entry.project.as_deref(), Some("archive/old"));
+    assert_eq!(entry.agent, "codex");
     assert!(
-        cli_old.status.success(),
-        "persisted identity must remain queryable: {}",
-        String::from_utf8_lossy(&cli_old.stderr)
-    );
-    let cli_old_payload: Value =
-        serde_json::from_slice(&cli_old.stdout).expect("parse old CLI envelope");
-    assert_eq!(payload_projects(&cli_old_payload), ["archive/old"]);
-    assert!(!payload_session_ids(&cli_old_payload).is_empty());
-    assert_eq!(
-        cli_old_payload["completeness"]["identity_source"],
-        "project-bucket-v1"
+        entry.source_path.contains("rename-session"),
+        "source path must keep the codex rollout: {}",
+        entry.source_path
     );
 
-    let mcp_old_payload = mcp_intents_payload(&store, "archive/old");
-    assert_eq!(
-        payload_session_ids(&cli_old_payload),
-        payload_session_ids(&mcp_old_payload)
+    let identities = aicx::catalog::project_identities_from_catalog_at(&aicx_home)
+        .expect("read catalog project identities");
+    assert!(
+        identities
+            .iter()
+            .any(|p| p.eq_ignore_ascii_case("archive/old")),
+        "catalog must keep historical project: {identities:?}"
     );
-    assert_eq!(
-        mcp_old_payload["completeness"]["identity_source"],
-        "project-bucket-v1"
+    assert!(
+        !identities
+            .iter()
+            .any(|p| p.eq_ignore_ascii_case("archive/new")),
+        "live remote must not appear in catalog: {identities:?}"
     );
 
-    let cli_new = cli_intents(&store, "archive/new");
+    // Search -p corpus reads catalog identities (not card mill paths).
+    let search_ids =
+        aicx::store::project_identities_for_search_at(&aicx_home).expect("search identity corpus");
     assert!(
-        !cli_new.status.success(),
-        "live remote must not rewrite historical identity: {}",
-        String::from_utf8_lossy(&cli_new.stdout)
+        search_ids
+            .iter()
+            .any(|p| p.eq_ignore_ascii_case("archive/old")),
+        "search corpus must include catalog historical identity: {search_ids:?}"
     );
     assert!(
-        mcp_intents_response(&store, "archive/new")["error"].is_object(),
-        "MCP must reject the same live-only identity as CLI"
+        !search_ids
+            .iter()
+            .any(|p| p.eq_ignore_ascii_case("archive/new")),
+        "search corpus must not invent live-only identity: {search_ids:?}"
     );
+
+    let cli = cli_catalog_resolve(&aicx_home, "rename-session");
+    assert!(
+        cli.status.success(),
+        "catalog resolve CLI must stay green: {}",
+        String::from_utf8_lossy(&cli.stderr)
+    );
+    let cli_payload: Value =
+        serde_json::from_slice(&cli.stdout).expect("parse catalog resolve JSON");
+    assert_eq!(cli_payload["project"], "archive/old");
+    assert_eq!(cli_payload["session_id"], "rename-session");
+
     println!(
-        "rename-repo old_status={} old_sessions={:?} old_identity_source={} new_status={} new_contains_session=false",
-        cli_old.status,
-        payload_session_ids(&cli_old_payload),
-        cli_old_payload["completeness"]["identity_source"],
-        cli_new.status
+        "rename-repo catalog_project={} search_ids={:?} live_remote=archive/new rejected",
+        entry.project.as_deref().unwrap_or(""),
+        search_ids
     );
 
     fs::remove_dir_all(root).expect("remove immutable rename corpus");
 }
 
 #[test]
-fn deprecated_checkout_does_not_capture_historical_sessions() {
+fn deprecated_checkout_does_not_capture_historical_sessions_via_catalog() {
+    // Historical topical project lives in the catalog. Renaming the live
+    // checkout remote to a `_depr` slug must not capture the session.
     let root = unique_store_root("deprecated-checkout");
     let checkout = synthetic_checkout(&root, "https://github.com/vetcoders/screen_scribe.git");
-    let store = ingest_historical_session(&root, &checkout, "screenscribe-history", "DEPRECATED");
+    let aicx_home = seed_codex_session_with_catalog_identity(
+        &root,
+        &checkout,
+        "screenscribe-history",
+        "DEPRECATED",
+        "vetcoders/screen_scribe",
+    );
 
     set_remote(
         &checkout,
         "https://github.com/vetcoders/screen_scribe_depr.git",
     );
 
-    let historical = cli_intents(&store, "vetcoders/screen_scribe");
+    let entry = aicx::catalog::resolve_session(&aicx_home, "screenscribe-history")
+        .expect("resolve catalog session")
+        .expect("screenscribe-history must remain in durable catalog");
+    assert_eq!(entry.project.as_deref(), Some("vetcoders/screen_scribe"));
+
+    let identities = aicx::catalog::project_identities_from_catalog_at(&aicx_home)
+        .expect("read catalog project identities");
     assert!(
-        historical.status.success(),
-        "historical project must survive deprecated checkout: {}",
-        String::from_utf8_lossy(&historical.stderr)
+        identities
+            .iter()
+            .any(|p| p.eq_ignore_ascii_case("vetcoders/screen_scribe")),
+        "historical project must survive: {identities:?}"
     );
-    let historical_payload: Value =
-        serde_json::from_slice(&historical.stdout).expect("parse historical CLI envelope");
-    assert!(!payload_session_ids(&historical_payload).is_empty());
-    let historical_mcp = mcp_intents_payload(&store, "vetcoders/screen_scribe");
-    assert_eq!(
-        payload_session_ids(&historical_payload),
-        payload_session_ids(&historical_mcp)
+    assert!(
+        !identities
+            .iter()
+            .any(|p| p.eq_ignore_ascii_case("vetcoders/screen_scribe_depr")),
+        "deprecated remote must not capture catalog identity: {identities:?}"
     );
 
-    let deprecated = cli_intents(&store, "vetcoders/screen_scribe_depr");
+    let search_ids =
+        aicx::store::project_identities_for_search_at(&aicx_home).expect("search identity corpus");
     assert!(
-        !deprecated.status.success(),
-        "current deprecated remote must not capture historical sessions"
+        search_ids
+            .iter()
+            .any(|p| p.eq_ignore_ascii_case("vetcoders/screen_scribe"))
     );
     assert!(
-        mcp_intents_response(&store, "vetcoders/screen_scribe_depr")["error"].is_object(),
-        "MCP must reject the same deprecated-only identity as CLI"
+        !search_ids
+            .iter()
+            .any(|p| p.eq_ignore_ascii_case("vetcoders/screen_scribe_depr")),
+        "deprecated-only identity must not enter search corpus: {search_ids:?}"
     );
+
+    let cli = cli_catalog_resolve(&aicx_home, "screenscribe-history");
+    assert!(
+        cli.status.success(),
+        "catalog resolve CLI must stay green: {}",
+        String::from_utf8_lossy(&cli.stderr)
+    );
+    let cli_payload: Value =
+        serde_json::from_slice(&cli.stdout).expect("parse catalog resolve JSON");
+    assert_eq!(cli_payload["project"], "vetcoders/screen_scribe");
+
+    // Require-resolution: historical filter still resolves; depr does not.
+    let historical_resolution = aicx::store::require_project_resolution(
+        &["vetcoders/screen_scribe".to_string()],
+        &search_ids,
+        ProjectMatchMode::Exact,
+    );
+    assert!(
+        historical_resolution.is_ok(),
+        "historical project must resolve against catalog-backed corpus: {historical_resolution:?}"
+    );
+    let depr_resolution = aicx::store::require_project_resolution(
+        &["vetcoders/screen_scribe_depr".to_string()],
+        &search_ids,
+        ProjectMatchMode::Exact,
+    );
+    assert!(
+        depr_resolution.is_err(),
+        "deprecated remote must not resolve as a project identity: {depr_resolution:?}"
+    );
+
     println!(
-        "deprecated-checkout historical_status={} historical_sessions={:?} deprecated_status={} deprecated_contains_session=false",
-        historical.status,
-        payload_session_ids(&historical_payload),
-        deprecated.status
+        "deprecated-checkout catalog_project={} search_ids={:?} depr_rejected=true",
+        entry.project.as_deref().unwrap_or(""),
+        search_ids
     );
 
     fs::remove_dir_all(root).expect("remove deprecated checkout corpus");
