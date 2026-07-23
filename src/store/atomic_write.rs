@@ -111,6 +111,7 @@ fn sync_parent_best_effort(path: &Path) {
 /// intentionally swallowed — the underlying file write is already durable;
 /// this only hardens directory-entry persistence on power-loss-sensitive
 /// filesystems.
+#[allow(dead_code)]
 pub fn parent_fsync(path: &Path) {
     sync_parent_best_effort(path);
 }

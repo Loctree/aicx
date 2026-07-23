@@ -1,13 +1,13 @@
-//! Central context store for ai-contexters.
+//! AICX home helpers and legacy corpus scan/read surfaces.
 //!
-//! Manages the `~/.aicx/` directory structure:
-//! - `store/<organization>/<repository>/<YYYY_MMDD>/<kind>/<agent>/<YYYY_MMDD>_<agent>_<session-id>_<chunk>.md`
-//! - `non-repository-contexts/<YYYY_MMDD>/<kind>/<agent>/<YYYY_MMDD>_<agent>_<session-id>_<chunk>.md`
-//! - `store/<project>/<date>/<time>_<agent>-context.{md,json}` — legacy monolithic helpers kept for library use/tests
-//! - `chunks/` — the base location for chunk content
-//! - `index.json` — manifest of stored contexts
+//! The per-frame card mill under `~/.aicx/store` is **retired** (extracts-store cut).
+//! Live identity is catalog + extracts + source-driven index (`aicx catalog` /
+//! `aicx extract` / `aicx index`). This module still exposes:
+//! - path helpers (`resolve_aicx_home`, `store_base_dir`, project identity)
+//! - scan/read of any residual on-disk corpus for doctor/migration
+//! - no-op stubs for former write APIs (never create cards)
 //!
-//! Vibecrafted with AI Agents by Vetcoders (c)2026 Vetcoders
+//! Vibecrafted with AI Agents by Vetcoders (c)2024-2026 LibraxisAI
 
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
@@ -29,7 +29,6 @@ pub use canonical_projection::{
 
 use crate::chunker::{self, ChunkerConfig};
 use crate::sanitize;
-use crate::segmentation::semantic_segments;
 use crate::timeline::{RepoIdentity, SemanticSegment, TimelineEntry};
 pub use aicx_parser::{classify_kind, timeline::Kind};
 
@@ -93,6 +92,7 @@ fn siphash13_hex6(input: &str) -> String {
     format!("{:06x}", (hasher.finish() & 0x00FF_FFFF) as u32)
 }
 
+#[allow(dead_code)]
 fn chunk_sequence_from_id(id: &str) -> Option<u32> {
     id.rsplit('_').next().and_then(parse_chunk_component)
 }
@@ -106,15 +106,18 @@ pub(crate) mod ignore;
 pub(crate) mod paths;
 pub(crate) mod sidecar;
 
+#[cfg(test)]
+use dedupe::DirShaCache;
+use dedupe::content_sha256;
 pub use dedupe::content_sha256_exists_in_dir;
-use dedupe::{DirShaCache, content_sha256, sha256_of_file};
+#[cfg(test)]
+use paths::validated_store_project_dir;
 
 pub use ignore::{
     AICX_IGNORE_FILENAME, StoreIgnoreMatcher, filter_ignored_paths_at, load_ignore_matcher_at,
 };
 use paths::aicx_context_corpus_dir_for;
 pub(crate) use paths::canonical_project_slug;
-use paths::validated_store_project_dir;
 pub use paths::{
     CANONICAL_STORE_DIRNAME, CONTEXT_CORPUS_DIRNAME, CONTEXT_CORPUS_SCHEMA_VERSION,
     LEGACY_SALVAGE_DIRNAME, LOCT_CONTEXT_PACK_FAMILY, NON_REPOSITORY_CONTEXTS,
@@ -384,370 +387,121 @@ pub struct StoreWriteSummary {
     pub project_summary: BTreeMap<String, BTreeMap<String, usize>>,
 }
 
-#[derive(Debug, Clone, Default)]
-struct SessionWriteOutcome {
-    written_paths: Vec<PathBuf>,
-    written_date_counts: BTreeMap<String, usize>,
-    skipped_empty_body: usize,
-    deduped_chunks: usize,
+// Card mill write surface is retired (extracts-store cut, 2026-07-23).
+// Public APIs never create per-frame cards under `~/.aicx/store`.
+// Catalog + extract + source-driven index are the live path.
+
+/// Whether the per-frame card mill may write under a store root.
+///
+/// **Always false.** There is no `AICX_ALLOW_CARD_MILL` escape hatch.
+/// Identity lives in catalog + extracts; search is source-driven CURRENT.
+pub fn card_mill_writes_enabled() -> bool {
+    false
 }
 
-struct SessionWriteSpec<'a> {
-    project: Option<&'a str>,
-    agent: &'a str,
-    date: &'a str,
-    session_id: &'a str,
-    kind: Option<Kind>,
-}
-
-// ============================================================================
-// Context writing
-// ============================================================================
-
-/// Write timeline entries to the canonical store.
-///
-/// Creates two files:
-/// - `~/.aicx/store/<project>/<date>/<time>_<agent>-context.md`
-/// - `~/.aicx/store/<project>/<date>/<time>_<agent>-context.json`
-///
-/// Returns paths of both files.
-///
-/// When the card mill is disabled (default operator binary), returns an empty
-/// vector and creates nothing — dual-body silence for the catalog era.
+/// Retired mill API: always empty (no directories, no cards).
 pub fn write_context(
-    project: &str,
-    agent: &str,
-    date: &str,
-    time: &str,
-    entries: &[TimelineEntry],
+    _project: &str,
+    _agent: &str,
+    _date: &str,
+    _time: &str,
+    _entries: &[TimelineEntry],
 ) -> Result<Vec<PathBuf>> {
-    if !card_mill_writes_enabled() {
-        return Ok(Vec::new());
-    }
-    let project = canonical_project_slug(project);
-    let mut written = Vec::new();
-
-    // Markdown
-    let md_path = get_context_path(&project, agent, date, time)?;
-    let mut md_content = String::new();
-    md_content.push_str(&format!("# {} | {} | {}\n\n", project, agent, date));
-
-    for entry in entries {
-        let ts = entry.timestamp.format("%Y-%m-%d %H:%M:%S UTC");
-        md_content.push_str(&format!("### {} | {}\n", ts, entry.role));
-        for line in entry.message.lines() {
-            md_content.push_str(&format!("> {}\n", line));
-        }
-        md_content.push('\n');
-    }
-
-    let write_path = sanitize::validate_write_path(&md_path)?;
-    atomic_write(&write_path, md_content.as_bytes())?;
-    written.push(md_path);
-
-    // JSON
-    let json_path = get_context_json_path(&project, agent, date, time)?;
-    let json_content = serde_json::to_string_pretty(entries)?;
-    let write_path = sanitize::validate_write_path(&json_path)?;
-    atomic_write(&write_path, json_content.as_bytes())?;
-    written.push(json_path);
-
-    Ok(written)
+    Ok(Vec::new())
 }
 
-/// Write timeline entries as agent-friendly chunks to the canonical store.
-///
-/// Instead of one monolithic file per (project, agent, date), splits entries
-/// into overlapping ~1500-token windows preserving conversation flow.
-///
-/// Layout (legacy): `~/.aicx/store/<project>/<date>/<time>_<agent>-<seq:03>.md`
-///
-/// Returns paths of all written chunk files.
-///
-/// When the card mill is disabled (default operator binary), returns an empty
-/// vector and creates nothing.
+/// Retired mill API: always empty.
 pub fn write_context_chunked(
-    project: &str,
-    agent: &str,
-    date: &str,
-    time: &str,
-    entries: &[TimelineEntry],
-    chunker_config: &ChunkerConfig,
+    _project: &str,
+    _agent: &str,
+    _date: &str,
+    _time: &str,
+    _entries: &[TimelineEntry],
+    _chunker_config: &ChunkerConfig,
 ) -> Result<Vec<PathBuf>> {
-    if !card_mill_writes_enabled() {
-        return Ok(vec![]);
-    }
-    if entries.is_empty() {
-        return Ok(vec![]);
-    }
-
-    let project = canonical_project_slug(project);
-    let chunks = chunker::chunk_entries(entries, &project, agent, chunker_config);
-    let dir = validated_store_project_dir(&canonical_store_dir()?, &project)?.join(date);
-    fs::create_dir_all(&dir)?;
-
-    let mut written = Vec::new();
-
-    for chunk in &chunks {
-        // Extract seq from chunk.id (last _NNN part)
-        let seq = chunk.id.rsplit('_').next().unwrap_or("001");
-
-        let filename = format!("{}_{}-{}.md", time, agent, seq);
-        let path = dir.join(&filename);
-
-        let write_path = sanitize::validate_write_path(&path)?;
-        atomic_write(&write_path, chunk.text.as_bytes())?;
-        written.push(path);
-    }
-
-    Ok(written)
+    Ok(Vec::new())
 }
 
-/// Write timeline entries using the session-first canonical layout.
-///
-/// Layout: `~/.aicx/store/<project>/<YYYY_MMDD>/<kind>/<agent>/<YYYY_MMDD>_<agent>_<session-id>_<chunk>.md`
-///
-/// The `kind` is auto-classified from entries if not provided.
-/// Date is derived from the source event timestamps, not from runtime.
-///
-/// Returns paths of all written chunk files.
-///
-/// When the card mill is disabled (default operator binary), returns an empty
-/// vector and creates nothing. Migration/salvage must use
-/// [`store_semantic_segments_at_forced`] instead of this public helper.
+/// Retired mill API: always empty.
 pub fn write_context_session_first(
-    project: &str,
-    agent: &str,
-    date: &str,
-    session_id: &str,
-    entries: &[TimelineEntry],
-    chunker_config: &ChunkerConfig,
-    kind: Option<Kind>,
+    _project: &str,
+    _agent: &str,
+    _date: &str,
+    _session_id: &str,
+    _entries: &[TimelineEntry],
+    _chunker_config: &ChunkerConfig,
+    _kind: Option<Kind>,
 ) -> Result<Vec<PathBuf>> {
-    if !card_mill_writes_enabled() {
-        return Ok(Vec::new());
-    }
-    let mut sha_cache = DirShaCache::default();
-    Ok(write_context_session_first_outcome_at(
-        &canonical_store_dir()?,
-        SessionWriteSpec {
-            project: Some(project),
-            agent,
-            date,
-            session_id,
-            kind,
-        },
-        entries,
-        chunker_config,
-        &mut sha_cache,
-    )?
-    .written_paths)
+    Ok(Vec::new())
 }
 
-#[cfg(all(test, feature = "app"))]
-fn write_context_session_first_at(
-    root: &Path,
-    spec: SessionWriteSpec<'_>,
-    entries: &[TimelineEntry],
-    chunker_config: &ChunkerConfig,
-) -> Result<Vec<PathBuf>> {
-    let mut sha_cache = DirShaCache::default();
-    Ok(
-        write_context_session_first_outcome_at(
-            root,
-            spec,
-            entries,
-            chunker_config,
-            &mut sha_cache,
-        )?
-        .written_paths,
-    )
+pub fn store_semantic_segments(
+    _entries: &[TimelineEntry],
+    _chunker_config: &ChunkerConfig,
+) -> Result<StoreWriteSummary> {
+    Ok(StoreWriteSummary::default())
 }
 
-fn write_context_session_first_outcome_at(
-    root: &Path,
-    spec: SessionWriteSpec<'_>,
+pub fn store_semantic_segments_with_progress<F>(
+    _entries: &[TimelineEntry],
+    _chunker_config: &ChunkerConfig,
+    _progress: F,
+) -> Result<StoreWriteSummary>
+where
+    F: FnMut(usize, usize),
+{
+    Ok(StoreWriteSummary::default())
+}
+
+pub fn store_semantic_segments_at<F>(
+    _base: &Path,
+    _entries: &[TimelineEntry],
+    _chunker_config: &ChunkerConfig,
+    _progress: F,
+) -> Result<StoreWriteSummary>
+where
+    F: FnMut(usize, usize),
+{
+    Ok(StoreWriteSummary::default())
+}
+
+/// Retired force-write entry — same as the disabled mill (always empty).
+pub fn store_semantic_segments_at_forced<F>(
+    base: &Path,
     entries: &[TimelineEntry],
     chunker_config: &ChunkerConfig,
-    sha_cache: &mut DirShaCache,
-) -> Result<SessionWriteOutcome> {
-    if entries.is_empty() {
-        return Ok(SessionWriteOutcome::default());
-    }
+    progress: F,
+) -> Result<StoreWriteSummary>
+where
+    F: FnMut(usize, usize),
+{
+    store_semantic_segments_at(base, entries, chunker_config, progress)
+}
 
-    let kind = spec.kind.unwrap_or_else(|| classify_kind(entries));
-    let project_label = spec
-        .project
-        .map(canonical_project_slug)
-        .unwrap_or_else(|| NON_REPOSITORY_CONTEXTS.to_string());
-    let chunks = chunker::chunk_entries(entries, &project_label, spec.agent, chunker_config);
+/// Retired mill primitive: always empty summary.
+pub fn store_segments_at<F>(
+    _base: &Path,
+    _segments: &[SemanticSegment],
+    _chunker_config: &ChunkerConfig,
+    _progress: F,
+) -> Result<StoreWriteSummary>
+where
+    F: FnMut(usize, usize),
+{
+    Ok(StoreWriteSummary::default())
+}
 
-    let mut outcome = SessionWriteOutcome::default();
-
-    for (idx, chunk) in chunks.iter().enumerate() {
-        if chunk_body_is_empty(&chunk.text) {
-            outcome.skipped_empty_body += 1;
-            continue;
-        }
-        let chunk_date = if chunk.date.trim().is_empty() {
-            spec.date
-        } else {
-            chunk.date.as_str()
-        };
-        let date_dir = compact_date(chunk_date);
-        let chunk_num = chunk_sequence_from_id(&chunk.id).unwrap_or((idx as u32) + 1);
-        let mut dir = root.join(&date_dir).join(kind.dir_name()).join(spec.agent);
-        if spec.project.is_some() {
-            dir = validated_store_project_dir(root, &project_label)?
-                .join(&date_dir)
-                .join(kind.dir_name())
-                .join(spec.agent);
-        }
-        fs::create_dir_all(&dir)?;
-
-        let filename = session_basename(chunk_date, spec.agent, spec.session_id, chunk_num);
-        let path = dir.join(&filename);
-        let content_sha256 = content_sha256(&chunk.text);
-        if sha_cache.contains(&dir, &content_sha256)? {
-            outcome.deduped_chunks += 1;
-            continue;
-        }
-
-        // Basename collision precheck. UUIDv7 prefix sessions can land on the
-        // same `session_basename` even after siphash suffix in pathological
-        // cases (different inputs, same suffix). If the target already exists
-        // with a different `content_sha256`, disambiguate via a `-c{hex}`
-        // suffix derived from the new content hash so the existing chunk is
-        // never silently overwritten.
-        //
-        // Orphan handling (#20): if the `.md` is present but its `.meta.json`
-        // sidecar is missing, the prior two-phase write was killed between the
-        // two renames. The prior policy silently spawned a `-c<hash>` shadow
-        // and left the orphan in place forever, so the canonical basename was
-        // permanently shadowed and operators saw duplicate-looking chunks.
-        // Now we either reclaim the orphan (its on-disk body already matches
-        // the new chunk — just write the missing sidecar) or quarantine it
-        // (different body — move under `dir/quarantine/` so the canonical
-        // slot is free for the new pair).
-        let target_path = if path.exists() {
-            let existing_sidecar = path.with_extension("meta.json");
-            if !existing_sidecar.exists() {
-                let orphan_sha = sha256_of_file(&path)?;
-                if orphan_sha == content_sha256 {
-                    let mut sidecar = chunker::ChunkMetadataSidecar::from(chunk);
-                    sidecar.content_sha256 = Some(content_sha256.clone());
-                    let sidecar_bytes = serde_json::to_vec_pretty(&sidecar)?;
-                    let sidecar_write = sanitize::validate_write_path(&existing_sidecar)?;
-                    atomic_write(&sidecar_write, &sidecar_bytes)?;
-                    sha_cache.insert(&dir, content_sha256);
-                    tracing::info!(
-                        target: "aicx::store",
-                        orphan = %path.display(),
-                        "reclaimed orphan chunk by writing missing sidecar"
-                    );
-                    outcome.deduped_chunks += 1;
-                    continue;
-                }
-                let quarantine_dir = dir.join("quarantine");
-                fs::create_dir_all(&quarantine_dir)?;
-                let stamp = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_nanos())
-                    .unwrap_or(0);
-                let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("chunk");
-                let quar_path = quarantine_dir.join(format!("{}-orphan-{}.md", stem, stamp));
-                fs::rename(&path, &quar_path).with_context(|| {
-                    format!(
-                        "Failed to quarantine orphan {} -> {}",
-                        path.display(),
-                        quar_path.display()
-                    )
-                })?;
-                atomic_write::parent_fsync(&path);
-                atomic_write::parent_fsync(&quar_path);
-                tracing::warn!(
-                    target: "aicx::store",
-                    orphan = %path.display(),
-                    quarantine = %quar_path.display(),
-                    orphan_sha = %orphan_sha,
-                    new_sha = %content_sha256,
-                    "quarantined orphan .md (sidecar missing, body mismatch) to free canonical slot"
-                );
-                path
-            } else {
-                let existing_sha =
-                    load_sidecar_from_path(&existing_sidecar).and_then(|s| s.content_sha256);
-                if existing_sha.as_deref() == Some(content_sha256.as_str()) {
-                    outcome.deduped_chunks += 1;
-                    continue;
-                }
-                let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("chunk");
-                let disambig =
-                    dir.join(format!("{}-c{}.md", stem, siphash13_hex6(&content_sha256)));
-                tracing::warn!(
-                    target: "aicx::store",
-                    existing = %path.display(),
-                    disambiguated = %disambig.display(),
-                    existing_sha = ?existing_sha,
-                    "session-first chunk basename collision; writing under disambiguated path"
-                );
-                disambig
-            }
-        } else {
-            path
-        };
-
-        let write_path = sanitize::validate_write_path(&target_path)?;
-        let sidecar_path = target_path.with_extension("meta.json");
-        let sidecar_write_path = sanitize::validate_write_path(&sidecar_path)?;
-
-        let mut sidecar = chunker::ChunkMetadataSidecar::from(chunk);
-        sidecar.content_sha256 = Some(content_sha256.clone());
-        let sidecar_bytes = serde_json::to_vec_pretty(&sidecar)?;
-
-        // Two-phase commit: stage both tempfiles, then rename in order
-        // (.md first, .meta.json second). A crash between renames leaves an
-        // orphan .md without sidecar — detectable and recoverable — instead
-        // of an orphan .md with a stale or absent sidecar.
-        let chunk_tmp = atomic_write::stage_tempfile(&write_path, chunk.text.as_bytes())?;
-        let sidecar_tmp = match atomic_write::stage_tempfile(&sidecar_write_path, &sidecar_bytes) {
-            Ok(tmp) => tmp,
-            Err(err) => {
-                atomic_write::discard_tempfile(&chunk_tmp);
-                return Err(err.into());
-            }
-        };
-        if let Err(err) = atomic_write::commit_tempfile(&chunk_tmp, &write_path) {
-            atomic_write::discard_tempfile(&chunk_tmp);
-            atomic_write::discard_tempfile(&sidecar_tmp);
-            return Err(err.into());
-        }
-        if let Err(err) = atomic_write::commit_tempfile(&sidecar_tmp, &sidecar_write_path) {
-            atomic_write::discard_tempfile(&sidecar_tmp);
-            return Err(err.into());
-        }
-        // Mirror `atomic_write`'s parent-dir fsync (#21): the two-phase
-        // rename above goes through `commit_tempfile` directly, so
-        // `atomic_write::atomic_write` never gets to run its own
-        // post-rename sync. Without this, chunk + sidecar persistence on
-        // power-loss-sensitive filesystems was weaker than the contract
-        // used by every single-file `atomic_write` call. The two rename
-        // targets live in the same parent dir, so one fsync covers both;
-        // we add a defensive second call when paths diverge in unusual
-        // tests.
-        atomic_write::parent_fsync(&write_path);
-        if write_path.parent() != sidecar_write_path.parent() {
-            atomic_write::parent_fsync(&sidecar_write_path);
-        }
-        sha_cache.insert(&dir, content_sha256);
-        *outcome
-            .written_date_counts
-            .entry(date_dir.clone())
-            .or_default() += 1;
-        outcome.written_paths.push(target_path);
-    }
-
-    Ok(outcome)
+/// Retired force-write entry — always empty.
+pub fn store_segments_at_forced<F>(
+    base: &Path,
+    segments: &[SemanticSegment],
+    chunker_config: &ChunkerConfig,
+    progress: F,
+) -> Result<StoreWriteSummary>
+where
+    F: FnMut(usize, usize),
+{
+    store_segments_at(base, segments, chunker_config, progress)
 }
 
 pub(crate) fn chunk_body_is_empty(content: &str) -> bool {
@@ -767,315 +521,6 @@ fn chunk_line_has_signal(line: &str) -> bool {
         return !message.trim().is_empty();
     }
     true
-}
-
-/// Whether the per-frame card mill may write under a store root.
-///
-/// **Always false for the operator binary.** The mill concept is deleted:
-/// identity is catalog + extracts + source-driven index. Library unit tests
-/// (`cfg(test)`) still exercise the write helpers so historical contracts can
-/// be migrated off the mill without reopening an operator salvage env.
-///
-/// There is no `AICX_ALLOW_CARD_MILL` escape hatch.
-pub fn card_mill_writes_enabled() -> bool {
-    cfg!(test)
-}
-
-pub fn store_semantic_segments(
-    entries: &[TimelineEntry],
-    chunker_config: &ChunkerConfig,
-) -> Result<StoreWriteSummary> {
-    store_semantic_segments_with_progress(entries, chunker_config, |_, _| {})
-}
-
-pub fn store_semantic_segments_with_progress<F>(
-    entries: &[TimelineEntry],
-    chunker_config: &ChunkerConfig,
-    progress: F,
-) -> Result<StoreWriteSummary>
-where
-    F: FnMut(usize, usize),
-{
-    store_semantic_segments_at(&store_base_dir()?, entries, chunker_config, progress)
-}
-
-pub fn store_semantic_segments_at<F>(
-    base: &Path,
-    entries: &[TimelineEntry],
-    chunker_config: &ChunkerConfig,
-    progress: F,
-) -> Result<StoreWriteSummary>
-where
-    F: FnMut(usize, usize),
-{
-    if entries.is_empty() {
-        return Ok(StoreWriteSummary::default());
-    }
-    let segments = semantic_segments(entries);
-    store_segments_at(base, &segments, chunker_config, progress)
-}
-
-/// Legacy force-write entry used by migration tests only.
-///
-/// Outside `cfg(test)` this is identical to [`store_semantic_segments_at`]:
-/// the card mill does not write. There is no operator salvage path.
-pub fn store_semantic_segments_at_forced<F>(
-    base: &Path,
-    entries: &[TimelineEntry],
-    chunker_config: &ChunkerConfig,
-    progress: F,
-) -> Result<StoreWriteSummary>
-where
-    F: FnMut(usize, usize),
-{
-    store_semantic_segments_at(base, entries, chunker_config, progress)
-}
-
-/// Write pre-computed [`SemanticSegment`]s to the canonical store. This
-/// is the underlying primitive — callers that already paid for
-/// segmentation (e.g. the CLI's phased pipeline that emits a
-/// `segment`-phase heartbeat before the first `.md` write) reuse those
-/// segments here instead of re-segmenting from raw entries.
-///
-/// When the card mill is disabled (default), returns an empty summary and
-/// creates no directories — dual-body silence for catalog-era operators.
-pub fn store_segments_at<F>(
-    base: &Path,
-    segments: &[SemanticSegment],
-    chunker_config: &ChunkerConfig,
-    progress: F,
-) -> Result<StoreWriteSummary>
-where
-    F: FnMut(usize, usize),
-{
-    if !card_mill_writes_enabled() {
-        return Ok(StoreWriteSummary::default());
-    }
-    store_segments_at_impl(base, segments, chunker_config, progress)
-}
-
-/// Legacy force-write entry. Outside tests the mill is off; see
-/// [`store_segments_at`].
-pub fn store_segments_at_forced<F>(
-    base: &Path,
-    segments: &[SemanticSegment],
-    chunker_config: &ChunkerConfig,
-    progress: F,
-) -> Result<StoreWriteSummary>
-where
-    F: FnMut(usize, usize),
-{
-    store_segments_at(base, segments, chunker_config, progress)
-}
-
-fn store_segments_at_impl<F>(
-    base: &Path,
-    segments: &[SemanticSegment],
-    chunker_config: &ChunkerConfig,
-    mut progress: F,
-) -> Result<StoreWriteSummary>
-where
-    F: FnMut(usize, usize),
-{
-    let mut summary = StoreWriteSummary::default();
-    if segments.is_empty() {
-        return Ok(summary);
-    }
-
-    let _lock = crate::locks::acquire_exclusive(base.join("locks").join("index.lock"))?;
-    let total_segments = segments.len();
-    // Save-on-drop RAII guard (#26): `index.json` used to be persisted
-    // only at the end of the loop, so Ctrl+C / panic between the first
-    // segment write and the loop tail left the on-disk index out of sync
-    // with newly-stored chunks. The guard wraps the in-memory index and
-    // calls `save_index_at` on every code path — successful completion
-    // sets `persisted = true` so `Drop` becomes a no-op, and any early
-    // return (`?`) or panic fires `Drop`, which writes the index
-    // opportunistically before the surrounding lock is released.
-    let mut guard = IndexSaveGuard {
-        base,
-        index: load_index_at(base)?,
-        persisted: false,
-    };
-    let mut sha_cache = DirShaCache::default();
-
-    for (segment_idx, segment) in segments.iter().enumerate() {
-        let date = segment
-            .entries
-            .first()
-            .map(|entry| entry.timestamp.format("%Y-%m-%d").to_string())
-            .unwrap_or_else(|| Utc::now().format("%Y-%m-%d").to_string());
-        let project = canonical_project_slug(&segment.project_label());
-
-        let outcome =
-            write_semantic_segment_at(base, segment, &date, chunker_config, &mut sha_cache)?;
-        summary.skipped_empty_body += outcome.skipped_empty_body;
-        summary.deduped_chunks += outcome.deduped_chunks;
-
-        // Two separate counters with two separate semantics:
-        //
-        // 1. `summary.total_entries` and `summary.project_summary` are
-        //    "this run processed N entries through the pipeline" —
-        //    used by CLI/JSON output that operators (and the
-        //    `runtime_cli_store_contract` test) expect to reflect the
-        //    full pipeline cost, regardless of whether the chunks
-        //    landed on disk or were dedup-skipped.
-        //
-        // 2. `update_index(...)` writes the on-disk-truth counter to
-        //    `index.json`. THAT one is proportional to chunks actually
-        //    written, so a `--full-rescan` over an already-stored
-        //    corpus doesn't pump the index counter on every run when
-        //    `write_context_session_first_outcome_at` short-circuits
-        //    every chunk on content_sha256 dedup. This is the
-        //    bug #1 fix from PR #7 — index reflects what's on disk,
-        //    not what the pipeline touched.
-        //
-        // Earlier in PR #7 these two semantics were collapsed (both
-        // proportional) which broke the contract test
-        // `store_cli_defaults_to_incremental_and_full_rescan_recovers_backfill`.
-        let chunks_written = outcome.written_paths.len();
-        let chunks_total = chunks_written + outcome.deduped_chunks + outcome.skipped_empty_body;
-        let entries_committed_to_disk = if chunks_total == 0 || chunks_written == 0 {
-            0
-        } else {
-            // Round-half-up integer division so a one-chunk-written
-            // segment doesn't truncate to 0 entries.
-            (segment.entries.len() * chunks_written + chunks_total / 2) / chunks_total
-        };
-
-        // Pipeline-processed counter (full segment entry count) —
-        // operator-facing CLI/JSON output + project_summary breakdown.
-        *summary
-            .project_summary
-            .entry(project.clone())
-            .or_default()
-            .entry(segment.agent.clone())
-            .or_insert(0) += segment.entries.len();
-        summary.total_entries += segment.entries.len();
-
-        // On-disk-truth counter (proportional to chunks actually
-        // written) — `index.json` only.
-        if entries_committed_to_disk > 0 {
-            if outcome.written_date_counts.is_empty() {
-                update_index(
-                    &mut guard.index,
-                    &project,
-                    &segment.agent,
-                    &compact_date(&date),
-                    entries_committed_to_disk,
-                );
-            } else {
-                let total_written: usize = outcome.written_date_counts.values().sum();
-                let mut remaining_entries = entries_committed_to_disk;
-                let mut remaining_dates = outcome.written_date_counts.len();
-                for (date, chunks_for_date) in &outcome.written_date_counts {
-                    let entry_count = if remaining_dates == 1 {
-                        remaining_entries
-                    } else {
-                        let proportional =
-                            entries_committed_to_disk * chunks_for_date / total_written;
-                        let count = proportional.max(1).min(remaining_entries);
-                        remaining_entries = remaining_entries.saturating_sub(count);
-                        remaining_dates -= 1;
-                        count
-                    };
-                    update_index(
-                        &mut guard.index,
-                        &project,
-                        &segment.agent,
-                        date,
-                        entry_count,
-                    );
-                }
-            }
-        }
-        summary.written_paths.extend(outcome.written_paths);
-        progress(segment_idx + 1, total_segments);
-    }
-
-    save_index_at(base, &guard.index)?;
-    guard.persisted = true;
-    Ok(summary)
-}
-
-/// RAII save-on-drop guard for the in-memory store index (#26).
-///
-/// Holds the index by value while `store_segments_at` mutates it. On
-/// successful completion the caller sets `persisted = true` after a
-/// regular `save_index_at` and `Drop` becomes a no-op; on any early
-/// return (error `?`) or panic the `Drop` impl persists the index
-/// opportunistically so Ctrl+C / mid-loop failure does not leave disk
-/// out of sync. Write errors during `Drop` are logged (best-effort);
-/// `Drop` cannot itself return a `Result`.
-struct IndexSaveGuard<'a> {
-    base: &'a Path,
-    index: StoreIndex,
-    persisted: bool,
-}
-
-impl Drop for IndexSaveGuard<'_> {
-    fn drop(&mut self) {
-        if self.persisted {
-            return;
-        }
-        match save_index_at(self.base, &self.index) {
-            Ok(()) => {
-                tracing::warn!(
-                    target: "aicx::store",
-                    base = %self.base.display(),
-                    "store_segments_at returned early; index.json persisted opportunistically via IndexSaveGuard::drop"
-                );
-            }
-            Err(err) => {
-                // `Drop` cannot return; tracing may itself be torn down
-                // during a panic so we also fall back to stderr.
-                tracing::error!(
-                    target: "aicx::store",
-                    base = %self.base.display(),
-                    "IndexSaveGuard::drop failed to persist index.json: {err:#}"
-                );
-                eprintln!(
-                    "aicx: IndexSaveGuard::drop failed to persist index.json at {}: {err:#}",
-                    self.base.display()
-                );
-            }
-        }
-    }
-}
-
-fn write_semantic_segment_at(
-    base: &Path,
-    segment: &SemanticSegment,
-    date: &str,
-    chunker_config: &ChunkerConfig,
-    sha_cache: &mut DirShaCache,
-) -> Result<SessionWriteOutcome> {
-    // Only assertable identities (Primary/Secondary) earn canonical store placement.
-    // Fallback/Opaque/None route to non-repository-contexts.
-    let project = if segment.has_assertable_identity() {
-        segment.repo.as_ref().map(RepoIdentity::slug)
-    } else {
-        None
-    };
-    let root = if project.is_some() {
-        base.join(CANONICAL_STORE_DIRNAME)
-    } else {
-        base.join(NON_REPOSITORY_CONTEXTS)
-    };
-
-    write_context_session_first_outcome_at(
-        &root,
-        SessionWriteSpec {
-            project: project.as_deref(),
-            agent: &segment.agent,
-            date,
-            session_id: &segment.session_id,
-            kind: Some(segment.kind),
-        },
-        &segment.entries,
-        chunker_config,
-        sha_cache,
-    )
 }
 
 pub fn scan_context_files() -> Result<Vec<StoredContextFile>> {

@@ -102,21 +102,13 @@ impl Aicx {
     where
         F: FnMut(usize, usize),
     {
-        // Production: card mill is deleted. cfg(test) still exercises the mill
-        // for migration contracts; operator binaries and library consumers get
-        // a hard fail, not dual-body silence that pretends the write succeeded.
-        if !crate::store::card_mill_writes_enabled() {
-            anyhow::bail!(
-                "card mill removed: Aicx::store_entries no longer writes per-frame cards under \
-                 ~/.aicx/store. Use `aicx catalog rebuild`, then `aicx extract` / `aicx index` \
-                 (catalog + extracts + source-driven CURRENT)."
-            );
-        }
-        crate::store::store_semantic_segments_at(
-            &self.config.store_root,
-            entries,
-            &opts.chunker,
-            progress,
+        // Card mill is deleted — never dual-body silence that pretends a write
+        // succeeded. Catalog + extract + source-driven CURRENT are the path.
+        let _ = (entries, opts, progress);
+        anyhow::bail!(
+            "card mill removed: Aicx::store_entries no longer writes per-frame cards under \
+             ~/.aicx/store. Use `aicx catalog rebuild`, then `aicx extract` / `aicx index` \
+             (catalog + extracts + source-driven CURRENT)."
         )
     }
 
@@ -863,117 +855,6 @@ mod tests {
     }
 
     #[test]
-    fn index_status_marks_stale_chunks_when_sessions_are_newer_than_chunks() {
-        let root = std::env::temp_dir().join(format!(
-            "aicx-api-index-status-stale-chunks-{}-{}",
-            std::process::id(),
-            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).expect("create root");
-
-        let older = Utc.with_ymd_and_hms(2026, 6, 11, 12, 33, 0).unwrap();
-        let newer = Utc.with_ymd_and_hms(2026, 6, 12, 9, 28, 0).unwrap();
-        let entry = TimelineEntry {
-            timestamp: older,
-            agent: "claude".to_string(),
-            session_id: "old-session".to_string(),
-            role: "user".to_string(),
-            message: "old chunk".to_string(),
-            frame_kind: Some(FrameKind::UserMsg),
-            branch: None,
-            cwd: Some("/Users/tester/vc-workspace/vetcoders/aicx".to_string()),
-            timestamp_source: None,
-            source_path: None,
-            source_sha256: None,
-            source_line_span: None,
-        };
-        let summary = crate::store::store_semantic_segments_at(
-            &root,
-            &[entry],
-            &ChunkerConfig::default(),
-            |_, _| {},
-        )
-        .expect("store chunk");
-        let index_dir = root.join("indexed").join("_all");
-        std::fs::create_dir_all(&index_dir).expect("create index dir");
-        let index_path = index_dir.join("embeddings.ndjson");
-        std::fs::write(
-            &index_path,
-            "{\"schema_version\":\"1.0\"}\n{\"id\":\"old\"}\n",
-        )
-        .expect("write index");
-
-        let older_file_time = filetime::FileTime::from_unix_time(older.timestamp(), 0);
-        for path in &summary.written_paths {
-            filetime::set_file_mtime(path, older_file_time).expect("set chunk mtime");
-        }
-        filetime::set_file_mtime(&index_path, older_file_time).expect("set index mtime");
-
-        let session = SessionInfo {
-            session_id: "fresh".to_string(),
-            agent: "claude".to_string(),
-            project: Some("aicx".to_string()),
-            repo_path: Some("/Users/tester/vc-workspace/vetcoders/aicx".to_string()),
-            started_at: Some(newer),
-            updated_at: Some(newer),
-            message_count: 1,
-            user_message_count: 1,
-            agent_message_count: 0,
-            title: Some("fresh work".to_string()),
-            source_path: root.join("fresh.jsonl"),
-            association: crate::sessions::Association::Exact,
-            temporal_confidence: crate::sessions::TemporalConfidence::Full,
-        };
-
-        let status =
-            index_status_at_with_sessions(&root, None, Some(&[session])).expect("index status");
-
-        assert_eq!(status.source_sessions, 1);
-        assert_eq!(status.sessions_newer_than_chunks, 1);
-        assert_eq!(status.sessions_without_timestamps, 0);
-        assert_eq!(status.newest_session_updated_at, Some(newer.to_rfc3339()));
-        assert_eq!(status.readiness, IndexReadiness::StaleChunks);
-        assert!(status.chunking_lag_secs.unwrap() > 0);
-
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn client_can_store_entries_without_cli_globals() {
-        let root = std::env::temp_dir().join(format!("aicx-api-store-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).expect("create root");
-
-        let client = Aicx::with_store_root(&root);
-        let entries = vec![TimelineEntry {
-            timestamp: Utc.with_ymd_and_hms(2026, 5, 6, 16, 0, 0).unwrap(),
-            agent: "codex".to_string(),
-            session_id: "api-lib-session".to_string(),
-            role: "user".to_string(),
-            message: "Decision: expose AICX as a real library surface.".to_string(),
-            frame_kind: Some(FrameKind::UserMsg),
-            branch: None,
-            cwd: None,
-            timestamp_source: None,
-            source_path: None,
-            source_sha256: None,
-            source_line_span: None,
-        }];
-
-        let summary = client
-            .store_entries(&entries, &StoreOptions::default())
-            .expect("store entries through public facade");
-
-        assert_eq!(summary.total_entries, 1);
-        assert_eq!(summary.written_paths.len(), 1);
-        assert!(summary.written_paths[0].starts_with(root.join("non-repository-contexts")));
-        assert_eq!(client.list_chunks().expect("scan chunks").len(), 1);
-
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
     fn index_status_prefers_hybrid_current_over_ndjson_mill() {
         let root = std::env::temp_dir().join(format!(
             "aicx-api-hybrid-status-{}-{}",
@@ -1047,6 +928,28 @@ mod tests {
             status.semantic_index_path
         );
 
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn store_entries_rejects_card_mill() {
+        let root = std::env::temp_dir().join(format!(
+            "aicx-api-mill-dead-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::create_dir_all(&root);
+        let client = super::Aicx::with_store_root(&root);
+        let err = client
+            .store_entries(&[], &super::StoreOptions::default())
+            .expect_err("mill must hard-fail");
+        assert!(
+            err.to_string().contains("card mill removed"),
+            "unexpected error: {err:#}"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 }

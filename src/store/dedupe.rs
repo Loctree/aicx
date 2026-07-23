@@ -1,3 +1,4 @@
+#![allow(dead_code)] // residual mill sha cache until scan path fully retires store cards
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, hash_map::Entry};
@@ -81,12 +82,12 @@ fn content_sha256s_in_dir(dir: &Path) -> Result<HashSet<String>> {
 }
 
 #[derive(Debug, Default)]
-pub(super) struct DirShaCache {
+pub(crate) struct DirShaCache {
     by_dir: HashMap<PathBuf, HashSet<String>>,
 }
 
 impl DirShaCache {
-    pub(super) fn contains(&mut self, dir: &Path, sha: &str) -> Result<bool> {
+    pub(crate) fn contains(&mut self, dir: &Path, sha: &str) -> Result<bool> {
         let hashes = match self.by_dir.entry(dir.to_path_buf()) {
             Entry::Occupied(entry) => entry.into_mut(),
             Entry::Vacant(entry) => entry.insert(content_sha256s_in_dir(dir)?),
@@ -94,7 +95,7 @@ impl DirShaCache {
         Ok(hashes.contains(sha))
     }
 
-    pub(super) fn insert(&mut self, dir: &Path, sha: String) {
+    pub(crate) fn insert(&mut self, dir: &Path, sha: String) {
         self.by_dir
             .entry(dir.to_path_buf())
             .or_default()
