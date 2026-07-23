@@ -55,8 +55,7 @@ pub async fn run(
 ) -> Result<Option<DoctorReport>> {
     let base = match base_override {
         Some(base) => base.to_path_buf(),
-        None => legacy_archive::store_base_dir()
-            .context("Failed to resolve aicx store base directory")?,
+        None => crate::aicx_home::ensure().context("Failed to resolve AICX home")?,
     };
     if deep {
         run_deep_impl(&base, opts, reporter, cancel).await
@@ -1029,34 +1028,39 @@ fn summarize_projection_stages(stages: &[StageInventoryEntry]) -> Option<StageSu
 }
 
 /// Informational: report the resolved AICX_HOME, whether it is pinned via the
-/// environment, and whether the canonical store / semantic index live under
-/// it. Diagnostic only — `canonical_store` owns the health gate; this exists so
-/// an operator can see *where* aicx is looking without spelunking.
+/// environment, and whether the source-driven index or a retired card archive
+/// exists under it.
 pub(crate) fn check_aicx_home(base: &Path) -> CheckResult {
     let env_pin = std::env::var_os("AICX_HOME").filter(|value| !value.is_empty());
     let resolved = base.display().to_string();
-    let store_present = base.join("store").exists();
+    let home_present = base.is_dir();
+    let legacy_archive_present = base.join(legacy_archive::LEGACY_CARDS_DIRNAME).exists();
     let indexed_present = base.join("indexed").exists();
     let source = match &env_pin {
         Some(value) => format!("pinned via AICX_HOME={}", PathBuf::from(value).display()),
         None => "default (bootstrap config or ~/.aicx)".to_string(),
     };
     let detail = format!(
-        "resolved home: {resolved} [{source}]; store/ {}, indexed/ {}",
-        if store_present { "present" } else { "missing" },
+        "resolved home: {resolved} [{source}]; home {}, legacy card archive {}, indexed/ {}",
+        if home_present { "present" } else { "missing" },
+        if legacy_archive_present {
+            "present"
+        } else {
+            "absent"
+        },
         if indexed_present {
             "present"
         } else {
             "missing"
         },
     );
-    let (severity, recommendation) = if store_present {
+    let (severity, recommendation) = if home_present {
         (Severity::Green, None)
     } else {
         (
             Severity::Warning,
             Some(format!(
-                "No canonical store under {resolved}. If your corpus lives elsewhere, set AICX_HOME to that path before running aicx (default is ~/.aicx)."
+                "AICX home {resolved} does not exist. Run `aicx catalog rebuild`, or set AICX_HOME to the intended home before running aicx (default is ~/.aicx)."
             )),
         )
     };
@@ -1827,7 +1831,7 @@ pub(crate) async fn check_steer_lance(base: &Path) -> CheckResult {
                 },
                 detail: format!("Lance probe failed: {msg}"),
                 recommendation: Some(if critical {
-                    "Run `aicx doctor --rebuild-steer-index` to delete and rebuild from canonical store".to_string()
+                    "Run `aicx doctor --rebuild-steer-index` to delete and rebuild from catalog-backed extracts".to_string()
                 } else {
                     format!(
                         "Investigate logs; persistent issues may need manual `rm -rf {}/steer_db`",
@@ -2237,7 +2241,7 @@ pub(crate) fn check_corpus_buckets(base: &Path) -> CheckResult {
 pub(crate) fn count_corpus_buckets(store_root: &Path) -> Result<usize> {
     let mut count = 0usize;
     for entry in
-        crate::sanitize::read_dir_validated(store_root).context("read corpus store root")?
+        crate::sanitize::read_dir_validated(store_root).context("read legacy corpus root")?
     {
         let entry = entry.context("read corpus store entry")?;
         if entry.file_type().map(|ty| ty.is_dir()).unwrap_or(false) {
@@ -2270,7 +2274,7 @@ pub(crate) fn scan_corpus_buckets(store_root: &Path) -> Result<Vec<String>> {
     }
 
     for org_entry in
-        crate::sanitize::read_dir_validated(store_root).context("read corpus store root")?
+        crate::sanitize::read_dir_validated(store_root).context("read legacy corpus root")?
     {
         let org_entry = org_entry.context("read corpus store entry")?;
         if !org_entry.file_type().map(|ty| ty.is_dir()).unwrap_or(false) {
@@ -2335,7 +2339,7 @@ pub(crate) async fn attempt_steer_rebuild(base: &Path) -> Result<String> {
         .context("rebuild after corruption removal")?;
 
     Ok(format!(
-        "removed {} and rebuilt steer index from canonical store",
+        "removed {} and rebuilt steer index from catalog-backed extracts",
         if removed.is_empty() {
             "nothing".to_string()
         } else {

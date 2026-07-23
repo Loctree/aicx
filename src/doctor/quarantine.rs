@@ -225,13 +225,13 @@ pub(crate) fn empty_body_quarantine_destination(
     quarantine_root: &Path,
     path: &Path,
 ) -> Result<PathBuf> {
-    // Empty-body chunks live under either the canonical store
+    // Empty-body chunks live under either the retired card archive
     // (`~/.aicx/store/<org>/<repo>/…`) or the non-repository fallback
     // (`~/.aicx/non-repository-contexts/<date>/…`); both roots are
     // scanned by `legacy_archive::scan_context_files_at`. Previously the prefix
     // check only accepted `~/.aicx/store/`, which made
     // `aicx doctor --prune-empty-bodies` crash with
-    // `empty-body chunk is outside store root` the moment any candidate
+    // `empty-body chunk is outside archive root` the moment any candidate
     // came from the non-repository corpus (operator observed ~4418
     // candidates on prod). Accept any path under `base` (the canonical
     // `~/.aicx/` home) and preserve its `base`-relative layout under
@@ -269,8 +269,7 @@ pub(crate) fn file_sha256(path: &Path) -> Result<String> {
 }
 
 pub fn restore_quarantine(slug: &str) -> Result<QuarantineRestoreReport> {
-    let base =
-        legacy_archive::store_base_dir().context("Failed to resolve aicx store base directory")?;
+    let base = crate::aicx_home::ensure().context("Failed to resolve AICX home")?;
     restore_quarantine_at(&base, slug)
 }
 

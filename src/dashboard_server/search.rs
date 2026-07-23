@@ -436,7 +436,7 @@ fn run_steer_search(params: SteerSearchParams, limit: usize) -> Result<SteerSear
     };
 
     let project_filters = merge_project_scopes(None, params.project.clone(), params.projects);
-    let store_root = crate::legacy_archive::store_base_dir()?;
+    let store_root = crate::aicx_home::ensure()?;
     let mut metadatas = Vec::new();
     for project in search_project_scopes(&store_root, &project_filters)? {
         let filter = crate::steer_index::SteerFilter {

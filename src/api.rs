@@ -33,7 +33,7 @@ pub struct AicxConfig {
 impl AicxConfig {
     pub fn from_env() -> Result<Self> {
         Ok(Self {
-            store_root: crate::legacy_archive::store_base_dir()?,
+            store_root: crate::aicx_home::ensure()?,
         })
     }
 
@@ -504,10 +504,8 @@ fn index_status_at_with_sessions(
 
 /// True when residual per-frame mill dirs still exist under the AICX home.
 fn residual_store_surface_present(base: &Path) -> bool {
-    base.join("store").is_dir()
-        || base
-            .join(crate::legacy_archive::CANONICAL_STORE_DIRNAME)
-            .is_dir()
+    base.join(crate::legacy_archive::LEGACY_CARDS_DIRNAME)
+        .is_dir()
         || base
             .join(crate::legacy_archive::NON_REPOSITORY_CONTEXTS)
             .is_dir()
@@ -639,7 +637,7 @@ fn discover_source_sessions_for_status_bounded(
     project: Option<&str>,
     newest_chunk: Option<SystemTime>,
 ) -> Vec<SessionInfo> {
-    let Ok(active_store_root) = crate::legacy_archive::store_base_dir() else {
+    let Ok(active_store_root) = crate::aicx_home::ensure() else {
         return Vec::new();
     };
     if active_store_root != base {

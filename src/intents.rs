@@ -65,7 +65,7 @@ pub fn extract_intents(config: &IntentsConfig) -> Result<Vec<IntentRecord>> {
 }
 
 pub fn extract_intents_with_stats(config: &IntentsConfig) -> Result<IntentExtraction> {
-    let store_root = legacy_archive::store_base_dir()?;
+    let store_root = crate::aicx_home::ensure()?;
     extract_intents_from_root_at_with_stats(config, &store_root, Utc::now())
 }
 
@@ -73,7 +73,7 @@ pub fn extract_intents_with_stats_for_projects(
     config: &IntentsConfig,
     projects: &[String],
 ) -> Result<IntentExtraction> {
-    let store_root = legacy_archive::store_base_dir()?;
+    let store_root = crate::aicx_home::ensure()?;
     extract_intents_from_root_at_for_projects_with_stats(config, projects, &store_root, Utc::now())
 }
 
@@ -456,7 +456,7 @@ fn persisted_project_from_card(path: &Path) -> Result<Option<String>> {
 fn normalize_scan_root(store_root: &Path) -> PathBuf {
     if store_root
         .file_name()
-        .is_some_and(|name| name == legacy_archive::CANONICAL_STORE_DIRNAME)
+        .is_some_and(|name| name == legacy_archive::LEGACY_CARDS_DIRNAME)
     {
         return store_root
             .parent()
@@ -3104,7 +3104,7 @@ fn link_insights_to_sources(entries: &mut [IntentEntry]) {
 // ── Migration support ───────────────────────────────────────────────
 
 pub fn migrate_intent_schema_dry_run(project_filter: Option<&str>) -> Result<MigrationReport> {
-    migrate_intent_schema_dry_run_at(&legacy_archive::store_base_dir()?, project_filter)
+    migrate_intent_schema_dry_run_at(&crate::aicx_home::ensure()?, project_filter)
 }
 
 pub fn migrate_intent_schema_dry_run_at(

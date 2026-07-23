@@ -285,26 +285,31 @@ fn check_canonical_store_warns_when_missing() {
 }
 
 #[test]
-fn check_aicx_home_is_green_when_store_present() {
+fn check_aicx_home_is_green_without_legacy_archive() {
     let tmp = unique_test_dir("home-present");
-    std::fs::create_dir_all(tmp.join("store")).unwrap();
+    std::fs::create_dir_all(&tmp).unwrap();
     let result = check_aicx_home(&tmp);
     assert_eq!(result.name, "aicx_home");
     assert_eq!(result.severity, Severity::Green);
-    assert!(result.detail.contains("store/ present"));
+    assert!(result.detail.contains("legacy card archive absent"));
     assert!(result.detail.contains(&tmp.display().to_string()));
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
 #[test]
-fn check_aicx_home_warns_and_advises_when_store_missing() {
+fn check_aicx_home_warns_and_advises_when_home_missing() {
     let tmp = unique_test_dir("home-missing");
-    std::fs::create_dir_all(&tmp).unwrap();
+    let _ = std::fs::remove_dir_all(&tmp);
     let result = check_aicx_home(&tmp);
     assert_eq!(result.name, "aicx_home");
     assert_eq!(result.severity, Severity::Warning);
-    assert!(result.detail.contains("store/ missing"));
-    assert!(result.recommendation.unwrap().contains("AICX_HOME"));
+    assert!(result.detail.contains("home missing"));
+    assert!(
+        result
+            .recommendation
+            .unwrap()
+            .contains("aicx catalog rebuild")
+    );
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
