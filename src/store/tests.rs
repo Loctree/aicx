@@ -758,7 +758,7 @@ fn output_session_first_path_structure() {
     let agent = "claude";
     let project = "ai-contexters";
 
-    // Simulate the path that write_context_session_first would create
+    // Preserve recognition of the retired session-first archive layout.
     let expected_subpath = format!("{}/{}/{}/{}", project, date, kind.dir_name(), agent);
 
     let basename = session_basename(date, agent, "sess-abc123", 1);
@@ -2585,17 +2585,4 @@ fn chunk_body_is_empty_is_header_agnostic() {
     assert!(!chunk_body_is_empty(
         "---\nsome unrelated text\n---\nDecision: real content survives\n"
     ));
-}
-
-#[test]
-fn card_mill_write_apis_are_hard_dead() {
-    assert!(!card_mill_writes_enabled());
-    let summary = store_semantic_segments(&[], &ChunkerConfig::default()).unwrap();
-    assert!(summary.written_paths.is_empty());
-    assert_eq!(summary.total_entries, 0);
-    assert!(
-        write_context("o/r", "codex", "2026-07-23", "120000", &[])
-            .unwrap()
-            .is_empty()
-    );
 }

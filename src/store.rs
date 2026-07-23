@@ -5,14 +5,14 @@
 //! `aicx extract` / `aicx index`). This module still exposes:
 //! - path helpers (`resolve_aicx_home`, `store_base_dir`, project identity)
 //! - scan/read of any residual on-disk corpus for doctor/migration
-//! - no-op stubs for former write APIs (never create cards)
+//! - no write APIs: catalog + extracts + source-driven index own persistence
 //!
 //! Vibecrafted with AI Agents by Vetcoders (c)2024-2026 LibraxisAI
 
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -28,9 +28,11 @@ pub use canonical_projection::{
     CANONICAL_PROJECTION_DIRNAME, CanonicalStoreManifest, read_canonical_projection_at,
 };
 
-use crate::chunker::{self, ChunkerConfig};
+use crate::chunker;
 use crate::sanitize;
-use crate::timeline::{RepoIdentity, SemanticSegment, TimelineEntry};
+use crate::timeline::RepoIdentity;
+#[cfg(test)]
+use crate::timeline::TimelineEntry;
 pub use aicx_parser::{classify_kind, timeline::Kind};
 
 // ============================================================================
@@ -377,132 +379,6 @@ impl ChunkRefSpec {
 
         Ok(Self::Path(PathBuf::from(reference)))
     }
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct StoreWriteSummary {
-    pub total_entries: usize,
-    pub written_paths: Vec<PathBuf>,
-    pub skipped_empty_body: usize,
-    pub deduped_chunks: usize,
-    pub project_summary: BTreeMap<String, BTreeMap<String, usize>>,
-}
-
-// Card mill write surface is retired (extracts-store cut, 2026-07-23).
-// Public APIs never create per-frame cards under `~/.aicx/store`.
-// Catalog + extract + source-driven index are the live path.
-
-/// Whether the per-frame card mill may write under a store root.
-///
-/// **Always false.** There is no `AICX_ALLOW_CARD_MILL` escape hatch.
-/// Identity lives in catalog + extracts; search is source-driven CURRENT.
-pub fn card_mill_writes_enabled() -> bool {
-    false
-}
-
-/// Retired mill API: always empty (no directories, no cards).
-pub fn write_context(
-    _project: &str,
-    _agent: &str,
-    _date: &str,
-    _time: &str,
-    _entries: &[TimelineEntry],
-) -> Result<Vec<PathBuf>> {
-    Ok(Vec::new())
-}
-
-/// Retired mill API: always empty.
-pub fn write_context_chunked(
-    _project: &str,
-    _agent: &str,
-    _date: &str,
-    _time: &str,
-    _entries: &[TimelineEntry],
-    _chunker_config: &ChunkerConfig,
-) -> Result<Vec<PathBuf>> {
-    Ok(Vec::new())
-}
-
-/// Retired mill API: always empty.
-pub fn write_context_session_first(
-    _project: &str,
-    _agent: &str,
-    _date: &str,
-    _session_id: &str,
-    _entries: &[TimelineEntry],
-    _chunker_config: &ChunkerConfig,
-    _kind: Option<Kind>,
-) -> Result<Vec<PathBuf>> {
-    Ok(Vec::new())
-}
-
-pub fn store_semantic_segments(
-    _entries: &[TimelineEntry],
-    _chunker_config: &ChunkerConfig,
-) -> Result<StoreWriteSummary> {
-    Ok(StoreWriteSummary::default())
-}
-
-pub fn store_semantic_segments_with_progress<F>(
-    _entries: &[TimelineEntry],
-    _chunker_config: &ChunkerConfig,
-    _progress: F,
-) -> Result<StoreWriteSummary>
-where
-    F: FnMut(usize, usize),
-{
-    Ok(StoreWriteSummary::default())
-}
-
-pub fn store_semantic_segments_at<F>(
-    _base: &Path,
-    _entries: &[TimelineEntry],
-    _chunker_config: &ChunkerConfig,
-    _progress: F,
-) -> Result<StoreWriteSummary>
-where
-    F: FnMut(usize, usize),
-{
-    Ok(StoreWriteSummary::default())
-}
-
-/// Retired force-write entry — same as the disabled mill (always empty).
-pub fn store_semantic_segments_at_forced<F>(
-    base: &Path,
-    entries: &[TimelineEntry],
-    chunker_config: &ChunkerConfig,
-    progress: F,
-) -> Result<StoreWriteSummary>
-where
-    F: FnMut(usize, usize),
-{
-    store_semantic_segments_at(base, entries, chunker_config, progress)
-}
-
-/// Retired mill primitive: always empty summary.
-pub fn store_segments_at<F>(
-    _base: &Path,
-    _segments: &[SemanticSegment],
-    _chunker_config: &ChunkerConfig,
-    _progress: F,
-) -> Result<StoreWriteSummary>
-where
-    F: FnMut(usize, usize),
-{
-    Ok(StoreWriteSummary::default())
-}
-
-/// Retired force-write entry — always empty.
-pub fn store_segments_at_forced<F>(
-    base: &Path,
-    segments: &[SemanticSegment],
-    chunker_config: &ChunkerConfig,
-    progress: F,
-) -> Result<StoreWriteSummary>
-where
-    F: FnMut(usize, usize),
-{
-    store_segments_at(base, segments, chunker_config, progress)
 }
 
 pub(crate) fn chunk_body_is_empty(content: &str) -> bool {

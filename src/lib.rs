@@ -126,7 +126,7 @@ mod test_support;
 
 pub use aicx_parser as parser;
 pub use aicx_parser::{card_header, chunker, frontmatter, sanitize, segmentation, timeline, types};
-pub use api::{Aicx, AicxConfig, IndexReadiness, IndexStatus, StoreOptions};
+pub use api::{Aicx, AicxConfig, IndexReadiness, IndexStatus};
 #[cfg(feature = "app")]
 pub use api::{SearchOptions, SearchResults};
 
@@ -158,13 +158,13 @@ pub fn os_user_home() -> Option<std::path::PathBuf> {
 pub mod prelude {
     #[cfg(feature = "app")]
     pub use crate::api::SearchOptions;
-    pub use crate::api::{Aicx, AicxConfig, StoreOptions};
+    pub use crate::api::{Aicx, AicxConfig};
     #[cfg(feature = "app")]
     pub use crate::doctor::{DoctorOptions, DoctorReport};
     pub use crate::intents::{IntentExtraction, IntentRecord, IntentsConfig};
     #[cfg(feature = "app")]
     pub use crate::rank::FuzzyResult;
-    pub use crate::store::{ChunkRefSpec, ReadContextChunk, StoreWriteSummary, StoredContextFile};
+    pub use crate::store::{ChunkRefSpec, ReadContextChunk, StoredContextFile};
     pub use crate::timeline::TimelineEntry;
 }
 

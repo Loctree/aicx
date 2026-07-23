@@ -13,17 +13,15 @@ use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use crate::chunker::ChunkerConfig;
 #[cfg(feature = "app")]
 use crate::doctor::{DoctorOptions, DoctorReport};
 use crate::intents::{IntentExtraction, IntentsConfig};
 #[cfg(feature = "app")]
 use crate::rank::FuzzyResult;
 use crate::sessions::{self, SessionInfo};
-use crate::store::{ReadContextChunk, StoreWriteSummary, StoredContextFile};
+use crate::store::{ReadContextChunk, StoredContextFile};
 #[cfg(feature = "app")]
 use crate::timeline::FrameKind;
-use crate::timeline::TimelineEntry;
 
 /// Configuration for an [`Aicx`] library handle.
 #[derive(Debug, Clone)]
@@ -83,33 +81,6 @@ impl Aicx {
         max_chars: Option<usize>,
     ) -> Result<ReadContextChunk> {
         crate::store::read_context_chunk_at(&self.config.store_root, reference.as_ref(), max_chars)
-    }
-
-    pub fn store_entries(
-        &self,
-        entries: &[TimelineEntry],
-        opts: &StoreOptions,
-    ) -> Result<StoreWriteSummary> {
-        self.store_entries_with_progress(entries, opts, |_, _| {})
-    }
-
-    pub fn store_entries_with_progress<F>(
-        &self,
-        entries: &[TimelineEntry],
-        opts: &StoreOptions,
-        progress: F,
-    ) -> Result<StoreWriteSummary>
-    where
-        F: FnMut(usize, usize),
-    {
-        // Card mill is deleted — never dual-body silence that pretends a write
-        // succeeded. Catalog + extract + source-driven CURRENT are the path.
-        let _ = (entries, opts, progress);
-        anyhow::bail!(
-            "card mill removed: Aicx::store_entries no longer writes per-frame cards under \
-             ~/.aicx/store. Use `aicx catalog rebuild`, then `aicx extract` / `aicx index` \
-             (catalog + extracts + source-driven CURRENT)."
-        )
     }
 
     /// Run a semantic search against the canonical store's persistent vector
@@ -187,11 +158,6 @@ impl Aicx {
     pub fn index_status(&self, project: Option<&str>) -> Result<IndexStatus> {
         index_status_at(&self.config.store_root, project)
     }
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct StoreOptions {
-    pub chunker: ChunkerConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -1107,28 +1073,6 @@ mod tests {
             status.semantic_index_path
         );
 
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn store_entries_rejects_card_mill() {
-        let root = std::env::temp_dir().join(format!(
-            "aicx-api-mill-dead-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = std::fs::create_dir_all(&root);
-        let client = super::Aicx::with_store_root(&root);
-        let err = client
-            .store_entries(&[], &super::StoreOptions::default())
-            .expect_err("mill must hard-fail");
-        assert!(
-            err.to_string().contains("card mill removed"),
-            "unexpected error: {err:#}"
-        );
         let _ = std::fs::remove_dir_all(root);
     }
 }
