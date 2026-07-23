@@ -18,9 +18,11 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+#[path = "store/atomic_write.rs"]
 pub(crate) mod atomic_write;
 use atomic_write::atomic_write;
 
+#[path = "store/canonical_projection.rs"]
 pub mod canonical_projection;
 // Write path deleted (extracts-store). Read/inspect remain for residual
 // corpus doctor quarantine and transitional overlay consumers.
@@ -104,9 +106,13 @@ fn chunk_sequence_from_id(id: &str) -> Option<u32> {
 // Path helpers
 // ============================================================================
 
+#[path = "store/dedupe.rs"]
 pub(crate) mod dedupe;
+#[path = "store/ignore.rs"]
 pub(crate) mod ignore;
+#[path = "store/paths.rs"]
 pub(crate) mod paths;
+#[path = "store/sidecar.rs"]
 pub(crate) mod sidecar;
 
 #[cfg(test)]
@@ -1803,6 +1809,7 @@ pub fn expand_compact_date(compact: &str) -> String {
     }
 }
 
+#[path = "store/migration.rs"]
 pub(crate) mod migration;
 pub use migration::{
     CardsV2Action, CardsV2Item, CardsV2Manifest, CardsV2Totals, LegacyItemKind, MigrationAction,
@@ -1817,4 +1824,5 @@ pub(crate) use migration::{SourceLocator, run_migration_at};
 // ============================================================================
 
 #[cfg(all(test, feature = "app"))]
+#[path = "store/tests.rs"]
 mod tests;

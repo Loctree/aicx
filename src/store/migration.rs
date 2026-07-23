@@ -21,13 +21,18 @@ use crate::timeline::TimelineEntry;
 
 // ============================================================================
 // Migration
+#[path = "migration/cards_v2.rs"]
 mod cards_v2;
 // Slim (`loctree-consumer`) builds keep only the hash/rollback core reachable;
 // the CLI/doctor-driven migration surface is dead there by design.
 #[cfg_attr(not(feature = "app"), allow(dead_code))]
+#[path = "migration/identity.rs"]
 mod identity;
+#[path = "migration/report.rs"]
 mod report;
+#[path = "migration/source_locator.rs"]
 mod source_locator;
+#[path = "migration/types.rs"]
 mod types;
 
 pub use cards_v2::{

@@ -59,6 +59,7 @@ pub mod importers;
 #[allow(dead_code, unused_imports)]
 mod importers;
 pub mod intents;
+pub mod legacy_archive;
 #[cfg(feature = "app")]
 pub mod locks;
 #[cfg(not(feature = "app"))]
@@ -110,7 +111,8 @@ pub mod state;
 pub mod steer_index;
 #[cfg(feature = "app")]
 mod steer_index_contract;
-pub mod store;
+#[doc(hidden)]
+pub use legacy_archive as store;
 #[cfg(feature = "app")]
 pub mod validation;
 #[cfg(not(feature = "app"))]
