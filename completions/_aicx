@@ -17,6 +17,7 @@ _aicx() {
     _arguments "${_arguments_options[@]}" : \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 '-V[Print version]' \
@@ -34,9 +35,22 @@ _aicx() {
 _arguments "${_arguments_options[@]}" : \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 ':shell:(bash elvish fish powershell zsh)' \
+&& ret=0
+;;
+(overlay)
+_arguments "${_arguments_options[@]}" : \
+'--repo=[Repository whose \`loct anchors\` catalog is the attribution target]:REPO:_files' \
+'--format=[Machine-readable overlay contract format]:FORMAT:(json)' \
+'--rebuild[Re-evaluate every typed card while preserving persisted intent ids]' \
+'-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
 ;;
 (claude)
@@ -65,6 +79,7 @@ none\:"Print nothing to stdout"))' \
 '--conversation[Conversation-first mode\: emit denoised user/assistant transcript only]' \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -95,6 +110,7 @@ none\:"Print nothing to stdout"))' \
 '--conversation[Conversation-first mode\: emit denoised user/assistant transcript only]' \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -123,6 +139,7 @@ none\:"Print nothing to stdout"))' \
 '--conversation[Conversation-first mode\: emit denoised user/assistant transcript only]' \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -144,6 +161,7 @@ _arguments "${_arguments_options[@]}" : \
 '--include-assistant[]' \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 '::input:_files' \
@@ -171,6 +189,7 @@ _arguments "${_arguments_options[@]}" : \
 '--conversation[Conversation-first mode\: emit denoised user/assistant transcript only]' \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -189,6 +208,7 @@ _arguments "${_arguments_options[@]}" : \
 '--conversation[Conversation-first mode\: emit denoised user/assistant transcript only]' \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -207,6 +227,7 @@ _arguments "${_arguments_options[@]}" : \
 '--conversation[Conversation-first mode\: emit denoised user/assistant transcript only]' \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -225,6 +246,7 @@ _arguments "${_arguments_options[@]}" : \
 '--conversation[Conversation-first mode\: emit denoised user/assistant transcript only]' \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -243,6 +265,7 @@ _arguments "${_arguments_options[@]}" : \
 '--conversation[Conversation-first mode\: emit denoised user/assistant transcript only]' \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -304,32 +327,80 @@ _arguments "${_arguments_options[@]}" : \
 '--dry-run[Preview discovery without writing; emits a JSON envelope on stdout (sessions_discovered, by_kind, by_agent, filters_applied) and a human-readable summary banner on stderr]' \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
 ;;
-(store)
+(catalog)
 _arguments "${_arguments_options[@]}" : \
-'*-p+[Source cwd/project filter(s)\: narrows session discovery before repo segmentation]:PROJECT:_default' \
-'*--project=[Source cwd/project filter(s)\: narrows session discovery before repo segmentation]:PROJECT:_default' \
-'-a+[Agent filter\: one of claude, codex, gemini, junie, grok, codescribe, operator-md. Default\: claude+codex+gemini+junie+grok+codescribe (operator-md is opt-in via \`--agent operator-md\`)]:AGENT:(claude codex gemini junie grok codescribe operator-md)' \
-'--agent=[Agent filter\: one of claude, codex, gemini, junie, grok, codescribe, operator-md. Default\: claude+codex+gemini+junie+grok+codescribe (operator-md is opt-in via \`--agent operator-md\`)]:AGENT:(claude codex gemini junie grok codescribe operator-md)' \
-'-H+[Hours to look back (default\: 48, 0 = all time)]:HOURS:_default' \
-'--hours=[Hours to look back (default\: 48, 0 = all time)]:HOURS:_default' \
-'--emit=[What to print to stdout\: paths, json, none (default\: none)]:EMIT:((paths\:"Print store chunk paths (one per line)"
-json\:"Print JSON report (includes \`store_paths\` for convenience)"
-none\:"Print nothing to stdout"))' \
-'--no-redact-secrets[Redact secrets (tokens/keys) from outputs before writing/syncing]' \
-'--full-rescan[Ignore the stored watermark and previously-seen hashes for this run]' \
-'(--full-rescan)--incremental[Legacy no-op\: incremental mode is now the default]' \
-'--user-only[Only include user messages (exclude assistant + reasoning)]' \
-'(--user-only)--include-assistant[Include assistant messages (legacy flag; now default)]' \
-'--no-noise-filter[Disable structural-noise filter (line-numbered grep matches, tool echoes, stray YAML delimiters). Default\: filter is ON. Use this for debugging or when raw upstream content must be preserved verbatim in the chunk text]' \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+":: :_aicx__subcmd__catalog_commands" \
+"*::: :->catalog" \
+&& ret=0
+
+    case $state in
+    (catalog)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:aicx-catalog-command-$line[1]:"
+        case $line[1] in
+            (rebuild)
+_arguments "${_arguments_options[@]}" : \
+'--json[Emit JSON report to stdout]' \
+'-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
+;;
+(resolve)
+_arguments "${_arguments_options[@]}" : \
+'--json[Emit JSON]' \
+'-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':session -- Session id (exact, logical, or unique prefix):_default' \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+":: :_aicx__subcmd__catalog__subcmd__help_commands" \
+"*::: :->help" \
+&& ret=0
+
+    case $state in
+    (help)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:aicx-catalog-help-command-$line[1]:"
+        case $line[1] in
+            (rebuild)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(resolve)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+        esac
+    ;;
+esac
 ;;
 (ingest)
 _arguments "${_arguments_options[@]}" : \
@@ -347,6 +418,7 @@ none\:"Print nothing to stdout"))' \
 '--no-noise-filter[Disable structural-noise filter]' \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 '::input -- Source path for explicit ingests\: markdown file/directory for --source operator-md, pack directory for --source loct-context-pack:_files' \
@@ -356,6 +428,7 @@ none\:"Print nothing to stdout"))' \
 _arguments "${_arguments_options[@]}" : \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -364,6 +437,7 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 ":: :_aicx__subcmd__sources_commands" \
@@ -385,6 +459,7 @@ _arguments "${_arguments_options[@]}" : \
 '--no-gitignore[Do not add safe local .gitignore suggestions]' \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -421,6 +496,7 @@ esac
 _arguments "${_arguments_options[@]}" : \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 ":: :_aicx__subcmd__sessions_commands" \
@@ -439,6 +515,7 @@ _arguments "${_arguments_options[@]}" : \
 '--json[Emit JSON with source metadata instead of the bare session id]' \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -453,6 +530,7 @@ _arguments "${_arguments_options[@]}" : \
 '--all[Scan the full session history (slower) instead of the default last-30-days window]' \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -462,6 +540,7 @@ _arguments "${_arguments_options[@]}" : \
 '--format=[Output format\: markdown | json]:FORMAT:_default' \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 ':session_id -- Session id (or a unique prefix):_default' \
@@ -476,6 +555,7 @@ _arguments "${_arguments_options[@]}" : \
 '--format=[Output format\: markdown | json]:FORMAT:_default' \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 ':session_id -- Session id (or a unique prefix):_default' \
@@ -525,6 +605,7 @@ esac
 _arguments "${_arguments_options[@]}" : \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 ":: :_aicx__subcmd__claims_commands" \
@@ -545,6 +626,7 @@ _arguments "${_arguments_options[@]}" : \
 '--format=[Output format\: json | summary]:FORMAT:_default' \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -581,6 +663,7 @@ esac
 _arguments "${_arguments_options[@]}" : \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 ":: :_aicx__subcmd__results_commands" \
@@ -602,6 +685,7 @@ _arguments "${_arguments_options[@]}" : \
 '--format=[Output format\: json | summary]:FORMAT:_default' \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -644,6 +728,7 @@ _arguments "${_arguments_options[@]}" : \
 '--format=[Output format\: markdown | json]:FORMAT:_default' \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -653,6 +738,7 @@ _arguments "${_arguments_options[@]}" : \
 '--smoke-test[Render one frame and exit; used by automated smoke tests]' \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -661,8 +747,8 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 '-H+[Hours to look back (filter by canonical chunk date)]:HOURS:_default' \
 '--hours=[Hours to look back (filter by canonical chunk date)]:HOURS:_default' \
-'-p+[Strict project filter\: \`owner/repo\`, \`/repo\` (cross-org repo name), \`owner/\` (org wildcard), or \`name\` (matches org OR repo). Substring matching is intentionally disabled — \`-p vista\` no longer leaks into \`vista-portal\`/\`vista-datasets\`]:PROJECT:_default' \
-'--project=[Strict project filter\: \`owner/repo\`, \`/repo\` (cross-org repo name), \`owner/\` (org wildcard), or \`name\` (matches org OR repo). Substring matching is intentionally disabled — \`-p vista\` no longer leaks into \`vista-portal\`/\`vista-datasets\`]:PROJECT:_default' \
+'-p+[Strict project filter\: \`owner/repo\`, \`/repo\` (cross-org repo name), \`owner/\` (org wildcard), or a unique exact \`name\`. Substring matching is intentionally disabled — \`-p vista\` no longer leaks into \`vista-portal\`/\`vista-datasets\`]:PROJECT:_default' \
+'--project=[Strict project filter\: \`owner/repo\`, \`/repo\` (cross-org repo name), \`owner/\` (org wildcard), or a unique exact \`name\`. Substring matching is intentionally disabled — \`-p vista\` no longer leaks into \`vista-portal\`/\`vista-datasets\`]:PROJECT:_default' \
 '--emit=[What to print to stdout\: summary, paths (default\: summary)]:EMIT:((summary\:"Print a compact per-project summary"
 paths\:"Print raw file paths (one per line)"))' \
 '-s[Legacy alias for \`--emit summary\`]' \
@@ -670,18 +756,20 @@ paths\:"Print raw file paths (one per line)"))' \
 '--strict[Filter out low-signal noise (<15 lines, task-notifications only)]' \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
 ;;
 (state)
 _arguments "${_arguments_options[@]}" : \
-'-p+[Project filter (applies to --info as well as --reset). Supports the standard shapes\: \`-p owner/repo\`, \`-p owner/\`, \`-p /repo\`, or a bare \`-p name\` (cross-org)]:PROJECT:_default' \
-'--project=[Project filter (applies to --info as well as --reset). Supports the standard shapes\: \`-p owner/repo\`, \`-p owner/\`, \`-p /repo\`, or a bare \`-p name\` (cross-org)]:PROJECT:_default' \
+'-p+[Project filter (applies to --info as well as --reset). Supports the standard shapes\: \`-p owner/repo\`, \`-p owner/\`, \`-p /repo\`, or a bare \`-p name\` that must resolve uniquely]:PROJECT:_default' \
+'--project=[Project filter (applies to --info as well as --reset). Supports the standard shapes\: \`-p owner/repo\`, \`-p owner/\`, \`-p /repo\`, or a bare \`-p name\` that must resolve uniquely]:PROJECT:_default' \
 '--reset[Reset all dedup hashes]' \
 '--info[Show state info/statistics]' \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -689,8 +777,8 @@ _arguments "${_arguments_options[@]}" : \
 (dashboard)
 _arguments "${_arguments_options[@]}" : \
 '--store-root=[Store root directory (default\: ~/.aicx)]:STORE_ROOT:_files' \
-'-p+[Narrow the dashboard dataset to project/store buckets containing this string]:PROJECT:_default' \
-'--project=[Narrow the dashboard dataset to project/store buckets containing this string]:PROJECT:_default' \
+'-p+[Exact project scope. A bare repository name must resolve uniquely]:PROJECT:_default' \
+'--project=[Exact project scope. A bare repository name must resolve uniquely]:PROJECT:_default' \
 '-H+[Narrow the dashboard dataset to the last N hours (omit for all time)]:HOURS:_default' \
 '--hours=[Narrow the dashboard dataset to the last N hours (omit for all time)]:HOURS:_default' \
 '-o+[Output HTML path (default\: ~/.aicx/aicx-dashboard.html)]:OUTPUT:_files' \
@@ -709,6 +797,7 @@ _arguments "${_arguments_options[@]}" : \
 '--allow-no-origin[Allow mutating dashboard API calls without Origin or Referer (tooling escape hatch)]' \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -730,6 +819,7 @@ _arguments "${_arguments_options[@]}" : \
 '--deterministic[Derive \`generated_at\` from the latest record timestamp instead of \`Utc\:\:now()\`. Also enabled via \`AICX_REPORTS_DETERMINISTIC=1\` env var]' \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -738,6 +828,7 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 ":: :_aicx__subcmd__corpus_commands" \
@@ -757,6 +848,7 @@ _arguments "${_arguments_options[@]}" : \
 json\:"Print compact JSON"))' \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -772,6 +864,7 @@ json\:"Print compact JSON"))' \
 '--backup[Write backups before applying repairs]' \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -782,6 +875,7 @@ _arguments "${_arguments_options[@]}" : \
 '--json[Emit compact JSON instead of readable text]' \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 '::root -- Store subtree or markdown card to validate. Defaults to the corpus roots used by audit:_files' \
@@ -840,6 +934,7 @@ _arguments "${_arguments_options[@]}" : \
 '--deterministic[Derive \`generated_at\` from the latest record timestamp instead of \`Utc\:\:now()\`. Also enabled via \`AICX_REPORTS_DETERMINISTIC=1\` env var]' \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -855,6 +950,7 @@ _arguments "${_arguments_options[@]}" : \
 '--no-open[Suppress automatic browser open on startup]' \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -881,6 +977,7 @@ _arguments "${_arguments_options[@]}" : \
 '--strict[Only show high-confidence intents]' \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -903,6 +1000,7 @@ _arguments "${_arguments_options[@]}" : \
 '--follow[Subscribe to filesystem events and stream new entries]' \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -919,6 +1017,7 @@ _arguments "${_arguments_options[@]}" : \
 '--no-require-auth[Disable Bearer auth on HTTP transport. Only allowed on loopback binds]' \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -943,6 +1042,7 @@ _arguments "${_arguments_options[@]}" : \
 '--no-gitignore[Do not auto-modify \`.gitignore\`]' \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -962,13 +1062,16 @@ _arguments "${_arguments_options[@]}" : \
 '--since=[Lower date bound\: YYYY-MM-DD or relative (e.g., 2026-04-23..)]:SINCE:_default' \
 '--until=[Upper date bound\: YYYY-MM-DD]:UNTIL:_default' \
 '--frame-kind=[Frame channel filter\: user_msg | agent_reply | internal_thought | tool_call]:FRAME_KIND:(user_msg agent_reply internal_thought tool_call)' \
-'--kind=[Filter by canonical corpus kind\: conversations, plans, reports, other]:KIND:(conversations conversation plans plan reports report other)' \
+'--kind=[Filter by indexed document kind\: conversations, plans, reports, other]:KIND:(conversations conversation plans plan reports report other)' \
 '(--evidence)--no-semantic[Bypass semantic vector search and run filesystem-fuzzy search]' \
 '--evidence[Return an evidence packet\: semantic candidates re-ranked by answer/support signals, with source sections and diagnostics]' \
 '-j[Emit compact JSON instead of plain text]' \
 '--json[Emit compact JSON instead of plain text]' \
+'--legacy-dense[Use legacy NDJSON reader for dense vector search instead of versioned mmap]' \
+'--deep[Dense re-rank (hybrid RRF over tantivy + mmap). Default is lexical-first with a recency prior against the published \`_all\` CURRENT generation — sub-second answers without loading the embedder or dense vectors]' \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 ':query -- Search query string:_default' \
@@ -978,6 +1081,7 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 ":: :_aicx__subcmd__eval_commands" \
@@ -1003,6 +1107,7 @@ _arguments "${_arguments_options[@]}" : \
 '--strict[Exit non-zero when any case fails. Useful for CI or local gates]' \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -1037,15 +1142,17 @@ esac
 ;;
 (index)
 _arguments "${_arguments_options[@]}" : \
-'*-p+[Project filter. Omit to index the global \`_all\` bucket]:PROJECT:_default' \
-'*--project=[Project filter. Omit to index the global \`_all\` bucket]:PROJECT:_default' \
-'--sample=[Stop after sampling this many chunks (0 = scan all)]:SAMPLE:_default' \
+'*-p+[Project filter for \`--dry-run\` inspection only. Persistent indexing always publishes the global \`_all\` catalog; \`search -p\` filters it]:PROJECT:_default' \
+'*--project=[Project filter for \`--dry-run\` inspection only. Persistent indexing always publishes the global \`_all\` catalog; \`search -p\` filters it]:PROJECT:_default' \
+'--sample=[Retired compatibility flag; source indexing always scans the selected catalog]:SAMPLE:_default' \
 '--dry-run=[Preview only. Omit this flag to materialize the persistent semantic index used by \`aicx search\`]::DRY_RUN:(true false)' \
 '-j[Emit JSON stats instead of plain text]' \
 '--json[Emit JSON stats instead of plain text]' \
-'--full-rescan[Force a full re-embed of every chunk. Default is incremental\: walk only sidecars newer than the existing index'\''s \`header.generated_at\` and append. Use this flag after embedder model changes or when the committed index is suspect]' \
+'--full-rescan[Ignore the source fingerprint and rebuild the selected lexical generation from every cataloged source]' \
+'--cache-extracts[Cache one readable conversation extract per indexed session under \`~/.aicx/extracts/\`. Omit to keep content only in live sources and Tantivy (zero filesystem content duplication)]' \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 ":: :_aicx__subcmd__index_commands" \
@@ -1066,6 +1173,7 @@ _arguments "${_arguments_options[@]}" : \
 '--json[Emit JSON status instead of plain text]' \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -1079,6 +1187,7 @@ _arguments "${_arguments_options[@]}" : \
 '--json[Emit JSON report instead of plain text]' \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -1119,6 +1228,7 @@ esac
 _arguments "${_arguments_options[@]}" : \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 ":: :_aicx__subcmd__config_commands" \
@@ -1137,6 +1247,7 @@ _arguments "${_arguments_options[@]}" : \
 '--force[Overwrite the existing config file if present]' \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -1147,6 +1258,19 @@ _arguments "${_arguments_options[@]}" : \
 '--json[Emit JSON instead of human-readable text]' \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(inspect)
+_arguments "${_arguments_options[@]}" : \
+'*--mcp-config=[Inspect an external MCP client/mux config for its configured AICX target. Repeat for multiple clients. Files are read only and never rewritten]:PATH:_files' \
+'-j[Emit the stable machine-readable inspection contract]' \
+'--json[Emit the stable machine-readable inspection contract]' \
+'-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -1171,6 +1295,10 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
+(inspect)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
 (help)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
@@ -1190,6 +1318,7 @@ _arguments "${_arguments_options[@]}" : \
 '--json[Emit compact JSON instead of readable text]' \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 ':reference -- Absolute path, store-relative path, file name, legacy compact ref, or `chunk\:<id>`:_default' \
@@ -1202,6 +1331,7 @@ _arguments "${_arguments_options[@]}" : \
 '--json[Emit compact JSON instead of readable text]' \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 ':reference -- Absolute path, store-relative path, file name, legacy compact ref, or `chunk\:<id>`:_default' \
@@ -1228,6 +1358,7 @@ _arguments "${_arguments_options[@]}" : \
 '--json[Emit compact JSON with oracle_status instead of readable text]' \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -1242,18 +1373,20 @@ _arguments "${_arguments_options[@]}" : \
 '(--dry-run)--apply[Write the cards-v2 migration (without it, --cards-v2 is a dry run)]' \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
 ;;
 (migrate-intent-schema)
 _arguments "${_arguments_options[@]}" : \
-'-p+[Strict project filter\: \`owner/repo\`, \`/repo\` (cross-org repo name), \`owner/\` (org wildcard), or \`name\` (matches org OR repo). Omit to scan the whole store. Substring matching is intentionally disabled]:PROJECT:_default' \
-'--project=[Strict project filter\: \`owner/repo\`, \`/repo\` (cross-org repo name), \`owner/\` (org wildcard), or \`name\` (matches org OR repo). Omit to scan the whole store. Substring matching is intentionally disabled]:PROJECT:_default' \
+'-p+[Strict project filter\: \`owner/repo\`, \`/repo\` (cross-org repo name), \`owner/\` (org wildcard), or a unique exact \`name\`. Omit to scan the whole store. Substring matching is intentionally disabled]:PROJECT:_default' \
+'--project=[Strict project filter\: \`owner/repo\`, \`/repo\` (cross-org repo name), \`owner/\` (org wildcard), or a unique exact \`name\`. Omit to scan the whole store. Substring matching is intentionally disabled]:PROJECT:_default' \
 '--store-root=[Override AICX store root (default\: ~/.aicx)]:STORE_ROOT:_files' \
 '--dry-run[Dry run\: show classification counts without writing sidecars]' \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -1263,11 +1396,12 @@ _arguments "${_arguments_options[@]}" : \
 '--restore-quarantine=[Restore files from a quarantine manifest slug]:SLUG:_default' \
 '--format=[Output format\: text (default), json]:FORMAT:_default' \
 '--rebuild-steer-index[Delete and rebuild the steer index from the canonical store when corrupted or schema-incompatible. Narrower contract than the legacy \`--fix\` (which was a no-op for sidecars/index consistency/empty bodies — those have dedicated flags)]' \
-'--fix-buckets[Move suspicious top-level corpus buckets to \$HOME/.aicx/quarantine/. Buckets that are merely CamelCase (legitimate GitHub orgs like \`LibraxisAI\`, \`Vetcoders\`, \`Loctree\`, \`Szowesgad\`) are canonicalized in place to lowercase instead of quarantined, merging into existing lowercase buckets if present]' \
+'--fix-buckets[Move suspicious top-level corpus buckets to \$HOME/.aicx/quarantine/. Buckets that are merely CamelCase (legitimate GitHub orgs like \`LibraxisAI\`, \`Vetcoders\`, \`Loctree\`, \`Sampleorg\`) are canonicalized in place to lowercase instead of quarantined, merging into existing lowercase buckets if present]' \
 '--dry-run[With --fix-buckets, preview the planned canonicalize/quarantine actions without modifying the filesystem. Output entries are prefixed with \`\[dry-run\]\`. Use this before running \`--fix-buckets\` against a large store to verify the classification before commit]' \
 '--rebuild-sidecars[Emit a reviewable bash script for missing sidecar backfill]' \
 '--prune-empty-bodies[Emit a reviewable bash script for moving empty-body chunks to quarantine]' \
-'--apply[With --prune-empty-bodies, move empty-body chunks into recoverable quarantine]' \
+'--migrate-identities[Plan the one-time project-identity migration\: persisted index.json key casing → GitHub nameWithOwner canon (lowercase, the fresh-derivation form), store/ directory normalization, historical-card alias map (annotate-only, cards never rewritten), and a typo-twin bucket report. Dry-run by default — writes migration/identity-manifest.json + identity-report.md with zero store mutation; add --apply to execute the planned renames]' \
+'(--dry-run)--apply[With --prune-empty-bodies, move empty-body chunks into recoverable quarantine. With --migrate-identities, execute the planned identity renames. Refuses to combine with --dry-run\: on a store-mutating surface the preview flag must always win, so the ambiguous combination is a parse error]' \
 '-y[Assume yes on doctor cleanup prompts]' \
 '--yes[Assume yes on doctor cleanup prompts]' \
 '--force[Skip dry-run preview and prompts; intended for CI cleanup runs]' \
@@ -1275,7 +1409,9 @@ _arguments "${_arguments_options[@]}" : \
 '-v[Print recommendations for green checks too]' \
 '--verbose[Print recommendations for green checks too]' \
 '--smoke[Run actual real HTTP POST / embedder tests instead of skipping them. Doctor stays fast and cheap by default; this flag exercises the AI provider]' \
+'--deep[Run the full forensic pass\: recursive store scans, semantic-index reconciliation, and payload-level checks. Emits progress phases with heartbeats and an explicit estimated scope; Ctrl-C cancels cleanly between operations. Without this flag (and without fix / full-scan flags, which imply it) doctor answers from the bounded fast health pass — metadata, leases, manifests, and sampled invariants only; anything it cannot prove is reported as \`unknown\`, never as healthy]' \
 '--oracle[Report AICX Oracle readiness\: ready | degraded | unsafe_for_loctree_scope.]' \
+'--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -1284,6 +1420,7 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -1294,6 +1431,7 @@ _arguments "${_arguments_options[@]}" : \
 '--json[Emit JSON instead of readable text]' \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -1311,6 +1449,10 @@ _arguments "${_arguments_options[@]}" : \
         curcontext="${curcontext%:*:*}:aicx-help-command-$line[1]:"
         case $line[1] in
             (completions)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(overlay)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
@@ -1366,9 +1508,29 @@ esac
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
-(store)
+(catalog)
+_arguments "${_arguments_options[@]}" : \
+":: :_aicx__subcmd__help__subcmd__catalog_commands" \
+"*::: :->catalog" \
+&& ret=0
+
+    case $state in
+    (catalog)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:aicx-help-catalog-command-$line[1]:"
+        case $line[1] in
+            (rebuild)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
+;;
+(resolve)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
 ;;
 (ingest)
 _arguments "${_arguments_options[@]}" : \
@@ -1614,6 +1776,10 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
+(inspect)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
         esac
     ;;
 esac
@@ -1663,12 +1829,13 @@ esac
 _aicx_commands() {
     local commands; commands=(
 'completions:Generate shell completions for the canonical CLI grammar' \
-'claude:Extract and store Agents'\'' sessions into the canonical corpus (canonical corpus extraction)' \
-'codex:Extract and store Codex sessions into the canonical corpus' \
-'all:Extract and store from all agents (Claude + Codex + Gemini + Junie + Codescribe) into the canonical corpus' \
+'overlay:Join typed canonical intents to the current Loctree anchor catalog' \
+'claude:Extract Claude sessions into local reports' \
+'codex:Extract Codex sessions into local reports' \
+'all:Extract sessions from all supported agents into local reports' \
 'extract:Extract a single session for one agent — by session id or direct file' \
 'conversations:Batch-export conversation JSON files without writing to the canonical store' \
-'store:Build the canonical corpus in from local agents'\'' session files' \
+'catalog:Rebuild the durable extract-era session catalog (no per-frame cards)' \
 'ingest:Ingest operator-owned source documents into the canonical corpus' \
 'list:List raw agent session sources on disk (pre-extraction inputs)' \
 'sources:Audit and explicitly protect raw source roots' \
@@ -1688,9 +1855,9 @@ _aicx_commands() {
 'tail:Print recent intents/chunks (snapshot mode); add --follow to stream new arrivals' \
 'serve:Run aicx as an MCP server' \
 'init:Retired compatibility shim; prints migration guidance' \
-'search:Search the canonical corpus. Semantic by default; automatic filesystem-fuzzy fallback when semantic search is unavailable' \
+'search:Search the CURRENT source/extract index. Lexical-first by default; optional dense rerank with --deep. When no index exists, the only fallback is a bounded recency-ranked filesystem search' \
 'eval:Run local evaluation helpers for retrieval/search quality' \
-'index:Catch up the canonical corpus, then build the semantic index. Use \`--dry-run\` to preview without writing' \
+'index:Build the source-driven lexical index. Use \`--dry-run\` to preview parsing and filtering without writing extracts or publishing CURRENT' \
 'config:Manage \`\$HOME/.aicx/config.toml\` for embedders and endpoints' \
 'read:Read one canonical chunk by path, file name, or \`chunk\:<id>\` reference' \
 'open:Read one canonical chunk by path, file name, or \`chunk\:<id>\` reference' \
@@ -1698,7 +1865,7 @@ _aicx_commands() {
 'migrate:Migrate legacy ~/.ai-contexters/ data into the canonical AICX store' \
 'migrate-intent-schema:Classify stored chunks into 11-type intent entries and report counts' \
 'doctor:Diagnose and optionally repair the canonical store and steer index' \
-'health:Emit the full AICX health report as JSON for automation' \
+'health:Emit the bounded AICX health report as JSON for automation' \
 'warmup:Warm/probe the configured local embedder before interactive search' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
@@ -1708,6 +1875,49 @@ _aicx_commands() {
 _aicx__subcmd__all_commands() {
     local commands; commands=()
     _describe -t commands 'aicx all commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__catalog_commands] )) ||
+_aicx__subcmd__catalog_commands() {
+    local commands; commands=(
+'rebuild:Walk all source roots and rewrite \`~/.aicx/catalog/sessions.jsonl\`' \
+'resolve:Resolve one session id from the durable catalog' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'aicx catalog commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__catalog__subcmd__help_commands] )) ||
+_aicx__subcmd__catalog__subcmd__help_commands() {
+    local commands; commands=(
+'rebuild:Walk all source roots and rewrite \`~/.aicx/catalog/sessions.jsonl\`' \
+'resolve:Resolve one session id from the durable catalog' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'aicx catalog help commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__catalog__subcmd__help__subcmd__help_commands] )) ||
+_aicx__subcmd__catalog__subcmd__help__subcmd__help_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx catalog help help commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__catalog__subcmd__help__subcmd__rebuild_commands] )) ||
+_aicx__subcmd__catalog__subcmd__help__subcmd__rebuild_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx catalog help rebuild commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__catalog__subcmd__help__subcmd__resolve_commands] )) ||
+_aicx__subcmd__catalog__subcmd__help__subcmd__resolve_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx catalog help resolve commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__catalog__subcmd__rebuild_commands] )) ||
+_aicx__subcmd__catalog__subcmd__rebuild_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx catalog rebuild commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__catalog__subcmd__resolve_commands] )) ||
+_aicx__subcmd__catalog__subcmd__resolve_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx catalog resolve commands' commands "$@"
 }
 (( $+functions[_aicx__subcmd__claims_commands] )) ||
 _aicx__subcmd__claims_commands() {
@@ -1765,6 +1975,7 @@ _aicx__subcmd__config_commands() {
     local commands; commands=(
 'init:Write a default \`~/.aicx/config.toml\` with cloud-embedder pre-selected. Bails if the file exists unless \`--force\`' \
 'show:Display the resolved embedder configuration after merging env, \`embedder.toml\`, \`config.toml\`, and built-in defaults' \
+'inspect:Inspect the exact running binary, install shadows, config, MCP target, embedder identity, and published index generation without changing them' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'aicx config commands' commands "$@"
@@ -1774,6 +1985,7 @@ _aicx__subcmd__config__subcmd__help_commands() {
     local commands; commands=(
 'init:Write a default \`~/.aicx/config.toml\` with cloud-embedder pre-selected. Bails if the file exists unless \`--force\`' \
 'show:Display the resolved embedder configuration after merging env, \`embedder.toml\`, \`config.toml\`, and built-in defaults' \
+'inspect:Inspect the exact running binary, install shadows, config, MCP target, embedder identity, and published index generation without changing them' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'aicx config help commands' commands "$@"
@@ -1788,6 +2000,11 @@ _aicx__subcmd__config__subcmd__help__subcmd__init_commands() {
     local commands; commands=()
     _describe -t commands 'aicx config help init commands' commands "$@"
 }
+(( $+functions[_aicx__subcmd__config__subcmd__help__subcmd__inspect_commands] )) ||
+_aicx__subcmd__config__subcmd__help__subcmd__inspect_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx config help inspect commands' commands "$@"
+}
 (( $+functions[_aicx__subcmd__config__subcmd__help__subcmd__show_commands] )) ||
 _aicx__subcmd__config__subcmd__help__subcmd__show_commands() {
     local commands; commands=()
@@ -1797,6 +2014,11 @@ _aicx__subcmd__config__subcmd__help__subcmd__show_commands() {
 _aicx__subcmd__config__subcmd__init_commands() {
     local commands; commands=()
     _describe -t commands 'aicx config init commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__config__subcmd__inspect_commands] )) ||
+_aicx__subcmd__config__subcmd__inspect_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx config inspect commands' commands "$@"
 }
 (( $+functions[_aicx__subcmd__config__subcmd__show_commands] )) ||
 _aicx__subcmd__config__subcmd__show_commands() {
@@ -1997,12 +2219,13 @@ _aicx__subcmd__health_commands() {
 _aicx__subcmd__help_commands() {
     local commands; commands=(
 'completions:Generate shell completions for the canonical CLI grammar' \
-'claude:Extract and store Agents'\'' sessions into the canonical corpus (canonical corpus extraction)' \
-'codex:Extract and store Codex sessions into the canonical corpus' \
-'all:Extract and store from all agents (Claude + Codex + Gemini + Junie + Codescribe) into the canonical corpus' \
+'overlay:Join typed canonical intents to the current Loctree anchor catalog' \
+'claude:Extract Claude sessions into local reports' \
+'codex:Extract Codex sessions into local reports' \
+'all:Extract sessions from all supported agents into local reports' \
 'extract:Extract a single session for one agent — by session id or direct file' \
 'conversations:Batch-export conversation JSON files without writing to the canonical store' \
-'store:Build the canonical corpus in from local agents'\'' session files' \
+'catalog:Rebuild the durable extract-era session catalog (no per-frame cards)' \
 'ingest:Ingest operator-owned source documents into the canonical corpus' \
 'list:List raw agent session sources on disk (pre-extraction inputs)' \
 'sources:Audit and explicitly protect raw source roots' \
@@ -2022,16 +2245,16 @@ _aicx__subcmd__help_commands() {
 'tail:Print recent intents/chunks (snapshot mode); add --follow to stream new arrivals' \
 'serve:Run aicx as an MCP server' \
 'init:Retired compatibility shim; prints migration guidance' \
-'search:Search the canonical corpus. Semantic by default; automatic filesystem-fuzzy fallback when semantic search is unavailable' \
+'search:Search the CURRENT source/extract index. Lexical-first by default; optional dense rerank with --deep. When no index exists, the only fallback is a bounded recency-ranked filesystem search' \
 'eval:Run local evaluation helpers for retrieval/search quality' \
-'index:Catch up the canonical corpus, then build the semantic index. Use \`--dry-run\` to preview without writing' \
+'index:Build the source-driven lexical index. Use \`--dry-run\` to preview parsing and filtering without writing extracts or publishing CURRENT' \
 'config:Manage \`\$HOME/.aicx/config.toml\` for embedders and endpoints' \
 'read:Read one canonical chunk by path, file name, or \`chunk\:<id>\` reference' \
 'steer:Retrieve chunks by steering metadata (requires --features lance)' \
 'migrate:Migrate legacy ~/.ai-contexters/ data into the canonical AICX store' \
 'migrate-intent-schema:Classify stored chunks into 11-type intent entries and report counts' \
 'doctor:Diagnose and optionally repair the canonical store and steer index' \
-'health:Emit the full AICX health report as JSON for automation' \
+'health:Emit the bounded AICX health report as JSON for automation' \
 'warmup:Warm/probe the configured local embedder before interactive search' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
@@ -2041,6 +2264,24 @@ _aicx__subcmd__help_commands() {
 _aicx__subcmd__help__subcmd__all_commands() {
     local commands; commands=()
     _describe -t commands 'aicx help all commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__help__subcmd__catalog_commands] )) ||
+_aicx__subcmd__help__subcmd__catalog_commands() {
+    local commands; commands=(
+'rebuild:Walk all source roots and rewrite \`~/.aicx/catalog/sessions.jsonl\`' \
+'resolve:Resolve one session id from the durable catalog' \
+    )
+    _describe -t commands 'aicx help catalog commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__help__subcmd__catalog__subcmd__rebuild_commands] )) ||
+_aicx__subcmd__help__subcmd__catalog__subcmd__rebuild_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx help catalog rebuild commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__help__subcmd__catalog__subcmd__resolve_commands] )) ||
+_aicx__subcmd__help__subcmd__catalog__subcmd__resolve_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx help catalog resolve commands' commands "$@"
 }
 (( $+functions[_aicx__subcmd__help__subcmd__claims_commands] )) ||
 _aicx__subcmd__help__subcmd__claims_commands() {
@@ -2079,6 +2320,7 @@ _aicx__subcmd__help__subcmd__config_commands() {
     local commands; commands=(
 'init:Write a default \`~/.aicx/config.toml\` with cloud-embedder pre-selected. Bails if the file exists unless \`--force\`' \
 'show:Display the resolved embedder configuration after merging env, \`embedder.toml\`, \`config.toml\`, and built-in defaults' \
+'inspect:Inspect the exact running binary, install shadows, config, MCP target, embedder identity, and published index generation without changing them' \
     )
     _describe -t commands 'aicx help config commands' commands "$@"
 }
@@ -2086,6 +2328,11 @@ _aicx__subcmd__help__subcmd__config_commands() {
 _aicx__subcmd__help__subcmd__config__subcmd__init_commands() {
     local commands; commands=()
     _describe -t commands 'aicx help config init commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__help__subcmd__config__subcmd__inspect_commands] )) ||
+_aicx__subcmd__help__subcmd__config__subcmd__inspect_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx help config inspect commands' commands "$@"
 }
 (( $+functions[_aicx__subcmd__help__subcmd__config__subcmd__show_commands] )) ||
 _aicx__subcmd__help__subcmd__config__subcmd__show_commands() {
@@ -2242,6 +2489,11 @@ _aicx__subcmd__help__subcmd__migrate-intent-schema_commands() {
     local commands; commands=()
     _describe -t commands 'aicx help migrate-intent-schema commands' commands "$@"
 }
+(( $+functions[_aicx__subcmd__help__subcmd__overlay_commands] )) ||
+_aicx__subcmd__help__subcmd__overlay_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx help overlay commands' commands "$@"
+}
 (( $+functions[_aicx__subcmd__help__subcmd__read_commands] )) ||
 _aicx__subcmd__help__subcmd__read_commands() {
     local commands; commands=()
@@ -2336,11 +2588,6 @@ _aicx__subcmd__help__subcmd__steer_commands() {
     local commands; commands=()
     _describe -t commands 'aicx help steer commands' commands "$@"
 }
-(( $+functions[_aicx__subcmd__help__subcmd__store_commands] )) ||
-_aicx__subcmd__help__subcmd__store_commands() {
-    local commands; commands=()
-    _describe -t commands 'aicx help store commands' commands "$@"
-}
 (( $+functions[_aicx__subcmd__help__subcmd__tail_commands] )) ||
 _aicx__subcmd__help__subcmd__tail_commands() {
     local commands; commands=()
@@ -2428,6 +2675,11 @@ _aicx__subcmd__migrate_commands() {
 _aicx__subcmd__migrate-intent-schema_commands() {
     local commands; commands=()
     _describe -t commands 'aicx migrate-intent-schema commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__overlay_commands] )) ||
+_aicx__subcmd__overlay_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx overlay commands' commands "$@"
 }
 (( $+functions[_aicx__subcmd__read_commands] )) ||
 _aicx__subcmd__read_commands() {
@@ -2597,11 +2849,6 @@ _aicx__subcmd__state_commands() {
 _aicx__subcmd__steer_commands() {
     local commands; commands=()
     _describe -t commands 'aicx steer commands' commands "$@"
-}
-(( $+functions[_aicx__subcmd__store_commands] )) ||
-_aicx__subcmd__store_commands() {
-    local commands; commands=()
-    _describe -t commands 'aicx store commands' commands "$@"
 }
 (( $+functions[_aicx__subcmd__tail_commands] )) ||
 _aicx__subcmd__tail_commands() {
