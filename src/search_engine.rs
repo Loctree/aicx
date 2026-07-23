@@ -867,19 +867,19 @@ fn unwrap_agent_message_event(line: &str) -> Option<String> {
     // still works on truncated agent_message envelopes.
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(line) {
         let ty = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
-        if ty == "item.completed" {
-            if let Some(item) = value.get("item") {
-                let item_ty = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                if matches!(item_ty, "agent_message" | "message") {
-                    if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
-                        return Some(text.to_string());
-                    }
-                }
-            }
-        } else if matches!(ty, "agent_message" | "message") {
-            if let Some(text) = value.get("text").and_then(|v| v.as_str()) {
+        if ty == "item.completed"
+            && let Some(item) = value.get("item")
+        {
+            let item_ty = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            if matches!(item_ty, "agent_message" | "message")
+                && let Some(text) = item.get("text").and_then(|v| v.as_str())
+            {
                 return Some(text.to_string());
             }
+        } else if matches!(ty, "agent_message" | "message")
+            && let Some(text) = value.get("text").and_then(|v| v.as_str())
+        {
+            return Some(text.to_string());
         }
     }
     scrape_agent_message_text_field(line)
