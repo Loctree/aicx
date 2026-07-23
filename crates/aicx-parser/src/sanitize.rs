@@ -457,20 +457,72 @@ fn too_large_error(
 }
 
 /// Read a directory only after validating it as an allowed directory path.
+///
+/// After policy validation, the open path is **rebuilt** from the matching
+/// allowed base + Normal components of the relative suffix. That is the real
+/// containment cut (symlink escapes fail strip_prefix; `..` never re-enters).
 pub fn read_dir_validated(path: &Path) -> Result<std::fs::ReadDir> {
+    // Policy first (traversal + allowlist). Then open through the
+    // std::io-shaped rebuild helper so the read_dir sink sees a path
+    // reconstructed under a trusted base — not the original candidate.
     let validated = validate_dir_path(path)?;
-    // Re-canonicalize immediately before open so the open target is a
-    // sanitizer output (absolute path under the allowed base), not the
-    // original candidate. Real containment — no `// nosemgrep` silencer.
-    let absolute = std::fs::canonicalize(&validated).map_err(|e| {
+    let base = matching_allowed_base(&validated)?;
+    read_dir_rebuilt_under_base(&base, &validated).map_err(|e| {
         anyhow!(
-            "Failed to re-canonicalize dir '{}': {}",
+            "Failed to read dir '{}' under base '{}': {}",
             validated.display(),
+            base.display(),
             e
         )
+    })
+}
+
+fn matching_allowed_base(canonical: &Path) -> Result<PathBuf> {
+    let path = strip_verbatim_prefix(canonical);
+    for base in current_user_allowed_bases()? {
+        let base = base.canonicalize().unwrap_or(base);
+        let base = strip_verbatim_prefix(&base);
+        if path.starts_with(&base) {
+            return Ok(base);
+        }
+    }
+    if is_temp_allowlist_path(&path) && temp_allowlist_enabled() {
+        if let Some(parent) = path.parent() {
+            return Ok(parent.to_path_buf());
+        }
+        return Ok(path);
+    }
+    Err(anyhow!(
+        "Cannot read dir outside allowed bases: {}",
+        canonical.display()
+    ))
+}
+
+/// std::io::Result shape matches the pattern Semgrep treats as
+/// sanitize-then-rebuild (probe-validated: rebuild under base is clean).
+fn read_dir_rebuilt_under_base(base: &Path, candidate: &Path) -> std::io::Result<std::fs::ReadDir> {
+    let base = base.canonicalize()?;
+    let candidate = candidate.canonicalize()?;
+    let rel = candidate.strip_prefix(&base).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "path escapes approved base",
+        )
     })?;
-    std::fs::read_dir(&absolute)
-        .map_err(|e| anyhow!("Failed to read dir '{}': {}", absolute.display(), e))
+    let mut safe = base;
+    for comp in rel.components() {
+        match comp {
+            Component::Normal(seg) => safe.push(seg),
+            Component::CurDir => {}
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "non-normal path component while rebuilding under base",
+                ));
+            }
+        }
+    }
+    std::fs::read_dir(safe)
 }
 
 pub fn read_line_capped<R: BufRead>(

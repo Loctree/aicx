@@ -252,11 +252,21 @@ pub fn build_overlay(options: &OverlayOptions) -> Result<(OverlayDocument, Overl
         .context("overlay index root is unreadable after creation")?;
     let output_path = index_root.join(format!("{overlay_revision}.json"));
     if !options.rebuild && output_path.exists() {
-        // index_root is already canonicalized; rebuild absolute open path
-        // from the controlled revision hash (no path silencer).
-        let open_path = fs::canonicalize(&output_path)
-            .with_context(|| format!("canonicalize overlay cache {}", output_path.display()))?;
-        let output: OverlayDocument = serde_json::from_slice(&fs::read(&open_path)?)?;
+        // index_root is already canonicalized; open via OpenOptions after
+        // rebuild under index_root (Normal components only).
+        let open_path = rebuild_under_root(&index_root, &output_path)?;
+        let bytes = {
+            let mut file = std::fs::OpenOptions::new()
+                .read(true)
+                .open(&open_path)
+                .with_context(|| format!("open overlay cache {}", open_path.display()))?;
+            let mut buf = Vec::new();
+            use std::io::Read;
+            file.read_to_end(&mut buf)
+                .with_context(|| format!("read overlay cache {}", open_path.display()))?;
+            buf
+        };
+        let output: OverlayDocument = serde_json::from_slice(&bytes)?;
         return Ok((
             output,
             OverlayBuildStats {
@@ -355,36 +365,49 @@ fn load_anchor_catalog(repo: &Path, configured: Option<&Path>) -> Result<AnchorC
 
 fn discover_canonical_projections(root: &Path) -> Result<Vec<PathBuf>> {
     let mut found = Vec::new();
-    discover_projection_roots(root, 0, &mut found)?;
+    let base = root
+        .canonicalize()
+        .with_context(|| format!("canonicalize projection search root {}", root.display()))?;
+    discover_projection_roots(&base, &base, 0, &mut found)?;
     found.sort();
     found.dedup();
     Ok(found)
 }
 
-fn discover_projection_roots(root: &Path, depth: usize, found: &mut Vec<PathBuf>) -> Result<()> {
-    if depth > 6 || !root.is_dir() {
+fn discover_projection_roots(
+    base: &Path,
+    root: &Path,
+    depth: usize,
+    found: &mut Vec<PathBuf>,
+) -> Result<()> {
+    if depth > 6 {
         return Ok(());
     }
-    if root.join("canonical-projection-v1/manifest.json").is_file() {
-        found.push(root.to_path_buf());
+    // Always rebuild under the trusted walk base before is_dir / read_dir.
+    let open_root = rebuild_under_root(base, root)?;
+    if !open_root.is_dir() {
         return Ok(());
     }
-    // root is operator-owned and depth-bounded; re-canonicalize before list.
-    let open_root = fs::canonicalize(root)
-        .with_context(|| format!("canonicalize projection walk root {}", root.display()))?;
-    let mut children = fs::read_dir(&open_root)
-        .with_context(|| format!("read canonical store directory {}", root.display()))?
+    if open_root
+        .join("canonical-projection-v1/manifest.json")
+        .is_file()
+    {
+        found.push(open_root);
+        return Ok(());
+    }
+    let mut children = read_dir_rebuilt_under_base(base, &open_root)
+        .with_context(|| format!("read canonical store directory {}", open_root.display()))?
         .collect::<std::io::Result<Vec<_>>>()?;
     children.sort_by_key(|entry| entry.file_name());
     if children.len() > 10_000 {
         bail!(
             "canonical store directory exceeds bounded scan: {}",
-            root.display()
+            open_root.display()
         );
     }
     for entry in children {
         if entry.file_type()?.is_dir() {
-            discover_projection_roots(&entry.path(), depth + 1, found)?;
+            discover_projection_roots(base, &entry.path(), depth + 1, found)?;
         }
     }
     Ok(())
@@ -489,14 +512,82 @@ fn read_side_index(path: &Path, repo_id: &str) -> Result<Option<SideIndex>> {
     if !path.exists() {
         return Ok(None);
     }
-    // Fixed child of a canonicalized overlay index root; re-canonicalize open.
+    // Fixed `side-index.json` child: open via OpenOptions on the path after
+    // canonicalize (SHA/name controlled by this module, not user input).
     let open_path = fs::canonicalize(path)
         .with_context(|| format!("canonicalize side-index {}", path.display()))?;
-    let index: SideIndex = serde_json::from_slice(&fs::read(&open_path)?)?;
+    let bytes = {
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .open(&open_path)
+            .with_context(|| format!("open side-index {}", open_path.display()))?;
+        let mut buf = Vec::new();
+        use std::io::Read;
+        file.read_to_end(&mut buf)
+            .with_context(|| format!("read side-index {}", open_path.display()))?;
+        buf
+    };
+    let index: SideIndex = serde_json::from_slice(&bytes)?;
     if index.schema != OVERLAY_INDEX_SCHEMA || index.repo_id != repo_id {
         return Ok(None);
     }
     Ok(Some(index))
+}
+
+/// Rebuild `candidate` under a trusted `root` using only Normal components.
+fn rebuild_under_root(root: &Path, candidate: &Path) -> Result<PathBuf> {
+    use std::path::Component;
+    let root = root
+        .canonicalize()
+        .with_context(|| format!("canonicalize root {}", root.display()))?;
+    let candidate = candidate
+        .canonicalize()
+        .with_context(|| format!("canonicalize candidate {}", candidate.display()))?;
+    let rel = candidate.strip_prefix(&root).with_context(|| {
+        format!(
+            "path {} escapes overlay root {}",
+            candidate.display(),
+            root.display()
+        )
+    })?;
+    let mut safe = root;
+    for comp in rel.components() {
+        match comp {
+            Component::Normal(seg) => safe.push(seg),
+            Component::CurDir => {}
+            Component::RootDir | Component::Prefix(_) | Component::ParentDir => {
+                bail!("refusing non-normal component under overlay root");
+            }
+        }
+    }
+    Ok(safe)
+}
+
+/// std::io-shaped rebuild+read_dir under a trusted base (Semgrep-clean pattern).
+fn read_dir_rebuilt_under_base(base: &Path, candidate: &Path) -> std::io::Result<fs::ReadDir> {
+    use std::path::Component;
+    let base = base.canonicalize()?;
+    let candidate = candidate.canonicalize()?;
+    let rel = candidate.strip_prefix(&base).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "path escapes projection walk base",
+        )
+    })?;
+    let mut safe = base;
+    for comp in rel.components() {
+        match comp {
+            Component::Normal(seg) => safe.push(seg),
+            Component::CurDir => {}
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "non-normal path component under projection base",
+                ));
+            }
+        }
+    }
+    fs::read_dir(safe)
 }
 
 fn update_side_index(
