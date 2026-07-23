@@ -28,11 +28,11 @@ mod cards_v2;
 #[cfg_attr(not(feature = "app"), allow(dead_code))]
 #[path = "migration/identity.rs"]
 mod identity;
-#[path = "../store/migration/report.rs"]
+#[path = "migration/report.rs"]
 mod report;
-#[path = "../store/migration/source_locator.rs"]
+#[path = "migration/source_locator.rs"]
 mod source_locator;
-#[path = "../store/migration/types.rs"]
+#[path = "migration/types.rs"]
 mod types;
 
 pub use cards_v2::{
