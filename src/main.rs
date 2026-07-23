@@ -7825,6 +7825,7 @@ fn print_index_status_text(status: &aicx::IndexStatus) {
             aicx::IndexReadiness::StaleIndex => "stale_index (chunks pending embedding)",
             aicx::IndexReadiness::Pending => "pending (only temp checkpoint)",
             aicx::IndexReadiness::Missing => "missing",
+            aicx::IndexReadiness::PendingScanTimeout => "pending_scan_timeout",
         }
     );
     eprintln!("  backend:                {}", status.backend);

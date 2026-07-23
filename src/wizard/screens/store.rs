@@ -61,7 +61,7 @@ impl Default for StoreScreen {
             running: false,
             log: Vec::new(),
             scroll: 0,
-            status: "store range: 48h".to_string(),
+            status: "catalog rebuild → index (extract-era path)".to_string(),
             hours: 48,
             progress: None,
             rx: None,
@@ -78,7 +78,7 @@ impl StoreScreen {
 
     pub fn start(&mut self) {
         if self.running {
-            self.status = "store run already in flight".to_string();
+            self.status = "catalog/index run already in flight".to_string();
             return;
         }
 
@@ -98,28 +98,58 @@ impl StoreScreen {
         self.running = true;
         self.log.clear();
         self.progress = None;
-        self.log
-            .push(format!("running: aicx store -H {} --emit none", self.hours));
-        self.status = "store run started".to_string();
+        // Card-mill `aicx store` is deleted. Wizard rebuild path is catalog +
+        // source-driven index with optional extract cache (hours is retained
+        // only as a UI hint; catalog rebuild walks live sources fully).
+        self.log.push(
+            "running: aicx catalog rebuild && aicx index --cache-extracts --emit none".to_string(),
+        );
+        self.status = "catalog rebuild + index started".to_string();
 
-        let hours = self.hours.to_string();
         let child_slot: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
         self.child = Some(child_slot.clone());
 
         thread::spawn(move || {
-            let mut child = match Command::new(exe)
-                .arg("store")
-                .arg("-H")
-                .arg(hours)
-                .arg("--emit")
-                .arg("none")
+            // Sequential shell-free pipeline: catalog rebuild then index.
+            // Fail closed if either step fails.
+            let catalog = Command::new(&exe)
+                .args(["catalog", "rebuild", "--json"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output();
+            match catalog {
+                Ok(out) => {
+                    for line in String::from_utf8_lossy(&out.stderr).lines() {
+                        let _ = event_tx.send(StoreEvent::Line(line.to_string()));
+                    }
+                    for line in String::from_utf8_lossy(&out.stdout).lines() {
+                        let _ = event_tx.send(StoreEvent::Line(line.to_string()));
+                    }
+                    if !out.status.success() {
+                        let _ = event_tx.send(StoreEvent::Line(
+                            "catalog rebuild failed; index not started".to_string(),
+                        ));
+                        let _ = event_tx.send(StoreEvent::Done(StoreOutcome::Failed));
+                        return;
+                    }
+                }
+                Err(error) => {
+                    let _ =
+                        event_tx.send(StoreEvent::Line(format!("catalog spawn failed: {error}")));
+                    let _ = event_tx.send(StoreEvent::Done(StoreOutcome::Failed));
+                    return;
+                }
+            }
+
+            let mut child = match Command::new(&exe)
+                .args(["index", "--cache-extracts"])
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .spawn()
             {
                 Ok(child) => child,
                 Err(error) => {
-                    let _ = event_tx.send(StoreEvent::Line(format!("spawn failed: {error}")));
+                    let _ = event_tx.send(StoreEvent::Line(format!("index spawn failed: {error}")));
                     let _ = event_tx.send(StoreEvent::Done(StoreOutcome::Failed));
                     return;
                 }

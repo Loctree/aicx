@@ -124,14 +124,19 @@ These fields are parsed by `src/frontmatter.rs`, applied during chunking, and pe
 
 Frontmatter is not just telemetry — it is part of the steering and selective re-entry contract. Orchestration can use `run_id` to retrieve all chunks from a specific agent run, `prompt_id` to find outputs from a specific prompt, or combine filters to narrow scope precisely.
 
-## Data Flow: `store`
+## Data Flow: catalog → extract → index (store command removed)
 
-`store` is the “build the canonical corpus from older history” command (see `src/main.rs::run_store`):
+The per-frame card mill and `aicx store` / `run_store` are **deleted**. Identity
+and retrieval rebuild through:
 
-1. Extract selected agents + source filters for a lookback window.
-2. Redact secrets (default).
-3. Chunk and write into the canonical `~/.aicx/` store, which may resolve into multiple repo buckets plus `non-repository-contexts`.
-4. Refresh sidecar/steering metadata surfaces.
+1. `aicx catalog rebuild` — walk live agent source roots into
+   `~/.aicx/catalog/sessions.jsonl` (session id → project/agent/date/cwd/source
+   path + live source fingerprint). Zero card files.
+2. `aicx extract <agent> --session <id>` (optional) — whole-session markdown
+   under `~/.aicx/extracts/` for human reading.
+3. `aicx index --cache-extracts` — source-driven lexical CURRENT under
+   `indexed/_all/hybrid/`, signal-filtered at parse time; project is a search
+   filter, not a separate index.
 
 ## MCP Surface (`src/mcp.rs`)
 

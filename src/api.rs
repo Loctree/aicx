@@ -266,6 +266,10 @@ pub enum IndexReadiness {
     /// Canonical chunks exist that have not been represented in the committed
     /// semantic index yet.
     StaleIndex,
+    /// Pending-corpus census exceeded its hard deadline (or was skipped as
+    /// unbounded). Status still returns immediately with whatever is known
+    /// from catalog/CURRENT; operators must not wait on silent source walks.
+    PendingScanTimeout,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -320,12 +324,6 @@ fn index_status_at_with_sessions(
         return Ok(status);
     }
 
-    let chunks = crate::store::scan_context_files_project_at(base, project)?;
-    let newest_chunk = chunks
-        .iter()
-        .filter_map(|chunk| chunk.path.metadata().ok()?.modified().ok())
-        .max();
-
     let project_bucket = canonical_bucket_name(project);
     let semantic_index_path = semantic_index_path_for_bucket(base, &project_bucket);
     let temp_index_path = semantic_index_path.with_extension("ndjson.tmp");
@@ -340,11 +338,117 @@ fn index_status_at_with_sessions(
     let temp_index_bytes = temp_metadata.as_ref().map(|metadata| metadata.len());
     let semantic_index_present = semantic_index_mtime.is_some();
     let temp_index_present = temp_index_mtime.is_some();
+
+    // Boundedness first: when CURRENT/catalog/residual mill are all absent,
+    // report Missing immediately. Never walk live agent trees (codex 42 GB,
+    // claude 5.9 GB) just to print "missing" — audit measured >60 s hangs.
+    let catalog_entries = crate::catalog::read_entries_at(base).unwrap_or_default();
+    let residual_mill_present = residual_store_surface_present(base);
+    if catalog_entries.is_empty()
+        && !residual_mill_present
+        && !semantic_index_present
+        && !temp_index_present
+        && source_sessions_override.is_none()
+    {
+        return Ok(IndexStatus {
+            canonical_chunks: 0,
+            semantic_index_present: false,
+            semantic_index_path: None,
+            semantic_index_rows: 0,
+            newest_chunk_mtime: None,
+            source_sessions: 0,
+            newest_session_updated_at: None,
+            sessions_newer_than_chunks: 0,
+            sessions_without_timestamps: 0,
+            chunking_lag_secs: None,
+            semantic_index_mtime: None,
+            semantic_lag_secs: None,
+            pending_chunks: 0,
+            temp_index_present: false,
+            temp_index_path: None,
+            temp_index_rows: 0,
+            temp_index_mtime: None,
+            temp_index_bytes: None,
+            readiness: IndexReadiness::Missing,
+            backend: "none".to_string(),
+            project_bucket,
+            committed_at: None,
+        });
+    }
+
+    // Catalog-only path: durable session identity without residual mill walk.
+    // Source-of-truth census of live agent roots is intentionally NOT done
+    // here — that was the hang. Operators admit sources via `catalog rebuild`.
+    if !catalog_entries.is_empty()
+        && !residual_mill_present
+        && !semantic_index_present
+        && !temp_index_present
+        && source_sessions_override.is_none()
+    {
+        let project_filter = project.map(str::trim).filter(|value| !value.is_empty());
+        let catalog_in_scope = match project_filter {
+            None => catalog_entries.len(),
+            Some(filter) => catalog_entries
+                .iter()
+                .filter(|entry| {
+                    entry
+                        .project
+                        .as_deref()
+                        .is_some_and(|p| p.eq_ignore_ascii_case(filter))
+                })
+                .count(),
+        };
+        return Ok(IndexStatus {
+            canonical_chunks: 0,
+            semantic_index_present: false,
+            semantic_index_path: None,
+            semantic_index_rows: 0,
+            newest_chunk_mtime: None,
+            source_sessions: catalog_in_scope,
+            newest_session_updated_at: None,
+            sessions_newer_than_chunks: catalog_in_scope,
+            sessions_without_timestamps: 0,
+            chunking_lag_secs: None,
+            semantic_index_mtime: None,
+            semantic_lag_secs: None,
+            pending_chunks: catalog_in_scope,
+            temp_index_present: false,
+            temp_index_path: None,
+            temp_index_rows: 0,
+            temp_index_mtime: None,
+            temp_index_bytes: None,
+            readiness: IndexReadiness::Missing,
+            backend: "catalog_only".to_string(),
+            project_bucket: project_filter
+                .map(|filter| canonical_bucket_name(Some(filter)))
+                .unwrap_or_else(|| "_all".to_string()),
+            committed_at: None,
+        });
+    }
+
+    let chunks = if residual_mill_present {
+        crate::store::scan_context_files_project_at(base, project).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let newest_chunk = chunks
+        .iter()
+        .filter_map(|chunk| chunk.path.metadata().ok()?.modified().ok())
+        .max();
+
+    // Prefer explicit override (tests) or catalog counts. Live agent-tree
+    // discovery is last-resort and hard-deadline bounded.
     let discovered_sessions;
     let source_sessions = match source_sessions_override {
         Some(sessions) => sessions,
+        None if !catalog_entries.is_empty() => {
+            // Empty slice: chunking lag uses catalog counts injected below.
+            discovered_sessions = Vec::new();
+            &discovered_sessions
+        }
         None => {
-            discovered_sessions = discover_source_sessions_for_status(base, project, newest_chunk);
+            discovered_sessions =
+                discover_source_sessions_for_status_bounded(base, project, newest_chunk);
             &discovered_sessions
         }
     };
@@ -363,10 +467,35 @@ fn index_status_at_with_sessions(
 
     let pending_chunks = chunks.len().saturating_sub(semantic_index_rows);
 
+    // When we skipped live discovery but have catalog rows, surface catalog
+    // counts as source_sessions so status is still useful.
+    let catalog_count = if source_sessions_override.is_none() && !catalog_entries.is_empty() {
+        let project_filter = project.map(str::trim).filter(|value| !value.is_empty());
+        match project_filter {
+            None => catalog_entries.len(),
+            Some(filter) => catalog_entries
+                .iter()
+                .filter(|entry| {
+                    entry
+                        .project
+                        .as_deref()
+                        .is_some_and(|p| p.eq_ignore_ascii_case(filter))
+                })
+                .count(),
+        }
+    } else {
+        chunking.source_sessions
+    };
+    let sessions_newer = if source_sessions_override.is_none() && !catalog_entries.is_empty() {
+        catalog_count.saturating_sub(chunks.len())
+    } else {
+        chunking.sessions_newer_than_chunks
+    };
+
     let readiness = match (semantic_index_present, temp_index_present) {
         (false, true) => IndexReadiness::Pending,
         (false, false) => IndexReadiness::Missing,
-        (true, _) if chunking.sessions_newer_than_chunks > 0 => IndexReadiness::StaleChunks,
+        (true, _) if sessions_newer > 0 => IndexReadiness::StaleChunks,
         (true, _) if pending_chunks > 0 || semantic_lag_secs.unwrap_or(0) > 0 => {
             IndexReadiness::StaleIndex
         }
@@ -380,11 +509,11 @@ fn index_status_at_with_sessions(
         semantic_index_path: semantic_index_present.then(|| path_for_json(&semantic_index_path)),
         semantic_index_rows,
         newest_chunk_mtime: newest_chunk.map(system_time_to_rfc3339),
-        source_sessions: chunking.source_sessions,
+        source_sessions: catalog_count,
         newest_session_updated_at: chunking
             .newest_session_updated_at
             .map(|value| value.to_rfc3339()),
-        sessions_newer_than_chunks: chunking.sessions_newer_than_chunks,
+        sessions_newer_than_chunks: sessions_newer,
         sessions_without_timestamps: chunking.sessions_without_timestamps,
         chunking_lag_secs: chunking.chunking_lag_secs,
         semantic_index_mtime: committed_at.clone(),
@@ -400,6 +529,13 @@ fn index_status_at_with_sessions(
         project_bucket,
         committed_at,
     })
+}
+
+/// True when residual per-frame mill dirs still exist under the AICX home.
+fn residual_store_surface_present(base: &Path) -> bool {
+    base.join("store").is_dir()
+        || base.join(crate::store::CANONICAL_STORE_DIRNAME).is_dir()
+        || base.join(crate::store::NON_REPOSITORY_CONTEXTS).is_dir()
 }
 
 /// Report readiness from hybrid CURRENT when it is the search truth surface.
@@ -519,7 +655,11 @@ struct ChunkingLag {
     chunking_lag_secs: Option<u64>,
 }
 
-fn discover_source_sessions_for_status(
+/// Bounded residual-mill census. Hard deadline: never block status >2s on a
+/// live agent-tree walk (operator home can hold tens of GB of sessions).
+const STATUS_SESSION_SCAN_DEADLINE: Duration = Duration::from_secs(2);
+
+fn discover_source_sessions_for_status_bounded(
     base: &Path,
     project: Option<&str>,
     newest_chunk: Option<SystemTime>,
@@ -534,10 +674,22 @@ fn discover_source_sessions_for_status(
         return Vec::new();
     };
 
-    sessions::discover_sessions_at(&home, newest_chunk, None, None)
-        .into_iter()
-        .filter(|session| status_session_matches_project(project, session))
-        .collect()
+    // Spawn the census on a helper thread and abandon it on deadline. Status
+    // must return; a hung walk is worse than an empty pending set.
+    let project = project.map(str::to_string);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let home = home.clone();
+    std::thread::spawn(move || {
+        let sessions = sessions::discover_sessions_at(&home, newest_chunk, None, None)
+            .into_iter()
+            .filter(|session| status_session_matches_project(project.as_deref(), session))
+            .collect::<Vec<_>>();
+        let _ = tx.send(sessions);
+    });
+    // Deadline exceeded → empty vec; readiness already reflects on-disk
+    // artifacts. The abandoned thread exits when discovery finishes.
+    rx.recv_timeout(STATUS_SESSION_SCAN_DEADLINE)
+        .unwrap_or_default()
 }
 
 fn status_session_matches_project(project: Option<&str>, session: &SessionInfo) -> bool {
@@ -794,6 +946,33 @@ mod tests {
         assert_eq!(status.backend, "ndjson");
         assert_eq!(status.project_bucket, "_all");
         assert!(status.committed_at.is_none());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn index_status_missing_is_immediate_without_live_source_census() {
+        // Audit P1: empty AICX home must not hang scanning agent trees.
+        let root = std::env::temp_dir().join(format!(
+            "aicx-api-index-status-fast-missing-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create root");
+
+        let started = std::time::Instant::now();
+        // None override = production path (no forced empty session list).
+        let status = index_status_at(&root, None).expect("index status");
+        let wall = started.elapsed();
+
+        assert_eq!(status.readiness, IndexReadiness::Missing);
+        assert_eq!(status.backend, "none");
+        assert_eq!(status.canonical_chunks, 0);
+        assert!(
+            wall < std::time::Duration::from_secs(2),
+            "missing status must return immediately, got {wall:?}"
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }

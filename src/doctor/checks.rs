@@ -731,7 +731,10 @@ fn check_canonical_store_fast(
             name: "canonical_store".to_string(),
             severity: Severity::Warning,
             detail: format!("Canonical store does not exist at {}", store_root.display()),
-            recommendation: Some("Run `aicx store -H 168` to populate".to_string()),
+            recommendation: Some(
+                "Run `aicx catalog rebuild` then `aicx index --cache-extracts` to populate"
+                    .to_string(),
+            ),
         };
     }
     let stages = crate::store::canonical_projection::inspect_projection_stages_at(&store_root);
@@ -813,7 +816,7 @@ fn check_sidecars_fast(walk: &BoundedWalk, budget: &mut FsBudget) -> CheckResult
                 "{missing}/{checked} sampled chunk(s) missing sidecars (fast sample)"
             ),
             recommendation: Some(
-                "Run `aicx doctor --deep` for full coverage, then `aicx store --full-rescan` to backfill"
+                "Run `aicx doctor --deep` for full coverage, then `aicx catalog rebuild` and `aicx index --full-rescan --cache-extracts` to backfill"
                     .to_string(),
             ),
         };
@@ -1502,7 +1505,7 @@ pub(crate) fn check_index_consistency(base: &Path) -> CheckResult {
                 None
             } else {
                 Some(format!(
-                    "Run `aicx store --full-rescan` to rebuild {}/index.json",
+                    "Run `aicx catalog rebuild` then `aicx index --full-rescan --cache-extracts` to rebuild lexical CURRENT (legacy {}/index.json is residual)",
                     doctor_home_label()
                 ))
             },
@@ -1530,7 +1533,7 @@ pub(crate) fn check_index_consistency(base: &Path) -> CheckResult {
                 severity: Severity::Critical,
                 detail: format!("index.json is malformed JSON: {err}"),
                 recommendation: Some(format!(
-                    "Backup and rebuild {}/index.json via `aicx store --full-rescan`",
+                    "Backup residual {}/index.json; rebuild via `aicx catalog rebuild` + `aicx index --full-rescan --cache-extracts`",
                     doctor_home_label()
                 )),
             };
@@ -1594,7 +1597,7 @@ pub(crate) fn check_index_consistency(base: &Path) -> CheckResult {
             None
         } else {
             Some(format!(
-                "Run `aicx store --full-rescan` to reconcile {}/index.json with the canonical store",
+                "Run `aicx catalog rebuild` + `aicx index --full-rescan --cache-extracts` to rebuild CURRENT (legacy {}/index.json is residual)",
                 doctor_home_label()
             ))
         },
@@ -1741,7 +1744,10 @@ pub(crate) fn check_canonical_store(base: &Path) -> CheckResult {
             name: "canonical_store".to_string(),
             severity: Severity::Warning,
             detail: format!("Canonical store does not exist at {}", store_root.display()),
-            recommendation: Some("Run `aicx store -H 168` to populate".to_string()),
+            recommendation: Some(
+                "Run `aicx catalog rebuild` then `aicx index --cache-extracts` to populate"
+                    .to_string(),
+            ),
         };
     }
     let files = store::scan_context_files_at(base).unwrap_or_default();
@@ -1848,7 +1854,9 @@ pub(crate) fn check_steer_bm25(base: &Path) -> CheckResult {
             name: "steer_bm25".to_string(),
             severity: Severity::Warning,
             detail: "BM25 steer index does not exist".to_string(),
-            recommendation: Some("Will be created on next `aicx store` run".to_string()),
+            recommendation: Some(
+                "Will be created on next `aicx catalog rebuild` + `aicx index` run".to_string(),
+            ),
         };
     }
     let entries = std::fs::read_dir(&bm25_dir)
@@ -1866,7 +1874,7 @@ pub(crate) fn check_steer_bm25(base: &Path) -> CheckResult {
             entries
         ),
         recommendation: if entries == 0 {
-            Some("BM25 dir is empty; reindex with `aicx store -H 168 --full-rescan`".to_string())
+            Some("BM25 dir is empty; reindex with `aicx catalog rebuild` then `aicx index --full-rescan --cache-extracts`".to_string())
         } else {
             None
         },
@@ -1880,7 +1888,9 @@ pub(crate) fn check_state(base: &Path) -> CheckResult {
             name: "state".to_string(),
             severity: Severity::Warning,
             detail: "state.json does not exist (no extraction watermarks)".to_string(),
-            recommendation: Some("Will be created on first `aicx store` run".to_string()),
+            recommendation: Some(
+                "Will be created on first `aicx catalog rebuild` + `aicx index` run".to_string(),
+            ),
         };
     }
     // state.json has a dedicated 128 MiB cap (see sanitize::MAX_STATE_JSON_BYTES);
@@ -1962,7 +1972,7 @@ pub(crate) fn check_sidecar_coverage(base: &Path) -> CheckResult {
         ),
         recommendation: if missing > 0 {
             Some(format!(
-                "{} chunks missing sidecars; run `aicx store --full-rescan` to backfill",
+                "{} residual chunks missing sidecars; prefer `aicx catalog rebuild` + `aicx index --full-rescan --cache-extracts` over the retired card mill",
                 missing
             ))
         } else {
@@ -2001,7 +2011,7 @@ pub(crate) fn check_content_dedup(base: &Path) -> CheckResult {
         },
         detail: format!("{duplicate_groups} duplicate hash group(s), {duplicate_chunks} chunk(s)"),
         recommendation: if duplicate_groups > 0 {
-            Some("Run `aicx store --full-rescan` only after pruning duplicate chunks or let content-hash dedup skip future writes".to_string())
+            Some("Prefer `aicx catalog rebuild` + `aicx index --full-rescan --cache-extracts`; residual card-mill rebuild is retired".to_string())
         } else {
             None
         },
