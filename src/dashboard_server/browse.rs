@@ -228,7 +228,7 @@ pub(super) async fn get_detail(
     };
 
     let snapshot = state.snapshot.read().await;
-    // Record IDs are 1-based (assigned as idx+1 in scan_store), so look up by
+    // Record IDs are 1-based (assigned during the legacy archive scan), so look up by
     // matching the id field rather than using it as a raw array index.
     if let Some(record) = snapshot.payload.records.iter().find(|r| r.id == params.id) {
         (

@@ -210,9 +210,9 @@ struct ScanResult {
     payload: DashboardPayload,
 }
 
-/// Build a complete HTML dashboard from store data.
+/// Build a complete HTML dashboard from the read-only legacy archive view.
 pub fn build_dashboard(config: &DashboardConfig) -> Result<DashboardArtifact> {
-    let scan = scan::scan_store(&config.store_root, config.preview_chars, &config.scope)?;
+    let scan = scan::scan_legacy_archive(&config.store_root, config.preview_chars, &config.scope)?;
     let html = render_dashboard_html(&scan.payload, &config.title)?;
 
     Ok(DashboardArtifact {
@@ -222,26 +222,29 @@ pub fn build_dashboard(config: &DashboardConfig) -> Result<DashboardArtifact> {
     })
 }
 
-/// Scan the store and return the raw payload (for server mode).
-pub fn scan_store_payload(store_root: &Path, preview_chars: usize) -> Result<DashboardPayload> {
-    let scan = scan::scan_store(store_root, preview_chars, &DashboardScope::default())?;
+/// Scan the legacy archive and return the raw payload (for server mode).
+pub fn scan_legacy_archive_payload(
+    aicx_home: &Path,
+    preview_chars: usize,
+) -> Result<DashboardPayload> {
+    let scan = scan::scan_legacy_archive(aicx_home, preview_chars, &DashboardScope::default())?;
     Ok(scan.payload)
 }
 
-/// Scan the store with an explicit scope and return the raw payload (for server mode).
-pub fn scan_store_payload_scoped(
-    store_root: &Path,
+/// Scan the legacy archive with an explicit scope and return the raw payload (for server mode).
+pub fn scan_legacy_archive_payload_scoped(
+    aicx_home: &Path,
     preview_chars: usize,
     scope: &DashboardScope,
 ) -> Result<DashboardPayload> {
-    let scan = scan::scan_store(store_root, preview_chars, scope)?;
+    let scan = scan::scan_legacy_archive(aicx_home, preview_chars, scope)?;
     Ok(scan.payload)
 }
 
 /// Build a static HTML artifact from an already-scanned payload.
 ///
-/// Reuses `payload` instead of scanning the store again — designed for server
-/// mode where `scan_store_payload` has already run.
+/// Reuses `payload` instead of scanning the archive again — designed for server
+/// mode where `scan_legacy_archive_payload` has already run.
 pub fn build_dashboard_from_payload(
     payload: &DashboardPayload,
     title: &str,

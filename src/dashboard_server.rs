@@ -237,7 +237,7 @@ pub async fn run_dashboard_server(config: DashboardServerConfig) -> Result<()> {
     } else {
         eprintln!("  Mutation origin gate: require Origin or Referer");
     }
-    eprintln!("  Store: {}", config.store_root.display());
+    eprintln!("  AICX home: {}", config.store_root.display());
     eprintln!("  CORS: {}", config.cors_policy.label());
     if auth_enforced {
         eprintln!("  Auth: enabled on /api/* (source: {auth_source_label})");
@@ -468,7 +468,7 @@ e.respondWith(caches.match(e.request).then(r=>{if(r)return r;\
 return fetch(e.request).catch(()=>{if(e.request.mode==='navigate')\
 return new Response('<html><body style=\"background:#0a0f19;color:#e5e7eb;\
 font-family:system-ui;display:flex;align-items:center;justify-content:center;\
-height:100vh;margin:0\"><div style=\"text-align:center\"><h1>aicx store not \
+height:100vh;margin:0\"><div style=\"text-align:center\"><h1>aicx archive not \
 reachable</h1><p>Start the server with <code>aicx dashboard --serve</code></p>\
 </div></body></html>',{headers:{'Content-Type':'text/html'}});});}));});"
     );
@@ -485,7 +485,7 @@ fn rebuild_dashboard(config: &DashboardServerConfig) -> Result<BuildOutput> {
     // Server mode: scan only — no static HTML rendering, no artifact write.
     // The server shell HTML is pre-built once at startup; all data reaches
     // clients through the /api/* endpoints.
-    let payload = dashboard::scan_store_payload_scoped(
+    let payload = dashboard::scan_legacy_archive_payload_scoped(
         &config.store_root,
         config.preview_chars,
         &config.scope,
