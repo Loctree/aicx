@@ -6,7 +6,7 @@
 //! ship to users — not a synthetic bypass.
 //!
 //! Pipeline asserted, end to end:
-//!   1. canonical store has at least one chunk (extract was previously run)
+//!   1. residual legacy archive fixture has at least one chunk
 //!   2. embedder loads via the configured backend (cloud or native GGUF)
 //!   3. `vector_index::write_index` materializes NDJSON + committed hybrid
 //!      artifacts under `~/.aicx/indexed/<bucket>/` (one dense payload per

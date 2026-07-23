@@ -15,7 +15,7 @@
 //! `.to_lowercase().contains()` on any of them.
 //!
 //! Sub-cases:
-//! 1. store path — `legacy_archive::project_filter_matches` direct call.
+//! 1. legacy archive path — `legacy_archive::project_filter_matches` direct call.
 //! 2. dashboard — `dashboard::project_matches_filter` public wrapper.
 //! 3. steer-index — replicates the `metadata_matches` split-and-delegate
 //!    shape from `src/steer_index/search.rs`, plus a source-level invariant grep
@@ -502,7 +502,7 @@ fn mcp_intents_payload_with_options(
 }
 
 #[test]
-fn store_path_rejects_substring_leak() {
+fn legacy_archive_path_rejects_substring_leak() {
     // Direct contract: `vista` is a bare cross-org repo-name token. Strict
     // semantics accept `vetcoders/vista` (org-or-repo equality) but reject
     // `vetcoders/vista-portal` (no substring fallback).
