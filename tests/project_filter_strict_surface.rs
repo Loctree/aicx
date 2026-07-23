@@ -7,7 +7,7 @@
 //! Bug #38 cut the last live substring project-filter call-site (the rank
 //! fallback fuzzy path in `src/rank.rs`). With Wave B-1 (dashboard), B-2
 //! (steer-index), and B-3 (rank) all routed through the canonical
-//! `aicx::store::project_filter_matches`, every `-p <project>` surface in
+//! `aicx::legacy_archive::project_filter_matches`, every `-p <project>` surface in
 //! the pipeline agrees: `vista` does NOT match `vista-portal`.
 //!
 //! This file is the surface-wide regression: it pins behavior across the
@@ -15,7 +15,7 @@
 //! `.to_lowercase().contains()` on any of them.
 //!
 //! Sub-cases:
-//! 1. store path — `store::project_filter_matches` direct call.
+//! 1. store path — `legacy_archive::project_filter_matches` direct call.
 //! 2. dashboard — `dashboard::project_matches_filter` public wrapper.
 //! 3. steer-index — replicates the `metadata_matches` split-and-delegate
 //!    shape from `src/steer_index/search.rs`, plus a source-level invariant grep
@@ -35,7 +35,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use aicx::api::Aicx;
 use aicx::dashboard::project_matches_filter;
 use aicx::intents::{IntentExtraction, IntentsConfig};
-use aicx::store::{ProjectMatchMode, project_filter_matches, require_project_resolution};
+use aicx::legacy_archive::{ProjectMatchMode, project_filter_matches, require_project_resolution};
 
 const LEAKY_FILTER: &str = "vista";
 const LEAKY_CANDIDATE_ORG: &str = "vetcoders";
@@ -78,7 +78,7 @@ fn write_intent_chunk(root: &std::path::Path, project: &str, marker: &str, seque
         .join("conversations")
         .join("codex");
     fs::create_dir_all(&directory).expect("create strict-filter fixture directory");
-    let filename = aicx::store::session_basename(
+    let filename = aicx::legacy_archive::session_basename(
         "2026-07-17",
         "codex",
         &format!("strict-{sequence}"),
@@ -107,7 +107,7 @@ fn write_ownerless_intent_chunk(
         .join("conversations")
         .join("codex");
     fs::create_dir_all(&directory).expect("create ownerless fixture directory");
-    let filename = aicx::store::session_basename(
+    let filename = aicx::legacy_archive::session_basename(
         "2026-07-17",
         "codex",
         &format!("ownerless-{sequence}"),
@@ -397,7 +397,7 @@ fn write_legacy_chunk_without_identity(root: &std::path::Path, project: &str) {
         .join("codex");
     fs::create_dir_all(&directory).expect("create legacy corpus directory");
     fs::write(
-        directory.join(aicx::store::session_basename(
+        directory.join(aicx::legacy_archive::session_basename(
             "2026-07-17",
             "codex",
             "legacy-no-identity",
@@ -429,7 +429,7 @@ fn write_f6_intent_chunk(
         .join("conversations")
         .join("codex");
     fs::create_dir_all(&directory).expect("create F6 fixture directory");
-    let filename = aicx::store::session_basename(date, "codex", session_id, sequence);
+    let filename = aicx::legacy_archive::session_basename(date, "codex", session_id, sequence);
     fs::write(
         directory.join(filename),
         format!(
@@ -566,7 +566,7 @@ fn steer_index_path_rejects_substring_leak() {
     // sibling is gone. Guards against silent regression in B-2's file.
     let src = read_source("src/steer_index/search.rs");
     assert!(
-        src.contains("crate::store::project_filter_matches"),
+        src.contains("crate::legacy_archive::project_filter_matches"),
         "steer-index lost its routing to canonical `project_filter_matches`"
     );
     assert!(
@@ -593,11 +593,11 @@ fn rank_path_rejects_substring_leak() {
     );
 
     // Source-level invariant: the rank fallback fuzzy path routes through
-    // `store::project_filter_matches` and the legacy lowercase-substring
+    // `legacy_archive::project_filter_matches` and the legacy lowercase-substring
     // sibling (`project_filter_lower` + `.contains(filter)`) is gone.
     let src = read_source("src/rank.rs");
     assert!(
-        src.contains("store::project_filter_matches"),
+        src.contains("legacy_archive::project_filter_matches"),
         "rank lost its routing to canonical `project_filter_matches`"
     );
     assert!(
@@ -609,7 +609,8 @@ fn rank_path_rejects_substring_leak() {
 #[test]
 fn resolver_world_model_is_exact_fail_closed_and_explicitly_fuzzy() {
     let root = strict_filter_corpus();
-    let corpus = aicx::store::project_identities_in_store_at(&root).expect("discover corpus");
+    let corpus =
+        aicx::legacy_archive::project_identities_in_store_at(&root).expect("discover corpus");
 
     let ambiguous =
         require_project_resolution(&["vista".to_string()], &corpus, ProjectMatchMode::Exact)
@@ -696,7 +697,8 @@ fn resolver_world_model_is_exact_fail_closed_and_explicitly_fuzzy() {
 #[test]
 fn intents_cli_and_mcp_resolution_path_share_selected_session_set() {
     let root = strict_filter_corpus();
-    let corpus = aicx::store::project_identities_in_store_at(&root).expect("discover corpus");
+    let corpus =
+        aicx::legacy_archive::project_identities_in_store_at(&root).expect("discover corpus");
     let selected = require_project_resolution(
         &["LibraxisAI/vista".to_string()],
         &corpus,
@@ -743,7 +745,7 @@ fn intents_cli_and_mcp_resolution_path_share_selected_session_set() {
     assert!(!stderr.contains("vista-portal"), "{stderr}");
 
     let intents_source = read_source("src/intents.rs");
-    assert!(intents_source.contains("store::project_filter_matches"));
+    assert!(intents_source.contains("legacy_archive::project_filter_matches"));
     assert!(!intents_source.contains(".contains(&project.to_ascii_lowercase())"));
     let mcp_source = read_source("src/mcp.rs");
     assert!(mcp_source.contains("resolve_mcp_projects"));
@@ -763,7 +765,8 @@ fn ownerless_bucket_world_model_has_cli_mcp_addressability_and_completeness() {
     write_intent_chunk(&root, "A/repo", "OWNED", 1);
     write_ownerless_intent_chunk(&root, "repo", "ORPHANED", 2);
 
-    let corpus = aicx::store::project_identities_in_store_at(&root).expect("discover corpus");
+    let corpus =
+        aicx::legacy_archive::project_identities_in_store_at(&root).expect("discover corpus");
     assert_eq!(corpus, ["A/repo", "_/repo"]);
 
     let ambiguous_cli = cli_intents(&root, "repo");
@@ -874,8 +877,8 @@ fn historical_identity_survives_live_remote_rename_via_catalog() {
     );
 
     // Search -p corpus reads catalog identities (not card mill paths).
-    let search_ids =
-        aicx::store::project_identities_for_search_at(&aicx_home).expect("search identity corpus");
+    let search_ids = aicx::legacy_archive::project_identities_for_search_at(&aicx_home)
+        .expect("search identity corpus");
     assert!(
         search_ids
             .iter()
@@ -948,8 +951,8 @@ fn deprecated_checkout_does_not_capture_historical_sessions_via_catalog() {
         "deprecated remote must not capture catalog identity: {identities:?}"
     );
 
-    let search_ids =
-        aicx::store::project_identities_for_search_at(&aicx_home).expect("search identity corpus");
+    let search_ids = aicx::legacy_archive::project_identities_for_search_at(&aicx_home)
+        .expect("search identity corpus");
     assert!(
         search_ids
             .iter()
@@ -973,7 +976,7 @@ fn deprecated_checkout_does_not_capture_historical_sessions_via_catalog() {
     assert_eq!(cli_payload["project"], "vetcoders/screen_scribe");
 
     // Require-resolution: historical filter still resolves; depr does not.
-    let historical_resolution = aicx::store::require_project_resolution(
+    let historical_resolution = aicx::legacy_archive::require_project_resolution(
         &["vetcoders/screen_scribe".to_string()],
         &search_ids,
         ProjectMatchMode::Exact,
@@ -982,7 +985,7 @@ fn deprecated_checkout_does_not_capture_historical_sessions_via_catalog() {
         historical_resolution.is_ok(),
         "historical project must resolve against catalog-backed corpus: {historical_resolution:?}"
     );
-    let depr_resolution = aicx::store::require_project_resolution(
+    let depr_resolution = aicx::legacy_archive::require_project_resolution(
         &["vetcoders/screen_scribe_depr".to_string()],
         &search_ids,
         ProjectMatchMode::Exact,

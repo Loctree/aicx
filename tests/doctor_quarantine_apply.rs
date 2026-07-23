@@ -348,7 +348,7 @@ fn apply_empty_body_quarantine_accepts_non_repository_contexts() {
 #[cfg(unix)]
 #[test]
 fn doctor_quarantines_dead_projection_stage_recoverably_and_idempotently() {
-    use aicx::store::canonical_projection::{
+    use aicx::legacy_archive::canonical_projection::{
         PROJECTION_STAGE_META_FILENAME, PROJECTION_STAGE_SCHEMA, ProjectionStageLease,
     };
 
@@ -497,7 +497,7 @@ fn doctor_quarantines_dead_projection_stage_recoverably_and_idempotently() {
 #[cfg(unix)]
 #[test]
 fn doctor_store_reconciliation_composes_identity_apply_with_stage_quarantine() {
-    use aicx::store::canonical_projection::{
+    use aicx::legacy_archive::canonical_projection::{
         PROJECTION_STAGE_META_FILENAME, PROJECTION_STAGE_SCHEMA, ProjectionStageLease,
     };
 

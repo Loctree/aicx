@@ -98,7 +98,7 @@ fn binary_does_not_contain_module_prefix_leak() {
     // scanning raw bytes. A user-facing leak looks like ASCII
     // `aicx::<lowercase_word>:<space-or-printable>`, and the trailing char
     // after the colon must NOT be another `:` (which would be a normal
-    // Rust path like `aicx::store::project_filter_matches`).
+    // Rust path like `aicx::legacy_archive::project_filter_matches`).
     let prefix = b"aicx::";
     let mut found: Vec<String> = Vec::new();
     let mut i = 0usize;
