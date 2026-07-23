@@ -1779,7 +1779,7 @@ impl AicxMcpServer {
 
     #[tool(
         name = "aicx_index_status",
-        description = "Report the truthful state of the AICX sessions -> chunks -> semantic-index pipeline for a project bucket. Returns `readiness` (ready/stale_chunks/stale_index/pending/missing), source session freshness, pending_chunks, backend, project_bucket, committed_at, and final + temp checkpoint paths. `ready` is set only when source sessions are not newer than chunks and the atomically committed `embeddings.ndjson` is current."
+        description = "Report the truthful state of the AICX index relative to what search uses. Prefers hybrid CURRENT (lexical-first source generation under indexed/_all/hybrid) when present — same surface as `aicx search`. Falls back to residual store-card + embeddings.ndjson status only when CURRENT is absent. Returns readiness (ready/stale_chunks/stale_index/pending/missing), backend (hybrid_lexical|hybrid|ndjson), catalog session counts, pending_chunks, project_bucket, committed_at."
     )]
     async fn index_status(
         &self,

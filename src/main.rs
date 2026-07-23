@@ -7666,8 +7666,11 @@ fn run_index(
             }
         );
         eprintln!(
-            "  sources: total={} parsed={} skipped={}",
-            report.sources_total, report.sources_parsed, report.sources_skipped
+            "  sources: total={} parsed={} reused={} skipped={}",
+            report.sources_total,
+            report.sources_parsed,
+            report.sources_reused,
+            report.sources_skipped
         );
         eprintln!(
             "  frames: raw={} signal={} filtered={}",

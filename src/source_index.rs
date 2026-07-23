@@ -14,7 +14,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use chrono::SecondsFormat;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::catalog::CatalogEntry;
@@ -35,11 +35,16 @@ const MAX_JSONL_RECORD_BYTES: usize = 2 * 1024 * 1024;
 /// one-shot rebuild so index truth tracks filter truth.
 const SIGNAL_FILTER_VERSION: &str = "signal-v2-vibecrafted-thought-strip";
 
+const PARSE_STATE_SCHEMA: &str = "aicx.source_parse_state.v1";
+const PARSE_STATE_RELPATH: &str = "indexed/_all/source_parse_state.v1.json";
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SourceIndexReport {
     pub catalog_path: String,
     pub sources_total: usize,
     pub sources_parsed: usize,
+    /// Sessions whose extract was reused without re-parsing the live source.
+    pub sources_reused: usize,
     pub sources_skipped: usize,
     pub raw_frames: usize,
     pub signal_frames: usize,
@@ -50,6 +55,32 @@ pub struct SourceIndexReport {
     pub wall_ms: u64,
     pub manifest_path: Option<String>,
     pub skipped_by_agent: BTreeMap<String, usize>,
+}
+
+/// Durable per-session parse ledger for true incremental index builds.
+///
+/// Whole-catalog fingerprint short-circuit covers the no-op case. When the
+/// catalog grows (new sessions) this ledger lets the indexer re-parse only the
+/// changed rows and reuse cached extracts for the rest — the audit failure was
+/// "+28 sessions → full multi-ten-minute reparse".
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct SourceParseState {
+    schema: String,
+    signal_filter_version: String,
+    sessions: BTreeMap<String, SessionParseRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SessionParseRecord {
+    source_path: String,
+    extract_relpath: String,
+    extract_sha256: String,
+    raw_frames: usize,
+    signal_frames: usize,
+    filtered_frames: usize,
+    project: Option<String>,
+    date: Option<String>,
+    cwd: Option<String>,
 }
 
 /// Build or preview the global lexical index from the durable catalog.
@@ -98,6 +129,7 @@ pub fn build(
             catalog_path: catalog_path.display().to_string(),
             sources_total: selected.len(),
             sources_parsed: 0,
+            sources_reused: 0,
             sources_skipped: 0,
             raw_frames: 0,
             signal_frames: 0,
@@ -115,17 +147,47 @@ pub fn build(
 
     let mut chunks = Vec::with_capacity(selected.len());
     let mut sources_parsed = 0usize;
+    let mut sources_reused = 0usize;
     let mut sources_skipped = 0usize;
     let mut raw_frames = 0usize;
     let mut signal_frames = 0usize;
     let mut filtered_frames = 0usize;
     let mut extracts_written = 0usize;
     let mut skipped_by_agent = BTreeMap::new();
+    let mut next_state = SourceParseState {
+        schema: PARSE_STATE_SCHEMA.to_string(),
+        signal_filter_version: SIGNAL_FILTER_VERSION.to_string(),
+        sessions: BTreeMap::new(),
+    };
 
     let user_home = crate::os_user_home().unwrap_or_else(|| aicx_home.to_path_buf());
     let source_allow = crate::source_path::SourceAllowlist::for_operator(&user_home, aicx_home);
+    let prior_state = if full_rescan {
+        SourceParseState::default()
+    } else {
+        load_parse_state(aicx_home)
+    };
 
     for entry in &selected {
+        let session_key = session_state_key(&entry.agent, &entry.session_id);
+
+        // True incremental: reuse a prior extract when the catalog still
+        // points at the same source path and the cached extract bytes match.
+        if let Some(chunk) = try_reuse_cached_extract(aicx_home, entry, &prior_state, &session_key)
+        {
+            let record = prior_state
+                .sessions
+                .get(&session_key)
+                .expect("reuse requires prior record");
+            raw_frames += record.raw_frames;
+            signal_frames += record.signal_frames;
+            filtered_frames += record.filtered_frames;
+            sources_reused += 1;
+            next_state.sessions.insert(session_key, record.clone());
+            chunks.push(chunk);
+            continue;
+        }
+
         // Resolve under approved roots before any parse/open.
         // Pass the catalog string through AsRef<Path> so Path::new lives only
         // inside the allowlist resolver (canonicalize + containment).
@@ -156,7 +218,8 @@ pub fn build(
             }
         };
         sources_parsed += 1;
-        raw_frames += frames.len();
+        let raw_count = frames.len();
+        raw_frames += raw_count;
         frames.sort_by_key(|frame| frame.timestamp);
         let before = frames.len();
         frames.retain(is_signal_frame);
@@ -164,8 +227,10 @@ pub fn build(
             frame.message = clean_message(&frame.message);
         }
         frames.retain(|frame| !frame.message.trim().is_empty());
-        signal_frames += frames.len();
-        filtered_frames += before.saturating_sub(frames.len());
+        let signal_count = frames.len();
+        signal_frames += signal_count;
+        let filtered_count = before.saturating_sub(frames.len());
+        filtered_frames += filtered_count;
         if frames.is_empty() {
             continue;
         }
@@ -182,7 +247,7 @@ pub fn build(
             extracts_written += 1;
         }
         let indexed_path = if !dry_run && cache_extracts {
-            extract_path
+            extract_path.clone()
         } else {
             source_path.to_path_buf()
         };
@@ -210,9 +275,30 @@ pub fn build(
         chunks.push(aicx_retrieve::ChunkRef {
             id: format!("{}:{}", entry.agent, entry.session_id),
             source_path: indexed_path.display().to_string(),
-            text: extract,
+            text: extract.clone(),
             metadata,
         });
+
+        if cache_extracts {
+            let rel = extract_path
+                .strip_prefix(aicx_home)
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|_| extract_path.clone());
+            next_state.sessions.insert(
+                session_key,
+                SessionParseRecord {
+                    source_path: entry.source_path.clone(),
+                    extract_relpath: rel.to_string_lossy().replace('\\', "/"),
+                    extract_sha256: sha256_hex(extract.as_bytes()),
+                    raw_frames: raw_count,
+                    signal_frames: signal_count,
+                    filtered_frames: filtered_count,
+                    project: entry.project.clone(),
+                    date: entry.date.clone().or(Some(date)),
+                    cwd: entry.cwd.clone(),
+                },
+            );
+        }
     }
 
     if chunks.is_empty() {
@@ -227,6 +313,11 @@ pub fn build(
     } else {
         let manifest =
             crate::vector_index::publish_source_lexical_generation(&chunks, &source_fingerprint)?;
+        // Persist parse state only after a successful publish so a killed build
+        // cannot claim sessions are current when CURRENT never flipped.
+        if cache_extracts && project_filters.is_empty() {
+            write_parse_state(aicx_home, &next_state)?;
+        }
         Some(
             crate::vector_index::hybrid_manifest_path(None)?
                 .display()
@@ -239,6 +330,7 @@ pub fn build(
         catalog_path: catalog_path.display().to_string(),
         sources_total: selected.len(),
         sources_parsed,
+        sources_reused,
         sources_skipped,
         raw_frames,
         signal_frames,
@@ -562,6 +654,119 @@ fn project_selected(project: Option<&str>, filters: &[String]) -> bool {
         })
 }
 
+fn session_state_key(agent: &str, session_id: &str) -> String {
+    format!("{agent}:{session_id}")
+}
+
+fn parse_state_path(aicx_home: &Path) -> PathBuf {
+    aicx_home.join(PARSE_STATE_RELPATH)
+}
+
+fn load_parse_state(aicx_home: &Path) -> SourceParseState {
+    let path = parse_state_path(aicx_home);
+    if !path.is_file() {
+        return SourceParseState::default();
+    }
+    let Ok(raw) = crate::source_path::read_under_aicx_home(aicx_home, &path) else {
+        return SourceParseState::default();
+    };
+    let Ok(state) = serde_json::from_str::<SourceParseState>(&raw) else {
+        return SourceParseState::default();
+    };
+    if state.schema != PARSE_STATE_SCHEMA || state.signal_filter_version != SIGNAL_FILTER_VERSION {
+        return SourceParseState::default();
+    }
+    state
+}
+
+fn write_parse_state(aicx_home: &Path, state: &SourceParseState) -> Result<()> {
+    let path = parse_state_path(aicx_home);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create parse-state dir {}", parent.display()))?;
+    }
+    let body = serde_json::to_vec_pretty(state).context("serialize source parse state")?;
+    let write_path = crate::sanitize::validate_write_path(&path)
+        .with_context(|| format!("validate parse-state path {}", path.display()))?;
+    let tmp = write_path.with_extension("json.tmp");
+    let tmp_write = crate::sanitize::validate_write_path(&tmp)
+        .with_context(|| format!("validate parse-state tmp {}", tmp.display()))?;
+    fs::write(&tmp_write, body)
+        .with_context(|| format!("write parse-state tmp {}", tmp_write.display()))?;
+    fs::rename(&tmp_write, &write_path).with_context(|| {
+        format!(
+            "publish parse-state {} -> {}",
+            tmp_write.display(),
+            write_path.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hex::encode(hasher.finalize())
+}
+
+fn try_reuse_cached_extract(
+    aicx_home: &Path,
+    entry: &CatalogEntry,
+    prior: &SourceParseState,
+    session_key: &str,
+) -> Option<aicx_retrieve::ChunkRef> {
+    if prior.signal_filter_version != SIGNAL_FILTER_VERSION {
+        return None;
+    }
+    let record = prior.sessions.get(session_key)?;
+    if record.source_path != entry.source_path {
+        return None;
+    }
+    let extract_path = aicx_home.join(&record.extract_relpath);
+    let body = crate::source_path::read_under_aicx_home(aicx_home, &extract_path).ok()?;
+    if sha256_hex(body.as_bytes()) != record.extract_sha256 {
+        return None;
+    }
+    if body.trim().is_empty() {
+        return None;
+    }
+    let project = entry
+        .project
+        .clone()
+        .or_else(|| record.project.clone())
+        .unwrap_or_else(|| "_unknown".to_string());
+    let date = entry
+        .date
+        .clone()
+        .or_else(|| record.date.clone())
+        .unwrap_or_default();
+    let preview_lines: Vec<String> = body
+        .lines()
+        .filter(|line| !line.trim().is_empty() && !line.starts_with('#'))
+        .take(6)
+        .map(str::to_string)
+        .collect();
+    let metadata = serde_json::json!({
+        "source_path": extract_path.to_string_lossy(),
+        "project": project,
+        "agent": entry.agent,
+        "date": date,
+        "kind": "conversations",
+        "session_id": entry.session_id,
+        "frame_kind": "conversation",
+        "cwd": entry.cwd.clone().or_else(|| record.cwd.clone()),
+        "source_catalog_path": entry.source_path,
+        "preview_lines": preview_lines,
+        "incremental_reuse": true,
+    });
+    Some(aicx_retrieve::ChunkRef {
+        id: format!("{}:{}", entry.agent, entry.session_id),
+        source_path: extract_path.display().to_string(),
+        text: body,
+        metadata,
+    })
+}
+
 fn source_fingerprint(
     aicx_home: &Path,
     catalog_path: &Path,
@@ -711,5 +916,72 @@ mod tests {
         // across filter generations without meaning to).
         assert!(!SIGNAL_FILTER_VERSION.is_empty());
         assert!(SIGNAL_FILTER_VERSION.starts_with("signal-v"));
+    }
+
+    #[test]
+    fn parse_state_reuse_requires_matching_source_path_and_extract_hash() {
+        let root = std::env::temp_dir().join(format!(
+            "aicx-source-index-reuse-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("extracts/claude")).unwrap();
+        let extract_rel = "extracts/claude/session_conversation.md";
+        let extract_path = root.join(extract_rel);
+        let body = "# claude session\n\nuser: hello routing\nassistant: arrows vc-frame landed\n";
+        fs::write(&extract_path, body).unwrap();
+
+        let entry = CatalogEntry {
+            schema: crate::catalog::CATALOG_SCHEMA.to_string(),
+            session_id: "session".to_string(),
+            agent: "claude".to_string(),
+            project: Some("vetcoders/vibecrafted".to_string()),
+            date: Some("2026-07-22".to_string()),
+            cwd: Some("/tmp/work".to_string()),
+            source_path: "/Users/x/.claude/projects/x/session.jsonl".to_string(),
+            title: Some("routing".to_string()),
+            machine: None,
+            logical_session_id: None,
+        };
+        let mut prior = SourceParseState {
+            schema: PARSE_STATE_SCHEMA.to_string(),
+            signal_filter_version: SIGNAL_FILTER_VERSION.to_string(),
+            sessions: BTreeMap::new(),
+        };
+        prior.sessions.insert(
+            session_state_key("claude", "session"),
+            SessionParseRecord {
+                source_path: entry.source_path.clone(),
+                extract_relpath: extract_rel.to_string(),
+                extract_sha256: sha256_hex(body.as_bytes()),
+                raw_frames: 4,
+                signal_frames: 2,
+                filtered_frames: 2,
+                project: entry.project.clone(),
+                date: entry.date.clone(),
+                cwd: entry.cwd.clone(),
+            },
+        );
+
+        let key = session_state_key("claude", "session");
+        let reused = try_reuse_cached_extract(&root, &entry, &prior, &key)
+            .expect("matching source+hash must reuse");
+        assert!(reused.text.contains("arrows vc-frame"));
+        assert_eq!(reused.id, "claude:session");
+
+        // Source path drift invalidates reuse.
+        let mut drifted = entry.clone();
+        drifted.source_path = "/elsewhere/session.jsonl".to_string();
+        assert!(try_reuse_cached_extract(&root, &drifted, &prior, &key).is_none());
+
+        // Corrupt extract bytes invalidate reuse.
+        fs::write(&extract_path, "tampered").unwrap();
+        assert!(try_reuse_cached_extract(&root, &entry, &prior, &key).is_none());
+
+        let _ = fs::remove_dir_all(&root);
     }
 }
