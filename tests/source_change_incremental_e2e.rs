@@ -246,3 +246,67 @@ fn source_append_invalidates_incremental_and_indexes_new_token() {
 
     let _ = fs::remove_dir_all(&root);
 }
+
+/// Live-fingerprint path: append without catalog rebuild must still reparse
+/// and surface the new token. Catalog lag must not hide source-change.
+#[test]
+fn source_append_without_catalog_rebuild_still_indexes_token() {
+    let root = unique_root("live-only");
+    let home = root.join("home");
+    let source_path = seed_codex_session(&home);
+
+    let catalog1 = run_aicx(&home, &["catalog", "rebuild", "--json"]);
+    assert_success(&catalog1, "catalog rebuild initial");
+    let index1 = run_aicx(
+        &home,
+        &["index", "--json", "--full-rescan", "--cache-extracts"],
+    );
+    assert_success(&index1, "index initial publish");
+
+    // Append only — do NOT rebuild catalog (stale catalog fingerprints).
+    const LIVE_TOKEN: &str = "LIVE_FP_NO_CATALOG_REBUILD_9e2a1b40_marble_l2";
+    append_codex_user_frame(&source_path, LIVE_TOKEN);
+
+    let index2 = run_aicx(&home, &["index", "--json", "--cache-extracts"]);
+    assert_success(&index2, "index after live append without catalog rebuild");
+    let rep2 = parse_json(&index2);
+    assert_eq!(
+        rep2["unchanged"].as_bool(),
+        Some(false),
+        "live append must not short-circuit: {rep2}"
+    );
+    assert_eq!(
+        rep2["sources_parsed"].as_u64(),
+        Some(1),
+        "exactly the changed source must reparse: {rep2}"
+    );
+
+    let search = run_aicx(
+        &home,
+        &[
+            "search", LIVE_TOKEN, "--json", "--limit", "5", "--hours", "0",
+        ],
+    );
+    assert_success(&search, "search live-only token");
+    assert!(
+        parse_json(&search).to_string().contains(LIVE_TOKEN),
+        "token from live-only append must be searchable"
+    );
+
+    // Second pass with no further append must short-circuit on live digest.
+    let noop = run_aicx(&home, &["index", "--json", "--cache-extracts"]);
+    assert_success(&noop, "index no-op after live reparse");
+    let noop_rep = parse_json(&noop);
+    assert_eq!(
+        noop_rep["unchanged"].as_bool(),
+        Some(true),
+        "no-op after live reparse: {noop_rep}"
+    );
+
+    println!(
+        "live-only-ok after_parsed={} noop_unchanged=true token_hit=true",
+        rep2["sources_parsed"]
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}

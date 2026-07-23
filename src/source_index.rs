@@ -126,17 +126,18 @@ pub fn build(
         .collect();
     let user_home = crate::os_user_home().unwrap_or_else(|| aicx_home.to_path_buf());
     let source_allow = crate::source_path::SourceAllowlist::for_operator(&user_home, aicx_home);
-    let source_fingerprint = source_fingerprint(aicx_home, &catalog_path, &selected)?;
+    // Digest includes LIVE size+mtime so appends without catalog rebuild still
+    // move the generation fingerprint (source-change incremental).
+    let source_fingerprint =
+        source_fingerprint(aicx_home, &catalog_path, &selected, &source_allow)?;
     // Incremental short-circuit applies to both publish and dry-run. A matching
-    // catalog+fingerprint digest means CURRENT already reflects this snapshot —
+    // live+catalog digest means CURRENT already reflects this snapshot —
     // re-parsing ~10k sources on every `index --dry-run` recreated the mill
     // latency the extracts-store cut was meant to kill. Use `--full-rescan` to
-    // force a walk. Live source drift (append without catalog rebuild) also
-    // skips the short-circuit so recent frames cannot stay invisible forever.
-    let live_matches_catalog = selected_sources_match_live_fingerprints(&selected, &source_allow);
+    // force a walk. Live source drift (append without catalog rebuild) moves
+    // the digest so recent frames cannot stay invisible forever.
     if !full_rescan
         && project_filters.is_empty()
-        && live_matches_catalog
         && crate::vector_index::source_lexical_generation_matches(&source_fingerprint)?
     {
         return Ok(SourceIndexReport {
@@ -298,7 +299,12 @@ pub fn build(
                 .strip_prefix(aicx_home)
                 .map(|p| p.to_path_buf())
                 .unwrap_or_else(|_| extract_path.clone());
-            let (source_len, source_mtime_ns) = resolve_entry_fingerprint(entry, &source_path);
+            // Always stamp LIVE stats into the parse ledger so reuse survives
+            // catalog lag (append without catalog rebuild still reuses later
+            // once CURRENT has the new extract).
+            let (source_len, source_mtime_ns) =
+                crate::catalog::live_source_fingerprint(&source_path)
+                    .unwrap_or_else(|| resolve_entry_fingerprint(entry, &source_path));
             next_state.sessions.insert(
                 session_key,
                 SessionParseRecord {
@@ -740,21 +746,23 @@ fn try_reuse_cached_extract(
     if record.source_path != entry.source_path {
         return None;
     }
-    // Catalog fingerprint (size + mtime) must still match the parse ledger.
     // Zeroed legacy records (pre-fingerprint schema) never reuse.
     if record.source_len == 0 || record.source_mtime_ns == 0 {
         return None;
     }
-    if entry.source_len != Some(record.source_len)
-        || entry.source_mtime_ns != Some(record.source_mtime_ns)
-    {
-        return None;
-    }
-    // Live source must also match — catches append without catalog rebuild
-    // and protects against stale catalog rows that never re-statted.
+    // LIVE source fingerprint is the reuse gate. Catalog-embedded size/mtime
+    // lag until rebuild; requiring them to match the ledger forced full
+    // reparse after a source-change index that already stamped live stats.
     if let Ok(live_path) = source_allow.resolve_file(entry.source_path.as_str()) {
         let (live_len, live_mtime) = crate::catalog::live_source_fingerprint(&live_path)?;
         if live_len != record.source_len || live_mtime != record.source_mtime_ns {
+            return None;
+        }
+    } else {
+        // Unreadable path: fall back to catalog-admitted fields only.
+        if entry.source_len != Some(record.source_len)
+            || entry.source_mtime_ns != Some(record.source_mtime_ns)
+        {
             return None;
         }
     }
@@ -807,23 +815,23 @@ fn source_fingerprint(
     aicx_home: &Path,
     catalog_path: &Path,
     entries: &[CatalogEntry],
+    source_allow: &crate::source_path::SourceAllowlist,
 ) -> Result<String> {
     let mut hasher = Sha256::new();
     // Filter generation first so a catalog-identical CURRENT cannot hide a
     // pre-filter corpus after signal-body rules change.
     hasher.update(SIGNAL_FILTER_VERSION.as_bytes());
     hasher.update([0]);
-    // Catalog bytes already embed per-row source_len + source_mtime_ns after
-    // rebuild. That is the admission boundary: appends change those fields
-    // without inventing a new session id, so the generation digest moves.
-    // Live re-stat is handled separately by selected_sources_match_live_*
-    // so mid-build vibecrafted growth does not thrash a just-published run
-    // unless the operator re-admits via catalog rebuild (or live drift is
-    // detected before the short-circuit).
+    // Catalog membership (session ids + project attribution) is part of the
+    // digest so new rows always admit a rebuild even when live stats match.
     hasher.update(
         crate::source_path::read_bytes_under_aicx_home(aicx_home, catalog_path)
             .with_context(|| format!("read catalog {}", catalog_path.display()))?,
     );
+    // Per-source live size+mtime is the change detector. Catalog-embedded
+    // fingerprints lag until rebuild; hashing LIVE stats means an append to
+    // an existing JSONL moves the generation digest without inventing a new
+    // session id (audit P0: source-CHANGE incremental, not only session-ADD).
     for entry in entries {
         hasher.update(entry.agent.as_bytes());
         hasher.update([0]);
@@ -831,38 +839,28 @@ fn source_fingerprint(
         hasher.update([0]);
         hasher.update(entry.source_path.as_bytes());
         hasher.update([0]);
-        hasher.update(entry.source_len.unwrap_or(0).to_le_bytes());
-        hasher.update(entry.source_mtime_ns.unwrap_or(0).to_le_bytes());
+        let (len, mtime) = live_or_catalog_fingerprint(entry, source_allow);
+        hasher.update(len.to_le_bytes());
+        hasher.update(mtime.to_le_bytes());
     }
     Ok(hex::encode(hasher.finalize()))
 }
 
-/// True when every selected catalog row still matches the live file's size+mtime.
-///
-/// Missing catalog fingerprints force a reparse (legacy rows). Unreadable
-/// sources are treated as non-matching so the short-circuit cannot hide drift.
-fn selected_sources_match_live_fingerprints(
-    entries: &[CatalogEntry],
+/// Prefer live size+mtime; fall back to catalog-admitted values when the file
+/// is temporarily unreadable (quarantine races, transient IO).
+fn live_or_catalog_fingerprint(
+    entry: &CatalogEntry,
     source_allow: &crate::source_path::SourceAllowlist,
-) -> bool {
-    for entry in entries {
-        let Some(catalog_len) = entry.source_len else {
-            return false;
-        };
-        let Some(catalog_mtime) = entry.source_mtime_ns else {
-            return false;
-        };
-        let Ok(path) = source_allow.resolve_file(entry.source_path.as_str()) else {
-            return false;
-        };
-        let Some((live_len, live_mtime)) = crate::catalog::live_source_fingerprint(&path) else {
-            return false;
-        };
-        if live_len != catalog_len || live_mtime != catalog_mtime {
-            return false;
+) -> (u64, u64) {
+    if let Ok(path) = source_allow.resolve_file(entry.source_path.as_str()) {
+        if let Some(live) = crate::catalog::live_source_fingerprint(&path) {
+            return live;
         }
     }
-    true
+    (
+        entry.source_len.unwrap_or(0),
+        entry.source_mtime_ns.unwrap_or(0),
+    )
 }
 
 fn resolve_entry_fingerprint(entry: &CatalogEntry, source_path: &Path) -> (u64, u64) {
@@ -1070,15 +1068,38 @@ mod tests {
         drifted.source_path = "/elsewhere/session.jsonl".to_string();
         assert!(try_reuse_cached_extract(&root, &drifted, &prior, &key, &allow).is_none());
 
-        // Source fingerprint drift (append) invalidates reuse even with same path.
-        let mut grown = entry.clone();
-        grown.source_len = Some(source_len + 64);
-        assert!(try_reuse_cached_extract(&root, &grown, &prior, &key, &allow).is_none());
+        // Catalog-only size drift must NOT invalidate when live file is unchanged
+        // (catalog lag after a live-stamped reparse is expected).
+        let mut catalog_lag = entry.clone();
+        catalog_lag.source_len = Some(source_len + 64);
+        assert!(
+            try_reuse_cached_extract(&root, &catalog_lag, &prior, &key, &allow).is_some(),
+            "stale catalog size alone must not force reparse when live matches"
+        );
+
+        // Live source growth (append) invalidates reuse.
+        fs::write(
+            &source_path,
+            "{\"type\":\"user\",\"text\":\"hello\"}\n{\"type\":\"user\",\"text\":\"more\"}\n",
+        )
+        .unwrap();
+        // Coarse FS mtime: touch content size always changes here.
+        assert!(
+            try_reuse_cached_extract(&root, &entry, &prior, &key, &allow).is_none(),
+            "live append must invalidate reuse"
+        );
+        // Restore live bytes so later checks use the original fingerprint.
+        fs::write(&source_path, "{\"type\":\"user\",\"text\":\"hello\"}\n").unwrap();
+        // mtime may have moved; refresh ledger to match restored content.
+        let (restored_len, restored_mtime) =
+            crate::catalog::live_source_fingerprint(&source_path).expect("restored fp");
+        prior.sessions.get_mut(&key).unwrap().source_len = restored_len;
+        prior.sessions.get_mut(&key).unwrap().source_mtime_ns = restored_mtime;
 
         // Zeroed legacy records never reuse (forces reparse after upgrade).
         prior.sessions.get_mut(&key).unwrap().source_len = 0;
         assert!(try_reuse_cached_extract(&root, &entry, &prior, &key, &allow).is_none());
-        prior.sessions.get_mut(&key).unwrap().source_len = source_len;
+        prior.sessions.get_mut(&key).unwrap().source_len = restored_len;
 
         // Corrupt extract bytes invalidate reuse.
         fs::write(&extract_path, "tampered").unwrap();
