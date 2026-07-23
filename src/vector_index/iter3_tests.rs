@@ -707,7 +707,7 @@ fn tempdir_for_test() -> std::path::PathBuf {
 }
 
 /// RAII guard that scopes `AICX_HOME` to a test tempdir so that paths
-/// derived from `store::store_base_dir()` (lock paths, store paths) stay
+/// derived from `aicx_home::ensure()` (lock paths, index paths) stay
 /// isolated from any concurrently running aicx process on the host.
 ///
 /// On drop, restores the previous value of `AICX_HOME` (or unsets it).

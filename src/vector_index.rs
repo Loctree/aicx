@@ -1,7 +1,7 @@
 //! Vector index builder for `aicx` semantic search.
 //!
-//! Goal: take the canonical store ([`crate::legacy_archive`]) markdown chunks and
-//! materialize a vector representation per chunk so `aicx search` can rank
+//! Goal: take readable legacy archive chunks and materialize a vector
+//! representation per chunk so compatibility search paths can rank
 //! by cosine similarity rather than line-overlap fuzzy. The index is
 //! configuration-driven so the same command works for the in-process
 //! native GGUF embedder ([`aicx_embeddings`]) and the cloud HTTP embed
@@ -114,7 +114,7 @@ impl<R: BufRead> Iterator for CappedIndexLines<R> {
 /// human stderr output and the `--json` machine output.
 #[derive(Debug, Clone, Serialize)]
 pub struct IndexStats {
-    /// Total chunk files discovered in the canonical store after the
+    /// Total chunk files discovered in the legacy card archive after the
     /// `project` filter has been applied.
     pub chunks_total: usize,
     /// Number of chunks actually fed to the embedder. Capped by `sample`
@@ -381,7 +381,7 @@ impl IndexStats {
     }
 }
 
-/// Sample the canonical store, embed up to `sample` chunks, return stats.
+/// Sample the legacy card archive, embed up to `sample` chunks, return stats.
 ///
 /// `sample == 0` means "embed every discovered chunk" (the operator
 /// signals they want a full ETA, not a quick smoke test).
@@ -403,7 +403,7 @@ pub fn dry_run_index(project: Option<&str>, sample: usize) -> Result<IndexStats>
         resume_tmp_path: None,
     };
 
-    let root = crate::legacy_archive::store_base_dir()?;
+    let root = crate::aicx_home::ensure()?;
     let files = live_index_files(&root, project)?;
     stats.chunks_total = files.len();
 
@@ -507,14 +507,13 @@ const CORRUPT_WARN_HEAD: usize = 5;
 /// project bucket. When `project == None`, returns the cross-project
 /// `_all` bucket path so an operator can index every chunk in one file.
 pub fn index_path(project: Option<&str>) -> Result<PathBuf> {
-    let base = crate::legacy_archive::store_base_dir()?;
+    let base = crate::aicx_home::ensure()?;
     Ok(index_path_for(&base, project))
 }
 
 fn index_path_for(base: &Path, project: Option<&str>) -> PathBuf {
-    // `store_base_dir()` resolves to the AICX home (`~/.aicx`), not the
-    // corpus store (`~/.aicx/store`). Keep the vector index inside the
-    // operator-owned AICX home so build, status, and search all agree.
+    // Keep the vector index inside the operator-owned AICX home so build,
+    // status, and search all agree.
     let index_root = base.join(INDEX_DIR_NAME);
     index_root
         .join(index_bucket_name(project))
@@ -800,7 +799,7 @@ fn live_index_files(
 
 /// Build (or rebuild) the persistent NDJSON-backed index for `project`.
 ///
-/// Iter 3 surface: scans the canonical store, embeds every chunk via the
+/// Iter 3 compatibility surface: scans the legacy card archive, embeds every chunk via the
 /// configured embedder ([`crate::embedder::EmbeddingEngine`]), and writes
 /// a single NDJSON file per project bucket. First line is an
 /// [`IndexHeader`] for schema/model metadata; subsequent lines are
@@ -1028,12 +1027,12 @@ pub fn write_index_with_options(
 
     let _lock = crate::locks::acquire_exclusive(crate::locks::lance_lock_path()?)?;
 
-    let root = crate::legacy_archive::store_base_dir()?;
+    let root = crate::aicx_home::ensure()?;
     let all_files = live_index_files(&root, project)?;
     stats.chunks_total = all_files.len();
 
     if all_files.is_empty() {
-        stats.fallback_reason = Some("no chunks found in canonical store".to_string());
+        stats.fallback_reason = Some("no chunks found in legacy card archive".to_string());
         stats.elapsed_ms = started.elapsed().as_millis();
         return Ok(stats);
     }
@@ -2818,7 +2817,7 @@ fn enforce_index_integrity(path: &Path, scan: &ScanResult) -> Result<()> {
     let rate = scan.corrupt_count as f64 / scan.total_data_lines.max(1) as f64;
     if scan.total_data_lines >= CORRUPT_MIN_SAMPLE && rate > CORRUPT_RATE_FAIL_FAST {
         return Err(anyhow::anyhow!(
-            "index integrity failure in {}: {} of {} data lines ({:.1}%) failed to parse — exceeds {:.0}% threshold. Recovery: `aicx index --full-rescan --project <name>` to rebuild from canonical store.",
+            "index integrity failure in {}: {} of {} data lines ({:.1}%) failed to parse — exceeds {:.0}% threshold. Recovery: `aicx index --full-rescan --project <name>` to rebuild from catalog-backed extracts.",
             path.display(),
             scan.corrupt_count,
             scan.total_data_lines,

@@ -100,9 +100,7 @@ pub fn index_lock_path() -> Result<PathBuf> {
 }
 
 fn resource_lock_path(name: &str) -> Result<PathBuf> {
-    Ok(crate::legacy_archive::store_base_dir()?
-        .join("locks")
-        .join(name))
+    Ok(crate::aicx_home::ensure()?.join("locks").join(name))
 }
 
 fn acquire_with_timeout(path: &Path, mode: LockMode, timeout: Duration) -> Result<LockHandle> {

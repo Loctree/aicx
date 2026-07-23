@@ -1,9 +1,9 @@
 //! BM25 + LanceDB steer index for fast session retrieval.
 //!
-//! The steer index is a dual-layer search structure over the canonical store:
-//! a BM25 text index for keyword ranking and a LanceDB vector store for
-//! metadata-filtered recall.  Public functions delegate to the store base
-//! directory discovered at runtime, keeping callers free of path logic.
+//! The steer index is a dual-layer search structure over catalog-backed
+//! extracts: a BM25 text index for keyword ranking and a LanceDB vector index
+//! for metadata-filtered recall. Public functions delegate AICX-home resolution
+//! to the runtime owner, keeping callers free of path logic.
 //!
 //! Vibecrafted with AI Agents by Vetcoders (c)2026 Vetcoders
 
@@ -70,7 +70,7 @@ pub async fn sync_steer_index(new_files: &[&PathBuf]) -> Result<()> {
             return Ok(());
         }
 
-        let base = crate::legacy_archive::store_base_dir()?;
+        let base = crate::aicx_home::ensure()?;
         let _lock = crate::locks::acquire_exclusive(crate::locks::steer_lock_path()?)?;
         ensure_steer_index_compatible_for_write_at(&base).await?;
         sync_steer_index_at(&base, new_files).await
@@ -99,7 +99,7 @@ pub async fn sync_steer_index_with_progress(
             return Ok(());
         }
 
-        let base = crate::legacy_archive::store_base_dir()?;
+        let base = crate::aicx_home::ensure()?;
         let _lock = crate::locks::acquire_exclusive(crate::locks::steer_lock_path()?)?;
         ensure_steer_index_compatible_for_write_at(&base).await?;
         sync_steer_index_at_with_reporter(&base, new_files, reporter, failures).await
@@ -114,7 +114,7 @@ pub async fn query_steer_index_count() -> Result<usize> {
 
     #[cfg(feature = "lance")]
     {
-        let base = crate::legacy_archive::store_base_dir()?;
+        let base = crate::aicx_home::ensure()?;
         let _lock = crate::locks::acquire_shared(crate::locks::steer_lock_path()?)?;
         call_steer_read_lock_hook();
         if let Err(err) = ensure_steer_index_compatible_at(&base).await {
@@ -152,7 +152,7 @@ pub async fn rebuild_steer_index_if_needed() -> Result<()> {
 
     #[cfg(feature = "lance")]
     {
-        let base = crate::legacy_archive::store_base_dir()?;
+        let base = crate::aicx_home::ensure()?;
         try_rebuild_steer_index_if_needed_at(&base).await
     }
 }
@@ -168,7 +168,7 @@ pub async fn search_steer_index(
 
     #[cfg(feature = "lance")]
     {
-        let base = crate::legacy_archive::store_base_dir()?;
+        let base = crate::aicx_home::ensure()?;
         let _lock = crate::locks::acquire_shared(crate::locks::steer_lock_path()?)?;
         call_steer_read_lock_hook();
         if let Err(err) = ensure_steer_index_compatible_at(&base).await {

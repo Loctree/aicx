@@ -220,7 +220,7 @@ impl Default for StateManager {
 /// No env reads, no filesystem creation. Used in tests to assert the
 /// `<home>/state.json` invariant without depending on `$AICX_HOME` or
 /// `$HOME`. The public [`StateManager::state_path`] wraps this with
-/// the env-resolving, side-effecting [`crate::legacy_archive::store_base_dir`].
+/// the env-resolving, side-effecting [`crate::aicx_home::ensure`].
 pub(crate) fn state_path_for(home: &Path) -> PathBuf {
     home.join("state.json")
 }
@@ -228,7 +228,7 @@ pub(crate) fn state_path_for(home: &Path) -> PathBuf {
 impl StateManager {
     /// Returns the path to the state file: `<base>/state.json`
     fn state_path() -> Result<PathBuf> {
-        Ok(state_path_for(&crate::legacy_archive::store_base_dir()?))
+        Ok(state_path_for(&crate::aicx_home::ensure()?))
     }
 
     /// Load state from disk. Creates a fresh default state only when the file
