@@ -157,16 +157,30 @@ fn ensure_aicx_binary_exists() -> PathBuf {
 }
 
 fn run_aicx(home: &Path, args: &[&str]) -> Output {
+    // Legacy mill contracts still seed cards under a temp HOME. Production
+    // binaries leave AICX_ALLOW_CARD_MILL unset (mill silent).
+    run_aicx_with_card_mill(home, args, true)
+}
+
+fn run_aicx_card_mill_disabled(home: &Path, args: &[&str]) -> Output {
+    run_aicx_with_card_mill(home, args, false)
+}
+
+fn run_aicx_with_card_mill(home: &Path, args: &[&str], allow_card_mill: bool) -> Output {
     fs::create_dir_all(home).expect("create temp HOME");
-    Command::new(ensure_aicx_binary_exists())
-        .args(args)
+    let mut cmd = Command::new(ensure_aicx_binary_exists());
+    cmd.args(args)
         .env("HOME", home)
         // Windows resolves the home dir from USERPROFILE, not HOME (dirs::home_dir).
         .env("USERPROFILE", home)
         .env("AICX_ALLOW_TMP", "1")
-        .env_remove("AICX_HOME")
-        .output()
-        .expect("run aicx")
+        .env_remove("AICX_HOME");
+    if allow_card_mill {
+        cmd.env("AICX_ALLOW_CARD_MILL", "1");
+    } else {
+        cmd.env_remove("AICX_ALLOW_CARD_MILL");
+    }
+    cmd.output().expect("run aicx")
 }
 
 fn assert_success(output: &Output) {
@@ -540,6 +554,58 @@ fn retired_store_subcommand_is_rejected() {
     assert!(
         !home.join(".aicx").join("store").exists(),
         "rejected command must not recreate the retired card store"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn default_cli_extraction_does_not_grow_store_without_card_mill_flag() {
+    // Dual-body silence: without AICX_ALLOW_CARD_MILL, agent extraction must
+    // not create ~/.aicx/store card trees (catalog + extracts are identity).
+    let root = unique_test_dir("card-mill-silent");
+    let home = root.join("home");
+    let repo_root = home.join("hosted").join("Vetcoders").join("aicx");
+    let history = home
+        .join(".codex")
+        .join("sessions")
+        .join("2026")
+        .join("07")
+        .join("23")
+        .join("rollout-silent.jsonl");
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time before unix epoch")
+        .as_secs() as i64;
+
+    fs::create_dir_all(repo_root.join(".git")).expect("create repo root");
+    write_codex_history(
+        &history,
+        "silent-mill-sess",
+        Some(&repo_root),
+        &[
+            ("user", now - 60, "Do not grow the card mill."),
+            ("assistant", now - 50, "Catalog and extracts only."),
+        ],
+    );
+
+    let output = run_aicx_card_mill_disabled(&home, &["codex", "-H", "24", "--emit", "json"]);
+    assert_success(&output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Card mill retired"),
+        "operator must see explicit dual-body silence; stderr was:\n{stderr}"
+    );
+    assert!(
+        !home.join(".aicx").join("store").exists(),
+        "default CLI extraction must not create ~/.aicx/store"
+    );
+
+    let payload = parse_stdout_json(&output);
+    let store_paths = json_paths(&payload, "store_paths");
+    assert!(
+        store_paths.is_empty(),
+        "store_paths must be empty when card mill is disabled, got {store_paths:?}"
     );
 
     let _ = fs::remove_dir_all(&root);

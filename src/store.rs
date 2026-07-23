@@ -750,6 +750,30 @@ fn chunk_line_has_signal(line: &str) -> bool {
     true
 }
 
+/// Whether the retired per-frame card mill may write under a store root.
+///
+/// Default is **off** for the operator binary. Identity is catalog, extracts,
+/// and the source-driven index. The mill remains as library code for unit tests
+/// and explicit salvage (`migrate`, `AICX_ALLOW_CARD_MILL=1`).
+///
+/// * Unit tests (`cfg(test)`) keep the mill enabled so library contracts remain
+///   executable without env ceremony.
+/// * Integration tests that still seed cards via the CLI binary must set
+///   `AICX_ALLOW_CARD_MILL=1`.
+/// * Production operators never set that env; dual-body growth stops.
+pub fn card_mill_writes_enabled() -> bool {
+    if cfg!(test) {
+        return true;
+    }
+    match std::env::var("AICX_ALLOW_CARD_MILL") {
+        Ok(value) => {
+            let value = value.trim();
+            value == "1" || value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("yes")
+        }
+        Err(_) => false,
+    }
+}
+
 pub fn store_semantic_segments(
     entries: &[TimelineEntry],
     chunker_config: &ChunkerConfig,
@@ -784,12 +808,64 @@ where
     store_segments_at(base, &segments, chunker_config, progress)
 }
 
+/// Force a card-mill write for explicit salvage/migration only.
+///
+/// Prefer catalog rebuild + extract + index. This bypasses
+/// [`card_mill_writes_enabled`] so `aicx migrate` can still rebuild a
+/// transitional tree without reopening the default operator path.
+pub fn store_semantic_segments_at_forced<F>(
+    base: &Path,
+    entries: &[TimelineEntry],
+    chunker_config: &ChunkerConfig,
+    progress: F,
+) -> Result<StoreWriteSummary>
+where
+    F: FnMut(usize, usize),
+{
+    if entries.is_empty() {
+        return Ok(StoreWriteSummary::default());
+    }
+    let segments = semantic_segments(entries);
+    store_segments_at_forced(base, &segments, chunker_config, progress)
+}
+
 /// Write pre-computed [`SemanticSegment`]s to the canonical store. This
 /// is the underlying primitive — callers that already paid for
 /// segmentation (e.g. the CLI's phased pipeline that emits a
 /// `segment`-phase heartbeat before the first `.md` write) reuse those
 /// segments here instead of re-segmenting from raw entries.
+///
+/// When the card mill is disabled (default), returns an empty summary and
+/// creates no directories — dual-body silence for catalog-era operators.
 pub fn store_segments_at<F>(
+    base: &Path,
+    segments: &[SemanticSegment],
+    chunker_config: &ChunkerConfig,
+    progress: F,
+) -> Result<StoreWriteSummary>
+where
+    F: FnMut(usize, usize),
+{
+    if !card_mill_writes_enabled() {
+        return Ok(StoreWriteSummary::default());
+    }
+    store_segments_at_impl(base, segments, chunker_config, progress)
+}
+
+/// Explicit card-mill write (migration/salvage). See [`store_segments_at`].
+pub fn store_segments_at_forced<F>(
+    base: &Path,
+    segments: &[SemanticSegment],
+    chunker_config: &ChunkerConfig,
+    progress: F,
+) -> Result<StoreWriteSummary>
+where
+    F: FnMut(usize, usize),
+{
+    store_segments_at_impl(base, segments, chunker_config, progress)
+}
+
+fn store_segments_at_impl<F>(
     base: &Path,
     segments: &[SemanticSegment],
     chunker_config: &ChunkerConfig,

@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use super::{read_store_dir, store_semantic_segments_at};
+use super::{read_store_dir, store_semantic_segments_at_forced};
 use crate::chunker::ChunkerConfig;
 use crate::sanitize;
 use crate::store::atomic_write::atomic_write;
@@ -839,7 +839,11 @@ fn rebuild_source_into_store_impl(
         anyhow::bail!("source produced no timeline entries");
     }
 
-    let summary = store_semantic_segments_at(store_root, &entries, chunker_config, |_, _| {})?;
+    // Migration is explicit salvage into a transitional store tree — force
+    // the card mill so operator migrate still works while the default CLI
+    // path stays dual-body silent.
+    let summary =
+        store_semantic_segments_at_forced(store_root, &entries, chunker_config, |_, _| {})?;
     Ok(summary.written_paths)
 }
 

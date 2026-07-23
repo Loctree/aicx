@@ -6586,66 +6586,81 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
         // Chunk phase — segments were prepared upstream (per-canonical-repo
         // dedup + self_echo). Denominator is segments so `current/total`
         // reflects actual write progress.
-        let segment_count = segments.len();
-        let chunk_phase =
-            aicx::progress::Phase::start(reporter.clone(), "chunk", Some(segment_count as u64));
-        let store_result = store::store_segments_at(
-            &aicx::store::store_base_dir()?,
-            &segments,
-            &chunker_config,
-            |done, _total| chunk_phase.tick(done as u64),
-        );
-        let store_summary = match store_result {
-            Ok(summary) => {
-                let written = summary.written_paths.len() as u64;
-                chunk_phase.finish_ok(format!("{written} chunks"));
-                summary
-            }
-            Err(e) => {
-                let record = chunk_phase.finish_err(&e, aicx::progress::recovery_hint_for("chunk"));
-                failures.record(record);
-                let _ = aicx::progress::render_failure_tail(&failures);
-                return Err(e);
-            }
-        };
-        scope_surface = StoreScopeSurface::from_store_summary(&project, &store_summary);
-        written_empty_body_skipped = store_summary.skipped_empty_body;
-        let newly_written_paths = store_summary.written_paths.clone();
-        all_written_paths.extend(newly_written_paths.iter().cloned());
+        //
+        // Card mill is retired by default (catalog + extracts + index). When
+        // disabled, skip the store write entirely so dual-body file trees do
+        // not re-grow under ~/.aicx/store.
+        if !store::card_mill_writes_enabled() {
+            eprintln!(
+                "  Card mill retired: not writing ~/.aicx/store cards ({} entries kept in memory for reports only).",
+                output_entries.len()
+            );
+            eprintln!(
+                "  Identity path: `aicx catalog rebuild` → `aicx extract` → `aicx index`. Salvage only: AICX_ALLOW_CARD_MILL=1"
+            );
+        } else {
+            let segment_count = segments.len();
+            let chunk_phase =
+                aicx::progress::Phase::start(reporter.clone(), "chunk", Some(segment_count as u64));
+            let store_result = store::store_segments_at(
+                &aicx::store::store_base_dir()?,
+                &segments,
+                &chunker_config,
+                |done, _total| chunk_phase.tick(done as u64),
+            );
+            let store_summary = match store_result {
+                Ok(summary) => {
+                    let written = summary.written_paths.len() as u64;
+                    chunk_phase.finish_ok(format!("{written} chunks"));
+                    summary
+                }
+                Err(e) => {
+                    let record =
+                        chunk_phase.finish_err(&e, aicx::progress::recovery_hint_for("chunk"));
+                    failures.record(record);
+                    let _ = aicx::progress::render_failure_tail(&failures);
+                    return Err(e);
+                }
+            };
+            scope_surface = StoreScopeSurface::from_store_summary(&project, &store_summary);
+            written_empty_body_skipped = store_summary.skipped_empty_body;
+            let newly_written_paths = store_summary.written_paths.clone();
+            all_written_paths.extend(newly_written_paths.iter().cloned());
 
-        // Update fast local metadata index
-        if let Ok(rt) = tokio::runtime::Runtime::new() {
-            let path_refs: Vec<&PathBuf> = newly_written_paths.iter().collect();
-            if let Err(e) = rt.block_on(aicx::steer_index::sync_steer_index_with_progress(
-                &path_refs,
-                reporter.clone(),
-                &failures,
-            )) {
-                eprintln!("⚠ steer index sync failed (search may be stale): {e}");
+            // Update fast local metadata index
+            if let Ok(rt) = tokio::runtime::Runtime::new() {
+                let path_refs: Vec<&PathBuf> = newly_written_paths.iter().collect();
+                if let Err(e) = rt.block_on(aicx::steer_index::sync_steer_index_with_progress(
+                    &path_refs,
+                    reporter.clone(),
+                    &failures,
+                )) {
+                    eprintln!("⚠ steer index sync failed (search may be stale): {e}");
+                }
             }
-        }
 
-        // Summary to stderr (diagnostics)
-        eprintln!(
-            "✓ {} entries → {} chunks",
-            output_entries.len(),
-            all_written_paths.len(),
-        );
-        if written_empty_body_skipped > 0 {
-            eprintln!("  Skipped {written_empty_body_skipped} empty-body chunk(s)");
+            // Summary to stderr (diagnostics)
+            eprintln!(
+                "✓ {} entries → {} chunks",
+                output_entries.len(),
+                all_written_paths.len(),
+            );
+            if written_empty_body_skipped > 0 {
+                eprintln!("  Skipped {written_empty_body_skipped} empty-body chunk(s)");
+            }
+            for (repo, agents_map) in &store_summary.project_summary {
+                let total: usize = agents_map.values().sum();
+                let detail: Vec<String> = agents_map
+                    .iter()
+                    .map(|(a, c)| format!("{}: {}", a, c))
+                    .collect();
+                eprintln!("  {}: {} entries ({})", repo, total, detail.join(", "));
+            }
+            eprintln!(
+                "  Resolved store buckets: {}",
+                render_resolved_store_buckets(&scope_surface)
+            );
         }
-        for (repo, agents_map) in &store_summary.project_summary {
-            let total: usize = agents_map.values().sum();
-            let detail: Vec<String> = agents_map
-                .iter()
-                .map(|(a, c)| format!("{}: {}", a, c))
-                .collect();
-            eprintln!("  {}: {} entries ({})", repo, total, detail.join(", "));
-        }
-        eprintln!(
-            "  Resolved store buckets: {}",
-            render_resolved_store_buckets(&scope_surface)
-        );
     }
 
     // stdout emission (integration-friendly).
@@ -7137,6 +7152,17 @@ fn run_store(args: StoreRunArgs) -> Result<()> {
 
     if post_echo == 0 {
         eprintln!("No entries found.");
+    } else if !store::card_mill_writes_enabled() {
+        // Ingest used to be the card mill. That dual body is retired: keep
+        // watermarks/state accounting below, but never re-grow ~/.aicx/store.
+        stored_count = post_echo;
+        eprintln!(
+            "  Card mill retired: not writing ~/.aicx/store cards ({} entries processed, 0 chunks written).",
+            stored_count
+        );
+        eprintln!(
+            "  Identity path: `aicx catalog rebuild` → `aicx extract` → `aicx index`. Salvage only: AICX_ALLOW_CARD_MILL=1"
+        );
     } else {
         // ──────────────────────────────────────────────────────────────
         // Chunk phase — denominator is segments (not entries), so the
