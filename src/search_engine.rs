@@ -671,7 +671,7 @@ fn try_lexical_search_native(
                 .and_then(serde_json::Value::as_str)
                 .is_some_and(|stored| {
                     stored.eq_ignore_ascii_case(project)
-                        || crate::store::project_filter_matches(
+                        || crate::legacy_archive::project_filter_matches(
                             stored.split_once('/').map(|(o, _)| o).unwrap_or(""),
                             stored.split_once('/').map(|(_, r)| r).unwrap_or(stored),
                             project,

@@ -139,14 +139,14 @@ impl SourceAllowlist {
 /// Convenience: resolve + open using the live operator home + AICX home.
 pub fn open_operator_source(candidate: &Path) -> Result<File> {
     let user_home = crate::os_user_home().context("resolve operator home")?;
-    let aicx_home = crate::store::resolve_aicx_home()?;
+    let aicx_home = crate::legacy_archive::resolve_aicx_home()?;
     SourceAllowlist::for_operator(&user_home, &aicx_home).open_file(candidate)
 }
 
 /// Convenience: resolve a catalog entry source path under the live allowlist.
 pub fn resolve_operator_source(candidate: &Path) -> Result<PathBuf> {
     let user_home = crate::os_user_home().context("resolve operator home")?;
-    let aicx_home = crate::store::resolve_aicx_home()?;
+    let aicx_home = crate::legacy_archive::resolve_aicx_home()?;
     SourceAllowlist::for_operator(&user_home, &aicx_home).resolve_file(candidate)
 }
 

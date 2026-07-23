@@ -5,8 +5,8 @@
 //! conversation Markdown. Loctree owns structural identity; this module joins
 //! distilled card claims to the catalog emitted by `loct anchors`.
 
+use crate::legacy_archive::{canonical_store_dir, read_canonical_projection_at, resolve_aicx_home};
 use crate::rank::{SEMANTIC_INTENT_CANDIDATE_THRESHOLD, intent_candidate_similarity};
-use crate::store::{canonical_store_dir, read_canonical_projection_at, resolve_aicx_home};
 use aicx_parser::engine::{Known, TurnRole};
 use aicx_parser::projections::CanonicalCard;
 use anyhow::{Context, Result, anyhow, bail};
@@ -1565,7 +1565,7 @@ fn atomic_write_json(path: &Path, value: &impl Serialize) -> Result<()> {
 mod tests {
     use super::*;
     #[cfg(unix)]
-    use crate::store::canonical_projection::CANONICAL_PROJECTION_DIRNAME;
+    use crate::legacy_archive::canonical_projection::CANONICAL_PROJECTION_DIRNAME;
     #[cfg(unix)]
     use aicx_parser::engine::{
         AgentKind, BoundaryFlags, ParseStatus, TurnKind, VisibleCompleteness,
@@ -2159,7 +2159,7 @@ mod tests {
             .unwrap();
             card_ids.push(card.id.clone());
         }
-        let manifest = crate::store::CanonicalStoreManifest {
+        let manifest = crate::legacy_archive::CanonicalStoreManifest {
             schema: "aicx.store.manifest.v1".to_owned(),
             card_schema: CANONICAL_CARD_SCHEMA.to_owned(),
             store_revision: format!("sr1:{}", revision_byte.to_string().repeat(64)),

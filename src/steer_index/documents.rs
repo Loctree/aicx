@@ -65,7 +65,7 @@ pub(super) fn add_query_value(terms: &mut Vec<String>, value: Option<&str>) {
 }
 
 fn build_steer_metadata(file: &Path) -> serde_json::Value {
-    let sidecar = crate::store::load_sidecar(file);
+    let sidecar = crate::legacy_archive::load_sidecar(file);
 
     let mut meta = serde_json::Map::new();
     meta.insert(
@@ -171,7 +171,7 @@ pub(super) fn doc_ids(docs: &[ChromaDocument]) -> HashSet<String> {
     docs.iter().map(|doc| doc.id.clone()).collect()
 }
 
-pub(super) fn file_ids(files: &[crate::store::StoredContextFile]) -> HashSet<String> {
+pub(super) fn file_ids(files: &[crate::legacy_archive::StoredContextFile]) -> HashSet<String> {
     files
         .iter()
         .map(|file| chunk_id_for_path(&file.path))
