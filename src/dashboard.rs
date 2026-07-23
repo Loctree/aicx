@@ -132,8 +132,8 @@ fn parse_rfc3339_timestamp(value: &str) -> Option<DateTime<Utc>> {
 /// Configuration for dashboard generation.
 #[derive(Debug, Clone)]
 pub struct DashboardConfig {
-    /// Store root directory (`~/.aicx`).
-    pub store_root: PathBuf,
+    /// AICX home directory (`~/.aicx`).
+    pub aicx_home: PathBuf,
     /// HTML document title.
     pub title: String,
     /// Max characters in per-record preview.
@@ -164,7 +164,7 @@ pub struct DashboardStats {
     pub agents_detected: usize,
     pub malformed_session_files: usize,
     pub ignored_non_date_dirs: usize,
-    pub ignored_non_store_projects: usize,
+    pub ignored_non_archive_projects: usize,
     pub index_loaded: bool,
     pub state_loaded: bool,
     pub fuzzy_index_chars: usize,
@@ -174,7 +174,7 @@ pub struct DashboardStats {
 #[derive(Debug, Clone, Serialize)]
 pub struct DashboardPayload {
     pub generated_at: String,
-    pub store_root: String,
+    pub aicx_home: String,
     pub stats: DashboardStats,
     pub assumptions: Vec<String>,
     pub projects: Vec<String>,
@@ -212,7 +212,7 @@ struct ScanResult {
 
 /// Build a complete HTML dashboard from the read-only legacy archive view.
 pub fn build_dashboard(config: &DashboardConfig) -> Result<DashboardArtifact> {
-    let scan = scan::scan_legacy_archive(&config.store_root, config.preview_chars, &config.scope)?;
+    let scan = scan::scan_legacy_archive(&config.aicx_home, config.preview_chars, &config.scope)?;
     let html = render_dashboard_html(&scan.payload, &config.title)?;
 
     Ok(DashboardArtifact {
@@ -479,7 +479,7 @@ fn render_dashboard_html(payload: &DashboardPayload, title: &str) -> Result<Stri
 "#,
         html_escape(title),
         assets::DASHBOARD_CSS,
-        html_escape(&payload.store_root),
+        html_escape(&payload.aicx_home),
         html_escape(&payload.generated_at),
         payload.stats.total_files,
         payload.stats.total_projects,

@@ -8691,7 +8691,7 @@ fn run_dashboard(args: DashboardRunArgs) -> Result<()> {
     };
 
     let config = DashboardConfig {
-        store_root: root.clone(),
+        aicx_home: root.clone(),
         title: args.title,
         preview_chars: args.preview_chars,
         scope: args.scope,

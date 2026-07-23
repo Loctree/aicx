@@ -200,7 +200,7 @@ pub(super) fn scan_legacy_archive(
 
     let payload = DashboardPayload {
         generated_at: Utc::now().to_rfc3339(),
-        store_root: aicx_home.display().to_string(),
+        aicx_home: aicx_home.display().to_string(),
         stats,
         assumptions,
         projects: projects.into_iter().collect(),

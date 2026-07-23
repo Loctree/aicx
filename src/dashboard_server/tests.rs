@@ -59,7 +59,7 @@ fn mk_state_with_origin_escape(
         snapshot: RwLock::new(DashboardSnapshot {
             payload: DashboardPayload {
                 generated_at: String::new(),
-                store_root: String::new(),
+                aicx_home: String::new(),
                 stats: DashboardStats::default(),
                 assumptions: Vec::new(),
                 projects: Vec::new(),

@@ -177,7 +177,7 @@ fn builds_dashboard_html_with_simple_layout() {
     .expect("md");
 
     let cfg = DashboardConfig {
-        store_root: root.clone(),
+        aicx_home: root.clone(),
         title: "AI Context Dashboard".to_string(),
         preview_chars: 100,
         scope: DashboardScope::default(),
@@ -216,7 +216,7 @@ fn server_shell_includes_highlight_styles_and_wiring() {
 fn static_dashboard_includes_highlight_styles_and_wiring() {
     let payload = DashboardPayload {
         generated_at: "2026-04-02T17:43:00Z".to_string(),
-        store_root: "/tmp/aicx".to_string(),
+        aicx_home: "/tmp/aicx".to_string(),
         records: Vec::new(),
         stats: DashboardStats::default(),
         assumptions: Vec::new(),
@@ -254,7 +254,7 @@ fn static_dashboard_includes_highlight_styles_and_wiring() {
 fn static_dashboard_includes_polish_normalization_map_for_l_stroke() {
     let payload = DashboardPayload {
         generated_at: "2026-04-02T17:43:00Z".to_string(),
-        store_root: "/tmp/aicx".to_string(),
+        aicx_home: "/tmp/aicx".to_string(),
         records: Vec::new(),
         stats: DashboardStats::default(),
         assumptions: Vec::new(),
