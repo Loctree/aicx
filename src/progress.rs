@@ -1,4 +1,4 @@
-//! Progress observability for the aicx store pipeline.
+//! Progress observability for source scanning, report rendering, indexing, and doctor work.
 //!
 //! Long-running phases (extract / chunk / steer_sync / bm25_sync) emit a
 //! `Phase` event at start, optional `tick` updates, and a final `finish`

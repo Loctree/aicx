@@ -1,172 +1,121 @@
 # Architecture
 
-`aicx` is the operator front door for agent session logs. It is a store-first
-system with retrieval surfaces layered on top:
-
-1. **Canonical corpus** (layer 1, `~/.aicx/`): read local agent session logs,
-   normalize into a single timeline schema, deduplicate, chunk into steerable
-   markdown with frontmatter metadata. This is ground truth.
-2. **Retrieval surfaces**: filesystem search, steering metadata, MCP tools, and
-   the reusable native embedding library in `crates/aicx-embeddings`.
-
-`aicx` owns the canonical corpus and portable local embedding foundation.
-Roost/rust-memex owns the advanced retrieval/operator plane.
-See `docs/ORACLE_CORPUS.md` for the operator contract: raw/canonical corpus is
-truth; indexes are derived, rebuildable views that must disclose fallback,
-freshness, and Loctree scope safety.
-
-The pipeline exposes chunks through CLI, MCP, dashboard search surfaces, and an
-adjacent Vibecrafted artifact explorer for workflow/marbles reports.
+`aicx` is a source-first catalog, extraction, and retrieval system.
 
 ```mermaid
-flowchart TD
-  CLI[aicx CLI] --> SRC[sources.rs: extract_*]
-  SRC --> DEDUP[state.rs: dedup + watermark]
-  DEDUP --> RED[redact.rs: redact_secrets]
-  RED --> STORE[store.rs: write_context_chunked]
-  STORE --> EMIT[stdout: --emit paths/json/none]
-  RED --> LOCAL[output.rs: write_report (-o)]
-  STORE --> STEER[steer_index.rs: sync_steer_index]
-  STORE --> MCP[mcp.rs: search/rank/steer tools]
+flowchart LR
+  SOURCES[Agent source roots] --> CATALOG[Catalog + source fingerprint]
+  CATALOG --> PARSER[Parser adapters]
+  PARSER --> FILTER[Signal filter]
+  FILTER --> LEX[Tantivy lexical generation]
+  FILTER --> EXTRACTS[Optional whole-session extracts]
+  LEX --> CURRENT[_all CURRENT]
+  CURRENT --> SEARCH[Lexical + recency search]
+  CURRENT --> DEEP[Optional dense mmap rerank]
+  CATALOG --> PROJECT[Project metadata filter]
+  PROJECT --> SEARCH
 ```
 
-## Module Map (Codebase Mapping)
+## Authority boundaries
 
-Library modules (see `src/lib.rs`). Parser-owned entries live under
-`crates/aicx-parser`; the old root-crate module locations are retired.
+- **Live source roots** own session content.
+- **Catalog** owns session identity, topical project attribution, canonical
+  source path, and live fingerprint.
+- **Extract cache** is optional readable duplication, one file per session.
+- **CURRENT generation** is a derived, atomically published search view.
+- **Legacy archive** is read/recovery-only for old card trees and projection
+  stages.
 
-- `src/extraction/`: source discovery + multi-agent extraction orchestration
-- `src/sessions.rs` + `src/session_catalog.rs`: bounded session discovery (locate-before-parse)
-- `src/state/`: dedup hashes + incremental watermarks
-- `src/store.rs` (+ `src/store/*`): canonical store under `$AICX_HOME`, projection stages, identity migration, atomic writes
-- `src/vector_index.rs`: committed semantic index + hybrid generation materialization (one dense payload per generation)
-- `src/search_engine.rs`: hybrid/semantic search dispatch with typed `RetrievalOutcome` status ownership
-- `src/oracle.rs`: CLI/MCP/evidence oracle status derivation from retrieval evidence (never invents healthy)
-- `src/mcp.rs`: MCP stdio/HTTP tools (`aicx_search`, `aicx_read`, `aicx_rank`, `aicx_steer`, `aicx_intents`, `aicx_index_status`)
-- `src/intents/`: structured intent/decision/outcome/task extraction
-- `src/doctor/`: bounded fast `health` (8192 fs-ops budget) vs deep forensic doctor
-- `src/cli_config.rs`: `aicx config show|init|inspect` — runtime inspection schema `aicx.runtime_inspection.v1`
-- `src/overlay.rs`: overlay-intent-v1 join against Loctree anchors (exact project identity, fail-closed)
-- `crates/aicx-parser`: deterministic session engine + five agent adapters; TB is differential oracle only
-- `crates/aicx-retrieve`: exact mmap dense adapter, fusion, manifests
-- `crates/aicx-embeddings`: reusable local GGUF embedding provider library
-- `src/redact.rs` + `crates/aicx-parser/src/sanitize.rs`: secret redaction + path allowlisting
+The removed card mill is not an authority boundary and cannot be re-grown by a
+production command.
 
-Binary orchestration:
-- `src/main.rs` / `src/bin/*`: clap CLI + `aicx-mcp`, wires flows, handles stdout emission (`--emit`).
+## Main modules
 
-## Data Flow: Extractors (`claude`, `codex`, `all`)
+- `src/catalog.rs` — source census and durable session catalog.
+- `src/source_path.rs` — canonical allowlisted source resolver.
+- `src/source_index.rs` — signal filtering, per-source parse state, and
+  incremental generation materialization.
+- `src/search_engine.rs` — typed search routing and fallback policy.
+- `src/aicx_home.rs` — the only AICX runtime-root resolver/initializer.
+- `src/legacy_archive.rs` + `src/legacy_archive/` — residual corpus
+  reads, quarantine inspection, and migration recovery.
+- `src/extraction/` and `crates/aicx-parser/` — agent discovery and parsing.
+- `src/vector_index.rs` and `crates/aicx-retrieve/` — hybrid generation and
+  dense mmap support.
+- `src/mcp.rs` — CLI-parity MCP tools.
+- `src/doctor/` — bounded health plus explicit deep recovery.
+- `src/wizard/` — interactive catalog/index/doctor surface.
 
-High-level sequence (see `src/main.rs::run_extraction`):
+## Catalog and incremental indexing
 
-1. Parse flags and build an `ExtractionConfig` (`src/sources.rs`).
-2. Read session sources and parse events:
-   - Claude: `~/.claude/projects/*/*.jsonl`
-   - Codex: `~/.codex/history.jsonl`
-   - Gemini: `~/.gemini/tmp/<hash>/chats/session-*.json`
-   - Gemini Antigravity direct extract: `~/.gemini/antigravity/conversations/<uuid>.pb` or `~/.gemini/antigravity/brain/<uuid>/`
-3. Normalize into timeline entries.
-4. Deduplicate:
-   - exact hash: `(agent, timestamp, message)`
-   - overlap hash: `(timestamp_bucket_60s, message)` across agents
-5. On corpus-building commands, redact secrets by default via `src/redact.rs`
-   unless `--no-redact-secrets`.
-6. Store-first chunking:
-   - use the source-side `--project` filter only to narrow session discovery
-   - then group the surviving entries by resolved repo identity `(repo-from-cwd, agent, date)`
-   - chunk per group (~1500 tokens, overlap), write canonical `.md` chunks into `~/.aicx/store/` or `~/.aicx/non-repository-contexts/`
-7. Stdout emission:
-   - `--emit none` prints nothing (default for extractors and `store`)
-   - `--emit paths` prints stored chunk paths, one per line
-   - `--emit json` prints a single JSON payload including `store_paths`, `requested_source_filters`, and `resolved_store_buckets`
-   - `--emit none` prints nothing
-8. Optional local output (`-o`): write a report to the given directory.
-9. Steer index refresh: sidecar metadata is available to CLI/MCP steering retrieval.
+`aicx catalog rebuild` walks registered source roots and writes
+`~/.aicx/catalog/sessions.jsonl`. Each row includes source length and mtime-ns.
 
-Note on heavy retrieval:
-- AICX no longer exposes a `memex-sync` CLI command.
-- Roost/rust-memex remains the advanced retrieval plane and can consume the
-  canonical store externally.
-- AICX native embeddings are exposed as a reusable library, not as an automatic
-  background indexing daemon.
+`aicx index` also fingerprints the live source before reuse. A changed existing
+session reparses even if the operator did not rebuild the catalog first. Parse
+state is persisted in `source_parse_state.v1.json`; a no-op run reuses the
+published generation.
 
-Dashboard cross-search still has one legacy external boundary:
-`/api/search/cross` shells out to the resolved absolute `rust-memex` or
-`rmcp-memex` binary. The spawn environment is intentionally cleared, then only
-`HOME`, `XDG_CONFIG_HOME`, and `XDG_DATA_HOME` are passed through for config-dir
-resolution. `PATH` is never passed; the binary must be resolved before
-`env_clear()` so a user-controlled `PATH` cannot change what gets executed.
-If the rust-memex CLI becomes fully self-contained, these variables may be absent and
-the child process must still fail with a normal command error, not by inheriting
-the parent environment.
+Only changed sessions pass through the parser. Filtering retains user messages,
+agent replies, plans, and reports while excluding tool calls, internal thought,
+system reminders, base64, and image payloads.
 
-Framework note:
-- Repo-local `.ai-context/` artifacts are now owned by higher-level workflow tooling such as `/vc-init`, not by the retired `aicx init` flow.
+## Publication and search
 
-## Frontmatter Steering Contract
+Persistent indexing publishes the global `_all` generation:
 
-Report files and chunk sidecars can include frontmatter metadata used for **steering** — targeted retrieval and selective re-entry by orchestration frameworks:
-
-```yaml
----
-agent: codex
-run_id: mrbl-001
-prompt_id: api-redesign_20260327
-model: claude-3-5-sonnet
-started_at: “2026-03-24T10:00:00Z”
-completed_at: “2026-03-24T10:30:00Z”
-token_usage: 125000
-findings_count: 3
----
+```text
+$AICX_HOME/indexed/_all/hybrid/
+  CURRENT
+  generations/<generation>/
+    tantivy_lex/
+    dense.exact_mmap_v1.bin   # optional
+    manifest.json
 ```
 
-These fields are parsed by `src/frontmatter.rs`, applied during chunking, and persisted as `.meta.json` sidecars alongside each chunk file. The `steer` command (CLI), `aicx_steer` tool (MCP), and `/api/search/steer` endpoint (dashboard) allow retrieval by these fields without filesystem grep.
+The manifest is written before the pointer flip. Search reads CURRENT and uses
+Tantivy plus a recency prior by default. `--deep` adds dense mmap RRF.
 
-Frontmatter is not just telemetry — it is part of the steering and selective re-entry contract. Orchestration can use `run_id` to retrieve all chunks from a specific agent run, `prompt_id` to find outputs from a specific prompt, or combine filters to narrow scope precisely.
+Project filters resolve against catalog/index identities and filter `_all`.
+Ambiguous exact filters fail closed. Filesystem fallback is legal only for the
+typed `IndexNotBuilt` state and is bounded.
 
-## Data Flow: catalog → extract → index (store command removed)
+## Source security
 
-The per-frame card mill and `aicx store` / `run_store` are **deleted**. Identity
-and retrieval rebuild through:
+Source candidates are resolved against approved roots:
 
-1. `aicx catalog rebuild` — walk live agent source roots into
-   `~/.aicx/catalog/sessions.jsonl` (session id → project/agent/date/cwd/source
-   path + live source fingerprint). Zero card files.
-2. `aicx extract <agent> --session <id>` (optional) — whole-session markdown
-   under `~/.aicx/extracts/` for human reading.
-3. `aicx index --cache-extracts` — source-driven lexical CURRENT under
-   `indexed/_all/hybrid/`, signal-filtered at parse time; project is a search
-   filter, not a separate index.
+- AICX home
+- Claude projects
+- Codex sessions
+- Grok sessions
+- Gemini tmp chats
+- Vibecrafted runtime runs
 
-## MCP Surface (`src/mcp.rs`)
+The resolver canonicalizes root and candidate, rejects non-files, and proves
+containment after symlink resolution before opening. Catalog reads, oversized
+Codex reads, fingerprints, and parser reads share that owner.
 
-The MCP server exposes six tools via stdio and streamable HTTP transports:
+## Legacy archive
 
-- `aicx_search` — semantic-first search over the canonical corpus. Ready indexes return `hybrid_rrf` oracle status and are safe for Loctree scope narrowing. Missing semantic preconditions degrade to filesystem fuzzy with an explicit `semantic_fallback` payload; callers that need fail-fast semantics pass `strict_semantic = true`.
-- `aicx_read` — read one canonical chunk by path, file name, or compact reference; this is the direct re-entry step after search, refs, steer, or dashboard discovery.
-- `aicx_rank` — rank chunks by signal density for a project as compact JSON.
-- `aicx_steer` — retrieve chunks by steering metadata (run_id, prompt_id, agent, kind, project, date) using sidecar data; returns `oracle_status` for the rebuildable metadata index and is safe for Loctree metadata narrowing only when source paths verify.
-- `aicx_intents` — extract intent/outcome/decision/task records from canonical chunks.
-- `aicx_index_status` — report the sessions -> chunks -> semantic-index pipeline for a project bucket, including readiness, backend, row count, and artifact paths.
+`legacy_archive` retains the minimum read/recovery surface needed for:
 
-CLI and MCP share one project-identity resolver (exact by default, fail-closed on
-ambiguous bare names) and one retrieval-status owner (`RetrievalOutcome` →
-`search_oracle_status_from_retrieval`). `aicx config inspect --json` reports
-install-channel drift, resolved `AICX_HOME`, embedder identity (secrets
-redacted), and `_all` hybrid generation without mutating anything.
+- doctor inventory and stage quarantine;
+- migration of existing old cards;
+- compatibility reads for explicit old chunk references.
 
-Recency filtering in `aicx_search` and `aicx_steer` uses canonical chunk dates from the store layout, not filesystem `mtime` accidents.
+It owns no card writer, projection writer, card-mill switch, or CLI ingestion
+route. New catalog/index code must not import it merely to resolve AICX home;
+that owner is `aicx_home`.
 
-The streamable HTTP transport binds to `127.0.0.1` by default and keeps rmcp's
-loopback-only `Host` validation. Operators can explicitly pass `--host <IP>` to
-listen on another interface and `--allowed-host <HOST>` for each remote
-hostname/IP clients will use. `--allow-any-host` disables that DNS-rebinding
-guard and is intended only for trusted networks.
+## Runtime interfaces
 
-## Security Model (Pragmatic)
+CLI and MCP share project resolution and typed retrieval outcomes. The wizard's
+Rebuild screen shells:
 
-Two mechanisms protect your machine and your data:
-- Path validation (read/write) in `crates/aicx-parser/src/sanitize.rs`.
-- Best-effort secret redaction in `src/redact.rs` (enabled by default).
+```text
+aicx catalog rebuild
+aicx index --cache-extracts
+```
 
-Redaction is conservative by design: it’s OK to over-redact sometimes; it’s not OK to leak tokens into committed artifacts. The flag lives only on corpus-building commands that create or rewrite artifacts, not on read-only search and steering surfaces.
+`index status` is bounded. When no catalog/CURRENT exists it returns `missing`
+immediately; an incomplete pending census reports `pending_scan_timeout`.
