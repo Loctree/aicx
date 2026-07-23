@@ -216,6 +216,16 @@ impl SemanticError {
             Self::NoResults { .. } => "no_results",
         }
     }
+
+    /// Whether CLI/MCP may degrade to filesystem-fuzzy for this error.
+    ///
+    /// Doctrine (audit recovery 2026-07-23): fuzzy is the last resort **only**
+    /// when no hybrid index exists at all ([`Self::IndexNotBuilt`]). Corrupt,
+    /// stale, busy, empty, dimension-mismatch, and embedder failures must
+    /// surface as typed errors — not get swallowed into letter-soup ranking.
+    pub fn allows_filesystem_fallback(&self) -> bool {
+        matches!(self, Self::IndexNotBuilt { .. })
+    }
 }
 
 impl std::fmt::Display for SemanticError {
@@ -3229,6 +3239,43 @@ mod tests {
         assert!(err.reason().contains("timed out acquiring shared lock"));
         assert!(!err.recommendation().contains("rm -f"));
         assert!(err.recommendation().contains("aicx index"));
+    }
+
+    #[test]
+    fn filesystem_fallback_only_for_index_not_built() {
+        let missing = SemanticError::IndexNotBuilt {
+            path: PathBuf::from("/tmp/aicx/indexed/_all/hybrid"),
+            reason: "no hybrid generation".into(),
+            recommendation: "run `aicx index`".into(),
+        };
+        assert!(missing.allows_filesystem_fallback());
+
+        let busy = SemanticError::IndexBusy {
+            path: PathBuf::from("/tmp/aicx/indexed/_all/hybrid"),
+            reason: "writer holds lock".into(),
+            recommendation: "wait for index".into(),
+        };
+        let corrupt = SemanticError::IndexCorrupt {
+            path: PathBuf::from("/tmp/aicx/indexed/_all/hybrid"),
+            reason: "manifest unreadable".into(),
+            recommendation: "rebuild".into(),
+        };
+        let stale = SemanticError::RetrievalManifestStale {
+            path: PathBuf::from("/tmp/aicx/indexed/_all/hybrid/CURRENT"),
+            reason: "fingerprint drift".into(),
+            recommendation: "rebuild".into(),
+        };
+        let embedder = SemanticError::EmbedderUnavailable {
+            reason: "model missing".into(),
+            recommendation: "hydrate embedder".into(),
+        };
+        for err in [&busy, &corrupt, &stale, &embedder] {
+            assert!(
+                !err.allows_filesystem_fallback(),
+                "{} must not fall back to filesystem fuzzy",
+                err.kind()
+            );
+        }
     }
 
     /// Legacy semantic label with NO hybrid manifest evidence must render as

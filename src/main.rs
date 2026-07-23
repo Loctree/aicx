@@ -7053,9 +7053,10 @@ fn project_scope_label(projects: &[String]) -> String {
     }
 }
 
-/// Semantic-first retrieval across the canonical store. Missing semantic
-/// preconditions degrade to filesystem-fuzzy; `--no-semantic` skips the
-/// semantic attempt entirely.
+/// Semantic-first retrieval across the hybrid index. Filesystem-fuzzy is
+/// used only when the index is missing (`IndexNotBuilt`); corrupt/stale/busy
+/// and embedder failures surface as typed errors. `--no-semantic` skips the
+/// hybrid attempt and runs fuzzy directly.
 struct SearchRunArgs<'a> {
     query: &'a str,
     projects: &'a [String],
@@ -7296,6 +7297,22 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
                 )
             }
             Err(err) => {
+                // Filesystem-fuzzy ONLY when no hybrid index exists.
+                // Corrupt / stale / busy / embedder / empty → honest error.
+                if !err.allows_filesystem_fallback() {
+                    if !json {
+                        eprintln!("aicx search: hybrid retrieval failed (no fuzzy swallow).");
+                        eprintln!("  kind:           {}", err.kind());
+                        eprintln!("  reason:         {}", err.reason());
+                        eprintln!("  recommendation: {}", err.recommendation());
+                    }
+                    anyhow::bail!(
+                        "aicx search failed: {} ({})\n  recommendation: {}",
+                        err.kind(),
+                        err.reason(),
+                        err.recommendation()
+                    );
+                }
                 let fallback = SemanticFallbackNotice::from_error(&err);
                 let (results, scanned) = aicx::search_engine::fuzzy_search_with_post_filters(
                     &root,
@@ -7307,7 +7324,7 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
                 )?;
                 if !json {
                     eprintln!(
-                        "aicx search: semantic search unavailable; falling back to filesystem fuzzy."
+                        "aicx search: index not built; falling back to filesystem fuzzy (recency-ranked)."
                     );
                     eprintln!("  kind:           {}", err.kind());
                     eprintln!("  reason:         {}", err.reason());

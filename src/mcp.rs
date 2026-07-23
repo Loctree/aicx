@@ -1087,7 +1087,7 @@ impl AicxMcpServer {
 
     #[tool(
         name = "aicx_search",
-        description = "Semantic-first search over the canonical corpus. When the semantic index or embedder is not ready, returns filesystem-fuzzy results with an explicit `semantic_fallback` payload; pass `strict_semantic=true` to receive the old fail-fast kind/reason/recommendation error. Filter pushdown (agent/score/date/hours) iterates a bounded semantic retrieval pool (up to 10x the requested limit) so a corpus whose top-N raw hits all sit outside the filter window still surfaces inside-window matches further down the ranking instead of returning silent-empty. When the cap is examined without satisfying the limit, the response carries a `filter_pushdown` payload with `kind=\"filter_yielded_partial\"` so callers can distinguish bounded under-delivery from a genuinely empty corpus."
+        description = "Semantic-first search over the canonical corpus. Filesystem-fuzzy fallback applies only when the hybrid index is missing (IndexNotBuilt), with an explicit `semantic_fallback` payload. Corrupt, stale, busy, empty, dimension-mismatch, and embedder failures return a typed fail-fast error (use strict_semantic=true for the same fail-fast on IndexNotBuilt). Filter pushdown (agent/score/date/hours) iterates a bounded semantic retrieval pool (up to 10x the requested limit) so a corpus whose top-N raw hits all sit outside the filter window still surfaces inside-window matches further down the ranking instead of returning silent-empty. When the cap is examined without satisfying the limit, the response carries a `filter_pushdown` payload with `kind=\"filter_yielded_partial\"` so callers can distinguish bounded under-delivery from a genuinely empty corpus."
     )]
     async fn search(
         &self,
@@ -1171,10 +1171,10 @@ impl AicxMcpServer {
             sort: params.sort.as_deref(),
         };
 
-        // D-6: short-circuit semantic work while the embedder is in the
-        // negative-cache window. Default MCP behavior still serves Layer 1
-        // corpus fuzzy search, so local agents remain useful without a
-        // hydrated embedder; strict clients can opt back into fail-fast.
+        // D-6: short-circuit while the embedder is in the negative-cache
+        // window. Embedder failures are NOT IndexNotBuilt — do not degrade to
+        // filesystem fuzzy (audit recovery 2026-07-23). Surface the typed
+        // error so callers rebuild/heal the embedder instead of ranking noise.
         let now = Instant::now();
         if let Some(remaining) = self.embedder_negative_cache_remaining(now) {
             let fallback = McpSemanticFallbackNotice {
@@ -1185,20 +1185,16 @@ impl AicxMcpServer {
                 ),
                 recommendation: "run `aicx doctor` to inspect embedder health; the cache clears automatically after the TTL elapses".to_string(),
             };
-            if strict_semantic {
-                return Err(mcp_semantic_unavailable_error(&fallback));
-            }
-            let payload = render_mcp_fuzzy_fallback_payload(&fallback_request, &fallback)?;
-            return Ok(CallToolResult::success(vec![Content::text(payload)]));
+            return Err(mcp_semantic_unavailable_error(&fallback));
         }
 
-        // Semantic-first dispatch with filter pushdown. Missing semantic
-        // preconditions degrade to filesystem-fuzzy by default, matching the
-        // CLI contract. `strict_semantic=true` keeps the fail-fast MCP mode.
-        // The wrapper iterates a bounded retrieval pool (`FILTER_EXAMINED_CAP_RATIO`
-        // x `limit`) so the canonical pathology — top-N raw hits sit
-        // outside the filter window while valid hits exist below — does
-        // not surface as silent-empty.
+        // Semantic-first dispatch with filter pushdown. Filesystem-fuzzy
+        // only for IndexNotBuilt (CLI parity). Other hybrid errors fail
+        // typed. `strict_semantic=true` also fails IndexNotBuilt fast.
+        // The wrapper iterates a bounded retrieval pool
+        // (`FILTER_EXAMINED_CAP_RATIO` x `limit`) so the canonical
+        // pathology — top-N raw hits sit outside the filter window while
+        // valid hits exist below — does not surface as silent-empty.
         let filtered = match crate::search_engine::try_semantic_search_filtered(
             &store_root,
             &query,
@@ -1219,7 +1215,10 @@ impl AicxMcpServer {
                     self.mark_embedder_unavailable(Instant::now(), MCP_EMBEDDER_NEGATIVE_TTL);
                 }
                 let fallback = McpSemanticFallbackNotice::from_error(&err);
-                if strict_semantic {
+                // Filesystem-fuzzy ONLY for IndexNotBuilt (audit recovery).
+                // strict_semantic remains fail-fast for every kind; non-strict
+                // still must not swallow corrupt/stale/busy into letter-soup.
+                if strict_semantic || !err.allows_filesystem_fallback() {
                     return Err(mcp_semantic_unavailable_error(&fallback));
                 }
                 let payload = render_mcp_fuzzy_fallback_payload(&fallback_request, &fallback)?;
