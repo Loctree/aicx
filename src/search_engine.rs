@@ -609,9 +609,10 @@ fn try_lexical_search_native(
     // the final result count. This used to be expensive because every
     // candidate triggered a store-file preview read; conversation previews
     // now come from indexed metadata and the top set performs no source I/O.
-    // A 500-hit floor keeps the intended fresh *and* relevant July result in
-    // view without scanning the whole corpus.
-    let window = lexical_rerank_window(limit);
+    // A 500-hit global floor keeps the intended fresh *and* relevant July
+    // result in view. Exact project pushdown needs only 100 candidates and
+    // avoids cold page-fault cost on the scoped sub-second path.
+    let window = lexical_rerank_window(limit, project_filter.is_some());
 
     // Push project (and other equality filters) into Tantivy so BM25 ranks
     // *inside* the project, not post-filters a global top-N (which silently
@@ -755,8 +756,8 @@ fn lexical_score_pct(score: f32) -> u8 {
 }
 
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
-fn lexical_rerank_window(limit: usize) -> usize {
-    limit.max(500)
+fn lexical_rerank_window(limit: usize, project_scoped: bool) -> usize {
+    limit.max(if project_scoped { 100 } else { 500 })
 }
 
 /// Recency prior: fresh conversations win over repeated stale mentions when
@@ -2625,9 +2626,11 @@ mod tests {
     #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
     #[test]
     fn lexical_rerank_window_keeps_a_wide_recency_candidate_pool() {
-        assert_eq!(lexical_rerank_window(1), 500);
-        assert_eq!(lexical_rerank_window(50), 500);
-        assert_eq!(lexical_rerank_window(750), 750);
+        assert_eq!(lexical_rerank_window(1, false), 500);
+        assert_eq!(lexical_rerank_window(50, false), 500);
+        assert_eq!(lexical_rerank_window(1, true), 100);
+        assert_eq!(lexical_rerank_window(50, true), 100);
+        assert_eq!(lexical_rerank_window(750, true), 750);
     }
 
     #[test]
