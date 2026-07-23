@@ -1625,13 +1625,14 @@ enum Commands {
     /// Build the source-driven lexical index. Use `--dry-run` to preview
     /// parsing and filtering without writing extracts or publishing CURRENT.
     ///
-    /// Default behaviour is incremental by source fingerprint: when the
-    /// catalog and source metadata are unchanged, AICX reuses CURRENT without
-    /// parsing session bodies. Otherwise it parses the selected sources,
-    /// filters tool/internal/system noise, and atomically publishes a fresh
-    /// Tantivy generation. With no `-p`, this is the `_all` index used by both
-    /// global search and project-scoped `search -p` queries. Dense vectors are
-    /// optional and are not built by this command.
+    /// Default behaviour is incremental by catalog snapshot: when the catalog
+    /// is unchanged, AICX reuses CURRENT without parsing session bodies. Run
+    /// `aicx catalog rebuild` to admit new or changed source sessions; the next
+    /// index run parses that snapshot, filters tool/internal/system noise, and
+    /// atomically publishes a fresh Tantivy generation. With no `-p`, this is
+    /// the `_all` index used by both global search and project-scoped
+    /// `search -p` queries. Dense vectors are optional and are not built by
+    /// this command.
     #[command(display_order = 14)]
     Index {
         #[command(subcommand)]

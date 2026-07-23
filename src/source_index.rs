@@ -45,9 +45,9 @@ pub struct SourceIndexReport {
 
 /// Build or preview the global lexical index from the durable catalog.
 ///
-/// Incremental truth is catalog/source metadata based. When neither the
-/// catalog nor any cataloged source changed, the CURRENT source generation is
-/// reused without parsing session bodies.
+/// Incremental truth is bounded by the durable catalog snapshot. When that
+/// snapshot is unchanged, CURRENT is reused without parsing session bodies.
+/// A catalog rebuild explicitly admits new or changed live-source state.
 pub fn build(
     aicx_home: &Path,
     project_filters: &[String],
