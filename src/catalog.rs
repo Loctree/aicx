@@ -21,8 +21,8 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::legacy_archive::{self};
 use crate::session_catalog::{AgentKind, CatalogSource, SessionCatalog};
-use crate::store::{self};
 
 pub const CATALOG_DIRNAME: &str = "catalog";
 pub const SESSIONS_FILENAME: &str = "sessions.jsonl";
@@ -89,7 +89,7 @@ pub fn sessions_path_for(home: &Path) -> PathBuf {
 }
 
 pub fn sessions_path() -> Result<PathBuf> {
-    Ok(sessions_path_for(&store::resolve_aicx_home()?))
+    Ok(sessions_path_for(&legacy_archive::resolve_aicx_home()?))
 }
 
 pub fn read_entries_at(home: &Path) -> Result<Vec<CatalogEntry>> {
@@ -203,7 +203,7 @@ pub fn rebuild(home: &Path, user_home: &Path) -> Result<RebuildReport> {
         body.push_str(&serde_json::to_string(entry)?);
         body.push('\n');
     }
-    store::atomic_write::atomic_write(&catalog_path, body.as_bytes())
+    legacy_archive::atomic_write::atomic_write(&catalog_path, body.as_bytes())
         .with_context(|| format!("write catalog {}", catalog_path.display()))?;
 
     Ok(RebuildReport {

@@ -10,10 +10,10 @@ use std::path::Path;
 
 use serde::Serialize;
 
+use crate::legacy_archive;
 use crate::oracle::OracleStatus;
 use crate::rank::FuzzyResult;
 use crate::sanitize::{normalize_query, read_to_string_validated};
-use crate::store;
 
 const EVIDENCE_SECTION_MAX_CHARS: usize = 900;
 const EVIDENCE_MATCH_MAX_CHARS: usize = 220;
@@ -610,7 +610,7 @@ fn load_result_body(result: &FuzzyResult) -> Option<String> {
 }
 
 fn load_result_metadata(result: &FuzzyResult) -> EvidenceMetadata {
-    let sidecar_path = store::sidecar_path_for_chunk(Path::new(&result.path));
+    let sidecar_path = legacy_archive::sidecar_path_for_chunk(Path::new(&result.path));
     let Ok(content) = read_to_string_validated(&sidecar_path) else {
         return EvidenceMetadata::default();
     };

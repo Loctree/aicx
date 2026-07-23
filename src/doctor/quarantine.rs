@@ -11,8 +11,8 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use crate::legacy_archive;
 use crate::sanitize;
-use crate::store;
 
 use super::types::{QuarantineManifest, QuarantineManifestItem, QuarantineRestoreReport};
 
@@ -26,7 +26,7 @@ pub(crate) struct EmptyBodyReport {
 }
 
 pub(crate) fn empty_body_report(base: &Path) -> EmptyBodyReport {
-    let files = store::scan_context_files_at(base).unwrap_or_default();
+    let files = legacy_archive::scan_context_files_at(base).unwrap_or_default();
     let mut report = EmptyBodyReport {
         total: files.len(),
         ..Default::default()
@@ -39,7 +39,7 @@ pub(crate) fn empty_body_report(base: &Path) -> EmptyBodyReport {
         let Ok(content) = sanitize::read_to_string_validated(&file.path) else {
             continue;
         };
-        if !store::chunk_body_is_empty(&content)
+        if !legacy_archive::chunk_body_is_empty(&content)
             && crate::card_header::card_body(&content).trim().len() >= 50
         {
             continue;
@@ -52,7 +52,7 @@ pub(crate) fn empty_body_report(base: &Path) -> EmptyBodyReport {
         }
         // Sidecar metadata is authoritative; the card header (bracket or
         // frontmatter) only fills in for sidecar-less legacy chunks.
-        let frame_kind = store::load_sidecar(&file.path)
+        let frame_kind = legacy_archive::load_sidecar(&file.path)
             .and_then(|sidecar| sidecar.frame_kind)
             .or_else(|| {
                 crate::card_header::parse_card_header(&content).and_then(|header| header.frame_kind)
@@ -228,7 +228,7 @@ pub(crate) fn empty_body_quarantine_destination(
     // Empty-body chunks live under either the canonical store
     // (`~/.aicx/store/<org>/<repo>/…`) or the non-repository fallback
     // (`~/.aicx/non-repository-contexts/<date>/…`); both roots are
-    // scanned by `store::scan_context_files_at`. Previously the prefix
+    // scanned by `legacy_archive::scan_context_files_at`. Previously the prefix
     // check only accepted `~/.aicx/store/`, which made
     // `aicx doctor --prune-empty-bodies` crash with
     // `empty-body chunk is outside store root` the moment any candidate
@@ -269,7 +269,8 @@ pub(crate) fn file_sha256(path: &Path) -> Result<String> {
 }
 
 pub fn restore_quarantine(slug: &str) -> Result<QuarantineRestoreReport> {
-    let base = store::store_base_dir().context("Failed to resolve aicx store base directory")?;
+    let base =
+        legacy_archive::store_base_dir().context("Failed to resolve aicx store base directory")?;
     restore_quarantine_at(&base, slug)
 }
 
@@ -435,7 +436,7 @@ pub fn format_restore_text(report: &QuarantineRestoreReport) -> String {
 }
 
 pub fn render_rebuild_sidecars_script(base: &Path) -> Result<String> {
-    let files = store::scan_context_files_at(base).unwrap_or_default();
+    let files = legacy_archive::scan_context_files_at(base).unwrap_or_default();
     let mut out = String::from("#!/usr/bin/env bash\nset -euo pipefail\n\n");
     out.push_str(
         "# Review before running. Card-mill sidecars are retired; rebuild identity + index.\n",
@@ -491,7 +492,7 @@ pub(crate) fn quarantine_projection_stages_at(
     base: &Path,
     dry_run: bool,
 ) -> Result<ProjectionStageQuarantineReport> {
-    use crate::store::canonical_projection::inspect_projection_stages_at;
+    use crate::legacy_archive::canonical_projection::inspect_projection_stages_at;
 
     let mut report = ProjectionStageQuarantineReport::default();
     let inventory = inspect_projection_stages_at(&base.join("store"));

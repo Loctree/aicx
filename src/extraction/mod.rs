@@ -11,8 +11,8 @@ pub(crate) use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration as StdDuration, SystemTime, UNIX_EPOCH};
 
+use crate::legacy_archive::project_filter_matches;
 pub(crate) use crate::sanitize;
-use crate::store::project_filter_matches;
 use crate::timeline::FrameKind;
 pub use crate::timeline::{
     CollapseStubKind, ConversationMessage, ExtractionConfig, MessageKind, SourceInfo, TimelineEntry,

@@ -16,10 +16,10 @@ use std::time::{Duration, SystemTime};
 #[cfg(feature = "app")]
 use crate::doctor::{DoctorOptions, DoctorReport};
 use crate::intents::{IntentExtraction, IntentsConfig};
+use crate::legacy_archive::{ReadContextChunk, StoredContextFile};
 #[cfg(feature = "app")]
 use crate::rank::FuzzyResult;
 use crate::sessions::{self, SessionInfo};
-use crate::store::{ReadContextChunk, StoredContextFile};
 #[cfg(feature = "app")]
 use crate::timeline::FrameKind;
 
@@ -33,7 +33,7 @@ pub struct AicxConfig {
 impl AicxConfig {
     pub fn from_env() -> Result<Self> {
         Ok(Self {
-            store_root: crate::store::store_base_dir()?,
+            store_root: crate::legacy_archive::store_base_dir()?,
         })
     }
 
@@ -72,7 +72,7 @@ impl Aicx {
     }
 
     pub fn list_chunks(&self) -> Result<Vec<StoredContextFile>> {
-        crate::store::scan_context_files_at(&self.config.store_root)
+        crate::legacy_archive::scan_context_files_at(&self.config.store_root)
     }
 
     pub fn read_chunk(
@@ -80,7 +80,11 @@ impl Aicx {
         reference: impl AsRef<str>,
         max_chars: Option<usize>,
     ) -> Result<ReadContextChunk> {
-        crate::store::read_context_chunk_at(&self.config.store_root, reference.as_ref(), max_chars)
+        crate::legacy_archive::read_context_chunk_at(
+            &self.config.store_root,
+            reference.as_ref(),
+            max_chars,
+        )
     }
 
     /// Run a semantic search against the canonical store's persistent vector
@@ -166,7 +170,7 @@ pub struct SearchOptions {
     pub limit: usize,
     pub projects: Vec<String>,
     pub project: Option<String>,
-    pub project_match: crate::store::ProjectMatchMode,
+    pub project_match: crate::legacy_archive::ProjectMatchMode,
     pub frame_kind: Option<FrameKind>,
     pub kind: Option<String>,
 }
@@ -178,7 +182,7 @@ impl Default for SearchOptions {
             limit: 10,
             projects: Vec::new(),
             project: None,
-            project_match: crate::store::ProjectMatchMode::Exact,
+            project_match: crate::legacy_archive::ProjectMatchMode::Exact,
             frame_kind: None,
             kind: None,
         }
@@ -189,13 +193,14 @@ impl Default for SearchOptions {
 fn search_project_scopes(
     store_root: &Path,
     projects: &[String],
-    match_mode: crate::store::ProjectMatchMode,
+    match_mode: crate::legacy_archive::ProjectMatchMode,
 ) -> Result<Vec<Option<String>>> {
     if projects.is_empty() {
         return Ok(vec![None]);
     }
-    let corpus = crate::store::project_identities_in_store_or_index_at(store_root)?;
-    let resolution = crate::store::require_project_resolution(projects, &corpus, match_mode)?;
+    let corpus = crate::legacy_archive::project_identities_in_store_or_index_at(store_root)?;
+    let resolution =
+        crate::legacy_archive::require_project_resolution(projects, &corpus, match_mode)?;
     Ok(resolution.selected.into_iter().map(Some).collect())
 }
 
@@ -393,7 +398,7 @@ fn index_status_at_with_sessions(
     }
 
     let chunks = if residual_mill_present {
-        crate::store::scan_context_files_project_at(base, project).unwrap_or_default()
+        crate::legacy_archive::scan_context_files_project_at(base, project).unwrap_or_default()
     } else {
         Vec::new()
     };
@@ -500,8 +505,12 @@ fn index_status_at_with_sessions(
 /// True when residual per-frame mill dirs still exist under the AICX home.
 fn residual_store_surface_present(base: &Path) -> bool {
     base.join("store").is_dir()
-        || base.join(crate::store::CANONICAL_STORE_DIRNAME).is_dir()
-        || base.join(crate::store::NON_REPOSITORY_CONTEXTS).is_dir()
+        || base
+            .join(crate::legacy_archive::CANONICAL_STORE_DIRNAME)
+            .is_dir()
+        || base
+            .join(crate::legacy_archive::NON_REPOSITORY_CONTEXTS)
+            .is_dir()
 }
 
 /// Report readiness from hybrid CURRENT when it is the search truth surface.
@@ -630,7 +639,7 @@ fn discover_source_sessions_for_status_bounded(
     project: Option<&str>,
     newest_chunk: Option<SystemTime>,
 ) -> Vec<SessionInfo> {
-    let Ok(active_store_root) = crate::store::store_base_dir() else {
+    let Ok(active_store_root) = crate::legacy_archive::store_base_dir() else {
         return Vec::new();
     };
     if active_store_root != base {

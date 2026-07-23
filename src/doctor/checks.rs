@@ -23,11 +23,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
 
+use crate::legacy_archive;
+use crate::legacy_archive::canonical_projection::StageInventoryEntry;
 use crate::progress::{Heartbeat, NoopReporter, Phase, Reporter};
 use crate::sanitize;
 use crate::steer_index;
-use crate::store;
-use crate::store::canonical_projection::StageInventoryEntry;
 use crate::validation::{is_valid_repo_bucket_name, is_valid_repo_project_slug};
 
 use super::quarantine::{
@@ -55,7 +55,8 @@ pub async fn run(
 ) -> Result<Option<DoctorReport>> {
     let base = match base_override {
         Some(base) => base.to_path_buf(),
-        None => store::store_base_dir().context("Failed to resolve aicx store base directory")?,
+        None => legacy_archive::store_base_dir()
+            .context("Failed to resolve aicx store base directory")?,
     };
     if deep {
         run_deep_impl(&base, opts, reporter, cancel).await
@@ -109,7 +110,7 @@ fn run_check_cancellable<T: Send + 'static>(
 /// unreadable — callers must report "unknown", never guess.
 fn index_tuple_count(base: &Path) -> Option<usize> {
     let raw = sanitize::read_to_string_validated(&base.join("index.json")).ok()?;
-    let index = serde_json::from_str::<store::StoreIndex>(&raw).ok()?;
+    let index = serde_json::from_str::<legacy_archive::StoreIndex>(&raw).ok()?;
     let mut tuples = 0usize;
     for (_, project_index) in index.projects {
         for (_, agent_index) in project_index.agents {
@@ -398,7 +399,7 @@ async fn run_deep_impl(
 
     if opts.migrate_identities {
         let apply_identities = opts.apply_migrate_identities;
-        match crate::store::migration::run_identity_migration_at(base, apply_identities) {
+        match crate::legacy_archive::migration::run_identity_migration_at(base, apply_identities) {
             Ok(outcome) => {
                 let prefix = if outcome.applied { "" } else { "[dry-run] " };
                 fixes_applied.push(format!(
@@ -737,7 +738,8 @@ fn check_canonical_store_fast(
             ),
         };
     }
-    let stages = crate::store::canonical_projection::inspect_projection_stages_at(&store_root);
+    let stages =
+        crate::legacy_archive::canonical_projection::inspect_projection_stages_at(&store_root);
     budget.charge(1 + stages.len().saturating_mul(4));
     let (inventory, inventory_known) = if walk.complete {
         (
@@ -804,7 +806,7 @@ fn check_sidecars_fast(walk: &BoundedWalk, budget: &mut FsBudget) -> CheckResult
             break;
         }
         checked += 1;
-        if !store::sidecar_path_for_chunk(chunk).exists() {
+        if !legacy_archive::sidecar_path_for_chunk(chunk).exists() {
             missing += 1;
         }
     }
@@ -850,7 +852,7 @@ fn check_sidecars_fast(walk: &BoundedWalk, budget: &mut FsBudget) -> CheckResult
 /// Bounded context-corpus check: existence-level truth only; a populated
 /// corpus tree requires the deep batch walk.
 fn check_context_corpus_fast(base: &Path, budget: &mut FsBudget) -> CheckResult {
-    let corpus_root = base.join(store::CONTEXT_CORPUS_DIRNAME);
+    let corpus_root = base.join(legacy_archive::CONTEXT_CORPUS_DIRNAME);
     budget.charge(1);
     if !corpus_root.exists() {
         return CheckResult {
@@ -993,8 +995,8 @@ fn summarize_projection_stages(stages: &[StageInventoryEntry]) -> Option<StageSu
     let unproven = stages.iter().any(|stage| {
         matches!(
             stage.class,
-            crate::store::canonical_projection::StageClass::Stale
-                | crate::store::canonical_projection::StageClass::UnknownOwner
+            crate::legacy_archive::canonical_projection::StageClass::Stale
+                | crate::legacy_archive::canonical_projection::StageClass::UnknownOwner
         )
     });
 
@@ -1136,7 +1138,7 @@ pub(crate) fn check_http_auth_token() -> CheckResult {
 }
 
 pub(crate) fn check_context_corpus(base: &Path) -> CheckResult {
-    let corpus_root = base.join(store::CONTEXT_CORPUS_DIRNAME);
+    let corpus_root = base.join(legacy_archive::CONTEXT_CORPUS_DIRNAME);
     if !corpus_root.exists() {
         return CheckResult {
             name: "context_corpus".to_string(),
@@ -1148,7 +1150,7 @@ pub(crate) fn check_context_corpus(base: &Path) -> CheckResult {
             recommendation: None,
         };
     }
-    let files = match store::scan_context_corpus_files_at(base) {
+    let files = match legacy_archive::scan_context_corpus_files_at(base) {
         Ok(files) => files,
         Err(err) => {
             return CheckResult {
@@ -1477,7 +1479,7 @@ pub(crate) fn check_index_freshness(base: &Path) -> CheckResult {
 }
 
 pub(crate) fn check_index_consistency(base: &Path) -> CheckResult {
-    let files = store::scan_context_files_at(base).unwrap_or_default();
+    let files = legacy_archive::scan_context_files_at(base).unwrap_or_default();
     let chunk_keys = files
         .iter()
         .map(|file| {
@@ -1525,7 +1527,7 @@ pub(crate) fn check_index_consistency(base: &Path) -> CheckResult {
             };
         }
     };
-    let index = match serde_json::from_str::<store::StoreIndex>(&raw) {
+    let index = match serde_json::from_str::<legacy_archive::StoreIndex>(&raw) {
         Ok(index) => index,
         Err(err) => {
             return CheckResult {
@@ -1750,11 +1752,12 @@ pub(crate) fn check_canonical_store(base: &Path) -> CheckResult {
             ),
         };
     }
-    let files = store::scan_context_files_at(base).unwrap_or_default();
+    let files = legacy_archive::scan_context_files_at(base).unwrap_or_default();
     // Fast inventory of in-flight/orphaned canonical-projection stages:
     // lease metadata only, payload is never read. A dead stage can retain
     // tens of gigabytes with no owner — surface it, never delete it.
-    let stages = crate::store::canonical_projection::inspect_projection_stages_at(&store_root);
+    let stages =
+        crate::legacy_archive::canonical_projection::inspect_projection_stages_at(&store_root);
     let Some(summary) = summarize_projection_stages(&stages) else {
         return CheckResult {
             name: "canonical_store".to_string(),
@@ -1930,8 +1933,9 @@ pub(crate) fn check_state(base: &Path) -> CheckResult {
 }
 
 pub(crate) fn check_sidecar_coverage(base: &Path) -> CheckResult {
-    let files = store::scan_context_files_at(base).unwrap_or_default();
-    let context_corpus_files = store::scan_context_corpus_files_at(base).unwrap_or_default();
+    let files = legacy_archive::scan_context_files_at(base).unwrap_or_default();
+    let context_corpus_files =
+        legacy_archive::scan_context_corpus_files_at(base).unwrap_or_default();
     let total = files.len() + context_corpus_files.len();
     if total == 0 {
         return CheckResult {
@@ -1943,7 +1947,7 @@ pub(crate) fn check_sidecar_coverage(base: &Path) -> CheckResult {
     }
     let mut missing = 0usize;
     for f in &files {
-        let sidecar = store::sidecar_path_for_chunk(&f.path);
+        let sidecar = legacy_archive::sidecar_path_for_chunk(&f.path);
         if !sidecar.exists() {
             missing += 1;
         }
@@ -1983,8 +1987,8 @@ pub(crate) fn check_sidecar_coverage(base: &Path) -> CheckResult {
 
 pub(crate) fn check_content_dedup(base: &Path) -> CheckResult {
     let mut seen: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for file in store::scan_context_files_at(base).unwrap_or_default() {
-        if let Some(sidecar) = store::load_sidecar(&file.path)
+    for file in legacy_archive::scan_context_files_at(base).unwrap_or_default() {
+        if let Some(sidecar) = legacy_archive::load_sidecar(&file.path)
             && let Some(hash) = sidecar.content_sha256
         {
             seen.entry(hash)
@@ -1992,7 +1996,7 @@ pub(crate) fn check_content_dedup(base: &Path) -> CheckResult {
                 .push(file.path.display().to_string());
         }
     }
-    for file in store::scan_context_corpus_files_at(base).unwrap_or_default() {
+    for file in legacy_archive::scan_context_corpus_files_at(base).unwrap_or_default() {
         if let Some(hash) = file.sidecar.content_sha256 {
             seen.entry(hash)
                 .or_default()
@@ -2091,7 +2095,7 @@ pub(crate) fn check_empty_body_chunks(base: &Path) -> CheckResult {
 ///   scaffolding.
 /// - `Green` for any milder signal (filter doing its job invisibly).
 pub(crate) fn check_noise_health(base: &Path) -> CheckResult {
-    let files = store::scan_context_files_at(base).unwrap_or_default();
+    let files = legacy_archive::scan_context_files_at(base).unwrap_or_default();
     let total = files.len();
     if total == 0 {
         return CheckResult {
