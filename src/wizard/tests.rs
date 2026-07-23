@@ -19,7 +19,7 @@ fn wizard_switches_between_four_screens() {
     app.handle_key(KeyCode::Char('3'));
     assert_eq!(app.active, Screen::Intents);
     app.handle_key(KeyCode::Char('4'));
-    assert_eq!(app.active, Screen::Store);
+    assert_eq!(app.active, Screen::Rebuild);
     app.handle_key(KeyCode::Char('1'));
     assert_eq!(app.active, Screen::Corpus);
 }
@@ -28,10 +28,10 @@ fn wizard_switches_between_four_screens() {
 fn wizard_store_range_cycles_without_starting_run() {
     let mut app = App::new();
     app.handle_key(KeyCode::Char('4'));
-    assert_eq!(app.store.hours, 48);
+    assert_eq!(app.rebuild.hours, 48);
     app.handle_key(KeyCode::Char('t'));
-    assert_eq!(app.store.hours, 168);
-    assert!(!app.store.running);
+    assert_eq!(app.rebuild.hours, 168);
+    assert!(!app.rebuild.running);
 }
 
 #[test]

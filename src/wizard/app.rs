@@ -1,7 +1,7 @@
 use crossterm::event::{KeyCode, KeyModifiers};
 
 use crate::wizard::screens::{
-    corpus::CorpusScreen, doctor::DoctorScreen, intents::IntentsScreen, store::StoreScreen,
+    corpus::CorpusScreen, doctor::DoctorScreen, intents::IntentsScreen, rebuild::RebuildScreen,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -9,7 +9,7 @@ pub enum Screen {
     Corpus,
     Doctor,
     Intents,
-    Store,
+    Rebuild,
 }
 
 impl Screen {
@@ -18,7 +18,7 @@ impl Screen {
             Self::Corpus => "Corpus",
             Self::Doctor => "Doctor",
             Self::Intents => "Intents",
-            Self::Store => "Store",
+            Self::Rebuild => "Rebuild",
         }
     }
 }
@@ -43,7 +43,7 @@ pub struct App {
     pub corpus: CorpusScreen,
     pub doctor: DoctorScreen,
     pub intents: IntentsScreen,
-    pub store: StoreScreen,
+    pub rebuild: RebuildScreen,
     pub should_quit: bool,
     pub show_help: bool,
     pub search_mode: bool,
@@ -59,7 +59,7 @@ impl App {
             corpus: CorpusScreen::load(),
             doctor: DoctorScreen::default(),
             intents: IntentsScreen::load(None, 168, None),
-            store: StoreScreen::default(),
+            rebuild: RebuildScreen::default(),
             should_quit: false,
             show_help: false,
             search_mode: false,
@@ -76,7 +76,7 @@ impl App {
     }
 
     pub fn tick(&mut self) {
-        self.store.poll();
+        self.rebuild.poll();
     }
 
     pub fn handle_paste(&mut self, content: String) {
@@ -96,8 +96,8 @@ impl App {
 
     pub fn handle_key_event(&mut self, key: crossterm::event::KeyEvent) {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-            if self.store.cancel() {
-                self.status = self.store.status.clone();
+            if self.rebuild.cancel() {
+                self.status = self.rebuild.status.clone();
             } else {
                 self.should_quit = true;
             }
@@ -127,8 +127,8 @@ impl App {
 
         match key {
             KeyCode::Char('q') => {
-                if self.store.is_running() {
-                    self.status = "store is running; press Ctrl+C to cancel or wait".to_string();
+                if self.rebuild.is_running() {
+                    self.status = "rebuild is running; press Ctrl+C to cancel or wait".to_string();
                 } else {
                     self.should_quit = true;
                 }
@@ -141,7 +141,7 @@ impl App {
             KeyCode::Char('1') => self.switch(Screen::Corpus),
             KeyCode::Char('2') => self.switch(Screen::Doctor),
             KeyCode::Char('3') => self.switch(Screen::Intents),
-            KeyCode::Char('4') => self.switch(Screen::Store),
+            KeyCode::Char('4') => self.switch(Screen::Rebuild),
             KeyCode::Char('/') => {
                 self.search_mode = true;
                 self.search_input = match self.active {
@@ -165,13 +165,13 @@ impl App {
                 self.doctor.refresh(false);
                 self.status = self.doctor.status.clone();
             }
-            KeyCode::Char('s') if self.active == Screen::Store => {
-                self.store.start();
-                self.status = self.store.status.clone();
+            KeyCode::Char('s') if self.active == Screen::Rebuild => {
+                self.rebuild.start();
+                self.status = self.rebuild.status.clone();
             }
-            KeyCode::Char('t') if self.active == Screen::Store => {
-                self.store.cycle_hours();
-                self.status = self.store.status.clone();
+            KeyCode::Char('t') if self.active == Screen::Rebuild => {
+                self.rebuild.cycle_hours();
+                self.status = self.rebuild.status.clone();
             }
             KeyCode::Char('p') if self.active == Screen::Intents => {
                 self.intents.cycle_project_filter();
@@ -200,7 +200,7 @@ impl App {
                 self.doctor.status.clone()
             }
             Screen::Intents => self.intents.status.clone(),
-            Screen::Store => self.store.status.clone(),
+            Screen::Rebuild => self.rebuild.status.clone(),
         };
     }
 
@@ -209,7 +209,7 @@ impl App {
             Screen::Corpus => self.corpus.move_selection(delta),
             Screen::Doctor => self.doctor.move_selection(delta),
             Screen::Intents => self.intents.move_selection(delta),
-            Screen::Store => self.store.move_log(delta),
+            Screen::Rebuild => self.rebuild.move_log(delta),
         }
     }
 
@@ -221,7 +221,7 @@ impl App {
                 self.status = self.doctor.status.clone();
             }
             Screen::Intents => self.intents.open_selected(),
-            Screen::Store => self.store.start(),
+            Screen::Rebuild => self.rebuild.start(),
         }
     }
 

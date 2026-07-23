@@ -9,27 +9,27 @@ use std::thread;
 use std::time::Duration;
 
 #[derive(Debug)]
-enum StoreEvent {
+enum RebuildEvent {
     Line(String),
-    Done(StoreOutcome),
+    Done(RebuildOutcome),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum StoreOutcome {
+enum RebuildOutcome {
     Completed,
     Failed,
     Cancelled,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct StoreProgress {
+pub struct RebuildProgress {
     pub phase: String,
     pub current: u64,
     pub total: Option<u64>,
     pub status: String,
 }
 
-impl StoreProgress {
+impl RebuildProgress {
     pub fn ratio(&self) -> f64 {
         let Some(total) = self.total else {
             return 0.0;
@@ -43,19 +43,19 @@ impl StoreProgress {
 }
 
 #[derive(Debug)]
-pub struct StoreScreen {
+pub struct RebuildScreen {
     pub running: bool,
     pub log: Vec<String>,
     pub scroll: usize,
     pub status: String,
     pub hours: u64,
-    pub progress: Option<StoreProgress>,
-    rx: Option<mpsc::Receiver<StoreEvent>>,
+    pub progress: Option<RebuildProgress>,
+    rx: Option<mpsc::Receiver<RebuildEvent>>,
     child: Option<Arc<Mutex<Option<Child>>>>,
     cancel_requested: Option<Arc<AtomicBool>>,
 }
 
-impl Default for StoreScreen {
+impl Default for RebuildScreen {
     fn default() -> Self {
         Self {
             running: false,
@@ -71,7 +71,7 @@ impl Default for StoreScreen {
     }
 }
 
-impl StoreScreen {
+impl RebuildScreen {
     pub fn is_running(&self) -> bool {
         self.running
     }
@@ -120,23 +120,23 @@ impl StoreScreen {
             match catalog {
                 Ok(out) => {
                     for line in String::from_utf8_lossy(&out.stderr).lines() {
-                        let _ = event_tx.send(StoreEvent::Line(line.to_string()));
+                        let _ = event_tx.send(RebuildEvent::Line(line.to_string()));
                     }
                     for line in String::from_utf8_lossy(&out.stdout).lines() {
-                        let _ = event_tx.send(StoreEvent::Line(line.to_string()));
+                        let _ = event_tx.send(RebuildEvent::Line(line.to_string()));
                     }
                     if !out.status.success() {
-                        let _ = event_tx.send(StoreEvent::Line(
+                        let _ = event_tx.send(RebuildEvent::Line(
                             "catalog rebuild failed; index not started".to_string(),
                         ));
-                        let _ = event_tx.send(StoreEvent::Done(StoreOutcome::Failed));
+                        let _ = event_tx.send(RebuildEvent::Done(RebuildOutcome::Failed));
                         return;
                     }
                 }
                 Err(error) => {
                     let _ =
-                        event_tx.send(StoreEvent::Line(format!("catalog spawn failed: {error}")));
-                    let _ = event_tx.send(StoreEvent::Done(StoreOutcome::Failed));
+                        event_tx.send(RebuildEvent::Line(format!("catalog spawn failed: {error}")));
+                    let _ = event_tx.send(RebuildEvent::Done(RebuildOutcome::Failed));
                     return;
                 }
             }
@@ -149,8 +149,9 @@ impl StoreScreen {
             {
                 Ok(child) => child,
                 Err(error) => {
-                    let _ = event_tx.send(StoreEvent::Line(format!("index spawn failed: {error}")));
-                    let _ = event_tx.send(StoreEvent::Done(StoreOutcome::Failed));
+                    let _ =
+                        event_tx.send(RebuildEvent::Line(format!("index spawn failed: {error}")));
+                    let _ = event_tx.send(RebuildEvent::Done(RebuildOutcome::Failed));
                     return;
                 }
             };
@@ -159,7 +160,7 @@ impl StoreScreen {
                 let tx = event_tx.clone();
                 thread::spawn(move || {
                     for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                        let _ = tx.send(StoreEvent::Line(line));
+                        let _ = tx.send(RebuildEvent::Line(line));
                     }
                 });
             }
@@ -168,7 +169,7 @@ impl StoreScreen {
                 let tx = event_tx.clone();
                 thread::spawn(move || {
                     for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                        let _ = tx.send(StoreEvent::Line(line));
+                        let _ = tx.send(RebuildEvent::Line(line));
                     }
                 });
             }
@@ -190,11 +191,11 @@ impl StoreScreen {
                             Ok(Some(status)) => {
                                 *guard = None;
                                 if cancel_requested.load(Ordering::SeqCst) {
-                                    StoreOutcome::Cancelled
+                                    RebuildOutcome::Cancelled
                                 } else if status.success() {
-                                    StoreOutcome::Completed
+                                    RebuildOutcome::Completed
                                 } else {
-                                    StoreOutcome::Failed
+                                    RebuildOutcome::Failed
                                 }
                             }
                             Ok(None) => {
@@ -204,16 +205,16 @@ impl StoreScreen {
                             }
                             Err(error) => {
                                 let _ = event_tx
-                                    .send(StoreEvent::Line(format!("wait failed: {error}")));
+                                    .send(RebuildEvent::Line(format!("wait failed: {error}")));
                                 *guard = None;
-                                StoreOutcome::Failed
+                                RebuildOutcome::Failed
                             }
                         }
                     } else {
-                        StoreOutcome::Cancelled
+                        RebuildOutcome::Cancelled
                     }
                 };
-                let _ = event_tx.send(StoreEvent::Done(outcome));
+                let _ = event_tx.send(RebuildEvent::Done(outcome));
                 break;
             }
         });
@@ -222,18 +223,18 @@ impl StoreScreen {
     pub fn poll(&mut self) {
         while let Some(event) = self.rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
             match event {
-                StoreEvent::Line(line) => {
+                RebuildEvent::Line(line) => {
                     self.update_progress_from_line(&line);
                     self.push_log(line);
                 }
-                StoreEvent::Done(outcome) => {
+                RebuildEvent::Done(outcome) => {
                     self.running = false;
                     self.child = None;
                     self.cancel_requested = None;
                     self.status = match outcome {
-                        StoreOutcome::Completed => "store run completed".to_string(),
-                        StoreOutcome::Failed => "store run failed".to_string(),
-                        StoreOutcome::Cancelled => "store run cancelled".to_string(),
+                        RebuildOutcome::Completed => "rebuild run completed".to_string(),
+                        RebuildOutcome::Failed => "rebuild run failed".to_string(),
+                        RebuildOutcome::Cancelled => "rebuild run cancelled".to_string(),
                     };
                 }
             }
@@ -260,10 +261,10 @@ impl StoreScreen {
         }
 
         if killed {
-            self.status = "store cancel requested; kill signal sent".to_string();
-            self.push_log("cancel requested; kill signal sent to store subprocess".to_string());
+            self.status = "rebuild cancel requested; kill signal sent".to_string();
+            self.push_log("cancel requested; kill signal sent to rebuild subprocess".to_string());
         } else {
-            self.status = "store cancel requested; subprocess already exiting".to_string();
+            self.status = "rebuild cancel requested; subprocess already exiting".to_string();
             self.push_log("cancel requested; subprocess already exiting".to_string());
         }
         true
@@ -272,7 +273,7 @@ impl StoreScreen {
     pub fn cycle_hours(&mut self) {
         const PRESETS: &[u64] = &[4, 24, 48, 168];
         if self.running {
-            self.status = "store range is locked while a run is active".to_string();
+            self.status = "rebuild range is locked while a run is active".to_string();
             return;
         }
         let current = if self.hours == 0 { 48 } else { self.hours };
@@ -282,7 +283,7 @@ impl StoreScreen {
             .map(|idx| PRESETS[(idx + 1) % PRESETS.len()])
             .unwrap_or(48);
         self.hours = next;
-        self.status = format!("store range set to {next}h");
+        self.status = format!("rebuild range set to {next}h");
     }
 
     pub fn move_log(&mut self, delta: isize) {
@@ -327,7 +328,7 @@ impl StoreScreen {
     }
 }
 
-fn parse_progress_line(line: &str) -> Option<StoreProgress> {
+fn parse_progress_line(line: &str) -> Option<RebuildProgress> {
     let inner = line.strip_prefix("[aicx][")?.strip_suffix(']')?;
     let mut phase = None;
     let mut event = None;
@@ -354,7 +355,7 @@ fn parse_progress_line(line: &str) -> Option<StoreProgress> {
         "finish" => total.unwrap_or(current.unwrap_or_default()),
         _ => current.unwrap_or_default(),
     };
-    Some(StoreProgress {
+    Some(RebuildProgress {
         phase: phase?,
         current,
         total,
