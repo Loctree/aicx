@@ -2,7 +2,7 @@
 //!
 //! Catalog reads, source indexing, and migration identity manifests must open
 //! only paths that resolve under approved roots after canonicalize. This is the
-//! real cut for path-traversal taint — not `// nosemgrep` silencers.
+//! containment boundary that closes path-traversal taint at runtime.
 //!
 //! Approved roots (when present on the machine):
 //! - `~/.claude/projects`

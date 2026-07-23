@@ -100,7 +100,7 @@ pub mod sessions;
 #[cfg(feature = "app")]
 pub mod source_index;
 /// Canonical path resolver for approved session sources and AICX home reads.
-/// Real containment (no nosemgrep silencers) for catalog / source_index opens.
+/// Enforces real containment for catalog and source-index opens.
 #[cfg(feature = "app")]
 pub mod source_path;
 #[cfg(not(feature = "app"))]
