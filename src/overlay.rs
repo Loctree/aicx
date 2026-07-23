@@ -31,7 +31,7 @@ pub struct OverlayOptions {
     pub repo: PathBuf,
     pub rebuild: bool,
     pub loct_bin: Option<PathBuf>,
-    pub store_root: Option<PathBuf>,
+    pub aicx_home: Option<PathBuf>,
     pub index_root: Option<PathBuf>,
 }
 
@@ -199,17 +199,17 @@ pub fn build_overlay(options: &OverlayOptions) -> Result<(OverlayDocument, Overl
         bail!("overlay repository is not a directory: {}", repo.display());
     }
     let catalog = load_anchor_catalog(&repo, options.loct_bin.as_deref())?;
-    let store_root = options
-        .store_root
+    let aicx_home = options
+        .aicx_home
         .clone()
         .unwrap_or(legacy_cards_dir()?)
         .canonicalize()
         .context("canonical C6 store root is missing or unreadable")?;
-    let projections = discover_canonical_projections(&store_root)?;
+    let projections = discover_canonical_projections(&aicx_home)?;
     if projections.is_empty() {
         bail!(
             "typed C6 canonical projection is unavailable under {}; run canonical ingest before overlay emission",
-            store_root.display()
+            aicx_home.display()
         );
     }
     let mut cards = Vec::new();
@@ -1982,7 +1982,7 @@ mod tests {
             repo: repo.clone(),
             rebuild: false,
             loct_bin: Some(loct.clone()),
-            store_root: Some(store.clone()),
+            aicx_home: Some(store.clone()),
             index_root: Some(index.clone()),
         };
         let (first, first_stats) = build_overlay(&options).unwrap();

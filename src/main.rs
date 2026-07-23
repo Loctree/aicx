@@ -2181,7 +2181,7 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
                 repo,
                 rebuild,
                 loct_bin: None,
-                store_root: None,
+                aicx_home: None,
                 index_root: None,
             })?;
             serde_json::to_writer_pretty(io::stdout().lock(), &overlay)?;
@@ -4172,13 +4172,13 @@ fn resolve_intents_project_filters(
     projects: &[String],
     match_mode: legacy_archive::ProjectMatchMode,
 ) -> Result<legacy_archive::ProjectIdentityResolution> {
-    let store_root = aicx::aicx_home::ensure()?;
-    resolve_intents_project_filters_at(projects, &store_root, match_mode)
+    let aicx_home = aicx::aicx_home::ensure()?;
+    resolve_intents_project_filters_at(projects, &aicx_home, match_mode)
 }
 
 fn resolve_intents_project_filters_at(
     projects: &[String],
-    store_root: &Path,
+    aicx_home: &Path,
     match_mode: legacy_archive::ProjectMatchMode,
 ) -> Result<legacy_archive::ProjectIdentityResolution> {
     if projects.is_empty() {
@@ -4189,7 +4189,7 @@ fn resolve_intents_project_filters_at(
             match_mode,
         });
     }
-    let corpus = legacy_archive::project_identities_in_store_at(store_root)?;
+    let corpus = legacy_archive::project_identities_in_store_at(aicx_home)?;
     Ok(legacy_archive::require_project_resolution(
         projects, &corpus, match_mode,
     )?)
@@ -4223,7 +4223,7 @@ fn project_alias_key(value: &str) -> String {
         .collect()
 }
 
-fn collect_recent_bucket_counts(store_root: &Path, hours: u64) -> Result<BTreeMap<String, usize>> {
+fn collect_recent_bucket_counts(aicx_home: &Path, hours: u64) -> Result<BTreeMap<String, usize>> {
     let cutoff = if hours == 0 {
         DateTime::<Utc>::from_timestamp(0, 0).expect("Unix epoch timestamp is valid")
     } else {
@@ -4231,7 +4231,7 @@ fn collect_recent_bucket_counts(store_root: &Path, hours: u64) -> Result<BTreeMa
         Utc::now() - chrono::Duration::hours(cutoff_hours)
     };
     let mut counts = BTreeMap::new();
-    for file in legacy_archive::scan_context_files_at(store_root)? {
+    for file in legacy_archive::scan_context_files_at(aicx_home)? {
         if file.path.extension().and_then(|ext| ext.to_str()) != Some("md") {
             continue;
         }
@@ -4317,8 +4317,8 @@ fn print_no_intents_message(
         eprintln!("{note}");
     }
 
-    let store_root = aicx::aicx_home::ensure()?;
-    let hints = nearby_bucket_hints(projects, &collect_recent_bucket_counts(&store_root, hours)?);
+    let aicx_home = aicx::aicx_home::ensure()?;
+    let hints = nearby_bucket_hints(projects, &collect_recent_bucket_counts(&aicx_home, hours)?);
     if !hints.is_empty() {
         eprintln!("Did you mean a nearby bucket with recent data?");
         for hint in &hints {
@@ -4447,9 +4447,9 @@ fn run_intents(
 
     match emit {
         "json" => {
-            let store_root = aicx::aicx_home::ensure()?;
+            let aicx_home = aicx::aicx_home::ensure()?;
             let oracle_status = aicx::oracle::OracleStatus::canonical_corpus_scan(
-                &store_root,
+                &aicx_home,
                 extraction.stats.scanned_count,
                 extraction.stats.candidate_count,
                 extraction.stats.source_paths_verified,
@@ -6988,14 +6988,14 @@ fn resolve_project_filters_or_error(
             match_mode,
         });
     }
-    let store_root = aicx::aicx_home::ensure()?;
+    let aicx_home = aicx::aicx_home::ensure()?;
     // Search doctrine: never stream retired multi-GB embeddings.ndjson for
     // `-p` resolution. Exact `owner/repo` forms pass through; bare names use
     // shallow store dirs + indexed bucket names + durable catalog.
     let corpus = if include_index {
-        legacy_archive::project_identities_for_search_at(&store_root)?
+        legacy_archive::project_identities_for_search_at(&aicx_home)?
     } else {
-        legacy_archive::project_identities_in_store_at(&store_root)?
+        legacy_archive::project_identities_in_store_at(&aicx_home)?
     };
     // Accept already-canonical owner/repo filters even when the local store
     // layout is empty (operator trashed cards): project is metadata on the
@@ -7090,8 +7090,8 @@ fn run_eval_search_quality(args: SearchQualityEvalArgs) -> Result<()> {
     }
 
     let bin = aicx_bin.unwrap_or(std::env::current_exe()?);
-    let store_root = aicx::aicx_home::ensure()?;
-    let project_filters = aicx::search_eval::discover_projects_for_cases(&store_root, &selected)?;
+    let aicx_home = aicx::aicx_home::ensure()?;
+    let project_filters = aicx::search_eval::discover_projects_for_cases(&aicx_home, &selected)?;
     let mut evaluations = Vec::new();
 
     for case in selected {
@@ -7155,7 +7155,7 @@ fn run_eval_search_quality(args: SearchQualityEvalArgs) -> Result<()> {
         }
     }
 
-    let report = aicx::search_eval::build_run_report(store_root.display().to_string(), evaluations);
+    let report = aicx::search_eval::build_run_report(aicx_home.display().to_string(), evaluations);
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
@@ -8076,9 +8076,9 @@ fn run_steer(args: SteerRunArgs<'_>) -> Result<()> {
     let mut out = io::BufWriter::new(stdout.lock());
     let color = stdout.is_terminal();
     let matched = metadatas.len();
-    let store_root = aicx::aicx_home::ensure()?;
+    let aicx_home = aicx::aicx_home::ensure()?;
     let oracle_status = aicx::oracle::OracleStatus::metadata_steer(
-        &store_root,
+        &aicx_home,
         matched,
         matched,
         aicx::oracle::verify_paths(metadatas.iter().filter_map(|meta| {

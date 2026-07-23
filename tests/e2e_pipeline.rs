@@ -64,13 +64,13 @@ fn e2e_index_and_query_roundtrip() {
 
     // Step 1: probe corpus. If empty, the operator hasn't run extract
     // yet — same precondition the production search would surface.
-    let store_root = aicx::aicx_home::ensure().expect("AICX home");
-    let chunks = aicx::legacy_archive::scan_context_files_project_at(&store_root, None)
-        .expect("scan corpus");
+    let aicx_home = aicx::aicx_home::ensure().expect("AICX home");
+    let chunks =
+        aicx::legacy_archive::scan_context_files_project_at(&aicx_home, None).expect("scan corpus");
     assert!(
         !chunks.is_empty(),
         "canonical corpus at {} is empty — run `aicx extract --all` before invoking the e2e test",
-        store_root.display()
+        aicx_home.display()
     );
 
     // Step 2: build a real index covering up to 16 chunks (small enough
@@ -100,7 +100,7 @@ fn e2e_index_and_query_roundtrip() {
     // Step 3: query the index. Use the fail-fast `try_semantic_search`
     // entrypoint so we exercise the same dispatch the CLI uses.
     let outcome = aicx::search_engine::try_semantic_search(
-        &store_root,
+        &aicx_home,
         "operator decision and architecture",
         5,
         &[None],

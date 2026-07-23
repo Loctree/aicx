@@ -155,7 +155,7 @@ fn cli_and_mcp_render_identical_search_items() {
 
     // --- MCP surface: the exact public retrieval+render path aicx_search uses
     //     for its fuzzy fallback, run in-process against the same store. ---
-    let store_root = aicx_home.clone();
+    let aicx_home = aicx_home.clone();
     let scopes: Vec<Option<&str>> = vec![None];
     let post_filters = aicx::search_engine::SemanticSearchFilters {
         agent: None,
@@ -167,7 +167,7 @@ fn cli_and_mcp_render_identical_search_items() {
         deep: false,
     };
     let (results, scanned) = aicx::search_engine::fuzzy_search_with_post_filters(
-        &store_root,
+        &aicx_home,
         QUERY,
         LIMIT,
         &scopes,
@@ -176,9 +176,9 @@ fn cli_and_mcp_render_identical_search_items() {
     )
     .expect("mcp-path fuzzy retrieval");
     let results = aicx::search_engine::finalize_fuzzy_results(results, None, None, LIMIT);
-    let oracle_status = aicx::rank::search_oracle_status(&store_root, &results, scanned);
+    let oracle_status = aicx::rank::search_oracle_status(&aicx_home, &results, scanned);
     let rendered =
-        aicx::rank::render_search_json_with_oracle(&store_root, &results, scanned, oracle_status)
+        aicx::rank::render_search_json_with_oracle(&aicx_home, &results, scanned, oracle_status)
             .expect("mcp-path render");
     let mcp_json: Value =
         serde_json::from_str(&rendered).expect("mcp-path payload must be valid JSON");
@@ -218,10 +218,10 @@ fn dense_only_semantic_json_is_not_false_green() {
 
     // Status construction through the single shared owner used by the CLI
     // JSON tail (src/main.rs) and the MCP success path (src/mcp.rs).
-    let store_root = Path::new("/tmp/aicx");
+    let aicx_home = Path::new("/tmp/aicx");
     let retrieval = outcome.retrieval_outcome(5, false);
     let oracle_status = aicx::search_engine::search_oracle_status_from_retrieval(
-        store_root,
+        aicx_home,
         &retrieval,
         outcome.retrieval_status.as_ref(),
         5,
@@ -257,7 +257,7 @@ fn retrieval_outcome_scenarios_serialize_distinctly_across_surfaces() {
         HybridRetrievalStatus, lexical_retrieval_outcome, semantic_retrieval_outcome,
     };
 
-    let store_root = Path::new("/tmp/aicx");
+    let aicx_home = Path::new("/tmp/aicx");
     let hybrid_status = HybridRetrievalStatus {
         generation_id: "g-parity".to_string(),
         source_chunk_count: 123,
@@ -320,14 +320,14 @@ fn retrieval_outcome_scenarios_serialize_distinctly_across_surfaces() {
         // CLI and MCP both call this exact function; invoking it twice stands
         // in for the two surfaces and must be deterministic.
         let cli_status = aicx::search_engine::search_oracle_status_from_retrieval(
-            store_root,
+            aicx_home,
             retrieval,
             *hybrid,
             retrieval.matched_count,
             true,
         );
         let mcp_status = aicx::search_engine::search_oracle_status_from_retrieval(
-            store_root,
+            aicx_home,
             retrieval,
             *hybrid,
             retrieval.matched_count,

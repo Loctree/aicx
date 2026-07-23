@@ -146,7 +146,7 @@ pub struct SearchQualityCaseEvaluation {
 #[derive(Debug, Clone, Serialize)]
 pub struct SearchQualityRunReport {
     pub mode: &'static str,
-    pub store_root: String,
+    pub aicx_home: String,
     pub total: usize,
     pub passed: usize,
     pub failed: usize,
@@ -188,10 +188,10 @@ pub fn select_search_quality_cases<'a>(
 }
 
 pub fn discover_projects_for_cases(
-    store_root: &Path,
+    aicx_home: &Path,
     cases: &[&SearchQualityCase],
 ) -> Result<BTreeMap<String, Vec<String>>> {
-    let store_dir = store_root.join("store");
+    let store_dir = aicx_home.join("store");
     if !store_dir.is_dir() {
         bail!(
             "search-quality eval expected a canonical store at {}; set AICX_HOME to the seeded store",
@@ -417,14 +417,14 @@ pub fn project_resolution_error_evaluation(
 }
 
 pub fn build_run_report(
-    store_root: String,
+    aicx_home: String,
     cases: Vec<SearchQualityCaseEvaluation>,
 ) -> SearchQualityRunReport {
     let passed = cases.iter().filter(|case| case.passed).count();
     let total = cases.len();
     SearchQualityRunReport {
         mode: "search_quality",
-        store_root,
+        aicx_home,
         total,
         passed,
         failed: total.saturating_sub(passed),
@@ -467,7 +467,7 @@ pub fn render_run_report_text(report: &SearchQualityRunReport) -> String {
     let mut output = String::new();
     output.push_str(&format!(
         "Search quality eval: {}/{} passed (store: {})\n",
-        report.passed, report.total, report.store_root
+        report.passed, report.total, report.aicx_home
     ));
 
     for case in &report.cases {
