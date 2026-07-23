@@ -3,7 +3,7 @@
 //! The per-frame card mill under `~/.aicx/store` is **retired** (extracts-store cut).
 //! Live identity is catalog + extracts + source-driven index (`aicx catalog` /
 //! `aicx extract` / `aicx index`). This module still exposes:
-//! - path helpers (`resolve_aicx_home`, `store_base_dir`, project identity)
+//! - explicit legacy card/archive paths and project identity
 //! - scan/read of any residual on-disk corpus for doctor/migration
 //! - no write APIs: catalog + extracts + source-driven index own persistence
 //!
@@ -119,21 +119,18 @@ pub(crate) mod sidecar;
 use dedupe::DirShaCache;
 use dedupe::content_sha256;
 pub use dedupe::content_sha256_exists_in_dir;
-#[cfg(test)]
-use paths::validated_store_project_dir;
 
 pub use ignore::{
     AICX_IGNORE_FILENAME, StoreIgnoreMatcher, filter_ignored_paths_at, load_ignore_matcher_at,
 };
 use paths::aicx_context_corpus_dir_for;
-pub(crate) use paths::canonical_project_slug;
 pub use paths::{
     CANONICAL_STORE_DIRNAME, CONTEXT_CORPUS_DIRNAME, CONTEXT_CORPUS_SCHEMA_VERSION,
-    LEGACY_SALVAGE_DIRNAME, LOCT_CONTEXT_PACK_FAMILY, NON_REPOSITORY_CONTEXTS,
-    OWNERLESS_PROJECT_ORGANIZATION, aicx_context_corpus_dir, canonical_store_dir, chunks_dir,
-    chunks_dir_for, context_corpus_root_dir, get_context_json_path, get_context_path,
-    legacy_store_base_dir, non_repository_contexts_dir, project_dir, resolve_aicx_home,
-    store_base_dir, store_base_dir_for,
+    LEGACY_CARDS_DIRNAME, LEGACY_SALVAGE_DIRNAME, LOCT_CONTEXT_PACK_FAMILY,
+    NON_REPOSITORY_CONTEXTS, OWNERLESS_PROJECT_ORGANIZATION, aicx_context_corpus_dir,
+    chunks_dir_for, context_corpus_root_dir, legacy_cards_dir, legacy_cards_dir_for,
+    legacy_store_base_dir, non_repository_contexts_dir, resolve_aicx_home, store_base_dir,
+    store_base_dir_for,
 };
 use sidecar::load_sidecar_from_path;
 pub use sidecar::{is_context_corpus_sidecar, load_sidecar, sidecar_path_for_chunk};
@@ -142,7 +139,7 @@ pub use sidecar::{is_context_corpus_sidecar, load_sidecar, sidecar_path_for_chun
 // Index types
 // ============================================================================
 
-/// Manifest of all stored contexts.
+/// Historical `index.json` schema retained for archive inspection/migration.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct StoreIndex {
     pub projects: HashMap<String, ProjectIndex>,
@@ -164,43 +161,8 @@ pub struct AgentIndex {
 }
 
 // ============================================================================
-// Index operations
+// Legacy index inspection/migration
 // ============================================================================
-
-/// Load the store index from `~/.aicx/index.json`.
-///
-/// Returns a default empty index if the file doesn't exist. If the file
-/// exists but cannot be read or parsed (and no `.bak` sibling rescues it),
-/// emits a `tracing::warn!` and still returns default to preserve the
-/// public `StoreIndex` API; callers that need fail-fast semantics on a
-/// corrupt index should call `load_index_at` directly.
-pub fn load_index() -> StoreIndex {
-    let base = match store_base_dir() {
-        Ok(dir) => dir,
-        Err(_) => return StoreIndex::default(),
-    };
-    let lock_path = match crate::locks::index_lock_path() {
-        Ok(path) => path,
-        Err(err) => {
-            tracing::warn!("failed to resolve index lock path: {err}");
-            return StoreIndex::default();
-        }
-    };
-    let _lock = match crate::locks::acquire_shared(lock_path) {
-        Ok(lock) => lock,
-        Err(err) => {
-            tracing::warn!("failed to acquire shared index lock: {err}");
-            return StoreIndex::default();
-        }
-    };
-    match load_index_at(&base) {
-        Ok(idx) => idx,
-        Err(err) => {
-            tracing::warn!("failed to load store index (returning empty default): {err:#}");
-            StoreIndex::default()
-        }
-    }
-}
 
 fn load_index_at(base: &Path) -> Result<StoreIndex> {
     let path = base.join("index.json");
@@ -244,15 +206,6 @@ fn read_and_parse_index(path: &Path) -> Result<StoreIndex> {
     serde_json::from_str(&contents).with_context(|| format!("parse failed: {}", path.display()))
 }
 
-/// Persist the store index to disk.
-pub fn save_index(index: &StoreIndex) -> Result<()> {
-    let base = store_base_dir()?;
-    let lock = crate::locks::acquire_exclusive(crate::locks::index_lock_path()?)?;
-    let result = save_index_at(&base, index);
-    crate::locks::release(lock);
-    result
-}
-
 fn save_index_at(base: &Path, index: &StoreIndex) -> Result<()> {
     let path = base.join("index.json");
     let json = serde_json::to_string_pretty(index).context("Failed to serialize index")?;
@@ -289,40 +242,6 @@ fn save_index_at(base: &Path, index: &StoreIndex) -> Result<()> {
     atomic_write(&path, json.as_bytes())
         .with_context(|| format!("Failed to write index: {}", path.display()))?;
     Ok(())
-}
-
-/// Update the in-memory index with a new context entry.
-pub fn update_index(
-    index: &mut StoreIndex,
-    project: &str,
-    agent: &str,
-    date: &str,
-    entry_count: usize,
-) {
-    let now = Utc::now();
-    index.last_updated = now;
-
-    let project_idx = index
-        .projects
-        .entry(canonical_project_slug(project))
-        .or_default();
-
-    let agent_idx = project_idx.agents.entry(agent.to_string()).or_default();
-
-    if !agent_idx.dates.contains(&date.to_string()) {
-        agent_idx.dates.push(date.to_string());
-        agent_idx.dates.sort();
-    }
-
-    agent_idx.total_entries += entry_count;
-    agent_idx.last_updated = now;
-}
-
-/// List all projects in the index.
-pub fn list_stored_projects(index: &StoreIndex) -> Vec<String> {
-    let mut projects: Vec<String> = index.projects.keys().cloned().collect();
-    projects.sort();
-    projects
 }
 
 #[derive(Debug, Clone)]

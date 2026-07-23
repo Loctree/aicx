@@ -1,4 +1,4 @@
-//! Cards v1 → v2 in-place store migration (`aicx migrate --cards-v2`).
+//! Cards v1 → v2 in-place legacy archive migration (`aicx migrate --cards-v2`).
 //!
 //! Upgrades existing canonical-store cards to the card schema v2 contract
 //! (docs/CARD_CONTRACT.md): the `.meta.json` sidecar gains `schema_version: 2`
@@ -20,7 +20,7 @@
 //!
 //! Streaming: the walk visits one card at a time and holds only manifest
 //! metadata (paths, old header line, field names) in memory — never file
-//! contents — so memory does not scale with store size.
+//! contents — so memory does not scale with archive size.
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -35,7 +35,7 @@ use crate::chunker::{
 };
 use crate::legacy_archive::atomic_write::atomic_write;
 use crate::legacy_archive::dedupe::content_sha256;
-use crate::legacy_archive::paths::canonical_store_dir;
+use crate::legacy_archive::paths::legacy_cards_dir;
 use crate::legacy_archive::sidecar::sidecar_path_for_chunk;
 use crate::legacy_archive::{is_context_corpus_sidecar, read_store_dir};
 use crate::sanitize;
@@ -145,7 +145,7 @@ fn count_action(items: &[CardsV2Item], action: CardsV2Action) -> usize {
 pub fn run_cards_v2_migration(dry_run: bool, root: Option<PathBuf>) -> Result<CardsV2Manifest> {
     let root = match root {
         Some(root) => root,
-        None => canonical_store_dir()?,
+        None => legacy_cards_dir()?,
     };
     let manifest = run_cards_v2_migration_at(&root, dry_run)?;
 

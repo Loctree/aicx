@@ -5,7 +5,7 @@
 //! conversation Markdown. Loctree owns structural identity; this module joins
 //! distilled card claims to the catalog emitted by `loct anchors`.
 
-use crate::legacy_archive::{canonical_store_dir, read_canonical_projection_at, resolve_aicx_home};
+use crate::legacy_archive::{legacy_cards_dir, read_canonical_projection_at, resolve_aicx_home};
 use crate::rank::{SEMANTIC_INTENT_CANDIDATE_THRESHOLD, intent_candidate_similarity};
 use aicx_parser::engine::{Known, TurnRole};
 use aicx_parser::projections::CanonicalCard;
@@ -202,7 +202,7 @@ pub fn build_overlay(options: &OverlayOptions) -> Result<(OverlayDocument, Overl
     let store_root = options
         .store_root
         .clone()
-        .unwrap_or(canonical_store_dir()?)
+        .unwrap_or(legacy_cards_dir()?)
         .canonicalize()
         .context("canonical C6 store root is missing or unreadable")?;
     let projections = discover_canonical_projections(&store_root)?;

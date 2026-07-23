@@ -12,7 +12,6 @@ use crate::chunker::ChunkerConfig;
 use crate::legacy_archive::atomic_write::atomic_write;
 use crate::legacy_archive::paths::{
     legacy_salvage_dir, legacy_store_base_dir, migration_manifest_path, migration_report_path,
-    store_base_dir,
 };
 use crate::sanitize;
 #[cfg(feature = "app")]
@@ -216,7 +215,7 @@ pub fn run_migration_with_paths(
     store_root: Option<PathBuf>,
 ) -> Result<MigrationManifest> {
     let legacy_root = legacy_root.unwrap_or(legacy_store_base_dir()?);
-    let store_root = store_root.unwrap_or(store_base_dir()?);
+    let store_root = store_root.unwrap_or(crate::aicx_home::ensure()?);
     let locator = SourceLocator::from_home();
     let manifest = run_migration_at(&legacy_root, &store_root, dry_run, &locator)?;
 

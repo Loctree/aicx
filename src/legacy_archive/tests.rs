@@ -4,7 +4,7 @@ use filetime::{FileTime, set_file_mtime};
 use std::{env, fs};
 
 // ──────────────────────────────────────────────────────────────────
-// AICX-home / store-base / chunks-dir contract tests.
+// AICX-home / legacy archive / chunks-dir contract tests.
 //
 // The legacy tests asserted `path.contains(".aicx")` which was a
 // literal-pattern relic from before `$AICX_HOME` override existed.
@@ -78,6 +78,20 @@ fn test_chunks_dir_for_lives_under_home_and_named_chunks() {
         chunks.file_name().and_then(|n| n.to_str()),
         Some("chunks"),
         "chunks_dir_for should end with `chunks`; got {chunks:?}"
+    );
+}
+
+#[test]
+fn legacy_cards_dir_for_is_pure_and_does_not_regrow_archive() {
+    let home = retrieval_test_root("legacy-cards-path-pure");
+    let _ = fs::remove_dir_all(&home);
+
+    let archive = legacy_cards_dir_for(&home);
+
+    assert_eq!(archive, home.join(LEGACY_CARDS_DIRNAME));
+    assert!(
+        !home.exists(),
+        "resolving a legacy archive path must not create AICX home or store/"
     );
 }
 
@@ -283,111 +297,6 @@ fn test_canonical_resolvers_agree_on_pinned_home() {
 }
 
 #[test]
-fn test_get_context_path_new_layout() {
-    // Case-preserving canonical (relaxed 2026-05-12): `Codescribe`
-    // stays `Codescribe` instead of being lowered to `codescribe`.
-    if let Ok(path) = get_context_path("Codescribe", "claude", "2026-01-22", "143005") {
-        let s = path.to_string_lossy();
-        assert!(s.contains("Codescribe"));
-        assert!(s.contains("2026-01-22"));
-        assert!(s.ends_with("143005_claude-context.md"));
-    }
-}
-
-#[test]
-fn test_get_context_json_path_new_layout() {
-    if let Ok(path) = get_context_json_path("Codescribe", "claude", "2026-01-22", "143005") {
-        let s = path.to_string_lossy();
-        assert!(s.contains("Codescribe"));
-        assert!(s.contains("2026-01-22"));
-        assert!(s.ends_with("143005_claude-context.json"));
-    }
-}
-
-#[test]
-fn canonical_project_slug_preserves_legit_shapes_and_lets_validator_reject_junk() {
-    use crate::validation::is_valid_repo_project_slug;
-
-    // Case is preserved — CamelCase GitHub orgs and dot/underscore-prefix
-    // bucket names pass through `canonical_project_slug` unchanged, and
-    // the validator accepts them directly (relaxed 2026-05-12 from prior
-    // lowercase-only schema).
-    assert_eq!(canonical_project_slug("local/.scripts"), "local/.scripts");
-    assert_eq!(canonical_project_slug("local/.aicx"), "local/.aicx");
-    assert_eq!(canonical_project_slug("local/_priv"), "local/_priv");
-    assert_eq!(canonical_project_slug("Vetcoders/Vista"), "Vetcoders/Vista");
-    assert_eq!(
-        canonical_project_slug("LibraxisAI/lbrxAgents"),
-        "LibraxisAI/lbrxAgents"
-    );
-    assert_eq!(canonical_project_slug("a/b"), "a/b");
-    // Trailing whitespace is trimmed:
-    assert_eq!(
-        canonical_project_slug("  vetcoders / aicx  "),
-        "vetcoders/aicx"
-    );
-
-    for s in [
-        "local/.scripts",
-        "local/.aicx",
-        "local/_priv",
-        "Vetcoders/Vista",
-        "LibraxisAI/lbrxAgents",
-        ".github",
-        ".aicx",
-    ] {
-        assert!(
-            is_valid_repo_project_slug(&canonical_project_slug(s)),
-            "{s} should round-trip through canonical_project_slug + validator"
-        );
-    }
-
-    // Mid-segment garbage (newlines, shell metacharacters, leading `$`/
-    // `{`/`<`) is intentionally NOT sanitized — the validator must
-    // still reject it so an extractor bug surfaces instead of silently
-    // writing mangled-but-passable filesystem paths.
-    assert!(!is_valid_repo_project_slug(&canonical_project_slug(
-        "Vetcoders/vibecrafted.git`"
-    )));
-    assert!(!is_valid_repo_project_slug(&canonical_project_slug(
-        "Vetcoders/loctree\n\n**AICX"
-    )));
-    assert!(!is_valid_repo_project_slug(&canonical_project_slug(
-        "${RELEASE_REPO}/releases"
-    )));
-}
-
-#[test]
-fn validated_store_project_dir_rejects_junk_bucket_segments() {
-    let root = retrieval_test_root("invalid-bucket-segments");
-    let _ = fs::remove_dir_all(&root);
-    fs::create_dir_all(&root).unwrap();
-
-    let bad = "Vetcoders/vibecrafted.git`";
-    let err = validated_store_project_dir(&root, bad).expect_err("invalid repo bucket");
-    assert!(
-        err.to_string()
-            .contains("invalid canonical store project bucket")
-    );
-    assert!(!root.join("Vetcoders").join("vibecrafted.git`").exists());
-
-    let bad = "Vetcoders/loctree\n\n**AICX";
-    assert!(validated_store_project_dir(&root, bad).is_err());
-    assert!(!root.join("Vetcoders").join("loctree\n\n**AICX").exists());
-
-    let bad = "Vetcoders/loctxc_O)outcomqqqqqqq]]qqqqqqqqqqqqqqqqqqqqqqqqqqq;;'[";
-    assert!(validated_store_project_dir(&root, bad).is_err());
-    assert!(
-        !root
-            .join("Vetcoders")
-            .join("loctxc_O)outcomqqqqqqq]]qqqqqqqqqqqqqqqqqqqqqqqqqqq;;'[")
-            .exists()
-    );
-
-    let _ = fs::remove_dir_all(&root);
-}
-
-#[test]
 fn test_write_context_creates_both_files() {
     let tmp = env::temp_dir().join("ai-ctx-test-store-new");
     let _ = fs::remove_dir_all(&tmp);
@@ -453,64 +362,6 @@ fn test_write_context_creates_both_files() {
     assert!(json_path.exists());
 
     let _ = fs::remove_dir_all(&tmp);
-}
-
-#[test]
-fn test_index_serialization_roundtrip() {
-    let mut index = StoreIndex::default();
-    update_index(&mut index, "Codescribe", "claude", "2026-01-22", 42);
-    update_index(&mut index, "Codescribe", "gemini", "2026-01-20", 10);
-    update_index(&mut index, "vista", "claude", "2026-01-21", 5);
-
-    let json = serde_json::to_string_pretty(&index).unwrap();
-    let restored: StoreIndex = serde_json::from_str(&json).unwrap();
-
-    // Case-preserving canonical (relaxed 2026-05-12): `Codescribe`
-    // stays `Codescribe` instead of being lowered to `codescribe`.
-    assert_eq!(restored.projects.len(), 2);
-    assert!(restored.projects.contains_key("Codescribe"));
-    assert!(restored.projects.contains_key("vista"));
-
-    let cs = &restored.projects["Codescribe"];
-    assert_eq!(cs.agents["claude"].total_entries, 42);
-    assert_eq!(cs.agents["claude"].dates, vec!["2026-01-22"]);
-    assert_eq!(cs.agents["gemini"].total_entries, 10);
-}
-
-#[test]
-fn test_update_index() {
-    let mut index = StoreIndex::default();
-
-    update_index(&mut index, "proj", "claude", "2026-01-20", 10);
-    update_index(&mut index, "proj", "claude", "2026-01-21", 5);
-    update_index(&mut index, "proj", "claude", "2026-01-20", 3); // same date, adds to total
-
-    let agent_idx = &index.projects["proj"].agents["claude"];
-    assert_eq!(agent_idx.total_entries, 18); // 10 + 5 + 3
-    assert_eq!(agent_idx.dates, vec!["2026-01-20", "2026-01-21"]);
-}
-
-#[test]
-fn test_list_stored_projects() {
-    let mut index = StoreIndex::default();
-    update_index(&mut index, "zebra", "claude", "2026-01-01", 1);
-    update_index(&mut index, "alpha", "codex", "2026-01-01", 1);
-    update_index(&mut index, "middle", "gemini", "2026-01-01", 1);
-
-    let projects = list_stored_projects(&index);
-    assert_eq!(projects, vec!["alpha", "middle", "zebra"]); // sorted
-}
-
-#[test]
-fn test_update_index_deduplicates_dates() {
-    let mut index = StoreIndex::default();
-    update_index(&mut index, "proj", "claude", "2026-01-22", 5);
-    update_index(&mut index, "proj", "claude", "2026-01-22", 3);
-    update_index(&mut index, "proj", "claude", "2026-01-22", 7);
-
-    let dates = &index.projects["proj"].agents["claude"].dates;
-    assert_eq!(dates.len(), 1); // no duplicates
-    assert_eq!(dates[0], "2026-01-22");
 }
 
 // ================================================================
@@ -2209,8 +2060,23 @@ fn test_malformed_index_json_returns_error_not_default() {
 
     // Add a valid .bak sibling → recovery returns it.
     let bak_path = index_path.with_extension("json.bak");
-    let mut good = StoreIndex::default();
-    update_index(&mut good, "Vetcoders/aicx", "claude", "2026_0520", 7);
+    let now = Utc::now();
+    let good = StoreIndex {
+        projects: std::collections::HashMap::from([(
+            "Vetcoders/aicx".to_string(),
+            ProjectIndex {
+                agents: std::collections::HashMap::from([(
+                    "claude".to_string(),
+                    AgentIndex {
+                        dates: vec!["2026_0520".to_string()],
+                        total_entries: 7,
+                        last_updated: now,
+                    },
+                )]),
+            },
+        )]),
+        last_updated: now,
+    };
     fs::write(
         &bak_path,
         serde_json::to_string_pretty(&good).unwrap().as_bytes(),
