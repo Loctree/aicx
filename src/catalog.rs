@@ -13,7 +13,7 @@
 //! files are written.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File};
+use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -75,10 +75,9 @@ pub fn read_entries_at(home: &Path) -> Result<Vec<CatalogEntry>> {
     if !path.exists() {
         return Ok(Vec::new());
     }
-    // `home` is the operator AICX root (env/home resolution), never a network
-    // request path; `path` is that root + fixed `catalog/sessions.jsonl`.
-    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
-    let file = File::open(&path).with_context(|| format!("open catalog {}", path.display()))?;
+    // Containment: catalog must resolve under the AICX home allowlist.
+    let file = crate::source_path::open_under_aicx_home(home, &path)
+        .with_context(|| format!("open catalog {}", path.display()))?;
     let reader = BufReader::new(file);
     let mut entries = Vec::new();
     for (line_no, line) in reader.lines().enumerate() {
@@ -99,9 +98,9 @@ pub fn project_identities_from_catalog_at(store_root: &Path) -> Result<Vec<Strin
     if !path.exists() {
         return Ok(Vec::new());
     }
-    // Operator-owned store root + fixed catalog filename — not actix request input.
-    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
-    let file = File::open(&path).with_context(|| format!("open catalog {}", path.display()))?;
+    // Containment: catalog must resolve under the AICX home allowlist.
+    let file = crate::source_path::open_under_aicx_home(store_root, &path)
+        .with_context(|| format!("open catalog {}", path.display()))?;
     let reader = BufReader::new(file);
     let mut identities = BTreeSet::new();
     for line in reader.lines() {
@@ -526,6 +525,7 @@ fn hostname() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::File;
     use std::io::Write;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};

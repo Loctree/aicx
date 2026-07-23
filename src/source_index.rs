@@ -85,7 +85,7 @@ pub fn build(
         .into_iter()
         .filter(|entry| project_selected(entry.project.as_deref(), project_filters))
         .collect();
-    let source_fingerprint = source_fingerprint(&catalog_path, &selected)?;
+    let source_fingerprint = source_fingerprint(aicx_home, &catalog_path, &selected)?;
     // Incremental short-circuit applies to both publish and dry-run. A matching
     // catalog fingerprint means CURRENT already reflects this snapshot — re-parsing
     // ~10k sources on every `index --dry-run` recreated the mill latency the
@@ -122,9 +122,12 @@ pub fn build(
     let mut extracts_written = 0usize;
     let mut skipped_by_agent = BTreeMap::new();
 
+    let user_home = crate::os_user_home().unwrap_or_else(|| aicx_home.to_path_buf());
+    let source_allow = crate::source_path::SourceAllowlist::for_operator(&user_home, aicx_home);
+
     for entry in &selected {
         let source_path = Path::new(&entry.source_path);
-        let mut frames = match parse_catalog_source(entry, source_path) {
+        let mut frames = match parse_catalog_source(entry, source_path, &source_allow) {
             Ok(frames) => frames,
             Err(error) => {
                 crate::diagnostics::log_describe(&format!(
@@ -232,9 +235,19 @@ pub fn build(
     })
 }
 
-fn parse_catalog_source(entry: &CatalogEntry, path: &Path) -> Result<Vec<TimelineEntry>> {
+fn parse_catalog_source(
+    entry: &CatalogEntry,
+    path: &Path,
+    allow: &crate::source_path::SourceAllowlist,
+) -> Result<Vec<TimelineEntry>> {
+    // Canonicalize + prove containment under approved source roots before any open.
+    let path = allow
+        .resolve_file(path)
+        .with_context(|| format!("resolve catalog source {}", path.display()))?;
+
     if entry.agent == "vibecrafted" {
-        let body = crate::sanitize::read_to_string_validated(path)
+        let body = allow
+            .read_to_string(&path)
             .with_context(|| format!("read runtime transcript {}", path.display()))?;
         // Token-stream runtime_runs logs interleave thought fragments with
         // visible text. Indexing the raw body made search surface
@@ -243,7 +256,7 @@ fn parse_catalog_source(entry: &CatalogEntry, path: &Path) -> Result<Vec<Timelin
         if message.trim().is_empty() {
             return Ok(Vec::new());
         }
-        let timestamp = fs::metadata(path)
+        let timestamp = fs::metadata(&path)
             .ok()
             .and_then(|metadata| metadata.modified().ok())
             .map(chrono::DateTime::<chrono::Utc>::from)
@@ -264,11 +277,11 @@ fn parse_catalog_source(entry: &CatalogEntry, path: &Path) -> Result<Vec<Timelin
         }]);
     }
 
-    let source_bytes = fs::metadata(path)
+    let source_bytes = fs::metadata(&path)
         .with_context(|| format!("stat source {}", path.display()))?
         .len();
     if entry.agent == "codex" && source_bytes > MAX_FULL_PARSE_BYTES {
-        return parse_large_codex_signal(entry, path);
+        return parse_large_codex_signal(entry, &path, allow);
     }
     if source_bytes > MAX_FULL_PARSE_BYTES {
         anyhow::bail!(
@@ -290,7 +303,7 @@ fn parse_catalog_source(entry: &CatalogEntry, path: &Path) -> Result<Vec<Timelin
         agent,
         &entry.session_id,
         entry.logical_session_id.clone(),
-        path,
+        &path,
     )?;
     Ok(crate::output::timeline_entries_from_model(parsed.model()))
 }
@@ -301,10 +314,15 @@ fn parse_catalog_source(entry: &CatalogEntry, path: &Path) -> Result<Vec<Timelin
 /// pasted artifacts share the JSONL. The full canonical projection pays for
 /// all of that noise. This path drains over-cap records without allocating
 /// them and deserializes only bounded message records.
-fn parse_large_codex_signal(entry: &CatalogEntry, path: &Path) -> Result<Vec<TimelineEntry>> {
-    // `path` comes from cataloged local session sources (operator home), not HTTP.
-    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
-    let file = fs::File::open(path).with_context(|| format!("open source {}", path.display()))?;
+fn parse_large_codex_signal(
+    entry: &CatalogEntry,
+    path: &Path,
+    allow: &crate::source_path::SourceAllowlist,
+) -> Result<Vec<TimelineEntry>> {
+    // `path` is already resolve_file'd by the caller; open through the allowlist.
+    let file = allow
+        .open_file(path)
+        .with_context(|| format!("open source {}", path.display()))?;
     let mut reader = BufReader::new(file);
     let mut frames = Vec::new();
     let mut line_no = 0u64;
@@ -527,7 +545,11 @@ fn project_selected(project: Option<&str>, filters: &[String]) -> bool {
         })
 }
 
-fn source_fingerprint(catalog_path: &Path, entries: &[CatalogEntry]) -> Result<String> {
+fn source_fingerprint(
+    aicx_home: &Path,
+    catalog_path: &Path,
+    entries: &[CatalogEntry],
+) -> Result<String> {
     let mut hasher = Sha256::new();
     // Filter generation first so a catalog-identical CURRENT cannot hide a
     // pre-filter corpus after signal-body rules change.
@@ -538,10 +560,9 @@ fn source_fingerprint(catalog_path: &Path, entries: &[CatalogEntry]) -> Result<S
     // indexing and would make every immediate second run look dirty. A
     // subsequent `aicx catalog rebuild` changes the catalog bytes and admits
     // the new source snapshot deterministically.
-    // `catalog_path` is the operator AICX catalog file under aicx_home.
-    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
+    // Catalog bytes must resolve under the AICX home allowlist.
     hasher.update(
-        fs::read(catalog_path)
+        crate::source_path::read_bytes_under_aicx_home(aicx_home, catalog_path)
             .with_context(|| format!("read catalog {}", catalog_path.display()))?,
     );
     for entry in entries {

@@ -224,6 +224,15 @@ fn is_temp_allowlist_path(path: &Path) -> bool {
     false
 }
 
+/// Whether a path is under the tempfile allowlist **and** that allowlist is
+/// currently enabled (test harness or `AICX_ALLOW_TMP=1`).
+///
+/// Used by the app-layer source resolver so unit tests under `/tmp` keep
+/// working without reopening production path escapes.
+pub fn path_is_temp_allowlisted(path: &Path) -> bool {
+    is_temp_allowlist_path(path) && temp_allowlist_enabled()
+}
+
 /// Strip a Windows `\\?\` (or `\\?\UNC\`) verbatim prefix so `Path::starts_with`
 /// compares plain `C:\…` components. `canonicalize()` yields verbatim paths on
 /// Windows; starts_with between a verbatim path and either a non-verbatim base
