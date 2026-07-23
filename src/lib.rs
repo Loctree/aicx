@@ -188,9 +188,9 @@ mod loctree_consumer_contract_tests {
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).expect("create slim store root");
+        std::fs::create_dir_all(&root).expect("create slim AICX home");
 
-        let client = Aicx::with_store_root(&root);
+        let client = Aicx::with_aicx_home(&root);
         assert!(client.list_chunks().expect("list chunks").is_empty());
         assert!(client.read_chunk("chunk:abcdef12", Some(16)).is_err());
 

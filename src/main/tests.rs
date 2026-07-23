@@ -882,7 +882,7 @@ fn intents_json_envelope_reports_cap_warning_and_limit_saturation() {
     body.push_str("[/signals]\n");
     fs::write(&selected_chunk, body).expect("write over-cap intents fixture");
 
-    let extraction = aicx::api::Aicx::with_store_root(&root)
+    let extraction = aicx::api::Aicx::with_aicx_home(&root)
         .extract_intents(&intents::IntentsConfig {
             project: resolution.selected[0].clone(),
             hours: 0,

@@ -27,19 +27,19 @@ use crate::timeline::FrameKind;
 #[derive(Debug, Clone)]
 pub struct AicxConfig {
     /// AICX base directory. Defaults to `~/.aicx`.
-    pub store_root: PathBuf,
+    pub aicx_home: PathBuf,
 }
 
 impl AicxConfig {
     pub fn from_env() -> Result<Self> {
         Ok(Self {
-            store_root: crate::aicx_home::ensure()?,
+            aicx_home: crate::aicx_home::ensure()?,
         })
     }
 
-    pub fn with_store_root(path: impl Into<PathBuf>) -> Self {
+    pub fn with_aicx_home(path: impl Into<PathBuf>) -> Self {
         Self {
-            store_root: path.into(),
+            aicx_home: path.into(),
         }
     }
 }
@@ -57,9 +57,9 @@ impl Aicx {
         })
     }
 
-    pub fn with_store_root(path: impl Into<PathBuf>) -> Self {
+    pub fn with_aicx_home(path: impl Into<PathBuf>) -> Self {
         Self {
-            config: AicxConfig::with_store_root(path),
+            config: AicxConfig::with_aicx_home(path),
         }
     }
 
@@ -67,12 +67,12 @@ impl Aicx {
         &self.config
     }
 
-    pub fn store_root(&self) -> &Path {
-        &self.config.store_root
+    pub fn aicx_home(&self) -> &Path {
+        &self.config.aicx_home
     }
 
     pub fn list_chunks(&self) -> Result<Vec<StoredContextFile>> {
-        crate::legacy_archive::scan_context_files_at(&self.config.store_root)
+        crate::legacy_archive::scan_context_files_at(&self.config.aicx_home)
     }
 
     pub fn read_chunk(
@@ -81,7 +81,7 @@ impl Aicx {
         max_chars: Option<usize>,
     ) -> Result<ReadContextChunk> {
         crate::legacy_archive::read_context_chunk_at(
-            &self.config.store_root,
+            &self.config.aicx_home,
             reference.as_ref(),
             max_chars,
         )
@@ -102,7 +102,7 @@ impl Aicx {
             opts.projects
         };
         let project_scopes_owned =
-            search_project_scopes(&self.config.store_root, &owned_projects, opts.project_match)?;
+            search_project_scopes(&self.config.aicx_home, &owned_projects, opts.project_match)?;
         let project_scopes: Vec<Option<&str>> = project_scopes_owned
             .iter()
             .map(|scope| scope.as_deref())
@@ -117,7 +117,7 @@ impl Aicx {
         };
 
         let outcome = crate::search_engine::try_semantic_search(
-            &self.config.store_root,
+            &self.config.aicx_home,
             query.as_ref(),
             opts.limit,
             &project_scopes,
@@ -136,7 +136,7 @@ impl Aicx {
     pub fn extract_intents(&self, config: &IntentsConfig) -> Result<IntentExtraction> {
         crate::intents::extract_intents_from_root_at_with_stats(
             config,
-            &self.config.store_root,
+            &self.config.aicx_home,
             chrono::Utc::now(),
         )
     }
@@ -149,18 +149,18 @@ impl Aicx {
         crate::intents::extract_intents_from_root_at_for_projects_with_stats(
             config,
             projects,
-            &self.config.store_root,
+            &self.config.aicx_home,
             chrono::Utc::now(),
         )
     }
 
     #[cfg(feature = "app")]
     pub async fn doctor(&self, opts: &DoctorOptions) -> Result<DoctorReport> {
-        crate::doctor::run_at(&self.config.store_root, opts).await
+        crate::doctor::run_at(&self.config.aicx_home, opts).await
     }
 
     pub fn index_status(&self, project: Option<&str>) -> Result<IndexStatus> {
-        index_status_at(&self.config.store_root, project)
+        index_status_at(&self.config.aicx_home, project)
     }
 }
 
@@ -191,14 +191,14 @@ impl Default for SearchOptions {
 
 #[cfg(feature = "app")]
 fn search_project_scopes(
-    store_root: &Path,
+    aicx_home: &Path,
     projects: &[String],
     match_mode: crate::legacy_archive::ProjectMatchMode,
 ) -> Result<Vec<Option<String>>> {
     if projects.is_empty() {
         return Ok(vec![None]);
     }
-    let corpus = crate::legacy_archive::project_identities_in_store_or_index_at(store_root)?;
+    let corpus = crate::legacy_archive::project_identities_in_store_or_index_at(aicx_home)?;
     let resolution =
         crate::legacy_archive::require_project_resolution(projects, &corpus, match_mode)?;
     Ok(resolution.selected.into_iter().map(Some).collect())
@@ -784,12 +784,12 @@ mod tests {
     use chrono::{TimeZone, Utc};
 
     #[test]
-    fn client_can_scan_empty_store_root() {
+    fn client_can_scan_empty_aicx_home() {
         let root = std::env::temp_dir().join(format!("aicx-api-empty-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).expect("create root");
 
-        let client = Aicx::with_store_root(&root);
+        let client = Aicx::with_aicx_home(&root);
         let chunks = client.list_chunks().expect("scan chunks");
         assert!(chunks.is_empty());
 

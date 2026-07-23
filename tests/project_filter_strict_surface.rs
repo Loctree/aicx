@@ -144,7 +144,7 @@ fn config(project: &str) -> IntentsConfig {
 }
 
 fn extract_via_api(root: &std::path::Path, project: &str) -> IntentExtraction {
-    Aicx::with_store_root(root)
+    Aicx::with_aicx_home(root)
         .extract_intents(&config(project))
         .expect("extract strict-filter intents through public API")
 }

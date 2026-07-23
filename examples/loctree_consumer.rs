@@ -4,7 +4,7 @@
 //!   cargo run --example loctree_consumer --no-default-features --features loctree-consumer
 //!
 //! Everything used here is the stable read core exposed to in-process
-//! consumers such as Loctree: store discovery, canonical chunk enumeration
+//! consumers such as Loctree: AICX-home discovery, legacy chunk enumeration
 //! and reads, typed chunk references, index-readiness inspection, and pure
 //! intent extraction. No CLI, MCP, embedder, or semantic-search surfaces are
 //! linked — `semantic_search`/`SearchOptions` live behind `feature = "app"`.
@@ -14,10 +14,10 @@ use aicx::intents::IntentsConfig;
 use aicx::legacy_archive::ChunkRefSpec;
 
 fn main() -> anyhow::Result<()> {
-    // 1. Resolve the store the same way Loctree does in-process
+    // 1. Resolve AICX home the same way Loctree does in-process
     //    (~/.aicx by default, honoring AICX_HOME overrides).
     let client = Aicx::from_env()?;
-    println!("Store root: {}", client.store_root().display());
+    println!("AICX home: {}", client.aicx_home().display());
 
     // 2. Index status is part of the slim surface: a consumer can tell
     //    whether semantic retrieval would be available without linking it.
@@ -27,7 +27,7 @@ fn main() -> anyhow::Result<()> {
 
     // 3. Enumerate canonical chunks and read one back through the typed
     //    reference API. `ChunkRefSpec` accepts `chunk:<id>` ids as well as
-    //    store-relative paths.
+    //    AICX-home-relative paths.
     let chunks = client.list_chunks()?;
     println!("Stored context files: {}", chunks.len());
 
@@ -37,7 +37,7 @@ fn main() -> anyhow::Result<()> {
     if let Some(first) = chunks.first() {
         let reference = first
             .path
-            .strip_prefix(client.store_root())
+            .strip_prefix(client.aicx_home())
             .unwrap_or(&first.path)
             .to_string_lossy()
             .replace('\\', "/");
