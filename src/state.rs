@@ -419,7 +419,7 @@ impl StateManager {
         }
 
         // Note: caller is responsible for holding `state_lock_path()` exclusive
-        // around the full read-modify-write cycle (see run_store/run_state/etc.
+        // around the full read-modify-write cycle (see extraction/state callers
         // in main.rs). Re-acquiring here would deadlock.
 
         let json = serde_json::to_string_pretty(self).context("Failed to serialize state")?;

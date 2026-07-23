@@ -3313,6 +3313,6 @@ fn lane_claim_source_filter_uses_shared_agent_role_predicate() {
     }
 }
 
-// `run_store` / `resolve_store_agents` / `StoreRunArgs` deleted from main.rs.
+// The retired card-mill route and its argument types are deleted from main.rs.
 // Identity path: catalog rebuild → extract → source-driven index.
 // Runtime grammar coverage: `tests/runtime_cli_store_contract.rs`.
