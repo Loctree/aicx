@@ -153,6 +153,8 @@ pub(crate) fn base_doctor_options(verbose: bool, smoke: bool) -> DoctorOptions {
         rebuild_sidecars: false,
         prune_empty_bodies: false,
         apply_prune_empty_bodies: false,
+        migrate_identities: false,
+        apply_migrate_identities: false,
         check_dedup: false,
         verbose,
         smoke,

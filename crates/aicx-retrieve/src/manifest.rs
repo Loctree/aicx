@@ -11,6 +11,63 @@ use serde::{Deserialize, Serialize};
 
 use crate::ManifestError;
 
+/// Machine-readable description of the exact mmap dense artifact referenced by
+/// `Manifest::dense_kind == "exact_mmap_v1"`.
+///
+/// The binary layout is little-endian and contiguous:
+/// `header[128] | metadata_refs[count * 16] | vectors[count * dim * f32] |
+/// metadata_json`. Each reference is `(offset: u64, len: u32, reserved: u32)`
+/// relative to the metadata region. The header carries magic, schema version,
+/// endian marker, dimension, distance, count, source BLAKE3 bytes, every region
+/// offset/length, and the exact file length.
+/// Canonical file name of the single dense vector payload inside a hybrid
+/// generation directory. One generation materializes vectors exactly once,
+/// into this artifact; the legacy `dense_brute_force.ndjson` twin is a
+/// migration read input only and is never written by new builds.
+pub const MMAP_DENSE_PAYLOAD_FILE_NAME: &str = "dense.exact_mmap_v1.bin";
+
+/// Blake3 digest bytes of an observed source hash string. The hex form of the
+/// returned bytes equals [`crate::source_hash_blake3`] for the same input, so
+/// the manifest's `source_hash_blake3` field and the 32-byte source hash
+/// embedded in the mmap dense payload share one derivation.
+pub fn source_hash_bytes(observed_source_hash: &str) -> [u8; 32] {
+    *blake3::hash(observed_source_hash.as_bytes()).as_bytes()
+}
+
+/// Decode a manifest `source_hash_blake3` hex string back into the 32-byte
+/// form the mmap dense payload embeds. Fails closed on malformed input.
+pub fn decode_source_hash_blake3(hex_hash: &str) -> Result<[u8; 32]> {
+    let decoded = hex::decode(hex_hash)
+        .with_context(|| format!("decode manifest source hash hex: {hex_hash}"))?;
+    <[u8; 32]>::try_from(decoded.as_slice())
+        .map_err(|_| anyhow::anyhow!("manifest source hash must be 32 bytes: {hex_hash}"))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MmapDenseFormatSchema {
+    pub schema: String,
+    pub magic_ascii: String,
+    pub byte_order: String,
+    pub header_bytes: usize,
+    pub metadata_reference_bytes: usize,
+    pub vector_element: String,
+    pub layout: String,
+}
+
+impl Default for MmapDenseFormatSchema {
+    fn default() -> Self {
+        Self {
+            schema: "aicx.dense.exact_mmap.v1".to_string(),
+            magic_ascii: "AICXDMM1".to_string(),
+            byte_order: "little_endian".to_string(),
+            header_bytes: 128,
+            metadata_reference_bytes: 16,
+            vector_element: "ieee754_f32".to_string(),
+            layout: "header|metadata_refs|fixed_width_vectors|metadata_json".to_string(),
+        }
+    }
+}
+
 /// Retrieval build manifest for split lexical + dense index artifacts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Manifest {
@@ -123,10 +180,41 @@ impl Manifest {
             });
         }
 
+        if self.embedder_distance != other.embedder_distance {
+            return Err(ManifestError::EmbedderModelDrift {
+                manifest_model: self.embedder_distance.clone(),
+                query_model: other.embedder_distance.clone(),
+            });
+        }
+
         if self.lexical_commit_id != other.lexical_commit_id {
             return Err(ManifestError::LexicalCommitMismatch {
                 expected: self.lexical_commit_id.clone(),
                 actual: other.lexical_commit_id.clone(),
+            });
+        }
+
+        // Partial-build drift: artifacts that claim the same generation must
+        // agree on payload kind and row counts, or an interrupted build could
+        // masquerade as complete.
+        if self.dense_kind != other.dense_kind {
+            return Err(ManifestError::GenerationMismatch {
+                lexical_gen: self.dense_kind.clone(),
+                dense_gen: other.dense_kind.clone(),
+            });
+        }
+
+        if self.dense_count != other.dense_count {
+            return Err(ManifestError::DenseCountMismatch {
+                expected: self.dense_count,
+                actual: other.dense_count,
+            });
+        }
+
+        if self.lexical_doc_count != other.lexical_doc_count {
+            return Err(ManifestError::LexicalDocCountMismatch {
+                expected: self.lexical_doc_count,
+                actual: other.lexical_doc_count,
             });
         }
 

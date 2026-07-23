@@ -24,17 +24,25 @@
 //!    shape from `src/rank.rs`, plus a source-level invariant grep that
 //!    the substring matcher is gone.
 
+use serde_json::Value;
 use std::fs;
+use std::io::Write;
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use aicx::api::Aicx;
 use aicx::dashboard::project_matches_filter;
-use aicx::store::project_filter_matches;
+use aicx::intents::{IntentExtraction, IntentsConfig};
+use aicx::store::{ProjectMatchMode, project_filter_matches, require_project_resolution};
 
 const LEAKY_FILTER: &str = "vista";
 const LEAKY_CANDIDATE_ORG: &str = "vetcoders";
 const LEAKY_CANDIDATE_REPO: &str = "vista-portal";
 const LEAKY_CANDIDATE_SLUG: &str = "vetcoders/vista-portal";
 const CANONICAL_TARGET_SLUG: &str = "vetcoders/vista";
+static NEXT_STORE_ID: AtomicU64 = AtomicU64::new(0);
 
 fn split_slug(slug: &str) -> (&str, &str) {
     slug.split_once('/').unwrap_or(("", slug))
@@ -44,6 +52,449 @@ fn read_source(rel: &str) -> String {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let path = manifest_dir.join(rel);
     fs::read_to_string(&path).unwrap_or_else(|err| panic!("read {}: {err}", path.display()))
+}
+
+fn unique_store_root(label: &str) -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "aicx-strict-filter-{label}-{}-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock after unix epoch")
+            .as_nanos(),
+        NEXT_STORE_ID.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
+fn write_intent_chunk(root: &std::path::Path, project: &str, marker: &str, sequence: u32) {
+    let (organization, repository) = project
+        .split_once('/')
+        .expect("strict-filter fixture uses owner/repo slugs");
+    let directory = root
+        .join("store")
+        .join(organization)
+        .join(repository)
+        .join("2026_0717")
+        .join("conversations")
+        .join("codex");
+    fs::create_dir_all(&directory).expect("create strict-filter fixture directory");
+    let filename = aicx::store::session_basename(
+        "2026-07-17",
+        "codex",
+        &format!("strict-{sequence}"),
+        sequence,
+    );
+    fs::write(
+        directory.join(filename),
+        format!(
+            "[project: {project} | agent: codex | date: 2026-07-17 | frame_kind: user_msg]\n\n\
+             [signals]\nIntent:\n- Preserve strict project identity marker {marker}\n[/signals]\n"
+        ),
+    )
+    .expect("write strict-filter intent chunk");
+}
+
+fn write_ownerless_intent_chunk(
+    root: &std::path::Path,
+    repository: &str,
+    marker: &str,
+    sequence: u32,
+) {
+    let directory = root
+        .join("store")
+        .join(repository)
+        .join("2026_0717")
+        .join("conversations")
+        .join("codex");
+    fs::create_dir_all(&directory).expect("create ownerless fixture directory");
+    let filename = aicx::store::session_basename(
+        "2026-07-17",
+        "codex",
+        &format!("ownerless-{sequence}"),
+        sequence,
+    );
+    fs::write(
+        directory.join(filename),
+        format!(
+            "[project: {repository} | agent: codex | date: 2026-07-17 | frame_kind: user_msg]\n\n\
+             [signals]\nIntent:\n- Preserve ownerless project identity marker {marker}\n[/signals]\n"
+        ),
+    )
+    .expect("write ownerless intent chunk");
+}
+
+fn strict_filter_corpus() -> PathBuf {
+    let root = unique_store_root("corpus");
+    write_intent_chunk(&root, "LibraxisAI/vista", "TARGET", 1);
+    write_intent_chunk(&root, "LibraxisAI/VistaScribe-dev", "SCRIBE", 2);
+    write_intent_chunk(&root, "VetCoders/vista-portal", "PORTAL", 3);
+    write_intent_chunk(&root, "Another/vista", "CROSS_ORG", 4);
+    root
+}
+
+fn config(project: &str) -> IntentsConfig {
+    IntentsConfig {
+        project: project.to_string(),
+        hours: 0,
+        strict: false,
+        min_confidence: None,
+        kind_filter: None,
+        frame_kind: None,
+    }
+}
+
+fn extract_via_api(root: &std::path::Path, project: &str) -> IntentExtraction {
+    Aicx::with_store_root(root)
+        .extract_intents(&config(project))
+        .expect("extract strict-filter intents through public API")
+}
+
+fn payload_projects(payload: &Value) -> Vec<&str> {
+    payload["items"]
+        .as_array()
+        .expect("intents envelope items")
+        .iter()
+        .map(|item| item["project"].as_str().expect("intent project"))
+        .collect()
+}
+
+fn payload_session_ids(payload: &Value) -> Vec<&str> {
+    payload["items"]
+        .as_array()
+        .expect("intents envelope items")
+        .iter()
+        .map(|item| item["session_id"].as_str().expect("intent session_id"))
+        .collect()
+}
+
+fn render_mcp_api_payload(root: &std::path::Path, project: &str) -> Value {
+    let extraction = extract_via_api(root, project);
+    let oracle_status = aicx::oracle::OracleStatus::canonical_corpus_scan(
+        root,
+        extraction.stats.scanned_count,
+        extraction.stats.candidate_count,
+        extraction.stats.source_paths_verified,
+    );
+    let body = aicx::intents::format_intents_oracle_json(&extraction.records, oracle_status)
+        .expect("serialize the payload used by MCP intents");
+    serde_json::from_str(&body).expect("parse MCP intents envelope")
+}
+
+fn run_git(checkout: &std::path::Path, args: &[&str]) {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(checkout)
+        .args(args)
+        .output()
+        .expect("run git fixture command");
+    assert!(
+        output.status.success(),
+        "git {:?} failed: {}",
+        args,
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn synthetic_checkout(root: &std::path::Path, remote: &str) -> PathBuf {
+    let checkout = root.join("checkout");
+    fs::create_dir_all(&checkout).expect("create synthetic checkout");
+    run_git(&checkout, &["init", "--quiet"]);
+    run_git(&checkout, &["remote", "add", "origin", remote]);
+    checkout
+}
+
+fn set_remote(checkout: &std::path::Path, remote: &str) {
+    run_git(checkout, &["remote", "set-url", "origin", remote]);
+}
+
+/// Seed a Codex source session under a synthetic user home and freeze topical
+/// project attribution into the durable catalog (the extract-era identity
+/// surface). Live git remotes must not rewrite that attribution.
+fn seed_codex_session_with_catalog_identity(
+    root: &std::path::Path,
+    checkout: &std::path::Path,
+    session_id: &str,
+    marker: &str,
+    historical_project: &str,
+) -> PathBuf {
+    let home = root.join("home");
+    let aicx_home = home.join(".aicx");
+    let history = home
+        .join(".codex")
+        .join("sessions")
+        .join("2026")
+        .join("07")
+        .join("17")
+        .join(format!("rollout-2026-07-17T12-00-00-{session_id}.jsonl"));
+    fs::create_dir_all(history.parent().expect("history parent"))
+        .expect("create Codex history directory");
+    let timestamp = "2026-07-17T12:00:00Z";
+    let rows = [
+        serde_json::json!({
+            "timestamp": timestamp,
+            "type": "session_meta",
+            "payload": {
+                "id": session_id,
+                "timestamp": timestamp,
+                "cwd": checkout,
+                "model": "gpt-test"
+            }
+        }),
+        serde_json::json!({
+            "timestamp": timestamp,
+            "type": "event_msg",
+            "payload": {
+                "type": "user_message",
+                "message": format!("Let's preserve immutable historical identity marker {marker}")
+            }
+        }),
+    ];
+    fs::write(
+        &history,
+        rows.iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+    .expect("write Codex history fixture");
+
+    // Catalog is the identity store: freeze owner/repo attribution once.
+    // (cwd alone is not topical project — proven operator doctrine 2026-07-23.)
+    fs::create_dir_all(aicx::catalog::catalog_dir_for(&aicx_home))
+        .expect("create catalog directory");
+    let entry = aicx::catalog::CatalogEntry {
+        schema: aicx::catalog::CATALOG_SCHEMA.to_string(),
+        session_id: session_id.to_string(),
+        agent: "codex".to_string(),
+        project: Some(historical_project.to_string()),
+        date: Some("2026-07-17".to_string()),
+        cwd: Some(checkout.display().to_string()),
+        source_path: history.display().to_string(),
+        title: Some(format!("historical identity marker {marker}")),
+        machine: Some("strict-filter-fixture".to_string()),
+        logical_session_id: None,
+    };
+    fs::write(
+        aicx::catalog::sessions_path_for(&aicx_home),
+        format!(
+            "{}\n",
+            serde_json::to_string(&entry).expect("serialize catalog entry")
+        ),
+    )
+    .expect("write durable catalog sessions.jsonl");
+
+    println!(
+        "catalog-seed session={session_id} project={historical_project} aicx={}",
+        aicx_home.display()
+    );
+    aicx_home
+}
+
+fn cli_catalog_resolve(aicx_home: &std::path::Path, session_id: &str) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_aicx"))
+        .env("AICX_HOME", aicx_home)
+        .env("AICX_ALLOW_TMP", "1")
+        .args(["catalog", "resolve", session_id, "--json"])
+        .output()
+        .expect("run CLI catalog resolve")
+}
+
+fn cli_intents(root: &std::path::Path, project: &str) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_aicx"))
+        .env("AICX_HOME", root)
+        .env("AICX_ALLOW_TMP", "1")
+        .args(["intents", "-p", project, "--emit", "json", "-H", "0"])
+        .output()
+        .expect("run CLI intents")
+}
+
+fn mcp_intents_response(root: &std::path::Path, project: &str) -> Value {
+    mcp_intents_response_with_arguments(
+        root,
+        serde_json::json!({"project": project, "hours": 0, "emit": "json", "limit": 100}),
+    )
+}
+
+fn mcp_intents_response_with_arguments(root: &std::path::Path, arguments: Value) -> Value {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_aicx-mcp"))
+        .env("AICX_HOME", root)
+        .env("AICX_ALLOW_TMP", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn aicx-mcp");
+    let mut stdin = child.stdin.take().expect("take aicx-mcp stdin");
+    let initialize = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": {"name": "immutable-identity-test", "version": "1"}
+        }
+    });
+    let initialized = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/initialized",
+        "params": {}
+    });
+    let call = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": {
+            "name": "aicx_intents",
+            "arguments": arguments
+        }
+    });
+    for request in [initialize, initialized, call] {
+        writeln!(stdin, "{request}").expect("write MCP request");
+    }
+    drop(stdin);
+    let output = child.wait_with_output().expect("wait for aicx-mcp");
+    assert!(
+        output.status.success(),
+        "aicx-mcp failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .expect("MCP stdout utf-8")
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|response| response["id"] == 2)
+        .expect("MCP tool response")
+}
+
+fn mcp_intents_payload(root: &std::path::Path, project: &str) -> Value {
+    mcp_intents_payload_with_arguments(
+        root,
+        serde_json::json!({"project": project, "hours": 0, "emit": "json", "limit": 100}),
+    )
+}
+
+fn mcp_intents_payload_with_arguments(root: &std::path::Path, arguments: Value) -> Value {
+    let response = mcp_intents_response_with_arguments(root, arguments);
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("MCP intents result missing text: {response}"));
+    serde_json::from_str(text).expect("parse MCP intents envelope")
+}
+
+fn write_legacy_chunk_without_identity(root: &std::path::Path, project: &str) {
+    let (organization, repository) = project.split_once('/').expect("legacy owner/repo");
+    let directory = root
+        .join("store")
+        .join(organization)
+        .join(repository)
+        .join("2026_0717")
+        .join("conversations")
+        .join("codex");
+    fs::create_dir_all(&directory).expect("create legacy corpus directory");
+    fs::write(
+        directory.join(aicx::store::session_basename(
+            "2026-07-17",
+            "codex",
+            "legacy-no-identity",
+            1,
+        )),
+        "[signals]\nIntent:\n- Preserve legacy fallback marker\n[/signals]\n",
+    )
+    .expect("write legacy chunk without persisted project");
+}
+
+fn write_f6_intent_chunk(
+    root: &std::path::Path,
+    project: &str,
+    date: &str,
+    session_id: &str,
+    sequence: u32,
+    user_line: &str,
+) {
+    let (organization, repository) = project.split_once('/').expect("F6 owner/repo project");
+    let directory = root
+        .join("store")
+        .join(organization)
+        .join(repository)
+        .join(format!(
+            "{}_{}",
+            date.get(..4).expect("F6 date year"),
+            date.get(5..).expect("F6 date month-day").replace('-', "")
+        ))
+        .join("conversations")
+        .join("codex");
+    fs::create_dir_all(&directory).expect("create F6 fixture directory");
+    let filename = aicx::store::session_basename(date, "codex", session_id, sequence);
+    fs::write(
+        directory.join(filename),
+        format!(
+            "[project: {project} | agent: codex | date: {date} | frame_kind: user_msg]\n\n\
+             [12:00:00] user: {user_line}\n"
+        ),
+    )
+    .expect("write F6 intent chunk");
+}
+
+fn cli_intents_payload_with_options(
+    root: &std::path::Path,
+    projects: &[&str],
+    limit: usize,
+    collapse_session: bool,
+) -> Value {
+    let mut args = vec!["intents".to_string()];
+    for project in projects {
+        args.extend(["-p".to_string(), (*project).to_string()]);
+    }
+    args.extend([
+        "--emit".to_string(),
+        "json".to_string(),
+        "-H".to_string(),
+        "0".to_string(),
+        "--sort".to_string(),
+        "newest".to_string(),
+        "--limit".to_string(),
+        limit.to_string(),
+    ]);
+    if collapse_session {
+        args.push("--collapse-session".to_string());
+    }
+
+    let output = Command::new(env!("CARGO_BIN_EXE_aicx"))
+        .env("AICX_HOME", root)
+        .env("AICX_ALLOW_TMP", "1")
+        .args(args)
+        .output()
+        .expect("run F6 CLI intents");
+    assert!(
+        output.status.success(),
+        "F6 CLI intents failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).expect("parse F6 CLI intents envelope")
+}
+
+fn mcp_intents_payload_with_options(
+    root: &std::path::Path,
+    projects: &[&str],
+    limit: usize,
+    collapse_session: bool,
+) -> Value {
+    let response = mcp_intents_response_with_arguments(
+        root,
+        serde_json::json!({
+            "projects": projects,
+            "hours": 0,
+            "emit": "json",
+            "sort": "newest",
+            "limit": limit,
+            "collapse_session": collapse_session
+        }),
+    );
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("F6 MCP intents result missing text: {response}"));
+    serde_json::from_str(text).expect("parse F6 MCP intents envelope")
 }
 
 #[test]
@@ -149,4 +600,547 @@ fn rank_path_rejects_substring_leak() {
         !src.contains("project_filter_lower"),
         "rank resurrected the `project_filter_lower` substring matcher"
     );
+}
+
+#[test]
+fn resolver_world_model_is_exact_fail_closed_and_explicitly_fuzzy() {
+    let root = strict_filter_corpus();
+    let corpus = aicx::store::project_identities_in_store_at(&root).expect("discover corpus");
+
+    let ambiguous =
+        require_project_resolution(&["vista".to_string()], &corpus, ProjectMatchMode::Exact)
+            .expect_err("two exact bare identities must fail closed");
+    assert_eq!(
+        ambiguous.candidates(),
+        ["Another/vista", "LibraxisAI/vista"]
+    );
+
+    let exact = require_project_resolution(
+        &["LibraxisAI/vista".to_string()],
+        &corpus,
+        ProjectMatchMode::Exact,
+    )
+    .expect("owner/repo exact");
+    assert_eq!(exact.selected, ["LibraxisAI/vista"]);
+
+    let unique = require_project_resolution(
+        &["vista-portal".to_string()],
+        &corpus,
+        ProjectMatchMode::Exact,
+    )
+    .expect("unique bare repo");
+    assert_eq!(unique.selected, ["VetCoders/vista-portal"]);
+
+    let fuzzy =
+        require_project_resolution(&["vista".to_string()], &corpus, ProjectMatchMode::Fuzzy)
+            .expect("explicit fuzzy family search");
+    assert_eq!(
+        fuzzy.selected,
+        [
+            "Another/vista",
+            "LibraxisAI/VistaScribe-dev",
+            "LibraxisAI/vista",
+            "VetCoders/vista-portal",
+        ]
+    );
+
+    let cli = Command::new(env!("CARGO_BIN_EXE_aicx"))
+        .env("AICX_HOME", &root)
+        .env("AICX_ALLOW_TMP", "1")
+        .args([
+            "--project-fuzzy",
+            "intents",
+            "-p",
+            "vista",
+            "--emit",
+            "json",
+            "-H",
+            "0",
+        ])
+        .output()
+        .expect("run fuzzy CLI intents");
+    assert!(
+        cli.status.success(),
+        "fuzzy CLI intents failed: {}",
+        String::from_utf8_lossy(&cli.stderr)
+    );
+    let cli_payload: Value = serde_json::from_slice(&cli.stdout).expect("parse fuzzy CLI envelope");
+    let mcp_payload = mcp_intents_payload_with_arguments(
+        &root,
+        serde_json::json!({
+            "project": "vista",
+            "project_match": "fuzzy",
+            "hours": 0,
+            "emit": "json",
+            "limit": 100
+        }),
+    );
+    for payload in [&cli_payload, &mcp_payload] {
+        assert_eq!(
+            payload["completeness"]["warnings"],
+            serde_json::json!(["fuzzy project matching active"])
+        );
+        assert_eq!(
+            payload["completeness"]["scope"]["selected"],
+            serde_json::json!(fuzzy.selected)
+        );
+    }
+
+    fs::remove_dir_all(root).expect("remove strict-filter corpus");
+}
+
+#[test]
+fn intents_cli_and_mcp_resolution_path_share_selected_session_set() {
+    let root = strict_filter_corpus();
+    let corpus = aicx::store::project_identities_in_store_at(&root).expect("discover corpus");
+    let selected = require_project_resolution(
+        &["LibraxisAI/vista".to_string()],
+        &corpus,
+        ProjectMatchMode::Exact,
+    )
+    .expect("shared exact resolution");
+
+    let mcp = render_mcp_api_payload(&root, &selected.selected[0]);
+    assert_eq!(payload_projects(&mcp), ["LibraxisAI/vista"]);
+
+    let cli = Command::new(env!("CARGO_BIN_EXE_aicx"))
+        .env("AICX_HOME", &root)
+        .env("AICX_ALLOW_TMP", "1")
+        .args([
+            "intents",
+            "-p",
+            "LibraxisAI/vista",
+            "--emit",
+            "json",
+            "-H",
+            "0",
+        ])
+        .output()
+        .expect("run CLI intents");
+    assert!(
+        cli.status.success(),
+        "{}",
+        String::from_utf8_lossy(&cli.stderr)
+    );
+    let cli_payload: Value = serde_json::from_slice(&cli.stdout).expect("parse CLI envelope");
+    assert_eq!(payload_projects(&cli_payload), payload_projects(&mcp));
+    assert_eq!(payload_session_ids(&cli_payload), payload_session_ids(&mcp));
+
+    let ambiguous_cli = Command::new(env!("CARGO_BIN_EXE_aicx"))
+        .env("AICX_HOME", &root)
+        .env("AICX_ALLOW_TMP", "1")
+        .args(["intents", "-p", "vista", "--emit", "json", "-H", "0"])
+        .output()
+        .expect("run ambiguous CLI intents");
+    assert!(!ambiguous_cli.status.success());
+    let stderr = String::from_utf8_lossy(&ambiguous_cli.stderr);
+    assert!(stderr.contains("Another/vista"), "{stderr}");
+    assert!(stderr.contains("LibraxisAI/vista"), "{stderr}");
+    assert!(!stderr.contains("vista-portal"), "{stderr}");
+
+    let intents_source = read_source("src/intents.rs");
+    assert!(intents_source.contains("store::project_filter_matches"));
+    assert!(!intents_source.contains(".contains(&project.to_ascii_lowercase())"));
+    let mcp_source = read_source("src/mcp.rs");
+    assert!(mcp_source.contains("resolve_mcp_projects"));
+    assert!(mcp_source.contains("project_resolution_mcp_error"));
+    assert!(mcp_source.contains("extract_intents_with_stats_for_projects"));
+    assert!(mcp_source.contains("format_intents_oracle_json"));
+    let cli_source = read_source("src/main.rs");
+    assert!(cli_source.contains("extract_intents_with_stats_for_projects"));
+    assert!(cli_source.contains("format_intents_oracle_json"));
+
+    fs::remove_dir_all(root).expect("remove strict-filter corpus");
+}
+
+#[test]
+fn ownerless_bucket_world_model_has_cli_mcp_addressability_and_completeness() {
+    let root = unique_store_root("ownerless-world-model");
+    write_intent_chunk(&root, "A/repo", "OWNED", 1);
+    write_ownerless_intent_chunk(&root, "repo", "ORPHANED", 2);
+
+    let corpus = aicx::store::project_identities_in_store_at(&root).expect("discover corpus");
+    assert_eq!(corpus, ["A/repo", "_/repo"]);
+
+    let ambiguous_cli = cli_intents(&root, "repo");
+    assert!(!ambiguous_cli.status.success());
+    let stderr = String::from_utf8_lossy(&ambiguous_cli.stderr);
+    assert!(stderr.contains("A/repo"), "{stderr}");
+    assert!(stderr.contains("_/repo"), "{stderr}");
+
+    let ambiguous_mcp = mcp_intents_response(&root, "repo");
+    assert_eq!(
+        ambiguous_mcp["error"]["data"]["candidates"],
+        serde_json::json!(["A/repo", "_/repo"]),
+        "{ambiguous_mcp}"
+    );
+
+    let ownerless_cli = cli_intents(&root, "_/repo");
+    assert!(
+        ownerless_cli.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ownerless_cli.stderr)
+    );
+    let ownerless_cli_payload: Value =
+        serde_json::from_slice(&ownerless_cli.stdout).expect("parse ownerless CLI payload");
+    let ownerless_mcp_payload = mcp_intents_payload(&root, "_/repo");
+    assert_eq!(payload_projects(&ownerless_cli_payload), ["_/repo"]);
+    assert_eq!(
+        payload_session_ids(&ownerless_cli_payload),
+        payload_session_ids(&ownerless_mcp_payload)
+    );
+    assert_eq!(
+        ownerless_cli_payload["completeness"]["orphaned_buckets"],
+        serde_json::json!(["_/repo"])
+    );
+    assert_eq!(
+        ownerless_mcp_payload["completeness"]["orphaned_buckets"],
+        serde_json::json!(["_/repo"])
+    );
+
+    let wildcard_cli = cli_intents(&root, "/repo");
+    assert!(
+        wildcard_cli.status.success(),
+        "{}",
+        String::from_utf8_lossy(&wildcard_cli.stderr)
+    );
+    let wildcard_cli_payload: Value =
+        serde_json::from_slice(&wildcard_cli.stdout).expect("parse wildcard CLI payload");
+    let wildcard_mcp_payload = mcp_intents_payload(&root, "/repo");
+    let mut wildcard_projects = payload_projects(&wildcard_cli_payload);
+    wildcard_projects.sort_unstable();
+    assert_eq!(wildcard_projects, ["A/repo", "_/repo"]);
+    assert_eq!(
+        payload_session_ids(&wildcard_cli_payload),
+        payload_session_ids(&wildcard_mcp_payload)
+    );
+    assert_eq!(
+        wildcard_cli_payload["completeness"]["orphaned_buckets"],
+        serde_json::json!(["_/repo"])
+    );
+    assert_eq!(
+        wildcard_cli_payload["completeness"]["scope"]["selected"],
+        serde_json::json!(["A/repo", "_/repo"])
+    );
+
+    fs::remove_dir_all(root).expect("remove ownerless world-model corpus");
+}
+
+#[test]
+fn historical_identity_survives_live_remote_rename_via_catalog() {
+    // Store-era cards are gone. Identity for a session is the durable catalog
+    // entry written at attribution time — live git remote renames must not
+    // rewrite it.
+    let root = unique_store_root("immutable-rename");
+    let checkout = synthetic_checkout(&root, "https://github.com/archive/old.git");
+    let aicx_home = seed_codex_session_with_catalog_identity(
+        &root,
+        &checkout,
+        "rename-session",
+        "RENAME",
+        "archive/old",
+    );
+
+    set_remote(&checkout, "https://github.com/archive/new.git");
+
+    let entry = aicx::catalog::resolve_session(&aicx_home, "rename-session")
+        .expect("resolve catalog session")
+        .expect("rename-session must remain in durable catalog");
+    assert_eq!(entry.project.as_deref(), Some("archive/old"));
+    assert_eq!(entry.agent, "codex");
+    assert!(
+        entry.source_path.contains("rename-session"),
+        "source path must keep the codex rollout: {}",
+        entry.source_path
+    );
+
+    let identities = aicx::catalog::project_identities_from_catalog_at(&aicx_home)
+        .expect("read catalog project identities");
+    assert!(
+        identities
+            .iter()
+            .any(|p| p.eq_ignore_ascii_case("archive/old")),
+        "catalog must keep historical project: {identities:?}"
+    );
+    assert!(
+        !identities
+            .iter()
+            .any(|p| p.eq_ignore_ascii_case("archive/new")),
+        "live remote must not appear in catalog: {identities:?}"
+    );
+
+    // Search -p corpus reads catalog identities (not card mill paths).
+    let search_ids =
+        aicx::store::project_identities_for_search_at(&aicx_home).expect("search identity corpus");
+    assert!(
+        search_ids
+            .iter()
+            .any(|p| p.eq_ignore_ascii_case("archive/old")),
+        "search corpus must include catalog historical identity: {search_ids:?}"
+    );
+    assert!(
+        !search_ids
+            .iter()
+            .any(|p| p.eq_ignore_ascii_case("archive/new")),
+        "search corpus must not invent live-only identity: {search_ids:?}"
+    );
+
+    let cli = cli_catalog_resolve(&aicx_home, "rename-session");
+    assert!(
+        cli.status.success(),
+        "catalog resolve CLI must stay green: {}",
+        String::from_utf8_lossy(&cli.stderr)
+    );
+    let cli_payload: Value =
+        serde_json::from_slice(&cli.stdout).expect("parse catalog resolve JSON");
+    assert_eq!(cli_payload["project"], "archive/old");
+    assert_eq!(cli_payload["session_id"], "rename-session");
+
+    println!(
+        "rename-repo catalog_project={} search_ids={:?} live_remote=archive/new rejected",
+        entry.project.as_deref().unwrap_or(""),
+        search_ids
+    );
+
+    fs::remove_dir_all(root).expect("remove immutable rename corpus");
+}
+
+#[test]
+fn deprecated_checkout_does_not_capture_historical_sessions_via_catalog() {
+    // Historical topical project lives in the catalog. Renaming the live
+    // checkout remote to a `_depr` slug must not capture the session.
+    let root = unique_store_root("deprecated-checkout");
+    let checkout = synthetic_checkout(&root, "https://github.com/vetcoders/screen_scribe.git");
+    let aicx_home = seed_codex_session_with_catalog_identity(
+        &root,
+        &checkout,
+        "screenscribe-history",
+        "DEPRECATED",
+        "vetcoders/screen_scribe",
+    );
+
+    set_remote(
+        &checkout,
+        "https://github.com/vetcoders/screen_scribe_depr.git",
+    );
+
+    let entry = aicx::catalog::resolve_session(&aicx_home, "screenscribe-history")
+        .expect("resolve catalog session")
+        .expect("screenscribe-history must remain in durable catalog");
+    assert_eq!(entry.project.as_deref(), Some("vetcoders/screen_scribe"));
+
+    let identities = aicx::catalog::project_identities_from_catalog_at(&aicx_home)
+        .expect("read catalog project identities");
+    assert!(
+        identities
+            .iter()
+            .any(|p| p.eq_ignore_ascii_case("vetcoders/screen_scribe")),
+        "historical project must survive: {identities:?}"
+    );
+    assert!(
+        !identities
+            .iter()
+            .any(|p| p.eq_ignore_ascii_case("vetcoders/screen_scribe_depr")),
+        "deprecated remote must not capture catalog identity: {identities:?}"
+    );
+
+    let search_ids =
+        aicx::store::project_identities_for_search_at(&aicx_home).expect("search identity corpus");
+    assert!(
+        search_ids
+            .iter()
+            .any(|p| p.eq_ignore_ascii_case("vetcoders/screen_scribe"))
+    );
+    assert!(
+        !search_ids
+            .iter()
+            .any(|p| p.eq_ignore_ascii_case("vetcoders/screen_scribe_depr")),
+        "deprecated-only identity must not enter search corpus: {search_ids:?}"
+    );
+
+    let cli = cli_catalog_resolve(&aicx_home, "screenscribe-history");
+    assert!(
+        cli.status.success(),
+        "catalog resolve CLI must stay green: {}",
+        String::from_utf8_lossy(&cli.stderr)
+    );
+    let cli_payload: Value =
+        serde_json::from_slice(&cli.stdout).expect("parse catalog resolve JSON");
+    assert_eq!(cli_payload["project"], "vetcoders/screen_scribe");
+
+    // Require-resolution: historical filter still resolves; depr does not.
+    let historical_resolution = aicx::store::require_project_resolution(
+        &["vetcoders/screen_scribe".to_string()],
+        &search_ids,
+        ProjectMatchMode::Exact,
+    );
+    assert!(
+        historical_resolution.is_ok(),
+        "historical project must resolve against catalog-backed corpus: {historical_resolution:?}"
+    );
+    let depr_resolution = aicx::store::require_project_resolution(
+        &["vetcoders/screen_scribe_depr".to_string()],
+        &search_ids,
+        ProjectMatchMode::Exact,
+    );
+    assert!(
+        depr_resolution.is_err(),
+        "deprecated remote must not resolve as a project identity: {depr_resolution:?}"
+    );
+
+    println!(
+        "deprecated-checkout catalog_project={} search_ids={:?} depr_rejected=true",
+        entry.project.as_deref().unwrap_or(""),
+        search_ids
+    );
+
+    fs::remove_dir_all(root).expect("remove deprecated checkout corpus");
+}
+
+#[test]
+fn legacy_record_falls_back_to_path_heuristic_with_cli_mcp_parity() {
+    let root = unique_store_root("legacy-path-heuristic");
+    write_legacy_chunk_without_identity(&root, "archive/legacy");
+
+    let cli = cli_intents(&root, "archive/legacy");
+    assert!(
+        cli.status.success(),
+        "legacy path fallback must remain queryable: {}",
+        String::from_utf8_lossy(&cli.stderr)
+    );
+    let cli_payload: Value =
+        serde_json::from_slice(&cli.stdout).expect("parse legacy CLI envelope");
+    let mcp_payload = mcp_intents_payload(&root, "archive/legacy");
+
+    assert_eq!(
+        payload_session_ids(&cli_payload),
+        payload_session_ids(&mcp_payload)
+    );
+    assert!(!payload_session_ids(&cli_payload).is_empty());
+    assert_eq!(
+        cli_payload["completeness"]["identity_source"],
+        "path-heuristic"
+    );
+    assert_eq!(
+        mcp_payload["completeness"]["identity_source"],
+        "path-heuristic"
+    );
+    let expected_warning = serde_json::json!(["1 record(s) resolved by path heuristic"]);
+    assert_eq!(cli_payload["completeness"]["warnings"], expected_warning);
+    assert_eq!(mcp_payload["completeness"]["warnings"], expected_warning);
+    println!(
+        "legacy-cli-envelope={}",
+        serde_json::to_string(&cli_payload).expect("serialize legacy CLI envelope evidence")
+    );
+
+    fs::remove_dir_all(root).expect("remove legacy fallback corpus");
+}
+
+#[test]
+fn f6_newest_and_collapse_world_model_has_cli_mcp_parity() {
+    let root = unique_store_root("f6-determinism");
+    let projects = ["alpha/repo", "beta/repo"];
+
+    // 120 sessions share the exact canonical timestamp. The newest-100 cut
+    // therefore depends entirely on the total identity/chunk tie-break order.
+    for index in 0..120 {
+        let session_id = format!("tie-{index:03}");
+        write_f6_intent_chunk(
+            &root,
+            projects[0],
+            "2026-07-17",
+            &session_id,
+            1,
+            &format!("Intent: Preserve deterministic tied session {session_id}"),
+        );
+    }
+
+    // Same session id in two project identities must remain two collapsed
+    // representatives even when their content is byte-for-byte identical.
+    for project in projects {
+        write_f6_intent_chunk(
+            &root,
+            project,
+            "2026-07-17",
+            "shared-id",
+            1,
+            "Intent: Preserve project-scoped shared session",
+        );
+    }
+
+    // New technical task noise must not become the representative when the
+    // same session contains an older substantive user intent.
+    write_f6_intent_chunk(
+        &root,
+        projects[0],
+        "2026-07-17",
+        "quality-id",
+        1,
+        "Task: Set model to Opus 4.8",
+    );
+    write_f6_intent_chunk(
+        &root,
+        projects[0],
+        "2026-07-16",
+        "quality-id",
+        2,
+        "Intent: Make newest-N deterministic across the shared CLI and MCP collector",
+    );
+
+    let cli_first = cli_intents_payload_with_options(&root, &[projects[0]], 100, false);
+    let cli_second = cli_intents_payload_with_options(&root, &[projects[0]], 100, false);
+    let mcp_first = mcp_intents_payload_with_options(&root, &[projects[0]], 100, false);
+    let mcp_second = mcp_intents_payload_with_options(&root, &[projects[0]], 100, false);
+    let cli_ids = payload_session_ids(&cli_first);
+
+    assert_eq!(cli_ids.len(), 100);
+    assert_eq!(cli_ids, payload_session_ids(&cli_second));
+    assert_eq!(cli_ids, payload_session_ids(&mcp_first));
+    assert_eq!(cli_ids, payload_session_ids(&mcp_second));
+    assert_eq!(cli_first["items"], cli_second["items"]);
+    assert_eq!(cli_first["items"], mcp_first["items"]);
+    assert_eq!(mcp_first["items"], mcp_second["items"]);
+    println!("F6_NEWEST_IDS={}", cli_ids.join(","));
+
+    let collapsed_cli = cli_intents_payload_with_options(&root, &projects, 500, true);
+    let collapsed_mcp = mcp_intents_payload_with_options(&root, &projects, 500, true);
+    assert_eq!(collapsed_cli["items"], collapsed_mcp["items"]);
+
+    let collapsed_items = collapsed_cli["items"]
+        .as_array()
+        .expect("collapsed F6 items array");
+    let shared = collapsed_items
+        .iter()
+        .filter(|item| item["session_id"] == "shared-id")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        shared.len(),
+        2,
+        "same session id across projects was merged"
+    );
+    assert_eq!(
+        shared
+            .iter()
+            .map(|item| item["project"].as_str().expect("shared project"))
+            .collect::<Vec<_>>(),
+        projects
+    );
+
+    let quality = collapsed_items
+        .iter()
+        .find(|item| item["session_id"] == "quality-id")
+        .expect("quality session representative");
+    assert_eq!(quality["kind"], "intent");
+    assert_eq!(
+        quality["summary"],
+        "Make newest-N deterministic across the shared CLI and MCP collector"
+    );
+    assert!(
+        !quality["summary"]
+            .as_str()
+            .expect("quality summary")
+            .contains("Set model")
+    );
+
+    fs::remove_dir_all(root).expect("remove F6 determinism corpus");
 }

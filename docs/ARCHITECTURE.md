@@ -32,23 +32,28 @@ flowchart TD
 
 ## Module Map (Codebase Mapping)
 
-Library modules (see `src/lib.rs`):
-Parser-owned entries use their current crate paths; the old root-crate module
-locations are retired.
+Library modules (see `src/lib.rs`). Parser-owned entries live under
+`crates/aicx-parser`; the old root-crate module locations are retired.
 
-- `src/sources.rs`: source discovery + extraction
-- `src/state.rs`: dedup hashes + incremental watermarks
-- `src/store.rs`: canonical store layout under `~/.aicx/` + `index.json`
-- `crates/aicx-parser/src/chunker.rs`: semantic windowing chunker (token heuristic + overlap + highlight extraction)
-- `src/output.rs`: local report writer (`-o`) + optional loctree snapshot inclusion
-- `src/redact.rs`: secret redaction (regex engine)
-- `crates/aicx-parser/src/sanitize.rs`: path validation for reads/writes (defense against traversal)
-- `src/steer_index.rs`: fast metadata index for steering-aware retrieval
-- `src/reports_extractor.rs`: scans `~/.vibecrafted/artifacts` and renders a standalone HTML/JSON dossier for workflow and marbles artifact review
+- `src/extraction/`: source discovery + multi-agent extraction orchestration
+- `src/sessions.rs` + `src/session_catalog.rs`: bounded session discovery (locate-before-parse)
+- `src/state/`: dedup hashes + incremental watermarks
+- `src/store.rs` (+ `src/store/*`): canonical store under `$AICX_HOME`, projection stages, identity migration, atomic writes
+- `src/vector_index.rs`: committed semantic index + hybrid generation materialization (one dense payload per generation)
+- `src/search_engine.rs`: hybrid/semantic search dispatch with typed `RetrievalOutcome` status ownership
+- `src/oracle.rs`: CLI/MCP/evidence oracle status derivation from retrieval evidence (never invents healthy)
+- `src/mcp.rs`: MCP stdio/HTTP tools (`aicx_search`, `aicx_read`, `aicx_rank`, `aicx_steer`, `aicx_intents`, `aicx_index_status`)
+- `src/intents/`: structured intent/decision/outcome/task extraction
+- `src/doctor/`: bounded fast `health` (8192 fs-ops budget) vs deep forensic doctor
+- `src/cli_config.rs`: `aicx config show|init|inspect` — runtime inspection schema `aicx.runtime_inspection.v1`
+- `src/overlay.rs`: overlay-intent-v1 join against Loctree anchors (exact project identity, fail-closed)
+- `crates/aicx-parser`: deterministic session engine + five agent adapters; TB is differential oracle only
+- `crates/aicx-retrieve`: exact mmap dense adapter, fusion, manifests
 - `crates/aicx-embeddings`: reusable local GGUF embedding provider library
+- `src/redact.rs` + `crates/aicx-parser/src/sanitize.rs`: secret redaction + path allowlisting
 
 Binary orchestration:
-- `src/main.rs`: clap CLI, wires flows together, handles stdout emission (`--emit`).
+- `src/main.rs` / `src/bin/*`: clap CLI + `aicx-mcp`, wires flows, handles stdout emission (`--emit`).
 
 ## Data Flow: Extractors (`claude`, `codex`, `all`)
 
@@ -138,6 +143,12 @@ The MCP server exposes six tools via stdio and streamable HTTP transports:
 - `aicx_steer` — retrieve chunks by steering metadata (run_id, prompt_id, agent, kind, project, date) using sidecar data; returns `oracle_status` for the rebuildable metadata index and is safe for Loctree metadata narrowing only when source paths verify.
 - `aicx_intents` — extract intent/outcome/decision/task records from canonical chunks.
 - `aicx_index_status` — report the sessions -> chunks -> semantic-index pipeline for a project bucket, including readiness, backend, row count, and artifact paths.
+
+CLI and MCP share one project-identity resolver (exact by default, fail-closed on
+ambiguous bare names) and one retrieval-status owner (`RetrievalOutcome` →
+`search_oracle_status_from_retrieval`). `aicx config inspect --json` reports
+install-channel drift, resolved `AICX_HOME`, embedder identity (secrets
+redacted), and `_all` hybrid generation without mutating anything.
 
 Recency filtering in `aicx_search` and `aicx_steer` uses canonical chunk dates from the store layout, not filesystem `mtime` accidents.
 

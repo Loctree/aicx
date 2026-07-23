@@ -6,6 +6,10 @@ use std::path::{Path, PathBuf};
 use crate::validation::is_valid_repo_project_slug;
 
 pub const NON_REPOSITORY_CONTEXTS: &str = "non-repository-contexts";
+/// Virtual organization used to address legacy store buckets that have no
+/// owner directory (`store/<repository>/...`). The sentinel is query-only:
+/// reading an ownerless bucket never migrates or renames its on-disk path.
+pub const OWNERLESS_PROJECT_ORGANIZATION: &str = "_";
 pub const CANONICAL_STORE_DIRNAME: &str = "store";
 pub const CONTEXT_CORPUS_DIRNAME: &str = "context-corpus";
 pub const LOCT_CONTEXT_PACK_FAMILY: &str = "loct-context-pack";
@@ -15,6 +19,8 @@ pub const LEGACY_SALVAGE_DIRNAME: &str = "legacy-store";
 const MIGRATION_DIRNAME: &str = "migration";
 const MIGRATION_MANIFEST_FILENAME: &str = "manifest.json";
 const MIGRATION_REPORT_FILENAME: &str = "report.md";
+const IDENTITY_MIGRATION_MANIFEST_FILENAME: &str = "identity-manifest.json";
+const IDENTITY_MIGRATION_REPORT_FILENAME: &str = "identity-report.md";
 const CONFIG_FILENAME: &str = "config.toml";
 const DEFAULT_AICX_DIRNAME: &str = ".aicx";
 
@@ -241,6 +247,14 @@ pub(super) fn migration_manifest_path(base: &Path) -> PathBuf {
 
 pub(super) fn migration_report_path(base: &Path) -> PathBuf {
     migration_dir(base).join(MIGRATION_REPORT_FILENAME)
+}
+
+pub(super) fn identity_migration_manifest_path(base: &Path) -> PathBuf {
+    migration_dir(base).join(IDENTITY_MIGRATION_MANIFEST_FILENAME)
+}
+
+pub(super) fn identity_migration_report_path(base: &Path) -> PathBuf {
+    migration_dir(base).join(IDENTITY_MIGRATION_REPORT_FILENAME)
 }
 
 /// Returns the project directory: `$AICX_HOME/store/<project>/`.

@@ -208,6 +208,109 @@ Lookup paths:
 - `~/.aicx/embeddings`
 - `~/.aicx/embeddings/hub`
 
+## Hybrid Generations — One Dense Payload
+
+Since W2-03, hybrid retrieval artifacts are generation-scoped and the dense
+vectors are materialized exactly once per generation.
+
+Layout under each bucket:
+
+```text
+<AICX_HOME>/indexed/<bucket>/embeddings.ndjson        # canonical committed semantic index (build source)
+<AICX_HOME>/indexed/<bucket>/hybrid/
+├── CURRENT                                           # pointer file naming the published generation
+└── generations/<generation>/
+    ├── tantivy_lex/                                  # lexical index
+    ├── dense.exact_mmap_v1.bin                       # THE dense payload (aicx.dense.exact_mmap.v1)
+    └── manifest.json                                 # generation authority, written last
+```
+
+Contract:
+
+- **One dense payload per generation.** Vectors are written once, into the
+  versioned mmap artifact. The old `hybrid/dense_brute_force.ndjson` twin
+  (a near-copy of `embeddings.ndjson`, 15 GB + 15 GB on the live `_all`
+  bucket) is never written by new builds; existing copies remain on disk as
+  migration read input only.
+- **Manifest last, pointer flip publishes.** A build writes lexical and dense
+  payloads first, `manifest.json` after them, and only then atomically
+  renames the `CURRENT` pointer. A build killed at any earlier boundary
+  leaves an unreferenced generation directory; readers keep resolving the
+  previous complete generation. Incomplete directories are quarantinable and
+  never alter current-generation resolution.
+- **Manifest binds the payload.** `manifest.json` carries the generation id,
+  the blake3 source hash of the committed semantic index, embedder model /
+  url hash / dimension / distance, dense kind + row count, and the lexical
+  commit id + doc count. Validation rejects drift on source, model,
+  dimension, distance, lexical generation, and partial-build divergence
+  (kind or count mismatch between manifest and artifacts).
+- **Legacy stores migrate on the next full build.** A bucket without a
+  `CURRENT` pointer resolves to the legacy root layout for reads; the next
+  `aicx index` full rebuild materializes a single-payload generation and
+  publishes it. No index files are deleted by the migration.
+
+Old generation directories accumulate until the doctor/quarantine surface
+reclaims them; this cut intentionally does not delete anything.
+
+## Dense Migration Benchmark
+
+`tools/bench_dense_migration.sh` is the W4 falsification harness for the dense
+replacement. It builds an isolated `AICX_HOME` shaped like the live store,
+including exact/case-drift/bare/underscore project identities, writes the
+legacy duplicate pair (`embeddings.ndjson` plus `hybrid/dense_brute_force.ndjson`),
+materializes a byte-compatible `dense.exact_mmap_v1.bin`, and compares both
+paths on identical global and project-filtered top-k queries.
+
+Fast contract gate:
+
+```bash
+bash tools/bench_dense_migration.sh --verify-only
+```
+
+Production-scale falsification should keep the live `~/.aicx` read-only and
+point the harness at an isolated filesystem budget, for example:
+
+```bash
+bash tools/bench_dense_migration.sh --rows 300000 --dim 4096 --queries 40 --output reports/dense-migration.json --keep
+```
+
+The hard budgets remain unchanged from the W4 brief:
+
+- dense mmap payload <= 60% of the legacy duplicate pair
+- peak RSS <= 1.25 GiB at the observed ~300k x 4096 scale
+- warm project-filter p95 <= 2 s; warm global p95 <= 8 s
+- exact top-k parity is 100% for equal ranking inputs
+- corrupt or interrupted generation copies must leave `CURRENT` untouched
+
+Measured verdict on 2026-07-22 (W4-01c): **OUTCOME 1 — budgets met by the
+release-mode engine**. The isolated 500000×1024 corpus still produces a
+2,133,416,794 byte dense mmap payload (≥2 GiB), keeps disk duplication low
+(0.0971× of the legacy pair), preserves exact top-k and reverse-order parity at
+1.0, and leaves `CURRENT` untouched after corrupt and interrupted copies.
+
+The 317.87 s global / 55.00 s project numbers from the first W4-01 scale run are
+**reference-model latency**, not engine latency. `run_mmap()` inside
+`tools/bench_dense_migration.sh` is pure Python: it struct-unpacks and
+dot-products every row in the interpreter and never executes the Rust
+`MmapDenseAdapter` (debug or release). After the hot-loop repair (`16310b3`) the
+unmodified harness re-ran at ~321.96 s / 55.37 s — still the Python path —
+while the release-mode adapter at the same scale measured:
+
+| Path | Warm latency | Frozen budget |
+|---|---:|---:|
+| global (empty filters) | 0.371–0.468 s | 8 s |
+| project-scoped | 0.212–0.221 s | 2 s |
+
+Scores stay bit-identical to the brute-force leg. The LanceDB / memex-search
+contingency in `backlog/memex-search-transplant.md` stays shelved. Do not re-read
+the shell harness's wall times as engine miss; do not relax the frozen budgets
+in `tests/retrieval_eval/baseline.json`.
+
+`--verify-only` is intentionally not production proof. It is the synchronous CI
+gate that proves the benchmark contract, byte layout, failed-copy safety checks,
+reverse-order query parity, and budget accounting still work before an operator
+runs the larger isolated corpus.
+
 ## Relationship To Roost/Rust-Memex
 
 Do not conflate config planes:

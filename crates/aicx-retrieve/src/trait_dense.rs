@@ -13,6 +13,9 @@ pub trait DenseIndex {
     fn kind(&self) -> &str;
     fn build(&mut self, chunks: &[DenseChunkRef]) -> Result<()>;
     fn insert(&mut self, chunk: &DenseChunkRef) -> Result<()>;
+    /// Return deterministic exact top-k results. Implementations should apply
+    /// filters before distance work and bound query heap growth by `limit` and
+    /// decoded metadata rather than the stored vector payload.
     fn query(&self, embedding: &[f32], limit: usize, filters: &FilterSet) -> Result<Vec<Hit>>;
     fn count(&self) -> usize;
 }

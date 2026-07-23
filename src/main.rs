@@ -1,13 +1,12 @@
 //! AI Contexters — the operator front door for agent session logs.
 //!
-//! `aicx` orchestrates a two-layer pipeline: canonical corpus first,
-//! optional semantic index second. Materialization is always explicit.
+//! `aicx` catalogs live agent sources, renders readable session extracts, and
+//! publishes a lexical-first retrieval index. Materialization is explicit.
 //!
-//! Two-layer architecture:
-//!   1. **Canonical corpus** (`~/.aicx/`) — deduplicated, chunked, steerable markdown.
-//!      Built by extractors (`claude`, `codex`, `all`) and `store`. This is ground truth.
-//!   2. **Optional semantic index** — local embedding-backed retrieval for builds that
-//!      opt into native embedder support. The corpus remains useful without it.
+//! Runtime architecture:
+//!   1. **Catalog** (`~/.aicx/catalog/sessions.jsonl`) — session identity and attribution.
+//!   2. **Extracts** (`~/.aicx/extracts/`) — optional readable session-level cache.
+//!   3. **Index** (`~/.aicx/indexed/_all/hybrid`) — Tantivy by default; dense is optional.
 //!
 //! Supported sources:
 //! - Claude Code: ~/.claude/projects/*/*.jsonl
@@ -71,16 +70,16 @@ fn print_intent_schema_migration_report(report: &intents::MigrationReport) {
 /// aicx — operator front door for agent session logs.
 ///
 /// Operator-driven pipeline:
-///   Canonical corpus: extract, deduplicate, and chunk agent logs into
-///     steerable markdown at ~/.aicx/. This is ground truth.
-///   Layer 2 (optional semantic index): local embedding-backed retrieval for native builds,
-///     while the canonical corpus stays portable and useful without it.
+///   Catalog: map live agent sessions to projects and source paths.
+///   Extracts: render one readable user/assistant transcript per session.
+///   Index: lexical-first Tantivy over extracts; dense rerank is optional.
 /// Quick start:
-///   aicx all -H 4                      # build canonical corpus
+///   aicx catalog rebuild
+///   aicx index
 #[derive(Debug, Parser)]
 #[command(name = "aicx")]
 #[command(author = "(c)2026 Vetcoders")]
-#[command(version)]
+#[command(version = env!("AICX_BUILD_VERSION"))]
 #[command(verbatim_doc_comment)]
 struct Cli {
     /// Verbose diagnostics: echo per-file extractor warnings to stderr.
@@ -91,6 +90,11 @@ struct Cli {
     /// restore the pre-G-4 per-file echo for debugging individual sessions.
     #[arg(long, short = 'v', global = true)]
     verbose: bool,
+
+    /// Opt in to project-family matching. By default project filters are exact
+    /// and an ambiguous bare repository name fails closed.
+    #[arg(long, global = true)]
+    project_fuzzy: bool,
 
     #[command(subcommand)]
     command: Option<Commands>,
@@ -556,7 +560,7 @@ struct DashboardArgs {
     #[arg(long)]
     store_root: Option<PathBuf>,
 
-    /// Narrow the dashboard dataset to project/store buckets containing this string
+    /// Exact project scope. A bare repository name must resolve uniquely.
     #[arg(short, long)]
     project: Option<String>,
 
@@ -847,6 +851,24 @@ struct SearchQualityEvalArgs {
 }
 
 #[derive(Debug, Subcommand)]
+enum CatalogAction {
+    /// Walk all source roots and rewrite `~/.aicx/catalog/sessions.jsonl`.
+    Rebuild {
+        /// Emit JSON report to stdout.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Resolve one session id from the durable catalog.
+    Resolve {
+        /// Session id (exact, logical, or unique prefix).
+        session: String,
+        /// Emit JSON.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum Commands {
     /// Generate shell completions for the canonical CLI grammar.
     #[command(hide = true)]
@@ -868,10 +890,10 @@ enum Commands {
     },
 
     // ── Layer 1: Canonical corpus ─────────────────────────────────────
-    /// Extract and store Agents' sessions into the canonical corpus (canonical corpus extraction).
+    /// Extract Claude sessions into local reports.
     ///
     /// Reads claude-code session files, then
-    /// writes steerable Markdown files to a central store.
+    /// writes readable Markdown/JSON reports only when an output is requested.
     #[command(display_order = 2)]
     Claude {
         #[command(flatten)]
@@ -938,10 +960,10 @@ enum Commands {
         conversation: bool,
     },
 
-    /// Extract and store Codex sessions into the canonical corpus.
+    /// Extract Codex sessions into local reports.
     ///
     /// Reads codex session files, then
-    /// writes steerable Markdown files to a central store.
+    /// writes readable Markdown/JSON reports only when an output is requested.
     #[command(display_order = 3)]
     Codex {
         #[command(flatten)]
@@ -1008,7 +1030,7 @@ enum Commands {
         conversation: bool,
     },
 
-    /// Extract and store from all agents (Claude + Codex + Gemini + Junie + Codescribe) into the canonical corpus.
+    /// Extract sessions from all supported agents into local reports.
     ///
     /// The daily-driver command: runs each extractor, deduplicates, chunks, and
     /// writes steerable markdown to ~/.aicx/. By default, uses per-source
@@ -1128,7 +1150,7 @@ enum Commands {
         input: Option<PathBuf>,
     },
 
-    /// Batch-export conversation JSON files without writing to the canonical store.
+    /// Batch-export conversation JSON files without writing card-mill files.
     ///
     /// Thin wrapper around `aicx extract --conversation` semantics: scans source
     /// sessions, groups by session_id, and writes one JSON file per session.
@@ -1171,58 +1193,15 @@ enum Commands {
         dry_run: bool,
     },
 
-    /// Build the canonical corpus in from local agents' session files.
+    /// Rebuild the durable extract-era session catalog (no per-frame cards).
     ///
-    /// Store-first corpus builder: extracts, deduplicates, chunks, and writes
-    /// steerable Markdown. By default, this command uses per-source watermarks
-    /// to skip previously scanned history. Use --full-rescan for backfills
-    /// and targeted re-extraction when you need to ignore the watermark.
-    ///
-    #[command(display_order = 4)]
-    Store {
-        #[command(flatten)]
-        redaction: RedactionArgs,
-
-        /// Source cwd/project filter(s): narrows session discovery before repo segmentation
-        #[arg(short, long, value_delimiter = ',')]
-        project: Vec<String>,
-
-        /// Agent filter: one of claude, codex, gemini, junie, grok, codescribe, operator-md.
-        /// Default: claude+codex+gemini+junie+grok+codescribe (operator-md is opt-in
-        /// via `--agent operator-md`).
-        #[arg(short, long, value_parser = ["claude", "codex", "gemini", "junie", "grok", "codescribe", "operator-md"])]
-        agent: Option<String>,
-
-        /// Hours to look back (default: 48, 0 = all time)
-        #[arg(short = 'H', long, default_value = "48")]
-        hours: u64,
-
-        /// Ignore the stored watermark and previously-seen hashes for this run
-        #[arg(long)]
-        full_rescan: bool,
-
-        /// Legacy no-op: incremental mode is now the default
-        #[arg(long, hide = true, conflicts_with = "full_rescan")]
-        incremental: bool,
-
-        /// Only include user messages (exclude assistant + reasoning)
-        #[arg(long)]
-        user_only: bool,
-
-        /// Include assistant messages (legacy flag; now default)
-        #[arg(long, hide = true, conflicts_with = "user_only")]
-        include_assistant: bool,
-
-        /// Disable structural-noise filter (line-numbered grep matches, tool
-        /// echoes, stray YAML delimiters). Default: filter is ON. Use this
-        /// for debugging or when raw upstream content must be preserved
-        /// verbatim in the chunk text.
-        #[arg(long)]
-        no_noise_filter: bool,
-
-        /// What to print to stdout: paths, json, none (default: none)
-        #[arg(long, value_enum, default_value_t = StdoutEmit::None)]
-        emit: StdoutEmit,
+    /// Walks live agent source roots (claude/codex/gemini/grok/junie +
+    /// vibecrafted runtime_runs) and writes `~/.aicx/catalog/sessions.jsonl`.
+    /// Does not materialize card files under `~/.aicx/store/`.
+    #[command(display_order = 3)]
+    Catalog {
+        #[command(subcommand)]
+        action: CatalogAction,
     },
 
     /// Ingest operator-owned source documents into the canonical corpus.
@@ -1267,9 +1246,9 @@ enum Commands {
     // ── Layer 1: Query & inspect ──────────────────────────────────────
     /// List raw agent session sources on disk (pre-extraction inputs).
     ///
-    /// Shows Claude Code, Codex, Gemini, and Junie log paths with session counts
-    /// and sizes. This is what extractors will read from — use `refs` to
-    /// see what is already in the canonical store after extraction.
+    /// Shows Claude Code, Codex, Gemini, Junie, and Grok log paths with session
+    /// counts and sizes. This is what extractors will read from — use
+    /// `catalog resolve` / `extract` to inspect identity and readable transcripts.
     #[command(display_order = 10)]
     List,
 
@@ -1330,7 +1309,7 @@ enum Commands {
         format: String,
     },
 
-    /// Interactive daily-driver entrypoint for corpus, doctor, intents, and store.
+    /// Interactive daily-driver entrypoint for catalog, extracts, index, and doctor.
     #[command(display_order = 9)]
     Wizard {
         /// Render one frame and exit; used by automated smoke tests.
@@ -1338,9 +1317,10 @@ enum Commands {
         smoke_test: bool,
     },
 
-    /// List chunks in the canonical store inventory.
+    /// List recent extract/catalog inventory under ~/.aicx/.
     ///
-    /// Shows what extractors have already written to ~/.aicx/.
+    /// Shows what the extract-era identity path has already materialised
+    /// (extracts cache and legacy card trees if still present on disk).
     #[command(display_order = 11)]
     Refs {
         /// Hours to look back (filter by canonical chunk date)
@@ -1348,8 +1328,8 @@ enum Commands {
         hours: u64,
 
         /// Strict project filter: `owner/repo`, `/repo` (cross-org repo
-        /// name), `owner/` (org wildcard), or `name` (matches org OR
-        /// repo). Substring matching is intentionally disabled — `-p vista`
+        /// name), `owner/` (org wildcard), or a unique exact `name`.
+        /// Substring matching is intentionally disabled — `-p vista`
         /// no longer leaks into `vista-portal`/`vista-datasets`.
         #[arg(short, long)]
         project: Option<String>,
@@ -1375,7 +1355,7 @@ enum Commands {
 
         /// Project filter (applies to --info as well as --reset).
         /// Supports the standard shapes: `-p owner/repo`, `-p owner/`,
-        /// `-p /repo`, or a bare `-p name` (cross-org).
+        /// `-p /repo`, or a bare `-p name` that must resolve uniquely.
         #[arg(short, long)]
         project: Option<String>,
 
@@ -1384,7 +1364,7 @@ enum Commands {
         info: bool,
     },
 
-    /// Generate a searchable HTML dashboard from the canonical store, or serve it locally.
+    /// Generate a searchable HTML dashboard from extracts/catalog, or serve it locally.
     Dashboard(#[command(flatten)] DashboardArgs),
 
     /// Extract Vibecrafted workflow and marbles reports into a standalone HTML explorer.
@@ -1572,8 +1552,9 @@ enum Commands {
         no_gitignore: bool,
     },
 
-    /// Search the canonical corpus. Semantic by default; automatic
-    /// filesystem-fuzzy fallback when semantic search is unavailable.
+    /// Search the CURRENT source/extract index. Lexical-first by default;
+    /// optional dense rerank with --deep. When no index exists, the only
+    /// fallback is a bounded recency-ranked filesystem search.
     #[command(display_order = 12)]
     Search {
         /// Search query string
@@ -1585,7 +1566,7 @@ enum Commands {
         ///   `-p owner/repo`   strict `<owner>/<repo>` slug match
         ///   `-p owner/`       all repos under that owner (org wildcard)
         ///   `-p /repo`        same repo name across every owner
-        ///   `-p name`         name matches an owner OR a repo (cross-org)
+        ///   `-p name`         unique exact owner or repo name; ambiguity fails
         ///
         /// Multiple `-p` flags or a comma list (`-p a,b`) form a union.
         /// Substring matching is intentionally not supported — `-p vista`
@@ -1606,7 +1587,7 @@ enum Commands {
         #[command(flatten)]
         filters: RetrievalFilters,
 
-        /// Filter by canonical corpus kind: conversations, plans, reports, other.
+        /// Filter by indexed document kind: conversations, plans, reports, other.
         #[arg(long, value_parser = ["conversations", "conversation", "plans", "plan", "reports", "report", "other"])]
         kind: Option<String>,
 
@@ -1622,6 +1603,17 @@ enum Commands {
         /// Emit compact JSON instead of plain text
         #[arg(short = 'j', long)]
         json: bool,
+
+        /// Use legacy NDJSON reader for dense vector search instead of versioned mmap.
+        #[arg(long)]
+        legacy_dense: bool,
+
+        /// Dense re-rank (hybrid RRF over tantivy + mmap). Default is
+        /// lexical-first with a recency prior against the published `_all`
+        /// CURRENT generation — sub-second answers without loading the
+        /// embedder or dense vectors.
+        #[arg(long)]
+        deep: bool,
     },
 
     /// Run local evaluation helpers for retrieval/search quality.
@@ -1631,31 +1623,30 @@ enum Commands {
         action: EvalAction,
     },
 
-    /// Catch up the canonical corpus, then build the semantic index. Use
-    /// `--dry-run` to preview without writing.
+    /// Build the source-driven lexical index. Use `--dry-run` to preview
+    /// parsing and filtering without writing extracts or publishing CURRENT.
     ///
-    /// Default behaviour is INCREMENTAL: first materialize missing canonical
-    /// chunks from source sessions, then embed only sidecars whose mtime is
-    /// newer than the existing index `header.generated_at`; new rows are
-    /// appended to the committed index file. With no `-p`, AICX builds the
-    /// `_all` index used by global search and project-scoped `search -p`
-    /// queries. Optional per-project buckets can be derived later with
-    /// `aicx index derive -p <project>` as a local cache. Pass
-    /// `--full-rescan` to re-embed every chunk from scratch — useful when
-    /// the embedder model changes, the index file is corrupt, or an
-    /// operator wants a deterministic from-zero rebuild.
+    /// Default behaviour is incremental by catalog snapshot: when the catalog
+    /// is unchanged, AICX reuses CURRENT without parsing session bodies. Run
+    /// `aicx catalog rebuild` to admit new or changed source sessions; the next
+    /// index run parses that snapshot, filters tool/internal/system noise, and
+    /// atomically publishes a fresh Tantivy generation. With no `-p`, this is
+    /// the `_all` index used by both global search and project-scoped
+    /// `search -p` queries. Dense vectors are optional and are not built by
+    /// this command.
     #[command(display_order = 14)]
     Index {
         #[command(subcommand)]
         action: Option<IndexAction>,
 
-        /// Project filter. Omit to index the global `_all` bucket.
+        /// Project filter for `--dry-run` inspection only. Persistent indexing
+        /// always publishes the global `_all` catalog; `search -p` filters it.
         ///
         /// Accepted forms (case-insensitive, repeatable):
         ///   `-p owner/repo`   strict `<owner>/<repo>` slug match
         ///   `-p owner/`       all repos under that owner (org wildcard)
         ///   `-p /repo`        same repo name across every owner
-        ///   `-p name`         name matches an owner OR a repo (cross-org)
+        ///   `-p name`         unique exact owner or repo name; ambiguity fails
         ///
         /// Multiple `-p` flags or a comma list (`-p a,b`) form a union.
         /// Substring matching is intentionally not supported — `-p vista`
@@ -1663,7 +1654,7 @@ enum Commands {
         #[arg(short, long, value_delimiter = ',')]
         project: Vec<String>,
 
-        /// Stop after sampling this many chunks (0 = scan all)
+        /// Retired compatibility flag; source indexing always scans the selected catalog.
         #[arg(long, default_value = "0")]
         sample: usize,
 
@@ -1682,12 +1673,16 @@ enum Commands {
         )]
         dry_run: bool,
 
-        /// Force a full re-embed of every chunk. Default is incremental:
-        /// walk only sidecars newer than the existing index's
-        /// `header.generated_at` and append. Use this flag after embedder
-        /// model changes or when the committed index is suspect.
+        /// Ignore the source fingerprint and rebuild the selected lexical
+        /// generation from every cataloged source.
         #[arg(long)]
         full_rescan: bool,
+
+        /// Cache one readable conversation extract per indexed session under
+        /// `~/.aicx/extracts/`. Omit to keep content only in live sources and
+        /// Tantivy (zero filesystem content duplication).
+        #[arg(long)]
+        cache_extracts: bool,
     },
 
     /// Manage `$HOME/.aicx/config.toml` for embedders and endpoints.
@@ -1781,8 +1776,8 @@ enum Commands {
     #[command(name = "migrate-intent-schema")]
     MigrateIntentSchema {
         /// Strict project filter: `owner/repo`, `/repo` (cross-org repo
-        /// name), `owner/` (org wildcard), or `name` (matches org OR
-        /// repo). Omit to scan the whole store. Substring matching is
+        /// name), `owner/` (org wildcard), or a unique exact `name`.
+        /// Omit to scan the whole store. Substring matching is
         /// intentionally disabled.
         #[arg(short, long)]
         project: Option<String>,
@@ -1796,20 +1791,26 @@ enum Commands {
         dry_run: bool,
     },
 
-    /// Diagnose and optionally repair the canonical store and steer index.
+    /// Diagnose and optionally repair AICX home health (index, state, residual store).
     ///
-    /// Runs integrity checks on the Lance steer DB, BM25 index, state.json,
-    /// sidecar coverage, and corpus bucket names. With
+    /// Runs integrity checks on the Lance steer DB, BM25/lexical index,
+    /// state.json, sidecar coverage, and residual corpus bucket names. With
     /// `--rebuild-steer-index`, corrupted steer indexes are deleted and
-    /// rebuilt from the canonical store (which is treated as ground truth
-    /// and never modified). Other remediations live behind dedicated flags
-    /// (`--prune-empty-bodies`, `--fix-buckets`, `aicx store --full-rescan`).
+    /// rebuilt from available corpus material (never invents cards). Other
+    /// remediations live behind dedicated flags (`--prune-empty-bodies`,
+    /// `--fix-buckets`). Prefer `aicx catalog rebuild` + `aicx index` for
+    /// the extract-era identity path.
     ///
     /// Exit codes: 0 on green/warning or after successful rebuild; 1 if
     /// critical issues are detected without remediation.
     #[command(display_order = 12)]
+    #[command(group(
+        clap::ArgGroup::new("doctor_apply_target")
+            .args(["prune_empty_bodies", "migrate_identities"])
+            .multiple(true)
+    ))]
     Doctor {
-        /// Delete and rebuild the steer index from the canonical store
+        /// Delete and rebuild the steer index from available corpus material
         /// when corrupted or schema-incompatible. Narrower contract than
         /// the legacy `--fix` (which was a no-op for sidecars/index
         /// consistency/empty bodies — those have dedicated flags).
@@ -1821,7 +1822,7 @@ enum Commands {
 
         /// Move suspicious top-level corpus buckets to $HOME/.aicx/quarantine/.
         /// Buckets that are merely CamelCase (legitimate GitHub orgs like
-        /// `LibraxisAI`, `Vetcoders`, `Loctree`, `Szowesgad`) are
+        /// `LibraxisAI`, `Vetcoders`, `Loctree`, `Sampleorg`) are
         /// canonicalized in place to lowercase instead of quarantined,
         /// merging into existing lowercase buckets if present.
         #[arg(long)]
@@ -1842,8 +1843,22 @@ enum Commands {
         #[arg(long)]
         prune_empty_bodies: bool,
 
-        /// With --prune-empty-bodies, move empty-body chunks into recoverable quarantine
-        #[arg(long, requires = "prune_empty_bodies")]
+        /// Plan the one-time project-identity migration: persisted index.json
+        /// key casing → GitHub nameWithOwner canon (lowercase, the
+        /// fresh-derivation form), store/ directory normalization,
+        /// historical-card alias map (annotate-only, cards never rewritten),
+        /// and a typo-twin bucket report. Dry-run by default — writes
+        /// migration/identity-manifest.json + identity-report.md with zero
+        /// store mutation; add --apply to execute the planned renames.
+        #[arg(long)]
+        migrate_identities: bool,
+
+        /// With --prune-empty-bodies, move empty-body chunks into recoverable
+        /// quarantine. With --migrate-identities, execute the planned
+        /// identity renames. Refuses to combine with --dry-run: on a
+        /// store-mutating surface the preview flag must always win, so the
+        /// ambiguous combination is a parse error.
+        #[arg(long, requires = "doctor_apply_target", conflicts_with = "dry_run")]
         apply: bool,
 
         /// Restore files from a quarantine manifest slug.
@@ -1871,6 +1886,17 @@ enum Commands {
         #[arg(long)]
         smoke: bool,
 
+        /// Run the full forensic pass: recursive store scans, semantic-index
+        /// reconciliation, and payload-level checks. Emits progress phases
+        /// with heartbeats and an explicit estimated scope; Ctrl-C cancels
+        /// cleanly between operations. Without this flag (and without fix /
+        /// full-scan flags, which imply it) doctor answers from the bounded
+        /// fast health pass — metadata, leases, manifests, and sampled
+        /// invariants only; anything it cannot prove is reported as
+        /// `unknown`, never as healthy.
+        #[arg(long)]
+        deep: bool,
+
         /// Output format: text (default), json
         #[arg(long, default_value = "text")]
         format: String,
@@ -1891,7 +1917,13 @@ enum Commands {
         oracle: bool,
     },
 
-    /// Emit the full AICX health report as JSON for automation.
+    /// Emit the bounded AICX health report as JSON for automation.
+    ///
+    /// Fast by contract: metadata, leases, manifests, lock state, and
+    /// sampled invariants only — never a recursive store scan, never a
+    /// diagnostics write. Checks whose truth needs the recursive pass are
+    /// reported with `"severity": "unknown"` plus the exact deep command
+    /// (`aicx doctor --deep`); unknown is never upgraded to healthy.
     #[command(display_order = 11)]
     Health,
 
@@ -1902,6 +1934,21 @@ enum Commands {
         #[arg(short = 'j', long)]
         json: bool,
     },
+}
+
+/// Doctor mode routing: any remediation, script-rendering, full-scan
+/// analysis (`--check-dedup`), or oracle-readiness request needs the deep
+/// forensic pass — the fast pass can neither fix nor certify. Everything
+/// else answers from the bounded fast health pass, which reports what it
+/// cannot prove as `unknown` instead of scanning the store recursively.
+fn doctor_needs_deep_pass(deep: bool, oracle: bool, opts: &aicx::doctor::DoctorOptions) -> bool {
+    deep || oracle
+        || opts.rebuild_steer_index
+        || opts.fix_buckets
+        || opts.rebuild_sidecars
+        || opts.prune_empty_bodies
+        || opts.migrate_identities
+        || opts.check_dedup
 }
 
 /// Index of the top-level subcommand token: the first argument that is not
@@ -2109,12 +2156,17 @@ fn main() -> Result<()> {
     let diagnostics_state_dir = aicx::store::store_base_dir().ok().map(|d| d.join("state"));
     let _ = aicx::diagnostics::init(cli.verbose, diagnostics_state_dir);
 
-    let result = run_command(cli.command);
+    let result = run_command(cli.command, cli.project_fuzzy);
     aicx::diagnostics::emit_summary();
     result
 }
 
-fn run_command(command: Option<Commands>) -> Result<()> {
+fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
+    let project_match = if project_fuzzy {
+        store::ProjectMatchMode::Fuzzy
+    } else {
+        store::ProjectMatchMode::Exact
+    };
     match command {
         Some(Commands::Completions { shell }) => {
             let mut command = Cli::command();
@@ -2277,8 +2329,42 @@ fn run_command(command: Option<Commands>) -> Result<()> {
         }) => {
             let json = aicx::cli::failure::want_json_envelope(false);
 
-            // Removed flag grammar: reject with a structured migration hint,
-            // never silently alias to the subcommand form.
+            // `--agent <a>` is a DEPRECATED ALIAS for the agent subcommand
+            // (restored 2026-07-16: hard removal broke fleet-wide silent
+            // consumers — hooks with `|| true` never read the migration hint).
+            // `--format` stays removed; `hours`/`include_assistant` have no
+            // new-grammar equivalent, so they still route to the hard error.
+            let alias_eligible = agent.is_some()
+                && target.is_none()
+                && format.is_none()
+                && hours.is_none()
+                && !include_assistant;
+            if alias_eligible {
+                let agent_name = agent.as_deref().unwrap_or_default();
+                if let Some(extract_agent) = ExtractAgent::from_str(agent_name) {
+                    let label = extract_agent.label();
+                    eprintln!(
+                        "note: `--agent {label}` is a deprecated alias; canonical form: `aicx extract {label} ...`"
+                    );
+                    let args = ExtractAgentArgs {
+                        redaction: RedactionArgs {
+                            redact_secrets: true,
+                        },
+                        session,
+                        file: input,
+                        output,
+                        project,
+                        user_only,
+                        max_message_chars: max_message_chars.unwrap_or(0),
+                        conversation,
+                    };
+                    run_extract_target(extract_agent, args)?;
+                    return Ok(());
+                }
+            }
+
+            // Removed flag grammar (--format, or legacy flags without a
+            // resolvable --agent): reject with a structured migration hint.
             let legacy_flags_used = agent.is_some()
                 || format.is_some()
                 || session.is_some()
@@ -2306,7 +2392,7 @@ fn run_command(command: Option<Commands>) -> Result<()> {
                     json,
                     aicx::cli::failure::StructuredFailure::new(
                         "legacy_flag_grammar",
-                        "legacy --agent/--format flag grammar was removed; the agent is a required subcommand",
+                        "legacy --format flag grammar was removed; the agent is a required subcommand (`--agent <a>` is accepted as a deprecated alias)",
                         format!("rerun as `{migration}`"),
                     )
                     .with_fallback(migration),
@@ -2350,34 +2436,14 @@ fn run_command(command: Option<Commands>) -> Result<()> {
                 redact_secrets: redaction.redact_secrets,
             })?;
         }
-        Some(Commands::Store {
-            redaction,
-            project,
-            agent,
-            hours,
-            full_rescan,
-            incremental,
-            user_only,
-            include_assistant: include_assistant_flag,
-            no_noise_filter,
-            emit,
-        }) => {
-            let include_assistant = include_assistant_flag || !user_only;
-            warn_incremental_legacy_flag(incremental);
-            warn_pending_mutation("store");
-            run_store(StoreRunArgs {
-                project,
-                agent,
-                hours,
-                cutoff: None,
-                full_rescan,
-                include_assistant,
-                emit,
-                redact_secrets: redaction.redact_secrets,
-                noise_filter_enabled: !no_noise_filter,
-                operator_md_input: None,
-            })?;
-        }
+        Some(Commands::Catalog { action }) => match action {
+            CatalogAction::Rebuild { json } => {
+                run_catalog_rebuild(json)?;
+            }
+            CatalogAction::Resolve { session, json } => {
+                run_catalog_resolve(&session, json)?;
+            }
+        },
         Some(Commands::Ingest {
             redaction,
             source,
@@ -2421,20 +2487,35 @@ fn run_command(command: Option<Commands>) -> Result<()> {
                 );
                 return Ok(());
             }
-            let has_explicit_since = since.is_some();
-            let cutoff = parse_ingest_since(since.as_deref())?;
-            run_store(StoreRunArgs {
+            // Card mill / `aicx store` is deleted. Agent session identity and
+            // search now flow: catalog rebuild → extract → source-driven index.
+            let _ = (
+                redaction,
                 project,
-                agent: Some(source.as_agent().to_string()),
                 hours,
-                cutoff,
-                full_rescan: full_rescan || has_explicit_since,
-                include_assistant: true,
+                since,
+                full_rescan,
+                no_noise_filter,
                 emit,
-                redact_secrets: redaction.redact_secrets,
-                noise_filter_enabled: !no_noise_filter,
-                operator_md_input: input,
-            })?;
+                input,
+            );
+            let json = aicx::cli::failure::want_json_envelope(false);
+            aicx::cli::failure::emit_and_error(
+                "aicx ingest",
+                json,
+                aicx::cli::failure::StructuredFailure::new(
+                    "card_mill_removed",
+                    format!(
+                        "per-frame store mill is removed; `aicx ingest --source {}` no longer writes ~/.aicx/store cards",
+                        source.as_agent()
+                    ),
+                    "run `aicx catalog rebuild`, then `aicx extract <agent> --session <id>`, then `aicx index`",
+                )
+                .with_fallback(
+                    "aicx catalog rebuild && aicx index   # source-driven lexical CURRENT",
+                ),
+            );
+            std::process::exit(2);
         }
         Some(Commands::List) => {
             let sources = sources::list_available_sources()?;
@@ -2507,17 +2588,17 @@ fn run_command(command: Option<Commands>) -> Result<()> {
             strict,
         }) => {
             let emit = if summary { RefsEmit::Summary } else { emit };
-            run_refs(hours, project, emit, strict)?;
+            run_refs(hours, project, emit, strict, project_match)?;
         }
         Some(Commands::State {
             reset,
             project,
             info,
         }) => {
-            run_state(reset, project, info)?;
+            run_state(reset, project, info, project_match)?;
         }
         Some(Commands::Dashboard(args)) => {
-            run_dashboard_command(args)?;
+            run_dashboard_command(args, project_match)?;
         }
         Some(Commands::Reports(args)) => {
             run_reports_command(args)?;
@@ -2563,6 +2644,7 @@ fn run_command(command: Option<Commands>) -> Result<()> {
                 &project,
                 hours,
                 filters,
+                project_match,
                 IntentsDisplayOptions {
                     emit: &emit,
                     strict,
@@ -2581,7 +2663,14 @@ fn run_command(command: Option<Commands>) -> Result<()> {
             kind,
             filters,
         }) => {
-            run_tail(&project, hours, follow, kind.as_deref(), filters)?;
+            run_tail(
+                &project,
+                hours,
+                follow,
+                kind.as_deref(),
+                filters,
+                project_match,
+            )?;
         }
         Some(Commands::Serve {
             transport,
@@ -2622,7 +2711,10 @@ fn run_command(command: Option<Commands>) -> Result<()> {
             no_semantic,
             evidence,
             json,
+            legacy_dense,
+            deep,
         }) => {
+            aicx::search_engine::LEGACY_DENSE_ACTIVE.with(|active| active.set(legacy_dense));
             run_search(SearchRunArgs {
                 query: &query,
                 projects: &project,
@@ -2633,6 +2725,8 @@ fn run_command(command: Option<Commands>) -> Result<()> {
                 kind: kind.as_deref(),
                 no_semantic,
                 evidence,
+                deep,
+                project_match,
             })?;
         }
         Some(Commands::Eval { action }) => match action {
@@ -2645,6 +2739,7 @@ fn run_command(command: Option<Commands>) -> Result<()> {
             json,
             dry_run,
             full_rescan,
+            cache_extracts,
         }) => match action {
             Some(IndexAction::Status { project, json }) => {
                 run_index_status(&project, json)?;
@@ -2660,7 +2755,7 @@ fn run_command(command: Option<Commands>) -> Result<()> {
                 if !dry_run {
                     warn_pending_mutation("index");
                 }
-                run_index(&project, sample, json, dry_run, full_rescan)?
+                run_index(&project, sample, json, dry_run, full_rescan, cache_extracts)?
             }
         },
         Some(Commands::Config { action }) => {
@@ -2682,15 +2777,16 @@ fn run_command(command: Option<Commands>) -> Result<()> {
             json,
             filters,
         }) => {
-            run_steer(
-                run_id.as_deref(),
-                prompt_id.as_deref(),
-                kind.as_deref(),
-                &project,
-                date.as_deref(),
+            run_steer(SteerRunArgs {
+                run_id: run_id.as_deref(),
+                prompt_id: prompt_id.as_deref(),
+                kind: kind.as_deref(),
+                projects: &project,
+                date: date.as_deref(),
                 json,
                 filters,
-            )?;
+                project_match,
+            })?;
         }
         Some(Commands::Migrate {
             dry_run,
@@ -2752,6 +2848,7 @@ fn run_command(command: Option<Commands>) -> Result<()> {
             dry_run,
             rebuild_sidecars,
             prune_empty_bodies,
+            migrate_identities,
             apply,
             restore_quarantine,
             yes,
@@ -2759,6 +2856,7 @@ fn run_command(command: Option<Commands>) -> Result<()> {
             check_dedup,
             verbose,
             smoke,
+            deep,
             format,
             oracle,
         }) => {
@@ -2777,9 +2875,11 @@ fn run_command(command: Option<Commands>) -> Result<()> {
                 || dry_run
                 || rebuild_sidecars
                 || prune_empty_bodies
+                || migrate_identities
                 || apply
                 || check_dedup
                 || oracle
+                || deep
                 || format == "json";
             if force || yes {
                 let rt = tokio::runtime::Runtime::new()
@@ -2841,15 +2941,50 @@ fn run_command(command: Option<Commands>) -> Result<()> {
                 dry_run,
                 rebuild_sidecars,
                 prune_empty_bodies,
-                apply_prune_empty_bodies: apply,
+                apply_prune_empty_bodies: apply && prune_empty_bodies,
+                migrate_identities,
+                apply_migrate_identities: apply && migrate_identities,
                 check_dedup,
                 verbose,
                 smoke,
             };
+            let deep_pass = doctor_needs_deep_pass(deep, oracle, &opts);
             let rt = tokio::runtime::Runtime::new()
                 .context("Failed to start tokio runtime for doctor")?;
-            let report = match rt.block_on(aicx::doctor::run(&opts)) {
-                Ok(report) => report,
+            let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let reporter: std::sync::Arc<dyn aicx::progress::Reporter> = if deep_pass {
+                aicx::progress::select_reporter(format == "json")
+            } else {
+                std::sync::Arc::new(aicx::progress::NoopReporter)
+            };
+            if deep_pass {
+                // Cooperative cancellation: first Ctrl-C flips the flag and
+                // the run winds down cleanly between operations (read-only
+                // scans are abandoned; remediations are recoverable moves
+                // that either completed or never started).
+                let cancel_signal = cancel.clone();
+                rt.spawn(async move {
+                    if tokio::signal::ctrl_c().await.is_ok() {
+                        cancel_signal.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                });
+            }
+            let run_outcome = rt.block_on(aicx::doctor::run(
+                None,
+                &opts,
+                deep_pass,
+                reporter,
+                cancel.clone(),
+            ));
+            let report = match run_outcome {
+                Ok(Some(report)) => report,
+                Ok(None) => {
+                    eprintln!(
+                        "aicx doctor: cancelled by operator; completed phases remain valid, \
+                         quarantine moves are recoverable, nothing was left mid-write."
+                    );
+                    std::process::exit(130);
+                }
                 Err(err) => {
                     // CLI-boundary failure-as-state for doctor. Catch the
                     // historical `--prune-empty-bodies` crash class (chunk
@@ -2916,13 +3051,25 @@ fn run_command(command: Option<Commands>) -> Result<()> {
                 rebuild_sidecars: false,
                 prune_empty_bodies: false,
                 apply_prune_empty_bodies: false,
+                migrate_identities: false,
+                apply_migrate_identities: false,
                 check_dedup: false,
                 verbose: true,
                 smoke: false,
             };
             let rt = tokio::runtime::Runtime::new()
                 .context("Failed to start tokio runtime for health")?;
-            let report = rt.block_on(aicx::doctor::run(&opts))?;
+            // Health is the bounded fast pass by contract: read-only, no
+            // recursive scan, no diagnostics write, no cancellation surface.
+            let report = rt
+                .block_on(aicx::doctor::run(
+                    None,
+                    &opts,
+                    false,
+                    std::sync::Arc::new(aicx::progress::NoopReporter),
+                    std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                ))?
+                .expect("fast health has no cancel source");
             println!("{}", serde_json::to_string_pretty(&report)?);
             std::process::exit(match report.overall {
                 aicx::doctor::Severity::Critical => 1,
@@ -3766,13 +3913,7 @@ fn session_id_table_value(id: &str) -> String {
 }
 
 fn session_project_label(session: &sessions::SessionInfo) -> String {
-    session
-        .repo_path
-        .as_deref()
-        .and_then(|path| aicx::parser::segmentation::infer_tiered_identity_from_cwd(Some(path)))
-        .map(|tiered| tiered.identity.slug())
-        .or_else(|| session.project.clone())
-        .unwrap_or_else(|| "-".to_string())
+    session.project.clone().unwrap_or_else(|| "-".to_string())
 }
 
 fn compact_repo_path(path: &str) -> String {
@@ -4021,291 +4162,41 @@ struct IntentPackKeywordHit {
 const DEFAULT_INTENTS_PACK_LIMIT: usize = 20;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct IntentsProjectResolution {
-    projects: Vec<String>,
-    unresolved_filters: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 struct BucketHint {
     slug: String,
     chunks: usize,
 }
 
-fn resolve_intents_project_filters(projects: &[String]) -> Result<IntentsProjectResolution> {
+fn resolve_intents_project_filters(
+    projects: &[String],
+    match_mode: store::ProjectMatchMode,
+) -> Result<store::ProjectIdentityResolution> {
     let store_root = store::store_base_dir()?;
-    let cwd = std::env::current_dir().ok();
-    let session_home = aicx::os_user_home();
-    resolve_intents_project_filters_with_session_home_at(
-        projects,
-        &store_root,
-        session_home.as_deref(),
-        cwd.as_deref(),
-    )
-}
-
-fn resolve_intents_project_filters_with_session_home_at(
-    projects: &[String],
-    store_root: &Path,
-    session_home: Option<&Path>,
-    cwd: Option<&Path>,
-) -> Result<IntentsProjectResolution> {
-    let sessions = discover_intents_resolution_sessions(projects, session_home);
-    resolve_intents_project_filters_at(projects, store_root, &sessions, cwd)
-}
-
-fn discover_intents_resolution_sessions(
-    projects: &[String],
-    session_home: Option<&Path>,
-) -> Vec<sessions::SessionInfo> {
-    if projects.is_empty() {
-        return Vec::new();
-    }
-    let Some(home) = session_home else {
-        return Vec::new();
-    };
-    sessions::discover_sessions_at(home, None, None, None)
+    resolve_intents_project_filters_at(projects, &store_root, match_mode)
 }
 
 fn resolve_intents_project_filters_at(
     projects: &[String],
     store_root: &Path,
-    sessions: &[sessions::SessionInfo],
-    cwd: Option<&Path>,
-) -> Result<IntentsProjectResolution> {
+    match_mode: store::ProjectMatchMode,
+) -> Result<store::ProjectIdentityResolution> {
     if projects.is_empty() {
-        return Ok(IntentsProjectResolution {
-            projects: Vec::new(),
+        return Ok(store::ProjectIdentityResolution {
+            selected: Vec::new(),
+            candidates: Vec::new(),
             unresolved_filters: Vec::new(),
+            match_mode,
         });
     }
-
-    let mut slugs: Vec<String> = store::scan_context_files_at(store_root)?
-        .into_iter()
-        .map(|file| file.project)
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect();
-    slugs.sort();
-
-    let mut resolved = BTreeSet::new();
-    let mut unresolved = Vec::new();
-    for filter in projects {
-        let matches = resolve_single_intents_project_filter(filter, &slugs, sessions, cwd)?;
-        if matches.is_empty() {
-            unresolved.push(filter.clone());
-        } else {
-            resolved.extend(matches);
-        }
-    }
-
-    Ok(IntentsProjectResolution {
-        projects: resolved.into_iter().collect(),
-        unresolved_filters: unresolved,
-    })
-}
-
-fn resolve_single_intents_project_filter(
-    filter: &str,
-    slugs: &[String],
-    sessions: &[sessions::SessionInfo],
-    cwd: Option<&Path>,
-) -> Result<Vec<String>> {
-    let filter = filter.trim();
-    if filter.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    if let Some(matches) = unique_resolution_stage(
-        filter,
-        "exact bucket",
-        slugs.iter().filter(|slug| slug.as_str() == filter).cloned(),
-    )? {
-        return Ok(matches);
-    }
-    if let Some(matches) = unique_resolution_stage(
-        filter,
-        "case-insensitive bucket",
-        slugs
-            .iter()
-            .filter(|slug| slug.eq_ignore_ascii_case(filter))
-            .cloned(),
-    )? {
-        return Ok(matches);
-    }
-
-    let session_matches = sessions
-        .iter()
-        .filter(|session| {
-            session
-                .project
-                .as_deref()
-                .is_some_and(|project| project.eq_ignore_ascii_case(filter))
-        })
-        .filter_map(|session| session.repo_path.as_deref())
-        .flat_map(|repo_path| slug_candidates_from_cwd_like(repo_path, filter, slugs));
-    if let Some(matches) =
-        unique_resolution_stage(filter, "sessions display-name", session_matches)?
-    {
-        return Ok(matches);
-    }
-
-    if let Some(cwd) = cwd.and_then(Path::to_str) {
-        let cwd_basename_matches = Path::new(cwd)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.eq_ignore_ascii_case(filter));
-        if cwd_basename_matches
-            && let Some(matches) = unique_resolution_stage(
-                filter,
-                "cwd basename",
-                slug_candidates_from_cwd_like(cwd, filter, slugs),
-            )?
-        {
-            return Ok(matches);
-        }
-    }
-
-    if let Some(remote_slug) = inferred_slug_from_cwd_like(filter)
-        && let Some(slug) = canonical_stored_slug(slugs, &remote_slug)
-    {
-        return Ok(vec![slug]);
-    }
-
-    if filter.starts_with('/') || filter.ends_with('/') {
-        let matches: Vec<String> = slugs
-            .iter()
-            .filter(|slug| {
-                split_slug(slug)
-                    .is_some_and(|(org, repo)| store::project_filter_matches(org, repo, filter))
-            })
-            .cloned()
-            .collect();
-        if !matches.is_empty() {
-            return Ok(matches);
-        }
-    }
-
-    if let Some(matches) = unique_resolution_stage(
-        filter,
-        "alias",
-        slugs
-            .iter()
-            .filter(|slug| slug_matches_project_alias(slug, filter))
-            .cloned(),
-    )? {
-        return Ok(matches);
-    }
-
-    Ok(Vec::new())
-}
-
-fn unique_resolution_stage<I>(
-    filter: &str,
-    stage: &str,
-    candidates: I,
-) -> Result<Option<Vec<String>>>
-where
-    I: IntoIterator<Item = String>,
-{
-    let matches: Vec<String> = candidates
-        .into_iter()
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect();
-    if matches.is_empty() {
-        return Ok(None);
-    }
-    if matches.len() > 1 {
-        anyhow::bail!(
-            "project filter {filter:?} is ambiguous at {stage} resolution; matched buckets:\n  - {}\nUse one exact bucket with -p owner/repo.",
-            matches.join("\n  - ")
-        );
-    }
-    Ok(Some(matches))
-}
-
-fn slug_candidates_from_cwd_like(cwd_like: &str, filter: &str, slugs: &[String]) -> Vec<String> {
-    if let Some(remote_slug) = inferred_slug_from_cwd_like(cwd_like)
-        && let Some(slug) = canonical_stored_slug(slugs, &remote_slug)
-    {
-        return vec![slug];
-    }
-
-    let mut matches = BTreeSet::new();
-    let basename = Path::new(cwd_like)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .filter(|name| name.eq_ignore_ascii_case(filter));
-    if let Some(basename) = basename {
-        matches.extend(
-            slugs
-                .iter()
-                .filter(|slug| {
-                    split_slug(slug).is_some_and(|(_, repo)| repo.eq_ignore_ascii_case(basename))
-                })
-                .cloned(),
-        );
-    }
-
-    matches.into_iter().collect()
-}
-
-fn inferred_slug_from_cwd_like(value: &str) -> Option<String> {
-    if !is_resolvable_cwd_like(value) {
-        return None;
-    }
-    let identity = aicx_parser::segmentation::infer_tiered_identity_from_cwd(Some(value))?.identity;
-    Some(identity.slug())
-}
-
-fn is_resolvable_cwd_like(value: &str) -> bool {
-    let value = value.trim();
-    value.starts_with('/')
-        || value.starts_with('~')
-        || value.starts_with("http://")
-        || value.starts_with("https://")
-        || value.starts_with("git@")
-        || value.starts_with("ssh://")
-        || value.starts_with("git://")
-        || (cfg!(windows) && is_windows_absolute_path(value))
-}
-
-fn is_windows_absolute_path(value: &str) -> bool {
-    let bytes = value.as_bytes();
-    (bytes.len() >= 3
-        && bytes[0].is_ascii_alphabetic()
-        && bytes[1] == b':'
-        && (bytes[2] == b'\\' || bytes[2] == b'/'))
-        || value.starts_with("\\\\")
-}
-
-fn canonical_stored_slug(slugs: &[String], candidate: &str) -> Option<String> {
-    slugs
-        .iter()
-        .find(|slug| slug.eq_ignore_ascii_case(candidate))
-        .cloned()
+    let corpus = store::project_identities_in_store_at(store_root)?;
+    Ok(store::require_project_resolution(
+        projects, &corpus, match_mode,
+    )?)
 }
 
 fn split_slug(slug: &str) -> Option<(&str, &str)> {
     let (org, repo) = slug.split_once('/')?;
-    if org.is_empty() || repo.is_empty() {
-        return None;
-    }
-    Some((org, repo))
-}
-
-fn slug_matches_project_alias(slug: &str, filter: &str) -> bool {
-    let filter_alias = project_alias_key(filter);
-    if filter_alias.is_empty() {
-        return false;
-    }
-    let Some((org, repo)) = split_slug(slug) else {
-        return false;
-    };
-    [slug, org, repo]
-        .into_iter()
-        .any(|candidate| project_alias_key(candidate) == filter_alias)
+    (!org.is_empty() && !repo.is_empty()).then_some((org, repo))
 }
 
 fn project_alias_key(value: &str) -> String {
@@ -4445,6 +4336,7 @@ fn run_intents(
     projects: &[String],
     hours: u64,
     filters: RetrievalFilters,
+    project_match: store::ProjectMatchMode,
     display: IntentsDisplayOptions<'_>,
 ) -> Result<()> {
     let IntentsDisplayOptions {
@@ -4471,18 +4363,8 @@ fn run_intents(
     // kind filter: extract WITHOUT it so Outcomes survive the resolution check,
     // then re-apply it after the unresolved narrowing.
     let post_kind = if unresolved { kind_filter } else { None };
-    let project_resolution = resolve_intents_project_filters(projects)?;
-    let mut effective_projects = if project_resolution.projects.is_empty() {
-        projects.to_vec()
-    } else {
-        project_resolution.projects.clone()
-    };
-    effective_projects.extend(project_resolution.unresolved_filters.iter().cloned());
-    effective_projects = effective_projects
-        .into_iter()
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect();
+    let project_resolution = resolve_intents_project_filters(projects, project_match)?;
+    let effective_projects = project_resolution.selected.clone();
 
     if should_render_intents_pack(&filters, emit, kind, unresolved, collapse_session) {
         run_intents_pack(&effective_projects, hours, &filters, strict, min_confidence)?;
@@ -4529,11 +4411,21 @@ fn run_intents(
         limit: filters.limit,
     };
 
-    let mut records = intents::apply_display_filters(records, &display_filters);
+    // Apply all narrowing except the final result limit first so the envelope
+    // can report how many records existed before truncation. This also keeps
+    // deferred `--kind + --unresolved` filtering inside the measured set.
+    let requested_limit = display_filters.limit;
+    let mut unbounded_display_filters = display_filters.clone();
+    unbounded_display_filters.limit = None;
+    let mut records = intents::apply_display_filters(records, &unbounded_display_filters);
 
     // F2: re-apply the kind filter we deferred so `--unresolved` could see Outcomes.
     if let Some(k) = post_kind {
         records.retain(|r| r.kind == k);
+    }
+    let available_before_limit = records.len();
+    if let Some(limit) = requested_limit {
+        records.truncate(limit);
     }
 
     if records.is_empty() && emit != "json" {
@@ -4561,7 +4453,19 @@ fn run_intents(
                 extraction.stats.candidate_count,
                 extraction.stats.source_paths_verified,
             );
-            let json = intents::format_intents_oracle_json(&records, oracle_status)?;
+            let completeness = extraction
+                .stats
+                .completeness(requested_limit, available_before_limit)
+                .with_project_scope(
+                    project_resolution.match_mode.as_str(),
+                    project_resolution.selected.clone(),
+                    project_resolution.candidates.clone(),
+                );
+            let json = intents::format_intents_oracle_json_with_completeness(
+                &records,
+                oracle_status,
+                completeness,
+            )?;
             println!("{}", json);
         }
         _ => {
@@ -4908,6 +4812,7 @@ fn run_tail(
     follow: bool,
     kind: Option<&str>,
     mut filters: RetrievalFilters,
+    project_match: store::ProjectMatchMode,
 ) -> Result<()> {
     if !follow {
         // One-shot mode: default to 20 when no explicit --limit was passed
@@ -4920,6 +4825,7 @@ fn run_tail(
             projects,
             hours,
             filters,
+            project_match,
             IntentsDisplayOptions {
                 emit: "markdown",
                 strict: false,
@@ -4940,8 +4846,10 @@ fn run_tail(
         _ => unreachable!("clap validates this"),
     });
 
+    let project_resolution = resolve_intents_project_filters(projects, project_match)?;
+    let effective_projects = project_resolution.selected;
     let mut config = intents::IntentsConfig {
-        project: projects.first().cloned().unwrap_or_default(),
+        project: effective_projects.first().cloned().unwrap_or_default(),
         hours,
         strict: false,
         min_confidence: None,
@@ -4952,11 +4860,12 @@ fn run_tail(
     let mut last_seen = std::collections::HashSet::new();
     eprintln!(
         "Watching for new intents in {}...",
-        project_scope_label(projects)
+        project_scope_label(&effective_projects)
     );
 
     loop {
-        if let Ok(extraction) = intents::extract_intents_with_stats_for_projects(&config, projects)
+        if let Ok(extraction) =
+            intents::extract_intents_with_stats_for_projects(&config, &effective_projects)
         {
             let mut records = extraction.records;
             // Apply filtering identical to run_intents
@@ -5226,8 +5135,21 @@ fn run_conversations_batch(options: ConversationsBatchOptions) -> Result<()> {
 
     let batch = sources::extract_agent_sessions(aicx::session_catalog::AgentKind::Claude, &config)?;
     emit_session_batch_summary("claude", &batch);
-    if batch.selected_sessions > 0 && batch.ingested_sessions == 0 {
-        anyhow::bail!("all selected Claude sessions were skipped; see per-session diagnostics");
+    // Unified all-skipped contract (O4): every batch surface exits 3 when
+    // every selected session was skipped by diagnostics, with the same
+    // condition as `run_extraction` (`skipped == selected`;
+    // `-p`-filtered sessions live outside `selected`). An empty window
+    // stays exit 0.
+    if batch.selected_sessions > 0
+        && batch.ingested_sessions == 0
+        && batch.skipped.len() == batch.selected_sessions
+    {
+        eprintln!(
+            "all {} selected session(s) were skipped; no invalid session was ingested",
+            batch.selected_sessions
+        );
+        eprintln!("  hint: inspect the per-session recover hints above");
+        std::process::exit(3);
     }
     let entries = batch.entries;
 
@@ -5923,33 +5845,6 @@ impl StoreScopeSurface {
             resolved_store_buckets: BTreeMap::new(),
         }
     }
-
-    fn from_store_summary(
-        requested_filters: &[String],
-        store_summary: &store::StoreWriteSummary,
-    ) -> Self {
-        Self {
-            requested_source_filters: normalized_requested_source_filters(requested_filters),
-            resolved_repositories: store_summary
-                .project_summary
-                .keys()
-                .filter(|bucket| bucket.as_str() != store::NON_REPOSITORY_CONTEXTS)
-                .cloned()
-                .collect(),
-            includes_non_repository_contexts: store_summary
-                .project_summary
-                .contains_key(store::NON_REPOSITORY_CONTEXTS),
-            resolved_store_buckets: store_summary.project_summary.clone(),
-        }
-    }
-
-    fn repository_buckets(&self) -> BTreeMap<String, BTreeMap<String, usize>> {
-        self.resolved_store_buckets
-            .iter()
-            .filter(|(bucket, _)| bucket.as_str() != store::NON_REPOSITORY_CONTEXTS)
-            .map(|(bucket, counts)| (bucket.clone(), counts.clone()))
-            .collect()
-    }
 }
 
 fn normalized_requested_source_filters(requested_filters: &[String]) -> Option<Vec<String>> {
@@ -5965,19 +5860,6 @@ fn render_requested_source_filters(requested_filters: &[String]) -> String {
         "(all sources)".to_string()
     } else {
         requested_filters.join(", ")
-    }
-}
-
-fn render_resolved_store_buckets(scope: &StoreScopeSurface) -> String {
-    if scope.resolved_store_buckets.is_empty() {
-        "(none written)".to_string()
-    } else {
-        scope
-            .resolved_store_buckets
-            .keys()
-            .cloned()
-            .collect::<Vec<_>>()
-            .join(", ")
     }
 }
 
@@ -6262,61 +6144,6 @@ struct ExtractionParams<'a> {
     emit: StdoutEmit,
 }
 
-struct StoreRunArgs {
-    project: Vec<String>,
-    agent: Option<String>,
-    hours: u64,
-    cutoff: Option<DateTime<Utc>>,
-    full_rescan: bool,
-    include_assistant: bool,
-    emit: StdoutEmit,
-    redact_secrets: bool,
-    /// Whether the chunker should strip structural noise. Mirrors
-    /// `ChunkerConfig::noise_filter_enabled`; the CLI surface is
-    /// `--no-noise-filter` (negated to keep the default ergonomic).
-    noise_filter_enabled: bool,
-    /// Optional explicit markdown file/directory for `operator-md` ingestion.
-    operator_md_input: Option<PathBuf>,
-}
-
-fn resolve_store_agents(agent: Option<&str>) -> Result<Vec<&'static str>> {
-    match agent {
-        Some("claude") => Ok(vec!["claude"]),
-        Some("claude-history") => Ok(vec!["claude-history"]),
-        Some("codex") => Ok(vec!["codex"]),
-        Some("codex-sessions") => Ok(vec!["codex-sessions"]),
-        Some("gemini") => Ok(vec!["gemini"]),
-        Some("junie") => Ok(vec!["junie"]),
-        Some("codescribe") => Ok(vec!["codescribe"]),
-        Some("operator-md") => Ok(vec!["operator-md"]),
-        Some(other) => Err(anyhow::anyhow!(
-            "Unsupported --agent '{}'. Expected one of: claude, claude-history, codex, codex-sessions, gemini, junie, grok, codescribe, operator-md.",
-            other
-        )),
-        None => Ok(vec![
-            "claude",
-            "claude-history",
-            "codex",
-            "codex-sessions",
-            "gemini",
-            "junie",
-            "codescribe",
-        ]),
-    }
-}
-
-fn parse_ingest_since(value: Option<&str>) -> Result<Option<DateTime<Utc>>> {
-    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
-        return Ok(None);
-    };
-    let date = parse_cli_date(Some(value), "--since")?
-        .ok_or_else(|| anyhow::anyhow!("Invalid --since value '{}'", value))?;
-    let datetime = date
-        .and_hms_opt(0, 0, 0)
-        .ok_or_else(|| anyhow::anyhow!("Invalid --since date '{}'", value))?;
-    Ok(Some(Utc.from_utc_datetime(&datetime)))
-}
-
 fn all_time_cutoff() -> DateTime<Utc> {
     DateTime::<Utc>::from_timestamp(0, 0).expect("Unix epoch timestamp is valid")
 }
@@ -6352,34 +6179,38 @@ fn emit_session_batch_summary(agent: &str, batch: &sources::SessionExtractionBat
         );
         eprintln!("    recover: {}", skip.recover);
     }
-    if batch.selected_sessions > 0 || !batch.skipped.is_empty() {
-        eprintln!(
-            "  [{}] session ingest summary: ingested={} skipped={}",
-            agent,
-            batch.ingested_sessions,
-            batch.skipped.len()
-        );
+    if batch.selected_sessions > 0 || !batch.skipped.is_empty() || batch.filtered_out_sessions > 0 {
+        if batch.duplicate_sources > 0 {
+            eprintln!(
+                "  [{}] session ingest summary: ingested={} skipped={} filtered_out={} duplicate_sources={}",
+                agent,
+                batch.ingested_sessions,
+                batch.skipped.len(),
+                batch.filtered_out_sessions,
+                batch.duplicate_sources
+            );
+        } else {
+            eprintln!(
+                "  [{}] session ingest summary: ingested={} skipped={} filtered_out={}",
+                agent,
+                batch.ingested_sessions,
+                batch.skipped.len(),
+                batch.filtered_out_sessions
+            );
+        }
     }
 }
 
+/// Canonical projection under `~/.aicx/store` is retired (aicx-extracts-store).
+/// Session identity lives in `~/.aicx/catalog/sessions.jsonl`; readable content
+/// is extract-on-demand (or optional `~/.aicx/extracts/`). Call sites still
+/// collect card payloads for transitional ingest accounting, but the CLI must
+/// not re-grow projection stage dirs or the card mill.
 fn commit_canonical_projection(
-    fresh_cards: Vec<aicx::parser::projections::CanonicalCard>,
-    ingested_session_ids: &BTreeSet<String>,
+    _fresh_cards: Vec<aicx::parser::projections::CanonicalCard>,
+    _ingested_session_ids: &BTreeSet<String>,
 ) -> Result<Option<PathBuf>> {
-    if ingested_session_ids.is_empty() {
-        return Ok(None);
-    }
-    let store_root = store::canonical_store_dir()?;
-    let mut cards = store::read_canonical_projection_at(&store_root)?
-        .map(|(_, cards)| cards)
-        .unwrap_or_default();
-    cards.retain(|card| !ingested_session_ids.contains(&card.session_id));
-    cards.extend(fresh_cards);
-    let projection = aicx::parser::projections::projection_from_cards(
-        cards,
-        &sources::canonical_projection_config(),
-    )?;
-    store::write_canonical_projection_at(&store_root, &projection).map(Some)
+    Ok(None)
 }
 
 fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
@@ -6437,9 +6268,9 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
     let failures = aicx::progress::FailureLog::new();
 
     // ──────────────────────────────────────────────────────────────────
-    // Extract phase — same phased UX as `run_store` so `aicx all`,
-    // `aicx claude`, `aicx codex` etc. don't stall silently for 15-20
-    // minutes during a --full-rescan/-H 0 sweep of agent stores.
+    // Extract phase — phased UX so `aicx all`, `aicx claude`, `aicx codex`
+    // etc. don't stall silently for 15-20 minutes during a --full-rescan/-H 0
+    // sweep of agent session roots.
     // Heartbeat uses exponential backoff (2s → 60s cap) so long
     // single-agent extracts emit a handful of ticks, not hundreds.
     // ──────────────────────────────────────────────────────────────────
@@ -6663,75 +6494,22 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
         sessions,
     };
 
-    let chunker_config = aicx::chunker::ChunkerConfig::default();
-    let mut all_written_paths: Vec<std::path::PathBuf> = Vec::new();
-    let mut written_empty_body_skipped = 0usize;
-    let mut scope_surface = StoreScopeSurface::empty(&project);
+    let all_written_paths: Vec<std::path::PathBuf> = Vec::new();
+    let written_empty_body_skipped = 0usize;
+    let scope_surface = StoreScopeSurface::empty(&project);
 
     if !output_entries.is_empty() {
         // Chunk phase — segments were prepared upstream (per-canonical-repo
         // dedup + self_echo). Denominator is segments so `current/total`
         // reflects actual write progress.
-        let segment_count = segments.len();
-        let chunk_phase =
-            aicx::progress::Phase::start(reporter.clone(), "chunk", Some(segment_count as u64));
-        let store_result = store::store_segments_at(
-            &aicx::store::store_base_dir()?,
-            &segments,
-            &chunker_config,
-            |done, _total| chunk_phase.tick(done as u64),
-        );
-        let store_summary = match store_result {
-            Ok(summary) => {
-                let written = summary.written_paths.len() as u64;
-                chunk_phase.finish_ok(format!("{written} chunks"));
-                summary
-            }
-            Err(e) => {
-                let record = chunk_phase.finish_err(&e, aicx::progress::recovery_hint_for("chunk"));
-                failures.record(record);
-                let _ = aicx::progress::render_failure_tail(&failures);
-                return Err(e);
-            }
-        };
-        scope_surface = StoreScopeSurface::from_store_summary(&project, &store_summary);
-        written_empty_body_skipped = store_summary.skipped_empty_body;
-        let newly_written_paths = store_summary.written_paths.clone();
-        all_written_paths.extend(newly_written_paths.iter().cloned());
-
-        // Update fast local metadata index
-        if let Ok(rt) = tokio::runtime::Runtime::new() {
-            let path_refs: Vec<&PathBuf> = newly_written_paths.iter().collect();
-            if let Err(e) = rt.block_on(aicx::steer_index::sync_steer_index_with_progress(
-                &path_refs,
-                reporter.clone(),
-                &failures,
-            )) {
-                eprintln!("⚠ steer index sync failed (search may be stale): {e}");
-            }
-        }
-
-        // Summary to stderr (diagnostics)
+        //
+        // Card mill deleted: never write ~/.aicx/store cards. Entries stay
+        // in memory for optional local reports only.
         eprintln!(
-            "✓ {} entries → {} chunks",
-            output_entries.len(),
-            all_written_paths.len(),
+            "  Card mill removed: not writing ~/.aicx/store cards ({} entries kept in memory for reports only).",
+            output_entries.len()
         );
-        if written_empty_body_skipped > 0 {
-            eprintln!("  Skipped {written_empty_body_skipped} empty-body chunk(s)");
-        }
-        for (repo, agents_map) in &store_summary.project_summary {
-            let total: usize = agents_map.values().sum();
-            let detail: Vec<String> = agents_map
-                .iter()
-                .map(|(a, c)| format!("{}: {}", a, c))
-                .collect();
-            eprintln!("  {}: {} entries ({})", repo, total, detail.join(", "));
-        }
-        eprintln!(
-            "  Resolved store buckets: {}",
-            render_resolved_store_buckets(&scope_surface)
-        );
+        eprintln!("  Identity path: `aicx catalog rebuild` → `aicx extract` → `aicx index`");
     }
 
     // stdout emission (integration-friendly).
@@ -6946,432 +6724,6 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
     Ok(())
 }
 
-/// Store extracted contexts in the canonical corpus.
-fn run_store(args: StoreRunArgs) -> Result<()> {
-    let StoreRunArgs {
-        project,
-        agent,
-        hours,
-        cutoff,
-        full_rescan,
-        include_assistant,
-        emit,
-        redact_secrets,
-        noise_filter_enabled,
-        operator_md_input,
-    } = args;
-
-    let cutoff = cutoff.unwrap_or_else(|| lookback_cutoff(hours));
-
-    let agents = resolve_store_agents(agent.as_deref())?;
-
-    // Hold the state lock across the full read-modify-write cycle so two
-    // concurrent store runs cannot clobber each other's state.
-    let _state_guard = aicx::locks::acquire_exclusive(aicx::locks::state_lock_path()?)?;
-
-    let mut state = StateManager::load()?;
-    let source_key = extraction_source_key(&agents, &project);
-    let source_aliases = extraction_source_key_aliases(&agents, &project);
-    state.migrate_watermark_aliases(&source_key, &source_aliases);
-    let watermark = if full_rescan {
-        None
-    } else {
-        state.get_watermark(&source_key)
-    };
-
-    let config = ExtractionConfig {
-        project_filter: project.clone(),
-        cutoff,
-        include_assistant,
-        watermark,
-    };
-    eprintln!(
-        "  Requested source filters: {}",
-        render_requested_source_filters(&project)
-    );
-
-    let structured_emit = matches!(emit, StdoutEmit::Json);
-    let reporter = aicx::progress::select_reporter(structured_emit);
-    let failures = aicx::progress::FailureLog::new();
-
-    // ──────────────────────────────────────────────────────────────────
-    // Extract phase
-    //
-    // Each agent's extractor is opaque from the outside (it walks
-    // `~/.claude/projects/`, `~/.codex/`, etc. on its own), so we wrap
-    // each call in a heartbeat so the operator still sees the spinner
-    // and elapsed-time advance during a long `--full-rescan -H 0` run.
-    // Per-agent ticks raise the heartbeat floor so the final tick value
-    // reflects accumulated entries, not just heartbeat counts.
-    // ──────────────────────────────────────────────────────────────────
-    let extract_phase =
-        aicx::progress::Phase::start(reporter.clone(), "extract", Some(agents.len() as u64));
-    let mut all_entries = Vec::new();
-    let mut selected_sessions = 0usize;
-    let mut ingested_sessions = 0usize;
-    let mut skipped_sessions = 0usize;
-    let mut canonical_cards = Vec::new();
-    let mut ingested_session_ids = BTreeSet::new();
-    let mut agents_done: u64 = 0;
-    for &ag in &agents {
-        // Backoff so a long single-agent extract (e.g. ~/.claude/projects/
-        // walking thousands of JSONL files) doesn't flood the structured
-        // log with one tick every 2s; first few ticks fire fast so the
-        // operator sees the spinner come alive, then settle to a 60s cap.
-        let hb = aicx::progress::Heartbeat::spawn_with_backoff(
-            extract_phase.clone(),
-            std::time::Duration::from_secs(2),
-            std::time::Duration::from_secs(60),
-        );
-        let agent_entries_result = match ag {
-            "claude" => {
-                sources::extract_agent_sessions(aicx::session_catalog::AgentKind::Claude, &config)
-            }
-            "codex" | "codex-sessions" => {
-                sources::extract_agent_sessions(aicx::session_catalog::AgentKind::Codex, &config)
-            }
-            "gemini" => {
-                sources::extract_agent_sessions(aicx::session_catalog::AgentKind::Gemini, &config)
-            }
-            "junie" => {
-                sources::extract_agent_sessions(aicx::session_catalog::AgentKind::Junie, &config)
-            }
-            "grok" | "grok-sessions" => {
-                sources::extract_agent_sessions(aicx::session_catalog::AgentKind::Grok, &config)
-            }
-            "codescribe" => aicx::importers::extract_codescribe(&config)
-                .map(sources::SessionExtractionBatch::from_entries),
-            "operator-md" => if let Some(input) = operator_md_input.as_deref() {
-                let home = dirs::home_dir().context("No home dir")?;
-                aicx::importers::extract_operator_markdown_from_input(&home, input, &config)
-            } else {
-                aicx::importers::extract_operator_markdown(&config)
-            }
-            .map(sources::SessionExtractionBatch::from_entries),
-            _ => Ok(sources::SessionExtractionBatch::default()),
-        };
-        hb.stop();
-        let agent_batch = match agent_entries_result {
-            Ok(batch) => batch,
-            Err(e) => {
-                let record =
-                    extract_phase.finish_err(&e, aicx::progress::recovery_hint_for("extract"));
-                failures.record(record);
-                let _ = aicx::progress::render_failure_tail(&failures);
-                return Err(e);
-            }
-        };
-        emit_session_batch_summary(ag, &agent_batch);
-        selected_sessions += agent_batch.selected_sessions;
-        ingested_sessions += agent_batch.ingested_sessions;
-        skipped_sessions += agent_batch.skipped.len();
-        canonical_cards.extend(agent_batch.canonical_cards);
-        ingested_session_ids.extend(agent_batch.ingested_session_ids);
-        let agent_entries = agent_batch.entries;
-        eprintln!("  [{}] {} entries", ag, agent_entries.len());
-        all_entries.extend(agent_entries);
-        agents_done += 1;
-        extract_phase.tick(agents_done);
-    }
-    if selected_sessions > 0 && ingested_sessions == 0 && skipped_sessions == selected_sessions {
-        let error = anyhow::anyhow!(
-            "all {selected_sessions} selected session(s) were skipped; no invalid session was ingested"
-        );
-        let record =
-            extract_phase.finish_err(&error, Some("inspect the per-session recover hints above"));
-        failures.record(record);
-        let _ = aicx::progress::render_failure_tail(&failures);
-        std::process::exit(3);
-    }
-    extract_phase.finish_ok(format!(
-        "{} agents → {} entries; ingested={} skipped={}",
-        agents.len(),
-        all_entries.len(),
-        ingested_sessions,
-        skipped_sessions
-    ));
-
-    all_entries.sort_by_key(|a| a.timestamp);
-
-    // ──────────────────────────────────────────────────────────────────
-    // Watermark capture (#19): record the latest raw-extract timestamp
-    // BEFORE any filtering. The post-filter `all_entries.last()` is not
-    // a safe watermark source — self-echo or dedup can drop the tail,
-    // leaving a watermark that re-extracts the same tail every run.
-    // ──────────────────────────────────────────────────────────────────
-    let raw_extract_latest: Option<DateTime<Utc>> = if skipped_sessions == 0 {
-        all_entries.last().map(|e| e.timestamp)
-    } else {
-        eprintln!(
-            "  Watermark held: {skipped_sessions} skipped session(s) remain eligible for retry"
-        );
-        None
-    };
-
-    // ──────────────────────────────────────────────────────────────────
-    // Redact phase (#6): redaction must happen BEFORE dedup so the hash
-    // domain converges across incremental and --full-rescan paths. The
-    // legacy ordering hashed pre-redact in incremental and post-redact
-    // in full_rescan, producing two competing seen_hashes universes.
-    // ──────────────────────────────────────────────────────────────────
-    if redact_secrets {
-        for e in &mut all_entries {
-            e.message = aicx::redact::redact_secrets(&e.message);
-        }
-    }
-    if !noise_filter_enabled {
-        eprintln!(
-            "  [warn] --no-noise-filter active: chunks will retain raw scaffolding (line-numbered grep, tool echoes, YAML delimiters)"
-        );
-    }
-    let chunker_config = aicx::chunker::ChunkerConfig {
-        noise_filter_enabled,
-        ..aicx::chunker::ChunkerConfig::default()
-    };
-
-    // ──────────────────────────────────────────────────────────────────
-    // Segment phase (moved UP, ahead of dedup): per-canonical-repo dedup
-    // (#8) needs the canonical repo identity from each segment, so
-    // segmentation runs first. Progress denominator = entry count so
-    // operators see real percentage during long rescans (pass-4 UX
-    // follow-up to D-2-cluster).
-    // ──────────────────────────────────────────────────────────────────
-    let segment_total = all_entries.len() as u64;
-    let segment_phase =
-        aicx::progress::Phase::start(reporter.clone(), "segment", Some(segment_total));
-    let segments = {
-        let hb = aicx::progress::Heartbeat::spawn_with_backoff(
-            segment_phase.clone(),
-            std::time::Duration::from_secs(2),
-            std::time::Duration::from_secs(60),
-        );
-        let result =
-            aicx::segmentation::semantic_segments_with_progress(&all_entries, |processed| {
-                hb.raise_floor(processed as u64)
-            });
-        hb.stop();
-        result
-    };
-    let segment_count_pre = segments.len();
-    segment_phase.finish_ok(format!(
-        "{} entries → {} segments",
-        all_entries.len(),
-        segment_count_pre
-    ));
-
-    // ──────────────────────────────────────────────────────────────────
-    // Dedup phase (#8): keyed on per-segment canonical repo slug rather
-    // than `_global` / `project.join("+")`. Cross-repo content
-    // collisions no longer falsely dedup. Legacy buckets in state.json
-    // stay as stale and are evicted by prune_old_hashes over time.
-    // ──────────────────────────────────────────────────────────────────
-    let pre_dedup: usize = segments.iter().map(|s| s.entries.len()).sum();
-    let dedup_phase =
-        aicx::progress::Phase::start(reporter.clone(), "dedup", Some(pre_dedup as u64));
-    let segments = dedup_segments_per_repo(segments, &mut state, full_rescan, |scanned| {
-        dedup_phase.tick(scanned as u64)
-    });
-    let post_dedup: usize = segments.iter().map(|s| s.entries.len()).sum();
-    let dedup_skipped = pre_dedup.saturating_sub(post_dedup);
-    dedup_phase.finish_ok(format!(
-        "kept {post_dedup} / {pre_dedup} (skipped {dedup_skipped})"
-    ));
-    if dedup_skipped > 0 {
-        eprintln!("  Dedup: {pre_dedup} → {post_dedup} entries (skipped {dedup_skipped} seen)");
-    }
-
-    // ──────────────────────────────────────────────────────────────────
-    // Self-echo phase (per-segment): drop aicx tool-echo entries within
-    // each segment, then drop segments that emptied.
-    // ──────────────────────────────────────────────────────────────────
-    let pre_echo = post_dedup;
-    let echo_phase =
-        aicx::progress::Phase::start(reporter.clone(), "self_echo", Some(pre_echo as u64));
-    let segments = {
-        const ECHO_TICK_EVERY: usize = 500;
-        let mut scanned: usize = 0;
-        let mut out = Vec::with_capacity(segments.len());
-        for mut seg in segments {
-            seg.entries.retain(|e| {
-                scanned += 1;
-                if scanned.is_multiple_of(ECHO_TICK_EVERY) {
-                    echo_phase.tick(scanned as u64);
-                }
-                !aicx::sanitize::is_self_echo(&e.message)
-            });
-            if !seg.entries.is_empty() {
-                out.push(seg);
-            }
-        }
-        echo_phase.tick(scanned as u64);
-        out
-    };
-    let post_echo: usize = segments.iter().map(|s| s.entries.len()).sum();
-    let echo_filtered = pre_echo.saturating_sub(post_echo);
-    echo_phase.finish_ok(format!(
-        "kept {post_echo} / {pre_echo} (filtered {echo_filtered})"
-    ));
-    if echo_filtered > 0 {
-        eprintln!("  Filtered {echo_filtered} self-echo entries");
-    }
-
-    let mut stored_count = 0;
-    let mut all_written_paths = Vec::new();
-    let mut scope_surface = StoreScopeSurface::empty(&project);
-    let mut skipped_empty_body = 0;
-    let mut deduped_chunks = 0;
-
-    if post_echo == 0 {
-        eprintln!("No entries found.");
-    } else {
-        // ──────────────────────────────────────────────────────────────
-        // Chunk phase — denominator is segments (not entries), so the
-        // `current/total` ratio reflects actual write progress.
-        // ──────────────────────────────────────────────────────────────
-        let segment_count = segments.len();
-        let chunk_phase =
-            aicx::progress::Phase::start(reporter.clone(), "chunk", Some(segment_count as u64));
-        let store_result = store::store_segments_at(
-            &aicx::store::store_base_dir()?,
-            &segments,
-            &chunker_config,
-            |done, _total| chunk_phase.tick(done as u64),
-        );
-        let store_summary = match store_result {
-            Ok(summary) => {
-                let written = summary.written_paths.len() as u64;
-                chunk_phase.finish_ok(format!("{written} chunks"));
-                summary
-            }
-            Err(e) => {
-                let record = chunk_phase.finish_err(&e, aicx::progress::recovery_hint_for("chunk"));
-                failures.record(record);
-                let _ = aicx::progress::render_failure_tail(&failures);
-                return Err(e);
-            }
-        };
-
-        stored_count = store_summary.total_entries;
-        all_written_paths = store_summary.written_paths.clone();
-        scope_surface = StoreScopeSurface::from_store_summary(&project, &store_summary);
-        skipped_empty_body = store_summary.skipped_empty_body;
-        deduped_chunks = store_summary.deduped_chunks;
-
-        if let Ok(rt) = tokio::runtime::Runtime::new() {
-            let path_refs: Vec<&PathBuf> = all_written_paths.iter().collect();
-            if let Err(e) = rt.block_on(aicx::steer_index::sync_steer_index_with_progress(
-                &path_refs,
-                reporter.clone(),
-                &failures,
-            )) {
-                eprintln!("⚠ steer index sync failed (search may be stale): {e}");
-            }
-        }
-
-        eprintln!(
-            "✓ {} entries → {} chunks",
-            stored_count,
-            all_written_paths.len(),
-        );
-        if store_summary.skipped_empty_body > 0 {
-            eprintln!(
-                "  Skipped {} empty-body chunk(s)",
-                store_summary.skipped_empty_body
-            );
-        }
-        if store_summary.deduped_chunks > 0 {
-            eprintln!(
-                "  Deduped {} content-identical chunk(s)",
-                store_summary.deduped_chunks
-            );
-        }
-        for (repo, agents_map) in &store_summary.project_summary {
-            let total: usize = agents_map.values().sum();
-            let detail: Vec<String> = agents_map
-                .iter()
-                .map(|(a, c)| format!("{}: {}", a, c))
-                .collect();
-            eprintln!("  {}: {} entries ({})", repo, total, detail.join(", "));
-        }
-        eprintln!(
-            "  Resolved store buckets: {}",
-            render_resolved_store_buckets(&scope_surface)
-        );
-    }
-
-    if let Some(path) = commit_canonical_projection(canonical_cards, &ingested_session_ids)? {
-        eprintln!("  Canonical projection: {}", path.display());
-    }
-
-    // ──────────────────────────────────────────────────────────────────
-    // Watermark write (#19): advance from `raw_extract_latest` captured
-    // BEFORE filtering, not from the post-filter survivor list. This
-    // closes the self-echo-tail re-extract loop.
-    // ──────────────────────────────────────────────────────────────────
-    if let Some(latest) = raw_extract_latest {
-        state.update_watermark(&source_key, latest);
-    }
-
-    // For --full-rescan, dedup_segments_per_repo skips persistent
-    // mark_seen during the run; we mark surviving entries now so future
-    // incremental runs honor what just landed.
-    if full_rescan {
-        for seg in &segments {
-            let project_label = seg.project_label();
-            let overlap_project = format!("_overlap:{project_label}");
-            for e in &seg.entries {
-                let exact =
-                    StateManager::content_hash(&e.agent, e.timestamp.timestamp(), &e.message);
-                let overlap = StateManager::overlap_hash(e.timestamp.timestamp(), &e.message);
-                state.mark_seen(&project_label, exact);
-                state.mark_seen(&overlap_project, overlap);
-            }
-        }
-    }
-    state.record_run(
-        stored_count,
-        agents.iter().map(|agent| (*agent).to_string()).collect(),
-    );
-    state.prune_old_hashes(50_000);
-    state.save()?;
-
-    match emit {
-        StdoutEmit::Paths => {
-            for path in &all_written_paths {
-                println!("{}", path.display());
-            }
-        }
-        StdoutEmit::Json => {
-            let store_paths: Vec<String> = all_written_paths
-                .iter()
-                .map(|path| path.display().to_string())
-                .collect();
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&serde_json::json!({
-                    "total_entries": stored_count,
-                    "total_chunks": all_written_paths.len(),
-                    "requested_source_filters": scope_surface.requested_source_filters,
-                    "resolved_repositories": scope_surface.resolved_repositories,
-                    "includes_non_repository_contexts": scope_surface.includes_non_repository_contexts,
-                    "resolved_store_buckets": scope_surface.resolved_store_buckets,
-                    "repos": scope_surface.repository_buckets(),
-                    "store_paths": store_paths,
-                    "written_empty_body_skipped": skipped_empty_body,
-                    "deduped_chunks": deduped_chunks,
-                }))?
-            );
-        }
-        StdoutEmit::None => {}
-    }
-
-    if aicx::progress::render_failure_tail(&failures) {
-        std::process::exit(2);
-    }
-
-    Ok(())
-}
-
 fn is_noise_artifact(path: &std::path::Path) -> bool {
     if !path.is_file() || path.extension().is_none_or(|ext| ext != "md") {
         return false;
@@ -7551,6 +6903,61 @@ fn parse_date_filter(s: &str) -> Result<(Option<String>, Option<String>)> {
     }
 }
 
+fn run_catalog_rebuild(json: bool) -> Result<()> {
+    let aicx_home = store::resolve_aicx_home()?;
+    let user_home = aicx::os_user_home().context("No home dir")?;
+    let report = aicx::catalog::rebuild(&aicx_home, &user_home)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        eprintln!(
+            "aicx catalog rebuild: {} session(s) in {} ms",
+            report.total_sessions, report.wall_ms
+        );
+        eprintln!("  catalog: {}", report.catalog_path);
+        eprintln!("  cards_written: {} (must stay 0)", report.cards_written);
+        eprintln!("  per agent:");
+        for (agent, count) in &report.agents {
+            eprintln!("    {agent:<12} {count}");
+        }
+        if !report.projects.is_empty() {
+            eprintln!("  top projects:");
+            let mut ranked: Vec<_> = report.projects.iter().collect();
+            ranked.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+            for (project, count) in ranked.into_iter().take(20) {
+                eprintln!("    {project:<40} {count}");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn run_catalog_resolve(session: &str, json: bool) -> Result<()> {
+    let aicx_home = store::resolve_aicx_home()?;
+    match aicx::catalog::resolve_session(&aicx_home, session)? {
+        Some(entry) => {
+            if json {
+                println!("{}", serde_json::to_string_pretty(&entry)?);
+            } else {
+                println!(
+                    "{}  {}  {}",
+                    entry.agent, entry.session_id, entry.source_path
+                );
+                if let Some(project) = entry.project {
+                    println!("  project: {project}");
+                }
+                if let Some(cwd) = entry.cwd {
+                    println!("  cwd: {cwd}");
+                }
+            }
+        }
+        None => anyhow::bail!(
+            "session `{session}` not in durable catalog; run `aicx catalog rebuild` first"
+        ),
+    }
+    Ok(())
+}
+
 fn project_scopes(projects: &[String]) -> Vec<Option<&str>> {
     if projects.is_empty() {
         vec![None]
@@ -7571,11 +6978,12 @@ fn project_scopes(projects: &[String]) -> Vec<Option<&str>> {
 /// `None` represents the `_all` cross-project bucket; `Some(slug)` is a
 /// canonical `<owner>/<repo>` slug exactly as `index` builds buckets for.
 fn resolve_index_scopes(projects: &[String]) -> Result<Vec<Option<String>>> {
-    let resolved = resolve_project_filters_or_error(projects)?;
-    Ok(if resolved.is_empty() {
+    let resolved =
+        resolve_project_filters_or_error(projects, store::ProjectMatchMode::Exact, true)?;
+    Ok(if resolved.selected.is_empty() {
         vec![None]
     } else {
-        resolved.into_iter().map(Some).collect()
+        resolved.selected.into_iter().map(Some).collect()
     })
 }
 
@@ -7584,30 +6992,57 @@ fn resolve_index_scopes(projects: &[String]) -> Result<Vec<Option<String>>> {
 /// it as "all projects"). Non-empty input that matches zero projects returns
 /// an error with the user-visible filter list, so search/index never silently
 /// resolve to `_all` after a typo.
-fn resolve_project_filters_or_error(projects: &[String]) -> Result<Vec<String>> {
+fn resolve_project_filters_or_error(
+    projects: &[String],
+    match_mode: store::ProjectMatchMode,
+    include_index: bool,
+) -> Result<store::ProjectIdentityResolution> {
     if projects.is_empty() {
-        return Ok(Vec::new());
+        return Ok(store::ProjectIdentityResolution {
+            selected: Vec::new(),
+            candidates: Vec::new(),
+            unresolved_filters: Vec::new(),
+            match_mode,
+        });
     }
-    let resolved = aicx::store::resolve_filters_to_slugs_or_error(projects)?;
-    // Warn (don't fail) when a bare-name filter matched both as an
-    // organization AND as a repository — operator likely wanted one or the
-    // other. Filter still resolves to the union; this is just a heads-up.
-    for filter in projects {
-        if let Some((as_org, as_repo)) =
-            aicx::store::detect_ambiguous_bare_filter(filter, &resolved)
+    let store_root = store::store_base_dir()?;
+    // Search doctrine: never stream retired multi-GB embeddings.ndjson for
+    // `-p` resolution. Exact `owner/repo` forms pass through; bare names use
+    // shallow store dirs + indexed bucket names + durable catalog.
+    let corpus = if include_index {
+        store::project_identities_for_search_at(&store_root)?
+    } else {
+        store::project_identities_in_store_at(&store_root)?
+    };
+    // Accept already-canonical owner/repo filters even when the local store
+    // layout is empty (operator trashed cards): project is metadata on the
+    // hybrid generation, not a directory precondition.
+    let mut resolution = store::resolve_project_identities(projects, &corpus, match_mode)?;
+    let mut still_unresolved = Vec::new();
+    for filter in resolution.unresolved_filters.drain(..) {
+        let trimmed = filter.trim();
+        if let Some((owner, repo)) = trimmed.split_once('/')
+            && !owner.is_empty()
+            && !repo.is_empty()
+            && !owner.ends_with('/')
+            && !repo.contains('/')
+            && match_mode == store::ProjectMatchMode::Exact
         {
-            let trimmed = filter.trim();
-            let org_example = as_org.first().cloned().unwrap_or_default();
-            let repo_example = as_repo.first().cloned().unwrap_or_default();
-            eprintln!(
-                "warning: filter '{trimmed}' matched as both an organization AND a repository name.\n  \
-                 as org    -> {trimmed}/* (e.g. {org_example})\n  \
-                 as repo   -> {repo_example}\n  \
-                 use -p {trimmed}/ for org-only or -p /{trimmed} for repo-only."
-            );
+            resolution.selected.push(trimmed.to_string());
+            continue;
         }
+        still_unresolved.push(filter);
     }
-    Ok(resolved)
+    resolution.unresolved_filters = still_unresolved;
+    if !projects.is_empty() && !resolution.unresolved_filters.is_empty() {
+        return Err(store::ProjectResolutionError::NoMatch {
+            filters: resolution.unresolved_filters,
+        }
+        .into());
+    }
+    resolution.selected.sort();
+    resolution.selected.dedup();
+    Ok(resolution)
 }
 
 fn project_scope_label(projects: &[String]) -> String {
@@ -7618,9 +7053,10 @@ fn project_scope_label(projects: &[String]) -> String {
     }
 }
 
-/// Semantic-first retrieval across the canonical store. Missing semantic
-/// preconditions degrade to filesystem-fuzzy; `--no-semantic` skips the
-/// semantic attempt entirely.
+/// Semantic-first retrieval across the hybrid index. Filesystem-fuzzy is
+/// used only when the index is missing (`IndexNotBuilt`); corrupt/stale/busy
+/// and embedder failures surface as typed errors. `--no-semantic` skips the
+/// hybrid attempt and runs fuzzy directly.
 struct SearchRunArgs<'a> {
     query: &'a str,
     projects: &'a [String],
@@ -7631,6 +7067,8 @@ struct SearchRunArgs<'a> {
     kind: Option<&'a str>,
     no_semantic: bool,
     evidence: bool,
+    deep: bool,
+    project_match: store::ProjectMatchMode,
 }
 
 fn validate_cli_search_limit(limit: usize) -> Result<()> {
@@ -7763,6 +7201,8 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
         kind,
         no_semantic,
         evidence,
+        deep,
+        project_match,
     } = args;
     let limit = filters.limit.unwrap_or(DEFAULT_RETRIEVAL_LIMIT);
     validate_cli_search_limit(limit)?;
@@ -7801,16 +7241,20 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
     } else {
         None
     };
+    let legacy_dense = aicx::search_engine::LEGACY_DENSE_ACTIVE.with(|active| active.get());
     let post_filters = aicx::search_engine::SemanticSearchFilters {
         agent: filters.agent.clone(),
         score_min: filters.score,
         date_lo: date_lo.clone(),
         date_hi: date_hi.clone(),
         hours_cutoff: hours_cutoff.clone(),
+        legacy_dense,
+        // --legacy-dense implies the dense recovery path (deep enough).
+        deep: deep || legacy_dense,
     };
 
-    let resolved_projects = resolve_project_filters_or_error(projects)?;
-    let scopes = project_scopes(&resolved_projects);
+    let project_resolution = resolve_project_filters_or_error(projects, project_match, true)?;
+    let scopes = project_scopes(&project_resolution.selected);
 
     let (results, scanned, semantic_status, pushdown_diagnostic, semantic_fallback) = if no_semantic
     {
@@ -7853,6 +7297,22 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
                 )
             }
             Err(err) => {
+                // Filesystem-fuzzy ONLY when no hybrid index exists.
+                // Corrupt / stale / busy / embedder / empty → honest error.
+                if !err.allows_filesystem_fallback() {
+                    if !json {
+                        eprintln!("aicx search: hybrid retrieval failed (no fuzzy swallow).");
+                        eprintln!("  kind:           {}", err.kind());
+                        eprintln!("  reason:         {}", err.reason());
+                        eprintln!("  recommendation: {}", err.recommendation());
+                    }
+                    anyhow::bail!(
+                        "aicx search failed: {} ({})\n  recommendation: {}",
+                        err.kind(),
+                        err.reason(),
+                        err.recommendation()
+                    );
+                }
                 let fallback = SemanticFallbackNotice::from_error(&err);
                 let (results, scanned) = aicx::search_engine::fuzzy_search_with_post_filters(
                     &root,
@@ -7864,7 +7324,7 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
                 )?;
                 if !json {
                     eprintln!(
-                        "aicx search: semantic search unavailable; falling back to filesystem fuzzy."
+                        "aicx search: index not built; falling back to filesystem fuzzy (recency-ranked)."
                     );
                     eprintln!("  kind:           {}", err.kind());
                     eprintln!("  reason:         {}", err.reason());
@@ -7888,26 +7348,44 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
         let source_paths_verified = aicx::oracle::verify_paths(
             aicx::evidence::evidence_source_paths(&report).map(Path::to_path_buf),
         );
-        let oracle_status = match semantic_status.as_ref() {
-            Some((_, _, _, Some(retrieval_status))) => aicx::oracle::OracleStatus::hybrid_rrf(
-                &root,
-                retrieval_status,
-                report.results,
-                source_paths_verified,
-            ),
-            Some((_, _, semantic_scanned, None)) => aicx::oracle::OracleStatus::content_semantic(
-                &root,
-                *semantic_scanned,
-                report.results,
-                source_paths_verified,
-            ),
-            None => aicx::oracle::OracleStatus::filesystem_fuzzy(
-                &root,
-                scanned,
-                report.results,
-                source_paths_verified,
-            ),
+        // One typed retrieval outcome (W1-01); the JSON oracle_status and the
+        // stderr status line below both render from this same value.
+        let retrieval = {
+            let base = match semantic_status.as_ref() {
+                Some((backend_label, _, semantic_scanned, retrieval_status)) => {
+                    aicx::search_engine::semantic_retrieval_outcome(
+                        backend_label,
+                        retrieval_status.as_ref(),
+                        *semantic_scanned,
+                        report.results,
+                        !source_paths_verified,
+                    )
+                }
+                None => aicx::search_engine::lexical_retrieval_outcome(
+                    semantic_fallback
+                        .as_ref()
+                        .map(|notice| format!("{}: {}", notice.kind, notice.reason)),
+                    scanned,
+                    report.results,
+                    !source_paths_verified,
+                ),
+            };
+            if pushdown_diagnostic.is_some() {
+                base.mark_partial()
+            } else {
+                base
+            }
         };
+        let hybrid_status = semantic_status
+            .as_ref()
+            .and_then(|(_, _, _, retrieval_status)| retrieval_status.as_ref());
+        let oracle_status = aicx::search_engine::search_oracle_status_from_retrieval(
+            &root,
+            &retrieval,
+            hybrid_status,
+            report.results,
+            source_paths_verified,
+        );
 
         if json {
             let rendered = aicx::evidence::render_evidence_json(&report, scanned, oracle_status)?;
@@ -7950,27 +7428,16 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
         let _ = io::stdout().flush();
 
         if io::stderr().is_terminal() {
-            let base_line = match semantic_status.as_ref() {
-                Some((semantic_backend, semantic_model_id, semantic_scanned, retrieval_status)) => {
-                    aicx::search_engine::render_semantic_status_line(
-                        semantic_backend,
-                        semantic_model_id,
-                        report.results,
-                        *semantic_scanned,
-                        retrieval_status.as_ref(),
-                    )
-                }
-                None => {
-                    let fallback = semantic_fallback
-                        .as_ref()
-                        .map(|notice| format!("semantic_unavailable kind={}", notice.kind))
-                        .unwrap_or_else(|| "operator_requested".to_string());
-                    format!(
-                        "{} evidence result(s) from {} scanned chunks. oracle_status: backend=filesystem_fuzzy index=none fallback={} loctree_scope_safe=false",
-                        report.results, scanned, fallback
-                    )
-                }
+            let (backend_label, model_id) = match semantic_status.as_ref() {
+                Some((backend_label, model_id, _, _)) => (*backend_label, Some(model_id.as_str())),
+                None => ("filesystem_fuzzy", None),
             };
+            let base_line = aicx::search_engine::render_semantic_status_line(
+                backend_label,
+                model_id,
+                &retrieval,
+                hybrid_status,
+            );
             let suffix = pushdown_diagnostic
                 .as_ref()
                 .map(|d| {
@@ -8014,37 +7481,51 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
         _ => None,
     };
 
-    if json {
-        let oracle_status = match semantic_status {
-            Some((
-                _semantic_backend,
-                _semantic_model_id,
-                _semantic_scanned,
-                Some(ref retrieval_status),
-            )) => aicx::oracle::OracleStatus::hybrid_rrf(
-                &root,
-                retrieval_status,
-                results.len(),
-                aicx::oracle::verify_paths(
-                    results
-                        .iter()
-                        .map(|result| std::path::Path::new(&result.path).to_path_buf()),
-                ),
-            ),
-            Some((_semantic_backend, _semantic_model_id, semantic_scanned, None)) => {
-                aicx::oracle::OracleStatus::content_semantic(
-                    &root,
-                    semantic_scanned,
+    // One typed retrieval outcome (W1-01); CLI JSON oracle_status and the
+    // stderr status line both render from this same value.
+    let source_paths_verified = aicx::oracle::verify_paths(
+        results
+            .iter()
+            .map(|result| std::path::Path::new(&result.path).to_path_buf()),
+    );
+    let retrieval = {
+        let base = match semantic_status.as_ref() {
+            Some((backend_label, _, semantic_scanned, retrieval_status)) => {
+                aicx::search_engine::semantic_retrieval_outcome(
+                    backend_label,
+                    retrieval_status.as_ref(),
+                    *semantic_scanned,
                     results.len(),
-                    aicx::oracle::verify_paths(
-                        results
-                            .iter()
-                            .map(|result| std::path::Path::new(&result.path).to_path_buf()),
-                    ),
+                    !source_paths_verified,
                 )
             }
-            None => rank::search_oracle_status(&root, &results, scanned),
+            None => aicx::search_engine::lexical_retrieval_outcome(
+                semantic_fallback
+                    .as_ref()
+                    .map(|notice| format!("{}: {}", notice.kind, notice.reason)),
+                scanned,
+                results.len(),
+                !source_paths_verified,
+            ),
         };
+        if pushdown_diagnostic.is_some() {
+            base.mark_partial()
+        } else {
+            base
+        }
+    };
+    let hybrid_status = semantic_status
+        .as_ref()
+        .and_then(|(_, _, _, retrieval_status)| retrieval_status.as_ref());
+
+    if json {
+        let oracle_status = aicx::search_engine::search_oracle_status_from_retrieval(
+            &root,
+            &retrieval,
+            hybrid_status,
+            results.len(),
+            source_paths_verified,
+        );
         let rendered =
             rank::render_search_json_with_oracle(&root, &results, scanned, oracle_status)?;
         let mut payload = aicx::search_engine::inject_filter_pushdown_diagnostic(
@@ -8102,29 +7583,16 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
     let _ = io::stdout().flush();
 
     if io::stderr().is_terminal() {
-        let base_line = match semantic_status {
-            Some((semantic_backend, semantic_model_id, semantic_scanned, retrieval_status)) => {
-                aicx::search_engine::render_semantic_status_line(
-                    semantic_backend,
-                    &semantic_model_id,
-                    results.len(),
-                    semantic_scanned,
-                    retrieval_status.as_ref(),
-                )
-            }
-            None => {
-                let fallback = semantic_fallback
-                    .as_ref()
-                    .map(|notice| format!("semantic_unavailable kind={}", notice.kind))
-                    .unwrap_or_else(|| "operator_requested".to_string());
-                format!(
-                    "{} result(s) from {} scanned chunks. oracle_status: backend=filesystem_fuzzy index=none fallback={} loctree_scope_safe=false",
-                    results.len(),
-                    scanned,
-                    fallback
-                )
-            }
+        let (backend_label, model_id) = match semantic_status.as_ref() {
+            Some((backend_label, model_id, _, _)) => (*backend_label, Some(model_id.as_str())),
+            None => ("filesystem_fuzzy", None),
         };
+        let base_line = aicx::search_engine::render_semantic_status_line(
+            backend_label,
+            model_id,
+            &retrieval,
+            hybrid_status,
+        );
         let suffix = pushdown_diagnostic
             .as_ref()
             .map(|d| {
@@ -8156,249 +7624,61 @@ impl SemanticFallbackNotice {
     }
 }
 
-/// Build the `IndexEvent` -> sink fanout used by `aicx index`. Always
-/// includes a tracing adapter (for log capture / non-TTY runs); adds an
-/// `IndicatifSink` with live ETA + rate when stderr is an interactive
-/// terminal. Translates `IndexEvent` variants into `ProgressUpdate`s that
-/// drive the progress bar position, length, message, and final-state.
-#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
-fn build_index_event_fanout(
-    interactive: bool,
-) -> std::sync::Arc<aicx::progress::FanOut<aicx_progress_contracts::IndexEvent>> {
-    use aicx::progress::{FanOut, IndicatifSink, ProgressUpdate, TracingSink};
-    use aicx_progress_contracts::IndexEvent;
-
-    let render = |event: &IndexEvent| -> Option<ProgressUpdate> {
-        match event {
-            IndexEvent::RunStarted { total_items, .. } => Some(ProgressUpdate {
-                position: 0,
-                length: Some(*total_items as u64),
-                message: Some("embedding chunks".to_string()),
-                finished: false,
-            }),
-            IndexEvent::StatsTick {
-                processed,
-                total,
-                items_per_sec,
-                eta_secs,
-                failed,
-                ..
-            } => {
-                let eta_label = match eta_secs {
-                    Some(secs) if *secs >= 60.0 => {
-                        let mins = (secs / 60.0).floor();
-                        let rem = secs - mins * 60.0;
-                        format!("ETA {mins:.0}m{rem:02.0}s")
-                    }
-                    Some(secs) => format!("ETA {secs:.0}s"),
-                    None => "ETA …".to_string(),
-                };
-                let err_suffix = if *failed > 0 {
-                    format!(" · {failed} failed")
-                } else {
-                    String::new()
-                };
-                Some(ProgressUpdate {
-                    position: *processed as u64,
-                    length: Some(*total as u64),
-                    message: Some(format!("{items_per_sec:.1}/s · {eta_label}{err_suffix}")),
-                    finished: false,
-                })
-            }
-            IndexEvent::RunCompleted {
-                processed,
-                indexed,
-                failed,
-                elapsed,
-                ..
-            } => Some(ProgressUpdate {
-                position: *processed as u64,
-                length: Some(*processed as u64),
-                message: Some(format!(
-                    "done · {indexed} indexed · {failed} failed · {:.1}s",
-                    elapsed.as_secs_f64()
-                )),
-                finished: true,
-            }),
-            _ => None,
-        }
-    };
-
-    let mut fan = FanOut::<IndexEvent>::new();
-    fan.push(std::sync::Arc::new(IndicatifSink::new(
-        0,
-        interactive,
-        render,
-    )));
-    fan.push(std::sync::Arc::new(TracingSink));
-    std::sync::Arc::new(fan)
-}
-
-fn write_index_for_current_build(
-    scope: Option<&str>,
-    sample: usize,
-    interactive: bool,
-    full_rescan: bool,
-) -> Result<aicx::vector_index::IndexStats> {
-    #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
-    {
-        let fan = build_index_event_fanout(interactive);
-        let fan_for_closure = std::sync::Arc::clone(&fan);
-        let on_event = move |event: &aicx_progress_contracts::IndexEvent| {
-            use aicx::progress::EventSink;
-            fan_for_closure.on_event(event);
-        };
-        let options = aicx::vector_index::IndexBuildOptions { full_rescan };
-        aicx::vector_index::write_index_with_options(scope, sample, options, &on_event)
-    }
-
-    #[cfg(not(any(feature = "native-embedder", feature = "cloud-embedder")))]
-    {
-        let _ = (scope, sample, interactive, full_rescan);
-        anyhow::bail!(
-            "aicx index requires a semantic embedder backend; rebuild with \
-             --features native-embedder or --features cloud-embedder, or use \
-             `aicx index --dry-run` to inspect corpus/index readiness without embedding"
-        );
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct IndexCatchUpPlan {
-    needed: bool,
-    cutoff: Option<DateTime<Utc>>,
-}
-
-fn index_catch_up_plan_from_statuses(statuses: &[aicx::IndexStatus]) -> Result<IndexCatchUpPlan> {
-    let mut needed = false;
-    let mut cutoff: Option<DateTime<Utc>> = None;
-
-    for status in statuses {
-        if status.sessions_newer_than_chunks == 0 {
-            continue;
-        }
-        needed = true;
-        let Some(newest_chunk_mtime) = status.newest_chunk_mtime.as_deref() else {
-            return Ok(IndexCatchUpPlan {
-                needed: true,
-                cutoff: None,
-            });
-        };
-        let parsed = DateTime::parse_from_rfc3339(newest_chunk_mtime)
-            .with_context(|| format!("parse newest_chunk_mtime `{newest_chunk_mtime}`"))?
-            .with_timezone(&Utc);
-        cutoff = Some(cutoff.map_or(parsed, |current| current.min(parsed)));
-    }
-
-    Ok(IndexCatchUpPlan { needed, cutoff })
-}
-
-fn index_catch_up_plan(scopes: &[Option<&str>]) -> Result<IndexCatchUpPlan> {
-    let store_root = store::store_base_dir()?;
-    let statuses = scopes
-        .iter()
-        .map(|scope| aicx::api::index_status_at(&store_root, *scope))
-        .collect::<Result<Vec<_>>>()?;
-    index_catch_up_plan_from_statuses(&statuses)
-}
-
-/// Build (or preview) the vector index. `dry_run=true` probes the
-/// embedder + samples chunks for ETA. `dry_run=false` writes a
-/// persistent NDJSON-backed index (Iter 3) that subsequent `aicx search`
-/// queries against via cosine similarity.
+/// Build (or preview) the source-driven lexical index.
+///
+/// The catalog plus live sources are the corpus. The producer renders one
+/// in-memory extract per session and publishes Tantivy directly; it writes
+/// readable extract files only with `--cache-extracts`, and never materializes
+/// per-frame cards or embedding NDJSON intermediates.
 fn run_index(
     projects: &[String],
-    sample: usize,
+    _sample: usize,
     json: bool,
     dry_run: bool,
     full_rescan: bool,
+    cache_extracts: bool,
 ) -> Result<()> {
     let resolved_scopes = resolve_index_scopes(projects)?;
-    let scopes: Vec<Option<&str>> = resolved_scopes.iter().map(Option::as_deref).collect();
-
-    let interactive = std::io::IsTerminal::is_terminal(&std::io::stderr()) && !json;
-
-    if !dry_run {
-        let catch_up = index_catch_up_plan(&scopes)?;
-        if catch_up.needed {
-            eprintln!("Canonical catch-up: materializing source sessions before embedding");
-            if let Some(cutoff) = catch_up.cutoff {
-                eprintln!("  Catch-up cutoff: {}", cutoff.to_rfc3339());
-            } else {
-                eprintln!("  Catch-up cutoff: <all time>");
-            }
-            run_store(StoreRunArgs {
-                project: projects.to_vec(),
-                agent: None,
-                hours: 0,
-                cutoff: catch_up.cutoff,
-                full_rescan: true,
-                include_assistant: true,
-                emit: StdoutEmit::None,
-                redact_secrets: true,
-                noise_filter_enabled: true,
-                operator_md_input: None,
-            })?;
-        } else {
-            eprintln!("Canonical catch-up: no source sessions newer than chunks");
-        }
-    }
-
-    // G-3: announce embedder backend class so the operator can predict perf.
-    // Cloud HTTP (~2.5s/req) vs native GGUF (~50ms/req on M-series) matter
-    // for ETA expectations; suppressed in --json mode so machine readers
-    // get a clean payload.
-    if !json {
-        #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
-        if let Some(label) = aicx::vector_index::probe_backend_label() {
-            eprintln!("Backend: {}", label);
-        }
-    }
-
-    let mut reports = Vec::with_capacity(scopes.len());
-    for scope in scopes {
-        let stats = if dry_run {
-            let _lock = aicx::locks::acquire_exclusive(aicx::locks::lance_lock_path()?)?;
-            aicx::vector_index::dry_run_index(scope, sample)?
-        } else {
-            write_index_for_current_build(scope, sample, interactive, full_rescan)?
-        };
-        reports.push((scope.map(ToString::to_string), stats));
-    }
-
-    if json {
-        if reports.len() == 1 {
-            println!("{}", aicx::vector_index::render_stats_json(&reports[0].1)?);
-        } else {
-            let payload = reports
-                .iter()
-                .map(|(project, stats)| {
-                    serde_json::json!({
-                        "project": project.as_deref().unwrap_or("_all"),
-                        "stats": stats,
-                    })
-                })
-                .collect::<Vec<_>>();
-            println!("{}", serde_json::to_string(&payload)?);
-        }
+    let filters: Vec<String> = resolved_scopes.into_iter().flatten().collect();
+    let aicx_home = store::resolve_aicx_home()?;
+    let _lock = if dry_run {
+        None
     } else {
-        for (idx, (project, stats)) in reports.iter().enumerate() {
-            if reports.len() > 1 {
-                if idx > 0 {
-                    eprintln!();
-                }
-                eprintln!(
-                    "scope: {}",
-                    project
-                        .as_deref()
-                        .filter(|value| !value.is_empty())
-                        .unwrap_or("_all")
-                );
+        Some(aicx::locks::acquire_exclusive(
+            aicx::locks::lance_lock_path()?,
+        )?)
+    };
+    let report =
+        aicx::source_index::build(&aicx_home, &filters, dry_run, full_rescan, cache_extracts)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        eprintln!(
+            "aicx index: {} lexical session document(s) in {} ms{}",
+            report.lexical_docs,
+            report.wall_ms,
+            if report.unchanged {
+                " (incremental no-op)"
+            } else if dry_run {
+                " (dry run)"
+            } else {
+                ""
             }
-            eprint!("{}", aicx::vector_index::render_stats_text(stats));
-            if let Some(path) = &stats.index_path {
-                eprintln!("\n  index_path:          {}", path.display());
-            }
+        );
+        eprintln!(
+            "  sources: total={} parsed={} reused={} skipped={}",
+            report.sources_total,
+            report.sources_parsed,
+            report.sources_reused,
+            report.sources_skipped
+        );
+        eprintln!(
+            "  frames: raw={} signal={} filtered={}",
+            report.raw_frames, report.signal_frames, report.filtered_frames
+        );
+        eprintln!("  extracts_written: {}", report.extracts_written);
+        if let Some(path) = &report.manifest_path {
+            eprintln!("  manifest: {path}");
         }
     }
     Ok(())
@@ -8734,15 +8014,28 @@ fn run_read(reference: &str, max_chars: Option<usize>, json: bool) -> Result<()>
 }
 
 /// Retrieve chunks by steering metadata (frontmatter sidecar fields).
-fn run_steer(
-    run_id: Option<&str>,
-    prompt_id: Option<&str>,
-    kind: Option<&str>,
-    projects: &[String],
-    date: Option<&str>,
+struct SteerRunArgs<'a> {
+    run_id: Option<&'a str>,
+    prompt_id: Option<&'a str>,
+    kind: Option<&'a str>,
+    projects: &'a [String],
+    date: Option<&'a str>,
     json: bool,
     filters: RetrievalFilters,
-) -> Result<()> {
+    project_match: store::ProjectMatchMode,
+}
+
+fn run_steer(args: SteerRunArgs<'_>) -> Result<()> {
+    let SteerRunArgs {
+        run_id,
+        prompt_id,
+        kind,
+        projects,
+        date,
+        json,
+        filters,
+        project_match,
+    } = args;
     let rt = tokio::runtime::Runtime::new()?;
     let limit = filters.limit.unwrap_or(DEFAULT_RETRIEVAL_LIMIT);
 
@@ -8755,7 +8048,8 @@ fn run_steer(
     };
 
     let frame_kind = filters.frame_kind.map(Into::into);
-    let scopes = project_scopes(projects);
+    let project_resolution = resolve_project_filters_or_error(projects, project_match, true)?;
+    let scopes = project_scopes(&project_resolution.selected);
     let mut metadatas = Vec::new();
     for project in scopes {
         let filter = aicx::steer_index::SteerFilter {
@@ -8894,9 +8188,22 @@ fn refs_cutoff(hours: u64) -> std::time::SystemTime {
 }
 
 /// List chunks in the canonical store, filtered by recency.
-fn run_refs(hours: u64, project: Option<String>, emit: RefsEmit, strict: bool) -> Result<()> {
+fn run_refs(
+    hours: u64,
+    project: Option<String>,
+    emit: RefsEmit,
+    strict: bool,
+    project_match: store::ProjectMatchMode,
+) -> Result<()> {
     let cutoff = refs_cutoff(hours);
-    let mut files = store::context_files_since(cutoff, project.as_deref())?;
+    let projects = project.into_iter().collect::<Vec<_>>();
+    let resolution = resolve_project_filters_or_error(&projects, project_match, false)?;
+    let mut files = Vec::new();
+    for scope in project_scopes(&resolution.selected) {
+        files.extend(store::context_files_since(cutoff, scope)?);
+    }
+    files.sort_by(|left, right| left.path.cmp(&right.path));
+    files.dedup_by(|left, right| left.path == right.path);
     if strict {
         files.retain(|file| !is_noise_artifact(&file.path));
     }
@@ -9034,9 +8341,27 @@ fn print_refs_summary(files: &[store::StoredContextFile]) -> Result<()> {
 }
 
 /// Manage dedup state.
-fn run_state(reset: bool, project: Option<String>, info: bool) -> Result<()> {
+fn run_state(
+    reset: bool,
+    project: Option<String>,
+    info: bool,
+    project_match: store::ProjectMatchMode,
+) -> Result<()> {
     let _state_guard = aicx::locks::acquire_exclusive(aicx::locks::state_lock_path()?)?;
     let mut state = StateManager::load()?;
+
+    let project_filters = project.into_iter().collect::<Vec<_>>();
+    let corpus = state.seen_hashes.keys().cloned().collect::<Vec<_>>();
+    let project_resolution = if project_filters.is_empty() {
+        store::ProjectIdentityResolution {
+            selected: Vec::new(),
+            candidates: Vec::new(),
+            unresolved_filters: Vec::new(),
+            match_mode: project_match,
+        }
+    } else {
+        store::require_project_resolution(&project_filters, &corpus, project_match)?
+    };
 
     if info {
         // B-P1-13: honor `--project` filter on --info as well as on --reset.
@@ -9045,16 +8370,18 @@ fn run_state(reset: bool, project: Option<String>, info: bool) -> Result<()> {
         // (`<owner>/<repo>` strict, `<owner>/` org wildcard, `/<repo>` repo
         // wildcard, bare `name` cross-org). Watermarks and runs are global
         // and remain unfiltered.
-        let filter = project.as_deref().map(str::trim).filter(|s| !s.is_empty());
         eprintln!("=== State Info ===");
-        if let Some(f) = filter {
-            eprintln!("Filtered by project: {}", f);
+        if !project_resolution.selected.is_empty() {
+            eprintln!(
+                "Filtered by project: {}",
+                project_resolution.selected.join(", ")
+            );
         }
-        if let Some(f) = filter {
+        if !project_resolution.selected.is_empty() {
             let matched: Vec<(&String, &aicx::state::SeenHashSet)> = state
                 .seen_hashes
                 .iter()
-                .filter(|(bucket, _)| state_bucket_matches_project_filter(bucket, f))
+                .filter(|(bucket, _)| project_resolution.selected.contains(bucket))
                 .collect();
             let total: usize = matched.iter().map(|(_, set)| set.len()).sum();
             eprintln!("  Total hashes (filtered): {}", total);
@@ -9078,10 +8405,15 @@ fn run_state(reset: bool, project: Option<String>, info: bool) -> Result<()> {
     }
 
     if reset {
-        if let Some(ref p) = project {
-            state.reset_project(p);
+        if !project_resolution.selected.is_empty() {
+            for project in &project_resolution.selected {
+                state.reset_project(project);
+            }
             state.save()?;
-            eprintln!("Reset hashes for project: {}", p);
+            eprintln!(
+                "Reset hashes for project: {}",
+                project_resolution.selected.join(", ")
+            );
         } else {
             state.reset_all();
             state.save()?;
@@ -9092,26 +8424,6 @@ fn run_state(reset: bool, project: Option<String>, info: bool) -> Result<()> {
 
     eprintln!("Use --info to show state or --reset to clear. See --help.");
     Ok(())
-}
-
-/// Apply the canonical `project_filter_matches` resolver to a state-store
-/// bucket key. Buckets are stored as lowercase `<owner>/<repo>` (see
-/// `aicx::state::migration::canonical_state_bucket`); buckets that don't
-/// split into exactly two segments are matched against the bare filter
-/// only (cross-org name match) and never against the slug or org-wildcard
-/// shapes.
-fn state_bucket_matches_project_filter(bucket: &str, filter: &str) -> bool {
-    let mut parts = bucket.splitn(2, '/');
-    match (parts.next(), parts.next()) {
-        (Some(org), Some(repo)) if !org.is_empty() && !repo.is_empty() => {
-            store::project_filter_matches(org, repo, filter)
-        }
-        _ => {
-            // Legacy / non-slug bucket: treat the whole key as the repo
-            // side so a bare `-p <name>` still works.
-            store::project_filter_matches("", bucket, filter)
-        }
-    }
 }
 
 struct DashboardServerRunArgs {
@@ -9302,11 +8614,32 @@ fn default_dashboard_output_path() -> Result<PathBuf> {
     Ok(store::store_base_dir()?.join("aicx-dashboard.html"))
 }
 
-fn run_dashboard_command(args: DashboardArgs) -> Result<()> {
+fn run_dashboard_command(
+    mut args: DashboardArgs,
+    project_match: store::ProjectMatchMode,
+) -> Result<()> {
     if args.serve && args.generate_html {
         return Err(anyhow::anyhow!(
             "Choose either --serve or --generate-html, not both."
         ));
+    }
+
+    if let Some(filter) = args.project.as_ref() {
+        let root = args
+            .store_root
+            .clone()
+            .map(Ok)
+            .unwrap_or_else(store::store_base_dir)?;
+        let corpus = store::project_identities_in_store_at(&root)?;
+        let filters = vec![filter.clone()];
+        let resolution = store::require_project_resolution(&filters, &corpus, project_match)?;
+        if resolution.selected.len() != 1 {
+            anyhow::bail!(
+                "dashboard project scope must resolve to one project; candidates:\n  - {}",
+                resolution.selected.join("\n  - ")
+            );
+        }
+        args.project = resolution.selected.into_iter().next();
     }
 
     if args.serve {

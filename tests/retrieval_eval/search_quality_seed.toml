@@ -10,6 +10,20 @@
 #   query         the (deliberately messy) operator query
 #   good_result / bad_result   human description of hit vs miss
 #   anchors_match "any_of" | "all_of"  (only meaningful when >1 anchor)
+#   frame_lane    roadmap-critical lane: operator_request, agent_decision,
+#                 code_tool_exhaust, system_hook, compact_duplicate,
+#                 opaque_reasoning
+#   expected_identity / expected_frame_kind
+#                 stable identity + frame kind a useful top-k hit must expose
+#   budget_top_k / min_useful_top_hits / max_forbidden_noise_top_hits
+#                 declared usefulness floor and forbidden-noise ceiling
+#   max_duplicate_hits_per_anchor
+#                 compact-recall inflation guard for duplicated anchors
+#   [[questions.forbidden_noise]]
+#     class         tool_output_exhaust, system_prompt_echo,
+#                   duplicated_compact_recall, opaque_reasoning_block, ...
+#     terms         terms that identify the forbidden class in top-k evidence
+#     terms_match   "any" | "all"
 #   [[questions.anchors]]
 #     map_id        session folder in tb-out-anchor-v4-20260619-121218
 #     expected_terms  tokens a correct top-hit must contain, CHECKED IN .md BODY
@@ -75,6 +89,148 @@ bad_result = "ogolnik 'indeks duzy' albo sama komenda statusu bez rozbicia per f
 [[questions.anchors]]
 map_id = "codex__019ed8cb__2026-06-18__d0055557"
 expected_terms = ["228018", "system_note", "agent_reply", "user_msg"]
+terms_match = "any"
+
+[[questions]]
+id = "aicx-lane-operator-request-runtime-exhaust"
+scope = "aicx"
+type = "evidence"
+query = "pokaz oryginalna prosbe operatora o runtime exhaust a nie stdout z narzedzi"
+good_result = "trafienie w user_msg z pytaniem/operator intentem o uzyteczny dialog ponad runtime exhaust."
+bad_result = "tool output, stderr/stdout, system prompt albo odpowiedz bez oryginalnej prosby operatora."
+frame_lane = "operator_request"
+expected_identity = "codex__019ed8cb__2026-06-18__d0055557"
+expected_frame_kind = "user_msg"
+budget_top_k = 5
+min_useful_top_hits = 1
+max_forbidden_noise_top_hits = 0
+max_duplicate_hits_per_anchor = 1
+[[questions.forbidden_noise]]
+class = "tool_output_exhaust"
+terms = ["tool_call_id", "stderr", "stdout", "command output"]
+terms_match = "any"
+[[questions.forbidden_noise]]
+class = "system_prompt_echo"
+terms = ["You are", "system prompt", "developer message"]
+terms_match = "any"
+[[questions.anchors]]
+map_id = "codex__019ed8cb__2026-06-18__d0055557"
+expected_terms = ["runtime exhaust", "operator", "user_msg", "agent_reply"]
+terms_match = "any"
+
+[[questions]]
+id = "aicx-lane-agent-decision-hybrid-rrf"
+scope = "aicx"
+type = "ask_answer"
+query = "jaka decyzja agenta naprawila hybrid_rrf zamiast dense-only bez kopiowania logow?"
+good_result = "agent_reply z decyzja o hybrid_rrf / filtrowaniu runtime noise przed oknem rankingu."
+bad_result = "same logi oracle_status albo surowe wyjscie search bez decyzji i uzasadnienia."
+frame_lane = "agent_decision"
+expected_identity = "codex__019ed8cb__2026-06-18__d0055557"
+expected_frame_kind = "agent_reply"
+budget_top_k = 5
+min_useful_top_hits = 1
+max_forbidden_noise_top_hits = 0
+max_duplicate_hits_per_anchor = 1
+[[questions.forbidden_noise]]
+class = "tool_output_exhaust"
+terms = ["oracle_status", "stderr", "target/debug/aicx", "Finished `dev` profile"]
+terms_match = "any"
+[[questions.anchors]]
+map_id = "codex__019ed8cb__2026-06-18__d0055557"
+expected_terms = ["hybrid_rrf", "semantic_dense_only", "candidate", "filter"]
+terms_match = "any"
+
+[[questions]]
+id = "aicx-lane-code-tool-exhaust-demotion"
+scope = "aicx"
+type = "evidence"
+query = "czy top5 umie zdegradowac output narzedzi typu cargo i stderr zamiast je cytowac?"
+good_result = "uzyteczny hit opisuje co zrobiono z tool-output exhaust, a nie sam blok stdout/stderr."
+bad_result = "wynik jest zdominowany przez cargo/test stderr, JSON narzedzi albo surowe transcript dumpy."
+frame_lane = "code_tool_exhaust"
+expected_identity = "codex__019ed8cb__2026-06-18__d0055557"
+expected_frame_kind = "tool_call"
+budget_top_k = 5
+min_useful_top_hits = 1
+max_forbidden_noise_top_hits = 0
+max_duplicate_hits_per_anchor = 1
+[[questions.forbidden_noise]]
+class = "tool_output_exhaust"
+terms = ["Blocking waiting for file lock", "Finished `test` profile", "error[E", "stderr"]
+terms_match = "any"
+[[questions.anchors]]
+map_id = "codex__019ed8cb__2026-06-18__d0055557"
+expected_terms = ["tool", "output", "noise", "filter"]
+terms_match = "any"
+
+[[questions]]
+id = "aicx-lane-system-hook-echo-budget"
+scope = "aicx"
+type = "evidence"
+query = "czy search nie wyciaga system hookow i prompt echo jako odpowiedzi?"
+good_result = "trafienie pokazuje decyzje/wiadomosc uzytkownika o ograniczaniu system/hook noise."
+bad_result = "system prompt, hook output, guidelines albo surowe instrukcje runtime w top5."
+frame_lane = "system_hook"
+expected_identity = "codex__019ed8cb__2026-06-18__d0055557"
+expected_frame_kind = "agent_reply"
+budget_top_k = 5
+min_useful_top_hits = 1
+max_forbidden_noise_top_hits = 0
+max_duplicate_hits_per_anchor = 1
+[[questions.forbidden_noise]]
+class = "system_prompt_echo"
+terms = ["GLOBAL GUIDELINES", "SYSTEM", "developer instructions", "hook"]
+terms_match = "any"
+[[questions.anchors]]
+map_id = "codex__019ed8cb__2026-06-18__d0055557"
+expected_terms = ["system_note", "hook", "noise", "agent_reply"]
+terms_match = "any"
+
+[[questions]]
+id = "aicx-lane-compact-duplicate-inflation"
+scope = "aicx"
+type = "evidence"
+query = "czy zdublowany compact recall sztucznie pompuje top5?"
+good_result = "jedno trafienie per anchor wystarcza; duplikaty compact recall sa widoczne jako inflacja, nie jako dodatkowa wartosc."
+bad_result = "top5 sklada sie z powtorzen tej samej compact recall lub tego samego anchoru."
+frame_lane = "compact_duplicate"
+expected_identity = "codex__019ed8cb__2026-06-18__d0055557"
+expected_frame_kind = "agent_reply"
+budget_top_k = 5
+min_useful_top_hits = 1
+max_forbidden_noise_top_hits = 0
+max_duplicate_hits_per_anchor = 1
+[[questions.forbidden_noise]]
+class = "duplicated_compact_recall"
+terms = ["compact recall", "duplicate", "powtorzen", "samej compact"]
+terms_match = "any"
+[[questions.anchors]]
+map_id = "codex__019ed8cb__2026-06-18__d0055557"
+expected_terms = ["compact", "duplicate", "recall", "anchor"]
+terms_match = "any"
+
+[[questions]]
+id = "aicx-lane-opaque-reasoning-block"
+scope = "aicx"
+type = "evidence"
+query = "czy opaque reasoning blocks sa odfiltrowane od dialogu ktory da sie uzyc?"
+good_result = "wynik wskazuje na uzyteczna decyzje lub operator request, nie na prywatny/internal_thought blok rozumowania."
+bad_result = "opaque chain-of-thought, internal reasoning dump albo thinking block bez publicznej decyzji."
+frame_lane = "opaque_reasoning"
+expected_identity = "codex__019ed8cb__2026-06-18__d0055557"
+expected_frame_kind = "internal_thought"
+budget_top_k = 5
+min_useful_top_hits = 1
+max_forbidden_noise_top_hits = 0
+max_duplicate_hits_per_anchor = 1
+[[questions.forbidden_noise]]
+class = "opaque_reasoning_block"
+terms = ["chain-of-thought", "private reasoning", "internal_thought", "thinking block"]
+terms_match = "any"
+[[questions.anchors]]
+map_id = "codex__019ed8cb__2026-06-18__d0055557"
+expected_terms = ["reasoning", "internal", "opaque", "decision"]
 terms_match = "any"
 
 [[questions]]
@@ -244,7 +400,7 @@ map_id = "claude__f30e5b56__2026-06-10__ec142ff3"
 expected_terms = ["MockVistaAutocompleteEngine", "qube_ffi.swift.patch:629", "continuation", "fatalError"]
 terms_match = "any"
 
-# ---------- ScreenScribe ----------
+# ---------- Screenscribe ----------
 
 [[questions]]
 id = "screenscribe-race-disaster"
@@ -362,7 +518,7 @@ map_id = "claude__21852ec7__2026-06-14__ae23ef0f"
 expected_terms = ["OPENAI_API_KEY", ".zshrc", "plaintext", "zrotuj"]
 terms_match = "any"
 
-# ---------- v3 additions: Pensieve / ScreenScribe / Loctree ----------
+# ---------- v3 additions: Pensieve / Screenscribe / Loctree ----------
 
 [[questions]]
 id = "pensieve-stoprecording-cadence"

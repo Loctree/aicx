@@ -151,7 +151,7 @@ Prebuilt releases + the smart `install.sh` that ships with them are the recommen
 Pin a specific release instead of `latest`:
 
 ```bash
-AICX_INSTALL_MODE=release AICX_RELEASE_TAG=v0.10.0 bash install.sh
+AICX_INSTALL_MODE=release AICX_RELEASE_TAG=v0.12.0 bash install.sh
 ```
 
 npm wrapper (`@loctree/aicx`) also exists.

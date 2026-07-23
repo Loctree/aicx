@@ -321,6 +321,179 @@ fn incremental_round_trip_appends_only_new_rows() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Build an `EmbeddingModelInfo` matching the headers written by the
+/// resume-checkpoint tests below (profile `base`, dimension `dim`).
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+fn test_model_info(dim: usize) -> crate::embedder::EmbeddingModelInfo {
+    crate::embedder::EmbeddingModelInfo {
+        model_id: "test-model".into(),
+        dimension: dim,
+        backend: "test".into(),
+        profile: crate::embedder::EmbeddingProfile::Base,
+        source: crate::embedder::NativeEmbeddingSource::ExplicitPath(std::path::PathBuf::from("")),
+    }
+}
+
+/// Serialize a well-formed resume checkpoint (header + `count` id rows)
+/// into `path`. Ids are `existing-{i}`. When `trailing_newline` is false
+/// the final row is written without a terminating `\n`, mirroring a build
+/// killed mid-write.
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+fn write_resume_checkpoint(path: &Path, dim: usize, count: usize, trailing_newline: bool) {
+    let header = IndexHeader {
+        schema_version: INDEX_SCHEMA_VERSION.into(),
+        model_id: "test-model".into(),
+        model_profile: "base".into(),
+        dimension: dim,
+        generated_at: "2026-05-15T12:00:00Z".into(),
+        entry_count: 0,
+    };
+    let embedding: Vec<f32> = (0..dim).map(|_| 0.1_f32).collect();
+    let mut body = serde_json::to_string(&header).unwrap();
+    body.push('\n');
+    for i in 0..count {
+        body.push_str(&make_entry_line(
+            &format!("existing-{i}"),
+            embedding.clone(),
+        ));
+        body.push('\n');
+    }
+    if !trailing_newline {
+        body.pop();
+    }
+    std::fs::write(path, &body).unwrap();
+}
+
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+#[test]
+fn load_resume_tmp_index_reads_full_checkpoint_and_flags_newline() {
+    // Resume precedence input: an interrupted full build leaves a `.tmp`
+    // checkpoint. The loader must surface every embedded id and the exact
+    // row count so the classifier can skip them — and must report whether
+    // the file needs a repair newline before append. If this returned
+    // `None`/short counts the resume path would silently re-embed.
+    let dir = tempdir_for_test();
+    let tmp = dir.join("embeddings.ndjson.tmp");
+    let info = test_model_info(4);
+
+    // Well-formed checkpoint (ends with `\n`).
+    write_resume_checkpoint(&tmp, 4, 6, true);
+    let state = load_resume_tmp_index(&tmp, &info)
+        .unwrap()
+        .expect("checkpoint must be resumable");
+    assert_eq!(state.rows, 6, "all 6 embedded rows counted");
+    assert_eq!(state.ids.len(), 6, "all 6 ids captured for skip set");
+    for i in 0..6 {
+        assert!(
+            state.ids.contains(&format!("existing-{i}")),
+            "id existing-{i} must be in the resume skip set"
+        );
+    }
+    assert!(
+        !state.needs_newline,
+        "trailing newline present -> no repair"
+    );
+
+    // Checkpoint killed mid-write (no trailing newline) must flag repair
+    // so the appended rows do not glue onto a partial last line.
+    write_resume_checkpoint(&tmp, 4, 6, false);
+    let state = load_resume_tmp_index(&tmp, &info).unwrap().unwrap();
+    assert_eq!(
+        state.rows, 6,
+        "partial-newline checkpoint still counts rows"
+    );
+    assert!(
+        state.needs_newline,
+        "missing trailing newline -> repair before append"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+#[test]
+fn resume_appends_new_rows_without_truncating_checkpoint() {
+    // Regression: the resume path must APPEND onto the surviving `.tmp`
+    // checkpoint, never truncate + re-seed it. Repro shape: a full build
+    // is interrupted with K embedded rows; resuming classifies the first
+    // K chunks as already-done (skip) and only embeds the M new ones, so
+    // the file ends with K + M rows and the original K are byte-preserved.
+    let dir = tempdir_for_test();
+    let tmp = dir.join("embeddings.ndjson.tmp");
+    let info = test_model_info(4);
+
+    const K: usize = 5;
+    const M: usize = 3;
+
+    // Interrupted full build: K embedded rows in the checkpoint.
+    write_resume_checkpoint(&tmp, 4, K, true);
+    let before = std::fs::read_to_string(&tmp).unwrap();
+    let original_rows: Vec<String> = before.lines().skip(1).map(str::to_string).collect();
+    assert_eq!(original_rows.len(), K, "checkpoint seeded with K rows");
+
+    // Resume reads the checkpoint -> skip set of the K embedded ids.
+    let state = load_resume_tmp_index(&tmp, &info).unwrap().unwrap();
+    let resumed_ids: HashSet<String> = state.ids.clone();
+
+    // Phase-1 classification (production predicate): the capped window is
+    // the K already-embedded chunks followed by M fresh ones. Ids come
+    // from `chunk_id_from_path`, exactly as the embed loop derives them.
+    let mut to_embed = Vec::new();
+    let mut skipped = 0usize;
+    let existing_paths: Vec<std::path::PathBuf> = (0..K)
+        .map(|i| dir.join(format!("existing-{i}.md")))
+        .collect();
+    let fresh_paths: Vec<std::path::PathBuf> =
+        (0..M).map(|i| dir.join(format!("fresh-{i}.md"))).collect();
+    for path in existing_paths.iter().chain(fresh_paths.iter()) {
+        let entry_id = chunk_id_from_path(path);
+        if resumed_ids.contains(&entry_id) {
+            skipped += 1;
+        } else {
+            to_embed.push(entry_id);
+        }
+    }
+    assert_eq!(skipped, K, "the K embedded chunks are resume-skipped");
+    assert_eq!(
+        to_embed.len(),
+        M,
+        "only the M new chunks flow to the embedder"
+    );
+    assert!(
+        to_embed.iter().all(|id| id.starts_with("fresh-")),
+        "zero re-embed of already-committed chunks"
+    );
+
+    // Resume writer (production sequencing): open with append(true), never
+    // create/truncate, then write the M new rows.
+    {
+        use std::fs::OpenOptions;
+        use std::io::{BufWriter, Write};
+        let mut writer = BufWriter::new(OpenOptions::new().append(true).open(&tmp).unwrap());
+        let embedding: Vec<f32> = vec![0.5, 0.6, 0.7, 0.8];
+        for id in &to_embed {
+            writeln!(writer, "{}", make_entry_line(id, embedding.clone())).unwrap();
+        }
+    }
+
+    // File ends with K + M rows; the original K are byte-identical.
+    let after = std::fs::read_to_string(&tmp).unwrap();
+    let data: Vec<&str> = after.lines().skip(1).collect();
+    assert_eq!(
+        data.len(),
+        K + M,
+        "checkpoint grew to K + M rows (no truncation)"
+    );
+    for (i, original) in original_rows.iter().enumerate() {
+        assert_eq!(data[i], original, "original row {i} preserved verbatim");
+    }
+    for row in data.iter().skip(K) {
+        assert!(row.contains("fresh-"), "appended rows are the new chunks");
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
 #[test]
 fn rewrite_index_with_truthful_header_replaces_placeholder_and_preserves_entries() {
@@ -419,9 +592,9 @@ fn derive_project_index_from_all_streams_matching_rows_only() {
         embedding: vec![1.0, 0.0],
     };
     let rows = [
-        mk_entry("vista-1", "vetcoders/Vista"),
+        mk_entry("example-app-1", "vetcoders/example-app"),
         mk_entry("other-1", "vetcoders/Other"),
-        mk_entry("vista-2", "vetcoders/Vista"),
+        mk_entry("example-app-2", "vetcoders/example-app"),
     ];
     let mut body = serde_json::to_string(&header).unwrap();
     body.push('\n');
@@ -431,10 +604,11 @@ fn derive_project_index_from_all_streams_matching_rows_only() {
     }
     std::fs::write(&all_index, body).expect("write synthetic all index");
 
-    let stats = derive_project_index_from_all("vetcoders/Vista").expect("derive project index");
+    let stats =
+        derive_project_index_from_all("vetcoders/example-app").expect("derive project index");
     assert_eq!(stats.entries_written, 2);
 
-    let project_index = index_path(Some("vetcoders/Vista")).expect("project index path");
+    let project_index = index_path(Some("vetcoders/example-app")).expect("project index path");
     assert_eq!(stats.index_path, project_index);
     let (derived_header, derived_entries) =
         read_committed_index_entries(&project_index).expect("read derived project index");
@@ -443,7 +617,7 @@ fn derive_project_index_from_all_streams_matching_rows_only() {
     assert!(
         derived_entries
             .iter()
-            .all(|entry| entry.project == "vetcoders/Vista"),
+            .all(|entry| entry.project == "vetcoders/example-app"),
         "derived bucket must not include other projects: {derived_entries:?}"
     );
 
@@ -481,9 +655,9 @@ fn derive_project_indexes_from_all_materializes_every_project_in_one_call() {
         embedding: vec![1.0, 0.0],
     };
     let rows = [
-        mk_entry("vista-1", "vetcoders/Vista"),
+        mk_entry("example-app-1", "vetcoders/example-app"),
         mk_entry("blackbox-1", "m-szymanska/agent-blackbox"),
-        mk_entry("vista-2", "vetcoders/Vista"),
+        mk_entry("example-app-2", "vetcoders/example-app"),
         mk_entry("blackbox-2", "m-szymanska/agent-blackbox"),
     ];
     let mut body = serde_json::to_string(&header).unwrap();
@@ -498,11 +672,11 @@ fn derive_project_indexes_from_all_materializes_every_project_in_one_call() {
     let projects: HashSet<_> = stats.iter().map(|stat| stat.project.as_str()).collect();
     assert_eq!(
         projects,
-        HashSet::from(["vetcoders/Vista", "m-szymanska/agent-blackbox"])
+        HashSet::from(["vetcoders/example-app", "m-szymanska/agent-blackbox"])
     );
     assert!(stats.iter().all(|stat| stat.entries_written == 2));
 
-    for project in ["vetcoders/Vista", "m-szymanska/agent-blackbox"] {
+    for project in ["vetcoders/example-app", "m-szymanska/agent-blackbox"] {
         let project_index = index_path(Some(project)).expect("project index path");
         let (derived_header, derived_entries) =
             read_committed_index_entries(&project_index).expect("read derived project index");
@@ -772,7 +946,7 @@ fn incremental_materialize_hybrid_refreshes_persisted_artifacts() {
 
     let root = tempdir_for_test();
     let _aicx_home_guard = ScopedAicxHome::set(&root);
-    let project = "vetcoders/Vista";
+    let project = "vetcoders/example-app";
     let semantic_index = index_path_for(&root, Some(project));
     std::fs::create_dir_all(semantic_index.parent().expect("semantic parent")).unwrap();
 
@@ -787,14 +961,14 @@ fn incremental_materialize_hybrid_refreshes_persisted_artifacts() {
 
     let make_entry = |id: &str, path: &std::path::Path, embedding: Vec<f32>| IndexEntry {
         id: id.to_string(),
-        project: "vetcoders/vista".to_string(),
+        project: "vetcoders/example-app".to_string(),
         agent: "claude".to_string(),
         date: "20260603".to_string(),
         path: path.to_path_buf(),
         kind: "conversations".to_string(),
         session_id: format!("session-{id}"),
         frame_kind: Some("agent_reply".to_string()),
-        cwd: Some("/Users/user/Git/Vista".to_string()),
+        cwd: Some("/Users/tester/Git/example-app".to_string()),
         embedding,
     };
     let write_semantic_index = |entries: &[IndexEntry], generated_at: &str| {
@@ -851,8 +1025,15 @@ fn incremental_materialize_hybrid_refreshes_persisted_artifacts() {
         embedding: entry_c.embedding.clone(),
     };
 
-    let refreshed = incremental_materialize_hybrid(Some(project), &info, &[delta], 3, &source_hash)
-        .expect("incremental hybrid refresh");
+    let refreshed = incremental_materialize_hybrid(
+        Some(project),
+        &info,
+        &[delta],
+        3,
+        &source_hash,
+        &semantic_index,
+    )
+    .expect("incremental hybrid refresh");
     assert_eq!(refreshed.source_chunk_count, 3);
     assert_eq!(refreshed.dense_count, 3);
     assert_eq!(refreshed.lexical_doc_count, 3);
@@ -866,13 +1047,22 @@ fn incremental_materialize_hybrid_refreshes_persisted_artifacts() {
     assert_eq!(persisted.dense_count, 3);
     assert_eq!(persisted.lexical_doc_count, 3);
 
+    // The refreshed generation still holds exactly one dense payload, bound
+    // to the refreshed manifest's source hash.
     let manifest_dir = hybrid_index_dir(Some(project)).expect("manifest dir");
+    assert!(
+        !hybrid_dense_path(Some(project))
+            .expect("legacy dense path")
+            .exists(),
+        "incremental refresh must not write the legacy NDJSON dense twin"
+    );
     let lexical = Box::new(TantivyAdapter::new(manifest_dir.clone()).expect("fresh lexical"));
     let dense = Box::new(
-        aicx_retrieve::load_from_ndjson(
-            &hybrid_dense_path(Some(project)).expect("dense path"),
+        aicx_retrieve::MmapDenseAdapter::open(
+            hybrid_dense_mmap_path(Some(project)).expect("dense payload path"),
             info.dimension,
             Distance::Cosine,
+            Some(aicx_retrieve::decode_source_hash_blake3(&persisted.source_hash_blake3).unwrap()),
         )
         .expect("fresh dense"),
     );
@@ -883,7 +1073,7 @@ fn incremental_materialize_hybrid_refreshes_persisted_artifacts() {
         fusion,
         manifest_dir,
         hybrid_embedder_fingerprint(&info),
-        &source_hash,
+        Some(source_hash.as_str()),
     )
     .expect("fresh reload after incremental refresh");
     let manifest = reloaded.manifest().expect("reloaded manifest");
@@ -899,7 +1089,7 @@ fn incremental_materialize_hybrid_refreshes_persisted_artifacts() {
 fn materialize_hybrid_index_skips_missing_source_rows() {
     let root = tempdir_for_test();
     let _aicx_home_guard = ScopedAicxHome::set(&root);
-    let project = "vetcoders/Vista";
+    let project = "vetcoders/example-app";
     let semantic_index = index_path_for(&root, Some(project));
     std::fs::create_dir_all(semantic_index.parent().expect("semantic parent")).unwrap();
 
@@ -911,14 +1101,14 @@ fn materialize_hybrid_index_skips_missing_source_rows() {
 
     let make_entry = |id: &str, path: &std::path::Path, embedding: Vec<f32>| IndexEntry {
         id: id.to_string(),
-        project: "vetcoders/vista".to_string(),
+        project: "vetcoders/example-app".to_string(),
         agent: "codex".to_string(),
         date: "20260614".to_string(),
         path: path.to_path_buf(),
         kind: "conversations".to_string(),
         session_id: format!("session-{id}"),
         frame_kind: Some("agent_reply".to_string()),
-        cwd: Some("/Users/user/vc-workspace/vetcoders/aicx".to_string()),
+        cwd: Some("/Users/tester/vc-workspace/vetcoders/aicx".to_string()),
         embedding,
     };
     let header = IndexHeader {
@@ -965,7 +1155,7 @@ fn materialize_hybrid_index_skips_missing_source_rows() {
 fn incremental_baseline_detects_hybrid_manifest_stale_against_committed_source() {
     let root = tempdir_for_test();
     let _aicx_home_guard = ScopedAicxHome::set(&root);
-    let project = "vetcoders/Vista";
+    let project = "vetcoders/example-app";
     let semantic_index = index_path_for(&root, Some(project));
     std::fs::create_dir_all(semantic_index.parent().expect("semantic parent")).unwrap();
 
@@ -978,14 +1168,14 @@ fn incremental_baseline_detects_hybrid_manifest_stale_against_committed_source()
 
     let make_entry = |id: &str, path: &std::path::Path, embedding: Vec<f32>| IndexEntry {
         id: id.to_string(),
-        project: "vetcoders/vista".to_string(),
+        project: "vetcoders/example-app".to_string(),
         agent: "claude".to_string(),
         date: "20260603".to_string(),
         path: path.to_path_buf(),
         kind: "conversations".to_string(),
         session_id: format!("session-{id}"),
         frame_kind: Some("agent_reply".to_string()),
-        cwd: Some("/Users/user/Git/Vista".to_string()),
+        cwd: Some("/Users/tester/Git/example-app".to_string()),
         embedding,
     };
     let write_semantic_index = |entries: &[IndexEntry], generated_at: &str| {
@@ -1049,7 +1239,7 @@ fn incremental_baseline_detects_hybrid_manifest_stale_against_committed_source()
 fn no_op_incremental_preserves_skip_against_pre_commit_source() {
     let root = tempdir_for_test();
     let _aicx_home_guard = ScopedAicxHome::set(&root);
-    let project = "vetcoders/Vista";
+    let project = "vetcoders/example-app";
     let semantic_index = index_path_for(&root, Some(project));
     std::fs::create_dir_all(semantic_index.parent().expect("semantic parent")).unwrap();
 
@@ -1060,14 +1250,14 @@ fn no_op_incremental_preserves_skip_against_pre_commit_source() {
 
     let entry = IndexEntry {
         id: "a".to_string(),
-        project: "vetcoders/vista".to_string(),
+        project: "vetcoders/example-app".to_string(),
         agent: "claude".to_string(),
         date: "20260603".to_string(),
         path: chunk_path,
         kind: "conversations".to_string(),
         session_id: "session-a".to_string(),
         frame_kind: Some("agent_reply".to_string()),
-        cwd: Some("/Users/user/Git/Vista".to_string()),
+        cwd: Some("/Users/tester/Git/example-app".to_string()),
         embedding: vec![1.0, 0.0],
     };
     let write_semantic_index = |generated_at: &str| {
@@ -1151,7 +1341,7 @@ fn no_op_incremental_preserves_skip_against_pre_commit_source() {
 fn existing_hybrid_artifacts_require_lexical_tantivy_meta() {
     let root = tempdir_for_test();
     let _aicx_home_guard = ScopedAicxHome::set(&root);
-    let project = "vetcoders/Vista";
+    let project = "vetcoders/example-app";
     let semantic_index = index_path_for(&root, Some(project));
     std::fs::create_dir_all(semantic_index.parent().expect("semantic parent")).unwrap();
 
@@ -1169,14 +1359,14 @@ fn existing_hybrid_artifacts_require_lexical_tantivy_meta() {
     };
     let entry = IndexEntry {
         id: "a".to_string(),
-        project: "vetcoders/vista".to_string(),
+        project: "vetcoders/example-app".to_string(),
         agent: "claude".to_string(),
         date: "20260603".to_string(),
         path: chunk_path,
         kind: "conversations".to_string(),
         session_id: "session-a".to_string(),
         frame_kind: Some("agent_reply".to_string()),
-        cwd: Some("/Users/user/Git/Vista".to_string()),
+        cwd: Some("/Users/tester/Git/example-app".to_string()),
         embedding: vec![1.0, 0.0],
     };
     let mut body = serde_json::to_string(&header).expect("serialize header");
@@ -1272,4 +1462,126 @@ fn scan_index_entries_kind_filter_excludes_non_matching() {
 
     let scan2 = scan_index_entries(ok_lines(lines), &q, Some("session"), None).expect("scan");
     assert_eq!(scan2.hits.len(), 2);
+}
+
+// ---------------------------------------------------------------------------
+// Batched-embedding logic (perf fix): grouping, batch fast path, retry, and
+// per-item poison fallback. Exercised against a mock so no live endpoint or
+// GGUF model is required.
+// ---------------------------------------------------------------------------
+
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+mod batch {
+    use super::super::{BatchEmbedder, embed_batch_spans, embed_batch_with_fallback};
+    use anyhow::{Result, anyhow};
+
+    /// Scripted embedder: fails the first `fail_batch_times` batch calls,
+    /// and any per-item embed whose text starts with `"poison"`. All other
+    /// outputs are a constant `dim`-length vector so callers can assert
+    /// success without caring about values.
+    struct MockEmbedder {
+        dim: usize,
+        fail_batch_times: usize,
+        batch_calls: usize,
+        one_calls: usize,
+    }
+
+    impl MockEmbedder {
+        fn new(dim: usize, fail_batch_times: usize) -> Self {
+            Self {
+                dim,
+                fail_batch_times,
+                batch_calls: 0,
+                one_calls: 0,
+            }
+        }
+    }
+
+    impl BatchEmbedder for MockEmbedder {
+        fn embed_batch(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            self.batch_calls += 1;
+            if self.batch_calls <= self.fail_batch_times {
+                return Err(anyhow!("mock batch failure #{}", self.batch_calls));
+            }
+            Ok(texts.iter().map(|_| vec![1.0; self.dim]).collect())
+        }
+
+        fn embed_one(&mut self, text: &str) -> Result<Vec<f32>> {
+            self.one_calls += 1;
+            if text.starts_with("poison") {
+                return Err(anyhow!("mock poison item"));
+            }
+            Ok(vec![2.0; self.dim])
+        }
+    }
+
+    fn prefixes(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn spans_cover_range_without_gaps() {
+        // 64 capped items, batch 16 -> exactly 4 full batches, covering 0..64.
+        let spans = embed_batch_spans(64, 16);
+        assert_eq!(spans, vec![(0, 16), (16, 32), (32, 48), (48, 64)]);
+        let total: usize = spans.iter().map(|(s, e)| e - s).sum();
+        assert_eq!(total, 64, "spans must cover every capped item once");
+    }
+
+    #[test]
+    fn spans_handle_partial_tail_and_small_counts() {
+        // sample-limit interaction: a cap smaller than one batch is a single
+        // short batch, never an empty or over-long span.
+        assert_eq!(embed_batch_spans(10, 16), vec![(0, 10)]);
+        assert_eq!(embed_batch_spans(0, 16), Vec::<(usize, usize)>::new());
+        // batch_size 0 degrades to serial (size 1), never an infinite loop.
+        assert_eq!(embed_batch_spans(3, 0), vec![(0, 1), (1, 2), (2, 3)]);
+    }
+
+    #[test]
+    fn batch_happy_path_is_single_call_no_fallback() {
+        let mut e = MockEmbedder::new(4, 0);
+        let out = embed_batch_with_fallback(&mut e, &prefixes(&["a", "b", "c", "d"]));
+        assert_eq!(out.len(), 4);
+        assert!(out.iter().all(|r| r.is_ok()));
+        assert_eq!(e.batch_calls, 1, "one batch call for the whole slice");
+        assert_eq!(e.one_calls, 0, "happy path must not touch per-item embed");
+    }
+
+    #[test]
+    fn batch_retries_once_before_falling_back() {
+        // First batch call fails, second succeeds -> no per-item fallback.
+        let mut e = MockEmbedder::new(4, 1);
+        let out = embed_batch_with_fallback(&mut e, &prefixes(&["a", "b", "c"]));
+        assert!(out.iter().all(|r| r.is_ok()));
+        assert_eq!(e.batch_calls, 2, "one failure + one retry");
+        assert_eq!(e.one_calls, 0, "successful retry must skip per-item path");
+    }
+
+    #[test]
+    fn batch_falls_back_per_item_and_isolates_poison() {
+        // Both batch attempts fail; per-item fallback isolates the poison
+        // chunk as Err while its neighbors still succeed. One bad chunk must
+        // not sink the whole batch.
+        let mut e = MockEmbedder::new(4, 2);
+        let out = embed_batch_with_fallback(&mut e, &prefixes(&["good-1", "poison-x", "good-2"]));
+        assert_eq!(e.batch_calls, 2, "batch attempted twice before fallback");
+        assert_eq!(e.one_calls, 3, "every item retried individually");
+        assert!(out[0].is_ok());
+        assert!(out[1].is_err(), "poison chunk is the only failure");
+        assert!(out[2].is_ok());
+    }
+
+    #[test]
+    fn single_item_skips_batch_call() {
+        let mut e = MockEmbedder::new(4, 0);
+        let out = embed_batch_with_fallback(&mut e, &prefixes(&["solo"]));
+        assert_eq!(out.len(), 1);
+        assert!(out[0].is_ok());
+        assert_eq!(
+            e.batch_calls, 0,
+            "a batch of one goes straight to embed_one"
+        );
+        assert_eq!(e.one_calls, 1);
+    }
 }

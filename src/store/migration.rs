@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use super::{read_store_dir, store_semantic_segments_at};
+use super::{read_store_dir, store_semantic_segments_at_forced};
 use crate::chunker::ChunkerConfig;
 use crate::sanitize;
 use crate::store::atomic_write::atomic_write;
@@ -22,12 +22,20 @@ use crate::timeline::TimelineEntry;
 // ============================================================================
 // Migration
 mod cards_v2;
+// Slim (`loctree-consumer`) builds keep only the hash/rollback core reachable;
+// the CLI/doctor-driven migration surface is dead there by design.
+#[cfg_attr(not(feature = "app"), allow(dead_code))]
+mod identity;
 mod report;
 mod source_locator;
 mod types;
 
 pub use cards_v2::{
     CardsV2Action, CardsV2Item, CardsV2Manifest, CardsV2Totals, run_cards_v2_migration,
+};
+#[allow(unused_imports)]
+pub use identity::{
+    compute_store_recursive_hash, rollback_identity_migration_at, run_identity_migration_at,
 };
 use report::{print_migration_summary, render_migration_report};
 pub(crate) use source_locator::SourceLocator;
@@ -834,7 +842,11 @@ fn rebuild_source_into_store_impl(
         anyhow::bail!("source produced no timeline entries");
     }
 
-    let summary = store_semantic_segments_at(store_root, &entries, chunker_config, |_, _| {})?;
+    // Migration is explicit salvage into a transitional store tree — force
+    // the card mill so operator migrate still works while the default CLI
+    // path stays dual-body silent.
+    let summary =
+        store_semantic_segments_at_forced(store_root, &entries, chunker_config, |_, _| {})?;
     Ok(summary.written_paths)
 }
 

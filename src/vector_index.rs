@@ -459,22 +459,23 @@ fn run_native_pass(
         sample.min(files.len())
     };
 
-    for stored in files.iter().take(cap) {
-        stats.chunks_sampled += 1;
-        let content = match crate::sanitize::read_to_string_validated(&stored.path) {
-            Ok(text) => text,
-            Err(_) => {
-                stats.embed_errors += 1;
-                continue;
+    let batch_size = engine.embed_batch_size();
+    for (start, end) in embed_batch_spans(cap, batch_size) {
+        let mut prefixes = Vec::with_capacity(end - start);
+        for stored in &files[start..end] {
+            stats.chunks_sampled += 1;
+            match crate::sanitize::read_to_string_validated(&stored.path) {
+                Ok(content) => {
+                    prefixes.push(take_prefix_bytes(&content, DEFAULT_EMBED_PREFIX_BYTES));
+                }
+                Err(_) => stats.embed_errors += 1,
             }
-        };
-        let prefix = take_prefix_bytes(&content, DEFAULT_EMBED_PREFIX_BYTES);
-        match engine.embed(&prefix) {
-            Ok(_vec) => {
-                stats.embeddings_computed += 1;
-            }
-            Err(_) => {
-                stats.embed_errors += 1;
+        }
+
+        for result in embed_batch_with_fallback(&mut engine, &prefixes) {
+            match result {
+                Ok(_) => stats.embeddings_computed += 1,
+                Err(_) => stats.embed_errors += 1,
             }
         }
     }
@@ -537,27 +538,215 @@ pub fn index_bucket_name(project: Option<&str>) -> String {
         .collect()
 }
 
-#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
-pub fn hybrid_index_dir(project: Option<&str>) -> Result<PathBuf> {
+/// Subdirectory of the hybrid root holding one directory per build generation.
+const HYBRID_GENERATIONS_DIR_NAME: &str = "generations";
+/// Pointer file at the hybrid root naming the published generation directory.
+/// Written last (tmp + atomic rename), so an interrupted build never becomes
+/// current — see [`resolve_hybrid_generation_dir`].
+const HYBRID_CURRENT_POINTER_FILE_NAME: &str = "CURRENT";
+
+/// Root of the hybrid retrieval area for a project bucket
+/// (`indexed/<bucket>/hybrid`). Generations live below it; legacy pre-W2-03
+/// stores keep their artifacts directly at this root.
+pub fn hybrid_root_dir(project: Option<&str>) -> Result<PathBuf> {
     let path = index_path(project)?;
     path.parent()
         .map(|parent| parent.join("hybrid"))
         .ok_or_else(|| anyhow::anyhow!("index path has no parent: {}", path.display()))
 }
 
-#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+/// Directory holding the published hybrid generation's artifacts
+/// (`manifest.json`, mmap dense payload, Tantivy lexical index).
+///
+/// Resolves the `CURRENT` pointer to `generations/<name>`; when the pointer is
+/// absent or invalid this falls back to the hybrid root itself, which is the
+/// legacy dual-file layout kept readable as migration input only.
+pub fn hybrid_index_dir(project: Option<&str>) -> Result<PathBuf> {
+    Ok(resolve_hybrid_generation_dir(&hybrid_root_dir(project)?))
+}
+
+/// Pure current-generation resolution over a hybrid root directory.
+///
+/// Fail-closed contract: only a pointer naming an existing, path-safe
+/// directory under `generations/` redirects readers. Every corrupt state —
+/// missing pointer, empty or traversal-shaped name, missing target — resolves
+/// to the legacy root, so a failed or interrupted build can never alter
+/// current-generation resolution.
+pub fn resolve_hybrid_generation_dir(hybrid_root: &Path) -> PathBuf {
+    let pointer = hybrid_root.join(HYBRID_CURRENT_POINTER_FILE_NAME);
+    let Ok(raw) = std::fs::read_to_string(&pointer) else {
+        return hybrid_root.to_path_buf();
+    };
+    let name = raw.trim();
+    if !is_valid_generation_dir_name(name) {
+        return hybrid_root.to_path_buf();
+    }
+    let candidate = hybrid_root.join(HYBRID_GENERATIONS_DIR_NAME).join(name);
+    if candidate.is_dir() {
+        candidate
+    } else {
+        hybrid_root.to_path_buf()
+    }
+}
+
+fn is_valid_generation_dir_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && !name.starts_with('.')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+/// Filesystem-safe directory name for a generation id (`:` is invalid on
+/// Windows; anything outside the safe set collapses to `-`).
+fn generation_dir_name(generation_id: &str) -> String {
+    let mut slug: String = generation_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    slug.truncate(96);
+    slug
+}
+
+/// Atomically flip the `CURRENT` pointer to `generation_dir`. This is the
+/// publish step: everything inside the generation directory — payloads first,
+/// manifest last — is already durable before the pointer rename lands.
+fn publish_hybrid_generation(hybrid_root: &Path, generation_dir: &Path) -> Result<()> {
+    use std::io::Write;
+
+    let name = generation_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "generation dir has no valid name: {}",
+                generation_dir.display()
+            )
+        })?;
+    let pointer = hybrid_root.join(HYBRID_CURRENT_POINTER_FILE_NAME);
+    let tmp = hybrid_root.join(format!("{HYBRID_CURRENT_POINTER_FILE_NAME}.tmp"));
+    let mut file = crate::sanitize::create_file_validated(&tmp)
+        .with_context(|| format!("create generation pointer tmp: {}", tmp.display()))?;
+    writeln!(file, "{name}")
+        .with_context(|| format!("write generation pointer tmp: {}", tmp.display()))?;
+    file.sync_all()
+        .with_context(|| format!("sync generation pointer tmp: {}", tmp.display()))?;
+    drop(file);
+    std::fs::rename(&tmp, &pointer).with_context(|| {
+        format!(
+            "publish generation pointer: {} -> {}",
+            tmp.display(),
+            pointer.display()
+        )
+    })?;
+    Ok(())
+}
+
+/// Whether CURRENT already represents the same catalog/source fingerprint.
+///
+/// Only lexical-only source generations qualify. Legacy store/NDJSON
+/// generations are never mistaken for a source-driven no-op.
+pub fn source_lexical_generation_matches(source_fingerprint: &str) -> Result<bool> {
+    let path = hybrid_manifest_path(None)?;
+    if !path.is_file() {
+        return Ok(false);
+    }
+    let manifest = match aicx_retrieve::Manifest::read_from_path(&path) {
+        Ok(manifest) => manifest,
+        Err(_) => return Ok(false),
+    };
+    Ok(manifest.dense_kind == "optional_not_built"
+        && manifest.source_hash_blake3 == aicx_retrieve::source_hash_blake3(source_fingerprint))
+}
+
+pub fn current_lexical_doc_count() -> Result<Option<usize>> {
+    let path = hybrid_manifest_path(None)?;
+    if !path.is_file() {
+        return Ok(None);
+    }
+    Ok(Some(
+        aicx_retrieve::Manifest::read_from_path(&path)?.lexical_doc_count,
+    ))
+}
+
+/// Publish one lexical-only CURRENT generation directly from source extracts.
+///
+/// Dense vectors are intentionally absent: `aicx search` stays lexical-first
+/// and `--deep` fails honestly until an explicit optional dense generation is
+/// built. No embeddings NDJSON or brute-force twin is emitted.
+pub fn publish_source_lexical_generation(
+    chunks: &[aicx_retrieve::ChunkRef],
+    source_fingerprint: &str,
+) -> Result<aicx_retrieve::Manifest> {
+    use aicx_retrieve::{LexicalIndex, Manifest, TantivyAdapter};
+
+    if chunks.is_empty() {
+        anyhow::bail!("cannot publish an empty source lexical generation");
+    }
+    let hybrid_root = hybrid_root_dir(None)?;
+    let generation_dir = hybrid_root
+        .join(HYBRID_GENERATIONS_DIR_NAME)
+        .join(generation_dir_name(&Manifest::fresh_generation_id()));
+    std::fs::create_dir_all(&generation_dir)
+        .with_context(|| format!("create generation dir: {}", generation_dir.display()))?;
+
+    let started = Manifest::now_utc();
+    let mut lexical = TantivyAdapter::new(generation_dir.clone())?;
+    let commit = lexical.build(chunks)?;
+    let completed = Manifest::now_utc();
+    let manifest = Manifest {
+        schema_version: "2.0".to_string(),
+        generation_id: Manifest::fresh_generation_id(),
+        source_chunk_count: chunks.len(),
+        source_hash_blake3: aicx_retrieve::source_hash_blake3(source_fingerprint),
+        embedder_model: "optional".to_string(),
+        embedder_url_hash: "not_built".to_string(),
+        embedder_dim: 0,
+        embedder_distance: "cosine".to_string(),
+        dense_count: 0,
+        dense_kind: "optional_not_built".to_string(),
+        lexical_commit_id: commit.0,
+        lexical_doc_count: lexical.doc_count(),
+        build_started_at: started,
+        build_completed_at: completed,
+        build_wall_seconds: completed
+            .signed_duration_since(started)
+            .num_seconds()
+            .max(0) as u64,
+        fusion_algorithm: "rrf".to_string(),
+        fusion_k: aicx_retrieve::RRF_K_DEFAULT,
+    };
+    manifest.write_to_path(&generation_dir.join("manifest.json"))?;
+    publish_hybrid_generation(&hybrid_root, &generation_dir)?;
+    Ok(manifest)
+}
+
 pub fn hybrid_manifest_path(project: Option<&str>) -> Result<PathBuf> {
     Ok(hybrid_index_dir(project)?.join("manifest.json"))
 }
 
-#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+/// Legacy NDJSON dense twin location inside the resolved generation dir.
+/// Migration read input only — new builds never write it; the single dense
+/// payload is [`hybrid_dense_mmap_path`].
 pub fn hybrid_dense_path(project: Option<&str>) -> Result<PathBuf> {
     Ok(aicx_retrieve::default_ndjson_path(&hybrid_index_dir(
         project,
     )?))
 }
 
-#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+/// The one dense vector payload of the resolved generation (versioned mmap
+/// artifact, `aicx.dense.exact_mmap.v1`).
+pub fn hybrid_dense_mmap_path(project: Option<&str>) -> Result<PathBuf> {
+    Ok(hybrid_index_dir(project)?.join(aicx_retrieve::MMAP_DENSE_PAYLOAD_FILE_NAME))
+}
+
 pub fn observed_source_hash_for_index_path(path: &Path) -> Result<String> {
     let mut file = crate::sanitize::open_file_validated(path)
         .with_context(|| format!("open {}", path.display()))?;
@@ -654,6 +843,85 @@ fn maybe_emit_stats_tick(
         in_flight: 1,
     });
     *last_tick = Instant::now();
+}
+
+/// Minimal embedding surface the batch loop needs. Split out from the
+/// concrete [`crate::embedder::EmbeddingEngine`] so the batch + fallback
+/// logic is unit-testable against a mock — no live endpoint or model.
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+pub(crate) trait BatchEmbedder {
+    fn embed_batch(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>>;
+    fn embed_one(&mut self, text: &str) -> Result<Vec<f32>>;
+}
+
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+impl BatchEmbedder for crate::embedder::EmbeddingEngine {
+    fn embed_batch(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        crate::embedder::EmbeddingEngine::embed_batch(self, texts)
+    }
+
+    fn embed_one(&mut self, text: &str) -> Result<Vec<f32>> {
+        self.embed(text)
+    }
+}
+
+/// Embed a batch of chunk prefixes with graceful degradation.
+///
+/// Attempt order:
+/// 1. One `embed_batch` for the whole slice — the fast path (a single HTTP
+///    round-trip for the cloud backend instead of one per chunk).
+/// 2. On a transport error, retry the whole batch exactly once — covers a
+///    transient endpoint hiccup / rate-limit blip.
+/// 3. On persistent failure (or a provider that returns the wrong count),
+///    fall back to per-item `embed_one` so a single poison chunk is
+///    isolated as one `Err` rather than sinking the whole batch.
+///
+/// Returns one `Result` per input, index-aligned with `prefixes`. A
+/// single-element input goes straight to `embed_one` (a batch of one has
+/// no latency win and keeps the retry semantics trivial).
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+fn embed_batch_with_fallback<E: BatchEmbedder>(
+    embedder: &mut E,
+    prefixes: &[String],
+) -> Vec<Result<Vec<f32>>> {
+    if prefixes.is_empty() {
+        return Vec::new();
+    }
+    if prefixes.len() == 1 {
+        return vec![embedder.embed_one(&prefixes[0])];
+    }
+    match embedder.embed_batch(prefixes) {
+        Ok(vecs) if vecs.len() == prefixes.len() => {
+            return vecs.into_iter().map(Ok).collect();
+        }
+        Ok(_) => {
+            // Provider contract break (wrong embedding count). Do not retry
+            // the same malformed call; isolate per item below.
+        }
+        Err(_) => {
+            // Retry the whole batch exactly once for transient failures.
+            if let Ok(vecs) = embedder.embed_batch(prefixes)
+                && vecs.len() == prefixes.len()
+            {
+                return vecs.into_iter().map(Ok).collect();
+            }
+        }
+    }
+    prefixes.iter().map(|p| embedder.embed_one(p)).collect()
+}
+
+/// Group `count` capped items into embed batches of at most `batch_size`.
+/// Returns `(start, end)` spans (start inclusive, end exclusive) that cover
+/// exactly `0..count` with no gaps or overlap. A `batch_size` of 0 degrades
+/// to serial (size 1) rather than looping forever. Centralized so the
+/// `--sample` cap ↔ batch-size interaction stays unit-testable.
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+fn embed_batch_spans(count: usize, batch_size: usize) -> Vec<(usize, usize)> {
+    let step = batch_size.max(1);
+    (0..count)
+        .step_by(step)
+        .map(|start| (start, (start + step).min(count)))
+        .collect()
 }
 
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
@@ -789,12 +1057,33 @@ pub fn write_index_with_options(
             .with_context(|| format!("create index dir: {}", parent.display()))?;
     }
 
+    // Detect a resumable full-build checkpoint BEFORE choosing the walk
+    // strategy. A surviving `.tmp` from an interrupted full (`sample == 0`)
+    // build is authoritative and must be *appended* to, never clobbered.
+    // Only `sample == 0` builds ever write `.tmp`; a `sample != 0` run with
+    // a checkpoint present is already rejected by the guard above, so this
+    // never truncates a diagnostic checkpoint.
+    //
+    // Crucially the checkpoint takes precedence over the incremental walk
+    // even when a committed index ALSO exists. Without this, resuming via
+    // the operator-advised `aicx index --sample 0` would take the
+    // incremental branch, truncate the checkpoint, and re-seed it from the
+    // (typically smaller) committed body — silently discarding every
+    // embedded row accumulated by the interrupted full build.
+    let resume = if sample == 0 {
+        load_resume_tmp_index(&tmp_path, &info)?
+    } else {
+        None
+    };
+
     // G-3: decide build mode. `--full-rescan` always rebuilds from zero.
     // `sample != 0` is a deterministic-subset diagnostic mode, also full.
-    // Otherwise look for a compatible committed index — if absent or
-    // incompatible (dim/model/profile drift), fall back to full so the
-    // operator does not silently mix model outputs.
-    let incremental_baseline = if options.full_rescan || sample != 0 {
+    // A live resume checkpoint forces a full-build continuation, so the
+    // incremental walk is suppressed. Otherwise look for a compatible
+    // committed index — if absent or incompatible (dim/model/profile
+    // drift), fall back to full so the operator does not silently mix
+    // model outputs.
+    let incremental_baseline = if options.full_rescan || sample != 0 || resume.is_some() {
         None
     } else {
         load_incremental_baseline(&target_path, &info)?
@@ -812,14 +1101,6 @@ pub fn write_index_with_options(
         files.len()
     } else {
         sample.min(files.len())
-    };
-    // Resume-from-checkpoint only applies to a full rebuild; an
-    // incremental walk never writes to `ndjson.tmp` so there is nothing
-    // to resume from.
-    let resume = if sample == 0 && incremental_baseline.is_none() {
-        load_resume_tmp_index(&tmp_path, &info)?
-    } else {
-        None
     };
     let resumed_ids: HashSet<String> = resume
         .as_ref()
@@ -901,6 +1182,17 @@ pub fn write_index_with_options(
     let tick_interval = Duration::from_secs(1);
     let mut hybrid_delta_chunks = Vec::new();
 
+    // Batched embedding (perf): the cloud backend spends one HTTP round-trip
+    // per chunk when embedded serially, which dominates a full build. Group
+    // chunks into `batch_size` slices and hand each to `embed_batch` — one
+    // POST per batch instead of one per chunk. Progress ticks stay per-chunk.
+    let batch_size = engine.embed_batch_size();
+
+    // Phase 1: classify the capped window into resumed-skip vs to-embed.
+    // Skips are cheap and emitted inline; only genuinely new chunks flow into
+    // the batch loop, so a resumed build never re-embeds a committed chunk.
+    let mut to_embed: Vec<(usize, &crate::store::StoredContextFile)> =
+        Vec::with_capacity(cap.saturating_sub(resumed_ids.len()));
     for (item_index, stored) in files.iter().take(cap).enumerate() {
         let entry_id = chunk_id_from_path(&stored.path);
         if resumed_ids.contains(&entry_id) {
@@ -925,98 +1217,150 @@ pub fn write_index_with_options(
             );
             continue;
         }
-        stats.chunks_sampled += 1;
-        let item_started = Instant::now();
-        let content = match crate::sanitize::read_to_string_validated(&stored.path) {
-            Ok(text) => text,
-            Err(err) => {
-                stats.embed_errors += 1;
-                failed += 1;
-                processed += 1;
-                on_event(&IndexEvent::ItemFailed {
-                    item_index,
-                    label: entry_id,
-                    error: format!("read failed: {err}"),
-                });
-                continue;
-            }
-        };
-        let prefix = take_prefix_bytes(&content, DEFAULT_EMBED_PREFIX_BYTES);
-        let embedder_started = Instant::now();
-        let embedding = match engine.embed(&prefix) {
-            Ok(vec) => vec,
-            Err(err) => {
-                stats.embed_errors += 1;
-                failed += 1;
-                processed += 1;
-                on_event(&IndexEvent::ItemFailed {
-                    item_index,
-                    label: entry_id,
-                    error: format!("embed failed: {err}"),
-                });
-                continue;
-            }
-        };
-        let embedder_ms = embedder_started.elapsed().as_millis() as u64;
-        let duration_ms = item_started.elapsed().as_millis() as u64;
-        let entry = IndexEntry {
-            id: entry_id.clone(),
-            project: stored.project.clone(),
-            agent: stored.agent.clone(),
-            date: stored.date_iso.clone(),
-            path: stored.path.clone(),
-            kind: stored.kind.dir_name().to_string(),
-            session_id: stored.session_id.clone(),
-            frame_kind: chunk_frame_kind(&stored.path),
-            cwd: chunk_cwd(&stored.path),
-            embedding,
-        };
-        if incremental_baseline.is_some() {
-            let metadata = serde_json::json!({
-                "source_path": stored.path.to_string_lossy(),
-                "project": stored.project,
-                "agent": stored.agent,
-                "date": stored.date_iso,
-                "kind": stored.kind.dir_name(),
-                "session_id": stored.session_id,
-                "frame_kind": chunk_frame_kind(&stored.path),
-                "cwd": chunk_cwd(&stored.path),
-            });
-            hybrid_delta_chunks.push(aicx_retrieve::DenseChunkRef {
-                chunk: aicx_retrieve::ChunkRef {
-                    id: entry_id.clone(),
-                    source_path: stored.path.to_string_lossy().to_string(),
-                    text: content,
-                    metadata,
-                },
-                embedding: entry.embedding.clone(),
-            });
+        to_embed.push((item_index, stored));
+    }
+
+    // Phase 2: embed the new chunks in bounded batches. Each batch is one
+    // `embed_batch` call (one cloud POST) yet still emits one progress event
+    // per chunk, so `[aicx][phase=...]` counts stay per-chunk not per-batch.
+    for (start, end) in embed_batch_spans(to_embed.len(), batch_size) {
+        let batch = &to_embed[start..end];
+
+        // Read + prefix each chunk in the batch. Read failures are recorded
+        // per item and excluded from the embed call (they carry no text).
+        let mut batch_meta: Vec<(usize, &crate::store::StoredContextFile, String)> =
+            Vec::with_capacity(batch.len());
+        let mut prefixes: Vec<String> = Vec::with_capacity(batch.len());
+        for &(item_index, stored) in batch {
+            let entry_id = chunk_id_from_path(&stored.path);
+            stats.chunks_sampled += 1;
+            let content = match crate::sanitize::read_to_string_validated(&stored.path) {
+                Ok(text) => text,
+                Err(err) => {
+                    stats.embed_errors += 1;
+                    failed += 1;
+                    processed += 1;
+                    on_event(&IndexEvent::ItemFailed {
+                        item_index,
+                        label: entry_id,
+                        error: format!("read failed: {err}"),
+                    });
+                    maybe_emit_stats_tick(
+                        on_event,
+                        &rolling,
+                        &mut last_tick,
+                        tick_interval,
+                        processed,
+                        indexed,
+                        skipped,
+                        failed,
+                        total_items,
+                    );
+                    continue;
+                }
+            };
+            let prefix = take_prefix_bytes(&content, DEFAULT_EMBED_PREFIX_BYTES);
+            prefixes.push(prefix);
+            batch_meta.push((item_index, stored, content));
         }
-        writeln!(writer, "{}", serde_json::to_string(&entry)?)?;
-        stats.embeddings_computed += 1;
-        indexed += 1;
-        processed += 1;
-        rolling.record(1);
-        on_event(&IndexEvent::ItemIndexed {
-            item_index,
-            label: entry_id,
-            chunks_indexed: 1,
-            duration_ms,
-            embedder_ms: Some(embedder_ms),
-            tokens_estimated: None,
-            content_hash: None,
-        });
-        maybe_emit_stats_tick(
-            on_event,
-            &rolling,
-            &mut last_tick,
-            tick_interval,
-            processed,
-            indexed,
-            skipped,
-            failed,
-            total_items,
-        );
+
+        if prefixes.is_empty() {
+            continue;
+        }
+
+        let batch_started = Instant::now();
+        let results = embed_batch_with_fallback(&mut engine, &prefixes);
+        let batch_ms = batch_started.elapsed().as_millis() as u64;
+        // Attribute the batch's wall time evenly across its chunks so the
+        // per-chunk `embedder_ms` stays honest under batching.
+        let per_item_ms = batch_ms / (prefixes.len() as u64).max(1);
+
+        for ((item_index, stored, content), result) in batch_meta.into_iter().zip(results) {
+            let entry_id = chunk_id_from_path(&stored.path);
+            let embedding = match result {
+                Ok(vec) => vec,
+                Err(err) => {
+                    stats.embed_errors += 1;
+                    failed += 1;
+                    processed += 1;
+                    on_event(&IndexEvent::ItemFailed {
+                        item_index,
+                        label: entry_id,
+                        error: format!("embed failed: {err}"),
+                    });
+                    maybe_emit_stats_tick(
+                        on_event,
+                        &rolling,
+                        &mut last_tick,
+                        tick_interval,
+                        processed,
+                        indexed,
+                        skipped,
+                        failed,
+                        total_items,
+                    );
+                    continue;
+                }
+            };
+            let entry = IndexEntry {
+                id: entry_id.clone(),
+                project: stored.project.clone(),
+                agent: stored.agent.clone(),
+                date: stored.date_iso.clone(),
+                path: stored.path.clone(),
+                kind: stored.kind.dir_name().to_string(),
+                session_id: stored.session_id.clone(),
+                frame_kind: chunk_frame_kind(&stored.path),
+                cwd: chunk_cwd(&stored.path),
+                embedding,
+            };
+            if incremental_baseline.is_some() {
+                let metadata = serde_json::json!({
+                    "source_path": stored.path.to_string_lossy(),
+                    "project": stored.project,
+                    "agent": stored.agent,
+                    "date": stored.date_iso,
+                    "kind": stored.kind.dir_name(),
+                    "session_id": stored.session_id,
+                    "frame_kind": chunk_frame_kind(&stored.path),
+                    "cwd": chunk_cwd(&stored.path),
+                });
+                hybrid_delta_chunks.push(aicx_retrieve::DenseChunkRef {
+                    chunk: aicx_retrieve::ChunkRef {
+                        id: entry_id.clone(),
+                        source_path: stored.path.to_string_lossy().to_string(),
+                        text: content,
+                        metadata,
+                    },
+                    embedding: entry.embedding.clone(),
+                });
+            }
+            writeln!(writer, "{}", serde_json::to_string(&entry)?)?;
+            stats.embeddings_computed += 1;
+            indexed += 1;
+            processed += 1;
+            rolling.record(1);
+            on_event(&IndexEvent::ItemIndexed {
+                item_index,
+                label: entry_id,
+                chunks_indexed: 1,
+                duration_ms: per_item_ms,
+                embedder_ms: Some(per_item_ms),
+                tokens_estimated: None,
+                content_hash: None,
+            });
+            maybe_emit_stats_tick(
+                on_event,
+                &rolling,
+                &mut last_tick,
+                tick_interval,
+                processed,
+                indexed,
+                skipped,
+                failed,
+                total_items,
+            );
+        }
     }
 
     // Emit completion only after the final atomic commit lands on disk so the
@@ -1203,6 +1547,7 @@ pub fn write_index_with_options(
                 &hybrid_delta_chunks,
                 total_indexed,
                 &committed_source_hash,
+                &target_path,
             ) {
                 Ok(manifest) => {
                     eprintln!(
@@ -1255,22 +1600,59 @@ fn materialize_hybrid_index(
     project: Option<&str>,
     info: &crate::embedder::EmbeddingModelInfo,
 ) -> Result<aicx_retrieve::Manifest> {
+    let fingerprint = hybrid_embedder_fingerprint(info);
+    let hybrid_root = hybrid_root_dir(project)?;
+    materialize_hybrid_generation(index_path, &hybrid_root, &fingerprint)
+}
+
+/// Map the fingerprint's distance label onto the typed adapter distance.
+/// Unknown labels fail closed rather than defaulting — implicit distance
+/// drift is exactly what the manifest contract forbids.
+fn distance_from_label(distance: &str) -> Result<aicx_retrieve::Distance> {
+    match distance {
+        "cosine" => Ok(aicx_retrieve::Distance::Cosine),
+        "dot" => Ok(aicx_retrieve::Distance::Dot),
+        "euclidean" => Ok(aicx_retrieve::Distance::Euclidean),
+        other => anyhow::bail!("unsupported dense distance label: {other}"),
+    }
+}
+
+/// Build one complete hybrid generation from the committed semantic index and
+/// publish it atomically.
+///
+/// W2-03 contract — one dense payload per generation:
+/// - vectors are materialized exactly once, into the versioned mmap artifact
+///   ([`aicx_retrieve::MMAP_DENSE_PAYLOAD_FILE_NAME`]); the legacy
+///   `dense_brute_force.ndjson` twin is never written,
+/// - all artifacts land in a fresh `generations/<id>` directory: lexical and
+///   dense payloads first, `manifest.json` last,
+/// - the `CURRENT` pointer flip is the only publish step, so a build killed at
+///   any earlier fsync/rename boundary leaves an unreferenced, quarantinable
+///   directory and readers stay on the previous complete generation.
+///
+/// Embedder-free by design (the caller supplies the fingerprint), so the
+/// generation contract is testable without a live model.
+pub fn materialize_hybrid_generation(
+    committed_index_path: &Path,
+    hybrid_root: &Path,
+    fingerprint: &aicx_retrieve::EmbedderFingerprint,
+) -> Result<aicx_retrieve::Manifest> {
     use aicx_retrieve::{
-        BruteForceAdapter, ChunkRef, DenseChunkRef, Distance, HybridIndex, ReciprocalRankFusion,
+        ChunkRef, DenseChunkRef, HybridIndex, Manifest, MmapDenseAdapter, ReciprocalRankFusion,
         TantivyAdapter,
     };
 
-    let (header, entries) = read_committed_index_entries(index_path)?;
-    if header.dimension != info.dimension {
+    let (header, entries) = read_committed_index_entries(committed_index_path)?;
+    if header.dimension != fingerprint.dim {
         anyhow::bail!(
             "hybrid build dim mismatch: committed index has {}, embedder has {}",
             header.dimension,
-            info.dimension
+            fingerprint.dim
         );
     }
+    let distance = distance_from_label(&fingerprint.distance)?;
 
-    let manifest_dir = hybrid_index_dir(project)?;
-    let source_hash = observed_source_hash_for_index_path(index_path)?;
+    let source_hash = observed_source_hash_for_index_path(committed_index_path)?;
     let mut lexical_chunks = Vec::with_capacity(entries.len());
     let mut dense_chunks = Vec::with_capacity(entries.len());
     let mut skipped_missing_source_count = 0usize;
@@ -1323,18 +1705,35 @@ fn materialize_hybrid_index(
         );
     }
 
-    let lexical = Box::new(TantivyAdapter::new(manifest_dir.clone())?);
-    let dense = Box::new(BruteForceAdapter::new(header.dimension).with_distance(Distance::Cosine));
+    // Fresh, unreferenced generation directory. Everything below writes into
+    // it; nothing is visible to readers until the pointer flip at the end.
+    let generation_dir = hybrid_root
+        .join(HYBRID_GENERATIONS_DIR_NAME)
+        .join(generation_dir_name(&Manifest::fresh_generation_id()));
+    std::fs::create_dir_all(&generation_dir)
+        .with_context(|| format!("create generation dir: {}", generation_dir.display()))?;
+
+    let lexical = Box::new(TantivyAdapter::new(generation_dir.clone())?);
+    let dense = Box::new(MmapDenseAdapter::create(
+        generation_dir.join(aicx_retrieve::MMAP_DENSE_PAYLOAD_FILE_NAME),
+        header.dimension,
+        distance,
+        aicx_retrieve::source_hash_bytes(&source_hash),
+    ));
     let fusion = Box::new(ReciprocalRankFusion::default());
-    let fingerprint = hybrid_embedder_fingerprint(info);
-    let mut hybrid = HybridIndex::new(lexical, dense, fusion, manifest_dir, fingerprint);
+    let mut hybrid = HybridIndex::new(
+        lexical,
+        dense,
+        fusion,
+        generation_dir.clone(),
+        fingerprint.clone(),
+    );
+    // build_hybrid materializes the lexical index and the single dense
+    // payload; commit writes `manifest.json` last within the generation dir.
     hybrid.build_hybrid(&lexical_chunks, &dense_chunks, &source_hash)?;
     let manifest = hybrid.commit()?.clone();
 
-    let mut dense_persist =
-        BruteForceAdapter::new(header.dimension).with_distance(Distance::Cosine);
-    aicx_retrieve::DenseIndex::build(&mut dense_persist, &dense_chunks)?;
-    dense_persist.persist_ndjson(&hybrid_dense_path(project)?)?;
+    publish_hybrid_generation(hybrid_root, &generation_dir)?;
 
     Ok(manifest)
 }
@@ -1346,34 +1745,82 @@ fn incremental_materialize_hybrid(
     delta_chunks: &[aicx_retrieve::DenseChunkRef],
     source_chunk_count: usize,
     source_hash: &str,
+    committed_index_path: &Path,
 ) -> Result<aicx_retrieve::Manifest> {
     use aicx_retrieve::{
-        DenseIndex, Distance, FusionStrategy, LexicalIndex, Manifest, ReciprocalRankFusion,
-        TantivyAdapter, validate_live_bindings_for_refresh,
+        ChunkRef, DenseChunkRef, DenseIndex, FusionStrategy, LexicalIndex, Manifest,
+        MmapDenseAdapter, ReciprocalRankFusion, TantivyAdapter, validate_live_bindings_for_refresh,
     };
 
     if delta_chunks.is_empty() {
         anyhow::bail!("incremental hybrid materialize requires at least one delta chunk");
     }
 
-    let manifest_dir = hybrid_index_dir(project)?;
-    let manifest_path = hybrid_manifest_path(project)?;
-    let dense_path = hybrid_dense_path(project)?;
+    let generation_dir = hybrid_index_dir(project)?;
+    let manifest_path = generation_dir.join("manifest.json");
+    let dense_path = generation_dir.join(aicx_retrieve::MMAP_DENSE_PAYLOAD_FILE_NAME);
     let manifest = Manifest::read_from_path(&manifest_path)?;
-    let mut lexical = TantivyAdapter::new(manifest_dir)?;
-    let mut dense = aicx_retrieve::load_from_ndjson(&dense_path, info.dimension, Distance::Cosine)?;
+    if manifest.dense_kind != aicx_retrieve::MMAP_DENSE_KIND {
+        // Legacy dual-file generations are migration read input only; the
+        // caller's fallback path performs a full rebuild that materializes
+        // the single-payload mmap generation.
+        anyhow::bail!(
+            "current generation carries legacy dense kind `{}`; full rebuild materializes the single dense payload",
+            manifest.dense_kind
+        );
+    }
+    let mut lexical = TantivyAdapter::new(generation_dir)?;
+    let distance = distance_from_label(&manifest.embedder_distance)?;
+    let expected_hash = aicx_retrieve::decode_source_hash_blake3(&manifest.source_hash_blake3)?;
+    let dense = MmapDenseAdapter::open(&dense_path, info.dimension, distance, Some(expected_hash))?;
     let fusion = ReciprocalRankFusion::default();
     let fingerprint = hybrid_embedder_fingerprint(info);
 
     validate_live_bindings_for_refresh(&manifest, &lexical, &dense, &fusion, &fingerprint)
         .map_err(|err| anyhow::anyhow!("incremental hybrid validate existing artifacts: {err}"))?;
+    // The refreshed payload embeds the NEW committed source hash, so the old
+    // mapping is rebuilt below instead of appended to; drop it before the
+    // atomic replacement (Windows cannot rename over a mapped file).
+    drop(dense);
 
     let build_started_at = Manifest::now_utc();
     for delta in delta_chunks {
         lexical.insert(&delta.chunk)?;
-        dense.insert(delta)?;
     }
-    dense.persist_ndjson(&dense_path)?;
+
+    // Rebuild the single dense payload once from the freshly committed
+    // semantic index. Vector text is not stored in the payload, so rows carry
+    // only id/source_path/metadata plus the embedding.
+    let (header, entries) = read_committed_index_entries(committed_index_path)?;
+    if header.dimension != info.dimension {
+        anyhow::bail!(
+            "incremental hybrid dim mismatch: committed index has {}, embedder has {}",
+            header.dimension,
+            info.dimension
+        );
+    }
+    let dense_chunks: Vec<DenseChunkRef> = entries
+        .into_iter()
+        .map(|entry| {
+            let metadata = index_entry_metadata_json(&entry);
+            DenseChunkRef {
+                chunk: ChunkRef {
+                    id: entry.id.clone(),
+                    source_path: entry.path.to_string_lossy().to_string(),
+                    text: String::new(),
+                    metadata,
+                },
+                embedding: entry.embedding,
+            }
+        })
+        .collect();
+    let mut dense = MmapDenseAdapter::create(
+        &dense_path,
+        info.dimension,
+        distance,
+        aicx_retrieve::source_hash_bytes(source_hash),
+    );
+    DenseIndex::build(&mut dense, &dense_chunks)?;
     let build_completed_at = Manifest::now_utc();
     let refreshed = Manifest {
         schema_version: manifest.schema_version,
@@ -1468,19 +1915,19 @@ pub(crate) fn should_skip_hybrid_rebuild(
 
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
 fn has_existing_hybrid_artifacts(project: Option<&str>) -> bool {
-    let Ok(manifest_path) = hybrid_manifest_path(project) else {
-        return false;
-    };
-    let Ok(dense_path) = hybrid_dense_path(project) else {
-        return false;
-    };
     let Ok(hybrid_dir) = hybrid_index_dir(project) else {
         return false;
     };
+    let manifest_path = hybrid_dir.join("manifest.json");
+    // Only the single-payload mmap generation counts as current-format
+    // artifacts. A legacy dual-file layout (NDJSON dense twin) reports false
+    // here so the build decision routes to a full rebuild, which migrates the
+    // store onto the generation layout.
+    let dense_mmap_path = hybrid_dir.join(aicx_retrieve::MMAP_DENSE_PAYLOAD_FILE_NAME);
     let lexical_meta = hybrid_dir
         .join(aicx_retrieve::TANTIVY_INDEX_DIR)
         .join("meta.json");
-    manifest_path.exists() && dense_path.exists() && lexical_meta.exists()
+    manifest_path.exists() && dense_mmap_path.exists() && lexical_meta.exists()
 }
 
 /// Does the committed hybrid manifest still match the CURRENT embedder?
@@ -1752,12 +2199,10 @@ fn rewrite_index_with_truthful_header(
     Ok(())
 }
 
-#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
 pub(crate) fn read_committed_index_entries(path: &Path) -> Result<(IndexHeader, Vec<IndexEntry>)> {
     read_committed_index_entries_matching_project(path, None)
 }
 
-#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
 pub(crate) fn read_committed_index_entries_matching_project(
     path: &Path,
     project_filter: Option<&str>,
@@ -1800,7 +2245,6 @@ pub(crate) fn read_committed_index_entries_matching_project(
     Ok((header, entries))
 }
 
-#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
 pub(crate) fn index_entry_metadata_json(entry: &IndexEntry) -> serde_json::Value {
     serde_json::json!({
         "source_path": entry.path.to_string_lossy(),

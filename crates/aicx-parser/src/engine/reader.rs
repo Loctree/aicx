@@ -7,7 +7,11 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::io::Read;
 
-pub const DEFAULT_MAX_SOURCE_BYTES: usize = 256 * 1024 * 1024;
+/// Soft upper bound for loading a source into memory. Large Codex rollouts
+/// (500+ MiB) are real; the old 256 MiB pre-check made PreCompact fail-open on
+/// a stale extract. Cap is high enough for current operator sessions; unit
+/// lines are still bounded by [`DEFAULT_MAX_UNIT_BYTES`].
+pub const DEFAULT_MAX_SOURCE_BYTES: usize = 2 * 1024 * 1024 * 1024;
 pub const DEFAULT_MAX_UNIT_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

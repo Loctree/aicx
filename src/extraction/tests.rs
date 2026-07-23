@@ -34,6 +34,44 @@ fn stale_fatal_completeness_is_not_mislabeled_in_flight() {
 
 #[test]
 #[cfg(feature = "app")]
+fn duplicate_session_sources_are_ordered_freshest_first() {
+    fn source(source_id: &str, modified_unix_nanos: u128) -> crate::session_catalog::CatalogSource {
+        crate::session_catalog::CatalogSource {
+            agent: crate::session_catalog::AgentKind::Codex,
+            source_id: source_id.to_owned(),
+            logical_session_id: Some("session-dup".to_owned()),
+            aliases: Vec::new(),
+            filename_aliases: Vec::new(),
+            scoped_children: Vec::new(),
+            path: std::path::PathBuf::from(format!("/tmp/{source_id}.jsonl")),
+            identity_inferred: false,
+            fingerprint: crate::session_catalog::SourceFingerprint {
+                len: 1,
+                modified_unix_nanos,
+            },
+            header_truncated: false,
+        }
+    }
+    let mut sources = vec![
+        source("stale-archived-copy", 100),
+        source("fresh-live-rollout", 300),
+        source("middle-copy", 200),
+    ];
+    order_sources_freshest_first(&mut sources);
+    let order: Vec<&str> = sources
+        .iter()
+        .map(|source| source.source_id.as_str())
+        .collect();
+    assert_eq!(
+        order,
+        vec!["fresh-live-rollout", "middle-copy", "stale-archived-copy"],
+        "the freshest physical copy must be parsed first so the per-batch \
+         session-id guard drops the older duplicates"
+    );
+}
+
+#[test]
+#[cfg(feature = "app")]
 fn session_selection_uses_watermark_as_retry_window_floor() {
     let cutoff = Utc.with_ymd_and_hms(2026, 7, 13, 0, 0, 0).unwrap();
     let watermark = Utc.with_ymd_and_hms(2026, 7, 14, 0, 0, 0).unwrap();

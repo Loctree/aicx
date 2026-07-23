@@ -15,6 +15,11 @@ pub enum VisibleCompleteness {
 pub struct BoundaryFlags {
     pub opaque_reasoning_present: bool,
     pub unsupported_visible_event: bool,
+    /// At least one Codex compaction marker was consumed (context_compacted /
+    /// top-level compacted / response_item.compacted). Default false for
+    /// backward-compatible serde of older coverage snapshots.
+    #[serde(default)]
+    pub compaction_boundary_present: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

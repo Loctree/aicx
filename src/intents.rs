@@ -7,7 +7,8 @@
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, NaiveDate, NaiveDateTime, NaiveTime, Utc};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use crate::chunker::{
@@ -25,16 +26,18 @@ mod schema;
 mod types;
 
 pub use self::display::{
-    IntentDisplayFilters, IntentSortOrder, UnresolvedMode, apply_display_filters,
-    format_intents_json, format_intents_markdown, format_intents_oracle_json,
+    IntentDisplayFilters, IntentDisplayResult, IntentSortOrder, UnresolvedMode,
+    apply_display_filters, apply_display_filters_with_completeness, format_intents_json,
+    format_intents_markdown, format_intents_oracle_json,
+    format_intents_oracle_json_with_completeness,
 };
 use self::types::{
     CandidateAccumulator, IntentCandidate, SignalSection, StoredChunkFile, TaskAccumulator,
     TaskEvent, TranscriptEntry,
 };
 pub use self::types::{
-    IntentExtraction, IntentExtractionStats, IntentKind, IntentRecord, IntentsConfig,
-    MigrationReport,
+    IntentExtraction, IntentExtractionStats, IntentKind, IntentRecord, IntentsCompleteness,
+    IntentsConfig, MigrationReport, ProjectResolutionScope,
 };
 // Lane 2-5 schema anchor (MASTER Phase 2 §3). Stages land incrementally; these
 // types are the convergence point every lane stage must agree on.
@@ -53,6 +56,9 @@ pub use self::schema::{
 /// handful. Cap here so memory stays bounded; emit a diagnostic on stderr when
 /// the cap is hit so the operator notices truncated extraction.
 const MAX_CANDIDATES: usize = 5000;
+const CARD_HEADER_READ_LIMIT: u64 = 64 * 1024;
+pub const PERSISTED_IDENTITY_SOURCE: &str = "project-bucket-v1";
+pub const PATH_HEURISTIC_IDENTITY_SOURCE: &str = "path-heuristic";
 
 pub fn extract_intents(config: &IntentsConfig) -> Result<Vec<IntentRecord>> {
     Ok(extract_intents_with_stats(config)?.records)
@@ -99,10 +105,32 @@ pub(crate) fn extract_intents_from_root_at_with_stats(
     )?;
     let scanned_count = files.len();
     let source_paths_verified = verify_stored_chunk_paths(&files);
+    let matched_project_buckets = files
+        .iter()
+        .map(|file| file.project.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let identity_source = if files
+        .iter()
+        .any(|file| file.identity_source == PATH_HEURISTIC_IDENTITY_SOURCE)
+    {
+        PATH_HEURISTIC_IDENTITY_SOURCE
+    } else {
+        PERSISTED_IDENTITY_SOURCE
+    }
+    .to_string();
+    let path_heuristic_sources: BTreeSet<String> = files
+        .iter()
+        .filter(|file| file.identity_source == PATH_HEURISTIC_IDENTITY_SOURCE)
+        .map(|file| file.path.to_string_lossy().into_owned())
+        .collect();
 
     let mut candidates = Vec::new();
     let mut task_events = Vec::new();
     let mut cap_warned = false;
+    let mut dropped_candidates = 0usize;
+    let mut dropped_task_events = 0usize;
 
     for file in files {
         let content = sanitize::read_to_string_validated(&file.path)
@@ -116,13 +144,13 @@ pub(crate) fn extract_intents_from_root_at_with_stats(
         // leak into record provenance.
         let (signal_candidates, signal_tasks) =
             extract_signal_candidates(&file, &file.project, &source_chunk, &signal_lines);
-        extend_with_cap(
+        dropped_candidates += extend_with_cap(
             &mut candidates,
             signal_candidates,
             &mut cap_warned,
             "candidates",
         );
-        extend_with_cap(
+        dropped_task_events += extend_with_cap(
             &mut task_events,
             signal_tasks,
             &mut cap_warned,
@@ -131,13 +159,14 @@ pub(crate) fn extract_intents_from_root_at_with_stats(
 
         let (raw_candidates, raw_tasks) =
             extract_transcript_candidates(&file, &file.project, &source_chunk, &transcript_entries);
-        extend_with_cap(
+        dropped_candidates += extend_with_cap(
             &mut candidates,
             raw_candidates,
             &mut cap_warned,
             "candidates",
         );
-        extend_with_cap(&mut task_events, raw_tasks, &mut cap_warned, "task_events");
+        dropped_task_events +=
+            extend_with_cap(&mut task_events, raw_tasks, &mut cap_warned, "task_events");
 
         if candidates.len() >= MAX_CANDIDATES && task_events.len() >= MAX_CANDIDATES {
             // Both buckets saturated — further files cannot add anything.
@@ -163,11 +192,21 @@ pub(crate) fn extract_intents_from_root_at_with_stats(
     reconcile_session_id_with_path(&mut records);
 
     sort_intent_records(&mut records);
+    let path_heuristic_records = records
+        .iter()
+        .filter(|record| path_heuristic_sources.contains(&record.source_chunk))
+        .count();
 
     let stats = IntentExtractionStats {
         scanned_count,
         candidate_count: records.len(),
         source_paths_verified,
+        candidate_cap: MAX_CANDIDATES,
+        dropped_candidates,
+        dropped_task_events,
+        matched_project_buckets,
+        identity_source,
+        path_heuristic_records,
     };
 
     Ok(IntentExtraction { records, stats })
@@ -186,6 +225,11 @@ pub(crate) fn extract_intents_from_root_at_for_projects_with_stats(
     let mut records = Vec::new();
     let mut scanned_count = 0usize;
     let mut source_paths_verified = true;
+    let mut dropped_candidates = 0usize;
+    let mut dropped_task_events = 0usize;
+    let mut matched_project_buckets = BTreeSet::new();
+    let mut identity_source = PERSISTED_IDENTITY_SOURCE.to_string();
+    let mut path_heuristic_records = 0usize;
 
     for project in projects {
         let mut scoped = config.clone();
@@ -193,6 +237,13 @@ pub(crate) fn extract_intents_from_root_at_for_projects_with_stats(
         let extraction = extract_intents_from_root_at_with_stats(&scoped, store_root, now)?;
         scanned_count += extraction.stats.scanned_count;
         source_paths_verified &= extraction.stats.source_paths_verified;
+        dropped_candidates += extraction.stats.dropped_candidates;
+        dropped_task_events += extraction.stats.dropped_task_events;
+        matched_project_buckets.extend(extraction.stats.matched_project_buckets);
+        path_heuristic_records += extraction.stats.path_heuristic_records;
+        if extraction.stats.identity_source == PATH_HEURISTIC_IDENTITY_SOURCE {
+            identity_source = PATH_HEURISTIC_IDENTITY_SOURCE.to_string();
+        }
         records.extend(extraction.records);
     }
 
@@ -203,6 +254,12 @@ pub(crate) fn extract_intents_from_root_at_for_projects_with_stats(
         scanned_count,
         candidate_count: records.len(),
         source_paths_verified,
+        candidate_cap: MAX_CANDIDATES,
+        dropped_candidates,
+        dropped_task_events,
+        matched_project_buckets: matched_project_buckets.into_iter().collect(),
+        identity_source,
+        path_heuristic_records,
     };
 
     Ok(IntentExtraction { records, stats })
@@ -251,11 +308,11 @@ fn extend_with_cap<T>(
     additions: Vec<T>,
     warned: &mut bool,
     bucket_name: &'static str,
-) {
+) -> usize {
     let room = MAX_CANDIDATES.saturating_sub(target.len());
     if additions.len() <= room {
         target.extend(additions);
-        return;
+        return 0;
     }
     let dropped = additions.len() - room;
     target.extend(additions.into_iter().take(room));
@@ -265,6 +322,7 @@ fn extend_with_cap<T>(
         );
         *warned = true;
     }
+    dropped
 }
 
 fn collect_chunk_files(
@@ -280,10 +338,19 @@ fn collect_chunk_files(
         if file.path.extension().and_then(|ext| ext.to_str()) != Some("md") {
             continue;
         }
-        if !file
-            .project
-            .to_ascii_lowercase()
-            .contains(&project.to_ascii_lowercase())
+        // Keep intents aligned with every other `-p` surface: canonical
+        // owner/repo equality, explicit owner/repo wildcards, and bare-name
+        // equality. Legacy ownerless buckets use the virtual `_/repo` address;
+        // their physical store path remains unchanged.
+        let persisted_project = persisted_project_from_card(&file.path)?;
+        let (identity_project, identity_source) = persisted_project
+            .map(|identity_project| (identity_project, PERSISTED_IDENTITY_SOURCE))
+            .unwrap_or_else(|| (file.project.clone(), PATH_HEURISTIC_IDENTITY_SOURCE));
+        let (organization, repository) = identity_project
+            .split_once('/')
+            .unwrap_or(("", identity_project.as_str()));
+        if !project.trim().is_empty()
+            && !store::project_filter_matches(organization, repository, project)
         {
             continue;
         }
@@ -346,7 +413,8 @@ fn collect_chunk_files(
             agent: file.agent,
             date: file.date_iso,
             path: file.path,
-            project: file.project,
+            project: identity_project,
+            identity_source: identity_source.to_string(),
             sequence: file.chunk,
             timestamp,
             session_id: file.session_id,
@@ -362,6 +430,27 @@ fn collect_chunk_files(
     });
 
     Ok(files)
+}
+
+fn persisted_project_from_card(path: &Path) -> Result<Option<String>> {
+    let file = sanitize::open_file_validated(path)
+        .with_context(|| format!("Failed to open chunk header: {}", path.display()))?;
+    let mut prefix = Vec::new();
+    file.take(CARD_HEADER_READ_LIMIT)
+        .read_to_end(&mut prefix)
+        .with_context(|| format!("Failed to read chunk header: {}", path.display()))?;
+    let prefix = String::from_utf8_lossy(&prefix);
+    Ok(crate::card_header::parse_card_header(&prefix)
+        .and_then(|header| header.project)
+        .filter(|project| {
+            project
+                .split_once('/')
+                .is_some_and(|(organization, repository)| {
+                    !organization.trim().is_empty()
+                        && !repository.trim().is_empty()
+                        && !repository.contains('/')
+                })
+        }))
 }
 
 fn normalize_scan_root(store_root: &Path) -> PathBuf {

@@ -2366,6 +2366,54 @@ fn project_filter_bare_name_matches_org_or_repo() {
 }
 
 #[test]
+fn ownerless_project_identity_is_addressable_and_participates_in_ambiguity() {
+    let corpus = vec!["A/repo".to_string(), "_/repo".to_string()];
+
+    let ambiguous =
+        require_project_resolution(&["repo".to_string()], &corpus, ProjectMatchMode::Exact)
+            .expect_err("bare repo must fail closed across owned and ownerless buckets");
+    assert_eq!(ambiguous.candidates(), ["A/repo", "_/repo"]);
+
+    let ownerless =
+        require_project_resolution(&["_/repo".to_string()], &corpus, ProjectMatchMode::Exact)
+            .expect("explicit ownerless address must resolve");
+    assert_eq!(ownerless.selected, ["_/repo"]);
+
+    let wildcard =
+        require_project_resolution(&["/repo".to_string()], &corpus, ProjectMatchMode::Exact)
+            .expect("cross-org wildcard must include the ownerless sentinel");
+    assert_eq!(wildcard.selected, ["A/repo", "_/repo"]);
+}
+
+#[test]
+fn store_scan_surfaces_ownerless_bucket_under_virtual_sentinel() {
+    let root = migration_test_root("ownerless-scan");
+    let directory = root
+        .join(CANONICAL_STORE_DIRNAME)
+        .join("repo")
+        .join("2026_0717")
+        .join("conversations")
+        .join("codex");
+    fs::create_dir_all(&directory).unwrap();
+    fs::write(
+        directory.join(session_basename("2026-07-17", "codex", "ownerless", 1)),
+        "[project: repo | agent: codex | date: 2026-07-17]\n",
+    )
+    .unwrap();
+
+    assert_eq!(project_identities_in_store_at(&root).unwrap(), ["_/repo"]);
+    let files = scan_context_files_at(&root).unwrap();
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].project, "_/repo");
+    assert_eq!(
+        files[0].repo.as_ref().map(RepoIdentity::slug).as_deref(),
+        Some("_/repo")
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn resolve_filters_to_slugs_expands_short_name_to_canonical() {
     let root = migration_test_root("resolve-short");
     let canonical = root.join(CANONICAL_STORE_DIRNAME);
@@ -2446,37 +2494,16 @@ fn resolve_filters_to_slugs_at_or_error_rejects_unknown_filters() {
 }
 
 #[test]
-fn resolve_filters_to_store_or_index_slugs_supports_index_only_all_bucket() {
+fn resolve_filters_to_store_or_index_slugs_supports_index_bucket_dirs() {
+    // Doctrine 2026-07-23: project identities come from bucket directory
+    // names (and store dirs / catalog), never from streaming embeddings.ndjson.
     let root = migration_test_root("resolve-index-only");
-    let indexed_all = root.join("indexed").join("_all");
-    fs::create_dir_all(&indexed_all).unwrap();
-    let header = serde_json::json!({
-        "schema_version": "aicx-vector-index/v1",
-        "model_id": "test-model",
-        "model_profile": "base",
-        "dimension": 2,
-        "generated_at": "2026-06-03T18:00:00Z",
-        "entry_count": 1
-    });
-    let entry = serde_json::json!({
-        "id": "chunk-a",
-        "project": "Vetcoders/Vista",
-        "agent": "claude",
-        "date": "20260603",
-        "path": "/tmp/chunk-a.md",
-        "kind": "conversations",
-        "session_id": "session-a",
-        "frame_kind": "agent_reply",
-        "cwd": "/Users/user/Git/Vista",
-        "embedding": [1.0, 0.0]
-    });
+    fs::create_dir_all(root.join("indexed").join("vetcoders_Vista")).unwrap();
+    fs::create_dir_all(root.join("indexed").join("_all")).unwrap();
+    // Poison NDJSON must be ignored.
     fs::write(
-        indexed_all.join("embeddings.ndjson"),
-        format!(
-            "{}\n{}\n",
-            serde_json::to_string(&header).unwrap(),
-            serde_json::to_string(&entry).unwrap()
-        ),
+        root.join("indexed").join("_all").join("embeddings.ndjson"),
+        r#"{"project":"must-not-be-read"}\n"#,
     )
     .unwrap();
 
@@ -2485,140 +2512,109 @@ fn resolve_filters_to_store_or_index_slugs_supports_index_only_all_bucket() {
         &["vetcoders/vista".to_string()],
     )
     .unwrap();
-    assert_eq!(got, vec!["Vetcoders/Vista"]);
+    assert!(
+        got.iter()
+            .any(|id| id.eq_ignore_ascii_case("vetcoders/Vista")),
+        "expected directory-derived identity, got {got:?}"
+    );
 
     let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
-fn resolve_filters_to_store_or_index_slugs_merges_store_and_index_only_matches() {
+fn resolve_filters_to_store_or_index_slugs_merges_store_and_index_bucket_dirs() {
     let root = migration_test_root("resolve-store-and-index");
     fs::create_dir_all(root.join(CANONICAL_STORE_DIRNAME).join("foo").join("bar")).unwrap();
-    let indexed_all = root.join("indexed").join("_all");
-    fs::create_dir_all(&indexed_all).unwrap();
-    let header = serde_json::json!({
-        "schema_version": "aicx-vector-index/v1",
-        "model_id": "test-model",
-        "model_profile": "base",
-        "dimension": 2,
-        "generated_at": "2026-06-03T18:00:00Z",
-        "entry_count": 1
-    });
-    let entry = serde_json::json!({
-        "id": "chunk-a",
-        "project": "baz/qux",
-        "embedding": [1.0, 0.0]
-    });
-    fs::write(
-        indexed_all.join("embeddings.ndjson"),
-        format!(
-            "{}\n{}\n",
-            serde_json::to_string(&header).unwrap(),
-            serde_json::to_string(&entry).unwrap()
-        ),
-    )
-    .unwrap();
+    fs::create_dir_all(root.join("indexed").join("baz_qux")).unwrap();
+    fs::create_dir_all(root.join("indexed").join("_all")).unwrap();
 
     let got = resolve_filters_to_store_or_index_slugs_at_or_error(
         &root,
         &["foo/bar".to_string(), "baz/qux".to_string()],
     )
     .unwrap();
-    assert_eq!(got, vec!["baz/qux", "foo/bar"]);
+    assert!(got.iter().any(|id| id == "foo/bar"), "got {got:?}");
+    assert!(
+        got.iter()
+            .any(|id| id == "baz/qux" || id.eq_ignore_ascii_case("baz/qux")),
+        "got {got:?}"
+    );
 
     let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
-fn resolve_filters_to_index_slugs_scans_all_bucket_for_unmatched_filters() {
+fn resolve_filters_to_index_slugs_uses_dedicated_bucket_dirs() {
     let root = migration_test_root("resolve-index-dedicated-and-all");
     let indexed = root.join("indexed");
-    let dedicated = indexed.join("foo_bar");
-    let all = indexed.join("_all");
-    fs::create_dir_all(&dedicated).unwrap();
-    fs::create_dir_all(&all).unwrap();
-    let header = serde_json::json!({
-        "schema_version": "aicx-vector-index/v1",
-        "model_id": "test-model",
-        "model_profile": "base",
-        "dimension": 2,
-        "generated_at": "2026-06-03T18:00:00Z",
-        "entry_count": 1
-    });
-    let dedicated_entry = serde_json::json!({
-        "id": "chunk-a",
-        "project": "foo/bar",
-        "embedding": [1.0, 0.0]
-    });
-    let all_entry = serde_json::json!({
-        "id": "chunk-b",
-        "project": "baz/qux",
-        "embedding": [0.0, 1.0]
-    });
-    fs::write(
-        dedicated.join("embeddings.ndjson"),
-        format!(
-            "{}\n{}\n",
-            serde_json::to_string(&header).unwrap(),
-            serde_json::to_string(&dedicated_entry).unwrap()
-        ),
-    )
-    .unwrap();
-    fs::write(
-        all.join("embeddings.ndjson"),
-        format!(
-            "{}\n{}\n",
-            serde_json::to_string(&header).unwrap(),
-            serde_json::to_string(&all_entry).unwrap()
-        ),
-    )
-    .unwrap();
+    fs::create_dir_all(indexed.join("foo_bar")).unwrap();
+    fs::create_dir_all(indexed.join("baz_qux")).unwrap();
+    fs::create_dir_all(indexed.join("_all")).unwrap();
 
     let got = resolve_filters_to_index_slugs_at(
         &indexed,
         &["foo/bar".to_string(), "baz/qux".to_string()],
     )
     .unwrap();
-    assert_eq!(got, vec!["baz/qux", "foo/bar"]);
+    assert!(got.iter().any(|id| id == "foo/bar"), "got {got:?}");
+    assert!(got.iter().any(|id| id == "baz/qux"), "got {got:?}");
 
     let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
-fn resolve_filters_to_index_slugs_reads_only_project_field() {
-    let root = migration_test_root("resolve-index-project-only");
-    let indexed_all = root.join("indexed").join("_all");
-    fs::create_dir_all(&indexed_all).unwrap();
-    let header = serde_json::json!({
-        "schema_version": "aicx-vector-index/v1",
-        "model_id": "test-model",
-        "model_profile": "base",
-        "dimension": 2,
-        "generated_at": "2026-06-03T18:00:00Z",
-        "entry_count": 1
-    });
-    let entry = serde_json::json!({
-        "id": "chunk-a",
-        "project": "Vetcoders/Vista",
-        "embedding": ["project resolver must not deserialize this as f32"]
-    });
+fn bare_filter_ambiguity_uses_directory_bucket_identities() {
+    // Two dedicated buckets both ending in "vista" → bare filter fails closed.
+    let root = migration_test_root("resolve-index-silver-topology");
+    let indexed = root.join("indexed");
+    fs::create_dir_all(indexed.join("A_vista")).unwrap();
+    fs::create_dir_all(indexed.join("B_vista")).unwrap();
+    fs::create_dir_all(indexed.join("B_vista-portal")).unwrap();
+    fs::create_dir_all(indexed.join("_all")).unwrap();
+
+    let error = resolve_filters_to_index_slugs_at(&indexed, &["vista".to_string()])
+        .expect_err("two exact * /vista buckets must stay ambiguous");
+    let resolution_error = error
+        .downcast_ref::<ProjectResolutionError>()
+        .expect("typed project-resolution error");
+    let candidates = resolution_error.candidates();
+    assert!(
+        candidates.iter().any(|c| c == "A/vista"),
+        "candidates={candidates:?}"
+    );
+    assert!(
+        candidates.iter().any(|c| c == "B/vista"),
+        "candidates={candidates:?}"
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn project_identities_for_search_uses_index_dirs_not_ndjson() {
+    // Doctrine 2026-07-23: search `-p` resolution must never stream
+    // multi-GB embeddings.ndjson. Bucket directory names + store dirs only.
+    let root = migration_test_root("resolve-index-dirs-only");
+    let indexed = root.join("indexed");
+    fs::create_dir_all(indexed.join("vetcoders_vista")).unwrap();
+    fs::create_dir_all(indexed.join("_all")).unwrap();
+    // Poison NDJSON — if anyone reopens streaming, this would be the bait.
     fs::write(
-        indexed_all.join("embeddings.ndjson"),
-        format!(
-            "{}\n{}\n",
-            serde_json::to_string(&header).unwrap(),
-            serde_json::to_string(&entry).unwrap()
-        ),
+        indexed.join("_all").join("embeddings.ndjson"),
+        "{not valid ndjson and would hang if scanned line-by-line at multi-GB scale}\n",
     )
     .unwrap();
 
-    let got = project_slugs_from_index_file(
-        &indexed_all.join("embeddings.ndjson"),
-        &["vetcoders/vista".to_string()],
-        false,
-    )
-    .unwrap();
-    assert_eq!(got, vec!["Vetcoders/Vista"]);
+    let got = project_identities_for_search_at(&root).unwrap();
+    assert!(
+        got.iter()
+            .any(|id| id == "vetcoders/vista" || id == "vetcoders_vista"),
+        "expected bucket-derived identity, got {got:?}"
+    );
+    assert!(
+        !got.iter().any(|id| id == "_all"),
+        "_all must not surface as a project filter"
+    );
 
     let _ = fs::remove_dir_all(&root);
 }
@@ -2637,57 +2633,55 @@ fn resolve_filters_to_slugs_empty_input_returns_empty() {
 }
 
 #[test]
-fn detect_ambiguous_bare_filter_flags_org_and_repo_collision() {
-    // `-p codex` resolves to both `codex/foo` (org match) AND
-    // `openai/codex` (repo match) — operator should be warned.
+fn bare_project_filter_fails_closed_with_all_candidates() {
     let root = migration_test_root("ambiguous-codex");
     let canonical = root.join(CANONICAL_STORE_DIRNAME);
     fs::create_dir_all(canonical.join("codex").join("some-repo")).unwrap();
     fs::create_dir_all(canonical.join("openai").join("codex")).unwrap();
     fs::create_dir_all(canonical.join("unrelated").join("lab")).unwrap();
 
-    let resolved = resolve_filters_to_slugs_at(&canonical, &["codex".to_string()]).unwrap();
-    // Filter still returns union (no behavior change).
-    assert_eq!(resolved, vec!["codex/some-repo", "openai/codex"]);
-
-    // Helper flags the ambiguity.
-    let detected =
-        detect_ambiguous_bare_filter("codex", &resolved).expect("ambiguity must be detected");
-    assert_eq!(detected.0, vec!["codex/some-repo"]);
-    assert_eq!(detected.1, vec!["openai/codex"]);
-
-    // Case-insensitive on the filter side too.
-    let detected_upper = detect_ambiguous_bare_filter("CODEX", &resolved)
-        .expect("ambiguity must be detected case-insensitively");
-    assert_eq!(detected_upper.0, vec!["codex/some-repo"]);
-    assert_eq!(detected_upper.1, vec!["openai/codex"]);
+    let err = resolve_filters_to_slugs_at(&canonical, &["codex".to_string()])
+        .expect_err("ambiguous bare filter must fail closed");
+    let resolution_error = err
+        .downcast_ref::<ProjectResolutionError>()
+        .expect("typed project-resolution error");
+    assert_eq!(
+        resolution_error.candidates(),
+        ["codex/some-repo", "openai/codex"]
+    );
 
     let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
-fn detect_ambiguous_bare_filter_skips_unambiguous_and_qualified_filters() {
-    // Org-only match → no ambiguity.
-    let slugs_org_only = vec![
-        "codex/some-repo".to_string(),
-        "codex/other-repo".to_string(),
+fn project_resolver_keeps_exact_and_fuzzy_modes_separate() {
+    let corpus = vec![
+        "B/vista".to_string(),
+        "B/vista-portal".to_string(),
+        "B/RepoScribe-dev".to_string(),
     ];
-    assert!(detect_ambiguous_bare_filter("codex", &slugs_org_only).is_none());
 
-    // Repo-only match → no ambiguity.
-    let slugs_repo_only = vec!["openai/codex".to_string(), "anthropic/codex".to_string()];
-    assert!(detect_ambiguous_bare_filter("codex", &slugs_repo_only).is_none());
+    let exact =
+        require_project_resolution(&["B/vista".to_string()], &corpus, ProjectMatchMode::Exact)
+            .unwrap();
+    assert_eq!(exact.selected, ["B/vista"]);
 
-    // Qualified filter forms (owner/, /repo, owner/repo) are never
-    // "ambiguous" — they expressed intent, so the helper short-circuits.
-    let slugs_mixed = vec!["codex/some-repo".to_string(), "openai/codex".to_string()];
-    assert!(detect_ambiguous_bare_filter("codex/", &slugs_mixed).is_none());
-    assert!(detect_ambiguous_bare_filter("/codex", &slugs_mixed).is_none());
-    assert!(detect_ambiguous_bare_filter("openai/codex", &slugs_mixed).is_none());
+    let bare = require_project_resolution(&["vista".to_string()], &corpus, ProjectMatchMode::Exact)
+        .unwrap();
+    assert_eq!(bare.selected, ["B/vista"]);
 
-    // Empty / whitespace filter → None.
-    assert!(detect_ambiguous_bare_filter("", &slugs_mixed).is_none());
-    assert!(detect_ambiguous_bare_filter("   ", &slugs_mixed).is_none());
+    let fuzzy =
+        require_project_resolution(&["vista".to_string()], &corpus, ProjectMatchMode::Fuzzy)
+            .unwrap();
+    assert_eq!(fuzzy.selected, ["B/vista", "B/vista-portal"]);
+
+    let suffix = require_project_resolution(
+        &["B/RepoScribe".to_string()],
+        &corpus,
+        ProjectMatchMode::Exact,
+    )
+    .expect_err("owner/repo exact must not match a family suffix");
+    assert_eq!(suffix.kind(), "project_not_found");
 }
 
 #[test]

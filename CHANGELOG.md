@@ -5,6 +5,56 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
+### Changed
+
+- **Product verification walk (W5-01).** Architecture and store-layout docs
+  aligned to code truth (hybrid generations, typed retrieval status, config
+  inspect, doctor/health split). `docs/EMBEDDINGS.md` records OUTCOME 1 and
+  labels the shell harness wall times as reference-model latency, never engine
+  latency. Isolated multi-agent fixture walk (extract → store → search/intents
+  → health → MCP) is evidence-only; no live `~/.aicx` mutation.
+- **Mmap exact-scan hot loop profiled and repaired — OUTCOME 1 (W4-01c).**
+  Profiling the release-mode `MmapDenseAdapter` at the same isolated
+  500000×1024 scale showed the Rust scan was never the latency culprit: warm
+  global query 0.578 s before / 0.371-0.468 s after the repair, project-scoped
+  0.241 s / 0.212-0.221 s — both far inside the frozen budgets (8 s global,
+  2 s project). The 317.87 s / 55.00 s recorded on 2026-07-22 measures the
+  pure-Python reference scan inside `tools/bench_dense_migration.sh`
+  (`run_mmap` struct-unpacks and dot-products every row in the interpreter);
+  the harness never executes the Rust adapter, debug or release. Hot-loop
+  repairs, with every contract preserved and scores bit-identical to the
+  brute-force leg: unfiltered scans skip row-metadata decoding entirely
+  (dropping a ~0.16 s/query serde_json + string-allocation tax at 500k rows),
+  filtered scans deserialize only the `metadata` object, the query
+  self-product is hoisted out of the scan, and scoring is
+  distance-specialized and branch-free with fail-closed non-finite
+  diagnostics moved off the hot path. The unmodified harness re-run at the
+  same scale reproduced its Python-scan figures (321.96 s / 55.37 s, with its
+  own pure-Python "legacy" scan at 37.9 s global) while parity 1.0, disk
+  ratio 0.0971, and failed-copy safety all held. Verdict: the mmap exact scan
+  stands; the Lance/memex-search contingency stays shelved.
+- **Dense migration benchmark gate.** Added `tools/bench_dense_migration.sh`
+  to build an isolated AICX_HOME-shaped corpus, compare legacy duplicate dense
+  NDJSON against the mmap payload, verify failed-copy `CURRENT` safety, reverse
+  query-order parity, top-k parity, disk ratio, and latency/RSS budget accounting
+  without mutating live `~/.aicx`. The first 2026-07-22 ≥2 GiB isolated run
+  recorded 317.87 s global / 55.00 s project as **reference-model (pure-Python)
+  latency** inside the harness's `run_mmap()` — not the Rust engine. W4-01c
+  reclassified that measurement and proved the release-mode `MmapDenseAdapter`
+  meets the frozen budgets (see OUTCOME 1 above). The harness remains the CI
+  contract for layout/parity/failed-copy; treat its wall times as reference
+  model only until a follow-up drives the real binary.
+- **Batched semantic-index embedding.** `aicx index` now embeds chunks in
+  batches through the existing `embed_batch` API instead of one HTTP
+  round-trip per chunk. For the cloud backend this collapses the dominant
+  per-chunk latency of a full build (one OpenAI-compatible POST carries an
+  `input` array of up to `batch_size` texts). Batch size is configurable
+  via `[embedder.cloud] batch_size` (default 16) with an `AICX_EMBED_BATCH`
+  env override; GGUF stays serial (`batch_size` 1) by default and opts in
+  only via the env var. A failing batch retries once, then degrades to
+  per-item embedding so one poison chunk cannot abort the run. Checkpoint,
+  resume, `--sample N`, and per-chunk progress ticks are unchanged.
+
 ## [0.11.0] - 2026-07-13
 
 Parser engine transplant — "Noc francuskiego łącznika". Full session-engine

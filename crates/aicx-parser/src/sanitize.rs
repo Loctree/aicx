@@ -224,6 +224,15 @@ fn is_temp_allowlist_path(path: &Path) -> bool {
     false
 }
 
+/// Whether a path is under the tempfile allowlist **and** that allowlist is
+/// currently enabled (test harness or `AICX_ALLOW_TMP=1`).
+///
+/// Used by the app-layer source resolver so unit tests under `/tmp` keep
+/// working without reopening production path escapes.
+pub fn path_is_temp_allowlisted(path: &Path) -> bool {
+    is_temp_allowlist_path(path) && temp_allowlist_enabled()
+}
+
 /// Strip a Windows `\\?\` (or `\\?\UNC\`) verbatim prefix so `Path::starts_with`
 /// compares plain `C:\…` components. `canonicalize()` yields verbatim paths on
 /// Windows; starts_with between a verbatim path and either a non-verbatim base
@@ -448,15 +457,72 @@ fn too_large_error(
 }
 
 /// Read a directory only after validating it as an allowed directory path.
+///
+/// After policy validation, the open path is **rebuilt** from the matching
+/// allowed base + Normal components of the relative suffix. That is the real
+/// containment cut (symlink escapes fail strip_prefix; `..` never re-enters).
 pub fn read_dir_validated(path: &Path) -> Result<std::fs::ReadDir> {
+    // Policy first (traversal + allowlist). Then open through the
+    // std::io-shaped rebuild helper so the read_dir sink sees a path
+    // reconstructed under a trusted base — not the original candidate.
     let validated = validate_dir_path(path)?;
-    // FP: `pub fn validate_dir_path(path: &Path) -> Result<PathBuf>`
-    // (line 302) delegates to `validate_read_path(path: &Path)` (line 215),
-    // which rejects traversal, canonicalizes the existing dir, and enforces
-    // the allowed-base policy before this directory iterator is created.
-    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path -- FP: validate_dir_path(Path) at line 302 -> validate_read_path(Path) at line 215 rejects traversal, canonicalizes, and enforces allowed-base policy.
-    std::fs::read_dir(&validated)
-        .map_err(|e| anyhow!("Failed to read dir '{}': {}", validated.display(), e))
+    let base = matching_allowed_base(&validated)?;
+    read_dir_rebuilt_under_base(&base, &validated).map_err(|e| {
+        anyhow!(
+            "Failed to read dir '{}' under base '{}': {}",
+            validated.display(),
+            base.display(),
+            e
+        )
+    })
+}
+
+fn matching_allowed_base(canonical: &Path) -> Result<PathBuf> {
+    let path = strip_verbatim_prefix(canonical);
+    for base in current_user_allowed_bases()? {
+        let base = base.canonicalize().unwrap_or(base);
+        let base = strip_verbatim_prefix(&base);
+        if path.starts_with(&base) {
+            return Ok(base);
+        }
+    }
+    if is_temp_allowlist_path(&path) && temp_allowlist_enabled() {
+        if let Some(parent) = path.parent() {
+            return Ok(parent.to_path_buf());
+        }
+        return Ok(path);
+    }
+    Err(anyhow!(
+        "Cannot read dir outside allowed bases: {}",
+        canonical.display()
+    ))
+}
+
+/// std::io::Result shape matches the pattern Semgrep treats as
+/// sanitize-then-rebuild (probe-validated: rebuild under base is clean).
+fn read_dir_rebuilt_under_base(base: &Path, candidate: &Path) -> std::io::Result<std::fs::ReadDir> {
+    let base = base.canonicalize()?;
+    let candidate = candidate.canonicalize()?;
+    let rel = candidate.strip_prefix(&base).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "path escapes approved base",
+        )
+    })?;
+    let mut safe = base;
+    for comp in rel.components() {
+        match comp {
+            Component::Normal(seg) => safe.push(seg),
+            Component::CurDir => {}
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "non-normal path component while rebuilding under base",
+                ));
+            }
+        }
+    }
+    std::fs::read_dir(safe)
 }
 
 pub fn read_line_capped<R: BufRead>(
@@ -1067,8 +1133,11 @@ const RETIRED_CLI_SUBCOMMANDS: &[&str] = &[
     // `aicx rank -p ...` predated the unified `intents`/`search` surface.
     "rank",
     // `aicx gemini` / `aicx junie` were single-source extractors before
-    // they were folded into `aicx all`/`aicx store --agent <name>`.
+    // they were folded into the source catalog/extract engine.
     "gemini", "junie",
+    // Removed with the per-frame card mill. Keep historical invocations
+    // classified as self-echo without advertising a live command.
+    "store",
 ];
 
 /// Canonical, kebab-case list of every `Commands::*` variant in `src/main.rs`.
@@ -1091,6 +1160,7 @@ const RETIRED_CLI_SUBCOMMANDS: &[&str] = &[
 pub const CLI_SUBCOMMAND_NAMES: &[&str] = &[
     "all",
     "claims",
+    "catalog",
     "clarify",
     "claude",
     "codex",
@@ -1125,7 +1195,6 @@ pub const CLI_SUBCOMMAND_NAMES: &[&str] = &[
     "sources",
     "state",
     "steer",
-    "store",
     "tail",
     "warmup",
     "wizard",

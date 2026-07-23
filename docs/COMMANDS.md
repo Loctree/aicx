@@ -1,11 +1,11 @@
 # Commands
 
-`aicx` is the operator front door for agent session logs. It is store-first and
+`aicx` is the operator front door for agent session logs. It is catalog-first and
 operator-driven: nothing mutates your corpus unless you run a command.
 
 | Layer | What | Command surface |
 |-------|------|-----------------|
-| **1 — Canonical corpus** | Extract, deduplicate, chunk agent logs into steerable markdown at `~/.aicx/`. This is ground truth. | `claude`, `codex`, `all`, `store`, `extract` |
+| **1 — Canonical corpus** | Catalog session identity, extract readable markdown, index sources. | `catalog`, `extract`, `index`, `claude`, `codex`, `all` |
 | **1b — Context corpus** | Append-only retention for `loct-context-pack` prism artifacts at `~/.aicx/context-corpus/`. Excluded from live-truth retrieval and `aicx intents`; materializes into a separate `context-corpus.embeddings.ndjson` namespace. See [`CONTEXT_CORPUS.md`](./CONTEXT_CORPUS.md). | `ingest --source loct-context-pack <PACK_DIR>`, `doctor --check-dedup` |
 | **2 — Retrieval surfaces** | Query the corpus through filesystem search, steering metadata, MCP tools, and the reusable native embedding library. | `search`, `steer`, `serve`, `aicx-embeddings` |
 
@@ -206,38 +206,22 @@ aicx extract codex --file ~/.codex/sessions/2026/04/10/rollout-<...>.jsonl --con
 aicx extract claude --file /path/to/session.jsonl -o /tmp/report.md
 ```
 
-## `aicx store`
+## `aicx store` (removed)
 
-Build the canonical corpus in `~/.aicx/` from agent logs.
+The per-frame card mill and `aicx store` subcommand are **deleted**.
 
-Store-first corpus builder: extracts, deduplicates, chunks, and writes steerable
-markdown. Like `claude`, `codex`, and `all`, it uses per-source watermarks by
-default so repeat runs stay incremental. Use `--full-rescan` for backfills and
-targeted re-extraction when you need to ignore the watermark.
+Identity and retrieval now use:
 
 ```bash
-aicx store [OPTIONS]
+aicx catalog rebuild
+aicx extract <agent> --session <id> --conversation
+aicx index
+aicx search '<query>'
 ```
 
-Options:
-- `-p, --project <PROJECT>...` source cwd/project filter(s)
-- `-a, --agent <AGENT>` `claude`, `codex`, `gemini`, `junie` (default: all)
-- `-H, --hours <HOURS>` lookback window (default: `48`, `0` = all time)
-- `--full-rescan` ignore the stored watermark and rescan the full lookback window
-- `--no-redact-secrets` disable secret redaction for this corpus build
-- `--user-only` exclude assistant + reasoning messages (default: assistant included)
-- `--emit <paths|json|none>` stdout mode (default: `none`)
-
-Notes:
-- `store` is store-first, but still watermark-driven by default.
-- For a deliberate backfill, use `aicx store --full-rescan`.
-- `--emit json` distinguishes requested source filters from resolved canonical output buckets with `requested_source_filters`, `resolved_repositories`, and `resolved_store_buckets`.
-
-Example:
-
-```bash
-aicx store -p Codescribe --agent claude -H 720 --emit paths
-```
+`aicx ingest --source <agent>` no longer writes `~/.aicx/store` cards; it exits
+with `card_mill_removed` and points at the catalog → extract → index path.
+There is no `AICX_ALLOW_CARD_MILL` salvage switch.
 
 ## `aicx corpus`
 
@@ -828,3 +812,11 @@ See: [vibecrafted.io](https://vibecrafted.io/)
 - `0` on success.
 - `1` on errors (invalid args, IO failures, runtime errors).
 - `--help` and `--version` exit `0`.
+
+### Batch ingest surfaces (`aicx claude|codex|gemini|junie|grok|all|store|conversations`)
+
+| Condition | Exit | Meaning |
+|---|---|---|
+| `selected == 0` (empty window, or every discovered session cut by `-p/--project`) | `0` | Empty result, not a failure. `-p`-filtered sessions are counted separately as `filtered_out` and never enter `selected`. |
+| `selected > 0 && ingested == 0 && skipped == selected` (all-skipped) | `3` | Every selected session was refused by per-session diagnostics; inspect the `recover:` hints. Watermarks are held so skipped sessions stay eligible for retry. |
+| `ingested > 0` (partial or full success) | `0` | Per-session skips are reported on stderr but do not fail the batch. |

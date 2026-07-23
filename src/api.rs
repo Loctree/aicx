@@ -102,6 +102,16 @@ impl Aicx {
     where
         F: FnMut(usize, usize),
     {
+        // Production: card mill is deleted. cfg(test) still exercises the mill
+        // for migration contracts; operator binaries and library consumers get
+        // a hard fail, not dual-body silence that pretends the write succeeded.
+        if !crate::store::card_mill_writes_enabled() {
+            anyhow::bail!(
+                "card mill removed: Aicx::store_entries no longer writes per-frame cards under \
+                 ~/.aicx/store. Use `aicx catalog rebuild`, then `aicx extract` / `aicx index` \
+                 (catalog + extracts + source-driven CURRENT)."
+            );
+        }
         crate::store::store_semantic_segments_at(
             &self.config.store_root,
             entries,
@@ -124,7 +134,8 @@ impl Aicx {
         } else {
             opts.projects
         };
-        let project_scopes_owned = search_project_scopes(&self.config.store_root, &owned_projects)?;
+        let project_scopes_owned =
+            search_project_scopes(&self.config.store_root, &owned_projects, opts.project_match)?;
         let project_scopes: Vec<Option<&str>> = project_scopes_owned
             .iter()
             .map(|scope| scope.as_deref())
@@ -197,6 +208,7 @@ pub struct SearchOptions {
     pub limit: usize,
     pub projects: Vec<String>,
     pub project: Option<String>,
+    pub project_match: crate::store::ProjectMatchMode,
     pub frame_kind: Option<FrameKind>,
     pub kind: Option<String>,
 }
@@ -208,6 +220,7 @@ impl Default for SearchOptions {
             limit: 10,
             projects: Vec::new(),
             project: None,
+            project_match: crate::store::ProjectMatchMode::Exact,
             frame_kind: None,
             kind: None,
         }
@@ -215,13 +228,17 @@ impl Default for SearchOptions {
 }
 
 #[cfg(feature = "app")]
-fn search_project_scopes(store_root: &Path, projects: &[String]) -> Result<Vec<Option<String>>> {
+fn search_project_scopes(
+    store_root: &Path,
+    projects: &[String],
+    match_mode: crate::store::ProjectMatchMode,
+) -> Result<Vec<Option<String>>> {
     if projects.is_empty() {
         return Ok(vec![None]);
     }
-    let resolved =
-        crate::store::resolve_filters_to_store_or_index_slugs_at_or_error(store_root, projects)?;
-    Ok(resolved.into_iter().map(Some).collect())
+    let corpus = crate::store::project_identities_in_store_or_index_at(store_root)?;
+    let resolution = crate::store::require_project_resolution(projects, &corpus, match_mode)?;
+    Ok(resolution.selected.into_iter().map(Some).collect())
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -304,6 +321,13 @@ fn index_status_at_with_sessions(
     project: Option<&str>,
     source_sessions_override: Option<&[SessionInfo]>,
 ) -> Result<IndexStatus> {
+    // Prefer the CURRENT hybrid generation — the same surface `aicx search`
+    // queries. Store cards + embeddings.ndjson are residual mill artifacts and
+    // must not be reported as readiness truth when CURRENT exists.
+    if let Some(status) = hybrid_current_index_status(base, project)? {
+        return Ok(status);
+    }
+
     let chunks = crate::store::scan_context_files_project_at(base, project)?;
     let newest_chunk = chunks
         .iter()
@@ -384,6 +408,114 @@ fn index_status_at_with_sessions(
         project_bucket,
         committed_at,
     })
+}
+
+/// Report readiness from hybrid CURRENT when it is the search truth surface.
+///
+/// Returns `Ok(None)` when no usable CURRENT generation exists under `base`,
+/// so callers can fall back to residual store/NDJSON status for migration.
+#[cfg(feature = "app")]
+fn hybrid_current_index_status(base: &Path, project: Option<&str>) -> Result<Option<IndexStatus>> {
+    // Source-driven publish always lands in the global `_all` bucket; project
+    // is a search-time filter, not a separate generation.
+    let hybrid_root = base.join("indexed").join("_all").join("hybrid");
+    if !hybrid_root.is_dir() {
+        return Ok(None);
+    }
+    let generation_dir = crate::vector_index::resolve_hybrid_generation_dir(&hybrid_root);
+    let manifest_path = generation_dir.join("manifest.json");
+    if !manifest_path.is_file() {
+        return Ok(None);
+    }
+    let manifest = match aicx_retrieve::Manifest::read_from_path(&manifest_path) {
+        Ok(manifest) => manifest,
+        Err(_) => return Ok(None),
+    };
+    // Search uses CURRENT for any generation with a lexical corpus. Prefer the
+    // source-driven lexical shape (`optional_not_built`) but also accept denser
+    // generations so status and search never disagree about "is there an index".
+    if manifest.lexical_doc_count == 0 {
+        return Ok(None);
+    }
+
+    let catalog_entries = crate::catalog::read_entries_at(base).unwrap_or_default();
+    let catalog_total = catalog_entries.len();
+    let project_filter = project.map(str::trim).filter(|value| !value.is_empty());
+    let catalog_in_scope = match project_filter {
+        None => catalog_total,
+        Some(filter) => catalog_entries
+            .iter()
+            .filter(|entry| {
+                entry
+                    .project
+                    .as_deref()
+                    .is_some_and(|project| project.eq_ignore_ascii_case(filter))
+            })
+            .count(),
+    };
+
+    let committed_at = Some(manifest.build_completed_at.to_rfc3339());
+    let generation_mtime = manifest_path
+        .metadata()
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
+        .map(system_time_to_rfc3339)
+        .or_else(|| committed_at.clone());
+
+    // Catalog rows beyond CURRENT lexical docs mean sessions are admitted but
+    // not yet published — stale index relative to the durable catalog.
+    let pending = catalog_total.saturating_sub(manifest.lexical_doc_count);
+    let readiness = if pending > 0 {
+        IndexReadiness::StaleIndex
+    } else {
+        IndexReadiness::Ready
+    };
+
+    let backend = if manifest.dense_kind == "optional_not_built" {
+        "hybrid_lexical"
+    } else {
+        "hybrid"
+    };
+
+    Ok(Some(IndexStatus {
+        // For the extract-era store, "chunks" == signal session documents.
+        canonical_chunks: manifest.lexical_doc_count,
+        semantic_index_present: true,
+        semantic_index_path: Some(path_for_json(&manifest_path)),
+        semantic_index_rows: manifest.lexical_doc_count,
+        newest_chunk_mtime: generation_mtime.clone(),
+        source_sessions: catalog_in_scope,
+        newest_session_updated_at: None,
+        sessions_newer_than_chunks: 0,
+        sessions_without_timestamps: 0,
+        chunking_lag_secs: None,
+        semantic_index_mtime: generation_mtime,
+        semantic_lag_secs: None,
+        pending_chunks: pending,
+        temp_index_present: false,
+        temp_index_path: None,
+        temp_index_rows: 0,
+        temp_index_mtime: None,
+        temp_index_bytes: None,
+        readiness,
+        backend: backend.to_string(),
+        // Surface the requested filter label for operators, but the generation
+        // is always the global CURRENT under `_all`.
+        project_bucket: project_filter
+            .map(|filter| canonical_bucket_name(Some(filter)))
+            .unwrap_or_else(|| "_all".to_string()),
+        committed_at,
+    }))
+}
+
+/// Slim (`loctree-consumer`) builds carry no retrieval surface, so the hybrid
+/// CURRENT manifest cannot be read; status falls back to residual store/NDJSON.
+#[cfg(not(feature = "app"))]
+fn hybrid_current_index_status(
+    _base: &Path,
+    _project: Option<&str>,
+) -> Result<Option<IndexStatus>> {
+    Ok(None)
 }
 
 #[derive(Debug, Clone)]
@@ -750,7 +882,7 @@ mod tests {
             message: "old chunk".to_string(),
             frame_kind: Some(FrameKind::UserMsg),
             branch: None,
-            cwd: Some("/Users/me/vc-workspace/vetcoders/aicx".to_string()),
+            cwd: Some("/Users/tester/vc-workspace/vetcoders/aicx".to_string()),
             timestamp_source: None,
             source_path: None,
             source_sha256: None,
@@ -782,7 +914,7 @@ mod tests {
             session_id: "fresh".to_string(),
             agent: "claude".to_string(),
             project: Some("aicx".to_string()),
-            repo_path: Some("/Users/me/vc-workspace/vetcoders/aicx".to_string()),
+            repo_path: Some("/Users/tester/vc-workspace/vetcoders/aicx".to_string()),
             started_at: Some(newer),
             updated_at: Some(newer),
             message_count: 1,
@@ -837,6 +969,83 @@ mod tests {
         assert_eq!(summary.written_paths.len(), 1);
         assert!(summary.written_paths[0].starts_with(root.join("non-repository-contexts")));
         assert_eq!(client.list_chunks().expect("scan chunks").len(), 1);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn index_status_prefers_hybrid_current_over_ndjson_mill() {
+        let root = std::env::temp_dir().join(format!(
+            "aicx-api-hybrid-status-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create root");
+
+        // Residual mill NDJSON that must NOT win status when CURRENT exists.
+        let ndjson_dir = root.join("indexed").join("_all");
+        std::fs::create_dir_all(&ndjson_dir).expect("ndjson dir");
+        std::fs::write(
+            ndjson_dir.join("embeddings.ndjson"),
+            "{\"schema_version\":\"1.0\"}\n{\"id\":\"stale-mill-row\"}\n",
+        )
+        .expect("write residual ndjson");
+
+        let gen_name = "g-2026-07-23T10-00-00Z-teststatus";
+        let gen_dir = root
+            .join("indexed")
+            .join("_all")
+            .join("hybrid")
+            .join("generations")
+            .join(gen_name);
+        std::fs::create_dir_all(&gen_dir).expect("generation dir");
+        let manifest = aicx_retrieve::Manifest {
+            schema_version: "2.0".to_string(),
+            generation_id: "g-2026-07-23T10:00:00Z-teststatus".to_string(),
+            source_chunk_count: 3,
+            source_hash_blake3: "abc".to_string(),
+            embedder_model: "optional".to_string(),
+            embedder_url_hash: "not_built".to_string(),
+            embedder_dim: 0,
+            embedder_distance: "cosine".to_string(),
+            dense_count: 0,
+            dense_kind: "optional_not_built".to_string(),
+            lexical_commit_id: "tantivy_test".to_string(),
+            lexical_doc_count: 3,
+            build_started_at: Utc.with_ymd_and_hms(2026, 7, 23, 10, 0, 0).unwrap(),
+            build_completed_at: Utc.with_ymd_and_hms(2026, 7, 23, 10, 0, 12).unwrap(),
+            build_wall_seconds: 12,
+            fusion_algorithm: "rrf".to_string(),
+            fusion_k: 60,
+        };
+        manifest
+            .write_to_path(&gen_dir.join("manifest.json"))
+            .expect("write hybrid manifest");
+        std::fs::write(
+            root.join("indexed")
+                .join("_all")
+                .join("hybrid")
+                .join("CURRENT"),
+            format!("{gen_name}\n"),
+        )
+        .expect("write CURRENT pointer");
+
+        let status = index_status_at(&root, None).expect("hybrid status");
+        assert_eq!(status.backend, "hybrid_lexical");
+        assert_eq!(status.readiness, IndexReadiness::Ready);
+        assert_eq!(status.semantic_index_rows, 3);
+        assert_eq!(status.canonical_chunks, 3);
+        assert!(
+            status
+                .semantic_index_path
+                .as_deref()
+                .is_some_and(|path| path.contains("manifest.json")
+                    && path.contains("generations")
+                    && !path.contains("embeddings.ndjson")),
+            "status must point at CURRENT generation, not residual ndjson: {:?}",
+            status.semantic_index_path
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }

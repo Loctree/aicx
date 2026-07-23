@@ -146,7 +146,7 @@ make release-bundle KEYS=~/.keys NOTARY_PROFILE=vc-notary
 make release-bundle KEYS=~/.keys CLEAN=0
 AICX_KEYS_DIR=~/.keys AICX_NOTARY_PROFILE=vc-notary make release-bundle
 bash install.sh
-AICX_INSTALL_MODE=release AICX_RELEASE_TAG=v0.10.0 bash install.sh
+AICX_INSTALL_MODE=release AICX_RELEASE_TAG=v0.12.0 bash install.sh
 ```
 
 Notes:
@@ -169,8 +169,8 @@ Notes:
 3. Create an annotated tag that matches the crate version.
 
 ```bash
-git tag -a v0.10.0 -m "aicx v0.10.0"
-git push origin v0.10.0
+git tag -a v0.12.0 -m "aicx v0.12.0"
+git push origin v0.12.0
 ```
 
 4. Wait for the `Release` workflow to finish and confirm the GitHub Release has all archives, `.sha256` files, and the expected body copied from `CHANGELOG.md`.

@@ -103,12 +103,61 @@ It is updated on every store write.
 
 AICX exposes canonical chunks through filesystem search, steering metadata,
 dashboard search, MCP tools, and the reusable `aicx-embeddings` library. Heavy
-semantic retrieval/indexing is owned by Roost/rust-memex outside this CLI
-surface.
+premium retrieval/indexing remains owned by Roost/rust-memex outside this CLI
+surface; the portable hybrid path lives under `indexed/` (below).
 
 `~/.aicx/.aicxignore` is honored before queueing chunks for the steer index and
 should also be honored by downstream retrieval materializers that consume the
 canonical store.
+
+### Semantic / hybrid index: `$AICX_HOME/indexed/`
+
+Derived, rebuildable views — never ground truth. Layout per bucket:
+
+```
+$AICX_HOME/indexed/<bucket>/
+  hybrid/
+    CURRENT                         # pointer naming the published generation
+    generations/<generation>/
+      tantivy_lex/                  # lexical index (default search path)
+      dense.exact_mmap_v1.bin       # optional dense payload (re-rank via --deep)
+      manifest.json                 # generation authority, written last
+  # RETIRED intermediates (safe to delete — operator button, not auto-rm):
+  # embeddings.ndjson               # legacy dense build source (~19 GB observed)
+  # hybrid/dense_brute_force.ndjson # retired brute adapter twin (~16 GB observed)
+```
+
+Contract (W2-03 / W3-02 / W4-01c + aicx-extracts-store 2026-07-23):
+
+- **Default search is lexical-first** against the published `_all` CURRENT
+  generation (`tantivy_lex` + recency prior). Dense mmap re-rank is opt-in
+  (`aicx search --deep`). Project (`-p`) is a metadata filter, not a per-project
+  index requirement.
+- **Index from catalog + sources** via `aicx catalog rebuild` then `aicx index`.
+  No per-frame card mill; `aicx store` is removed.
+- **One dense payload per generation when dense is built.** New default index
+  runs do not stream multi-GB NDJSON for query. Legacy
+  `hybrid/dense_brute_force.ndjson` is migration read input only.
+- **Manifest last, pointer flip publishes.** Incomplete generation directories are
+  unreferenced and may be quarantined; they never alter current resolution.
+- **Truthful status:** when the hybrid CURRENT generation is missing, search
+  fails closed with an honest error (or a bounded recency-ranked filesystem
+  fallback when that path is still enabled) — never a multi-minute NDJSON hang.
+
+#### Operator button — reclaim retired NDJSON (pre-authorized accept-dou)
+
+Workers must **not** auto-delete these. On a host still carrying the mill
+residue (~35 GB reclaim expected), measure then remove only after confirm:
+
+```bash
+du -sh ~/.aicx/indexed/_all/embeddings.ndjson \
+       ~/.aicx/indexed/_all/hybrid/dense_brute_force.ndjson
+# only after confirm:
+# rm -f ~/.aicx/indexed/_all/embeddings.ndjson \
+#       ~/.aicx/indexed/_all/hybrid/dense_brute_force.ndjson
+```
+
+See `docs/EMBEDDINGS.md` for embedder profiles and the dense migration gate.
 
 ### Sibling: Context Corpus (`~/.aicx/context-corpus/`)
 
@@ -127,6 +176,34 @@ Historically, `aicx` grouped contexts under a file-centric identity (e.g., `file
 **Compatibility Rules:**
 - Older stored artifacts are NOT automatically orphaned or silently broken on read. However, they will no longer be updated.
 - To maintain a single coherent history, run `aicx migrate`. This command will cleanly move your older `~/.ai-contexters` contexts into the correct repository-named directories in `~/.aicx/` and update your `index.json`.
+
+## Store reconciliation contract
+
+Identity migration and abandoned canonical-projection stages are exercised as
+one recovery workflow against a copied `AICX_HOME`; neither operation requires
+or permits mutation of the live store during verification.
+
+1. `aicx doctor --migrate-identities` inventories identity drift and writes the
+   resumable `migration/identity-manifest.json`. This is a dry run: a recursive
+   hash of `store/` must remain unchanged.
+2. `aicx doctor --fix-buckets --dry-run` inventories abandoned projection
+   stages from their `stage.json` leases without reading payloads.
+3. Apply only after reviewing both previews. Identity apply is resumable after
+   every persisted step; eligible projection stages move, never delete, into a
+   named `quarantine/projection-stages-<timestamp>/` artifact with a restore
+   manifest.
+4. Verify before/after inventories by file count, bytes, unique logical
+   sessions, identities, resolvable physical duplicates, and unresolved
+   conflicts. A non-identical pair for one logical session is an explicit
+   conflict: no freshest-wins choice is allowed. Rollback must restore the
+   original payload inventory byte-for-byte.
+
+The synthetic contract pack at
+`tests/fixtures/store_reconciliation/synthetic_store.json` mirrors casing/style
+drift, ownerless and underscore-prefixed buckets, deprecated checkouts, and a
+divergent logical-session pair without copying private session content. The E2E
+tests materialize `reconciliation-before.json` and
+`reconciliation-after.json` inside their temporary copied home.
 
 ## Repo-local Context Artifacts: `.ai-context/`
 

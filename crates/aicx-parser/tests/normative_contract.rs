@@ -79,6 +79,7 @@ fn normative_contract_status_truth_table() {
                         boundary_flags: BoundaryFlags {
                             opaque_reasoning_present: case.opaque_reasoning_present,
                             unsupported_visible_event: case.unsupported_visible_event,
+                            compaction_boundary_present: false,
                         },
                         malformed_tail_present: case.malformed_tail_present,
                         visible_event_lost: case.visible_event_lost,

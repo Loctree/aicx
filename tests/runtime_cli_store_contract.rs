@@ -66,11 +66,23 @@ fn write_codex_history(
 }
 
 fn write_claude_session_fixture(path: &Path, session_id: Option<&str>, text: &str) {
+    write_claude_session_fixture_with_cwd(path, session_id, "/repo", text);
+}
+
+// SYNTHETIC fixture writer (same minimal Claude JSONL shape as
+// tests/fixtures/parser_engine/claude/minimal.jsonl); cwd is the
+// discovery-filter axis under test, not captured operator material.
+fn write_claude_session_fixture_with_cwd(
+    path: &Path,
+    session_id: Option<&str>,
+    cwd: &str,
+    text: &str,
+) {
     let timestamp = chrono::Utc::now().to_rfc3339();
     let mut row = json!({
         "timestamp": timestamp,
         "type": "user",
-        "cwd": "/repo",
+        "cwd": cwd,
         "message": {"role": "user", "content": text}
     });
     if let Some(session_id) = session_id {
@@ -145,16 +157,21 @@ fn ensure_aicx_binary_exists() -> PathBuf {
 }
 
 fn run_aicx(home: &Path, args: &[&str]) -> Output {
+    // Card mill is removed from the operator binary — no salvage env.
+    run_aicx_card_mill_disabled(home, args)
+}
+
+fn run_aicx_card_mill_disabled(home: &Path, args: &[&str]) -> Output {
     fs::create_dir_all(home).expect("create temp HOME");
-    Command::new(ensure_aicx_binary_exists())
-        .args(args)
+    let mut cmd = Command::new(ensure_aicx_binary_exists());
+    cmd.args(args)
         .env("HOME", home)
         // Windows resolves the home dir from USERPROFILE, not HOME (dirs::home_dir).
         .env("USERPROFILE", home)
         .env("AICX_ALLOW_TMP", "1")
         .env_remove("AICX_HOME")
-        .output()
-        .expect("run aicx")
+        .env_remove("AICX_ALLOW_CARD_MILL");
+    cmd.output().expect("run aicx")
 }
 
 fn assert_success(output: &Output) {
@@ -195,15 +212,6 @@ fn json_paths(value: &Value, key: &str) -> Vec<PathBuf> {
                     .to_string(),
             )
         })
-        .collect()
-}
-
-fn json_strings(value: &Value, key: &str) -> Vec<String> {
-    value[key]
-        .as_array()
-        .expect("json array")
-        .iter()
-        .map(|entry| entry.as_str().expect("json string").to_string())
         .collect()
 }
 
@@ -460,7 +468,7 @@ fn sources_protect_apply_creates_only_local_git_without_remote() {
 }
 
 #[test]
-fn normal_store_and_extract_do_not_initialize_source_git() {
+fn catalog_and_extract_do_not_initialize_source_git_or_create_store() {
     let root = unique_test_dir("source-normal-readonly");
     let home = root.join("home");
     let source_root = home.join(".codex");
@@ -476,14 +484,18 @@ fn normal_store_and_extract_do_not_initialize_source_git() {
         &[("user", now - 60, "private source root must stay read-only")],
     );
 
-    let store_output = run_aicx(
-        &home,
-        &["store", "--agent", "codex", "-H", "24", "--emit", "json"],
-    );
-    assert_success(&store_output);
+    let catalog_output = run_aicx(&home, &["catalog", "rebuild", "--json"]);
+    assert_success(&catalog_output);
+    let catalog = parse_stdout_json(&catalog_output);
+    assert_eq!(catalog["cards_written"].as_u64(), Some(0));
+    assert_eq!(catalog["total_sessions"].as_u64(), Some(1));
     assert!(
         !source_root.join(".git").exists(),
-        "store must not initialize git in source roots"
+        "catalog must not initialize git in source roots"
+    );
+    assert!(
+        !home.join(".aicx").join("store").exists(),
+        "catalog rebuild must not recreate the retired card store"
     );
 
     let input_arg = history.display().to_string();
@@ -511,8 +523,28 @@ fn normal_store_and_extract_do_not_initialize_source_git() {
 }
 
 #[test]
-fn store_cli_deduplicates_exact_entries_on_first_run() {
-    let root = unique_test_dir("store-exact-dedup");
+fn retired_store_subcommand_is_rejected() {
+    let root = unique_test_dir("retired-store-command");
+    let home = root.join("home");
+    let output = run_aicx(&home, &["store"]);
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("unrecognized subcommand 'store'"),
+        "retired command should fail at the CLI grammar boundary"
+    );
+    assert!(
+        !home.join(".aicx").join("store").exists(),
+        "rejected command must not recreate the retired card store"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn default_cli_extraction_does_not_grow_store_without_card_mill_flag() {
+    // Dual-body silence: operator binary never writes ~/.aicx/store cards.
+    let root = unique_test_dir("card-mill-silent");
     let home = root.join("home");
     let repo_root = home.join("hosted").join("Vetcoders").join("aicx");
     let history = home
@@ -520,8 +552,8 @@ fn store_cli_deduplicates_exact_entries_on_first_run() {
         .join("sessions")
         .join("2026")
         .join("07")
-        .join("13")
-        .join("rollout-test.jsonl");
+        .join("23")
+        .join("rollout-silent.jsonl");
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system time before unix epoch")
@@ -530,27 +562,32 @@ fn store_cli_deduplicates_exact_entries_on_first_run() {
     fs::create_dir_all(repo_root.join(".git")).expect("create repo root");
     write_codex_history(
         &history,
-        "store-dedup-sess",
+        "silent-mill-sess",
         Some(&repo_root),
         &[
-            ("user", now - 300, "duplicate store context"),
-            ("user", now - 300, "duplicate store context"),
+            ("user", now - 60, "Do not grow the card mill."),
+            ("assistant", now - 50, "Catalog and extracts only."),
         ],
     );
 
-    let output = parse_stdout_json(&run_aicx(
-        &home,
-        &["store", "--agent", "codex", "-H", "24", "--emit", "json"],
-    ));
-    assert_eq!(output["total_entries"].as_u64(), Some(1));
+    let output = run_aicx_card_mill_disabled(&home, &["codex", "-H", "24", "--emit", "json"]);
+    assert_success(&output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Card mill removed") || stderr.contains("Card mill retired"),
+        "operator must see explicit dual-body silence; stderr was:\n{stderr}"
+    );
+    assert!(
+        !home.join(".aicx").join("store").exists(),
+        "default CLI extraction must not create ~/.aicx/store"
+    );
 
-    let store_paths = json_paths(&output, "store_paths");
-    let combined_store = store_paths
-        .iter()
-        .map(|path| fs::read_to_string(path).expect("read store chunk"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert_eq!(combined_store.matches("duplicate store context").count(), 1);
+    let payload = parse_stdout_json(&output);
+    let store_paths = json_paths(&payload, "store_paths");
+    assert!(
+        store_paths.is_empty(),
+        "store_paths must be empty when card mill is disabled, got {store_paths:?}"
+    );
 
     let _ = fs::remove_dir_all(&root);
 }
@@ -609,135 +646,26 @@ fn store_cli_codex_emits_repo_and_non_repo_canonical_roots() {
     );
 
     let output = run_aicx(&home, &["codex", "-H", "24", "--emit", "json"]);
+    assert_success(&output);
     let payload = parse_stdout_json(&output);
     let store_paths = json_paths(&payload, "store_paths");
-    let resolved_repositories = json_strings(&payload, "resolved_repositories");
+    let stderr = String::from_utf8_lossy(&output.stderr);
 
+    // Card mill is deleted: extract may still parse sessions, but it must not
+    // materialize per-frame store paths under ~/.aicx/store.
     assert!(
-        store_paths.len() >= 2,
-        "expected at least 2 store paths (repo + non-repo), got {}",
-        store_paths.len()
+        store_paths.is_empty(),
+        "card mill removed: expected zero store_paths, got {store_paths:?}"
+    );
+    assert!(
+        stderr.contains("Card mill removed") || stderr.contains("Card mill retired"),
+        "operator must see mill-removed messaging; stderr was:\n{stderr}"
+    );
+    assert!(
+        !home.join(".aicx").join("store").exists(),
+        "extraction must not create ~/.aicx/store"
     );
     assert!(payload["requested_source_filters"].is_null());
-    assert_eq!(
-        resolved_repositories,
-        vec!["Vetcoders/ai-contexters".to_string()]
-    );
-    assert_eq!(
-        payload["includes_non_repository_contexts"].as_bool(),
-        Some(true)
-    );
-    assert!(payload["resolved_store_buckets"]["Vetcoders/ai-contexters"].is_object());
-    assert!(payload["resolved_store_buckets"]["non-repository-contexts"].is_object());
-    assert!(store_paths.iter().any(|path| {
-        path.starts_with(
-            home.join(".aicx")
-                .join("store")
-                .join("Vetcoders")
-                .join("ai-contexters"),
-        )
-    }));
-    assert!(
-        store_paths
-            .iter()
-            .any(|path| { path.starts_with(home.join(".aicx").join("non-repository-contexts")) })
-    );
-    assert!(
-        store_paths
-            .iter()
-            .all(|path| !path.to_string_lossy().contains(".codex/history.jsonl"))
-    );
-    assert!(store_paths.iter().all(|path| path.exists()));
-
-    let _ = fs::remove_dir_all(&root);
-}
-
-#[test]
-fn store_cli_store_command_emits_repo_and_non_repo_canonical_roots() {
-    let root = unique_test_dir("store-command");
-    let home = root.join("home");
-    let repo_root = home.join("hosted").join("Vetcoders").join("loctree");
-    let history = home
-        .join(".codex")
-        .join("sessions")
-        .join("2026")
-        .join("07")
-        .join("13")
-        .join("rollout-test.jsonl");
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time before unix epoch")
-        .as_secs() as i64;
-
-    fs::create_dir_all(repo_root.join(".git")).expect("create repo root");
-    write_codex_history(
-        &history,
-        "repo-store-sess",
-        Some(&repo_root),
-        &[
-            (
-                "user",
-                now - 120,
-                "Please inspect the loctree runtime contract.",
-            ),
-            ("assistant", now - 110, "Reviewing canonical emission now."),
-        ],
-    );
-    write_codex_history(
-        &history.with_file_name("rollout-unknown.jsonl"),
-        "unknown-store-sess",
-        None,
-        &[
-            ("user", now - 100, "Planning first, repository unknown."),
-            ("assistant", now - 90, "Still unresolved; keep this honest."),
-        ],
-    );
-
-    let output = run_aicx(
-        &home,
-        &["store", "--agent", "codex", "-H", "24", "--emit", "json"],
-    );
-    let payload = parse_stdout_json(&output);
-    let store_paths = json_paths(&payload, "store_paths");
-    let resolved_repositories = json_strings(&payload, "resolved_repositories");
-
-    assert!(
-        payload["total_entries"].as_u64().unwrap_or(0) >= 4,
-        "expected at least 4 entries"
-    );
-    assert!(
-        payload["total_chunks"].as_u64().unwrap_or(0) >= 2,
-        "expected at least 2 chunks"
-    );
-    assert!(payload["requested_source_filters"].is_null());
-    assert_eq!(resolved_repositories, vec!["Vetcoders/loctree".to_string()]);
-    assert_eq!(
-        payload["includes_non_repository_contexts"].as_bool(),
-        Some(true)
-    );
-    assert!(payload["resolved_store_buckets"]["Vetcoders/loctree"].is_object());
-    assert!(payload["resolved_store_buckets"]["non-repository-contexts"].is_object());
-    assert!(payload["repos"]["Vetcoders/loctree"].is_object());
-    assert!(payload["repos"].get("non-repository-contexts").is_none());
-    assert!(
-        store_paths.len() >= 2,
-        "expected at least 2 store paths, got {}",
-        store_paths.len()
-    );
-    assert!(store_paths.iter().any(|path| {
-        path.starts_with(
-            home.join(".aicx")
-                .join("store")
-                .join("Vetcoders")
-                .join("loctree"),
-        )
-    }));
-    assert!(
-        store_paths
-            .iter()
-            .any(|path| { path.starts_with(home.join(".aicx").join("non-repository-contexts")) })
-    );
-    assert!(store_paths.iter().all(|path| path.exists()));
 
     let _ = fs::remove_dir_all(&root);
 }
@@ -823,9 +751,11 @@ fn migration_cli_rebuilds_and_salvages_realistic_bundle() {
         rebuilt_bundle["action_reason"].as_str(),
         Some("partial_source_recovery")
     );
+    // Card mill is removed from the operator binary: migration may still
+    // salvage legacy files, but it must not re-grow per-frame store cards.
     assert!(
-        !canonical_paths.is_empty(),
-        "expected at least 1 canonical path, got {}",
+        canonical_paths.is_empty(),
+        "card mill removed: expected zero canonical store paths, got {}",
         canonical_paths.len()
     );
     assert!(
@@ -833,25 +763,14 @@ fn migration_cli_rebuilds_and_salvages_realistic_bundle() {
         "expected at least 3 salvage paths, got {}",
         salvage_paths.len()
     );
-    assert!(
-        canonical_paths[0].starts_with(
-            store_root
-                .join("store")
-                .join("Vetcoders")
-                .join("ai-contexters")
-        )
-    );
-    assert!(canonical_paths[0].exists());
     assert!(salvage_paths.iter().all(|path| path.exists()));
-
-    let all_canonical_content: String = canonical_paths
-        .iter()
-        .map(|p| fs::read_to_string(p).expect("read rebuilt canonical chunk"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(all_canonical_content.contains("Please inspect the migration seam."));
-    assert!(all_canonical_content.contains("Reviewing the repo-centric store now."));
-    assert!(!all_canonical_content.contains("input:"));
+    assert!(
+        !store_root.join("store").exists()
+            || fs::read_dir(store_root.join("store"))
+                .map(|entries| entries.count() == 0)
+                .unwrap_or(true),
+        "migration must not re-grow store cards when mill is removed"
+    );
 
     let salvaged_legacy = fs::read_to_string(
         store_root
@@ -1090,196 +1009,6 @@ fn all_cli_force_ignores_watermark_like_full_rescan() {
 }
 
 #[test]
-fn store_cli_defaults_to_incremental_and_full_rescan_recovers_backfill() {
-    let root = unique_test_dir("store-incremental-default");
-    let home = root.join("home");
-    let repo_root = home.join("hosted").join("Vetcoders").join("aicx");
-    let history = home
-        .join(".codex")
-        .join("sessions")
-        .join("2026")
-        .join("07")
-        .join("13")
-        .join("rollout-test.jsonl");
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time before unix epoch")
-        .as_secs() as i64;
-
-    fs::create_dir_all(repo_root.join(".git")).expect("create repo root");
-    write_codex_history(
-        &history,
-        "store-watermark-sess",
-        Some(&repo_root),
-        &[
-            ("user", now - 300, "store old context"),
-            ("assistant", now - 290, "store old reply"),
-        ],
-    );
-
-    let first = parse_stdout_json(&run_aicx(
-        &home,
-        &["store", "--agent", "codex", "-H", "24", "--emit", "json"],
-    ));
-    assert_eq!(first["total_entries"].as_u64(), Some(2));
-
-    append_codex_entry(
-        &history,
-        "store-watermark-sess",
-        Some(&repo_root),
-        "user",
-        now - 120,
-        "store new context",
-    );
-
-    let second = parse_stdout_json(&run_aicx(
-        &home,
-        &["store", "--agent", "codex", "-H", "24", "--emit", "json"],
-    ));
-    assert_eq!(second["total_entries"].as_u64(), Some(1));
-
-    append_codex_entry(
-        &history,
-        "store-watermark-sess",
-        Some(&repo_root),
-        "user",
-        now - 240,
-        "store late backfill",
-    );
-
-    let third = parse_stdout_json(&run_aicx(
-        &home,
-        &["store", "--agent", "codex", "-H", "24", "--emit", "json"],
-    ));
-    assert_eq!(third["total_entries"].as_u64(), Some(0));
-
-    let fourth = parse_stdout_json(&run_aicx(
-        &home,
-        &[
-            "store",
-            "--agent",
-            "codex",
-            "-H",
-            "24",
-            "--full-rescan",
-            "--emit",
-            "json",
-        ],
-    ));
-    assert_eq!(fourth["total_entries"].as_u64(), Some(4));
-
-    let store_paths = json_paths(&fourth, "store_paths");
-    let combined_store = store_paths
-        .iter()
-        .map(|path| fs::read_to_string(path).expect("read store chunk"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(combined_store.contains("store late backfill"));
-
-    let state = read_state(&home);
-    let expected_watermark = chrono::DateTime::<chrono::Utc>::from_timestamp(now - 120, 0)
-        .expect("valid timestamp")
-        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-    assert_eq!(
-        state["last_processed"]["codex:all"].as_str(),
-        Some(expected_watermark.as_str())
-    );
-
-    let _ = fs::remove_dir_all(&root);
-}
-
-#[test]
-fn store_cli_hours_zero_means_all_time() {
-    let root = unique_test_dir("store-hours-zero");
-    let home = root.join("home");
-    let repo_root = home.join("hosted").join("Vetcoders").join("aicx");
-    let history = home
-        .join(".codex")
-        .join("sessions")
-        .join("2026")
-        .join("07")
-        .join("13")
-        .join("rollout-test.jsonl");
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time before unix epoch")
-        .as_secs() as i64;
-
-    fs::create_dir_all(repo_root.join(".git")).expect("create repo root");
-    write_codex_history(
-        &history,
-        "store-all-time-sess",
-        Some(&repo_root),
-        &[(
-            "user",
-            now - (90 * 24 * 3600),
-            "store ancient context should still land with hours zero",
-        )],
-    );
-
-    let windowed = parse_stdout_json(&run_aicx(
-        &home,
-        &["store", "--agent", "codex", "-H", "48", "--emit", "json"],
-    ));
-    assert_eq!(windowed["total_entries"].as_u64(), Some(0));
-
-    let all_time = parse_stdout_json(&run_aicx(
-        &home,
-        &[
-            "store",
-            "--agent",
-            "codex",
-            "-H",
-            "0",
-            "--full-rescan",
-            "--emit",
-            "json",
-        ],
-    ));
-    assert_eq!(all_time["total_entries"].as_u64(), Some(1));
-
-    let store_paths = json_paths(&all_time, "store_paths");
-    let combined_store = store_paths
-        .iter()
-        .map(|path| fs::read_to_string(path).expect("read store chunk"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(combined_store.contains("store ancient context should still land with hours zero"));
-
-    let _ = fs::remove_dir_all(&root);
-}
-
-#[test]
-fn test_run_store_saves_state_on_empty_result() {
-    let root = unique_test_dir("store-empty-save");
-    let home = root.join("home");
-    let history = home
-        .join(".codex")
-        .join("sessions")
-        .join("2026")
-        .join("07")
-        .join("13")
-        .join("rollout-test.jsonl");
-    write_codex_history(&history, "empty-sess", None, &[]);
-
-    let output = parse_stdout_json(&run_aicx(
-        &home,
-        &["store", "--agent", "codex", "-H", "24", "--emit", "json"],
-    ));
-    assert_eq!(output["total_entries"].as_u64(), Some(0));
-
-    let state = read_state(&home);
-    let runs = state["runs"].as_array().expect("runs array in state.json");
-    assert_eq!(
-        runs.len(),
-        1,
-        "state should save run history even when no entries were extracted via store"
-    );
-
-    let _ = fs::remove_dir_all(&root);
-}
-
-#[test]
 fn test_run_extraction_saves_state_on_empty_result() {
     let root = unique_test_dir("extract-empty-save");
     let home = root.join("home");
@@ -1332,28 +1061,18 @@ fn session_batch_quarantines_bad_claude_source_and_holds_watermark() {
     assert!(stderr.contains("session_id=22222222-2222-4222-8222-222222222222"));
     assert!(stderr.contains("recover: aicx extract claude --file"));
     assert!(stderr.contains("Watermark held: 1 skipped session(s)"));
-    assert!(stderr.contains("Canonical projection:"));
-
-    let projection_dir = home
-        .join(".aicx")
-        .join("store")
-        .join("canonical-projection-v1");
-    let manifest: Value = serde_json::from_str(
-        &fs::read_to_string(projection_dir.join("manifest.json"))
-            .expect("canonical projection manifest"),
-    )
-    .expect("valid canonical projection manifest");
-    let card_ids = manifest["card_ids"].as_array().expect("manifest card ids");
-    assert_eq!(card_ids.len(), 1, "only the healthy session may project");
-    let card_name = format!(
-        "{}.json",
-        card_ids[0].as_str().expect("card id").replace(':', "_")
+    assert!(
+        !stderr.contains("Canonical projection:"),
+        "CLI must not write or advertise the retired canonical projection mill\nstderr:\n{stderr}"
     );
-    let card: Value = serde_json::from_str(
-        &fs::read_to_string(projection_dir.join("cards").join(card_name)).expect("canonical card"),
-    )
-    .expect("valid canonical card");
-    assert_eq!(card["session_id"].as_str(), Some("healthy-session"));
+    assert!(
+        !home
+            .join(".aicx")
+            .join("store")
+            .join("canonical-projection-v1")
+            .exists(),
+        "healthy batch must not re-grow canonical-projection-v1 after extracts-store cut"
+    );
 
     let state = read_state(&home);
     assert_eq!(
@@ -1380,6 +1099,122 @@ fn session_batch_quarantines_bad_claude_source_and_holds_watermark() {
 }
 
 #[test]
+fn session_batch_drops_duplicate_physical_source_and_counts_it() {
+    let root = unique_test_dir("claude-batch-duplicate-source");
+    let home = root.join("home");
+    let sessions = home.join(".claude").join("projects").join("project");
+    let fresh = sessions.join("33333333-3333-4333-8333-333333333333.jsonl");
+    let stale = sessions.join("44444444-4444-4444-8444-444444444444.jsonl");
+    // Same logical session discovered through two physical paths (e.g. a live
+    // rollout plus an archived copy). Different bodies on purpose: without the
+    // per-batch guard BOTH would project and the manifest would carry two card
+    // sets for one session (the pre-fix run died on `duplicate canonical card
+    // id` for identical copies and silently doubled for diverged ones).
+    write_claude_session_fixture(&fresh, Some("twin-session"), "fresh prompt");
+    write_claude_session_fixture(&stale, Some("twin-session"), "stale prompt");
+    filetime::set_file_mtime(
+        &stale,
+        filetime::FileTime::from_system_time(
+            SystemTime::now() - std::time::Duration::from_secs(3600),
+        ),
+    )
+    .expect("age the stale duplicate");
+
+    let output = run_aicx(&home, &["claude", "-H", "24", "--emit", "json"]);
+    assert_success(&output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(
+            "session ingest summary: ingested=1 skipped=0 filtered_out=0 duplicate_sources=1"
+        ),
+        "duplicate physical source must be dropped and counted, not skipped\nstderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("Watermark held"),
+        "a dropped duplicate must not hold the watermark\nstderr:\n{stderr}"
+    );
+    assert!(
+        !home
+            .join(".aicx")
+            .join("store")
+            .join("canonical-projection-v1")
+            .exists(),
+        "duplicate guard must not re-grow the retired projection mill"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+// Focused coverage for the W0-02 conflict resolution of 6049e664: the
+// duplicate-source guard composes with the `-p` discovery filter. Order is
+// project filter first (filtered copies never reach the guard), then the
+// duplicate check; a dropped duplicate still counts as selected, never as
+// filtered_out or skipped.
+#[test]
+fn session_batch_project_filter_composes_with_duplicate_guard() {
+    let root = unique_test_dir("claude-batch-filter-plus-duplicate");
+    let home = root.join("home");
+    let projects = home.join(".claude").join("projects");
+    let fresh = projects
+        .join("-repo-alpha")
+        .join("77777777-7777-4777-8777-777777777777.jsonl");
+    let stale = projects
+        .join("-repo-alpha")
+        .join("88888888-8888-4888-8888-888888888888.jsonl");
+    let beta = projects
+        .join("-repo-beta")
+        .join("99999999-9999-4999-8999-999999999999.jsonl");
+    write_claude_session_fixture_with_cwd(
+        &fresh,
+        Some("twin-session"),
+        "/repo/alpha",
+        "fresh prompt inside the filtered project",
+    );
+    write_claude_session_fixture_with_cwd(
+        &stale,
+        Some("twin-session"),
+        "/repo/alpha",
+        "stale prompt inside the filtered project",
+    );
+    filetime::set_file_mtime(
+        &stale,
+        filetime::FileTime::from_system_time(
+            SystemTime::now() - std::time::Duration::from_secs(3600),
+        ),
+    )
+    .expect("age the stale duplicate");
+    write_claude_session_fixture_with_cwd(
+        &beta,
+        Some("beta-session"),
+        "/repo/beta",
+        "beta prompt outside the filtered project",
+    );
+
+    let output = run_aicx(
+        &home,
+        &["claude", "-H", "24", "-p", "alpha", "--emit", "json"],
+    );
+    assert_success(&output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(
+            "session ingest summary: ingested=1 skipped=0 filtered_out=1 duplicate_sources=1"
+        ),
+        "filter and duplicate guard must count independently\nstderr:\n{stderr}"
+    );
+    assert!(
+        !home
+            .join(".aicx")
+            .join("store")
+            .join("canonical-projection-v1")
+            .exists(),
+        "filtered batch must not write retired canonical-projection-v1"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
 fn session_batch_returns_exit_three_when_every_session_is_quarantined() {
     let root = unique_test_dir("claude-batch-all-skipped");
     let home = root.join("home");
@@ -1395,6 +1230,615 @@ fn session_batch_returns_exit_three_when_every_session_is_quarantined() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("session ingest summary: ingested=0 skipped=1"));
     assert!(stderr.contains("all 1 selected session(s) were skipped"));
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn conversations_batch_all_skipped_exits_three_like_other_batches() {
+    // O4 (transplant P3-01): three divergent all-skipped paths — the
+    // conversations batch used a generic bail (exit 1) while extraction
+    // and store batches exit 3. One contract: all-skipped → exit 3.
+    let root = unique_test_dir("conversations-all-skipped");
+    let home = root.join("home");
+    let out_dir = root.join("out");
+    let invalid = home
+        .join(".claude")
+        .join("projects")
+        .join("project")
+        .join("77777777-7777-4777-8777-777777777777.jsonl");
+    write_claude_session_fixture(&invalid, None, "identity-free prompt");
+
+    let output = run_aicx(
+        &home,
+        &[
+            "conversations",
+            "-H",
+            "24",
+            "--out-dir",
+            out_dir.to_str().expect("utf-8 out dir"),
+        ],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "all-skipped conversations batch must exit 3\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("all 1 selected session(s) were skipped"));
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn conversations_batch_empty_window_exits_zero() {
+    // Empty discovery window is an empty result, not a failure.
+    let root = unique_test_dir("conversations-empty-window");
+    let home = root.join("home");
+    let out_dir = root.join("out");
+
+    let output = run_aicx(
+        &home,
+        &[
+            "conversations",
+            "-H",
+            "24",
+            "--out-dir",
+            out_dir.to_str().expect("utf-8 out dir"),
+        ],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "empty window must exit 0\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn project_filter_narrows_batch_discovery() {
+    // O1 (`~/.aicx/aicx-problems.md` 2026-07-17 15:12 UTC): `aicx claude -p X`
+    // promises "narrows session discovery before repo segmentation", but batch
+    // discovery ignored the filter and ingested every session in the window.
+    let root = unique_test_dir("claude-batch-project-filter");
+    let home = root.join("home");
+    let alpha = home
+        .join(".claude")
+        .join("projects")
+        .join("-repo-alpha")
+        .join("44444444-4444-4444-8444-444444444444.jsonl");
+    let beta = home
+        .join(".claude")
+        .join("projects")
+        .join("-repo-beta")
+        .join("55555555-5555-4555-8555-555555555555.jsonl");
+    write_claude_session_fixture_with_cwd(
+        &alpha,
+        Some("alpha-session"),
+        "/repo/alpha",
+        "alpha prompt inside the filtered project",
+    );
+    write_claude_session_fixture_with_cwd(
+        &beta,
+        Some("beta-session"),
+        "/repo/beta",
+        "beta prompt outside the filtered project",
+    );
+
+    let output = run_aicx(
+        &home,
+        &["claude", "-H", "24", "-p", "alpha", "--emit", "json"],
+    );
+    assert_success(&output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("session ingest summary: ingested=1 skipped=0 filtered_out=1"),
+        "batch summary must expose the filtered_out counter\nstderr:\n{stderr}"
+    );
+    assert!(
+        !home
+            .join(".aicx")
+            .join("store")
+            .join("canonical-projection-v1")
+            .exists(),
+        "project filter path must not re-grow retired canonical-projection-v1"
+    );
+
+    // Sessions cut by the filter are neither ingested nor skipped: residual
+    // store files (if any legacy writers remain) must not carry beta content.
+    let mut stack = vec![home.join(".aicx").join("store")];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if let Ok(content) = fs::read_to_string(&path) {
+                assert!(
+                    !content.contains("beta prompt outside the filtered project"),
+                    "filtered-out session leaked into store file {}",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn project_filter_cutting_everything_is_not_all_skipped() {
+    // A `-p` filter that excludes every discovered session is an empty result,
+    // not a failure: exit 0, filtered_out counted, nothing skipped.
+    let root = unique_test_dir("claude-batch-filter-all-out");
+    let home = root.join("home");
+    let beta = home
+        .join(".claude")
+        .join("projects")
+        .join("-repo-beta")
+        .join("66666666-6666-4666-8666-666666666666.jsonl");
+    write_claude_session_fixture_with_cwd(
+        &beta,
+        Some("beta-session"),
+        "/repo/beta",
+        "beta prompt outside the filtered project",
+    );
+
+    let output = run_aicx(&home, &["claude", "-H", "24", "-p", "alpha"]);
+    assert_success(&output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("session ingest summary: ingested=0 skipped=0 filtered_out=1"),
+        "all-filtered batch must not be reported as all-skipped\nstderr:\n{stderr}"
+    );
+    assert!(!stderr.contains("selected session(s) were skipped"));
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn test_identity_migration_via_doctor_cli() {
+    let root = unique_test_dir("identity-migration-cli");
+    let home = root.join("home");
+    let aicx_dir = home.join(".aicx");
+    let store_dir = aicx_dir.join("store");
+
+    // 1. Seed store and index cased
+    fs::create_dir_all(store_dir.join("VetCoders/CodeScribe/2026_0717/context/claude")).unwrap();
+    fs::write(
+        store_dir.join("VetCoders/CodeScribe/2026_0717/context/claude/chunk1.md"),
+        "chunk contents",
+    )
+    .unwrap();
+
+    let index_data = json!({
+        "schema_version": 1,
+        "last_updated": chrono::Utc::now().to_rfc3339(),
+        "projects": {
+            "VetCoders/CodeScribe": {
+                "agents": {
+                    "claude": {
+                        "dates": ["2026-07-17"],
+                        "total_entries": 42,
+                        "last_updated": chrono::Utc::now().to_rfc3339()
+                    }
+                }
+            }
+        }
+    });
+    write_file(&aicx_dir.join("index.json"), &index_data.to_string());
+
+    // 2. Run dry-run doctor --migrate-identities
+    let output = run_aicx(&home, &["doctor", "--migrate-identities"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("[dry-run] identity migration:"));
+
+    // Verify manifest was written and is in dry-run mode
+    let manifest_path = aicx_dir.join("migration/identity-manifest.json");
+    assert!(manifest_path.is_file());
+    let manifest_content = fs::read_to_string(&manifest_path).unwrap();
+    assert!(manifest_content.contains("\"mode\": \"dry-run\""));
+
+    // 3. Modify a file to trigger precondition mismatch
+    fs::write(
+        store_dir.join("VetCoders/CodeScribe/2026_0717/context/claude/chunk1.md"),
+        "modified chunk contents to trigger mismatch",
+    )
+    .unwrap();
+
+    // 4. Try to apply, should fail due to changed precondition (source hash check failed)
+    let output_apply_fail = run_aicx(&home, &["doctor", "--migrate-identities", "--apply"]);
+    assert!(!output_apply_fail.status.success());
+    let stdout_apply_fail = String::from_utf8_lossy(&output_apply_fail.stdout);
+    assert!(
+        stdout_apply_fail.contains("identity migration skipped:")
+            || stdout_apply_fail.contains("Precondition failed:")
+    );
+
+    // Let's verify manifest is now in apply-failed mode
+    let manifest_content_failed = fs::read_to_string(&manifest_path).unwrap();
+    assert!(manifest_content_failed.contains("\"mode\": \"apply-failed\""));
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ReconciliationFixture {
+    schema: String,
+    projects: Vec<ReconciliationFixtureProject>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ReconciliationFixtureProject {
+    identity: String,
+    session_id: String,
+    relative: String,
+    body: String,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+struct ReconciliationInventory {
+    file_count: usize,
+    bytes: u64,
+    logical_sessions: usize,
+    identities: Vec<String>,
+    resolvable_physical_duplicates: usize,
+    unresolved_conflicts: Vec<String>,
+}
+
+fn load_store_reconciliation_fixture() -> ReconciliationFixture {
+    serde_json::from_str(include_str!(
+        "fixtures/store_reconciliation/synthetic_store.json"
+    ))
+    .expect("valid synthetic store-reconciliation fixture")
+}
+
+fn seed_store_reconciliation_fixture(base: &Path, fixture: &ReconciliationFixture) {
+    assert_eq!(fixture.schema, "aicx.test.store_reconciliation.v1");
+    let mut projects = serde_json::Map::new();
+    for item in &fixture.projects {
+        let payload = json!({
+            "project": item.identity,
+            "session_id": item.session_id,
+            "body": item.body,
+        });
+        write_file(
+            &base.join("store").join(&item.identity).join(&item.relative),
+            &payload.to_string(),
+        );
+        projects.insert(
+            item.identity.clone(),
+            json!({
+                "agents": {
+                    "claude": {
+                        "dates": ["2026-07-20"],
+                        "total_entries": 1,
+                        "last_updated": "2026-07-20T00:00:00Z"
+                    }
+                }
+            }),
+        );
+    }
+    write_file(
+        &base.join("index.json"),
+        &json!({
+            "projects": projects,
+            "last_updated": "2026-07-20T00:00:00Z"
+        })
+        .to_string(),
+    );
+}
+
+fn reconciliation_inventory(base: &Path) -> ReconciliationInventory {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let mut payloads = Vec::new();
+    for root in [base.join("store"), base.join("quarantine")] {
+        let mut pending = vec![root];
+        while let Some(dir) = pending.pop() {
+            let Ok(entries) = fs::read_dir(dir) else {
+                continue;
+            };
+            for entry in entries.filter_map(Result::ok) {
+                let path = entry.path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else if path.extension().and_then(|value| value.to_str()) == Some("payload") {
+                    payloads.push(path);
+                }
+            }
+        }
+    }
+    payloads.sort();
+
+    let mut bytes = 0_u64;
+    let mut identities = BTreeSet::new();
+    let mut sessions: BTreeMap<String, Vec<Vec<u8>>> = BTreeMap::new();
+    for path in &payloads {
+        let raw = fs::read(path).expect("read synthetic payload");
+        bytes += raw.len() as u64;
+        let value: Value = serde_json::from_slice(&raw).expect("parse synthetic payload");
+        identities.insert(
+            value["project"]
+                .as_str()
+                .expect("project string")
+                .to_owned(),
+        );
+        sessions
+            .entry(
+                value["session_id"]
+                    .as_str()
+                    .expect("session id string")
+                    .to_owned(),
+            )
+            .or_default()
+            .push(raw);
+    }
+
+    let mut resolvable_physical_duplicates = 0;
+    let mut unresolved_conflicts = Vec::new();
+    for (session, copies) in &sessions {
+        if copies.len() < 2 {
+            continue;
+        }
+        let unique = copies.iter().collect::<BTreeSet<_>>();
+        if unique.len() == 1 {
+            resolvable_physical_duplicates += copies.len() - 1;
+        } else {
+            unresolved_conflicts.push(session.clone());
+        }
+    }
+
+    ReconciliationInventory {
+        file_count: payloads.len(),
+        bytes,
+        logical_sessions: sessions.len(),
+        identities: identities.into_iter().collect(),
+        resolvable_physical_duplicates,
+        unresolved_conflicts,
+    }
+}
+
+fn recursive_store_digest(store: &Path) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut files = Vec::new();
+    let mut pending = vec![store.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let Ok(entries) = fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path);
+            } else {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    let mut digest = Sha256::new();
+    for path in files {
+        digest.update(
+            path.strip_prefix(store)
+                .expect("store-relative path")
+                .to_string_lossy()
+                .as_bytes(),
+        );
+        digest.update(fs::read(path).expect("read store file"));
+    }
+    format!("{:x}", digest.finalize())
+}
+
+fn rollback_store_reconciliation_from_manifest(base: &Path) {
+    let manifest_path = base.join("migration/identity-manifest.json");
+    let manifest: Value = serde_json::from_str(
+        &fs::read_to_string(&manifest_path).expect("read identity manifest for rollback"),
+    )
+    .expect("parse identity manifest for rollback");
+    for step in manifest["steps"]
+        .as_array()
+        .expect("migration steps")
+        .iter()
+        .rev()
+    {
+        let operation = step["operation"].as_str().expect("operation");
+        let source = step["source_identity"].as_str().expect("source identity");
+        let target = step["target_identity"].as_str().expect("target identity");
+        match operation {
+            "rename_dir" | "quarantine_deprecated" => {
+                let current = if target.starts_with("quarantine/") {
+                    base.join(target)
+                } else {
+                    base.join("store").join(target)
+                };
+                let original = base.join("store").join(source);
+                if current.exists() {
+                    if let Some(parent) = original.parent() {
+                        fs::create_dir_all(parent).expect("create rollback parent");
+                    }
+                    let temporary = original.with_file_name(format!(
+                        ".store-reconciliation-rollback-{}",
+                        original.file_name().expect("source name").to_string_lossy()
+                    ));
+                    fs::rename(&current, &temporary).expect("rename rollback temporary");
+                    fs::rename(temporary, original).expect("restore original directory");
+                }
+            }
+            "rename_index_key" => {
+                let mut index: Value = serde_json::from_str(
+                    &fs::read_to_string(base.join("index.json")).expect("read applied index"),
+                )
+                .expect("parse applied index");
+                let projects = index["projects"].as_object_mut().expect("index projects");
+                projects.remove(target);
+                let recovery: Value = serde_json::from_str(
+                    step["recovery_reference"]
+                        .as_str()
+                        .expect("index recovery reference"),
+                )
+                .expect("parse index recovery reference");
+                projects.insert(source.to_owned(), recovery);
+                write_file(&base.join("index.json"), &index.to_string());
+            }
+            "annotate_card" => {}
+            other => panic!("unexpected migration operation {other}"),
+        }
+    }
+}
+
+#[test]
+fn store_reconciliation_preserves_logical_truth_across_lifecycle() {
+    let root = unique_test_dir("store-reconciliation-lifecycle");
+    let home = root.join("home");
+    let base = home.join(".aicx");
+    let fixture = load_store_reconciliation_fixture();
+    seed_store_reconciliation_fixture(&base, &fixture);
+
+    let before = reconciliation_inventory(&base);
+    write_file(
+        &base.join("reconciliation-before.json"),
+        &serde_json::to_string_pretty(&before).expect("serialize before manifest"),
+    );
+    assert_eq!(before.file_count, fixture.projects.len());
+    assert_eq!(before.logical_sessions, fixture.projects.len() - 1);
+    assert_eq!(before.resolvable_physical_duplicates, 0);
+    assert_eq!(before.unresolved_conflicts, ["session-divergent"]);
+
+    let source_hash = recursive_store_digest(&base.join("store"));
+    let dry_run = run_aicx(&home, &["doctor", "--migrate-identities"]);
+    assert!(
+        String::from_utf8_lossy(&dry_run.stdout).contains("[dry-run] identity migration:"),
+        "doctor may remain non-zero for unrelated health findings, but migration preview must run"
+    );
+    let manifest_path = base.join("migration/identity-manifest.json");
+    let dry_manifest: Value = serde_json::from_str(
+        &fs::read_to_string(&manifest_path).expect("read dry-run identity manifest"),
+    )
+    .expect("parse dry-run identity manifest");
+    assert_eq!(dry_manifest["mode"], "dry-run");
+    assert_eq!(
+        recursive_store_digest(&base.join("store")),
+        source_hash,
+        "recursive source hash proves dry-run purity"
+    );
+
+    let applied = run_aicx(&home, &["doctor", "--migrate-identities", "--apply"]);
+    assert!(
+        String::from_utf8_lossy(&applied.stdout).contains("identity migration:"),
+        "doctor may remain non-zero for unrelated health findings, but migration apply must run"
+    );
+    let applied_manifest: Value = serde_json::from_str(
+        &fs::read_to_string(&manifest_path).expect("read applied identity manifest"),
+    )
+    .expect("parse applied identity manifest");
+    assert_eq!(applied_manifest["mode"], "apply");
+    assert!(base.join("store/loctree/aicx").is_dir());
+    assert!(
+        base.join("store/aicx").is_dir(),
+        "ownerless bucket retained"
+    );
+    assert!(
+        base.join("store/_aicx").is_dir(),
+        "internal bucket retained"
+    );
+    assert!(
+        applied_manifest["steps"]
+            .as_array()
+            .expect("applied steps")
+            .iter()
+            .any(|step| step["operation"] == "quarantine_deprecated" && step["result"] == "success"),
+        "deprecated checkout must have a named quarantine recovery reference"
+    );
+
+    let after = reconciliation_inventory(&base);
+    write_file(
+        &base.join("reconciliation-after.json"),
+        &serde_json::to_string_pretty(&after).expect("serialize after manifest"),
+    );
+    assert_eq!(after.file_count, before.file_count);
+    assert_eq!(after.bytes, before.bytes);
+    assert_eq!(after.logical_sessions, before.logical_sessions);
+    assert_eq!(after.resolvable_physical_duplicates, 0);
+    assert_eq!(after.unresolved_conflicts, ["session-divergent"]);
+    assert!(
+        after
+            .identities
+            .iter()
+            .any(|identity| identity == "Loctree/AICX"),
+        "payload provenance remains immutable while its physical bucket is canonicalized"
+    );
+
+    rollback_store_reconciliation_from_manifest(&base);
+    assert!(base.join("store/Loctree/AICX").is_dir());
+    let rolled_back = reconciliation_inventory(&base);
+    assert_eq!(
+        rolled_back, before,
+        "rollback restores every input byte and identity"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn store_reconciliation_resumes_after_each_completed_durable_prefix() {
+    let root = unique_test_dir("store-reconciliation-resume");
+    let home = root.join("home");
+    let base = home.join(".aicx");
+    let fixture = load_store_reconciliation_fixture();
+    seed_store_reconciliation_fixture(&base, &fixture);
+    let before = reconciliation_inventory(&base);
+
+    let planned = run_aicx(&home, &["doctor", "--migrate-identities"]);
+    assert!(String::from_utf8_lossy(&planned.stdout).contains("[dry-run] identity migration:"));
+    let manifest_path = base.join("migration/identity-manifest.json");
+    let original_index = fs::read_to_string(base.join("index.json")).expect("read fixture index");
+    let mut index: Value = serde_json::from_str(&original_index).expect("parse fixture index");
+    index["projects"]["Loctree/AICX"]["agents"]["claude"]["total_entries"] = json!(99);
+    write_file(&base.join("index.json"), &index.to_string());
+
+    let interrupted = run_aicx(&home, &["doctor", "--migrate-identities", "--apply"]);
+    assert!(
+        String::from_utf8_lossy(&interrupted.stdout).contains("identity migration skipped:"),
+        "changed later phase must interrupt apply: {}",
+        String::from_utf8_lossy(&interrupted.stdout)
+    );
+    let persisted: Value = serde_json::from_str(
+        &fs::read_to_string(manifest_path).expect("read interrupted manifest"),
+    )
+    .expect("parse interrupted manifest");
+    let steps = persisted["steps"].as_array().expect("persisted steps");
+    assert!(
+        steps.iter().any(|step| step["result"] == "success"),
+        "every completed durable prefix is persisted before interruption"
+    );
+    assert!(
+        steps.iter().any(|step| step["result"]
+            .as_str()
+            .is_some_and(|value| value.starts_with("failed:"))),
+        "the interrupted phase is explicit, never silently skipped"
+    );
+
+    write_file(&base.join("index.json"), &original_index);
+    let resumed = run_aicx(&home, &["doctor", "--migrate-identities", "--apply"]);
+    assert!(String::from_utf8_lossy(&resumed.stdout).contains("identity migration:"));
+    let resumed_manifest: Value = serde_json::from_str(
+        &fs::read_to_string(base.join("migration/identity-manifest.json"))
+            .expect("read resumed manifest"),
+    )
+    .expect("parse resumed manifest");
+    assert_eq!(resumed_manifest["mode"], "apply");
+    let after = reconciliation_inventory(&base);
+    assert_eq!(after.file_count, before.file_count);
+    assert_eq!(after.bytes, before.bytes);
+    assert_eq!(after.logical_sessions, before.logical_sessions);
+    assert_eq!(after.unresolved_conflicts, ["session-divergent"]);
 
     let _ = fs::remove_dir_all(&root);
 }
