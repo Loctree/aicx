@@ -18,11 +18,11 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-#[path = "store/atomic_write.rs"]
+#[path = "legacy_archive/atomic_write.rs"]
 pub(crate) mod atomic_write;
 use atomic_write::atomic_write;
 
-#[path = "store/canonical_projection.rs"]
+#[path = "legacy_archive/canonical_projection.rs"]
 pub mod canonical_projection;
 // Write path deleted (extracts-store). Read/inspect remain for residual
 // corpus doctor quarantine and transitional overlay consumers.
@@ -106,11 +106,11 @@ fn chunk_sequence_from_id(id: &str) -> Option<u32> {
 // Path helpers
 // ============================================================================
 
-#[path = "store/dedupe.rs"]
+#[path = "legacy_archive/dedupe.rs"]
 pub(crate) mod dedupe;
-#[path = "store/ignore.rs"]
+#[path = "legacy_archive/ignore.rs"]
 pub(crate) mod ignore;
-#[path = "store/paths.rs"]
+#[path = "legacy_archive/paths.rs"]
 pub(crate) mod paths;
 #[path = "store/sidecar.rs"]
 pub(crate) mod sidecar;
