@@ -2728,7 +2728,7 @@ fn migrate_accepts_custom_roots() {
         "--no-intent-schema",
         "--legacy-root",
         "/tmp/legacy",
-        "--store-root",
+        "--aicx-home",
         "/tmp/aicx",
     ])
     .expect("migrate command with explicit roots should parse");
@@ -2751,6 +2751,14 @@ fn migrate_accepts_custom_roots() {
         }
         _ => panic!("expected migrate command"),
     }
+}
+
+#[test]
+fn migrate_rejects_removed_store_root_flag() {
+    assert!(
+        Cli::try_parse_from(["aicx", "migrate", "--store-root", "/tmp/aicx"]).is_err(),
+        "the removed store concept must not survive as a public flag"
+    );
 }
 
 #[test]

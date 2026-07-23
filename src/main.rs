@@ -115,9 +115,9 @@ struct RedactionArgs {
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum StdoutEmit {
-    /// Print store chunk paths (one per line).
+    /// Print legacy archive chunk paths (one per line).
     Paths,
-    /// Print JSON report (includes `store_paths` for convenience).
+    /// Print JSON report (includes the compatibility `store_paths` field).
     Json,
     /// Print nothing to stdout.
     None,
@@ -186,7 +186,7 @@ impl ExtractAgent {
         }
     }
 
-    /// Session-store root scanned by the catalog locator for `--session`.
+    /// Agent source root scanned by the catalog locator for `--session`.
     fn session_root(self, home: &Path) -> PathBuf {
         match self {
             Self::Codex => home.join(".codex").join("sessions"),
@@ -556,8 +556,8 @@ struct DashboardArgs {
     #[arg(long)]
     generate_html: bool,
 
-    /// Store root directory (default: ~/.aicx)
-    #[arg(long)]
+    /// AICX home directory (default: ~/.aicx)
+    #[arg(long = "aicx-home", value_name = "PATH")]
     store_root: Option<PathBuf>,
 
     /// Exact project scope. A bare repository name must resolve uniquely.
@@ -743,8 +743,8 @@ enum CorpusCommand {
 
 #[derive(Debug, Clone, Args)]
 struct DashboardServeLegacyArgs {
-    /// Store root directory (default: ~/.aicx)
-    #[arg(long)]
+    /// AICX home directory (default: ~/.aicx)
+    #[arg(long = "aicx-home", value_name = "PATH")]
     store_root: Option<PathBuf>,
 
     /// Bind host IP address (loopback only; example: 127.0.0.1)
@@ -1150,7 +1150,7 @@ enum Commands {
         input: Option<PathBuf>,
     },
 
-    /// Batch-export conversation JSON files without writing card-mill files.
+    /// Batch-export conversation JSON files without writing per-frame card files.
     ///
     /// Thin wrapper around `aicx extract --conversation` semantics: scans source
     /// sessions, groups by session_id, and writes one JSON file per session.
@@ -1383,7 +1383,7 @@ enum Commands {
 
     /// Extract structured intents from the canonical corpus.
     Intents {
-        /// Repo or store-bucket filters. Omit to scan all projects.
+        /// Catalog project filters. Omit to scan all projects.
         /// Repeated `-p` flags or comma list (`-p a,b`) form a union.
         #[arg(short, long, value_delimiter = ',')]
         project: Vec<String>,
@@ -1432,7 +1432,7 @@ enum Commands {
 
     /// Print recent intents/chunks (snapshot mode); add --follow to stream new arrivals.
     Tail {
-        /// Repo or store-bucket filters. Omit to scan all projects.
+        /// Catalog project filters. Omit to scan all projects.
         /// Repeated `-p` flags or comma list (`-p a,b`) form a union.
         #[arg(short, long, value_delimiter = ',')]
         project: Vec<String>,
@@ -1692,13 +1692,13 @@ enum Commands {
         action: cli_config::ConfigAction,
     },
 
-    /// Read one canonical chunk by path, file name, or `chunk:<id>` reference.
+    /// Read one legacy archive chunk by path, file name, or `chunk:<id>` reference.
     ///
     /// This closes the discover -> read loop: pass a path from `aicx search`,
     /// `aicx refs --emit paths`, dashboard `/api/chunk`, or MCP search results.
     #[command(display_order = 14, visible_alias = "open")]
     Read {
-        /// Absolute path, store-relative path, file name, legacy compact ref, or `chunk:<id>`
+        /// Absolute path, archive-relative path, file name, legacy compact ref, or `chunk:<id>`
         reference: String,
 
         /// Truncate chunk content to this many UTF-8 characters
@@ -1724,7 +1724,7 @@ enum Commands {
         #[arg(short, long)]
         kind: Option<String>,
 
-        /// Repo or store-bucket filters. Omit to search all projects.
+        /// Catalog project filters. Omit to search all projects.
         /// Repeated `-p` flags or comma list (`-p a,b`) form a union.
         #[arg(short, long, value_delimiter = ',')]
         project: Vec<String>,
@@ -1742,25 +1742,25 @@ enum Commands {
         filters: RetrievalFilters,
     },
 
-    /// Migrate legacy ~/.ai-contexters/ data into the canonical AICX store.
+    /// Migrate legacy ~/.ai-contexters/ artifacts into the AICX legacy archive.
     Migrate {
         /// Dry run: show what would be moved without modifying files
         #[arg(long)]
         dry_run: bool,
 
-        /// Override legacy input store root (default: ~/.ai-contexters)
+        /// Override legacy input archive root (default: ~/.ai-contexters)
         #[arg(long)]
         legacy_root: Option<PathBuf>,
 
-        /// Override AICX store root (default: ~/.aicx)
-        #[arg(long)]
+        /// Override AICX home (default: ~/.aicx)
+        #[arg(long = "aicx-home", value_name = "PATH")]
         store_root: Option<PathBuf>,
 
         /// Skip post-migration intent schema scan on the legacy archive
         #[arg(long, default_value_t = false)]
         no_intent_schema: bool,
 
-        /// Upgrade store cards v1 -> v2 in place (sidecar schema/honesty
+        /// Upgrade legacy archive cards v1 -> v2 in place (sidecar schema/honesty
         /// fields, bracket header -> YAML frontmatter; body bytes never
         /// change). Optional ROOT overrides the walked directory (default:
         /// legacy archive dir). Dry-run by default; pass --apply to write.
@@ -1772,18 +1772,18 @@ enum Commands {
         apply: bool,
     },
 
-    /// Classify stored chunks into 11-type intent entries and report counts.
+    /// Classify legacy archive chunks into 11-type intent entries and report counts.
     #[command(name = "migrate-intent-schema")]
     MigrateIntentSchema {
         /// Strict project filter: `owner/repo`, `/repo` (cross-org repo
         /// name), `owner/` (org wildcard), or a unique exact `name`.
-        /// Omit to scan the whole store. Substring matching is
+        /// Omit to scan the whole legacy archive. Substring matching is
         /// intentionally disabled.
         #[arg(short, long)]
         project: Option<String>,
 
-        /// Override AICX store root (default: ~/.aicx)
-        #[arg(long)]
+        /// Override AICX home (default: ~/.aicx)
+        #[arg(long = "aicx-home", value_name = "PATH")]
         store_root: Option<PathBuf>,
 
         /// Dry run: show classification counts without writing sidecars
@@ -1791,7 +1791,7 @@ enum Commands {
         dry_run: bool,
     },
 
-    /// Diagnose and optionally repair AICX home health (index, state, residual store).
+    /// Diagnose and optionally repair AICX home health (index, state, legacy archive).
     ///
     /// Runs integrity checks on the Lance steer DB, BM25/lexical index,
     /// state.json, sidecar coverage, and residual corpus bucket names. With
@@ -1831,7 +1831,7 @@ enum Commands {
         /// With --fix-buckets, preview the planned canonicalize/quarantine
         /// actions without modifying the filesystem. Output entries are
         /// prefixed with `[dry-run]`. Use this before running `--fix-buckets`
-        /// against a large store to verify the classification before commit.
+        /// against a large legacy archive to verify the classification before commit.
         #[arg(long)]
         dry_run: bool,
 
@@ -1845,18 +1845,18 @@ enum Commands {
 
         /// Plan the one-time project-identity migration: persisted index.json
         /// key casing → GitHub nameWithOwner canon (lowercase, the
-        /// fresh-derivation form), store/ directory normalization,
+        /// fresh-derivation form), legacy `store/` directory normalization,
         /// historical-card alias map (annotate-only, cards never rewritten),
         /// and a typo-twin bucket report. Dry-run by default — writes
         /// migration/identity-manifest.json + identity-report.md with zero
-        /// store mutation; add --apply to execute the planned renames.
+        /// archive mutation; add --apply to execute the planned renames.
         #[arg(long)]
         migrate_identities: bool,
 
         /// With --prune-empty-bodies, move empty-body chunks into recoverable
         /// quarantine. With --migrate-identities, execute the planned
         /// identity renames. Refuses to combine with --dry-run: on a
-        /// store-mutating surface the preview flag must always win, so the
+        /// archive-mutating surface the preview flag must always win, so the
         /// ambiguous combination is a parse error.
         #[arg(long, requires = "doctor_apply_target", conflicts_with = "dry_run")]
         apply: bool,
@@ -1873,7 +1873,7 @@ enum Commands {
         #[arg(long)]
         force: bool,
 
-        /// Report duplicate content_sha256 groups across store and context-corpus
+        /// Report duplicate content_sha256 groups across legacy archive and context-corpus
         #[arg(long)]
         check_dedup: bool,
 
@@ -1886,7 +1886,7 @@ enum Commands {
         #[arg(long)]
         smoke: bool,
 
-        /// Run the full forensic pass: recursive store scans, semantic-index
+        /// Run the full forensic pass: recursive legacy archive scans, semantic-index
         /// reconciliation, and payload-level checks. Emits progress phases
         /// with heartbeats and an explicit estimated scope; Ctrl-C cancels
         /// cleanly between operations. Without this flag (and without fix /
@@ -1920,7 +1920,7 @@ enum Commands {
     /// Emit the bounded AICX health report as JSON for automation.
     ///
     /// Fast by contract: metadata, leases, manifests, lock state, and
-    /// sampled invariants only — never a recursive store scan, never a
+    /// sampled invariants only — never a recursive legacy archive scan, never a
     /// diagnostics write. Checks whose truth needs the recursive pass are
     /// reported with `"severity": "unknown"` plus the exact deep command
     /// (`aicx doctor --deep`); unknown is never upgraded to healthy.
@@ -1940,7 +1940,7 @@ enum Commands {
 /// analysis (`--check-dedup`), or oracle-readiness request needs the deep
 /// forensic pass — the fast pass can neither fix nor certify. Everything
 /// else answers from the bounded fast health pass, which reports what it
-/// cannot prove as `unknown` instead of scanning the store recursively.
+/// cannot prove as `unknown` instead of scanning the legacy archive recursively.
 fn doctor_needs_deep_pass(deep: bool, oracle: bool, opts: &aicx::doctor::DoctorOptions) -> bool {
     deep || oracle
         || opts.rebuild_steer_index
@@ -2996,7 +2996,7 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
                     let json = aicx::cli::failure::want_json_envelope(format == "json");
                     let message = format!("{err:#}");
                     let kind = if message.contains("outside aicx canonical root")
-                        || message.contains("outside store root")
+                        || message.contains("outside archive root")
                     {
                         "path_outside_aicx_root"
                     } else {
@@ -3007,7 +3007,7 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
                         message,
                         "rerun with --verbose to see per-check details; \
                          if the path is genuinely outside ~/.aicx report it \
-                         to the operator (possible store corruption or misconfigured roots)",
+                         to the operator (possible archive corruption or misconfigured roots)",
                     );
                     let wrapped = aicx::cli::failure::emit_and_error("aicx doctor", json, failure);
                     return Err(wrapped);
@@ -8531,7 +8531,7 @@ fn spawn_dashboard_server_background(args: DashboardServerBackgroundArgs<'_>) ->
         .arg(args.host.to_string())
         .arg("--port")
         .arg(args.port.to_string())
-        .arg("--store-root")
+        .arg("--aicx-home")
         .arg(args.store_root.as_os_str());
 
     if let Some(project) = args.scope.project.as_deref() {

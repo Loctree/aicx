@@ -722,7 +722,7 @@ fn migration_cli_rebuilds_and_salvages_realistic_bundle() {
             "migrate",
             "--legacy-root",
             &legacy_root_arg,
-            "--store-root",
+            "--aicx-home",
             &store_root_arg,
         ],
     );
