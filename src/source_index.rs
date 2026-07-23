@@ -26,6 +26,15 @@ const MAX_UNBROKEN_TOKEN_CHARS: usize = 4096;
 const MAX_FULL_PARSE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_JSONL_RECORD_BYTES: usize = 2 * 1024 * 1024;
 
+/// Bump whenever signal filtering or extract body shaping changes.
+///
+/// The catalog fingerprint alone is not enough: a CURRENT generation built
+/// before thought-token stripping still matched the same catalog bytes and
+/// short-circuited forever, leaving search previews full of
+/// `{"type":"thought","data":"..."}` spam. Including this constant forces a
+/// one-shot rebuild so index truth tracks filter truth.
+const SIGNAL_FILTER_VERSION: &str = "signal-v2-vibecrafted-thought-strip";
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SourceIndexReport {
     pub catalog_path: String,
@@ -520,6 +529,10 @@ fn project_selected(project: Option<&str>, filters: &[String]) -> bool {
 
 fn source_fingerprint(catalog_path: &Path, entries: &[CatalogEntry]) -> Result<String> {
     let mut hasher = Sha256::new();
+    // Filter generation first so a catalog-identical CURRENT cannot hide a
+    // pre-filter corpus after signal-body rules change.
+    hasher.update(SIGNAL_FILTER_VERSION.as_bytes());
+    hasher.update([0]);
     // The catalog is the explicit snapshot boundary. Do not mix live source
     // mtimes into this digest: an active Vibecrafted transcript grows while
     // indexing and would make every immediate second run look dirty. A
@@ -635,5 +648,13 @@ mod tests {
         let raw = "# implement report\n\nRouting strzałek taby landed in W2-B-4c.\n";
         let cleaned = vibecrafted_signal_body(raw);
         assert!(cleaned.contains("Routing strzałek taby landed in W2-B-4c."));
+    }
+
+    #[test]
+    fn signal_filter_version_is_non_empty_and_stable_for_this_cut() {
+        // Guard against accidental empty version (would collapse fingerprints
+        // across filter generations without meaning to).
+        assert!(!SIGNAL_FILTER_VERSION.is_empty());
+        assert!(SIGNAL_FILTER_VERSION.starts_with("signal-v"));
     }
 }

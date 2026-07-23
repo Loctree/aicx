@@ -715,6 +715,14 @@ fn try_lexical_search_native(
         .collect();
 
     apply_recency_prior(&mut results);
+    // Lexical path used to stop at BM25+recency. That left pre-filter CURRENT
+    // generations ranking thought-token streams and JSON event dumps above
+    // readable operator answers. Quality demotion + preview sanitize close
+    // that lie until (and after) the next signal-filter rebuild.
+    for result in &mut results {
+        sanitize_lexical_preview_lines(result);
+    }
+    apply_lexical_quality_prior(query, &mut results);
     results.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| b.date.cmp(&a.date)));
     results.truncate(limit);
     // Prefer indexed preview metadata. Only open source files when preview is
@@ -730,6 +738,7 @@ fn try_lexical_search_native(
         let path = std::path::Path::new(&result.path);
         if path.exists() {
             result.matched_lines = semantic_preview_lines(path);
+            sanitize_lexical_preview_lines(result);
         }
     }
 
@@ -809,6 +818,110 @@ fn apply_recency_prior(results: &mut [FuzzyResult]) {
         // while still fitting the historical u8 score field.
         result.score = result.score.saturating_add(boost).min(145);
     }
+}
+
+/// Drop thought-token / pure event-stream lines from operator-facing previews.
+///
+/// Pre-filter index generations stored raw `runtime_runs` token streams in
+/// `preview_lines`. Leaving them in the result body made search look like the
+/// mill still owned the product surface even when BM25 hit the right session.
+fn sanitize_lexical_preview_lines(result: &mut FuzzyResult) {
+    if result.matched_lines.is_empty() {
+        return;
+    }
+    let cleaned: Vec<String> = result
+        .matched_lines
+        .iter()
+        .filter(|line| !is_thought_token_or_event_noise_line(line))
+        .cloned()
+        .collect();
+    if !cleaned.is_empty() {
+        result.matched_lines = cleaned;
+    }
+}
+
+fn is_thought_token_or_event_noise_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    // Compact JSON thought tokens from vibecrafted runtime_runs.
+    if trimmed.contains("\"type\":\"thought\"") || trimmed.contains("\"type\": \"thought\"") {
+        return true;
+    }
+    // Generic event envelopes with no human prose (thread.started, turn.*, item.started).
+    if trimmed.starts_with('{')
+        && (trimmed.contains("\"type\":\"thread.")
+            || trimmed.contains("\"type\":\"turn.")
+            || trimmed.contains("\"type\":\"item.started\"")
+            || trimmed.contains("\"type\": \"thread.")
+            || trimmed.contains("\"type\": \"turn.")
+            || trimmed.contains("\"type\": \"item.started\""))
+    {
+        return true;
+    }
+    // Single-token thought fragments: {"type":"thought","data":"The"}
+    if trimmed.starts_with('{')
+        && trimmed.contains("\"type\"")
+        && trimmed.contains("thought")
+        && trimmed.contains("\"data\"")
+        && trimmed.chars().count() < 120
+    {
+        return true;
+    }
+    false
+}
+
+/// Demote low-signal lexical hits and lightly boost query-term evidence in
+/// the preview body. Runs after the recency prior so fresh noise still loses
+/// to a slightly older readable answer.
+fn apply_lexical_quality_prior(query: &str, results: &mut [FuzzyResult]) {
+    let normalized_query = normalize_query(query);
+    let query_terms: Vec<&str> = normalized_query
+        .split_whitespace()
+        .filter(|term| term.len() >= 3)
+        .collect();
+    for result in results.iter_mut() {
+        if low_signal_semantic_result(result) {
+            result.score = result.score.saturating_sub(30);
+        }
+        if thought_token_preview_ratio(result) >= 0.5 {
+            result.score = result.score.saturating_sub(40);
+        }
+        if query_terms.is_empty() {
+            continue;
+        }
+        let haystack = normalize_query(&result.matched_lines.join(" "));
+        let matched = query_terms
+            .iter()
+            .filter(|term| haystack.contains(**term))
+            .count();
+        if matched > 0 {
+            result.score = result
+                .score
+                .saturating_add((matched.saturating_mul(4).min(16)) as u8)
+                .min(145);
+        } else if !haystack.is_empty() {
+            // Preview present but zero query terms → soft demotion so pure
+            // recency cannot park an unrelated transcript on top.
+            result.score = result.score.saturating_sub(8);
+        }
+    }
+}
+
+fn thought_token_preview_ratio(result: &FuzzyResult) -> f32 {
+    if result.matched_lines.is_empty() {
+        return 0.0;
+    }
+    let noisy = result
+        .matched_lines
+        .iter()
+        .filter(|line| is_thought_token_or_event_noise_line(line))
+        .count();
+    // After sanitize, ratio is usually 0; compute against original would be
+    // better, but post-sanitize emptiness of remaining lines is handled by
+    // low_signal. Keep ratio for any residual unfiltered noise patterns.
+    noisy as f32 / result.matched_lines.len() as f32
 }
 
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
@@ -2301,10 +2414,27 @@ fn low_signal_semantic_result(result: &FuzzyResult) -> bool {
         "web_search",
         "open_page",
         "no matching deferred tools found",
+        "type thought",
+        "type thread started",
+        "type turn started",
+        "type item started",
+        "type item completed",
+        "skill descriptions were shortened",
     ];
     if noisy_needles
         .iter()
         .any(|needle| normalized.contains(needle))
+    {
+        return true;
+    }
+    // Raw vibecrafted token streams often survive as short JSON lines.
+    if result
+        .matched_lines
+        .iter()
+        .filter(|line| is_thought_token_or_event_noise_line(line))
+        .count()
+        * 2
+        >= result.matched_lines.len().max(1)
     {
         return true;
     }
@@ -2689,6 +2819,64 @@ mod tests {
         assert_eq!(lexical_rerank_window(1, true), 80);
         assert_eq!(lexical_rerank_window(50, true), 80);
         assert_eq!(lexical_rerank_window(750, true), 750);
+    }
+
+    #[test]
+    fn sanitize_lexical_preview_drops_thought_tokens_keeps_prose() {
+        let mut result = fuzzy(100, "conversations", "2026-07-22", None);
+        result.matched_lines = vec![
+            r#"{"type":"thought","data":"The"}"#.to_string(),
+            r#"{"type":"thread.started","thread_id":"abc"}"#.to_string(),
+            "Routing strzałek taby is W2-B-4c in vc-procs.".to_string(),
+        ];
+        sanitize_lexical_preview_lines(&mut result);
+        assert_eq!(result.matched_lines.len(), 1);
+        assert!(result.matched_lines[0].contains("W2-B-4c"));
+    }
+
+    #[test]
+    fn lexical_quality_prior_demotes_thought_spam_below_readable_answer() {
+        let mut results = vec![
+            {
+                let mut noisy = fuzzy(100, "conversations", "2026-07-22", None);
+                noisy.matched_lines = vec![
+                    r#"{"type":"thought","data":"The"}"#.to_string(),
+                    r#"{"type":"thought","data":" user"}"#.to_string(),
+                    r#"{"type":"thought","data":" wants"}"#.to_string(),
+                ];
+                noisy.label = "noise".to_string();
+                noisy
+            },
+            {
+                let mut clean = fuzzy(80, "conversations", "2026-07-22", None);
+                clean.matched_lines = vec![
+                    "Operator asked about routing strzałek taby.".to_string(),
+                    "Answer: W2-B-4c in vc-procs.".to_string(),
+                ];
+                clean.label = "signal".to_string();
+                clean
+            },
+        ];
+        for result in &mut results {
+            sanitize_lexical_preview_lines(result);
+        }
+        apply_lexical_quality_prior("routing strzałek taby", &mut results);
+        results.sort_by_key(|b| std::cmp::Reverse(b.score));
+        assert_eq!(
+            results[0].label,
+            "signal",
+            "readable query-matched answer must outrank thought-token spam; scores signal={} noise={}",
+            results
+                .iter()
+                .find(|r| r.label == "signal")
+                .map(|r| r.score)
+                .unwrap_or(0),
+            results
+                .iter()
+                .find(|r| r.label == "noise")
+                .map(|r| r.score)
+                .unwrap_or(0),
+        );
     }
 
     #[test]
