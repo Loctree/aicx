@@ -87,8 +87,8 @@ impl Aicx {
         )
     }
 
-    /// Run a semantic search against the canonical store's persistent vector
-    /// index. Fails fast with a descriptive error when any precondition is
+    /// Search the published source/extract generation. Fails fast with a
+    /// descriptive error when any precondition is
     /// missing (embedder unhydrated, index not built, dimension mismatch).
     #[cfg(feature = "app")]
     pub fn semantic_search(

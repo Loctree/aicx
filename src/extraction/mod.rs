@@ -114,7 +114,8 @@ fn order_sources_freshest_first(sources: &mut [crate::session_catalog::CatalogSo
 ///
 /// App-only: session discovery (`session_catalog`), parser dispatch, and
 /// timeline projection all live behind `feature = "app"`; the slim
-/// loctree-consumer profile reads the canonical store instead of raw sources.
+/// The loctree-consumer profile can read explicit legacy archive fixtures
+/// instead of discovering raw sources.
 #[cfg(feature = "app")]
 pub fn extract_agent_sessions(
     agent: crate::session_catalog::AgentKind,

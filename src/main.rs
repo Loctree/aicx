@@ -907,7 +907,7 @@ enum Commands {
         #[arg(short = 'H', long, default_value = "48")]
         hours: u64,
 
-        /// Output directory (omit to only write to store)
+        /// Output directory for explicit report files
         #[arg(short, long)]
         output: Option<PathBuf>,
 
@@ -977,7 +977,7 @@ enum Commands {
         #[arg(short = 'H', long, default_value = "48")]
         hours: u64,
 
-        /// Output directory (omit to only write to store)
+        /// Output directory for explicit report files
         #[arg(short, long)]
         output: Option<PathBuf>,
 
@@ -1049,7 +1049,7 @@ enum Commands {
         #[arg(short = 'H', long, default_value = "48")]
         hours: u64,
 
-        /// Output directory (omit to only write to store)
+        /// Output directory for explicit report files
         #[arg(short, long)]
         output: Option<PathBuf>,
 
@@ -1756,14 +1756,14 @@ enum Commands {
         #[arg(long)]
         store_root: Option<PathBuf>,
 
-        /// Skip post-migration intent schema scan on the canonical store
+        /// Skip post-migration intent schema scan on the legacy archive
         #[arg(long, default_value_t = false)]
         no_intent_schema: bool,
 
         /// Upgrade store cards v1 -> v2 in place (sidecar schema/honesty
         /// fields, bracket header -> YAML frontmatter; body bytes never
         /// change). Optional ROOT overrides the walked directory (default:
-        /// canonical store dir). Dry-run by default; pass --apply to write.
+        /// legacy archive dir). Dry-run by default; pass --apply to write.
         #[arg(long, value_name = "ROOT", num_args = 0..=1)]
         cards_v2: Option<Option<PathBuf>>,
 
@@ -2891,7 +2891,7 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
                 let rt = tokio::runtime::Runtime::new()
                     .context("Failed to start tokio runtime for doctor cleanup")?;
                 let base = aicx::legacy_archive::store_base_dir()
-                    .context("Failed to resolve aicx store base directory")?;
+                    .context("Failed to resolve AICX home")?;
                 let cleanup = rt.block_on(aicx::doctor::run_automated_cleanup_at(
                     &base,
                     force,
@@ -2917,7 +2917,7 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
                 let rt = tokio::runtime::Runtime::new()
                     .context("Failed to start tokio runtime for doctor interactive cleanup")?;
                 let base = aicx::legacy_archive::store_base_dir()
-                    .context("Failed to resolve aicx store base directory")?;
+                    .context("Failed to resolve AICX home")?;
                 let cleanup = rt.block_on(aicx::doctor::run_interactive_cleanup_at(
                     &base, verbose, smoke,
                 ))?;
@@ -5721,7 +5721,7 @@ struct ExtractRender {
 
 /// Render one parsed extraction to Markdown or JSON, in conversation or
 /// full-report mode. Projection only: the raw source is never re-opened here,
-/// and nothing is written to the canonical store. Output is written only
+/// and nothing is written to the legacy card archive. Output is written only
 /// after the parse succeeded, so a fatal parse can never leave partial files.
 fn write_extract_outputs(render: ExtractRender) -> Result<()> {
     let ExtractRender {
@@ -5943,9 +5943,8 @@ const MUTATION_WARN_DELAY_SECONDS_DEFAULT: u64 = 3;
 /// resolved AICX home, then sleep briefly so the operator can Ctrl-C if they
 /// invoked the command by accident.
 ///
-/// Wave D Cut D1 (B-P0-03): seven subcommands (`all`, `claude`, `codex`,
-/// `store`, `migrate`, `migrate-intent-schema`, `index`) write to the
-/// canonical store on bare no-arg invocations. Operators occasionally
+/// Mutating commands can write reports, migration recovery, state, or index
+/// artifacts under AICX home. Operators occasionally
 /// trigger them by accident (typoed subcommand, muscle-memory from a
 /// different repo, etc.). This warning gives a 3-second confirmation
 /// window without changing the dry-run-default polarity (that lands in
@@ -8177,7 +8176,7 @@ fn refs_cutoff(hours: u64) -> std::time::SystemTime {
     }
 }
 
-/// List chunks in the canonical store, filtered by recency.
+/// List residual legacy archive chunks, filtered by recency.
 fn run_refs(
     hours: u64,
     project: Option<String>,
