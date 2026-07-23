@@ -106,7 +106,7 @@ fn exclusive_contention_serializes_threads() {
 }
 
 #[test]
-fn test_concurrent_run_store_does_not_lose_state_updates() {
+fn concurrent_state_updates_do_not_lose_watermarks_or_hashes() {
     let _env_lock = AICX_HOME_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()

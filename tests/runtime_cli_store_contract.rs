@@ -169,8 +169,7 @@ fn run_aicx_card_mill_disabled(home: &Path, args: &[&str]) -> Output {
         // Windows resolves the home dir from USERPROFILE, not HOME (dirs::home_dir).
         .env("USERPROFILE", home)
         .env("AICX_ALLOW_TMP", "1")
-        .env_remove("AICX_HOME")
-        .env_remove("AICX_ALLOW_CARD_MILL");
+        .env_remove("AICX_HOME");
     cmd.output().expect("run aicx")
 }
 

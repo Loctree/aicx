@@ -296,7 +296,7 @@ fn heartbeat_floor_pins_tick_value_to_real_progress() {
     // returned 750 entries) override the bare heartbeat counter so the
     // spinner doesn't regress to "1, 2, 3, ..." after meaningful work
     // landed. This guards the per-agent source_scan loop pattern in
-    // `run_store`.
+    // the source catalog pipeline.
     let reporter = Arc::new(CapturingReporter::default());
     let phase = Phase::start(reporter.clone(), "source_scan", Some(1000));
     let hb = Heartbeat::spawn(phase.clone(), Duration::from_millis(150));

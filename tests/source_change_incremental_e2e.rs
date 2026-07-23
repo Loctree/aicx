@@ -47,7 +47,6 @@ fn run_aicx(home: &Path, args: &[&str]) -> Output {
         .env("USERPROFILE", home)
         .env("AICX_ALLOW_TMP", "1")
         .env_remove("AICX_HOME")
-        .env_remove("AICX_ALLOW_CARD_MILL")
         .output()
         .expect("run aicx")
 }
