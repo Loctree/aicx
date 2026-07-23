@@ -125,11 +125,11 @@ pub use ignore::{
 };
 use paths::aicx_context_corpus_dir_for;
 pub use paths::{
-    CANONICAL_STORE_DIRNAME, CONTEXT_CORPUS_DIRNAME, CONTEXT_CORPUS_SCHEMA_VERSION,
-    LEGACY_CARDS_DIRNAME, LEGACY_SALVAGE_DIRNAME, LOCT_CONTEXT_PACK_FAMILY,
-    NON_REPOSITORY_CONTEXTS, OWNERLESS_PROJECT_ORGANIZATION, aicx_context_corpus_dir,
-    chunks_dir_for, context_corpus_root_dir, legacy_cards_dir, legacy_cards_dir_for,
-    legacy_store_base_dir, non_repository_contexts_dir, resolve_aicx_home,
+    CONTEXT_CORPUS_DIRNAME, CONTEXT_CORPUS_SCHEMA_VERSION, LEGACY_CARDS_DIRNAME,
+    LEGACY_SALVAGE_DIRNAME, LOCT_CONTEXT_PACK_FAMILY, NON_REPOSITORY_CONTEXTS,
+    OWNERLESS_PROJECT_ORGANIZATION, aicx_context_corpus_dir, chunks_dir_for,
+    context_corpus_root_dir, legacy_cards_dir, legacy_cards_dir_for, legacy_store_base_dir,
+    non_repository_contexts_dir, resolve_aicx_home,
 };
 use sidecar::load_sidecar_from_path;
 pub use sidecar::{is_context_corpus_sidecar, load_sidecar, sidecar_path_for_chunk};
@@ -356,7 +356,7 @@ pub fn scan_context_files_project_at(
     let ignore = load_ignore_matcher_at(&base)?;
     let mut files = Vec::new();
 
-    let canonical_root = base.join(CANONICAL_STORE_DIRNAME);
+    let canonical_root = base.join(LEGACY_CARDS_DIRNAME);
     if canonical_root.is_dir() {
         scan_repo_store_filtered(&canonical_root, &ignore, &filter, &mut files)?;
     }
@@ -382,7 +382,7 @@ fn scan_context_files_with_ignore(
 ) -> Result<Vec<StoredContextFile>> {
     let mut files = Vec::new();
 
-    let canonical_root = base.join(CANONICAL_STORE_DIRNAME);
+    let canonical_root = base.join(LEGACY_CARDS_DIRNAME);
     if canonical_root.is_dir() {
         scan_repo_store(&canonical_root, ignore, &mut files)?;
     }
@@ -1370,7 +1370,7 @@ pub fn canonical_project_identities_at(canonical_root: &Path) -> Result<Vec<Stri
 }
 
 pub fn project_identities_in_store_at(store_root: &Path) -> Result<Vec<String>> {
-    let canonical_root = store_root.join(CANONICAL_STORE_DIRNAME);
+    let canonical_root = store_root.join(LEGACY_CARDS_DIRNAME);
     canonical_project_identities_at(&canonical_root)
 }
 

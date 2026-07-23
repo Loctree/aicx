@@ -2817,8 +2817,7 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
             )?;
             if !no_intent_schema {
                 let intent_report = intents::migrate_intent_schema_dry_run_at(
-                    &PathBuf::from(&manifest.store_root)
-                        .join(legacy_archive::CANONICAL_STORE_DIRNAME),
+                    &PathBuf::from(&manifest.store_root).join(legacy_archive::LEGACY_CARDS_DIRNAME),
                     None,
                 )?;
                 print_intent_schema_migration_report(&intent_report);
@@ -2834,7 +2833,7 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
             }
             let report = if let Some(store_root) = store_root {
                 intents::migrate_intent_schema_dry_run_at(
-                    &store_root.join(legacy_archive::CANONICAL_STORE_DIRNAME),
+                    &store_root.join(legacy_archive::LEGACY_CARDS_DIRNAME),
                     project.as_deref(),
                 )?
             } else {

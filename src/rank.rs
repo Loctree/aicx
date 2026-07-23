@@ -605,7 +605,7 @@ fn infer_project_filter_from_query(store_root: &Path, query_terms: &[&str]) -> O
         return None;
     }
 
-    let canonical_root = store_root.join(legacy_archive::CANONICAL_STORE_DIRNAME);
+    let canonical_root = store_root.join(legacy_archive::LEGACY_CARDS_DIRNAME);
     let mut scores: HashMap<String, u8> = HashMap::new();
 
     let Ok(org_entries) = fs::read_dir(canonical_root) else {
@@ -1694,7 +1694,7 @@ Some boilerplate text.
         body: &str,
     ) -> std::path::PathBuf {
         let dir = root
-            .join(legacy_archive::CANONICAL_STORE_DIRNAME)
+            .join(legacy_archive::LEGACY_CARDS_DIRNAME)
             .join(organization)
             .join(repository)
             .join("2026_0524")

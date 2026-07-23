@@ -315,7 +315,7 @@ pub fn plan_identity_migration_at(base: &Path) -> Result<IdentityMigrationManife
     // Directory scan: level 1 (org or single-segment bucket) and level 2
     // (repo). Repo-level renames are listed first so apply can run them
     // under the still-original org path before the org itself is renamed.
-    let store_root = base.join(super::super::CANONICAL_STORE_DIRNAME);
+    let store_root = base.join(super::super::LEGACY_CARDS_DIRNAME);
     let mut repo_renames = Vec::new();
     let mut org_renames = Vec::new();
     let mut slugs_by_org: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -632,7 +632,7 @@ fn execute_step(base: &Path, step: &mut MigrationStep, conflicts: &mut Vec<Strin
         return Ok(());
     }
 
-    let store_root = base.join(super::super::CANONICAL_STORE_DIRNAME);
+    let store_root = base.join(super::super::LEGACY_CARDS_DIRNAME);
 
     match step.operation.as_str() {
         "rename_dir" | "quarantine_deprecated" => {
@@ -911,7 +911,7 @@ pub fn rollback_identity_migration_at(base: &Path) -> Result<()> {
     let raw = crate::source_path::read_under_aicx_home(base, &manifest_path)?;
     let mut manifest: IdentityMigrationManifest = serde_json::from_str(&raw)?;
 
-    let store_root = base.join(super::super::CANONICAL_STORE_DIRNAME);
+    let store_root = base.join(super::super::LEGACY_CARDS_DIRNAME);
     let conflicts = Vec::new();
 
     for step in manifest.steps.iter_mut().rev() {

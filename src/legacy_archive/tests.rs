@@ -1728,7 +1728,7 @@ fn ownerless_project_identity_is_addressable_and_participates_in_ambiguity() {
 fn store_scan_surfaces_ownerless_bucket_under_virtual_sentinel() {
     let root = migration_test_root("ownerless-scan");
     let directory = root
-        .join(CANONICAL_STORE_DIRNAME)
+        .join(LEGACY_CARDS_DIRNAME)
         .join("repo")
         .join("2026_0717")
         .join("conversations")
@@ -1755,7 +1755,7 @@ fn store_scan_surfaces_ownerless_bucket_under_virtual_sentinel() {
 #[test]
 fn resolve_filters_to_slugs_expands_short_name_to_canonical() {
     let root = migration_test_root("resolve-short");
-    let canonical = root.join(CANONICAL_STORE_DIRNAME);
+    let canonical = root.join(LEGACY_CARDS_DIRNAME);
     fs::create_dir_all(
         canonical
             .join("example-org")
@@ -1776,7 +1776,7 @@ fn resolve_filters_to_slugs_expands_short_name_to_canonical() {
 #[test]
 fn resolve_filters_to_slugs_supports_explicit_syntax() {
     let root = migration_test_root("resolve-explicit");
-    let canonical = root.join(CANONICAL_STORE_DIRNAME);
+    let canonical = root.join(LEGACY_CARDS_DIRNAME);
     fs::create_dir_all(canonical.join("example-org").join("lab")).unwrap();
     fs::create_dir_all(canonical.join("example-org").join("badi")).unwrap();
     fs::create_dir_all(canonical.join("vetcoders").join("Codescribe")).unwrap();
@@ -1808,7 +1808,7 @@ fn resolve_filters_to_slugs_supports_explicit_syntax() {
 #[test]
 fn resolve_filters_to_slugs_no_match_returns_empty_vec() {
     let root = migration_test_root("resolve-empty");
-    let canonical = root.join(CANONICAL_STORE_DIRNAME);
+    let canonical = root.join(LEGACY_CARDS_DIRNAME);
     fs::create_dir_all(canonical.join("foo").join("bar")).unwrap();
 
     let got = resolve_filters_to_slugs_at(&canonical, &["nonexistent".to_string()]).unwrap();
@@ -1820,7 +1820,7 @@ fn resolve_filters_to_slugs_no_match_returns_empty_vec() {
 #[test]
 fn resolve_filters_to_slugs_at_or_error_rejects_unknown_filters() {
     let root = migration_test_root("resolve-error");
-    let canonical = root.join(CANONICAL_STORE_DIRNAME);
+    let canonical = root.join(LEGACY_CARDS_DIRNAME);
     fs::create_dir_all(canonical.join("foo").join("bar")).unwrap();
 
     let err = resolve_filters_to_slugs_at_or_error(&canonical, &["nonexistent".to_string()])
@@ -1863,7 +1863,7 @@ fn resolve_filters_to_store_or_index_slugs_supports_index_bucket_dirs() {
 #[test]
 fn resolve_filters_to_store_or_index_slugs_merges_store_and_index_bucket_dirs() {
     let root = migration_test_root("resolve-store-and-index");
-    fs::create_dir_all(root.join(CANONICAL_STORE_DIRNAME).join("foo").join("bar")).unwrap();
+    fs::create_dir_all(root.join(LEGACY_CARDS_DIRNAME).join("foo").join("bar")).unwrap();
     fs::create_dir_all(root.join("indexed").join("baz_qux")).unwrap();
     fs::create_dir_all(root.join("indexed").join("_all")).unwrap();
 
@@ -1962,7 +1962,7 @@ fn project_identities_for_search_uses_index_dirs_not_ndjson() {
 fn resolve_filters_to_slugs_empty_input_returns_empty() {
     // Empty filters list means "all projects" by caller convention.
     let root = migration_test_root("resolve-no-filter");
-    let canonical = root.join(CANONICAL_STORE_DIRNAME);
+    let canonical = root.join(LEGACY_CARDS_DIRNAME);
     fs::create_dir_all(canonical.join("foo").join("bar")).unwrap();
 
     let got = resolve_filters_to_slugs_at(&canonical, &[]).unwrap();
@@ -1974,7 +1974,7 @@ fn resolve_filters_to_slugs_empty_input_returns_empty() {
 #[test]
 fn bare_project_filter_fails_closed_with_all_candidates() {
     let root = migration_test_root("ambiguous-codex");
-    let canonical = root.join(CANONICAL_STORE_DIRNAME);
+    let canonical = root.join(LEGACY_CARDS_DIRNAME);
     fs::create_dir_all(canonical.join("codex").join("some-repo")).unwrap();
     fs::create_dir_all(canonical.join("openai").join("codex")).unwrap();
     fs::create_dir_all(canonical.join("unrelated").join("lab")).unwrap();
