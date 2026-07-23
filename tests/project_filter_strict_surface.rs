@@ -262,6 +262,8 @@ fn seed_codex_session_with_catalog_identity(
     // (cwd alone is not topical project — proven operator doctrine 2026-07-23.)
     fs::create_dir_all(aicx::catalog::catalog_dir_for(&aicx_home))
         .expect("create catalog directory");
+    let (source_len, source_mtime_ns) =
+        aicx::catalog::live_source_fingerprint(&history).unwrap_or((0, 0));
     let entry = aicx::catalog::CatalogEntry {
         schema: aicx::catalog::CATALOG_SCHEMA.to_string(),
         session_id: session_id.to_string(),
@@ -270,6 +272,8 @@ fn seed_codex_session_with_catalog_identity(
         date: Some("2026-07-17".to_string()),
         cwd: Some(checkout.display().to_string()),
         source_path: history.display().to_string(),
+        source_len: Some(source_len).filter(|&n| n > 0),
+        source_mtime_ns: Some(source_mtime_ns).filter(|&n| n > 0),
         title: Some(format!("historical identity marker {marker}")),
         machine: Some("strict-filter-fixture".to_string()),
         logical_session_id: None,

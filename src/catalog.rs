@@ -40,12 +40,34 @@ pub struct CatalogEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
     pub source_path: String,
+    /// Live source size at last catalog rebuild (bytes). Part of the
+    /// source-change fingerprint so appends invalidate incremental reuse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_len: Option<u64>,
+    /// Live source mtime at last catalog rebuild (unix nanoseconds).
+    /// Paired with `source_len` so `aicx index` re-parses changed sessions
+    /// instead of treating path-stable catalog rows as frozen.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_mtime_ns: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub machine: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub logical_session_id: Option<String>,
+}
+
+/// Size + mtime-ns for a path. Returns `None` when the file is unreadable.
+pub fn live_source_fingerprint(path: &Path) -> Option<(u64, u64)> {
+    let metadata = fs::metadata(path).ok()?;
+    let mtime_ns = metadata
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    // u64 covers unix nanos until year ~2554; truncation is intentional.
+    Some((metadata.len(), mtime_ns as u64))
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -281,6 +303,8 @@ fn entry_from_source(agent: AgentKind, source: &CatalogSource) -> CatalogEntry {
         date,
         cwd,
         source_path: source.path.display().to_string(),
+        source_len: Some(source.fingerprint.len),
+        source_mtime_ns: Some(source.fingerprint.modified_unix_nanos as u64),
         title: None,
         machine: hostname(),
         logical_session_id: if agent == AgentKind::Grok {
@@ -330,6 +354,9 @@ fn merge_session_info(
         .updated_at
         .or(info.started_at)
         .map(|dt| dt.format("%Y-%m-%d").to_string());
+    let (source_len, source_mtime_ns) = live_source_fingerprint(&info.source_path)
+        .map(|(len, mtime)| (Some(len), Some(mtime)))
+        .unwrap_or((None, None));
     let entry = by_id.entry(key).or_insert_with(|| CatalogEntry {
         schema: CATALOG_SCHEMA.to_string(),
         session_id: info.session_id.clone(),
@@ -338,6 +365,8 @@ fn merge_session_info(
         date: date.clone(),
         cwd: info.repo_path.clone(),
         source_path: info.source_path.display().to_string(),
+        source_len,
+        source_mtime_ns,
         title: info.title.clone(),
         machine: hostname(),
         logical_session_id: None,
@@ -356,6 +385,12 @@ fn merge_session_info(
     }
     if entry.source_path.is_empty() {
         entry.source_path = info.source_path.display().to_string();
+    }
+    // Refresh fingerprint whenever discovery sees the live file — rebuild must
+    // admit source appends even when session id/path are unchanged.
+    if let Some((len, mtime)) = live_source_fingerprint(&info.source_path) {
+        entry.source_len = Some(len);
+        entry.source_mtime_ns = Some(mtime);
     }
 }
 
@@ -387,13 +422,15 @@ fn enrich_runtime_runs(by_id: &mut BTreeMap<(String, String), CatalogEntry>, use
         if !transcript.is_file() {
             continue;
         }
-        let meta = fs::metadata(&transcript).ok();
-        let date = meta.and_then(|m| m.modified().ok()).and_then(|t| {
-            let secs = t.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs() as i64;
+        let (source_len, source_mtime_ns) = live_source_fingerprint(&transcript)
+            .map(|(len, mtime)| (Some(len), Some(mtime)))
+            .unwrap_or((None, None));
+        let date = source_mtime_ns.and_then(|ns| {
+            let secs = (ns / 1_000_000_000) as i64;
             chrono::DateTime::from_timestamp(secs, 0).map(|dt| dt.format("%Y-%m-%d").to_string())
         });
         let key = ("vibecrafted".to_string(), run_id.clone());
-        by_id.entry(key).or_insert_with(|| CatalogEntry {
+        let entry = by_id.entry(key).or_insert_with(|| CatalogEntry {
             schema: CATALOG_SCHEMA.to_string(),
             session_id: run_id,
             agent: "vibecrafted".to_string(),
@@ -401,10 +438,16 @@ fn enrich_runtime_runs(by_id: &mut BTreeMap<(String, String), CatalogEntry>, use
             date,
             cwd: None,
             source_path: transcript.display().to_string(),
+            source_len,
+            source_mtime_ns,
             title: Some("runtime_run transcript".to_string()),
             machine: hostname(),
             logical_session_id: None,
         });
+        if let Some((len, mtime)) = live_source_fingerprint(&transcript) {
+            entry.source_len = Some(len);
+            entry.source_mtime_ns = Some(mtime);
+        }
     }
 }
 
@@ -584,6 +627,8 @@ mod tests {
             date: Some("2026-07-22".into()),
             cwd: None,
             source_path: "/tmp/x".into(),
+            source_len: None,
+            source_mtime_ns: None,
             title: None,
             machine: None,
             logical_session_id: None,
@@ -612,6 +657,8 @@ mod tests {
                 date: None,
                 cwd: None,
                 source_path: format!("/tmp/{session_id}.jsonl"),
+                source_len: None,
+                source_mtime_ns: None,
                 title: None,
                 machine: None,
                 logical_session_id: None,
