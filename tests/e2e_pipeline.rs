@@ -64,7 +64,7 @@ fn e2e_index_and_query_roundtrip() {
 
     // Step 1: probe corpus. If empty, the operator hasn't run extract
     // yet — same precondition the production search would surface.
-    let store_root = aicx::legacy_archive::store_base_dir().expect("store_base_dir");
+    let store_root = aicx::aicx_home::ensure().expect("AICX home");
     let chunks = aicx::legacy_archive::scan_context_files_project_at(&store_root, None)
         .expect("scan corpus");
     assert!(

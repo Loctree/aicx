@@ -129,8 +129,7 @@ pub use paths::{
     LEGACY_CARDS_DIRNAME, LEGACY_SALVAGE_DIRNAME, LOCT_CONTEXT_PACK_FAMILY,
     NON_REPOSITORY_CONTEXTS, OWNERLESS_PROJECT_ORGANIZATION, aicx_context_corpus_dir,
     chunks_dir_for, context_corpus_root_dir, legacy_cards_dir, legacy_cards_dir_for,
-    legacy_store_base_dir, non_repository_contexts_dir, resolve_aicx_home, store_base_dir,
-    store_base_dir_for,
+    legacy_store_base_dir, non_repository_contexts_dir, resolve_aicx_home,
 };
 use sidecar::load_sidecar_from_path;
 pub use sidecar::{is_context_corpus_sidecar, load_sidecar, sidecar_path_for_chunk};
@@ -326,12 +325,12 @@ fn chunk_line_has_signal(line: &str) -> bool {
 }
 
 pub fn scan_context_files() -> Result<Vec<StoredContextFile>> {
-    let base = store_base_dir()?;
+    let base = crate::aicx_home::ensure()?;
     scan_context_files_at(&base)
 }
 
 pub fn scan_context_files_raw() -> Result<Vec<StoredContextFile>> {
-    let base = store_base_dir()?;
+    let base = crate::aicx_home::ensure()?;
     scan_context_files_raw_at(&base)
 }
 
@@ -413,7 +412,7 @@ pub fn context_files_since(
     cutoff: SystemTime,
     project_filter: Option<&str>,
 ) -> Result<Vec<StoredContextFile>> {
-    context_files_since_at(&store_base_dir()?, cutoff, project_filter)
+    context_files_since_at(&crate::aicx_home::ensure()?, cutoff, project_filter)
 }
 
 fn read_store_dir(path: &Path) -> Result<fs::ReadDir> {
@@ -425,7 +424,7 @@ fn read_store_dir(path: &Path) -> Result<fs::ReadDir> {
 /// Read one canonical chunk by absolute path, store-relative path, file name,
 /// or compact chunk reference.
 pub fn read_context_chunk(reference: &str, max_chars: Option<usize>) -> Result<ReadContextChunk> {
-    read_context_chunk_at(&store_base_dir()?, reference, max_chars)
+    read_context_chunk_at(&crate::aicx_home::ensure()?, reference, max_chars)
 }
 
 pub fn read_context_chunk_at(
@@ -941,7 +940,7 @@ fn read_context_corpus_index_rows(path: &Path) -> Result<Vec<ContextCorpusIndexR
 /// Find stored chunks whose sidecar metadata matches a run ID.
 pub fn chunks_by_run_id(run_id: &str, project: Option<&str>) -> Result<Vec<StoredContextFile>> {
     let cutoff = SystemTime::now() - std::time::Duration::from_secs(7 * 24 * 3600);
-    chunks_by_run_id_at(&store_base_dir()?, run_id, project, cutoff)
+    chunks_by_run_id_at(&crate::aicx_home::ensure()?, run_id, project, cutoff)
 }
 
 fn chunks_by_run_id_at(
@@ -1272,14 +1271,14 @@ fn project_identity_matches(identity: &str, filter: &str, match_mode: ProjectMat
 /// - non-empty input → union of canonical slugs that match any filter
 /// - matched zero projects → empty vec (caller decides: error or all)
 pub fn resolve_filters_to_slugs(filters: &[String]) -> Result<Vec<String>> {
-    let base = store_base_dir()?;
-    let canonical_root = base.join(CANONICAL_STORE_DIRNAME);
+    let base = crate::aicx_home::ensure()?;
+    let canonical_root = base.join(LEGACY_CARDS_DIRNAME);
     resolve_filters_to_slugs_at(&canonical_root, filters)
 }
 
 pub fn resolve_filters_to_slugs_or_error(filters: &[String]) -> Result<Vec<String>> {
-    let base = store_base_dir()?;
-    let canonical_root = base.join(CANONICAL_STORE_DIRNAME);
+    let base = crate::aicx_home::ensure()?;
+    let canonical_root = base.join(LEGACY_CARDS_DIRNAME);
     resolve_filters_to_slugs_at_or_error(&canonical_root, filters)
 }
 

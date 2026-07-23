@@ -15,7 +15,7 @@ use std::{env, fs};
 // we refuse to ship.
 //
 // Replacement strategy (pass-4):
-//   * `store_base_dir_for` / `chunks_dir_for` / `state_path_for`
+//   * `aicx_home::root_for` / `chunks_dir_for` / `state_path_for`
 //     are pure functions tested with explicit paths — parallel-safe,
 //     deterministic, no env touched.
 //   * `resolve_aicx_home` is tested under a process-wide Mutex
@@ -61,9 +61,9 @@ impl Drop for AicxHomeEnvGuard {
 }
 
 #[test]
-fn test_store_base_dir_for_is_identity_on_explicit_home() {
+fn test_aicx_home_root_for_is_identity_on_explicit_home() {
     let home = PathBuf::from("/tmp/test-aicx-base");
-    assert_eq!(store_base_dir_for(&home), home);
+    assert_eq!(crate::aicx_home::root_for(&home), home);
 }
 
 #[test]
@@ -240,7 +240,7 @@ fn test_resolve_aicx_home_rejects_control_chars_in_bootstrap_storage_home() {
 /// Integration guard: every canonical-root resolver in the workspace
 /// must agree on `$AICX_HOME` when it is pinned. Covers the split-brain
 /// regression (bugs #25 + #40) where seven sites still hard-coded
-/// `dirs::home_dir().join(".aicx")` while `store_base_dir` honored the
+/// `dirs::home_dir().join(".aicx")` while the AICX-home resolver honored the
 /// env override. If a future change re-introduces that drift this test
 /// flips red.
 #[test]

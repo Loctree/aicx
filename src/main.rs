@@ -2153,9 +2153,7 @@ fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    let diagnostics_state_dir = aicx::legacy_archive::store_base_dir()
-        .ok()
-        .map(|d| d.join("state"));
+    let diagnostics_state_dir = aicx::aicx_home::ensure().ok().map(|d| d.join("state"));
     let _ = aicx::diagnostics::init(cli.verbose, diagnostics_state_dir);
 
     let result = run_command(cli.command, cli.project_fuzzy);
@@ -2890,8 +2888,7 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
             if force || yes {
                 let rt = tokio::runtime::Runtime::new()
                     .context("Failed to start tokio runtime for doctor cleanup")?;
-                let base = aicx::legacy_archive::store_base_dir()
-                    .context("Failed to resolve AICX home")?;
+                let base = aicx::aicx_home::ensure().context("Failed to resolve AICX home")?;
                 let cleanup = rt.block_on(aicx::doctor::run_automated_cleanup_at(
                     &base,
                     force,
@@ -2916,8 +2913,7 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
             if !legacy_or_readonly && io::stdin().is_terminal() {
                 let rt = tokio::runtime::Runtime::new()
                     .context("Failed to start tokio runtime for doctor interactive cleanup")?;
-                let base = aicx::legacy_archive::store_base_dir()
-                    .context("Failed to resolve AICX home")?;
+                let base = aicx::aicx_home::ensure().context("Failed to resolve AICX home")?;
                 let cleanup = rt.block_on(aicx::doctor::run_interactive_cleanup_at(
                     &base, verbose, smoke,
                 ))?;
@@ -4177,7 +4173,7 @@ fn resolve_intents_project_filters(
     projects: &[String],
     match_mode: legacy_archive::ProjectMatchMode,
 ) -> Result<legacy_archive::ProjectIdentityResolution> {
-    let store_root = legacy_archive::store_base_dir()?;
+    let store_root = aicx::aicx_home::ensure()?;
     resolve_intents_project_filters_at(projects, &store_root, match_mode)
 }
 
@@ -4322,7 +4318,7 @@ fn print_no_intents_message(
         eprintln!("{note}");
     }
 
-    let store_root = legacy_archive::store_base_dir()?;
+    let store_root = aicx::aicx_home::ensure()?;
     let hints = nearby_bucket_hints(projects, &collect_recent_bucket_counts(&store_root, hours)?);
     if !hints.is_empty() {
         eprintln!("Did you mean a nearby bucket with recent data?");
@@ -4452,7 +4448,7 @@ fn run_intents(
 
     match emit {
         "json" => {
-            let store_root = legacy_archive::store_base_dir()?;
+            let store_root = aicx::aicx_home::ensure()?;
             let oracle_status = aicx::oracle::OracleStatus::canonical_corpus_scan(
                 &store_root,
                 extraction.stats.scanned_count,
@@ -5004,7 +5000,7 @@ fn safe_session_extract_stem(session_id: &str) -> String {
 }
 
 fn default_session_extract_path_for_stem(agent_label: &str, stem: &str) -> Result<PathBuf> {
-    let base = aicx::legacy_archive::store_base_dir()?;
+    let base = aicx::aicx_home::ensure()?;
     Ok(base
         .join("extracts")
         .join(agent_label)
@@ -6993,7 +6989,7 @@ fn resolve_project_filters_or_error(
             match_mode,
         });
     }
-    let store_root = legacy_archive::store_base_dir()?;
+    let store_root = aicx::aicx_home::ensure()?;
     // Search doctrine: never stream retired multi-GB embeddings.ndjson for
     // `-p` resolution. Exact `owner/repo` forms pass through; bare names use
     // shallow store dirs + indexed bucket names + durable catalog.
@@ -7095,7 +7091,7 @@ fn run_eval_search_quality(args: SearchQualityEvalArgs) -> Result<()> {
     }
 
     let bin = aicx_bin.unwrap_or(std::env::current_exe()?);
-    let store_root = legacy_archive::store_base_dir()?;
+    let store_root = aicx::aicx_home::ensure()?;
     let project_filters = aicx::search_eval::discover_projects_for_cases(&store_root, &selected)?;
     let mut evaluations = Vec::new();
 
@@ -7214,7 +7210,7 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
         query.to_string()
     };
 
-    let root = legacy_archive::store_base_dir()?;
+    let root = aicx::aicx_home::ensure()?;
 
     // Build the canonical filter pushdown for the retrieval primitive.
     // The explicit date filter wins over `--hours`, matching legacy
@@ -8081,7 +8077,7 @@ fn run_steer(args: SteerRunArgs<'_>) -> Result<()> {
     let mut out = io::BufWriter::new(stdout.lock());
     let color = stdout.is_terminal();
     let matched = metadatas.len();
-    let store_root = legacy_archive::store_base_dir()?;
+    let store_root = aicx::aicx_home::ensure()?;
     let oracle_status = aicx::oracle::OracleStatus::metadata_steer(
         &store_root,
         matched,
@@ -8436,7 +8432,7 @@ fn run_dashboard_server(args: DashboardServerRunArgs) -> Result<()> {
     let root = if let Some(path) = args.store_root {
         path
     } else {
-        legacy_archive::store_base_dir()?
+        aicx::aicx_home::ensure()?
     };
     let host: std::net::IpAddr = args.host.parse().with_context(|| {
         format!(
@@ -8600,7 +8596,7 @@ struct DashboardRunArgs {
 }
 
 fn default_dashboard_output_path() -> Result<PathBuf> {
-    Ok(legacy_archive::store_base_dir()?.join("aicx-dashboard.html"))
+    Ok(aicx::aicx_home::ensure()?.join("aicx-dashboard.html"))
 }
 
 fn run_dashboard_command(
@@ -8618,7 +8614,7 @@ fn run_dashboard_command(
             .store_root
             .clone()
             .map(Ok)
-            .unwrap_or_else(legacy_archive::store_base_dir)?;
+            .unwrap_or_else(aicx::aicx_home::ensure)?;
         let corpus = legacy_archive::project_identities_in_store_at(&root)?;
         let filters = vec![filter.clone()];
         let resolution =
@@ -8692,7 +8688,7 @@ fn run_dashboard(args: DashboardRunArgs) -> Result<()> {
     let root = if let Some(path) = args.store_root {
         path
     } else {
-        legacy_archive::store_base_dir()?
+        aicx::aicx_home::ensure()?
     };
 
     let config = DashboardConfig {
@@ -8756,7 +8752,7 @@ struct ReportsExtractorRunArgs {
 }
 
 fn default_reports_output_path() -> Result<PathBuf> {
-    Ok(legacy_archive::store_base_dir()?.join("aicx-reports.html"))
+    Ok(aicx::aicx_home::ensure()?.join("aicx-reports.html"))
 }
 
 fn run_reports_command(args: ReportsArgs) -> Result<()> {

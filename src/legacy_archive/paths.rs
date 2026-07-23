@@ -19,11 +19,9 @@ const MIGRATION_MANIFEST_FILENAME: &str = "manifest.json";
 const MIGRATION_REPORT_FILENAME: &str = "report.md";
 const IDENTITY_MIGRATION_MANIFEST_FILENAME: &str = "identity-manifest.json";
 const IDENTITY_MIGRATION_REPORT_FILENAME: &str = "identity-report.md";
+pub use crate::aicx_home::resolve as resolve_aicx_home;
 #[cfg(test)]
 pub(crate) use crate::aicx_home::resolve_from as resolve_aicx_home_from;
-pub use crate::aicx_home::{
-    ensure as store_base_dir, resolve as resolve_aicx_home, root_for as store_base_dir_for,
-};
 
 fn canonical_path_segment(value: &str, label: &str) -> Result<String> {
     let cleaned = value.trim().to_ascii_lowercase();
@@ -55,7 +53,7 @@ pub fn legacy_cards_dir_for(home: &Path) -> PathBuf {
 
 /// Returns the immutable context-corpus root: `$AICX_HOME/context-corpus/`.
 pub fn context_corpus_root_dir() -> Result<PathBuf> {
-    let dir = context_corpus_root_dir_for(&store_base_dir()?);
+    let dir = context_corpus_root_dir_for(&crate::aicx_home::ensure()?);
     fs::create_dir_all(&dir)?;
     Ok(dir)
 }
@@ -65,11 +63,11 @@ pub fn context_corpus_root_dir() -> Result<PathBuf> {
 /// No env reads, no filesystem creation. Used by tests that must exercise
 /// context-corpus ingest behavior without racing on process-global env vars.
 pub(crate) fn context_corpus_root_dir_for(home: &Path) -> PathBuf {
-    store_base_dir_for(home).join(CONTEXT_CORPUS_DIRNAME)
+    crate::aicx_home::root_for(home).join(CONTEXT_CORPUS_DIRNAME)
 }
 
 pub fn aicx_context_corpus_dir(org: &str, repo: &str, date: &str, batch: &str) -> Result<PathBuf> {
-    aicx_context_corpus_dir_for(&store_base_dir()?, org, repo, date, batch)
+    aicx_context_corpus_dir_for(&crate::aicx_home::ensure()?, org, repo, date, batch)
 }
 
 pub(crate) fn aicx_context_corpus_dir_for(
@@ -97,7 +95,7 @@ pub(crate) fn aicx_context_corpus_dir_for(
 /// Returns the non-repository fallback root:
 /// `$AICX_HOME/non-repository-contexts/`.
 pub fn non_repository_contexts_dir() -> Result<PathBuf> {
-    let dir = store_base_dir()?.join(NON_REPOSITORY_CONTEXTS);
+    let dir = crate::aicx_home::ensure()?.join(NON_REPOSITORY_CONTEXTS);
     fs::create_dir_all(&dir)?;
     Ok(dir)
 }
@@ -138,5 +136,5 @@ pub(super) fn identity_migration_report_path(base: &Path) -> PathBuf {
 /// No env reads, no filesystem creation. Used in tests to verify chunks-dir
 /// shape without depending on `$AICX_HOME`.
 pub fn chunks_dir_for(home: &Path) -> PathBuf {
-    store_base_dir_for(home).join("chunks")
+    crate::aicx_home::root_for(home).join("chunks")
 }

@@ -2714,7 +2714,7 @@ fn conversations_batch_writes_synthetic_sessions_without_store_path() {
             .any(|name| name.starts_with("session-two_unsafe-") && name.ends_with(".json")),
         "expected a session-two_unsafe-<hash>.json file, got {entries:?}"
     );
-    assert!(!out_dir.starts_with(aicx::legacy_archive::store_base_dir().unwrap()));
+    assert!(!out_dir.starts_with(aicx::aicx_home::ensure().unwrap()));
 
     let _ = fs::remove_dir_all(&root);
 }
