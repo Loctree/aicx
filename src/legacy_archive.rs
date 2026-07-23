@@ -112,7 +112,7 @@ pub(crate) mod dedupe;
 pub(crate) mod ignore;
 #[path = "legacy_archive/paths.rs"]
 pub(crate) mod paths;
-#[path = "store/sidecar.rs"]
+#[path = "legacy_archive/sidecar.rs"]
 pub(crate) mod sidecar;
 
 #[cfg(test)]
@@ -1809,7 +1809,7 @@ pub fn expand_compact_date(compact: &str) -> String {
     }
 }
 
-#[path = "store/migration.rs"]
+#[path = "legacy_archive/migration.rs"]
 pub(crate) mod migration;
 pub use migration::{
     CardsV2Action, CardsV2Item, CardsV2Manifest, CardsV2Totals, LegacyItemKind, MigrationAction,
@@ -1824,5 +1824,5 @@ pub(crate) use migration::{SourceLocator, run_migration_at};
 // ============================================================================
 
 #[cfg(all(test, feature = "app"))]
-#[path = "store/tests.rs"]
+#[path = "legacy_archive/tests.rs"]
 mod tests;
