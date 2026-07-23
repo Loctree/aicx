@@ -2151,9 +2151,13 @@ pub fn project_identities_for_search_at(store_root: &Path) -> Result<Vec<String>
         &store_root.join("indexed"),
     )?);
     // Durable catalog (when present) carries topical project attribution
-    // that cwd-derived store layout may miss.
-    if let Ok(catalog_ids) = crate::catalog::project_identities_from_catalog_at(store_root) {
-        identities.extend(catalog_ids);
+    // that cwd-derived store layout may miss. Slim (`loctree-consumer`)
+    // builds compile without the catalog module and skip this widening.
+    #[cfg(feature = "app")]
+    {
+        if let Ok(catalog_ids) = crate::catalog::project_identities_from_catalog_at(store_root) {
+            identities.extend(catalog_ids);
+        }
     }
     Ok(identities.into_iter().collect())
 }

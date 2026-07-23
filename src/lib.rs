@@ -101,6 +101,9 @@ pub mod source_index;
 /// Real containment (no nosemgrep silencers) for catalog / source_index opens.
 #[cfg(feature = "app")]
 pub mod source_path;
+#[cfg(not(feature = "app"))]
+#[allow(dead_code)]
+mod source_path;
 #[cfg(feature = "app")]
 pub mod state;
 #[cfg(feature = "app")]

@@ -414,6 +414,7 @@ fn index_status_at_with_sessions(
 ///
 /// Returns `Ok(None)` when no usable CURRENT generation exists under `base`,
 /// so callers can fall back to residual store/NDJSON status for migration.
+#[cfg(feature = "app")]
 fn hybrid_current_index_status(base: &Path, project: Option<&str>) -> Result<Option<IndexStatus>> {
     // Source-driven publish always lands in the global `_all` bucket; project
     // is a search-time filter, not a separate generation.
@@ -505,6 +506,16 @@ fn hybrid_current_index_status(base: &Path, project: Option<&str>) -> Result<Opt
             .unwrap_or_else(|| "_all".to_string()),
         committed_at,
     }))
+}
+
+/// Slim (`loctree-consumer`) builds carry no retrieval surface, so the hybrid
+/// CURRENT manifest cannot be read; status falls back to residual store/NDJSON.
+#[cfg(not(feature = "app"))]
+fn hybrid_current_index_status(
+    _base: &Path,
+    _project: Option<&str>,
+) -> Result<Option<IndexStatus>> {
+    Ok(None)
 }
 
 #[derive(Debug, Clone)]
