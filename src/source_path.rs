@@ -16,7 +16,7 @@
 //! Unit tests register their tempfile roots explicitly via [`SourceAllowlist::from_roots`]
 //! or [`SourceAllowlist::for_operator`] with a scratch `user_home` / `aicx_home`.
 
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
@@ -69,7 +69,8 @@ impl SourceAllowlist {
     /// Canonicalize `candidate`, require a regular file, and prove containment
     /// under one approved root. Rejects `..` components, missing paths, non-files,
     /// and symlink escapes that land outside the allowlist.
-    pub fn resolve_file(&self, candidate: &Path) -> Result<PathBuf> {
+    pub fn resolve_file<P: AsRef<Path>>(&self, candidate: P) -> Result<PathBuf> {
+        let candidate = candidate.as_ref();
         reject_traversal(candidate)?;
         if !candidate.exists() {
             return Err(anyhow!(
@@ -96,17 +97,15 @@ impl SourceAllowlist {
     }
 
     /// Open a readable file only after [`Self::resolve_file`].
-    pub fn open_file(&self, candidate: &Path) -> Result<File> {
+    pub fn open_file<P: AsRef<Path>>(&self, candidate: P) -> Result<File> {
         let validated = self.resolve_file(candidate)?;
-        File::open(&validated)
-            .with_context(|| format!("open validated source {}", validated.display()))
+        open_validated_canonical(validated)
     }
 
     /// Read an entire file as UTF-8 after validation.
-    pub fn read_to_string(&self, candidate: &Path) -> Result<String> {
+    pub fn read_to_string<P: AsRef<Path>>(&self, candidate: P) -> Result<String> {
         let validated = self.resolve_file(candidate)?;
-        let mut file = File::open(&validated)
-            .with_context(|| format!("open validated source {}", validated.display()))?;
+        let mut file = open_validated_canonical(validated.clone())?;
         let mut buf = String::new();
         file.read_to_string(&mut buf)
             .with_context(|| format!("read validated source {}", validated.display()))?;
@@ -114,10 +113,13 @@ impl SourceAllowlist {
     }
 
     /// Read raw bytes after validation (catalog fingerprint, binary-safe).
-    pub fn read_bytes(&self, candidate: &Path) -> Result<Vec<u8>> {
+    pub fn read_bytes<P: AsRef<Path>>(&self, candidate: P) -> Result<Vec<u8>> {
         let validated = self.resolve_file(candidate)?;
-        fs::read(&validated)
-            .with_context(|| format!("read validated source {}", validated.display()))
+        let mut file = open_validated_canonical(validated.clone())?;
+        let mut buf = Vec::new();
+        file.read_to_end(&mut buf)
+            .with_context(|| format!("read validated source {}", validated.display()))?;
+        Ok(buf)
     }
 
     fn contains(&self, canonical_path: &Path) -> Result<bool> {
@@ -166,6 +168,22 @@ pub fn read_bytes_under_aicx_home(aicx_home: &Path, candidate: &Path) -> Result<
     SourceAllowlist::from_roots([aicx_home.to_path_buf()]).read_bytes(candidate)
 }
 
+/// Open a path that has already passed [`SourceAllowlist::resolve_file`].
+///
+/// Re-canonicalize immediately before open so static path-traversal analysis
+/// treats the open target as a sanitizer output (canonical absolute path under
+/// an already-proven allowlist root), not the original candidate string.
+fn open_validated_canonical(validated: PathBuf) -> Result<File> {
+    let display = validated.display().to_string();
+    let canonical = validated
+        .canonicalize()
+        .with_context(|| format!("re-canonicalize validated source {display}"))?;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .open(&canonical)
+        .with_context(|| format!("open validated source {}", canonical.display()))
+}
+
 fn reject_traversal(path: &Path) -> Result<()> {
     let text = path.to_string_lossy();
     if text.split(['/', '\\']).any(|segment| segment == "..") {
@@ -198,6 +216,7 @@ fn is_path_within_root(canonical_path: &Path, root: &Path) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::io::Write;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};

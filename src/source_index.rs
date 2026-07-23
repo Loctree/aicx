@@ -126,8 +126,22 @@ pub fn build(
     let source_allow = crate::source_path::SourceAllowlist::for_operator(&user_home, aicx_home);
 
     for entry in &selected {
-        let source_path = Path::new(&entry.source_path);
-        let mut frames = match parse_catalog_source(entry, source_path, &source_allow) {
+        // Resolve under approved roots before any parse/open.
+        // Pass the catalog string through AsRef<Path> so Path::new lives only
+        // inside the allowlist resolver (canonicalize + containment).
+        let source_path = match source_allow.resolve_file(entry.source_path.as_str()) {
+            Ok(path) => path,
+            Err(error) => {
+                crate::diagnostics::log_describe(&format!(
+                    "source_index_skip agent={} session_id={} path={} error={error:#}",
+                    entry.agent, entry.session_id, entry.source_path
+                ));
+                sources_skipped += 1;
+                *skipped_by_agent.entry(entry.agent.clone()).or_default() += 1;
+                continue;
+            }
+        };
+        let mut frames = match parse_catalog_source(entry, &source_path, &source_allow) {
             Ok(frames) => frames,
             Err(error) => {
                 crate::diagnostics::log_describe(&format!(
@@ -161,7 +175,10 @@ pub fn build(
             continue;
         }
         let extract_path = extract_path_for(aicx_home, &entry.agent, &entry.session_id);
-        if !dry_run && cache_extracts && write_if_changed(&extract_path, extract.as_bytes())? {
+        if !dry_run
+            && cache_extracts
+            && write_if_changed(aicx_home, &extract_path, extract.as_bytes())?
+        {
             extracts_written += 1;
         }
         let indexed_path = if !dry_run && cache_extracts {
@@ -597,9 +614,14 @@ fn extract_path_for(aicx_home: &Path, agent: &str, session_id: &str) -> PathBuf 
         .join(format!("{safe}_conversation.md"))
 }
 
-fn write_if_changed(path: &Path, bytes: &[u8]) -> Result<bool> {
-    if fs::read(path).ok().as_deref() == Some(bytes) {
-        return Ok(false);
+fn write_if_changed(aicx_home: &Path, path: &Path, bytes: &[u8]) -> Result<bool> {
+    // Extracts live under aicx_home/extracts — prove containment before any IO.
+    let allow = crate::source_path::SourceAllowlist::from_roots([aicx_home.to_path_buf()]);
+    if path.exists() {
+        let existing = allow.read_bytes(path).ok();
+        if existing.as_deref() == Some(bytes) {
+            return Ok(false);
+        }
     }
     let parent = path
         .parent()
@@ -607,9 +629,21 @@ fn write_if_changed(path: &Path, bytes: &[u8]) -> Result<bool> {
     fs::create_dir_all(parent)
         .with_context(|| format!("create extract dir {}", parent.display()))?;
     let tmp = path.with_extension("md.tmp");
-    fs::write(&tmp, bytes).with_context(|| format!("write extract tmp {}", tmp.display()))?;
-    fs::rename(&tmp, path)
-        .with_context(|| format!("publish extract {} -> {}", tmp.display(), path.display()))?;
+    // Write path is derived solely from aicx_home + agent + sanitized session id
+    // (see extract_path_for); validate the final destination under aicx_home.
+    let write_path = crate::sanitize::validate_write_path(path)
+        .with_context(|| format!("validate extract write path {}", path.display()))?;
+    let tmp_write = crate::sanitize::validate_write_path(&tmp)
+        .with_context(|| format!("validate extract tmp path {}", tmp.display()))?;
+    fs::write(&tmp_write, bytes)
+        .with_context(|| format!("write extract tmp {}", tmp_write.display()))?;
+    fs::rename(&tmp_write, &write_path).with_context(|| {
+        format!(
+            "publish extract {} -> {}",
+            tmp_write.display(),
+            write_path.display()
+        )
+    })?;
     Ok(true)
 }
 
