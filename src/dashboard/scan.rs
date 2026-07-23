@@ -73,7 +73,7 @@ pub(super) fn scan_store(
         ));
     }
 
-    for stored_file in crate::store::scan_context_files_at(&store_root)? {
+    for stored_file in crate::legacy_archive::scan_context_files_at(&store_root)? {
         if !project_matches_filter(&stored_file.project, scope.project.as_deref()) {
             continue;
         }

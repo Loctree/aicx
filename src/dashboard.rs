@@ -45,7 +45,7 @@ impl DashboardScope {
     }
 }
 
-/// Strict project filter shared with `aicx::store::project_filter_matches`.
+/// Strict project filter shared with `aicx::legacy_archive::project_filter_matches`.
 ///
 /// Splits the canonical project slug into `<organization>/<repository>` (or
 /// `("", bucket)` when the slug is a single segment) and routes the user
@@ -61,7 +61,7 @@ pub fn project_matches_filter(project: &str, filter: Option<&str>) -> bool {
         return true;
     }
     let (organization, repository) = project.split_once('/').unwrap_or(("", project));
-    crate::store::project_filter_matches(organization, repository, needle)
+    crate::legacy_archive::project_filter_matches(organization, repository, needle)
 }
 
 pub fn date_matches_hours_scope(date_iso: &str, hours: Option<u64>) -> bool {

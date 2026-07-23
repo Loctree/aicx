@@ -11,7 +11,7 @@
 
 use aicx::api::Aicx;
 use aicx::intents::IntentsConfig;
-use aicx::store::ChunkRefSpec;
+use aicx::legacy_archive::ChunkRefSpec;
 
 fn main() -> anyhow::Result<()> {
     // 1. Resolve the store the same way Loctree does in-process

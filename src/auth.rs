@@ -80,7 +80,7 @@ impl AuthConfig {
 /// up with an auth token stranded in the default `~/.aicx` while
 /// everything else moves.
 fn default_token_path() -> Result<PathBuf> {
-    Ok(crate::store::resolve_aicx_home()?.join("auth-token"))
+    Ok(crate::legacy_archive::resolve_aicx_home()?.join("auth-token"))
 }
 
 /// Where the HTTP auth token resolves from, as a non-mutating probe.
