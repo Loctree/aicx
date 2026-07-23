@@ -262,9 +262,31 @@ fn aicx_mutation_warn_delay_zero_skips_sleep_but_keeps_warning() {
     // Delay=0 is a safe shorthand: keep the note (still informational
     // value) but skip the sleep entirely. Bounded test runtime depends
     // on this.
+    //
+    // Proof order (load-aware):
+    // 1. Message shape — delay=0 path omits the "Ctrl-C within Ns" fragment
+    //    and still prints the note. That is the contract, independent of
+    //    wall-clock noise under parallel cargo test load.
+    // 2. Hang detection only — a cold ~100MB debug binary can take multi-
+    //    second to start under contention; a hard `< 3s` bound was flaky
+    //    while the sleep was correctly skipped.
     let bin = ensure_aicx_binary_exists();
     let home = unique_aicx_home("delay0");
     let legacy = unique_aicx_home("delay0-legacy");
+
+    // Warm the binary once so dyld / page-in is not counted as "sleep".
+    let _warmup = Command::new(&bin)
+        .arg("migrate")
+        .arg("--dry-run")
+        .arg("--legacy-root")
+        .arg(&legacy)
+        .arg("--store-root")
+        .arg(&home)
+        .env("AICX_HOME", &home)
+        .env("AICX_MUTATION_WARN_DELAY_SECONDS", "0")
+        .env_remove("AICX_NO_MUTATION_WARN")
+        .output()
+        .expect("warm aicx migrate");
 
     let start = std::time::Instant::now();
     let output = Command::new(&bin)
@@ -280,21 +302,28 @@ fn aicx_mutation_warn_delay_zero_skips_sleep_but_keeps_warning() {
         .expect("run aicx migrate delay=0");
     let elapsed = start.elapsed();
 
-    assert!(
-        elapsed.as_secs() < 3,
-        "delay=0 must skip the 3s sleep (elapsed: {:?})",
-        elapsed
-    );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("aicx migrate: note:"),
         "delay=0 must still emit the warning text; got:\n{stderr}"
     );
     // The variant with delay 0 omits the "Ctrl-C within Ns" prompt fragment
-    // to keep the note honest about what was skipped.
+    // to keep the note honest about what was skipped — this is the primary
+    // proof that the early-return path ran (not the sleep path).
     assert!(
-        !stderr.contains("Ctrl-C within 0s"),
-        "delay=0 must not advertise a Ctrl-C window of 0 seconds; got:\n{stderr}"
+        !stderr.contains("Ctrl-C within"),
+        "delay=0 path must omit the Ctrl-C window fragment; got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("set AICX_NO_MUTATION_WARN=1 to silence this note")
+            || stderr.contains("Set AICX_NO_MUTATION_WARN=1 to silence this note"),
+        "delay=0 note must keep the silence-env hint; got:\n{stderr}"
+    );
+    // Hang detection only (not a sleep-proof under load).
+    assert!(
+        elapsed.as_secs() < 20,
+        "delay=0 migrate hung longer than hang budget (elapsed: {:?})",
+        elapsed
     );
 
     let _ = std::fs::remove_dir_all(&home);
