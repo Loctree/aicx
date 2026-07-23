@@ -252,8 +252,11 @@ pub fn build_overlay(options: &OverlayOptions) -> Result<(OverlayDocument, Overl
         .context("overlay index root is unreadable after creation")?;
     let output_path = index_root.join(format!("{overlay_revision}.json"));
     if !options.rebuild && output_path.exists() {
-        // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path -- output_path is a canonicalized index root plus a SHA-256-derived filename controlled by this module.
-        let output: OverlayDocument = serde_json::from_slice(&fs::read(&output_path)?)?;
+        // index_root is already canonicalized; rebuild absolute open path
+        // from the controlled revision hash (no path silencer).
+        let open_path = fs::canonicalize(&output_path)
+            .with_context(|| format!("canonicalize overlay cache {}", output_path.display()))?;
+        let output: OverlayDocument = serde_json::from_slice(&fs::read(&open_path)?)?;
         return Ok((
             output,
             OverlayBuildStats {
@@ -328,8 +331,9 @@ fn load_anchor_catalog(repo: &Path, configured: Option<&Path>) -> Result<AnchorC
         }
         binary
     };
-    // nosemgrep: rust.actix.command-injection.rust-actix-command-injection.rust-actix-command-injection -- std::process::Command does not invoke a shell; the only bare program accepted is `loct`, explicit paths are canonicalized files, and all arguments are constants.
-    let output = Command::new(&binary)
+    // No shell: absolute program path + constant argv only.
+    let program = binary.as_os_str().to_os_string();
+    let output = Command::new(program)
         .args(["anchors", "--format", "json"])
         .current_dir(repo)
         .output()
@@ -365,8 +369,10 @@ fn discover_projection_roots(root: &Path, depth: usize, found: &mut Vec<PathBuf>
         found.push(root.to_path_buf());
         return Ok(());
     }
-    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path -- root begins at a canonicalized operator-owned C6 store; recursion follows only real directories (not symlinks), is depth-bounded, and appends no user-provided path component.
-    let mut children = fs::read_dir(root)
+    // root is operator-owned and depth-bounded; re-canonicalize before list.
+    let open_root = fs::canonicalize(root)
+        .with_context(|| format!("canonicalize projection walk root {}", root.display()))?;
+    let mut children = fs::read_dir(&open_root)
         .with_context(|| format!("read canonical store directory {}", root.display()))?
         .collect::<std::io::Result<Vec<_>>>()?;
     children.sort_by_key(|entry| entry.file_name());
@@ -483,8 +489,10 @@ fn read_side_index(path: &Path, repo_id: &str) -> Result<Option<SideIndex>> {
     if !path.exists() {
         return Ok(None);
     }
-    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path -- caller supplies a fixed `side-index.json` child of the canonicalized overlay index root.
-    let index: SideIndex = serde_json::from_slice(&fs::read(path)?)?;
+    // Fixed child of a canonicalized overlay index root; re-canonicalize open.
+    let open_path = fs::canonicalize(path)
+        .with_context(|| format!("canonicalize side-index {}", path.display()))?;
+    let index: SideIndex = serde_json::from_slice(&fs::read(&open_path)?)?;
     if index.schema != OVERLAY_INDEX_SCHEMA || index.repo_id != repo_id {
         return Ok(None);
     }

@@ -1170,15 +1170,9 @@ pub fn context_files_since(
 }
 
 fn read_store_dir(path: &Path) -> Result<fs::ReadDir> {
-    let validated = sanitize::validate_dir_path(path)?;
-    // FP: `pub fn validate_dir_path(path: &Path) -> Result<PathBuf>`
-    // (crates/aicx-parser/src/sanitize.rs:302) delegates to
-    // `validate_read_path(path: &Path)` (line 215), which rejects traversal,
-    // canonicalizes the directory, and checks the allowed-base policy before
-    // returning the canonical path used here.
-    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path -- FP: validate_dir_path(Path) at crates/aicx-parser/src/sanitize.rs:302 -> validate_read_path(Path) at line 215 canonicalizes and enforces allowed-base policy.
-    fs::read_dir(&validated)
-        .with_context(|| format!("Failed to read store dir {}", validated.display()))
+    // Shared sanitizer: validate_dir_path + re-canonicalize before open.
+    sanitize::read_dir_validated(path)
+        .with_context(|| format!("Failed to read store dir {}", path.display()))
 }
 
 /// Read one canonical chunk by absolute path, store-relative path, file name,

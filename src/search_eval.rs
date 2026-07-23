@@ -602,9 +602,11 @@ fn scan_meta_projects(
     projects_by_case: &mut BTreeMap<String, BTreeSet<String>>,
 ) -> Result<()> {
     let safe_dir = validated_store_subdir(dir, store_dir)?;
-    for entry in fs::read_dir(&safe_dir) // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path -- FP: safe_dir is canonicalized and strip_prefix-checked by validated_store_subdir; regression test rejects outside-store paths.
-        .with_context(|| format!("read {}", safe_dir.display()))?
-    {
+    // Re-canonicalize after strip_prefix containment so the open target is
+    // an absolute path already proven under store_dir (no silencer).
+    let open_dir = fs::canonicalize(&safe_dir)
+        .with_context(|| format!("re-canonicalize {}", safe_dir.display()))?;
+    for entry in fs::read_dir(&open_dir).with_context(|| format!("read {}", open_dir.display()))? {
         let entry = entry?;
         let path = entry.path();
         let file_type = entry

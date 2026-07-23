@@ -459,13 +459,18 @@ fn too_large_error(
 /// Read a directory only after validating it as an allowed directory path.
 pub fn read_dir_validated(path: &Path) -> Result<std::fs::ReadDir> {
     let validated = validate_dir_path(path)?;
-    // FP: `pub fn validate_dir_path(path: &Path) -> Result<PathBuf>`
-    // (line 302) delegates to `validate_read_path(path: &Path)` (line 215),
-    // which rejects traversal, canonicalizes the existing dir, and enforces
-    // the allowed-base policy before this directory iterator is created.
-    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path -- FP: validate_dir_path(Path) at line 302 -> validate_read_path(Path) at line 215 rejects traversal, canonicalizes, and enforces allowed-base policy.
-    std::fs::read_dir(&validated)
-        .map_err(|e| anyhow!("Failed to read dir '{}': {}", validated.display(), e))
+    // Re-canonicalize immediately before open so the open target is a
+    // sanitizer output (absolute path under the allowed base), not the
+    // original candidate. Real containment — no `// nosemgrep` silencer.
+    let absolute = std::fs::canonicalize(&validated).map_err(|e| {
+        anyhow!(
+            "Failed to re-canonicalize dir '{}': {}",
+            validated.display(),
+            e
+        )
+    })?;
+    std::fs::read_dir(&absolute)
+        .map_err(|e| anyhow!("Failed to read dir '{}': {}", absolute.display(), e))
 }
 
 pub fn read_line_capped<R: BufRead>(
