@@ -33,12 +33,12 @@ use crate::chunker::{
     CARD_CLAIM_SCOPE_SESSION_CLOSE, CARD_FRESHNESS_CONTRACT_HISTORICAL, CARD_SCHEMA_VERSION,
     CARD_VERIFICATION_STATE_NOT_VERIFIED_BY_AICX, ChunkMetadataSidecar,
 };
+use crate::legacy_archive::atomic_write::atomic_write;
+use crate::legacy_archive::dedupe::content_sha256;
+use crate::legacy_archive::paths::canonical_store_dir;
+use crate::legacy_archive::sidecar::sidecar_path_for_chunk;
+use crate::legacy_archive::{is_context_corpus_sidecar, read_store_dir};
 use crate::sanitize;
-use crate::store::atomic_write::atomic_write;
-use crate::store::dedupe::content_sha256;
-use crate::store::paths::canonical_store_dir;
-use crate::store::sidecar::sidecar_path_for_chunk;
-use crate::store::{is_context_corpus_sidecar, read_store_dir};
 
 const CARDS_V2_MIGRATION_DIRNAME: &str = ".migration";
 const CARDS_V2_SUBDIR: &str = "cards-v2";
@@ -300,7 +300,7 @@ fn migrate_one_card(card_path: &Path, dry_run: bool) -> Result<CardOutcome> {
     let sidecar_path = sidecar_path_for_chunk(card_path);
     if !sidecar_path.exists() {
         tracing::warn!(
-            target: "aicx::store",
+            target: "aicx::legacy_archive",
             card = %card_path.display(),
             "cards-v2: orphan .md without sidecar; skipped (never deleted)"
         );

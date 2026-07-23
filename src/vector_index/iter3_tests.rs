@@ -78,7 +78,7 @@ fn partition_incremental_files_keeps_only_unembedded_and_fresh() {
         ("b", "2026-05-16T00:00:00Z"), // newer than cutoff
         ("c", "2026-05-16T00:00:00Z"), // newer than cutoff
     ];
-    let mut files: Vec<crate::store::StoredContextFile> = Vec::new();
+    let mut files: Vec<crate::legacy_archive::StoredContextFile> = Vec::new();
     for (id, mtime_rfc) in chunks {
         let path = dir.join(format!("{id}.md"));
         std::fs::write(&path, format!("# chunk {id}")).unwrap();
@@ -87,7 +87,7 @@ fn partition_incremental_files_keeps_only_unembedded_and_fresh() {
             .with_timezone(&chrono::Utc)
             .into();
         filetime::set_file_mtime(&path, filetime::FileTime::from_system_time(ts)).unwrap();
-        files.push(crate::store::StoredContextFile {
+        files.push(crate::legacy_archive::StoredContextFile {
             path,
             project: "test".into(),
             repo: None,
@@ -148,7 +148,7 @@ fn partition_incremental_files_reembeds_missing_id_with_old_mtime() {
             .into();
     filetime::set_file_mtime(&restored_path, filetime::FileTime::from_system_time(old_ts)).unwrap();
 
-    let files = vec![crate::store::StoredContextFile {
+    let files = vec![crate::legacy_archive::StoredContextFile {
         path: restored_path,
         project: "test".into(),
         repo: None,

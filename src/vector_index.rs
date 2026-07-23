@@ -1,6 +1,6 @@
 //! Vector index builder for `aicx` semantic search.
 //!
-//! Goal: take the canonical store ([`crate::store`]) markdown chunks and
+//! Goal: take the canonical store ([`crate::legacy_archive`]) markdown chunks and
 //! materialize a vector representation per chunk so `aicx search` can rank
 //! by cosine similarity rather than line-overlap fuzzy. The index is
 //! configuration-driven so the same command works for the in-process
@@ -403,7 +403,7 @@ pub fn dry_run_index(project: Option<&str>, sample: usize) -> Result<IndexStats>
         resume_tmp_path: None,
     };
 
-    let root = crate::store::store_base_dir()?;
+    let root = crate::legacy_archive::store_base_dir()?;
     let files = live_index_files(&root, project)?;
     stats.chunks_total = files.len();
 
@@ -435,7 +435,7 @@ pub fn dry_run_index(project: Option<&str>, sample: usize) -> Result<IndexStats>
 
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
 fn run_native_pass(
-    files: &[crate::store::StoredContextFile],
+    files: &[crate::legacy_archive::StoredContextFile],
     sample: usize,
     stats: &mut IndexStats,
 ) {
@@ -507,7 +507,7 @@ const CORRUPT_WARN_HEAD: usize = 5;
 /// project bucket. When `project == None`, returns the cross-project
 /// `_all` bucket path so an operator can index every chunk in one file.
 pub fn index_path(project: Option<&str>) -> Result<PathBuf> {
-    let base = crate::store::store_base_dir()?;
+    let base = crate::legacy_archive::store_base_dir()?;
     Ok(index_path_for(&base, project))
 }
 
@@ -783,11 +783,12 @@ pub fn hybrid_embedder_fingerprint(
 fn live_index_files(
     root: &std::path::Path,
     project: Option<&str>,
-) -> Result<Vec<crate::store::StoredContextFile>> {
-    let mut files = crate::store::scan_context_files_project_at(root, project)?;
+) -> Result<Vec<crate::legacy_archive::StoredContextFile>> {
+    let mut files = crate::legacy_archive::scan_context_files_project_at(root, project)?;
     files.retain(|file| {
-        !crate::store::load_sidecar(&file.path).is_some_and(|sidecar| {
-            sidecar.artifact_family.as_deref() == Some(crate::store::LOCT_CONTEXT_PACK_FAMILY)
+        !crate::legacy_archive::load_sidecar(&file.path).is_some_and(|sidecar| {
+            sidecar.artifact_family.as_deref()
+                == Some(crate::legacy_archive::LOCT_CONTEXT_PACK_FAMILY)
                 || sidecar
                     .truth_status
                     .as_ref()
@@ -1027,7 +1028,7 @@ pub fn write_index_with_options(
 
     let _lock = crate::locks::acquire_exclusive(crate::locks::lance_lock_path()?)?;
 
-    let root = crate::store::store_base_dir()?;
+    let root = crate::legacy_archive::store_base_dir()?;
     let all_files = live_index_files(&root, project)?;
     stats.chunks_total = all_files.len();
 
@@ -1093,7 +1094,7 @@ pub fn write_index_with_options(
     // newer than the baseline `generated_at` AND not already embedded
     // (id-set diff covers crash-recovery cases where mtime ≤ generated_at
     // but the row never made it into the committed index).
-    let files: Vec<crate::store::StoredContextFile> = match incremental_baseline.as_ref() {
+    let files: Vec<crate::legacy_archive::StoredContextFile> = match incremental_baseline.as_ref() {
         Some(baseline) => partition_incremental_files(&all_files, baseline),
         None => all_files.clone(),
     };
@@ -1191,7 +1192,7 @@ pub fn write_index_with_options(
     // Phase 1: classify the capped window into resumed-skip vs to-embed.
     // Skips are cheap and emitted inline; only genuinely new chunks flow into
     // the batch loop, so a resumed build never re-embeds a committed chunk.
-    let mut to_embed: Vec<(usize, &crate::store::StoredContextFile)> =
+    let mut to_embed: Vec<(usize, &crate::legacy_archive::StoredContextFile)> =
         Vec::with_capacity(cap.saturating_sub(resumed_ids.len()));
     for (item_index, stored) in files.iter().take(cap).enumerate() {
         let entry_id = chunk_id_from_path(&stored.path);
@@ -1228,7 +1229,7 @@ pub fn write_index_with_options(
 
         // Read + prefix each chunk in the batch. Read failures are recorded
         // per item and excluded from the embed call (they carry no text).
-        let mut batch_meta: Vec<(usize, &crate::store::StoredContextFile, String)> =
+        let mut batch_meta: Vec<(usize, &crate::legacy_archive::StoredContextFile, String)> =
             Vec::with_capacity(batch.len());
         let mut prefixes: Vec<String> = Vec::with_capacity(batch.len());
         for &(item_index, stored) in batch {
@@ -1430,7 +1431,7 @@ pub fn write_index_with_options(
     // Context-corpus commits AFTER primary. Tiny corpus; collect entries
     // in-memory so the header carries the truthful `entry_count` from the
     // first byte written (no rewrite needed).
-    let context_files = crate::store::scan_context_corpus_files_at(&root)?;
+    let context_files = crate::legacy_archive::scan_context_corpus_files_at(&root)?;
     if !context_files.is_empty() {
         let context_target = context_corpus_index_path(project)?;
         if let Some(parent) = context_target.parent() {
@@ -2573,9 +2574,9 @@ fn hybrid_manifest_matches_committed_source(
 /// tests.
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
 fn partition_incremental_files(
-    files: &[crate::store::StoredContextFile],
+    files: &[crate::legacy_archive::StoredContextFile],
     baseline: &IncrementalBaseline,
-) -> Vec<crate::store::StoredContextFile> {
+) -> Vec<crate::legacy_archive::StoredContextFile> {
     files
         .iter()
         .filter(|stored| {

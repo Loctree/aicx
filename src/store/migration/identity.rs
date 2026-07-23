@@ -39,9 +39,11 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::legacy_archive::atomic_write::atomic_write;
+use crate::legacy_archive::paths::{
+    identity_migration_manifest_path, identity_migration_report_path,
+};
 use crate::sanitize;
-use crate::store::atomic_write::atomic_write;
-use crate::store::paths::{identity_migration_manifest_path, identity_migration_report_path};
 
 /// Directories under `store/` that are reserved surfaces, not project
 /// buckets — never candidates for identity renames.
@@ -216,7 +218,7 @@ pub fn compute_store_recursive_hash(store_root: &Path) -> Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-fn compute_index_key_hash(index: &crate::store::StoreIndex, key: &str) -> String {
+fn compute_index_key_hash(index: &crate::legacy_archive::StoreIndex, key: &str) -> String {
     if let Some(project) = index.projects.get(key) {
         let json = serde_json::to_string(project).unwrap_or_default();
         let mut hasher = Sha256::new();
@@ -1033,7 +1035,7 @@ pub fn run_identity_migration_at(base: &Path, apply: bool) -> Result<IdentityMig
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::{AgentIndex, ProjectIndex, StoreIndex};
+    use crate::legacy_archive::{AgentIndex, ProjectIndex, StoreIndex};
     use std::collections::HashMap;
 
     // SYNTHETIC fixture store, shaped after the live drift documented in
@@ -1491,7 +1493,7 @@ mod tests {
         assert!(repo_names.contains(&"codescribe".to_string()));
         assert!(!repo_names.contains(&"CodeScribe".to_string()));
 
-        let index = crate::store::load_index_at(&base).unwrap();
+        let index = crate::legacy_archive::load_index_at(&base).unwrap();
         assert!(index.projects.contains_key("vetcoders/codescribe"));
         assert!(!index.projects.contains_key("VetCoders/CodeScribe"));
 
@@ -1507,7 +1509,7 @@ mod tests {
         assert!(repo_names2.contains(&"CodeScribe".to_string()));
         assert!(!repo_names2.contains(&"codescribe".to_string()));
 
-        let index = crate::store::load_index_at(&base).unwrap();
+        let index = crate::legacy_archive::load_index_at(&base).unwrap();
         assert!(!index.projects.contains_key("vetcoders/codescribe"));
         assert!(index.projects.contains_key("VetCoders/CodeScribe"));
 
