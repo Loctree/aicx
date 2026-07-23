@@ -257,9 +257,9 @@ fn ingest_historical_session(
         .env("HOME", &home)
         .env("USERPROFILE", &home)
         .env("AICX_ALLOW_TMP", "1")
-        // Strict-surface fixtures still seed transitional store cards so
-        // intents/MCP can read project identity. Production leaves this unset.
-        .env("AICX_ALLOW_CARD_MILL", "1")
+        // Card mill is removed from the operator binary; this fixture seeds
+        // sessions only. Project identity for intents must come from catalog.
+        .env_remove("AICX_ALLOW_CARD_MILL")
         .env_remove("AICX_HOME")
         .args(["codex", "-H", "0", "--emit", "json"])
         .output()

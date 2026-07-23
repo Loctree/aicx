@@ -2487,20 +2487,35 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
                 );
                 return Ok(());
             }
-            let has_explicit_since = since.is_some();
-            let cutoff = parse_ingest_since(since.as_deref())?;
-            run_store(StoreRunArgs {
+            // Card mill / `aicx store` is deleted. Agent session identity and
+            // search now flow: catalog rebuild → extract → source-driven index.
+            let _ = (
+                redaction,
                 project,
-                agent: Some(source.as_agent().to_string()),
                 hours,
-                cutoff,
-                full_rescan: full_rescan || has_explicit_since,
-                include_assistant: true,
+                since,
+                full_rescan,
+                no_noise_filter,
                 emit,
-                redact_secrets: redaction.redact_secrets,
-                noise_filter_enabled: !no_noise_filter,
-                operator_md_input: input,
-            })?;
+                input,
+            );
+            let json = aicx::cli::failure::want_json_envelope(false);
+            aicx::cli::failure::emit_and_error(
+                "aicx ingest",
+                json,
+                aicx::cli::failure::StructuredFailure::new(
+                    "card_mill_removed",
+                    format!(
+                        "per-frame store mill is removed; `aicx ingest --source {}` no longer writes ~/.aicx/store cards",
+                        source.as_agent()
+                    ),
+                    "run `aicx catalog rebuild`, then `aicx extract <agent> --session <id>`, then `aicx index`",
+                )
+                .with_fallback(
+                    "aicx catalog rebuild && aicx index   # source-driven lexical CURRENT",
+                ),
+            );
+            std::process::exit(2);
         }
         Some(Commands::List) => {
             let sources = sources::list_available_sources()?;
@@ -5122,7 +5137,7 @@ fn run_conversations_batch(options: ConversationsBatchOptions) -> Result<()> {
     emit_session_batch_summary("claude", &batch);
     // Unified all-skipped contract (O4): every batch surface exits 3 when
     // every selected session was skipped by diagnostics, with the same
-    // condition as `run_extraction`/`run_store` (`skipped == selected`;
+    // condition as `run_extraction` (`skipped == selected`;
     // `-p`-filtered sessions live outside `selected`). An empty window
     // stays exit 0.
     if batch.selected_sessions > 0
@@ -5830,33 +5845,6 @@ impl StoreScopeSurface {
             resolved_store_buckets: BTreeMap::new(),
         }
     }
-
-    fn from_store_summary(
-        requested_filters: &[String],
-        store_summary: &store::StoreWriteSummary,
-    ) -> Self {
-        Self {
-            requested_source_filters: normalized_requested_source_filters(requested_filters),
-            resolved_repositories: store_summary
-                .project_summary
-                .keys()
-                .filter(|bucket| bucket.as_str() != store::NON_REPOSITORY_CONTEXTS)
-                .cloned()
-                .collect(),
-            includes_non_repository_contexts: store_summary
-                .project_summary
-                .contains_key(store::NON_REPOSITORY_CONTEXTS),
-            resolved_store_buckets: store_summary.project_summary.clone(),
-        }
-    }
-
-    fn repository_buckets(&self) -> BTreeMap<String, BTreeMap<String, usize>> {
-        self.resolved_store_buckets
-            .iter()
-            .filter(|(bucket, _)| bucket.as_str() != store::NON_REPOSITORY_CONTEXTS)
-            .map(|(bucket, counts)| (bucket.clone(), counts.clone()))
-            .collect()
-    }
 }
 
 fn normalized_requested_source_filters(requested_filters: &[String]) -> Option<Vec<String>> {
@@ -5872,19 +5860,6 @@ fn render_requested_source_filters(requested_filters: &[String]) -> String {
         "(all sources)".to_string()
     } else {
         requested_filters.join(", ")
-    }
-}
-
-fn render_resolved_store_buckets(scope: &StoreScopeSurface) -> String {
-    if scope.resolved_store_buckets.is_empty() {
-        "(none written)".to_string()
-    } else {
-        scope
-            .resolved_store_buckets
-            .keys()
-            .cloned()
-            .collect::<Vec<_>>()
-            .join(", ")
     }
 }
 
@@ -6169,66 +6144,6 @@ struct ExtractionParams<'a> {
     emit: StdoutEmit,
 }
 
-struct StoreRunArgs {
-    project: Vec<String>,
-    agent: Option<String>,
-    hours: u64,
-    cutoff: Option<DateTime<Utc>>,
-    full_rescan: bool,
-    include_assistant: bool,
-    emit: StdoutEmit,
-    redact_secrets: bool,
-    /// Whether the chunker should strip structural noise. Mirrors
-    /// `ChunkerConfig::noise_filter_enabled`; the CLI surface is
-    /// `--no-noise-filter` (negated to keep the default ergonomic).
-    noise_filter_enabled: bool,
-    /// Optional explicit markdown file/directory for `operator-md` ingestion.
-    operator_md_input: Option<PathBuf>,
-}
-
-fn resolve_store_agents(agent: Option<&str>) -> Result<Vec<&'static str>> {
-    match agent {
-        Some("claude") => Ok(vec!["claude"]),
-        Some("claude-history") => Ok(vec!["claude-history"]),
-        Some("codex") => Ok(vec!["codex"]),
-        Some("codex-sessions") => Ok(vec!["codex-sessions"]),
-        Some("gemini") => Ok(vec!["gemini"]),
-        Some("junie") => Ok(vec!["junie"]),
-        Some("codescribe") => Ok(vec!["codescribe"]),
-        Some("operator-md") => Ok(vec!["operator-md"]),
-        Some(other) => Err(anyhow::anyhow!(
-            "Unsupported --agent '{}'. Expected one of: claude, claude-history, codex, codex-sessions, gemini, junie, grok, codescribe, operator-md.",
-            other
-        )),
-        // `codex-sessions` stays a valid explicit `--agent` alias above, but
-        // must NOT ride the default list: it maps to the same
-        // `AgentKind::Codex` rollout catalog as `codex` (since the parser
-        // transplant, 25fc6ec), so a default run would ingest every codex
-        // session twice and the canonical projection fail-closes on
-        // `duplicate canonical card id` (reproduced live 2026-07-22).
-        None => Ok(vec![
-            "claude",
-            "claude-history",
-            "codex",
-            "gemini",
-            "junie",
-            "codescribe",
-        ]),
-    }
-}
-
-fn parse_ingest_since(value: Option<&str>) -> Result<Option<DateTime<Utc>>> {
-    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
-        return Ok(None);
-    };
-    let date = parse_cli_date(Some(value), "--since")?
-        .ok_or_else(|| anyhow::anyhow!("Invalid --since value '{}'", value))?;
-    let datetime = date
-        .and_hms_opt(0, 0, 0)
-        .ok_or_else(|| anyhow::anyhow!("Invalid --since date '{}'", value))?;
-    Ok(Some(Utc.from_utc_datetime(&datetime)))
-}
-
 fn all_time_cutoff() -> DateTime<Utc> {
     DateTime::<Utc>::from_timestamp(0, 0).expect("Unix epoch timestamp is valid")
 }
@@ -6353,9 +6268,9 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
     let failures = aicx::progress::FailureLog::new();
 
     // ──────────────────────────────────────────────────────────────────
-    // Extract phase — same phased UX as `run_store` so `aicx all`,
-    // `aicx claude`, `aicx codex` etc. don't stall silently for 15-20
-    // minutes during a --full-rescan/-H 0 sweep of agent stores.
+    // Extract phase — phased UX so `aicx all`, `aicx claude`, `aicx codex`
+    // etc. don't stall silently for 15-20 minutes during a --full-rescan/-H 0
+    // sweep of agent session roots.
     // Heartbeat uses exponential backoff (2s → 60s cap) so long
     // single-agent extracts emit a handful of ticks, not hundreds.
     // ──────────────────────────────────────────────────────────────────
@@ -6579,90 +6494,22 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
         sessions,
     };
 
-    let chunker_config = aicx::chunker::ChunkerConfig::default();
-    let mut all_written_paths: Vec<std::path::PathBuf> = Vec::new();
-    let mut written_empty_body_skipped = 0usize;
-    let mut scope_surface = StoreScopeSurface::empty(&project);
+    let all_written_paths: Vec<std::path::PathBuf> = Vec::new();
+    let written_empty_body_skipped = 0usize;
+    let scope_surface = StoreScopeSurface::empty(&project);
 
     if !output_entries.is_empty() {
         // Chunk phase — segments were prepared upstream (per-canonical-repo
         // dedup + self_echo). Denominator is segments so `current/total`
         // reflects actual write progress.
         //
-        // Card mill is retired by default (catalog + extracts + index). When
-        // disabled, skip the store write entirely so dual-body file trees do
-        // not re-grow under ~/.aicx/store.
-        if !store::card_mill_writes_enabled() {
-            eprintln!(
-                "  Card mill retired: not writing ~/.aicx/store cards ({} entries kept in memory for reports only).",
-                output_entries.len()
-            );
-            eprintln!(
-                "  Identity path: `aicx catalog rebuild` → `aicx extract` → `aicx index`. Salvage only: AICX_ALLOW_CARD_MILL=1"
-            );
-        } else {
-            let segment_count = segments.len();
-            let chunk_phase =
-                aicx::progress::Phase::start(reporter.clone(), "chunk", Some(segment_count as u64));
-            let store_result = store::store_segments_at(
-                &aicx::store::store_base_dir()?,
-                &segments,
-                &chunker_config,
-                |done, _total| chunk_phase.tick(done as u64),
-            );
-            let store_summary = match store_result {
-                Ok(summary) => {
-                    let written = summary.written_paths.len() as u64;
-                    chunk_phase.finish_ok(format!("{written} chunks"));
-                    summary
-                }
-                Err(e) => {
-                    let record =
-                        chunk_phase.finish_err(&e, aicx::progress::recovery_hint_for("chunk"));
-                    failures.record(record);
-                    let _ = aicx::progress::render_failure_tail(&failures);
-                    return Err(e);
-                }
-            };
-            scope_surface = StoreScopeSurface::from_store_summary(&project, &store_summary);
-            written_empty_body_skipped = store_summary.skipped_empty_body;
-            let newly_written_paths = store_summary.written_paths.clone();
-            all_written_paths.extend(newly_written_paths.iter().cloned());
-
-            // Update fast local metadata index
-            if let Ok(rt) = tokio::runtime::Runtime::new() {
-                let path_refs: Vec<&PathBuf> = newly_written_paths.iter().collect();
-                if let Err(e) = rt.block_on(aicx::steer_index::sync_steer_index_with_progress(
-                    &path_refs,
-                    reporter.clone(),
-                    &failures,
-                )) {
-                    eprintln!("⚠ steer index sync failed (search may be stale): {e}");
-                }
-            }
-
-            // Summary to stderr (diagnostics)
-            eprintln!(
-                "✓ {} entries → {} chunks",
-                output_entries.len(),
-                all_written_paths.len(),
-            );
-            if written_empty_body_skipped > 0 {
-                eprintln!("  Skipped {written_empty_body_skipped} empty-body chunk(s)");
-            }
-            for (repo, agents_map) in &store_summary.project_summary {
-                let total: usize = agents_map.values().sum();
-                let detail: Vec<String> = agents_map
-                    .iter()
-                    .map(|(a, c)| format!("{}: {}", a, c))
-                    .collect();
-                eprintln!("  {}: {} entries ({})", repo, total, detail.join(", "));
-            }
-            eprintln!(
-                "  Resolved store buckets: {}",
-                render_resolved_store_buckets(&scope_surface)
-            );
-        }
+        // Card mill deleted: never write ~/.aicx/store cards. Entries stay
+        // in memory for optional local reports only.
+        eprintln!(
+            "  Card mill removed: not writing ~/.aicx/store cards ({} entries kept in memory for reports only).",
+            output_entries.len()
+        );
+        eprintln!("  Identity path: `aicx catalog rebuild` → `aicx extract` → `aicx index`");
     }
 
     // stdout emission (integration-friendly).
@@ -6868,443 +6715,6 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
             metadata.sessions.len(),
             agents.join("+"),
         );
-    }
-
-    if aicx::progress::render_failure_tail(&failures) {
-        std::process::exit(2);
-    }
-
-    Ok(())
-}
-
-/// Store extracted contexts in the canonical corpus.
-fn run_store(args: StoreRunArgs) -> Result<()> {
-    let StoreRunArgs {
-        project,
-        agent,
-        hours,
-        cutoff,
-        full_rescan,
-        include_assistant,
-        emit,
-        redact_secrets,
-        noise_filter_enabled,
-        operator_md_input,
-    } = args;
-
-    let cutoff = cutoff.unwrap_or_else(|| lookback_cutoff(hours));
-
-    let agents = resolve_store_agents(agent.as_deref())?;
-
-    // Hold the state lock across the full read-modify-write cycle so two
-    // concurrent store runs cannot clobber each other's state.
-    let _state_guard = aicx::locks::acquire_exclusive(aicx::locks::state_lock_path()?)?;
-
-    let mut state = StateManager::load()?;
-    let source_key = extraction_source_key(&agents, &project);
-    let source_aliases = extraction_source_key_aliases(&agents, &project);
-    state.migrate_watermark_aliases(&source_key, &source_aliases);
-    let watermark = if full_rescan {
-        None
-    } else {
-        state.get_watermark(&source_key)
-    };
-
-    let config = ExtractionConfig {
-        project_filter: project.clone(),
-        cutoff,
-        include_assistant,
-        watermark,
-    };
-    eprintln!(
-        "  Requested source filters: {}",
-        render_requested_source_filters(&project)
-    );
-
-    let structured_emit = matches!(emit, StdoutEmit::Json);
-    let reporter = aicx::progress::select_reporter(structured_emit);
-    let failures = aicx::progress::FailureLog::new();
-
-    // ──────────────────────────────────────────────────────────────────
-    // Extract phase
-    //
-    // Each agent's extractor is opaque from the outside (it walks
-    // `~/.claude/projects/`, `~/.codex/`, etc. on its own), so we wrap
-    // each call in a heartbeat so the operator still sees the spinner
-    // and elapsed-time advance during a long `--full-rescan -H 0` run.
-    // Per-agent ticks raise the heartbeat floor so the final tick value
-    // reflects accumulated entries, not just heartbeat counts.
-    // ──────────────────────────────────────────────────────────────────
-    let extract_phase =
-        aicx::progress::Phase::start(reporter.clone(), "extract", Some(agents.len() as u64));
-    let mut all_entries = Vec::new();
-    let mut selected_sessions = 0usize;
-    let mut ingested_sessions = 0usize;
-    let mut skipped_sessions = 0usize;
-    let mut canonical_cards = Vec::new();
-    let mut ingested_session_ids = BTreeSet::new();
-    let mut agents_done: u64 = 0;
-    for &ag in &agents {
-        // Backoff so a long single-agent extract (e.g. ~/.claude/projects/
-        // walking thousands of JSONL files) doesn't flood the structured
-        // log with one tick every 2s; first few ticks fire fast so the
-        // operator sees the spinner come alive, then settle to a 60s cap.
-        let hb = aicx::progress::Heartbeat::spawn_with_backoff(
-            extract_phase.clone(),
-            std::time::Duration::from_secs(2),
-            std::time::Duration::from_secs(60),
-        );
-        let agent_entries_result = match ag {
-            "claude" => {
-                sources::extract_agent_sessions(aicx::session_catalog::AgentKind::Claude, &config)
-            }
-            "codex" | "codex-sessions" => {
-                sources::extract_agent_sessions(aicx::session_catalog::AgentKind::Codex, &config)
-            }
-            "gemini" => {
-                sources::extract_agent_sessions(aicx::session_catalog::AgentKind::Gemini, &config)
-            }
-            "junie" => {
-                sources::extract_agent_sessions(aicx::session_catalog::AgentKind::Junie, &config)
-            }
-            "grok" | "grok-sessions" => {
-                sources::extract_agent_sessions(aicx::session_catalog::AgentKind::Grok, &config)
-            }
-            "codescribe" => aicx::importers::extract_codescribe(&config)
-                .map(sources::SessionExtractionBatch::from_entries),
-            "operator-md" => if let Some(input) = operator_md_input.as_deref() {
-                let home = dirs::home_dir().context("No home dir")?;
-                aicx::importers::extract_operator_markdown_from_input(&home, input, &config)
-            } else {
-                aicx::importers::extract_operator_markdown(&config)
-            }
-            .map(sources::SessionExtractionBatch::from_entries),
-            _ => Ok(sources::SessionExtractionBatch::default()),
-        };
-        hb.stop();
-        let agent_batch = match agent_entries_result {
-            Ok(batch) => batch,
-            Err(e) => {
-                let record =
-                    extract_phase.finish_err(&e, aicx::progress::recovery_hint_for("extract"));
-                failures.record(record);
-                let _ = aicx::progress::render_failure_tail(&failures);
-                return Err(e);
-            }
-        };
-        emit_session_batch_summary(ag, &agent_batch);
-        selected_sessions += agent_batch.selected_sessions;
-        ingested_sessions += agent_batch.ingested_sessions;
-        skipped_sessions += agent_batch.skipped.len();
-        canonical_cards.extend(agent_batch.canonical_cards);
-        ingested_session_ids.extend(agent_batch.ingested_session_ids);
-        let agent_entries = agent_batch.entries;
-        eprintln!("  [{}] {} entries", ag, agent_entries.len());
-        all_entries.extend(agent_entries);
-        agents_done += 1;
-        extract_phase.tick(agents_done);
-    }
-    if selected_sessions > 0 && ingested_sessions == 0 && skipped_sessions == selected_sessions {
-        let error = anyhow::anyhow!(
-            "all {selected_sessions} selected session(s) were skipped; no invalid session was ingested"
-        );
-        let record =
-            extract_phase.finish_err(&error, Some("inspect the per-session recover hints above"));
-        failures.record(record);
-        let _ = aicx::progress::render_failure_tail(&failures);
-        std::process::exit(3);
-    }
-    extract_phase.finish_ok(format!(
-        "{} agents → {} entries; ingested={} skipped={}",
-        agents.len(),
-        all_entries.len(),
-        ingested_sessions,
-        skipped_sessions
-    ));
-
-    all_entries.sort_by_key(|a| a.timestamp);
-
-    // ──────────────────────────────────────────────────────────────────
-    // Watermark capture (#19): record the latest raw-extract timestamp
-    // BEFORE any filtering. The post-filter `all_entries.last()` is not
-    // a safe watermark source — self-echo or dedup can drop the tail,
-    // leaving a watermark that re-extracts the same tail every run.
-    // ──────────────────────────────────────────────────────────────────
-    let raw_extract_latest: Option<DateTime<Utc>> = if skipped_sessions == 0 {
-        all_entries.last().map(|e| e.timestamp)
-    } else {
-        eprintln!(
-            "  Watermark held: {skipped_sessions} skipped session(s) remain eligible for retry"
-        );
-        None
-    };
-
-    // ──────────────────────────────────────────────────────────────────
-    // Redact phase (#6): redaction must happen BEFORE dedup so the hash
-    // domain converges across incremental and --full-rescan paths. The
-    // legacy ordering hashed pre-redact in incremental and post-redact
-    // in full_rescan, producing two competing seen_hashes universes.
-    // ──────────────────────────────────────────────────────────────────
-    if redact_secrets {
-        for e in &mut all_entries {
-            e.message = aicx::redact::redact_secrets(&e.message);
-        }
-    }
-    if !noise_filter_enabled {
-        eprintln!(
-            "  [warn] --no-noise-filter active: chunks will retain raw scaffolding (line-numbered grep, tool echoes, YAML delimiters)"
-        );
-    }
-    let chunker_config = aicx::chunker::ChunkerConfig {
-        noise_filter_enabled,
-        ..aicx::chunker::ChunkerConfig::default()
-    };
-
-    // ──────────────────────────────────────────────────────────────────
-    // Segment phase (moved UP, ahead of dedup): per-canonical-repo dedup
-    // (#8) needs the canonical repo identity from each segment, so
-    // segmentation runs first. Progress denominator = entry count so
-    // operators see real percentage during long rescans (pass-4 UX
-    // follow-up to D-2-cluster).
-    // ──────────────────────────────────────────────────────────────────
-    let segment_total = all_entries.len() as u64;
-    let segment_phase =
-        aicx::progress::Phase::start(reporter.clone(), "segment", Some(segment_total));
-    let segments = {
-        let hb = aicx::progress::Heartbeat::spawn_with_backoff(
-            segment_phase.clone(),
-            std::time::Duration::from_secs(2),
-            std::time::Duration::from_secs(60),
-        );
-        let result =
-            aicx::segmentation::semantic_segments_with_progress(&all_entries, |processed| {
-                hb.raise_floor(processed as u64)
-            });
-        hb.stop();
-        result
-    };
-    let segment_count_pre = segments.len();
-    segment_phase.finish_ok(format!(
-        "{} entries → {} segments",
-        all_entries.len(),
-        segment_count_pre
-    ));
-
-    // ──────────────────────────────────────────────────────────────────
-    // Dedup phase (#8): keyed on per-segment canonical repo slug rather
-    // than `_global` / `project.join("+")`. Cross-repo content
-    // collisions no longer falsely dedup. Legacy buckets in state.json
-    // stay as stale and are evicted by prune_old_hashes over time.
-    // ──────────────────────────────────────────────────────────────────
-    let pre_dedup: usize = segments.iter().map(|s| s.entries.len()).sum();
-    let dedup_phase =
-        aicx::progress::Phase::start(reporter.clone(), "dedup", Some(pre_dedup as u64));
-    let segments = dedup_segments_per_repo(segments, &mut state, full_rescan, |scanned| {
-        dedup_phase.tick(scanned as u64)
-    });
-    let post_dedup: usize = segments.iter().map(|s| s.entries.len()).sum();
-    let dedup_skipped = pre_dedup.saturating_sub(post_dedup);
-    dedup_phase.finish_ok(format!(
-        "kept {post_dedup} / {pre_dedup} (skipped {dedup_skipped})"
-    ));
-    if dedup_skipped > 0 {
-        eprintln!("  Dedup: {pre_dedup} → {post_dedup} entries (skipped {dedup_skipped} seen)");
-    }
-
-    // ──────────────────────────────────────────────────────────────────
-    // Self-echo phase (per-segment): drop aicx tool-echo entries within
-    // each segment, then drop segments that emptied.
-    // ──────────────────────────────────────────────────────────────────
-    let pre_echo = post_dedup;
-    let echo_phase =
-        aicx::progress::Phase::start(reporter.clone(), "self_echo", Some(pre_echo as u64));
-    let segments = {
-        const ECHO_TICK_EVERY: usize = 500;
-        let mut scanned: usize = 0;
-        let mut out = Vec::with_capacity(segments.len());
-        for mut seg in segments {
-            seg.entries.retain(|e| {
-                scanned += 1;
-                if scanned.is_multiple_of(ECHO_TICK_EVERY) {
-                    echo_phase.tick(scanned as u64);
-                }
-                !aicx::sanitize::is_self_echo(&e.message)
-            });
-            if !seg.entries.is_empty() {
-                out.push(seg);
-            }
-        }
-        echo_phase.tick(scanned as u64);
-        out
-    };
-    let post_echo: usize = segments.iter().map(|s| s.entries.len()).sum();
-    let echo_filtered = pre_echo.saturating_sub(post_echo);
-    echo_phase.finish_ok(format!(
-        "kept {post_echo} / {pre_echo} (filtered {echo_filtered})"
-    ));
-    if echo_filtered > 0 {
-        eprintln!("  Filtered {echo_filtered} self-echo entries");
-    }
-
-    let mut stored_count = 0;
-    let mut all_written_paths = Vec::new();
-    let mut scope_surface = StoreScopeSurface::empty(&project);
-    let mut skipped_empty_body = 0;
-    let mut deduped_chunks = 0;
-
-    if post_echo == 0 {
-        eprintln!("No entries found.");
-    } else if !store::card_mill_writes_enabled() {
-        // Ingest used to be the card mill. That dual body is retired: keep
-        // watermarks/state accounting below, but never re-grow ~/.aicx/store.
-        stored_count = post_echo;
-        eprintln!(
-            "  Card mill retired: not writing ~/.aicx/store cards ({} entries processed, 0 chunks written).",
-            stored_count
-        );
-        eprintln!(
-            "  Identity path: `aicx catalog rebuild` → `aicx extract` → `aicx index`. Salvage only: AICX_ALLOW_CARD_MILL=1"
-        );
-    } else {
-        // ──────────────────────────────────────────────────────────────
-        // Chunk phase — denominator is segments (not entries), so the
-        // `current/total` ratio reflects actual write progress.
-        // ──────────────────────────────────────────────────────────────
-        let segment_count = segments.len();
-        let chunk_phase =
-            aicx::progress::Phase::start(reporter.clone(), "chunk", Some(segment_count as u64));
-        let store_result = store::store_segments_at(
-            &aicx::store::store_base_dir()?,
-            &segments,
-            &chunker_config,
-            |done, _total| chunk_phase.tick(done as u64),
-        );
-        let store_summary = match store_result {
-            Ok(summary) => {
-                let written = summary.written_paths.len() as u64;
-                chunk_phase.finish_ok(format!("{written} chunks"));
-                summary
-            }
-            Err(e) => {
-                let record = chunk_phase.finish_err(&e, aicx::progress::recovery_hint_for("chunk"));
-                failures.record(record);
-                let _ = aicx::progress::render_failure_tail(&failures);
-                return Err(e);
-            }
-        };
-
-        stored_count = store_summary.total_entries;
-        all_written_paths = store_summary.written_paths.clone();
-        scope_surface = StoreScopeSurface::from_store_summary(&project, &store_summary);
-        skipped_empty_body = store_summary.skipped_empty_body;
-        deduped_chunks = store_summary.deduped_chunks;
-
-        if let Ok(rt) = tokio::runtime::Runtime::new() {
-            let path_refs: Vec<&PathBuf> = all_written_paths.iter().collect();
-            if let Err(e) = rt.block_on(aicx::steer_index::sync_steer_index_with_progress(
-                &path_refs,
-                reporter.clone(),
-                &failures,
-            )) {
-                eprintln!("⚠ steer index sync failed (search may be stale): {e}");
-            }
-        }
-
-        eprintln!(
-            "✓ {} entries → {} chunks",
-            stored_count,
-            all_written_paths.len(),
-        );
-        if store_summary.skipped_empty_body > 0 {
-            eprintln!(
-                "  Skipped {} empty-body chunk(s)",
-                store_summary.skipped_empty_body
-            );
-        }
-        if store_summary.deduped_chunks > 0 {
-            eprintln!(
-                "  Deduped {} content-identical chunk(s)",
-                store_summary.deduped_chunks
-            );
-        }
-        for (repo, agents_map) in &store_summary.project_summary {
-            let total: usize = agents_map.values().sum();
-            let detail: Vec<String> = agents_map
-                .iter()
-                .map(|(a, c)| format!("{}: {}", a, c))
-                .collect();
-            eprintln!("  {}: {} entries ({})", repo, total, detail.join(", "));
-        }
-        eprintln!(
-            "  Resolved store buckets: {}",
-            render_resolved_store_buckets(&scope_surface)
-        );
-    }
-
-    if let Some(path) = commit_canonical_projection(canonical_cards, &ingested_session_ids)? {
-        eprintln!("  Canonical projection: {}", path.display());
-    }
-
-    // ──────────────────────────────────────────────────────────────────
-    // Watermark write (#19): advance from `raw_extract_latest` captured
-    // BEFORE filtering, not from the post-filter survivor list. This
-    // closes the self-echo-tail re-extract loop.
-    // ──────────────────────────────────────────────────────────────────
-    if let Some(latest) = raw_extract_latest {
-        state.update_watermark(&source_key, latest);
-    }
-
-    // For --full-rescan, dedup_segments_per_repo skips persistent
-    // mark_seen during the run; we mark surviving entries now so future
-    // incremental runs honor what just landed.
-    if full_rescan {
-        for seg in &segments {
-            let project_label = seg.project_label();
-            let overlap_project = format!("_overlap:{project_label}");
-            for e in &seg.entries {
-                let exact =
-                    StateManager::content_hash(&e.agent, e.timestamp.timestamp(), &e.message);
-                let overlap = StateManager::overlap_hash(e.timestamp.timestamp(), &e.message);
-                state.mark_seen(&project_label, exact);
-                state.mark_seen(&overlap_project, overlap);
-            }
-        }
-    }
-    state.record_run(
-        stored_count,
-        agents.iter().map(|agent| (*agent).to_string()).collect(),
-    );
-    state.prune_old_hashes(50_000);
-    state.save()?;
-
-    match emit {
-        StdoutEmit::Paths => {
-            for path in &all_written_paths {
-                println!("{}", path.display());
-            }
-        }
-        StdoutEmit::Json => {
-            let store_paths: Vec<String> = all_written_paths
-                .iter()
-                .map(|path| path.display().to_string())
-                .collect();
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&serde_json::json!({
-                    "total_entries": stored_count,
-                    "total_chunks": all_written_paths.len(),
-                    "requested_source_filters": scope_surface.requested_source_filters,
-                    "resolved_repositories": scope_surface.resolved_repositories,
-                    "includes_non_repository_contexts": scope_surface.includes_non_repository_contexts,
-                    "resolved_store_buckets": scope_surface.resolved_store_buckets,
-                    "repos": scope_surface.repository_buckets(),
-                    "store_paths": store_paths,
-                    "written_empty_body_skipped": skipped_empty_body,
-                    "deduped_chunks": deduped_chunks,
-                }))?
-            );
-        }
-        StdoutEmit::None => {}
     }
 
     if aicx::progress::render_failure_tail(&failures) {

@@ -3309,36 +3309,6 @@ fn lane_claim_source_filter_uses_shared_agent_role_predicate() {
     }
 }
 
-#[test]
-fn default_store_agents_ingest_each_physical_source_once() {
-    // Live regression 2026-07-22: `codex` and `codex-sessions` both resolve
-    // to AgentKind::Codex (~/.codex/sessions rollouts), so a default
-    // `aicx store`/`aicx index` run ingested every codex session twice and
-    // the canonical projection fail-closed on `duplicate canonical card id`.
-    // The alias stays explicit-only; the default list names each extraction
-    // root exactly once.
-    let defaults = resolve_store_agents(None).expect("default agent list resolves");
-    assert!(
-        defaults.contains(&"codex"),
-        "codex stays in the default run"
-    );
-    assert!(
-        !defaults.contains(&"codex-sessions"),
-        "codex-sessions is an explicit-only alias of codex; both in the \
-         default list means dual ingest of the same rollout catalog"
-    );
-    assert!(
-        !defaults.contains(&"grok-sessions"),
-        "grok-sessions is an explicit-only alias of grok"
-    );
-    let mut sorted = defaults.clone();
-    sorted.sort_unstable();
-    sorted.dedup();
-    assert_eq!(sorted.len(), defaults.len(), "no duplicate default agents");
-
-    // The explicit alias keeps working for operators who ask for it by name.
-    assert_eq!(
-        resolve_store_agents(Some("codex-sessions")).expect("explicit alias resolves"),
-        vec!["codex-sessions"]
-    );
-}
+// `run_store` / `resolve_store_agents` / `StoreRunArgs` deleted from main.rs.
+// Identity path: catalog rebuild → extract → source-driven index.
+// Runtime grammar coverage: `tests/runtime_cli_store_contract.rs`.

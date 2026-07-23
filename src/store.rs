@@ -769,28 +769,16 @@ fn chunk_line_has_signal(line: &str) -> bool {
     true
 }
 
-/// Whether the retired per-frame card mill may write under a store root.
+/// Whether the per-frame card mill may write under a store root.
 ///
-/// Default is **off** for the operator binary. Identity is catalog, extracts,
-/// and the source-driven index. The mill remains as library code for unit tests
-/// and explicit salvage (`migrate`, `AICX_ALLOW_CARD_MILL=1`).
+/// **Always false for the operator binary.** The mill concept is deleted:
+/// identity is catalog + extracts + source-driven index. Library unit tests
+/// (`cfg(test)`) still exercise the write helpers so historical contracts can
+/// be migrated off the mill without reopening an operator salvage env.
 ///
-/// * Unit tests (`cfg(test)`) keep the mill enabled so library contracts remain
-///   executable without env ceremony.
-/// * Integration tests that still seed cards via the CLI binary must set
-///   `AICX_ALLOW_CARD_MILL=1`.
-/// * Production operators never set that env; dual-body growth stops.
+/// There is no `AICX_ALLOW_CARD_MILL` escape hatch.
 pub fn card_mill_writes_enabled() -> bool {
-    if cfg!(test) {
-        return true;
-    }
-    match std::env::var("AICX_ALLOW_CARD_MILL") {
-        Ok(value) => {
-            let value = value.trim();
-            value == "1" || value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("yes")
-        }
-        Err(_) => false,
-    }
+    cfg!(test)
 }
 
 pub fn store_semantic_segments(
@@ -827,11 +815,10 @@ where
     store_segments_at(base, &segments, chunker_config, progress)
 }
 
-/// Force a card-mill write for explicit salvage/migration only.
+/// Legacy force-write entry used by migration tests only.
 ///
-/// Prefer catalog rebuild + extract + index. This bypasses
-/// [`card_mill_writes_enabled`] so `aicx migrate` can still rebuild a
-/// transitional tree without reopening the default operator path.
+/// Outside `cfg(test)` this is identical to [`store_semantic_segments_at`]:
+/// the card mill does not write. There is no operator salvage path.
 pub fn store_semantic_segments_at_forced<F>(
     base: &Path,
     entries: &[TimelineEntry],
@@ -841,11 +828,7 @@ pub fn store_semantic_segments_at_forced<F>(
 where
     F: FnMut(usize, usize),
 {
-    if entries.is_empty() {
-        return Ok(StoreWriteSummary::default());
-    }
-    let segments = semantic_segments(entries);
-    store_segments_at_forced(base, &segments, chunker_config, progress)
+    store_semantic_segments_at(base, entries, chunker_config, progress)
 }
 
 /// Write pre-computed [`SemanticSegment`]s to the canonical store. This
@@ -871,7 +854,8 @@ where
     store_segments_at_impl(base, segments, chunker_config, progress)
 }
 
-/// Explicit card-mill write (migration/salvage). See [`store_segments_at`].
+/// Legacy force-write entry. Outside tests the mill is off; see
+/// [`store_segments_at`].
 pub fn store_segments_at_forced<F>(
     base: &Path,
     segments: &[SemanticSegment],
@@ -881,7 +865,7 @@ pub fn store_segments_at_forced<F>(
 where
     F: FnMut(usize, usize),
 {
-    store_segments_at_impl(base, segments, chunker_config, progress)
+    store_segments_at(base, segments, chunker_config, progress)
 }
 
 fn store_segments_at_impl<F>(

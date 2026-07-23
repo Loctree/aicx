@@ -157,16 +157,11 @@ fn ensure_aicx_binary_exists() -> PathBuf {
 }
 
 fn run_aicx(home: &Path, args: &[&str]) -> Output {
-    // Legacy mill contracts still seed cards under a temp HOME. Production
-    // binaries leave AICX_ALLOW_CARD_MILL unset (mill silent).
-    run_aicx_with_card_mill(home, args, true)
+    // Card mill is removed from the operator binary — no salvage env.
+    run_aicx_card_mill_disabled(home, args)
 }
 
 fn run_aicx_card_mill_disabled(home: &Path, args: &[&str]) -> Output {
-    run_aicx_with_card_mill(home, args, false)
-}
-
-fn run_aicx_with_card_mill(home: &Path, args: &[&str], allow_card_mill: bool) -> Output {
     fs::create_dir_all(home).expect("create temp HOME");
     let mut cmd = Command::new(ensure_aicx_binary_exists());
     cmd.args(args)
@@ -174,12 +169,8 @@ fn run_aicx_with_card_mill(home: &Path, args: &[&str], allow_card_mill: bool) ->
         // Windows resolves the home dir from USERPROFILE, not HOME (dirs::home_dir).
         .env("USERPROFILE", home)
         .env("AICX_ALLOW_TMP", "1")
-        .env_remove("AICX_HOME");
-    if allow_card_mill {
-        cmd.env("AICX_ALLOW_CARD_MILL", "1");
-    } else {
-        cmd.env_remove("AICX_ALLOW_CARD_MILL");
-    }
+        .env_remove("AICX_HOME")
+        .env_remove("AICX_ALLOW_CARD_MILL");
     cmd.output().expect("run aicx")
 }
 
@@ -221,15 +212,6 @@ fn json_paths(value: &Value, key: &str) -> Vec<PathBuf> {
                     .to_string(),
             )
         })
-        .collect()
-}
-
-fn json_strings(value: &Value, key: &str) -> Vec<String> {
-    value[key]
-        .as_array()
-        .expect("json array")
-        .iter()
-        .map(|entry| entry.as_str().expect("json string").to_string())
         .collect()
 }
 
@@ -561,8 +543,7 @@ fn retired_store_subcommand_is_rejected() {
 
 #[test]
 fn default_cli_extraction_does_not_grow_store_without_card_mill_flag() {
-    // Dual-body silence: without AICX_ALLOW_CARD_MILL, agent extraction must
-    // not create ~/.aicx/store card trees (catalog + extracts are identity).
+    // Dual-body silence: operator binary never writes ~/.aicx/store cards.
     let root = unique_test_dir("card-mill-silent");
     let home = root.join("home");
     let repo_root = home.join("hosted").join("Vetcoders").join("aicx");
@@ -593,7 +574,7 @@ fn default_cli_extraction_does_not_grow_store_without_card_mill_flag() {
     assert_success(&output);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("Card mill retired"),
+        stderr.contains("Card mill removed") || stderr.contains("Card mill retired"),
         "operator must see explicit dual-body silence; stderr was:\n{stderr}"
     );
     assert!(
@@ -665,45 +646,26 @@ fn store_cli_codex_emits_repo_and_non_repo_canonical_roots() {
     );
 
     let output = run_aicx(&home, &["codex", "-H", "24", "--emit", "json"]);
+    assert_success(&output);
     let payload = parse_stdout_json(&output);
     let store_paths = json_paths(&payload, "store_paths");
-    let resolved_repositories = json_strings(&payload, "resolved_repositories");
+    let stderr = String::from_utf8_lossy(&output.stderr);
 
+    // Card mill is deleted: extract may still parse sessions, but it must not
+    // materialize per-frame store paths under ~/.aicx/store.
     assert!(
-        store_paths.len() >= 2,
-        "expected at least 2 store paths (repo + non-repo), got {}",
-        store_paths.len()
+        store_paths.is_empty(),
+        "card mill removed: expected zero store_paths, got {store_paths:?}"
+    );
+    assert!(
+        stderr.contains("Card mill removed") || stderr.contains("Card mill retired"),
+        "operator must see mill-removed messaging; stderr was:\n{stderr}"
+    );
+    assert!(
+        !home.join(".aicx").join("store").exists(),
+        "extraction must not create ~/.aicx/store"
     );
     assert!(payload["requested_source_filters"].is_null());
-    assert_eq!(
-        resolved_repositories,
-        vec!["Vetcoders/ai-contexters".to_string()]
-    );
-    assert_eq!(
-        payload["includes_non_repository_contexts"].as_bool(),
-        Some(true)
-    );
-    assert!(payload["resolved_store_buckets"]["Vetcoders/ai-contexters"].is_object());
-    assert!(payload["resolved_store_buckets"]["non-repository-contexts"].is_object());
-    assert!(store_paths.iter().any(|path| {
-        path.starts_with(
-            home.join(".aicx")
-                .join("store")
-                .join("Vetcoders")
-                .join("ai-contexters"),
-        )
-    }));
-    assert!(
-        store_paths
-            .iter()
-            .any(|path| { path.starts_with(home.join(".aicx").join("non-repository-contexts")) })
-    );
-    assert!(
-        store_paths
-            .iter()
-            .all(|path| !path.to_string_lossy().contains(".codex/history.jsonl"))
-    );
-    assert!(store_paths.iter().all(|path| path.exists()));
 
     let _ = fs::remove_dir_all(&root);
 }
@@ -789,9 +751,11 @@ fn migration_cli_rebuilds_and_salvages_realistic_bundle() {
         rebuilt_bundle["action_reason"].as_str(),
         Some("partial_source_recovery")
     );
+    // Card mill is removed from the operator binary: migration may still
+    // salvage legacy files, but it must not re-grow per-frame store cards.
     assert!(
-        !canonical_paths.is_empty(),
-        "expected at least 1 canonical path, got {}",
+        canonical_paths.is_empty(),
+        "card mill removed: expected zero canonical store paths, got {}",
         canonical_paths.len()
     );
     assert!(
@@ -799,25 +763,14 @@ fn migration_cli_rebuilds_and_salvages_realistic_bundle() {
         "expected at least 3 salvage paths, got {}",
         salvage_paths.len()
     );
-    assert!(
-        canonical_paths[0].starts_with(
-            store_root
-                .join("store")
-                .join("Vetcoders")
-                .join("ai-contexters")
-        )
-    );
-    assert!(canonical_paths[0].exists());
     assert!(salvage_paths.iter().all(|path| path.exists()));
-
-    let all_canonical_content: String = canonical_paths
-        .iter()
-        .map(|p| fs::read_to_string(p).expect("read rebuilt canonical chunk"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(all_canonical_content.contains("Please inspect the migration seam."));
-    assert!(all_canonical_content.contains("Reviewing the repo-centric store now."));
-    assert!(!all_canonical_content.contains("input:"));
+    assert!(
+        !store_root.join("store").exists()
+            || fs::read_dir(store_root.join("store"))
+                .map(|entries| entries.count() == 0)
+                .unwrap_or(true),
+        "migration must not re-grow store cards when mill is removed"
+    );
 
     let salvaged_legacy = fs::read_to_string(
         store_root
