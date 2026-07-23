@@ -204,7 +204,7 @@ pub fn build_overlay(options: &OverlayOptions) -> Result<(OverlayDocument, Overl
         .clone()
         .unwrap_or(legacy_cards_dir()?)
         .canonicalize()
-        .context("canonical C6 store root is missing or unreadable")?;
+        .context("legacy C6 archive root is missing or unreadable")?;
     let projections = discover_canonical_projections(&aicx_home)?;
     if projections.is_empty() {
         bail!(
@@ -396,12 +396,12 @@ fn discover_projection_roots(
         return Ok(());
     }
     let mut children = read_dir_rebuilt_under_base(base, &open_root)
-        .with_context(|| format!("read canonical store directory {}", open_root.display()))?
+        .with_context(|| format!("read legacy C6 archive directory {}", open_root.display()))?
         .collect::<std::io::Result<Vec<_>>>()?;
     children.sort_by_key(|entry| entry.file_name());
     if children.len() > 10_000 {
         bail!(
-            "canonical store directory exceeds bounded scan: {}",
+            "legacy C6 archive directory exceeds bounded scan: {}",
             open_root.display()
         );
     }
@@ -423,11 +423,11 @@ fn overlay_project_identity_matches(card_project: &str, repo_id: &str) -> bool {
 
 fn combined_store_revision(revisions: &BTreeSet<String>) -> Result<String> {
     if revisions.is_empty() {
-        bail!("canonical store manifests did not expose store_revision");
+        bail!("legacy C6 archive manifests did not expose store_revision");
     }
     if revisions.len() != 1 {
         bail!(
-            "target repo spans {} distinct C6 store revisions; rebuild the canonical projection instead of synthesizing a downstream revision",
+            "target repo spans {} distinct legacy C6 revisions; rebuild the canonical projection instead of synthesizing a downstream revision",
             revisions.len()
         );
     }

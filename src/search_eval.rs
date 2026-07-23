@@ -194,7 +194,7 @@ pub fn discover_projects_for_cases(
     let store_dir = aicx_home.join("store");
     if !store_dir.is_dir() {
         bail!(
-            "search-quality eval expected a canonical store at {}; set AICX_HOME to the seeded store",
+            "search-quality eval expected a seeded legacy card fixture at {}; set AICX_HOME to the fixture home",
             store_dir.display()
         );
     }
@@ -685,7 +685,7 @@ fn validated_store_subdir(dir: &Path, store_dir: &Path) -> Result<PathBuf> {
         .with_context(|| format!("canonicalize {}", dir.display()))?;
     canonical_dir.strip_prefix(store_dir).with_context(|| {
         format!(
-            "search-quality eval refused to scan outside canonical store: {} is not under {}",
+            "search-quality eval refused to scan outside the legacy card fixture: {} is not under {}",
             canonical_dir.display(),
             store_dir.display()
         )
@@ -700,7 +700,7 @@ fn read_dir_rebuilt_under_base(base: &Path, candidate: &Path) -> std::io::Result
     let rel = candidate.strip_prefix(&base).map_err(|_| {
         std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
-            "path escapes store root",
+            "path escapes the legacy card fixture",
         )
     })?;
     let mut safe = base;
@@ -711,7 +711,7 @@ fn read_dir_rebuilt_under_base(base: &Path, candidate: &Path) -> std::io::Result
             _ => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
-                    "non-normal path component under store root",
+                    "non-normal path component under the legacy card fixture",
                 ));
             }
         }
@@ -1295,18 +1295,22 @@ mod tests {
     }
 
     #[test]
-    fn store_subdir_guard_rejects_paths_outside_store() {
+    fn legacy_fixture_guard_rejects_paths_outside_fixture() {
         let root = temp_root("project-discovery-guard");
         let store_dir = root.join("store");
         let outside_dir = root.join("outside");
-        fs::create_dir_all(&store_dir).expect("create store");
+        fs::create_dir_all(&store_dir).expect("create legacy fixture");
         fs::create_dir_all(&outside_dir).expect("create outside");
-        let store_dir = store_dir.canonicalize().expect("canonical store");
+        let store_dir = store_dir.canonicalize().expect("canonical legacy fixture");
 
         let error = validated_store_subdir(&outside_dir, &store_dir)
             .expect_err("outside directory should be rejected");
 
-        assert!(error.to_string().contains("outside canonical store"));
+        assert!(
+            error
+                .to_string()
+                .contains("outside the legacy card fixture")
+        );
 
         let _ = fs::remove_dir_all(root);
     }

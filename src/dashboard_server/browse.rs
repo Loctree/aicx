@@ -357,7 +357,7 @@ fn resolve_bounded_path(root: &Path, target: &Path) -> Result<PathBuf> {
 
     let canonical_root = root
         .canonicalize()
-        .with_context(|| format!("Cannot canonicalize store root: {}", root.display()))?;
+        .with_context(|| format!("Cannot canonicalize AICX home: {}", root.display()))?;
 
     if !target.exists() {
         return Err(anyhow!("Path does not exist: {}", target.display()));
@@ -369,7 +369,7 @@ fn resolve_bounded_path(root: &Path, target: &Path) -> Result<PathBuf> {
 
     if !canonical_target.starts_with(&canonical_root) {
         return Err(anyhow!(
-            "Path escapes store root: {} is not under {}",
+            "Path escapes AICX home: {} is not under {}",
             canonical_target.display(),
             canonical_root.display()
         ));

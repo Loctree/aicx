@@ -1,10 +1,9 @@
 //! Diagnostic and self-healing layer for aicx.
 //!
-//! `aicx doctor` performs an integrity audit of the canonical store, the
-//! steer index (Lance + BM25), state.json, sidecar coverage, and corpus
-//! bucket names. With
+//! `aicx doctor` audits AICX-home state, the published retrieval index,
+//! state.json, source protection, and residual legacy card archives. With
 //! `--rebuild-steer-index` (formerly `--fix`, kept as a deprecated alias),
-//! the steer index is deleted and rebuilt from the canonical store via
+//! the steer index is deleted and rebuilt through
 //! `steer_index::rebuild_steer_index_if_needed`. The flag was renamed in
 //! 2026-05-25 (Wave D / Cut D1) because the original `--fix` was a no-op
 //! for most warning classes (sidecars, index consistency, empty bodies),
@@ -13,7 +12,7 @@
 //! dedicated flags (`--prune-empty-bodies`, `--fix-buckets`) or the
 //! extract-era rebuild path (`aicx catalog rebuild && aicx index --cache-extracts`).
 //!
-//! With `--fix-buckets`, suspicious top-level store buckets are moved to
+//! With `--fix-buckets`, suspicious top-level legacy archive buckets are moved to
 //! timestamped quarantine. With `--prune-empty-bodies --apply`, empty-body
 //! chunks and their sidecars are moved to a recoverable empty-body quarantine.
 //!

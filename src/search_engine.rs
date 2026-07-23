@@ -3,7 +3,7 @@
 //! The library primitive is **semantic-by-contract**: a query is encoded
 //! through the in-process embedder ([`crate::embedder`], which re-exports
 //! the local [`aicx_embeddings`] crate's GGUF + cloud HTTP stack) and
-//! matched against a materialized vector index of the canonical store.
+//! matched against the published catalog-and-extract retrieval generation.
 //!
 //! The primitive never pretends fuzzy results are semantic. When a precondition is missing
 //! (embedder unhydrated, index not built, empty/low-signal corpus,

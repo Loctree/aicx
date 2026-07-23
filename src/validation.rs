@@ -1,6 +1,6 @@
 //! Shared schema validation for repository-derived filesystem buckets.
 //!
-//! The canonical store bucket schema is **case-preserving**: ASCII
+//! The legacy card bucket schema is **case-preserving**: ASCII
 //! alphanumeric first character (either case), then ASCII alphanumeric,
 //! dot, underscore, or dash. GitHub orgs are CamelCase by convention
 //! (`LibraxisAI`, `Vetcoders`, `Loctree`, `Sampleorg`), and forcing
@@ -29,12 +29,12 @@ pub fn is_valid_repo_bucket_name(value: &str) -> bool {
         && chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
 }
 
-/// Validate a canonical store project slug before it becomes a filesystem path.
+/// Validate a legacy archive project slug before it becomes a filesystem path.
 ///
 /// Accepts either one legacy bucket segment (`local`) or the canonical
 /// `organization/repository` shape. Each segment must pass the same bucket
 /// schema so bad content-extracted names cannot create junk directories under
-/// `~/.aicx/store`.
+/// the retired `~/.aicx/store` archive.
 pub fn is_valid_repo_project_slug(value: &str) -> bool {
     let mut parts = value.split('/');
     let Some(first) = parts.next() else {
