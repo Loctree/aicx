@@ -609,7 +609,7 @@ fn resolve_mcp_projects(
     include_index: bool,
 ) -> Result<store::ProjectIdentityResolution, McpError> {
     let corpus = if include_index {
-        store::project_identities_in_store_or_index_at(store_root)
+        store::project_identities_for_search_at(store_root)
     } else {
         store::project_identities_in_store_at(store_root)
     }
@@ -893,6 +893,7 @@ fn build_mcp_semantic_filters(
             date_hi,
             hours_cutoff,
             legacy_dense: false,
+            deep: false,
         },
     }
 }

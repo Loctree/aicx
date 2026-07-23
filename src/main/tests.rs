@@ -593,6 +593,7 @@ fn run_search_rejects_limit_over_hard_cap_before_store_access() {
         kind: None,
         no_semantic: true,
         evidence: false,
+        deep: false,
         project_match: store::ProjectMatchMode::Exact,
     })
     .expect_err("oversized search limit must fail before reading the store");

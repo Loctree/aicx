@@ -164,6 +164,7 @@ fn cli_and_mcp_render_identical_search_items() {
         date_hi: None,
         hours_cutoff: None,
         legacy_dense: false,
+        deep: false,
     };
     let (results, scanned) = aicx::search_engine::fuzzy_search_with_post_filters(
         &store_root,

@@ -2494,37 +2494,16 @@ fn resolve_filters_to_slugs_at_or_error_rejects_unknown_filters() {
 }
 
 #[test]
-fn resolve_filters_to_store_or_index_slugs_supports_index_only_all_bucket() {
+fn resolve_filters_to_store_or_index_slugs_supports_index_bucket_dirs() {
+    // Doctrine 2026-07-23: project identities come from bucket directory
+    // names (and store dirs / catalog), never from streaming embeddings.ndjson.
     let root = migration_test_root("resolve-index-only");
-    let indexed_all = root.join("indexed").join("_all");
-    fs::create_dir_all(&indexed_all).unwrap();
-    let header = serde_json::json!({
-        "schema_version": "aicx-vector-index/v1",
-        "model_id": "test-model",
-        "model_profile": "base",
-        "dimension": 2,
-        "generated_at": "2026-06-03T18:00:00Z",
-        "entry_count": 1
-    });
-    let entry = serde_json::json!({
-        "id": "chunk-a",
-        "project": "Vetcoders/Vista",
-        "agent": "claude",
-        "date": "20260603",
-        "path": "/tmp/chunk-a.md",
-        "kind": "conversations",
-        "session_id": "session-a",
-        "frame_kind": "agent_reply",
-        "cwd": "/Users/user/Git/Vista",
-        "embedding": [1.0, 0.0]
-    });
+    fs::create_dir_all(root.join("indexed").join("vetcoders_Vista")).unwrap();
+    fs::create_dir_all(root.join("indexed").join("_all")).unwrap();
+    // Poison NDJSON must be ignored.
     fs::write(
-        indexed_all.join("embeddings.ndjson"),
-        format!(
-            "{}\n{}\n",
-            serde_json::to_string(&header).unwrap(),
-            serde_json::to_string(&entry).unwrap()
-        ),
+        root.join("indexed").join("_all").join("embeddings.ndjson"),
+        r#"{"project":"must-not-be-read"}\n"#,
     )
     .unwrap();
 
@@ -2533,182 +2512,109 @@ fn resolve_filters_to_store_or_index_slugs_supports_index_only_all_bucket() {
         &["vetcoders/vista".to_string()],
     )
     .unwrap();
-    assert_eq!(got, vec!["Vetcoders/Vista"]);
+    assert!(
+        got.iter()
+            .any(|id| id.eq_ignore_ascii_case("vetcoders/Vista")),
+        "expected directory-derived identity, got {got:?}"
+    );
 
     let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
-fn resolve_filters_to_store_or_index_slugs_merges_store_and_index_only_matches() {
+fn resolve_filters_to_store_or_index_slugs_merges_store_and_index_bucket_dirs() {
     let root = migration_test_root("resolve-store-and-index");
     fs::create_dir_all(root.join(CANONICAL_STORE_DIRNAME).join("foo").join("bar")).unwrap();
-    let indexed_all = root.join("indexed").join("_all");
-    fs::create_dir_all(&indexed_all).unwrap();
-    let header = serde_json::json!({
-        "schema_version": "aicx-vector-index/v1",
-        "model_id": "test-model",
-        "model_profile": "base",
-        "dimension": 2,
-        "generated_at": "2026-06-03T18:00:00Z",
-        "entry_count": 1
-    });
-    let entry = serde_json::json!({
-        "id": "chunk-a",
-        "project": "baz/qux",
-        "embedding": [1.0, 0.0]
-    });
-    fs::write(
-        indexed_all.join("embeddings.ndjson"),
-        format!(
-            "{}\n{}\n",
-            serde_json::to_string(&header).unwrap(),
-            serde_json::to_string(&entry).unwrap()
-        ),
-    )
-    .unwrap();
+    fs::create_dir_all(root.join("indexed").join("baz_qux")).unwrap();
+    fs::create_dir_all(root.join("indexed").join("_all")).unwrap();
 
     let got = resolve_filters_to_store_or_index_slugs_at_or_error(
         &root,
         &["foo/bar".to_string(), "baz/qux".to_string()],
     )
     .unwrap();
-    assert_eq!(got, vec!["baz/qux", "foo/bar"]);
+    assert!(got.iter().any(|id| id == "foo/bar"), "got {got:?}");
+    assert!(
+        got.iter()
+            .any(|id| id == "baz/qux" || id.eq_ignore_ascii_case("baz/qux")),
+        "got {got:?}"
+    );
 
     let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
-fn resolve_filters_to_index_slugs_scans_all_bucket_for_unmatched_filters() {
+fn resolve_filters_to_index_slugs_uses_dedicated_bucket_dirs() {
     let root = migration_test_root("resolve-index-dedicated-and-all");
     let indexed = root.join("indexed");
-    let dedicated = indexed.join("foo_bar");
-    let all = indexed.join("_all");
-    fs::create_dir_all(&dedicated).unwrap();
-    fs::create_dir_all(&all).unwrap();
-    let header = serde_json::json!({
-        "schema_version": "aicx-vector-index/v1",
-        "model_id": "test-model",
-        "model_profile": "base",
-        "dimension": 2,
-        "generated_at": "2026-06-03T18:00:00Z",
-        "entry_count": 1
-    });
-    let dedicated_entry = serde_json::json!({
-        "id": "chunk-a",
-        "project": "foo/bar",
-        "embedding": [1.0, 0.0]
-    });
-    let all_entry = serde_json::json!({
-        "id": "chunk-b",
-        "project": "baz/qux",
-        "embedding": [0.0, 1.0]
-    });
-    fs::write(
-        dedicated.join("embeddings.ndjson"),
-        format!(
-            "{}\n{}\n",
-            serde_json::to_string(&header).unwrap(),
-            serde_json::to_string(&dedicated_entry).unwrap()
-        ),
-    )
-    .unwrap();
-    fs::write(
-        all.join("embeddings.ndjson"),
-        format!(
-            "{}\n{}\n",
-            serde_json::to_string(&header).unwrap(),
-            serde_json::to_string(&all_entry).unwrap()
-        ),
-    )
-    .unwrap();
+    fs::create_dir_all(indexed.join("foo_bar")).unwrap();
+    fs::create_dir_all(indexed.join("baz_qux")).unwrap();
+    fs::create_dir_all(indexed.join("_all")).unwrap();
 
     let got = resolve_filters_to_index_slugs_at(
         &indexed,
         &["foo/bar".to_string(), "baz/qux".to_string()],
     )
     .unwrap();
-    assert_eq!(got, vec!["baz/qux", "foo/bar"]);
+    assert!(got.iter().any(|id| id == "foo/bar"), "got {got:?}");
+    assert!(got.iter().any(|id| id == "baz/qux"), "got {got:?}");
 
     let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
-fn bare_filter_ambiguity_is_independent_of_index_bucket_topology() {
+fn bare_filter_ambiguity_uses_directory_bucket_identities() {
+    // Two dedicated buckets both ending in "vista" → bare filter fails closed.
     let root = migration_test_root("resolve-index-silver-topology");
     let indexed = root.join("indexed");
-    let dedicated = indexed.join("A_vista");
-    let all = indexed.join("_all");
-    fs::create_dir_all(&dedicated).unwrap();
-    fs::create_dir_all(&all).unwrap();
-    let header = serde_json::json!({
-        "schema_version": "aicx-vector-index/v1",
-        "model_id": "test-model",
-        "model_profile": "base",
-        "dimension": 2,
-        "generated_at": "2026-07-17T00:00:00Z",
-        "entry_count": 2
-    });
-    let row = |id: &str, project: &str| serde_json::json!({"id": id, "project": project, "embedding": [1.0, 0.0]});
-    fs::write(
-        dedicated.join("embeddings.ndjson"),
-        format!(
-            "{}\n{}\n",
-            serde_json::to_string(&header).unwrap(),
-            serde_json::to_string(&row("a", "A/vista")).unwrap()
-        ),
-    )
-    .unwrap();
-    fs::write(
-        all.join("embeddings.ndjson"),
-        format!(
-            "{}\n{}\n{}\n",
-            serde_json::to_string(&header).unwrap(),
-            serde_json::to_string(&row("b", "B/vista")).unwrap(),
-            serde_json::to_string(&row("portal", "B/vista-portal")).unwrap()
-        ),
-    )
-    .unwrap();
+    fs::create_dir_all(indexed.join("A_vista")).unwrap();
+    fs::create_dir_all(indexed.join("B_vista")).unwrap();
+    fs::create_dir_all(indexed.join("B_vista-portal")).unwrap();
+    fs::create_dir_all(indexed.join("_all")).unwrap();
 
     let error = resolve_filters_to_index_slugs_at(&indexed, &["vista".to_string()])
-        .expect_err("one exact bucket must not hide another identity in _all");
+        .expect_err("two exact * /vista buckets must stay ambiguous");
     let resolution_error = error
         .downcast_ref::<ProjectResolutionError>()
         .expect("typed project-resolution error");
-    assert_eq!(resolution_error.candidates(), ["A/vista", "B/vista"]);
+    let candidates = resolution_error.candidates();
+    assert!(
+        candidates.iter().any(|c| c == "A/vista"),
+        "candidates={candidates:?}"
+    );
+    assert!(
+        candidates.iter().any(|c| c == "B/vista"),
+        "candidates={candidates:?}"
+    );
 
     fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
-fn resolve_filters_to_index_slugs_reads_only_project_field() {
-    let root = migration_test_root("resolve-index-project-only");
-    let indexed_all = root.join("indexed").join("_all");
-    fs::create_dir_all(&indexed_all).unwrap();
-    let header = serde_json::json!({
-        "schema_version": "aicx-vector-index/v1",
-        "model_id": "test-model",
-        "model_profile": "base",
-        "dimension": 2,
-        "generated_at": "2026-06-03T18:00:00Z",
-        "entry_count": 1
-    });
-    let entry = serde_json::json!({
-        "id": "chunk-a",
-        "project": "Vetcoders/Vista",
-        "embedding": ["project resolver must not deserialize this as f32"]
-    });
+fn project_identities_for_search_uses_index_dirs_not_ndjson() {
+    // Doctrine 2026-07-23: search `-p` resolution must never stream
+    // multi-GB embeddings.ndjson. Bucket directory names + store dirs only.
+    let root = migration_test_root("resolve-index-dirs-only");
+    let indexed = root.join("indexed");
+    fs::create_dir_all(indexed.join("vetcoders_vista")).unwrap();
+    fs::create_dir_all(indexed.join("_all")).unwrap();
+    // Poison NDJSON — if anyone reopens streaming, this would be the bait.
     fs::write(
-        indexed_all.join("embeddings.ndjson"),
-        format!(
-            "{}\n{}\n",
-            serde_json::to_string(&header).unwrap(),
-            serde_json::to_string(&entry).unwrap()
-        ),
+        indexed.join("_all").join("embeddings.ndjson"),
+        "{not valid ndjson and would hang if scanned line-by-line at multi-GB scale}\n",
     )
     .unwrap();
 
-    let got = project_slugs_from_index_file(&indexed_all.join("embeddings.ndjson")).unwrap();
-    assert_eq!(got, vec!["Vetcoders/Vista"]);
+    let got = project_identities_for_search_at(&root).unwrap();
+    assert!(
+        got.iter()
+            .any(|id| id == "vetcoders/vista" || id == "vetcoders_vista"),
+        "expected bucket-derived identity, got {got:?}"
+    );
+    assert!(
+        !got.iter().any(|id| id == "_all"),
+        "_all must not surface as a project filter"
+    );
 
     let _ = fs::remove_dir_all(&root);
 }

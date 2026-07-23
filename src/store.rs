@@ -14,7 +14,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
-use std::io::{self, BufRead, Write};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -2065,6 +2065,26 @@ pub fn project_identities_in_store_or_index_at(store_root: &Path) -> Result<Vec<
     Ok(identities.into_iter().collect())
 }
 
+/// Fast corpus for search `-p` resolution: shallow store dirs + indexed
+/// bucket directory names. Never opens `embeddings.ndjson` (multi-GB).
+///
+/// Doctrine 2026-07-23: project is a metadata filter on the hybrid
+/// generation, not a precondition that may stream 19 GB of retired NDJSON.
+pub fn project_identities_for_search_at(store_root: &Path) -> Result<Vec<String>> {
+    let mut identities: BTreeSet<String> = project_identities_in_store_at(store_root)?
+        .into_iter()
+        .collect();
+    identities.extend(project_identities_from_index_dirs_at(
+        &store_root.join("indexed"),
+    )?);
+    // Durable catalog (when present) carries topical project attribution
+    // that cwd-derived store layout may miss.
+    if let Ok(catalog_ids) = crate::catalog::project_identities_from_catalog_at(store_root) {
+        identities.extend(catalog_ids);
+    }
+    Ok(identities.into_iter().collect())
+}
+
 #[cfg(test)]
 fn resolve_filters_to_index_slugs_at(
     indexed_root: &Path,
@@ -2074,34 +2094,9 @@ fn resolve_filters_to_index_slugs_at(
     Ok(resolve_project_identities(filters, &corpus, ProjectMatchMode::Exact)?.selected)
 }
 
-fn project_slugs_from_index_file(index_path: &Path) -> Result<Vec<String>> {
-    if !index_path.exists() {
-        return Ok(Vec::new());
-    }
-    let file = sanitize::open_file_validated(index_path)
-        .with_context(|| format!("open indexed project resolver: {}", index_path.display()))?;
-    let reader = io::BufReader::new(file);
-    let mut slugs = Vec::new();
-    for (idx, line) in reader.lines().enumerate() {
-        let line =
-            line.with_context(|| format!("read line {} in {}", idx + 1, index_path.display()))?;
-        if idx == 0 || line.trim().is_empty() {
-            continue;
-        }
-        let Ok(row) = serde_json::from_str::<ProjectOnlyIndexRow>(&line) else {
-            continue;
-        };
-        let Some(project) = row.project else {
-            continue;
-        };
-        if !slugs.iter().any(|existing| existing == project) {
-            slugs.push(project.to_string());
-        }
-    }
-    Ok(slugs)
-}
-
-fn project_identities_from_index_at(indexed_root: &Path) -> Result<Vec<String>> {
+/// Directory-name identities under `~/.aicx/indexed/` (no NDJSON reads).
+/// Bucket dirs use underscore form (`vetcoders_vista`); bare names stay bare.
+fn project_identities_from_index_dirs_at(indexed_root: &Path) -> Result<Vec<String>> {
     if !indexed_root.exists() {
         return Ok(Vec::new());
     }
@@ -2114,16 +2109,30 @@ fn project_identities_from_index_at(indexed_root: &Path) -> Result<Vec<String>> 
         if !entry.path().is_dir() {
             continue;
         }
-        identities.extend(project_slugs_from_index_file(
-            &entry.path().join("embeddings.ndjson"),
-        )?);
+        let name = entry.file_name().to_string_lossy().to_string();
+        // Internal / retired buckets — not project filters.
+        if name == "_all" || name.starts_with('.') {
+            continue;
+        }
+        if let Some((owner, repo)) = name.split_once('_')
+            && !owner.is_empty()
+            && !repo.is_empty()
+            && !owner.starts_with('_')
+        {
+            // Best-effort: `loctree_aicx` → `loctree/aicx`. Multi-underscore
+            // repos keep the first split only (search also accepts the bare
+            // bucket name below).
+            identities.insert(format!("{owner}/{repo}"));
+        }
+        identities.insert(name);
     }
     Ok(identities.into_iter().collect())
 }
 
-#[derive(Deserialize)]
-struct ProjectOnlyIndexRow<'a> {
-    project: Option<&'a str>,
+/// Legacy path kept for tests that still call through `*_or_index_at`.
+/// Does **not** stream `embeddings.ndjson` — directory names only.
+fn project_identities_from_index_at(indexed_root: &Path) -> Result<Vec<String>> {
+    project_identities_from_index_dirs_at(indexed_root)
 }
 
 fn scan_repo_store_filtered(

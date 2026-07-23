@@ -852,6 +852,24 @@ struct SearchQualityEvalArgs {
 }
 
 #[derive(Debug, Subcommand)]
+enum CatalogAction {
+    /// Walk all source roots and rewrite `~/.aicx/catalog/sessions.jsonl`.
+    Rebuild {
+        /// Emit JSON report to stdout.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Resolve one session id from the durable catalog.
+    Resolve {
+        /// Session id (exact, logical, or unique prefix).
+        session: String,
+        /// Emit JSON.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum Commands {
     /// Generate shell completions for the canonical CLI grammar.
     #[command(hide = true)]
@@ -1176,7 +1194,23 @@ enum Commands {
         dry_run: bool,
     },
 
+    /// Rebuild the durable extract-era session catalog (no per-frame cards).
+    ///
+    /// Walks live agent source roots (claude/codex/gemini/grok/junie +
+    /// vibecrafted runtime_runs) and writes `~/.aicx/catalog/sessions.jsonl`.
+    /// Does not materialize card files under `~/.aicx/store/`.
+    #[command(display_order = 3)]
+    Catalog {
+        #[command(subcommand)]
+        action: CatalogAction,
+    },
+
     /// Build the canonical corpus in from local agents' session files.
+    ///
+    /// **RETIRING (2026-07-23):** prefer `aicx catalog rebuild` for identity
+    /// inventory and `aicx extract` for readable session markdown. Card-mill
+    /// writes remain for one migration window so existing index paths keep
+    /// working; they are not the target architecture.
     ///
     /// Store-first corpus builder: extracts, deduplicates, chunks, and writes
     /// steerable Markdown. By default, this command uses per-source watermarks
@@ -1631,6 +1665,13 @@ enum Commands {
         /// Use legacy NDJSON reader for dense vector search instead of versioned mmap.
         #[arg(long)]
         legacy_dense: bool,
+
+        /// Dense re-rank (hybrid RRF over tantivy + mmap). Default is
+        /// lexical-first with a recency prior against the published `_all`
+        /// CURRENT generation — sub-second answers without loading the
+        /// embedder or dense vectors.
+        #[arg(long)]
+        deep: bool,
     },
 
     /// Run local evaluation helpers for retrieval/search quality.
@@ -2449,6 +2490,14 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
                 redact_secrets: redaction.redact_secrets,
             })?;
         }
+        Some(Commands::Catalog { action }) => match action {
+            CatalogAction::Rebuild { json } => {
+                run_catalog_rebuild(json)?;
+            }
+            CatalogAction::Resolve { session, json } => {
+                run_catalog_resolve(&session, json)?;
+            }
+        },
         Some(Commands::Store {
             redaction,
             project,
@@ -2464,6 +2513,11 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
             let include_assistant = include_assistant_flag || !user_only;
             warn_incremental_legacy_flag(incremental);
             warn_pending_mutation("store");
+            eprintln!(
+                "aicx store: retiring card-mill path — prefer `aicx catalog rebuild` for \
+                 identity inventory and `aicx extract` for readable sessions. Card writes \
+                 still run this window so legacy index pipelines do not break mid-migration."
+            );
             run_store(StoreRunArgs {
                 project,
                 agent,
@@ -2730,6 +2784,7 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
             evidence,
             json,
             legacy_dense,
+            deep,
         }) => {
             aicx::search_engine::LEGACY_DENSE_ACTIVE.with(|active| active.set(legacy_dense));
             run_search(SearchRunArgs {
@@ -2742,6 +2797,7 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
                 kind: kind.as_deref(),
                 no_semantic,
                 evidence,
+                deep,
                 project_match,
             })?;
         }
@@ -7505,6 +7561,61 @@ fn parse_date_filter(s: &str) -> Result<(Option<String>, Option<String>)> {
     }
 }
 
+fn run_catalog_rebuild(json: bool) -> Result<()> {
+    let aicx_home = store::resolve_aicx_home()?;
+    let user_home = aicx::os_user_home().context("No home dir")?;
+    let report = aicx::catalog::rebuild(&aicx_home, &user_home)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        eprintln!(
+            "aicx catalog rebuild: {} session(s) in {} ms",
+            report.total_sessions, report.wall_ms
+        );
+        eprintln!("  catalog: {}", report.catalog_path);
+        eprintln!("  cards_written: {} (must stay 0)", report.cards_written);
+        eprintln!("  per agent:");
+        for (agent, count) in &report.agents {
+            eprintln!("    {agent:<12} {count}");
+        }
+        if !report.projects.is_empty() {
+            eprintln!("  top projects:");
+            let mut ranked: Vec<_> = report.projects.iter().collect();
+            ranked.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+            for (project, count) in ranked.into_iter().take(20) {
+                eprintln!("    {project:<40} {count}");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn run_catalog_resolve(session: &str, json: bool) -> Result<()> {
+    let aicx_home = store::resolve_aicx_home()?;
+    match aicx::catalog::resolve_session(&aicx_home, session)? {
+        Some(entry) => {
+            if json {
+                println!("{}", serde_json::to_string_pretty(&entry)?);
+            } else {
+                println!(
+                    "{}  {}  {}",
+                    entry.agent, entry.session_id, entry.source_path
+                );
+                if let Some(project) = entry.project {
+                    println!("  project: {project}");
+                }
+                if let Some(cwd) = entry.cwd {
+                    println!("  cwd: {cwd}");
+                }
+            }
+        }
+        None => anyhow::bail!(
+            "session `{session}` not in durable catalog; run `aicx catalog rebuild` first"
+        ),
+    }
+    Ok(())
+}
+
 fn project_scopes(projects: &[String]) -> Vec<Option<&str>> {
     if projects.is_empty() {
         vec![None]
@@ -7553,14 +7664,43 @@ fn resolve_project_filters_or_error(
         });
     }
     let store_root = store::store_base_dir()?;
+    // Search doctrine: never stream retired multi-GB embeddings.ndjson for
+    // `-p` resolution. Exact `owner/repo` forms pass through; bare names use
+    // shallow store dirs + indexed bucket names + durable catalog.
     let corpus = if include_index {
-        store::project_identities_in_store_or_index_at(&store_root)?
+        store::project_identities_for_search_at(&store_root)?
     } else {
         store::project_identities_in_store_at(&store_root)?
     };
-    Ok(store::require_project_resolution(
-        projects, &corpus, match_mode,
-    )?)
+    // Accept already-canonical owner/repo filters even when the local store
+    // layout is empty (operator trashed cards): project is metadata on the
+    // hybrid generation, not a directory precondition.
+    let mut resolution = store::resolve_project_identities(projects, &corpus, match_mode)?;
+    let mut still_unresolved = Vec::new();
+    for filter in resolution.unresolved_filters.drain(..) {
+        let trimmed = filter.trim();
+        if let Some((owner, repo)) = trimmed.split_once('/')
+            && !owner.is_empty()
+            && !repo.is_empty()
+            && !owner.ends_with('/')
+            && !repo.contains('/')
+            && match_mode == store::ProjectMatchMode::Exact
+        {
+            resolution.selected.push(trimmed.to_string());
+            continue;
+        }
+        still_unresolved.push(filter);
+    }
+    resolution.unresolved_filters = still_unresolved;
+    if !projects.is_empty() && !resolution.unresolved_filters.is_empty() {
+        return Err(store::ProjectResolutionError::NoMatch {
+            filters: resolution.unresolved_filters,
+        }
+        .into());
+    }
+    resolution.selected.sort();
+    resolution.selected.dedup();
+    Ok(resolution)
 }
 
 fn project_scope_label(projects: &[String]) -> String {
@@ -7584,6 +7724,7 @@ struct SearchRunArgs<'a> {
     kind: Option<&'a str>,
     no_semantic: bool,
     evidence: bool,
+    deep: bool,
     project_match: store::ProjectMatchMode,
 }
 
@@ -7717,6 +7858,7 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
         kind,
         no_semantic,
         evidence,
+        deep,
         project_match,
     } = args;
     let limit = filters.limit.unwrap_or(DEFAULT_RETRIEVAL_LIMIT);
@@ -7764,6 +7906,8 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
         date_hi: date_hi.clone(),
         hours_cutoff: hours_cutoff.clone(),
         legacy_dense,
+        // --legacy-dense implies the dense recovery path (deep enough).
+        deep: deep || legacy_dense,
     };
 
     let project_resolution = resolve_project_filters_or_error(projects, project_match, true)?;
