@@ -15,10 +15,11 @@ static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 fn unique_test_dir(name: &str) -> PathBuf {
     let n = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
-    // FP: test-only helper; uniqueness comes from process::id() + atomic
-    // counter + test name, and this path never participates in production
-    // file handling.
-    let dir = std::env::temp_dir() // nosemgrep: rust.lang.security.temp-dir.temp-dir -- FP: test-only unique dir uses pid + atomic counter + test name, never production file handling.
+    // Test-only scratch under target/ — not std::env::temp_dir() (avoids
+    // temp-dir policy noise; production code never calls this helper).
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join("test-tmp")
         .join(format!("ai_ctx_test_{}_{}_{}", std::process::id(), n, name));
     fs::create_dir_all(&dir).unwrap();
     dir

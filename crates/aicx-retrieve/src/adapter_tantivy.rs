@@ -1,12 +1,15 @@
 // Vibecrafted with AI Agents by Vetcoders (c)2024-2026 LibraxisAI
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
 use tantivy::collector::{FilterCollector, TopDocs};
-use tantivy::query::{AllQuery, Query, QueryParser};
+use tantivy::query::{
+    AllQuery, BooleanQuery, ConstScoreQuery, PhraseQuery, Query, QueryParser, TermQuery,
+};
 use tantivy::schema::{
     FAST, Field, INDEXED, IndexRecordOption, STORED, STRING, Schema, TantivyDocument,
     TextFieldIndexing, TextOptions, Value,
@@ -15,7 +18,7 @@ use tantivy::tokenizer::{
     LowerCaser, RemoveLongFilter, SimpleTokenizer, TextAnalyzer, Token, TokenFilter, TokenStream,
     Tokenizer,
 };
-use tantivy::{DocAddress, Index, IndexWriter, Score, Searcher, doc};
+use tantivy::{DocAddress, Index, IndexWriter, Score, Searcher, Term, doc};
 use tantivy_stemmers::algorithms;
 
 use crate::{ChunkRef, FilterSet, Hit, LexicalCommitId, LexicalIndex, LexicalQuery};
@@ -88,6 +91,41 @@ impl TantivyAdapter {
         &self.dir
     }
 
+    /// Scan committed document metadata without requiring a lexical query.
+    ///
+    /// This is the canonical metadata-only retrieval surface for callers such
+    /// as `aicx steer`. It examines every live document before applying the
+    /// predicate, so rare exact metadata matches cannot disappear behind an
+    /// arbitrary lexical top-N boundary. The caller-provided limit bounds only
+    /// returned values; the committed corpus remains the search authority.
+    pub fn scan_metadata(
+        &self,
+        limit: usize,
+        mut predicate: impl FnMut(&serde_json::Value) -> bool,
+    ) -> Result<Vec<serde_json::Value>> {
+        if limit == 0 || self.doc_count == 0 {
+            return Ok(Vec::new());
+        }
+
+        let reader = self.index.reader().context("open tantivy reader")?;
+        let searcher = reader.searcher();
+        let collector = TopDocs::with_limit(self.doc_count).order_by_score();
+        let docs = searcher
+            .search(&AllQuery, &collector)
+            .context("scan committed tantivy metadata")?;
+        let mut matches = Vec::with_capacity(limit.min(docs.len()));
+        for (rank, (score, address)) in docs.into_iter().enumerate() {
+            let hit = self.hit_from_doc(&searcher, score, rank, address)?;
+            if predicate(&hit.metadata) {
+                matches.push(hit.metadata);
+                if matches.len() >= limit {
+                    break;
+                }
+            }
+        }
+        Ok(matches)
+    }
+
     fn refresh_stats(&mut self) -> Result<LexicalCommitId> {
         self.commit_id = read_commit_id(&self.index)?;
         self.doc_count = read_doc_count(&self.index)?;
@@ -138,9 +176,46 @@ impl TantivyAdapter {
             return Ok(Box::new(AllQuery));
         }
         let parser = QueryParser::for_index(&self.index, vec![self.fields.body, self.fields.id]);
-        parser
+        let parsed = parser
             .parse_query(text)
-            .with_context(|| format!("parse lexical query {text:?}"))
+            .with_context(|| format!("parse lexical query {text:?}"))?;
+
+        // A catalog document is one whole session, so ordinary BM25 length
+        // normalization can bury the right long conversation beneath a short
+        // file that repeats only one query word. Add a small field-length-
+        // independent score per distinct body term while retaining BM25 for
+        // frequency and rarity. This makes term coverage the first useful
+        // discriminator without turning search into strict conjunction.
+        let mut analyzer = self
+            .index
+            .tokenizer_for_field(self.fields.body)
+            .context("open body query tokenizer")?;
+        let mut phrase_terms = Vec::new();
+        analyzer.token_stream(text).process(&mut |token| {
+            phrase_terms.push(Term::from_field_text(self.fields.body, &token.text));
+        });
+        let mut body_terms = phrase_terms.clone();
+        body_terms.dedup();
+        if body_terms.len() < 2 {
+            return Ok(parsed);
+        }
+        let coverage = BooleanQuery::union(
+            body_terms
+                .into_iter()
+                .map(|term| {
+                    Box::new(ConstScoreQuery::new(
+                        Box::new(TermQuery::new(term, IndexRecordOption::Basic)),
+                        5.0,
+                    )) as Box<dyn Query>
+                })
+                .collect(),
+        );
+        let phrase = ConstScoreQuery::new(Box::new(PhraseQuery::new(phrase_terms)), 20.0);
+        Ok(Box::new(BooleanQuery::union(vec![
+            parsed,
+            Box::new(coverage),
+            Box::new(phrase),
+        ])))
     }
 
     fn search_top_docs(
@@ -204,7 +279,6 @@ impl TantivyAdapter {
         ensure_metadata_field(&mut metadata, "agent", agent);
         ensure_metadata_field(&mut metadata, "date", date);
         ensure_metadata_field(&mut metadata, "project", project);
-
         Ok(Hit {
             chunk_id,
             score,
@@ -213,6 +287,140 @@ impl TantivyAdapter {
             metadata,
         })
     }
+
+    /// Extract query-time body context only for already-ranked candidates.
+    ///
+    /// Whole-session bodies can be large. Calling Tantivy's snippet generator
+    /// for the full 500-hit recency window cost seconds; exact-id enrichment
+    /// lets the caller pay only for the small set it may display.
+    pub fn query_snippets(
+        &self,
+        query_text: &str,
+        chunk_ids: &[String],
+    ) -> Result<HashMap<String, Vec<String>>> {
+        if query_text.trim().is_empty() || chunk_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let reader = self.index.reader().context("open tantivy reader")?;
+        let searcher = reader.searcher();
+        let mut snippets = HashMap::with_capacity(chunk_ids.len());
+
+        for chunk_id in chunk_ids {
+            let id_query = TermQuery::new(
+                Term::from_field_text(self.fields.id, chunk_id),
+                IndexRecordOption::Basic,
+            );
+            let Some((_, address)) = searcher
+                .search(&id_query, &TopDocs::with_limit(1).order_by_score())
+                .with_context(|| format!("find tantivy chunk {chunk_id} for snippet"))?
+                .into_iter()
+                .next()
+            else {
+                continue;
+            };
+            let document: TantivyDocument = searcher
+                .doc(address)
+                .with_context(|| format!("load tantivy chunk {chunk_id} for snippet"))?;
+            let body = text_or_empty(&document, self.fields.body);
+            let lines = query_context_lines(&body, query_text);
+            if !lines.is_empty() {
+                snippets.insert(chunk_id.clone(), lines);
+            }
+        }
+
+        Ok(snippets)
+    }
+}
+
+fn query_context_lines(body: &str, query: &str) -> Vec<String> {
+    const MAX_CONTEXT_CHARS: usize = 800;
+    let terms = query
+        .split_whitespace()
+        .map(|term| {
+            term.trim_matches(|ch: char| !ch.is_alphanumeric() && ch != '-' && ch != '_')
+                .to_lowercase()
+        })
+        .filter(|term| term.chars().count() >= 3)
+        .collect::<Vec<_>>();
+    if terms.is_empty() {
+        return Vec::new();
+    }
+    let prefixes = terms
+        .iter()
+        .map(|term| (term.chars().count() >= 5).then(|| term.chars().take(5).collect::<String>()))
+        .collect::<Vec<_>>();
+    let normalized_query = query.to_lowercase();
+
+    let lines = body.lines().collect::<Vec<_>>();
+    let mut best = None::<(usize, i32)>;
+    let mut best_clean_full_match = None::<(usize, i32)>;
+    for (index, line) in lines.iter().enumerate() {
+        let normalized = line.to_lowercase();
+        let term_score = terms
+            .iter()
+            .zip(&prefixes)
+            .filter(|pair| {
+                let term = pair.0;
+                let prefix = pair.1;
+                normalized.contains(term.as_str())
+                    || prefix
+                        .as_deref()
+                        .is_some_and(|prefix| normalized.contains(prefix))
+            })
+            .count() as i32;
+        let phrase_score = if normalized.contains(&normalized_query) {
+            2
+        } else {
+            0
+        };
+        let benchmark = normalized.contains("aicx search")
+            || normalized.contains("acceptance")
+            || normalized.contains("golden")
+            || normalized.contains("latency")
+            || normalized.contains("wall time")
+            || normalized.contains(" warm");
+        let score = term_score + phrase_score;
+        // Prefer the newest equally good context. Continued sessions often
+        // repeat an old acceptance prompt before the actual later answer.
+        if score >= best.map(|(_, score)| score).unwrap_or(0) {
+            best = Some((index, score));
+        }
+        // A continued session can later quote the release benchmark verbatim.
+        // Prefer a real line containing every query term; when no such line
+        // exists, retain the benchmark line so the caller can demote the echo.
+        if !benchmark
+            && term_score == terms.len() as i32
+            && score >= best_clean_full_match.map(|(_, score)| score).unwrap_or(0)
+        {
+            best_clean_full_match = Some((index, score));
+        }
+    }
+    let Some((best_index, score)) = best_clean_full_match.or(best) else {
+        return Vec::new();
+    };
+    if score <= 0 {
+        return Vec::new();
+    }
+
+    let mut context = Vec::new();
+    let mut chars = 0usize;
+    let start = best_index.saturating_sub(1);
+    let end = (best_index + 3).min(lines.len().saturating_sub(1));
+    for line in &lines[start..=end] {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let remaining = MAX_CONTEXT_CHARS.saturating_sub(chars);
+        if remaining == 0 {
+            break;
+        }
+        let excerpt = line.chars().take(remaining).collect::<String>();
+        chars += excerpt.chars().count();
+        context.push(excerpt);
+    }
+    context
 }
 
 impl LexicalIndex for TantivyAdapter {
@@ -716,5 +924,131 @@ mod swap_tests {
 
         assert_eq!(fs::read_to_string(target.join("marker")).unwrap(), "NEW");
         assert!(!staging.exists());
+    }
+
+    #[test]
+    fn lexical_query_attaches_body_snippet_at_the_actual_match() {
+        let tmp = TempDir::new().unwrap();
+        let mut adapter = TantivyAdapter::new(tmp.path().to_path_buf()).unwrap();
+        adapter
+            .build(&[ChunkRef {
+                id: "session-1".to_string(),
+                source_path: "/sessions/session-1.md".to_string(),
+                text: [
+                    "Unrelated session preamble.",
+                    "Acceptance: aicx search 'routing strzałek taby' must be fast.",
+                    "## assistant",
+                    "The durable answer is that routing strzałek taby landed in W2-B-4c.",
+                    "Unrelated footer.",
+                ]
+                .join("\n"),
+                metadata: serde_json::json!({
+                    "agent": "codex",
+                    "date": "2026-07-22",
+                    "project": "vetcoders/vc-frame",
+                }),
+            }])
+            .unwrap();
+
+        let hits = adapter
+            .query(&LexicalQuery {
+                text: "routing strzałek taby".to_string(),
+                limit: 1,
+                filters: FilterSet::default(),
+            })
+            .unwrap();
+
+        let snippets = adapter
+            .query_snippets("routing strzałek taby", &[hits[0].chunk_id.to_string()])
+            .unwrap();
+        let snippets = &snippets["session-1"];
+        assert!(
+            snippets.iter().any(|line| line.contains("W2-B-4c")),
+            "snippet must come from the matched body region: {snippets:?}"
+        );
+    }
+
+    #[test]
+    fn lexical_query_prefers_multi_term_coverage_over_short_single_term_spam() {
+        let tmp = TempDir::new().unwrap();
+        let mut adapter = TantivyAdapter::new(tmp.path().to_path_buf()).unwrap();
+        adapter
+            .build(&[
+                ChunkRef {
+                    id: "short-spam".to_string(),
+                    source_path: "/sessions/short.md".to_string(),
+                    text: "arrows arrows arrows arrows arrows".to_string(),
+                    metadata: serde_json::json!({}),
+                },
+                ChunkRef {
+                    id: "long-answer".to_string(),
+                    source_path: "/sessions/long.md".to_string(),
+                    text: format!(
+                        "{}\nThe answer connects arrows with routing.",
+                        "unrelated session history ".repeat(2_000)
+                    ),
+                    metadata: serde_json::json!({}),
+                },
+            ])
+            .unwrap();
+
+        let hits = adapter
+            .query(&LexicalQuery {
+                text: "arrows routing".to_string(),
+                limit: 2,
+                filters: FilterSet::default(),
+            })
+            .unwrap();
+
+        assert_eq!(hits[0].chunk_id, "long-answer");
+    }
+
+    #[test]
+    fn lexical_query_boosts_the_exact_phrase_above_a_reordered_bag_of_words() {
+        let tmp = TempDir::new().unwrap();
+        let mut adapter = TantivyAdapter::new(tmp.path().to_path_buf()).unwrap();
+        adapter
+            .build(&[
+                ChunkRef {
+                    id: "reordered".to_string(),
+                    source_path: "/sessions/reordered.md".to_string(),
+                    text: "vc-frame has many notes; arrows are elsewhere".to_string(),
+                    metadata: serde_json::json!({}),
+                },
+                ChunkRef {
+                    id: "exact".to_string(),
+                    source_path: "/sessions/exact.md".to_string(),
+                    text: "The operator searched for arrows vc-frame.".to_string(),
+                    metadata: serde_json::json!({}),
+                },
+            ])
+            .unwrap();
+
+        let hits = adapter
+            .query(&LexicalQuery {
+                text: "arrows vc-frame".to_string(),
+                limit: 2,
+                filters: FilterSet::default(),
+            })
+            .unwrap();
+
+        assert_eq!(hits[0].chunk_id, "exact");
+    }
+
+    #[test]
+    fn query_context_prefers_real_pensieve_hit_over_later_aicx_benchmark() {
+        let body = [
+            "pensieve to znajduje [Pensieve search 'arrows vc-frame']",
+            "unrelated release paragraph",
+            "Golden queries: `aicx search 'arrows vc-frame'` 0.056 s",
+        ]
+        .join("\n");
+
+        let lines = query_context_lines(&body, "arrows vc-frame");
+
+        assert_eq!(
+            lines.first().map(String::as_str),
+            Some("pensieve to znajduje [Pensieve search 'arrows vc-frame']")
+        );
     }
 }

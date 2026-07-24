@@ -126,11 +126,11 @@ pub(super) fn terminal_status_lines(phase: &Phase, current: u64, frame: usize) -
 
 pub(super) fn phase_label(phase: &str) -> &'static str {
     match phase {
-        "extract" => "extracting sources",
+        "source_scan" => "scanning session sources",
         "dedup" => "deduplicating entries",
         "self_echo" => "filtering self-echo entries",
         "segment" => "building semantic segments",
-        "chunk" => "chunking canonical corpus",
+        "render" => "rendering requested reports",
         "steer_sync" => "syncing steer index",
         "bm25_sync" => "syncing BM25 index",
         _ => "working",
@@ -139,11 +139,11 @@ pub(super) fn phase_label(phase: &str) -> &'static str {
 
 pub(super) fn phase_detail(phase: &str) -> &'static str {
     match phase {
-        "extract" => "reading agent stores; source counts print after scan",
+        "source_scan" => "reading registered agent sources; counts print after scan",
         "dedup" => "comparing entries against persisted seen-hashes",
         "self_echo" => "stripping aicx tool-echo entries that would feed back into the corpus",
         "segment" => "grouping entries into repo-scoped sessions before any write",
-        "chunk" => "writing canonical markdown chunks; final buckets print below",
+        "render" => "writing explicit report outputs; final counts print below",
         "steer_sync" => "refreshing metadata retrieval index",
         "bm25_sync" => "refreshing lexical candidate index",
         _ => "progress is live; final summary prints below",

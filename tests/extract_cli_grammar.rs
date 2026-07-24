@@ -93,8 +93,12 @@ fn help_lists_agent_subcommands_and_hides_flag_grammar() {
 }
 
 #[test]
-fn legacy_flag_grammar_is_rejected_not_aliased() {
-    let home = unique_test_dir("legacy");
+fn legacy_agent_flag_is_aliased_with_deprecation_note() {
+    // Restored 2026-07-16: the hard removal of `--agent` silently broke
+    // fleet-wide consumers (hooks with `|| true` never see the migration
+    // hint). The alias must behave EXACTLY like the subcommand form and
+    // announce its deprecation on stderr.
+    let home = unique_test_dir("legacy-agent-alias");
     let rollout = home
         .join(".codex")
         .join("sessions")
@@ -115,7 +119,49 @@ fn legacy_flag_grammar_is_rejected_not_aliased() {
             "--conversation",
         ],
     );
-    assert_eq!(output.status.code(), Some(2), "legacy grammar must exit 2");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "aliased legacy --agent grammar must succeed\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("deprecated alias"),
+        "deprecation note missing:\n{stderr}"
+    );
+    let extracts = home.join(".aicx").join("extracts");
+    assert!(
+        extracts.exists(),
+        "aliased invocation must write the extract like the subcommand form"
+    );
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn legacy_format_flag_stays_rejected_not_aliased() {
+    let home = unique_test_dir("legacy-format");
+    let rollout = home
+        .join(".codex")
+        .join("sessions")
+        .join("2026")
+        .join("07")
+        .join("13")
+        .join(format!("rollout-2026-07-13T04-00-00-{SESSION_UUID}.jsonl"));
+    write_file(&rollout, &rollout_fixture(SESSION_UUID));
+
+    let output = run_extract(
+        &home,
+        &[
+            "extract",
+            "--format",
+            "codex",
+            "--session",
+            SESSION_UUID,
+            "--conversation",
+        ],
+    );
+    assert_eq!(output.status.code(), Some(2), "legacy --format must exit 2");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("legacy_flag_grammar"),
@@ -127,7 +173,7 @@ fn legacy_flag_grammar_is_rejected_not_aliased() {
     );
     assert!(
         !stderr.contains("extract: resolved"),
-        "legacy grammar must not reach catalog resolution"
+        "legacy --format must not reach catalog resolution"
     );
     let extracts = home.join(".aicx").join("extracts");
     assert!(

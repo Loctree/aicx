@@ -1,5 +1,7 @@
 //! Explicit AICX Oracle provenance for search-like surfaces.
 
+#[cfg(feature = "app")]
+use aicx_retrieve::RetrievalOutcome;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 
@@ -61,12 +63,24 @@ impl ClaimHonesty {
 #[serde(rename_all = "snake_case")]
 pub enum OracleBackend {
     CanonicalCorpus,
+    /// Direct, allowlisted reads of sessions attributed by the durable catalog.
+    CatalogSources,
     FilesystemFuzzy,
     SteerMetadata,
     ContentSemantic,
     Hybrid,
     #[serde(rename = "hybrid_rrf")]
     HybridRrf,
+    /// Dense cosine leg served without the lexical fusion leg — a degraded
+    /// hybrid execution, never a healthy semantic claim.
+    SemanticDenseOnly,
+    /// Lexical-first path against the published hybrid generation's Tantivy
+    /// artifact (default 2026-07-23). Not filesystem-fuzzy; not dense fusion.
+    #[serde(rename = "lexical_tantivy")]
+    LexicalTantivy,
+    /// The caller produced results but carried no execution evidence; health
+    /// cannot be claimed for this surface.
+    RetrievalUnknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -77,6 +91,8 @@ pub enum OracleIndexKind {
     CanonicalChunks,
     ContentChunks,
     OnionContent,
+    /// Published hybrid generation lexical leg (`tantivy_lex`).
+    LexicalTantivy,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -94,7 +110,7 @@ pub struct OracleStatus {
     pub index_kind: OracleIndexKind,
     pub fallback_reason: Option<String>,
     pub derived_view: String,
-    pub store_root: String,
+    pub aicx_home: String,
     pub indexed_count: usize,
     pub scanned_count: usize,
     pub candidate_count: usize,
@@ -112,6 +128,13 @@ pub struct OracleStatus {
     pub lexical_doc_count: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fusion_algorithm: Option<String>,
+    /// Typed retrieval execution status (W1-01). One value rendered on every
+    /// surface; additive key so existing JSON consumers are untouched.
+    /// App-only: the slim `loctree-consumer` profile does not link
+    /// `aicx-retrieve`, and this field is never emitted there.
+    #[cfg(feature = "app")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retrieval: Option<RetrievalOutcome>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -129,8 +152,44 @@ where
 }
 
 impl OracleStatus {
+    pub fn catalog_source_scan(
+        aicx_home: &Path,
+        scanned_count: usize,
+        candidate_count: usize,
+        source_paths_verified: bool,
+    ) -> Self {
+        Self {
+            source_layer: catalog_sources_layer(),
+            backend: OracleBackend::CatalogSources,
+            index_kind: OracleIndexKind::None,
+            fallback_reason: None,
+            derived_view: "catalog_source_extract_scan_no_semantic_index".to_string(),
+            aicx_home: display_path(aicx_home),
+            indexed_count: 0,
+            scanned_count,
+            candidate_count,
+            source_paths_verified,
+            stale_or_unknown: !source_paths_verified,
+            loctree_scope_safe: source_paths_verified,
+            loctree_scope_note: if source_paths_verified {
+                "safe_as_allowlisted_historical_source_evidence; not a semantic similarity oracle"
+                    .to_string()
+            } else {
+                "unsafe_for_scope_narrowing; one or more catalog sources could not be verified"
+                    .to_string()
+            },
+            manifest_generation_id: None,
+            manifest_source_chunk_count: None,
+            dense_count: None,
+            lexical_doc_count: None,
+            fusion_algorithm: None,
+            #[cfg(feature = "app")]
+            retrieval: None,
+        }
+    }
+
     pub fn canonical_corpus_scan(
-        store_root: &Path,
+        aicx_home: &Path,
         scanned_count: usize,
         candidate_count: usize,
         source_paths_verified: bool,
@@ -141,7 +200,7 @@ impl OracleStatus {
             index_kind: OracleIndexKind::CanonicalChunks,
             fallback_reason: None,
             derived_view: "canonical_chunk_scan_no_semantic_index".to_string(),
-            store_root: display_path(store_root),
+            aicx_home: display_path(aicx_home),
             indexed_count: 0,
             scanned_count,
             candidate_count,
@@ -158,11 +217,13 @@ impl OracleStatus {
             dense_count: None,
             lexical_doc_count: None,
             fusion_algorithm: None,
+            #[cfg(feature = "app")]
+            retrieval: None,
         }
     }
 
     pub fn filesystem_fuzzy(
-        store_root: &Path,
+        aicx_home: &Path,
         scanned_count: usize,
         candidate_count: usize,
         source_paths_verified: bool,
@@ -175,7 +236,7 @@ impl OracleStatus {
                 "fallback_filesystem_fuzzy: content index unavailable".to_string(),
             ),
             derived_view: "none_filesystem_scan".to_string(),
-            store_root: display_path(store_root),
+            aicx_home: display_path(aicx_home),
             indexed_count: 0,
             scanned_count,
             candidate_count,
@@ -190,11 +251,13 @@ impl OracleStatus {
             dense_count: None,
             lexical_doc_count: None,
             fusion_algorithm: None,
+            #[cfg(feature = "app")]
+            retrieval: None,
         }
     }
 
     pub fn content_semantic(
-        store_root: &Path,
+        aicx_home: &Path,
         indexed_count: usize,
         candidate_count: usize,
         source_paths_verified: bool,
@@ -205,7 +268,7 @@ impl OracleStatus {
             index_kind: OracleIndexKind::ContentChunks,
             fallback_reason: None,
             derived_view: "materialized_vector_index_from_canonical_chunks".to_string(),
-            store_root: display_path(store_root),
+            aicx_home: display_path(aicx_home),
             indexed_count,
             scanned_count: indexed_count,
             candidate_count,
@@ -223,12 +286,14 @@ impl OracleStatus {
             dense_count: None,
             lexical_doc_count: None,
             fusion_algorithm: None,
+            #[cfg(feature = "app")]
+            retrieval: None,
         }
     }
 
     #[cfg(feature = "app")]
     pub fn hybrid_rrf(
-        store_root: &Path,
+        aicx_home: &Path,
         status: &crate::search_engine::HybridRetrievalStatus,
         candidate_count: usize,
         source_paths_verified: bool,
@@ -238,8 +303,11 @@ impl OracleStatus {
             backend: OracleBackend::HybridRrf,
             index_kind: OracleIndexKind::OnionContent,
             fallback_reason: None,
-            derived_view: "hybrid_rrf_manifest_bound_lexical_dense_index".to_string(),
-            store_root: display_path(store_root),
+            derived_view: format!(
+                "hybrid_rrf_manifest_bound_lexical_dense_index:{}",
+                status.dense_kind
+            ),
+            aicx_home: display_path(aicx_home),
             indexed_count: status.source_chunk_count,
             scanned_count: status.source_chunk_count,
             candidate_count,
@@ -257,11 +325,13 @@ impl OracleStatus {
             dense_count: Some(status.dense_count),
             lexical_doc_count: Some(status.lexical_doc_count),
             fusion_algorithm: Some(status.fusion_algorithm.clone()),
+            #[cfg(feature = "app")]
+            retrieval: None,
         }
     }
 
     pub fn metadata_steer(
-        store_root: &Path,
+        aicx_home: &Path,
         indexed_count: usize,
         candidate_count: usize,
         source_paths_verified: bool,
@@ -273,7 +343,7 @@ impl OracleStatus {
             index_kind: OracleIndexKind::MetadataSteer,
             fallback_reason: None,
             derived_view: "metadata_steer_index_rebuildable_from_canonical_chunks".to_string(),
-            store_root: display_path(store_root),
+            aicx_home: display_path(aicx_home),
             indexed_count,
             scanned_count: indexed_count,
             candidate_count,
@@ -291,7 +361,143 @@ impl OracleStatus {
             dense_count: None,
             lexical_doc_count: None,
             fusion_algorithm: None,
+            #[cfg(feature = "app")]
+            retrieval: None,
         }
+    }
+
+    /// Lexical-first answers from the published hybrid generation Tantivy
+    /// index. Distinct from [`Self::filesystem_fuzzy`] (last-resort card
+    /// scan when no generation exists).
+    #[cfg(feature = "app")]
+    pub fn lexical_tantivy(
+        aicx_home: &Path,
+        scanned_count: usize,
+        candidate_count: usize,
+        source_paths_verified: bool,
+        hybrid: Option<&crate::search_engine::HybridRetrievalStatus>,
+    ) -> Self {
+        let (indexed, generation_id, source_chunks, lexical_docs) = match hybrid {
+            Some(h) => (
+                h.lexical_doc_count.max(h.source_chunk_count),
+                Some(h.generation_id.clone()),
+                Some(h.source_chunk_count),
+                Some(h.lexical_doc_count),
+            ),
+            None => (scanned_count, None, None, None),
+        };
+        Self {
+            source_layer: canonical_layer(),
+            backend: OracleBackend::LexicalTantivy,
+            index_kind: OracleIndexKind::LexicalTantivy,
+            fallback_reason: None,
+            derived_view: "published_hybrid_generation_lexical_tantivy".to_string(),
+            aicx_home: display_path(aicx_home),
+            indexed_count: indexed,
+            scanned_count,
+            candidate_count,
+            source_paths_verified,
+            stale_or_unknown: !source_paths_verified,
+            loctree_scope_safe: source_paths_verified,
+            loctree_scope_note: if source_paths_verified {
+                "safe_for_lexical_scope_when_followed_by_canonical_chunk_read".to_string()
+            } else {
+                "unsafe_for_scope_narrowing; lexical hits must be re-read from source paths"
+                    .to_string()
+            },
+            manifest_generation_id: generation_id,
+            manifest_source_chunk_count: source_chunks,
+            dense_count: hybrid.map(|h| h.dense_count),
+            lexical_doc_count: lexical_docs,
+            fusion_algorithm: None,
+            retrieval: None,
+        }
+    }
+
+    /// Degraded hybrid execution: only the dense cosine leg ran (hybrid
+    /// manifest missing or stale). Always carries a fallback reason — this
+    /// status must never serialize as a healthy semantic backend.
+    pub fn semantic_dense_only(
+        aicx_home: &Path,
+        scanned_count: usize,
+        candidate_count: usize,
+        source_paths_verified: bool,
+        fallback_reason: String,
+    ) -> Self {
+        Self {
+            source_layer: canonical_layer(),
+            backend: OracleBackend::SemanticDenseOnly,
+            index_kind: OracleIndexKind::ContentChunks,
+            fallback_reason: Some(fallback_reason),
+            derived_view: "dense_only_cosine_over_committed_primary_index".to_string(),
+            aicx_home: display_path(aicx_home),
+            indexed_count: scanned_count,
+            scanned_count,
+            candidate_count,
+            source_paths_verified,
+            stale_or_unknown: !source_paths_verified,
+            loctree_scope_safe: source_paths_verified,
+            loctree_scope_note: if source_paths_verified {
+                "degraded_dense_only; semantically valid but lexical fusion leg is unavailable — \
+                 follow with canonical chunk read"
+                    .to_string()
+            } else {
+                "unsafe_for_scope_narrowing; dense-only index returned paths that are not all readable"
+                    .to_string()
+            },
+            manifest_generation_id: None,
+            manifest_source_chunk_count: None,
+            dense_count: None,
+            lexical_doc_count: None,
+            fusion_algorithm: None,
+            #[cfg(feature = "app")]
+            retrieval: None,
+        }
+    }
+
+    /// Results arrived without execution evidence (legacy caller, no hybrid
+    /// manifest, no dense-only marker). Fails closed: stale/unknown, never
+    /// scope-safe, never a healthy semantic claim.
+    pub fn retrieval_unknown(
+        aicx_home: &Path,
+        scanned_count: usize,
+        candidate_count: usize,
+        fallback_reason: String,
+    ) -> Self {
+        Self {
+            source_layer: canonical_layer(),
+            backend: OracleBackend::RetrievalUnknown,
+            index_kind: OracleIndexKind::None,
+            fallback_reason: Some(fallback_reason),
+            derived_view: "retrieval_execution_evidence_missing".to_string(),
+            aicx_home: display_path(aicx_home),
+            indexed_count: 0,
+            scanned_count,
+            candidate_count,
+            source_paths_verified: false,
+            stale_or_unknown: true,
+            loctree_scope_safe: false,
+            loctree_scope_note:
+                "unsafe_for_scope_narrowing; retrieval carried no execution evidence — \
+                 treat results as unverified routing signal"
+                    .to_string(),
+            manifest_generation_id: None,
+            manifest_source_chunk_count: None,
+            dense_count: None,
+            lexical_doc_count: None,
+            fusion_algorithm: None,
+            #[cfg(feature = "app")]
+            retrieval: None,
+        }
+    }
+
+    /// Attach the typed retrieval execution status. Every search-like JSON
+    /// surface (CLI search/evidence, MCP search/evidence) carries this same
+    /// value; renderers must not re-derive health elsewhere.
+    #[cfg(feature = "app")]
+    pub fn with_retrieval(mut self, retrieval: RetrievalOutcome) -> Self {
+        self.retrieval = Some(retrieval);
+        self
     }
 }
 
@@ -322,6 +528,10 @@ fn display_path(path: &Path) -> String {
 
 fn canonical_layer() -> String {
     "layer_1_canonical_corpus".to_string()
+}
+
+fn catalog_sources_layer() -> String {
+    "layer_1_catalog_sources".to_string()
 }
 
 #[cfg(test)]
@@ -413,5 +623,17 @@ mod tests {
                 .loctree_scope_note
                 .contains("not a semantic similarity oracle")
         );
+    }
+
+    #[test]
+    fn catalog_intents_status_names_direct_source_evidence_truthfully() {
+        let status = OracleStatus::catalog_source_scan(Path::new("/tmp/aicx"), 2, 2, true);
+
+        assert_eq!(status.source_layer, "layer_1_catalog_sources");
+        assert_eq!(status.backend, OracleBackend::CatalogSources);
+        assert_eq!(status.index_kind, OracleIndexKind::None);
+        assert_eq!(status.fallback_reason, None);
+        assert!(status.loctree_scope_safe);
+        assert!(status.derived_view.contains("catalog_source_extract"));
     }
 }

@@ -12,10 +12,10 @@ const OPERATOR_MD_KIND: &str = "operator-md";
 /// Default discovery window applied when a caller does NOT supply its own cutoff.
 ///
 /// Historically this acted as an unconditional ceiling, which silently capped
-/// `aicx store --agent operator-md -H 0` (all-time backfill) at 30 days. It
+/// an explicit all-time operator-markdown batch at 30 days. It
 /// is now a *default* honored only when `caller_cutoff` is `None` in
 /// [`discover_operator_markdown_from`]. Callers that thread an
-/// `ExtractionConfig::cutoff` through (e.g. the store pipeline) bypass this
+/// `ExtractionConfig::cutoff` through (e.g. the source-scan pipeline) bypass this
 /// default entirely, so explicit lookback flags are honored.
 const OPERATOR_MD_RECENT_DAYS: i64 = 30;
 
@@ -126,7 +126,7 @@ fn push_operator_markdown_input(
 ///   ([`OPERATOR_MD_RECENT_DAYS`]). This is the legacy convenience for source
 ///   enumeration paths that have no [`ExtractionConfig`] to hand in.
 /// - `Some(t)` honors `t` directly. `t = UNIX epoch` therefore means
-///   "all time", which is what `aicx store --agent operator-md -H 0` needs.
+///   "all time", which is what explicit operator-markdown backfills need.
 pub fn discover_operator_markdown_from(
     home: &Path,
     repo_root: Option<&Path>,
@@ -219,7 +219,7 @@ pub fn extract_operator_markdown_from_home_and_repo(
 /// Extract operator markdown from an explicit file or directory.
 ///
 /// This is the bridge for ad-hoc `.md` exports: the file still goes through the
-/// same operator-md parser and canonical store writer, but discovery is scoped
+/// same operator-md parser and explicit report renderer, but discovery is scoped
 /// to the provided path rather than Downloads / inbox / docs/operator.
 pub fn extract_operator_markdown_from_input(
     home: &Path,

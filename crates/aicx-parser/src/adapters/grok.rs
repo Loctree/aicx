@@ -31,7 +31,7 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 
 /// Adapter version for this cut. Bumped only on contract-visible behavior changes.
-const ADAPTER_VERSION: &str = "c9p-2026-07-13";
+const ADAPTER_VERSION: &str = "c9p-2026-07-24";
 
 pub struct GrokAdapter;
 
@@ -162,50 +162,36 @@ impl AgentAdapter for GrokAdapter {
                     .map(|k| k == "summary")
                     .unwrap_or(false)
                 {
-                    if let Ok(v) = serde_json::from_str::<Value>(text)
-                        && let Some(info) = v.get("info")
-                    {
-                        cwd = info
-                            .get("cwd")
-                            .and_then(|x| x.as_str())
-                            .map(|s| s.to_owned())
-                            .or_else(|| {
-                                info.get("git_root_dir")
-                                    .and_then(|x| x.as_str())
-                                    .map(|s| s.to_owned())
-                            });
-                        branch = info
-                            .get("head_branch")
-                            .and_then(|x| x.as_str())
-                            .map(|s| s.to_owned());
-                        model_id = info
-                            .get("current_model_id")
-                            .and_then(|x| x.as_str())
-                            .map(|s| s.to_owned());
-                        title = v
-                            .get("session_summary")
-                            .and_then(|x| x.as_str())
-                            .map(|s| s.to_owned());
-                        started_at = info
-                            .get("created_at")
-                            .and_then(|x| x.as_str())
-                            .map(|s| s.to_owned());
-                        ended_at = info
-                            .get("updated_at")
-                            .and_then(|x| x.as_str())
-                            .map(|s| s.to_owned());
-                        git_root = info
-                            .get("git_root_dir")
-                            .and_then(|x| x.as_str())
-                            .map(|s| s.to_owned());
+                    if let Ok(v) = serde_json::from_str::<Value>(text) {
+                        // Real Grok summary.json mixes a small `info` object
+                        // (id, cwd) with top-level session fields (created_at,
+                        // current_model_id, git_root_dir, head_branch, …).
+                        let info = v.get("info");
+                        let pick = |key: &str| -> Option<String> {
+                            info.and_then(|i| i.get(key))
+                                .and_then(|x| x.as_str())
+                                .or_else(|| v.get(key).and_then(|x| x.as_str()))
+                                .map(|s| s.to_owned())
+                        };
+                        cwd = pick("cwd").or_else(|| pick("git_root_dir"));
+                        branch = pick("head_branch");
+                        model_id = pick("current_model_id");
+                        title = pick("session_summary").or_else(|| pick("generated_title"));
+                        started_at = pick("created_at");
+                        ended_at = pick("updated_at").or_else(|| pick("last_active_at"));
+                        git_root = pick("git_root_dir");
                     }
                 } else if matches!(cu.disposition, ClassifiedDisposition::Consumed { .. })
                     && let Ok(v) = serde_json::from_str::<Value>(text)
                 {
-                    if unit.artifact_name.contains("event")
+                    // Prefer artifact name: chat_history must never be diverted
+                    // into the events bucket by content heuristics.
+                    let is_chat_artifact = unit.artifact_name.contains("chat_history");
+                    let is_event_artifact = unit.artifact_name.contains("event")
+                        && !is_chat_artifact
                         || text.contains("\"event_type\"")
-                        || text.contains("\"response_item\"")
-                    {
+                        || text.contains("\"response_item\"");
+                    if is_event_artifact && !is_chat_artifact {
                         event_lines.push((cu.ordinal, v));
                     } else {
                         chat_lines.push((cu.ordinal, v));
@@ -214,9 +200,12 @@ impl AgentAdapter for GrokAdapter {
             }
         }
 
-        // Prefer summary cwd over git_root.
+        // Prefer summary cwd over git_root; fall back to decoding the Grok
+        // path layout `…/sessions/<percent-encoded-cwd>/<uuid>/chat_history.jsonl`
+        // when summary is missing (direct --file without sibling summary).
         let cwd = cwd
             .or(git_root)
+            .or_else(|| infer_cwd_from_source(source))
             .unwrap_or_else(|| "/unknown/grok-cwd".to_owned());
         let model_id = model_id.unwrap_or_else(|| "grok".to_owned());
         let _title = title.unwrap_or_else(|| "grok session".to_owned());
@@ -465,6 +454,7 @@ impl AgentAdapter for GrokAdapter {
                     .iter()
                     .any(|(_, v)| v.get("type").and_then(|t| t.as_str()) == Some("reasoning")),
                 unsupported_visible_event: unsupported_visible,
+                compaction_boundary_present: false,
             },
             malformed_tail_present: skipped
                 .iter()
@@ -519,6 +509,63 @@ impl AgentAdapter for GrokAdapter {
 }
 
 // --- helpers (private to adapter; leave receipts) ---
+
+/// Decode cwd from Grok on-disk layout when summary.json is absent:
+/// `…/sessions/<percent-encoded-cwd>/<uuid>/chat_history.jsonl`.
+fn infer_cwd_from_source(source: &SourceHandle) -> Option<String> {
+    for artifact in source.artifacts() {
+        let Some(path) = artifact.validated_path() else {
+            continue;
+        };
+        // path = …/<encoded-cwd>/<session-uuid>/chat_history.jsonl
+        let session_dir = path.parent()?;
+        let encoded_cwd_dir = session_dir.parent()?;
+        // Prefer the segment immediately under a `sessions` directory.
+        let under_sessions = encoded_cwd_dir
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            == Some("sessions");
+        if !under_sessions {
+            continue;
+        }
+        let encoded = encoded_cwd_dir.file_name()?.to_str()?;
+        let decoded = decode_percent_path(encoded);
+        if decoded.starts_with('/') || decoded.contains(':') {
+            return Some(decoded);
+        }
+    }
+    None
+}
+
+fn decode_percent_path(encoded: &str) -> String {
+    let bytes = encoded.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut cursor = 0usize;
+    while cursor < bytes.len() {
+        if bytes[cursor] == b'%'
+            && cursor + 2 < bytes.len()
+            && let (Some(high), Some(low)) =
+                (hex_nibble(bytes[cursor + 1]), hex_nibble(bytes[cursor + 2]))
+        {
+            decoded.push((high << 4) | low);
+            cursor += 3;
+        } else {
+            decoded.push(bytes[cursor]);
+            cursor += 1;
+        }
+    }
+    String::from_utf8_lossy(&decoded).into_owned()
+}
+
+const fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
 
 fn classify_grok_line(line: &str) -> Result<String, SkippedReason> {
     let v: Value = serde_json::from_str(line).map_err(|_| SkippedReason::Malformed)?;

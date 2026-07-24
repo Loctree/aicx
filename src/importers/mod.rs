@@ -3,7 +3,7 @@
 //!
 //! Importers are an integration line, not agent session adapters: they consume
 //! human-authored artifacts (CodeScribe transcripts, operator Markdown) and
-//! project them into `TimelineEntry` records for the store pipeline. Nothing in
+//! project them into `TimelineEntry` records for source scanning and report rendering. Nothing in
 //! this namespace implements or registers `aicx_parser::adapters::AgentAdapter`,
 //! and nothing here participates in session catalog resolution.
 //!

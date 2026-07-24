@@ -198,8 +198,14 @@ struct DiagnosticsState {
     initialized: bool,
     verbose: bool,
     run_id: String,
+    /// Computed at `init`, materialized lazily on the first write. Read-only
+    /// commands (health, doctor without records) must never create the run
+    /// log just because the process started.
+    pending_log_path: Option<PathBuf>,
+    /// Set only once the log file actually exists on disk.
     log_path: Option<PathBuf>,
     log_writer: Option<BufWriter<File>>,
+    log_open_failed: bool,
     log_failure_reported: bool,
     extractors: BTreeMap<&'static str, ExtractorCounters>,
 }
@@ -233,8 +239,11 @@ fn lock_state() -> MutexGuard<'static, DiagnosticsState> {
 /// Initialize the diagnostics aggregator for this CLI run.
 ///
 /// `verbose` controls whether per-file warnings are echoed to stderr (default
-/// false keeps stderr quiet). The structured run log is always written to
-/// `<state_dir>/diagnostics-<run-id>.log` when `state_dir` is resolvable.
+/// false keeps stderr quiet). The structured run log path is computed here but
+/// the file is **not** created — it materializes on the first actual write
+/// (see [`log_describe`]), so read-only commands leave `<state_dir>` byte-for-
+/// byte untouched. Retention over closed run logs is enforced at that first
+/// materialization, never during a run that writes nothing.
 pub fn init(verbose: bool, state_dir: Option<PathBuf>) -> Result<()> {
     let mut state = lock_state();
     if state.initialized {
@@ -244,31 +253,233 @@ pub fn init(verbose: bool, state_dir: Option<PathBuf>) -> Result<()> {
     }
 
     let run_id = generate_run_id();
-    let mut log_path = None;
-    let mut log_writer = None;
-    if let Some(dir) = state_dir {
-        let path = dir.join(format!("diagnostics-{run_id}.log"));
-        match open_log(&path) {
-            Ok(writer) => {
-                log_writer = Some(writer);
-                log_path = Some(path);
-            }
-            Err(err) => {
-                eprintln!(
-                    "diagnostics: failed to open run log at {}: {err}",
-                    path.display()
-                );
-                state.log_failure_reported = true;
-            }
-        }
-    }
-
+    state.pending_log_path = state_dir.map(|dir| dir.join(format!("diagnostics-{run_id}.log")));
     state.initialized = true;
     state.verbose = verbose;
     state.run_id = run_id;
-    state.log_path = log_path;
-    state.log_writer = log_writer;
+    state.log_path = None;
+    state.log_writer = None;
     Ok(())
+}
+
+/// Materialize the run log on first use: enforce retention over closed run
+/// logs in the same directory, then open the file append-only. Failure is
+/// remembered so a broken filesystem is reported once, not per line.
+fn ensure_log_writer(state: &mut DiagnosticsState) {
+    if state.log_writer.is_some() || state.log_open_failed {
+        return;
+    }
+    let Some(path) = state.pending_log_path.clone() else {
+        return;
+    };
+    if let (Some(dir), Some(active_name)) = (path.parent(), path.file_name()) {
+        // Best-effort by design: retention must never block the run that is
+        // trying to write its own diagnostics.
+        let _ = enforce_retention(
+            dir,
+            active_name,
+            Utc::now(),
+            &DiagnosticsRetentionPolicy::default(),
+        );
+    }
+    match open_log(&path) {
+        Ok(writer) => {
+            state.log_writer = Some(writer);
+            state.log_path = Some(path);
+        }
+        Err(err) => {
+            eprintln!(
+                "diagnostics: failed to open run log at {}: {err}",
+                path.display()
+            );
+            state.log_open_failed = true;
+            state.log_failure_reported = true;
+        }
+    }
+}
+
+/// Retention policy for closed diagnostics run logs under `<state_dir>`.
+///
+/// Applied only when a new run materializes its own log. Bounds are joint:
+/// age first, then file count, then total bytes — deterministic given the
+/// same directory contents. The active run's log and logs owned by a still-
+/// running process are never candidates.
+#[derive(Debug, Clone)]
+pub struct DiagnosticsRetentionPolicy {
+    /// Keep at most this many run logs (protected files count toward the cap
+    /// but are never deleted to satisfy it).
+    pub max_files: usize,
+    /// Keep at most this many bytes of run logs in total.
+    pub max_total_bytes: u64,
+    /// Delete closed run logs older than this, regardless of count/bytes.
+    pub max_age: chrono::Duration,
+}
+
+impl Default for DiagnosticsRetentionPolicy {
+    fn default() -> Self {
+        Self {
+            max_files: 32,
+            max_total_bytes: 64 * 1024 * 1024,
+            max_age: chrono::Duration::days(14),
+        }
+    }
+}
+
+/// Outcome of one retention pass, for tests and (future) doctor reporting.
+#[derive(Debug, Default)]
+pub struct DiagnosticsRetentionOutcome {
+    pub deleted: Vec<PathBuf>,
+    pub kept: usize,
+}
+
+/// One closed-run candidate parsed from `diagnostics-<stamp>-<pid>.log`.
+struct RunLogEntry {
+    path: PathBuf,
+    stamp: chrono::DateTime<Utc>,
+    size: u64,
+}
+
+/// Parse `diagnostics-<%Y%m%dT%H%M%SZ>-<pid>.log`. Returns `None` for
+/// anything that does not match exactly — unknown files are never deleted.
+fn parse_run_log_name(name: &str) -> Option<(chrono::DateTime<Utc>, u32)> {
+    let rest = name.strip_prefix("diagnostics-")?.strip_suffix(".log")?;
+    let (stamp_raw, pid_raw) = rest.rsplit_once('-')?;
+    let pid: u32 = pid_raw.parse().ok()?;
+    let stamp = chrono::NaiveDateTime::parse_from_str(stamp_raw, "%Y%m%dT%H%M%SZ")
+        .ok()?
+        .and_utc();
+    Some((stamp, pid))
+}
+
+/// Best-effort liveness probe for the pid embedded in a run-log name.
+/// `Some(true)` = alive (protected), `Some(false)` = dead (closed run),
+/// `None` = cannot tell on this platform (protected unless past `max_age`).
+fn run_log_pid_alive(pid: u32) -> Option<bool> {
+    if pid == std::process::id() {
+        return Some(true);
+    }
+    #[cfg(unix)]
+    {
+        if pid == 0 || pid > i32::MAX as u32 {
+            return None;
+        }
+        let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        if rc == 0 {
+            return Some(true);
+        }
+        match std::io::Error::last_os_error().raw_os_error() {
+            Some(libc::ESRCH) => Some(false),
+            // EPERM: process exists under another uid — alive.
+            Some(libc::EPERM) => Some(true),
+            _ => None,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
+/// Enforce [`DiagnosticsRetentionPolicy`] over `dir`.
+///
+/// Never touches `active_name`, files whose embedded pid is still alive, or
+/// files whose name does not parse as a run log. Deletion is per-file
+/// `remove_file` (atomic at the filesystem level); order is deterministic:
+/// age purge first, then oldest-first until the count cap holds, then
+/// oldest-first until the byte cap holds.
+pub(crate) fn enforce_retention(
+    dir: &Path,
+    active_name: &std::ffi::OsStr,
+    now: chrono::DateTime<Utc>,
+    policy: &DiagnosticsRetentionPolicy,
+) -> DiagnosticsRetentionOutcome {
+    let mut outcome = DiagnosticsRetentionOutcome::default();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return outcome;
+    };
+
+    let mut protected_count = 0usize;
+    let mut protected_bytes = 0u64;
+    let mut eligible: Vec<RunLogEntry> = Vec::new();
+
+    for entry in entries.flatten() {
+        let name_os = entry.file_name();
+        let Some(name) = name_os.to_str() else {
+            continue;
+        };
+        if !name.starts_with("diagnostics-") || !name.ends_with(".log") {
+            continue;
+        }
+        let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+        if name_os == active_name {
+            protected_count += 1;
+            protected_bytes += size;
+            continue;
+        }
+        let Some((stamp, pid)) = parse_run_log_name(name) else {
+            // Fail closed: a run-log-looking file we cannot parse is kept.
+            protected_count += 1;
+            protected_bytes += size;
+            continue;
+        };
+        let age = now.signed_duration_since(stamp);
+        let closed = match run_log_pid_alive(pid) {
+            Some(true) => false,
+            Some(false) => true,
+            // Unknown liveness: only age can prove the run abandoned.
+            None => age > policy.max_age,
+        };
+        if !closed {
+            protected_count += 1;
+            protected_bytes += size;
+            continue;
+        }
+        eligible.push(RunLogEntry {
+            path: entry.path(),
+            stamp,
+            size,
+        });
+    }
+
+    // Deterministic order: oldest first, name as tie-break.
+    eligible.sort_by(|a, b| (a.stamp, &a.path).cmp(&(b.stamp, &b.path)));
+
+    let delete = |entry: &RunLogEntry, outcome: &mut DiagnosticsRetentionOutcome| {
+        match std::fs::remove_file(&entry.path) {
+            Ok(()) => outcome.deleted.push(entry.path.clone()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                outcome.deleted.push(entry.path.clone());
+            }
+            Err(_) => {}
+        }
+    };
+
+    // 1. Age purge.
+    let mut kept: Vec<RunLogEntry> = Vec::new();
+    for entry in eligible {
+        if now.signed_duration_since(entry.stamp) > policy.max_age {
+            delete(&entry, &mut outcome);
+        } else {
+            kept.push(entry);
+        }
+    }
+
+    // 2. Count cap (protected files count toward the cap, oldest closed go).
+    while protected_count + kept.len() > policy.max_files && !kept.is_empty() {
+        let entry = kept.remove(0);
+        delete(&entry, &mut outcome);
+    }
+
+    // 3. Byte cap.
+    let mut total_bytes = protected_bytes + kept.iter().map(|e| e.size).sum::<u64>();
+    while total_bytes > policy.max_total_bytes && !kept.is_empty() {
+        let entry = kept.remove(0);
+        total_bytes = total_bytes.saturating_sub(entry.size);
+        delete(&entry, &mut outcome);
+    }
+
+    outcome.kept = protected_count + kept.len();
+    outcome
 }
 
 fn open_log(path: &Path) -> Result<BufWriter<File>> {
@@ -329,10 +540,12 @@ pub fn record(extractor: &'static str, kind: DiagnosticKind, count: usize, path:
         .record(kind, count, &label);
 }
 
-/// Append a fully-formatted line to the per-run diagnostic log. No-op if the
-/// log file could not be opened. Always called regardless of verbosity.
+/// Append a fully-formatted line to the per-run diagnostic log. The log file
+/// is materialized on the first call (lazy — see [`init`]); no-op if it could
+/// not be opened. Always called regardless of verbosity.
 pub fn log_describe(line: &str) {
     let mut state = lock_state();
+    ensure_log_writer(&mut state);
     let writer = match state.log_writer.as_mut() {
         Some(w) => w,
         None => return,
@@ -452,6 +665,180 @@ mod tests {
         reset_for_tests();
         init(verbose, dir).expect("init");
         guard
+    }
+
+    #[test]
+    fn init_alone_creates_no_log_file() {
+        // W2-04 red-first: a read-only command (health/doctor without
+        // records) must not materialize `diagnostics-<run-id>.log`. The
+        // log file may only appear once something is actually written.
+        let dir = std::env::temp_dir().join(format!(
+            "aicx-diag-lazy-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _serial = lock_test_init(false, Some(dir.clone()));
+        let entries: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().collect();
+        assert!(
+            entries.is_empty(),
+            "init must not create a diagnostics log before the first write; found {entries:?}"
+        );
+        // First write materializes the log (and only then).
+        log_describe("first line");
+        let entries: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().collect();
+        assert_eq!(
+            entries.len(),
+            1,
+            "first log_describe must materialize exactly the run log"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn retention_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "aicx-diag-retention-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Pid far above pid_max on Linux (4 194 304) and macOS (99 998) —
+    /// guaranteed ESRCH, i.e. a closed run.
+    const DEAD_PID: u32 = 999_999_999;
+
+    fn write_log(dir: &Path, stamp: &str, pid: u32, bytes: usize) -> PathBuf {
+        let path = dir.join(format!("diagnostics-{stamp}-{pid}.log"));
+        std::fs::write(&path, vec![b'x'; bytes]).unwrap();
+        path
+    }
+
+    #[test]
+    fn retention_below_current_size_rotates_only_eligible_closed_runs() {
+        // W2-04 red-first: limits set below the current directory size must
+        // rotate ONLY eligible closed runs — never the active run, never a
+        // log owned by a live process, never an unparsable name.
+        let dir = retention_dir("eligible");
+        let now = chrono::DateTime::parse_from_rfc3339("2026-07-22T12:00:00Z")
+            .unwrap()
+            .to_utc();
+
+        let active_name = format!("diagnostics-20260722T115900Z-{}.log", std::process::id());
+        let active = dir.join(&active_name);
+        std::fs::write(&active, vec![b'x'; 4096]).unwrap();
+        let live = write_log(&dir, "20260722T110000Z", std::process::id(), 4096);
+        let weird = dir.join("diagnostics-not-a-run-log.log");
+        std::fs::write(&weird, b"???").unwrap();
+        let old_closed = write_log(&dir, "20260720T090000Z", DEAD_PID, 4096);
+        let mid_closed = write_log(&dir, "20260721T090000Z", DEAD_PID, 4096);
+        let new_closed = write_log(&dir, "20260722T090000Z", DEAD_PID, 4096);
+
+        let policy = DiagnosticsRetentionPolicy {
+            max_files: 4,
+            max_total_bytes: 1, // far below current size — pressure everywhere
+            max_age: chrono::Duration::days(14),
+        };
+        let outcome = enforce_retention(&dir, std::ffi::OsStr::new(&active_name), now, &policy);
+
+        assert!(active.exists(), "active run must never be deleted");
+        assert!(live.exists(), "live-pid run must never be deleted");
+        assert!(
+            weird.exists(),
+            "unparsable run-log name must never be deleted"
+        );
+        assert!(
+            !old_closed.exists(),
+            "closed runs must rotate under pressure"
+        );
+        assert!(
+            !mid_closed.exists(),
+            "closed runs must rotate under pressure"
+        );
+        assert!(
+            !new_closed.exists(),
+            "closed runs must rotate under pressure"
+        );
+        assert_eq!(outcome.deleted.len(), 3);
+        // Deterministic order: oldest closed first.
+        assert_eq!(outcome.deleted[0], old_closed);
+        assert_eq!(outcome.deleted[1], mid_closed);
+        assert_eq!(outcome.deleted[2], new_closed);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn retention_count_and_age_caps_are_deterministic_and_keep_newest() {
+        let dir = retention_dir("caps");
+        let now = chrono::DateTime::parse_from_rfc3339("2026-07-22T12:00:00Z")
+            .unwrap()
+            .to_utc();
+
+        // Ancient closed run — past max_age, must go regardless of count.
+        let ancient = write_log(&dir, "20260601T000000Z", DEAD_PID, 10);
+        // Three recent closed runs; count cap 2 keeps the newest two.
+        let d1 = write_log(&dir, "20260722T080000Z", DEAD_PID, 10);
+        let d2 = write_log(&dir, "20260722T090000Z", DEAD_PID, 10);
+        let d3 = write_log(&dir, "20260722T100000Z", DEAD_PID, 10);
+
+        let policy = DiagnosticsRetentionPolicy {
+            max_files: 2,
+            max_total_bytes: 1024,
+            max_age: chrono::Duration::days(14),
+        };
+        let outcome = enforce_retention(
+            &dir,
+            std::ffi::OsStr::new("diagnostics-20260722T120000Z-1.log"),
+            now,
+            &policy,
+        );
+
+        assert!(!ancient.exists(), "past-max-age closed run must be purged");
+        assert!(
+            !d1.exists(),
+            "oldest closed run beyond count cap must rotate"
+        );
+        assert!(d2.exists());
+        assert!(d3.exists());
+        assert_eq!(outcome.kept, 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn retention_no_pressure_deletes_nothing() {
+        let dir = retention_dir("idle");
+        let now = chrono::DateTime::parse_from_rfc3339("2026-07-22T12:00:00Z")
+            .unwrap()
+            .to_utc();
+        let a = write_log(&dir, "20260722T080000Z", DEAD_PID, 10);
+        let b = write_log(&dir, "20260722T090000Z", DEAD_PID, 10);
+        let outcome = enforce_retention(
+            &dir,
+            std::ffi::OsStr::new("diagnostics-20260722T120000Z-1.log"),
+            now,
+            &DiagnosticsRetentionPolicy::default(),
+        );
+        assert!(a.exists());
+        assert!(b.exists());
+        assert!(outcome.deleted.is_empty());
+        assert_eq!(outcome.kept, 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_run_log_name_accepts_only_exact_shape() {
+        assert!(parse_run_log_name("diagnostics-20260722T081443Z-80671.log").is_some());
+        assert!(parse_run_log_name("diagnostics-20260722T081443Z-.log").is_none());
+        assert!(parse_run_log_name("diagnostics-garbage-80671.log").is_none());
+        assert!(parse_run_log_name("other-20260722T081443Z-80671.log").is_none());
+        assert!(parse_run_log_name("diagnostics-20260722T081443Z-80671.txt").is_none());
     }
 
     #[test]

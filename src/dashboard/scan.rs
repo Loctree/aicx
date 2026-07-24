@@ -1,4 +1,4 @@
-//! Store scanner and dashboard payload extraction.
+//! Read-only legacy archive scanner and dashboard payload extraction.
 
 use anyhow::Result;
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
@@ -19,12 +19,12 @@ const SEARCH_READ_BYTES: u64 = 256 * 1024;
 const MAX_SEARCH_TEXT_CHARS: usize = 12_000;
 const MAX_DETAIL_CHARS: usize = 32_000;
 
-pub(super) fn scan_store(
-    store_root: &Path,
+pub(super) fn scan_legacy_archive(
+    aicx_home: &Path,
     preview_chars: usize,
     scope: &DashboardScope,
 ) -> Result<ScanResult> {
-    let store_root = crate::sanitize::validate_dir_path(store_root)?;
+    let aicx_home = crate::sanitize::validate_dir_path(aicx_home)?;
     let scope = scope.normalized();
 
     let mut stats = DashboardStats {
@@ -33,11 +33,11 @@ pub(super) fn scan_store(
     };
 
     let mut assumptions = vec![
-        "Data source is canonical files from ~/.aicx with repo and non-repository roots.".to_string(),
-        "Layout is intentionally simplified to Search -> List -> Content for daily browsing.".to_string(),
-        "Repo-scoped files are scanned from ~/.aicx/store/<org>/<repo>/<YYYY_MMDD>/<kind>/<agent>/...".to_string(),
-        "Non-repository fallbacks are scanned from ~/.aicx/non-repository-contexts/<YYYY_MMDD>/<kind>/<agent>/...".to_string(),
-        "Fuzzy search index uses normalized matching over file metadata and bounded raw-note content excerpts.".to_string(),
+        "This compatibility view is read-only and scans legacy cards still present under ~/.aicx; catalog + extracts own live session truth.".to_string(),
+        "Layout is intentionally simplified to Search -> List -> Content for archive inspection.".to_string(),
+        "Legacy repo-scoped cards may remain under ~/.aicx/store/<org>/<repo>/<YYYY_MMDD>/<kind>/<agent>/...".to_string(),
+        "Legacy non-repository cards may remain under ~/.aicx/non-repository-contexts/<YYYY_MMDD>/<kind>/<agent>/...".to_string(),
+        "Archive fuzzy search uses normalized matching over file metadata and bounded content excerpts.".to_string(),
     ];
 
     let mut records = Vec::<DashboardRecord>::new();
@@ -45,8 +45,8 @@ pub(super) fn scan_store(
     let mut agents = BTreeSet::<String>::new();
     let mut kinds = BTreeSet::<String>::new();
 
-    let index_path = store_root.join("index.json");
-    let state_path = store_root.join("state.json");
+    let index_path = aicx_home.join("index.json");
+    let state_path = aicx_home.join("state.json");
     stats.index_loaded = index_path.exists();
     stats.state_loaded = state_path.exists();
 
@@ -62,7 +62,7 @@ pub(super) fn scan_store(
 
     if let Some(project) = scope.project.as_ref() {
         assumptions.push(format!(
-            "Startup scope narrows dashboard payload to project/store buckets containing: {}",
+            "Startup scope narrows the legacy archive view to project buckets containing: {}",
             project
         ));
     }
@@ -73,7 +73,7 @@ pub(super) fn scan_store(
         ));
     }
 
-    for stored_file in crate::store::scan_context_files_at(&store_root)? {
+    for stored_file in crate::legacy_archive::scan_context_files_at(&aicx_home)? {
         if !project_matches_filter(&stored_file.project, scope.project.as_deref()) {
             continue;
         }
@@ -114,7 +114,7 @@ pub(super) fn scan_store(
             .map(|datetime| datetime.format("%H:%M:%S").to_string())
             .unwrap_or_else(|| "00:00:00".to_string());
         let relative_path = file_path
-            .strip_prefix(&store_root)
+            .strip_prefix(&aicx_home)
             .map(|path| path.display().to_string())
             .unwrap_or_else(|_| file_path.display().to_string());
 
@@ -200,7 +200,7 @@ pub(super) fn scan_store(
 
     let payload = DashboardPayload {
         generated_at: Utc::now().to_rfc3339(),
-        store_root: store_root.display().to_string(),
+        aicx_home: aicx_home.display().to_string(),
         stats,
         assumptions,
         projects: projects.into_iter().collect(),

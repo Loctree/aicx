@@ -43,7 +43,7 @@ const REGENERATE_HEADER_VALUE: &str = "regenerate";
 /// Runtime configuration for dashboard server mode.
 #[derive(Debug, Clone)]
 pub struct DashboardServerConfig {
-    pub store_root: PathBuf,
+    pub aicx_home: PathBuf,
     pub scope: DashboardScope,
     pub title: String,
     pub preview_chars: usize,
@@ -102,7 +102,7 @@ struct DashboardStatusResponse {
     rebuilding: bool,
     generated_at: String,
     build_count: u64,
-    store_root: String,
+    aicx_home: String,
     artifact_path: String,
     artifact_written: bool,
     title: String,
@@ -237,7 +237,7 @@ pub async fn run_dashboard_server(config: DashboardServerConfig) -> Result<()> {
     } else {
         eprintln!("  Mutation origin gate: require Origin or Referer");
     }
-    eprintln!("  Store: {}", config.store_root.display());
+    eprintln!("  AICX home: {}", config.aicx_home.display());
     eprintln!("  CORS: {}", config.cors_policy.label());
     if auth_enforced {
         eprintln!("  Auth: enabled on /api/* (source: {auth_source_label})");
@@ -278,7 +278,7 @@ async fn get_health() -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "ok": true,
         "service": "aicx-dashboard",
-        "version": env!("CARGO_PKG_VERSION"),
+        "version": crate::BUILD_VERSION,
     }))
 }
 
@@ -292,7 +292,7 @@ async fn get_status(
         rebuilding: state.rebuilding.load(Ordering::SeqCst),
         generated_at: snapshot.generated_at.to_rfc3339(),
         build_count: snapshot.build_count,
-        store_root: state.config.store_root.display().to_string(),
+        aicx_home: state.config.aicx_home.display().to_string(),
         artifact_path: state.config.artifact_path.display().to_string(),
         artifact_written: false,
         title: state.config.title.clone(),
@@ -420,8 +420,8 @@ async fn get_context(State(state): State<Arc<DashboardServerState>>) -> Json<ser
     let snapshot = state.snapshot.read().await;
     Json(serde_json::json!({
         "ok": true,
-        "version": env!("CARGO_PKG_VERSION"),
-        "store_root": state.config.store_root.display().to_string(),
+        "version": crate::BUILD_VERSION,
+        "aicx_home": state.config.aicx_home.display().to_string(),
         "host": state.config.host.to_string(),
         "port": state.config.port,
         "generated_at": snapshot.generated_at.to_rfc3339(),
@@ -454,7 +454,7 @@ async fn get_manifest() -> Response {
 async fn get_service_worker() -> Response {
     let sw_js = concat!(
         "const CACHE_NAME='aicx-shell-v",
-        env!("CARGO_PKG_VERSION"),
+        env!("AICX_BUILD_VERSION"),
         "';\
 const SHELL_URLS=['/','/manifest.webmanifest'];\
 self.addEventListener('install',e=>{e.waitUntil(caches.open(CACHE_NAME)\
@@ -468,7 +468,7 @@ e.respondWith(caches.match(e.request).then(r=>{if(r)return r;\
 return fetch(e.request).catch(()=>{if(e.request.mode==='navigate')\
 return new Response('<html><body style=\"background:#0a0f19;color:#e5e7eb;\
 font-family:system-ui;display:flex;align-items:center;justify-content:center;\
-height:100vh;margin:0\"><div style=\"text-align:center\"><h1>aicx store not \
+height:100vh;margin:0\"><div style=\"text-align:center\"><h1>aicx archive not \
 reachable</h1><p>Start the server with <code>aicx dashboard --serve</code></p>\
 </div></body></html>',{headers:{'Content-Type':'text/html'}});});}));});"
     );
@@ -485,8 +485,8 @@ fn rebuild_dashboard(config: &DashboardServerConfig) -> Result<BuildOutput> {
     // Server mode: scan only — no static HTML rendering, no artifact write.
     // The server shell HTML is pre-built once at startup; all data reaches
     // clients through the /api/* endpoints.
-    let payload = dashboard::scan_store_payload_scoped(
-        &config.store_root,
+    let payload = dashboard::scan_legacy_archive_payload_scoped(
+        &config.aicx_home,
         config.preview_chars,
         &config.scope,
     )?;

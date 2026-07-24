@@ -440,3 +440,69 @@ fn codex_requires_one_explicit_jsonl_artifact() {
         .expect("bounded whole-document read");
     assert!(adapter.classify(&whole, &whole_read).is_err());
 }
+
+#[test]
+fn codex_dual_envelope_dedups_event_msg_when_response_item_owns_chat() {
+    let body = fixture("dual_envelope.jsonl");
+    let session = model("22222222-2222-4222-8222-222222222222", &body);
+    let visible: Vec<_> = session
+        .turns
+        .iter()
+        .filter(|turn| matches!(turn.kind, TurnKind::UserMsg | TurnKind::AgentReply))
+        .collect();
+    assert_eq!(
+        visible.len(),
+        2,
+        "expected one user + one assistant turn, got {}: {:?}",
+        visible.len(),
+        visible
+            .iter()
+            .map(|t| (t.role, t.kind, t.text.as_str()))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(visible[0].role, TurnRole::User);
+    assert_eq!(visible[0].text, "Diagnose the burn site.");
+    assert_eq!(visible[1].role, TurnRole::Assistant);
+    assert_eq!(visible[1].text, "I see double turns.");
+    // No skip for dual envelope; chat must not double.
+    assert_eq!(session.coverage.skipped_count, 0);
+    assert!(
+        session.coverage.consumed_count >= 6,
+        "expected all physical units consumed, got {}",
+        session.coverage.consumed_count
+    );
+}
+
+#[test]
+fn codex_compaction_markers_consumed_without_unsupported_or_visible_loss() {
+    let body = fixture("compaction_markers.jsonl");
+    let session = model("33333333-3333-4333-8333-333333333333", &body);
+    assert!(
+        session
+            .coverage
+            .status
+            .boundary_flags
+            .compaction_boundary_present,
+        "compaction markers must set boundary flag"
+    );
+    assert!(
+        !session
+            .coverage
+            .status
+            .boundary_flags
+            .unsupported_visible_event,
+        "compaction must not be classified as unsupported visible"
+    );
+    let visible: Vec<_> = session
+        .turns
+        .iter()
+        .filter(|turn| matches!(turn.kind, TurnKind::UserMsg | TurnKind::AgentReply))
+        .map(|t| t.text.as_str())
+        .collect();
+    assert_eq!(
+        visible,
+        ["Before compact", "Ack before", "After compact", "Ack after"]
+    );
+    assert_eq!(session.coverage.skipped_count, 0);
+    assert_eq!(session.coverage.raw_line_count, 8);
+}

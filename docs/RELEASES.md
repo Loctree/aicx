@@ -1,76 +1,29 @@
 # Releases and Distribution
 
-`aicx` now ships through these repo-owned channels:
+GitHub Releases are the user-facing binary release lane for `aicx`. The source
+registry, npm wrapper, and Homebrew are secondary distribution surfaces; none
+of them replaces the signed GitHub asset set.
 
-1. Source install from a local checkout or accessible git remote.
-2. GitHub Releases with prebuilt archives for users who do not want a Rust toolchain.
-3. npm wrapper distribution under `@loctree/aicx` once platform packages match
-   the current GitHub Release asset shape.
-4. Homebrew tap packaging once the GitHub Release asset shape is promoted there.
+`Cargo.toml` owns the semantic version. `CHANGELOG.md` owns release notes.
+`tools/release_sync.py` keeps versioned install and npm examples aligned.
 
-There is also a maintainer-local macOS bundling path for signed production
-archives. That is separate from the current public v0.6.5 slim unsigned
-GitHub Release assets:
+## Canonical Asset Set
 
-```bash
-make release-bundle KEYS=~/.keys
-make release-bundle KEYS=~/.keys NATIVE=1
-make release-bundle KEYS=~/.keys NOTARY_PROFILE=my-notary-profile
-```
+Tagging `vX.Y.Z` runs `.github/workflows/release.yml`. The workflow verifies
+the tag/version contract and release gates, then publishes:
 
-This document is the maintainer path from green CI to public release artifacts.
+| Platform | Release asset | Platform proof |
+| --- | --- | --- |
+| macOS arm64 | `aicx-vX.Y.Z-aarch64-apple-darwin-slim.zip` | Developer ID codesign + Apple notarization |
+| Linux x64 GNU | `aicx-vX.Y.Z-x86_64-linux-gnu-slim.tar.gz` | GPG detached signature |
+| Windows x64 | `aicx-vX.Y.Z-x86_64-pc-windows-msvc-slim.zip` | GPG detached signature |
+| Debian x64 | `aicx_X.Y.Z-1_amd64.deb` | GPG detached signature |
 
-## Current Shape
+Every archive and Debian package has an adjacent `.sha256` and `.asc`.
+`loctree-release-pubkey.asc` is published with the release. The macOS job also
+publishes its notarization record.
 
-- The supported public v0.6.5 install path is GitHub Releases plus adjacent
-  `.sha256` sidecars.
-- Public v0.6.5 archives are slim unsigned `.tar.gz` bundles for macOS arm64,
-  Linux x64 GNU, and Linux arm64 GNU.
-- Linux cross builds pin `cross-rs` builder images to release `v0.2.5`
-  (`0.2.5@sha256:9e5b39c09874bc1816c675ed11afca2c2ed6cee0c4ed2b3c1d5763c346c9ae3f`
-  for x86_64 GNU and
-  `0.2.5@sha256:702154f52b2d8091671aa2c84d5582d849f949977228c735ff8462f93cc0e1e4`
-  for aarch64 musl). Operators manually bump both `Cross.toml` image refs
-  when a new `cross-rs` release is worth tracking; automated image updates are
-  outside the pass-3 scope.
-- The npm surface lives under `distribution/npm/`, but it is not the supported
-  v0.6.5 install path until its platform mapping is updated from the older
-  zip/musl shape.
-- Manual npm publication now has a dedicated workflow at `.github/workflows/npm-publish.yml`.
-- `Cargo.toml` is the semantic version source of truth; `tools/release_sync.py` propagates that version into npm manifests and the user-facing install examples.
-- `make version` shows the current package/tag state. `make version-patch` and
-  `make bump-patch` are operator aliases for `make version-bump VERSION=patch`.
-- `CHANGELOG.md` is the release-notes source of truth; the GitHub release workflow now derives its body from the matching version section instead of ad-hoc generated notes.
-- `install.sh` prefers a colocated release bundle first, then a local checkout, and otherwise falls back to the published install path.
-- `AICX_INSTALL_MODE=git` remains available for testing unreleased source directly from GitHub.
-
-## What the Public Release Asset Set Contains
-
-Tagging `vX.Y.Z` triggers `.github/workflows/release.yml`, which:
-
-- verifies the tag matches `Cargo.toml`
-- reruns the required release gates: `semgrep`, default clippy, native GGUF clippy, binary tests, native GGUF tests, and `cargo fmt -- --check`
-- builds both shipped binaries: `aicx` and `aicx-mcp`
-- builds Linux artifacts on the Linux release runner
-- builds macOS artifacts on the macOS release runner
-- packages archives plus `LICENSE`, `README.md`, `install.sh`, and command docs
-- uploads SHA-256 checksum files alongside each archive
-- creates or updates the matching GitHub Release using the current version section from `CHANGELOG.md`
-- keeps self-hosted runners lean by not caching `target/` in release jobs and cleaning Cargo build artifacts after packaging/upload
-
-Current binary targets:
-
-- `aarch64-apple-darwin`
-- `x86_64-unknown-linux-gnu`
-- `aarch64-unknown-linux-gnu`
-
-Archive naming is deterministic:
-
-- `aicx-vX.Y.Z-aarch64-apple-darwin-slim-unsigned.tar.gz`
-- `aicx-vX.Y.Z-x86_64-unknown-linux-gnu-slim-unsigned.tar.gz`
-- `aicx-vX.Y.Z-aarch64-unknown-linux-gnu-slim-unsigned.tar.gz`
-
-Each archive contains:
+Each bundle contains:
 
 - `aicx`
 - `aicx-mcp`
@@ -79,169 +32,195 @@ Each archive contains:
 - `README.md`
 - `docs/COMMANDS.md`
 - `docs/RELEASES.md`
+- `release-manifest.json`
 
-### Asset verification
+The release workflow builds exactly three binary targets:
 
-Download `SHA256SUMS` into the same directory as the `.tar.gz` release assets,
-then run:
+- `aarch64-apple-darwin`
+- `x86_64-unknown-linux-gnu`
+- `x86_64-pc-windows-msvc`
 
-```bash
-sha256sum -c SHA256SUMS
-```
+Do not revive the removed unsigned/musl archive lane. Adding a platform means
+updating the build matrix, installer, npm metadata checks, documentation, and
+cold-install smoke as one release-contract change.
 
-The command expects `SHA256SUMS` and the referenced archives to be colocated.
-It exits non-zero if any archive is missing or does not match the published
-checksum.
+## User Install
 
-The maintainer-local macOS signing path expects these operator-owned inputs:
-
-- `MACOS_CERT_P12_BASE64`
-- `MACOS_CERT_PASSWORD`
-- `MACOS_KEYCHAIN_PASSWORD`
-- `MACOS_DEVELOPER_ID_APPLICATION`
-- `APPLE_API_KEY_BASE64`
-- `APPLE_API_KEY_ID`
-- `APPLE_API_ISSUER_ID`
-
-## Local macOS Signed Bundle
-
-For local production-style signed macOS artifacts, use:
+Download the installer from the same immutable tag as the desired release:
 
 ```bash
-make release-bundle KEYS=/path/to/.keys
-make release-bundle KEYS=/path/to/.keys NATIVE=1
+curl -fsSLO https://raw.githubusercontent.com/Loctree/aicx/v0.12.0/install.sh
+AICX_INSTALL_MODE=release AICX_RELEASE_TAG=v0.12.0 bash install.sh
 ```
 
-The target:
+Release mode selects the platform archive, downloads its adjacent `.sha256`,
+verifies the digest, and delegates to the installer inside the verified
+bundle. It installs `aicx` and `aicx-mcp` into `~/.local/bin`.
 
-- builds `aicx` and `aicx-mcp` for the local Apple target
-- builds slim binaries by default, or native GGUF-capable binaries with `NATIVE=1`
-- assembles a release bundle in `dist/`
-- includes `install.sh` for post-download install into `~/.local/bin`
-- imports the signing certificate into a temporary keychain
-- signs both binaries with timestamps and hardened runtime
-- writes a SHA-256 checksum next to the archive
-- cleans `target/<triple>` after the bundle is safely written by default; use `CLEAN=0` if you intentionally want to keep local release artifacts
-
-Expected key layout matches the current daily operator structure under `~/.keys`:
-
-- `signing-identity.txt`
-- `Certificates.p12`
-- `cert_password.txt`
-- `.notary.env`
-
-Optional notarization auth paths, if that maintainer lane is re-enabled:
-
-1. `NOTARY_PROFILE=<keychain-profile>` on the `make` command line.
-2. `AICX_NOTARY_PROFILE` in the shell environment.
-3. `NOTARY_KEYCHAIN_PROFILE` inside `KEYS/.notary.env`.
-4. Fallback to `NOTARY_APPLE_ID`, `NOTARY_TEAM_ID`, and `NOTARY_PASSWORD` from `KEYS/.notary.env`.
-
-Examples:
+For an unreleased checkout, use the local source path:
 
 ```bash
-make release-bundle KEYS=~/.keys
-make release-bundle KEYS=~/.keys NATIVE=1
-make release-bundle KEYS=~/.keys NOTARY_PROFILE=vc-notary
-make release-bundle KEYS=~/.keys CLEAN=0
-AICX_KEYS_DIR=~/.keys AICX_NOTARY_PROFILE=vc-notary make release-bundle
-bash install.sh
-AICX_INSTALL_MODE=release AICX_RELEASE_TAG=v0.10.0 bash install.sh
+cargo install --path . --locked --force --bin aicx --bin aicx-mcp
 ```
 
-Notes:
+`AICX_INSTALL_MODE=git` exists for maintainer testing of unreleased GitHub
+source. It is not proof that a tagged binary release works.
 
-- This target is macOS-only.
-- Public v0.6.5 release assets are slim unsigned `.tar.gz` archives. Do not
-  describe them as notarized unless the release workflow actually notarizes
-  that asset set.
-- The target does not print secret values; it only reads the files from the operator-owned keys directory.
-- `install.sh` inside the bundle copies binaries into `~/.local/bin` and removes stale user-local / `~/.cargo/bin` copies before configuring MCP.
-- That install path does not require Rust or a local rust-memex compile on the target machine.
-- `AICX_INSTALL_MODE=release` downloads the official release asset, fetches the adjacent `.sha256`, verifies the checksum, and only then delegates to the bundled installer.
-- On macOS, `AICX_INSTALL_MODE=release` expects the
-  `aicx-vX.Y.Z-aarch64-apple-darwin-slim-unsigned.tar.gz` asset.
+## Maintainer Preparation
 
-## Maintainer Release Flow
-
-1. Run `make release-prepare VERSION={patch|minor|major|x.y.z}` to bump the version, sync docs + npm surfaces, close `CHANGELOG.md`, preview release notes, and refresh `Cargo.lock` for this crate.
-2. Merge to `main` only after CI is green and the product surface is honest.
-3. Create an annotated tag that matches the crate version.
+Prepare and inspect the release on the candidate branch:
 
 ```bash
-git tag -a v0.10.0 -m "aicx v0.10.0"
-git push origin v0.10.0
+make release-prepare VERSION=0.12.0
+make release-check
+git diff --check
 ```
 
-4. Wait for the `Release` workflow to finish and confirm the GitHub Release has all archives, `.sha256` files, and the expected body copied from `CHANGELOG.md`.
-5. Smoke-test one archive on macOS or Linux before announcing it publicly.
+`make release-check` enforces the version/tag channel, a closed changelog
+section, formatting, tests, clippy, builds, and Semgrep. The release is still
+blocked if the runtime acceptance criteria or public install path are not
+proven, even when this gate is green.
 
-## Publish Track
-
-The current publish track is binary-first:
-
-1. Git tag triggers GitHub Release assets.
-2. macOS arm64 archives are currently slim unsigned `.tar.gz` bundles.
-3. Linux GNU archives are built for x64 and arm64.
-4. Each archive gets an adjacent `.sha256`.
-5. npm platform packages publish only after their platform mapping matches the
-   GitHub Release assets.
-6. Homebrew should consume the same GitHub Release assets and checksums.
-
-Crates.io publication is intentionally not the active release lane. The root
-crate depends on local first-party product crates (`rust-memex` and
-`aicx-embeddings`) that are not published to crates.io. Treat `cargo publish` /
-`cargo publish --dry-run` failures as expected unless the product decision
-changes and all first-party crates get a crates.io-compatible publication plan.
-
-## macOS Signing Runner Session Requirement
-
-The macOS release leg (`dragon-macos`) Apple-codesigns the binaries with the
-Developer ID identity. `codesign` can only resolve a keychain signing identity
-from inside a GUI login (`Aqua`) security session. This is a hard macOS
-constraint, not a property of `tools/release_bundle.sh`.
-
-Symptom when the runner is in the wrong session: `codesign` fails at step
-`[3/6]` with **"no identity found"** even though the Developer ID identity is
-valid (`security find-identity -v -p codesigning` → `1 valid identities found`)
-and the temporary-keychain import at step `[2/6]` succeeds.
-
-The signing script is correct: it creates a temp keychain, imports the `.p12`,
-runs `set-key-partition-list`, sets the temp keychain as the user default
-(needed for `SessionCreate=true` launchd sessions), and signs with `--keychain`.
-Reproducing that exact sequence in an `Aqua` session signs cleanly and passes
-`codesign --verify --deep --strict` (full chain Developer ID → Apple Root CA,
-hardened runtime, secure timestamp). No keychain-default trick in the script can
-compensate for a runner session that has no access to keychain services at all.
-
-Requirement: the `dragon-macos` self-hosted runner that builds aicx must run as
-a per-user LaunchAgent **inside the logged-in GUI session**, bootstrapped into
-`gui/$(id -u)` as the logged-in user. The decisive, verifiable property is
-`launchctl managername` → `Aqua` from inside the job — not any single plist flag
-(`SessionCreate` values differ across this host's runner plists, so do not treat
-the flag as the contract; verify `managername`). A runner started from a
-system-domain `LaunchDaemon`, over ssh, or by a detached non-Aqua supervisor runs
-without an Aqua security session and cannot codesign, regardless of the script.
-
-Diagnose the runner's session before a release:
+The user-facing release must come from the intended commit on `main`. Verify
+the exact commit before tagging:
 
 ```bash
-launchctl managername                       # must print: Aqua
-security find-identity -v -p codesigning    # must list the Developer ID identity
+git status --short --branch
+git rev-parse HEAD
+git rev-parse origin/main
+git merge-base --is-ancestor origin/main HEAD
 ```
 
-If `managername` is not `Aqua`, fix the runner's launchd configuration (move it
-into the GUI session) before re-running the release — do not patch the signing
-script.
+## Local Signed macOS Candidate
 
-As a backstop, `tools/release_bundle.sh` fails fast at step `[2b/6]` (after the
-temp-keychain import + `set-key-partition-list`, before the codesign loop) when
-the imported identity is not resolvable in the build session. It prints the same
-remedy and the in-session `find-identity` output instead of dying mid-run at
-`[3/6]` with a cryptic "no identity found" and a SecurityAgent GUI dialog.
+On the signing Mac, run the repository contract from an interactive shell so
+the operator keychain profile is visible:
 
-## Recovery and Reruns
+```bash
+zsh -ic 'cd /path/to/aicx && make release-bundle KEYS="$HOME/.keys" CLEAN=0'
+```
 
-- To rebuild a release for an existing tag, rerun the failed workflow or use `workflow_dispatch` with the same `vX.Y.Z` tag.
-- If the tag does not match `Cargo.toml`, the workflow fails before any binaries are published.
-- If npm publish fails, verify the GitHub Release assets and `.sha256` files exist before republishing the wrapper.
+The operator-owned credential directory is `$HOME/.keys`. The bundle script
+imports the Developer ID certificate into a temporary keychain, codesigns both
+binaries with hardened runtime and timestamping, notarizes and staples the
+bundle, writes SHA-256 and GPG detached signatures, and emits
+`release-manifest.json`.
+
+The signing session must be an Aqua GUI login:
+
+```bash
+launchctl managername
+security find-identity -v -p codesigning
+```
+
+`launchctl managername` must report `Aqua`, and the codesigning identity must
+be resolvable inside that same session. Do not print or copy credential
+contents into logs or reports.
+
+Local candidate success is pre-release evidence only. It does not replace a
+cold install from the GitHub URL produced by the tag workflow.
+
+## Publish Flow
+
+After review, runtime acceptance, and merge to `main`:
+
+1. Run `make release-check` on the exact commit to tag.
+2. Create a GPG-signed annotated tag with `make release-tag`.
+3. Push only the tag with `make release-push`.
+4. Wait for every `Release` workflow leg.
+5. Verify the GitHub Release body matches the `CHANGELOG.md` version section.
+6. Verify every archive has `.sha256` and `.asc`, and the public key is present.
+7. Run cold-install smoke from the published `vX.Y.Z` URL in a clean temporary
+   home.
+8. Publish npm only after the exact GitHub assets exist and the cold smoke is
+   green.
+
+The equivalent explicit tag commands are:
+
+```bash
+git tag -as v0.12.0 -m "Release v0.12.0"
+git push origin v0.12.0
+```
+
+Do not tag or push from a dirty tree, an unmerged branch, or a commit whose
+runtime acceptance is operator-deferred.
+
+## Verification
+
+Verify a downloaded asset without trusting its filename:
+
+```bash
+curl -fsSLO https://github.com/Loctree/aicx/releases/download/v0.12.0/loctree-release-pubkey.asc
+curl -fsSLO https://github.com/Loctree/aicx/releases/download/v0.12.0/aicx-v0.12.0-aarch64-apple-darwin-slim.zip
+curl -fsSLO https://github.com/Loctree/aicx/releases/download/v0.12.0/aicx-v0.12.0-aarch64-apple-darwin-slim.zip.sha256
+curl -fsSLO https://github.com/Loctree/aicx/releases/download/v0.12.0/aicx-v0.12.0-aarch64-apple-darwin-slim.zip.asc
+shasum -a 256 -c aicx-v0.12.0-aarch64-apple-darwin-slim.zip.sha256
+gpg --import loctree-release-pubkey.asc
+gpg --verify aicx-v0.12.0-aarch64-apple-darwin-slim.zip.asc \
+  aicx-v0.12.0-aarch64-apple-darwin-slim.zip
+```
+
+On macOS, also verify the extracted binaries and notarization:
+
+```bash
+codesign --verify --deep --strict --verbose=2 aicx
+codesign --verify --deep --strict --verbose=2 aicx-mcp
+spctl --assess --type execute --verbose=2 aicx
+spctl --assess --type execute --verbose=2 aicx-mcp
+```
+
+Cold-install smoke must use a fresh temporary directory and the public release
+URL, not the working tree or an existing `PATH` binary:
+
+```bash
+smoke_home="$(mktemp -d)"
+HOME="$smoke_home" AICX_INSTALL_MODE=release AICX_RELEASE_TAG=v0.12.0 bash install.sh
+HOME="$smoke_home" "$smoke_home/.local/bin/aicx" --version
+HOME="$smoke_home" "$smoke_home/.local/bin/aicx-mcp" --version
+```
+
+Verify the version contains the intended release version and provenance. Then
+exercise the release's user-visible acceptance queries against an explicitly
+prepared test corpus. Do not turn a read-only release check into an implicit
+publish of the operator's live index.
+
+## npm
+
+`distribution/npm/` contains one wrapper plus three platform packages:
+
+- `@loctree/aicx-darwin-arm64`
+- `@loctree/aicx-linux-x64-gnu`
+- `@loctree/aicx-win32-x64-gnu` (legacy npm suffix; MSVC binary)
+- `@loctree/aicx`
+
+Use `.github/workflows/npm-publish.yml` after the matching GitHub Release is
+complete. The workflow checks the three release archive names and their
+checksums, validates package metadata, publishes platform packages first, then
+the wrapper. See `distribution/npm/PUBLISHING.md`.
+
+The crates.io lane is source/library distribution, not the primary user-facing
+binary release. `make publish-crates-dry` validates the leaf crates; the full
+topological upload is an explicit maintainer action.
+
+## Deployment Surface
+
+The normal deployment is local CLI plus MCP stdio. `aicx serve` can expose
+streamable HTTP, but remote exposure is an operator deployment decision:
+non-loopback binds require Bearer auth, Host validation must be deliberate,
+and TLS/reverse-proxy ownership sits outside the binary release.
+
+Release verification must inventory the actual bind, auth, CORS/Host policy,
+secret materialization, observability, and rollback path before treating an
+HTTP deployment as public.
+
+## Recovery and Rollback
+
+- A failed workflow is rerun for the same tag only after its cause is fixed.
+- A tag/version mismatch fails before publication.
+- A bad immutable release is not silently overwritten. Mark it as affected,
+  publish a corrected patch release, and keep the provenance trail.
+- npm versions are immutable; deprecate or unpublish only within registry
+  policy, then publish a corrected patch.
+- Keep the previously proven release available until the new cold-install
+  smoke and runtime acceptance pass.
+- Never delete or rewrite operator indexes as part of release rollback.

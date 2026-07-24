@@ -8,8 +8,8 @@ If you discover a security vulnerability in aicx, please report it responsibly.
 
 ### How to Report
 
-- Use [GitHub Security Advisories](https://github.com/vetcoders/ai-contexters/security/advisories/new) to submit a private report.
-- Alternatively, contact us directly at **hello@vetcoders.io**.
+- Use [GitHub Security Advisories](https://github.com/Loctree/aicx/security/advisories/new) to submit a private report.
+- Alternatively, contact us directly at **security@loctree.com**.
 
 ### What to Include
 

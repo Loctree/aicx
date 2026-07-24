@@ -1,8 +1,8 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
+use crate::legacy_archive::{self, StoredContextFile};
 use crate::sanitize;
-use crate::store::{self, StoredContextFile};
 
 #[derive(Debug, Clone)]
 pub struct CorpusEntry {
@@ -30,7 +30,7 @@ pub struct CorpusScreen {
 
 impl CorpusScreen {
     pub fn load() -> Self {
-        match store::scan_context_files() {
+        match legacy_archive::scan_context_files() {
             Ok(files) => {
                 let entries = files.iter().map(entry_from_file).collect::<Vec<_>>();
                 let mut screen = Self {

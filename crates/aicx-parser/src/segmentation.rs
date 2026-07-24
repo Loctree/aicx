@@ -405,16 +405,14 @@ fn infer_tiered_identity_from_text(text: &str) -> Option<TieredIdentity> {
     })
 }
 
-/// Resolve a canonical `(organization, repository)` identity from a
-/// cwd string by consulting ground-truth signals — git remote URL,
-/// then known-layout heuristics, finally URL-shape inference.
+/// Resolve identity once, while raw entries are being segmented for ingest.
 ///
-/// Returns `None` when no canonical identity can be honestly resolved.
-/// Made `pub` so `src/sources.rs::project_filter_matches_path` can use
-/// the same canonical resolver instead of the prior path-segment
-/// heuristic (which leaked cross-org per `chatgpt-codex-connector`
-/// P1 review on PR #8; see Wave F-2 follow-up commit body).
-pub fn infer_tiered_identity_from_cwd(cwd: Option<&str>) -> Option<TieredIdentity> {
+/// The live checkout is a time-local signal: its remote may be renamed or
+/// repointed after the session happened. Therefore this helper is private to
+/// the ingest segmentation module. Query surfaces must read the project bucket
+/// persisted by ingest and cannot call this function through the public parser
+/// API.
+fn infer_tiered_identity_from_cwd(cwd: Option<&str>) -> Option<TieredIdentity> {
     let cwd = cwd?.trim();
     if cwd.is_empty() || looks_like_weak_source_identifier(cwd) {
         return None;
@@ -687,6 +685,10 @@ fn looks_like_date_pattern(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// Process-wide lock for tests that mutate `AICX_HOME` / `HOME`.
+    /// Parallel workspace cargo-test races otherwise flake
+    /// `project_hash_registry_load_default_honors_aicx_home_*`.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     use super::*;
     use chrono::{TimeZone, Utc};
     use std::fs;
@@ -1618,6 +1620,10 @@ mod tests {
         // helper now honors AICX_HOME first, falls back to HOME/.aicx,
         // and returns an empty registry (not panic) when neither env
         // var resolves to an existing file.
+        let _serial = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
         let aicx_home = mk_tmp_dir("registry-aicx-home");
         fs::create_dir_all(&aicx_home).unwrap();
         let map_path = aicx_home.join("gemini-project-map.json");
@@ -1627,13 +1633,10 @@ mod tests {
         )
         .unwrap();
 
-        // Serialize env mutation so we don't fight other tests that
-        // also touch HOME/AICX_HOME — the segmentation module owns no
-        // other env-touching tests today, but this guard is cheap.
         let prev_aicx_home = std::env::var_os("AICX_HOME");
         let prev_home = std::env::var_os("HOME");
-        // SAFETY: This is a single-threaded test and we restore the
-        // previous values before returning.
+        // SAFETY: ENV_LOCK serializes process-global env mutation; restore
+        // previous values before dropping the guard.
         unsafe {
             std::env::set_var("AICX_HOME", &aicx_home);
         }

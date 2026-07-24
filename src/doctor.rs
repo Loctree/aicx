@@ -1,24 +1,22 @@
 //! Diagnostic and self-healing layer for aicx.
 //!
-//! `aicx doctor` performs an integrity audit of the canonical store, the
-//! steer index (Lance + BM25), state.json, sidecar coverage, and corpus
-//! bucket names. With
-//! `--rebuild-steer-index` (formerly `--fix`, kept as a deprecated alias),
-//! the steer index is deleted and rebuilt from the canonical store via
-//! `steer_index::rebuild_steer_index_if_needed`. The flag was renamed in
-//! 2026-05-25 (Wave D / Cut D1) because the original `--fix` was a no-op
-//! for most warning classes (sidecars, index consistency, empty bodies),
-//! addressing only the corrupted-steer-index case. The narrower name
-//! matches the actual contract; other remediations live behind their
-//! dedicated flags (`--prune-empty-bodies`, `--fix-buckets`,
-//! `aicx store --full-rescan`).
+//! `aicx doctor` audits AICX-home state, the published retrieval index,
+//! state.json, source protection, and residual legacy card archives. With
+//! `--clean-retired-steer` removes retired steer-only artifacts; the old
+//! `--rebuild-steer-index` and `--fix` spellings remain deprecated aliases.
+//! The published CURRENT generation is owned exclusively by `aicx index`;
+//! doctor never grows a parallel retrieval index. Other remediations live
+//! behind their dedicated flags (`--prune-empty-bodies`, `--fix-buckets`) or
+//! the extract-era rebuild path
+//! (`aicx catalog rebuild && aicx index --cache-extracts`).
 //!
-//! With `--fix-buckets`, suspicious top-level store buckets are moved to
+//! With `--fix-buckets`, suspicious top-level legacy archive buckets are moved to
 //! timestamped quarantine. With `--prune-empty-bodies --apply`, empty-body
 //! chunks and their sidecars are moved to a recoverable empty-body quarantine.
 //!
-//! The canonical store (`~/.aicx/store/`) is treated as ground truth: doctor
-//! never deletes store contents. Bucket quarantine is a rename into
+//! Legacy card mill paths under `~/.aicx/store/` may still be inspected by
+//! doctor for migration hygiene, but the live corpus is catalog + sources +
+//! optional extracts. Bucket quarantine is a rename into
 //! `~/.aicx/quarantine/<timestamp>/`, preserving the original payload.
 //!
 //! Vibecrafted with AI Agents by Vetcoders (c)2026 Vetcoders

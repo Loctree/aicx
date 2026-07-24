@@ -2,7 +2,7 @@
 
 use super::scan::{
     classify_extension_kind_ref, collect_json_strings, extract_latest_timestamp_from_json,
-    extract_latest_timestamp_from_text, scan_store,
+    extract_latest_timestamp_from_text, scan_legacy_archive,
 };
 use super::*;
 use chrono::{TimeZone, Utc};
@@ -145,7 +145,7 @@ fn scans_store_and_builds_payload() {
     )
     .expect("state");
 
-    let scan = scan_store(&root, 120, &DashboardScope::default()).expect("scan");
+    let scan = scan_legacy_archive(&root, 120, &DashboardScope::default()).expect("scan");
     assert_eq!(scan.payload.stats.total_projects, 1);
     assert_eq!(scan.payload.stats.total_files, 2);
     assert_eq!(scan.payload.stats.search_backend, "raw-notes-fuzzy");
@@ -177,7 +177,7 @@ fn builds_dashboard_html_with_simple_layout() {
     .expect("md");
 
     let cfg = DashboardConfig {
-        store_root: root.clone(),
+        aicx_home: root.clone(),
         title: "AI Context Dashboard".to_string(),
         preview_chars: 100,
         scope: DashboardScope::default(),
@@ -216,7 +216,7 @@ fn server_shell_includes_highlight_styles_and_wiring() {
 fn static_dashboard_includes_highlight_styles_and_wiring() {
     let payload = DashboardPayload {
         generated_at: "2026-04-02T17:43:00Z".to_string(),
-        store_root: "/tmp/aicx".to_string(),
+        aicx_home: "/tmp/aicx".to_string(),
         records: Vec::new(),
         stats: DashboardStats::default(),
         assumptions: Vec::new(),
@@ -254,7 +254,7 @@ fn static_dashboard_includes_highlight_styles_and_wiring() {
 fn static_dashboard_includes_polish_normalization_map_for_l_stroke() {
     let payload = DashboardPayload {
         generated_at: "2026-04-02T17:43:00Z".to_string(),
-        store_root: "/tmp/aicx".to_string(),
+        aicx_home: "/tmp/aicx".to_string(),
         records: Vec::new(),
         stats: DashboardStats::default(),
         assumptions: Vec::new(),
@@ -331,7 +331,7 @@ fn scan_skips_symlinked_files() {
     let symlink_path = proj.join("2026_0224_codex_symlink001_001.md");
     std::os::unix::fs::symlink(&outside_file, &symlink_path).expect("symlink");
 
-    let scan = scan_store(&root, 120, &DashboardScope::default()).expect("scan");
+    let scan = scan_legacy_archive(&root, 120, &DashboardScope::default()).expect("scan");
     assert_eq!(scan.payload.stats.total_files, 1);
     assert!(
         scan.payload
@@ -345,7 +345,7 @@ fn scan_skips_symlinked_files() {
 }
 
 #[test]
-fn scan_store_scope_filters_by_project_and_hours() {
+fn scan_legacy_archive_scope_filters_by_project_and_hours() {
     let root = mk_tmp_dir("ai_ctx_dashboard_scope");
     let recent = Utc::now() - chrono::Duration::hours(1);
     let alpha_date = recent.format("%Y_%m%d").to_string();
@@ -383,14 +383,14 @@ fn scan_store_scope_filters_by_project_and_hours() {
     .expect("beta file");
 
     // Bug #27/#28 regression: the startup scope filter is now strict
-    // (routes through `aicx::store::project_filter_matches`). The old
+    // (routes through `aicx::legacy_archive::project_filter_matches`). The old
     // assertion used `Some("alpha")` and relied on substring matching
     // against canonical slug `local/alpha-project` — that was the
     // very leak the strict filter is designed to kill. The strict
     // matcher accepts `alpha-project` (cross-org repo-name match),
     // `local/alpha-project` (exact slug), `local/` (org wildcard),
     // or `/alpha-project` (repo wildcard).
-    let scoped = scan_store(
+    let scoped = scan_legacy_archive(
         &root,
         120,
         &DashboardScope {
@@ -402,13 +402,9 @@ fn scan_store_scope_filters_by_project_and_hours() {
 
     assert_eq!(scoped.payload.records.len(), 1);
     assert_eq!(scoped.payload.records[0].project, "local/alpha-project");
-    assert!(
-        scoped
-            .payload
-            .assumptions
-            .iter()
-            .any(|line| line.contains("project/store buckets containing: alpha-project"))
-    );
+    assert!(scoped.payload.assumptions.iter().any(|line| {
+        line.contains("legacy archive view to project buckets containing: alpha-project")
+    }));
     assert!(
         scoped
             .payload
@@ -420,7 +416,7 @@ fn scan_store_scope_filters_by_project_and_hours() {
     // Bug #27 positive guard: the substring-only filter `alpha` MUST
     // NOT match canonical `local/alpha-project` under strict
     // semantics. The dashboard layer used to silently leak this.
-    let substring_leak = scan_store(
+    let substring_leak = scan_legacy_archive(
         &root,
         120,
         &DashboardScope {

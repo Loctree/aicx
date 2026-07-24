@@ -6,10 +6,11 @@
 //! ship to users — not a synthetic bypass.
 //!
 //! Pipeline asserted, end to end:
-//!   1. canonical store has at least one chunk (extract was previously run)
+//!   1. residual legacy archive fixture has at least one chunk
 //!   2. embedder loads via the configured backend (cloud or native GGUF)
 //!   3. `vector_index::write_index` materializes NDJSON + committed hybrid
-//!      artifacts under `~/.aicx/indexed/<bucket>/`
+//!      artifacts under `~/.aicx/indexed/<bucket>/` (one dense payload per
+//!      generation under `hybrid/generations/<id>/` + `CURRENT`)
 //!   4. `search_engine::try_semantic_search` returns at least one hybrid RRF
 //!      hit for a well-formed query, dimension-matched against the manifest
 //!   5. normalized score is in `[0, 100]` for the top hit (sanity)
@@ -19,7 +20,13 @@
 //! operator running this test sees the same diagnostic + recommendation
 //! as a real user would.
 //!
-//! Vibecrafted with AI Agents by Vetcoders (c)2026 Vetcoders
+//! Product-wide multi-agent fixture walks (extract → store → search/intents →
+//! health → MCP) for release verification use an isolated `AICX_HOME` and
+//! never mutate live `~/.aicx`. Those walks are operator evidence, not this
+//! opt-in semantic gate. Search status must remain truthful when the index
+//! or embedder is missing (`semantic_fallback` / degraded `RetrievalOutcome`).
+//!
+//! 𝚅𝚒𝚋𝚎𝚌𝚛𝚊𝚏𝚝𝚎𝚍. with AI Agents by VetCoders (c)2024-2026 LibraxisAI
 
 #![cfg(feature = "e2e-aicx")]
 
@@ -57,13 +64,13 @@ fn e2e_index_and_query_roundtrip() {
 
     // Step 1: probe corpus. If empty, the operator hasn't run extract
     // yet — same precondition the production search would surface.
-    let store_root = aicx::store::store_base_dir().expect("store_base_dir");
+    let aicx_home = aicx::aicx_home::ensure().expect("AICX home");
     let chunks =
-        aicx::store::scan_context_files_project_at(&store_root, None).expect("scan corpus");
+        aicx::legacy_archive::scan_context_files_project_at(&aicx_home, None).expect("scan corpus");
     assert!(
         !chunks.is_empty(),
         "canonical corpus at {} is empty — run `aicx extract --all` before invoking the e2e test",
-        store_root.display()
+        aicx_home.display()
     );
 
     // Step 2: build a real index covering up to 16 chunks (small enough
@@ -93,7 +100,7 @@ fn e2e_index_and_query_roundtrip() {
     // Step 3: query the index. Use the fail-fast `try_semantic_search`
     // entrypoint so we exercise the same dispatch the CLI uses.
     let outcome = aicx::search_engine::try_semantic_search(
-        &store_root,
+        &aicx_home,
         "operator decision and architecture",
         5,
         &[None],

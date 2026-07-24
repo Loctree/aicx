@@ -13,7 +13,7 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use crate::store::atomic_write::atomic_write;
+use crate::legacy_archive::atomic_write::atomic_write;
 
 pub mod migration;
 
@@ -220,7 +220,7 @@ impl Default for StateManager {
 /// No env reads, no filesystem creation. Used in tests to assert the
 /// `<home>/state.json` invariant without depending on `$AICX_HOME` or
 /// `$HOME`. The public [`StateManager::state_path`] wraps this with
-/// the env-resolving, side-effecting [`crate::store::store_base_dir`].
+/// the env-resolving, side-effecting [`crate::aicx_home::ensure`].
 pub(crate) fn state_path_for(home: &Path) -> PathBuf {
     home.join("state.json")
 }
@@ -228,7 +228,7 @@ pub(crate) fn state_path_for(home: &Path) -> PathBuf {
 impl StateManager {
     /// Returns the path to the state file: `<base>/state.json`
     fn state_path() -> Result<PathBuf> {
-        Ok(state_path_for(&crate::store::store_base_dir()?))
+        Ok(state_path_for(&crate::aicx_home::ensure()?))
     }
 
     /// Load state from disk. Creates a fresh default state only when the file
@@ -419,7 +419,7 @@ impl StateManager {
         }
 
         // Note: caller is responsible for holding `state_lock_path()` exclusive
-        // around the full read-modify-write cycle (see run_store/run_state/etc.
+        // around the full read-modify-write cycle (see extraction/state callers
         // in main.rs). Re-acquiring here would deadlock.
 
         let json = serde_json::to_string_pretty(self).context("Failed to serialize state")?;
@@ -825,7 +825,7 @@ mod tests {
                 if target == target_path.as_path() {
                     return Err(std::io::Error::other("mock atomic_write failure"));
                 }
-                crate::store::atomic_write::atomic_write(target, content)
+                crate::legacy_archive::atomic_write::atomic_write(target, content)
             })
             .expect_err("mocked final atomic write should fail");
 

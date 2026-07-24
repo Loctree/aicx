@@ -15,9 +15,19 @@
 //!
 //! Vibecrafted with AI Agents by Vetcoders (c)2026 Vetcoders
 
+/// Public identity of the exact checkout used to build this AICX artifact.
+pub const BUILD_VERSION: &str = env!("AICX_BUILD_VERSION");
+pub const GIT_COMMIT: &str = env!("AICX_GIT_COMMIT");
+pub const GIT_DIRTY: bool = env!("AICX_GIT_DIRTY").as_bytes()[0] == b'1';
+
+pub mod aicx_home;
 pub mod api;
 #[cfg(feature = "app")]
 pub mod auth;
+/// Durable extract-era session identity catalog (`~/.aicx/catalog/sessions.jsonl`).
+/// Replaces per-frame card mill for identity + project attribution.
+#[cfg(feature = "app")]
+pub mod catalog;
 #[cfg(feature = "app")]
 pub mod cli;
 #[cfg(feature = "app")]
@@ -50,6 +60,7 @@ pub mod importers;
 #[allow(dead_code, unused_imports)]
 mod importers;
 pub mod intents;
+pub mod legacy_archive;
 #[cfg(feature = "app")]
 pub mod locks;
 #[cfg(not(feature = "app"))]
@@ -87,12 +98,20 @@ pub mod search_eval;
 pub mod session_catalog;
 pub mod sessions;
 #[cfg(feature = "app")]
+pub mod source_index;
+/// Canonical path resolver for approved session sources and AICX home reads.
+/// Enforces real containment for catalog and source-index opens.
+#[cfg(feature = "app")]
+pub mod source_path;
+#[cfg(not(feature = "app"))]
+#[allow(dead_code)]
+mod source_path;
+#[cfg(feature = "app")]
 pub mod state;
 #[cfg(feature = "app")]
 pub mod steer_index;
 #[cfg(feature = "app")]
 mod steer_index_contract;
-pub mod store;
 #[cfg(feature = "app")]
 pub mod validation;
 #[cfg(not(feature = "app"))]
@@ -108,7 +127,7 @@ mod test_support;
 
 pub use aicx_parser as parser;
 pub use aicx_parser::{card_header, chunker, frontmatter, sanitize, segmentation, timeline, types};
-pub use api::{Aicx, AicxConfig, IndexReadiness, IndexStatus, StoreOptions};
+pub use api::{Aicx, AicxConfig, IndexReadiness, IndexStatus};
 #[cfg(feature = "app")]
 pub use api::{SearchOptions, SearchResults};
 
@@ -140,13 +159,13 @@ pub fn os_user_home() -> Option<std::path::PathBuf> {
 pub mod prelude {
     #[cfg(feature = "app")]
     pub use crate::api::SearchOptions;
-    pub use crate::api::{Aicx, AicxConfig, StoreOptions};
+    pub use crate::api::{Aicx, AicxConfig};
     #[cfg(feature = "app")]
     pub use crate::doctor::{DoctorOptions, DoctorReport};
     pub use crate::intents::{IntentExtraction, IntentRecord, IntentsConfig};
+    pub use crate::legacy_archive::{ChunkRefSpec, ReadContextChunk, StoredContextFile};
     #[cfg(feature = "app")]
     pub use crate::rank::FuzzyResult;
-    pub use crate::store::{ChunkRefSpec, ReadContextChunk, StoreWriteSummary, StoredContextFile};
     pub use crate::timeline::TimelineEntry;
 }
 
@@ -159,8 +178,8 @@ mod loctree_consumer_contract_tests {
         fn assert_send_sync<T: Send + Sync>() {}
 
         assert_send_sync::<Aicx>();
-        assert_send_sync::<store::StoredContextFile>();
-        assert_send_sync::<store::ReadContextChunk>();
+        assert_send_sync::<legacy_archive::StoredContextFile>();
+        assert_send_sync::<legacy_archive::ReadContextChunk>();
         assert_send_sync::<sessions::SessionInfo>();
         assert_send_sync::<intents::IntentExtraction>();
 
@@ -169,14 +188,20 @@ mod loctree_consumer_contract_tests {
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).expect("create slim store root");
+        std::fs::create_dir_all(&root).expect("create slim AICX home");
 
-        let client = Aicx::with_store_root(&root);
+        let client = Aicx::with_aicx_home(&root);
         assert!(client.list_chunks().expect("list chunks").is_empty());
         assert!(client.read_chunk("chunk:abcdef12", Some(16)).is_err());
+        let status = api::index_status_at(&root, None).expect("read slim index status");
+        assert!(matches!(status.readiness, api::IndexReadiness::Missing));
 
-        let parsed = store::ChunkRefSpec::parse("chunk:abcdef12").expect("typed chunk ref");
-        assert_eq!(parsed, store::ChunkRefSpec::Id("abcdef12".to_string()));
+        let parsed =
+            legacy_archive::ChunkRefSpec::parse("chunk:abcdef12").expect("typed chunk ref");
+        assert_eq!(
+            parsed,
+            legacy_archive::ChunkRefSpec::Id("abcdef12".to_string())
+        );
 
         let config = intents::IntentsConfig {
             project: String::new(),
@@ -191,6 +216,11 @@ mod loctree_consumer_contract_tests {
             timeline::FrameKind::UserMsg,
             "intent defaults stay available in the slim profile"
         );
+        let extraction =
+            intents::extract_intents_from_root_at_with_stats(&config, &root, chrono::Utc::now())
+                .expect("extract slim intents");
+        assert!(extraction.records.is_empty());
+        assert_eq!(extraction.stats.source_errors, 0);
 
         let _session_type: Option<sessions::SessionInfo> = None;
         let _ = std::fs::remove_dir_all(root);

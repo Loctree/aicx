@@ -45,7 +45,7 @@ impl DashboardScope {
     }
 }
 
-/// Strict project filter shared with `aicx::store::project_filter_matches`.
+/// Strict project filter shared with `aicx::legacy_archive::project_filter_matches`.
 ///
 /// Splits the canonical project slug into `<organization>/<repository>` (or
 /// `("", bucket)` when the slug is a single segment) and routes the user
@@ -61,7 +61,7 @@ pub fn project_matches_filter(project: &str, filter: Option<&str>) -> bool {
         return true;
     }
     let (organization, repository) = project.split_once('/').unwrap_or(("", project));
-    crate::store::project_filter_matches(organization, repository, needle)
+    crate::legacy_archive::project_filter_matches(organization, repository, needle)
 }
 
 pub fn date_matches_hours_scope(date_iso: &str, hours: Option<u64>) -> bool {
@@ -132,8 +132,8 @@ fn parse_rfc3339_timestamp(value: &str) -> Option<DateTime<Utc>> {
 /// Configuration for dashboard generation.
 #[derive(Debug, Clone)]
 pub struct DashboardConfig {
-    /// Store root directory (`~/.aicx`).
-    pub store_root: PathBuf,
+    /// AICX home directory (`~/.aicx`).
+    pub aicx_home: PathBuf,
     /// HTML document title.
     pub title: String,
     /// Max characters in per-record preview.
@@ -164,7 +164,7 @@ pub struct DashboardStats {
     pub agents_detected: usize,
     pub malformed_session_files: usize,
     pub ignored_non_date_dirs: usize,
-    pub ignored_non_store_projects: usize,
+    pub ignored_non_archive_projects: usize,
     pub index_loaded: bool,
     pub state_loaded: bool,
     pub fuzzy_index_chars: usize,
@@ -174,7 +174,7 @@ pub struct DashboardStats {
 #[derive(Debug, Clone, Serialize)]
 pub struct DashboardPayload {
     pub generated_at: String,
-    pub store_root: String,
+    pub aicx_home: String,
     pub stats: DashboardStats,
     pub assumptions: Vec<String>,
     pub projects: Vec<String>,
@@ -210,9 +210,9 @@ struct ScanResult {
     payload: DashboardPayload,
 }
 
-/// Build a complete HTML dashboard from store data.
+/// Build a complete HTML dashboard from the read-only legacy archive view.
 pub fn build_dashboard(config: &DashboardConfig) -> Result<DashboardArtifact> {
-    let scan = scan::scan_store(&config.store_root, config.preview_chars, &config.scope)?;
+    let scan = scan::scan_legacy_archive(&config.aicx_home, config.preview_chars, &config.scope)?;
     let html = render_dashboard_html(&scan.payload, &config.title)?;
 
     Ok(DashboardArtifact {
@@ -222,26 +222,29 @@ pub fn build_dashboard(config: &DashboardConfig) -> Result<DashboardArtifact> {
     })
 }
 
-/// Scan the store and return the raw payload (for server mode).
-pub fn scan_store_payload(store_root: &Path, preview_chars: usize) -> Result<DashboardPayload> {
-    let scan = scan::scan_store(store_root, preview_chars, &DashboardScope::default())?;
+/// Scan the legacy archive and return the raw payload (for server mode).
+pub fn scan_legacy_archive_payload(
+    aicx_home: &Path,
+    preview_chars: usize,
+) -> Result<DashboardPayload> {
+    let scan = scan::scan_legacy_archive(aicx_home, preview_chars, &DashboardScope::default())?;
     Ok(scan.payload)
 }
 
-/// Scan the store with an explicit scope and return the raw payload (for server mode).
-pub fn scan_store_payload_scoped(
-    store_root: &Path,
+/// Scan the legacy archive with an explicit scope and return the raw payload (for server mode).
+pub fn scan_legacy_archive_payload_scoped(
+    aicx_home: &Path,
     preview_chars: usize,
     scope: &DashboardScope,
 ) -> Result<DashboardPayload> {
-    let scan = scan::scan_store(store_root, preview_chars, scope)?;
+    let scan = scan::scan_legacy_archive(aicx_home, preview_chars, scope)?;
     Ok(scan.payload)
 }
 
 /// Build a static HTML artifact from an already-scanned payload.
 ///
-/// Reuses `payload` instead of scanning the store again — designed for server
-/// mode where `scan_store_payload` has already run.
+/// Reuses `payload` instead of scanning the archive again — designed for server
+/// mode where `scan_legacy_archive_payload` has already run.
 pub fn build_dashboard_from_payload(
     payload: &DashboardPayload,
     title: &str,
@@ -476,7 +479,7 @@ fn render_dashboard_html(payload: &DashboardPayload, title: &str) -> Result<Stri
 "#,
         html_escape(title),
         assets::DASHBOARD_CSS,
-        html_escape(&payload.store_root),
+        html_escape(&payload.aicx_home),
         html_escape(&payload.generated_at),
         payload.stats.total_files,
         payload.stats.total_projects,

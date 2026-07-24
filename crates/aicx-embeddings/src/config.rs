@@ -164,7 +164,7 @@ pub fn config_search_paths() -> Vec<PathBuf> {
 /// tagged with the branch it came from. Order = priority; the first
 /// existing file wins.
 ///
-/// Root resolution mirrors `aicx::store::resolve_aicx_home`: `$AICX_HOME`
+/// Root resolution mirrors `aicx::aicx_home::resolve`: `$AICX_HOME`
 /// wins when set+non-empty, otherwise bootstrap `$HOME/.aicx/config.toml`
 /// may provide `[storage].home`, otherwise `~/.aicx`. Duplicated locally
 /// because aicx-embeddings is a leaf crate (the main `aicx` crate
@@ -227,7 +227,7 @@ fn should_include_bootstrap_home(env_home: &Option<std::ffi::OsString>) -> bool 
     env_home.as_ref().is_none_or(|value| value.is_empty())
 }
 
-/// Local mirror of `aicx::store::resolve_aicx_home`.
+/// Local mirror of `aicx::aicx_home::resolve`.
 pub(crate) fn aicx_home_root() -> Option<PathBuf> {
     let default_home = dirs::home_dir().map(|home| home.join(".aicx"));
     aicx_home_root_from(std::env::var_os("AICX_HOME"), default_home.as_deref())
@@ -280,7 +280,7 @@ fn configured_home_from_bootstrap_config(default_home: &Path) -> Option<PathBuf>
     if value.is_empty() {
         return None;
     }
-    // Mirror the validation in aicx::store::paths: reject control characters
+    // Mirror the validation in aicx::aicx_home: reject control characters
     // and `..` traversal so this crate never resolves a relocated root that
     // the main crate will refuse.
     if value.chars().any(char::is_control) {

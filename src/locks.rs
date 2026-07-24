@@ -100,7 +100,7 @@ pub fn index_lock_path() -> Result<PathBuf> {
 }
 
 fn resource_lock_path(name: &str) -> Result<PathBuf> {
-    Ok(crate::store::store_base_dir()?.join("locks").join(name))
+    Ok(crate::aicx_home::ensure()?.join("locks").join(name))
 }
 
 fn acquire_with_timeout(path: &Path, mode: LockMode, timeout: Duration) -> Result<LockHandle> {
@@ -292,7 +292,7 @@ fn write_holder_sidecar(path: &Path, holder: &Holder) -> Result<Option<HolderSid
         holder.mode.sidecar_value(),
         holder.token
     );
-    crate::store::atomic_write::atomic_write(&sidecar, content.as_bytes())
+    crate::legacy_archive::atomic_write::atomic_write(&sidecar, content.as_bytes())
         .with_context(|| format!("write lock holder sidecar: {}", sidecar.display()))?;
     Ok(Some(HolderSidecar {
         path: sidecar,

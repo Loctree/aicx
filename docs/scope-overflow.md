@@ -203,3 +203,6 @@ Split / block list before merge:
   our own `aicx store` child — low-risk, deferred.
 - Do not add new release-channel, installer, CSP nonce, or heartbeat work to
   PR #5 unless the operator explicitly reopens the scope.
+> Historical scope record. References to `src/store.rs` and `aicx store`
+> describe the retired card-mill implementation and are not current
+> operational instructions.

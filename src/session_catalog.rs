@@ -52,6 +52,18 @@ impl AgentKind {
             Self::Claude | Self::Codex | Self::Junie | Self::Grok => extension == Some("jsonl"),
         }
     }
+
+    /// Grok session dirs carry multiple JSONL streams (chat, events, updates,
+    /// hunks, rewind). Only `chat_history.jsonl` is conversation content;
+    /// telemetry streams must not become catalog identity.
+    fn is_primary_source_file(self, path: &Path) -> bool {
+        match self {
+            Self::Grok => {
+                path.file_name().and_then(|name| name.to_str()) == Some("chat_history.jsonl")
+            }
+            _ => true,
+        }
+    }
 }
 
 impl fmt::Display for AgentKind {
@@ -266,8 +278,22 @@ impl SessionCatalog {
     /// No cache is retained, so add/remove/rename/content changes are observed
     /// on every call and cached state can never become correctness authority.
     pub fn scan_with_stats(&self) -> CatalogScan {
+        self.scan_with_stats_and_progress(|_| {})
+    }
+
+    /// Rebuild the catalog while exposing live I/O counters to a progress sink.
+    ///
+    /// The callback is synchronous and must stay cheap. It is invoked after
+    /// each visited directory and each probed source so callers can throttle
+    /// display updates without guessing whether the scan is still alive.
+    pub fn scan_with_stats_and_progress(
+        &self,
+        mut on_progress: impl FnMut(&CatalogIoStats),
+    ) -> CatalogScan {
         let mut stats = CatalogIoStats::default();
-        let result = self.scan_sources(&mut stats);
+        on_progress(&stats);
+        let result = self.scan_sources_with_progress(&mut stats, &mut on_progress);
+        on_progress(&stats);
         CatalogScan { result, stats }
     }
 
@@ -327,14 +353,26 @@ impl SessionCatalog {
         resolve_from_sources(self.agent, query, sources)
     }
 
-    fn scan_sources(&self, stats: &mut CatalogIoStats) -> Result<Vec<CatalogSource>, CatalogError> {
-        let candidates = self.collect_candidate_paths(stats)?;
-        self.probe_candidates(&candidates, stats)
+    fn scan_sources_with_progress(
+        &self,
+        stats: &mut CatalogIoStats,
+        on_progress: &mut dyn FnMut(&CatalogIoStats),
+    ) -> Result<Vec<CatalogSource>, CatalogError> {
+        let candidates = self.collect_candidate_paths_with_progress(stats, on_progress)?;
+        self.probe_candidates_with_progress(&candidates, stats, on_progress)
     }
 
     fn collect_candidate_paths(
         &self,
         stats: &mut CatalogIoStats,
+    ) -> Result<Vec<CandidatePath>, CatalogError> {
+        self.collect_candidate_paths_with_progress(stats, &mut |_| {})
+    }
+
+    fn collect_candidate_paths_with_progress(
+        &self,
+        stats: &mut CatalogIoStats,
+        on_progress: &mut dyn FnMut(&CatalogIoStats),
     ) -> Result<Vec<CandidatePath>, CatalogError> {
         let mut pending = vec![(self.root.clone(), 0usize)];
         let mut paths = BTreeSet::new();
@@ -366,11 +404,14 @@ impl SessionCatalog {
                     || !self
                         .agent
                         .accepts_extension(path.extension().and_then(|ext| ext.to_str()))
+                    || !self.agent.is_primary_source_file(&path)
                 {
                     continue;
                 }
                 paths.insert(path);
             }
+            stats.metadata_candidates = paths.len();
+            on_progress(stats);
         }
 
         let mut candidates = Vec::with_capacity(paths.len());
@@ -379,25 +420,45 @@ impl SessionCatalog {
                 stats.rejected_paths += 1;
                 continue;
             };
-            let filename_aliases = filename_aliases(&path);
-            if filename_aliases.is_empty() {
-                stats.rejected_paths += 1;
-                continue;
-            }
+            let mut filename_aliases = filename_aliases(&path);
             let filename_uuid = path
                 .file_stem()
                 .and_then(|stem| stem.to_str())
                 .and_then(uuid_from_filename)
-                .map(str::to_ascii_lowercase);
+                .map(str::to_ascii_lowercase)
+                .or_else(|| {
+                    // Grok layout: `…/<cwd-encoded>/<session-uuid>/chat_history.jsonl`.
+                    // The physical session id lives on the parent directory, not the
+                    // chat filename stem — surface it so ExactSourceId resolves.
+                    if self.agent == AgentKind::Grok {
+                        path.parent()
+                            .and_then(|parent| parent.file_name())
+                            .and_then(|name| name.to_str())
+                            .filter(|name| is_uuid(name))
+                            .map(|name| name.to_ascii_lowercase())
+                    } else {
+                        None
+                    }
+                });
+            if let Some(ref uuid) = filename_uuid {
+                filename_aliases.push(uuid.clone());
+            }
+            dedupe_ordered(&mut filename_aliases);
+            if filename_aliases.is_empty() {
+                stats.rejected_paths += 1;
+                continue;
+            }
             candidates.push(CandidatePath {
                 path,
                 filename_aliases,
                 filename_uuid,
                 fingerprint: SourceFingerprint::from_metadata(&metadata),
             });
+            on_progress(stats);
         }
         candidates.sort_by(|left, right| left.path.cmp(&right.path));
         stats.metadata_candidates = candidates.len();
+        on_progress(stats);
         Ok(candidates)
     }
 
@@ -406,6 +467,15 @@ impl SessionCatalog {
         candidates: &[CandidatePath],
         stats: &mut CatalogIoStats,
     ) -> Result<Vec<CatalogSource>, CatalogError> {
+        self.probe_candidates_with_progress(candidates, stats, &mut |_| {})
+    }
+
+    fn probe_candidates_with_progress(
+        &self,
+        candidates: &[CandidatePath],
+        stats: &mut CatalogIoStats,
+        on_progress: &mut dyn FnMut(&CatalogIoStats),
+    ) -> Result<Vec<CatalogSource>, CatalogError> {
         let mut sources = Vec::with_capacity(candidates.len());
         for candidate in candidates {
             match self.probe_candidate(candidate, stats) {
@@ -413,6 +483,7 @@ impl SessionCatalog {
                 Ok(None) | Err(CatalogError::Io { .. }) => stats.rejected_paths += 1,
                 Err(error) => return Err(error),
             }
+            on_progress(stats);
         }
         sources.sort_by(|left, right| {
             left.source_id

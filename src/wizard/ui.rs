@@ -49,7 +49,7 @@ fn render_bottombar(frame: &mut Frame, area: Rect, app: &App) {
         Screen::Intents => {
             " q quit | p project | a agent | t time | / filter | Enter chunk | ? help "
         }
-        Screen::Store => " q quit | s start | t range | Ctrl+C cancel | jk scroll | ? help ",
+        Screen::Rebuild => " q quit | s start | t range | Ctrl+C cancel | jk scroll | ? help ",
     };
     let line = format!("{} | {}", text, app.status);
     frame.render_widget(
@@ -63,7 +63,7 @@ fn render_main(frame: &mut Frame, area: Rect, app: &App) {
         Screen::Corpus => render_corpus(frame, area, app),
         Screen::Doctor => render_doctor(frame, area, app),
         Screen::Intents => render_intents(frame, area, app),
-        Screen::Store => render_store(frame, area, app),
+        Screen::Rebuild => render_store(frame, area, app),
     }
 }
 
@@ -237,37 +237,37 @@ fn render_store(frame: &mut Frame, area: Rect, app: &App) {
         .split(area);
 
     let ratio = app
-        .store
+        .rebuild
         .progress
         .as_ref()
         .map(|progress| progress.ratio())
         .unwrap_or(0.0);
-    let label = match (app.store.running, app.store.progress.as_ref()) {
+    let label = match (app.rebuild.running, app.rebuild.progress.as_ref()) {
         (true, Some(progress)) => match progress.total {
             Some(total) if total > 0 => format!(
                 "{} {} {}/{} - last {}h",
-                progress.phase, progress.status, progress.current, total, app.store.hours
+                progress.phase, progress.status, progress.current, total, app.rebuild.hours
             ),
             _ => format!(
                 "{} {} - last {}h",
-                progress.phase, progress.status, app.store.hours
+                progress.phase, progress.status, app.rebuild.hours
             ),
         },
-        (true, None) => format!("store starting - last {}h", app.store.hours),
+        (true, None) => format!("rebuild starting - last {}h", app.rebuild.hours),
         (false, Some(progress)) => format!("last phase: {} {}", progress.phase, progress.status),
-        (false, None) => format!("idle - next run last {}h", app.store.hours),
+        (false, None) => format!("idle - next run last {}h", app.rebuild.hours),
     };
     frame.render_widget(
         Gauge::default()
-            .block(block("Store"))
+            .block(block("Rebuild"))
             .gauge_style(Style::default().fg(Color::Cyan))
             .ratio(ratio)
             .label(label.as_str()),
         chunks[0],
     );
 
-    let start = app.store.scroll.min(app.store.log.len());
-    let lines = app.store.log[start..]
+    let start = app.rebuild.scroll.min(app.rebuild.log.len());
+    let lines = app.rebuild.log[start..]
         .iter()
         .map(|line| Line::from(line.clone()))
         .collect::<Vec<_>>();
@@ -308,14 +308,14 @@ fn render_help(frame: &mut Frame, area: Rect) {
     let text = vec![
         Line::from("aicx wizard keymap"),
         Line::from(""),
-        Line::from("1 corpus | 2 doctor | 3 intents | 4 store"),
+        Line::from("1 corpus | 2 doctor | 3 intents | 4 rebuild"),
         Line::from("hjkl / arrows navigate visible lists"),
         Line::from("/ filters corpus or intents"),
         Line::from(
             "doctor: r refresh, f runs aicx doctor --rebuild-steer-index, b shows Plan B deferral",
         ),
-        Line::from("store: t changes range, s runs aicx store -H <range> --emit none"),
-        Line::from("store: Ctrl+C sends kill to the running subprocess"),
+        Line::from("rebuild: s runs aicx catalog rebuild && aicx index --cache-extracts"),
+        Line::from("rebuild: Ctrl+C cancels a long rebuild when supported"),
         Line::from("q quits when no long operation is in flight"),
     ];
     frame.render_widget(Paragraph::new(text).block(block("Help")), area);

@@ -1,0 +1,1746 @@
+//! AICX home helpers and legacy corpus scan/read surfaces.
+//!
+//! The per-frame card mill under `~/.aicx/store` is **retired** (extracts-store cut).
+//! Live identity is catalog + extracts + source-driven index (`aicx catalog` /
+//! `aicx extract` / `aicx index`). This module still exposes:
+//! - explicit legacy card/archive paths and project identity
+//! - scan/read of any residual on-disk corpus for doctor/migration
+//! - no write APIs: catalog + extracts + source-driven index own persistence
+//!
+//! Vibecrafted with AI Agents by Vetcoders (c)2024-2026 LibraxisAI
+
+use anyhow::{Context, Result, anyhow};
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeSet, HashMap};
+use std::fs;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
+
+#[path = "legacy_archive/atomic_write.rs"]
+pub(crate) mod atomic_write;
+use atomic_write::atomic_write;
+
+#[path = "legacy_archive/canonical_projection.rs"]
+pub mod canonical_projection;
+// Write path deleted (extracts-store). Read/inspect remain for residual
+// corpus doctor quarantine and transitional overlay consumers.
+pub use canonical_projection::{
+    CANONICAL_PROJECTION_DIRNAME, CanonicalStoreManifest, read_canonical_projection_at,
+};
+
+use crate::chunker;
+use crate::sanitize;
+use crate::timeline::RepoIdentity;
+#[cfg(test)]
+use crate::timeline::TimelineEntry;
+pub use aicx_parser::{classify_kind, timeline::Kind};
+
+// ============================================================================
+// Session-first filename generation
+// ============================================================================
+
+/// Generate a canonical session-first basename for a store chunk file.
+///
+/// Format: `<YYYY_MMDD>_<agent>_<session-id>_<chunk>.md`
+///
+/// The date is derived from the source event timestamp, NOT from
+/// the time `store` was run. Session identity is the primary uniqueness
+/// anchor; the date prefix ensures lexicographic ordering and
+/// self-description when the file is viewed outside its directory context.
+pub fn session_basename(date: &str, agent: &str, session_id: &str, chunk: u32) -> String {
+    let date_compact = compact_date(date);
+    let sid = truncate_session_id(session_id);
+    format!("{}_{}_{}_{:03}.md", date_compact, agent, sid, chunk)
+}
+
+/// Compact a YYYY-MM-DD date to YYYY_MMDD form.
+pub(crate) fn compact_date(date: &str) -> String {
+    // Handle both "2026-03-21" and "2026_0321" input
+    let digits: String = date.chars().filter(|c| c.is_ascii_digit()).collect();
+    if digits.len() >= 8 {
+        format!("{}_{}", &digits[..4], &digits[4..8])
+    } else {
+        // Fallback: use as-is with underscores
+        date.replace('-', "_")
+    }
+}
+
+/// Truncate session ID to a reasonable length for filenames.
+///
+/// UUIDv7 IDs share a time-dominated prefix; truncating to 12 hex chars
+/// makes basename collisions between near-in-time sessions plausible. We
+/// keep up to 20 cleaned chars, and append a 6-hex SipHash-1-3 suffix of
+/// the original ID when truncation actually drops information so the
+/// basename remains collision-resistant.
+fn truncate_session_id(session_id: &str) -> String {
+    let cleaned: String = session_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+        .collect();
+    const LIMIT: usize = 20;
+    if cleaned.len() <= LIMIT {
+        return cleaned;
+    }
+    format!("{}-h{}", &cleaned[..LIMIT], siphash13_hex6(session_id))
+}
+
+/// Stable 6-char hex of `input` via SipHash-1-3 with default (zero) key.
+/// 24 bits of disambiguation — collision probability ~2^-24 for unrelated
+/// inputs, sufficient for basename suffix disambiguation.
+fn siphash13_hex6(input: &str) -> String {
+    use siphasher::sip::SipHasher13;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = SipHasher13::new();
+    input.hash(&mut hasher);
+    format!("{:06x}", (hasher.finish() & 0x00FF_FFFF) as u32)
+}
+
+#[allow(dead_code)]
+fn chunk_sequence_from_id(id: &str) -> Option<u32> {
+    id.rsplit('_').next().and_then(parse_chunk_component)
+}
+
+// ============================================================================
+// Path helpers
+// ============================================================================
+
+#[path = "legacy_archive/dedupe.rs"]
+pub(crate) mod dedupe;
+#[path = "legacy_archive/ignore.rs"]
+pub(crate) mod ignore;
+#[path = "legacy_archive/paths.rs"]
+pub(crate) mod paths;
+#[path = "legacy_archive/sidecar.rs"]
+pub(crate) mod sidecar;
+
+#[cfg(test)]
+use dedupe::DirShaCache;
+use dedupe::content_sha256;
+pub use dedupe::content_sha256_exists_in_dir;
+
+pub use ignore::{
+    AICX_IGNORE_FILENAME, StoreIgnoreMatcher, filter_ignored_paths_at, load_ignore_matcher_at,
+};
+use paths::aicx_context_corpus_dir_for;
+pub use paths::{
+    CONTEXT_CORPUS_DIRNAME, CONTEXT_CORPUS_SCHEMA_VERSION, LEGACY_CARDS_DIRNAME,
+    LEGACY_SALVAGE_DIRNAME, LOCT_CONTEXT_PACK_FAMILY, NON_REPOSITORY_CONTEXTS,
+    OWNERLESS_PROJECT_ORGANIZATION, aicx_context_corpus_dir, chunks_dir_for,
+    context_corpus_root_dir, legacy_cards_dir, legacy_cards_dir_for, legacy_store_base_dir,
+    non_repository_contexts_dir,
+};
+use sidecar::load_sidecar_from_path;
+pub use sidecar::{is_context_corpus_sidecar, load_sidecar, sidecar_path_for_chunk};
+
+// ============================================================================
+// Index types
+// ============================================================================
+
+/// Historical `index.json` schema retained for archive inspection/migration.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct StoreIndex {
+    pub projects: HashMap<String, ProjectIndex>,
+    pub last_updated: DateTime<Utc>,
+}
+
+/// Per-project index entry.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProjectIndex {
+    pub agents: HashMap<String, AgentIndex>,
+}
+
+/// Per-agent index within a project.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentIndex {
+    pub dates: Vec<String>,
+    pub total_entries: usize,
+    pub last_updated: DateTime<Utc>,
+}
+
+// ============================================================================
+// Legacy index inspection/migration
+// ============================================================================
+
+fn load_index_at(base: &Path) -> Result<StoreIndex> {
+    let path = base.join("index.json");
+    if !path.exists() {
+        return Ok(StoreIndex::default());
+    }
+
+    match read_and_parse_index(&path) {
+        Ok(idx) => Ok(idx),
+        Err(primary_err) => {
+            let bak_path = path.with_extension("json.bak");
+            tracing::warn!(
+                path = %path.display(),
+                bak = %bak_path.display(),
+                "store index corrupt or unreadable ({primary_err:#}); attempting .bak recovery"
+            );
+            if bak_path.exists() {
+                match read_and_parse_index(&bak_path) {
+                    Ok(idx) => {
+                        tracing::warn!("recovered store index from {}", bak_path.display());
+                        return Ok(idx);
+                    }
+                    Err(bak_err) => {
+                        return Err(anyhow!(
+                            "store index unreadable and .bak fallback also failed (primary: {primary_err:#}; bak: {bak_err:#})"
+                        ));
+                    }
+                }
+            }
+            Err(primary_err.context(format!(
+                "store index unreadable and no .bak sibling at {}",
+                bak_path.display()
+            )))
+        }
+    }
+}
+
+fn read_and_parse_index(path: &Path) -> Result<StoreIndex> {
+    let contents = sanitize::read_to_string_validated(path)
+        .with_context(|| format!("read failed: {}", path.display()))?;
+    serde_json::from_str(&contents).with_context(|| format!("parse failed: {}", path.display()))
+}
+
+fn save_index_at(base: &Path, index: &StoreIndex) -> Result<()> {
+    let path = base.join("index.json");
+    let json = serde_json::to_string_pretty(index).context("Failed to serialize index")?;
+
+    // Best-effort: snapshot the previous index to `.bak` BEFORE the swap so a
+    // crash mid-write still leaves a recoverable copy. Open the source once
+    // and stream from that FD to avoid path re-resolution between exists/copy.
+    let bak = path.with_extension("json.bak");
+    match fs::OpenOptions::new().read(true).open(&path) {
+        Ok(mut src) => {
+            let copy_result: Result<u64> = (|| {
+                let mut dst = sanitize::create_file_validated(&bak)?;
+                std::io::copy(&mut src, &mut dst)
+                    .with_context(|| format!("copy {} -> {}", path.display(), bak.display()))
+            })();
+            if let Err(err) = copy_result {
+                tracing::warn!(
+                    src = %path.display(),
+                    dst = %bak.display(),
+                    "failed to snapshot index to .bak before save: {err}"
+                );
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            tracing::warn!(
+                src = %path.display(),
+                dst = %bak.display(),
+                "failed to open index before .bak snapshot: {err}"
+            );
+        }
+    }
+
+    atomic_write(&path, json.as_bytes())
+        .with_context(|| format!("Failed to write index: {}", path.display()))?;
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+pub struct StoredContextFile {
+    pub path: PathBuf,
+    pub project: String,
+    pub repo: Option<RepoIdentity>,
+    pub date_compact: String,
+    pub date_iso: String,
+    pub kind: Kind,
+    pub agent: String,
+    pub session_id: String,
+    pub chunk: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ReadContextChunk {
+    pub path: PathBuf,
+    pub relative_path: String,
+    pub project: String,
+    pub date: String,
+    pub kind: String,
+    pub agent: String,
+    pub session_id: String,
+    pub chunk: u32,
+    pub bytes: u64,
+    pub content: String,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChunkRefSpec {
+    Path(PathBuf),
+    Id(String),
+    LegacyCompact(String),
+}
+
+impl ChunkRefSpec {
+    pub fn parse(reference: &str) -> Result<Self> {
+        let reference = reference.trim();
+        if reference.is_empty() {
+            return Err(anyhow!("chunk reference is required"));
+        }
+
+        if let Some(id) = reference.strip_prefix("chunk:") {
+            let id = id.trim();
+            if !is_chunk_id_prefix(id) {
+                return Err(anyhow!("invalid chunk reference id: {reference}"));
+            }
+            return Ok(Self::Id(id.to_ascii_lowercase()));
+        }
+
+        if is_chunk_id_prefix(reference) {
+            return Ok(Self::Id(reference.to_ascii_lowercase()));
+        }
+
+        if reference.contains('|') {
+            return Ok(Self::LegacyCompact(reference.to_string()));
+        }
+
+        Ok(Self::Path(PathBuf::from(reference)))
+    }
+}
+
+pub(crate) fn chunk_body_is_empty(content: &str) -> bool {
+    !crate::card_header::card_body(content)
+        .lines()
+        .any(chunk_line_has_signal)
+}
+
+fn chunk_line_has_signal(line: &str) -> bool {
+    let line = line.trim();
+    if line.is_empty() {
+        return false;
+    }
+    if let Some((_, rest)) = line.split_once("] ")
+        && let Some((_, message)) = rest.split_once(':')
+    {
+        return !message.trim().is_empty();
+    }
+    true
+}
+
+pub fn scan_context_files() -> Result<Vec<StoredContextFile>> {
+    let base = crate::aicx_home::ensure()?;
+    scan_context_files_at(&base)
+}
+
+pub fn scan_context_files_raw() -> Result<Vec<StoredContextFile>> {
+    let base = crate::aicx_home::ensure()?;
+    scan_context_files_raw_at(&base)
+}
+
+pub fn scan_context_files_at(base: &Path) -> Result<Vec<StoredContextFile>> {
+    let base = sanitize::validate_dir_path(base)?;
+    let ignore = load_ignore_matcher_at(&base)?;
+    scan_context_files_with_ignore(&base, &ignore)
+}
+
+pub fn scan_context_files_project_at(
+    base: &Path,
+    project_filter: Option<&str>,
+) -> Result<Vec<StoredContextFile>> {
+    let base = sanitize::validate_dir_path(base)?;
+    let Some(filter) = project_filter
+        .map(str::trim)
+        .filter(|filter| !filter.is_empty())
+    else {
+        return scan_context_files_at(&base);
+    };
+
+    let filter = filter.to_lowercase();
+    let ignore = load_ignore_matcher_at(&base)?;
+    let mut files = Vec::new();
+
+    let canonical_root = base.join(LEGACY_CARDS_DIRNAME);
+    if canonical_root.is_dir() {
+        scan_repo_store_filtered(&canonical_root, &ignore, &filter, &mut files)?;
+    }
+
+    let non_repo_root = base.join(NON_REPOSITORY_CONTEXTS);
+    if non_repo_root.is_dir() && NON_REPOSITORY_CONTEXTS.contains(&filter) {
+        scan_non_repository_store(&non_repo_root, &ignore, &mut files)?;
+    }
+
+    sort_context_files(&mut files);
+    Ok(files)
+}
+
+pub fn scan_context_files_raw_at(base: &Path) -> Result<Vec<StoredContextFile>> {
+    let base = sanitize::validate_dir_path(base)?;
+    let ignore = StoreIgnoreMatcher::empty_at(&base);
+    scan_context_files_with_ignore(&base, &ignore)
+}
+
+fn scan_context_files_with_ignore(
+    base: &Path,
+    ignore: &StoreIgnoreMatcher,
+) -> Result<Vec<StoredContextFile>> {
+    let mut files = Vec::new();
+
+    let canonical_root = base.join(LEGACY_CARDS_DIRNAME);
+    if canonical_root.is_dir() {
+        scan_repo_store(&canonical_root, ignore, &mut files)?;
+    }
+
+    let non_repo_root = base.join(NON_REPOSITORY_CONTEXTS);
+    if non_repo_root.is_dir() {
+        scan_non_repository_store(&non_repo_root, ignore, &mut files)?;
+    }
+
+    sort_context_files(&mut files);
+
+    Ok(files)
+}
+
+fn sort_context_files(files: &mut [StoredContextFile]) {
+    files.sort_by(|left, right| {
+        left.date_compact
+            .cmp(&right.date_compact)
+            .then_with(|| left.project.cmp(&right.project))
+            .then_with(|| left.agent.cmp(&right.agent))
+            .then_with(|| left.session_id.cmp(&right.session_id))
+            .then_with(|| left.chunk.cmp(&right.chunk))
+    });
+}
+
+pub fn context_files_since(
+    cutoff: SystemTime,
+    project_filter: Option<&str>,
+) -> Result<Vec<StoredContextFile>> {
+    context_files_since_at(&crate::aicx_home::ensure()?, cutoff, project_filter)
+}
+
+fn read_store_dir(path: &Path) -> Result<fs::ReadDir> {
+    // Shared sanitizer: validate_dir_path + re-canonicalize before open.
+    sanitize::read_dir_validated(path)
+        .with_context(|| format!("Failed to read store dir {}", path.display()))
+}
+
+/// Read one canonical chunk by absolute path, store-relative path, file name,
+/// or compact chunk reference.
+pub fn read_context_chunk(reference: &str, max_chars: Option<usize>) -> Result<ReadContextChunk> {
+    read_context_chunk_at(&crate::aicx_home::ensure()?, reference, max_chars)
+}
+
+pub fn read_context_chunk_at(
+    base: &Path,
+    reference: &str,
+    max_chars: Option<usize>,
+) -> Result<ReadContextChunk> {
+    let base = sanitize::validate_dir_path(base)?;
+    let spec = ChunkRefSpec::parse(reference)?;
+
+    let files = scan_context_files_at(&base)?;
+    let file = resolve_context_chunk_file(&base, files, &spec)?;
+
+    let relative_path = file
+        .path
+        .strip_prefix(&base)
+        .unwrap_or(&file.path)
+        .to_string_lossy()
+        // Canonical store keys are forward-slash on every OS so the same
+        // conversation resolves to the same relative path on Windows and Unix.
+        .replace('\\', "/");
+    let path = sanitize::validate_read_path(&file.path)?;
+    let bytes = path.metadata().map(|meta| meta.len()).unwrap_or(0);
+    let content = sanitize::read_to_string_validated(&path)?;
+    let (content, truncated) = truncate_chars(content, max_chars);
+
+    Ok(ReadContextChunk {
+        path,
+        relative_path,
+        project: file.project,
+        date: file.date_iso,
+        kind: file.kind.dir_name().to_string(),
+        agent: file.agent,
+        session_id: file.session_id,
+        chunk: file.chunk,
+        bytes,
+        content,
+        truncated,
+    })
+}
+
+fn resolve_context_chunk_file(
+    base: &Path,
+    files: Vec<StoredContextFile>,
+    spec: &ChunkRefSpec,
+) -> Result<StoredContextFile> {
+    match spec {
+        ChunkRefSpec::Id(id) => resolve_context_chunk_id(files, id),
+        ChunkRefSpec::Path(path) => {
+            let reference = path.to_string_lossy();
+            files
+                .into_iter()
+                .find(|file| stored_file_matches_reference(base, file, &reference))
+                .ok_or_else(|| anyhow!("chunk not found: {reference}"))
+        }
+        ChunkRefSpec::LegacyCompact(reference) => files
+            .into_iter()
+            .find(|file| stored_file_matches_reference(base, file, reference))
+            .ok_or_else(|| anyhow!("chunk not found: {reference}")),
+    }
+}
+
+fn resolve_context_chunk_id(files: Vec<StoredContextFile>, id: &str) -> Result<StoredContextFile> {
+    let mut matches = Vec::new();
+    for file in files {
+        let path_id = chunk_path_ref_id(&file);
+        if path_id.starts_with(id) {
+            matches.push((path_id, file));
+        }
+    }
+
+    match matches.len() {
+        0 => Err(anyhow!("chunk not found for id: chunk:{id}")),
+        1 => Ok(matches.remove(0).1),
+        _ => {
+            let candidates = matches
+                .iter()
+                .map(|(candidate_id, file)| format!("chunk:{candidate_id} {}", file.path.display()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(anyhow!(
+                "ambiguous chunk id chunk:{id}; candidates: {candidates}"
+            ))
+        }
+    }
+}
+
+fn chunk_path_ref_id(file: &StoredContextFile) -> String {
+    let path = file.path.to_string_lossy();
+    let hash = content_sha256(path.as_ref());
+    hash.chars().take(8).collect()
+}
+
+fn is_chunk_id_prefix(value: &str) -> bool {
+    (4..=64).contains(&value.len()) && value.chars().all(|ch| ch.is_ascii_hexdigit())
+}
+
+fn stored_file_matches_reference(base: &Path, file: &StoredContextFile, reference: &str) -> bool {
+    let path = file.path.to_string_lossy();
+    if path == reference {
+        return true;
+    }
+
+    let reference_path = Path::new(reference);
+    if reference_path.is_absolute() && reference_path == file.path {
+        return true;
+    }
+
+    if file
+        .path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == reference)
+    {
+        return true;
+    }
+
+    if file
+        .path
+        .strip_prefix(base)
+        .ok()
+        // Canonical references are forward-slash; normalise the OS-native
+        // relative path so a `store/org/repo/...` ref matches on Windows too.
+        .is_some_and(|relative| relative.to_string_lossy().replace('\\', "/") == reference)
+    {
+        return true;
+    }
+
+    let compact_ref = format!(
+        "{}|{}|{}|{}|{}|{:03}",
+        file.project,
+        file.date_iso,
+        file.kind.dir_name(),
+        file.agent,
+        file.session_id,
+        file.chunk
+    );
+    compact_ref == reference
+}
+
+fn truncate_chars(content: String, max_chars: Option<usize>) -> (String, bool) {
+    let Some(max_chars) = max_chars else {
+        return (content, false);
+    };
+    let mut iter = content.chars();
+    let truncated: String = iter.by_ref().take(max_chars).collect();
+    let was_truncated = iter.next().is_some();
+    (truncated, was_truncated)
+}
+
+fn context_files_since_at(
+    base: &Path,
+    cutoff: SystemTime,
+    project_filter: Option<&str>,
+) -> Result<Vec<StoredContextFile>> {
+    // Strict project filter via `project_filter_matches` (same
+    // semantics as `aicx search`, `aicx store -p ...` etc.) so the
+    // `refs`/MCP/since paths don't leak `-p vista` into `vista-portal`,
+    // `vista-datasets`, etc. `StoredContextFile.project` is the
+    // canonical `<org>/<repo>` slug (or the non-repo bucket name for
+    // entries without a resolved repo identity); split on '/' to feed
+    // the org+repo pair into the matcher.
+    let filter = project_filter
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let cutoff_date = DateTime::<Utc>::from(cutoff).format("%Y-%m-%d").to_string();
+    let mut files = scan_context_files_at(base)?;
+    files.retain(|file| {
+        let matches_project = match filter {
+            None => true,
+            Some(f) => {
+                let (org, repo) = file
+                    .project
+                    .split_once('/')
+                    .unwrap_or(("", file.project.as_str()));
+                project_filter_matches(org, repo, f)
+            }
+        };
+        // Discovery recency is anchored to the canonical chunk date encoded in the
+        // store layout, not filesystem mtime which can drift during migration/copy.
+        let matches_cutoff = file.date_iso >= cutoff_date;
+        matches_project && matches_cutoff
+    });
+    Ok(files)
+}
+
+#[derive(Debug, Clone)]
+pub struct ContextCorpusFile {
+    pub raw_path: PathBuf,
+    pub sidecar_path: PathBuf,
+    pub sidecar: chunker::ChunkMetadataSidecar,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ContextCorpusIngestSummary {
+    pub target_dir: PathBuf,
+    pub raw_written: usize,
+    pub sidecars_written: usize,
+    pub deduped_chunks: usize,
+    pub index_path: PathBuf,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ContextCorpusIndexRow {
+    id: String,
+    path: String,
+    artifact_family: Option<String>,
+    schema_version: Option<String>,
+    truth_status_role: Option<String>,
+    keywords: Option<Vec<String>>,
+    band: Option<String>,
+    content_sha256: Option<String>,
+}
+
+pub fn ingest_loct_context_pack(pack_dir: &Path) -> Result<ContextCorpusIngestSummary> {
+    ingest_loct_context_pack_into(pack_dir, None)
+}
+
+fn ingest_loct_context_pack_into(
+    pack_dir: &Path,
+    home: Option<&Path>,
+) -> Result<ContextCorpusIngestSummary> {
+    let pack_dir = sanitize::validate_dir_path(pack_dir)?;
+    let raw_dir = pack_dir.join("raw");
+    let sidecars_dir = pack_dir.join("sidecars");
+    let raw_dir = sanitize::validate_dir_path(&raw_dir)
+        .with_context(|| format!("loct context pack missing raw/: {}", raw_dir.display()))?;
+    let sidecars_dir = sanitize::validate_dir_path(&sidecars_dir).with_context(|| {
+        format!(
+            "loct context pack missing sidecars/: {}",
+            sidecars_dir.display()
+        )
+    })?;
+
+    let mut items = Vec::new();
+    for entry in read_store_dir(&raw_dir)?.filter_map(|entry| entry.ok()) {
+        let raw_path = entry.path();
+        if raw_path.extension().and_then(|ext| ext.to_str()) != Some("md") {
+            continue;
+        }
+        let Some(stem) = raw_path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        let sidecar_path = sidecars_dir.join(format!("{stem}.json"));
+        let mut sidecar = load_sidecar_from_path(&sidecar_path)
+            .with_context(|| format!("missing or invalid sidecar: {}", sidecar_path.display()))?;
+        sidecar.artifact_family = Some(LOCT_CONTEXT_PACK_FAMILY.to_string());
+        if sidecar.truth_status.is_none() {
+            sidecar.truth_status = Some(chunker::TruthStatus {
+                role: chunker::TruthRole::Example,
+                runtime_authoritative: false,
+                stale_against_current_head: false,
+                current_head_when_ingested: None,
+            });
+        }
+        let raw = sanitize::read_to_string_validated(&raw_path)?;
+        let hash = content_sha256(&raw);
+        sidecar.content_sha256 = Some(hash);
+        items.push((raw_path, sidecar_path, sidecar));
+    }
+
+    if items.is_empty() {
+        anyhow::bail!("loct context pack contains no raw/*.md chunks");
+    }
+
+    // Bug #34: reject mixed-project packs before any chunk lands on disk.
+    // The legacy code took (org, repo) from the FIRST sidecar and assumed
+    // every other record belonged there; a packaging mistake silently
+    // routed records into the wrong project bucket.
+    let (org, repo) = context_corpus_repo_from_sidecar(&items[0].2)?;
+    let first_sidecar_path = items[0].1.clone();
+    if let Some((offender_path, offender_org, offender_repo)) =
+        items.iter().skip(1).find_map(|(_, sidecar_path, sidecar)| {
+            context_corpus_repo_from_sidecar(sidecar)
+                .ok()
+                .and_then(|(other_org, other_repo)| {
+                    (other_org != org || other_repo != repo).then_some((
+                        sidecar_path.clone(),
+                        other_org,
+                        other_repo,
+                    ))
+                })
+        })
+    {
+        anyhow::bail!(
+            "loct context pack {} mixes projects: first sidecar {} declares {}/{}, but sidecar {} declares {}/{}",
+            pack_dir.display(),
+            first_sidecar_path.display(),
+            org,
+            repo,
+            offender_path.display(),
+            offender_org,
+            offender_repo,
+        );
+    }
+    let date = items[0].2.date.clone();
+    let batch = pack_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("batch");
+    let target = match home {
+        Some(home) => aicx_context_corpus_dir_for(home, &org, &repo, &date, batch)?,
+        None => aicx_context_corpus_dir(&org, &repo, &date, batch)?,
+    };
+    let target_raw = target.join("raw");
+    let target_sidecars = target.join("sidecars");
+    let index_path = target.join("index.jsonl");
+
+    let mut seen_hashes = context_corpus_hashes_in_dir(&target_sidecars)?;
+
+    // Bug #35: index.jsonl was unconditionally truncated on re-ingest,
+    // erasing rows for chunks the second pack didn't re-present. Load
+    // the existing manifest, then merge new rows by id so the on-disk
+    // index always contains the union of previously-stored + newly-
+    // ingested chunks.
+    let mut index_rows = read_context_corpus_index_rows(&index_path)?;
+    let mut id_to_pos: HashMap<String, usize> = index_rows
+        .iter()
+        .enumerate()
+        .map(|(idx, row)| (row.id.clone(), idx))
+        .collect();
+
+    let mut summary = ContextCorpusIngestSummary {
+        target_dir: target.clone(),
+        index_path: index_path.clone(),
+        ..ContextCorpusIngestSummary::default()
+    };
+
+    for (raw_path, _source_sidecar_path, sidecar) in items {
+        let hash = sidecar.content_sha256.clone().unwrap_or_default();
+        if !hash.is_empty() && seen_hashes.contains_key(&hash) {
+            summary.deduped_chunks += 1;
+            continue;
+        }
+        if !hash.is_empty() {
+            seen_hashes.insert(hash.clone(), sidecar.id.clone());
+        }
+
+        let file_name = raw_path
+            .file_name()
+            .ok_or_else(|| anyhow!("raw chunk missing filename: {}", raw_path.display()))?;
+        let raw_target = target_raw.join(file_name);
+        let sidecar_target = target_sidecars.join(format!(
+            "{}.json",
+            raw_target
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or(&sidecar.id)
+        ));
+
+        let mut raw_src = sanitize::open_file_validated(&raw_path)?;
+        let mut raw_dst = sanitize::create_file_validated(&raw_target)?;
+        io::copy(&mut raw_src, &mut raw_dst)?;
+        raw_dst.flush()?;
+        raw_dst.sync_all()?;
+        let mut file = sanitize::create_file_validated(&sidecar_target)?;
+        file.write_all(serde_json::to_vec_pretty(&sidecar)?.as_slice())?;
+        summary.raw_written += 1;
+        summary.sidecars_written += 1;
+
+        let row = ContextCorpusIndexRow {
+            id: sidecar.id.clone(),
+            path: raw_target.display().to_string(),
+            artifact_family: sidecar.artifact_family.clone(),
+            schema_version: Some(CONTEXT_CORPUS_SCHEMA_VERSION.to_string()),
+            truth_status_role: sidecar
+                .truth_status
+                .as_ref()
+                .map(|status| match status.role {
+                    chunker::TruthRole::Live => "live".to_string(),
+                    chunker::TruthRole::Example => "example".to_string(),
+                }),
+            keywords: sidecar.keywords.clone(),
+            band: sidecar.frame_kind.map(|kind| kind.as_str().to_string()),
+            content_sha256: sidecar.content_sha256.clone(),
+        };
+        match id_to_pos.get(&row.id).copied() {
+            Some(idx) => index_rows[idx] = row,
+            None => {
+                id_to_pos.insert(row.id.clone(), index_rows.len());
+                index_rows.push(row);
+            }
+        }
+    }
+
+    write_context_corpus_index(&index_path, &index_rows)?;
+    Ok(summary)
+}
+
+pub fn scan_context_corpus_files_at(base: &Path) -> Result<Vec<ContextCorpusFile>> {
+    let base = sanitize::validate_dir_path(base)?;
+    let root = base.join(CONTEXT_CORPUS_DIRNAME);
+    if !root.is_dir() {
+        return Ok(Vec::new());
+    }
+
+    let mut out = Vec::new();
+    scan_context_corpus_files_recursive(&root, &mut out)?;
+    out.sort_by(|left, right| left.raw_path.cmp(&right.raw_path));
+    Ok(out)
+}
+
+fn scan_context_corpus_files_recursive(dir: &Path, out: &mut Vec<ContextCorpusFile>) -> Result<()> {
+    for entry in read_store_dir(dir)?.filter_map(|entry| entry.ok()) {
+        let path = entry.path();
+        if path.is_dir() {
+            if path.file_name().and_then(|name| name.to_str()) == Some("raw") {
+                collect_context_corpus_raw_dir(&path, out)?;
+            } else {
+                scan_context_corpus_files_recursive(&path, out)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn collect_context_corpus_raw_dir(raw_dir: &Path, out: &mut Vec<ContextCorpusFile>) -> Result<()> {
+    let Some(pack_dir) = raw_dir.parent() else {
+        return Ok(());
+    };
+    let sidecars_dir = pack_dir.join("sidecars");
+    if !sidecars_dir.is_dir() {
+        return Ok(());
+    }
+    for entry in read_store_dir(raw_dir)?.filter_map(|entry| entry.ok()) {
+        let raw_path = entry.path();
+        if raw_path.extension().and_then(|ext| ext.to_str()) != Some("md") {
+            continue;
+        }
+        let Some(stem) = raw_path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        let sidecar_path = sidecars_dir.join(format!("{stem}.json"));
+        let Some(sidecar) = load_sidecar_from_path(&sidecar_path) else {
+            continue;
+        };
+        out.push(ContextCorpusFile {
+            raw_path,
+            sidecar_path,
+            sidecar,
+        });
+    }
+    Ok(())
+}
+
+fn context_corpus_repo_from_sidecar(
+    sidecar: &chunker::ChunkMetadataSidecar,
+) -> Result<(String, String)> {
+    let project = sidecar.project.trim();
+    if let Some((org, repo)) = project.split_once('/') {
+        return Ok((org.to_string(), repo.to_string()));
+    }
+    Ok(("unknown".to_string(), project.to_string()))
+}
+
+fn context_corpus_hashes_in_dir(sidecars_dir: &Path) -> Result<HashMap<String, String>> {
+    let mut hashes = HashMap::new();
+    if !sidecars_dir.exists() {
+        return Ok(hashes);
+    }
+    for entry in read_store_dir(sidecars_dir)?.filter_map(|entry| entry.ok()) {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(sidecar) = load_sidecar_from_path(&path) else {
+            continue;
+        };
+        if let Some(hash) = sidecar.content_sha256 {
+            hashes.insert(hash, sidecar.id);
+        }
+    }
+    Ok(hashes)
+}
+
+fn write_context_corpus_index(path: &Path, rows: &[ContextCorpusIndexRow]) -> Result<()> {
+    let mut buf = Vec::with_capacity(rows.len() * 256);
+    for row in rows {
+        serde_json::to_writer(&mut buf, row)?;
+        buf.push(b'\n');
+    }
+    // Atomic rename keeps the manifest crash-consistent: readers either
+    // see the prior full index or the new full index, never a partial
+    // truncation. Required by bug #35's preservation contract.
+    atomic_write(path, &buf)
+        .map_err(|err| anyhow!("write context corpus index {}: {}", path.display(), err))?;
+    Ok(())
+}
+
+fn read_context_corpus_index_rows(path: &Path) -> Result<Vec<ContextCorpusIndexRow>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let content = sanitize::read_to_string_validated(path)?;
+    let mut rows = Vec::new();
+    for (line_no, raw_line) in content.lines().enumerate() {
+        let trimmed = raw_line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let row: ContextCorpusIndexRow = serde_json::from_str(trimmed).with_context(|| {
+            format!(
+                "parse context corpus index row at {}:{}",
+                path.display(),
+                line_no + 1
+            )
+        })?;
+        rows.push(row);
+    }
+    Ok(rows)
+}
+
+/// Find stored chunks whose sidecar metadata matches a run ID.
+pub fn chunks_by_run_id(run_id: &str, project: Option<&str>) -> Result<Vec<StoredContextFile>> {
+    let cutoff = SystemTime::now() - std::time::Duration::from_secs(7 * 24 * 3600);
+    chunks_by_run_id_at(&crate::aicx_home::ensure()?, run_id, project, cutoff)
+}
+
+fn chunks_by_run_id_at(
+    base: &Path,
+    run_id: &str,
+    project: Option<&str>,
+    cutoff: SystemTime,
+) -> Result<Vec<StoredContextFile>> {
+    let project_filter = project.map(str::trim).filter(|value| !value.is_empty());
+    let cutoff_date = DateTime::<Utc>::from(cutoff).format("%Y-%m-%d").to_string();
+    let mut matched = Vec::new();
+
+    for file in scan_context_files_at(base)? {
+        let matches_project = match project_filter {
+            None => true,
+            Some(f) => {
+                let (org, repo) = file
+                    .project
+                    .split_once('/')
+                    .unwrap_or(("", file.project.as_str()));
+                project_filter_matches(org, repo, f)
+            }
+        };
+        let matches_cutoff = file.date_iso >= cutoff_date;
+
+        if !matches_project || !matches_cutoff {
+            continue;
+        }
+
+        if load_sidecar(&file.path)
+            .and_then(|sidecar| sidecar.run_id)
+            .as_deref()
+            == Some(run_id)
+        {
+            matched.push(file);
+        }
+    }
+
+    Ok(matched)
+}
+
+fn scan_repo_store(
+    root: &Path,
+    ignore: &StoreIgnoreMatcher,
+    files: &mut Vec<StoredContextFile>,
+) -> Result<()> {
+    for organization_entry in read_store_dir(root)?.filter_map(|entry| entry.ok()) {
+        let organization_path = organization_entry.path();
+        if !organization_path.is_dir() {
+            continue;
+        }
+        let organization = organization_entry.file_name().to_string_lossy().to_string();
+
+        // Pre-owner store layouts wrote `store/<repository>/<date>/...`.
+        // Keep that physical layout immutable and expose a virtual `_/repo`
+        // identity at read time so the bucket is discoverable and queryable.
+        if is_ownerless_repository_root(&organization_path)? {
+            let repo = RepoIdentity {
+                organization: OWNERLESS_PROJECT_ORGANIZATION.to_string(),
+                repository: organization,
+            };
+            let repo_slug = repo.slug();
+            scan_single_repo_store(&organization_path, ignore, &repo, &repo_slug, files)?;
+            continue;
+        }
+
+        for repository_entry in read_store_dir(&organization_path)?.filter_map(|entry| entry.ok()) {
+            let repository_path = repository_entry.path();
+            if !repository_path.is_dir() {
+                continue;
+            }
+            let repository = repository_entry.file_name().to_string_lossy().to_string();
+            let repo = RepoIdentity {
+                organization: organization.clone(),
+                repository,
+            };
+            let repo_slug = repo.slug();
+            scan_single_repo_store(&repository_path, ignore, &repo, &repo_slug, files)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Decide whether `<organization>/<repository>` matches a single `-p` filter.
+///
+/// This is intentionally public: integration tests and downstream callers use
+/// it as the canonical project-filter contract, so signature or semantic changes
+/// are public API changes.
+///
+/// Semantics (case-insensitive throughout):
+/// - `-p owner/repo` → strict `<owner>/<repo>` slug equality.
+/// - `-p owner/` → every repo under this owner (org wildcard).
+/// - `-p /repo` → every `*/repo` across all owners (repo wildcard).
+/// - `-p name` → match `name` as organization OR repository (cross-org).
+///
+/// Substring matching (old behavior) is intentionally removed: `-p vista`
+/// no longer matched `vista-portal`, `VistaBrain`, `vista-datasets`, etc.
+/// Operators get the same effect with `-p vetcoders/Vista -p vetcoders/vista-portal …`
+/// when they really mean a list.
+pub fn project_filter_matches(organization: &str, repository: &str, filter: &str) -> bool {
+    let filter = filter.trim();
+    if filter.is_empty() {
+        return false;
+    }
+
+    // `-p /repo` → cross-org exact repo-name match
+    if let Some(repo_only) = filter.strip_prefix('/') {
+        if repo_only.is_empty() || repo_only.contains('/') {
+            return false;
+        }
+        return repository.eq_ignore_ascii_case(repo_only);
+    }
+
+    // `-p owner/` → org wildcard (all repos under this owner)
+    if let Some(org_only) = filter.strip_suffix('/') {
+        if org_only.is_empty() || org_only.contains('/') {
+            return false;
+        }
+        return organization.eq_ignore_ascii_case(org_only);
+    }
+
+    // `-p owner/repo` → strict slug equality
+    if filter.contains('/') {
+        let slug = format!("{organization}/{repository}");
+        return slug.eq_ignore_ascii_case(filter);
+    }
+
+    // `-p name` → cross-org match on organization OR repository
+    organization.eq_ignore_ascii_case(filter) || repository.eq_ignore_ascii_case(filter)
+}
+
+/// Stable query address for a legacy bucket stored without an owner directory.
+pub fn ownerless_project_address(repository: &str) -> String {
+    format!("{OWNERLESS_PROJECT_ORGANIZATION}/{}", repository.trim())
+}
+
+pub fn is_ownerless_project_address(identity: &str) -> bool {
+    identity
+        .split_once('/')
+        .is_some_and(|(organization, repository)| {
+            organization == OWNERLESS_PROJECT_ORGANIZATION && !repository.is_empty()
+        })
+}
+
+/// Project identity matching is exact by default. Family/substring matching
+/// exists only as an explicit opt-in mode on CLI/MCP surfaces.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectMatchMode {
+    #[default]
+    Exact,
+    Fuzzy,
+}
+
+impl ProjectMatchMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Exact => "exact",
+            Self::Fuzzy => "fuzzy",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ProjectIdentityResolution {
+    pub selected: Vec<String>,
+    pub candidates: Vec<String>,
+    pub unresolved_filters: Vec<String>,
+    pub match_mode: ProjectMatchMode,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProjectResolutionError {
+    Ambiguous {
+        filter: String,
+        candidates: Vec<String>,
+    },
+    NoMatch {
+        filters: Vec<String>,
+    },
+}
+
+impl ProjectResolutionError {
+    pub fn candidates(&self) -> &[String] {
+        match self {
+            Self::Ambiguous { candidates, .. } => candidates,
+            Self::NoMatch { .. } => &[],
+        }
+    }
+
+    pub fn filter(&self) -> Option<&str> {
+        match self {
+            Self::Ambiguous { filter, .. } => Some(filter),
+            Self::NoMatch { .. } => None,
+        }
+    }
+
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::Ambiguous { .. } => "ambiguous_project",
+            Self::NoMatch { .. } => "project_not_found",
+        }
+    }
+}
+
+impl std::fmt::Display for ProjectResolutionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ambiguous { filter, candidates } => write!(
+                formatter,
+                "project filter {filter:?} is ambiguous; candidates:\n  - {}\nUse one exact bucket with -p owner/repo.",
+                candidates.join("\n  - ")
+            ),
+            Self::NoMatch { filters } => write!(
+                formatter,
+                "no project matches filter(s): {}\n  accepted forms (case-insensitive): owner/repo (strict), owner/ (org wildcard), /repo (cross-org repo), name (unique exact org or repo); use --project-fuzzy for explicit family matching",
+                filters
+                    .iter()
+                    .map(|filter| format!("{filter:?}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ProjectResolutionError {}
+
+/// Resolve project filters against a complete, topology-independent identity
+/// corpus. Both CLI and MCP pass their discovered identities through this one
+/// function; callers do not select a bucket before ambiguity is assessed.
+///
+/// Exact-mode rules:
+/// - `owner/repo` is case-insensitive slug equality;
+/// - `owner/` and `/repo` are explicit multi-project wildcards;
+/// - a bare name must identify exactly one owner-or-repository identity;
+/// - two or more bare-name candidates fail closed with the full sorted list.
+pub fn resolve_project_identities(
+    filters: &[String],
+    corpus: &[String],
+    match_mode: ProjectMatchMode,
+) -> std::result::Result<ProjectIdentityResolution, ProjectResolutionError> {
+    let identities: Vec<String> = corpus
+        .iter()
+        .map(|identity| identity.trim())
+        .filter(|identity| !identity.is_empty())
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let mut selected = BTreeSet::new();
+    let mut candidates = BTreeSet::new();
+    let mut unresolved_filters = Vec::new();
+
+    for raw_filter in filters {
+        let filter = raw_filter.trim();
+        if filter.is_empty() {
+            unresolved_filters.push(raw_filter.clone());
+            continue;
+        }
+        let matches: Vec<String> = identities
+            .iter()
+            .filter(|identity| project_identity_matches(identity, filter, match_mode))
+            .cloned()
+            .collect();
+        candidates.extend(matches.iter().cloned());
+
+        if matches.is_empty() {
+            unresolved_filters.push(raw_filter.clone());
+            continue;
+        }
+        if match_mode == ProjectMatchMode::Exact && !filter.contains('/') && matches.len() > 1 {
+            return Err(ProjectResolutionError::Ambiguous {
+                filter: raw_filter.clone(),
+                candidates: matches,
+            });
+        }
+        selected.extend(matches);
+    }
+
+    Ok(ProjectIdentityResolution {
+        selected: selected.into_iter().collect(),
+        candidates: candidates.into_iter().collect(),
+        unresolved_filters,
+        match_mode,
+    })
+}
+
+pub fn require_project_resolution(
+    filters: &[String],
+    corpus: &[String],
+    match_mode: ProjectMatchMode,
+) -> std::result::Result<ProjectIdentityResolution, ProjectResolutionError> {
+    let resolution = resolve_project_identities(filters, corpus, match_mode)?;
+    if !filters.is_empty() && !resolution.unresolved_filters.is_empty() {
+        return Err(ProjectResolutionError::NoMatch {
+            filters: resolution.unresolved_filters,
+        });
+    }
+    Ok(resolution)
+}
+
+fn project_identity_matches(identity: &str, filter: &str, match_mode: ProjectMatchMode) -> bool {
+    let (organization, repository) = identity.split_once('/').unwrap_or(("", identity));
+    match match_mode {
+        ProjectMatchMode::Exact => project_filter_matches(organization, repository, filter),
+        ProjectMatchMode::Fuzzy => {
+            let needle = filter.trim_matches('/').trim().to_ascii_lowercase();
+            if needle.is_empty() {
+                return false;
+            }
+            identity.to_ascii_lowercase().contains(&needle)
+                || organization.to_ascii_lowercase().contains(&needle)
+                || repository.to_ascii_lowercase().contains(&needle)
+        }
+    }
+}
+
+/// Resolve user-supplied `-p` filters into canonical `<owner>/<repo>` slugs
+/// by enumerating the on-disk canonical store. Used by `aicx search` and
+/// `aicx index` so a single short name like `-p spotlight-convo-pipeline-v2`
+/// expands to `example-org/spotlight-convo-pipeline-v2` before downstream
+/// index path / search engine lookup.
+///
+/// Returns:
+/// - empty input → empty output (treat as "search all projects")
+/// - non-empty input → union of canonical slugs that match any filter
+/// - matched zero projects → empty vec (caller decides: error or all)
+pub fn resolve_filters_to_slugs(filters: &[String]) -> Result<Vec<String>> {
+    let base = crate::aicx_home::ensure()?;
+    let canonical_root = base.join(LEGACY_CARDS_DIRNAME);
+    resolve_filters_to_slugs_at(&canonical_root, filters)
+}
+
+pub fn resolve_filters_to_slugs_or_error(filters: &[String]) -> Result<Vec<String>> {
+    let base = crate::aicx_home::ensure()?;
+    let canonical_root = base.join(LEGACY_CARDS_DIRNAME);
+    resolve_filters_to_slugs_at_or_error(&canonical_root, filters)
+}
+
+pub fn resolve_filters_to_slugs_at(
+    canonical_root: &Path,
+    filters: &[String],
+) -> Result<Vec<String>> {
+    if filters.is_empty() {
+        return Ok(Vec::new());
+    }
+    if !canonical_root.is_dir() {
+        return Ok(Vec::new());
+    }
+
+    let mut slugs: Vec<String> = Vec::new();
+    for organization_entry in read_store_dir(canonical_root)?.filter_map(|entry| entry.ok()) {
+        let organization_path = organization_entry.path();
+        if !organization_path.is_dir() {
+            continue;
+        }
+        let organization = organization_entry.file_name().to_string_lossy().to_string();
+
+        for repository_entry in read_store_dir(&organization_path)?.filter_map(|entry| entry.ok()) {
+            let repository_path = repository_entry.path();
+            if !repository_path.is_dir() {
+                continue;
+            }
+            let repository = repository_entry.file_name().to_string_lossy().to_string();
+
+            let slug = format!("{organization}/{repository}");
+            if !slugs.iter().any(|existing| existing == &slug) {
+                slugs.push(slug);
+            }
+        }
+    }
+
+    slugs.sort();
+    Ok(resolve_project_identities(filters, &slugs, ProjectMatchMode::Exact)?.selected)
+}
+
+pub fn resolve_filters_to_slugs_at_or_error(
+    canonical_root: &Path,
+    filters: &[String],
+) -> Result<Vec<String>> {
+    if filters.is_empty() {
+        return Ok(Vec::new());
+    }
+    let corpus = canonical_project_identities_at(canonical_root)?;
+    Ok(require_project_resolution(filters, &corpus, ProjectMatchMode::Exact)?.selected)
+}
+
+pub fn resolve_filters_to_store_or_index_slugs_at_or_error(
+    store_root: &Path,
+    filters: &[String],
+) -> Result<Vec<String>> {
+    if filters.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let corpus = project_identities_in_store_or_index_at(store_root)?;
+    Ok(require_project_resolution(filters, &corpus, ProjectMatchMode::Exact)?.selected)
+}
+
+pub fn canonical_project_identities_at(canonical_root: &Path) -> Result<Vec<String>> {
+    if !canonical_root.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut identities = BTreeSet::new();
+    for organization_entry in read_store_dir(canonical_root)?.filter_map(|entry| entry.ok()) {
+        let organization_path = organization_entry.path();
+        if !organization_path.is_dir() {
+            continue;
+        }
+        let organization = organization_entry.file_name().to_string_lossy().to_string();
+        if is_ownerless_repository_root(&organization_path)? {
+            identities.insert(ownerless_project_address(&organization));
+            continue;
+        }
+        for repository_entry in read_store_dir(&organization_path)?.filter_map(|entry| entry.ok()) {
+            if repository_entry.path().is_dir() {
+                identities.insert(format!(
+                    "{organization}/{}",
+                    repository_entry.file_name().to_string_lossy()
+                ));
+            }
+        }
+    }
+    Ok(identities.into_iter().collect())
+}
+
+pub fn project_identities_in_store_at(store_root: &Path) -> Result<Vec<String>> {
+    let canonical_root = store_root.join(LEGACY_CARDS_DIRNAME);
+    canonical_project_identities_at(&canonical_root)
+}
+
+pub fn project_identities_in_store_or_index_at(store_root: &Path) -> Result<Vec<String>> {
+    let mut identities: BTreeSet<String> = project_identities_in_store_at(store_root)?
+        .into_iter()
+        .collect();
+    identities.extend(project_identities_from_index_at(
+        &store_root.join("indexed"),
+    )?);
+    Ok(identities.into_iter().collect())
+}
+
+/// Fast corpus for search `-p` resolution: shallow store dirs + indexed
+/// bucket directory names. Never opens `embeddings.ndjson` (multi-GB).
+///
+/// Doctrine 2026-07-23: project is a metadata filter on the hybrid
+/// generation, not a precondition that may stream 19 GB of retired NDJSON.
+pub fn project_identities_for_search_at(store_root: &Path) -> Result<Vec<String>> {
+    let mut identities: BTreeSet<String> = project_identities_in_store_at(store_root)?
+        .into_iter()
+        .collect();
+    identities.extend(project_identities_from_index_dirs_at(
+        &store_root.join("indexed"),
+    )?);
+    // Durable catalog (when present) carries topical project attribution
+    // that cwd-derived store layout may miss. Slim (`loctree-consumer`)
+    // builds compile without the catalog module and skip this widening.
+    #[cfg(feature = "app")]
+    {
+        if let Ok(catalog_ids) = crate::catalog::project_identities_from_catalog_at(store_root) {
+            identities.extend(catalog_ids);
+        }
+    }
+    Ok(identities.into_iter().collect())
+}
+
+#[cfg(test)]
+fn resolve_filters_to_index_slugs_at(
+    indexed_root: &Path,
+    filters: &[String],
+) -> Result<Vec<String>> {
+    let corpus = project_identities_from_index_at(indexed_root)?;
+    Ok(resolve_project_identities(filters, &corpus, ProjectMatchMode::Exact)?.selected)
+}
+
+/// Directory-name identities under `~/.aicx/indexed/` (no NDJSON reads).
+/// Bucket dirs use underscore form (`vetcoders_vista`); bare names stay bare.
+fn project_identities_from_index_dirs_at(indexed_root: &Path) -> Result<Vec<String>> {
+    if !indexed_root.exists() {
+        return Ok(Vec::new());
+    }
+    let mut identities = BTreeSet::new();
+    for entry in sanitize::read_dir_validated(indexed_root)
+        .with_context(|| format!("read indexed root {}", indexed_root.display()))?
+    {
+        let entry =
+            entry.with_context(|| format!("read indexed entry in {}", indexed_root.display()))?;
+        if !entry.path().is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        // Internal / retired buckets — not project filters.
+        if name == "_all" || name.starts_with('.') {
+            continue;
+        }
+        if let Some((owner, repo)) = name.split_once('_')
+            && !owner.is_empty()
+            && !repo.is_empty()
+            && !owner.starts_with('_')
+        {
+            // Best-effort: `loctree_aicx` → `loctree/aicx`. Multi-underscore
+            // repos keep the first split only (search also accepts the bare
+            // bucket name below).
+            identities.insert(format!("{owner}/{repo}"));
+        }
+        identities.insert(name);
+    }
+    Ok(identities.into_iter().collect())
+}
+
+/// Legacy path kept for tests that still call through `*_or_index_at`.
+/// Does **not** stream `embeddings.ndjson` — directory names only.
+fn project_identities_from_index_at(indexed_root: &Path) -> Result<Vec<String>> {
+    project_identities_from_index_dirs_at(indexed_root)
+}
+
+fn scan_repo_store_filtered(
+    root: &Path,
+    ignore: &StoreIgnoreMatcher,
+    project_filter: &str,
+    files: &mut Vec<StoredContextFile>,
+) -> Result<()> {
+    for organization_entry in read_store_dir(root)?.filter_map(|entry| entry.ok()) {
+        let organization_path = organization_entry.path();
+        if !organization_path.is_dir() {
+            continue;
+        }
+        let organization = organization_entry.file_name().to_string_lossy().to_string();
+
+        if is_ownerless_repository_root(&organization_path)? {
+            if project_filter_matches(
+                OWNERLESS_PROJECT_ORGANIZATION,
+                &organization,
+                project_filter,
+            ) {
+                let repo = RepoIdentity {
+                    organization: OWNERLESS_PROJECT_ORGANIZATION.to_string(),
+                    repository: organization,
+                };
+                let repo_slug = repo.slug();
+                scan_single_repo_store(&organization_path, ignore, &repo, &repo_slug, files)?;
+            }
+            continue;
+        }
+
+        for repository_entry in read_store_dir(&organization_path)?.filter_map(|entry| entry.ok()) {
+            let repository_path = repository_entry.path();
+            if !repository_path.is_dir() {
+                continue;
+            }
+            let repository = repository_entry.file_name().to_string_lossy().to_string();
+            if !project_filter_matches(&organization, &repository, project_filter) {
+                continue;
+            }
+            let repo = RepoIdentity {
+                organization: organization.clone(),
+                repository: repository.clone(),
+            };
+            let repo_slug = repo.slug();
+            scan_single_repo_store(&repository_path, ignore, &repo, &repo_slug, files)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Detect the legacy `store/<repository>/<date>/<kind>/...` shape without
+/// confusing a canonical `store/<organization>/<repository>/...` directory
+/// for an ownerless repository. A direct child containing a known `Kind`
+/// directory is the distinguishing structural signal.
+fn is_ownerless_repository_root(path: &Path) -> Result<bool> {
+    for date_entry in read_store_dir(path)?.filter_map(|entry| entry.ok()) {
+        let date_path = date_entry.path();
+        if !date_path.is_dir() {
+            continue;
+        }
+        for kind_entry in read_store_dir(&date_path)?.filter_map(|entry| entry.ok()) {
+            if kind_entry.path().is_dir()
+                && Kind::parse(&kind_entry.file_name().to_string_lossy()).is_some()
+            {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn scan_single_repo_store(
+    repository_path: &Path,
+    ignore: &StoreIgnoreMatcher,
+    repo: &RepoIdentity,
+    repo_slug: &str,
+    files: &mut Vec<StoredContextFile>,
+) -> Result<()> {
+    for date_entry in read_store_dir(repository_path)?.filter_map(|entry| entry.ok()) {
+        let date_path = date_entry.path();
+        if !date_path.is_dir() {
+            continue;
+        }
+        let date_compact = date_entry.file_name().to_string_lossy().to_string();
+
+        for kind_entry in read_store_dir(&date_path)?.filter_map(|entry| entry.ok()) {
+            let kind_path = kind_entry.path();
+            if !kind_path.is_dir() {
+                continue;
+            }
+            let Some(kind) = Kind::parse(&kind_entry.file_name().to_string_lossy()) else {
+                continue;
+            };
+
+            for agent_entry in read_store_dir(&kind_path)?.filter_map(|entry| entry.ok()) {
+                let agent_path = agent_entry.path();
+                if !agent_path.is_dir() {
+                    continue;
+                }
+                let agent = agent_entry.file_name().to_string_lossy().to_string();
+                let ctx = LeafScanContext {
+                    repo: Some(repo.clone()),
+                    project: repo_slug,
+                    date_compact: &date_compact,
+                    kind,
+                    agent: &agent,
+                };
+                collect_leaf_files(&agent_path, &ctx, ignore, files)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn scan_non_repository_store(
+    root: &Path,
+    ignore: &StoreIgnoreMatcher,
+    files: &mut Vec<StoredContextFile>,
+) -> Result<()> {
+    for date_entry in read_store_dir(root)?.filter_map(|entry| entry.ok()) {
+        let date_path = date_entry.path();
+        if !date_path.is_dir() {
+            continue;
+        }
+        let date_compact = date_entry.file_name().to_string_lossy().to_string();
+
+        for kind_entry in read_store_dir(&date_path)?.filter_map(|entry| entry.ok()) {
+            let kind_path = kind_entry.path();
+            if !kind_path.is_dir() {
+                continue;
+            }
+            let Some(kind) = Kind::parse(&kind_entry.file_name().to_string_lossy()) else {
+                continue;
+            };
+
+            for agent_entry in read_store_dir(&kind_path)?.filter_map(|entry| entry.ok()) {
+                let agent_path = agent_entry.path();
+                if !agent_path.is_dir() {
+                    continue;
+                }
+                let agent = agent_entry.file_name().to_string_lossy().to_string();
+                let ctx = LeafScanContext {
+                    repo: None,
+                    project: NON_REPOSITORY_CONTEXTS,
+                    date_compact: &date_compact,
+                    kind,
+                    agent: &agent,
+                };
+                collect_leaf_files(&agent_path, &ctx, ignore, files)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[derive(Clone)]
+struct LeafScanContext<'a> {
+    repo: Option<RepoIdentity>,
+    project: &'a str,
+    date_compact: &'a str,
+    kind: Kind,
+    agent: &'a str,
+}
+
+fn collect_leaf_files(
+    dir: &Path,
+    ctx: &LeafScanContext<'_>,
+    ignore: &StoreIgnoreMatcher,
+    files: &mut Vec<StoredContextFile>,
+) -> Result<()> {
+    for file_entry in read_store_dir(dir)?.filter_map(|entry| entry.ok()) {
+        let path = file_entry.path();
+        let file_type = match file_entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(_) => continue,
+        };
+        if file_type.is_symlink() || !file_type.is_file() {
+            continue;
+        }
+        if path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_none_or(|ext| ext != "md" && ext != "json")
+        {
+            continue;
+        }
+        if ignore.is_ignored(&path) {
+            continue;
+        }
+
+        let Some((session_id, chunk)) = parse_session_basename(
+            &file_entry.file_name().to_string_lossy(),
+            ctx.agent,
+            ctx.date_compact,
+        ) else {
+            continue;
+        };
+
+        files.push(StoredContextFile {
+            path,
+            project: ctx.project.to_string(),
+            repo: ctx.repo.clone(),
+            date_compact: ctx.date_compact.to_string(),
+            date_iso: expand_compact_date(ctx.date_compact),
+            kind: ctx.kind,
+            agent: ctx.agent.to_string(),
+            session_id,
+            chunk,
+        });
+    }
+
+    Ok(())
+}
+
+fn parse_session_basename(name: &str, agent: &str, date_compact: &str) -> Option<(String, u32)> {
+    let ext = if name.ends_with(".md") {
+        ".md"
+    } else if name.ends_with(".json") {
+        ".json"
+    } else {
+        return None;
+    };
+
+    let stem = name.strip_suffix(ext)?;
+    let prefix = format!("{date_compact}_{agent}_");
+    let remainder = stem.strip_prefix(&prefix)?;
+    let (session_id, chunk_str) = remainder.rsplit_once('_')?;
+
+    if session_id.is_empty()
+        || !session_id
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+    {
+        return None;
+    }
+
+    let chunk = parse_chunk_component(chunk_str)?;
+    Some((session_id.to_string(), chunk))
+}
+
+fn parse_chunk_component(value: &str) -> Option<u32> {
+    let digits = match value.split_once("-c") {
+        Some((digits, suffix))
+            if suffix.len() == 6 && suffix.chars().all(|ch| ch.is_ascii_hexdigit()) =>
+        {
+            digits
+        }
+        Some(_) => return None,
+        None => value,
+    };
+
+    if digits.len() < 3 || !digits.chars().all(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+
+    digits.parse().ok()
+}
+
+pub fn expand_compact_date(compact: &str) -> String {
+    let digits: String = compact.chars().filter(|ch| ch.is_ascii_digit()).collect();
+    if digits.len() >= 8 {
+        format!("{}-{}-{}", &digits[..4], &digits[4..6], &digits[6..8])
+    } else {
+        compact.to_string()
+    }
+}
+
+#[path = "legacy_archive/migration.rs"]
+pub(crate) mod migration;
+pub use migration::{
+    CardsV2Action, CardsV2Item, CardsV2Manifest, CardsV2Totals, LegacyItemKind, MigrationAction,
+    MigrationExecution, MigrationItem, MigrationManifest, MigrationTotals, run_cards_v2_migration,
+    run_migration, run_migration_with_paths,
+};
+#[cfg(all(test, feature = "app"))]
+pub(crate) use migration::{SourceLocator, run_migration_at};
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(all(test, feature = "app"))]
+#[path = "legacy_archive/tests.rs"]
+mod tests;

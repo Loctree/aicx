@@ -96,3 +96,6 @@ Poniższy dokument łączy trzy perspektywy:
 ---
 
 **Status:** Dokument roboczy. Będzie aktualizowany w miarę postępu dekompozycji.
+> Historical architecture snapshot. It predates the 2026-07-23
+> catalog/extract/CURRENT cut; paths and store-first recommendations below are
+> evidence of the retired design, not current runtime guidance.

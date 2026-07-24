@@ -86,3 +86,6 @@ This plan will be updated live as reality teaches us during execution.
 
 ---
 Owner: Grok — full end-to-end delivery under vc-ownership.
+> Historical decomposition plan. The `store` namespace described below was
+> removed on 2026-07-23; current owners are `aicx_home`, `catalog`,
+> `source_index`, and `legacy_archive`.

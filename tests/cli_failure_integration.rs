@@ -241,10 +241,12 @@ fn extract_without_agent_subcommand_emits_structured_failure() {
 }
 
 #[test]
-fn extract_legacy_agent_flag_emits_structured_migration_hint() {
+fn extract_legacy_format_flag_emits_structured_migration_hint() {
+    // `--agent` is an accepted deprecated alias since 2026-07-16; the hard
+    // rejection path is exercised by the still-removed `--format` grammar.
     let bin = ensure_aicx_binary_exists();
     let output = Command::new(&bin)
-        .args(["extract", "--agent", "codex", "--session", "abc12345"])
+        .args(["extract", "--format", "codex", "--session", "abc12345"])
         .output()
         .expect("run legacy extract flag grammar rejection case");
     assert_eq!(

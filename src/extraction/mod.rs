@@ -11,8 +11,8 @@ pub(crate) use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration as StdDuration, SystemTime, UNIX_EPOCH};
 
+use crate::legacy_archive::project_filter_matches;
 pub(crate) use crate::sanitize;
-use crate::store::project_filter_matches;
 use crate::timeline::FrameKind;
 pub use crate::timeline::{
     CollapseStubKind, ConversationMessage, ExtractionConfig, MessageKind, SourceInfo, TimelineEntry,
@@ -56,14 +56,24 @@ pub struct SessionSkip {
 }
 
 /// Fail-closed per-session extraction with batch-level resilience.
+///
+/// Entries flow to extract/report output only. Per-frame store cards and
+/// canonical-projection materialization are retired (extracts-store cut).
 #[cfg(feature = "app")]
 #[derive(Debug, Default)]
 pub struct SessionExtractionBatch {
     pub entries: Vec<TimelineEntry>,
-    pub canonical_cards: Vec<aicx_parser::projections::CanonicalCard>,
     pub ingested_session_ids: BTreeSet<String>,
     pub selected_sessions: usize,
     pub ingested_sessions: usize,
+    /// Sessions cut by the `-p/--project` discovery filter. Deliberately
+    /// outside `selected_sessions`/`skipped`: an all-filtered batch is an
+    /// empty result, not an all-skipped failure.
+    pub filtered_out_sessions: usize,
+    /// Extra physical sources whose logical session was already ingested in
+    /// this batch (e.g. an archived copy of the same rollout file). Dropped,
+    /// not skipped: they must not hold the watermark or trigger retries.
+    pub duplicate_sources: usize,
     pub skipped: Vec<SessionSkip>,
 }
 
@@ -73,19 +83,39 @@ impl SessionExtractionBatch {
         Self {
             ingested_sessions: usize::from(!entries.is_empty()),
             entries,
-            canonical_cards: Vec::new(),
             ingested_session_ids: BTreeSet::new(),
             selected_sessions: 0,
+            filtered_out_sessions: 0,
+            duplicate_sources: 0,
             skipped: Vec::new(),
         }
     }
+}
+
+/// Freshest copy first: one logical session can be discoverable through more
+/// than one physical path (e.g. a live rollout file plus an archived copy).
+/// Parsing the most recently modified source first lets the per-batch
+/// session-id guard drop older duplicates so extract/report sees one body.
+#[cfg(feature = "app")]
+fn order_sources_freshest_first(sources: &mut [crate::session_catalog::CatalogSource]) {
+    // STABLE sort on purpose (NOT sort_unstable_by): archived copies made with
+    // `cp -p` carry an identical mtime, and on a tie the catalog scan order
+    // must decide the duplicate winner deterministically. An unstable sort
+    // would make "which copy wins" run-to-run random for equal timestamps.
+    sources.sort_by(|left, right| {
+        right
+            .fingerprint
+            .modified_unix_nanos
+            .cmp(&left.fingerprint.modified_unix_nanos)
+    });
 }
 
 /// Discover identities with the catalog and parse every selected session once.
 ///
 /// App-only: session discovery (`session_catalog`), parser dispatch, and
 /// timeline projection all live behind `feature = "app"`; the slim
-/// loctree-consumer profile reads the canonical store instead of raw sources.
+/// The loctree-consumer profile can read explicit legacy archive fixtures
+/// instead of discovering raw sources.
 #[cfg(feature = "app")]
 pub fn extract_agent_sessions(
     agent: crate::session_catalog::AgentKind,
@@ -105,12 +135,13 @@ pub fn extract_agent_sessions(
     let scan = crate::session_catalog::SessionCatalog::new(agent, &root)?.scan_with_stats();
     let parser_agent = parser_agent(agent);
     let mut batch = SessionExtractionBatch::default();
-    for source in scan
+    let mut sources: Vec<_> = scan
         .result?
         .into_iter()
         .filter(|source| source_is_selected(source.fingerprint.modified_unix_nanos, config))
-    {
-        batch.selected_sessions += 1;
+        .collect();
+    order_sources_freshest_first(&mut sources);
+    for source in sources {
         let parsed = crate::parser_dispatch::parse_file(
             parser_agent,
             &source.source_id,
@@ -119,33 +150,41 @@ pub fn extract_agent_sessions(
         );
         match parsed {
             Ok(session) => {
-                let projection = match aicx_parser::projections::project_validated_session(
-                    &session,
-                    &canonical_projection_config(),
-                ) {
-                    Ok(projection) => projection,
-                    Err(error) => {
-                        batch.skipped.push(session_skip(
-                            agent,
-                            &source.path,
-                            &source.source_id,
-                            source.logical_session_id.as_deref(),
-                            source.fingerprint.modified_unix_nanos,
-                            &format!("canonical projection failed: {error}"),
-                        ));
-                        continue;
-                    }
-                };
+                if !session_matches_project_filter(session.model(), &config.project_filter) {
+                    batch.filtered_out_sessions += 1;
+                    crate::diagnostics::log_describe(&format!(
+                        "session_filtered_out agent={} session_id={} path={}",
+                        agent,
+                        session.model().session_id,
+                        source.path.display()
+                    ));
+                    continue;
+                }
+                batch.selected_sessions += 1;
+                if batch
+                    .ingested_session_ids
+                    .contains(&session.model().session_id)
+                {
+                    batch.duplicate_sources += 1;
+                    continue;
+                }
+                // Store-era canonical card projection is retired. A successful
+                // parse is enough to emit timeline entries / extract bodies.
                 batch.ingested_sessions += 1;
                 batch
                     .ingested_session_ids
                     .insert(session.model().session_id.clone());
-                batch.canonical_cards.extend(projection.cards);
                 batch
                     .entries
                     .extend(crate::output::timeline_entries_from_model(session.model()));
             }
             Err(error) => {
+                // A parse failure hides the session's cwd, so an active
+                // `-p` filter cannot prove the session is out of scope.
+                // Keep it selected + skipped: hiding parse failures inside
+                // the filtered project would be worse than surfacing a
+                // neighbour's broken session.
+                batch.selected_sessions += 1;
                 batch.skipped.push(session_skip(
                     agent,
                     &source.path,
@@ -165,16 +204,6 @@ pub fn extract_agent_sessions(
                 .is_none_or(|watermark| entry.timestamp > watermark)
     });
     Ok(batch)
-}
-
-#[cfg(feature = "app")]
-pub fn canonical_projection_config() -> aicx_parser::projections::ProjectionConfig {
-    aicx_parser::projections::ProjectionConfig {
-        extraction_schema: aicx_parser::engine::SESSION_MODEL_SCHEMA.to_owned(),
-        producer_version: format!("aicx-parser@{}", env!("CARGO_PKG_VERSION")),
-        attribution_version: "project-bucket-v1".to_owned(),
-        project_override: None,
-    }
 }
 
 #[cfg(feature = "app")]
@@ -213,6 +242,38 @@ fn session_skip(
         skip.recover
     ));
     skip
+}
+
+/// Session-level `-p/--project` discovery filter (O1, problem-log
+/// 2026-07-17 15:12 UTC): a session belongs to the requested project when
+/// ANY of its known working directories (session provenance or per-segment
+/// cwd) matches the filter, using the same word-boundary path semantics as
+/// per-entry segmentation (`project_filter_matches_path`). Fail-closed: with
+/// an active filter, a session with no known cwd cannot be shown to belong
+/// to the requested project and is filtered out (visible in `filtered_out`).
+#[cfg(feature = "app")]
+fn session_matches_project_filter(
+    model: &aicx_parser::engine::SessionModel,
+    filters: &[String],
+) -> bool {
+    if filters.is_empty() {
+        return true;
+    }
+    let provenance_cwd = match model.provenance.cwd.as_ref() {
+        aicx_parser::engine::Known::Value(cwd) => Some(cwd.as_str()),
+        aicx_parser::engine::Known::Unknown(_) => None,
+    };
+    let segment_cwds = model
+        .segments
+        .iter()
+        .filter_map(|segment| match segment.cwd.as_ref() {
+            aicx_parser::engine::Known::Value(cwd) => Some(cwd.as_str()),
+            aicx_parser::engine::Known::Unknown(_) => None,
+        });
+    provenance_cwd
+        .into_iter()
+        .chain(segment_cwds)
+        .any(|cwd| project_filter_matches_path(cwd, filters))
 }
 
 #[cfg(feature = "app")]

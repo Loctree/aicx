@@ -99,7 +99,7 @@ fn tail_help_covers_snapshot_and_follow() {
 }
 
 #[test]
-fn steer_help_mentions_lance_feature_requirement() {
+fn steer_help_names_the_published_current_index_without_lance_gating() {
     let bin = ensure_aicx_binary_exists();
     let output = Command::new(&bin)
         .args(["steer", "--help"])
@@ -108,14 +108,19 @@ fn steer_help_mentions_lance_feature_requirement() {
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_ascii_lowercase();
     assert!(
-        stdout.contains("lance") || stdout.contains("features"),
-        "aicx steer --help should mention the lance feature requirement; got:\n{}",
+        stdout.contains("published current index"),
+        "aicx steer --help should name its canonical index; got:\n{}",
+        stdout
+    );
+    assert!(
+        !stdout.contains("lance") && !stdout.contains("feature-gated"),
+        "aicx steer --help must not advertise the retired Lance gate; got:\n{}",
         stdout
     );
 }
 
 #[test]
-fn top_level_help_drops_layer_1_jargon_in_named_subcommands() {
+fn top_level_help_drops_layer_1_jargon_and_store_command() {
     let bin = ensure_aicx_binary_exists();
     let output = Command::new(&bin)
         .args(["--help"])
@@ -124,13 +129,13 @@ fn top_level_help_drops_layer_1_jargon_in_named_subcommands() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     // Top-level help shows the short description for each subcommand. The
-    // four-command set (all/claude/codex/store) must not show the bare
+    // current extraction/catalog set must not show the bare
     // "(layer 1)" jargon — they should use a plain or "canonical corpus
     // extraction" phrasing instead.
     //
     // We grep line-by-line for the subcommand row and assert no "(layer 1)"
     // suffix is present on it.
-    for cmd in ["all", "claude", "codex", "store"] {
+    for cmd in ["all", "claude", "codex", "catalog"] {
         let line = stdout
             .lines()
             .find(|line| {
@@ -148,4 +153,10 @@ fn top_level_help_drops_layer_1_jargon_in_named_subcommands() {
             "subcommand `{cmd}` row still mentions `(layer 1)` jargon: {line}"
         );
     }
+    assert!(
+        !stdout
+            .lines()
+            .any(|line| line.trim_start().starts_with("store ")),
+        "retired `store` command must not return to primary help"
+    );
 }

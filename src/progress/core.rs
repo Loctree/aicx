@@ -96,7 +96,11 @@ impl Phase {
 pub fn recovery_hint_for(phase: &str) -> Option<&'static str> {
     match phase {
         "steer_sync" | "bm25_sync" => Some("aicx doctor --rebuild-steer-index"),
-        "extract" | "dedup" | "self_echo" | "segment" | "chunk" => Some("aicx store --full-rescan"),
+        // Card-mill `aicx store` is deleted. Corpus recovery is catalog +
+        // source-driven index (optional extract cache).
+        "source_scan" | "dedup" | "self_echo" | "segment" | "render" => {
+            Some("aicx catalog rebuild && aicx index --cache-extracts")
+        }
         _ => None,
     }
 }

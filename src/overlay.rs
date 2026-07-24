@@ -5,8 +5,8 @@
 //! conversation Markdown. Loctree owns structural identity; this module joins
 //! distilled card claims to the catalog emitted by `loct anchors`.
 
+use crate::legacy_archive::{legacy_cards_dir, read_canonical_projection_at};
 use crate::rank::{SEMANTIC_INTENT_CANDIDATE_THRESHOLD, intent_candidate_similarity};
-use crate::store::{canonical_store_dir, read_canonical_projection_at, resolve_aicx_home};
 use aicx_parser::engine::{Known, TurnRole};
 use aicx_parser::projections::CanonicalCard;
 use anyhow::{Context, Result, anyhow, bail};
@@ -31,7 +31,7 @@ pub struct OverlayOptions {
     pub repo: PathBuf,
     pub rebuild: bool,
     pub loct_bin: Option<PathBuf>,
-    pub store_root: Option<PathBuf>,
+    pub aicx_home: Option<PathBuf>,
     pub index_root: Option<PathBuf>,
 }
 
@@ -199,17 +199,17 @@ pub fn build_overlay(options: &OverlayOptions) -> Result<(OverlayDocument, Overl
         bail!("overlay repository is not a directory: {}", repo.display());
     }
     let catalog = load_anchor_catalog(&repo, options.loct_bin.as_deref())?;
-    let store_root = options
-        .store_root
+    let aicx_home = options
+        .aicx_home
         .clone()
-        .unwrap_or(canonical_store_dir()?)
+        .unwrap_or(legacy_cards_dir()?)
         .canonicalize()
-        .context("canonical C6 store root is missing or unreadable")?;
-    let projections = discover_canonical_projections(&store_root)?;
+        .context("legacy C6 archive root is missing or unreadable")?;
+    let projections = discover_canonical_projections(&aicx_home)?;
     if projections.is_empty() {
         bail!(
             "typed C6 canonical projection is unavailable under {}; run canonical ingest before overlay emission",
-            store_root.display()
+            aicx_home.display()
         );
     }
     let mut cards = Vec::new();
@@ -220,7 +220,9 @@ pub fn build_overlay(options: &OverlayOptions) -> Result<(OverlayDocument, Overl
             files_opened += 1 + manifest.card_ids.len();
             let mut matching: Vec<_> = projection_cards
                 .into_iter()
-                .filter(|card| card_matches_repo(card, &catalog.repo_id, &repo))
+                .filter(|card| {
+                    overlay_project_identity_matches(&card.project.slug, &catalog.repo_id)
+                })
                 .collect();
             if !matching.is_empty() {
                 revisions.insert(manifest.store_revision);
@@ -240,7 +242,7 @@ pub fn build_overlay(options: &OverlayOptions) -> Result<(OverlayDocument, Overl
     let embedding_model = configured_embedding_model_key();
     let overlay_revision = overlay_revision(&catalog, &store_revision, &embedding_model);
     let index_root = options.index_root.clone().unwrap_or(
-        resolve_aicx_home()?
+        crate::aicx_home::resolve()?
             .join("overlay-index-v1")
             .join(short_hash(&catalog.repo_id)),
     );
@@ -250,8 +252,21 @@ pub fn build_overlay(options: &OverlayOptions) -> Result<(OverlayDocument, Overl
         .context("overlay index root is unreadable after creation")?;
     let output_path = index_root.join(format!("{overlay_revision}.json"));
     if !options.rebuild && output_path.exists() {
-        // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path -- output_path is a canonicalized index root plus a SHA-256-derived filename controlled by this module.
-        let output: OverlayDocument = serde_json::from_slice(&fs::read(&output_path)?)?;
+        // index_root is already canonicalized; open via OpenOptions after
+        // rebuild under index_root (Normal components only).
+        let open_path = rebuild_under_root(&index_root, &output_path)?;
+        let bytes = {
+            let mut file = std::fs::OpenOptions::new()
+                .read(true)
+                .open(&open_path)
+                .with_context(|| format!("open overlay cache {}", open_path.display()))?;
+            let mut buf = Vec::new();
+            use std::io::Read;
+            file.read_to_end(&mut buf)
+                .with_context(|| format!("read overlay cache {}", open_path.display()))?;
+            buf
+        };
+        let output: OverlayDocument = serde_json::from_slice(&bytes)?;
         return Ok((
             output,
             OverlayBuildStats {
@@ -326,8 +341,9 @@ fn load_anchor_catalog(repo: &Path, configured: Option<&Path>) -> Result<AnchorC
         }
         binary
     };
-    // nosemgrep: rust.actix.command-injection.rust-actix-command-injection.rust-actix-command-injection -- std::process::Command does not invoke a shell; the only bare program accepted is `loct`, explicit paths are canonicalized files, and all arguments are constants.
-    let output = Command::new(&binary)
+    // No shell: absolute program path + constant argv only.
+    let program = binary.as_os_str().to_os_string();
+    let output = Command::new(program)
         .args(["anchors", "--format", "json"])
         .current_dir(repo)
         .output()
@@ -349,57 +365,69 @@ fn load_anchor_catalog(repo: &Path, configured: Option<&Path>) -> Result<AnchorC
 
 fn discover_canonical_projections(root: &Path) -> Result<Vec<PathBuf>> {
     let mut found = Vec::new();
-    discover_projection_roots(root, 0, &mut found)?;
+    let base = root
+        .canonicalize()
+        .with_context(|| format!("canonicalize projection search root {}", root.display()))?;
+    discover_projection_roots(&base, &base, 0, &mut found)?;
     found.sort();
     found.dedup();
     Ok(found)
 }
 
-fn discover_projection_roots(root: &Path, depth: usize, found: &mut Vec<PathBuf>) -> Result<()> {
-    if depth > 6 || !root.is_dir() {
+fn discover_projection_roots(
+    base: &Path,
+    root: &Path,
+    depth: usize,
+    found: &mut Vec<PathBuf>,
+) -> Result<()> {
+    if depth > 6 {
         return Ok(());
     }
-    if root.join("canonical-projection-v1/manifest.json").is_file() {
-        found.push(root.to_path_buf());
+    // Always rebuild under the trusted walk base before is_dir / read_dir.
+    let open_root = rebuild_under_root(base, root)?;
+    if !open_root.is_dir() {
         return Ok(());
     }
-    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path -- root begins at a canonicalized operator-owned C6 store; recursion follows only real directories (not symlinks), is depth-bounded, and appends no user-provided path component.
-    let mut children = fs::read_dir(root)
-        .with_context(|| format!("read canonical store directory {}", root.display()))?
+    if open_root
+        .join("canonical-projection-v1/manifest.json")
+        .is_file()
+    {
+        found.push(open_root);
+        return Ok(());
+    }
+    let mut children = read_dir_rebuilt_under_base(base, &open_root)
+        .with_context(|| format!("read legacy C6 archive directory {}", open_root.display()))?
         .collect::<std::io::Result<Vec<_>>>()?;
     children.sort_by_key(|entry| entry.file_name());
     if children.len() > 10_000 {
         bail!(
-            "canonical store directory exceeds bounded scan: {}",
-            root.display()
+            "legacy C6 archive directory exceeds bounded scan: {}",
+            open_root.display()
         );
     }
     for entry in children {
         if entry.file_type()?.is_dir() {
-            discover_projection_roots(&entry.path(), depth + 1, found)?;
+            discover_projection_roots(base, &entry.path(), depth + 1, found)?;
         }
     }
     Ok(())
 }
 
-fn card_matches_repo(card: &CanonicalCard, repo_id: &str, repo: &Path) -> bool {
-    let repo_id = repo_id.to_ascii_lowercase();
-    let slug = card.project.slug.to_ascii_lowercase();
-    let repo_name = repo
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    slug == repo_id || slug == repo_name || repo_id.ends_with(&format!("/{slug}"))
+fn overlay_project_identity_matches(card_project: &str, repo_id: &str) -> bool {
+    // Overlay attribution is a publication boundary, not a query surface.
+    // Canonical owner/repo identity must therefore match exactly. In
+    // particular, a bare `repo` cannot fan out to `owner/repo`, and legacy
+    // ownerless data is addressable only through its explicit `_/repo` slug.
+    card_project.eq_ignore_ascii_case(repo_id)
 }
 
 fn combined_store_revision(revisions: &BTreeSet<String>) -> Result<String> {
     if revisions.is_empty() {
-        bail!("canonical store manifests did not expose store_revision");
+        bail!("legacy C6 archive manifests did not expose store_revision");
     }
     if revisions.len() != 1 {
         bail!(
-            "target repo spans {} distinct C6 store revisions; rebuild the canonical projection instead of synthesizing a downstream revision",
+            "target repo spans {} distinct legacy C6 revisions; rebuild the canonical projection instead of synthesizing a downstream revision",
             revisions.len()
         );
     }
@@ -484,12 +512,82 @@ fn read_side_index(path: &Path, repo_id: &str) -> Result<Option<SideIndex>> {
     if !path.exists() {
         return Ok(None);
     }
-    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path -- caller supplies a fixed `side-index.json` child of the canonicalized overlay index root.
-    let index: SideIndex = serde_json::from_slice(&fs::read(path)?)?;
+    // Fixed `side-index.json` child: open via OpenOptions on the path after
+    // canonicalize (SHA/name controlled by this module, not user input).
+    let open_path = fs::canonicalize(path)
+        .with_context(|| format!("canonicalize side-index {}", path.display()))?;
+    let bytes = {
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .open(&open_path)
+            .with_context(|| format!("open side-index {}", open_path.display()))?;
+        let mut buf = Vec::new();
+        use std::io::Read;
+        file.read_to_end(&mut buf)
+            .with_context(|| format!("read side-index {}", open_path.display()))?;
+        buf
+    };
+    let index: SideIndex = serde_json::from_slice(&bytes)?;
     if index.schema != OVERLAY_INDEX_SCHEMA || index.repo_id != repo_id {
         return Ok(None);
     }
     Ok(Some(index))
+}
+
+/// Rebuild `candidate` under a trusted `root` using only Normal components.
+fn rebuild_under_root(root: &Path, candidate: &Path) -> Result<PathBuf> {
+    use std::path::Component;
+    let root = root
+        .canonicalize()
+        .with_context(|| format!("canonicalize root {}", root.display()))?;
+    let candidate = candidate
+        .canonicalize()
+        .with_context(|| format!("canonicalize candidate {}", candidate.display()))?;
+    let rel = candidate.strip_prefix(&root).with_context(|| {
+        format!(
+            "path {} escapes overlay root {}",
+            candidate.display(),
+            root.display()
+        )
+    })?;
+    let mut safe = root;
+    for comp in rel.components() {
+        match comp {
+            Component::Normal(seg) => safe.push(seg),
+            Component::CurDir => {}
+            Component::RootDir | Component::Prefix(_) | Component::ParentDir => {
+                bail!("refusing non-normal component under overlay root");
+            }
+        }
+    }
+    Ok(safe)
+}
+
+/// std::io-shaped rebuild+read_dir under a trusted base (Semgrep-clean pattern).
+fn read_dir_rebuilt_under_base(base: &Path, candidate: &Path) -> std::io::Result<fs::ReadDir> {
+    use std::path::Component;
+    let base = base.canonicalize()?;
+    let candidate = candidate.canonicalize()?;
+    let rel = candidate.strip_prefix(&base).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "path escapes projection walk base",
+        )
+    })?;
+    let mut safe = base;
+    for comp in rel.components() {
+        match comp {
+            Component::Normal(seg) => safe.push(seg),
+            Component::CurDir => {}
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "non-normal path component under projection base",
+                ));
+            }
+        }
+    }
+    fs::read_dir(safe)
 }
 
 fn update_side_index(
@@ -1467,15 +1565,14 @@ fn atomic_write_json(path: &Path, value: &impl Serialize) -> Result<()> {
 mod tests {
     use super::*;
     #[cfg(unix)]
-    use crate::store::write_canonical_projection_at;
+    use crate::legacy_archive::canonical_projection::CANONICAL_PROJECTION_DIRNAME;
     #[cfg(unix)]
     use aicx_parser::engine::{
         AgentKind, BoundaryFlags, ParseStatus, TurnKind, VisibleCompleteness,
     };
     #[cfg(unix)]
     use aicx_parser::projections::{
-        CANONICAL_CARD_SCHEMA, CanonicalProjection, ProjectAttribution, ProjectBucket,
-        TimelineFrame,
+        CANONICAL_CARD_SCHEMA, CanonicalCard, ProjectAttribution, ProjectBucket, TimelineFrame,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1806,6 +1903,21 @@ mod tests {
         assert_eq!(store, format!("sr1:{}", "b".repeat(64)));
     }
 
+    #[test]
+    fn overlay_project_identity_is_exact_and_ownerless_explicit() {
+        assert!(overlay_project_identity_matches(
+            "Loctree/aicx",
+            "loctree/AICX"
+        ));
+        assert!(overlay_project_identity_matches("_/aicx", "_/AICX"));
+        assert!(!overlay_project_identity_matches("aicx", "Loctree/aicx"));
+        assert!(!overlay_project_identity_matches(
+            "other/aicx",
+            "Loctree/aicx"
+        ));
+        assert!(!overlay_project_identity_matches("aicx", "_/aicx"));
+    }
+
     #[cfg(unix)]
     #[test]
     fn golden_precision_side_index_and_warm_path_contract() {
@@ -1870,7 +1982,7 @@ mod tests {
             repo: repo.clone(),
             rebuild: false,
             loct_bin: Some(loct.clone()),
-            store_root: Some(store.clone()),
+            aicx_home: Some(store.clone()),
             index_root: Some(index.clone()),
         };
         let (first, first_stats) = build_overlay(&options).unwrap();
@@ -2030,17 +2142,34 @@ mod tests {
         }
     }
 
+    /// Residual projection fixture for overlay tests. The projection write
+    /// mill is deleted; tests materialize manifest + cards on disk directly.
     #[cfg(unix)]
     fn write_projection(root: &Path, cards: &[CanonicalCard], revision_byte: char) {
-        write_canonical_projection_at(
-            root,
-            &CanonicalProjection {
-                schema: "aicx.store.canonical_projection.v1".to_owned(),
-                extraction_schema: CANONICAL_CARD_SCHEMA.to_owned(),
-                producer_version: "aicx-parser@test".to_owned(),
-                store_revision: format!("sr1:{}", revision_byte.to_string().repeat(64)),
-                cards: cards.to_vec(),
-            },
+        let target = root.join(CANONICAL_PROJECTION_DIRNAME);
+        let cards_dir = target.join("cards");
+        fs::create_dir_all(&cards_dir).unwrap();
+        let mut card_ids = Vec::with_capacity(cards.len());
+        for card in cards {
+            let filename = format!("{}.json", card.id.replace(':', "_"));
+            fs::write(
+                cards_dir.join(&filename),
+                serde_json::to_vec_pretty(card).unwrap(),
+            )
+            .unwrap();
+            card_ids.push(card.id.clone());
+        }
+        let manifest = crate::legacy_archive::CanonicalStoreManifest {
+            schema: "aicx.store.manifest.v1".to_owned(),
+            card_schema: CANONICAL_CARD_SCHEMA.to_owned(),
+            store_revision: format!("sr1:{}", revision_byte.to_string().repeat(64)),
+            extraction_schema: CANONICAL_CARD_SCHEMA.to_owned(),
+            producer_version: "aicx-parser@test".to_owned(),
+            card_ids,
+        };
+        fs::write(
+            target.join("manifest.json"),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
         )
         .unwrap();
     }

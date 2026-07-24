@@ -43,7 +43,7 @@ fn cache_bases() -> Vec<PathBuf> {
     if let Some(home) = crate::os_user_home() {
         out.push(home.join(".cache").join("huggingface").join("hub"));
     }
-    if let Ok(aicx_home) = crate::store::resolve_aicx_home() {
+    if let Ok(aicx_home) = crate::aicx_home::resolve() {
         out.push(aicx_home.join("embeddings"));
         out.push(aicx_home.join("embeddings").join("hub"));
     }

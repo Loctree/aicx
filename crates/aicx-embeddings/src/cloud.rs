@@ -28,6 +28,16 @@ pub const DEFAULT_TIMEOUT_SECS: u64 = 30;
 /// is the operator declaration.
 pub const DEFAULT_CLOUD_DIMENSION: usize = 1536;
 
+/// Default number of chunk texts embedded per HTTP request during an
+/// `aicx index` build. OpenAI-compatible `/v1/embeddings` accepts an
+/// `input` array, so one round-trip amortizes across the whole batch.
+/// 16 is a conservative default: large enough to collapse ~10× of the
+/// per-request latency (measured warm on a local Ollama endpoint) yet
+/// small enough to keep the POST body and provider-side memory bounded.
+/// Override per-config with `[embedder.cloud] batch_size` or per-run with
+/// `AICX_EMBED_BATCH`.
+pub const DEFAULT_CLOUD_EMBED_BATCH: usize = 16;
+
 /// Cloud embedding endpoint configuration.
 ///
 /// All fields are deserialized from `[embedder.cloud]` in
@@ -56,6 +66,12 @@ pub struct CloudEmbeddingConfig {
     /// Request timeout in seconds. Default 30.
     #[serde(default)]
     pub timeout_secs: Option<u64>,
+    /// Number of chunk texts to embed per HTTP request during an index
+    /// build. `None` falls back to [`DEFAULT_CLOUD_EMBED_BATCH`]. The
+    /// `AICX_EMBED_BATCH` env var overrides this at runtime. Values below
+    /// 1 are clamped to 1 (serial embedding).
+    #[serde(default)]
+    pub batch_size: Option<usize>,
 }
 
 impl CloudEmbeddingConfig {

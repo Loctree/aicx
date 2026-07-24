@@ -744,7 +744,7 @@ use aicx_parser::engine::{Known, SessionModel, TurnKind, TurnRole};
 
 /// Canonical mapping from the typed parser model's `TurnKind` to the stable
 /// retrieval `FrameKind` vocabulary. This is the frozen projection contract
-/// consumed by conversation/report rendering and the store pipeline; the
+/// consumed by conversation/report rendering and source indexing; the
 /// `frame_kind_contract` integration test pins it.
 pub fn frame_kind_for_turn(kind: TurnKind) -> FrameKind {
     match kind {

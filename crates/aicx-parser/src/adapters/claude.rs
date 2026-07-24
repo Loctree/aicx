@@ -1038,6 +1038,7 @@ impl Analysis {
             boundary_flags: BoundaryFlags {
                 opaque_reasoning_present: self.opaque_reasoning_present,
                 unsupported_visible_event: self.unsupported_visible_event,
+                compaction_boundary_present: false,
             },
             malformed_tail_present: self.malformed_tail_present,
             visible_event_lost: self.visible_event_lost,

@@ -21,7 +21,9 @@ mod gguf;
 
 #[cfg(feature = "cloud")]
 pub use cloud::CloudEmbeddingProvider;
-pub use cloud::{CloudEmbeddingConfig, DEFAULT_CLOUD_DIMENSION, DEFAULT_TIMEOUT_SECS};
+pub use cloud::{
+    CloudEmbeddingConfig, DEFAULT_CLOUD_DIMENSION, DEFAULT_CLOUD_EMBED_BATCH, DEFAULT_TIMEOUT_SECS,
+};
 
 /// Maximum input byte length any embedder backend will accept (D-9). Inputs
 /// over this size short-circuit with a structured error before the embedder
@@ -285,9 +287,42 @@ pub trait LocalEmbeddingProvider: Send {
     }
 }
 
+/// Resolve the per-request embedding batch size from config + env.
+///
+/// Precedence (highest wins): `AICX_EMBED_BATCH` env override →
+/// `[embedder.cloud] batch_size` (cloud backend only) →
+/// [`DEFAULT_CLOUD_EMBED_BATCH`] for cloud / `1` for every other backend.
+/// The result is clamped to `>= 1` so a bogus `0` degrades to serial
+/// embedding instead of an empty-batch loop.
+///
+/// GGUF defaults to `1` on purpose: its `embed_batch` sizes a llama.cpp
+/// context to the batch's total token count, so a large default batch
+/// would inflate local memory on workstation builds. Operators who want
+/// GGUF batching opt in explicitly via `AICX_EMBED_BATCH`.
+fn resolve_embed_batch_size(config: &EmbeddingConfig, resolved_backend: &str) -> usize {
+    let default = if resolved_backend == "cloud" {
+        config
+            .cloud
+            .as_ref()
+            .and_then(|cloud| cloud.batch_size)
+            .unwrap_or(DEFAULT_CLOUD_EMBED_BATCH)
+    } else {
+        1
+    };
+    std::env::var("AICX_EMBED_BATCH")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .unwrap_or(default)
+        .max(1)
+}
+
 /// Stateful local embedding engine. This hides the concrete backend.
 pub struct EmbeddingEngine {
     inner: Box<dyn LocalEmbeddingProvider>,
+    /// Chunk texts embedded per `embed_batch` call the index builder
+    /// should target. Resolved once at construction from config + env
+    /// (see [`resolve_embed_batch_size`]); `1` means serial embedding.
+    batch_size: usize,
 }
 
 impl EmbeddingEngine {
@@ -296,6 +331,20 @@ impl EmbeddingEngine {
     }
 
     pub fn with_config(config: EmbeddingConfig) -> Result<Self> {
+        let mut engine = Self::build_backend(config.clone())?;
+        let backend = engine.info().backend.clone();
+        engine.batch_size = resolve_embed_batch_size(&config, &backend);
+        Ok(engine)
+    }
+
+    /// Recommended number of chunk texts to hand a single `embed_batch`
+    /// call during an index build. `1` for serial (GGUF default, or a
+    /// cloud config that pins it); higher collapses per-request latency.
+    pub fn embed_batch_size(&self) -> usize {
+        self.batch_size
+    }
+
+    fn build_backend(config: EmbeddingConfig) -> Result<Self> {
         match config.backend {
             BackendPreference::Cloud => Self::with_cloud(config),
             BackendPreference::Gguf => Self::with_gguf(config),
@@ -338,6 +387,8 @@ impl EmbeddingEngine {
         })?;
         Ok(Self {
             inner: Box::new(cloud::CloudEmbeddingProvider::new(cloud_cfg)?),
+            // Overwritten by `with_config` once the backend is known.
+            batch_size: 1,
         })
     }
 
@@ -353,6 +404,8 @@ impl EmbeddingEngine {
     fn with_gguf(config: EmbeddingConfig) -> Result<Self> {
         Ok(Self {
             inner: Box::new(gguf::GgufEmbeddingProvider::with_config(config)?),
+            // Overwritten by `with_config` once the backend is known.
+            batch_size: 1,
         })
     }
 
@@ -535,6 +588,117 @@ mod tests {
     #[test]
     fn similarity_length_mismatch_is_zero() {
         assert_eq!(similarity(&[1.0, 0.0], &[1.0, 0.0, 0.0]), 0.0);
+    }
+
+    // `AICX_EMBED_BATCH` is process-global; serialize the resolver tests
+    // that mutate it so they stay correct under `cargo test` parallelism
+    // (mirrors the AICX_HOME_ENV_LOCK pattern used elsewhere in the tree).
+    static EMBED_BATCH_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// RAII guard: set (or clear) `AICX_EMBED_BATCH` for the test body and
+    /// restore the prior value on drop so tests never leak env state into
+    /// each other.
+    struct BatchEnvGuard {
+        prior: Option<String>,
+    }
+
+    impl BatchEnvGuard {
+        fn set(value: Option<&str>) -> Self {
+            let prior = std::env::var("AICX_EMBED_BATCH").ok();
+            match value {
+                Some(v) => unsafe { std::env::set_var("AICX_EMBED_BATCH", v) },
+                None => unsafe { std::env::remove_var("AICX_EMBED_BATCH") },
+            }
+            Self { prior }
+        }
+    }
+
+    impl Drop for BatchEnvGuard {
+        fn drop(&mut self) {
+            match &self.prior {
+                Some(v) => unsafe { std::env::set_var("AICX_EMBED_BATCH", v) },
+                None => unsafe { std::env::remove_var("AICX_EMBED_BATCH") },
+            }
+        }
+    }
+
+    fn cloud_config_with_batch(batch: Option<usize>) -> EmbeddingConfig {
+        EmbeddingConfig {
+            backend: BackendPreference::Cloud,
+            cloud: Some(CloudEmbeddingConfig {
+                url: "http://127.0.0.1:11434/v1/embeddings".to_string(),
+                model: "qwen3-embedding".to_string(),
+                batch_size: batch,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn embed_batch_size_cloud_defaults_to_sixteen() {
+        let _lock = EMBED_BATCH_ENV_LOCK.lock().expect("env lock");
+        let _env = BatchEnvGuard::set(None);
+        let cfg = cloud_config_with_batch(None);
+        assert_eq!(
+            resolve_embed_batch_size(&cfg, "cloud"),
+            DEFAULT_CLOUD_EMBED_BATCH
+        );
+    }
+
+    #[test]
+    fn embed_batch_size_cloud_config_value_wins_over_default() {
+        let _lock = EMBED_BATCH_ENV_LOCK.lock().expect("env lock");
+        let _env = BatchEnvGuard::set(None);
+        let cfg = cloud_config_with_batch(Some(8));
+        assert_eq!(resolve_embed_batch_size(&cfg, "cloud"), 8);
+    }
+
+    #[test]
+    fn embed_batch_size_env_overrides_config() {
+        let _lock = EMBED_BATCH_ENV_LOCK.lock().expect("env lock");
+        let _env = BatchEnvGuard::set(Some("32"));
+        let cfg = cloud_config_with_batch(Some(8));
+        assert_eq!(resolve_embed_batch_size(&cfg, "cloud"), 32);
+    }
+
+    #[test]
+    fn embed_batch_size_gguf_defaults_to_serial_but_honors_env() {
+        let _lock = EMBED_BATCH_ENV_LOCK.lock().expect("env lock");
+        let cfg = EmbeddingConfig::default();
+
+        let _off = BatchEnvGuard::set(None);
+        assert_eq!(
+            resolve_embed_batch_size(&cfg, "gguf"),
+            1,
+            "gguf must default to serial embedding"
+        );
+        drop(_off);
+
+        let _on = BatchEnvGuard::set(Some("4"));
+        assert_eq!(
+            resolve_embed_batch_size(&cfg, "gguf"),
+            4,
+            "explicit env opt-in must batch gguf too"
+        );
+    }
+
+    #[test]
+    fn embed_batch_size_clamps_zero_and_ignores_garbage_env() {
+        let _lock = EMBED_BATCH_ENV_LOCK.lock().expect("env lock");
+        let cfg = cloud_config_with_batch(Some(0));
+
+        let _zero_env = BatchEnvGuard::set(Some("0"));
+        assert_eq!(
+            resolve_embed_batch_size(&cfg, "cloud"),
+            1,
+            "a zero batch size must clamp to serial, never an empty batch"
+        );
+        drop(_zero_env);
+
+        let _garbage = BatchEnvGuard::set(Some("not-a-number"));
+        // Garbage env is ignored; falls back to the (clamped) config value.
+        assert_eq!(resolve_embed_batch_size(&cfg, "cloud"), 1);
     }
 
     #[test]

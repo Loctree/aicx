@@ -1,5 +1,15 @@
 # AICX MCP Agent Adoption Runbook
 
+> **Store-era checkpoint notice.** The Sztudio V4 proof recorded below was
+> captured on a 2026-06-19 snapshot whose AICX home still contained a live
+> `store/` card tree — that is why the fixture expectations use
+> `EXPECT_SOURCE_CONTAINS="/aicx-home/store/tb14d-anchor-v4"`. The `aicx store`
+> command and the card store concept have since been removed; extracts-era
+> homes have no `store/` directory (see `docs/AICX_HOME_LAYOUT.md`). Keep the
+> V4 expectations only when smoking that exact historical snapshot; for
+> current runtimes, point `EXPECT_SOURCE_CONTAINS` at a canonical session
+> source path.
+
 This runbook turns a one-off streamable HTTP success into a repeatable agent
 runtime. It deliberately separates four gates:
 

@@ -34,7 +34,7 @@ fn project_filter_does_not_match_substring_leak() {
 
     // Positive control: the canonical `vetcoders/vista` slug MUST match
     // `-p vista` via the cross-org repo-name rule that lives in
-    // `aicx::store::project_filter_matches`. The dashboard surface now
+    // `aicx::legacy_archive::project_filter_matches`. The dashboard surface now
     // agrees with store / mcp / rank / steer on this.
     assert!(
         project_matches_filter("vetcoders/vista", Some("vista")),

@@ -147,9 +147,10 @@ if (hasError) {
   console.error("prebuilt binaries, or npm failed to download optionalDependencies.\n");
   console.error("Supported pre-built platforms:");
   console.error("  - macOS arm64 (Apple Silicon)");
-  console.error("  - Linux x64 (GNU libc)\n");
+  console.error("  - Linux x64 (GNU libc)");
+  console.error("  - Windows x64 (MSVC)\n");
   console.error("If you are on a supported platform, check your network or npm config.");
-  console.error("If you are on an unsupported platform (e.g. Windows, Linux musl, macOS Intel),");
+  console.error("If you are on an unsupported platform (e.g. Linux musl or macOS Intel),");
   console.error("use a source build as a contributor fallback.\n");
   console.error("To install from source (requires Rust):");
   console.error("  cargo install --git https://github.com/Loctree/aicx.git\n");

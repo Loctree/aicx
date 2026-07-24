@@ -5,6 +5,7 @@ on:
     paths:
       - 'src/vector_index.rs'
       - 'src/search_engine.rs'
+      - 'src/search_eval.rs'
       - 'crates/aicx-retrieve/**'
       - 'tests/retrieval_eval/**'
 
@@ -22,3 +23,7 @@ jobs:
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable 2026-07
       - name: Run retrieval eval harness
         run: make test-retrieval-eval
+      - name: Run search quality budget contract
+        run: |
+          cargo test -p aicx search_eval::tests
+          cargo run --bin aicx -- eval search-quality --strict

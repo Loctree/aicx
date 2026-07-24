@@ -1,9 +1,13 @@
 use anyhow::{Context, Result};
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
+use crate::extraction::is_harness_injected_noise;
 use crate::oracle::{ClaimHonesty, OracleEnvelope, OracleStatus};
 
-use super::{IntentKind, IntentRecord, cmp_dates_flexible, parse_flexible_utc};
+use super::{
+    IntentKind, IntentRecord, IntentsCompleteness, cmp_dates_flexible, parse_flexible_utc,
+};
 
 /// Sort order for `apply_display_filters`. Mirrors the CLI's `SortOrder`
 /// without importing main.rs types into the library.
@@ -47,6 +51,13 @@ pub struct IntentDisplayFilters {
     pub date_hi: Option<String>,
     pub sort: Option<IntentSortOrder>,
     pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+pub struct IntentDisplayResult {
+    pub records: Vec<IntentRecord>,
+    pub available_before_limit: usize,
+    pub requested_limit: Option<usize>,
 }
 
 fn clean_to_significant_words(text: &str) -> HashSet<String> {
@@ -208,9 +219,16 @@ fn outcome_matches_intent(outcome: &IntentRecord, intent: &IntentRecord) -> bool
 /// aggregation in `collapse_session` becomes inconsistent with the
 /// downstream filters.
 pub fn apply_display_filters(
-    mut records: Vec<IntentRecord>,
+    records: Vec<IntentRecord>,
     filters: &IntentDisplayFilters,
 ) -> Vec<IntentRecord> {
+    apply_display_filters_with_completeness(records, filters).records
+}
+
+pub fn apply_display_filters_with_completeness(
+    mut records: Vec<IntentRecord>,
+    filters: &IntentDisplayFilters,
+) -> IntentDisplayResult {
     if filters.unresolved {
         match filters.unresolved_mode {
             UnresolvedMode::Session => {
@@ -243,28 +261,26 @@ pub fn apply_display_filters(
 
     if filters.collapse_session {
         records = collapse_exact_daily_duplicates(records);
-        let mut map: HashMap<String, IntentRecord> = HashMap::new();
-        let mut order = Vec::new();
+        let mut map: HashMap<(String, String), IntentRecord> = HashMap::new();
         for rec in records {
-            let key = rec.session_id.clone();
-            match map.entry(key.clone()) {
+            let key = (rec.project.clone(), rec.session_id.clone());
+            match map.entry(key) {
                 std::collections::hash_map::Entry::Vacant(entry) => {
-                    order.push(key);
-                    let mut clone = rec.clone();
-                    clone.count = Some(rec.count.unwrap_or(1));
-                    entry.insert(clone);
+                    let mut rec = rec;
+                    rec.count = Some(rec.count.unwrap_or(1));
+                    entry.insert(rec);
                 }
                 std::collections::hash_map::Entry::Occupied(mut entry) => {
-                    let existing = entry.get_mut();
-                    *existing.count.get_or_insert(0) += rec.count.unwrap_or(1);
-                    if !existing.evidence.contains(&rec.summary) {
-                        existing.evidence.push(rec.summary);
-                    }
-                    append_unique_source_chunk(&mut existing.source_chunk, &rec.source_chunk);
+                    merge_collapsed_record(entry.get_mut(), rec);
                 }
             }
         }
-        records = order.into_iter().filter_map(|k| map.remove(&k)).collect();
+        for record in map.values_mut() {
+            record.evidence.sort();
+            record.evidence.dedup();
+            canonicalize_source_chunks(&mut record.source_chunk);
+        }
+        records = map.into_values().collect();
     }
 
     if let Some(agent_filter) = &filters.agent {
@@ -305,31 +321,35 @@ pub fn apply_display_filters(
         });
     }
 
-    if let Some(sort_order) = filters.sort {
-        records.sort_by(|a, b| {
-            let t_a = a.timestamp.as_deref().unwrap_or(a.date.as_str());
-            let t_b = b.timestamp.as_deref().unwrap_or(b.date.as_str());
-            let ord = cmp_dates_flexible(t_a, t_b);
-            match sort_order {
-                IntentSortOrder::Newest => ord.reverse(),
-                IntentSortOrder::Oldest => ord,
-            }
-        });
-    }
+    // The documented default is newest-first. Always materialize that order
+    // before applying the limit so equal timestamps cannot inherit filesystem,
+    // HashMap, or caller iteration order. Project/session/chunk identity is the
+    // shared CLI+MCP tie-break contract; kind/summary close the order for the
+    // multiple intent records that can legitimately originate in one chunk.
+    let sort_order = filters.sort.unwrap_or(IntentSortOrder::Newest);
+    records.sort_by(|left, right| compare_intent_records(left, right, sort_order));
 
+    let available_before_limit = records.len();
     if let Some(limit) = filters.limit {
         records.truncate(limit);
     }
 
-    records
+    IntentDisplayResult {
+        records,
+        available_before_limit,
+        requested_limit: filters.limit,
+    }
 }
 
 fn collapse_exact_daily_duplicates(records: Vec<IntentRecord>) -> Vec<IntentRecord> {
-    let mut map: HashMap<(IntentKind, String, String, String), IntentRecord> = HashMap::new();
+    let mut map: HashMap<(String, String, IntentKind, String, String, String), IntentRecord> =
+        HashMap::new();
     let mut order = Vec::new();
 
     for rec in records {
         let key = (
+            rec.project.clone(),
+            rec.session_id.clone(),
             rec.kind,
             rec.agent.clone(),
             rec.date.clone(),
@@ -361,6 +381,84 @@ fn collapse_exact_daily_duplicates(records: Vec<IntentRecord>) -> Vec<IntentReco
         .collect()
 }
 
+fn compare_intent_records(
+    left: &IntentRecord,
+    right: &IntentRecord,
+    sort_order: IntentSortOrder,
+) -> Ordering {
+    let left_time = left.timestamp.as_deref().unwrap_or(left.date.as_str());
+    let right_time = right.timestamp.as_deref().unwrap_or(right.date.as_str());
+    let time_order = cmp_dates_flexible(left_time, right_time);
+    let time_order = match sort_order {
+        IntentSortOrder::Newest => time_order.reverse(),
+        IntentSortOrder::Oldest => time_order,
+    };
+
+    time_order
+        .then_with(|| left.project.cmp(&right.project))
+        .then_with(|| left.session_id.cmp(&right.session_id))
+        .then_with(|| left.source_chunk.cmp(&right.source_chunk))
+        .then_with(|| left.kind.sort_rank().cmp(&right.kind.sort_rank()))
+        .then_with(|| left.summary.cmp(&right.summary))
+}
+
+fn merge_collapsed_record(existing: &mut IntentRecord, incoming: IntentRecord) {
+    let total_count = existing.count.unwrap_or(1) + incoming.count.unwrap_or(1);
+    let existing_summary = existing.summary.clone();
+    let incoming_summary = incoming.summary.clone();
+    let mut combined_evidence = existing.evidence.clone();
+    append_unique_values(&mut combined_evidence, incoming.evidence.iter().cloned());
+    let mut combined_source_chunk = existing.source_chunk.clone();
+    append_unique_source_chunk(&mut combined_source_chunk, &incoming.source_chunk);
+
+    if representative_preference(&incoming, existing).is_gt() {
+        *existing = incoming;
+        if existing.summary != existing_summary {
+            append_unique_values(&mut combined_evidence, [existing_summary]);
+        }
+    } else if existing.summary != incoming_summary {
+        append_unique_values(&mut combined_evidence, [incoming_summary]);
+    }
+
+    existing.count = Some(total_count);
+    existing.evidence = combined_evidence;
+    existing.source_chunk = combined_source_chunk;
+}
+
+/// Compare two candidates for the single representative of a collapsed
+/// `(project_identity, session_id)` group. This intentionally reuses signals
+/// already owned by the intents pipeline instead of inventing another ranker:
+/// conversation harness-noise detection, IntentKind's established strength,
+/// then the longest substantive frame. Remaining fields are deterministic
+/// tie-breakers only.
+fn representative_preference(left: &IntentRecord, right: &IntentRecord) -> Ordering {
+    let left_is_noise = is_harness_injected_noise("user", &left.summary);
+    let right_is_noise = is_harness_injected_noise("user", &right.summary);
+    let left_time = left.timestamp.as_deref().unwrap_or(left.date.as_str());
+    let right_time = right.timestamp.as_deref().unwrap_or(right.date.as_str());
+
+    right_is_noise
+        .cmp(&left_is_noise)
+        .then_with(|| right.kind.sort_rank().cmp(&left.kind.sort_rank()))
+        .then_with(|| {
+            left.summary
+                .chars()
+                .count()
+                .cmp(&right.summary.chars().count())
+        })
+        .then_with(|| cmp_dates_flexible(left_time, right_time))
+        .then_with(|| right.source_chunk.cmp(&left.source_chunk))
+        .then_with(|| right.summary.cmp(&left.summary))
+}
+
+fn append_unique_values(target: &mut Vec<String>, values: impl IntoIterator<Item = String>) {
+    for value in values {
+        if !target.contains(&value) {
+            target.push(value);
+        }
+    }
+}
+
 fn normalize_display_key(text: &str) -> String {
     text.split_whitespace()
         .collect::<Vec<_>>()
@@ -369,15 +467,24 @@ fn normalize_display_key(text: &str) -> String {
 }
 
 fn append_unique_source_chunk(target: &mut String, source_chunk: &str) {
-    if target.split(", ").any(|existing| existing == source_chunk) {
-        return;
-    }
-    if target.is_empty() {
-        target.push_str(source_chunk);
-    } else {
-        target.push_str(", ");
+    if !source_chunk.is_empty() {
+        if !target.is_empty() {
+            target.push_str(", ");
+        }
         target.push_str(source_chunk);
     }
+    canonicalize_source_chunks(target);
+}
+
+fn canonicalize_source_chunks(target: &mut String) {
+    let mut chunks = target
+        .split(", ")
+        .filter(|chunk| !chunk.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    chunks.sort();
+    chunks.dedup();
+    *target = chunks.join(", ");
 }
 
 pub fn format_intents_markdown(records: &[IntentRecord]) -> String {
@@ -441,6 +548,30 @@ pub fn format_intents_oracle_json(
     serde_json::to_string_pretty(&OracleEnvelope {
         oracle_status,
         claim_honesty: ClaimHonesty::canonical(),
+        results: records.len(),
+        items: records,
+    })
+    .context("Failed to serialize intents oracle JSON")
+}
+
+pub fn format_intents_oracle_json_with_completeness(
+    records: &[IntentRecord],
+    oracle_status: OracleStatus,
+    completeness: IntentsCompleteness,
+) -> Result<String> {
+    #[derive(serde::Serialize)]
+    struct IntentsOracleEnvelope<'a> {
+        oracle_status: OracleStatus,
+        claim_honesty: ClaimHonesty,
+        completeness: IntentsCompleteness,
+        results: usize,
+        items: &'a [IntentRecord],
+    }
+
+    serde_json::to_string_pretty(&IntentsOracleEnvelope {
+        oracle_status,
+        claim_honesty: ClaimHonesty::canonical(),
+        completeness,
         results: records.len(),
         items: records,
     })

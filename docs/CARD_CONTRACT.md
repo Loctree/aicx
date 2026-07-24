@@ -1,12 +1,19 @@
 ---
 contract_version: 2
-status: active
+status: legacy
 owner: Vetcoders
-last_reviewed: 2026-07-02
+last_reviewed: 2026-07-24
 revalidate_by: 2026-08-02
 ---
 
 # AICX Card Contract
+
+> **Legacy only.** Per-frame cards are no longer written: the `aicx store`
+> command and the card-mill write path were removed in the extracts-first cut.
+> This contract now describes the on-disk schema that `src/legacy_archive/**`
+> (doctor, quarantine, migrate) reads from existing card trees. Live memory
+> truth is the durable catalog plus session extracts and the published
+> `CURRENT` index — see `docs/AICX_HOME_LAYOUT.md`.
 
 > **runtime > kontrakt > pamięć.** This file is an anchor, not scripture — it
 > carries an expiry date (`revalidate_by`); an old, unverified decision is
@@ -125,7 +132,7 @@ Card schema evolution is additive.
 | Writer | `crates/aicx-parser/src/chunker.rs` (`format_chunk_text_inner`, l. 833; `From<&Chunk> for ChunkMetadataSidecar`, l. 281) | Emits `.md` with YAML frontmatter (`schema: card.v2`) + optional `[signals]` block, and a sidecar with `schema_version: 2`, honesty tuple, `source` L0 pointer, typed `signals`. |
 | Readers | `crates/aicx-parser/src/card_header.rs`, `src/intents.rs::parse_chunk_document` | Header-agnostic (bracket or frontmatter); sidecar-first metadata selection. |
 | Validator | `src/corpus/validate.rs` (`aicx corpus validate-cards`) | Accepts `schema_version` 1 or 2; on born-v2 checks honesty values, `source.path`, header shape, full-file `content_sha256`, and md↔sidecar signal parity as hard errors. On migrated-v2 (`migrated_from_schema` present), missing legacy `source.path` becomes `migrated_missing_source` warning and unbackfilled markdown signals become `migrated_signals_unbackfilled` warning. Hash mismatch stays an error for all cards. |
-| Migration | `src/store/migration/cards_v2.rs` (`aicx migrate --cards-v2`) | In-place v1→v2 upgrade: sidecar gains schema/honesty fields plus `migrated_from_schema: 1`, bracket header → YAML frontmatter, and refreshed full-file `content_sha256` with old/new hashes recorded in the manifest. Body bytes never change; dry-run by default, `--apply` to write; idempotent. |
+| Migration | `src/legacy_archive/migration/cards_v2.rs` (`aicx migrate --cards-v2`) | In-place recovery upgrade for existing v1 archive cards: sidecar gains schema/honesty fields plus `migrated_from_schema: 1`, bracket header → YAML frontmatter, and refreshed full-file `content_sha256` with old/new hashes recorded in the manifest. Body bytes never change; dry-run by default, `--apply` to write; idempotent. |
 
 ## Decision Log
 

@@ -24,7 +24,7 @@ pub(super) struct SemanticSearchParams {
     #[serde(default = "default_search_limit")]
     limit: usize,
     /// Optional project filter routed through the canonical
-    /// `aicx::store::project_filter_matches` helper. Strict semantics: no
+    /// `aicx::legacy_archive::project_filter_matches` helper. Strict semantics: no
     /// substring matching. Prefer `projects` for cross-project search.
     project: Option<String>,
     /// Optional project filters for cross-project search (strict).
@@ -74,7 +74,7 @@ pub(super) struct SteerSearchParams {
     kind: Option<String>,
     /// Filter by frame/channel
     frame_kind: Option<crate::timeline::FrameKind>,
-    /// Filter by project (strict, via `aicx::store::project_filter_matches`)
+    /// Filter by project (strict, via `aicx::legacy_archive::project_filter_matches`)
     project: Option<String>,
     /// Filter by multiple project filters (strict)
     #[serde(default)]
@@ -145,14 +145,15 @@ pub(super) fn merge_project_scopes(
 }
 
 fn search_project_scopes(
-    store_root: &std::path::Path,
+    aicx_home: &std::path::Path,
     projects: &[String],
 ) -> Result<Vec<Option<String>>> {
     if projects.is_empty() {
         return Ok(vec![None]);
     }
-    let resolved =
-        crate::store::resolve_filters_to_store_or_index_slugs_at_or_error(store_root, projects)?;
+    let resolved = crate::legacy_archive::resolve_filters_to_store_or_index_slugs_at_or_error(
+        aicx_home, projects,
+    )?;
     Ok(resolved.into_iter().map(Some).collect())
 }
 
@@ -212,7 +213,7 @@ pub(super) async fn get_semantic_search(
     }
 
     let limit = params.limit.min(100);
-    let store_root = state.config.store_root.clone();
+    let aicx_home = state.config.aicx_home.clone();
     let scope = state.config.scope.normalized();
     let request_projects = merge_project_scopes(
         scope.project.as_deref(),
@@ -251,7 +252,7 @@ pub(super) async fn get_semantic_search(
     let query_clone = query.clone();
     let project_owned = request_projects.clone();
     let kind_filter_owned = kind_filter;
-    let project_scopes_owned = match search_project_scopes(&store_root, &project_owned) {
+    let project_scopes_owned = match search_project_scopes(&aicx_home, &project_owned) {
         Ok(scopes) => scopes,
         Err(error) => {
             return (
@@ -271,7 +272,7 @@ pub(super) async fn get_semantic_search(
             .map(|scope| scope.as_deref())
             .collect();
         crate::search_engine::try_semantic_search(
-            &store_root,
+            &aicx_home,
             &query_clone,
             limit,
             &project_scopes,
@@ -435,9 +436,9 @@ fn run_steer_search(params: SteerSearchParams, limit: usize) -> Result<SteerSear
     };
 
     let project_filters = merge_project_scopes(None, params.project.clone(), params.projects);
-    let store_root = crate::store::store_base_dir()?;
+    let aicx_home = crate::aicx_home::ensure()?;
     let mut metadatas = Vec::new();
-    for project in search_project_scopes(&store_root, &project_filters)? {
+    for project in search_project_scopes(&aicx_home, &project_filters)? {
         let filter = crate::steer_index::SteerFilter {
             run_id: params.run_id.as_deref(),
             prompt_id: params.prompt_id.as_deref(),

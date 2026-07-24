@@ -13,35 +13,33 @@ use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use crate::chunker::ChunkerConfig;
 #[cfg(feature = "app")]
 use crate::doctor::{DoctorOptions, DoctorReport};
 use crate::intents::{IntentExtraction, IntentsConfig};
+use crate::legacy_archive::{ReadContextChunk, StoredContextFile};
 #[cfg(feature = "app")]
 use crate::rank::FuzzyResult;
 use crate::sessions::{self, SessionInfo};
-use crate::store::{ReadContextChunk, StoreWriteSummary, StoredContextFile};
 #[cfg(feature = "app")]
 use crate::timeline::FrameKind;
-use crate::timeline::TimelineEntry;
 
 /// Configuration for an [`Aicx`] library handle.
 #[derive(Debug, Clone)]
 pub struct AicxConfig {
     /// AICX base directory. Defaults to `~/.aicx`.
-    pub store_root: PathBuf,
+    pub aicx_home: PathBuf,
 }
 
 impl AicxConfig {
     pub fn from_env() -> Result<Self> {
         Ok(Self {
-            store_root: crate::store::store_base_dir()?,
+            aicx_home: crate::aicx_home::ensure()?,
         })
     }
 
-    pub fn with_store_root(path: impl Into<PathBuf>) -> Self {
+    pub fn with_aicx_home(path: impl Into<PathBuf>) -> Self {
         Self {
-            store_root: path.into(),
+            aicx_home: path.into(),
         }
     }
 }
@@ -59,9 +57,9 @@ impl Aicx {
         })
     }
 
-    pub fn with_store_root(path: impl Into<PathBuf>) -> Self {
+    pub fn with_aicx_home(path: impl Into<PathBuf>) -> Self {
         Self {
-            config: AicxConfig::with_store_root(path),
+            config: AicxConfig::with_aicx_home(path),
         }
     }
 
@@ -69,12 +67,12 @@ impl Aicx {
         &self.config
     }
 
-    pub fn store_root(&self) -> &Path {
-        &self.config.store_root
+    pub fn aicx_home(&self) -> &Path {
+        &self.config.aicx_home
     }
 
     pub fn list_chunks(&self) -> Result<Vec<StoredContextFile>> {
-        crate::store::scan_context_files_at(&self.config.store_root)
+        crate::legacy_archive::scan_context_files_at(&self.config.aicx_home)
     }
 
     pub fn read_chunk(
@@ -82,36 +80,15 @@ impl Aicx {
         reference: impl AsRef<str>,
         max_chars: Option<usize>,
     ) -> Result<ReadContextChunk> {
-        crate::store::read_context_chunk_at(&self.config.store_root, reference.as_ref(), max_chars)
-    }
-
-    pub fn store_entries(
-        &self,
-        entries: &[TimelineEntry],
-        opts: &StoreOptions,
-    ) -> Result<StoreWriteSummary> {
-        self.store_entries_with_progress(entries, opts, |_, _| {})
-    }
-
-    pub fn store_entries_with_progress<F>(
-        &self,
-        entries: &[TimelineEntry],
-        opts: &StoreOptions,
-        progress: F,
-    ) -> Result<StoreWriteSummary>
-    where
-        F: FnMut(usize, usize),
-    {
-        crate::store::store_semantic_segments_at(
-            &self.config.store_root,
-            entries,
-            &opts.chunker,
-            progress,
+        crate::legacy_archive::read_context_chunk_at(
+            &self.config.aicx_home,
+            reference.as_ref(),
+            max_chars,
         )
     }
 
-    /// Run a semantic search against the canonical store's persistent vector
-    /// index. Fails fast with a descriptive error when any precondition is
+    /// Search the published source/extract generation. Fails fast with a
+    /// descriptive error when any precondition is
     /// missing (embedder unhydrated, index not built, dimension mismatch).
     #[cfg(feature = "app")]
     pub fn semantic_search(
@@ -124,7 +101,8 @@ impl Aicx {
         } else {
             opts.projects
         };
-        let project_scopes_owned = search_project_scopes(&self.config.store_root, &owned_projects)?;
+        let project_scopes_owned =
+            search_project_scopes(&self.config.aicx_home, &owned_projects, opts.project_match)?;
         let project_scopes: Vec<Option<&str>> = project_scopes_owned
             .iter()
             .map(|scope| scope.as_deref())
@@ -139,7 +117,7 @@ impl Aicx {
         };
 
         let outcome = crate::search_engine::try_semantic_search(
-            &self.config.store_root,
+            &self.config.aicx_home,
             query.as_ref(),
             opts.limit,
             &project_scopes,
@@ -158,7 +136,7 @@ impl Aicx {
     pub fn extract_intents(&self, config: &IntentsConfig) -> Result<IntentExtraction> {
         crate::intents::extract_intents_from_root_at_with_stats(
             config,
-            &self.config.store_root,
+            &self.config.aicx_home,
             chrono::Utc::now(),
         )
     }
@@ -171,24 +149,19 @@ impl Aicx {
         crate::intents::extract_intents_from_root_at_for_projects_with_stats(
             config,
             projects,
-            &self.config.store_root,
+            &self.config.aicx_home,
             chrono::Utc::now(),
         )
     }
 
     #[cfg(feature = "app")]
     pub async fn doctor(&self, opts: &DoctorOptions) -> Result<DoctorReport> {
-        crate::doctor::run_at(&self.config.store_root, opts).await
+        crate::doctor::run_at(&self.config.aicx_home, opts).await
     }
 
     pub fn index_status(&self, project: Option<&str>) -> Result<IndexStatus> {
-        index_status_at(&self.config.store_root, project)
+        index_status_at(&self.config.aicx_home, project)
     }
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct StoreOptions {
-    pub chunker: ChunkerConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -197,6 +170,7 @@ pub struct SearchOptions {
     pub limit: usize,
     pub projects: Vec<String>,
     pub project: Option<String>,
+    pub project_match: crate::legacy_archive::ProjectMatchMode,
     pub frame_kind: Option<FrameKind>,
     pub kind: Option<String>,
 }
@@ -208,6 +182,7 @@ impl Default for SearchOptions {
             limit: 10,
             projects: Vec::new(),
             project: None,
+            project_match: crate::legacy_archive::ProjectMatchMode::Exact,
             frame_kind: None,
             kind: None,
         }
@@ -215,13 +190,18 @@ impl Default for SearchOptions {
 }
 
 #[cfg(feature = "app")]
-fn search_project_scopes(store_root: &Path, projects: &[String]) -> Result<Vec<Option<String>>> {
+fn search_project_scopes(
+    aicx_home: &Path,
+    projects: &[String],
+    match_mode: crate::legacy_archive::ProjectMatchMode,
+) -> Result<Vec<Option<String>>> {
     if projects.is_empty() {
         return Ok(vec![None]);
     }
-    let resolved =
-        crate::store::resolve_filters_to_store_or_index_slugs_at_or_error(store_root, projects)?;
-    Ok(resolved.into_iter().map(Some).collect())
+    let corpus = crate::legacy_archive::project_identities_in_store_or_index_at(aicx_home)?;
+    let resolution =
+        crate::legacy_archive::require_project_resolution(projects, &corpus, match_mode)?;
+    Ok(resolution.selected.into_iter().map(Some).collect())
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -257,6 +237,10 @@ pub enum IndexReadiness {
     /// Canonical chunks exist that have not been represented in the committed
     /// semantic index yet.
     StaleIndex,
+    /// Pending-corpus census exceeded its hard deadline (or was skipped as
+    /// unbounded). Status still returns immediately with whatever is known
+    /// from catalog/CURRENT; operators must not wait on silent source walks.
+    PendingScanTimeout,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -299,16 +283,34 @@ pub fn index_status_at(base: &Path, project: Option<&str>) -> Result<IndexStatus
     index_status_at_with_sessions(base, project, None)
 }
 
+#[cfg(feature = "app")]
+fn catalog_projects_for_status(base: &Path) -> Vec<Option<String>> {
+    crate::catalog::read_entries_at(base)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|entry| entry.project)
+        .collect()
+}
+
+#[cfg(not(feature = "app"))]
+fn catalog_projects_for_status(_base: &Path) -> Vec<Option<String>> {
+    // The slim library profile intentionally excludes source discovery and
+    // catalog ingestion. Status remains bounded and reports legacy read-core
+    // state without pulling the app graph into `loctree-consumer`.
+    Vec::new()
+}
+
 fn index_status_at_with_sessions(
     base: &Path,
     project: Option<&str>,
     source_sessions_override: Option<&[SessionInfo]>,
 ) -> Result<IndexStatus> {
-    let chunks = crate::store::scan_context_files_project_at(base, project)?;
-    let newest_chunk = chunks
-        .iter()
-        .filter_map(|chunk| chunk.path.metadata().ok()?.modified().ok())
-        .max();
+    // Prefer the CURRENT hybrid generation — the same surface `aicx search`
+    // queries. Store cards + embeddings.ndjson are residual mill artifacts and
+    // must not be reported as readiness truth when CURRENT exists.
+    if let Some(status) = hybrid_current_index_status(base, project)? {
+        return Ok(status);
+    }
 
     let project_bucket = canonical_bucket_name(project);
     let semantic_index_path = semantic_index_path_for_bucket(base, &project_bucket);
@@ -324,11 +326,116 @@ fn index_status_at_with_sessions(
     let temp_index_bytes = temp_metadata.as_ref().map(|metadata| metadata.len());
     let semantic_index_present = semantic_index_mtime.is_some();
     let temp_index_present = temp_index_mtime.is_some();
+
+    // Boundedness first: when CURRENT/catalog/residual mill are all absent,
+    // report Missing immediately. Never walk live agent trees (codex 42 GB,
+    // claude 5.9 GB) just to print "missing" — audit measured >60 s hangs.
+    let catalog_entries = catalog_projects_for_status(base);
+    let residual_mill_present = residual_store_surface_present(base);
+    if catalog_entries.is_empty()
+        && !residual_mill_present
+        && !semantic_index_present
+        && !temp_index_present
+        && source_sessions_override.is_none()
+    {
+        return Ok(IndexStatus {
+            canonical_chunks: 0,
+            semantic_index_present: false,
+            semantic_index_path: None,
+            semantic_index_rows: 0,
+            newest_chunk_mtime: None,
+            source_sessions: 0,
+            newest_session_updated_at: None,
+            sessions_newer_than_chunks: 0,
+            sessions_without_timestamps: 0,
+            chunking_lag_secs: None,
+            semantic_index_mtime: None,
+            semantic_lag_secs: None,
+            pending_chunks: 0,
+            temp_index_present: false,
+            temp_index_path: None,
+            temp_index_rows: 0,
+            temp_index_mtime: None,
+            temp_index_bytes: None,
+            readiness: IndexReadiness::Missing,
+            backend: "none".to_string(),
+            project_bucket,
+            committed_at: None,
+        });
+    }
+
+    // Catalog-only path: durable session identity without residual mill walk.
+    // Source-of-truth census of live agent roots is intentionally NOT done
+    // here — that was the hang. Operators admit sources via `catalog rebuild`.
+    if !catalog_entries.is_empty()
+        && !residual_mill_present
+        && !semantic_index_present
+        && !temp_index_present
+        && source_sessions_override.is_none()
+    {
+        let project_filter = project.map(str::trim).filter(|value| !value.is_empty());
+        let catalog_in_scope = match project_filter {
+            None => catalog_entries.len(),
+            Some(filter) => catalog_entries
+                .iter()
+                .filter(|project| {
+                    project
+                        .as_deref()
+                        .is_some_and(|p| p.eq_ignore_ascii_case(filter))
+                })
+                .count(),
+        };
+        return Ok(IndexStatus {
+            canonical_chunks: 0,
+            semantic_index_present: false,
+            semantic_index_path: None,
+            semantic_index_rows: 0,
+            newest_chunk_mtime: None,
+            source_sessions: catalog_in_scope,
+            newest_session_updated_at: None,
+            sessions_newer_than_chunks: catalog_in_scope,
+            sessions_without_timestamps: 0,
+            chunking_lag_secs: None,
+            semantic_index_mtime: None,
+            semantic_lag_secs: None,
+            pending_chunks: catalog_in_scope,
+            temp_index_present: false,
+            temp_index_path: None,
+            temp_index_rows: 0,
+            temp_index_mtime: None,
+            temp_index_bytes: None,
+            readiness: IndexReadiness::Missing,
+            backend: "catalog_only".to_string(),
+            project_bucket: project_filter
+                .map(|filter| canonical_bucket_name(Some(filter)))
+                .unwrap_or_else(|| "_all".to_string()),
+            committed_at: None,
+        });
+    }
+
+    let chunks = if residual_mill_present {
+        crate::legacy_archive::scan_context_files_project_at(base, project).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let newest_chunk = chunks
+        .iter()
+        .filter_map(|chunk| chunk.path.metadata().ok()?.modified().ok())
+        .max();
+
+    // Prefer explicit override (tests) or catalog counts. Live agent-tree
+    // discovery is last-resort and hard-deadline bounded.
     let discovered_sessions;
     let source_sessions = match source_sessions_override {
         Some(sessions) => sessions,
+        None if !catalog_entries.is_empty() => {
+            // Empty slice: chunking lag uses catalog counts injected below.
+            discovered_sessions = Vec::new();
+            &discovered_sessions
+        }
         None => {
-            discovered_sessions = discover_source_sessions_for_status(base, project, newest_chunk);
+            discovered_sessions =
+                discover_source_sessions_for_status_bounded(base, project, newest_chunk);
             &discovered_sessions
         }
     };
@@ -347,10 +454,34 @@ fn index_status_at_with_sessions(
 
     let pending_chunks = chunks.len().saturating_sub(semantic_index_rows);
 
+    // When we skipped live discovery but have catalog rows, surface catalog
+    // counts as source_sessions so status is still useful.
+    let catalog_count = if source_sessions_override.is_none() && !catalog_entries.is_empty() {
+        let project_filter = project.map(str::trim).filter(|value| !value.is_empty());
+        match project_filter {
+            None => catalog_entries.len(),
+            Some(filter) => catalog_entries
+                .iter()
+                .filter(|project| {
+                    project
+                        .as_deref()
+                        .is_some_and(|p| p.eq_ignore_ascii_case(filter))
+                })
+                .count(),
+        }
+    } else {
+        chunking.source_sessions
+    };
+    let sessions_newer = if source_sessions_override.is_none() && !catalog_entries.is_empty() {
+        catalog_count.saturating_sub(chunks.len())
+    } else {
+        chunking.sessions_newer_than_chunks
+    };
+
     let readiness = match (semantic_index_present, temp_index_present) {
         (false, true) => IndexReadiness::Pending,
         (false, false) => IndexReadiness::Missing,
-        (true, _) if chunking.sessions_newer_than_chunks > 0 => IndexReadiness::StaleChunks,
+        (true, _) if sessions_newer > 0 => IndexReadiness::StaleChunks,
         (true, _) if pending_chunks > 0 || semantic_lag_secs.unwrap_or(0) > 0 => {
             IndexReadiness::StaleIndex
         }
@@ -364,11 +495,11 @@ fn index_status_at_with_sessions(
         semantic_index_path: semantic_index_present.then(|| path_for_json(&semantic_index_path)),
         semantic_index_rows,
         newest_chunk_mtime: newest_chunk.map(system_time_to_rfc3339),
-        source_sessions: chunking.source_sessions,
+        source_sessions: catalog_count,
         newest_session_updated_at: chunking
             .newest_session_updated_at
             .map(|value| value.to_rfc3339()),
-        sessions_newer_than_chunks: chunking.sessions_newer_than_chunks,
+        sessions_newer_than_chunks: sessions_newer,
         sessions_without_timestamps: chunking.sessions_without_timestamps,
         chunking_lag_secs: chunking.chunking_lag_secs,
         semantic_index_mtime: committed_at.clone(),
@@ -386,6 +517,122 @@ fn index_status_at_with_sessions(
     })
 }
 
+/// True when residual per-frame mill dirs still exist under the AICX home.
+fn residual_store_surface_present(base: &Path) -> bool {
+    base.join(crate::legacy_archive::LEGACY_CARDS_DIRNAME)
+        .is_dir()
+        || base
+            .join(crate::legacy_archive::NON_REPOSITORY_CONTEXTS)
+            .is_dir()
+}
+
+/// Report readiness from hybrid CURRENT when it is the search truth surface.
+///
+/// Returns `Ok(None)` when no usable CURRENT generation exists under `base`,
+/// so callers can fall back to residual store/NDJSON status for migration.
+#[cfg(feature = "app")]
+fn hybrid_current_index_status(base: &Path, project: Option<&str>) -> Result<Option<IndexStatus>> {
+    // Source-driven publish always lands in the global `_all` bucket; project
+    // is a search-time filter, not a separate generation.
+    let hybrid_root = base.join("indexed").join("_all").join("hybrid");
+    if !hybrid_root.is_dir() {
+        return Ok(None);
+    }
+    let generation_dir = crate::vector_index::resolve_hybrid_generation_dir(&hybrid_root);
+    let manifest_path = generation_dir.join("manifest.json");
+    if !manifest_path.is_file() {
+        return Ok(None);
+    }
+    let manifest = match aicx_retrieve::Manifest::read_from_path(&manifest_path) {
+        Ok(manifest) => manifest,
+        Err(_) => return Ok(None),
+    };
+    // Search uses CURRENT for any generation with a lexical corpus. Prefer the
+    // source-driven lexical shape (`optional_not_built`) but also accept denser
+    // generations so status and search never disagree about "is there an index".
+    if manifest.lexical_doc_count == 0 {
+        return Ok(None);
+    }
+
+    let catalog_entries = catalog_projects_for_status(base);
+    let catalog_total = catalog_entries.len();
+    let project_filter = project.map(str::trim).filter(|value| !value.is_empty());
+    let catalog_in_scope = match project_filter {
+        None => catalog_total,
+        Some(filter) => catalog_entries
+            .iter()
+            .filter(|project| {
+                project
+                    .as_deref()
+                    .is_some_and(|project| project.eq_ignore_ascii_case(filter))
+            })
+            .count(),
+    };
+
+    let committed_at = Some(manifest.build_completed_at.to_rfc3339());
+    let generation_mtime = manifest_path
+        .metadata()
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
+        .map(system_time_to_rfc3339)
+        .or_else(|| committed_at.clone());
+
+    // Catalog rows beyond CURRENT lexical docs mean sessions are admitted but
+    // not yet published — stale index relative to the durable catalog.
+    let pending = catalog_total.saturating_sub(manifest.lexical_doc_count);
+    let readiness = if pending > 0 {
+        IndexReadiness::StaleIndex
+    } else {
+        IndexReadiness::Ready
+    };
+
+    let backend = if manifest.dense_kind == "optional_not_built" {
+        "hybrid_lexical"
+    } else {
+        "hybrid"
+    };
+
+    Ok(Some(IndexStatus {
+        // For the extract-era store, "chunks" == signal session documents.
+        canonical_chunks: manifest.lexical_doc_count,
+        semantic_index_present: true,
+        semantic_index_path: Some(path_for_json(&manifest_path)),
+        semantic_index_rows: manifest.lexical_doc_count,
+        newest_chunk_mtime: generation_mtime.clone(),
+        source_sessions: catalog_in_scope,
+        newest_session_updated_at: None,
+        sessions_newer_than_chunks: 0,
+        sessions_without_timestamps: 0,
+        chunking_lag_secs: None,
+        semantic_index_mtime: generation_mtime,
+        semantic_lag_secs: None,
+        pending_chunks: pending,
+        temp_index_present: false,
+        temp_index_path: None,
+        temp_index_rows: 0,
+        temp_index_mtime: None,
+        temp_index_bytes: None,
+        readiness,
+        backend: backend.to_string(),
+        // Surface the requested filter label for operators, but the generation
+        // is always the global CURRENT under `_all`.
+        project_bucket: project_filter
+            .map(|filter| canonical_bucket_name(Some(filter)))
+            .unwrap_or_else(|| "_all".to_string()),
+        committed_at,
+    }))
+}
+
+/// Slim (`loctree-consumer`) builds carry no retrieval surface, so the hybrid
+/// CURRENT manifest cannot be read; status falls back to residual store/NDJSON.
+#[cfg(not(feature = "app"))]
+fn hybrid_current_index_status(
+    _base: &Path,
+    _project: Option<&str>,
+) -> Result<Option<IndexStatus>> {
+    Ok(None)
+}
+
 #[derive(Debug, Clone)]
 struct ChunkingLag {
     source_sessions: usize,
@@ -395,12 +642,16 @@ struct ChunkingLag {
     chunking_lag_secs: Option<u64>,
 }
 
-fn discover_source_sessions_for_status(
+/// Bounded residual-mill census. Hard deadline: never block status >2s on a
+/// live agent-tree walk (operator home can hold tens of GB of sessions).
+const STATUS_SESSION_SCAN_DEADLINE: Duration = Duration::from_secs(2);
+
+fn discover_source_sessions_for_status_bounded(
     base: &Path,
     project: Option<&str>,
     newest_chunk: Option<SystemTime>,
 ) -> Vec<SessionInfo> {
-    let Ok(active_store_root) = crate::store::store_base_dir() else {
+    let Ok(active_store_root) = crate::aicx_home::ensure() else {
         return Vec::new();
     };
     if active_store_root != base {
@@ -410,10 +661,22 @@ fn discover_source_sessions_for_status(
         return Vec::new();
     };
 
-    sessions::discover_sessions_at(&home, newest_chunk, None, None)
-        .into_iter()
-        .filter(|session| status_session_matches_project(project, session))
-        .collect()
+    // Spawn the census on a helper thread and abandon it on deadline. Status
+    // must return; a hung walk is worse than an empty pending set.
+    let project = project.map(str::to_string);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let home = home.clone();
+    std::thread::spawn(move || {
+        let sessions = sessions::discover_sessions_at(&home, newest_chunk, None, None)
+            .into_iter()
+            .filter(|session| status_session_matches_project(project.as_deref(), session))
+            .collect::<Vec<_>>();
+        let _ = tx.send(sessions);
+    });
+    // Deadline exceeded → empty vec; readiness already reflects on-disk
+    // artifacts. The abandoned thread exits when discovery finishes.
+    rx.recv_timeout(STATUS_SESSION_SCAN_DEADLINE)
+        .unwrap_or_default()
 }
 
 fn status_session_matches_project(project: Option<&str>, session: &SessionInfo) -> bool {
@@ -535,12 +798,12 @@ mod tests {
     use chrono::{TimeZone, Utc};
 
     #[test]
-    fn client_can_scan_empty_store_root() {
+    fn client_can_scan_empty_aicx_home() {
         let root = std::env::temp_dir().join(format!("aicx-api-empty-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).expect("create root");
 
-        let client = Aicx::with_store_root(&root);
+        let client = Aicx::with_aicx_home(&root);
         let chunks = client.list_chunks().expect("scan chunks");
         assert!(chunks.is_empty());
 
@@ -675,6 +938,33 @@ mod tests {
     }
 
     #[test]
+    fn index_status_missing_is_immediate_without_live_source_census() {
+        // Audit P1: empty AICX home must not hang scanning agent trees.
+        let root = std::env::temp_dir().join(format!(
+            "aicx-api-index-status-fast-missing-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create root");
+
+        let started = std::time::Instant::now();
+        // None override = production path (no forced empty session list).
+        let status = index_status_at(&root, None).expect("index status");
+        let wall = started.elapsed();
+
+        assert_eq!(status.readiness, IndexReadiness::Missing);
+        assert_eq!(status.backend, "none");
+        assert_eq!(status.canonical_chunks, 0);
+        assert!(
+            wall < std::time::Duration::from_secs(2),
+            "missing status must return immediately, got {wall:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn index_status_canonicalizes_project_bucket_slug() {
         let root = std::env::temp_dir().join(format!(
             "aicx-api-index-status-bucket-{}-{}",
@@ -731,112 +1021,78 @@ mod tests {
     }
 
     #[test]
-    fn index_status_marks_stale_chunks_when_sessions_are_newer_than_chunks() {
+    fn index_status_prefers_hybrid_current_over_ndjson_mill() {
         let root = std::env::temp_dir().join(format!(
-            "aicx-api-index-status-stale-chunks-{}-{}",
+            "aicx-api-hybrid-status-{}-{}",
             std::process::id(),
             chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
         ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).expect("create root");
 
-        let older = Utc.with_ymd_and_hms(2026, 6, 11, 12, 33, 0).unwrap();
-        let newer = Utc.with_ymd_and_hms(2026, 6, 12, 9, 28, 0).unwrap();
-        let entry = TimelineEntry {
-            timestamp: older,
-            agent: "claude".to_string(),
-            session_id: "old-session".to_string(),
-            role: "user".to_string(),
-            message: "old chunk".to_string(),
-            frame_kind: Some(FrameKind::UserMsg),
-            branch: None,
-            cwd: Some("/Users/me/vc-workspace/vetcoders/aicx".to_string()),
-            timestamp_source: None,
-            source_path: None,
-            source_sha256: None,
-            source_line_span: None,
-        };
-        let summary = crate::store::store_semantic_segments_at(
-            &root,
-            &[entry],
-            &ChunkerConfig::default(),
-            |_, _| {},
-        )
-        .expect("store chunk");
-        let index_dir = root.join("indexed").join("_all");
-        std::fs::create_dir_all(&index_dir).expect("create index dir");
-        let index_path = index_dir.join("embeddings.ndjson");
+        // Residual mill NDJSON that must NOT win status when CURRENT exists.
+        let ndjson_dir = root.join("indexed").join("_all");
+        std::fs::create_dir_all(&ndjson_dir).expect("ndjson dir");
         std::fs::write(
-            &index_path,
-            "{\"schema_version\":\"1.0\"}\n{\"id\":\"old\"}\n",
+            ndjson_dir.join("embeddings.ndjson"),
+            "{\"schema_version\":\"1.0\"}\n{\"id\":\"stale-mill-row\"}\n",
         )
-        .expect("write index");
+        .expect("write residual ndjson");
 
-        let older_file_time = filetime::FileTime::from_unix_time(older.timestamp(), 0);
-        for path in &summary.written_paths {
-            filetime::set_file_mtime(path, older_file_time).expect("set chunk mtime");
-        }
-        filetime::set_file_mtime(&index_path, older_file_time).expect("set index mtime");
-
-        let session = SessionInfo {
-            session_id: "fresh".to_string(),
-            agent: "claude".to_string(),
-            project: Some("aicx".to_string()),
-            repo_path: Some("/Users/me/vc-workspace/vetcoders/aicx".to_string()),
-            started_at: Some(newer),
-            updated_at: Some(newer),
-            message_count: 1,
-            user_message_count: 1,
-            agent_message_count: 0,
-            title: Some("fresh work".to_string()),
-            source_path: root.join("fresh.jsonl"),
-            association: crate::sessions::Association::Exact,
-            temporal_confidence: crate::sessions::TemporalConfidence::Full,
+        let gen_name = "g-2026-07-23T10-00-00Z-teststatus";
+        let gen_dir = root
+            .join("indexed")
+            .join("_all")
+            .join("hybrid")
+            .join("generations")
+            .join(gen_name);
+        std::fs::create_dir_all(&gen_dir).expect("generation dir");
+        let manifest = aicx_retrieve::Manifest {
+            schema_version: "2.0".to_string(),
+            generation_id: "g-2026-07-23T10:00:00Z-teststatus".to_string(),
+            source_chunk_count: 3,
+            source_hash_blake3: "abc".to_string(),
+            embedder_model: "optional".to_string(),
+            embedder_url_hash: "not_built".to_string(),
+            embedder_dim: 0,
+            embedder_distance: "cosine".to_string(),
+            dense_count: 0,
+            dense_kind: "optional_not_built".to_string(),
+            lexical_commit_id: "tantivy_test".to_string(),
+            lexical_doc_count: 3,
+            build_started_at: Utc.with_ymd_and_hms(2026, 7, 23, 10, 0, 0).unwrap(),
+            build_completed_at: Utc.with_ymd_and_hms(2026, 7, 23, 10, 0, 12).unwrap(),
+            build_wall_seconds: 12,
+            fusion_algorithm: "rrf".to_string(),
+            fusion_k: 60,
         };
+        manifest
+            .write_to_path(&gen_dir.join("manifest.json"))
+            .expect("write hybrid manifest");
+        std::fs::write(
+            root.join("indexed")
+                .join("_all")
+                .join("hybrid")
+                .join("CURRENT"),
+            format!("{gen_name}\n"),
+        )
+        .expect("write CURRENT pointer");
 
-        let status =
-            index_status_at_with_sessions(&root, None, Some(&[session])).expect("index status");
-
-        assert_eq!(status.source_sessions, 1);
-        assert_eq!(status.sessions_newer_than_chunks, 1);
-        assert_eq!(status.sessions_without_timestamps, 0);
-        assert_eq!(status.newest_session_updated_at, Some(newer.to_rfc3339()));
-        assert_eq!(status.readiness, IndexReadiness::StaleChunks);
-        assert!(status.chunking_lag_secs.unwrap() > 0);
-
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn client_can_store_entries_without_cli_globals() {
-        let root = std::env::temp_dir().join(format!("aicx-api-store-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).expect("create root");
-
-        let client = Aicx::with_store_root(&root);
-        let entries = vec![TimelineEntry {
-            timestamp: Utc.with_ymd_and_hms(2026, 5, 6, 16, 0, 0).unwrap(),
-            agent: "codex".to_string(),
-            session_id: "api-lib-session".to_string(),
-            role: "user".to_string(),
-            message: "Decision: expose AICX as a real library surface.".to_string(),
-            frame_kind: Some(FrameKind::UserMsg),
-            branch: None,
-            cwd: None,
-            timestamp_source: None,
-            source_path: None,
-            source_sha256: None,
-            source_line_span: None,
-        }];
-
-        let summary = client
-            .store_entries(&entries, &StoreOptions::default())
-            .expect("store entries through public facade");
-
-        assert_eq!(summary.total_entries, 1);
-        assert_eq!(summary.written_paths.len(), 1);
-        assert!(summary.written_paths[0].starts_with(root.join("non-repository-contexts")));
-        assert_eq!(client.list_chunks().expect("scan chunks").len(), 1);
+        let status = index_status_at(&root, None).expect("hybrid status");
+        assert_eq!(status.backend, "hybrid_lexical");
+        assert_eq!(status.readiness, IndexReadiness::Ready);
+        assert_eq!(status.semantic_index_rows, 3);
+        assert_eq!(status.canonical_chunks, 3);
+        assert!(
+            status
+                .semantic_index_path
+                .as_deref()
+                .is_some_and(|path| path.contains("manifest.json")
+                    && path.contains("generations")
+                    && !path.contains("embeddings.ndjson")),
+            "status must point at CURRENT generation, not residual ndjson: {:?}",
+            status.semantic_index_path
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }

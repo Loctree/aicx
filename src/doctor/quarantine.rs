@@ -1,15 +1,18 @@
 //! Recoverable quarantine machinery: empty-body chunk detection and
-//! quarantine, suspicious-bucket quarantine, manifest-driven restore,
-//! and reviewable remediation scripts. Doctor never deletes store
-//! contents; every move lands under `~/.aicx/quarantine/`.
+//! quarantine, suspicious-bucket quarantine, dead canonical-projection
+//! stage quarantine, manifest-driven restore, and reviewable remediation
+//! scripts. Doctor never deletes store contents; every move lands under
+//! `~/.aicx/quarantine/`. Final deletion of quarantined payload stays
+//! with the operator, guided by the written manifest (the verified
+//! recovery reference).
 
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use crate::legacy_archive;
 use crate::sanitize;
-use crate::store;
 
 use super::types::{QuarantineManifest, QuarantineManifestItem, QuarantineRestoreReport};
 
@@ -23,7 +26,7 @@ pub(crate) struct EmptyBodyReport {
 }
 
 pub(crate) fn empty_body_report(base: &Path) -> EmptyBodyReport {
-    let files = store::scan_context_files_at(base).unwrap_or_default();
+    let files = legacy_archive::scan_context_files_at(base).unwrap_or_default();
     let mut report = EmptyBodyReport {
         total: files.len(),
         ..Default::default()
@@ -36,7 +39,7 @@ pub(crate) fn empty_body_report(base: &Path) -> EmptyBodyReport {
         let Ok(content) = sanitize::read_to_string_validated(&file.path) else {
             continue;
         };
-        if !store::chunk_body_is_empty(&content)
+        if !legacy_archive::chunk_body_is_empty(&content)
             && crate::card_header::card_body(&content).trim().len() >= 50
         {
             continue;
@@ -49,7 +52,7 @@ pub(crate) fn empty_body_report(base: &Path) -> EmptyBodyReport {
         }
         // Sidecar metadata is authoritative; the card header (bracket or
         // frontmatter) only fills in for sidecar-less legacy chunks.
-        let frame_kind = store::load_sidecar(&file.path)
+        let frame_kind = legacy_archive::load_sidecar(&file.path)
             .and_then(|sidecar| sidecar.frame_kind)
             .or_else(|| {
                 crate::card_header::parse_card_header(&content).and_then(|header| header.frame_kind)
@@ -222,13 +225,13 @@ pub(crate) fn empty_body_quarantine_destination(
     quarantine_root: &Path,
     path: &Path,
 ) -> Result<PathBuf> {
-    // Empty-body chunks live under either the canonical store
+    // Empty-body chunks live under either the retired card archive
     // (`~/.aicx/store/<org>/<repo>/…`) or the non-repository fallback
     // (`~/.aicx/non-repository-contexts/<date>/…`); both roots are
-    // scanned by `store::scan_context_files_at`. Previously the prefix
+    // scanned by `legacy_archive::scan_context_files_at`. Previously the prefix
     // check only accepted `~/.aicx/store/`, which made
     // `aicx doctor --prune-empty-bodies` crash with
-    // `empty-body chunk is outside store root` the moment any candidate
+    // `empty-body chunk is outside archive root` the moment any candidate
     // came from the non-repository corpus (operator observed ~4418
     // candidates on prod). Accept any path under `base` (the canonical
     // `~/.aicx/` home) and preserve its `base`-relative layout under
@@ -266,7 +269,7 @@ pub(crate) fn file_sha256(path: &Path) -> Result<String> {
 }
 
 pub fn restore_quarantine(slug: &str) -> Result<QuarantineRestoreReport> {
-    let base = store::store_base_dir().context("Failed to resolve aicx store base directory")?;
+    let base = crate::aicx_home::ensure().context("Failed to resolve AICX home")?;
     restore_quarantine_at(&base, slug)
 }
 
@@ -432,10 +435,10 @@ pub fn format_restore_text(report: &QuarantineRestoreReport) -> String {
 }
 
 pub fn render_rebuild_sidecars_script(base: &Path) -> Result<String> {
-    let files = store::scan_context_files_at(base).unwrap_or_default();
+    let files = legacy_archive::scan_context_files_at(base).unwrap_or_default();
     let mut out = String::from("#!/usr/bin/env bash\nset -euo pipefail\n\n");
     out.push_str(
-        "# Review before running. Rebuilds missing sidecars by forcing a corpus rescan.\n",
+        "# Review before running. Card-mill sidecars are retired; rebuild identity + index.\n",
     );
     let missing = files
         .iter()
@@ -447,9 +450,11 @@ pub fn render_rebuild_sidecars_script(base: &Path) -> Result<String> {
         out.push_str("# No missing sidecars detected.\n");
     } else {
         for path in missing {
-            out.push_str(&format!("# missing: {path}\n"));
+            out.push_str(&format!("# missing (legacy card path): {path}\n"));
         }
-        out.push_str("aicx store --full-rescan\n");
+        // `aicx store` is deleted — recovery is catalog + source index.
+        out.push_str("aicx catalog rebuild\n");
+        out.push_str("aicx index --cache-extracts\n");
     }
     Ok(out)
 }
@@ -465,6 +470,115 @@ pub(crate) fn shell_quote_path(path: &Path) -> String {
     let value = value.strip_prefix(r"\\?\").unwrap_or(&value);
     let value = value.replace('\\', "/");
     format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct ProjectionStageQuarantineReport {
+    pub(crate) quarantine_root: Option<PathBuf>,
+    pub(crate) manifest_path: Option<PathBuf>,
+    pub(crate) moved: Vec<String>,
+    pub(crate) left_in_place: Vec<String>,
+    pub(crate) failures: Vec<String>,
+}
+
+/// Quarantine every quarantine-eligible canonical-projection stage found
+/// under `<base>/store/`. Recoverable move only (rename into
+/// `<base>/quarantine/projection-stages-<timestamp>/` with a restore
+/// manifest); stages whose owner is live, stale, or unprovable are left in
+/// place and reported. Idempotent: a second pass finds no eligible stages
+/// and does nothing.
+pub(crate) fn quarantine_projection_stages_at(
+    base: &Path,
+    dry_run: bool,
+) -> Result<ProjectionStageQuarantineReport> {
+    use crate::legacy_archive::canonical_projection::inspect_projection_stages_at;
+
+    let mut report = ProjectionStageQuarantineReport::default();
+    let inventory = inspect_projection_stages_at(&base.join("store"));
+    if inventory.is_empty() {
+        return Ok(report);
+    }
+    let timestamp = empty_body_quarantine_timestamp();
+    let slug = format!("projection-stages-{timestamp}");
+    let quarantine_root = base.join("quarantine").join(&slug);
+    let mut items = Vec::new();
+    for entry in inventory {
+        let label = entry.class.as_str();
+        if !entry.class.quarantine_eligible() {
+            report.left_in_place.push(format!(
+                "{label}: {} ({})",
+                entry.path.display(),
+                entry.reason
+            ));
+            continue;
+        }
+        if dry_run {
+            report.moved.push(format!(
+                "[dry-run] would quarantine {label} projection stage {}",
+                entry.path.display()
+            ));
+            continue;
+        }
+        let Some(name) = entry.path.file_name() else {
+            report.failures.push(format!(
+                "{label}: unnamable stage path {}",
+                entry.path.display()
+            ));
+            continue;
+        };
+        let dst = quarantine_root.join(name);
+        if dst.exists() {
+            report.failures.push(format!(
+                "{label}: quarantine destination already exists: {}",
+                dst.display()
+            ));
+            continue;
+        }
+        if let Err(e) = std::fs::create_dir_all(&quarantine_root)
+            .context("create projection-stage quarantine root")
+        {
+            report.failures.push(format!("{label}: {e:#}"));
+            continue;
+        }
+        match std::fs::rename(&entry.path, &dst) {
+            Ok(()) => {
+                report.moved.push(format!(
+                    "quarantined {label} projection stage {} to {}",
+                    entry.path.display(),
+                    dst.display()
+                ));
+                items.push(QuarantineManifestItem {
+                    original_path: entry.path.clone(),
+                    quarantined_path: dst,
+                    // Directory move: restore is rename-based; the lease
+                    // inside carries the payload's source hash as the
+                    // content-level recovery reference.
+                    sha256: String::new(),
+                });
+            }
+            Err(e) => report.failures.push(format!(
+                "{label}: rename {} failed: {e}",
+                entry.path.display()
+            )),
+        }
+    }
+
+    if !items.is_empty() {
+        let manifest = QuarantineManifest {
+            schema_version: 1,
+            category: "projection_stages".to_string(),
+            slug,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            items,
+        };
+        let manifest_path = quarantine_root.join("manifest.json");
+        std::fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)
+            .with_context(|| format!("write quarantine manifest {}", manifest_path.display()))?;
+        report.quarantine_root = Some(quarantine_root);
+        report.manifest_path = Some(manifest_path);
+    }
+
+    Ok(report)
 }
 
 pub(crate) fn quarantine_bucket(store_root: &Path, bucket_name: &str) -> Result<PathBuf> {

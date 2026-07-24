@@ -375,14 +375,59 @@ def materialize_donor(case: Case, oracle_out: Path) -> dict[str, Any]:
     return document
 
 
+
+def materialize_aicx(case: Case) -> dict[str, Any]:
+    """Run the AICX parser SUT and return an oracle envelope.
+
+    Transcript Builder is the *oracle/donor*, not the subject under test.
+    """
+    expected = load_json(case.expected)
+    if not isinstance(expected, dict):
+        raise OracleError(f"case {case.id}: expected golden must be an object")
+    session_id = expected.get("session_id") or "oracle-envelope"
+    command = [
+        "cargo",
+        "run",
+        "-q",
+        "-p",
+        "aicx-parser",
+        "--example",
+        "oracle_envelope",
+        "--",
+        "--agent",
+        case.agent,
+        "--fixture",
+        str(case.fixture),
+        "--session-id",
+        str(session_id),
+    ]
+    completed = run_checked(case.id, command)
+    try:
+        document = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise OracleError(
+            f"case {case.id}: AICX envelope is not JSON: {exc}; stdout={completed.stdout[:400]!r}"
+        ) from exc
+    if not isinstance(document, dict):
+        raise OracleError(f"case {case.id}: AICX envelope root must be an object")
+    return document
+
+
 def run_all(cases: list[Case]) -> None:
     donor_cases = [case for case in cases if case.oracle_kind == "transcript_builder"]
     native_cases = [case for case in cases if case.oracle_kind == "rust_golden"]
     with tempfile.TemporaryDirectory(prefix="aicx-parser-oracle-all-") as tmp:
         root = Path(tmp)
         for case in donor_cases:
-            actual = materialize_donor(case, root / case.id)
-            compare_case(case, actual)
+            # SUT first: AICX must match the frozen golden.
+            sut = materialize_aicx(case)
+            compare_case(case, sut)
+            print(f"parser oracle AICX SUT comparison: PASS ({case.id})")
+            # Donor cross-check: Transcript Builder still matches the same golden.
+            # Negative control is implicit in self_test corruption paths; here we
+            # only refuse a world where donor and golden diverge silently.
+            donor = materialize_donor(case, root / case.id)
+            compare_case(case, donor)
             print(f"parser oracle donor comparison: PASS ({case.id})")
 
     native_tests = {
@@ -407,7 +452,7 @@ def run_all(cases: list[Case]) -> None:
 
     print(
         "parser oracle aggregate: PASS "
-        f"({len(donor_cases)} donor adapters + {len(native_cases)} native golden)"
+        f"({len(donor_cases)} AICX+donor adapters + {len(native_cases)} native golden)"
     )
 
 

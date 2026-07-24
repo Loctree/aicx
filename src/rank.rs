@@ -14,10 +14,10 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
+use crate::legacy_archive;
 use crate::oracle::OracleStatus;
 use crate::sanitize;
 use crate::sanitize::normalize_query;
-use crate::store;
 use crate::timeline::FrameKind;
 
 // ============================================================================
@@ -459,10 +459,10 @@ fn truncate_search_match(line: &str, max_chars: usize) -> String {
 }
 
 fn select_search_candidates(
-    files: Vec<store::StoredContextFile>,
+    files: Vec<legacy_archive::StoredContextFile>,
     query_terms: &[&str],
     limit: usize,
-) -> Vec<store::StoredContextFile> {
+) -> Vec<legacy_archive::StoredContextFile> {
     if query_terms.is_empty() {
         return files;
     }
@@ -509,7 +509,7 @@ fn select_search_candidates(
         .collect()
 }
 
-fn metadata_match_count(file: &store::StoredContextFile, query_terms: &[&str]) -> usize {
+fn metadata_match_count(file: &legacy_archive::StoredContextFile, query_terms: &[&str]) -> usize {
     let metadata = metadata_search_text(file);
     query_terms
         .iter()
@@ -517,7 +517,7 @@ fn metadata_match_count(file: &store::StoredContextFile, query_terms: &[&str]) -
         .count()
 }
 
-fn metadata_search_text(file: &store::StoredContextFile) -> String {
+fn metadata_search_text(file: &legacy_archive::StoredContextFile) -> String {
     normalize_query(&format!(
         "{} {} {} {} {} {}",
         file.project,
@@ -530,7 +530,7 @@ fn metadata_search_text(file: &store::StoredContextFile) -> String {
 }
 
 fn metadata_matched_lines(
-    file: &store::StoredContextFile,
+    file: &legacy_archive::StoredContextFile,
     metadata_text: &str,
     query_terms: &[&str],
 ) -> Vec<String> {
@@ -541,7 +541,7 @@ fn metadata_matched_lines(
     metadata_line(file)
 }
 
-fn metadata_line(file: &store::StoredContextFile) -> Vec<String> {
+fn metadata_line(file: &legacy_archive::StoredContextFile) -> Vec<String> {
     vec![format!(
         "[metadata] project: {} | agent: {} | date: {} | kind: {} | path: {}",
         file.project,
@@ -564,7 +564,7 @@ fn metadata_covers_query(metadata_text: &str, query_terms: &[&str]) -> bool {
 }
 
 fn metadata_only_result(
-    stored_file: store::StoredContextFile,
+    stored_file: legacy_archive::StoredContextFile,
     metadata_text: &str,
     query_terms: &[&str],
 ) -> FuzzyResult {
@@ -599,13 +599,13 @@ fn metadata_only_result(
     }
 }
 
-fn infer_project_filter_from_query(store_root: &Path, query_terms: &[&str]) -> Option<String> {
+fn infer_project_filter_from_query(aicx_home: &Path, query_terms: &[&str]) -> Option<String> {
     let tokens = project_hint_tokens(query_terms);
     if tokens.is_empty() {
         return None;
     }
 
-    let canonical_root = store_root.join(store::CANONICAL_STORE_DIRNAME);
+    let canonical_root = aicx_home.join(legacy_archive::LEGACY_CARDS_DIRNAME);
     let mut scores: HashMap<String, u8> = HashMap::new();
 
     let Ok(org_entries) = fs::read_dir(canonical_root) else {
@@ -706,7 +706,7 @@ fn compact_project_token(value: &str) -> String {
 
 /// Fuzzy-search stored chunk files with normalized matching and quality scoring.
 pub fn fuzzy_search_store(
-    store_root: &Path,
+    aicx_home: &Path,
     query: &str,
     limit: usize,
     project_filters: &[Option<&str>],
@@ -721,7 +721,7 @@ pub fn fuzzy_search_store(
     let mut scanned = 0usize;
     for scope in scopes {
         let (mut results, scope_scanned) =
-            fuzzy_search_store_one(store_root, query, limit, scope, frame_kind_filter)?;
+            fuzzy_search_store_one(aicx_home, query, limit, scope, frame_kind_filter)?;
         scanned += scope_scanned;
         merged.append(&mut results);
     }
@@ -731,7 +731,7 @@ pub fn fuzzy_search_store(
 }
 
 fn fuzzy_search_store_one(
-    store_root: &Path,
+    aicx_home: &Path,
     query: &str,
     limit: usize,
     project_filter: Option<&str>,
@@ -744,14 +744,15 @@ fn fuzzy_search_store_one(
     let mut total_scanned = 0usize;
 
     let inferred_project_filter = if project_filter.is_none() {
-        infer_project_filter_from_query(store_root, &query_terms)
+        infer_project_filter_from_query(aicx_home, &query_terms)
     } else {
         None
     };
     let effective_project_filter = project_filter.or(inferred_project_filter.as_deref());
 
-    let stored_files = store::scan_context_files_project_at(store_root, effective_project_filter)
-        .map_err(io::Error::other)?;
+    let stored_files =
+        legacy_archive::scan_context_files_project_at(aicx_home, effective_project_filter)
+            .map_err(io::Error::other)?;
     let stored_files = select_search_candidates(stored_files, &query_terms, limit);
     for stored_file in stored_files {
         if stored_file.path.extension().is_none_or(|ext| ext != "md") {
@@ -759,7 +760,7 @@ fn fuzzy_search_store_one(
         }
 
         // Strict canonical project filter: split the stored `<owner>/<repo>`
-        // slug and delegate to `store::project_filter_matches` so the rank
+        // slug and delegate to `legacy_archive::project_filter_matches` so the rank
         // fallback fuzzy path agrees with store / dashboard / steer / mcp.
         // Substring fallback (`-p vista` matching `vista-portal`, etc.) is
         // intentionally removed — Bug #38.
@@ -768,7 +769,7 @@ fn fuzzy_search_store_one(
                 .project
                 .split_once('/')
                 .unwrap_or(("", stored_file.project.as_str()));
-            if !store::project_filter_matches(organization, repository, filter) {
+            if !legacy_archive::project_filter_matches(organization, repository, filter) {
                 continue;
             }
         }
@@ -1693,7 +1694,7 @@ Some boilerplate text.
         body: &str,
     ) -> std::path::PathBuf {
         let dir = root
-            .join(store::CANONICAL_STORE_DIRNAME)
+            .join(legacy_archive::LEGACY_CARDS_DIRNAME)
             .join(organization)
             .join(repository)
             .join("2026_0524")
@@ -1750,7 +1751,7 @@ Some boilerplate text.
 
         write_canonical_search_fixture(
             &root,
-            "VetCoders",
+            "Vetcoders",
             "aicx",
             "sessaicx",
             "User asked:\nWhy did we move embeddings to Sztudio?\n\nAgent answered:\nDecision: foundationneedle belongs in the content match, not in a metadata banner.\n",
@@ -1910,7 +1911,7 @@ Some boilerplate text.
             &[FuzzyResult {
                 file: "chunk.md".to_string(),
                 path: "/tmp/chunk.md".to_string(),
-                project: "VetCoders/aicx".to_string(),
+                project: "Vetcoders/aicx".to_string(),
                 kind: "conversations".to_string(),
                 frame_kind: None,
                 agent: "codex".to_string(),
@@ -1920,7 +1921,7 @@ Some boilerplate text.
                 label: "HIGH".to_string(),
                 density: 1.0,
                 matched_lines: vec![
-                    "[metadata] project: VetCoders/aicx | agent: codex | date: 2026-06-19 | kind: conversations | path: /tmp/chunk.md".to_string(),
+                    "[metadata] project: Vetcoders/aicx | agent: codex | date: 2026-06-19 | kind: conversations | path: /tmp/chunk.md".to_string(),
                 ],
                 session_id: Some("sess-456".to_string()),
                 cwd: None,
