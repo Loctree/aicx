@@ -95,7 +95,10 @@ function verifyHoistedPlatformResolution() {
     );
 
     const require = createRequire(import.meta.url);
-    const { resolvePlatformPackageRoot } = require(path.join(ROOT, "aicx", "index.js"));
+    const {
+      resolvePlatformBinaryPath,
+      resolvePlatformPackageRoot,
+    } = require(path.join(ROOT, "aicx", "index.js"));
     const resolvedRoot = resolvePlatformPackageRoot(
       "@loctree/aicx-darwin-arm64",
       wrapperRoot
@@ -105,6 +108,14 @@ function verifyHoistedPlatformResolution() {
       resolvedRoot,
       fs.realpathSync(platformRoot)
     );
+
+    let traversalRejected = false;
+    try {
+      resolvePlatformBinaryPath(resolvedRoot, "../../escape");
+    } catch {
+      traversalRejected = true;
+    }
+    assertEqual("platform binary traversal rejection", traversalRejected, true);
   } catch (error) {
     fail(`hoisted platform package resolution: ${error.message}`);
   } finally {
