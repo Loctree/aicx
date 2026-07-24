@@ -99,7 +99,7 @@ fn tail_help_covers_snapshot_and_follow() {
 }
 
 #[test]
-fn steer_help_mentions_lance_feature_requirement() {
+fn steer_help_names_the_published_current_index_without_lance_gating() {
     let bin = ensure_aicx_binary_exists();
     let output = Command::new(&bin)
         .args(["steer", "--help"])
@@ -108,8 +108,13 @@ fn steer_help_mentions_lance_feature_requirement() {
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_ascii_lowercase();
     assert!(
-        stdout.contains("lance") || stdout.contains("features"),
-        "aicx steer --help should mention the lance feature requirement; got:\n{}",
+        stdout.contains("published current index"),
+        "aicx steer --help should name its canonical index; got:\n{}",
+        stdout
+    );
+    assert!(
+        !stdout.contains("lance") && !stdout.contains("feature-gated"),
+        "aicx steer --help must not advertise the retired Lance gate; got:\n{}",
         stdout
     );
 }

@@ -31,7 +31,7 @@ resolver = "3"
 [features]
 # Stable, slim library profile for in-process consumers such as Loctree.
 # Use with `default-features = false` to expose the catalog/read/session/intent core
-# without CLI, dashboard, MCP, retrieval, embedder, or Lance surfaces.
+# without CLI, dashboard, MCP, retrieval, or embedder surfaces.
 loctree-consumer = []
 default = ["app", "native-embedder", "cloud-embedder"]
 app = [
@@ -52,9 +52,6 @@ app = [
     "dep:tracing-subscriber",
     "dep:which",
 ]
-# Temporary compatibility alias while doctor wording migrates in this release.
-# Metadata steering now reads the canonical Tantivy CURRENT generation.
-lance = ["app"]
 # In-process GGUF embeddings (offline / dev workstations).
 native-embedder = ["dep:aicx-embeddings", "aicx-embeddings/gguf"]
 native-embedder-metal = ["native-embedder", "aicx-embeddings/metal"]

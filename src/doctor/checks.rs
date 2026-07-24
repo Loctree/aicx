@@ -27,7 +27,6 @@ use crate::legacy_archive;
 use crate::legacy_archive::canonical_projection::StageInventoryEntry;
 use crate::progress::{Heartbeat, NoopReporter, Phase, Reporter};
 use crate::sanitize;
-use crate::steer_index;
 use crate::validation::{is_valid_repo_bucket_name, is_valid_repo_project_slug};
 
 use super::quarantine::{
@@ -1785,106 +1784,98 @@ pub(crate) fn check_canonical_store(base: &Path) -> CheckResult {
     }
 }
 
-#[cfg(not(feature = "lance"))]
-pub(crate) async fn check_steer_lance(_base: &Path) -> CheckResult {
-    CheckResult {
-        name: "steer_lance".to_string(),
-        severity: Severity::NotConfigured,
-        detail: "steer_index (Lance/BM25) feature is disabled".to_string(),
-        recommendation: None,
-    }
+fn current_hybrid_generation_at(base: &Path) -> PathBuf {
+    let hybrid_root = base.join("indexed").join("_all").join("hybrid");
+    crate::vector_index::resolve_hybrid_generation_dir(&hybrid_root)
 }
 
-#[cfg(feature = "lance")]
 pub(crate) async fn check_steer_lance(base: &Path) -> CheckResult {
-    let lance_dir = base.join("steer_db").join("mcp_documents.lance");
-    if !lance_dir.exists() {
+    let generation = current_hybrid_generation_at(base);
+    let manifest_path = generation.join("manifest.json");
+    if !manifest_path.is_file() {
         return CheckResult {
-            name: "steer_lance".to_string(),
-            severity: Severity::Warning,
-            detail: "Lance steer table does not exist (will be created on next sync)".to_string(),
-            recommendation: None,
-        };
-    }
-    match steer_index::query_steer_index_count().await {
-        Ok(count) => CheckResult {
-            name: "steer_lance".to_string(),
-            severity: Severity::Skipped,
+            name: "steer_current_metadata".to_string(),
+            severity: Severity::NotConfigured,
             detail: format!(
-                "Lance steer table exists ({} documents); real query not run",
-                count
+                "published CURRENT metadata index is not built at {}",
+                manifest_path.display()
+            ),
+            recommendation: Some("Build it with `aicx index`".to_string()),
+        };
+    }
+
+    match aicx_retrieve::TantivyAdapter::new(generation) {
+        Ok(count) => CheckResult {
+            name: "steer_current_metadata".to_string(),
+            severity: Severity::Green,
+            detail: format!(
+                "published CURRENT metadata is queryable ({} documents)",
+                count.doc_count
             ),
             recommendation: None,
         },
-        Err(e) => {
-            let msg = e.to_string();
-            let critical = msg.contains("Not found")
-                || msg.contains("manifest")
-                || msg.contains("_deletions")
-                || msg.contains("LanceError");
-            CheckResult {
-                name: "steer_lance".to_string(),
-                severity: if critical {
-                    Severity::Critical
-                } else {
-                    Severity::Warning
-                },
-                detail: format!("Lance probe failed: {msg}"),
-                recommendation: Some(if critical {
-                    "Run `aicx doctor --rebuild-steer-index` to delete and rebuild from catalog-backed extracts".to_string()
-                } else {
-                    format!(
-                        "Investigate logs; persistent issues may need manual `rm -rf {}/steer_db`",
-                        doctor_home_label()
-                    )
-                }),
-            }
-        }
+        Err(error) => CheckResult {
+            name: "steer_current_metadata".to_string(),
+            severity: Severity::Critical,
+            detail: format!("published CURRENT metadata probe failed: {error}"),
+            recommendation: Some("Rebuild CURRENT with `aicx index`".to_string()),
+        },
     }
 }
 
-#[cfg(not(feature = "lance"))]
-pub(crate) fn check_steer_bm25(_base: &Path) -> CheckResult {
-    CheckResult {
-        name: "steer_bm25".to_string(),
-        severity: Severity::NotConfigured,
-        detail: "steer_index (Lance/BM25) feature is disabled".to_string(),
-        recommendation: None,
-    }
-}
-
-#[cfg(feature = "lance")]
 pub(crate) fn check_steer_bm25(base: &Path) -> CheckResult {
-    let bm25_dir = base.join("steer_bm25");
-    if !bm25_dir.exists() {
+    let generation = current_hybrid_generation_at(base);
+    let manifest_path = generation.join("manifest.json");
+    if !manifest_path.is_file() {
         return CheckResult {
-            name: "steer_bm25".to_string(),
-            severity: Severity::Warning,
-            detail: "BM25 steer index does not exist".to_string(),
-            recommendation: Some(
-                "Will be created on next `aicx catalog rebuild` + `aicx index` run".to_string(),
+            name: "steer_current_lexical".to_string(),
+            severity: Severity::NotConfigured,
+            detail: format!(
+                "published CURRENT lexical index is not built at {}",
+                manifest_path.display()
             ),
+            recommendation: Some("Build it with `aicx index`".to_string()),
         };
     }
-    let entries = std::fs::read_dir(&bm25_dir)
-        .map(|it| it.flatten().count())
-        .unwrap_or(0);
+
+    let manifest = match aicx_retrieve::Manifest::read_from_path(&manifest_path) {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            return CheckResult {
+                name: "steer_current_lexical".to_string(),
+                severity: Severity::Critical,
+                detail: format!("published CURRENT manifest is unreadable: {error}"),
+                recommendation: Some("Rebuild CURRENT with `aicx index`".to_string()),
+            };
+        }
+    };
+    let tantivy_meta = generation
+        .join(aicx_retrieve::TANTIVY_INDEX_DIR)
+        .join("meta.json");
+    let compatible = manifest
+        .lexical_commit_id
+        .starts_with(aicx_retrieve::TANTIVY_SCHEMA_VERSION);
+    if !compatible || !tantivy_meta.is_file() {
+        return CheckResult {
+            name: "steer_current_lexical".to_string(),
+            severity: Severity::Critical,
+            detail: format!(
+                "published CURRENT lexical artifact is incompatible or incomplete (commit={}, meta={})",
+                manifest.lexical_commit_id,
+                tantivy_meta.display()
+            ),
+            recommendation: Some("Rebuild CURRENT with `aicx index`".to_string()),
+        };
+    }
+
     CheckResult {
-        name: "steer_bm25".to_string(),
-        severity: if entries > 0 {
-            Severity::Skipped
-        } else {
-            Severity::Warning
-        },
+        name: "steer_current_lexical".to_string(),
+        severity: Severity::Green,
         detail: format!(
-            "BM25 index has {} entries on disk; real query not run",
-            entries
+            "published CURRENT lexical artifact is compatible (commit={})",
+            manifest.lexical_commit_id
         ),
-        recommendation: if entries == 0 {
-            Some("BM25 dir is empty; reindex with `aicx catalog rebuild` then `aicx index --full-rescan --cache-extracts`".to_string())
-        } else {
-            None
-        },
+        recommendation: None,
     }
 }
 
@@ -2334,12 +2325,8 @@ pub(crate) async fn attempt_steer_rebuild(base: &Path) -> Result<String> {
         removed.push("steer_index_meta.json");
     }
 
-    steer_index::rebuild_steer_index_if_needed()
-        .await
-        .context("rebuild after corruption removal")?;
-
     Ok(format!(
-        "removed {} and rebuilt steer index from catalog-backed extracts",
+        "removed retired steer artifacts: {}; CURRENT is owned by `aicx index`",
         if removed.is_empty() {
             "nothing".to_string()
         } else {

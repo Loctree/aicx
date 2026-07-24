@@ -1799,13 +1799,13 @@ enum Commands {
 
     /// Diagnose and optionally repair AICX home health (index, state, legacy archive).
     ///
-    /// Runs integrity checks on the Lance steer DB, BM25/lexical index,
+    /// Runs integrity checks on the published CURRENT metadata/lexical index,
     /// state.json, sidecar coverage, and residual corpus bucket names. With
-    /// `--rebuild-steer-index`, corrupted steer indexes are deleted and
-    /// rebuilt from available corpus material (never invents cards). Other
-    /// remediations live behind dedicated flags (`--prune-empty-bodies`,
-    /// `--fix-buckets`). Prefer `aicx catalog rebuild` + `aicx index` for
-    /// the extract-era identity path.
+    /// `--clean-retired-steer`, obsolete steer-only artifacts are removed;
+    /// CURRENT is rebuilt exclusively by `aicx index`. Other remediations live
+    /// behind dedicated flags (`--prune-empty-bodies`, `--fix-buckets`).
+    /// Prefer `aicx catalog rebuild` + `aicx index` for the extract-era
+    /// identity path.
     ///
     /// Exit codes: 0 on green/warning or after successful rebuild; 1 if
     /// critical issues are detected without remediation.
@@ -1816,14 +1816,16 @@ enum Commands {
             .multiple(true)
     ))]
     Doctor {
-        /// Delete and rebuild the steer index from available corpus material
-        /// when corrupted or schema-incompatible. Narrower contract than
-        /// the legacy `--fix` (which was a no-op for sidecars/index
-        /// consistency/empty bodies — those have dedicated flags).
+        /// Remove obsolete steer-only artifacts. This never mutates or
+        /// rebuilds CURRENT; use `aicx index` for the canonical retrieval
+        /// generation.
         ///
-        /// Legacy alias: `--fix` is accepted with a deprecation warning
-        /// and will be removed in v1.0.
-        #[arg(long = "rebuild-steer-index", alias = "fix")]
+        /// Legacy aliases: `--rebuild-steer-index` and `--fix` are accepted
+        /// with a deprecation warning and will be removed in v1.0.
+        #[arg(
+            long = "clean-retired-steer",
+            aliases = ["rebuild-steer-index", "fix"]
+        )]
         rebuild_steer_index: bool,
 
         /// Move suspicious top-level corpus buckets to $HOME/.aicx/quarantine/.
@@ -2878,7 +2880,7 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
                 std::process::exit(if report.failures.is_empty() { 0 } else { 1 });
             }
 
-            let fix = rebuild_steer_index; // Assuming `fix` is an alias for `--rebuild-steer-index`.
+            let fix = rebuild_steer_index;
             let legacy_or_readonly = fix
                 || fix_buckets
                 || dry_run
@@ -2933,13 +2935,13 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
                 );
             }
 
-            // Surface the legacy `--fix` form as deprecated so callers can
-            // migrate. We cannot tell from the parsed bool whether the
-            // operator typed `--fix` or `--rebuild-steer-index`; inspect
-            // the raw argv instead. The flag accepts both via Clap alias.
-            if rebuild_steer_index && std::env::args().any(|arg| arg == "--fix") {
+            // Surface both retired names as deprecated. Clap normalizes aliases
+            // into one bool, so inspect raw argv solely to select the warning.
+            if rebuild_steer_index
+                && std::env::args().any(|arg| arg == "--fix" || arg == "--rebuild-steer-index")
+            {
                 eprintln!(
-                    "aicx doctor: warning: '--fix' is deprecated; use '--rebuild-steer-index'. The old flag will be removed in v1.0."
+                    "aicx doctor: warning: '--fix' and '--rebuild-steer-index' are deprecated; use '--clean-retired-steer'. The old flags will be removed in v1.0."
                 );
             }
             let opts = aicx::doctor::DoctorOptions {

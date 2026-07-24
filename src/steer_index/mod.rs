@@ -14,15 +14,6 @@ pub async fn query_steer_index_count() -> Result<usize> {
     Ok(open_current_adapter()?.doc_count)
 }
 
-/// Compatibility shim for the old doctor flag.
-///
-/// A steer-specific rebuild no longer exists; CURRENT is rebuilt only by the
-/// canonical `aicx index` pipeline. The doctor surface removes this shim in the
-/// same migration series.
-pub async fn rebuild_steer_index_if_needed() -> Result<()> {
-    bail!("the separate steer index is retired; rebuild CURRENT with `aicx index`")
-}
-
 pub async fn search_steer_index(
     filter: &SteerFilter<'_>,
     limit: usize,
