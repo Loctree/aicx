@@ -1385,7 +1385,7 @@ _aicx() {
             return 0
             ;;
         aicx__subcmd__doctor)
-            opts="-y -v -h --rebuild-steer-index --fix-buckets --dry-run --rebuild-sidecars --prune-empty-bodies --migrate-identities --apply --restore-quarantine --yes --force --check-dedup --verbose --smoke --deep --format --oracle --project-fuzzy --help"
+            opts="-y -v -h --clean-retired-steer --fix-buckets --dry-run --rebuild-sidecars --prune-empty-bodies --migrate-identities --apply --restore-quarantine --yes --force --check-dedup --verbose --smoke --deep --format --oracle --project-fuzzy --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0

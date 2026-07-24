@@ -1395,7 +1395,7 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 '--restore-quarantine=[Restore files from a quarantine manifest slug]:SLUG:_default' \
 '--format=[Output format\: text (default), json]:FORMAT:_default' \
-'--rebuild-steer-index[Delete and rebuild the steer index from available corpus material when corrupted or schema-incompatible. Narrower contract than the legacy \`--fix\` (which was a no-op for sidecars/index consistency/empty bodies — those have dedicated flags)]' \
+'--clean-retired-steer[Remove obsolete steer-only artifacts. This never mutates or rebuilds CURRENT; use \`aicx index\` for the canonical retrieval generation]' \
 '--fix-buckets[Move suspicious top-level corpus buckets to \$HOME/.aicx/quarantine/. Buckets that are merely CamelCase (legitimate GitHub orgs like \`LibraxisAI\`, \`Vetcoders\`, \`Loctree\`, \`Sampleorg\`) are canonicalized in place to lowercase instead of quarantined, merging into existing lowercase buckets if present]' \
 '--dry-run[With --fix-buckets, preview the planned canonicalize/quarantine actions without modifying the filesystem. Output entries are prefixed with \`\[dry-run\]\`. Use this before running \`--fix-buckets\` against a large legacy archive to verify the classification before commit]' \
 '--rebuild-sidecars[Emit a reviewable bash script for missing sidecar backfill]' \
@@ -1851,7 +1851,7 @@ _aicx_commands() {
 'corpus:Audit or repair derived corpus markdown' \
 'reports-extractor:Deprecated compatibility shim for \`aicx reports\`' \
 'dashboard-serve:Deprecated compatibility shim for \`aicx dashboard --serve\`' \
-'intents:Extract structured intents from the canonical corpus' \
+'intents:Extract structured intents from the durable catalog and allowlisted session sources' \
 'tail:Print recent intents/chunks (snapshot mode); add --follow to stream new arrivals' \
 'serve:Run aicx as an MCP server' \
 'init:Retired compatibility shim; prints migration guidance' \
@@ -1861,7 +1861,7 @@ _aicx_commands() {
 'config:Manage \`\$HOME/.aicx/config.toml\` for embedders and endpoints' \
 'read:Read one legacy archive chunk by path, file name, or \`chunk\:<id>\` reference' \
 'open:Read one legacy archive chunk by path, file name, or \`chunk\:<id>\` reference' \
-'steer:Retrieve chunks by steering metadata (requires --features lance)' \
+'steer:Retrieve chunks by metadata from the published CURRENT index' \
 'migrate:Migrate legacy ~/.ai-contexters/ artifacts into the AICX legacy archive' \
 'migrate-intent-schema:Classify legacy archive chunks into 11-type intent entries and report counts' \
 'doctor:Diagnose and optionally repair AICX home health (index, state, legacy archive)' \
@@ -2241,7 +2241,7 @@ _aicx__subcmd__help_commands() {
 'corpus:Audit or repair derived corpus markdown' \
 'reports-extractor:Deprecated compatibility shim for \`aicx reports\`' \
 'dashboard-serve:Deprecated compatibility shim for \`aicx dashboard --serve\`' \
-'intents:Extract structured intents from the canonical corpus' \
+'intents:Extract structured intents from the durable catalog and allowlisted session sources' \
 'tail:Print recent intents/chunks (snapshot mode); add --follow to stream new arrivals' \
 'serve:Run aicx as an MCP server' \
 'init:Retired compatibility shim; prints migration guidance' \
@@ -2250,7 +2250,7 @@ _aicx__subcmd__help_commands() {
 'index:Build the source-driven lexical index. Use \`--dry-run\` to preview parsing and filtering without writing extracts or publishing CURRENT' \
 'config:Manage \`\$HOME/.aicx/config.toml\` for embedders and endpoints' \
 'read:Read one legacy archive chunk by path, file name, or \`chunk\:<id>\` reference' \
-'steer:Retrieve chunks by steering metadata (requires --features lance)' \
+'steer:Retrieve chunks by metadata from the published CURRENT index' \
 'migrate:Migrate legacy ~/.ai-contexters/ artifacts into the AICX legacy archive' \
 'migrate-intent-schema:Classify legacy archive chunks into 11-type intent entries and report counts' \
 'doctor:Diagnose and optionally repair AICX home health (index, state, legacy archive)' \
