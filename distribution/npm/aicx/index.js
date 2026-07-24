@@ -2,7 +2,7 @@
 
 const { execFileSync, spawnSync } = require("child_process");
 const { existsSync, realpathSync } = require("fs");
-const { dirname, isAbsolute, join, relative, sep } = require("path");
+const { dirname, isAbsolute, relative, sep } = require("path");
 
 const PLATFORM_PACKAGES = Object.freeze({
   "darwin-arm64": Object.freeze({
@@ -110,6 +110,17 @@ function assertContainedPath(rootPath, candidatePath) {
   }
 }
 
+function resolvePlatformBinaryPath(packageRoot, binaryFileName) {
+  const allowedBinaryNames = new Set(Object.values(BINARY_FILENAMES));
+  if (!allowedBinaryNames.has(binaryFileName)) {
+    throw new Error(`Refusing unexpected platform binary name: ${binaryFileName}`);
+  }
+
+  const binaryPath = `${packageRoot}${sep}${binaryFileName}`;
+  assertContainedPath(packageRoot, binaryPath);
+  return binaryPath;
+}
+
 function getBinaryPath(binaryName) {
   const platformPackage = getPlatformPackage();
   const packageName = platformPackage.name;
@@ -127,7 +138,7 @@ function getBinaryPath(binaryName) {
     );
   }
 
-  const binaryPath = join(packageRoot, resolvedBinaryName);
+  const binaryPath = resolvePlatformBinaryPath(packageRoot, resolvedBinaryName);
 
   if (!existsSync(binaryPath)) {
     throw new Error(
@@ -198,6 +209,7 @@ module.exports = {
   execAicxMcpSync,
   getBinaryPath,
   getPlatformPackageName,
+  resolvePlatformBinaryPath,
   resolvePlatformPackageRoot,
 };
 
