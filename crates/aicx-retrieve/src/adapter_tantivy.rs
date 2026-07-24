@@ -88,6 +88,41 @@ impl TantivyAdapter {
         &self.dir
     }
 
+    /// Scan committed document metadata without requiring a lexical query.
+    ///
+    /// This is the canonical metadata-only retrieval surface for callers such
+    /// as `aicx steer`. It examines every live document before applying the
+    /// predicate, so rare exact metadata matches cannot disappear behind an
+    /// arbitrary lexical top-N boundary. The caller-provided limit bounds only
+    /// returned values; the committed corpus remains the search authority.
+    pub fn scan_metadata(
+        &self,
+        limit: usize,
+        mut predicate: impl FnMut(&serde_json::Value) -> bool,
+    ) -> Result<Vec<serde_json::Value>> {
+        if limit == 0 || self.doc_count == 0 {
+            return Ok(Vec::new());
+        }
+
+        let reader = self.index.reader().context("open tantivy reader")?;
+        let searcher = reader.searcher();
+        let collector = TopDocs::with_limit(self.doc_count).order_by_score();
+        let docs = searcher
+            .search(&AllQuery, &collector)
+            .context("scan committed tantivy metadata")?;
+        let mut matches = Vec::with_capacity(limit.min(docs.len()));
+        for (rank, (score, address)) in docs.into_iter().enumerate() {
+            let hit = self.hit_from_doc(&searcher, score, rank, address)?;
+            if predicate(&hit.metadata) {
+                matches.push(hit.metadata);
+                if matches.len() >= limit {
+                    break;
+                }
+            }
+        }
+        Ok(matches)
+    }
+
     fn refresh_stats(&mut self) -> Result<LexicalCommitId> {
         self.commit_id = read_commit_id(&self.index)?;
         self.doc_count = read_doc_count(&self.index)?;

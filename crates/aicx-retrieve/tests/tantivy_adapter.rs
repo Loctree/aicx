@@ -125,6 +125,30 @@ fn doc_count_matches_insert_count() {
 }
 
 #[test]
+fn metadata_scan_finds_rare_exact_match_outside_small_top_n() {
+    let temp = TempDir::new().unwrap();
+    let mut adapter = TantivyAdapter::new(temp.path().to_path_buf()).unwrap();
+    let mut chunks: Vec<_> = (0..250)
+        .map(|i| chunk(i, "metadata-only retrieval body", "codex"))
+        .collect();
+    chunks[249].metadata["prompt_id"] = json!("prompt-rare-249");
+    chunks[249].metadata["run_id"] = json!("run-rare-249");
+
+    adapter.build(&chunks).unwrap();
+    let matches = adapter
+        .scan_metadata(1, |metadata| {
+            metadata.get("prompt_id") == Some(&json!("prompt-rare-249"))
+                && metadata.get("run_id") == Some(&json!("run-rare-249"))
+        })
+        .unwrap();
+
+    assert_eq!(matches.len(), 1);
+    assert_eq!(matches[0]["prompt_id"], "prompt-rare-249");
+    assert_eq!(matches[0]["run_id"], "run-rare-249");
+    assert!(adapter.scan_metadata(0, |_| true).unwrap().is_empty());
+}
+
+#[test]
 fn per_field_tokenizer_handles_identifiers_and_stems() {
     let temp = TempDir::new().unwrap();
     let mut adapter = TantivyAdapter::new(temp.path().to_path_buf()).unwrap();
