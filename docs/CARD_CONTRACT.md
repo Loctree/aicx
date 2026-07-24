@@ -1,12 +1,19 @@
 ---
 contract_version: 2
-status: active
+status: legacy
 owner: Vetcoders
-last_reviewed: 2026-07-02
+last_reviewed: 2026-07-24
 revalidate_by: 2026-08-02
 ---
 
 # AICX Card Contract
+
+> **Legacy only.** Per-frame cards are no longer written: the `aicx store`
+> command and the card-mill write path were removed in the extracts-first cut.
+> This contract now describes the on-disk schema that `src/legacy_archive/**`
+> (doctor, quarantine, migrate) reads from existing card trees. Live memory
+> truth is the durable catalog plus session extracts and the published
+> `CURRENT` index — see `docs/AICX_HOME_LAYOUT.md`.
 
 > **runtime > kontrakt > pamięć.** This file is an anchor, not scripture — it
 > carries an expiry date (`revalidate_by`); an old, unverified decision is

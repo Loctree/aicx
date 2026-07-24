@@ -5,7 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
+### Removed
+
+- **`aicx store` and the per-frame card store concept.** The command exits
+  with an argument-parse error, `src/store.rs` and the card-mill write path
+  are gone, and no production namespace called `store` remains. Live memory
+  truth is now `catalog rebuild → extract (optional cache) → index → CURRENT`
+  under a single AICX home (`src/aicx_home.rs`). Existing on-disk card trees
+  are handled read-only by `src/legacy_archive/**` (doctor, quarantine,
+  migrate) and can neither regrow nor masquerade as the runtime store.
+  `docs/STORE_LAYOUT.md` was replaced by `docs/AICX_HOME_LAYOUT.md`.
+
 ### Changed
+
+- **`aicx intents` reads the durable catalog and allowlisted session sources
+  directly.** Project resolution no longer requires the retired card archive;
+  oracle JSON reports `backend=catalog_sources` with source-read accounting so
+  skipped or unreadable sources cannot look like a complete result. The legacy
+  archive is consulted only when the durable catalog itself is absent.
 
 - **Product verification walk (W5-01).** Architecture and store-layout docs
   aligned to code truth (hybrid generations, typed retrieval status, config

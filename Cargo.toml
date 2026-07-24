@@ -30,7 +30,7 @@ resolver = "3"
 
 [features]
 # Stable, slim library profile for in-process consumers such as Loctree.
-# Use with `default-features = false` to expose the store/read/session/intent core
+# Use with `default-features = false` to expose the catalog/read/session/intent core
 # without CLI, dashboard, MCP, retrieval, embedder, or Lance surfaces.
 loctree-consumer = []
 default = ["app", "native-embedder", "cloud-embedder"]
