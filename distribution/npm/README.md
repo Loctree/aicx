@@ -6,8 +6,8 @@ The source of truth for the product lives in
 thin JS wrapper and platform-package manifests that ship to the `@loctree` npm
 scope.
 
-> Status: aligned to the current `*-slim-unsigned.tar.gz` GitHub Release asset
-> shape for macOS arm64 and Linux x64 GNU. Do not publish npm packages until the
+> Status: aligned to the signed GitHub Release asset shape for macOS arm64,
+> Linux x64 GNU, and Windows x64 MSVC. Do not publish npm packages until the
 > matching release assets and `.sha256` sidecars exist for the target version.
 
 ## Wrapper package
@@ -23,8 +23,9 @@ Current platform matrix:
 
 - `darwin-arm64`
 - `linux-x64-gnu`
+- `win32-x64-gnu` (legacy npm package suffix; contains the MSVC build)
 
-Total: **1 wrapper + 2 active platform packages = 3 npm packages.**
+Total: **1 wrapper + 3 active platform packages = 4 npm packages.**
 
 ## Install
 
@@ -64,7 +65,8 @@ distribution/npm/
     │   └── aicx-mcp
     └── platform-packages/
         ├── darwin-arm64/
-        └── linux-x64-gnu/
+        ├── linux-x64-gnu/
+        └── win32-x64-gnu/
 ```
 
 ## Repo maintenance workflow

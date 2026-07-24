@@ -88,15 +88,28 @@ The maintained overview is [COMMANDS.md](docs/COMMANDS.md).
 
 ## Installation
 
-```bash
-cargo install --locked aicx
+GitHub Release bundles are the supported user-facing path:
 
-# Native GGUF embedder support:
-cargo install --locked aicx --features native-embedder
+```bash
+curl -fsSLO https://raw.githubusercontent.com/Loctree/aicx/v0.12.0/install.sh
+AICX_INSTALL_MODE=release AICX_RELEASE_TAG=v0.12.0 bash install.sh
 ```
 
-Prebuilt releases and `install.sh` are the recommended path for non-Rust users.
-See [install-paths.md](docs/install-paths.md).
+The installer selects the published bundle for the current platform, verifies
+its adjacent SHA-256 sidecar, and installs both `aicx` and `aicx-mcp`.
+
+For contributors working from a checkout:
+
+```bash
+cargo install --path . --locked --force --bin aicx --bin aicx-mcp
+
+# Native GGUF embedder support:
+cargo install --path . --locked --force --features native-embedder \
+  --bin aicx --bin aicx-mcp
+```
+
+See [install-paths.md](docs/install-paths.md) and
+[RELEASES.md](docs/RELEASES.md).
 
 ## Development
 
