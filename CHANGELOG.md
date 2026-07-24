@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
+## [0.12.1] - 2026-07-24
+
+### Fixed
+
+- **npm cold installs now survive standard dependency hoisting and concurrent
+  lifecycle scripts.** The wrapper resolves platform packages through Node's
+  module resolver and waits, with a hard deadline, for the platform downloader
+  to publish both binaries before validation.
+- **macOS release checksum sidecars are portable.** Native signed/notarized
+  bundles now record the archive basename rather than a self-hosted runner's
+  absolute `dist` path.
+
 ## [0.12.0] - 2026-07-24
 
 ### Removed
