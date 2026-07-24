@@ -20,7 +20,7 @@ std::thread_local! {
     pub static LEGACY_DENSE_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use serde::Serialize;
@@ -686,15 +686,18 @@ fn try_lexical_search_native(
     } else {
         BACKEND_LEXICAL
     };
-    // Build results without per-hit store file I/O. Preview lines are filled
-    // only for the truncated top set so missing-store paths cannot dominate.
-    // Timestamp (when present) drives the recency prior; fall back to date.
+    // Keep the Tantivy id beside the public path so the first cheap rank pass
+    // can ask the index for exact body snippets only for its leading set.
+    let mut chunk_ids_by_path = HashMap::with_capacity(hits.len());
+    // Build results without per-hit source-file I/O. Timestamp (when present)
+    // drives the recency prior; fall back to date.
     let mut results: Vec<FuzzyResult> = hits
         .into_iter()
         .map(|h| {
             let path = hit_path(&h);
+            let path_string = path.to_string_lossy().to_string();
+            chunk_ids_by_path.insert(path_string.clone(), h.chunk_id.clone());
             let score_pct = lexical_score_pct(h.score);
-            let matched_lines = hit_metadata_lines(&h, "preview_lines");
             let date = hit_metadata_string(&h, "date");
             let timestamp = hit_metadata_optional_string(&h, "timestamp")
                 .or_else(|| hit_metadata_optional_string(&h, "session_date"))
@@ -706,8 +709,8 @@ fn try_lexical_search_native(
                     }
                 });
             FuzzyResult {
-                file: path.to_string_lossy().to_string(),
-                path: path.to_string_lossy().to_string(),
+                file: path_string.clone(),
+                path: path_string,
                 project: hit_metadata_string(&h, "project"),
                 kind: hit_metadata_string(&h, "kind"),
                 frame_kind: hit_metadata_optional_string(&h, "frame_kind"),
@@ -717,23 +720,46 @@ fn try_lexical_search_native(
                 score: score_pct,
                 label: format!("{backend_label}:{}", h.chunk_id),
                 density: h.score,
-                matched_lines,
+                matched_lines: hit_metadata_lines(&h, "preview_lines"),
                 session_id: hit_metadata_optional_string(&h, "session_id"),
                 cwd: hit_metadata_optional_string(&h, "cwd"),
             }
         })
         .collect();
 
-    apply_recency_prior(&mut results);
-    // Lexical path used to stop at BM25+recency. That left pre-filter CURRENT
-    // generations ranking thought-token streams and JSON event dumps above
-    // readable operator answers. Quality demotion + preview sanitize close
-    // that lie until (and after) the next signal-filter rebuild.
-    for result in &mut results {
-        sanitize_lexical_preview_lines(result);
+    // Select enrichment candidates from Tantivy's raw retrieval score. Compact
+    // first-lines are often an old compaction summary and can bury the actual
+    // matched body before we have inspected it. Recency and quality apply
+    // after the exact body context has been attached.
+    results.sort_by(|a, b| {
+        b.density
+            .total_cmp(&a.density)
+            .then_with(|| b.date.cmp(&a.date))
+    });
+    let snippet_ids = results
+        .iter()
+        .take(LEXICAL_SNIPPET_RERANK_LIMIT)
+        .filter_map(|result| chunk_ids_by_path.get(&result.path).cloned())
+        .collect::<Vec<_>>();
+    let snippets =
+        lexical
+            .query_snippets(query, &snippet_ids)
+            .map_err(|err| SemanticError::IndexCorrupt {
+                path: gen_dir.clone(),
+                reason: format!("lexical snippet enrichment failed: {err:#}"),
+                recommendation: "retry; if it persists rebuild with `aicx index`".to_string(),
+            })?;
+    for result in results.iter_mut().take(LEXICAL_SNIPPET_RERANK_LIMIT) {
+        let Some(chunk_id) = chunk_ids_by_path.get(&result.path) else {
+            continue;
+        };
+        if let Some(lines) = snippets.get(chunk_id) {
+            result.matched_lines.clone_from(lines);
+        }
     }
-    apply_lexical_quality_prior(query, &mut results);
-    results.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| b.date.cmp(&a.date)));
+    // Re-run from the raw BM25 density so the preview-based first pass does
+    // not double-add priors. This final pass ranks the actual matched context.
+    rank_lexical_candidates(query, &mut results);
     results.truncate(limit);
     // Prefer indexed preview metadata. Only open source files when preview is
     // empty and the path exists — cold project-scoped searches were paying
@@ -792,6 +818,39 @@ fn lexical_score_pct(score: f32) -> u8 {
 }
 
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+const LEXICAL_SNIPPET_RERANK_LIMIT: usize = 24;
+
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+fn rank_lexical_candidates(query: &str, results: &mut [FuzzyResult]) {
+    for result in results.iter_mut() {
+        // Rebuild from the raw Tantivy score on every pass. The first pass
+        // uses compact indexed previews to choose the snippet set; the second
+        // uses actual matched body context without double-counting priors.
+        let self_echo = result.density.is_sign_negative() || is_search_benchmark_context(result);
+        result.score = if self_echo {
+            0
+        } else {
+            lexical_score_pct(result.density)
+        };
+        if self_echo {
+            // A transcript quoting the search command/acceptance is evidence
+            // about this benchmark, not an answer to the operator's question.
+            // It must lose even when the quoted phrase gives it perfect BM25.
+            result.density = -result.density.abs();
+        }
+        sanitize_lexical_preview_lines(result);
+    }
+    apply_recency_prior(results);
+    apply_lexical_quality_prior(query, results);
+    results.sort_by(|a, b| {
+        b.score
+            .cmp(&a.score)
+            .then_with(|| b.density.total_cmp(&a.density))
+            .then_with(|| b.date.cmp(&a.date))
+    });
+}
+
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
 fn lexical_rerank_window(limit: usize, project_scoped: bool) -> usize {
     // Project equality is pushed into Tantivy when the filter is exact
     // `owner/repo`, so a modest window is enough. Global search needs a wider
@@ -847,14 +906,15 @@ fn sanitize_lexical_preview_lines(result: &mut FuzzyResult) {
         .iter()
         .filter_map(|line| normalize_preview_line(line))
         .collect();
-    if !cleaned.is_empty() {
-        result.matched_lines = cleaned;
-    }
+    result.matched_lines = cleaned;
 }
 
 fn normalize_preview_line(line: &str) -> Option<String> {
     let trimmed = line.trim();
     if trimmed.is_empty() {
+        return None;
+    }
+    if is_search_benchmark_echo(trimmed) {
         return None;
     }
     if is_thought_token_or_event_noise_line(trimmed) {
@@ -868,6 +928,52 @@ fn normalize_preview_line(line: &str) -> Option<String> {
         return Some(text.chars().take(240).collect());
     }
     Some(trimmed.to_string())
+}
+
+fn is_search_benchmark_echo(line: &str) -> bool {
+    if crate::sanitize::is_self_echo(line) {
+        return true;
+    }
+    let lower = normalize_query(line);
+    lower.contains("search")
+        && (lower.contains("warm")
+            || lower.contains("latency")
+            || lower.contains("wall time")
+            || lower.contains("golden")
+            || lower.contains("acceptance"))
+}
+
+fn is_search_benchmark_context(result: &FuzzyResult) -> bool {
+    if result
+        .matched_lines
+        .iter()
+        .any(|line| is_search_benchmark_echo(line))
+    {
+        return true;
+    }
+    let project = result.project.to_ascii_lowercase();
+    let generated_or_aicx =
+        result.agent.eq_ignore_ascii_case("vibecrafted") || project.contains("aicx");
+    if !generated_or_aicx {
+        return false;
+    }
+    let text = normalize_query(&result.matched_lines.join(" "));
+    [
+        "pensieve",
+        "latency",
+        "golden",
+        "right doc",
+        "top doc",
+        "warm search",
+    ]
+    .iter()
+    .any(|marker| text.contains(marker))
+        || (text.contains("current")
+            && (text.contains("rank")
+                || text.contains("ranking")
+                || text.contains("pozycji")
+                || text.contains("top "))
+            && (text.contains("index") || text.contains("indeks")))
 }
 
 fn unwrap_agent_message_event(line: &str) -> Option<String> {
@@ -2291,7 +2397,12 @@ fn apply_default_semantic_quality(
     for result in &mut results {
         result.score = semantic_quality_score(query, result);
     }
-    results.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| b.date.cmp(&a.date)));
+    results.sort_by(|a, b| {
+        b.score
+            .cmp(&a.score)
+            .then_with(|| b.density.total_cmp(&a.density))
+            .then_with(|| b.date.cmp(&a.date))
+    });
     dedupe_semantic_results(results)
 }
 
@@ -2303,7 +2414,16 @@ fn default_visible_frame(result: &FuzzyResult) -> bool {
 }
 
 fn semantic_quality_score(query: &str, result: &FuzzyResult) -> u8 {
-    let mut score = result.score as i16;
+    let lexical = result.label.starts_with("lexical_tantivy");
+    // Lexical priors may reach 145 (BM25 + recency + first-pass quality).
+    // Feeding that directly into a 0..100 public score made every strong hit
+    // clamp to 100 and erased all discrimination. Reserve half the public
+    // range for evidence from the actual matched context.
+    let mut score = if lexical {
+        ((result.score as i32 * 50 + 72) / 145) as i16
+    } else {
+        result.score as i16
+    };
     score += match result.frame_kind.as_deref().and_then(FrameKind::parse) {
         Some(FrameKind::UserMsg) => 6,
         Some(FrameKind::AgentReply) => 5,
@@ -2321,23 +2441,63 @@ fn semantic_quality_score(query: &str, result: &FuzzyResult) -> u8 {
     if !normalized_query.is_empty() && haystack.contains(&normalized_query) {
         score += 12;
     }
-    score += anchor_quality_delta(&anchors, &haystack);
-    score += informative_agent_reply_delta(result, &anchors, &haystack);
+    let anchor_delta = anchor_quality_delta(&anchors, &haystack);
+    let answer_delta = informative_agent_reply_delta(result, &anchors, &haystack);
+    score += if lexical {
+        anchor_delta.clamp(-20, 24)
+    } else {
+        anchor_delta
+    };
+    score += if lexical {
+        answer_delta.min(12)
+    } else {
+        answer_delta
+    };
     if !query_terms.is_empty() {
         let matched_terms = query_terms
             .iter()
-            .filter(|term| haystack.contains(**term))
+            .filter(|term| {
+                haystack.contains(**term)
+                    || (lexical
+                        && term.chars().count() >= 5
+                        && haystack.contains(&term.chars().take(5).collect::<String>()))
+            })
             .count();
         score += (matched_terms.saturating_mul(3).min(12)) as i16;
+        if lexical && matched_terms >= 2 {
+            score += 10 + ((matched_terms - 2).min(2) as i16 * 4);
+        }
         if matched_terms == 0 {
             score -= 15;
         }
+    }
+    if lexical && matched_answer_section(result) {
+        score += 10;
+    }
+    if lexical && result.density.is_sign_negative() {
+        score -= 60;
     }
     if low_signal_semantic_result(result) {
         score -= 8;
     }
 
-    score.clamp(0, 100) as u8
+    score.clamp(0, if lexical { 95 } else { 100 }) as u8
+}
+
+fn matched_answer_section(result: &FuzzyResult) -> bool {
+    let text = normalize_query(&result.matched_lines.join(" "));
+    [
+        "# raport",
+        "docelowy model",
+        "werdykt",
+        "what landed",
+        "what changed",
+        "root cause",
+        "diagnoza",
+        "conclusion",
+    ]
+    .iter()
+    .any(|marker| text.contains(marker))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2971,6 +3131,99 @@ mod tests {
             result.matched_lines[0]
         );
         assert!(!result.matched_lines[0].contains("item.completed"));
+    }
+
+    #[test]
+    fn sanitize_lexical_preview_drops_aicx_search_echo_but_keeps_answer() {
+        let mut result = fuzzy(100, "conversations", "2026-07-24", None);
+        result.matched_lines = vec![
+            "Acceptance: `aicx search 'routing strzałek taby'` must return W2-B-4c.".to_string(),
+            "Answer: W2-B-4c landed; new tabs grow directly from the base card.".to_string(),
+        ];
+
+        sanitize_lexical_preview_lines(&mut result);
+
+        assert_eq!(
+            result.matched_lines,
+            vec!["Answer: W2-B-4c landed; new tabs grow directly from the base card."]
+        );
+    }
+
+    #[test]
+    fn lexical_rank_demotes_benchmark_self_echo_below_the_answer() {
+        let mut echo = fuzzy(100, "conversations", "2026-07-24", None);
+        echo.label = "echo".to_string();
+        echo.density = 30.0;
+        echo.matched_lines = vec!["| Warm search `routing strzałek taby` | 0.27 s |".to_string()];
+        let mut answer = fuzzy(80, "conversations", "2026-07-22", None);
+        answer.label = "answer".to_string();
+        answer.density = 20.0;
+        answer.matched_lines =
+            vec!["Raport: interactive routing uses górne taby and strzałki.".to_string()];
+
+        let mut results = vec![echo, answer];
+        rank_lexical_candidates("routing strzałek taby", &mut results);
+
+        assert_eq!(results[0].label, "answer", "{results:?}");
+        assert!(
+            results
+                .iter()
+                .find(|result| result.label == "echo")
+                .is_some_and(|result| result.density.is_sign_negative()),
+            "benchmark echo must retain an internal demotion marker: {results:?}"
+        );
+    }
+
+    #[test]
+    fn lexical_rank_demotes_aicx_current_ranking_diagnostics() {
+        let mut echo = fuzzy(100, "conversations", "2026-07-24", None);
+        echo.label = "echo".to_string();
+        echo.project = "aicx".to_string();
+        echo.density = 40.0;
+        echo.matched_lines =
+            vec!["Właściwa sesja jest na pozycji 275, bo CURRENT ma starszy indeks.".to_string()];
+        let mut answer = fuzzy(70, "conversations", "2026-07-22", None);
+        answer.label = "answer".to_string();
+        answer.density = 20.0;
+        answer.matched_lines =
+            vec!["Raport: interactive routing uses górne taby and strzałki.".to_string()];
+
+        let mut results = vec![echo, answer];
+        rank_lexical_candidates("routing strzałek taby", &mut results);
+
+        assert_eq!(results[0].label, "answer", "{results:?}");
+    }
+
+    #[test]
+    fn lexical_public_quality_score_preserves_headroom_below_one_hundred() {
+        let mut result = fuzzy(145, "conversations", "2026-07-24", None);
+        result.label = "lexical_tantivy:answer".to_string();
+        result.project = "vetcoders/vc-frame".to_string();
+        result.matched_lines = vec!["W2-B-4c makes vc-frame tabs grow from the base.".to_string()];
+
+        let score = semantic_quality_score("W2-B-4c tabs grow from base", &result);
+
+        assert!(score < 100, "lexical evidence must not saturate: {score}");
+        assert!(score >= 70, "strong exact evidence scored too low: {score}");
+    }
+
+    #[test]
+    fn lexical_public_quality_score_matches_polish_inflection_prefixes() {
+        let mut inflected = fuzzy(70, "conversations", "2026-07-22", None);
+        inflected.label = "lexical_tantivy:inflected".to_string();
+        inflected.matched_lines =
+            vec!["Górne taby obsługują nawigację przez strzałki.".to_string()];
+        let mut partial = inflected.clone();
+        partial.label = "lexical_tantivy:partial".to_string();
+        partial.matched_lines = vec!["Górne taby są widoczne.".to_string()];
+
+        let inflected_score = semantic_quality_score("routing strzałek taby", &inflected);
+        let partial_score = semantic_quality_score("routing strzałek taby", &partial);
+
+        assert!(
+            inflected_score > partial_score,
+            "Polish inflection should count as term coverage: {inflected_score} <= {partial_score}"
+        );
     }
 
     #[test]

@@ -2093,7 +2093,7 @@ fn steer_help_stays_short_and_scope_oriented() {
         .expect("steer subcommand should exist");
     let rendered = steer.render_help().to_string();
 
-    assert!(rendered.contains("Retrieve chunks by steering metadata"));
+    assert!(rendered.contains("Retrieve chunks by metadata from the published CURRENT index"));
     assert!(rendered.contains("--project <PROJECT>"));
     assert!(!rendered.contains("aicx steer --run-id mrbl-001"));
     assert!(!rendered.contains("--no-redact-secrets"));

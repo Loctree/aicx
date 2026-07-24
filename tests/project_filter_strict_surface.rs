@@ -545,8 +545,8 @@ fn dashboard_path_rejects_substring_leak() {
 }
 
 #[test]
-fn steer_index_path_rejects_substring_leak() {
-    // `metadata_matches` in `src/steer_index/search.rs` is crate-private. Replicate
+fn steer_current_path_rejects_substring_leak() {
+    // `metadata_matches` in `src/steer_index/mod.rs` is crate-private. Replicate
     // its exact split-and-delegate shape against the canonical helper so the
     // contract this surface promises is locked in at the test boundary.
     let (organization, repository) = split_slug(LEAKY_CANDIDATE_SLUG);
@@ -562,9 +562,9 @@ fn steer_index_path_rejects_substring_leak() {
     );
 
     // Source-level invariant: the canonical helper is invoked from the
-    // steer-index candidate filter, and the old `lowercase().contains`
-    // sibling is gone. Guards against silent regression in B-2's file.
-    let src = read_source("src/steer_index/search.rs");
+    // CURRENT-index candidate filter, and the old `lowercase().contains`
+    // sibling is gone. Guards against silent regression in the live backend.
+    let src = read_source("src/steer_index/mod.rs");
     assert!(
         src.contains("crate::legacy_archive::project_filter_matches"),
         "steer-index lost its routing to canonical `project_filter_matches`"
