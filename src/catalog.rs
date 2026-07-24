@@ -22,7 +22,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::legacy_archive::{self};
-use crate::session_catalog::{AgentKind, CatalogSource, SessionCatalog};
+use crate::session_catalog::{AgentKind, CatalogIoStats, CatalogSource, SessionCatalog};
 
 pub const CATALOG_DIRNAME: &str = "catalog";
 pub const SESSIONS_FILENAME: &str = "sessions.jsonl";
@@ -78,6 +78,42 @@ pub struct RebuildReport {
     pub catalog_path: String,
     pub wall_ms: u64,
     pub cards_written: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RebuildStage {
+    Preparing,
+    ScanningSources,
+    EnrichingSessions,
+    SnapshottingRuntimeRuns,
+    Serializing,
+    Writing,
+    Complete,
+}
+
+#[derive(Debug, Clone)]
+pub struct RebuildProgress {
+    pub stage: RebuildStage,
+    pub agent: Option<&'static str>,
+    pub agent_index: usize,
+    pub agent_total: usize,
+    pub io: CatalogIoStats,
+    pub sessions: usize,
+    pub elapsed_ms: u64,
+}
+
+impl RebuildProgress {
+    pub fn preparing() -> Self {
+        Self {
+            stage: RebuildStage::Preparing,
+            agent: None,
+            agent_index: 0,
+            agent_total: 5,
+            io: CatalogIoStats::default(),
+            sessions: 0,
+            elapsed_ms: 0,
+        }
+    }
 }
 
 pub fn catalog_dir_for(home: &Path) -> PathBuf {
@@ -150,16 +186,34 @@ pub fn project_identities_from_catalog_at(aicx_home: &Path) -> Result<Vec<String
 /// cwd/project/title when available, and writes one jsonl line per
 /// session. Never creates per-frame card files under `store/`.
 pub fn rebuild(home: &Path, user_home: &Path) -> Result<RebuildReport> {
+    rebuild_with_progress(home, user_home, |_| {})
+}
+
+pub fn rebuild_with_progress(
+    home: &Path,
+    user_home: &Path,
+    mut on_progress: impl FnMut(&RebuildProgress),
+) -> Result<RebuildReport> {
     let started = Instant::now();
     let mut by_id: BTreeMap<(String, String), CatalogEntry> = BTreeMap::new();
+    let mut progress = RebuildProgress::preparing();
+    on_progress(&progress);
 
-    for agent in [
+    let agents = [
         AgentKind::Claude,
         AgentKind::Codex,
         AgentKind::Gemini,
         AgentKind::Grok,
         AgentKind::Junie,
-    ] {
+    ];
+    for (agent_offset, agent) in agents.into_iter().enumerate() {
+        progress.stage = RebuildStage::ScanningSources;
+        progress.agent = Some(agent.as_str());
+        progress.agent_index = agent_offset + 1;
+        progress.io = CatalogIoStats::default();
+        progress.elapsed_ms = started.elapsed().as_millis() as u64;
+        on_progress(&progress);
+
         let root = agent_source_root(agent, user_home);
         if !root.exists() {
             continue;
@@ -168,7 +222,12 @@ pub fn rebuild(home: &Path, user_home: &Path) -> Result<RebuildReport> {
             Ok(c) => c,
             Err(_) => continue,
         };
-        let scan = catalog.scan_with_stats();
+        let scan = catalog.scan_with_stats_and_progress(|io| {
+            progress.io = io.clone();
+            progress.sessions = by_id.len();
+            progress.elapsed_ms = started.elapsed().as_millis() as u64;
+            on_progress(&progress);
+        });
         let sources = match scan.result {
             Ok(s) => s,
             Err(_) => continue,
@@ -180,14 +239,31 @@ pub fn rebuild(home: &Path, user_home: &Path) -> Result<RebuildReport> {
             let entry = entry_from_source(agent, &source);
             by_id.insert((entry.agent.clone(), entry.session_id.clone()), entry);
         }
+        progress.io = scan.stats;
+        progress.sessions = by_id.len();
+        progress.elapsed_ms = started.elapsed().as_millis() as u64;
+        on_progress(&progress);
     }
 
     // Enrich with sessions discovery (cwd / project / title / dates).
+    progress.stage = RebuildStage::EnrichingSessions;
+    progress.agent = None;
+    progress.sessions = by_id.len();
+    progress.elapsed_ms = started.elapsed().as_millis() as u64;
+    on_progress(&progress);
     enrich_from_sessions_discovery(&mut by_id, user_home);
 
     // vibecrafted runtime_runs — snapshot identity before collector GC.
+    progress.stage = RebuildStage::SnapshottingRuntimeRuns;
+    progress.sessions = by_id.len();
+    progress.elapsed_ms = started.elapsed().as_millis() as u64;
+    on_progress(&progress);
     enrich_runtime_runs(&mut by_id, user_home);
 
+    progress.stage = RebuildStage::Serializing;
+    progress.sessions = by_id.len();
+    progress.elapsed_ms = started.elapsed().as_millis() as u64;
+    on_progress(&progress);
     let catalog_path = sessions_path_for(home);
     fs::create_dir_all(catalog_dir_for(home))
         .with_context(|| format!("create catalog dir {}", catalog_dir_for(home).display()))?;
@@ -203,17 +279,26 @@ pub fn rebuild(home: &Path, user_home: &Path) -> Result<RebuildReport> {
         body.push_str(&serde_json::to_string(entry)?);
         body.push('\n');
     }
+    progress.stage = RebuildStage::Writing;
+    progress.sessions = by_id.len();
+    progress.elapsed_ms = started.elapsed().as_millis() as u64;
+    on_progress(&progress);
     legacy_archive::atomic_write::atomic_write(&catalog_path, body.as_bytes())
         .with_context(|| format!("write catalog {}", catalog_path.display()))?;
 
-    Ok(RebuildReport {
+    let report = RebuildReport {
         total_sessions: by_id.len(),
         agents,
         projects,
         catalog_path: catalog_path.display().to_string(),
         wall_ms: started.elapsed().as_millis() as u64,
         cards_written: 0,
-    })
+    };
+    progress.stage = RebuildStage::Complete;
+    progress.sessions = report.total_sessions;
+    progress.elapsed_ms = report.wall_ms;
+    on_progress(&progress);
+    Ok(report)
 }
 
 /// Resolve a session_id → source_path from the durable catalog (exact id match).

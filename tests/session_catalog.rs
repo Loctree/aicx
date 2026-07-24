@@ -117,11 +117,20 @@ fn filename_uuid_owns_source_while_root_drift_and_children_stay_explicit() {
     );
 
     let catalog = SessionCatalog::new(AgentKind::Claude, root.path()).unwrap();
-    let scan = catalog.scan_with_stats();
+    let mut progress = Vec::new();
+    let scan = catalog.scan_with_stats_and_progress(|stats| progress.push(stats.clone()));
     let scanned = scan.result.unwrap();
     assert_eq!(scanned.len(), 2);
     assert_eq!(scan.stats.files_opened, 2);
     assert_eq!(scan.stats.body_reads, 0);
+    assert!(
+        progress.windows(2).all(
+            |pair| pair[0].directories_visited <= pair[1].directories_visited
+                && pair[0].files_opened <= pair[1].files_opened
+        ),
+        "progress counters must be monotonic: {progress:?}"
+    );
+    assert_eq!(progress.last(), Some(&scan.stats));
     let drifted = catalog.resolve("root-after-compact").unwrap();
     assert_eq!(drifted.source.source_id, UUID_A);
     assert_eq!(

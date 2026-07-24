@@ -91,6 +91,50 @@ fn write_claude_session_fixture_with_cwd(
     write_file(path, &row.to_string());
 }
 
+#[test]
+fn catalog_rebuild_reports_clear_progress_without_corrupting_json() {
+    let root = unique_test_dir("catalog-progress");
+    let source = root
+        .join(".claude")
+        .join("projects")
+        .join("-repo")
+        .join("progress-session.jsonl");
+    write_claude_session_fixture(
+        &source,
+        Some("progress-session"),
+        "catalog progress fixture",
+    );
+
+    let output = Command::new(ensure_aicx_binary_exists())
+        .args(["catalog", "rebuild", "--json"])
+        .env("HOME", &root)
+        .env("USERPROFILE", &root)
+        .env("AICX_ALLOW_TMP", "1")
+        .env_remove("AICX_HOME")
+        .output()
+        .expect("run catalog rebuild");
+    assert!(
+        output.status.success(),
+        "catalog rebuild failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let report: Value = serde_json::from_slice(&output.stdout).expect("stdout remains JSON");
+    assert_eq!(report["cards_written"], 0);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("aicx catalog rebuild · preparing source roots"),
+        "missing start feedback:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("aicx catalog rebuild · complete"),
+        "missing completion feedback:\n{stderr}"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
 fn current_profile_dir() -> PathBuf {
     let test_exe = std::env::current_exe().expect("resolve current test executable");
     test_exe

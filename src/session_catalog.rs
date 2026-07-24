@@ -278,8 +278,22 @@ impl SessionCatalog {
     /// No cache is retained, so add/remove/rename/content changes are observed
     /// on every call and cached state can never become correctness authority.
     pub fn scan_with_stats(&self) -> CatalogScan {
+        self.scan_with_stats_and_progress(|_| {})
+    }
+
+    /// Rebuild the catalog while exposing live I/O counters to a progress sink.
+    ///
+    /// The callback is synchronous and must stay cheap. It is invoked after
+    /// each visited directory and each probed source so callers can throttle
+    /// display updates without guessing whether the scan is still alive.
+    pub fn scan_with_stats_and_progress(
+        &self,
+        mut on_progress: impl FnMut(&CatalogIoStats),
+    ) -> CatalogScan {
         let mut stats = CatalogIoStats::default();
-        let result = self.scan_sources(&mut stats);
+        on_progress(&stats);
+        let result = self.scan_sources_with_progress(&mut stats, &mut on_progress);
+        on_progress(&stats);
         CatalogScan { result, stats }
     }
 
@@ -339,14 +353,26 @@ impl SessionCatalog {
         resolve_from_sources(self.agent, query, sources)
     }
 
-    fn scan_sources(&self, stats: &mut CatalogIoStats) -> Result<Vec<CatalogSource>, CatalogError> {
-        let candidates = self.collect_candidate_paths(stats)?;
-        self.probe_candidates(&candidates, stats)
+    fn scan_sources_with_progress(
+        &self,
+        stats: &mut CatalogIoStats,
+        on_progress: &mut dyn FnMut(&CatalogIoStats),
+    ) -> Result<Vec<CatalogSource>, CatalogError> {
+        let candidates = self.collect_candidate_paths_with_progress(stats, on_progress)?;
+        self.probe_candidates_with_progress(&candidates, stats, on_progress)
     }
 
     fn collect_candidate_paths(
         &self,
         stats: &mut CatalogIoStats,
+    ) -> Result<Vec<CandidatePath>, CatalogError> {
+        self.collect_candidate_paths_with_progress(stats, &mut |_| {})
+    }
+
+    fn collect_candidate_paths_with_progress(
+        &self,
+        stats: &mut CatalogIoStats,
+        on_progress: &mut dyn FnMut(&CatalogIoStats),
     ) -> Result<Vec<CandidatePath>, CatalogError> {
         let mut pending = vec![(self.root.clone(), 0usize)];
         let mut paths = BTreeSet::new();
@@ -384,6 +410,8 @@ impl SessionCatalog {
                 }
                 paths.insert(path);
             }
+            stats.metadata_candidates = paths.len();
+            on_progress(stats);
         }
 
         let mut candidates = Vec::with_capacity(paths.len());
@@ -426,9 +454,11 @@ impl SessionCatalog {
                 filename_uuid,
                 fingerprint: SourceFingerprint::from_metadata(&metadata),
             });
+            on_progress(stats);
         }
         candidates.sort_by(|left, right| left.path.cmp(&right.path));
         stats.metadata_candidates = candidates.len();
+        on_progress(stats);
         Ok(candidates)
     }
 
@@ -437,6 +467,15 @@ impl SessionCatalog {
         candidates: &[CandidatePath],
         stats: &mut CatalogIoStats,
     ) -> Result<Vec<CatalogSource>, CatalogError> {
+        self.probe_candidates_with_progress(candidates, stats, &mut |_| {})
+    }
+
+    fn probe_candidates_with_progress(
+        &self,
+        candidates: &[CandidatePath],
+        stats: &mut CatalogIoStats,
+        on_progress: &mut dyn FnMut(&CatalogIoStats),
+    ) -> Result<Vec<CatalogSource>, CatalogError> {
         let mut sources = Vec::with_capacity(candidates.len());
         for candidate in candidates {
             match self.probe_candidate(candidate, stats) {
@@ -444,6 +483,7 @@ impl SessionCatalog {
                 Ok(None) | Err(CatalogError::Io { .. }) => stats.rejected_paths += 1,
                 Err(error) => return Err(error),
             }
+            on_progress(stats);
         }
         sources.sort_by(|left, right| {
             left.source_id

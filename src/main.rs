@@ -29,6 +29,9 @@ use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
 
 mod cli_config;
 
@@ -6961,7 +6964,45 @@ fn parse_date_filter(s: &str) -> Result<(Option<String>, Option<String>)> {
 fn run_catalog_rebuild(json: bool) -> Result<()> {
     let aicx_home = aicx::aicx_home::resolve()?;
     let user_home = aicx::os_user_home().context("No home dir")?;
-    let report = aicx::catalog::rebuild(&aicx_home, &user_home)?;
+    let progress = Arc::new(Mutex::new(aicx::catalog::RebuildProgress::preparing()));
+    let worker_progress = Arc::clone(&progress);
+    let worker = thread::spawn(move || {
+        aicx::catalog::rebuild_with_progress(&aicx_home, &user_home, |update| {
+            if let Ok(mut current) = worker_progress.lock() {
+                *current = update.clone();
+            }
+        })
+    });
+
+    let interactive = io::stderr().is_terminal();
+    let started = Instant::now();
+    let mut last_stage = None;
+    let mut last_log = Instant::now()
+        .checked_sub(Duration::from_secs(10))
+        .unwrap_or_else(Instant::now);
+    loop {
+        let snapshot = progress
+            .lock()
+            .map(|current| current.clone())
+            .unwrap_or_else(|_| aicx::catalog::RebuildProgress::preparing());
+        let stage_changed = last_stage != Some(snapshot.stage);
+        if interactive || stage_changed || last_log.elapsed() >= Duration::from_secs(10) {
+            render_catalog_progress(&snapshot, started.elapsed(), interactive)?;
+            last_stage = Some(snapshot.stage);
+            last_log = Instant::now();
+        }
+        if worker.is_finished() {
+            break;
+        }
+        thread::sleep(Duration::from_secs(1));
+    }
+    let worker_result = worker
+        .join()
+        .map_err(|_| anyhow::anyhow!("catalog rebuild worker panicked"))?;
+    if interactive {
+        eprintln!();
+    }
+    let report = worker_result?;
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
@@ -6983,6 +7024,60 @@ fn run_catalog_rebuild(json: bool) -> Result<()> {
                 eprintln!("    {project:<40} {count}");
             }
         }
+    }
+    Ok(())
+}
+
+fn render_catalog_progress(
+    progress: &aicx::catalog::RebuildProgress,
+    elapsed: Duration,
+    interactive: bool,
+) -> Result<()> {
+    use aicx::catalog::RebuildStage;
+
+    let elapsed_secs = elapsed.as_secs();
+    let message = match progress.stage {
+        RebuildStage::Preparing => {
+            format!("aicx catalog rebuild · preparing source roots · {elapsed_secs}s")
+        }
+        RebuildStage::ScanningSources => format!(
+            "aicx catalog rebuild · sources {}/{} {} · {} dirs · {} candidates · {} headers · {} sessions · {}s",
+            progress.agent_index,
+            progress.agent_total,
+            progress.agent.unwrap_or("unknown"),
+            progress.io.directories_visited,
+            progress.io.metadata_candidates,
+            progress.io.files_opened,
+            progress.sessions,
+            elapsed_secs
+        ),
+        RebuildStage::EnrichingSessions => format!(
+            "aicx catalog rebuild · enriching project/title metadata · {} sessions · {}s",
+            progress.sessions, elapsed_secs
+        ),
+        RebuildStage::SnapshottingRuntimeRuns => format!(
+            "aicx catalog rebuild · snapshotting runtime-run identities · {} sessions · {}s",
+            progress.sessions, elapsed_secs
+        ),
+        RebuildStage::Serializing => format!(
+            "aicx catalog rebuild · serializing catalog · {} sessions · {}s",
+            progress.sessions, elapsed_secs
+        ),
+        RebuildStage::Writing => format!(
+            "aicx catalog rebuild · atomically writing sessions.jsonl · {} sessions · {}s",
+            progress.sessions, elapsed_secs
+        ),
+        RebuildStage::Complete => format!(
+            "aicx catalog rebuild · complete · {} sessions · {}s",
+            progress.sessions, elapsed_secs
+        ),
+    };
+
+    if interactive {
+        eprint!("\r\x1b[2K{message}");
+        io::stderr().flush()?;
+    } else {
+        eprintln!("{message}");
     }
     Ok(())
 }
