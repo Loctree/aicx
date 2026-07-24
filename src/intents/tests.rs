@@ -72,6 +72,7 @@ fn extract_demo_extraction(label: &str, body: &str) -> IntentExtraction {
 }
 
 #[test]
+#[cfg(feature = "app")]
 fn catalog_source_replaces_retired_cards_for_intent_extraction() {
     let root = migration_test_root("catalog-source");
     let _ = fs::remove_dir_all(&root);

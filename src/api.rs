@@ -283,6 +283,23 @@ pub fn index_status_at(base: &Path, project: Option<&str>) -> Result<IndexStatus
     index_status_at_with_sessions(base, project, None)
 }
 
+#[cfg(feature = "app")]
+fn catalog_projects_for_status(base: &Path) -> Vec<Option<String>> {
+    crate::catalog::read_entries_at(base)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|entry| entry.project)
+        .collect()
+}
+
+#[cfg(not(feature = "app"))]
+fn catalog_projects_for_status(_base: &Path) -> Vec<Option<String>> {
+    // The slim library profile intentionally excludes source discovery and
+    // catalog ingestion. Status remains bounded and reports legacy read-core
+    // state without pulling the app graph into `loctree-consumer`.
+    Vec::new()
+}
+
 fn index_status_at_with_sessions(
     base: &Path,
     project: Option<&str>,
@@ -313,7 +330,7 @@ fn index_status_at_with_sessions(
     // Boundedness first: when CURRENT/catalog/residual mill are all absent,
     // report Missing immediately. Never walk live agent trees (codex 42 GB,
     // claude 5.9 GB) just to print "missing" — audit measured >60 s hangs.
-    let catalog_entries = crate::catalog::read_entries_at(base).unwrap_or_default();
+    let catalog_entries = catalog_projects_for_status(base);
     let residual_mill_present = residual_store_surface_present(base);
     if catalog_entries.is_empty()
         && !residual_mill_present
@@ -361,9 +378,8 @@ fn index_status_at_with_sessions(
             None => catalog_entries.len(),
             Some(filter) => catalog_entries
                 .iter()
-                .filter(|entry| {
-                    entry
-                        .project
+                .filter(|project| {
+                    project
                         .as_deref()
                         .is_some_and(|p| p.eq_ignore_ascii_case(filter))
                 })
@@ -446,9 +462,8 @@ fn index_status_at_with_sessions(
             None => catalog_entries.len(),
             Some(filter) => catalog_entries
                 .iter()
-                .filter(|entry| {
-                    entry
-                        .project
+                .filter(|project| {
+                    project
                         .as_deref()
                         .is_some_and(|p| p.eq_ignore_ascii_case(filter))
                 })
@@ -539,16 +554,15 @@ fn hybrid_current_index_status(base: &Path, project: Option<&str>) -> Result<Opt
         return Ok(None);
     }
 
-    let catalog_entries = crate::catalog::read_entries_at(base).unwrap_or_default();
+    let catalog_entries = catalog_projects_for_status(base);
     let catalog_total = catalog_entries.len();
     let project_filter = project.map(str::trim).filter(|value| !value.is_empty());
     let catalog_in_scope = match project_filter {
         None => catalog_total,
         Some(filter) => catalog_entries
             .iter()
-            .filter(|entry| {
-                entry
-                    .project
+            .filter(|project| {
+                project
                     .as_deref()
                     .is_some_and(|project| project.eq_ignore_ascii_case(filter))
             })

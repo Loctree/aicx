@@ -193,6 +193,8 @@ mod loctree_consumer_contract_tests {
         let client = Aicx::with_aicx_home(&root);
         assert!(client.list_chunks().expect("list chunks").is_empty());
         assert!(client.read_chunk("chunk:abcdef12", Some(16)).is_err());
+        let status = api::index_status_at(&root, None).expect("read slim index status");
+        assert!(matches!(status.readiness, api::IndexReadiness::Missing));
 
         let parsed =
             legacy_archive::ChunkRefSpec::parse("chunk:abcdef12").expect("typed chunk ref");
@@ -214,6 +216,11 @@ mod loctree_consumer_contract_tests {
             timeline::FrameKind::UserMsg,
             "intent defaults stay available in the slim profile"
         );
+        let extraction =
+            intents::extract_intents_from_root_at_with_stats(&config, &root, chrono::Utc::now())
+                .expect("extract slim intents");
+        assert!(extraction.records.is_empty());
+        assert_eq!(extraction.stats.source_errors, 0);
 
         let _session_type: Option<sessions::SessionInfo> = None;
         let _ = std::fs::remove_dir_all(root);

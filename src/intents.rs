@@ -341,6 +341,7 @@ fn extend_with_cap<T>(
     dropped
 }
 
+#[cfg(feature = "app")]
 fn collect_intent_files(
     aicx_home: &Path,
     project: &str,
@@ -432,6 +433,24 @@ fn collect_intent_files(
             .then_with(|| left.path.cmp(&right.path))
     });
     Ok((files, source_errors, CATALOG_IDENTITY_SOURCE))
+}
+
+#[cfg(not(feature = "app"))]
+fn collect_intent_files(
+    aicx_home: &Path,
+    project: &str,
+    cutoff: DateTime<Utc>,
+    frame_kind: FrameKind,
+) -> Result<(Vec<StoredChunkFile>, usize, &'static str)> {
+    // `loctree-consumer` is the legacy read-core profile: it deliberately
+    // excludes app-only source discovery and catalog parsing. Keep pure intent
+    // extraction available over explicitly supplied legacy artifacts without
+    // pulling the full CLI/index graph into the library feature.
+    Ok((
+        collect_legacy_chunk_files(aicx_home, project, cutoff, frame_kind)?,
+        0,
+        PERSISTED_IDENTITY_SOURCE,
+    ))
 }
 
 fn collect_legacy_chunk_files(
