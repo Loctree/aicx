@@ -557,7 +557,10 @@ plan\t''
 reports\t''
 report\t''
 other\t''"
-complete -c aicx -n "__fish_aicx_using_subcommand search" -l no-semantic -d 'Bypass semantic vector search and run filesystem-fuzzy search'
+complete -c aicx -n "__fish_aicx_using_subcommand search" -l session -d 'Search passages inside one catalog session instead of ranking sessions' -r
+complete -c aicx -n "__fish_aicx_using_subcommand search" -l context -d 'Context lines before and after each passage match (default: 2)' -r
+complete -c aicx -n "__fish_aicx_using_subcommand search" -l literal -d 'Match an exact, identifier-boundary substring inside --session'
+complete -c aicx -n "__fish_aicx_using_subcommand search" -l no-semantic -d 'Force lexical-only retrieval from the published CURRENT index'
 complete -c aicx -n "__fish_aicx_using_subcommand search" -l evidence -d 'Return an evidence packet: semantic candidates re-ranked by answer/support signals, with source sections and diagnostics'
 complete -c aicx -n "__fish_aicx_using_subcommand search" -s j -l json -d 'Emit compact JSON instead of plain text'
 complete -c aicx -n "__fish_aicx_using_subcommand search" -l legacy-dense -d 'Use legacy NDJSON reader for dense vector search instead of versioned mmap'

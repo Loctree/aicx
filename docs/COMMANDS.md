@@ -99,13 +99,31 @@ aicx search -p owner/repo <query>
 aicx search -p owner/ <query>
 aicx search -p /repo <query>
 aicx search --deep <query>
+aicx search --no-semantic <query>
+aicx search --session <session-id> <query>
+aicx search --session <session-id> --literal --context 4 <query>
 aicx search --json <query>
 ```
 
 The default route is Tantivy lexical search with a recency prior. `--deep`
 adds dense mmap re-ranking. A bounded, recency-ranked filesystem fallback is
 used only when the typed failure is `IndexNotBuilt`; corrupt, stale, or busy
-indexes fail honestly.
+indexes fail honestly. `--no-semantic` is stricter: it reads the published
+CURRENT lexical generation or returns a typed error, and never falls through
+to filesystem fuzzy search.
+
+`--session` is the last-mile passage route after a session-level hit. It reads
+the cached whole-session extract when present; otherwise it parses the live
+source through the same signal-only path as the index without writing a cache.
+Token matching is the default. `--literal` performs an exact,
+identifier-boundary match. Passages are source ordered, stably numbered, and
+include a line span, source path, and ±2 context lines by default (`--context
+N` overrides it).
+
+Every search prints `scanned N of M sessions; skipped: ...` to stderr.
+Machine-readable output also carries the same structured `coverage` object.
+Missing CURRENT rows are counted per extractor (for example,
+`gemini_unindexed=116`) instead of becoming silent holes.
 
 Project filters are exact by default. Ambiguous bare repository names fail
 closed; `--project-fuzzy` is an explicit opt-in.

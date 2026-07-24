@@ -1063,7 +1063,10 @@ _arguments "${_arguments_options[@]}" : \
 '--until=[Upper date bound\: YYYY-MM-DD]:UNTIL:_default' \
 '--frame-kind=[Frame channel filter\: user_msg | agent_reply | internal_thought | tool_call]:FRAME_KIND:(user_msg agent_reply internal_thought tool_call)' \
 '--kind=[Filter by indexed document kind\: conversations, plans, reports, other]:KIND:(conversations conversation plans plan reports report other)' \
-'(--evidence)--no-semantic[Bypass semantic vector search and run filesystem-fuzzy search]' \
+'--session=[Search passages inside one catalog session instead of ranking sessions]:SESSION:_default' \
+'--context=[Context lines before and after each passage match (default\: 2)]:N:_default' \
+'--literal[Match an exact, identifier-boundary substring inside --session]' \
+'(--evidence)--no-semantic[Force lexical-only retrieval from the published CURRENT index]' \
 '--evidence[Return an evidence packet\: semantic candidates re-ranked by answer/support signals, with source sections and diagnostics]' \
 '-j[Emit compact JSON instead of plain text]' \
 '--json[Emit compact JSON instead of plain text]' \
