@@ -552,6 +552,9 @@ fn run_search_rejects_limit_over_hard_cap_before_store_access() {
         json: false,
         filters,
         kind: None,
+        session: None,
+        literal: false,
+        context: 2,
         no_semantic: true,
         evidence: false,
         deep: false,
@@ -1464,6 +1467,45 @@ fn search_accepts_no_semantic_escape_hatch() {
         }
         _ => panic!("expected search command"),
     }
+}
+
+#[test]
+fn search_accepts_session_passage_grammar() {
+    let cli = Cli::try_parse_from([
+        "aicx",
+        "search",
+        "vc-trust",
+        "--session",
+        "f842d85e",
+        "--literal",
+        "--context",
+        "4",
+        "--json",
+    ])
+    .expect("session passage search grammar should parse");
+
+    match cli.command {
+        Some(Commands::Search {
+            session,
+            literal,
+            context,
+            json,
+            ..
+        }) => {
+            assert_eq!(session.as_deref(), Some("f842d85e"));
+            assert!(literal);
+            assert_eq!(context, Some(4));
+            assert!(json);
+        }
+        _ => panic!("expected search command"),
+    }
+}
+
+#[test]
+fn search_literal_requires_session_scope() {
+    let err = Cli::try_parse_from(["aicx", "search", "vc-trust", "--literal"])
+        .expect_err("--literal without --session must fail at the grammar boundary");
+    assert!(err.to_string().contains("--session"));
 }
 
 #[test]

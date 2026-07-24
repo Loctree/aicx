@@ -172,6 +172,33 @@ impl TantivyAdapter {
         Ok(matches)
     }
 
+    /// Enumerate the exact committed chunk ids without decoding stored bodies.
+    ///
+    /// `id` is a unique STRING term, so the term dictionary is the cheapest
+    /// authoritative identity census for coverage reporting. A metadata scan
+    /// would decompress every whole-session body and add seconds to each
+    /// lexical query merely to print `scanned N of M`.
+    pub fn scan_chunk_ids(&self) -> Result<Vec<String>> {
+        let reader = self.index.reader().context("open tantivy reader")?;
+        let searcher = reader.searcher();
+        let mut ids = Vec::with_capacity(self.doc_count);
+        for segment in searcher.segment_readers() {
+            let inverted = segment
+                .inverted_index(self.fields.id)
+                .context("open chunk id term dictionary")?;
+            let mut terms = inverted.terms().stream().context("stream chunk id terms")?;
+            while terms.advance() {
+                let id = std::str::from_utf8(terms.key())
+                    .context("decode chunk id term as UTF-8")?
+                    .to_string();
+                ids.push(id);
+            }
+        }
+        ids.sort();
+        ids.dedup();
+        Ok(ids)
+    }
+
     fn refresh_stats(&mut self) -> Result<LexicalCommitId> {
         self.commit_id = read_commit_id(&self.index)?;
         self.doc_count = read_doc_count(&self.index)?;
@@ -1271,6 +1298,33 @@ mod swap_tests {
 
         assert_eq!(fs::read_to_string(target.join("marker")).unwrap(), "NEW");
         assert!(!staging.exists());
+    }
+
+    #[test]
+    fn chunk_id_census_reads_term_dictionary_without_stored_bodies() {
+        let tmp = TempDir::new().unwrap();
+        let mut adapter = TantivyAdapter::new(tmp.path().to_path_buf()).unwrap();
+        adapter
+            .build(&[
+                ChunkRef {
+                    id: "claude:f842d85e".to_string(),
+                    source_path: "/sessions/claude.md".to_string(),
+                    text: "large body ".repeat(10_000),
+                    metadata: serde_json::json!({"agent": "claude"}),
+                },
+                ChunkRef {
+                    id: "codex:af7bd7cc".to_string(),
+                    source_path: "/sessions/codex.md".to_string(),
+                    text: "another large body ".repeat(10_000),
+                    metadata: serde_json::json!({"agent": "codex"}),
+                },
+            ])
+            .unwrap();
+
+        assert_eq!(
+            adapter.scan_chunk_ids().unwrap(),
+            vec!["claude:f842d85e".to_string(), "codex:af7bd7cc".to_string()]
+        );
     }
 
     #[test]

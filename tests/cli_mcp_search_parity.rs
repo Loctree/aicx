@@ -11,7 +11,7 @@
 //!     -> search_engine::finalize_fuzzy_results
 //!     -> rank::search_oracle_status + rank::render_search_json_with_oracle
 //! (see `render_mcp_fuzzy_fallback_payload` in src/mcp.rs). The CLI fuzzy path
-//! (`aicx search --no-semantic`) routes through the exact same functions.
+//! (default search when CURRENT is absent) routes through the same functions.
 //!
 //! This test drives the real CLI binary as a subprocess and reproduces the MCP
 //! render path in-process, then asserts the rendered `items` are byte-identical.
@@ -124,16 +124,9 @@ fn cli_and_mcp_render_identical_search_items() {
     let aicx_home = home.join(".aicx");
     build_store_fixture(&aicx_home);
 
-    // --- CLI surface: real binary, fuzzy path (--no-semantic), JSON output. ---
+    // --- CLI surface: real binary, typed IndexNotBuilt fuzzy fallback. ---
     let output = Command::new(ensure_aicx_binary_exists())
-        .args([
-            "search",
-            QUERY,
-            "--json",
-            "--no-semantic",
-            "--limit",
-            &LIMIT.to_string(),
-        ])
+        .args(["search", QUERY, "--json", "--limit", &LIMIT.to_string()])
         .env("HOME", &home)
         .env("USERPROFILE", &home)
         .env("AICX_ALLOW_TMP", "1")
