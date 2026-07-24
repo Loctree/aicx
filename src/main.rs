@@ -1716,7 +1716,7 @@ enum Commands {
         json: bool,
     },
 
-    /// Retrieve chunks by steering metadata (requires --features lance).
+    /// Retrieve chunks by metadata from the published CURRENT index.
     Steer {
         /// Filter by run_id (exact match)
         #[arg(long)]

@@ -1,199 +1,217 @@
-//! BM25 + LanceDB steer index for fast session retrieval.
+//! Metadata-only retrieval over the published hybrid CURRENT generation.
 //!
-//! The steer index is a dual-layer search structure over catalog-backed
-//! extracts: a BM25 text index for keyword ranking and a LanceDB vector index
-//! for metadata-filtered recall. Public functions delegate AICX-home resolution
-//! to the runtime owner, keeping callers free of path logic.
+//! `aicx steer`, MCP `aicx_steer`, and the dashboard all read the same
+//! committed Tantivy documents as `aicx search`. There is no separate writer,
+//! Lance database, BM25 side index, or store scan to drift from CURRENT.
 //!
 //! Vibecrafted with AI Agents by Vetcoders (c)2026 Vetcoders
 
-#[cfg(feature = "lance")]
-mod documents;
-#[cfg(not(feature = "lance"))]
-mod fallback;
-#[cfg(feature = "lance")]
-mod hooks;
-#[cfg(feature = "lance")]
-mod lifecycle;
-#[cfg(feature = "lance")]
-mod metadata;
-#[cfg(feature = "lance")]
-mod paths;
-#[cfg(feature = "lance")]
-mod search;
-#[cfg(feature = "lance")]
-mod sync;
-#[cfg(feature = "lance")]
-mod types;
-
-#[cfg(all(test, feature = "lance"))]
-mod tests;
-
-use anyhow::Result;
-#[cfg(feature = "lance")]
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-
-use crate::progress::{FailureLog, Reporter};
+use anyhow::{Context, Result, bail};
 
 pub use crate::steer_index_contract::SteerFilter;
-#[cfg(feature = "lance")]
-use hooks::call_steer_read_lock_hook;
-#[cfg(feature = "lance")]
-use lifecycle::{
-    ensure_steer_index_compatible_at, ensure_steer_index_compatible_for_write_at,
-    query_steer_index_at, rebuild_steer_index_if_needed_at,
-};
-#[cfg(feature = "lance")]
-use metadata::{is_steer_incompatible, warn_if_steer_incompatible};
-#[cfg(feature = "lance")]
-use paths::steer_lock_path_at;
-#[cfg(feature = "lance")]
-use search::{search_bm25_candidates_at, search_store_scan_at};
-#[cfg(feature = "lance")]
-use sync::{sync_steer_index_at, sync_steer_index_at_with_reporter};
-#[cfg(feature = "lance")]
-pub use types::SteerIncompatible;
-
-/// Builds or updates the fast steer index using rmcp-memex LanceDB backend.
-/// Treats the sidecar as the source of truth for every touched chunk.
-pub async fn sync_steer_index(new_files: &[&PathBuf]) -> Result<()> {
-    #[cfg(not(feature = "lance"))]
-    {
-        fallback::sync_noop(new_files).await
-    }
-
-    #[cfg(feature = "lance")]
-    {
-        if new_files.is_empty() {
-            return Ok(());
-        }
-
-        let base = crate::aicx_home::ensure()?;
-        let _lock = crate::locks::acquire_exclusive(crate::locks::steer_lock_path()?)?;
-        ensure_steer_index_compatible_for_write_at(&base).await?;
-        sync_steer_index_at(&base, new_files).await
-    }
-}
-
-/// Instrumented variant of [`sync_steer_index`] that emits Phase events
-/// (`steer_sync` and `bm25_sync`) through `reporter` and pushes any
-/// phase failure into `failures` before propagating the error to the
-/// caller. The existing [`sync_steer_index`] entry point keeps its
-/// signature and behavior; new code paths that want progress visibility
-/// should call this variant.
-pub async fn sync_steer_index_with_progress(
-    new_files: &[&PathBuf],
-    reporter: Arc<dyn Reporter>,
-    failures: &FailureLog,
-) -> Result<()> {
-    #[cfg(not(feature = "lance"))]
-    {
-        fallback::sync_with_progress_noop(new_files, reporter, failures).await
-    }
-
-    #[cfg(feature = "lance")]
-    {
-        if new_files.is_empty() {
-            return Ok(());
-        }
-
-        let base = crate::aicx_home::ensure()?;
-        let _lock = crate::locks::acquire_exclusive(crate::locks::steer_lock_path()?)?;
-        ensure_steer_index_compatible_for_write_at(&base).await?;
-        sync_steer_index_at_with_reporter(&base, new_files, reporter, failures).await
-    }
-}
 
 pub async fn query_steer_index_count() -> Result<usize> {
-    #[cfg(not(feature = "lance"))]
-    {
-        fallback::query_count_disabled().await
-    }
-
-    #[cfg(feature = "lance")]
-    {
-        let base = crate::aicx_home::ensure()?;
-        let _lock = crate::locks::acquire_shared(crate::locks::steer_lock_path()?)?;
-        call_steer_read_lock_hook();
-        if let Err(err) = ensure_steer_index_compatible_at(&base).await {
-            warn_if_steer_incompatible(&err);
-            if is_steer_incompatible(&err) {
-                return Ok(0);
-            }
-            return Err(err);
-        }
-        let docs = query_steer_index_at(&base).await?;
-        Ok(docs.len())
-    }
+    Ok(open_current_adapter()?.doc_count)
 }
 
-pub async fn try_rebuild_steer_index_if_needed_at(base: &Path) -> Result<()> {
-    #[cfg(not(feature = "lance"))]
-    {
-        let _ = base;
-        Ok(())
-    }
-
-    #[cfg(feature = "lance")]
-    {
-        fs::create_dir_all(base)?;
-        let _lock = crate::locks::acquire_exclusive(steer_lock_path_at(base))?;
-        rebuild_steer_index_if_needed_at(base).await
-    }
-}
-
+/// Compatibility shim for the old doctor flag.
+///
+/// A steer-specific rebuild no longer exists; CURRENT is rebuilt only by the
+/// canonical `aicx index` pipeline. The doctor surface removes this shim in the
+/// same migration series.
 pub async fn rebuild_steer_index_if_needed() -> Result<()> {
-    #[cfg(not(feature = "lance"))]
-    {
-        fallback::rebuild_if_needed_noop().await
-    }
-
-    #[cfg(feature = "lance")]
-    {
-        let base = crate::aicx_home::ensure()?;
-        try_rebuild_steer_index_if_needed_at(&base).await
-    }
+    bail!("the separate steer index is retired; rebuild CURRENT with `aicx index`")
 }
 
 pub async fn search_steer_index(
     filter: &SteerFilter<'_>,
     limit: usize,
 ) -> Result<Vec<serde_json::Value>> {
-    #[cfg(not(feature = "lance"))]
+    let adapter = open_current_adapter()?;
+    search_generation_metadata(&adapter, filter, limit)
+}
+
+fn open_current_adapter() -> Result<aicx_retrieve::TantivyAdapter> {
+    let hybrid_root =
+        crate::vector_index::hybrid_root_dir(None).context("resolve global hybrid index root")?;
+    let generation = crate::vector_index::resolve_hybrid_generation_dir(&hybrid_root);
+    let manifest_path = generation.join("manifest.json");
+    if !manifest_path.is_file() {
+        bail!(
+            "published CURRENT index is missing at {}; run `aicx index`",
+            manifest_path.display()
+        );
+    }
+    let manifest = aicx_retrieve::Manifest::read_from_path(&manifest_path)
+        .with_context(|| format!("read CURRENT manifest {}", manifest_path.display()))?;
+    if !manifest
+        .lexical_commit_id
+        .starts_with(aicx_retrieve::TANTIVY_SCHEMA_VERSION)
     {
-        fallback::search_disabled(filter, limit).await
+        bail!(
+            "CURRENT lexical artifact is incompatible (commit {}); run `aicx index`",
+            manifest.lexical_commit_id
+        );
+    }
+    let tantivy_meta = generation
+        .join(aicx_retrieve::TANTIVY_INDEX_DIR)
+        .join("meta.json");
+    if !tantivy_meta.is_file() {
+        bail!(
+            "CURRENT Tantivy metadata is missing at {}; run `aicx index`",
+            tantivy_meta.display()
+        );
+    }
+    aicx_retrieve::TantivyAdapter::new(generation).context("open CURRENT Tantivy metadata index")
+}
+
+fn search_generation_metadata(
+    adapter: &aicx_retrieve::TantivyAdapter,
+    filter: &SteerFilter<'_>,
+    limit: usize,
+) -> Result<Vec<serde_json::Value>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let mut matches = adapter.scan_metadata(adapter.doc_count, |metadata| {
+        metadata_matches(metadata, filter)
+    })?;
+    for metadata in &mut matches {
+        if metadata.get("path").is_none()
+            && let Some(source_path) = metadata.get("source_path").cloned()
+            && let Some(object) = metadata.as_object_mut()
+        {
+            object.insert("path".to_string(), source_path);
+        }
+    }
+    matches.sort_by(|left, right| {
+        metadata_date(right)
+            .cmp(metadata_date(left))
+            .then_with(|| metadata_path(left).cmp(metadata_path(right)))
+    });
+    matches.truncate(limit);
+    Ok(matches)
+}
+
+fn metadata_matches(metadata: &serde_json::Value, filter: &SteerFilter<'_>) -> bool {
+    if let Some(project) = filter.project {
+        let Some(stored) = metadata.get("project").and_then(|value| value.as_str()) else {
+            return false;
+        };
+        let (organization, repository) = stored.split_once('/').unwrap_or(("", stored));
+        if !crate::legacy_archive::project_filter_matches(organization, repository, project) {
+            return false;
+        }
+    }
+    exact_ci(metadata, "agent", filter.agent)
+        && exact_ci(metadata, "kind", filter.kind)
+        && exact(
+            metadata,
+            "frame_kind",
+            filter.frame_kind.map(|kind| kind.as_str()),
+        )
+        && exact(metadata, "run_id", filter.run_id)
+        && exact(metadata, "prompt_id", filter.prompt_id)
+        && date_in_range(metadata, filter.date_lo, filter.date_hi)
+}
+
+fn exact(metadata: &serde_json::Value, key: &str, expected: Option<&str>) -> bool {
+    expected
+        .is_none_or(|expected| metadata.get(key).and_then(|value| value.as_str()) == Some(expected))
+}
+
+fn exact_ci(metadata: &serde_json::Value, key: &str, expected: Option<&str>) -> bool {
+    expected.is_none_or(|expected| {
+        metadata
+            .get(key)
+            .and_then(|value| value.as_str())
+            .is_some_and(|actual| actual.eq_ignore_ascii_case(expected))
+    })
+}
+
+fn date_in_range(
+    metadata: &serde_json::Value,
+    date_lo: Option<&str>,
+    date_hi: Option<&str>,
+) -> bool {
+    if date_lo.is_none() && date_hi.is_none() {
+        return true;
+    }
+    let Some(date) = metadata.get("date").and_then(|value| value.as_str()) else {
+        return false;
+    };
+    date_lo.is_none_or(|lo| date >= lo) && date_hi.is_none_or(|hi| date <= hi)
+}
+
+fn metadata_date(metadata: &serde_json::Value) -> &str {
+    metadata
+        .get("timestamp")
+        .and_then(|value| value.as_str())
+        .or_else(|| metadata.get("date").and_then(|value| value.as_str()))
+        .unwrap_or("")
+}
+
+fn metadata_path(metadata: &serde_json::Value) -> &str {
+    metadata
+        .get("path")
+        .and_then(|value| value.as_str())
+        .or_else(|| metadata.get("source_path").and_then(|value| value.as_str()))
+        .unwrap_or("")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aicx_retrieve::{ChunkRef, LexicalIndex};
+    use serde_json::json;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn current_metadata_filter_preserves_exact_ids_and_newest_order() {
+        let temp = std::env::temp_dir().join(format!(
+            "aicx-steer-current-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut adapter = aicx_retrieve::TantivyAdapter::new(temp.clone()).unwrap();
+        let chunks = vec![
+            chunk("older", "2026-07-20", "prompt-target"),
+            chunk("newer", "2026-07-23", "prompt-target"),
+            chunk("other", "2026-07-24", "prompt-other"),
+        ];
+        adapter.build(&chunks).unwrap();
+
+        let filter = SteerFilter {
+            prompt_id: Some("prompt-target"),
+            project: Some("VetCoders/aicx"),
+            ..SteerFilter::default()
+        };
+        let matches = search_generation_metadata(&adapter, &filter, 10).unwrap();
+
+        assert_eq!(matches.len(), 2);
+        assert_eq!(matches[0]["date"], "2026-07-23");
+        assert_eq!(matches[0]["path"], "/tmp/newer.md");
+        assert_eq!(matches[1]["date"], "2026-07-20");
+
+        let _ = std::fs::remove_dir_all(temp);
     }
 
-    #[cfg(feature = "lance")]
-    {
-        let base = crate::aicx_home::ensure()?;
-        let _lock = crate::locks::acquire_shared(crate::locks::steer_lock_path()?)?;
-        call_steer_read_lock_hook();
-        if let Err(err) = ensure_steer_index_compatible_at(&base).await {
-            warn_if_steer_incompatible(&err);
-            if is_steer_incompatible(&err) {
-                return Ok(vec![]);
-            }
-            return Err(err);
+    fn chunk(id: &str, date: &str, prompt_id: &str) -> ChunkRef {
+        ChunkRef {
+            id: id.to_string(),
+            source_path: format!("/tmp/{id}.md"),
+            text: format!("body for {id}"),
+            metadata: json!({
+                "agent": "codex",
+                "date": date,
+                "project": "VetCoders/aicx",
+                "prompt_id": prompt_id,
+                "run_id": "run-1",
+                "kind": "report",
+            }),
         }
-
-        let candidate_results = match search_bm25_candidates_at(&base, filter, limit).await {
-            Ok(results) => results,
-            Err(err) => {
-                warn_if_steer_incompatible(&err);
-                if is_steer_incompatible(&err) {
-                    return Ok(vec![]);
-                }
-                return Err(err);
-            }
-        };
-
-        if candidate_results.len() >= limit || !candidate_results.is_empty() {
-            return Ok(candidate_results);
-        }
-
-        search_store_scan_at(&base, filter, limit)
     }
 }
