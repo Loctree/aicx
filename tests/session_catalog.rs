@@ -277,6 +277,54 @@ fn every_lookup_refreshes_metadata_so_add_remove_rename_and_rewrite_cannot_go_st
 }
 
 #[test]
+fn grok_session_dir_prefers_chat_history_over_telemetry_streams() {
+    let root = TestRoot::new("grok-multistream");
+    let encoded_cwd = "%2FVolumes%2Fvc-workspace%2Fvetcoders%2Fcodescribe";
+    let session_rel = format!("{encoded_cwd}/{UUID_A}");
+    // Conversation stream — no embedded session id; identity is the parent dir.
+    root.write(
+        format!("{session_rel}/chat_history.jsonl"),
+        r#"{"type":"user","content":"hello from chat"}
+{"type":"assistant","content":"hi back"}
+"#,
+    );
+    // Telemetry streams that *do* embed session_id — must never win identity.
+    root.write(
+        format!("{session_rel}/events.jsonl"),
+        &format!(
+            r#"{{"ts":"2026-07-23T00:00:00Z","type":"turn_started","session_id":"{UUID_A}"}}
+{{"ts":"2026-07-23T00:00:01Z","type":"phase_changed","phase":"idle"}}
+"#
+        ),
+    );
+    root.write(
+        format!("{session_rel}/hunk_records.jsonl"),
+        &format!(r#"{{"sessionId":"{UUID_A}","hunkId":"h1","filePath":"/tmp/x"}}"#),
+    );
+    root.write(
+        format!("{session_rel}/updates.jsonl"),
+        &format!(r#"{{"timestamp":1,"method":"x","params":{{"sessionId":"{UUID_A}"}}}}"#),
+    );
+
+    let catalog = SessionCatalog::new(AgentKind::Grok, root.path()).unwrap();
+    let resolved = catalog.resolve(UUID_A).unwrap();
+    assert_eq!(resolved.matched_by, MatchKind::ExactSourceId);
+    assert_eq!(resolved.source.source_id, UUID_A);
+    assert!(
+        resolved
+            .source
+            .path
+            .ends_with(format!("{UUID_A}/chat_history.jsonl")),
+        "expected chat_history primary, got {}",
+        resolved.source.path.display()
+    );
+
+    let scanned = catalog.scan_with_stats().result.unwrap();
+    assert_eq!(scanned.len(), 1, "only chat_history must be cataloged");
+    assert!(scanned[0].path.file_name().and_then(|n| n.to_str()) == Some("chat_history.jsonl"));
+}
+
+#[test]
 fn scan_matrix_covers_all_agent_header_shapes() {
     let fixtures = [
         (
@@ -284,12 +332,6 @@ fn scan_matrix_covers_all_agent_header_shapes() {
             UUID_A,
             codex_meta("codex-logical"),
             "codex-logical",
-        ),
-        (
-            AgentKind::Grok,
-            UUID_A,
-            codex_meta("grok-logical"),
-            "grok-logical",
         ),
         (
             AgentKind::Claude,
@@ -327,4 +369,23 @@ fn scan_matrix_covers_all_agent_header_shapes() {
             "agent={agent}"
         );
     }
+
+    // Grok: primary stream is always `chat_history.jsonl`; session identity is
+    // the parent directory UUID (body lines carry no session_id).
+    let root = TestRoot::new("grok-header-shape");
+    root.write(
+        format!("{UUID_A}/chat_history.jsonl"),
+        r#"{"type":"user","content":"grok-header"}
+{"type":"assistant","content":"ack"}
+"#,
+    );
+    let catalog = SessionCatalog::new(AgentKind::Grok, root.path()).unwrap();
+    let resolved = catalog.resolve(UUID_A).unwrap();
+    assert_eq!(resolved.source.source_id, UUID_A);
+    assert!(
+        resolved
+            .source
+            .path
+            .ends_with(format!("{UUID_A}/chat_history.jsonl"))
+    );
 }

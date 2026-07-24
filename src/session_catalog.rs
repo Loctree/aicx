@@ -52,6 +52,18 @@ impl AgentKind {
             Self::Claude | Self::Codex | Self::Junie | Self::Grok => extension == Some("jsonl"),
         }
     }
+
+    /// Grok session dirs carry multiple JSONL streams (chat, events, updates,
+    /// hunks, rewind). Only `chat_history.jsonl` is conversation content;
+    /// telemetry streams must not become catalog identity.
+    fn is_primary_source_file(self, path: &Path) -> bool {
+        match self {
+            Self::Grok => {
+                path.file_name().and_then(|name| name.to_str()) == Some("chat_history.jsonl")
+            }
+            _ => true,
+        }
+    }
 }
 
 impl fmt::Display for AgentKind {
@@ -366,6 +378,7 @@ impl SessionCatalog {
                     || !self
                         .agent
                         .accepts_extension(path.extension().and_then(|ext| ext.to_str()))
+                    || !self.agent.is_primary_source_file(&path)
                 {
                     continue;
                 }
@@ -379,16 +392,34 @@ impl SessionCatalog {
                 stats.rejected_paths += 1;
                 continue;
             };
-            let filename_aliases = filename_aliases(&path);
-            if filename_aliases.is_empty() {
-                stats.rejected_paths += 1;
-                continue;
-            }
+            let mut filename_aliases = filename_aliases(&path);
             let filename_uuid = path
                 .file_stem()
                 .and_then(|stem| stem.to_str())
                 .and_then(uuid_from_filename)
-                .map(str::to_ascii_lowercase);
+                .map(str::to_ascii_lowercase)
+                .or_else(|| {
+                    // Grok layout: `…/<cwd-encoded>/<session-uuid>/chat_history.jsonl`.
+                    // The physical session id lives on the parent directory, not the
+                    // chat filename stem — surface it so ExactSourceId resolves.
+                    if self.agent == AgentKind::Grok {
+                        path.parent()
+                            .and_then(|parent| parent.file_name())
+                            .and_then(|name| name.to_str())
+                            .filter(|name| is_uuid(name))
+                            .map(|name| name.to_ascii_lowercase())
+                    } else {
+                        None
+                    }
+                });
+            if let Some(ref uuid) = filename_uuid {
+                filename_aliases.push(uuid.clone());
+            }
+            dedupe_ordered(&mut filename_aliases);
+            if filename_aliases.is_empty() {
+                stats.rejected_paths += 1;
+                continue;
+            }
             candidates.push(CandidatePath {
                 path,
                 filename_aliases,

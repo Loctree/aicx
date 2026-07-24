@@ -192,7 +192,10 @@ impl ExtractAgent {
             Self::Codex => home.join(".codex").join("sessions"),
             Self::Claude => home.join(".claude").join("projects"),
             Self::Gemini => home.join(".gemini").join("tmp"),
-            Self::Grok => home.join(".grok"),
+            // Match durable catalog rebuild: sessions live under
+            // `~/.grok/sessions/<cwd-encoded>/<uuid>/…`, not the bare `~/.grok`
+            // tree (config, relocations, assets).
+            Self::Grok => home.join(".grok").join("sessions"),
             Self::Junie => home.join(".junie").join("sessions"),
         }
     }
@@ -5505,6 +5508,11 @@ fn emit_catalog_failure(agent: ExtractAgent, error: aicx::session_catalog::Catal
 ///
 /// This is the bounded first-class consumer contract (C0A §7): after the path
 /// is supplied there is no discovery, no corpus scan, and no store access.
+///
+/// Note: multi-artifact Grok handles (chat_history + summary.json) currently
+/// trip the kernel's classification evidence check on live pretty-printed
+/// summaries. Cwd is recovered via path decode in the adapter; summary fusion
+/// is a follow-up once WholeDocument evidence parity is fixed.
 fn source_handle_for_file(
     agent: ExtractAgent,
     source_id: &str,
@@ -5517,6 +5525,32 @@ fn source_handle_for_file(
         logical_session_id,
         path,
     )
+}
+
+/// For Grok `…/<uuid>/chat_history.jsonl`, prefer the parent directory UUID as
+/// the source identity instead of the filename stem `chat_history`.
+fn grok_direct_source_id(agent: ExtractAgent, path: &Path) -> Option<String> {
+    if agent != ExtractAgent::Grok {
+        return None;
+    }
+    if path.file_name().and_then(|n| n.to_str()) != Some("chat_history.jsonl") {
+        return None;
+    }
+    let parent = path.parent()?.file_name()?.to_str()?;
+    // UUID shape: 8-4-4-4-12 hex with dashes.
+    if parent.len() == 36
+        && parent.as_bytes().iter().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                *byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
+    {
+        Some(parent.to_ascii_lowercase())
+    } else {
+        None
+    }
 }
 
 /// Parse the artifacts of one resolved `SourceHandle` exactly once.
@@ -5609,7 +5643,9 @@ fn run_extract_session(
         resolved.source.logical_session_id.clone(),
         &resolved.source.path,
     )?;
-    debug_assert_eq!(handle.artifacts().len(), 1);
+    // Grok may attach sibling summary.json for cwd/title/timestamps; other
+    // agents stay single-artifact.
+    debug_assert!(!handle.artifacts().is_empty());
 
     let entries = parse_selected_source_once(&handle, options.include_assistant)?;
     if entries.is_empty() {
@@ -5667,11 +5703,16 @@ fn run_extract_direct_file(
         .file_name()
         .map(|name| name.to_string_lossy().to_string())
         .unwrap_or_else(|| "(unknown)".to_string());
-    let source_id = input
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .filter(|stem| !stem.is_empty())
-        .unwrap_or("direct-source");
+    // Grok layout: identity is the parent session-dir UUID when the file is
+    // `chat_history.jsonl` — not the truncated stem `chat_history`.
+    let source_id = grok_direct_source_id(agent, &input).unwrap_or_else(|| {
+        input
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .filter(|stem| !stem.is_empty())
+            .unwrap_or("direct-source")
+            .to_string()
+    });
 
     // Direct mode accepts exactly one finite parser artifact. Directory
     // discovery belongs to the catalog/importer boundary.
@@ -5680,8 +5721,8 @@ fn run_extract_direct_file(
             "directory session inputs are not parser artifacts; select the concrete session file"
         );
     }
-    let handle = source_handle_for_file(agent, source_id, None, &input)?;
-    debug_assert_eq!(handle.artifacts().len(), 1);
+    let handle = source_handle_for_file(agent, &source_id, Some(source_id.clone()), &input)?;
+    debug_assert!(!handle.artifacts().is_empty());
     eprintln!("extract: catalog_files_opened=0 sources_parsed=1");
 
     let entries = parse_selected_source_once(&handle, options.include_assistant)?;
