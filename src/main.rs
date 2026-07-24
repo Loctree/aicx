@@ -1384,7 +1384,7 @@ enum Commands {
     #[command(name = "dashboard-serve", hide = true)]
     DashboardServeLegacy(#[command(flatten)] DashboardServeLegacyArgs),
 
-    /// Extract structured intents from the canonical corpus.
+    /// Extract structured intents from the durable catalog and allowlisted session sources.
     Intents {
         /// Catalog project filters. Omit to scan all projects.
         /// Repeated `-p` flags or comma list (`-p a,b`) form a union.
@@ -4192,7 +4192,7 @@ fn resolve_intents_project_filters_at(
             match_mode,
         });
     }
-    let corpus = legacy_archive::project_identities_in_store_at(aicx_home)?;
+    let corpus = legacy_archive::project_identities_for_search_at(aicx_home)?;
     Ok(legacy_archive::require_project_resolution(
         projects, &corpus, match_mode,
     )?)
@@ -4234,6 +4234,25 @@ fn collect_recent_bucket_counts(aicx_home: &Path, hours: u64) -> Result<BTreeMap
         Utc::now() - chrono::Duration::hours(cutoff_hours)
     };
     let mut counts = BTreeMap::new();
+    let catalog_entries = aicx::catalog::read_entries_at(aicx_home)?;
+    if !catalog_entries.is_empty() {
+        for entry in catalog_entries {
+            let Some(project) = entry.project else {
+                continue;
+            };
+            let timestamp = entry
+                .date
+                .as_deref()
+                .and_then(|date| NaiveDate::parse_from_str(date, "%Y-%m-%d").ok())
+                .and_then(|date| date.and_hms_opt(0, 0, 0))
+                .map(|datetime| DateTime::<Utc>::from_naive_utc_and_offset(datetime, Utc));
+            if timestamp.is_some_and(|timestamp| timestamp >= cutoff) {
+                *counts.entry(project).or_insert(0) += 1;
+            }
+        }
+        return Ok(counts);
+    }
+
     for file in legacy_archive::scan_context_files_at(aicx_home)? {
         if file.path.extension().and_then(|ext| ext.to_str()) != Some("md") {
             continue;
@@ -4326,7 +4345,7 @@ fn print_no_intents_message(
         eprintln!("Did you mean a nearby bucket with recent data?");
         for hint in &hints {
             eprintln!(
-                "- {} ({} chunks in last {}h)",
+                "- {} ({} source sessions in last {}h)",
                 hint.slug, hint.chunks, hours
             );
         }
@@ -4451,12 +4470,22 @@ fn run_intents(
     match emit {
         "json" => {
             let aicx_home = aicx::aicx_home::ensure()?;
-            let oracle_status = aicx::oracle::OracleStatus::canonical_corpus_scan(
-                &aicx_home,
-                extraction.stats.scanned_count,
-                extraction.stats.candidate_count,
-                extraction.stats.source_paths_verified,
-            );
+            let oracle_status =
+                if extraction.stats.identity_source == intents::CATALOG_IDENTITY_SOURCE {
+                    aicx::oracle::OracleStatus::catalog_source_scan(
+                        &aicx_home,
+                        extraction.stats.scanned_count,
+                        extraction.stats.candidate_count,
+                        extraction.stats.source_paths_verified,
+                    )
+                } else {
+                    aicx::oracle::OracleStatus::canonical_corpus_scan(
+                        &aicx_home,
+                        extraction.stats.scanned_count,
+                        extraction.stats.candidate_count,
+                        extraction.stats.source_paths_verified,
+                    )
+                };
             let completeness = extraction
                 .stats
                 .completeness(requested_limit, available_before_limit)
@@ -4672,7 +4701,9 @@ fn format_intents_pack_markdown(
     if let Some(limit) = per_section_limit {
         out.push_str(&format!("- per_section_limit: {limit}\n"));
     }
-    out.push_str("- source: canonical corpus\n");
+    out.push_str(
+        "- source: durable catalog + allowlisted session sources (legacy archive only when the catalog is absent)\n",
+    );
     out.push_str(&format!(
         "- {}\n\n",
         aicx::oracle::ClaimHonesty::canonical().display_line()

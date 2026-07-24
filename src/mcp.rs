@@ -613,7 +613,7 @@ fn resolve_mcp_projects(
     } else {
         legacy_archive::project_identities_in_store_at(aicx_home)
     }
-    .map_err(|error| McpError::internal_error(format!("Store error: {error}"), None))?;
+    .map_err(|error| McpError::internal_error(format!("Project catalog error: {error}"), None))?;
     legacy_archive::require_project_resolution(projects, &corpus, match_mode)
         .map_err(project_resolution_mcp_error)
 }
@@ -1649,7 +1649,7 @@ impl AicxMcpServer {
 
     #[tool(
         name = "aicx_intents",
-        description = "Retrieve structured intents, decisions, outcomes, and tasks from the canonical corpus. Supports project/projects and source_chunk back-references."
+        description = "Retrieve structured intents, decisions, outcomes, and tasks from the durable catalog plus allowlisted session sources. Supports project/projects and source_chunk back-references."
     )]
     async fn intents(
         &self,
@@ -1712,7 +1712,7 @@ impl AicxMcpServer {
                 match_mode: project_match,
             }
         } else {
-            resolve_mcp_projects(&aicx_home, &owned_projects, project_match, false)?
+            resolve_mcp_projects(&aicx_home, &owned_projects, project_match, true)?
         };
         let effective_projects = project_resolution.selected.clone();
 
@@ -1749,12 +1749,22 @@ impl AicxMcpServer {
         let body = match params.emit.as_str() {
             "markdown" | "md" => intents::format_intents_markdown(&records),
             _ => {
-                let oracle_status = OracleStatus::canonical_corpus_scan(
-                    &aicx_home,
-                    extraction.stats.scanned_count,
-                    extraction.stats.candidate_count,
-                    extraction.stats.source_paths_verified,
-                );
+                let oracle_status =
+                    if extraction.stats.identity_source == intents::CATALOG_IDENTITY_SOURCE {
+                        OracleStatus::catalog_source_scan(
+                            &aicx_home,
+                            extraction.stats.scanned_count,
+                            extraction.stats.candidate_count,
+                            extraction.stats.source_paths_verified,
+                        )
+                    } else {
+                        OracleStatus::canonical_corpus_scan(
+                            &aicx_home,
+                            extraction.stats.scanned_count,
+                            extraction.stats.candidate_count,
+                            extraction.stats.source_paths_verified,
+                        )
+                    };
                 let completeness = extraction
                     .stats
                     .completeness(display.requested_limit, display.available_before_limit)

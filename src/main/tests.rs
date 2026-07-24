@@ -18,7 +18,9 @@ fn intents_pack_report_carries_header_level_honesty_notice() {
     let notice_pos = out
         .find("- claims: historical @ session close")
         .expect("notice present");
-    let source_pos = out.find("- source: canonical corpus").expect("source line");
+    let source_pos = out
+        .find("- source: durable catalog + allowlisted session sources")
+        .expect("source line");
     assert!(
         source_pos < notice_pos,
         "honesty notice should sit with the header metadata lines"
@@ -805,6 +807,47 @@ fn intents_project_resolver_fails_closed_on_ambiguous_bare_slug() {
     assert!(msg.contains("ambiguous"));
     assert!(msg.contains("one/Screenscribe"));
     assert!(msg.contains("two/Screenscribe"));
+}
+
+#[test]
+fn intents_project_resolver_uses_catalog_without_legacy_cards() {
+    let root = unique_test_dir("intents-catalog-resolver");
+    let catalog_path = aicx::catalog::sessions_path_for(&root);
+    let entry = aicx::catalog::CatalogEntry {
+        schema: aicx::catalog::CATALOG_SCHEMA.to_string(),
+        session_id: "catalog-only-session".to_string(),
+        agent: "codex".to_string(),
+        project: Some("Loctree/aicx".to_string()),
+        date: Some("2026-07-24".to_string()),
+        cwd: None,
+        source_path: root.join("source.jsonl").display().to_string(),
+        source_len: None,
+        source_mtime_ns: None,
+        title: None,
+        machine: None,
+        logical_session_id: None,
+    };
+    write_file(
+        &catalog_path,
+        &format!(
+            "{}\n",
+            serde_json::to_string(&entry).expect("serialize catalog entry")
+        ),
+    );
+
+    let resolution = resolve_intents_project_filters_at(
+        &["aicx".to_string()],
+        &root,
+        legacy_archive::ProjectMatchMode::Exact,
+    )
+    .expect("catalog-only project should resolve");
+
+    assert_eq!(resolution.selected, ["Loctree/aicx"]);
+    assert!(
+        !root.join(legacy_archive::LEGACY_CARDS_DIRNAME).exists(),
+        "project resolution must not require retired cards"
+    );
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]

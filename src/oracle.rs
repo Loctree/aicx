@@ -63,6 +63,8 @@ impl ClaimHonesty {
 #[serde(rename_all = "snake_case")]
 pub enum OracleBackend {
     CanonicalCorpus,
+    /// Direct, allowlisted reads of sessions attributed by the durable catalog.
+    CatalogSources,
     FilesystemFuzzy,
     SteerMetadata,
     ContentSemantic,
@@ -150,6 +152,42 @@ where
 }
 
 impl OracleStatus {
+    pub fn catalog_source_scan(
+        aicx_home: &Path,
+        scanned_count: usize,
+        candidate_count: usize,
+        source_paths_verified: bool,
+    ) -> Self {
+        Self {
+            source_layer: catalog_sources_layer(),
+            backend: OracleBackend::CatalogSources,
+            index_kind: OracleIndexKind::None,
+            fallback_reason: None,
+            derived_view: "catalog_source_extract_scan_no_semantic_index".to_string(),
+            aicx_home: display_path(aicx_home),
+            indexed_count: 0,
+            scanned_count,
+            candidate_count,
+            source_paths_verified,
+            stale_or_unknown: !source_paths_verified,
+            loctree_scope_safe: source_paths_verified,
+            loctree_scope_note: if source_paths_verified {
+                "safe_as_allowlisted_historical_source_evidence; not a semantic similarity oracle"
+                    .to_string()
+            } else {
+                "unsafe_for_scope_narrowing; one or more catalog sources could not be verified"
+                    .to_string()
+            },
+            manifest_generation_id: None,
+            manifest_source_chunk_count: None,
+            dense_count: None,
+            lexical_doc_count: None,
+            fusion_algorithm: None,
+            #[cfg(feature = "app")]
+            retrieval: None,
+        }
+    }
+
     pub fn canonical_corpus_scan(
         aicx_home: &Path,
         scanned_count: usize,
@@ -492,6 +530,10 @@ fn canonical_layer() -> String {
     "layer_1_canonical_corpus".to_string()
 }
 
+fn catalog_sources_layer() -> String {
+    "layer_1_catalog_sources".to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -581,5 +623,17 @@ mod tests {
                 .loctree_scope_note
                 .contains("not a semantic similarity oracle")
         );
+    }
+
+    #[test]
+    fn catalog_intents_status_names_direct_source_evidence_truthfully() {
+        let status = OracleStatus::catalog_source_scan(Path::new("/tmp/aicx"), 2, 2, true);
+
+        assert_eq!(status.source_layer, "layer_1_catalog_sources");
+        assert_eq!(status.backend, OracleBackend::CatalogSources);
+        assert_eq!(status.index_kind, OracleIndexKind::None);
+        assert_eq!(status.fallback_reason, None);
+        assert!(status.loctree_scope_safe);
+        assert!(status.derived_view.contains("catalog_source_extract"));
     }
 }
