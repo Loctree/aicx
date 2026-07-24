@@ -71,6 +71,76 @@ fn extract_demo_extraction(label: &str, body: &str) -> IntentExtraction {
     extraction
 }
 
+#[test]
+fn catalog_source_replaces_retired_cards_for_intent_extraction() {
+    let root = migration_test_root("catalog-source");
+    let _ = fs::remove_dir_all(&root);
+    let source = root.join("runtime_runs/catalog-intents/transcript.log");
+    fs::create_dir_all(source.parent().expect("source parent")).expect("create source parent");
+    fs::write(
+        &source,
+        "We completed the catalog-backed intent hydration and verified the source path.\n",
+    )
+    .expect("write source transcript");
+    let catalog_path = crate::catalog::sessions_path_for(&root);
+    fs::create_dir_all(catalog_path.parent().expect("catalog parent"))
+        .expect("create catalog parent");
+    let entry = crate::catalog::CatalogEntry {
+        schema: crate::catalog::CATALOG_SCHEMA.to_string(),
+        session_id: "catalog-intents-session".to_string(),
+        agent: "vibecrafted".to_string(),
+        project: Some("Loctree/aicx".to_string()),
+        date: Some("2026-07-24".to_string()),
+        cwd: Some("/Volumes/vc-workspace/Loctree/aicx".to_string()),
+        source_path: source.display().to_string(),
+        source_len: None,
+        source_mtime_ns: None,
+        title: Some("catalog hydration".to_string()),
+        machine: Some("test".to_string()),
+        logical_session_id: None,
+    };
+    fs::write(
+        &catalog_path,
+        format!(
+            "{}\n",
+            serde_json::to_string(&entry).expect("serialize catalog row")
+        ),
+    )
+    .expect("write catalog");
+
+    let config = IntentsConfig {
+        project: "Loctree/aicx".to_string(),
+        hours: 0,
+        strict: false,
+        min_confidence: None,
+        kind_filter: Some(IntentKind::Outcome),
+        frame_kind: Some(FrameKind::AgentReply),
+    };
+    let extraction = extract_intents_from_root_at_with_stats(&config, &root, Utc::now())
+        .expect("extract from catalog source");
+
+    assert_eq!(extraction.stats.identity_source, CATALOG_IDENTITY_SOURCE);
+    assert_eq!(extraction.stats.source_errors, 0);
+    assert!(extraction.stats.source_paths_verified);
+    assert_eq!(extraction.stats.matched_project_buckets, ["Loctree/aicx"]);
+    let canonical_source = source.canonicalize().expect("canonical source path");
+    assert!(
+        extraction.records.iter().any(|record| {
+            record.project == "Loctree/aicx"
+                && record.session_id == "catalog-intents-session"
+                && record.source_chunk == canonical_source.display().to_string()
+                && record.summary.contains("catalog-backed intent hydration")
+        }),
+        "catalog-backed outcome missing: {:?}",
+        extraction.records
+    );
+    assert!(
+        !root.join("store").exists(),
+        "intent extraction must not regrow the retired card store"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
 fn extract_demo_records(label: &str, body: &str) -> Vec<IntentRecord> {
     extract_demo_extraction(label, body).records
 }
@@ -1718,6 +1788,7 @@ fn build_candidate_threads_sidecar_honesty_into_record() {
         timestamp: Utc::now(),
         session_id: "sess-b2".to_string(),
         honesty: crate::oracle::ClaimHonesty::canonical(),
+        transcript_entries: None,
     };
 
     let candidate = build_candidate(
@@ -3613,6 +3684,7 @@ mod flexible_dates {
             timestamp: Utc::now(),
             session_id: "sess-1".to_string(),
             honesty: Default::default(),
+            transcript_entries: None,
         };
 
         // Repro case: no context, no evidence -> degraded (returns None)
@@ -3668,6 +3740,7 @@ mod flexible_dates {
             timestamp: Utc::now(),
             session_id: "sess-gate".to_string(),
             honesty: Default::default(),
+            transcript_entries: None,
         };
 
         let signal_lines: Vec<String> = vec![
@@ -3896,6 +3969,7 @@ Update Cargo.lock dependencies\n";
             timestamp: Utc::now(),
             session_id: "sess-code".to_string(),
             honesty: Default::default(),
+            transcript_entries: None,
         };
 
         let signal_lines: Vec<String> = vec![
@@ -4177,6 +4251,7 @@ Results:
             timestamp: Utc::now(),
             session_id: "sess-1".to_string(),
             honesty: Default::default(),
+            transcript_entries: None,
         };
 
         // 1. Voice transcript intent without context/evidence (confidence 2)

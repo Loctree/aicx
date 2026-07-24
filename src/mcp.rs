@@ -2569,6 +2569,7 @@ mod tests {
             scanned_count: 3,
             candidate_count: 3,
             source_paths_verified: true,
+            source_errors: 0,
             candidate_cap: 5_000,
             dropped_candidates: 2,
             dropped_task_events: 0,

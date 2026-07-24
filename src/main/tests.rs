@@ -834,6 +834,7 @@ fn intents_project_resolver_exact_and_fuzzy_modes_are_separate() {
         scanned_count: 1,
         candidate_count: 1,
         source_paths_verified: true,
+        source_errors: 0,
         candidate_cap: 5_000,
         dropped_candidates: 0,
         dropped_task_events: 0,

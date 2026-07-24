@@ -57,6 +57,7 @@ pub use self::schema::{
 /// the cap is hit so the operator notices truncated extraction.
 const MAX_CANDIDATES: usize = 5000;
 const CARD_HEADER_READ_LIMIT: u64 = 64 * 1024;
+pub const CATALOG_IDENTITY_SOURCE: &str = "catalog-v1";
 pub const PERSISTED_IDENTITY_SOURCE: &str = "project-bucket-v1";
 pub const PATH_HEURISTIC_IDENTITY_SOURCE: &str = "path-heuristic";
 
@@ -97,21 +98,23 @@ pub(crate) fn extract_intents_from_root_at_with_stats(
         let cutoff_hours = config.hours.min(i64::MAX as u64) as i64;
         now - Duration::hours(cutoff_hours)
     };
-    let files = collect_chunk_files(
+    let (files, source_errors, corpus_identity_source) = collect_intent_files(
         aicx_home,
         &config.project,
         cutoff,
         config.effective_frame_kind(),
     )?;
     let scanned_count = files.len();
-    let source_paths_verified = verify_stored_chunk_paths(&files);
+    let source_paths_verified = source_errors == 0 && verify_stored_chunk_paths(&files);
     let matched_project_buckets = files
         .iter()
         .map(|file| file.project.clone())
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
-    let identity_source = if files
+    let identity_source = if corpus_identity_source == CATALOG_IDENTITY_SOURCE {
+        CATALOG_IDENTITY_SOURCE
+    } else if files
         .iter()
         .any(|file| file.identity_source == PATH_HEURISTIC_IDENTITY_SOURCE)
     {
@@ -133,10 +136,15 @@ pub(crate) fn extract_intents_from_root_at_with_stats(
     let mut dropped_task_events = 0usize;
 
     for file in files {
-        let content = sanitize::read_to_string_validated(&file.path)
-            .with_context(|| format!("Failed to read chunk file: {}", file.path.display()))?;
-
-        let (signal_lines, transcript_entries) = parse_chunk_document(&content);
+        let (signal_lines, transcript_entries) = if let Some(transcript_entries) =
+            file.transcript_entries.as_ref()
+        {
+            (Vec::new(), transcript_entries.clone())
+        } else {
+            let content = sanitize::read_to_string_validated(&file.path)
+                .with_context(|| format!("Failed to read chunk file: {}", file.path.display()))?;
+            parse_chunk_document(&content)
+        };
         let source_chunk = file.path.to_string_lossy().to_string();
 
         // oś 3: stamp records with the chunk's canonical bucket (file.project),
@@ -201,6 +209,7 @@ pub(crate) fn extract_intents_from_root_at_with_stats(
         scanned_count,
         candidate_count: records.len(),
         source_paths_verified,
+        source_errors,
         candidate_cap: MAX_CANDIDATES,
         dropped_candidates,
         dropped_task_events,
@@ -225,6 +234,7 @@ pub(crate) fn extract_intents_from_root_at_for_projects_with_stats(
     let mut records = Vec::new();
     let mut scanned_count = 0usize;
     let mut source_paths_verified = true;
+    let mut source_errors = 0usize;
     let mut dropped_candidates = 0usize;
     let mut dropped_task_events = 0usize;
     let mut matched_project_buckets = BTreeSet::new();
@@ -237,12 +247,17 @@ pub(crate) fn extract_intents_from_root_at_for_projects_with_stats(
         let extraction = extract_intents_from_root_at_with_stats(&scoped, aicx_home, now)?;
         scanned_count += extraction.stats.scanned_count;
         source_paths_verified &= extraction.stats.source_paths_verified;
+        source_errors += extraction.stats.source_errors;
         dropped_candidates += extraction.stats.dropped_candidates;
         dropped_task_events += extraction.stats.dropped_task_events;
         matched_project_buckets.extend(extraction.stats.matched_project_buckets);
         path_heuristic_records += extraction.stats.path_heuristic_records;
         if extraction.stats.identity_source == PATH_HEURISTIC_IDENTITY_SOURCE {
             identity_source = PATH_HEURISTIC_IDENTITY_SOURCE.to_string();
+        } else if extraction.stats.identity_source == CATALOG_IDENTITY_SOURCE
+            && identity_source != PATH_HEURISTIC_IDENTITY_SOURCE
+        {
+            identity_source = CATALOG_IDENTITY_SOURCE.to_string();
         }
         records.extend(extraction.records);
     }
@@ -254,6 +269,7 @@ pub(crate) fn extract_intents_from_root_at_for_projects_with_stats(
         scanned_count,
         candidate_count: records.len(),
         source_paths_verified,
+        source_errors,
         candidate_cap: MAX_CANDIDATES,
         dropped_candidates,
         dropped_task_events,
@@ -325,7 +341,100 @@ fn extend_with_cap<T>(
     dropped
 }
 
-fn collect_chunk_files(
+fn collect_intent_files(
+    aicx_home: &Path,
+    project: &str,
+    cutoff: DateTime<Utc>,
+    frame_kind: FrameKind,
+) -> Result<(Vec<StoredChunkFile>, usize, &'static str)> {
+    let entries = crate::catalog::read_entries_at(aicx_home)?;
+    if entries.is_empty() {
+        return Ok((
+            collect_legacy_chunk_files(aicx_home, project, cutoff, frame_kind)?,
+            0,
+            PERSISTED_IDENTITY_SOURCE,
+        ));
+    }
+
+    let mut files = Vec::new();
+    let mut source_errors = 0usize;
+    for entry in entries {
+        let Some(identity_project) = entry.project.clone() else {
+            continue;
+        };
+        let (organization, repository) = identity_project
+            .split_once('/')
+            .unwrap_or(("", identity_project.as_str()));
+        if !project.trim().is_empty()
+            && !legacy_archive::project_filter_matches(organization, repository, project)
+        {
+            continue;
+        }
+
+        let canonical_date = entry
+            .date
+            .as_deref()
+            .and_then(|date| NaiveDate::parse_from_str(date, "%Y-%m-%d").ok());
+        if canonical_date.is_some_and(|date| date < cutoff.date_naive()) {
+            continue;
+        }
+
+        let (source_path, frames) =
+            match crate::source_index::read_catalog_signal_at(aicx_home, &entry, frame_kind) {
+                Ok(result) => result,
+                Err(error) => {
+                    source_errors += 1;
+                    crate::diagnostics::log_describe(&format!(
+                        "intents_source_skip agent={} session_id={} path={} error={error:#}",
+                        entry.agent, entry.session_id, entry.source_path
+                    ));
+                    continue;
+                }
+            };
+        if frames.is_empty() {
+            continue;
+        }
+        let timestamp = frames
+            .last()
+            .map(|frame| frame.timestamp)
+            .expect("non-empty frames have a last timestamp");
+        if canonical_date.is_none() && timestamp < cutoff {
+            continue;
+        }
+        let date = entry
+            .date
+            .clone()
+            .unwrap_or_else(|| timestamp.format("%Y-%m-%d").to_string());
+        let transcript_entries = frames
+            .into_iter()
+            .map(|frame| TranscriptEntry {
+                role: frame.role,
+                lines: frame.message.lines().map(str::to_string).collect(),
+            })
+            .collect();
+        files.push(StoredChunkFile {
+            agent: entry.agent,
+            date,
+            path: source_path,
+            project: identity_project,
+            identity_source: CATALOG_IDENTITY_SOURCE.to_string(),
+            sequence: 0,
+            timestamp,
+            session_id: entry.session_id,
+            honesty: crate::oracle::ClaimHonesty::canonical(),
+            transcript_entries: Some(transcript_entries),
+        });
+    }
+
+    files.sort_by(|left, right| {
+        left.timestamp
+            .cmp(&right.timestamp)
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    Ok((files, source_errors, CATALOG_IDENTITY_SOURCE))
+}
+
+fn collect_legacy_chunk_files(
     aicx_home: &Path,
     project: &str,
     cutoff: DateTime<Utc>,
@@ -419,6 +528,7 @@ fn collect_chunk_files(
             timestamp,
             session_id: file.session_id,
             honesty,
+            transcript_entries: None,
         });
     }
 
@@ -3112,7 +3222,7 @@ pub fn migrate_intent_schema_dry_run_at(
     project_filter: Option<&str>,
 ) -> Result<MigrationReport> {
     let inferred_project = project_filter.map(str::to_string);
-    let files = collect_chunk_files(
+    let files = collect_legacy_chunk_files(
         aicx_home,
         project_filter.unwrap_or(""),
         DateTime::<Utc>::from_naive_utc_and_offset(

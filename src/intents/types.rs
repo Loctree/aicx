@@ -87,6 +87,7 @@ pub struct IntentExtractionStats {
     pub scanned_count: usize,
     pub candidate_count: usize,
     pub source_paths_verified: bool,
+    pub source_errors: usize,
     pub candidate_cap: usize,
     pub dropped_candidates: usize,
     pub dropped_task_events: usize,
@@ -110,6 +111,7 @@ pub struct ProjectResolutionScope {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IntentsCompleteness {
     pub complete: bool,
+    pub source_errors: usize,
     pub candidate_cap: usize,
     pub candidate_cap_reached: bool,
     pub dropped_candidates: usize,
@@ -162,7 +164,7 @@ impl IntentExtractionStats {
         let limit_saturated = requested_limit
             .is_some_and(|limit| available_before_limit > 0 && available_before_limit >= limit);
         let candidate_cap_reached = self.dropped_candidates > 0 || self.dropped_task_events > 0;
-        let complete = !candidate_cap_reached && !limit_saturated;
+        let complete = self.source_errors == 0 && !candidate_cap_reached && !limit_saturated;
         let orphaned_buckets = self
             .matched_project_buckets
             .iter()
@@ -182,9 +184,16 @@ impl IntentExtractionStats {
                 self.candidate_cap, self.dropped_candidates, self.dropped_task_events
             ));
         }
+        if self.source_errors > 0 {
+            warnings.push(format!(
+                "{} catalog source(s) were unreadable or unsupported",
+                self.source_errors
+            ));
+        }
 
         IntentsCompleteness {
             complete,
+            source_errors: self.source_errors,
             candidate_cap: self.candidate_cap,
             candidate_cap_reached,
             dropped_candidates: self.dropped_candidates,
@@ -218,6 +227,7 @@ pub(super) struct StoredChunkFile {
     pub(super) timestamp: DateTime<Utc>,
     pub(super) session_id: String,
     pub(super) honesty: ClaimHonesty,
+    pub(super) transcript_entries: Option<Vec<TranscriptEntry>>,
 }
 
 #[derive(Debug, Clone)]

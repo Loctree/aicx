@@ -440,6 +440,46 @@ fn parse_catalog_source(
     Ok(crate::output::timeline_entries_from_model(parsed.model()))
 }
 
+/// Read one cataloged session through the same allowlisted, signal-only parser
+/// used by the lexical index.
+///
+/// Intent retrieval uses this path directly instead of reconstructing evidence
+/// from retired per-frame cards. The returned path is canonical and proven to
+/// live below one of the operator-approved source roots before any source open.
+pub(crate) fn read_catalog_signal_at(
+    aicx_home: &Path,
+    entry: &CatalogEntry,
+    frame_kind: FrameKind,
+) -> Result<(PathBuf, Vec<TimelineEntry>)> {
+    let user_home = crate::os_user_home().unwrap_or_else(|| aicx_home.to_path_buf());
+    let source_allow = crate::source_path::SourceAllowlist::for_operator(&user_home, aicx_home);
+    let source_path = source_allow
+        .resolve_file(entry.source_path.as_str())
+        .with_context(|| {
+            format!(
+                "resolve catalog source agent={} session_id={}",
+                entry.agent, entry.session_id
+            )
+        })?;
+    let mut frames = parse_catalog_source(entry, &source_path, &source_allow)?;
+    frames.sort_by_key(|frame| frame.timestamp);
+    frames.retain(is_signal_frame);
+    frames.retain(|frame| frame_matches_kind(frame, frame_kind));
+    for frame in &mut frames {
+        frame.message = clean_message(&frame.message);
+    }
+    frames.retain(|frame| !frame.message.trim().is_empty());
+    Ok((source_path, frames))
+}
+
+fn frame_matches_kind(frame: &TimelineEntry, requested: FrameKind) -> bool {
+    frame.frame_kind.unwrap_or(match frame.role.as_str() {
+        "user" => FrameKind::UserMsg,
+        "assistant" => FrameKind::AgentReply,
+        _ => FrameKind::SystemNote,
+    }) == requested
+}
+
 /// Bounded signal-only reader for oversized Codex rollouts.
 ///
 /// Historical rollouts can exceed hundreds of MB because tool results and
