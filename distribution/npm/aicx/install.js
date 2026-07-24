@@ -4,10 +4,15 @@ const { accessSync, constants, existsSync, unlinkSync } = require("fs");
 const { execFileSync } = require("child_process");
 const { homedir } = require("os");
 const { join } = require("path");
-const { getBinaryPath } = require("./index.js");
+const {
+  getBinaryPath,
+  getPlatformPackageName,
+  resolvePlatformPackageRoot,
+} = require("./index.js");
 
-let hasError = false;
 const VERSION = require("./package.json").version;
+const PLATFORM_INSTALL_TIMEOUT_MS = 120_000;
+const PLATFORM_INSTALL_POLL_MS = 250;
 
 function envFlag(name) {
   return /^(1|true|yes|on)$/i.test(process.env[name] || "");
@@ -120,44 +125,72 @@ function scanAicxShadows(installedAicxPath, installedMcpPath, targetVersion) {
   }
 }
 
-function validateBinary(binaryName) {
-  try {
-    const binaryPath = getBinaryPath(binaryName);
-    if (!existsSync(binaryPath)) {
-      console.error(`\n[AICX Install Error] ${binaryName} binary not found at ${binaryPath}`);
-      hasError = true;
-      return;
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function waitForPlatformBinaries() {
+  const packageName = getPlatformPackageName();
+
+  // npm may run dependency and wrapper postinstall scripts concurrently. Fail
+  // immediately when the optional platform package is absent, but when npm has
+  // already installed its manifest, allow its downloader to finish atomically.
+  resolvePlatformPackageRoot(packageName);
+
+  const deadline = Date.now() + PLATFORM_INSTALL_TIMEOUT_MS;
+  let lastError;
+  while (Date.now() < deadline) {
+    try {
+      return {
+        aicx: getBinaryPath("aicx"),
+        mcp: getBinaryPath("aicx-mcp"),
+      };
+    } catch (error) {
+      lastError = error;
+      await delay(PLATFORM_INSTALL_POLL_MS);
     }
-
-    accessSync(binaryPath, constants.X_OK);
-    console.log(`${binaryName} binary installed successfully at ${binaryPath}`);
-  } catch (error) {
-    console.error(`\n[AICX Install Error] Could not verify ${binaryName}:\n${error.message}\n`);
-    hasError = true;
   }
+
+  throw new Error(
+    `Timed out after ${PLATFORM_INSTALL_TIMEOUT_MS}ms waiting for ${packageName} binaries.\n` +
+    `${lastError ? lastError.message : "No binary status was reported."}`
+  );
 }
 
-validateBinary("aicx");
-validateBinary("aicx-mcp");
+async function main() {
+  let binaryPaths;
+  try {
+    binaryPaths = await waitForPlatformBinaries();
+    accessSync(binaryPaths.aicx, constants.X_OK);
+    accessSync(binaryPaths.mcp, constants.X_OK);
+  } catch (error) {
+    console.error(`\n[AICX Install Error] Could not verify platform binaries:\n${error.message}\n`);
+    console.error("\n======================================================================");
+    console.error("AICX npm installation failed.");
+    console.error("This usually happens because your platform is not supported by our");
+    console.error("prebuilt binaries, or npm failed to download optionalDependencies.\n");
+    console.error("Supported pre-built platforms:");
+    console.error("  - macOS arm64 (Apple Silicon)");
+    console.error("  - Linux x64 (GNU libc)");
+    console.error("  - Windows x64 (MSVC)\n");
+    console.error("If you are on a supported platform, check your network or npm config.");
+    console.error("If you are on an unsupported platform (e.g. Linux musl or macOS Intel),");
+    console.error("use a source build as a contributor fallback.\n");
+    console.error("To install from source (requires Rust):");
+    console.error("  cargo install --git https://github.com/Loctree/aicx.git\n");
+    console.error("Alternatively, download a binary manually from:");
+    console.error("  https://github.com/Loctree/aicx/releases");
+    console.error("======================================================================\n");
+    process.exitCode = 1;
+    return;
+  }
 
-if (hasError) {
-  console.error("\n======================================================================");
-  console.error("AICX npm installation failed.");
-  console.error("This usually happens because your platform is not supported by our");
-  console.error("prebuilt binaries, or npm failed to download optionalDependencies.\n");
-  console.error("Supported pre-built platforms:");
-  console.error("  - macOS arm64 (Apple Silicon)");
-  console.error("  - Linux x64 (GNU libc)");
-  console.error("  - Windows x64 (MSVC)\n");
-  console.error("If you are on a supported platform, check your network or npm config.");
-  console.error("If you are on an unsupported platform (e.g. Linux musl or macOS Intel),");
-  console.error("use a source build as a contributor fallback.\n");
-  console.error("To install from source (requires Rust):");
-  console.error("  cargo install --git https://github.com/Loctree/aicx.git\n");
-  console.error("Alternatively, download a binary manually from:");
-  console.error("  https://github.com/Loctree/aicx/releases");
-  console.error("======================================================================\n");
-  process.exit(1);
+  console.log(`aicx binary installed successfully at ${binaryPaths.aicx}`);
+  console.log(`aicx-mcp binary installed successfully at ${binaryPaths.mcp}`);
+  scanAicxShadows(binaryPaths.aicx, binaryPaths.mcp, VERSION);
 }
 
-scanAicxShadows(getBinaryPath("aicx"), getBinaryPath("aicx-mcp"), VERSION);
+main().catch((error) => {
+  console.error(`\n[AICX Install Error] Unexpected failure:\n${error.stack || error.message}\n`);
+  process.exitCode = 1;
+});
