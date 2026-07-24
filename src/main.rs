@@ -1597,7 +1597,19 @@ enum Commands {
         #[arg(long, value_parser = ["conversations", "conversation", "plans", "plan", "reports", "report", "other"])]
         kind: Option<String>,
 
-        /// Bypass semantic vector search and run filesystem-fuzzy search.
+        /// Search passages inside one catalog session instead of ranking sessions.
+        #[arg(long)]
+        session: Option<String>,
+
+        /// Match an exact, identifier-boundary substring inside --session.
+        #[arg(long, requires = "session")]
+        literal: bool,
+
+        /// Context lines before and after each passage match (default: 2).
+        #[arg(long, requires = "session", value_name = "N")]
+        context: Option<usize>,
+
+        /// Force lexical-only retrieval from the published CURRENT index.
         #[arg(long, conflicts_with = "evidence")]
         no_semantic: bool,
 
@@ -2716,6 +2728,9 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
             date,
             filters,
             kind,
+            session,
+            literal,
+            context,
             no_semantic,
             evidence,
             json,
@@ -2731,6 +2746,9 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
                 json,
                 filters,
                 kind: kind.as_deref(),
+                session: session.as_deref(),
+                literal,
+                context: context.unwrap_or(2),
                 no_semantic,
                 evidence,
                 deep,
@@ -7205,10 +7223,10 @@ fn project_scope_label(projects: &[String]) -> String {
     }
 }
 
-/// Semantic-first retrieval across the hybrid index. Filesystem-fuzzy is
-/// used only when the index is missing (`IndexNotBuilt`); corrupt/stale/busy
-/// and embedder failures surface as typed errors. `--no-semantic` skips the
-/// hybrid attempt and runs fuzzy directly.
+/// Lexical-first retrieval across the published CURRENT index. Filesystem
+/// fuzzy is used only for the default mode when no index exists;
+/// `--no-semantic` means a strict lexical-only CURRENT read and never routes
+/// into the retired filesystem-fuzzy path.
 struct SearchRunArgs<'a> {
     query: &'a str,
     projects: &'a [String],
@@ -7217,6 +7235,9 @@ struct SearchRunArgs<'a> {
     json: bool,
     filters: RetrievalFilters,
     kind: Option<&'a str>,
+    session: Option<&'a str>,
+    literal: bool,
+    context: usize,
     no_semantic: bool,
     evidence: bool,
     deep: bool,
@@ -7231,6 +7252,67 @@ fn validate_cli_search_limit(limit: usize) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn run_session_passage_search(
+    aicx_home: &Path,
+    session: &str,
+    query: &str,
+    context: usize,
+    literal: bool,
+    json: bool,
+) -> Result<()> {
+    let report = match aicx::source_index::search_session_passages(
+        aicx_home, session, query, context, literal,
+    ) {
+        Ok(report) => report,
+        Err(error) => {
+            eprintln!(
+                "{}",
+                aicx::source_index::SearchCoverage::single_session(false, "session").render_line()
+            );
+            return Err(error);
+        }
+    };
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else if report.passages.is_empty() {
+        println!(
+            "No {} passages for {:?} in session {}.",
+            report.mode, report.query, report.session_id
+        );
+    } else {
+        println!(
+            "Session {} · agent={} · mode={} · context=±{}",
+            report.session_id, report.agent, report.mode, report.context
+        );
+        for passage in &report.passages {
+            println!(
+                "\nPassage {} · lines {}-{} · source {}",
+                passage.passage,
+                passage.line_span.start,
+                passage.line_span.end,
+                passage.source_path
+            );
+            for (offset, line) in passage.text.lines().enumerate() {
+                println!("{:>6} | {}", passage.line_span.start + offset, line);
+            }
+        }
+    }
+    eprintln!("{}", report.coverage.render_line());
+    Ok(())
+}
+
+fn inject_search_coverage(
+    payload: &str,
+    coverage: &aicx::source_index::SearchCoverage,
+) -> Result<String> {
+    let mut value: serde_json::Value = serde_json::from_str(payload)?;
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("search JSON renderer returned a non-object payload"))?;
+    object.insert("coverage".to_string(), serde_json::to_value(coverage)?);
+    Ok(serde_json::to_string(&value)?)
 }
 
 fn run_eval_search_quality(args: SearchQualityEvalArgs) -> Result<()> {
@@ -7351,11 +7433,18 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
         json,
         filters,
         kind,
+        session,
+        literal,
+        context,
         no_semantic,
         evidence,
         deep,
         project_match,
     } = args;
+    if let Some(session) = session {
+        let root = aicx::aicx_home::resolve()?;
+        return run_session_passage_search(&root, session, query, context, literal, json);
+    }
     let limit = filters.limit.unwrap_or(DEFAULT_RETRIEVAL_LIMIT);
     validate_cli_search_limit(limit)?;
     if evidence && no_semantic {
@@ -7379,6 +7468,7 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
     };
 
     let root = aicx::aicx_home::ensure()?;
+    let coverage = aicx::source_index::current_search_coverage(&root);
 
     // Build the canonical filter pushdown for the retrieval primitive.
     // The explicit date filter wins over `--hours`, matching legacy
@@ -7408,18 +7498,12 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
     let project_resolution = resolve_project_filters_or_error(projects, project_match, true)?;
     let scopes = project_scopes(&project_resolution.selected);
 
-    let (results, scanned, semantic_status, pushdown_diagnostic, semantic_fallback) = if no_semantic
-    {
-        let (results, scanned) = aicx::search_engine::fuzzy_search_with_post_filters(
-            &root,
-            &search_query,
-            limit,
-            &scopes,
-            filters.frame_kind.map(Into::into),
-            &post_filters,
-        )?;
-        (results, scanned, None, None, None)
-    } else {
+    let mut index_filters = post_filters.clone();
+    if no_semantic {
+        index_filters.deep = false;
+        index_filters.legacy_dense = false;
+    }
+    let (results, scanned, semantic_status, pushdown_diagnostic, semantic_fallback) =
         match aicx::search_engine::try_semantic_search_filtered(
             &root,
             &search_query,
@@ -7427,7 +7511,7 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
             &scopes,
             filters.frame_kind.map(Into::into),
             kind_filter.map(|kind| kind.dir_name()),
-            &post_filters,
+            &index_filters,
         ) {
             Ok(filtered) => {
                 let aicx::search_engine::FilteredSemanticOutcome {
@@ -7449,6 +7533,16 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
                 )
             }
             Err(err) => {
+                if no_semantic {
+                    eprintln!("{}", coverage.render_line());
+                    anyhow::bail!(
+                        "aicx search --no-semantic requires the published CURRENT lexical index: \
+                         {} ({})\n  recommendation: {}",
+                        err.kind(),
+                        err.reason(),
+                        err.recommendation()
+                    );
+                }
                 // Filesystem-fuzzy ONLY when no hybrid index exists.
                 // Corrupt / stale / busy / embedder / empty → honest error.
                 if !err.allows_filesystem_fallback() {
@@ -7458,6 +7552,7 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
                         eprintln!("  reason:         {}", err.reason());
                         eprintln!("  recommendation: {}", err.recommendation());
                     }
+                    eprintln!("{}", coverage.render_line());
                     anyhow::bail!(
                         "aicx search failed: {} ({})\n  recommendation: {}",
                         err.kind(),
@@ -7484,8 +7579,7 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
                 }
                 (results, scanned, None, None, Some(fallback))
             }
-        }
-    };
+        };
 
     // Defensive kind retain ahead of the evidence path: the shared finalize
     // below retains too, but `--evidence` consumes `results` before finalize
@@ -7561,6 +7655,8 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
                 }
                 payload = serde_json::to_string(&value)?;
             }
+            payload = inject_search_coverage(&payload, &coverage)?;
+            eprintln!("{}", coverage.render_line());
             println!("{}", payload);
             return Ok(());
         }
@@ -7570,6 +7666,7 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
                 "No evidence for {:?} (examined {} candidates).",
                 query, report.candidates_examined
             );
+            eprintln!("{}", coverage.render_line());
             return Ok(());
         }
 
@@ -7607,6 +7704,7 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
                 suffix
             );
         }
+        eprintln!("{}", coverage.render_line());
         return Ok(());
     }
 
@@ -7705,6 +7803,8 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
             }
             payload = serde_json::to_string(&value)?;
         }
+        payload = inject_search_coverage(&payload, &coverage)?;
+        eprintln!("{}", coverage.render_line());
         println!("{}", payload);
         return Ok(());
     }
@@ -7725,6 +7825,7 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
                  or rebuild the index if the corpus is expected to satisfy it."
             );
         }
+        eprintln!("{}", coverage.render_line());
         return Ok(());
     }
 
@@ -7756,6 +7857,7 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
             .unwrap_or_default();
         eprintln!("\n{}{}", base_line, suffix);
     }
+    eprintln!("{}", coverage.render_line());
     Ok(())
 }
 

@@ -1385,7 +1385,7 @@ _aicx() {
             return 0
             ;;
         aicx__subcmd__doctor)
-            opts="-y -v -h --rebuild-steer-index --fix-buckets --dry-run --rebuild-sidecars --prune-empty-bodies --migrate-identities --apply --restore-quarantine --yes --force --check-dedup --verbose --smoke --deep --format --oracle --project-fuzzy --help"
+            opts="-y -v -h --clean-retired-steer --fix-buckets --dry-run --rebuild-sidecars --prune-empty-bodies --migrate-identities --apply --restore-quarantine --yes --force --check-dedup --verbose --smoke --deep --format --oracle --project-fuzzy --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -3365,7 +3365,7 @@ _aicx() {
             return 0
             ;;
         aicx__subcmd__search)
-            opts="-p -H -d -j -v -h --project --hours --date --limit --sort --score --agent --since --until --frame-kind --kind --no-semantic --evidence --json --legacy-dense --deep --verbose --project-fuzzy --help"
+            opts="-p -H -d -j -v -h --project --hours --date --limit --sort --score --agent --since --until --frame-kind --kind --session --literal --context --no-semantic --evidence --json --legacy-dense --deep --verbose --project-fuzzy --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -3425,6 +3425,14 @@ _aicx() {
                     ;;
                 --kind)
                     COMPREPLY=($(compgen -W "conversations conversation plans plan reports report other" -- "${cur}"))
+                    return 0
+                    ;;
+                --session)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --context)
+                    COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
                 *)

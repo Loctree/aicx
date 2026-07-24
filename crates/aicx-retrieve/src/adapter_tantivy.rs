@@ -30,6 +30,52 @@ pub const TANTIVY_INDEX_DIR: &str = "tantivy_lex";
 const BODY_TOKENIZER: &str = "aicx_body_pl_en";
 const WRITER_HEAP_BYTES: usize = 50_000_000;
 
+/// Query-time evidence class used to keep durable decisions above narration.
+///
+/// The ordering deliberately mirrors transcript-builder's discrimination
+/// doctrine: explicit subject-bearing invariants outrank ordinary decisions,
+/// which outrank substantive prose. Progress chatter, questions, boilerplate,
+/// and benchmark echoes are noise even when they repeat every query token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum LexicalEvidenceClass {
+    Noise,
+    Substantive,
+    SubjectDecision,
+    ExplicitInvariant,
+}
+
+/// Classify one excerpt with transcript-builder's tri-gate doctrine.
+///
+/// A durable signal needs both strong decision/constraint language and a
+/// concrete subject (identifier, path, code symbol, or named ALL-CAPS
+/// surface). Explicit `decision:` / `contract:` / `invariant:` markers may
+/// override the narration blocklist, but only when that concrete subject is
+/// present.
+pub fn classify_lexical_evidence(excerpt: &str) -> LexicalEvidenceClass {
+    let candidate = clean_excerpt_candidate(excerpt);
+    if candidate.is_empty() || is_lexical_boilerplate(candidate) {
+        return LexicalEvidenceClass::Noise;
+    }
+
+    let normalized = candidate.to_lowercase();
+    let concrete_subject = has_concrete_subject(candidate);
+    if concrete_subject && has_explicit_marker(candidate, &normalized) {
+        return LexicalEvidenceClass::ExplicitInvariant;
+    }
+    if is_blocked_narration(candidate, &normalized) {
+        return LexicalEvidenceClass::Noise;
+    }
+    if concrete_subject && has_strong_decision_language(&normalized) {
+        return LexicalEvidenceClass::SubjectDecision;
+    }
+    LexicalEvidenceClass::Substantive
+}
+
+/// Whether an excerpt is structural/frontmatter noise rather than content.
+pub fn is_lexical_boilerplate(excerpt: &str) -> bool {
+    is_boilerplate_excerpt(clean_excerpt_candidate(excerpt))
+}
+
 /// Tantivy-backed BM25 implementation of [`LexicalIndex`].
 pub struct TantivyAdapter {
     pub index: Index,
@@ -124,6 +170,33 @@ impl TantivyAdapter {
             }
         }
         Ok(matches)
+    }
+
+    /// Enumerate the exact committed chunk ids without decoding stored bodies.
+    ///
+    /// `id` is a unique STRING term, so the term dictionary is the cheapest
+    /// authoritative identity census for coverage reporting. A metadata scan
+    /// would decompress every whole-session body and add seconds to each
+    /// lexical query merely to print `scanned N of M`.
+    pub fn scan_chunk_ids(&self) -> Result<Vec<String>> {
+        let reader = self.index.reader().context("open tantivy reader")?;
+        let searcher = reader.searcher();
+        let mut ids = Vec::with_capacity(self.doc_count);
+        for segment in searcher.segment_readers() {
+            let inverted = segment
+                .inverted_index(self.fields.id)
+                .context("open chunk id term dictionary")?;
+            let mut terms = inverted.terms().stream().context("stream chunk id terms")?;
+            while terms.advance() {
+                let id = std::str::from_utf8(terms.key())
+                    .context("decode chunk id term as UTF-8")?
+                    .to_string();
+                ids.push(id);
+            }
+        }
+        ids.sort();
+        ids.dedup();
+        Ok(ids)
     }
 
     fn refresh_stats(&mut self) -> Result<LexicalCommitId> {
@@ -305,27 +378,33 @@ impl TantivyAdapter {
         let reader = self.index.reader().context("open tantivy reader")?;
         let searcher = reader.searcher();
         let mut snippets = HashMap::with_capacity(chunk_ids.len());
+        let id_query = BooleanQuery::union(
+            chunk_ids
+                .iter()
+                .map(|chunk_id| {
+                    Box::new(TermQuery::new(
+                        Term::from_field_text(self.fields.id, chunk_id),
+                        IndexRecordOption::Basic,
+                    )) as Box<dyn Query>
+                })
+                .collect(),
+        );
+        let candidates = searcher
+            .search(
+                &id_query,
+                &TopDocs::with_limit(chunk_ids.len()).order_by_score(),
+            )
+            .context("find tantivy chunks for snippet enrichment")?;
 
-        for chunk_id in chunk_ids {
-            let id_query = TermQuery::new(
-                Term::from_field_text(self.fields.id, chunk_id),
-                IndexRecordOption::Basic,
-            );
-            let Some((_, address)) = searcher
-                .search(&id_query, &TopDocs::with_limit(1).order_by_score())
-                .with_context(|| format!("find tantivy chunk {chunk_id} for snippet"))?
-                .into_iter()
-                .next()
-            else {
-                continue;
-            };
+        for (_, address) in candidates {
             let document: TantivyDocument = searcher
                 .doc(address)
-                .with_context(|| format!("load tantivy chunk {chunk_id} for snippet"))?;
+                .context("load tantivy chunk for snippet enrichment")?;
+            let chunk_id = required_text(&document, self.fields.id, "id")?;
             let body = text_or_empty(&document, self.fields.body);
             let lines = query_context_lines(&body, query_text);
             if !lines.is_empty() {
-                snippets.insert(chunk_id.clone(), lines);
+                snippets.insert(chunk_id, lines);
             }
         }
 
@@ -351,76 +430,371 @@ fn query_context_lines(body: &str, query: &str) -> Vec<String> {
         .map(|term| (term.chars().count() >= 5).then(|| term.chars().take(5).collect::<String>()))
         .collect::<Vec<_>>();
     let normalized_query = query.to_lowercase();
+    let signal_term_floor = terms.len().min(2) as i32;
+    let mut best = None::<(LexicalEvidenceClass, i32, i32, usize, String)>;
+    let mut discovery_order = 0usize;
 
-    let lines = body.lines().collect::<Vec<_>>();
-    let mut best = None::<(usize, i32)>;
-    let mut best_clean_full_match = None::<(usize, i32)>;
-    for (index, line) in lines.iter().enumerate() {
-        let normalized = line.to_lowercase();
-        let term_score = terms
-            .iter()
-            .zip(&prefixes)
-            .filter(|pair| {
-                let term = pair.0;
-                let prefix = pair.1;
-                normalized.contains(term.as_str())
-                    || prefix
-                        .as_deref()
-                        .is_some_and(|prefix| normalized.contains(prefix))
-            })
-            .count() as i32;
-        let phrase_score = if normalized.contains(&normalized_query) {
-            2
-        } else {
-            0
-        };
-        let benchmark = normalized.contains("aicx search")
-            || normalized.contains("acceptance")
-            || normalized.contains("golden")
-            || normalized.contains("latency")
-            || normalized.contains("wall time")
-            || normalized.contains(" warm");
-        let score = term_score + phrase_score;
-        // Prefer the newest equally good context. Continued sessions often
-        // repeat an old acceptance prompt before the actual later answer.
-        if score >= best.map(|(_, score)| score).unwrap_or(0) {
-            best = Some((index, score));
-        }
-        // A continued session can later quote the release benchmark verbatim.
-        // Prefer a real line containing every query term; when no such line
-        // exists, retain the benchmark line so the caller can demote the echo.
-        if !benchmark
-            && term_score == terms.len() as i32
-            && score >= best_clean_full_match.map(|(_, score)| score).unwrap_or(0)
-        {
-            best_clean_full_match = Some((index, score));
-        }
-    }
-    let Some((best_index, score)) = best_clean_full_match.or(best) else {
-        return Vec::new();
-    };
-    if score <= 0 {
-        return Vec::new();
-    }
-
-    let mut context = Vec::new();
-    let mut chars = 0usize;
-    let start = best_index.saturating_sub(1);
-    let end = (best_index + 3).min(lines.len().saturating_sub(1));
-    for line in &lines[start..=end] {
-        let line = line.trim();
-        if line.is_empty() {
+    for line in body.lines() {
+        // Whole-session extracts can contain multi-megabyte messages. Reject
+        // lines with no query term before sentence splitting/classification;
+        // only the tiny matched subset pays the tri-gate cost.
+        let normalized_line = line.to_lowercase();
+        let line_matches = terms.iter().zip(&prefixes).any(|pair| {
+            let term = pair.0;
+            let prefix = pair.1;
+            normalized_line.contains(term.as_str())
+                || prefix
+                    .as_deref()
+                    .is_some_and(|prefix| normalized_line.contains(prefix))
+        });
+        if !line_matches {
+            discovery_order += 1;
             continue;
         }
-        let remaining = MAX_CONTEXT_CHARS.saturating_sub(chars);
-        if remaining == 0 {
-            break;
+        for sentence in sentence_fragments(line) {
+            let candidate = clean_excerpt_candidate(sentence);
+            if candidate.is_empty() {
+                discovery_order += 1;
+                continue;
+            }
+            let normalized = candidate.to_lowercase();
+            let term_score = terms
+                .iter()
+                .zip(&prefixes)
+                .filter(|pair| {
+                    let term = pair.0;
+                    let prefix = pair.1;
+                    normalized.contains(term.as_str())
+                        || prefix
+                            .as_deref()
+                            .is_some_and(|prefix| normalized.contains(prefix))
+                })
+                .count() as i32;
+            if term_score == 0 {
+                discovery_order += 1;
+                continue;
+            }
+            let phrase_score = i32::from(normalized.contains(&normalized_query));
+            let class = classify_lexical_evidence(candidate);
+            if class == LexicalEvidenceClass::Noise {
+                discovery_order += 1;
+                continue;
+            }
+            // A decision about one incidental word is not evidence for a
+            // multi-term query. Require two matched terms before a sentence
+            // receives a decision/invariant class; otherwise retain it only
+            // as ordinary substantive context.
+            let class = if term_score >= signal_term_floor {
+                class
+            } else {
+                class.min(LexicalEvidenceClass::Substantive)
+            };
+            let replace =
+                best.as_ref()
+                    .is_none_or(|(best_class, best_terms, best_phrase, best_order, _)| {
+                        (
+                            class,
+                            term_score,
+                            phrase_score,
+                            std::cmp::Reverse(discovery_order),
+                        ) > (
+                            *best_class,
+                            *best_terms,
+                            *best_phrase,
+                            std::cmp::Reverse(*best_order),
+                        )
+                    });
+            if replace {
+                best = Some((
+                    class,
+                    term_score,
+                    phrase_score,
+                    discovery_order,
+                    candidate.to_string(),
+                ));
+            }
+            discovery_order += 1;
         }
-        let excerpt = line.chars().take(remaining).collect::<String>();
-        chars += excerpt.chars().count();
-        context.push(excerpt);
     }
-    context
+    let Some((_, _, _, _, excerpt)) = best else {
+        return Vec::new();
+    };
+    vec![excerpt.chars().take(MAX_CONTEXT_CHARS).collect()]
+}
+
+fn sentence_fragments(line: &str) -> impl Iterator<Item = &str> {
+    line.split_inclusive(['.', '!', '?'])
+}
+
+fn clean_excerpt_candidate(excerpt: &str) -> &str {
+    excerpt
+        .trim()
+        .trim_start_matches('#')
+        .trim_start_matches(['-', '*'])
+        .trim()
+}
+
+fn is_boilerplate_excerpt(candidate: &str) -> bool {
+    if candidate.chars().count() < 16 || candidate.contains('\u{1b}') {
+        return true;
+    }
+    let lower = candidate.to_lowercase();
+    candidate == "---"
+        || (candidate.starts_with('<') && candidate.ends_with('>'))
+        || [
+            "<user_info",
+            "</user_info",
+            "<environment_context",
+            "<recommended_plugins",
+            "os version:",
+            "shell:",
+            "workspace path:",
+            "current_date:",
+            "timezone:",
+            "run_id:",
+            "session_id:",
+            "launcher_template:",
+            "session:",
+            "agent:",
+            "project:",
+            "source:",
+            "cwd:",
+            "frame_kind:",
+            "search result:",
+            "source file(s):",
+        ]
+        .iter()
+        .any(|prefix| lower.starts_with(prefix))
+}
+
+fn has_explicit_marker(candidate: &str, normalized: &str) -> bool {
+    [
+        "decision:",
+        "decyzja:",
+        "contract:",
+        "kontrakt:",
+        "invariant:",
+        "inwariant:",
+        "rule:",
+        "zasada:",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker))
+        || candidate
+            .split_whitespace()
+            .take(3)
+            .filter(|token| {
+                let token = trim_subject_token(token);
+                token.len() >= 3
+                    && token.chars().any(|ch| ch.is_ascii_alphabetic())
+                    && token
+                        .chars()
+                        .filter(|ch| ch.is_ascii_alphabetic())
+                        .all(|ch| ch.is_ascii_uppercase())
+            })
+            .count()
+            >= 2
+}
+
+fn has_strong_decision_language(normalized: &str) -> bool {
+    [
+        " must ",
+        "must not",
+        " never ",
+        " do not ",
+        " don't ",
+        " cannot ",
+        " only owner",
+        " owns ",
+        "source of truth",
+        "single source of truth",
+        "hard delete",
+        "is required",
+        "is retired",
+        "replaced by",
+        " musi ",
+        "nie wolno",
+        " nigdy ",
+        "wycięte",
+        "na twardo",
+        "jedyny właściciel",
+        "źródło prawdy",
+        "zastępuje",
+    ]
+    .iter()
+    .any(|marker| {
+        normalized.contains(marker)
+            || normalized.starts_with(marker.trim_start())
+            || normalized.ends_with(marker.trim_end())
+    })
+}
+
+fn is_blocked_narration(candidate: &str, normalized: &str) -> bool {
+    if candidate.ends_with('?')
+        || [
+            "what ",
+            "why ",
+            "how ",
+            "where ",
+            "when ",
+            "czy ",
+            "jak ",
+            "dlaczego ",
+            "gdzie ",
+            "kiedy ",
+        ]
+        .iter()
+        .any(|prefix| normalized.starts_with(prefix))
+    {
+        return true;
+    }
+
+    [
+        "i am ",
+        "i'm ",
+        "i’ll ",
+        "i will ",
+        "now ",
+        "first ",
+        "next ",
+        "checking ",
+        "reading ",
+        "running ",
+        "using ",
+        "the operator asked",
+        "operator asked",
+        "operator prompt",
+        "mission:",
+        "addendum ",
+        "current state",
+        "fleet status",
+        "status:",
+        "stan floty",
+        "teraz ",
+        "najpierw ",
+        "następnie ",
+        "sprawdzam ",
+        "czytam ",
+        "uruchamiam ",
+        "szukam ",
+        "robię ",
+        "używam ",
+        "plan ",
+        "kontrakt mówi",
+    ]
+    .iter()
+    .any(|prefix| normalized.starts_with(prefix))
+        || [
+            "aicx search",
+            "search -p ",
+            "search --project ",
+            "search '",
+            "search \"",
+            "search `",
+            "golden query",
+            "golden queries",
+            "golden search",
+            "search time",
+            "search times",
+            "acceptance:",
+            "wall time",
+            "| warm ",
+            "warm `-p ",
+            "build is green",
+            "build green",
+            "smoke is green",
+            "smoke green",
+            "commit done",
+            "push done",
+            "top =",
+        ]
+        .iter()
+        .any(|marker| normalized.contains(marker))
+}
+
+fn has_concrete_subject(candidate: &str) -> bool {
+    if candidate
+        .split('`')
+        .enumerate()
+        .any(|(index, token)| index % 2 == 1 && token.trim().len() >= 2)
+    {
+        return true;
+    }
+
+    let mut consecutive_all_caps = 0usize;
+    for raw in candidate.split_whitespace() {
+        let token = trim_subject_token(raw);
+        if token.is_empty() {
+            consecutive_all_caps = 0;
+            continue;
+        }
+        if looks_like_path(token)
+            || looks_like_snake_symbol(token)
+            || looks_like_camel_case(token)
+            || looks_like_structured_identifier(token)
+        {
+            return true;
+        }
+        if is_all_caps_word(token) {
+            consecutive_all_caps += 1;
+            if consecutive_all_caps >= 2 {
+                return true;
+            }
+        } else {
+            consecutive_all_caps = 0;
+        }
+    }
+    false
+}
+
+fn trim_subject_token(token: &str) -> &str {
+    token.trim_matches(|ch: char| {
+        !ch.is_alphanumeric() && !matches!(ch, '/' | '\\' | '_' | '-' | '.' | ':')
+    })
+}
+
+fn looks_like_path(token: &str) -> bool {
+    token.len() >= 3
+        && (token.contains('/') || token.contains('\\'))
+        && token
+            .split(['/', '\\'])
+            .filter(|part| !part.is_empty())
+            .count()
+            >= 2
+}
+
+fn looks_like_snake_symbol(token: &str) -> bool {
+    token.contains('_')
+        && token.chars().any(|ch| ch.is_ascii_alphabetic())
+        && token
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+}
+
+fn looks_like_camel_case(token: &str) -> bool {
+    let mut saw_lower = false;
+    for ch in token.chars() {
+        if ch.is_ascii_lowercase() {
+            saw_lower = true;
+        } else if saw_lower && ch.is_ascii_uppercase() {
+            return true;
+        }
+    }
+    false
+}
+
+fn looks_like_structured_identifier(token: &str) -> bool {
+    token.chars().any(|ch| ch.is_ascii_digit())
+        && token.chars().any(|ch| matches!(ch, '-' | ':' | '.'))
+        && token.chars().any(|ch| ch.is_ascii_alphabetic())
+}
+
+fn is_all_caps_word(token: &str) -> bool {
+    token.chars().filter(|ch| ch.is_ascii_alphabetic()).count() >= 2
+        && token
+            .chars()
+            .filter(|ch| ch.is_ascii_alphabetic())
+            .all(|ch| ch.is_ascii_uppercase())
 }
 
 impl LexicalIndex for TantivyAdapter {
@@ -927,6 +1301,33 @@ mod swap_tests {
     }
 
     #[test]
+    fn chunk_id_census_reads_term_dictionary_without_stored_bodies() {
+        let tmp = TempDir::new().unwrap();
+        let mut adapter = TantivyAdapter::new(tmp.path().to_path_buf()).unwrap();
+        adapter
+            .build(&[
+                ChunkRef {
+                    id: "claude:f842d85e".to_string(),
+                    source_path: "/sessions/claude.md".to_string(),
+                    text: "large body ".repeat(10_000),
+                    metadata: serde_json::json!({"agent": "claude"}),
+                },
+                ChunkRef {
+                    id: "codex:af7bd7cc".to_string(),
+                    source_path: "/sessions/codex.md".to_string(),
+                    text: "another large body ".repeat(10_000),
+                    metadata: serde_json::json!({"agent": "codex"}),
+                },
+            ])
+            .unwrap();
+
+        assert_eq!(
+            adapter.scan_chunk_ids().unwrap(),
+            vec!["claude:f842d85e".to_string(), "codex:af7bd7cc".to_string()]
+        );
+    }
+
+    #[test]
     fn lexical_query_attaches_body_snippet_at_the_actual_match() {
         let tmp = TempDir::new().unwrap();
         let mut adapter = TantivyAdapter::new(tmp.path().to_path_buf()).unwrap();
@@ -1036,7 +1437,7 @@ mod swap_tests {
     }
 
     #[test]
-    fn query_context_prefers_real_pensieve_hit_over_later_aicx_benchmark() {
+    fn query_context_silences_search_command_echoes() {
         let body = [
             "pensieve to znajduje [Pensieve search 'arrows vc-frame']",
             "unrelated release paragraph",
@@ -1046,9 +1447,53 @@ mod swap_tests {
 
         let lines = query_context_lines(&body, "arrows vc-frame");
 
+        assert!(
+            lines.is_empty(),
+            "silence must beat benchmark echo: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn evidence_tri_gate_requires_decision_language_and_a_concrete_subject() {
         assert_eq!(
-            lines.first().map(String::as_str),
-            Some("pensieve to znajduje [Pensieve search 'arrows vc-frame']")
+            classify_lexical_evidence("W2-B-4c must own arrow routing for the vc-frame top tabs."),
+            LexicalEvidenceClass::SubjectDecision
+        );
+        assert_eq!(
+            classify_lexical_evidence(
+                "Decision: W2-B-4c must own arrow routing for the vc-frame top tabs."
+            ),
+            LexicalEvidenceClass::ExplicitInvariant
+        );
+        assert_eq!(
+            classify_lexical_evidence(
+                "I am checking W2-B-4c arrow routing in the current index now."
+            ),
+            LexicalEvidenceClass::Noise
+        );
+        assert_eq!(
+            classify_lexical_evidence("This must remain fast and reliable for operators."),
+            LexicalEvidenceClass::Substantive,
+            "bare modal language without a concrete subject is not a decision"
+        );
+    }
+
+    #[test]
+    fn query_context_chooses_subject_decision_over_frontmatter_and_narration() {
+        let body = [
+            "<user_info>",
+            "OS Version: macOS 26.0",
+            "I am checking W2-B-4c routing strzałek in the current index.",
+            "Decision: W2-B-4c must own routing strzałek for the top tabs.",
+            "Acceptance: `aicx search 'routing strzałek'` must return W2-B-4c.",
+        ]
+        .join("\n");
+
+        let lines = query_context_lines(&body, "W2-B-4c routing strzałek");
+
+        assert_eq!(
+            lines,
+            vec!["Decision: W2-B-4c must own routing strzałek for the top tabs."]
         );
     }
 }

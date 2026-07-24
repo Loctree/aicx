@@ -665,7 +665,7 @@ done
 echo "[4/6] Packaging notarization archive..."
 rm -f "$ARCHIVE_PATH" "$CHECKSUM_PATH" "$NOTARY_LOG_PATH" "${ARCHIVE_PATH}.asc"
 ditto -c -k --keepParent "$BUNDLE_DIR" "$ARCHIVE_PATH"
-sha256_file "$ARCHIVE_PATH" > "$CHECKSUM_PATH"
+(cd "$DIST_DIR" && sha256_file "$(basename "$ARCHIVE_PATH")") > "$CHECKSUM_PATH"
 
 # GPG detached signature is mandatory — Loctree releases never ship unsigned.
 if [[ -z "${LOCTREE_GPG_KEY_ID:-}" ]]; then

@@ -6,7 +6,7 @@
 //! directly. It never reads or writes per-frame store cards or embedding
 //! NDJSON intermediates.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
@@ -55,6 +55,86 @@ pub struct SourceIndexReport {
     pub wall_ms: u64,
     pub manifest_path: Option<String>,
     pub skipped_by_agent: BTreeMap<String, usize>,
+}
+
+/// Honest corpus coverage attached to every CLI search surface.
+///
+/// `scanned_sessions` is the number of catalog sessions present in the
+/// published CURRENT lexical generation. `total_sessions` is the durable
+/// catalog size. Missing rows are grouped by extractor so an empty result
+/// cannot silently hide an unreadable agent source.
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+pub struct SearchCoverage {
+    pub scanned_sessions: usize,
+    pub total_sessions: usize,
+    pub skipped: BTreeMap<String, usize>,
+}
+
+impl SearchCoverage {
+    pub fn single_session(scanned: bool, agent: &str) -> Self {
+        let mut skipped = BTreeMap::new();
+        if !scanned {
+            skipped.insert(format!("{}_unreadable", coverage_agent_key(agent)), 1);
+        }
+        Self {
+            scanned_sessions: usize::from(scanned),
+            total_sessions: 1,
+            skipped,
+        }
+    }
+
+    pub fn render_line(&self) -> String {
+        let skipped = if self.skipped.is_empty() {
+            "none".to_string()
+        } else {
+            self.skipped
+                .iter()
+                .map(|(reason, count)| format!("{reason}={count}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        format!(
+            "scanned {} of {} sessions; skipped: {}",
+            self.scanned_sessions, self.total_sessions, skipped
+        )
+    }
+}
+
+/// One stable, source-ordered passage from a catalog session.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SessionPassage {
+    pub passage: usize,
+    pub line_span: LineSpan,
+    pub match_lines: Vec<usize>,
+    pub text: String,
+    pub source_path: String,
+    pub document_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct LineSpan {
+    pub start: usize,
+    pub end: usize,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SessionPassageReport {
+    pub session_id: String,
+    pub agent: String,
+    pub query: String,
+    pub mode: &'static str,
+    pub context: usize,
+    pub cache_hit: bool,
+    pub passages: Vec<SessionPassage>,
+    pub coverage: SearchCoverage,
+}
+
+#[derive(Debug)]
+struct SessionDocument {
+    body: String,
+    source_path: String,
+    document_path: PathBuf,
+    cache_hit: bool,
 }
 
 /// Durable per-session parse ledger for true incremental index builds.
@@ -365,6 +445,260 @@ pub fn build(
         manifest_path,
         skipped_by_agent,
     })
+}
+
+/// Compare the durable catalog with the document identities actually committed
+/// to CURRENT. This intentionally scans the exact id term dictionary rather
+/// than trusting only the manifest count: the count alone cannot say which
+/// extractor has holes.
+pub fn current_search_coverage(aicx_home: &Path) -> SearchCoverage {
+    let entries = match crate::catalog::read_entries_at(aicx_home) {
+        Ok(entries) => entries,
+        Err(_) => {
+            return SearchCoverage {
+                skipped: BTreeMap::from([("catalog_unreadable".to_string(), 1)]),
+                ..SearchCoverage::default()
+            };
+        }
+    };
+    let total_sessions = entries.len();
+    let indexed = match current_indexed_session_keys() {
+        Ok(indexed) => indexed,
+        Err(_) => {
+            let mut skipped = BTreeMap::new();
+            for entry in &entries {
+                *skipped
+                    .entry(format!(
+                        "{}_index_unreadable",
+                        coverage_agent_key(entry.agent.as_str())
+                    ))
+                    .or_default() += 1;
+            }
+            return SearchCoverage {
+                scanned_sessions: 0,
+                total_sessions,
+                skipped,
+            };
+        }
+    };
+    let mut skipped = BTreeMap::new();
+    let mut scanned_sessions = 0usize;
+
+    for entry in &entries {
+        if indexed.contains(&session_state_key(&entry.agent, &entry.session_id)) {
+            scanned_sessions += 1;
+        } else {
+            *skipped
+                .entry(format!(
+                    "{}_unindexed",
+                    coverage_agent_key(entry.agent.as_str())
+                ))
+                .or_default() += 1;
+        }
+    }
+    let indexed_orphans = indexed.len().saturating_sub(scanned_sessions);
+    if indexed_orphans > 0 {
+        skipped.insert("index_orphaned".to_string(), indexed_orphans);
+    }
+
+    SearchCoverage {
+        scanned_sessions,
+        total_sessions,
+        skipped,
+    }
+}
+
+fn current_indexed_session_keys() -> Result<HashSet<String>> {
+    let hybrid_root = crate::vector_index::hybrid_root_dir(None)?;
+    let generation = crate::vector_index::resolve_hybrid_generation_dir(&hybrid_root);
+    if !generation.join("manifest.json").is_file() {
+        return Ok(HashSet::new());
+    }
+    let lexical = aicx_retrieve::TantivyAdapter::new(generation)?;
+    Ok(lexical.scan_chunk_ids()?.into_iter().collect())
+}
+
+fn coverage_agent_key(agent: &str) -> String {
+    let normalized: String = agent
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let normalized = normalized.trim_matches('_');
+    if normalized.is_empty() {
+        "unknown".to_string()
+    } else {
+        normalized.to_string()
+    }
+}
+
+/// Search every matching passage inside one catalog session.
+///
+/// Cached extracts are read first. When no cache exists, the source is parsed
+/// through the same signal-only parser and renderer used by `aicx index`; this
+/// fallback is read-only and never materializes a cache file.
+pub fn search_session_passages(
+    aicx_home: &Path,
+    session: &str,
+    query: &str,
+    context: usize,
+    literal: bool,
+) -> Result<SessionPassageReport> {
+    if query.trim().is_empty() {
+        anyhow::bail!("session passage query must not be empty");
+    }
+    let entry = crate::catalog::resolve_session(aicx_home, session)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "session `{session}` not in durable catalog; run `aicx catalog rebuild` first"
+        )
+    })?;
+    let document = read_session_document(aicx_home, &entry)?;
+    let hit_lines = matching_line_numbers(&document.body, query, literal)?;
+    let spans = merge_context_spans(&hit_lines, document.body.lines().count(), context);
+    let lines: Vec<&str> = document.body.lines().collect();
+    let source_path = document.source_path;
+    let document_path = document.document_path.display().to_string();
+    let passages = spans
+        .into_iter()
+        .enumerate()
+        .map(|(index, (start, end, match_lines))| SessionPassage {
+            passage: index + 1,
+            line_span: LineSpan { start, end },
+            match_lines,
+            text: lines[start - 1..end].join("\n"),
+            source_path: source_path.clone(),
+            document_path: document_path.clone(),
+        })
+        .collect();
+
+    Ok(SessionPassageReport {
+        session_id: entry.session_id,
+        agent: entry.agent.clone(),
+        query: query.to_string(),
+        mode: if literal { "literal" } else { "token" },
+        context,
+        cache_hit: document.cache_hit,
+        passages,
+        coverage: SearchCoverage::single_session(true, &entry.agent),
+    })
+}
+
+fn read_session_document(aicx_home: &Path, entry: &CatalogEntry) -> Result<SessionDocument> {
+    let cache_path = extract_path_for(aicx_home, &entry.agent, &entry.session_id);
+    if cache_path.is_file() {
+        let body = crate::source_path::read_under_aicx_home(aicx_home, &cache_path)
+            .with_context(|| format!("read session extract cache {}", cache_path.display()))?;
+        return Ok(SessionDocument {
+            body,
+            source_path: entry.source_path.clone(),
+            document_path: cache_path,
+            cache_hit: true,
+        });
+    }
+
+    let user_home = crate::os_user_home().unwrap_or_else(|| aicx_home.to_path_buf());
+    let source_allow = crate::source_path::SourceAllowlist::for_operator(&user_home, aicx_home);
+    let source_path = source_allow
+        .resolve_file(entry.source_path.as_str())
+        .with_context(|| {
+            format!(
+                "resolve catalog source agent={} session_id={}",
+                entry.agent, entry.session_id
+            )
+        })?;
+    let mut frames = parse_catalog_source(entry, &source_path, &source_allow)?;
+    frames.sort_by_key(|frame| frame.timestamp);
+    frames.retain(is_signal_frame);
+    for frame in &mut frames {
+        frame.message = clean_message(&frame.message);
+    }
+    frames.retain(|frame| !frame.message.trim().is_empty());
+    let body = render_extract(entry, &frames);
+    Ok(SessionDocument {
+        body,
+        source_path: entry.source_path.clone(),
+        document_path: source_path,
+        cache_hit: false,
+    })
+}
+
+fn matching_line_numbers(body: &str, query: &str, literal: bool) -> Result<Vec<usize>> {
+    if literal {
+        return Ok(body
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| contains_boundary_literal(line, query))
+            .map(|(index, _)| index + 1)
+            .collect());
+    }
+
+    let query_tokens = lexical_tokens(query);
+    if query_tokens.is_empty() {
+        anyhow::bail!("token query must contain at least one letter or digit");
+    }
+    Ok(body
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| {
+            let line_tokens: HashSet<String> = lexical_tokens(line).into_iter().collect();
+            query_tokens.iter().any(|token| line_tokens.contains(token))
+        })
+        .map(|(index, _)| index + 1)
+        .collect())
+}
+
+fn lexical_tokens(value: &str) -> Vec<String> {
+    value
+        .split(|ch: char| !ch.is_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .map(|token| token.to_lowercase())
+        .collect()
+}
+
+fn contains_boundary_literal(line: &str, query: &str) -> bool {
+    let Some(first) = query.chars().next() else {
+        return false;
+    };
+    let Some(last) = query.chars().next_back() else {
+        return false;
+    };
+    line.match_indices(query).any(|(start, matched)| {
+        let end = start + matched.len();
+        let before = line[..start].chars().next_back();
+        let after = line[end..].chars().next();
+        (!is_identifier_char(first) || before.is_none_or(|ch| !is_identifier_char(ch)))
+            && (!is_identifier_char(last) || after.is_none_or(|ch| !is_identifier_char(ch)))
+    })
+}
+
+fn is_identifier_char(ch: char) -> bool {
+    ch.is_alphanumeric() || ch == '_'
+}
+
+fn merge_context_spans(
+    hit_lines: &[usize],
+    total_lines: usize,
+    context: usize,
+) -> Vec<(usize, usize, Vec<usize>)> {
+    let mut spans: Vec<(usize, usize, Vec<usize>)> = Vec::new();
+    for &line in hit_lines {
+        let start = line.saturating_sub(context).max(1);
+        let end = line.saturating_add(context).min(total_lines);
+        if let Some((_, previous_end, previous_hits)) = spans.last_mut()
+            && start <= previous_end.saturating_add(1)
+        {
+            *previous_end = (*previous_end).max(end);
+            previous_hits.push(line);
+        } else {
+            spans.push((start, end, vec![line]));
+        }
+    }
+    spans
 }
 
 fn parse_catalog_source(

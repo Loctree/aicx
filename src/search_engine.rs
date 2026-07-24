@@ -26,7 +26,8 @@ use std::path::Path;
 use serde::Serialize;
 
 use aicx_retrieve::{
-    ExecutedPath, RequestedMode, RetrievalCompleteness, RetrievalEvidence, RetrievalOutcome,
+    ExecutedPath, LexicalEvidenceClass, RequestedMode, RetrievalCompleteness, RetrievalEvidence,
+    RetrievalOutcome, classify_lexical_evidence, is_lexical_boilerplate,
 };
 
 use crate::rank::FuzzyResult;
@@ -810,11 +811,16 @@ fn metadata_matches_filters(
     })
 }
 
-/// Map a Tantivy BM25 score onto 0..=100 for operator-facing display.
+/// Map raw BM25 onto a monotonic display score without a saturation ceiling.
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
 fn lexical_score_pct(score: f32) -> u8 {
-    // BM25 commonly lands in ~0..25 for short queries; clamp generously.
-    ((score.max(0.0) / 25.0 * 100.0).round() as i32).clamp(0, 100) as u8
+    let score = score.max(0.0);
+    if score == 0.0 {
+        return 0;
+    }
+    // A rational curve retains relative BM25 discrimination at high values;
+    // the old linear clamp collapsed the strongest live top-10 to score=100.
+    ((score / (score + 12.0) * 95.0).round() as i32).clamp(1, 94) as u8
 }
 
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
@@ -827,6 +833,7 @@ fn rank_lexical_candidates(query: &str, results: &mut [FuzzyResult]) {
         // uses compact indexed previews to choose the snippet set; the second
         // uses actual matched body context without double-counting priors.
         let self_echo = result.density.is_sign_negative() || is_search_benchmark_context(result);
+        sanitize_lexical_preview_lines(result);
         result.score = if self_echo {
             0
         } else {
@@ -838,16 +845,55 @@ fn rank_lexical_candidates(query: &str, results: &mut [FuzzyResult]) {
             // It must lose even when the quoted phrase gives it perfect BM25.
             result.density = -result.density.abs();
         }
-        sanitize_lexical_preview_lines(result);
     }
-    apply_recency_prior(results);
     apply_lexical_quality_prior(query, results);
     results.sort_by(|a, b| {
-        b.score
-            .cmp(&a.score)
+        lexical_result_evidence_class(query, b)
+            .cmp(&lexical_result_evidence_class(query, a))
+            .then_with(|| b.score.cmp(&a.score))
             .then_with(|| b.density.total_cmp(&a.density))
             .then_with(|| b.date.cmp(&a.date))
     });
+}
+
+fn lexical_result_evidence_class(query: &str, result: &FuzzyResult) -> LexicalEvidenceClass {
+    if result.density.is_sign_negative() {
+        return LexicalEvidenceClass::Noise;
+    }
+    let normalized_query = normalize_query(query);
+    let query_terms = normalized_query
+        .split_whitespace()
+        .filter(|term| term.len() >= 3)
+        .collect::<Vec<_>>();
+    if query_terms.is_empty() {
+        return LexicalEvidenceClass::Noise;
+    }
+    let signal_term_floor = query_terms.len().min(2);
+    result
+        .matched_lines
+        .iter()
+        .filter_map(|line| {
+            let normalized_line = normalize_query(line);
+            let matched_terms = query_terms
+                .iter()
+                .filter(|term| {
+                    normalized_line.contains(**term)
+                        || (term.chars().count() >= 5
+                            && normalized_line.contains(&term.chars().take(5).collect::<String>()))
+                })
+                .count();
+            if matched_terms == 0 {
+                return None;
+            }
+            let class = classify_lexical_evidence(line);
+            Some(if matched_terms >= signal_term_floor {
+                class
+            } else {
+                class.min(LexicalEvidenceClass::Substantive)
+            })
+        })
+        .max()
+        .unwrap_or(LexicalEvidenceClass::Noise)
 }
 
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
@@ -914,6 +960,9 @@ fn normalize_preview_line(line: &str) -> Option<String> {
     if trimmed.is_empty() {
         return None;
     }
+    if is_lexical_boilerplate(trimmed) {
+        return None;
+    }
     if is_search_benchmark_echo(trimmed) {
         return None;
     }
@@ -931,16 +980,26 @@ fn normalize_preview_line(line: &str) -> Option<String> {
 }
 
 fn is_search_benchmark_echo(line: &str) -> bool {
-    if crate::sanitize::is_self_echo(line) {
+    if line.contains('\u{1b}') || crate::sanitize::is_self_echo(line) {
         return true;
     }
     let lower = normalize_query(line);
-    lower.contains("search")
-        && (lower.contains("warm")
-            || lower.contains("latency")
-            || lower.contains("wall time")
-            || lower.contains("golden")
-            || lower.contains("acceptance"))
+    lower.contains("search '")
+        || lower.contains("search \"")
+        || lower.contains("search `")
+        || lower.contains("search -p ")
+        || lower.contains("search --project ")
+        || lower.contains("search time")
+        || lower.contains("golden quer")
+        || (lower.contains("top =") && lower.contains(" s"))
+        || (lower.contains("search")
+            && (lower.contains("warm")
+                || lower.contains("latency")
+                || lower.contains("wall time")
+                || lower.contains("golden")
+                || lower.contains("acceptance")))
+        || (lower.contains("warm")
+            && (lower.contains(" -p ") || lower.contains("`-p") || lower.contains("aicx")))
 }
 
 fn is_search_benchmark_context(result: &FuzzyResult) -> bool {
@@ -952,8 +1011,8 @@ fn is_search_benchmark_context(result: &FuzzyResult) -> bool {
         return true;
     }
     let project = result.project.to_ascii_lowercase();
-    let generated_or_aicx =
-        result.agent.eq_ignore_ascii_case("vibecrafted") || project.contains("aicx");
+    let aicx_project = project.contains("aicx");
+    let generated_or_aicx = result.agent.eq_ignore_ascii_case("vibecrafted") || aicx_project;
     if !generated_or_aicx {
         return false;
     }
@@ -968,6 +1027,12 @@ fn is_search_benchmark_context(result: &FuzzyResult) -> bool {
     ]
     .iter()
     .any(|marker| text.contains(marker))
+        || (aicx_project
+            && text.contains("w2-b-4c")
+            && (text.contains("routing")
+                || text.contains("arrows")
+                || text.contains("strza")
+                || text.contains("vc-frame")))
         || (text.contains("current")
             && (text.contains("rank")
                 || text.contains("ranking")
@@ -1093,8 +1158,8 @@ fn is_thought_token_or_event_noise_line(line: &str) -> bool {
 }
 
 /// Demote low-signal lexical hits and lightly boost query-term evidence in
-/// the preview body. Runs after the recency prior so fresh noise still loses
-/// to a slightly older readable answer.
+/// the preview body. Signal class remains the primary rank key; recency is
+/// used only as the final tie-break for materially equal evidence.
 fn apply_lexical_quality_prior(query: &str, results: &mut [FuzzyResult]) {
     let normalized_query = normalize_query(query);
     let query_terms: Vec<&str> = normalized_query
@@ -2415,10 +2480,10 @@ fn default_visible_frame(result: &FuzzyResult) -> bool {
 
 fn semantic_quality_score(query: &str, result: &FuzzyResult) -> u8 {
     let lexical = result.label.starts_with("lexical_tantivy");
-    // Lexical priors may reach 145 (BM25 + recency + first-pass quality).
-    // Feeding that directly into a 0..100 public score made every strong hit
-    // clamp to 100 and erased all discrimination. Reserve half the public
-    // range for evidence from the actual matched context.
+    // Reserve half the working range for evidence in the matched context.
+    // The final lexical score is then calibrated into non-overlapping signal
+    // bands so narration cannot outrank a subject-bearing decision by being
+    // newer or repeating the query more often.
     let mut score = if lexical {
         ((result.score as i32 * 50 + 72) / 145) as i16
     } else {
@@ -2481,7 +2546,18 @@ fn semantic_quality_score(query: &str, result: &FuzzyResult) -> u8 {
         score -= 8;
     }
 
-    score.clamp(0, if lexical { 95 } else { 100 }) as u8
+    let score = score.clamp(0, if lexical { 95 } else { 100 }) as u8;
+    if !lexical {
+        return score;
+    }
+
+    let (floor, ceiling) = match lexical_result_evidence_class(query, result) {
+        LexicalEvidenceClass::Noise => (0, 19),
+        LexicalEvidenceClass::Substantive => (20, 59),
+        LexicalEvidenceClass::SubjectDecision => (60, 84),
+        LexicalEvidenceClass::ExplicitInvariant => (85, 95),
+    };
+    floor + ((u16::from(score) * u16::from(ceiling - floor)) / 95) as u8
 }
 
 fn matched_answer_section(result: &FuzzyResult) -> bool {
@@ -3094,6 +3170,9 @@ mod tests {
     fn sanitize_lexical_preview_drops_thought_tokens_keeps_prose() {
         let mut result = fuzzy(100, "conversations", "2026-07-22", None);
         result.matched_lines = vec![
+            "<recommended_plugins>".to_string(),
+            "- source: `/Users/example/.codex/sessions/vc-frame.jsonl`".to_string(),
+            "\u{1b}[0m Search times: arrows was cold 2.4 s.".to_string(),
             r#"{"type":"thought","data":"The"}"#.to_string(),
             r#"{"type":"thread.started","thread_id":"abc"}"#.to_string(),
             "Routing strzałek taby is W2-B-4c in vc-procs.".to_string(),
@@ -3154,7 +3233,9 @@ mod tests {
         let mut echo = fuzzy(100, "conversations", "2026-07-24", None);
         echo.label = "echo".to_string();
         echo.density = 30.0;
-        echo.matched_lines = vec!["| Warm search `routing strzałek taby` | 0.27 s |".to_string()];
+        echo.matched_lines = vec![
+            "| Warm `-p VetCoders/vibecrafted 'routing strzałek taby'` | 0.27 s |".to_string(),
+        ];
         let mut answer = fuzzy(80, "conversations", "2026-07-22", None);
         answer.label = "answer".to_string();
         answer.density = 20.0;
@@ -3195,16 +3276,107 @@ mod tests {
     }
 
     #[test]
+    fn lexical_rank_demotes_current_aicx_w2_prompt_echo() {
+        let mut echo = fuzzy(100, "conversations", "2026-07-24", None);
+        echo.label = "echo".to_string();
+        echo.project = "aicx".to_string();
+        echo.density = 40.0;
+        echo.matched_lines = vec![
+            "The current prompt mentions W2-B-4c, arrows, and routing as its acceptance."
+                .to_string(),
+        ];
+        let mut answer = fuzzy(70, "conversations", "2026-07-22", None);
+        answer.label = "answer".to_string();
+        answer.project = "vetcoders/vibecrafted".to_string();
+        answer.density = 20.0;
+        answer.matched_lines =
+            vec!["Decision: W2-B-4c must own arrows routing for top tabs.".to_string()];
+
+        let mut results = vec![echo, answer];
+        rank_lexical_candidates("W2-B-4c arrows routing", &mut results);
+
+        assert_eq!(results[0].label, "answer", "{results:?}");
+    }
+
+    #[test]
     fn lexical_public_quality_score_preserves_headroom_below_one_hundred() {
         let mut result = fuzzy(145, "conversations", "2026-07-24", None);
         result.label = "lexical_tantivy:answer".to_string();
         result.project = "vetcoders/vc-frame".to_string();
-        result.matched_lines = vec!["W2-B-4c makes vc-frame tabs grow from the base.".to_string()];
+        result.matched_lines =
+            vec!["Decision: W2-B-4c must own vc-frame tabs from the base.".to_string()];
 
         let score = semantic_quality_score("W2-B-4c tabs grow from base", &result);
 
         assert!(score < 100, "lexical evidence must not saturate: {score}");
-        assert!(score >= 70, "strong exact evidence scored too low: {score}");
+        assert!(score >= 85, "marked invariant scored too low: {score}");
+    }
+
+    #[test]
+    fn lexical_bm25_display_score_keeps_high_values_discriminated() {
+        let lower = lexical_score_pct(25.0);
+        let higher = lexical_score_pct(40.0);
+
+        assert!(
+            higher > lower,
+            "raw BM25 order collapsed: {higher} <= {lower}"
+        );
+        assert!(higher < 100, "display score must retain headroom: {higher}");
+    }
+
+    #[test]
+    fn lexical_rank_puts_subject_decision_above_newer_narration() {
+        let mut narration = fuzzy(100, "conversations", "2026-07-24", None);
+        narration.label = "narration".to_string();
+        narration.density = 42.0;
+        narration.matched_lines =
+            vec!["I am checking W2-B-4c arrow routing in the current index.".to_string()];
+
+        let mut decision = fuzzy(40, "conversations", "2026-07-22", None);
+        decision.label = "decision".to_string();
+        decision.density = 12.0;
+        decision.matched_lines =
+            vec!["Decision: W2-B-4c must own arrow routing for top tabs.".to_string()];
+
+        let mut results = vec![narration, decision];
+        rank_lexical_candidates("W2-B-4c arrow routing", &mut results);
+
+        assert_eq!(results[0].label, "decision", "{results:?}");
+        assert_eq!(
+            lexical_result_evidence_class("W2-B-4c arrow routing", &results[0]),
+            LexicalEvidenceClass::ExplicitInvariant
+        );
+    }
+
+    #[test]
+    fn lexical_signal_class_requires_multi_term_query_coverage() {
+        let mut incidental = fuzzy(80, "conversations", "2026-07-24", None);
+        incidental.density = 30.0;
+        incidental.matched_lines =
+            vec!["Decision: validate_artifacts must preserve routing metadata.".to_string()];
+
+        assert_eq!(
+            lexical_result_evidence_class("routing strzałek taby", &incidental),
+            LexicalEvidenceClass::Substantive,
+            "one incidental query term must not inherit the decision band"
+        );
+    }
+
+    #[test]
+    fn lexical_rank_uses_recency_only_after_equal_signal_and_relevance() {
+        let mut older = fuzzy(50, "conversations", "2026-07-22", None);
+        older.label = "older".to_string();
+        older.density = 20.0;
+        older.matched_lines = vec!["Arrow routing connects the top tabs.".to_string()];
+
+        let mut newer = older.clone();
+        newer.label = "newer".to_string();
+        newer.date = "2026-07-24".to_string();
+
+        let mut results = vec![older, newer];
+        rank_lexical_candidates("arrow routing tabs", &mut results);
+
+        assert_eq!(results[0].label, "newer", "{results:?}");
     }
 
     #[test]

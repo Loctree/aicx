@@ -2,20 +2,17 @@
 
 const { execFileSync, spawnSync } = require("child_process");
 const { existsSync, realpathSync } = require("fs");
-const { isAbsolute, relative, sep } = require("path");
+const { dirname, isAbsolute, relative, sep } = require("path");
 
 const PLATFORM_PACKAGES = Object.freeze({
   "darwin-arm64": Object.freeze({
     name: "@loctree/aicx-darwin-arm64",
-    root: `${__dirname}/node_modules/@loctree/aicx-darwin-arm64`,
   }),
   "linux-x64-gnu": Object.freeze({
     name: "@loctree/aicx-linux-x64-gnu",
-    root: `${__dirname}/node_modules/@loctree/aicx-linux-x64-gnu`,
   }),
   "win32-x64-gnu": Object.freeze({
     name: "@loctree/aicx-win32-x64-gnu",
-    root: `${__dirname}/node_modules/@loctree/aicx-win32-x64-gnu`,
   }),
 });
 
@@ -99,6 +96,13 @@ function getBinaryFileName(binaryName) {
   return binaryFileName;
 }
 
+function resolvePlatformPackageRoot(packageName, searchRoot = __dirname) {
+  const manifestPath = require.resolve(`${packageName}/package.json`, {
+    paths: [searchRoot],
+  });
+  return realpathSync(dirname(manifestPath));
+}
+
 function assertContainedPath(rootPath, candidatePath) {
   const rel = relative(rootPath, candidatePath);
   if (rel === "" || rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
@@ -106,11 +110,35 @@ function assertContainedPath(rootPath, candidatePath) {
   }
 }
 
+function resolvePlatformBinaryPath(packageRoot, binaryFileName) {
+  const allowedBinaryNames = new Set(Object.values(BINARY_FILENAMES));
+  if (!allowedBinaryNames.has(binaryFileName)) {
+    throw new Error(`Refusing unexpected platform binary name: ${binaryFileName}`);
+  }
+
+  const binaryPath = `${packageRoot}${sep}${binaryFileName}`;
+  assertContainedPath(packageRoot, binaryPath);
+  return binaryPath;
+}
+
 function getBinaryPath(binaryName) {
   const platformPackage = getPlatformPackage();
   const packageName = platformPackage.name;
   const resolvedBinaryName = getBinaryFileName(binaryName);
-  const binaryPath = `${platformPackage.root}/${resolvedBinaryName}`;
+  let packageRoot;
+
+  try {
+    packageRoot = resolvePlatformPackageRoot(packageName);
+  } catch (error) {
+    throw new Error(
+      `${packageName} is not installed or cannot be resolved.\n` +
+      `This typically happens if npm optionalDependencies failed to install or were skipped.\n` +
+      `Download the binary manually from: https://github.com/Loctree/aicx/releases`,
+      { cause: error }
+    );
+  }
+
+  const binaryPath = resolvePlatformBinaryPath(packageRoot, resolvedBinaryName);
 
   if (!existsSync(binaryPath)) {
     throw new Error(
@@ -121,7 +149,7 @@ function getBinaryPath(binaryName) {
     );
   }
 
-  const realPackageRoot = realpathSync(platformPackage.root);
+  const realPackageRoot = realpathSync(packageRoot);
   const realBinaryPath = realpathSync(binaryPath);
   assertContainedPath(realPackageRoot, realBinaryPath);
 
@@ -180,6 +208,9 @@ module.exports = {
   execAicxMcp,
   execAicxMcpSync,
   getBinaryPath,
+  getPlatformPackageName,
+  resolvePlatformBinaryPath,
+  resolvePlatformPackageRoot,
 };
 
 if (require.main === module) {

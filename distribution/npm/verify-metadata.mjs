@@ -5,7 +5,9 @@
  */
 
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
+import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -74,6 +76,53 @@ function assertNotIncludes(label, text, needle) {
   }
 }
 
+function verifyHoistedPlatformResolution() {
+  const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), "aicx-npm-resolution-"));
+  const wrapperRoot = path.join(fixtureRoot, "node_modules", "@loctree", "aicx");
+  const platformRoot = path.join(
+    fixtureRoot,
+    "node_modules",
+    "@loctree",
+    "aicx-darwin-arm64"
+  );
+
+  try {
+    fs.mkdirSync(wrapperRoot, { recursive: true });
+    fs.mkdirSync(platformRoot, { recursive: true });
+    fs.writeFileSync(
+      path.join(platformRoot, "package.json"),
+      `${JSON.stringify({ name: "@loctree/aicx-darwin-arm64", version: "0.0.0" })}\n`
+    );
+
+    const require = createRequire(import.meta.url);
+    const {
+      resolvePlatformBinaryPath,
+      resolvePlatformPackageRoot,
+    } = require(path.join(ROOT, "aicx", "index.js"));
+    const resolvedRoot = resolvePlatformPackageRoot(
+      "@loctree/aicx-darwin-arm64",
+      wrapperRoot
+    );
+    assertEqual(
+      "hoisted platform package resolution",
+      resolvedRoot,
+      fs.realpathSync(platformRoot)
+    );
+
+    let traversalRejected = false;
+    try {
+      resolvePlatformBinaryPath(resolvedRoot, "../../escape");
+    } catch {
+      traversalRejected = true;
+    }
+    assertEqual("platform binary traversal rejection", traversalRejected, true);
+  } catch (error) {
+    fail(`hoisted platform package resolution: ${error.message}`);
+  } finally {
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+}
+
 const wrapper = readJson(WRAPPER.path);
 assertEqual("wrapper name", wrapper.name, WRAPPER.name);
 
@@ -122,6 +171,8 @@ for (const platform of PLATFORMS) {
   // GPG-detached (and macOS additionally Apple-codesigned + notarized).
   assertNotIncludes(`${platform.key} postinstall`, postinstall, "slim-unsigned");
 }
+
+verifyHoistedPlatformResolution();
 
 if (process.exitCode) {
   process.exit(process.exitCode);
