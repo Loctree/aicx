@@ -3,6 +3,34 @@
 This document maps the supported binary install channels and the shadow checks
 that keep `PATH` from resolving older `aicx` or `aicx-mcp` binaries.
 
+## Channel Precedence
+
+Install channels are **not** co-equal. On any external / end-user machine the
+order is **prebuilt-first**; building from source with `cargo` is the last
+resort — never a default, never a silent fallback:
+
+1. **npm** — `npm install -g @loctree/aicx` (prebuilt platform packages)
+2. **Release download (curl)** — `AICX_INSTALL_MODE=release bash install.sh`
+   (downloads + SHA256-verifies a prebuilt bundle)
+3. **Release bundle** — `bash install.sh` from an unpacked release archive
+4. _developer only_ — **Local source** / `make install-bin` → `cargo install`
+5. _developer only_ — **git** — `AICX_INSTALL_MODE=git`
+
+**Contract:** a stranger's machine must never be required to have a Rust
+toolchain, `protoc`, or spare build disk to run aicx. The two end-user channels
+(1, 2) are prebuilt-only with no automatic source-build fallback — verified by
+audit: `distribution/npm/**` postinstall only downloads / SHA256-verifies /
+extracts / copies, and `install.sh` release mode `exit 0`s before reaching any
+`cargo` branch. Source build is reachable only through the explicit developer
+modes above.
+
+**Known sharp edge:** `install.sh` `auto` mode resolves to **local** (source
+build) when a `Cargo.toml` is adjacent — i.e. run from inside a clone. A bare
+standalone `install.sh` with no checkout resolves to `release`, so strangers are
+safe, but a repo cloner running `bash install.sh` gets a compile rather than a
+prebuilt bundle. Pass `AICX_INSTALL_MODE=release` explicitly in any non-dev
+automation to stay on the prebuilt path.
+
 ## Install Surface
 
 ```text
