@@ -1,7 +1,8 @@
 //! Server-mode dashboard browser JavaScript.
 
 /// JavaScript for the server-mode shell — all data fetched via API.
-/// v6: real filters, sort, inline markdown renderer, URL state, expand/collapse.
+/// v6.1: real filters, sort, inline markdown, URL state, expand/collapse,
+/// human Bearer login (localStorage) so `/api/*` auth works in a browser.
 pub(crate) const DASHBOARD_SERVER_SCRIPT: &str = r#"
 (() => {
   const $ = (id) => document.getElementById(id);
@@ -25,6 +26,98 @@ pub(crate) const DASHBOARD_SERVER_SCRIPT: &str = r#"
   };
 
   const renderMarkdown = AicxMarkdown.renderMarkdown;
+
+  /* --- browser Bearer auth (human UX; server still owns cascade) -------- */
+  const AUTH_KEY = 'aicx_dashboard_token';
+  const getToken = () => {
+    try { return localStorage.getItem(AUTH_KEY) || ''; } catch (_) { return ''; }
+  };
+  const clearToken = () => {
+    try { localStorage.removeItem(AUTH_KEY); } catch (_) {}
+  };
+  const saveToken = (tok) => {
+    try {
+      if (tok) localStorage.setItem(AUTH_KEY, tok);
+      else clearToken();
+    } catch (_) {}
+  };
+  const ensureLoginDom = () => {
+    if (document.getElementById('aicx-auth-overlay')) return;
+    const overlay = document.createElement('div');
+    overlay.id = 'aicx-auth-overlay';
+    overlay.className = 'aicx-auth-overlay';
+    overlay.innerHTML =
+      '<div class="aicx-auth-card">' +
+      '<h2>AICX Dashboard</h2>' +
+      '<p>This server protects <code>/api/*</code> with a Bearer token. Paste the token from <code>~/.aicx/auth-token</code> (or <code>AICX_HTTP_AUTH_TOKEN</code>). It stays in this browser only (localStorage).</p>' +
+      '<div class="aicx-auth-err" id="aicx-auth-err" style="display:none"></div>' +
+      '<form id="aicx-auth-form">' +
+      '<input type="password" id="aicx-auth-tok" placeholder="Bearer token" autocomplete="off" autofocus />' +
+      '<button type="submit" id="aicx-auth-btn">Authenticate</button>' +
+      '</form></div>';
+    document.body.appendChild(overlay);
+    document.getElementById('aicx-auth-form').addEventListener('submit', function(e) {
+      e.preventDefault();
+      const tok = (document.getElementById('aicx-auth-tok').value || '').trim();
+      if (!tok) return;
+      const err = document.getElementById('aicx-auth-err');
+      const btn = document.getElementById('aicx-auth-btn');
+      btn.disabled = true;
+      if (err) err.style.display = 'none';
+      fetch('/api/status', { headers: { 'Authorization': 'Bearer ' + tok } })
+        .then(function(r) {
+          if (!r.ok) {
+            if (err) {
+              err.textContent = 'Invalid token (HTTP ' + r.status + ').';
+              err.style.display = 'block';
+            }
+            return;
+          }
+          saveToken(tok);
+          hideLogin();
+          loadBrowseData();
+        })
+        .catch(function(ex) {
+          if (err) {
+            err.textContent = 'Auth probe failed: ' + ex.message;
+            err.style.display = 'block';
+          }
+        })
+        .finally(function() { btn.disabled = false; });
+    });
+  };
+  const hideLogin = () => {
+    const el = document.getElementById('aicx-auth-overlay');
+    if (el) el.style.display = 'none';
+  };
+  const showLogin = (msg) => {
+    ensureLoginDom();
+    const el = document.getElementById('aicx-auth-overlay');
+    const err = document.getElementById('aicx-auth-err');
+    const tok = document.getElementById('aicx-auth-tok');
+    if (err) {
+      err.textContent = msg || 'Enter the bearer token from ~/.aicx/auth-token (or AICX_HTTP_AUTH_TOKEN).';
+      err.style.display = 'block';
+    }
+    if (el) el.style.display = 'flex';
+    if (tok) { tok.value = ''; setTimeout(function() { tok.focus(); }, 0); }
+  };
+  const apiFetch = (url, opts) => {
+    opts = opts || {};
+    const headers = Object.assign({}, opts.headers || {});
+    const t = getToken();
+    if (t) headers['Authorization'] = 'Bearer ' + t;
+    return fetch(url, Object.assign({}, opts, { headers: headers })).then(function(r) {
+      if (r.status === 401) {
+        clearToken();
+        showLogin('Unauthorized. Paste a valid token and try again.');
+        const err = new Error('unauthorized');
+        err.status = 401;
+        throw err;
+      }
+      return r;
+    });
+  };
 
   /* --- URL state --------------------------------------------------------- */
   const pushUrlState = () => {
@@ -115,7 +208,7 @@ pub(crate) const DASHBOARD_SERVER_SCRIPT: &str = r#"
     }
     ui.detailContent.textContent = 'Loading full content\u2026';
     const endpoint = rec.id !== undefined ? '/api/chunk?id=' + rec.id : '/api/detail?id=' + rec.id;
-    fetch(endpoint)
+    apiFetch(endpoint)
       .then(function(r) { return r.json(); })
       .then(function(data) {
         if (!data.ok) { ui.detailContent.textContent = 'Failed: ' + (data.error || 'unknown'); return; }
@@ -124,7 +217,10 @@ pub(crate) const DASHBOARD_SERVER_SCRIPT: &str = r#"
         if (ui.expand) ui.expand.textContent = 'Collapse';
         ui.detailContent.innerHTML = '<div class="md-rendered">' + renderMarkdown(content) + '</div>';
       })
-      .catch(function(err) { ui.detailContent.textContent = 'Load failed: ' + err.message; });
+      .catch(function(err) {
+        if (err && err.status === 401) return;
+        ui.detailContent.textContent = 'Load failed: ' + err.message;
+      });
   };
 
   /* --- result list ------------------------------------------------------- */
@@ -197,7 +293,7 @@ pub(crate) const DASHBOARD_SERVER_SCRIPT: &str = r#"
     const params = new URLSearchParams({ q: q, limit: '100' });
     if (state.project) params.set('project', state.project);
     if (state.scoreMin > 0) params.set('score', String(state.scoreMin));
-    fetch('/api/search/semantic?' + params.toString(), { signal: searchAbort.signal })
+    apiFetch('/api/search/semantic?' + params.toString(), { signal: searchAbort.signal })
       .then(function(r) { return r.json(); })
       .then(function(data) {
         if (!data.ok) { ui.summary.textContent = 'Search error: ' + (data.error || 'unknown'); return; }
@@ -215,7 +311,11 @@ pub(crate) const DASHBOARD_SERVER_SCRIPT: &str = r#"
         renderList(rows);
         runHooks('afterRender', rows);
       })
-      .catch(function(err) { if (err.name === 'AbortError') return; ui.summary.textContent = 'Search failed: ' + err.message; });
+      .catch(function(err) {
+        if (err.name === 'AbortError') return;
+        if (err && err.status === 401) return;
+        ui.summary.textContent = 'Search failed: ' + err.message;
+      });
   };
 
   const refresh = () => {
@@ -269,10 +369,13 @@ pub(crate) const DASHBOARD_SERVER_SCRIPT: &str = r#"
   if (ui.regenerateBtn) {
     ui.regenerateBtn.addEventListener('click', function() {
       ui.regenerateBtn.disabled = true; ui.regenerateBtn.textContent = '\u2026';
-      fetch('/api/regenerate', { method: 'POST', headers: { 'x-ai-contexters-action': 'regenerate' } })
+      apiFetch('/api/regenerate', { method: 'POST', headers: { 'x-ai-contexters-action': 'regenerate' } })
         .then(function(r) { return r.json(); })
         .then(function(data) { if (data.ok) loadBrowseData(); else alert('Regenerate failed: ' + (data.error || 'unknown')); })
-        .catch(function(err) { alert('Regenerate error: ' + err.message); })
+        .catch(function(err) {
+          if (err && err.status === 401) return;
+          alert('Regenerate error: ' + err.message);
+        })
         .finally(function() { ui.regenerateBtn.disabled = false; ui.regenerateBtn.textContent = '\u21BB'; });
     });
   }
@@ -300,7 +403,7 @@ pub(crate) const DASHBOARD_SERVER_SCRIPT: &str = r#"
     if (state.sort) params.set('sort', state.sort);
     if (state.since) params.set('since', state.since);
     const qs = params.toString();
-    fetch('/api/browse' + (qs ? '?' + qs : ''))
+    apiFetch('/api/browse' + (qs ? '?' + qs : ''))
       .then(function(r) { return r.json(); })
       .then(function(data) {
         if (!data.ok) { ui.summary.textContent = 'Failed: ' + (data.error || 'unknown'); return; }
@@ -317,18 +420,51 @@ pub(crate) const DASHBOARD_SERVER_SCRIPT: &str = r#"
         (data.assumptions || []).forEach(function(a) { const li = document.createElement('li'); li.textContent = a; ui.assumptions.appendChild(li); });
         applyBrowseFilters();
       })
-      .catch(function(err) { ui.summary.textContent = 'Load failed: ' + err.message; });
+      .catch(function(err) {
+        if (err && err.status === 401) return;
+        ui.summary.textContent = 'Load failed: ' + err.message;
+      });
+  };
+
+  const consumeQueryToken = () => {
+    try {
+      const p = new URLSearchParams(location.search);
+      if (!p.has('token')) return;
+      const t = (p.get('token') || '').trim();
+      if (t) saveToken(t);
+      p.delete('token');
+      const qs = p.toString();
+      history.replaceState(null, '', qs ? (location.pathname + '?' + qs) : location.pathname);
+    } catch (_) {}
+  };
+
+  const boot = () => {
+    readUrlState();
+    consumeQueryToken();
+    const headers = {};
+    const t = getToken();
+    if (t) headers['Authorization'] = 'Bearer ' + t;
+    // /api/status is Bearer-gated when auth is on; public when --no-require-auth.
+    fetch('/api/status', { headers: headers })
+      .then(function(r) {
+        if (r.status === 401) {
+          showLogin();
+          return;
+        }
+        loadBrowseData();
+      })
+      .catch(function() { loadBrowseData(); });
   };
 
   window.AIContextersDashboard = {
-    version: '6.0.0-pwa',
+    version: '6.1.0-pwa-auth',
     state: state,
     registerHook: function(name, fn) { if (!hooks[name] || typeof fn !== 'function') return false; hooks[name].push(fn); return true; },
     refresh: refresh,
     reload: loadBrowseData,
+    clearAuth: function() { clearToken(); showLogin('Token cleared.'); },
   };
 
-  readUrlState();
-  loadBrowseData();
+  boot();
 })();
 "#;

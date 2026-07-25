@@ -241,6 +241,12 @@ pub async fn run_dashboard_server(config: DashboardServerConfig) -> Result<()> {
     eprintln!("  CORS: {}", config.cors_policy.label());
     if auth_enforced {
         eprintln!("  Auth: enabled on /api/* (source: {auth_source_label})");
+        eprintln!(
+            "  Browser: shell is public; paste Bearer from ~/.aicx/auth-token (stored in localStorage)"
+        );
+        eprintln!(
+            "  One-shot URL: http://{addr}/?token=<token>  (token stripped after first load)"
+        );
         if let Some(msg) = auth::proxy_rate_limit_warning(config.host) {
             eprintln!("  ⚠ Rate-limit (proxy): {msg}");
         }
