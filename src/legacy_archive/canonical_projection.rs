@@ -1,5 +1,5 @@
 use aicx_parser::projections::{CANONICAL_CARD_SCHEMA, CanonicalCard, CanonicalProjection};
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use anyhow::Context;
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
