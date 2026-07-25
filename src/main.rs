@@ -1204,7 +1204,12 @@ enum Commands {
     /// Walks live agent source roots (claude/codex/gemini/grok/junie +
     /// vibecrafted runtime_runs) and writes `~/.aicx/catalog/sessions.jsonl`.
     /// Does not materialize card files under `~/.aicx/store/`.
-    #[command(display_order = 3)]
+    ///
+    /// `store` is a restored alias for muscle memory: the legacy `aicx store`
+    /// name now points at this catalog engine (readable extract-era catalog,
+    /// no `~/.aicx/store/` card materialization) rather than the removed
+    /// card-writing engine.
+    #[command(display_order = 3, visible_alias = "store")]
     Catalog {
         #[command(subcommand)]
         action: CatalogAction,
