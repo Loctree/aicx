@@ -880,14 +880,14 @@ enum Commands {
     #[command(hide = true)]
     Completions { shell: Shell },
 
-    /// Join residual C6 intent cards to the current Loctree anchor catalog.
+    /// Join catalog typed intents to the current Loctree anchor catalog.
     ///
-    /// Emits `loctree.overlay.intent.v1`. Requires residual
-    /// `canonical-projection-v1` fixtures under the legacy archive root —
-    /// the mill that wrote those cards is **retired**. There is no palette
-    /// command named "canonical ingest". Live intents live on the extract-era
-    /// path: `aicx catalog rebuild` then `aicx intents -p <owner/repo>`.
-    /// `aicx ingest` is operator-md / loct-context-pack only.
+    /// Emits `loctree.overlay.intent.v1`. Primary feed is extract-era catalog
+    /// sessions → typed intent records (`aicx catalog rebuild`). Residual C6
+    /// `canonical-projection-v1` fixtures are a fallback only — the write mill
+    /// is **retired**. There is no palette command named "canonical ingest".
+    /// Recovery: `aicx catalog rebuild` then `aicx intents -p <owner/repo>`,
+    /// then re-run overlay. `aicx ingest` is operator-md / loct-context-pack only.
     Overlay {
         /// Repository whose `loct anchors` catalog is the attribution target.
         #[arg(long)]
@@ -897,7 +897,7 @@ enum Commands {
         #[arg(long, value_enum, default_value_t = OverlayFormat::Json)]
         format: OverlayFormat,
 
-        /// Re-evaluate every typed card while preserving persisted intent ids.
+        /// Re-evaluate every typed claim while preserving persisted intent ids.
         #[arg(long)]
         rebuild: bool,
     },
