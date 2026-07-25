@@ -1,9 +1,21 @@
 //! Typed intent-to-structure overlay (`loctree.overlay.intent.v1`).
 //!
-//! This layer consumes only C6 canonical cards and their frozen
-//! `evidence_event_id` references. It never opens agent sessions or rendered
-//! conversation Markdown. Loctree owns structural identity; this module joins
-//! distilled card claims to the catalog emitted by `loct anchors`.
+//! This layer joins distilled intent claims to the catalog emitted by
+//! `loct anchors`. Loctree owns structural identity.
+//!
+//! ## Feed status (extract-era honesty)
+//!
+//! The live intent surface is catalog + extracts (`aicx catalog rebuild`,
+//! `aicx intents`). The **overlay emitter still reads residual C6
+//! `canonical-projection-v1` fixtures** under the legacy archive root —
+//! the mill that wrote those cards is retired
+//! (`write_canonical_projection_at` fails closed). There is no palette
+//! command named "canonical ingest". Operator recovery for *intents*
+//! is `aicx catalog rebuild` (+ optional `aicx index`); rebuilding the
+//! overlay feed itself is an open extract-era wiring cut, not a hidden
+//! CLI alias.
+//!
+//! Overlay never opens agent sessions or rendered conversation Markdown.
 
 use crate::legacy_archive::{legacy_cards_dir, read_canonical_projection_at};
 use crate::rank::{SEMANTIC_INTENT_CANDIDATE_THRESHOLD, intent_candidate_similarity};
@@ -25,6 +37,15 @@ pub const ATTRIBUTION_VERSION: &str = "path-symbol-resolver.v2";
 pub const DEDUP_VERSION: &str = "semantic-negation-veto.v1";
 pub const EMBEDDING_MODEL: &str = "aicx-embeddings.configured.v1";
 pub const ATTRIBUTION_THRESHOLD: f64 = 0.90;
+
+/// Fail-closed operator message when no residual C6 projection exists.
+/// Must never name a phantom palette command (e.g. "canonical ingest").
+pub const MISSING_C6_PROJECTION_HINT: &str = "typed C6 canonical-projection-v1 is unavailable under \
+    the legacy archive root (mill retired: write_canonical_projection_at fails closed). \
+    Overlay cannot emit without residual C6 fixtures for this repo. \
+    Live intents: `aicx catalog rebuild` then `aicx intents -p <owner/repo>`. \
+    `aicx ingest` is operator-md/loct-context-pack only — not a C6 session projection. \
+    Extract-era overlay feed wiring is not yet on the palette.";
 
 #[derive(Debug, Clone)]
 pub struct OverlayOptions {
@@ -78,6 +99,14 @@ pub enum OverlayTarget {
         language: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         anchor_id: Option<String>,
+        /// Optional 1-based inclusive start line for path+range targets.
+        /// Absent when the anchor catalog is path-grain only (current `loct
+        /// anchors`). Additive; serde-backward-tolerant for v1 consumers.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        start_line: Option<u32>,
+        /// Optional 1-based inclusive end line (must be >= start_line when set).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        end_line: Option<u32>,
     },
     Symbol {
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -208,7 +237,8 @@ pub fn build_overlay(options: &OverlayOptions) -> Result<(OverlayDocument, Overl
     let projections = discover_canonical_projections(&aicx_home)?;
     if projections.is_empty() {
         bail!(
-            "typed C6 canonical projection is unavailable under {}; run canonical ingest before overlay emission",
+            "{} (searched under {})",
+            MISSING_C6_PROJECTION_HINT,
             aicx_home.display()
         );
     }
@@ -232,7 +262,12 @@ pub fn build_overlay(options: &OverlayOptions) -> Result<(OverlayDocument, Overl
     }
     if cards.is_empty() {
         bail!(
-            "typed C6 store has no canonical cards for {} (raw-session fallback is forbidden)",
+            "typed C6 residual projection has no cards for repo_id={} under {} \
+             (raw-session fallback is forbidden; mill retired). \
+             Live intents: `aicx catalog rebuild` then `aicx intents -p {}`. \
+             Overlay feed is not yet wired to extract-era catalog sources.",
+            catalog.repo_id,
+            aicx_home.display(),
             catalog.repo_id
         );
     }
@@ -427,7 +462,10 @@ fn combined_store_revision(revisions: &BTreeSet<String>) -> Result<String> {
     }
     if revisions.len() != 1 {
         bail!(
-            "target repo spans {} distinct legacy C6 revisions; rebuild the canonical projection instead of synthesizing a downstream revision",
+            "target repo spans {} distinct legacy C6 revisions under residual projections; \
+             refuse to synthesize a downstream revision (canonical mill is retired — \
+             do not expect a palette 'rebuild projection' command). Isolate one \
+             store_revision fixture set or wait for extract-era overlay feed wiring.",
             revisions.len()
         );
     }
@@ -1454,6 +1492,10 @@ fn target_from_anchor(anchor: &Anchor) -> OverlayTarget {
             path: anchor.normalized_path.clone(),
             language: Some(anchor.language.clone()),
             anchor_id: Some(anchor.anchor_id.clone()),
+            // `loct anchors` is path-grain today; line range is additive
+            // capacity for a future path+span catalog / find consumer.
+            start_line: None,
+            end_line: None,
         },
     }
 }
@@ -1577,6 +1619,75 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static TEST_ID: AtomicUsize = AtomicUsize::new(0);
+
+    /// Operator front-door contract: fail-closed copy must name real palette
+    /// commands and must never invent "canonical ingest".
+    #[test]
+    fn missing_c6_hint_names_real_palette_not_phantom_command() {
+        let hint = MISSING_C6_PROJECTION_HINT;
+        assert!(
+            !hint.to_ascii_lowercase().contains("canonical ingest"),
+            "phantom command must not appear in operator-facing fail-closed copy"
+        );
+        assert!(
+            hint.contains("catalog rebuild"),
+            "must point at live extract-era catalog path"
+        );
+        assert!(
+            hint.contains("aicx intents"),
+            "must point at live intents command"
+        );
+        assert!(
+            hint.contains("aicx ingest"),
+            "must disambiguate operator-md ingest from C6 projection"
+        );
+        assert!(
+            hint.contains("retired") || hint.contains("mill retired"),
+            "must state that the C6 write mill is retired"
+        );
+    }
+
+    #[test]
+    fn path_target_line_range_is_additive_and_omitted_when_none() {
+        let without = OverlayTarget::Path {
+            path: "src/main.rs".to_owned(),
+            language: Some("rs".to_owned()),
+            anchor_id: Some("anc1:test".to_owned()),
+            start_line: None,
+            end_line: None,
+        };
+        let json = serde_json::to_value(&without).unwrap();
+        assert_eq!(json["kind"], "path");
+        assert_eq!(json["path"], "src/main.rs");
+        assert!(json.get("start_line").is_none());
+        assert!(json.get("end_line").is_none());
+
+        let with = OverlayTarget::Path {
+            path: "src/overlay.rs".to_owned(),
+            language: Some("rs".to_owned()),
+            anchor_id: Some("anc1:range".to_owned()),
+            start_line: Some(210),
+            end_line: Some(214),
+        };
+        let json = serde_json::to_value(&with).unwrap();
+        assert_eq!(json["start_line"], 210);
+        assert_eq!(json["end_line"], 214);
+
+        // Legacy path-only cards remain deserializable.
+        let legacy = r#"{"kind":"path","path":"src/main.rs","language":"rs","anchor_id":"anc1:x"}"#;
+        let parsed: OverlayTarget = serde_json::from_str(legacy).unwrap();
+        match parsed {
+            OverlayTarget::Path {
+                start_line,
+                end_line,
+                ..
+            } => {
+                assert_eq!(start_line, None);
+                assert_eq!(end_line, None);
+            }
+            other => panic!("expected Path, got {other:?}"),
+        }
+    }
 
     #[cfg(unix)]
     #[derive(Debug, Deserialize)]

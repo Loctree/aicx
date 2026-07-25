@@ -880,7 +880,14 @@ enum Commands {
     #[command(hide = true)]
     Completions { shell: Shell },
 
-    /// Join typed canonical intents to the current Loctree anchor catalog.
+    /// Join residual C6 intent cards to the current Loctree anchor catalog.
+    ///
+    /// Emits `loctree.overlay.intent.v1`. Requires residual
+    /// `canonical-projection-v1` fixtures under the legacy archive root —
+    /// the mill that wrote those cards is **retired**. There is no palette
+    /// command named "canonical ingest". Live intents live on the extract-era
+    /// path: `aicx catalog rebuild` then `aicx intents -p <owner/repo>`.
+    /// `aicx ingest` is operator-md / loct-context-pack only.
     Overlay {
         /// Repository whose `loct anchors` catalog is the attribution target.
         #[arg(long)]
