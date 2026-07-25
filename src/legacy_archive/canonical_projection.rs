@@ -157,7 +157,7 @@ pub fn read_canonical_projection_at(
     Ok(Some((manifest, cards)))
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn write_stage_lease(stage: &Path, lease: &ProjectionStageLease) -> Result<()> {
     super::atomic_write::atomic_write(
         &stage.join(PROJECTION_STAGE_META_FILENAME),
@@ -379,7 +379,7 @@ fn process_alive(_pid: i32) -> Option<bool> {
     None
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn current_process_start_identity() -> Option<String> {
     process_start_identity(std::process::id())
 }

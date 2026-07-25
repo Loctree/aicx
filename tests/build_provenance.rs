@@ -3,10 +3,12 @@ mod build_support;
 
 use std::{
     fs,
-    os::unix::fs::PermissionsExt as _,
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt as _;
 
 struct TempDir(PathBuf);
 
@@ -96,6 +98,7 @@ fn inspect(home: &Path, path: Option<&str>, mcp_config: Option<&Path>) -> serde_
     serde_json::from_slice(&output.stdout).expect("inspection JSON")
 }
 
+#[cfg(unix)]
 fn write_executable(path: &Path, body: &str) {
     fs::write(path, body).expect("write fake executable");
     let mut permissions = fs::metadata(path)
@@ -144,6 +147,7 @@ fn runtime_inspection_and_mcp_server_info_share_build_identity() {
 }
 
 #[test]
+#[cfg(unix)]
 fn runtime_inspection_reports_stale_path_binary_and_missing_config_target() {
     let home = TempDir::new("drift-home");
     let fake_bin = home.path().join(".local/bin");
