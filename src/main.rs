@@ -8122,7 +8122,7 @@ fn print_index_status_text(status: &aicx::IndexStatus) {
         "  readiness:              {}",
         match status.readiness {
             aicx::IndexReadiness::Ready => "ready",
-            aicx::IndexReadiness::StaleChunks => "stale_chunks (sessions newer than chunks)",
+            aicx::IndexReadiness::StaleChunks => "stale_chunks (source snapshot changed)",
             aicx::IndexReadiness::StaleIndex => "stale_index (chunks pending embedding)",
             aicx::IndexReadiness::Pending => "pending (only temp checkpoint)",
             aicx::IndexReadiness::Missing => "missing",
@@ -8150,6 +8150,13 @@ fn print_index_status_text(status: &aicx::IndexStatus) {
         status.newest_chunk_mtime.as_deref().unwrap_or("<none>")
     );
     eprintln!("  source_sessions:        {}", status.source_sessions);
+    eprintln!(
+        "  source_snapshot_matches: {}",
+        status
+            .source_snapshot_matches
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "<unknown>".to_string())
+    );
     eprintln!(
         "  newest_session_updated: {}",
         status

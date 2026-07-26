@@ -237,8 +237,8 @@ pub enum IndexReadiness {
     /// Canonical chunks exist that have not been represented in the committed
     /// semantic index yet.
     StaleIndex,
-    /// Pending-corpus census exceeded its hard deadline (or was skipped as
-    /// unbounded). Status still returns immediately with whatever is known
+    /// Pending-corpus census exceeded its hard deadline, failed, or was skipped
+    /// as unbounded. Status still returns immediately with whatever is known
     /// from catalog/CURRENT; operators must not wait on silent source walks.
     PendingScanTimeout,
 }
@@ -264,6 +264,10 @@ pub struct IndexStatus {
     pub semantic_index_rows: usize,
     pub newest_chunk_mtime: Option<String>,
     pub source_sessions: usize,
+    /// Whether CURRENT is bound to the exact current catalog + live-source
+    /// fingerprint. `None` means this backend has no source snapshot proof or
+    /// the bounded census could not complete.
+    pub source_snapshot_matches: Option<bool>,
     pub newest_session_updated_at: Option<String>,
     pub sessions_newer_than_chunks: usize,
     pub sessions_without_timestamps: usize,
@@ -362,6 +366,7 @@ fn index_status_at_with_sessions(
             semantic_index_rows: 0,
             newest_chunk_mtime: None,
             source_sessions: 0,
+            source_snapshot_matches: None,
             newest_session_updated_at: None,
             sessions_newer_than_chunks: 0,
             sessions_without_timestamps: 0,
@@ -411,6 +416,7 @@ fn index_status_at_with_sessions(
             semantic_index_rows: 0,
             newest_chunk_mtime: None,
             source_sessions: catalog_in_scope,
+            source_snapshot_matches: None,
             newest_session_updated_at: None,
             sessions_newer_than_chunks: catalog_in_scope,
             sessions_without_timestamps: 0,
@@ -522,6 +528,7 @@ fn index_status_at_with_sessions(
         semantic_index_rows,
         newest_chunk_mtime: newest_chunk.map(system_time_to_rfc3339),
         source_sessions: catalog_count,
+        source_snapshot_matches: None,
         newest_session_updated_at: chunking
             .newest_session_updated_at
             .map(|value| value.to_rfc3339()),
@@ -605,13 +612,29 @@ fn hybrid_current_index_status(base: &Path, project: Option<&str>) -> Result<Opt
         .map(system_time_to_rfc3339)
         .or_else(|| committed_at.clone());
 
-    // Catalog rows beyond CURRENT lexical docs mean sessions are admitted but
-    // not yet published — stale index relative to the durable catalog.
-    let pending = catalog_total.saturating_sub(manifest.lexical_doc_count);
-    let readiness = if pending > 0 {
-        IndexReadiness::StaleIndex
-    } else {
-        IndexReadiness::Ready
+    // A catalog session is not necessarily an index document: parsing can
+    // legitimately produce zero user/assistant signal. Compare like with like
+    // for lexical lag, then independently verify that CURRENT still represents
+    // the exact catalog + live-source snapshot bound into its manifest.
+    let pending = manifest
+        .source_chunk_count
+        .saturating_sub(manifest.lexical_doc_count);
+    let (source_snapshot_matches, source_census_failed) =
+        match crate::source_index::current_source_fingerprint_at(base) {
+            Ok(Some(fingerprint)) => (
+                Some(
+                    manifest.source_hash_blake3 == aicx_retrieve::source_hash_blake3(&fingerprint),
+                ),
+                false,
+            ),
+            Ok(None) => (None, false),
+            Err(_) => (None, true),
+        };
+    let readiness = match source_snapshot_matches {
+        _ if source_census_failed => IndexReadiness::PendingScanTimeout,
+        Some(false) => IndexReadiness::StaleChunks,
+        _ if pending > 0 => IndexReadiness::StaleIndex,
+        _ => IndexReadiness::Ready,
     };
 
     let backend = if manifest.dense_kind == "optional_not_built" {
@@ -652,6 +675,7 @@ fn hybrid_current_index_status(base: &Path, project: Option<&str>) -> Result<Opt
         semantic_index_rows: manifest.lexical_doc_count,
         newest_chunk_mtime: generation_mtime.clone(),
         source_sessions: catalog_in_scope,
+        source_snapshot_matches,
         newest_session_updated_at: None,
         sessions_newer_than_chunks: 0,
         sessions_without_timestamps: 0,
@@ -1049,6 +1073,7 @@ mod tests {
             semantic_index_rows: 0,
             newest_chunk_mtime: None,
             source_sessions: 0,
+            source_snapshot_matches: None,
             newest_session_updated_at: None,
             sessions_newer_than_chunks: 0,
             sessions_without_timestamps: 0,
@@ -1078,6 +1103,123 @@ mod tests {
         assert_eq!(payload["project_bucket"], "_all");
         assert!(payload["committed_at"].is_null());
         assert_eq!(payload["temp_index_rows"], 1);
+    }
+
+    #[test]
+    fn hybrid_status_separates_catalog_coverage_from_lexical_lag() {
+        let root = std::env::temp_dir().join(format!(
+            "aicx-api-hybrid-source-status-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let source_dir = root.join("sources");
+        let catalog_dir = root.join("catalog");
+        std::fs::create_dir_all(&source_dir).expect("create source dir");
+        std::fs::create_dir_all(&catalog_dir).expect("create catalog dir");
+
+        let mut catalog_lines = Vec::new();
+        for ordinal in 0..4 {
+            let source_path = source_dir.join(format!("session-{ordinal}.jsonl"));
+            std::fs::write(&source_path, format!("session {ordinal}\n"))
+                .expect("write source fixture");
+            let (source_len, source_mtime_ns) =
+                crate::catalog::live_source_fingerprint(&source_path)
+                    .expect("source fixture fingerprint");
+            catalog_lines.push(
+                serde_json::to_string(&crate::catalog::CatalogEntry {
+                    schema: crate::catalog::CATALOG_SCHEMA.to_string(),
+                    session_id: format!("session-{ordinal}"),
+                    agent: "codex".to_string(),
+                    project: Some("Loctree/aicx".to_string()),
+                    date: Some("2026-07-27".to_string()),
+                    cwd: Some(root.display().to_string()),
+                    source_path: source_path.display().to_string(),
+                    source_len: Some(source_len),
+                    source_mtime_ns: Some(source_mtime_ns),
+                    title: None,
+                    machine: Some("test".to_string()),
+                    logical_session_id: None,
+                })
+                .expect("serialize catalog fixture"),
+            );
+        }
+        std::fs::write(
+            catalog_dir.join(crate::catalog::SESSIONS_FILENAME),
+            format!("{}\n", catalog_lines.join("\n")),
+        )
+        .expect("write catalog fixture");
+
+        let source_fingerprint = crate::source_index::current_source_fingerprint_at(&root)
+            .expect("compute source fingerprint")
+            .expect("non-empty source fingerprint");
+        let gen_name = "g-2026-07-27T00-00-00Z-source-status";
+        let hybrid_root = root.join("indexed").join("_all").join("hybrid");
+        let gen_dir = hybrid_root.join("generations").join(gen_name);
+        std::fs::create_dir_all(&gen_dir).expect("create generation dir");
+        let mut manifest = aicx_retrieve::Manifest {
+            schema_version: "2.0".to_string(),
+            generation_id: "g-2026-07-27T00:00:00Z-source-status".to_string(),
+            // Three signal documents from four catalog sessions is complete:
+            // the fourth source legitimately produced no indexable signal.
+            source_chunk_count: 3,
+            source_hash_blake3: aicx_retrieve::source_hash_blake3(&source_fingerprint),
+            embedder_model: "optional".to_string(),
+            embedder_url_hash: "not_built".to_string(),
+            embedder_dim: 0,
+            embedder_distance: "cosine".to_string(),
+            dense_count: 0,
+            dense_kind: "optional_not_built".to_string(),
+            lexical_commit_id: "tantivy_test".to_string(),
+            lexical_doc_count: 3,
+            build_started_at: Utc.with_ymd_and_hms(2026, 7, 27, 0, 0, 0).unwrap(),
+            build_completed_at: Utc.with_ymd_and_hms(2026, 7, 27, 0, 0, 1).unwrap(),
+            build_wall_seconds: 1,
+            fusion_algorithm: "rrf".to_string(),
+            fusion_k: 60,
+        };
+        manifest
+            .write_to_path(&gen_dir.join("manifest.json"))
+            .expect("write manifest");
+        std::fs::write(hybrid_root.join("CURRENT"), format!("{gen_name}\n"))
+            .expect("write CURRENT");
+
+        let ready = index_status_at(&root, None).expect("ready source status");
+        assert_eq!(ready.source_sessions, 4);
+        assert_eq!(ready.source_snapshot_matches, Some(true));
+        assert_eq!(ready.canonical_chunks, 3);
+        assert_eq!(ready.pending_chunks, 0);
+        assert_eq!(ready.readiness, IndexReadiness::Ready);
+
+        std::fs::write(source_dir.join("session-0.jsonl"), "session 0 changed\n")
+            .expect("mutate source fixture");
+        let stale_source = index_status_at(&root, None).expect("stale source status");
+        assert_eq!(stale_source.pending_chunks, 0);
+        assert_eq!(stale_source.source_snapshot_matches, Some(false));
+        assert_eq!(stale_source.sessions_newer_than_chunks, 0);
+        assert_eq!(stale_source.readiness, IndexReadiness::StaleChunks);
+
+        let changed_fingerprint = crate::source_index::current_source_fingerprint_at(&root)
+            .expect("recompute changed fingerprint")
+            .expect("changed source fingerprint");
+        manifest.source_hash_blake3 = aicx_retrieve::source_hash_blake3(&changed_fingerprint);
+        manifest.source_chunk_count = 4;
+        manifest
+            .write_to_path(&gen_dir.join("manifest.json"))
+            .expect("write internally stale manifest");
+        let stale_index = index_status_at(&root, None).expect("stale lexical status");
+        assert_eq!(stale_index.pending_chunks, 1);
+        assert_eq!(stale_index.readiness, IndexReadiness::StaleIndex);
+
+        let catalog_path = catalog_dir.join(crate::catalog::SESSIONS_FILENAME);
+        std::fs::remove_file(&catalog_path).expect("remove catalog fixture");
+        std::fs::create_dir(&catalog_path).expect("replace catalog with unreadable directory");
+        let unknown_source =
+            index_status_at(&root, None).expect("status survives failed source census");
+        assert_eq!(unknown_source.source_snapshot_matches, None);
+        assert_eq!(unknown_source.readiness, IndexReadiness::PendingScanTimeout);
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

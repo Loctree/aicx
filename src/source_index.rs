@@ -1314,6 +1314,21 @@ fn source_fingerprint(
     Ok(hex::encode(hasher.finalize()))
 }
 
+/// Recompute the exact catalog + live-source fingerprint bound into CURRENT.
+///
+/// Status uses this to distinguish source drift from lexical publication lag.
+/// The scan stats each cataloged source but never parses session contents.
+pub(crate) fn current_source_fingerprint_at(aicx_home: &Path) -> Result<Option<String>> {
+    let catalog_path = crate::catalog::sessions_path_for(aicx_home);
+    let entries = crate::catalog::read_entries_at(aicx_home)?;
+    if entries.is_empty() {
+        return Ok(None);
+    }
+    let user_home = crate::os_user_home().unwrap_or_else(|| aicx_home.to_path_buf());
+    let source_allow = crate::source_path::SourceAllowlist::for_operator(&user_home, aicx_home);
+    source_fingerprint(aicx_home, &catalog_path, &entries, &source_allow).map(Some)
+}
+
 /// Prefer live size+mtime; fall back to catalog-admitted values when the file
 /// is temporarily unreadable (quarantine races, transient IO).
 fn live_or_catalog_fingerprint(

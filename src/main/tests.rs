@@ -473,6 +473,7 @@ fn dummy_index_status(bucket: &str) -> aicx::IndexStatus {
         semantic_index_rows: 3,
         newest_chunk_mtime: Some("2026-05-24T00:00:00Z".to_string()),
         source_sessions: 0,
+        source_snapshot_matches: None,
         newest_session_updated_at: None,
         sessions_newer_than_chunks: 0,
         sessions_without_timestamps: 0,
