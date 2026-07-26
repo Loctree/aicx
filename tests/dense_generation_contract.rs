@@ -9,11 +9,14 @@
 //! drift axis between artifacts that claim the same generation.
 
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use aicx::vector_index::{
-    IndexEntry, IndexHeader, materialize_hybrid_generation, observed_source_hash_for_index_path,
-    publish_source_hybrid_generation, resolve_hybrid_generation_dir,
+    BatchEmbedder, DenseBuildOptions, DenseBuildProgress, IndexEntry, IndexHeader,
+    build_source_hybrid_generation_resumable, materialize_hybrid_generation,
+    observed_source_hash_for_index_path, publish_source_hybrid_generation,
+    resolve_hybrid_generation_dir, source_dense_checkpoint_path,
 };
 use aicx_retrieve::{
     ChunkRef, Distance, EmbedderFingerprint, FilterSet, LexicalQuery, MMAP_DENSE_KIND,
@@ -112,6 +115,264 @@ fn files_under(dir: &Path) -> Vec<PathBuf> {
     }
     files.sort();
     files
+}
+
+#[derive(Default)]
+struct CountingEmbedder {
+    dimension: usize,
+    fail_after_successful_batches: Option<usize>,
+    successful_batches: usize,
+    batch_sizes: Vec<usize>,
+    embedded_texts: Vec<String>,
+}
+
+impl CountingEmbedder {
+    fn new(dimension: usize) -> Self {
+        Self {
+            dimension,
+            ..Self::default()
+        }
+    }
+
+    fn interrupt_after(dimension: usize, successful_batches: usize) -> Self {
+        Self {
+            dimension,
+            fail_after_successful_batches: Some(successful_batches),
+            ..Self::default()
+        }
+    }
+}
+
+impl BatchEmbedder for CountingEmbedder {
+    fn embed_batch(&mut self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
+        if self
+            .fail_after_successful_batches
+            .is_some_and(|limit| self.successful_batches >= limit)
+        {
+            anyhow::bail!("injected dense batch interruption");
+        }
+        self.successful_batches += 1;
+        self.batch_sizes.push(texts.len());
+        self.embedded_texts.extend(texts.iter().cloned());
+        Ok(texts
+            .iter()
+            .enumerate()
+            .map(|(index, _)| {
+                let mut vector = vec![0.0; self.dimension];
+                vector[index % self.dimension] = 1.0;
+                vector
+            })
+            .collect())
+    }
+
+    fn embed_one(&mut self, text: &str) -> anyhow::Result<Vec<f32>> {
+        if self
+            .fail_after_successful_batches
+            .is_some_and(|limit| self.successful_batches >= limit)
+        {
+            anyhow::bail!("injected dense item interruption");
+        }
+        self.successful_batches += 1;
+        self.batch_sizes.push(1);
+        self.embedded_texts.push(text.to_string());
+        let mut vector = vec![0.0; self.dimension];
+        vector[0] = 1.0;
+        Ok(vector)
+    }
+}
+
+#[test]
+fn resume_reuses_completed_vectors_and_keeps_current_readable() {
+    let root = fixture_root("resume");
+    let hybrid_root = root.join("indexed").join("_all").join("hybrid");
+    let chunks = source_chunks();
+    let source_fingerprint = "catalog-v1:resume";
+    let options = DenseBuildOptions { batch_size: 2 };
+
+    let initial_embeddings = vec![vec![1.0, 0.0], vec![0.0, 1.0], vec![0.6, 0.4]];
+    publish_source_hybrid_generation(
+        &chunks,
+        &initial_embeddings,
+        "catalog-v1:prior-current",
+        &hybrid_root,
+        &fingerprint(),
+    )
+    .expect("publish prior current generation");
+    let prior_current =
+        std::fs::read_to_string(hybrid_root.join("CURRENT")).expect("read prior CURRENT");
+
+    let mut interrupted = CountingEmbedder::interrupt_after(2, 1);
+    build_source_hybrid_generation_resumable(
+        &chunks,
+        source_fingerprint,
+        &hybrid_root,
+        &fingerprint(),
+        &mut interrupted,
+        options,
+        &|_| {},
+    )
+    .expect_err("second batch interruption must preserve checkpoint");
+    assert_eq!(
+        interrupted.embedded_texts.len(),
+        2,
+        "the first completed batch is the durable resume unit"
+    );
+    assert_eq!(
+        std::fs::read_to_string(hybrid_root.join("CURRENT")).expect("read CURRENT after failure"),
+        prior_current,
+        "an interrupted dense build must keep the prior generation readable"
+    );
+
+    let checkpoint = source_dense_checkpoint_path(&hybrid_root, source_fingerprint, &fingerprint());
+    assert!(checkpoint.is_file(), "interruption must leave a checkpoint");
+    let checkpoint_body = std::fs::read_to_string(&checkpoint).expect("read checkpoint");
+    let mut checkpoint_lines = checkpoint_body.lines();
+    let header: serde_json::Value =
+        serde_json::from_str(checkpoint_lines.next().expect("checkpoint header"))
+            .expect("parse checkpoint header");
+    assert_eq!(header["source_fingerprint"], source_fingerprint);
+    assert_eq!(header["embedder_model"], fingerprint().model);
+    assert_eq!(header["embedder_url_hash"], fingerprint().url_hash);
+    assert_eq!(header["dimension"], fingerprint().dim);
+    assert_eq!(header["distance"], fingerprint().distance);
+    let first_row: serde_json::Value =
+        serde_json::from_str(checkpoint_lines.next().expect("checkpoint vector row"))
+            .expect("parse checkpoint vector row");
+    assert_eq!(first_row["chunk_id"], chunks[0].id);
+    assert!(
+        first_row["content_hash_blake3"]
+            .as_str()
+            .is_some_and(|hash| hash.len() == 64),
+        "checkpoint row binds reuse to chunk content"
+    );
+    {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&checkpoint)
+            .expect("open checkpoint for partial-row simulation");
+        file.write_all(b"{\"chunk_id\":\"partial")
+            .expect("append partial checkpoint row");
+        file.sync_all().expect("sync partial checkpoint row");
+    }
+
+    let unrelated = checkpoint
+        .parent()
+        .expect("checkpoint parent")
+        .join("unrelated.ndjson");
+    std::fs::write(&unrelated, "unrelated checkpoint").expect("write unrelated checkpoint");
+    let progress = Mutex::new(Vec::<DenseBuildProgress>::new());
+    let mut resumed = CountingEmbedder::new(2);
+    let manifest = build_source_hybrid_generation_resumable(
+        &chunks,
+        source_fingerprint,
+        &hybrid_root,
+        &fingerprint(),
+        &mut resumed,
+        options,
+        &|event| progress.lock().expect("progress lock").push(event),
+    )
+    .expect("resume and publish source-driven generation");
+    assert_eq!(
+        resumed.embedded_texts.len(),
+        1,
+        "two vectors must be reused"
+    );
+    assert_eq!(manifest.dense_count, chunks.len());
+    assert!(
+        resumed.batch_sizes.iter().all(|size| *size <= 2),
+        "embedder batches must stay bounded: {:?}",
+        resumed.batch_sizes
+    );
+    assert!(
+        progress
+            .lock()
+            .expect("progress lock")
+            .iter()
+            .any(|event| event.reused == 2 && event.completed == chunks.len()),
+        "progress must expose reused and completed counts"
+    );
+    assert!(
+        !checkpoint.exists(),
+        "successful publication removes only its consumed checkpoint"
+    );
+    assert!(
+        unrelated.exists(),
+        "successful publication must not delete unrelated checkpoints"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn checkpoint_reuse_rejects_every_compatibility_axis() {
+    let base_chunks = source_chunks();
+    let base_source = "catalog-v1:checkpoint-identity";
+    let base_fingerprint = fingerprint();
+
+    for axis in ["content", "source", "model", "dimension", "distance"] {
+        let root = fixture_root(&format!("checkpoint-{axis}"));
+        let hybrid_root = root.join("indexed").join("_all").join("hybrid");
+        let mut interrupted = CountingEmbedder::interrupt_after(2, 1);
+        build_source_hybrid_generation_resumable(
+            &base_chunks,
+            base_source,
+            &hybrid_root,
+            &base_fingerprint,
+            &mut interrupted,
+            DenseBuildOptions { batch_size: 2 },
+            &|_| {},
+        )
+        .expect_err("seed partial checkpoint");
+
+        let mut chunks = base_chunks.clone();
+        let mut source = base_source.to_string();
+        let mut fp = base_fingerprint.clone();
+        match axis {
+            "content" => chunks[0].text.push_str(" changed"),
+            "source" => source.push_str("-changed"),
+            "model" => {
+                fp = EmbedderFingerprint::new(
+                    "other-model",
+                    "http://example.invalid/embed",
+                    2,
+                    "cosine",
+                )
+            }
+            "dimension" => {
+                fp = EmbedderFingerprint::new(
+                    "test-model",
+                    "http://example.invalid/embed",
+                    3,
+                    "cosine",
+                )
+            }
+            "distance" => {
+                fp =
+                    EmbedderFingerprint::new("test-model", "http://example.invalid/embed", 2, "dot")
+            }
+            _ => unreachable!(),
+        }
+        let mut fresh = CountingEmbedder::new(fp.dim);
+        build_source_hybrid_generation_resumable(
+            &chunks,
+            &source,
+            &hybrid_root,
+            &fp,
+            &mut fresh,
+            DenseBuildOptions { batch_size: 2 },
+            &|_| {},
+        )
+        .expect("incompatible axis starts a safe workset");
+        let expected_new = if axis == "content" { 2 } else { chunks.len() };
+        assert_eq!(
+            fresh.embedded_texts.len(),
+            expected_new,
+            "{axis} compatibility drift reused the wrong vectors"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
 
 #[test]

@@ -741,8 +741,6 @@ pub fn publish_source_hybrid_generation(
     hybrid_root: &Path,
     fingerprint: &aicx_retrieve::EmbedderFingerprint,
 ) -> Result<aicx_retrieve::Manifest> {
-    use aicx_retrieve::DenseChunkRef;
-
     if chunks.is_empty() {
         anyhow::bail!("cannot publish an empty source hybrid generation");
     }
@@ -757,11 +755,39 @@ pub fn publish_source_hybrid_generation(
         anyhow::bail!("source hybrid embedder dimension must be greater than zero");
     }
 
+    publish_source_hybrid_generation_owned(
+        chunks,
+        embeddings.to_vec(),
+        source_fingerprint,
+        hybrid_root,
+        fingerprint,
+    )
+}
+
+fn publish_source_hybrid_generation_owned(
+    chunks: &[aicx_retrieve::ChunkRef],
+    embeddings: Vec<Vec<f32>>,
+    source_fingerprint: &str,
+    hybrid_root: &Path,
+    fingerprint: &aicx_retrieve::EmbedderFingerprint,
+) -> Result<aicx_retrieve::Manifest> {
+    use aicx_retrieve::{ChunkRef, DenseChunkRef};
+
     let dense_chunks = chunks
         .iter()
-        .cloned()
-        .zip(embeddings.iter().cloned())
-        .map(|(chunk, embedding)| DenseChunkRef { chunk, embedding })
+        .zip(embeddings)
+        .map(|(chunk, embedding)| DenseChunkRef {
+            // The mmap adapter persists id/path/metadata, not source text.
+            // Keep the dense projection compact so a large canonical corpus
+            // is not duplicated in memory while Tantivy builds.
+            chunk: ChunkRef {
+                id: chunk.id.clone(),
+                source_path: chunk.source_path.clone(),
+                text: String::new(),
+                metadata: chunk.metadata.clone(),
+            },
+            embedding,
+        })
         .collect::<Vec<_>>();
 
     publish_hybrid_generation_from_chunks(
@@ -771,6 +797,343 @@ pub fn publish_source_hybrid_generation(
         hybrid_root,
         fingerprint,
     )
+}
+
+const SOURCE_DENSE_CHECKPOINT_SCHEMA: &str = "aicx.source_dense_checkpoint.v1";
+const SOURCE_DENSE_CHECKPOINT_DIR: &str = "dense-checkpoints";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DenseBuildOptions {
+    pub batch_size: usize,
+}
+
+impl Default for DenseBuildOptions {
+    fn default() -> Self {
+        Self { batch_size: 1 }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct DenseBuildProgress {
+    pub total: usize,
+    pub reused: usize,
+    pub completed: usize,
+    pub newly_embedded: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct SourceDenseCheckpointHeader {
+    schema: String,
+    source_fingerprint: String,
+    embedder_model: String,
+    embedder_url_hash: String,
+    dimension: usize,
+    distance: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SourceDenseCheckpointRow {
+    chunk_id: String,
+    content_hash_blake3: String,
+    embedding: Vec<f32>,
+}
+
+fn source_dense_checkpoint_header(
+    source_fingerprint: &str,
+    fingerprint: &aicx_retrieve::EmbedderFingerprint,
+) -> SourceDenseCheckpointHeader {
+    SourceDenseCheckpointHeader {
+        schema: SOURCE_DENSE_CHECKPOINT_SCHEMA.to_string(),
+        source_fingerprint: source_fingerprint.to_string(),
+        embedder_model: fingerprint.model.clone(),
+        embedder_url_hash: fingerprint.url_hash.clone(),
+        dimension: fingerprint.dim,
+        distance: fingerprint.distance.clone(),
+    }
+}
+
+pub fn source_dense_checkpoint_path(
+    hybrid_root: &Path,
+    source_fingerprint: &str,
+    fingerprint: &aicx_retrieve::EmbedderFingerprint,
+) -> PathBuf {
+    let header = source_dense_checkpoint_header(source_fingerprint, fingerprint);
+    let identity =
+        serde_json::to_vec(&header).expect("checkpoint header serialization is infallible");
+    let name = format!("{}.ndjson", blake3::hash(&identity).to_hex());
+    hybrid_root.join(SOURCE_DENSE_CHECKPOINT_DIR).join(name)
+}
+
+fn source_chunk_content_hash(chunk: &aicx_retrieve::ChunkRef) -> Result<String> {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(chunk.id.as_bytes());
+    hasher.update(&[0]);
+    hasher.update(chunk.source_path.as_bytes());
+    hasher.update(&[0]);
+    hasher.update(chunk.text.as_bytes());
+    hasher.update(&[0]);
+    hasher.update(&serde_json::to_vec(&chunk.metadata)?);
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
+fn initialize_source_dense_checkpoint(
+    path: &Path,
+    header: &SourceDenseCheckpointHeader,
+) -> Result<()> {
+    use std::io::Write;
+
+    if path.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create dense checkpoint dir: {}", parent.display()))?;
+    }
+    let mut file = crate::sanitize::create_file_validated(path)
+        .with_context(|| format!("create dense checkpoint: {}", path.display()))?;
+    serde_json::to_writer(&mut file, header)?;
+    file.write_all(b"\n")?;
+    file.sync_all()
+        .with_context(|| format!("sync dense checkpoint header: {}", path.display()))?;
+    Ok(())
+}
+
+fn load_source_dense_checkpoint(
+    path: &Path,
+    expected: &SourceDenseCheckpointHeader,
+    chunks: &[aicx_retrieve::ChunkRef],
+) -> Result<std::collections::BTreeMap<String, Vec<f32>>> {
+    use std::collections::{BTreeMap, HashMap};
+    use std::io::Seek;
+
+    if !path.is_file() {
+        return Ok(BTreeMap::new());
+    }
+    let file = crate::sanitize::open_file_validated(path)
+        .with_context(|| format!("open dense checkpoint: {}", path.display()))?;
+    let mut reader = std::io::BufReader::new(file);
+    let header =
+        crate::sanitize::read_line_capped(&mut reader, crate::sanitize::MAX_VALIDATED_BYTES)
+            .with_context(|| format!("read dense checkpoint header: {}", path.display()))?;
+    let header =
+        header.ok_or_else(|| anyhow::anyhow!("dense checkpoint is empty: {}", path.display()))?;
+    if header.exceeded {
+        anyhow::bail!("dense checkpoint header is too large: {}", path.display());
+    }
+    let header_line = header.line.trim_end_matches(['\r', '\n']);
+    let observed: SourceDenseCheckpointHeader = serde_json::from_str(header_line)
+        .with_context(|| format!("parse dense checkpoint header: {}", path.display()))?;
+    if &observed != expected {
+        anyhow::bail!(
+            "dense checkpoint identity mismatch in {}; move the checkpoint aside or retry with its original source/embedder configuration",
+            path.display()
+        );
+    }
+
+    let expected_content = chunks
+        .iter()
+        .map(|chunk| Ok((chunk.id.clone(), source_chunk_content_hash(chunk)?)))
+        .collect::<Result<HashMap<_, _>>>()?;
+    let mut reusable = BTreeMap::new();
+    let mut durable_offset = reader
+        .stream_position()
+        .with_context(|| format!("locate dense checkpoint rows: {}", path.display()))?;
+    loop {
+        let row =
+            crate::sanitize::read_line_capped(&mut reader, crate::sanitize::MAX_VALIDATED_BYTES)
+                .with_context(|| format!("read dense checkpoint row: {}", path.display()))?;
+        let Some(row) = row else {
+            break;
+        };
+        if row.exceeded {
+            anyhow::bail!("dense checkpoint row is too large in {}", path.display());
+        }
+        let complete_line = row.line.ends_with('\n');
+        let row_line = row.line.trim_end_matches(['\r', '\n']);
+        let parsed: SourceDenseCheckpointRow = match serde_json::from_str(row_line) {
+            Ok(row) => row,
+            Err(_) if !complete_line => {
+                // A process can die between append writes. The final partial
+                // record is not durable work. Truncate it before the next
+                // append so repeated interruptions remain resumable.
+                drop(reader);
+                let validated = crate::sanitize::validate_write_path(path)?;
+                let file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&validated)
+                    .with_context(|| {
+                        format!("open dense checkpoint for repair: {}", validated.display())
+                    })?;
+                file.set_len(durable_offset).with_context(|| {
+                    format!("truncate partial dense checkpoint: {}", validated.display())
+                })?;
+                file.sync_all().with_context(|| {
+                    format!("sync repaired dense checkpoint: {}", validated.display())
+                })?;
+                break;
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("parse dense checkpoint row in {}", path.display()));
+            }
+        };
+        if parsed.embedding.len() != expected.dimension
+            || parsed.embedding.iter().any(|value| !value.is_finite())
+        {
+            anyhow::bail!(
+                "dense checkpoint row {} has invalid embedding dimension/data in {}",
+                parsed.chunk_id,
+                path.display()
+            );
+        }
+        if expected_content.get(&parsed.chunk_id) == Some(&parsed.content_hash_blake3) {
+            reusable.insert(parsed.chunk_id, parsed.embedding);
+        }
+        durable_offset = reader
+            .stream_position()
+            .with_context(|| format!("locate dense checkpoint row end: {}", path.display()))?;
+    }
+    Ok(reusable)
+}
+
+fn append_source_dense_checkpoint_rows(
+    path: &Path,
+    rows: &[SourceDenseCheckpointRow],
+) -> Result<()> {
+    use std::io::Write;
+
+    let validated = crate::sanitize::validate_write_path(path)?;
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&validated)
+        .with_context(|| format!("append dense checkpoint: {}", validated.display()))?;
+    for row in rows {
+        serde_json::to_writer(&mut file, row)?;
+        file.write_all(b"\n")?;
+    }
+    file.sync_all()
+        .with_context(|| format!("sync dense checkpoint rows: {}", validated.display()))?;
+    Ok(())
+}
+
+/// Embed canonical source chunks in bounded, restartable batches and publish
+/// the completed hybrid generation atomically.
+///
+/// Checkpoint rows live outside `generations/` and are reusable only for the
+/// exact source/embedder identity plus matching per-chunk content hashes.
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+#[allow(clippy::too_many_arguments)]
+pub fn build_source_hybrid_generation_resumable<E: BatchEmbedder>(
+    chunks: &[aicx_retrieve::ChunkRef],
+    source_fingerprint: &str,
+    hybrid_root: &Path,
+    fingerprint: &aicx_retrieve::EmbedderFingerprint,
+    embedder: &mut E,
+    options: DenseBuildOptions,
+    on_progress: &dyn Fn(DenseBuildProgress),
+) -> Result<aicx_retrieve::Manifest> {
+    let unique_ids = chunks
+        .iter()
+        .map(|chunk| chunk.id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    if unique_ids.len() != chunks.len() {
+        anyhow::bail!("source dense build requires unique canonical chunk ids");
+    }
+    if chunks.is_empty() {
+        anyhow::bail!("cannot build dense checkpoint for an empty source corpus");
+    }
+    if fingerprint.dim == 0 {
+        anyhow::bail!("dense checkpoint embedder dimension must be greater than zero");
+    }
+
+    let header = source_dense_checkpoint_header(source_fingerprint, fingerprint);
+    let checkpoint_path =
+        source_dense_checkpoint_path(hybrid_root, source_fingerprint, fingerprint);
+    initialize_source_dense_checkpoint(&checkpoint_path, &header)?;
+    let mut vectors = load_source_dense_checkpoint(&checkpoint_path, &header, chunks)?;
+    let reused = chunks
+        .iter()
+        .filter(|chunk| vectors.contains_key(&chunk.id))
+        .count();
+    let missing = chunks
+        .iter()
+        .enumerate()
+        .filter_map(|(index, chunk)| (!vectors.contains_key(&chunk.id)).then_some(index))
+        .collect::<Vec<_>>();
+    let mut newly_embedded = 0usize;
+    on_progress(DenseBuildProgress {
+        total: chunks.len(),
+        reused,
+        completed: reused,
+        newly_embedded,
+    });
+
+    for (start, end) in embed_batch_spans(missing.len(), options.batch_size) {
+        let indexes = &missing[start..end];
+        let texts = indexes
+            .iter()
+            .map(|index| take_prefix_bytes(&chunks[*index].text, DEFAULT_EMBED_PREFIX_BYTES))
+            .collect::<Vec<_>>();
+        let results = embed_batch_with_fallback(embedder, &texts);
+        let mut rows = Vec::with_capacity(indexes.len());
+        for (index, result) in indexes.iter().zip(results) {
+            let chunk = &chunks[*index];
+            let embedding = result.with_context(|| format!("embed source chunk {}", chunk.id))?;
+            if embedding.len() != fingerprint.dim {
+                anyhow::bail!(
+                    "embed source chunk {} returned dim {}, expected {}",
+                    chunk.id,
+                    embedding.len(),
+                    fingerprint.dim
+                );
+            }
+            if embedding.iter().any(|value| !value.is_finite()) {
+                anyhow::bail!("embed source chunk {} returned non-finite values", chunk.id);
+            }
+            rows.push(SourceDenseCheckpointRow {
+                chunk_id: chunk.id.clone(),
+                content_hash_blake3: source_chunk_content_hash(chunk)?,
+                embedding,
+            });
+        }
+        append_source_dense_checkpoint_rows(&checkpoint_path, &rows)?;
+        for row in rows {
+            vectors.insert(row.chunk_id, row.embedding);
+            newly_embedded += 1;
+        }
+        on_progress(DenseBuildProgress {
+            total: chunks.len(),
+            reused,
+            completed: reused + newly_embedded,
+            newly_embedded,
+        });
+    }
+
+    let embeddings = chunks
+        .iter()
+        .map(|chunk| {
+            vectors
+                .remove(&chunk.id)
+                .ok_or_else(|| anyhow::anyhow!("missing completed vector for {}", chunk.id))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let manifest = publish_source_hybrid_generation_owned(
+        chunks,
+        embeddings,
+        source_fingerprint,
+        hybrid_root,
+        fingerprint,
+    )?;
+    if let Err(error) = std::fs::remove_file(&checkpoint_path)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!(
+            "[aicx][phase=index event=dense_checkpoint_cleanup_failed path={} error={}]",
+            checkpoint_path.display(),
+            error
+        );
+    }
+    Ok(manifest)
 }
 
 pub fn hybrid_manifest_path(project: Option<&str>) -> Result<PathBuf> {
@@ -895,7 +1258,7 @@ fn maybe_emit_stats_tick(
 /// concrete [`crate::embedder::EmbeddingEngine`] so the batch + fallback
 /// logic is unit-testable against a mock — no live endpoint or model.
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
-pub(crate) trait BatchEmbedder {
+pub trait BatchEmbedder {
     fn embed_batch(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>>;
     fn embed_one(&mut self, text: &str) -> Result<Vec<f32>>;
 }
