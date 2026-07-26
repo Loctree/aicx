@@ -194,13 +194,11 @@ fn cli_and_mcp_render_identical_search_items() {
     let _ = fs::remove_dir_all(&root);
 }
 
-/// W1-01 falsification fixture: a dense-only semantic outcome (hits exist,
-/// hybrid manifest absent → `retrieval_status: None`) must NOT serialize as a
-/// healthy `content_semantic` oracle status without a fallback_reason. This is
-/// the known JSON false-green: the CLI text surface says `[degraded]` while
-/// the CLI/MCP JSON surfaces claim a healthy semantic backend.
+/// An untyped dense-only label without hybrid manifest evidence must never
+/// recreate the removed implicit dense fallback. It is unknown, while the
+/// explicit `semantic_legacy_dense` recovery label is tested separately below.
 #[test]
-fn dense_only_semantic_json_is_not_false_green() {
+fn untyped_dense_only_label_is_unknown_not_false_green() {
     let outcome = aicx::search_engine::SemanticSearchOutcome {
         results: Vec::new(),
         scanned: 227_290,
@@ -225,18 +223,18 @@ fn dense_only_semantic_json_is_not_false_green() {
     assert_ne!(
         json["backend"],
         Value::String("content_semantic".to_string()),
-        "dense-only execution must not claim the healthy content_semantic backend: {json}"
+        "untyped dense-only evidence must not claim the healthy content_semantic backend: {json}"
     );
     assert!(
         json.get("fallback_reason").is_some_and(|r| !r.is_null()),
-        "dense-only execution is degraded and must carry a fallback_reason: {json}"
+        "missing execution evidence must carry a fallback_reason: {json}"
     );
     assert_eq!(
         json["backend"],
-        Value::String("semantic_dense_only".to_string())
+        Value::String("retrieval_unknown".to_string())
     );
-    assert_eq!(json["retrieval"]["completeness"], "degraded");
-    assert_eq!(json["retrieval"]["executed_path"], "dense_only");
+    assert_eq!(json["retrieval"]["completeness"], "unknown");
+    assert_eq!(json["retrieval"]["executed_path"], "none");
     assert_eq!(json["retrieval"]["requested_mode"], "hybrid");
 }
 
