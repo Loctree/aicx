@@ -591,7 +591,7 @@ pub fn resolve_hybrid_generation_dir(hybrid_root: &Path) -> PathBuf {
 /// missing, malformed, or dangling pointer cannot resurrect stale artifacts.
 pub fn resolve_current_generation_dir(hybrid_root: &Path) -> Result<PathBuf> {
     let pointer = hybrid_root.join(HYBRID_CURRENT_POINTER_FILE_NAME);
-    let raw = std::fs::read_to_string(&pointer)
+    let raw = crate::sanitize::read_to_string_validated(&pointer)
         .with_context(|| format!("read CURRENT pointer {}", pointer.display()))?;
     let name = raw.trim();
     if !is_valid_generation_dir_name(name) {
