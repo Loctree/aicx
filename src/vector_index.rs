@@ -727,6 +727,52 @@ pub fn publish_source_lexical_generation(
     Ok(manifest)
 }
 
+/// Publish one complete hybrid generation directly from canonical source chunks.
+///
+/// `embeddings` is index-aligned with `chunks`; the publisher constructs dense
+/// rows itself so lexical and dense identifiers cannot silently diverge. The
+/// generation is reopened and its manifest bindings are validated before the
+/// atomic `CURRENT` pointer flip. This path never reads or writes the legacy
+/// `embeddings.ndjson` semantic index.
+pub fn publish_source_hybrid_generation(
+    chunks: &[aicx_retrieve::ChunkRef],
+    embeddings: &[Vec<f32>],
+    source_fingerprint: &str,
+    hybrid_root: &Path,
+    fingerprint: &aicx_retrieve::EmbedderFingerprint,
+) -> Result<aicx_retrieve::Manifest> {
+    use aicx_retrieve::DenseChunkRef;
+
+    if chunks.is_empty() {
+        anyhow::bail!("cannot publish an empty source hybrid generation");
+    }
+    if chunks.len() != embeddings.len() {
+        anyhow::bail!(
+            "source hybrid count mismatch: {} chunks but {} embeddings",
+            chunks.len(),
+            embeddings.len()
+        );
+    }
+    if fingerprint.dim == 0 {
+        anyhow::bail!("source hybrid embedder dimension must be greater than zero");
+    }
+
+    let dense_chunks = chunks
+        .iter()
+        .cloned()
+        .zip(embeddings.iter().cloned())
+        .map(|(chunk, embedding)| DenseChunkRef { chunk, embedding })
+        .collect::<Vec<_>>();
+
+    publish_hybrid_generation_from_chunks(
+        chunks,
+        &dense_chunks,
+        source_fingerprint,
+        hybrid_root,
+        fingerprint,
+    )
+}
+
 pub fn hybrid_manifest_path(project: Option<&str>) -> Result<PathBuf> {
     Ok(hybrid_index_dir(project)?.join("manifest.json"))
 }
@@ -1617,6 +1663,83 @@ fn distance_from_label(distance: &str) -> Result<aicx_retrieve::Distance> {
     }
 }
 
+fn publish_hybrid_generation_from_chunks(
+    lexical_chunks: &[aicx_retrieve::ChunkRef],
+    dense_chunks: &[aicx_retrieve::DenseChunkRef],
+    source_hash: &str,
+    hybrid_root: &Path,
+    fingerprint: &aicx_retrieve::EmbedderFingerprint,
+) -> Result<aicx_retrieve::Manifest> {
+    use aicx_retrieve::{
+        HybridIndex, Manifest, MmapDenseAdapter, ReciprocalRankFusion, TantivyAdapter,
+        validate_live_bindings_for_refresh,
+    };
+
+    let distance = distance_from_label(&fingerprint.distance)?;
+    let generation_dir = hybrid_root
+        .join(HYBRID_GENERATIONS_DIR_NAME)
+        .join(generation_dir_name(&Manifest::fresh_generation_id()));
+    std::fs::create_dir_all(&generation_dir)
+        .with_context(|| format!("create generation dir: {}", generation_dir.display()))?;
+
+    let lexical = Box::new(TantivyAdapter::new(generation_dir.clone())?);
+    let dense = Box::new(MmapDenseAdapter::create(
+        generation_dir.join(aicx_retrieve::MMAP_DENSE_PAYLOAD_FILE_NAME),
+        fingerprint.dim,
+        distance,
+        aicx_retrieve::source_hash_bytes(source_hash),
+    ));
+    let fusion = Box::new(ReciprocalRankFusion::default());
+    let mut hybrid = HybridIndex::new(
+        lexical,
+        dense,
+        fusion,
+        generation_dir.clone(),
+        fingerprint.clone(),
+    );
+    hybrid.build_hybrid(lexical_chunks, dense_chunks, source_hash)?;
+    let manifest = hybrid.commit()?.clone();
+    drop(hybrid);
+
+    let persisted = Manifest::read_from_path(&generation_dir.join("manifest.json"))?;
+    let lexical = TantivyAdapter::new(generation_dir.clone())?;
+    let dense = MmapDenseAdapter::open(
+        generation_dir.join(aicx_retrieve::MMAP_DENSE_PAYLOAD_FILE_NAME),
+        fingerprint.dim,
+        distance,
+        Some(aicx_retrieve::source_hash_bytes(source_hash)),
+    )?;
+    let fusion = ReciprocalRankFusion::default();
+    validate_live_bindings_for_refresh(&persisted, &lexical, &dense, &fusion, fingerprint)
+        .map_err(|error| anyhow::anyhow!("validate source hybrid generation: {error}"))?;
+    if persisted.source_chunk_count != lexical_chunks.len()
+        || persisted.lexical_doc_count != lexical_chunks.len()
+        || persisted.dense_count != lexical_chunks.len()
+    {
+        anyhow::bail!(
+            "source hybrid generation count mismatch after build: source={}, lexical={}, dense={}, expected={}",
+            persisted.source_chunk_count,
+            persisted.lexical_doc_count,
+            persisted.dense_count,
+            lexical_chunks.len()
+        );
+    }
+    let expected_source_hash = aicx_retrieve::source_hash_blake3(source_hash);
+    if persisted.source_hash_blake3 != expected_source_hash {
+        anyhow::bail!(
+            "source hybrid generation fingerprint mismatch after build: manifest={}, expected={}",
+            persisted.source_hash_blake3,
+            expected_source_hash
+        );
+    }
+    if persisted != manifest {
+        anyhow::bail!("source hybrid generation manifest changed after persistence");
+    }
+
+    publish_hybrid_generation(hybrid_root, &generation_dir)?;
+    Ok(manifest)
+}
+
 /// Build one complete hybrid generation from the committed semantic index and
 /// publish it atomically.
 ///
@@ -1637,10 +1760,7 @@ pub fn materialize_hybrid_generation(
     hybrid_root: &Path,
     fingerprint: &aicx_retrieve::EmbedderFingerprint,
 ) -> Result<aicx_retrieve::Manifest> {
-    use aicx_retrieve::{
-        ChunkRef, DenseChunkRef, HybridIndex, Manifest, MmapDenseAdapter, ReciprocalRankFusion,
-        TantivyAdapter,
-    };
+    use aicx_retrieve::{ChunkRef, DenseChunkRef};
 
     let (header, entries) = read_committed_index_entries(committed_index_path)?;
     if header.dimension != fingerprint.dim {
@@ -1650,8 +1770,6 @@ pub fn materialize_hybrid_generation(
             fingerprint.dim
         );
     }
-    let distance = distance_from_label(&fingerprint.distance)?;
-
     let source_hash = observed_source_hash_for_index_path(committed_index_path)?;
     let mut lexical_chunks = Vec::with_capacity(entries.len());
     let mut dense_chunks = Vec::with_capacity(entries.len());
@@ -1705,37 +1823,13 @@ pub fn materialize_hybrid_generation(
         );
     }
 
-    // Fresh, unreferenced generation directory. Everything below writes into
-    // it; nothing is visible to readers until the pointer flip at the end.
-    let generation_dir = hybrid_root
-        .join(HYBRID_GENERATIONS_DIR_NAME)
-        .join(generation_dir_name(&Manifest::fresh_generation_id()));
-    std::fs::create_dir_all(&generation_dir)
-        .with_context(|| format!("create generation dir: {}", generation_dir.display()))?;
-
-    let lexical = Box::new(TantivyAdapter::new(generation_dir.clone())?);
-    let dense = Box::new(MmapDenseAdapter::create(
-        generation_dir.join(aicx_retrieve::MMAP_DENSE_PAYLOAD_FILE_NAME),
-        header.dimension,
-        distance,
-        aicx_retrieve::source_hash_bytes(&source_hash),
-    ));
-    let fusion = Box::new(ReciprocalRankFusion::default());
-    let mut hybrid = HybridIndex::new(
-        lexical,
-        dense,
-        fusion,
-        generation_dir.clone(),
-        fingerprint.clone(),
-    );
-    // build_hybrid materializes the lexical index and the single dense
-    // payload; commit writes `manifest.json` last within the generation dir.
-    hybrid.build_hybrid(&lexical_chunks, &dense_chunks, &source_hash)?;
-    let manifest = hybrid.commit()?.clone();
-
-    publish_hybrid_generation(hybrid_root, &generation_dir)?;
-
-    Ok(manifest)
+    publish_hybrid_generation_from_chunks(
+        &lexical_chunks,
+        &dense_chunks,
+        &source_hash,
+        hybrid_root,
+        fingerprint,
+    )
 }
 
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]

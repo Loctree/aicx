@@ -13,11 +13,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use aicx::vector_index::{
     IndexEntry, IndexHeader, materialize_hybrid_generation, observed_source_hash_for_index_path,
-    resolve_hybrid_generation_dir,
+    publish_source_hybrid_generation, resolve_hybrid_generation_dir,
 };
 use aicx_retrieve::{
-    Distance, EmbedderFingerprint, MMAP_DENSE_KIND, MMAP_DENSE_PAYLOAD_FILE_NAME, Manifest,
-    MmapDenseAdapter, RetrieveError, source_hash_bytes,
+    ChunkRef, Distance, EmbedderFingerprint, FilterSet, LexicalQuery, MMAP_DENSE_KIND,
+    MMAP_DENSE_PAYLOAD_FILE_NAME, Manifest, MmapDenseAdapter, RetrieveError, TantivyAdapter,
+    source_hash_bytes,
 };
 use chrono::{TimeZone, Utc};
 
@@ -76,6 +77,22 @@ fn fingerprint() -> EmbedderFingerprint {
     EmbedderFingerprint::new("test-model", "http://example.invalid/embed", 2, "cosine")
 }
 
+fn source_chunks() -> Vec<ChunkRef> {
+    ["a", "b", "c"]
+        .into_iter()
+        .map(|id| ChunkRef {
+            id: id.to_string(),
+            source_path: format!("/catalog/{id}.jsonl"),
+            text: format!("source-driven content for {id}"),
+            metadata: serde_json::json!({
+                "project": "vetcoders/example-app",
+                "agent": "codex",
+                "session_id": format!("session-{id}"),
+            }),
+        })
+        .collect()
+}
+
 /// Every regular file under `dir`, relative-path-sorted, for payload census.
 fn files_under(dir: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
@@ -95,6 +112,118 @@ fn files_under(dir: &Path) -> Vec<PathBuf> {
     }
     files.sort();
     files
+}
+
+#[test]
+fn source_driven_generation_builds_aligned_lexical_and_dense_artifacts() {
+    let root = fixture_root("source-driven");
+    let hybrid_root = root.join("indexed").join("_all").join("hybrid");
+    let chunks = source_chunks();
+    let embeddings = vec![vec![1.0, 0.0], vec![0.0, 1.0], vec![0.6, 0.4]];
+    let source_fingerprint = "catalog-v1:source-snapshot";
+
+    let manifest = publish_source_hybrid_generation(
+        &chunks,
+        &embeddings,
+        source_fingerprint,
+        &hybrid_root,
+        &fingerprint(),
+    )
+    .expect("publish source-driven hybrid generation");
+
+    assert_eq!(manifest.source_chunk_count, chunks.len());
+    assert_eq!(manifest.lexical_doc_count, chunks.len());
+    assert_eq!(manifest.dense_count, chunks.len());
+    assert_eq!(manifest.dense_kind, MMAP_DENSE_KIND);
+    assert_eq!(
+        manifest.source_hash_blake3,
+        hex::encode(source_hash_bytes(source_fingerprint))
+    );
+
+    let generation_dir = resolve_hybrid_generation_dir(&hybrid_root);
+    assert!(generation_dir.join("manifest.json").is_file());
+    assert!(generation_dir.join(MMAP_DENSE_PAYLOAD_FILE_NAME).is_file());
+    assert!(
+        files_under(&hybrid_root).iter().all(|path| {
+            path.file_name()
+                .is_none_or(|name| name != "embeddings.ndjson")
+        }),
+        "source-driven publication must not create the legacy semantic index"
+    );
+
+    let dense = MmapDenseAdapter::open(
+        generation_dir.join(MMAP_DENSE_PAYLOAD_FILE_NAME),
+        fingerprint().dim,
+        Distance::Cosine,
+        Some(source_hash_bytes(source_fingerprint)),
+    )
+    .expect("open source-driven dense payload");
+    assert_eq!(aicx_retrieve::DenseIndex::count(&dense), chunks.len());
+    let dense_ids =
+        aicx_retrieve::DenseIndex::query(&dense, &[1.0, 0.0], chunks.len(), &FilterSet::default())
+            .expect("query source-driven dense payload")
+            .into_iter()
+            .map(|hit| hit.chunk_id)
+            .collect::<std::collections::BTreeSet<_>>();
+    let lexical = TantivyAdapter::new(generation_dir.clone()).expect("open lexical index");
+    let lexical_ids = aicx_retrieve::LexicalIndex::query(
+        &lexical,
+        &LexicalQuery {
+            text: "source-driven content".to_string(),
+            limit: chunks.len(),
+            filters: FilterSet::default(),
+        },
+    )
+    .expect("query source-driven lexical index")
+    .into_iter()
+    .map(|hit| hit.chunk_id)
+    .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        lexical_ids, dense_ids,
+        "lexical and dense legs must expose the same canonical chunk identifiers"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn source_driven_failure_keeps_previous_current_generation() {
+    let root = fixture_root("source-driven-failure");
+    let hybrid_root = root.join("indexed").join("_all").join("hybrid");
+    let chunks = source_chunks();
+    let embeddings = vec![vec![1.0, 0.0], vec![0.0, 1.0], vec![0.6, 0.4]];
+
+    publish_source_hybrid_generation(
+        &chunks,
+        &embeddings,
+        "catalog-v1:healthy",
+        &hybrid_root,
+        &fingerprint(),
+    )
+    .expect("publish healthy source-driven generation");
+    let prior_current =
+        std::fs::read_to_string(hybrid_root.join("CURRENT")).expect("read prior CURRENT");
+
+    let wrong_dimension = vec![vec![1.0], vec![0.0], vec![0.5]];
+    let error = publish_source_hybrid_generation(
+        &chunks,
+        &wrong_dimension,
+        "catalog-v1:broken",
+        &hybrid_root,
+        &fingerprint(),
+    )
+    .expect_err("wrong embedding dimension must fail");
+    assert!(
+        error.to_string().contains("dim"),
+        "unexpected embedding error: {error:#}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(hybrid_root.join("CURRENT")).expect("read CURRENT after failure"),
+        prior_current,
+        "failed source-driven generation must not replace CURRENT"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
