@@ -480,6 +480,8 @@ fn dummy_index_status(bucket: &str) -> aicx::IndexStatus {
         semantic_index_mtime: Some("2026-05-24T00:01:00Z".to_string()),
         semantic_lag_secs: Some(60),
         pending_chunks: 0,
+        dense_state: aicx::DenseState::Ready,
+        dense_missing_count: 0,
         temp_index_present: false,
         temp_index_path: None,
         temp_index_rows: 0,
@@ -557,6 +559,7 @@ fn run_search_rejects_limit_over_hard_cap_before_store_access() {
         context: 2,
         no_semantic: true,
         evidence: false,
+        legacy_dense: false,
         deep: false,
         project_match: legacy_archive::ProjectMatchMode::Exact,
     })
@@ -1677,13 +1680,51 @@ fn index_defaults_to_materialization() {
 
     match cli.command {
         Some(Commands::Index {
-            dry_run, project, ..
+            dry_run,
+            dense,
+            project,
+            ..
         }) => {
             assert!(!dry_run);
+            assert!(!dense, "default indexing must stay lexical-only");
             assert!(project.is_empty());
         }
         _ => panic!("expected index command"),
     }
+}
+
+#[test]
+fn index_accepts_explicit_dense_build_with_full_rescan_and_extract_cache() {
+    let cli = Cli::try_parse_from([
+        "aicx",
+        "index",
+        "--dense",
+        "--full-rescan",
+        "--cache-extracts",
+    ])
+    .expect("explicit dense index command should parse");
+
+    match cli.command {
+        Some(Commands::Index {
+            dense,
+            full_rescan,
+            cache_extracts,
+            ..
+        }) => {
+            assert!(dense);
+            assert!(full_rescan);
+            assert!(cache_extracts);
+        }
+        _ => panic!("expected index command"),
+    }
+}
+
+#[test]
+fn index_dense_conflicts_with_dry_run() {
+    assert!(
+        Cli::try_parse_from(["aicx", "index", "--dense", "--dry-run"]).is_err(),
+        "dense materialization cannot be presented as a dry run"
+    );
 }
 
 #[test]

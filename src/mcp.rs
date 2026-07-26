@@ -1789,7 +1789,7 @@ impl AicxMcpServer {
 
     #[tool(
         name = "aicx_index_status",
-        description = "Report the truthful state of the AICX index relative to what search uses. Prefers hybrid CURRENT (lexical-first source generation under indexed/_all/hybrid) when present — same surface as `aicx search`. Falls back to residual store-card + embeddings.ndjson status only when CURRENT is absent. Returns readiness (ready/stale_chunks/stale_index/pending/missing), backend (hybrid_lexical|hybrid|ndjson), catalog session counts, pending_chunks, project_bucket, committed_at."
+        description = "Report the truthful state of the AICX index relative to what search uses. Prefers hybrid CURRENT (lexical-first source generation under indexed/_all/hybrid) when present — same surface as `aicx search`. Falls back to residual store-card + embeddings.ndjson status only when CURRENT is absent. Returns lexical readiness independently from dense_state (optional_not_built|building|ready|stale), dense_missing_count, backend, catalog session counts, pending_chunks, project_bucket, and committed_at."
     )]
     async fn index_status(
         &self,

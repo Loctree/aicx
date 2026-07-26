@@ -159,9 +159,9 @@ bash install.sh --pick-home
 bash install.sh --aicx-home="$HOME/.aicx"
 ```
 
-The default root remains `~/.aicx`, so the default semantic index remains
-`~/.aicx/indexed/_all/embeddings.ndjson`. Picking a custom AICX home moves the
-same layout under that root: `<AICX_HOME>/indexed/_all/embeddings.ndjson`.
+The default root remains `~/.aicx`. The live retrieval pointer is
+`~/.aicx/indexed/_all/hybrid/CURRENT`; a custom AICX home moves the same
+generation layout under `<AICX_HOME>/indexed/_all/hybrid/`.
 
 Useful env vars:
 
@@ -213,25 +213,28 @@ Lookup paths:
 Since W2-03, hybrid retrieval artifacts are generation-scoped and the dense
 vectors are materialized exactly once per generation.
 
-Layout under each bucket:
+The source-driven corpus publishes one global `_all` generation:
 
 ```text
-<AICX_HOME>/indexed/<bucket>/embeddings.ndjson        # canonical committed semantic index (build source)
-<AICX_HOME>/indexed/<bucket>/hybrid/
-├── CURRENT                                           # pointer file naming the published generation
+<AICX_HOME>/indexed/_all/hybrid/
+├── CURRENT                                           # pointer naming the published generation
+├── dense-checkpoints/                                # restartable private worksets
 └── generations/<generation>/
     ├── tantivy_lex/                                  # lexical index
-    ├── dense.exact_mmap_v1.bin                       # THE dense payload (aicx.dense.exact_mmap.v1)
+    ├── dense.exact_mmap_v1.bin                       # optional, built only by --dense
     └── manifest.json                                 # generation authority, written last
 ```
 
 Contract:
 
+- **Lexical by default, dense by request.** `aicx index` publishes Tantivy
+  without initializing an embedder. `aicx index --dense` builds or resumes the
+  optional mmap payload. `aicx index status` reports lexical `readiness`
+  independently from `dense_state` and `dense_missing_count`.
 - **One dense payload per generation.** Vectors are written once, into the
-  versioned mmap artifact. The old `hybrid/dense_brute_force.ndjson` twin
-  (a near-copy of `embeddings.ndjson`, 15 GB + 15 GB on the live `_all`
-  bucket) is never written by new builds; existing copies remain on disk as
-  migration read input only.
+  versioned mmap artifact. Neither `embeddings.ndjson` nor
+  `hybrid/dense_brute_force.ndjson` participates in canonical build or deep
+  search.
 - **Manifest last, pointer flip publishes.** A build writes lexical and dense
   payloads first, `manifest.json` after them, and only then atomically
   renames the `CURRENT` pointer. A build killed at any earlier boundary
@@ -239,15 +242,15 @@ Contract:
   previous complete generation. Incomplete directories are quarantinable and
   never alter current-generation resolution.
 - **Manifest binds the payload.** `manifest.json` carries the generation id,
-  the blake3 source hash of the committed semantic index, embedder model /
+  the blake3 source hash of the canonical source corpus, embedder model /
   url hash / dimension / distance, dense kind + row count, and the lexical
   commit id + doc count. Validation rejects drift on source, model,
   dimension, distance, lexical generation, and partial-build divergence
   (kind or count mismatch between manifest and artifacts).
-- **Legacy stores migrate on the next full build.** A bucket without a
-  `CURRENT` pointer resolves to the legacy root layout for reads; the next
-  `aicx index` full rebuild materializes a single-payload generation and
-  publishes it. No index files are deleted by the migration.
+- **No implicit legacy fallback.** `aicx search --deep` opens the exact global
+  CURRENT manifest, mmap and Tantivy artifacts or returns a typed error with
+  `aicx index --dense` as recovery. The retired primary NDJSON reader is
+  reachable only through explicit `aicx search --legacy-dense`.
 
 Old generation directories accumulate until the doctor/quarantine surface
 reclaims them; this cut intentionally does not delete anything.

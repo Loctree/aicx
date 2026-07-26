@@ -127,7 +127,7 @@ mod test_support;
 
 pub use aicx_parser as parser;
 pub use aicx_parser::{card_header, chunker, frontmatter, sanitize, segmentation, timeline, types};
-pub use api::{Aicx, AicxConfig, IndexReadiness, IndexStatus};
+pub use api::{Aicx, AicxConfig, DenseState, IndexReadiness, IndexStatus};
 #[cfg(feature = "app")]
 pub use api::{SearchOptions, SearchResults};
 

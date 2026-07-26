@@ -279,7 +279,7 @@ maybe_configure_aicx_home() {
     echo ""
     echo "AICX storage root setup"
     echo "  Default root: $default_home"
-    echo "  Semantic index path: <AICX_HOME>/indexed/_all/embeddings.ndjson"
+    echo "  Retrieval index path: <AICX_HOME>/indexed/_all/hybrid/CURRENT"
     echo "  Press Enter for the default, or enter an absolute path / ~/... for a persistent custom root."
     printf "AICX_HOME [%s]: " "$default_home"
     read -r selected_home || true
@@ -294,7 +294,7 @@ maybe_configure_aicx_home() {
   config_written=$(write_storage_home_config "$selected_home")
   echo "  config: $config_written"
   echo "  storage root: $selected_home"
-  echo "  semantic index path: $selected_home/indexed/_all/embeddings.ndjson"
+  echo "  retrieval index path: $selected_home/indexed/_all/hybrid/CURRENT"
 }
 
 write_embedder_config() {

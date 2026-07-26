@@ -14,12 +14,6 @@
 //!
 //! Vibecrafted with AI Agents by Vetcoders (c)2026 Vetcoders
 
-std::thread_local! {
-    /// CLI-only recovery selection. The process executes one command, while
-    /// library/MCP callers pass `SemanticSearchFilters::legacy_dense` directly.
-    pub static LEGACY_DENSE_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
@@ -67,8 +61,6 @@ const BACKEND_HYBRID_RRF: &str = "hybrid_rrf";
 const BACKEND_HYBRID_RRF_GLOBAL_SCOPED: &str = "hybrid_rrf_global_scoped";
 const BACKEND_LEXICAL: &str = "lexical_tantivy";
 const BACKEND_LEXICAL_GLOBAL_SCOPED: &str = "lexical_tantivy_global_scoped";
-const BACKEND_SEMANTIC_DENSE_ONLY: &str = "semantic_dense_only";
-const BACKEND_SEMANTIC_DENSE_ONLY_GLOBAL_SCOPED: &str = "semantic_dense_only_global_scoped";
 const BACKEND_SEMANTIC_LEGACY_DENSE: &str = "semantic_legacy_dense";
 const BACKEND_SEMANTIC_LEGACY_DENSE_GLOBAL_SCOPED: &str = "semantic_legacy_dense_global_scoped";
 /// Retired multi-shard fan-out budget (kept for regression tests only).
@@ -261,10 +253,8 @@ fn index_query_error(path: &std::path::Path, err: anyhow::Error) -> SemanticErro
     SemanticError::IndexCorrupt {
         path: path.to_path_buf(),
         reason,
-        recommendation: format!(
-            "delete and rebuild: `rm -f {} && aicx index`",
-            path.display()
-        ),
+        recommendation: "run `aicx index --dense` to atomically publish a replacement CURRENT"
+            .to_string(),
     }
 }
 
@@ -343,7 +333,6 @@ fn try_semantic_search_with_boundary(
         let mut scanned = 0usize;
         let mut model_id = None;
         let mut hybrid_statuses = Vec::new();
-        let mut any_dense_only = false;
         let mut any_legacy_dense = false;
         let mut any_lexical = false;
         let mut any_global_project_scope = false;
@@ -370,15 +359,6 @@ fn try_semantic_search_with_boundary(
             };
             boundary.examined = boundary.examined.saturating_add(scope_boundary.examined);
             boundary.saturated |= scope_boundary.saturated;
-            if outcome
-                .backend_label
-                .starts_with(BACKEND_SEMANTIC_DENSE_ONLY)
-                || outcome
-                    .backend_label
-                    .starts_with(BACKEND_SEMANTIC_LEGACY_DENSE)
-            {
-                any_dense_only = true;
-            }
             if outcome
                 .backend_label
                 .starts_with(BACKEND_SEMANTIC_LEGACY_DENSE)
@@ -409,10 +389,6 @@ fn try_semantic_search_with_boundary(
                     BACKEND_SEMANTIC_LEGACY_DENSE_GLOBAL_SCOPED
                 } else if any_legacy_dense {
                     BACKEND_SEMANTIC_LEGACY_DENSE
-                } else if any_dense_only && any_global_project_scope {
-                    BACKEND_SEMANTIC_DENSE_ONLY_GLOBAL_SCOPED
-                } else if any_dense_only {
-                    BACKEND_SEMANTIC_DENSE_ONLY
                 } else if any_lexical && any_global_project_scope {
                     BACKEND_LEXICAL_GLOBAL_SCOPED
                 } else if any_lexical {
@@ -431,15 +407,6 @@ fn try_semantic_search_with_boundary(
 }
 
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
-#[derive(Debug)]
-struct SemanticBucketScope<'a> {
-    index_project: Option<&'a str>,
-    retrieval_project_filter: Option<&'a str>,
-    index_path: std::path::PathBuf,
-    used_global_project_scope: bool,
-}
-
-#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
 #[derive(Clone, Copy)]
 struct SemanticRetrievalFilters<'a> {
     kind: Option<&'a str>,
@@ -448,86 +415,6 @@ struct SemanticRetrievalFilters<'a> {
     agent: Option<&'a str>,
     date: Option<&'a str>,
     candidate_filters: Option<&'a SemanticSearchFilters>,
-}
-
-#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
-fn index_not_built_error(path: std::path::PathBuf, project_filter: Option<&str>) -> SemanticError {
-    let recommendation = match project_filter {
-        Some(p) => format!(
-            "run `aicx index` to build the global index used by `search -p {p}`; \
-             optionally run `aicx index --project {p}` to materialize a local project cache"
-        ),
-        None => {
-            "run `aicx index` (one-off; subsequent runs query the index in-process)".to_string()
-        }
-    };
-    let legacy_hint = legacy_index_hint(project_filter, &path)
-        .map(|hint| format!(" {hint}"))
-        .unwrap_or_default();
-    SemanticError::IndexNotBuilt {
-        path: path.clone(),
-        reason: format!(
-            "vector index not yet materialized at {}{}",
-            path.display(),
-            legacy_hint
-        ),
-        recommendation,
-    }
-}
-
-#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
-fn legacy_index_hint(project_filter: Option<&str>, canonical_path: &Path) -> Option<String> {
-    let legacy_path = crate::os_user_home()?
-        .join("index")
-        .join(crate::vector_index::index_bucket_name(project_filter))
-        .join("embeddings.ndjson");
-    if legacy_path.exists() && legacy_path != canonical_path {
-        Some(format!(
-            "Found legacy index at {}; current AICX uses {}.",
-            legacy_path.display(),
-            canonical_path.display()
-        ))
-    } else {
-        None
-    }
-}
-
-#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
-fn select_semantic_bucket_scope<'a>(
-    project_filter: Option<&'a str>,
-    project_index_path: std::path::PathBuf,
-    all_index_path: std::path::PathBuf,
-) -> std::result::Result<SemanticBucketScope<'a>, SemanticError> {
-    // Prefer the global `_all` generation for every query. Project is a
-    // metadata filter on that corpus, not a separate index requirement.
-    // Optional per-project shards remain usable as a local cache when the
-    // global bucket is missing (migration / partial rollouts).
-    if all_index_path.exists() {
-        return Ok(SemanticBucketScope {
-            index_project: None,
-            retrieval_project_filter: project_filter,
-            index_path: all_index_path,
-            used_global_project_scope: project_filter.is_some(),
-        });
-    }
-
-    if project_index_path.exists() {
-        return Ok(SemanticBucketScope {
-            index_project: project_filter,
-            retrieval_project_filter: project_filter,
-            index_path: project_index_path,
-            used_global_project_scope: false,
-        });
-    }
-
-    Err(index_not_built_error(
-        if project_filter.is_some() {
-            project_index_path
-        } else {
-            all_index_path
-        },
-        project_filter,
-    ))
 }
 
 /// Lexical-first retrieval against the published `_all` hybrid CURRENT
@@ -562,7 +449,14 @@ fn try_lexical_search_native(
             recommendation: "ensure $AICX_HOME (or $HOME) is writable, then run `aicx index`"
                 .to_string(),
         })?;
-    let gen_dir = crate::vector_index::resolve_hybrid_generation_dir(&hybrid_root);
+    let gen_dir =
+        crate::vector_index::resolve_current_generation_dir(&hybrid_root).map_err(|err| {
+            SemanticError::IndexNotBuilt {
+                path: hybrid_root.join("CURRENT"),
+                reason: format!("source-driven lexical CURRENT is unavailable: {err:#}"),
+                recommendation: "run `aicx index` to publish a lexical CURRENT".to_string(),
+            }
+        })?;
     let manifest_path = gen_dir.join("manifest.json");
     if !manifest_path.exists() {
         return Err(SemanticError::IndexNotBuilt {
@@ -580,23 +474,9 @@ fn try_lexical_search_native(
         SemanticError::RetrievalManifestStale {
             path: manifest_path.clone(),
             reason: format!("could not read retrieval manifest: {err}"),
-            recommendation: "run `aicx index` to rebuild the hybrid retrieval bucket".to_string(),
+            recommendation: "run `aicx index --dense` to rebuild the hybrid CURRENT".to_string(),
         }
     })?;
-
-    // Fail closed when CURRENT did not resolve and the root still names the
-    // retired brute-force NDJSON dense adapter (would otherwise hang).
-    if gen_dir == hybrid_root && manifest.dense_kind == aicx_retrieve::BRUTE_FORCE_KIND {
-        return Err(SemanticError::RetrievalManifestStale {
-            path: manifest_path.clone(),
-            reason: "published hybrid manifest names the retired NDJSON dense adapter \
-                     and no CURRENT generation pointer is available"
-                .to_string(),
-            recommendation:
-                "run `aicx index` to publish an mmap generation, or pass `--legacy-dense` only for recovery"
-                    .to_string(),
-        });
-    }
 
     let lexical = aicx_retrieve::TantivyAdapter::new(gen_dir.clone()).map_err(|err| {
         SemanticError::RetrievalManifestStale {
@@ -1218,35 +1098,80 @@ fn try_semantic_search_native(
     kind_filter: Option<&str>,
     candidate_filters: Option<&SemanticSearchFilters>,
 ) -> std::result::Result<(SemanticOutcome, CandidateBoundary), SemanticError> {
-    // Resolve + verify the committed index FIRST, BEFORE paying the
-    // (potentially heavy) embedder bootstrap. On a host with no local index
-    // (e.g. a read mirror, which serves semantic from a remote mesh host and
-    // keeps `indexed/` empty by design) this makes `aicx search` / the MCP
-    // `aicx_search` fail-fast with `IndexNotBuilt` WITHOUT loading the
-    // embedder — so a client retrying a deterministically-missing index does
-    // not pay a model/config bootstrap (the most expensive step) on every
-    // call. Functionally identical to checking after; the order is what saves
-    // the CPU.
-    let project_index_path = crate::vector_index::index_path(project_filter).map_err(|err| {
-        SemanticError::IndexNotBuilt {
-            path: std::path::PathBuf::new(),
-            reason: format!("could not resolve index path: {err}"),
-            recommendation: "ensure $AICX_HOME (or $HOME) is writable, then run `aicx index`"
-                .to_string(),
+    let legacy_dense = candidate_filters.map(|f| f.legacy_dense).unwrap_or(false);
+    // Resolve one explicit storage contract before paying embedder startup:
+    //
+    // - normal `--deep`: global source-driven hybrid CURRENT manifest only;
+    // - explicit `--legacy-dense`: retired primary NDJSON only.
+    //
+    // These cones never fall through into each other. In particular, an
+    // absent/corrupt CURRENT must not silently resurrect embeddings.ndjson.
+    let (path, retrieval_project_filter, used_global_project_scope) = if legacy_dense {
+        let project_path = crate::vector_index::index_path(project_filter).map_err(|error| {
+            SemanticError::IndexNotBuilt {
+                path: std::path::PathBuf::new(),
+                reason: format!("could not resolve explicit legacy dense index: {error}"),
+                recommendation: "remove `--legacy-dense` and run `aicx index --dense`".to_string(),
+            }
+        })?;
+        let global_path = if project_filter.is_some() {
+            crate::vector_index::index_path(None).map_err(|error| SemanticError::IndexNotBuilt {
+                path: std::path::PathBuf::new(),
+                reason: format!("could not resolve global legacy dense index: {error}"),
+                recommendation: "remove `--legacy-dense` and run `aicx index --dense`".to_string(),
+            })?
+        } else {
+            project_path.clone()
+        };
+        if global_path.is_file() {
+            (global_path, project_filter, project_filter.is_some())
+        } else if project_path.is_file() {
+            (project_path, project_filter, false)
+        } else {
+            return Err(SemanticError::IndexNotBuilt {
+                path: if project_filter.is_some() {
+                    project_path
+                } else {
+                    global_path
+                },
+                reason: "explicit legacy dense index is not present".to_string(),
+                recommendation:
+                    "remove `--legacy-dense` and run `aicx index --dense` to use CURRENT"
+                        .to_string(),
+            });
         }
-    })?;
-    let all_index_path = if project_filter.is_some() {
-        crate::vector_index::index_path(None).map_err(|err| SemanticError::IndexNotBuilt {
-            path: std::path::PathBuf::new(),
-            reason: format!("could not resolve _all index path: {err}"),
-            recommendation: "ensure $AICX_HOME (or $HOME) is writable, then run `aicx index`"
-                .to_string(),
-        })?
     } else {
-        project_index_path.clone()
+        let hybrid_root = crate::vector_index::hybrid_root_dir(None).map_err(|error| {
+            SemanticError::IndexNotBuilt {
+                path: std::path::PathBuf::new(),
+                reason: format!("could not resolve source-driven hybrid root: {error}"),
+                recommendation: "ensure $AICX_HOME is correct, then run `aicx index --dense`"
+                    .to_string(),
+            }
+        })?;
+        let generation_dir = crate::vector_index::resolve_current_generation_dir(&hybrid_root)
+            .map_err(|error| SemanticError::IndexNotBuilt {
+                path: hybrid_root.join("CURRENT"),
+                reason: format!("source-driven dense CURRENT is unavailable: {error:#}"),
+                recommendation:
+                    "run `aicx index --dense` to build or resume the optional dense generation"
+                        .to_string(),
+            })?;
+        let manifest_path = generation_dir.join("manifest.json");
+        if !manifest_path.is_file() {
+            return Err(SemanticError::IndexNotBuilt {
+                path: manifest_path.clone(),
+                reason: format!(
+                    "source-driven dense CURRENT is not published at {}",
+                    manifest_path.display()
+                ),
+                recommendation:
+                    "run `aicx index --dense` to build or resume the optional dense generation"
+                        .to_string(),
+            });
+        }
+        (manifest_path, project_filter, project_filter.is_some())
     };
-    let scope = select_semantic_bucket_scope(project_filter, project_index_path, all_index_path)?;
-    let path = scope.index_path.clone();
 
     // Touch the file once to surface IO errors early with a readable
     // recommendation.
@@ -1254,10 +1179,12 @@ fn try_semantic_search_native(
         return Err(SemanticError::IndexCorrupt {
             path: path.clone(),
             reason: format!("cannot stat index file: {err}"),
-            recommendation: format!(
-                "delete and rebuild: `rm -f {} && aicx index`",
-                path.display()
-            ),
+            recommendation: if legacy_dense {
+                "remove `--legacy-dense` and run `aicx index --dense`".to_string()
+            } else {
+                "run `aicx index --dense`; interrupted work will resume from its compatible checkpoint"
+                    .to_string()
+            },
         });
     }
 
@@ -1289,9 +1216,9 @@ fn try_semantic_search_native(
     let info = engine.info().clone();
     let embedder_dim = info.dimension;
 
-    // Read header line first so we can detect dimension mismatch BEFORE
-    // touching any vectors.
-    if let Some(header) = read_index_header(&path) {
+    // The retired NDJSON reader owns its own header contract. Canonical deep
+    // search validates dimension/model/source bindings from manifest+mmap.
+    if legacy_dense && let Some(header) = read_index_header(&path) {
         if header.dimension != embedder_dim {
             return Err(SemanticError::DimensionMismatch {
                 path: path.clone(),
@@ -1301,10 +1228,9 @@ fn try_semantic_search_native(
                     "index built with dimension={} (model {}), current embedder is dimension={} (model {})",
                     header.dimension, header.model_id, embedder_dim, info.model_id
                 ),
-                recommendation: format!(
-                    "rebuild the index with the current embedder: `rm -f {} && aicx index`",
-                    path.display()
-                ),
+                recommendation:
+                    "remove `--legacy-dense` and run `aicx index --dense` with the current embedder"
+                        .to_string(),
             });
         }
         if header.entry_count == 0 && index_appears_empty(&path) {
@@ -1314,8 +1240,8 @@ fn try_semantic_search_native(
                     "index file at {} contains 0 entries — corpus may be empty or all chunks failed to embed",
                     path.display()
                 ),
-                recommendation: "run `aicx extract --all` to populate the canonical corpus, \
-                     then rebuild: `aicx index`"
+                recommendation: "run `aicx extract --all`, then publish CURRENT with \
+                     `aicx index --dense` and omit `--legacy-dense`"
                     .to_string(),
             });
         }
@@ -1352,17 +1278,7 @@ fn try_semantic_search_native(
         });
     }
 
-    let manifest_path =
-        crate::vector_index::hybrid_manifest_path(scope.index_project).map_err(|err| {
-            SemanticError::IndexCorrupt {
-                path: path.clone(),
-                reason: format!("could not resolve hybrid manifest path: {err}"),
-                recommendation: "ensure $AICX_HOME (or $HOME) is writable, then run `aicx index`"
-                    .to_string(),
-            }
-        })?;
-    // Embed the query once — both the hybrid path and the dense-only
-    // fallback need the query vector.
+    // Embed the query once after the selected storage contract is present.
     let query_embedding = match engine.embed(query) {
         Ok(embedding) => embedding,
         Err(err) => {
@@ -1376,12 +1292,10 @@ fn try_semantic_search_native(
         }
     };
 
-    let legacy_dense = candidate_filters.map(|f| f.legacy_dense).unwrap_or(false);
-
     let retrieval_filters = SemanticRetrievalFilters {
         kind: kind_filter,
         frame_kind: frame_kind_filter,
-        project: scope.retrieval_project_filter,
+        project: retrieval_project_filter,
         agent: candidate_filters.and_then(|filters| filters.agent.as_deref()),
         date: candidate_filters.and_then(candidate_exact_date),
         candidate_filters,
@@ -1391,12 +1305,12 @@ fn try_semantic_search_native(
     // hybrid generation entirely and truthfully reports the old primary
     // NDJSON reader as a degraded dense-only execution path.
     if legacy_dense {
-        let backend_label = if scope.used_global_project_scope {
+        let backend_label = if used_global_project_scope {
             BACKEND_SEMANTIC_LEGACY_DENSE_GLOBAL_SCOPED
         } else {
             BACKEND_SEMANTIC_LEGACY_DENSE
         };
-        return query_dense_only_from_primary_filtered(
+        return query_explicit_legacy_dense(
             &path,
             &query_embedding,
             embedder_dim,
@@ -1408,35 +1322,10 @@ fn try_semantic_search_native(
         .map(|outcome| (outcome, CandidateBoundary::default()));
     }
 
-    // A missing manifest means no hybrid generation was ever published, so
-    // the committed primary index may serve an explicit dense-only fallback.
-    // Once a manifest exists it is authoritative: stale/corrupt generation
-    // state fails closed and never activates the old reader implicitly.
-    let hybrid = if manifest_path.exists() {
-        // A published manifest is authoritative. Any parse, binding, lexical,
-        // or mmap failure is corruption/staleness and must escape as a typed
-        // error; reading the old primary NDJSON here would hide a broken
-        // generation behind stale data.
-        load_hybrid_index(scope.index_project, &path, &info, &manifest_path)?
-    } else {
-        // Manifest was never committed — serve dense-only directly from the
-        // primary committed index (already validated above: exists, correct
-        // dimension, non-empty).
-        return query_dense_only_from_primary_filtered(
-            &path,
-            &query_embedding,
-            embedder_dim,
-            limit,
-            retrieval_filters,
-            &info.model_id,
-            if scope.used_global_project_scope {
-                BACKEND_SEMANTIC_DENSE_ONLY_GLOBAL_SCOPED
-            } else {
-                BACKEND_SEMANTIC_DENSE_ONLY
-            },
-        )
-        .map(|outcome| (outcome, CandidateBoundary::default()));
-    };
+    // Canonical deep search has exactly one reader: the published global
+    // source-driven CURRENT. Any manifest/binding/artifact failure escapes as
+    // a typed error; there is no implicit NDJSON recovery branch.
+    let hybrid = load_hybrid_index(&info, &path)?;
     let manifest = hybrid.manifest().cloned();
     let filters = hybrid_filters(retrieval_filters);
     let extra_filter_active = candidate_filters.is_some_and(supported_candidate_filter_active);
@@ -1472,7 +1361,7 @@ fn try_semantic_search_native(
             let path = hit_path(&h);
             let score_pct = hybrid_score_pct(h.score);
             let matched_lines = semantic_preview_lines(&path);
-            let label_backend = if scope.used_global_project_scope {
+            let label_backend = if used_global_project_scope {
                 BACKEND_HYBRID_RRF_GLOBAL_SCOPED
             } else {
                 BACKEND_HYBRID_RRF
@@ -1501,7 +1390,7 @@ fn try_semantic_search_native(
         SemanticOutcome {
             results,
             scanned,
-            backend_label: if scope.used_global_project_scope {
+            backend_label: if used_global_project_scope {
                 BACKEND_HYBRID_RRF_GLOBAL_SCOPED
             } else {
                 BACKEND_HYBRID_RRF
@@ -1515,8 +1404,6 @@ fn try_semantic_search_native(
 
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
 fn load_hybrid_index(
-    project_filter: Option<&str>,
-    source_index_path: &std::path::Path,
     info: &crate::embedder::EmbeddingModelInfo,
     manifest_path: &std::path::Path,
 ) -> std::result::Result<aicx_retrieve::HybridIndex, SemanticError> {
@@ -1527,43 +1414,37 @@ fn load_hybrid_index(
         SemanticError::RetrievalManifestStale {
             path: manifest_path.to_path_buf(),
             reason: format!("could not read retrieval manifest: {err}"),
-            recommendation: "run `aicx index` to rebuild the hybrid retrieval bucket".to_string(),
+            recommendation: "run `aicx index --dense` to rebuild the hybrid retrieval bucket"
+                .to_string(),
         }
     })?;
-    let manifest_dir = crate::vector_index::hybrid_index_dir(project_filter).map_err(|err| {
-        SemanticError::RetrievalManifestStale {
-            path: manifest_path.to_path_buf(),
-            reason: format!("could not resolve hybrid index dir: {err}"),
-            recommendation: "run `aicx index` to rebuild the hybrid retrieval bucket".to_string(),
-        }
-    })?;
-    // Do NOT re-hash the multi-GB primary NDJSON on the search hot path —
-    // that alone made global search hang for tens of seconds. Generation
-    // bindings (lexical commit, dense count/kind, embedder fingerprint)
-    // still validate the published CURRENT generation.
-    let _ = source_index_path;
-    let lexical = Box::new(
-        aicx_retrieve::TantivyAdapter::new(manifest_dir.clone()).map_err(|err| {
-            SemanticError::RetrievalManifestStale {
+    let manifest_dir =
+        manifest_path
+            .parent()
+            .ok_or_else(|| SemanticError::RetrievalManifestStale {
                 path: manifest_path.to_path_buf(),
-                reason: format!("could not open hybrid lexical artifact: {err:#}"),
-                recommendation: "run `aicx index` to rebuild the committed hybrid artifacts"
+                reason: "CURRENT manifest has no generation directory".to_string(),
+                recommendation: "run `aicx index --dense` to rebuild the hybrid retrieval bucket"
                     .to_string(),
-            }
-        })?,
-    );
+            })?;
+    // Generation bindings (lexical commit, dense count/kind, embedder
+    // fingerprint) validate CURRENT directly; no primary NDJSON participates.
+    let lexical =
+        Box::new(
+            aicx_retrieve::TantivyAdapter::new(manifest_dir.to_path_buf()).map_err(|err| {
+                SemanticError::RetrievalManifestStale {
+                    path: manifest_path.to_path_buf(),
+                    reason: format!("could not open hybrid lexical artifact: {err:#}"),
+                    recommendation:
+                        "run `aicx index --dense` to rebuild the committed hybrid artifacts"
+                            .to_string(),
+                }
+            })?,
+        );
 
     let dense: Box<dyn aicx_retrieve::DenseIndex> = match manifest.dense_kind.as_str() {
         aicx_retrieve::MMAP_DENSE_KIND => {
-            let mmap_path =
-                crate::vector_index::hybrid_dense_mmap_path(project_filter).map_err(|err| {
-                    SemanticError::RetrievalManifestStale {
-                        path: manifest_path.to_path_buf(),
-                        reason: format!("could not resolve hybrid dense mmap path: {err}"),
-                        recommendation: "run `aicx index` to rebuild the hybrid retrieval bucket"
-                            .to_string(),
-                    }
-                })?;
+            let mmap_path = manifest_dir.join(aicx_retrieve::MMAP_DENSE_PAYLOAD_FILE_NAME);
             if !mmap_path.exists() {
                 return Err(SemanticError::RetrievalManifestStale {
                     path: manifest_path.to_path_buf(),
@@ -1571,8 +1452,9 @@ fn load_hybrid_index(
                         "hybrid dense mmap artifact is missing at {}",
                         mmap_path.display()
                     ),
-                    recommendation: "run `aicx index` to rebuild the committed hybrid artifacts"
-                        .to_string(),
+                    recommendation:
+                        "run `aicx index --dense` to rebuild the committed hybrid artifacts"
+                            .to_string(),
                 });
             }
             let expected_distance = match manifest.embedder_distance.as_str() {
@@ -1583,7 +1465,7 @@ fn load_hybrid_index(
                     return Err(SemanticError::RetrievalManifestStale {
                         path: manifest_path.to_path_buf(),
                         reason: format!("unknown embedder distance in manifest: {other}"),
-                        recommendation: "run `aicx index` to rebuild the hybrid retrieval bucket"
+                        recommendation: "run `aicx index --dense` to rebuild the hybrid CURRENT"
                             .to_string(),
                     });
                 }
@@ -1594,7 +1476,7 @@ fn load_hybrid_index(
             .map_err(|err| SemanticError::RetrievalManifestStale {
                 path: manifest_path.to_path_buf(),
                 reason: format!("could not decode source hash: {err}"),
-                recommendation: "run `aicx index` to rebuild the hybrid retrieval bucket"
+                recommendation: "run `aicx index --dense` to rebuild the hybrid CURRENT"
                     .to_string(),
             })?;
             Box::new(
@@ -1607,8 +1489,9 @@ fn load_hybrid_index(
                 .map_err(|err| SemanticError::RetrievalManifestStale {
                     path: manifest_path.to_path_buf(),
                     reason: format!("could not open hybrid dense mmap artifact: {err:#}"),
-                    recommendation: "run `aicx index` to rebuild the committed hybrid artifacts"
-                        .to_string(),
+                    recommendation:
+                        "run `aicx index --dense` to rebuild the committed hybrid artifacts"
+                            .to_string(),
                 })?,
             )
         }
@@ -1617,7 +1500,7 @@ fn load_hybrid_index(
                 path: manifest_path.to_path_buf(),
                 reason: "published hybrid manifest names the retired NDJSON dense adapter"
                     .to_string(),
-                recommendation: "run `aicx index` to publish an mmap generation, or explicitly use `aicx search --legacy-dense` for recovery"
+                recommendation: "run `aicx index --dense` to publish an mmap generation, or explicitly use `aicx search --legacy-dense` for recovery"
                     .to_string(),
             });
         }
@@ -1625,8 +1508,8 @@ fn load_hybrid_index(
             return Err(SemanticError::RetrievalManifestStale {
                 path: manifest_path.to_path_buf(),
                 reason: format!("unsupported dense index kind: {other}"),
-                recommendation: "run `aicx index` to rebuild the committed hybrid artifacts"
-                    .to_string(),
+                recommendation:
+                    "run `aicx index --dense` to rebuild the committed hybrid artifacts".to_string(),
             });
         }
     };
@@ -1637,7 +1520,7 @@ fn load_hybrid_index(
         lexical,
         dense,
         fusion,
-        manifest_dir,
+        manifest_dir.to_path_buf(),
         fingerprint,
         None,
     )
@@ -1645,24 +1528,19 @@ fn load_hybrid_index(
         path: manifest_path.to_path_buf(),
         reason: format!("hybrid retrieval manifest does not match live artifacts: {err:#}"),
         recommendation:
-            "run `aicx index` to rebuild lexical+dense artifacts from the canonical corpus"
+            "run `aicx index --dense` to rebuild lexical+dense artifacts from the canonical corpus"
                 .to_string(),
     })
 }
 
-/// Dense-only semantic fallback that reads the PRIMARY committed index
+/// Explicit legacy recovery reader for the PRIMARY committed index
 /// (`index_path` = `vector_index::index_path`, i.e. `indexed/<bucket>/embeddings.ndjson`)
 /// directly, bypassing the hybrid manifest + tantivy lexical layer entirely.
 ///
-/// Engaged only when no hybrid manifest has been published, or when the
-/// operator explicitly selects `--legacy-dense`. A present but invalid
-/// generation fails closed instead of reading stale primary vectors.
-///
-/// This is NOT the doctrinal "silent fuzzy fallback" (see module docs): it is
-/// explicit semantic search over real embeddings, surfaced via
-/// `backend_label = "semantic_dense_only"` or `"semantic_legacy_dense"`.
+/// Engaged only when the operator explicitly selects `--legacy-dense`.
+/// Canonical deep search has no call edge into this reader.
 #[cfg(all(any(feature = "native-embedder", feature = "cloud-embedder"), test))]
-fn query_dense_only_from_primary(
+fn query_explicit_legacy_dense_for_test(
     index_path: &std::path::Path,
     query_embedding: &[f32],
     dim: usize,
@@ -1671,7 +1549,7 @@ fn query_dense_only_from_primary(
     model_id: &str,
     used_global_project_scope: bool,
 ) -> std::result::Result<SemanticOutcome, SemanticError> {
-    query_dense_only_from_primary_filtered(
+    query_explicit_legacy_dense(
         index_path,
         query_embedding,
         dim,
@@ -1679,15 +1557,15 @@ fn query_dense_only_from_primary(
         filters,
         model_id,
         if used_global_project_scope {
-            BACKEND_SEMANTIC_DENSE_ONLY_GLOBAL_SCOPED
+            BACKEND_SEMANTIC_LEGACY_DENSE_GLOBAL_SCOPED
         } else {
-            BACKEND_SEMANTIC_DENSE_ONLY
+            BACKEND_SEMANTIC_LEGACY_DENSE
         },
     )
 }
 
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
-fn query_dense_only_from_primary_filtered(
+fn query_explicit_legacy_dense(
     index_path: &std::path::Path,
     query_embedding: &[f32],
     dim: usize,
@@ -1706,11 +1584,9 @@ fn query_dense_only_from_primary_filtered(
     )
     .map_err(|err| SemanticError::IndexCorrupt {
         path: index_path.to_path_buf(),
-        reason: format!("dense-only fallback could not read committed index: {err:#}"),
-        recommendation: format!(
-            "delete and rebuild: `rm -f {} && aicx index`",
-            index_path.display()
-        ),
+        reason: format!("explicit legacy dense reader could not read committed index: {err:#}"),
+        recommendation: "remove `--legacy-dense` and publish CURRENT with `aicx index --dense`"
+            .to_string(),
     })?;
 
     // Defensive dimension guard: a committed index built with a different
@@ -1723,13 +1599,11 @@ fn query_dense_only_from_primary_filtered(
             index_dim: header.dimension,
             embedder_dim: dim,
             reason: format!(
-                "dense-only fallback: committed index dimension={} (model {}), current embedder dimension={}",
+                "explicit legacy dense index dimension={} (model {}), current embedder dimension={}",
                 header.dimension, header.model_id, dim
             ),
-            recommendation: format!(
-                "rebuild with the current embedder: `rm -f {} && aicx index`",
-                index_path.display()
-            ),
+            recommendation: "remove `--legacy-dense` and publish CURRENT with `aicx index --dense`"
+                .to_string(),
         });
     }
 
@@ -1737,10 +1611,11 @@ fn query_dense_only_from_primary_filtered(
         return Err(SemanticError::EmptyIndex {
             path: index_path.to_path_buf(),
             reason: format!(
-                "dense-only fallback: committed index at {} contains 0 entries",
+                "explicit legacy dense index at {} contains 0 entries",
                 index_path.display()
             ),
-            recommendation: "run `aicx extract --all` to populate the corpus, then `aicx index`"
+            recommendation: "run `aicx extract --all`, then publish CURRENT with \
+                 `aicx index --dense` and omit `--legacy-dense`"
                 .to_string(),
         });
     }
@@ -1784,19 +1659,18 @@ fn query_dense_only_from_primary_filtered(
     let mut dense = BruteForceAdapter::new(dim).with_distance(Distance::Cosine);
     DenseIndex::build(&mut dense, &dense_chunks).map_err(|err| SemanticError::IndexCorrupt {
         path: index_path.to_path_buf(),
-        reason: format!("dense-only fallback could not build in-memory dense index: {err:#}"),
-        recommendation: format!(
-            "delete and rebuild: `rm -f {} && aicx index`",
-            index_path.display()
-        ),
+        reason: format!("explicit legacy dense reader could not build in-memory index: {err:#}"),
+        recommendation: "remove `--legacy-dense` and publish CURRENT with `aicx index --dense`"
+            .to_string(),
     })?;
 
     let filter_set = hybrid_filters(filters);
     let hits = DenseIndex::query(&dense, query_embedding, limit, &filter_set).map_err(|err| {
         SemanticError::IndexCorrupt {
             path: index_path.to_path_buf(),
-            reason: format!("dense-only fallback query failed: {err:#}"),
-            recommendation: "retry; if it persists rebuild with `aicx index`".to_string(),
+            reason: format!("explicit legacy dense query failed: {err:#}"),
+            recommendation: "remove `--legacy-dense` and publish CURRENT with `aicx index --dense`"
+                .to_string(),
         }
     })?;
 
@@ -1807,9 +1681,9 @@ fn query_dense_only_from_primary_filtered(
             let score_pct = dense_score_pct(h.score);
             let matched_lines = semantic_preview_lines(&path);
             let label = if used_global_project_scope {
-                format!("dense_only_global_scoped:{}", h.chunk_id)
+                format!("legacy_dense_global_scoped:{}", h.chunk_id)
             } else {
-                format!("dense_only:{}", h.chunk_id)
+                format!("legacy_dense:{}", h.chunk_id)
             };
             FuzzyResult {
                 file: path.to_string_lossy().to_string(),
@@ -1952,23 +1826,12 @@ pub fn semantic_retrieval_outcome(
     stale_evidence: bool,
 ) -> RetrievalOutcome {
     let legacy_dense = backend_label.starts_with(BACKEND_SEMANTIC_LEGACY_DENSE);
-    let dense_only = backend_label.starts_with(BACKEND_SEMANTIC_DENSE_ONLY);
     let lexical = backend_label.starts_with(BACKEND_LEXICAL);
     let (executed_path, fallback_reason, requested_mode) = if legacy_dense {
         (
             Some(ExecutedPath::DenseOnly),
             Some(
                 "operator_selected_legacy_dense: served brute-force cosine from the committed primary NDJSON index"
-                    .to_string(),
-            ),
-            RequestedMode::Hybrid,
-        )
-    } else if dense_only {
-        (
-            Some(ExecutedPath::DenseOnly),
-            Some(
-                "hybrid_unavailable: lexical fusion leg missing or stale; served dense-only \
-                 cosine from the committed primary index"
                     .to_string(),
             ),
             RequestedMode::Hybrid,
@@ -3725,30 +3588,29 @@ mod tests {
         );
     }
 
-    /// Patch 3 / Bug B+ observability: the dense-only degraded path must NOT
-    /// render as a healthy hybrid query. It must say so out loud (operator
-    /// sees the quality drop), not silently claim `index=hybrid fallback=none`.
+    /// Explicit legacy recovery must never render as a healthy hybrid query.
     #[test]
-    fn semantic_status_line_flags_dense_only_as_degraded() {
-        let retrieval = semantic_retrieval_outcome("semantic_dense_only", None, 227_290, 5, false);
+    fn semantic_status_line_flags_explicit_legacy_dense_as_degraded() {
+        let retrieval =
+            semantic_retrieval_outcome(BACKEND_SEMANTIC_LEGACY_DENSE, None, 227_290, 5, false);
         let line = render_semantic_status_line(
-            "semantic_dense_only",
+            BACKEND_SEMANTIC_LEGACY_DENSE,
             Some("qwen3-embedding-8b"),
             &retrieval,
             None,
         );
-        assert!(line.contains("backend=semantic_dense_only"));
+        assert!(line.contains("backend=semantic_legacy_dense"));
         assert!(
             !line.contains("index=hybrid"),
-            "dense-only must not claim index=hybrid: {line}"
+            "legacy dense must not claim index=hybrid: {line}"
         );
         assert!(
             !line.contains("fallback=none"),
-            "dense-only is a fallback; must not claim fallback=none: {line}"
+            "legacy dense is explicit recovery; must not claim fallback=none: {line}"
         );
         assert!(
-            line.contains("degraded") && line.contains("fallback=hybrid_unavailable"),
-            "dense-only must surface degraded status explicitly: {line}"
+            line.contains("degraded") && line.contains("fallback=operator_selected_legacy_dense"),
+            "legacy dense must surface degraded status explicitly: {line}"
         );
         assert!(line.contains("completeness=degraded"), "line was: {line}");
     }
@@ -3788,16 +3650,15 @@ mod tests {
         );
     }
 
-    /// World-model contract: the typed mapping refuses to invent execution
-    /// evidence. Legacy semantic success without a manifest is unknown, the
-    /// dense-only label is degraded with a reason, hybrid+manifest is complete.
+    /// World-model contract: untyped semantic success is unknown, explicit
+    /// legacy recovery is degraded, and hybrid+manifest is complete.
     #[test]
     fn semantic_retrieval_outcome_maps_evidence_not_labels_to_health() {
         let legacy = semantic_retrieval_outcome("embedded_semantic", None, 100, 5, false);
         assert_eq!(legacy.completeness, RetrievalCompleteness::Unknown);
         assert_eq!(legacy.executed_path, ExecutedPath::None);
 
-        let dense = semantic_retrieval_outcome(BACKEND_SEMANTIC_DENSE_ONLY, None, 1000, 5, false);
+        let dense = semantic_retrieval_outcome(BACKEND_SEMANTIC_LEGACY_DENSE, None, 1000, 5, false);
         assert_eq!(dense.completeness, RetrievalCompleteness::Degraded);
         assert_eq!(dense.executed_path, ExecutedPath::DenseOnly);
         assert!(
@@ -3805,7 +3666,7 @@ mod tests {
                 .fallback_reason
                 .as_deref()
                 .unwrap()
-                .starts_with("hybrid_unavailable")
+                .starts_with("operator_selected_legacy_dense")
         );
 
         let status = HybridRetrievalStatus {
@@ -3820,63 +3681,6 @@ mod tests {
         assert_eq!(hybrid.completeness, RetrievalCompleteness::Complete);
         assert_eq!(hybrid.executed_path, ExecutedPath::HybridFusion);
         assert_eq!(hybrid.fallback_reason, None);
-    }
-
-    /// Project-filter queries use the global `_all` generation with metadata
-    /// pushdown when the project shard is absent.
-    #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
-    #[test]
-    fn project_bucket_missing_falls_back_to_global_with_filter() {
-        let dir =
-            std::env::temp_dir().join(format!("aicx-semantic-global-scope-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("create temp dir");
-        let project_index_path = dir.join("vetcoders_vista").join("embeddings.ndjson");
-        let all_index_path = dir.join("_all").join("embeddings.ndjson");
-        std::fs::create_dir_all(all_index_path.parent().unwrap()).expect("create all bucket");
-        std::fs::write(&all_index_path, "{}\n").expect("touch all index");
-
-        let scope = select_semantic_bucket_scope(
-            Some("vetcoders/vista"),
-            project_index_path.clone(),
-            all_index_path.clone(),
-        )
-        .expect("global fallback");
-
-        assert_eq!(scope.index_path, all_index_path);
-        assert_eq!(scope.index_project, None);
-        assert_eq!(scope.retrieval_project_filter, Some("vetcoders/vista"));
-        assert!(scope.used_global_project_scope);
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Global `_all` is preferred over a project shard when both exist.
-    #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
-    #[test]
-    fn global_bucket_preferred_over_project_shard() {
-        let dir =
-            std::env::temp_dir().join(format!("aicx-project-shard-select-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let project_index_path = dir.join("target").join("embeddings.ndjson");
-        let all_index_path = dir.join("_all").join("embeddings.ndjson");
-        std::fs::create_dir_all(project_index_path.parent().unwrap()).expect("project dir");
-        std::fs::create_dir_all(all_index_path.parent().unwrap()).expect("global dir");
-        std::fs::write(&project_index_path, "target\n").expect("project index");
-        std::fs::write(&all_index_path, "foreign\n").expect("global index");
-
-        let scope = select_semantic_bucket_scope(
-            Some("vetcoders/target"),
-            project_index_path,
-            all_index_path.clone(),
-        )
-        .expect("global preferred");
-
-        assert_eq!(scope.index_path, all_index_path);
-        assert_eq!(scope.index_project, None);
-        assert_eq!(scope.retrieval_project_filter, Some("vetcoders/target"));
-        assert!(scope.used_global_project_scope);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
@@ -3894,8 +3698,8 @@ mod tests {
     }
 
     /// A published but corrupt manifest is a typed stale-generation error.
-    /// The caller propagates this error and may only use the primary NDJSON
-    /// path when the manifest is absent or the operator chose --legacy-dense.
+    /// The caller propagates this error; canonical deep search never opens the
+    /// retired primary NDJSON path.
     #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
     #[test]
     fn corrupt_published_manifest_fails_before_any_adapter_is_opened() {
@@ -3915,7 +3719,7 @@ mod tests {
             source: aicx_embeddings::NativeEmbeddingSource::ExplicitPath(dir.join("model.gguf")),
         };
 
-        let err = load_hybrid_index(None, &dir.join("missing.ndjson"), &info, &manifest_path)
+        let err = load_hybrid_index(&info, &manifest_path)
             .expect_err("corrupt published manifest must fail closed");
         assert!(matches!(err, SemanticError::RetrievalManifestStale { .. }));
         assert!(err.reason().contains("could not read retrieval manifest"));
@@ -3928,7 +3732,7 @@ mod tests {
     /// project.
     #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
     #[test]
-    fn dense_only_global_index_project_filter_is_strict_before_limit() {
+    fn explicit_legacy_dense_global_index_project_filter_is_strict_before_limit() {
         use crate::vector_index::{IndexEntry, IndexHeader};
         use std::io::Write;
 
@@ -3993,7 +3797,7 @@ mod tests {
         }
 
         let query = vec![1.0_f32, 0.0, 0.0];
-        let outcome = query_dense_only_from_primary(
+        let outcome = query_explicit_legacy_dense_for_test(
             &index_path,
             &query,
             3,
@@ -4002,7 +3806,7 @@ mod tests {
             "test-model",
             false,
         )
-        .expect("dense-only global query should retain requested project hits");
+        .expect("explicit legacy global query should retain requested project hits");
 
         assert_eq!(outcome.results.len(), 1);
         assert_eq!(outcome.results[0].project, "vetcoders/vista");
@@ -4017,7 +3821,7 @@ mod tests {
 
     #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
     #[test]
-    fn dense_only_missing_project_is_true_empty_not_empty_index() {
+    fn explicit_legacy_dense_missing_project_is_true_empty_not_empty_index() {
         use crate::vector_index::{IndexEntry, IndexHeader};
         use std::io::Write;
 
@@ -4054,7 +3858,7 @@ mod tests {
             writeln!(file, "{}", serde_json::to_string(&entry).unwrap()).unwrap();
         }
 
-        let outcome = query_dense_only_from_primary(
+        let outcome = query_explicit_legacy_dense_for_test(
             &index_path,
             &[1.0, 0.0, 0.0],
             3,
@@ -4070,14 +3874,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Patch 3 / Bug B+: when the hybrid stack is unavailable, semantic
-    /// search must degrade to dense-only ranking over the PRIMARY committed
-    /// index instead of hard-failing. This proves the dense leg reads the
-    /// committed `embeddings.ndjson` directly, ranks by cosine, labels itself
-    /// `semantic_dense_only`, and surfaces the closest embedding first.
+    /// Explicit migration recovery reads the retired primary
+    /// `embeddings.ndjson` directly, ranks by cosine, labels itself as legacy,
+    /// and surfaces the closest embedding first. Canonical deep search has no
+    /// call edge into this helper.
     #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
     #[test]
-    fn dense_only_from_primary_ranks_by_cosine_without_hybrid() {
+    fn explicit_legacy_dense_ranks_by_cosine_without_hybrid() {
         use crate::vector_index::{IndexEntry, IndexHeader};
         use std::io::Write;
 
@@ -4123,7 +3926,7 @@ mod tests {
 
         // Query closest to entry_a's [1, 0, 0].
         let query = vec![0.9_f32, 0.1, 0.0];
-        let outcome = query_dense_only_from_primary(
+        let outcome = query_explicit_legacy_dense_for_test(
             &index_path,
             &query,
             3,
@@ -4132,11 +3935,11 @@ mod tests {
             "test-model",
             false,
         )
-        .expect("dense-only query should succeed on a valid primary index");
+        .expect("explicit legacy query should succeed on a valid primary index");
 
         assert_eq!(
-            outcome.backend_label, "semantic_dense_only",
-            "dense-only path must label itself explicitly, not as hybrid"
+            outcome.backend_label, "semantic_legacy_dense",
+            "explicit legacy path must label itself truthfully, not as hybrid"
         );
         assert!(
             !outcome.results.is_empty(),
@@ -4153,7 +3956,7 @@ mod tests {
 
     #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
     #[test]
-    fn dense_only_global_scope_labels_backend_explicitly() {
+    fn explicit_legacy_dense_global_scope_labels_backend_explicitly() {
         use crate::vector_index::{IndexEntry, IndexHeader};
         use std::io::Write;
 
@@ -4192,7 +3995,7 @@ mod tests {
             writeln!(f, "{}", serde_json::to_string(&entry).unwrap()).unwrap();
         }
 
-        let outcome = query_dense_only_from_primary(
+        let outcome = query_explicit_legacy_dense_for_test(
             &index_path,
             &[1.0, 0.0, 0.0],
             3,
@@ -4201,16 +4004,16 @@ mod tests {
             "test-model",
             true,
         )
-        .expect("dense-only global scoped query should succeed");
+        .expect("explicit legacy global scoped query should succeed");
 
         assert_eq!(
             outcome.backend_label,
-            BACKEND_SEMANTIC_DENSE_ONLY_GLOBAL_SCOPED
+            BACKEND_SEMANTIC_LEGACY_DENSE_GLOBAL_SCOPED
         );
         assert!(
             outcome.results[0]
                 .label
-                .starts_with("dense_only_global_scoped:"),
+                .starts_with("legacy_dense_global_scoped:"),
             "global-scoped hit label should be explicit, got {}",
             outcome.results[0].label
         );
@@ -4224,7 +4027,7 @@ mod tests {
     /// DimensionMismatch, not silently rank garbage.
     #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
     #[test]
-    fn dense_only_rejects_dimension_mismatch_instead_of_ranking_garbage() {
+    fn explicit_legacy_dense_rejects_dimension_mismatch_instead_of_ranking_garbage() {
         use crate::vector_index::{IndexEntry, IndexHeader};
         use std::io::Write;
 
@@ -4267,7 +4070,7 @@ mod tests {
 
         // ...but the current embedder is dimension 3.
         let query = vec![1.0_f32, 0.0, 0.0];
-        let err = query_dense_only_from_primary(
+        let err = query_explicit_legacy_dense_for_test(
             &index_path,
             &query,
             3,
@@ -4292,7 +4095,7 @@ mod tests {
     /// EmptyIndex (actionable), never panic or return an empty-but-Ok outcome.
     #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
     #[test]
-    fn dense_only_empty_index_is_typed_error_not_panic() {
+    fn explicit_legacy_dense_empty_index_is_typed_error_not_panic() {
         use crate::vector_index::IndexHeader;
         use std::io::Write;
 
@@ -4315,7 +4118,7 @@ mod tests {
         }
 
         let query = vec![1.0_f32, 0.0, 0.0];
-        let err = query_dense_only_from_primary(
+        let err = query_explicit_legacy_dense_for_test(
             &index_path,
             &query,
             3,

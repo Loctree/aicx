@@ -51,6 +51,10 @@ pub struct SourceIndexReport {
     pub filtered_frames: usize,
     pub extracts_written: usize,
     pub lexical_docs: usize,
+    pub dense_requested: bool,
+    pub dense_count: usize,
+    pub dense_reused: usize,
+    pub dense_newly_embedded: usize,
     pub unchanged: bool,
     pub wall_ms: u64,
     pub manifest_path: Option<String>,
@@ -182,8 +186,14 @@ pub fn build(
     dry_run: bool,
     full_rescan: bool,
     cache_extracts: bool,
+    dense: bool,
 ) -> Result<SourceIndexReport> {
     let started = Instant::now();
+    if dry_run && dense {
+        anyhow::bail!(
+            "`aicx index --dense` publishes an index and cannot be combined with --dry-run"
+        );
+    }
     if !dry_run && !project_filters.is_empty() {
         anyhow::bail!(
             "project-scoped index publishing is retired; run `aicx index` once for the global \
@@ -216,10 +226,19 @@ pub fn build(
     // latency the extracts-store cut was meant to kill. Use `--full-rescan` to
     // force a walk. Live source drift (append without catalog rebuild) moves
     // the digest so recent frames cannot stay invisible forever.
-    if !full_rescan
+    let hybrid_root = crate::vector_index::source_hybrid_root_at(aicx_home);
+    if !dense
+        && !full_rescan
         && project_filters.is_empty()
-        && crate::vector_index::source_lexical_generation_matches(&source_fingerprint)?
+        && crate::vector_index::source_generation_matches_at(
+            &hybrid_root,
+            &source_fingerprint,
+            None,
+        )?
     {
+        let manifest_path = crate::vector_index::resolve_current_generation_dir(&hybrid_root)?
+            .join("manifest.json");
+        let manifest = aicx_retrieve::Manifest::read_from_path(&manifest_path)?;
         return Ok(SourceIndexReport {
             catalog_path: catalog_path.display().to_string(),
             sources_total: selected.len(),
@@ -230,12 +249,14 @@ pub fn build(
             signal_frames: 0,
             filtered_frames: 0,
             extracts_written: 0,
-            lexical_docs: crate::vector_index::current_lexical_doc_count()?.unwrap_or(0),
+            lexical_docs: manifest.lexical_doc_count,
+            dense_requested: false,
+            dense_count: manifest.dense_count,
+            dense_reused: 0,
+            dense_newly_embedded: 0,
             unchanged: true,
             wall_ms: started.elapsed().as_millis() as u64,
-            manifest_path: crate::vector_index::hybrid_manifest_path(None)
-                .ok()
-                .map(|path| path.display().to_string()),
+            manifest_path: Some(manifest_path.display().to_string()),
             skipped_by_agent: BTreeMap::new(),
         });
     }
@@ -411,23 +432,90 @@ pub fn build(
         );
     }
 
+    let mut dense_count = 0usize;
+    let mut dense_reused = 0usize;
+    let mut dense_newly_embedded = 0usize;
+    let mut unchanged = false;
     let manifest_path = if dry_run {
         None
-    } else {
-        let manifest =
-            crate::vector_index::publish_source_lexical_generation(&chunks, &source_fingerprint)?;
-        // Persist parse state only after a successful publish so a killed build
-        // cannot claim sessions are current when CURRENT never flipped.
-        if cache_extracts && project_filters.is_empty() {
-            write_parse_state(aicx_home, &next_state)?;
+    } else if dense {
+        #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+        {
+            let mut engine = crate::embedder::EmbeddingEngine::new().with_context(|| {
+                "initialize the configured embedder for `aicx index --dense`; \
+                 check `aicx config show` and the configured model/endpoint"
+            })?;
+            let fingerprint = crate::vector_index::hybrid_embedder_fingerprint(engine.info());
+            if !full_rescan
+                && crate::vector_index::source_generation_matches_at(
+                    &hybrid_root,
+                    &source_fingerprint,
+                    Some(&fingerprint),
+                )?
+            {
+                dense_count = chunks.len();
+                unchanged = true;
+            } else {
+                let batch_size = engine.embed_batch_size();
+                let final_progress =
+                    std::cell::Cell::new(crate::vector_index::DenseBuildProgress {
+                        total: chunks.len(),
+                        reused: 0,
+                        completed: 0,
+                        newly_embedded: 0,
+                    });
+                let manifest = crate::vector_index::build_source_hybrid_generation_resumable(
+                    &chunks,
+                    &source_fingerprint,
+                    &hybrid_root,
+                    &fingerprint,
+                    &mut engine,
+                    crate::vector_index::DenseBuildOptions { batch_size },
+                    &|progress| final_progress.set(progress),
+                )
+                .with_context(|| {
+                    "build the requested dense generation; the previous CURRENT remains readable \
+                     and a compatible checkpoint can be resumed by rerunning `aicx index --dense`"
+                })?;
+                let progress = final_progress.get();
+                dense_count = manifest.dense_count;
+                dense_reused = progress.reused;
+                dense_newly_embedded = progress.newly_embedded;
+            }
+            Some(
+                crate::vector_index::resolve_current_generation_dir(&hybrid_root)?
+                    .join("manifest.json")
+                    .display()
+                    .to_string(),
+            )
         }
+        #[cfg(not(any(feature = "native-embedder", feature = "cloud-embedder")))]
+        {
+            anyhow::bail!(
+                "`aicx index --dense` is unavailable in this build; install a binary compiled \
+                 with `native-embedder` or `cloud-embedder`"
+            );
+        }
+    } else {
+        let manifest = crate::vector_index::publish_source_lexical_generation_at(
+            &chunks,
+            &source_fingerprint,
+            &hybrid_root,
+        )?;
+        dense_count = manifest.dense_count;
         Some(
-            crate::vector_index::hybrid_manifest_path(None)?
+            crate::vector_index::resolve_current_generation_dir(&hybrid_root)?
+                .join("manifest.json")
                 .display()
                 .to_string(),
         )
         .filter(|_| manifest.lexical_doc_count == chunks.len())
     };
+    // Persist parse state only after a successful publish so a killed build
+    // cannot claim sessions are current when CURRENT never flipped.
+    if manifest_path.is_some() && !unchanged && cache_extracts && project_filters.is_empty() {
+        write_parse_state(aicx_home, &next_state)?;
+    }
 
     Ok(SourceIndexReport {
         catalog_path: catalog_path.display().to_string(),
@@ -440,7 +528,11 @@ pub fn build(
         filtered_frames,
         extracts_written,
         lexical_docs: chunks.len(),
-        unchanged: false,
+        dense_requested: dense,
+        dense_count,
+        dense_reused,
+        dense_newly_embedded,
+        unchanged,
         wall_ms: started.elapsed().as_millis() as u64,
         manifest_path,
         skipped_by_agent,
@@ -510,7 +602,9 @@ pub fn current_search_coverage(aicx_home: &Path) -> SearchCoverage {
 
 fn current_indexed_session_keys() -> Result<HashSet<String>> {
     let hybrid_root = crate::vector_index::hybrid_root_dir(None)?;
-    let generation = crate::vector_index::resolve_hybrid_generation_dir(&hybrid_root);
+    let Ok(generation) = crate::vector_index::resolve_current_generation_dir(&hybrid_root) else {
+        return Ok(HashSet::new());
+    };
     if !generation.join("manifest.json").is_file() {
         return Ok(HashSet::new());
     }
@@ -1312,6 +1406,7 @@ mod tests {
         let error = build(
             &root,
             &["vetcoders/vibecrafted".to_string()],
+            false,
             false,
             false,
             false,

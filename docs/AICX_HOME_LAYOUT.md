@@ -52,9 +52,12 @@ Deleting the cache does not delete source truth.
 `indexed/_all/hybrid/CURRENT` names the published generation. Tantivy is the
 default query path. Dense mmap is optional and read only for `--deep`.
 
-Legacy `embeddings.ndjson` and `dense_brute_force.ndjson` are retired
-intermediates. Their deletion is an explicit operator action; AICX never
-removes `indexed/*` automatically.
+`aicx index` publishes lexical CURRENT without initializing an embedder.
+`aicx index --dense` builds or resumes the optional mmap payload, and
+`aicx search --deep` reads that exact CURRENT. Legacy `embeddings.ndjson` and
+`dense_brute_force.ndjson` are retired intermediates reachable only through
+the explicit `--legacy-dense` recovery path. Their deletion is an explicit
+operator action; AICX never removes `indexed/*` automatically.
 
 ## Residual old artifacts
 

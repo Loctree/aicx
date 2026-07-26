@@ -16,7 +16,7 @@ use aicx::vector_index::{
     BatchEmbedder, DenseBuildOptions, DenseBuildProgress, IndexEntry, IndexHeader,
     build_source_hybrid_generation_resumable, materialize_hybrid_generation,
     observed_source_hash_for_index_path, publish_source_hybrid_generation,
-    resolve_hybrid_generation_dir, source_dense_checkpoint_path,
+    resolve_current_generation_dir, resolve_hybrid_generation_dir, source_dense_checkpoint_path,
 };
 use aicx_retrieve::{
     ChunkRef, Distance, EmbedderFingerprint, FilterSet, LexicalQuery, MMAP_DENSE_KIND,
@@ -396,6 +396,20 @@ fn source_driven_generation_builds_aligned_lexical_and_dense_artifacts() {
     assert_eq!(manifest.lexical_doc_count, chunks.len());
     assert_eq!(manifest.dense_count, chunks.len());
     assert_eq!(manifest.dense_kind, MMAP_DENSE_KIND);
+    assert!(
+        aicx::vector_index::source_generation_matches_at(&hybrid_root, source_fingerprint, None,)
+            .expect("lexical no-op match"),
+        "a default lexical index run must preserve an already-complete dense CURRENT"
+    );
+    assert!(
+        aicx::vector_index::source_generation_matches_at(
+            &hybrid_root,
+            source_fingerprint,
+            Some(&fingerprint()),
+        )
+        .expect("dense no-op match"),
+        "the exact source/embedder identity should be a dense no-op"
+    );
     assert_eq!(
         manifest.source_hash_blake3,
         hex::encode(source_hash_bytes(source_fingerprint))
@@ -815,6 +829,10 @@ fn legacy_layout_without_pointer_resolves_to_root_for_migration_reads() {
         resolve_hybrid_generation_dir(&hybrid_root),
         hybrid_root,
         "legacy dual-file layout resolves to the root so migration reads keep working"
+    );
+    assert!(
+        resolve_current_generation_dir(&hybrid_root).is_err(),
+        "canonical readers must reject the same root layout without CURRENT"
     );
 
     let _ = std::fs::remove_dir_all(&root);

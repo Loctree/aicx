@@ -1650,8 +1650,8 @@ enum Commands {
     /// index run parses that snapshot, filters tool/internal/system noise, and
     /// atomically publishes a fresh Tantivy generation. With no `-p`, this is
     /// the `_all` index used by both global search and project-scoped
-    /// `search -p` queries. Dense vectors are optional and are not built by
-    /// this command.
+    /// `search -p` queries. Dense vectors are optional and are built only
+    /// when `--dense` is passed explicitly.
     #[command(display_order = 14)]
     Index {
         #[command(subcommand)]
@@ -1701,6 +1701,12 @@ enum Commands {
         /// Tantivy (zero filesystem content duplication).
         #[arg(long)]
         cache_extracts: bool,
+
+        /// Explicitly build or resume the optional mmap dense index using the
+        /// configured embedder. The default command remains lexical-only and
+        /// never initializes an embedding model or endpoint.
+        #[arg(long, conflicts_with = "dry_run")]
+        dense: bool,
     },
 
     /// Manage `$HOME/.aicx/config.toml` for embedders and endpoints.
@@ -2737,7 +2743,6 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
             legacy_dense,
             deep,
         }) => {
-            aicx::search_engine::LEGACY_DENSE_ACTIVE.with(|active| active.set(legacy_dense));
             run_search(SearchRunArgs {
                 query: &query,
                 projects: &project,
@@ -2751,6 +2756,7 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
                 context: context.unwrap_or(2),
                 no_semantic,
                 evidence,
+                legacy_dense,
                 deep,
                 project_match,
             })?;
@@ -2766,6 +2772,7 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
             dry_run,
             full_rescan,
             cache_extracts,
+            dense,
         }) => match action {
             Some(IndexAction::Status { project, json }) => {
                 run_index_status(&project, json)?;
@@ -2781,7 +2788,15 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
                 if !dry_run {
                     warn_pending_mutation("index");
                 }
-                run_index(&project, sample, json, dry_run, full_rescan, cache_extracts)?
+                run_index(
+                    &project,
+                    sample,
+                    json,
+                    dry_run,
+                    full_rescan,
+                    cache_extracts,
+                    dense,
+                )?
             }
         },
         Some(Commands::Config { action }) => {
@@ -7240,6 +7255,7 @@ struct SearchRunArgs<'a> {
     context: usize,
     no_semantic: bool,
     evidence: bool,
+    legacy_dense: bool,
     deep: bool,
     project_match: legacy_archive::ProjectMatchMode,
 }
@@ -7438,6 +7454,7 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
         context,
         no_semantic,
         evidence,
+        legacy_dense,
         deep,
         project_match,
     } = args;
@@ -7483,7 +7500,6 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
     } else {
         None
     };
-    let legacy_dense = aicx::search_engine::LEGACY_DENSE_ACTIVE.with(|active| active.get());
     let post_filters = aicx::search_engine::SemanticSearchFilters {
         agent: filters.agent.clone(),
         score_min: filters.score,
@@ -7891,6 +7907,7 @@ fn run_index(
     dry_run: bool,
     full_rescan: bool,
     cache_extracts: bool,
+    dense: bool,
 ) -> Result<()> {
     let resolved_scopes = resolve_index_scopes(projects)?;
     let filters: Vec<String> = resolved_scopes.into_iter().flatten().collect();
@@ -7902,8 +7919,14 @@ fn run_index(
             aicx::locks::lance_lock_path()?,
         )?)
     };
-    let report =
-        aicx::source_index::build(&aicx_home, &filters, dry_run, full_rescan, cache_extracts)?;
+    let report = aicx::source_index::build(
+        &aicx_home,
+        &filters,
+        dry_run,
+        full_rescan,
+        cache_extracts,
+        dense,
+    )?;
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
@@ -7931,6 +7954,13 @@ fn run_index(
             report.raw_frames, report.signal_frames, report.filtered_frames
         );
         eprintln!("  extracts_written: {}", report.extracts_written);
+        eprintln!(
+            "  dense: requested={} count={} reused={} newly_embedded={}",
+            report.dense_requested,
+            report.dense_count,
+            report.dense_reused,
+            report.dense_newly_embedded
+        );
         if let Some(path) = &report.manifest_path {
             eprintln!("  manifest: {path}");
         }
@@ -8154,6 +8184,16 @@ fn print_index_status_text(status: &aicx::IndexStatus) {
             .unwrap_or_else(|| "<unknown>".to_string())
     );
     eprintln!("  pending_chunks:         {}", status.pending_chunks);
+    eprintln!(
+        "  dense_state:            {}",
+        match status.dense_state {
+            aicx::DenseState::OptionalNotBuilt => "optional_not_built",
+            aicx::DenseState::Building => "building",
+            aicx::DenseState::Ready => "ready",
+            aicx::DenseState::Stale => "stale",
+        }
+    );
+    eprintln!("  dense_missing_count:    {}", status.dense_missing_count);
     eprintln!("  temp_index_present:     {}", status.temp_index_present);
     eprintln!(
         "  temp_index_path:        {}",

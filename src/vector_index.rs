@@ -1,25 +1,14 @@
-//! Vector index builder for `aicx` semantic search.
+//! Dense and hybrid index storage for `aicx` search.
 //!
-//! Goal: take readable legacy archive chunks and materialize a vector
-//! representation per chunk so compatibility search paths can rank
-//! by cosine similarity rather than line-overlap fuzzy. The index is
-//! configuration-driven so the same command works for the in-process
-//! native GGUF embedder ([`aicx_embeddings`]) and the cloud HTTP embed
-//! endpoint.
+//! Canonical indexing publishes source-driven generations below
+//! `indexed/_all/hybrid/generations/`, with `CURRENT` as the only runtime
+//! authority. Tantivy is always present; dense mmap is optional.
 //!
-//! Two surfaces:
+//! Retired NDJSON helpers remain for explicit migration and repair commands:
 //! - [`dry_run_index`]: probe the embedder, sample N chunks, embed them,
 //!   return stats. Used for ETA estimation before a full rebuild.
-//! - [`write_index`] / [`query_index`] (Iter 3): persistent NDJSON-backed
-//!   index per project at `~/.aicx/indexed/<bucket>/embeddings.ndjson`,
-//!   queryable via in-process cosine similarity.
-//!
-//! NDJSON over Lance for the MVP: each chunk is one JSON line
-//! (`{id, project, agent, date, path, embedding}`). One file per project
-//! bucket so per-project rebuilds and crashes do not corrupt others. Lance
-//! migration is a separate iteration once we validate the operator-side
-//! query patterns; the public API ([`query_index`]) stays the same so the
-//! storage swap is transparent to callers.
+//! - [`write_index`] / [`query_index`]: the old per-bucket
+//!   `embeddings.ndjson` format, never selected by canonical search.
 //!
 //! Vibecrafted with AI Agents by Vetcoders (c)2026 Vetcoders
 
@@ -554,6 +543,14 @@ pub fn hybrid_root_dir(project: Option<&str>) -> Result<PathBuf> {
         .ok_or_else(|| anyhow::anyhow!("index path has no parent: {}", path.display()))
 }
 
+/// Root of the source-driven global hybrid index under an explicit AICX home.
+///
+/// Build/status callers that already resolved `AICX_HOME` use this helper so
+/// publication cannot drift to a second process-global home.
+pub fn source_hybrid_root_at(aicx_home: &Path) -> PathBuf {
+    aicx_home.join("indexed").join("_all").join("hybrid")
+}
+
 /// Directory holding the published hybrid generation's artifacts
 /// (`manifest.json`, mmap dense payload, Tantivy lexical index).
 ///
@@ -564,13 +561,12 @@ pub fn hybrid_index_dir(project: Option<&str>) -> Result<PathBuf> {
     Ok(resolve_hybrid_generation_dir(&hybrid_root_dir(project)?))
 }
 
-/// Pure current-generation resolution over a hybrid root directory.
+/// Migration-compatible generation resolution over a hybrid root directory.
 ///
-/// Fail-closed contract: only a pointer naming an existing, path-safe
-/// directory under `generations/` redirects readers. Every corrupt state —
-/// missing pointer, empty or traversal-shaped name, missing target — resolves
-/// to the legacy root, so a failed or interrupted build can never alter
-/// current-generation resolution.
+/// A valid pointer names `generations/<name>`. Missing or corrupt pointers
+/// deliberately resolve to the retired root layout for status, doctor and
+/// migration tooling. Canonical search must use
+/// [`resolve_current_generation_dir`] instead.
 pub fn resolve_hybrid_generation_dir(hybrid_root: &Path) -> PathBuf {
     let pointer = hybrid_root.join(HYBRID_CURRENT_POINTER_FILE_NAME);
     let Ok(raw) = std::fs::read_to_string(&pointer) else {
@@ -586,6 +582,29 @@ pub fn resolve_hybrid_generation_dir(hybrid_root: &Path) -> PathBuf {
     } else {
         hybrid_root.to_path_buf()
     }
+}
+
+/// Resolve only a valid, published CURRENT generation.
+///
+/// Unlike [`resolve_hybrid_generation_dir`], this never falls back to the
+/// retired root layout. Canonical search uses this strict resolver so a
+/// missing, malformed, or dangling pointer cannot resurrect stale artifacts.
+pub fn resolve_current_generation_dir(hybrid_root: &Path) -> Result<PathBuf> {
+    let pointer = hybrid_root.join(HYBRID_CURRENT_POINTER_FILE_NAME);
+    let raw = std::fs::read_to_string(&pointer)
+        .with_context(|| format!("read CURRENT pointer {}", pointer.display()))?;
+    let name = raw.trim();
+    if !is_valid_generation_dir_name(name) {
+        anyhow::bail!("invalid CURRENT generation name in {}", pointer.display());
+    }
+    let candidate = hybrid_root.join(HYBRID_GENERATIONS_DIR_NAME).join(name);
+    if !candidate.is_dir() {
+        anyhow::bail!(
+            "CURRENT generation directory is missing at {}",
+            candidate.display()
+        );
+    }
+    Ok(candidate)
 }
 
 fn is_valid_generation_dir_name(name: &str) -> bool {
@@ -650,10 +669,22 @@ fn publish_hybrid_generation(hybrid_root: &Path, generation_dir: &Path) -> Resul
 
 /// Whether CURRENT already represents the same catalog/source fingerprint.
 ///
-/// Only lexical-only source generations qualify. Legacy store/NDJSON
-/// generations are never mistaken for a source-driven no-op.
+/// A dense source generation also qualifies: a later default lexical index
+/// run must preserve, not silently replace, the optional dense payload.
 pub fn source_lexical_generation_matches(source_fingerprint: &str) -> Result<bool> {
-    let path = hybrid_manifest_path(None)?;
+    let root = hybrid_root_dir(None)?;
+    source_generation_matches_at(&root, source_fingerprint, None)
+}
+
+pub fn source_generation_matches_at(
+    hybrid_root: &Path,
+    source_fingerprint: &str,
+    dense_fingerprint: Option<&aicx_retrieve::EmbedderFingerprint>,
+) -> Result<bool> {
+    let path = match resolve_current_generation_dir(hybrid_root) {
+        Ok(generation) => generation.join("manifest.json"),
+        Err(_) => return Ok(false),
+    };
     if !path.is_file() {
         return Ok(false);
     }
@@ -661,8 +692,24 @@ pub fn source_lexical_generation_matches(source_fingerprint: &str) -> Result<boo
         Ok(manifest) => manifest,
         Err(_) => return Ok(false),
     };
-    Ok(manifest.dense_kind == "optional_not_built"
-        && manifest.source_hash_blake3 == aicx_retrieve::source_hash_blake3(source_fingerprint))
+    if manifest.lexical_doc_count == 0
+        || manifest.source_hash_blake3 != aicx_retrieve::source_hash_blake3(source_fingerprint)
+    {
+        return Ok(false);
+    }
+    let Some(fingerprint) = dense_fingerprint else {
+        return Ok(true);
+    };
+    Ok(manifest.dense_kind == aicx_retrieve::MMAP_DENSE_KIND
+        && manifest.dense_count == manifest.lexical_doc_count
+        && manifest.embedder_model == fingerprint.model
+        && manifest.embedder_url_hash == fingerprint.url_hash
+        && manifest.embedder_dim == fingerprint.dim
+        && manifest.embedder_distance == fingerprint.distance
+        && path.parent().is_some_and(|dir| {
+            dir.join(aicx_retrieve::MMAP_DENSE_PAYLOAD_FILE_NAME)
+                .is_file()
+        }))
 }
 
 pub fn current_lexical_doc_count() -> Result<Option<usize>> {
@@ -684,12 +731,20 @@ pub fn publish_source_lexical_generation(
     chunks: &[aicx_retrieve::ChunkRef],
     source_fingerprint: &str,
 ) -> Result<aicx_retrieve::Manifest> {
+    let hybrid_root = hybrid_root_dir(None)?;
+    publish_source_lexical_generation_at(chunks, source_fingerprint, &hybrid_root)
+}
+
+pub fn publish_source_lexical_generation_at(
+    chunks: &[aicx_retrieve::ChunkRef],
+    source_fingerprint: &str,
+    hybrid_root: &Path,
+) -> Result<aicx_retrieve::Manifest> {
     use aicx_retrieve::{LexicalIndex, Manifest, TantivyAdapter};
 
     if chunks.is_empty() {
         anyhow::bail!("cannot publish an empty source lexical generation");
     }
-    let hybrid_root = hybrid_root_dir(None)?;
     let generation_dir = hybrid_root
         .join(HYBRID_GENERATIONS_DIR_NAME)
         .join(generation_dir_name(&Manifest::fresh_generation_id()));
@@ -723,7 +778,7 @@ pub fn publish_source_lexical_generation(
         fusion_k: aicx_retrieve::RRF_K_DEFAULT,
     };
     manifest.write_to_path(&generation_dir.join("manifest.json"))?;
-    publish_hybrid_generation(&hybrid_root, &generation_dir)?;
+    publish_hybrid_generation(hybrid_root, &generation_dir)?;
     Ok(manifest)
 }
 

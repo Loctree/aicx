@@ -243,6 +243,19 @@ pub enum IndexReadiness {
     PendingScanTimeout,
 }
 
+/// Independent state of the optional dense layer.
+///
+/// This deliberately does not replace [`IndexReadiness`]: lexical CURRENT can
+/// be ready while dense vectors have never been requested.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DenseState {
+    OptionalNotBuilt,
+    Building,
+    Ready,
+    Stale,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct IndexStatus {
     pub canonical_chunks: usize,
@@ -258,6 +271,10 @@ pub struct IndexStatus {
     pub semantic_index_mtime: Option<String>,
     pub semantic_lag_secs: Option<u64>,
     pub pending_chunks: usize,
+    /// Optional dense-layer state; independent from lexical readiness.
+    pub dense_state: DenseState,
+    /// Lexical CURRENT documents not represented in the dense payload.
+    pub dense_missing_count: usize,
     pub temp_index_present: bool,
     pub temp_index_path: Option<String>,
     pub temp_index_rows: usize,
@@ -352,6 +369,8 @@ fn index_status_at_with_sessions(
             semantic_index_mtime: None,
             semantic_lag_secs: None,
             pending_chunks: 0,
+            dense_state: DenseState::OptionalNotBuilt,
+            dense_missing_count: 0,
             temp_index_present: false,
             temp_index_path: None,
             temp_index_rows: 0,
@@ -399,6 +418,8 @@ fn index_status_at_with_sessions(
             semantic_index_mtime: None,
             semantic_lag_secs: None,
             pending_chunks: catalog_in_scope,
+            dense_state: DenseState::OptionalNotBuilt,
+            dense_missing_count: 0,
             temp_index_present: false,
             temp_index_path: None,
             temp_index_rows: 0,
@@ -453,6 +474,11 @@ fn index_status_at_with_sessions(
     };
 
     let pending_chunks = chunks.len().saturating_sub(semantic_index_rows);
+    let dense_state = match (semantic_index_present, temp_index_present) {
+        (true, _) => DenseState::Ready,
+        (false, true) => DenseState::Building,
+        (false, false) => DenseState::OptionalNotBuilt,
+    };
 
     // When we skipped live discovery but have catalog rows, surface catalog
     // counts as source_sessions so status is still useful.
@@ -505,6 +531,8 @@ fn index_status_at_with_sessions(
         semantic_index_mtime: committed_at.clone(),
         semantic_lag_secs,
         pending_chunks,
+        dense_state,
+        dense_missing_count: chunks.len().saturating_sub(semantic_index_rows),
         temp_index_present,
         temp_index_path: temp_index_present.then(|| path_for_json(&temp_index_path)),
         temp_index_rows,
@@ -591,6 +619,30 @@ fn hybrid_current_index_status(base: &Path, project: Option<&str>) -> Result<Opt
     } else {
         "hybrid"
     };
+    let dense_payload_present = generation_dir
+        .join(aicx_retrieve::MMAP_DENSE_PAYLOAD_FILE_NAME)
+        .is_file();
+    let checkpoint_present = hybrid_root
+        .join("dense-checkpoints")
+        .read_dir()
+        .ok()
+        .is_some_and(|entries| {
+            entries
+                .filter_map(|entry| entry.ok())
+                .any(|entry| entry.path().is_file())
+        });
+    let dense_state = if manifest.dense_kind == aicx_retrieve::MMAP_DENSE_KIND
+        && manifest.dense_count == manifest.lexical_doc_count
+        && dense_payload_present
+    {
+        DenseState::Ready
+    } else if checkpoint_present {
+        DenseState::Building
+    } else if manifest.dense_kind == "optional_not_built" && manifest.dense_count == 0 {
+        DenseState::OptionalNotBuilt
+    } else {
+        DenseState::Stale
+    };
 
     Ok(Some(IndexStatus {
         // For the extract-era store, "chunks" == signal session documents.
@@ -607,6 +659,10 @@ fn hybrid_current_index_status(base: &Path, project: Option<&str>) -> Result<Opt
         semantic_index_mtime: generation_mtime,
         semantic_lag_secs: None,
         pending_chunks: pending,
+        dense_state,
+        dense_missing_count: manifest
+            .lexical_doc_count
+            .saturating_sub(manifest.dense_count),
         temp_index_present: false,
         temp_index_path: None,
         temp_index_rows: 0,
@@ -1000,6 +1056,8 @@ mod tests {
             semantic_index_mtime: None,
             semantic_lag_secs: None,
             pending_chunks: 0,
+            dense_state: DenseState::Building,
+            dense_missing_count: 0,
             temp_index_present: true,
             temp_index_path: Some("/tmp/_all/embeddings.ndjson.tmp".to_string()),
             temp_index_rows: 1,
@@ -1014,6 +1072,8 @@ mod tests {
         let payload: serde_json::Value =
             serde_json::to_value(&status).expect("status should serialize");
         assert_eq!(payload["readiness"], "pending");
+        assert_eq!(payload["dense_state"], "building");
+        assert_eq!(payload["dense_missing_count"], 0);
         assert_eq!(payload["backend"], "ndjson");
         assert_eq!(payload["project_bucket"], "_all");
         assert!(payload["committed_at"].is_null());
@@ -1047,7 +1107,7 @@ mod tests {
             .join("generations")
             .join(gen_name);
         std::fs::create_dir_all(&gen_dir).expect("generation dir");
-        let manifest = aicx_retrieve::Manifest {
+        let mut manifest = aicx_retrieve::Manifest {
             schema_version: "2.0".to_string(),
             generation_id: "g-2026-07-23T10:00:00Z-teststatus".to_string(),
             source_chunk_count: 3,
@@ -1083,6 +1143,8 @@ mod tests {
         assert_eq!(status.readiness, IndexReadiness::Ready);
         assert_eq!(status.semantic_index_rows, 3);
         assert_eq!(status.canonical_chunks, 3);
+        assert_eq!(status.dense_state, DenseState::OptionalNotBuilt);
+        assert_eq!(status.dense_missing_count, 3);
         assert!(
             status
                 .semantic_index_path
@@ -1093,6 +1155,37 @@ mod tests {
             "status must point at CURRENT generation, not residual ndjson: {:?}",
             status.semantic_index_path
         );
+
+        let checkpoint_dir = root
+            .join("indexed")
+            .join("_all")
+            .join("hybrid")
+            .join("dense-checkpoints");
+        std::fs::create_dir_all(&checkpoint_dir).expect("checkpoint dir");
+        std::fs::write(checkpoint_dir.join("active.ndjson"), "{}\n")
+            .expect("write dense checkpoint marker");
+        let building = index_status_at(&root, None).expect("building dense status");
+        assert_eq!(building.readiness, IndexReadiness::Ready);
+        assert_eq!(building.dense_state, DenseState::Building);
+        std::fs::remove_dir_all(&checkpoint_dir).expect("remove checkpoint marker");
+
+        manifest.dense_kind = aicx_retrieve::MMAP_DENSE_KIND.to_string();
+        manifest.dense_count = 3;
+        manifest.embedder_model = "test-model".to_string();
+        manifest.embedder_url_hash = "test-url".to_string();
+        manifest.embedder_dim = 2;
+        manifest
+            .write_to_path(&gen_dir.join("manifest.json"))
+            .expect("write dense hybrid manifest");
+        std::fs::write(
+            gen_dir.join(aicx_retrieve::MMAP_DENSE_PAYLOAD_FILE_NAME),
+            b"dense",
+        )
+        .expect("write dense payload marker");
+        let ready_dense = index_status_at(&root, None).expect("ready dense status");
+        assert_eq!(ready_dense.readiness, IndexReadiness::Ready);
+        assert_eq!(ready_dense.dense_state, DenseState::Ready);
+        assert_eq!(ready_dense.dense_missing_count, 0);
 
         let _ = std::fs::remove_dir_all(root);
     }
