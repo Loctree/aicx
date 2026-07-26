@@ -45,6 +45,8 @@ pub struct SourceIndexReport {
     pub sources_parsed: usize,
     /// Sessions whose extract was reused without re-parsing the live source.
     pub sources_reused: usize,
+    /// Unchanged zero-signal or stable parse-failure outcomes reused from the ledger.
+    pub terminal_reused: usize,
     pub sources_skipped: usize,
     pub raw_frames: usize,
     pub signal_frames: usize,
@@ -152,6 +154,10 @@ struct SourceParseState {
     schema: String,
     signal_filter_version: String,
     sessions: BTreeMap<String, SessionParseRecord>,
+    /// Terminal non-indexed outcomes are source-fingerprint scoped. This is
+    /// additive to v1 so existing ledgers keep all reusable extract records.
+    #[serde(default)]
+    terminal_sessions: BTreeMap<String, TerminalParseRecord>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -171,6 +177,24 @@ struct SessionParseRecord {
     project: Option<String>,
     date: Option<String>,
     cwd: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum TerminalDisposition {
+    ZeroSignal,
+    ParseFailure,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TerminalParseRecord {
+    source_path: String,
+    source_len: u64,
+    source_mtime_ns: u64,
+    disposition: TerminalDisposition,
+    raw_frames: usize,
+    signal_frames: usize,
+    filtered_frames: usize,
 }
 
 /// Build or preview the global lexical index from the durable catalog.
@@ -244,6 +268,7 @@ pub fn build(
             sources_total: selected.len(),
             sources_parsed: 0,
             sources_reused: 0,
+            terminal_reused: 0,
             sources_skipped: 0,
             raw_frames: 0,
             signal_frames: 0,
@@ -264,6 +289,7 @@ pub fn build(
     let mut chunks = Vec::with_capacity(selected.len());
     let mut sources_parsed = 0usize;
     let mut sources_reused = 0usize;
+    let mut terminal_reused = 0usize;
     let mut sources_skipped = 0usize;
     let mut raw_frames = 0usize;
     let mut signal_frames = 0usize;
@@ -274,6 +300,7 @@ pub fn build(
         schema: PARSE_STATE_SCHEMA.to_string(),
         signal_filter_version: SIGNAL_FILTER_VERSION.to_string(),
         sessions: BTreeMap::new(),
+        terminal_sessions: BTreeMap::new(),
     };
 
     let prior_state = if full_rescan {
@@ -304,6 +331,24 @@ pub fn build(
             continue;
         }
 
+        // A stable non-indexed disposition is just as reusable as an extract:
+        // unchanged zero-signal sources and parser-declared Fatal sessions
+        // cannot produce a new document until their live fingerprint changes.
+        if let Some(record) =
+            try_reuse_terminal_record(entry, &prior_state, &session_key, &source_allow)
+        {
+            raw_frames += record.raw_frames;
+            signal_frames += record.signal_frames;
+            filtered_frames += record.filtered_frames;
+            terminal_reused += 1;
+            if record.disposition == TerminalDisposition::ParseFailure {
+                sources_skipped += 1;
+                *skipped_by_agent.entry(entry.agent.clone()).or_default() += 1;
+            }
+            next_state.terminal_sessions.insert(session_key, record);
+            continue;
+        }
+
         // Resolve under approved roots before any parse/open.
         // Pass the catalog string through AsRef<Path> so Path::new lives only
         // inside the allowlist resolver (canonicalize + containment).
@@ -330,6 +375,19 @@ pub fn build(
                 ));
                 sources_skipped += 1;
                 *skipped_by_agent.entry(entry.agent.clone()).or_default() += 1;
+                if cache_extracts && is_terminal_parse_failure(&error) {
+                    next_state.terminal_sessions.insert(
+                        session_key,
+                        terminal_parse_record(
+                            entry,
+                            &source_path,
+                            TerminalDisposition::ParseFailure,
+                            0,
+                            0,
+                            0,
+                        ),
+                    );
+                }
                 continue;
             }
         };
@@ -348,11 +406,37 @@ pub fn build(
         let filtered_count = before.saturating_sub(frames.len());
         filtered_frames += filtered_count;
         if frames.is_empty() {
+            if cache_extracts {
+                next_state.terminal_sessions.insert(
+                    session_key,
+                    terminal_parse_record(
+                        entry,
+                        &source_path,
+                        TerminalDisposition::ZeroSignal,
+                        raw_count,
+                        signal_count,
+                        filtered_count,
+                    ),
+                );
+            }
             continue;
         }
 
         let extract = render_extract(entry, &frames);
         if extract.trim().is_empty() {
+            if cache_extracts {
+                next_state.terminal_sessions.insert(
+                    session_key,
+                    terminal_parse_record(
+                        entry,
+                        &source_path,
+                        TerminalDisposition::ZeroSignal,
+                        raw_count,
+                        signal_count,
+                        filtered_count,
+                    ),
+                );
+            }
             continue;
         }
         let extract_path = extract_path_for(aicx_home, &entry.agent, &entry.session_id);
@@ -522,6 +606,7 @@ pub fn build(
         sources_total: selected.len(),
         sources_parsed,
         sources_reused,
+        terminal_reused,
         sources_skipped,
         raw_frames,
         signal_frames,
@@ -1279,6 +1364,79 @@ fn try_reuse_cached_extract(
     })
 }
 
+fn try_reuse_terminal_record(
+    entry: &CatalogEntry,
+    prior: &SourceParseState,
+    session_key: &str,
+    source_allow: &crate::source_path::SourceAllowlist,
+) -> Option<TerminalParseRecord> {
+    if prior.signal_filter_version != SIGNAL_FILTER_VERSION {
+        return None;
+    }
+    let record = prior.terminal_sessions.get(session_key)?;
+    if !source_record_matches(
+        entry,
+        &record.source_path,
+        record.source_len,
+        record.source_mtime_ns,
+        source_allow,
+    ) {
+        return None;
+    }
+    Some(record.clone())
+}
+
+fn source_record_matches(
+    entry: &CatalogEntry,
+    record_source_path: &str,
+    record_source_len: u64,
+    record_source_mtime_ns: u64,
+    source_allow: &crate::source_path::SourceAllowlist,
+) -> bool {
+    if record_source_path != entry.source_path
+        || record_source_len == 0
+        || record_source_mtime_ns == 0
+    {
+        return false;
+    }
+    // Unlike an existing extract, a terminal record has no document bytes to
+    // fall back to. Require the live source to remain readable so a transient
+    // allowlist/path failure stays visible and retryable.
+    let Ok(live_path) = source_allow.resolve_file(entry.source_path.as_str()) else {
+        return false;
+    };
+    crate::catalog::live_source_fingerprint(&live_path).is_some_and(|(live_len, live_mtime)| {
+        live_len == record_source_len && live_mtime == record_source_mtime_ns
+    })
+}
+
+fn terminal_parse_record(
+    entry: &CatalogEntry,
+    source_path: &Path,
+    disposition: TerminalDisposition,
+    raw_frames: usize,
+    signal_frames: usize,
+    filtered_frames: usize,
+) -> TerminalParseRecord {
+    let (source_len, source_mtime_ns) = crate::catalog::live_source_fingerprint(source_path)
+        .unwrap_or_else(|| resolve_entry_fingerprint(entry, source_path));
+    TerminalParseRecord {
+        source_path: entry.source_path.clone(),
+        source_len,
+        source_mtime_ns,
+        disposition,
+        raw_frames,
+        signal_frames,
+        filtered_frames,
+    }
+}
+
+fn is_terminal_parse_failure(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.to_string().contains("Fatal completeness"))
+}
+
 fn source_fingerprint(
     aicx_home: &Path,
     catalog_path: &Path,
@@ -1521,6 +1679,7 @@ mod tests {
             schema: PARSE_STATE_SCHEMA.to_string(),
             signal_filter_version: SIGNAL_FILTER_VERSION.to_string(),
             sessions: BTreeMap::new(),
+            terminal_sessions: BTreeMap::new(),
         };
         prior.sessions.insert(
             session_state_key("claude", "session"),
@@ -1590,5 +1749,98 @@ mod tests {
         assert!(try_reuse_cached_extract(&root, &entry, &prior, &key, &allow).is_none());
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn parse_state_v1_without_terminal_sessions_remains_readable() {
+        let raw = format!(
+            r#"{{
+  "schema": "{PARSE_STATE_SCHEMA}",
+  "signal_filter_version": "{SIGNAL_FILTER_VERSION}",
+  "sessions": {{}}
+}}"#
+        );
+        let state: SourceParseState =
+            serde_json::from_str(&raw).expect("legacy v1 parse state must deserialize");
+        assert!(state.sessions.is_empty());
+        assert!(state.terminal_sessions.is_empty());
+    }
+
+    #[test]
+    fn terminal_parse_state_reuses_only_an_unchanged_live_source() {
+        let root = std::env::temp_dir().join(format!(
+            "aicx-source-index-terminal-reuse-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let source_path = root
+            .join(".codex")
+            .join("sessions")
+            .join("zero-signal.jsonl");
+        fs::create_dir_all(source_path.parent().unwrap()).unwrap();
+        fs::write(&source_path, "{\"type\":\"metadata\"}\n").unwrap();
+        let (source_len, source_mtime_ns) =
+            crate::catalog::live_source_fingerprint(&source_path).expect("source fingerprint");
+        let entry = CatalogEntry {
+            schema: crate::catalog::CATALOG_SCHEMA.to_string(),
+            session_id: "zero-signal".to_string(),
+            agent: "codex".to_string(),
+            project: None,
+            date: None,
+            cwd: None,
+            source_path: source_path.display().to_string(),
+            source_len: Some(source_len),
+            source_mtime_ns: Some(source_mtime_ns),
+            title: None,
+            machine: None,
+            logical_session_id: None,
+        };
+        let key = session_state_key(&entry.agent, &entry.session_id);
+        let record = TerminalParseRecord {
+            source_path: entry.source_path.clone(),
+            source_len,
+            source_mtime_ns,
+            disposition: TerminalDisposition::ZeroSignal,
+            raw_frames: 1,
+            signal_frames: 0,
+            filtered_frames: 1,
+        };
+        let mut prior = SourceParseState {
+            schema: PARSE_STATE_SCHEMA.to_string(),
+            signal_filter_version: SIGNAL_FILTER_VERSION.to_string(),
+            sessions: BTreeMap::new(),
+            terminal_sessions: BTreeMap::new(),
+        };
+        prior.terminal_sessions.insert(key.clone(), record);
+        let allow = crate::source_path::SourceAllowlist::for_operator(&root, &root);
+
+        let reused = try_reuse_terminal_record(&entry, &prior, &key, &allow)
+            .expect("unchanged terminal source must reuse");
+        assert_eq!(reused.disposition, TerminalDisposition::ZeroSignal);
+        assert_eq!(reused.filtered_frames, 1);
+
+        fs::write(
+            &source_path,
+            "{\"type\":\"metadata\"}\n{\"type\":\"event_msg\"}\n",
+        )
+        .unwrap();
+        assert!(
+            try_reuse_terminal_record(&entry, &prior, &key, &allow).is_none(),
+            "live source growth must invalidate terminal reuse"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn only_parser_declared_fatal_failures_are_terminal() {
+        let fatal = anyhow::anyhow!("session parse failed with Fatal completeness");
+        let transient = anyhow::anyhow!("read source: resource temporarily unavailable");
+        assert!(is_terminal_parse_failure(&fatal));
+        assert!(!is_terminal_parse_failure(&transient));
     }
 }

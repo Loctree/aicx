@@ -7943,10 +7943,11 @@ fn run_index(
             }
         );
         eprintln!(
-            "  sources: total={} parsed={} reused={} skipped={}",
+            "  sources: total={} parsed={} reused={} terminal_reused={} skipped={}",
             report.sources_total,
             report.sources_parsed,
             report.sources_reused,
+            report.terminal_reused,
             report.sources_skipped
         );
         eprintln!(

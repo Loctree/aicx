@@ -18,6 +18,7 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const CODEX_SESSION_ID: &str = "019c578c-source-change-marble-l1-0001";
+const ZERO_SIGNAL_SESSION_ID: &str = "019c578c-source-change-zero-signal-0002";
 const INITIAL_TOKEN: &str = "SOURCE_CHANGE_INITIAL_TOKEN_marble_a1b2c3";
 const APPENDED_TOKEN: &str = "AUDIT_CHANGED_SESSION_ONLY_7f4d9c31_marble_l1";
 
@@ -112,6 +113,29 @@ fn seed_codex_session(home: &Path) -> PathBuf {
         .to_string(),
     ]
     .join("\n");
+    write_file(&path, &format!("{body}\n"));
+    path
+}
+
+fn seed_zero_signal_codex_session(home: &Path) -> PathBuf {
+    let path = home
+        .join(".codex")
+        .join("sessions")
+        .join("2026")
+        .join("07")
+        .join("23")
+        .join(format!("rollout-{ZERO_SIGNAL_SESSION_ID}.jsonl"));
+    let body = json!({
+        "timestamp": "2026-07-23T09:00:00Z",
+        "type": "session_meta",
+        "payload": {
+            "id": ZERO_SIGNAL_SESSION_ID,
+            "timestamp": "2026-07-23T09:00:00Z",
+            "cwd": "/Volumes/vc-workspace/vetcoders/vibecrafted",
+            "model": "gpt-test"
+        }
+    })
+    .to_string();
     write_file(&path, &format!("{body}\n"));
     path
 }
@@ -253,6 +277,7 @@ fn source_append_without_catalog_rebuild_still_indexes_token() {
     let root = unique_root("live-only");
     let home = root.join("home");
     let source_path = seed_codex_session(&home);
+    let _zero_signal_path = seed_zero_signal_codex_session(&home);
 
     let catalog1 = run_aicx(&home, &["catalog", "rebuild", "--json"]);
     assert_success(&catalog1, "catalog rebuild initial");
@@ -278,6 +303,11 @@ fn source_append_without_catalog_rebuild_still_indexes_token() {
         rep2["sources_parsed"].as_u64(),
         Some(1),
         "exactly the changed source must reparse: {rep2}"
+    );
+    assert_eq!(
+        rep2["terminal_reused"].as_u64(),
+        Some(1),
+        "unchanged zero-signal source must reuse its terminal disposition: {rep2}"
     );
 
     let search = run_aicx(
