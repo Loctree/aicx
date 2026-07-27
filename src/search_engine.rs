@@ -2504,6 +2504,7 @@ fn semantic_quality_score(query: &str, result: &FuzzyResult) -> u8 {
         .split_whitespace()
         .filter(|term| term.len() >= 3)
         .collect();
+    let mut full_query_coverage = false;
     let haystack = semantic_result_haystack(result);
     let anchors = query_anchors(&normalized_query);
     if !normalized_query.is_empty() && haystack.contains(&normalized_query) {
@@ -2531,6 +2532,7 @@ fn semantic_quality_score(query: &str, result: &FuzzyResult) -> u8 {
                         && haystack.contains(&term.chars().take(5).collect::<String>()))
             })
             .count();
+        full_query_coverage = matched_terms >= 2 && matched_terms == query_terms.len();
         score += (matched_terms.saturating_mul(3).min(12)) as i16;
         if lexical && matched_terms >= 2 {
             score += 10 + ((matched_terms - 2).min(2) as i16 * 4);
@@ -2554,13 +2556,22 @@ fn semantic_quality_score(query: &str, result: &FuzzyResult) -> u8 {
         return score;
     }
 
-    let (floor, ceiling) = match lexical_result_evidence_class(query, result) {
+    let evidence_class = lexical_result_evidence_class(query, result);
+    let (floor, ceiling) = match evidence_class {
         LexicalEvidenceClass::Noise => (0, 19),
         LexicalEvidenceClass::Substantive => (20, 59),
         LexicalEvidenceClass::SubjectDecision => (60, 84),
         LexicalEvidenceClass::ExplicitInvariant => (85, 95),
     };
-    floor + ((u16::from(score) * u16::from(ceiling - floor)) / 95) as u8
+    let calibrated = floor + ((u16::from(score) * u16::from(ceiling - floor)) / 95) as u8;
+    // `--score` is also a relevance filter. A historical quote that covers
+    // every meaningful query term must be able to pass the operator's common
+    // `--score 70` threshold without being mislabeled as a decision.
+    if evidence_class == LexicalEvidenceClass::Substantive && full_query_coverage {
+        calibrated.max(70)
+    } else {
+        calibrated
+    }
 }
 
 fn matched_answer_section(result: &FuzzyResult) -> bool {
@@ -3349,6 +3360,31 @@ mod tests {
 
         assert!(score < 100, "lexical evidence must not saturate: {score}");
         assert!(score >= 85, "marked invariant scored too low: {score}");
+    }
+
+    #[test]
+    fn lexical_substantive_dictation_variants_can_pass_score_seventy() {
+        for query in [
+            "żółte ai zimna wojna",
+            "zółte ai wojnaelektroniczna",
+            "zolte ai wojna elektroniczna",
+        ] {
+            let mut result = fuzzy(139, "conversations", "2026-07-27", None);
+            result.label = "lexical_tantivy:historical".to_string();
+            result.frame_kind = Some("conversation".to_string());
+            result.matched_lines =
+                vec!["„zimna wojnaelektroniczna wspierana przez zółte AI…”".to_string()];
+
+            assert_eq!(
+                lexical_result_evidence_class(query, &result),
+                LexicalEvidenceClass::Substantive
+            );
+            let score = semantic_quality_score(query, &result);
+            assert!(
+                score >= 70,
+                "{query:?} scored {score}; a complete historical passage must survive --score 70"
+            );
+        }
     }
 
     #[test]

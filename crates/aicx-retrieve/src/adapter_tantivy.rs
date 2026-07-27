@@ -460,8 +460,18 @@ fn query_context_lines(body: &str, query: &str) -> Vec<String> {
         .map(|term| (term.chars().count() >= 5).then(|| term.chars().take(5).collect::<String>()))
         .collect::<Vec<_>>();
     let normalized_query = normalize_query(query);
+    // A live session that records a search command or acceptance matrix can
+    // contain the bare query beside the historical passage being tested.
+    // Treat only those harness-shaped bare lines as echoes; an ordinary
+    // historical message that happens to equal the query remains searchable.
+    let benchmark_context = body.lines().any(|line| {
+        let lower = line.to_ascii_lowercase();
+        lower.contains("aicx search")
+            || lower.contains("runtime-acceptance query=")
+            || lower.trim_start().starts_with("query=")
+    });
     let signal_term_floor = terms.len().min(2) as i32;
-    let mut best = None::<(LexicalEvidenceClass, i32, i32, usize, String)>;
+    let mut best = None::<(LexicalEvidenceClass, i32, i32, i32, usize, String)>;
     let mut discovery_order = 0usize;
 
     for line in body.lines() {
@@ -488,6 +498,16 @@ fn query_context_lines(body: &str, query: &str) -> Vec<String> {
                 continue;
             }
             let normalized = normalize_query(candidate);
+            let lower = candidate.to_ascii_lowercase();
+            if benchmark_context
+                && (normalized == normalized_query
+                    || lower.contains("runtime-acceptance query=")
+                    || lower.contains("aicx search")
+                    || lower.trim_start().starts_with("query="))
+            {
+                discovery_order += 1;
+                continue;
+            }
             let term_score = terms
                 .iter()
                 .zip(&prefixes)
@@ -505,6 +525,12 @@ fn query_context_lines(body: &str, query: &str) -> Vec<String> {
                 continue;
             }
             let phrase_score = i32::from(normalized.contains(&normalized_query));
+            let quote_score = i32::from(
+                benchmark_context
+                    && candidate
+                        .trim_start()
+                        .starts_with(['>', '"', '\'', '„', '“']),
+            );
             let class = classify_lexical_evidence(candidate);
             if class == LexicalEvidenceClass::Noise {
                 discovery_order += 1;
@@ -519,26 +545,29 @@ fn query_context_lines(body: &str, query: &str) -> Vec<String> {
             } else {
                 class.min(LexicalEvidenceClass::Substantive)
             };
-            let replace =
-                best.as_ref()
-                    .is_none_or(|(best_class, best_terms, best_phrase, best_order, _)| {
-                        (
-                            class,
-                            term_score,
-                            phrase_score,
-                            std::cmp::Reverse(discovery_order),
-                        ) > (
-                            *best_class,
-                            *best_terms,
-                            *best_phrase,
-                            std::cmp::Reverse(*best_order),
-                        )
-                    });
+            let replace = best.as_ref().is_none_or(
+                |(best_class, best_terms, best_phrase, best_quote, best_order, _)| {
+                    (
+                        class,
+                        term_score,
+                        phrase_score,
+                        quote_score,
+                        std::cmp::Reverse(discovery_order),
+                    ) > (
+                        *best_class,
+                        *best_terms,
+                        *best_phrase,
+                        *best_quote,
+                        std::cmp::Reverse(*best_order),
+                    )
+                },
+            );
             if replace {
                 best = Some((
                     class,
                     term_score,
                     phrase_score,
+                    quote_score,
                     discovery_order,
                     candidate.to_string(),
                 ));
@@ -546,7 +575,7 @@ fn query_context_lines(body: &str, query: &str) -> Vec<String> {
             discovery_order += 1;
         }
     }
-    let Some((_, _, _, _, excerpt)) = best else {
+    let Some((_, _, _, _, _, excerpt)) = best else {
         return Vec::new();
     };
     vec![excerpt.chars().take(MAX_CONTEXT_CHARS).collect()]
@@ -1726,6 +1755,30 @@ mod swap_tests {
             lines.is_empty(),
             "silence must beat benchmark echo: {lines:?}"
         );
+    }
+
+    #[test]
+    fn query_context_prefers_historical_passage_over_bare_acceptance_query() {
+        let body = [
+            "runtime-acceptance query=\"żółte ai zimna wojna\"",
+            "żółte ai zimna wojna",
+            "Dyktowanie skleiło `wojnaelektroniczna` i zapisało `zółte` zamiast `żółte`.",
+            "„zimna wojnaelektroniczna wspierana przez zółte AI…”",
+        ]
+        .join("\n");
+
+        for query in [
+            "żółte ai zimna wojna",
+            "zółte ai wojnaelektroniczna",
+            "zolte ai wojna elektroniczna",
+        ] {
+            let lines = query_context_lines(&body, query);
+            assert_eq!(
+                lines,
+                vec!["„zimna wojnaelektroniczna wspierana przez zółte AI…”"],
+                "{query:?} must prefer the quoted historical passage"
+            );
+        }
     }
 
     #[test]

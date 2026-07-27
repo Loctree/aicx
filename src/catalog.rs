@@ -377,8 +377,7 @@ pub fn status(home: &Path, user_home: &Path) -> Result<CatalogStatusReport> {
         let live_entry = live.get(&key);
         let live_fp = live_entry
             .map(|e| Path::new(&e.source_path))
-            .and_then(live_source_fingerprint)
-            .or_else(|| live_source_fingerprint(Path::new(&entry.source_path)));
+            .and_then(live_source_fingerprint);
 
         match (live_fp, entry.source_len, entry.source_mtime_ns) {
             (Some((live_len, live_mtime)), Some(cat_len), Some(cat_mtime))
@@ -414,7 +413,7 @@ pub fn status(home: &Path, user_home: &Path) -> Result<CatalogStatusReport> {
                     Some(live_mtime),
                 );
             }
-            (None, _, _) if Path::new(&entry.source_path).is_file() => {
+            (None, _, _) if live_entry.is_some() => {
                 counts.fingerprint_unknown += 1;
                 agent_counts.fingerprint_unknown += 1;
                 push_sample(
@@ -1307,6 +1306,48 @@ mod tests {
         assert_eq!(report.counts.missing_source, 1);
         assert_eq!(report.readiness, CatalogReadiness::SourcesMissing);
         assert!(report.by_machine.get("laptop").copied() == Some(1));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn status_does_not_stat_catalog_paths_outside_live_agent_roots() {
+        let dir = test_root("status-untrusted-catalog-path");
+        let home = dir.join(".aicx");
+        fs::create_dir_all(catalog_dir_for(&home)).unwrap();
+        let outside = dir.join("outside-agent-roots.jsonl");
+        fs::write(
+            &outside,
+            "catalog data must not authorize filesystem access",
+        )
+        .unwrap();
+        let (source_len, source_mtime_ns) = live_source_fingerprint(&outside).unwrap();
+        let entry = CatalogEntry {
+            schema: CATALOG_SCHEMA.to_string(),
+            session_id: "untrusted-path".into(),
+            agent: "claude".into(),
+            project: Some("Loctree/aicx".into()),
+            date: Some("2026-07-27".into()),
+            cwd: None,
+            source_path: outside.display().to_string(),
+            source_len: Some(source_len),
+            source_mtime_ns: Some(source_mtime_ns),
+            title: None,
+            machine: Some("laptop".into()),
+            logical_session_id: None,
+        };
+        fs::write(
+            sessions_path_for(&home),
+            format!("{}\n", serde_json::to_string(&entry).unwrap()),
+        )
+        .unwrap();
+        let user = dir.join("user");
+        fs::create_dir_all(&user).unwrap();
+
+        let report = status(&home, &user).unwrap();
+
+        assert_eq!(report.counts.current, 0);
+        assert_eq!(report.counts.missing_source, 1);
+        assert_eq!(report.readiness, CatalogReadiness::SourcesMissing);
         let _ = fs::remove_dir_all(&dir);
     }
 }
