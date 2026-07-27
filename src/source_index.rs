@@ -362,6 +362,7 @@ pub fn build(
             "date": date,
             "kind": "conversations",
             "session_id": entry.session_id,
+            "logical_session_id": entry.logical_session_id,
             "frame_kind": "conversation",
             "cwd": entry.cwd,
             "source_catalog_path": entry.source_path,

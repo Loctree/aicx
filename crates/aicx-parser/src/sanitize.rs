@@ -1061,32 +1061,23 @@ mod tests {
 // Query normalization (PL/EN diacritics + case folding)
 // ============================================================================
 
-/// Normalize text for fuzzy matching: NFC + lowercase + strip Polish diacritics.
+/// Normalize text for lexical/fuzzy matching: NFD + mark removal + lowercase.
 ///
-/// NFC canonical composition is applied first so NFD-stored variants (e.g.
-/// `o` + combining acute) collapse to the same code points as NFC-stored
-/// composed variants (`ó`) before diacritic mapping. Without this step,
-/// `źródło` typed via NFD on one platform would refuse to match the same
-/// word typed via NFC on another.
-///
-/// Maps: ą→a, ć→c, ę→e, ł→l, ń→n, ó→o, ś→s, ź→z, ż→z
-/// Enables "wdrozenie" to match "wdrożenie", "zrodlo" to match "źródło", etc.
+/// Canonical decomposition makes composed and decomposed Unicode spellings
+/// converge. Combining marks are then removed. Polish `ł`/`Ł` needs an
+/// explicit mapping because Unicode decomposition intentionally leaves it
+/// intact.
 pub fn normalize_query(text: &str) -> String {
-    use unicode_normalization::UnicodeNormalization;
-    text.nfc()
-        .map(|c| match c {
-            'Ą' | 'ą' => 'a',
-            'Ć' | 'ć' => 'c',
-            'Ę' | 'ę' => 'e',
-            'Ł' | 'ł' => 'l',
-            'Ń' | 'ń' => 'n',
-            'Ó' | 'ó' => 'o',
-            'Ś' | 'ś' => 's',
-            'Ź' | 'ź' | 'Ż' | 'ż' => 'z',
-            _ => c,
+    use unicode_normalization::{UnicodeNormalization, char::is_combining_mark};
+
+    text.nfd()
+        .filter(|ch| !is_combining_mark(*ch))
+        .flat_map(char::to_lowercase)
+        .map(|ch| match ch {
+            'ł' => 'l',
+            _ => ch,
         })
-        .collect::<String>()
-        .to_lowercase()
+        .collect()
 }
 
 // ============================================================================
@@ -1695,9 +1686,6 @@ mod normalize_tests {
 
     #[test]
     fn test_normalize_query_unifies_nfc_and_nfd_inputs() {
-        // D-11: same word stored in NFC ("ó" composed) vs NFD ("o" + combining
-        // acute U+0301) must normalize to the same key. Without NFC pre-pass,
-        // NFD lookups would not survive the diacritic mapping table.
         use unicode_normalization::UnicodeNormalization;
         let composed = "źródło";
         let decomposed: String = composed.nfd().collect();
@@ -1708,9 +1696,16 @@ mod normalize_tests {
         assert_eq!(
             normalize_query(composed),
             normalize_query(&decomposed),
-            "NFC pre-pass must collapse pre-composed and decomposed diacritics"
+            "canonical decomposition must collapse composed and decomposed diacritics"
         );
         assert_eq!(normalize_query(&decomposed), "zrodlo");
+    }
+
+    #[test]
+    fn test_normalize_query_removes_general_combining_marks_and_maps_l_stroke() {
+        assert_eq!(normalize_query("Crème déjà vu"), "creme deja vu");
+        assert_eq!(normalize_query("Łódź łódź"), "lodz lodz");
+        assert_eq!(normalize_query("z\u{301}o\u{308}l\u{301}te"), "zolte");
     }
 
     #[test]

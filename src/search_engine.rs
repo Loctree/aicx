@@ -400,6 +400,7 @@ fn try_semantic_search_with_boundary(
         }
         apply_recency_prior(&mut merged_results);
         merged_results.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| b.date.cmp(&a.date)));
+        let mut merged_results = dedupe_semantic_results(merged_results);
         merged_results.truncate(limit);
         Ok((
             SemanticOutcome {
@@ -722,7 +723,8 @@ fn try_lexical_search_native(
                 label: format!("{backend_label}:{}", h.chunk_id),
                 density: h.score,
                 matched_lines: hit_metadata_lines(&h, "preview_lines"),
-                session_id: hit_metadata_optional_string(&h, "session_id"),
+                session_id: hit_metadata_optional_string(&h, "logical_session_id")
+                    .or_else(|| hit_metadata_optional_string(&h, "session_id")),
                 cwd: hit_metadata_optional_string(&h, "cwd"),
             }
         })
@@ -761,6 +763,7 @@ fn try_lexical_search_native(
     // Re-run from the raw BM25 density so the preview-based first pass does
     // not double-add priors. This final pass ranks the actual matched context.
     rank_lexical_candidates(query, &mut results);
+    let mut results = dedupe_semantic_results(results);
     results.truncate(limit);
     // Prefer indexed preview metadata. Only open source files when preview is
     // empty and the path exists — cold project-scoped searches were paying
@@ -2796,18 +2799,31 @@ fn low_signal_semantic_result(result: &FuzzyResult) -> bool {
 }
 
 fn dedupe_semantic_results(results: Vec<FuzzyResult>) -> Vec<FuzzyResult> {
+    let mut seen_sessions = HashSet::new();
     let mut seen_snippets = HashSet::new();
     let mut deduped = Vec::with_capacity(results.len());
     for result in results {
+        let session_duplicate = result
+            .session_id
+            .as_deref()
+            .filter(|session_id| !session_id.is_empty())
+            .is_some_and(|session_id| {
+                !seen_sessions.insert(format!(
+                    "{}|{}|{}",
+                    result.project,
+                    result.frame_kind.as_deref().unwrap_or("-"),
+                    session_id
+                ))
+            });
         let snippet_key = normalize_query(&result.matched_lines.join("\n"));
-        if snippet_key.len() >= 24
+        let snippet_duplicate = snippet_key.len() >= 24
             && !seen_snippets.insert(format!(
                 "{}|{}|{}",
                 result.project,
                 result.frame_kind.as_deref().unwrap_or("-"),
                 snippet_key
-            ))
-        {
+            ));
+        if session_duplicate || snippet_duplicate {
             continue;
         }
         deduped.push(result);
@@ -3103,6 +3119,29 @@ mod tests {
             session_id: None,
             cwd: None,
         }
+    }
+
+    #[test]
+    fn dedupe_collapses_seven_physical_copies() {
+        let copies = (0..7)
+            .map(|index| {
+                let mut result = fuzzy(100 - index, "conversations", "2026-07-27", None);
+                result.path = format!("/extracts/copy-{index}.md");
+                result.file.clone_from(&result.path);
+                result.label = format!("copy-{index}");
+                result.frame_kind = Some("conversation".to_string());
+                result.session_id = Some(format!("physical-session-{index}"));
+                result.matched_lines = vec![
+                    "Raport AICX: zółte AI łączy zimna wojna z wojnaelektroniczna.".to_string(),
+                ];
+                result
+            })
+            .collect();
+
+        let deduped = dedupe_semantic_results(copies);
+
+        assert_eq!(deduped.len(), 1);
+        assert_eq!(deduped[0].label, "copy-0", "best-ranked copy must win");
     }
 
     #[test]

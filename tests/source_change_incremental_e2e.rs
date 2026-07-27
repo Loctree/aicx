@@ -20,6 +20,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const CODEX_SESSION_ID: &str = "019c578c-source-change-marble-l1-0001";
 const INITIAL_TOKEN: &str = "SOURCE_CHANGE_INITIAL_TOKEN_marble_a1b2c3";
 const APPENDED_TOKEN: &str = "AUDIT_CHANGED_SESSION_ONLY_7f4d9c31_marble_l1";
+const FOLDED_FIXTURE: &str =
+    "Raport AICX: zółte AI opisuje zimna wojna jako projekt wojnaelektroniczna.";
+const FOLDED_QUERIES: [&str; 3] = [
+    "żółte ai zimna wojna",
+    "zółte ai wojnaelektroniczna",
+    "zolte ai wojna elektroniczna",
+];
 
 fn unique_root(label: &str) -> PathBuf {
     std::env::temp_dir().join(format!(
@@ -135,6 +142,43 @@ fn append_codex_user_frame(path: &Path, token: &str) {
         .expect("open codex session for append");
     writeln!(file, "{line}").expect("append frame");
     file.sync_all().expect("sync append");
+}
+
+fn seed_folded_copies(home: &Path) {
+    for copy in 0..7 {
+        let session_id = format!("019faicx-folded-copy-{copy:04}");
+        let path = home
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("07")
+            .join("27")
+            .join(format!("rollout-{session_id}.jsonl"));
+        let body = [
+            json!({
+                "timestamp": "2026-07-27T01:00:00Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": session_id,
+                    "timestamp": "2026-07-27T01:00:00Z",
+                    "cwd": "/Volumes/vc-workspace/Loctree/aicx",
+                    "model": "gpt-test"
+                }
+            })
+            .to_string(),
+            json!({
+                "timestamp": "2026-07-27T01:00:01Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "agent_message",
+                    "message": FOLDED_FIXTURE
+                }
+            })
+            .to_string(),
+        ]
+        .join("\n");
+        write_file(&path, &format!("{body}\n"));
+    }
 }
 
 #[test]
@@ -306,6 +350,67 @@ fn source_append_without_catalog_rebuild_still_indexes_token() {
         "live-only-ok after_parsed={} noop_unchanged=true token_hit=true",
         rep2["sources_parsed"]
     );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn folded_polish_queries_converge_cli() {
+    let root = unique_root("folded-cli");
+    let home = root.join("home");
+    seed_folded_copies(&home);
+
+    let catalog = run_aicx(&home, &["catalog", "rebuild", "--json"]);
+    assert_success(&catalog, "catalog rebuild folded fixture");
+    assert_eq!(
+        parse_json(&catalog)["total_sessions"].as_u64(),
+        Some(7),
+        "all seven physical copies must enter the scratch catalog"
+    );
+
+    let index = run_aicx(
+        &home,
+        &["index", "--json", "--full-rescan", "--cache-extracts"],
+    );
+    assert_success(&index, "index folded fixture");
+    assert_eq!(
+        parse_json(&index)["lexical_docs"].as_u64(),
+        Some(7),
+        "all seven physical copies must reach CURRENT"
+    );
+
+    let mut accepted_match = None;
+    for query in FOLDED_QUERIES {
+        let output = run_aicx(
+            &home,
+            &["search", query, "--json", "--limit", "20", "--hours", "0"],
+        );
+        assert_success(&output, &format!("search {query:?}"));
+        let payload = parse_json(&output);
+        assert_eq!(
+            payload["results"].as_u64(),
+            Some(1),
+            "{query:?} must present one logical result from seven copies: {payload}"
+        );
+        let matches = payload["items"][0]["matches"].clone();
+        assert!(
+            matches.to_string().contains("zółte AI")
+                && matches.to_string().contains("wojnaelektroniczna"),
+            "{query:?} must preserve the original fixture passage: {payload}"
+        );
+        if let Some(expected) = &accepted_match {
+            assert_eq!(
+                &matches, expected,
+                "all spellings must converge on the same original evidence"
+            );
+        } else {
+            accepted_match = Some(matches);
+        }
+        println!(
+            "runtime-acceptance query={query:?} physical=7 presented={} match={}",
+            payload["results"], payload["items"][0]["matches"]
+        );
+    }
 
     let _ = fs::remove_dir_all(&root);
 }
