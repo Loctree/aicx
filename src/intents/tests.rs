@@ -187,9 +187,14 @@ fn live_window_admits_fresh_mtime_rows_and_unadmitted_sessions() {
         logical_session_id: None,
     };
     let production_user_home = crate::os_user_home().unwrap_or_else(|| root.clone());
+    let cutoff_ns = (Utc::now() - chrono::Duration::hours(24))
+        .timestamp_nanos_opt()
+        .map(|nanos| nanos.max(0) as u128)
+        .unwrap_or(0);
     crate::catalog::prime_live_delta_cache_for_tests(
         &root,
         &production_user_home,
+        cutoff_ns,
         crate::catalog::LiveDelta {
             unadmitted: vec![row_b],
             live_sessions: 2,

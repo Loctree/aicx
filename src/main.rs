@@ -857,6 +857,35 @@ struct SearchQualityEvalArgs {
 }
 
 #[derive(Debug, Subcommand)]
+enum ContinuityAction {
+    /// Render the continuity pack to stdout.
+    Show {
+        /// Catalog project filters (union). Fail-closed identity: bare or
+        /// unknown names error with candidates instead of returning silence.
+        #[arg(short, long, value_delimiter = ',')]
+        project: Vec<String>,
+        /// Window in hours.
+        #[arg(short = 'H', long, default_value = "24")]
+        hours: u64,
+        /// Bound the output to a prompt-inject budget (~6k tokens).
+        #[arg(long)]
+        for_inject: bool,
+    },
+    /// Write the continuity pack to a file.
+    Write {
+        /// Catalog project filters (union).
+        #[arg(short, long, value_delimiter = ',')]
+        project: Vec<String>,
+        /// Window in hours.
+        #[arg(short = 'H', long, default_value = "24")]
+        hours: u64,
+        /// Output path.
+        #[arg(short, long, default_value = "CONTINUITY.md")]
+        output: PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum CatalogAction {
     /// Walk all source roots and rewrite `~/.aicx/catalog/sessions.jsonl`.
     Rebuild {
@@ -1464,6 +1493,14 @@ enum Commands {
         /// Disable the automatic live scan for hot (≤ 48h) windows.
         #[arg(long)]
         no_live: bool,
+    },
+
+    /// Multi-agent continuity pack: NOW / PEERS / DECISIONS / TASKS /
+    /// SOURCES / INDEX HEALTH for a project window. Live parse first,
+    /// census second — never blocked on the embedder.
+    Continuity {
+        #[command(subcommand)]
+        action: ContinuityAction,
     },
 
     /// Print recent intents/chunks (snapshot mode); add --follow to stream new arrivals.
@@ -2712,6 +2749,37 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
                 },
                 live_mode,
             )?;
+        }
+        Some(Commands::Continuity { action }) => {
+            let (projects, hours, for_inject, output) = match action {
+                ContinuityAction::Show {
+                    project,
+                    hours,
+                    for_inject,
+                } => (project, hours, for_inject, None),
+                ContinuityAction::Write {
+                    project,
+                    hours,
+                    output,
+                } => (project, hours, false, Some(output)),
+            };
+            let resolution = resolve_intents_project_filters(&projects, project_match)?;
+            let aicx_home = aicx::aicx_home::ensure()?;
+            let pack = aicx::continuity::build(&aicx_home, &resolution.selected, hours)?;
+            let rendered = aicx::continuity::render(&pack, for_inject);
+            match output {
+                Some(path) => {
+                    std::fs::write(&path, &rendered)
+                        .with_context(|| format!("write continuity pack {}", path.display()))?;
+                    eprintln!(
+                        "continuity pack written: {} ({} bytes, {} live session(s))",
+                        path.display(),
+                        rendered.len(),
+                        pack.live_sessions
+                    );
+                }
+                None => print!("{rendered}"),
+            }
         }
         Some(Commands::Tail {
             project,

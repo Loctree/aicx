@@ -495,7 +495,11 @@ fn collect_live_unadmitted_files(
     source_errors: &mut usize,
 ) -> Result<usize> {
     let user_home = crate::os_user_home().unwrap_or_else(|| aicx_home.to_path_buf());
-    let delta = crate::catalog::live_delta(aicx_home, &user_home)?;
+    let cutoff_unix_ns = cutoff
+        .timestamp_nanos_opt()
+        .map(|nanos| nanos.max(0) as u128)
+        .unwrap_or(0);
+    let delta = crate::catalog::live_delta(aicx_home, &user_home, cutoff_unix_ns)?;
     let mut admitted = 0usize;
     for entry in delta.unadmitted {
         if seen_sessions.contains(&(entry.agent.clone(), entry.session_id.clone())) {

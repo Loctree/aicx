@@ -502,25 +502,31 @@ pub struct LiveDelta {
 /// 30 s stays comfortably inside the ≤60 s live-window freshness SLA.
 const LIVE_DELTA_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Extraction lanes compute their cutoff from independent `Utc::now()` calls;
+/// treat cutoffs within a minute as the same window for cache purposes.
+const LIVE_DELTA_CUTOFF_TOLERANCE_NS: u128 = 60 * 1_000_000_000;
+
 #[allow(clippy::type_complexity)]
-static LIVE_DELTA_CACHE: std::sync::Mutex<Option<(Instant, PathBuf, PathBuf, LiveDelta)>> =
+static LIVE_DELTA_CACHE: std::sync::Mutex<Option<(Instant, PathBuf, PathBuf, u128, LiveDelta)>> =
     std::sync::Mutex::new(None);
 
-pub fn live_delta(home: &Path, user_home: &Path) -> Result<LiveDelta> {
+pub fn live_delta(home: &Path, user_home: &Path, cutoff_unix_ns: u128) -> Result<LiveDelta> {
     if let Ok(guard) = LIVE_DELTA_CACHE.lock()
-        && let Some((stamp, cached_home, cached_user_home, delta)) = guard.as_ref()
+        && let Some((stamp, cached_home, cached_user_home, cached_cutoff, delta)) = guard.as_ref()
         && stamp.elapsed() < LIVE_DELTA_CACHE_TTL
         && cached_home == home
         && cached_user_home == user_home
+        && cached_cutoff.abs_diff(cutoff_unix_ns) <= LIVE_DELTA_CUTOFF_TOLERANCE_NS
     {
         return Ok(delta.clone());
     }
-    let delta = live_delta_uncached(home, user_home)?;
+    let delta = live_delta_uncached(home, user_home, cutoff_unix_ns)?;
     if let Ok(mut guard) = LIVE_DELTA_CACHE.lock() {
         *guard = Some((
             Instant::now(),
             home.to_path_buf(),
             user_home.to_path_buf(),
+            cutoff_unix_ns,
             delta.clone(),
         ));
     }
@@ -530,30 +536,69 @@ pub fn live_delta(home: &Path, user_home: &Path) -> Result<LiveDelta> {
 /// Seed the live-delta cache so unit tests exercise the intents live window
 /// without walking the developer's real agent roots.
 #[cfg(test)]
-pub(crate) fn prime_live_delta_cache_for_tests(home: &Path, user_home: &Path, delta: LiveDelta) {
+pub(crate) fn prime_live_delta_cache_for_tests(
+    home: &Path,
+    user_home: &Path,
+    cutoff_unix_ns: u128,
+    delta: LiveDelta,
+) {
     if let Ok(mut guard) = LIVE_DELTA_CACHE.lock() {
         *guard = Some((
             Instant::now(),
             home.to_path_buf(),
             user_home.to_path_buf(),
+            cutoff_unix_ns,
             delta,
         ));
     }
 }
 
-fn live_delta_uncached(home: &Path, user_home: &Path) -> Result<LiveDelta> {
+fn live_delta_uncached(home: &Path, user_home: &Path, cutoff_unix_ns: u128) -> Result<LiveDelta> {
     let started = Instant::now();
     let catalog_keys: BTreeSet<(String, String)> = read_entries_at(home)?
         .into_iter()
         .map(|entry| (entry.agent, entry.session_id))
         .collect();
-    let live = scan_live_entries(user_home);
-    let live_sessions = live.len();
-    let newest_live_mtime_ns = live
-        .values()
-        .filter_map(|entry| entry.source_mtime_ns)
-        .max();
-    let unadmitted = live
+
+    let mut live_sessions = 0usize;
+    let mut newest_live_mtime_ns: Option<u64> = None;
+    let mut fresh: BTreeMap<(String, String), CatalogEntry> = BTreeMap::new();
+    let agents = [
+        AgentKind::Claude,
+        AgentKind::Codex,
+        AgentKind::Gemini,
+        AgentKind::Grok,
+        AgentKind::Junie,
+    ];
+    for agent in agents {
+        let root = agent_source_root(agent, user_home);
+        if !root.exists() {
+            continue;
+        }
+        let Ok(catalog) = SessionCatalog::new(agent, &root) else {
+            continue;
+        };
+        let Ok(scan) = catalog.scan_hot_window(cutoff_unix_ns) else {
+            continue;
+        };
+        live_sessions += scan.total_candidates;
+        if let Some(newest) = scan.newest_modified_unix_nanos {
+            let newest = newest.min(u64::MAX as u128) as u64;
+            newest_live_mtime_ns = Some(newest_live_mtime_ns.map_or(newest, |max| max.max(newest)));
+        }
+        for source in scan.fresh_sources {
+            if !is_primary_catalog_source(agent, &source.path) {
+                continue;
+            }
+            let entry = entry_from_source(agent, &source);
+            fresh.insert((entry.agent.clone(), entry.session_id.clone()), entry);
+        }
+    }
+    // Runtime-run transcripts are a bounded tree — the vibecrafted lane of
+    // the live window stays in.
+    enrich_runtime_runs(&mut fresh, user_home);
+
+    let unadmitted = fresh
         .into_iter()
         .filter(|(key, _)| !catalog_keys.contains(key))
         .map(|(_, entry)| entry)
@@ -1177,7 +1222,7 @@ mod tests {
         .unwrap();
 
         // No durable catalog yet: the whole live surface is unadmitted.
-        let before = live_delta_uncached(&home, &user).unwrap();
+        let before = live_delta_uncached(&home, &user, 0).unwrap();
         assert_eq!(before.live_sessions, 1);
         assert_eq!(before.unadmitted.len(), 1);
         assert!(before.newest_live_mtime_ns.is_some());
@@ -1185,7 +1230,7 @@ mod tests {
 
         // Rebuild admits the session — the delta must drain to zero.
         rebuild(&home, &user).unwrap();
-        let after = live_delta_uncached(&home, &user).unwrap();
+        let after = live_delta_uncached(&home, &user, 0).unwrap();
         assert_eq!(after.live_sessions, 1);
         assert!(
             after.unadmitted.is_empty(),

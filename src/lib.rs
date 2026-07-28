@@ -30,6 +30,10 @@ pub mod auth;
 pub mod catalog;
 #[cfg(feature = "app")]
 pub mod cli;
+/// Multi-agent continuity pack (`aicx continuity show|write`) — deterministic
+/// session-resume surface built from live window + census, embedder-free.
+#[cfg(feature = "app")]
+pub mod continuity;
 #[cfg(feature = "app")]
 pub mod corpus;
 #[cfg(feature = "app")]

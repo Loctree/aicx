@@ -398,3 +398,34 @@ fn scan_matrix_covers_all_agent_header_shapes() {
             .ends_with(format!("{UUID_A}/chat_history.jsonl"))
     );
 }
+
+#[test]
+fn hot_window_scan_probes_only_fresh_candidates() {
+    let root = TestRoot::new("hot-window");
+    root.write(
+        format!("{UUID_A}.jsonl"),
+        "{\"sessionId\":\"hot-logical\"}\n",
+    );
+
+    let catalog = SessionCatalog::new(AgentKind::Claude, root.path()).unwrap();
+
+    // Cutoff at epoch: everything is fresh and gets probed.
+    let all_fresh = catalog.scan_hot_window(0).unwrap();
+    assert_eq!(all_fresh.total_candidates, 1);
+    assert_eq!(all_fresh.fresh_sources.len(), 1);
+    assert!(all_fresh.newest_modified_unix_nanos.is_some());
+    assert_eq!(
+        all_fresh.fresh_sources[0].logical_session_id.as_deref(),
+        Some("hot-logical")
+    );
+
+    // Cutoff in the far future: the walk still counts candidates and reports
+    // the newest mtime, but no bounded headers are opened.
+    let none_fresh = catalog.scan_hot_window(u128::MAX).unwrap();
+    assert_eq!(none_fresh.total_candidates, 1);
+    assert!(none_fresh.fresh_sources.is_empty());
+    assert_eq!(
+        none_fresh.newest_modified_unix_nanos,
+        all_fresh.newest_modified_unix_nanos
+    );
+}
