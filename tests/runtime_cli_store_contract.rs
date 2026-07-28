@@ -557,6 +557,13 @@ fn catalog_and_extract_do_not_initialize_source_git_or_create_store() {
         ],
     );
     assert_success(&extract_output);
+    let rendered = fs::read_to_string(&output_path).expect("read conversation extract");
+    let rendered_lines = rendered.lines().count();
+    let stderr = String::from_utf8_lossy(&extract_output.stderr);
+    assert!(
+        stderr.contains(&format!(" / {rendered_lines} lines (codex) -> ")),
+        "success receipt must report the physical extract line count:\n{stderr}"
+    );
     assert!(
         !source_root.join(".git").exists(),
         "extract must not initialize git in source roots"
