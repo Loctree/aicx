@@ -250,6 +250,14 @@ fn session_mode_resolves_catalog_first_and_parses_once() {
         out_path.exists(),
         "output file must exist exactly when extraction succeeded; stderr:\n{stderr}"
     );
+    if output.status.success() {
+        let rendered = fs::read_to_string(&out_path).expect("read rendered extract");
+        let rendered_lines = rendered.lines().count();
+        assert!(
+            stderr.contains(&format!(" / {rendered_lines} lines (codex) -> ")),
+            "success receipt must report the physical extract line count:\n{stderr}"
+        );
+    }
     let _ = fs::remove_dir_all(&home);
 }
 

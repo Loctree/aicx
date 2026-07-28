@@ -26,7 +26,7 @@ use clap_complete::{Shell, generate};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, BufRead, BufReader, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::{Arc, Mutex};
@@ -5934,9 +5934,18 @@ fn write_extract_outputs(render: ExtractRender) -> Result<()> {
         )?;
     }
 
+    let output_lines = BufReader::new(
+        fs::File::open(&output_path)
+            .with_context(|| format!("Failed to open extract: {}", output_path.display()))?,
+    )
+    .lines()
+    .try_fold(0usize, |count, line| line.map(|_| count + 1))
+    .with_context(|| format!("Failed to count extract lines: {}", output_path.display()))?;
+
     eprintln!(
-        "Wrote {} entries ({}) -> {}",
+        "Wrote {} entries / {} lines ({}) -> {}",
         entries.len(),
+        output_lines,
         agent.label(),
         output_path.display()
     );
