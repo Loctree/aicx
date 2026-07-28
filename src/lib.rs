@@ -215,6 +215,7 @@ mod loctree_consumer_contract_tests {
             min_confidence: None,
             kind_filter: None,
             frame_kind: None,
+            live: false,
         };
         assert_eq!(
             config.effective_frame_kind(),
