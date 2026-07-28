@@ -603,3 +603,38 @@ Always state:
 Do not hide uncertainty.
 
 Do not claim confidence you have not earned.
+
+---
+
+# Distribution Contract — Prebuilt-First (aicx & loctree)
+
+Installing our tools on an **external / end-user machine must never require a
+build from source.** Ship prebuilt binaries; a `cargo`/source build is the
+last-resort fallback — never a default, never a silent fallback.
+
+Precedence (full channel map in `docs/install-paths.md`):
+
+1. npm prebuilt platform packages — `npm install -g @loctree/aicx`
+2. release download via curl — `AICX_INSTALL_MODE=release bash install.sh`
+   (prebuilt bundle, SHA256-verified)
+3. release bundle from an unpacked archive
+4. _developer only_ — local source / `make install-bin` → `cargo install`
+5. _developer only_ — `AICX_INSTALL_MODE=git`
+
+Why this is law: a non-programmer founder / stranger cannot be expected to have
+a Rust toolchain, `protoc`, or spare build disk. Source-build fragility
+(missing `cargo`, full disk, toolchain PATH drift) is an internal-CI concern,
+not a user-facing install path. The 2026-07-24 ops-runner outage — a self-hosted
+build machine wedged by a full disk — is the internal echo of exactly the
+failure mode a stranger would hit; do not export it to users.
+
+Agent rules:
+
+- When adding or changing an install/packaging path, keep channels 1–3 free of
+  any `cargo`/`rustc`/compile step (postinstall may only download, verify,
+  extract, copy). Confirm by audit, not assumption.
+- Never make source-build the default resolution for a non-dev entry point.
+  Known sharp edge: `install.sh` `auto` mode resolves to `local` (source) when a
+  `Cargo.toml` is adjacent — dev-only, but pass `AICX_INSTALL_MODE=release`
+  explicitly in any non-dev automation.
+- The same contract applies to loctree's curl-installable releases.

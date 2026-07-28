@@ -573,19 +573,29 @@ fn catalog_and_extract_do_not_initialize_source_git_or_create_store() {
 }
 
 #[test]
-fn retired_store_subcommand_is_rejected() {
-    let root = unique_test_dir("retired-store-command");
+fn store_subcommand_is_a_catalog_alias_without_card_mill() {
+    let root = unique_test_dir("store-catalog-alias");
     let home = root.join("home");
-    let output = run_aicx(&home, &["store"]);
 
-    assert_eq!(output.status.code(), Some(2));
+    // Bare `aicx store` is recognized grammar (alias of `catalog`), so clap
+    // demands a subcommand instead of rejecting the name outright.
+    let bare = run_aicx(&home, &["store"]);
+    assert_eq!(bare.status.code(), Some(2));
+    let bare_stderr = String::from_utf8_lossy(&bare.stderr);
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("unrecognized subcommand 'store'"),
-        "retired command should fail at the CLI grammar boundary"
+        !bare_stderr.contains("unrecognized subcommand"),
+        "`store` must be a live alias, not an unknown command:\n{bare_stderr}"
     );
+
+    // `aicx store rebuild` runs the catalog engine and never materializes
+    // the retired `~/.aicx/store/` card mill.
+    let rebuild = run_aicx(&home, &["store", "rebuild", "--json"]);
+    assert_success(&rebuild);
+    let catalog = parse_stdout_json(&rebuild);
+    assert_eq!(catalog["cards_written"].as_u64(), Some(0));
     assert!(
         !home.join(".aicx").join("store").exists(),
-        "rejected command must not recreate the retired card store"
+        "store alias must not recreate the retired card store"
     );
 
     let _ = fs::remove_dir_all(&root);
