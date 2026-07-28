@@ -79,6 +79,7 @@ pub mod output;
 pub mod overlay;
 #[cfg(feature = "app")]
 pub mod parser_dispatch;
+mod process_liveness;
 #[cfg(feature = "app")]
 pub mod progress;
 #[cfg(feature = "app")]

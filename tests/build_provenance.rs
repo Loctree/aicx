@@ -3,10 +3,12 @@ mod build_support;
 
 use std::{
     fs,
-    os::unix::fs::PermissionsExt as _,
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt as _;
 
 struct TempDir(PathBuf);
 
@@ -96,6 +98,7 @@ fn inspect(home: &Path, path: Option<&str>, mcp_config: Option<&Path>) -> serde_
     serde_json::from_slice(&output.stdout).expect("inspection JSON")
 }
 
+#[cfg(unix)]
 fn write_executable(path: &Path, body: &str) {
     fs::write(path, body).expect("write fake executable");
     let mut permissions = fs::metadata(path)
@@ -144,6 +147,7 @@ fn runtime_inspection_and_mcp_server_info_share_build_identity() {
 }
 
 #[test]
+#[cfg(unix)]
 fn runtime_inspection_reports_stale_path_binary_and_missing_config_target() {
     let home = TempDir::new("drift-home");
     let fake_bin = home.path().join(".local/bin");
@@ -152,6 +156,15 @@ fn runtime_inspection_reports_stale_path_binary_and_missing_config_target() {
         &fake_bin.join("aicx-mcp"),
         "#!/bin/sh\necho 'aicx-mcp 0.1.0+gdeadbeef'\n",
     );
+    // macOS syspolicyd assesses a freshly written executable on its first
+    // spawn; on a loaded CI host that one-time assessment can exceed the 2s
+    // version-probe budget and misreport the candidate as "unavailable".
+    // Pay the Gatekeeper cost here so the probe measures the binary itself.
+    Command::new(fake_bin.join("aicx-mcp"))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("warm up fake aicx-mcp");
     let config = home.path().join("mcp.json");
     let config_body = r#"{"mcpServers":{"aicx":{"command":"/missing/aicx-mcp"},"aicx-wrapper":{"command":"rust-mux-proxy"},"aicx-secret":{"command":"https://operator:super-secret@example.test/aicx-mcp?token=never-print-me"}}}"#;
     fs::write(&config, config_body).expect("write MCP config");
@@ -169,10 +182,15 @@ fn runtime_inspection_reports_stale_path_binary_and_missing_config_target() {
     let mcp_candidates = payload["installations"]["aicx_mcp"]
         .as_array()
         .expect("MCP candidates");
-    assert!(mcp_candidates.iter().any(|candidate| {
-        candidate["path"] == fake_bin.join("aicx-mcp").display().to_string()
-            && candidate["status"] == "drift"
-    }));
+    assert!(
+        mcp_candidates.iter().any(|candidate| {
+            candidate["path"] == fake_bin.join("aicx-mcp").display().to_string()
+                && candidate["status"] == "drift"
+        }),
+        "expected drift candidate at {} — actual candidates: {}",
+        fake_bin.join("aicx-mcp").display(),
+        serde_json::to_string_pretty(&payload["installations"]).unwrap_or_default()
+    );
     let configured = payload["mcp"]["configured_targets"]
         .as_array()
         .expect("configured targets");
