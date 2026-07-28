@@ -283,21 +283,32 @@ pub fn index_status_at(base: &Path, project: Option<&str>) -> Result<IndexStatus
     index_status_at_with_sessions(base, project, None)
 }
 
+/// (project, source_mtime_ns) per catalog row — the census fingerprint is the
+/// zero-walk freshness truth for status surfaces.
 #[cfg(feature = "app")]
-fn catalog_projects_for_status(base: &Path) -> Vec<Option<String>> {
+fn catalog_rows_for_status(base: &Path) -> Vec<(Option<String>, Option<u64>)> {
     crate::catalog::read_entries_at(base)
         .unwrap_or_default()
         .into_iter()
-        .map(|entry| entry.project)
+        .map(|entry| (entry.project, entry.source_mtime_ns))
         .collect()
 }
 
 #[cfg(not(feature = "app"))]
-fn catalog_projects_for_status(_base: &Path) -> Vec<Option<String>> {
+fn catalog_rows_for_status(_base: &Path) -> Vec<(Option<String>, Option<u64>)> {
     // The slim library profile intentionally excludes source discovery and
     // catalog ingestion. Status remains bounded and reports legacy read-core
     // state without pulling the app graph into `loctree-consumer`.
     Vec::new()
+}
+
+/// RFC3339 of a unix-nanosecond mtime.
+fn mtime_ns_to_rfc3339(mtime_ns: u64) -> Option<String> {
+    chrono::DateTime::<chrono::Utc>::from_timestamp(
+        (mtime_ns / 1_000_000_000) as i64,
+        (mtime_ns % 1_000_000_000) as u32,
+    )
+    .map(|dt| dt.to_rfc3339())
 }
 
 fn index_status_at_with_sessions(
@@ -330,7 +341,11 @@ fn index_status_at_with_sessions(
     // Boundedness first: when CURRENT/catalog/residual mill are all absent,
     // report Missing immediately. Never walk live agent trees (codex 42 GB,
     // claude 5.9 GB) just to print "missing" — audit measured >60 s hangs.
-    let catalog_entries = catalog_projects_for_status(base);
+    let catalog_rows = catalog_rows_for_status(base);
+    let catalog_entries: Vec<Option<String>> = catalog_rows
+        .iter()
+        .map(|(project, _)| project.clone())
+        .collect();
     let residual_mill_present = residual_store_surface_present(base);
     if catalog_entries.is_empty()
         && !residual_mill_present
@@ -385,6 +400,21 @@ fn index_status_at_with_sessions(
                 })
                 .count(),
         };
+        let newest_session_mtime_ns = match project_filter {
+            None => catalog_rows
+                .iter()
+                .filter_map(|(_, mtime_ns)| *mtime_ns)
+                .max(),
+            Some(filter) => catalog_rows
+                .iter()
+                .filter(|(project, _)| {
+                    project
+                        .as_deref()
+                        .is_some_and(|p| p.eq_ignore_ascii_case(filter))
+                })
+                .filter_map(|(_, mtime_ns)| *mtime_ns)
+                .max(),
+        };
         return Ok(IndexStatus {
             canonical_chunks: 0,
             semantic_index_present: false,
@@ -392,7 +422,7 @@ fn index_status_at_with_sessions(
             semantic_index_rows: 0,
             newest_chunk_mtime: None,
             source_sessions: catalog_in_scope,
-            newest_session_updated_at: None,
+            newest_session_updated_at: newest_session_mtime_ns.and_then(mtime_ns_to_rfc3339),
             sessions_newer_than_chunks: catalog_in_scope,
             sessions_without_timestamps: 0,
             chunking_lag_secs: None,
@@ -554,19 +584,41 @@ fn hybrid_current_index_status(base: &Path, project: Option<&str>) -> Result<Opt
         return Ok(None);
     }
 
-    let catalog_entries = catalog_projects_for_status(base);
-    let catalog_total = catalog_entries.len();
+    let catalog_rows = catalog_rows_for_status(base);
+    let catalog_total = catalog_rows.len();
     let project_filter = project.map(str::trim).filter(|value| !value.is_empty());
-    let catalog_in_scope = match project_filter {
-        None => catalog_total,
-        Some(filter) => catalog_entries
+    let in_scope: Vec<&(Option<String>, Option<u64>)> = match project_filter {
+        None => catalog_rows.iter().collect(),
+        Some(filter) => catalog_rows
             .iter()
-            .filter(|project| {
+            .filter(|(project, _)| {
                 project
                     .as_deref()
                     .is_some_and(|project| project.eq_ignore_ascii_case(filter))
             })
+            .collect(),
+    };
+    let catalog_in_scope = in_scope.len();
+
+    // Census fingerprints are the zero-walk freshness truth: the newest
+    // session mtime recorded at last rebuild, and how many in-scope sessions
+    // are newer than this CURRENT generation. `<none>`/0 while agents are
+    // visibly active was the P0 "freshness lie" — never fake these again.
+    let newest_session_mtime_ns = in_scope.iter().filter_map(|(_, mtime_ns)| *mtime_ns).max();
+    let build_completed_ns = manifest
+        .build_completed_at
+        .timestamp_nanos_opt()
+        .map(|nanos| nanos as u64);
+    let sessions_newer = match build_completed_ns {
+        Some(build_ns) => in_scope
+            .iter()
+            .filter(|(_, mtime_ns)| mtime_ns.is_some_and(|mtime| mtime > build_ns))
             .count(),
+        None => 0,
+    };
+    let chunking_lag_secs = match (newest_session_mtime_ns, build_completed_ns) {
+        (Some(newest), Some(build)) if newest > build => Some((newest - build) / 1_000_000_000),
+        _ => None,
     };
 
     let committed_at = Some(manifest.build_completed_at.to_rfc3339());
@@ -580,7 +632,9 @@ fn hybrid_current_index_status(base: &Path, project: Option<&str>) -> Result<Opt
     // Catalog rows beyond CURRENT lexical docs mean sessions are admitted but
     // not yet published — stale index relative to the durable catalog.
     let pending = catalog_total.saturating_sub(manifest.lexical_doc_count);
-    let readiness = if pending > 0 {
+    let readiness = if sessions_newer > 0 {
+        IndexReadiness::StaleChunks
+    } else if pending > 0 {
         IndexReadiness::StaleIndex
     } else {
         IndexReadiness::Ready
@@ -600,10 +654,10 @@ fn hybrid_current_index_status(base: &Path, project: Option<&str>) -> Result<Opt
         semantic_index_rows: manifest.lexical_doc_count,
         newest_chunk_mtime: generation_mtime.clone(),
         source_sessions: catalog_in_scope,
-        newest_session_updated_at: None,
-        sessions_newer_than_chunks: 0,
+        newest_session_updated_at: newest_session_mtime_ns.and_then(mtime_ns_to_rfc3339),
+        sessions_newer_than_chunks: sessions_newer,
         sessions_without_timestamps: 0,
-        chunking_lag_secs: None,
+        chunking_lag_secs,
         semantic_index_mtime: generation_mtime,
         semantic_lag_secs: None,
         pending_chunks: pending,
@@ -810,6 +864,62 @@ mod tests {
         let status = client.index_status(None).expect("index status");
         assert_eq!(status.canonical_chunks, 0);
         assert!(!status.semantic_index_present);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(feature = "app")]
+    fn catalog_only_status_reports_newest_session_mtime_from_census_fingerprints() {
+        let root = std::env::temp_dir().join(format!(
+            "aicx-api-census-freshness-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let catalog_path = crate::catalog::sessions_path_for(&root);
+        std::fs::create_dir_all(catalog_path.parent().expect("catalog parent"))
+            .expect("create catalog dir");
+        let older_ns: u64 = 1_753_000_000_000_000_000;
+        let newer_ns: u64 = 1_753_600_000_000_000_000;
+        let row = |session: &str, mtime_ns: u64| {
+            serde_json::to_string(&crate::catalog::CatalogEntry {
+                schema: crate::catalog::CATALOG_SCHEMA.to_string(),
+                session_id: session.to_string(),
+                agent: "claude".to_string(),
+                project: Some("Loctree/aicx".to_string()),
+                date: Some("2026-07-28".to_string()),
+                cwd: None,
+                source_path: format!("/tmp/{session}.jsonl"),
+                source_len: Some(1),
+                source_mtime_ns: Some(mtime_ns),
+                title: None,
+                machine: None,
+                logical_session_id: None,
+            })
+            .expect("serialize row")
+        };
+        std::fs::write(
+            &catalog_path,
+            format!("{}\n{}\n", row("older", older_ns), row("newer", newer_ns)),
+        )
+        .expect("write census");
+
+        let status = index_status_at(&root, None).expect("index status");
+        let newest = status
+            .newest_session_updated_at
+            .expect("census fingerprints must surface a real newest_session_updated_at");
+        let expected = chrono::DateTime::<chrono::Utc>::from_timestamp(
+            (newer_ns / 1_000_000_000) as i64,
+            (newer_ns % 1_000_000_000) as u32,
+        )
+        .expect("timestamp")
+        .to_rfc3339();
+        assert_eq!(
+            newest, expected,
+            "must pick the NEWEST in-scope fingerprint"
+        );
+        assert_eq!(status.backend, "catalog_only");
 
         let _ = std::fs::remove_dir_all(root);
     }

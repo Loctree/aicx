@@ -4549,6 +4549,21 @@ fn run_intents(
         records.truncate(limit);
     }
 
+    // P2.8 fail-closed: an empty result served from a census older than half
+    // the requested window, with nothing admitted live, is indistinguishable
+    // from "nothing happened" — and that silence is a lie. Refuse it.
+    if records.is_empty()
+        && hours > 0
+        && extraction.stats.live_sessions == 0
+        && let Some(lag) = catalog_lag_hours()
+        && lag > (hours as f64) / 2.0
+    {
+        anyhow::bail!(
+            "stale_context_engine: 0 records in the last {hours}h, but the catalog census is {lag:.1}h old and the live scan admitted 0 sessions\n\
+             hint: run `aicx catalog rebuild` (then `aicx index`); an empty result from a stale engine is a bug, not \"no intent\""
+        );
+    }
+
     if records.is_empty() && emit != "json" {
         // Honesty even when empty: a hot window with zero records must show
         // whether the live scan actually ran and how stale the census is —
