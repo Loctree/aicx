@@ -6,7 +6,8 @@ use serde::Serialize;
 use std::path::{Path, PathBuf};
 
 use crate::chunker::{
-    CARD_CLAIM_SCOPE_SESSION_CLOSE, CARD_FRESHNESS_CONTRACT_HISTORICAL,
+    CARD_CLAIM_SCOPE_OPEN_SESSION, CARD_CLAIM_SCOPE_SESSION_CLOSE,
+    CARD_FRESHNESS_CONTRACT_HISTORICAL, CARD_FRESHNESS_CONTRACT_LIVE,
     CARD_VERIFICATION_STATE_NOT_VERIFIED_BY_AICX,
 };
 
@@ -33,6 +34,22 @@ impl ClaimHonesty {
             freshness_contract: Some(CARD_FRESHNESS_CONTRACT_HISTORICAL.to_string()),
             verification_state: Some(CARD_VERIFICATION_STATE_NOT_VERIFIED_BY_AICX.to_string()),
         }
+    }
+
+    /// Live-window frame for claims read from open (or catalog-unadmitted)
+    /// sessions: fresher than the durable census, never runtime-verified,
+    /// and explicitly NOT bound to a session close.
+    pub fn live_open() -> Self {
+        Self {
+            claim_scope: Some(CARD_CLAIM_SCOPE_OPEN_SESSION.to_string()),
+            freshness_contract: Some(CARD_FRESHNESS_CONTRACT_LIVE.to_string()),
+            verification_state: Some(CARD_VERIFICATION_STATE_NOT_VERIFIED_BY_AICX.to_string()),
+        }
+    }
+
+    /// True when this frame carries the live/open-session contract.
+    pub fn is_live_open(&self) -> bool {
+        self.claim_scope.as_deref() == Some(CARD_CLAIM_SCOPE_OPEN_SESSION)
     }
 
     /// Compact operator-facing honesty line, e.g.

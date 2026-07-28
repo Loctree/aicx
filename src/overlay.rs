@@ -428,6 +428,9 @@ fn load_catalog_intent_feed(
             min_confidence: None,
             kind_filter: None,
             frame_kind: Some(frame_kind),
+            // Overlay is a durable-identity join over the full census; the
+            // hot live window has no meaning at hours=0.
+            live: false,
         };
         let extraction = extract_intents_from_root_at_with_stats(&config, aicx_home, Utc::now())
             .with_context(|| {

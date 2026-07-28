@@ -1455,6 +1455,15 @@ enum Commands {
         /// Filter by kind: decision, intent, outcome, task
         #[arg(long, value_parser = ["decision", "intent", "outcome", "task"])]
         kind: Option<String>,
+
+        /// Force the live source-root scan regardless of the window size.
+        /// (Windows of ≤ 48h scan live sources automatically.)
+        #[arg(long, conflicts_with = "no_live")]
+        live: bool,
+
+        /// Disable the automatic live scan for hot (≤ 48h) windows.
+        #[arg(long)]
+        no_live: bool,
     },
 
     /// Print recent intents/chunks (snapshot mode); add --follow to stream new arrivals.
@@ -2683,7 +2692,10 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
             strict,
             min_confidence,
             kind,
+            live,
+            no_live,
         }) => {
+            let live_mode = live || (intents::IntentsConfig::auto_live(hours) && !no_live);
             run_intents(
                 &project,
                 hours,
@@ -2698,6 +2710,7 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
                     unresolved_mode: unresolved_mode.into(),
                     collapse_session,
                 },
+                live_mode,
             )?;
         }
         Some(Commands::Tail {
@@ -4402,12 +4415,42 @@ fn print_no_intents_message(
     Ok(())
 }
 
+/// Age of the durable catalog census in hours (None when no catalog exists).
+fn catalog_lag_hours() -> Option<f64> {
+    let home = aicx::aicx_home::resolve().ok()?;
+    let mtime = std::fs::metadata(aicx::catalog::sessions_path_for(&home))
+        .ok()?
+        .modified()
+        .ok()?;
+    let age = std::time::SystemTime::now().duration_since(mtime).ok()?;
+    Some(age.as_secs_f64() / 3600.0)
+}
+
+/// P0 live-window report header: never let a hot query masquerade as a pure
+/// census read. Printed on text surfaces only (JSON carries the same truth
+/// inside `completeness.live_sessions`).
+fn print_live_window_header(live_sessions: usize) {
+    println!("live_sessions: {live_sessions}");
+    match catalog_lag_hours() {
+        Some(lag) => println!("index_lag_hours: {lag:.1}"),
+        None => println!("index_lag_hours: unknown (no catalog census)"),
+    }
+    let mode = if live_sessions > 0 {
+        "hybrid_live"
+    } else {
+        "catalog_index (live scan: 0 newer than census)"
+    };
+    println!("mode: {mode}\n");
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_intents(
     projects: &[String],
     hours: u64,
     filters: RetrievalFilters,
     project_match: legacy_archive::ProjectMatchMode,
     display: IntentsDisplayOptions<'_>,
+    live: bool,
 ) -> Result<()> {
     let IntentsDisplayOptions {
         emit,
@@ -4437,7 +4480,14 @@ fn run_intents(
     let effective_projects = project_resolution.selected.clone();
 
     if should_render_intents_pack(&filters, emit, kind, unresolved, collapse_session) {
-        run_intents_pack(&effective_projects, hours, &filters, strict, min_confidence)?;
+        run_intents_pack(
+            &effective_projects,
+            hours,
+            &filters,
+            strict,
+            min_confidence,
+            live,
+        )?;
         return Ok(());
     }
 
@@ -4448,6 +4498,7 @@ fn run_intents(
         min_confidence,
         kind_filter: if unresolved { None } else { kind_filter },
         frame_kind: filters.frame_kind.map(Into::into),
+        live,
     };
 
     let extraction =
@@ -4499,6 +4550,12 @@ fn run_intents(
     }
 
     if records.is_empty() && emit != "json" {
+        // Honesty even when empty: a hot window with zero records must show
+        // whether the live scan actually ran and how stale the census is —
+        // "no intents" and "stale engine" are different truths.
+        if live {
+            print_live_window_header(extraction.stats.live_sessions);
+        }
         let unresolved_note = (unresolved
             && unresolved_mode == aicx::intents::UnresolvedMode::Session
             && post_kind == Some(intents::IntentKind::Intent))
@@ -4549,6 +4606,9 @@ fn run_intents(
             println!("{}", json);
         }
         _ => {
+            if live {
+                print_live_window_header(extraction.stats.live_sessions);
+            }
             let md = intents::format_intents_markdown(&records);
             print!("{}", md);
         }
@@ -4577,10 +4637,11 @@ fn run_intents_pack(
     filters: &RetrievalFilters,
     strict: bool,
     min_confidence: Option<u8>,
+    live: bool,
 ) -> Result<()> {
     let lane_sort = filters.sort.unwrap_or(SortOrder::Newest);
     let lane_limit = filters.limit.or(Some(DEFAULT_INTENTS_PACK_LIMIT));
-    let decisions = extract_intents_pack_lane(
+    let (decisions, live_a) = extract_intents_pack_lane(
         projects,
         hours,
         filters,
@@ -4592,8 +4653,9 @@ fn run_intents_pack(
         false,
         lane_sort,
         lane_limit,
+        live,
     )?;
-    let tasks = extract_intents_pack_lane(
+    let (tasks, live_b) = extract_intents_pack_lane(
         projects,
         hours,
         filters,
@@ -4605,8 +4667,9 @@ fn run_intents_pack(
         false,
         lane_sort,
         lane_limit,
+        live,
     )?;
-    let user_msg = extract_intents_pack_lane(
+    let (user_msg, live_c) = extract_intents_pack_lane(
         projects,
         hours,
         filters,
@@ -4618,8 +4681,9 @@ fn run_intents_pack(
         false,
         lane_sort,
         lane_limit,
+        live,
     )?;
-    let agent_reply = extract_intents_pack_lane(
+    let (agent_reply, live_d) = extract_intents_pack_lane(
         projects,
         hours,
         filters,
@@ -4631,8 +4695,9 @@ fn run_intents_pack(
         false,
         lane_sort,
         lane_limit,
+        live,
     )?;
-    let unresolved = extract_intents_pack_lane(
+    let (unresolved, live_e) = extract_intents_pack_lane(
         projects,
         hours,
         filters,
@@ -4644,7 +4709,13 @@ fn run_intents_pack(
         true,
         lane_sort,
         lane_limit,
+        live,
     )?;
+    // Lanes overlap on the same sessions — the widest lane is the honest count.
+    let live_sessions = live_a.max(live_b).max(live_c).max(live_d).max(live_e);
+    if live {
+        print_live_window_header(live_sessions);
+    }
 
     let sections = vec![
         IntentPackSection {
@@ -4693,7 +4764,8 @@ fn extract_intents_pack_lane(
     unresolved: bool,
     sort: SortOrder,
     limit: Option<usize>,
-) -> Result<Vec<intents::IntentRecord>> {
+    live: bool,
+) -> Result<(Vec<intents::IntentRecord>, usize)> {
     let config = intents::IntentsConfig {
         project: projects.first().cloned().unwrap_or_default(),
         hours,
@@ -4701,6 +4773,7 @@ fn extract_intents_pack_lane(
         min_confidence,
         kind_filter: if unresolved { None } else { kind_filter },
         frame_kind,
+        live,
     };
     let extraction = intents::extract_intents_with_stats_for_projects(&config, projects)?;
     let (date_lo, date_hi) = intent_date_bounds(filters)?;
@@ -4723,7 +4796,7 @@ fn extract_intents_pack_lane(
     if unresolved && let Some(kind) = kind_filter {
         records.retain(|record| record.kind == kind);
     }
-    Ok(records)
+    Ok((records, extraction.stats.live_sessions))
 }
 
 fn intent_date_bounds(filters: &RetrievalFilters) -> Result<(Option<String>, Option<String>)> {
@@ -4917,6 +4990,7 @@ fn run_tail(
                 unresolved_mode: aicx::intents::UnresolvedMode::Session,
                 collapse_session: false,
             },
+            intents::IntentsConfig::auto_live(hours),
         );
     }
 
@@ -4937,6 +5011,7 @@ fn run_tail(
         min_confidence: None,
         kind_filter,
         frame_kind: filters.frame_kind.map(Into::into),
+        live: intents::IntentsConfig::auto_live(hours),
     };
 
     let mut last_seen = std::collections::HashSet::new();

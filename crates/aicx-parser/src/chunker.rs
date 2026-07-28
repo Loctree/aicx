@@ -175,6 +175,11 @@ pub const CARD_SCHEMA_VERSION: u32 = 2;
 pub const CARD_CLAIM_SCOPE_SESSION_CLOSE: &str = "session_close";
 pub const CARD_FRESHNESS_CONTRACT_HISTORICAL: &str = "historical";
 pub const CARD_VERIFICATION_STATE_NOT_VERIFIED_BY_AICX: &str = "not_verified_by_aicx";
+/// Live-window claims read from sessions that are still open (or newer than
+/// the durable catalog census). Distinct from the historical/session-close
+/// contract so consumers can never mistake an in-flight claim for a closed one.
+pub const CARD_CLAIM_SCOPE_OPEN_SESSION: &str = "open_session";
+pub const CARD_FRESHNESS_CONTRACT_LIVE: &str = "live_unverified";
 
 /// Canonical `kind` labels for [`CardSignal`] records. One label per
 /// `ChunkSignals` family plus `highlight`; consumers (validator, migration,

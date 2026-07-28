@@ -24,6 +24,7 @@ impl IntentsScreen {
             min_confidence: None,
             kind_filter: None,
             frame_kind: None,
+            live: intents::IntentsConfig::auto_live(hours),
         };
 
         match intents::extract_intents(&config) {

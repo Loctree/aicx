@@ -887,6 +887,7 @@ fn intents_project_resolver_exact_and_fuzzy_modes_are_separate() {
         matched_project_buckets: fuzzy.selected.clone(),
         identity_source: intents::PERSISTED_IDENTITY_SOURCE.to_string(),
         path_heuristic_records: 0,
+        live_sessions: 0,
     };
     let complete = stats.completeness(None, 1);
     assert_eq!(
@@ -937,6 +938,7 @@ fn intents_json_envelope_reports_cap_warning_and_limit_saturation() {
             min_confidence: None,
             kind_filter: None,
             frame_kind: None,
+            live: false,
         })
         .expect("extract over-cap intents fixture");
     assert!(extraction.stats.dropped_candidates > 0);

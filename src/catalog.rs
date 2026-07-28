@@ -485,6 +485,87 @@ pub fn status(home: &Path, user_home: &Path) -> Result<CatalogStatusReport> {
     })
 }
 
+/// Hot-window live delta: sessions present on disk that the durable catalog
+/// census does not admit yet. `newest_live_mtime_ns` spans ALL live sessions
+/// (lag honesty), while `unadmitted` carries only the sessions a hot query
+/// must parse ad-hoc. Same discovery + enrichment as `rebuild`, no writes.
+#[derive(Debug, Clone, Default)]
+pub struct LiveDelta {
+    pub unadmitted: Vec<CatalogEntry>,
+    pub live_sessions: usize,
+    pub newest_live_mtime_ns: Option<u64>,
+    pub wall_ms: u64,
+}
+
+/// One command run (or one MCP burst) should pay for a single source-root
+/// walk even when several extraction lanes ask for the delta back-to-back.
+/// 30 s stays comfortably inside the ≤60 s live-window freshness SLA.
+const LIVE_DELTA_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+#[allow(clippy::type_complexity)]
+static LIVE_DELTA_CACHE: std::sync::Mutex<Option<(Instant, PathBuf, PathBuf, LiveDelta)>> =
+    std::sync::Mutex::new(None);
+
+pub fn live_delta(home: &Path, user_home: &Path) -> Result<LiveDelta> {
+    if let Ok(guard) = LIVE_DELTA_CACHE.lock()
+        && let Some((stamp, cached_home, cached_user_home, delta)) = guard.as_ref()
+        && stamp.elapsed() < LIVE_DELTA_CACHE_TTL
+        && cached_home == home
+        && cached_user_home == user_home
+    {
+        return Ok(delta.clone());
+    }
+    let delta = live_delta_uncached(home, user_home)?;
+    if let Ok(mut guard) = LIVE_DELTA_CACHE.lock() {
+        *guard = Some((
+            Instant::now(),
+            home.to_path_buf(),
+            user_home.to_path_buf(),
+            delta.clone(),
+        ));
+    }
+    Ok(delta)
+}
+
+/// Seed the live-delta cache so unit tests exercise the intents live window
+/// without walking the developer's real agent roots.
+#[cfg(test)]
+pub(crate) fn prime_live_delta_cache_for_tests(home: &Path, user_home: &Path, delta: LiveDelta) {
+    if let Ok(mut guard) = LIVE_DELTA_CACHE.lock() {
+        *guard = Some((
+            Instant::now(),
+            home.to_path_buf(),
+            user_home.to_path_buf(),
+            delta,
+        ));
+    }
+}
+
+fn live_delta_uncached(home: &Path, user_home: &Path) -> Result<LiveDelta> {
+    let started = Instant::now();
+    let catalog_keys: BTreeSet<(String, String)> = read_entries_at(home)?
+        .into_iter()
+        .map(|entry| (entry.agent, entry.session_id))
+        .collect();
+    let live = scan_live_entries(user_home);
+    let live_sessions = live.len();
+    let newest_live_mtime_ns = live
+        .values()
+        .filter_map(|entry| entry.source_mtime_ns)
+        .max();
+    let unadmitted = live
+        .into_iter()
+        .filter(|(key, _)| !catalog_keys.contains(key))
+        .map(|(_, entry)| entry)
+        .collect();
+    Ok(LiveDelta {
+        unadmitted,
+        live_sessions,
+        newest_live_mtime_ns,
+        wall_ms: started.elapsed().as_millis() as u64,
+    })
+}
+
 fn scan_live_entries(user_home: &Path) -> BTreeMap<(String, String), CatalogEntry> {
     scan_live_entries_with_progress(user_home, Instant::now(), &mut |_| {})
 }
@@ -1075,6 +1156,42 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         root
+    }
+
+    #[test]
+    fn live_delta_reports_unadmitted_until_rebuild_admits_them() {
+        let dir = test_root("live-delta");
+        let home = dir.join(".aicx");
+        let user = dir.join("user");
+        fs::create_dir_all(user.join(".claude").join("projects").join("proj")).unwrap();
+        let session = user
+            .join(".claude")
+            .join("projects")
+            .join("proj")
+            .join("bbbbbbbb-cccc-dddd-eeee-ffffffffffff.jsonl");
+        let mut f = File::create(&session).unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"user","sessionId":"bbbbbbbb-cccc-dddd-eeee-ffffffffffff","message":{{"content":"live window probe"}}}}"#
+        )
+        .unwrap();
+
+        // No durable catalog yet: the whole live surface is unadmitted.
+        let before = live_delta_uncached(&home, &user).unwrap();
+        assert_eq!(before.live_sessions, 1);
+        assert_eq!(before.unadmitted.len(), 1);
+        assert!(before.newest_live_mtime_ns.is_some());
+        assert_eq!(before.unadmitted[0].agent, "claude");
+
+        // Rebuild admits the session — the delta must drain to zero.
+        rebuild(&home, &user).unwrap();
+        let after = live_delta_uncached(&home, &user).unwrap();
+        assert_eq!(after.live_sessions, 1);
+        assert!(
+            after.unadmitted.is_empty(),
+            "admitted session still reported unadmitted: {:?}",
+            after.unadmitted
+        );
     }
 
     #[test]

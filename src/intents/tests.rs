@@ -56,6 +56,7 @@ fn extract_demo_extraction(label: &str, body: &str) -> IntentExtraction {
         min_confidence: None,
         kind_filter: None,
         frame_kind: None,
+        live: false,
     };
     let now = DateTime::<Utc>::from_naive_utc_and_offset(
         NaiveDate::from_ymd_opt(2026, 3, 15)
@@ -69,6 +70,180 @@ fn extract_demo_extraction(label: &str, body: &str) -> IntentExtraction {
         extract_intents_from_root_at_with_stats(&config, &root, now).expect("extract intents");
     let _ = fs::remove_dir_all(root);
     extraction
+}
+
+#[test]
+fn markdown_separates_live_open_claims_from_closed_timeline() {
+    let record = |summary: &str, honesty: crate::oracle::ClaimHonesty| IntentRecord {
+        kind: IntentKind::Outcome,
+        summary: summary.to_string(),
+        context: None,
+        evidence: Vec::new(),
+        project: "Loctree/aicx".to_string(),
+        agent: "vibecrafted".to_string(),
+        date: "2026-07-28".to_string(),
+        timestamp: None,
+        session_id: "live-md".to_string(),
+        count: None,
+        first_chunk: None,
+        last_chunk: None,
+        source_chunk: "/tmp/live-md.log".to_string(),
+        source: None,
+        honesty,
+    };
+    let records = vec![
+        record("closed claim", crate::oracle::ClaimHonesty::canonical()),
+        record("in-flight claim", crate::oracle::ClaimHonesty::live_open()),
+    ];
+
+    let markdown = format_intents_markdown(&records);
+    let live_heading = markdown
+        .find("## Live Session Intent (unverified, open)")
+        .expect("live section heading");
+    let closed_heading = markdown
+        .find("## Closed Session Intent")
+        .expect("closed section heading");
+    let live_claim = markdown.find("in-flight claim").expect("live claim");
+    let closed_claim = markdown.find("closed claim").expect("closed claim");
+    assert!(live_heading < live_claim && live_claim < closed_heading);
+    assert!(closed_heading < closed_claim);
+    assert!(markdown.contains("live unverified @ open session"));
+
+    // No live records → classic single-timeline shape, no live headings.
+    let closed_only = format_intents_markdown(&[record(
+        "closed claim",
+        crate::oracle::ClaimHonesty::canonical(),
+    )]);
+    assert!(!closed_only.contains("Live Session Intent"));
+    assert!(!closed_only.contains("Closed Session Intent"));
+}
+
+#[test]
+#[cfg(feature = "app")]
+fn live_window_admits_fresh_mtime_rows_and_unadmitted_sessions() {
+    let root = migration_test_root("live-window");
+    let _ = fs::remove_dir_all(&root);
+
+    // Row A: catalog row whose census DATE is far outside the window, but
+    // whose live source file is freshly written (mtime = now).
+    let stale_dated = root.join("runtime_runs/live-a/transcript.log");
+    fs::create_dir_all(stale_dated.parent().expect("parent")).expect("create parent");
+    fs::write(
+        &stale_dated,
+        "We completed the live-window admission for the stale-dated row.\n",
+    )
+    .expect("write stale-dated source");
+    let catalog_path = crate::catalog::sessions_path_for(&root);
+    fs::create_dir_all(catalog_path.parent().expect("catalog parent"))
+        .expect("create catalog parent");
+    let row_a = crate::catalog::CatalogEntry {
+        schema: crate::catalog::CATALOG_SCHEMA.to_string(),
+        session_id: "live-a".to_string(),
+        agent: "vibecrafted".to_string(),
+        project: Some("Loctree/aicx".to_string()),
+        date: Some("2026-01-01".to_string()),
+        cwd: None,
+        source_path: stale_dated.display().to_string(),
+        source_len: None,
+        source_mtime_ns: None,
+        title: None,
+        machine: Some("test".to_string()),
+        logical_session_id: None,
+    };
+    fs::write(
+        &catalog_path,
+        format!(
+            "{}\n",
+            serde_json::to_string(&row_a).expect("serialize row")
+        ),
+    )
+    .expect("write catalog");
+
+    // Row B: session the census does not know at all (unadmitted). The
+    // live-delta cache is primed so the test never walks real agent roots.
+    let unadmitted = root.join("runtime_runs/live-b/transcript.log");
+    fs::create_dir_all(unadmitted.parent().expect("parent")).expect("create parent");
+    fs::write(
+        &unadmitted,
+        "We completed the live-window admission for the unadmitted session.\n",
+    )
+    .expect("write unadmitted source");
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("unix time")
+        .as_nanos() as u64;
+    let row_b = crate::catalog::CatalogEntry {
+        schema: crate::catalog::CATALOG_SCHEMA.to_string(),
+        session_id: "live-b".to_string(),
+        agent: "vibecrafted".to_string(),
+        project: Some("Loctree/aicx".to_string()),
+        date: None,
+        cwd: None,
+        source_path: unadmitted.display().to_string(),
+        source_len: Some(64),
+        source_mtime_ns: Some(now_ns),
+        title: None,
+        machine: Some("test".to_string()),
+        logical_session_id: None,
+    };
+    let production_user_home = crate::os_user_home().unwrap_or_else(|| root.clone());
+    crate::catalog::prime_live_delta_cache_for_tests(
+        &root,
+        &production_user_home,
+        crate::catalog::LiveDelta {
+            unadmitted: vec![row_b],
+            live_sessions: 2,
+            newest_live_mtime_ns: Some(now_ns),
+            wall_ms: 0,
+        },
+    );
+
+    let config = |live: bool| IntentsConfig {
+        project: "Loctree/aicx".to_string(),
+        hours: 24,
+        strict: false,
+        min_confidence: None,
+        kind_filter: Some(IntentKind::Outcome),
+        frame_kind: Some(FrameKind::AgentReply),
+        live,
+    };
+
+    // Census-only view: the stale date drops row A and row B is invisible.
+    let closed = extract_intents_from_root_at_with_stats(&config(false), &root, Utc::now())
+        .expect("extract without live window");
+    assert_eq!(closed.stats.live_sessions, 0);
+    assert!(
+        closed.records.is_empty(),
+        "census-only extraction must not see live rows: {:?}",
+        closed.records
+    );
+
+    // Live window: both rows admitted, both stamped with the open frame.
+    let live = extract_intents_from_root_at_with_stats(&config(true), &root, Utc::now())
+        .expect("extract with live window");
+    assert_eq!(live.stats.live_sessions, 2);
+    let summaries: Vec<&str> = live
+        .records
+        .iter()
+        .map(|record| record.summary.as_str())
+        .collect();
+    assert!(
+        summaries.iter().any(|s| s.contains("stale-dated row")),
+        "stale-dated fresh-mtime row missing: {summaries:?}"
+    );
+    assert!(
+        summaries.iter().any(|s| s.contains("unadmitted session")),
+        "unadmitted live session missing: {summaries:?}"
+    );
+    assert!(
+        live.records
+            .iter()
+            .all(|record| record.honesty.is_live_open()),
+        "live-window records must carry the open_session frame: {:?}",
+        live.records
+    );
+
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -116,6 +291,7 @@ fn catalog_source_replaces_retired_cards_for_intent_extraction() {
         min_confidence: None,
         kind_filter: Some(IntentKind::Outcome),
         frame_kind: Some(FrameKind::AgentReply),
+        live: false,
     };
     let extraction = extract_intents_from_root_at_with_stats(&config, &root, Utc::now())
         .expect("extract from catalog source");
@@ -209,6 +385,7 @@ Intent:
         min_confidence: None,
         kind_filter: Some(IntentKind::Intent),
         frame_kind: None,
+        live: false,
     };
     let now = DateTime::<Utc>::from_naive_utc_and_offset(
         NaiveDate::from_ymd_opt(2026, 3, 15)
@@ -259,6 +436,7 @@ Notes:
         min_confidence: None,
         kind_filter: Some(IntentKind::Intent),
         frame_kind: None,
+        live: false,
     };
     let now = DateTime::<Utc>::from_naive_utc_and_offset(
         NaiveDate::from_ymd_opt(2026, 3, 15)
@@ -355,6 +533,7 @@ Intent:
         min_confidence: None,
         kind_filter: None,
         frame_kind: None,
+        live: false,
     };
     let now = DateTime::<Utc>::from_naive_utc_and_offset(
         NaiveDate::from_ymd_opt(2026, 3, 15)
@@ -808,6 +987,7 @@ fn md_radar_style_user_messages_surface_in_main_intents_view() {
             min_confidence: None,
             kind_filter: None,
             frame_kind: None,
+            live: false,
         },
         &root,
         DateTime::<Utc>::from_naive_utc_and_offset(
@@ -1073,6 +1253,7 @@ RED LIGHT: checklist detected (open: 0, done: 1)
         min_confidence: None,
         kind_filter: None,
         frame_kind: None,
+        live: false,
     };
     let now = DateTime::<Utc>::from_naive_utc_and_offset(
         NaiveDate::from_ymd_opt(2026, 3, 15)
@@ -1137,6 +1318,7 @@ fn extraction_stats_report_scanned_chunks_and_candidates_before_display_filters(
         min_confidence: None,
         kind_filter: None,
         frame_kind: None,
+        live: false,
     };
     let now = DateTime::<Utc>::from_naive_utc_and_offset(
         NaiveDate::from_ymd_opt(2026, 3, 15)
@@ -1190,6 +1372,7 @@ fn hours_filter_uses_canonical_chunk_date_not_mtime() {
         min_confidence: None,
         kind_filter: None,
         frame_kind: None,
+        live: false,
     };
     let now = DateTime::<Utc>::from_naive_utc_and_offset(
         NaiveDate::from_ymd_opt(2026, 3, 15)
@@ -1241,6 +1424,7 @@ commit abcdef1 proves the old path was wrong.
         min_confidence: None,
         kind_filter: None,
         frame_kind: None,
+        live: false,
     };
     let now = DateTime::<Utc>::from_naive_utc_and_offset(
         NaiveDate::from_ymd_opt(2026, 3, 15)
@@ -1301,6 +1485,7 @@ fn tool_call_and_agent_reply_do_not_become_outcomes() {
         min_confidence: None,
         kind_filter: None,
         frame_kind: None,
+        live: false,
     };
     let now = DateTime::<Utc>::from_naive_utc_and_offset(
         NaiveDate::from_ymd_opt(2026, 3, 15)
@@ -1350,6 +1535,7 @@ fn strict_mode_filters_heuristic_only_intents() {
         min_confidence: None,
         kind_filter: None,
         frame_kind: None,
+        live: false,
     };
     let now = DateTime::<Utc>::from_naive_utc_and_offset(
         NaiveDate::from_ymd_opt(2026, 3, 15)
@@ -1395,6 +1581,7 @@ fn frame_kind_filter_keeps_only_matching_chunks() {
         min_confidence: None,
         kind_filter: None,
         frame_kind: Some(FrameKind::UserMsg),
+        live: false,
     };
     let now = DateTime::<Utc>::from_naive_utc_and_offset(
         NaiveDate::from_ymd_opt(2026, 3, 15)
@@ -1423,6 +1610,7 @@ fn default_frame_kind_is_user_msg() {
         min_confidence: None,
         kind_filter: None,
         frame_kind: None,
+        live: false,
     };
 
     assert_eq!(config.effective_frame_kind(), FrameKind::UserMsg);
@@ -1452,6 +1640,7 @@ fn default_frame_kind_admits_user_chunk() {
         min_confidence: None,
         kind_filter: None,
         frame_kind: None,
+        live: false,
     };
     let now = DateTime::<Utc>::from_naive_utc_and_offset(
         NaiveDate::from_ymd_opt(2026, 3, 15)
@@ -1501,6 +1690,7 @@ fn default_frame_kind_admits_user_chunk_and_rejects_agent_chunk() {
         min_confidence: None,
         kind_filter: None,
         frame_kind: None,
+        live: false,
     };
     let now = DateTime::<Utc>::from_naive_utc_and_offset(
         NaiveDate::from_ymd_opt(2026, 3, 15)
@@ -1550,6 +1740,7 @@ fn explicit_agent_frame_kind_override_still_admits_agent_chunk() {
         min_confidence: None,
         kind_filter: None,
         frame_kind: Some(FrameKind::AgentReply),
+        live: false,
     };
     let now = DateTime::<Utc>::from_naive_utc_and_offset(
         NaiveDate::from_ymd_opt(2026, 3, 15)
@@ -1851,6 +2042,7 @@ fn agent_chunk_still_yields_intents_drift_red() {
         min_confidence: None,
         kind_filter: None,
         frame_kind: None,
+        live: false,
     };
     let now = DateTime::<Utc>::from_naive_utc_and_offset(
         NaiveDate::from_ymd_opt(2026, 3, 15)
@@ -2932,6 +3124,7 @@ mod quality {
             min_confidence: None,
             kind_filter: Some(IntentKind::Decision),
             frame_kind: None,
+            live: false,
         };
         let now = DateTime::<Utc>::from_naive_utc_and_offset(
             NaiveDate::from_ymd_opt(2026, 5, 5)
@@ -3010,6 +3203,7 @@ mod quality {
             min_confidence: None,
             kind_filter: Some(IntentKind::Decision),
             frame_kind: None,
+            live: false,
         };
         let now = DateTime::<Utc>::from_naive_utc_and_offset(
             NaiveDate::from_ymd_opt(2026, 5, 5)
@@ -3068,6 +3262,7 @@ mod quality {
             min_confidence: None,
             kind_filter: None,
             frame_kind: None,
+            live: false,
         };
         let now = DateTime::<Utc>::from_naive_utc_and_offset(
             NaiveDate::from_ymd_opt(2026, 5, 5)
@@ -3823,6 +4018,7 @@ mod flexible_dates {
             min_confidence: None,
             kind_filter: None,
             frame_kind: None,
+            live: false,
         };
         let now = DateTime::<Utc>::from_naive_utc_and_offset(
             NaiveDate::from_ymd_opt(2026, 3, 15)
@@ -3899,6 +4095,7 @@ Update Cargo.lock dependencies\n";
             min_confidence: None,
             kind_filter: None,
             frame_kind: None,
+            live: false,
         };
         let now = DateTime::<Utc>::from_naive_utc_and_offset(
             NaiveDate::from_ymd_opt(2026, 3, 15)
@@ -4032,6 +4229,7 @@ Results:
             min_confidence: None,
             kind_filter: None,
             frame_kind: None,
+            live: false,
         };
         let now = DateTime::<Utc>::from_naive_utc_and_offset(
             NaiveDate::from_ymd_opt(2026, 3, 15)

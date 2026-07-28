@@ -492,6 +492,10 @@ pub fn format_intents_markdown(records: &[IntentRecord]) -> String {
         return String::new();
     }
 
+    let (live, closed): (Vec<&IntentRecord>, Vec<&IntentRecord>) = records
+        .iter()
+        .partition(|record| record.honesty.is_live_open());
+
     let mut out = String::from("# Intent Timeline\n\n");
     // Honesty frame for the whole surface: every record below is a historical
     // claim bound to its session close, never runtime-verified by aicx.
@@ -499,6 +503,25 @@ pub fn format_intents_markdown(records: &[IntentRecord]) -> String {
         "_{}_\n\n",
         ClaimHonesty::canonical().display_line()
     ));
+
+    // P0 live window: never blend in-flight claims into the closed timeline.
+    // Live records get their own labeled section (and honesty line) first;
+    // when nothing is live the output is byte-identical to the classic form.
+    if !live.is_empty() {
+        out.push_str("## Live Session Intent (unverified, open)\n\n");
+        out.push_str(&format!(
+            "_{}_\n\n",
+            ClaimHonesty::live_open().display_line()
+        ));
+        format_intents_records_into(&mut out, &live);
+        out.push_str("## Closed Session Intent\n\n");
+    }
+    format_intents_records_into(&mut out, &closed);
+
+    out
+}
+
+fn format_intents_records_into(out: &mut String, records: &[&IntentRecord]) {
     let mut last_date: Option<&str> = None;
 
     for record in records {
@@ -533,8 +556,6 @@ pub fn format_intents_markdown(records: &[IntentRecord]) -> String {
         }
         out.push('\n');
     }
-
-    out
 }
 
 pub fn format_intents_json(records: &[IntentRecord]) -> Result<String> {
