@@ -156,6 +156,15 @@ fn runtime_inspection_reports_stale_path_binary_and_missing_config_target() {
         &fake_bin.join("aicx-mcp"),
         "#!/bin/sh\necho 'aicx-mcp 0.1.0+gdeadbeef'\n",
     );
+    // macOS syspolicyd assesses a freshly written executable on its first
+    // spawn; on a loaded CI host that one-time assessment can exceed the 2s
+    // version-probe budget and misreport the candidate as "unavailable".
+    // Pay the Gatekeeper cost here so the probe measures the binary itself.
+    Command::new(fake_bin.join("aicx-mcp"))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("warm up fake aicx-mcp");
     let config = home.path().join("mcp.json");
     let config_body = r#"{"mcpServers":{"aicx":{"command":"/missing/aicx-mcp"},"aicx-wrapper":{"command":"rust-mux-proxy"},"aicx-secret":{"command":"https://operator:super-secret@example.test/aicx-mcp?token=never-print-me"}}}"#;
     fs::write(&config, config_body).expect("write MCP config");
