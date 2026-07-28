@@ -371,6 +371,11 @@ fn collect_intent_files(
     let mut source_errors = 0usize;
     let mut live_sessions = 0usize;
     let mut seen_sessions: BTreeSet<(String, String)> = BTreeSet::new();
+    // Census paths are only ever touched through the operator allowlist —
+    // the same containment contract as read_catalog_signal_at.
+    let allow_user_home = crate::os_user_home().unwrap_or_else(|| aicx_home.to_path_buf());
+    let source_allow =
+        crate::source_path::SourceAllowlist::for_operator(&allow_user_home, aicx_home);
     for entry in entries {
         let Some(identity_project) = entry.project.clone() else {
             continue;
@@ -394,9 +399,12 @@ fn collect_intent_files(
                 continue;
             }
             // Hot window: the census date predates the cutoff, but the file
-            // may still be receiving appends. One stat decides — the live
-            // mtime outranks the rebuild-time date.
-            let hot = crate::catalog::live_source_fingerprint(Path::new(&entry.source_path))
+            // may still be receiving appends. One allowlist-resolved stat
+            // decides — the live mtime outranks the rebuild-time date.
+            let hot = source_allow
+                .resolve_file(entry.source_path.as_str())
+                .ok()
+                .and_then(|path| crate::catalog::live_source_fingerprint(&path))
                 .is_some_and(|(_, mtime_ns)| mtime_ns_within_window(mtime_ns, cutoff));
             if !hot {
                 continue;
