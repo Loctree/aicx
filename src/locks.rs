@@ -404,36 +404,16 @@ fn epoch_seconds(time: SystemTime) -> Result<u64> {
         .as_secs())
 }
 
-#[cfg(unix)]
 fn pid_is_alive(pid: u32) -> bool {
+    // A holder sidecar is written by a live process recording its own pid, so
+    // pid 0 can only mean a corrupted or partially written sidecar. Probing 0
+    // is undecidable (`None`), and folding that into the fail-closed `true`
+    // arm would park stale-lock recovery forever; an impossible pid counts as
+    // dead while genuine probe uncertainty stays fail-closed (alive).
     if pid == 0 {
         return false;
     }
-    // SAFETY: kill(pid, 0) performs existence/permission probing and does not
-    // deliver a signal.
-    let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
-    if result == 0 {
-        return true;
-    }
-    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
-}
-
-#[cfg(windows)]
-fn pid_is_alive(pid: u32) -> bool {
-    if pid == 0 {
-        return false;
-    }
-    // PROCESS_QUERY_LIMITED_INFORMATION is sufficient to probe existence.
-    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
-    // ERROR_ACCESS_DENIED means the process exists but we lack permission.
-    const ERROR_ACCESS_DENIED: i32 = 5;
-    // SAFETY: FFI call; returned handle is valid when non-null.
-    let handle = unsafe { windows_ffi::OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
-    if handle.is_null() {
-        return std::io::Error::last_os_error().raw_os_error() == Some(ERROR_ACCESS_DENIED);
-    }
-    unsafe { windows_ffi::CloseHandle(handle) };
-    true
+    crate::process_liveness::probe_pid_liveness(pid).unwrap_or(true)
 }
 
 #[cfg(unix)]
@@ -550,7 +530,7 @@ fn lock_would_block(err: &anyhow::Error) -> bool {
         .is_some_and(|code| code == windows_ffi::ERROR_LOCK_VIOLATION)
 }
 
-/// Windows-only FFI declarations for file-locking and process-existence APIs.
+/// Windows-only FFI declarations for file locking.
 #[cfg(windows)]
 mod windows_ffi {
     use std::ffi::c_void;
@@ -591,13 +571,6 @@ mod windows_ffi {
             n_number_of_bytes_to_unlock_high: u32,
         ) -> i32;
 
-        pub fn OpenProcess(
-            dw_desired_access: u32,
-            b_inherit_handle: i32,
-            dw_process_id: u32,
-        ) -> *mut c_void;
-
-        pub fn CloseHandle(h_object: *mut c_void) -> i32;
     }
 }
 
@@ -889,7 +862,7 @@ mod tests {
     #[test]
     fn stale_dead_lance_holder_is_recovered_with_warning() {
         let path = temp_lance_lock("stale-dead");
-        let dead_pid = 99_999_999;
+        let (dead_pid, _dead_process) = crate::process_liveness::exited_test_process();
         let holder = Holder::new(
             dead_pid,
             SystemTime::now() - Duration::from_secs(125),
@@ -902,6 +875,29 @@ mod tests {
             capture_logs(|| acquire_exclusive(&path).expect("recover stale holder"));
         assert!(
             logs.contains(&format!("recovered stale lock from dead PID {dead_pid}")),
+            "logs: {logs}"
+        );
+        let contents = fs::read_to_string(holder_sidecar_path(&path).unwrap()).unwrap();
+        assert!(contents.contains(&format!("pid={}", std::process::id())));
+        release(handle);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn stale_zero_pid_holder_is_recovered_not_parked_forever() {
+        let path = temp_lance_lock("stale-zero-pid");
+        let holder = Holder::new(
+            0,
+            SystemTime::now() - Duration::from_secs(125),
+            "aicx index",
+            LockMode::Exclusive,
+        );
+        write_holder_sidecar(&path, &holder).expect("write corrupted zero-pid holder");
+
+        let (handle, logs) =
+            capture_logs(|| acquire_exclusive(&path).expect("recover zero-pid holder"));
+        assert!(
+            logs.contains("recovered stale lock from dead PID 0"),
             "logs: {logs}"
         );
         let contents = fs::read_to_string(holder_sidecar_path(&path).unwrap()).unwrap();

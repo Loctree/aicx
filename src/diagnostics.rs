@@ -358,26 +358,7 @@ fn run_log_pid_alive(pid: u32) -> Option<bool> {
     if pid == std::process::id() {
         return Some(true);
     }
-    #[cfg(unix)]
-    {
-        if pid == 0 || pid > i32::MAX as u32 {
-            return None;
-        }
-        let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
-        if rc == 0 {
-            return Some(true);
-        }
-        match std::io::Error::last_os_error().raw_os_error() {
-            Some(libc::ESRCH) => Some(false),
-            // EPERM: process exists under another uid — alive.
-            Some(libc::EPERM) => Some(true),
-            _ => None,
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        None
-    }
+    crate::process_liveness::probe_pid_liveness(pid)
 }
 
 /// Enforce [`DiagnosticsRetentionPolicy`] over `dir`.
@@ -711,10 +692,6 @@ mod tests {
         dir
     }
 
-    /// Pid far above pid_max on Linux (4 194 304) and macOS (99 998) —
-    /// guaranteed ESRCH, i.e. a closed run.
-    const DEAD_PID: u32 = 999_999_999;
-
     fn write_log(dir: &Path, stamp: &str, pid: u32, bytes: usize) -> PathBuf {
         let path = dir.join(format!("diagnostics-{stamp}-{pid}.log"));
         std::fs::write(&path, vec![b'x'; bytes]).unwrap();
@@ -730,6 +707,7 @@ mod tests {
         let now = chrono::DateTime::parse_from_rfc3339("2026-07-22T12:00:00Z")
             .unwrap()
             .to_utc();
+        let (dead_pid, _dead_process) = crate::process_liveness::exited_test_process();
 
         let active_name = format!("diagnostics-20260722T115900Z-{}.log", std::process::id());
         let active = dir.join(&active_name);
@@ -737,9 +715,9 @@ mod tests {
         let live = write_log(&dir, "20260722T110000Z", std::process::id(), 4096);
         let weird = dir.join("diagnostics-not-a-run-log.log");
         std::fs::write(&weird, b"???").unwrap();
-        let old_closed = write_log(&dir, "20260720T090000Z", DEAD_PID, 4096);
-        let mid_closed = write_log(&dir, "20260721T090000Z", DEAD_PID, 4096);
-        let new_closed = write_log(&dir, "20260722T090000Z", DEAD_PID, 4096);
+        let old_closed = write_log(&dir, "20260720T090000Z", dead_pid, 4096);
+        let mid_closed = write_log(&dir, "20260721T090000Z", dead_pid, 4096);
+        let new_closed = write_log(&dir, "20260722T090000Z", dead_pid, 4096);
 
         let policy = DiagnosticsRetentionPolicy {
             max_files: 4,
@@ -780,13 +758,14 @@ mod tests {
         let now = chrono::DateTime::parse_from_rfc3339("2026-07-22T12:00:00Z")
             .unwrap()
             .to_utc();
+        let (dead_pid, _dead_process) = crate::process_liveness::exited_test_process();
 
         // Ancient closed run — past max_age, must go regardless of count.
-        let ancient = write_log(&dir, "20260601T000000Z", DEAD_PID, 10);
+        let ancient = write_log(&dir, "20260601T000000Z", dead_pid, 10);
         // Three recent closed runs; count cap 2 keeps the newest two.
-        let d1 = write_log(&dir, "20260722T080000Z", DEAD_PID, 10);
-        let d2 = write_log(&dir, "20260722T090000Z", DEAD_PID, 10);
-        let d3 = write_log(&dir, "20260722T100000Z", DEAD_PID, 10);
+        let d1 = write_log(&dir, "20260722T080000Z", dead_pid, 10);
+        let d2 = write_log(&dir, "20260722T090000Z", dead_pid, 10);
+        let d3 = write_log(&dir, "20260722T100000Z", dead_pid, 10);
 
         let policy = DiagnosticsRetentionPolicy {
             max_files: 2,
@@ -817,8 +796,9 @@ mod tests {
         let now = chrono::DateTime::parse_from_rfc3339("2026-07-22T12:00:00Z")
             .unwrap()
             .to_utc();
-        let a = write_log(&dir, "20260722T080000Z", DEAD_PID, 10);
-        let b = write_log(&dir, "20260722T090000Z", DEAD_PID, 10);
+        let (dead_pid, _dead_process) = crate::process_liveness::exited_test_process();
+        let a = write_log(&dir, "20260722T080000Z", dead_pid, 10);
+        let b = write_log(&dir, "20260722T090000Z", dead_pid, 10);
         let outcome = enforce_retention(
             &dir,
             std::ffi::OsStr::new("diagnostics-20260722T120000Z-1.log"),

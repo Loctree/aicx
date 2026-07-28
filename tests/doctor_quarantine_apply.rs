@@ -36,6 +36,7 @@ fn unique_base(label: &str) -> PathBuf {
     dir
 }
 
+#[cfg(unix)]
 fn recursive_store_digest(store: &std::path::Path) -> String {
     use sha2::{Digest, Sha256};
 
