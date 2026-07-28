@@ -173,10 +173,15 @@ fn runtime_inspection_reports_stale_path_binary_and_missing_config_target() {
     let mcp_candidates = payload["installations"]["aicx_mcp"]
         .as_array()
         .expect("MCP candidates");
-    assert!(mcp_candidates.iter().any(|candidate| {
-        candidate["path"] == fake_bin.join("aicx-mcp").display().to_string()
-            && candidate["status"] == "drift"
-    }));
+    assert!(
+        mcp_candidates.iter().any(|candidate| {
+            candidate["path"] == fake_bin.join("aicx-mcp").display().to_string()
+                && candidate["status"] == "drift"
+        }),
+        "expected drift candidate at {} — actual candidates: {}",
+        fake_bin.join("aicx-mcp").display(),
+        serde_json::to_string_pretty(&payload["installations"]).unwrap_or_default()
+    );
     let configured = payload["mcp"]["configured_targets"]
         .as_array()
         .expect("configured targets");
