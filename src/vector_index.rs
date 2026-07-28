@@ -653,6 +653,8 @@ fn publish_hybrid_generation(hybrid_root: &Path, generation_dir: &Path) -> Resul
 /// Only lexical-only source generations qualify. Legacy store/NDJSON
 /// generations are never mistaken for a source-driven no-op.
 pub fn source_lexical_generation_matches(source_fingerprint: &str) -> Result<bool> {
+    use aicx_retrieve::LexicalIndex;
+
     let path = hybrid_manifest_path(None)?;
     if !path.is_file() {
         return Ok(false);
@@ -661,8 +663,37 @@ pub fn source_lexical_generation_matches(source_fingerprint: &str) -> Result<boo
         Ok(manifest) => manifest,
         Err(_) => return Ok(false),
     };
-    Ok(manifest.dense_kind == "optional_not_built"
-        && manifest.source_hash_blake3 == aicx_retrieve::source_hash_blake3(source_fingerprint))
+    if manifest.dense_kind != "optional_not_built"
+        || manifest.source_hash_blake3 != aicx_retrieve::source_hash_blake3(source_fingerprint)
+    {
+        return Ok(false);
+    }
+
+    // A matching source hash is insufficient after a lexical schema change:
+    // otherwise CURRENT can short-circuit forever while lacking the folded
+    // shadow fields. Open the committed artifact through the current adapter;
+    // missing fields fail closed and force the supported generation rebuild.
+    let Some(generation_dir) = path.parent() else {
+        return Ok(false);
+    };
+    if !generation_dir
+        .join(aicx_retrieve::TANTIVY_INDEX_DIR)
+        .join("meta.json")
+        .is_file()
+    {
+        return Ok(false);
+    }
+    let lexical = match aicx_retrieve::TantivyAdapter::new(generation_dir.to_path_buf()) {
+        Ok(lexical) => lexical,
+        Err(_) => return Ok(false),
+    };
+    Ok(
+        lexical.schema_version() == aicx_retrieve::TANTIVY_SCHEMA_VERSION
+            && lexical.doc_count() == manifest.lexical_doc_count
+            && manifest
+                .lexical_commit_id
+                .starts_with(aicx_retrieve::TANTIVY_SCHEMA_VERSION),
+    )
 }
 
 pub fn current_lexical_doc_count() -> Result<Option<usize>> {

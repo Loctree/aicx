@@ -145,6 +145,9 @@ _aicx() {
             aicx__subcmd__catalog,resolve)
                 cmd="aicx__subcmd__catalog__subcmd__resolve"
                 ;;
+            aicx__subcmd__catalog,status)
+                cmd="aicx__subcmd__catalog__subcmd__status"
+                ;;
             aicx__subcmd__catalog__subcmd__help,help)
                 cmd="aicx__subcmd__catalog__subcmd__help__subcmd__help"
                 ;;
@@ -153,6 +156,9 @@ _aicx() {
                 ;;
             aicx__subcmd__catalog__subcmd__help,resolve)
                 cmd="aicx__subcmd__catalog__subcmd__help__subcmd__resolve"
+                ;;
+            aicx__subcmd__catalog__subcmd__help,status)
+                cmd="aicx__subcmd__catalog__subcmd__help__subcmd__status"
                 ;;
             aicx__subcmd__claims,extract)
                 cmd="aicx__subcmd__claims__subcmd__extract"
@@ -385,6 +391,9 @@ _aicx() {
             aicx__subcmd__help__subcmd__catalog,resolve)
                 cmd="aicx__subcmd__help__subcmd__catalog__subcmd__resolve"
                 ;;
+            aicx__subcmd__help__subcmd__catalog,status)
+                cmd="aicx__subcmd__help__subcmd__catalog__subcmd__status"
+                ;;
             aicx__subcmd__help__subcmd__claims,extract)
                 cmd="aicx__subcmd__help__subcmd__claims__subcmd__extract"
                 ;;
@@ -595,7 +604,7 @@ _aicx() {
             return 0
             ;;
         aicx__subcmd__catalog)
-            opts="-v -h --verbose --project-fuzzy --help rebuild resolve help"
+            opts="-v -h --verbose --project-fuzzy --help rebuild status resolve help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -609,7 +618,7 @@ _aicx() {
             return 0
             ;;
         aicx__subcmd__catalog__subcmd__help)
-            opts="rebuild resolve help"
+            opts="rebuild status resolve help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -664,6 +673,20 @@ _aicx() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
+        aicx__subcmd__catalog__subcmd__help__subcmd__status)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
         aicx__subcmd__catalog__subcmd__rebuild)
             opts="-v -h --json --verbose --project-fuzzy --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
@@ -679,6 +702,20 @@ _aicx() {
             return 0
             ;;
         aicx__subcmd__catalog__subcmd__resolve)
+            opts="-v -h --json --verbose --project-fuzzy --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        aicx__subcmd__catalog__subcmd__status)
             opts="-v -h --json --verbose --project-fuzzy --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
@@ -1861,7 +1898,7 @@ _aicx() {
             return 0
             ;;
         aicx__subcmd__help__subcmd__catalog)
-            opts="rebuild resolve"
+            opts="rebuild status resolve"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -1889,6 +1926,20 @@ _aicx() {
             return 0
             ;;
         aicx__subcmd__help__subcmd__catalog__subcmd__resolve)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        aicx__subcmd__help__subcmd__catalog__subcmd__status)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )

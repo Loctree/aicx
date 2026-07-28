@@ -46,13 +46,54 @@ No command in the current ingestion or indexing path writes per-frame cards.
 ## Catalog
 
 ```bash
+aicx catalog status
+aicx catalog status --json
 aicx catalog rebuild
 aicx catalog resolve <session-id>
 ```
 
+`catalog status` compares durable `sessions.jsonl` fingerprints to live agent
+source roots **without writing**. Classes:
+
+| Class | Meaning | Operator move |
+|---|---|---|
+| `current` | catalog size+mtime matches live file | none |
+| `stale` | same session, live append/edit | rebuild stamps fingerprints; index already re-parses on live fp |
+| `unadmitted` | live primary source not in catalog | `aicx catalog rebuild` |
+| `missing_source` | catalog path does not resolve here | fix paths / sync sources onto this host |
+| `fingerprint_unknown` | no usable stats | rebuild to stamp `source_len` / `source_mtime_ns` |
+
+Readiness values: `missing` · `empty` · `fresh` · `needs_rebuild` · `sources_missing`.
+
+Orthogonal surfaces:
+
+- **catalog status** = will rebuild admit/change identity rows?
+- **index status** = is CURRENT lagging the catalog/corpus?
+
 `catalog rebuild` walks the registered Claude, Codex, Grok, Gemini, Junie, and
 Vibecrafted runtime roots. It writes the compact catalog and prints counts; it
 does not materialize session content.
+
+### Multi-machine / sync (operator truth)
+
+1. **Session JSONL sync** — catalog only discovers files under this host's agent
+   roots (`~/.claude/projects`, `~/.codex/sessions`, `~/.gemini/tmp`,
+   `~/.grok/sessions`, `~/.junie/sessions`, `~/.vibecrafted/control_plane/runtime_runs`).
+   Drop synced JSONL into those trees, then `catalog status` → `catalog rebuild`.
+2. **No alternate daily store intake** — there is no second "drop folder" for
+   sessions. `AICX_HOME` / `[storage].home` relocates the **whole** home
+   (catalog + index + extracts), not a parallel session root.
+3. **Copying only `sessions.jsonl` fails** — rows keep absolute `source_path`;
+   the indexing host must open those paths. Symptom: `missing_source`.
+4. **0.6b next to 8b** — dense generations are model+dimension locked
+   (fail-closed). Do not merge laptop 0.6b dense into dragon 8b CURRENT.
+   Rebuild lexical CURRENT on the owner host from shared sources; optional
+   dense on that same embedder only.
+5. **Dragon as index owner** — recommended: dragon runs `catalog rebuild` +
+   `index`, hosts embedder (`config.toml` cloud URL), and
+   `aicx serve --transport http --auth-token … --allowed-host <tailscale-name>`.
+   Remotes use streamable HTTP MCP with Bearer (not OAuth). See
+   [MULTI_MACHINE.md](./MULTI_MACHINE.md).
 
 ## Extract
 

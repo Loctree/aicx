@@ -1,15 +1,30 @@
 //! Typed intent-to-structure overlay (`loctree.overlay.intent.v1`).
 //!
-//! This layer consumes only C6 canonical cards and their frozen
-//! `evidence_event_id` references. It never opens agent sessions or rendered
-//! conversation Markdown. Loctree owns structural identity; this module joins
-//! distilled card claims to the catalog emitted by `loct anchors`.
+//! This layer joins distilled intent claims to the catalog emitted by
+//! `loct anchors`. Loctree owns structural identity.
+//!
+//! ## Feed status (extract-era)
+//!
+//! Primary feed: durable catalog sessions → typed intent records
+//! (`aicx catalog rebuild`, then `aicx intents` / in-process extraction).
+//! Residual C6 `canonical-projection-v1` fixtures remain a **fallback**
+//! only (golden/legacy fixtures). The C6 write mill is retired
+//! (`write_canonical_projection_at` fails closed). There is no palette
+//! command named "canonical ingest".
+//!
+//! Overlay never opens agent sessions or rendered conversation Markdown
+//! as a fallback feed; every emitted claim carries a frozen `evidence_ref`.
 
-use crate::legacy_archive::{legacy_cards_dir, read_canonical_projection_at};
+use crate::intents::{
+    IntentKind, IntentRecord, IntentsConfig, extract_intents_from_root_at_with_stats,
+};
+use crate::legacy_archive::read_canonical_projection_at;
 use crate::rank::{SEMANTIC_INTENT_CANDIDATE_THRESHOLD, intent_candidate_similarity};
+use crate::timeline::FrameKind;
 use aicx_parser::engine::{Known, TurnRole};
 use aicx_parser::projections::CanonicalCard;
 use anyhow::{Context, Result, anyhow, bail};
+use chrono::Utc;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -25,6 +40,20 @@ pub const ATTRIBUTION_VERSION: &str = "path-symbol-resolver.v2";
 pub const DEDUP_VERSION: &str = "semantic-negation-veto.v1";
 pub const EMBEDDING_MODEL: &str = "aicx-embeddings.configured.v1";
 pub const ATTRIBUTION_THRESHOLD: f64 = 0.90;
+pub const FEED_SOURCE_CATALOG: &str = "catalog-v1";
+pub const FEED_SOURCE_RESIDUAL_C6: &str = "residual-c6";
+
+/// Fail-closed operator message when neither catalog intents nor residual
+/// C6 fixtures can supply claims for the target repo identity.
+/// Must never name a phantom palette command (e.g. "canonical ingest").
+pub const MISSING_C6_PROJECTION_HINT: &str = "overlay feed is empty for this repo under the AICX home \
+    (no catalog typed intents matched identity, and residual C6 \
+    canonical-projection-v1 fixtures are absent — mill retired: \
+    write_canonical_projection_at fails closed). \
+    Live path: `aicx catalog rebuild` then `aicx intents -p <owner/repo>`, \
+    then re-run `aicx overlay --repo <path>`. \
+    `aicx ingest` is operator-md/loct-context-pack only — not a session projection. \
+    Identity remains fail-closed exact owner/repo; raw-session fallback is forbidden.";
 
 #[derive(Debug, Clone)]
 pub struct OverlayOptions {
@@ -78,6 +107,14 @@ pub enum OverlayTarget {
         language: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         anchor_id: Option<String>,
+        /// Optional 1-based inclusive start line for path+range targets.
+        /// Absent when the anchor catalog is path-grain only (current `loct
+        /// anchors`). Additive; serde-backward-tolerant for v1 consumers.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        start_line: Option<u32>,
+        /// Optional 1-based inclusive end line (must be >= start_line when set).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        end_line: Option<u32>,
     },
     Symbol {
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -189,6 +226,32 @@ pub struct OverlayBuildStats {
     pub raw_session_files_opened: usize,
 }
 
+/// Normalized claim seed for the side-index (catalog intents or residual C6).
+#[derive(Debug, Clone)]
+struct OverlayFeedItem {
+    evidence_event_id: String,
+    session_id: String,
+    turn_idx: u64,
+    theses: Vec<String>,
+    valid_from: String,
+    authority: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OverlayFeedSource {
+    Catalog,
+    ResidualC6,
+}
+
+impl OverlayFeedSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Catalog => FEED_SOURCE_CATALOG,
+            Self::ResidualC6 => FEED_SOURCE_RESIDUAL_C6,
+        }
+    }
+}
+
 pub fn build_overlay(options: &OverlayOptions) -> Result<(OverlayDocument, OverlayBuildStats)> {
     let started = Instant::now();
     let repo = options
@@ -199,53 +262,38 @@ pub fn build_overlay(options: &OverlayOptions) -> Result<(OverlayDocument, Overl
         bail!("overlay repository is not a directory: {}", repo.display());
     }
     let catalog = load_anchor_catalog(&repo, options.loct_bin.as_deref())?;
-    let aicx_home = options
-        .aicx_home
-        .clone()
-        .unwrap_or(legacy_cards_dir()?)
-        .canonicalize()
-        .context("legacy C6 archive root is missing or unreadable")?;
-    let projections = discover_canonical_projections(&aicx_home)?;
-    if projections.is_empty() {
-        bail!(
-            "typed C6 canonical projection is unavailable under {}; run canonical ingest before overlay emission",
+    let aicx_home = match &options.aicx_home {
+        Some(path) => path.clone(),
+        None => crate::aicx_home::resolve().context("AICX home is missing or unreadable")?,
+    };
+    let aicx_home = aicx_home.canonicalize().with_context(|| {
+        format!(
+            "AICX home is missing or unreadable: {}",
             aicx_home.display()
-        );
-    }
-    let mut cards = Vec::new();
-    let mut revisions = BTreeSet::new();
-    let mut files_opened = 0usize;
-    for root in projections {
-        if let Some((manifest, projection_cards)) = read_canonical_projection_at(&root)? {
-            files_opened += 1 + manifest.card_ids.len();
-            let mut matching: Vec<_> = projection_cards
-                .into_iter()
-                .filter(|card| {
-                    overlay_project_identity_matches(&card.project.slug, &catalog.repo_id)
-                })
-                .collect();
-            if !matching.is_empty() {
-                revisions.insert(manifest.store_revision);
-                cards.append(&mut matching);
-            }
-        }
-    }
-    if cards.is_empty() {
+        )
+    })?;
+
+    let (feed, store_revision, feed_source, mut files_opened) =
+        load_overlay_feed(&aicx_home, &catalog.repo_id)?;
+    if feed.is_empty() {
         bail!(
-            "typed C6 store has no canonical cards for {} (raw-session fallback is forbidden)",
+            "{} (searched under {}; repo_id={})",
+            MISSING_C6_PROJECTION_HINT,
+            aicx_home.display(),
             catalog.repo_id
         );
     }
-    cards.sort_by(|left, right| left.id.cmp(&right.id));
-    cards.dedup_by(|left, right| left.id == right.id);
-    let store_revision = combined_store_revision(&revisions)?;
+
     let embedding_model = configured_embedding_model_key();
     let overlay_revision = overlay_revision(&catalog, &store_revision, &embedding_model);
-    let index_root = options.index_root.clone().unwrap_or(
-        crate::aicx_home::resolve()?
+    // Prefer the same resolved AICX home used for the feed so isolated
+    // `AICX_HOME` / `--aicx-home` runs never spill side-index into the operator
+    // default home.
+    let index_root = options.index_root.clone().unwrap_or_else(|| {
+        aicx_home
             .join("overlay-index-v1")
-            .join(short_hash(&catalog.repo_id)),
-    );
+            .join(short_hash(&catalog.repo_id))
+    });
     fs::create_dir_all(&index_root)?;
     let index_root = index_root
         .canonicalize()
@@ -270,7 +318,7 @@ pub fn build_overlay(options: &OverlayOptions) -> Result<(OverlayDocument, Overl
         return Ok((
             output,
             OverlayBuildStats {
-                canonical_cards_seen: cards.len(),
+                canonical_cards_seen: feed.len(),
                 files_opened: files_opened + 2,
                 ..OverlayBuildStats::default()
             },
@@ -280,7 +328,7 @@ pub fn build_overlay(options: &OverlayOptions) -> Result<(OverlayDocument, Overl
     let previous = read_side_index(&side_index_path, &catalog.repo_id)?;
     let (mut index, new_intents, retained_intents) = update_side_index(
         previous,
-        &cards,
+        &feed,
         &catalog.repo_id,
         &store_revision,
         &embedding_model,
@@ -288,16 +336,17 @@ pub fn build_overlay(options: &OverlayOptions) -> Result<(OverlayDocument, Overl
     )?;
     materialize_side_index(&mut index, &catalog, &repo)?;
     atomic_write_json(&side_index_path, &index)?;
+    files_opened += usize::from(side_index_path.exists()) + 1;
     let entries = index.groups.clone();
     let unresolved = index.unresolved_attributions.clone();
     let emitted_attributions = entries.iter().map(|entry| entry.attributions.len()).sum();
     let stats = OverlayBuildStats {
-        canonical_cards_seen: cards.len(),
+        canonical_cards_seen: feed.len(),
         new_intents,
         retained_intents,
         emitted_attributions,
         unresolved_attributions: unresolved.len(),
-        files_opened: files_opened + usize::from(side_index_path.exists()) + 1,
+        files_opened,
         raw_session_files_opened: 0,
     };
     let output = OverlayDocument {
@@ -314,10 +363,283 @@ pub fn build_overlay(options: &OverlayOptions) -> Result<(OverlayDocument, Overl
     atomic_write_json(&output_path, &output)?;
     tracing::debug!(
         elapsed_ms = started.elapsed().as_millis(),
+        feed_source = feed_source.as_str(),
         ?stats,
         "overlay built"
     );
     Ok((output, stats))
+}
+
+/// Primary: catalog typed intents. Fallback: residual C6 projection fixtures.
+fn load_overlay_feed(
+    aicx_home: &Path,
+    repo_id: &str,
+) -> Result<(Vec<OverlayFeedItem>, String, OverlayFeedSource, usize)> {
+    let (catalog_items, catalog_files) = load_catalog_intent_feed(aicx_home, repo_id)?;
+    if !catalog_items.is_empty() {
+        let store_revision = catalog_feed_revision(&catalog_items);
+        return Ok((
+            catalog_items,
+            store_revision,
+            OverlayFeedSource::Catalog,
+            catalog_files,
+        ));
+    }
+
+    let (c6_items, store_revision, c6_files) = load_residual_c6_feed(aicx_home, repo_id)?;
+    Ok((
+        c6_items,
+        store_revision,
+        OverlayFeedSource::ResidualC6,
+        catalog_files + c6_files,
+    ))
+}
+
+fn load_catalog_intent_feed(
+    aicx_home: &Path,
+    repo_id: &str,
+) -> Result<(Vec<OverlayFeedItem>, usize)> {
+    // Extract-era purity: empty catalog means empty *catalog* feed.
+    // Do not fall through into residual store context.md mill via
+    // `extract_intents_from_root_at_with_stats` (that path is for `aicx
+    // intents` recovery). Overlay's only non-catalog fallback is residual
+    // C6 fixtures below in `load_overlay_feed`.
+    let catalog_entries = crate::catalog::read_entries_at(aicx_home).with_context(|| {
+        format!(
+            "read catalog sessions under {} for overlay feed",
+            aicx_home.display()
+        )
+    })?;
+    if catalog_entries.is_empty() {
+        return Ok((Vec::new(), 0));
+    }
+
+    // Overlay needs the durable project identity, not a short rolling window.
+    // Catalog signal frames are partitioned by frame_kind (user_msg vs
+    // agent_reply). Overlay joins both signal lanes so operator decisions and
+    // agent outcomes can attribute — without inventing a third extraction API.
+    let mut records = Vec::new();
+    let mut files_opened = 0usize;
+    for frame_kind in [FrameKind::UserMsg, FrameKind::AgentReply] {
+        let config = IntentsConfig {
+            project: repo_id.to_owned(),
+            hours: 0,
+            strict: false,
+            min_confidence: None,
+            kind_filter: None,
+            frame_kind: Some(frame_kind),
+        };
+        let extraction = extract_intents_from_root_at_with_stats(&config, aicx_home, Utc::now())
+            .with_context(|| {
+                format!(
+                    "catalog intent extraction failed under {} for repo_id={} frame={frame_kind:?}",
+                    aicx_home.display(),
+                    repo_id
+                )
+            })?;
+        files_opened = files_opened.max(extraction.stats.scanned_count);
+        records.extend(extraction.records);
+    }
+    // Stable dedup before feed conversion (same claim may appear on both lanes
+    // only via dual-source rows; evidence_ref still fail-closes empty sources).
+    records.sort_by(|left, right| {
+        (
+            left.session_id.as_str(),
+            left.source_chunk.as_str(),
+            left.kind.heading(),
+            left.summary.as_str(),
+        )
+            .cmp(&(
+                right.session_id.as_str(),
+                right.source_chunk.as_str(),
+                right.kind.heading(),
+                right.summary.as_str(),
+            ))
+    });
+    records.dedup_by(|left, right| {
+        left.session_id == right.session_id
+            && left.source_chunk == right.source_chunk
+            && left.kind == right.kind
+            && left.summary == right.summary
+    });
+    let items = intent_records_to_feed(&records, repo_id);
+    Ok((items, files_opened))
+}
+
+fn intent_records_to_feed(records: &[IntentRecord], repo_id: &str) -> Vec<OverlayFeedItem> {
+    let mut items = Vec::new();
+    for record in records {
+        if !overlay_project_identity_matches(&record.project, repo_id) {
+            continue;
+        }
+        let Some(item) = intent_record_to_feed_item(record) else {
+            continue;
+        };
+        items.push(item);
+    }
+    items.sort_by(|left, right| {
+        (
+            left.evidence_event_id.as_str(),
+            left.session_id.as_str(),
+            left.turn_idx,
+        )
+            .cmp(&(
+                right.evidence_event_id.as_str(),
+                right.session_id.as_str(),
+                right.turn_idx,
+            ))
+    });
+    items.dedup_by(|left, right| left.evidence_event_id == right.evidence_event_id);
+    items
+}
+
+fn intent_record_to_feed_item(record: &IntentRecord) -> Option<OverlayFeedItem> {
+    let summary = record.summary.trim();
+    if summary.is_empty() {
+        return None;
+    }
+    // Fail-closed: no frozen evidence identity → no overlay claim.
+    if record.source_chunk.trim().is_empty() && record.evidence.is_empty() {
+        return None;
+    }
+    let evidence_event_id = frozen_intent_evidence_ref(record);
+    if evidence_event_id.is_empty() {
+        return None;
+    }
+    let mut theses = BTreeSet::new();
+    theses.insert(truncate_chars(
+        &summary.split_whitespace().collect::<Vec<_>>().join(" "),
+        200,
+    ));
+    // Path-bearing evidence lines can pin attribution better than summary alone.
+    if !record.evidence.is_empty() {
+        for thesis in distill_theses(&record.evidence.join("\n")) {
+            theses.insert(thesis);
+        }
+    }
+    theses.retain(|thesis| !thesis.is_empty());
+    if theses.is_empty() {
+        return None;
+    }
+    let valid_from = record
+        .timestamp
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            let date = record.date.trim();
+            (!date.is_empty()).then(|| format!("{date}T00:00:00Z"))
+        })
+        .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_owned());
+    let authority = match record.kind {
+        IntentKind::Decision | IntentKind::Intent => "operator_confirmed",
+        IntentKind::Outcome | IntentKind::Task => "agent_derived",
+    }
+    .to_owned();
+    Some(OverlayFeedItem {
+        evidence_event_id,
+        session_id: safe_token(&record.session_id),
+        turn_idx: 0,
+        theses: theses.into_iter().collect(),
+        valid_from,
+        authority,
+    })
+}
+
+fn frozen_intent_evidence_ref(record: &IntentRecord) -> String {
+    // Stable, content-addressed evidence id for catalog-era claims.
+    // Binds session + durable source path + claim text so re-extraction of the
+    // same intent retains identity without depending on C6 event ids.
+    let material = [
+        record.session_id.as_str(),
+        record.source_chunk.as_str(),
+        record.kind.heading(),
+        record.summary.trim(),
+    ]
+    .join("\0");
+    format!(
+        "intent1:{}",
+        hex::encode(Sha256::digest(material.as_bytes()))
+    )
+}
+
+fn catalog_feed_revision(items: &[OverlayFeedItem]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(FEED_SOURCE_CATALOG.as_bytes());
+    for item in items {
+        hasher.update(item.evidence_event_id.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(item.session_id.as_bytes());
+        hasher.update(b"\0");
+        for thesis in &item.theses {
+            hasher.update(thesis.as_bytes());
+            hasher.update(b"\0");
+        }
+    }
+    format!("cat1:{}", hex::encode(hasher.finalize()))
+}
+
+fn load_residual_c6_feed(
+    aicx_home: &Path,
+    repo_id: &str,
+) -> Result<(Vec<OverlayFeedItem>, String, usize)> {
+    let projections = discover_canonical_projections(aicx_home)?;
+    if projections.is_empty() {
+        return Ok((Vec::new(), String::new(), 0));
+    }
+    let mut cards = Vec::new();
+    let mut revisions = BTreeSet::new();
+    let mut files_opened = 0usize;
+    for root in projections {
+        if let Some((manifest, projection_cards)) = read_canonical_projection_at(&root)? {
+            files_opened += 1 + manifest.card_ids.len();
+            let mut matching: Vec<_> = projection_cards
+                .into_iter()
+                .filter(|card| overlay_project_identity_matches(&card.project.slug, repo_id))
+                .collect();
+            if !matching.is_empty() {
+                revisions.insert(manifest.store_revision);
+                cards.append(&mut matching);
+            }
+        }
+    }
+    if cards.is_empty() {
+        return Ok((Vec::new(), String::new(), files_opened));
+    }
+    cards.sort_by(|left, right| left.id.cmp(&right.id));
+    cards.dedup_by(|left, right| left.id == right.id);
+    let store_revision = combined_store_revision(&revisions)?;
+    let items = residual_c6_cards_to_feed(&cards);
+    Ok((items, store_revision, files_opened))
+}
+
+fn residual_c6_cards_to_feed(cards: &[CanonicalCard]) -> Vec<OverlayFeedItem> {
+    let mut items = Vec::new();
+    for card in cards {
+        let Some(evidence_event_id) = card.evidence_event_ids.first() else {
+            continue;
+        };
+        if evidence_event_id.trim().is_empty() {
+            continue;
+        }
+        let theses = distill_theses(&card.frame.text);
+        if theses.is_empty() {
+            continue;
+        }
+        items.push(OverlayFeedItem {
+            evidence_event_id: evidence_event_id.clone(),
+            session_id: safe_token(&card.session_id),
+            turn_idx: card.frame.turn_idx,
+            theses,
+            valid_from: card_timestamp(card),
+            authority: if card.frame.role == TurnRole::User {
+                "operator_confirmed"
+            } else {
+                "agent_derived"
+            }
+            .to_owned(),
+        });
+    }
+    items
 }
 
 fn load_anchor_catalog(repo: &Path, configured: Option<&Path>) -> Result<AnchorCatalog> {
@@ -427,7 +749,10 @@ fn combined_store_revision(revisions: &BTreeSet<String>) -> Result<String> {
     }
     if revisions.len() != 1 {
         bail!(
-            "target repo spans {} distinct legacy C6 revisions; rebuild the canonical projection instead of synthesizing a downstream revision",
+            "target repo spans {} distinct legacy C6 revisions under residual projections; \
+             refuse to synthesize a downstream revision (canonical mill is retired — \
+             do not expect a palette 'rebuild projection' command). Isolate one \
+             store_revision fixture set or wait for extract-era overlay feed wiring.",
             revisions.len()
         );
     }
@@ -592,7 +917,7 @@ fn read_dir_rebuilt_under_base(base: &Path, candidate: &Path) -> std::io::Result
 
 fn update_side_index(
     previous: Option<SideIndex>,
-    cards: &[CanonicalCard],
+    feed: &[OverlayFeedItem],
     repo_id: &str,
     store_revision: &str,
     embedding_model: &str,
@@ -624,29 +949,27 @@ fn update_side_index(
         })
         .unwrap_or_default();
     if rebuild {
-        let current: BTreeSet<_> = cards
+        let current: BTreeSet<_> = feed
             .iter()
-            .filter_map(|card| {
-                card.evidence_event_ids
-                    .first()
-                    .map(|evidence| (evidence, distill_theses(&card.frame.text)))
-            })
-            .flat_map(|(evidence, theses)| {
-                theses
-                    .into_iter()
-                    .map(|thesis| claim_key(evidence, &thesis))
+            .flat_map(|item| {
+                item.theses
+                    .iter()
+                    .map(|thesis| claim_key(&item.evidence_event_id, thesis))
             })
             .collect();
         existing_by_claim.retain(|key, _| current.contains(key));
     }
     let retained = existing_by_claim.len();
     let mut new_intents = 0usize;
-    for card in cards {
-        let Some(evidence_event_id) = card.evidence_event_ids.first() else {
+    for item in feed {
+        if item.evidence_event_id.trim().is_empty() {
             continue;
-        };
-        for thesis in distill_theses(&card.frame.text) {
-            let key = claim_key(evidence_event_id, &thesis);
+        }
+        for thesis in &item.theses {
+            if thesis.trim().is_empty() {
+                continue;
+            }
+            let key = claim_key(&item.evidence_event_id, thesis);
             if existing_by_claim.contains_key(&key) {
                 continue;
             }
@@ -656,19 +979,13 @@ fn update_side_index(
                 IndexedIntent {
                     intent_id,
                     group_intent_id: String::new(),
-                    evidence_event_id: evidence_event_id.clone(),
+                    evidence_event_id: item.evidence_event_id.clone(),
                     claim_key: key,
-                    session_id: safe_token(&card.session_id),
-                    turn_idx: card.frame.turn_idx,
-                    thesis,
-                    valid_from: card_timestamp(card),
-                    // User/operator cards are authority; other typed cards remain derived.
-                    authority: if card.frame.role == TurnRole::User {
-                        "operator_confirmed"
-                    } else {
-                        "agent_derived"
-                    }
-                    .to_owned(),
+                    session_id: item.session_id.clone(),
+                    turn_idx: item.turn_idx,
+                    thesis: thesis.clone(),
+                    valid_from: item.valid_from.clone(),
+                    authority: item.authority.clone(),
                     embedding: Vec::new(),
                 },
             );
@@ -1454,6 +1771,10 @@ fn target_from_anchor(anchor: &Anchor) -> OverlayTarget {
             path: anchor.normalized_path.clone(),
             language: Some(anchor.language.clone()),
             anchor_id: Some(anchor.anchor_id.clone()),
+            // `loct anchors` is path-grain today; line range is additive
+            // capacity for a future path+span catalog / find consumer.
+            start_line: None,
+            end_line: None,
         },
     }
 }
@@ -1577,6 +1898,256 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static TEST_ID: AtomicUsize = AtomicUsize::new(0);
+
+    /// Operator front-door contract: fail-closed copy must name real palette
+    /// commands and must never invent "canonical ingest".
+    #[test]
+    fn missing_c6_hint_names_real_palette_not_phantom_command() {
+        let hint = MISSING_C6_PROJECTION_HINT;
+        assert!(
+            !hint.to_ascii_lowercase().contains("canonical ingest"),
+            "phantom command must not appear in operator-facing fail-closed copy"
+        );
+        assert!(
+            hint.contains("catalog rebuild"),
+            "must point at live extract-era catalog path"
+        );
+        assert!(
+            hint.contains("aicx intents"),
+            "must point at live intents command"
+        );
+        assert!(
+            hint.contains("aicx overlay"),
+            "must name the overlay re-run after catalog rebuild"
+        );
+        assert!(
+            hint.contains("aicx ingest"),
+            "must disambiguate operator-md ingest from C6 projection"
+        );
+        assert!(
+            hint.contains("retired") || hint.contains("mill retired"),
+            "must state that the C6 write mill is retired"
+        );
+    }
+
+    #[test]
+    fn frozen_intent_evidence_ref_is_stable_and_non_empty() {
+        let record = IntentRecord {
+            kind: IntentKind::Decision,
+            summary: "Must pin overlay feed to catalog sources".to_owned(),
+            context: None,
+            evidence: vec!["src/overlay.rs carries the emitter".to_owned()],
+            project: "Loctree/aicx".to_owned(),
+            agent: "grok".to_owned(),
+            date: "2026-07-25".to_owned(),
+            timestamp: Some("2026-07-25T10:00:00Z".to_owned()),
+            session_id: "session-catalog-feed".to_owned(),
+            count: None,
+            first_chunk: None,
+            last_chunk: None,
+            source_chunk: "/tmp/fixture/transcript.log".to_owned(),
+            source: Some("catalog-v1".to_owned()),
+            honesty: crate::oracle::ClaimHonesty::default(),
+        };
+        let first = frozen_intent_evidence_ref(&record);
+        let second = frozen_intent_evidence_ref(&record);
+        assert_eq!(first, second);
+        assert!(first.starts_with("intent1:"));
+        assert_eq!(first.len(), "intent1:".len() + 64);
+        let item = intent_record_to_feed_item(&record).expect("feed item");
+        assert_eq!(item.evidence_event_id, first);
+        assert!(!item.theses.is_empty());
+        assert_eq!(item.authority, "operator_confirmed");
+    }
+
+    #[test]
+    fn intent_record_without_evidence_is_fail_closed() {
+        let record = IntentRecord {
+            kind: IntentKind::Intent,
+            summary: "claim without durable source".to_owned(),
+            context: None,
+            evidence: Vec::new(),
+            project: "Loctree/aicx".to_owned(),
+            agent: "grok".to_owned(),
+            date: "2026-07-25".to_owned(),
+            timestamp: None,
+            session_id: "session-no-evidence".to_owned(),
+            count: None,
+            first_chunk: None,
+            last_chunk: None,
+            source_chunk: String::new(),
+            source: None,
+            honesty: crate::oracle::ClaimHonesty::default(),
+        };
+        assert!(intent_record_to_feed_item(&record).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn catalog_intent_feed_emits_overlay_without_c6_projection() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = unique_test_root("catalog-feed");
+        let repo = root.join("repo");
+        let home = root.join("aicx-home");
+        let index = root.join("index");
+        fs::create_dir_all(repo.join("src")).unwrap();
+        fs::write(
+            repo.join("src/overlay.rs"),
+            "// DECISION: catalog feed must not open residual C6\n",
+        )
+        .unwrap();
+
+        // Fake loct anchors for exact owner/repo identity + path anchor.
+        let anchors = AnchorCatalog {
+            repo_id: "Loctree/aicx".to_owned(),
+            snapshot_commit: "deadbeef".to_owned(),
+            anchor_catalog_revision: "acr1:catalog-feed-test".to_owned(),
+            producer_version: "test".to_owned(),
+            anchors: vec![Anchor {
+                anchor_id: "anc1:overlay".to_owned(),
+                normalized_path: "src/overlay.rs".to_owned(),
+                language: "rs".to_owned(),
+                qualified_symbol: None,
+                signature_hash: None,
+            }],
+        };
+        let anchors_path = root.join("anchors.json");
+        fs::write(&anchors_path, serde_json::to_vec(&anchors).unwrap()).unwrap();
+        let loct = root.join("loct");
+        fs::write(
+            &loct,
+            format!("#!/bin/sh\nexec /bin/cat '{}'\n", anchors_path.display()),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&loct).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&loct, permissions).unwrap();
+
+        // Catalog session pointing at a transcript with a decision + path.
+        let source = home
+            .join("runtime_runs")
+            .join("catalog-overlay-feed")
+            .join("transcript.log");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::write(
+            &source,
+            "DECISION: catalog feed must not open residual C6 in src/overlay.rs\n\
+             WHY: extract-era overlay emitter should join typed intents to anchors.\n",
+        )
+        .unwrap();
+        let catalog_path = crate::catalog::sessions_path_for(&home);
+        fs::create_dir_all(catalog_path.parent().unwrap()).unwrap();
+        let entry = crate::catalog::CatalogEntry {
+            schema: crate::catalog::CATALOG_SCHEMA.to_string(),
+            session_id: "catalog-overlay-feed-session".to_string(),
+            agent: "vibecrafted".to_string(),
+            project: Some("Loctree/aicx".to_string()),
+            date: Some("2026-07-25".to_string()),
+            cwd: Some(repo.display().to_string()),
+            source_path: source.display().to_string(),
+            source_len: None,
+            source_mtime_ns: None,
+            title: Some("catalog overlay feed".to_string()),
+            machine: Some("test".to_string()),
+            logical_session_id: None,
+        };
+        fs::write(
+            &catalog_path,
+            format!("{}\n", serde_json::to_string(&entry).unwrap()),
+        )
+        .unwrap();
+
+        // No C6 under home — if the emitter still requires residual projection,
+        // this build must fail closed. Catalog feed is the only source.
+        assert!(!home.join("store").exists());
+        assert!(!home.join("canonical-projection-v1").exists());
+
+        let options = OverlayOptions {
+            repo: repo.clone(),
+            rebuild: true,
+            loct_bin: Some(loct),
+            aicx_home: Some(home.clone()),
+            index_root: Some(index),
+        };
+        let (doc, stats) = build_overlay(&options).expect("catalog feed overlay");
+        assert_eq!(doc.repo_id, "Loctree/aicx");
+        assert!(doc.store_revision.starts_with("cat1:"));
+        assert!(
+            stats.canonical_cards_seen > 0,
+            "catalog feed should yield at least one claim seed"
+        );
+        assert!(
+            stats.raw_session_files_opened == 0,
+            "overlay must not open raw sessions as a fallback"
+        );
+        assert!(
+            !doc.entries.is_empty() || !doc.unresolved_attributions.is_empty(),
+            "catalog claims must reach attribution (resolved or unresolved), got empty both"
+        );
+        let evidence_ok = doc.entries.iter().all(|entry| {
+            entry.attributions.iter().all(|attr| {
+                !attr.evidence_ref.is_empty() && attr.evidence_ref.starts_with("intent1:")
+            }) && entry.refs.iter().all(|r| {
+                !r.evidence_event_id.is_empty() && r.evidence_event_id.starts_with("intent1:")
+            })
+        }) && doc
+            .unresolved_attributions
+            .iter()
+            .all(|u| !u.evidence_ref.is_empty() && u.evidence_ref.starts_with("intent1:"));
+        assert!(
+            evidence_ok,
+            "every attribution/ref must carry frozen intent1 evidence_ref; entries={:?} unresolved={:?}",
+            doc.entries, doc.unresolved_attributions
+        );
+        // Residual C6 still not required / not created.
+        assert!(!home.join("store").exists());
+        if std::env::var_os("AICX_OVERLAY_TEST_ROOT").is_none() {
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn path_target_line_range_is_additive_and_omitted_when_none() {
+        let without = OverlayTarget::Path {
+            path: "src/main.rs".to_owned(),
+            language: Some("rs".to_owned()),
+            anchor_id: Some("anc1:test".to_owned()),
+            start_line: None,
+            end_line: None,
+        };
+        let json = serde_json::to_value(&without).unwrap();
+        assert_eq!(json["kind"], "path");
+        assert_eq!(json["path"], "src/main.rs");
+        assert!(json.get("start_line").is_none());
+        assert!(json.get("end_line").is_none());
+
+        let with = OverlayTarget::Path {
+            path: "src/overlay.rs".to_owned(),
+            language: Some("rs".to_owned()),
+            anchor_id: Some("anc1:range".to_owned()),
+            start_line: Some(210),
+            end_line: Some(214),
+        };
+        let json = serde_json::to_value(&with).unwrap();
+        assert_eq!(json["start_line"], 210);
+        assert_eq!(json["end_line"], 214);
+
+        // Legacy path-only cards remain deserializable.
+        let legacy = r#"{"kind":"path","path":"src/main.rs","language":"rs","anchor_id":"anc1:x"}"#;
+        let parsed: OverlayTarget = serde_json::from_str(legacy).unwrap();
+        match parsed {
+            OverlayTarget::Path {
+                start_line,
+                end_line,
+                ..
+            } => {
+                assert_eq!(start_line, None);
+                assert_eq!(end_line, None);
+            }
+            other => panic!("expected Path, got {other:?}"),
+        }
+    }
 
     #[cfg(unix)]
     #[derive(Debug, Deserialize)]

@@ -119,8 +119,10 @@ fn initialized_stdio_server_exits_within_five_seconds_after_stdin_eof() {
 
 #[test]
 fn test_mcp_slim_defaults() {
+    // Search/steer defaults must match CLI command defaults (search/steer → 10).
+    // Rank remains MCP-only at 20; intents stay bounded at 20 for MCP safety.
     let params: SearchParams = serde_json::from_str(r#"{"query": "test"}"#).unwrap();
-    assert_eq!(params.limit, 20);
+    assert_eq!(params.limit, 10);
     assert!(!params.evidence);
     assert!(params.slim);
     assert!(!params.verbose);
@@ -131,7 +133,7 @@ fn test_mcp_slim_defaults() {
     assert!(!params.verbose);
 
     let params: SteerParams = serde_json::from_str(r#"{}"#).unwrap();
-    assert_eq!(params.limit, 20);
+    assert_eq!(params.limit, 10);
     assert!(params.project.is_none());
     assert!(params.projects.is_none());
     assert!(params.slim);

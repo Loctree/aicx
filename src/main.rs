@@ -864,6 +864,15 @@ enum CatalogAction {
         #[arg(long)]
         json: bool,
     },
+    /// Compare durable catalog fingerprints to live agent sources (no write).
+    ///
+    /// Granular classes: current / stale / unadmitted / missing_source /
+    /// fingerprint_unknown. Orthogonal to `aicx index status` (index vs catalog).
+    Status {
+        /// Emit JSON (`aicx.catalog.status.v1`).
+        #[arg(long)]
+        json: bool,
+    },
     /// Resolve one session id from the durable catalog.
     Resolve {
         /// Session id (exact, logical, or unique prefix).
@@ -880,7 +889,14 @@ enum Commands {
     #[command(hide = true)]
     Completions { shell: Shell },
 
-    /// Join typed canonical intents to the current Loctree anchor catalog.
+    /// Join catalog typed intents to the current Loctree anchor catalog.
+    ///
+    /// Emits `loctree.overlay.intent.v1`. Primary feed is extract-era catalog
+    /// sessions → typed intent records (`aicx catalog rebuild`). Residual C6
+    /// `canonical-projection-v1` fixtures are a fallback only — the write mill
+    /// is **retired**. There is no palette command named "canonical ingest".
+    /// Recovery: `aicx catalog rebuild` then `aicx intents -p <owner/repo>`,
+    /// then re-run overlay. `aicx ingest` is operator-md / loct-context-pack only.
     Overlay {
         /// Repository whose `loct anchors` catalog is the attribution target.
         #[arg(long)]
@@ -890,7 +906,7 @@ enum Commands {
         #[arg(long, value_enum, default_value_t = OverlayFormat::Json)]
         format: OverlayFormat,
 
-        /// Re-evaluate every typed card while preserving persisted intent ids.
+        /// Re-evaluate every typed claim while preserving persisted intent ids.
         #[arg(long)]
         rebuild: bool,
     },
@@ -2459,6 +2475,9 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
         Some(Commands::Catalog { action }) => match action {
             CatalogAction::Rebuild { json } => {
                 run_catalog_rebuild(json)?;
+            }
+            CatalogAction::Status { json } => {
+                run_catalog_status(json)?;
             }
             CatalogAction::Resolve { session, json } => {
                 run_catalog_resolve(&session, json)?;
@@ -7098,6 +7117,84 @@ fn render_catalog_progress(
         io::stderr().flush()?;
     } else {
         eprintln!("{message}");
+    }
+    Ok(())
+}
+
+fn run_catalog_status(json: bool) -> Result<()> {
+    let aicx_home = aicx::aicx_home::resolve()?;
+    let user_home = aicx::os_user_home().context("No home dir")?;
+    let report = aicx::catalog::status(&aicx_home, &user_home)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+
+    let readiness = match report.readiness {
+        aicx::catalog::CatalogReadiness::Missing => "missing",
+        aicx::catalog::CatalogReadiness::Empty => "empty",
+        aicx::catalog::CatalogReadiness::Fresh => "fresh",
+        aicx::catalog::CatalogReadiness::NeedsRebuild => "needs_rebuild",
+        aicx::catalog::CatalogReadiness::SourcesMissing => "sources_missing",
+    };
+    eprintln!(
+        "aicx catalog status · readiness={readiness} · {} ms",
+        report.wall_ms
+    );
+    eprintln!("  catalog: {}", report.catalog_path);
+    if let Some(mtime) = &report.catalog_mtime {
+        eprintln!("  catalog_mtime: {mtime}");
+    }
+    eprintln!(
+        "  sessions: catalog={} live={}",
+        report.catalog_sessions, report.live_sessions
+    );
+    eprintln!(
+        "  classes: current={} stale={} unadmitted={} missing_source={} fingerprint_unknown={}",
+        report.counts.current,
+        report.counts.stale,
+        report.counts.unadmitted,
+        report.counts.missing_source,
+        report.counts.fingerprint_unknown
+    );
+    if !report.by_agent.is_empty() {
+        eprintln!("  by agent:");
+        for (agent, counts) in &report.by_agent {
+            eprintln!(
+                "    {agent:<12} current={} stale={} unadmitted={} missing={}",
+                counts.current, counts.stale, counts.unadmitted, counts.missing_source
+            );
+        }
+    }
+    if !report.by_machine.is_empty() {
+        eprintln!("  by machine (catalog stamp):");
+        for (machine, count) in &report.by_machine {
+            eprintln!("    {machine:<16} {count}");
+        }
+    }
+    if !report.samples.is_empty() {
+        eprintln!("  samples (up to {}):", report.samples.len());
+        for sample in &report.samples {
+            eprintln!(
+                "    [{class}] {agent} {session}  {path}",
+                class = sample.class,
+                agent = sample.agent,
+                session = sample.session_id,
+                path = sample.source_path
+            );
+        }
+    }
+    if !report.recommendations.is_empty() {
+        eprintln!("  next:");
+        for line in &report.recommendations {
+            eprintln!("    - {line}");
+        }
+    }
+    if !report.notes.is_empty() {
+        eprintln!("  topology notes:");
+        for line in &report.notes {
+            eprintln!("    · {line}");
+        }
     }
     Ok(())
 }

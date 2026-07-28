@@ -41,6 +41,9 @@ Each catalog row maps one session to:
 The catalog adds topical project attribution without duplicating conversation
 content.
 
+Inspect drift without rewriting: `aicx catalog status` (see
+[COMMANDS.md](./COMMANDS.md) and [MULTI_MACHINE.md](./MULTI_MACHINE.md)).
+
 ## Extract cache
 
 `aicx extract` renders one readable session on request.

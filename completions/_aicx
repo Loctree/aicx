@@ -45,7 +45,7 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 '--repo=[Repository whose \`loct anchors\` catalog is the attribution target]:REPO:_files' \
 '--format=[Machine-readable overlay contract format]:FORMAT:(json)' \
-'--rebuild[Re-evaluate every typed card while preserving persisted intent ids]' \
+'--rebuild[Re-evaluate every typed claim while preserving persisted intent ids]' \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
@@ -359,6 +359,16 @@ _arguments "${_arguments_options[@]}" : \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
 ;;
+(status)
+_arguments "${_arguments_options[@]}" : \
+'--json[Emit JSON (\`aicx.catalog.status.v1\`)]' \
+'-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
 (resolve)
 _arguments "${_arguments_options[@]}" : \
 '--json[Emit JSON]' \
@@ -383,6 +393,10 @@ _arguments "${_arguments_options[@]}" : \
         curcontext="${curcontext%:*:*}:aicx-catalog-help-command-$line[1]:"
         case $line[1] in
             (rebuild)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(status)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
@@ -1527,6 +1541,10 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
+(status)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
 (resolve)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
@@ -1832,7 +1850,7 @@ esac
 _aicx_commands() {
     local commands; commands=(
 'completions:Generate shell completions for the canonical CLI grammar' \
-'overlay:Join typed canonical intents to the current Loctree anchor catalog' \
+'overlay:Join catalog typed intents to the current Loctree anchor catalog' \
 'claude:Extract Claude sessions into local reports' \
 'codex:Extract Codex sessions into local reports' \
 'all:Extract sessions from all supported agents into local reports' \
@@ -1883,6 +1901,7 @@ _aicx__subcmd__all_commands() {
 _aicx__subcmd__catalog_commands() {
     local commands; commands=(
 'rebuild:Walk all source roots and rewrite \`~/.aicx/catalog/sessions.jsonl\`' \
+'status:Compare durable catalog fingerprints to live agent sources (no write)' \
 'resolve:Resolve one session id from the durable catalog' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
@@ -1892,6 +1911,7 @@ _aicx__subcmd__catalog_commands() {
 _aicx__subcmd__catalog__subcmd__help_commands() {
     local commands; commands=(
 'rebuild:Walk all source roots and rewrite \`~/.aicx/catalog/sessions.jsonl\`' \
+'status:Compare durable catalog fingerprints to live agent sources (no write)' \
 'resolve:Resolve one session id from the durable catalog' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
@@ -1912,6 +1932,11 @@ _aicx__subcmd__catalog__subcmd__help__subcmd__resolve_commands() {
     local commands; commands=()
     _describe -t commands 'aicx catalog help resolve commands' commands "$@"
 }
+(( $+functions[_aicx__subcmd__catalog__subcmd__help__subcmd__status_commands] )) ||
+_aicx__subcmd__catalog__subcmd__help__subcmd__status_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx catalog help status commands' commands "$@"
+}
 (( $+functions[_aicx__subcmd__catalog__subcmd__rebuild_commands] )) ||
 _aicx__subcmd__catalog__subcmd__rebuild_commands() {
     local commands; commands=()
@@ -1921,6 +1946,11 @@ _aicx__subcmd__catalog__subcmd__rebuild_commands() {
 _aicx__subcmd__catalog__subcmd__resolve_commands() {
     local commands; commands=()
     _describe -t commands 'aicx catalog resolve commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__catalog__subcmd__status_commands] )) ||
+_aicx__subcmd__catalog__subcmd__status_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx catalog status commands' commands "$@"
 }
 (( $+functions[_aicx__subcmd__claims_commands] )) ||
 _aicx__subcmd__claims_commands() {
@@ -2222,7 +2252,7 @@ _aicx__subcmd__health_commands() {
 _aicx__subcmd__help_commands() {
     local commands; commands=(
 'completions:Generate shell completions for the canonical CLI grammar' \
-'overlay:Join typed canonical intents to the current Loctree anchor catalog' \
+'overlay:Join catalog typed intents to the current Loctree anchor catalog' \
 'claude:Extract Claude sessions into local reports' \
 'codex:Extract Codex sessions into local reports' \
 'all:Extract sessions from all supported agents into local reports' \
@@ -2272,6 +2302,7 @@ _aicx__subcmd__help__subcmd__all_commands() {
 _aicx__subcmd__help__subcmd__catalog_commands() {
     local commands; commands=(
 'rebuild:Walk all source roots and rewrite \`~/.aicx/catalog/sessions.jsonl\`' \
+'status:Compare durable catalog fingerprints to live agent sources (no write)' \
 'resolve:Resolve one session id from the durable catalog' \
     )
     _describe -t commands 'aicx help catalog commands' commands "$@"
@@ -2285,6 +2316,11 @@ _aicx__subcmd__help__subcmd__catalog__subcmd__rebuild_commands() {
 _aicx__subcmd__help__subcmd__catalog__subcmd__resolve_commands() {
     local commands; commands=()
     _describe -t commands 'aicx help catalog resolve commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__help__subcmd__catalog__subcmd__status_commands] )) ||
+_aicx__subcmd__help__subcmd__catalog__subcmd__status_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx help catalog status commands' commands "$@"
 }
 (( $+functions[_aicx__subcmd__help__subcmd__claims_commands] )) ||
 _aicx__subcmd__help__subcmd__claims_commands() {

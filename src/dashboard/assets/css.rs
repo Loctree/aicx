@@ -348,6 +348,71 @@ mark.hl-fuzzy {
   color: var(--muted);
 }
 
+/* Human Bearer login overlay (server-mode only; static dashboard has no /api/* gate) */
+.aicx-auth-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 10000;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  background: rgba(5, 8, 14, 0.82);
+  backdrop-filter: blur(4px);
+  padding: 18px;
+}
+.aicx-auth-card {
+  width: min(420px, 100%);
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 28px 24px;
+  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.45);
+}
+.aicx-auth-card h2 {
+  margin: 0 0 10px;
+  font-size: 1.2rem;
+  color: var(--accent);
+}
+.aicx-auth-card p {
+  margin: 0 0 16px;
+  color: var(--muted);
+  font-size: 0.9rem;
+  line-height: 1.45;
+}
+.aicx-auth-card code {
+  color: var(--accent-2);
+  font-size: 0.85em;
+}
+.aicx-auth-err {
+  color: #f87171;
+  font-size: 0.85rem;
+  margin: 0 0 12px;
+}
+.aicx-auth-card input[type="password"] {
+  width: 100%;
+  padding: 10px 12px;
+  margin: 0 0 12px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: var(--panel-2);
+  color: var(--text);
+  font-size: 0.95rem;
+}
+.aicx-auth-card button[type="submit"] {
+  width: 100%;
+  padding: 10px 12px;
+  border: 0;
+  border-radius: 8px;
+  background: linear-gradient(120deg, #0ea5e9, #22d3ee);
+  color: #041018;
+  font-weight: 600;
+  cursor: pointer;
+}
+.aicx-auth-card button[type="submit"]:disabled {
+  opacity: 0.6;
+  cursor: wait;
+}
+
 @media (max-width: 1020px) {
   .filter-row {
     grid-template-columns: 1fr;

@@ -500,8 +500,8 @@ fn push_allowed_host(allowed: &mut Vec<String>, host: impl AsRef<str>) {
 pub struct SearchParams {
     /// Search query text
     pub query: String,
-    /// Max results to return (default: 10)
-    #[serde(default = "default_limit")]
+    /// Max results to return (default: 10 — matches CLI `aicx search`).
+    #[serde(default = "default_search_limit")]
     pub limit: usize,
     /// Optional exact project filter. A bare repo name must be unique; prefer
     /// `projects` for explicit cross-project search.
@@ -551,7 +551,17 @@ pub struct ReadParams {
     pub max_chars: Option<usize>,
 }
 
-fn default_limit() -> usize {
+/// CLI `aicx search` defaults to 10 when `--limit` is omitted. MCP must match
+/// so agents that omit `limit` do not get a different ranking window than
+/// humans typing the same query in the terminal.
+fn default_search_limit() -> usize {
+    10
+}
+
+/// MCP-only quality rank surface (no CLI `rank` command). Keep a wider default
+/// so operators scanning recent density still see a useful board without
+/// forcing an explicit limit on every call.
+fn default_rank_limit() -> usize {
     20
 }
 
@@ -655,8 +665,8 @@ pub struct RankParams {
     pub sort: Option<String>,
     /// Show only top N bundles
     pub top: Option<usize>,
-    /// Max results to return
-    #[serde(default = "default_limit")]
+    /// Max results to return (default: 20)
+    #[serde(default = "default_rank_limit")]
     pub limit: usize,
     /// Return only metadata without full snippet content
     #[serde(default = "default_true")]
@@ -695,7 +705,7 @@ pub struct SteerParams {
     pub project_match: Option<String>,
     /// Filter by date (YYYY-MM-DD, or range like 2026-03-20..2026-03-28)
     pub date: Option<String>,
-    /// Max results (default: 20)
+    /// Max results (default: 10 — matches CLI `aicx steer`)
     #[serde(default = "default_steer_limit")]
     pub limit: usize,
     /// Minimum score threshold (0-100)
@@ -715,7 +725,7 @@ pub struct SteerParams {
 }
 
 fn default_steer_limit() -> usize {
-    20
+    10
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -2191,7 +2201,7 @@ mod tests {
     fn minimal_search_params() -> SearchParams {
         SearchParams {
             query: "dashboard".to_string(),
-            limit: 20,
+            limit: 10,
             project: None,
             projects: None,
             project_match: None,
@@ -2352,7 +2362,10 @@ mod tests {
     fn search_params_roundtrip_include_new_optional_filters() {
         let params: SearchParams =
             serde_json::from_str(r#"{"query":"dashboard"}"#).expect("search params should parse");
-        assert_eq!(params.limit, 20);
+        assert_eq!(
+            params.limit, 10,
+            "MCP search default limit must match CLI `aicx search` (10)"
+        );
         assert!(params.project.is_none());
         assert!(params.score.is_none());
         assert!(params.hours.is_none());

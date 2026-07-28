@@ -213,6 +213,26 @@ fn server_shell_includes_highlight_styles_and_wiring() {
 }
 
 #[test]
+fn server_shell_includes_browser_bearer_auth_wiring() {
+    let html = render_server_shell_html("AI Context Browser");
+
+    // Storage + inject path (human can authenticate without a separate IdP).
+    assert!(html.contains("aicx_dashboard_token"));
+    assert!(html.contains("const apiFetch = (url, opts) => {"));
+    assert!(html.contains("headers['Authorization'] = 'Bearer ' + t;"));
+    assert!(html.contains("const showLogin = (msg) => {"));
+    assert!(html.contains("aicx-auth-overlay"));
+    assert!(html.contains("const consumeQueryToken = () => {"));
+    assert!(html.contains("const boot = () => {"));
+    // All corpus calls must go through apiFetch, not bare fetch.
+    assert!(html.contains("apiFetch('/api/browse'"));
+    assert!(html.contains("apiFetch('/api/search/semantic?'"));
+    assert!(html.contains("apiFetch('/api/regenerate'"));
+    assert!(html.contains(".aicx-auth-overlay {"));
+    assert!(html.contains("version: '6.1.0-pwa-auth'"));
+}
+
+#[test]
 fn static_dashboard_includes_highlight_styles_and_wiring() {
     let payload = DashboardPayload {
         generated_at: "2026-04-02T17:43:00Z".to_string(),
