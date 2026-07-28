@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+# Vibecrafted commit-msg hook.
+#
+# Enforces the agent/runtime commit standard:
+#
+#   [codex/interactive] chore: Polish Makefile help output formatting
+#
+#   Refactors the help target to use structured printf output.
+#
+#   Authored-By: codex <agents@vetcoders.io>
+#   session_id: 019e93be-379d-7303-9ad4-ffae468db99f
+#   timestamp: 2026_0604_1408_MDT
+#   runtime: iterm2
+
+set -euo pipefail
+
+msg_file="${1:-}"
+if [ -z "$msg_file" ] || [ ! -f "$msg_file" ]; then
+    printf 'commit-msg: expected path to commit message file\n' >&2
+    exit 2
+fi
+
+first_line="$(head -n1 "$msg_file" | tr -d '\r')"
+
+# Git-generated commit subjects have fixed forms; do not fight them here.
+case "$first_line" in
+    "Merge "*|"Revert "*|"fixup!"*|"squash!"*|"amend!"*) exit 0 ;;
+esac
+
+types='feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert|release|merge'
+subject_max="${VIBECRAFTED_COMMIT_MSG_SUBJECT_MAX:-100}"
+subject_pattern="^\\[([a-z][a-z0-9_-]*)/[a-z0-9][a-z0-9._-]*\\] (${types})(\\(.+\\))?: .{1,${subject_max}}$"
+
+failures=()
+agent=""
+if [[ "$first_line" =~ $subject_pattern ]]; then
+    agent="${BASH_REMATCH[1]}"
+else
+    failures+=("subject must be: [<agent>/<runtime>] <type>(<scope>): <subject>")
+fi
+
+if grep -Eiq '(^Co-Authored-By:|noreply@|@anthropic\.com|@openai\.com)' "$msg_file"; then
+    failures+=("vendor footers are forbidden; use Authored-By only")
+fi
+
+if [ -n "$agent" ] && ! grep -Eq "^Authored-By: ${agent} <agents@vetcoders\\.io>$" "$msg_file"; then
+    failures+=("missing Authored-By: ${agent} <agents@vetcoders.io>")
+elif [ -z "$agent" ] && ! grep -Eq '^Authored-By: [a-z][a-z0-9_-]* <agents@vetcoders\.io>$' "$msg_file"; then
+    failures+=("missing Authored-By: <agent> <agents@vetcoders.io>")
+fi
+
+if ! grep -Eq '^session_id: [0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' "$msg_file"; then
+    failures+=("missing session_id: <uuid>")
+fi
+
+if ! grep -Eq '^timestamp: [0-9]{4}_[0-9]{4}_[0-9]{4}_[A-Za-z0-9_+-]+$' "$msg_file"; then
+    failures+=("missing timestamp: YYYY_MMDD_HHMM_TZ")
+fi
+
+if ! grep -Eq '^runtime: .+' "$msg_file"; then
+    failures+=("missing runtime: <runtime name>")
+fi
+
+has_body=0
+while IFS= read -r line || [ -n "$line" ]; do
+    line="${line%$'\r'}"
+    case "$line" in
+        "$first_line"|"") continue ;;
+    esac
+    if printf '%s\n' "$line" | grep -Eq '^(Authored-By|session_id|timestamp|runtime|Signed-off-by|Vibecrafted-Warn-Signature):'; then
+        continue
+    fi
+    has_body=1
+    break
+done < "$msg_file"
+
+if [ "$has_body" -ne 1 ]; then
+    failures+=("commit message needs an explanatory body before trailers")
+fi
+
+if [ "${#failures[@]}" -eq 0 ]; then
+    exit 0
+fi
+
+printf 'commit-msg: invalid Vibecrafted commit message\n' >&2
+for failure in "${failures[@]}"; do
+    printf '  - %s\n' "$failure" >&2
+done
+printf '\nExpected shape:\n' >&2
+printf '  [codex/interactive] chore: Polish Makefile help output formatting\n\n' >&2
+printf '  Refactors the help target to use structured printf output.\n\n' >&2
+printf '  Authored-By: codex <agents@vetcoders.io>\n' >&2
+printf '  session_id: 019e93be-379d-7303-9ad4-ffae468db99f\n' >&2
+printf '  timestamp: 2026_0604_1408_MDT\n' >&2
+printf '  runtime: iterm2\n' >&2
+exit 1
