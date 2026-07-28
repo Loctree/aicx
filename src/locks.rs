@@ -405,6 +405,14 @@ fn epoch_seconds(time: SystemTime) -> Result<u64> {
 }
 
 fn pid_is_alive(pid: u32) -> bool {
+    // A holder sidecar is written by a live process recording its own pid, so
+    // pid 0 can only mean a corrupted or partially written sidecar. Probing 0
+    // is undecidable (`None`), and folding that into the fail-closed `true`
+    // arm would park stale-lock recovery forever; an impossible pid counts as
+    // dead while genuine probe uncertainty stays fail-closed (alive).
+    if pid == 0 {
+        return false;
+    }
     crate::process_liveness::probe_pid_liveness(pid).unwrap_or(true)
 }
 
@@ -867,6 +875,29 @@ mod tests {
             capture_logs(|| acquire_exclusive(&path).expect("recover stale holder"));
         assert!(
             logs.contains(&format!("recovered stale lock from dead PID {dead_pid}")),
+            "logs: {logs}"
+        );
+        let contents = fs::read_to_string(holder_sidecar_path(&path).unwrap()).unwrap();
+        assert!(contents.contains(&format!("pid={}", std::process::id())));
+        release(handle);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn stale_zero_pid_holder_is_recovered_not_parked_forever() {
+        let path = temp_lance_lock("stale-zero-pid");
+        let holder = Holder::new(
+            0,
+            SystemTime::now() - Duration::from_secs(125),
+            "aicx index",
+            LockMode::Exclusive,
+        );
+        write_holder_sidecar(&path, &holder).expect("write corrupted zero-pid holder");
+
+        let (handle, logs) =
+            capture_logs(|| acquire_exclusive(&path).expect("recover zero-pid holder"));
+        assert!(
+            logs.contains("recovered stale lock from dead PID 0"),
             "logs: {logs}"
         );
         let contents = fs::read_to_string(holder_sidecar_path(&path).unwrap()).unwrap();

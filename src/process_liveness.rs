@@ -30,12 +30,16 @@ pub(crate) fn probe_pid_liveness(pid: u32) -> Option<bool> {
     }
 
     const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    const SYNCHRONIZE: u32 = 0x0010_0000;
     const ERROR_ACCESS_DENIED: i32 = 5;
     const ERROR_INVALID_PARAMETER: i32 = 87;
-    const STILL_ACTIVE: u32 = 259;
+    const WAIT_OBJECT_0: u32 = 0;
+    const WAIT_TIMEOUT: u32 = 258;
 
     // SAFETY: FFI call; a non-null handle is closed before returning.
-    let handle = unsafe { windows_ffi::OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    let handle = unsafe {
+        windows_ffi::OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, 0, pid)
+    };
     if handle.is_null() {
         return match std::io::Error::last_os_error().raw_os_error() {
             // Protected system processes exist but cannot be opened here.
@@ -46,17 +50,17 @@ pub(crate) fn probe_pid_liveness(pid: u32) -> Option<bool> {
         };
     }
 
-    let mut exit_code = 0u32;
-    // SAFETY: `handle` is valid and `exit_code` points to writable storage.
-    let status = unsafe { windows_ffi::GetExitCodeProcess(handle, &mut exit_code) };
+    // A zero-timeout wait disambiguates "running" from "exited with code 259
+    // (STILL_ACTIVE)": the process handle is signaled if and only if the
+    // process has terminated, regardless of the exit code it chose.
+    // SAFETY: `handle` is valid; zero timeout never blocks.
+    let wait = unsafe { windows_ffi::WaitForSingleObject(handle, 0) };
     // SAFETY: `handle` was returned by OpenProcess and is closed exactly once.
     unsafe { windows_ffi::CloseHandle(handle) };
-    if status == 0 {
-        None
-    } else {
-        // A process that actually exits with STILL_ACTIVE remains ambiguous;
-        // treating it as alive preserves the fail-closed deletion contract.
-        Some(exit_code == STILL_ACTIVE)
+    match wait {
+        WAIT_OBJECT_0 => Some(false),
+        WAIT_TIMEOUT => Some(true),
+        _ => None,
     }
 }
 
@@ -76,7 +80,7 @@ mod windows_ffi {
             b_inherit_handle: i32,
             dw_process_id: u32,
         ) -> *mut c_void;
-        pub fn GetExitCodeProcess(process: *mut c_void, exit_code: *mut u32) -> i32;
+        pub fn WaitForSingleObject(handle: *mut c_void, milliseconds: u32) -> u32;
         pub fn CloseHandle(object: *mut c_void) -> i32;
     }
 }
