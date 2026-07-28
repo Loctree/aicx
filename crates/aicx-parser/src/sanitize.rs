@@ -1135,9 +1135,6 @@ const RETIRED_CLI_SUBCOMMANDS: &[&str] = &[
     // `aicx gemini` / `aicx junie` were single-source extractors before
     // they were folded into the source catalog/extract engine.
     "gemini", "junie",
-    // Removed with the per-frame card mill. Keep historical invocations
-    // classified as self-echo without advertising a live command.
-    "store",
 ];
 
 /// Canonical, kebab-case list of every `Commands::*` variant in `src/main.rs`.
@@ -1195,6 +1192,9 @@ pub const CLI_SUBCOMMAND_NAMES: &[&str] = &[
     "sources",
     "state",
     "steer",
+    // `store` is a visible alias of `catalog` (restored for muscle memory);
+    // it points at the catalog engine, not the removed card mill.
+    "store",
     "tail",
     "warmup",
     "wizard",
