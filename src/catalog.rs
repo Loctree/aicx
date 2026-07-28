@@ -80,6 +80,92 @@ pub struct RebuildReport {
     pub cards_written: usize,
 }
 
+/// Granular catalog vs live-source readiness for operator tooling.
+///
+/// Orthogonal to `aicx index status` (index vs catalog). This surface answers:
+/// will the next rebuild admit new sessions, and which rows are already stale?
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CatalogReadiness {
+    /// No durable catalog file yet.
+    Missing,
+    /// Catalog empty and no live sources discovered.
+    Empty,
+    /// Every catalog row matches live fingerprints; no unadmitted live sources.
+    Fresh,
+    /// Live sources exist that are not in the catalog, and/or fingerprints drifted.
+    NeedsRebuild,
+    /// Catalog has rows but every live source path is missing (sync/path problem).
+    SourcesMissing,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StalenessCounts {
+    /// Catalog row fingerprint matches live source.
+    pub current: usize,
+    /// Catalog row exists but live size/mtime differs (append/edit).
+    pub stale: usize,
+    /// Live primary source not present in durable catalog.
+    pub unadmitted: usize,
+    /// Catalog row whose source_path is gone or unreadable.
+    pub missing_source: usize,
+    /// Catalog row lacks fingerprint and live stats could not be read.
+    pub fingerprint_unknown: usize,
+}
+
+impl StalenessCounts {
+    pub fn total_catalog_classified(&self) -> usize {
+        self.current + self.stale + self.missing_source + self.fingerprint_unknown
+    }
+
+    pub fn rebuild_pressure(&self) -> usize {
+        self.stale + self.unadmitted + self.missing_source
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StalenessSample {
+    pub agent: String,
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine: Option<String>,
+    pub source_path: String,
+    pub class: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog_len: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_len: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog_mtime_ns: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_mtime_ns: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CatalogStatusReport {
+    pub schema: String,
+    pub readiness: CatalogReadiness,
+    pub catalog_path: String,
+    pub catalog_present: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog_mtime: Option<String>,
+    pub catalog_sessions: usize,
+    pub live_sessions: usize,
+    pub counts: StalenessCounts,
+    pub by_agent: BTreeMap<String, StalenessCounts>,
+    /// Hostnames stamped into catalog rows at last rebuild (identity only).
+    pub by_machine: BTreeMap<String, usize>,
+    pub samples: Vec<StalenessSample>,
+    pub recommendations: Vec<String>,
+    pub notes: Vec<String>,
+    pub wall_ms: u64,
+}
+
+pub const CATALOG_STATUS_SCHEMA: &str = "aicx.catalog.status.v1";
+const STATUS_SAMPLE_CAP: usize = 12;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RebuildStage {
     Preparing,
@@ -195,6 +281,219 @@ pub fn rebuild_with_progress(
     mut on_progress: impl FnMut(&RebuildProgress),
 ) -> Result<RebuildReport> {
     let started = Instant::now();
+    let mut progress = RebuildProgress::preparing();
+    on_progress(&progress);
+
+    let by_id = scan_live_entries_with_progress(user_home, started, &mut on_progress);
+
+    progress.stage = RebuildStage::Serializing;
+    progress.sessions = by_id.len();
+    progress.elapsed_ms = started.elapsed().as_millis() as u64;
+    on_progress(&progress);
+    let catalog_path = sessions_path_for(home);
+    fs::create_dir_all(catalog_dir_for(home))
+        .with_context(|| format!("create catalog dir {}", catalog_dir_for(home).display()))?;
+
+    let mut agents: BTreeMap<String, usize> = BTreeMap::new();
+    let mut projects: BTreeMap<String, usize> = BTreeMap::new();
+    let mut body = String::new();
+    for entry in by_id.values() {
+        *agents.entry(entry.agent.clone()).or_default() += 1;
+        if let Some(ref project) = entry.project {
+            *projects.entry(project.clone()).or_default() += 1;
+        }
+        body.push_str(&serde_json::to_string(entry)?);
+        body.push('\n');
+    }
+    progress.stage = RebuildStage::Writing;
+    progress.sessions = by_id.len();
+    progress.elapsed_ms = started.elapsed().as_millis() as u64;
+    on_progress(&progress);
+    legacy_archive::atomic_write::atomic_write(&catalog_path, body.as_bytes())
+        .with_context(|| format!("write catalog {}", catalog_path.display()))?;
+
+    let report = RebuildReport {
+        total_sessions: by_id.len(),
+        agents,
+        projects,
+        catalog_path: catalog_path.display().to_string(),
+        wall_ms: started.elapsed().as_millis() as u64,
+        cards_written: 0,
+    };
+    progress.stage = RebuildStage::Complete;
+    progress.sessions = report.total_sessions;
+    progress.elapsed_ms = report.wall_ms;
+    on_progress(&progress);
+    Ok(report)
+}
+
+/// Compare durable catalog rows to live agent source roots without rewriting.
+///
+/// Classes:
+/// - `current` — catalog fingerprint matches live size+mtime
+/// - `stale` — same session id/path, live fingerprint drifted (append/edit)
+/// - `unadmitted` — live primary source not yet in catalog
+/// - `missing_source` — catalog path no longer readable on this host
+/// - `fingerprint_unknown` — no catalog fingerprint and live stats unavailable
+///
+/// This does **not** inspect the search index. After rebuild pressure drops to
+/// zero, run `aicx index status` / `aicx index` for CURRENT freshness.
+pub fn status(home: &Path, user_home: &Path) -> Result<CatalogStatusReport> {
+    let started = Instant::now();
+    let catalog_path = sessions_path_for(home);
+    let catalog_present = catalog_path.is_file();
+    let catalog_mtime = if catalog_present {
+        fs::metadata(&catalog_path)
+            .ok()
+            .and_then(|meta| meta.modified().ok())
+            .and_then(|mtime| {
+                let secs = mtime.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs() as i64;
+                chrono::DateTime::from_timestamp(secs, 0).map(|dt| dt.to_rfc3339())
+            })
+    } else {
+        None
+    };
+    let catalog_entries = read_entries_at(home)?;
+    let live = scan_live_entries(user_home);
+
+    let mut counts = StalenessCounts::default();
+    let mut by_agent: BTreeMap<String, StalenessCounts> = BTreeMap::new();
+    let mut by_machine: BTreeMap<String, usize> = BTreeMap::new();
+    let mut samples = Vec::new();
+
+    let mut live_keys: BTreeSet<(String, String)> = BTreeSet::new();
+    for entry in live.values() {
+        live_keys.insert((entry.agent.clone(), entry.session_id.clone()));
+    }
+
+    let mut catalog_keys: BTreeSet<(String, String)> = BTreeSet::new();
+    for entry in &catalog_entries {
+        let key = (entry.agent.clone(), entry.session_id.clone());
+        catalog_keys.insert(key.clone());
+        if let Some(machine) = entry.machine.as_deref().filter(|m| !m.is_empty()) {
+            *by_machine.entry(machine.to_string()).or_default() += 1;
+        }
+        let agent_counts = by_agent.entry(entry.agent.clone()).or_default();
+        let live_entry = live.get(&key);
+        let live_fp = live_entry
+            .map(|e| Path::new(&e.source_path))
+            .and_then(live_source_fingerprint);
+
+        match (live_fp, entry.source_len, entry.source_mtime_ns) {
+            (Some((live_len, live_mtime)), Some(cat_len), Some(cat_mtime))
+                if live_len == cat_len && live_mtime == cat_mtime =>
+            {
+                counts.current += 1;
+                agent_counts.current += 1;
+            }
+            (Some((live_len, live_mtime)), Some(cat_len), Some(cat_mtime)) => {
+                counts.stale += 1;
+                agent_counts.stale += 1;
+                push_sample(
+                    &mut samples,
+                    entry,
+                    "stale",
+                    Some(cat_len),
+                    Some(live_len),
+                    Some(cat_mtime),
+                    Some(live_mtime),
+                );
+            }
+            (Some((live_len, live_mtime)), _, _) => {
+                // Catalog lacked fingerprint — treat as stale so rebuild admits stats.
+                counts.stale += 1;
+                agent_counts.stale += 1;
+                push_sample(
+                    &mut samples,
+                    entry,
+                    "stale",
+                    entry.source_len,
+                    Some(live_len),
+                    entry.source_mtime_ns,
+                    Some(live_mtime),
+                );
+            }
+            (None, _, _) if live_entry.is_some() => {
+                counts.fingerprint_unknown += 1;
+                agent_counts.fingerprint_unknown += 1;
+                push_sample(
+                    &mut samples,
+                    entry,
+                    "fingerprint_unknown",
+                    entry.source_len,
+                    None,
+                    entry.source_mtime_ns,
+                    None,
+                );
+            }
+            (None, _, _) => {
+                counts.missing_source += 1;
+                agent_counts.missing_source += 1;
+                push_sample(
+                    &mut samples,
+                    entry,
+                    "missing_source",
+                    entry.source_len,
+                    None,
+                    entry.source_mtime_ns,
+                    None,
+                );
+            }
+        }
+    }
+
+    for key in &live_keys {
+        if catalog_keys.contains(key) {
+            continue;
+        }
+        let Some(entry) = live.get(key) else {
+            continue;
+        };
+        counts.unadmitted += 1;
+        by_agent.entry(entry.agent.clone()).or_default().unadmitted += 1;
+        let live_fp = live_source_fingerprint(Path::new(&entry.source_path));
+        push_sample(
+            &mut samples,
+            entry,
+            "unadmitted",
+            None,
+            live_fp.map(|(len, _)| len),
+            None,
+            live_fp.map(|(_, mtime)| mtime),
+        );
+    }
+
+    let readiness = classify_readiness(catalog_present, catalog_entries.len(), live.len(), &counts);
+    let recommendations = recommendations_for(readiness, &counts);
+    let notes = multi_host_notes(&by_machine, &counts);
+
+    Ok(CatalogStatusReport {
+        schema: CATALOG_STATUS_SCHEMA.to_string(),
+        readiness,
+        catalog_path: catalog_path.display().to_string(),
+        catalog_present,
+        catalog_mtime,
+        catalog_sessions: catalog_entries.len(),
+        live_sessions: live.len(),
+        counts,
+        by_agent,
+        by_machine,
+        samples,
+        recommendations,
+        notes,
+        wall_ms: started.elapsed().as_millis() as u64,
+    })
+}
+
+fn scan_live_entries(user_home: &Path) -> BTreeMap<(String, String), CatalogEntry> {
+    scan_live_entries_with_progress(user_home, Instant::now(), &mut |_| {})
+}
+
+fn scan_live_entries_with_progress(
+    user_home: &Path,
+    started: Instant,
+    on_progress: &mut impl FnMut(&RebuildProgress),
+) -> BTreeMap<(String, String), CatalogEntry> {
     let mut by_id: BTreeMap<(String, String), CatalogEntry> = BTreeMap::new();
     let mut progress = RebuildProgress::preparing();
     on_progress(&progress);
@@ -245,7 +544,6 @@ pub fn rebuild_with_progress(
         on_progress(&progress);
     }
 
-    // Enrich with sessions discovery (cwd / project / title / dates).
     progress.stage = RebuildStage::EnrichingSessions;
     progress.agent = None;
     progress.sessions = by_id.len();
@@ -253,52 +551,160 @@ pub fn rebuild_with_progress(
     on_progress(&progress);
     enrich_from_sessions_discovery(&mut by_id, user_home);
 
-    // vibecrafted runtime_runs — snapshot identity before collector GC.
     progress.stage = RebuildStage::SnapshottingRuntimeRuns;
     progress.sessions = by_id.len();
     progress.elapsed_ms = started.elapsed().as_millis() as u64;
     on_progress(&progress);
     enrich_runtime_runs(&mut by_id, user_home);
 
-    progress.stage = RebuildStage::Serializing;
-    progress.sessions = by_id.len();
-    progress.elapsed_ms = started.elapsed().as_millis() as u64;
-    on_progress(&progress);
-    let catalog_path = sessions_path_for(home);
-    fs::create_dir_all(catalog_dir_for(home))
-        .with_context(|| format!("create catalog dir {}", catalog_dir_for(home).display()))?;
+    by_id
+}
 
-    let mut agents: BTreeMap<String, usize> = BTreeMap::new();
-    let mut projects: BTreeMap<String, usize> = BTreeMap::new();
-    let mut body = String::new();
-    for entry in by_id.values() {
-        *agents.entry(entry.agent.clone()).or_default() += 1;
-        if let Some(ref project) = entry.project {
-            *projects.entry(project.clone()).or_default() += 1;
-        }
-        body.push_str(&serde_json::to_string(entry)?);
-        body.push('\n');
+fn push_sample(
+    samples: &mut Vec<StalenessSample>,
+    entry: &CatalogEntry,
+    class: &str,
+    catalog_len: Option<u64>,
+    live_len: Option<u64>,
+    catalog_mtime_ns: Option<u64>,
+    live_mtime_ns: Option<u64>,
+) {
+    if samples.len() >= STATUS_SAMPLE_CAP {
+        return;
     }
-    progress.stage = RebuildStage::Writing;
-    progress.sessions = by_id.len();
-    progress.elapsed_ms = started.elapsed().as_millis() as u64;
-    on_progress(&progress);
-    legacy_archive::atomic_write::atomic_write(&catalog_path, body.as_bytes())
-        .with_context(|| format!("write catalog {}", catalog_path.display()))?;
+    samples.push(StalenessSample {
+        agent: entry.agent.clone(),
+        session_id: entry.session_id.clone(),
+        project: entry.project.clone(),
+        machine: entry.machine.clone(),
+        source_path: entry.source_path.clone(),
+        class: class.to_string(),
+        catalog_len,
+        live_len,
+        catalog_mtime_ns,
+        live_mtime_ns,
+    });
+}
 
-    let report = RebuildReport {
-        total_sessions: by_id.len(),
-        agents,
-        projects,
-        catalog_path: catalog_path.display().to_string(),
-        wall_ms: started.elapsed().as_millis() as u64,
-        cards_written: 0,
-    };
-    progress.stage = RebuildStage::Complete;
-    progress.sessions = report.total_sessions;
-    progress.elapsed_ms = report.wall_ms;
-    on_progress(&progress);
-    Ok(report)
+fn classify_readiness(
+    catalog_present: bool,
+    catalog_sessions: usize,
+    live_sessions: usize,
+    counts: &StalenessCounts,
+) -> CatalogReadiness {
+    if !catalog_present {
+        return CatalogReadiness::Missing;
+    }
+    if catalog_sessions == 0 && live_sessions == 0 {
+        return CatalogReadiness::Empty;
+    }
+    if counts.missing_source > 0
+        && counts.current == 0
+        && counts.stale == 0
+        && counts.unadmitted == 0
+        && live_sessions == 0
+    {
+        return CatalogReadiness::SourcesMissing;
+    }
+    if counts.rebuild_pressure() > 0 || counts.fingerprint_unknown > 0 {
+        return CatalogReadiness::NeedsRebuild;
+    }
+    CatalogReadiness::Fresh
+}
+
+fn recommendations_for(readiness: CatalogReadiness, counts: &StalenessCounts) -> Vec<String> {
+    let mut out = Vec::new();
+    match readiness {
+        CatalogReadiness::Missing => {
+            out.push("Run `aicx catalog rebuild` to create ~/.aicx/catalog/sessions.jsonl.".into());
+            out.push(
+                "Then `aicx index` (optionally `--cache-extracts`) to publish CURRENT.".into(),
+            );
+        }
+        CatalogReadiness::Empty => {
+            out.push(
+                "No agent session sources found under ~/.claude|codex|gemini|grok|junie or vibecrafted runtime_runs."
+                    .into(),
+            );
+            out.push(
+                "Sync JSONL into those roots on this host, or set AICX_HOME only after sources resolve here."
+                    .into(),
+            );
+        }
+        CatalogReadiness::Fresh => {
+            out.push("Catalog fingerprints match live sources.".into());
+            out.push(
+                "Check search lag with `aicx index status` — catalog fresh ≠ index CURRENT fresh."
+                    .into(),
+            );
+        }
+        CatalogReadiness::NeedsRebuild => {
+            if counts.unadmitted > 0 {
+                out.push(format!(
+                    "{} live session(s) not in catalog — `aicx catalog rebuild` admits them.",
+                    counts.unadmitted
+                ));
+            }
+            if counts.stale > 0 {
+                out.push(format!(
+                    "{} catalog row(s) have drifted size/mtime — rebuild refreshes fingerprints (index still re-parses on live fingerprint even without rebuild).",
+                    counts.stale
+                ));
+            }
+            if counts.missing_source > 0 {
+                out.push(format!(
+                    "{} catalog row(s) point at missing paths — path must resolve on the indexing host (absolute paths; sync sources, not only sessions.jsonl).",
+                    counts.missing_source
+                ));
+            }
+            if counts.fingerprint_unknown > 0 {
+                out.push(format!(
+                    "{} row(s) lack usable fingerprints — rebuild to stamp source_len/source_mtime_ns.",
+                    counts.fingerprint_unknown
+                ));
+            }
+            out.push("After rebuild: `aicx index status` then `aicx index` if readiness is stale_index/pending.".into());
+        }
+        CatalogReadiness::SourcesMissing => {
+            out.push(
+                "Catalog rows exist but no live sources resolve — this host cannot index content until JSONL lands under agent roots with the same absolute paths, or you rebuild on the machine that owns the sources."
+                    .into(),
+            );
+            out.push(
+                "Do not co-locate dense 0.6b and 8b generations as one CURRENT; dimension/model mismatch is fail-closed. Prefer one index owner host."
+                    .into(),
+            );
+        }
+    }
+    out
+}
+
+fn multi_host_notes(by_machine: &BTreeMap<String, usize>, counts: &StalenessCounts) -> Vec<String> {
+    let mut notes = vec![
+        "Catalog discovers only local agent source roots on the host running rebuild/status.".into(),
+        "Alternative store drop dirs are not scanned; put JSONL under ~/.claude/projects, ~/.codex/sessions, ~/.gemini/tmp, ~/.grok/sessions, ~/.junie/sessions, or ~/.vibecrafted/control_plane/runtime_runs.".into(),
+        "AICX_HOME / [storage].home relocates the whole home (catalog+index+extracts), not a second session intake path.".into(),
+        "Dense indexes are model+dimension locked. Laptop 0.6b vectors must not merge into dragon 8b CURRENT — lexical Tantivy can be rebuilt on the owner host from shared sources.".into(),
+        "Remote agents: `aicx serve --transport http` with Bearer token (not OAuth). Prefer one index owner (e.g. dragon) and point remotes at its streamable HTTP + embedder URL.".into(),
+    ];
+    if by_machine.len() > 1 {
+        notes.push(format!(
+            "Catalog already stamps {} machine identity bucket(s): {} — identity only; paths still must resolve here.",
+            by_machine.len(),
+            by_machine
+                .iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if counts.missing_source > 0 {
+        notes.push(
+            "missing_source is the usual multi-machine failure mode: catalog copied without matching source trees/paths."
+                .into(),
+        );
+    }
+    notes
 }
 
 /// Resolve a session_id → source_path from the durable catalog (exact id match).
@@ -781,5 +1187,167 @@ mod tests {
             grok_session_id_from_path(path).as_deref(),
             Some("019f5407-5b0c-7363-b210-1093f26a41f7")
         );
+    }
+
+    #[test]
+    fn status_reports_missing_catalog_and_unadmitted_live() {
+        let dir = test_root("status-unadmitted");
+        let home = dir.join(".aicx");
+        let user = dir.join("user");
+        let project = user.join(".claude").join("projects").join("proj");
+        fs::create_dir_all(&project).unwrap();
+        let session = project.join("bbbbbbbb-bbbb-cccc-dddd-eeeeeeeeeeee.jsonl");
+        let mut f = File::create(&session).unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"user","sessionId":"bbbbbbbb-bbbb-cccc-dddd-eeeeeeeeeeee","message":{{"content":"hi"}}}}"#
+        )
+        .unwrap();
+
+        let report = status(&home, &user).unwrap();
+        assert_eq!(report.readiness, CatalogReadiness::Missing);
+        assert_eq!(report.counts.unadmitted, 1);
+        assert!(
+            report
+                .recommendations
+                .iter()
+                .any(|r| r.contains("catalog rebuild"))
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn status_marks_stale_when_live_fingerprint_drifts() {
+        let dir = test_root("status-stale");
+        let home = dir.join(".aicx");
+        let user = dir.join("user");
+        let project = user.join(".claude").join("projects").join("proj");
+        fs::create_dir_all(&project).unwrap();
+        let session_id = "cccccccc-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let session = project.join(format!("{session_id}.jsonl"));
+        let mut f = File::create(&session).unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"user","sessionId":"{session_id}","message":{{"content":"v1"}}}}"#
+        )
+        .unwrap();
+        rebuild(&home, &user).unwrap();
+
+        // Append so size+mtime change.
+        let mut f = fs::OpenOptions::new().append(true).open(&session).unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"user","sessionId":"{session_id}","message":{{"content":"v2-append"}}}}"#
+        )
+        .unwrap();
+
+        let report = status(&home, &user).unwrap();
+        assert_eq!(report.readiness, CatalogReadiness::NeedsRebuild);
+        assert_eq!(report.counts.stale, 1);
+        assert_eq!(report.counts.unadmitted, 0);
+        assert!(
+            report
+                .samples
+                .iter()
+                .any(|s| s.class == "stale" && s.session_id == session_id)
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn status_marks_fresh_after_rebuild() {
+        let dir = test_root("status-fresh");
+        let home = dir.join(".aicx");
+        let user = dir.join("user");
+        let project = user.join(".claude").join("projects").join("proj");
+        fs::create_dir_all(&project).unwrap();
+        let session = project.join("dddddddd-bbbb-cccc-dddd-eeeeeeeeeeee.jsonl");
+        let mut f = File::create(&session).unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"user","sessionId":"dddddddd-bbbb-cccc-dddd-eeeeeeeeeeee","message":{{"content":"hi"}}}}"#
+        )
+        .unwrap();
+        rebuild(&home, &user).unwrap();
+        let report = status(&home, &user).unwrap();
+        assert_eq!(report.readiness, CatalogReadiness::Fresh);
+        assert_eq!(report.counts.current, 1);
+        assert_eq!(report.counts.rebuild_pressure(), 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn status_marks_missing_source_when_path_gone() {
+        let dir = test_root("status-missing-source");
+        let home = dir.join(".aicx");
+        fs::create_dir_all(catalog_dir_for(&home)).unwrap();
+        let entry = CatalogEntry {
+            schema: CATALOG_SCHEMA.to_string(),
+            session_id: "ghost-session".into(),
+            agent: "claude".into(),
+            project: Some("Loctree/aicx".into()),
+            date: Some("2026-07-26".into()),
+            cwd: None,
+            source_path: dir.join("does-not-exist.jsonl").display().to_string(),
+            source_len: Some(10),
+            source_mtime_ns: Some(1),
+            title: None,
+            machine: Some("laptop".into()),
+            logical_session_id: None,
+        };
+        fs::write(
+            sessions_path_for(&home),
+            format!("{}\n", serde_json::to_string(&entry).unwrap()),
+        )
+        .unwrap();
+        let user = dir.join("user");
+        fs::create_dir_all(&user).unwrap();
+        let report = status(&home, &user).unwrap();
+        assert_eq!(report.counts.missing_source, 1);
+        assert_eq!(report.readiness, CatalogReadiness::SourcesMissing);
+        assert!(report.by_machine.get("laptop").copied() == Some(1));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn status_does_not_stat_catalog_paths_outside_live_agent_roots() {
+        let dir = test_root("status-untrusted-catalog-path");
+        let home = dir.join(".aicx");
+        fs::create_dir_all(catalog_dir_for(&home)).unwrap();
+        let outside = dir.join("outside-agent-roots.jsonl");
+        fs::write(
+            &outside,
+            "catalog data must not authorize filesystem access",
+        )
+        .unwrap();
+        let (source_len, source_mtime_ns) = live_source_fingerprint(&outside).unwrap();
+        let entry = CatalogEntry {
+            schema: CATALOG_SCHEMA.to_string(),
+            session_id: "untrusted-path".into(),
+            agent: "claude".into(),
+            project: Some("Loctree/aicx".into()),
+            date: Some("2026-07-27".into()),
+            cwd: None,
+            source_path: outside.display().to_string(),
+            source_len: Some(source_len),
+            source_mtime_ns: Some(source_mtime_ns),
+            title: None,
+            machine: Some("laptop".into()),
+            logical_session_id: None,
+        };
+        fs::write(
+            sessions_path_for(&home),
+            format!("{}\n", serde_json::to_string(&entry).unwrap()),
+        )
+        .unwrap();
+        let user = dir.join("user");
+        fs::create_dir_all(&user).unwrap();
+
+        let report = status(&home, &user).unwrap();
+
+        assert_eq!(report.counts.current, 0);
+        assert_eq!(report.counts.missing_source, 1);
+        assert_eq!(report.readiness, CatalogReadiness::SourcesMissing);
+        let _ = fs::remove_dir_all(&dir);
     }
 }

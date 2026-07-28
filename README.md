@@ -24,11 +24,16 @@ There is no per-frame card mill and no `aicx store` command.
    recency prior. `--deep` explicitly adds dense mmap re-ranking.
 
 ```bash
+aicx catalog status          # granular identity staleness (no write)
 aicx catalog rebuild
+aicx index status            # CURRENT / pending lag (orthogonal to catalog)
 aicx index
 aicx search 'arrows vc-frame'
 aicx search -p vetcoders/vibecrafted 'routing strzałek taby'
 ```
+
+Multi-machine session sync, dense-model co-location, and dragon-as-owner HTTP:
+see [docs/MULTI_MACHINE.md](./docs/MULTI_MACHINE.md).
 
 Project selection is metadata filtering over `_all`, not a requirement to build
 parallel project indexes.

@@ -5,6 +5,7 @@ use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
+use aicx_parser::normalize_query;
 use anyhow::{Context, Result, anyhow};
 use tantivy::collector::{FilterCollector, TopDocs};
 use tantivy::query::{
@@ -24,10 +25,15 @@ use tantivy_stemmers::algorithms;
 use crate::{ChunkRef, FilterSet, Hit, LexicalCommitId, LexicalIndex, LexicalQuery};
 
 pub const TANTIVY_KIND: &str = "tantivy_lexical";
-pub const TANTIVY_SCHEMA_VERSION: &str = "tantivy_lexical_v2_fast_body";
+pub const TANTIVY_SCHEMA_VERSION: &str = "tantivy_lexical_v3_folded_dictation";
 pub const TANTIVY_INDEX_DIR: &str = "tantivy_lex";
 
 const BODY_TOKENIZER: &str = "aicx_body_pl_en";
+const FOLDED_TOKENIZER: &str = "aicx_folded_pl_en";
+const COMPACT_TOKENIZER: &str = "aicx_compact";
+const MAX_DICTATION_QUERY_TERMS: usize = 16;
+const MIN_DICTATION_JOIN_CHARS: usize = 4;
+const MAX_DICTATION_JOIN_CHARS: usize = 48;
 const WRITER_HEAP_BYTES: usize = 50_000_000;
 
 /// Query-time evidence class used to keep durable decisions above narration.
@@ -92,6 +98,8 @@ struct TantivyFields {
     id: Field,
     source_path: Field,
     body: Field,
+    search_folded: Field,
+    search_compact: Field,
     agent: Field,
     date: Field,
     project: Field,
@@ -228,11 +236,15 @@ impl TantivyAdapter {
         let agent = metadata_string(&chunk.metadata, "agent");
         let date = metadata_string(&chunk.metadata, "date");
         let project = metadata_string(&chunk.metadata, "project");
+        let folded = normalize_query(&chunk.text);
+        let compact = dictation_shadow(&folded);
 
         writer.add_document(doc!(
             fields.id => chunk.id.as_str(),
             fields.source_path => chunk.source_path.as_str(),
             fields.body => chunk.text.as_str(),
+            fields.search_folded => folded.as_str(),
+            fields.search_compact => compact.as_str(),
             fields.agent => agent.as_str(),
             fields.date => date.as_str(),
             fields.project => project.as_str(),
@@ -253,42 +265,64 @@ impl TantivyAdapter {
             .parse_query(text)
             .with_context(|| format!("parse lexical query {text:?}"))?;
 
-        // A catalog document is one whole session, so ordinary BM25 length
-        // normalization can bury the right long conversation beneath a short
-        // file that repeats only one query word. Add a small field-length-
-        // independent score per distinct body term while retaining BM25 for
-        // frequency and rarity. This makes term coverage the first useful
-        // discriminator without turning search into strict conjunction.
+        // Score bands are intentionally non-overlapping. A hit satisfying the
+        // original field lane also satisfies the shadows, so additive union
+        // keeps original > folded > bounded dictation without depending on
+        // BM25 length normalization.
+        let mut lanes = vec![parsed];
+        let body_terms = self.field_terms(self.fields.body, text)?;
+        if !body_terms.is_empty() {
+            let coverage = BooleanQuery::union(
+                body_terms
+                    .iter()
+                    .cloned()
+                    .map(|term| {
+                        Box::new(ConstScoreQuery::new(
+                            Box::new(TermQuery::new(term, IndexRecordOption::Basic)),
+                            5.0,
+                        )) as Box<dyn Query>
+                    })
+                    .collect(),
+            );
+            lanes.push(Box::new(coverage));
+            lanes.push(required_terms_query(body_terms.clone(), 30_000.0));
+            if body_terms.len() >= 2 {
+                lanes.push(Box::new(ConstScoreQuery::new(
+                    Box::new(PhraseQuery::new(body_terms)),
+                    50_000.0,
+                )));
+            }
+        }
+
+        let folded = normalize_query(text);
+        let folded_terms = self.field_terms(self.fields.search_folded, &folded)?;
+        if !folded_terms.is_empty() {
+            lanes.push(required_terms_query(folded_terms.clone(), 5_000.0));
+            if folded_terms.len() >= 2 {
+                lanes.push(Box::new(ConstScoreQuery::new(
+                    Box::new(PhraseQuery::new(folded_terms)),
+                    7_000.0,
+                )));
+            }
+        }
+        lanes.extend(dictation_query_lanes(self.fields.search_compact, &folded));
+
+        Ok(Box::new(BooleanQuery::union(lanes)))
+    }
+
+    fn field_terms(&self, field: Field, text: &str) -> Result<Vec<Term>> {
         let mut analyzer = self
             .index
-            .tokenizer_for_field(self.fields.body)
-            .context("open body query tokenizer")?;
-        let mut phrase_terms = Vec::new();
+            .tokenizer_for_field(field)
+            .context("open lexical query tokenizer")?;
+        let mut terms = Vec::new();
         analyzer.token_stream(text).process(&mut |token| {
-            phrase_terms.push(Term::from_field_text(self.fields.body, &token.text));
+            let term = Term::from_field_text(field, &token.text);
+            if !terms.contains(&term) {
+                terms.push(term);
+            }
         });
-        let mut body_terms = phrase_terms.clone();
-        body_terms.dedup();
-        if body_terms.len() < 2 {
-            return Ok(parsed);
-        }
-        let coverage = BooleanQuery::union(
-            body_terms
-                .into_iter()
-                .map(|term| {
-                    Box::new(ConstScoreQuery::new(
-                        Box::new(TermQuery::new(term, IndexRecordOption::Basic)),
-                        5.0,
-                    )) as Box<dyn Query>
-                })
-                .collect(),
-        );
-        let phrase = ConstScoreQuery::new(Box::new(PhraseQuery::new(phrase_terms)), 20.0);
-        Ok(Box::new(BooleanQuery::union(vec![
-            parsed,
-            Box::new(coverage),
-            Box::new(phrase),
-        ])))
+        Ok(terms)
     }
 
     fn search_top_docs(
@@ -414,12 +448,8 @@ impl TantivyAdapter {
 
 fn query_context_lines(body: &str, query: &str) -> Vec<String> {
     const MAX_CONTEXT_CHARS: usize = 800;
-    let terms = query
-        .split_whitespace()
-        .map(|term| {
-            term.trim_matches(|ch: char| !ch.is_alphanumeric() && ch != '-' && ch != '_')
-                .to_lowercase()
-        })
+    let terms = lexical_words(query)
+        .into_iter()
         .filter(|term| term.chars().count() >= 3)
         .collect::<Vec<_>>();
     if terms.is_empty() {
@@ -429,16 +459,26 @@ fn query_context_lines(body: &str, query: &str) -> Vec<String> {
         .iter()
         .map(|term| (term.chars().count() >= 5).then(|| term.chars().take(5).collect::<String>()))
         .collect::<Vec<_>>();
-    let normalized_query = query.to_lowercase();
+    let normalized_query = normalize_query(query);
+    // A live session that records a search command or acceptance matrix can
+    // contain the bare query beside the historical passage being tested.
+    // Treat only those harness-shaped bare lines as echoes; an ordinary
+    // historical message that happens to equal the query remains searchable.
+    let benchmark_context = body.lines().any(|line| {
+        let lower = line.to_ascii_lowercase();
+        lower.contains("aicx search")
+            || lower.contains("runtime-acceptance query=")
+            || lower.trim_start().starts_with("query=")
+    });
     let signal_term_floor = terms.len().min(2) as i32;
-    let mut best = None::<(LexicalEvidenceClass, i32, i32, usize, String)>;
+    let mut best = None::<(LexicalEvidenceClass, i32, i32, i32, usize, String)>;
     let mut discovery_order = 0usize;
 
     for line in body.lines() {
         // Whole-session extracts can contain multi-megabyte messages. Reject
         // lines with no query term before sentence splitting/classification;
         // only the tiny matched subset pays the tri-gate cost.
-        let normalized_line = line.to_lowercase();
+        let normalized_line = normalize_query(line);
         let line_matches = terms.iter().zip(&prefixes).any(|pair| {
             let term = pair.0;
             let prefix = pair.1;
@@ -457,7 +497,17 @@ fn query_context_lines(body: &str, query: &str) -> Vec<String> {
                 discovery_order += 1;
                 continue;
             }
-            let normalized = candidate.to_lowercase();
+            let normalized = normalize_query(candidate);
+            let lower = candidate.to_ascii_lowercase();
+            if benchmark_context
+                && (normalized == normalized_query
+                    || lower.contains("runtime-acceptance query=")
+                    || lower.contains("aicx search")
+                    || lower.trim_start().starts_with("query="))
+            {
+                discovery_order += 1;
+                continue;
+            }
             let term_score = terms
                 .iter()
                 .zip(&prefixes)
@@ -475,6 +525,12 @@ fn query_context_lines(body: &str, query: &str) -> Vec<String> {
                 continue;
             }
             let phrase_score = i32::from(normalized.contains(&normalized_query));
+            let quote_score = i32::from(
+                benchmark_context
+                    && candidate
+                        .trim_start()
+                        .starts_with(['>', '"', '\'', '„', '“']),
+            );
             let class = classify_lexical_evidence(candidate);
             if class == LexicalEvidenceClass::Noise {
                 discovery_order += 1;
@@ -489,26 +545,29 @@ fn query_context_lines(body: &str, query: &str) -> Vec<String> {
             } else {
                 class.min(LexicalEvidenceClass::Substantive)
             };
-            let replace =
-                best.as_ref()
-                    .is_none_or(|(best_class, best_terms, best_phrase, best_order, _)| {
-                        (
-                            class,
-                            term_score,
-                            phrase_score,
-                            std::cmp::Reverse(discovery_order),
-                        ) > (
-                            *best_class,
-                            *best_terms,
-                            *best_phrase,
-                            std::cmp::Reverse(*best_order),
-                        )
-                    });
+            let replace = best.as_ref().is_none_or(
+                |(best_class, best_terms, best_phrase, best_quote, best_order, _)| {
+                    (
+                        class,
+                        term_score,
+                        phrase_score,
+                        quote_score,
+                        std::cmp::Reverse(discovery_order),
+                    ) > (
+                        *best_class,
+                        *best_terms,
+                        *best_phrase,
+                        *best_quote,
+                        std::cmp::Reverse(*best_order),
+                    )
+                },
+            );
             if replace {
                 best = Some((
                     class,
                     term_score,
                     phrase_score,
+                    quote_score,
                     discovery_order,
                     candidate.to_string(),
                 ));
@@ -516,10 +575,96 @@ fn query_context_lines(body: &str, query: &str) -> Vec<String> {
             discovery_order += 1;
         }
     }
-    let Some((_, _, _, _, excerpt)) = best else {
+    let Some((_, _, _, _, _, excerpt)) = best else {
         return Vec::new();
     };
     vec![excerpt.chars().take(MAX_CONTEXT_CHARS).collect()]
+}
+
+fn required_terms_query(terms: Vec<Term>, score: Score) -> Box<dyn Query> {
+    Box::new(ConstScoreQuery::new(
+        Box::new(BooleanQuery::intersection(
+            terms
+                .into_iter()
+                .map(|term| {
+                    Box::new(TermQuery::new(term, IndexRecordOption::Basic)) as Box<dyn Query>
+                })
+                .collect(),
+        )),
+        score,
+    ))
+}
+
+fn lexical_words(text: &str) -> Vec<String> {
+    folded_words(&normalize_query(text))
+}
+
+fn folded_words(folded: &str) -> Vec<String> {
+    folded
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn joinable_dictation_pair(left: &str, right: &str) -> bool {
+    let left_len = left.chars().count();
+    let right_len = right.chars().count();
+    left_len >= MIN_DICTATION_JOIN_CHARS
+        && right_len >= MIN_DICTATION_JOIN_CHARS
+        && left_len + right_len <= MAX_DICTATION_JOIN_CHARS
+}
+
+/// Build a bounded shadow with normal words plus deterministic adjacent joins.
+///
+/// This makes `wojna elektroniczna` and `wojnaelektroniczna` share a term
+/// without an edit-distance scan or an unbounded character n-gram expansion.
+fn dictation_shadow(folded: &str) -> String {
+    let words = folded_words(folded);
+    let mut shadow = Vec::with_capacity(words.len().saturating_mul(2));
+    shadow.extend(words.iter().cloned());
+    shadow.extend(
+        words
+            .windows(2)
+            .filter(|pair| joinable_dictation_pair(&pair[0], &pair[1]))
+            .map(|pair| format!("{}{}", pair[0], pair[1])),
+    );
+    shadow.join(" ")
+}
+
+fn dictation_query_lanes(field: Field, folded: &str) -> Vec<Box<dyn Query>> {
+    let words = folded_words(folded)
+        .into_iter()
+        .take(MAX_DICTATION_QUERY_TERMS)
+        .collect::<Vec<_>>();
+    if words.is_empty() {
+        return Vec::new();
+    }
+
+    let mut variants = vec![words.clone()];
+    for index in 0..words.len().saturating_sub(1) {
+        if !joinable_dictation_pair(&words[index], &words[index + 1]) {
+            continue;
+        }
+        let mut joined = Vec::with_capacity(words.len() - 1);
+        joined.extend(words[..index].iter().cloned());
+        joined.push(format!("{}{}", words[index], words[index + 1]));
+        joined.extend(words[index + 2..].iter().cloned());
+        variants.push(joined);
+    }
+
+    variants
+        .into_iter()
+        .map(|variant| {
+            required_terms_query(
+                variant
+                    .into_iter()
+                    .map(|word| Term::from_field_text(field, &word))
+                    .collect(),
+                500.0,
+            )
+        })
+        .collect()
 }
 
 fn sentence_fragments(line: &str) -> impl Iterator<Item = &str> {
@@ -922,6 +1067,8 @@ impl TantivyFields {
             id: schema.get_field("id")?,
             source_path: schema.get_field("source_path")?,
             body: schema.get_field("body")?,
+            search_folded: schema.get_field("search_folded")?,
+            search_compact: schema.get_field("search_compact")?,
             agent: schema.get_field("agent")?,
             date: schema.get_field("date")?,
             project: schema.get_field("project")?,
@@ -942,12 +1089,24 @@ fn build_schema() -> (Schema, TantivyFields) {
                 .set_index_option(IndexRecordOption::WithFreqsAndPositions),
         )
         .set_stored();
+    let folded_text = TextOptions::default().set_indexing_options(
+        TextFieldIndexing::default()
+            .set_tokenizer(FOLDED_TOKENIZER)
+            .set_index_option(IndexRecordOption::WithFreqsAndPositions),
+    );
+    let compact_text = TextOptions::default().set_indexing_options(
+        TextFieldIndexing::default()
+            .set_tokenizer(COMPACT_TOKENIZER)
+            .set_index_option(IndexRecordOption::Basic),
+    );
     let stored_only = TextOptions::default().set_stored();
 
     let mut builder = Schema::builder();
     let id = builder.add_text_field("id", STRING | STORED);
     let source_path = builder.add_text_field("source_path", STRING | STORED);
     let body = builder.add_text_field("body", body_text);
+    let search_folded = builder.add_text_field("search_folded", folded_text);
+    let search_compact = builder.add_text_field("search_compact", compact_text);
     let agent = builder.add_text_field("agent", raw_fast.clone());
     let date = builder.add_text_field("date", raw_fast.clone());
     let project = builder.add_text_field("project", raw_fast);
@@ -960,6 +1119,8 @@ fn build_schema() -> (Schema, TantivyFields) {
         id,
         source_path,
         body,
+        search_folded,
+        search_compact,
         agent,
         date,
         project,
@@ -972,13 +1133,24 @@ fn build_schema() -> (Schema, TantivyFields) {
 }
 
 fn register_tokenizers(index: &Index) {
-    let tokenizer = TextAnalyzer::builder(SimpleTokenizer::default())
+    let body_tokenizer = TextAnalyzer::builder(SimpleTokenizer::default())
         .filter(RemoveLongFilter::limit(40))
         .filter(LowerCaser)
         .filter(PolishParticipleTrim)
         .filter(TantivyStemmersFilter::new(algorithms::english_porter_2))
         .build();
-    index.tokenizers().register(BODY_TOKENIZER, tokenizer);
+    let folded_tokenizer = body_tokenizer.clone();
+    let compact_tokenizer = TextAnalyzer::builder(SimpleTokenizer::default())
+        .filter(RemoveLongFilter::limit(MAX_DICTATION_JOIN_CHARS))
+        .filter(LowerCaser)
+        .build();
+    index.tokenizers().register(BODY_TOKENIZER, body_tokenizer);
+    index
+        .tokenizers()
+        .register(FOLDED_TOKENIZER, folded_tokenizer);
+    index
+        .tokenizers()
+        .register(COMPACT_TOKENIZER, compact_tokenizer);
 }
 
 fn read_commit_id(index: &Index) -> Result<LexicalCommitId> {
@@ -1328,6 +1500,24 @@ mod swap_tests {
     }
 
     #[test]
+    fn legacy_schema_fails_closed_without_folded_fields() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join(TANTIVY_INDEX_DIR);
+        fs::create_dir_all(&dir).unwrap();
+        let mut builder = Schema::builder();
+        builder.add_text_field("id", STRING | STORED);
+        builder.add_text_field("source_path", STRING | STORED);
+        builder.add_text_field("body", STRING | STORED);
+        let legacy = builder.build();
+        Index::create_in_dir(&dir, legacy).unwrap();
+
+        assert!(
+            TantivyAdapter::new(tmp.path().to_path_buf()).is_err(),
+            "an index without search_folded/search_compact must force rebuild"
+        );
+    }
+
+    #[test]
     fn lexical_query_attaches_body_snippet_at_the_actual_match() {
         let tmp = TempDir::new().unwrap();
         let mut adapter = TantivyAdapter::new(tmp.path().to_path_buf()).unwrap();
@@ -1437,6 +1627,120 @@ mod swap_tests {
     }
 
     #[test]
+    fn folded_search_preserves_original_snippet() {
+        let tmp = TempDir::new().unwrap();
+        let mut adapter = TantivyAdapter::new(tmp.path().to_path_buf()).unwrap();
+        adapter
+            .build(&[ChunkRef {
+                id: "folded-source".to_string(),
+                source_path: "/sessions/folded.md".to_string(),
+                text: "Raport AICX: zółte AI zachowuje oryginalny tekst źródłowy.".to_string(),
+                metadata: serde_json::json!({}),
+            }])
+            .unwrap();
+
+        let hits = adapter
+            .query(&LexicalQuery {
+                text: "zolte ai".to_string(),
+                limit: 1,
+                filters: FilterSet::default(),
+            })
+            .unwrap();
+        let snippets = adapter
+            .query_snippets("zolte ai", &[hits[0].chunk_id.clone()])
+            .unwrap();
+
+        assert_eq!(hits[0].chunk_id, "folded-source");
+        assert!(
+            snippets["folded-source"]
+                .iter()
+                .any(|line| line.contains("zółte AI")),
+            "snippet must come from original stored body: {snippets:?}"
+        );
+    }
+
+    #[test]
+    fn lexical_lanes_rank_original_then_folded_then_compound() {
+        let tmp = TempDir::new().unwrap();
+        let mut adapter = TantivyAdapter::new(tmp.path().to_path_buf()).unwrap();
+        adapter
+            .build(&[
+                ChunkRef {
+                    id: "compact".to_string(),
+                    source_path: "/sessions/compact.md".to_string(),
+                    text: "zółte AI wojna elektroniczna".to_string(),
+                    metadata: serde_json::json!({}),
+                },
+                ChunkRef {
+                    id: "folded".to_string(),
+                    source_path: "/sessions/folded.md".to_string(),
+                    text: "żółte AI wojnaelektroniczna".to_string(),
+                    metadata: serde_json::json!({}),
+                },
+                ChunkRef {
+                    id: "original".to_string(),
+                    source_path: "/sessions/original.md".to_string(),
+                    text: "zółte AI wojnaelektroniczna".to_string(),
+                    metadata: serde_json::json!({}),
+                },
+            ])
+            .unwrap();
+
+        let hits = adapter
+            .query(&LexicalQuery {
+                text: "zółte ai wojnaelektroniczna".to_string(),
+                limit: 3,
+                filters: FilterSet::default(),
+            })
+            .unwrap();
+
+        assert_eq!(
+            hits.iter()
+                .map(|hit| hit.chunk_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["original", "folded", "compact"]
+        );
+        assert!(hits[0].score > hits[1].score);
+        assert!(hits[1].score > hits[2].score);
+    }
+
+    #[test]
+    fn compound_and_spaced_queries_converge() {
+        let tmp = TempDir::new().unwrap();
+        let mut adapter = TantivyAdapter::new(tmp.path().to_path_buf()).unwrap();
+        adapter
+            .build(&[
+                ChunkRef {
+                    id: "compound".to_string(),
+                    source_path: "/sessions/compound.md".to_string(),
+                    text: "zółte AI wojnaelektroniczna".to_string(),
+                    metadata: serde_json::json!({}),
+                },
+                ChunkRef {
+                    id: "spaced".to_string(),
+                    source_path: "/sessions/spaced.md".to_string(),
+                    text: "zółte AI wojna elektroniczna".to_string(),
+                    metadata: serde_json::json!({}),
+                },
+            ])
+            .unwrap();
+
+        for query in [
+            "zolte ai wojnaelektroniczna",
+            "zolte ai wojna elektroniczna",
+        ] {
+            let hits = adapter
+                .query(&LexicalQuery {
+                    text: query.to_string(),
+                    limit: 2,
+                    filters: FilterSet::default(),
+                })
+                .unwrap();
+            assert_eq!(hits.len(), 2, "{query:?} must find both spellings");
+        }
+    }
+
+    #[test]
     fn query_context_silences_search_command_echoes() {
         let body = [
             "pensieve to znajduje [Pensieve search 'arrows vc-frame']",
@@ -1451,6 +1755,30 @@ mod swap_tests {
             lines.is_empty(),
             "silence must beat benchmark echo: {lines:?}"
         );
+    }
+
+    #[test]
+    fn query_context_prefers_historical_passage_over_bare_acceptance_query() {
+        let body = [
+            "runtime-acceptance query=\"żółte ai zimna wojna\"",
+            "żółte ai zimna wojna",
+            "Dyktowanie skleiło `wojnaelektroniczna` i zapisało `zółte` zamiast `żółte`.",
+            "„zimna wojnaelektroniczna wspierana przez zółte AI…”",
+        ]
+        .join("\n");
+
+        for query in [
+            "żółte ai zimna wojna",
+            "zółte ai wojnaelektroniczna",
+            "zolte ai wojna elektroniczna",
+        ] {
+            let lines = query_context_lines(&body, query);
+            assert_eq!(
+                lines,
+                vec!["„zimna wojnaelektroniczna wspierana przez zółte AI…”"],
+                "{query:?} must prefer the quoted historical passage"
+            );
+        }
     }
 
     #[test]
