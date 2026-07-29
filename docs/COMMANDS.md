@@ -43,6 +43,30 @@ the published index remain the content owners.
 
 No command in the current ingestion or indexing path writes per-frame cards.
 
+## Wizard (TUI + vc-frame assimilation)
+
+```bash
+aicx wizard
+aicx wizard --view search
+aicx wizard --view search --query 'problemy dziwne' -p /pensieve -a claude
+```
+
+Screens: `1` corpus · `2` doctor · `3` intents · `4` rebuild · `5` search.  
+`/` from any screen opens the Search query box and switches to Search.
+
+Search uses the same engine as `aicx search` (lexical CURRENT). Results always
+declare who answered (`index CURRENT …` vs `fallback FS (bounded, recency)`).
+Missing/stale index shows a drift banner + repair path — never silent empty.
+
+JSON surfaces for plugins / vc-frame Session Gallery:
+
+```bash
+aicx search --json '<query>'
+aicx sessions list --json
+aicx sessions show --json <session-id>
+# aliases also work: sessions list --format json
+```
+
 ## Catalog
 
 ```bash
@@ -115,18 +139,31 @@ not card-mill files.
 
 ```bash
 aicx index --dry-run
-aicx index
+aicx index                    # lexical CURRENT only (default, every machine)
+aicx index --semantic         # opt-in dense mmap (owner workstation)
 aicx index --cache-extracts
 aicx index --full-rescan
-aicx index status
+aicx index status             # lexical_status + dense_status planes
 ```
 
 Persistent indexing always owns the global `_all` generation. `-p` on
 `aicx index` limits dry-run inspection only; `aicx search -p` filters the
 global catalog metadata.
 
+**Planes (feature, not bug):**
+
+| Command | What it publishes |
+|---|---|
+| `aicx index` | Tantivy lexical only (`dense_kind=optional_not_built`) |
+| `aicx index --semantic` | Lexical + `dense.exact_mmap_v1.bin` via configured embedder |
+
+Default search is lexical-first. Dense rerank needs `--semantic` once on the
+owner host, then `aicx search --deep`.
+
 Incremental reuse is gated by the live source fingerprint. A changed existing
 session reparses on the next run even when no catalog rebuild happened.
+`--semantic` will rebuild when dense is missing even if lexical CURRENT
+already matches.
 
 Signal filtering keeps user messages, agent replies, plans, and reports while
 dropping tool-call noise, internal thought, system reminders, and image/base64

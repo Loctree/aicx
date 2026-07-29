@@ -51,6 +51,15 @@ pub struct SourceIndexReport {
     pub filtered_frames: usize,
     pub extracts_written: usize,
     pub lexical_docs: usize,
+    /// Dense vectors published when `semantic` was requested; 0 for lexical-only.
+    #[serde(default)]
+    pub dense_docs: usize,
+    /// `optional_not_built` | `exact_mmap_v1` | …
+    #[serde(default)]
+    pub dense_kind: String,
+    /// Whether this run requested `aicx index --semantic`.
+    #[serde(default)]
+    pub semantic_requested: bool,
     pub unchanged: bool,
     pub wall_ms: u64,
     pub manifest_path: Option<String>,
@@ -182,6 +191,7 @@ pub fn build(
     dry_run: bool,
     full_rescan: bool,
     cache_extracts: bool,
+    semantic: bool,
 ) -> Result<SourceIndexReport> {
     let started = Instant::now();
     if !dry_run && !project_filters.is_empty() {
@@ -189,6 +199,12 @@ pub fn build(
             "project-scoped index publishing is retired; run `aicx index` once for the global \
              catalog, then filter queries with `aicx search -p <project>` (use `aicx index -p \
              <project> --dry-run` only to inspect a project slice)"
+        );
+    }
+    if semantic && dry_run {
+        anyhow::bail!(
+            "`aicx index --semantic --dry-run` cannot preview dense embedding without writing; \
+             drop --dry-run to embed, or run lexical `aicx index --dry-run` alone"
         );
     }
     let catalog_path = crate::catalog::sessions_path_for(aicx_home);
@@ -216,10 +232,17 @@ pub fn build(
     // latency the extracts-store cut was meant to kill. Use `--full-rescan` to
     // force a walk. Live source drift (append without catalog rebuild) moves
     // the digest so recent frames cannot stay invisible forever.
+    //
+    // `--semantic` refuses the lexical-only short-circuit when dense is absent
+    // so operators can attach dense to an otherwise current corpus without
+    // `--full-rescan`.
+    let dense_missing = crate::vector_index::current_dense_not_built().unwrap_or(true);
     if !full_rescan
         && project_filters.is_empty()
         && crate::vector_index::source_lexical_generation_matches(&source_fingerprint)?
+        && !(semantic && dense_missing)
     {
+        let (dense_kind, dense_docs) = current_dense_stats();
         return Ok(SourceIndexReport {
             catalog_path: catalog_path.display().to_string(),
             sources_total: selected.len(),
@@ -231,6 +254,9 @@ pub fn build(
             filtered_frames: 0,
             extracts_written: 0,
             lexical_docs: crate::vector_index::current_lexical_doc_count()?.unwrap_or(0),
+            dense_docs,
+            dense_kind,
+            semantic_requested: semantic,
             unchanged: true,
             wall_ms: started.elapsed().as_millis() as u64,
             manifest_path: crate::vector_index::hybrid_manifest_path(None)
@@ -412,8 +438,35 @@ pub fn build(
         );
     }
 
-    let manifest_path = if dry_run {
-        None
+    let (manifest_path, dense_docs, dense_kind) = if dry_run {
+        (
+            None,
+            0usize,
+            if semantic {
+                "would_build_semantic".to_string()
+            } else {
+                "optional_not_built".to_string()
+            },
+        )
+    } else if semantic {
+        let (dense_chunks, fingerprint) = embed_chunks_for_semantic(&chunks)?;
+        let manifest = crate::vector_index::publish_source_hybrid_generation(
+            &chunks,
+            &dense_chunks,
+            &source_fingerprint,
+            &fingerprint,
+        )?;
+        if cache_extracts && project_filters.is_empty() {
+            write_parse_state(aicx_home, &next_state)?;
+        }
+        let path = crate::vector_index::hybrid_manifest_path(None)?
+            .display()
+            .to_string();
+        (
+            Some(path).filter(|_| manifest.lexical_doc_count == chunks.len()),
+            manifest.dense_count,
+            manifest.dense_kind,
+        )
     } else {
         let manifest =
             crate::vector_index::publish_source_lexical_generation(&chunks, &source_fingerprint)?;
@@ -422,12 +475,14 @@ pub fn build(
         if cache_extracts && project_filters.is_empty() {
             write_parse_state(aicx_home, &next_state)?;
         }
-        Some(
-            crate::vector_index::hybrid_manifest_path(None)?
-                .display()
-                .to_string(),
+        let path = crate::vector_index::hybrid_manifest_path(None)?
+            .display()
+            .to_string();
+        (
+            Some(path).filter(|_| manifest.lexical_doc_count == chunks.len()),
+            0,
+            "optional_not_built".to_string(),
         )
-        .filter(|_| manifest.lexical_doc_count == chunks.len())
     };
 
     Ok(SourceIndexReport {
@@ -441,11 +496,112 @@ pub fn build(
         filtered_frames,
         extracts_written,
         lexical_docs: chunks.len(),
+        dense_docs,
+        dense_kind,
+        semantic_requested: semantic,
         unchanged: false,
         wall_ms: started.elapsed().as_millis() as u64,
         manifest_path,
         skipped_by_agent,
     })
+}
+
+fn current_dense_stats() -> (String, usize) {
+    let Ok(path) = crate::vector_index::hybrid_manifest_path(None) else {
+        return ("missing".to_string(), 0);
+    };
+    if !path.is_file() {
+        return ("missing".to_string(), 0);
+    }
+    match aicx_retrieve::Manifest::read_from_path(&path) {
+        Ok(m) => (m.dense_kind, m.dense_count),
+        Err(_) => ("unreadable".to_string(), 0),
+    }
+}
+
+/// Embed session extracts for `--semantic` using the configured cloud/native engine.
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+fn embed_chunks_for_semantic(
+    chunks: &[aicx_retrieve::ChunkRef],
+) -> Result<(
+    Vec<aicx_retrieve::DenseChunkRef>,
+    aicx_retrieve::EmbedderFingerprint,
+)> {
+    let mut engine = crate::embedder::EmbeddingEngine::new().with_context(|| {
+        "initialize embedder for `aicx index --semantic` (configure ~/.aicx/config.toml \
+         [embedder.cloud] or native GGUF, then `aicx warmup`)"
+            .to_string()
+    })?;
+    let info = engine.info().clone();
+    let fingerprint = crate::vector_index::hybrid_embedder_fingerprint(&info);
+    let batch_size = engine.embed_batch_size().max(1);
+    let mut dense_chunks = Vec::with_capacity(chunks.len());
+    let total = chunks.len();
+    for (batch_idx, batch) in chunks.chunks(batch_size).enumerate() {
+        let texts: Vec<String> = batch
+            .iter()
+            .map(|chunk| {
+                // Bound embed payload: first ~8k chars keeps signal, avoids multi-MB HTTP.
+                let text = chunk.text.as_str();
+                if text.len() > 8_192 {
+                    text.chars().take(8_192).collect()
+                } else {
+                    text.to_string()
+                }
+            })
+            .collect();
+        let vectors = engine.embed_batch(&texts).with_context(|| {
+            format!(
+                "embed batch {}/{} ({} texts) for index --semantic",
+                batch_idx + 1,
+                total.div_ceil(batch_size),
+                texts.len()
+            )
+        })?;
+        if vectors.len() != batch.len() {
+            anyhow::bail!(
+                "embedder returned {} vectors for {} texts in batch {}",
+                vectors.len(),
+                batch.len(),
+                batch_idx + 1
+            );
+        }
+        for (chunk, embedding) in batch.iter().zip(vectors) {
+            if embedding.len() != fingerprint.dim {
+                anyhow::bail!(
+                    "embedder returned dim {} for chunk {}; config expects {}",
+                    embedding.len(),
+                    chunk.id,
+                    fingerprint.dim
+                );
+            }
+            dense_chunks.push(aicx_retrieve::DenseChunkRef {
+                chunk: chunk.clone(),
+                embedding,
+            });
+        }
+        if batch_idx == 0 || (batch_idx + 1) % 10 == 0 || (batch_idx + 1) * batch_size >= total {
+            eprintln!(
+                "aicx index --semantic · embedded {}/{} session document(s)",
+                dense_chunks.len(),
+                total
+            );
+        }
+    }
+    Ok((dense_chunks, fingerprint))
+}
+
+#[cfg(not(any(feature = "native-embedder", feature = "cloud-embedder")))]
+fn embed_chunks_for_semantic(
+    _chunks: &[aicx_retrieve::ChunkRef],
+) -> Result<(
+    Vec<aicx_retrieve::DenseChunkRef>,
+    aicx_retrieve::EmbedderFingerprint,
+)> {
+    anyhow::bail!(
+        "`aicx index --semantic` requires a build with `cloud-embedder` and/or `native-embedder` \
+         features (default release builds include both)"
+    )
 }
 
 /// Compare the durable catalog with the document identities actually committed
@@ -1313,6 +1469,7 @@ mod tests {
         let error = build(
             &root,
             &["vetcoders/vibecrafted".to_string()],
+            false,
             false,
             false,
             false,

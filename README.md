@@ -26,13 +26,15 @@ There is no per-frame card mill and no `aicx store` command.
 ```bash
 aicx catalog status          # granular identity staleness (no write)
 aicx catalog rebuild
-aicx index status            # CURRENT / pending lag (orthogonal to catalog)
-aicx index
+aicx index status            # lexical_status + dense_status planes
+aicx index                   # lexical CURRENT (every machine)
+aicx index --semantic        # opt-in dense on owner workstation
 aicx search 'arrows vc-frame'
+aicx search --deep '…'       # needs --semantic on this home
 aicx search -p vetcoders/vibecrafted 'routing strzałek taby'
 ```
 
-Multi-machine session sync, dense-model co-location, and dragon-as-owner HTTP:
+Multi-machine session sync, dense owner host, and HTTP serve:
 see [docs/MULTI_MACHINE.md](./docs/MULTI_MACHINE.md).
 
 Project selection is metadata filtering over `_all`, not a requirement to build

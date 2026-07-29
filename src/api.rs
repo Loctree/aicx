@@ -277,6 +277,74 @@ pub struct IndexStatus {
     /// MCP callers do not have to know that the mtime equals the commit
     /// time (true because `write_index` atomic-renames into place).
     pub committed_at: Option<String>,
+    /// Lexical plane: `ready` when CURRENT has tantivy docs, else `missing`.
+    #[serde(default = "default_lexical_status")]
+    pub lexical_status: String,
+    /// Dense plane: `ready` | `not_built` | `missing`.
+    /// Orthogonal to `readiness` (catalog lag). Lexical-only CURRENT is
+    /// normal; run `aicx index --semantic` on the owner host for dense.
+    #[serde(default = "default_dense_status")]
+    pub dense_status: String,
+    /// Manifest dense_kind (`optional_not_built`, `exact_mmap_v1`, …).
+    #[serde(default)]
+    pub dense_kind: String,
+    /// Dense row count from CURRENT manifest (0 when not built).
+    #[serde(default)]
+    pub dense_count: usize,
+    /// Operator hint when dense is absent but lexical is ready.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dense_recommendation: Option<String>,
+}
+
+#[allow(dead_code)] // serde(default = ...) for IndexStatus
+fn default_lexical_status() -> String {
+    "unknown".to_string()
+}
+
+#[allow(dead_code)] // serde(default = ...) for IndexStatus
+fn default_dense_status() -> String {
+    "unknown".to_string()
+}
+
+#[allow(dead_code)] // shared with residual IndexStatus constructors
+fn plane_fields_for_missing() -> (String, String, String, usize, Option<String>) {
+    (
+        "missing".to_string(),
+        "missing".to_string(),
+        "missing".to_string(),
+        0,
+        Some("run `aicx catalog rebuild` then `aicx index` (lexical); opt in with `aicx index --semantic` for dense".to_string()),
+    )
+}
+
+fn plane_fields_from_manifest(
+    dense_kind: &str,
+    dense_count: usize,
+    lexical_docs: usize,
+) -> (String, String, String, usize, Option<String>) {
+    let lexical_status = if lexical_docs > 0 {
+        "ready".to_string()
+    } else {
+        "missing".to_string()
+    };
+    let (dense_status, rec) = if dense_kind == "optional_not_built" || dense_count == 0 {
+        (
+            "not_built".to_string(),
+            Some(
+                "lexical CURRENT is enough for default search; run `aicx index --semantic` on the owner host for dense / `search --deep`"
+                    .to_string(),
+            ),
+        )
+    } else {
+        ("ready".to_string(), None)
+    };
+    (
+        lexical_status,
+        dense_status,
+        dense_kind.to_string(),
+        dense_count,
+        rec,
+    )
 }
 
 pub fn index_status_at(base: &Path, project: Option<&str>) -> Result<IndexStatus> {
@@ -376,6 +444,14 @@ fn index_status_at_with_sessions(
             backend: "none".to_string(),
             project_bucket,
             committed_at: None,
+            lexical_status: "missing".to_string(),
+            dense_status: "missing".to_string(),
+            dense_kind: "missing".to_string(),
+            dense_count: 0,
+            dense_recommendation: Some(
+                "run `aicx catalog rebuild` then `aicx index`; opt in with `aicx index --semantic` for dense"
+                    .to_string(),
+            ),
         });
     }
 
@@ -440,6 +516,14 @@ fn index_status_at_with_sessions(
                 .map(|filter| canonical_bucket_name(Some(filter)))
                 .unwrap_or_else(|| "_all".to_string()),
             committed_at: None,
+            lexical_status: "missing".to_string(),
+            dense_status: "missing".to_string(),
+            dense_kind: "missing".to_string(),
+            dense_count: 0,
+            dense_recommendation: Some(
+                "run `aicx catalog rebuild` then `aicx index`; opt in with `aicx index --semantic` for dense"
+                    .to_string(),
+            ),
         });
     }
 
@@ -544,6 +628,22 @@ fn index_status_at_with_sessions(
         backend: "ndjson".to_string(),
         project_bucket,
         committed_at,
+        lexical_status: if semantic_index_present {
+            "legacy_ndjson".to_string()
+        } else {
+            "missing".to_string()
+        },
+        dense_status: if semantic_index_present {
+            "legacy_ndjson".to_string()
+        } else {
+            "missing".to_string()
+        },
+        dense_kind: "legacy_ndjson".to_string(),
+        dense_count: semantic_index_rows,
+        dense_recommendation: Some(
+            "residual NDJSON mill path; prefer CURRENT hybrid via `aicx index` (+ `--semantic`)"
+                .to_string(),
+        ),
     })
 }
 
@@ -646,6 +746,12 @@ fn hybrid_current_index_status(base: &Path, project: Option<&str>) -> Result<Opt
         "hybrid"
     };
 
+    let (lexical_status, dense_status, dense_kind, dense_count, dense_recommendation) =
+        plane_fields_from_manifest(
+            &manifest.dense_kind,
+            manifest.dense_count,
+            manifest.lexical_doc_count,
+        );
     Ok(Some(IndexStatus {
         // For the extract-era store, "chunks" == signal session documents.
         canonical_chunks: manifest.lexical_doc_count,
@@ -674,6 +780,11 @@ fn hybrid_current_index_status(base: &Path, project: Option<&str>) -> Result<Opt
             .map(|filter| canonical_bucket_name(Some(filter)))
             .unwrap_or_else(|| "_all".to_string()),
         committed_at,
+        lexical_status,
+        dense_status,
+        dense_kind,
+        dense_count,
+        dense_recommendation,
     }))
 }
 
@@ -1119,6 +1230,14 @@ mod tests {
             backend: "ndjson".to_string(),
             project_bucket: "_all".to_string(),
             committed_at: None,
+            lexical_status: "missing".to_string(),
+            dense_status: "missing".to_string(),
+            dense_kind: "missing".to_string(),
+            dense_count: 0,
+            dense_recommendation: Some(
+                "run `aicx catalog rebuild` then `aicx index`; opt in with `aicx index --semantic` for dense"
+                    .to_string(),
+            ),
         };
 
         let payload: serde_json::Value =

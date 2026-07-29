@@ -390,6 +390,10 @@ enum SessionsCommand {
         /// Output format: table | json.
         #[arg(long, default_value = "table")]
         format: String,
+
+        /// Alias for `--format json` (vc-frame / plugin assimilation).
+        #[arg(short = 'j', long)]
+        json: bool,
     },
 
     /// Show one session's metadata, located by id (or a unique prefix).
@@ -400,6 +404,10 @@ enum SessionsCommand {
         /// Output format: markdown | json.
         #[arg(long, default_value = "markdown")]
         format: String,
+
+        /// Alias for `--format json` (vc-frame / plugin assimilation).
+        #[arg(short = 'j', long)]
+        json: bool,
     },
 
     /// Unified truth report for one session: human intents (Lane 1), agent
@@ -1366,11 +1374,31 @@ enum Commands {
     },
 
     /// Interactive daily-driver entrypoint for catalog, extracts, index, and doctor.
+    ///
+    /// Start directly in Search for vc-frame / plugin assimilation:
+    /// `aicx wizard --view search --query "…" [--project p] [--agent a]`.
+    /// Missing index is a banner inside the TUI — never a stdin prompt.
     #[command(display_order = 9)]
     Wizard {
         /// Render one frame and exit; used by automated smoke tests.
         #[arg(long, hide = true)]
         smoke_test: bool,
+
+        /// Open a specific screen: corpus | doctor | intents | rebuild | search
+        #[arg(long, value_name = "VIEW")]
+        view: Option<String>,
+
+        /// Initial search query when `--view search` (or global prefill for Search)
+        #[arg(long, value_name = "QUERY")]
+        query: Option<String>,
+
+        /// Optional project filter for Search/Intents entry (exact, fail-closed)
+        #[arg(long, short = 'p', value_name = "PROJECT")]
+        project: Option<String>,
+
+        /// Optional agent filter for Search/Intents entry
+        #[arg(long, short = 'a', value_name = "AGENT")]
+        agent: Option<String>,
     },
 
     /// List recent extract/catalog inventory under ~/.aicx/.
@@ -1708,8 +1736,8 @@ enum Commands {
         action: EvalAction,
     },
 
-    /// Build the source-driven lexical index. Use `--dry-run` to preview
-    /// parsing and filtering without writing extracts or publishing CURRENT.
+    /// Build the source-driven lexical index (default) or opt-in dense CURRENT
+    /// with `--semantic`. Use `--dry-run` to preview lexical parsing only.
     ///
     /// Default behaviour is incremental by catalog snapshot: when the catalog
     /// is unchanged, AICX reuses CURRENT without parsing session bodies. Run
@@ -1717,8 +1745,7 @@ enum Commands {
     /// index run parses that snapshot, filters tool/internal/system noise, and
     /// atomically publishes a fresh Tantivy generation. With no `-p`, this is
     /// the `_all` index used by both global search and project-scoped
-    /// `search -p` queries. Dense vectors are optional and are not built by
-    /// this command.
+    /// `search -p` queries. Dense vectors require `--semantic` on an owner host.
     #[command(display_order = 14)]
     Index {
         #[command(subcommand)]
@@ -1748,7 +1775,7 @@ enum Commands {
         json: bool,
 
         /// Preview only. Omit this flag to materialize the persistent
-        /// semantic index used by `aicx search`.
+        /// lexical CURRENT used by `aicx search`. Incompatible with `--semantic`.
         #[arg(
             long,
             default_value_t = false,
@@ -1768,6 +1795,12 @@ enum Commands {
         /// Tantivy (zero filesystem content duplication).
         #[arg(long)]
         cache_extracts: bool,
+
+        /// Opt-in dense semantic generation: embed session extracts and publish
+        /// `dense.exact_mmap_v1.bin` beside Tantivy in CURRENT. Prefer one
+        /// workstation owner; laptops stay on plain `aicx index`.
+        #[arg(long)]
+        semantic: bool,
     },
 
     /// Manage `$HOME/.aicx/config.toml` for embedders and endpoints.
@@ -2658,11 +2691,30 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
             max,
             format,
         }) => run_clarify(&session, agent, hours, repo, max, &format)?,
-        Some(Commands::Wizard { smoke_test }) => {
+        Some(Commands::Wizard {
+            smoke_test,
+            view,
+            query,
+            project,
+            agent,
+        }) => {
             if smoke_test {
                 aicx::wizard::smoke_test()?;
             } else {
-                aicx::wizard::run()?;
+                let view = match view.as_deref() {
+                    None => None,
+                    Some(name) => Some(aicx::wizard::Screen::parse(name).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "unknown wizard --view `{name}`; expected corpus|doctor|intents|rebuild|search"
+                        )
+                    })?),
+                };
+                aicx::wizard::run_with_launch(aicx::wizard::WizardLaunch {
+                    view,
+                    query,
+                    project,
+                    agent,
+                })?;
             }
         }
         Some(Commands::Init { .. }) => {
@@ -2871,6 +2923,7 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
             dry_run,
             full_rescan,
             cache_extracts,
+            semantic,
         }) => match action {
             Some(IndexAction::Status { project, json }) => {
                 run_index_status(&project, json)?;
@@ -2884,9 +2937,21 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
             }
             None => {
                 if !dry_run {
-                    warn_pending_mutation("index");
+                    warn_pending_mutation(if semantic {
+                        "index --semantic"
+                    } else {
+                        "index"
+                    });
                 }
-                run_index(&project, sample, json, dry_run, full_rescan, cache_extracts)?
+                run_index(
+                    &project,
+                    sample,
+                    json,
+                    dry_run,
+                    full_rescan,
+                    cache_extracts,
+                    semantic,
+                )?
             }
         },
         Some(Commands::Config { action }) => {
@@ -3591,8 +3656,19 @@ fn run_sessions_command(command: SessionsCommand) -> Result<()> {
             all,
             limit,
             format,
-        } => run_sessions_list(cwd, agent, since, all, limit, &format),
-        SessionsCommand::Show { session_id, format } => run_session_show(session_id, &format),
+            json,
+        } => {
+            let format = if json { "json".to_string() } else { format };
+            run_sessions_list(cwd, agent, since, all, limit, &format)
+        }
+        SessionsCommand::Show {
+            session_id,
+            format,
+            json,
+        } => {
+            let format = if json { "json".to_string() } else { format };
+            run_session_show(session_id, &format)
+        }
         SessionsCommand::Report {
             session_id,
             agent,
@@ -8160,6 +8236,7 @@ fn run_index(
     dry_run: bool,
     full_rescan: bool,
     cache_extracts: bool,
+    semantic: bool,
 ) -> Result<()> {
     let resolved_scopes = resolve_index_scopes(projects)?;
     let filters: Vec<String> = resolved_scopes.into_iter().flatten().collect();
@@ -8171,13 +8248,24 @@ fn run_index(
             aicx::locks::lance_lock_path()?,
         )?)
     };
-    let report =
-        aicx::source_index::build(&aicx_home, &filters, dry_run, full_rescan, cache_extracts)?;
+    let report = aicx::source_index::build(
+        &aicx_home,
+        &filters,
+        dry_run,
+        full_rescan,
+        cache_extracts,
+        semantic,
+    )?;
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
+        let mode = if report.semantic_requested {
+            "index --semantic"
+        } else {
+            "index"
+        };
         eprintln!(
-            "aicx index: {} lexical session document(s) in {} ms{}",
+            "aicx {mode}: {} lexical session document(s) in {} ms{}",
             report.lexical_docs,
             report.wall_ms,
             if report.unchanged {
@@ -8200,8 +8288,19 @@ fn run_index(
             report.raw_frames, report.signal_frames, report.filtered_frames
         );
         eprintln!("  extracts_written: {}", report.extracts_written);
+        eprintln!(
+            "  dense: kind={} docs={}",
+            report.dense_kind, report.dense_docs
+        );
         if let Some(path) = &report.manifest_path {
             eprintln!("  manifest: {path}");
+        }
+        if report.semantic_requested && report.dense_docs > 0 {
+            eprintln!("  next: aicx search --deep '<query>' uses dense RRF on this CURRENT");
+        } else if !report.semantic_requested {
+            eprintln!(
+                "  note: dense not built (feature). Opt in with `aicx index --semantic` on the owner host."
+            );
         }
     }
     Ok(())
@@ -8362,13 +8461,24 @@ fn print_index_status_text(status: &aicx::IndexStatus) {
         match status.readiness {
             aicx::IndexReadiness::Ready => "ready",
             aicx::IndexReadiness::StaleChunks => "stale_chunks (sessions newer than chunks)",
-            aicx::IndexReadiness::StaleIndex => "stale_index (chunks pending embedding)",
+            aicx::IndexReadiness::StaleIndex => {
+                "stale_index (catalog sessions not yet in CURRENT lexical)"
+            }
             aicx::IndexReadiness::Pending => "pending (only temp checkpoint)",
             aicx::IndexReadiness::Missing => "missing",
             aicx::IndexReadiness::PendingScanTimeout => "pending_scan_timeout",
         }
     );
     eprintln!("  backend:                {}", status.backend);
+    eprintln!("  lexical_status:         {}", status.lexical_status);
+    eprintln!("  dense_status:           {}", status.dense_status);
+    eprintln!(
+        "  dense_kind/count:       {} / {}",
+        status.dense_kind, status.dense_count
+    );
+    if let Some(rec) = &status.dense_recommendation {
+        eprintln!("  dense_recommendation:   {rec}");
+    }
     eprintln!("  project_bucket:         {}", status.project_bucket);
     eprintln!("  canonical_chunks:       {}", status.canonical_chunks);
     eprintln!(
