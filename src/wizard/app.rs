@@ -2,6 +2,7 @@ use crossterm::event::{KeyCode, KeyModifiers};
 
 use crate::wizard::screens::{
     corpus::CorpusScreen, doctor::DoctorScreen, intents::IntentsScreen, rebuild::RebuildScreen,
+    search::SearchScreen,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -10,6 +11,7 @@ pub enum Screen {
     Doctor,
     Intents,
     Rebuild,
+    Search,
 }
 
 impl Screen {
@@ -19,6 +21,18 @@ impl Screen {
             Self::Doctor => "Doctor",
             Self::Intents => "Intents",
             Self::Rebuild => "Rebuild",
+            Self::Search => "Search",
+        }
+    }
+
+    pub fn parse(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "corpus" | "1" => Some(Self::Corpus),
+            "doctor" | "2" => Some(Self::Doctor),
+            "intents" | "3" => Some(Self::Intents),
+            "rebuild" | "4" => Some(Self::Rebuild),
+            "search" | "5" => Some(Self::Search),
+            _ => None,
         }
     }
 }
@@ -38,12 +52,22 @@ impl Confirmation {
     }
 }
 
+/// Optional launch overrides for non-interactive entry (`--view search` etc.).
+#[derive(Debug, Clone, Default)]
+pub struct WizardLaunch {
+    pub view: Option<Screen>,
+    pub query: Option<String>,
+    pub project: Option<String>,
+    pub agent: Option<String>,
+}
+
 pub struct App {
     pub active: Screen,
     pub corpus: CorpusScreen,
     pub doctor: DoctorScreen,
     pub intents: IntentsScreen,
     pub rebuild: RebuildScreen,
+    pub search: SearchScreen,
     pub should_quit: bool,
     pub show_help: bool,
     pub search_mode: bool,
@@ -54,20 +78,39 @@ pub struct App {
 
 impl App {
     pub fn new() -> Self {
+        Self::with_launch(WizardLaunch::default())
+    }
+
+    pub fn with_launch(launch: WizardLaunch) -> Self {
+        let active = launch.view.unwrap_or(Screen::Corpus);
+        let search = SearchScreen::with_filters(
+            launch.query.clone(),
+            launch.project.clone(),
+            launch.agent.clone(),
+        );
         let mut app = Self {
-            active: Screen::Corpus,
+            active,
             corpus: CorpusScreen::load(),
             doctor: DoctorScreen::default(),
-            intents: IntentsScreen::load(None, 168, None),
+            intents: IntentsScreen::load(launch.project.clone(), 168, launch.agent.clone()),
             rebuild: RebuildScreen::default(),
+            search,
             should_quit: false,
             show_help: false,
             search_mode: false,
-            search_input: String::new(),
+            search_input: launch.query.clone().unwrap_or_default(),
             confirmation: None,
             status: "ready".to_string(),
         };
-        app.status = app.corpus.status_line();
+        if matches!(active, Screen::Search) {
+            app.status = app.search.status.clone();
+            if app.search.query.is_empty() {
+                // Headless entry into search: open the query box without stdin prompts.
+                app.search_mode = true;
+            }
+        } else {
+            app.status = app.corpus.status_line();
+        }
         app
     }
 
@@ -142,12 +185,17 @@ impl App {
             KeyCode::Char('2') => self.switch(Screen::Doctor),
             KeyCode::Char('3') => self.switch(Screen::Intents),
             KeyCode::Char('4') => self.switch(Screen::Rebuild),
+            KeyCode::Char('5') => self.switch(Screen::Search),
             KeyCode::Char('/') => {
+                // Always land on Search for retrieval; corpus/intents keep local filter via Enter routing.
+                if !matches!(self.active, Screen::Search) {
+                    self.switch(Screen::Search);
+                }
                 self.search_mode = true;
-                self.search_input = match self.active {
-                    Screen::Corpus => self.corpus.search.clone(),
-                    Screen::Intents => self.intents.query.clone(),
-                    _ => String::new(),
+                self.search_input = if self.search.query.is_empty() {
+                    String::new()
+                } else {
+                    self.search.query.clone()
                 };
             }
             KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
@@ -185,6 +233,25 @@ impl App {
                 self.intents.cycle_hours();
                 self.status = self.intents.status.clone();
             }
+            KeyCode::Char('p') if self.active == Screen::Search => {
+                self.search.cycle_project_filter();
+                self.status = self.search.status.clone();
+            }
+            KeyCode::Char('a') if self.active == Screen::Search => {
+                self.search.cycle_agent_filter();
+                self.status = self.search.status.clone();
+            }
+            KeyCode::Char('t') if self.active == Screen::Search => {
+                self.search.cycle_hours();
+                self.status = self.search.status.clone();
+            }
+            KeyCode::Char('r') if self.active == Screen::Search => {
+                self.search.refresh_drift();
+                if !self.search.query.is_empty() {
+                    self.search.run_search();
+                }
+                self.status = self.search.status.clone();
+            }
             _ => {}
         }
     }
@@ -201,6 +268,10 @@ impl App {
             }
             Screen::Intents => self.intents.status.clone(),
             Screen::Rebuild => self.rebuild.status.clone(),
+            Screen::Search => {
+                self.search.refresh_drift();
+                self.search.status.clone()
+            }
         };
     }
 
@@ -210,6 +281,7 @@ impl App {
             Screen::Doctor => self.doctor.move_selection(delta),
             Screen::Intents => self.intents.move_selection(delta),
             Screen::Rebuild => self.rebuild.move_log(delta),
+            Screen::Search => self.search.move_selection(delta),
         }
     }
 
@@ -222,6 +294,10 @@ impl App {
             }
             Screen::Intents => self.intents.open_selected(),
             Screen::Rebuild => self.rebuild.start(),
+            Screen::Search => {
+                self.search.open_selected();
+                self.status = "source opened in preview".to_string();
+            }
         }
     }
 
@@ -233,12 +309,23 @@ impl App {
             }
             KeyCode::Enter => {
                 match self.active {
-                    Screen::Corpus => self.corpus.apply_search(self.search_input.clone()),
-                    Screen::Intents => self.intents.apply_query(self.search_input.clone()),
-                    _ => {}
+                    Screen::Corpus => {
+                        self.corpus.apply_search(self.search_input.clone());
+                        self.status = format!("filter: {}", self.search_input);
+                    }
+                    Screen::Intents => {
+                        self.intents.apply_query(self.search_input.clone());
+                        self.status = format!("filter: {}", self.search_input);
+                    }
+                    Screen::Search | Screen::Doctor | Screen::Rebuild => {
+                        if !matches!(self.active, Screen::Search) {
+                            self.switch(Screen::Search);
+                        }
+                        self.search.apply_query(self.search_input.clone());
+                        self.status = self.search.status.clone();
+                    }
                 }
                 self.search_mode = false;
-                self.status = format!("filter: {}", self.search_input);
             }
             KeyCode::Backspace => {
                 self.search_input.pop();

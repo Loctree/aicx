@@ -12,10 +12,14 @@ pub mod ui;
 #[cfg(test)]
 mod tests;
 
-pub use app::{App, Screen};
+pub use app::{App, Screen, WizardLaunch};
 
 pub fn run() -> anyhow::Result<()> {
-    event::run()
+    event::run_with_launch(WizardLaunch::default())
+}
+
+pub fn run_with_launch(launch: WizardLaunch) -> anyhow::Result<()> {
+    event::run_with_launch(launch)
 }
 
 pub fn smoke_test() -> anyhow::Result<()> {
@@ -27,6 +31,14 @@ pub fn smoke_test() -> anyhow::Result<()> {
     if !app.should_quit {
         anyhow::bail!("wizard smoke did not set quit state");
     }
-    println!("aicx wizard smoke: booted, rendered, quit");
+    // Search entry path must boot without stdin prompts.
+    let search_app = App::with_launch(WizardLaunch {
+        view: Some(Screen::Search),
+        query: Some(String::new()),
+        project: None,
+        agent: None,
+    });
+    assert_eq!(search_app.active, Screen::Search);
+    println!("aicx wizard smoke: booted, rendered, quit, search-view entry ok");
     Ok(())
 }

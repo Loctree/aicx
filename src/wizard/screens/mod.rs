@@ -2,6 +2,7 @@ pub mod corpus;
 pub mod doctor;
 pub mod intents;
 pub mod rebuild;
+pub mod search;
 
 /// Clamped list-selection arithmetic shared by every wizard screen.
 /// Empty lists collapse the cursor to `0`; movement saturates at both
