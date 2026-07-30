@@ -149,12 +149,7 @@ impl SearchScreen {
     }
 
     pub fn cycle_project_filter(&mut self) {
-        self.project = match self.project.as_deref() {
-            None => Some("Loctree/aicx".to_string()),
-            Some("Loctree/aicx") => Some("VetCoders/vibecrafted".to_string()),
-            Some("VetCoders/vibecrafted") => Some("/pensieve".to_string()),
-            Some(_) => None,
-        };
+        self.project = super::cycle_catalog_project(self.project.as_deref());
         if !self.query.trim().is_empty() {
             self.run_search();
         } else {
@@ -163,13 +158,7 @@ impl SearchScreen {
     }
 
     pub fn cycle_agent_filter(&mut self) {
-        self.agent = match self.agent.as_deref() {
-            None => Some("claude".to_string()),
-            Some("claude") => Some("codex".to_string()),
-            Some("codex") => Some("grok".to_string()),
-            Some("grok") => Some("gemini".to_string()),
-            Some(_) => None,
-        };
+        self.agent = super::cycle_catalog_agent(self.agent.as_deref());
         if !self.query.trim().is_empty() {
             self.run_search();
         } else {
@@ -237,7 +226,7 @@ impl SearchScreen {
                 "{banner}\n\n{}\n\n{}",
                 self.backend_line,
                 self.repair_hint.as_deref().unwrap_or(
-                    "Run repair from Rebuild (key 4) or: aicx catalog rebuild && aicx index"
+                    "Run bounded refresh first: aicx catalog refresh; rebuild is only the full-census repair."
                 )
             );
         }

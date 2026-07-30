@@ -5,6 +5,48 @@ use filetime::{FileTime, set_file_mtime};
 use std::fs;
 use std::path::PathBuf;
 
+#[cfg(feature = "app")]
+#[test]
+fn per_frame_cwd_prevents_cross_repo_session_contamination() {
+    let frame = |cwd: Option<&str>, message: &str| crate::timeline::TimelineEntry {
+        timestamp: Utc::now(),
+        agent: "claude".to_string(),
+        session_id: "shared-session".to_string(),
+        role: "user".to_string(),
+        message: message.to_string(),
+        frame_kind: Some(FrameKind::UserMsg),
+        branch: None,
+        cwd: cwd.map(str::to_string),
+        timestamp_source: None,
+        source_path: None,
+        source_sha256: None,
+        source_line_span: None,
+    };
+    let mut frames = vec![
+        frame(Some("/Volumes/vc-workspace/Loctree/aicx"), "aicx decision"),
+        frame(
+            Some("/Volumes/vc-workspace/vetcoders/pensieve"),
+            "pensieve decision",
+        ),
+        frame(None, "legacy frame without cwd"),
+    ];
+
+    retain_frames_for_project(&mut frames, "Loctree/aicx");
+
+    assert_eq!(frames.len(), 2);
+    assert!(frames.iter().any(|frame| frame.message == "aicx decision"));
+    assert!(
+        frames
+            .iter()
+            .any(|frame| frame.message == "legacy frame without cwd")
+    );
+    assert!(
+        frames
+            .iter()
+            .all(|frame| frame.message != "pensieve decision")
+    );
+}
+
 fn chunk_path(root: &Path, project: &str, date: &str, name: &str) -> PathBuf {
     let date_compact = crate::legacy_archive::compact_date(date);
     let agent = if name.contains("_claude") || name.contains("claude") {
@@ -197,6 +239,7 @@ fn live_window_admits_fresh_mtime_rows_and_unadmitted_sessions() {
         cutoff_ns,
         crate::catalog::LiveDelta {
             unadmitted: vec![row_b],
+            changed: Vec::new(),
             live_sessions: 2,
             newest_live_mtime_ns: Some(now_ns),
             wall_ms: 0,

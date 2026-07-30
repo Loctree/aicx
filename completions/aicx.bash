@@ -148,6 +148,9 @@ _aicx() {
             aicx__subcmd__catalog,rebuild)
                 cmd="aicx__subcmd__catalog__subcmd__rebuild"
                 ;;
+            aicx__subcmd__catalog,refresh)
+                cmd="aicx__subcmd__catalog__subcmd__refresh"
+                ;;
             aicx__subcmd__catalog,resolve)
                 cmd="aicx__subcmd__catalog__subcmd__resolve"
                 ;;
@@ -159,6 +162,9 @@ _aicx() {
                 ;;
             aicx__subcmd__catalog__subcmd__help,rebuild)
                 cmd="aicx__subcmd__catalog__subcmd__help__subcmd__rebuild"
+                ;;
+            aicx__subcmd__catalog__subcmd__help,refresh)
+                cmd="aicx__subcmd__catalog__subcmd__help__subcmd__refresh"
                 ;;
             aicx__subcmd__catalog__subcmd__help,resolve)
                 cmd="aicx__subcmd__catalog__subcmd__help__subcmd__resolve"
@@ -415,6 +421,9 @@ _aicx() {
             aicx__subcmd__help__subcmd__catalog,rebuild)
                 cmd="aicx__subcmd__help__subcmd__catalog__subcmd__rebuild"
                 ;;
+            aicx__subcmd__help__subcmd__catalog,refresh)
+                cmd="aicx__subcmd__help__subcmd__catalog__subcmd__refresh"
+                ;;
             aicx__subcmd__help__subcmd__catalog,resolve)
                 cmd="aicx__subcmd__help__subcmd__catalog__subcmd__resolve"
                 ;;
@@ -637,7 +646,7 @@ _aicx() {
             return 0
             ;;
         aicx__subcmd__catalog)
-            opts="-v -h --verbose --project-fuzzy --help rebuild status resolve help"
+            opts="-v -h --verbose --project-fuzzy --help rebuild refresh status resolve help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -651,7 +660,7 @@ _aicx() {
             return 0
             ;;
         aicx__subcmd__catalog__subcmd__help)
-            opts="rebuild status resolve help"
+            opts="rebuild refresh status resolve help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -679,6 +688,20 @@ _aicx() {
             return 0
             ;;
         aicx__subcmd__catalog__subcmd__help__subcmd__rebuild)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        aicx__subcmd__catalog__subcmd__help__subcmd__refresh)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
@@ -727,6 +750,28 @@ _aicx() {
                 return 0
             fi
             case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        aicx__subcmd__catalog__subcmd__refresh)
+            opts="-H -v -h --hours --json --verbose --project-fuzzy --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --hours)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                -H)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
                 *)
                     COMPREPLY=()
                     ;;
@@ -1229,7 +1274,7 @@ _aicx() {
             return 0
             ;;
         aicx__subcmd__continuity__subcmd__show)
-            opts="-p -H -v -h --project --hours --for-inject --verbose --project-fuzzy --help"
+            opts="-p -H -v -h --project --hours --for-inject --no-refresh --verbose --project-fuzzy --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -1259,7 +1304,7 @@ _aicx() {
             return 0
             ;;
         aicx__subcmd__continuity__subcmd__write)
-            opts="-p -H -o -v -h --project --hours --output --verbose --project-fuzzy --help"
+            opts="-p -H -o -v -h --project --hours --output --no-refresh --verbose --project-fuzzy --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -2069,7 +2114,7 @@ _aicx() {
             return 0
             ;;
         aicx__subcmd__help__subcmd__catalog)
-            opts="rebuild status resolve"
+            opts="rebuild refresh status resolve"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -2083,6 +2128,20 @@ _aicx() {
             return 0
             ;;
         aicx__subcmd__help__subcmd__catalog__subcmd__rebuild)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        aicx__subcmd__help__subcmd__catalog__subcmd__refresh)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )

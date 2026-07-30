@@ -1,9 +1,9 @@
-//! Read-only legacy archive scanner and dashboard payload extraction.
+//! Read-only catalog/live-session scanner with a legacy fallback.
 
 use anyhow::Result;
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use serde_json::Value;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Read;
 use std::path::Path;
@@ -18,6 +18,7 @@ const MAX_JSON_PARSE_BYTES: u64 = 8 * 1024 * 1024;
 const SEARCH_READ_BYTES: u64 = 256 * 1024;
 const MAX_SEARCH_TEXT_CHARS: usize = 12_000;
 const MAX_DETAIL_CHARS: usize = 32_000;
+type ConversationPreview = (Option<usize>, String, String, String, Option<i64>);
 
 pub(super) fn scan_legacy_archive(
     aicx_home: &Path,
@@ -25,6 +26,9 @@ pub(super) fn scan_legacy_archive(
     scope: &DashboardScope,
 ) -> Result<ScanResult> {
     let aicx_home = crate::sanitize::validate_dir_path(aicx_home)?;
+    if crate::catalog::sessions_path_for(&aicx_home).is_file() {
+        return scan_catalog_sessions(&aicx_home, preview_chars, scope);
+    }
     let scope = scope.normalized();
 
     let mut stats = DashboardStats {
@@ -210,6 +214,225 @@ pub(super) fn scan_legacy_archive(
     };
 
     Ok(ScanResult { payload })
+}
+
+fn scan_catalog_sessions(
+    aicx_home: &Path,
+    preview_chars: usize,
+    scope: &DashboardScope,
+) -> Result<ScanResult> {
+    let scope = scope.normalized();
+    let mut by_key: BTreeMap<(String, String), crate::catalog::CatalogEntry> =
+        crate::catalog::read_entries_at(aicx_home)?
+            .into_iter()
+            .map(|entry| ((entry.agent.clone(), entry.session_id.clone()), entry))
+            .collect();
+    let user_home = crate::os_user_home().unwrap_or_else(|| aicx_home.to_path_buf());
+    let source_allow = crate::source_path::SourceAllowlist::for_operator(&user_home, aicx_home);
+    let cutoff_ns = scope
+        .hours
+        .map(|hours| Utc::now() - chrono::Duration::hours(hours as i64))
+        .and_then(|cutoff| cutoff.timestamp_nanos_opt())
+        .map(|value| value.max(0) as u128)
+        .unwrap_or(0);
+    let live_delta = crate::catalog::live_delta(aicx_home, &user_home, cutoff_ns).ok();
+    if let Some(delta) = &live_delta {
+        for entry in &delta.unadmitted {
+            by_key.insert(
+                (entry.agent.clone(), entry.session_id.clone()),
+                entry.clone(),
+            );
+        }
+    }
+
+    let mut stats = DashboardStats {
+        search_backend: "catalog-live-source".to_string(),
+        state_loaded: true,
+        ..Default::default()
+    };
+    let mut assumptions = vec![
+        "Primary dataset: durable session catalog plus the bounded live delta; retired per-frame cards are not scanned.".to_string(),
+        "Session content is read directly from allowlisted agent sources and bounded for preview/detail.".to_string(),
+        "Project identity is the catalog owner/repo bucket; hot refresh reattributes resolvable cwd values from git origin.".to_string(),
+    ];
+    if let Some(delta) = &live_delta {
+        assumptions.push(format!(
+            "Live window saw {} candidate session(s), including {} unadmitted source(s), in {} ms.",
+            delta.live_sessions,
+            delta.unadmitted.len(),
+            delta.wall_ms
+        ));
+    }
+
+    let mut records = Vec::new();
+    let mut projects = BTreeSet::new();
+    let mut agents = BTreeSet::new();
+    let mut kinds = BTreeSet::new();
+    kinds.insert("session".to_string());
+
+    for entry in by_key.into_values() {
+        let project = entry
+            .project
+            .clone()
+            .unwrap_or_else(|| "_unknown".to_string());
+        if !project_matches_filter(&project, scope.project.as_deref()) {
+            continue;
+        }
+        let Ok(path) = source_allow.resolve_file(entry.source_path.as_str()) else {
+            continue;
+        };
+        let Ok(metadata) = fs::metadata(&path) else {
+            continue;
+        };
+        let modified = metadata.modified().ok();
+        let modified_sort_ts = modified.map(|mtime| DateTime::<Utc>::from(mtime).timestamp());
+        let date = entry.date.clone().unwrap_or_else(|| {
+            modified_sort_ts
+                .and_then(|timestamp| Utc.timestamp_opt(timestamp, 0).single())
+                .map(|datetime| datetime.format("%Y-%m-%d").to_string())
+                .unwrap_or_default()
+        });
+        if !sort_ts_matches_hours_scope(modified_sort_ts, &date, scope.hours) {
+            continue;
+        }
+        let extension = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("log")
+            .to_ascii_lowercase();
+        let (entry_count, preview, search_excerpt, detail_text, content_sort_ts) =
+            read_catalog_conversation_preview(aicx_home, &entry, preview_chars).unwrap_or_else(
+                || {
+                    read_preview_and_search_excerpt(
+                        &path,
+                        &extension,
+                        metadata.len(),
+                        preview_chars,
+                    )
+                },
+            );
+        // Source modification time is the durable signal that a live session
+        // changed. Some providers preserve stale or malformed frame timestamps,
+        // so letting content time win can bury the hottest session.
+        let sort_ts = modified_sort_ts.or(content_sort_ts).unwrap_or_default();
+        let time = Utc
+            .timestamp_opt(sort_ts, 0)
+            .single()
+            .map(|datetime| datetime.format("%H:%M:%S").to_string())
+            .unwrap_or_else(|| "00:00:00".to_string());
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("session")
+            .to_string();
+        let search_blob = trim_chars(
+            &collapse_ws(&format!(
+                "{} {} {} {} {} {}",
+                project,
+                entry.agent,
+                date,
+                entry.session_id,
+                entry.cwd.as_deref().unwrap_or(""),
+                search_excerpt
+            ))
+            .to_lowercase(),
+            MAX_SEARCH_TEXT_CHARS,
+        );
+        projects.insert(project.clone());
+        agents.insert(entry.agent.clone());
+        stats.fuzzy_index_chars += search_blob.len();
+        stats.total_bytes += metadata.len();
+        stats.total_entries_estimate += entry_count.unwrap_or(0);
+        records.push(DashboardRecord {
+            id: 0,
+            project,
+            agent: entry.agent,
+            date,
+            time,
+            kind: "session".to_string(),
+            extension,
+            file_name,
+            relative_path: entry.source_path.clone(),
+            absolute_path: path.display().to_string(),
+            bytes: metadata.len(),
+            size_human: human_size(metadata.len()),
+            modified_utc: format_modified_utc(modified),
+            sort_ts,
+            entry_count,
+            preview,
+            search_blob,
+            detail_text,
+        });
+    }
+
+    records.sort_by(|left, right| {
+        right
+            .sort_ts
+            .cmp(&left.sort_ts)
+            .then_with(|| left.absolute_path.cmp(&right.absolute_path))
+    });
+    for (index, record) in records.iter_mut().enumerate() {
+        record.id = index + 1;
+    }
+    stats.total_files = records.len();
+    stats.total_projects = projects.len();
+    stats.total_days = records
+        .iter()
+        .map(|record| format!("{}:{}", record.project, record.date))
+        .collect::<BTreeSet<_>>()
+        .len();
+    stats.agents_detected = agents.len();
+    stats.index_loaded = aicx_home
+        .join("indexed")
+        .join("_all")
+        .join("hybrid")
+        .is_dir();
+    assumptions.push(format!(
+        "Rendered {} current session source(s) across {} exact project bucket(s).",
+        stats.total_files, stats.total_projects
+    ));
+
+    Ok(ScanResult {
+        payload: DashboardPayload {
+            generated_at: Utc::now().to_rfc3339(),
+            aicx_home: aicx_home.display().to_string(),
+            stats,
+            assumptions,
+            projects: projects.into_iter().collect(),
+            agents: agents.into_iter().collect(),
+            kinds: kinds.into_iter().collect(),
+            records,
+        },
+    })
+}
+
+fn read_catalog_conversation_preview(
+    aicx_home: &Path,
+    entry: &crate::catalog::CatalogEntry,
+    preview_chars: usize,
+) -> Option<ConversationPreview> {
+    let (_, frames) = crate::source_index::read_catalog_conversation_at(aicx_home, entry).ok()?;
+    if frames.is_empty() {
+        return None;
+    }
+    let mut conversation = String::new();
+    for frame in &frames {
+        conversation.push_str(&format!(
+            "[{}] {}: {}\n\n",
+            frame.timestamp.format("%Y-%m-%d %H:%M:%S"),
+            frame.role,
+            frame.message.trim()
+        ));
+        if conversation.chars().count() >= MAX_DETAIL_CHARS {
+            break;
+        }
+    }
+    let detail = trim_chars(&conversation, MAX_DETAIL_CHARS);
+    let collapsed = collapse_ws(&conversation);
+    let preview = trim_chars(&collapsed, preview_chars);
+    let search_excerpt = trim_chars(&collapsed, MAX_SEARCH_TEXT_CHARS);
+    let sort_ts = frames.last().map(|frame| frame.timestamp.timestamp());
+    Some((Some(frames.len()), preview, search_excerpt, detail, sort_ts))
 }
 
 fn supported_note_extension(ext: &str) -> bool {

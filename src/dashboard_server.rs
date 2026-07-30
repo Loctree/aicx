@@ -491,7 +491,7 @@ fn rebuild_dashboard(config: &DashboardServerConfig) -> Result<BuildOutput> {
     // Server mode: scan only — no static HTML rendering, no artifact write.
     // The server shell HTML is pre-built once at startup; all data reaches
     // clients through the /api/* endpoints.
-    let payload = dashboard::scan_legacy_archive_payload_scoped(
+    let payload = dashboard::scan_current_payload_scoped(
         &config.aicx_home,
         config.preview_chars,
         &config.scope,

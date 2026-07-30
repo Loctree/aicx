@@ -14,8 +14,8 @@ aicx <command> --help
 ## Daily path
 
 ```bash
-# Refresh source identity and project attribution.
-aicx catalog rebuild
+# Bounded daily admission; also repairs cwd-guessed identities from git origin.
+aicx catalog refresh
 
 # Incrementally parse changed sources and publish CURRENT.
 aicx index
@@ -51,8 +51,12 @@ aicx wizard --view search
 aicx wizard --view search --query 'problemy dziwne' -p /pensieve -a claude
 ```
 
-Screens: `1` corpus · `2` doctor · `3` intents · `4` rebuild · `5` search.  
+Screens: `1` sessions · `2` doctor · `3` intents · `4` refresh · `5` search.
 `/` from any screen opens the Search query box and switches to Search.
+
+Wizard entry infers the exact current `owner/repo` from git origin, performs a
+bounded hot refresh, and never requires a session id. Screen 4 runs hot refresh
+plus incremental indexing; full rebuild remains an explicit census repair.
 
 Search uses the same engine as `aicx search` (lexical CURRENT). Results always
 declare who answered (`index CURRENT …` vs `fallback FS (bounded, recency)`).
@@ -72,6 +76,7 @@ aicx sessions show --json <session-id>
 ```bash
 aicx catalog status
 aicx catalog status --json
+aicx catalog refresh
 aicx catalog rebuild
 aicx catalog resolve <session-id>
 ```
@@ -82,8 +87,8 @@ source roots **without writing**. Classes:
 | Class | Meaning | Operator move |
 |---|---|---|
 | `current` | catalog size+mtime matches live file | none |
-| `stale` | same session, live append/edit | rebuild stamps fingerprints; index already re-parses on live fp |
-| `unadmitted` | live primary source not in catalog | `aicx catalog rebuild` |
+| `stale` | same session, live append/edit | `aicx catalog refresh`; index already re-parses on live fp |
+| `unadmitted` | live primary source not in catalog | `aicx catalog refresh` |
 | `missing_source` | catalog path does not resolve here | fix paths / sync sources onto this host |
 | `fingerprint_unknown` | no usable stats | rebuild to stamp `source_len` / `source_mtime_ns` |
 
@@ -97,6 +102,11 @@ Orthogonal surfaces:
 `catalog rebuild` walks the registered Claude, Codex, Grok, Gemini, Junie, and
 Vibecrafted runtime roots. It writes the compact catalog and prints counts; it
 does not materialize session content.
+
+`catalog refresh` scans only a bounded hot window, merges new/changed sessions
+under the catalog lock, and reattributes existing rows whose `cwd` resolves to
+a git origin. It refuses to create an initial partial census: one full rebuild
+is still required on a new AICX home.
 
 ### Multi-machine / sync (operator truth)
 
@@ -218,8 +228,8 @@ aicx wizard
 `index status` is bounded and reports `missing` or `pending_scan_timeout`
 instead of silently walking the operator home without a deadline.
 
-The wizard's Rebuild screen runs `catalog rebuild` followed by `index`; it
-does not shell a removed command.
+The wizard's Refresh screen runs `catalog refresh` followed by incremental
+`index`; it does not turn the daily UI into a full source-root walk.
 
 ## Legacy archive and migration
 

@@ -20,7 +20,7 @@ impl Screen {
             Self::Corpus => "Corpus",
             Self::Doctor => "Doctor",
             Self::Intents => "Intents",
-            Self::Rebuild => "Rebuild",
+            Self::Rebuild => "Refresh",
             Self::Search => "Search",
         }
     }
@@ -30,7 +30,7 @@ impl Screen {
             "corpus" | "1" => Some(Self::Corpus),
             "doctor" | "2" => Some(Self::Doctor),
             "intents" | "3" => Some(Self::Intents),
-            "rebuild" | "4" => Some(Self::Rebuild),
+            "refresh" | "rebuild" | "4" => Some(Self::Rebuild),
             "search" | "5" => Some(Self::Search),
             _ => None,
         }

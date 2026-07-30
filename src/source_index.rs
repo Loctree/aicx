@@ -33,7 +33,7 @@ const MAX_JSONL_RECORD_BYTES: usize = 2 * 1024 * 1024;
 /// short-circuited forever, leaving search previews full of
 /// `{"type":"thought","data":"..."}` spam. Including this constant forces a
 /// one-shot rebuild so index truth tracks filter truth.
-const SIGNAL_FILTER_VERSION: &str = "signal-v2-vibecrafted-thought-strip";
+const SIGNAL_FILTER_VERSION: &str = "signal-v3-workspace-metadata-strip";
 
 const PARSE_STATE_SCHEMA: &str = "aicx.source_parse_state.v1";
 const PARSE_STATE_RELPATH: &str = "indexed/_all/source_parse_state.v1.json";
@@ -942,6 +942,18 @@ pub(crate) fn read_catalog_signal_at(
     entry: &CatalogEntry,
     frame_kind: FrameKind,
 ) -> Result<(PathBuf, Vec<TimelineEntry>)> {
+    let (source_path, mut frames) = read_catalog_conversation_at(aicx_home, entry)?;
+    frames.retain(|frame| frame_matches_kind(frame, frame_kind));
+    Ok((source_path, frames))
+}
+
+/// Read one cataloged session as the clean user/assistant conversation used by
+/// current operator surfaces. System prompts, tool payloads, and thought
+/// frames are removed before callers build previews or retrieval records.
+pub(crate) fn read_catalog_conversation_at(
+    aicx_home: &Path,
+    entry: &CatalogEntry,
+) -> Result<(PathBuf, Vec<TimelineEntry>)> {
     let user_home = crate::os_user_home().unwrap_or_else(|| aicx_home.to_path_buf());
     let source_allow = crate::source_path::SourceAllowlist::for_operator(&user_home, aicx_home);
     let source_path = source_allow
@@ -955,7 +967,6 @@ pub(crate) fn read_catalog_signal_at(
     let mut frames = parse_catalog_source(entry, &source_path, &source_allow)?;
     frames.sort_by_key(|frame| frame.timestamp);
     frames.retain(is_signal_frame);
-    frames.retain(|frame| frame_matches_kind(frame, frame_kind));
     for frame in &mut frames {
         frame.message = clean_message(&frame.message);
     }
@@ -1138,6 +1149,7 @@ fn looks_like_binary_payload(message: &str) -> bool {
 }
 
 fn clean_message(message: &str) -> String {
+    let message = strip_known_harness_blocks(message);
     let mut cleaned = String::new();
     for line in message.lines() {
         if line.chars().count() > MAX_UNBROKEN_TOKEN_CHARS
@@ -1154,6 +1166,23 @@ fn clean_message(message: &str) -> String {
         cleaned.push('\n');
     }
     cleaned.trim().to_string()
+}
+
+fn strip_known_harness_blocks(message: &str) -> String {
+    let mut cleaned = message.to_string();
+    for tag in ["user_info", "git_status"] {
+        let opening = format!("<{tag}>");
+        let closing = format!("</{tag}>");
+        while let Some(start) = cleaned.find(&opening) {
+            let content_start = start + opening.len();
+            let Some(relative_end) = cleaned[content_start..].find(&closing) else {
+                break;
+            };
+            let end = content_start + relative_end + closing.len();
+            cleaned.replace_range(start..end, "");
+        }
+    }
+    cleaned
 }
 
 fn render_extract(entry: &CatalogEntry, frames: &[TimelineEntry]) -> String {
@@ -1513,6 +1542,15 @@ mod tests {
         let raw = "# implement report\n\nRouting strzałek taby landed in W2-B-4c.\n";
         let cleaned = vibecrafted_signal_body(raw);
         assert!(cleaned.contains("Routing strzałek taby landed in W2-B-4c."));
+    }
+
+    #[test]
+    fn clean_message_strips_workspace_bootstrap_blocks() {
+        let raw = "<user_info>\nOS Version: macos\n</user_info>\n\
+                   <git_status>\nM src/main.rs\n</git_status>\n\
+                   Build the live continuity path.";
+        let cleaned = clean_message(raw);
+        assert_eq!(cleaned, "Build the live continuity path.");
     }
 
     #[test]

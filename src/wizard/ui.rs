@@ -419,15 +419,15 @@ fn render_help(frame: &mut Frame, area: Rect) {
     let text = vec![
         Line::from("aicx wizard keymap"),
         Line::from(""),
-        Line::from("1 corpus | 2 doctor | 3 intents | 4 rebuild | 5 search"),
+        Line::from("1 sessions | 2 doctor | 3 intents | 4 refresh | 5 search"),
         Line::from("hjkl / arrows navigate visible lists"),
         Line::from("/ opens search query (from any screen → Search view)"),
         Line::from("search: Enter runs aicx search; p/a/t filters; r re-run; Enter opens source"),
         Line::from(
             "doctor: r refresh, f runs aicx doctor --rebuild-steer-index, b shows Plan B deferral",
         ),
-        Line::from("rebuild: s runs aicx catalog rebuild && aicx index --cache-extracts"),
-        Line::from("rebuild: Ctrl+C cancels a long rebuild when supported"),
+        Line::from("refresh: s runs bounded catalog refresh + incremental CURRENT index"),
+        Line::from("refresh: Ctrl+C cancels a long index when supported"),
         Line::from("CLI: aicx wizard --view search --query '…' [--project p] [--agent a]"),
         Line::from("q quits when no long operation is in flight"),
     ];

@@ -16,7 +16,20 @@ pub struct IntentsScreen {
 
 impl IntentsScreen {
     pub fn load(project: Option<String>, hours: u64, agent: Option<String>) -> Self {
-        let project_filter = project.clone().unwrap_or_else(|| "aicx".to_string());
+        if project.as_deref().is_none_or(str::is_empty) {
+            return Self {
+                records: Vec::new(),
+                visible: Vec::new(),
+                selected: 0,
+                query: String::new(),
+                project,
+                agent,
+                hours,
+                preview: String::new(),
+                status: "select an exact catalog project with p".to_string(),
+            };
+        }
+        let project_filter = project.clone().unwrap_or_default();
         let config = intents::IntentsConfig {
             project: project_filter.clone(),
             hours,
@@ -44,7 +57,11 @@ impl IntentsScreen {
                 screen.status = format!(
                     "{} intents loaded for project filter '{}'",
                     screen.visible.len(),
-                    project_filter
+                    if project_filter.is_empty() {
+                        "(all catalog projects)"
+                    } else {
+                        &project_filter
+                    }
                 );
                 screen
             }
@@ -109,20 +126,12 @@ impl IntentsScreen {
     }
 
     pub fn cycle_project_filter(&mut self) {
-        self.project = match self.project.as_deref() {
-            None => Some("aicx".to_string()),
-            Some("aicx") => Some("rust-memex".to_string()),
-            Some(_) => None,
-        };
+        self.project = super::cycle_catalog_project(self.project.as_deref());
         *self = Self::load(self.project.clone(), self.hours, self.agent.clone());
     }
 
     pub fn cycle_agent_filter(&mut self) {
-        self.agent = match self.agent.as_deref() {
-            None => Some("codex".to_string()),
-            Some("codex") => Some("claude".to_string()),
-            Some(_) => None,
-        };
+        self.agent = super::cycle_catalog_agent(self.agent.as_deref());
         self.apply_filters();
     }
 

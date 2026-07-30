@@ -878,6 +878,9 @@ enum ContinuityAction {
         /// Bound the output to a prompt-inject budget (~6k tokens).
         #[arg(long)]
         for_inject: bool,
+        /// Skip the bounded catalog hot refresh performed before rendering.
+        #[arg(long)]
+        no_refresh: bool,
     },
     /// Write the continuity pack to a file.
     Write {
@@ -890,6 +893,9 @@ enum ContinuityAction {
         /// Output path.
         #[arg(short, long, default_value = "CONTINUITY.md")]
         output: PathBuf,
+        /// Skip the bounded catalog hot refresh performed before rendering.
+        #[arg(long)]
+        no_refresh: bool,
     },
 }
 
@@ -897,6 +903,18 @@ enum ContinuityAction {
 enum CatalogAction {
     /// Walk all source roots and rewrite `~/.aicx/catalog/sessions.jsonl`.
     Rebuild {
+        /// Emit JSON report to stdout.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Admit new or changed sessions from a bounded hot window.
+    ///
+    /// Requires one prior full rebuild; never turns a partial window into the
+    /// initial durable census.
+    Refresh {
+        /// Window in hours.
+        #[arg(short = 'H', long, default_value = "48", value_parser = clap::value_parser!(u64).range(1..=720))]
+        hours: u64,
         /// Emit JSON report to stdout.
         #[arg(long)]
         json: bool,
@@ -2560,6 +2578,9 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
             CatalogAction::Rebuild { json } => {
                 run_catalog_rebuild(json)?;
             }
+            CatalogAction::Refresh { hours, json } => {
+                run_catalog_refresh(hours, json)?;
+            }
             CatalogAction::Status { json } => {
                 run_catalog_status(json)?;
             }
@@ -2695,17 +2716,28 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
             smoke_test,
             view,
             query,
-            project,
+            mut project,
             agent,
         }) => {
             if smoke_test {
                 aicx::wizard::smoke_test()?;
             } else {
+                run_catalog_refresh(168, false)?;
+                if project.is_none() {
+                    project = Some(current_checkout_project()?);
+                }
+                if let Some(filter) = project.as_ref() {
+                    let resolution = resolve_intents_project_filters(
+                        std::slice::from_ref(filter),
+                        project_match,
+                    )?;
+                    project = resolution.selected.into_iter().next();
+                }
                 let view = match view.as_deref() {
                     None => None,
                     Some(name) => Some(aicx::wizard::Screen::parse(name).ok_or_else(|| {
                         anyhow::anyhow!(
-                            "unknown wizard --view `{name}`; expected corpus|doctor|intents|rebuild|search"
+                            "unknown wizard --view `{name}`; expected corpus|doctor|intents|refresh|search"
                         )
                     })?),
                 };
@@ -2803,18 +2835,28 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
             )?;
         }
         Some(Commands::Continuity { action }) => {
-            let (projects, hours, for_inject, output) = match action {
+            let (projects, hours, for_inject, output, no_refresh) = match action {
                 ContinuityAction::Show {
                     project,
                     hours,
                     for_inject,
-                } => (project, hours, for_inject, None),
+                    no_refresh,
+                } => (project, hours, for_inject, None, no_refresh),
                 ContinuityAction::Write {
                     project,
                     hours,
                     output,
-                } => (project, hours, false, Some(output)),
+                    no_refresh,
+                } => (project, hours, false, Some(output), no_refresh),
             };
+            let projects = if projects.is_empty() {
+                vec![current_checkout_project()?]
+            } else {
+                projects
+            };
+            if !no_refresh {
+                run_catalog_refresh(hours.clamp(48, 720), false)?;
+            }
             let resolution = resolve_intents_project_filters(&projects, project_match)?;
             let aicx_home = aicx::aicx_home::ensure()?;
             let pack = aicx::continuity::build(&aicx_home, &resolution.selected, hours)?;
@@ -4397,9 +4439,40 @@ fn resolve_intents_project_filters_at(
         });
     }
     let corpus = legacy_archive::project_identities_for_search_at(aicx_home)?;
-    Ok(legacy_archive::require_project_resolution(
-        projects, &corpus, match_mode,
-    )?)
+    let mut resolution = legacy_archive::require_project_resolution(projects, &corpus, match_mode)?;
+    let mut seen = BTreeSet::new();
+    resolution
+        .selected
+        .retain(|project| seen.insert(project.to_ascii_lowercase()));
+    Ok(resolution)
+}
+
+/// Resolve the operator's current checkout to the canonical owner/repo bucket.
+///
+/// This is intentionally a CLI-entry concern, not historical attribution:
+/// persisted sessions keep their catalog identity, while an interactive
+/// `continuity`/`wizard` invocation may use the live checkout to choose which
+/// already-persisted bucket to query.
+fn current_checkout_project() -> Result<String> {
+    let cwd = std::env::current_dir().context("resolve current checkout directory")?;
+    let output = ProcessCommand::new("git")
+        .arg("-C")
+        .arg(&cwd)
+        .args(["remote", "get-url", "origin"])
+        .output()
+        .with_context(|| format!("read git origin from {}", cwd.display()))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "cannot infer exact continuity project: current checkout has no readable `origin`; pass `-p owner/repo`"
+        );
+    }
+    let remote = String::from_utf8_lossy(&output.stdout);
+    aicx::catalog::project_slug_from_remote(remote.trim()).ok_or_else(|| {
+        anyhow::anyhow!(
+            "cannot infer owner/repo from git origin `{}`; pass `-p owner/repo`",
+            remote.trim()
+        )
+    })
 }
 
 fn split_slug(slug: &str) -> Option<(&str, &str)> {
@@ -7369,6 +7442,34 @@ fn render_catalog_progress(
     Ok(())
 }
 
+fn run_catalog_refresh(hours: u64, json: bool) -> Result<()> {
+    let aicx_home = aicx::aicx_home::resolve()?;
+    let user_home = aicx::os_user_home().context("No home dir")?;
+    let cutoff = lookback_cutoff(hours);
+    let cutoff_ns = cutoff
+        .timestamp_nanos_opt()
+        .map(|value| value.max(0) as u128)
+        .unwrap_or(0);
+    let report = aicx::catalog::refresh_hot(&aicx_home, &user_home, cutoff_ns)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+    eprintln!(
+        "aicx catalog refresh · hot={}h · changed={} admitted={} reattributed={} total={} · {} ms",
+        hours,
+        report.changed_sessions,
+        report.admitted_sessions,
+        report.reattributed_sessions,
+        report.total_sessions,
+        report.wall_ms
+    );
+    if let Some(recommendation) = &report.recommendation {
+        eprintln!("  {recommendation}");
+    }
+    Ok(())
+}
+
 fn run_catalog_status(json: bool) -> Result<()> {
     let aicx_home = aicx::aicx_home::resolve()?;
     let user_home = aicx::os_user_home().context("No home dir")?;
@@ -9258,13 +9359,35 @@ fn run_dashboard_command(
         ));
     }
 
+    let root = args
+        .aicx_home
+        .clone()
+        .map(Ok)
+        .unwrap_or_else(aicx::aicx_home::ensure)?;
+    if aicx::catalog::sessions_path_for(&root).is_file() {
+        let user_home = aicx::os_user_home().context("No home dir")?;
+        let refresh_hours = args.hours.unwrap_or(168).clamp(48, 720);
+        let cutoff_ns = lookback_cutoff(refresh_hours)
+            .timestamp_nanos_opt()
+            .map(|value| value.max(0) as u128)
+            .unwrap_or(0);
+        let refresh = aicx::catalog::refresh_hot(&root, &user_home, cutoff_ns)?;
+        eprintln!(
+            "dashboard catalog refresh: changed={} admitted={} reattributed={} ({} ms)",
+            refresh.changed_sessions,
+            refresh.admitted_sessions,
+            refresh.reattributed_sessions,
+            refresh.wall_ms
+        );
+    }
+    if args.project.is_none() {
+        args.project = current_checkout_project().ok();
+    }
     if let Some(filter) = args.project.as_ref() {
-        let root = args
-            .aicx_home
-            .clone()
-            .map(Ok)
-            .unwrap_or_else(aicx::aicx_home::ensure)?;
-        let corpus = legacy_archive::project_identities_in_store_at(&root)?;
+        let mut corpus = aicx::catalog::project_identities_from_catalog_at(&root)?;
+        if corpus.is_empty() {
+            corpus = legacy_archive::project_identities_in_store_at(&root)?;
+        }
         let filters = vec![filter.clone()];
         let resolution =
             legacy_archive::require_project_resolution(&filters, &corpus, project_match)?;

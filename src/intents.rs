@@ -18,7 +18,7 @@ use crate::chunker::{
 use crate::extraction::{IntentLineModality, intent_line_modality, is_harness_injected_noise};
 use crate::legacy_archive;
 use crate::sanitize;
-use crate::timeline::FrameKind;
+use crate::timeline::{FrameKind, TimelineEntry};
 use crate::types::{EntryState, EntryType, IntentEntry, Link, LinkType};
 
 mod display;
@@ -412,7 +412,7 @@ fn collect_intent_files(
             live_row = true;
         }
 
-        let (source_path, frames) =
+        let (source_path, mut frames) =
             match crate::source_index::read_catalog_signal_at(aicx_home, &entry, frame_kind) {
                 Ok(result) => result,
                 Err(error) => {
@@ -424,6 +424,7 @@ fn collect_intent_files(
                     continue;
                 }
             };
+        retain_frames_for_project(&mut frames, &identity_project);
         if frames.is_empty() {
             continue;
         }
@@ -535,7 +536,7 @@ fn collect_live_unadmitted_files(
         {
             continue;
         }
-        let (source_path, frames) =
+        let (source_path, mut frames) =
             match crate::source_index::read_catalog_signal_at(aicx_home, &entry, frame_kind) {
                 Ok(result) => result,
                 Err(error) => {
@@ -547,6 +548,7 @@ fn collect_live_unadmitted_files(
                     continue;
                 }
             };
+        retain_frames_for_project(&mut frames, &identity_project);
         if frames.is_empty() {
             continue;
         }
@@ -580,6 +582,23 @@ fn collect_live_unadmitted_files(
         });
     }
     Ok(admitted)
+}
+
+/// Keep per-frame checkout truth ahead of a session's start-directory label.
+///
+/// Agents can `cd` into another repository without starting a new session.
+/// Frames that carry an explicit cwd must therefore prove they still belong
+/// to the requested canonical bucket. Older sources without per-frame cwd
+/// retain the catalog attribution instead of being silently discarded.
+#[cfg(feature = "app")]
+fn retain_frames_for_project(frames: &mut Vec<TimelineEntry>, project: &str) {
+    let filters = [project.to_string()];
+    frames.retain(|frame| {
+        frame
+            .cwd
+            .as_deref()
+            .is_none_or(|cwd| crate::extraction::project_filter_matches_path(cwd, &filters))
+    });
 }
 
 /// True when a unix-nanosecond mtime falls at or after the window cutoff.

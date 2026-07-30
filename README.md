@@ -25,6 +25,7 @@ There is no per-frame card mill and no `aicx store` command.
 
 ```bash
 aicx catalog status          # granular identity staleness (no write)
+aicx catalog refresh         # bounded daily admission + remote identity repair
 aicx catalog rebuild
 aicx index status            # lexical_status + dense_status planes
 aicx index                   # lexical CURRENT (every machine)
@@ -84,8 +85,8 @@ See [ORACLE_CORPUS.md](docs/ORACLE_CORPUS.md).
 - `sessions`, `list`, `sources` — discover and protect raw sources.
 - `read`, `tail`, `dashboard`, `reports` — inspect derived artifacts.
 - `serve` — MCP over stdio or HTTP.
-- `wizard` — daily-driver UI; its Rebuild screen runs catalog rebuild then
-  index.
+- `wizard` — daily-driver UI; it infers the exact current git project and its
+  Refresh screen runs bounded catalog refresh then incremental index.
 - `doctor`, `health`, `index status` — bounded diagnostics.
 - `legacy_archive` — explicit read/recovery ownership for residual old card
   trees. It is not an ingestion path.
