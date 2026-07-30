@@ -508,6 +508,10 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
+(refresh)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
 (status)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
@@ -547,6 +551,18 @@ _arguments "${_arguments_options[@]}" : \
         case $line[1] in
             (rebuild)
 _arguments "${_arguments_options[@]}" : \
+'--json[Emit JSON report to stdout]' \
+'-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(refresh)
+_arguments "${_arguments_options[@]}" : \
+'-H+[Window in hours]:HOURS:_default' \
+'--hours=[Window in hours]:HOURS:_default' \
 '--json[Emit JSON report to stdout]' \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \

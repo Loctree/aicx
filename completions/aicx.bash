@@ -1274,7 +1274,7 @@ _aicx() {
             return 0
             ;;
         aicx__subcmd__continuity__subcmd__show)
-            opts="-p -H -v -h --project --hours --for-inject --verbose --project-fuzzy --help"
+            opts="-p -H -v -h --project --hours --for-inject --no-refresh --verbose --project-fuzzy --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -1304,7 +1304,7 @@ _aicx() {
             return 0
             ;;
         aicx__subcmd__continuity__subcmd__write)
-            opts="-p -H -o -v -h --project --hours --output --verbose --project-fuzzy --help"
+            opts="-p -H -o -v -h --project --hours --output --no-refresh --verbose --project-fuzzy --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
