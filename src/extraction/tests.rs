@@ -464,3 +464,92 @@ fn test_conversation_exact_short_duplicate_key_includes_agent() {
     let conv = to_conversation(&entries, &[]);
     assert_eq!(conv.len(), 2, "agent must be part of the dedup key");
 }
+
+/// End-to-end: a message the operator submits while a turn is running reaches
+/// `--conversation`. It exists in the Claude JSONL only as a `queue-operation`
+/// enqueue record, so any loss between the adapter and this projection is
+/// silent and permanent.
+#[test]
+#[cfg(feature = "app")]
+fn test_conversation_recovers_mid_turn_queued_operator_message() {
+    use aicx_parser::engine::{SourceArtifact, SourceFraming, SourceHandle};
+
+    const SESSION: &str = "3faa8508-abfb-4bc7-9a93-8908e2e7c9ee";
+    let body = [
+        serde_json::json!({
+            "type": "user",
+            "message": {"role": "user", "content": "pokaz mi ten hook"},
+            "sessionId": SESSION,
+            "cwd": "/Users/silver/Git/aicx",
+            "timestamp": "2026-07-30T10:24:00.000Z",
+        }),
+        serde_json::json!({
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "model": "claude-opus-5",
+                "content": [{"type": "text", "text": "Juz czytam."}],
+            },
+            "sessionId": SESSION,
+            "timestamp": "2026-07-30T10:24:10.000Z",
+        }),
+        // Submitted while the assistant was still working.
+        serde_json::json!({
+            "type": "queue-operation",
+            "operation": "enqueue",
+            "content": "chodzmi mi o zawartosc, tresc tego co daje pre/post compact hook",
+            "sessionId": SESSION,
+            "timestamp": "2026-07-30T10:25:00.883Z",
+        }),
+        serde_json::json!({
+            "type": "queue-operation",
+            "operation": "remove",
+            "content": "chodzmi mi o zawartosc, tresc tego co daje pre/post compact hook",
+            "sessionId": SESSION,
+            "timestamp": "2026-07-30T10:25:16.862Z",
+        }),
+    ]
+    .iter()
+    .fold(String::new(), |mut body, row| {
+        body.push_str(&row.to_string());
+        body.push('\n');
+        body
+    });
+
+    let artifact =
+        SourceArtifact::memory("session.jsonl", body.into_bytes(), SourceFraming::JsonLines)
+            .expect("memory artifact");
+    let handle = SourceHandle::new(
+        aicx_parser::engine::AgentKind::Claude,
+        SESSION,
+        Some(SESSION.to_owned()),
+        vec![artifact],
+    )
+    .expect("source handle");
+    let session = crate::parser_dispatch::parse_handle(&handle).expect("parse");
+    let entries = crate::output::timeline_entries_from_model(session.model());
+
+    let conv = to_conversation(&entries, &[]);
+    let user_messages: Vec<&str> = conv
+        .iter()
+        .filter(|message| message.role == "user")
+        .map(|message| message.message.as_str())
+        .collect();
+    assert_eq!(
+        user_messages,
+        vec![
+            "pokaz mi ten hook",
+            "chodzmi mi o zawartosc, tresc tego co daje pre/post compact hook",
+        ],
+        "the mid-turn message must survive the whole extract pipeline"
+    );
+    let recovered = conv
+        .iter()
+        .find(|message| message.message.starts_with("chodzmi mi"))
+        .expect("mid-turn message");
+    assert_eq!(
+        recovered.timestamp,
+        Utc.with_ymd_and_hms(2026, 7, 30, 10, 25, 0).unwrap() + chrono::Duration::milliseconds(883),
+        "it keeps the moment it was submitted, not the moment it was delivered"
+    );
+}

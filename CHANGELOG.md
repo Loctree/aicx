@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
+### Fixed
+
+- **Claude extracts no longer lose the messages you send mid-turn.** A message
+  submitted while a turn is running lives in the session JSONL only as a
+  `queue-operation` enqueue record; the Claude adapter consumed that record as
+  `metadata_record` and threw the body away, so the text was unrecoverable for
+  every downstream consumer (`--conversation`, chunks, intents). The record is
+  still consumed as `metadata_record` — taxonomy and the frozen oracle fixture
+  are unchanged — but its `enqueue` text is now projected as an ordinary
+  `user` turn carrying the record's own timestamp and evidence. Two dedupe
+  layers keep it honest: re-submitting the same text keeps the first enqueue,
+  and a queued message the harness later delivers as a real `user` row loses
+  to that row. Verified on a live 1180-entry session that had permanently
+  dropped 20 operator messages. See `docs/PARSER_NORMATIVE_CONTRACT.md` §2.1.
+
 ## [0.12.1] - 2026-07-24
 
 ### Fixed

@@ -83,6 +83,41 @@ Unknown unit shapes are **data** (skipped with a typed reason and a warning),
 never silence. Every fixture unit must terminate in exactly one declared
 taxonomy kind; the checker enforces unique match.
 
+### 2.1 Consumption kind is not a licence to drop the body
+
+A unit's taxonomy kind decides its **accounting**, never whether its content
+may be discarded. `metadata_record` means "not a conversational row", not
+"no operator text inside". Where a recognized metadata record is the *only*
+carrier of literal operator input, the adapter must project that text.
+
+The normative case is Claude `queue-operation`:
+
+- The record stays `consumed(metadata_record)` — taxonomy and the accounting
+  invariant are untouched, and the frozen oracle fixture does not move.
+- Additionally, `operation == "enqueue"` projects its text (`.content`, with
+  `.prompt` as the older build's field name) as a plain `TurnKind::UserMsg`
+  turn, timestamped from the record and referencing the record's own evidence.
+  No new schema, no new turn kind, no new consumed kind.
+- Empty bodies and `<task-notification` heads are harness chatter, not input.
+  `remove` / `dequeue` / `popAll` repeat text `enqueue` already carried.
+
+**Why this is normative and not a projection-layer nicety:** a message the
+operator submits while a turn is running exists in the JSONL *only* as this
+record. The harness writes a `type:"user"` row only for what it delivers
+between turns, so a mid-turn submission that is interrupted or superseded
+never becomes one. Dropping the body therefore loses literal operator input
+permanently and silently — the loss class is invisible to coverage, because
+the record was faithfully consumed.
+
+Two dedupe layers keep the projection from doubling a message, both observed
+on live sessions:
+
+1. the same text enqueued more than once (interrupt, then re-submit) — the
+   first enqueue is the message;
+2. a queued message the harness later delivers after the turn ends, where it
+   also becomes a real `user` row — the projection loses to the real row, on
+   equal trimmed text with a delivery timestamp at or after the enqueue.
+
 ---
 
 ## 3. Parse status — an orthogonal contract
