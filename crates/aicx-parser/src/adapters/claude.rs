@@ -24,6 +24,12 @@
 //!   they terminate as skipped(unknown_payload_type) with a typed warning.
 //! - Donor does not model usage; `message.usage` becomes typed `UsageEvent`s
 //!   with delta semantics per the C0A §4 normative extension.
+//! - Donor drops `queue-operation` bodies; the kernel keeps the record's
+//!   `metadata_record` consumption AND projects `enqueue` text as a `user`
+//!   turn. Operator messages typed while a turn is running exist in the JSONL
+//!   only as that record — they never become a `type:"user"` row unless the
+//!   harness delivers them after the turn ends — so dropping the body is a
+//!   silent loss of literal operator input.
 
 use super::{AdapterError, AgentAdapter, ClassifiedDisposition, ClassifiedUnit, RawUnitLevel};
 use crate::engine::{
@@ -36,7 +42,7 @@ use crate::engine::{
 };
 use crate::skill_collapse::detect_skill_marker;
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub const CLAUDE_ADAPTER_VERSION: &str = "claude-adapter-v1";
 
@@ -60,6 +66,17 @@ const METADATA_TYPES: [&str; 9] = [
     "permission-mode",
     "last-prompt",
 ];
+
+/// Metadata record the harness writes when the operator submits a message
+/// while a turn is still running.
+const QUEUE_OPERATION_TYPE: &str = "queue-operation";
+
+/// Queue operation carrying the operator's literal text. `remove`, `dequeue`
+/// and `popAll` are bookkeeping over text that was already enqueued.
+const QUEUE_ENQUEUE_OPERATION: &str = "enqueue";
+
+/// Queued harness notifications are machine chatter, never operator input.
+const TASK_NOTIFICATION_HEAD: &str = "<task-notification";
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ClaudeAdapter;
@@ -110,6 +127,10 @@ struct Analysis {
     skipped: Vec<SkippedUnit>,
     warnings: Vec<CoverageWarning>,
     turns: Vec<Turn>,
+    /// Turn indexes projected from `queue-operation` enqueues, in emission
+    /// order. Provenance for the mid-turn dedupe post-pass only; never a
+    /// schema field.
+    queue_turns: Vec<u64>,
     tool_events: Vec<ToolEvent>,
     usage_events: Vec<UsageEvent>,
     skill_invocations: Vec<SkillInvocation>,
@@ -172,6 +193,7 @@ fn analyze(source: &SourceHandle, read: &SourceRead) -> Result<Analysis, Adapter
         skipped: Vec::new(),
         warnings: Vec::new(),
         turns: Vec::new(),
+        queue_turns: Vec::new(),
         tool_events: Vec::new(),
         usage_events: Vec::new(),
         skill_invocations: Vec::new(),
@@ -335,6 +357,9 @@ fn walk_physical_unit(
         kind if METADATA_TYPES.contains(&kind) => {
             consume_physical(raw, "metadata_record", ctx, analysis)?;
             backfill_segment(object, analysis);
+            if kind == QUEUE_OPERATION_TYPE {
+                emit_queued_user_turn(raw, object, &timestamp, ctx, analysis)?;
+            }
         }
         _ => {
             analysis.unsupported_visible_event = true;
@@ -682,6 +707,44 @@ fn emit_text_turn(
     }
 }
 
+/// Project the operator text carried by a `queue-operation` enqueue as a
+/// `user` turn.
+///
+/// The record itself stays consumed as `metadata_record` (frozen taxonomy);
+/// this only recovers its body. A message submitted while a turn is running
+/// lives in the JSONL nowhere else — the harness writes a `type:"user"` row
+/// only for what it delivers between turns — so without this projection the
+/// literal operator input is lost for every downstream consumer.
+fn emit_queued_user_turn(
+    raw: &RawUnit,
+    object: &serde_json::Map<String, Value>,
+    timestamp: &Known<String>,
+    ctx: &Ctx<'_>,
+    analysis: &mut Analysis,
+) -> Result<(), AdapterError> {
+    if string_field(object, "operation") != Some(QUEUE_ENQUEUE_OPERATION) {
+        return Ok(());
+    }
+    // `.content` is the live shape; `.prompt` is the older build's field name.
+    let Some(text) = string_field(object, "content").or_else(|| string_field(object, "prompt"))
+    else {
+        return Ok(());
+    };
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed.starts_with(TASK_NOTIFICATION_HEAD) {
+        return Ok(());
+    }
+    // Same locator + kind + content hash as the record's own consumption, so
+    // the reference resolves to evidence the coverage report already carries.
+    let evidence = physical_evidence(raw, "metadata_record", ctx)?;
+    let next_turn = analysis.turns.len() as u64;
+    emit_text_turn("user", trimmed, timestamp, vec![evidence], analysis);
+    if analysis.turns.len() as u64 > next_turn {
+        analysis.queue_turns.push(next_turn);
+    }
+    Ok(())
+}
+
 fn push_turn(
     role: TurnRole,
     kind: TurnKind,
@@ -1024,7 +1087,132 @@ fn warn(analysis: &mut Analysis, kind: WarningKind, ordinal: u64) {
 // ---------------------------------------------------------------------------
 
 impl Analysis {
+    /// Drop the queue-projected turns that would double an operator message.
+    ///
+    /// Two layers, both observed on live sessions:
+    /// (a) the operator interrupts and re-submits the same text, so the same
+    ///     body is enqueued more than once — the first enqueue is the message;
+    /// (b) the harness delivers a queued message after the turn ends, where it
+    ///     also becomes a real `type:"user"` row — the projection then loses
+    ///     to the real row it anticipated.
+    ///
+    /// A session without a dropped queue turn leaves the model untouched.
+    fn dedupe_queue_turns(&mut self) {
+        if self.queue_turns.is_empty() {
+            return;
+        }
+        let mut dropped: BTreeSet<u64> = BTreeSet::new();
+        {
+            let projected: BTreeSet<u64> = self.queue_turns.iter().copied().collect();
+            let mut delivered: BTreeMap<&str, Vec<i64>> = BTreeMap::new();
+            for turn in &self.turns {
+                if turn.kind == TurnKind::UserMsg
+                    && !projected.contains(&turn.turn_idx)
+                    && let Some(millis) = timestamp_millis(&turn.timestamp)
+                {
+                    delivered
+                        .entry(turn.text.as_str())
+                        .or_default()
+                        .push(millis);
+                }
+            }
+            let mut seen: BTreeSet<&str> = BTreeSet::new();
+            for &turn_idx in &self.queue_turns {
+                let turn = &self.turns[turn_idx as usize];
+                if !seen.insert(turn.text.as_str()) {
+                    dropped.insert(turn_idx);
+                    continue;
+                }
+                let Some(queued_at) = timestamp_millis(&turn.timestamp) else {
+                    continue;
+                };
+                if delivered
+                    .get(turn.text.as_str())
+                    .is_some_and(|stamps| stamps.iter().any(|&millis| millis >= queued_at))
+                {
+                    dropped.insert(turn_idx);
+                }
+            }
+        }
+        if dropped.is_empty() {
+            return;
+        }
+
+        let mut reindexed = vec![None; self.turns.len()];
+        let mut turns = Vec::with_capacity(self.turns.len() - dropped.len());
+        for (old_idx, mut turn) in std::mem::take(&mut self.turns).into_iter().enumerate() {
+            if dropped.contains(&(old_idx as u64)) {
+                continue;
+            }
+            let turn_idx = turns.len() as u64;
+            reindexed[old_idx] = Some(turn_idx);
+            turn.turn_idx = turn_idx;
+            turns.push(turn);
+        }
+        self.turns = turns;
+        self.queue_turns.clear();
+        // A projected turn carries no tool event, but it can carry a skill
+        // invocation; both index turns and must follow the renumbering.
+        self.tool_events
+            .retain_mut(|event| match reindexed[event.turn_idx as usize] {
+                Some(turn_idx) => {
+                    event.turn_idx = turn_idx;
+                    true
+                }
+                None => false,
+            });
+        self.skill_invocations.retain_mut(|invocation| {
+            match reindexed[invocation.turn_idx as usize] {
+                Some(turn_idx) => {
+                    invocation.turn_idx = turn_idx;
+                    true
+                }
+                None => false,
+            }
+        });
+
+        // Segment drafts index turns too. Rebuild their bounds over the
+        // survivors with the same rule `push_turn` applies while walking.
+        for draft in &mut self.segments {
+            draft.first_turn = None;
+            draft.last_turn = 0;
+            draft.started_at = Known::unknown();
+            draft.ended_at = Known::unknown();
+        }
+        for turn in &self.turns {
+            let draft = &mut self.segments[turn.segment_id as usize];
+            if draft.first_turn.is_none() {
+                draft.first_turn = Some(turn.turn_idx);
+                draft.started_at = turn.timestamp.clone();
+            }
+            draft.last_turn = turn.turn_idx;
+            if let Known::Value(_) = turn.timestamp {
+                draft.ended_at = turn.timestamp.clone();
+            }
+        }
+        // `finalize_segments` drops turnless drafts and renumbers by position,
+        // and a draft can now lose every turn it had. Compact here so the
+        // segment ids it assigns still match `turn.segment_id`.
+        if self.segments.iter().any(|draft| draft.first_turn.is_none()) {
+            let mut segment_ids = vec![None; self.segments.len()];
+            let mut next_segment_id = 0_u32;
+            for (index, draft) in self.segments.iter().enumerate() {
+                if draft.first_turn.is_some() {
+                    segment_ids[index] = Some(next_segment_id);
+                    next_segment_id += 1;
+                }
+            }
+            for turn in &mut self.turns {
+                if let Some(segment_id) = segment_ids[turn.segment_id as usize] {
+                    turn.segment_id = segment_id;
+                }
+            }
+            self.segments.retain(|draft| draft.first_turn.is_some());
+        }
+    }
+
     fn into_parse(mut self, source: &SourceHandle, read: &SourceRead) -> UnvalidatedParse {
+        self.dedupe_queue_turns();
         let fatal = !self.session_id_seen;
         let visible_completeness = if fatal {
             VisibleCompleteness::Fatal
@@ -1123,6 +1311,15 @@ fn known_timestamp(raw: Option<&str>) -> Known<String> {
             Known::value(value.to_owned())
         }
         _ => Known::unknown(),
+    }
+}
+
+fn timestamp_millis(timestamp: &Known<String>) -> Option<i64> {
+    match timestamp {
+        Known::Value(value) => chrono::DateTime::parse_from_rfc3339(value)
+            .ok()
+            .map(|value| value.timestamp_millis()),
+        Known::Unknown(_) => None,
     }
 }
 

@@ -749,3 +749,230 @@ fn claude_adapter_rejects_multi_artifact_and_non_jsonl_framing() {
     let read = reader.read(&whole).unwrap();
     assert!(adapter.classify(&whole, &read).is_err());
 }
+
+// ---------------------------------------------------------------------------
+// Mid-turn queue projection (`queue-operation` enqueue -> user turn)
+// ---------------------------------------------------------------------------
+
+const QUEUE_SESSION: &str = "44444444-4444-4444-8444-444444444444";
+
+fn queue_row(operation: &str, field: &str, text: &str, timestamp: &str) -> String {
+    format!(
+        "{}\n",
+        serde_json::json!({
+            "type": "queue-operation",
+            "operation": operation,
+            field: text,
+            "sessionId": QUEUE_SESSION,
+            "timestamp": timestamp,
+        })
+    )
+}
+
+fn user_row(text: &str, timestamp: &str) -> String {
+    format!(
+        "{}\n",
+        serde_json::json!({
+            "type": "user",
+            "message": {"role": "user", "content": text},
+            "sessionId": QUEUE_SESSION,
+            "timestamp": timestamp,
+        })
+    )
+}
+
+fn user_turn_texts(model: &SessionModel) -> Vec<&str> {
+    model
+        .turns
+        .iter()
+        .filter(|turn| turn.kind == TurnKind::UserMsg)
+        .map(|turn| turn.text.as_str())
+        .collect()
+}
+
+#[test]
+fn claude_queue_enqueue_content_becomes_a_user_turn() {
+    let body = queue_row(
+        "enqueue",
+        "content",
+        "czy mozesz to sprawdzic w runtime?",
+        "2026-07-30T10:24:23.406Z",
+    );
+    let model = session_model(QUEUE_SESSION, &body);
+
+    assert_eq!(
+        user_turn_texts(&model),
+        vec!["czy mozesz to sprawdzic w runtime?"],
+        "a message submitted mid-turn exists only as the enqueue record"
+    );
+    let turn = &model.turns[0];
+    assert_eq!(turn.role, TurnRole::User);
+    assert_eq!(
+        turn.timestamp,
+        Known::value("2026-07-30T10:24:23.406Z".to_owned()),
+        "the projection keeps the record's own timestamp"
+    );
+
+    // The record stays consumed as metadata (frozen taxonomy is untouched) and
+    // the turn references exactly that evidence.
+    let consumed_kinds: Vec<&str> = model
+        .coverage
+        .consumed
+        .iter()
+        .map(|unit| unit.kind.as_str())
+        .collect();
+    assert_eq!(consumed_kinds, vec!["metadata_record"]);
+    assert_eq!(turn.raw_unit_refs.len(), 1);
+    assert_eq!(turn.raw_unit_refs[0].unit_kind, "metadata_record");
+    assert_eq!(
+        turn.raw_unit_refs[0].evidence_event_id,
+        model.coverage.consumed[0].evidence.evidence_event_id
+    );
+}
+
+#[test]
+fn claude_queue_enqueue_falls_back_to_the_prompt_field() {
+    let body = queue_row(
+        "enqueue",
+        "prompt",
+        "starszy build trzyma tekst w .prompt",
+        "2026-07-30T10:24:23.406Z",
+    );
+    let model = session_model(QUEUE_SESSION, &body);
+
+    assert_eq!(
+        user_turn_texts(&model),
+        vec!["starszy build trzyma tekst w .prompt"]
+    );
+}
+
+#[test]
+fn claude_queue_enqueue_of_a_task_notification_is_not_operator_input() {
+    let body = queue_row(
+        "enqueue",
+        "content",
+        "<task-notification>\n<task-id>a715678b</task-id>\n</task-notification>",
+        "2026-07-30T10:24:23.406Z",
+    );
+    let model = session_model(QUEUE_SESSION, &body);
+
+    assert!(
+        model.turns.is_empty(),
+        "harness notifications are machine chatter, not a chat turn"
+    );
+    assert_eq!(
+        model.coverage.consumed_count, 1,
+        "still consumed as metadata"
+    );
+}
+
+#[test]
+fn claude_queue_bookkeeping_operations_emit_no_turn() {
+    for operation in ["remove", "dequeue", "popAll"] {
+        let body = queue_row(
+            operation,
+            "content",
+            "tekst juz raz zakolejkowany",
+            "2026-07-30T10:24:23.406Z",
+        );
+        let model = session_model(QUEUE_SESSION, &body);
+
+        assert!(
+            model.turns.is_empty(),
+            "{operation} repeats text that enqueue already carried"
+        );
+        assert_eq!(model.coverage.consumed_count, 1);
+    }
+}
+
+#[test]
+fn claude_re_enqueued_text_keeps_only_the_first_submission() {
+    let body = format!(
+        "{}{}{}",
+        queue_row(
+            "enqueue",
+            "content",
+            "ma to sens?",
+            "2026-07-30T06:51:06.736Z"
+        ),
+        queue_row(
+            "remove",
+            "content",
+            "ma to sens?",
+            "2026-07-30T06:51:40.877Z"
+        ),
+        queue_row(
+            "enqueue",
+            "content",
+            "ma to sens?",
+            "2026-07-30T06:52:11.010Z"
+        ),
+    );
+    let model = session_model(QUEUE_SESSION, &body);
+
+    assert_eq!(
+        user_turn_texts(&model),
+        vec!["ma to sens?"],
+        "an interrupt-and-resubmit is one message, dated at the first enqueue"
+    );
+    assert_eq!(
+        model.turns[0].timestamp,
+        Known::value("2026-07-30T06:51:06.736Z".to_owned())
+    );
+}
+
+#[test]
+fn claude_queued_text_delivered_after_the_turn_is_not_doubled() {
+    let body = format!(
+        "{}{}",
+        queue_row(
+            "enqueue",
+            "content",
+            "Dopiszmy jeszcze cos",
+            "2026-07-30T06:55:06.868Z"
+        ),
+        user_row("Dopiszmy jeszcze cos", "2026-07-30T06:55:14.449Z"),
+    );
+    let model = session_model(QUEUE_SESSION, &body);
+
+    assert_eq!(
+        user_turn_texts(&model),
+        vec!["Dopiszmy jeszcze cos"],
+        "the real user row wins over the projection that anticipated it"
+    );
+    assert_eq!(
+        model.turns[0].timestamp,
+        Known::value("2026-07-30T06:55:14.449Z".to_owned()),
+        "the surviving turn is the delivered one"
+    );
+    assert_eq!(
+        model.turns[0].raw_unit_refs[0].unit_kind, "user",
+        "the survivor is the real row, not the queue record"
+    );
+    // Dropping a projected turn must leave the model internally consistent.
+    assert_eq!(model.turns[0].turn_idx, 0);
+    assert_eq!(model.segments.len(), 1);
+    assert_eq!(model.segments[0].turn_range.start, 0);
+    assert_eq!(model.segments[0].turn_range.end, 0);
+}
+
+#[test]
+fn claude_queued_text_delivered_before_the_enqueue_is_a_separate_message() {
+    let body = format!(
+        "{}{}",
+        user_row("sprawdz to jeszcze raz", "2026-07-30T06:55:06.868Z"),
+        queue_row(
+            "enqueue",
+            "content",
+            "sprawdz to jeszcze raz",
+            "2026-07-30T06:57:14.449Z"
+        ),
+    );
+    let model = session_model(QUEUE_SESSION, &body);
+
+    assert_eq!(
+        user_turn_texts(&model).len(),
+        2,
+        "an earlier identical row cannot be the delivery of a later enqueue"
+    );
+}
