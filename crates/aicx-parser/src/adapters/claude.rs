@@ -55,10 +55,16 @@ const SYNTHETIC_MODEL: &str = "<synthetic>";
 
 /// Recognized non-conversational record types, consumed as `metadata_record`
 /// (frozen taxonomy list — recognized means consumed, never skipped).
-const METADATA_TYPES: [&str; 9] = [
+const METADATA_TYPES: [&str; 10] = [
     "summary",
     "attachment",
     "file-history-snapshot",
+    // Younger sibling of the snapshot: the harness moved file-history tracking
+    // from whole snapshots to per-message deltas. Pure rewind/backup
+    // bookkeeping (backup descriptor, message ids, tracking path) — no
+    // conversation content. Recognizing it stops a modern session from
+    // degrading its own parse status with harness noise.
+    "file-history-delta",
     "pr-link",
     "queue-operation",
     "ai-title",

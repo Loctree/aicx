@@ -750,6 +750,54 @@ fn claude_adapter_rejects_multi_artifact_and_non_jsonl_framing() {
     assert!(adapter.classify(&whole, &read).is_err());
 }
 
+#[test]
+fn claude_file_history_delta_is_metadata_not_an_unsupported_event() {
+    // Rewind/backup bookkeeping the harness writes per message: a backup
+    // descriptor, the message ids it belongs to, and a tracking path. No
+    // conversation content, so it carries no visible event.
+    let session = "55555555-5555-4555-8555-555555555555";
+    let body = concat!(
+        r#"{"type":"user","message":{"role":"user","content":"popraw ten plik"},"#,
+        r#""sessionId":"55555555-5555-4555-8555-555555555555","#,
+        r#""timestamp":"2026-07-27T23:08:40.000Z"}"#,
+        "\n",
+        r#"{"type":"file-history-delta","messageId":"605ff099","#,
+        r#""snapshotMessageId":"9f44590f","trackingPath":"/repo/notes.md","#,
+        r#""backup":{"backupFileName":"68ccd2c3@v1","version":1,"#,
+        r#""backupTime":"2026-07-27T23:08:49.286Z","realParentDir":"/repo"},"#,
+        r#""timestamp":"2026-07-27T23:08:49.286Z"}"#,
+        "\n",
+    );
+    let model = session_model(session, body);
+
+    let delta = &model.coverage.consumed[1];
+    assert_eq!(
+        delta.kind, "metadata_record",
+        "file-history-delta is the per-message successor of file-history-snapshot"
+    );
+    assert_eq!(model.coverage.skipped_count, 0);
+
+    // The point of the fix: a healthy modern session must not degrade its own
+    // parse status with the harness's own bookkeeping.
+    assert!(
+        model.coverage.warnings.is_empty(),
+        "recognized bookkeeping emits no warning, got {:?}",
+        model.coverage.warnings
+    );
+    let status = status(&model);
+    assert!(
+        !status.boundary_flags.unsupported_visible_event,
+        "bookkeeping carries no visible event to preserve as unsupported"
+    );
+    assert_eq!(
+        status.visible_completeness,
+        VisibleCompleteness::CompleteVisible
+    );
+
+    // It is metadata, never chat: the only turn is the operator's message.
+    assert_eq!(user_turn_texts(&model), vec!["popraw ten plik"]);
+}
+
 // ---------------------------------------------------------------------------
 // Mid-turn queue projection (`queue-operation` enqueue -> user turn)
 // ---------------------------------------------------------------------------

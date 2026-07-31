@@ -152,8 +152,8 @@ name = "metadata_record"
 level = "physical"
 locator = "ordinal"
 provenance = "donor_spec"
-description = "Recognized non-conversational records: summary, attachment, file-history-snapshot, pr-link, queue-operation, ai-title, mode, permission-mode, last-prompt. Consumed as metadata — non-conversational does NOT mean skipped."
-match = { field = "type", equals_any = ["summary", "attachment", "file-history-snapshot", "pr-link", "queue-operation", "ai-title", "mode", "permission-mode", "last-prompt"] }
+description = "Recognized non-conversational records: summary, attachment, file-history-snapshot, file-history-delta, pr-link, queue-operation, ai-title, mode, permission-mode, last-prompt. Consumed as metadata — non-conversational does NOT mean skipped. file-history-delta is the per-message successor of file-history-snapshot (rewind/backup bookkeeping, no conversation content). queue-operation is consumed here AND has its enqueue text projected as a user turn — see PARSER_NORMATIVE_CONTRACT.md §2.1."
+match = { field = "type", equals_any = ["summary", "attachment", "file-history-snapshot", "file-history-delta", "pr-link", "queue-operation", "ai-title", "mode", "permission-mode", "last-prompt"] }
 
 [[agent.kind]]
 name = "text_block"

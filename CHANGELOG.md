@@ -7,6 +7,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **Modern Claude sessions no longer degrade their own parse status.** The
+  harness moved file-history tracking from whole snapshots to per-message
+  `file-history-delta` records, which the taxonomy did not declare. Every one
+  of them terminated as `skipped(unknown_payload_type)` with a warning and
+  raised `unsupported_visible_event` — a healthy session flagged as carrying
+  unsupported visible events, purely from its own bookkeeping (48 such records
+  in one observed session). The record is verified to be rewind/backup
+  bookkeeping with no conversation content, so it is now recognized as
+  `metadata_record` alongside `file-history-snapshot`.
+
 - **Claude extracts no longer lose the messages you send mid-turn.** A message
   submitted while a turn is running lives in the session JSONL only as a
   `queue-operation` enqueue record; the Claude adapter consumed that record as
