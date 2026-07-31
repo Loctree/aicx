@@ -750,6 +750,118 @@ fn claude_adapter_rejects_multi_artifact_and_non_jsonl_framing() {
     assert!(adapter.classify(&whole, &read).is_err());
 }
 
+fn assistant_row_with_thinking_block(session: &str, block: &str) -> String {
+    format!(
+        concat!(
+            r#"{{"type":"assistant","sessionId":"{session}","#,
+            r#""timestamp":"2026-07-31T08:00:00.000Z","#,
+            r#""message":{{"role":"assistant","model":"claude-opus-5","#,
+            r#""content":[{block},{{"type":"text","text":"Gotowe."}}]}}}}"#,
+            "\n"
+        ),
+        session = session,
+        block = block,
+    )
+}
+
+#[test]
+fn claude_signature_only_thinking_block_is_consumed_silently() {
+    // Since 2026-07 the harness writes thinking blocks signature-only: the
+    // reasoning text never reaches the JSONL. Treating that as an unknown
+    // payload made every reasoning session flag itself as carrying
+    // unsupported visible events.
+    let session = "66666666-6666-4666-8666-666666666666";
+    let body = assistant_row_with_thinking_block(
+        session,
+        r#"{"type":"thinking","thinking":"","signature":"ErUBCkYIBxgCKkDd"}"#,
+    );
+    let model = session_model(session, &body);
+
+    assert!(
+        model.coverage.warnings.is_empty(),
+        "a known block with no body is not an unknown payload, got {:?}",
+        model.coverage.warnings
+    );
+    let status = status(&model);
+    assert!(!status.boundary_flags.unsupported_visible_event);
+    assert!(!status.visible_event_lost);
+    assert_eq!(
+        status.visible_completeness,
+        VisibleCompleteness::CompleteVisible
+    );
+
+    // Still consumed as a thinking_block — accounting is untouched, only the
+    // turn projection is skipped.
+    assert!(
+        model
+            .coverage
+            .consumed
+            .iter()
+            .any(|unit| unit.kind == "thinking_block"),
+        "the block is consumed, never skipped"
+    );
+    assert_eq!(model.coverage.skipped_count, 0);
+    assert_eq!(
+        model
+            .turns
+            .iter()
+            .filter(|turn| turn.kind == TurnKind::InternalThought)
+            .count(),
+        0,
+        "an empty body yields no internal_thought turn"
+    );
+    assert_eq!(
+        model
+            .turns
+            .iter()
+            .filter(|turn| turn.kind == TurnKind::AgentReply)
+            .count(),
+        1,
+        "the sibling text block is unaffected"
+    );
+}
+
+#[test]
+fn claude_thinking_block_with_a_body_still_becomes_an_internal_thought() {
+    let session = "66666666-6666-4666-8666-666666666667";
+    let body = assistant_row_with_thinking_block(
+        session,
+        r#"{"type":"thinking","thinking":"  Plan the cut.  ","signature":"sig-abc"}"#,
+    );
+    let model = session_model(session, &body);
+
+    let thoughts: Vec<&str> = model
+        .turns
+        .iter()
+        .filter(|turn| turn.kind == TurnKind::InternalThought)
+        .map(|turn| turn.text.as_str())
+        .collect();
+    assert_eq!(thoughts, vec!["Plan the cut."], "unchanged behavior");
+    assert_eq!(model.turns[0].role, TurnRole::Assistant);
+    assert!(model.coverage.warnings.is_empty());
+    assert!(!status(&model).boundary_flags.unsupported_visible_event);
+}
+
+#[test]
+fn claude_thinking_block_without_the_field_stays_an_unsupported_shape() {
+    // The silent path is for a KNOWN block with no body. A block missing the
+    // field entirely is still an unrecognized shape and must stay visible.
+    let session = "66666666-6666-4666-8666-666666666668";
+    let body =
+        assistant_row_with_thinking_block(session, r#"{"type":"thinking","signature":"sig-abc"}"#);
+    let model = session_model(session, &body);
+
+    assert!(status(&model).boundary_flags.unsupported_visible_event);
+    assert!(
+        model
+            .coverage
+            .warnings
+            .iter()
+            .any(|warning| warning.kind == WarningKind::UnknownPayloadType),
+        "a missing field is not the same as an empty one"
+    );
+}
+
 #[test]
 fn claude_file_history_delta_is_metadata_not_an_unsupported_event() {
     // Rewind/backup bookkeeping the harness writes per message: a backup

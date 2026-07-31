@@ -7,6 +7,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **`unsupported_visible_event` means something again on Claude sessions.**
+  Since 2026-07 the harness emits thinking blocks signature-only — `thinking`
+  is present but empty and the reasoning text never reaches the JSONL (live
+  evidence: 400 of 400 blocks in one session). The adapter treated an empty
+  body as an unrecognized shape, so it raised the boundary flag and a typed
+  warning on every single one; any session that reasoned at all reported
+  itself as carrying unsupported visible events. A known block with no body is
+  now consumed silently, exactly like an empty text block. A block with a body
+  is unchanged (`internal_thought`), and a block missing the field entirely is
+  still an unsupported shape.
+
 - **Modern Claude sessions no longer degrade their own parse status.** The
   harness moved file-history tracking from whole snapshots to per-message
   `file-history-delta` records, which the taxonomy did not declare. Every one

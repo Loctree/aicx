@@ -539,8 +539,11 @@ fn walk_content_block(
                 logical,
                 analysis,
             )?;
-            if let Some(text) = string_field(object, "thinking") {
-                if !text.trim().is_empty() {
+            // `thinking` present as a string is a KNOWN block, whether or not
+            // it carries a body. Only a missing or non-string field is an
+            // unrecognized shape.
+            match object.get("thinking").and_then(Value::as_str) {
+                Some(text) if !text.trim().is_empty() => {
                     push_turn(
                         TurnRole::Assistant,
                         TurnKind::InternalThought,
@@ -551,13 +554,24 @@ fn walk_content_block(
                         analysis,
                     );
                 }
-            } else {
-                analysis.unsupported_visible_event = true;
-                warn(
-                    analysis,
-                    WarningKind::UnknownPayloadType,
-                    raw.coverage_ordinal,
-                );
+                // Signature-only block: since 2026-07 the harness writes
+                // `{"type":"thinking","thinking":"","signature":"..."}` — the
+                // reasoning text never reaches the JSONL, only its signature.
+                // (Live evidence 2026-07-31: 400 of 400 thinking blocks in one
+                // session were empty.) A known block with no body is consumed
+                // silently, exactly like an empty text block in
+                // `emit_text_turn`; treating it as an unknown payload made
+                // `unsupported_visible_event` fire on every reasoning session,
+                // which drained the flag of meaning.
+                Some(_) => {}
+                None => {
+                    analysis.unsupported_visible_event = true;
+                    warn(
+                        analysis,
+                        WarningKind::UnknownPayloadType,
+                        raw.coverage_ordinal,
+                    );
+                }
             }
             Ok(())
         }

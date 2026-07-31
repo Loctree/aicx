@@ -188,7 +188,7 @@ level = "logical"
 parent = "assistant"
 locator = "ordinal"
 provenance = "donor_spec"
-description = "Visible thinking block — preserved as its own internal_thought turn, never merged into assistant text."
+description = "Thinking block — a body is preserved as its own internal_thought turn, never merged into assistant text. Always consumed, including the signature-only shape the harness emits since 2026-07 (`thinking` present but empty): a known block with no body yields no turn and is NOT an unknown payload."
 match = { field = "type", equals = "thinking" }
 
 # ================================================================== gemini (CLI dual format + Antigravity)
