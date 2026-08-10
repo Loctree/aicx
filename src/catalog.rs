@@ -1186,7 +1186,7 @@ fn enrich_runtime_runs(by_id: &mut BTreeMap<(String, String), CatalogEntry>, use
             schema: CATALOG_SCHEMA.to_string(),
             session_id: run_id,
             agent: "vibecrafted".to_string(),
-            project: Some("VetCoders/vibecrafted".to_string()),
+            project: Some("vetcoders/vibecrafted".to_string()),
             date,
             cwd: None,
             source_path: transcript.display().to_string(),
@@ -1472,7 +1472,7 @@ mod tests {
             schema: CATALOG_SCHEMA.to_string(),
             session_id: "s1".into(),
             agent: "claude".into(),
-            project: Some("VetCoders/mlx-lm".into()),
+            project: Some("vetcoders/mlx-lm".into()),
             date: Some("2026-07-22".into()),
             cwd: None,
             source_path: "/tmp/x".into(),
@@ -1495,7 +1495,7 @@ mod tests {
         )
         .unwrap();
         let ids = project_identities_from_catalog_at(&home).unwrap();
-        assert_eq!(ids, vec!["VetCoders/mlx-lm".to_string()]);
+        assert_eq!(ids, vec!["vetcoders/mlx-lm".to_string()]);
         let _ = fs::remove_dir_all(&home);
     }
 
@@ -1723,8 +1723,8 @@ mod tests {
             Some("Loctree/aicx".to_string())
         );
         assert_eq!(
-            project_slug_from_remote("git@github.com:VetCoders/pensieve.git"),
-            Some("VetCoders/pensieve".to_string())
+            project_slug_from_remote("git@github.com:vetcoders/pensieve.git"),
+            Some("vetcoders/pensieve".to_string())
         );
     }
 
@@ -1753,7 +1753,7 @@ mod tests {
                     "remote",
                     "add",
                     "origin",
-                    "https://github.com/VetCoders/pensieve.git",
+                    "https://github.com/vetcoders/pensieve.git",
                 ])
                 .status()
                 .unwrap()
@@ -1785,7 +1785,7 @@ mod tests {
         let report = refresh_hot(&home, &user, 0).unwrap();
         assert_eq!(report.reattributed_sessions, 1);
         let refreshed = read_entries_at(&home).unwrap();
-        assert_eq!(refreshed[0].project.as_deref(), Some("VetCoders/pensieve"));
+        assert_eq!(refreshed[0].project.as_deref(), Some("vetcoders/pensieve"));
         let _ = fs::remove_dir_all(&dir);
     }
 }

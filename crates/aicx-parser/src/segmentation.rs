@@ -793,8 +793,8 @@ mod tests {
 
         let segments = semantic_segments(&entries);
         assert_eq!(segments.len(), 2);
-        assert_eq!(segments[0].project_label(), "Vetcoders/ai-contexters");
-        assert_eq!(segments[1].project_label(), "Vetcoders/loctree");
+        assert_eq!(segments[0].project_label(), "vetcoders/ai-contexters");
+        assert_eq!(segments[1].project_label(), "vetcoders/loctree");
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -840,7 +840,7 @@ mod tests {
         assert_eq!(segments.len(), 2);
         assert!(segments[0].repo.is_none());
         assert_eq!(segments[0].kind, Kind::Plans);
-        assert_eq!(segments[1].project_label(), "Vetcoders/ai-contexters");
+        assert_eq!(segments[1].project_label(), "vetcoders/ai-contexters");
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -879,7 +879,7 @@ mod tests {
                 "remote",
                 "add",
                 "origin",
-                "git@github.com:Vetcoders/ai-contexters.git",
+                "git@github.com:vetcoders/ai-contexters.git",
             ])
             .output()
             .expect("git remote add should run");
@@ -893,7 +893,7 @@ mod tests {
         );
 
         let repo_identity = infer_repo_identity_from_entry(&entry).expect("repo identity");
-        assert_eq!(repo_identity.slug(), "Vetcoders/ai-contexters");
+        assert_eq!(repo_identity.slug(), "vetcoders/ai-contexters");
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -1001,7 +1001,7 @@ mod tests {
     #[test]
     fn fallback_routes_invalid_remote_repo_to_unknown_local_bucket() {
         let identity = infer_repo_identity_from_remote_like(
-            "https://github.com/Vetcoders/${RELEASE_REPO}.git",
+            "https://github.com/vetcoders/${RELEASE_REPO}.git",
         )
         .expect("malformed repository should resolve to local unknown fallback");
 
@@ -1026,7 +1026,7 @@ mod tests {
                 "remote",
                 "add",
                 "origin",
-                "git@github.com:Vetcoders/loctree.git",
+                "git@github.com:vetcoders/loctree.git",
             ])
             .output()
             .expect("git remote add");
@@ -1042,7 +1042,7 @@ mod tests {
         let tiered = infer_tiered_identity_from_entry(&e, &ProjectHashRegistry::default())
             .expect("should resolve");
         assert_eq!(tiered.tier, SourceTier::Primary);
-        assert_eq!(tiered.identity.slug(), "Vetcoders/loctree");
+        assert_eq!(tiered.identity.slug(), "vetcoders/loctree");
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -1099,7 +1099,7 @@ mod tests {
                 "remote",
                 "add",
                 "origin",
-                "git@github.com:Vetcoders/ai-contexters.git",
+                "git@github.com:vetcoders/ai-contexters.git",
             ])
             .output()
             .expect("git remote add");
@@ -1121,7 +1121,7 @@ mod tests {
         let tiered =
             infer_tiered_identity_from_entry(&e, &registry).expect("registry should resolve");
         assert_eq!(tiered.tier, SourceTier::Secondary);
-        assert_eq!(tiered.identity.slug(), "Vetcoders/ai-contexters");
+        assert_eq!(tiered.identity.slug(), "vetcoders/ai-contexters");
         assert!(tiered.tier.is_assertable());
 
         let _ = fs::remove_dir_all(&root);
@@ -1245,7 +1245,7 @@ mod tests {
                 "remote",
                 "add",
                 "origin",
-                "git@github.com:Vetcoders/ai-contexters.git",
+                "git@github.com:vetcoders/ai-contexters.git",
             ])
             .output()
             .expect("git remote add");
@@ -1268,7 +1268,7 @@ mod tests {
         assert_eq!(segments.len(), 1);
         assert!(segments[0].repo.is_some());
         assert_eq!(segments[0].source_tier, Some(SourceTier::Secondary));
-        assert_eq!(segments[0].project_label(), "Vetcoders/ai-contexters");
+        assert_eq!(segments[0].project_label(), "vetcoders/ai-contexters");
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -1384,7 +1384,7 @@ mod tests {
         // Mac convention `/Users/<u>/Git/...` (capital G) must match the
         // lowercase `git` marker. Previously case-sensitive comparison rejected
         // it, sending identity inference into the now-removed text fallback.
-        let path = Path::new("/Users/user/Git/Vetcoders/ai-contexters/src/lib.rs");
+        let path = Path::new("/Users/user/Git/vetcoders/ai-contexters/src/lib.rs");
         let id = infer_repo_identity_from_known_layout(path).expect("Git (capital) matches");
         assert_eq!(id.organization, "Vetcoders");
         assert_eq!(id.repository, "ai-contexters");
@@ -1454,7 +1454,7 @@ mod tests {
             (2026, 5, 19, 10, 0, 0),
             "sess-url",
             "user",
-            "See https://github.com/Vetcoders/aicx for context.",
+            "See https://github.com/vetcoders/aicx for context.",
             None,
         );
         assert!(
@@ -1473,21 +1473,21 @@ mod tests {
             (2026, 5, 19, 10, 0, 0),
             "sess-bucket",
             "user",
-            "Read https://github.com/Vetcoders/aicx and tell me what you see.",
+            "Read https://github.com/vetcoders/aicx and tell me what you see.",
             None,
         );
         let resolution = resolve_bucket(&e, &ProjectHashRegistry::default());
         assert_eq!(resolution.source, BucketingSource::ContentMention);
-        assert_eq!(resolution.bucket, "Vetcoders/aicx");
+        assert_eq!(resolution.bucket, "vetcoders/aicx");
     }
 
     #[test]
     fn semantic_segment_does_not_split_on_text_url_mention() {
-        // Round-2 regression: a session whose cwd points at Vetcoders/Vista
+        // Round-2 regression: a session whose cwd points at vetcoders/Vista
         // (Primary identity, real .git on disk) and whose middle chunk simply
         // mentions a different repo URL must stay as ONE segment with the
         // owner-correct identity. Pre-fix this split into two segments
-        // (vetcoders/Vista → Vetcoders/aicx Fallback) and the second chunk
+        // (vetcoders/Vista → vetcoders/aicx Fallback) and the second chunk
         // routed away from its real owner.
         let root = mk_tmp_dir("segment-no-split-on-url");
         let repo = root.join("Git").join("Vetcoders").join("vista");
@@ -1500,7 +1500,7 @@ mod tests {
                 "remote",
                 "add",
                 "origin",
-                "git@github.com:Vetcoders/vista.git",
+                "git@github.com:vetcoders/vista.git",
             ])
             .output()
             .unwrap();
@@ -1518,7 +1518,7 @@ mod tests {
                 (2026, 5, 19, 10, 1, 0),
                 "sess-no-split",
                 "assistant",
-                "See https://github.com/Vetcoders/aicx for the shared parser.",
+                "See https://github.com/vetcoders/aicx for the shared parser.",
                 None,
             ),
             entry(
@@ -1536,7 +1536,7 @@ mod tests {
             1,
             "single-owner session must not split on a text URL mention"
         );
-        assert_eq!(segments[0].project_label(), "Vetcoders/vista");
+        assert_eq!(segments[0].project_label(), "vetcoders/vista");
         assert!(segments[0].has_assertable_identity());
 
         let _ = fs::remove_dir_all(&root);

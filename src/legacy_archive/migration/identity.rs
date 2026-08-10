@@ -4,7 +4,7 @@
 //! The immutable-identity doctrine is correct: query surfaces read the
 //! persisted identity and never silently re-derive it. That same doctrine
 //! faithfully preserves a wrong historical casing — `index.json` still
-//! carries pre-rename keys like `VetCoders/CodeScribe` while fresh
+//! carries pre-rename keys like `vetcoders/CodeScribe` while fresh
 //! derivation (`canonical_repo_label`) emits `vetcoders/codescribe`, and a
 //! case-insensitive filesystem (APFS) masks the store-directory split that
 //! WILL materialize on a case-sensitive one. The remedy class is therefore
@@ -1077,26 +1077,26 @@ mod tests {
 
     fn seed_store(base: &Path) {
         let store = base.join("store");
-        fs::create_dir_all(store.join("VetCoders/CodeScribe/2026_0717/context/claude")).unwrap();
+        fs::create_dir_all(store.join("vetcoders/CodeScribe/2026_0717/context/claude")).unwrap();
         fs::write(
-            store.join("VetCoders/CodeScribe/2026_0717/context/claude/chunk1.md"),
+            store.join("vetcoders/CodeScribe/2026_0717/context/claude/chunk1.md"),
             "chunk payload",
         )
         .unwrap();
-        fs::create_dir_all(store.join("VetCoders/ai-contexers")).unwrap();
-        fs::create_dir_all(store.join("VetCoders/ai-contexters")).unwrap();
+        fs::create_dir_all(store.join("vetcoders/ai-contexers")).unwrap();
+        fs::create_dir_all(store.join("vetcoders/ai-contexters")).unwrap();
         let cards = store.join("canonical-projection-v1/cards");
         fs::create_dir_all(&cards).unwrap();
         // card3 shape: `project` is an object carrying the persisted slug.
         fs::write(
             cards.join("card3_76b8e606.json"),
-            r#"{"session_id":"s1","project":{"slug":"VetCoders/CodeScribe","attribution":{"kind":"inferred","version":"project-bucket-v1"}}}"#,
+            r#"{"session_id":"s1","project":{"slug":"vetcoders/CodeScribe","attribution":{"kind":"inferred","version":"project-bucket-v1"}}}"#,
         )
         .unwrap();
         // Legacy shape: bare string project — must also be annotated.
         fs::write(
             cards.join("card2_legacy.json"),
-            r#"{"session_id":"s2","project":"VetCoders/CodeScribe"}"#,
+            r#"{"session_id":"s2","project":"vetcoders/CodeScribe"}"#,
         )
         .unwrap();
     }
@@ -1123,7 +1123,7 @@ mod tests {
     #[test]
     fn plan_detects_casing_drift_cards_and_typo_twins() {
         let base = fixture_base("plan");
-        write_index(&base, &[("VetCoders/CodeScribe", 42)]);
+        write_index(&base, &[("vetcoders/CodeScribe", 42)]);
         seed_store(&base);
 
         let manifest = plan_identity_migration_at(&base).unwrap();
@@ -1131,7 +1131,7 @@ mod tests {
         assert_eq!(
             manifest.index_key_renames,
             vec![IndexKeyRename {
-                from: "VetCoders/CodeScribe".to_string(),
+                from: "vetcoders/CodeScribe".to_string(),
                 to: "vetcoders/codescribe".to_string(),
                 merge_into_existing: false,
             }]
@@ -1141,12 +1141,12 @@ mod tests {
             manifest.dir_renames,
             vec![
                 StoreDirRename {
-                    from: "VetCoders/CodeScribe".to_string(),
-                    to: "VetCoders/codescribe".to_string(),
+                    from: "vetcoders/CodeScribe".to_string(),
+                    to: "vetcoders/codescribe".to_string(),
                     case_only: true,
                 },
                 StoreDirRename {
-                    from: "VetCoders".to_string(),
+                    from: "vetcoders".to_string(),
                     to: "vetcoders".to_string(),
                     case_only: true,
                 },
@@ -1159,7 +1159,7 @@ mod tests {
             manifest.card_aliases
         );
         assert!(manifest.card_aliases.iter().all(|alias| {
-            alias.from == "VetCoders/CodeScribe" && alias.to == "vetcoders/codescribe"
+            alias.from == "vetcoders/CodeScribe" && alias.to == "vetcoders/codescribe"
         }));
         assert_eq!(manifest.typo_twins.len(), 1);
         assert_eq!(manifest.typo_twins[0].repo_a, "ai-contexers");
@@ -1173,7 +1173,7 @@ mod tests {
         let base = fixture_base("plan-split");
         write_index(
             &base,
-            &[("VetCoders/CodeScribe", 40), ("vetcoders/codescribe", 2)],
+            &[("vetcoders/CodeScribe", 40), ("vetcoders/codescribe", 2)],
         );
 
         let manifest = plan_identity_migration_at(&base).unwrap();
@@ -1186,7 +1186,7 @@ mod tests {
     #[test]
     fn dry_run_leaves_store_and_index_untouched() {
         let base = fixture_base("dry-run");
-        write_index(&base, &[("VetCoders/CodeScribe", 42)]);
+        write_index(&base, &[("vetcoders/CodeScribe", 42)]);
         seed_store(&base);
         let index_before = fs::read_to_string(base.join("index.json")).unwrap();
         let store_before = snapshot(&base.join("store"));
@@ -1216,7 +1216,7 @@ mod tests {
         let base = fixture_base("apply");
         write_index(
             &base,
-            &[("VetCoders/CodeScribe", 40), ("vetcoders/codescribe", 2)],
+            &[("vetcoders/CodeScribe", 40), ("vetcoders/codescribe", 2)],
         );
         seed_store(&base);
         let card_path = base.join("store/canonical-projection-v1/cards/card3_76b8e606.json");
@@ -1234,7 +1234,7 @@ mod tests {
             "{store_names:?}"
         );
         assert!(
-            !store_names.contains(&"VetCoders".to_string()),
+            !store_names.contains(&"vetcoders".to_string()),
             "{store_names:?}"
         );
         let repo_names = list_dir_names(&base.join("store/vetcoders")).unwrap();
@@ -1255,7 +1255,7 @@ mod tests {
         // Index: one merged canonical key with summed totals.
         let index = super::super::super::load_index_at(&base).unwrap();
         assert!(index.projects.contains_key("vetcoders/codescribe"));
-        assert!(!index.projects.contains_key("VetCoders/CodeScribe"));
+        assert!(!index.projects.contains_key("vetcoders/CodeScribe"));
         let merged = &index.projects["vetcoders/codescribe"].agents["claude"];
         assert_eq!(merged.total_entries, 42);
 
@@ -1282,7 +1282,7 @@ mod tests {
     #[test]
     fn merge_move_merges_recursively_and_records_conflicts() {
         let base = fixture_base("merge-move");
-        let from = base.join("VetCoders-split");
+        let from = base.join("vetcoders-split");
         let to = base.join("vetcoders");
         fs::create_dir_all(from.join("nested")).unwrap();
         fs::create_dir_all(&to).unwrap();
@@ -1332,7 +1332,7 @@ mod tests {
     #[test]
     fn merge_move_removes_fully_emptied_source_dir() {
         let base = fixture_base("merge-move-clean");
-        let from = base.join("VetCoders-split");
+        let from = base.join("vetcoders-split");
         let to = base.join("vetcoders");
         fs::create_dir_all(&from).unwrap();
         fs::write(from.join("chunk.md"), "payload").unwrap();
@@ -1350,7 +1350,7 @@ mod tests {
     #[test]
     fn test_precondition_hash_mismatch() {
         let base = fixture_base("precondition-mismatch");
-        write_index(&base, &[("VetCoders/CodeScribe", 42)]);
+        write_index(&base, &[("vetcoders/CodeScribe", 42)]);
         seed_store(&base);
 
         // 1. Dry run / planning phase
@@ -1359,7 +1359,7 @@ mod tests {
 
         // 2. Change source: write a new file to cased dir
         fs::write(
-            base.join("store/VetCoders/CodeScribe/2026_0717/context/claude/chunk2.md"),
+            base.join("store/vetcoders/CodeScribe/2026_0717/context/claude/chunk2.md"),
             "changed source data",
         )
         .unwrap();
@@ -1411,12 +1411,12 @@ mod tests {
     #[test]
     fn test_deprecated_checkout_quarantine() {
         let base = fixture_base("deprecated-quarantine");
-        write_index(&base, &[("VetCoders/CodeScribe-deprecated", 42)]);
+        write_index(&base, &[("vetcoders/CodeScribe-deprecated", 42)]);
         let store = base.join("store");
-        fs::create_dir_all(store.join("VetCoders/CodeScribe-deprecated/2026_0717/context/claude"))
+        fs::create_dir_all(store.join("vetcoders/CodeScribe-deprecated/2026_0717/context/claude"))
             .unwrap();
         fs::write(
-            store.join("VetCoders/CodeScribe-deprecated/2026_0717/context/claude/chunk1.md"),
+            store.join("vetcoders/CodeScribe-deprecated/2026_0717/context/claude/chunk1.md"),
             "deprecated payload",
         )
         .unwrap();
@@ -1440,7 +1440,7 @@ mod tests {
                 .is_file()
         );
         // Verify source dir is gone
-        assert!(!store.join("VetCoders/CodeScribe-deprecated").exists());
+        assert!(!store.join("vetcoders/CodeScribe-deprecated").exists());
 
         let _ = fs::remove_dir_all(&base);
     }
@@ -1448,7 +1448,7 @@ mod tests {
     #[test]
     fn test_interrupted_apply_and_resume() {
         let base = fixture_base("resume");
-        write_index(&base, &[("VetCoders/CodeScribe", 42)]);
+        write_index(&base, &[("vetcoders/CodeScribe", 42)]);
         seed_store(&base);
 
         // 1. Dry run to plan
@@ -1478,7 +1478,7 @@ mod tests {
     #[test]
     fn test_rollback_behavior() {
         let base = fixture_base("rollback");
-        write_index(&base, &[("VetCoders/CodeScribe", 42)]);
+        write_index(&base, &[("vetcoders/CodeScribe", 42)]);
         seed_store(&base);
 
         // Apply migration
@@ -1487,7 +1487,7 @@ mod tests {
 
         let store_names = list_dir_names(&base.join("store")).unwrap();
         assert!(store_names.contains(&"vetcoders".to_string()));
-        assert!(!store_names.contains(&"VetCoders".to_string()));
+        assert!(!store_names.contains(&"vetcoders".to_string()));
 
         let repo_names = list_dir_names(&base.join("store/vetcoders")).unwrap();
         assert!(repo_names.contains(&"codescribe".to_string()));
@@ -1495,23 +1495,23 @@ mod tests {
 
         let index = crate::legacy_archive::load_index_at(&base).unwrap();
         assert!(index.projects.contains_key("vetcoders/codescribe"));
-        assert!(!index.projects.contains_key("VetCoders/CodeScribe"));
+        assert!(!index.projects.contains_key("vetcoders/CodeScribe"));
 
         // Rollback
         rollback_identity_migration_at(&base).unwrap();
 
         // Check original state is restored
         let store_names2 = list_dir_names(&base.join("store")).unwrap();
-        assert!(store_names2.contains(&"VetCoders".to_string()));
+        assert!(store_names2.contains(&"vetcoders".to_string()));
         assert!(!store_names2.contains(&"vetcoders".to_string()));
 
-        let repo_names2 = list_dir_names(&base.join("store/VetCoders")).unwrap();
+        let repo_names2 = list_dir_names(&base.join("store/vetcoders")).unwrap();
         assert!(repo_names2.contains(&"CodeScribe".to_string()));
         assert!(!repo_names2.contains(&"codescribe".to_string()));
 
         let index = crate::legacy_archive::load_index_at(&base).unwrap();
         assert!(!index.projects.contains_key("vetcoders/codescribe"));
-        assert!(index.projects.contains_key("VetCoders/CodeScribe"));
+        assert!(index.projects.contains_key("vetcoders/CodeScribe"));
 
         let _ = fs::remove_dir_all(&base);
     }
@@ -1519,7 +1519,7 @@ mod tests {
     #[test]
     fn test_dry_run_leaves_recursive_hash_unchanged() {
         let base = fixture_base("dry-run-hash");
-        write_index(&base, &[("VetCoders/CodeScribe", 42)]);
+        write_index(&base, &[("vetcoders/CodeScribe", 42)]);
         seed_store(&base);
 
         let hash_before = compute_store_recursive_hash(&base.join("store")).unwrap();

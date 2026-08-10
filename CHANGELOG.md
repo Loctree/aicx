@@ -7,6 +7,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **Lexical schema downgrade is a controlled conflict, not silent
+  corruption.** Publishing `CURRENT` refuses a generation whose lexical
+  schema is provably older than the published one (or than the binary's
+  supported schema), and search returns a typed conflict naming the foreign
+  writer when `CURRENT` drifts from the binary — the failure mode observed
+  when a file-sync tool (MEGA) replicated the machine-local
+  `~/.aicx/indexed/` between hosts running different aicx builds
+  (`v3_folded_dictation` ↔ `v2_fast_body`). `docs/MULTI_MACHINE.md` documents
+  which AICX home paths are machine-local and must stay out of file sync.
+
 - **`unsupported_visible_event` means something again on Claude sessions.**
   Since 2026-07 the harness emits thinking blocks signature-only — `thinking`
   is present but empty and the reasoning text never reaches the JSONL (live
@@ -40,6 +50,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   and a queued message the harness later delivers as a real `user` row loses
   to that row. Verified on a live 1180-entry session that had permanently
   dropped 20 operator messages. See `docs/PARSER_NORMATIVE_CONTRACT.md` §2.1.
+
+### Added
+
+- **Index generation provenance.** Retrieval manifests now record
+  `writer_version` and `build_id` (`<version>+g<sha>[.dirty]`) of the writer
+  that published the generation. Pre-provenance manifests stay readable and
+  self-describe as `unknown (pre-provenance writer)`.
 
 ## [0.12.1] - 2026-07-24
 
@@ -803,7 +820,7 @@ oracle, never a runtime dependency.
 
 ### Fixed
 
-- Corrected the `SECURITY.md` disclosure path so private vulnerability reports go to the public `Vetcoders/ai-contexters` repository instead of a stale owner link.
+- Corrected the `SECURITY.md` disclosure path so private vulnerability reports go to the public `vetcoders/ai-contexters` repository instead of a stale owner link.
 - Updated GitHub Actions workflow dependencies to current major versions for `checkout`, `cache`, `setup-python`, `upload-artifact`, and `download-artifact`, removing the Node 20 deprecation surface from future CI and release runs.
 
 ## [0.4.2] - 2026-03-17
@@ -848,7 +865,7 @@ oracle, never a runtime dependency.
 ### Changed
 
 - Rank made default command (`aicx -p proj` runs rank).
-- Skills removed from repo — canonical source: Vetcoders/vetcoders-skills.
+- Skills removed from repo — canonical source: vetcoders/vetcoders-skills.
 - Package excludes: `*.html`, `*.patch`, `*.orig`, `.ai-agents/`, `skills/`.
 
 ### Added (Governance)

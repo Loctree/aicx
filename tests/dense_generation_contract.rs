@@ -321,6 +321,8 @@ fn manifest_validation_rejects_every_drift_axis() {
     let base = Manifest {
         schema_version: "2.0".to_string(),
         generation_id: "g-2026-07-22T07:00:00Z-deadbeef".to_string(),
+        writer_version: "0.12.1".to_string(),
+        build_id: "0.12.1+gtestbead".to_string(),
         source_chunk_count: 3,
         source_hash_blake3: "blake3-source".to_string(),
         embedder_model: "test-model".to_string(),

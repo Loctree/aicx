@@ -177,7 +177,7 @@ mod tests {
 
         let filter = SteerFilter {
             prompt_id: Some("prompt-target"),
-            project: Some("VetCoders/aicx"),
+            project: Some("vetcoders/aicx"),
             ..SteerFilter::default()
         };
         let matches = search_generation_metadata(&adapter, &filter, 10).unwrap();
@@ -198,7 +198,7 @@ mod tests {
             metadata: json!({
                 "agent": "codex",
                 "date": date,
-                "project": "VetCoders/aicx",
+                "project": "vetcoders/aicx",
                 "prompt_id": prompt_id,
                 "run_id": "run-1",
                 "kind": "report",

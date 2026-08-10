@@ -119,21 +119,21 @@ mod tests {
         assert!(is_valid_repo_project_slug("vetcoders/mlx-batch-server.git"));
 
         // CamelCase paths valid (case-preserving canonical):
-        assert!(is_valid_repo_project_slug("Vetcoders/aicx"));
-        assert!(is_valid_repo_project_slug("Vetcoders/Vista"));
+        assert!(is_valid_repo_project_slug("vetcoders/aicx"));
+        assert!(is_valid_repo_project_slug("vetcoders/Vista"));
         assert!(is_valid_repo_project_slug("LibraxisAI/lbrxAgents"));
         assert!(is_valid_repo_project_slug("Loctree/aicx"));
 
         // Mid-segment garbage still rejected (extractor-bug evidence):
-        assert!(!is_valid_repo_project_slug("Vetcoders/vibecrafted.git`"));
-        assert!(!is_valid_repo_project_slug("Vetcoders/loctree\n\n**AICX"));
+        assert!(!is_valid_repo_project_slug("vetcoders/vibecrafted.git`"));
+        assert!(!is_valid_repo_project_slug("vetcoders/loctree\n\n**AICX"));
         assert!(!is_valid_repo_project_slug(
-            "Vetcoders/loctxc_O)outcomqqqqqqq]]qqqqqqqqqqqqqqqqqqqqqqqqqqq;;'["
+            "vetcoders/loctxc_O)outcomqqqqqqq]]qqqqqqqqqqqqqqqqqqqqqqqqqqq;;'["
         ));
 
         // Structural rejects:
-        assert!(!is_valid_repo_project_slug("Vetcoders/aicx/extra"));
+        assert!(!is_valid_repo_project_slug("vetcoders/aicx/extra"));
         assert!(!is_valid_repo_project_slug("/aicx"));
-        assert!(!is_valid_repo_project_slug("Vetcoders/"));
+        assert!(!is_valid_repo_project_slug("vetcoders/"));
     }
 }

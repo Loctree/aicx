@@ -55,6 +55,31 @@ Putting JSONL under `~/.aicx/store` or a custom folder does **not** admit them.
 | Copy only dense generation dirs with different embedder | dimension/model mismatch on `--deep` / dense path |
 | Point two hosts at one shared `AICX_HOME` over flaky FS | lock/races on CURRENT publish; prefer single writer |
 | Drop JSONL outside agent roots | forever `unadmitted=0` and invisible |
+| File-sync `~/.aicx/indexed` between hosts (MEGA, Syncthing, …) | CURRENT swaps to another host's generation; on lexical schema drift search now refuses with a typed writer-identified conflict instead of mystery corruption |
+
+## Machine-local vs durable state (file-sync tools)
+
+The hybrid Tantivy index is **machine-local**: every host rebuilds it with
+`aicx index` from its own catalog. Syncing it between hosts running different
+aicx builds swaps `CURRENT` between schema generations (observed 2026-08-10:
+MEGA flipping `v3_folded_dictation` ↔ `v2_fast_body`).
+
+Exclude from any file-sync of `~/.aicx` (MEGA `.megaignore` syntax):
+
+```text
+-dN:indexed
+-dN:catalog
+-dN:extracts
+-dN:tmp
+-fN:auth-token
+```
+
+Keep `store/` and `context-corpus/` synced (durable data). Classify
+`state.json` before deciding.
+
+Defense in depth since 2026-08-10: manifests carry `writer_version` /
+`build_id`, and both publish and search reject a provable lexical schema
+downgrade with a typed conflict naming the foreign writer.
 
 ## Relocating AICX home (not session intake)
 

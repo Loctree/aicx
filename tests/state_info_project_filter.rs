@@ -187,7 +187,7 @@ fn state_info_with_org_wildcard_filter_includes_org_siblings() {
     assert!(out.status.success(), "stderr:\n{stderr}");
     assert!(
         stderr.contains("Total hashes (filtered): 5"),
-        "two vetcoders buckets total 5 hashes; stderr:\n{stderr}"
+        "two Vetcoders buckets total 5 hashes; stderr:\n{stderr}"
     );
     assert!(
         stderr.contains("Projects (filtered):     2"),

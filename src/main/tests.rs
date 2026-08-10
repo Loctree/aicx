@@ -362,8 +362,8 @@ fn index_status_routes_through_index_canonical_resolver() {
     // Canonical on-disk store: 4 buckets across 2 orgs / 3 repo names.
     // Mixed case mirrors real-world GitHub slugs (filesystem preserves it).
     let bucket_slugs = [
-        "Vetcoders/Loctree",
-        "Vetcoders/aicx",
+        "vetcoders/Loctree",
+        "vetcoders/aicx",
         "Sampleorg/Loctree",
         "Sampleorg/Codescribe",
     ];
@@ -390,9 +390,9 @@ fn index_status_routes_through_index_canonical_resolver() {
     // The 4 canonical filter shapes from the bug brief.
     let shapes: &[(&str, &[&str])] = &[
         // strict slug
-        ("Vetcoders/Loctree", &["vetcoders_loctree"]),
+        ("vetcoders/Loctree", &["vetcoders_loctree"]),
         // org wildcard
-        ("Vetcoders/", &["vetcoders_aicx", "vetcoders_loctree"]),
+        ("vetcoders/", &["vetcoders_aicx", "vetcoders_loctree"]),
         // cross-org repo (explicit wildcard — selects every org on purpose)
         ("/Loctree", &["sampleorg_loctree", "vetcoders_loctree"]),
     ];
@@ -410,7 +410,7 @@ fn index_status_routes_through_index_canonical_resolver() {
         "fail-closed error must name the ambiguity:\n{bare_message}"
     );
     assert!(
-        bare_message.contains("Sampleorg/Loctree") && bare_message.contains("Vetcoders/Loctree"),
+        bare_message.contains("Sampleorg/Loctree") && bare_message.contains("vetcoders/Loctree"),
         "fail-closed error must list both candidates:\n{bare_message}"
     );
 
@@ -514,7 +514,7 @@ fn index_status_json_payload_is_always_array_for_single_scope() {
 fn index_status_json_payload_is_array_for_multiple_scopes() {
     let reports = vec![
         (
-            Some("Vetcoders/aicx".to_string()),
+            Some("vetcoders/aicx".to_string()),
             dummy_index_status("vetcoders_aicx"),
         ),
         (
@@ -528,7 +528,7 @@ fn index_status_json_payload_is_array_for_multiple_scopes() {
         .expect("multi-scope index status JSON must use the same envelope");
 
     assert_eq!(items.len(), 2);
-    assert_eq!(items[0]["project"], "Vetcoders/aicx");
+    assert_eq!(items[0]["project"], "vetcoders/aicx");
     assert_eq!(items[1]["project"], "Loctree/loctree-suite");
     assert_eq!(items[0]["status"]["project_bucket"], "vetcoders_aicx");
     assert_eq!(
@@ -2110,7 +2110,7 @@ fn read_command_parses_discover_path_and_json_mode() {
     let cli = Cli::try_parse_from([
         "aicx",
         "read",
-        "store/Vetcoders/aicx/2026_0502/reports/codex/chunk.md",
+        "store/vetcoders/aicx/2026_0502/reports/codex/chunk.md",
         "--max-chars",
         "400",
         "--json",
@@ -2125,7 +2125,7 @@ fn read_command_parses_discover_path_and_json_mode() {
         }) => {
             assert_eq!(
                 reference,
-                "store/Vetcoders/aicx/2026_0502/reports/codex/chunk.md"
+                "store/vetcoders/aicx/2026_0502/reports/codex/chunk.md"
             );
             assert_eq!(max_chars, Some(400));
             assert!(json);
@@ -3077,11 +3077,11 @@ fn test_pipeline_redacts_once_before_dedup() {
     let kept = dedup_segments_per_repo(vec![seg], &mut state, false, |_| {});
     assert_eq!(kept.iter().map(|s| s.entries.len()).sum::<usize>(), 1);
     assert!(
-        !state.is_new("Vetcoders/aicx", &hash_redacted),
+        !state.is_new("vetcoders/aicx", &hash_redacted),
         "post-redact hash must be in seen_hashes after dedup"
     );
     assert!(
-        state.is_new("Vetcoders/aicx", &hash_raw),
+        state.is_new("vetcoders/aicx", &hash_raw),
         "pre-redact hash must NOT appear in seen_hashes — proves redaction ran before dedup"
     );
 }
@@ -3137,7 +3137,7 @@ fn test_dedup_keyed_per_canonical_repo() {
         &entry_a.message,
     );
     assert!(
-        !state.is_new("Vetcoders/repo-a", &hash),
+        !state.is_new("vetcoders/repo-a", &hash),
         "hash must be marked under repo-a's bucket"
     );
     // Different timestamps → different exact hashes. Just verify the
@@ -3148,7 +3148,7 @@ fn test_dedup_keyed_per_canonical_repo() {
         &entry_b.message,
     );
     assert!(
-        !state.is_new("Vetcoders/repo-b", &hash_b),
+        !state.is_new("vetcoders/repo-b", &hash_b),
         "hash must be marked under repo-b's bucket"
     );
 
@@ -3191,7 +3191,7 @@ fn test_dedup_keyed_per_canonical_repo() {
 fn test_full_rescan_dedups_across_segments_within_same_repo() {
     // Same content, same timestamp, same agent — both entries
     // produce identical `content_hash` and `overlap_hash`. The
-    // segments share a canonical repo (Vetcoders/repo-a) but live
+    // segments share a canonical repo (vetcoders/repo-a) but live
     // in distinct sessions (the realistic shape: one repo touched
     // by several Claude sessions over time).
     let dup_message = "echo across sessions";
