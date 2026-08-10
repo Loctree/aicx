@@ -617,8 +617,48 @@ fn generation_dir_name(generation_id: &str) -> String {
 /// Atomically flip the `CURRENT` pointer to `generation_dir`. This is the
 /// publish step: everything inside the generation directory — payloads first,
 /// manifest last — is already durable before the pointer rename lands.
+///
+/// Downgrade gate: flipping CURRENT to a generation whose lexical schema is
+/// provably older than the currently published one (or older than what this
+/// binary writes) is refused with a typed conflict naming the incoming
+/// writer. A mis-synced machine-local index dir thus surfaces as an explicit
+/// error instead of silently corrupting search.
 fn publish_hybrid_generation(hybrid_root: &Path, generation_dir: &Path) -> Result<()> {
     use std::io::Write;
+
+    let incoming_manifest_path = generation_dir.join("manifest.json");
+    let incoming =
+        aicx_retrieve::Manifest::read_from_path(&incoming_manifest_path).with_context(|| {
+            format!(
+                "refusing to publish a generation without a readable manifest: {}",
+                incoming_manifest_path.display()
+            )
+        })?;
+    incoming
+        .ensure_lexical_schema_supported(aicx_retrieve::TANTIVY_SCHEMA_VERSION)
+        .map_err(|err| anyhow::anyhow!(err))
+        .context("refusing to publish a generation with drifted lexical schema")?;
+
+    let published_dir = resolve_hybrid_generation_dir(hybrid_root);
+    if published_dir != *generation_dir {
+        let published_manifest_path = published_dir.join("manifest.json");
+        if let Ok(published) = aicx_retrieve::Manifest::read_from_path(&published_manifest_path)
+            && let (Some(incoming_generation), Some(published_generation)) = (
+                aicx_retrieve::lexical_schema_generation(&incoming.lexical_commit_id),
+                aicx_retrieve::lexical_schema_generation(&published.lexical_commit_id),
+            )
+            && incoming_generation < published_generation
+        {
+            return Err(anyhow::anyhow!(
+                aicx_retrieve::RetrieveError::LexicalSchemaDowngrade {
+                    current: published.lexical_commit_id.clone(),
+                    incoming: incoming.lexical_commit_id.clone(),
+                    writer: incoming.writer_label(),
+                }
+            ))
+            .context("refusing to downgrade the published CURRENT generation");
+        }
+    }
 
     let name = generation_dir
         .file_name()
@@ -734,6 +774,8 @@ pub fn publish_source_lexical_generation(
     let manifest = Manifest {
         schema_version: "2.0".to_string(),
         generation_id: Manifest::fresh_generation_id(),
+        writer_version: env!("CARGO_PKG_VERSION").to_string(),
+        build_id: crate::BUILD_VERSION.to_string(),
         source_chunk_count: chunks.len(),
         source_hash_blake3: aicx_retrieve::source_hash_blake3(source_fingerprint),
         embedder_model: "optional".to_string(),
@@ -818,6 +860,7 @@ pub fn publish_source_hybrid_generation(
         generation_dir.clone(),
         fingerprint.clone(),
     );
+    hybrid.set_writer_identity(env!("CARGO_PKG_VERSION"), crate::BUILD_VERSION);
     hybrid.build_hybrid(chunks, dense_chunks, source_fingerprint)?;
     let manifest = hybrid.commit()?.clone();
     publish_hybrid_generation(&hybrid_root, &generation_dir)?;
@@ -1943,6 +1986,8 @@ fn incremental_materialize_hybrid(
     let refreshed = Manifest {
         schema_version: manifest.schema_version,
         generation_id: Manifest::fresh_generation_id(),
+        writer_version: env!("CARGO_PKG_VERSION").to_string(),
+        build_id: crate::BUILD_VERSION.to_string(),
         source_chunk_count,
         source_hash_blake3: aicx_retrieve::source_hash_blake3(source_hash),
         embedder_model: fingerprint.model,
