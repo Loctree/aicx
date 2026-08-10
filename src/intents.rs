@@ -18,7 +18,7 @@ use crate::chunker::{
 use crate::extraction::{IntentLineModality, intent_line_modality, is_harness_injected_noise};
 use crate::legacy_archive;
 use crate::sanitize;
-use crate::timeline::FrameKind;
+use crate::timeline::{FrameKind, TimelineEntry};
 use crate::types::{EntryState, EntryType, IntentEntry, Link, LinkType};
 
 mod display;
@@ -60,6 +60,9 @@ const CARD_HEADER_READ_LIMIT: u64 = 64 * 1024;
 pub const CATALOG_IDENTITY_SOURCE: &str = "catalog-v1";
 pub const PERSISTED_IDENTITY_SOURCE: &str = "project-bucket-v1";
 pub const PATH_HEURISTIC_IDENTITY_SOURCE: &str = "path-heuristic";
+/// Sessions admitted straight from a live source-root scan (hot window),
+/// bypassing the durable catalog census that has not admitted them yet.
+pub const LIVE_SCAN_IDENTITY_SOURCE: &str = "live-scan-v1";
 
 pub fn extract_intents(config: &IntentsConfig) -> Result<Vec<IntentRecord>> {
     Ok(extract_intents_with_stats(config)?.records)
@@ -98,11 +101,12 @@ pub(crate) fn extract_intents_from_root_at_with_stats(
         let cutoff_hours = config.hours.min(i64::MAX as u64) as i64;
         now - Duration::hours(cutoff_hours)
     };
-    let (files, source_errors, corpus_identity_source) = collect_intent_files(
+    let (files, source_errors, corpus_identity_source, live_sessions) = collect_intent_files(
         aicx_home,
         &config.project,
         cutoff,
         config.effective_frame_kind(),
+        config.live,
     )?;
     let scanned_count = files.len();
     let source_paths_verified = source_errors == 0 && verify_stored_chunk_paths(&files);
@@ -216,6 +220,7 @@ pub(crate) fn extract_intents_from_root_at_with_stats(
         matched_project_buckets,
         identity_source,
         path_heuristic_records,
+        live_sessions,
     };
 
     Ok(IntentExtraction { records, stats })
@@ -240,6 +245,7 @@ pub(crate) fn extract_intents_from_root_at_for_projects_with_stats(
     let mut matched_project_buckets = BTreeSet::new();
     let mut identity_source = PERSISTED_IDENTITY_SOURCE.to_string();
     let mut path_heuristic_records = 0usize;
+    let mut live_sessions = 0usize;
 
     for project in projects {
         let mut scoped = config.clone();
@@ -252,6 +258,7 @@ pub(crate) fn extract_intents_from_root_at_for_projects_with_stats(
         dropped_task_events += extraction.stats.dropped_task_events;
         matched_project_buckets.extend(extraction.stats.matched_project_buckets);
         path_heuristic_records += extraction.stats.path_heuristic_records;
+        live_sessions += extraction.stats.live_sessions;
         if extraction.stats.identity_source == PATH_HEURISTIC_IDENTITY_SOURCE {
             identity_source = PATH_HEURISTIC_IDENTITY_SOURCE.to_string();
         } else if extraction.stats.identity_source == CATALOG_IDENTITY_SOURCE
@@ -276,6 +283,7 @@ pub(crate) fn extract_intents_from_root_at_for_projects_with_stats(
         matched_project_buckets: matched_project_buckets.into_iter().collect(),
         identity_source,
         path_heuristic_records,
+        live_sessions,
     };
 
     Ok(IntentExtraction { records, stats })
@@ -347,18 +355,27 @@ fn collect_intent_files(
     project: &str,
     cutoff: DateTime<Utc>,
     frame_kind: FrameKind,
-) -> Result<(Vec<StoredChunkFile>, usize, &'static str)> {
+    live: bool,
+) -> Result<(Vec<StoredChunkFile>, usize, &'static str, usize)> {
     let entries = crate::catalog::read_entries_at(aicx_home)?;
     if entries.is_empty() {
         return Ok((
             collect_legacy_chunk_files(aicx_home, project, cutoff, frame_kind)?,
             0,
             PERSISTED_IDENTITY_SOURCE,
+            0,
         ));
     }
 
     let mut files = Vec::new();
     let mut source_errors = 0usize;
+    let mut live_sessions = 0usize;
+    let mut seen_sessions: BTreeSet<(String, String)> = BTreeSet::new();
+    // Census paths are only ever touched through the operator allowlist —
+    // the same containment contract as read_catalog_signal_at.
+    let allow_user_home = crate::os_user_home().unwrap_or_else(|| aicx_home.to_path_buf());
+    let source_allow =
+        crate::source_path::SourceAllowlist::for_operator(&allow_user_home, aicx_home);
     for entry in entries {
         let Some(identity_project) = entry.project.clone() else {
             continue;
@@ -376,11 +393,26 @@ fn collect_intent_files(
             .date
             .as_deref()
             .and_then(|date| NaiveDate::parse_from_str(date, "%Y-%m-%d").ok());
+        let mut live_row = false;
         if canonical_date.is_some_and(|date| date < cutoff.date_naive()) {
-            continue;
+            if !live {
+                continue;
+            }
+            // Hot window: the census date predates the cutoff, but the file
+            // may still be receiving appends. One allowlist-resolved stat
+            // decides — the live mtime outranks the rebuild-time date.
+            let hot = source_allow
+                .resolve_file(entry.source_path.as_str())
+                .ok()
+                .and_then(|path| crate::catalog::live_source_fingerprint(&path))
+                .is_some_and(|(_, mtime_ns)| mtime_ns_within_window(mtime_ns, cutoff));
+            if !hot {
+                continue;
+            }
+            live_row = true;
         }
 
-        let (source_path, frames) =
+        let (source_path, mut frames) =
             match crate::source_index::read_catalog_signal_at(aicx_home, &entry, frame_kind) {
                 Ok(result) => result,
                 Err(error) => {
@@ -392,6 +424,7 @@ fn collect_intent_files(
                     continue;
                 }
             };
+        retain_frames_for_project(&mut frames, &identity_project);
         if frames.is_empty() {
             continue;
         }
@@ -413,6 +446,10 @@ fn collect_intent_files(
                 lines: frame.message.lines().map(str::to_string).collect(),
             })
             .collect();
+        seen_sessions.insert((entry.agent.clone(), entry.session_id.clone()));
+        if live_row {
+            live_sessions += 1;
+        }
         files.push(StoredChunkFile {
             agent: entry.agent,
             date,
@@ -422,9 +459,25 @@ fn collect_intent_files(
             sequence: 0,
             timestamp,
             session_id: entry.session_id,
-            honesty: crate::oracle::ClaimHonesty::canonical(),
+            honesty: if live_row {
+                crate::oracle::ClaimHonesty::live_open()
+            } else {
+                crate::oracle::ClaimHonesty::canonical()
+            },
             transcript_entries: Some(transcript_entries),
         });
+    }
+
+    if live {
+        live_sessions += collect_live_unadmitted_files(
+            aicx_home,
+            project,
+            cutoff,
+            frame_kind,
+            &seen_sessions,
+            &mut files,
+            &mut source_errors,
+        )?;
     }
 
     files.sort_by(|left, right| {
@@ -432,7 +485,128 @@ fn collect_intent_files(
             .cmp(&right.timestamp)
             .then_with(|| left.path.cmp(&right.path))
     });
-    Ok((files, source_errors, CATALOG_IDENTITY_SOURCE))
+    Ok((files, source_errors, CATALOG_IDENTITY_SOURCE, live_sessions))
+}
+
+/// Admit sessions the durable catalog census does not know yet (P0 live
+/// window): scan live source roots, keep entries inside the mtime window and
+/// project filter, parse them through the same catalog-source reader, and
+/// stamp records with the `open_session` honesty frame.
+#[cfg(feature = "app")]
+#[allow(clippy::too_many_arguments)]
+fn collect_live_unadmitted_files(
+    aicx_home: &Path,
+    project: &str,
+    cutoff: DateTime<Utc>,
+    frame_kind: FrameKind,
+    seen_sessions: &BTreeSet<(String, String)>,
+    files: &mut Vec<StoredChunkFile>,
+    source_errors: &mut usize,
+) -> Result<usize> {
+    let user_home = crate::os_user_home().unwrap_or_else(|| aicx_home.to_path_buf());
+    let cutoff_unix_ns = cutoff
+        .timestamp_nanos_opt()
+        .map(|nanos| nanos.max(0) as u128)
+        .unwrap_or(0);
+    let delta = crate::catalog::live_delta(aicx_home, &user_home, cutoff_unix_ns)?;
+    let mut admitted = 0usize;
+    for entry in delta.unadmitted {
+        if seen_sessions.contains(&(entry.agent.clone(), entry.session_id.clone())) {
+            continue;
+        }
+        // Live scan only serves the hot window: skip anything whose source
+        // mtime is older than the cutoff (or unreadable — the census will
+        // pick it up at next rebuild).
+        if !entry
+            .source_mtime_ns
+            .is_some_and(|mtime_ns| mtime_ns_within_window(mtime_ns, cutoff))
+        {
+            continue;
+        }
+        let Some(identity_project) = entry.project.clone() else {
+            // Fail-closed identity: an unattributed live session cannot be
+            // proven to belong to the requested project. Never guess.
+            continue;
+        };
+        let (organization, repository) = identity_project
+            .split_once('/')
+            .unwrap_or(("", identity_project.as_str()));
+        if !project.trim().is_empty()
+            && !legacy_archive::project_filter_matches(organization, repository, project)
+        {
+            continue;
+        }
+        let (source_path, mut frames) =
+            match crate::source_index::read_catalog_signal_at(aicx_home, &entry, frame_kind) {
+                Ok(result) => result,
+                Err(error) => {
+                    *source_errors += 1;
+                    crate::diagnostics::log_describe(&format!(
+                        "intents_live_source_skip agent={} session_id={} path={} error={error:#}",
+                        entry.agent, entry.session_id, entry.source_path
+                    ));
+                    continue;
+                }
+            };
+        retain_frames_for_project(&mut frames, &identity_project);
+        if frames.is_empty() {
+            continue;
+        }
+        let timestamp = frames
+            .last()
+            .map(|frame| frame.timestamp)
+            .expect("non-empty frames have a last timestamp");
+        let date = entry
+            .date
+            .clone()
+            .unwrap_or_else(|| timestamp.format("%Y-%m-%d").to_string());
+        let transcript_entries = frames
+            .into_iter()
+            .map(|frame| TranscriptEntry {
+                role: frame.role,
+                lines: frame.message.lines().map(str::to_string).collect(),
+            })
+            .collect();
+        admitted += 1;
+        files.push(StoredChunkFile {
+            agent: entry.agent,
+            date,
+            path: source_path,
+            project: identity_project,
+            identity_source: LIVE_SCAN_IDENTITY_SOURCE.to_string(),
+            sequence: 0,
+            timestamp,
+            session_id: entry.session_id,
+            honesty: crate::oracle::ClaimHonesty::live_open(),
+            transcript_entries: Some(transcript_entries),
+        });
+    }
+    Ok(admitted)
+}
+
+/// Keep per-frame checkout truth ahead of a session's start-directory label.
+///
+/// Agents can `cd` into another repository without starting a new session.
+/// Frames that carry an explicit cwd must therefore prove they still belong
+/// to the requested canonical bucket. Older sources without per-frame cwd
+/// retain the catalog attribution instead of being silently discarded.
+#[cfg(feature = "app")]
+fn retain_frames_for_project(frames: &mut Vec<TimelineEntry>, project: &str) {
+    let filters = [project.to_string()];
+    frames.retain(|frame| {
+        frame
+            .cwd
+            .as_deref()
+            .is_none_or(|cwd| crate::extraction::project_filter_matches_path(cwd, &filters))
+    });
+}
+
+/// True when a unix-nanosecond mtime falls at or after the window cutoff.
+#[cfg(feature = "app")]
+fn mtime_ns_within_window(mtime_ns: u64, cutoff: DateTime<Utc>) -> bool {
+    let secs = (mtime_ns / 1_000_000_000) as i64;
+    let nanos = (mtime_ns % 1_000_000_000) as u32;
+    DateTime::<Utc>::from_timestamp(secs, nanos).is_some_and(|mtime| mtime >= cutoff)
 }
 
 #[cfg(not(feature = "app"))]
@@ -441,7 +615,8 @@ fn collect_intent_files(
     project: &str,
     cutoff: DateTime<Utc>,
     frame_kind: FrameKind,
-) -> Result<(Vec<StoredChunkFile>, usize, &'static str)> {
+    _live: bool,
+) -> Result<(Vec<StoredChunkFile>, usize, &'static str, usize)> {
     // `loctree-consumer` is the legacy read-core profile: it deliberately
     // excludes app-only source discovery and catalog parsing. Keep pure intent
     // extraction available over explicitly supplied legacy artifacts without
@@ -450,6 +625,7 @@ fn collect_intent_files(
         collect_legacy_chunk_files(aicx_home, project, cutoff, frame_kind)?,
         0,
         PERSISTED_IDENTITY_SOURCE,
+        0,
     ))
 }
 

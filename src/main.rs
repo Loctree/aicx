@@ -390,6 +390,10 @@ enum SessionsCommand {
         /// Output format: table | json.
         #[arg(long, default_value = "table")]
         format: String,
+
+        /// Alias for `--format json` (vc-frame / plugin assimilation).
+        #[arg(short = 'j', long)]
+        json: bool,
     },
 
     /// Show one session's metadata, located by id (or a unique prefix).
@@ -400,6 +404,10 @@ enum SessionsCommand {
         /// Output format: markdown | json.
         #[arg(long, default_value = "markdown")]
         format: String,
+
+        /// Alias for `--format json` (vc-frame / plugin assimilation).
+        #[arg(short = 'j', long)]
+        json: bool,
     },
 
     /// Unified truth report for one session: human intents (Lane 1), agent
@@ -857,9 +865,56 @@ struct SearchQualityEvalArgs {
 }
 
 #[derive(Debug, Subcommand)]
+enum ContinuityAction {
+    /// Render the continuity pack to stdout.
+    Show {
+        /// Catalog project filters (union). Fail-closed identity: bare or
+        /// unknown names error with candidates instead of returning silence.
+        #[arg(short, long, value_delimiter = ',')]
+        project: Vec<String>,
+        /// Window in hours.
+        #[arg(short = 'H', long, default_value = "24")]
+        hours: u64,
+        /// Bound the output to a prompt-inject budget (~6k tokens).
+        #[arg(long)]
+        for_inject: bool,
+        /// Skip the bounded catalog hot refresh performed before rendering.
+        #[arg(long)]
+        no_refresh: bool,
+    },
+    /// Write the continuity pack to a file.
+    Write {
+        /// Catalog project filters (union).
+        #[arg(short, long, value_delimiter = ',')]
+        project: Vec<String>,
+        /// Window in hours.
+        #[arg(short = 'H', long, default_value = "24")]
+        hours: u64,
+        /// Output path.
+        #[arg(short, long, default_value = "CONTINUITY.md")]
+        output: PathBuf,
+        /// Skip the bounded catalog hot refresh performed before rendering.
+        #[arg(long)]
+        no_refresh: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum CatalogAction {
     /// Walk all source roots and rewrite `~/.aicx/catalog/sessions.jsonl`.
     Rebuild {
+        /// Emit JSON report to stdout.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Admit new or changed sessions from a bounded hot window.
+    ///
+    /// Requires one prior full rebuild; never turns a partial window into the
+    /// initial durable census.
+    Refresh {
+        /// Window in hours.
+        #[arg(short = 'H', long, default_value = "48", value_parser = clap::value_parser!(u64).range(1..=720))]
+        hours: u64,
         /// Emit JSON report to stdout.
         #[arg(long)]
         json: bool,
@@ -1337,11 +1392,31 @@ enum Commands {
     },
 
     /// Interactive daily-driver entrypoint for catalog, extracts, index, and doctor.
+    ///
+    /// Start directly in Search for vc-frame / plugin assimilation:
+    /// `aicx wizard --view search --query "…" [--project p] [--agent a]`.
+    /// Missing index is a banner inside the TUI — never a stdin prompt.
     #[command(display_order = 9)]
     Wizard {
         /// Render one frame and exit; used by automated smoke tests.
         #[arg(long, hide = true)]
         smoke_test: bool,
+
+        /// Open a specific screen: corpus | doctor | intents | rebuild | search
+        #[arg(long, value_name = "VIEW")]
+        view: Option<String>,
+
+        /// Initial search query when `--view search` (or global prefill for Search)
+        #[arg(long, value_name = "QUERY")]
+        query: Option<String>,
+
+        /// Optional project filter for Search/Intents entry (exact, fail-closed)
+        #[arg(long, short = 'p', value_name = "PROJECT")]
+        project: Option<String>,
+
+        /// Optional agent filter for Search/Intents entry
+        #[arg(long, short = 'a', value_name = "AGENT")]
+        agent: Option<String>,
     },
 
     /// List recent extract/catalog inventory under ~/.aicx/.
@@ -1455,6 +1530,23 @@ enum Commands {
         /// Filter by kind: decision, intent, outcome, task
         #[arg(long, value_parser = ["decision", "intent", "outcome", "task"])]
         kind: Option<String>,
+
+        /// Force the live source-root scan regardless of the window size.
+        /// (Windows of ≤ 48h scan live sources automatically.)
+        #[arg(long, conflicts_with = "no_live")]
+        live: bool,
+
+        /// Disable the automatic live scan for hot (≤ 48h) windows.
+        #[arg(long)]
+        no_live: bool,
+    },
+
+    /// Multi-agent continuity pack: NOW / PEERS / DECISIONS / TASKS /
+    /// SOURCES / INDEX HEALTH for a project window. Live parse first,
+    /// census second — never blocked on the embedder.
+    Continuity {
+        #[command(subcommand)]
+        action: ContinuityAction,
     },
 
     /// Print recent intents/chunks (snapshot mode); add --follow to stream new arrivals.
@@ -1662,8 +1754,8 @@ enum Commands {
         action: EvalAction,
     },
 
-    /// Build the source-driven lexical index. Use `--dry-run` to preview
-    /// parsing and filtering without writing extracts or publishing CURRENT.
+    /// Build the source-driven lexical index (default) or opt-in dense CURRENT
+    /// with `--semantic`. Use `--dry-run` to preview lexical parsing only.
     ///
     /// Default behaviour is incremental by catalog snapshot: when the catalog
     /// is unchanged, AICX reuses CURRENT without parsing session bodies. Run
@@ -1671,8 +1763,7 @@ enum Commands {
     /// index run parses that snapshot, filters tool/internal/system noise, and
     /// atomically publishes a fresh Tantivy generation. With no `-p`, this is
     /// the `_all` index used by both global search and project-scoped
-    /// `search -p` queries. Dense vectors are optional and are not built by
-    /// this command.
+    /// `search -p` queries. Dense vectors require `--semantic` on an owner host.
     #[command(display_order = 14)]
     Index {
         #[command(subcommand)]
@@ -1702,7 +1793,7 @@ enum Commands {
         json: bool,
 
         /// Preview only. Omit this flag to materialize the persistent
-        /// semantic index used by `aicx search`.
+        /// lexical CURRENT used by `aicx search`. Incompatible with `--semantic`.
         #[arg(
             long,
             default_value_t = false,
@@ -1722,6 +1813,12 @@ enum Commands {
         /// Tantivy (zero filesystem content duplication).
         #[arg(long)]
         cache_extracts: bool,
+
+        /// Opt-in dense semantic generation: embed session extracts and publish
+        /// `dense.exact_mmap_v1.bin` beside Tantivy in CURRENT. Prefer one
+        /// workstation owner; laptops stay on plain `aicx index`.
+        #[arg(long)]
+        semantic: bool,
     },
 
     /// Manage `$HOME/.aicx/config.toml` for embedders and endpoints.
@@ -2481,6 +2578,9 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
             CatalogAction::Rebuild { json } => {
                 run_catalog_rebuild(json)?;
             }
+            CatalogAction::Refresh { hours, json } => {
+                run_catalog_refresh(hours, json)?;
+            }
             CatalogAction::Status { json } => {
                 run_catalog_status(json)?;
             }
@@ -2612,11 +2712,41 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
             max,
             format,
         }) => run_clarify(&session, agent, hours, repo, max, &format)?,
-        Some(Commands::Wizard { smoke_test }) => {
+        Some(Commands::Wizard {
+            smoke_test,
+            view,
+            query,
+            mut project,
+            agent,
+        }) => {
             if smoke_test {
                 aicx::wizard::smoke_test()?;
             } else {
-                aicx::wizard::run()?;
+                run_catalog_refresh(168, false)?;
+                if project.is_none() {
+                    project = Some(current_checkout_project()?);
+                }
+                if let Some(filter) = project.as_ref() {
+                    let resolution = resolve_intents_project_filters(
+                        std::slice::from_ref(filter),
+                        project_match,
+                    )?;
+                    project = resolution.selected.into_iter().next();
+                }
+                let view = match view.as_deref() {
+                    None => None,
+                    Some(name) => Some(aicx::wizard::Screen::parse(name).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "unknown wizard --view `{name}`; expected corpus|doctor|intents|refresh|search"
+                        )
+                    })?),
+                };
+                aicx::wizard::run_with_launch(aicx::wizard::WizardLaunch {
+                    view,
+                    query,
+                    project,
+                    agent,
+                })?;
             }
         }
         Some(Commands::Init { .. }) => {
@@ -2683,7 +2813,10 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
             strict,
             min_confidence,
             kind,
+            live,
+            no_live,
         }) => {
+            let live_mode = live || (intents::IntentsConfig::auto_live(hours) && !no_live);
             run_intents(
                 &project,
                 hours,
@@ -2698,7 +2831,49 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
                     unresolved_mode: unresolved_mode.into(),
                     collapse_session,
                 },
+                live_mode,
             )?;
+        }
+        Some(Commands::Continuity { action }) => {
+            let (projects, hours, for_inject, output, no_refresh) = match action {
+                ContinuityAction::Show {
+                    project,
+                    hours,
+                    for_inject,
+                    no_refresh,
+                } => (project, hours, for_inject, None, no_refresh),
+                ContinuityAction::Write {
+                    project,
+                    hours,
+                    output,
+                    no_refresh,
+                } => (project, hours, false, Some(output), no_refresh),
+            };
+            let projects = if projects.is_empty() {
+                vec![current_checkout_project()?]
+            } else {
+                projects
+            };
+            if !no_refresh {
+                run_catalog_refresh(hours.clamp(48, 720), false)?;
+            }
+            let resolution = resolve_intents_project_filters(&projects, project_match)?;
+            let aicx_home = aicx::aicx_home::ensure()?;
+            let pack = aicx::continuity::build(&aicx_home, &resolution.selected, hours)?;
+            let rendered = aicx::continuity::render(&pack, for_inject);
+            match output {
+                Some(path) => {
+                    std::fs::write(&path, &rendered)
+                        .with_context(|| format!("write continuity pack {}", path.display()))?;
+                    eprintln!(
+                        "continuity pack written: {} ({} bytes, {} live session(s))",
+                        path.display(),
+                        rendered.len(),
+                        pack.live_sessions
+                    );
+                }
+                None => print!("{rendered}"),
+            }
         }
         Some(Commands::Tail {
             project,
@@ -2790,6 +2965,7 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
             dry_run,
             full_rescan,
             cache_extracts,
+            semantic,
         }) => match action {
             Some(IndexAction::Status { project, json }) => {
                 run_index_status(&project, json)?;
@@ -2803,9 +2979,21 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
             }
             None => {
                 if !dry_run {
-                    warn_pending_mutation("index");
+                    warn_pending_mutation(if semantic {
+                        "index --semantic"
+                    } else {
+                        "index"
+                    });
                 }
-                run_index(&project, sample, json, dry_run, full_rescan, cache_extracts)?
+                run_index(
+                    &project,
+                    sample,
+                    json,
+                    dry_run,
+                    full_rescan,
+                    cache_extracts,
+                    semantic,
+                )?
             }
         },
         Some(Commands::Config { action }) => {
@@ -3510,8 +3698,19 @@ fn run_sessions_command(command: SessionsCommand) -> Result<()> {
             all,
             limit,
             format,
-        } => run_sessions_list(cwd, agent, since, all, limit, &format),
-        SessionsCommand::Show { session_id, format } => run_session_show(session_id, &format),
+            json,
+        } => {
+            let format = if json { "json".to_string() } else { format };
+            run_sessions_list(cwd, agent, since, all, limit, &format)
+        }
+        SessionsCommand::Show {
+            session_id,
+            format,
+            json,
+        } => {
+            let format = if json { "json".to_string() } else { format };
+            run_session_show(session_id, &format)
+        }
         SessionsCommand::Report {
             session_id,
             agent,
@@ -4240,9 +4439,40 @@ fn resolve_intents_project_filters_at(
         });
     }
     let corpus = legacy_archive::project_identities_for_search_at(aicx_home)?;
-    Ok(legacy_archive::require_project_resolution(
-        projects, &corpus, match_mode,
-    )?)
+    let mut resolution = legacy_archive::require_project_resolution(projects, &corpus, match_mode)?;
+    let mut seen = BTreeSet::new();
+    resolution
+        .selected
+        .retain(|project| seen.insert(project.to_ascii_lowercase()));
+    Ok(resolution)
+}
+
+/// Resolve the operator's current checkout to the canonical owner/repo bucket.
+///
+/// This is intentionally a CLI-entry concern, not historical attribution:
+/// persisted sessions keep their catalog identity, while an interactive
+/// `continuity`/`wizard` invocation may use the live checkout to choose which
+/// already-persisted bucket to query.
+fn current_checkout_project() -> Result<String> {
+    let cwd = std::env::current_dir().context("resolve current checkout directory")?;
+    let output = ProcessCommand::new("git")
+        .arg("-C")
+        .arg(&cwd)
+        .args(["remote", "get-url", "origin"])
+        .output()
+        .with_context(|| format!("read git origin from {}", cwd.display()))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "cannot infer exact continuity project: current checkout has no readable `origin`; pass `-p owner/repo`"
+        );
+    }
+    let remote = String::from_utf8_lossy(&output.stdout);
+    aicx::catalog::project_slug_from_remote(remote.trim()).ok_or_else(|| {
+        anyhow::anyhow!(
+            "cannot infer owner/repo from git origin `{}`; pass `-p owner/repo`",
+            remote.trim()
+        )
+    })
 }
 
 fn split_slug(slug: &str) -> Option<(&str, &str)> {
@@ -4402,12 +4632,42 @@ fn print_no_intents_message(
     Ok(())
 }
 
+/// Age of the durable catalog census in hours (None when no catalog exists).
+fn catalog_lag_hours() -> Option<f64> {
+    let home = aicx::aicx_home::resolve().ok()?;
+    let mtime = std::fs::metadata(aicx::catalog::sessions_path_for(&home))
+        .ok()?
+        .modified()
+        .ok()?;
+    let age = std::time::SystemTime::now().duration_since(mtime).ok()?;
+    Some(age.as_secs_f64() / 3600.0)
+}
+
+/// P0 live-window report header: never let a hot query masquerade as a pure
+/// census read. Printed on text surfaces only (JSON carries the same truth
+/// inside `completeness.live_sessions`).
+fn print_live_window_header(live_sessions: usize) {
+    println!("live_sessions: {live_sessions}");
+    match catalog_lag_hours() {
+        Some(lag) => println!("index_lag_hours: {lag:.1}"),
+        None => println!("index_lag_hours: unknown (no catalog census)"),
+    }
+    let mode = if live_sessions > 0 {
+        "hybrid_live"
+    } else {
+        "catalog_index (live scan: 0 newer than census)"
+    };
+    println!("mode: {mode}\n");
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_intents(
     projects: &[String],
     hours: u64,
     filters: RetrievalFilters,
     project_match: legacy_archive::ProjectMatchMode,
     display: IntentsDisplayOptions<'_>,
+    live: bool,
 ) -> Result<()> {
     let IntentsDisplayOptions {
         emit,
@@ -4437,7 +4697,14 @@ fn run_intents(
     let effective_projects = project_resolution.selected.clone();
 
     if should_render_intents_pack(&filters, emit, kind, unresolved, collapse_session) {
-        run_intents_pack(&effective_projects, hours, &filters, strict, min_confidence)?;
+        run_intents_pack(
+            &effective_projects,
+            hours,
+            &filters,
+            strict,
+            min_confidence,
+            live,
+        )?;
         return Ok(());
     }
 
@@ -4448,6 +4715,7 @@ fn run_intents(
         min_confidence,
         kind_filter: if unresolved { None } else { kind_filter },
         frame_kind: filters.frame_kind.map(Into::into),
+        live,
     };
 
     let extraction =
@@ -4498,7 +4766,28 @@ fn run_intents(
         records.truncate(limit);
     }
 
+    // P2.8 fail-closed: an empty result served from a census older than half
+    // the requested window, with nothing admitted live, is indistinguishable
+    // from "nothing happened" — and that silence is a lie. Refuse it.
+    if records.is_empty()
+        && hours > 0
+        && extraction.stats.live_sessions == 0
+        && let Some(lag) = catalog_lag_hours()
+        && lag > (hours as f64) / 2.0
+    {
+        anyhow::bail!(
+            "stale_context_engine: 0 records in the last {hours}h, but the catalog census is {lag:.1}h old and the live scan admitted 0 sessions\n\
+             hint: run `aicx catalog rebuild` (then `aicx index`); an empty result from a stale engine is a bug, not \"no intent\""
+        );
+    }
+
     if records.is_empty() && emit != "json" {
+        // Honesty even when empty: a hot window with zero records must show
+        // whether the live scan actually ran and how stale the census is —
+        // "no intents" and "stale engine" are different truths.
+        if live {
+            print_live_window_header(extraction.stats.live_sessions);
+        }
         let unresolved_note = (unresolved
             && unresolved_mode == aicx::intents::UnresolvedMode::Session
             && post_kind == Some(intents::IntentKind::Intent))
@@ -4549,6 +4838,9 @@ fn run_intents(
             println!("{}", json);
         }
         _ => {
+            if live {
+                print_live_window_header(extraction.stats.live_sessions);
+            }
             let md = intents::format_intents_markdown(&records);
             print!("{}", md);
         }
@@ -4577,10 +4869,11 @@ fn run_intents_pack(
     filters: &RetrievalFilters,
     strict: bool,
     min_confidence: Option<u8>,
+    live: bool,
 ) -> Result<()> {
     let lane_sort = filters.sort.unwrap_or(SortOrder::Newest);
     let lane_limit = filters.limit.or(Some(DEFAULT_INTENTS_PACK_LIMIT));
-    let decisions = extract_intents_pack_lane(
+    let (decisions, live_a) = extract_intents_pack_lane(
         projects,
         hours,
         filters,
@@ -4592,8 +4885,9 @@ fn run_intents_pack(
         false,
         lane_sort,
         lane_limit,
+        live,
     )?;
-    let tasks = extract_intents_pack_lane(
+    let (tasks, live_b) = extract_intents_pack_lane(
         projects,
         hours,
         filters,
@@ -4605,8 +4899,9 @@ fn run_intents_pack(
         false,
         lane_sort,
         lane_limit,
+        live,
     )?;
-    let user_msg = extract_intents_pack_lane(
+    let (user_msg, live_c) = extract_intents_pack_lane(
         projects,
         hours,
         filters,
@@ -4618,8 +4913,9 @@ fn run_intents_pack(
         false,
         lane_sort,
         lane_limit,
+        live,
     )?;
-    let agent_reply = extract_intents_pack_lane(
+    let (agent_reply, live_d) = extract_intents_pack_lane(
         projects,
         hours,
         filters,
@@ -4631,8 +4927,9 @@ fn run_intents_pack(
         false,
         lane_sort,
         lane_limit,
+        live,
     )?;
-    let unresolved = extract_intents_pack_lane(
+    let (unresolved, live_e) = extract_intents_pack_lane(
         projects,
         hours,
         filters,
@@ -4644,7 +4941,13 @@ fn run_intents_pack(
         true,
         lane_sort,
         lane_limit,
+        live,
     )?;
+    // Lanes overlap on the same sessions — the widest lane is the honest count.
+    let live_sessions = live_a.max(live_b).max(live_c).max(live_d).max(live_e);
+    if live {
+        print_live_window_header(live_sessions);
+    }
 
     let sections = vec![
         IntentPackSection {
@@ -4693,7 +4996,8 @@ fn extract_intents_pack_lane(
     unresolved: bool,
     sort: SortOrder,
     limit: Option<usize>,
-) -> Result<Vec<intents::IntentRecord>> {
+    live: bool,
+) -> Result<(Vec<intents::IntentRecord>, usize)> {
     let config = intents::IntentsConfig {
         project: projects.first().cloned().unwrap_or_default(),
         hours,
@@ -4701,6 +5005,7 @@ fn extract_intents_pack_lane(
         min_confidence,
         kind_filter: if unresolved { None } else { kind_filter },
         frame_kind,
+        live,
     };
     let extraction = intents::extract_intents_with_stats_for_projects(&config, projects)?;
     let (date_lo, date_hi) = intent_date_bounds(filters)?;
@@ -4723,7 +5028,7 @@ fn extract_intents_pack_lane(
     if unresolved && let Some(kind) = kind_filter {
         records.retain(|record| record.kind == kind);
     }
-    Ok(records)
+    Ok((records, extraction.stats.live_sessions))
 }
 
 fn intent_date_bounds(filters: &RetrievalFilters) -> Result<(Option<String>, Option<String>)> {
@@ -4917,6 +5222,7 @@ fn run_tail(
                 unresolved_mode: aicx::intents::UnresolvedMode::Session,
                 collapse_session: false,
             },
+            intents::IntentsConfig::auto_live(hours),
         );
     }
 
@@ -4937,6 +5243,7 @@ fn run_tail(
         min_confidence: None,
         kind_filter,
         frame_kind: filters.frame_kind.map(Into::into),
+        live: intents::IntentsConfig::auto_live(hours),
     };
 
     let mut last_seen = std::collections::HashSet::new();
@@ -7135,6 +7442,34 @@ fn render_catalog_progress(
     Ok(())
 }
 
+fn run_catalog_refresh(hours: u64, json: bool) -> Result<()> {
+    let aicx_home = aicx::aicx_home::resolve()?;
+    let user_home = aicx::os_user_home().context("No home dir")?;
+    let cutoff = lookback_cutoff(hours);
+    let cutoff_ns = cutoff
+        .timestamp_nanos_opt()
+        .map(|value| value.max(0) as u128)
+        .unwrap_or(0);
+    let report = aicx::catalog::refresh_hot(&aicx_home, &user_home, cutoff_ns)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+    eprintln!(
+        "aicx catalog refresh · hot={}h · changed={} admitted={} reattributed={} total={} · {} ms",
+        hours,
+        report.changed_sessions,
+        report.admitted_sessions,
+        report.reattributed_sessions,
+        report.total_sessions,
+        report.wall_ms
+    );
+    if let Some(recommendation) = &report.recommendation {
+        eprintln!("  {recommendation}");
+    }
+    Ok(())
+}
+
 fn run_catalog_status(json: bool) -> Result<()> {
     let aicx_home = aicx::aicx_home::resolve()?;
     let user_home = aicx::os_user_home().context("No home dir")?;
@@ -8002,6 +8337,7 @@ fn run_index(
     dry_run: bool,
     full_rescan: bool,
     cache_extracts: bool,
+    semantic: bool,
 ) -> Result<()> {
     let resolved_scopes = resolve_index_scopes(projects)?;
     let filters: Vec<String> = resolved_scopes.into_iter().flatten().collect();
@@ -8013,13 +8349,24 @@ fn run_index(
             aicx::locks::lance_lock_path()?,
         )?)
     };
-    let report =
-        aicx::source_index::build(&aicx_home, &filters, dry_run, full_rescan, cache_extracts)?;
+    let report = aicx::source_index::build(
+        &aicx_home,
+        &filters,
+        dry_run,
+        full_rescan,
+        cache_extracts,
+        semantic,
+    )?;
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
+        let mode = if report.semantic_requested {
+            "index --semantic"
+        } else {
+            "index"
+        };
         eprintln!(
-            "aicx index: {} lexical session document(s) in {} ms{}",
+            "aicx {mode}: {} lexical session document(s) in {} ms{}",
             report.lexical_docs,
             report.wall_ms,
             if report.unchanged {
@@ -8042,8 +8389,19 @@ fn run_index(
             report.raw_frames, report.signal_frames, report.filtered_frames
         );
         eprintln!("  extracts_written: {}", report.extracts_written);
+        eprintln!(
+            "  dense: kind={} docs={}",
+            report.dense_kind, report.dense_docs
+        );
         if let Some(path) = &report.manifest_path {
             eprintln!("  manifest: {path}");
+        }
+        if report.semantic_requested && report.dense_docs > 0 {
+            eprintln!("  next: aicx search --deep '<query>' uses dense RRF on this CURRENT");
+        } else if !report.semantic_requested {
+            eprintln!(
+                "  note: dense not built (feature). Opt in with `aicx index --semantic` on the owner host."
+            );
         }
     }
     Ok(())
@@ -8204,13 +8562,24 @@ fn print_index_status_text(status: &aicx::IndexStatus) {
         match status.readiness {
             aicx::IndexReadiness::Ready => "ready",
             aicx::IndexReadiness::StaleChunks => "stale_chunks (sessions newer than chunks)",
-            aicx::IndexReadiness::StaleIndex => "stale_index (chunks pending embedding)",
+            aicx::IndexReadiness::StaleIndex => {
+                "stale_index (catalog sessions not yet in CURRENT lexical)"
+            }
             aicx::IndexReadiness::Pending => "pending (only temp checkpoint)",
             aicx::IndexReadiness::Missing => "missing",
             aicx::IndexReadiness::PendingScanTimeout => "pending_scan_timeout",
         }
     );
     eprintln!("  backend:                {}", status.backend);
+    eprintln!("  lexical_status:         {}", status.lexical_status);
+    eprintln!("  dense_status:           {}", status.dense_status);
+    eprintln!(
+        "  dense_kind/count:       {} / {}",
+        status.dense_kind, status.dense_count
+    );
+    if let Some(rec) = &status.dense_recommendation {
+        eprintln!("  dense_recommendation:   {rec}");
+    }
     eprintln!("  project_bucket:         {}", status.project_bucket);
     eprintln!("  canonical_chunks:       {}", status.canonical_chunks);
     eprintln!(
@@ -8990,13 +9359,35 @@ fn run_dashboard_command(
         ));
     }
 
+    let root = args
+        .aicx_home
+        .clone()
+        .map(Ok)
+        .unwrap_or_else(aicx::aicx_home::ensure)?;
+    if aicx::catalog::sessions_path_for(&root).is_file() {
+        let user_home = aicx::os_user_home().context("No home dir")?;
+        let refresh_hours = args.hours.unwrap_or(168).clamp(48, 720);
+        let cutoff_ns = lookback_cutoff(refresh_hours)
+            .timestamp_nanos_opt()
+            .map(|value| value.max(0) as u128)
+            .unwrap_or(0);
+        let refresh = aicx::catalog::refresh_hot(&root, &user_home, cutoff_ns)?;
+        eprintln!(
+            "dashboard catalog refresh: changed={} admitted={} reattributed={} ({} ms)",
+            refresh.changed_sessions,
+            refresh.admitted_sessions,
+            refresh.reattributed_sessions,
+            refresh.wall_ms
+        );
+    }
+    if args.project.is_none() {
+        args.project = current_checkout_project().ok();
+    }
     if let Some(filter) = args.project.as_ref() {
-        let root = args
-            .aicx_home
-            .clone()
-            .map(Ok)
-            .unwrap_or_else(aicx::aicx_home::ensure)?;
-        let corpus = legacy_archive::project_identities_in_store_at(&root)?;
+        let mut corpus = aicx::catalog::project_identities_from_catalog_at(&root)?;
+        if corpus.is_empty() {
+            corpus = legacy_archive::project_identities_in_store_at(&root)?;
+        }
         let filters = vec![filter.clone()];
         let resolution =
             legacy_archive::require_project_resolution(&filters, &corpus, project_match)?;

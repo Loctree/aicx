@@ -10,13 +10,14 @@ use crossterm::terminal::{
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
-use crate::wizard::{app::App, ui};
+use crate::wizard::app::{App, WizardLaunch};
+use crate::wizard::ui;
 
 type Tui = Terminal<CrosstermBackend<Stdout>>;
 
-pub fn run() -> Result<()> {
+pub fn run_with_launch(launch: WizardLaunch) -> Result<()> {
     let mut terminal = init_terminal()?;
-    let mut app = App::new();
+    let mut app = App::with_launch(launch);
     let result = run_app(&mut terminal, &mut app);
     let restore_result = restore_terminal();
     restore_result?;

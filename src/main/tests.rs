@@ -489,6 +489,11 @@ fn dummy_index_status(bucket: &str) -> aicx::IndexStatus {
         backend: "ndjson".to_string(),
         project_bucket: bucket.to_string(),
         committed_at: Some("2026-05-24T00:01:00Z".to_string()),
+        lexical_status: "ready".to_string(),
+        dense_status: "not_built".to_string(),
+        dense_kind: "optional_not_built".to_string(),
+        dense_count: 0,
+        dense_recommendation: None,
     }
 }
 
@@ -887,6 +892,7 @@ fn intents_project_resolver_exact_and_fuzzy_modes_are_separate() {
         matched_project_buckets: fuzzy.selected.clone(),
         identity_source: intents::PERSISTED_IDENTITY_SOURCE.to_string(),
         path_heuristic_records: 0,
+        live_sessions: 0,
     };
     let complete = stats.completeness(None, 1);
     assert_eq!(
@@ -937,6 +943,7 @@ fn intents_json_envelope_reports_cap_warning_and_limit_saturation() {
             min_confidence: None,
             kind_filter: None,
             frame_kind: None,
+            live: false,
         })
         .expect("extract over-cap intents fixture");
     assert!(extraction.stats.dropped_candidates > 0);
@@ -1677,12 +1684,31 @@ fn index_defaults_to_materialization() {
 
     match cli.command {
         Some(Commands::Index {
-            dry_run, project, ..
+            dry_run,
+            project,
+            semantic,
+            ..
         }) => {
             assert!(!dry_run);
             assert!(project.is_empty());
+            assert!(!semantic);
         }
         _ => panic!("expected index command"),
+    }
+}
+
+#[test]
+fn index_accepts_semantic_flag() {
+    let cli = Cli::try_parse_from(["aicx", "index", "--semantic"])
+        .expect("index --semantic should parse");
+    match cli.command {
+        Some(Commands::Index {
+            semantic, dry_run, ..
+        }) => {
+            assert!(semantic);
+            assert!(!dry_run);
+        }
+        _ => panic!("expected index --semantic"),
     }
 }
 

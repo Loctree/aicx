@@ -61,7 +61,7 @@ impl Default for RebuildScreen {
             running: false,
             log: Vec::new(),
             scroll: 0,
-            status: "catalog rebuild → index (extract-era path)".to_string(),
+            status: "hot catalog refresh → incremental CURRENT index".to_string(),
             hours: 48,
             progress: None,
             rx: None,
@@ -98,22 +98,21 @@ impl RebuildScreen {
         self.running = true;
         self.log.clear();
         self.progress = None;
-        // Card-mill `aicx store` is deleted. Wizard rebuild path is catalog +
-        // source-driven index with optional extract cache (hours is retained
-        // only as a UI hint; catalog rebuild walks live sources fully).
-        self.log.push(
-            "running: aicx catalog rebuild && aicx index --cache-extracts --emit none".to_string(),
-        );
-        self.status = "catalog rebuild + index started".to_string();
+        let hours = self.hours.to_string();
+        self.log.push(format!(
+            "running: aicx catalog refresh -H {} && aicx index --cache-extracts",
+            self.hours
+        ));
+        self.status = "hot refresh + incremental index started".to_string();
 
         let child_slot: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
         self.child = Some(child_slot.clone());
 
         thread::spawn(move || {
-            // Sequential shell-free pipeline: catalog rebuild then index.
+            // Sequential shell-free pipeline: bounded refresh then index.
             // Fail closed if either step fails.
             let catalog = Command::new(&exe)
-                .args(["catalog", "rebuild", "--json"])
+                .args(["catalog", "refresh", "-H", &hours, "--json"])
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .output();
@@ -127,7 +126,7 @@ impl RebuildScreen {
                     }
                     if !out.status.success() {
                         let _ = event_tx.send(RebuildEvent::Line(
-                            "catalog rebuild failed; index not started".to_string(),
+                            "catalog refresh failed; index not started".to_string(),
                         ));
                         let _ = event_tx.send(RebuildEvent::Done(RebuildOutcome::Failed));
                         return;

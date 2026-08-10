@@ -709,8 +709,8 @@ pub fn current_lexical_doc_count() -> Result<Option<usize>> {
 /// Publish one lexical-only CURRENT generation directly from source extracts.
 ///
 /// Dense vectors are intentionally absent: `aicx search` stays lexical-first
-/// and `--deep` fails honestly until an explicit optional dense generation is
-/// built. No embeddings NDJSON or brute-force twin is emitted.
+/// and `--deep` fails honestly until `aicx index --semantic` materializes dense.
+/// No embeddings NDJSON or brute-force twin is emitted.
 pub fn publish_source_lexical_generation(
     chunks: &[aicx_retrieve::ChunkRef],
     source_fingerprint: &str,
@@ -756,6 +756,93 @@ pub fn publish_source_lexical_generation(
     manifest.write_to_path(&generation_dir.join("manifest.json"))?;
     publish_hybrid_generation(&hybrid_root, &generation_dir)?;
     Ok(manifest)
+}
+
+/// Publish CURRENT with lexical Tantivy **and** one dense mmap payload.
+///
+/// Opt-in path for `aicx index --semantic`. Atomic generation: write
+/// generation dir → lexical + dense → manifest last → CURRENT flip.
+pub fn publish_source_hybrid_generation(
+    chunks: &[aicx_retrieve::ChunkRef],
+    dense_chunks: &[aicx_retrieve::DenseChunkRef],
+    source_fingerprint: &str,
+    fingerprint: &aicx_retrieve::EmbedderFingerprint,
+) -> Result<aicx_retrieve::Manifest> {
+    use aicx_retrieve::{
+        HybridIndex, Manifest, MmapDenseAdapter, ReciprocalRankFusion, TantivyAdapter,
+    };
+
+    if chunks.is_empty() {
+        anyhow::bail!("cannot publish an empty source hybrid generation");
+    }
+    if dense_chunks.len() != chunks.len() {
+        anyhow::bail!(
+            "hybrid publish requires one dense vector per lexical chunk (lexical={}, dense={})",
+            chunks.len(),
+            dense_chunks.len()
+        );
+    }
+    if fingerprint.dim == 0 {
+        anyhow::bail!("embedder dimension must be non-zero for --semantic publish");
+    }
+    for (idx, dense) in dense_chunks.iter().enumerate() {
+        if dense.embedding.len() != fingerprint.dim {
+            anyhow::bail!(
+                "dense chunk {idx} dim {} != embedder dim {}",
+                dense.embedding.len(),
+                fingerprint.dim
+            );
+        }
+    }
+
+    let hybrid_root = hybrid_root_dir(None)?;
+    let generation_dir = hybrid_root
+        .join(HYBRID_GENERATIONS_DIR_NAME)
+        .join(generation_dir_name(&Manifest::fresh_generation_id()));
+    std::fs::create_dir_all(&generation_dir)
+        .with_context(|| format!("create generation dir: {}", generation_dir.display()))?;
+
+    let distance = distance_from_label(&fingerprint.distance)?;
+    let lexical = Box::new(TantivyAdapter::new(generation_dir.clone())?);
+    let dense = Box::new(MmapDenseAdapter::create(
+        generation_dir.join(aicx_retrieve::MMAP_DENSE_PAYLOAD_FILE_NAME),
+        fingerprint.dim,
+        distance,
+        aicx_retrieve::source_hash_bytes(source_fingerprint),
+    ));
+    let fusion = Box::new(ReciprocalRankFusion::default());
+    let mut hybrid = HybridIndex::new(
+        lexical,
+        dense,
+        fusion,
+        generation_dir.clone(),
+        fingerprint.clone(),
+    );
+    hybrid.build_hybrid(chunks, dense_chunks, source_fingerprint)?;
+    let manifest = hybrid.commit()?.clone();
+    publish_hybrid_generation(&hybrid_root, &generation_dir)?;
+    Ok(manifest)
+}
+
+/// True when CURRENT is lexical-only (`optional_not_built`) or missing dense mmap.
+pub fn current_dense_not_built() -> Result<bool> {
+    let path = hybrid_manifest_path(None)?;
+    if !path.is_file() {
+        return Ok(true);
+    }
+    let manifest = match aicx_retrieve::Manifest::read_from_path(&path) {
+        Ok(m) => m,
+        Err(_) => return Ok(true),
+    };
+    if manifest.dense_kind == "optional_not_built" || manifest.dense_count == 0 {
+        return Ok(true);
+    }
+    let Some(generation_dir) = path.parent() else {
+        return Ok(true);
+    };
+    Ok(!generation_dir
+        .join(aicx_retrieve::MMAP_DENSE_PAYLOAD_FILE_NAME)
+        .is_file())
 }
 
 pub fn hybrid_manifest_path(project: Option<&str>) -> Result<PathBuf> {
@@ -3094,3 +3181,58 @@ pub fn render_stats_json(stats: &IndexStats) -> Result<String> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod source_hybrid_publish_tests {
+    use super::*;
+    use aicx_retrieve::{ChunkRef, DenseChunkRef, EmbedderFingerprint, MMAP_DENSE_KIND};
+
+    #[test]
+    fn publish_source_hybrid_writes_dense_mmap_and_manifest() {
+        let root = std::env::temp_dir().join(format!(
+            "aicx-hybrid-publish-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("indexed").join("_all").join("hybrid")).unwrap();
+        // Point hybrid_root via AICX_HOME
+        let prev = std::env::var_os("AICX_HOME");
+        // SAFETY: test-only env isolation
+        unsafe { std::env::set_var("AICX_HOME", &root) };
+
+        let chunk = ChunkRef {
+            id: "claude:sess-1".into(),
+            source_path: "/tmp/sess-1.jsonl".into(),
+            text: "hello hybrid semantic publish".into(),
+            metadata: serde_json::json!({"agent": "claude", "project": "Loctree/aicx"}),
+        };
+        let dense = DenseChunkRef {
+            chunk: chunk.clone(),
+            embedding: vec![0.1, 0.2, 0.3, 0.4],
+        };
+        let fp = EmbedderFingerprint::new("test-model", "http://test/embed", 4, "cosine");
+        let manifest =
+            publish_source_hybrid_generation(&[chunk], &[dense], "fp-test-source", &fp).unwrap();
+        assert_eq!(manifest.dense_kind, MMAP_DENSE_KIND);
+        assert_eq!(manifest.dense_count, 1);
+        assert_eq!(manifest.lexical_doc_count, 1);
+        assert_eq!(manifest.embedder_dim, 4);
+        let generation_dir = hybrid_index_dir(None).unwrap();
+        assert!(
+            generation_dir
+                .join(aicx_retrieve::MMAP_DENSE_PAYLOAD_FILE_NAME)
+                .is_file()
+        );
+        assert!(!current_dense_not_built().unwrap());
+
+        match prev {
+            Some(v) => unsafe { std::env::set_var("AICX_HOME", v) },
+            None => unsafe { std::env::remove_var("AICX_HOME") },
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}

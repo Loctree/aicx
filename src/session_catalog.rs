@@ -99,6 +99,15 @@ pub struct ScopedChildIdentity {
     pub parent_id: Option<String>,
 }
 
+/// Result of [`SessionCatalog::scan_hot_window`]: walk-only totals plus fully
+/// probed sources for the fresh (in-window) candidates only.
+#[derive(Debug, Clone)]
+pub struct HotWindowScan {
+    pub total_candidates: usize,
+    pub newest_modified_unix_nanos: Option<u128>,
+    pub fresh_sources: Vec<CatalogSource>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CatalogSource {
     pub agent: AgentKind,
@@ -468,6 +477,29 @@ impl SessionCatalog {
         stats: &mut CatalogIoStats,
     ) -> Result<Vec<CatalogSource>, CatalogError> {
         self.probe_candidates_with_progress(candidates, stats, &mut |_| {})
+    }
+
+    /// Hot-window scan: walk + stat every candidate (cheap), but open bounded
+    /// headers ONLY for candidates whose mtime falls inside the window. The
+    /// full probe pass costs minutes on real roots; a hot query cannot pay it.
+    pub fn scan_hot_window(&self, cutoff_unix_ns: u128) -> Result<HotWindowScan, CatalogError> {
+        let mut stats = CatalogIoStats::default();
+        let candidates = self.collect_candidate_paths(&mut stats)?;
+        let total_candidates = candidates.len();
+        let newest_modified_unix_nanos = candidates
+            .iter()
+            .map(|candidate| candidate.fingerprint.modified_unix_nanos)
+            .max();
+        let fresh: Vec<CandidatePath> = candidates
+            .into_iter()
+            .filter(|candidate| candidate.fingerprint.modified_unix_nanos >= cutoff_unix_ns)
+            .collect();
+        let fresh_sources = self.probe_candidates(&fresh, &mut stats)?;
+        Ok(HotWindowScan {
+            total_candidates,
+            newest_modified_unix_nanos,
+            fresh_sources,
+        })
     }
 
     fn probe_candidates_with_progress(

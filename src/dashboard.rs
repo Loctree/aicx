@@ -1,7 +1,8 @@
-//! AI Contexters dashboard generator.
+//! AICX live-session dashboard generator.
 //!
-//! Builds a static HTML dashboard for daily browsing of raw extracted notes
-//! from the AICX store (`~/.aicx` by default).
+//! Builds a static or served dashboard from the durable catalog, hot live
+//! delta, and clean conversation projection. Residual cards are a fallback
+//! only when no catalog exists.
 //!
 //! Layout: Search -> List -> Content
 //!
@@ -210,7 +211,7 @@ struct ScanResult {
     payload: DashboardPayload,
 }
 
-/// Build a complete HTML dashboard from the read-only legacy archive view.
+/// Build a complete HTML dashboard from current catalog/live truth.
 pub fn build_dashboard(config: &DashboardConfig) -> Result<DashboardArtifact> {
     let scan = scan::scan_legacy_archive(&config.aicx_home, config.preview_chars, &config.scope)?;
     let html = render_dashboard_html(&scan.payload, &config.title)?;
@@ -222,17 +223,14 @@ pub fn build_dashboard(config: &DashboardConfig) -> Result<DashboardArtifact> {
     })
 }
 
-/// Scan the legacy archive and return the raw payload (for server mode).
-pub fn scan_legacy_archive_payload(
-    aicx_home: &Path,
-    preview_chars: usize,
-) -> Result<DashboardPayload> {
+/// Scan current catalog/live truth and return the raw payload (server mode).
+pub fn scan_current_payload(aicx_home: &Path, preview_chars: usize) -> Result<DashboardPayload> {
     let scan = scan::scan_legacy_archive(aicx_home, preview_chars, &DashboardScope::default())?;
     Ok(scan.payload)
 }
 
-/// Scan the legacy archive with an explicit scope and return the raw payload (for server mode).
-pub fn scan_legacy_archive_payload_scoped(
+/// Scan current catalog/live truth with an explicit scope.
+pub fn scan_current_payload_scoped(
     aicx_home: &Path,
     preview_chars: usize,
     scope: &DashboardScope,
@@ -241,10 +239,27 @@ pub fn scan_legacy_archive_payload_scoped(
     Ok(scan.payload)
 }
 
+#[doc(hidden)]
+pub fn scan_legacy_archive_payload(
+    aicx_home: &Path,
+    preview_chars: usize,
+) -> Result<DashboardPayload> {
+    scan_current_payload(aicx_home, preview_chars)
+}
+
+#[doc(hidden)]
+pub fn scan_legacy_archive_payload_scoped(
+    aicx_home: &Path,
+    preview_chars: usize,
+    scope: &DashboardScope,
+) -> Result<DashboardPayload> {
+    scan_current_payload_scoped(aicx_home, preview_chars, scope)
+}
+
 /// Build a static HTML artifact from an already-scanned payload.
 ///
-/// Reuses `payload` instead of scanning the archive again — designed for server
-/// mode where `scan_legacy_archive_payload` has already run.
+/// Reuses `payload` instead of scanning sources again — designed for server
+/// mode where `scan_current_payload` has already run.
 pub fn build_dashboard_from_payload(
     payload: &DashboardPayload,
     title: &str,
