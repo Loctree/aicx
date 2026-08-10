@@ -140,6 +140,7 @@ fn config(project: &str) -> IntentsConfig {
         min_confidence: None,
         kind_filter: None,
         frame_kind: None,
+        live: false,
     }
 }
 

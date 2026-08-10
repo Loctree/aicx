@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
-use crate::legacy_archive::{self, StoredContextFile};
+use crate::legacy_archive;
 use crate::sanitize;
 
 #[derive(Debug, Clone)]
@@ -9,6 +9,15 @@ pub struct CorpusEntry {
     pub label: String,
     pub path: PathBuf,
     pub haystack: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct CorpusItem {
+    pub project: String,
+    pub agent: String,
+    pub date: String,
+    pub kind: String,
+    pub path: PathBuf,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,7 +29,7 @@ pub enum CorpusColumn {
 
 #[derive(Debug)]
 pub struct CorpusScreen {
-    pub all_files: Vec<StoredContextFile>,
+    pub all_files: Vec<CorpusItem>,
     pub entries: Vec<CorpusEntry>,
     pub selected: usize,
     pub column: CorpusColumn,
@@ -30,7 +39,7 @@ pub struct CorpusScreen {
 
 impl CorpusScreen {
     pub fn load() -> Self {
-        match legacy_archive::scan_context_files() {
+        match load_corpus_items() {
             Ok(files) => {
                 let entries = files.iter().map(entry_from_file).collect::<Vec<_>>();
                 let mut screen = Self {
@@ -60,22 +69,18 @@ impl CorpusScreen {
         let mut repos = BTreeSet::new();
         let mut latest = None::<String>;
         for file in &self.all_files {
-            if let Some(repo) = &file.repo {
-                orgs.insert(repo.organization.clone());
-                repos.insert(repo.slug());
-            } else {
-                orgs.insert("non-repository-contexts".to_string());
-                repos.insert(file.project.clone());
-            }
+            let (organization, _) = file.project.split_once('/').unwrap_or(("_", &file.project));
+            orgs.insert(organization.to_string());
+            repos.insert(file.project.clone());
             latest = Some(
                 latest
-                    .map(|current| current.max(file.date_iso.clone()))
-                    .unwrap_or_else(|| file.date_iso.clone()),
+                    .map(|current| current.max(file.date.clone()))
+                    .unwrap_or_else(|| file.date.clone()),
             );
         }
 
         format!(
-            "{} chunks - {} orgs - {} repos - last sync {}",
+            "{} sessions - {} orgs - {} repos - latest {}",
             self.all_files.len(),
             orgs.len(),
             repos.len(),
@@ -88,7 +93,7 @@ impl CorpusScreen {
             return self.status.clone();
         }
         format!(
-            "{} of {} visible chunks{}",
+            "{} of {} visible sessions{}",
             self.selected.saturating_add(1),
             self.entries.len(),
             if self.search.is_empty() {
@@ -103,10 +108,10 @@ impl CorpusScreen {
         let mut values = BTreeSet::new();
         for file in &self.all_files {
             values.insert(
-                file.repo
-                    .as_ref()
-                    .map(|repo| repo.organization.clone())
-                    .unwrap_or_else(|| "non-repository-contexts".to_string()),
+                file.project
+                    .split_once('/')
+                    .map(|(organization, _)| organization.to_string())
+                    .unwrap_or_else(|| "_".to_string()),
             );
         }
         values.into_iter().collect()
@@ -115,12 +120,7 @@ impl CorpusScreen {
     pub fn repos(&self) -> Vec<String> {
         let mut values = BTreeSet::new();
         for file in &self.all_files {
-            values.insert(
-                file.repo
-                    .as_ref()
-                    .map(|repo| repo.slug())
-                    .unwrap_or_else(|| file.project.clone()),
-            );
+            values.insert(file.project.clone());
         }
         values.into_iter().collect()
     }
@@ -167,21 +167,44 @@ impl CorpusScreen {
     }
 }
 
-fn entry_from_file(file: &StoredContextFile) -> CorpusEntry {
-    let repo = file
-        .repo
-        .as_ref()
-        .map(|repo| repo.slug())
-        .unwrap_or_else(|| file.project.clone());
+fn entry_from_file(file: &CorpusItem) -> CorpusEntry {
     let label = format!(
-        "{} / {} / {} / {} / chunk {}",
-        repo, file.date_iso, file.kind, file.agent, file.chunk
+        "{} / {} / {} / {}",
+        file.project, file.date, file.kind, file.agent
     );
     CorpusEntry {
         label: label.clone(),
         path: file.path.clone(),
         haystack: format!("{} {}", label, file.path.display()).to_ascii_lowercase(),
     }
+}
+
+fn load_corpus_items() -> anyhow::Result<Vec<CorpusItem>> {
+    let home = crate::aicx_home::resolve()?;
+    if crate::catalog::sessions_path_for(&home).is_file() {
+        return Ok(crate::catalog::read_entries_at(&home)?
+            .into_iter()
+            .filter_map(|entry| {
+                Some(CorpusItem {
+                    project: entry.project?,
+                    agent: entry.agent,
+                    date: entry.date.unwrap_or_default(),
+                    kind: "session".to_string(),
+                    path: PathBuf::from(entry.source_path),
+                })
+            })
+            .collect());
+    }
+    Ok(legacy_archive::scan_context_files()?
+        .into_iter()
+        .map(|file| CorpusItem {
+            project: file.project,
+            agent: file.agent,
+            date: file.date_iso,
+            kind: file.kind.dir_name().to_string(),
+            path: file.path,
+        })
+        .collect())
 }
 
 #[cfg(test)]

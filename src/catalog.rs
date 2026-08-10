@@ -16,6 +16,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -246,7 +247,7 @@ pub fn project_identities_from_catalog_at(aicx_home: &Path) -> Result<Vec<String
     let file = crate::source_path::open_under_aicx_home(aicx_home, &path)
         .with_context(|| format!("open catalog {}", path.display()))?;
     let reader = BufReader::new(file);
-    let mut identities = BTreeSet::new();
+    let mut identities = BTreeMap::new();
     for line in reader.lines() {
         let line = line.with_context(|| format!("read catalog line {}", path.display()))?;
         if line.trim().is_empty() {
@@ -258,11 +259,13 @@ pub fn project_identities_from_catalog_at(aicx_home: &Path) -> Result<Vec<String
         if let Some(project) = entry.project {
             let project = project.trim();
             if !project.is_empty() {
-                identities.insert(project.to_string());
+                identities
+                    .entry(project.to_ascii_lowercase())
+                    .or_insert_with(|| project.to_string());
             }
         }
     }
-    Ok(identities.into_iter().collect())
+    Ok(identities.into_values().collect())
 }
 
 /// Rebuild the durable catalog from live agent source roots.
@@ -309,6 +312,7 @@ pub fn rebuild_with_progress(
     progress.sessions = by_id.len();
     progress.elapsed_ms = started.elapsed().as_millis() as u64;
     on_progress(&progress);
+    let _catalog_guard = crate::locks::acquire_exclusive(home.join("locks").join("catalog.lock"))?;
     legacy_archive::atomic_write::atomic_write(&catalog_path, body.as_bytes())
         .with_context(|| format!("write catalog {}", catalog_path.display()))?;
 
@@ -485,6 +489,258 @@ pub fn status(home: &Path, user_home: &Path) -> Result<CatalogStatusReport> {
     })
 }
 
+/// Hot-window live delta: sessions present on disk that the durable catalog
+/// census does not admit yet. `newest_live_mtime_ns` spans ALL live sessions
+/// (lag honesty), while `unadmitted` carries only the sessions a hot query
+/// must parse ad-hoc. Same discovery + enrichment as `rebuild`, no writes.
+#[derive(Debug, Clone, Default)]
+pub struct LiveDelta {
+    pub unadmitted: Vec<CatalogEntry>,
+    /// Hot-window rows that are new or whose live fingerprint changed.
+    ///
+    /// This is the bounded input for [`refresh_hot`]. It deliberately omits
+    /// cold catalog rows so an interactive refresh never becomes a full walk.
+    pub changed: Vec<CatalogEntry>,
+    pub live_sessions: usize,
+    pub newest_live_mtime_ns: Option<u64>,
+    pub wall_ms: u64,
+}
+
+pub const CATALOG_REFRESH_SCHEMA: &str = "aicx.catalog.refresh.v1";
+
+#[derive(Debug, Clone, Serialize)]
+pub struct HotRefreshReport {
+    pub schema: String,
+    pub catalog_path: String,
+    pub catalog_present: bool,
+    pub scanned_live_sessions: usize,
+    pub changed_sessions: usize,
+    pub admitted_sessions: usize,
+    pub reattributed_sessions: usize,
+    pub total_sessions: usize,
+    pub wall_ms: u64,
+    pub recommendation: Option<String>,
+}
+
+/// One command run (or one MCP burst) should pay for a single source-root
+/// walk even when several extraction lanes ask for the delta back-to-back.
+/// 30 s stays comfortably inside the ≤60 s live-window freshness SLA.
+const LIVE_DELTA_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Extraction lanes compute their cutoff from independent `Utc::now()` calls;
+/// treat cutoffs within a minute as the same window for cache purposes.
+const LIVE_DELTA_CUTOFF_TOLERANCE_NS: u128 = 60 * 1_000_000_000;
+
+#[allow(clippy::type_complexity)]
+static LIVE_DELTA_CACHE: std::sync::Mutex<Option<(Instant, PathBuf, PathBuf, u128, LiveDelta)>> =
+    std::sync::Mutex::new(None);
+
+pub fn live_delta(home: &Path, user_home: &Path, cutoff_unix_ns: u128) -> Result<LiveDelta> {
+    if let Ok(guard) = LIVE_DELTA_CACHE.lock()
+        && let Some((stamp, cached_home, cached_user_home, cached_cutoff, delta)) = guard.as_ref()
+        && stamp.elapsed() < LIVE_DELTA_CACHE_TTL
+        && cached_home == home
+        && cached_user_home == user_home
+        && cached_cutoff.abs_diff(cutoff_unix_ns) <= LIVE_DELTA_CUTOFF_TOLERANCE_NS
+    {
+        return Ok(delta.clone());
+    }
+    let delta = live_delta_uncached(home, user_home, cutoff_unix_ns)?;
+    if let Ok(mut guard) = LIVE_DELTA_CACHE.lock() {
+        *guard = Some((
+            Instant::now(),
+            home.to_path_buf(),
+            user_home.to_path_buf(),
+            cutoff_unix_ns,
+            delta.clone(),
+        ));
+    }
+    Ok(delta)
+}
+
+/// Seed the live-delta cache so unit tests exercise the intents live window
+/// without walking the developer's real agent roots.
+#[cfg(test)]
+pub(crate) fn prime_live_delta_cache_for_tests(
+    home: &Path,
+    user_home: &Path,
+    cutoff_unix_ns: u128,
+    delta: LiveDelta,
+) {
+    if let Ok(mut guard) = LIVE_DELTA_CACHE.lock() {
+        *guard = Some((
+            Instant::now(),
+            home.to_path_buf(),
+            user_home.to_path_buf(),
+            cutoff_unix_ns,
+            delta,
+        ));
+    }
+}
+
+fn live_delta_uncached(home: &Path, user_home: &Path, cutoff_unix_ns: u128) -> Result<LiveDelta> {
+    let started = Instant::now();
+    let catalog_by_key: BTreeMap<(String, String), CatalogEntry> = read_entries_at(home)?
+        .into_iter()
+        .map(|entry| ((entry.agent.clone(), entry.session_id.clone()), entry))
+        .collect();
+
+    let mut live_sessions = 0usize;
+    let mut newest_live_mtime_ns: Option<u64> = None;
+    let mut fresh: BTreeMap<(String, String), CatalogEntry> = BTreeMap::new();
+    let agents = [
+        AgentKind::Claude,
+        AgentKind::Codex,
+        AgentKind::Gemini,
+        AgentKind::Grok,
+        AgentKind::Junie,
+    ];
+    for agent in agents {
+        let root = agent_source_root(agent, user_home);
+        if !root.exists() {
+            continue;
+        }
+        let Ok(catalog) = SessionCatalog::new(agent, &root) else {
+            continue;
+        };
+        let Ok(scan) = catalog.scan_hot_window(cutoff_unix_ns) else {
+            continue;
+        };
+        live_sessions += scan.total_candidates;
+        if let Some(newest) = scan.newest_modified_unix_nanos {
+            let newest = newest.min(u64::MAX as u128) as u64;
+            newest_live_mtime_ns = Some(newest_live_mtime_ns.map_or(newest, |max| max.max(newest)));
+        }
+        for source in scan.fresh_sources {
+            if !is_primary_catalog_source(agent, &source.path) {
+                continue;
+            }
+            let entry = entry_from_source(agent, &source);
+            fresh.insert((entry.agent.clone(), entry.session_id.clone()), entry);
+        }
+    }
+    // Runtime-run transcripts are a bounded tree — the vibecrafted lane of
+    // the live window stays in.
+    enrich_runtime_runs(&mut fresh, user_home);
+
+    let unadmitted = fresh
+        .iter()
+        .filter(|(key, _)| !catalog_by_key.contains_key(*key))
+        .map(|(_, entry)| entry.clone())
+        .collect();
+    let changed = fresh
+        .into_iter()
+        .filter(|(key, entry)| {
+            catalog_by_key.get(key).is_none_or(|cataloged| {
+                cataloged.source_path != entry.source_path
+                    || cataloged.source_len != entry.source_len
+                    || cataloged.source_mtime_ns != entry.source_mtime_ns
+                    || cataloged.project != entry.project
+                    || cataloged.cwd != entry.cwd
+            })
+        })
+        .map(|(_, entry)| entry)
+        .collect();
+    Ok(LiveDelta {
+        unadmitted,
+        changed,
+        live_sessions,
+        newest_live_mtime_ns,
+        wall_ms: started.elapsed().as_millis() as u64,
+    })
+}
+
+/// Admit only new or fingerprint-changed sessions inside a hot time window.
+///
+/// The first durable census remains an explicit full rebuild: creating a
+/// catalog from a bounded window would falsely present a partial inventory as
+/// complete. Once `sessions.jsonl` exists, this path is safe for interactive
+/// continuity, wizard, and dashboard entry because it merges hot rows under
+/// the same catalog write lock and never deletes cold rows.
+pub fn refresh_hot(
+    home: &Path,
+    user_home: &Path,
+    cutoff_unix_ns: u128,
+) -> Result<HotRefreshReport> {
+    let started = Instant::now();
+    let catalog_path = sessions_path_for(home);
+    if !catalog_path.is_file() {
+        return Ok(HotRefreshReport {
+            schema: CATALOG_REFRESH_SCHEMA.to_string(),
+            catalog_path: catalog_path.display().to_string(),
+            catalog_present: false,
+            scanned_live_sessions: 0,
+            changed_sessions: 0,
+            admitted_sessions: 0,
+            reattributed_sessions: 0,
+            total_sessions: 0,
+            wall_ms: started.elapsed().as_millis() as u64,
+            recommendation: Some(
+                "Run `aicx catalog rebuild` once to establish the durable census; hot refresh will maintain it afterwards."
+                    .to_string(),
+            ),
+        });
+    }
+
+    let delta = live_delta_uncached(home, user_home, cutoff_unix_ns)?;
+    let scanned_live_sessions = delta.live_sessions;
+    let changed_sessions = delta.changed.len();
+    let admitted_sessions = delta.unadmitted.len();
+    let mut preview_catalog: BTreeMap<(String, String), CatalogEntry> = read_entries_at(home)?
+        .into_iter()
+        .map(|entry| ((entry.agent.clone(), entry.session_id.clone()), entry))
+        .collect();
+    let reattributed_sessions = reattribute_catalog_entries(&mut preview_catalog);
+    if changed_sessions == 0 && reattributed_sessions == 0 {
+        return Ok(HotRefreshReport {
+            schema: CATALOG_REFRESH_SCHEMA.to_string(),
+            catalog_path: catalog_path.display().to_string(),
+            catalog_present: true,
+            scanned_live_sessions,
+            changed_sessions,
+            admitted_sessions,
+            reattributed_sessions,
+            total_sessions: read_entries_at(home)?.len(),
+            wall_ms: started.elapsed().as_millis() as u64,
+            recommendation: None,
+        });
+    }
+
+    let lock_path = home.join("locks").join("catalog.lock");
+    let _guard = crate::locks::acquire_exclusive(&lock_path)?;
+    let mut catalog: BTreeMap<(String, String), CatalogEntry> = read_entries_at(home)?
+        .into_iter()
+        .map(|entry| ((entry.agent.clone(), entry.session_id.clone()), entry))
+        .collect();
+    for entry in delta.changed {
+        catalog.insert((entry.agent.clone(), entry.session_id.clone()), entry);
+    }
+    let reattributed_sessions = reattribute_catalog_entries(&mut catalog);
+    let mut body = String::new();
+    for entry in catalog.values() {
+        body.push_str(&serde_json::to_string(entry)?);
+        body.push('\n');
+    }
+    legacy_archive::atomic_write::atomic_write(&catalog_path, body.as_bytes())
+        .with_context(|| format!("write hot-refreshed catalog {}", catalog_path.display()))?;
+    if let Ok(mut cache) = LIVE_DELTA_CACHE.lock() {
+        *cache = None;
+    }
+
+    Ok(HotRefreshReport {
+        schema: CATALOG_REFRESH_SCHEMA.to_string(),
+        catalog_path: catalog_path.display().to_string(),
+        catalog_present: true,
+        scanned_live_sessions,
+        changed_sessions,
+        admitted_sessions,
+        reattributed_sessions,
+        total_sessions: catalog.len(),
+        wall_ms: started.elapsed().as_millis() as u64,
+        recommendation: None,
+    })
+}
+
 fn scan_live_entries(user_home: &Path) -> BTreeMap<(String, String), CatalogEntry> {
     scan_live_entries_with_progress(user_home, Instant::now(), &mut |_| {})
 }
@@ -556,6 +812,7 @@ fn scan_live_entries_with_progress(
     progress.elapsed_ms = started.elapsed().as_millis() as u64;
     on_progress(&progress);
     enrich_runtime_runs(&mut by_id, user_home);
+    reattribute_catalog_entries(&mut by_id);
 
     by_id
 }
@@ -862,11 +1119,15 @@ fn merge_session_info(
         machine: hostname(),
         logical_session_id: None,
     });
-    if entry.project.is_none() {
+    if let Some(repo_path) = info.repo_path.as_deref() {
+        entry.cwd = Some(repo_path.to_string());
+        if let Some(remote_project) = project_from_git_remote(repo_path) {
+            entry.project = Some(remote_project);
+        } else if entry.project.is_none() {
+            entry.project = info.project.clone();
+        }
+    } else if entry.project.is_none() {
         entry.project = info.project.clone();
-    }
-    if entry.cwd.is_none() {
-        entry.cwd = info.repo_path.clone();
     }
     if entry.title.is_none() {
         entry.title = info.title.clone();
@@ -1041,6 +1302,67 @@ fn project_from_cwd(cwd: &str) -> Option<String> {
     Some(seg.to_string())
 }
 
+fn reattribute_catalog_entries(entries: &mut BTreeMap<(String, String), CatalogEntry>) -> usize {
+    let mut cache: BTreeMap<String, Option<String>> = BTreeMap::new();
+    let mut changed = 0usize;
+    for entry in entries.values_mut() {
+        let Some(cwd) = entry.cwd.as_deref().filter(|cwd| !cwd.is_empty()) else {
+            continue;
+        };
+        let remote_project = cache
+            .entry(cwd.to_string())
+            .or_insert_with(|| project_from_git_remote(cwd))
+            .clone();
+        if let Some(project) = remote_project
+            && entry.project.as_deref() != Some(project.as_str())
+        {
+            entry.project = Some(project);
+            changed += 1;
+        }
+    }
+    changed
+}
+
+fn project_from_git_remote(cwd: &str) -> Option<String> {
+    let path = Path::new(cwd);
+    if !path.is_dir() {
+        return None;
+    }
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["remote", "get-url", "origin"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    project_slug_from_remote(String::from_utf8_lossy(&output.stdout).trim())
+}
+
+pub fn project_slug_from_remote(remote: &str) -> Option<String> {
+    let trimmed = remote
+        .trim()
+        .split(['?', '#'])
+        .next()?
+        .trim_end_matches('/')
+        .trim_end_matches(".git");
+    let path = if let Some((_, rest)) = trimmed.split_once("://") {
+        rest.split_once('/')?.1
+    } else if let Some((_, rest)) = trimmed.rsplit_once(':') {
+        rest
+    } else {
+        trimmed
+    };
+    let mut parts = path.split('/').filter(|part| !part.is_empty()).rev();
+    let repository = parts.next()?.trim();
+    let organization = parts.next()?.trim();
+    if organization.is_empty() || repository.is_empty() {
+        return None;
+    }
+    Some(format!("{organization}/{repository}"))
+}
+
 fn hostname() -> Option<String> {
     std::env::var("HOSTNAME")
         .or_else(|_| std::env::var("HOST"))
@@ -1075,6 +1397,42 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         root
+    }
+
+    #[test]
+    fn live_delta_reports_unadmitted_until_rebuild_admits_them() {
+        let dir = test_root("live-delta");
+        let home = dir.join(".aicx");
+        let user = dir.join("user");
+        fs::create_dir_all(user.join(".claude").join("projects").join("proj")).unwrap();
+        let session = user
+            .join(".claude")
+            .join("projects")
+            .join("proj")
+            .join("bbbbbbbb-cccc-dddd-eeee-ffffffffffff.jsonl");
+        let mut f = File::create(&session).unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"user","sessionId":"bbbbbbbb-cccc-dddd-eeee-ffffffffffff","message":{{"content":"live window probe"}}}}"#
+        )
+        .unwrap();
+
+        // No durable catalog yet: the whole live surface is unadmitted.
+        let before = live_delta_uncached(&home, &user, 0).unwrap();
+        assert_eq!(before.live_sessions, 1);
+        assert_eq!(before.unadmitted.len(), 1);
+        assert!(before.newest_live_mtime_ns.is_some());
+        assert_eq!(before.unadmitted[0].agent, "claude");
+
+        // Rebuild admits the session — the delta must drain to zero.
+        rebuild(&home, &user).unwrap();
+        let after = live_delta_uncached(&home, &user, 0).unwrap();
+        assert_eq!(after.live_sessions, 1);
+        assert!(
+            after.unadmitted.is_empty(),
+            "admitted session still reported unadmitted: {:?}",
+            after.unadmitted
+        );
     }
 
     #[test]
@@ -1124,9 +1482,16 @@ mod tests {
             machine: None,
             logical_session_id: None,
         };
+        let mut case_variant = entry.clone();
+        case_variant.session_id = "s2".into();
+        case_variant.project = Some("vetcoders/mlx-lm".into());
         fs::write(
             sessions_path_for(&home),
-            format!("{}\n", serde_json::to_string(&entry).unwrap()),
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&entry).unwrap(),
+                serde_json::to_string(&case_variant).unwrap()
+            ),
         )
         .unwrap();
         let ids = project_identities_from_catalog_at(&home).unwrap();
@@ -1348,6 +1713,79 @@ mod tests {
         assert_eq!(report.counts.current, 0);
         assert_eq!(report.counts.missing_source, 1);
         assert_eq!(report.readiness, CatalogReadiness::SourcesMissing);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remote_slug_parser_accepts_https_and_scp_shapes() {
+        assert_eq!(
+            project_slug_from_remote("https://github.com/Loctree/aicx.git"),
+            Some("Loctree/aicx".to_string())
+        );
+        assert_eq!(
+            project_slug_from_remote("git@github.com:VetCoders/pensieve.git"),
+            Some("VetCoders/pensieve".to_string())
+        );
+    }
+
+    #[test]
+    fn hot_refresh_reattributes_existing_path_guess_from_git_origin() {
+        let dir = test_root("refresh-reattribute");
+        let home = dir.join(".aicx");
+        let user = dir.join("user");
+        let repo = dir.join("Git").join("pensieve");
+        fs::create_dir_all(&repo).unwrap();
+        fs::create_dir_all(&user).unwrap();
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(["init", "--quiet"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args([
+                    "remote",
+                    "add",
+                    "origin",
+                    "https://github.com/VetCoders/pensieve.git",
+                ])
+                .status()
+                .unwrap()
+                .success()
+        );
+        fs::create_dir_all(catalog_dir_for(&home)).unwrap();
+        let source = repo.join("session.jsonl");
+        fs::write(&source, "{\"type\":\"user\"}\n").unwrap();
+        let entry = CatalogEntry {
+            schema: CATALOG_SCHEMA.to_string(),
+            session_id: "identity-session".into(),
+            agent: "codex".into(),
+            project: Some("Git/pensieve".into()),
+            date: Some("2026-07-30".into()),
+            cwd: Some(repo.display().to_string()),
+            source_path: source.display().to_string(),
+            source_len: None,
+            source_mtime_ns: None,
+            title: None,
+            machine: None,
+            logical_session_id: None,
+        };
+        fs::write(
+            sessions_path_for(&home),
+            format!("{}\n", serde_json::to_string(&entry).unwrap()),
+        )
+        .unwrap();
+
+        let report = refresh_hot(&home, &user, 0).unwrap();
+        assert_eq!(report.reattributed_sessions, 1);
+        let refreshed = read_entries_at(&home).unwrap();
+        assert_eq!(refreshed[0].project.as_deref(), Some("VetCoders/pensieve"));
         let _ = fs::remove_dir_all(&dir);
     }
 }

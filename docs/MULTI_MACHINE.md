@@ -81,15 +81,28 @@ pipeline for foreign session dumps.
 ```text
 [ laptop / remote agents ]
         |  session jsonl rsync → agent roots on dragon
-        |  MCP streamable HTTP (Bearer)
+        |  local: aicx index  (lexical only, fast)
+        |  MCP streamable HTTP (Bearer) for deep / shared search
         v
 [ dragon ]
   - owns ~/.aicx (or AICX_HOME)
   - aicx catalog rebuild && aicx index
+  - aicx index --semantic     # one dense CURRENT; opt-in, owner-only
   - embedder: cloud URL in config.toml (e.g. Ollama qwen3-embedding:8b)
   - aicx serve --transport http --host 0.0.0.0 --port 8044 \
       --auth-token "$TOKEN" --allowed-host dragon --allowed-host <tailscale-name>
+  - optional: cloudflare tunnel for grok.com / slack / web agents
 ```
+
+Status planes on every host:
+
+```bash
+aicx index status
+# lexical_status: ready|missing
+# dense_status:   ready|not_built|missing
+```
+
+Laptop `dense_status=not_built` with `lexical_status=ready` is **normal**.
 
 Auth today is **Bearer token**, not OAuth. Token sources: CLI flag, env
 `AICX_HTTP_AUTH_TOKEN`, or generated file under AICX home. Host header
