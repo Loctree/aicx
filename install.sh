@@ -1136,6 +1136,16 @@ configure_mcp "codex" "$HOME/.codex/settings.json"
 # Gemini
 configure_mcp "gemini" "$HOME/.gemini/settings.json"
 
+# Background reindex cadence (macOS launchd; no-op elsewhere). Opt out with
+# AICX_SKIP_SCHEDULE=1. Lives beside MCP config because both are host wiring,
+# not store content.
+if [ "${AICX_SKIP_SCHEDULE:-0}" != "1" ]; then
+  SCHEDULE_SCRIPT="$(dirname "$0")/tools/install-reindex-schedule.sh"
+  if [ -f "$SCHEDULE_SCRIPT" ]; then
+    bash "$SCHEDULE_SCRIPT" || echo "  Warning: reindex schedule install failed (non-fatal)."
+  fi
+fi
+
 # --- Step 4: Full store bootstrap ---
 echo "[4/4] Full context extraction (this may take a moment)..."
 "${AICX_RUN[@]}" all -H 10000 --emit none

@@ -11,7 +11,7 @@ ifeq (,$(shell command -v cargo 2>/dev/null))
   endif
 endif
 
-.PHONY: all build build-native completions release-binaries install install-bin install-config install-cargo git-hooks
+.PHONY: all build build-native completions release-binaries install install-bin install-config install-cargo git-hooks install-schedule uninstall-schedule
 .PHONY: precheck precheck-native loctree-consumer-check test test-native check fmt fmt-check clippy clippy-native semgrep ci clean help manifest-check
 .PHONY: embeddings-check embeddings-test embeddings-clippy embeddings-hydrate embeddings-info
 .PHONY: version version-show version-check version-bump version-patch bump-patch changelog-close release-notes release-plan release-prepare release-check release-tag release-push package-check release-bundle release-bundle-only-binaries test-e2e
@@ -94,6 +94,14 @@ release-binaries:
 install:
 	./install.sh
 	@$(MAKE) git-hooks
+
+# Background reindex cadence (launchd, macOS): catalog rebuild + index every
+# 2 h. install.sh wires this automatically; these targets manage it directly.
+install-schedule:
+	bash ./tools/install-reindex-schedule.sh
+
+uninstall-schedule:
+	bash ./tools/install-reindex-schedule.sh --uninstall
 
 install-bin:
 	AICX_INSTALL_MODE=local ./install.sh --shadow-check-only
