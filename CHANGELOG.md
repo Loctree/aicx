@@ -9,6 +9,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **Continuity is no longer blind to checkouts whose path spells the
+  project differently than its identity.** Three stacked fixes: Claude
+  session `cwd` is now sniffed from the session head instead of decoded
+  from the lossy `~/.claude/projects/<slug>` directory name (every `-`
+  inside a real path component used to become a bogus `/`, fabricating
+  identities like `suite/vibecrafted` and cwds that do not exist);
+  per-frame retention accepts frames whose cwd is the session checkout
+  (or a subdirectory) so remote-derived identities survive suite dirs and
+  renamed clones while the strict adjacent-segment anti-leak proof still
+  guards frames that left the checkout; and the continuity INDEX HEALTH
+  footer reports the bucket with the newest session activity across the
+  expanded project filters instead of an arbitrary first bucket.
+
 - **Lexical schema downgrade is a controlled conflict, not silent
   corruption.** Publishing `CURRENT` refuses a generation whose lexical
   schema is provably older than the published one (or than the binary's
