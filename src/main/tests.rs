@@ -373,7 +373,7 @@ fn index_status_routes_through_index_canonical_resolver() {
 
     // Corresponding semantic index buckets (lowercase + `/` → `_`).
     for bucket in [
-        "vetcoders_loctree",
+        "loctree_loctree",
         "vetcoders_aicx",
         "sampleorg_loctree",
         "sampleorg_codescribe",
@@ -390,11 +390,11 @@ fn index_status_routes_through_index_canonical_resolver() {
     // The 4 canonical filter shapes from the bug brief.
     let shapes: &[(&str, &[&str])] = &[
         // strict slug
-        ("Loctree/loctree", &["vetcoders_loctree"]),
+        ("Loctree/loctree", &["loctree_loctree"]),
         // org wildcard
-        ("vetcoders/", &["vetcoders_aicx", "vetcoders_loctree"]),
+        ("vetcoders/", &["vetcoders_aicx"]),
         // cross-org repo (explicit wildcard — selects every org on purpose)
-        ("/Loctree", &["sampleorg_loctree", "vetcoders_loctree"]),
+        ("/Loctree", &["loctree_loctree", "sampleorg_loctree"]),
     ];
 
     // World-model fix (F3, P0-4): a bare name with more than one identity
