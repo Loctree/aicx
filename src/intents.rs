@@ -426,7 +426,7 @@ fn collect_intent_files(
                     continue;
                 }
             };
-        retain_frames_for_project(&mut frames, &identity_project);
+        retain_frames_for_project(&mut frames, &identity_project, entry.cwd.as_deref());
         if frames.is_empty() {
             continue;
         }
@@ -550,7 +550,7 @@ fn collect_live_unadmitted_files(
                     continue;
                 }
             };
-        retain_frames_for_project(&mut frames, &identity_project);
+        retain_frames_for_project(&mut frames, &identity_project, entry.cwd.as_deref());
         if frames.is_empty() {
             continue;
         }
@@ -592,14 +592,35 @@ fn collect_live_unadmitted_files(
 /// Frames that carry an explicit cwd must therefore prove they still belong
 /// to the requested canonical bucket. Older sources without per-frame cwd
 /// retain the catalog attribution instead of being silently discarded.
+///
+/// Membership has two proofs, either suffices:
+/// 1. the frame cwd is the session checkout (or a subdirectory of it) —
+///    the catalog identity was derived from that very checkout (git remote),
+///    and a checkout path need not spell `org/repo` in adjacent segments
+///    (suite dirs, renamed clones);
+/// 2. the frame cwd spells the project as adjacent path segments — the
+///    strict anti-leak matcher for frames that left the session checkout.
 #[cfg(feature = "app")]
-fn retain_frames_for_project(frames: &mut Vec<TimelineEntry>, project: &str) {
+fn retain_frames_for_project(
+    frames: &mut Vec<TimelineEntry>,
+    project: &str,
+    session_cwd: Option<&str>,
+) {
     let filters = [project.to_string()];
+    let session_root = session_cwd
+        .map(|cwd| cwd.trim_end_matches(['/', '\\']))
+        .filter(|cwd| !cwd.is_empty());
     frames.retain(|frame| {
-        frame
-            .cwd
-            .as_deref()
-            .is_none_or(|cwd| crate::extraction::project_filter_matches_path(cwd, &filters))
+        frame.cwd.as_deref().is_none_or(|cwd| {
+            let inside_session_checkout = session_root.is_some_and(|root| {
+                let cwd = cwd.trim_end_matches(['/', '\\']);
+                cwd == root
+                    || cwd
+                        .strip_prefix(root)
+                        .is_some_and(|rest| rest.starts_with('/') || rest.starts_with('\\'))
+            });
+            inside_session_checkout || crate::extraction::project_filter_matches_path(cwd, &filters)
+        })
     });
 }
 

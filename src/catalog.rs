@@ -1206,11 +1206,19 @@ fn enrich_runtime_runs(by_id: &mut BTreeMap<(String, String), CatalogEntry>, use
 fn infer_cwd_from_path(agent: AgentKind, path: &Path) -> Option<String> {
     match agent {
         AgentKind::Claude => {
-            // ~/.claude/projects/<encoded-cwd>/<session>.jsonl
-            path.parent()
-                .and_then(|p| p.file_name())
-                .and_then(|n| n.to_str())
-                .map(|encoded| encoded.replace('-', "/"))
+            // Ground truth first: Claude session events carry `cwd` verbatim.
+            // The directory slug is lossy — every `-` inside a real path
+            // component ("vc-workspace", "vibecrafted-suite") decodes into a
+            // bogus `/`, which fabricates identities like `suite/vibecrafted`
+            // and a cwd no reattribution can ever `git -C` into.
+            sniff_claude_cwd(path).or_else(|| {
+                // ~/.claude/projects/<encoded-cwd>/<session>.jsonl — lossy
+                // last resort for unreadable/headless files.
+                path.parent()
+                    .and_then(|p| p.file_name())
+                    .and_then(|n| n.to_str())
+                    .map(|encoded| encoded.replace('-', "/"))
+            })
         }
         AgentKind::Grok => {
             // ~/.grok/sessions/<cwd-encoded>/<session>/...
@@ -1228,6 +1236,36 @@ fn infer_cwd_from_path(agent: AgentKind, path: &Path) -> Option<String> {
         }
         _ => None,
     }
+}
+
+/// Read the working directory out of a Claude session head.
+///
+/// Leaf/summary records at the top of a JSONL carry no `cwd`; the first
+/// real event does. The scan is bounded (lines and bytes) so a session
+/// whose head is one enormous pasted line cannot stall catalog admission.
+fn sniff_claude_cwd(path: &Path) -> Option<String> {
+    use std::io::{BufRead, Read};
+    const MAX_LINES: usize = 64;
+    const MAX_BYTES: u64 = 256 * 1024;
+
+    let file = std::fs::File::open(path).ok()?;
+    let mut reader = std::io::BufReader::new(file.take(MAX_BYTES));
+    let mut line = String::new();
+    for _ in 0..MAX_LINES {
+        line.clear();
+        if reader.read_line(&mut line).ok()? == 0 {
+            return None;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if let Some(cwd) = value.get("cwd").and_then(|v| v.as_str())
+            && !cwd.is_empty()
+        {
+            return Some(cwd.to_string());
+        }
+    }
+    None
 }
 
 fn decode_grok_cwd(encoded: &str) -> String {
@@ -1433,6 +1471,40 @@ mod tests {
             "admitted session still reported unadmitted: {:?}",
             after.unadmitted
         );
+    }
+
+    #[test]
+    fn claude_cwd_prefers_session_event_truth_over_lossy_slug() {
+        let dir = test_root("cwd-sniff");
+        // Slug whose dashes are NOT all separators: naive decode fabricates
+        // `/Volumes/vc/workspace/.../suite/vibecrafted`.
+        let project_dir = dir.join("-Volumes-vc-workspace-vetcoders-vibecrafted-suite-vibecrafted");
+        fs::create_dir_all(&project_dir).unwrap();
+        let session = project_dir.join("aaaa.jsonl");
+        let mut f = File::create(&session).unwrap();
+        writeln!(f, r#"{{"type":"summary","leafUuid":"x"}}"#).unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"attachment","cwd":"/Volumes/vc-workspace/vetcoders/vibecrafted-suite/vibecrafted"}}"#
+        )
+        .unwrap();
+
+        let cwd = infer_cwd_from_path(AgentKind::Claude, &session).unwrap();
+        assert_eq!(
+            cwd,
+            "/Volumes/vc-workspace/vetcoders/vibecrafted-suite/vibecrafted"
+        );
+
+        // Head without cwd → lossy slug decode stays as the last resort.
+        let bare = project_dir.join("bbbb.jsonl");
+        fs::write(&bare, "{\"type\":\"summary\"}\n").unwrap();
+        let cwd = infer_cwd_from_path(AgentKind::Claude, &bare).unwrap();
+        assert_eq!(
+            cwd,
+            "/Volumes/vc/workspace/vetcoders/vibecrafted/suite/vibecrafted"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

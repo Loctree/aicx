@@ -31,7 +31,7 @@ fn per_frame_cwd_prevents_cross_repo_session_contamination() {
         frame(None, "legacy frame without cwd"),
     ];
 
-    retain_frames_for_project(&mut frames, "Loctree/aicx");
+    retain_frames_for_project(&mut frames, "Loctree/aicx", None);
 
     assert_eq!(frames.len(), 2);
     assert!(frames.iter().any(|frame| frame.message == "aicx decision"));
@@ -44,6 +44,37 @@ fn per_frame_cwd_prevents_cross_repo_session_contamination() {
         frames
             .iter()
             .all(|frame| frame.message != "pensieve decision")
+    );
+
+    // Remote-derived identity: the checkout path spells neither `vetcoders`
+    // nor `vibecrafted` as adjacent segments, yet frames inside the session
+    // checkout (or its subdirs) inherit the session identity. Frames that
+    // left the checkout still need the strict path proof.
+    let suite_checkout = "/Volumes/vc-workspace/vetcoders/vibecrafted-suite/vibecrafted";
+    let mut frames = vec![
+        frame(Some(suite_checkout), "suite decision"),
+        frame(
+            Some("/Volumes/vc-workspace/vetcoders/vibecrafted-suite/vibecrafted/labs"),
+            "suite subdir decision",
+        ),
+        frame(
+            Some("/Volumes/vc-workspace/vetcoders/vibecrafted-suitcase"),
+            "prefix-sibling decision",
+        ),
+        frame(
+            Some("/Volumes/vc-workspace/vetcoders/pensieve"),
+            "foreign decision",
+        ),
+    ];
+
+    retain_frames_for_project(&mut frames, "vetcoders/vibecrafted", Some(suite_checkout));
+
+    assert_eq!(frames.len(), 2, "{frames:?}");
+    assert!(frames.iter().any(|frame| frame.message == "suite decision"));
+    assert!(
+        frames
+            .iter()
+            .any(|frame| frame.message == "suite subdir decision")
     );
 }
 

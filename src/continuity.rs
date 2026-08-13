@@ -73,11 +73,7 @@ pub fn build(aicx_home: &Path, projects: &[String], hours: u64) -> Result<Contin
 
     let cutoff = Utc::now() - chrono::Duration::hours(hours.min(i64::MAX as u64) as i64);
     let sources = collect_sources(aicx_home, projects, cutoff);
-    let index_health = collect_index_health(
-        aicx_home,
-        projects.first().map(String::as_str),
-        extraction.stats.live_sessions,
-    );
+    let index_health = collect_index_health(aicx_home, projects, extraction.stats.live_sessions);
 
     Ok(ContinuityPack {
         project_label: if projects.is_empty() {
@@ -161,11 +157,33 @@ fn collect_sources(
 
 fn collect_index_health(
     aicx_home: &Path,
-    project: Option<&str>,
+    projects: &[String],
     live_sessions: usize,
 ) -> IndexHealthLine {
-    match crate::api::index_status_at(aicx_home, project) {
-        Ok(status) => IndexHealthLine {
+    // A `-p /repo` filter expands to several buckets; health of an arbitrary
+    // first bucket (e.g. one dormant since spring) must not masquerade as the
+    // pack's health. Report the bucket with the newest session activity —
+    // that is the one whose staleness would actually poison this pack.
+    let mut best = None;
+    let scopes: Vec<Option<&str>> = if projects.is_empty() {
+        vec![None]
+    } else {
+        projects.iter().map(|p| Some(p.as_str())).collect()
+    };
+    for scope in scopes {
+        if let Ok(status) = crate::api::index_status_at(aicx_home, scope) {
+            let fresher = best
+                .as_ref()
+                .is_none_or(|current: &crate::api::IndexStatus| {
+                    status.newest_session_updated_at > current.newest_session_updated_at
+                });
+            if fresher {
+                best = Some(status);
+            }
+        }
+    }
+    match best {
+        Some(status) => IndexHealthLine {
             newest_session_updated_at: status.newest_session_updated_at,
             committed_at: status.committed_at,
             pending: status.pending_chunks,
@@ -173,7 +191,7 @@ fn collect_index_health(
             readiness: format!("{:?}", status.readiness).to_lowercase(),
             mode: if live_sessions > 0 { "live" } else { "census" },
         },
-        Err(_) => IndexHealthLine {
+        None => IndexHealthLine {
             newest_session_updated_at: None,
             committed_at: None,
             pending: 0,
