@@ -15,6 +15,7 @@
 //! Semantic callers can add their own reserved-word rules on top
 //! (template-placeholder rejection, etc.).
 
+#[cfg(any(feature = "app", test))]
 pub fn is_valid_repo_bucket_name(value: &str) -> bool {
     if value.len() > 100 {
         return false;
@@ -35,6 +36,7 @@ pub fn is_valid_repo_bucket_name(value: &str) -> bool {
 /// `organization/repository` shape. Each segment must pass the same bucket
 /// schema so bad content-extracted names cannot create junk directories under
 /// the retired `~/.aicx/store` archive.
+#[cfg(any(feature = "app", test))]
 pub fn is_valid_repo_project_slug(value: &str) -> bool {
     let mut parts = value.split('/');
     let Some(first) = parts.next() else {

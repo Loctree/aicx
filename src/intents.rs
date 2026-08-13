@@ -18,7 +18,9 @@ use crate::chunker::{
 use crate::extraction::{IntentLineModality, intent_line_modality, is_harness_injected_noise};
 use crate::legacy_archive;
 use crate::sanitize;
-use crate::timeline::{FrameKind, TimelineEntry};
+use crate::timeline::FrameKind;
+#[cfg(feature = "app")]
+use crate::timeline::TimelineEntry;
 use crate::types::{EntryState, EntryType, IntentEntry, Link, LinkType};
 
 mod display;

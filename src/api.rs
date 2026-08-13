@@ -317,6 +317,7 @@ fn plane_fields_for_missing() -> (String, String, String, usize, Option<String>)
     )
 }
 
+#[cfg(feature = "app")]
 fn plane_fields_from_manifest(
     dense_kind: &str,
     dense_count: usize,
