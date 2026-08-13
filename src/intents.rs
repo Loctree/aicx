@@ -399,13 +399,15 @@ fn collect_intent_files(
         // A catalog rebuild stamps every row current, which used to collapse
         // the hot set to zero and leave NOW/PEERS empty. Prefer a live stat;
         // fall back to the census fingerprint so a just-rebuilt hot row
-        // still counts.
+        // still counts. Paths the operator allowlist refuses are NEVER
+        // stat'ed raw (a poisoned census row could point anywhere — the
+        // same containment contract as read_catalog_signal_at); they fall
+        // through to the census fingerprint instead.
         let hot = if live {
             source_allow
                 .resolve_file(entry.source_path.as_str())
                 .ok()
                 .and_then(|path| crate::catalog::live_source_fingerprint(&path))
-                .or_else(|| crate::catalog::live_source_fingerprint(Path::new(&entry.source_path)))
                 .or_else(|| entry.source_mtime_ns.map(|mtime_ns| (0, mtime_ns)))
                 .is_some_and(|(_, mtime_ns)| mtime_ns_within_window(mtime_ns, cutoff))
         } else {
