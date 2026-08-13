@@ -373,6 +373,12 @@ pub fn render(pack: &ContinuityPack, for_inject: bool) -> String {
         "- readiness: {} · mode: {} · live_sessions: {}\n",
         health.readiness, health.mode, pack.live_sessions
     ));
+    if health.pending > 0 || health.sessions_newer_than_chunks > 0 {
+        out.push_str(&format!(
+            "- warning: chunk lag (pending={}, sessions_newer_than_chunks={}); run `aicx catalog rebuild --with-chunks` or `aicx index` — empty NOW/PEERS is not proof of a quiet window\n",
+            health.pending, health.sessions_newer_than_chunks
+        ));
+    }
 
     if for_inject && out.len() > INJECT_CHAR_BUDGET {
         // Keep the head (NOW/PEERS carry the sharpest context) and stamp the
@@ -483,5 +489,66 @@ mod tests {
         assert_eq!(first, second, "continuity pack must be deterministic");
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn continuity_now_lists_live_open_sessions() {
+        let pack = ContinuityPack {
+            project_label: "vetcoders/vibecrafted".into(),
+            hours: 24,
+            live_sessions: 1,
+            records: vec![crate::intents::IntentRecord {
+                kind: IntentKind::Intent,
+                summary: "keep live window independent of census".into(),
+                context: None,
+                evidence: Vec::new(),
+                project: "vetcoders/vibecrafted".into(),
+                agent: "claude".into(),
+                date: "2026-08-13".into(),
+                timestamp: Some("2026-08-13T02:00:00Z".into()),
+                session_id: "hot-open".into(),
+                count: None,
+                first_chunk: None,
+                last_chunk: None,
+                source_chunk: "sess.jsonl".into(),
+                source: None,
+                honesty: crate::oracle::ClaimHonesty::live_open(),
+            }],
+            sources: Vec::new(),
+            index_health: IndexHealthLine {
+                newest_session_updated_at: Some("2026-08-13T02:00:00Z".into()),
+                committed_at: None,
+                pending: 0,
+                sessions_newer_than_chunks: 0,
+                readiness: "ready".into(),
+                mode: "live",
+            },
+        };
+        let rendered = render(&pack, false);
+        assert!(rendered.contains("open: claude · hot-open"));
+        assert!(!rendered.contains("warning: chunk lag"));
+    }
+
+    #[test]
+    fn continuity_index_health_warns_on_pending_chunks() {
+        let pack = ContinuityPack {
+            project_label: "vetcoders/vibecrafted".into(),
+            hours: 24,
+            live_sessions: 1,
+            records: Vec::new(),
+            sources: Vec::new(),
+            index_health: IndexHealthLine {
+                newest_session_updated_at: Some("2026-08-13T01:48:00Z".into()),
+                committed_at: Some("2026-08-13T01:48:00Z".into()),
+                pending: 631,
+                sessions_newer_than_chunks: 12,
+                readiness: "stale_chunks".into(),
+                mode: "live",
+            },
+        };
+        let rendered = render(&pack, false);
+        assert!(rendered.contains("newest_session_updated: 2026-08-13T01:48:00Z"));
+        assert!(rendered.contains("warning: chunk lag (pending=631"));
+        assert!(rendered.contains("aicx catalog rebuild --with-chunks"));
     }
 }

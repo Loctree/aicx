@@ -217,6 +217,12 @@ fn oracle_readiness_is_ready_when_semantic_and_freshness_are_green() {
             detail: "ok".to_string(),
             recommendation: None,
         },
+        continuity_freshness: CheckResult {
+            name: "continuity_freshness".to_string(),
+            severity: Severity::Green,
+            detail: "ok".to_string(),
+            recommendation: None,
+        },
         aicx_home: CheckResult::default(),
         binary_pair: CheckResult::default(),
         http_auth_token: CheckResult::default(),
@@ -1156,6 +1162,56 @@ fn fix_buckets_leaves_unproven_ownership_stage_in_place() {
         report.fixes_applied
     );
 
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn continuity_freshness_is_green_without_hot_sources() {
+    let tmp = unique_test_dir("continuity-quiet");
+    let result = check_continuity_freshness(&tmp);
+    assert_eq!(result.name, "continuity_freshness");
+    assert_eq!(result.severity, Severity::Green);
+    assert!(result.detail.contains("no live session sources"));
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn continuity_freshness_warns_when_hot_sources_have_pending_chunks() {
+    let tmp = unique_test_dir("continuity-lag");
+    let catalog_dir = crate::catalog::catalog_dir_for(&tmp);
+    std::fs::create_dir_all(&catalog_dir).unwrap();
+    let source = tmp.join("hot.jsonl");
+    std::fs::write(&source, "{\"type\":\"user\",\"text\":\"now\"}\n").unwrap();
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let entry = crate::catalog::CatalogEntry {
+        schema: crate::catalog::CATALOG_SCHEMA.to_string(),
+        session_id: "hot-session".into(),
+        agent: "claude".into(),
+        project: Some("vetcoders/vibecrafted".into()),
+        date: Some(chrono::Utc::now().format("%Y-%m-%d").to_string()),
+        cwd: None,
+        source_path: source.display().to_string(),
+        source_len: Some(32),
+        source_mtime_ns: Some(now_ns),
+        title: None,
+        machine: None,
+        logical_session_id: None,
+    };
+    std::fs::write(
+        crate::catalog::sessions_path_for(&tmp),
+        format!("{}\n", serde_json::to_string(&entry).unwrap()),
+    )
+    .unwrap();
+
+    let result = check_continuity_freshness(&tmp);
+    assert_eq!(result.name, "continuity_freshness");
+    // A catalog-only home has no CURRENT index, so pending lag is the
+    // honest product signal — doctor must not stay Green.
+    assert_eq!(result.severity, Severity::Warning);
+    assert!(result.detail.contains("live source"));
     let _ = std::fs::remove_dir_all(&tmp);
 }
 

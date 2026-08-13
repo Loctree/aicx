@@ -22,6 +22,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   footer reports the bucket with the newest session activity across the
   expanded project filters instead of an arbitrary first bucket.
 
+- **Continuity live window is mtime-in-window, not newer-than-census.**
+  A `catalog rebuild` that stamps every fingerprint current no longer
+  demotes today's open sessions to canonical-only, so NOW/PEERS stay
+  populated. INDEX HEALTH warns when `pending_chunks` or
+  `sessions_newer_than_chunks` is non-zero instead of rendering an
+  unexplained empty pack. `aicx catalog rebuild --with-chunks` drains
+  the lag through `aicx index` and always prints `pending_chunks`.
+  `aicx doctor` now measures `continuity_freshness` (hot sources vs
+  pending lag) so Overall Green cannot ignore a blind resume surface.
+  Catalog admission case-folds project slugs
+  (`VetCoders/vibecrafted` → `vetcoders/vibecrafted`).
+
 - **Lexical schema downgrade is a controlled conflict, not silent
   corruption.** Publishing `CURRENT` refuses a generation whose lexical
   schema is provably older than the published one (or than the binary's

@@ -906,6 +906,10 @@ enum CatalogAction {
         /// Emit JSON report to stdout.
         #[arg(long)]
         json: bool,
+        /// After rewriting the catalog, drain pending chunks through
+        /// `aicx index` (lexical CURRENT) and print the remaining lag.
+        #[arg(long)]
+        with_chunks: bool,
     },
     /// Admit new or changed sessions from a bounded hot window.
     ///
@@ -2575,8 +2579,8 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
             })?;
         }
         Some(Commands::Catalog { action }) => match action {
-            CatalogAction::Rebuild { json } => {
-                run_catalog_rebuild(json)?;
+            CatalogAction::Rebuild { json, with_chunks } => {
+                run_catalog_rebuild(json, with_chunks)?;
             }
             CatalogAction::Refresh { hours, json } => {
                 run_catalog_refresh(hours, json)?;
@@ -7321,8 +7325,9 @@ fn parse_date_filter(s: &str) -> Result<(Option<String>, Option<String>)> {
     }
 }
 
-fn run_catalog_rebuild(json: bool) -> Result<()> {
+fn run_catalog_rebuild(json: bool, with_chunks: bool) -> Result<()> {
     let aicx_home = aicx::aicx_home::resolve()?;
+    let aicx_home_for_status = aicx_home.clone();
     let user_home = aicx::os_user_home().context("No home dir")?;
     let progress = Arc::new(Mutex::new(aicx::catalog::RebuildProgress::preparing()));
     let worker_progress = Arc::clone(&progress);
@@ -7362,7 +7367,20 @@ fn run_catalog_rebuild(json: bool) -> Result<()> {
     if interactive {
         eprintln!();
     }
-    let report = worker_result?;
+    let mut report = worker_result?;
+    report.pending_chunks = aicx::api::index_status_at(&aicx_home_for_status, None)
+        .map(|status| status.pending_chunks)
+        .unwrap_or(0);
+    if with_chunks && report.pending_chunks > 0 {
+        eprintln!(
+            "aicx catalog rebuild: draining {} pending chunk(s) via `aicx index`",
+            report.pending_chunks
+        );
+        run_index(&[], 0, json, false, false, false, false)?;
+        report.pending_chunks = aicx::api::index_status_at(&aicx_home_for_status, None)
+            .map(|status| status.pending_chunks)
+            .unwrap_or(report.pending_chunks);
+    }
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
@@ -7372,6 +7390,12 @@ fn run_catalog_rebuild(json: bool) -> Result<()> {
         );
         eprintln!("  catalog: {}", report.catalog_path);
         eprintln!("  cards_written: {} (must stay 0)", report.cards_written);
+        eprintln!("  pending_chunks: {}", report.pending_chunks);
+        if report.pending_chunks > 0 && !with_chunks {
+            eprintln!(
+                "  warning: rebuild does not drain chunks; run `aicx catalog rebuild --with-chunks` or `aicx index`"
+            );
+        }
         eprintln!("  per agent:");
         for (agent, count) in &report.agents {
             eprintln!("    {agent:<12} {count}");

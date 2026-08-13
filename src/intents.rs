@@ -395,24 +395,26 @@ fn collect_intent_files(
             .date
             .as_deref()
             .and_then(|date| NaiveDate::parse_from_str(date, "%Y-%m-%d").ok());
-        let mut live_row = false;
-        if canonical_date.is_some_and(|date| date < cutoff.date_naive()) {
-            if !live {
-                continue;
-            }
-            // Hot window: the census date predates the cutoff, but the file
-            // may still be receiving appends. One allowlist-resolved stat
-            // decides — the live mtime outranks the rebuild-time date.
-            let hot = source_allow
+        // Live window is mtime-in-window, not "newer than census fingerprint".
+        // A catalog rebuild stamps every row current, which used to collapse
+        // the hot set to zero and leave NOW/PEERS empty. Prefer a live stat;
+        // fall back to the census fingerprint so a just-rebuilt hot row
+        // still counts.
+        let hot = if live {
+            source_allow
                 .resolve_file(entry.source_path.as_str())
                 .ok()
                 .and_then(|path| crate::catalog::live_source_fingerprint(&path))
-                .is_some_and(|(_, mtime_ns)| mtime_ns_within_window(mtime_ns, cutoff));
-            if !hot {
-                continue;
-            }
-            live_row = true;
+                .or_else(|| crate::catalog::live_source_fingerprint(Path::new(&entry.source_path)))
+                .or_else(|| entry.source_mtime_ns.map(|mtime_ns| (0, mtime_ns)))
+                .is_some_and(|(_, mtime_ns)| mtime_ns_within_window(mtime_ns, cutoff))
+        } else {
+            false
+        };
+        if canonical_date.is_some_and(|date| date < cutoff.date_naive()) && (!live || !hot) {
+            continue;
         }
+        let live_row = session_is_hot_live(live, hot);
 
         let (source_path, mut frames) =
             match crate::source_index::read_catalog_signal_at(aicx_home, &entry, frame_kind) {
@@ -622,6 +624,13 @@ fn retain_frames_for_project(
             inside_session_checkout || crate::extraction::project_filter_matches_path(cwd, &filters)
         })
     });
+}
+
+/// Catalog-admitted sessions stay live when they are still inside the
+/// requested mtime window. Rebuild fingerprint equality must not demote them.
+#[cfg(feature = "app")]
+pub(crate) fn session_is_hot_live(live: bool, mtime_in_window: bool) -> bool {
+    live && mtime_in_window
 }
 
 /// True when a unix-nanosecond mtime falls at or after the window cutoff.

@@ -79,6 +79,10 @@ pub struct RebuildReport {
     pub catalog_path: String,
     pub wall_ms: u64,
     pub cards_written: usize,
+    /// Sessions the search index has not yet absorbed. Rebuild never
+    /// drains chunks unless the caller asked `--with-chunks`.
+    #[serde(default)]
+    pub pending_chunks: usize,
 }
 
 /// Granular catalog vs live-source readiness for operator tooling.
@@ -323,6 +327,7 @@ pub fn rebuild_with_progress(
         catalog_path: catalog_path.display().to_string(),
         wall_ms: started.elapsed().as_millis() as u64,
         cards_written: 0,
+        pending_chunks: 0,
     };
     progress.stage = RebuildStage::Complete;
     progress.sessions = report.total_sessions;
@@ -1034,7 +1039,8 @@ fn entry_from_source(agent: AgentKind, source: &CatalogSource) -> CatalogEntry {
     let project = cwd
         .as_deref()
         .and_then(project_from_cwd)
-        .or_else(|| infer_project_from_path(agent, &source.path));
+        .or_else(|| infer_project_from_path(agent, &source.path))
+        .map(|slug| canonicalize_project_slug(&slug));
     let date = source
         .fingerprint
         .modified_unix_nanos
@@ -1124,10 +1130,10 @@ fn merge_session_info(
         if let Some(remote_project) = project_from_git_remote(repo_path) {
             entry.project = Some(remote_project);
         } else if entry.project.is_none() {
-            entry.project = info.project.clone();
+            entry.project = info.project.as_deref().map(canonicalize_project_slug);
         }
     } else if entry.project.is_none() {
-        entry.project = info.project.clone();
+        entry.project = info.project.as_deref().map(canonicalize_project_slug);
     }
     if entry.title.is_none() {
         entry.title = info.title.clone();
@@ -1334,10 +1340,10 @@ fn project_from_cwd(cwd: &str) -> Option<String> {
             && owner.len() >= 2
             && repo.len() >= 2
         {
-            return Some(format!("{owner}/{repo}"));
+            return Some(canonicalize_project_slug(&format!("{owner}/{repo}")));
         }
     }
-    Some(seg.to_string())
+    Some(canonicalize_project_slug(seg))
 }
 
 fn reattribute_catalog_entries(entries: &mut BTreeMap<(String, String), CatalogEntry>) -> usize {
@@ -1351,11 +1357,12 @@ fn reattribute_catalog_entries(entries: &mut BTreeMap<(String, String), CatalogE
             .entry(cwd.to_string())
             .or_insert_with(|| project_from_git_remote(cwd))
             .clone();
-        if let Some(project) = remote_project
-            && entry.project.as_deref() != Some(project.as_str())
-        {
-            entry.project = Some(project);
-            changed += 1;
+        if let Some(project) = remote_project {
+            let project = canonicalize_project_slug(&project);
+            if entry.project.as_deref() != Some(project.as_str()) {
+                entry.project = Some(project);
+                changed += 1;
+            }
         }
     }
     changed
@@ -1398,7 +1405,21 @@ pub fn project_slug_from_remote(remote: &str) -> Option<String> {
     if organization.is_empty() || repository.is_empty() {
         return None;
     }
-    Some(format!("{organization}/{repository}"))
+    Some(canonicalize_project_slug(&format!(
+        "{organization}/{repository}"
+    )))
+}
+
+/// Case-fold and normalize separators so catalog admission does not mint
+/// parallel buckets (`VetCoders/vibecrafted` vs `vetcoders/vibecrafted`).
+/// Hyphens inside a segment stay; only path separators are folded.
+pub(crate) fn canonicalize_project_slug(raw: &str) -> String {
+    raw.replace('\\', "/")
+        .split('/')
+        .filter(|segment| !segment.trim().is_empty())
+        .map(|segment| segment.trim().to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 fn hostname() -> Option<String> {
@@ -1792,7 +1813,11 @@ mod tests {
     fn remote_slug_parser_accepts_https_and_scp_shapes() {
         assert_eq!(
             project_slug_from_remote("https://github.com/Loctree/aicx.git"),
-            Some("Loctree/aicx".to_string())
+            Some("loctree/aicx".to_string())
+        );
+        assert_eq!(
+            project_slug_from_remote("https://github.com/VetCoders/vibecrafted.git"),
+            Some("vetcoders/vibecrafted".to_string())
         );
         assert_eq!(
             project_slug_from_remote("git@github.com:vetcoders/pensieve.git"),
@@ -1859,5 +1884,18 @@ mod tests {
         let refreshed = read_entries_at(&home).unwrap();
         assert_eq!(refreshed[0].project.as_deref(), Some("vetcoders/pensieve"));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn project_slug_canonicalizes_case_and_separators() {
+        assert_eq!(
+            canonicalize_project_slug("VetCoders/vibecrafted"),
+            "vetcoders/vibecrafted"
+        );
+        assert_eq!(
+            canonicalize_project_slug(r"VetCoders\CodeScribe"),
+            "vetcoders/codescribe"
+        );
+        assert_eq!(canonicalize_project_slug("/vibecrafted/"), "vibecrafted");
     }
 }

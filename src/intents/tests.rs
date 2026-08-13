@@ -7,6 +7,23 @@ use std::path::PathBuf;
 
 #[cfg(feature = "app")]
 #[test]
+fn catalog_rebuild_does_not_clear_hot_live_stamp() {
+    assert!(
+        session_is_hot_live(true, true),
+        "mtime-in-window sessions stay live after census fingerprints match"
+    );
+    assert!(
+        !session_is_hot_live(true, false),
+        "cold mtime must not be stamped live"
+    );
+    assert!(
+        !session_is_hot_live(false, true),
+        "live scan off must not invent live_open"
+    );
+}
+
+#[cfg(feature = "app")]
+#[test]
 fn per_frame_cwd_prevents_cross_repo_session_contamination() {
     let frame = |cwd: Option<&str>, message: &str| crate::timeline::TimelineEntry {
         timestamp: Utc::now(),

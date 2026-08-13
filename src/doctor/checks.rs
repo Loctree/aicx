@@ -558,6 +558,10 @@ async fn run_deep_impl(
     }
 
     let sidecar_coverage = sidecars.clone();
+    let continuity_freshness = {
+        let base = base.to_path_buf();
+        check_continuity_freshness(&base)
+    };
 
     let overall = max_severity(&[
         canonical_store.severity,
@@ -574,6 +578,7 @@ async fn run_deep_impl(
         empty_body_chunks.severity,
         content_dedup.severity,
         context_corpus.severity,
+        continuity_freshness.severity,
     ]);
 
     Ok(Some(DoctorReport {
@@ -593,6 +598,7 @@ async fn run_deep_impl(
         empty_body_chunks,
         content_dedup,
         context_corpus,
+        continuity_freshness,
         aicx_home,
         binary_pair,
         http_auth_token,
@@ -901,6 +907,7 @@ pub(crate) async fn run_fast_impl(
         }
     };
     let context_corpus = check_context_corpus_fast(base, budget);
+    let continuity_freshness = check_continuity_freshness(base);
     let aicx_home = check_aicx_home(base);
     let binary_pair = check_binary_pair();
     let http_auth_token = check_http_auth_token();
@@ -921,6 +928,7 @@ pub(crate) async fn run_fast_impl(
         empty_body_chunks.severity,
         content_dedup.severity,
         context_corpus.severity,
+        continuity_freshness.severity,
     ]);
 
     DoctorReport {
@@ -940,6 +948,7 @@ pub(crate) async fn run_fast_impl(
         empty_body_chunks,
         content_dedup,
         context_corpus,
+        continuity_freshness,
         aicx_home,
         binary_pair,
         http_auth_token,
@@ -1377,6 +1386,71 @@ pub(crate) fn list_indexed_buckets(indexed_root: &Path) -> Vec<String> {
 /// incremental refresh, `aicx index --full-rescan` for a from-zero
 /// rebuild. Path interpolation flows through `doctor_home_label` so the
 /// recommendation tracks `$AICX_HOME` like the other 8 doctor strings.
+/// Product check: doctor Green must not ignore a live 24h window that
+/// continuity cannot serve. Pending chunks or a stale newest-session
+/// stamp while sources are still hot is a warning, not a quiet pass.
+pub(crate) fn check_continuity_freshness(base: &Path) -> CheckResult {
+    const HOT_WINDOW: Duration = Duration::from_secs(24 * 3600);
+    let now = SystemTime::now();
+    let cutoff = now
+        .checked_sub(HOT_WINDOW)
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+    let entries = crate::catalog::read_entries_at(base).unwrap_or_default();
+    let mut hot_sources = 0usize;
+    for entry in &entries {
+        let mtime_ns = crate::catalog::live_source_fingerprint(Path::new(&entry.source_path))
+            .map(|(_, ns)| ns)
+            .or(entry.source_mtime_ns);
+        if mtime_ns.is_some_and(|ns| unix_ns_at_or_after(ns, cutoff)) {
+            hot_sources += 1;
+        }
+    }
+
+    let status = crate::api::index_status_at(base, None).ok();
+    let pending = status.as_ref().map(|s| s.pending_chunks).unwrap_or(0);
+    let newer = status
+        .as_ref()
+        .map(|s| s.sessions_newer_than_chunks)
+        .unwrap_or(0);
+
+    if hot_sources == 0 {
+        return CheckResult {
+            name: "continuity_freshness".to_string(),
+            severity: Severity::Green,
+            detail: "no live session sources inside the 24h hot window".to_string(),
+            recommendation: None,
+        };
+    }
+
+    if pending > 0 || newer > 0 {
+        return CheckResult {
+            name: "continuity_freshness".to_string(),
+            severity: Severity::Warning,
+            detail: format!(
+                "{hot_sources} live source(s) in 24h window, but index lag pending_chunks={pending} sessions_newer_than_chunks={newer}"
+            ),
+            recommendation: Some(
+                "Run `aicx catalog rebuild --with-chunks` or `aicx index` so continuity is not census-blind".to_string(),
+            ),
+        };
+    }
+
+    CheckResult {
+        name: "continuity_freshness".to_string(),
+        severity: Severity::Green,
+        detail: format!("{hot_sources} live source(s) in 24h window; pending_chunks=0"),
+        recommendation: None,
+    }
+}
+
+fn unix_ns_at_or_after(mtime_ns: u64, cutoff: SystemTime) -> bool {
+    let secs = mtime_ns / 1_000_000_000;
+    let nanos = (mtime_ns % 1_000_000_000) as u32;
+    SystemTime::UNIX_EPOCH
+        .checked_add(Duration::new(secs, nanos))
+        .is_some_and(|mtime| mtime >= cutoff)
+}
+
 pub(crate) fn check_index_freshness(base: &Path) -> CheckResult {
     let indexed_root = base.join("indexed");
     let newest_chunk = newest_mtime(&base.join("store"))
