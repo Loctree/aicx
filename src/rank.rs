@@ -1713,14 +1713,14 @@ Some boilerplate text.
 
         let vista_path = write_canonical_search_fixture(
             &root,
-            "Vetcoders",
+            "vetcoders",
             "Vista",
             "sessvista",
             "[project: vetcoders/Vista | agent: codex | date: 2026-05-24]\n\nDecision: strictneedle belongs to the exact Vista repository.\n",
         );
         write_canonical_search_fixture(
             &root,
-            "Vetcoders",
+            "vetcoders",
             "vista-portal",
             "sessportal",
             "[project: vetcoders/vista-portal | agent: codex | date: 2026-05-24]\n\nDecision: strictneedle must not leak through a bare vista filter.\n",
@@ -1751,7 +1751,7 @@ Some boilerplate text.
 
         write_canonical_search_fixture(
             &root,
-            "Vetcoders",
+            "vetcoders",
             "aicx",
             "sessaicx",
             "User asked:\nWhy did we move embeddings to Sztudio?\n\nAgent answered:\nDecision: foundationneedle belongs in the content match, not in a metadata banner.\n",
@@ -1785,7 +1785,7 @@ Some boilerplate text.
 
         write_canonical_search_fixture(
             &root,
-            "Vetcoders",
+            "vetcoders",
             "Vista",
             "sessfront",
             "---\nproject: vetcoders/Vista\nagent: codex\ndate: 2026-05-24\nframe_kind: agent_reply\n---\n\nDecision: frontneedle lives only in the body.\n",

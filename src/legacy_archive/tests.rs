@@ -1,5 +1,7 @@
 use super::*;
+use crate::timeline::TimelineEntry;
 use chrono::TimeZone;
+use dedupe::DirShaCache;
 use filetime::{FileTime, set_file_mtime};
 use std::{env, fs};
 
@@ -734,7 +736,7 @@ fn scan_retrieves_repo_centric_files_with_correct_metadata() {
     // store/vetcoders/ai-contexters/2026_0321/conversations/claude/<file>.md
     let chunk_dir = root
         .join("store")
-        .join("Vetcoders")
+        .join("vetcoders")
         .join("ai-contexters")
         .join("2026_0321")
         .join("conversations")
@@ -920,7 +922,7 @@ fn read_context_chunk_accepts_relative_path_file_name_and_compact_ref() {
 
     let chunk_path = root
         .join("store")
-        .join("Vetcoders")
+        .join("vetcoders")
         .join("ai-contexters")
         .join("2026_0321")
         .join("conversations")
@@ -1095,7 +1097,7 @@ fn scan_retrieves_both_repo_and_non_repo_files_together() {
     // Repo-centric file
     let repo_dir = root
         .join("store")
-        .join("Vetcoders")
+        .join("vetcoders")
         .join("loctree")
         .join("2026_0320")
         .join("reports")
@@ -1320,7 +1322,7 @@ fn scan_context_files_respects_aicxignore_and_negation() {
 
     let ignored = root
         .join("store")
-        .join("Vetcoders")
+        .join("vetcoders")
         .join("ai-contexters")
         .join("2026_0331")
         .join("reports")
@@ -1328,7 +1330,7 @@ fn scan_context_files_respects_aicxignore_and_negation() {
         .join("2026_0331_codex_sess-rpt_001.md");
     let kept = root
         .join("store")
-        .join("Vetcoders")
+        .join("vetcoders")
         .join("ai-contexters")
         .join("2026_0331")
         .join("conversations")

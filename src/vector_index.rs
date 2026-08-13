@@ -3244,10 +3244,9 @@ mod source_hybrid_publish_tests {
         ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("indexed").join("_all").join("hybrid")).unwrap();
-        // Point hybrid_root via AICX_HOME
-        let prev = std::env::var_os("AICX_HOME");
-        // SAFETY: test-only env isolation
-        unsafe { std::env::set_var("AICX_HOME", &root) };
+        // Point hybrid_root via AICX_HOME under the shared env lock — raw
+        // set_var here raced the iter3 AICX_HOME-scoped tests.
+        let _home = super::iter3_tests::ScopedAicxHome::set(&root);
 
         let chunk = ChunkRef {
             id: "claude:sess-1".into(),
@@ -3274,10 +3273,7 @@ mod source_hybrid_publish_tests {
         );
         assert!(!current_dense_not_built().unwrap());
 
-        match prev {
-            Some(v) => unsafe { std::env::set_var("AICX_HOME", v) },
-            None => unsafe { std::env::remove_var("AICX_HOME") },
-        }
+        drop(_home);
         let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -714,14 +714,19 @@ fn tempdir_for_test() -> std::path::PathBuf {
 /// Required for tests that exercise code paths inside
 /// `query_index_with_embedding` etc., which acquire the canonical
 /// `lance.lock` derived from `AICX_HOME`.
-struct ScopedAicxHome {
+pub(super) struct ScopedAicxHome {
     previous: Option<std::ffi::OsString>,
     _guard: std::sync::MutexGuard<'static, ()>,
 }
 
 impl ScopedAicxHome {
-    fn set(home: &std::path::Path) -> Self {
-        let guard = AICX_HOME_ENV_LOCK.lock().expect("AICX_HOME test lock");
+    pub(super) fn set(home: &std::path::Path) -> Self {
+        // A panic under the guard poisons the mutex; recover the inner guard
+        // so one genuine failure does not cascade into phantom PoisonErrors
+        // across every later AICX_HOME-scoped test.
+        let guard = AICX_HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let previous = std::env::var_os("AICX_HOME");
         // SAFETY: env mutation is single-threaded within this test scope;
         // the RAII guard restores prior state on drop.
