@@ -794,7 +794,7 @@ mod tests {
         let segments = semantic_segments(&entries);
         assert_eq!(segments.len(), 2);
         assert_eq!(segments[0].project_label(), "vetcoders/ai-contexters");
-        assert_eq!(segments[1].project_label(), "vetcoders/loctree");
+        assert_eq!(segments[1].project_label(), "Loctree/loctree");
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -1026,7 +1026,7 @@ mod tests {
                 "remote",
                 "add",
                 "origin",
-                "git@github.com:vetcoders/loctree.git",
+                "git@github.com:Loctree/loctree.git",
             ])
             .output()
             .expect("git remote add");
@@ -1042,7 +1042,7 @@ mod tests {
         let tiered = infer_tiered_identity_from_entry(&e, &ProjectHashRegistry::default())
             .expect("should resolve");
         assert_eq!(tiered.tier, SourceTier::Primary);
-        assert_eq!(tiered.identity.slug(), "vetcoders/loctree");
+        assert_eq!(tiered.identity.slug(), "Loctree/loctree");
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -1454,7 +1454,7 @@ mod tests {
             (2026, 5, 19, 10, 0, 0),
             "sess-url",
             "user",
-            "See https://github.com/vetcoders/aicx for context.",
+            "See https://github.com/Loctree/aicx for context.",
             None,
         );
         assert!(
@@ -1473,7 +1473,7 @@ mod tests {
             (2026, 5, 19, 10, 0, 0),
             "sess-bucket",
             "user",
-            "Read https://github.com/vetcoders/aicx and tell me what you see.",
+            "Read https://github.com/Loctree/aicx and tell me what you see.",
             None,
         );
         let resolution = resolve_bucket(&e, &ProjectHashRegistry::default());
@@ -1487,7 +1487,7 @@ mod tests {
         // (Primary identity, real .git on disk) and whose middle chunk simply
         // mentions a different repo URL must stay as ONE segment with the
         // owner-correct identity. Pre-fix this split into two segments
-        // (vetcoders/Vista → vetcoders/aicx Fallback) and the second chunk
+        // (vetcoders/Vista → Loctree/aicx Fallback) and the second chunk
         // routed away from its real owner.
         let root = mk_tmp_dir("segment-no-split-on-url");
         let repo = root.join("Git").join("Vetcoders").join("vista");
@@ -1518,7 +1518,7 @@ mod tests {
                 (2026, 5, 19, 10, 1, 0),
                 "sess-no-split",
                 "assistant",
-                "See https://github.com/vetcoders/aicx for the shared parser.",
+                "See https://github.com/Loctree/aicx for the shared parser.",
                 None,
             ),
             entry(

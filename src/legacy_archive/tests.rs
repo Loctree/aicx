@@ -1097,7 +1097,7 @@ fn scan_retrieves_both_repo_and_non_repo_files_together() {
     // Repo-centric file
     let repo_dir = root
         .join("store")
-        .join("vetcoders")
+        .join("Loctree")
         .join("loctree")
         .join("2026_0320")
         .join("reports")
@@ -1121,7 +1121,7 @@ fn scan_retrieves_both_repo_and_non_repo_files_together() {
     let scanned = scan_context_files_at(&root).expect("scan should succeed");
     assert_eq!(scanned.len(), 2);
 
-    let repo_file = scanned.iter().find(|f| f.project == "vetcoders/loctree");
+    let repo_file = scanned.iter().find(|f| f.project == "Loctree/loctree");
     let non_repo_file = scanned
         .iter()
         .find(|f| f.project == NON_REPOSITORY_CONTEXTS);

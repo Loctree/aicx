@@ -1196,11 +1196,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).expect("create root");
 
-        let status = index_status_at_with_sessions(&root, Some("vetcoders/Loctree"), Some(&[]))
+        let status = index_status_at_with_sessions(&root, Some("Loctree/loctree"), Some(&[]))
             .expect("index status with project");
 
         // Mirrors the on-disk bucket: lowercase + path separators replaced.
-        assert_eq!(status.project_bucket, "vetcoders_loctree");
+        assert_eq!(status.project_bucket, "loctree_loctree");
         assert_eq!(status.readiness, IndexReadiness::Missing);
 
         let _ = std::fs::remove_dir_all(root);

@@ -358,7 +358,7 @@ fn check_corpus_buckets_flags_template_literals() {
     // them on Windows — they are an impossible input there, not a skipped
     // case. Create + assert them on non-Windows only.
     #[cfg(not(windows))]
-    std::fs::create_dir_all(store.join("vetcoders").join("loctree\n\n**AICX")).unwrap();
+    std::fs::create_dir_all(store.join("Loctree").join("loctree\n\n**AICX")).unwrap();
     // Template-placeholder leaks (leading `{`, `<`, `$`):
     std::fs::create_dir_all(store.join("{target_owner}")).unwrap();
     #[cfg(not(windows))]
@@ -376,7 +376,7 @@ fn check_corpus_buckets_flags_template_literals() {
     assert!(result.detail.contains("$RELEASE_REPO"));
     assert!(result.detail.contains("vetcoders/vibecrafted.git`"));
     #[cfg(not(windows))]
-    assert!(result.detail.contains("vetcoders/loctree"));
+    assert!(result.detail.contains("Loctree/loctree"));
 
     let _ = std::fs::remove_dir_all(&tmp);
 }
@@ -509,12 +509,12 @@ fn empty_body_chunks_red_when_over_threshold_and_script_is_reviewable() {
     let full = dir.join("2026_0506_claude_sess-full_001.md");
     std::fs::write(
         &empty,
-        "[project: vetcoders/aicx | agent: claude | date: 2026-05-06 | frame_kind: internal_thought]\n\n",
+        "[project: Loctree/aicx | agent: claude | date: 2026-05-06 | frame_kind: internal_thought]\n\n",
     )
     .unwrap();
     std::fs::write(
         &full,
-        "[project: vetcoders/aicx | agent: claude | date: 2026-05-06]\n\nThis chunk carries enough real body content to avoid the empty-body threshold.",
+        "[project: Loctree/aicx | agent: claude | date: 2026-05-06]\n\nThis chunk carries enough real body content to avoid the empty-body threshold.",
     )
     .unwrap();
 
@@ -594,13 +594,13 @@ fn apply_prune_empty_bodies_moves_chunks_to_quarantine_and_rechecks() {
     let empty_sidecar = empty.with_extension("meta.json");
     std::fs::write(
         &empty,
-        "[project: vetcoders/aicx | agent: claude | date: 2026-05-06 | frame_kind: internal_thought]\n\n",
+        "[project: Loctree/aicx | agent: claude | date: 2026-05-06 | frame_kind: internal_thought]\n\n",
     )
     .unwrap();
     std::fs::write(&empty_sidecar, "{}").unwrap();
     std::fs::write(
         &full,
-        "[project: vetcoders/aicx | agent: claude | date: 2026-05-06]\n\nThis chunk carries enough real body content to avoid the empty-body threshold.",
+        "[project: Loctree/aicx | agent: claude | date: 2026-05-06]\n\nThis chunk carries enough real body content to avoid the empty-body threshold.",
     )
     .unwrap();
 
@@ -896,7 +896,7 @@ fn empty_body_frame_kind_prefers_sidecar_and_falls_back_to_header() {
     let with_sidecar = dir.join("2026_0702_claude_sess-sidecar_001.md");
     std::fs::write(
         &with_sidecar,
-        "[project: vetcoders/aicx | agent: claude | date: 2026-07-02 | frame_kind: internal_thought]\n\n",
+        "[project: Loctree/aicx | agent: claude | date: 2026-07-02 | frame_kind: internal_thought]\n\n",
     )
     .unwrap();
     std::fs::write(
@@ -908,7 +908,7 @@ fn empty_body_frame_kind_prefers_sidecar_and_falls_back_to_header() {
     // No sidecar — the legacy bracket header fills in.
     std::fs::write(
         dir.join("2026_0702_claude_sess-header_001.md"),
-        "[project: vetcoders/aicx | agent: claude | date: 2026-07-02 | frame_kind: internal_thought]\n\n",
+        "[project: Loctree/aicx | agent: claude | date: 2026-07-02 | frame_kind: internal_thought]\n\n",
     )
     .unwrap();
 

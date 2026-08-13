@@ -86,7 +86,7 @@ fn apply_empty_body_quarantine_moves_to_recoverable_dir_not_delete() {
     let empty_sidecar = empty_chunk.with_extension("meta.json");
     std::fs::write(
         &empty_chunk,
-        "[project: vetcoders/aicx | agent: claude | date: 2026-05-06 | frame_kind: internal_thought]\n\n",
+        "[project: Loctree/aicx | agent: claude | date: 2026-05-06 | frame_kind: internal_thought]\n\n",
     )
     .expect("write empty chunk");
     std::fs::write(&empty_sidecar, "{}").expect("write empty sidecar");
@@ -95,7 +95,7 @@ fn apply_empty_body_quarantine_moves_to_recoverable_dir_not_delete() {
     let full_chunk = chunk_dir.join("2026_0506_claude_sess-full_001.md");
     std::fs::write(
         &full_chunk,
-        "[project: vetcoders/aicx | agent: claude | date: 2026-05-06]\n\nReal body content that exceeds the empty-body detection threshold.",
+        "[project: Loctree/aicx | agent: claude | date: 2026-05-06]\n\nReal body content that exceeds the empty-body detection threshold.",
     )
     .expect("write full chunk");
 
@@ -216,7 +216,7 @@ fn apply_empty_body_quarantine_moves_to_recoverable_dir_not_delete() {
     // so content must be preserved exactly.
     let moved_bytes = std::fs::read(&moved_chunk).expect("read moved chunk bytes");
     assert!(
-        moved_bytes.starts_with(b"[project: vetcoders/aicx | agent: claude | date: 2026-05-06"),
+        moved_bytes.starts_with(b"[project: Loctree/aicx | agent: claude | date: 2026-05-06"),
         "quarantined chunk content must match original (rename preserves bytes)"
     );
 

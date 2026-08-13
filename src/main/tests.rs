@@ -362,7 +362,7 @@ fn index_status_routes_through_index_canonical_resolver() {
     // Canonical on-disk store: 4 buckets across 2 orgs / 3 repo names.
     // Mixed case mirrors real-world GitHub slugs (filesystem preserves it).
     let bucket_slugs = [
-        "vetcoders/Loctree",
+        "Loctree/loctree",
         "vetcoders/aicx",
         "Sampleorg/Loctree",
         "Sampleorg/Codescribe",
@@ -390,7 +390,7 @@ fn index_status_routes_through_index_canonical_resolver() {
     // The 4 canonical filter shapes from the bug brief.
     let shapes: &[(&str, &[&str])] = &[
         // strict slug
-        ("vetcoders/Loctree", &["vetcoders_loctree"]),
+        ("Loctree/loctree", &["vetcoders_loctree"]),
         // org wildcard
         ("vetcoders/", &["vetcoders_aicx", "vetcoders_loctree"]),
         // cross-org repo (explicit wildcard — selects every org on purpose)
@@ -410,7 +410,7 @@ fn index_status_routes_through_index_canonical_resolver() {
         "fail-closed error must name the ambiguity:\n{bare_message}"
     );
     assert!(
-        bare_message.contains("Sampleorg/Loctree") && bare_message.contains("vetcoders/Loctree"),
+        bare_message.contains("Sampleorg/Loctree") && bare_message.contains("Loctree/loctree"),
         "fail-closed error must list both candidates:\n{bare_message}"
     );
 

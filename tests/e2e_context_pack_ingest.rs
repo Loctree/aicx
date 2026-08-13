@@ -127,7 +127,7 @@ fn context_pack_ingest_retains_immutable_pack_and_live_reads_skip_examples() {
 
     write_file(
         &pack.join("raw").join("ctx-example.md"),
-        "[project: vetcoders/aicx | agent: loct-context-pack | date: 2026-05-08]\n\n[signals]\nDecision:\n- [decision] Frozen prism example must not become live truth\n[/signals]\n",
+        "[project: Loctree/aicx | agent: loct-context-pack | date: 2026-05-08]\n\n[signals]\nDecision:\n- [decision] Frozen prism example must not become live truth\n[/signals]\n",
     );
     write_file(
         &pack.join("sidecars").join("ctx-example.json"),
@@ -207,7 +207,7 @@ fn context_pack_ingest_retains_immutable_pack_and_live_reads_skip_examples() {
     let live_chunk = live_dir.join("2026_0508_codex_live-sess_001.md");
     write_file(
         &live_chunk,
-        "[project: vetcoders/aicx | agent: codex | date: 2026-05-08]\n\n[signals]\nDecision:\n- [decision] Live truth survives intent scan\n[/signals]\n",
+        "[project: Loctree/aicx | agent: codex | date: 2026-05-08]\n\n[signals]\nDecision:\n- [decision] Live truth survives intent scan\n[/signals]\n",
     );
     write_file(
         &live_chunk.with_extension("meta.json"),
@@ -224,7 +224,7 @@ fn context_pack_ingest_retains_immutable_pack_and_live_reads_skip_examples() {
     let example_chunk = live_dir.join("2026_0508_codex_example-sess_001.md");
     write_file(
         &example_chunk,
-        "[project: vetcoders/aicx | agent: codex | date: 2026-05-08]\n\n[signals]\nDecision:\n- [decision] Frozen example must be filtered\n[/signals]\n",
+        "[project: Loctree/aicx | agent: codex | date: 2026-05-08]\n\n[signals]\nDecision:\n- [decision] Frozen example must be filtered\n[/signals]\n",
     );
     write_file(
         &example_chunk.with_extension("meta.json"),

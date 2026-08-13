@@ -128,7 +128,7 @@ mod tests {
 
         // Mid-segment garbage still rejected (extractor-bug evidence):
         assert!(!is_valid_repo_project_slug("vetcoders/vibecrafted.git`"));
-        assert!(!is_valid_repo_project_slug("vetcoders/loctree\n\n**AICX"));
+        assert!(!is_valid_repo_project_slug("Loctree/loctree\n\n**AICX"));
         assert!(!is_valid_repo_project_slug(
             "vetcoders/loctxc_O)outcomqqqqqqq]]qqqqqqqqqqqqqqqqqqqqqqqqqqq;;'["
         ));

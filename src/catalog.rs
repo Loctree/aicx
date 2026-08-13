@@ -1816,7 +1816,7 @@ mod tests {
             Some("loctree/aicx".to_string())
         );
         assert_eq!(
-            project_slug_from_remote("https://github.com/VetCoders/vibecrafted.git"),
+            project_slug_from_remote("https://github.com/vetcoders/vibecrafted.git"),
             Some("vetcoders/vibecrafted".to_string())
         );
         assert_eq!(

@@ -1921,7 +1921,7 @@ Some boilerplate text.
                 label: "HIGH".to_string(),
                 density: 1.0,
                 matched_lines: vec![
-                    "[metadata] project: vetcoders/aicx | agent: codex | date: 2026-06-19 | kind: conversations | path: /tmp/chunk.md".to_string(),
+                    "[metadata] project: Loctree/aicx | agent: codex | date: 2026-06-19 | kind: conversations | path: /tmp/chunk.md".to_string(),
                 ],
                 session_id: Some("sess-456".to_string()),
                 cwd: None,
