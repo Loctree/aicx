@@ -109,6 +109,7 @@ pub(crate) fn extract_intents_from_root_at_with_stats(
         cutoff,
         config.effective_frame_kind(),
         config.live,
+        config.hours == 0,
     )?;
     let scanned_count = files.len();
     let source_paths_verified = source_errors == 0 && verify_stored_chunk_paths(&files);
@@ -118,7 +119,9 @@ pub(crate) fn extract_intents_from_root_at_with_stats(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
-    let identity_source = if corpus_identity_source == CATALOG_IDENTITY_SOURCE {
+    let identity_source = if corpus_identity_source == INDEX_IDENTITY_SOURCE {
+        INDEX_IDENTITY_SOURCE
+    } else if corpus_identity_source == CATALOG_IDENTITY_SOURCE {
         CATALOG_IDENTITY_SOURCE
     } else if files
         .iter()
@@ -146,6 +149,20 @@ pub(crate) fn extract_intents_from_root_at_with_stats(
             file.transcript_entries.as_ref()
         {
             (Vec::new(), transcript_entries.clone())
+        } else if let Some(body) = file.body.as_ref() {
+            // Served from the committed index: the document is already in
+            // memory and needs no disk read or transcript re-parse.
+            //
+            // The census path narrows frames to the requested channel before
+            // the classifier ever sees them; the index stores the whole
+            // extract, so the same narrowing happens here instead. Without it
+            // `--frame-kind user_msg` would silently classify assistant prose
+            // as operator intent.
+            let mut transcript_entries = parse_extract_document(body);
+            let wanted = config.effective_frame_kind();
+            transcript_entries
+                .retain(|entry| FrameKind::parse(&entry.role).is_some_and(|kind| kind == wanted));
+            (Vec::new(), transcript_entries)
         } else {
             let content = sanitize::read_to_string_validated(&file.path)
                 .with_context(|| format!("Failed to read chunk file: {}", file.path.display()))?;
@@ -351,6 +368,104 @@ fn extend_with_cap<T>(
     dropped
 }
 
+/// Identity provenance for records served from the committed lexical index.
+pub const INDEX_IDENTITY_SOURCE: &str = "index-v1";
+
+/// Serve chunk documents from the committed lexical index.
+///
+/// The index already stores, per session, the canonical extract verbatim plus
+/// the resolved identity (project, agent, date, session id, cwd) — the exact
+/// inputs this module used to rebuild by re-parsing every original transcript
+/// on every call. Reading them back is the same work `aicx search` does in
+/// milliseconds.
+///
+/// Returns `None` when the index cannot serve the request, so the caller falls
+/// back to the census walk instead of silently reporting an empty timeline:
+/// - no published CURRENT generation (`aicx index` never ran),
+/// - a hot-window request, where freshly written sessions are not committed
+///   yet and only the live source scan can see them, or
+/// - a full-history request (`hours == 0`), which is the durable-identity join
+///   `overlay` performs. Overlay freezes `intent1:` evidence refs, so its input
+///   set must stay the census: the index is signal-filtered at write time and
+///   covers only what was committed, and swapping the source under it would
+///   move revisions that are meant to be stable.
+#[cfg(feature = "app")]
+fn collect_intent_files_from_index(
+    aicx_home: &Path,
+    project: &str,
+    cutoff: DateTime<Utc>,
+    live: bool,
+    full_history: bool,
+) -> Option<Vec<StoredChunkFile>> {
+    if live || full_history {
+        return None;
+    }
+    let adapter = crate::steer_index::open_current_adapter_at(aicx_home).ok()?;
+    let cutoff_date = cutoff.date_naive();
+
+    let chunks = adapter
+        .scan_chunks(adapter.doc_count, |metadata| {
+            let stored_project = metadata.get("project").and_then(|value| value.as_str());
+            let Some(stored_project) = stored_project else {
+                return false;
+            };
+            if !project.trim().is_empty() {
+                let (organization, repository) = stored_project
+                    .split_once('/')
+                    .unwrap_or(("", stored_project));
+                if !legacy_archive::project_filter_matches(organization, repository, project) {
+                    return false;
+                }
+            }
+            metadata
+                .get("date")
+                .and_then(|value| value.as_str())
+                .and_then(|date| NaiveDate::parse_from_str(date, "%Y-%m-%d").ok())
+                .is_some_and(|date| date >= cutoff_date)
+        })
+        .ok()?;
+
+    let mut files = Vec::with_capacity(chunks.len());
+    for chunk in chunks {
+        let metadata = &chunk.metadata;
+        let field = |key: &str| {
+            metadata
+                .get(key)
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .to_string()
+        };
+        let date = field("date");
+        let Some(timestamp) = NaiveDate::parse_from_str(&date, "%Y-%m-%d")
+            .ok()
+            .and_then(|day| day.and_hms_opt(0, 0, 0))
+            .map(|naive| naive.and_utc())
+        else {
+            continue;
+        };
+        files.push(StoredChunkFile {
+            agent: field("agent"),
+            date,
+            path: PathBuf::from(field("source_path")),
+            project: field("project"),
+            identity_source: INDEX_IDENTITY_SOURCE.to_string(),
+            sequence: 0,
+            timestamp,
+            session_id: field("session_id"),
+            honesty: crate::oracle::ClaimHonesty::canonical(),
+            transcript_entries: None,
+            body: Some(chunk.text),
+        });
+    }
+
+    files.sort_by(|left, right| {
+        left.timestamp
+            .cmp(&right.timestamp)
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    Some(files)
+}
+
 #[cfg(feature = "app")]
 fn collect_intent_files(
     aicx_home: &Path,
@@ -358,7 +473,15 @@ fn collect_intent_files(
     cutoff: DateTime<Utc>,
     frame_kind: FrameKind,
     live: bool,
+    full_history: bool,
 ) -> Result<(Vec<StoredChunkFile>, usize, &'static str, usize)> {
+    // Prefer the committed index: same documents, no transcript re-parse.
+    if let Some(files) =
+        collect_intent_files_from_index(aicx_home, project, cutoff, live, full_history)
+    {
+        return Ok((files, 0, INDEX_IDENTITY_SOURCE, 0));
+    }
+
     let entries = crate::catalog::read_entries_at(aicx_home)?;
     if entries.is_empty() {
         return Ok((
@@ -471,6 +594,7 @@ fn collect_intent_files(
                 crate::oracle::ClaimHonesty::canonical()
             },
             transcript_entries: Some(transcript_entries),
+            body: None,
         });
     }
 
@@ -585,6 +709,7 @@ fn collect_live_unadmitted_files(
             session_id: entry.session_id,
             honesty: crate::oracle::ClaimHonesty::live_open(),
             transcript_entries: Some(transcript_entries),
+            body: None,
         });
     }
     Ok(admitted)
@@ -650,11 +775,14 @@ fn collect_intent_files(
     cutoff: DateTime<Utc>,
     frame_kind: FrameKind,
     _live: bool,
+    _full_history: bool,
 ) -> Result<(Vec<StoredChunkFile>, usize, &'static str, usize)> {
     // `loctree-consumer` is the legacy read-core profile: it deliberately
-    // excludes app-only source discovery and catalog parsing. Keep pure intent
-    // extraction available over explicitly supplied legacy artifacts without
-    // pulling the full CLI/index graph into the library feature.
+    // excludes app-only source discovery and catalog parsing — including the
+    // lexical index, so the window/live/full-history distinctions have no
+    // source to choose between here. Keep pure intent extraction available
+    // over explicitly supplied legacy artifacts without pulling the full
+    // CLI/index graph into the library feature.
     Ok((
         collect_legacy_chunk_files(aicx_home, project, cutoff, frame_kind)?,
         0,
@@ -758,6 +886,7 @@ fn collect_legacy_chunk_files(
             session_id: file.session_id,
             honesty,
             transcript_entries: None,
+            body: None,
         });
     }
 
@@ -810,6 +939,58 @@ fn combine_date_time(date: NaiveDate, time: &str) -> Option<DateTime<Utc>> {
     let time = NaiveTime::parse_from_str(time, "%H%M%S").ok()?;
     let datetime = NaiveDateTime::new(date, time);
     Some(DateTime::<Utc>::from_naive_utc_and_offset(datetime, Utc))
+}
+
+/// Parse a session extract as rendered into the lexical index.
+///
+/// `source_index::render_extract` emits a different shape than the card
+/// documents `parse_chunk_document` handles: a `# AICX session extract`
+/// preamble, then one `## <rfc3339> · <role>` heading per frame. Feeding it to
+/// the card parser silently loses every role — the classifier then cannot tell
+/// operator input from assistant prose, which is precisely the distinction
+/// `--frame-kind` exists to make.
+///
+/// Fenced blocks are skipped, as in the card parser: pasted shell output,
+/// diffs, dispatch briefs and repeated `/loop` directives are quoted
+/// boilerplate, not fresh intent. That is the same call `is_signal_frame`
+/// makes upstream when the extract is written.
+fn parse_extract_document(content: &str) -> Vec<TranscriptEntry> {
+    const ROLE_SEPARATOR: &str = " · ";
+
+    let mut entries: Vec<TranscriptEntry> = Vec::new();
+    let mut current: Option<TranscriptEntry> = None;
+    let mut fenced = false;
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") {
+            fenced = !fenced;
+            continue;
+        }
+        if fenced {
+            continue;
+        }
+        if let Some(heading) = trimmed.strip_prefix("## ")
+            && let Some((_timestamp, role)) = heading.rsplit_once(ROLE_SEPARATOR)
+        {
+            if let Some(entry) = current.take() {
+                entries.push(entry);
+            }
+            current = Some(TranscriptEntry {
+                role: role.trim().to_string(),
+                lines: Vec::new(),
+            });
+            continue;
+        }
+        if let Some(entry) = current.as_mut() {
+            entry.lines.push(line.to_string());
+        }
+    }
+
+    if let Some(entry) = current.take() {
+        entries.push(entry);
+    }
+    entries
 }
 
 fn parse_chunk_document(content: &str) -> (Vec<String>, Vec<TranscriptEntry>) {

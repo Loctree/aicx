@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
+### Changed
+
+- **`aicx intents` reads the committed index instead of re-parsing every
+  transcript.** The lexical index already stores each session's canonical
+  extract verbatim (`ChunkRef.text`) next to its resolved identity —
+  project, agent, date, session id, cwd — which is exactly what intent
+  extraction was rebuilding from scratch on every invocation. It now
+  reads those documents back through the new
+  `TantivyAdapter::scan_chunks` surface, the body-carrying sibling of
+  `scan_metadata`. Measured on the same query (`-p /vibecrafted --sort
+  newest -H 480`, 2492 matching sessions / 8.24 GB of source JSONL):
+  **5m27s → 7.15s**. The census walk remains the fallback for hot-window
+  requests (`--live`, windows ≤ 48h) and for machines with no published
+  `CURRENT`, so freshly written sessions are never silently dropped.
+  Records served this way are stamped `identity_source: index-v1`.
+  Full-history requests (`hours == 0`) also stay on the census: that is the
+  durable-identity join `aicx overlay` performs, and it freezes `intent1:`
+  evidence refs, so its input set must not move under it. Verified: overlay
+  revision is byte-identical before and after this change.
+  Frames are still narrowed to the requested `--frame-kind` before
+  classification, so serving whole extracts does not quietly promote
+  assistant prose to operator intent.
+
 ## [0.12.2] - 2026-08-13
 
 ### Fixed

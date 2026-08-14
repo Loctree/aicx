@@ -554,6 +554,19 @@ pub fn hybrid_root_dir(project: Option<&str>) -> Result<PathBuf> {
         .ok_or_else(|| anyhow::anyhow!("index path has no parent: {}", path.display()))
 }
 
+/// Hybrid root under an explicitly supplied AICX home.
+///
+/// Callers that already hold a home (tests against a fixture root, or any
+/// code path threading `aicx_home` through) must not fall back to the
+/// ambient one — that silently reads the operator's real index instead of
+/// the home they were handed.
+pub(crate) fn hybrid_root_dir_at(base: &Path, project: Option<&str>) -> Result<PathBuf> {
+    let path = index_path_for(base, project);
+    path.parent()
+        .map(|parent| parent.join("hybrid"))
+        .ok_or_else(|| anyhow::anyhow!("index path has no parent: {}", path.display()))
+}
+
 /// Directory holding the published hybrid generation's artifacts
 /// (`manifest.json`, mmap dense payload, Tantivy lexical index).
 ///

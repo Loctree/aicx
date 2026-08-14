@@ -180,6 +180,57 @@ impl TantivyAdapter {
         Ok(matches)
     }
 
+    /// Scan committed chunks — metadata *and* stored body — without a query.
+    ///
+    /// `scan_metadata` answers "which sessions match"; this answers "and what
+    /// did they say", which is what a classifier needs. The body field is
+    /// `.set_stored()`, so the text is already in the index: callers that
+    /// would otherwise re-parse the original transcripts (megabytes of raw
+    /// JSONL per call) can read the same canonical extract straight from the
+    /// committed segments instead.
+    ///
+    /// The predicate sees metadata only, so non-matching documents never pay
+    /// for body decompression — the cost stays proportional to what the
+    /// caller actually keeps.
+    pub fn scan_chunks(
+        &self,
+        limit: usize,
+        mut predicate: impl FnMut(&serde_json::Value) -> bool,
+    ) -> Result<Vec<ChunkRef>> {
+        if limit == 0 || self.doc_count == 0 {
+            return Ok(Vec::new());
+        }
+
+        let reader = self.index.reader().context("open tantivy reader")?;
+        let searcher = reader.searcher();
+        let collector = TopDocs::with_limit(self.doc_count).order_by_score();
+        let docs = searcher
+            .search(&AllQuery, &collector)
+            .context("scan committed tantivy chunks")?;
+        let mut matches = Vec::new();
+        for (score, address) in docs {
+            let hit = self.hit_from_doc(&searcher, score, 0, address)?;
+            if !predicate(&hit.metadata) {
+                continue;
+            }
+            let document: TantivyDocument = searcher
+                .doc(address)
+                .context("load tantivy chunk document")?;
+            let text = text_or_empty(&document, self.fields.body);
+            let source_path = text_or_empty(&document, self.fields.source_path);
+            matches.push(ChunkRef {
+                id: hit.chunk_id,
+                source_path,
+                text,
+                metadata: hit.metadata,
+            });
+            if matches.len() >= limit {
+                break;
+            }
+        }
+        Ok(matches)
+    }
+
     /// Enumerate the exact committed chunk ids without decoding stored bodies.
     ///
     /// `id` is a unique STRING term, so the term dictionary is the cheapest
