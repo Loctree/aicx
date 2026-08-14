@@ -16,7 +16,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `TantivyAdapter::scan_chunks` surface, the body-carrying sibling of
   `scan_metadata`. Measured on the same query (`-p /vibecrafted --sort
   newest -H 480`, 2492 matching sessions / 8.24 GB of source JSONL):
-  **5m27s → 7.15s**. The census walk remains the fallback for hot-window
+  **5m27s → 21.8s**, returning the same 80 records as the census walk. The census walk remains the fallback for hot-window
   requests (`--live`, windows ≤ 48h) and for machines with no published
   `CURRENT`, so freshly written sessions are never silently dropped.
   Records served this way are stamped `identity_source: index-v1`.
