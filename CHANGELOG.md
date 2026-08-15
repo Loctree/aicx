@@ -5,6 +5,35 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
+### Added
+
+- **The Codex adapter understands the shape Codex has been writing since
+  2026-07-11.** Five record types appeared that day and the adapter had
+  never been taught any of them; two more had simply been renamed upstream.
+  In the last 40 sessions that is 6 182 records the parser could not place —
+  and the sessions are not rare: 840 of 871 July rollouts and 321 of 321
+  August ones carry them. Now handled:
+  - `event_msg/sub_agent_activity` (1 599) — Codex fans out to subagents,
+    and a session that dispatched a dozen of them read as one agent working
+    alone. Recorded as `subagent <kind>: <agent_path>`.
+  - `event_msg/patch_apply_end` (2 836) — the record of what Codex actually
+    changed on disk. Recorded as `patch apply ok|failed: <paths>` plus the
+    first stderr line; the change bodies stay out of the transcript.
+  - `response_item/agent_message` (177) — a third chat envelope carrying
+    agent-to-agent dispatch (`author → recipient`), outside the existing
+    dual-envelope suppression, so it was the one copy of that payload.
+  - `event_msg/thread_goal_updated` (31) — carries the goal objective in
+    prose, which is operator intent worth retrieving.
+  - `event_msg/turn_aborted` (20) — an interrupted turn is operator
+    behaviour, not noise.
+  - `event_msg/mcp_tool_call_end` (299) and `event_msg/web_search_end` (22)
+    are the current spellings of `mcp_tool_call_response` and
+    `web_search_complete`; both spellings stay accepted.
+  - `world_state` (875) and `inter_agent_communication_metadata` (177) are
+    session state, not conversation. They are now classified as known and
+    deliberately dropped, so they stop counting as visible coverage loss
+    the way a genuinely unrecognized payload should.
+
 ### Fixed
 
 - **Extracts are recorded verbatim instead of HTML-entity encoded.** Every

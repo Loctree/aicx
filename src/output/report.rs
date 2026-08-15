@@ -694,13 +694,13 @@ fn write_blockquote_with_code(w: &mut impl Write, message: &str) -> Result<()> {
     Ok(())
 }
 
-/// Escaping belongs to whoever turns this markdown into HTML, not to the
-/// artifact. The extract is the canonical record of what was said, and every
-/// renderer we ship already escapes on the way out — `AicxMarkdown` in
-/// `dashboard_inline_markdown.js` escapes `& < >` on every line before
-/// inlining. Escaping here on top of that produced `&amp;lt;` on screen, and
-/// turned every apostrophe in a transcript into `&#39;` for the agents and
-/// operators who read these files raw. Fidelity in, escaping at the edge.
+// Escaping belongs to whoever turns this markdown into HTML, not to the
+// artifact. The extract is the canonical record of what was said, and every
+// renderer we ship already escapes on the way out — `AicxMarkdown` in
+// `dashboard_inline_markdown.js` escapes `& < >` on every line before
+// inlining. Escaping here on top of that produced `&amp;lt;` on screen, and
+// turned every apostrophe in a transcript into `&#39;` for the agents and
+// operators who read these files raw. Fidelity in, escaping at the edge.
 
 /// Pick a code fence one backtick longer than the longest run inside `content`
 /// (minimum 3). Guarantees the fence cannot be closed early by inner backticks.
