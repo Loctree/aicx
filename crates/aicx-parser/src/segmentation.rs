@@ -752,7 +752,7 @@ mod tests {
         // segment with B's URL as identity; that smear is gone.
         let root = mk_tmp_dir("multi-repo-cwd-switch");
         let repo_a = root.join("hosted").join("Vetcoders").join("ai-contexters");
-        let repo_b = root.join("hosted").join("Vetcoders").join("loctree");
+        let repo_b = root.join("hosted").join("Loctree").join("loctree");
         for r in [&repo_a, &repo_b] {
             fs::create_dir_all(r).unwrap();
             Command::new("git").arg("init").arg(r).output().unwrap();
@@ -793,7 +793,7 @@ mod tests {
 
         let segments = semantic_segments(&entries);
         assert_eq!(segments.len(), 2);
-        assert_eq!(segments[0].project_label(), "vetcoders/ai-contexters");
+        assert_eq!(segments[0].project_label(), "Vetcoders/ai-contexters");
         assert_eq!(segments[1].project_label(), "Loctree/loctree");
 
         let _ = fs::remove_dir_all(&root);
@@ -840,7 +840,7 @@ mod tests {
         assert_eq!(segments.len(), 2);
         assert!(segments[0].repo.is_none());
         assert_eq!(segments[0].kind, Kind::Plans);
-        assert_eq!(segments[1].project_label(), "vetcoders/ai-contexters");
+        assert_eq!(segments[1].project_label(), "Vetcoders/ai-contexters");
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -1384,7 +1384,7 @@ mod tests {
         // Mac convention `/Users/<u>/Git/...` (capital G) must match the
         // lowercase `git` marker. Previously case-sensitive comparison rejected
         // it, sending identity inference into the now-removed text fallback.
-        let path = Path::new("/Users/user/Git/vetcoders/ai-contexters/src/lib.rs");
+        let path = Path::new("/Users/user/Git/Vetcoders/ai-contexters/src/lib.rs");
         let id = infer_repo_identity_from_known_layout(path).expect("Git (capital) matches");
         assert_eq!(id.organization, "Vetcoders");
         assert_eq!(id.repository, "ai-contexters");
@@ -1478,7 +1478,7 @@ mod tests {
         );
         let resolution = resolve_bucket(&e, &ProjectHashRegistry::default());
         assert_eq!(resolution.source, BucketingSource::ContentMention);
-        assert_eq!(resolution.bucket, "vetcoders/aicx");
+        assert_eq!(resolution.bucket, "Loctree/aicx");
     }
 
     #[test]

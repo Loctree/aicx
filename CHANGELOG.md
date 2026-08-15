@@ -5,7 +5,57 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
+### Fixed
+
+- **`aicx catalog refresh` reached a fixed point instead of rewriting the
+  whole census on every call.** The hot delta marked a session changed when
+  its cataloged `project` differed from the freshly scanned one — but those
+  two values come from different pipelines: the scan guesses identity from
+  the directory layout (`vibecrafted-suite/vc-slack-agent`), while the
+  catalog holds what `git remote get-url origin` resolved
+  (`vetcoders/vc-slack`). Reattribution then rewrote the scanned guess back
+  to the origin slug, so the next call found the same difference again. On
+  the owner host that meant 272 phantom "changed" rows and a full rewrite of
+  a 13 119-line catalog on every `continuity`, `dashboard`, and wizard call,
+  forever. The delta now compares post-reattribution values on both sides;
+  measured on a copy of the live census, the churn drops from 272 to 0 and
+  consecutive refreshes converge.
+- **Four red parser tests left behind by the org-identity fixture sweep.**
+  The sweep rewrote expectations that read as string literals but could not
+  see fixtures assembled from separate `.join()` components, so a segment
+  built under `hosted/Vetcoders/loctree` was asserted to be
+  `Loctree/loctree`, and a path lowercased to `/Git/vetcoders/…` was still
+  asserted to yield `Vetcoders`. Each test is now internally consistent
+  again, with the fixture directories carrying the true org.
+- **`tests/fixtures/overlay-intent-v1/` is a true mirror again.** The
+  directory is contract-bound (C0-01) to be byte-identical with
+  `loctree-suite/docs/contracts/fixtures/overlay-intent-v1/`, and an
+  aicx-owned fixture on a different schema
+  (`aicx.overlay.semantic-fixture.v1`) had been parked inside it, failing
+  `sync_fixtures.py --check`. It moved to `tests/fixtures/overlay-semantic-v1/`
+  rather than being deleted — it freezes the dedup/supersede pathology cases.
+  The mirror now verifies: 10 fixtures byte-identical in both repos.
+
 ### Changed
+
+- **A hot refresh no longer re-reads sessions the census already knows.**
+  `scan_hot_window` opened a bounded header for every source inside the
+  window — thousands of files per call — to re-derive identity that was
+  already on disk, byte for byte. Candidates whose `(path, len, mtime)`
+  fingerprint matches the catalog are now skipped before the read.
+  Measured on the live census (13 119 sessions): `catalog refresh --hours
+  720` went **11.4s → 2.6s**, and the cost stopped scaling with the window
+  (a 24h and a 720h refresh now cost the same). End to end,
+  `continuity show -p /aicx -H 720` went **30.5s → 14.9s**. The trade: path-derived
+  fields of an untouched source are not re-derived when the derivation
+  itself improves — `aicx catalog rebuild` remains the pass that does.
+- **`origin` resolution is memoized across calls.** Reattribution spawned
+  one `git remote get-url origin` per checkout on every sweep — ~500 on the
+  owner host, twice per refresh. The answers now live in
+  `<home>/catalog/remotes.json`, keyed by the checkout's git-metadata mtime,
+  so a re-pointed remote is still picked up on the next refresh without
+  paying a subprocess per row. Checkouts with a relative `cwd` are no longer
+  attributed at all: their answer was an accident of the invoking directory.
 
 - **`aicx intents` reads the committed index instead of re-parsing every
   transcript.** The lexical index already stores each session's canonical

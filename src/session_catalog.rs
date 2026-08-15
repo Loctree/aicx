@@ -483,6 +483,22 @@ impl SessionCatalog {
     /// headers ONLY for candidates whose mtime falls inside the window. The
     /// full probe pass costs minutes on real roots; a hot query cannot pay it.
     pub fn scan_hot_window(&self, cutoff_unix_ns: u128) -> Result<HotWindowScan, CatalogError> {
+        self.scan_hot_window_skipping(cutoff_unix_ns, &|_, _| false)
+    }
+
+    /// The same walk, with the caller allowed to declare a candidate already
+    /// known — a path whose fingerprint the census already holds unchanged.
+    ///
+    /// Freshness alone is not a reason to re-read: on a warm census most of
+    /// the window is sessions nothing has touched since the last pass, and
+    /// their bounded header re-derives byte-identical identity. Skipping them
+    /// is what separates a hot refresh from a rebuild. They still count into
+    /// `total_candidates` — the walk did see them.
+    pub fn scan_hot_window_skipping(
+        &self,
+        cutoff_unix_ns: u128,
+        is_known: &dyn Fn(&Path, &SourceFingerprint) -> bool,
+    ) -> Result<HotWindowScan, CatalogError> {
         let mut stats = CatalogIoStats::default();
         let candidates = self.collect_candidate_paths(&mut stats)?;
         let total_candidates = candidates.len();
@@ -493,6 +509,7 @@ impl SessionCatalog {
         let fresh: Vec<CandidatePath> = candidates
             .into_iter()
             .filter(|candidate| candidate.fingerprint.modified_unix_nanos >= cutoff_unix_ns)
+            .filter(|candidate| !is_known(&candidate.path, &candidate.fingerprint))
             .collect();
         let fresh_sources = self.probe_candidates(&fresh, &mut stats)?;
         Ok(HotWindowScan {
