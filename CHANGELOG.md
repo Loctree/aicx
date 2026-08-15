@@ -7,6 +7,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **Extracts are recorded verbatim instead of HTML-entity encoded.** Every
+  message body went through an HTML escape on its way into the Markdown
+  artifact, so a transcript reached its readers with `&#39;` for every
+  apostrophe, `&quot;` for every quote, and `&lt;`/`&gt;` around every tag —
+  1 340 such artifacts in one Codex session extract, 300+ in a Claude one.
+  The escape was also redundant and actively wrong: the dashboard's own
+  renderer (`AicxMarkdown` in `dashboard_inline_markdown.js`) escapes
+  `& < >` per line before inlining, so a `<` in a session was displayed as
+  `&amp;lt;`. Escaping now happens only at the rendering edge, where it
+  belongs; the extract keeps what was actually said. Verified on the same
+  Codex session: 1 340 artifacts → 0, and `<user_shell_command>` blocks read
+  as themselves.
+- **The extract header stopped describing a query nobody made.** It labelled
+  the resolved project identity as `Filter` and the age of the oldest entry
+  as `Period | last N hours`, so a single-session extract read as a
+  time-windowed search narrowed to one repository. They are now `Project`
+  and `Oldest entry | N h ago`.
+
 - **`aicx catalog refresh` reached a fixed point instead of rewriting the
   whole census on every call.** The hot delta marked a session changed when
   its cataloged `project` differed from the freshly scanned one — but those
