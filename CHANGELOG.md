@@ -55,7 +55,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   owner host, twice per refresh. The answers now live in
   `<home>/catalog/remotes.json`, keyed by the checkout's git-metadata mtime,
   so a re-pointed remote is still picked up on the next refresh without
-  paying a subprocess per row. Checkouts with a relative `cwd` are no longer
+  paying a subprocess per row. Any path that resolves identities maintains
+  the memo, including `continuity show --no-refresh` — it writes that one
+  cache file and nothing else. Checkouts with a relative `cwd` are no longer
   attributed at all: their answer was an accident of the invoking directory.
 
 - **`aicx intents` reads the committed index instead of re-parsing every
