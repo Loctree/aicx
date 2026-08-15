@@ -1,7 +1,7 @@
 # Vetcoders HTTP MCP Services Runbook
 
-**Wersja:** 1.0.0 (Sierpień 2026)  
-**Status:** Kanoniczna Architektura Multi-Agent & Multi-Machine  
+**Wersja:** 1.0.0 (Sierpień 2026)
+**Status:** Kanoniczna Architektura Multi-Agent & Multi-Machine
 **Zakres:** `aicx-mcp` (Pamięć & Wyszukiwanie Intencji) + `loctree-mcp` / `loct watch --http` (Strukturalna Percepcja Kodu)
 
 ---
