@@ -41,7 +41,7 @@ use aicx::dashboard_server::{self, DashboardCorsPolicy, DashboardServerConfig};
 use aicx::extraction::{self as sources, ExtractionConfig};
 use aicx::intents;
 use aicx::legacy_archive;
-use aicx::mcp::{self, McpHttpConfig, McpTransport};
+use aicx::mcp::{self, McpHttpConfig, McpLifecycleConfig, McpTransport};
 use aicx::output::{self, OutputConfig, OutputFormat, OutputMode, ReportMetadata};
 use aicx::rank;
 use aicx::reports_extractor::{self, ReportsExtractorConfig};
@@ -1614,6 +1614,14 @@ enum Commands {
         /// Disable Bearer auth on HTTP transport. Only allowed on loopback binds.
         #[arg(long = "no-require-auth", action = clap::ArgAction::SetTrue)]
         no_require_auth: bool,
+
+        /// Refresh the hot catalog and lexical index in the background at this cadence.
+        #[arg(long, default_value_t = 300, value_parser = clap::value_parser!(u64).range(10..))]
+        refresh_interval_seconds: u64,
+
+        /// Disable the HTTP server's background catalog/index refresh loop.
+        #[arg(long)]
+        no_auto_refresh: bool,
     },
 
     #[command(
@@ -2904,6 +2912,8 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
             auth_token,
             require_auth,
             no_require_auth,
+            refresh_interval_seconds,
+            no_auto_refresh,
         }) => {
             let require_auth = require_auth && !no_require_auth;
             let auth_config = aicx::auth::load_auth_config(auth_token.as_deref(), require_auth)?;
@@ -2922,7 +2932,15 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
                 allow_any_host,
             };
             let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(async { mcp::run_transport(transport, http_config, auth_config).await })?;
+            let lifecycle = McpLifecycleConfig {
+                auto_refresh_interval: (!no_auto_refresh)
+                    .then(|| Duration::from_secs(refresh_interval_seconds)),
+                ..McpLifecycleConfig::default()
+            };
+            rt.block_on(async {
+                mcp::run_transport_with_lifecycle(transport, http_config, auth_config, lifecycle)
+                    .await
+            })?;
         }
         Some(Commands::Search {
             query,

@@ -33,8 +33,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   aicx-owned fixture on a different schema
   (`aicx.overlay.semantic-fixture.v1`) had been parked inside it, failing
   `sync_fixtures.py --check`. It moved to `tests/fixtures/overlay-semantic-v1/`
-  rather than being deleted — it freezes the dedup/supersede pathology cases.
-  The mirror now verifies: 10 fixtures byte-identical in both repos.
+  — it is live test input, `include_str!`-ed by the semantic dedup suite in
+  `src/overlay.rs`, which now reads it from its own directory. The mirror
+  verifies again: 10 fixtures byte-identical in both repos.
 
 ### Changed
 
