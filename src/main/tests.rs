@@ -2071,10 +2071,12 @@ fn serve_help_prefers_http_name_and_stays_compact() {
     assert!(rendered.contains("--no-require-auth"));
     assert!(!rendered.contains("Transport: stdio (default) or sse"));
     assert!(!rendered.contains("embedding mode"));
-    assert!(
-        rendered.lines().count() < 48,
-        "serve help should stay compact"
-    );
+    // The guard is against help bloat, not against `serve` gaining real
+    // flags — HTTP transport, auth, and the background refresh loop each
+    // brought their own. Raise the budget when a flag lands; treat a jump
+    // with no new flag as the bloat this test exists to catch.
+    let lines = rendered.lines().count();
+    assert!(lines <= 60, "serve help should stay compact, got {lines}");
 }
 
 #[test]
