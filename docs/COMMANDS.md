@@ -216,6 +216,49 @@ Missing CURRENT rows are counted per extractor (for example,
 Project filters are exact by default. Ambiguous bare repository names fail
 closed; `--project-fuzzy` is an explicit opt-in.
 
+## Search recipes
+
+Operator patterns that fall out of the flags above.
+
+**Two-step flow — session first, passages second.** Rank sessions with a broad
+query, then drill into the winning session for exact passages:
+
+```bash
+aicx search 'hybrid publisher drift'
+aicx search --session <session-id> 'publisher'
+aicx search --session <session-id> --literal --context 4 'publish_current'
+```
+
+**Find your own words.** `--frame-kind user_msg` restricts matches to operator
+messages — useful for "what did I actually ask for":
+
+```bash
+aicx search --frame-kind user_msg 'rebuild the store'
+```
+
+**Narrow by time and agent before reaching for more flags:**
+
+```bash
+aicx search --since 2026-08-01 --agent claude 'release bundle'
+aicx search -d 2026-08-10..2026-08-16 'catalog rebuild'
+```
+
+**Read the coverage line.** Every search prints
+`scanned N of M sessions; skipped: ...` to stderr. A hit list with a large
+skip count is an answer about the index, not about your history — run
+`aicx index status` before concluding something was never discussed.
+
+**Default first, `--deep` second.** The lexical default answers in
+sub-second time without loading an embedder. Reach for `--deep` only when
+lexical ranking misses paraphrases, and only on a host where dense CURRENT
+has been built (`aicx index --semantic` on the index owner).
+
+**Sessions without a git remote** are cataloged under path-derived buckets
+(for example a home-directory session lands under its directory name).
+They are always part of the global `_all` index and of unscoped search;
+only `-p` filtering needs their exact bucket name. Ambiguous bare names
+fail closed with a candidate list — copy the exact bucket from that list.
+
 ## Status and diagnostics
 
 ```bash
