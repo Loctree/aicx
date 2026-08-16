@@ -481,6 +481,10 @@ fn scan_codex_session_file(path: &Path) -> Option<SessionInfo> {
 /// Thin wrapper around the codex v1/responses scanner so Grok sessions
 /// (which use identical rollout layout under ~/.grok/sessions) get the
 /// correct `agent: "grok"` label. Reuses all the heavy scanning logic.
+///
+/// Grok's live layout is `…/sessions/<cwd>/<uuid>/chat_history.jsonl`. When
+/// the file has no `session_meta.id`, the stem would otherwise become the
+/// useless identity `chat_history`; promote the parent UUID in that case.
 pub fn discover_grok_sessions(
     sessions_root: &Path,
     modified_after: Option<SystemTime>,
@@ -488,8 +492,33 @@ pub fn discover_grok_sessions(
     let mut sessions = discover_codex_sessions(sessions_root, modified_after);
     for s in &mut sessions {
         s.agent = "grok".to_string();
+        if s.session_id == "chat_history"
+            && let Some(id) = grok_parent_uuid(&s.source_path)
+        {
+            s.session_id = id;
+        }
     }
     sessions
+}
+
+fn grok_parent_uuid(path: &Path) -> Option<String> {
+    if path.file_name().and_then(|name| name.to_str()) != Some("chat_history.jsonl") {
+        return None;
+    }
+    let parent = path.parent()?.file_name()?.to_str()?;
+    if parent.len() == 36
+        && parent.as_bytes().iter().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                *byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
+    {
+        Some(parent.to_ascii_lowercase())
+    } else {
+        None
+    }
 }
 
 /// Best-effort text of a codex message payload (`content` can be a string or an
@@ -1157,6 +1186,30 @@ pub fn find_session_by_id(home: &Path, id: &str) -> Option<SessionInfo> {
             if let Some(info) = scan_junie_session_file(&events, &sid) {
                 return Some(info);
             }
+        }
+    }
+
+    // Grok: parent-dir UUID of chat_history.jsonl, or a rollout-shaped stem.
+    // Discovery remaps the stem `chat_history` to that UUID.
+    let grok_root = home.join(".grok").join("sessions");
+    if grok_root.is_dir() {
+        let mut candidates: Vec<SessionInfo> = discover_grok_sessions(&grok_root, None)
+            .into_iter()
+            .filter(|info| info.session_id.starts_with(id))
+            .collect();
+        candidates.sort_by(|a, b| {
+            a.session_id
+                .cmp(&b.session_id)
+                .then_with(|| a.source_path.cmp(&b.source_path))
+        });
+        if candidates.len() > 1 {
+            eprintln!(
+                "aicx: session: id '{id}' matches {} grok sessions; using the first (sorted)",
+                candidates.len()
+            );
+        }
+        if let Some(info) = candidates.into_iter().next() {
+            return Some(info);
         }
     }
 
@@ -2087,5 +2140,32 @@ mod tests {
             codex_rollout_id_segment("rollout-2026-01-29T13-58-09-"),
             None
         );
+    }
+
+    #[test]
+    fn grok_chat_history_uses_parent_uuid_as_session_id() {
+        let home = temp_root("grok_uuid_home");
+        let dir = home
+            .join(".grok")
+            .join("sessions")
+            .join("-Volumes-vc-workspace-Loctree-aicx")
+            .join("01a00aba-3b20-752a-a70a-37c68611b8df");
+        fs::create_dir_all(&dir).unwrap();
+        write_session(
+            &dir,
+            "chat_history.jsonl",
+            &[
+                r#"{"timestamp":"2026-08-16T12:00:00Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hello grok"}]}}"#,
+            ],
+        );
+        let sessions = discover_grok_sessions(&home.join(".grok").join("sessions"), None);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].agent, "grok");
+        assert_eq!(
+            sessions[0].session_id,
+            "01a00aba-3b20-752a-a70a-37c68611b8df"
+        );
+        assert!(find_session_by_id(&home, "01a00aba-3b20").is_some());
+        let _ = fs::remove_dir_all(&home);
     }
 }

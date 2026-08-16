@@ -4113,6 +4113,12 @@ fn run_sessions_list(
             here.as_deref(),
         ));
     }
+    if want_agent.is_none_or(|a| a == "grok") {
+        discovered.extend(sessions::discover_grok_sessions(
+            &home.join(".grok").join("sessions"),
+            modified_after,
+        ));
+    }
     if want_agent.is_none_or(|a| a == "junie") {
         // Junie has no cwd in its dir layout (the dir name is a timestamp), so
         // there is no pre-read prune; select_sessions applies the --cwd filter
