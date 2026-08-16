@@ -36,6 +36,14 @@ pub enum AgentKind {
 }
 
 impl AgentKind {
+    pub const ALL: [Self; 5] = [
+        Self::Claude,
+        Self::Codex,
+        Self::Gemini,
+        Self::Junie,
+        Self::Grok,
+    ];
+
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Claude => "claude",
@@ -43,6 +51,38 @@ impl AgentKind {
             Self::Gemini => "gemini",
             Self::Junie => "junie",
             Self::Grok => "grok",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "claude" => Some(Self::Claude),
+            "codex" => Some(Self::Codex),
+            "gemini" | "gemini-antigravity" => Some(Self::Gemini),
+            "junie" => Some(Self::Junie),
+            "grok" => Some(Self::Grok),
+            _ => None,
+        }
+    }
+
+    /// On-disk session root for this agent under the operator home.
+    pub fn session_root(self, home: &Path) -> PathBuf {
+        match self {
+            Self::Claude => home.join(".claude").join("projects"),
+            Self::Codex => home.join(".codex").join("sessions"),
+            Self::Gemini => home.join(".gemini").join("tmp"),
+            Self::Grok => home.join(".grok").join("sessions"),
+            Self::Junie => home.join(".junie").join("sessions"),
+        }
+    }
+
+    pub const fn parser_kind(self) -> aicx_parser::engine::AgentKind {
+        match self {
+            Self::Claude => aicx_parser::engine::AgentKind::Claude,
+            Self::Codex => aicx_parser::engine::AgentKind::Codex,
+            Self::Gemini => aicx_parser::engine::AgentKind::Gemini,
+            Self::Grok => aicx_parser::engine::AgentKind::Grok,
+            Self::Junie => aicx_parser::engine::AgentKind::Junie,
         }
     }
 
