@@ -431,7 +431,7 @@ help:
 	@printf '  $(HELP_C_YELLOW)%s$(HELP_C_RESET)\n' 'CORE COMMANDS'
 	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'build' '- Build release binaries (aicx + aicx-mcp)'
 	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'build-native' '- Build release binaries with native GGUF embedder support'
-	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'install' '- Install binaries + configure local MCP clients via install.sh'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'install' '- Install binaries + MCP clients (does not re-scan sessions)'
 	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'install-bin' '- Install only aicx + aicx-mcp from the current checkout'
 	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'install-config' '- Configure local MCP clients without reinstalling binaries'
 	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'install-cargo' '- Explain why crates.io install is not the active path'

@@ -39,6 +39,10 @@ AICX_EMBEDDER_FILENAME="${AICX_EMBEDDER_FILENAME:-${AICX_EMBEDDER_FILE:-}}"
 AICX_EMBEDDER_CONFIG_PATH="${AICX_EMBEDDER_CONFIG_PATH:-$HOME/.aicx/embedder.toml}"
 AICX_INSTALL_FORCE="${AICX_INSTALL_FORCE:-0}"
 AICX_INSTALL_DRY_RUN="${AICX_INSTALL_DRY_RUN:-0}"
+# Install must not re-scan every agent session. Opt in with --extract or
+# AICX_INSTALL_EXTRACT=1. Hours default to 24, not the old 10000-hour landmine.
+AICX_INSTALL_EXTRACT="${AICX_INSTALL_EXTRACT:-0}"
+AICX_INSTALL_EXTRACT_HOURS="${AICX_INSTALL_EXTRACT_HOURS:-24}"
 AICX_CARGO_BIN_DIR="${AICX_CARGO_BIN_DIR:-${CARGO_INSTALL_ROOT:+$CARGO_INSTALL_ROOT/bin}}"
 AICX_EMBEDDER_SETUP_DETAIL="No local embedder profile was configured in this run."
 if [ -z "$AICX_CARGO_BIN_DIR" ]; then
@@ -60,6 +64,8 @@ for arg in "$@"; do
     --pick-home) AICX_HOME_PICKER="1" ;;
     --no-home-prompt) AICX_HOME_PICKER="0" ;;
     --aicx-home=*) AICX_STORAGE_HOME="${arg#*=}" ;;
+    --extract) AICX_INSTALL_EXTRACT="1" ;;
+    --no-extract) AICX_INSTALL_EXTRACT="0" ;;
     --pick-embedder) AICX_EMBEDDER_PICKER="1" ;;
     --no-embedder-prompt) AICX_EMBEDDER_PICKER="0" ;;
     --embedder-profile=*) AICX_EMBEDDER_PROFILE="${arg#*=}" ;;
@@ -102,6 +108,12 @@ for arg in "$@"; do
       echo "  --aicx-home=/absolute/path         # persist [storage].home in ~/.aicx/config.toml"
       echo "  --no-home-prompt                   # suppress interactive AICX_HOME picker"
       echo "  default: ~/.aicx                   # semantic index remains ~/.aicx/indexed/"
+      echo ""
+      echo "Session extract during install (off by default):"
+      echo "  --extract                          # run aicx all after binaries are in place"
+      echo "  --no-extract                       # leave the existing catalog alone (default)"
+      echo "  AICX_INSTALL_EXTRACT=1             # same as --extract"
+      echo "  AICX_INSTALL_EXTRACT_HOURS=24      # window when extract is opted in (default 24)"
       exit 0
       ;;
   esac
@@ -1145,10 +1157,20 @@ if [ "${AICX_SKIP_MCP_SERVICE:-0}" != "1" ]; then
   fi
 fi
 
-# --- Step 4: Full store bootstrap ---
-echo "[4/4] Full context extraction (this may take a moment)..."
-"${AICX_RUN[@]}" all -H 10000 --emit none
-echo "  store bootstrap complete"
+# --- Step 4: do not re-scan sessions on every install ---
+# `make install` / install.sh used to run `aicx all -H 10000` here. That is a
+# full-history extract of every registered agent, not an install step: it
+# floods skip lines, takes longer than the binary build, and rewrites the
+# operator's live catalog. Extract stays opt-in.
+if [ "${AICX_INSTALL_EXTRACT}" = "1" ]; then
+  echo "[4/4] Context extract (opt-in, last ${AICX_INSTALL_EXTRACT_HOURS}h)..."
+  "${AICX_RUN[@]}" all -H "${AICX_INSTALL_EXTRACT_HOURS}" --emit none
+  echo "  extract complete"
+else
+  echo "[4/4] Context extract skipped (install does not re-scan sessions)."
+  echo "  Existing catalog under ~/.aicx is left alone."
+  echo "  Opt in: AICX_INSTALL_EXTRACT=1 make install   or   aicx all -H 24"
+fi
 echo "  local embedder default: base (F2LLM 0.6B Q4_K_M GGUF, hydrated on demand)"
 maybe_configure_native_embedder
 echo ""
