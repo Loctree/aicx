@@ -15,7 +15,14 @@ set -euo pipefail
 #   AICX_MCP_PORT          port for HTTP transport (default 8044)
 #   AICX_MCP_HOST          bind host (default: 127.0.0.1; set a Tailscale IP explicitly for remote access)
 #   AICX_MCP_ALLOWED_HOSTS comma-separated allowed Host headers (default: loopback + bind host)
+#   AICX_MCP_RUST_LOG      tracing filter for the LaunchAgent (default below).
+#                          Do not use `aicx serve --verbose` — that flag only
+#                          echoes per-file extractor warnings, not MCP/HTTP.
 #   AICX_BIN               explicit aicx binary path (default: resolve from PATH / ~/.local/bin / ~/.cargo/bin)
+#
+# `launchctl bootstrap gui/<uid>` only works from an Aqua login. Agent
+# terminals, SSH, and some multiplexers return Error 5 (EIO) plus a
+# "retry as root" hint — that hint is wrong for a per-user LaunchAgent.
 
 LABEL="io.vetcoders.aicx.mcp"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
@@ -81,6 +88,10 @@ AICX_BIN_XML="$(printf '%s' "$AICX_BIN" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g'
 HOST_XML="$(printf '%s' "$HOST" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g' -e "s/'/\&apos;/g")"
 PORT_XML="$(printf '%s' "$PORT" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g' -e "s/'/\&apos;/g")"
 PATH_XML="$(printf '%s' "$AICX_DIR:/usr/bin:/bin:$HOME/.local/bin:$HOME/.cargo/bin:/opt/homebrew/bin" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g' -e "s/'/\&apos;/g")"
+# Default: tool-name audit + refresh ticks + rmcp session lifecycle.
+# Not `info` globally — that floods hyper/h2. Not `--verbose` — extractor only.
+RUST_LOG_VALUE="${AICX_MCP_RUST_LOG:-mcp.audit=info,mcp.refresh=debug,mcp.lifecycle=info,rmcp=info}"
+RUST_LOG_XML="$(printf '%s' "$RUST_LOG_VALUE" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g' -e "s/'/\&apos;/g")"
 
 mkdir -p "$HOME/Library/LaunchAgents" "$LOG_DIR"
 
@@ -106,6 +117,8 @@ cat > "$PLIST" <<PLIST_EOF
   <dict>
     <key>PATH</key>
     <string>$PATH_XML</string>
+    <key>RUST_LOG</key>
+    <string>$RUST_LOG_XML</string>
   </dict>
   <key>RunAtLoad</key>
   <true/>
@@ -121,11 +134,43 @@ PLIST_EOF
 
 plutil -lint "$PLIST" >/dev/null
 
+service_loaded() {
+  launchctl print "$(gui_domain)/$LABEL" >/dev/null 2>&1
+}
+
+# Capture bootstrap stderr so Apple's "retry as root" hint never reaches the
+# operator as the last word. A failed bootstrap must not abort the installer
+# (`set -e`): the plist is already written and will load at the next Aqua login.
+try_bootstrap() {
+  local err
+  err="$(launchctl bootstrap "$(gui_domain)" "$PLIST" 2>&1)" || true
+  if service_loaded; then
+    return 0
+  fi
+  if [ -n "$err" ]; then
+    note "mcp service: bootstrap: $err"
+  fi
+  return 1
+}
+
+MANAGER="$(launchctl managername 2>/dev/null || true)"
+if [ "$MANAGER" != "Aqua" ]; then
+  note "mcp service: plist written to $PLIST"
+  note "mcp service: not loaded — this shell is not an Aqua login (launchctl managername=${MANAGER:-unknown})"
+  note "mcp service: load from Terminal.app / a GUI session:"
+  note "  launchctl bootstrap gui/$(id -u) $PLIST"
+  note "mcp service: otherwise it loads at the next GUI login. Do not run this as root."
+  exit 0
+fi
+
 # Idempotent refresh
 launchctl bootout "$(gui_domain)/$LABEL" 2>/dev/null || true
-launchctl bootstrap "$(gui_domain)" "$PLIST"
+if ! try_bootstrap; then
+  sleep 1
+  try_bootstrap || true
+fi
 
-if launchctl print "$(gui_domain)/$LABEL" >/dev/null 2>&1; then
+if service_loaded; then
   # The HTTP server owns bounded catalog/index refresh now. Retire the former
   # second writer when upgrading an existing installation.
   launchctl bootout "$(gui_domain)/io.vetcoders.aicx.reindex" 2>/dev/null || true
@@ -134,5 +179,7 @@ if launchctl print "$(gui_domain)/$LABEL" >/dev/null 2>&1; then
   note "index refresh: owned by the MCP server (default every 5m)"
   note "mcp service logs: $LOG_DIR/aicx-serve-http.log"
 else
-  note "mcp service: plist written to $PLIST (bootstrap failed or pending user session)"
+  note "mcp service: plist written to $PLIST (bootstrap failed in this Aqua session)"
+  note "mcp service: retry: launchctl bootstrap gui/$(id -u) $PLIST"
+  note "mcp service: do not run as root — this is a per-user LaunchAgent"
 fi

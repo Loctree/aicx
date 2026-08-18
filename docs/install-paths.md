@@ -117,6 +117,12 @@ path, the `PATH`-resolved path, and all other `which -a` entries for that
 binary. The fix is to move the target directory earlier in `PATH` or remove the
 older channel.
 
+Install does **not** run `aicx all`. A binary/MCP refresh must not re-parse
+every registered agent session. Opt in with `--extract` /
+`AICX_INSTALL_EXTRACT=1` (default window 24 hours). The HTTP LaunchAgent
+bootstrap is Aqua-only: a non-GUI shell writes the plist and prints how to
+load it from Terminal.app instead of failing with launchctl Error 5.
+
 ## MCP Runtime Drift
 
 The CLI and MCP server are shipped as one versioned pair. Any long-running MCP
