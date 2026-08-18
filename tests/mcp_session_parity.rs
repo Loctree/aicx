@@ -93,3 +93,64 @@ fn mcp_list_without_project_matches_cli_session_ids() {
     assert_eq!(cli_ids, mcp_ids);
     let _ = fs::remove_dir_all(home);
 }
+
+#[test]
+fn cli_sessions_list_project_flag_matches_mcp_slash_repo() {
+    let home = unique_home("project");
+    write_claude(
+        &home,
+        "-Volumes-vc-workspace-Loctree-aicx",
+        "eeeeeeee-1111-2222-3333-444444444444",
+        "/Volumes/vc-workspace/Loctree/aicx",
+        "project filter",
+    );
+    write_claude(
+        &home,
+        "-Volumes-vc-workspace-vetcoders-vibecrafted",
+        "ffffffff-1111-2222-3333-444444444444",
+        "/Volumes/vc-workspace/vetcoders/vibecrafted",
+        "foreign",
+    );
+
+    let cli = Command::new(env!("CARGO_BIN_EXE_aicx"))
+        .env("HOME", &home)
+        .env("AICX_NO_MUTATION_WARN", "1")
+        .args(["sessions", "list", "--json", "--all", "-p", "/aicx"])
+        .output()
+        .expect("run aicx sessions list -p");
+    assert!(
+        cli.status.success(),
+        "cli -p failed: {}",
+        String::from_utf8_lossy(&cli.stderr)
+    );
+    let cli_json: Value = serde_json::from_slice(&cli.stdout).expect("cli json");
+    let cli_ids: Vec<&str> = cli_json
+        .as_array()
+        .expect("cli array")
+        .iter()
+        .filter_map(|row| row.get("session_id").and_then(Value::as_str))
+        .collect();
+    assert_eq!(cli_ids, ["eeeeeeee-1111-2222-3333-444444444444"]);
+    assert!(
+        String::from_utf8_lossy(&cli.stderr).is_empty()
+            || !String::from_utf8_lossy(&cli.stderr).contains("scanned=0")
+    );
+
+    let aicx_home = home.join(".aicx");
+    fs::create_dir_all(&aicx_home).expect("aicx home");
+    let mcp = aicx::mcp_session::list_sessions(aicx::mcp_session::ListSessionsRequest {
+        user_home: &home,
+        aicx_home: &aicx_home,
+        project: Some("/aicx"),
+        projects: &[],
+        project_match: aicx::legacy_archive::ProjectMatchMode::Exact,
+        agent: None,
+        hours: 0,
+        since: None,
+        limit: 20,
+    })
+    .expect("mcp list /aicx");
+    assert_eq!(mcp.matched, 1);
+    assert_eq!(mcp.sessions[0].session_id, cli_ids[0]);
+    let _ = fs::remove_dir_all(home);
+}

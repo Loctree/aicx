@@ -369,6 +369,12 @@ enum SessionsCommand {
         #[arg(long)]
         cwd: bool,
 
+        /// Exact project filter, same shapes as search/intents/MCP:
+        /// `owner/repo`, `/repo` (cross-org repo), `owner/` (org wildcard),
+        /// or a unique bare `name`. Empty is a numbered miss, not silence.
+        #[arg(short, long, value_delimiter = ',')]
+        project: Vec<String>,
+
         /// Filter by agent (claude | codex | gemini | junie | grok).
         #[arg(long, value_parser = ["claude", "codex", "gemini", "junie", "grok"])]
         agent: Option<String>,
@@ -2713,7 +2719,7 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
             }
         }
         Some(Commands::Sources { command }) => run_sources_command(command)?,
-        Some(Commands::Sessions { command }) => run_sessions_command(command)?,
+        Some(Commands::Sessions { command }) => run_sessions_command(command, project_match)?,
         Some(Commands::Claims { command }) => run_claims_command(command)?,
         Some(Commands::Results { command }) => run_results_command(command)?,
         Some(Commands::Clarify {
@@ -3710,11 +3716,15 @@ fn run_clarify(
     Ok(())
 }
 
-fn run_sessions_command(command: SessionsCommand) -> Result<()> {
+fn run_sessions_command(
+    command: SessionsCommand,
+    project_match: legacy_archive::ProjectMatchMode,
+) -> Result<()> {
     match command {
         SessionsCommand::Current { json } => run_sessions_current(json),
         SessionsCommand::List {
             cwd,
+            project,
             agent,
             since,
             all,
@@ -3723,7 +3733,15 @@ fn run_sessions_command(command: SessionsCommand) -> Result<()> {
             json,
         } => {
             let format = if json { "json".to_string() } else { format };
-            run_sessions_list(cwd, agent, since, all, limit, &format)
+            run_sessions_list(
+                cwd,
+                agent,
+                since,
+                all,
+                limit,
+                &format,
+                Some((project, project_match)),
+            )
         }
         SessionsCommand::Show {
             session_id,
@@ -4034,6 +4052,7 @@ fn current_session_from_disk() -> Result<Option<CurrentSessionPayload>> {
     discovered.extend(sessions::discover_grok_sessions(
         &home.join(".grok").join("sessions"),
         Some(modified_after),
+        Some(&here),
     ));
 
     let mut selected = sessions::select_sessions(discovered, Some(&here), None, Some(since_dt), 1);
@@ -4062,6 +4081,7 @@ fn run_sessions_list(
     all: bool,
     limit: usize,
     format: &str,
+    project: Option<(Vec<String>, legacy_archive::ProjectMatchMode)>,
 ) -> Result<()> {
     // Recency window: default to the last 30 days so the scan stays fast on
     // large histories; --since sets it explicitly, --all scans everything.
@@ -4117,6 +4137,7 @@ fn run_sessions_list(
         discovered.extend(sessions::discover_grok_sessions(
             &home.join(".grok").join("sessions"),
             modified_after,
+            here.as_deref(),
         ));
     }
     if want_agent.is_none_or(|a| a == "junie") {
@@ -4129,13 +4150,40 @@ fn run_sessions_list(
         ));
     }
 
-    let selected = sessions::select_sessions(
+    let scanned = discovered.len();
+    let project_filters = project
+        .as_ref()
+        .map(|(filters, _)| filters)
+        .filter(|filters| !filters.is_empty());
+    let mut selected = sessions::select_sessions(
         discovered,
         here.as_deref(),
         agent.as_deref(),
         since_dt,
-        limit,
+        if project_filters.is_some() { 0 } else { limit },
     );
+    if let Some((filters, project_match)) = project.as_ref()
+        && !filters.is_empty()
+    {
+        let aicx_home = aicx::aicx_home::ensure()?;
+        let resolved = aicx::mcp_session::resolve_session_project_filters(
+            filters,
+            &selected,
+            &aicx_home,
+            *project_match,
+        )
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+        selected.retain(|session| aicx::mcp_session::session_matches_project(session, &resolved));
+        if limit > 0 && selected.len() > limit {
+            selected.truncate(limit);
+        }
+        if selected.is_empty() {
+            eprintln!(
+                "aicx: sessions: scanned={scanned}; matched=0 for project filter {} — this is a project miss, not a missing source tree",
+                filters.join(",")
+            );
+        }
+    }
 
     match format {
         "json" => println!("{}", serde_json::to_string_pretty(&selected)?),

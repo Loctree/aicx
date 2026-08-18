@@ -31,6 +31,18 @@ pub enum SessionSurfaceError {
     Internal { message: String },
 }
 
+impl std::fmt::Display for SessionSurfaceError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidParams { message, .. } | Self::Internal { message } => {
+                formatter.write_str(message)
+            }
+        }
+    }
+}
+
+impl std::error::Error for SessionSurfaceError {}
+
 impl SessionSurfaceError {
     fn invalid(kind: &str, message: impl Into<String>, extra: Value) -> Self {
         let message = message.into();
@@ -394,7 +406,7 @@ fn datetime_to_system_time(dt: DateTime<Utc>) -> std::time::SystemTime {
     std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs)
 }
 
-fn resolve_session_project_filters(
+pub fn resolve_session_project_filters(
     filters: &[String],
     sessions: &[SessionInfo],
     aicx_home: &Path,
@@ -469,7 +481,7 @@ fn identity_from_repo_path(path: &str) -> Option<String> {
     Some(format!("{owner}/{repo}"))
 }
 
-fn session_matches_project(session: &SessionInfo, filters: &[String]) -> bool {
+pub fn session_matches_project(session: &SessionInfo, filters: &[String]) -> bool {
     if filters.is_empty() {
         return true;
     }
@@ -934,6 +946,53 @@ mod tests {
             other => panic!("expected project_not_found, got {other:?}"),
         }
 
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn list_percent_encoded_grok_matches_cross_org_repo_filter() {
+        let home = temp_home("grok-filter");
+        let aicx_home = home.join(".aicx");
+        fs::create_dir_all(&aicx_home).expect("aicx home");
+        let dir = home
+            .join(".grok")
+            .join("sessions")
+            .join("%2FVolumes%2Fvc-workspace%2FLoctree%2Faicx")
+            .join("01a00c9a-2344-70f1-8446-c31b4ca80d0e");
+        fs::create_dir_all(&dir).expect("grok session");
+        fs::write(
+            dir.join("chat_history.jsonl"),
+            concat!(
+                r#"{"type":"user","content":[{"type":"text","text":"fix /aicx filter"}]}"#,
+                "\n",
+                r#"{"type":"assistant","content":"ok"}"#,
+                "\n"
+            ),
+        )
+        .expect("write grok");
+
+        let listed = list_sessions(ListSessionsRequest {
+            user_home: &home,
+            aicx_home: &aicx_home,
+            project: Some("/aicx"),
+            projects: &[],
+            project_match: ProjectMatchMode::Exact,
+            agent: Some("grok"),
+            hours: 0,
+            since: None,
+            limit: 20,
+        })
+        .expect("list /aicx grok");
+        assert!(!listed.empty, "{listed:?}");
+        assert_eq!(listed.matched, 1);
+        assert_eq!(
+            listed.sessions[0].session_id,
+            "01a00c9a-2344-70f1-8446-c31b4ca80d0e"
+        );
+        assert_eq!(
+            listed.sessions[0].repo_path.as_deref(),
+            Some("/Volumes/vc-workspace/Loctree/aicx")
+        );
         let _ = fs::remove_dir_all(home);
     }
 
