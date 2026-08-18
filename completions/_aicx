@@ -756,6 +756,8 @@ _arguments "${_arguments_options[@]}" : \
 '--since=[Only sessions updated on/after this date (YYYY-MM-DD). Defaults to the last 30 days; pass --all to scan the full history]:SINCE:_default' \
 '--limit=[Max sessions to show (0 = all)]:LIMIT:_default' \
 '--format=[Output format\: table | json]:FORMAT:_default' \
+'-p+[Exact project filter]:PROJECT:_default' \
+'--project=[Exact project filter]:PROJECT:_default' \
 '--cwd[Restrict to sessions whose repo/cwd matches the current directory]' \
 '--all[Scan the full session history (slower) instead of the default last-30-days window]' \
 '-j[Alias for \`--format json\` (vc-frame / plugin assimilation)]' \

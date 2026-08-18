@@ -136,6 +136,83 @@ fn decode_claude_project_dir(dir_name: &str) -> Option<String> {
     Some(dir_name.replace('-', "/"))
 }
 
+/// Decode a Grok session-root segment.
+///
+/// Live Grok layout is `~/.grok/sessions/<percent-encoded-cwd>/<uuid>/…`
+/// (`%2FVolumes%2F…`). Older fixtures and a few local trees still use the
+/// Claude-style hyphen encoding. Both are inferences — callers mark
+/// [`Association::Inferred`].
+pub(crate) fn decode_percent_encoded_path(encoded: &str) -> String {
+    let bytes = encoded.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut cursor = 0usize;
+    while cursor < bytes.len() {
+        if bytes[cursor] == b'%'
+            && cursor + 2 < bytes.len()
+            && let (Some(high), Some(low)) =
+                (hex_nibble(bytes[cursor + 1]), hex_nibble(bytes[cursor + 2]))
+        {
+            decoded.push((high << 4) | low);
+            cursor += 3;
+        } else {
+            decoded.push(bytes[cursor]);
+            cursor += 1;
+        }
+    }
+    String::from_utf8_lossy(&decoded).into_owned()
+}
+
+const fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn looks_like_absolute_path(value: &str) -> bool {
+    value.starts_with('/') || value.contains(':')
+}
+
+/// Infer cwd from `…/sessions/<encoded-cwd>/<uuid>/chat_history.jsonl`.
+pub(crate) fn infer_grok_cwd_from_path(path: &Path) -> Option<String> {
+    let session_dir = path.parent()?;
+    let encoded_dir = session_dir.parent()?;
+    let under_sessions = encoded_dir
+        .parent()
+        .and_then(|parent| parent.file_name())
+        .and_then(|name| name.to_str())
+        == Some("sessions");
+    if !under_sessions {
+        return None;
+    }
+    let encoded = encoded_dir.file_name()?.to_str()?;
+    if encoded.contains('%') {
+        let decoded = decode_percent_encoded_path(encoded);
+        if looks_like_absolute_path(&decoded) {
+            return Some(decoded);
+        }
+    }
+    if encoded.starts_with('-') {
+        return decode_claude_project_dir(encoded);
+    }
+    None
+}
+
+fn grok_dir_matches_cwd(encoded_dir_name: &str, want: &str) -> bool {
+    if encoded_dir_name.contains('%') {
+        let decoded = decode_percent_encoded_path(encoded_dir_name);
+        return looks_like_absolute_path(&decoded) && cwd_nests(want, &decoded);
+    }
+    if encoded_dir_name.starts_with('-') {
+        let want_enc = want.replace('/', "-").to_lowercase();
+        let dir_lc = encoded_dir_name.to_lowercase();
+        return nests_under(&dir_lc, &want_enc, '-') || nests_under(&want_enc, &dir_lc, '-');
+    }
+    encoded_dir_name.eq_ignore_ascii_case(want)
+}
+
 /// Derive a short project label (last path segment) from a cwd.
 ///
 /// Splits on both separators: a recorded cwd is an OS-native path, so on Windows
@@ -478,27 +555,176 @@ fn scan_codex_session_file(path: &Path) -> Option<SessionInfo> {
     })
 }
 
-/// Thin wrapper around the codex v1/responses scanner so Grok sessions
-/// (which use identical rollout layout under ~/.grok/sessions) get the
-/// correct `agent: "grok"` label. Reuses all the heavy scanning logic.
+/// Discover Grok sessions under `~/.grok/sessions`.
 ///
-/// Grok's live layout is `…/sessions/<cwd>/<uuid>/chat_history.jsonl`. When
-/// the file has no `session_meta.id`, the stem would otherwise become the
-/// useless identity `chat_history`; promote the parent UUID in that case.
+/// Live layout is `…/sessions/<percent-encoded-cwd>/<uuid>/chat_history.jsonl`.
+/// Only `chat_history.jsonl` is a session — sibling `events.jsonl` /
+/// `updates.jsonl` / `rewind_points.jsonl` are not. The Codex rollout scanner
+/// is the wrong reader here: Grok writes `type=user|assistant` lines without
+/// `session_meta.cwd`, so a Codex pass leaves `repo_path` empty and `--cwd`
+/// / `-p /repo` drop every live Grok session.
 pub fn discover_grok_sessions(
     sessions_root: &Path,
     modified_after: Option<SystemTime>,
+    cwd_filter: Option<&str>,
 ) -> Vec<SessionInfo> {
-    let mut sessions = discover_codex_sessions(sessions_root, modified_after);
-    for s in &mut sessions {
-        s.agent = "grok".to_string();
-        if s.session_id == "chat_history"
-            && let Some(id) = grok_parent_uuid(&s.source_path)
-        {
-            s.session_id = id;
+    let mut out = Vec::new();
+    let mut skipped = 0usize;
+    let mut stack = vec![(sessions_root.to_path_buf(), 0usize)];
+    while let Some((dir, depth)) = stack.pop() {
+        let Ok(read) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in read.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                skipped += 1;
+                continue;
+            };
+            let path = entry.path();
+            if file_type.is_dir() {
+                if depth < MAX_CODEX_SCAN_DEPTH {
+                    if let Some(want) = cwd_filter {
+                        let dir_name = path
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .unwrap_or_default();
+                        let parent_is_sessions = path
+                            .parent()
+                            .and_then(|parent| parent.file_name())
+                            .and_then(|name| name.to_str())
+                            == Some("sessions");
+                        if parent_is_sessions && !grok_dir_matches_cwd(dir_name, want) {
+                            continue;
+                        }
+                    }
+                    stack.push((path, depth + 1));
+                }
+            } else if file_type.is_file()
+                && path.file_name().and_then(|name| name.to_str()) == Some("chat_history.jsonl")
+                && !older_than(&path, modified_after)
+            {
+                match scan_grok_session_file(&path) {
+                    Some(info) => out.push(info),
+                    None => skipped += 1,
+                }
+            }
         }
     }
-    sessions
+    if skipped > 0 {
+        eprintln!("aicx: sessions: skipped {skipped} unreadable file(s) (grok)");
+    }
+    out
+}
+
+fn scan_grok_session_file(path: &Path) -> Option<SessionInfo> {
+    let file = fs::File::open(path).ok()?;
+    let reader = BufReader::new(file);
+    let session_id = grok_parent_uuid(path).unwrap_or_else(|| {
+        path.file_stem()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_string()
+    });
+
+    let mut started_at: Option<DateTime<Utc>> = None;
+    let mut updated_at: Option<DateTime<Utc>> = None;
+    let mut user_message_count = 0usize;
+    let mut agent_message_count = 0usize;
+    let mut title: Option<String> = None;
+    let mut saw_parsable_line = false;
+    let mut saw_json_timestamp = false;
+
+    for line in reader.lines().map_while(Result::ok) {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        saw_parsable_line = true;
+
+        if let Some(ts) = value
+            .get("timestamp")
+            .and_then(|item| item.as_str())
+            .and_then(|raw| DateTime::parse_from_rfc3339(raw).ok())
+            .map(|dt| dt.with_timezone(&Utc))
+        {
+            saw_json_timestamp = true;
+            started_at = Some(started_at.map_or(ts, |cur| cur.min(ts)));
+            updated_at = Some(updated_at.map_or(ts, |cur| cur.max(ts)));
+        }
+
+        match value.get("type").and_then(|item| item.as_str()) {
+            Some("user") => {
+                user_message_count += 1;
+                if title.is_none()
+                    && let Some(text) = grok_message_text(Some(&value))
+                    && !text.trim().is_empty()
+                    && !text.contains("<system-reminder>")
+                {
+                    title = Some(short_title(&text));
+                }
+            }
+            Some("assistant") => agent_message_count += 1,
+            _ => {}
+        }
+    }
+
+    if started_at.is_none()
+        && let Some(mtime) = file_mtime_utc(path)
+    {
+        started_at = Some(mtime);
+        updated_at = Some(mtime);
+    }
+
+    let inferred_cwd = infer_grok_cwd_from_path(path);
+    let (repo_path, association) = match inferred_cwd {
+        Some(cwd) => (Some(cwd), Association::Inferred),
+        None => (None, Association::Unknown),
+    };
+    let project = repo_path.as_deref().and_then(project_label_from_cwd);
+    let temporal_confidence = if saw_json_timestamp {
+        TemporalConfidence::Full
+    } else if started_at.is_some() || saw_parsable_line {
+        TemporalConfidence::Partial
+    } else {
+        TemporalConfidence::None
+    };
+
+    Some(SessionInfo {
+        session_id,
+        agent: "grok".to_string(),
+        project,
+        repo_path,
+        started_at,
+        updated_at,
+        message_count: user_message_count + agent_message_count,
+        user_message_count,
+        agent_message_count,
+        title,
+        source_path: path.to_path_buf(),
+        association,
+        temporal_confidence,
+    })
+}
+
+fn grok_message_text(payload: Option<&serde_json::Value>) -> Option<String> {
+    let content = payload?.get("content")?;
+    if let Some(text) = content.as_str() {
+        return Some(text.to_string());
+    }
+    content.as_array()?.iter().find_map(|part| {
+        part.get("text")
+            .and_then(|item| item.as_str())
+            .filter(|text| !text.trim().is_empty())
+            .map(String::from)
+    })
+}
+
+fn file_mtime_utc(path: &Path) -> Option<DateTime<Utc>> {
+    let mtime = fs::metadata(path).ok()?.modified().ok()?;
+    Some(DateTime::<Utc>::from(mtime))
 }
 
 fn grok_parent_uuid(path: &Path) -> Option<String> {
@@ -970,6 +1196,7 @@ pub fn discover_sessions_at(
         discovered.extend(discover_grok_sessions(
             &home.join(".grok").join("sessions"),
             modified_after,
+            cwd_filter,
         ));
     }
     if agent.is_none_or(|a| a == "gemini") {
@@ -1193,7 +1420,7 @@ pub fn find_session_by_id(home: &Path, id: &str) -> Option<SessionInfo> {
     // Discovery remaps the stem `chat_history` to that UUID.
     let grok_root = home.join(".grok").join("sessions");
     if grok_root.is_dir() {
-        let mut candidates: Vec<SessionInfo> = discover_grok_sessions(&grok_root, None)
+        let mut candidates: Vec<SessionInfo> = discover_grok_sessions(&grok_root, None, None)
             .into_iter()
             .filter(|info| info.session_id.starts_with(id))
             .collect();
@@ -2155,17 +2382,78 @@ mod tests {
             &dir,
             "chat_history.jsonl",
             &[
-                r#"{"timestamp":"2026-08-16T12:00:00Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hello grok"}]}}"#,
+                r#"{"type":"user","content":[{"type":"text","text":"hello grok"}],"timestamp":"2026-08-16T12:00:00Z"}"#,
             ],
         );
-        let sessions = discover_grok_sessions(&home.join(".grok").join("sessions"), None);
+        let sessions = discover_grok_sessions(&home.join(".grok").join("sessions"), None, None);
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].agent, "grok");
         assert_eq!(
             sessions[0].session_id,
             "01a00aba-3b20-752a-a70a-37c68611b8df"
         );
+        assert_eq!(sessions[0].user_message_count, 1);
         assert!(find_session_by_id(&home, "01a00aba-3b20").is_some());
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn grok_percent_encoded_cwd_matches_checkout_and_ignores_sidecar_jsonl() {
+        let home = temp_root("grok_percent_cwd");
+        let dir = home
+            .join(".grok")
+            .join("sessions")
+            .join("%2FVolumes%2Fvc-workspace%2FLoctree%2Faicx")
+            .join("01a00c9a-2344-70f1-8446-c31b4ca80d0e");
+        fs::create_dir_all(&dir).unwrap();
+        write_session(
+            &dir,
+            "chat_history.jsonl",
+            &[
+                r#"{"type":"system","content":"You are Grok"}"#,
+                r#"{"type":"user","content":[{"type":"text","text":"<user_query>\nfix the filter\n</user_query>"}]}"#,
+                r#"{"type":"assistant","content":"working"}"#,
+            ],
+        );
+        write_session(
+            &dir,
+            "events.jsonl",
+            &[r#"{"type":"event","name":"noise"}"#],
+        );
+        write_session(&dir, "updates.jsonl", &[r#"{"type":"update"}"#]);
+
+        let root = home.join(".grok").join("sessions");
+        let sessions =
+            discover_grok_sessions(&root, None, Some("/Volumes/vc-workspace/Loctree/aicx"));
+        assert_eq!(sessions.len(), 1, "sidecar jsonl files are not sessions");
+        assert_eq!(
+            sessions[0].session_id,
+            "01a00c9a-2344-70f1-8446-c31b4ca80d0e"
+        );
+        assert_eq!(
+            sessions[0].repo_path.as_deref(),
+            Some("/Volumes/vc-workspace/Loctree/aicx")
+        );
+        assert_eq!(sessions[0].project.as_deref(), Some("aicx"));
+        assert_eq!(sessions[0].user_message_count, 1);
+        assert_eq!(sessions[0].agent_message_count, 1);
+        assert_eq!(sessions[0].association, Association::Inferred);
+
+        let selected = select_sessions(
+            sessions.clone(),
+            Some("/Volumes/vc-workspace/Loctree/aicx"),
+            None,
+            None,
+            0,
+        );
+        assert_eq!(selected.len(), 1);
+
+        let other = discover_grok_sessions(
+            &root,
+            None,
+            Some("/Volumes/vc-workspace/vetcoders/vibecrafted"),
+        );
+        assert!(other.is_empty());
         let _ = fs::remove_dir_all(&home);
     }
 }

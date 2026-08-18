@@ -67,9 +67,17 @@ JSON surfaces for plugins / vc-frame Session Gallery:
 ```bash
 aicx search --json '<query>'
 aicx sessions list --json
+aicx sessions list --cwd --json
+aicx sessions list -p /aicx --json
 aicx sessions show --json <session-id>
 # aliases also work: sessions list --format json
 ```
+
+`sessions list -p` uses the same exact identity rules as search and
+MCP (`owner/repo`, `/repo`, `owner/`, unique bare name). An empty list
+for a resolved project prints `scanned=N; matched=0` — that is a
+project miss, not a missing source tree. `--cwd` matches the current
+checkout, including Grok's percent-encoded session roots.
 
 ## Catalog
 
