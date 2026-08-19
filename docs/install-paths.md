@@ -123,6 +123,18 @@ every registered agent session. Opt in with `--extract` /
 bootstrap is Aqua-only: a non-GUI shell writes the plist and prints how to
 load it from Terminal.app instead of failing with launchctl Error 5.
 
+On Darwin, a full install and `make install-service` write Claude/Codex/Gemini
+`mcpServers.aicx` as Streamable HTTP matching the LaunchAgent:
+
+```json
+{ "url": "http://127.0.0.1:8044/mcp" }
+```
+
+`AICX_MCP_HOST` / `AICX_MCP_PORT` change both the bind and the client URL.
+Binding `0.0.0.0` still writes `127.0.0.1` into clients. A leftover
+`command`/`args` pair is dropped when replacing an `aicx` entry. Opt out of
+the daemon (and keep stdio clients) with `AICX_SKIP_MCP_SERVICE=1`.
+
 ## MCP Runtime Drift
 
 The CLI and MCP server are shipped as one versioned pair. Any long-running MCP

@@ -48,6 +48,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **Full install no longer leaves MCP clients on stdio while the LaunchAgent
+  speaks HTTP.** `configure_mcp` used to write `{"command": "…/aicx-mcp",
+  "args": []}` *before* `install-mcp-service.sh` created
+  `io.vetcoders.aicx.mcp` on `http://127.0.0.1:8044/mcp`. Darwin installs now
+  start the service first and write `{"url": "http://<host>:<port>/mcp"}`
+  (wildcard bind becomes `127.0.0.1`; host/port come from the plist). A
+  readable `auth-token` is added as a Bearer header because `aicx serve`
+  requires auth by default. `AICX_SKIP_MCP_SERVICE=1` keeps stdio.
+  `make install-service` wires the same client URL.
+
 - **Grok sessions now belong to a checkout.** Live layout is
   `~/.grok/sessions/<percent-encoded-cwd>/<uuid>/chat_history.jsonl`.
   Discovery had reused the Codex rollout reader, so `repo_path` stayed

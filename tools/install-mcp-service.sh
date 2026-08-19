@@ -19,6 +19,8 @@ set -euo pipefail
 #                          Do not use `aicx serve --verbose` — that flag only
 #                          echoes per-file extractor warnings, not MCP/HTTP.
 #   AICX_BIN               explicit aicx binary path (default: resolve from PATH / ~/.local/bin / ~/.cargo/bin)
+#   AICX_SKIP_MCP_CLIENTS  set to 1 to install the LaunchAgent without rewriting
+#                          Claude/Codex/Gemini settings (install.sh uses this)
 #
 # `launchctl bootstrap gui/<uid>` only works from an Aqua login. Agent
 # terminals, SSH, and some multiplexers return Error 5 (EIO) plus a
@@ -133,6 +135,20 @@ cat > "$PLIST" <<PLIST_EOF
 PLIST_EOF
 
 plutil -lint "$PLIST" >/dev/null
+
+# Point Claude/Codex/Gemini at this LaunchAgent URL (not stdio aicx-mcp).
+# install.sh sets AICX_SKIP_MCP_CLIENTS=1 and applies the same helper once.
+if [ "${AICX_SKIP_MCP_CLIENTS:-0}" != "1" ]; then
+  CLIENTS_HELPER="$(cd "$(dirname "$0")" && pwd)/configure_mcp_clients.py"
+  if [ -f "$CLIENTS_HELPER" ] && command -v python3 >/dev/null 2>&1; then
+    python3 "$CLIENTS_HELPER" \
+      --wire-defaults \
+      --transport http \
+      --plist "$PLIST" \
+      --token-file "${AICX_HOME:-$HOME/.aicx}/auth-token" || \
+      note "mcp clients: HTTP wiring failed (non-fatal)"
+  fi
+fi
 
 service_loaded() {
   launchctl print "$(gui_domain)/$LABEL" >/dev/null 2>&1
