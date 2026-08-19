@@ -7,6 +7,23 @@ use std::path::PathBuf;
 
 #[cfg(feature = "app")]
 #[test]
+fn catalog_rebuild_does_not_clear_hot_live_stamp() {
+    assert!(
+        session_is_hot_live(true, true),
+        "mtime-in-window sessions stay live after census fingerprints match"
+    );
+    assert!(
+        !session_is_hot_live(true, false),
+        "cold mtime must not be stamped live"
+    );
+    assert!(
+        !session_is_hot_live(false, true),
+        "live scan off must not invent live_open"
+    );
+}
+
+#[cfg(feature = "app")]
+#[test]
 fn per_frame_cwd_prevents_cross_repo_session_contamination() {
     let frame = |cwd: Option<&str>, message: &str| crate::timeline::TimelineEntry {
         timestamp: Utc::now(),
@@ -31,7 +48,7 @@ fn per_frame_cwd_prevents_cross_repo_session_contamination() {
         frame(None, "legacy frame without cwd"),
     ];
 
-    retain_frames_for_project(&mut frames, "Loctree/aicx");
+    retain_frames_for_project(&mut frames, "Loctree/aicx", None);
 
     assert_eq!(frames.len(), 2);
     assert!(frames.iter().any(|frame| frame.message == "aicx decision"));
@@ -44,6 +61,37 @@ fn per_frame_cwd_prevents_cross_repo_session_contamination() {
         frames
             .iter()
             .all(|frame| frame.message != "pensieve decision")
+    );
+
+    // Remote-derived identity: the checkout path spells neither `vetcoders`
+    // nor `vibecrafted` as adjacent segments, yet frames inside the session
+    // checkout (or its subdirs) inherit the session identity. Frames that
+    // left the checkout still need the strict path proof.
+    let suite_checkout = "/Volumes/vc-workspace/vetcoders/vibecrafted-suite/vibecrafted";
+    let mut frames = vec![
+        frame(Some(suite_checkout), "suite decision"),
+        frame(
+            Some("/Volumes/vc-workspace/vetcoders/vibecrafted-suite/vibecrafted/labs"),
+            "suite subdir decision",
+        ),
+        frame(
+            Some("/Volumes/vc-workspace/vetcoders/vibecrafted-suitcase"),
+            "prefix-sibling decision",
+        ),
+        frame(
+            Some("/Volumes/vc-workspace/vetcoders/pensieve"),
+            "foreign decision",
+        ),
+    ];
+
+    retain_frames_for_project(&mut frames, "vetcoders/vibecrafted", Some(suite_checkout));
+
+    assert_eq!(frames.len(), 2, "{frames:?}");
+    assert!(frames.iter().any(|frame| frame.message == "suite decision"));
+    assert!(
+        frames
+            .iter()
+            .any(|frame| frame.message == "suite subdir decision")
     );
 }
 
@@ -620,7 +668,7 @@ fn collapse_session_merges_exact_daily_duplicates_within_session() {
         summary: "przerobimy Screenscribe na portal".to_string(),
         context: None,
         evidence: vec![],
-        project: "Vetcoders/Screenscribe".to_string(),
+        project: "vetcoders/Screenscribe".to_string(),
         agent: "codex".to_string(),
         date: "2026-05-31".to_string(),
         timestamp: None,
@@ -842,7 +890,7 @@ fn collapse_session_tolerates_existing_none_count() {
         summary: summary.to_string(),
         context: None,
         evidence: vec![],
-        project: "Vetcoders/Screenscribe".to_string(),
+        project: "vetcoders/Screenscribe".to_string(),
         agent: "codex".to_string(),
         date: "2026-05-31".to_string(),
         timestamp: None,
@@ -2029,6 +2077,7 @@ fn build_candidate_threads_sidecar_honesty_into_record() {
         session_id: "sess-b2".to_string(),
         honesty: crate::oracle::ClaimHonesty::canonical(),
         transcript_entries: None,
+        body: None,
     };
 
     let candidate = build_candidate(
@@ -3929,6 +3978,7 @@ mod flexible_dates {
             session_id: "sess-1".to_string(),
             honesty: Default::default(),
             transcript_entries: None,
+            body: None,
         };
 
         // Repro case: no context, no evidence -> degraded (returns None)
@@ -3985,6 +4035,7 @@ mod flexible_dates {
             session_id: "sess-gate".to_string(),
             honesty: Default::default(),
             transcript_entries: None,
+            body: None,
         };
 
         let signal_lines: Vec<String> = vec![
@@ -4216,6 +4267,7 @@ Update Cargo.lock dependencies\n";
             session_id: "sess-code".to_string(),
             honesty: Default::default(),
             transcript_entries: None,
+            body: None,
         };
 
         let signal_lines: Vec<String> = vec![
@@ -4499,6 +4551,7 @@ Results:
             session_id: "sess-1".to_string(),
             honesty: Default::default(),
             transcript_entries: None,
+            body: None,
         };
 
         // 1. Voice transcript intent without context/evidence (confidence 2)
@@ -4563,4 +4616,110 @@ Results:
         assert_eq!(min_conf_records.len(), 1);
         assert_eq!(min_conf_records[0].summary, "high confidence intent");
     }
+}
+
+/// The lexical index stores extracts, not cards — roles live in
+/// `## <rfc3339> · <role>` headings, not `[HH:MM:SS] role:` prefixes.
+///
+/// Parsing an extract with the card parser silently yields zero roles, and a
+/// classifier that cannot tell operator input from assistant prose is exactly
+/// what `--frame-kind` exists to prevent. This pins the extract shape.
+#[test]
+fn extract_document_parser_recovers_roles_from_heading_form() {
+    let extract = "# AICX session extract\n\
+                   \n\
+                   - session: `abc`\n\
+                   - agent: `claude`\n\
+                   \n\
+                   ## 2026-08-14T07:45:55.000Z · user\n\
+                   \n\
+                   napraw filtr projektu\n\
+                   \n\
+                   ## 2026-08-14T07:46:10.000Z · assistant\n\
+                   \n\
+                   zrobione\n\
+                   \n\
+                   ```\n\
+                   napisz brief do /tmp/brief.md\n\
+                   ```\n";
+
+    let entries = super::parse_extract_document(extract);
+
+    assert_eq!(
+        entries.len(),
+        2,
+        "one entry per heading, preamble excluded; got {entries:?}"
+    );
+    assert_eq!(entries[0].role, "user");
+    assert!(
+        entries[0]
+            .lines
+            .iter()
+            .any(|line| line.contains("napraw filtr projektu")),
+        "user body must survive: {:?}",
+        entries[0].lines
+    );
+    assert_eq!(entries[1].role, "assistant");
+    assert!(
+        entries
+            .iter()
+            .flat_map(|entry| entry.lines.iter())
+            .all(|line| !line.contains("napisz brief do /tmp/brief.md")),
+        "fenced content is quoted boilerplate — dispatch briefs and repeated \
+         directives must not read as fresh intent"
+    );
+
+    // The card parser cannot read this shape — that mismatch was the bug.
+    let (_signals, card_entries) = super::parse_chunk_document(extract);
+    assert!(
+        card_entries.iter().all(|entry| entry.role != "user"),
+        "card parser must not be the one reading extracts"
+    );
+}
+
+/// Overlay's full-history join must keep reading the census.
+///
+/// `build_overlay` calls extraction with `hours: 0` and freezes `intent1:`
+/// evidence refs from the result. The lexical index is signal-filtered when
+/// written and only covers committed sessions, so serving overlay from it
+/// would move refs that are meant to be stable. `hours == 0` therefore
+/// refuses the index path outright.
+#[test]
+#[cfg(feature = "app")]
+fn full_history_requests_never_take_the_index_path() {
+    let home = std::env::temp_dir().join(format!(
+        "aicx-intents-fullhistory-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time before unix epoch")
+            .as_nanos()
+    ));
+
+    // hours == 0 is the overlay contract: full history, census-backed.
+    assert!(
+        super::collect_intent_files_from_index(
+            &home,
+            "vetcoders/aicx",
+            chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0).expect("epoch"),
+            false,
+            true,
+        )
+        .is_none(),
+        "full-history requests must fall through to the census"
+    );
+
+    // The live hot window is likewise census-only: fresh sessions are not
+    // committed to the index yet.
+    assert!(
+        super::collect_intent_files_from_index(
+            &home,
+            "vetcoders/aicx",
+            chrono::Utc::now(),
+            true,
+            false,
+        )
+        .is_none(),
+        "hot-window requests must fall through to the census"
+    );
 }

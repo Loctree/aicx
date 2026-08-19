@@ -714,14 +714,19 @@ fn tempdir_for_test() -> std::path::PathBuf {
 /// Required for tests that exercise code paths inside
 /// `query_index_with_embedding` etc., which acquire the canonical
 /// `lance.lock` derived from `AICX_HOME`.
-struct ScopedAicxHome {
+pub(super) struct ScopedAicxHome {
     previous: Option<std::ffi::OsString>,
     _guard: std::sync::MutexGuard<'static, ()>,
 }
 
 impl ScopedAicxHome {
-    fn set(home: &std::path::Path) -> Self {
-        let guard = AICX_HOME_ENV_LOCK.lock().expect("AICX_HOME test lock");
+    pub(super) fn set(home: &std::path::Path) -> Self {
+        // A panic under the guard poisons the mutex; recover the inner guard
+        // so one genuine failure does not cascade into phantom PoisonErrors
+        // across every later AICX_HOME-scoped test.
+        let guard = AICX_HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let previous = std::env::var_os("AICX_HOME");
         // SAFETY: env mutation is single-threaded within this test scope;
         // the RAII guard restores prior state on drop.
@@ -1583,5 +1588,143 @@ mod batch {
             "a batch of one goes straight to embed_one"
         );
         assert_eq!(e.one_calls, 1);
+    }
+}
+
+/// Downgrade-gate coverage for `publish_hybrid_generation`: a mis-synced or
+/// outdated writer must produce a typed conflict, never a silent CURRENT flip.
+mod publish_downgrade_gate {
+    use super::*;
+
+    fn manifest_with_lexical(lexical_commit_id: &str, writer: &str) -> aicx_retrieve::Manifest {
+        let now = aicx_retrieve::Manifest::now_utc();
+        aicx_retrieve::Manifest {
+            schema_version: "2.0".to_string(),
+            generation_id: aicx_retrieve::Manifest::fresh_generation_id(),
+            writer_version: writer.to_string(),
+            build_id: writer.to_string(),
+            source_chunk_count: 1,
+            source_hash_blake3: "test-hash".to_string(),
+            embedder_model: "optional".to_string(),
+            embedder_url_hash: "not_built".to_string(),
+            embedder_dim: 0,
+            embedder_distance: "cosine".to_string(),
+            dense_count: 0,
+            dense_kind: "optional_not_built".to_string(),
+            lexical_commit_id: lexical_commit_id.to_string(),
+            lexical_doc_count: 1,
+            build_started_at: now,
+            build_completed_at: now,
+            build_wall_seconds: 0,
+            fusion_algorithm: "rrf".to_string(),
+            fusion_k: 60,
+        }
+    }
+
+    fn write_generation(
+        hybrid_root: &Path,
+        name: &str,
+        lexical_commit_id: &str,
+        writer: &str,
+    ) -> std::path::PathBuf {
+        let gen_dir = hybrid_root.join(HYBRID_GENERATIONS_DIR_NAME).join(name);
+        std::fs::create_dir_all(&gen_dir).unwrap();
+        manifest_with_lexical(lexical_commit_id, writer)
+            .write_to_path(&gen_dir.join("manifest.json"))
+            .unwrap();
+        gen_dir
+    }
+
+    fn current_pointer(hybrid_root: &Path) -> String {
+        std::fs::read_to_string(hybrid_root.join("CURRENT"))
+            .unwrap_or_default()
+            .trim()
+            .to_string()
+    }
+
+    fn supported_commit_id(suffix: &str) -> String {
+        format!("{}:{suffix}", aicx_retrieve::TANTIVY_SCHEMA_VERSION)
+    }
+
+    #[test]
+    fn publish_accepts_supported_schema_and_flips_current() {
+        let root = tempdir_for_test();
+        let gen_a = write_generation(&root, "g-test-a", &supported_commit_id("seg-a"), "0.12.1");
+        publish_hybrid_generation(&root, &gen_a).expect("supported schema publishes");
+        assert_eq!(current_pointer(&root), "g-test-a");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn publish_refuses_downgrade_and_keeps_current() {
+        let root = tempdir_for_test();
+        let newer = write_generation(&root, "g-test-new", &supported_commit_id("seg-n"), "0.12.1");
+        publish_hybrid_generation(&root, &newer).expect("baseline publish");
+
+        let older = write_generation(
+            &root,
+            "g-test-old",
+            "tantivy_lexical_v2_fast_body:seg-o",
+            "0.11.0-foreign",
+        );
+        let err = publish_hybrid_generation(&root, &older).expect_err("downgrade must be refused");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("downgrade"), "unexpected error: {msg}");
+        assert!(
+            msg.contains("0.11.0-foreign"),
+            "writer identity missing: {msg}"
+        );
+        assert_eq!(
+            current_pointer(&root),
+            "g-test-new",
+            "CURRENT must not move"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn publish_refuses_schema_newer_than_binary() {
+        let root = tempdir_for_test();
+        let future = write_generation(
+            &root,
+            "g-test-future",
+            "tantivy_lexical_v99_from_the_future:seg-f",
+            "9.9.9",
+        );
+        let err = publish_hybrid_generation(&root, &future).expect_err("future schema refused");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("newer"), "unexpected error: {msg}");
+        assert!(current_pointer(&root).is_empty(), "CURRENT must stay unset");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn publish_refuses_generation_without_manifest() {
+        let root = tempdir_for_test();
+        let gen_dir = root.join(HYBRID_GENERATIONS_DIR_NAME).join("g-test-bare");
+        std::fs::create_dir_all(&gen_dir).unwrap();
+        let err = publish_hybrid_generation(&root, &gen_dir).expect_err("manifest is mandatory");
+        assert!(format!("{err:#}").contains("readable manifest"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn publish_upgrades_over_foreign_v2_current() {
+        // Simulates the MEGA-sync incident: a foreign host's v2 generation
+        // sits under CURRENT (written directly, bypassing this binary's
+        // gate). A local v3 rebuild must be allowed to reclaim CURRENT.
+        let root = tempdir_for_test();
+        write_generation(
+            &root,
+            "g-foreign-v2",
+            "tantivy_lexical_v2_fast_body:seg-x",
+            "",
+        );
+        std::fs::write(root.join("CURRENT"), "g-foreign-v2\n").unwrap();
+
+        let v3 = write_generation(&root, "g-local-v3", &supported_commit_id("seg-y"), "0.12.1");
+        publish_hybrid_generation(&root, &v3).expect("upgrade over foreign v2 must succeed");
+        assert_eq!(current_pointer(&root), "g-local-v3");
+        let _ = std::fs::remove_dir_all(root);
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "aicx"
-version = "0.12.1"
+version = "0.12.2"
 build = "build.rs"
 edition = "2024"
 rust-version = "1.91.1"
@@ -63,10 +63,10 @@ cloud-embedder = ["dep:aicx-embeddings", "aicx-embeddings/cloud"]
 e2e-aicx = ["native-embedder", "cloud-embedder"]
 
 [dependencies]
-aicx-embeddings = { path = "crates/aicx-embeddings", version = "0.12.1", optional = true, default-features = false }
-aicx-monitor = { path = "crates/aicx-monitor", version = "0.12.1", optional = true }
-aicx-parser = { path = "crates/aicx-parser", version = "0.12.1", features = ["json-schema"] }
-aicx-progress-contracts = { path = "crates/aicx-progress-contracts", version = "0.12.1", optional = true }
+aicx-embeddings = { path = "crates/aicx-embeddings", version = "0.12.2", optional = true, default-features = false }
+aicx-monitor = { path = "crates/aicx-monitor", version = "0.12.2", optional = true }
+aicx-parser = { path = "crates/aicx-parser", version = "0.12.2", features = ["json-schema"] }
+aicx-progress-contracts = { path = "crates/aicx-progress-contracts", version = "0.12.2", optional = true }
 anyhow = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"], optional = true }
@@ -95,7 +95,7 @@ tower_governor = { version = "0.8", default-features = false, features = ["axum"
 rmcp = { version = "1.2", features = ["server", "schemars", "transport-io", "transport-streamable-http-server", "transport-streamable-http-server-session"], optional = true }
 libc = "0.2.183"
 schemars = "1.2.1"
-aicx-retrieve = { path = "crates/aicx-retrieve", version = "0.12.1", optional = true }
+aicx-retrieve = { path = "crates/aicx-retrieve", version = "0.12.2", optional = true }
 blake3 = "1.8.5"
 which = { version = "8.0.2", optional = true }
 

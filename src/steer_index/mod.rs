@@ -25,6 +25,25 @@ pub async fn search_steer_index(
 fn open_current_adapter() -> Result<aicx_retrieve::TantivyAdapter> {
     let hybrid_root =
         crate::vector_index::hybrid_root_dir(None).context("resolve global hybrid index root")?;
+    open_current_adapter_in(hybrid_root)
+}
+
+/// Open the committed CURRENT lexical generation under a specific AICX home.
+///
+/// Shared with `intents`, which reads the same documents rather than keeping a
+/// second corpus view that could drift from CURRENT. The home is explicit so a
+/// caller holding a fixture root never reads the operator's real index.
+pub(crate) fn open_current_adapter_at(
+    aicx_home: &std::path::Path,
+) -> Result<aicx_retrieve::TantivyAdapter> {
+    let hybrid_root = crate::vector_index::hybrid_root_dir_at(aicx_home, None)
+        .context("resolve hybrid index root")?;
+    open_current_adapter_in(hybrid_root)
+}
+
+fn open_current_adapter_in(
+    hybrid_root: std::path::PathBuf,
+) -> Result<aicx_retrieve::TantivyAdapter> {
     let generation = crate::vector_index::resolve_hybrid_generation_dir(&hybrid_root);
     let manifest_path = generation.join("manifest.json");
     if !manifest_path.is_file() {
@@ -177,7 +196,7 @@ mod tests {
 
         let filter = SteerFilter {
             prompt_id: Some("prompt-target"),
-            project: Some("VetCoders/aicx"),
+            project: Some("vetcoders/aicx"),
             ..SteerFilter::default()
         };
         let matches = search_generation_metadata(&adapter, &filter, 10).unwrap();
@@ -198,7 +217,7 @@ mod tests {
             metadata: json!({
                 "agent": "codex",
                 "date": date,
-                "project": "VetCoders/aicx",
+                "project": "vetcoders/aicx",
                 "prompt_id": prompt_id,
                 "run_id": "run-1",
                 "kind": "report",

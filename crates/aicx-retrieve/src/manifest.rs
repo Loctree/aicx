@@ -68,11 +68,42 @@ impl Default for MmapDenseFormatSchema {
     }
 }
 
+/// Crate version of this writer, stamped into every manifest it publishes.
+pub const WRITER_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Build identity for manifests written by this compilation unit. Release
+/// pipelines export `AICX_BUILD_VERSION` (the same override the app's
+/// `build.rs` honors), so binaries carry `<version>+g<sha>[.dirty]`; plain
+/// library builds fall back to the crate version.
+pub fn default_build_id() -> String {
+    option_env!("AICX_BUILD_VERSION")
+        .unwrap_or(WRITER_VERSION)
+        .to_string()
+}
+
+/// Ordering key of a lexical schema tag or `lexical_commit_id`
+/// (`tantivy_lexical_v3_folded_dictation` → `3`). `None` means the value
+/// carries no comparable schema generation (legacy or synthetic ids); callers
+/// must not treat that as either older or newer.
+pub fn lexical_schema_generation(lexical_id: &str) -> Option<u32> {
+    let rest = lexical_id.strip_prefix("tantivy_lexical_v")?;
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    (!digits.is_empty()).then(|| digits.parse().ok())?
+}
+
 /// Retrieval build manifest for split lexical + dense index artifacts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Manifest {
     pub schema_version: String,
     pub generation_id: String,
+    /// Version of the writer that built this generation. Empty on manifests
+    /// written before provenance hardening (2026-08-10).
+    #[serde(default)]
+    pub writer_version: String,
+    /// Exact build identity of the writer (`<version>+g<sha>[.dirty]` when
+    /// available). Empty on pre-provenance manifests.
+    #[serde(default)]
+    pub build_id: String,
     pub source_chunk_count: usize,
     pub source_hash_blake3: String,
     pub embedder_model: String,
@@ -141,6 +172,52 @@ impl Manifest {
 
     pub fn now_utc() -> DateTime<Utc> {
         Utc::now()
+    }
+
+    /// Human-readable writer identity for conflict messages. Manifests from
+    /// before provenance hardening carry no identity and say so explicitly.
+    pub fn writer_label(&self) -> String {
+        match (
+            self.writer_version.trim().is_empty(),
+            self.build_id.trim().is_empty(),
+        ) {
+            (true, true) => "unknown (pre-provenance writer)".to_string(),
+            (false, true) => self.writer_version.clone(),
+            (true, false) => self.build_id.clone(),
+            (false, false) => format!("{} ({})", self.writer_version, self.build_id),
+        }
+    }
+
+    /// Reject schema drift between this published manifest and the reader's
+    /// supported lexical schema tag. A provable downgrade (index older than
+    /// the binary) and a provable too-new index both become typed conflicts
+    /// naming the foreign writer; ids without a comparable generation fall
+    /// through to the adapter's own fail-closed field checks.
+    pub fn ensure_lexical_schema_supported(
+        &self,
+        binary_schema: &str,
+    ) -> Result<(), ManifestError> {
+        let Some(index_generation) = lexical_schema_generation(&self.lexical_commit_id) else {
+            return Ok(());
+        };
+        let Some(binary_generation) = lexical_schema_generation(binary_schema) else {
+            return Ok(());
+        };
+        if index_generation < binary_generation {
+            return Err(ManifestError::LexicalSchemaDowngrade {
+                current: binary_schema.to_string(),
+                incoming: self.lexical_commit_id.clone(),
+                writer: self.writer_label(),
+            });
+        }
+        if index_generation > binary_generation {
+            return Err(ManifestError::LexicalSchemaTooNew {
+                index_schema: self.lexical_commit_id.clone(),
+                binary_schema: binary_schema.to_string(),
+                writer: self.writer_label(),
+            });
+        }
+        Ok(())
     }
 
     /// Validate that two retrieval artifacts belong to the same generation.

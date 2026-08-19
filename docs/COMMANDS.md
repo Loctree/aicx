@@ -100,8 +100,9 @@ Orthogonal surfaces:
 - **index status** = is CURRENT lagging the catalog/corpus?
 
 `catalog rebuild` walks the registered Claude, Codex, Grok, Gemini, Junie, and
-Vibecrafted runtime roots. It writes the compact catalog and prints counts; it
-does not materialize session content.
+Vibecrafted runtime roots. It writes the compact catalog and prints counts,
+including `pending_chunks`. It does not materialize session content unless
+`--with-chunks` is passed, which drains the lag through `aicx index`.
 
 `catalog refresh` scans only a bounded hot window, merges new/changed sessions
 under the catalog lock, and reattributes existing rows whose `cwd` resolves to

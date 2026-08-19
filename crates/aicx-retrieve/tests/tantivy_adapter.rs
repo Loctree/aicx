@@ -302,3 +302,57 @@ fn deterministic_query_token(text: &str) -> Option<String> {
         })
         .max_by_key(|token| token.len())
 }
+
+/// `scan_chunks` must return the stored body, not just metadata.
+///
+/// This is the contract `aicx intents` relies on to stop re-parsing original
+/// transcripts: the canonical extract is already committed to the index, so a
+/// classifier can read it back verbatim. A metadata-only scan would force the
+/// caller back onto the source files and undo the whole point.
+#[test]
+fn scan_chunks_returns_stored_bodies_and_honors_the_predicate() {
+    let temp = TempDir::new().expect("create temp index dir");
+    let mut adapter = TantivyAdapter::new(temp.path().to_path_buf()).expect("open adapter");
+    adapter
+        .build(&[
+            chunk(
+                1,
+                "decision: keep the lexical index authoritative",
+                "claude",
+            ),
+            chunk(2, "unrelated chatter from another agent", "codex"),
+        ])
+        .expect("build index");
+
+    let claude_only = adapter
+        .scan_chunks(usize::MAX, |metadata| {
+            metadata.get("agent").and_then(|value| value.as_str()) == Some("claude")
+        })
+        .expect("scan chunks");
+
+    assert_eq!(
+        claude_only.len(),
+        1,
+        "predicate must exclude the codex chunk; got {claude_only:?}"
+    );
+    assert!(
+        claude_only[0]
+            .text
+            .contains("keep the lexical index authoritative"),
+        "stored body must come back verbatim, got: {:?}",
+        claude_only[0].text
+    );
+    assert_eq!(
+        claude_only[0]
+            .metadata
+            .get("agent")
+            .and_then(|value| value.as_str()),
+        Some("claude"),
+        "metadata must travel with the body"
+    );
+
+    let capped = adapter
+        .scan_chunks(1, |_| true)
+        .expect("scan chunks with a cap");
+    assert_eq!(capped.len(), 1, "limit must bound the returned set");
+}

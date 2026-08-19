@@ -1136,6 +1136,15 @@ configure_mcp "codex" "$HOME/.codex/settings.json"
 # Gemini
 configure_mcp "gemini" "$HOME/.gemini/settings.json"
 
+# Background HTTP MCP service daemon (macOS launchd; no-op elsewhere). Opt out with
+# AICX_SKIP_MCP_SERVICE=1.
+if [ "${AICX_SKIP_MCP_SERVICE:-0}" != "1" ]; then
+  MCP_SERVICE_SCRIPT="$(dirname "$0")/tools/install-mcp-service.sh"
+  if [ -f "$MCP_SERVICE_SCRIPT" ]; then
+    bash "$MCP_SERVICE_SCRIPT" || echo "  Warning: MCP HTTP service install failed (non-fatal)."
+  fi
+fi
+
 # --- Step 4: Full store bootstrap ---
 echo "[4/4] Full context extraction (this may take a moment)..."
 "${AICX_RUN[@]}" all -H 10000 --emit none

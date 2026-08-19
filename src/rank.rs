@@ -1713,17 +1713,17 @@ Some boilerplate text.
 
         let vista_path = write_canonical_search_fixture(
             &root,
-            "Vetcoders",
+            "vetcoders",
             "Vista",
             "sessvista",
-            "[project: Vetcoders/Vista | agent: codex | date: 2026-05-24]\n\nDecision: strictneedle belongs to the exact Vista repository.\n",
+            "[project: vetcoders/Vista | agent: codex | date: 2026-05-24]\n\nDecision: strictneedle belongs to the exact Vista repository.\n",
         );
         write_canonical_search_fixture(
             &root,
-            "Vetcoders",
+            "vetcoders",
             "vista-portal",
             "sessportal",
-            "[project: Vetcoders/vista-portal | agent: codex | date: 2026-05-24]\n\nDecision: strictneedle must not leak through a bare vista filter.\n",
+            "[project: vetcoders/vista-portal | agent: codex | date: 2026-05-24]\n\nDecision: strictneedle must not leak through a bare vista filter.\n",
         );
 
         let (results, scanned) =
@@ -1732,7 +1732,7 @@ Some boilerplate text.
 
         assert_eq!(scanned, 1, "bare `-p vista` must scan only exact Vista");
         assert_eq!(results.len(), 1, "vista-portal must not match `-p vista`");
-        assert_eq!(results[0].project, "Vetcoders/Vista");
+        assert_eq!(results[0].project, "vetcoders/Vista");
         assert_eq!(
             results[0].path,
             fs::canonicalize(&vista_path)
@@ -1751,7 +1751,7 @@ Some boilerplate text.
 
         write_canonical_search_fixture(
             &root,
-            "Vetcoders",
+            "vetcoders",
             "aicx",
             "sessaicx",
             "User asked:\nWhy did we move embeddings to Sztudio?\n\nAgent answered:\nDecision: foundationneedle belongs in the content match, not in a metadata banner.\n",
@@ -1785,14 +1785,14 @@ Some boilerplate text.
 
         write_canonical_search_fixture(
             &root,
-            "Vetcoders",
+            "vetcoders",
             "Vista",
             "sessfront",
-            "---\nproject: Vetcoders/Vista\nagent: codex\ndate: 2026-05-24\nframe_kind: agent_reply\n---\n\nDecision: frontneedle lives only in the body.\n",
+            "---\nproject: vetcoders/Vista\nagent: codex\ndate: 2026-05-24\nframe_kind: agent_reply\n---\n\nDecision: frontneedle lives only in the body.\n",
         );
 
         let (results, scanned) =
-            fuzzy_search_store_one(&root, "frontneedle", 10, Some("Vetcoders/Vista"), None)
+            fuzzy_search_store_one(&root, "frontneedle", 10, Some("vetcoders/Vista"), None)
                 .expect("fixture fuzzy search should succeed");
 
         assert_eq!(scanned, 1);
@@ -1823,7 +1823,7 @@ Some boilerplate text.
             &[FuzzyResult {
                 file: "chunk.md".to_string(),
                 path: "/tmp/chunk.md".to_string(),
-                project: "Vetcoders/ai-contexters".to_string(),
+                project: "vetcoders/ai-contexters".to_string(),
                 kind: "reports".to_string(),
                 frame_kind: None,
                 agent: "codex".to_string(),
@@ -1883,7 +1883,7 @@ Some boilerplate text.
         );
         assert_eq!(payload["items"][0]["score"], 88);
         assert_eq!(payload["items"][0]["label"], "HIGH");
-        assert_eq!(payload["items"][0]["project"], "Vetcoders/ai-contexters");
+        assert_eq!(payload["items"][0]["project"], "vetcoders/ai-contexters");
         assert_eq!(payload["items"][0]["kind"], "reports");
         assert_eq!(payload["items"][0]["agent"], "codex");
         assert_eq!(payload["items"][0]["date"], "2026-03-31");
@@ -1911,7 +1911,7 @@ Some boilerplate text.
             &[FuzzyResult {
                 file: "chunk.md".to_string(),
                 path: "/tmp/chunk.md".to_string(),
-                project: "Vetcoders/aicx".to_string(),
+                project: "vetcoders/aicx".to_string(),
                 kind: "conversations".to_string(),
                 frame_kind: None,
                 agent: "codex".to_string(),
@@ -1921,7 +1921,7 @@ Some boilerplate text.
                 label: "HIGH".to_string(),
                 density: 1.0,
                 matched_lines: vec![
-                    "[metadata] project: Vetcoders/aicx | agent: codex | date: 2026-06-19 | kind: conversations | path: /tmp/chunk.md".to_string(),
+                    "[metadata] project: Loctree/aicx | agent: codex | date: 2026-06-19 | kind: conversations | path: /tmp/chunk.md".to_string(),
                 ],
                 session_id: Some("sess-456".to_string()),
                 cwd: None,

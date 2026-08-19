@@ -22,7 +22,7 @@ env:
 jobs:
   verify:
     name: Verify release input
-    runs-on: [self-hosted, ops-linux]
+    runs-on: ubuntu-latest
     outputs:
       release_tag: ${{ steps.meta.outputs.release_tag }}
       version: ${{ steps.meta.outputs.version }}
@@ -169,13 +169,13 @@ jobs:
       matrix:
         include:
           - runner_name: ops-linux
-            runner: '["self-hosted", "ops-linux"]'
+            runner: ubuntu-latest
             target: x86_64-unknown-linux-gnu
           - runner_name: dragon-macos
-            runner: '["self-hosted", "dragon-macos"]'
+            runner: macos-latest
             target: aarch64-apple-darwin
           - runner_name: windows-pc
-            runner: '["self-hosted", "windows-pc"]'
+            runner: windows-latest
             target: x86_64-pc-windows-msvc
 
     steps:
@@ -346,7 +346,7 @@ jobs:
   github-release:
     name: Publish GitHub Release
     needs: [verify, build]
-    runs-on: [self-hosted, ops-linux]
+    runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6

@@ -317,6 +317,7 @@ fn plane_fields_for_missing() -> (String, String, String, usize, Option<String>)
     )
 }
 
+#[cfg(feature = "app")]
 fn plane_fields_from_manifest(
     dense_kind: &str,
     dense_count: usize,
@@ -1195,11 +1196,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).expect("create root");
 
-        let status = index_status_at_with_sessions(&root, Some("Vetcoders/Loctree"), Some(&[]))
+        let status = index_status_at_with_sessions(&root, Some("Loctree/loctree"), Some(&[]))
             .expect("index status with project");
 
         // Mirrors the on-disk bucket: lowercase + path separators replaced.
-        assert_eq!(status.project_bucket, "vetcoders_loctree");
+        assert_eq!(status.project_bucket, "loctree_loctree");
         assert_eq!(status.readiness, IndexReadiness::Missing);
 
         let _ = std::fs::remove_dir_all(root);
@@ -1279,6 +1280,8 @@ mod tests {
         let manifest = aicx_retrieve::Manifest {
             schema_version: "2.0".to_string(),
             generation_id: "g-2026-07-23T10:00:00Z-teststatus".to_string(),
+            writer_version: "0.12.1".to_string(),
+            build_id: "0.12.1+gtestbead".to_string(),
             source_chunk_count: 3,
             source_hash_blake3: "abc".to_string(),
             embedder_model: "optional".to_string(),

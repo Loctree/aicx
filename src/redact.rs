@@ -7,7 +7,7 @@
 //!
 //! This is best-effort and intentionally conservative.
 //!
-//! Created by vetcoders (c)2026
+//! Created by Vetcoders (c)2026
 
 use regex::{Captures, Regex, RegexSet};
 use std::borrow::Cow;

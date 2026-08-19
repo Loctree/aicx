@@ -100,8 +100,9 @@ fn seed_state_json(aicx_home: &Path) {
         "last_processed": {},
         "hash_algorithm": "blake3-128-v2",
         "seen_hashes": {
-            "vetcoders/loctree-suite": ["aa", "bb", "cc"],
+            "Loctree/loctree-suite": ["aa", "bb", "cc"],
             "vetcoders/aicx": ["dd", "ee"],
+            "vetcoders/vibecrafted": ["gg", "hh"],
             "libraxisai/agents": ["ff"],
         },
         "runs": [],
@@ -137,11 +138,14 @@ fn state_info_without_filter_shows_all_buckets() {
     );
     // Default totals line (no `(filtered)` suffix).
     assert!(
-        stderr.contains("Total hashes: 6"),
-        "expected total hashes 6 (3+2+1) across all buckets; stderr:\n{stderr}"
+        stderr.contains("Total hashes: 8"),
+        "expected total hashes 8 (3+2+2+1) across all buckets; stderr:\n{stderr}"
     );
-    assert!(stderr.contains("vetcoders/loctree-suite: 3 hashes"));
+    // Display canonicalizes slugs (case-fold): the seeded
+    // `Loctree/loctree-suite` key renders lowercase.
+    assert!(stderr.contains("loctree/loctree-suite: 3 hashes"));
     assert!(stderr.contains("vetcoders/aicx: 2 hashes"));
+    assert!(stderr.contains("vetcoders/vibecrafted: 2 hashes"));
     assert!(stderr.contains("libraxisai/agents: 1 hashes"));
     assert!(
         !stderr.contains("Filtered by project:"),
@@ -154,12 +158,12 @@ fn state_info_without_filter_shows_all_buckets() {
 fn state_info_with_slug_filter_narrows_to_one_bucket() {
     let home = unique_test_dir("slug");
     seed_state_json(&home);
-    let out = run_aicx_state_info(&home, Some("vetcoders/loctree-suite"));
+    let out = run_aicx_state_info(&home, Some("Loctree/loctree-suite"));
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "stderr:\n{stderr}");
     assert!(
-        stderr.contains("Filtered by project: vetcoders/loctree-suite"),
-        "banner missing; stderr:\n{stderr}"
+        stderr.contains("Filtered by project: loctree/loctree-suite"),
+        "banner missing (filter echoes the canonical case-folded slug); stderr:\n{stderr}"
     );
     assert!(
         stderr.contains("Total hashes (filtered): 3"),
@@ -169,7 +173,7 @@ fn state_info_with_slug_filter_narrows_to_one_bucket() {
         stderr.contains("Projects (filtered):     1"),
         "should match exactly one bucket; stderr:\n{stderr}"
     );
-    assert!(stderr.contains("vetcoders/loctree-suite: 3 hashes"));
+    assert!(stderr.contains("loctree/loctree-suite: 3 hashes"));
     assert!(
         !stderr.contains("vetcoders/aicx: 2 hashes"),
         "must not include sibling buckets under same org; stderr:\n{stderr}"
@@ -186,15 +190,19 @@ fn state_info_with_org_wildcard_filter_includes_org_siblings() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "stderr:\n{stderr}");
     assert!(
-        stderr.contains("Total hashes (filtered): 5"),
-        "two vetcoders buckets total 5 hashes; stderr:\n{stderr}"
+        stderr.contains("Total hashes (filtered): 4"),
+        "two vetcoders buckets total 4 hashes; stderr:\n{stderr}"
     );
     assert!(
         stderr.contains("Projects (filtered):     2"),
         "should match exactly two buckets; stderr:\n{stderr}"
     );
-    assert!(stderr.contains("vetcoders/loctree-suite"));
     assert!(stderr.contains("vetcoders/aicx"));
+    assert!(stderr.contains("vetcoders/vibecrafted"));
+    assert!(
+        !stderr.contains("loctree/loctree-suite"),
+        "must not include other-org buckets; stderr:\n{stderr}"
+    );
     assert!(
         !stderr.contains("libraxisai/agents"),
         "must not include other-org buckets; stderr:\n{stderr}"

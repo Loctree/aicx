@@ -1469,9 +1469,9 @@ fn test_identity_migration_via_doctor_cli() {
     let store_dir = aicx_dir.join("store");
 
     // 1. Seed store and index cased
-    fs::create_dir_all(store_dir.join("VetCoders/CodeScribe/2026_0717/context/claude")).unwrap();
+    fs::create_dir_all(store_dir.join("vetcoders/CodeScribe/2026_0717/context/claude")).unwrap();
     fs::write(
-        store_dir.join("VetCoders/CodeScribe/2026_0717/context/claude/chunk1.md"),
+        store_dir.join("vetcoders/CodeScribe/2026_0717/context/claude/chunk1.md"),
         "chunk contents",
     )
     .unwrap();
@@ -1480,7 +1480,7 @@ fn test_identity_migration_via_doctor_cli() {
         "schema_version": 1,
         "last_updated": chrono::Utc::now().to_rfc3339(),
         "projects": {
-            "VetCoders/CodeScribe": {
+            "vetcoders/CodeScribe": {
                 "agents": {
                     "claude": {
                         "dates": ["2026-07-17"],
@@ -1506,7 +1506,7 @@ fn test_identity_migration_via_doctor_cli() {
 
     // 3. Modify a file to trigger precondition mismatch
     fs::write(
-        store_dir.join("VetCoders/CodeScribe/2026_0717/context/claude/chunk1.md"),
+        store_dir.join("vetcoders/CodeScribe/2026_0717/context/claude/chunk1.md"),
         "modified chunk contents to trigger mismatch",
     )
     .unwrap();

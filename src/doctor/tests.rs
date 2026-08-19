@@ -217,6 +217,12 @@ fn oracle_readiness_is_ready_when_semantic_and_freshness_are_green() {
             detail: "ok".to_string(),
             recommendation: None,
         },
+        continuity_freshness: CheckResult {
+            name: "continuity_freshness".to_string(),
+            severity: Severity::Green,
+            detail: "ok".to_string(),
+            recommendation: None,
+        },
         aicx_home: CheckResult::default(),
         binary_pair: CheckResult::default(),
         http_auth_token: CheckResult::default(),
@@ -251,7 +257,7 @@ fn index_consistency_flags_orphaned_and_missing_tuples() {
         tmp.join("index.json"),
         serde_json::json!({
             "projects": {
-                "Vetcoders/aicx": {
+                "vetcoders/aicx": {
                     "agents": {
                         "codex": {
                             "dates": ["2026_0505"],
@@ -352,7 +358,7 @@ fn check_corpus_buckets_flags_template_literals() {
     // them on Windows — they are an impossible input there, not a skipped
     // case. Create + assert them on non-Windows only.
     #[cfg(not(windows))]
-    std::fs::create_dir_all(store.join("vetcoders").join("loctree\n\n**AICX")).unwrap();
+    std::fs::create_dir_all(store.join("Loctree").join("loctree\n\n**AICX")).unwrap();
     // Template-placeholder leaks (leading `{`, `<`, `$`):
     std::fs::create_dir_all(store.join("{target_owner}")).unwrap();
     #[cfg(not(windows))]
@@ -370,7 +376,7 @@ fn check_corpus_buckets_flags_template_literals() {
     assert!(result.detail.contains("$RELEASE_REPO"));
     assert!(result.detail.contains("vetcoders/vibecrafted.git`"));
     #[cfg(not(windows))]
-    assert!(result.detail.contains("vetcoders/loctree"));
+    assert!(result.detail.contains("Loctree/loctree"));
 
     let _ = std::fs::remove_dir_all(&tmp);
 }
@@ -503,12 +509,12 @@ fn empty_body_chunks_red_when_over_threshold_and_script_is_reviewable() {
     let full = dir.join("2026_0506_claude_sess-full_001.md");
     std::fs::write(
         &empty,
-        "[project: Vetcoders/aicx | agent: claude | date: 2026-05-06 | frame_kind: internal_thought]\n\n",
+        "[project: Loctree/aicx | agent: claude | date: 2026-05-06 | frame_kind: internal_thought]\n\n",
     )
     .unwrap();
     std::fs::write(
         &full,
-        "[project: Vetcoders/aicx | agent: claude | date: 2026-05-06]\n\nThis chunk carries enough real body content to avoid the empty-body threshold.",
+        "[project: Loctree/aicx | agent: claude | date: 2026-05-06]\n\nThis chunk carries enough real body content to avoid the empty-body threshold.",
     )
     .unwrap();
 
@@ -532,7 +538,7 @@ fn migrate_identities_dry_run_reports_plan_without_touching_store() {
     // SYNTHETIC store shaped after the persisted-casing drift documented in
     // ~/.aicx/aicx-problems.md (2026-07-17 15:18 UTC).
     let tmp = unique_test_dir("migrate-identities-dry-run");
-    let dir = tmp.join("store").join("VetCoders").join("CodeScribe");
+    let dir = tmp.join("store").join("vetcoders").join("CodeScribe");
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("payload.md"), "chunk").unwrap();
 
@@ -565,7 +571,7 @@ fn migrate_identities_dry_run_reports_plan_without_touching_store() {
         .filter_map(|entry| entry.ok())
         .map(|entry| entry.file_name().to_string_lossy().into_owned())
         .collect();
-    assert!(names.contains(&"VetCoders".to_string()), "{names:?}");
+    assert!(names.contains(&"vetcoders".to_string()), "{names:?}");
     assert!(tmp.join("migration/identity-manifest.json").is_file());
     assert!(tmp.join("migration/identity-report.md").is_file());
 
@@ -588,13 +594,13 @@ fn apply_prune_empty_bodies_moves_chunks_to_quarantine_and_rechecks() {
     let empty_sidecar = empty.with_extension("meta.json");
     std::fs::write(
         &empty,
-        "[project: Vetcoders/aicx | agent: claude | date: 2026-05-06 | frame_kind: internal_thought]\n\n",
+        "[project: Loctree/aicx | agent: claude | date: 2026-05-06 | frame_kind: internal_thought]\n\n",
     )
     .unwrap();
     std::fs::write(&empty_sidecar, "{}").unwrap();
     std::fs::write(
         &full,
-        "[project: Vetcoders/aicx | agent: claude | date: 2026-05-06]\n\nThis chunk carries enough real body content to avoid the empty-body threshold.",
+        "[project: Loctree/aicx | agent: claude | date: 2026-05-06]\n\nThis chunk carries enough real body content to avoid the empty-body threshold.",
     )
     .unwrap();
 
@@ -890,26 +896,26 @@ fn empty_body_frame_kind_prefers_sidecar_and_falls_back_to_header() {
     let with_sidecar = dir.join("2026_0702_claude_sess-sidecar_001.md");
     std::fs::write(
         &with_sidecar,
-        "[project: Vetcoders/aicx | agent: claude | date: 2026-07-02 | frame_kind: internal_thought]\n\n",
+        "[project: Loctree/aicx | agent: claude | date: 2026-07-02 | frame_kind: internal_thought]\n\n",
     )
     .unwrap();
     std::fs::write(
         with_sidecar.with_extension("meta.json"),
-        r#"{"id":"sess-sidecar_001","project":"Vetcoders/aicx","agent":"claude","date":"2026-07-02","session_id":"sess-sidecar","kind":"conversations","frame_kind":"system_note"}"#,
+        r#"{"id":"sess-sidecar_001","project":"vetcoders/aicx","agent":"claude","date":"2026-07-02","session_id":"sess-sidecar","kind":"conversations","frame_kind":"system_note"}"#,
     )
     .unwrap();
 
     // No sidecar — the legacy bracket header fills in.
     std::fs::write(
         dir.join("2026_0702_claude_sess-header_001.md"),
-        "[project: Vetcoders/aicx | agent: claude | date: 2026-07-02 | frame_kind: internal_thought]\n\n",
+        "[project: Loctree/aicx | agent: claude | date: 2026-07-02 | frame_kind: internal_thought]\n\n",
     )
     .unwrap();
 
     // No sidecar, YAML frontmatter header — the v2 form fills in the same way.
     std::fs::write(
         dir.join("2026_0702_claude_sess-front_001.md"),
-        "---\nproject: Vetcoders/aicx\nagent: claude\ndate: 2026-07-02\nframe_kind: tool_call\n---\n\n",
+        "---\nproject: vetcoders/aicx\nagent: claude\ndate: 2026-07-02\nframe_kind: tool_call\n---\n\n",
     )
     .unwrap();
 
@@ -941,12 +947,12 @@ fn empty_body_detection_is_header_agnostic_for_frontmatter_cards() {
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
         dir.join("2026_0702_claude_sess-fm-empty_001.md"),
-        "---\nproject: Vetcoders/aicx\nagent: claude\ndate: 2026-07-02\n---\n\n",
+        "---\nproject: vetcoders/aicx\nagent: claude\ndate: 2026-07-02\n---\n\n",
     )
     .unwrap();
     std::fs::write(
         dir.join("2026_0702_claude_sess-fm-full_001.md"),
-        "---\nproject: Vetcoders/aicx\nagent: claude\ndate: 2026-07-02\n---\n\nThis chunk carries enough real body content to avoid the empty-body threshold.",
+        "---\nproject: vetcoders/aicx\nagent: claude\ndate: 2026-07-02\n---\n\nThis chunk carries enough real body content to avoid the empty-body threshold.",
     )
     .unwrap();
 
@@ -1156,6 +1162,56 @@ fn fix_buckets_leaves_unproven_ownership_stage_in_place() {
         report.fixes_applied
     );
 
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn continuity_freshness_is_green_without_hot_sources() {
+    let tmp = unique_test_dir("continuity-quiet");
+    let result = check_continuity_freshness(&tmp);
+    assert_eq!(result.name, "continuity_freshness");
+    assert_eq!(result.severity, Severity::Green);
+    assert!(result.detail.contains("no live session sources"));
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn continuity_freshness_warns_when_hot_sources_have_pending_chunks() {
+    let tmp = unique_test_dir("continuity-lag");
+    let catalog_dir = crate::catalog::catalog_dir_for(&tmp);
+    std::fs::create_dir_all(&catalog_dir).unwrap();
+    let source = tmp.join("hot.jsonl");
+    std::fs::write(&source, "{\"type\":\"user\",\"text\":\"now\"}\n").unwrap();
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let entry = crate::catalog::CatalogEntry {
+        schema: crate::catalog::CATALOG_SCHEMA.to_string(),
+        session_id: "hot-session".into(),
+        agent: "claude".into(),
+        project: Some("vetcoders/vibecrafted".into()),
+        date: Some(chrono::Utc::now().format("%Y-%m-%d").to_string()),
+        cwd: None,
+        source_path: source.display().to_string(),
+        source_len: Some(32),
+        source_mtime_ns: Some(now_ns),
+        title: None,
+        machine: None,
+        logical_session_id: None,
+    };
+    std::fs::write(
+        crate::catalog::sessions_path_for(&tmp),
+        format!("{}\n", serde_json::to_string(&entry).unwrap()),
+    )
+    .unwrap();
+
+    let result = check_continuity_freshness(&tmp);
+    assert_eq!(result.name, "continuity_freshness");
+    // A catalog-only home has no CURRENT index, so pending lag is the
+    // honest product signal — doctor must not stay Green.
+    assert_eq!(result.severity, Severity::Warning);
+    assert!(result.detail.contains("live source"));
     let _ = std::fs::remove_dir_all(&tmp);
 }
 

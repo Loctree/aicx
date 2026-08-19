@@ -18,6 +18,8 @@ pub struct HybridIndex {
     manifest_dir: PathBuf,
     manifest: Option<Manifest>,
     embedder_fingerprint: EmbedderFingerprint,
+    writer_version: String,
+    build_id: String,
 }
 
 impl std::fmt::Debug for HybridIndex {
@@ -106,7 +108,21 @@ impl HybridIndex {
             manifest_dir: manifest_dir.into(),
             manifest: None,
             embedder_fingerprint,
+            writer_version: crate::WRITER_VERSION.to_string(),
+            build_id: crate::default_build_id(),
         }
+    }
+
+    /// Override the writer identity stamped into manifests this index
+    /// publishes. Binaries pass their exact build provenance
+    /// (`<version>+g<sha>[.dirty]`); the default is the crate version.
+    pub fn set_writer_identity(
+        &mut self,
+        writer_version: impl Into<String>,
+        build_id: impl Into<String>,
+    ) {
+        self.writer_version = writer_version.into();
+        self.build_id = build_id.into();
     }
 
     pub fn build_hybrid(
@@ -124,6 +140,8 @@ impl HybridIndex {
         self.manifest = Some(Manifest {
             schema_version: "2.0".to_string(),
             generation_id: Manifest::fresh_generation_id(),
+            writer_version: self.writer_version.clone(),
+            build_id: self.build_id.clone(),
             source_chunk_count: lexical_chunks.len(),
             source_hash_blake3: source_hash_blake3(source_hash),
             embedder_model: self.embedder_fingerprint.model.clone(),
@@ -157,6 +175,8 @@ impl HybridIndex {
         self.manifest = Some(Manifest {
             schema_version: prior.schema_version,
             generation_id: Manifest::fresh_generation_id(),
+            writer_version: self.writer_version.clone(),
+            build_id: self.build_id.clone(),
             source_chunk_count: prior.source_chunk_count,
             source_hash_blake3: prior.source_hash_blake3,
             embedder_model: self.embedder_fingerprint.model.clone(),
@@ -214,6 +234,8 @@ impl HybridIndex {
             manifest_dir,
             manifest: Some(manifest),
             embedder_fingerprint,
+            writer_version: crate::WRITER_VERSION.to_string(),
+            build_id: crate::default_build_id(),
         })
     }
 
@@ -483,6 +505,8 @@ fn validate_bindings(
     let observed = Manifest {
         schema_version: manifest.schema_version.clone(),
         generation_id: manifest.generation_id.clone(),
+        writer_version: manifest.writer_version.clone(),
+        build_id: manifest.build_id.clone(),
         source_chunk_count: manifest.source_chunk_count,
         source_hash_blake3: observed_source_hash
             .map(source_hash_blake3)

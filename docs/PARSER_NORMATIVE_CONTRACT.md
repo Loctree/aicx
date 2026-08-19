@@ -71,7 +71,7 @@ and provenance grade (`donor_spec` / `donor_adapter` / `aicx_history` /
 | Agent | Container | Physical unit | Logical units |
 |---|---|---|---|
 | Codex | single JSONL file | line (`session_meta`, `turn_context`, `event_msg`, `response_item`) | `response_item.payload.type`: `message`, `function_call`, `function_call_output`, `reasoning`, `encrypted_reasoning`; `event_msg` usage snapshot (`token_count`) |
-| Claude | single JSONL file | line (`user`, `assistant`, `system`, `summary`, `attachment`, `file-history-snapshot`, `pr-link`, `queue-operation`, `ai-title`, `mode`, `permission-mode`, `last-prompt`) | `message.content[]` blocks: `text`, `tool_use`, `tool_result`, `thinking`; `message.usage` (delta usage) |
+| Claude | single JSONL file | line (`user`, `assistant`, `system`, `summary`, `attachment`, `file-history-snapshot`, `file-history-delta`, `pr-link`, `queue-operation`, `ai-title`, `mode`, `permission-mode`, `last-prompt`) | `message.content[]` blocks: `text`, `tool_use`, `tool_result`, `thinking`; `message.usage` (delta usage) |
 | Gemini CLI | dual: whole-file JSON **or** JSONL stream | whole-file: the document (line numbers substituted); JSONL: line (`header`, `message`, `$set` heartbeat) | `messages[i]` (`user`, `gemini`, `error`, `info`); nested `thoughts[]`; nested `toolCalls[]` (inline result) |
 | Gemini Antigravity | brain-state directory | opaque `.pb` (never parsed as plaintext) | recovered `conversation_artifact`; `step_output_fallback` decision stream |
 | Grok | session directory | `chat_history.jsonl` line (`user`, `assistant`, `reasoning`, `tool_result`, `system`, `backend_tool_call`); `summary.json` whole-file; `hunk_records.jsonl` line | assistant fan-out: message text, inline `reasoning`, `tool_calls[]` (JSON-string args); reasoning record: `summary[]` text or `encrypted_content` (opaque) |
@@ -82,6 +82,48 @@ unit terminates in exactly one state — `consumed(kind)` XOR `skipped(reason)`.
 Unknown unit shapes are **data** (skipped with a typed reason and a warning),
 never silence. Every fixture unit must terminate in exactly one declared
 taxonomy kind; the checker enforces unique match.
+
+The cost of *not* declaring a known harness record is real, not cosmetic: it
+terminates as `skipped(unknown_payload_type)` with a warning and raises
+`unsupported_visible_event`, so a healthy modern session degrades its own
+parse status with its own bookkeeping. When a harness record is confirmed to
+carry no visible event (verified against live sources, not guessed), declaring
+it is a fix, not a convenience.
+
+### 2.1 Consumption kind is not a licence to drop the body
+
+A unit's taxonomy kind decides its **accounting**, never whether its content
+may be discarded. `metadata_record` means "not a conversational row", not
+"no operator text inside". Where a recognized metadata record is the *only*
+carrier of literal operator input, the adapter must project that text.
+
+The normative case is Claude `queue-operation`:
+
+- The record stays `consumed(metadata_record)` — taxonomy and the accounting
+  invariant are untouched, and the frozen oracle fixture does not move.
+- Additionally, `operation == "enqueue"` projects its text (`.content`, with
+  `.prompt` as the older build's field name) as a plain `TurnKind::UserMsg`
+  turn, timestamped from the record and referencing the record's own evidence.
+  No new schema, no new turn kind, no new consumed kind.
+- Empty bodies and `<task-notification` heads are harness chatter, not input.
+  `remove` / `dequeue` / `popAll` repeat text `enqueue` already carried.
+
+**Why this is normative and not a projection-layer nicety:** a message the
+operator submits while a turn is running exists in the JSONL *only* as this
+record. The harness writes a `type:"user"` row only for what it delivers
+between turns, so a mid-turn submission that is interrupted or superseded
+never becomes one. Dropping the body therefore loses literal operator input
+permanently and silently — the loss class is invisible to coverage, because
+the record was faithfully consumed.
+
+Two dedupe layers keep the projection from doubling a message, both observed
+on live sessions:
+
+1. the same text enqueued more than once (interrupt, then re-submit) — the
+   first enqueue is the message;
+2. a queued message the harness later delivers after the turn ends, where it
+   also becomes a real `user` row — the projection loses to the real row, on
+   equal trimmed text with a delivery timestamp at or after the enqueue.
 
 ---
 

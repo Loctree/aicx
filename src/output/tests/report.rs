@@ -575,17 +575,25 @@ fn render_message_markdown(msg: &str) -> String {
 }
 
 #[test]
-fn test_html_escape_neutralizes_script_payload() {
+fn test_message_bodies_are_recorded_verbatim_not_entity_encoded() {
+    // The extract is the canonical record of what was said; escaping is the
+    // renderer's job (AicxMarkdown escapes `& < >` per line before inlining,
+    // so escaping here produced `&amp;lt;` on screen). A payload is carried
+    // through unchanged — inert because nothing here synthesizes markup.
     let out = render_message_markdown("<script>alert(1)</script>");
-    // Script payload becomes inert text — no live `<script>` tag survives.
-    assert!(out.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
-    assert!(!out.contains("<script>"));
-    assert!(!out.contains("</script>"));
+    assert!(out.contains("<script>alert(1)</script>"));
+    assert!(!out.contains("&lt;"));
 
-    // Same protection holds for multi-line plain text.
     let multi = render_message_markdown("line a\n<img src=x onerror=alert(1)>\nline b");
-    assert!(multi.contains("&lt;img src=x onerror=alert(1)&gt;"));
-    assert!(!multi.contains("<img"));
+    assert!(multi.contains("<img src=x onerror=alert(1)>"));
+
+    // Prose punctuation is the reason this matters day to day: an apostrophe
+    // must never reach a reader as `&#39;`.
+    let prose = render_message_markdown("operator's note said \"ship it\" & meant it");
+    assert!(prose.contains("operator's note said \"ship it\" & meant it"));
+    assert!(!prose.contains("&#39;"));
+    assert!(!prose.contains("&quot;"));
+    assert!(!prose.contains("&amp;"));
 }
 
 #[test]

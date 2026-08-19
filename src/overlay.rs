@@ -2208,7 +2208,7 @@ mod tests {
     fn semantic_fixture() -> SemanticFixture {
         let fixture: SemanticFixture = serde_json::from_str(include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/overlay-intent-v1/dedup_semantic_2026-07-12.json"
+            "/tests/fixtures/overlay-semantic-v1/dedup_semantic_2026-07-12.json"
         )))
         .unwrap();
         assert_eq!(fixture.schema, "aicx.overlay.semantic-fixture.v1");

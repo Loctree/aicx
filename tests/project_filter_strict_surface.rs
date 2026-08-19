@@ -127,7 +127,7 @@ fn strict_filter_corpus() -> PathBuf {
     let root = unique_store_root("corpus");
     write_intent_chunk(&root, "LibraxisAI/vista", "TARGET", 1);
     write_intent_chunk(&root, "LibraxisAI/VistaScribe-dev", "SCRIBE", 2);
-    write_intent_chunk(&root, "VetCoders/vista-portal", "PORTAL", 3);
+    write_intent_chunk(&root, "vetcoders/vista-portal", "PORTAL", 3);
     write_intent_chunk(&root, "Another/vista", "CROSS_ORG", 4);
     root
 }
@@ -635,7 +635,7 @@ fn resolver_world_model_is_exact_fail_closed_and_explicitly_fuzzy() {
         ProjectMatchMode::Exact,
     )
     .expect("unique bare repo");
-    assert_eq!(unique.selected, ["VetCoders/vista-portal"]);
+    assert_eq!(unique.selected, ["vetcoders/vista-portal"]);
 
     let fuzzy =
         require_project_resolution(&["vista".to_string()], &corpus, ProjectMatchMode::Fuzzy)
@@ -646,7 +646,7 @@ fn resolver_world_model_is_exact_fail_closed_and_explicitly_fuzzy() {
             "Another/vista",
             "LibraxisAI/VistaScribe-dev",
             "LibraxisAI/vista",
-            "VetCoders/vista-portal",
+            "vetcoders/vista-portal",
         ]
     );
 

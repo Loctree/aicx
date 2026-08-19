@@ -4,9 +4,13 @@ set -euo pipefail
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$ROOT_DIR"
 
+# tomllib needs python >= 3.11; bare `python3` can resolve to the macOS
+# stock 3.9. Mirror the Makefile's $(PYTHON) fallback chain.
+PYTHON_BIN=$(command -v python3.14 || command -v python3.13 || command -v python3.12 || command -v python3.11 || command -v python3)
+
 read_version() {
   local path="$1"
-  python3 - "$path" <<'PY'
+  "$PYTHON_BIN" - "$path" <<'PY'
 import json
 import sys
 import tomllib
@@ -43,7 +47,7 @@ check_version "npm-linux" "$(read_version distribution/npm/aicx/platform-package
 check_version "npm-win" "$(read_version distribution/npm/aicx/platform-packages/win32-x64-gnu/package.json)"
 
 optional_versions=$(
-  python3 - <<'PY'
+  "$PYTHON_BIN" - <<'PY'
 import json
 from pathlib import Path
 

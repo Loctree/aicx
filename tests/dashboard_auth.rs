@@ -114,6 +114,8 @@ async fn test_invalid_bearer_burst_rate_limited_after_threshold() {
         .await
         .expect("oneshot");
     assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(response.headers().get("retry-after").unwrap(), "1");
+    assert_eq!(response.headers().get("x-ratelimit-after").unwrap(), "1");
 }
 
 #[tokio::test]

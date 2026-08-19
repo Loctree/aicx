@@ -749,3 +749,390 @@ fn claude_adapter_rejects_multi_artifact_and_non_jsonl_framing() {
     let read = reader.read(&whole).unwrap();
     assert!(adapter.classify(&whole, &read).is_err());
 }
+
+fn assistant_row_with_thinking_block(session: &str, block: &str) -> String {
+    format!(
+        concat!(
+            r#"{{"type":"assistant","sessionId":"{session}","#,
+            r#""timestamp":"2026-07-31T08:00:00.000Z","#,
+            r#""message":{{"role":"assistant","model":"claude-opus-5","#,
+            r#""content":[{block},{{"type":"text","text":"Gotowe."}}]}}}}"#,
+            "\n"
+        ),
+        session = session,
+        block = block,
+    )
+}
+
+#[test]
+fn claude_signature_only_thinking_block_is_consumed_silently() {
+    // Since 2026-07 the harness writes thinking blocks signature-only: the
+    // reasoning text never reaches the JSONL. Treating that as an unknown
+    // payload made every reasoning session flag itself as carrying
+    // unsupported visible events.
+    let session = "66666666-6666-4666-8666-666666666666";
+    let body = assistant_row_with_thinking_block(
+        session,
+        r#"{"type":"thinking","thinking":"","signature":"ErUBCkYIBxgCKkDd"}"#,
+    );
+    let model = session_model(session, &body);
+
+    assert!(
+        model.coverage.warnings.is_empty(),
+        "a known block with no body is not an unknown payload, got {:?}",
+        model.coverage.warnings
+    );
+    let status = status(&model);
+    assert!(!status.boundary_flags.unsupported_visible_event);
+    assert!(!status.visible_event_lost);
+    assert_eq!(
+        status.visible_completeness,
+        VisibleCompleteness::CompleteVisible
+    );
+
+    // Still consumed as a thinking_block — accounting is untouched, only the
+    // turn projection is skipped.
+    assert!(
+        model
+            .coverage
+            .consumed
+            .iter()
+            .any(|unit| unit.kind == "thinking_block"),
+        "the block is consumed, never skipped"
+    );
+    assert_eq!(model.coverage.skipped_count, 0);
+    assert_eq!(
+        model
+            .turns
+            .iter()
+            .filter(|turn| turn.kind == TurnKind::InternalThought)
+            .count(),
+        0,
+        "an empty body yields no internal_thought turn"
+    );
+    assert_eq!(
+        model
+            .turns
+            .iter()
+            .filter(|turn| turn.kind == TurnKind::AgentReply)
+            .count(),
+        1,
+        "the sibling text block is unaffected"
+    );
+}
+
+#[test]
+fn claude_thinking_block_with_a_body_still_becomes_an_internal_thought() {
+    let session = "66666666-6666-4666-8666-666666666667";
+    let body = assistant_row_with_thinking_block(
+        session,
+        r#"{"type":"thinking","thinking":"  Plan the cut.  ","signature":"sig-abc"}"#,
+    );
+    let model = session_model(session, &body);
+
+    let thoughts: Vec<&str> = model
+        .turns
+        .iter()
+        .filter(|turn| turn.kind == TurnKind::InternalThought)
+        .map(|turn| turn.text.as_str())
+        .collect();
+    assert_eq!(thoughts, vec!["Plan the cut."], "unchanged behavior");
+    assert_eq!(model.turns[0].role, TurnRole::Assistant);
+    assert!(model.coverage.warnings.is_empty());
+    assert!(!status(&model).boundary_flags.unsupported_visible_event);
+}
+
+#[test]
+fn claude_thinking_block_without_the_field_stays_an_unsupported_shape() {
+    // The silent path is for a KNOWN block with no body. A block missing the
+    // field entirely is still an unrecognized shape and must stay visible.
+    let session = "66666666-6666-4666-8666-666666666668";
+    let body =
+        assistant_row_with_thinking_block(session, r#"{"type":"thinking","signature":"sig-abc"}"#);
+    let model = session_model(session, &body);
+
+    assert!(status(&model).boundary_flags.unsupported_visible_event);
+    assert!(
+        model
+            .coverage
+            .warnings
+            .iter()
+            .any(|warning| warning.kind == WarningKind::UnknownPayloadType),
+        "a missing field is not the same as an empty one"
+    );
+}
+
+#[test]
+fn claude_file_history_delta_is_metadata_not_an_unsupported_event() {
+    // Rewind/backup bookkeeping the harness writes per message: a backup
+    // descriptor, the message ids it belongs to, and a tracking path. No
+    // conversation content, so it carries no visible event.
+    let session = "55555555-5555-4555-8555-555555555555";
+    let body = concat!(
+        r#"{"type":"user","message":{"role":"user","content":"popraw ten plik"},"#,
+        r#""sessionId":"55555555-5555-4555-8555-555555555555","#,
+        r#""timestamp":"2026-07-27T23:08:40.000Z"}"#,
+        "\n",
+        r#"{"type":"file-history-delta","messageId":"605ff099","#,
+        r#""snapshotMessageId":"9f44590f","trackingPath":"/repo/notes.md","#,
+        r#""backup":{"backupFileName":"68ccd2c3@v1","version":1,"#,
+        r#""backupTime":"2026-07-27T23:08:49.286Z","realParentDir":"/repo"},"#,
+        r#""timestamp":"2026-07-27T23:08:49.286Z"}"#,
+        "\n",
+    );
+    let model = session_model(session, body);
+
+    let delta = &model.coverage.consumed[1];
+    assert_eq!(
+        delta.kind, "metadata_record",
+        "file-history-delta is the per-message successor of file-history-snapshot"
+    );
+    assert_eq!(model.coverage.skipped_count, 0);
+
+    // The point of the fix: a healthy modern session must not degrade its own
+    // parse status with the harness's own bookkeeping.
+    assert!(
+        model.coverage.warnings.is_empty(),
+        "recognized bookkeeping emits no warning, got {:?}",
+        model.coverage.warnings
+    );
+    let status = status(&model);
+    assert!(
+        !status.boundary_flags.unsupported_visible_event,
+        "bookkeeping carries no visible event to preserve as unsupported"
+    );
+    assert_eq!(
+        status.visible_completeness,
+        VisibleCompleteness::CompleteVisible
+    );
+
+    // It is metadata, never chat: the only turn is the operator's message.
+    assert_eq!(user_turn_texts(&model), vec!["popraw ten plik"]);
+}
+
+// ---------------------------------------------------------------------------
+// Mid-turn queue projection (`queue-operation` enqueue -> user turn)
+// ---------------------------------------------------------------------------
+
+const QUEUE_SESSION: &str = "44444444-4444-4444-8444-444444444444";
+
+fn queue_row(operation: &str, field: &str, text: &str, timestamp: &str) -> String {
+    format!(
+        "{}\n",
+        serde_json::json!({
+            "type": "queue-operation",
+            "operation": operation,
+            field: text,
+            "sessionId": QUEUE_SESSION,
+            "timestamp": timestamp,
+        })
+    )
+}
+
+fn user_row(text: &str, timestamp: &str) -> String {
+    format!(
+        "{}\n",
+        serde_json::json!({
+            "type": "user",
+            "message": {"role": "user", "content": text},
+            "sessionId": QUEUE_SESSION,
+            "timestamp": timestamp,
+        })
+    )
+}
+
+fn user_turn_texts(model: &SessionModel) -> Vec<&str> {
+    model
+        .turns
+        .iter()
+        .filter(|turn| turn.kind == TurnKind::UserMsg)
+        .map(|turn| turn.text.as_str())
+        .collect()
+}
+
+#[test]
+fn claude_queue_enqueue_content_becomes_a_user_turn() {
+    let body = queue_row(
+        "enqueue",
+        "content",
+        "czy mozesz to sprawdzic w runtime?",
+        "2026-07-30T10:24:23.406Z",
+    );
+    let model = session_model(QUEUE_SESSION, &body);
+
+    assert_eq!(
+        user_turn_texts(&model),
+        vec!["czy mozesz to sprawdzic w runtime?"],
+        "a message submitted mid-turn exists only as the enqueue record"
+    );
+    let turn = &model.turns[0];
+    assert_eq!(turn.role, TurnRole::User);
+    assert_eq!(
+        turn.timestamp,
+        Known::value("2026-07-30T10:24:23.406Z".to_owned()),
+        "the projection keeps the record's own timestamp"
+    );
+
+    // The record stays consumed as metadata (frozen taxonomy is untouched) and
+    // the turn references exactly that evidence.
+    let consumed_kinds: Vec<&str> = model
+        .coverage
+        .consumed
+        .iter()
+        .map(|unit| unit.kind.as_str())
+        .collect();
+    assert_eq!(consumed_kinds, vec!["metadata_record"]);
+    assert_eq!(turn.raw_unit_refs.len(), 1);
+    assert_eq!(turn.raw_unit_refs[0].unit_kind, "metadata_record");
+    assert_eq!(
+        turn.raw_unit_refs[0].evidence_event_id,
+        model.coverage.consumed[0].evidence.evidence_event_id
+    );
+}
+
+#[test]
+fn claude_queue_enqueue_falls_back_to_the_prompt_field() {
+    let body = queue_row(
+        "enqueue",
+        "prompt",
+        "starszy build trzyma tekst w .prompt",
+        "2026-07-30T10:24:23.406Z",
+    );
+    let model = session_model(QUEUE_SESSION, &body);
+
+    assert_eq!(
+        user_turn_texts(&model),
+        vec!["starszy build trzyma tekst w .prompt"]
+    );
+}
+
+#[test]
+fn claude_queue_enqueue_of_a_task_notification_is_not_operator_input() {
+    let body = queue_row(
+        "enqueue",
+        "content",
+        "<task-notification>\n<task-id>a715678b</task-id>\n</task-notification>",
+        "2026-07-30T10:24:23.406Z",
+    );
+    let model = session_model(QUEUE_SESSION, &body);
+
+    assert!(
+        model.turns.is_empty(),
+        "harness notifications are machine chatter, not a chat turn"
+    );
+    assert_eq!(
+        model.coverage.consumed_count, 1,
+        "still consumed as metadata"
+    );
+}
+
+#[test]
+fn claude_queue_bookkeeping_operations_emit_no_turn() {
+    for operation in ["remove", "dequeue", "popAll"] {
+        let body = queue_row(
+            operation,
+            "content",
+            "tekst juz raz zakolejkowany",
+            "2026-07-30T10:24:23.406Z",
+        );
+        let model = session_model(QUEUE_SESSION, &body);
+
+        assert!(
+            model.turns.is_empty(),
+            "{operation} repeats text that enqueue already carried"
+        );
+        assert_eq!(model.coverage.consumed_count, 1);
+    }
+}
+
+#[test]
+fn claude_re_enqueued_text_keeps_only_the_first_submission() {
+    let body = format!(
+        "{}{}{}",
+        queue_row(
+            "enqueue",
+            "content",
+            "ma to sens?",
+            "2026-07-30T06:51:06.736Z"
+        ),
+        queue_row(
+            "remove",
+            "content",
+            "ma to sens?",
+            "2026-07-30T06:51:40.877Z"
+        ),
+        queue_row(
+            "enqueue",
+            "content",
+            "ma to sens?",
+            "2026-07-30T06:52:11.010Z"
+        ),
+    );
+    let model = session_model(QUEUE_SESSION, &body);
+
+    assert_eq!(
+        user_turn_texts(&model),
+        vec!["ma to sens?"],
+        "an interrupt-and-resubmit is one message, dated at the first enqueue"
+    );
+    assert_eq!(
+        model.turns[0].timestamp,
+        Known::value("2026-07-30T06:51:06.736Z".to_owned())
+    );
+}
+
+#[test]
+fn claude_queued_text_delivered_after_the_turn_is_not_doubled() {
+    let body = format!(
+        "{}{}",
+        queue_row(
+            "enqueue",
+            "content",
+            "Dopiszmy jeszcze cos",
+            "2026-07-30T06:55:06.868Z"
+        ),
+        user_row("Dopiszmy jeszcze cos", "2026-07-30T06:55:14.449Z"),
+    );
+    let model = session_model(QUEUE_SESSION, &body);
+
+    assert_eq!(
+        user_turn_texts(&model),
+        vec!["Dopiszmy jeszcze cos"],
+        "the real user row wins over the projection that anticipated it"
+    );
+    assert_eq!(
+        model.turns[0].timestamp,
+        Known::value("2026-07-30T06:55:14.449Z".to_owned()),
+        "the surviving turn is the delivered one"
+    );
+    assert_eq!(
+        model.turns[0].raw_unit_refs[0].unit_kind, "user",
+        "the survivor is the real row, not the queue record"
+    );
+    // Dropping a projected turn must leave the model internally consistent.
+    assert_eq!(model.turns[0].turn_idx, 0);
+    assert_eq!(model.segments.len(), 1);
+    assert_eq!(model.segments[0].turn_range.start, 0);
+    assert_eq!(model.segments[0].turn_range.end, 0);
+}
+
+#[test]
+fn claude_queued_text_delivered_before_the_enqueue_is_a_separate_message() {
+    let body = format!(
+        "{}{}",
+        user_row("sprawdz to jeszcze raz", "2026-07-30T06:55:06.868Z"),
+        queue_row(
+            "enqueue",
+            "content",
+            "sprawdz to jeszcze raz",
+            "2026-07-30T06:57:14.449Z"
+        ),
+    );
+    let model = session_model(QUEUE_SESSION, &body);
+
+    assert_eq!(
+        user_turn_texts(&model).len(),
+        2,
+        "an earlier identical row cannot be the delivery of a later enqueue"
+    );
+}

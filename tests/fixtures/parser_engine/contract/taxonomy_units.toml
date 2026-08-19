@@ -92,6 +92,14 @@ level = "physical"
 expected_kind = "metadata_record"
 sample = '{"type":"pr-link","url":"example: pull request 7"}'
 
+# Per-message successor of file-history-snapshot: rewind/backup bookkeeping
+# only, no conversation content.
+[[unit]]
+agent = "claude"
+level = "physical"
+expected_kind = "metadata_record"
+sample = '{"type":"file-history-delta","messageId":"m1","snapshotMessageId":"m0","trackingPath":"/repo/notes.md","backup":{"backupFileName":"68ccd2c3@v1","version":1,"backupTime":"2026-07-27T23:08:49.286Z","realParentDir":"/repo"},"timestamp":"2026-07-27T23:08:49.286Z"}'
+
 [[unit]]
 agent = "claude"
 level = "logical"

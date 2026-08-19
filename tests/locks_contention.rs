@@ -113,7 +113,7 @@ fn concurrent_state_updates_do_not_lose_watermarks_or_hashes() {
         .expect("AICX_HOME test lock");
     let _home = ScopedAicxHome::new("rmw");
     let source = "claude:test";
-    let project = "Vetcoders/Vista";
+    let project = "vetcoders/Vista";
 
     let first = thread::spawn(move || {
         locked_state_update(

@@ -374,7 +374,7 @@ fn merge_project_scopes_rejects_substring_rollup() {
 #[test]
 fn merge_project_scopes_keeps_canonical_match_case_insensitive() {
     let merged = merge_project_scopes(
-        Some("Vetcoders/Vista"),
+        Some("vetcoders/Vista"),
         None,
         vec![
             "vetcoders/vista".to_string(),

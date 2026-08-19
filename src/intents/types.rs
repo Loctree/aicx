@@ -259,6 +259,13 @@ pub(super) struct StoredChunkFile {
     pub(super) session_id: String,
     pub(super) honesty: ClaimHonesty,
     pub(super) transcript_entries: Option<Vec<TranscriptEntry>>,
+    /// Chunk document already held in memory, read from the committed lexical
+    /// index instead of the original transcript.
+    ///
+    /// The index stores the canonical extract verbatim (`ChunkRef.text`), so
+    /// this is the same document `parse_chunk_document` would reconstruct
+    /// from disk — minus the re-parse of megabytes of raw JSONL.
+    pub(super) body: Option<String>,
 }
 
 #[derive(Debug, Clone)]

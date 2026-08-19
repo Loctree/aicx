@@ -28,6 +28,8 @@ use crate::session_catalog::{AgentKind, CatalogIoStats, CatalogSource, SessionCa
 pub const CATALOG_DIRNAME: &str = "catalog";
 pub const SESSIONS_FILENAME: &str = "sessions.jsonl";
 pub const CATALOG_SCHEMA: &str = "aicx.catalog.session.v1";
+const REMOTE_MEMO_FILENAME: &str = "remotes.json";
+const REMOTE_MEMO_SCHEMA: &str = "aicx.catalog.remotes.v1";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CatalogEntry {
@@ -79,6 +81,10 @@ pub struct RebuildReport {
     pub catalog_path: String,
     pub wall_ms: u64,
     pub cards_written: usize,
+    /// Sessions the search index has not yet absorbed. Rebuild never
+    /// drains chunks unless the caller asked `--with-chunks`.
+    #[serde(default)]
+    pub pending_chunks: usize,
 }
 
 /// Granular catalog vs live-source readiness for operator tooling.
@@ -287,7 +293,7 @@ pub fn rebuild_with_progress(
     let mut progress = RebuildProgress::preparing();
     on_progress(&progress);
 
-    let by_id = scan_live_entries_with_progress(user_home, started, &mut on_progress);
+    let by_id = scan_live_entries_with_progress(home, user_home, started, &mut on_progress);
 
     progress.stage = RebuildStage::Serializing;
     progress.sessions = by_id.len();
@@ -323,6 +329,7 @@ pub fn rebuild_with_progress(
         catalog_path: catalog_path.display().to_string(),
         wall_ms: started.elapsed().as_millis() as u64,
         cards_written: 0,
+        pending_chunks: 0,
     };
     progress.stage = RebuildStage::Complete;
     progress.sessions = report.total_sessions;
@@ -358,7 +365,7 @@ pub fn status(home: &Path, user_home: &Path) -> Result<CatalogStatusReport> {
         None
     };
     let catalog_entries = read_entries_at(home)?;
-    let live = scan_live_entries(user_home);
+    let live = scan_live_entries(home, user_home);
 
     let mut counts = StalenessCounts::default();
     let mut by_agent: BTreeMap<String, StalenessCounts> = BTreeMap::new();
@@ -585,6 +592,29 @@ fn live_delta_uncached(home: &Path, user_home: &Path, cutoff_unix_ns: u128) -> R
         .map(|entry| ((entry.agent.clone(), entry.session_id.clone()), entry))
         .collect();
 
+    // Sources the census already holds at this exact fingerprint. Probing
+    // them again would open a bounded header per file — thousands of reads
+    // per call on a real root — only to re-derive the identity already on
+    // disk. The cost of that trust: path-derived fields (cwd, project guess)
+    // of an untouched source are not re-derived when the derivation itself
+    // improves; `aicx catalog rebuild` is the pass that does.
+    let known_fingerprints: BTreeMap<&str, (u64, u128)> = catalog_by_key
+        .values()
+        .filter_map(|entry| {
+            Some((
+                entry.source_path.as_str(),
+                (entry.source_len?, entry.source_mtime_ns? as u128),
+            ))
+        })
+        .collect();
+    let is_known = |path: &Path, fingerprint: &crate::session_catalog::SourceFingerprint| {
+        known_fingerprints
+            .get(path.to_string_lossy().as_ref())
+            .is_some_and(|(len, modified)| {
+                *len == fingerprint.len && *modified == fingerprint.modified_unix_nanos
+            })
+    };
+
     let mut live_sessions = 0usize;
     let mut newest_live_mtime_ns: Option<u64> = None;
     let mut fresh: BTreeMap<(String, String), CatalogEntry> = BTreeMap::new();
@@ -603,7 +633,7 @@ fn live_delta_uncached(home: &Path, user_home: &Path, cutoff_unix_ns: u128) -> R
         let Ok(catalog) = SessionCatalog::new(agent, &root) else {
             continue;
         };
-        let Ok(scan) = catalog.scan_hot_window(cutoff_unix_ns) else {
+        let Ok(scan) = catalog.scan_hot_window_skipping(cutoff_unix_ns, &is_known) else {
             continue;
         };
         live_sessions += scan.total_candidates;
@@ -622,6 +652,19 @@ fn live_delta_uncached(home: &Path, user_home: &Path, cutoff_unix_ns: u128) -> R
     // Runtime-run transcripts are a bounded tree — the vibecrafted lane of
     // the live window stays in.
     enrich_runtime_runs(&mut fresh, user_home);
+
+    // Reattribution — not the path guess — is what finally decides a
+    // session's identity, so the delta has to compare post-reattribution
+    // values on both sides. Comparing a fresh path guess (`vibecrafted-suite/
+    // vc-slack-agent`, read off the directory layout) against a cataloged
+    // origin slug (`vetcoders/vc-slack`) marked ~270 untouched sessions as
+    // changed on every single call: the whole catalog was rewritten, the
+    // rewrite reattributed the rows straight back, and the next call found
+    // the same difference again. A fixed point was unreachable by
+    // construction.
+    let mut memo = RemoteMemo::load(home);
+    reattribute_catalog_entries(&mut fresh, &mut memo);
+    memo.persist();
 
     let unadmitted = fresh
         .iter()
@@ -690,7 +733,9 @@ pub fn refresh_hot(
         .into_iter()
         .map(|entry| ((entry.agent.clone(), entry.session_id.clone()), entry))
         .collect();
-    let reattributed_sessions = reattribute_catalog_entries(&mut preview_catalog);
+    let mut memo = RemoteMemo::load(home);
+    let reattributed_sessions = reattribute_catalog_entries(&mut preview_catalog, &mut memo);
+    memo.persist();
     if changed_sessions == 0 && reattributed_sessions == 0 {
         return Ok(HotRefreshReport {
             schema: CATALOG_REFRESH_SCHEMA.to_string(),
@@ -715,7 +760,8 @@ pub fn refresh_hot(
     for entry in delta.changed {
         catalog.insert((entry.agent.clone(), entry.session_id.clone()), entry);
     }
-    let reattributed_sessions = reattribute_catalog_entries(&mut catalog);
+    let reattributed_sessions = reattribute_catalog_entries(&mut catalog, &mut memo);
+    memo.persist();
     let mut body = String::new();
     for entry in catalog.values() {
         body.push_str(&serde_json::to_string(entry)?);
@@ -741,11 +787,12 @@ pub fn refresh_hot(
     })
 }
 
-fn scan_live_entries(user_home: &Path) -> BTreeMap<(String, String), CatalogEntry> {
-    scan_live_entries_with_progress(user_home, Instant::now(), &mut |_| {})
+fn scan_live_entries(home: &Path, user_home: &Path) -> BTreeMap<(String, String), CatalogEntry> {
+    scan_live_entries_with_progress(home, user_home, Instant::now(), &mut |_| {})
 }
 
 fn scan_live_entries_with_progress(
+    home: &Path,
     user_home: &Path,
     started: Instant,
     on_progress: &mut impl FnMut(&RebuildProgress),
@@ -812,7 +859,9 @@ fn scan_live_entries_with_progress(
     progress.elapsed_ms = started.elapsed().as_millis() as u64;
     on_progress(&progress);
     enrich_runtime_runs(&mut by_id, user_home);
-    reattribute_catalog_entries(&mut by_id);
+    let mut memo = RemoteMemo::load(home);
+    reattribute_catalog_entries(&mut by_id, &mut memo);
+    memo.persist();
 
     by_id
 }
@@ -1034,7 +1083,8 @@ fn entry_from_source(agent: AgentKind, source: &CatalogSource) -> CatalogEntry {
     let project = cwd
         .as_deref()
         .and_then(project_from_cwd)
-        .or_else(|| infer_project_from_path(agent, &source.path));
+        .or_else(|| infer_project_from_path(agent, &source.path))
+        .map(|slug| canonicalize_project_slug(&slug));
     let date = source
         .fingerprint
         .modified_unix_nanos
@@ -1124,10 +1174,10 @@ fn merge_session_info(
         if let Some(remote_project) = project_from_git_remote(repo_path) {
             entry.project = Some(remote_project);
         } else if entry.project.is_none() {
-            entry.project = info.project.clone();
+            entry.project = info.project.as_deref().map(canonicalize_project_slug);
         }
     } else if entry.project.is_none() {
-        entry.project = info.project.clone();
+        entry.project = info.project.as_deref().map(canonicalize_project_slug);
     }
     if entry.title.is_none() {
         entry.title = info.title.clone();
@@ -1186,7 +1236,7 @@ fn enrich_runtime_runs(by_id: &mut BTreeMap<(String, String), CatalogEntry>, use
             schema: CATALOG_SCHEMA.to_string(),
             session_id: run_id,
             agent: "vibecrafted".to_string(),
-            project: Some("VetCoders/vibecrafted".to_string()),
+            project: Some("vetcoders/vibecrafted".to_string()),
             date,
             cwd: None,
             source_path: transcript.display().to_string(),
@@ -1206,11 +1256,19 @@ fn enrich_runtime_runs(by_id: &mut BTreeMap<(String, String), CatalogEntry>, use
 fn infer_cwd_from_path(agent: AgentKind, path: &Path) -> Option<String> {
     match agent {
         AgentKind::Claude => {
-            // ~/.claude/projects/<encoded-cwd>/<session>.jsonl
-            path.parent()
-                .and_then(|p| p.file_name())
-                .and_then(|n| n.to_str())
-                .map(|encoded| encoded.replace('-', "/"))
+            // Ground truth first: Claude session events carry `cwd` verbatim.
+            // The directory slug is lossy — every `-` inside a real path
+            // component ("vc-workspace", "vibecrafted-suite") decodes into a
+            // bogus `/`, which fabricates identities like `suite/vibecrafted`
+            // and a cwd no reattribution can ever `git -C` into.
+            sniff_claude_cwd(path).or_else(|| {
+                // ~/.claude/projects/<encoded-cwd>/<session>.jsonl — lossy
+                // last resort for unreadable/headless files.
+                path.parent()
+                    .and_then(|p| p.file_name())
+                    .and_then(|n| n.to_str())
+                    .map(|encoded| encoded.replace('-', "/"))
+            })
         }
         AgentKind::Grok => {
             // ~/.grok/sessions/<cwd-encoded>/<session>/...
@@ -1228,6 +1286,36 @@ fn infer_cwd_from_path(agent: AgentKind, path: &Path) -> Option<String> {
         }
         _ => None,
     }
+}
+
+/// Read the working directory out of a Claude session head.
+///
+/// Leaf/summary records at the top of a JSONL carry no `cwd`; the first
+/// real event does. The scan is bounded (lines and bytes) so a session
+/// whose head is one enormous pasted line cannot stall catalog admission.
+fn sniff_claude_cwd(path: &Path) -> Option<String> {
+    use std::io::{BufRead, Read};
+    const MAX_LINES: usize = 64;
+    const MAX_BYTES: u64 = 256 * 1024;
+
+    let file = std::fs::File::open(path).ok()?;
+    let mut reader = std::io::BufReader::new(file.take(MAX_BYTES));
+    let mut line = String::new();
+    for _ in 0..MAX_LINES {
+        line.clear();
+        if reader.read_line(&mut line).ok()? == 0 {
+            return None;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if let Some(cwd) = value.get("cwd").and_then(|v| v.as_str())
+            && !cwd.is_empty()
+        {
+            return Some(cwd.to_string());
+        }
+    }
+    None
 }
 
 fn decode_grok_cwd(encoded: &str) -> String {
@@ -1296,31 +1384,170 @@ fn project_from_cwd(cwd: &str) -> Option<String> {
             && owner.len() >= 2
             && repo.len() >= 2
         {
-            return Some(format!("{owner}/{repo}"));
+            return Some(canonicalize_project_slug(&format!("{owner}/{repo}")));
         }
     }
-    Some(seg.to_string())
+    Some(canonicalize_project_slug(seg))
 }
 
-fn reattribute_catalog_entries(entries: &mut BTreeMap<(String, String), CatalogEntry>) -> usize {
-    let mut cache: BTreeMap<String, Option<String>> = BTreeMap::new();
+fn reattribute_catalog_entries(
+    entries: &mut BTreeMap<(String, String), CatalogEntry>,
+    memo: &mut RemoteMemo,
+) -> usize {
     let mut changed = 0usize;
     for entry in entries.values_mut() {
         let Some(cwd) = entry.cwd.as_deref().filter(|cwd| !cwd.is_empty()) else {
             continue;
         };
-        let remote_project = cache
-            .entry(cwd.to_string())
-            .or_insert_with(|| project_from_git_remote(cwd))
-            .clone();
-        if let Some(project) = remote_project
-            && entry.project.as_deref() != Some(project.as_str())
-        {
-            entry.project = Some(project);
-            changed += 1;
+        if let Some(project) = memo.project_for(cwd) {
+            let project = canonicalize_project_slug(&project);
+            if entry.project.as_deref() != Some(project.as_str()) {
+                entry.project = Some(project);
+                changed += 1;
+            }
         }
     }
     changed
+}
+
+/// Memoized `origin` resolution, keyed by checkout path.
+///
+/// Reattribution runs over every catalog row on every hot refresh, and the
+/// owner host carries ~500 distinct checkouts. One `git remote get-url`
+/// subprocess per checkout costs ~10 s, paid again by each `continuity`,
+/// `dashboard`, and wizard call. The memo lives next to the catalog and is
+/// invalidated by the mtime of the checkout's git metadata, so a re-pointed
+/// `origin` still lands on the next refresh without a spawn per row.
+struct RemoteMemo {
+    path: PathBuf,
+    entries: BTreeMap<String, RemoteMemoEntry>,
+    dirty: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct RemoteMemoEntry {
+    /// Git metadata entry discovered for this checkout (`.git` directory, or
+    /// the link file of a worktree/submodule).
+    git_path: String,
+    git_mtime_ns: u64,
+    /// mtime of `<git>/config` when the checkout owns a real git directory —
+    /// that file is where `origin` actually lives.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    config_mtime_ns: Option<u64>,
+    /// Resolved `owner/repo`. Absent means git was asked and had no origin;
+    /// that answer is cached too, so unremoted checkouts stop costing spawns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    project: Option<String>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct RemoteMemoFile {
+    #[serde(default)]
+    schema: String,
+    #[serde(default)]
+    entries: BTreeMap<String, RemoteMemoEntry>,
+}
+
+impl RemoteMemo {
+    fn load(home: &Path) -> Self {
+        let path = catalog_dir_for(home).join(REMOTE_MEMO_FILENAME);
+        let entries = fs::read_to_string(&path)
+            .ok()
+            .and_then(|body| serde_json::from_str::<RemoteMemoFile>(&body).ok())
+            .filter(|file| file.schema == REMOTE_MEMO_SCHEMA)
+            .map(|file| file.entries)
+            .unwrap_or_default();
+        Self {
+            path,
+            entries,
+            dirty: false,
+        }
+    }
+
+    fn project_for(&mut self, cwd: &str) -> Option<String> {
+        let path = Path::new(cwd);
+        // A relative cwd (`.` shows up in older rows) resolves against
+        // whichever directory the process happens to run in, so any answer
+        // would be an accident of invocation — and memoizing it would make
+        // that accident stick.
+        if !path.is_absolute() {
+            return None;
+        }
+        let stamp = git_metadata_stamp(path)?;
+        if let Some(hit) = self.entries.get(cwd)
+            && hit.git_path == stamp.git_path
+            && hit.git_mtime_ns == stamp.git_mtime_ns
+            && hit.config_mtime_ns == stamp.config_mtime_ns
+        {
+            return hit.project.clone();
+        }
+        let project = project_from_git_remote(cwd);
+        self.entries.insert(
+            cwd.to_string(),
+            RemoteMemoEntry {
+                project: project.clone(),
+                ..stamp
+            },
+        );
+        self.dirty = true;
+        project
+    }
+
+    /// Best-effort persist. A missing or unwritable memo only costs speed, so
+    /// a failure here must never fail the catalog operation that owns it.
+    fn persist(&mut self) {
+        if !self.dirty {
+            return;
+        }
+        self.dirty = false;
+        let file = RemoteMemoFile {
+            schema: REMOTE_MEMO_SCHEMA.to_string(),
+            entries: self.entries.clone(),
+        };
+        let Ok(body) = serde_json::to_vec(&file) else {
+            return;
+        };
+        if let Some(parent) = self.path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let _ = legacy_archive::atomic_write::atomic_write(&self.path, &body);
+    }
+}
+
+/// Fingerprint the git metadata that decides a checkout's `origin`.
+///
+/// Walks up like git itself does, so a session whose cwd sits inside a
+/// subdirectory of a repository resolves the same way `git -C` would.
+fn git_metadata_stamp(cwd: &Path) -> Option<RemoteMemoEntry> {
+    let mut current = Some(cwd);
+    while let Some(dir) = current {
+        let git = dir.join(".git");
+        if let Ok(meta) = fs::symlink_metadata(&git) {
+            let config_mtime_ns = if meta.is_dir() {
+                fs::metadata(git.join("config"))
+                    .ok()
+                    .and_then(|meta| mtime_unix_ns(&meta))
+            } else {
+                None
+            };
+            return Some(RemoteMemoEntry {
+                git_path: git.display().to_string(),
+                git_mtime_ns: mtime_unix_ns(&meta).unwrap_or(0),
+                config_mtime_ns,
+                project: None,
+            });
+        }
+        current = dir.parent();
+    }
+    None
+}
+
+fn mtime_unix_ns(meta: &fs::Metadata) -> Option<u64> {
+    meta.modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|since| since.as_nanos().min(u64::MAX as u128) as u64)
 }
 
 fn project_from_git_remote(cwd: &str) -> Option<String> {
@@ -1360,7 +1587,21 @@ pub fn project_slug_from_remote(remote: &str) -> Option<String> {
     if organization.is_empty() || repository.is_empty() {
         return None;
     }
-    Some(format!("{organization}/{repository}"))
+    Some(canonicalize_project_slug(&format!(
+        "{organization}/{repository}"
+    )))
+}
+
+/// Case-fold and normalize separators so catalog admission does not mint
+/// parallel buckets (`VetCoders/vibecrafted` vs `vetcoders/vibecrafted`).
+/// Hyphens inside a segment stay; only path separators are folded.
+pub(crate) fn canonicalize_project_slug(raw: &str) -> String {
+    raw.replace('\\', "/")
+        .split('/')
+        .filter(|segment| !segment.trim().is_empty())
+        .map(|segment| segment.trim().to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 fn hostname() -> Option<String> {
@@ -1436,6 +1677,40 @@ mod tests {
     }
 
     #[test]
+    fn claude_cwd_prefers_session_event_truth_over_lossy_slug() {
+        let dir = test_root("cwd-sniff");
+        // Slug whose dashes are NOT all separators: naive decode fabricates
+        // `/Volumes/vc/workspace/.../suite/vibecrafted`.
+        let project_dir = dir.join("-Volumes-vc-workspace-vetcoders-vibecrafted-suite-vibecrafted");
+        fs::create_dir_all(&project_dir).unwrap();
+        let session = project_dir.join("aaaa.jsonl");
+        let mut f = File::create(&session).unwrap();
+        writeln!(f, r#"{{"type":"summary","leafUuid":"x"}}"#).unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"attachment","cwd":"/Volumes/vc-workspace/vetcoders/vibecrafted-suite/vibecrafted"}}"#
+        )
+        .unwrap();
+
+        let cwd = infer_cwd_from_path(AgentKind::Claude, &session).unwrap();
+        assert_eq!(
+            cwd,
+            "/Volumes/vc-workspace/vetcoders/vibecrafted-suite/vibecrafted"
+        );
+
+        // Head without cwd → lossy slug decode stays as the last resort.
+        let bare = project_dir.join("bbbb.jsonl");
+        fs::write(&bare, "{\"type\":\"summary\"}\n").unwrap();
+        let cwd = infer_cwd_from_path(AgentKind::Claude, &bare).unwrap();
+        assert_eq!(
+            cwd,
+            "/Volumes/vc/workspace/vetcoders/vibecrafted/suite/vibecrafted"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn catalog_roundtrip_writes_zero_cards() {
         let dir = test_root("roundtrip");
         let home = dir.join(".aicx");
@@ -1472,7 +1747,7 @@ mod tests {
             schema: CATALOG_SCHEMA.to_string(),
             session_id: "s1".into(),
             agent: "claude".into(),
-            project: Some("VetCoders/mlx-lm".into()),
+            project: Some("vetcoders/mlx-lm".into()),
             date: Some("2026-07-22".into()),
             cwd: None,
             source_path: "/tmp/x".into(),
@@ -1495,7 +1770,7 @@ mod tests {
         )
         .unwrap();
         let ids = project_identities_from_catalog_at(&home).unwrap();
-        assert_eq!(ids, vec!["VetCoders/mlx-lm".to_string()]);
+        assert_eq!(ids, vec!["vetcoders/mlx-lm".to_string()]);
         let _ = fs::remove_dir_all(&home);
     }
 
@@ -1720,11 +1995,15 @@ mod tests {
     fn remote_slug_parser_accepts_https_and_scp_shapes() {
         assert_eq!(
             project_slug_from_remote("https://github.com/Loctree/aicx.git"),
-            Some("Loctree/aicx".to_string())
+            Some("loctree/aicx".to_string())
         );
         assert_eq!(
-            project_slug_from_remote("git@github.com:VetCoders/pensieve.git"),
-            Some("VetCoders/pensieve".to_string())
+            project_slug_from_remote("https://github.com/vetcoders/vibecrafted.git"),
+            Some("vetcoders/vibecrafted".to_string())
+        );
+        assert_eq!(
+            project_slug_from_remote("git@github.com:vetcoders/pensieve.git"),
+            Some("vetcoders/pensieve".to_string())
         );
     }
 
@@ -1753,7 +2032,7 @@ mod tests {
                     "remote",
                     "add",
                     "origin",
-                    "https://github.com/VetCoders/pensieve.git",
+                    "https://github.com/vetcoders/pensieve.git",
                 ])
                 .status()
                 .unwrap()
@@ -1785,7 +2064,20 @@ mod tests {
         let report = refresh_hot(&home, &user, 0).unwrap();
         assert_eq!(report.reattributed_sessions, 1);
         let refreshed = read_entries_at(&home).unwrap();
-        assert_eq!(refreshed[0].project.as_deref(), Some("VetCoders/pensieve"));
+        assert_eq!(refreshed[0].project.as_deref(), Some("vetcoders/pensieve"));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn project_slug_canonicalizes_case_and_separators() {
+        assert_eq!(
+            canonicalize_project_slug("VetCoders/vibecrafted"),
+            "vetcoders/vibecrafted"
+        );
+        assert_eq!(
+            canonicalize_project_slug(r"VetCoders\CodeScribe"),
+            "vetcoders/codescribe"
+        );
+        assert_eq!(canonicalize_project_slug("/vibecrafted/"), "vibecrafted");
     }
 }

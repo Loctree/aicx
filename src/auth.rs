@@ -18,7 +18,7 @@ use axum::{
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tower_governor::{GovernorLayer, governor::GovernorConfigBuilder};
+use tower_governor::{GovernorLayer, errors::GovernorError, governor::GovernorConfigBuilder};
 
 const AUTH_RATE_LIMIT_BURST: u32 = 100;
 const AUTH_RATE_LIMIT_REPLENISH_MS: u64 = 600;
@@ -653,6 +653,26 @@ fn unauthorized_response() -> Response {
         .into_response()
 }
 
+fn governor_error_response(error: GovernorError) -> Response {
+    let mut response: Response = error.into();
+    if response.status() == StatusCode::TOO_MANY_REQUESTS {
+        // tower-governor 0.8 truncates sub-second waits with `as_secs()`, which
+        // can produce Retry-After: 0. A zero hint makes compliant client
+        // backoff useless, so advertise the smallest actionable delay.
+        for name in ["retry-after", "x-ratelimit-after"] {
+            let is_zero = response
+                .headers()
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value == "0");
+            if is_zero {
+                response.headers_mut().insert(name, "1".parse().unwrap());
+            }
+        }
+    }
+    response
+}
+
 async fn auth_middleware(
     State(config): State<Arc<AuthConfig>>,
     request: Request,
@@ -720,7 +740,7 @@ where
         .finish()
         .expect("auth rate limit config is non-zero");
 
-    router.layer(GovernorLayer::new(governor_config))
+    router.layer(GovernorLayer::new(governor_config).error_handler(governor_error_response))
 }
 
 /// Operator-facing description of the rate-limit / proxy contract.

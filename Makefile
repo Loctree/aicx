@@ -11,7 +11,7 @@ ifeq (,$(shell command -v cargo 2>/dev/null))
   endif
 endif
 
-.PHONY: all build build-native completions release-binaries install install-bin install-config install-cargo git-hooks
+.PHONY: all build build-native completions release-binaries install install-bin install-config install-cargo git-hooks install-schedule uninstall-schedule install-service uninstall-service
 .PHONY: precheck precheck-native loctree-consumer-check test test-native check fmt fmt-check clippy clippy-native semgrep ci clean help manifest-check
 .PHONY: embeddings-check embeddings-test embeddings-clippy embeddings-hydrate embeddings-info
 .PHONY: version version-show version-check version-bump version-patch bump-patch changelog-close release-notes release-plan release-prepare release-check release-tag release-push package-check release-bundle release-bundle-only-binaries test-e2e
@@ -94,6 +94,21 @@ release-binaries:
 install:
 	./install.sh
 	@$(MAKE) git-hooks
+
+# Background HTTP MCP service daemon (launchd, macOS)
+install-service:
+	bash ./tools/install-mcp-service.sh
+
+uninstall-service:
+	bash ./tools/install-mcp-service.sh --uninstall
+
+# Legacy standalone reindex cadence. HTTP service installations use the
+# server-owned async refresh loop; keep these targets only for headless setups.
+install-schedule:
+	bash ./tools/install-reindex-schedule.sh
+
+uninstall-schedule:
+	bash ./tools/install-reindex-schedule.sh --uninstall
 
 install-bin:
 	AICX_INSTALL_MODE=local ./install.sh --shadow-check-only
@@ -420,6 +435,10 @@ help:
 	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'install-bin' '- Install only aicx + aicx-mcp from the current checkout'
 	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'install-config' '- Configure local MCP clients without reinstalling binaries'
 	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'install-cargo' '- Explain why crates.io install is not the active path'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'install-service' '- Install & start local AICX Streamable HTTP service (:8044)'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'uninstall-service' '- Stop & remove the AICX Streamable HTTP service'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'install-schedule' '- Install legacy standalone reindex schedule (without HTTP service)'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'uninstall-schedule' '- Remove the legacy standalone reindex schedule'
 	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'git-hooks' '- Install repo-local pre-commit + pre-push hooks'
 	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'precheck' '- Quick default cargo check'
 	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'precheck-native' 'Quick native GGUF cargo check'
