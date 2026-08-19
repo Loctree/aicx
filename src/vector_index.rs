@@ -686,6 +686,10 @@ fn publish_hybrid_generation(hybrid_root: &Path, generation_dir: &Path) -> Resul
                 generation_dir.display()
             )
         })?;
+    let previous_name = std::fs::read_to_string(hybrid_root.join(HYBRID_CURRENT_POINTER_FILE_NAME))
+        .ok()
+        .map(|raw| raw.trim().to_string())
+        .filter(|raw| is_valid_generation_dir_name(raw) && raw != name);
     let pointer = hybrid_root.join(HYBRID_CURRENT_POINTER_FILE_NAME);
     let tmp = hybrid_root.join(format!("{HYBRID_CURRENT_POINTER_FILE_NAME}.tmp"));
     let mut file = crate::sanitize::create_file_validated(&tmp)
@@ -704,15 +708,24 @@ fn publish_hybrid_generation(hybrid_root: &Path, generation_dir: &Path) -> Resul
     })?;
     // Pointer is durable. Prune is best-effort: a leftover dir is disk waste,
     // not a search-correctness failure.
-    if let Err(error) = prune_unreferenced_hybrid_generations(hybrid_root, name) {
+    if let Err(error) =
+        prune_unreferenced_hybrid_generations(hybrid_root, name, previous_name.as_deref())
+    {
         eprintln!("[aicx][phase=index event=generation_prune_failed keep={name} err={error}]");
     }
     Ok(())
 }
 
-/// Delete generation directories that are no longer CURRENT, keeping
-/// [`HYBRID_GENERATION_RETAIN`] newest names (CURRENT is always retained).
-fn prune_unreferenced_hybrid_generations(hybrid_root: &Path, keep_name: &str) -> Result<()> {
+/// Delete superseded *complete* generation directories after a CURRENT flip.
+///
+/// Keep the live pointer and the previous pointer ([`HYBRID_GENERATION_RETAIN`]
+/// = those two). Directories without `manifest.json` are interrupted builds
+/// and stay quarantined — they must not steal the rollback slot by name sort.
+fn prune_unreferenced_hybrid_generations(
+    hybrid_root: &Path,
+    keep_name: &str,
+    previous_name: Option<&str>,
+) -> Result<()> {
     let gens = hybrid_root.join(HYBRID_GENERATIONS_DIR_NAME);
     let read_dir = match std::fs::read_dir(&gens) {
         Ok(read_dir) => read_dir,
@@ -721,7 +734,13 @@ fn prune_unreferenced_hybrid_generations(hybrid_root: &Path, keep_name: &str) ->
             return Err(err).with_context(|| format!("read generations dir: {}", gens.display()));
         }
     };
-    let mut names: Vec<String> = Vec::new();
+    let mut retain: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    retain.insert(keep_name.to_string());
+    if let Some(previous_name) = previous_name
+        && retain.len() < HYBRID_GENERATION_RETAIN
+    {
+        retain.insert(previous_name.to_string());
+    }
     for entry in read_dir {
         let entry = entry.with_context(|| format!("read generations entry: {}", gens.display()))?;
         if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
@@ -731,25 +750,13 @@ fn prune_unreferenced_hybrid_generations(hybrid_root: &Path, keep_name: &str) ->
         let Some(name) = name.to_str() else {
             continue;
         };
-        if !is_valid_generation_dir_name(name) {
+        if !is_valid_generation_dir_name(name) || retain.contains(name) {
             continue;
         }
-        names.push(name.to_string());
-    }
-    names.sort();
-    let mut retain: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    retain.insert(keep_name.to_string());
-    for name in names.iter().rev() {
-        if retain.len() >= HYBRID_GENERATION_RETAIN {
-            break;
-        }
-        retain.insert(name.clone());
-    }
-    for name in names {
-        if retain.contains(&name) {
+        let path = gens.join(name);
+        if !path.join("manifest.json").is_file() {
             continue;
         }
-        let path = gens.join(&name);
         std::fs::remove_dir_all(&path)
             .with_context(|| format!("remove unreferenced generation: {}", path.display()))?;
     }

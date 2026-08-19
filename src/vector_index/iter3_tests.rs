@@ -1767,4 +1767,25 @@ mod publish_downgrade_gate {
         );
         let _ = std::fs::remove_dir_all(root);
     }
+
+    #[test]
+    fn publish_does_not_prune_interrupted_dirs_without_manifest() {
+        let root = tempdir_for_test();
+        let first = write_generation(&root, "g-live-a", &supported_commit_id("a"), "0.12.2");
+        publish_hybrid_generation(&root, &first).expect("first");
+        let interrupted = root.join(HYBRID_GENERATIONS_DIR_NAME).join("g-zzz-partial");
+        std::fs::create_dir_all(&interrupted).unwrap();
+        std::fs::write(interrupted.join("dense.tmp"), b"partial").unwrap();
+        let second = write_generation(&root, "g-live-b", &supported_commit_id("b"), "0.12.2");
+        publish_hybrid_generation(&root, &second).expect("second");
+        assert!(interrupted.is_dir(), "interrupted dir stays quarantined");
+        assert!(
+            root.join(HYBRID_GENERATIONS_DIR_NAME)
+                .join("g-live-a")
+                .is_dir(),
+            "previous CURRENT stays as rollback"
+        );
+        assert_eq!(current_pointer(&root), "g-live-b");
+        let _ = std::fs::remove_dir_all(root);
+    }
 }
