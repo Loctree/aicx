@@ -543,6 +543,10 @@ const HYBRID_GENERATIONS_DIR_NAME: &str = "generations";
 /// Written last (tmp + atomic rename), so an interrupted build never becomes
 /// current — see [`resolve_hybrid_generation_dir`].
 const HYBRID_CURRENT_POINTER_FILE_NAME: &str = "CURRENT";
+/// Keep CURRENT plus one previous generation after each publish. Auto-refresh
+/// used to leave every snapshot on disk (hundreds of gigabytes). Older
+/// unreferenced dirs are deleted only after the pointer flip succeeds.
+const HYBRID_GENERATION_RETAIN: usize = 2;
 
 /// Root of the hybrid retrieval area for a project bucket
 /// (`indexed/<bucket>/hybrid`). Generations live below it; legacy pre-W2-03
@@ -698,6 +702,57 @@ fn publish_hybrid_generation(hybrid_root: &Path, generation_dir: &Path) -> Resul
             pointer.display()
         )
     })?;
+    // Pointer is durable. Prune is best-effort: a leftover dir is disk waste,
+    // not a search-correctness failure.
+    if let Err(error) = prune_unreferenced_hybrid_generations(hybrid_root, name) {
+        eprintln!("[aicx][phase=index event=generation_prune_failed keep={name} err={error}]");
+    }
+    Ok(())
+}
+
+/// Delete generation directories that are no longer CURRENT, keeping
+/// [`HYBRID_GENERATION_RETAIN`] newest names (CURRENT is always retained).
+fn prune_unreferenced_hybrid_generations(hybrid_root: &Path, keep_name: &str) -> Result<()> {
+    let gens = hybrid_root.join(HYBRID_GENERATIONS_DIR_NAME);
+    let read_dir = match std::fs::read_dir(&gens) {
+        Ok(read_dir) => read_dir,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            return Err(err).with_context(|| format!("read generations dir: {}", gens.display()));
+        }
+    };
+    let mut names: Vec<String> = Vec::new();
+    for entry in read_dir {
+        let entry = entry.with_context(|| format!("read generations entry: {}", gens.display()))?;
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !is_valid_generation_dir_name(name) {
+            continue;
+        }
+        names.push(name.to_string());
+    }
+    names.sort();
+    let mut retain: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    retain.insert(keep_name.to_string());
+    for name in names.iter().rev() {
+        if retain.len() >= HYBRID_GENERATION_RETAIN {
+            break;
+        }
+        retain.insert(name.clone());
+    }
+    for name in names {
+        if retain.contains(&name) {
+            continue;
+        }
+        let path = gens.join(&name);
+        std::fs::remove_dir_all(&path)
+            .with_context(|| format!("remove unreferenced generation: {}", path.display()))?;
+    }
     Ok(())
 }
 

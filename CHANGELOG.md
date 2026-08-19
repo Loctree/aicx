@@ -48,6 +48,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **Hybrid index publish no longer hoards every generation on disk.**
+  `CURRENT` flip used to leave the previous `generations/<id>/` forever, so a
+  5-minute MCP auto-refresh stacked hundreds of ~1G Tantivy copies (218G on
+  one operator home). Publish now keeps the live generation plus one previous
+  rollback snapshot and deletes the rest after the pointer is durable.
+
 - **Full install no longer leaves MCP clients on stdio while the LaunchAgent
   speaks HTTP.** `configure_mcp` used to write `{"command": "…/aicx-mcp",
   "args": []}` *before* `install-mcp-service.sh` created

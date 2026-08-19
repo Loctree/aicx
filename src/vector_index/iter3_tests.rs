@@ -1727,4 +1727,44 @@ mod publish_downgrade_gate {
         assert_eq!(current_pointer(&root), "g-local-v3");
         let _ = std::fs::remove_dir_all(root);
     }
+
+    #[test]
+    fn publish_prunes_unreferenced_generations_and_keeps_current_plus_one() {
+        let root = tempdir_for_test();
+        let names = [
+            "g-2026-08-01",
+            "g-2026-08-02",
+            "g-2026-08-03",
+            "g-2026-08-04",
+        ];
+        let mut last = None;
+        for name in names {
+            let dir = write_generation(&root, name, &supported_commit_id(name), "0.12.2");
+            publish_hybrid_generation(&root, &dir).expect("publish");
+            last = Some(name);
+        }
+        assert_eq!(current_pointer(&root), last.unwrap());
+        let leftover: Vec<String> = std::fs::read_dir(root.join(HYBRID_GENERATIONS_DIR_NAME))
+            .unwrap()
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+                entry
+                    .file_type()
+                    .ok()?
+                    .is_dir()
+                    .then(|| entry.file_name().to_string_lossy().into_owned())
+            })
+            .collect();
+        assert_eq!(
+            leftover
+                .iter()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
+            ["g-2026-08-03", "g-2026-08-04"]
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
 }
