@@ -48,6 +48,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **`aicx search --deep` reads the published hybrid CURRENT mmap, not
+  retired `embeddings.ndjson`.** After `aicx index --semantic` the live
+  dense artifact is `dense.exact_mmap_v1.bin` inside the CURRENT
+  generation. `--deep` used to share the `--legacy-dense` gate, fail
+  with `index_not_built` at `indexed/_all/embeddings.ndjson`, and fall
+  back to filesystem fuzzy on any mmap-only home. It now runs hybrid RRF
+  over Tantivy + mmap. `--legacy-dense` is the only remaining NDJSON
+  reader.
+
 - **Hybrid index publish no longer hoards every generation on disk.**
   `CURRENT` flip used to leave the previous `generations/<id>/` forever, so a
   5-minute MCP auto-refresh stacked hundreds of ~1G Tantivy copies (218G on

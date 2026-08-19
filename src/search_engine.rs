@@ -108,8 +108,9 @@ pub enum SemanticError {
         reason: String,
         recommendation: String,
     },
-    /// `index_path(project)` does not exist on disk yet — operator never ran
-    /// `aicx index`.
+    /// No published retrieval generation. Default / `--deep` look at hybrid
+    /// CURRENT (`indexed/_all/hybrid`); `--legacy-dense` looks at the retired
+    /// per-bucket `embeddings.ndjson` path.
     IndexNotBuilt {
         path: std::path::PathBuf,
         reason: String,
@@ -349,8 +350,21 @@ fn try_semantic_search_with_boundary(
         let mut any_global_project_scope = false;
         let mut boundary = CandidateBoundary::default();
         for scope in scopes {
-            let (mut outcome, scope_boundary) = if deep || legacy_dense {
+            // `--legacy-dense` is the only remaining NDJSON reader. `--deep`
+            // must not share that gate: after `aicx index --semantic` the
+            // live artifact is CURRENT + `dense.exact_mmap_v1.bin`, and a
+            // home that never wrote `embeddings.ndjson` is the normal case.
+            let (mut outcome, scope_boundary) = if legacy_dense {
                 try_semantic_search_native(
+                    query,
+                    per_scope_limit,
+                    scope,
+                    frame_kind_filter,
+                    kind_filter,
+                    candidate_filters,
+                )?
+            } else if deep {
+                try_hybrid_rrf_search_native(
                     query,
                     per_scope_limit,
                     scope,
@@ -825,6 +839,248 @@ fn try_lexical_search_native(
             scanned: examined,
             backend_label,
             model_id: manifest.embedder_model.clone(),
+            retrieval_status,
+        },
+        boundary,
+    ))
+}
+
+/// Dense RRF over the published `_all` hybrid CURRENT generation
+/// (Tantivy + `dense.exact_mmap_v1.bin`). This is `--deep`.
+///
+/// The retired per-bucket `embeddings.ndjson` file is never a precondition
+/// here. A mmap-only home (the `aicx index --semantic` shape) must work.
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+fn try_hybrid_rrf_search_native(
+    query: &str,
+    limit: usize,
+    project_filter: Option<&str>,
+    frame_kind_filter: Option<FrameKind>,
+    kind_filter: Option<&str>,
+    candidate_filters: Option<&SemanticSearchFilters>,
+) -> std::result::Result<(SemanticOutcome, CandidateBoundary), SemanticError> {
+    if query.trim().is_empty() {
+        return Err(SemanticError::NoResults {
+            path: std::path::PathBuf::new(),
+            scanned: 0,
+            reason: "query is empty or whitespace-only — embedder needs at least one token"
+                .to_string(),
+            recommendation:
+                "pass a non-empty query, e.g. `aicx search --deep 'how does the noise filter work'`"
+                    .to_string(),
+        });
+    }
+    if query.len() > aicx_embeddings::MAX_EMBED_INPUT_BYTES {
+        return Err(SemanticError::NoResults {
+            path: std::path::PathBuf::new(),
+            scanned: 0,
+            reason: format!(
+                "query is {} bytes; semantic embedder rejects inputs over {} bytes",
+                query.len(),
+                aicx_embeddings::MAX_EMBED_INPUT_BYTES
+            ),
+            recommendation: "trim the query to a sentence or two; embeddings only need a short focus phrase to retrieve similar chunks".to_string(),
+        });
+    }
+
+    let hybrid_root =
+        crate::vector_index::hybrid_root_dir(None).map_err(|err| SemanticError::IndexNotBuilt {
+            path: std::path::PathBuf::new(),
+            reason: format!("could not resolve hybrid root: {err}"),
+            recommendation: "ensure $AICX_HOME (or $HOME) is writable, then run `aicx index`"
+                .to_string(),
+        })?;
+    let gen_dir = crate::vector_index::resolve_hybrid_generation_dir(&hybrid_root);
+    let manifest_path = gen_dir.join("manifest.json");
+    if !manifest_path.exists() {
+        return Err(SemanticError::IndexNotBuilt {
+            path: manifest_path.clone(),
+            reason: format!(
+                "no published hybrid generation at {} (CURRENT + generations/)",
+                hybrid_root.display()
+            ),
+            recommendation: "run `aicx index` to publish a hybrid generation, then `aicx index --semantic` for the mmap dense payload used by `--deep`"
+                .to_string(),
+        });
+    }
+
+    let manifest = aicx_retrieve::Manifest::read_from_path(&manifest_path).map_err(|err| {
+        SemanticError::RetrievalManifestStale {
+            path: manifest_path.clone(),
+            reason: format!("could not read retrieval manifest: {err}"),
+            recommendation: "run `aicx index` to rebuild the hybrid retrieval bucket".to_string(),
+        }
+    })?;
+    manifest
+        .ensure_lexical_schema_supported(aicx_retrieve::TANTIVY_SCHEMA_VERSION)
+        .map_err(|err| lexical_schema_conflict_error(&manifest_path, &err))?;
+
+    if manifest.dense_kind == "optional_not_built" || manifest.dense_count == 0 {
+        return Err(SemanticError::RetrievalManifestStale {
+            path: manifest_path,
+            reason: format!(
+                "published CURRENT generation {} has no dense mmap (dense_kind={}, dense_count={}); `--deep` needs {}",
+                manifest.generation_id,
+                manifest.dense_kind,
+                manifest.dense_count,
+                aicx_retrieve::MMAP_DENSE_KIND
+            ),
+            recommendation:
+                "run `aicx index --semantic` on the owner host, then retry `aicx search --deep`"
+                    .to_string(),
+        });
+    }
+    if manifest.dense_kind == aicx_retrieve::BRUTE_FORCE_KIND {
+        return Err(SemanticError::RetrievalManifestStale {
+            path: manifest_path,
+            reason: "published hybrid manifest names the retired NDJSON dense adapter".to_string(),
+            recommendation:
+                "run `aicx index --semantic` to publish an mmap generation, or pass `--legacy-dense` only for recovery"
+                    .to_string(),
+        });
+    }
+    if manifest.dense_kind != aicx_retrieve::MMAP_DENSE_KIND {
+        return Err(SemanticError::RetrievalManifestStale {
+            path: manifest_path,
+            reason: format!("unsupported dense index kind: {}", manifest.dense_kind),
+            recommendation: "run `aicx index --semantic` to rebuild the committed hybrid artifacts"
+                .to_string(),
+        });
+    }
+
+    // Check the mmap payload before paying embedder bootstrap. A CURRENT
+    // generation that claims exact_mmap_v1 but has no file is stale, not
+    // "index not built" at embeddings.ndjson.
+    let mmap_path = gen_dir.join(aicx_retrieve::MMAP_DENSE_PAYLOAD_FILE_NAME);
+    if !mmap_path.exists() {
+        return Err(SemanticError::RetrievalManifestStale {
+            path: mmap_path.clone(),
+            reason: format!(
+                "hybrid dense mmap artifact is missing at {} (CURRENT claims {})",
+                mmap_path.display(),
+                aicx_retrieve::MMAP_DENSE_KIND
+            ),
+            recommendation: "run `aicx index --semantic` to rebuild the committed hybrid artifacts"
+                .to_string(),
+        });
+    }
+
+    let mut engine = match crate::embedder::EmbeddingEngine::new() {
+        Ok(engine) => engine,
+        Err(err) => {
+            let msg = err.to_string();
+            let recommendation = if msg.contains("hydrated") || msg.contains("cache") {
+                "run `hf download mradermacher/F2LLM-v2-0.6B-GGUF F2LLM-v2-0.6B.Q4_K_M.gguf` \
+                 (or set `AICX_EMBEDDER_PATH=/path/to/your.gguf`), then retry"
+                    .to_string()
+            } else if msg.contains("cloud") || msg.contains("url") {
+                "verify `~/.aicx/config.toml` `[embedder.cloud]` url + api_key_env are set, \
+                 export the api key, retry"
+                    .to_string()
+            } else {
+                "check `aicx config show` for resolved backend; if unhealthy run `aicx doctor` \
+                 then retry"
+                    .to_string()
+            };
+            return Err(SemanticError::EmbedderUnavailable {
+                reason: format!("semantic embedder unavailable (optional): {msg}"),
+                recommendation,
+            });
+        }
+    };
+    let info = engine.info().clone();
+
+    let query_embedding = match engine.embed(query) {
+        Ok(embedding) => embedding,
+        Err(err) => {
+            return Err(SemanticError::EmbedderUnavailable {
+                reason: format!("semantic embedder could not encode query: {err}"),
+                recommendation:
+                    "check `aicx config show` for resolved backend; if unhealthy run `aicx doctor` \
+                     then retry"
+                        .to_string(),
+            });
+        }
+    };
+
+    let used_global_project_scope = project_filter.is_some();
+    let hybrid = load_hybrid_index(None, &gen_dir, &info, &manifest_path)?;
+    let retrieval_filters = SemanticRetrievalFilters {
+        kind: kind_filter,
+        frame_kind: frame_kind_filter,
+        project: project_filter,
+        agent: candidate_filters.and_then(|filters| filters.agent.as_deref()),
+        date: candidate_filters.and_then(candidate_exact_date),
+        candidate_filters,
+    };
+    let filters = hybrid_filters(retrieval_filters);
+    let extra_filter_active = candidate_filters.is_some_and(supported_candidate_filter_active);
+    let query_result = match hybrid.query_hybrid_with_budget_and_filter(
+        aicx_retrieve::HybridQueryInput {
+            query_text: query,
+            query_embedding: &query_embedding,
+            filters,
+            limit,
+        },
+        aicx_retrieve::DEFAULT_FILTER_REFILL_BUDGET,
+        extra_filter_active,
+        |metadata| {
+            candidate_filters
+                .is_none_or(|filters| semantic_candidate_metadata_matches(metadata, filters))
+        },
+    ) {
+        Ok(result) => result,
+        Err(err) => return Err(index_query_error(&gen_dir, err)),
+    };
+    let boundary = CandidateBoundary {
+        examined: query_result.examined_count,
+        saturated: query_result.retrieval_outcome.completeness == RetrievalCompleteness::Partial,
+    };
+    let hits = query_result.hits;
+    let retrieval_status = Some(HybridRetrievalStatus::from(&manifest));
+    let scanned = boundary.examined;
+    let results: Vec<FuzzyResult> = hits
+        .into_iter()
+        .take(limit)
+        .map(|h| {
+            let path = hit_path(&h);
+            let score_pct = hybrid_score_pct(h.score);
+            let matched_lines = semantic_preview_lines(&path);
+            let label_backend = if used_global_project_scope {
+                BACKEND_HYBRID_RRF_GLOBAL_SCOPED
+            } else {
+                BACKEND_HYBRID_RRF
+            };
+            let label = format!("{label_backend}:{}", h.chunk_id);
+            FuzzyResult {
+                file: path.to_string_lossy().to_string(),
+                path: path.to_string_lossy().to_string(),
+                project: hit_metadata_string(&h, "project"),
+                kind: hit_metadata_string(&h, "kind"),
+                frame_kind: hit_metadata_optional_string(&h, "frame_kind"),
+                agent: hit_metadata_string(&h, "agent"),
+                date: hit_metadata_string(&h, "date"),
+                timestamp: None,
+                score: score_pct,
+                label,
+                density: h.score,
+                matched_lines,
+                session_id: hit_metadata_optional_string(&h, "session_id"),
+                cwd: hit_metadata_optional_string(&h, "cwd"),
+            }
+        })
+        .collect();
+
+    Ok((
+        SemanticOutcome {
+            results,
+            scanned,
+            backend_label: if used_global_project_scope {
+                BACKEND_HYBRID_RRF_GLOBAL_SCOPED
+            } else {
+                BACKEND_HYBRID_RRF
+            },
+            model_id: info.model_id,
             retrieval_status,
         },
         boundary,
@@ -3755,6 +4011,139 @@ mod tests {
                 // the success branch is also a valid contract.
             }
         }
+    }
+
+    fn semantic_error_blob(err: &SemanticError) -> String {
+        format!("{} {} {}", err.kind(), err.reason(), err.recommendation())
+    }
+
+    fn write_mmap_current_without_payload(home: &Path, generation: &str) {
+        let generation_dir = home
+            .join("indexed")
+            .join("_all")
+            .join("hybrid")
+            .join("generations")
+            .join(generation);
+        fs::create_dir_all(&generation_dir).expect("create mmap-only generation dir");
+        fs::write(
+            home.join("indexed")
+                .join("_all")
+                .join("hybrid")
+                .join("CURRENT"),
+            format!("{generation}\n"),
+        )
+        .expect("write CURRENT pointer");
+        let manifest = serde_json::json!({
+            "schema_version": "2.0",
+            "generation_id": generation,
+            "source_chunk_count": 1,
+            "source_hash_blake3": "00".repeat(64),
+            "embedder_model": "test-model",
+            "embedder_url_hash": "00",
+            "embedder_dim": 2,
+            "embedder_distance": "cosine",
+            "dense_count": 1,
+            "dense_kind": aicx_retrieve::MMAP_DENSE_KIND,
+            "lexical_commit_id": aicx_retrieve::TANTIVY_SCHEMA_VERSION,
+            "lexical_doc_count": 1,
+            "build_started_at": "2026-08-19T00:00:00Z",
+            "build_completed_at": "2026-08-19T00:00:01Z",
+            "build_wall_seconds": 1,
+            "fusion_algorithm": "rrf",
+            "fusion_k": 60,
+        });
+        fs::write(
+            generation_dir.join("manifest.json"),
+            serde_json::to_string_pretty(&manifest).expect("serialize fixture manifest"),
+        )
+        .expect("write generation manifest");
+        let ndjson = home.join("indexed").join("_all").join("embeddings.ndjson");
+        assert!(
+            !ndjson.exists(),
+            "fixture must not materialize the retired NDJSON path"
+        );
+    }
+
+    #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+    #[test]
+    fn deep_search_without_current_points_at_hybrid_not_ndjson() {
+        let home = set_search_test_aicx_home("deep-no-current");
+        let mut filters = SemanticSearchFilters::default();
+        filters.deep = true;
+        let err = try_semantic_search_filtered(
+            &home.dir,
+            "hybrid current query",
+            5,
+            &[None],
+            None,
+            None,
+            &filters,
+        )
+        .expect_err("--deep with no CURRENT must fail closed");
+        let blob = semantic_error_blob(&err);
+        assert_eq!(err.kind(), "index_not_built", "{blob}");
+        assert!(
+            !blob.contains("embeddings.ndjson"),
+            "--deep must not diagnose the retired NDJSON path: {blob}"
+        );
+        assert!(
+            blob.contains("hybrid") || blob.contains("CURRENT"),
+            "--deep IndexNotBuilt must name the hybrid generation: {blob}"
+        );
+    }
+
+    #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+    #[test]
+    fn deep_search_on_mmap_current_does_not_require_legacy_ndjson() {
+        let home = set_search_test_aicx_home("deep-mmap-only");
+        write_mmap_current_without_payload(&home.dir, "g-2026-08-19T00-00-00Z-deadbeef");
+        let mut filters = SemanticSearchFilters::default();
+        filters.deep = true;
+        let err = try_semantic_search_filtered(
+            &home.dir,
+            "hybrid current query",
+            5,
+            &[None],
+            None,
+            None,
+            &filters,
+        )
+        .expect_err("missing mmap payload must fail on CURRENT, not NDJSON");
+        let blob = semantic_error_blob(&err);
+        assert_eq!(err.kind(), "retrieval_manifest_stale", "{blob}");
+        assert!(
+            !blob.contains("embeddings.ndjson"),
+            "issue #49: --deep on an mmap-only home must not resolve embeddings.ndjson: {blob}"
+        );
+        assert!(
+            blob.contains("dense.exact_mmap_v1.bin") || blob.contains("exact_mmap_v1"),
+            "error must name the mmap artifact: {blob}"
+        );
+    }
+
+    #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+    #[test]
+    fn legacy_dense_search_still_resolves_embeddings_ndjson() {
+        let home = set_search_test_aicx_home("legacy-dense-ndjson");
+        let mut filters = SemanticSearchFilters::default();
+        filters.legacy_dense = true;
+        filters.deep = true;
+        let err = try_semantic_search_filtered(
+            &home.dir,
+            "legacy recovery query",
+            5,
+            &[None],
+            None,
+            None,
+            &filters,
+        )
+        .expect_err("--legacy-dense with no NDJSON must fail closed");
+        let blob = semantic_error_blob(&err);
+        assert_eq!(err.kind(), "index_not_built", "{blob}");
+        assert!(
+            blob.contains("embeddings.ndjson"),
+            "--legacy-dense remains the NDJSON recovery path: {blob}"
+        );
     }
 
     #[test]
