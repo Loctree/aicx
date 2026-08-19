@@ -686,10 +686,12 @@ fn publish_hybrid_generation(hybrid_root: &Path, generation_dir: &Path) -> Resul
                 generation_dir.display()
             )
         })?;
-    let previous_name = std::fs::read_to_string(hybrid_root.join(HYBRID_CURRENT_POINTER_FILE_NAME))
-        .ok()
-        .map(|raw| raw.trim().to_string())
-        .filter(|raw| is_valid_generation_dir_name(raw) && raw != name);
+    let previous_name = crate::sanitize::read_to_string_validated(
+        &hybrid_root.join(HYBRID_CURRENT_POINTER_FILE_NAME),
+    )
+    .ok()
+    .map(|raw| raw.trim().to_string())
+    .filter(|raw| is_valid_generation_dir_name(raw) && raw != name);
     let pointer = hybrid_root.join(HYBRID_CURRENT_POINTER_FILE_NAME);
     let tmp = hybrid_root.join(format!("{HYBRID_CURRENT_POINTER_FILE_NAME}.tmp"));
     let mut file = crate::sanitize::create_file_validated(&tmp)
@@ -727,11 +729,11 @@ fn prune_unreferenced_hybrid_generations(
     previous_name: Option<&str>,
 ) -> Result<()> {
     let gens = hybrid_root.join(HYBRID_GENERATIONS_DIR_NAME);
-    let read_dir = match std::fs::read_dir(&gens) {
+    let read_dir = match crate::sanitize::read_dir_validated(&gens) {
         Ok(read_dir) => read_dir,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(_) if !gens.exists() => return Ok(()),
         Err(err) => {
-            return Err(err).with_context(|| format!("read generations dir: {}", gens.display()));
+            return Err(err).context(format!("read generations dir: {}", gens.display()));
         }
     };
     let mut retain: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
@@ -757,8 +759,10 @@ fn prune_unreferenced_hybrid_generations(
         if !path.join("manifest.json").is_file() {
             continue;
         }
-        std::fs::remove_dir_all(&path)
-            .with_context(|| format!("remove unreferenced generation: {}", path.display()))?;
+        let validated = crate::sanitize::validate_dir_path(&path)
+            .with_context(|| format!("validate unreferenced generation: {}", path.display()))?;
+        std::fs::remove_dir_all(&validated)
+            .with_context(|| format!("remove unreferenced generation: {}", validated.display()))?;
     }
     Ok(())
 }
