@@ -4068,8 +4068,10 @@ mod tests {
     #[test]
     fn deep_search_without_current_points_at_hybrid_not_ndjson() {
         let home = set_search_test_aicx_home("deep-no-current");
-        let mut filters = SemanticSearchFilters::default();
-        filters.deep = true;
+        let filters = SemanticSearchFilters {
+            deep: true,
+            ..SemanticSearchFilters::default()
+        };
         let err = try_semantic_search_filtered(
             &home.dir,
             "hybrid current query",
@@ -4097,8 +4099,10 @@ mod tests {
     fn deep_search_on_mmap_current_does_not_require_legacy_ndjson() {
         let home = set_search_test_aicx_home("deep-mmap-only");
         write_mmap_current_without_payload(&home.dir, "g-2026-08-19T00-00-00Z-deadbeef");
-        let mut filters = SemanticSearchFilters::default();
-        filters.deep = true;
+        let filters = SemanticSearchFilters {
+            deep: true,
+            ..SemanticSearchFilters::default()
+        };
         let err = try_semantic_search_filtered(
             &home.dir,
             "hybrid current query",
@@ -4125,9 +4129,11 @@ mod tests {
     #[test]
     fn legacy_dense_search_still_resolves_embeddings_ndjson() {
         let home = set_search_test_aicx_home("legacy-dense-ndjson");
-        let mut filters = SemanticSearchFilters::default();
-        filters.legacy_dense = true;
-        filters.deep = true;
+        let filters = SemanticSearchFilters {
+            legacy_dense: true,
+            deep: true,
+            ..SemanticSearchFilters::default()
+        };
         let err = try_semantic_search_filtered(
             &home.dir,
             "legacy recovery query",
