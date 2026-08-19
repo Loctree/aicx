@@ -1,5 +1,7 @@
 use super::*;
+use crate::timeline::TimelineEntry;
 use chrono::TimeZone;
+use dedupe::DirShaCache;
 use filetime::{FileTime, set_file_mtime};
 use std::{env, fs};
 
@@ -624,7 +626,7 @@ fn write_dir_sha_cache_test_sidecar(dir: &Path, stem: &str, sha: &str) {
     let path = dir.join(format!("{stem}.meta.json"));
     let sidecar = serde_json::json!({
         "id": stem,
-        "project": "Vetcoders/aicx",
+        "project": "vetcoders/aicx",
         "agent": "claude",
         "date": "2026-05-22",
         "session_id": "dir-sha-cache-test",
@@ -731,10 +733,10 @@ fn scan_retrieves_repo_centric_files_with_correct_metadata() {
     let _ = fs::remove_dir_all(&root);
 
     // Create canonical repo-centric layout:
-    // store/Vetcoders/ai-contexters/2026_0321/conversations/claude/<file>.md
+    // store/vetcoders/ai-contexters/2026_0321/conversations/claude/<file>.md
     let chunk_dir = root
         .join("store")
-        .join("Vetcoders")
+        .join("vetcoders")
         .join("ai-contexters")
         .join("2026_0321")
         .join("conversations")
@@ -748,7 +750,7 @@ fn scan_retrieves_repo_centric_files_with_correct_metadata() {
     assert_eq!(scanned.len(), 1);
 
     let file = &scanned[0];
-    assert_eq!(file.project, "Vetcoders/ai-contexters");
+    assert_eq!(file.project, "vetcoders/ai-contexters");
     assert_eq!(file.agent, "claude");
     assert_eq!(file.kind, Kind::Conversations);
     assert_eq!(file.date_compact, "2026_0321");
@@ -758,7 +760,7 @@ fn scan_retrieves_repo_centric_files_with_correct_metadata() {
     assert!(file.repo.is_some());
     assert_eq!(
         file.repo.as_ref().unwrap().slug(),
-        "Vetcoders/ai-contexters"
+        "vetcoders/ai-contexters"
     );
 
     let _ = fs::remove_dir_all(&root);
@@ -879,7 +881,7 @@ fn load_sidecar_keeps_adjacent_meta_json_priority_for_legacy_chunks() {
         &adjacent,
         &serde_json::json!({
             "id": "legacy-live",
-            "project": "Vetcoders/aicx",
+            "project": "vetcoders/aicx",
             "agent": "codex",
             "date": "2026-05-08",
             "session_id": "live-sess",
@@ -891,7 +893,7 @@ fn load_sidecar_keeps_adjacent_meta_json_priority_for_legacy_chunks() {
         &sidecars,
         &serde_json::json!({
             "id": "sidecars-example",
-            "project": "Vetcoders/aicx",
+            "project": "vetcoders/aicx",
             "agent": "codex",
             "date": "2026-05-08",
             "session_id": "live-sess",
@@ -920,7 +922,7 @@ fn read_context_chunk_accepts_relative_path_file_name_and_compact_ref() {
 
     let chunk_path = root
         .join("store")
-        .join("Vetcoders")
+        .join("vetcoders")
         .join("ai-contexters")
         .join("2026_0321")
         .join("conversations")
@@ -930,11 +932,11 @@ fn read_context_chunk_accepts_relative_path_file_name_and_compact_ref() {
 
     let by_relative = read_context_chunk_at(
             &root,
-            "store/Vetcoders/ai-contexters/2026_0321/conversations/claude/2026_0321_claude_sess-abc123_001.md",
+            "store/vetcoders/ai-contexters/2026_0321/conversations/claude/2026_0321_claude_sess-abc123_001.md",
             Some(14),
         )
         .expect("read by relative path");
-    assert_eq!(by_relative.project, "Vetcoders/ai-contexters");
+    assert_eq!(by_relative.project, "vetcoders/ai-contexters");
     assert_eq!(by_relative.kind, "conversations");
     assert_eq!(by_relative.session_id, "sess-abc123");
     assert_eq!(by_relative.chunk, 1);
@@ -947,7 +949,7 @@ fn read_context_chunk_accepts_relative_path_file_name_and_compact_ref() {
 
     let by_compact = read_context_chunk_at(
         &root,
-        "Vetcoders/ai-contexters|2026-03-21|conversations|claude|sess-abc123|001",
+        "vetcoders/ai-contexters|2026-03-21|conversations|claude|sess-abc123|001",
         None,
     )
     .expect("read by compact ref");
@@ -964,11 +966,11 @@ fn chunk_ref_spec_parse_accepts_paths_and_chunk_ids() {
     );
     assert_eq!(
         ChunkRefSpec::parse(
-            "store/Vetcoders/ai-contexters/2026_0321/conversations/claude/chunk.md"
+            "store/vetcoders/ai-contexters/2026_0321/conversations/claude/chunk.md"
         )
         .unwrap(),
         ChunkRefSpec::Path(PathBuf::from(
-            "store/Vetcoders/ai-contexters/2026_0321/conversations/claude/chunk.md"
+            "store/vetcoders/ai-contexters/2026_0321/conversations/claude/chunk.md"
         ))
     );
     assert_eq!(
@@ -1095,7 +1097,7 @@ fn scan_retrieves_both_repo_and_non_repo_files_together() {
     // Repo-centric file
     let repo_dir = root
         .join("store")
-        .join("Vetcoders")
+        .join("Loctree")
         .join("loctree")
         .join("2026_0320")
         .join("reports")
@@ -1119,7 +1121,7 @@ fn scan_retrieves_both_repo_and_non_repo_files_together() {
     let scanned = scan_context_files_at(&root).expect("scan should succeed");
     assert_eq!(scanned.len(), 2);
 
-    let repo_file = scanned.iter().find(|f| f.project == "Vetcoders/loctree");
+    let repo_file = scanned.iter().find(|f| f.project == "Loctree/loctree");
     let non_repo_file = scanned
         .iter()
         .find(|f| f.project == NON_REPOSITORY_CONTEXTS);
@@ -1269,7 +1271,7 @@ fn chunks_by_run_id_does_not_leak_substring_into_neighbor_repos() {
         &vista.with_extension("meta.json"),
         &serde_json::json!({
             "id": "vista-run",
-            "project": "Vetcoders/vista",
+            "project": "vetcoders/vista",
             "agent": "claude",
             "date": "2026-04-01",
             "session_id": "sess-vista",
@@ -1282,7 +1284,7 @@ fn chunks_by_run_id_does_not_leak_substring_into_neighbor_repos() {
         &vista_portal.with_extension("meta.json"),
         &serde_json::json!({
             "id": "vista-portal-run",
-            "project": "Vetcoders/vista-portal",
+            "project": "vetcoders/vista-portal",
             "agent": "claude",
             "date": "2026-04-01",
             "session_id": "sess-portal",
@@ -1320,7 +1322,7 @@ fn scan_context_files_respects_aicxignore_and_negation() {
 
     let ignored = root
         .join("store")
-        .join("Vetcoders")
+        .join("vetcoders")
         .join("ai-contexters")
         .join("2026_0331")
         .join("reports")
@@ -1328,7 +1330,7 @@ fn scan_context_files_respects_aicxignore_and_negation() {
         .join("2026_0331_codex_sess-rpt_001.md");
     let kept = root
         .join("store")
-        .join("Vetcoders")
+        .join("vetcoders")
         .join("ai-contexters")
         .join("2026_0331")
         .join("conversations")
@@ -1339,7 +1341,7 @@ fn scan_context_files_respects_aicxignore_and_negation() {
     write_chunk_file(&kept, "Conversation that should remain visible");
     fs::write(
         root.join(AICX_IGNORE_FILENAME),
-        "store/Vetcoders/ai-contexters/**\n!store/Vetcoders/ai-contexters/**/conversations/**\n",
+        "store/vetcoders/ai-contexters/**\n!store/vetcoders/ai-contexters/**/conversations/**\n",
     )
     .unwrap();
 
@@ -1605,7 +1607,7 @@ fn project_filter_strict_owner_repo_match() {
     assert!(project_filter_matches(
         "Vetcoders",
         "Codescribe",
-        "Vetcoders/Codescribe"
+        "vetcoders/Codescribe"
     ));
     // Case-insensitive both sides.
     assert!(project_filter_matches(
@@ -1616,7 +1618,7 @@ fn project_filter_strict_owner_repo_match() {
     assert!(!project_filter_matches(
         "Vetcoders",
         "Codescribe",
-        "Vetcoders/Vista"
+        "vetcoders/Vista"
     ));
     assert!(!project_filter_matches(
         "Vetcoders",
@@ -2063,7 +2065,7 @@ fn test_malformed_index_json_returns_error_not_default() {
     let now = Utc::now();
     let good = StoreIndex {
         projects: std::collections::HashMap::from([(
-            "Vetcoders/aicx".to_string(),
+            "vetcoders/aicx".to_string(),
             ProjectIndex {
                 agents: std::collections::HashMap::from([(
                     "claude".to_string(),
@@ -2086,7 +2088,7 @@ fn test_malformed_index_json_returns_error_not_default() {
     assert!(
         recovered
             .projects
-            .get("Vetcoders/aicx")
+            .get("vetcoders/aicx")
             .and_then(|p| p.agents.get("claude"))
             .is_some(),
         "recovered index must contain the .bak payload"
@@ -2146,7 +2148,7 @@ fn write_pack_sidecar(pack: &Path, stem: &str, project: &str, date: &str) {
 #[test]
 fn ingest_loct_context_pack_rejects_mixed_projects() {
     let pack = unique_pack_dir("mixed");
-    write_pack_sidecar(&pack, "alpha", "Vetcoders/aicx", "2026-05-08");
+    write_pack_sidecar(&pack, "alpha", "vetcoders/aicx", "2026-05-08");
     write_pack_sidecar(&pack, "beta", "Loctree/aicx", "2026-05-08");
 
     let err = ingest_loct_context_pack(&pack)
@@ -2155,7 +2157,7 @@ fn ingest_loct_context_pack_rejects_mixed_projects() {
 
     // Names both project tuples.
     assert!(
-        message.contains("Vetcoders/aicx") || message.contains("vetcoders/aicx"),
+        message.contains("vetcoders/aicx") || message.contains("vetcoders/aicx"),
         "error should name first project tuple; got {message}"
     );
     assert!(
@@ -2280,14 +2282,14 @@ fn ingest_loct_context_pack_preserves_rows_for_subset_reingest() {
         write_pack_chunk(
             &pack,
             "alpha",
-            "Vetcoders/aicx",
+            "vetcoders/aicx",
             "2026-05-08",
             "first chunk",
         );
         write_pack_chunk(
             &pack,
             "beta",
-            "Vetcoders/aicx",
+            "vetcoders/aicx",
             "2026-05-08",
             "second chunk",
         );
@@ -2303,7 +2305,7 @@ fn ingest_loct_context_pack_preserves_rows_for_subset_reingest() {
         write_pack_chunk(
             &pack,
             "alpha",
-            "Vetcoders/aicx",
+            "vetcoders/aicx",
             "2026-05-08",
             "first chunk",
         );
@@ -2334,14 +2336,14 @@ fn ingest_loct_context_pack_preserves_rows_for_identical_reingest() {
         write_pack_chunk(
             &pack,
             "alpha",
-            "Vetcoders/aicx",
+            "vetcoders/aicx",
             "2026-05-08",
             "first chunk",
         );
         write_pack_chunk(
             &pack,
             "beta",
-            "Vetcoders/aicx",
+            "vetcoders/aicx",
             "2026-05-08",
             "second chunk",
         );
@@ -2352,14 +2354,14 @@ fn ingest_loct_context_pack_preserves_rows_for_identical_reingest() {
         write_pack_chunk(
             &pack,
             "alpha",
-            "Vetcoders/aicx",
+            "vetcoders/aicx",
             "2026-05-08",
             "first chunk",
         );
         write_pack_chunk(
             &pack,
             "beta",
-            "Vetcoders/aicx",
+            "vetcoders/aicx",
             "2026-05-08",
             "second chunk",
         );
@@ -2390,7 +2392,7 @@ fn ingest_loct_context_pack_unions_old_and_new_on_reingest() {
         write_pack_chunk(
             &pack,
             "alpha",
-            "Vetcoders/aicx",
+            "vetcoders/aicx",
             "2026-05-08",
             "first chunk",
         );
@@ -2404,14 +2406,14 @@ fn ingest_loct_context_pack_unions_old_and_new_on_reingest() {
         write_pack_chunk(
             &pack,
             "alpha",
-            "Vetcoders/aicx",
+            "vetcoders/aicx",
             "2026-05-08",
             "first chunk",
         );
         write_pack_chunk(
             &pack,
             "gamma",
-            "Vetcoders/aicx",
+            "vetcoders/aicx",
             "2026-05-08",
             "third chunk",
         );

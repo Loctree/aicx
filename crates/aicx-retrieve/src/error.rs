@@ -31,6 +31,27 @@ pub enum RetrieveError {
     #[error("schema version unsupported: {0}")]
     SchemaVersionUnsupported(String),
 
+    #[error(
+        "lexical schema downgrade rejected: published={current}, incoming={incoming}, \
+         incoming writer={writer}; a foreign or outdated writer tried to replace a newer \
+         generation — machine-local index state is not shareable between hosts"
+    )]
+    LexicalSchemaDowngrade {
+        current: String,
+        incoming: String,
+        writer: String,
+    },
+
+    #[error(
+        "lexical schema {index_schema} is newer than this binary's {binary_schema} \
+         (index writer={writer}); upgrade aicx instead of rebuilding"
+    )]
+    LexicalSchemaTooNew {
+        index_schema: String,
+        binary_schema: String,
+        writer: String,
+    },
+
     #[error("source hash drift: manifest={manifest_hash}, observed={observed_hash}")]
     SourceHashDrift {
         manifest_hash: String,

@@ -553,7 +553,7 @@ mod tests {
     }
 
     fn valid_v1_markdown() -> &'static str {
-        "[project: vetcoders/aicx | agent: codex | date: 2026-07-02]\n\n[00:00:00] user: hello\n"
+        "[project: Loctree/aicx | agent: codex | date: 2026-07-02]\n\n[00:00:00] user: hello\n"
     }
 
     fn valid_v2_markdown() -> &'static str {
@@ -790,7 +790,7 @@ mod tests {
     #[test]
     fn validate_cards_reports_v1_signal_mismatch_as_warning() {
         let root = temp_root("signals-v1");
-        let markdown = "[project: vetcoders/aicx | agent: codex | date: 2026-07-02]\n\n[signals]\nDecision:\n- [decision] keep\n[/signals]\n\n[00:00:00] user: hello\n";
+        let markdown = "[project: Loctree/aicx | agent: codex | date: 2026-07-02]\n\n[signals]\nDecision:\n- [decision] keep\n[/signals]\n\n[00:00:00] user: hello\n";
         write_card(&root, "signals", markdown, v1_sidecar("signals"));
 
         let report = validate_cards(&CorpusValidateOptions {
@@ -882,7 +882,7 @@ mod tests {
         let root = temp_root("samples");
         for idx in 0..MAX_SAMPLES_PER_ROOT {
             let markdown = format!(
-                "[project: vetcoders/aicx | agent: codex | date: 2026-07-02]\n\n[signals]\nDecision:\n- [decision] keep {idx}\n[/signals]\n\n[00:00:00] user: hello\n"
+                "[project: Loctree/aicx | agent: codex | date: 2026-07-02]\n\n[signals]\nDecision:\n- [decision] keep {idx}\n[/signals]\n\n[00:00:00] user: hello\n"
             );
             write_card(
                 &root,

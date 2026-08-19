@@ -428,6 +428,9 @@ fn load_catalog_intent_feed(
             min_confidence: None,
             kind_filter: None,
             frame_kind: Some(frame_kind),
+            // Overlay is a durable-identity join over the full census; the
+            // hot live window has no meaning at hours=0.
+            live: false,
         };
         let extraction = extract_intents_from_root_at_with_stats(&config, aicx_home, Utc::now())
             .with_context(|| {
@@ -575,7 +578,7 @@ fn catalog_feed_revision(items: &[OverlayFeedItem]) -> String {
             hasher.update(b"\0");
         }
     }
-    format!("cat1:{}", hex::encode(hasher.finalize()))
+    format!("sr1:{}", hex::encode(hasher.finalize()))
 }
 
 fn load_residual_c6_feed(
@@ -1988,7 +1991,9 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let root = unique_test_root("catalog-feed");
-        let repo = root.join("repo");
+        // The per-frame cwd must prove the same canonical owner/repo bucket
+        // as the catalog row; this fixture intentionally models that contract.
+        let repo = root.join("Loctree").join("aicx");
         let home = root.join("aicx-home");
         let index = root.join("index");
         fs::create_dir_all(repo.join("src")).unwrap();
@@ -2072,7 +2077,7 @@ mod tests {
         };
         let (doc, stats) = build_overlay(&options).expect("catalog feed overlay");
         assert_eq!(doc.repo_id, "Loctree/aicx");
-        assert!(doc.store_revision.starts_with("cat1:"));
+        assert!(doc.store_revision.starts_with("sr1:"));
         assert!(
             stats.canonical_cards_seen > 0,
             "catalog feed should yield at least one claim seed"
@@ -2203,7 +2208,7 @@ mod tests {
     fn semantic_fixture() -> SemanticFixture {
         let fixture: SemanticFixture = serde_json::from_str(include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/overlay-intent-v1/dedup_semantic_2026-07-12.json"
+            "/tests/fixtures/overlay-semantic-v1/dedup_semantic_2026-07-12.json"
         )))
         .unwrap();
         assert_eq!(fixture.schema, "aicx.overlay.semantic-fixture.v1");

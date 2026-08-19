@@ -3,7 +3,10 @@
 #![cfg(feature = "app")]
 
 use aicx::auth::{self, AuthConfig, AuthSource};
-use aicx::mcp::{IntentsParams, RankParams, ReadParams, SearchParams, SteerParams};
+use aicx::mcp::{
+    ContinuityParams, IntentsParams, RankParams, ReadParams, SearchParams, SessionParams,
+    SessionsParams, SteerParams,
+};
 use axum::{
     Router,
     body::Body,
@@ -160,9 +163,22 @@ fn test_mcp_slim_defaults() {
     );
 
     let params: ReadParams =
-        serde_json::from_str(r#"{"reference":"store/Vetcoders/aicx/chunk.md"}"#).unwrap();
-    assert_eq!(params.reference, "store/Vetcoders/aicx/chunk.md");
+        serde_json::from_str(r#"{"reference":"store/vetcoders/aicx/chunk.md"}"#).unwrap();
+    assert_eq!(params.reference, "store/vetcoders/aicx/chunk.md");
     assert!(params.max_chars.is_none());
+
+    let params: SessionsParams = serde_json::from_str(r#"{}"#).unwrap();
+    assert_eq!(params.limit, 20);
+    assert_eq!(params.hours, 720);
+    assert!(params.project.is_none());
+
+    let params: SessionParams = serde_json::from_str(r#"{"session":"abc"}"#).unwrap();
+    assert!(params.conversation);
+    assert!(!params.user_only);
+
+    let params: ContinuityParams = serde_json::from_str(r#"{"project":"Loctree/aicx"}"#).unwrap();
+    assert_eq!(params.hours, 24);
+    assert!(!params.for_inject);
 }
 
 // ----------------------------------------------------------------------------

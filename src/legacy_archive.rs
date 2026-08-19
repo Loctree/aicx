@@ -33,8 +33,6 @@ pub use canonical_projection::{
 use crate::chunker;
 use crate::sanitize;
 use crate::timeline::RepoIdentity;
-#[cfg(test)]
-use crate::timeline::TimelineEntry;
 pub use aicx_parser::{classify_kind, timeline::Kind};
 
 // ============================================================================
@@ -115,8 +113,6 @@ pub(crate) mod paths;
 #[path = "legacy_archive/sidecar.rs"]
 pub(crate) mod sidecar;
 
-#[cfg(test)]
-use dedupe::DirShaCache;
 use dedupe::content_sha256;
 pub use dedupe::content_sha256_exists_in_dir;
 
@@ -305,12 +301,14 @@ impl ChunkRefSpec {
     }
 }
 
+#[cfg(feature = "app")]
 pub(crate) fn chunk_body_is_empty(content: &str) -> bool {
     !crate::card_header::card_body(content)
         .lines()
         .any(chunk_line_has_signal)
 }
 
+#[cfg(feature = "app")]
 fn chunk_line_has_signal(line: &str) -> bool {
     let line = line.trim();
     if line.is_empty() {
@@ -1409,6 +1407,7 @@ pub fn project_identities_for_search_at(store_root: &Path) -> Result<Vec<String>
 }
 
 #[cfg(test)]
+#[cfg(all(test, feature = "app"))]
 fn resolve_filters_to_index_slugs_at(
     indexed_root: &Path,
     filters: &[String],

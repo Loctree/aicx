@@ -26,7 +26,7 @@
 //! opt-in semantic gate. Search status must remain truthful when the index
 //! or embedder is missing (`semantic_fallback` / degraded `RetrievalOutcome`).
 //!
-//! 𝚅𝚒𝚋𝚎𝚌𝚛𝚊𝚏𝚝𝚎𝚍. with AI Agents by VetCoders (c)2024-2026 LibraxisAI
+//! 𝚅𝚒𝚋𝚎𝚌𝚛𝚊𝚏𝚝𝚎𝚍. with AI Agents by Vetcoders (c)2024-2026 LibraxisAI
 
 #![cfg(feature = "e2e-aicx")]
 

@@ -12,7 +12,7 @@ fn wizard_q_quits_when_idle() {
 }
 
 #[test]
-fn wizard_switches_between_four_screens() {
+fn wizard_switches_between_five_screens() {
     let mut app = App::new();
     app.handle_key(KeyCode::Char('2'));
     assert_eq!(app.active, Screen::Doctor);
@@ -20,8 +20,39 @@ fn wizard_switches_between_four_screens() {
     assert_eq!(app.active, Screen::Intents);
     app.handle_key(KeyCode::Char('4'));
     assert_eq!(app.active, Screen::Rebuild);
+    app.handle_key(KeyCode::Char('5'));
+    assert_eq!(app.active, Screen::Search);
     app.handle_key(KeyCode::Char('1'));
     assert_eq!(app.active, Screen::Corpus);
+}
+
+#[test]
+fn wizard_slash_from_any_screen_lands_on_search() {
+    let mut app = App::new();
+    app.handle_key(KeyCode::Char('2'));
+    app.handle_key(KeyCode::Char('/'));
+    assert_eq!(app.active, Screen::Search);
+    assert!(app.search_mode);
+}
+
+#[test]
+fn wizard_view_search_launch_without_query_opens_input() {
+    use super::app::WizardLaunch;
+    let app = App::with_launch(WizardLaunch {
+        view: Some(Screen::Search),
+        query: None,
+        project: None,
+        agent: None,
+    });
+    assert_eq!(app.active, Screen::Search);
+    assert!(app.search_mode);
+}
+
+#[test]
+fn screen_parse_accepts_search_aliases() {
+    assert_eq!(Screen::parse("search"), Some(Screen::Search));
+    assert_eq!(Screen::parse("5"), Some(Screen::Search));
+    assert_eq!(Screen::parse("nope"), None);
 }
 
 #[test]

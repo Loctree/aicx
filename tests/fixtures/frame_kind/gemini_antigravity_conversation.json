@@ -1,12 +1,14 @@
 {
-  "projectRoot": "/Users/tester/workspace/Vetcoders/ai-contexters",
+  "projectRoot": "/Users/tester/workspace/vetcoders/ai-contexters",
   "messages": [
     {
       "role": "user",
       "timestamp": "2026-04-14T10:00:00Z",
       "content": {
         "parts": [
-          { "text": "User asks for frame separation" }
+          {
+            "text": "User asks for frame separation"
+          }
         ]
       }
     },
@@ -15,12 +17,19 @@
       "timestamp": "2026-04-14T10:00:01Z",
       "content": {
         "parts": [
-          { "text": "Visible assistant reply" },
-          { "text": "Hidden chain of thought", "thought": true },
+          {
+            "text": "Visible assistant reply"
+          },
+          {
+            "text": "Hidden chain of thought",
+            "thought": true
+          },
           {
             "functionCall": {
               "name": "searchDocs",
-              "args": { "query": "frame_kind" }
+              "args": {
+                "query": "frame_kind"
+              }
             }
           }
         ]

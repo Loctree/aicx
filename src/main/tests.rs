@@ -362,8 +362,8 @@ fn index_status_routes_through_index_canonical_resolver() {
     // Canonical on-disk store: 4 buckets across 2 orgs / 3 repo names.
     // Mixed case mirrors real-world GitHub slugs (filesystem preserves it).
     let bucket_slugs = [
-        "Vetcoders/Loctree",
-        "Vetcoders/aicx",
+        "Loctree/loctree",
+        "vetcoders/aicx",
         "Sampleorg/Loctree",
         "Sampleorg/Codescribe",
     ];
@@ -373,7 +373,7 @@ fn index_status_routes_through_index_canonical_resolver() {
 
     // Corresponding semantic index buckets (lowercase + `/` → `_`).
     for bucket in [
-        "vetcoders_loctree",
+        "loctree_loctree",
         "vetcoders_aicx",
         "sampleorg_loctree",
         "sampleorg_codescribe",
@@ -390,11 +390,11 @@ fn index_status_routes_through_index_canonical_resolver() {
     // The 4 canonical filter shapes from the bug brief.
     let shapes: &[(&str, &[&str])] = &[
         // strict slug
-        ("Vetcoders/Loctree", &["vetcoders_loctree"]),
+        ("Loctree/loctree", &["loctree_loctree"]),
         // org wildcard
-        ("Vetcoders/", &["vetcoders_aicx", "vetcoders_loctree"]),
+        ("vetcoders/", &["vetcoders_aicx"]),
         // cross-org repo (explicit wildcard — selects every org on purpose)
-        ("/Loctree", &["sampleorg_loctree", "vetcoders_loctree"]),
+        ("/Loctree", &["loctree_loctree", "sampleorg_loctree"]),
     ];
 
     // World-model fix (F3, P0-4): a bare name with more than one identity
@@ -410,7 +410,7 @@ fn index_status_routes_through_index_canonical_resolver() {
         "fail-closed error must name the ambiguity:\n{bare_message}"
     );
     assert!(
-        bare_message.contains("Sampleorg/Loctree") && bare_message.contains("Vetcoders/Loctree"),
+        bare_message.contains("Sampleorg/Loctree") && bare_message.contains("Loctree/loctree"),
         "fail-closed error must list both candidates:\n{bare_message}"
     );
 
@@ -489,6 +489,11 @@ fn dummy_index_status(bucket: &str) -> aicx::IndexStatus {
         backend: "ndjson".to_string(),
         project_bucket: bucket.to_string(),
         committed_at: Some("2026-05-24T00:01:00Z".to_string()),
+        lexical_status: "ready".to_string(),
+        dense_status: "not_built".to_string(),
+        dense_kind: "optional_not_built".to_string(),
+        dense_count: 0,
+        dense_recommendation: None,
     }
 }
 
@@ -509,7 +514,7 @@ fn index_status_json_payload_is_always_array_for_single_scope() {
 fn index_status_json_payload_is_array_for_multiple_scopes() {
     let reports = vec![
         (
-            Some("Vetcoders/aicx".to_string()),
+            Some("vetcoders/aicx".to_string()),
             dummy_index_status("vetcoders_aicx"),
         ),
         (
@@ -523,7 +528,7 @@ fn index_status_json_payload_is_array_for_multiple_scopes() {
         .expect("multi-scope index status JSON must use the same envelope");
 
     assert_eq!(items.len(), 2);
-    assert_eq!(items[0]["project"], "Vetcoders/aicx");
+    assert_eq!(items[0]["project"], "vetcoders/aicx");
     assert_eq!(items[1]["project"], "Loctree/loctree-suite");
     assert_eq!(items[0]["status"]["project_bucket"], "vetcoders_aicx");
     assert_eq!(
@@ -887,6 +892,7 @@ fn intents_project_resolver_exact_and_fuzzy_modes_are_separate() {
         matched_project_buckets: fuzzy.selected.clone(),
         identity_source: intents::PERSISTED_IDENTITY_SOURCE.to_string(),
         path_heuristic_records: 0,
+        live_sessions: 0,
     };
     let complete = stats.completeness(None, 1);
     assert_eq!(
@@ -937,6 +943,7 @@ fn intents_json_envelope_reports_cap_warning_and_limit_saturation() {
             min_confidence: None,
             kind_filter: None,
             frame_kind: None,
+            live: false,
         })
         .expect("extract over-cap intents fixture");
     assert!(extraction.stats.dropped_candidates > 0);
@@ -1677,12 +1684,31 @@ fn index_defaults_to_materialization() {
 
     match cli.command {
         Some(Commands::Index {
-            dry_run, project, ..
+            dry_run,
+            project,
+            semantic,
+            ..
         }) => {
             assert!(!dry_run);
             assert!(project.is_empty());
+            assert!(!semantic);
         }
         _ => panic!("expected index command"),
+    }
+}
+
+#[test]
+fn index_accepts_semantic_flag() {
+    let cli = Cli::try_parse_from(["aicx", "index", "--semantic"])
+        .expect("index --semantic should parse");
+    match cli.command {
+        Some(Commands::Index {
+            semantic, dry_run, ..
+        }) => {
+            assert!(semantic);
+            assert!(!dry_run);
+        }
+        _ => panic!("expected index --semantic"),
     }
 }
 
@@ -2045,10 +2071,12 @@ fn serve_help_prefers_http_name_and_stays_compact() {
     assert!(rendered.contains("--no-require-auth"));
     assert!(!rendered.contains("Transport: stdio (default) or sse"));
     assert!(!rendered.contains("embedding mode"));
-    assert!(
-        rendered.lines().count() < 48,
-        "serve help should stay compact"
-    );
+    // The guard is against help bloat, not against `serve` gaining real
+    // flags — HTTP transport, auth, and the background refresh loop each
+    // brought their own. Raise the budget when a flag lands; treat a jump
+    // with no new flag as the bloat this test exists to catch.
+    let lines = rendered.lines().count();
+    assert!(lines <= 60, "serve help should stay compact, got {lines}");
 }
 
 #[test]
@@ -2084,7 +2112,7 @@ fn read_command_parses_discover_path_and_json_mode() {
     let cli = Cli::try_parse_from([
         "aicx",
         "read",
-        "store/Vetcoders/aicx/2026_0502/reports/codex/chunk.md",
+        "store/vetcoders/aicx/2026_0502/reports/codex/chunk.md",
         "--max-chars",
         "400",
         "--json",
@@ -2099,7 +2127,7 @@ fn read_command_parses_discover_path_and_json_mode() {
         }) => {
             assert_eq!(
                 reference,
-                "store/Vetcoders/aicx/2026_0502/reports/codex/chunk.md"
+                "store/vetcoders/aicx/2026_0502/reports/codex/chunk.md"
             );
             assert_eq!(max_chars, Some(400));
             assert!(json);
@@ -3051,11 +3079,11 @@ fn test_pipeline_redacts_once_before_dedup() {
     let kept = dedup_segments_per_repo(vec![seg], &mut state, false, |_| {});
     assert_eq!(kept.iter().map(|s| s.entries.len()).sum::<usize>(), 1);
     assert!(
-        !state.is_new("Vetcoders/aicx", &hash_redacted),
+        !state.is_new("vetcoders/aicx", &hash_redacted),
         "post-redact hash must be in seen_hashes after dedup"
     );
     assert!(
-        state.is_new("Vetcoders/aicx", &hash_raw),
+        state.is_new("vetcoders/aicx", &hash_raw),
         "pre-redact hash must NOT appear in seen_hashes — proves redaction ran before dedup"
     );
 }
@@ -3111,7 +3139,7 @@ fn test_dedup_keyed_per_canonical_repo() {
         &entry_a.message,
     );
     assert!(
-        !state.is_new("Vetcoders/repo-a", &hash),
+        !state.is_new("vetcoders/repo-a", &hash),
         "hash must be marked under repo-a's bucket"
     );
     // Different timestamps → different exact hashes. Just verify the
@@ -3122,7 +3150,7 @@ fn test_dedup_keyed_per_canonical_repo() {
         &entry_b.message,
     );
     assert!(
-        !state.is_new("Vetcoders/repo-b", &hash_b),
+        !state.is_new("vetcoders/repo-b", &hash_b),
         "hash must be marked under repo-b's bucket"
     );
 
@@ -3165,7 +3193,7 @@ fn test_dedup_keyed_per_canonical_repo() {
 fn test_full_rescan_dedups_across_segments_within_same_repo() {
     // Same content, same timestamp, same agent — both entries
     // produce identical `content_hash` and `overlap_hash`. The
-    // segments share a canonical repo (Vetcoders/repo-a) but live
+    // segments share a canonical repo (vetcoders/repo-a) but live
     // in distinct sessions (the realistic shape: one repo touched
     // by several Claude sessions over time).
     let dup_message = "echo across sessions";

@@ -30,6 +30,10 @@ pub mod auth;
 pub mod catalog;
 #[cfg(feature = "app")]
 pub mod cli;
+/// Multi-agent continuity pack (`aicx continuity show|write`) — deterministic
+/// session-resume surface built from live window + census, embedder-free.
+#[cfg(feature = "app")]
+pub mod continuity;
 #[cfg(feature = "app")]
 pub mod corpus;
 #[cfg(feature = "app")]
@@ -68,6 +72,8 @@ pub mod locks;
 mod locks;
 #[cfg(feature = "app")]
 pub mod mcp;
+#[cfg(feature = "app")]
+pub mod mcp_session;
 #[cfg(feature = "app")]
 pub mod oracle;
 #[cfg(not(feature = "app"))]
@@ -211,6 +217,7 @@ mod loctree_consumer_contract_tests {
             min_confidence: None,
             kind_filter: None,
             frame_kind: None,
+            live: false,
         };
         assert_eq!(
             config.effective_frame_kind(),

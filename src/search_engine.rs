@@ -531,6 +531,33 @@ fn select_semantic_bucket_scope<'a>(
     ))
 }
 
+/// Controlled conflict for a CURRENT generation whose lexical schema drifted
+/// from this binary. The classic cause is a file-sync tool (e.g. MEGA)
+/// replicating the machine-local `indexed/` directory between hosts running
+/// different aicx builds — name it instead of reporting mystery corruption.
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+fn lexical_schema_conflict_error(
+    manifest_path: &Path,
+    err: &aicx_retrieve::RetrieveError,
+) -> SemanticError {
+    let recommendation = match err {
+        aicx_retrieve::RetrieveError::LexicalSchemaTooNew { .. } => {
+            "this index was published by a newer aicx — upgrade this binary; \
+             do not rebuild, or you will downgrade the shared generation"
+                .to_string()
+        }
+        _ => "run `aicx index` to republish a supported generation, and exclude \
+              the machine-local index dir from any file sync (MEGA: add `-dN:indexed` \
+              to the sync root's .megaignore) so another host cannot overwrite it"
+            .to_string(),
+    };
+    SemanticError::RetrievalManifestStale {
+        path: manifest_path.to_path_buf(),
+        reason: format!("published CURRENT generation conflicts with this binary: {err}"),
+        recommendation,
+    }
+}
+
 /// Lexical-first retrieval against the published `_all` hybrid CURRENT
 /// generation (Tantivy only). No embedder bootstrap, no dense mmap, no
 /// primary-NDJSON rehash. Project/kind/frame/agent filters are metadata
@@ -584,6 +611,10 @@ fn try_lexical_search_native(
             recommendation: "run `aicx index` to rebuild the hybrid retrieval bucket".to_string(),
         }
     })?;
+
+    manifest
+        .ensure_lexical_schema_supported(aicx_retrieve::TANTIVY_SCHEMA_VERSION)
+        .map_err(|err| lexical_schema_conflict_error(&manifest_path, &err))?;
 
     // Fail closed when CURRENT did not resolve and the root still names the
     // retired brute-force NDJSON dense adapter (would otherwise hang).
@@ -1533,6 +1564,9 @@ fn load_hybrid_index(
             recommendation: "run `aicx index` to rebuild the hybrid retrieval bucket".to_string(),
         }
     })?;
+    manifest
+        .ensure_lexical_schema_supported(aicx_retrieve::TANTIVY_SCHEMA_VERSION)
+        .map_err(|err| lexical_schema_conflict_error(manifest_path, &err))?;
     let manifest_dir = crate::vector_index::hybrid_index_dir(project_filter).map_err(|err| {
         SemanticError::RetrievalManifestStale {
             path: manifest_path.to_path_buf(),
@@ -3284,7 +3318,7 @@ mod tests {
         echo.label = "echo".to_string();
         echo.density = 30.0;
         echo.matched_lines = vec![
-            "| Warm `-p VetCoders/vibecrafted 'routing strzałek taby'` | 0.27 s |".to_string(),
+            "| Warm `-p vetcoders/vibecrafted 'routing strzałek taby'` | 0.27 s |".to_string(),
         ];
         let mut answer = fuzzy(80, "conversations", "2026-07-22", None);
         answer.label = "answer".to_string();

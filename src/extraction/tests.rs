@@ -194,7 +194,7 @@ fn test_conversation_first_repo_project_identity() {
             role: "user".to_string(),
             message: "hello".to_string(),
             branch: None,
-            cwd: Some("/Users/user/hosted/Vetcoders/ai-contexters".to_string()),
+            cwd: Some("/Users/user/hosted/vetcoders/ai-contexters".to_string()),
             timestamp_source: None,
             source_path: None,
             source_sha256: None,
@@ -222,7 +222,7 @@ fn test_conversation_first_repo_project_identity() {
     assert_eq!(conv[1].repo_project, "ai-contexters");
     assert_eq!(
         conv[0].source_path.as_deref(),
-        Some("/Users/user/hosted/Vetcoders/ai-contexters")
+        Some("/Users/user/hosted/vetcoders/ai-contexters")
     );
     assert!(conv[1].source_path.is_none());
 }

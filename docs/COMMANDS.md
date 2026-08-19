@@ -14,8 +14,8 @@ aicx <command> --help
 ## Daily path
 
 ```bash
-# Refresh source identity and project attribution.
-aicx catalog rebuild
+# Bounded daily admission; also repairs cwd-guessed identities from git origin.
+aicx catalog refresh
 
 # Incrementally parse changed sources and publish CURRENT.
 aicx index
@@ -43,11 +43,48 @@ the published index remain the content owners.
 
 No command in the current ingestion or indexing path writes per-frame cards.
 
+## Wizard (TUI + vc-frame assimilation)
+
+```bash
+aicx wizard
+aicx wizard --view search
+aicx wizard --view search --query 'problemy dziwne' -p /pensieve -a claude
+```
+
+Screens: `1` sessions · `2` doctor · `3` intents · `4` refresh · `5` search.
+`/` from any screen opens the Search query box and switches to Search.
+
+Wizard entry infers the exact current `owner/repo` from git origin, performs a
+bounded hot refresh, and never requires a session id. Screen 4 runs hot refresh
+plus incremental indexing; full rebuild remains an explicit census repair.
+
+Search uses the same engine as `aicx search` (lexical CURRENT). Results always
+declare who answered (`index CURRENT …` vs `fallback FS (bounded, recency)`).
+Missing/stale index shows a drift banner + repair path — never silent empty.
+
+JSON surfaces for plugins / vc-frame Session Gallery:
+
+```bash
+aicx search --json '<query>'
+aicx sessions list --json
+aicx sessions list --cwd --json
+aicx sessions list -p /aicx --json
+aicx sessions show --json <session-id>
+# aliases also work: sessions list --format json
+```
+
+`sessions list -p` uses the same exact identity rules as search and
+MCP (`owner/repo`, `/repo`, `owner/`, unique bare name). An empty list
+for a resolved project prints `scanned=N; matched=0` — that is a
+project miss, not a missing source tree. `--cwd` matches the current
+checkout, including Grok's percent-encoded session roots.
+
 ## Catalog
 
 ```bash
 aicx catalog status
 aicx catalog status --json
+aicx catalog refresh
 aicx catalog rebuild
 aicx catalog resolve <session-id>
 ```
@@ -58,8 +95,8 @@ source roots **without writing**. Classes:
 | Class | Meaning | Operator move |
 |---|---|---|
 | `current` | catalog size+mtime matches live file | none |
-| `stale` | same session, live append/edit | rebuild stamps fingerprints; index already re-parses on live fp |
-| `unadmitted` | live primary source not in catalog | `aicx catalog rebuild` |
+| `stale` | same session, live append/edit | `aicx catalog refresh`; index already re-parses on live fp |
+| `unadmitted` | live primary source not in catalog | `aicx catalog refresh` |
 | `missing_source` | catalog path does not resolve here | fix paths / sync sources onto this host |
 | `fingerprint_unknown` | no usable stats | rebuild to stamp `source_len` / `source_mtime_ns` |
 
@@ -71,8 +108,14 @@ Orthogonal surfaces:
 - **index status** = is CURRENT lagging the catalog/corpus?
 
 `catalog rebuild` walks the registered Claude, Codex, Grok, Gemini, Junie, and
-Vibecrafted runtime roots. It writes the compact catalog and prints counts; it
-does not materialize session content.
+Vibecrafted runtime roots. It writes the compact catalog and prints counts,
+including `pending_chunks`. It does not materialize session content unless
+`--with-chunks` is passed, which drains the lag through `aicx index`.
+
+`catalog refresh` scans only a bounded hot window, merges new/changed sessions
+under the catalog lock, and reattributes existing rows whose `cwd` resolves to
+a git origin. It refuses to create an initial partial census: one full rebuild
+is still required on a new AICX home.
 
 ### Multi-machine / sync (operator truth)
 
@@ -115,18 +158,31 @@ not card-mill files.
 
 ```bash
 aicx index --dry-run
-aicx index
+aicx index                    # lexical CURRENT only (default, every machine)
+aicx index --semantic         # opt-in dense mmap (owner workstation)
 aicx index --cache-extracts
 aicx index --full-rescan
-aicx index status
+aicx index status             # lexical_status + dense_status planes
 ```
 
 Persistent indexing always owns the global `_all` generation. `-p` on
 `aicx index` limits dry-run inspection only; `aicx search -p` filters the
 global catalog metadata.
 
+**Planes (feature, not bug):**
+
+| Command | What it publishes |
+|---|---|
+| `aicx index` | Tantivy lexical only (`dense_kind=optional_not_built`) |
+| `aicx index --semantic` | Lexical + `dense.exact_mmap_v1.bin` via configured embedder |
+
+Default search is lexical-first. Dense rerank needs `--semantic` once on the
+owner host, then `aicx search --deep`.
+
 Incremental reuse is gated by the live source fingerprint. A changed existing
 session reparses on the next run even when no catalog rebuild happened.
+`--semantic` will rebuild when dense is missing even if lexical CURRENT
+already matches.
 
 Signal filtering keeps user messages, agent replies, plans, and reports while
 dropping tool-call noise, internal thought, system reminders, and image/base64
@@ -181,8 +237,8 @@ aicx wizard
 `index status` is bounded and reports `missing` or `pending_scan_timeout`
 instead of silently walking the operator home without a deadline.
 
-The wizard's Rebuild screen runs `catalog rebuild` followed by `index`; it
-does not shell a removed command.
+The wizard's Refresh screen runs `catalog refresh` followed by incremental
+`index`; it does not turn the daily UI into a full source-root walk.
 
 ## Legacy archive and migration
 

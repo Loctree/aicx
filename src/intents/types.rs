@@ -70,11 +70,27 @@ pub struct IntentsConfig {
     pub min_confidence: Option<u8>,
     pub kind_filter: Option<IntentKind>,
     pub frame_kind: Option<FrameKind>,
+    /// Hot-window mode: also admit sessions the durable catalog census does
+    /// not know yet (unadmitted) and catalog rows whose live mtime is inside
+    /// the window even though their rebuild-time date fell outside it. Those
+    /// records carry the `open_session`/`live_unverified` honesty frame.
+    pub live: bool,
 }
+
+/// Widest retrieval window that turns the live source scan on by default.
+/// Beyond this the census/index is authoritative and a live walk would only
+/// add cost without hot-window value.
+pub const LIVE_WINDOW_MAX_HOURS: u64 = 48;
 
 impl IntentsConfig {
     pub fn default_frame_kind() -> FrameKind {
         FrameKind::UserMsg
+    }
+
+    /// Default live-window rule shared by every surface (CLI, MCP, wizard):
+    /// hot when a bounded window of ≤ [`LIVE_WINDOW_MAX_HOURS`] is requested.
+    pub fn auto_live(hours: u64) -> bool {
+        hours > 0 && hours <= LIVE_WINDOW_MAX_HOURS
     }
 
     pub fn effective_frame_kind(&self) -> FrameKind {
@@ -94,6 +110,10 @@ pub struct IntentExtractionStats {
     pub matched_project_buckets: Vec<String>,
     pub identity_source: String,
     pub path_heuristic_records: usize,
+    /// Sessions admitted through the live window (open/unadmitted sources
+    /// newer than the catalog census). 0 when live mode was off or nothing
+    /// was fresher than the census.
+    pub live_sessions: usize,
 }
 
 /// Machine-readable honesty about whether an intents payload is exhaustive.
@@ -119,6 +139,10 @@ pub struct IntentsCompleteness {
     pub matched_project_buckets: Vec<String>,
     pub orphaned_buckets: Vec<String>,
     pub identity_source: String,
+    /// Sessions admitted through the hot live window (open/unadmitted
+    /// sources newer than the catalog census).
+    #[serde(default)]
+    pub live_sessions: usize,
     #[serde(default)]
     pub warnings: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -190,6 +214,12 @@ impl IntentExtractionStats {
                 self.source_errors
             ));
         }
+        if self.live_sessions > 0 {
+            warnings.push(format!(
+                "{} session(s) admitted from the live window (open/unadmitted, unverified)",
+                self.live_sessions
+            ));
+        }
 
         IntentsCompleteness {
             complete,
@@ -201,6 +231,7 @@ impl IntentExtractionStats {
             matched_project_buckets: self.matched_project_buckets.clone(),
             orphaned_buckets,
             identity_source: self.identity_source.clone(),
+            live_sessions: self.live_sessions,
             warnings,
             requested_limit,
             available_before_limit,
@@ -228,6 +259,13 @@ pub(super) struct StoredChunkFile {
     pub(super) session_id: String,
     pub(super) honesty: ClaimHonesty,
     pub(super) transcript_entries: Option<Vec<TranscriptEntry>>,
+    /// Chunk document already held in memory, read from the committed lexical
+    /// index instead of the original transcript.
+    ///
+    /// The index stores the canonical extract verbatim (`ChunkRef.text`), so
+    /// this is the same document `parse_chunk_document` would reconstruct
+    /// from disk — minus the re-parse of megabytes of raw JSONL.
+    pub(super) body: Option<String>,
 }
 
 #[derive(Debug, Clone)]

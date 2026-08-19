@@ -27,6 +27,7 @@ use crate::api;
 use crate::auth::{self, AuthConfig};
 use crate::intents::{self, IntentKind, IntentsConfig};
 use crate::legacy_archive;
+use crate::mcp_session;
 use crate::oracle::OracleStatus;
 use crate::rank;
 use crate::timeline::{FrameKind, Kind};
@@ -44,6 +45,8 @@ const MCP_SESSION_IDLE_TTL: Duration = Duration::from_secs(30 * 60);
 const MCP_SESSION_MAX_SESSIONS: usize = 1000;
 const MCP_SESSION_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 const MCP_IDLE_MEMORY_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+pub const MCP_AUTO_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
+pub const MCP_AUTO_REFRESH_HOURS: u64 = 48;
 
 /// Default time without an MCP tool request before request-derived memory is
 /// reclaimed. Search/index/corpus data is loaded inside each request rather
@@ -62,14 +65,82 @@ const MCP_EMBEDDER_NEGATIVE_TTL: Duration = Duration::from_secs(5 * 60);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct McpLifecycleConfig {
     pub idle_memory_drop_after: Duration,
+    pub auto_refresh_interval: Option<Duration>,
+    pub auto_refresh_hours: u64,
 }
 
 impl Default for McpLifecycleConfig {
     fn default() -> Self {
         Self {
             idle_memory_drop_after: MCP_IDLE_MEMORY_DROP_AFTER,
+            auto_refresh_interval: Some(MCP_AUTO_REFRESH_INTERVAL),
+            auto_refresh_hours: MCP_AUTO_REFRESH_HOURS,
         }
     }
+}
+
+fn refresh_catalog_and_index(hours: u64) -> anyhow::Result<()> {
+    let aicx_home = crate::aicx_home::resolve()?;
+    let user_home = crate::os_user_home()
+        .ok_or_else(|| anyhow::anyhow!("cannot resolve user home for MCP auto-refresh"))?;
+    let cutoff = chrono::Utc::now() - chrono::Duration::hours(hours.min(720) as i64);
+    let cutoff_ns = cutoff
+        .timestamp_nanos_opt()
+        .map(|value| value.max(0) as u128)
+        .unwrap_or(0);
+    let refresh = crate::catalog::refresh_hot(&aicx_home, &user_home, cutoff_ns)?;
+    let status = crate::api::index_status_at(&aicx_home, None).ok();
+    let pending = status
+        .as_ref()
+        .map(|status| status.pending_chunks)
+        .unwrap_or(0);
+    let index_current = status.as_ref().is_some_and(|status| {
+        status.readiness == crate::api::IndexReadiness::Ready && status.lexical_status == "ready"
+    });
+
+    if refresh.changed_sessions == 0
+        && refresh.admitted_sessions == 0
+        && refresh.reattributed_sessions == 0
+        && pending == 0
+        && index_current
+    {
+        tracing::debug!(target: "mcp.refresh", "MCP auto-refresh: catalog and index already current");
+        return Ok(());
+    }
+
+    let _lock = crate::locks::acquire_exclusive(crate::locks::lance_lock_path()?)?;
+    let report = crate::source_index::build(&aicx_home, &[], false, false, false, false)?;
+    tracing::info!(
+        target: "mcp.refresh",
+        changed_sessions = refresh.changed_sessions,
+        admitted_sessions = refresh.admitted_sessions,
+        reattributed_sessions = refresh.reattributed_sessions,
+        pending_chunks_before = pending,
+        lexical_docs = report.lexical_docs,
+        unchanged = report.unchanged,
+        wall_ms = report.wall_ms,
+        "MCP auto-refresh published the current lexical index"
+    );
+    Ok(())
+}
+
+fn spawn_mcp_auto_refresh(interval: Duration, hours: u64) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            ticker.tick().await;
+            match tokio::task::spawn_blocking(move || refresh_catalog_and_index(hours)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    tracing::warn!(target: "mcp.refresh", %error, "MCP auto-refresh failed")
+                }
+                Err(error) => {
+                    tracing::warn!(target: "mcp.refresh", %error, "MCP auto-refresh worker failed")
+                }
+            }
+        }
+    });
 }
 
 #[derive(Debug)]
@@ -801,6 +872,62 @@ pub struct IndexStatusParams {
     /// slug rules the index writer uses on disk.
     #[serde(default)]
     pub project: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SessionsParams {
+    /// Exact project filter (`owner/repo`, `owner/`, `/repo`, or a unique bare name).
+    /// Empty result for a resolved project means that project has no sessions,
+    /// not that discovery failed. Ambiguous or unknown bare names fail closed.
+    pub project: Option<String>,
+    /// Optional additional exact project filters.
+    pub projects: Option<Vec<String>>,
+    /// Project identity matching: `exact` (default) or explicit `fuzzy`.
+    pub project_match: Option<String>,
+    /// Filter by agent: claude, codex, gemini, junie, grok.
+    pub agent: Option<String>,
+    /// Hours to look back (default 720 = 30 days, 0 = all time).
+    #[serde(default = "mcp_session::default_list_hours")]
+    pub hours: u64,
+    /// Optional lower date bound (YYYY-MM-DD).
+    pub since: Option<String>,
+    /// Max sessions to return (default 20, 0 = all).
+    #[serde(default = "mcp_session::default_list_limit")]
+    pub limit: usize,
+}
+
+fn default_session_conversation() -> bool {
+    true
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SessionParams {
+    /// Session id or unique prefix. Ambiguous prefixes fail closed with candidates.
+    pub session: String,
+    /// Optional agent so a shared prefix is not searched across every runtime.
+    pub agent: Option<String>,
+    /// Include the conversation extract (default true). Metadata is always returned.
+    #[serde(default = "default_session_conversation")]
+    pub conversation: bool,
+    /// Keep only user turns in the extract.
+    #[serde(default)]
+    pub user_only: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ContinuityParams {
+    /// Exact project filter. Required — MCP cannot infer the operator checkout.
+    pub project: Option<String>,
+    /// Optional additional exact project filters.
+    pub projects: Option<Vec<String>>,
+    /// Project identity matching: `exact` (default) or explicit `fuzzy`.
+    pub project_match: Option<String>,
+    /// Window in hours (default 24, matching `aicx continuity show`).
+    #[serde(default = "mcp_session::default_continuity_hours")]
+    pub hours: u64,
+    /// Bound the markdown to the prompt-inject budget.
+    #[serde(default)]
+    pub for_inject: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -1733,6 +1860,7 @@ impl AicxMcpServer {
             min_confidence: params.min_confidence,
             kind_filter,
             frame_kind: params.frame_kind,
+            live: IntentsConfig::auto_live(params.hours),
         };
 
         let extraction =
@@ -1816,6 +1944,111 @@ impl AicxMcpServer {
         })?;
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
+
+    #[tool(
+        name = "aicx_sessions",
+        description = "List live agent sessions the way `aicx sessions list` does: agent, project/root, id, title, updated, live. Project filters are exact (owner/repo, owner/, /repo, unique bare name). An empty list for a resolved project means that project has no sessions in the window — scanned/matched counts are always returned. Unknown or ambiguous project ids fail closed; this is not an index search and does not rebuild anything."
+    )]
+    async fn sessions_list(
+        &self,
+        Parameters(params): Parameters<SessionsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let _request_activity = self.idle_memory.begin_request();
+        tracing::info!(target: "mcp.audit", tool_name = "aicx_sessions", "mcp tool invoked");
+        validate_string_len(params.project.as_deref(), 4096, "project")?;
+        validate_string_len(params.agent.as_deref(), 64, "agent")?;
+        validate_string_len(params.since.as_deref(), 32, "since")?;
+        validate_string_len(params.project_match.as_deref(), 32, "project_match")?;
+        if let Some(projects) = &params.projects {
+            for (i, project) in projects.iter().enumerate() {
+                validate_string_len(Some(project), 4096, &format!("projects[{i}]"))?;
+            }
+        }
+        let project_match = parse_project_match(params.project_match.as_deref())?;
+        let user_home = crate::os_user_home()
+            .ok_or_else(|| McpError::internal_error("No operator home directory", None))?;
+        let aicx_home = crate::aicx_home::ensure()
+            .map_err(|e| McpError::internal_error(format!("AICX home error: {e}"), None))?;
+        let projects = params.projects.unwrap_or_default();
+        let payload = mcp_session::list_sessions(mcp_session::ListSessionsRequest {
+            user_home: &user_home,
+            aicx_home: &aicx_home,
+            project: params.project.as_deref(),
+            projects: &projects,
+            project_match,
+            agent: params.agent.as_deref(),
+            hours: params.hours,
+            since: params.since.as_deref(),
+            limit: params.limit,
+        })
+        .map_err(mcp_session::SessionSurfaceError::into_mcp)?;
+        let json = serde_json::to_string(&payload)
+            .map_err(|e| McpError::internal_error(format!("Serialize sessions JSON: {e}"), None))?;
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    #[tool(
+        name = "aicx_session",
+        description = "Open one session by id or unique prefix: metadata plus the conversation extract (`aicx sessions show` + `aicx extract <agent> --session … --conversation`). Ambiguous prefixes and missing ids fail closed with candidate counts. Does not attach or resume a provider session."
+    )]
+    async fn session_show(
+        &self,
+        Parameters(params): Parameters<SessionParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let _request_activity = self.idle_memory.begin_request();
+        tracing::info!(target: "mcp.audit", tool_name = "aicx_session", "mcp tool invoked");
+        validate_string_len(Some(params.session.as_str()), 256, "session")?;
+        validate_string_len(params.agent.as_deref(), 64, "agent")?;
+        let user_home = crate::os_user_home()
+            .ok_or_else(|| McpError::internal_error("No operator home directory", None))?;
+        let payload = mcp_session::show_session(mcp_session::ShowSessionRequest {
+            user_home: &user_home,
+            session: &params.session,
+            agent: params.agent.as_deref(),
+            conversation: params.conversation,
+            user_only: params.user_only,
+        })
+        .map_err(mcp_session::SessionSurfaceError::into_mcp)?;
+        let json = serde_json::to_string(&payload)
+            .map_err(|e| McpError::internal_error(format!("Serialize session JSON: {e}"), None))?;
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    #[tool(
+        name = "aicx_continuity",
+        description = "Render the multi-agent continuity pack (NOW / PEERS / DECISIONS / TASKS / SOURCES / INDEX HEALTH) from a live parse, same as `aicx continuity show`. Project filter is required and exact. The pack is context transport only: it never selects native resume and never tells the agent to recover or continue a previous provider session."
+    )]
+    async fn continuity(
+        &self,
+        Parameters(params): Parameters<ContinuityParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let _request_activity = self.idle_memory.begin_request();
+        tracing::info!(target: "mcp.audit", tool_name = "aicx_continuity", "mcp tool invoked");
+        validate_string_len(params.project.as_deref(), 4096, "project")?;
+        validate_string_len(params.project_match.as_deref(), 32, "project_match")?;
+        if let Some(projects) = &params.projects {
+            for (i, project) in projects.iter().enumerate() {
+                validate_string_len(Some(project), 4096, &format!("projects[{i}]"))?;
+            }
+        }
+        let project_match = parse_project_match(params.project_match.as_deref())?;
+        let aicx_home = crate::aicx_home::ensure()
+            .map_err(|e| McpError::internal_error(format!("AICX home error: {e}"), None))?;
+        let projects = params.projects.unwrap_or_default();
+        let payload = mcp_session::continuity_pack(mcp_session::ContinuityRequest {
+            aicx_home: &aicx_home,
+            project: params.project.as_deref(),
+            projects: &projects,
+            project_match,
+            hours: params.hours,
+            for_inject: params.for_inject,
+        })
+        .map_err(mcp_session::SessionSurfaceError::into_mcp)?;
+        let json = serde_json::to_string(&payload).map_err(|e| {
+            McpError::internal_error(format!("Serialize continuity JSON: {e}"), None)
+        })?;
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
 }
 
 // ============================================================================
@@ -1853,6 +2086,9 @@ pub const MCP_TOOL_SURFACE: &[&str] = &[
     "aicx_steer",
     "aicx_intents",
     "aicx_index_status",
+    "aicx_sessions",
+    "aicx_session",
+    "aicx_continuity",
 ];
 
 /// Run MCP server over stdio transport.
@@ -1965,6 +2201,9 @@ pub async fn run_http_config_with_lifecycle(
     spawn_mcp_session_cleanup(session_manager.clone(), MCP_SESSION_SWEEP_INTERVAL);
     let idle_memory = Arc::new(McpIdleMemoryManager::new(lifecycle.idle_memory_drop_after));
     spawn_mcp_idle_memory_cleanup(idle_memory.clone(), MCP_IDLE_MEMORY_SWEEP_INTERVAL);
+    if let Some(interval) = lifecycle.auto_refresh_interval {
+        spawn_mcp_auto_refresh(interval, lifecycle.auto_refresh_hours);
+    }
     let service = rmcp::transport::streamable_http_server::StreamableHttpService::new(
         move || Ok(AicxMcpServer::with_idle_memory(idle_memory.clone())),
         session_manager,
@@ -2114,15 +2353,17 @@ fn validate_score_filter(score: Option<u8>) -> Result<Option<u8>, McpError> {
 mod tests {
     use super::{
         AicxMcpServer, AicxSessionManager, AicxSessionManagerError, MAX_SCORE_FILTER,
-        MCP_EMBEDDER_NEGATIVE_TTL, MCP_SESSION_IDLE_TTL, MCP_SESSION_MAX_SESSIONS,
-        MCP_SESSION_SWEEP_INTERVAL, McpHttpConfig, McpIdleMemoryManager, McpSemanticFallbackNotice,
-        McpTransport, RankItem, RankResponse, SearchParams, SteerResponse, background_refresh_args,
+        MCP_AUTO_REFRESH_HOURS, MCP_AUTO_REFRESH_INTERVAL, MCP_EMBEDDER_NEGATIVE_TTL,
+        MCP_SESSION_IDLE_TTL, MCP_SESSION_MAX_SESSIONS, MCP_SESSION_SWEEP_INTERVAL, McpHttpConfig,
+        McpIdleMemoryManager, McpLifecycleConfig, McpSemanticFallbackNotice, McpTransport,
+        RankItem, RankResponse, SearchParams, SteerResponse, background_refresh_args,
         build_mcp_semantic_filters, configured_mcp_session_manager,
         inject_mcp_filter_pushdown_payload, inject_mcp_semantic_fallback_payload,
         parse_date_filter_mcp, parse_project_match, resolve_mcp_projects,
         spawn_mcp_session_cleanup, validate_http_auth_policy, validate_score_filter,
         validate_string_len,
     };
+
     use crate::auth::{AuthConfig, AuthSource};
     use crate::oracle::OracleStatus;
     use clap::ValueEnum as _;
@@ -2134,6 +2375,16 @@ mod tests {
         sync::Arc,
         time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
+
+    #[test]
+    fn http_lifecycle_defaults_to_bounded_auto_refresh() {
+        let lifecycle = McpLifecycleConfig::default();
+        assert_eq!(
+            lifecycle.auto_refresh_interval,
+            Some(MCP_AUTO_REFRESH_INTERVAL)
+        );
+        assert_eq!(lifecycle.auto_refresh_hours, MCP_AUTO_REFRESH_HOURS);
+    }
 
     fn project_store_root(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -2285,13 +2536,13 @@ mod tests {
     #[test]
     fn rank_response_serializes_as_compact_json() {
         let json = serde_json::to_string(&RankResponse {
-            project: "Vetcoders/ai-contexters".to_string(),
+            project: "vetcoders/ai-contexters".to_string(),
             hours: 72,
             strict: true,
             results: 1,
             items: vec![RankItem {
                 file: "chunk.md".to_string(),
-                project: "Vetcoders/ai-contexters".to_string(),
+                project: "vetcoders/ai-contexters".to_string(),
                 date: "2026-03-31".to_string(),
                 timestamp: Some("2026-03-31T10:00:00Z".to_string()),
                 kind: "reports".to_string(),
@@ -2322,7 +2573,7 @@ mod tests {
             results: 1,
             items: vec![serde_json::json!({
                 "path": "/tmp/chunk.md",
-                "project": "Vetcoders/ai-contexters",
+                "project": "vetcoders/ai-contexters",
                 "agent": "codex",
                 "kind": "reports",
             })],
@@ -2543,6 +2794,9 @@ mod tests {
             "aicx_steer",
             "aicx_intents",
             "aicx_index_status",
+            "aicx_sessions",
+            "aicx_session",
+            "aicx_continuity",
         ];
         assert_eq!(
             super::MCP_TOOL_SURFACE.len(),
@@ -2603,6 +2857,7 @@ mod tests {
             ],
             identity_source: crate::intents::PERSISTED_IDENTITY_SOURCE.to_string(),
             path_heuristic_records: 0,
+            live_sessions: 0,
         };
         let completeness = stats.completeness(Some(1), 3).with_project_scope(
             "exact",

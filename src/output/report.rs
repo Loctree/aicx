@@ -529,12 +529,15 @@ fn write_markdown_header(w: &mut impl Write, metadata: &ReportMetadata) -> Resul
         "| Generated | {} |",
         metadata.generated_at.format("%Y-%m-%d %H:%M:%S UTC")
     )?;
+    // Same correction as the conversation header: these two carry the
+    // resolved project identity and the age of the oldest entry, not a
+    // filter and not a requested window.
     writeln!(
         w,
-        "| Filter | {} |",
+        "| Project | {} |",
         metadata.project_filter.as_deref().unwrap_or("(all)")
     )?;
-    writeln!(w, "| Period | last {} hours |", metadata.hours_back)?;
+    writeln!(w, "| Oldest entry | {} h ago |", metadata.hours_back)?;
     writeln!(w, "| Entries | {} |", metadata.total_entries)?;
     writeln!(w, "| Sessions | {} |", metadata.sessions.len())?;
     writeln!(w)?;
@@ -655,15 +658,15 @@ pub(crate) fn write_formatted_message(w: &mut impl Write, message: &str) -> Resu
         // backticks (and any HTML/markdown they contain) cannot break out.
         write_blockquote_with_code(w, body)?;
     } else if !is_multiline {
-        // Single line: markdown `>` blockquote with HTML escape.
-        writeln!(w, "> {}", html_escape(body))?;
+        // Single line: markdown `>` blockquote, verbatim.
+        writeln!(w, "> {body}")?;
     } else {
-        // Multi-line plain text: markdown `>` blockquote per line, HTML-escaped.
+        // Multi-line plain text: markdown `>` blockquote per line, verbatim.
         for line in body.lines() {
             if line.is_empty() {
                 writeln!(w, ">")?;
             } else {
-                writeln!(w, "> {}", html_escape(line))?;
+                writeln!(w, "> {line}")?;
             }
         }
         writeln!(w)?;
@@ -691,16 +694,13 @@ fn write_blockquote_with_code(w: &mut impl Write, message: &str) -> Result<()> {
     Ok(())
 }
 
-/// HTML-escape the five characters that can break out of markdown blockquote
-/// rendering when the downstream renderer treats raw HTML as live markup.
-fn html_escape(input: &str) -> String {
-    input
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&#39;")
-}
+// Escaping belongs to whoever turns this markdown into HTML, not to the
+// artifact. The extract is the canonical record of what was said, and every
+// renderer we ship already escapes on the way out — `AicxMarkdown` in
+// `dashboard_inline_markdown.js` escapes `& < >` on every line before
+// inlining. Escaping here on top of that produced `&amp;lt;` on screen, and
+// turned every apostrophe in a transcript into `&#39;` for the agents and
+// operators who read these files raw. Fidelity in, escaping at the edge.
 
 /// Pick a code fence one backtick longer than the longest run inside `content`
 /// (minimum 3). Guarantees the fence cannot be closed early by inner backticks.

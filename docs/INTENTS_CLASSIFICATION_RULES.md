@@ -44,23 +44,41 @@ Source anchors:
 - `EntryType`: `crates/aicx-parser/src/types.rs`
 - 11-type to 4-bucket mapping: `src/intents.rs::entry_type_to_timeline_kind`
 
-## Pre-Classification File Selection
+## Pre-Classification Document Selection
 
-Before any line is classified, `aicx intents` selects stored canonical chunks:
+Before any line is classified, `aicx intents` gathers chunk documents. There
+are two sources, tried in order.
 
-1. Scans canonical chunk markdown files.
-2. Keeps only `.md` files.
-3. Filters by project using a case-insensitive substring match on the stored
-   project slug/path.
-4. Loads the sidecar metadata when available.
-5. Skips Loctree context pack chunks.
-6. Skips sidecars marked as example truth.
-7. Applies `frame_kind`; default is `user_msg`.
-8. Applies the time cutoff using the canonical chunk date from the store layout.
-   Filesystem `mtime` is only fallback when canonical date parsing fails.
+### 1. The committed lexical index (default)
 
-Default consequence: ordinary `aicx intents -p X` reads `user_msg` chunks, not
-agent reply chunks. Agent reply chunks require explicit `--frame-kind`.
+`aicx index` already stores every session's canonical extract verbatim next to
+its resolved identity, so intent extraction reads those documents back instead
+of re-parsing the original transcripts:
+
+1. Opens the published `CURRENT` generation under the active AICX home.
+2. Filters by project on the stored slug, through the same
+   `project_filter_matches` resolver the rest of the CLI uses.
+3. Filters by the stored canonical date against the requested window.
+4. Reads back the stored body — the extract — plus `agent`, `date`,
+   `session_id` and `cwd` from the document metadata.
+5. Narrows frames to `frame_kind`; default is `user_msg`.
+
+Records gathered this way carry `identity_source: index-v1`.
+
+### 2. The catalog census (fallback)
+
+Used when the index cannot answer: no published `CURRENT` on this machine, or
+a hot-window request (`--live`, or a window of 48h or less) where freshly
+written sessions are not committed yet. This path walks the census and parses
+the original transcripts, applying the same project, window and `frame_kind`
+narrowing. Records carry `identity_source: catalog-v1`.
+
+The fallback exists so a machine that never ran `aicx index` still gets a
+timeline rather than a confident empty one.
+
+Default consequence, on both paths: ordinary `aicx intents -p X` reads
+`user_msg` frames, not agent replies. Agent replies require an explicit
+`--frame-kind`.
 
 Source anchors:
 

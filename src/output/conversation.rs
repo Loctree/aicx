@@ -53,12 +53,16 @@ pub fn write_conversation_markdown_with_redaction(
         "| Generated | {} |",
         metadata.generated_at.format("%Y-%m-%d %H:%M:%S UTC")
     )?;
+    // `project_filter` is the resolved project identity, and `hours_back` is
+    // the age of the oldest entry — neither is a query the caller made, so
+    // labelling them Filter/Period made a single-session extract read as a
+    // time-windowed search that had been narrowed to one repository.
     writeln!(
         file,
-        "| Filter | {} |",
+        "| Project | {} |",
         metadata.project_filter.as_deref().unwrap_or("(all)")
     )?;
-    writeln!(file, "| Period | last {} hours |", metadata.hours_back)?;
+    writeln!(file, "| Oldest entry | {} h ago |", metadata.hours_back)?;
     writeln!(file, "| Messages | {} |", messages.len())?;
     writeln!(file, "| Sessions | {} |", metadata.sessions.len())?;
     writeln!(file)?;

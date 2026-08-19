@@ -14,10 +14,11 @@ Usually required for non-loopback:
 Optional assertions:
   AICX_MCP_EXPECT_ROWS              exact semantic_index_rows value
   AICX_MCP_EXPECT_READINESS         exact index readiness value
-  AICX_MCP_EXPECT_BACKEND           expected search backend (default: hybrid_rrf)
+  AICX_MCP_EXPECT_BACKEND           exact expected search backend (default: any healthy backend)
   AICX_MCP_EXPECT_SOURCE_CONTAINS   substring that must appear in search output
   AICX_MCP_QUERY                    search query (default: po co Silverowi model embeddingowy)
   AICX_MCP_TIMEOUT                  curl max-time seconds (default: 8)
+  AICX_MCP_RETRIES                  retries after HTTP 429 (default: 4; backoff 1,2,4,8s)
   AICX_MCP_SKIP_NOAUTH_CHECK=1      skip unauthenticated /mcp rejection check
 
 Example:
@@ -54,9 +55,15 @@ timeout="${AICX_MCP_TIMEOUT:-8}"
 query="${AICX_MCP_QUERY:-po co Silverowi model embeddingowy}"
 expect_rows="${AICX_MCP_EXPECT_ROWS:-}"
 expect_readiness="${AICX_MCP_EXPECT_READINESS:-}"
-expect_backend="${AICX_MCP_EXPECT_BACKEND:-hybrid_rrf}"
+expect_backend="${AICX_MCP_EXPECT_BACKEND:-}"
 expect_source="${AICX_MCP_EXPECT_SOURCE_CONTAINS:-}"
 skip_noauth="${AICX_MCP_SKIP_NOAUTH_CHECK:-0}"
+max_retries="${AICX_MCP_RETRIES:-4}"
+
+if ! [[ "$max_retries" =~ ^[0-9]+$ ]]; then
+  echo "ERROR: AICX_MCP_RETRIES must be a non-negative integer" >&2
+  exit 2
+fi
 
 if [[ "$url" == */mcp ]]; then
   health_url="${AICX_MCP_HEALTH_URL:-${url%/mcp}/health}"
@@ -173,6 +180,38 @@ post_mcp() {
     "$url"
 }
 
+retry_after_seconds() {
+  local headers="$1"
+  local value
+  value="$(awk 'tolower($1) == "retry-after:" { print $2; exit }' "$headers" | tr -d '\r')"
+  if [[ "$value" =~ ^[1-9][0-9]*$ ]]; then
+    printf '%s\n' "$value"
+  fi
+}
+
+post_mcp_with_backoff() {
+  local request="$1"
+  local headers="$2"
+  local body="$3"
+  shift 3
+  local attempt=0
+  local delay
+
+  while true; do
+    post_mcp "$request" "$headers" "$body" "$@"
+    if [[ "$(status_code "$headers")" != "429" || "$attempt" -ge "$max_retries" ]]; then
+      return 0
+    fi
+    delay="$(retry_after_seconds "$headers")"
+    if [[ -z "$delay" ]]; then
+      delay=$((1 << attempt))
+    fi
+    echo "rate limited: retry $((attempt + 1))/$max_retries after ${delay}s" >&2
+    sleep "$delay"
+    attempt=$((attempt + 1))
+  done
+}
+
 assert_http_status() {
   local name="$1"
   local headers="$2"
@@ -217,7 +256,7 @@ if [[ -n "$token" ]]; then
 fi
 
 echo "== initialize =="
-post_mcp "$(json_request initialize)" "$workdir/init.headers" "$workdir/init.body" "${auth_args[@]}"
+post_mcp_with_backoff "$(json_request initialize)" "$workdir/init.headers" "$workdir/init.body" "${auth_args[@]}"
 assert_http_status "initialize" "$workdir/init.headers" "200"
 session_id="$(session_id_from_headers "$workdir/init.headers")"
 if [[ -z "$session_id" ]]; then
@@ -227,7 +266,7 @@ fi
 echo "initialize: PASS (session $session_id)"
 
 echo "== initialized notification =="
-post_mcp "$(json_request initialized)" "$workdir/initialized.headers" "$workdir/initialized.body" \
+post_mcp_with_backoff "$(json_request initialized)" "$workdir/initialized.headers" "$workdir/initialized.body" \
   "${auth_args[@]}" \
   -H "Mcp-Session-Id: $session_id"
 initialized_status="$(status_code "$workdir/initialized.headers")"
@@ -238,7 +277,7 @@ fi
 echo "initialized: PASS (${initialized_status})"
 
 echo "== tools/list =="
-post_mcp "$(json_request tools_list)" "$workdir/tools.headers" "$workdir/tools.body" \
+post_mcp_with_backoff "$(json_request tools_list)" "$workdir/tools.headers" "$workdir/tools.body" \
   "${auth_args[@]}" \
   -H "Mcp-Session-Id: $session_id"
 assert_http_status "tools/list" "$workdir/tools.headers" "200"
@@ -249,7 +288,7 @@ fi
 echo "tools/list: PASS"
 
 echo "== aicx_index_status =="
-post_mcp "$(json_request tool_call aicx_index_status '{}')" \
+post_mcp_with_backoff "$(json_request tool_call aicx_index_status '{}')" \
   "$workdir/status.headers" \
   "$workdir/status.body" \
   "${auth_args[@]}" \
@@ -284,7 +323,7 @@ import sys
 print(json.dumps({"query": sys.argv[1], "limit": 1, "slim": True}, ensure_ascii=False))
 PY
 )"
-post_mcp "$(json_request tool_call aicx_search "$search_args")" \
+post_mcp_with_backoff "$(json_request tool_call aicx_search "$search_args")" \
   "$workdir/search.headers" \
   "$workdir/search.body" \
   "${auth_args[@]}" \

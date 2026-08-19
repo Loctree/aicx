@@ -36,6 +36,14 @@ pub enum AgentKind {
 }
 
 impl AgentKind {
+    pub const ALL: [Self; 5] = [
+        Self::Claude,
+        Self::Codex,
+        Self::Gemini,
+        Self::Junie,
+        Self::Grok,
+    ];
+
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Claude => "claude",
@@ -43,6 +51,38 @@ impl AgentKind {
             Self::Gemini => "gemini",
             Self::Junie => "junie",
             Self::Grok => "grok",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "claude" => Some(Self::Claude),
+            "codex" => Some(Self::Codex),
+            "gemini" | "gemini-antigravity" => Some(Self::Gemini),
+            "junie" => Some(Self::Junie),
+            "grok" => Some(Self::Grok),
+            _ => None,
+        }
+    }
+
+    /// On-disk session root for this agent under the operator home.
+    pub fn session_root(self, home: &Path) -> PathBuf {
+        match self {
+            Self::Claude => home.join(".claude").join("projects"),
+            Self::Codex => home.join(".codex").join("sessions"),
+            Self::Gemini => home.join(".gemini").join("tmp"),
+            Self::Grok => home.join(".grok").join("sessions"),
+            Self::Junie => home.join(".junie").join("sessions"),
+        }
+    }
+
+    pub const fn parser_kind(self) -> aicx_parser::engine::AgentKind {
+        match self {
+            Self::Claude => aicx_parser::engine::AgentKind::Claude,
+            Self::Codex => aicx_parser::engine::AgentKind::Codex,
+            Self::Gemini => aicx_parser::engine::AgentKind::Gemini,
+            Self::Grok => aicx_parser::engine::AgentKind::Grok,
+            Self::Junie => aicx_parser::engine::AgentKind::Junie,
         }
     }
 
@@ -97,6 +137,15 @@ impl SourceFingerprint {
 pub struct ScopedChildIdentity {
     pub id: String,
     pub parent_id: Option<String>,
+}
+
+/// Result of [`SessionCatalog::scan_hot_window`]: walk-only totals plus fully
+/// probed sources for the fresh (in-window) candidates only.
+#[derive(Debug, Clone)]
+pub struct HotWindowScan {
+    pub total_candidates: usize,
+    pub newest_modified_unix_nanos: Option<u128>,
+    pub fresh_sources: Vec<CatalogSource>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -468,6 +517,46 @@ impl SessionCatalog {
         stats: &mut CatalogIoStats,
     ) -> Result<Vec<CatalogSource>, CatalogError> {
         self.probe_candidates_with_progress(candidates, stats, &mut |_| {})
+    }
+
+    /// Hot-window scan: walk + stat every candidate (cheap), but open bounded
+    /// headers ONLY for candidates whose mtime falls inside the window. The
+    /// full probe pass costs minutes on real roots; a hot query cannot pay it.
+    pub fn scan_hot_window(&self, cutoff_unix_ns: u128) -> Result<HotWindowScan, CatalogError> {
+        self.scan_hot_window_skipping(cutoff_unix_ns, &|_, _| false)
+    }
+
+    /// The same walk, with the caller allowed to declare a candidate already
+    /// known — a path whose fingerprint the census already holds unchanged.
+    ///
+    /// Freshness alone is not a reason to re-read: on a warm census most of
+    /// the window is sessions nothing has touched since the last pass, and
+    /// their bounded header re-derives byte-identical identity. Skipping them
+    /// is what separates a hot refresh from a rebuild. They still count into
+    /// `total_candidates` — the walk did see them.
+    pub fn scan_hot_window_skipping(
+        &self,
+        cutoff_unix_ns: u128,
+        is_known: &dyn Fn(&Path, &SourceFingerprint) -> bool,
+    ) -> Result<HotWindowScan, CatalogError> {
+        let mut stats = CatalogIoStats::default();
+        let candidates = self.collect_candidate_paths(&mut stats)?;
+        let total_candidates = candidates.len();
+        let newest_modified_unix_nanos = candidates
+            .iter()
+            .map(|candidate| candidate.fingerprint.modified_unix_nanos)
+            .max();
+        let fresh: Vec<CandidatePath> = candidates
+            .into_iter()
+            .filter(|candidate| candidate.fingerprint.modified_unix_nanos >= cutoff_unix_ns)
+            .filter(|candidate| !is_known(&candidate.path, &candidate.fingerprint))
+            .collect();
+        let fresh_sources = self.probe_candidates(&fresh, &mut stats)?;
+        Ok(HotWindowScan {
+            total_candidates,
+            newest_modified_unix_nanos,
+            fresh_sources,
+        })
     }
 
     fn probe_candidates_with_progress(

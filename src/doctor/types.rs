@@ -112,6 +112,11 @@ pub struct DoctorReport {
     pub content_dedup: CheckResult,
     #[serde(default)]
     pub context_corpus: CheckResult,
+    /// Product-surface freshness: live sources in the 24h window vs
+    /// pending chunk / newest-session lag. Green only when the hot
+    /// window has no unexplained census/index hole.
+    #[serde(default)]
+    pub continuity_freshness: CheckResult,
     /// Informational: which AICX_HOME the runtime resolved, whether it is
     /// pinned via env, and whether store/indexed live there. Not part of
     /// `overall` — diagnostic, not a gate.

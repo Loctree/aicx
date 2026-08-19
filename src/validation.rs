@@ -15,6 +15,7 @@
 //! Semantic callers can add their own reserved-word rules on top
 //! (template-placeholder rejection, etc.).
 
+#[cfg(any(feature = "app", test))]
 pub fn is_valid_repo_bucket_name(value: &str) -> bool {
     if value.len() > 100 {
         return false;
@@ -35,6 +36,7 @@ pub fn is_valid_repo_bucket_name(value: &str) -> bool {
 /// `organization/repository` shape. Each segment must pass the same bucket
 /// schema so bad content-extracted names cannot create junk directories under
 /// the retired `~/.aicx/store` archive.
+#[cfg(any(feature = "app", test))]
 pub fn is_valid_repo_project_slug(value: &str) -> bool {
     let mut parts = value.split('/');
     let Some(first) = parts.next() else {
@@ -119,21 +121,21 @@ mod tests {
         assert!(is_valid_repo_project_slug("vetcoders/mlx-batch-server.git"));
 
         // CamelCase paths valid (case-preserving canonical):
-        assert!(is_valid_repo_project_slug("Vetcoders/aicx"));
-        assert!(is_valid_repo_project_slug("Vetcoders/Vista"));
+        assert!(is_valid_repo_project_slug("vetcoders/aicx"));
+        assert!(is_valid_repo_project_slug("vetcoders/Vista"));
         assert!(is_valid_repo_project_slug("LibraxisAI/lbrxAgents"));
         assert!(is_valid_repo_project_slug("Loctree/aicx"));
 
         // Mid-segment garbage still rejected (extractor-bug evidence):
-        assert!(!is_valid_repo_project_slug("Vetcoders/vibecrafted.git`"));
-        assert!(!is_valid_repo_project_slug("Vetcoders/loctree\n\n**AICX"));
+        assert!(!is_valid_repo_project_slug("vetcoders/vibecrafted.git`"));
+        assert!(!is_valid_repo_project_slug("Loctree/loctree\n\n**AICX"));
         assert!(!is_valid_repo_project_slug(
-            "Vetcoders/loctxc_O)outcomqqqqqqq]]qqqqqqqqqqqqqqqqqqqqqqqqqqq;;'["
+            "vetcoders/loctxc_O)outcomqqqqqqq]]qqqqqqqqqqqqqqqqqqqqqqqqqqq;;'["
         ));
 
         // Structural rejects:
-        assert!(!is_valid_repo_project_slug("Vetcoders/aicx/extra"));
+        assert!(!is_valid_repo_project_slug("vetcoders/aicx/extra"));
         assert!(!is_valid_repo_project_slug("/aicx"));
-        assert!(!is_valid_repo_project_slug("Vetcoders/"));
+        assert!(!is_valid_repo_project_slug("vetcoders/"));
     }
 }

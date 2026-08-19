@@ -7,6 +7,219 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+### Added
+
+- **MCP grew the missing session chain.** Agents can now list sessions
+  (`aicx_sessions`), open one session and extract its conversation
+  (`aicx_session`), and pull a continuity pack (`aicx_continuity`) without
+  shelling out to the CLI. Project filters stay exact; empty `-p` is a
+  numbered project miss, not `scanned=0`; ambiguous ids fail closed. The
+  continuity pack is context only — it does not select native resume.
+
+- **`aicx sessions list -p` is the same exact identity filter as MCP.**
+  `/repo`, `owner/repo`, `owner/`, and a unique bare name all work. A
+  resolved project with zero hits prints `scanned=N; matched=0` on
+  stderr instead of a silent `[]`.
+
+- **The Codex adapter understands the shape Codex has been writing since
+  2026-07-11.** Five record types appeared that day and the adapter had
+  never been taught any of them; two more had simply been renamed upstream.
+  In the last 40 sessions that is 6 182 records the parser could not place —
+  and the sessions are not rare: 840 of 871 July rollouts and 321 of 321
+  August ones carry them. Now handled:
+  - `event_msg/sub_agent_activity` (1 599) — Codex fans out to subagents,
+    and a session that dispatched a dozen of them read as one agent working
+    alone. Recorded as `subagent <kind>: <agent_path>`.
+  - `event_msg/patch_apply_end` (2 836) — the record of what Codex actually
+    changed on disk. Recorded as `patch apply ok|failed: <paths>` plus the
+    first stderr line; the change bodies stay out of the transcript.
+  - `response_item/agent_message` (177) — a third chat envelope carrying
+    agent-to-agent dispatch (`author → recipient`), outside the existing
+    dual-envelope suppression, so it was the one copy of that payload.
+  - `event_msg/thread_goal_updated` (31) — carries the goal objective in
+    prose, which is operator intent worth retrieving.
+  - `event_msg/turn_aborted` (20) — an interrupted turn is operator
+    behaviour, not noise.
+  - `event_msg/mcp_tool_call_end` (299) and `event_msg/web_search_end` (22)
+    are the current spellings of `mcp_tool_call_response` and
+    `web_search_complete`; both spellings stay accepted.
+  - `world_state` (875) and `inter_agent_communication_metadata` (177) are
+    session state, not conversation. They are now classified as known and
+    deliberately dropped, so they stop counting as visible coverage loss
+    the way a genuinely unrecognized payload should.
+
+### Fixed
+
+- **Hybrid index publish no longer hoards every generation on disk.**
+  `CURRENT` flip used to leave the previous `generations/<id>/` forever, so a
+  5-minute MCP auto-refresh stacked hundreds of ~1G Tantivy copies (218G on
+  one operator home). Publish now keeps the live generation plus one previous
+  rollback snapshot and deletes the rest after the pointer is durable.
+
+- **Full install no longer leaves MCP clients on stdio while the LaunchAgent
+  speaks HTTP.** `configure_mcp` used to write `{"command": "…/aicx-mcp",
+  "args": []}` *before* `install-mcp-service.sh` created
+  `io.vetcoders.aicx.mcp` on `http://127.0.0.1:8044/mcp`. Darwin installs now
+  start the service first and write `{"url": "http://<host>:<port>/mcp"}`
+  (wildcard bind becomes `127.0.0.1`; host/port come from the plist). A
+  readable `auth-token` is added as a Bearer header because `aicx serve`
+  requires auth by default. `AICX_SKIP_MCP_SERVICE=1` keeps stdio.
+  `make install-service` wires the same client URL.
+
+- **Grok sessions now belong to a checkout.** Live layout is
+  `~/.grok/sessions/<percent-encoded-cwd>/<uuid>/chat_history.jsonl`.
+  Discovery had reused the Codex rollout reader, so `repo_path` stayed
+  empty, `--cwd` and `-p /aicx` dropped every Grok session, and sibling
+  `events.jsonl` files looked like extra sessions. The list now reads
+  native `user`/`assistant` lines, infers cwd from the encoded parent,
+  and treats only `chat_history.jsonl` as the session.
+
+- **`make install` no longer re-extracts the entire agent history.** Step 4
+  used to run `aicx all -H 10000` after every binary refresh, so a
+  developer reinstall dumped hundreds of `[skip]` lines (Claude journals,
+  Fatal-completeness sessions, hosted archives) and could rewrite a live
+  catalog. Extract is now opt-in (`--extract` / `AICX_INSTALL_EXTRACT=1`,
+  default window 24 hours). The existing `~/.aicx` catalog is left alone.
+
+- **MCP LaunchAgent install no longer dies on launchctl Error 5.**
+  `launchctl bootstrap gui/<uid>` only works from an Aqua login. Agent
+  terminals and SSH returned `Bootstrap failed: 5: Input/output error` plus
+  a "retry as root" hint, and `set -e` aborted the script before the
+  already-written plist could be reported. The installer now detects a
+  non-Aqua session, keeps the plist, and prints the GUI-session load
+  command. Do not run the per-user agent as root.
+
+- **Extracts are recorded verbatim instead of HTML-entity encoded.** Every
+  message body went through an HTML escape on its way into the Markdown
+  artifact, so a transcript reached its readers with `&#39;` for every
+  apostrophe, `&quot;` for every quote, and `&lt;`/`&gt;` around every tag —
+  1 340 such artifacts in one Codex session extract, 300+ in a Claude one.
+  The escape was also redundant and actively wrong: the dashboard's own
+  renderer (`AicxMarkdown` in `dashboard_inline_markdown.js`) escapes
+  `& < >` per line before inlining, so a `<` in a session was displayed as
+  `&amp;lt;`. Escaping now happens only at the rendering edge, where it
+  belongs; the extract keeps what was actually said. Verified on the same
+  Codex session: 1 340 artifacts → 0, and `<user_shell_command>` blocks read
+  as themselves.
+- **The extract header stopped describing a query nobody made.** It labelled
+  the resolved project identity as `Filter` and the age of the oldest entry
+  as `Period | last N hours`, so a single-session extract read as a
+  time-windowed search narrowed to one repository. They are now `Project`
+  and `Oldest entry | N h ago`.
+
+- **`aicx catalog refresh` reached a fixed point instead of rewriting the
+  whole census on every call.** The hot delta marked a session changed when
+  its cataloged `project` differed from the freshly scanned one — but those
+  two values come from different pipelines: the scan guesses identity from
+  the directory layout (`vibecrafted-suite/vc-slack-agent`), while the
+  catalog holds what `git remote get-url origin` resolved
+  (`vetcoders/vc-slack`). Reattribution then rewrote the scanned guess back
+  to the origin slug, so the next call found the same difference again. On
+  the owner host that meant 272 phantom "changed" rows and a full rewrite of
+  a 13 119-line catalog on every `continuity`, `dashboard`, and wizard call,
+  forever. The delta now compares post-reattribution values on both sides;
+  measured on a copy of the live census, the churn drops from 272 to 0 and
+  consecutive refreshes converge.
+- **Four red parser tests left behind by the org-identity fixture sweep.**
+  The sweep rewrote expectations that read as string literals but could not
+  see fixtures assembled from separate `.join()` components, so a segment
+  built under `hosted/Vetcoders/loctree` was asserted to be
+  `Loctree/loctree`, and a path lowercased to `/Git/vetcoders/…` was still
+  asserted to yield `Vetcoders`. Each test is now internally consistent
+  again, with the fixture directories carrying the true org.
+- **`tests/fixtures/overlay-intent-v1/` is a true mirror again.** The
+  directory is contract-bound (C0-01) to be byte-identical with
+  `loctree-suite/docs/contracts/fixtures/overlay-intent-v1/`, and an
+  aicx-owned fixture on a different schema
+  (`aicx.overlay.semantic-fixture.v1`) had been parked inside it, failing
+  `sync_fixtures.py --check`. It moved to `tests/fixtures/overlay-semantic-v1/`
+  — it is live test input, `include_str!`-ed by the semantic dedup suite in
+  `src/overlay.rs`, which now reads it from its own directory. The mirror
+  verifies again: 10 fixtures byte-identical in both repos.
+
+### Changed
+
+- **A hot refresh no longer re-reads sessions the census already knows.**
+  `scan_hot_window` opened a bounded header for every source inside the
+  window — thousands of files per call — to re-derive identity that was
+  already on disk, byte for byte. Candidates whose `(path, len, mtime)`
+  fingerprint matches the catalog are now skipped before the read.
+  Measured on the live census (13 119 sessions): `catalog refresh --hours
+  720` went **11.4s → 2.6s**, and the cost stopped scaling with the window
+  (a 24h and a 720h refresh now cost the same). End to end,
+  `continuity show -p /aicx -H 720` went **30.5s → 14.9s**. The trade: path-derived
+  fields of an untouched source are not re-derived when the derivation
+  itself improves — `aicx catalog rebuild` remains the pass that does.
+- **`origin` resolution is memoized across calls.** Reattribution spawned
+  one `git remote get-url origin` per checkout on every sweep — ~500 on the
+  owner host, twice per refresh. The answers now live in
+  `<home>/catalog/remotes.json`, keyed by the checkout's git-metadata mtime,
+  so a re-pointed remote is still picked up on the next refresh without
+  paying a subprocess per row. Any path that resolves identities maintains
+  the memo, including `continuity show --no-refresh` — it writes that one
+  cache file and nothing else. Checkouts with a relative `cwd` are no longer
+  attributed at all: their answer was an accident of the invoking directory.
+
+- **`aicx intents` reads the committed index instead of re-parsing every
+  transcript.** The lexical index already stores each session's canonical
+  extract verbatim (`ChunkRef.text`) next to its resolved identity —
+  project, agent, date, session id, cwd — which is exactly what intent
+  extraction was rebuilding from scratch on every invocation. It now
+  reads those documents back through the new
+  `TantivyAdapter::scan_chunks` surface, the body-carrying sibling of
+  `scan_metadata`. Measured on the same query (`-p /vibecrafted --sort
+  newest -H 480`, 2492 matching sessions / 8.24 GB of source JSONL):
+  **5m27s → 21.8s**, returning the same 80 records as the census walk. The census walk remains the fallback for hot-window
+  requests (`--live`, windows ≤ 48h) and for machines with no published
+  `CURRENT`, so freshly written sessions are never silently dropped.
+  Records served this way are stamped `identity_source: index-v1`.
+  Full-history requests (`hours == 0`) also stay on the census: that is the
+  durable-identity join `aicx overlay` performs, and it freezes `intent1:`
+  evidence refs, so its input set must not move under it. Verified: overlay
+  revision is byte-identical before and after this change.
+  Frames are still narrowed to the requested `--frame-kind` before
+  classification, so serving whole extracts does not quietly promote
+  assistant prose to operator intent.
+
+## [0.12.2] - 2026-08-13
+
+### Fixed
+
+- **Continuity is no longer blind to checkouts whose path spells the
+  project differently than its identity.** Three stacked fixes: Claude
+  session `cwd` is now sniffed from the session head instead of decoded
+  from the lossy `~/.claude/projects/<slug>` directory name (every `-`
+  inside a real path component used to become a bogus `/`, fabricating
+  identities like `suite/vibecrafted` and cwds that do not exist);
+  per-frame retention accepts frames whose cwd is the session checkout
+  (or a subdirectory) so remote-derived identities survive suite dirs and
+  renamed clones while the strict adjacent-segment anti-leak proof still
+  guards frames that left the checkout; and the continuity INDEX HEALTH
+  footer reports the bucket with the newest session activity across the
+  expanded project filters instead of an arbitrary first bucket.
+
+- **Continuity live window is mtime-in-window, not newer-than-census.**
+  A `catalog rebuild` that stamps every fingerprint current no longer
+  demotes today's open sessions to canonical-only, so NOW/PEERS stay
+  populated. INDEX HEALTH warns when `pending_chunks` or
+  `sessions_newer_than_chunks` is non-zero instead of rendering an
+  unexplained empty pack. `aicx catalog rebuild --with-chunks` drains
+  the lag through `aicx index` and always prints `pending_chunks`.
+  `aicx doctor` now measures `continuity_freshness` (hot sources vs
+  pending lag) so Overall Green cannot ignore a blind resume surface.
+  Catalog admission case-folds project slugs
+  (`VetCoders/vibecrafted` → `vetcoders/vibecrafted`).
+
+- **Lexical schema downgrade is a controlled conflict, not silent
+  corruption.** Publishing `CURRENT` refuses a generation whose lexical
+  schema is provably older than the published one (or than the binary's
+  supported schema), and search returns a typed conflict naming the foreign
+  writer when `CURRENT` drifts from the binary — the failure mode observed
+  when a file-sync tool (MEGA) replicated the machine-local
+  `~/.aicx/indexed/` between hosts running different aicx builds
+  (`v3_folded_dictation` ↔ `v2_fast_body`). `docs/MULTI_MACHINE.md` documents
+  which AICX home paths are machine-local and must stay out of file sync.
+
 - **`unsupported_visible_event` means something again on Claude sessions.**
   Since 2026-07 the harness emits thinking blocks signature-only — `thinking`
   is present but empty and the reasoning text never reaches the JSONL (live
@@ -40,6 +253,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   and a queued message the harness later delivers as a real `user` row loses
   to that row. Verified on a live 1180-entry session that had permanently
   dropped 20 operator messages. See `docs/PARSER_NORMATIVE_CONTRACT.md` §2.1.
+
+### Added
+
+- **Index generation provenance.** Retrieval manifests now record
+  `writer_version` and `build_id` (`<version>+g<sha>[.dirty]`) of the writer
+  that published the generation. Pre-provenance manifests stay readable and
+  self-describe as `unknown (pre-provenance writer)`.
 
 ## [0.12.1] - 2026-07-24
 
@@ -803,7 +1023,7 @@ oracle, never a runtime dependency.
 
 ### Fixed
 
-- Corrected the `SECURITY.md` disclosure path so private vulnerability reports go to the public `Vetcoders/ai-contexters` repository instead of a stale owner link.
+- Corrected the `SECURITY.md` disclosure path so private vulnerability reports go to the public `vetcoders/ai-contexters` repository instead of a stale owner link.
 - Updated GitHub Actions workflow dependencies to current major versions for `checkout`, `cache`, `setup-python`, `upload-artifact`, and `download-artifact`, removing the Node 20 deprecation surface from future CI and release runs.
 
 ## [0.4.2] - 2026-03-17
@@ -848,7 +1068,7 @@ oracle, never a runtime dependency.
 ### Changed
 
 - Rank made default command (`aicx -p proj` runs rank).
-- Skills removed from repo — canonical source: Vetcoders/vetcoders-skills.
+- Skills removed from repo — canonical source: vetcoders/vetcoders-skills.
 - Package excludes: `*.html`, `*.patch`, `*.orig`, `.ai-agents/`, `skills/`.
 
 ### Added (Governance)

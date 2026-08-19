@@ -44,12 +44,17 @@ fn render_topbar(frame: &mut Frame, area: Rect, app: &App) {
 
 fn render_bottombar(frame: &mut Frame, area: Rect, app: &App) {
     let text = match app.active {
-        Screen::Corpus => " q quit | 1-4 screens | hjkl nav | / filter | Enter preview | ? help ",
-        Screen::Doctor => " q quit | r refresh | f fix steer | b fix buckets | ? help ",
+        Screen::Corpus => " q quit | 1-5 screens | / search | hjkl nav | Enter preview | ? help ",
+        Screen::Doctor => " q quit | r refresh | f fix steer | b fix buckets | / search | ? help ",
         Screen::Intents => {
-            " q quit | p project | a agent | t time | / filter | Enter chunk | ? help "
+            " q quit | p project | a agent | t time | / search | Enter chunk | ? help "
         }
-        Screen::Rebuild => " q quit | s start | t range | Ctrl+C cancel | jk scroll | ? help ",
+        Screen::Rebuild => {
+            " q quit | s start | t range | Ctrl+C cancel | / search | jk scroll | ? help "
+        }
+        Screen::Search => {
+            " q quit | / query | Enter run/open | p project | a agent | t time | r re-run | ? help "
+        }
     };
     let line = format!("{} | {}", text, app.status);
     frame.render_widget(
@@ -64,7 +69,113 @@ fn render_main(frame: &mut Frame, area: Rect, app: &App) {
         Screen::Doctor => render_doctor(frame, area, app),
         Screen::Intents => render_intents(frame, area, app),
         Screen::Rebuild => render_store(frame, area, app),
+        Screen::Search => render_search_view(frame, area, app),
     }
+}
+
+fn render_search_view(frame: &mut Frame, area: Rect, app: &App) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(6),
+            Constraint::Length(if app.search.drift_banner.is_some() {
+                4
+            } else {
+                2
+            }),
+        ])
+        .split(area);
+
+    let meta = format!(
+        "q={} · p={} · a={} · t={} · {}",
+        if app.search.query.is_empty() {
+            "∅".to_string()
+        } else {
+            truncate(&app.search.query, 40)
+        },
+        app.search.project.as_deref().unwrap_or("*"),
+        app.search.agent.as_deref().unwrap_or("*"),
+        if app.search.hours == 0 {
+            "all".to_string()
+        } else {
+            format!("{}h", app.search.hours)
+        },
+        app.search.backend_line
+    );
+    frame.render_widget(
+        Paragraph::new(meta)
+            .block(block("Search engine (aicx search)"))
+            .wrap(Wrap { trim: true }),
+        chunks[0],
+    );
+
+    let body = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(52), Constraint::Percentage(48)])
+        .split(chunks[1]);
+
+    let items = app
+        .search
+        .hits
+        .iter()
+        .enumerate()
+        .map(|(idx, hit)| {
+            let style = if idx == app.search.selected {
+                Style::default().fg(Color::Cyan).bold()
+            } else {
+                Style::default()
+            };
+            ListItem::new(Line::from(Span::styled(
+                format!(
+                    "{}{}",
+                    if idx == app.search.selected {
+                        "> "
+                    } else {
+                        "  "
+                    },
+                    truncate(&hit.list_label(), 90)
+                ),
+                style,
+            )))
+        })
+        .collect::<Vec<_>>();
+    let title = if app.search.hits.is_empty() {
+        "Hits (empty)"
+    } else {
+        "Hits"
+    };
+    frame.render_widget(List::new(items).block(block(title)), body[0]);
+
+    frame.render_widget(
+        Paragraph::new(app.search.selected_preview())
+            .block(block("Source"))
+            .wrap(Wrap { trim: false }),
+        body[1],
+    );
+
+    let footer = if let Some(banner) = &app.search.drift_banner {
+        let repair = app
+            .search
+            .repair_hint
+            .as_deref()
+            .unwrap_or("aicx catalog rebuild && aicx index");
+        format!("{banner}\n→ {repair}")
+    } else {
+        app.search.backend_line.clone()
+    };
+    let style = if app.search.drift_banner.is_some() {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default().fg(Color::Green)
+    };
+    frame.render_widget(
+        Paragraph::new(footer)
+            .style(style)
+            .block(block("Truth / drift"))
+            .wrap(Wrap { trim: true }),
+        chunks[2],
+    );
 }
 
 fn render_corpus(frame: &mut Frame, area: Rect, app: &App) {
@@ -308,14 +419,16 @@ fn render_help(frame: &mut Frame, area: Rect) {
     let text = vec![
         Line::from("aicx wizard keymap"),
         Line::from(""),
-        Line::from("1 corpus | 2 doctor | 3 intents | 4 rebuild"),
+        Line::from("1 sessions | 2 doctor | 3 intents | 4 refresh | 5 search"),
         Line::from("hjkl / arrows navigate visible lists"),
-        Line::from("/ filters corpus or intents"),
+        Line::from("/ opens search query (from any screen → Search view)"),
+        Line::from("search: Enter runs aicx search; p/a/t filters; r re-run; Enter opens source"),
         Line::from(
             "doctor: r refresh, f runs aicx doctor --rebuild-steer-index, b shows Plan B deferral",
         ),
-        Line::from("rebuild: s runs aicx catalog rebuild && aicx index --cache-extracts"),
-        Line::from("rebuild: Ctrl+C cancels a long rebuild when supported"),
+        Line::from("refresh: s runs bounded catalog refresh + incremental CURRENT index"),
+        Line::from("refresh: Ctrl+C cancels a long index when supported"),
+        Line::from("CLI: aicx wizard --view search --query '…' [--project p] [--agent a]"),
         Line::from("q quits when no long operation is in flight"),
     ];
     frame.render_widget(Paragraph::new(text).block(block("Help")), area);
@@ -323,8 +436,13 @@ fn render_help(frame: &mut Frame, area: Rect) {
 
 fn render_search(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(Clear, area);
+    let title = if matches!(app.active, Screen::Search) {
+        "Search query (Enter runs CURRENT; Esc cancel)"
+    } else {
+        "Filter / search (Enter applies)"
+    };
     frame.render_widget(
-        Paragraph::new(format!("filter: {}", app.search_input)).block(block("Search")),
+        Paragraph::new(format!("> {}", app.search_input)).block(block(title)),
         area,
     );
 }

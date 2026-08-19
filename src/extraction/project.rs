@@ -53,7 +53,7 @@ fn canonical_project_parts(value: &str) -> Option<(String, String)> {
 /// The previous last-segment relax (path's last segment equals filter's
 /// repo, even when the owner is absent from the path) is **gone**.
 /// It caused the cross-org leak flagged by `chatgpt-codex-connector` P1
-/// on PR #8 (filter `Loctree/aicx` matched `/.../Vetcoders/aicx`). Query
+/// on PR #8 (filter `Loctree/aicx` matched `/.../vetcoders/aicx`). Query
 /// paths do not call this helper: their ground truth is the project identity
 /// persisted when the card was ingested. In particular, this function never
 /// opens `.git/config` or re-derives historical identity from a live checkout.
@@ -107,7 +107,7 @@ pub(crate) fn project_filter_matches_path(cwd: &str, filters: &[String]) -> bool
                 return false;
             }
             // Strict adjacency — no last-segment relax. Cross-org leakage
-            // (filter `Loctree/aicx` matching `/.../Vetcoders/aicx`) is
+            // (filter `Loctree/aicx` matching `/.../vetcoders/aicx`) is
             // impossible and no live remote is consulted.
             return path_segments
                 .windows(2)

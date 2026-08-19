@@ -11,6 +11,11 @@
 #   session_id: 019e93be-379d-7303-9ad4-ffae468db99f
 #   timestamp: 2026_0604_1408_MDT
 #   runtime: iterm2
+#
+# Humans keep a human address. `[maciej/manual]` may use
+# `Authored-By: maciej <void@div0.space>`. Agents stay on
+# `agents@vetcoders.io`. The example body below is not a required
+# sentence — do not paste it into a real commit.
 
 set -euo pipefail
 
@@ -43,7 +48,29 @@ if grep -Eiq '(^Co-Authored-By:|noreply@|@anthropic\.com|@openai\.com)' "$msg_fi
     failures+=("vendor footers are forbidden; use Authored-By only")
 fi
 
-if [ -n "$agent" ] && ! grep -Eq "^Authored-By: ${agent} <agents@vetcoders\\.io>$" "$msg_file"; then
+# Humans are not agents. The founder/operator envelope is a real address,
+# not agents@vetcoders.io. Runtime `manual` or a known human subject name
+# selects that lane. Everyone else stays fail-closed on the agent mailbox.
+human_agents='maciej|monika'
+human_emails='void@div0\.space|hello@vetcoders\.io'
+runtime_lane=""
+if [[ "$first_line" =~ ^\[([^]/]+)/([^]]+)\] ]]; then
+    runtime_lane="${BASH_REMATCH[2]}"
+fi
+is_human=0
+if [ -n "$agent" ] && [[ "$agent" =~ ^(${human_agents})$ ]]; then
+    is_human=1
+fi
+if [ "$runtime_lane" = "manual" ]; then
+    is_human=1
+fi
+
+if [ "$is_human" -eq 1 ]; then
+    author="${agent:-maciej}"
+    if ! grep -Eq "^Authored-By: ${author} <(${human_emails})>$" "$msg_file"; then
+        failures+=("missing Authored-By: ${author} <void@div0.space> (human lane; not agents@vetcoders.io)")
+    fi
+elif [ -n "$agent" ] && ! grep -Eq "^Authored-By: ${agent} <agents@vetcoders\\.io>$" "$msg_file"; then
     failures+=("missing Authored-By: ${agent} <agents@vetcoders.io>")
 elif [ -z "$agent" ] && ! grep -Eq '^Authored-By: [a-z][a-z0-9_-]* <agents@vetcoders\.io>$' "$msg_file"; then
     failures+=("missing Authored-By: <agent> <agents@vetcoders.io>")
@@ -86,11 +113,18 @@ printf 'commit-msg: invalid Vibecrafted commit message\n' >&2
 for failure in "${failures[@]}"; do
     printf '  - %s\n' "$failure" >&2
 done
-printf '\nExpected shape:\n' >&2
-printf '  [codex/interactive] chore: Polish Makefile help output formatting\n\n' >&2
-printf '  Refactors the help target to use structured printf output.\n\n' >&2
+printf '\nAgent shape:\n' >&2
+printf '  [codex/interactive] chore: describe the change\n\n' >&2
+printf '  Why this commit exists.\n\n' >&2
 printf '  Authored-By: codex <agents@vetcoders.io>\n' >&2
 printf '  session_id: 019e93be-379d-7303-9ad4-ffae468db99f\n' >&2
 printf '  timestamp: 2026_0604_1408_MDT\n' >&2
 printf '  runtime: iterm2\n' >&2
+printf '\nHuman shape:\n' >&2
+printf '  [maciej/manual] feat: describe the change\n\n' >&2
+printf '  Why this commit exists.\n\n' >&2
+printf '  Authored-By: maciej <void@div0.space>\n' >&2
+printf '  session_id: <uuid>\n' >&2
+printf '  timestamp: YYYY_MMDD_HHMM_TZ\n' >&2
+printf '  runtime: vibecrafted\n' >&2
 exit 1

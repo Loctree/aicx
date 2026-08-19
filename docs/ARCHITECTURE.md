@@ -43,6 +43,8 @@ production command.
 - `src/vector_index.rs` and `crates/aicx-retrieve/` — hybrid generation and
   dense mmap support.
 - `src/mcp.rs` — CLI-parity MCP tools.
+- `src/mcp_session.rs` — MCP session chain (`aicx_sessions` / `aicx_session` /
+  `aicx_continuity`): live list, one-session extract, continuity pack.
 - `src/doctor/` — bounded health plus explicit deep recovery.
 - `src/wizard/` — interactive catalog/index/doctor surface.
 
@@ -50,6 +52,9 @@ production command.
 
 `aicx catalog rebuild` walks registered source roots and writes
 `~/.aicx/catalog/sessions.jsonl`. Each row includes source length and mtime-ns.
+After that initial census, `aicx catalog refresh` maintains the hot window and
+repairs path-guessed project labels from the checkout's git origin without a
+daily full walk.
 
 `aicx index` also fingerprints the live source before reuse. A changed existing
 session reparses even if the operator did not rebuild the catalog first. Parse

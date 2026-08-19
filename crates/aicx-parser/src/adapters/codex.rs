@@ -201,6 +201,19 @@ fn classify_raw(
                     kind: event_type.to_owned(),
                 },
             ),
+            // Envelopes Codex started emitting on 2026-07-11 that carry
+            // session state rather than conversation: `world_state` repeats
+            // the whole AGENTS.md, and the inter-agent record is a routing
+            // flag. Known and deliberately dropped — not a coverage gap, so
+            // they must not inflate the visible-skip count the way an
+            // genuinely unrecognized payload should.
+            "world_state" | "inter_agent_communication_metadata" => (
+                event_type.to_owned(),
+                ClassifiedDisposition::Skipped {
+                    reason: SkippedReason::Unsupported,
+                    visible: false,
+                },
+            ),
             _ => (
                 "unknown_payload".to_owned(),
                 ClassifiedDisposition::Skipped {
@@ -479,15 +492,64 @@ impl<'a> Assembly<'a> {
             "function_call" | "tool_call" | "mcp_tool_call" => {
                 self.push_tool_turn(event, timestamp, evidence, ToolEventKind::Call)
             }
-            "tool_result" | "mcp_tool_call_response" => {
+            // `mcp_tool_call_end` / `web_search_end` are the current names for
+            // what this adapter first learned as `mcp_tool_call_response` /
+            // `web_search_complete`. Both spellings stay accepted so old
+            // archives keep parsing.
+            "tool_result" | "mcp_tool_call_response" | "mcp_tool_call_end" => {
                 self.push_tool_turn(event, timestamp, evidence, ToolEventKind::Result)
             }
+            // Codex applies edits through this event; the payload carries the
+            // whole stdout and per-file change bodies, so the turn records the
+            // outcome and the files, not the diff.
+            "patch_apply_end" => self.push_turn(
+                TurnRole::System,
+                TurnKind::SystemNote,
+                patch_apply_summary(&event["payload"]),
+                timestamp,
+                Known::unknown(),
+                evidence,
+            ),
+            // Codex fans out to subagents now. Without this the transcript of
+            // a session that dispatched a dozen of them reads as one agent
+            // working alone.
+            "sub_agent_activity" => self.push_turn(
+                TurnRole::System,
+                TurnKind::SystemNote,
+                sub_agent_summary(&event["payload"]),
+                timestamp,
+                Known::unknown(),
+                evidence,
+            ),
+            "thread_goal_updated" => self.push_turn(
+                TurnRole::System,
+                TurnKind::SystemNote,
+                thread_goal_summary(&event["payload"]),
+                timestamp,
+                Known::unknown(),
+                evidence,
+            ),
+            // An interrupted turn is operator behaviour worth keeping.
+            "turn_aborted" => self.push_turn(
+                TurnRole::System,
+                TurnKind::SystemNote,
+                format!(
+                    "turn aborted: {}",
+                    string_at(&event["payload"], &["reason"]).unwrap_or("unknown reason")
+                ),
+                timestamp,
+                Known::unknown(),
+                evidence,
+            ),
+            // Thread configuration echo — consumed, carries no conversation.
+            "thread_settings_applied" => Ok(()),
             "task_started"
             | "task_complete"
             | "error"
             | "notification"
             | "web_search"
-            | "web_search_complete" => self.push_turn(
+            | "web_search_complete"
+            | "web_search_end" => self.push_turn(
                 TurnRole::System,
                 TurnKind::SystemNote,
                 payload_text(&event["payload"]),
@@ -536,6 +598,18 @@ impl<'a> Assembly<'a> {
                     evidence,
                 )
             }
+            // Agent-to-agent dispatch: `author` hands a task to `recipient`.
+            // A third chat envelope, distinct from `message`, so the
+            // dual-envelope suppression above does not apply and this is the
+            // only place the payload survives.
+            "agent_message" => self.push_turn(
+                TurnRole::Assistant,
+                TurnKind::AgentReply,
+                agent_message_text(payload),
+                timestamp,
+                Known::unknown(),
+                evidence,
+            ),
             "function_call" | "custom_tool_call" | "web_search_call" => {
                 self.push_tool_turn(event, timestamp, evidence, ToolEventKind::Call)
             }
@@ -1038,6 +1112,65 @@ fn payload_text(payload: &Value) -> String {
         .map(value_text)
         .unwrap_or_else(|| value_text(payload))
 }
+/// `patch_apply_end` carries stdout plus a per-file change map whose bodies
+/// are whole file contents. The transcript keeps the outcome and the paths;
+/// the diff itself lives in the repository, not in a session record.
+fn patch_apply_summary(payload: &Value) -> String {
+    let outcome = match payload.get("success").and_then(Value::as_bool) {
+        Some(true) => "ok",
+        Some(false) => "failed",
+        None => "unknown",
+    };
+    let mut summary = match payload.get("changes").and_then(Value::as_object) {
+        Some(changes) if !changes.is_empty() => {
+            let mut paths: Vec<&str> = changes.keys().map(String::as_str).collect();
+            paths.sort_unstable();
+            format!("patch apply {outcome}: {}", paths.join(", "))
+        }
+        _ => format!("patch apply {outcome}"),
+    };
+    if let Some(stderr) = payload.get("stderr").and_then(Value::as_str)
+        && let Some(first) = stderr.lines().find(|line| !line.trim().is_empty())
+    {
+        summary.push_str(" — ");
+        summary.push_str(first.trim());
+    }
+    summary
+}
+
+/// One line per subagent lifecycle event: enough to see the fan-out shape of
+/// a session without carrying the child's own transcript.
+fn sub_agent_summary(payload: &Value) -> String {
+    let kind = string_at(payload, &["kind"]).unwrap_or("activity");
+    match string_at(payload, &["agent_path"]) {
+        Some(path) => format!("subagent {kind}: {path}"),
+        None => format!("subagent {kind}"),
+    }
+}
+
+/// The goal objective is operator intent stated in prose — the single most
+/// retrievable thing in the payload.
+fn thread_goal_summary(payload: &Value) -> String {
+    match string_at(payload, &["goal", "objective"]) {
+        Some(objective) => format!("thread goal: {objective}"),
+        None => "thread goal updated".to_owned(),
+    }
+}
+
+/// Agent-to-agent dispatch text, prefixed with the routing pair so a reader
+/// can tell who was handed what. Encrypted content blocks carry no text and
+/// drop out through `content_text`.
+fn agent_message_text(payload: &Value) -> String {
+    let body = content_text(&payload["content"]);
+    match (
+        string_at(payload, &["author"]),
+        string_at(payload, &["recipient"]),
+    ) {
+        (Some(author), Some(recipient)) => format!("{author} → {recipient}\n{body}"),
+        _ => body,
+    }
+}
+
 fn content_text(content: &Value) -> String {
     match content {
         Value::String(text) => text.clone(),
