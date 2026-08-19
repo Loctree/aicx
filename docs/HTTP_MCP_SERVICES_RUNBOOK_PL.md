@@ -46,7 +46,7 @@ pliku tokena albo mechanizmu zmiennej/nagłówka danego klienta.
   cd /Volumes/vc-workspace/Loctree/aicx
   make install
   ```
-  *(Uruchamia `install.sh`, instaluje binarki, konfiguruje klientów MCP i rejestruje serwis HTTP MCP w launchd. Ten serwer jest właścicielem odświeżania indeksu).*
+  *(Uruchamia `install.sh`, instaluje binarki, rejestruje `io.vetcoders.aicx.mcp` i zapisuje klientom Claude/Codex/Gemini `mcpServers.aicx` jako `{"url":"http://127.0.0.1:8044/mcp"}` — nie stdio `command`. Ten serwer jest właścicielem odświeżania indeksu. `AICX_SKIP_MCP_SERVICE=1` zostawia stdio.)*
 
 * **Zarządzanie serwisem LaunchAgent:**
   ```bash

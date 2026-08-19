@@ -46,7 +46,7 @@ client-specific environment/header mechanism.
   cd /Volumes/vc-workspace/Loctree/aicx
   make install
   ```
-  *(Runs `install.sh`, installs binaries, sets up MCP clients, and registers the launchd MCP HTTP service. That server owns index refresh).*
+  *(Runs `install.sh`, installs binaries, registers `io.vetcoders.aicx.mcp`, and writes Claude/Codex/Gemini `mcpServers.aicx` as `{"url":"http://127.0.0.1:8044/mcp"}` — not stdio `command`. That server owns index refresh. `AICX_SKIP_MCP_SERVICE=1` keeps stdio.)*
 
 * **Explicit service management:**
   ```bash
