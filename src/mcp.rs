@@ -27,6 +27,7 @@ use crate::api;
 use crate::auth::{self, AuthConfig};
 use crate::intents::{self, IntentKind, IntentsConfig};
 use crate::legacy_archive;
+use crate::mcp_session;
 use crate::oracle::OracleStatus;
 use crate::rank;
 use crate::timeline::{FrameKind, Kind};
@@ -871,6 +872,62 @@ pub struct IndexStatusParams {
     /// slug rules the index writer uses on disk.
     #[serde(default)]
     pub project: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SessionsParams {
+    /// Exact project filter (`owner/repo`, `owner/`, `/repo`, or a unique bare name).
+    /// Empty result for a resolved project means that project has no sessions,
+    /// not that discovery failed. Ambiguous or unknown bare names fail closed.
+    pub project: Option<String>,
+    /// Optional additional exact project filters.
+    pub projects: Option<Vec<String>>,
+    /// Project identity matching: `exact` (default) or explicit `fuzzy`.
+    pub project_match: Option<String>,
+    /// Filter by agent: claude, codex, gemini, junie, grok.
+    pub agent: Option<String>,
+    /// Hours to look back (default 720 = 30 days, 0 = all time).
+    #[serde(default = "mcp_session::default_list_hours")]
+    pub hours: u64,
+    /// Optional lower date bound (YYYY-MM-DD).
+    pub since: Option<String>,
+    /// Max sessions to return (default 20, 0 = all).
+    #[serde(default = "mcp_session::default_list_limit")]
+    pub limit: usize,
+}
+
+fn default_session_conversation() -> bool {
+    true
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SessionParams {
+    /// Session id or unique prefix. Ambiguous prefixes fail closed with candidates.
+    pub session: String,
+    /// Optional agent so a shared prefix is not searched across every runtime.
+    pub agent: Option<String>,
+    /// Include the conversation extract (default true). Metadata is always returned.
+    #[serde(default = "default_session_conversation")]
+    pub conversation: bool,
+    /// Keep only user turns in the extract.
+    #[serde(default)]
+    pub user_only: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ContinuityParams {
+    /// Exact project filter. Required — MCP cannot infer the operator checkout.
+    pub project: Option<String>,
+    /// Optional additional exact project filters.
+    pub projects: Option<Vec<String>>,
+    /// Project identity matching: `exact` (default) or explicit `fuzzy`.
+    pub project_match: Option<String>,
+    /// Window in hours (default 24, matching `aicx continuity show`).
+    #[serde(default = "mcp_session::default_continuity_hours")]
+    pub hours: u64,
+    /// Bound the markdown to the prompt-inject budget.
+    #[serde(default)]
+    pub for_inject: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -1887,6 +1944,111 @@ impl AicxMcpServer {
         })?;
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
+
+    #[tool(
+        name = "aicx_sessions",
+        description = "List live agent sessions the way `aicx sessions list` does: agent, project/root, id, title, updated, live. Project filters are exact (owner/repo, owner/, /repo, unique bare name). An empty list for a resolved project means that project has no sessions in the window — scanned/matched counts are always returned. Unknown or ambiguous project ids fail closed; this is not an index search and does not rebuild anything."
+    )]
+    async fn sessions_list(
+        &self,
+        Parameters(params): Parameters<SessionsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let _request_activity = self.idle_memory.begin_request();
+        tracing::info!(target: "mcp.audit", tool_name = "aicx_sessions", "mcp tool invoked");
+        validate_string_len(params.project.as_deref(), 4096, "project")?;
+        validate_string_len(params.agent.as_deref(), 64, "agent")?;
+        validate_string_len(params.since.as_deref(), 32, "since")?;
+        validate_string_len(params.project_match.as_deref(), 32, "project_match")?;
+        if let Some(projects) = &params.projects {
+            for (i, project) in projects.iter().enumerate() {
+                validate_string_len(Some(project), 4096, &format!("projects[{i}]"))?;
+            }
+        }
+        let project_match = parse_project_match(params.project_match.as_deref())?;
+        let user_home = crate::os_user_home()
+            .ok_or_else(|| McpError::internal_error("No operator home directory", None))?;
+        let aicx_home = crate::aicx_home::ensure()
+            .map_err(|e| McpError::internal_error(format!("AICX home error: {e}"), None))?;
+        let projects = params.projects.unwrap_or_default();
+        let payload = mcp_session::list_sessions(mcp_session::ListSessionsRequest {
+            user_home: &user_home,
+            aicx_home: &aicx_home,
+            project: params.project.as_deref(),
+            projects: &projects,
+            project_match,
+            agent: params.agent.as_deref(),
+            hours: params.hours,
+            since: params.since.as_deref(),
+            limit: params.limit,
+        })
+        .map_err(mcp_session::SessionSurfaceError::into_mcp)?;
+        let json = serde_json::to_string(&payload)
+            .map_err(|e| McpError::internal_error(format!("Serialize sessions JSON: {e}"), None))?;
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    #[tool(
+        name = "aicx_session",
+        description = "Open one session by id or unique prefix: metadata plus the conversation extract (`aicx sessions show` + `aicx extract <agent> --session … --conversation`). Ambiguous prefixes and missing ids fail closed with candidate counts. Does not attach or resume a provider session."
+    )]
+    async fn session_show(
+        &self,
+        Parameters(params): Parameters<SessionParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let _request_activity = self.idle_memory.begin_request();
+        tracing::info!(target: "mcp.audit", tool_name = "aicx_session", "mcp tool invoked");
+        validate_string_len(Some(params.session.as_str()), 256, "session")?;
+        validate_string_len(params.agent.as_deref(), 64, "agent")?;
+        let user_home = crate::os_user_home()
+            .ok_or_else(|| McpError::internal_error("No operator home directory", None))?;
+        let payload = mcp_session::show_session(mcp_session::ShowSessionRequest {
+            user_home: &user_home,
+            session: &params.session,
+            agent: params.agent.as_deref(),
+            conversation: params.conversation,
+            user_only: params.user_only,
+        })
+        .map_err(mcp_session::SessionSurfaceError::into_mcp)?;
+        let json = serde_json::to_string(&payload)
+            .map_err(|e| McpError::internal_error(format!("Serialize session JSON: {e}"), None))?;
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    #[tool(
+        name = "aicx_continuity",
+        description = "Render the multi-agent continuity pack (NOW / PEERS / DECISIONS / TASKS / SOURCES / INDEX HEALTH) from a live parse, same as `aicx continuity show`. Project filter is required and exact. The pack is context transport only: it never selects native resume and never tells the agent to recover or continue a previous provider session."
+    )]
+    async fn continuity(
+        &self,
+        Parameters(params): Parameters<ContinuityParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let _request_activity = self.idle_memory.begin_request();
+        tracing::info!(target: "mcp.audit", tool_name = "aicx_continuity", "mcp tool invoked");
+        validate_string_len(params.project.as_deref(), 4096, "project")?;
+        validate_string_len(params.project_match.as_deref(), 32, "project_match")?;
+        if let Some(projects) = &params.projects {
+            for (i, project) in projects.iter().enumerate() {
+                validate_string_len(Some(project), 4096, &format!("projects[{i}]"))?;
+            }
+        }
+        let project_match = parse_project_match(params.project_match.as_deref())?;
+        let aicx_home = crate::aicx_home::ensure()
+            .map_err(|e| McpError::internal_error(format!("AICX home error: {e}"), None))?;
+        let projects = params.projects.unwrap_or_default();
+        let payload = mcp_session::continuity_pack(mcp_session::ContinuityRequest {
+            aicx_home: &aicx_home,
+            project: params.project.as_deref(),
+            projects: &projects,
+            project_match,
+            hours: params.hours,
+            for_inject: params.for_inject,
+        })
+        .map_err(mcp_session::SessionSurfaceError::into_mcp)?;
+        let json = serde_json::to_string(&payload).map_err(|e| {
+            McpError::internal_error(format!("Serialize continuity JSON: {e}"), None)
+        })?;
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
 }
 
 // ============================================================================
@@ -1924,6 +2086,9 @@ pub const MCP_TOOL_SURFACE: &[&str] = &[
     "aicx_steer",
     "aicx_intents",
     "aicx_index_status",
+    "aicx_sessions",
+    "aicx_session",
+    "aicx_continuity",
 ];
 
 /// Run MCP server over stdio transport.
@@ -2629,6 +2794,9 @@ mod tests {
             "aicx_steer",
             "aicx_intents",
             "aicx_index_status",
+            "aicx_sessions",
+            "aicx_session",
+            "aicx_continuity",
         ];
         assert_eq!(
             super::MCP_TOOL_SURFACE.len(),

@@ -267,8 +267,9 @@ fn interrupted_builds_never_become_current() {
     std::fs::write(&pointer, &healthy_pointer).expect("restore pointer");
     assert_eq!(resolve_hybrid_generation_dir(&hybrid_root), published_dir);
 
-    // A completed second build atomically flips the pointer; the previous
-    // generation stays on disk (no deletion in this cut).
+    // A completed second build atomically flips the pointer. The previous
+    // CURRENT stays as the rollback snapshot. Interrupted dirs (no manifest)
+    // stay quarantined and must not steal that slot.
     let refreshed = materialize_hybrid_generation(&committed, &hybrid_root, &fingerprint())
         .expect("second published generation");
     assert_ne!(refreshed.generation_id, first.generation_id);

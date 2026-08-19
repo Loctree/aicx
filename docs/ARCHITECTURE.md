@@ -43,6 +43,8 @@ production command.
 - `src/vector_index.rs` and `crates/aicx-retrieve/` — hybrid generation and
   dense mmap support.
 - `src/mcp.rs` — CLI-parity MCP tools.
+- `src/mcp_session.rs` — MCP session chain (`aicx_sessions` / `aicx_session` /
+  `aicx_continuity`): live list, one-session extract, continuity pack.
 - `src/doctor/` — bounded health plus explicit deep recovery.
 - `src/wizard/` — interactive catalog/index/doctor surface.
 

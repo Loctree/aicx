@@ -39,6 +39,10 @@ AICX_EMBEDDER_FILENAME="${AICX_EMBEDDER_FILENAME:-${AICX_EMBEDDER_FILE:-}}"
 AICX_EMBEDDER_CONFIG_PATH="${AICX_EMBEDDER_CONFIG_PATH:-$HOME/.aicx/embedder.toml}"
 AICX_INSTALL_FORCE="${AICX_INSTALL_FORCE:-0}"
 AICX_INSTALL_DRY_RUN="${AICX_INSTALL_DRY_RUN:-0}"
+# Install must not re-scan every agent session. Opt in with --extract or
+# AICX_INSTALL_EXTRACT=1. Hours default to 24, not the old 10000-hour landmine.
+AICX_INSTALL_EXTRACT="${AICX_INSTALL_EXTRACT:-0}"
+AICX_INSTALL_EXTRACT_HOURS="${AICX_INSTALL_EXTRACT_HOURS:-24}"
 AICX_CARGO_BIN_DIR="${AICX_CARGO_BIN_DIR:-${CARGO_INSTALL_ROOT:+$CARGO_INSTALL_ROOT/bin}}"
 AICX_EMBEDDER_SETUP_DETAIL="No local embedder profile was configured in this run."
 if [ -z "$AICX_CARGO_BIN_DIR" ]; then
@@ -60,12 +64,17 @@ for arg in "$@"; do
     --pick-home) AICX_HOME_PICKER="1" ;;
     --no-home-prompt) AICX_HOME_PICKER="0" ;;
     --aicx-home=*) AICX_STORAGE_HOME="${arg#*=}" ;;
+    --extract) AICX_INSTALL_EXTRACT="1" ;;
+    --no-extract) AICX_INSTALL_EXTRACT="0" ;;
     --pick-embedder) AICX_EMBEDDER_PICKER="1" ;;
     --no-embedder-prompt) AICX_EMBEDDER_PICKER="0" ;;
     --embedder-profile=*) AICX_EMBEDDER_PROFILE="${arg#*=}" ;;
     --help|-h)
       echo "Usage: install.sh [--skip-install] [--dry-run] [--force]"
       echo "  Install aicx + aicx-mcp and configure MCP for Claude Code, Codex, and Gemini."
+      echo "  On Darwin, a full install starts io.vetcoders.aicx.mcp and writes client"
+      echo "  {\"url\": \"http://127.0.0.1:8044/mcp\"} (or AICX_MCP_HOST/PORT). Stdio remains"
+      echo "  only when AICX_SKIP_MCP_SERVICE=1 or the LaunchAgent is not installed."
       echo "  Run from a release bundle or the repo root / local checkout."
       echo "  --dry-run shows shadow cleanup without installing or rewriting config."
       echo "  --force skips the multiple-aicx PATH confirmation."
@@ -102,6 +111,12 @@ for arg in "$@"; do
       echo "  --aicx-home=/absolute/path         # persist [storage].home in ~/.aicx/config.toml"
       echo "  --no-home-prompt                   # suppress interactive AICX_HOME picker"
       echo "  default: ~/.aicx                   # semantic index remains ~/.aicx/indexed/"
+      echo ""
+      echo "Session extract during install (off by default):"
+      echo "  --extract                          # run aicx all after binaries are in place"
+      echo "  --no-extract                       # leave the existing catalog alone (default)"
+      echo "  AICX_INSTALL_EXTRACT=1             # same as --extract"
+      echo "  AICX_INSTALL_EXTRACT_HOURS=24      # window when extract is opted in (default 24)"
       exit 0
       ;;
   esac
@@ -1062,93 +1077,81 @@ if resolve_aicx_mcp; then
     echo "  aicx-mcp $AICX_MCP_COMMAND"
   fi
 else
-  echo "  Warning: aicx-mcp not found. MCP config will be skipped."
+  echo "  Warning: aicx-mcp not found. Stdio MCP config will be skipped."
 fi
 
 # --- Step 3: Configure storage + MCP ---
 echo "[3/4] Configuring storage + MCP servers..."
 maybe_configure_aicx_home
 
-configure_mcp() {
-  local tool_name="$1"
-  local settings_path="$2"
-  local settings_dir
-  settings_dir=$(dirname "$settings_path")
+MCP_CLIENTS_HELPER="$SCRIPT_DIR/tools/configure_mcp_clients.py"
+MCP_SERVICE_SCRIPT="$SCRIPT_DIR/tools/install-mcp-service.sh"
+MCP_SERVICE_PLIST="$HOME/Library/LaunchAgents/io.vetcoders.aicx.mcp.plist"
+MCP_TRANSPORT="stdio"
 
-  if [ ! -d "$settings_dir" ]; then
-    echo "  [$tool_name] skipped (dir not found: $settings_dir)"
-    return
-  fi
-
-  # Create settings file if it doesn't exist
-  if [ ! -f "$settings_path" ]; then
-    echo '{}' > "$settings_path"
-  fi
-
-  if [ -z "$AICX_MCP_COMMAND" ]; then
-    echo "  [$tool_name] skipped (aicx-mcp unavailable)"
-    return
-  fi
-
-  update_status=$(
-    SETTINGS_PATH="$settings_path" \
-    AICX_MCP_COMMAND="$AICX_MCP_COMMAND" \
-    AICX_MCP_ARGS_JSON="$AICX_MCP_ARGS_JSON" \
-    python3 - <<'PY'
-import json
-import os
-
-path = os.environ["SETTINGS_PATH"]
-desired = {
-    "command": os.environ["AICX_MCP_COMMAND"],
-    "args": json.loads(os.environ["AICX_MCP_ARGS_JSON"]),
-}
-
-with open(path) as f:
-    data = json.load(f)
-
-servers = data.setdefault("mcpServers", {})
-current = servers.get("aicx")
-
-if current == desired:
-    print("already configured")
-else:
-    servers["aicx"] = desired
-    with open(path, "w") as f:
-        json.dump(data, f, indent=2)
-        f.write("\n")
-    print("configured")
-PY
-  ) || {
-    echo "  [$tool_name] failed to configure (python3 error)"
-    return
-  }
-
-  echo "  [$tool_name] ${update_status}: $settings_path"
-}
-
-# Claude Code
-configure_mcp "claude" "$HOME/.claude/settings.json"
-
-# Codex
-configure_mcp "codex" "$HOME/.codex/settings.json"
-
-# Gemini
-configure_mcp "gemini" "$HOME/.gemini/settings.json"
-
-# Background HTTP MCP service daemon (macOS launchd; no-op elsewhere). Opt out with
-# AICX_SKIP_MCP_SERVICE=1.
+# Background HTTP MCP service first (macOS launchd; no-op elsewhere). Clients
+# must be wired after this step so a full install does not leave them on
+# stdio while the LaunchAgent speaks Streamable HTTP. Opt out of the daemon
+# (and keep stdio clients) with AICX_SKIP_MCP_SERVICE=1.
 if [ "${AICX_SKIP_MCP_SERVICE:-0}" != "1" ]; then
-  MCP_SERVICE_SCRIPT="$(dirname "$0")/tools/install-mcp-service.sh"
   if [ -f "$MCP_SERVICE_SCRIPT" ]; then
-    bash "$MCP_SERVICE_SCRIPT" || echo "  Warning: MCP HTTP service install failed (non-fatal)."
+    # AICX_SKIP_MCP_CLIENTS=1: this call only writes the LaunchAgent. Client
+    # JSON is applied once below so install.sh owns the status lines.
+    AICX_SKIP_MCP_CLIENTS=1 bash "$MCP_SERVICE_SCRIPT" || echo "  Warning: MCP HTTP service install failed (non-fatal)."
+  fi
+  if [ "$(uname -s)" = "Darwin" ] && [ -f "$MCP_SERVICE_PLIST" ]; then
+    MCP_TRANSPORT="http"
   fi
 fi
 
-# --- Step 4: Full store bootstrap ---
-echo "[4/4] Full context extraction (this may take a moment)..."
-"${AICX_RUN[@]}" all -H 10000 --emit none
-echo "  store bootstrap complete"
+configure_mcp_clients() {
+  if [ ! -f "$MCP_CLIENTS_HELPER" ]; then
+    echo "  Warning: $MCP_CLIENTS_HELPER missing; MCP client config skipped."
+    return
+  fi
+  if [ "$MCP_TRANSPORT" = "http" ]; then
+    python3 "$MCP_CLIENTS_HELPER" \
+      --wire-defaults \
+      --transport http \
+      --plist "$MCP_SERVICE_PLIST" \
+      --token-file "${AICX_HOME:-$HOME/.aicx}/auth-token" || {
+        echo "  Warning: MCP HTTP client wiring failed (non-fatal)."
+        return
+      }
+    echo "  MCP clients: Streamable HTTP (same endpoint as io.vetcoders.aicx.mcp)"
+    return
+  fi
+  if [ -z "$AICX_MCP_COMMAND" ]; then
+    echo "  MCP clients skipped (aicx-mcp unavailable; no HTTP service to point at)"
+    return
+  fi
+  python3 "$MCP_CLIENTS_HELPER" \
+    --wire-defaults \
+    --transport stdio \
+    --command "$AICX_MCP_COMMAND" \
+    --args-json "$AICX_MCP_ARGS_JSON" || {
+      echo "  Warning: MCP stdio client wiring failed (non-fatal)."
+      return
+    }
+  echo "  MCP clients: stdio aicx-mcp (HTTP service skipped or unavailable)"
+}
+
+configure_mcp_clients
+
+# --- Step 4: do not re-scan sessions on every install ---
+# `make install` / install.sh used to run `aicx all -H 10000` here. That is a
+# full-history extract of every registered agent, not an install step: it
+# floods skip lines, takes longer than the binary build, and rewrites the
+# operator's live catalog. Extract stays opt-in.
+if [ "${AICX_INSTALL_EXTRACT}" = "1" ]; then
+  echo "[4/4] Context extract (opt-in, last ${AICX_INSTALL_EXTRACT_HOURS}h)..."
+  "${AICX_RUN[@]}" all -H "${AICX_INSTALL_EXTRACT_HOURS}" --emit none
+  echo "  extract complete"
+else
+  echo "[4/4] Context extract skipped (install does not re-scan sessions)."
+  echo "  Existing catalog under ~/.aicx is left alone."
+  echo "  Opt in: AICX_INSTALL_EXTRACT=1 make install   or   aicx all -H 24"
+fi
 echo "  local embedder default: base (F2LLM 0.6B Q4_K_M GGUF, hydrated on demand)"
 maybe_configure_native_embedder
 echo ""
@@ -1158,7 +1161,14 @@ echo "=== AICX setup complete ==="
 echo ""
 echo "Installed:"
 echo "  aicx      - command-line tool for indexing and searching agent history"
-echo "  aicx-mcp  - MCP server for Claude Code, Codex and Gemini"
+echo "  aicx-mcp  - stdio MCP binary (used when HTTP service is skipped)"
+if [ "$MCP_TRANSPORT" = "http" ]; then
+  MCP_CLIENT_URL="$(python3 "$MCP_CLIENTS_HELPER" --print-url --plist "$MCP_SERVICE_PLIST" 2>/dev/null || true)"
+  echo "  MCP HTTP  - LaunchAgent io.vetcoders.aicx.mcp"
+  echo "              clients: ${MCP_CLIENT_URL:-http://127.0.0.1:8044/mcp}"
+else
+  echo "  MCP stdio - Claude/Codex/Gemini still spawn aicx-mcp (HTTP service skipped)"
+fi
 echo ""
 echo "Install path:"
 echo "  $INSTALL_TARGET_BIN_DIR"

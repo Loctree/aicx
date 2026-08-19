@@ -7,6 +7,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **MCP grew the missing session chain.** Agents can now list sessions
+  (`aicx_sessions`), open one session and extract its conversation
+  (`aicx_session`), and pull a continuity pack (`aicx_continuity`) without
+  shelling out to the CLI. Project filters stay exact; empty `-p` is a
+  numbered project miss, not `scanned=0`; ambiguous ids fail closed. The
+  continuity pack is context only — it does not select native resume.
+
+- **`aicx sessions list -p` is the same exact identity filter as MCP.**
+  `/repo`, `owner/repo`, `owner/`, and a unique bare name all work. A
+  resolved project with zero hits prints `scanned=N; matched=0` on
+  stderr instead of a silent `[]`.
+
 - **The Codex adapter understands the shape Codex has been writing since
   2026-07-11.** Five record types appeared that day and the adapter had
   never been taught any of them; two more had simply been renamed upstream.
@@ -35,6 +47,45 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     the way a genuinely unrecognized payload should.
 
 ### Fixed
+
+- **Hybrid index publish no longer hoards every generation on disk.**
+  `CURRENT` flip used to leave the previous `generations/<id>/` forever, so a
+  5-minute MCP auto-refresh stacked hundreds of ~1G Tantivy copies (218G on
+  one operator home). Publish now keeps the live generation plus one previous
+  rollback snapshot and deletes the rest after the pointer is durable.
+
+- **Full install no longer leaves MCP clients on stdio while the LaunchAgent
+  speaks HTTP.** `configure_mcp` used to write `{"command": "…/aicx-mcp",
+  "args": []}` *before* `install-mcp-service.sh` created
+  `io.vetcoders.aicx.mcp` on `http://127.0.0.1:8044/mcp`. Darwin installs now
+  start the service first and write `{"url": "http://<host>:<port>/mcp"}`
+  (wildcard bind becomes `127.0.0.1`; host/port come from the plist). A
+  readable `auth-token` is added as a Bearer header because `aicx serve`
+  requires auth by default. `AICX_SKIP_MCP_SERVICE=1` keeps stdio.
+  `make install-service` wires the same client URL.
+
+- **Grok sessions now belong to a checkout.** Live layout is
+  `~/.grok/sessions/<percent-encoded-cwd>/<uuid>/chat_history.jsonl`.
+  Discovery had reused the Codex rollout reader, so `repo_path` stayed
+  empty, `--cwd` and `-p /aicx` dropped every Grok session, and sibling
+  `events.jsonl` files looked like extra sessions. The list now reads
+  native `user`/`assistant` lines, infers cwd from the encoded parent,
+  and treats only `chat_history.jsonl` as the session.
+
+- **`make install` no longer re-extracts the entire agent history.** Step 4
+  used to run `aicx all -H 10000` after every binary refresh, so a
+  developer reinstall dumped hundreds of `[skip]` lines (Claude journals,
+  Fatal-completeness sessions, hosted archives) and could rewrite a live
+  catalog. Extract is now opt-in (`--extract` / `AICX_INSTALL_EXTRACT=1`,
+  default window 24 hours). The existing `~/.aicx` catalog is left alone.
+
+- **MCP LaunchAgent install no longer dies on launchctl Error 5.**
+  `launchctl bootstrap gui/<uid>` only works from an Aqua login. Agent
+  terminals and SSH returned `Bootstrap failed: 5: Input/output error` plus
+  a "retry as root" hint, and `set -e` aborted the script before the
+  already-written plist could be reported. The installer now detects a
+  non-Aqua session, keeps the plist, and prints the GUI-session load
+  command. Do not run the per-user agent as root.
 
 - **Extracts are recorded verbatim instead of HTML-entity encoded.** Every
   message body went through an HTML escape on its way into the Markdown

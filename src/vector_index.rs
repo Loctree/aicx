@@ -543,6 +543,10 @@ const HYBRID_GENERATIONS_DIR_NAME: &str = "generations";
 /// Written last (tmp + atomic rename), so an interrupted build never becomes
 /// current — see [`resolve_hybrid_generation_dir`].
 const HYBRID_CURRENT_POINTER_FILE_NAME: &str = "CURRENT";
+/// Keep CURRENT plus one previous generation after each publish. Auto-refresh
+/// used to leave every snapshot on disk (hundreds of gigabytes). Older
+/// unreferenced dirs are deleted only after the pointer flip succeeds.
+const HYBRID_GENERATION_RETAIN: usize = 2;
 
 /// Root of the hybrid retrieval area for a project bucket
 /// (`indexed/<bucket>/hybrid`). Generations live below it; legacy pre-W2-03
@@ -682,6 +686,12 @@ fn publish_hybrid_generation(hybrid_root: &Path, generation_dir: &Path) -> Resul
                 generation_dir.display()
             )
         })?;
+    let previous_name = crate::sanitize::read_to_string_validated(
+        &hybrid_root.join(HYBRID_CURRENT_POINTER_FILE_NAME),
+    )
+    .ok()
+    .map(|raw| raw.trim().to_string())
+    .filter(|raw| is_valid_generation_dir_name(raw) && raw != name);
     let pointer = hybrid_root.join(HYBRID_CURRENT_POINTER_FILE_NAME);
     let tmp = hybrid_root.join(format!("{HYBRID_CURRENT_POINTER_FILE_NAME}.tmp"));
     let mut file = crate::sanitize::create_file_validated(&tmp)
@@ -698,6 +708,62 @@ fn publish_hybrid_generation(hybrid_root: &Path, generation_dir: &Path) -> Resul
             pointer.display()
         )
     })?;
+    // Pointer is durable. Prune is best-effort: a leftover dir is disk waste,
+    // not a search-correctness failure.
+    if let Err(error) =
+        prune_unreferenced_hybrid_generations(hybrid_root, name, previous_name.as_deref())
+    {
+        eprintln!("[aicx][phase=index event=generation_prune_failed keep={name} err={error}]");
+    }
+    Ok(())
+}
+
+/// Delete superseded *complete* generation directories after a CURRENT flip.
+///
+/// Keep the live pointer and the previous pointer ([`HYBRID_GENERATION_RETAIN`]
+/// = those two). Directories without `manifest.json` are interrupted builds
+/// and stay quarantined — they must not steal the rollback slot by name sort.
+fn prune_unreferenced_hybrid_generations(
+    hybrid_root: &Path,
+    keep_name: &str,
+    previous_name: Option<&str>,
+) -> Result<()> {
+    let gens = hybrid_root.join(HYBRID_GENERATIONS_DIR_NAME);
+    let read_dir = match crate::sanitize::read_dir_validated(&gens) {
+        Ok(read_dir) => read_dir,
+        Err(_) if !gens.exists() => return Ok(()),
+        Err(err) => {
+            return Err(err).context(format!("read generations dir: {}", gens.display()));
+        }
+    };
+    let mut retain: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    retain.insert(keep_name.to_string());
+    if let Some(previous_name) = previous_name
+        && retain.len() < HYBRID_GENERATION_RETAIN
+    {
+        retain.insert(previous_name.to_string());
+    }
+    for entry in read_dir {
+        let entry = entry.with_context(|| format!("read generations entry: {}", gens.display()))?;
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !is_valid_generation_dir_name(name) || retain.contains(name) {
+            continue;
+        }
+        let path = gens.join(name);
+        if !path.join("manifest.json").is_file() {
+            continue;
+        }
+        let validated = crate::sanitize::validate_dir_path(&path)
+            .with_context(|| format!("validate unreferenced generation: {}", path.display()))?;
+        std::fs::remove_dir_all(&validated)
+            .with_context(|| format!("remove unreferenced generation: {}", validated.display()))?;
+    }
     Ok(())
 }
 

@@ -4096,7 +4096,7 @@ _aicx() {
             return 0
             ;;
         aicx__subcmd__sessions__subcmd__list)
-            opts="-j -v -h --cwd --agent --since --all --limit --format --json --verbose --project-fuzzy --help"
+            opts="-j -v -h -p --cwd --project --agent --since --all --limit --format --json --verbose --project-fuzzy --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0

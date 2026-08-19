@@ -1282,7 +1282,7 @@ fn infer_cwd_from_path(agent: AgentKind, path: &Path) -> Option<String> {
             encoded_cwd
                 .file_name()
                 .and_then(|name| name.to_str())
-                .map(decode_grok_cwd)
+                .map(crate::sessions::decode_percent_encoded_path)
         }
         _ => None,
     }
@@ -1318,41 +1318,12 @@ fn sniff_claude_cwd(path: &Path) -> Option<String> {
     None
 }
 
-fn decode_grok_cwd(encoded: &str) -> String {
-    let bytes = encoded.as_bytes();
-    let mut decoded = Vec::with_capacity(bytes.len());
-    let mut cursor = 0usize;
-    while cursor < bytes.len() {
-        if bytes[cursor] == b'%'
-            && cursor + 2 < bytes.len()
-            && let (Some(high), Some(low)) =
-                (hex_nibble(bytes[cursor + 1]), hex_nibble(bytes[cursor + 2]))
-        {
-            decoded.push((high << 4) | low);
-            cursor += 3;
-        } else {
-            decoded.push(bytes[cursor]);
-            cursor += 1;
-        }
-    }
-    String::from_utf8_lossy(&decoded).into_owned()
-}
-
 fn grok_session_id_from_path(path: &Path) -> Option<String> {
     path.parent()?
         .file_name()?
         .to_str()
         .filter(|name| !name.is_empty())
         .map(str::to_string)
-}
-
-const fn hex_nibble(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
 }
 
 fn infer_project_from_path(agent: AgentKind, path: &Path) -> Option<String> {
