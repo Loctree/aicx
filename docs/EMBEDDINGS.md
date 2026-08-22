@@ -249,8 +249,11 @@ Contract:
   `aicx index` full rebuild materializes a single-payload generation and
   publishes it. No index files are deleted by the migration.
 
-Old generation directories accumulate until the doctor/quarantine surface
-reclaims them; this cut intentionally does not delete anything.
+After a successful pointer flip, AICX keeps the live complete generation and
+one complete rollback, then prunes older complete generations. Interrupted
+directories without `manifest.json` stay quarantined because an active writer
+may still own them; an offline cleanup must stop all AICX writers before
+removing those directories.
 
 ## Dense Migration Benchmark
 
