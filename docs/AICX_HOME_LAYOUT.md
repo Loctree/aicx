@@ -22,6 +22,24 @@ $AICX_HOME/
   state/
   locks/
   config.toml
+  .aicxignore                       # checkout paths excluded from the index
+```
+
+## `.aicxignore`
+
+`$AICX_HOME/.aicxignore` lists checkout paths that must not enter search
+memory. `~/Repozytoria/moje_prywatne` covers that directory and every
+nested repo under it. Absolute paths work the same way.
+
+The catalog still records the session. Multi-root sessions already split
+on `cwd` into project buckets; only frames whose `cwd` sits under a listed
+prefix are dropped before index/extract-for-search. A stray `cd` into a
+private tree does not throw away the rest of the session.
+
+```
+# ~/.aicx/.aicxignore
+~/Repozytoria/moje_prywatne
+/Volumes/secret/client-side
 ```
 
 ## Catalog

@@ -117,6 +117,13 @@ under the catalog lock, and reattributes existing rows whose `cwd` resolves to
 a git origin. It refuses to create an initial partial census: one full rebuild
 is still required on a new AICX home.
 
+`$AICX_HOME/.aicxignore` is the operator deny list for search memory. Each
+line is a checkout path (`~/Repozytoria/moje_prywatne` or absolute). That
+directory and every repo under it are excluded at **frame** grain: a
+session that wandered in for one turn still indexes its other project
+buckets. Re-run `aicx index` after editing the file (cached extracts are
+not reused while ignore rules are present).
+
 ### Multi-machine / sync (operator truth)
 
 1. **Session JSONL sync** — catalog only discovers files under this host's agent

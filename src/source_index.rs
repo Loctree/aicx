@@ -221,6 +221,8 @@ pub fn build(
         .filter(|entry| project_selected(entry.project.as_deref(), project_filters))
         .collect();
     let user_home = crate::os_user_home().unwrap_or_else(|| aicx_home.to_path_buf());
+    let ignore =
+        crate::legacy_archive::load_repo_path_ignore(aicx_home, &user_home).unwrap_or_default();
     let source_allow = crate::source_path::SourceAllowlist::for_operator(&user_home, aicx_home);
     // Digest includes LIVE size+mtime so appends without catalog rebuild still
     // move the generation fingerprint (source-change incremental).
@@ -293,8 +295,14 @@ pub fn build(
         // True incremental: reuse a prior extract only when the source
         // fingerprint (path + size + mtime) still matches and extract bytes
         // have not been tampered with.
-        if let Some(chunk) =
-            try_reuse_cached_extract(aicx_home, entry, &prior_state, &session_key, &source_allow)
+        if ignore.is_empty()
+            && let Some(chunk) = try_reuse_cached_extract(
+                aicx_home,
+                entry,
+                &prior_state,
+                &session_key,
+                &source_allow,
+            )
         {
             let record = prior_state
                 .sessions
@@ -348,6 +356,7 @@ pub fn build(
             frame.message = clean_message(&frame.message);
         }
         frames.retain(|frame| !frame.message.trim().is_empty());
+        drop_ignored_cwd_frames(&mut frames, &ignore);
         let signal_count = frames.len();
         signal_frames += signal_count;
         let filtered_count = before.saturating_sub(frames.len());
@@ -746,8 +755,11 @@ pub fn search_session_passages(
 }
 
 fn read_session_document(aicx_home: &Path, entry: &CatalogEntry) -> Result<SessionDocument> {
+    let user_home = crate::os_user_home().unwrap_or_else(|| aicx_home.to_path_buf());
+    let ignore =
+        crate::legacy_archive::load_repo_path_ignore(aicx_home, &user_home).unwrap_or_default();
     let cache_path = extract_path_for(aicx_home, &entry.agent, &entry.session_id);
-    if cache_path.is_file() {
+    if ignore.is_empty() && cache_path.is_file() {
         let body = crate::source_path::read_under_aicx_home(aicx_home, &cache_path)
             .with_context(|| format!("read session extract cache {}", cache_path.display()))?;
         return Ok(SessionDocument {
@@ -757,8 +769,6 @@ fn read_session_document(aicx_home: &Path, entry: &CatalogEntry) -> Result<Sessi
             cache_hit: true,
         });
     }
-
-    let user_home = crate::os_user_home().unwrap_or_else(|| aicx_home.to_path_buf());
     let source_allow = crate::source_path::SourceAllowlist::for_operator(&user_home, aicx_home);
     let source_path = source_allow
         .resolve_file(entry.source_path.as_str())
@@ -775,6 +785,7 @@ fn read_session_document(aicx_home: &Path, entry: &CatalogEntry) -> Result<Sessi
         frame.message = clean_message(&frame.message);
     }
     frames.retain(|frame| !frame.message.trim().is_empty());
+    drop_ignored_cwd_frames(&mut frames, &ignore);
     let body = render_extract(entry, &frames);
     Ok(SessionDocument {
         body,
@@ -971,7 +982,20 @@ pub(crate) fn read_catalog_conversation_at(
         frame.message = clean_message(&frame.message);
     }
     frames.retain(|frame| !frame.message.trim().is_empty());
+    let ignore =
+        crate::legacy_archive::load_repo_path_ignore(aicx_home, &user_home).unwrap_or_default();
+    drop_ignored_cwd_frames(&mut frames, &ignore);
     Ok((source_path, frames))
+}
+
+fn drop_ignored_cwd_frames(
+    frames: &mut Vec<TimelineEntry>,
+    ignore: &crate::legacy_archive::RepoPathIgnoreMatcher,
+) {
+    if ignore.is_empty() {
+        return;
+    }
+    frames.retain(|frame| !ignore.ignores_cwd(frame.cwd.as_deref()));
 }
 
 fn frame_matches_kind(frame: &TimelineEntry, requested: FrameKind) -> bool {
