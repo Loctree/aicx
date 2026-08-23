@@ -10,7 +10,6 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  RUST_MEMEX_REF: 047e63bd9c89bb174fed6e69f9a3a9c203e04981
 
 jobs:
   check:
@@ -20,10 +19,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: linux-self-hosted
-            runner: '["self-hosted", "ops-linux"]'
-          - name: macos-self-hosted
-            runner: '["self-hosted", "dragon-macos"]'
+          # Hosted runners only: org self-hosted runners are not exposed to
+          # private repositories since the 2026-08 miner incident.
+          - name: linux
+            runner: '"ubuntu-latest"'
+          - name: macos
+            runner: '"macos-15"'
           - name: windows-latest
             runner: '"windows-latest"'
 
@@ -31,35 +32,6 @@ jobs:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           path: aicx
-
-      - name: Checkout rust-memex sibling
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
-        with:
-          repository: Loctree/rust-memex
-          ref: ${{ env.RUST_MEMEX_REF }}
-          path: rust-memex
-
-      - name: Install protoc
-        # Skipped on Windows: the slim Windows bundle builds default features
-        # only (no `lance`), so rust-memex/grpc — the sole protoc consumer —
-        # is never compiled.
-        if: runner.os != 'Windows'
-        shell: bash
-        run: |
-          if command -v protoc >/dev/null 2>&1; then
-            echo "protoc already installed: $(protoc --version)"
-            exit 0
-          fi
-          if [[ "$RUNNER_OS" == "Linux" ]]; then
-            sudo apt-get update -qq
-            sudo apt-get install -y -qq protobuf-compiler
-          elif [[ "$RUNNER_OS" == "macOS" ]]; then
-            brew install protobuf
-          else
-            echo "::error::Unsupported OS for protoc install: $RUNNER_OS"
-            exit 1
-          fi
-          protoc --version
 
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         if: runner.os == 'Linux'
