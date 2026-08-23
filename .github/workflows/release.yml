@@ -289,6 +289,13 @@ jobs:
           # GGUF stays a Unix/native-runner capability.
           NO_DEFAULT_FEATURES: "1"
           FEATURES: app,cloud-embedder
+          # windows-pc is the operator's lower-resource self-hosted machine.
+          # An unconstrained release build launched enough concurrent rustc
+          # processes for several of them to fast-fail together with
+          # 0xc0000409. The same source and pinned toolchain are green on the
+          # hosted exact-main Windows gate, so serialize this signing runner
+          # instead of weakening the release profile or dropping Windows.
+          CARGO_BUILD_JOBS: "1"
           AICX_CLEAN_AFTER_BUILD: "0"
           PACKAGE_NAME: ${{ env.PACKAGE_NAME }}
           LOCTREE_GPG_KEY_ID: ${{ vars.LOCTREE_GPG_KEY_ID }}

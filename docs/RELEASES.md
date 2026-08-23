@@ -34,11 +34,21 @@ Each bundle contains:
 - `docs/RELEASES.md`
 - `release-manifest.json`
 
+The Windows zip is portable and intentionally omits the Unix-only
+`install.sh`; users invoke `aicx.exe` and `aicx-mcp.exe` directly.
+
 The release workflow builds exactly three binary targets:
 
 - `aarch64-apple-darwin`
 - `x86_64-unknown-linux-gnu`
 - `x86_64-pc-windows-msvc`
+
+The signed Windows leg runs on the operator-owned `windows-pc` runner because
+that host owns the release GPG key. Cargo is serialized there with
+`CARGO_BUILD_JOBS=1`: an unconstrained release build can exceed that machine's
+compiler capacity and make multiple `rustc` processes fast-fail together.
+The hosted Windows merge gate remains the clean-machine proof that the same
+MSVC target and bundle path compile independently of the signing host.
 
 Do not revive the removed unsigned/musl archive lane. Adding a platform means
 updating the build matrix, installer, npm metadata checks, documentation, and
