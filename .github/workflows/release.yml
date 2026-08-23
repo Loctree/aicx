@@ -233,7 +233,10 @@ jobs:
         shell: bash
         run: |
           python3 -m pip install --disable-pip-version-check cargo-zigbuild==0.23.0
-          cargo zigbuild --version
+          # cargo-zigbuild 0.23.0 exposes no --version flag. Probe the pinned
+          # subcommand through its stable help path so a healthy install does
+          # not fail before the actual glibc-floor build starts.
+          cargo zigbuild --help >/dev/null
 
       - name: Build signed + notarized macOS bundle (dragon-macos)
         if: matrix.runner_name == 'dragon-macos'
@@ -286,6 +289,13 @@ jobs:
           # GGUF stays a Unix/native-runner capability.
           NO_DEFAULT_FEATURES: "1"
           FEATURES: app,cloud-embedder
+          # windows-pc is the operator's lower-resource self-hosted machine.
+          # An unconstrained release build launched enough concurrent rustc
+          # processes for several of them to fast-fail together with
+          # 0xc0000409. The same source and pinned toolchain are green on the
+          # hosted exact-main Windows gate, so serialize this signing runner
+          # instead of weakening the release profile or dropping Windows.
+          CARGO_BUILD_JOBS: "1"
           AICX_CLEAN_AFTER_BUILD: "0"
           PACKAGE_NAME: ${{ env.PACKAGE_NAME }}
           LOCTREE_GPG_KEY_ID: ${{ vars.LOCTREE_GPG_KEY_ID }}
@@ -316,7 +326,18 @@ jobs:
           archive="${archives[0]}"
           case "${archive}" in
             *.tar.gz) tar -xzf "${archive}" -C "${smoke_dir}" ;;
-            *.zip) tar -xf "${archive}" -C "${smoke_dir}" ;;
+            # Git Bash on the self-hosted signing machine provides GNU tar,
+            # which cannot extract zip files (hosted Windows happens to find
+            # bsdtar first). Python 3.11+ is already a hard requirement of the
+            # Windows bundle step, so use its portable stdlib zip reader there.
+            # macOS has bsdtar but no guaranteed `python` alias; retain tar.
+            *.zip)
+              if [[ "${RUNNER_OS}" == "Windows" ]]; then
+                python -c 'import sys, zipfile; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])' "${archive}" "${smoke_dir}"
+              else
+                tar -xf "${archive}" -C "${smoke_dir}"
+              fi
+              ;;
             *) echo "unsupported archive: ${archive}" >&2; exit 1 ;;
           esac
           bundle_dir=$(find "${smoke_dir}" -mindepth 1 -maxdepth 1 -type d | head -1)
