@@ -16,7 +16,7 @@ In multi-agent environments (fleet of 10–50 agents: Codex, Claude, Gemini, Ant
 | **RAM usage** | Memory duplication for each process (50 × 50MB+) | **Shared RAM (~30–60MB per process)** |
 | **Cache management** | Disk contention over `.cache` files | **Single in-memory `Arc<Snapshot>` in RAM** |
 | **Query speed** | Binary startup + cold read per call | **< 1–5 ms (instant RAM graph lookup)** |
-| **Remote access** | Only locally on the working machine | **Network / Tailscale access (`dragon`, `div0`, `sztudio`)** |
+| **Remote access** | Only locally on the working machine | **Network / Tailscale access (`host-a`, `host-b`)** |
 | **Scalability** | Overwhelms CPU and file descriptor limits | **Tokio + Axum easily handles thousands of concurrent requests** |
 
 ---

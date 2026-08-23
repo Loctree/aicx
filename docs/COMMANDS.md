@@ -141,10 +141,10 @@ not reused while ignore rules are present).
 3. **Copying only `sessions.jsonl` fails** — rows keep absolute `source_path`;
    the indexing host must open those paths. Symptom: `missing_source`.
 4. **0.6b next to 8b** — dense generations are model+dimension locked
-   (fail-closed). Do not merge laptop 0.6b dense into dragon 8b CURRENT.
+   (fail-closed). Do not merge laptop 0.6b dense into the owner's 8b CURRENT.
    Rebuild lexical CURRENT on the owner host from shared sources; optional
    dense on that same embedder only.
-5. **Dragon as index owner** — recommended: dragon runs `catalog rebuild` +
+5. **One host as index owner** — recommended: the owner host runs `catalog rebuild` +
    `index`, hosts embedder (`config.toml` cloud URL), and
    `aicx serve --transport http --auth-token … --allowed-host <tailscale-name>`.
    Remotes use streamable HTTP MCP with Bearer (not OAuth). See

@@ -16,7 +16,7 @@ W środowiskach wieloagentowych (flota 10–50 agentów Codex, Claude, Gemini, A
 | **Zużycie RAM** | Duplikacja pamięci per proces (50 × 50MB+) | **Współdzielona pamięć RAM (~30–60MB na proces)** |
 | **Zarządzanie cache** | Wyścigi dyskowe o pliki `.cache` | **Jedno in-memory `Arc<Snapshot>` w pamięci RAM** |
 | **Szybkość zapytań** | Start binarki + cold read per wywołanie | **< 1–5 ms (natychmiastowy odczyt grafu z RAM)** |
-| **Dostęp zdalny** | Tylko lokalnie na maszynie roboczej | **Dostęp po sieci / Tailscale (`dragon`, `div0`, `sztudio`)** |
+| **Dostęp zdalny** | Tylko lokalnie na maszynie roboczej | **Dostęp po sieci / Tailscale (`host-a`, `host-b`)** |
 | **Skalowalność** | Dławi CPU i wyczerpuje limity deskryptorów plików | **Tokio + Axum bez problemu obsługuje tysiące zapytań** |
 
 ---

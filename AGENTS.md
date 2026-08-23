@@ -335,8 +335,7 @@ Precedence (full channel map in `docs/install-paths.md`):
 Why this is law: a non-programmer founder / stranger cannot be expected to have
 a Rust toolchain, `protoc`, or spare build disk. Source-build fragility
 (missing `cargo`, full disk, toolchain PATH drift) is an internal-CI concern,
-not a user-facing install path. The 2026-07-24 ops-runner outage — a self-hosted
-build machine wedged by a full disk — is the internal echo of exactly the
+not a user-facing install path. A self-hosted build machine wedged by a full disk is the internal echo of exactly the
 failure mode a stranger would hit; do not export it to users.
 
 Agent rules:
