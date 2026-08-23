@@ -156,6 +156,10 @@ struct SessionDocument {
 struct SourceParseState {
     schema: String,
     signal_filter_version: String,
+    /// Hash of normalized checkout prefixes from `$AICX_HOME/.aicxignore`.
+    /// Old ledgers deserialize to empty and are deliberately not reusable.
+    #[serde(default)]
+    repo_path_ignore_fingerprint: String,
     sessions: BTreeMap<String, SessionParseRecord>,
 }
 
@@ -221,11 +225,18 @@ pub fn build(
         .filter(|entry| project_selected(entry.project.as_deref(), project_filters))
         .collect();
     let user_home = crate::os_user_home().unwrap_or_else(|| aicx_home.to_path_buf());
+    let ignore = crate::legacy_archive::load_repo_path_ignore(aicx_home, &user_home)?;
+    let repo_path_ignore_fingerprint = ignore.fingerprint();
     let source_allow = crate::source_path::SourceAllowlist::for_operator(&user_home, aicx_home);
     // Digest includes LIVE size+mtime so appends without catalog rebuild still
     // move the generation fingerprint (source-change incremental).
-    let source_fingerprint =
-        source_fingerprint(aicx_home, &catalog_path, &selected, &source_allow)?;
+    let source_fingerprint = source_fingerprint(
+        aicx_home,
+        &catalog_path,
+        &selected,
+        &source_allow,
+        &repo_path_ignore_fingerprint,
+    )?;
     // Incremental short-circuit applies to both publish and dry-run. A matching
     // live+catalog digest means CURRENT already reflects this snapshot —
     // re-parsing ~10k sources on every `index --dry-run` recreated the mill
@@ -278,13 +289,14 @@ pub fn build(
     let mut next_state = SourceParseState {
         schema: PARSE_STATE_SCHEMA.to_string(),
         signal_filter_version: SIGNAL_FILTER_VERSION.to_string(),
+        repo_path_ignore_fingerprint: repo_path_ignore_fingerprint.clone(),
         sessions: BTreeMap::new(),
     };
 
     let prior_state = if full_rescan {
         SourceParseState::default()
     } else {
-        load_parse_state(aicx_home)
+        load_parse_state(aicx_home, &repo_path_ignore_fingerprint)
     };
 
     for entry in &selected {
@@ -293,9 +305,14 @@ pub fn build(
         // True incremental: reuse a prior extract only when the source
         // fingerprint (path + size + mtime) still matches and extract bytes
         // have not been tampered with.
-        if let Some(chunk) =
-            try_reuse_cached_extract(aicx_home, entry, &prior_state, &session_key, &source_allow)
-        {
+        if let Some(chunk) = try_reuse_cached_extract(
+            aicx_home,
+            entry,
+            &prior_state,
+            &session_key,
+            &source_allow,
+            &repo_path_ignore_fingerprint,
+        ) {
             let record = prior_state
                 .sessions
                 .get(&session_key)
@@ -348,6 +365,7 @@ pub fn build(
             frame.message = clean_message(&frame.message);
         }
         frames.retain(|frame| !frame.message.trim().is_empty());
+        drop_ignored_cwd_frames(&mut frames, &ignore);
         let signal_count = frames.len();
         signal_frames += signal_count;
         let filtered_count = before.saturating_sub(frames.len());
@@ -746,20 +764,28 @@ pub fn search_session_passages(
 }
 
 fn read_session_document(aicx_home: &Path, entry: &CatalogEntry) -> Result<SessionDocument> {
+    let user_home = crate::os_user_home().unwrap_or_else(|| aicx_home.to_path_buf());
+    let ignore = crate::legacy_archive::load_repo_path_ignore(aicx_home, &user_home)?;
+    let repo_path_ignore_fingerprint = ignore.fingerprint();
     let cache_path = extract_path_for(aicx_home, &entry.agent, &entry.session_id);
-    if cache_path.is_file() {
-        let body = crate::source_path::read_under_aicx_home(aicx_home, &cache_path)
-            .with_context(|| format!("read session extract cache {}", cache_path.display()))?;
+    let source_allow = crate::source_path::SourceAllowlist::for_operator(&user_home, aicx_home);
+    let prior_state = load_parse_state(aicx_home, &repo_path_ignore_fingerprint);
+    let session_key = session_state_key(&entry.agent, &entry.session_id);
+    if let Some(chunk) = try_reuse_cached_extract(
+        aicx_home,
+        entry,
+        &prior_state,
+        &session_key,
+        &source_allow,
+        &repo_path_ignore_fingerprint,
+    ) {
         return Ok(SessionDocument {
-            body,
+            body: chunk.text,
             source_path: entry.source_path.clone(),
             document_path: cache_path,
             cache_hit: true,
         });
     }
-
-    let user_home = crate::os_user_home().unwrap_or_else(|| aicx_home.to_path_buf());
-    let source_allow = crate::source_path::SourceAllowlist::for_operator(&user_home, aicx_home);
     let source_path = source_allow
         .resolve_file(entry.source_path.as_str())
         .with_context(|| {
@@ -775,6 +801,7 @@ fn read_session_document(aicx_home: &Path, entry: &CatalogEntry) -> Result<Sessi
         frame.message = clean_message(&frame.message);
     }
     frames.retain(|frame| !frame.message.trim().is_empty());
+    drop_ignored_cwd_frames(&mut frames, &ignore);
     let body = render_extract(entry, &frames);
     Ok(SessionDocument {
         body,
@@ -971,7 +998,19 @@ pub(crate) fn read_catalog_conversation_at(
         frame.message = clean_message(&frame.message);
     }
     frames.retain(|frame| !frame.message.trim().is_empty());
+    let ignore = crate::legacy_archive::load_repo_path_ignore(aicx_home, &user_home)?;
+    drop_ignored_cwd_frames(&mut frames, &ignore);
     Ok((source_path, frames))
+}
+
+fn drop_ignored_cwd_frames(
+    frames: &mut Vec<TimelineEntry>,
+    ignore: &crate::legacy_archive::RepoPathIgnoreMatcher,
+) {
+    if ignore.is_empty() {
+        return;
+    }
+    frames.retain(|frame| !ignore.ignores_cwd(frame.cwd.as_deref()));
 }
 
 fn frame_matches_kind(frame: &TimelineEntry, requested: FrameKind) -> bool {
@@ -1000,6 +1039,7 @@ fn parse_large_codex_signal(
     let mut reader = BufReader::new(file);
     let mut frames = Vec::new();
     let mut line_no = 0u64;
+    let mut current_cwd = entry.cwd.clone();
     while let Some(record) = crate::sanitize::read_line_capped(&mut reader, MAX_JSONL_RECORD_BYTES)?
     {
         line_no += 1;
@@ -1009,6 +1049,18 @@ fn parse_large_codex_signal(
         let Ok(value) = serde_json::from_str::<serde_json::Value>(&record.line) else {
             continue;
         };
+        if value.get("type").and_then(serde_json::Value::as_str) == Some("turn_context") {
+            if let Some(cwd) = value
+                .get("payload")
+                .and_then(|payload| payload.get("cwd"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|cwd| !cwd.is_empty())
+            {
+                current_cwd = Some(cwd.to_string());
+            }
+            continue;
+        }
         if value.get("type").and_then(serde_json::Value::as_str) != Some("response_item") {
             continue;
         }
@@ -1057,7 +1109,7 @@ fn parse_large_codex_signal(
             message,
             frame_kind: Some(frame_kind),
             branch: None,
-            cwd: entry.cwd.clone(),
+            cwd: current_cwd.clone(),
             timestamp_source: Some("record".to_string()),
             source_path: Some(entry.source_path.clone()),
             source_sha256: None,
@@ -1245,7 +1297,7 @@ fn parse_state_path(aicx_home: &Path) -> PathBuf {
     aicx_home.join(PARSE_STATE_RELPATH)
 }
 
-fn load_parse_state(aicx_home: &Path) -> SourceParseState {
+fn load_parse_state(aicx_home: &Path, repo_path_ignore_fingerprint: &str) -> SourceParseState {
     let path = parse_state_path(aicx_home);
     if !path.is_file() {
         return SourceParseState::default();
@@ -1256,7 +1308,10 @@ fn load_parse_state(aicx_home: &Path) -> SourceParseState {
     let Ok(state) = serde_json::from_str::<SourceParseState>(&raw) else {
         return SourceParseState::default();
     };
-    if state.schema != PARSE_STATE_SCHEMA || state.signal_filter_version != SIGNAL_FILTER_VERSION {
+    if state.schema != PARSE_STATE_SCHEMA
+        || state.signal_filter_version != SIGNAL_FILTER_VERSION
+        || state.repo_path_ignore_fingerprint != repo_path_ignore_fingerprint
+    {
         return SourceParseState::default();
     }
     state
@@ -1298,8 +1353,11 @@ fn try_reuse_cached_extract(
     prior: &SourceParseState,
     session_key: &str,
     source_allow: &crate::source_path::SourceAllowlist,
+    repo_path_ignore_fingerprint: &str,
 ) -> Option<aicx_retrieve::ChunkRef> {
-    if prior.signal_filter_version != SIGNAL_FILTER_VERSION {
+    if prior.signal_filter_version != SIGNAL_FILTER_VERSION
+        || prior.repo_path_ignore_fingerprint != repo_path_ignore_fingerprint
+    {
         return None;
     }
     let record = prior.sessions.get(session_key)?;
@@ -1376,11 +1434,16 @@ fn source_fingerprint(
     catalog_path: &Path,
     entries: &[CatalogEntry],
     source_allow: &crate::source_path::SourceAllowlist,
+    repo_path_ignore_fingerprint: &str,
 ) -> Result<String> {
     let mut hasher = Sha256::new();
     // Filter generation first so a catalog-identical CURRENT cannot hide a
     // pre-filter corpus after signal-body rules change.
     hasher.update(SIGNAL_FILTER_VERSION.as_bytes());
+    hasher.update([0]);
+    // Privacy rules are part of corpus identity. A rule edit must invalidate
+    // CURRENT even when the catalog and every source file are unchanged.
+    hasher.update(repo_path_ignore_fingerprint.as_bytes());
     hasher.update([0]);
     // Catalog membership (session ids + project attribution) is part of the
     // digest so new rows always admit a rebuild even when live stats match.
@@ -1562,6 +1625,120 @@ mod tests {
     }
 
     #[test]
+    fn large_codex_signal_tracks_turn_context_cwd_per_frame() {
+        let root = std::env::temp_dir().join(format!(
+            "aicx-source-index-large-codex-cwd-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let source_path = root.join("rollout.jsonl");
+        let body = concat!(
+            "{\"timestamp\":\"2026-08-22T00:00:00Z\",\"type\":\"turn_context\",\"payload\":{\"cwd\":\"/repo/public\"}}\n",
+            "{\"timestamp\":\"2026-08-22T00:00:01Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"public marker\"}]}}\n",
+            "{\"timestamp\":\"2026-08-22T00:00:02Z\",\"type\":\"turn_context\",\"payload\":{\"cwd\":\"/repo/private\"}}\n",
+            "{\"timestamp\":\"2026-08-22T00:00:03Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"private marker\"}]}}\n"
+        );
+        fs::write(&source_path, body).unwrap();
+        let entry = CatalogEntry {
+            schema: crate::catalog::CATALOG_SCHEMA.to_string(),
+            session_id: "large-codex".to_string(),
+            agent: "codex".to_string(),
+            project: Some("owner/repo".to_string()),
+            date: Some("2026-08-22".to_string()),
+            cwd: Some("/repo/initial".to_string()),
+            source_path: source_path.display().to_string(),
+            source_len: None,
+            source_mtime_ns: None,
+            title: None,
+            machine: None,
+            logical_session_id: None,
+        };
+        let allow = crate::source_path::SourceAllowlist::from_roots([root.clone()]);
+
+        let frames = parse_large_codex_signal(&entry, &source_path, &allow).unwrap();
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].cwd.as_deref(), Some("/repo/public"));
+        assert_eq!(frames[1].cwd.as_deref(), Some("/repo/private"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn source_fingerprint_changes_with_checkout_deny_list() {
+        let root = std::env::temp_dir().join(format!(
+            "aicx-source-index-ignore-fingerprint-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("catalog")).unwrap();
+        let catalog_path = root.join("catalog/sessions.jsonl");
+        fs::write(&catalog_path, "catalog snapshot\n").unwrap();
+        let allow = crate::source_path::SourceAllowlist::from_roots([root.clone()]);
+
+        let before = source_fingerprint(&root, &catalog_path, &[], &allow, "deny-a").unwrap();
+        let after = source_fingerprint(&root, &catalog_path, &[], &allow, "deny-b").unwrap();
+        assert_ne!(before, after);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn checkout_deny_list_drops_only_matching_frames() {
+        let root = std::env::temp_dir().join(format!(
+            "aicx-source-index-ignore-frames-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let aicx_home = root.join(".aicx");
+        fs::create_dir_all(&aicx_home).unwrap();
+        fs::write(
+            aicx_home.join(crate::legacy_archive::AICX_IGNORE_FILENAME),
+            "/repo/private\n",
+        )
+        .unwrap();
+        let ignore = crate::legacy_archive::load_repo_path_ignore(&aicx_home, &root).unwrap();
+        let frame = |message: &str, cwd: &str| TimelineEntry {
+            timestamp: chrono::Utc::now(),
+            agent: "codex".to_string(),
+            session_id: "multi-root".to_string(),
+            role: "user".to_string(),
+            message: message.to_string(),
+            frame_kind: Some(FrameKind::UserMsg),
+            branch: None,
+            cwd: Some(cwd.to_string()),
+            timestamp_source: Some("record".to_string()),
+            source_path: None,
+            source_sha256: None,
+            source_line_span: None,
+        };
+        let mut frames = vec![
+            frame("keep public", "/repo/public"),
+            frame("drop private", "/repo/private/nested"),
+            frame("keep public again", "/repo/public"),
+        ];
+
+        drop_ignored_cwd_frames(&mut frames, &ignore);
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].message, "keep public");
+        assert_eq!(frames[1].message, "keep public again");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn parse_state_reuse_requires_matching_source_path_and_extract_hash() {
         let root = std::env::temp_dir().join(format!(
             "aicx-source-index-reuse-{}-{}",
@@ -1606,6 +1783,7 @@ mod tests {
         let mut prior = SourceParseState {
             schema: PARSE_STATE_SCHEMA.to_string(),
             signal_filter_version: SIGNAL_FILTER_VERSION.to_string(),
+            repo_path_ignore_fingerprint: "ignore-fingerprint".to_string(),
             sessions: BTreeMap::new(),
         };
         prior.sessions.insert(
@@ -1628,22 +1806,34 @@ mod tests {
         let key = session_state_key("claude", "session");
         // Allowlist roots: treat test root as both HOME and aicx_home.
         let allow = crate::source_path::SourceAllowlist::for_operator(&root, &root);
-        let reused = try_reuse_cached_extract(&root, &entry, &prior, &key, &allow)
-            .expect("matching source fingerprint+hash must reuse");
+        let reused =
+            try_reuse_cached_extract(&root, &entry, &prior, &key, &allow, "ignore-fingerprint")
+                .expect("matching source fingerprint+hash must reuse");
         assert!(reused.text.contains("arrows vc-frame"));
         assert_eq!(reused.id, "claude:session");
 
         // Source path drift invalidates reuse.
         let mut drifted = entry.clone();
         drifted.source_path = "/elsewhere/session.jsonl".to_string();
-        assert!(try_reuse_cached_extract(&root, &drifted, &prior, &key, &allow).is_none());
+        assert!(
+            try_reuse_cached_extract(&root, &drifted, &prior, &key, &allow, "ignore-fingerprint")
+                .is_none()
+        );
 
         // Catalog-only size drift must NOT invalidate when live file is unchanged
         // (catalog lag after a live-stamped reparse is expected).
         let mut catalog_lag = entry.clone();
         catalog_lag.source_len = Some(source_len + 64);
         assert!(
-            try_reuse_cached_extract(&root, &catalog_lag, &prior, &key, &allow).is_some(),
+            try_reuse_cached_extract(
+                &root,
+                &catalog_lag,
+                &prior,
+                &key,
+                &allow,
+                "ignore-fingerprint"
+            )
+            .is_some(),
             "stale catalog size alone must not force reparse when live matches"
         );
 
@@ -1655,7 +1845,8 @@ mod tests {
         .unwrap();
         // Coarse FS mtime: touch content size always changes here.
         assert!(
-            try_reuse_cached_extract(&root, &entry, &prior, &key, &allow).is_none(),
+            try_reuse_cached_extract(&root, &entry, &prior, &key, &allow, "ignore-fingerprint")
+                .is_none(),
             "live append must invalidate reuse"
         );
         // Restore live bytes so later checks use the original fingerprint.
@@ -1668,12 +1859,31 @@ mod tests {
 
         // Zeroed legacy records never reuse (forces reparse after upgrade).
         prior.sessions.get_mut(&key).unwrap().source_len = 0;
-        assert!(try_reuse_cached_extract(&root, &entry, &prior, &key, &allow).is_none());
+        assert!(
+            try_reuse_cached_extract(&root, &entry, &prior, &key, &allow, "ignore-fingerprint")
+                .is_none()
+        );
         prior.sessions.get_mut(&key).unwrap().source_len = restored_len;
+
+        assert!(
+            try_reuse_cached_extract(
+                &root,
+                &entry,
+                &prior,
+                &key,
+                &allow,
+                "changed-ignore-fingerprint"
+            )
+            .is_none(),
+            "deny-list drift must invalidate cached extracts"
+        );
 
         // Corrupt extract bytes invalidate reuse.
         fs::write(&extract_path, "tampered").unwrap();
-        assert!(try_reuse_cached_extract(&root, &entry, &prior, &key, &allow).is_none());
+        assert!(
+            try_reuse_cached_extract(&root, &entry, &prior, &key, &allow, "ignore-fingerprint")
+                .is_none()
+        );
 
         let _ = fs::remove_dir_all(&root);
     }

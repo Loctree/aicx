@@ -22,6 +22,28 @@ $AICX_HOME/
   state/
   locks/
   config.toml
+  .aicxignore                       # checkout paths excluded from the index
+```
+
+## `.aicxignore`
+
+`$AICX_HOME/.aicxignore` lists checkout paths that must not enter search
+memory. `~/Repozytoria/moje_prywatne` covers that directory and every
+nested repo under it. Absolute paths work the same way.
+
+The catalog still records the session. Multi-root sessions already split
+on `cwd` into project buckets; only frames whose `cwd` sits under a listed
+prefix are dropped before index/extract-for-search. A stray `cd` into a
+private tree does not throw away the rest of the session.
+Path prefixes are literal; glob and negation syntax is rejected for checkout
+rules. A rule change invalidates the published index and matching extract
+cache automatically. If the file cannot be read, indexing and conversation
+retrieval stop instead of admitting unfiltered content.
+
+```
+# ~/.aicx/.aicxignore
+~/Repozytoria/moje_prywatne
+/Volumes/secret/client-side
 ```
 
 ## Catalog
@@ -55,8 +77,11 @@ Deleting the cache does not delete source truth.
 `indexed/_all/hybrid/CURRENT` names the published generation. Tantivy is the
 default query path. Dense mmap is optional and read only for `--deep`.
 
-After the `CURRENT` pointer flips, unreferenced `generations/<id>/`
-directories older than the last two (live + one rollback) are deleted.
+After the `CURRENT` pointer flips, superseded complete
+`generations/<id>/` directories are deleted, leaving the live generation and
+one rollback. Interrupted directories without `manifest.json` remain
+quarantined because another writer may still own them; remove those only in an
+offline cleanup after all AICX writers are stopped.
 Legacy `embeddings.ndjson` and `dense_brute_force.ndjson` are retired
 intermediates. Their deletion is still an explicit operator action.
 

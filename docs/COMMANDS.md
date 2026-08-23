@@ -32,6 +32,11 @@ aicx search --deep 'routing strzałek taby'
 file per session under `~/.aicx/extracts/`. Without that flag, source logs and
 the published index remain the content owners.
 
+Checkout prefixes in `~/.aicx/.aicxignore` are part of index and cache
+identity. Editing the file makes the next `aicx index` rebuild automatically;
+an unreadable file or unsupported checkout glob/negation aborts rather than
+indexing without the deny list.
+
 ## Runtime artifacts
 
 | Surface | Purpose |
@@ -116,6 +121,13 @@ including `pending_chunks`. It does not materialize session content unless
 under the catalog lock, and reattributes existing rows whose `cwd` resolves to
 a git origin. It refuses to create an initial partial census: one full rebuild
 is still required on a new AICX home.
+
+`$AICX_HOME/.aicxignore` is the operator deny list for search memory. Each
+line is a checkout path (`~/Repozytoria/moje_prywatne` or absolute). That
+directory and every repo under it are excluded at **frame** grain: a
+session that wandered in for one turn still indexes its other project
+buckets. Re-run `aicx index` after editing the file (cached extracts are
+not reused while ignore rules are present).
 
 ### Multi-machine / sync (operator truth)
 

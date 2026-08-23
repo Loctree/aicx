@@ -117,7 +117,8 @@ use dedupe::content_sha256;
 pub use dedupe::content_sha256_exists_in_dir;
 
 pub use ignore::{
-    AICX_IGNORE_FILENAME, StoreIgnoreMatcher, filter_ignored_paths_at, load_ignore_matcher_at,
+    AICX_IGNORE_FILENAME, RepoPathIgnoreMatcher, StoreIgnoreMatcher, filter_ignored_paths_at,
+    load_ignore_matcher_at, load_repo_path_ignore,
 };
 use paths::aicx_context_corpus_dir_for;
 pub use paths::{
