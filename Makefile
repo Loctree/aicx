@@ -272,6 +272,7 @@ version-show:
 version-check:
 	@$(PYTHON) tools/release_sync.py check
 	@$(MAKE) version-check-selftest
+	@$(PYTHON) tools/windows_release_contract_check.py
 	@bash tools/release-channel-check.sh
 
 version-check-selftest:
