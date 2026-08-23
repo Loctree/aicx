@@ -484,7 +484,12 @@ pub fn build(
                 sources_skipped += 1;
                 *skipped_by_agent.entry(entry.agent.clone()).or_default() += 1;
                 let (source_len, source_mtime_ns) = catalog_entry_fingerprint(entry);
-                let disposition = if missing_approved_catalog_source(entry, &source_allow) {
+                let prior_disposition = prior_state.dispositions.get(&session_key);
+                let disposition = if recurrent_missing_approved_catalog_source(
+                    entry,
+                    prior_disposition,
+                    &source_allow,
+                ) {
                     SourceDisposition::TerminalSkip {
                         reason: TerminalSkipReason::SourceMissing,
                     }
@@ -1262,17 +1267,37 @@ fn parse_catalog_source_outcome(
     }
 }
 
-fn missing_approved_catalog_source(
+/// Accept an approved-root `NotFound` as terminal only after the same catalog
+/// identity was durably observed missing by an earlier incremental attempt.
+fn recurrent_missing_approved_catalog_source(
     entry: &CatalogEntry,
+    prior: Option<&SourceDispositionRecord>,
     allow: &crate::source_path::SourceAllowlist,
 ) -> bool {
     let candidate = Path::new(&entry.source_path);
+    let (Some(source_len), Some(source_mtime_ns)) = (entry.source_len, entry.source_mtime_ns)
+    else {
+        return false;
+    };
     candidate.is_absolute()
         && !candidate
             .components()
             .any(|component| matches!(component, Component::ParentDir))
         && allow.roots().iter().any(|root| candidate.starts_with(root))
         && matches!(fs::metadata(candidate), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+        && prior.is_some_and(|record| {
+            record.source_path == entry.source_path
+                && record.source_len == source_len
+                && record.source_mtime_ns == source_mtime_ns
+                && matches!(
+                    record.disposition,
+                    SourceDisposition::RetryableError {
+                        reason: RetryableErrorReason::SourceUnavailable
+                    } | SourceDisposition::TerminalSkip {
+                        reason: TerminalSkipReason::SourceMissing
+                    }
+                )
+        })
 }
 
 fn decode_vibecrafted_transcript(bytes: &[u8]) -> Result<&str> {
@@ -2623,7 +2648,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_approved_source_is_terminal_and_allows_publication() {
+    fn missing_approved_source_requires_matching_prior_evidence() {
         let root = std::env::temp_dir().join(format!(
             "aicx-source-incomplete-current-{}-{}",
             std::process::id(),
@@ -2676,29 +2701,112 @@ mod tests {
         fs::create_dir_all(current.parent().unwrap()).unwrap();
         fs::write(&current, "last-good\n").unwrap();
 
-        build(&root, &[], false, true, false, false)
-            .expect("durably missing approved source must be terminal");
+        let error = build(&root, &[], false, true, false, false)
+            .expect_err("first missing observation must block publication");
+        assert!(error.to_string().contains("retryable_error=1"));
+        assert_eq!(fs::read_to_string(&current).unwrap(), "last-good\n");
 
         let raw = fs::read_to_string(parse_state_path(&root)).expect("durable accounting attempt");
-        let state: SourceParseState = serde_json::from_str(&raw).unwrap();
+        let first_state: SourceParseState = serde_json::from_str(&raw).unwrap();
         assert!(matches!(
-            state.dispositions["vibecrafted:indexed"].disposition,
+            first_state.dispositions["vibecrafted:indexed"].disposition,
             SourceDisposition::Indexed
         ));
         assert!(matches!(
-            state.dispositions["vibecrafted:retryable"].disposition,
+            first_state.dispositions["vibecrafted:retryable"].disposition,
+            SourceDisposition::RetryableError {
+                reason: RetryableErrorReason::SourceUnavailable
+            }
+        ));
+        let allow = crate::source_path::SourceAllowlist::for_operator(&root, &root);
+        assert!(recurrent_missing_approved_catalog_source(
+            &entries[1],
+            first_state.dispositions.get("vibecrafted:retryable"),
+            &allow
+        ));
+
+        build(&root, &[], false, false, false, false)
+            .expect("matching recurrent missing evidence must allow publication");
+        let raw = fs::read_to_string(parse_state_path(&root)).expect("terminal accounting");
+        let state: SourceParseState = serde_json::from_str(&raw).unwrap();
+        let prior = &state.dispositions["vibecrafted:retryable"];
+        assert!(matches!(
+            prior.disposition,
             SourceDisposition::TerminalSkip {
                 reason: TerminalSkipReason::SourceMissing
             }
         ));
 
+        assert!(recurrent_missing_approved_catalog_source(
+            &entries[1],
+            Some(prior),
+            &allow
+        ));
+
+        let mut changed_path = entries[1].clone();
+        changed_path.source_path = root.join("other-missing.log").display().to_string();
+        assert!(!recurrent_missing_approved_catalog_source(
+            &changed_path,
+            Some(prior),
+            &allow
+        ));
+
+        let mut changed_fingerprint = entries[1].clone();
+        changed_fingerprint.source_len = Some(78);
+        assert!(!recurrent_missing_approved_catalog_source(
+            &changed_fingerprint,
+            Some(prior),
+            &allow
+        ));
+
+        let mut absent_fingerprint = entries[1].clone();
+        absent_fingerprint.source_mtime_ns = None;
+        assert!(!recurrent_missing_approved_catalog_source(
+            &absent_fingerprint,
+            Some(prior),
+            &allow
+        ));
+
+        let mut empty_source = entries[1].clone();
+        empty_source.source_len = Some(0);
+        let mut empty_prior = prior.clone();
+        empty_prior.source_len = 0;
+        assert!(recurrent_missing_approved_catalog_source(
+            &empty_source,
+            Some(&empty_prior),
+            &allow
+        ));
+
         let mut outside = entries[1].clone();
         outside.source_path = "/not-an-approved-root/missing.log".to_string();
-        let allow = crate::source_path::SourceAllowlist::for_operator(&root, &root);
-        assert!(
-            !missing_approved_catalog_source(&outside, &allow),
-            "missing paths outside the allowlist must remain retryable"
-        );
+        assert!(!recurrent_missing_approved_catalog_source(
+            &outside,
+            Some(prior),
+            &allow
+        ));
+
+        let mut traversal = entries[1].clone();
+        traversal.source_path = root
+            .join("nested")
+            .join("..")
+            .join("missing.log")
+            .display()
+            .to_string();
+        assert!(!recurrent_missing_approved_catalog_source(
+            &traversal,
+            Some(prior),
+            &allow
+        ));
+
+        let directory = root.join("not-a-file");
+        fs::create_dir_all(&directory).unwrap();
+        let mut non_file = entries[1].clone();
+        non_file.source_path = directory.display().to_string();
+        assert!(!recurrent_missing_approved_catalog_source(
+            &non_file,
+            Some(prior),
+            &allow
+        ));
 
         let _ = fs::remove_dir_all(root);
     }
