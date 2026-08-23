@@ -202,6 +202,12 @@ wrapper alone is insufficient: npm can expose it before a just-published
 platform tarball has propagated, causing a transient missing-binary failure on
 one runner even though a later install succeeds.
 
+Windows ZIP extraction is pinned to `%SystemRoot%\System32\tar.exe`. An
+unqualified `tar` is not a portable Windows contract: Git Bash can put GNU tar
+first on `PATH`, and GNU tar does not extract the release ZIP. The installer
+validates the system extractor path and invokes it directly without a shell;
+PowerShell and CI therefore exercise the same native Windows path.
+
 `distribution/npm/` contains one wrapper plus three platform packages:
 
 - `@loctree/aicx-darwin-arm64`
