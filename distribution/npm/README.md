@@ -72,9 +72,9 @@ distribution/npm/
 ## Repo maintenance workflow
 
 ```bash
-node distribution/npm/sync-version.mjs 0.12.3
-node distribution/npm/sync-version.mjs --check 0.12.3
-node distribution/npm/verify-metadata.mjs 0.12.3
+node distribution/npm/sync-version.mjs 0.12.4
+node distribution/npm/sync-version.mjs --check 0.12.4
+node distribution/npm/verify-metadata.mjs 0.12.4
 ```
 
 See [PUBLISHING.md](./PUBLISHING.md) for the publish flow.

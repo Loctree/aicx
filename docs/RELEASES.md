@@ -60,7 +60,7 @@ Download the installer from the same immutable tag as the desired release:
 
 ```bash
 curl -fsSLO https://raw.githubusercontent.com/Loctree/aicx/v0.12.0/install.sh
-AICX_INSTALL_MODE=release AICX_RELEASE_TAG=v0.12.3 bash install.sh
+AICX_INSTALL_MODE=release AICX_RELEASE_TAG=v0.12.4 bash install.sh
 ```
 
 Release mode selects the platform archive, downloads its adjacent `.sha256`,
@@ -148,8 +148,8 @@ After review, runtime acceptance, and merge to `main`:
 The equivalent explicit tag commands are:
 
 ```bash
-git tag -as v0.12.3 -m "Release v0.12.3"
-git push origin v0.12.3
+git tag -as v0.12.4 -m "Release v0.12.4"
+git push origin v0.12.4
 ```
 
 Do not tag or push from a dirty tree, an unmerged branch, or a commit whose
