@@ -170,6 +170,10 @@ for (const platform of PLATFORMS) {
   // Loctree releases never ship `-unsigned` assets — every archive is
   // GPG-detached (and macOS additionally Apple-codesigned + notarized).
   assertNotIncludes(`${platform.key} postinstall`, postinstall, "slim-unsigned");
+  if (platform.key === "win32-x64-gnu") {
+    assertIncludes(`${platform.key} postinstall`, postinstall, 'process.platform === "win32"');
+    assertIncludes(`${platform.key} postinstall`, postinstall, 'execFileSync("tar", ["-xf"');
+  }
 }
 
 verifyHoistedPlatformResolution();

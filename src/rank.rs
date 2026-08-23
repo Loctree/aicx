@@ -1754,7 +1754,7 @@ Some boilerplate text.
             "vetcoders",
             "aicx",
             "sessaicx",
-            "User asked:\nWhy did we move embeddings to Sztudio?\n\nAgent answered:\nDecision: foundationneedle belongs in the content match, not in a metadata banner.\n",
+            "User asked:\nWhy did we move embeddings to host-b?\n\nAgent answered:\nDecision: foundationneedle belongs in the content match, not in a metadata banner.\n",
         );
 
         let (results, scanned) =

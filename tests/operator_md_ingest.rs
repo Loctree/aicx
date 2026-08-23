@@ -322,7 +322,7 @@ project: vetcoders/screen_scribe
 cwd: ~/Git/Screenscribe
 date: 2026-06-17
 source_format: chatgpt-export
-author: monika
+author: tester
 session_id: manual-chatgpt-screenscribe
 ---
 
@@ -364,7 +364,7 @@ Decision: najpierw kontrakt exportu, potem UI copy.
             .message
             .contains("project: vetcoders/screen_scribe")
     );
-    assert!(entries[0].message.contains("author: monika"));
+    assert!(entries[0].message.contains("author: tester"));
     assert!(
         entries[1]
             .message

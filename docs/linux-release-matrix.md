@@ -28,12 +28,17 @@ leg executes the repository bundle contract on the `ops-linux` runner:
 TARGET=x86_64-unknown-linux-gnu \
   AICX_RELEASE_BUNDLE_ONLY_BINARIES=1 \
   AICX_BUNDLE_FLAVOR=slim \
+  AICX_CARGO_BUILD_CMD="cargo zigbuild" \
+  AICX_BUILD_TARGET=x86_64-unknown-linux-gnu.2.28 \
   ./tools/release_bundle.sh
 ```
 
 The script normalizes the target name in the public asset to
 `x86_64-linux-gnu`, writes SHA-256 and GPG detached signatures, and refuses to
 publish when the signing key or passphrase material is unavailable.
+`cargo zigbuild` links against the declared glibc 2.28 floor; before upload,
+the workflow extracts both binaries, runs their version commands, and rejects
+any imported `GLIBC_*` symbol newer than 2.28.
 
 The same workflow produces a Debian package and signs it independently.
 
@@ -42,9 +47,13 @@ The same workflow produces a Debian package and signs it independently.
 Build the supported Linux target on a compatible host:
 
 ```bash
-cargo build --locked --release --target x86_64-unknown-linux-gnu \
+cargo zigbuild --locked --release --target x86_64-unknown-linux-gnu.2.28 \
   --bin aicx --bin aicx-mcp
 ```
+
+Install the pinned release tool first with
+`python3 -m pip install cargo-zigbuild==0.23.0`; that package also supplies the
+Zig toolchain used by `cargo zigbuild`.
 
 For a production-shaped binary-only bundle, use the same contract as CI with
 the operator signing environment available:
@@ -65,8 +74,8 @@ tag and install into a clean temporary home:
 
 ```bash
 smoke_home="$(mktemp -d)"
-curl -fsSLO https://raw.githubusercontent.com/Loctree/aicx/v0.12.0/install.sh
-HOME="$smoke_home" AICX_INSTALL_MODE=release AICX_RELEASE_TAG=v0.12.0 bash install.sh
+curl -fsSLO https://raw.githubusercontent.com/Loctree/aicx/v0.12.3/install.sh
+HOME="$smoke_home" AICX_INSTALL_MODE=release AICX_RELEASE_TAG=v0.12.3 bash install.sh
 HOME="$smoke_home" "$smoke_home/.local/bin/aicx" --version
 HOME="$smoke_home" "$smoke_home/.local/bin/aicx-mcp" --version
 ```

@@ -408,6 +408,8 @@ release-bundle:
 
 release-bundle-only-binaries:
 	@AICX_RELEASE_BUNDLE_ONLY_BINARIES=1 \
+	AICX_CARGO_BUILD_CMD="$(CARGO_BUILD)" \
+	AICX_BUILD_TARGET="$(BUILD_TARGET)" \
 	TARGET="$(TARGET)" \
 	DIST_DIR="$(DIST_DIR)" \
 	DRY_RUN="$(DRY_RUN)" \

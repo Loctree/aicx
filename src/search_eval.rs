@@ -1109,7 +1109,7 @@ mod tests {
                 "path": "/tmp/aicx.md",
                 "metadata": { "round_id": "codex__demo__2026-06-19__abc12345:round:0001" },
                 "sections": {
-                    "agent_answered": "Silver ma byc operatorski, a Sztudio trzyma embedding workload."
+                    "agent_answered": "host-a ma byc operatorski, a host-b trzyma embedding workload."
                 }
             }]
         });
@@ -1133,7 +1133,7 @@ mod tests {
                 "label": "supported",
                 "metadata": { "round_id": "codex__other__2026-06-19__abc12345:round:0001" },
                 "sections": {
-                    "agent_answered": "Silver ma byc operatorski, a Sztudio trzyma embedding workload."
+                    "agent_answered": "host-a ma byc operatorski, a host-b trzyma embedding workload."
                 }
             }]
         });
@@ -1191,7 +1191,7 @@ mod tests {
                         "frame_kind": "tool_call"
                     },
                     "sections": {
-                        "evidence": "tool_call_id=abc stderr=panic cargo output Silver sztudio"
+                        "evidence": "tool_call_id=abc stderr=panic cargo output host-a host-b"
                     }
                 },
                 {
@@ -1202,7 +1202,7 @@ mod tests {
                         "frame_kind": "agent_reply"
                     },
                     "sections": {
-                        "agent_answered": "Silver ma byc operatorski, a Sztudio trzyma embedding workload."
+                        "agent_answered": "host-a ma byc operatorski, a host-b trzyma embedding workload."
                     }
                 }
             ]
@@ -1233,7 +1233,7 @@ mod tests {
                         "frame_kind": "agent_reply"
                     },
                     "sections": {
-                        "agent_answered": "Silver ma byc operatorski, a Sztudio trzyma embedding workload. compact recall"
+                        "agent_answered": "host-a ma byc operatorski, a host-b trzyma embedding workload. compact recall"
                     }
                 },
                 {
@@ -1244,7 +1244,7 @@ mod tests {
                         "frame_kind": "agent_reply"
                     },
                     "sections": {
-                        "agent_answered": "Silver ma byc operatorski, a Sztudio trzyma embedding workload. compact recall duplicate"
+                        "agent_answered": "host-a ma byc operatorski, a host-b trzyma embedding workload. compact recall duplicate"
                     }
                 }
             ]
@@ -1320,7 +1320,7 @@ mod tests {
             id: "demo-case".to_string(),
             scope: "aicx".to_string(),
             case_type: SearchQualityCaseType::Evidence,
-            query: "czemu sztudio".to_string(),
+            query: "czemu host-b".to_string(),
             good_result: "anchored answer".to_string(),
             bad_result: "wrong session".to_string(),
             anchors_match: SearchQualityAnchorsMatch::AnyOf,
@@ -1335,7 +1335,7 @@ mod tests {
             forbidden_noise: Vec::new(),
             anchors: vec![SearchQualityAnchor {
                 map_id: "codex__demo__2026-06-19__abc12345".to_string(),
-                expected_terms: vec!["sztudio".to_string(), "silver".to_string()],
+                expected_terms: vec!["host-b".to_string(), "host-a".to_string()],
                 terms_match: SearchQualityTermsMatch::Any,
             }],
         }

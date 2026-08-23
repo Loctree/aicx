@@ -79,8 +79,11 @@ Environment:
   PACKAGE_NAME              Bundle prefix (default: Cargo package name)
   NATIVE=1                  Build with --features native-embedder (model weights are still not bundled)
   FEATURES                  Explicit Cargo feature list for the bundle build
-  AICX_CARGO_BUILD_CMD      Explicit build command for binary-only mode.
-                            Default: cargo build.
+  AICX_CARGO_BUILD_CMD      Explicit build command for binary-only mode
+                            (default: cargo build).
+  AICX_BUILD_TARGET         Cargo target passed to the build command. Defaults
+                            to TARGET; use x86_64-unknown-linux-gnu.2.28 with
+                            cargo zigbuild to enforce the published glibc floor.
   AICX_CLEAN_AFTER_BUILD    Run cargo clean --target <triple> after bundle creation (default: 1)
   DRY_RUN=1                 Print resolved actions without signing/notarizing
 
@@ -277,6 +280,7 @@ PY
   fi
   HOST_TARGET="$(host_target)"
   BUILD_CMD="${AICX_CARGO_BUILD_CMD:-cargo build}"
+  BUILD_TARGET="${AICX_BUILD_TARGET:-$TARGET}"
   if [[ -z "${AICX_CARGO_BUILD_CMD:-}" && "$TARGET" != "$HOST_TARGET" ]]; then
     cat >&2 <<EOF
 Error: binary-only release bundles default to native builds.
@@ -306,6 +310,7 @@ EOF
   echo "Repo:            $REPO_ROOT"
   echo "Version:         $VERSION"
   echo "Target:          $TARGET"
+  echo "Build target:    $BUILD_TARGET"
   echo "Build command:   $BUILD_CMD"
   echo "Build flavor:    $BUILD_FLAVOR"
   echo "Cargo features:  ${FEATURES_VALUE:-<none>}"
@@ -317,9 +322,9 @@ EOF
     echo ""
     echo "[dry-run] Would:"
     if [[ -n "$FEATURES_VALUE" ]]; then
-      echo "  1. $BUILD_CMD --locked --release --target $TARGET --features $FEATURES_VALUE --bin aicx --bin aicx-mcp"
+      echo "  1. $BUILD_CMD --locked --release --target $BUILD_TARGET --features $FEATURES_VALUE --bin aicx --bin aicx-mcp"
     else
-      echo "  1. $BUILD_CMD --locked --release --target $TARGET --bin aicx --bin aicx-mcp"
+      echo "  1. $BUILD_CMD --locked --release --target $BUILD_TARGET --bin aicx --bin aicx-mcp"
     fi
     echo "  2. compose $BUNDLE_DIR layout (bin + LICENSE + README + install.sh + docs)"
     echo "  3. tar -czf $ARCHIVE_PATH"
@@ -332,10 +337,10 @@ EOF
     cd "$REPO_ROOT"
     if [[ -n "$FEATURES_VALUE" ]]; then
       # shellcheck disable=SC2086
-      $BUILD_CMD --locked --release --target "$TARGET" $NODEFAULT_FLAG --features "$FEATURES_VALUE" --bin aicx --bin aicx-mcp
+      $BUILD_CMD --locked --release --target "$BUILD_TARGET" $NODEFAULT_FLAG --features "$FEATURES_VALUE" --bin aicx --bin aicx-mcp
     else
       # shellcheck disable=SC2086
-      $BUILD_CMD --locked --release --target "$TARGET" $NODEFAULT_FLAG --bin aicx --bin aicx-mcp
+      $BUILD_CMD --locked --release --target "$BUILD_TARGET" $NODEFAULT_FLAG --bin aicx --bin aicx-mcp
     fi
   )
 

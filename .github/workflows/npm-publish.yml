@@ -20,6 +20,8 @@ jobs:
       release_tag: ${{ steps.meta.outputs.release_tag }}
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: v${{ inputs.version }}
 
       - name: Validate requested version
         id: meta
@@ -61,6 +63,13 @@ jobs:
           RELEASE_TAG: ${{ steps.meta.outputs.release_tag }}
         run: |
           base_url="https://github.com/Loctree/aicx/releases/download/${RELEASE_TAG}"
+          verify_dir=$(mktemp -d)
+          trap 'rm -rf "${verify_dir}"' EXIT
+          mkdir -m 700 "${verify_dir}/gnupg"
+          curl -fsSL "${base_url}/loctree-release-pubkey.asc" \
+            -o "${verify_dir}/loctree-release-pubkey.asc"
+          gpg --batch --homedir "${verify_dir}/gnupg" \
+            --import "${verify_dir}/loctree-release-pubkey.asc"
           # Signed-only release surface. macOS ships .zip (notarized via ditto);
           # Linux ships .tar.gz (GPG-detached); Windows ships .zip (GPG-detached
           # MSVC build). All three carry GPG .asc sidecars.
@@ -70,8 +79,12 @@ jobs:
             "aicx-v${{ steps.meta.outputs.version }}-x86_64-pc-windows-msvc-slim.zip"
           )
           for asset in "${assets[@]}"; do
-            curl -fsLI "${base_url}/${asset}" >/dev/null
-            curl -fsLI "${base_url}/${asset}.sha256" >/dev/null
+            curl -fsSL "${base_url}/${asset}" -o "${verify_dir}/${asset}"
+            curl -fsSL "${base_url}/${asset}.sha256" -o "${verify_dir}/${asset}.sha256"
+            curl -fsSL "${base_url}/${asset}.asc" -o "${verify_dir}/${asset}.asc"
+            (cd "${verify_dir}" && sha256sum -c "${asset}.sha256")
+            gpg --batch --homedir "${verify_dir}/gnupg" \
+              --verify "${verify_dir}/${asset}.asc" "${verify_dir}/${asset}"
           done
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
@@ -96,6 +109,8 @@ jobs:
           - win32-x64-gnu
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ needs.verify.outputs.release_tag }}
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
@@ -117,6 +132,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ needs.verify.outputs.release_tag }}
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
@@ -134,3 +151,39 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: npm publish --access public
+
+  smoke-cold-install:
+    name: Cold npm install (${{ matrix.os }})
+    needs: [verify, publish-wrapper]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15, windows-latest]
+    steps:
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 20
+
+      - name: Wait for wrapper version and install into an empty prefix
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          for attempt in {1..20}; do
+            published=$(npm view "@loctree/aicx@${RELEASE_VERSION}" version 2>/dev/null || true)
+            if [[ "${published}" == "${RELEASE_VERSION}" ]]; then
+              break
+            fi
+            if [[ "${attempt}" == 20 ]]; then
+              echo "npm registry did not expose @loctree/aicx@${RELEASE_VERSION}" >&2
+              exit 1
+            fi
+            sleep 15
+          done
+          smoke_dir="${RUNNER_TEMP}/aicx-npm-smoke"
+          rm -rf "${smoke_dir}"
+          mkdir -p "${smoke_dir}"
+          npm install --prefix "${smoke_dir}" "@loctree/aicx@${RELEASE_VERSION}"
+          "${smoke_dir}/node_modules/.bin/aicx" --version
+          "${smoke_dir}/node_modules/.bin/aicx-mcp" --version

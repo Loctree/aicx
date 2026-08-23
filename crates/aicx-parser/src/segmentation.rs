@@ -1403,7 +1403,7 @@ mod tests {
         // tier via `git remote get-url origin`. That leaked ownership from
         // local-clone-folder-name → remote-URL repo (e.g. cwd `vista-codex`
         // with chunk mentioning `/Users/.../ai-collaborators/.git/...` and that
-        // repo's remote pointing to `Szowesgad/maciej-almanach.git`).
+        // repo's remote pointing to `owner/other-repo.git`).
         //
         // After fix: `infer_tiered_identity_from_text` only reads `https://github.com/X/Y`
         // URL mentions and clamps the tier to Fallback. Path mentions are ignored.

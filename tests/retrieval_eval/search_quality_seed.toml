@@ -51,20 +51,20 @@ expected_terms = ["_all", "indexed/vetcoders_vista", "embeddings.ndjson", "bucke
 terms_match = "any"
 
 [[questions]]
-id = "aicx-sztudio-vs-silver"
+id = "aicx-host-b-vs-host-a"
 scope = "aicx"
 type = "ask_answer"
-query = "czemu przenieslismy embeddingi i model na sztudio a nie zostawilismy na silver, po co silverowi model?"
-good_result = "decyzja: Silver nie powinien miec modelu ani pelnego indexu; sztudio = runtime truth z Ollama qwen3-embedding:8b, silver tylko klient."
-bad_result = "sama komenda search/status bez 'dlaczego sztudio', albo wynik o innym hoscie."
+query = "czemu przenieslismy embeddingi i model na host-b a nie zostawilismy na host-a, po co host-a model?"
+good_result = "decyzja: host-a nie powinien miec modelu ani pelnego indexu; host-b = runtime truth z Ollama qwen3-embedding:8b, host-a tylko klient."
+bad_result = "sama komenda search/status bez 'dlaczego host-b', albo wynik o innym hoscie."
 anchors_match = "any_of"
 [[questions.anchors]]
 map_id = "codex__019ed8cb__2026-06-18__d0055557"
-expected_terms = ["Silver", "sztudio", "qwen3-embedding:8b", "runtime truth"]
+expected_terms = ["host-a", "host-b", "qwen3-embedding:8b", "runtime truth"]
 terms_match = "any"
 [[questions.anchors]]
 map_id = "claude__d7bbf152__2026-06-04__cab6a103"
-expected_terms = ["qwen3-embedding:8b", "4096", "sztudio"]
+expected_terms = ["qwen3-embedding:8b", "4096", "host-b"]
 terms_match = "any"
 
 [[questions]]

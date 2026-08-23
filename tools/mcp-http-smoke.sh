@@ -16,7 +16,7 @@ Optional assertions:
   AICX_MCP_EXPECT_READINESS         exact index readiness value
   AICX_MCP_EXPECT_BACKEND           exact expected search backend (default: any healthy backend)
   AICX_MCP_EXPECT_SOURCE_CONTAINS   substring that must appear in search output
-  AICX_MCP_QUERY                    search query (default: po co Silverowi model embeddingowy)
+  AICX_MCP_QUERY                    search query (default: why does host-a need an embedding model)
   AICX_MCP_TIMEOUT                  curl max-time seconds (default: 8)
   AICX_MCP_RETRIES                  retries after HTTP 429 (default: 4; backoff 1,2,4,8s)
   AICX_MCP_SKIP_NOAUTH_CHECK=1      skip unauthenticated /mcp rejection check
@@ -52,7 +52,7 @@ command -v python3 >/dev/null || {
 url="${AICX_MCP_URL}"
 token="${AICX_MCP_TOKEN:-}"
 timeout="${AICX_MCP_TIMEOUT:-8}"
-query="${AICX_MCP_QUERY:-po co Silverowi model embeddingowy}"
+query="${AICX_MCP_QUERY:-why does host-a need an embedding model}"
 expect_rows="${AICX_MCP_EXPECT_ROWS:-}"
 expect_readiness="${AICX_MCP_EXPECT_READINESS:-}"
 expect_backend="${AICX_MCP_EXPECT_BACKEND:-}"

@@ -959,7 +959,7 @@ mod tests {
     #[test]
     fn evidence_query_classifier_detects_explanation() {
         assert_eq!(
-            classify_evidence_query("czemu przenieslismy embeddingi na Sztudio"),
+            classify_evidence_query("czemu przenieslismy embeddingi na host-b"),
             EvidenceQueryClass::Explanation
         );
         assert_eq!(
@@ -972,7 +972,7 @@ mod tests {
     fn evidence_rerank_prefers_reasoned_answer_over_meta_search_round() {
         let supported_path = write_fixture(
             "supported",
-            "[project: x]\nUser intent:\nczemu przenieslismy embeddingi na Sztudio?\n\nAgent answered:\nPrzenieslismy embeddingi na Sztudio, bo indeksowanie store jest ciezkim workloadem. Decyzja: Silver zostaje maszyna operatorska, a Sztudio wykonawcza.\n",
+            "[project: x]\nUser intent:\nczemu przenieslismy embeddingi na host-b?\n\nAgent answered:\nPrzenieslismy embeddingi na host-b, bo indeksowanie store jest ciezkim workloadem. Decyzja: host-a zostaje maszyna operatorska, a host-b wykonawcza.\n",
             serde_json::json!({
                 "artifact_family": "tb-spotlight-rounds",
                 "round_id": "round-supported",
@@ -994,10 +994,10 @@ mod tests {
         );
 
         let report = build_evidence_report(
-            "czemu przenieslismy embeddingi na Sztudio",
+            "czemu przenieslismy embeddingi na host-b",
             vec![
-                fake_result(&meta_path, 99, vec!["aicx search embeddingi Sztudio"]),
-                fake_result(&supported_path, 78, vec!["Decyzja: Sztudio wykonawcza"]),
+                fake_result(&meta_path, 99, vec!["aicx search embeddingi host-b"]),
+                fake_result(&supported_path, 78, vec!["Decyzja: host-b wykonawcza"]),
             ],
             2,
         );
@@ -1017,7 +1017,7 @@ mod tests {
     fn evidence_does_not_label_answer_overlap_with_search_trace_as_meta() {
         let path = write_fixture(
             "overlap-with-trace",
-            "[project: x]\nUser intent:\nczemu przenieslismy embeddingi na Sztudio?\n\nAgent answered:\nAICX_HOME=/tmp/aicx aicx search -p aicx \"embeddingi Sztudio\". Smoke pokazal backend=hybrid_rrf.\n",
+            "[project: x]\nUser intent:\nczemu przenieslismy embeddingi na host-b?\n\nAgent answered:\nAICX_HOME=/tmp/aicx aicx search -p aicx \"embeddingi host-b\". Smoke pokazal backend=hybrid_rrf.\n",
             serde_json::json!({
                 "artifact_family": "tb-spotlight-rounds",
                 "round_id": "round-overlap-with-trace",
@@ -1028,7 +1028,7 @@ mod tests {
         );
 
         let report = build_evidence_report(
-            "czemu przenieslismy embeddingi na Sztudio",
+            "czemu przenieslismy embeddingi na host-b",
             vec![fake_result(&path, 92, vec!["backend=hybrid_rrf"])],
             1,
         );
@@ -1043,7 +1043,7 @@ mod tests {
     fn evidence_does_not_label_decision_with_search_trace_as_meta() {
         let path = write_fixture(
             "decision-with-trace",
-            "[project: x]\nUser intent:\nczemu przenieslismy embeddingi na Sztudio?\n\nAgent answered:\nDecyzja: przenieslismy embeddingi na Sztudio, bo indeksowanie store jest ciezkim workloadem. Smoke przez aicx search pokazal backend=hybrid_rrf, wiec trace jest dowodem wykonania, a nie meta-only odpowiedzia.\n",
+            "[project: x]\nUser intent:\nczemu przenieslismy embeddingi na host-b?\n\nAgent answered:\nDecyzja: przenieslismy embeddingi na host-b, bo indeksowanie store jest ciezkim workloadem. Smoke przez aicx search pokazal backend=hybrid_rrf, wiec trace jest dowodem wykonania, a nie meta-only odpowiedzia.\n",
             serde_json::json!({
                 "artifact_family": "tb-spotlight-rounds",
                 "round_id": "round-decision-with-trace",
@@ -1054,7 +1054,7 @@ mod tests {
         );
 
         let report = build_evidence_report(
-            "czemu przenieslismy embeddingi na Sztudio",
+            "czemu przenieslismy embeddingi na host-b",
             vec![fake_result(&path, 92, vec!["backend=hybrid_rrf"])],
             1,
         );

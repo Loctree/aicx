@@ -757,7 +757,7 @@ oracle, never a runtime dependency.
   `git remote get-url origin` to resolve identity — so a chunk that
   merely *mentioned* `/Users/foo/Downloads/ai-collaborators/...` could
   hijack a session into whatever GitHub repo that local clone's remote
-  pointed to (e.g. `Szowesgad/maciej-almanach`). Round-1 cut the FS
+  pointed to (e.g. `owner/other-repo`). Round-1 cut the FS
   walk; round-2 also drops text-mention identity from
   `infer_tiered_identity_from_entry` entirely. Entry-level identity now
   comes only from cwd / projectHash registry. Text mentions stay
