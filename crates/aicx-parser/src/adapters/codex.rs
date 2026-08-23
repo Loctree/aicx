@@ -1336,7 +1336,7 @@ mod tests {
     #[ignore = "private operator fixture; run explicitly for C2 performance proof"]
     fn private_large_rollout_stays_below_two_seconds_and_stable() {
         let path = Path::new(
-            "/Users/polyversai/.codex/sessions/2026/04/10/rollout-2026-04-10T17-42-48-019d780f-6763-7d40-a7f8-ab0c2313c576.jsonl",
+            "/Users/tester/.codex/sessions/2026/04/10/rollout-2026-04-10T17-42-48-019d780f-6763-7d40-a7f8-ab0c2313c576.jsonl",
         );
         let run = || {
             let artifact =

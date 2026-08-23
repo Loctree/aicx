@@ -19,7 +19,7 @@
       "refs": [
         {
           "evidence_event_id": "ev1:claude:c935402e-0000-1111-2222-333344445555:000120:text:00ff11ee22dd33cc",
-          "ref": "session:/Users/polyversai/.claude/projects/loctree/c935402e.jsonl#L120"
+          "ref": "session:/Users/tester/.claude/projects/loctree/c935402e.jsonl#L120"
         }
       ]
     }

@@ -874,7 +874,7 @@ mod tests {
             &home,
             "-Users-someone-Downloads-ChatGPT-export",
             "bbbbbbbb-1111-2222-3333-444444444444",
-            "/Users/someone/Downloads/ChatGPT-export",
+            "/Users/tester/Downloads/ChatGPT-export",
             "chatgpt dump",
         );
 

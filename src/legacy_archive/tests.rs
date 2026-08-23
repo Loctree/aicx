@@ -1906,7 +1906,7 @@ fn resolve_filters_to_index_slugs_uses_dedicated_bucket_dirs() {
 #[test]
 fn bare_filter_ambiguity_uses_directory_bucket_identities() {
     // Two dedicated buckets both ending in "vista" → bare filter fails closed.
-    let root = migration_test_root("resolve-index-silver-topology");
+    let root = migration_test_root("resolve-index-host-topology");
     let indexed = root.join("indexed");
     fs::create_dir_all(indexed.join("A_vista")).unwrap();
     fs::create_dir_all(indexed.join("B_vista")).unwrap();

@@ -1564,7 +1564,7 @@ fn eval_search_quality_accepts_run_flags() {
         "search-quality",
         "--run",
         "--case",
-        "aicx_sztudio_reason,md_radar_marbles",
+        "aicx_hostb_reason,md_radar_marbles",
         "--top",
         "5",
         "--limit",
@@ -1584,7 +1584,7 @@ fn eval_search_quality_accepts_run_flags() {
             assert_eq!(
                 args.cases,
                 vec![
-                    "aicx_sztudio_reason".to_string(),
+                    "aicx_hostb_reason".to_string(),
                     "md_radar_marbles".to_string()
                 ]
             );

@@ -3255,7 +3255,7 @@ mod tests {
         let mut result = fuzzy(100, "conversations", "2026-07-22", None);
         result.matched_lines = vec![
             "<recommended_plugins>".to_string(),
-            "- source: `/Users/example/.codex/sessions/vc-frame.jsonl`".to_string(),
+            "- source: `/Users/tester/.codex/sessions/vc-frame.jsonl`".to_string(),
             "\u{1b}[0m Search times: arrows was cold 2.4 s.".to_string(),
             r#"{"type":"thought","data":"The"}"#.to_string(),
             r#"{"type":"thread.started","thread_id":"abc"}"#.to_string(),
@@ -4545,14 +4545,14 @@ mod tests {
                 68,
                 Some("agent_reply"),
                 vec![
-                    "[10:01:00] assistant: To jest to - vista leak + devista; leak-vista-info poszlo do public repo"
+                    "[10:01:00] assistant: To jest to - acme leak + deacme; leak-acme-info poszlo do public repo"
                         .to_string(),
                 ],
             ),
         ];
 
         let filtered =
-            apply_default_semantic_quality(pool, "vista-leak o co w tym chodziolo?", None);
+            apply_default_semantic_quality(pool, "acme-leak o co w tym chodziolo?", None);
 
         assert_eq!(
             filtered[0].label, "test:1",
@@ -4606,7 +4606,7 @@ mod tests {
                 88,
                 Some("agent_reply"),
                 vec![
-                    "[10:00:00] assistant: Silver and Sztudio connection is now stable".to_string(),
+                    "[10:00:00] assistant: host-a and host-b connection is now stable".to_string(),
                 ],
             ),
             fake_hit_with_frame(
@@ -4616,13 +4616,13 @@ mod tests {
                 57,
                 Some("agent_reply"),
                 vec![
-                    "[10:01:00] assistant: Sztudio uses qwen3 embedding model for semantic index"
+                    "[10:01:00] assistant: host-b uses qwen3 embedding model for semantic index"
                         .to_string(),
                 ],
             ),
         ];
 
-        let filtered = apply_default_semantic_quality(pool, "qwen3-embedding sztudio silver", None);
+        let filtered = apply_default_semantic_quality(pool, "qwen3-embedding host-b host-a", None);
 
         assert_eq!(
             filtered[0].label, "test:1",
@@ -4640,7 +4640,7 @@ mod tests {
                 76,
                 Some("user_msg"),
                 vec![
-                    "[10:00:00] user: spoko, ostatnio w podobny sposob poszlo duzo leak-vista-info"
+                    "[10:00:00] user: spoko, ostatnio w podobny sposob poszlo duzo leak-acme-info"
                         .to_string(),
                 ],
             ),
@@ -4651,14 +4651,13 @@ mod tests {
                 60,
                 Some("agent_reply"),
                 vec![
-                    "[10:01:00] assistant: To jest to - vista leak plus devista; leak-vista-info poszlo do public repo i trzeba zamknac incydent"
+                    "[10:01:00] assistant: To jest to - acme leak plus deacme; leak-acme-info poszlo do public repo i trzeba zamknac incydent"
                         .to_string(),
                 ],
             ),
         ];
 
-        let filtered =
-            apply_default_semantic_quality(pool, "vista-leak o co w tym chodzilo?", None);
+        let filtered = apply_default_semantic_quality(pool, "acme-leak o co w tym chodzilo?", None);
 
         assert_eq!(
             filtered[0].label, "test:1",

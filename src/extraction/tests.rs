@@ -480,7 +480,7 @@ fn test_conversation_recovers_mid_turn_queued_operator_message() {
             "type": "user",
             "message": {"role": "user", "content": "pokaz mi ten hook"},
             "sessionId": SESSION,
-            "cwd": "/Users/silver/Git/aicx",
+            "cwd": "/Users/tester/Git/aicx",
             "timestamp": "2026-07-30T10:24:00.000Z",
         }),
         serde_json::json!({
