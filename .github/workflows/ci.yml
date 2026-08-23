@@ -49,6 +49,11 @@ jobs:
           python -m pip install --upgrade pip semgrep
           semgrep --config auto --error --quiet
 
+      - name: npm publish workflow contract
+        if: runner.os == 'Linux'
+        working-directory: aicx
+        run: python tools/npm_publish_contract_selftest.py
+
       - name: cargo check
         working-directory: aicx
         run: cargo check --locked

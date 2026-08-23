@@ -196,6 +196,12 @@ publish of the operator's live index.
 
 ## npm
 
+Cold-install smoke waits until the wrapper and every optional native package
+at the requested version are visible from the registry. Waiting for the
+wrapper alone is insufficient: npm can expose it before a just-published
+platform tarball has propagated, causing a transient missing-binary failure on
+one runner even though a later install succeeds.
+
 `distribution/npm/` contains one wrapper plus three platform packages:
 
 - `@loctree/aicx-darwin-arm64`
