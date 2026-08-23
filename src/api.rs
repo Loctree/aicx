@@ -332,7 +332,7 @@ fn plane_fields_from_manifest(
         (
             "not_built".to_string(),
             Some(
-                "lexical CURRENT is enough for default search; run `aicx index --semantic` on the owner host for dense / `search --deep`"
+                "lexical CURRENT is enough for public search; `aicx index --semantic` is optional and reserved for Overlay-owned dense workflows on the owner host"
                     .to_string(),
             ),
         )
@@ -1525,5 +1525,19 @@ mod tests {
         assert_eq!(retryable.readiness, IndexReadiness::StaleIndex);
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn lexical_only_dense_recommendation_does_not_revive_retired_search_flags() {
+        let (_, dense_status, dense_kind, dense_count, recommendation) =
+            plane_fields_from_manifest("optional_not_built", 0, 1);
+        let recommendation = recommendation.expect("lexical-only dense guidance");
+
+        assert_eq!(dense_status, "not_built");
+        assert_eq!(dense_kind, "optional_not_built");
+        assert_eq!(dense_count, 0);
+        assert!(recommendation.contains("public search"));
+        assert!(recommendation.contains("Overlay-owned"));
+        assert!(!recommendation.contains("search --deep"));
     }
 }
