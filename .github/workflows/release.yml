@@ -326,7 +326,11 @@ jobs:
           archive="${archives[0]}"
           case "${archive}" in
             *.tar.gz) tar -xzf "${archive}" -C "${smoke_dir}" ;;
-            *.zip) tar -xf "${archive}" -C "${smoke_dir}" ;;
+            # Git Bash on the self-hosted signing machine provides GNU tar,
+            # which cannot extract zip files (hosted Windows happens to find
+            # bsdtar first). Python 3.11+ is already a hard requirement of the
+            # bundle step, so use its portable stdlib zip reader here too.
+            *.zip) python -c 'import sys, zipfile; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])' "${archive}" "${smoke_dir}" ;;
             *) echo "unsupported archive: ${archive}" >&2; exit 1 ;;
           esac
           bundle_dir=$(find "${smoke_dir}" -mindepth 1 -maxdepth 1 -type d | head -1)
