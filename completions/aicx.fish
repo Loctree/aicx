@@ -57,7 +57,7 @@ complete -c aicx -n "__fish_aicx_needs_command" -f -a "continuity" -d 'Multi-age
 complete -c aicx -n "__fish_aicx_needs_command" -f -a "tail" -d 'Print recent intents/chunks (snapshot mode); add --follow to stream new arrivals'
 complete -c aicx -n "__fish_aicx_needs_command" -f -a "serve" -d 'Run aicx as an MCP server'
 complete -c aicx -n "__fish_aicx_needs_command" -f -a "init" -d 'Retired compatibility shim; prints migration guidance'
-complete -c aicx -n "__fish_aicx_needs_command" -f -a "search" -d 'Search the CURRENT source/extract index. Lexical-first by default; optional dense rerank with --deep. When no index exists, the only fallback is a bounded recency-ranked filesystem search'
+complete -c aicx -n "__fish_aicx_needs_command" -f -a "search" -d 'Search the published CURRENT source/extract index with Tantivy and a recency prior. Missing or invalid CURRENT fails with a typed error'
 complete -c aicx -n "__fish_aicx_needs_command" -f -a "eval" -d 'Run local evaluation helpers for retrieval/search quality'
 complete -c aicx -n "__fish_aicx_needs_command" -f -a "index" -d 'Build the source-driven lexical index (default) or opt-in dense CURRENT with `--semantic`. Use `--dry-run` to preview lexical parsing only'
 complete -c aicx -n "__fish_aicx_needs_command" -f -a "config" -d 'Manage `$HOME/.aicx/config.toml` for embedders and endpoints'
@@ -229,6 +229,7 @@ complete -c aicx -n "__fish_aicx_using_subcommand catalog; and not __fish_seen_s
 complete -c aicx -n "__fish_aicx_using_subcommand catalog; and not __fish_seen_subcommand_from rebuild refresh status resolve help" -f -a "resolve" -d 'Resolve one session id from the durable catalog'
 complete -c aicx -n "__fish_aicx_using_subcommand catalog; and not __fish_seen_subcommand_from rebuild refresh status resolve help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
 complete -c aicx -n "__fish_aicx_using_subcommand catalog; and __fish_seen_subcommand_from rebuild" -l json -d 'Emit JSON report to stdout'
+complete -c aicx -n "__fish_aicx_using_subcommand catalog; and __fish_seen_subcommand_from rebuild" -l with-chunks -d 'After rewriting the catalog, drain pending chunks through `aicx index` (lexical CURRENT) and print the remaining lag'
 complete -c aicx -n "__fish_aicx_using_subcommand catalog; and __fish_seen_subcommand_from rebuild" -s v -l verbose -d 'Verbose diagnostics: echo per-file extractor warnings to stderr'
 complete -c aicx -n "__fish_aicx_using_subcommand catalog; and __fish_seen_subcommand_from rebuild" -l project-fuzzy -d 'Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed'
 complete -c aicx -n "__fish_aicx_using_subcommand catalog; and __fish_seen_subcommand_from rebuild" -s h -l help -d 'Print help (see more with \'--help\')'
@@ -259,6 +260,7 @@ complete -c aicx -n "__fish_aicx_using_subcommand store; and not __fish_seen_sub
 complete -c aicx -n "__fish_aicx_using_subcommand store; and not __fish_seen_subcommand_from rebuild refresh status resolve help" -f -a "resolve" -d 'Resolve one session id from the durable catalog'
 complete -c aicx -n "__fish_aicx_using_subcommand store; and not __fish_seen_subcommand_from rebuild refresh status resolve help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
 complete -c aicx -n "__fish_aicx_using_subcommand store; and __fish_seen_subcommand_from rebuild" -l json -d 'Emit JSON report to stdout'
+complete -c aicx -n "__fish_aicx_using_subcommand store; and __fish_seen_subcommand_from rebuild" -l with-chunks -d 'After rewriting the catalog, drain pending chunks through `aicx index` (lexical CURRENT) and print the remaining lag'
 complete -c aicx -n "__fish_aicx_using_subcommand store; and __fish_seen_subcommand_from rebuild" -s v -l verbose -d 'Verbose diagnostics: echo per-file extractor warnings to stderr'
 complete -c aicx -n "__fish_aicx_using_subcommand store; and __fish_seen_subcommand_from rebuild" -l project-fuzzy -d 'Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed'
 complete -c aicx -n "__fish_aicx_using_subcommand store; and __fish_seen_subcommand_from rebuild" -s h -l help -d 'Print help (see more with \'--help\')'
@@ -324,6 +326,7 @@ complete -c aicx -n "__fish_aicx_using_subcommand sessions; and __fish_seen_subc
 complete -c aicx -n "__fish_aicx_using_subcommand sessions; and __fish_seen_subcommand_from current" -s v -l verbose -d 'Verbose diagnostics: echo per-file extractor warnings to stderr'
 complete -c aicx -n "__fish_aicx_using_subcommand sessions; and __fish_seen_subcommand_from current" -l project-fuzzy -d 'Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed'
 complete -c aicx -n "__fish_aicx_using_subcommand sessions; and __fish_seen_subcommand_from current" -s h -l help -d 'Print help (see more with \'--help\')'
+complete -c aicx -n "__fish_aicx_using_subcommand sessions; and __fish_seen_subcommand_from list" -s p -l project -d 'Exact project filter, same shapes as search/intents/MCP: `owner/repo`, `/repo` (cross-org repo), `owner/` (org wildcard), or a unique bare `name`. Empty is a numbered miss, not silence' -r
 complete -c aicx -n "__fish_aicx_using_subcommand sessions; and __fish_seen_subcommand_from list" -l agent -d 'Filter by agent (claude | codex | gemini | junie | grok)' -r -f -a "claude\t''
 codex\t''
 gemini\t''
@@ -515,7 +518,7 @@ complete -c aicx -n "__fish_aicx_using_subcommand intents" -l limit -d 'Maximum 
 complete -c aicx -n "__fish_aicx_using_subcommand intents" -l sort -d 'Sort order applied after filtering. Default: command-specific' -r -f -a "newest\t''
 oldest\t''
 score\t''"
-complete -c aicx -n "__fish_aicx_using_subcommand intents" -l score -d 'Minimum score threshold (0-100; semantic match confidence)' -r
+complete -c aicx -n "__fish_aicx_using_subcommand intents" -l score -d 'Minimum score threshold (0-100; retrieval confidence)' -r
 complete -c aicx -n "__fish_aicx_using_subcommand intents" -l agent -d 'Agent name filter: claude | codex | gemini | junie | codescribe' -r
 complete -c aicx -n "__fish_aicx_using_subcommand intents" -l since -d 'Lower date bound: YYYY-MM-DD or relative (e.g., 2026-04-23..)' -r
 complete -c aicx -n "__fish_aicx_using_subcommand intents" -l until -d 'Upper date bound: YYYY-MM-DD' -r
@@ -570,7 +573,7 @@ complete -c aicx -n "__fish_aicx_using_subcommand tail" -l limit -d 'Maximum num
 complete -c aicx -n "__fish_aicx_using_subcommand tail" -l sort -d 'Sort order applied after filtering. Default: command-specific' -r -f -a "newest\t''
 oldest\t''
 score\t''"
-complete -c aicx -n "__fish_aicx_using_subcommand tail" -l score -d 'Minimum score threshold (0-100; semantic match confidence)' -r
+complete -c aicx -n "__fish_aicx_using_subcommand tail" -l score -d 'Minimum score threshold (0-100; retrieval confidence)' -r
 complete -c aicx -n "__fish_aicx_using_subcommand tail" -l agent -d 'Agent name filter: claude | codex | gemini | junie | codescribe' -r
 complete -c aicx -n "__fish_aicx_using_subcommand tail" -l since -d 'Lower date bound: YYYY-MM-DD or relative (e.g., 2026-04-23..)' -r
 complete -c aicx -n "__fish_aicx_using_subcommand tail" -l until -d 'Upper date bound: YYYY-MM-DD' -r
@@ -592,6 +595,7 @@ complete -c aicx -n "__fish_aicx_using_subcommand serve" -l require-auth -d 'Req
 false\t''"
 complete -c aicx -n "__fish_aicx_using_subcommand serve" -l allow-any-host -d 'Disable HTTP Host header validation. Not recommended outside trusted networks'
 complete -c aicx -n "__fish_aicx_using_subcommand serve" -l no-require-auth -d 'Disable Bearer auth on HTTP transport. Only allowed on loopback binds'
+complete -c aicx -n "__fish_aicx_using_subcommand serve" -l no-auto-refresh -d 'Retained compatibility no-op. HTTP serving is always reader-only'
 complete -c aicx -n "__fish_aicx_using_subcommand serve" -s v -l verbose -d 'Verbose diagnostics: echo per-file extractor warnings to stderr'
 complete -c aicx -n "__fish_aicx_using_subcommand serve" -l project-fuzzy -d 'Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed'
 complete -c aicx -n "__fish_aicx_using_subcommand serve" -s h -l help -d 'Print help (see more with \'--help\')'
@@ -618,7 +622,7 @@ complete -c aicx -n "__fish_aicx_using_subcommand search" -l limit -d 'Maximum n
 complete -c aicx -n "__fish_aicx_using_subcommand search" -l sort -d 'Sort order applied after filtering. Default: command-specific' -r -f -a "newest\t''
 oldest\t''
 score\t''"
-complete -c aicx -n "__fish_aicx_using_subcommand search" -l score -d 'Minimum score threshold (0-100; semantic match confidence)' -r
+complete -c aicx -n "__fish_aicx_using_subcommand search" -l score -d 'Minimum score threshold (0-100; retrieval confidence)' -r
 complete -c aicx -n "__fish_aicx_using_subcommand search" -l agent -d 'Agent name filter: claude | codex | gemini | junie | codescribe' -r
 complete -c aicx -n "__fish_aicx_using_subcommand search" -l since -d 'Lower date bound: YYYY-MM-DD or relative (e.g., 2026-04-23..)' -r
 complete -c aicx -n "__fish_aicx_using_subcommand search" -l until -d 'Upper date bound: YYYY-MM-DD' -r
@@ -636,11 +640,8 @@ other\t''"
 complete -c aicx -n "__fish_aicx_using_subcommand search" -l session -d 'Search passages inside one catalog session instead of ranking sessions' -r
 complete -c aicx -n "__fish_aicx_using_subcommand search" -l context -d 'Context lines before and after each passage match (default: 2)' -r
 complete -c aicx -n "__fish_aicx_using_subcommand search" -l literal -d 'Match an exact, identifier-boundary substring inside --session'
-complete -c aicx -n "__fish_aicx_using_subcommand search" -l no-semantic -d 'Force lexical-only retrieval from the published CURRENT index'
-complete -c aicx -n "__fish_aicx_using_subcommand search" -l evidence -d 'Return an evidence packet: semantic candidates re-ranked by answer/support signals, with source sections and diagnostics'
+complete -c aicx -n "__fish_aicx_using_subcommand search" -l evidence -d 'Return an evidence packet: lexical candidates re-ranked by answer/support signals, with source sections and diagnostics'
 complete -c aicx -n "__fish_aicx_using_subcommand search" -s j -l json -d 'Emit compact JSON instead of plain text'
-complete -c aicx -n "__fish_aicx_using_subcommand search" -l legacy-dense -d 'Use legacy NDJSON reader for dense vector search instead of versioned mmap'
-complete -c aicx -n "__fish_aicx_using_subcommand search" -l deep -d 'Dense re-rank (hybrid RRF over tantivy + mmap). Default is lexical-first with a recency prior against the published `_all` CURRENT generation — sub-second answers without loading the embedder or dense vectors'
 complete -c aicx -n "__fish_aicx_using_subcommand search" -s v -l verbose -d 'Verbose diagnostics: echo per-file extractor warnings to stderr'
 complete -c aicx -n "__fish_aicx_using_subcommand search" -l project-fuzzy -d 'Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed'
 complete -c aicx -n "__fish_aicx_using_subcommand search" -s h -l help -d 'Print help (see more with \'--help\')'
@@ -734,7 +735,7 @@ complete -c aicx -n "__fish_aicx_using_subcommand steer" -l limit -d 'Maximum nu
 complete -c aicx -n "__fish_aicx_using_subcommand steer" -l sort -d 'Sort order applied after filtering. Default: command-specific' -r -f -a "newest\t''
 oldest\t''
 score\t''"
-complete -c aicx -n "__fish_aicx_using_subcommand steer" -l score -d 'Minimum score threshold (0-100; semantic match confidence)' -r
+complete -c aicx -n "__fish_aicx_using_subcommand steer" -l score -d 'Minimum score threshold (0-100; retrieval confidence)' -r
 complete -c aicx -n "__fish_aicx_using_subcommand steer" -l agent -d 'Agent name filter: claude | codex | gemini | junie | codescribe' -r
 complete -c aicx -n "__fish_aicx_using_subcommand steer" -l since -d 'Lower date bound: YYYY-MM-DD or relative (e.g., 2026-04-23..)' -r
 complete -c aicx -n "__fish_aicx_using_subcommand steer" -l until -d 'Upper date bound: YYYY-MM-DD' -r
@@ -814,7 +815,7 @@ complete -c aicx -n "__fish_aicx_using_subcommand help; and not __fish_seen_subc
 complete -c aicx -n "__fish_aicx_using_subcommand help; and not __fish_seen_subcommand_from completions overlay claude codex all extract conversations catalog ingest list sources sessions claims results clarify wizard refs state dashboard reports corpus reports-extractor dashboard-serve intents continuity tail serve init search eval index config read steer migrate migrate-intent-schema doctor health warmup help" -f -a "tail" -d 'Print recent intents/chunks (snapshot mode); add --follow to stream new arrivals'
 complete -c aicx -n "__fish_aicx_using_subcommand help; and not __fish_seen_subcommand_from completions overlay claude codex all extract conversations catalog ingest list sources sessions claims results clarify wizard refs state dashboard reports corpus reports-extractor dashboard-serve intents continuity tail serve init search eval index config read steer migrate migrate-intent-schema doctor health warmup help" -f -a "serve" -d 'Run aicx as an MCP server'
 complete -c aicx -n "__fish_aicx_using_subcommand help; and not __fish_seen_subcommand_from completions overlay claude codex all extract conversations catalog ingest list sources sessions claims results clarify wizard refs state dashboard reports corpus reports-extractor dashboard-serve intents continuity tail serve init search eval index config read steer migrate migrate-intent-schema doctor health warmup help" -f -a "init" -d 'Retired compatibility shim; prints migration guidance'
-complete -c aicx -n "__fish_aicx_using_subcommand help; and not __fish_seen_subcommand_from completions overlay claude codex all extract conversations catalog ingest list sources sessions claims results clarify wizard refs state dashboard reports corpus reports-extractor dashboard-serve intents continuity tail serve init search eval index config read steer migrate migrate-intent-schema doctor health warmup help" -f -a "search" -d 'Search the CURRENT source/extract index. Lexical-first by default; optional dense rerank with --deep. When no index exists, the only fallback is a bounded recency-ranked filesystem search'
+complete -c aicx -n "__fish_aicx_using_subcommand help; and not __fish_seen_subcommand_from completions overlay claude codex all extract conversations catalog ingest list sources sessions claims results clarify wizard refs state dashboard reports corpus reports-extractor dashboard-serve intents continuity tail serve init search eval index config read steer migrate migrate-intent-schema doctor health warmup help" -f -a "search" -d 'Search the published CURRENT source/extract index with Tantivy and a recency prior. Missing or invalid CURRENT fails with a typed error'
 complete -c aicx -n "__fish_aicx_using_subcommand help; and not __fish_seen_subcommand_from completions overlay claude codex all extract conversations catalog ingest list sources sessions claims results clarify wizard refs state dashboard reports corpus reports-extractor dashboard-serve intents continuity tail serve init search eval index config read steer migrate migrate-intent-schema doctor health warmup help" -f -a "eval" -d 'Run local evaluation helpers for retrieval/search quality'
 complete -c aicx -n "__fish_aicx_using_subcommand help; and not __fish_seen_subcommand_from completions overlay claude codex all extract conversations catalog ingest list sources sessions claims results clarify wizard refs state dashboard reports corpus reports-extractor dashboard-serve intents continuity tail serve init search eval index config read steer migrate migrate-intent-schema doctor health warmup help" -f -a "index" -d 'Build the source-driven lexical index (default) or opt-in dense CURRENT with `--semantic`. Use `--dry-run` to preview lexical parsing only'
 complete -c aicx -n "__fish_aicx_using_subcommand help; and not __fish_seen_subcommand_from completions overlay claude codex all extract conversations catalog ingest list sources sessions claims results clarify wizard refs state dashboard reports corpus reports-extractor dashboard-serve intents continuity tail serve init search eval index config read steer migrate migrate-intent-schema doctor health warmup help" -f -a "config" -d 'Manage `$HOME/.aicx/config.toml` for embedders and endpoints'

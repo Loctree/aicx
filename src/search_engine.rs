@@ -1,16 +1,9 @@
-//! Semantic search dispatch with typed diagnostics.
+//! Search dispatch with typed diagnostics.
 //!
-//! The library primitive is **semantic-by-contract**: a query is encoded
-//! through the in-process embedder ([`crate::embedder`], which re-exports
-//! the local [`aicx_embeddings`] crate's GGUF + cloud HTTP stack) and
-//! matched against the published catalog-and-extract retrieval generation.
-//!
-//! The primitive never pretends fuzzy results are semantic. When a precondition is missing
-//! (embedder unhydrated, index not built, empty/low-signal corpus,
-//! dimension mismatch between query and index), [`try_semantic_search`]
-//! returns a typed [`SemanticError`] with a human-readable `reason` AND
-//! an actionable `recommendation`. The CLI may then explicitly degrade to
-//! filesystem-fuzzy while surfacing the semantic failure in its rendered output.
+//! Public CLI/MCP search uses the Tantivy-only
+//! [`try_lexical_search_filtered`] reader. Retained semantic primitives serve
+//! internal compatibility callers and return typed [`SemanticError`] values
+//! when their embedder or dense-index preconditions are unavailable.
 //!
 //! Vibecrafted with AI Agents by Vetcoders (c)2026 Vetcoders
 
@@ -360,6 +353,7 @@ fn try_semantic_search_with_boundary(
                 )?
             } else {
                 try_lexical_search_native(
+                    _store_root,
                     query,
                     per_scope_limit,
                     scope,
@@ -561,9 +555,11 @@ fn lexical_schema_conflict_error(
 /// Lexical-first retrieval against the published `_all` hybrid CURRENT
 /// generation (Tantivy only). No embedder bootstrap, no dense mmap, no
 /// primary-NDJSON rehash. Project/kind/frame/agent filters are metadata
-/// pushdown. Dense re-rank lives behind `--deep` / `SemanticSearchFilters::deep`.
+/// pushdown. Retained internal callers may request dense re-rank through
+/// `SemanticSearchFilters::deep`; public CLI/MCP search always clears it.
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
 fn try_lexical_search_native(
+    aicx_home: &Path,
     query: &str,
     limit: usize,
     project_filter: Option<&str>,
@@ -583,13 +579,14 @@ fn try_lexical_search_native(
     }
 
     // Always the global `_all` hybrid root — project is a filter, not a bucket.
-    let hybrid_root =
-        crate::vector_index::hybrid_root_dir(None).map_err(|err| SemanticError::IndexNotBuilt {
+    let hybrid_root = crate::vector_index::hybrid_root_dir_at(aicx_home, None).map_err(|err| {
+        SemanticError::IndexNotBuilt {
             path: std::path::PathBuf::new(),
             reason: format!("could not resolve hybrid root: {err}"),
             recommendation: "ensure $AICX_HOME (or $HOME) is writable, then run `aicx index`"
                 .to_string(),
-        })?;
+        }
+    })?;
     let gen_dir = crate::vector_index::resolve_hybrid_generation_dir(&hybrid_root);
     let manifest_path = gen_dir.join("manifest.json");
     if !manifest_path.exists() {
@@ -624,9 +621,7 @@ fn try_lexical_search_native(
             reason: "published hybrid manifest names the retired NDJSON dense adapter \
                      and no CURRENT generation pointer is available"
                 .to_string(),
-            recommendation:
-                "run `aicx index` to publish an mmap generation, or pass `--legacy-dense` only for recovery"
-                    .to_string(),
+            recommendation: "run `aicx index` to publish a valid mmap generation".to_string(),
         });
     }
 
@@ -1654,8 +1649,7 @@ fn load_hybrid_index(
                 path: manifest_path.to_path_buf(),
                 reason: "published hybrid manifest names the retired NDJSON dense adapter"
                     .to_string(),
-                recommendation: "run `aicx index` to publish an mmap generation, or explicitly use `aicx search --legacy-dense` for recovery"
-                    .to_string(),
+                recommendation: "run `aicx index` to publish a valid mmap generation".to_string(),
             });
         }
         other => {
@@ -1692,7 +1686,7 @@ fn load_hybrid_index(
 /// directly, bypassing the hybrid manifest + tantivy lexical layer entirely.
 ///
 /// Engaged only when no hybrid manifest has been published, or when the
-/// operator explicitly selects `--legacy-dense`. A present but invalid
+/// an internal compatibility caller explicitly selects legacy dense. A present but invalid
 /// generation fails closed instead of reading stale primary vectors.
 ///
 /// This is NOT the doctrinal "silent fuzzy fallback" (see module docs): it is
@@ -2485,6 +2479,34 @@ pub fn try_semantic_search_filtered(
         },
         diagnostic,
     })
+}
+
+/// Public Tantivy-only search entrypoint for CLI and MCP readers.
+///
+/// This deliberately clears every dense recovery selector before dispatch, so
+/// callers cannot initialize an embedder, inspect dense artifacts, or reach a
+/// legacy NDJSON reader through normal search.
+pub fn try_lexical_search_filtered(
+    aicx_home: &Path,
+    query: &str,
+    user_limit: usize,
+    project_filters: &[Option<&str>],
+    frame_kind_filter: Option<FrameKind>,
+    kind_filter: Option<&str>,
+    post_filters: &SemanticSearchFilters,
+) -> std::result::Result<FilteredSemanticOutcome, SemanticError> {
+    let mut lexical_filters = post_filters.clone();
+    lexical_filters.legacy_dense = false;
+    lexical_filters.deep = false;
+    try_semantic_search_filtered(
+        aicx_home,
+        query,
+        user_limit,
+        project_filters,
+        frame_kind_filter,
+        kind_filter,
+        &lexical_filters,
+    )
 }
 
 fn apply_default_semantic_quality(
@@ -4004,7 +4026,7 @@ mod tests {
 
     /// A published but corrupt manifest is a typed stale-generation error.
     /// The caller propagates this error and may only use the primary NDJSON
-    /// path when the manifest is absent or the operator chose --legacy-dense.
+    /// path when the manifest is absent or an internal caller chose legacy dense.
     #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
     #[test]
     fn corrupt_published_manifest_fails_before_any_adapter_is_opened() {

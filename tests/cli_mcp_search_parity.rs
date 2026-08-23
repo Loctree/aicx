@@ -5,13 +5,7 @@
 //! North Star parity: a human typing `aicx search <q>` and an agent calling
 //! MCP `aicx_search` for the same query must get the same results.
 //!
-//! Both surfaces share one retrieval+render path. The MCP `aicx_search` fuzzy
-//! fallback is literally:
-//!   search_engine::fuzzy_search_with_post_filters
-//!     -> search_engine::finalize_fuzzy_results
-//!     -> rank::search_oracle_status + rank::render_search_json_with_oracle
-//! (see `render_mcp_fuzzy_fallback_payload` in src/mcp.rs). The CLI fuzzy path
-//! (default search when CURRENT is absent) routes through the same functions.
+//! Both surfaces share the Tantivy-only retrieval and render path.
 //!
 //! This test drives the real CLI binary as a subprocess and reproduces the MCP
 //! render path in-process, then asserts the rendered `items` are byte-identical.
@@ -87,30 +81,55 @@ fn ensure_aicx_binary_exists() -> PathBuf {
         .clone()
 }
 
-/// Build a small canonical store fixture under `<home>/.aicx/store/...`.
+/// Build a small catalog/source fixture that can publish lexical CURRENT.
 fn build_store_fixture(aicx_home: &Path) {
-    let base = aicx_home
-        .join("store")
-        .join("vetcoders")
-        .join("aicx")
-        .join("2026_0601")
-        .join("reports")
-        .join("codex");
+    const SESSION_ID: &str = "parity-1111-4222-8333-444444444444";
+    let source = aicx_home
+        .join("sources")
+        .join(format!("{SESSION_ID}.jsonl"));
+    let rows = [
+        serde_json::json!({
+            "timestamp": "2026-06-01T08:00:00Z",
+            "type": "session_meta",
+            "payload": {"id": SESSION_ID, "cwd": "/Volumes/vc-workspace/Loctree/aicx"}
+        }),
+        serde_json::json!({
+            "timestamp": "2026-06-01T08:00:01Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "Decision: deployment uses a local Tantivy CURRENT. Deployment stays reader-only over HTTP. Deployment does not require an embedder."}]
+            }
+        }),
+    ];
     write_file(
-        &base.join("2026_0601_codex_sess-p1_001.md"),
-        "Decision: the remote backend is an optional accelerator for deployment, not a requirement.",
+        &source,
+        &rows
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n"),
     );
+    let (source_len, source_mtime_ns) =
+        aicx::catalog::live_source_fingerprint(&source).expect("source fingerprint");
+    let entry = aicx::catalog::CatalogEntry {
+        schema: aicx::catalog::CATALOG_SCHEMA.to_string(),
+        session_id: SESSION_ID.to_string(),
+        agent: "codex".to_string(),
+        project: Some("Loctree/aicx".to_string()),
+        date: Some("2026-06-01".to_string()),
+        cwd: Some("/Volumes/vc-workspace/Loctree/aicx".to_string()),
+        source_path: source.display().to_string(),
+        source_len: Some(source_len),
+        source_mtime_ns: Some(source_mtime_ns),
+        title: Some("deployment parity".to_string()),
+        machine: Some("scratch".to_string()),
+        logical_session_id: None,
+    };
     write_file(
-        &base.join("2026_0601_codex_sess-p2_001.md"),
-        "Note: local-first deployment search must work even when the backend is unreachable.",
-    );
-    write_file(
-        &base.join("2026_0601_codex_sess-p3_001.md"),
-        "Unrelated chunk about installer drift and binary pairs.",
-    );
-    write_file(
-        &base.join("2026_0601_codex_sess-p4_001.md"),
-        "Deployment runtime hosts the hybrid index; a local node mirrors a subset.",
+        &aicx::catalog::sessions_path_for(aicx_home),
+        &format!("{}\n", serde_json::to_string(&entry).unwrap()),
     );
 }
 
@@ -124,13 +143,30 @@ fn cli_and_mcp_render_identical_search_items() {
     let aicx_home = home.join(".aicx");
     build_store_fixture(&aicx_home);
 
-    // --- CLI surface: real binary, typed IndexNotBuilt fuzzy fallback. ---
-    let output = Command::new(ensure_aicx_binary_exists())
+    let binary = ensure_aicx_binary_exists();
+    let index = Command::new(&binary)
+        .args(["index", "--json", "--full-rescan", "--cache-extracts"])
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("AICX_HOME", &aicx_home)
+        .env("AICX_ALLOW_TMP", "1")
+        .env("AICX_EMBEDDER_PATH", root.join("poison-missing.gguf"))
+        .output()
+        .expect("publish lexical CURRENT");
+    assert!(
+        index.status.success(),
+        "index failed: {}",
+        String::from_utf8_lossy(&index.stderr)
+    );
+
+    // --- CLI surface: real binary over published lexical CURRENT. ---
+    let output = Command::new(&binary)
         .args(["search", QUERY, "--json", "--limit", &LIMIT.to_string()])
         .env("HOME", &home)
         .env("USERPROFILE", &home)
+        .env("AICX_HOME", &aicx_home)
         .env("AICX_ALLOW_TMP", "1")
-        .env_remove("AICX_HOME")
+        .env("AICX_EMBEDDER_PATH", root.join("poison-missing.gguf"))
         .output()
         .expect("run aicx search");
     assert!(
@@ -146,8 +182,8 @@ fn cli_and_mcp_render_identical_search_items() {
         .cloned()
         .expect("cli payload has items");
 
-    // --- MCP surface: the exact public retrieval+render path aicx_search uses
-    //     for its fuzzy fallback, run in-process against the same store. ---
+    // --- MCP surface: the exact lexical retrieval/render path used by
+    //     aicx_search, run in-process against the same CURRENT. ---
     let aicx_home = aicx_home.clone();
     let scopes: Vec<Option<&str>> = vec![None];
     let post_filters = aicx::search_engine::SemanticSearchFilters {
@@ -156,20 +192,40 @@ fn cli_and_mcp_render_identical_search_items() {
         date_lo: None,
         date_hi: None,
         hours_cutoff: None,
-        legacy_dense: false,
-        deep: false,
+        // Poison the retired selectors: the public lexical entrypoint must
+        // clear both before dispatch and still match the CLI.
+        legacy_dense: true,
+        deep: true,
     };
-    let (results, scanned) = aicx::search_engine::fuzzy_search_with_post_filters(
+    let filtered = aicx::search_engine::try_lexical_search_filtered(
         &aicx_home,
         QUERY,
         LIMIT,
         &scopes,
         None,
+        None,
         &post_filters,
     )
-    .expect("mcp-path fuzzy retrieval");
-    let results = aicx::search_engine::finalize_fuzzy_results(results, None, None, LIMIT);
-    let oracle_status = aicx::rank::search_oracle_status(&aicx_home, &results, scanned);
+    .expect("mcp-path lexical retrieval");
+    let scanned = filtered.outcome.scanned;
+    let retrieval_status = filtered.outcome.retrieval_status.clone();
+    let backend_label = filtered.outcome.backend_label;
+    let results =
+        aicx::search_engine::finalize_fuzzy_results(filtered.outcome.results, None, None, LIMIT);
+    let retrieval = aicx::search_engine::semantic_retrieval_outcome(
+        backend_label,
+        retrieval_status.as_ref(),
+        scanned,
+        results.len(),
+        false,
+    );
+    let oracle_status = aicx::search_engine::search_oracle_status_from_retrieval(
+        &aicx_home,
+        &retrieval,
+        retrieval_status.as_ref(),
+        results.len(),
+        true,
+    );
     let rendered =
         aicx::rank::render_search_json_with_oracle(&aicx_home, &results, scanned, oracle_status)
             .expect("mcp-path render");
@@ -187,8 +243,8 @@ fn cli_and_mcp_render_identical_search_items() {
     );
     let item_count = cli_items.as_array().map(|a| a.len()).unwrap_or(0);
     assert!(
-        item_count >= 3,
-        "fixture has 3 chunks mentioning the query; got {item_count} items"
+        item_count >= 1,
+        "fixture has a lexical deployment hit; got {item_count} items"
     );
 
     let _ = fs::remove_dir_all(&root);

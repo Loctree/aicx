@@ -45,8 +45,6 @@ const MCP_SESSION_IDLE_TTL: Duration = Duration::from_secs(30 * 60);
 const MCP_SESSION_MAX_SESSIONS: usize = 1000;
 const MCP_SESSION_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 const MCP_IDLE_MEMORY_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
-pub const MCP_AUTO_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
-pub const MCP_AUTO_REFRESH_HOURS: u64 = 48;
 
 /// Default time without an MCP tool request before request-derived memory is
 /// reclaimed. Search/index/corpus data is loaded inside each request rather
@@ -55,92 +53,17 @@ pub const MCP_AUTO_REFRESH_HOURS: u64 = 48;
 /// arenas. The next request follows the normal lazy-load path.
 pub const MCP_IDLE_MEMORY_DROP_AFTER: Duration = Duration::from_secs(15 * 60);
 
-/// D-6: once the embedder fails to load (model not hydrated, cloud creds
-/// missing, ...) the MCP server short-circuits subsequent semantic search
-/// requests for this long so a flapping endpoint cannot retry-storm the
-/// embedder. 5 minutes balances "recover quickly when the operator fixes
-/// the config" against "stop hammering the same broken path".
-const MCP_EMBEDDER_NEGATIVE_TTL: Duration = Duration::from_secs(5 * 60);
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct McpLifecycleConfig {
     pub idle_memory_drop_after: Duration,
-    pub auto_refresh_interval: Option<Duration>,
-    pub auto_refresh_hours: u64,
 }
 
 impl Default for McpLifecycleConfig {
     fn default() -> Self {
         Self {
             idle_memory_drop_after: MCP_IDLE_MEMORY_DROP_AFTER,
-            auto_refresh_interval: Some(MCP_AUTO_REFRESH_INTERVAL),
-            auto_refresh_hours: MCP_AUTO_REFRESH_HOURS,
         }
     }
-}
-
-fn refresh_catalog_and_index(hours: u64) -> anyhow::Result<()> {
-    let aicx_home = crate::aicx_home::resolve()?;
-    let user_home = crate::os_user_home()
-        .ok_or_else(|| anyhow::anyhow!("cannot resolve user home for MCP auto-refresh"))?;
-    let cutoff = chrono::Utc::now() - chrono::Duration::hours(hours.min(720) as i64);
-    let cutoff_ns = cutoff
-        .timestamp_nanos_opt()
-        .map(|value| value.max(0) as u128)
-        .unwrap_or(0);
-    let refresh = crate::catalog::refresh_hot(&aicx_home, &user_home, cutoff_ns)?;
-    let status = crate::api::index_status_at(&aicx_home, None).ok();
-    let pending = status
-        .as_ref()
-        .map(|status| status.pending_chunks)
-        .unwrap_or(0);
-    let index_current = status.as_ref().is_some_and(|status| {
-        status.readiness == crate::api::IndexReadiness::Ready && status.lexical_status == "ready"
-    });
-
-    if refresh.changed_sessions == 0
-        && refresh.admitted_sessions == 0
-        && refresh.reattributed_sessions == 0
-        && pending == 0
-        && index_current
-    {
-        tracing::debug!(target: "mcp.refresh", "MCP auto-refresh: catalog and index already current");
-        return Ok(());
-    }
-
-    let _lock = crate::locks::acquire_exclusive(crate::locks::lance_lock_path()?)?;
-    let report = crate::source_index::build(&aicx_home, &[], false, false, false, false)?;
-    tracing::info!(
-        target: "mcp.refresh",
-        changed_sessions = refresh.changed_sessions,
-        admitted_sessions = refresh.admitted_sessions,
-        reattributed_sessions = refresh.reattributed_sessions,
-        pending_chunks_before = pending,
-        lexical_docs = report.lexical_docs,
-        unchanged = report.unchanged,
-        wall_ms = report.wall_ms,
-        "MCP auto-refresh published the current lexical index"
-    );
-    Ok(())
-}
-
-fn spawn_mcp_auto_refresh(interval: Duration, hours: u64) {
-    tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(interval);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            ticker.tick().await;
-            match tokio::task::spawn_blocking(move || refresh_catalog_and_index(hours)).await {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => {
-                    tracing::warn!(target: "mcp.refresh", %error, "MCP auto-refresh failed")
-                }
-                Err(error) => {
-                    tracing::warn!(target: "mcp.refresh", %error, "MCP auto-refresh worker failed")
-                }
-            }
-        }
-    });
 }
 
 #[derive(Debug)]
@@ -608,10 +531,6 @@ pub struct SearchParams {
     /// Return snippet + full evidence
     #[serde(default)]
     pub verbose: bool,
-    /// Return a structured error instead of filesystem-fuzzy fallback when
-    /// semantic preconditions are missing.
-    #[serde(default)]
-    pub strict_semantic: bool,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -1043,133 +962,29 @@ fn inject_mcp_filter_pushdown_payload(
         .map_err(|e| McpError::internal_error(format!("Inject filter_pushdown JSON: {e}"), None))
 }
 
-#[derive(Debug, Clone)]
-struct McpSemanticFallbackNotice {
-    kind: String,
-    reason: String,
-    recommendation: String,
-}
-
-impl McpSemanticFallbackNotice {
-    fn from_error(err: &crate::search_engine::SemanticError) -> Self {
-        Self {
-            kind: err.kind().to_string(),
-            reason: err.reason().to_string(),
-            recommendation: err.recommendation().to_string(),
-        }
-    }
-}
-
-fn mcp_semantic_unavailable_error(fallback: &McpSemanticFallbackNotice) -> McpError {
+fn mcp_lexical_unavailable_error(err: &crate::search_engine::SemanticError) -> McpError {
     let payload = serde_json::json!({
         "ok": false,
-        "error": "semantic_search_unavailable",
-        "kind": fallback.kind,
-        "reason": fallback.reason,
-        "recommendation": fallback.recommendation,
+        "error": "lexical_search_unavailable",
+        "kind": err.kind(),
+        "reason": err.reason(),
+        "recommendation": err.recommendation(),
     });
     McpError::invalid_params(
         format!(
-            "semantic search unavailable [{}]: {} — recommendation: {}",
-            fallback.kind, fallback.reason, fallback.recommendation
+            "lexical CURRENT search unavailable [{}]: {} — recommendation: {}",
+            err.kind(),
+            err.reason(),
+            err.recommendation()
         ),
         Some(payload),
     )
-}
-
-fn inject_mcp_semantic_fallback_payload(
-    rendered: &str,
-    fallback: &McpSemanticFallbackNotice,
-) -> Result<String, McpError> {
-    let mut value: serde_json::Value = serde_json::from_str(rendered).map_err(|e| {
-        McpError::internal_error(format!("Inject semantic_fallback JSON: {e}"), None)
-    })?;
-    let obj = value.as_object_mut().ok_or_else(|| {
-        McpError::internal_error(
-            "Inject semantic_fallback JSON: rendered search payload is not an object",
-            None,
-        )
-    })?;
-    obj.insert(
-        "semantic_fallback".to_string(),
-        serde_json::json!({
-            "used": true,
-            "backend": "filesystem_fuzzy",
-            "kind": fallback.kind,
-            "reason": fallback.reason,
-            "recommendation": fallback.recommendation,
-        }),
-    );
-    serde_json::to_string(&value).map_err(|e| {
-        McpError::internal_error(format!("Serialize semantic_fallback JSON: {e}"), None)
-    })
-}
-
-/// Shared inputs for the MCP filesystem-fuzzy fallback. Groups the search
-/// parameters so the renderer keeps a 2-argument shape (request + fallback
-/// notice) and both fallback call sites build one value instead of threading
-/// eight positional args.
-struct McpFuzzyFallbackRequest<'a> {
-    aicx_home: &'a std::path::Path,
-    query: &'a str,
-    limit: usize,
-    project_scopes: &'a [Option<&'a str>],
-    frame_kind: Option<FrameKind>,
-    kind_filter: Option<&'a str>,
-    post_filters: &'a crate::search_engine::SemanticSearchFilters,
-    sort: Option<&'a str>,
-}
-
-fn render_mcp_fuzzy_fallback_payload(
-    req: &McpFuzzyFallbackRequest<'_>,
-    fallback: &McpSemanticFallbackNotice,
-) -> Result<String, McpError> {
-    // Shared retrieval + post-filter + finalize primitives keep this MCP
-    // fallback byte-identical to the CLI `aicx search` fuzzy path.
-    let (results, scanned) = crate::search_engine::fuzzy_search_with_post_filters(
-        req.aicx_home,
-        req.query,
-        req.limit,
-        req.project_scopes,
-        req.frame_kind,
-        req.post_filters,
-    )
-    .map_err(|e| McpError::internal_error(format!("Filesystem fuzzy search: {e}"), None))?;
-    let results =
-        crate::search_engine::finalize_fuzzy_results(results, req.kind_filter, req.sort, req.limit);
-    let source_paths_verified = crate::oracle::verify_paths(
-        results
-            .iter()
-            .map(|result| std::path::Path::new(&result.path).to_path_buf()),
-    );
-    // Typed retrieval outcome (W1-01): this fallback is a degraded hybrid
-    // request served by the lexical/filesystem leg, and the status says so.
-    let retrieval = crate::search_engine::lexical_retrieval_outcome(
-        Some(format!("{}: {}", fallback.kind, fallback.reason)),
-        scanned,
-        results.len(),
-        !source_paths_verified,
-    );
-    let oracle_status = crate::search_engine::search_oracle_status_from_retrieval(
-        req.aicx_home,
-        &retrieval,
-        None,
-        results.len(),
-        source_paths_verified,
-    );
-    let rendered =
-        rank::render_search_json_with_oracle(req.aicx_home, &results, scanned, oracle_status)
-            .map_err(|e| {
-                McpError::internal_error(format!("Serialize fallback search JSON: {e}"), None)
-            })?;
-    inject_mcp_semantic_fallback_payload(&rendered, fallback)
 }
 
 #[derive(Clone)]
 pub struct AicxMcpServer {
     #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
-    embedder_unavailable_until: Arc<Mutex<Option<Instant>>>,
     idle_memory: Arc<McpIdleMemoryManager>,
 }
 
@@ -1190,41 +1005,13 @@ impl AicxMcpServer {
     fn with_idle_memory(idle_memory: Arc<McpIdleMemoryManager>) -> Self {
         Self {
             tool_router: Self::tool_router(),
-            embedder_unavailable_until: Arc::new(Mutex::new(None)),
             idle_memory,
         }
     }
 
-    fn embedder_unavailable_guard(&self) -> std::sync::MutexGuard<'_, Option<Instant>> {
-        self.embedder_unavailable_until.lock().expect(
-            "embedder_unavailable_until mutex poisoned; negative-cache state is only mutated by AicxMcpServer",
-        )
-    }
-
-    /// D-6: returns remaining negative-cache TTL when the embedder was
-    /// flagged unavailable. Side effect: lazily clears the entry when it
-    /// has expired so a subsequent retry hits the embedder again.
-    fn embedder_negative_cache_remaining(&self, now: Instant) -> Option<Duration> {
-        let mut guard = self.embedder_unavailable_guard();
-        match *guard {
-            Some(until) if until > now => Some(until.duration_since(now)),
-            Some(_) => {
-                *guard = None;
-                None
-            }
-            None => None,
-        }
-    }
-
-    /// D-6: arm the negative cache for `ttl` from `now`. Called after a
-    /// real embedder failure so subsequent requests fail-fast.
-    fn mark_embedder_unavailable(&self, now: Instant, ttl: Duration) {
-        *self.embedder_unavailable_guard() = Some(now + ttl);
-    }
-
     #[tool(
         name = "aicx_search",
-        description = "Semantic-first search over the canonical corpus. Filesystem-fuzzy fallback applies only when the hybrid index is missing (IndexNotBuilt), with an explicit `semantic_fallback` payload. Corrupt, stale, busy, empty, dimension-mismatch, and embedder failures return a typed fail-fast error (use strict_semantic=true for the same fail-fast on IndexNotBuilt). Filter pushdown (agent/score/date/hours) iterates a bounded semantic retrieval pool (up to 10x the requested limit) so a corpus whose top-N raw hits all sit outside the filter window still surfaces inside-window matches further down the ranking instead of returning silent-empty. When the cap is examined without satisfying the limit, the response carries a `filter_pushdown` payload with `kind=\"filter_yielded_partial\"` so callers can distinguish bounded under-delivery from a genuinely empty corpus."
+        description = "Tantivy search over the published CURRENT corpus with recency and filter pushdown. Search never initializes an embedder, reads dense or legacy artifacts, or falls back to the filesystem. Missing or invalid CURRENT returns a typed error. Evidence mode re-ranks lexical candidates by answer and support signals."
     )]
     async fn search(
         &self,
@@ -1277,7 +1064,6 @@ impl AicxMcpServer {
         let kind_filter_dir = kind_filter.map(|kind| kind.dir_name());
         let query = params.query;
         let limit = params.limit.min(50);
-        let strict_semantic = params.strict_semantic;
         let project_match = parse_project_match(params.project_match.as_deref())?;
         let project = params.project;
         let owned_projects = params
@@ -1296,43 +1082,13 @@ impl AicxMcpServer {
 
         let post_filters = filter_build.post_filters;
 
-        // One request value shared by both fuzzy-fallback exits below.
-        let fallback_request = McpFuzzyFallbackRequest {
-            aicx_home: &aicx_home,
-            query: &query,
-            limit,
-            project_scopes: &project_scopes,
-            frame_kind,
-            kind_filter: kind_filter_dir,
-            post_filters: &post_filters,
-            sort: params.sort.as_deref(),
-        };
-
-        // D-6: short-circuit while the embedder is in the negative-cache
-        // window. Embedder failures are NOT IndexNotBuilt — do not degrade to
-        // filesystem fuzzy (audit recovery 2026-07-23). Surface the typed
-        // error so callers rebuild/heal the embedder instead of ranking noise.
-        let now = Instant::now();
-        if let Some(remaining) = self.embedder_negative_cache_remaining(now) {
-            let fallback = McpSemanticFallbackNotice {
-                kind: "embedder_unavailable".to_string(),
-                reason: format!(
-                    "embedder negative cache active for another {}s — last embed attempt failed",
-                    remaining.as_secs()
-                ),
-                recommendation: "run `aicx doctor` to inspect embedder health; the cache clears automatically after the TTL elapses".to_string(),
-            };
-            return Err(mcp_semantic_unavailable_error(&fallback));
-        }
-
-        // Semantic-first dispatch with filter pushdown. Filesystem-fuzzy
-        // only for IndexNotBuilt (CLI parity). Other hybrid errors fail
-        // typed. `strict_semantic=true` also fails IndexNotBuilt fast.
+        // Tantivy-only dispatch with filter pushdown. Missing/corrupt CURRENT
+        // fails typed; no embedder state or filesystem fallback participates.
         // The wrapper iterates a bounded retrieval pool
         // (`FILTER_EXAMINED_CAP_RATIO` x `limit`) so the canonical
         // pathology — top-N raw hits sit outside the filter window while
         // valid hits exist below — does not surface as silent-empty.
-        let filtered = match crate::search_engine::try_semantic_search_filtered(
+        let filtered = match crate::search_engine::try_lexical_search_filtered(
             &aicx_home,
             &query,
             limit,
@@ -1342,25 +1098,7 @@ impl AicxMcpServer {
             &post_filters,
         ) {
             Ok(filtered) => filtered,
-            Err(err) => {
-                // D-6: arm the negative cache on real embedder failures so
-                // subsequent requests fail-fast for MCP_EMBEDDER_NEGATIVE_TTL
-                // instead of re-running the same broken bootstrap. Other
-                // kinds (index missing, dim mismatch, ...) remain
-                // synchronously retryable.
-                if err.kind() == "embedder_unavailable" {
-                    self.mark_embedder_unavailable(Instant::now(), MCP_EMBEDDER_NEGATIVE_TTL);
-                }
-                let fallback = McpSemanticFallbackNotice::from_error(&err);
-                // Filesystem-fuzzy ONLY for IndexNotBuilt (audit recovery).
-                // strict_semantic remains fail-fast for every kind; non-strict
-                // still must not swallow corrupt/stale/busy into letter-soup.
-                if strict_semantic || !err.allows_filesystem_fallback() {
-                    return Err(mcp_semantic_unavailable_error(&fallback));
-                }
-                let payload = render_mcp_fuzzy_fallback_payload(&fallback_request, &fallback)?;
-                return Ok(CallToolResult::success(vec![Content::text(payload)]));
-            }
+            Err(err) => return Err(mcp_lexical_unavailable_error(&err)),
         };
         let crate::search_engine::FilteredSemanticOutcome {
             outcome,
@@ -2201,9 +1939,6 @@ pub async fn run_http_config_with_lifecycle(
     spawn_mcp_session_cleanup(session_manager.clone(), MCP_SESSION_SWEEP_INTERVAL);
     let idle_memory = Arc::new(McpIdleMemoryManager::new(lifecycle.idle_memory_drop_after));
     spawn_mcp_idle_memory_cleanup(idle_memory.clone(), MCP_IDLE_MEMORY_SWEEP_INTERVAL);
-    if let Some(interval) = lifecycle.auto_refresh_interval {
-        spawn_mcp_auto_refresh(interval, lifecycle.auto_refresh_hours);
-    }
     let service = rmcp::transport::streamable_http_server::StreamableHttpService::new(
         move || Ok(AicxMcpServer::with_idle_memory(idle_memory.clone())),
         session_manager,
@@ -2352,16 +2087,13 @@ fn validate_score_filter(score: Option<u8>) -> Result<Option<u8>, McpError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AicxMcpServer, AicxSessionManager, AicxSessionManagerError, MAX_SCORE_FILTER,
-        MCP_AUTO_REFRESH_HOURS, MCP_AUTO_REFRESH_INTERVAL, MCP_EMBEDDER_NEGATIVE_TTL,
-        MCP_SESSION_IDLE_TTL, MCP_SESSION_MAX_SESSIONS, MCP_SESSION_SWEEP_INTERVAL, McpHttpConfig,
-        McpIdleMemoryManager, McpLifecycleConfig, McpSemanticFallbackNotice, McpTransport,
-        RankItem, RankResponse, SearchParams, SteerResponse, background_refresh_args,
-        build_mcp_semantic_filters, configured_mcp_session_manager,
-        inject_mcp_filter_pushdown_payload, inject_mcp_semantic_fallback_payload,
-        parse_date_filter_mcp, parse_project_match, resolve_mcp_projects,
-        spawn_mcp_session_cleanup, validate_http_auth_policy, validate_score_filter,
-        validate_string_len,
+        AicxSessionManager, AicxSessionManagerError, MAX_SCORE_FILTER, MCP_SESSION_IDLE_TTL,
+        MCP_SESSION_MAX_SESSIONS, MCP_SESSION_SWEEP_INTERVAL, McpHttpConfig, McpIdleMemoryManager,
+        McpLifecycleConfig, McpTransport, RankItem, RankResponse, SearchParams, SteerResponse,
+        background_refresh_args, build_mcp_semantic_filters, configured_mcp_session_manager,
+        inject_mcp_filter_pushdown_payload, parse_date_filter_mcp, parse_project_match,
+        resolve_mcp_projects, spawn_mcp_session_cleanup, validate_http_auth_policy,
+        validate_score_filter, validate_string_len,
     };
 
     use crate::auth::{AuthConfig, AuthSource};
@@ -2377,13 +2109,37 @@ mod tests {
     };
 
     #[test]
-    fn http_lifecycle_defaults_to_bounded_auto_refresh() {
+    fn http_lifecycle_contains_only_reader_memory_policy() {
         let lifecycle = McpLifecycleConfig::default();
         assert_eq!(
-            lifecycle.auto_refresh_interval,
-            Some(MCP_AUTO_REFRESH_INTERVAL)
+            lifecycle.idle_memory_drop_after,
+            super::MCP_IDLE_MEMORY_DROP_AFTER
         );
-        assert_eq!(lifecycle.auto_refresh_hours, MCP_AUTO_REFRESH_HOURS);
+    }
+
+    #[test]
+    fn mcp_public_search_and_http_lifecycle_are_reader_only() {
+        let source = include_str!("mcp.rs");
+        for retired in [
+            ["Semantic-first", " search"].concat(),
+            ["strict_", "semantic: bool"].concat(),
+            ["spawn_mcp_", "auto_refresh"].concat(),
+            ["refresh_catalog_", "and_index"].concat(),
+            ["crate::catalog::", "refresh_hot"].concat(),
+            ["crate::source_index::", "build"].concat(),
+        ] {
+            assert!(
+                !source.contains(&retired),
+                "reader-only MCP source must not contain retired writer/search path: {retired}"
+            );
+        }
+        assert!(source.matches("try_lexical_search_filtered").count() >= 2);
+        assert!(
+            source
+                .matches("Evidence mode re-ranks lexical candidates")
+                .count()
+                >= 2
+        );
     }
 
     fn project_store_root(label: &str) -> PathBuf {
@@ -2468,7 +2224,6 @@ mod tests {
             evidence: false,
             slim: true,
             verbose: false,
-            strict_semantic: false,
         }
     }
 
@@ -2622,7 +2377,6 @@ mod tests {
         assert!(params.hours.is_none());
         assert!(params.date.is_none());
         assert!(!params.evidence);
-        assert!(!params.strict_semantic);
     }
 
     #[test]
@@ -2634,11 +2388,14 @@ mod tests {
     }
 
     #[test]
-    fn search_params_can_opt_back_into_strict_semantic() {
+    fn retired_strict_semantic_is_ignored_and_absent_from_schema() {
         let params: SearchParams =
             serde_json::from_str(r#"{"query":"dashboard","strict_semantic":true}"#)
-                .expect("search params should parse");
-        assert!(params.strict_semantic);
+                .expect("unknown compatibility field should not break old callers");
+        assert_eq!(params.query, "dashboard");
+        let schema = schemars::schema_for!(SearchParams);
+        let rendered = serde_json::to_string(&schema).expect("serialize search schema");
+        assert!(!rendered.contains("strict_semantic"));
     }
 
     #[test]
@@ -2709,33 +2466,6 @@ mod tests {
         assert_eq!(json["filter_pushdown"]["matched"], 2);
         assert_eq!(json["filter_pushdown"]["requested_limit"], 10);
         assert_eq!(json["filter_pushdown"]["examined_cap_ratio"], 10);
-    }
-
-    #[test]
-    fn mcp_search_payload_includes_semantic_fallback_diagnostic() {
-        let fallback = McpSemanticFallbackNotice {
-            kind: "index_not_built".to_string(),
-            reason: "index missing".to_string(),
-            recommendation: "run `aicx index`".to_string(),
-        };
-
-        let payload = inject_mcp_semantic_fallback_payload(
-            r#"{"oracle_status":{"backend":"filesystem_fuzzy"},"results":0,"items":[]}"#,
-            &fallback,
-        )
-        .expect("fallback payload should inject");
-        let json: serde_json::Value =
-            serde_json::from_str(&payload).expect("payload should stay valid JSON");
-
-        assert_eq!(json["results"], 0);
-        assert_eq!(json["semantic_fallback"]["used"], true);
-        assert_eq!(json["semantic_fallback"]["backend"], "filesystem_fuzzy");
-        assert_eq!(json["semantic_fallback"]["kind"], "index_not_built");
-        assert_eq!(json["semantic_fallback"]["reason"], "index missing");
-        assert_eq!(
-            json["semantic_fallback"]["recommendation"],
-            "run `aicx index`"
-        );
     }
 
     #[test]
@@ -2917,53 +2647,6 @@ mod tests {
         assert_eq!(
             payload["completeness"]["scope"]["candidates"],
             serde_json::json!(["two/aicx"])
-        );
-    }
-
-    #[test]
-    fn embedder_negative_ttl_is_five_minutes() {
-        // D-6: production TTL is five minutes; a regression to the test-only
-        // 30s value would let a flapping endpoint retry-storm an unhealthy
-        // embedder six times faster than intended.
-        assert_eq!(MCP_EMBEDDER_NEGATIVE_TTL, Duration::from_secs(5 * 60));
-    }
-
-    #[test]
-    fn mark_embedder_unavailable_arms_cache() {
-        // D-6: mark + check cycle works end-to-end without external state.
-        let server = AicxMcpServer::new();
-        let now = Instant::now();
-        assert!(server.embedder_negative_cache_remaining(now).is_none());
-        server.mark_embedder_unavailable(now, Duration::from_secs(120));
-        let remaining = server
-            .embedder_negative_cache_remaining(now)
-            .expect("cache should be armed after mark");
-        assert!(remaining.as_secs() >= 119 && remaining.as_secs() <= 120);
-        // After TTL elapsed, cache lazily clears.
-        assert!(
-            server
-                .embedder_negative_cache_remaining(now + Duration::from_secs(121))
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn embedder_negative_cache_expires_by_ttl() {
-        let server = AicxMcpServer::new();
-        let now = Instant::now();
-        server.mark_embedder_unavailable(now, MCP_EMBEDDER_NEGATIVE_TTL);
-
-        let remaining = server
-            .embedder_negative_cache_remaining(now + Duration::from_secs(10))
-            .expect("cache should still be active");
-        assert!(remaining.as_secs() >= MCP_EMBEDDER_NEGATIVE_TTL.as_secs() - 11);
-
-        assert!(
-            server
-                .embedder_negative_cache_remaining(
-                    now + MCP_EMBEDDER_NEGATIVE_TTL + Duration::from_secs(1)
-                )
-                .is_none()
         );
     }
 

@@ -352,6 +352,7 @@ _arguments "${_arguments_options[@]}" : \
             (rebuild)
 _arguments "${_arguments_options[@]}" : \
 '--json[Emit JSON report to stdout]' \
+'--with-chunks[After rewriting the catalog, drain pending chunks through \`aicx index\` (lexical CURRENT) and print the remaining lag]' \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
@@ -452,106 +453,7 @@ _arguments "${_arguments_options[@]}" : \
             (rebuild)
 _arguments "${_arguments_options[@]}" : \
 '--json[Emit JSON report to stdout]' \
-'-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
-'--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
-'--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
-'-h[Print help (see more with '\''--help'\'')]' \
-'--help[Print help (see more with '\''--help'\'')]' \
-&& ret=0
-;;
-(refresh)
-_arguments "${_arguments_options[@]}" : \
-'-H+[Window in hours]:HOURS:_default' \
-'--hours=[Window in hours]:HOURS:_default' \
-'--json[Emit JSON report to stdout]' \
-'-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
-'--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
-'--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
-'-h[Print help (see more with '\''--help'\'')]' \
-'--help[Print help (see more with '\''--help'\'')]' \
-&& ret=0
-;;
-(status)
-_arguments "${_arguments_options[@]}" : \
-'--json[Emit JSON (\`aicx.catalog.status.v1\`)]' \
-'-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
-'--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
-'--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
-'-h[Print help (see more with '\''--help'\'')]' \
-'--help[Print help (see more with '\''--help'\'')]' \
-&& ret=0
-;;
-(resolve)
-_arguments "${_arguments_options[@]}" : \
-'--json[Emit JSON]' \
-'-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
-'--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
-'--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
-'-h[Print help (see more with '\''--help'\'')]' \
-'--help[Print help (see more with '\''--help'\'')]' \
-':session -- Session id (exact, logical, or unique prefix):_default' \
-&& ret=0
-;;
-(help)
-_arguments "${_arguments_options[@]}" : \
-":: :_aicx__subcmd__catalog__subcmd__help_commands" \
-"*::: :->help" \
-&& ret=0
-
-    case $state in
-    (help)
-        words=($line[1] "${words[@]}")
-        (( CURRENT += 1 ))
-        curcontext="${curcontext%:*:*}:aicx-catalog-help-command-$line[1]:"
-        case $line[1] in
-            (rebuild)
-_arguments "${_arguments_options[@]}" : \
-&& ret=0
-;;
-(refresh)
-_arguments "${_arguments_options[@]}" : \
-&& ret=0
-;;
-(status)
-_arguments "${_arguments_options[@]}" : \
-&& ret=0
-;;
-(resolve)
-_arguments "${_arguments_options[@]}" : \
-&& ret=0
-;;
-(help)
-_arguments "${_arguments_options[@]}" : \
-&& ret=0
-;;
-        esac
-    ;;
-esac
-;;
-        esac
-    ;;
-esac
-;;
-(store)
-_arguments "${_arguments_options[@]}" : \
-'-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
-'--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
-'--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
-'-h[Print help (see more with '\''--help'\'')]' \
-'--help[Print help (see more with '\''--help'\'')]' \
-":: :_aicx__subcmd__catalog_commands" \
-"*::: :->catalog" \
-&& ret=0
-
-    case $state in
-    (catalog)
-        words=($line[1] "${words[@]}")
-        (( CURRENT += 1 ))
-        curcontext="${curcontext%:*:*}:aicx-catalog-command-$line[1]:"
-        case $line[1] in
-            (rebuild)
-_arguments "${_arguments_options[@]}" : \
-'--json[Emit JSON report to stdout]' \
+'--with-chunks[After rewriting the catalog, drain pending chunks through \`aicx index\` (lexical CURRENT) and print the remaining lag]' \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
@@ -752,12 +654,12 @@ _arguments "${_arguments_options[@]}" : \
 ;;
 (list)
 _arguments "${_arguments_options[@]}" : \
+'*-p+[Exact project filter, same shapes as search/intents/MCP\: \`owner/repo\`, \`/repo\` (cross-org repo), \`owner/\` (org wildcard), or a unique bare \`name\`. Empty is a numbered miss, not silence]:PROJECT:_default' \
+'*--project=[Exact project filter, same shapes as search/intents/MCP\: \`owner/repo\`, \`/repo\` (cross-org repo), \`owner/\` (org wildcard), or a unique bare \`name\`. Empty is a numbered miss, not silence]:PROJECT:_default' \
 '--agent=[Filter by agent (claude | codex | gemini | junie | grok)]:AGENT:(claude codex gemini junie grok)' \
 '--since=[Only sessions updated on/after this date (YYYY-MM-DD). Defaults to the last 30 days; pass --all to scan the full history]:SINCE:_default' \
 '--limit=[Max sessions to show (0 = all)]:LIMIT:_default' \
 '--format=[Output format\: table | json]:FORMAT:_default' \
-'-p+[Exact project filter]:PROJECT:_default' \
-'--project=[Exact project filter]:PROJECT:_default' \
 '--cwd[Restrict to sessions whose repo/cwd matches the current directory]' \
 '--all[Scan the full session history (slower) instead of the default last-30-days window]' \
 '-j[Alias for \`--format json\` (vc-frame / plugin assimilation)]' \
@@ -1205,7 +1107,7 @@ _arguments "${_arguments_options[@]}" : \
 '--hours=[Hours to look back (default\: 720 = 30 days)]:HOURS:_default' \
 '--limit=[Maximum number of results to return. Default is command-specific\: search/steer 10, tail 20, intents unlimited (full roadmap)]:LIMIT:_default' \
 '--sort=[Sort order applied after filtering. Default\: command-specific]:SORT:(newest oldest score)' \
-'--score=[Minimum score threshold (0-100; semantic match confidence)]:SCORE:_default' \
+'--score=[Minimum score threshold (0-100; retrieval confidence)]:SCORE:_default' \
 '--agent=[Agent name filter\: claude | codex | gemini | junie | codescribe]:AGENT:_default' \
 '--since=[Lower date bound\: YYYY-MM-DD or relative (e.g., 2026-04-23..)]:SINCE:_default' \
 '--until=[Upper date bound\: YYYY-MM-DD]:UNTIL:_default' \
@@ -1316,7 +1218,7 @@ _arguments "${_arguments_options[@]}" : \
 '--kind=[Filter by kind\: decision, intent, outcome, task]:KIND:_default' \
 '--limit=[Maximum number of results to return. Default is command-specific\: search/steer 10, tail 20, intents unlimited (full roadmap)]:LIMIT:_default' \
 '--sort=[Sort order applied after filtering. Default\: command-specific]:SORT:(newest oldest score)' \
-'--score=[Minimum score threshold (0-100; semantic match confidence)]:SCORE:_default' \
+'--score=[Minimum score threshold (0-100; retrieval confidence)]:SCORE:_default' \
 '--agent=[Agent name filter\: claude | codex | gemini | junie | codescribe]:AGENT:_default' \
 '--since=[Lower date bound\: YYYY-MM-DD or relative (e.g., 2026-04-23..)]:SINCE:_default' \
 '--until=[Upper date bound\: YYYY-MM-DD]:UNTIL:_default' \
@@ -1339,6 +1241,7 @@ _arguments "${_arguments_options[@]}" : \
 '(--no-require-auth)--require-auth=[Require Bearer auth on HTTP transport (default\: true). Pass \`--no-require-auth\` to opt out]:REQUIRE_AUTH:(true false)' \
 '--allow-any-host[Disable HTTP Host header validation. Not recommended outside trusted networks]' \
 '--no-require-auth[Disable Bearer auth on HTTP transport. Only allowed on loopback binds]' \
+'--no-auto-refresh[Retained compatibility no-op. HTTP serving is always reader-only]' \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
@@ -1381,7 +1284,7 @@ _arguments "${_arguments_options[@]}" : \
 '--date=[Filter by date\: single day (2026-03-28), range (2026-03-20..2026-03-28), or open-ended (2026-03-20.. or ..2026-03-28)]:DATE:_default' \
 '--limit=[Maximum number of results to return. Default is command-specific\: search/steer 10, tail 20, intents unlimited (full roadmap)]:LIMIT:_default' \
 '--sort=[Sort order applied after filtering. Default\: command-specific]:SORT:(newest oldest score)' \
-'--score=[Minimum score threshold (0-100; semantic match confidence)]:SCORE:_default' \
+'--score=[Minimum score threshold (0-100; retrieval confidence)]:SCORE:_default' \
 '--agent=[Agent name filter\: claude | codex | gemini | junie | codescribe]:AGENT:_default' \
 '--since=[Lower date bound\: YYYY-MM-DD or relative (e.g., 2026-04-23..)]:SINCE:_default' \
 '--until=[Upper date bound\: YYYY-MM-DD]:UNTIL:_default' \
@@ -1390,12 +1293,9 @@ _arguments "${_arguments_options[@]}" : \
 '--session=[Search passages inside one catalog session instead of ranking sessions]:SESSION:_default' \
 '--context=[Context lines before and after each passage match (default\: 2)]:N:_default' \
 '--literal[Match an exact, identifier-boundary substring inside --session]' \
-'(--evidence)--no-semantic[Force lexical-only retrieval from the published CURRENT index]' \
-'--evidence[Return an evidence packet\: semantic candidates re-ranked by answer/support signals, with source sections and diagnostics]' \
+'--evidence[Return an evidence packet\: lexical candidates re-ranked by answer/support signals, with source sections and diagnostics]' \
 '-j[Emit compact JSON instead of plain text]' \
 '--json[Emit compact JSON instead of plain text]' \
-'--legacy-dense[Use legacy NDJSON reader for dense vector search instead of versioned mmap]' \
-'--deep[Dense re-rank (hybrid RRF over tantivy + mmap). Default is lexical-first with a recency prior against the published \`_all\` CURRENT generation — sub-second answers without loading the embedder or dense vectors]' \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
@@ -1677,7 +1577,7 @@ _arguments "${_arguments_options[@]}" : \
 '--date=[Filter by date\: single day (2026-03-28), range (2026-03-20..2026-03-28), or open-ended (2026-03-20.. or ..2026-03-28)]:DATE:_default' \
 '--limit=[Maximum number of results to return. Default is command-specific\: search/steer 10, tail 20, intents unlimited (full roadmap)]:LIMIT:_default' \
 '--sort=[Sort order applied after filtering. Default\: command-specific]:SORT:(newest oldest score)' \
-'--score=[Minimum score threshold (0-100; semantic match confidence)]:SCORE:_default' \
+'--score=[Minimum score threshold (0-100; retrieval confidence)]:SCORE:_default' \
 '--agent=[Agent name filter\: claude | codex | gemini | junie | codescribe]:AGENT:_default' \
 '--since=[Lower date bound\: YYYY-MM-DD or relative (e.g., 2026-04-23..)]:SINCE:_default' \
 '--until=[Upper date bound\: YYYY-MM-DD]:UNTIL:_default' \
@@ -2217,7 +2117,7 @@ _aicx_commands() {
 'tail:Print recent intents/chunks (snapshot mode); add --follow to stream new arrivals' \
 'serve:Run aicx as an MCP server' \
 'init:Retired compatibility shim; prints migration guidance' \
-'search:Search the CURRENT source/extract index. Lexical-first by default; optional dense rerank with --deep. When no index exists, the only fallback is a bounded recency-ranked filesystem search' \
+'search:Search the published CURRENT source/extract index with Tantivy and a recency prior. Missing or invalid CURRENT fails with a typed error' \
 'eval:Run local evaluation helpers for retrieval/search quality' \
 'index:Build the source-driven lexical index (default) or opt-in dense CURRENT with \`--semantic\`. Use \`--dry-run\` to preview lexical parsing only' \
 'config:Manage \`\$HOME/.aicx/config.toml\` for embedders and endpoints' \
@@ -2675,7 +2575,7 @@ _aicx__subcmd__help_commands() {
 'tail:Print recent intents/chunks (snapshot mode); add --follow to stream new arrivals' \
 'serve:Run aicx as an MCP server' \
 'init:Retired compatibility shim; prints migration guidance' \
-'search:Search the CURRENT source/extract index. Lexical-first by default; optional dense rerank with --deep. When no index exists, the only fallback is a bounded recency-ranked filesystem search' \
+'search:Search the published CURRENT source/extract index with Tantivy and a recency prior. Missing or invalid CURRENT fails with a typed error' \
 'eval:Run local evaluation helpers for retrieval/search quality' \
 'index:Build the source-driven lexical index (default) or opt-in dense CURRENT with \`--semantic\`. Use \`--dry-run\` to preview lexical parsing only' \
 'config:Manage \`\$HOME/.aicx/config.toml\` for embedders and endpoints' \

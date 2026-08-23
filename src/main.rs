@@ -538,7 +538,7 @@ struct RetrievalFilters {
     #[arg(long, value_enum)]
     sort: Option<SortOrder>,
 
-    /// Minimum score threshold (0-100; semantic match confidence).
+    /// Minimum score threshold (0-100; retrieval confidence).
     #[arg(long)]
     score: Option<u8>,
 
@@ -1621,12 +1621,8 @@ enum Commands {
         #[arg(long = "no-require-auth", action = clap::ArgAction::SetTrue)]
         no_require_auth: bool,
 
-        /// Refresh the hot catalog and lexical index in the background at this cadence.
-        #[arg(long, default_value_t = 300, value_parser = clap::value_parser!(u64).range(10..))]
-        refresh_interval_seconds: u64,
-
-        /// Disable the HTTP server's background catalog/index refresh loop.
-        #[arg(long)]
+        /// Retained compatibility no-op. HTTP serving is always reader-only.
+        #[arg(long, hide = true)]
         no_auto_refresh: bool,
     },
 
@@ -1689,9 +1685,8 @@ enum Commands {
         no_gitignore: bool,
     },
 
-    /// Search the CURRENT source/extract index. Lexical-first by default;
-    /// optional dense rerank with --deep. When no index exists, the only
-    /// fallback is a bounded recency-ranked filesystem search.
+    /// Search the published CURRENT source/extract index with Tantivy and a
+    /// recency prior. Missing or invalid CURRENT fails with a typed error.
     #[command(display_order = 12)]
     Search {
         /// Search query string
@@ -1740,11 +1735,7 @@ enum Commands {
         #[arg(long, requires = "session", value_name = "N")]
         context: Option<usize>,
 
-        /// Force lexical-only retrieval from the published CURRENT index.
-        #[arg(long, conflicts_with = "evidence")]
-        no_semantic: bool,
-
-        /// Return an evidence packet: semantic candidates re-ranked by
+        /// Return an evidence packet: lexical candidates re-ranked by
         /// answer/support signals, with source sections and diagnostics.
         #[arg(long)]
         evidence: bool,
@@ -1752,17 +1743,6 @@ enum Commands {
         /// Emit compact JSON instead of plain text
         #[arg(short = 'j', long)]
         json: bool,
-
-        /// Use legacy NDJSON reader for dense vector search instead of versioned mmap.
-        #[arg(long)]
-        legacy_dense: bool,
-
-        /// Dense re-rank (hybrid RRF over tantivy + mmap). Default is
-        /// lexical-first with a recency prior against the published `_all`
-        /// CURRENT generation — sub-second answers without loading the
-        /// embedder or dense vectors.
-        #[arg(long)]
-        deep: bool,
     },
 
     /// Run local evaluation helpers for retrieval/search quality.
@@ -2918,7 +2898,6 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
             auth_token,
             require_auth,
             no_require_auth,
-            refresh_interval_seconds,
             no_auto_refresh,
         }) => {
             let require_auth = require_auth && !no_require_auth;
@@ -2938,11 +2917,8 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
                 allow_any_host,
             };
             let rt = tokio::runtime::Runtime::new()?;
-            let lifecycle = McpLifecycleConfig {
-                auto_refresh_interval: (!no_auto_refresh)
-                    .then(|| Duration::from_secs(refresh_interval_seconds)),
-                ..McpLifecycleConfig::default()
-            };
+            let _ = no_auto_refresh;
+            let lifecycle = McpLifecycleConfig::default();
             rt.block_on(async {
                 mcp::run_transport_with_lifecycle(transport, http_config, auth_config, lifecycle)
                     .await
@@ -2958,13 +2934,9 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
             session,
             literal,
             context,
-            no_semantic,
             evidence,
             json,
-            legacy_dense,
-            deep,
         }) => {
-            aicx::search_engine::LEGACY_DENSE_ACTIVE.with(|active| active.set(legacy_dense));
             run_search(SearchRunArgs {
                 query: &query,
                 projects: &project,
@@ -2976,9 +2948,7 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
                 session: session.as_deref(),
                 literal,
                 context: context.unwrap_or(2),
-                no_semantic,
                 evidence,
-                deep,
                 project_match,
             })?;
         }
@@ -7765,10 +7735,7 @@ fn project_scope_label(projects: &[String]) -> String {
     }
 }
 
-/// Lexical-first retrieval across the published CURRENT index. Filesystem
-/// fuzzy is used only for the default mode when no index exists;
-/// `--no-semantic` means a strict lexical-only CURRENT read and never routes
-/// into the retired filesystem-fuzzy path.
+/// Tantivy-only retrieval across the published CURRENT index.
 struct SearchRunArgs<'a> {
     query: &'a str,
     projects: &'a [String],
@@ -7780,9 +7747,7 @@ struct SearchRunArgs<'a> {
     session: Option<&'a str>,
     literal: bool,
     context: usize,
-    no_semantic: bool,
     evidence: bool,
-    deep: bool,
     project_match: legacy_archive::ProjectMatchMode,
 }
 
@@ -7978,9 +7943,7 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
         session,
         literal,
         context,
-        no_semantic,
         evidence,
-        deep,
         project_match,
     } = args;
     if let Some(session) = session {
@@ -7989,9 +7952,6 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
     }
     let limit = filters.limit.unwrap_or(DEFAULT_RETRIEVAL_LIMIT);
     validate_cli_search_limit(limit)?;
-    if evidence && no_semantic {
-        anyhow::bail!("search --evidence requires semantic search; remove --no-semantic");
-    }
     let kind_filter = kind.and_then(aicx::timeline::Kind::parse);
     // Extract inline date hints from query if no explicit --date given
     let (effective_query, inline_date) = if date.is_none() {
@@ -8025,35 +7985,28 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
     } else {
         None
     };
-    let legacy_dense = aicx::search_engine::LEGACY_DENSE_ACTIVE.with(|active| active.get());
     let post_filters = aicx::search_engine::SemanticSearchFilters {
         agent: filters.agent.clone(),
         score_min: filters.score,
         date_lo: date_lo.clone(),
         date_hi: date_hi.clone(),
         hours_cutoff: hours_cutoff.clone(),
-        legacy_dense,
-        // --legacy-dense implies the dense recovery path (deep enough).
-        deep: deep || legacy_dense,
+        legacy_dense: false,
+        deep: false,
     };
 
     let project_resolution = resolve_project_filters_or_error(projects, project_match, true)?;
     let scopes = project_scopes(&project_resolution.selected);
 
-    let mut index_filters = post_filters.clone();
-    if no_semantic {
-        index_filters.deep = false;
-        index_filters.legacy_dense = false;
-    }
-    let (results, scanned, semantic_status, pushdown_diagnostic, semantic_fallback) =
-        match aicx::search_engine::try_semantic_search_filtered(
+    let (results, scanned, semantic_status, pushdown_diagnostic) =
+        match aicx::search_engine::try_lexical_search_filtered(
             &root,
             &search_query,
             limit,
             &scopes,
             filters.frame_kind.map(Into::into),
             kind_filter.map(|kind| kind.dir_name()),
-            &index_filters,
+            &post_filters,
         ) {
             Ok(filtered) => {
                 let aicx::search_engine::FilteredSemanticOutcome {
@@ -8066,60 +8019,22 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
                     outcome.scanned,
                     outcome.retrieval_status.clone(),
                 );
-                (
-                    outcome.results,
-                    outcome.scanned,
-                    Some(status),
-                    diagnostic,
-                    None,
-                )
+                (outcome.results, outcome.scanned, Some(status), diagnostic)
             }
             Err(err) => {
-                if no_semantic {
-                    eprintln!("{}", coverage.render_line());
-                    anyhow::bail!(
-                        "aicx search --no-semantic requires the published CURRENT lexical index: \
-                         {} ({})\n  recommendation: {}",
-                        err.kind(),
-                        err.reason(),
-                        err.recommendation()
-                    );
-                }
-                // Filesystem-fuzzy ONLY when no hybrid index exists.
-                // Corrupt / stale / busy / embedder / empty → honest error.
-                if !err.allows_filesystem_fallback() {
-                    if !json {
-                        eprintln!("aicx search: hybrid retrieval failed (no fuzzy swallow).");
-                        eprintln!("  kind:           {}", err.kind());
-                        eprintln!("  reason:         {}", err.reason());
-                        eprintln!("  recommendation: {}", err.recommendation());
-                    }
-                    eprintln!("{}", coverage.render_line());
-                    anyhow::bail!(
-                        "aicx search failed: {} ({})\n  recommendation: {}",
-                        err.kind(),
-                        err.reason(),
-                        err.recommendation()
-                    );
-                }
-                let fallback = SemanticFallbackNotice::from_error(&err);
-                let (results, scanned) = aicx::search_engine::fuzzy_search_with_post_filters(
-                    &root,
-                    &search_query,
-                    limit,
-                    &scopes,
-                    filters.frame_kind.map(Into::into),
-                    &post_filters,
-                )?;
                 if !json {
-                    eprintln!(
-                        "aicx search: index not built; falling back to filesystem fuzzy (recency-ranked)."
-                    );
+                    eprintln!("aicx search: lexical CURRENT retrieval failed.");
                     eprintln!("  kind:           {}", err.kind());
                     eprintln!("  reason:         {}", err.reason());
                     eprintln!("  recommendation: {}", err.recommendation());
                 }
-                (results, scanned, None, None, Some(fallback))
+                eprintln!("{}", coverage.render_line());
+                anyhow::bail!(
+                    "aicx search failed: {} ({})\n  recommendation: {}",
+                    err.kind(),
+                    err.reason(),
+                    err.recommendation()
+                );
             }
         };
 
@@ -8149,14 +8064,7 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
                         !source_paths_verified,
                     )
                 }
-                None => aicx::search_engine::lexical_retrieval_outcome(
-                    semantic_fallback
-                        .as_ref()
-                        .map(|notice| format!("{}: {}", notice.kind, notice.reason)),
-                    scanned,
-                    report.results,
-                    !source_paths_verified,
-                ),
+                None => unreachable!("lexical CURRENT success always carries retrieval status"),
             };
             if pushdown_diagnostic.is_some() {
                 base.mark_partial()
@@ -8181,22 +8089,6 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
                 &rendered,
                 pushdown_diagnostic.as_ref(),
             )?;
-            if let Some(ref fallback) = semantic_fallback {
-                let mut value: serde_json::Value = serde_json::from_str(&payload)?;
-                if let Some(obj) = value.as_object_mut() {
-                    obj.insert(
-                        "semantic_fallback".to_string(),
-                        serde_json::json!({
-                            "used": true,
-                            "backend": "filesystem_fuzzy",
-                            "kind": fallback.kind,
-                            "reason": fallback.reason,
-                            "recommendation": fallback.recommendation,
-                        }),
-                    );
-                }
-                payload = serde_json::to_string(&value)?;
-            }
             payload = inject_search_coverage(&payload, &coverage)?;
             eprintln!("{}", coverage.render_line());
             println!("{}", payload);
@@ -8291,14 +8183,7 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
                     !source_paths_verified,
                 )
             }
-            None => aicx::search_engine::lexical_retrieval_outcome(
-                semantic_fallback
-                    .as_ref()
-                    .map(|notice| format!("{}: {}", notice.kind, notice.reason)),
-                scanned,
-                results.len(),
-                !source_paths_verified,
-            ),
+            None => unreachable!("lexical CURRENT success always carries retrieval status"),
         };
         if pushdown_diagnostic.is_some() {
             base.mark_partial()
@@ -8328,22 +8213,6 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
         // freshness check; attach the honesty hint pointing at `index status`.
         if let Some(source_chunks) = hybrid_source_chunks {
             payload = aicx::search_engine::inject_index_snapshot_hint(&payload, source_chunks)?;
-        }
-        if let Some(ref fallback) = semantic_fallback {
-            let mut value: serde_json::Value = serde_json::from_str(&payload)?;
-            if let Some(obj) = value.as_object_mut() {
-                obj.insert(
-                    "semantic_fallback".to_string(),
-                    serde_json::json!({
-                        "used": true,
-                        "backend": "filesystem_fuzzy",
-                        "kind": fallback.kind,
-                        "reason": fallback.reason,
-                        "recommendation": fallback.recommendation,
-                    }),
-                );
-            }
-            payload = serde_json::to_string(&value)?;
         }
         payload = inject_search_coverage(&payload, &coverage)?;
         eprintln!("{}", coverage.render_line());
@@ -8401,23 +8270,6 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
     }
     eprintln!("{}", coverage.render_line());
     Ok(())
-}
-
-#[derive(Debug, Clone)]
-struct SemanticFallbackNotice {
-    kind: String,
-    reason: String,
-    recommendation: String,
-}
-
-impl SemanticFallbackNotice {
-    fn from_error(err: &aicx::search_engine::SemanticError) -> Self {
-        Self {
-            kind: err.kind().to_string(),
-            reason: err.reason().to_string(),
-            recommendation: err.recommendation().to_string(),
-        }
-    }
 }
 
 /// Build (or preview) the source-driven lexical index.
@@ -8493,7 +8345,7 @@ fn run_index(
             eprintln!("  manifest: {path}");
         }
         if report.semantic_requested && report.dense_docs > 0 {
-            eprintln!("  next: aicx search --deep '<query>' uses dense RRF on this CURRENT");
+            eprintln!("  note: dense artifacts are retained for internal compatibility only");
         } else if !report.semantic_requested {
             eprintln!(
                 "  note: dense not built (feature). Opt in with `aicx index --semantic` on the owner host."

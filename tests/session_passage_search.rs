@@ -205,8 +205,8 @@ fn vc_trust_replay_searches_then_reads_every_passage_without_grep() {
         "boundary decoy must not become its own literal passage"
     );
 
-    let lexical_only = run_aicx(&aicx_home, &["search", QUERY, "--no-semantic", "--json"]);
-    assert_success(&lexical_only, "--no-semantic CURRENT search");
+    let lexical_only = run_aicx(&aicx_home, &["search", QUERY, "--json"]);
+    assert_success(&lexical_only, "CURRENT lexical search");
     let lexical_payload = parse_json(&lexical_only);
     assert_eq!(
         lexical_payload["oracle_status"]["backend"],
@@ -258,13 +258,13 @@ fn passage_parse_on_read_and_missing_current_are_honest() {
         "context-zero literal passages must exclude the identifier-boundary decoy"
     );
 
-    let no_semantic = run_aicx(&aicx_home, &["search", QUERY, "--no-semantic", "--json"]);
+    let no_semantic = run_aicx(&aicx_home, &["search", QUERY, "--json"]);
     assert!(
         !no_semantic.status.success(),
         "missing CURRENT must fail instead of scanning legacy chunks"
     );
     let stderr = String::from_utf8_lossy(&no_semantic.stderr);
-    assert!(stderr.contains("requires the published CURRENT lexical index"));
+    assert!(stderr.contains("index_not_built"));
     assert!(stderr.contains("scanned 0 of 1 sessions; skipped: codex_unindexed=1"));
     assert!(!stderr.contains("scanned 0 chunks"));
     assert!(!stderr.contains("filesystem-fuzzy"));

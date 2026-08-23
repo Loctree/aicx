@@ -560,9 +560,7 @@ fn run_search_rejects_limit_over_hard_cap_before_store_access() {
         session: None,
         literal: false,
         context: 2,
-        no_semantic: true,
         evidence: false,
-        deep: false,
         project_match: legacy_archive::ProjectMatchMode::Exact,
     })
     .expect_err("oversized search limit must fail before reading the store");
@@ -1464,15 +1462,14 @@ fn search_accepts_score_and_json_flags() {
 }
 
 #[test]
-fn search_accepts_no_semantic_escape_hatch() {
-    let cli = Cli::try_parse_from(["aicx", "search", "dashboard", "--no-semantic"])
-        .expect("search command with --no-semantic should parse");
-
-    match cli.command {
-        Some(Commands::Search { no_semantic, .. }) => {
-            assert!(no_semantic);
-        }
-        _ => panic!("expected search command"),
+fn search_rejects_retired_semantic_flags() {
+    for flag in ["--no-semantic", "--legacy-dense", "--deep"] {
+        let err = Cli::try_parse_from(["aicx", "search", "dashboard", flag])
+            .expect_err("retired search flag must not parse");
+        assert!(
+            err.to_string().contains("unexpected argument"),
+            "{flag}: {err}"
+        );
     }
 }
 
@@ -1529,11 +1526,13 @@ fn search_accepts_evidence_mode() {
 }
 
 #[test]
-fn search_rejects_evidence_with_no_semantic() {
-    let err = Cli::try_parse_from(["aicx", "search", "dashboard", "--evidence", "--no-semantic"])
-        .expect_err("evidence mode must require semantic search");
-
-    assert!(err.to_string().contains("cannot be used with"));
+fn search_evidence_has_no_semantic_flag_dependency() {
+    let cli = Cli::try_parse_from(["aicx", "search", "dashboard", "--evidence"])
+        .expect("evidence mode must operate on lexical candidates");
+    assert!(matches!(
+        cli.command,
+        Some(Commands::Search { evidence: true, .. })
+    ));
 }
 
 #[test]
@@ -2072,17 +2071,15 @@ fn serve_help_prefers_http_name_and_stays_compact() {
     assert!(!rendered.contains("Transport: stdio (default) or sse"));
     assert!(!rendered.contains("embedding mode"));
     // The guard is against help bloat, not against `serve` gaining real
-    // flags — HTTP transport, auth, and the background refresh loop each
-    // brought their own. Raise the budget when a flag lands; treat a jump
+    // flags — HTTP transport and auth each brought their own. Raise the
+    // budget when a flag lands; treat a jump
     // with no new flag as the bloat this test exists to catch.
     let lines = rendered.lines().count();
     assert!(lines <= 60, "serve help should stay compact, got {lines}");
 }
 
 #[test]
-fn search_help_explains_lexical_first_with_bounded_fallback() {
-    // `aicx search` is lexical-first over CURRENT. Filesystem search is a
-    // bounded recovery path only when no index exists.
+fn search_help_explains_tantivy_current_without_fallback() {
     let mut cmd = Cli::command();
     let search = cmd
         .find_subcommand_mut("search")
@@ -2090,20 +2087,20 @@ fn search_help_explains_lexical_first_with_bounded_fallback() {
     let rendered = search.render_long_help().to_string();
 
     assert!(
-        rendered.to_lowercase().contains("lexical-first"),
-        "search --help must name lexical retrieval as the default"
+        rendered.to_lowercase().contains("tantivy"),
+        "search --help must name Tantivy retrieval"
     );
     assert!(
-        rendered.to_lowercase().contains("filesystem"),
-        "search --help must mention the filesystem recovery path"
+        rendered.contains("CURRENT"),
+        "search --help must name the published CURRENT contract"
     );
     assert!(
-        rendered.to_lowercase().contains("fallback"),
-        "search --help must call out the fallback path explicitly"
+        !rendered.to_lowercase().contains("filesystem"),
+        "search --help must not advertise filesystem search"
     );
     assert!(
-        !rendered.contains("filesystem-only"),
-        "search --help must not advertise filesystem as the primary contract"
+        !rendered.to_lowercase().contains("semantic"),
+        "search --help must not advertise retired semantic search"
     );
 }
 
