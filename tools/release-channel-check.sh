@@ -26,6 +26,9 @@ PY
 }
 
 workspace_version=$(read_version Cargo.toml)
+# Native Windows Python writes CRLF to stdout. Bash command substitution strips
+# the LF but retains the CR, so normalize the transport before comparisons.
+workspace_version=${workspace_version%$'\r'}
 err=0
 
 echo "Release channel versions:"
@@ -33,6 +36,7 @@ echo "Release channel versions:"
 check_version() {
   local name="$1"
   local version="$2"
+  version=${version%$'\r'}
   printf '  %s -> %s\n' "$name" "$version"
   if [ "$version" != "$workspace_version" ]; then
     printf '    mismatch vs workspace (%s)\n' "$workspace_version"

@@ -94,7 +94,9 @@ jobs:
 
       - name: Check release channel versions
         working-directory: aicx
-        run: bash tools/release-channel-check.sh
+        run: |
+          bash tools/release-channel-check-selftest.sh
+          bash tools/release-channel-check.sh
 
       - name: Check Cargo.toml version matches tag
         working-directory: aicx

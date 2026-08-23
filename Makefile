@@ -14,7 +14,7 @@ endif
 .PHONY: all build build-native completions release-binaries install install-bin install-config install-cargo git-hooks install-schedule uninstall-schedule install-service uninstall-service
 .PHONY: precheck precheck-native loctree-consumer-check test test-native check fmt fmt-check clippy clippy-native semgrep ci clean help manifest-check
 .PHONY: embeddings-check embeddings-test embeddings-clippy embeddings-hydrate embeddings-info
-.PHONY: version version-show version-check version-bump version-patch bump-patch changelog-close release-notes release-plan release-prepare release-check release-tag release-push package-check release-bundle release-bundle-only-binaries test-e2e
+.PHONY: version version-show version-check version-check-selftest version-bump version-patch bump-patch changelog-close release-notes release-plan release-prepare release-check release-tag release-push package-check release-bundle release-bundle-only-binaries test-e2e
 .PHONY: publish-crates publish-crates-dry
 
 all: build
@@ -271,7 +271,11 @@ version-show:
 
 version-check:
 	@$(PYTHON) tools/release_sync.py check
+	@$(MAKE) version-check-selftest
 	@bash tools/release-channel-check.sh
+
+version-check-selftest:
+	@bash tools/release-channel-check-selftest.sh
 
 version-bump:
 ifeq ($(origin VERSION),command line)

@@ -81,7 +81,9 @@ jobs:
 
       - name: Release channel version consistency
         shell: bash
-        run: bash tools/release-channel-check.sh
+        run: |
+          bash tools/release-channel-check-selftest.sh
+          bash tools/release-channel-check.sh
 
       - name: Sync npm package versions
         shell: bash
