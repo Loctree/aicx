@@ -686,7 +686,6 @@ fn hybrid_current_index_status(base: &Path, project: Option<&str>) -> Result<Opt
     }
 
     let catalog_rows = catalog_rows_for_status(base);
-    let catalog_total = catalog_rows.len();
     let project_filter = project.map(str::trim).filter(|value| !value.is_empty());
     let in_scope: Vec<&(Option<String>, Option<u64>)> = match project_filter {
         None => catalog_rows.iter().collect(),
@@ -710,13 +709,27 @@ fn hybrid_current_index_status(base: &Path, project: Option<&str>) -> Result<Opt
         .build_completed_at
         .timestamp_nanos_opt()
         .map(|nanos| nanos as u64);
-    let sessions_newer = match build_completed_ns {
-        Some(build_ns) => in_scope
-            .iter()
-            .filter(|(_, mtime_ns)| mtime_ns.is_some_and(|mtime| mtime > build_ns))
-            .count(),
-        None => 0,
-    };
+    let source_accounting = crate::source_index::current_source_accounting_at(base, project);
+    let accounting_matches_current = source_accounting.as_ref().is_some_and(|accounting| {
+        accounting.snapshot_matches == Some(true)
+            && aicx_retrieve::source_hash_blake3(&accounting.source_fingerprint)
+                == manifest.source_hash_blake3
+    });
+    let sessions_newer = source_accounting
+        .as_ref()
+        .map(|accounting| {
+            accounting.source_drift
+                + usize::from(
+                    accounting.snapshot_matches == Some(true) && !accounting_matches_current,
+                )
+        })
+        .unwrap_or_else(|| match build_completed_ns {
+            Some(build_ns) => in_scope
+                .iter()
+                .filter(|(_, mtime_ns)| mtime_ns.is_some_and(|mtime| mtime > build_ns))
+                .count(),
+            None => 0,
+        });
     let chunking_lag_secs = match (newest_session_mtime_ns, build_completed_ns) {
         (Some(newest), Some(build)) if newest > build => Some((newest - build) / 1_000_000_000),
         _ => None,
@@ -730,10 +743,21 @@ fn hybrid_current_index_status(base: &Path, project: Option<&str>) -> Result<Opt
         .map(system_time_to_rfc3339)
         .or_else(|| committed_at.clone());
 
-    // Catalog rows beyond CURRENT lexical docs mean sessions are admitted but
-    // not yet published — stale index relative to the durable catalog.
-    let pending = catalog_total.saturating_sub(manifest.lexical_doc_count);
-    let readiness = if sessions_newer > 0 {
+    // Lexical pending is derived from expected indexed documents plus
+    // retryable/deferred gaps. Catalog rows that correctly resolved to
+    // zero-signal or a typed terminal skip are not pending documents.
+    let pending = source_accounting.as_ref().map_or(0, |accounting| {
+        if project_filter.is_some() {
+            accounting.retryable_error + accounting.deferred_live_changed
+        } else {
+            accounting.lexical_pending(manifest.lexical_doc_count)
+        }
+    });
+    let readiness = if source_accounting.is_none() {
+        // Compatibility is explicit: a pre-ledger CURRENT remains searchable,
+        // but expected-document readiness is unknown until one fresh index run.
+        IndexReadiness::PendingScanTimeout
+    } else if sessions_newer > 0 {
         IndexReadiness::StaleChunks
     } else if pending > 0 {
         IndexReadiness::StaleIndex
@@ -742,25 +766,46 @@ fn hybrid_current_index_status(base: &Path, project: Option<&str>) -> Result<Opt
     };
 
     let backend = if manifest.dense_kind == "optional_not_built" {
-        "hybrid_lexical"
+        if source_accounting.is_some() {
+            "hybrid_lexical"
+        } else {
+            "hybrid_lexical_legacy_accounting"
+        }
     } else {
-        "hybrid"
+        if source_accounting.is_some() {
+            "hybrid"
+        } else {
+            "hybrid_legacy_accounting"
+        }
     };
 
-    let (lexical_status, dense_status, dense_kind, dense_count, dense_recommendation) =
+    let (lexical_status, mut dense_status, dense_kind, dense_count, mut dense_recommendation) =
         plane_fields_from_manifest(
             &manifest.dense_kind,
             manifest.dense_count,
             manifest.lexical_doc_count,
         );
+    let dense_payload_path = generation_dir.join(aicx_retrieve::MMAP_DENSE_PAYLOAD_FILE_NAME);
+    let dense_manifest_claims_present =
+        manifest.dense_count > 0 && manifest.dense_kind != "optional_not_built";
+    let dense_payload_present = dense_manifest_claims_present && dense_payload_path.is_file();
+    if dense_manifest_claims_present && !dense_payload_present {
+        dense_status = "missing".to_string();
+        dense_recommendation = Some(
+            "CURRENT manifest claims dense rows but the dense payload is missing; rebuild with `aicx index --semantic` on the owner host"
+                .to_string(),
+        );
+    }
     Ok(Some(IndexStatus {
         // For the extract-era store, "chunks" == signal session documents.
         canonical_chunks: manifest.lexical_doc_count,
-        semantic_index_present: true,
-        semantic_index_path: Some(path_for_json(&manifest_path)),
-        semantic_index_rows: manifest.lexical_doc_count,
+        semantic_index_present: dense_payload_present,
+        semantic_index_path: dense_payload_present.then(|| path_for_json(&dense_payload_path)),
+        semantic_index_rows: manifest.dense_count,
         newest_chunk_mtime: generation_mtime.clone(),
-        source_sessions: catalog_in_scope,
+        source_sessions: source_accounting
+            .as_ref()
+            .map_or(catalog_in_scope, |accounting| accounting.total),
         newest_session_updated_at: newest_session_mtime_ns.and_then(mtime_ns_to_rfc3339),
         sessions_newer_than_chunks: sessions_newer,
         sessions_without_timestamps: 0,
@@ -1311,20 +1356,173 @@ mod tests {
         .expect("write CURRENT pointer");
 
         let status = index_status_at(&root, None).expect("hybrid status");
-        assert_eq!(status.backend, "hybrid_lexical");
-        assert_eq!(status.readiness, IndexReadiness::Ready);
-        assert_eq!(status.semantic_index_rows, 3);
+        assert_eq!(status.backend, "hybrid_lexical_legacy_accounting");
+        assert_eq!(status.readiness, IndexReadiness::PendingScanTimeout);
+        assert!(!status.semantic_index_present);
+        assert_eq!(status.semantic_index_rows, 0);
         assert_eq!(status.canonical_chunks, 3);
-        assert!(
-            status
-                .semantic_index_path
-                .as_deref()
-                .is_some_and(|path| path.contains("manifest.json")
-                    && path.contains("generations")
-                    && !path.contains("embeddings.ndjson")),
-            "status must point at CURRENT generation, not residual ndjson: {:?}",
-            status.semantic_index_path
-        );
+        assert!(status.semantic_index_path.is_none());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn hybrid_status_uses_dispositions_for_lexical_pending_and_source_drift() {
+        let root = std::env::temp_dir().join(format!(
+            "aicx-api-source-accounting-status-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("catalog")).expect("catalog dir");
+        let source_dir = root.join("sources");
+        std::fs::create_dir_all(&source_dir).expect("source dir");
+
+        let mut entries = Vec::new();
+        for ordinal in 0..4usize {
+            let path = source_dir.join(format!("session-{ordinal}.jsonl"));
+            std::fs::write(&path, format!("session {ordinal}\n")).expect("source fixture");
+            let (source_len, source_mtime_ns) =
+                crate::catalog::live_source_fingerprint(&path).expect("source fingerprint");
+            entries.push(crate::catalog::CatalogEntry {
+                schema: crate::catalog::CATALOG_SCHEMA.to_string(),
+                session_id: format!("session-{ordinal}"),
+                agent: "codex".to_string(),
+                project: Some("Loctree/aicx".to_string()),
+                date: None,
+                cwd: None,
+                source_path: path.display().to_string(),
+                source_len: Some(source_len),
+                source_mtime_ns: Some(source_mtime_ns),
+                title: None,
+                machine: None,
+                logical_session_id: None,
+            });
+        }
+        let catalog = entries
+            .iter()
+            .map(|entry| serde_json::to_string(entry).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(root.join("catalog/sessions.jsonl"), format!("{catalog}\n"))
+            .expect("catalog fixture");
+
+        let source_fingerprint = crate::source_index::current_source_fingerprint_at(&root)
+            .expect("source fingerprint census")
+            .expect("non-empty fingerprint");
+        let user_home = crate::os_user_home().unwrap_or_else(|| root.clone());
+        let ignore_fingerprint = crate::legacy_archive::load_repo_path_ignore(&root, &user_home)
+            .expect("ignore rules")
+            .fingerprint();
+        let dispositions = entries
+            .iter()
+            .enumerate()
+            .map(|(ordinal, entry)| {
+                (
+                    format!("{}:{}", entry.agent, entry.session_id),
+                    serde_json::json!({
+                        "source_path": entry.source_path,
+                        "source_len": entry.source_len,
+                        "source_mtime_ns": entry.source_mtime_ns,
+                        "project": entry.project,
+                        "disposition": if ordinal == 3 {
+                            serde_json::json!({"state": "zero_signal"})
+                        } else {
+                            serde_json::json!({"state": "indexed"})
+                        },
+                        "raw_frames": 1,
+                        "signal_frames": usize::from(ordinal < 3),
+                        "filtered_frames": usize::from(ordinal == 3),
+                    }),
+                )
+            })
+            .collect::<serde_json::Map<_, _>>();
+        let parse_state_path = root.join("indexed/_all/source_parse_state.v1.json");
+        std::fs::create_dir_all(parse_state_path.parent().unwrap()).expect("state dir");
+        let write_state =
+            |fingerprint: &str, dispositions: &serde_json::Map<String, serde_json::Value>| {
+                std::fs::write(
+                    &parse_state_path,
+                    serde_json::to_vec_pretty(&serde_json::json!({
+                        "schema": "aicx.source_parse_state.v1",
+                        "signal_filter_version": "signal-v3-workspace-metadata-strip",
+                        "repo_path_ignore_fingerprint": ignore_fingerprint,
+                        "disposition_policy_version": "source-disposition-v1",
+                        "source_fingerprint": fingerprint,
+                        "sessions": {},
+                        "dispositions": dispositions,
+                    }))
+                    .unwrap(),
+                )
+                .expect("write disposition state");
+            };
+        write_state(&source_fingerprint, &dispositions);
+
+        let gen_name = "g-2026-08-23T10-00-00Z-accounting";
+        let hybrid_root = root.join("indexed/_all/hybrid");
+        let gen_dir = hybrid_root.join("generations").join(gen_name);
+        std::fs::create_dir_all(&gen_dir).expect("generation dir");
+        let mut manifest = aicx_retrieve::Manifest {
+            schema_version: "2.0".to_string(),
+            generation_id: gen_name.to_string(),
+            writer_version: "0.12.3".to_string(),
+            build_id: "0.12.3+gaccounting".to_string(),
+            source_chunk_count: 3,
+            source_hash_blake3: aicx_retrieve::source_hash_blake3(&source_fingerprint),
+            embedder_model: "optional".to_string(),
+            embedder_url_hash: "not_built".to_string(),
+            embedder_dim: 0,
+            embedder_distance: "cosine".to_string(),
+            dense_count: 0,
+            dense_kind: "optional_not_built".to_string(),
+            lexical_commit_id: "tantivy_test".to_string(),
+            lexical_doc_count: 3,
+            build_started_at: Utc.with_ymd_and_hms(2026, 8, 23, 10, 0, 0).unwrap(),
+            build_completed_at: Utc.with_ymd_and_hms(2026, 8, 23, 10, 0, 1).unwrap(),
+            build_wall_seconds: 1,
+            fusion_algorithm: "rrf".to_string(),
+            fusion_k: 60,
+        };
+        manifest
+            .write_to_path(&gen_dir.join("manifest.json"))
+            .unwrap();
+        std::fs::write(hybrid_root.join("CURRENT"), format!("{gen_name}\n")).unwrap();
+
+        let ready = index_status_at(&root, None).expect("accounted status");
+        assert_eq!(ready.source_sessions, 4);
+        assert_eq!(ready.canonical_chunks, 3);
+        assert_eq!(ready.pending_chunks, 0);
+        assert_eq!(ready.readiness, IndexReadiness::Ready);
+        assert!(!ready.semantic_index_present);
+        assert_eq!(ready.dense_status, "not_built");
+
+        std::fs::write(source_dir.join("session-0.jsonl"), "session 0 changed\n")
+            .expect("mutate source fingerprint");
+        let drifted = index_status_at(&root, None).expect("source drift status");
+        assert_eq!(drifted.pending_chunks, 0);
+        assert!(drifted.sessions_newer_than_chunks > 0);
+        assert_eq!(drifted.readiness, IndexReadiness::StaleChunks);
+
+        let changed_fingerprint = crate::source_index::current_source_fingerprint_at(&root)
+            .unwrap()
+            .unwrap();
+        let mut retryable_dispositions = dispositions;
+        let changed =
+            crate::catalog::live_source_fingerprint(&source_dir.join("session-0.jsonl")).unwrap();
+        retryable_dispositions["codex:session-0"]["source_len"] = changed.0.into();
+        retryable_dispositions["codex:session-0"]["source_mtime_ns"] = changed.1.into();
+        retryable_dispositions["codex:session-2"]["disposition"] =
+            serde_json::json!({"state": "retryable_error", "reason": "source_unavailable"});
+        write_state(&changed_fingerprint, &retryable_dispositions);
+        manifest.source_hash_blake3 = aicx_retrieve::source_hash_blake3(&changed_fingerprint);
+        manifest
+            .write_to_path(&gen_dir.join("manifest.json"))
+            .unwrap();
+
+        let retryable = index_status_at(&root, None).expect("retryable gap status");
+        assert_eq!(retryable.sessions_newer_than_chunks, 0);
+        assert_eq!(retryable.pending_chunks, 1);
+        assert_eq!(retryable.readiness, IndexReadiness::StaleIndex);
 
         let _ = std::fs::remove_dir_all(root);
     }

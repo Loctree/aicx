@@ -11,6 +11,7 @@ use std::fs;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
 use chrono::SecondsFormat;
@@ -25,6 +26,7 @@ const MAX_EXTRACT_CHARS: usize = 4 * 1024 * 1024;
 const MAX_UNBROKEN_TOKEN_CHARS: usize = 4096;
 const MAX_FULL_PARSE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_JSONL_RECORD_BYTES: usize = 2 * 1024 * 1024;
+const IN_FLIGHT_FATAL_GRACE: Duration = Duration::from_secs(5 * 60);
 
 /// Bump whenever signal filtering or extract body shaping changes.
 ///
@@ -34,6 +36,8 @@ const MAX_JSONL_RECORD_BYTES: usize = 2 * 1024 * 1024;
 /// `{"type":"thought","data":"..."}` spam. Including this constant forces a
 /// one-shot rebuild so index truth tracks filter truth.
 const SIGNAL_FILTER_VERSION: &str = "signal-v3-workspace-metadata-strip";
+/// Bump when typed terminal classification or parser support changes.
+const DISPOSITION_POLICY_VERSION: &str = "source-disposition-v1";
 
 const PARSE_STATE_SCHEMA: &str = "aicx.source_parse_state.v1";
 const PARSE_STATE_RELPATH: &str = "indexed/_all/source_parse_state.v1.json";
@@ -45,7 +49,13 @@ pub struct SourceIndexReport {
     pub sources_parsed: usize,
     /// Sessions whose extract was reused without re-parsing the live source.
     pub sources_reused: usize,
+    /// Unchanged zero-signal or typed terminal dispositions reused from the ledger.
+    pub terminal_reused: usize,
     pub sources_skipped: usize,
+    pub zero_signal_sources: usize,
+    pub terminal_skip_sources: usize,
+    pub retryable_error_sources: usize,
+    pub deferred_live_changed_sources: usize,
     pub raw_frames: usize,
     pub signal_frames: usize,
     pub filtered_frames: usize,
@@ -160,7 +170,15 @@ struct SourceParseState {
     /// Old ledgers deserialize to empty and are deliberately not reusable.
     #[serde(default)]
     repo_path_ignore_fingerprint: String,
+    #[serde(default)]
+    disposition_policy_version: String,
+    /// Whole-snapshot fingerprint used by CURRENT. Empty on legacy ledgers.
+    #[serde(default)]
+    source_fingerprint: String,
     sessions: BTreeMap<String, SessionParseRecord>,
+    /// Durable accounting exists independently of extract caching.
+    #[serde(default)]
+    dispositions: BTreeMap<String, SourceDispositionRecord>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -180,6 +198,86 @@ struct SessionParseRecord {
     project: Option<String>,
     date: Option<String>,
     cwd: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum TerminalSkipReason {
+    ParserFatal,
+    UnsupportedAgent,
+    OversizedUnsupportedSource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RetryableErrorReason {
+    SourceUnavailable,
+    ParserError,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+enum SourceDisposition {
+    Indexed,
+    ZeroSignal,
+    TerminalSkip { reason: TerminalSkipReason },
+    RetryableError { reason: RetryableErrorReason },
+    DeferredLiveChanged,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SourceDispositionRecord {
+    source_path: String,
+    #[serde(default)]
+    source_len: u64,
+    #[serde(default)]
+    source_mtime_ns: u64,
+    project: Option<String>,
+    disposition: SourceDisposition,
+    #[serde(default)]
+    raw_frames: usize,
+    #[serde(default)]
+    signal_frames: usize,
+    #[serde(default)]
+    filtered_frames: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct SourceAccounting {
+    pub total: usize,
+    pub indexed: usize,
+    pub zero_signal: usize,
+    pub terminal_skip: usize,
+    pub retryable_error: usize,
+    pub deferred_live_changed: usize,
+    pub source_drift: usize,
+    pub source_fingerprint: String,
+    pub snapshot_matches: Option<bool>,
+}
+
+impl SourceAccounting {
+    fn is_complete(&self) -> bool {
+        self.total
+            == self.indexed
+                + self.zero_signal
+                + self.terminal_skip
+                + self.retryable_error
+                + self.deferred_live_changed
+            && self.retryable_error == 0
+            && self.deferred_live_changed == 0
+    }
+
+    pub(crate) fn lexical_pending(&self, lexical_docs: usize) -> usize {
+        self.indexed.saturating_sub(lexical_docs)
+            + self.retryable_error
+            + self.deferred_live_changed
+    }
+}
+
+enum SourceParseOutcome {
+    Parsed(Vec<TimelineEntry>),
+    Terminal(TerminalSkipReason),
+    DeferredLiveChanged,
 }
 
 /// Build or preview the global lexical index from the durable catalog.
@@ -248,18 +346,28 @@ pub fn build(
     // so operators can attach dense to an otherwise current corpus without
     // `--full-rescan`.
     let dense_missing = crate::vector_index::current_dense_not_built().unwrap_or(true);
+    let current_accounting = current_source_accounting_at(aicx_home, None);
     if !full_rescan
         && project_filters.is_empty()
         && crate::vector_index::source_lexical_generation_matches(&source_fingerprint)?
+        && current_accounting.as_ref().is_some_and(|accounting| {
+            accounting.snapshot_matches == Some(true) && accounting.is_complete()
+        })
         && !(semantic && dense_missing)
     {
         let (dense_kind, dense_docs) = current_dense_stats();
+        let accounting = current_accounting.expect("matching accounting checked above");
         return Ok(SourceIndexReport {
             catalog_path: catalog_path.display().to_string(),
             sources_total: selected.len(),
             sources_parsed: 0,
             sources_reused: 0,
-            sources_skipped: 0,
+            terminal_reused: accounting.zero_signal + accounting.terminal_skip,
+            sources_skipped: accounting.terminal_skip,
+            zero_signal_sources: accounting.zero_signal,
+            terminal_skip_sources: accounting.terminal_skip,
+            retryable_error_sources: accounting.retryable_error,
+            deferred_live_changed_sources: accounting.deferred_live_changed,
             raw_frames: 0,
             signal_frames: 0,
             filtered_frames: 0,
@@ -280,6 +388,7 @@ pub fn build(
     let mut chunks = Vec::with_capacity(selected.len());
     let mut sources_parsed = 0usize;
     let mut sources_reused = 0usize;
+    let mut terminal_reused = 0usize;
     let mut sources_skipped = 0usize;
     let mut raw_frames = 0usize;
     let mut signal_frames = 0usize;
@@ -290,7 +399,10 @@ pub fn build(
         schema: PARSE_STATE_SCHEMA.to_string(),
         signal_filter_version: SIGNAL_FILTER_VERSION.to_string(),
         repo_path_ignore_fingerprint: repo_path_ignore_fingerprint.clone(),
+        disposition_policy_version: DISPOSITION_POLICY_VERSION.to_string(),
+        source_fingerprint: source_fingerprint.clone(),
         sessions: BTreeMap::new(),
+        dispositions: BTreeMap::new(),
     };
 
     let prior_state = if full_rescan {
@@ -322,7 +434,38 @@ pub fn build(
             filtered_frames += record.filtered_frames;
             sources_reused += 1;
             next_state.sessions.insert(session_key, record.clone());
+            next_state.dispositions.insert(
+                session_state_key(&entry.agent, &entry.session_id),
+                disposition_record(
+                    entry,
+                    record.source_len,
+                    record.source_mtime_ns,
+                    SourceDisposition::Indexed,
+                    record.raw_frames,
+                    record.signal_frames,
+                    record.filtered_frames,
+                ),
+            );
             chunks.push(chunk);
+            continue;
+        }
+
+        if let Some(record) = try_reuse_terminal_disposition(
+            entry,
+            &prior_state,
+            &session_key,
+            &source_allow,
+            &repo_path_ignore_fingerprint,
+        ) {
+            raw_frames += record.raw_frames;
+            signal_frames += record.signal_frames;
+            filtered_frames += record.filtered_frames;
+            terminal_reused += 1;
+            if matches!(record.disposition, SourceDisposition::TerminalSkip { .. }) {
+                sources_skipped += 1;
+                *skipped_by_agent.entry(entry.agent.clone()).or_default() += 1;
+            }
+            next_state.dispositions.insert(session_key, record);
             continue;
         }
 
@@ -338,11 +481,60 @@ pub fn build(
                 ));
                 sources_skipped += 1;
                 *skipped_by_agent.entry(entry.agent.clone()).or_default() += 1;
+                let (source_len, source_mtime_ns) = catalog_entry_fingerprint(entry);
+                next_state.dispositions.insert(
+                    session_key,
+                    disposition_record(
+                        entry,
+                        source_len,
+                        source_mtime_ns,
+                        SourceDisposition::RetryableError {
+                            reason: RetryableErrorReason::SourceUnavailable,
+                        },
+                        0,
+                        0,
+                        0,
+                    ),
+                );
                 continue;
             }
         };
-        let mut frames = match parse_catalog_source(entry, &source_path, &source_allow) {
-            Ok(frames) => frames,
+        let before_fingerprint = crate::catalog::live_source_fingerprint(&source_path)
+            .unwrap_or_else(|| resolve_entry_fingerprint(entry, &source_path));
+        let mut frames = match parse_catalog_source_outcome(entry, &source_path, &source_allow) {
+            Ok(SourceParseOutcome::Parsed(frames)) => frames,
+            Ok(SourceParseOutcome::Terminal(reason)) => {
+                sources_skipped += 1;
+                *skipped_by_agent.entry(entry.agent.clone()).or_default() += 1;
+                next_state.dispositions.insert(
+                    session_key,
+                    disposition_record(
+                        entry,
+                        before_fingerprint.0,
+                        before_fingerprint.1,
+                        SourceDisposition::TerminalSkip { reason },
+                        0,
+                        0,
+                        0,
+                    ),
+                );
+                continue;
+            }
+            Ok(SourceParseOutcome::DeferredLiveChanged) => {
+                next_state.dispositions.insert(
+                    session_key,
+                    disposition_record(
+                        entry,
+                        before_fingerprint.0,
+                        before_fingerprint.1,
+                        SourceDisposition::DeferredLiveChanged,
+                        0,
+                        0,
+                        0,
+                    ),
+                );
+                continue;
+            }
             Err(error) => {
                 crate::diagnostics::log_describe(&format!(
                     "source_index_skip agent={} session_id={} path={} error={error:#}",
@@ -352,6 +544,20 @@ pub fn build(
                 ));
                 sources_skipped += 1;
                 *skipped_by_agent.entry(entry.agent.clone()).or_default() += 1;
+                next_state.dispositions.insert(
+                    session_key,
+                    disposition_record(
+                        entry,
+                        before_fingerprint.0,
+                        before_fingerprint.1,
+                        SourceDisposition::RetryableError {
+                            reason: RetryableErrorReason::ParserError,
+                        },
+                        0,
+                        0,
+                        0,
+                    ),
+                );
                 continue;
             }
         };
@@ -370,12 +576,51 @@ pub fn build(
         signal_frames += signal_count;
         let filtered_count = before.saturating_sub(frames.len());
         filtered_frames += filtered_count;
+        if crate::catalog::live_source_fingerprint(&source_path) != Some(before_fingerprint) {
+            next_state.dispositions.insert(
+                session_key,
+                disposition_record(
+                    entry,
+                    before_fingerprint.0,
+                    before_fingerprint.1,
+                    SourceDisposition::DeferredLiveChanged,
+                    raw_count,
+                    signal_count,
+                    filtered_count,
+                ),
+            );
+            continue;
+        }
         if frames.is_empty() {
+            next_state.dispositions.insert(
+                session_key,
+                disposition_record(
+                    entry,
+                    before_fingerprint.0,
+                    before_fingerprint.1,
+                    SourceDisposition::ZeroSignal,
+                    raw_count,
+                    signal_count,
+                    filtered_count,
+                ),
+            );
             continue;
         }
 
         let extract = render_extract(entry, &frames);
         if extract.trim().is_empty() {
+            next_state.dispositions.insert(
+                session_key,
+                disposition_record(
+                    entry,
+                    before_fingerprint.0,
+                    before_fingerprint.1,
+                    SourceDisposition::ZeroSignal,
+                    raw_count,
+                    signal_count,
+                    filtered_count,
+                ),
+            );
             continue;
         }
         let extract_path = extract_path_for(aicx_home, &entry.agent, &entry.session_id);
@@ -418,6 +663,18 @@ pub fn build(
             text: extract.clone(),
             metadata,
         });
+        next_state.dispositions.insert(
+            session_key.clone(),
+            disposition_record(
+                entry,
+                before_fingerprint.0,
+                before_fingerprint.1,
+                SourceDisposition::Indexed,
+                raw_count,
+                signal_count,
+                filtered_count,
+            ),
+        );
 
         if cache_extracts {
             let rel = extract_path
@@ -449,10 +706,34 @@ pub fn build(
         }
     }
 
+    let accounting = accounting_from_state(&next_state, None, None);
+    if !dry_run && project_filters.is_empty() {
+        // Persist the complete attempt before publication. Retryable/deferred
+        // gaps survive restart, while CURRENT is still untouched.
+        write_parse_state(aicx_home, &next_state)?;
+    }
+    if !accounting.is_complete() {
+        anyhow::bail!(
+            "source snapshot incomplete: indexed={} zero_signal={} terminal_skip={} retryable_error={} deferred_live_changed={} total={}; CURRENT preserved",
+            accounting.indexed,
+            accounting.zero_signal,
+            accounting.terminal_skip,
+            accounting.retryable_error,
+            accounting.deferred_live_changed,
+            accounting.total
+        );
+    }
+    if chunks.len() != accounting.indexed {
+        anyhow::bail!(
+            "source accounting mismatch: {} indexed disposition(s), {} lexical document(s); CURRENT preserved",
+            accounting.indexed,
+            chunks.len()
+        );
+    }
     if chunks.is_empty() {
         anyhow::bail!(
-            "source-driven index produced zero signal extracts from {} cataloged source(s)",
-            selected.len()
+            "source-driven index produced zero expected documents from {} fully accounted source(s); CURRENT preserved",
+            accounting.total
         );
     }
 
@@ -474,9 +755,6 @@ pub fn build(
             &source_fingerprint,
             &fingerprint,
         )?;
-        if cache_extracts && project_filters.is_empty() {
-            write_parse_state(aicx_home, &next_state)?;
-        }
         let path = crate::vector_index::hybrid_manifest_path(None)?
             .display()
             .to_string();
@@ -488,11 +766,6 @@ pub fn build(
     } else {
         let manifest =
             crate::vector_index::publish_source_lexical_generation(&chunks, &source_fingerprint)?;
-        // Persist parse state only after a successful publish so a killed build
-        // cannot claim sessions are current when CURRENT never flipped.
-        if cache_extracts && project_filters.is_empty() {
-            write_parse_state(aicx_home, &next_state)?;
-        }
         let path = crate::vector_index::hybrid_manifest_path(None)?
             .display()
             .to_string();
@@ -508,7 +781,12 @@ pub fn build(
         sources_total: selected.len(),
         sources_parsed,
         sources_reused,
+        terminal_reused,
         sources_skipped,
+        zero_signal_sources: accounting.zero_signal,
+        terminal_skip_sources: accounting.terminal_skip,
+        retryable_error_sources: accounting.retryable_error,
+        deferred_live_changed_sources: accounting.deferred_live_changed,
         raw_frames,
         signal_frames,
         filtered_frames,
@@ -890,6 +1168,22 @@ fn parse_catalog_source(
     path: &Path,
     allow: &crate::source_path::SourceAllowlist,
 ) -> Result<Vec<TimelineEntry>> {
+    match parse_catalog_source_outcome(entry, path, allow)? {
+        SourceParseOutcome::Parsed(frames) => Ok(frames),
+        SourceParseOutcome::Terminal(reason) => {
+            anyhow::bail!("source has typed terminal disposition: {reason:?}")
+        }
+        SourceParseOutcome::DeferredLiveChanged => {
+            anyhow::bail!("source parse is deferred while the source is actively changing")
+        }
+    }
+}
+
+fn parse_catalog_source_outcome(
+    entry: &CatalogEntry,
+    path: &Path,
+    allow: &crate::source_path::SourceAllowlist,
+) -> Result<SourceParseOutcome> {
     // Canonicalize + prove containment under approved source roots before any open.
     let path = allow
         .resolve_file(path)
@@ -904,14 +1198,14 @@ fn parse_catalog_source(
         // `{"type":"thought","data":"The"}` spam over real operator answers.
         let message = vibecrafted_signal_body(&body);
         if message.trim().is_empty() {
-            return Ok(Vec::new());
+            return Ok(SourceParseOutcome::Parsed(Vec::new()));
         }
         let timestamp = fs::metadata(&path)
             .ok()
             .and_then(|metadata| metadata.modified().ok())
             .map(chrono::DateTime::<chrono::Utc>::from)
             .unwrap_or_else(chrono::Utc::now);
-        return Ok(vec![TimelineEntry {
+        return Ok(SourceParseOutcome::Parsed(vec![TimelineEntry {
             timestamp,
             agent: entry.agent.clone(),
             session_id: entry.session_id.clone(),
@@ -924,21 +1218,19 @@ fn parse_catalog_source(
             source_path: Some(entry.source_path.clone()),
             source_sha256: None,
             source_line_span: None,
-        }]);
+        }]));
     }
 
     let source_bytes = fs::metadata(&path)
         .with_context(|| format!("stat source {}", path.display()))?
         .len();
     if entry.agent == "codex" && source_bytes > MAX_FULL_PARSE_BYTES {
-        return parse_large_codex_signal(entry, &path, allow);
+        return parse_large_codex_signal(entry, &path, allow).map(SourceParseOutcome::Parsed);
     }
     if source_bytes > MAX_FULL_PARSE_BYTES {
-        anyhow::bail!(
-            "source is {} bytes (bounded full-parser limit is {} bytes)",
-            source_bytes,
-            MAX_FULL_PARSE_BYTES
-        );
+        return Ok(SourceParseOutcome::Terminal(
+            TerminalSkipReason::OversizedUnsupportedSource,
+        ));
     }
 
     let agent = match entry.agent.as_str() {
@@ -947,15 +1239,45 @@ fn parse_catalog_source(
         "gemini" => aicx_parser::engine::AgentKind::Gemini,
         "grok" => aicx_parser::engine::AgentKind::Grok,
         "junie" => aicx_parser::engine::AgentKind::Junie,
-        other => anyhow::bail!("unsupported catalog agent `{other}`"),
+        _ => {
+            return Ok(SourceParseOutcome::Terminal(
+                TerminalSkipReason::UnsupportedAgent,
+            ));
+        }
     };
-    let parsed = crate::parser_dispatch::parse_file(
+    let handle = crate::parser_dispatch::source_handle_for_file(
         agent,
         &entry.session_id,
         entry.logical_session_id.clone(),
         &path,
     )?;
-    Ok(crate::output::timeline_entries_from_model(parsed.model()))
+    match aicx_parser::engine::ParserEngine::default().parse_registered(&handle)? {
+        aicx_parser::engine::ValidatedParse::Session(parsed) => Ok(SourceParseOutcome::Parsed(
+            crate::output::timeline_entries_from_model(parsed.model()),
+        )),
+        aicx_parser::engine::ValidatedParse::Fatal(_) => Ok(fatal_parse_outcome(&path)),
+    }
+}
+
+fn fatal_parse_outcome(path: &Path) -> SourceParseOutcome {
+    if source_is_recently_modified(path) {
+        SourceParseOutcome::DeferredLiveChanged
+    } else {
+        SourceParseOutcome::Terminal(TerminalSkipReason::ParserFatal)
+    }
+}
+
+fn source_is_recently_modified(path: &Path) -> bool {
+    let Some(modified) = path
+        .metadata()
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
+    else {
+        return false;
+    };
+    SystemTime::now()
+        .duration_since(modified)
+        .map_or(true, |age| age <= IN_FLIGHT_FATAL_GRACE)
 }
 
 /// Read one cataloged session through the same allowlisted, signal-only parser
@@ -1297,6 +1619,138 @@ fn parse_state_path(aicx_home: &Path) -> PathBuf {
     aicx_home.join(PARSE_STATE_RELPATH)
 }
 
+fn disposition_record(
+    entry: &CatalogEntry,
+    source_len: u64,
+    source_mtime_ns: u64,
+    disposition: SourceDisposition,
+    raw_frames: usize,
+    signal_frames: usize,
+    filtered_frames: usize,
+) -> SourceDispositionRecord {
+    SourceDispositionRecord {
+        source_path: entry.source_path.clone(),
+        source_len,
+        source_mtime_ns,
+        project: entry.project.clone(),
+        disposition,
+        raw_frames,
+        signal_frames,
+        filtered_frames,
+    }
+}
+
+fn catalog_entry_fingerprint(entry: &CatalogEntry) -> (u64, u64) {
+    (
+        entry.source_len.unwrap_or(0),
+        entry.source_mtime_ns.unwrap_or(0),
+    )
+}
+
+fn accounting_from_state(
+    state: &SourceParseState,
+    project: Option<&str>,
+    snapshot_matches: Option<bool>,
+) -> SourceAccounting {
+    let project = project.map(str::trim).filter(|value| !value.is_empty());
+    let mut accounting = SourceAccounting {
+        source_fingerprint: state.source_fingerprint.clone(),
+        snapshot_matches,
+        ..SourceAccounting::default()
+    };
+    for record in state.dispositions.values().filter(|record| {
+        project.is_none_or(|filter| {
+            record
+                .project
+                .as_deref()
+                .is_some_and(|value| value.eq_ignore_ascii_case(filter))
+        })
+    }) {
+        accounting.total += 1;
+        match record.disposition {
+            SourceDisposition::Indexed => accounting.indexed += 1,
+            SourceDisposition::ZeroSignal => accounting.zero_signal += 1,
+            SourceDisposition::TerminalSkip { .. } => accounting.terminal_skip += 1,
+            SourceDisposition::RetryableError { .. } => accounting.retryable_error += 1,
+            SourceDisposition::DeferredLiveChanged => accounting.deferred_live_changed += 1,
+        }
+    }
+    accounting
+}
+
+/// Read durable source accounting and independently verify its live snapshot.
+///
+/// `None` is explicit legacy compatibility: CURRENT predates the disposition
+/// ledger, so status must not reconstruct expected documents by subtracting
+/// catalog rows from lexical documents.
+pub(crate) fn current_source_accounting_at(
+    aicx_home: &Path,
+    project: Option<&str>,
+) -> Option<SourceAccounting> {
+    let entries = crate::catalog::read_entries_at(aicx_home).ok()?;
+    if entries.is_empty() {
+        return None;
+    }
+    let user_home = crate::os_user_home().unwrap_or_else(|| aicx_home.to_path_buf());
+    let ignore = crate::legacy_archive::load_repo_path_ignore(aicx_home, &user_home).ok()?;
+    let ignore_fingerprint = ignore.fingerprint();
+    let state = load_parse_state(aicx_home, &ignore_fingerprint);
+    if state.dispositions.is_empty() || state.source_fingerprint.is_empty() {
+        return None;
+    }
+    let source_allow = crate::source_path::SourceAllowlist::for_operator(&user_home, aicx_home);
+    let records_match = entries.len() == state.dispositions.len()
+        && entries.iter().all(|entry| {
+            state
+                .dispositions
+                .get(&session_state_key(&entry.agent, &entry.session_id))
+                .is_some_and(|record| disposition_record_matches(entry, record, &source_allow))
+        });
+    let catalog_path = crate::catalog::sessions_path_for(aicx_home);
+    let current_fingerprint = source_fingerprint(
+        aicx_home,
+        &catalog_path,
+        &entries,
+        &source_allow,
+        &ignore_fingerprint,
+    )
+    .ok();
+    let snapshot_matches =
+        records_match && current_fingerprint.as_deref() == Some(state.source_fingerprint.as_str());
+    let mut accounting = accounting_from_state(&state, project, Some(snapshot_matches));
+    accounting.source_drift = entries
+        .iter()
+        .filter(|entry| {
+            !state
+                .dispositions
+                .get(&session_state_key(&entry.agent, &entry.session_id))
+                .is_some_and(|record| disposition_record_matches(entry, record, &source_allow))
+        })
+        .count()
+        + state.dispositions.len().saturating_sub(entries.len());
+    Some(accounting)
+}
+
+#[cfg(test)]
+pub(crate) fn current_source_fingerprint_at(aicx_home: &Path) -> Result<Option<String>> {
+    let entries = crate::catalog::read_entries_at(aicx_home)?;
+    if entries.is_empty() {
+        return Ok(None);
+    }
+    let user_home = crate::os_user_home().unwrap_or_else(|| aicx_home.to_path_buf());
+    let ignore = crate::legacy_archive::load_repo_path_ignore(aicx_home, &user_home)?;
+    let source_allow = crate::source_path::SourceAllowlist::for_operator(&user_home, aicx_home);
+    let catalog_path = crate::catalog::sessions_path_for(aicx_home);
+    source_fingerprint(
+        aicx_home,
+        &catalog_path,
+        &entries,
+        &source_allow,
+        &ignore.fingerprint(),
+    )
+    .map(Some)
+}
+
 fn load_parse_state(aicx_home: &Path, repo_path_ignore_fingerprint: &str) -> SourceParseState {
     let path = parse_state_path(aicx_home);
     if !path.is_file() {
@@ -1305,14 +1759,34 @@ fn load_parse_state(aicx_home: &Path, repo_path_ignore_fingerprint: &str) -> Sou
     let Ok(raw) = crate::source_path::read_under_aicx_home(aicx_home, &path) else {
         return SourceParseState::default();
     };
-    let Ok(state) = serde_json::from_str::<SourceParseState>(&raw) else {
+    let Ok(mut state) = serde_json::from_str::<SourceParseState>(&raw) else {
         return SourceParseState::default();
     };
     if state.schema != PARSE_STATE_SCHEMA
         || state.signal_filter_version != SIGNAL_FILTER_VERSION
+        || (!state.disposition_policy_version.is_empty()
+            && state.disposition_policy_version != DISPOSITION_POLICY_VERSION)
         || state.repo_path_ignore_fingerprint != repo_path_ignore_fingerprint
     {
         return SourceParseState::default();
+    }
+    // Additive compatibility: old ledgers recorded only indexed extracts.
+    // They remain reusable, but source accounting stays explicitly legacy
+    // until a fresh build stamps a whole-snapshot fingerprint.
+    for (session_key, record) in &state.sessions {
+        state
+            .dispositions
+            .entry(session_key.clone())
+            .or_insert_with(|| SourceDispositionRecord {
+                source_path: record.source_path.clone(),
+                source_len: record.source_len,
+                source_mtime_ns: record.source_mtime_ns,
+                project: record.project.clone(),
+                disposition: SourceDisposition::Indexed,
+                raw_frames: record.raw_frames,
+                signal_frames: record.signal_frames,
+                filtered_frames: record.filtered_frames,
+            });
     }
     state
 }
@@ -1345,6 +1819,51 @@ fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     hex::encode(hasher.finalize())
+}
+
+fn disposition_record_matches(
+    entry: &CatalogEntry,
+    record: &SourceDispositionRecord,
+    source_allow: &crate::source_path::SourceAllowlist,
+) -> bool {
+    if record.source_path != entry.source_path
+        || record.source_len == 0
+        || record.source_mtime_ns == 0
+    {
+        return false;
+    }
+    let Ok(live_path) = source_allow.resolve_file(entry.source_path.as_str()) else {
+        return false;
+    };
+    crate::catalog::live_source_fingerprint(&live_path).is_some_and(|(live_len, live_mtime)| {
+        live_len == record.source_len && live_mtime == record.source_mtime_ns
+    })
+}
+
+fn try_reuse_terminal_disposition(
+    entry: &CatalogEntry,
+    prior: &SourceParseState,
+    session_key: &str,
+    source_allow: &crate::source_path::SourceAllowlist,
+    repo_path_ignore_fingerprint: &str,
+) -> Option<SourceDispositionRecord> {
+    if prior.signal_filter_version != SIGNAL_FILTER_VERSION
+        || prior.disposition_policy_version != DISPOSITION_POLICY_VERSION
+        || prior.repo_path_ignore_fingerprint != repo_path_ignore_fingerprint
+    {
+        return None;
+    }
+    let record = prior.dispositions.get(session_key)?;
+    if !matches!(
+        record.disposition,
+        SourceDisposition::ZeroSignal | SourceDisposition::TerminalSkip { .. }
+    ) || !disposition_record_matches(entry, record, source_allow)
+    {
+        return None;
+    }
+    let mut reused = record.clone();
+    reused.project = entry.project.clone();
+    Some(reused)
 }
 
 fn try_reuse_cached_extract(
@@ -1440,6 +1959,8 @@ fn source_fingerprint(
     // Filter generation first so a catalog-identical CURRENT cannot hide a
     // pre-filter corpus after signal-body rules change.
     hasher.update(SIGNAL_FILTER_VERSION.as_bytes());
+    hasher.update([0]);
+    hasher.update(DISPOSITION_POLICY_VERSION.as_bytes());
     hasher.update([0]);
     // Privacy rules are part of corpus identity. A rule edit must invalidate
     // CURRENT even when the catalog and every source file are unchanged.
@@ -1784,7 +2305,10 @@ mod tests {
             schema: PARSE_STATE_SCHEMA.to_string(),
             signal_filter_version: SIGNAL_FILTER_VERSION.to_string(),
             repo_path_ignore_fingerprint: "ignore-fingerprint".to_string(),
+            disposition_policy_version: DISPOSITION_POLICY_VERSION.to_string(),
+            source_fingerprint: String::new(),
             sessions: BTreeMap::new(),
+            dispositions: BTreeMap::new(),
         };
         prior.sessions.insert(
             session_state_key("claude", "session"),
@@ -1886,5 +2410,239 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn serialized_dispositions_drive_expected_documents_and_retryable_pending() {
+        let mut state = SourceParseState {
+            schema: PARSE_STATE_SCHEMA.to_string(),
+            signal_filter_version: SIGNAL_FILTER_VERSION.to_string(),
+            repo_path_ignore_fingerprint: "ignore-v1".to_string(),
+            disposition_policy_version: DISPOSITION_POLICY_VERSION.to_string(),
+            source_fingerprint: "snapshot-v1".to_string(),
+            sessions: BTreeMap::new(),
+            dispositions: BTreeMap::new(),
+        };
+        for ordinal in 0..10_050usize {
+            let disposition = if ordinal < 10_015 {
+                SourceDisposition::Indexed
+            } else if ordinal < 10_046 {
+                SourceDisposition::TerminalSkip {
+                    reason: TerminalSkipReason::ParserFatal,
+                }
+            } else {
+                SourceDisposition::ZeroSignal
+            };
+            state.dispositions.insert(
+                format!("codex:session-{ordinal}"),
+                SourceDispositionRecord {
+                    source_path: format!("/sources/session-{ordinal}.jsonl"),
+                    source_len: 1,
+                    source_mtime_ns: ordinal as u64 + 1,
+                    project: Some("Loctree/aicx".to_string()),
+                    disposition,
+                    raw_frames: 1,
+                    signal_frames: usize::from(ordinal < 10_015),
+                    filtered_frames: usize::from(ordinal >= 10_015),
+                },
+            );
+        }
+
+        let accounting = accounting_from_state(&state, None, Some(true));
+        assert_eq!(accounting.total, 10_050);
+        assert_eq!(accounting.indexed, 10_015);
+        assert_eq!(accounting.terminal_skip, 31);
+        assert_eq!(accounting.zero_signal, 4);
+        assert_eq!(accounting.lexical_pending(10_015), 0);
+
+        let serialized = serde_json::to_value(&state).expect("serialize disposition ledger");
+        assert_eq!(serialized["source_fingerprint"], "snapshot-v1");
+        assert_eq!(
+            serialized["dispositions"]["codex:session-10015"]["disposition"]["state"],
+            "terminal_skip"
+        );
+        assert_eq!(
+            serialized["dispositions"]["codex:session-10015"]["disposition"]["reason"],
+            "parser_fatal"
+        );
+
+        state
+            .dispositions
+            .get_mut("codex:session-10014")
+            .unwrap()
+            .disposition = SourceDisposition::RetryableError {
+            reason: RetryableErrorReason::SourceUnavailable,
+        };
+        let retryable = accounting_from_state(&state, None, Some(true));
+        assert_eq!(retryable.indexed, 10_014);
+        assert_eq!(retryable.retryable_error, 1);
+        assert_eq!(retryable.lexical_pending(10_014), 1);
+        assert!(!retryable.is_complete());
+    }
+
+    #[test]
+    fn terminal_reuse_is_cache_independent_and_fingerprint_scoped() {
+        let root = std::env::temp_dir().join(format!(
+            "aicx-source-terminal-cache-independent-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let source_path = root.join("zero-signal.jsonl");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&source_path, "{}\n").unwrap();
+        let (source_len, source_mtime_ns) =
+            crate::catalog::live_source_fingerprint(&source_path).unwrap();
+        let entry = CatalogEntry {
+            schema: crate::catalog::CATALOG_SCHEMA.to_string(),
+            session_id: "zero-signal".to_string(),
+            agent: "codex".to_string(),
+            project: None,
+            date: None,
+            cwd: None,
+            source_path: source_path.display().to_string(),
+            source_len: Some(source_len),
+            source_mtime_ns: Some(source_mtime_ns),
+            title: None,
+            machine: None,
+            logical_session_id: None,
+        };
+        let key = session_state_key(&entry.agent, &entry.session_id);
+        let mut prior = SourceParseState {
+            schema: PARSE_STATE_SCHEMA.to_string(),
+            signal_filter_version: SIGNAL_FILTER_VERSION.to_string(),
+            repo_path_ignore_fingerprint: "ignore-v1".to_string(),
+            disposition_policy_version: DISPOSITION_POLICY_VERSION.to_string(),
+            source_fingerprint: "snapshot-v1".to_string(),
+            sessions: BTreeMap::new(),
+            dispositions: BTreeMap::new(),
+        };
+        prior.dispositions.insert(
+            key.clone(),
+            disposition_record(
+                &entry,
+                source_len,
+                source_mtime_ns,
+                SourceDisposition::ZeroSignal,
+                1,
+                0,
+                1,
+            ),
+        );
+        let allow = crate::source_path::SourceAllowlist::from_roots([root.clone()]);
+
+        assert!(
+            try_reuse_terminal_disposition(&entry, &prior, &key, &allow, "ignore-v1").is_some(),
+            "zero-signal disposition must reuse without an extract cache"
+        );
+        fs::write(&source_path, "{}\n{}\n").unwrap();
+        assert!(
+            try_reuse_terminal_disposition(&entry, &prior, &key, &allow, "ignore-v1").is_none(),
+            "live fingerprint change must invalidate terminal reuse"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn recent_parser_fatal_is_deferred_by_typed_control_flow() {
+        let root = std::env::temp_dir().join(format!(
+            "aicx-source-recent-fatal-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("actively-written.jsonl");
+        fs::write(&path, "unterminated active record").unwrap();
+
+        assert!(matches!(
+            fatal_parse_outcome(&path),
+            SourceParseOutcome::DeferredLiveChanged
+        ));
+        let transient = SourceDisposition::RetryableError {
+            reason: RetryableErrorReason::ParserError,
+        };
+        assert!(
+            !matches!(transient, SourceDisposition::TerminalSkip { .. }),
+            "transient parser errors must never become terminal by message matching"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn retryable_gap_preserves_last_good_current_and_serializes_attempt() {
+        let root = std::env::temp_dir().join(format!(
+            "aicx-source-incomplete-current-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("catalog")).unwrap();
+        let source_path = root.join("runtime-transcript.log");
+        fs::write(&source_path, "visible answer\n").unwrap();
+        let (source_len, source_mtime_ns) =
+            crate::catalog::live_source_fingerprint(&source_path).unwrap();
+        let missing_path = root.join("missing-transcript.log");
+        let entries = [
+            CatalogEntry {
+                schema: crate::catalog::CATALOG_SCHEMA.to_string(),
+                session_id: "indexed".to_string(),
+                agent: "vibecrafted".to_string(),
+                project: Some("Loctree/aicx".to_string()),
+                date: None,
+                cwd: None,
+                source_path: source_path.display().to_string(),
+                source_len: Some(source_len),
+                source_mtime_ns: Some(source_mtime_ns),
+                title: None,
+                machine: None,
+                logical_session_id: None,
+            },
+            CatalogEntry {
+                schema: crate::catalog::CATALOG_SCHEMA.to_string(),
+                session_id: "retryable".to_string(),
+                agent: "vibecrafted".to_string(),
+                project: Some("Loctree/aicx".to_string()),
+                date: None,
+                cwd: None,
+                source_path: missing_path.display().to_string(),
+                source_len: Some(77),
+                source_mtime_ns: Some(88),
+                title: None,
+                machine: None,
+                logical_session_id: None,
+            },
+        ];
+        let catalog = entries
+            .iter()
+            .map(|entry| serde_json::to_string(entry).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(root.join("catalog/sessions.jsonl"), format!("{catalog}\n")).unwrap();
+        let current = root.join("indexed/_all/hybrid/CURRENT");
+        fs::create_dir_all(current.parent().unwrap()).unwrap();
+        fs::write(&current, "last-good\n").unwrap();
+
+        let error = build(&root, &[], false, true, false, false)
+            .expect_err("retryable source must block publication");
+        assert!(error.to_string().contains("retryable_error=1"));
+        assert_eq!(fs::read_to_string(&current).unwrap(), "last-good\n");
+
+        let raw = fs::read_to_string(parse_state_path(&root)).expect("durable accounting attempt");
+        let state: SourceParseState = serde_json::from_str(&raw).unwrap();
+        assert!(matches!(
+            state.dispositions["vibecrafted:indexed"].disposition,
+            SourceDisposition::Indexed
+        ));
+        assert!(matches!(
+            state.dispositions["vibecrafted:retryable"].disposition,
+            SourceDisposition::RetryableError {
+                reason: RetryableErrorReason::SourceUnavailable
+            }
+        ));
+
+        let _ = fs::remove_dir_all(root);
     }
 }
