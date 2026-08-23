@@ -290,12 +290,13 @@ jobs:
           NO_DEFAULT_FEATURES: "1"
           FEATURES: app,cloud-embedder
           # windows-pc is the operator's lower-resource self-hosted machine.
-          # An unconstrained release build launched enough concurrent rustc
-          # processes for several of them to fast-fail together with
-          # 0xc0000409. The same source and pinned toolchain are green on the
-          # hosted exact-main Windows gate, so serialize this signing runner
-          # instead of weakening the release profile or dropping Windows.
+          # Serialize compilation and disable cross-crate LTO for this target:
+          # full LTO still puts the entire final aicx link in one rustc process
+          # and exhausted the host even with CARGO_BUILD_JOBS=1. opt-level=3
+          # and stripping remain inherited from [profile.release]. The hosted
+          # exact-main Windows gate proves the same MSVC source independently.
           CARGO_BUILD_JOBS: "1"
+          CARGO_PROFILE_RELEASE_LTO: "false"
           AICX_CLEAN_AFTER_BUILD: "0"
           PACKAGE_NAME: ${{ env.PACKAGE_NAME }}
           LOCTREE_GPG_KEY_ID: ${{ vars.LOCTREE_GPG_KEY_ID }}

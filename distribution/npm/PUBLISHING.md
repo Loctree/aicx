@@ -58,9 +58,9 @@ Then it:
 ### Step 1 - Sync versions
 
 ```bash
-node distribution/npm/sync-version.mjs 0.12.4
-node distribution/npm/sync-version.mjs --check 0.12.4
-node distribution/npm/verify-metadata.mjs 0.12.4
+node distribution/npm/sync-version.mjs 0.12.5
+node distribution/npm/sync-version.mjs --check 0.12.5
+node distribution/npm/verify-metadata.mjs 0.12.5
 ```
 
 ### Step 2 - Publish platform packages first
@@ -120,12 +120,12 @@ then publishes the wrapper.
 Real asset shape:
 
 ```bash
-curl -LI https://github.com/Loctree/aicx/releases/download/v0.12.4/aicx-v0.12.4-aarch64-apple-darwin-slim.zip
-curl -LI https://github.com/Loctree/aicx/releases/download/v0.12.4/aicx-v0.12.4-aarch64-apple-darwin-slim.zip.sha256
-curl -LI https://github.com/Loctree/aicx/releases/download/v0.12.4/aicx-v0.12.4-x86_64-linux-gnu-slim.tar.gz
-curl -LI https://github.com/Loctree/aicx/releases/download/v0.12.4/aicx-v0.12.4-x86_64-linux-gnu-slim.tar.gz.sha256
-curl -LI https://github.com/Loctree/aicx/releases/download/v0.12.4/aicx-v0.12.4-x86_64-pc-windows-msvc-slim.zip
-curl -LI https://github.com/Loctree/aicx/releases/download/v0.12.4/aicx-v0.12.4-x86_64-pc-windows-msvc-slim.zip.sha256
+curl -LI https://github.com/Loctree/aicx/releases/download/v0.12.5/aicx-v0.12.5-aarch64-apple-darwin-slim.zip
+curl -LI https://github.com/Loctree/aicx/releases/download/v0.12.5/aicx-v0.12.5-aarch64-apple-darwin-slim.zip.sha256
+curl -LI https://github.com/Loctree/aicx/releases/download/v0.12.5/aicx-v0.12.5-x86_64-linux-gnu-slim.tar.gz
+curl -LI https://github.com/Loctree/aicx/releases/download/v0.12.5/aicx-v0.12.5-x86_64-linux-gnu-slim.tar.gz.sha256
+curl -LI https://github.com/Loctree/aicx/releases/download/v0.12.5/aicx-v0.12.5-x86_64-pc-windows-msvc-slim.zip
+curl -LI https://github.com/Loctree/aicx/releases/download/v0.12.5/aicx-v0.12.5-x86_64-pc-windows-msvc-slim.zip.sha256
 ```
 
 ### optionalDependencies disabled

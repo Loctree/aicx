@@ -45,10 +45,12 @@ The release workflow builds exactly three binary targets:
 
 The signed Windows leg runs on the operator-owned `windows-pc` runner because
 that host owns the release GPG key. Cargo is serialized there with
-`CARGO_BUILD_JOBS=1`: an unconstrained release build can exceed that machine's
-compiler capacity and make multiple `rustc` processes fast-fail together.
-The hosted Windows merge gate remains the clean-machine proof that the same
-MSVC target and bundle path compile independently of the signing host.
+`CARGO_BUILD_JOBS=1`, and that target overrides full cross-crate LTO with
+`CARGO_PROFILE_RELEASE_LTO=false`. Serialization prevents concurrent compiler
+pressure; disabling LTO prevents the final single `rustc` link from exhausting
+the host by itself. Release `opt-level=3` and stripping remain enabled. The
+hosted Windows merge gate remains the clean-machine proof that the same MSVC
+source and bundle path compile independently of the signing host.
 
 Do not revive the removed unsigned/musl archive lane. Adding a platform means
 updating the build matrix, installer, npm metadata checks, documentation, and
@@ -60,7 +62,7 @@ Download the installer from the same immutable tag as the desired release:
 
 ```bash
 curl -fsSLO https://raw.githubusercontent.com/Loctree/aicx/v0.12.0/install.sh
-AICX_INSTALL_MODE=release AICX_RELEASE_TAG=v0.12.4 bash install.sh
+AICX_INSTALL_MODE=release AICX_RELEASE_TAG=v0.12.5 bash install.sh
 ```
 
 Release mode selects the platform archive, downloads its adjacent `.sha256`,
@@ -148,8 +150,8 @@ After review, runtime acceptance, and merge to `main`:
 The equivalent explicit tag commands are:
 
 ```bash
-git tag -as v0.12.4 -m "Release v0.12.4"
-git push origin v0.12.4
+git tag -as v0.12.5 -m "Release v0.12.5"
+git push origin v0.12.5
 ```
 
 Do not tag or push from a dirty tree, an unmerged branch, or a commit whose
