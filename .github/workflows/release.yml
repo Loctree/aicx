@@ -233,7 +233,10 @@ jobs:
         shell: bash
         run: |
           python3 -m pip install --disable-pip-version-check cargo-zigbuild==0.23.0
-          cargo zigbuild --version
+          # cargo-zigbuild 0.23.0 exposes no --version flag. Probe the pinned
+          # subcommand through its stable help path so a healthy install does
+          # not fail before the actual glibc-floor build starts.
+          cargo zigbuild --help >/dev/null
 
       - name: Build signed + notarized macOS bundle (dragon-macos)
         if: matrix.runner_name == 'dragon-macos'
