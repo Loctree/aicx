@@ -172,7 +172,11 @@ for (const platform of PLATFORMS) {
   assertNotIncludes(`${platform.key} postinstall`, postinstall, "slim-unsigned");
   if (platform.key === "win32-x64-gnu") {
     assertIncludes(`${platform.key} postinstall`, postinstall, 'process.platform === "win32"');
-    assertIncludes(`${platform.key} postinstall`, postinstall, 'execFileSync("tar", ["-xf"');
+    assertIncludes(`${platform.key} postinstall`, postinstall, "function windowsSystemTar()");
+    assertIncludes(`${platform.key} postinstall`, postinstall, 'process.env.SystemRoot || process.env.WINDIR');
+    assertIncludes(`${platform.key} postinstall`, postinstall, 'join(windowsRoot, "System32", "tar.exe")');
+    assertIncludes(`${platform.key} postinstall`, postinstall, 'execFileSync(windowsSystemTar(), ["-xf"');
+    assertNotIncludes(`${platform.key} postinstall`, postinstall, 'execFileSync("tar", ["-xf"');
   }
 }
 

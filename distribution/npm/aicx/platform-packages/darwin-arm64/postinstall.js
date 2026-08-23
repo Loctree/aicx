@@ -208,10 +208,22 @@ function verifySha256(filePath, expectedDigest) {
   }
 }
 
+function windowsSystemTar() {
+  const windowsRoot = process.env.SystemRoot || process.env.WINDIR;
+  if (!windowsRoot) {
+    throw new Error("Windows system root is unavailable; cannot locate System32\\tar.exe");
+  }
+  const tarPath = join(windowsRoot, "System32", "tar.exe");
+  if (!existsSync(tarPath)) {
+    throw new Error(`Windows archive extractor is unavailable at ${tarPath}`);
+  }
+  return tarPath;
+}
+
 function extractArchive(archivePath, destDir, archiveType) {
   if (archiveType === "zip") {
     if (process.platform === "win32") {
-      execFileSync("tar", ["-xf", archivePath, "-C", destDir], { stdio: "inherit" });
+      execFileSync(windowsSystemTar(), ["-xf", archivePath, "-C", destDir], { stdio: "inherit" });
       return;
     }
     execFileSync("unzip", ["-q", archivePath, "-d", destDir], { stdio: "inherit" });
