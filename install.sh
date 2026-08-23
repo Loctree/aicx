@@ -805,7 +805,11 @@ detect_release_target() {
       exit 1
       ;;
     Linux:x86_64) echo "x86_64-linux-gnu" ;;
-    Linux:aarch64|Linux:arm64) echo "aarch64-linux-gnu" ;;
+    Linux:aarch64|Linux:arm64)
+      echo "Error: aarch64 Linux release assets are not published in the current AICX release asset set." >&2
+      echo "  Use a local bundle install instead, or install from source with cargo." >&2
+      exit 1
+      ;;
     *)
       echo "Error: unsupported platform for release installer: ${os}/${arch}" >&2
       echo "  Use a local bundle install instead, or install from source with cargo." >&2

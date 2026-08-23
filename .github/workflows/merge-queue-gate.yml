@@ -7,8 +7,7 @@ name: Merge Queue Gate
 # main.
 #
 # Per platform (macos-15 | ubuntu-latest | windows-latest) on hosted
-# runners (org self-hosted runners are not exposed to private repositories
-# since the 2026-08 miner incident):
+# runners, keeping operator-owned signing credentials out of pre-merge jobs:
 #   1. Build the release bundle (real artifacts, single platform per job)
 #   2. Dry-run npm publish for the matching platform-package
 #
@@ -41,34 +40,67 @@ jobs:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable 2026-07
 
+      - name: Cargo check --locked --workspace
+        run: cargo check --locked --workspace --all-targets
+
+  bundle-and-dryrun-publish:
+    name: Bundle + dry-run publish (${{ matrix.platform }})
+    needs: cargo-check
+    runs-on: ${{ matrix.runs_on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: darwin-arm64
+            runs_on: macos-15
+            npm_package_dir: distribution/npm/aicx/platform-packages/darwin-arm64
+          - platform: linux-x64-gnu
+            runs_on: ubuntu-latest
+            npm_package_dir: distribution/npm/aicx/platform-packages/linux-x64-gnu
+          - platform: win32-x64-gnu
+            runs_on: windows-latest
+            npm_package_dir: distribution/npm/aicx/platform-packages/win32-x64-gnu
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable 2026-07
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: 24.11.1
+          registry-url: "https://registry.npmjs.org"
+
       - name: Resolve workspace version
         id: meta
-        shell: ${{ matrix.bash }}
+        shell: bash
         run: |
           version=$(grep '^version' Cargo.toml | head -1 | cut -d '"' -f 2)
           echo "version=${version}" >> "${GITHUB_OUTPUT}"
 
       - name: Release channel version consistency
-        shell: ${{ matrix.bash }}
+        shell: bash
         run: bash tools/release-channel-check.sh
 
       - name: Sync npm package versions
-        shell: ${{ matrix.bash }}
+        shell: bash
         run: node distribution/npm/sync-version.mjs "${{ steps.meta.outputs.version }}"
 
       - name: Build release bundle (real, per platform)
-        shell: ${{ matrix.bash }}
+        shell: bash
         env:
           AICX_RELEASE_BUNDLE_ONLY_BINARIES: "1"
           # Merge queue gate runs without access to org secrets/vars. Skip
           # GPG signing here — real signing happens in release.yml on tag push.
           AICX_RELEASE_SKIP_SIGNING: "1"
           LOCTREE_GPG_KEY_ID: ""
+          PLATFORM: ${{ matrix.platform }}
         run: |
           # Windows: use the native msvc target (the runner's default).
           # We no longer force gnu + Strawberry here — release.yml and the
           # npm platform packages were updated to expect the msvc triple.
-          if [[ "${{ matrix.platform }}" == win32-* ]]; then
+          if [[ "$PLATFORM" == win32-* ]]; then
             export TARGET=x86_64-pc-windows-msvc
           fi
           bash tools/release_bundle.sh
@@ -81,11 +113,11 @@ jobs:
 
       - name: npm publish --dry-run (platform package ${{ matrix.platform }})
         working-directory: ${{ matrix.npm_package_dir }}
-        shell: ${{ matrix.bash }}
+        shell: bash
         run: npm publish --dry-run --access public
 
       - name: Summary
-        shell: ${{ matrix.bash }}
+        shell: bash
         run: |
           echo "Merge queue gate passed for ${{ matrix.platform }}:"
           echo "  - cargo workspace check ✓ (linux job)"

@@ -31,6 +31,7 @@ jobs:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           fetch-depth: 0
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
           path: aicx
 
       - name: Checkout rust-memex sibling
@@ -74,7 +75,7 @@ jobs:
             echo "release tag is required" >&2
             exit 1
           fi
-          if [[ ! "${release_tag}" =~ ^v[0-9]+[.][0-9]+[.][0-9]+ ]]; then
+          if [[ ! "${release_tag}" =~ ^v[0-9]+[.][0-9]+[.][0-9]+$ ]]; then
             echo "release tag must look like vX.Y.Z" >&2
             exit 1
           fi
@@ -169,18 +170,19 @@ jobs:
       matrix:
         include:
           - runner_name: ops-linux
-            runner: ubuntu-latest
+            runner: '["self-hosted","ops-linux"]'
             target: x86_64-unknown-linux-gnu
           - runner_name: dragon-macos
-            runner: macos-latest
+            runner: '["self-hosted","dragon-macos"]'
             target: aarch64-apple-darwin
           - runner_name: windows-pc
-            runner: windows-latest
+            runner: '["self-hosted","windows-pc"]'
             target: x86_64-pc-windows-msvc
 
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
+          ref: ${{ needs.verify.outputs.release_tag }}
           path: aicx
 
       - name: Checkout rust-memex sibling
@@ -219,6 +221,18 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        if: matrix.runner_name == 'ops-linux'
+        with:
+          python-version: '3.12'
+
+      - name: Install pinned glibc-floor build tool
+        if: matrix.runner_name == 'ops-linux'
+        shell: bash
+        run: |
+          python3 -m pip install --disable-pip-version-check cargo-zigbuild==0.23.0
+          cargo zigbuild --version
+
       - name: Build signed + notarized macOS bundle (dragon-macos)
         if: matrix.runner_name == 'dragon-macos'
         shell: bash
@@ -243,6 +257,8 @@ jobs:
           DIST_DIR: ${{ github.workspace }}/aicx/dist
           AICX_RELEASE_BUNDLE_ONLY_BINARIES: "1"
           AICX_BUNDLE_FLAVOR: slim
+          AICX_CARGO_BUILD_CMD: cargo zigbuild
+          AICX_BUILD_TARGET: x86_64-unknown-linux-gnu.2.28
           AICX_CLEAN_AFTER_BUILD: "0"
           PACKAGE_NAME: ${{ env.PACKAGE_NAME }}
           LOCTREE_GPG_KEY_ID: ${{ vars.LOCTREE_GPG_KEY_ID }}
@@ -278,6 +294,60 @@ jobs:
           # MinGW/gnu target; the runner now builds the native msvc target.)
           export PATH="/c/Program Files (x86)/GnuPG/bin:$PATH"
           ./tools/release_bundle.sh
+
+      - name: Smoke extracted release archive
+        shell: bash
+        working-directory: aicx
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          shopt -s nullglob
+          archives=(dist/*.tar.gz dist/*.zip)
+          if [[ ${#archives[@]} -ne 1 ]]; then
+            echo "expected exactly one release archive, found ${#archives[@]}" >&2
+            printf '  %s\n' "${archives[@]}" >&2
+            exit 1
+          fi
+          smoke_dir="${RUNNER_TEMP}/aicx-release-smoke-${TARGET}"
+          rm -rf "${smoke_dir}"
+          mkdir -p "${smoke_dir}"
+          archive="${archives[0]}"
+          case "${archive}" in
+            *.tar.gz) tar -xzf "${archive}" -C "${smoke_dir}" ;;
+            *.zip) tar -xf "${archive}" -C "${smoke_dir}" ;;
+            *) echo "unsupported archive: ${archive}" >&2; exit 1 ;;
+          esac
+          bundle_dir=$(find "${smoke_dir}" -mindepth 1 -maxdepth 1 -type d | head -1)
+          if [[ -z "${bundle_dir}" ]]; then
+            echo "release archive did not contain a bundle directory" >&2
+            exit 1
+          fi
+          exe=""
+          if [[ "${TARGET}" == *windows* ]]; then
+            exe=".exe"
+          fi
+          "${bundle_dir}/aicx${exe}" --version
+          "${bundle_dir}/aicx-mcp${exe}" --version
+          if [[ "${TARGET}" == *linux-gnu ]]; then
+            command -v objdump >/dev/null
+            highest_glibc=$(objdump -T "${bundle_dir}/aicx" "${bundle_dir}/aicx-mcp" \
+              | grep -oE 'GLIBC_[0-9]+([.][0-9]+)*' \
+              | sed 's/^GLIBC_//' \
+              | sort -V \
+              | tail -1)
+            python3 - "${highest_glibc}" <<'PY'
+          import sys
+
+          def version(value):
+              return tuple(int(part) for part in value.split("."))
+
+          actual = sys.argv[1]
+          if not actual or version(actual) > version("2.28"):
+              raise SystemExit(f"GLIBC symbol floor exceeded: {actual or 'no symbols found'} > 2.28")
+          print(f"highest imported GLIBC symbol: {actual}")
+          PY
+          fi
+          rm -rf "${smoke_dir}"
 
       - name: Build .deb (linux only)
         if: contains(matrix.target, 'linux')
@@ -346,12 +416,13 @@ jobs:
   github-release:
     name: Publish GitHub Release
     needs: [verify, build]
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, ops-linux]
 
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           fetch-depth: 0
+          ref: ${{ needs.verify.outputs.release_tag }}
 
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:

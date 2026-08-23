@@ -210,6 +210,10 @@ function verifySha256(filePath, expectedDigest) {
 
 function extractArchive(archivePath, destDir, archiveType) {
   if (archiveType === "zip") {
+    if (process.platform === "win32") {
+      execFileSync("tar", ["-xf", archivePath, "-C", destDir], { stdio: "inherit" });
+      return;
+    }
     execFileSync("unzip", ["-q", archivePath, "-d", destDir], { stdio: "inherit" });
     return;
   }
