@@ -2255,6 +2255,117 @@ mod tests {
     }
 
     #[test]
+    fn side_index_creates_and_reuses_embeddings_without_global_current() {
+        let root = unique_test_root("side-index-independence");
+        let side_index_path = root.join("overlay-index-v1").join("side-index.json");
+        let global_current = root.join("hybrid").join("CURRENT");
+        fs::create_dir_all(side_index_path.parent().unwrap()).unwrap();
+        assert!(
+            !global_current.exists(),
+            "fixture must not provide a global dense CURRENT"
+        );
+
+        let first_feed = vec![OverlayFeedItem {
+            evidence_event_id: "ev1:codex:side-index:000001:text:0000000000000001".to_owned(),
+            session_id: "side-index-session-a".to_owned(),
+            turn_idx: 1,
+            theses: vec!["DECISION: keep src/overlay.rs semantically independent".to_owned()],
+            valid_from: "2026-08-23T12:00:00Z".to_owned(),
+            authority: "operator_confirmed".to_owned(),
+        }];
+        let (mut created, new_intents, retained_intents) = update_side_index(
+            None,
+            &first_feed,
+            "Loctree/aicx",
+            "sr1:first",
+            "test:frozen-semantic-fixture.v1",
+            false,
+        )
+        .unwrap();
+        assert_eq!((new_intents, retained_intents), (1, 0));
+        let emitted_ids = created
+            .entries
+            .iter()
+            .map(|entry| entry.intent_id.clone())
+            .collect();
+        ensure_embeddings(&mut created.entries, &emitted_ids).unwrap();
+        let created_vector = created.entries[0].embedding.clone();
+        assert!(!created_vector.is_empty());
+        // Freeze a distinguishable persisted vector. If the second pass ever
+        // recomputes retained embeddings, the deterministic test embedder will
+        // restore `created_vector` and this regression assertion will fail.
+        let persisted_vector = vec![0.25; created_vector.len()];
+        assert_ne!(persisted_vector, created_vector);
+        created.entries[0].embedding.clone_from(&persisted_vector);
+        atomic_write_json(&side_index_path, &created).unwrap();
+
+        let mut second_feed = first_feed;
+        second_feed.push(OverlayFeedItem {
+            evidence_event_id: "ev1:codex:side-index:000002:text:0000000000000002".to_owned(),
+            session_id: "side-index-session-b".to_owned(),
+            turn_idx: 2,
+            theses: vec!["DECISION: keep src/overlay.rs typed output stable".to_owned()],
+            valid_from: "2026-08-23T12:01:00Z".to_owned(),
+            authority: "agent_derived".to_owned(),
+        });
+        let previous = read_side_index(&side_index_path, "Loctree/aicx")
+            .unwrap()
+            .expect("persisted side-index");
+        let persisted_intent_id = previous.entries[0].intent_id.clone();
+        let (mut reused, new_intents, retained_intents) = update_side_index(
+            Some(previous),
+            &second_feed,
+            "Loctree/aicx",
+            "sr1:second",
+            "test:frozen-semantic-fixture.v1",
+            false,
+        )
+        .unwrap();
+        assert_eq!((new_intents, retained_intents), (1, 1));
+        let emitted_ids = reused
+            .entries
+            .iter()
+            .map(|entry| entry.intent_id.clone())
+            .collect();
+        ensure_embeddings(&mut reused.entries, &emitted_ids).unwrap();
+        let retained = reused
+            .entries
+            .iter()
+            .find(|entry| entry.intent_id == persisted_intent_id)
+            .expect("retained intent");
+        assert_eq!(retained.embedding, persisted_vector);
+        assert!(
+            reused
+                .entries
+                .iter()
+                .all(|entry| !entry.embedding.is_empty())
+        );
+        atomic_write_json(&side_index_path, &reused).unwrap();
+
+        let round_trip = read_side_index(&side_index_path, "Loctree/aicx")
+            .unwrap()
+            .expect("round-tripped side-index");
+        assert_eq!(round_trip.schema, OVERLAY_INDEX_SCHEMA);
+        assert_eq!(round_trip.entries.len(), 2);
+        assert!(
+            !global_current.exists(),
+            "Overlay side-index must not create a global dense CURRENT"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn overlay_wire_type_consumes_loctree_v1_contract_fixture() {
+        let document: OverlayDocument = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/overlay-intent-v1/valid_01_full_overlay.json"
+        )))
+        .expect("Loctree v1 contract fixture must remain consumable");
+        assert_eq!(document.schema, OVERLAY_SCHEMA);
+        assert!(!document.entries.is_empty());
+    }
+
+    #[test]
     fn overlay_dedup_semantic_merges_paraphrases_and_live_pathologies() {
         let fixture = semantic_fixture();
         for (name, expected_refs) in [
@@ -2562,7 +2673,16 @@ mod tests {
             index_root: Some(index.clone()),
         };
         let (first, first_stats) = build_overlay(&options).unwrap();
+        assert!(
+            !store.join("hybrid").join("CURRENT").exists(),
+            "Overlay fixture must not depend on global dense CURRENT"
+        );
         assert_eq!(first_stats.raw_session_files_opened, 0);
+        let emitted_path = index.join(format!("{}.json", first.overlay_revision));
+        let emitted: OverlayDocument = serde_json::from_slice(&fs::read(emitted_path).unwrap())
+            .expect("emitted Loctree overlay document");
+        assert_eq!(emitted, first);
+        assert_eq!(emitted.schema, OVERLAY_SCHEMA);
         let expected_groups = golden
             .pairs
             .iter()
