@@ -1447,7 +1447,7 @@ mod tests {
                         "schema": "aicx.source_parse_state.v1",
                         "signal_filter_version": "signal-v3-workspace-metadata-strip",
                         "repo_path_ignore_fingerprint": ignore_fingerprint,
-                        "disposition_policy_version": "source-disposition-v1",
+                        "disposition_policy_version": "source-disposition-v2-missing-terminal",
                         "source_fingerprint": fingerprint,
                         "sessions": {},
                         "dispositions": dispositions,

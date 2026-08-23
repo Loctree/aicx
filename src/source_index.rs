@@ -9,7 +9,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io::BufReader;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::Instant;
 use std::time::{Duration, SystemTime};
 
@@ -26,6 +26,7 @@ const MAX_EXTRACT_CHARS: usize = 4 * 1024 * 1024;
 const MAX_UNBROKEN_TOKEN_CHARS: usize = 4096;
 const MAX_FULL_PARSE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_JSONL_RECORD_BYTES: usize = 2 * 1024 * 1024;
+const VIBECRAFTED_RETENTION_BYTES: usize = 64 * 1024;
 const IN_FLIGHT_FATAL_GRACE: Duration = Duration::from_secs(5 * 60);
 
 /// Bump whenever signal filtering or extract body shaping changes.
@@ -37,7 +38,7 @@ const IN_FLIGHT_FATAL_GRACE: Duration = Duration::from_secs(5 * 60);
 /// one-shot rebuild so index truth tracks filter truth.
 const SIGNAL_FILTER_VERSION: &str = "signal-v3-workspace-metadata-strip";
 /// Bump when typed terminal classification or parser support changes.
-const DISPOSITION_POLICY_VERSION: &str = "source-disposition-v1";
+const DISPOSITION_POLICY_VERSION: &str = "source-disposition-v2-missing-terminal";
 
 const PARSE_STATE_SCHEMA: &str = "aicx.source_parse_state.v1";
 const PARSE_STATE_RELPATH: &str = "indexed/_all/source_parse_state.v1.json";
@@ -206,6 +207,7 @@ enum TerminalSkipReason {
     ParserFatal,
     UnsupportedAgent,
     OversizedUnsupportedSource,
+    SourceMissing,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -482,19 +484,18 @@ pub fn build(
                 sources_skipped += 1;
                 *skipped_by_agent.entry(entry.agent.clone()).or_default() += 1;
                 let (source_len, source_mtime_ns) = catalog_entry_fingerprint(entry);
+                let disposition = if missing_approved_catalog_source(entry, &source_allow) {
+                    SourceDisposition::TerminalSkip {
+                        reason: TerminalSkipReason::SourceMissing,
+                    }
+                } else {
+                    SourceDisposition::RetryableError {
+                        reason: RetryableErrorReason::SourceUnavailable,
+                    }
+                };
                 next_state.dispositions.insert(
                     session_key,
-                    disposition_record(
-                        entry,
-                        source_len,
-                        source_mtime_ns,
-                        SourceDisposition::RetryableError {
-                            reason: RetryableErrorReason::SourceUnavailable,
-                        },
-                        0,
-                        0,
-                        0,
-                    ),
+                    disposition_record(entry, source_len, source_mtime_ns, disposition, 0, 0, 0),
                 );
                 continue;
             }
@@ -1190,13 +1191,15 @@ fn parse_catalog_source_outcome(
         .with_context(|| format!("resolve catalog source {}", path.display()))?;
 
     if entry.agent == "vibecrafted" {
-        let body = allow
-            .read_to_string(&path)
+        let bytes = allow
+            .read_bytes(&path)
             .with_context(|| format!("read runtime transcript {}", path.display()))?;
+        let body = decode_vibecrafted_transcript(&bytes)
+            .with_context(|| format!("decode runtime transcript {}", path.display()))?;
         // Token-stream runtime_runs logs interleave thought fragments with
         // visible text. Indexing the raw body made search surface
         // `{"type":"thought","data":"The"}` spam over real operator answers.
-        let message = vibecrafted_signal_body(&body);
+        let message = vibecrafted_signal_body(body);
         if message.trim().is_empty() {
             return Ok(SourceParseOutcome::Parsed(Vec::new()));
         }
@@ -1257,6 +1260,37 @@ fn parse_catalog_source_outcome(
         )),
         aicx_parser::engine::ValidatedParse::Fatal(_) => Ok(fatal_parse_outcome(&path)),
     }
+}
+
+fn missing_approved_catalog_source(
+    entry: &CatalogEntry,
+    allow: &crate::source_path::SourceAllowlist,
+) -> bool {
+    let candidate = Path::new(&entry.source_path);
+    candidate.is_absolute()
+        && !candidate
+            .components()
+            .any(|component| matches!(component, Component::ParentDir))
+        && allow.roots().iter().any(|root| candidate.starts_with(root))
+        && matches!(fs::metadata(candidate), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+}
+
+fn decode_vibecrafted_transcript(bytes: &[u8]) -> Result<&str> {
+    if let Ok(body) = std::str::from_utf8(bytes) {
+        return Ok(body);
+    }
+    if bytes.len() != VIBECRAFTED_RETENTION_BYTES {
+        return std::str::from_utf8(bytes).map_err(Into::into);
+    }
+    let prefix = bytes
+        .iter()
+        .take(3)
+        .take_while(|byte| **byte & 0b1100_0000 == 0b1000_0000)
+        .count();
+    if prefix == 0 {
+        return std::str::from_utf8(bytes).map_err(Into::into);
+    }
+    std::str::from_utf8(&bytes[prefix..]).map_err(Into::into)
 }
 
 fn fatal_parse_outcome(path: &Path) -> SourceParseOutcome {
@@ -2572,7 +2606,24 @@ mod tests {
     }
 
     #[test]
-    fn retryable_gap_preserves_last_good_current_and_serializes_attempt() {
+    fn vibecrafted_retention_tail_accepts_only_truncated_utf8_prefix() {
+        let mut retained = vec![b'x'; VIBECRAFTED_RETENTION_BYTES];
+        retained[0] = 0x86;
+        retained[1] = 0x92;
+        let decoded = decode_vibecrafted_transcript(&retained).unwrap();
+        assert_eq!(decoded.len(), VIBECRAFTED_RETENTION_BYTES - 2);
+        assert!(decoded.bytes().all(|byte| byte == b'x'));
+
+        let short = [0x86, b'x'];
+        assert!(decode_vibecrafted_transcript(&short).is_err());
+
+        let mut invalid_interior = vec![b'x'; VIBECRAFTED_RETENTION_BYTES];
+        invalid_interior[17] = 0x86;
+        assert!(decode_vibecrafted_transcript(&invalid_interior).is_err());
+    }
+
+    #[test]
+    fn missing_approved_source_is_terminal_and_allows_publication() {
         let root = std::env::temp_dir().join(format!(
             "aicx-source-incomplete-current-{}-{}",
             std::process::id(),
@@ -2625,10 +2676,8 @@ mod tests {
         fs::create_dir_all(current.parent().unwrap()).unwrap();
         fs::write(&current, "last-good\n").unwrap();
 
-        let error = build(&root, &[], false, true, false, false)
-            .expect_err("retryable source must block publication");
-        assert!(error.to_string().contains("retryable_error=1"));
-        assert_eq!(fs::read_to_string(&current).unwrap(), "last-good\n");
+        build(&root, &[], false, true, false, false)
+            .expect("durably missing approved source must be terminal");
 
         let raw = fs::read_to_string(parse_state_path(&root)).expect("durable accounting attempt");
         let state: SourceParseState = serde_json::from_str(&raw).unwrap();
@@ -2638,10 +2687,18 @@ mod tests {
         ));
         assert!(matches!(
             state.dispositions["vibecrafted:retryable"].disposition,
-            SourceDisposition::RetryableError {
-                reason: RetryableErrorReason::SourceUnavailable
+            SourceDisposition::TerminalSkip {
+                reason: TerminalSkipReason::SourceMissing
             }
         ));
+
+        let mut outside = entries[1].clone();
+        outside.source_path = "/not-an-approved-root/missing.log".to_string();
+        let allow = crate::source_path::SourceAllowlist::for_operator(&root, &root);
+        assert!(
+            !missing_approved_catalog_source(&outside, &allow),
+            "missing paths outside the allowlist must remain retryable"
+        );
 
         let _ = fs::remove_dir_all(root);
     }
