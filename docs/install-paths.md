@@ -18,11 +18,11 @@ resort — never a default, never a silent fallback:
 
 **Contract:** a stranger's machine must never be required to have a Rust
 toolchain, `protoc`, or spare build disk to run aicx. The two end-user channels
-(1, 2) are prebuilt-only with no automatic source-build fallback — verified by
-audit: `distribution/npm/**` postinstall only downloads / SHA256-verifies /
-extracts / copies, and `install.sh` release mode `exit 0`s before reaching any
-`cargo` branch. Source build is reachable only through the explicit developer
-modes above.
+(1, 2) are prebuilt-only with no automatic source-build fallback. npm platform
+tgz files carry both binaries and define zero lifecycle scripts; source release
+assets are checksum- and signature-verified before `npm pack`. `install.sh`
+release mode exits before reaching any `cargo` branch. Source build is reachable
+only through the explicit developer modes above.
 
 **Known sharp edge:** `install.sh` `auto` mode resolves to **local** (source
 build) when a `Cargo.toml` is adjacent — i.e. run from inside a clone. A bare
@@ -61,7 +61,7 @@ npm @loctree/aicx
 | Release download | `AICX_INSTALL_MODE=release bash install.sh` | `~/.local/bin` | delegates to bundle mode after checksum verification |
 | Local source | `bash install.sh` in a checkout | cargo bin dir | removes older/equal `~/.local/bin` and npm-bin shadows |
 | Make source | `make install-bin` | cargo bin dir | runs the same shell shadow check before `cargo install` and PATH check after |
-| npm package | `npm install -g @loctree/aicx` | npm global package/bin surface | warns by default; removes older/equal local/cargo shadows only with `AICX_NPM_REPLACE_LOCAL=1` |
+| npm package | `npm install -g @loctree/aicx` | npm global package/bin surface | no implicit shadow scan or cleanup; use `aicx config inspect --json` / `aicx doctor` explicitly |
 
 ## Pre-install Scan
 
@@ -223,24 +223,6 @@ An npm global shim appears as channel `npm` when its visible path contains the
 npm package surface. MCP `initialize.result.serverInfo.version` is sourced from
 the same build identity as `.runtime.build.version`; disagreement means the MCP
 response came from a different running artifact or service process.
-
-## npm Opt-in Replacement
-
-npm postinstall cannot safely prompt, so it warns by default. To let npm remove
-older or equal local shadows during installation:
-
-```bash
-AICX_NPM_REPLACE_LOCAL=1 npm install -g @loctree/aicx
-```
-
-The npm cleanup only targets:
-
-- `~/.local/bin/aicx`
-- `~/.local/bin/aicx-mcp`
-- `~/.cargo/bin/aicx`
-- `~/.cargo/bin/aicx-mcp`
-
-It does not uninstall other npm packages or rewrite shell startup files.
 
 ## Release Version Gate
 

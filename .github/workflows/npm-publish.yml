@@ -23,155 +23,185 @@ jobs:
         with:
           ref: v${{ inputs.version }}
 
-      - name: Validate requested version
+      - name: Validate requested version and release tag
         id: meta
         env:
           INPUT_VERSION: ${{ inputs.version }}
         run: |
           version="${INPUT_VERSION}"
-          if [[ -z "${version}" ]]; then
-            echo "version is required" >&2
-            exit 1
-          fi
           if [[ ! "${version}" =~ ^[0-9]+[.][0-9]+[.][0-9]+$ ]]; then
             echo "version must look like x.y.z" >&2
+            exit 1
+          fi
+          cargo_version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')
+          if [[ "${cargo_version}" != "${version}" ]]; then
+            echo "Cargo.toml version ${cargo_version} does not match ${version}" >&2
             exit 1
           fi
           echo "version=${version}" >> "${GITHUB_OUTPUT}"
           echo "release_tag=v${version}" >> "${GITHUB_OUTPUT}"
 
-      - name: Check Cargo.toml version matches input
-        env:
-          RELEASE_VERSION: ${{ steps.meta.outputs.version }}
-        run: |
-          python3 - <<'PY'
-          import os
-          import tomllib
-
-          with open("Cargo.toml", "rb") as fh:
-              cargo_version = tomllib.load(fh)["package"]["version"]
-
-          release_version = os.environ["RELEASE_VERSION"]
-          if cargo_version != release_version:
-              raise SystemExit(
-                  f"Cargo.toml version {cargo_version} does not match requested npm publish version {release_version}"
-              )
-          PY
-
-      - name: Verify release assets exist
-        env:
-          RELEASE_TAG: ${{ steps.meta.outputs.release_tag }}
-        run: |
-          base_url="https://github.com/Loctree/aicx/releases/download/${RELEASE_TAG}"
-          verify_dir=$(mktemp -d)
-          trap 'rm -rf "${verify_dir}"' EXIT
-          mkdir -m 700 "${verify_dir}/gnupg"
-          curl -fsSL "${base_url}/loctree-release-pubkey.asc" \
-            -o "${verify_dir}/loctree-release-pubkey.asc"
-          gpg --batch --homedir "${verify_dir}/gnupg" \
-            --import "${verify_dir}/loctree-release-pubkey.asc"
-          # Signed-only release surface. macOS ships .zip (notarized via ditto);
-          # Linux ships .tar.gz (GPG-detached); Windows ships .zip (GPG-detached
-          # MSVC build). All three carry GPG .asc sidecars.
-          assets=(
-            "aicx-v${{ steps.meta.outputs.version }}-aarch64-apple-darwin-slim.zip"
-            "aicx-v${{ steps.meta.outputs.version }}-x86_64-linux-gnu-slim.tar.gz"
-            "aicx-v${{ steps.meta.outputs.version }}-x86_64-pc-windows-msvc-slim.zip"
-          )
-          for asset in "${assets[@]}"; do
-            curl -fsSL "${base_url}/${asset}" -o "${verify_dir}/${asset}"
-            curl -fsSL "${base_url}/${asset}.sha256" -o "${verify_dir}/${asset}.sha256"
-            curl -fsSL "${base_url}/${asset}.asc" -o "${verify_dir}/${asset}.asc"
-            (cd "${verify_dir}" && sha256sum -c "${asset}.sha256")
-            gpg --batch --homedir "${verify_dir}/gnupg" \
-              --verify "${verify_dir}/${asset}.asc" "${verify_dir}/${asset}"
-          done
-
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24
 
-      - name: Verify npm package metadata
+      - name: Verify script-free source metadata
         run: |
           node distribution/npm/sync-version.mjs "${{ steps.meta.outputs.version }}"
-          node distribution/npm/verify-metadata.mjs "${{ steps.meta.outputs.version }}"
+          python tools/npm_publish_contract_selftest.py
+
+  pack-platform-packages:
+    name: Verify + pack ${{ matrix.platform }}
+    needs: verify
+    runs-on: ${{ matrix.runs_on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: darwin-arm64
+            runs_on: macos-15
+            asset_triple: aarch64-apple-darwin
+            asset_ext: zip
+          - platform: linux-x64-gnu
+            runs_on: ubuntu-latest
+            asset_triple: x86_64-linux-gnu
+            asset_ext: tar.gz
+          - platform: win32-x64-gnu
+            runs_on: windows-latest
+            asset_triple: x86_64-pc-windows-msvc
+            asset_ext: zip
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ needs.verify.outputs.release_tag }}
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Pin npm 11.17.0
+        shell: bash
+        run: npm install --global npm@11.17.0
+
+      - name: Ensure GPG is available
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          if (-not (Get-Command gpg -ErrorAction SilentlyContinue)) {
+            choco install gnupg --no-progress --yes
+          }
+
+      - name: Download signed release input
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.verify.outputs.release_tag }}
+          RELEASE_VERSION: ${{ needs.verify.outputs.version }}
+          ASSET_TRIPLE: ${{ matrix.asset_triple }}
+          ASSET_EXT: ${{ matrix.asset_ext }}
+        run: |
+          release_dir="${RUNNER_TEMP}/aicx-release-input"
+          mkdir -p "${release_dir}"
+          base_url="https://github.com/Loctree/aicx/releases/download/${RELEASE_TAG}"
+          asset="aicx-v${RELEASE_VERSION}-${ASSET_TRIPLE}-slim.${ASSET_EXT}"
+          for name in "${asset}" "${asset}.sha256" "${asset}.asc" loctree-release-pubkey.asc; do
+            curl --fail --show-error --location "${base_url}/${name}" --output "${release_dir}/${name}"
+          done
+
+      - name: Verify source asset, stage binaries, and inspect npm pack
+        shell: bash
+        run: |
+          node distribution/npm/sync-version.mjs "${{ needs.verify.outputs.version }}"
+          node distribution/npm/stage-platform-package.mjs \
+            "${{ needs.verify.outputs.version }}" \
+            "${{ matrix.platform }}" \
+            "${RUNNER_TEMP}/aicx-release-input"
+          node distribution/npm/verify-metadata.mjs \
+            "${{ needs.verify.outputs.version }}" \
+            "--platform=${{ matrix.platform }}"
+
+      - name: Pack verified platform tgz
+        id: pack
+        working-directory: distribution/npm/aicx/platform-packages/${{ matrix.platform }}
+        shell: bash
+        run: |
+          tgz=$(npm pack --ignore-scripts --json | node -e 'let s=""; process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s)[0].filename))')
+          bytes=$(node -e 'const fs=require("fs"); console.log(fs.statSync(process.argv[1]).size)' "${tgz}")
+          echo "tgz=${tgz}" >> "${GITHUB_OUTPUT}"
+          echo "### ${{ matrix.platform }} npm tgz: ${bytes} bytes" >> "${GITHUB_STEP_SUMMARY}"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: npm-${{ matrix.platform }}
+          path: distribution/npm/aicx/platform-packages/${{ matrix.platform }}/${{ steps.pack.outputs.tgz }}
+          if-no-files-found: error
+
+  pack-wrapper:
+    name: Pack script-free wrapper
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ needs.verify.outputs.release_tag }}
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+      - name: Pack and inspect wrapper
+        working-directory: distribution/npm/aicx
+        shell: bash
+        run: |
+          node ../sync-version.mjs "${{ needs.verify.outputs.version }}"
+          npm install --global npm@11.17.0
+          npm pack --dry-run --ignore-scripts
+          npm pack --ignore-scripts
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: npm-wrapper
+          path: distribution/npm/aicx/loctree-aicx-${{ needs.verify.outputs.version }}.tgz
+          if-no-files-found: error
 
   publish-platform-packages:
     name: Publish platform package ${{ matrix.platform }}
-    needs: verify
+    needs: [verify, pack-platform-packages]
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        platform:
-          - darwin-arm64
-          - linux-x64-gnu
-          - win32-x64-gnu
+        platform: [darwin-arm64, linux-x64-gnu, win32-x64-gnu]
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          ref: ${{ needs.verify.outputs.release_tag }}
-
+          name: npm-${{ matrix.platform }}
+          path: npm-package
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: 20
+          node-version: 24
           registry-url: "https://registry.npmjs.org"
-
-      - name: Sync npm package versions
-        run: node distribution/npm/sync-version.mjs "${{ needs.verify.outputs.version }}"
-
-      - name: Publish platform package
-        working-directory: distribution/npm/aicx/platform-packages/${{ matrix.platform }}
+      - name: Publish attested tgz
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npm publish --access public
+        run: npm publish npm-package/*.tgz --access public --ignore-scripts
 
   publish-wrapper:
     name: Publish wrapper package
-    needs: [verify, publish-platform-packages]
+    needs: [verify, pack-wrapper, publish-platform-packages]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          ref: ${{ needs.verify.outputs.release_tag }}
-
+          name: npm-wrapper
+          path: npm-package
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: 20
+          node-version: 24
           registry-url: "https://registry.npmjs.org"
-
-      - name: Sync npm package versions
-        run: node distribution/npm/sync-version.mjs "${{ needs.verify.outputs.version }}"
-
       - name: Wait for npm registry propagation
-        run: sleep 30
-
-      - name: Publish wrapper package
-        working-directory: distribution/npm/aicx
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npm publish --access public
-
-  smoke-cold-install:
-    name: Cold npm install (${{ matrix.os }})
-    needs: [verify, publish-wrapper]
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-15, windows-latest]
-    steps:
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version: 20
-
-      - name: Wait for wrapper and platform versions, then install into an empty prefix
         shell: bash
         env:
           RELEASE_VERSION: ${{ needs.verify.outputs.version }}
         run: |
           packages=(
-            "@loctree/aicx"
             "@loctree/aicx-darwin-arm64"
             "@loctree/aicx-linux-x64-gnu"
             "@loctree/aicx-win32-x64-gnu"
@@ -180,22 +210,76 @@ jobs:
             missing=()
             for package in "${packages[@]}"; do
               published=$(npm view "${package}@${RELEASE_VERSION}" version 2>/dev/null || true)
-              if [[ "${published}" != "${RELEASE_VERSION}" ]]; then
-                missing+=("${package}")
-              fi
+              [[ "${published}" == "${RELEASE_VERSION}" ]] || missing+=("${package}")
             done
-            if [[ "${#missing[@]}" == 0 ]]; then
-              break
-            fi
+            [[ "${#missing[@]}" == 0 ]] && break
             if [[ "${attempt}" == 20 ]]; then
-              echo "npm registry did not expose all AICX packages at ${RELEASE_VERSION}: ${missing[*]}" >&2
+              echo "npm registry did not expose ${missing[*]} at ${RELEASE_VERSION}" >&2
               exit 1
             fi
             sleep 15
           done
-          smoke_dir="${RUNNER_TEMP}/aicx-npm-smoke"
-          rm -rf "${smoke_dir}"
-          mkdir -p "${smoke_dir}"
-          npm install --prefix "${smoke_dir}" "@loctree/aicx@${RELEASE_VERSION}"
-          "${smoke_dir}/node_modules/.bin/aicx" --version
-          "${smoke_dir}/node_modules/.bin/aicx-mcp" --version
+      - name: Publish attested wrapper tgz
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish npm-package/*.tgz --access public --ignore-scripts
+
+  smoke-cold-install:
+    name: Cold npm install (${{ matrix.os }}, ${{ matrix.install_mode }})
+    needs: [verify, publish-wrapper]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15, windows-latest]
+        install_mode: [normal, ignore-scripts]
+    steps:
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+      - name: Pin npm 11.17.0
+        shell: bash
+        run: npm install --global npm@11.17.0
+      - name: Wait for the native package, install, and run real commands
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ needs.verify.outputs.version }}
+          INSTALL_MODE: ${{ matrix.install_mode }}
+        run: |
+          case "${RUNNER_OS}" in
+            Linux) platform_package="@loctree/aicx-linux-x64-gnu" ;;
+            macOS) platform_package="@loctree/aicx-darwin-arm64" ;;
+            Windows) platform_package="@loctree/aicx-win32-x64-gnu" ;;
+          esac
+          packages=("@loctree/aicx" "${platform_package}")
+          for attempt in {1..20}; do
+            missing=()
+            for package in "${packages[@]}"; do
+              published=$(npm view "${package}@${RELEASE_VERSION}" version 2>/dev/null || true)
+              [[ "${published}" == "${RELEASE_VERSION}" ]] || missing+=("${package}")
+            done
+            [[ "${#missing[@]}" == 0 ]] && break
+            if [[ "${attempt}" == 20 ]]; then
+              echo "npm registry did not expose ${missing[*]} at ${RELEASE_VERSION}" >&2
+              exit 1
+            fi
+            sleep 15
+          done
+
+          smoke_dir="${RUNNER_TEMP}/aicx-npm-${INSTALL_MODE}"
+          prefix="${smoke_dir}/prefix"
+          cache="${smoke_dir}/cache"
+          log="${smoke_dir}/install.log"
+          mkdir -p "${prefix}" "${cache}"
+          install_args=()
+          [[ "${INSTALL_MODE}" == "ignore-scripts" ]] && install_args+=(--ignore-scripts)
+          npm install --prefix "${prefix}" --cache "${cache}" --loglevel verbose \
+            "${install_args[@]}" "@loctree/aicx@${RELEASE_VERSION}" 2>&1 | tee "${log}"
+          if grep -qi "allow-scripts" "${log}"; then
+            echo "install log contains forbidden allow-scripts warning" >&2
+            exit 1
+          fi
+          bin_dir="${prefix}/node_modules/.bin"
+          "${bin_dir}/aicx" --version
+          "${bin_dir}/aicx-mcp" --version
+          "${bin_dir}/aicx" config inspect --json >/dev/null

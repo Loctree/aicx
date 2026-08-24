@@ -21,9 +21,7 @@
     "directory": "distribution/npm/aicx/platform-packages/darwin-arm64"
   },
   "files": [
-    "postinstall.js"
-  ],
-  "scripts": {
-    "postinstall": "node postinstall.js"
-  }
+    "bin/aicx",
+    "bin/aicx-mcp"
+  ]
 }

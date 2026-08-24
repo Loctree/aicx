@@ -1,7 +1,7 @@
 {
   "name": "@loctree/aicx",
   "version": "0.12.5",
-  "description": "aicx CLI + MCP server. Thin-release npm wrapper that installs both aicx and aicx-mcp from GitHub Releases.",
+  "description": "aicx CLI + MCP server. Script-free wrapper for prebuilt platform packages.",
   "keywords": [
     "aicx",
     "mcp",
@@ -24,12 +24,8 @@
     "index.d.ts",
     "bin/aicx",
     "bin/aicx-mcp",
-    "install.js",
     "README.md"
   ],
-  "scripts": {
-    "postinstall": "node install.js"
-  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/Loctree/aicx.git",

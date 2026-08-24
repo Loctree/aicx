@@ -1,134 +1,59 @@
 # Publishing Guide - aicx npm packages
 
-> Status: aligned to the signed GitHub Release asset shape for macOS arm64,
-> Linux x64 GNU, and Windows x64 MSVC. Publish only after the matching release
-> assets and `.sha256` sidecars exist for the target version.
+The npm surface is one script-free wrapper plus three script-free platform
+packages. Every platform tgz contains `aicx` and `aicx-mcp` (`.exe` on
+Windows); installation never downloads or extracts a GitHub Release asset.
 
-This guide describes the publish flow for the single wrapper package and its
-platform sub-packages under the `@loctree` npm scope.
+## Package matrix
 
-## Architecture
+| Platform package | Source release asset | Payload |
+| --- | --- | --- |
+| `@loctree/aicx-darwin-arm64` | `aicx-v{V}-aarch64-apple-darwin-slim.zip` | `bin/aicx`, `bin/aicx-mcp` |
+| `@loctree/aicx-linux-x64-gnu` | `aicx-v{V}-x86_64-linux-gnu-slim.tar.gz` | `bin/aicx`, `bin/aicx-mcp` |
+| `@loctree/aicx-win32-x64-gnu` | `aicx-v{V}-x86_64-pc-windows-msvc-slim.zip` | `bin/aicx.exe`, `bin/aicx-mcp.exe` |
 
-One wrapper, three active platform packages.
+The legacy Windows npm suffix remains `gnu`, but its fenced package carries the
+MSVC release binaries.
 
-The wrapper publishes two commands:
+## Publish contract
 
-- `aicx`
-- `aicx-mcp`
+Publication is available only through the manual `npm-publish.yml` operator
+button after the matching signed GitHub Release exists. For each platform, a
+native runner:
 
-Platform packages install the matching release asset from
-`https://github.com/Loctree/aicx/releases`.
+1. downloads the archive, `.sha256`, `.asc`, and release public key;
+2. verifies SHA-256 and the detached GPG signature;
+3. extracts exactly one copy of each expected binary and rejects symlinks;
+4. stages the pair under the platform package's `bin/` directory;
+5. checks suffixes, executable mode, and both `--version` results;
+6. inspects `npm pack` contents and uploads the resulting tgz as an attested CI artifact.
 
-| Wrapper | `bin` entries | Platform package pattern | Release repo |
-| --- | --- | --- | --- |
-| `@loctree/aicx` | `aicx`, `aicx-mcp` | `@loctree/aicx-{platform}` | `Loctree/aicx` |
+Publish jobs consume those immutable tgz artifacts rather than repacking a
+checkout. Platform packages publish first; the wrapper publishes after registry
+propagation. The workflow never creates a release, tag, or version bump.
 
-Platform matrix:
+## Local metadata gate
 
-- `darwin-arm64`
-- `linux-x64-gnu`
-- `win32-x64-gnu` (legacy npm package suffix; contains the MSVC build)
-
-Each platform package downloads:
-
-- the release archive
-- the adjacent `.sha256`
-
-Then it:
-
-- verifies SHA-256
-- extracts the archive
-- copies `aicx` and `aicx-mcp` into the package directory
-
-## Prerequisites
-
-1. `@loctree` npm org exists and you have publish rights.
-2. GitHub releases exist for the target version with the asset names expected
-   by the platform packages:
-   - `aicx-v{V}-aarch64-apple-darwin-slim.zip`
-   - `aicx-v{V}-x86_64-linux-gnu-slim.tar.gz`
-   - `aicx-v{V}-x86_64-pc-windows-msvc-slim.zip`
-3. Each asset has an adjacent `.sha256`.
-4. The release also carries detached `.asc` signatures and
-   `loctree-release-pubkey.asc`.
-5. Node.js 20+.
-
-## Publish flow
-
-### Step 1 - Sync versions
+After staging the current host's signed release asset:
 
 ```bash
 node distribution/npm/sync-version.mjs 0.12.5
-node distribution/npm/sync-version.mjs --check 0.12.5
-node distribution/npm/verify-metadata.mjs 0.12.5
+node distribution/npm/stage-platform-package.mjs 0.12.5 darwin-arm64 /path/to/release-input
+node distribution/npm/verify-metadata.mjs 0.12.5 --platform=darwin-arm64
 ```
 
-### Step 2 - Publish platform packages first
+Use the matching platform key on Linux or Windows. The verifier requires zero
+`preinstall`, `install`, `postinstall`, and `prepare` scripts in every manifest,
+checks the exact pack list, and refuses cross-platform version attestation.
 
-```bash
-for plat in darwin-arm64 linux-x64-gnu win32-x64-gnu; do
-  (cd distribution/npm/aicx/platform-packages/$plat && npm publish --access public)
-done
-```
+## Cold-install acceptance
 
-### Step 3 - Wait for npm registry propagation
+After publication, the workflow runs six isolated npm 11.17.0 jobs: normal and
+`--ignore-scripts` installs on macOS arm64, Linux x64 GNU, and real Windows x64.
+Each job uses a fresh prefix and cache, rejects any `allow-scripts` text in the
+verbose log, runs both version commands, and executes `aicx config inspect --json`.
 
-```bash
-sleep 30
-```
-
-### Step 4 - Publish the wrapper
-
-```bash
-(cd distribution/npm/aicx && npm publish --access public)
-```
-
-### Step 5 - Verify
-
-```bash
-mkdir -p /tmp/aicx-npm-verify && cd /tmp/aicx-npm-verify
-npm init -y >/dev/null
-npm install @loctree/aicx
-npx aicx --version
-npx aicx-mcp --version
-```
-
-## GitHub Actions path
-
-The repo also includes a manual workflow:
-
-- `.github/workflows/npm-publish.yml`
-
-Run it with a concrete `x.y.z` version after the matching GitHub Release assets
-exist. It publishes platform packages first, waits for registry propagation,
-then publishes the wrapper.
-
-## Troubleshooting
-
-### "Platform package not found"
-
-- Platform packages must be published before the wrapper.
-- Wait 30-60 seconds after the platform publish for npm registry propagation.
-- Verify names exactly match the wrapper `optionalDependencies`.
-
-### Binary download failures
-
-- Verify the GitHub release exists at the correct tag (`v{VERSION}` with the `v` prefix).
-- Verify the release assets and `.sha256` files exist.
-- Test download manually:
-
-Real asset shape:
-
-```bash
-curl -LI https://github.com/Loctree/aicx/releases/download/v0.12.5/aicx-v0.12.5-aarch64-apple-darwin-slim.zip
-curl -LI https://github.com/Loctree/aicx/releases/download/v0.12.5/aicx-v0.12.5-aarch64-apple-darwin-slim.zip.sha256
-curl -LI https://github.com/Loctree/aicx/releases/download/v0.12.5/aicx-v0.12.5-x86_64-linux-gnu-slim.tar.gz
-curl -LI https://github.com/Loctree/aicx/releases/download/v0.12.5/aicx-v0.12.5-x86_64-linux-gnu-slim.tar.gz.sha256
-curl -LI https://github.com/Loctree/aicx/releases/download/v0.12.5/aicx-v0.12.5-x86_64-pc-windows-msvc-slim.zip
-curl -LI https://github.com/Loctree/aicx/releases/download/v0.12.5/aicx-v0.12.5-x86_64-pc-windows-msvc-slim.zip.sha256
-```
-
-### optionalDependencies disabled
-
-- Some CI / package manager configs disable optional deps.
-- Check `.npmrc` / `.yarnrc` for `optional=false` or `--ignore-optional`.
+This migration intentionally makes platform tgz files much larger: they now
+carry the product binaries instead of a downloader. Record the exact byte sizes
+from the workflow job summaries in the release PR before pressing the publish
+button.

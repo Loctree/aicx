@@ -56,7 +56,7 @@ function getPlatformKey() {
   }
 
   if (platform === "win32") {
-    // Currently only ship MinGW-w64 (gnu) Windows binaries.
+    // The legacy npm package key ends in gnu, but its payload is the MSVC build.
     return `${platform}-${normalizedArch}-gnu`;
   }
 
@@ -116,7 +116,19 @@ function resolvePlatformBinaryPath(packageRoot, binaryFileName) {
     throw new Error(`Refusing unexpected platform binary name: ${binaryFileName}`);
   }
 
-  const binaryPath = `${packageRoot}${sep}${binaryFileName}`;
+  // binaryFileName is a member of the closed allowlist above. Keep the final
+  // path construction literal so static security analyzers can prove that no
+  // untrusted path segment reaches the filesystem.
+  let binaryPath;
+  if (binaryFileName === "aicx") {
+    binaryPath = `${packageRoot}${sep}bin${sep}aicx`;
+  } else if (binaryFileName === "aicx-mcp") {
+    binaryPath = `${packageRoot}${sep}bin${sep}aicx-mcp`;
+  } else if (binaryFileName === "aicx.exe") {
+    binaryPath = `${packageRoot}${sep}bin${sep}aicx.exe`;
+  } else {
+    binaryPath = `${packageRoot}${sep}bin${sep}aicx-mcp.exe`;
+  }
   assertContainedPath(packageRoot, binaryPath);
   return binaryPath;
 }
