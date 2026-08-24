@@ -45,6 +45,8 @@ const MCP_SESSION_IDLE_TTL: Duration = Duration::from_secs(30 * 60);
 const MCP_SESSION_MAX_SESSIONS: usize = 1000;
 const MCP_SESSION_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 const MCP_IDLE_MEMORY_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+pub const MCP_AUTO_REFRESH_INTERVAL: Duration = Duration::from_secs(30 * 60);
+pub const MCP_AUTO_REFRESH_HOURS: u64 = 48;
 
 /// Default time without an MCP tool request before request-derived memory is
 /// reclaimed. Search/index/corpus data is loaded inside each request rather
@@ -56,14 +58,82 @@ pub const MCP_IDLE_MEMORY_DROP_AFTER: Duration = Duration::from_secs(15 * 60);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct McpLifecycleConfig {
     pub idle_memory_drop_after: Duration,
+    pub auto_refresh_interval: Option<Duration>,
+    pub auto_refresh_hours: u64,
 }
 
 impl Default for McpLifecycleConfig {
     fn default() -> Self {
         Self {
             idle_memory_drop_after: MCP_IDLE_MEMORY_DROP_AFTER,
+            auto_refresh_interval: Some(MCP_AUTO_REFRESH_INTERVAL),
+            auto_refresh_hours: MCP_AUTO_REFRESH_HOURS,
         }
     }
+}
+
+fn refresh_catalog_and_index(hours: u64) -> anyhow::Result<()> {
+    let aicx_home = crate::aicx_home::resolve()?;
+    let user_home = crate::os_user_home()
+        .ok_or_else(|| anyhow::anyhow!("cannot resolve user home for MCP auto-refresh"))?;
+    let cutoff = chrono::Utc::now() - chrono::Duration::hours(hours.min(720) as i64);
+    let cutoff_ns = cutoff
+        .timestamp_nanos_opt()
+        .map(|value| value.max(0) as u128)
+        .unwrap_or(0);
+    let refresh = crate::catalog::refresh_hot(&aicx_home, &user_home, cutoff_ns)?;
+    let status = crate::api::index_status_at(&aicx_home, None).ok();
+    let pending = status
+        .as_ref()
+        .map(|status| status.pending_chunks)
+        .unwrap_or(0);
+    let index_current = status.as_ref().is_some_and(|status| {
+        status.readiness == crate::api::IndexReadiness::Ready && status.lexical_status == "ready"
+    });
+
+    if refresh.changed_sessions == 0
+        && refresh.admitted_sessions == 0
+        && refresh.reattributed_sessions == 0
+        && pending == 0
+        && index_current
+    {
+        tracing::debug!(target: "mcp.refresh", "MCP auto-refresh: catalog and index already current");
+        return Ok(());
+    }
+
+    let _lock = crate::locks::acquire_exclusive(crate::locks::lance_lock_path()?)?;
+    let report = crate::source_index::build(&aicx_home, &[], false, false, false, false)?;
+    tracing::info!(
+        target: "mcp.refresh",
+        changed_sessions = refresh.changed_sessions,
+        admitted_sessions = refresh.admitted_sessions,
+        reattributed_sessions = refresh.reattributed_sessions,
+        pending_chunks_before = pending,
+        lexical_docs = report.lexical_docs,
+        unchanged = report.unchanged,
+        wall_ms = report.wall_ms,
+        "MCP auto-refresh published the current lexical index"
+    );
+    Ok(())
+}
+
+fn spawn_mcp_auto_refresh(interval: Duration, hours: u64) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            ticker.tick().await;
+            match tokio::task::spawn_blocking(move || refresh_catalog_and_index(hours)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    tracing::warn!(target: "mcp.refresh", %error, "MCP auto-refresh failed")
+                }
+                Err(error) => {
+                    tracing::warn!(target: "mcp.refresh", %error, "MCP auto-refresh worker failed")
+                }
+            }
+        }
+    });
 }
 
 #[derive(Debug)]
@@ -1939,6 +2009,9 @@ pub async fn run_http_config_with_lifecycle(
     spawn_mcp_session_cleanup(session_manager.clone(), MCP_SESSION_SWEEP_INTERVAL);
     let idle_memory = Arc::new(McpIdleMemoryManager::new(lifecycle.idle_memory_drop_after));
     spawn_mcp_idle_memory_cleanup(idle_memory.clone(), MCP_IDLE_MEMORY_SWEEP_INTERVAL);
+    if let Some(interval) = lifecycle.auto_refresh_interval {
+        spawn_mcp_auto_refresh(interval, lifecycle.auto_refresh_hours);
+    }
     let service = rmcp::transport::streamable_http_server::StreamableHttpService::new(
         move || Ok(AicxMcpServer::with_idle_memory(idle_memory.clone())),
         session_manager,
@@ -2109,30 +2182,34 @@ mod tests {
     };
 
     #[test]
-    fn http_lifecycle_contains_only_reader_memory_policy() {
+    fn http_lifecycle_defaults_to_one_bounded_writer() {
         let lifecycle = McpLifecycleConfig::default();
         assert_eq!(
             lifecycle.idle_memory_drop_after,
             super::MCP_IDLE_MEMORY_DROP_AFTER
         );
+        assert_eq!(
+            lifecycle.auto_refresh_interval,
+            Some(super::MCP_AUTO_REFRESH_INTERVAL)
+        );
+        assert_eq!(lifecycle.auto_refresh_hours, super::MCP_AUTO_REFRESH_HOURS);
     }
 
     #[test]
-    fn mcp_public_search_and_http_lifecycle_are_reader_only() {
+    fn mcp_public_search_stays_lexical_while_http_owns_refresh() {
         let source = include_str!("mcp.rs");
         for retired in [
             ["Semantic-first", " search"].concat(),
             ["strict_", "semantic: bool"].concat(),
-            ["spawn_mcp_", "auto_refresh"].concat(),
-            ["refresh_catalog_", "and_index"].concat(),
-            ["crate::catalog::", "refresh_hot"].concat(),
-            ["crate::source_index::", "build"].concat(),
         ] {
             assert!(
                 !source.contains(&retired),
-                "reader-only MCP source must not contain retired writer/search path: {retired}"
+                "lexical MCP source must not contain retired semantic path: {retired}"
             );
         }
+        assert!(source.contains("spawn_mcp_auto_refresh"));
+        assert!(source.contains("crate::catalog::refresh_hot"));
+        assert!(source.contains("crate::source_index::build"));
         assert!(source.matches("try_lexical_search_filtered").count() >= 2);
         assert!(
             source

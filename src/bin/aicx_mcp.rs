@@ -67,8 +67,12 @@ struct Args {
     #[arg(long, default_value_t = 15, value_parser = clap::value_parser!(u64).range(1..))]
     idle_drop_minutes: u64,
 
-    /// Retained compatibility no-op. HTTP serving is always reader-only.
-    #[arg(long, hide = true)]
+    /// Refresh the hot catalog and lexical index in the background at this cadence.
+    #[arg(long, default_value_t = 1800, value_parser = clap::value_parser!(u64).range(10..))]
+    refresh_interval_seconds: u64,
+
+    /// Disable the HTTP server's background catalog/index refresh loop.
+    #[arg(long)]
     no_auto_refresh: bool,
 }
 
@@ -150,11 +154,13 @@ fn main() -> ExitCode {
         allowed_hosts: args.allowed_hosts,
         allow_any_host: args.allow_any_host,
     };
-    let _ = args.no_auto_refresh;
     let lifecycle = McpLifecycleConfig {
         idle_memory_drop_after: std::time::Duration::from_secs(
             args.idle_drop_minutes.saturating_mul(60),
         ),
+        auto_refresh_interval: (!args.no_auto_refresh)
+            .then(|| std::time::Duration::from_secs(args.refresh_interval_seconds)),
+        ..McpLifecycleConfig::default()
     };
     match rt.block_on(async {
         mcp::run_transport_with_lifecycle(args.transport, http_config, auth_config, lifecycle).await
@@ -195,6 +201,7 @@ mod tests {
         assert_eq!(args.host, IpAddr::V4(Ipv4Addr::LOCALHOST));
         assert_eq!(args.port, 8044);
         assert_eq!(args.idle_drop_minutes, 15);
+        assert_eq!(args.refresh_interval_seconds, 1800);
         assert!(!args.no_auto_refresh);
     }
 
@@ -252,14 +259,14 @@ mod tests {
         assert!(rendered.contains("Bind address for streamable HTTP transport"));
         assert!(rendered.contains("--no-require-auth"));
         assert!(rendered.contains("--idle-drop-minutes"));
-        assert!(!rendered.contains("--refresh-interval-seconds"));
-        assert!(!rendered.contains("--no-auto-refresh"));
+        assert!(rendered.contains("--refresh-interval-seconds"));
+        assert!(rendered.contains("--no-auto-refresh"));
     }
 
     #[test]
-    fn retired_no_auto_refresh_flag_remains_a_hidden_no_op() {
+    fn no_auto_refresh_disables_the_writer_loop() {
         let args = Args::try_parse_from(["aicx-mcp", "--no-auto-refresh"])
-            .expect("existing service configs must remain compatible");
+            .expect("explicit reader-only mode should parse");
         assert!(args.no_auto_refresh);
     }
 

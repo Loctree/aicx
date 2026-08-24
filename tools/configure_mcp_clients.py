@@ -6,8 +6,8 @@ LaunchAgent and the client JSON stay on the same transport.
 
 HTTP desired shape (command/args dropped):
   {"url": "http://127.0.0.1:8044/mcp"}
-plus Authorization when a token file is readable — `aicx serve` requires
-Bearer auth by default (loopback included).
+plus Authorization when a token file is readable, unless `--no-auth` is set
+for an explicitly unauthenticated loopback service.
 
 Stdio desired shape (url/headers/type dropped):
   {"command": "...", "args": []}
@@ -24,10 +24,10 @@ from pathlib import Path
 from typing import Any
 
 
-DEFAULT_TARGETS: list[tuple[str, Path]] = [
-    ("claude", Path.home() / ".claude" / "settings.json"),
-    ("codex", Path.home() / ".codex" / "settings.json"),
-    ("gemini", Path.home() / ".gemini" / "settings.json"),
+DEFAULT_TARGETS: list[tuple[str, Path, str, str]] = [
+    ("claude", Path.home() / ".claude.json", "aicx", "json"),
+    ("codex", Path.home() / ".codex" / "config.toml", "aicx-local", "toml"),
+    ("gemini", Path.home() / ".gemini" / "settings.json", "aicx", "json"),
 ]
 
 WILDCARD_HOSTS = {"0.0.0.0", "::", "[::]"}
@@ -117,7 +117,65 @@ def desired_stdio(command: str, args: list[str]) -> dict[str, Any]:
     return {"command": command, "args": args}
 
 
-def apply_entry(path: Path, desired: dict[str, Any]) -> str:
+def desired_for_client(name: str, desired: dict[str, Any]) -> dict[str, Any]:
+    """Add discriminators required by clients without leaking them to others."""
+    if name != "claude":
+        return desired
+    if "url" in desired:
+        return {"type": "http", **desired}
+    return {"type": "stdio", **desired}
+
+
+def apply_toml_entry(path: Path, server_name: str, desired: dict[str, Any]) -> str:
+    if not path.parent.is_dir():
+        return "skipped (dir not found)"
+    if not path.is_file():
+        path.write_text("", encoding="utf-8")
+
+    text = path.read_text(encoding="utf-8")
+    header = f"[mcp_servers.{server_name}]"
+    lines = text.splitlines()
+    try:
+        start = lines.index(header)
+    except ValueError:
+        if lines and lines[-1].strip():
+            lines.append("")
+        start = len(lines)
+        lines.append(header)
+    end = start + 1
+    while end < len(lines) and not lines[end].startswith("["):
+        end += 1
+
+    preserved = [
+        line
+        for line in lines[start + 1 : end]
+        if not line.lstrip().startswith(("url =", "command =", "args =", "env =", "type ="))
+    ]
+    while preserved and not preserved[-1].strip():
+        preserved.pop()
+    transport_lines: list[str]
+    if "url" in desired:
+        transport_lines = [f"url = {json.dumps(desired['url'])}"]
+    else:
+        transport_lines = [f"command = {json.dumps(desired['command'])}"]
+        if desired.get("args"):
+            transport_lines.append(f"args = {json.dumps(desired['args'])}")
+    replacement = [header, *transport_lines, *preserved, ""]
+    rendered = "\n".join([*lines[:start], *replacement, *lines[end:]]).rstrip() + "\n"
+    if rendered == text:
+        return "already configured"
+    path.write_text(rendered, encoding="utf-8")
+    return "configured"
+
+
+def apply_entry(
+    path: Path,
+    desired: dict[str, Any],
+    server_name: str = "aicx",
+    config_format: str = "json",
+) -> str:
+    if config_format == "toml":
+        return apply_toml_entry(path, server_name, desired)
     if not path.parent.is_dir():
         return "skipped (dir not found)"
     if not path.is_file():
@@ -131,9 +189,9 @@ def apply_entry(path: Path, desired: dict[str, Any]) -> str:
     servers = data.setdefault("mcpServers", {})
     if not isinstance(servers, dict):
         return "failed (mcpServers is not an object)"
-    if servers.get("aicx") == desired:
+    if servers.get(server_name) == desired:
         return "already configured"
-    servers["aicx"] = desired
+    servers[server_name] = desired
     serialized = json.dumps(data, indent=2) + "\n"
     path.write_text(serialized, encoding="utf-8")
     return "configured"
@@ -151,12 +209,17 @@ def default_plist() -> Path:
 
 
 def wire_targets(
-    targets: list[tuple[str, Path]],
+    targets: list[tuple[str, Path, str, str]],
     desired: dict[str, Any],
 ) -> int:
     failures = 0
-    for name, path in targets:
-        status = apply_entry(path, desired)
+    for name, path, server_name, config_format in targets:
+        status = apply_entry(
+            path,
+            desired_for_client(name, desired),
+            server_name,
+            config_format,
+        )
         print(f"  [{name}] {status}: {path}")
         if status.startswith("failed"):
             failures += 1
@@ -178,6 +241,16 @@ def self_test() -> int:
     check("ipv6 wildcard becomes loopback", client_url("::", "8044") == "http://127.0.0.1:8044/mcp")
     check("tailscale host kept", client_url("100.82.232.70", "8044") == "http://100.82.232.70:8044/mcp")
     check("ipv6 literal is bracketed", client_url("::1", "8044") == "http://[::1]:8044/mcp")
+    check(
+        "claude HTTP keeps required transport discriminator",
+        desired_for_client("claude", desired_http("http://127.0.0.1:8044/mcp", None))
+        == {"type": "http", "url": "http://127.0.0.1:8044/mcp"},
+    )
+    check(
+        "other clients keep URL-only HTTP shape",
+        desired_for_client("codex", desired_http("http://127.0.0.1:8044/mcp", None))
+        == {"url": "http://127.0.0.1:8044/mcp"},
+    )
 
     with tempfile.TemporaryDirectory() as raw:
         root = Path(raw)
@@ -205,6 +278,27 @@ def self_test() -> int:
         again = apply_entry(settings, desired_http("http://127.0.0.1:8044/mcp", None))
         check("http idempotent", again == "already configured")
 
+        toml_settings = root / "config.toml"
+        toml_settings.write_text('[mcp_servers.other]\ncommand = "keep-me"\n', encoding="utf-8")
+        toml_status = apply_toml_entry(
+            toml_settings,
+            "aicx-local",
+            desired_http("http://127.0.0.1:8044/mcp", None),
+        )
+        try:
+            import tomllib
+
+            toml_payload = tomllib.loads(toml_settings.read_text(encoding="utf-8"))
+        except (ImportError, ValueError):
+            toml_payload = {}
+        check("toml append reports configured", toml_status == "configured")
+        check(
+            "toml append is valid and preserves existing servers",
+            toml_payload.get("mcp_servers", {}).get("other", {}).get("command") == "keep-me"
+            and toml_payload.get("mcp_servers", {}).get("aicx-local", {}).get("url")
+            == "http://127.0.0.1:8044/mcp",
+        )
+
         with_token = apply_entry(
             settings, desired_http("http://127.0.0.1:8044/mcp", "unit-test-token")
         )
@@ -219,6 +313,24 @@ def self_test() -> int:
 
         missing_dir = apply_entry(root / "nope" / "settings.json", desired_stdio("/bin/aicx-mcp", []))
         check("missing dir is skipped", missing_dir == "skipped (dir not found)")
+
+        codex = root / "config.toml"
+        codex.write_text(
+            '[mcp_servers.aicx-local]\ncommand = "/old/aicx-mcp"\n\n'
+            '[mcp_servers.aicx-local.tools.aicx_search]\napproval_mode = "approve"\n',
+            encoding="utf-8",
+        )
+        status = apply_entry(
+            codex,
+            desired_http("http://127.0.0.1:8044/mcp", None),
+            "aicx-local",
+            "toml",
+        )
+        rendered = codex.read_text(encoding="utf-8")
+        check("codex toml reports configured", status == "configured")
+        check("codex toml drops command", 'command = "/old/aicx-mcp"' not in rendered)
+        check("codex toml writes url", 'url = "http://127.0.0.1:8044/mcp"' in rendered)
+        check("codex tool approvals preserved", "approval_mode = \"approve\"" in rendered)
 
         plist = root / "io.vetcoders.aicx.mcp.plist"
         plist.write_bytes(
@@ -262,6 +374,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--port")
     parser.add_argument("--plist")
     parser.add_argument("--token-file")
+    parser.add_argument("--no-auth", action="store_true")
     parser.add_argument("--command")
     parser.add_argument("--args-json", default="[]")
     return parser.parse_args(argv)
@@ -285,8 +398,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.transport == "http":
         token_path = Path(args.token_file) if args.token_file else default_token_file()
-        token = read_token(token_path)
-        if token is None and args.token_file:
+        token = None if args.no_auth else read_token(token_path)
+        if token is None and args.token_file and not args.no_auth:
             print(
                 "  warning: MCP HTTP is token-gated; no readable token file, writing url only",
                 file=sys.stderr,
@@ -306,11 +419,18 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         desired = desired_stdio(args.command, parsed_args)
 
-    targets: list[tuple[str, Path]] = []
+    targets: list[tuple[str, Path, str, str]] = []
     if args.wire_defaults:
         targets.extend(DEFAULT_TARGETS)
     for index, raw in enumerate(args.settings):
-        targets.append((args.name if len(args.settings) == 1 else f"{args.name}-{index}", Path(raw)))
+        targets.append(
+            (
+                args.name if len(args.settings) == 1 else f"{args.name}-{index}",
+                Path(raw),
+                args.name,
+                "json",
+            )
+        )
     if not targets:
         print("error: pass --wire-defaults and/or --settings", file=sys.stderr)
         return 2

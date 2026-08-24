@@ -23,22 +23,13 @@ In multi-agent environments (fleet of 10–50 agents: Codex, Claude, Gemini, Ant
 
 ## 2. Service 1: `aicx-mcp` (Memory & Intent Search Engine)
 
-The installed service binds to `127.0.0.1` by default. Tailnet exposure is an
-explicit operator choice:
-
-```bash
-AICX_MCP_HOST="$(tailscale ip -4)" \
-  AICX_MCP_ALLOWED_HOSTS="$(hostname -s),$(tailscale ip -4),localhost,127.0.0.1" \
-  make install-service
-```
-
-Keep client URLs on loopback unless the client actually runs on another trusted
-Tailnet machine. Never commit the generated token value; use the token file or a
-client-specific environment/header mechanism.
+The installed service binds only to `127.0.0.1` and uses no auth because it is
+not network-reachable. Tailnet/LAN exposure is a separate, explicit deployment
+profile; do not turn the local LaunchAgent into a remote route.
 
 ### 2.1. Live Refresh Behavior
-* **Is `aicx serve` live?** **Yes.** `aicx serve` does not freeze a stale in-memory copy of the index. Every tool invocation (`aicx_search`, `aicx_steer`, `aicx_intents`) reads the live Tantivy and vector store state from disk (`~/.aicx/`).
-* **Ingestion cadence:** HTTP mode owns a bounded async refresh loop: every 5 minutes it refreshes the hot 48-hour catalog window and incrementally publishes the lexical index. The blocking filesystem/index work runs outside Tokio request workers. Use `--refresh-interval-seconds` to tune it or `--no-auto-refresh` only when another explicit writer owns freshness.
+* **Is `aicx-mcp` live?** **Yes.** The HTTP daemon reads the published Tantivy CURRENT from disk on every tool invocation and owns the bounded lexical refresh loop.
+* **Ingestion cadence:** HTTP mode owns a bounded async refresh loop: every 30 minutes it refreshes the hot 48-hour catalog window and incrementally publishes the lexical index. The blocking filesystem/index work runs outside Tokio request workers. Use `--refresh-interval-seconds` to tune it or `--no-auto-refresh` only when another explicit writer owns freshness.
 
 ### 2.2. Installation & Makefile Targets
 * **Standard install (with wizard):**
@@ -46,7 +37,7 @@ client-specific environment/header mechanism.
   cd /Volumes/vc-workspace/Loctree/aicx
   make install
   ```
-  *(Runs `install.sh`, installs binaries, registers `io.vetcoders.aicx.mcp`, and writes Claude/Codex/Gemini `mcpServers.aicx` as `{"url":"http://127.0.0.1:8044/mcp"}` — not stdio `command`. That server owns index refresh. `AICX_SKIP_MCP_SERVICE=1` keeps stdio.)*
+  *(Runs `install.sh`, installs binaries, registers the no-auth loopback `io.vetcoders.aicx.mcp`, and writes Claude/Codex/Gemini AICX entries as `{"url":"http://127.0.0.1:8044/mcp"}` — not stdio `command`. That server owns index refresh. `AICX_SKIP_MCP_SERVICE=1` keeps stdio.)*
 
 * **Explicit service management:**
   ```bash
@@ -62,7 +53,6 @@ curl -s http://127.0.0.1:8044/health && echo " (Health: OK)"
 
 # 2. Handshake MCP
 curl -s \
-  -H "Authorization: Bearer $(cat ~/.aicx/auth-token)" \
   -H "Accept: application/json, text/event-stream" \
   -H "Content-Type: application/json" \
   -X POST http://127.0.0.1:8044/mcp \
@@ -141,10 +131,7 @@ curl -s \
 {
   "mcpServers": {
     "aicx": {
-      "url": "http://127.0.0.1:8044/mcp",
-      "headers": {
-        "Authorization": "Bearer <AICX_LOCAL_TOKEN>"
-      }
+      "url": "http://127.0.0.1:8044/mcp"
     },
     "loctree": {
       "url": "http://127.0.0.1:5174/mcp"
@@ -158,7 +145,6 @@ curl -s \
 ```toml
 [mcp_servers.aicx]
 url = "http://127.0.0.1:8044/mcp"
-bearer_token_env_var = "AICX_MCP_TOKEN"
 
 [mcp_servers.aicx.tools.aicx_search]
 approval_mode = "approve"
@@ -181,7 +167,7 @@ The services are configured as LaunchAgents in `~/Library/LaunchAgents/` with `R
 
 | Service Label | Command | Default Port | Log Destination |
 | :--- | :--- | :--- | :--- |
-| **`io.vetcoders.aicx.mcp`** | `aicx serve --transport http` | `8044` | `~/.aicx/logs/aicx-serve-http.log` |
+| **`io.vetcoders.aicx.mcp`** | `~/.local/bin/aicx-mcp --transport http --host 127.0.0.1 --port 8044 --no-require-auth --refresh-interval-seconds 1800` | `8044` | `~/.aicx/logs/aicx-serve-http.log` |
 | **`io.vetcoders.loctree.mcp`** | `loctree-mcp --transport http` | `5174` | `~/.loctree/logs/loctree-serve-http.log` |
 
 The former `io.vetcoders.aicx.reindex` timer is removed when the HTTP service is installed, preventing two competing index writers.

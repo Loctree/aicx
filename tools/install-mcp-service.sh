@@ -3,7 +3,8 @@ set -euo pipefail
 # install-mcp-service.sh — background HTTP MCP server daemon for AICX (macOS launchd).
 #
 # Installs a per-user LaunchAgent that runs
-#   aicx serve --transport http
+#   ~/.local/bin/aicx-mcp --transport http --host 127.0.0.1 --port 8044
+#     --no-require-auth --refresh-interval-seconds 1800
 # with KeepAlive=true, so the Streamable HTTP MCP service stays available 24/7
 # across machine restarts without manual intervention.
 #
@@ -13,12 +14,11 @@ set -euo pipefail
 #
 # Env overrides:
 #   AICX_MCP_PORT          port for HTTP transport (default 8044)
-#   AICX_MCP_HOST          bind host (default: 127.0.0.1; set a Tailscale IP explicitly for remote access)
-#   AICX_MCP_ALLOWED_HOSTS comma-separated allowed Host headers (default: loopback + bind host)
+#   AICX_MCP_REFRESH_INTERVAL refresh cadence in seconds (default: 1800)
 #   AICX_MCP_RUST_LOG      tracing filter for the LaunchAgent (default below).
 #                          Do not use `aicx serve --verbose` — that flag only
 #                          echoes per-file extractor warnings, not MCP/HTTP.
-#   AICX_BIN               explicit aicx binary path (default: resolve from PATH / ~/.local/bin / ~/.cargo/bin)
+#   AICX_MCP_BIN           explicit aicx-mcp path (default: ~/.local/bin/aicx-mcp)
 #   AICX_SKIP_MCP_CLIENTS  set to 1 to install the LaunchAgent without rewriting
 #                          Claude/Codex/Gemini settings (install.sh uses this)
 #
@@ -30,6 +30,7 @@ LABEL="io.vetcoders.aicx.mcp"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 LOG_DIR="$HOME/.aicx/logs"
 PORT="${AICX_MCP_PORT:-8044}"
+REFRESH_INTERVAL="${AICX_MCP_REFRESH_INTERVAL:-1800}"
 
 note() { printf '  %s\n' "$*"; }
 
@@ -47,48 +48,23 @@ if [ "${1:-}" = "--uninstall" ]; then
   exit 0
 fi
 
-# Resolve binary
-AICX_BIN="${AICX_BIN:-}"
-if [ -z "$AICX_BIN" ]; then
-  if [ -x "$HOME/.local/bin/aicx" ]; then
-    AICX_BIN="$HOME/.local/bin/aicx"
-  elif [ -x "$HOME/.cargo/bin/aicx" ]; then
-    AICX_BIN="$HOME/.cargo/bin/aicx"
-  else
-    AICX_BIN="$(command -v aicx || true)"
-  fi
-fi
-
-if [ -z "$AICX_BIN" ] || [ ! -x "$AICX_BIN" ]; then
-  note "mcp service: skipped (aicx not found — build/install aicx first)"
+# Pin the service executable. User-facing service installs must never drift to
+# a bare PATH or ~/.cargo/bin fallback.
+AICX_MCP_BIN="${AICX_MCP_BIN:-$HOME/.local/bin/aicx-mcp}"
+if [ ! -x "$AICX_MCP_BIN" ]; then
+  note "mcp service: skipped ($AICX_MCP_BIN is not executable)"
   exit 0
 fi
+AICX_DIR="$(dirname "$AICX_MCP_BIN")"
 
-AICX_DIR="$(dirname "$AICX_BIN")"
+# This LaunchAgent profile is deliberately local-only and unauthenticated.
+# Remote exposure requires a separate, auth-enabled deployment profile.
+HOST="127.0.0.1"
 
-# Local-only is the safe and portable default. Tailnet exposure is an explicit
-# operator decision: AICX_MCP_HOST="$(tailscale ip -4)" make install-service.
-HOST="${AICX_MCP_HOST:-127.0.0.1}"
-
-# Build allowed-host arguments as plist entries, not a shell command string.
-# This keeps operator-provided hostnames out of shell parsing entirely.
-ALLOWED_ARGS_XML=""
-SEEN_HOSTS="|"
-IFS=',' read -ra HOSTS <<< "${AICX_MCP_ALLOWED_HOSTS:-localhost,127.0.0.1,::1,$HOST}"
-for h in "${HOSTS[@]}"; do
-  h_trimmed="$(echo "$h" | xargs)"
-  if [ -n "$h_trimmed" ] && [[ "$SEEN_HOSTS" != *"|$h_trimmed|"* ]]; then
-    SEEN_HOSTS="$SEEN_HOSTS$h_trimmed|"
-    h_xml="$(printf '%s' "$h_trimmed" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g' -e "s/'/\&apos;/g")"
-    ALLOWED_ARGS_XML="$ALLOWED_ARGS_XML
-    <string>--allowed-host</string>
-    <string>$h_xml</string>"
-  fi
-done
-
-AICX_BIN_XML="$(printf '%s' "$AICX_BIN" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g' -e "s/'/\&apos;/g")"
+AICX_MCP_BIN_XML="$(printf '%s' "$AICX_MCP_BIN" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g' -e "s/'/\&apos;/g")"
 HOST_XML="$(printf '%s' "$HOST" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g' -e "s/'/\&apos;/g")"
 PORT_XML="$(printf '%s' "$PORT" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g' -e "s/'/\&apos;/g")"
+REFRESH_INTERVAL_XML="$(printf '%s' "$REFRESH_INTERVAL" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g' -e "s/'/\&apos;/g")"
 PATH_XML="$(printf '%s' "$AICX_DIR:/usr/bin:/bin:$HOME/.local/bin:$HOME/.cargo/bin:/opt/homebrew/bin" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g' -e "s/'/\&apos;/g")"
 # Default: tool-name audit + refresh ticks + rmcp session lifecycle.
 # Not `info` globally — that floods hyper/h2. Not `--verbose` — extractor only.
@@ -106,14 +82,16 @@ cat > "$PLIST" <<PLIST_EOF
   <string>$LABEL</string>
   <key>ProgramArguments</key>
   <array>
-    <string>$AICX_BIN_XML</string>
-    <string>serve</string>
+    <string>$AICX_MCP_BIN_XML</string>
     <string>--transport</string>
     <string>http</string>
     <string>--host</string>
     <string>$HOST_XML</string>
     <string>--port</string>
-    <string>$PORT_XML</string>$ALLOWED_ARGS_XML
+    <string>$PORT_XML</string>
+    <string>--no-require-auth</string>
+    <string>--refresh-interval-seconds</string>
+    <string>$REFRESH_INTERVAL_XML</string>
   </array>
   <key>EnvironmentVariables</key>
   <dict>
@@ -145,7 +123,7 @@ if [ "${AICX_SKIP_MCP_CLIENTS:-0}" != "1" ]; then
       --wire-defaults \
       --transport http \
       --plist "$PLIST" \
-      --token-file "${AICX_HOME:-$HOME/.aicx}/auth-token" || \
+      --no-auth || \
       note "mcp clients: HTTP wiring failed (non-fatal)"
   fi
 fi
@@ -192,7 +170,7 @@ if service_loaded; then
   launchctl bootout "$(gui_domain)/io.vetcoders.aicx.reindex" 2>/dev/null || true
   rm -f "$HOME/Library/LaunchAgents/io.vetcoders.aicx.reindex.plist"
   note "mcp service: running on http://$HOST:$PORT/mcp via $LABEL"
-  note "index refresh: owned by the MCP server (default every 5m)"
+  note "index refresh: owned by the MCP server (every ${REFRESH_INTERVAL}s)"
   note "mcp service logs: $LOG_DIR/aicx-serve-http.log"
 else
   note "mcp service: plist written to $PLIST (bootstrap failed in this Aqua session)"

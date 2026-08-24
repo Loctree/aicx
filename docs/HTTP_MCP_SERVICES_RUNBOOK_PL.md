@@ -23,22 +23,14 @@ W środowiskach wieloagentowych (flota 10–50 agentów Codex, Claude, Gemini, A
 
 ## 2. Serwis 1: `aicx-mcp` (Silnik Pamięci i Wyszukiwania Intencji)
 
-Instalowana usługa domyślnie nasłuchuje wyłącznie na `127.0.0.1`. Wystawienie
-jej do Tailnetu jest jawną decyzją operatora:
-
-```bash
-AICX_MCP_HOST="$(tailscale ip -4)" \
-  AICX_MCP_ALLOWED_HOSTS="$(hostname -s),$(tailscale ip -4),localhost,127.0.0.1" \
-  make install-service
-```
-
-Adres klienta pozostaw na loopbacku, chyba że klient faktycznie działa na innej
-zaufanej maszynie Tailnetu. Nie commituj wartości wygenerowanego tokena — użyj
-pliku tokena albo mechanizmu zmiennej/nagłówka danego klienta.
+Instalowana usługa nasłuchuje wyłącznie na `127.0.0.1` i nie wymaga auth,
+ponieważ nie jest osiągalna z sieci. Wystawienie do Tailnetu/LAN jest osobnym,
+jawnym profilem wdrożenia; lokalnego LaunchAgenta nie należy zamieniać w trasę
+zdalną.
 
 ### 2.1. Odświeżanie na Żywo (Live Refresh)
-* **Czy `aicx serve` odświeża się na żywo?** **Tak.** `aicx serve` nie zamraża stanu indeksu w RAM na stałe. Każde zapytanie narzędzia (`aicx_search`, `aicx_steer`, `aicx_intents`) odpytuje bezpośrednio bieżący stan bazy Tantivy oraz wektorów z dysku (`~/.aicx/`).
-* **Cykl indeksowania:** Tryb HTTP ma własną ograniczoną pętlę async: co 5 minut odświeża gorące 48 godzin katalogu i inkrementalnie publikuje indeks leksykalny. Blokująca praca plikowa i indeksowanie wykonują się poza workerami requestów Tokio. Interwał zmienisz przez `--refresh-interval-seconds`; `--no-auto-refresh` ma sens tylko wtedy, gdy świeżość ma innego jawnego właściciela.
+* **Czy `aicx-mcp` odświeża się na żywo?** **Tak.** Daemon HTTP czyta opublikowany Tantivy CURRENT z dysku przy każdym wywołaniu narzędzia i jest właścicielem ograniczonej pętli odświeżania leksykalnego.
+* **Cykl indeksowania:** Tryb HTTP ma własną ograniczoną pętlę async: co 30 minut odświeża gorące 48 godzin katalogu i inkrementalnie publikuje indeks leksykalny. Blokująca praca plikowa i indeksowanie wykonują się poza workerami requestów Tokio. Interwał zmienisz przez `--refresh-interval-seconds`; `--no-auto-refresh` ma sens tylko wtedy, gdy świeżość ma innego jawnego właściciela.
 
 ### 2.2. Instalacja i Cele w Makefile
 * **Standardowa instalacja (z kreatorem):**
@@ -62,7 +54,6 @@ curl -s http://127.0.0.1:8044/health && echo " (Health: OK)"
 
 # 2. Handshake MCP
 curl -s \
-  -H "Authorization: Bearer $(cat ~/.aicx/auth-token)" \
   -H "Accept: application/json, text/event-stream" \
   -H "Content-Type: application/json" \
   -X POST http://127.0.0.1:8044/mcp \
@@ -141,10 +132,7 @@ curl -s \
 {
   "mcpServers": {
     "aicx": {
-      "url": "http://127.0.0.1:8044/mcp",
-      "headers": {
-        "Authorization": "Bearer <TOKEN_Z_~/.aicx/auth-token>"
-      }
+      "url": "http://127.0.0.1:8044/mcp"
     },
     "loctree": {
       "url": "http://127.0.0.1:5174/mcp"
@@ -156,7 +144,6 @@ curl -s \
 Lub przez CLI:
 ```bash
 claude mcp add --scope user --transport http \
-  --header "Authorization: Bearer $(cat ~/.aicx/auth-token)" \
   aicx http://127.0.0.1:8044/mcp
 
 claude mcp add --scope user --transport http \
@@ -168,7 +155,6 @@ claude mcp add --scope user --transport http \
 ```toml
 [mcp_servers.aicx]
 url = "http://127.0.0.1:8044/mcp"
-bearer_token_env_var = "AICX_MCP_TOKEN"
 
 [mcp_servers.aicx.tools.aicx_search]
 approval_mode = "approve"
@@ -191,7 +177,7 @@ Serwisy są zarejestrowane jako per-user LaunchAgents w `~/Library/LaunchAgents/
 
 | Identyfikator Serwisu | Polecenie | Domyślny Port | Cel Logowania |
 | :--- | :--- | :--- | :--- |
-| **`io.vetcoders.aicx.mcp`** | `aicx serve --transport http` | `8044` | `~/.aicx/logs/aicx-serve-http.log` |
+| **`io.vetcoders.aicx.mcp`** | `~/.local/bin/aicx-mcp --transport http --host 127.0.0.1 --port 8044 --no-require-auth --refresh-interval-seconds 1800` | `8044` | `~/.aicx/logs/aicx-serve-http.log` |
 | **`io.vetcoders.loctree.mcp`** | `loctree-mcp --transport http` | `5174` | `~/.loctree/logs/loctree-serve-http.log` |
 
 Poprzedni timer `io.vetcoders.aicx.reindex` jest usuwany przy instalacji serwera HTTP, aby nie utrzymywać dwóch konkurujących writerów indeksu.
