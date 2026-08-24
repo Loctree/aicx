@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 
 const { execFileSync, spawnSync } = require("child_process");
-const { existsSync, realpathSync } = require("fs");
+const { existsSync, readFileSync, realpathSync } = require("fs");
+const { homedir } = require("os");
 const { dirname, isAbsolute, relative, sep } = require("path");
 
 const PLATFORM_PACKAGES = Object.freeze({
@@ -199,7 +200,32 @@ function execBinarySync(binaryName, args = []) {
 }
 
 function execAicx(args = [], options = {}) {
+  maybePrintRuntimeMigrationHint(args);
   return execBinary("aicx", args, options);
+}
+
+function maybePrintRuntimeMigrationHint(args = []) {
+  if (process.platform !== "darwin" || args.includes("--repair-runtime")) {
+    return;
+  }
+  const launchAgents = `${homedir()}${sep}Library${sep}LaunchAgents`;
+  const plistPath = [
+    `${launchAgents}${sep}com.loctree.aicx.mcp.plist`,
+    `${launchAgents}${sep}io.vetcoders.aicx.mcp.plist`,
+  ].find(existsSync);
+  if (!plistPath) {
+    return;
+  }
+  try {
+    if (!readFileSync(plistPath, "utf8").includes("--no-auto-refresh")) {
+      process.stderr.write(
+        "[aicx] Background runtime needs a one-time migration: aicx doctor --repair-runtime\n"
+      );
+    }
+  } catch (error) {
+    // The native CLI remains authoritative. A best-effort hint must never
+    // prevent a command from running because a plist became unreadable.
+  }
 }
 
 function execAicxSync(args = []) {
@@ -221,10 +247,12 @@ module.exports = {
   execAicxMcpSync,
   getBinaryPath,
   getPlatformPackageName,
+  maybePrintRuntimeMigrationHint,
   resolvePlatformBinaryPath,
   resolvePlatformPackageRoot,
 };
 
 if (require.main === module) {
+  process.env.AICX_RUNTIME_BIN ||= process.argv[1];
   execAicx(process.argv.slice(2));
 }
