@@ -8582,6 +8582,9 @@ fn print_index_status_text(status: &aicx::IndexStatus) {
             .unwrap_or_else(|| "<unknown>".to_string())
     );
     eprintln!("  pending_chunks:         {}", status.pending_chunks);
+    eprintln!("  source_drift:           {}", status.source_drift);
+    eprintln!("  deferred_live:          {}", status.deferred_live);
+    eprintln!("  retryable_error:        {}", status.retryable_error);
     eprintln!("  temp_index_present:     {}", status.temp_index_present);
     eprintln!(
         "  temp_index_path:        {}",

@@ -193,6 +193,19 @@ owner host, then `aicx search --deep`.
 
 Incremental reuse is gated by the live source fingerprint. A changed existing
 session reparses on the next run even when no catalog rebuild happened.
+
+Index status keeps three independent truths:
+
+- `pending_chunks` counts snapshot documents missing from CURRENT;
+- `retryable_error` counts source/parser gaps that still block publication;
+- `source_drift` and `deferred_live` report sources that moved after the
+  published snapshot. They remain visible but do not make an otherwise
+  complete, searchable CURRENT unready.
+
+Thus `lexical_status=ready`, `pending_chunks=0`, `retryable_error=0`, and
+`readiness=ready` can truthfully coexist with non-zero `source_drift` and
+`deferred_live`. A later stable `catalog refresh` plus ordinary `aicx index`
+admits the newer source snapshot and returns both drift counters to zero.
 `--semantic` will rebuild when dense is missing even if lexical CURRENT
 already matches.
 

@@ -772,9 +772,16 @@ fn prune_unreferenced_hybrid_generations(
 /// Only lexical-only source generations qualify. Legacy store/NDJSON
 /// generations are never mistaken for a source-driven no-op.
 pub fn source_lexical_generation_matches(source_fingerprint: &str) -> Result<bool> {
+    source_lexical_generation_matches_at(&crate::aicx_home::resolve()?, source_fingerprint)
+}
+
+pub(crate) fn source_lexical_generation_matches_at(
+    base: &Path,
+    source_fingerprint: &str,
+) -> Result<bool> {
     use aicx_retrieve::LexicalIndex;
 
-    let path = hybrid_manifest_path(None)?;
+    let path = hybrid_manifest_path_at(base, None)?;
     if !path.is_file() {
         return Ok(false);
     }
@@ -816,7 +823,11 @@ pub fn source_lexical_generation_matches(source_fingerprint: &str) -> Result<boo
 }
 
 pub fn current_lexical_doc_count() -> Result<Option<usize>> {
-    let path = hybrid_manifest_path(None)?;
+    current_lexical_doc_count_at(&crate::aicx_home::resolve()?)
+}
+
+pub(crate) fn current_lexical_doc_count_at(base: &Path) -> Result<Option<usize>> {
+    let path = hybrid_manifest_path_at(base, None)?;
     if !path.is_file() {
         return Ok(None);
     }
@@ -834,12 +845,20 @@ pub fn publish_source_lexical_generation(
     chunks: &[aicx_retrieve::ChunkRef],
     source_fingerprint: &str,
 ) -> Result<aicx_retrieve::Manifest> {
+    publish_source_lexical_generation_at(&crate::aicx_home::resolve()?, chunks, source_fingerprint)
+}
+
+pub(crate) fn publish_source_lexical_generation_at(
+    base: &Path,
+    chunks: &[aicx_retrieve::ChunkRef],
+    source_fingerprint: &str,
+) -> Result<aicx_retrieve::Manifest> {
     use aicx_retrieve::{LexicalIndex, Manifest, TantivyAdapter};
 
     if chunks.is_empty() {
         anyhow::bail!("cannot publish an empty source lexical generation");
     }
-    let hybrid_root = hybrid_root_dir(None)?;
+    let hybrid_root = hybrid_root_dir_at(base, None)?;
     let generation_dir = hybrid_root
         .join(HYBRID_GENERATIONS_DIR_NAME)
         .join(generation_dir_name(&Manifest::fresh_generation_id()));
@@ -889,6 +908,22 @@ pub fn publish_source_hybrid_generation(
     source_fingerprint: &str,
     fingerprint: &aicx_retrieve::EmbedderFingerprint,
 ) -> Result<aicx_retrieve::Manifest> {
+    publish_source_hybrid_generation_at(
+        &crate::aicx_home::resolve()?,
+        chunks,
+        dense_chunks,
+        source_fingerprint,
+        fingerprint,
+    )
+}
+
+pub(crate) fn publish_source_hybrid_generation_at(
+    base: &Path,
+    chunks: &[aicx_retrieve::ChunkRef],
+    dense_chunks: &[aicx_retrieve::DenseChunkRef],
+    source_fingerprint: &str,
+    fingerprint: &aicx_retrieve::EmbedderFingerprint,
+) -> Result<aicx_retrieve::Manifest> {
     use aicx_retrieve::{
         HybridIndex, Manifest, MmapDenseAdapter, ReciprocalRankFusion, TantivyAdapter,
     };
@@ -916,7 +951,7 @@ pub fn publish_source_hybrid_generation(
         }
     }
 
-    let hybrid_root = hybrid_root_dir(None)?;
+    let hybrid_root = hybrid_root_dir_at(base, None)?;
     let generation_dir = hybrid_root
         .join(HYBRID_GENERATIONS_DIR_NAME)
         .join(generation_dir_name(&Manifest::fresh_generation_id()));
@@ -948,7 +983,11 @@ pub fn publish_source_hybrid_generation(
 
 /// True when CURRENT is lexical-only (`optional_not_built`) or missing dense mmap.
 pub fn current_dense_not_built() -> Result<bool> {
-    let path = hybrid_manifest_path(None)?;
+    current_dense_not_built_at(&crate::aicx_home::resolve()?)
+}
+
+pub(crate) fn current_dense_not_built_at(base: &Path) -> Result<bool> {
+    let path = hybrid_manifest_path_at(base, None)?;
     if !path.is_file() {
         return Ok(true);
     }
@@ -969,6 +1008,10 @@ pub fn current_dense_not_built() -> Result<bool> {
 
 pub fn hybrid_manifest_path(project: Option<&str>) -> Result<PathBuf> {
     Ok(hybrid_index_dir(project)?.join("manifest.json"))
+}
+
+pub(crate) fn hybrid_manifest_path_at(base: &Path, project: Option<&str>) -> Result<PathBuf> {
+    Ok(resolve_hybrid_generation_dir(&hybrid_root_dir_at(base, project)?).join("manifest.json"))
 }
 
 /// Legacy NDJSON dense twin location inside the resolved generation dir.

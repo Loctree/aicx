@@ -242,6 +242,12 @@ struct SourceDispositionRecord {
     signal_frames: usize,
     #[serde(default)]
     filtered_frames: usize,
+    /// Whether snapshot bytes were fully classified before the live source moved.
+    #[serde(default)]
+    snapshot_complete: bool,
+    /// Whether that complete snapshot classification produced a lexical document.
+    #[serde(default)]
+    snapshot_indexed: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -252,6 +258,8 @@ pub(crate) struct SourceAccounting {
     pub terminal_skip: usize,
     pub retryable_error: usize,
     pub deferred_live_changed: usize,
+    pub deferred_live_incomplete: usize,
+    pub deferred_live_indexed: usize,
     pub source_drift: usize,
     pub source_fingerprint: String,
     pub snapshot_matches: Option<bool>,
@@ -266,13 +274,22 @@ impl SourceAccounting {
                 + self.retryable_error
                 + self.deferred_live_changed
             && self.retryable_error == 0
-            && self.deferred_live_changed == 0
+            && self.deferred_live_incomplete == 0
     }
 
     pub(crate) fn lexical_pending(&self, lexical_docs: usize) -> usize {
-        self.indexed.saturating_sub(lexical_docs)
+        self.expected_lexical_documents()
+            .saturating_sub(lexical_docs)
             + self.retryable_error
-            + self.deferred_live_changed
+            + self.deferred_live_incomplete
+    }
+
+    pub(crate) fn expected_lexical_documents(&self) -> usize {
+        self.indexed + self.deferred_live_indexed
+    }
+
+    pub(crate) fn blocking_source_gaps(&self) -> usize {
+        self.retryable_error + self.deferred_live_incomplete
     }
 }
 
@@ -347,17 +364,20 @@ pub fn build(
     // `--semantic` refuses the lexical-only short-circuit when dense is absent
     // so operators can attach dense to an otherwise current corpus without
     // `--full-rescan`.
-    let dense_missing = crate::vector_index::current_dense_not_built().unwrap_or(true);
+    let dense_missing = crate::vector_index::current_dense_not_built_at(aicx_home).unwrap_or(true);
     let current_accounting = current_source_accounting_at(aicx_home, None);
     if !full_rescan
         && project_filters.is_empty()
-        && crate::vector_index::source_lexical_generation_matches(&source_fingerprint)?
+        && crate::vector_index::source_lexical_generation_matches_at(
+            aicx_home,
+            &source_fingerprint,
+        )?
         && current_accounting.as_ref().is_some_and(|accounting| {
             accounting.snapshot_matches == Some(true) && accounting.is_complete()
         })
         && !(semantic && dense_missing)
     {
-        let (dense_kind, dense_docs) = current_dense_stats();
+        let (dense_kind, dense_docs) = current_dense_stats(aicx_home);
         let accounting = current_accounting.expect("matching accounting checked above");
         return Ok(SourceIndexReport {
             catalog_path: catalog_path.display().to_string(),
@@ -374,13 +394,14 @@ pub fn build(
             signal_frames: 0,
             filtered_frames: 0,
             extracts_written: 0,
-            lexical_docs: crate::vector_index::current_lexical_doc_count()?.unwrap_or(0),
+            lexical_docs: crate::vector_index::current_lexical_doc_count_at(aicx_home)?
+                .unwrap_or(0),
             dense_docs,
             dense_kind,
             semantic_requested: semantic,
             unchanged: true,
             wall_ms: started.elapsed().as_millis() as u64,
-            manifest_path: crate::vector_index::hybrid_manifest_path(None)
+            manifest_path: crate::vector_index::hybrid_manifest_path_at(aicx_home, None)
                 .ok()
                 .map(|path| path.display().to_string()),
             skipped_by_agent: BTreeMap::new(),
@@ -582,24 +603,21 @@ pub fn build(
         signal_frames += signal_count;
         let filtered_count = before.saturating_sub(frames.len());
         filtered_frames += filtered_count;
-        if crate::catalog::live_source_fingerprint(&source_path) != Some(before_fingerprint) {
-            next_state.dispositions.insert(
-                session_key,
-                disposition_record(
+        run_test_source_mutation_hook(&source_path);
+        let deferred_live_changed =
+            crate::catalog::live_source_fingerprint(&source_path) != Some(before_fingerprint);
+        if frames.is_empty() {
+            let record = if deferred_live_changed {
+                complete_deferred_disposition_record(
                     entry,
                     before_fingerprint.0,
                     before_fingerprint.1,
-                    SourceDisposition::DeferredLiveChanged,
                     raw_count,
                     signal_count,
                     filtered_count,
-                ),
-            );
-            continue;
-        }
-        if frames.is_empty() {
-            next_state.dispositions.insert(
-                session_key,
+                    false,
+                )
+            } else {
                 disposition_record(
                     entry,
                     before_fingerprint.0,
@@ -608,15 +626,25 @@ pub fn build(
                     raw_count,
                     signal_count,
                     filtered_count,
-                ),
-            );
+                )
+            };
+            next_state.dispositions.insert(session_key, record);
             continue;
         }
 
         let extract = render_extract(entry, &frames);
         if extract.trim().is_empty() {
-            next_state.dispositions.insert(
-                session_key,
+            let record = if deferred_live_changed {
+                complete_deferred_disposition_record(
+                    entry,
+                    before_fingerprint.0,
+                    before_fingerprint.1,
+                    raw_count,
+                    signal_count,
+                    filtered_count,
+                    false,
+                )
+            } else {
                 disposition_record(
                     entry,
                     before_fingerprint.0,
@@ -625,8 +653,9 @@ pub fn build(
                     raw_count,
                     signal_count,
                     filtered_count,
-                ),
-            );
+                )
+            };
+            next_state.dispositions.insert(session_key, record);
             continue;
         }
         let extract_path = extract_path_for(aicx_home, &entry.agent, &entry.session_id);
@@ -669,8 +698,17 @@ pub fn build(
             text: extract.clone(),
             metadata,
         });
-        next_state.dispositions.insert(
-            session_key.clone(),
+        let disposition = if deferred_live_changed {
+            complete_deferred_disposition_record(
+                entry,
+                before_fingerprint.0,
+                before_fingerprint.1,
+                raw_count,
+                signal_count,
+                filtered_count,
+                true,
+            )
+        } else {
             disposition_record(
                 entry,
                 before_fingerprint.0,
@@ -679,26 +717,26 @@ pub fn build(
                 raw_count,
                 signal_count,
                 filtered_count,
-            ),
-        );
+            )
+        };
+        next_state
+            .dispositions
+            .insert(session_key.clone(), disposition);
 
         if cache_extracts {
             let rel = extract_path
                 .strip_prefix(aicx_home)
                 .map(|p| p.to_path_buf())
                 .unwrap_or_else(|_| extract_path.clone());
-            // Always stamp LIVE stats into the parse ledger so reuse survives
-            // catalog lag (append without catalog rebuild still reuses later
-            // once CURRENT has the new extract).
-            let (source_len, source_mtime_ns) =
-                crate::catalog::live_source_fingerprint(&source_path)
-                    .unwrap_or_else(|| resolve_entry_fingerprint(entry, &source_path));
+            // Bind the cached extract to the exact bytes parsed for this
+            // snapshot. If the live source advanced during the build, the next
+            // run must parse B instead of reusing A under B's fingerprint.
             next_state.sessions.insert(
                 session_key,
                 SessionParseRecord {
                     source_path: entry.source_path.clone(),
-                    source_len,
-                    source_mtime_ns,
+                    source_len: before_fingerprint.0,
+                    source_mtime_ns: before_fingerprint.1,
                     extract_relpath: rel.to_string_lossy().replace('\\', "/"),
                     extract_sha256: sha256_hex(extract.as_bytes()),
                     raw_frames: raw_count,
@@ -729,10 +767,10 @@ pub fn build(
             accounting.total
         );
     }
-    if chunks.len() != accounting.indexed {
+    if chunks.len() != accounting.expected_lexical_documents() {
         anyhow::bail!(
             "source accounting mismatch: {} indexed disposition(s), {} lexical document(s); CURRENT preserved",
-            accounting.indexed,
+            accounting.expected_lexical_documents(),
             chunks.len()
         );
     }
@@ -755,13 +793,14 @@ pub fn build(
         )
     } else if semantic {
         let (dense_chunks, fingerprint) = embed_chunks_for_semantic(&chunks)?;
-        let manifest = crate::vector_index::publish_source_hybrid_generation(
+        let manifest = crate::vector_index::publish_source_hybrid_generation_at(
+            aicx_home,
             &chunks,
             &dense_chunks,
             &source_fingerprint,
             &fingerprint,
         )?;
-        let path = crate::vector_index::hybrid_manifest_path(None)?
+        let path = crate::vector_index::hybrid_manifest_path_at(aicx_home, None)?
             .display()
             .to_string();
         (
@@ -770,9 +809,12 @@ pub fn build(
             manifest.dense_kind,
         )
     } else {
-        let manifest =
-            crate::vector_index::publish_source_lexical_generation(&chunks, &source_fingerprint)?;
-        let path = crate::vector_index::hybrid_manifest_path(None)?
+        let manifest = crate::vector_index::publish_source_lexical_generation_at(
+            aicx_home,
+            &chunks,
+            &source_fingerprint,
+        )?;
+        let path = crate::vector_index::hybrid_manifest_path_at(aicx_home, None)?
             .display()
             .to_string();
         (
@@ -808,8 +850,8 @@ pub fn build(
     })
 }
 
-fn current_dense_stats() -> (String, usize) {
-    let Ok(path) = crate::vector_index::hybrid_manifest_path(None) else {
+fn current_dense_stats(aicx_home: &Path) -> (String, usize) {
+    let Ok(path) = crate::vector_index::hybrid_manifest_path_at(aicx_home, None) else {
         return ("missing".to_string(), 0);
     };
     if !path.is_file() {
@@ -1696,7 +1738,32 @@ fn disposition_record(
         raw_frames,
         signal_frames,
         filtered_frames,
+        snapshot_complete: false,
+        snapshot_indexed: false,
     }
+}
+
+fn complete_deferred_disposition_record(
+    entry: &CatalogEntry,
+    source_len: u64,
+    source_mtime_ns: u64,
+    raw_frames: usize,
+    signal_frames: usize,
+    filtered_frames: usize,
+    snapshot_indexed: bool,
+) -> SourceDispositionRecord {
+    let mut record = disposition_record(
+        entry,
+        source_len,
+        source_mtime_ns,
+        SourceDisposition::DeferredLiveChanged,
+        raw_frames,
+        signal_frames,
+        filtered_frames,
+    );
+    record.snapshot_complete = true;
+    record.snapshot_indexed = snapshot_indexed;
+    record
 }
 
 fn catalog_entry_fingerprint(entry: &CatalogEntry) -> (u64, u64) {
@@ -1731,11 +1798,51 @@ fn accounting_from_state(
             SourceDisposition::ZeroSignal => accounting.zero_signal += 1,
             SourceDisposition::TerminalSkip { .. } => accounting.terminal_skip += 1,
             SourceDisposition::RetryableError { .. } => accounting.retryable_error += 1,
-            SourceDisposition::DeferredLiveChanged => accounting.deferred_live_changed += 1,
+            SourceDisposition::DeferredLiveChanged => {
+                accounting.deferred_live_changed += 1;
+                if record.snapshot_complete {
+                    accounting.deferred_live_indexed += usize::from(record.snapshot_indexed);
+                } else {
+                    accounting.deferred_live_incomplete += 1;
+                }
+            }
         }
     }
     accounting
 }
+
+#[cfg(test)]
+type SourceMutationHook = (PathBuf, Vec<u8>);
+
+#[cfg(test)]
+fn source_mutation_hook() -> &'static std::sync::Mutex<Option<SourceMutationHook>> {
+    static HOOK: std::sync::OnceLock<std::sync::Mutex<Option<SourceMutationHook>>> =
+        std::sync::OnceLock::new();
+    HOOK.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+#[cfg(test)]
+fn install_test_source_mutation_hook(path: PathBuf, replacement: Vec<u8>) {
+    *source_mutation_hook().lock().expect("source mutation hook") = Some((path, replacement));
+}
+
+#[cfg(test)]
+fn run_test_source_mutation_hook(path: &Path) {
+    let mut hook = source_mutation_hook().lock().expect("source mutation hook");
+    if hook.as_ref().is_some_and(|(target, _)| {
+        target == path
+            || fs::canonicalize(target)
+                .ok()
+                .zip(fs::canonicalize(path).ok())
+                .is_some_and(|(target, path)| target == path)
+    }) {
+        let (_, replacement) = hook.take().expect("matching source mutation hook");
+        fs::write(path, replacement).expect("mutate source after snapshot parse");
+    }
+}
+
+#[cfg(not(test))]
+fn run_test_source_mutation_hook(_path: &Path) {}
 
 /// Read durable source accounting and independently verify its live snapshot.
 ///
@@ -1845,6 +1952,8 @@ fn load_parse_state(aicx_home: &Path, repo_path_ignore_fingerprint: &str) -> Sou
                 raw_frames: record.raw_frames,
                 signal_frames: record.signal_frames,
                 filtered_frames: record.filtered_frames,
+                snapshot_complete: false,
+                snapshot_indexed: false,
             });
     }
     state
@@ -2503,6 +2612,8 @@ mod tests {
                     raw_frames: 1,
                     signal_frames: usize::from(ordinal < 10_015),
                     filtered_frames: usize::from(ordinal >= 10_015),
+                    snapshot_complete: false,
+                    snapshot_indexed: false,
                 },
             );
         }
@@ -2537,6 +2648,29 @@ mod tests {
         assert_eq!(retryable.retryable_error, 1);
         assert_eq!(retryable.lexical_pending(10_014), 1);
         assert!(!retryable.is_complete());
+
+        let deferred = state
+            .dispositions
+            .get_mut("codex:session-10014")
+            .expect("deferred fixture");
+        deferred.disposition = SourceDisposition::DeferredLiveChanged;
+        deferred.snapshot_complete = true;
+        deferred.snapshot_indexed = true;
+        let complete_drift = accounting_from_state(&state, None, Some(false));
+        assert_eq!(complete_drift.deferred_live_changed, 1);
+        assert_eq!(complete_drift.deferred_live_indexed, 1);
+        assert_eq!(complete_drift.deferred_live_incomplete, 0);
+        assert_eq!(complete_drift.lexical_pending(10_015), 0);
+        assert!(complete_drift.is_complete());
+
+        state
+            .dispositions
+            .get_mut("codex:session-10014")
+            .expect("incomplete deferred fixture")
+            .snapshot_complete = false;
+        let incomplete_drift = accounting_from_state(&state, None, Some(false));
+        assert_eq!(incomplete_drift.lexical_pending(10_014), 1);
+        assert!(!incomplete_drift.is_complete());
     }
 
     #[test]
@@ -2645,6 +2779,85 @@ mod tests {
         let mut invalid_interior = vec![b'x'; VIBECRAFTED_RETENTION_BYTES];
         invalid_interior[17] = 0x86;
         assert!(decode_vibecrafted_transcript(&invalid_interior).is_err());
+    }
+
+    #[test]
+    fn post_snapshot_live_change_publishes_a_and_next_run_converges_to_b() {
+        let root = std::env::temp_dir().join(format!(
+            "aicx-source-live-deferral-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("catalog")).unwrap();
+        let source_path = root.join("runtime-transcript.log");
+        let snapshot_a = b"snapshot A searchable marker\n".to_vec();
+        let live_b = b"snapshot A searchable marker\npost snapshot B marker\n".to_vec();
+        fs::write(&source_path, &snapshot_a).unwrap();
+        let (source_len, source_mtime_ns) =
+            crate::catalog::live_source_fingerprint(&source_path).unwrap();
+        let mut entry = CatalogEntry {
+            schema: crate::catalog::CATALOG_SCHEMA.to_string(),
+            session_id: "live-drift".to_string(),
+            agent: "vibecrafted".to_string(),
+            project: Some("Loctree/aicx".to_string()),
+            date: None,
+            cwd: None,
+            source_path: source_path.display().to_string(),
+            source_len: Some(source_len),
+            source_mtime_ns: Some(source_mtime_ns),
+            title: None,
+            machine: None,
+            logical_session_id: None,
+        };
+        let write_catalog = |entry: &CatalogEntry| {
+            fs::write(
+                root.join("catalog/sessions.jsonl"),
+                format!("{}\n", serde_json::to_string(entry).unwrap()),
+            )
+            .unwrap();
+        };
+        write_catalog(&entry);
+
+        install_test_source_mutation_hook(source_path.clone(), live_b.clone());
+        let first = build(&root, &[], false, true, true, false)
+            .expect("snapshot A should publish despite post-parse live growth");
+        assert_eq!(first.lexical_docs, 1);
+        assert_eq!(first.deferred_live_changed_sources, 1);
+        assert_eq!(first.retryable_error_sources, 0);
+        let extract = fs::read_to_string(extract_path_for(&root, &entry.agent, &entry.session_id))
+            .expect("snapshot extract");
+        assert!(extract.contains("snapshot A searchable marker"));
+        assert!(!extract.contains("post snapshot B marker"));
+
+        let first_status = crate::api::index_status_at(&root, None).expect("status after A");
+        assert_eq!(first_status.lexical_status, "ready");
+        assert_eq!(first_status.pending_chunks, 0);
+        assert_eq!(first_status.retryable_error, 0);
+        assert_eq!(first_status.source_drift, 1);
+        assert_eq!(first_status.deferred_live, 1);
+        assert_eq!(first_status.readiness, crate::api::IndexReadiness::Ready);
+
+        let (source_len, source_mtime_ns) =
+            crate::catalog::live_source_fingerprint(&source_path).unwrap();
+        entry.source_len = Some(source_len);
+        entry.source_mtime_ns = Some(source_mtime_ns);
+        write_catalog(&entry);
+        let second = build(&root, &[], false, false, true, false)
+            .expect("stable snapshot B should converge");
+        assert_eq!(second.lexical_docs, 1);
+        assert_eq!(second.deferred_live_changed_sources, 0);
+        let extract = fs::read_to_string(extract_path_for(&root, &entry.agent, &entry.session_id))
+            .expect("converged extract");
+        assert!(extract.contains("post snapshot B marker"));
+
+        let second_status = crate::api::index_status_at(&root, None).expect("status after B");
+        assert_eq!(second_status.pending_chunks, 0);
+        assert_eq!(second_status.source_drift, 0);
+        assert_eq!(second_status.deferred_live, 0);
+        assert_eq!(second_status.readiness, crate::api::IndexReadiness::Ready);
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

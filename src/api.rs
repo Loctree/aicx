@@ -258,6 +258,15 @@ pub struct IndexStatus {
     pub semantic_index_mtime: Option<String>,
     pub semantic_lag_secs: Option<u64>,
     pub pending_chunks: usize,
+    /// Live catalog sources whose current fingerprint differs from snapshot CURRENT.
+    #[serde(default)]
+    pub source_drift: usize,
+    /// Drift observed during the build after snapshot bytes were fully classified.
+    #[serde(default)]
+    pub deferred_live: usize,
+    /// Retryable source gaps that still belong to the published snapshot contract.
+    #[serde(default)]
+    pub retryable_error: usize,
     pub temp_index_present: bool,
     pub temp_index_path: Option<String>,
     pub temp_index_rows: usize,
@@ -436,6 +445,9 @@ fn index_status_at_with_sessions(
             semantic_index_mtime: None,
             semantic_lag_secs: None,
             pending_chunks: 0,
+            source_drift: 0,
+            deferred_live: 0,
+            retryable_error: 0,
             temp_index_present: false,
             temp_index_path: None,
             temp_index_rows: 0,
@@ -506,6 +518,9 @@ fn index_status_at_with_sessions(
             semantic_index_mtime: None,
             semantic_lag_secs: None,
             pending_chunks: catalog_in_scope,
+            source_drift: 0,
+            deferred_live: 0,
+            retryable_error: 0,
             temp_index_present: false,
             temp_index_path: None,
             temp_index_rows: 0,
@@ -620,6 +635,9 @@ fn index_status_at_with_sessions(
         semantic_index_mtime: committed_at.clone(),
         semantic_lag_secs,
         pending_chunks,
+        source_drift: 0,
+        deferred_live: 0,
+        retryable_error: 0,
         temp_index_present,
         temp_index_path: temp_index_present.then(|| path_for_json(&temp_index_path)),
         temp_index_rows,
@@ -711,18 +729,12 @@ fn hybrid_current_index_status(base: &Path, project: Option<&str>) -> Result<Opt
         .map(|nanos| nanos as u64);
     let source_accounting = crate::source_index::current_source_accounting_at(base, project);
     let accounting_matches_current = source_accounting.as_ref().is_some_and(|accounting| {
-        accounting.snapshot_matches == Some(true)
-            && aicx_retrieve::source_hash_blake3(&accounting.source_fingerprint)
-                == manifest.source_hash_blake3
+        aicx_retrieve::source_hash_blake3(&accounting.source_fingerprint)
+            == manifest.source_hash_blake3
     });
     let sessions_newer = source_accounting
         .as_ref()
-        .map(|accounting| {
-            accounting.source_drift
-                + usize::from(
-                    accounting.snapshot_matches == Some(true) && !accounting_matches_current,
-                )
-        })
+        .map(|accounting| accounting.source_drift + usize::from(!accounting_matches_current))
         .unwrap_or_else(|| match build_completed_ns {
             Some(build_ns) => in_scope
                 .iter()
@@ -743,12 +755,12 @@ fn hybrid_current_index_status(base: &Path, project: Option<&str>) -> Result<Opt
         .map(system_time_to_rfc3339)
         .or_else(|| committed_at.clone());
 
-    // Lexical pending is derived from expected indexed documents plus
-    // retryable/deferred gaps. Catalog rows that correctly resolved to
-    // zero-signal or a typed terminal skip are not pending documents.
+    // Lexical pending is derived from expected snapshot documents plus only
+    // blocking source gaps. A complete snapshot-A document remains complete
+    // when its live source advances to B after parsing.
     let pending = source_accounting.as_ref().map_or(0, |accounting| {
         if project_filter.is_some() {
-            accounting.retryable_error + accounting.deferred_live_changed
+            accounting.blocking_source_gaps()
         } else {
             accounting.lexical_pending(manifest.lexical_doc_count)
         }
@@ -757,9 +769,7 @@ fn hybrid_current_index_status(base: &Path, project: Option<&str>) -> Result<Opt
         // Compatibility is explicit: a pre-ledger CURRENT remains searchable,
         // but expected-document readiness is unknown until one fresh index run.
         IndexReadiness::PendingScanTimeout
-    } else if sessions_newer > 0 {
-        IndexReadiness::StaleChunks
-    } else if pending > 0 {
+    } else if !accounting_matches_current || pending > 0 {
         IndexReadiness::StaleIndex
     } else {
         IndexReadiness::Ready
@@ -813,6 +823,15 @@ fn hybrid_current_index_status(base: &Path, project: Option<&str>) -> Result<Opt
         semantic_index_mtime: generation_mtime,
         semantic_lag_secs: None,
         pending_chunks: pending,
+        source_drift: source_accounting
+            .as_ref()
+            .map_or(0, |accounting| accounting.source_drift),
+        deferred_live: source_accounting
+            .as_ref()
+            .map_or(0, |accounting| accounting.deferred_live_changed),
+        retryable_error: source_accounting
+            .as_ref()
+            .map_or(0, |accounting| accounting.retryable_error),
         temp_index_present: false,
         temp_index_path: None,
         temp_index_rows: 0,
@@ -1267,6 +1286,9 @@ mod tests {
             semantic_index_mtime: None,
             semantic_lag_secs: None,
             pending_chunks: 0,
+            source_drift: 0,
+            deferred_live: 0,
+            retryable_error: 0,
             temp_index_present: true,
             temp_index_path: Some("/tmp/_all/embeddings.ndjson.tmp".to_string()),
             temp_index_rows: 1,
@@ -1492,6 +1514,9 @@ mod tests {
         assert_eq!(ready.source_sessions, 4);
         assert_eq!(ready.canonical_chunks, 3);
         assert_eq!(ready.pending_chunks, 0);
+        assert_eq!(ready.source_drift, 0);
+        assert_eq!(ready.deferred_live, 0);
+        assert_eq!(ready.retryable_error, 0);
         assert_eq!(ready.readiness, IndexReadiness::Ready);
         assert!(!ready.semantic_index_present);
         assert_eq!(ready.dense_status, "not_built");
@@ -1500,8 +1525,8 @@ mod tests {
             .expect("mutate source fingerprint");
         let drifted = index_status_at(&root, None).expect("source drift status");
         assert_eq!(drifted.pending_chunks, 0);
-        assert!(drifted.sessions_newer_than_chunks > 0);
-        assert_eq!(drifted.readiness, IndexReadiness::StaleChunks);
+        assert_eq!(drifted.source_drift, 1);
+        assert_eq!(drifted.readiness, IndexReadiness::Ready);
 
         let changed_fingerprint = crate::source_index::current_source_fingerprint_at(&root)
             .unwrap()
@@ -1522,7 +1547,28 @@ mod tests {
         let retryable = index_status_at(&root, None).expect("retryable gap status");
         assert_eq!(retryable.sessions_newer_than_chunks, 0);
         assert_eq!(retryable.pending_chunks, 1);
+        assert_eq!(retryable.retryable_error, 1);
         assert_eq!(retryable.readiness, IndexReadiness::StaleIndex);
+
+        retryable_dispositions["codex:session-2"]["disposition"] =
+            serde_json::json!({"state": "indexed"});
+        write_state(&changed_fingerprint, &retryable_dispositions);
+        manifest.lexical_doc_count = 2;
+        manifest
+            .write_to_path(&gen_dir.join("manifest.json"))
+            .unwrap();
+        let missing_doc = index_status_at(&root, None).expect("missing lexical document status");
+        assert_eq!(missing_doc.pending_chunks, 1);
+        assert_eq!(missing_doc.readiness, IndexReadiness::StaleIndex);
+
+        manifest.lexical_doc_count = 3;
+        manifest.source_hash_blake3 = "manifest-accounting-mismatch".to_string();
+        manifest
+            .write_to_path(&gen_dir.join("manifest.json"))
+            .unwrap();
+        let mismatch = index_status_at(&root, None).expect("manifest mismatch status");
+        assert_eq!(mismatch.pending_chunks, 0);
+        assert_eq!(mismatch.readiness, IndexReadiness::StaleIndex);
 
         let _ = std::fs::remove_dir_all(root);
     }
