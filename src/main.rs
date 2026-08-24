@@ -1621,12 +1621,12 @@ enum Commands {
         #[arg(long = "no-require-auth", action = clap::ArgAction::SetTrue)]
         no_require_auth: bool,
 
-        /// Refresh the hot catalog and lexical index in the background at this cadence.
-        #[arg(long, default_value_t = 300, value_parser = clap::value_parser!(u64).range(10..))]
+        /// Retired compatibility option. Index publication is owned by the short-lived scheduler.
+        #[arg(long, hide = true, default_value_t = 300, value_parser = clap::value_parser!(u64).range(10..))]
         refresh_interval_seconds: u64,
 
-        /// Disable the HTTP server's background catalog/index refresh loop.
-        #[arg(long)]
+        /// Retired compatibility option. MCP no longer refreshes indexes in-process.
+        #[arg(long, hide = true)]
         no_auto_refresh: bool,
     },
 
@@ -2028,7 +2028,7 @@ enum Commands {
         /// Repair the macOS background runtime in one pass: preserve the
         /// existing MCP bind configuration, point launchd at the public AICX
         /// launcher, disable in-process refresh, reload the service, and
-        /// install the daily short-lived catalog/index scheduler.
+        /// install the short-lived catalog/index scheduler (every 8640s).
         #[arg(
             long,
             conflicts_with_all = [
@@ -2944,8 +2944,8 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
             auth_token,
             require_auth,
             no_require_auth,
-            refresh_interval_seconds,
-            no_auto_refresh,
+            refresh_interval_seconds: _,
+            no_auto_refresh: _,
         }) => {
             let require_auth = require_auth && !no_require_auth;
             let auth_config = aicx::auth::load_auth_config(auth_token.as_deref(), require_auth)?;
@@ -2964,11 +2964,7 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
                 allow_any_host,
             };
             let rt = tokio::runtime::Runtime::new()?;
-            let lifecycle = McpLifecycleConfig {
-                auto_refresh_interval: (!no_auto_refresh)
-                    .then(|| Duration::from_secs(refresh_interval_seconds)),
-                ..McpLifecycleConfig::default()
-            };
+            let lifecycle = McpLifecycleConfig::default();
             rt.block_on(async {
                 mcp::run_transport_with_lifecycle(transport, http_config, auth_config, lifecycle)
                     .await

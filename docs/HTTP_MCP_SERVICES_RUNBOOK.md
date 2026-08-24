@@ -38,7 +38,7 @@ client-specific environment/header mechanism.
 
 ### 2.1. Live Refresh Behavior
 * **Is `aicx serve` live?** **Yes.** `aicx serve` does not freeze a stale in-memory copy of the index. Every tool invocation (`aicx_search`, `aicx_steer`, `aicx_intents`) reads the live Tantivy and vector store state from disk (`~/.aicx/`).
-* **Ingestion cadence:** A manually started HTTP server owns a bounded async refresh loop by default. The installed macOS LaunchAgent instead uses `--no-auto-refresh`; `com.loctree.aicx.reindex` runs the full catalog/index publication once daily in a short-lived process. Use `--refresh-interval-seconds` only for deliberate standalone-server deployments.
+* **Ingestion cadence:** The long-lived MCP server never rebuilds indexes in-process. `com.loctree.aicx.reindex` runs the full catalog/index publication every 8640 seconds (2 h 24 min) in a short-lived process. The retired `--refresh-interval-seconds` and `--no-auto-refresh` flags remain accepted only so older launch configurations do not break.
 
 ### 2.2. Installation & Makefile Targets
 * **Standard install (with wizard):**
@@ -184,10 +184,10 @@ The long-lived MCP services are configured as LaunchAgents in
 | :--- | :--- | :--- | :--- |
 | **`com.loctree.aicx.mcp`** | `aicx serve --transport http` | `8044` | `~/.aicx/logs/aicx-serve-http.log` |
 | **`com.loctree.loctree.mcp`** | `loctree-mcp --transport http` | `5174` | `~/.loctree/logs/loctree-serve-http.log` |
-| **`com.loctree.aicx.reindex`** | `aicx catalog rebuild && aicx index` | daily | `~/.aicx/logs/aicx-reindex.*.log` |
+| **`com.loctree.aicx.reindex`** | `aicx catalog rebuild && aicx index` | every 8640s | `~/.aicx/logs/aicx-reindex.*.log` |
 
 The AICX MCP service runs with `--no-auto-refresh`. The separate, short-lived
-daily publisher owns catalog/index writes and releases its heap when it exits.
+8640-second publisher owns catalog/index writes and releases its heap when it exits.
 Run `aicx doctor --repair-runtime` once to migrate an older installation while
 preserving its MCP host, port, and allowed-host configuration.
 

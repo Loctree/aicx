@@ -102,7 +102,7 @@ install-service:
 uninstall-service:
 	bash ./tools/install-mcp-service.sh --uninstall
 
-# Short-lived daily reindex cadence. The long-lived HTTP service serves MCP
+# Short-lived 8640s reindex cadence. The long-lived HTTP service serves MCP
 # traffic with in-process auto-refresh disabled.
 install-schedule:
 	bash ./tools/install-reindex-schedule.sh
@@ -445,8 +445,8 @@ help:
 	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'install-cargo' '- Explain why crates.io install is not the active path'
 	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'install-service' '- Install & start local AICX Streamable HTTP service (:8044)'
 	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'uninstall-service' '- Stop & remove the AICX Streamable HTTP service'
-	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'install-schedule' '- Install the daily short-lived catalog/index publisher'
-	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'uninstall-schedule' '- Remove the daily catalog/index publisher'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'install-schedule' '- Install the short-lived 8640s catalog/index publisher'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'uninstall-schedule' '- Remove the 8640s catalog/index publisher'
 	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'git-hooks' '- Install repo-local pre-commit + pre-push hooks'
 	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'precheck' '- Quick default cargo check'
 	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'precheck-native' 'Quick native GGUF cargo check'

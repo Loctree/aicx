@@ -4,7 +4,7 @@ set -euo pipefail
 #
 # Installs a per-user LaunchAgent that runs
 #   aicx catalog rebuild && aicx index
-# every AICX_REINDEX_INTERVAL seconds (default 86400 = 24 h), so the catalog
+# every AICX_REINDEX_INTERVAL seconds (default 8640 = 2 h 24 min), so the catalog
 # admits new sessions and the lexical index republishes without anyone
 # remembering to run it. launchd serializes per-label, so a long rebuild
 # never overlaps the next tick.
@@ -14,7 +14,7 @@ set -euo pipefail
 #   bash tools/install-reindex-schedule.sh --uninstall  # remove agent + plist
 #
 # Env:
-#   AICX_REINDEX_INTERVAL  seconds between runs (default 86400)
+#   AICX_REINDEX_INTERVAL  seconds between runs (default 8640)
 #   AICX_BIN               explicit aicx binary (default: resolve from PATH)
 #
 # Non-macOS hosts: prints a note and exits 0 (the schedule is launchd-only
@@ -24,7 +24,7 @@ LABEL="com.loctree.aicx.reindex"
 LEGACY_LABEL="io.vetcoders.aicx.reindex"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 LOG_DIR="$HOME/.aicx/logs"
-INTERVAL="${AICX_REINDEX_INTERVAL:-86400}"
+INTERVAL="${AICX_REINDEX_INTERVAL:-8640}"
 
 note() { printf '  %s\n' "$*"; }
 
