@@ -341,8 +341,8 @@ failure mode a stranger would hit; do not export it to users.
 Agent rules:
 
 - When adding or changing an install/packaging path, keep channels 1–3 free of
-  any `cargo`/`rustc`/compile step (postinstall may only download, verify,
-  extract, copy). Confirm by audit, not assumption.
+  any `cargo`/`rustc`/compile step. npm packages must contain their prebuilt
+  payload and define zero lifecycle scripts. Confirm by audit, not assumption.
 - Never make source-build the default resolution for a non-dev entry point.
   Known sharp edge: `install.sh` `auto` mode resolves to `local` (source) when a
   `Cargo.toml` is adjacent — dev-only, but pass `AICX_INSTALL_MODE=release`

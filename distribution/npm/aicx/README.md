@@ -20,9 +20,9 @@ aicx --help
 aicx-mcp --version
 ```
 
-The install flow resolves the matching platform package, downloads the official
-GitHub Release archive, verifies the adjacent `.sha256`, and extracts both
-binaries in place.
+The wrapper resolves both binaries from the matching platform package. That
+package already contains the verified release binaries; npm installation does
+not run lifecycle scripts, download release assets, or unpack archives.
 
 The npm package installs the product binaries only. Local embedder models remain
-an explicit post-install choice; they are not hidden inside npm postinstall.
+an explicit operator choice.

@@ -1,6 +1,6 @@
 # distribution/npm - aicx npm release surface
 
-This directory is the planned npm distribution surface for `aicx`.
+This directory is the npm distribution surface for `aicx`.
 The source of truth for the product lives in
 [Loctree/aicx](https://github.com/Loctree/aicx); this folder contains only the
 thin JS wrapper and platform-package manifests that ship to the `@loctree` npm
@@ -8,7 +8,7 @@ scope.
 
 > Status: aligned to the signed GitHub Release asset shape for macOS arm64,
 > Linux x64 GNU, and Windows x64 MSVC. Do not publish npm packages until the
-> matching release assets and `.sha256` sidecars exist for the target version.
+> matching signed release assets exist for the target version.
 
 ## Wrapper package
 
@@ -44,8 +44,9 @@ That install surface is intentionally binary-only:
 
 - no repo checkout
 - no Rust toolchain
+- no npm lifecycle scripts
+- no install-time release download or extraction
 - no hidden local embedder model payload
-- no surprise multi-GB postinstall download
 
 ## Layout
 
@@ -53,20 +54,21 @@ That install surface is intentionally binary-only:
 distribution/npm/
 ├── README.md
 ├── PUBLISHING.md
+├── stage-platform-package.mjs
 ├── sync-version.mjs
+├── verify-metadata.mjs
 └── aicx/
     ├── package.json
     ├── README.md
     ├── index.js
     ├── index.d.ts
-    ├── install.js
     ├── bin/
     │   ├── aicx
     │   └── aicx-mcp
     └── platform-packages/
-        ├── darwin-arm64/
-        ├── linux-x64-gnu/
-        └── win32-x64-gnu/
+        ├── darwin-arm64/bin/{aicx,aicx-mcp}
+        ├── linux-x64-gnu/bin/{aicx,aicx-mcp}
+        └── win32-x64-gnu/bin/{aicx.exe,aicx-mcp.exe}
 ```
 
 ## Repo maintenance workflow
@@ -74,7 +76,7 @@ distribution/npm/
 ```bash
 node distribution/npm/sync-version.mjs 0.12.5
 node distribution/npm/sync-version.mjs --check 0.12.5
-node distribution/npm/verify-metadata.mjs 0.12.5
+node distribution/npm/verify-metadata.mjs 0.12.5 --platform=<native-platform>
 ```
 
 See [PUBLISHING.md](./PUBLISHING.md) for the publish flow.

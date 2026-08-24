@@ -22,9 +22,7 @@
     "directory": "distribution/npm/aicx/platform-packages/win32-x64-gnu"
   },
   "files": [
-    "postinstall.js"
-  ],
-  "scripts": {
-    "postinstall": "node postinstall.js"
-  }
+    "bin/aicx.exe",
+    "bin/aicx-mcp.exe"
+  ]
 }

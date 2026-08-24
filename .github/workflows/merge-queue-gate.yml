@@ -113,6 +113,18 @@ jobs:
         shell: bash
         run: npm publish --dry-run --access public
 
+      - name: Stage locally built binaries into the platform package
+        shell: bash
+        run: |
+          node distribution/npm/stage-platform-package.mjs \
+            "${{ steps.meta.outputs.version }}" \
+            "${{ matrix.platform }}" \
+            dist \
+            local-unsigned-ci
+          node distribution/npm/verify-metadata.mjs \
+            "${{ steps.meta.outputs.version }}" \
+            "--platform=${{ matrix.platform }}"
+
       - name: npm publish --dry-run (platform package ${{ matrix.platform }})
         working-directory: ${{ matrix.npm_package_dir }}
         shell: bash
