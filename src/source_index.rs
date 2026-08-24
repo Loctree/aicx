@@ -1994,6 +1994,17 @@ fn disposition_record_matches(
     record: &SourceDispositionRecord,
     source_allow: &crate::source_path::SourceAllowlist,
 ) -> bool {
+    // A missing terminal disposition describes continued absence, not a live
+    // fingerprint. Reappearance must force normal processing even when the
+    // file happens to have the same size and mtime as the missing ledger row.
+    if matches!(
+        record.disposition,
+        SourceDisposition::TerminalSkip {
+            reason: TerminalSkipReason::SourceMissing
+        }
+    ) {
+        return recurrent_missing_approved_catalog_source(entry, Some(record), source_allow);
+    }
     if record.source_path != entry.source_path
         || record.source_len == 0
         || record.source_mtime_ns == 0
@@ -2874,7 +2885,7 @@ mod tests {
         let (source_len, source_mtime_ns) =
             crate::catalog::live_source_fingerprint(&source_path).unwrap();
         let missing_path = root.join("missing-transcript.log");
-        let entries = [
+        let mut entries = [
             CatalogEntry {
                 schema: crate::catalog::CATALOG_SCHEMA.to_string(),
                 session_id: "indexed".to_string(),
@@ -2932,6 +2943,14 @@ mod tests {
             }
         ));
         let allow = crate::source_path::SourceAllowlist::for_operator(&root, &root);
+        assert!(
+            !disposition_record_matches(
+                &entries[1],
+                &first_state.dispositions["vibecrafted:retryable"],
+                &allow
+            ),
+            "retryable missing sources must not use settled terminal accounting"
+        );
         assert!(recurrent_missing_approved_catalog_source(
             &entries[1],
             first_state.dispositions.get("vibecrafted:retryable"),
@@ -2955,6 +2974,11 @@ mod tests {
             Some(prior),
             &allow
         ));
+        let settled = current_source_accounting_at(&root, None).expect("settled accounting");
+        assert_eq!(
+            settled.source_drift, 0,
+            "an exact durable terminal missing source must remain settled while absent"
+        );
 
         let mut changed_path = entries[1].clone();
         changed_path.source_path = root.join("other-missing.log").display().to_string();
@@ -3020,6 +3044,38 @@ mod tests {
             Some(prior),
             &allow
         ));
+
+        fs::write(&missing_path, "reappeared answer\n").unwrap();
+        let (reappeared_len, reappeared_mtime_ns) =
+            crate::catalog::live_source_fingerprint(&missing_path).unwrap();
+        let mut same_fingerprint_terminal = prior.clone();
+        same_fingerprint_terminal.source_len = reappeared_len;
+        same_fingerprint_terminal.source_mtime_ns = reappeared_mtime_ns;
+        let mut reappeared_entry = entries[1].clone();
+        reappeared_entry.source_len = Some(reappeared_len);
+        reappeared_entry.source_mtime_ns = Some(reappeared_mtime_ns);
+        assert!(
+            !disposition_record_matches(&reappeared_entry, &same_fingerprint_terminal, &allow),
+            "a reappeared source must not match SourceMissing even at the old fingerprint"
+        );
+
+        entries[1] = reappeared_entry;
+        let catalog = entries
+            .iter()
+            .map(|entry| serde_json::to_string(entry).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(root.join("catalog/sessions.jsonl"), format!("{catalog}\n")).unwrap();
+        let reprocessed = build(&root, &[], false, false, false, false)
+            .expect("a reappeared source must return to normal processing");
+        assert_eq!(reprocessed.terminal_reused, 0);
+        assert_eq!(reprocessed.terminal_skip_sources, 0);
+        assert_eq!(reprocessed.retryable_error_sources, 0);
+        assert_eq!(reprocessed.lexical_docs, 2);
+        let reappeared_status =
+            current_source_accounting_at(&root, None).expect("reappeared accounting");
+        assert_eq!(reappeared_status.source_drift, 0);
+        assert_eq!(reappeared_status.indexed, 2);
 
         let _ = fs::remove_dir_all(root);
     }
