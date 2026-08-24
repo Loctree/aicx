@@ -38,7 +38,7 @@ pliku tokena albo mechanizmu zmiennej/nagłówka danego klienta.
 
 ### 2.1. Odświeżanie na Żywo (Live Refresh)
 * **Czy `aicx serve` odświeża się na żywo?** **Tak.** `aicx serve` nie zamraża stanu indeksu w RAM na stałe. Każde zapytanie narzędzia (`aicx_search`, `aicx_steer`, `aicx_intents`) odpytuje bezpośrednio bieżący stan bazy Tantivy oraz wektorów z dysku (`~/.aicx/`).
-* **Cykl indeksowania:** Długowieczny serwer MCP nigdy nie przebudowuje indeksów we własnym procesie. `com.loctree.aicx.reindex` co 8640 sekund (2 godz. 24 min) uruchamia pełną publikację katalogu/indeksu w krótkowiecznym procesie. Wycofane flagi `--refresh-interval-seconds` i `--no-auto-refresh` są nadal akceptowane wyłącznie po to, żeby starsze konfiguracje startowe nie przestały działać.
+* **Cykl indeksowania:** Długowieczny serwer MCP nigdy nie przebudowuje indeksów we własnym procesie. Co 8640 sekund (2 godz. 24 min) `com.loctree.aicx.reindex` przyjmuje ograniczoną gorącą deltę katalogu i prosi krótkowieczny proces o publikację tylko wtedy, gdy fingerprint indeksu się zmienił. Scheduler wykonuje jedyny wymagany pełny census wyłącznie wtedy, gdy katalogu jeszcze nie ma. Wycofane flagi `--refresh-interval-seconds` i `--no-auto-refresh` są nadal akceptowane wyłącznie po to, żeby starsze konfiguracje startowe nie przestały działać.
 
 ### 2.2. Instalacja i Cele w Makefile
 * **Standardowa instalacja (z kreatorem):**
@@ -194,10 +194,10 @@ Długowieczne serwisy MCP są zarejestrowane jako per-user LaunchAgents w
 | :--- | :--- | :--- | :--- |
 | **`com.loctree.aicx.mcp`** | `aicx serve --transport http` | `8044` | `~/.aicx/logs/aicx-serve-http.log` |
 | **`com.loctree.loctree.mcp`** | `loctree-mcp --transport http` | `5174` | `~/.loctree/logs/loctree-serve-http.log` |
-| **`com.loctree.aicx.reindex`** | `aicx catalog rebuild && aicx index` | co 8640 s | `~/.aicx/logs/aicx-reindex.*.log` |
+| **`com.loctree.aicx.reindex`** | hot refresh; bootstrap gdy brak; index | co 8640 s | `~/.aicx/logs/aicx-reindex.*.log` |
 
 Serwis AICX MCP działa z `--no-auto-refresh`. Osobny, krótkowieczny publisher
-co 8640 sekund przejmuje zapis katalogu/indeksu i zwalnia pamięć po zakończeniu.
+co 8640 sekund przyjmuje wyłącznie ograniczoną gorącą deltę (pełny census buduje tylko przy bootstrapie), publikuje indeks wyłącznie po zmianie fingerprintu i zwalnia pamięć po zakończeniu.
 Starszą instalację migruje jednokrotnie `aicx doctor --repair-runtime`, zachowując
 host, port i listę allowed-hosts MCP.
 

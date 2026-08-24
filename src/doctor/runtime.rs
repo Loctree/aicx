@@ -83,7 +83,7 @@ pub fn repair_runtime() -> Result<RuntimeRepairReport> {
 
 pub fn format_runtime_repair_text(report: &RuntimeRepairReport) -> String {
     format!(
-        "aicx runtime repaired\n\n{}\n{}\n\n  ownership: MCP serves requests; short-lived rebuild/index runs every 2h24m\n",
+        "aicx runtime repaired\n\n{}\n{}\n\n  ownership: MCP serves requests; short-lived hot refresh/index runs every 2h24m\n",
         report.mcp_service, report.index_scheduler
     )
 }
@@ -103,7 +103,8 @@ mod tests {
     #[test]
     fn repair_uses_short_lived_indexer_every_8640_seconds() {
         assert_eq!(REINDEX_INTERVAL_SECONDS, "8640");
-        assert!(INSTALL_REINDEX_SCRIPT.contains("catalog rebuild"));
+        assert!(INSTALL_REINDEX_SCRIPT.contains("catalog refresh --json"));
+        assert!(INSTALL_REINDEX_SCRIPT.contains("catalog_present\": false"));
         assert!(INSTALL_REINDEX_SCRIPT.contains("index"));
     }
 }

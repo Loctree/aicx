@@ -3,7 +3,7 @@ set -euo pipefail
 # install-reindex-schedule.sh — background reindex cadence for AICX (macOS).
 #
 # Installs a per-user LaunchAgent that runs
-#   aicx catalog rebuild && aicx index
+#   aicx catalog refresh && aicx index
 # every AICX_REINDEX_INTERVAL seconds (default 8640 = 2 h 24 min), so the catalog
 # admits new sessions and the lexical index republishes without anyone
 # remembering to run it. launchd serializes per-label, so a long rebuild
@@ -73,7 +73,7 @@ cat > "$PLIST" <<PLIST_EOF
   <array>
     <string>/bin/sh</string>
     <string>-c</string>
-    <string>export PATH="$AICX_DIR:/usr/bin:/bin:\$HOME/.local/bin:\$HOME/.cargo/bin"; "$AICX_BIN" catalog rebuild &amp;&amp; "$AICX_BIN" index</string>
+    <string>export PATH="$AICX_DIR:/usr/bin:/bin:\$HOME/.local/bin:\$HOME/.cargo/bin"; refresh_report="\$("$AICX_BIN" catalog refresh --json)" || exit 1; printf '%s\n' "\$refresh_report"; if printf '%s\n' "\$refresh_report" | /usr/bin/grep -q '"catalog_present": false'; then "$AICX_BIN" catalog rebuild || exit 1; fi; exec "$AICX_BIN" index</string>
   </array>
   <key>StartInterval</key>
   <integer>$INTERVAL</integer>
