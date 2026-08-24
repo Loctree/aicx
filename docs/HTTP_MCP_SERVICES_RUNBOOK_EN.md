@@ -46,12 +46,12 @@ client-specific environment/header mechanism.
   cd /Volumes/vc-workspace/Loctree/aicx
   make install
   ```
-  *(Runs `install.sh`, installs binaries, registers `io.vetcoders.aicx.mcp`, and writes Claude/Codex/Gemini `mcpServers.aicx` as `{"url":"http://127.0.0.1:8044/mcp"}` — not stdio `command`. That server owns index refresh. `AICX_SKIP_MCP_SERVICE=1` keeps stdio.)*
+  *(Runs `install.sh`, installs binaries, registers `com.loctree.aicx.mcp`, and writes Claude/Codex/Gemini `mcpServers.aicx` as `{"url":"http://127.0.0.1:8044/mcp"}` — not stdio `command`. That server owns index refresh. `AICX_SKIP_MCP_SERVICE=1` keeps stdio.)*
 
 * **Explicit service management:**
   ```bash
-  make install-service    # Installs and starts io.vetcoders.aicx.mcp LaunchAgent
-  make uninstall-service  # Stops and unregisters io.vetcoders.aicx.mcp LaunchAgent
+  make install-service    # Installs and starts com.loctree.aicx.mcp LaunchAgent
+  make uninstall-service  # Stops and unregisters com.loctree.aicx.mcp LaunchAgent
   make install-schedule   # Legacy: standalone refresh only when no HTTP server is installed
   ```
 
@@ -93,12 +93,12 @@ loct watch --http --port 5174 &
   cd /Volumes/vc-workspace/Loctree/loctree-suite
   make install-all
   ```
-  *(Compiles `loct`, `loctree`, `loctree-mcp`, `loctree-lsp`, codesigns, and registers the `io.vetcoders.loctree.mcp` launchd service).*
+  *(Compiles `loct`, `loctree`, `loctree-mcp`, `loctree-lsp`, codesigns, and registers the `com.loctree.loctree.mcp` launchd service).*
 
 * **Explicit service management:**
   ```bash
-  make install-service    # Installs and starts io.vetcoders.loctree.mcp LaunchAgent
-  make uninstall-service  # Stops and unregisters io.vetcoders.loctree.mcp LaunchAgent
+  make install-service    # Installs and starts com.loctree.loctree.mcp LaunchAgent
+  make uninstall-service  # Stops and unregisters com.loctree.loctree.mcp LaunchAgent
   ```
 
 ### 3.3. Smoke Test
@@ -181,8 +181,8 @@ The services are configured as LaunchAgents in `~/Library/LaunchAgents/` with `R
 
 | Service Label | Command | Default Port | Log Destination |
 | :--- | :--- | :--- | :--- |
-| **`io.vetcoders.aicx.mcp`** | `aicx serve --transport http` | `8044` | `~/.aicx/logs/aicx-serve-http.log` |
-| **`io.vetcoders.loctree.mcp`** | `loctree-mcp --transport http` | `5174` | `~/.loctree/logs/loctree-serve-http.log` |
+| **`com.loctree.aicx.mcp`** | `aicx serve --transport http` | `8044` | `~/.aicx/logs/aicx-serve-http.log` |
+| **`com.loctree.loctree.mcp`** | `loctree-mcp --transport http` | `5174` | `~/.loctree/logs/loctree-serve-http.log` |
 
 The former `io.vetcoders.aicx.reindex` timer is removed when the HTTP service is installed, preventing two competing index writers.
 
@@ -203,9 +203,9 @@ alias mcp-logs='tail -f ~/.aicx/logs/aicx-serve-http.log ~/.loctree/logs/loctree
 alias mcp-launchd='launchctl list | grep vetcoders'
 
 # Restart all launchd MCP services
-alias mcp-restart='launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/io.vetcoders.aicx.mcp.plist 2>/dev/null; \
-  launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/io.vetcoders.aicx.mcp.plist; \
-  launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/io.vetcoders.loctree.mcp.plist 2>/dev/null; \
-  launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/io.vetcoders.loctree.mcp.plist; \
+alias mcp-restart='launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.loctree.aicx.mcp.plist 2>/dev/null; \
+  launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.loctree.aicx.mcp.plist; \
+  launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.loctree.loctree.mcp.plist 2>/dev/null; \
+  launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.loctree.loctree.mcp.plist; \
   echo "🚀 Services restarted under launchd"'
 ```

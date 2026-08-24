@@ -46,12 +46,12 @@ pliku tokena albo mechanizmu zmiennej/nagłówka danego klienta.
   cd /Volumes/vc-workspace/Loctree/aicx
   make install
   ```
-  *(Uruchamia `install.sh`, instaluje binarki, rejestruje `io.vetcoders.aicx.mcp` i zapisuje klientom Claude/Codex/Gemini `mcpServers.aicx` jako `{"url":"http://127.0.0.1:8044/mcp"}` — nie stdio `command`. Ten serwer jest właścicielem odświeżania indeksu. `AICX_SKIP_MCP_SERVICE=1` zostawia stdio.)*
+  *(Uruchamia `install.sh`, instaluje binarki, rejestruje `com.loctree.aicx.mcp` i zapisuje klientom Claude/Codex/Gemini `mcpServers.aicx` jako `{"url":"http://127.0.0.1:8044/mcp"}` — nie stdio `command`. Ten serwer jest właścicielem odświeżania indeksu. `AICX_SKIP_MCP_SERVICE=1` zostawia stdio.)*
 
 * **Zarządzanie serwisem LaunchAgent:**
   ```bash
-  make install-service    # Instaluje i startuje LaunchAgent io.vetcoders.aicx.mcp
-  make uninstall-service  # Zatrzymuje i wyrejestrowuje LaunchAgent io.vetcoders.aicx.mcp
+  make install-service    # Instaluje i startuje LaunchAgent com.loctree.aicx.mcp
+  make uninstall-service  # Zatrzymuje i wyrejestrowuje LaunchAgent com.loctree.aicx.mcp
   make install-schedule   # Legacy: osobny refresh tylko gdy nie działa serwer HTTP
   ```
 
@@ -93,12 +93,12 @@ loct watch --http --port 5174 &
   cd /Volumes/vc-workspace/Loctree/loctree-suite
   make install-all
   ```
-  *(Kompiluje `loct`, `loctree`, `loctree-mcp`, `loctree-lsp`, podpisuje binarki i rejestruje serwis launchd `io.vetcoders.loctree.mcp`).*
+  *(Kompiluje `loct`, `loctree`, `loctree-mcp`, `loctree-lsp`, podpisuje binarki i rejestruje serwis launchd `com.loctree.loctree.mcp`).*
 
 * **Zarządzanie serwisem LaunchAgent:**
   ```bash
-  make install-service    # Instaluje i startuje LaunchAgent io.vetcoders.loctree.mcp
-  make uninstall-service  # Zatrzymuje i wyrejestrowuje LaunchAgent io.vetcoders.loctree.mcp
+  make install-service    # Instaluje i startuje LaunchAgent com.loctree.loctree.mcp
+  make uninstall-service  # Zatrzymuje i wyrejestrowuje LaunchAgent com.loctree.loctree.mcp
   ```
 
 ### 3.3. Weryfikacja Działania (Smoke Test)
@@ -191,8 +191,8 @@ Serwisy są zarejestrowane jako per-user LaunchAgents w `~/Library/LaunchAgents/
 
 | Identyfikator Serwisu | Polecenie | Domyślny Port | Cel Logowania |
 | :--- | :--- | :--- | :--- |
-| **`io.vetcoders.aicx.mcp`** | `aicx serve --transport http` | `8044` | `~/.aicx/logs/aicx-serve-http.log` |
-| **`io.vetcoders.loctree.mcp`** | `loctree-mcp --transport http` | `5174` | `~/.loctree/logs/loctree-serve-http.log` |
+| **`com.loctree.aicx.mcp`** | `aicx serve --transport http` | `8044` | `~/.aicx/logs/aicx-serve-http.log` |
+| **`com.loctree.loctree.mcp`** | `loctree-mcp --transport http` | `5174` | `~/.loctree/logs/loctree-serve-http.log` |
 
 Poprzedni timer `io.vetcoders.aicx.reindex` jest usuwany przy instalacji serwera HTTP, aby nie utrzymywać dwóch konkurujących writerów indeksu.
 
@@ -213,9 +213,9 @@ alias mcp-logs='tail -f ~/.aicx/logs/aicx-serve-http.log ~/.loctree/logs/loctree
 alias mcp-launchd='launchctl list | grep vetcoders'
 
 # Restart obu serwisów launchd
-alias mcp-restart='launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/io.vetcoders.aicx.mcp.plist 2>/dev/null; \
-  launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/io.vetcoders.aicx.mcp.plist; \
-  launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/io.vetcoders.loctree.mcp.plist 2>/dev/null; \
-  launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/io.vetcoders.loctree.mcp.plist; \
+alias mcp-restart='launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.loctree.aicx.mcp.plist 2>/dev/null; \
+  launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.loctree.aicx.mcp.plist; \
+  launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.loctree.loctree.mcp.plist 2>/dev/null; \
+  launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.loctree.loctree.mcp.plist; \
   echo "🚀 Serwisy zrestartowane w launchd"'
 ```

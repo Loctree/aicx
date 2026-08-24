@@ -20,7 +20,8 @@ set -euo pipefail
 # Non-macOS hosts: prints a note and exits 0 (the schedule is launchd-only
 # for now; a systemd user timer is the natural Linux counterpart).
 
-LABEL="io.vetcoders.aicx.reindex"
+LABEL="com.loctree.aicx.reindex"
+LEGACY_LABEL="io.vetcoders.aicx.reindex"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 LOG_DIR="$HOME/Library/Logs/vetcoders"
 INTERVAL="${AICX_REINDEX_INTERVAL:-7200}"
@@ -37,6 +38,8 @@ gui_domain() { printf 'gui/%s' "$(id -u)"; }
 if [ "${1:-}" = "--uninstall" ]; then
   launchctl bootout "$(gui_domain)/$LABEL" 2>/dev/null || true
   rm -f "$PLIST"
+  launchctl bootout "$(gui_domain)/$LEGACY_LABEL" 2>/dev/null || true
+  rm -f "$HOME/Library/LaunchAgents/$LEGACY_LABEL.plist"
   note "reindex schedule: removed ($LABEL)"
   exit 0
 fi
@@ -92,7 +95,10 @@ PLIST_EOF
 
 plutil -lint "$PLIST" >/dev/null
 
-# Idempotent refresh: drop any prior registration, then bootstrap the new one.
+# Idempotent refresh: drop any prior registration (including the legacy
+# io.vetcoders.aicx.reindex label), then bootstrap the new one.
+launchctl bootout "$(gui_domain)/$LEGACY_LABEL" 2>/dev/null || true
+rm -f "$HOME/Library/LaunchAgents/$LEGACY_LABEL.plist"
 launchctl bootout "$(gui_domain)/$LABEL" 2>/dev/null || true
 launchctl bootstrap "$(gui_domain)" "$PLIST"
 

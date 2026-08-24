@@ -147,7 +147,7 @@ def default_token_file() -> Path:
 
 
 def default_plist() -> Path:
-    return Path.home() / "Library" / "LaunchAgents" / "io.vetcoders.aicx.mcp.plist"
+    return Path.home() / "Library" / "LaunchAgents" / "com.loctree.aicx.mcp.plist"
 
 
 def wire_targets(
@@ -220,7 +220,7 @@ def self_test() -> int:
         missing_dir = apply_entry(root / "nope" / "settings.json", desired_stdio("/bin/aicx-mcp", []))
         check("missing dir is skipped", missing_dir == "skipped (dir not found)")
 
-        plist = root / "io.vetcoders.aicx.mcp.plist"
+        plist = root / "com.loctree.aicx.mcp.plist"
         plist.write_bytes(
             b"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

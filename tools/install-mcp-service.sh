@@ -26,7 +26,8 @@ set -euo pipefail
 # terminals, SSH, and some multiplexers return Error 5 (EIO) plus a
 # "retry as root" hint — that hint is wrong for a per-user LaunchAgent.
 
-LABEL="io.vetcoders.aicx.mcp"
+LABEL="com.loctree.aicx.mcp"
+LEGACY_LABEL="io.vetcoders.aicx.mcp"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 LOG_DIR="$HOME/.aicx/logs"
 PORT="${AICX_MCP_PORT:-8044}"
@@ -40,9 +41,18 @@ fi
 
 gui_domain() { printf 'gui/%s' "$(id -u)"; }
 
+# Boot out a launchd label and delete its plist if present. Used for the
+# canonical label and to migrate machines still running the legacy
+# io.vetcoders.aicx.mcp agent so install/uninstall never leave two servers.
+retire_launchd_label() {
+  local label="$1"
+  launchctl bootout "$(gui_domain)/$label" 2>/dev/null || true
+  rm -f "$HOME/Library/LaunchAgents/$label.plist"
+}
+
 if [ "${1:-}" = "--uninstall" ]; then
-  launchctl bootout "$(gui_domain)/$LABEL" 2>/dev/null || true
-  rm -f "$PLIST"
+  retire_launchd_label "$LABEL"
+  retire_launchd_label "$LEGACY_LABEL"
   note "mcp service: removed ($LABEL)"
   exit 0
 fi
@@ -179,7 +189,10 @@ if [ "$MANAGER" != "Aqua" ]; then
   exit 0
 fi
 
-# Idempotent refresh
+# Migrate machines still running the legacy io.vetcoders.aicx.mcp agent so
+# install never leaves two HTTP MCP servers. Then idempotent refresh of the
+# canonical label without deleting the plist we just wrote.
+retire_launchd_label "$LEGACY_LABEL"
 launchctl bootout "$(gui_domain)/$LABEL" 2>/dev/null || true
 if ! try_bootstrap; then
   sleep 1
@@ -189,8 +202,8 @@ fi
 if service_loaded; then
   # The HTTP server owns bounded catalog/index refresh now. Retire the former
   # second writer when upgrading an existing installation.
-  launchctl bootout "$(gui_domain)/io.vetcoders.aicx.reindex" 2>/dev/null || true
-  rm -f "$HOME/Library/LaunchAgents/io.vetcoders.aicx.reindex.plist"
+  retire_launchd_label "com.loctree.aicx.reindex"
+  retire_launchd_label "io.vetcoders.aicx.reindex"
   note "mcp service: running on http://$HOST:$PORT/mcp via $LABEL"
   note "index refresh: owned by the MCP server (default every 5m)"
   note "mcp service logs: $LOG_DIR/aicx-serve-http.log"
