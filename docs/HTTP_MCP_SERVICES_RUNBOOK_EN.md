@@ -38,7 +38,7 @@ client-specific environment/header mechanism.
 
 ### 2.1. Live Refresh Behavior
 * **Is `aicx serve` live?** **Yes.** `aicx serve` does not freeze a stale in-memory copy of the index. Every tool invocation (`aicx_search`, `aicx_steer`, `aicx_intents`) reads the live Tantivy and vector store state from disk (`~/.aicx/`).
-* **Ingestion cadence:** HTTP mode owns a bounded async refresh loop: every 5 minutes it refreshes the hot 48-hour catalog window and incrementally publishes the lexical index. The blocking filesystem/index work runs outside Tokio request workers. Use `--refresh-interval-seconds` to tune it or `--no-auto-refresh` only when another explicit writer owns freshness.
+* **Ingestion cadence:** A manually started HTTP server owns a bounded async refresh loop by default. The installed macOS LaunchAgent instead uses `--no-auto-refresh`; `com.loctree.aicx.reindex` runs the full catalog/index publication once daily in a short-lived process. Use `--refresh-interval-seconds` only for deliberate standalone-server deployments.
 
 ### 2.2. Installation & Makefile Targets
 * **Standard install (with wizard):**
@@ -177,14 +177,19 @@ url = "http://127.0.0.1:5174/mcp"
 
 ## 5. macOS launchd LaunchAgents
 
-The services are configured as LaunchAgents in `~/Library/LaunchAgents/` with `RunAtLoad=true` and `KeepAlive=true`:
+The long-lived MCP services are configured as LaunchAgents in
+`~/Library/LaunchAgents/` with `RunAtLoad=true` and `KeepAlive=true`:
 
-| Service Label | Command | Default Port | Log Destination |
+| Service Label | Command | Port / Cadence | Log Destination |
 | :--- | :--- | :--- | :--- |
 | **`com.loctree.aicx.mcp`** | `aicx serve --transport http` | `8044` | `~/.aicx/logs/aicx-serve-http.log` |
 | **`com.loctree.loctree.mcp`** | `loctree-mcp --transport http` | `5174` | `~/.loctree/logs/loctree-serve-http.log` |
+| **`com.loctree.aicx.reindex`** | `aicx catalog rebuild && aicx index` | daily | `~/.aicx/logs/aicx-reindex.*.log` |
 
-The former `io.vetcoders.aicx.reindex` timer is removed when the HTTP service is installed, preventing two competing index writers.
+The AICX MCP service runs with `--no-auto-refresh`. The separate, short-lived
+daily publisher owns catalog/index writes and releases its heap when it exits.
+Run `aicx doctor --repair-runtime` once to migrate an older installation while
+preserving its MCP host, port, and allowed-host configuration.
 
 ---
 

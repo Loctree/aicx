@@ -2415,6 +2415,24 @@ fn doctor_deep_flag_parses_and_defaults_off() {
 }
 
 #[test]
+fn doctor_repair_runtime_parses_as_explicit_action() {
+    let cli = Cli::try_parse_from(["aicx", "doctor", "--repair-runtime"])
+        .expect("doctor runtime repair should parse");
+    match cli.command {
+        Some(Commands::Doctor { repair_runtime, .. }) => assert!(repair_runtime),
+        _ => panic!("expected doctor command"),
+    }
+}
+
+#[test]
+fn doctor_repair_runtime_rejects_silent_mixed_actions() {
+    assert!(
+        Cli::try_parse_from(["aicx", "doctor", "--repair-runtime", "--deep"]).is_err(),
+        "runtime repair must not silently discard another doctor action"
+    );
+}
+
+#[test]
 fn doctor_deep_routing_covers_fix_scan_and_oracle_requests() {
     // W2-04: the fast pass can neither fix nor certify — every remediation,
     // script-rendering, full-scan, or oracle request must route deep; a

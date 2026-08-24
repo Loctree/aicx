@@ -2025,6 +2025,32 @@ enum Commands {
         #[arg(short = 'y', long)]
         yes: bool,
 
+        /// Repair the macOS background runtime in one pass: preserve the
+        /// existing MCP bind configuration, point launchd at the public AICX
+        /// launcher, disable in-process refresh, reload the service, and
+        /// install the daily short-lived catalog/index scheduler.
+        #[arg(
+            long,
+            conflicts_with_all = [
+                "rebuild_steer_index",
+                "fix_buckets",
+                "dry_run",
+                "rebuild_sidecars",
+                "prune_empty_bodies",
+                "migrate_identities",
+                "apply",
+                "restore_quarantine",
+                "yes",
+                "force",
+                "check_dedup",
+                "verbose",
+                "smoke",
+                "deep",
+                "oracle"
+            ]
+        )]
+        repair_runtime: bool,
+
         /// Skip dry-run preview and prompts; intended for CI cleanup runs.
         #[arg(long)]
         force: bool,
@@ -3121,6 +3147,7 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
             apply,
             restore_quarantine,
             yes,
+            repair_runtime,
             force,
             check_dedup,
             verbose,
@@ -3129,6 +3156,14 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
             format,
             oracle,
         }) => {
+            if repair_runtime {
+                let report = aicx::doctor::repair_runtime()?;
+                match format.as_str() {
+                    "json" => println!("{}", serde_json::to_string_pretty(&report)?),
+                    _ => print!("{}", aicx::doctor::format_runtime_repair_text(&report)),
+                }
+                return Ok(());
+            }
             if let Some(slug) = restore_quarantine {
                 let report = aicx::doctor::restore_quarantine(&slug)?;
                 match format.as_str() {
