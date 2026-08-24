@@ -506,3 +506,198 @@ fn codex_compaction_markers_consumed_without_unsupported_or_visible_loss() {
     assert_eq!(session.coverage.skipped_count, 0);
     assert_eq!(session.coverage.raw_line_count, 8);
 }
+
+// ---------------------------------------------------------------------------
+// 2026-08 schema change: user-run shell actions and control payloads arrive as
+// `role=user` input_text messages. The adapter must classify them as
+// tool/control turns — `--conversation` filters on frame kind downstream.
+// These tests are RED on codex-rollout-v1 and GREEN on codex-rollout-v2.
+// ---------------------------------------------------------------------------
+
+fn dialogue_texts(model: &SessionModel) -> Vec<String> {
+    model
+        .turns
+        .iter()
+        .filter(|turn| matches!(turn.kind, TurnKind::UserMsg | TurnKind::AgentReply))
+        .map(|turn| turn.text.clone())
+        .collect()
+}
+
+#[test]
+fn codex_user_shell_envelope_is_tool_not_dialogue() {
+    let body = br#"{"timestamp":"2026-08-24T10:00:00Z","type":"session_meta","payload":{"id":"shell-envelope","cwd":"/repo"}}
+{"timestamp":"2026-08-24T10:00:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"sprawdz wersje aicx na dragonie"}]}}
+{"timestamp":"2026-08-24T10:00:02Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<user_shell_command>\n<command>\npsa loctree\n</command>\n<result>\nExit code: 0\nmaciejgad 40740 loctree-lsp --root /private/repo --stdio\n</result>\n</user_shell_command>"}]}}
+{"timestamp":"2026-08-24T10:00:03Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"widze wynik, wersja siedzi"}]}}
+"#;
+    let model = model("shell-envelope", body);
+
+    let dialogue = dialogue_texts(&model);
+    assert_eq!(
+        dialogue,
+        vec![
+            "sprawdz wersje aicx na dragonie".to_owned(),
+            "widze wynik, wersja siedzi".to_owned(),
+        ],
+        "conversation frames must carry zero envelope bytes"
+    );
+    assert!(
+        dialogue
+            .iter()
+            .all(|text| !text.contains("<user_shell_command") && !text.contains("<result>")),
+        "no envelope markers may leak into dialogue frames"
+    );
+
+    let tool_turns: Vec<_> = model
+        .turns
+        .iter()
+        .filter(|turn| turn.kind == TurnKind::ToolResult)
+        .collect();
+    assert_eq!(tool_turns.len(), 1, "whole envelope becomes one tool turn");
+    assert_eq!(tool_turns[0].role, TurnRole::Tool);
+    assert_eq!(
+        tool_turns[0].tool_name,
+        Known::value("user_shell_command".to_owned())
+    );
+    assert!(tool_turns[0].text.starts_with("<user_shell_command>"));
+    assert!(tool_turns[0].text.contains("psa loctree"));
+    assert!(
+        tool_turns[0]
+            .text
+            .trim_end()
+            .ends_with("</user_shell_command>"),
+        "tool turn preserves the verbatim envelope for full extraction"
+    );
+    assert!(
+        model
+            .tool_events
+            .iter()
+            .any(|event| event.tool_name == "user_shell_command"),
+        "reclassified envelope registers a ToolEvent"
+    );
+
+    // Order survives: user prose, tool envelope, assistant reply.
+    let kinds: Vec<TurnKind> = model.turns.iter().map(|turn| turn.kind).collect();
+    assert_eq!(
+        kinds,
+        vec![
+            TurnKind::UserMsg,
+            TurnKind::ToolResult,
+            TurnKind::AgentReply
+        ]
+    );
+}
+
+#[test]
+fn codex_mixed_prose_and_envelope_preserves_prose() {
+    let body = br#"{"timestamp":"2026-08-24T10:01:00Z","type":"session_meta","payload":{"id":"mixed","cwd":"/repo"}}
+{"timestamp":"2026-08-24T10:01:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"zobacz co wyszlo:\n<user_shell_command>\n<command>\nls\n</command>\n<result>\nplik.txt\n</result>\n</user_shell_command>\ni powiedz co dalej"}]}}
+"#;
+    let model = model("mixed", body);
+    let kinds: Vec<TurnKind> = model.turns.iter().map(|turn| turn.kind).collect();
+    assert_eq!(
+        kinds,
+        vec![TurnKind::UserMsg, TurnKind::ToolResult, TurnKind::UserMsg],
+        "prose survives on both sides of the stripped envelope"
+    );
+    assert_eq!(model.turns[0].text, "zobacz co wyszlo:");
+    assert_eq!(model.turns[2].text, "i powiedz co dalej");
+    assert!(model.turns[1].text.contains("plik.txt"));
+}
+
+#[test]
+fn codex_literal_tag_mention_stays_dialogue() {
+    let body = br#"{"timestamp":"2026-08-24T10:02:00Z","type":"session_meta","payload":{"id":"mention","cwd":"/repo"}}
+{"timestamp":"2026-08-24T10:02:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"czemu `<user_shell_command>` pojawia sie w ekstrakcie?"}]}}
+{"timestamp":"2026-08-24T10:02:02Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"przyklad zacytowany w fence:\n```\n<user_shell_command>\n<command>x</command>\n</user_shell_command>\n```\nto jest cytat do dyskusji"}]}}
+"#;
+    let model = model("mention", body);
+    let kinds: Vec<TurnKind> = model.turns.iter().map(|turn| turn.kind).collect();
+    assert_eq!(
+        kinds,
+        vec![TurnKind::UserMsg, TurnKind::UserMsg],
+        "inline mention and fenced quotation are human dialogue, not envelopes"
+    );
+    assert_eq!(
+        model.turns[0].text,
+        "czemu `<user_shell_command>` pojawia sie w ekstrakcie?"
+    );
+    assert!(
+        model.turns[1].text.contains("</user_shell_command>"),
+        "fenced quotation stays byte-preserved in the dialogue turn"
+    );
+    assert!(model.tool_events.is_empty());
+}
+
+#[test]
+fn codex_control_envelopes_become_system_notes() {
+    let body = br#"{"timestamp":"2026-08-24T10:03:00Z","type":"session_meta","payload":{"id":"control","cwd":"/repo"}}
+{"timestamp":"2026-08-24T10:03:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<codex_internal_context version=\"1\">\ngoal state snapshot\n</codex_internal_context>"}]}}
+{"timestamp":"2026-08-24T10:03:02Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<INSTRUCTIONS>\nalways answer in haiku\n</INSTRUCTIONS>"}]}}
+{"timestamp":"2026-08-24T10:03:03Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"a teraz normalne pytanie"}]}}
+"#;
+    let model = model("control", body);
+    let kinds: Vec<TurnKind> = model.turns.iter().map(|turn| turn.kind).collect();
+    assert_eq!(
+        kinds,
+        vec![
+            TurnKind::SystemNote,
+            TurnKind::SystemNote,
+            TurnKind::UserMsg
+        ],
+        "control envelopes leave the dialogue channel entirely"
+    );
+    assert_eq!(model.turns[0].role, TurnRole::System);
+    assert_eq!(model.turns[1].role, TurnRole::System);
+    assert_eq!(dialogue_texts(&model), vec!["a teraz normalne pytanie"]);
+}
+
+#[test]
+fn codex_huge_shell_result_fully_reclassified() {
+    let huge = "x".repeat(50_000);
+    let text = format!(
+        "<user_shell_command>\n<command>\ncat big\n</command>\n<result>\n{huge}\n</result>\n</user_shell_command>"
+    );
+    let line = serde_json::json!({
+        "timestamp": "2026-08-24T10:04:01Z",
+        "type": "response_item",
+        "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": text}]}
+    });
+    let body = format!(
+        "{}\n{}\n",
+        r#"{"timestamp":"2026-08-24T10:04:00Z","type":"session_meta","payload":{"id":"huge","cwd":"/repo"}}"#,
+        serde_json::to_string(&line).expect("serialize huge line"),
+    );
+    let model = model("huge", body.as_bytes());
+    assert!(
+        dialogue_texts(&model).is_empty(),
+        "no dialogue frames at all"
+    );
+    let tool_turns: Vec<_> = model
+        .turns
+        .iter()
+        .filter(|turn| turn.kind == TurnKind::ToolResult)
+        .collect();
+    assert_eq!(tool_turns.len(), 1);
+    assert!(tool_turns[0].text_chars > 50_000);
+}
+
+#[test]
+fn codex_unterminated_envelope_fails_closed() {
+    let body = br#"{"timestamp":"2026-08-24T10:05:00Z","type":"session_meta","payload":{"id":"unterminated","cwd":"/repo"}}
+{"timestamp":"2026-08-24T10:05:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<user_shell_command>\n<command>\nenv\n</command>\n<result>\nAWS_SECRET=truncated-mid-flight"}]}}
+"#;
+    let model = model("unterminated", body);
+    assert!(
+        dialogue_texts(&model).is_empty(),
+        "a malformed envelope must never leak into dialogue — fail closed"
+    );
+    assert_eq!(
+        model
+            .turns
+            .iter()
+            .filter(|turn| turn.kind == TurnKind::ToolResult)
+            .count(),
+        1
+    );
+}

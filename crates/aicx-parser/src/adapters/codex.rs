@@ -21,7 +21,7 @@ use crate::engine::{
 use serde_json::Value;
 use std::collections::BTreeMap;
 
-pub const CODEX_ADAPTER_VERSION: &str = "codex-rollout-v1";
+pub const CODEX_ADAPTER_VERSION: &str = "codex-rollout-v2";
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CodexAdapter;
@@ -589,14 +589,17 @@ impl<'a> Assembly<'a> {
                     TurnRole::Tool => TurnKind::ToolResult,
                     TurnRole::System => TurnKind::SystemNote,
                 };
-                self.push_turn(
-                    role,
-                    kind,
-                    content_text(&payload["content"]),
-                    timestamp,
-                    Known::unknown(),
-                    evidence,
-                )
+                let text = content_text(&payload["content"]);
+                // The 2026-08 Codex schema change began serializing user-run
+                // shell actions and internal control payloads as ordinary
+                // `role=user` input_text messages. The schema says `user`; the
+                // product semantics say tool/control event, and the adapter
+                // owns that normalization — see
+                // `push_user_message_classified`.
+                if role == TurnRole::User {
+                    return self.push_user_message_classified(text, timestamp, evidence);
+                }
+                self.push_turn(role, kind, text, timestamp, Known::unknown(), evidence)
             }
             // Agent-to-agent dispatch: `author` hands a task to `recipient`.
             // A third chat envelope, distinct from `message`, so the
@@ -757,6 +760,88 @@ impl<'a> Assembly<'a> {
             payload_bytes: body.len() as u64,
             raw_unit_refs: vec![evidence],
         });
+        Ok(())
+    }
+
+    /// Classify a `role=user` message body before it reaches the turn stream.
+    ///
+    /// A plain human message passes through byte-identical to the legacy
+    /// path. A body carrying reserved Codex control envelopes (see
+    /// [`match_envelope_open`]) is split: whole-envelope
+    /// `<user_shell_command>` blocks become `Tool`/`ToolResult` turns with a
+    /// registered [`ToolEvent`], control envelopes (`codex_internal_context`,
+    /// `INSTRUCTIONS`, …) become `System`/`SystemNote` turns, and any genuine
+    /// human prose around them survives as `UserMsg` turns in order. The
+    /// conversation projection filters on frame kind, so reclassified
+    /// envelopes vanish from `--conversation` while full extraction retains
+    /// them as correctly-typed turns.
+    fn push_user_message_classified(
+        &mut self,
+        text: String,
+        timestamp: Known<String>,
+        evidence: RawUnitRef,
+    ) -> Result<(), AdapterError> {
+        let segments = split_user_envelope_segments(&text);
+        let has_envelope = segments
+            .iter()
+            .any(|segment| !matches!(segment, UserSegment::Prose(_)));
+        if !has_envelope {
+            // Fast path: no envelope anywhere — emit the original body
+            // unchanged so ordinary messages keep byte-identical hashes.
+            return self.push_turn(
+                TurnRole::User,
+                TurnKind::UserMsg,
+                text,
+                timestamp,
+                Known::unknown(),
+                evidence,
+            );
+        }
+        for segment in segments {
+            match segment {
+                UserSegment::Prose(prose) => {
+                    let prose = prose.trim().to_owned();
+                    self.push_turn(
+                        TurnRole::User,
+                        TurnKind::UserMsg,
+                        prose,
+                        timestamp.clone(),
+                        Known::unknown(),
+                        evidence.clone(),
+                    )?;
+                }
+                UserSegment::ToolEnvelope { tag, body } => {
+                    self.push_turn(
+                        TurnRole::Tool,
+                        TurnKind::ToolResult,
+                        body.clone(),
+                        timestamp.clone(),
+                        Known::value(tag.to_owned()),
+                        evidence.clone(),
+                    )?;
+                    let turn_idx = self.turns.len() as u64 - 1;
+                    self.tools.push(ToolEvent {
+                        kind: ToolEventKind::Result,
+                        turn_idx,
+                        tool_name: tag.to_owned(),
+                        correlation_id: Known::unknown(),
+                        payload_hash: sha256_hex(body.as_bytes()),
+                        payload_bytes: body.len() as u64,
+                        raw_unit_refs: vec![evidence.clone()],
+                    });
+                }
+                UserSegment::ControlEnvelope { tag: _, body } => {
+                    self.push_turn(
+                        TurnRole::System,
+                        TurnKind::SystemNote,
+                        body,
+                        timestamp.clone(),
+                        Known::unknown(),
+                        evidence.clone(),
+                    )?;
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1169,6 +1254,148 @@ fn agent_message_text(payload: &Value) -> String {
         (Some(author), Some(recipient)) => format!("{author} → {recipient}\n{body}"),
         _ => body,
     }
+}
+
+/// Reserved Codex envelopes that arrive inside `role=user` message bodies
+/// after the 2026-08 schema change. Tool envelopes carry user-run shell
+/// actions (command + result payload); control envelopes carry injected
+/// context or instructions. Neither is human dialogue.
+const USER_TOOL_ENVELOPE_TAGS: [&str; 1] = ["user_shell_command"];
+const USER_CONTROL_ENVELOPE_TAGS: [&str; 5] = [
+    "codex_internal_context",
+    "INSTRUCTIONS",
+    "instructions",
+    "user_instructions",
+    "environment_context",
+];
+
+/// One classified span of a `role=user` message body.
+#[derive(Debug, PartialEq, Eq)]
+enum UserSegment {
+    /// Genuine human prose (possibly all of the message).
+    Prose(String),
+    /// A whole `<user_shell_command>…</user_shell_command>` block, tags
+    /// included, preserved verbatim for full-extraction fidelity.
+    ToolEnvelope { tag: &'static str, body: String },
+    /// A whole control/instruction envelope, tags included.
+    ControlEnvelope { tag: &'static str, body: String },
+}
+
+/// Typed, whole-envelope opening-tag matcher.
+///
+/// Returns `(tag, is_tool, closes_on_same_line)` when the trimmed line is a
+/// complete opening tag for a known envelope: `<tag>` or `<tag attrs…>`,
+/// optionally terminated by the matching `</tag>` on the same line. A line
+/// where the tag is followed by same-line prose is NOT an envelope — that is
+/// a human mentioning the literal tag, and it stays in the conversation.
+fn match_envelope_open(trimmed: &str) -> Option<(&'static str, bool, bool)> {
+    if !trimmed.starts_with('<') {
+        return None;
+    }
+    let candidates = USER_TOOL_ENVELOPE_TAGS
+        .iter()
+        .map(|tag| (*tag, true))
+        .chain(USER_CONTROL_ENVELOPE_TAGS.iter().map(|tag| (*tag, false)));
+    for (tag, is_tool) in candidates {
+        let after = match trimmed[1..].strip_prefix(tag) {
+            Some(after) => after,
+            None => continue,
+        };
+        // The character after the tag name must terminate or extend the tag
+        // (`>` or whitespace before attributes) — `<user_shell_commandX>`
+        // must not match.
+        let attrs_ok = match after.chars().next() {
+            Some('>') => true,
+            Some(c) if c.is_whitespace() => true,
+            _ => false,
+        };
+        if !attrs_ok {
+            continue;
+        }
+        // The opening tag must close on this line.
+        let Some(gt) = after.find('>') else { continue };
+        let tail = after[gt + 1..].trim();
+        if tail.is_empty() {
+            return Some((tag, is_tool, false));
+        }
+        let close = format!("</{tag}>");
+        if tail.ends_with(close.as_str()) {
+            return Some((tag, is_tool, true));
+        }
+        // Opening tag followed by same-line prose: human mention, not an
+        // envelope.
+    }
+    None
+}
+
+/// Split a `role=user` message body into prose and whole-envelope segments.
+///
+/// Line-anchored and fence-aware: an envelope starts only at a line that is a
+/// complete opening tag (see [`match_envelope_open`]) outside a markdown code
+/// fence, and runs through the line holding its matching close tag. Inline
+/// mentions of the literal tag never match. An unterminated envelope runs to
+/// the end of the message — fail closed: leaking a shell result is worse than
+/// over-classifying a malformed envelope.
+fn split_user_envelope_segments(text: &str) -> Vec<UserSegment> {
+    fn push_envelope(
+        segments: &mut Vec<UserSegment>,
+        tag: &'static str,
+        is_tool: bool,
+        body: String,
+    ) {
+        segments.push(if is_tool {
+            UserSegment::ToolEnvelope { tag, body }
+        } else {
+            UserSegment::ControlEnvelope { tag, body }
+        });
+    }
+
+    let mut segments = Vec::new();
+    let mut prose = String::new();
+    let mut open: Option<(&'static str, bool, String)> = None;
+    let mut in_fence = false;
+    for line in text.lines() {
+        if let Some((tag, _, body)) = open.as_mut() {
+            body.push_str(line);
+            body.push('\n');
+            if line.trim() == format!("</{tag}>") {
+                let (tag, is_tool, body) = open.take().expect("open envelope");
+                push_envelope(&mut segments, tag, is_tool, body);
+            }
+            continue;
+        }
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+            prose.push_str(line);
+            prose.push('\n');
+            continue;
+        }
+        if !in_fence && let Some((tag, is_tool, closes_inline)) = match_envelope_open(trimmed) {
+            if !prose.trim().is_empty() {
+                segments.push(UserSegment::Prose(std::mem::take(&mut prose)));
+            } else {
+                prose.clear();
+            }
+            let mut body = String::from(line);
+            body.push('\n');
+            if closes_inline {
+                push_envelope(&mut segments, tag, is_tool, body);
+            } else {
+                open = Some((tag, is_tool, body));
+            }
+            continue;
+        }
+        prose.push_str(line);
+        prose.push('\n');
+    }
+    if let Some((tag, is_tool, body)) = open.take() {
+        push_envelope(&mut segments, tag, is_tool, body);
+    }
+    if !prose.trim().is_empty() {
+        segments.push(UserSegment::Prose(prose));
+    }
+    segments
 }
 
 fn content_text(content: &Value) -> String {
