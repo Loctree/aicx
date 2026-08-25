@@ -9,7 +9,7 @@ use serde::Serialize;
 
 const REPAIR_MCP_SCRIPT: &str = include_str!("../../tools/repair-mcp-runtime.sh");
 const INSTALL_REINDEX_SCRIPT: &str = include_str!("../../tools/install-reindex-schedule.sh");
-const REINDEX_INTERVAL_SECONDS: &str = "86400";
+const REINDEX_INTERVAL_SECONDS: &str = "8640";
 
 #[derive(Debug, Serialize)]
 pub struct RuntimeRepairReport {
@@ -77,13 +77,13 @@ pub fn repair_runtime() -> Result<RuntimeRepairReport> {
         launcher,
         mcp_service,
         index_scheduler,
-        reindex_interval_seconds: 86_400,
+        reindex_interval_seconds: 8_640,
     })
 }
 
 pub fn format_runtime_repair_text(report: &RuntimeRepairReport) -> String {
     format!(
-        "aicx runtime repaired\n\n{}\n{}\n\n  ownership: MCP serves requests; scheduled rebuild/index runs once daily\n",
+        "aicx runtime repaired\n\n{}\n{}\n\n  ownership: MCP serves requests; short-lived hot refresh/index runs every 2h24m\n",
         report.mcp_service, report.index_scheduler
     )
 }
@@ -101,9 +101,10 @@ mod tests {
     }
 
     #[test]
-    fn repair_uses_daily_short_lived_indexer() {
-        assert_eq!(REINDEX_INTERVAL_SECONDS, "86400");
-        assert!(INSTALL_REINDEX_SCRIPT.contains("catalog rebuild"));
+    fn repair_uses_short_lived_indexer_every_8640_seconds() {
+        assert_eq!(REINDEX_INTERVAL_SECONDS, "8640");
+        assert!(INSTALL_REINDEX_SCRIPT.contains("catalog refresh --json"));
+        assert!(INSTALL_REINDEX_SCRIPT.contains("catalog_present\": false"));
         assert!(INSTALL_REINDEX_SCRIPT.contains("index"));
     }
 }

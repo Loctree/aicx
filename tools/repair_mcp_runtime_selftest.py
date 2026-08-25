@@ -10,6 +10,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).parents[1]
 SCRIPT = ROOT / "tools/repair-mcp-runtime.sh"
+SCHEDULER_SCRIPT = ROOT / "tools/install-reindex-schedule.sh"
 
 
 def main() -> None:
@@ -24,7 +25,16 @@ def main() -> None:
         agents.mkdir(parents=True)
         fake_bin.mkdir()
         launcher = fake_bin / "aicx"
-        launcher.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        calls = tmp / "aicx-calls.log"
+        launcher.write_text(
+            "#!/bin/sh\n"
+            "printf '%s\\n' \"$*\" >> \"$AICX_SELFTEST_CALLS\"\n"
+            "if [ \"$*\" = 'catalog refresh --json' ]; then\n"
+            "  printf '{\"catalog_present\": %s}\\n' \"${AICX_SELFTEST_CATALOG_PRESENT:-false}\"\n"
+            "fi\n"
+            "exit 0\n",
+            encoding="utf-8",
+        )
         launcher.chmod(0o755)
         launchctl = fake_bin / "launchctl"
         launchctl.write_text(
@@ -48,6 +58,7 @@ def main() -> None:
             "HOME": str(home),
             "PATH": f"{fake_bin}:{os.environ['PATH']}",
             "AICX_BIN": str(launcher),
+            "AICX_SELFTEST_CALLS": str(calls),
         }
         subprocess.run(["bash", str(SCRIPT)], env=env, check=True, capture_output=True, text=True)
         repaired = plistlib.loads(plist_path.read_bytes())
@@ -56,6 +67,36 @@ def main() -> None:
         assert args[1:-1] == original_args[1:]
         assert args[-1] == "--no-auto-refresh"
         assert args.count("--no-auto-refresh") == 1
+        subprocess.run(
+            ["bash", str(SCHEDULER_SCRIPT)],
+            env=env,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        scheduler_path = agents / "com.loctree.aicx.reindex.plist"
+        scheduler = plistlib.loads(scheduler_path.read_bytes())
+        scheduled_command = scheduler["ProgramArguments"][2]
+        assert "catalog refresh --json" in scheduled_command
+        assert '"catalog_present": false' in scheduled_command
+        assert "catalog rebuild" in scheduled_command
+
+        subprocess.run(scheduler["ProgramArguments"], env=env, check=True, capture_output=True)
+        assert calls.read_text(encoding="utf-8").splitlines() == [
+            "catalog refresh --json",
+            "catalog rebuild",
+            "index",
+        ]
+
+        calls.unlink()
+        current_env = env | {"AICX_SELFTEST_CATALOG_PRESENT": "true"}
+        subprocess.run(
+            scheduler["ProgramArguments"], env=current_env, check=True, capture_output=True
+        )
+        assert calls.read_text(encoding="utf-8").splitlines() == [
+            "catalog refresh --json",
+            "index",
+        ]
         print("repair MCP runtime preserves network configuration: passed")
 
 
