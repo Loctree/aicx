@@ -15,6 +15,8 @@ use crate::chunker::{
     INTENT_KEYWORDS, is_decision_tag, is_local_command_artifact_line, is_outcome_tag,
     is_result_line, normalize_key, parse_checklist_task, truncate_signal_line,
 };
+use crate::extraction::conversation::{projection_kind_for_role, projection_role_for_role};
+use crate::extraction::projection::{ProjectionKind, ProjectionRole, ProjectionSpec};
 use crate::extraction::{IntentLineModality, intent_line_modality, is_harness_injected_noise};
 use crate::legacy_archive;
 use crate::sanitize;
@@ -1293,6 +1295,28 @@ fn revalidate_signal_kind(declared: IntentKind, payload: &str) -> Option<SignalV
     }
 }
 
+/// The intent signal lane (W2-T13, Decision 9): `Human` + `EchoSeal` are the
+/// operator's intention signal. `Inject` never enters distillation, and the
+/// `InterAgent` lane never does either — it is not the human and it is not
+/// the assistant. Intents own no speech reducer of their own: this spec is
+/// asked, role strings are not compared here.
+fn intent_signal_spec() -> ProjectionSpec {
+    let mut spec = ProjectionSpec::default();
+    spec.roles = vec![ProjectionRole::Human];
+    spec.kinds = vec![ProjectionKind::Human, ProjectionKind::EchoSeal];
+    // Delayed human speech (echo bus / queue) is still the human speaking.
+    spec.dialog = true;
+    spec
+}
+
+/// Does the signal lane emit this transcript role?
+fn is_intent_signal_role(spec: &ProjectionSpec, role: &str) -> bool {
+    let role_ok =
+        projection_role_for_role(role).is_some_and(|projected| spec.emits_role(projected));
+    let kind_ok = projection_kind_for_role(role).is_some_and(|kind| spec.emits_kind(kind));
+    role_ok && kind_ok
+}
+
 fn extract_transcript_candidates(
     file: &StoredChunkFile,
     project: &str,
@@ -1301,9 +1325,10 @@ fn extract_transcript_candidates(
 ) -> (Vec<IntentCandidate>, Vec<TaskEvent>) {
     let mut candidates = Vec::new();
     let mut task_events = Vec::new();
+    let signal_spec = intent_signal_spec();
 
     for entry in transcript_entries {
-        let is_user = entry.role.eq_ignore_ascii_case("user");
+        let is_user = is_intent_signal_role(&signal_spec, &entry.role);
         if is_user {
             let message = entry.lines.join("\n");
             if (is_harness_injected_noise(&entry.role, &message)
@@ -3173,8 +3198,9 @@ pub fn classify_chunk_entries(
         byte_offset += line.len() + 1;
     }
 
+    let signal_spec = intent_signal_spec();
     for entry in &transcript_entries {
-        let is_user = entry.role.eq_ignore_ascii_case("user");
+        let is_user = is_intent_signal_role(&signal_spec, &entry.role);
         for raw_line in &entry.lines {
             let trimmed = raw_line.trim();
             if trimmed.is_empty() {

@@ -24,7 +24,7 @@ use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use clap::{ArgAction, Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{Shell, generate};
 use serde::Serialize;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::io::{self, BufRead, BufReader, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -38,6 +38,8 @@ mod cli_config;
 use aicx::corpus;
 use aicx::dashboard::{self, DashboardConfig, DashboardScope};
 use aicx::dashboard_server::{self, DashboardCorsPolicy, DashboardServerConfig};
+use aicx::extraction::conversation::{self as conv, LineageLink};
+use aicx::extraction::projection::{LINEAGE_UNBOUNDED, ProjectionSpec, ProjectionWindow};
 use aicx::extraction::{self as sources, ExtractionConfig};
 use aicx::intents;
 use aicx::legacy_archive;
@@ -277,6 +279,34 @@ struct ExtractAgentArgs {
     /// Conversation-first mode: emit denoised user/assistant transcript only
     #[arg(long)]
     conversation: bool,
+
+    /// Hours to look back inside the session view (0 = unbounded). A window
+    /// on the projection, not a re-parse; absence is never a silent default.
+    #[arg(short = 'H', long, default_value = "0")]
+    hours: u64,
+
+    /// Throne kind filter (repeatable / comma list): human | echo_seal |
+    /// shell_action | inject | assistant_final | lineage_meta | inter_agent.
+    /// `inter_agent` opens the inter-agent lane; it is never rendered as
+    /// assistant and stays outside --conversation / --dialog by default.
+    #[arg(long, value_delimiter = ',', value_name = "KIND")]
+    kind: Vec<String>,
+
+    /// Dialogue view: human speech (direct + delayed echo-bus / queued, with
+    /// their seals) plus assistant-final answers.
+    #[arg(long)]
+    dialog: bool,
+
+    /// Walk parent sessions through `session_meta.forked_from_id` (session
+    /// catalog lookup, never filename guessing). Bare `--lineage` = unbounded;
+    /// `--lineage=N` = at most N parents. Needs --session (catalog).
+    #[arg(long, num_args = 0..=1, default_missing_value = "unbounded", require_equals = true, value_name = "DEPTH")]
+    lineage: Option<String>,
+
+    /// Retained shell result body: none (`$ cmd [N lines, sha256:…]`, default)
+    /// | head=N | full. The body stays in the substrate either way.
+    #[arg(long, default_value = "none", value_name = "none|head=N|full")]
+    result: String,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
@@ -1763,6 +1793,21 @@ enum Commands {
         /// embedder or dense vectors.
         #[arg(long)]
         deep: bool,
+
+        /// Dialogue view of hits: delayed human speech (echo-bus / queue)
+        /// rendered as speech, with its seals.
+        #[arg(long)]
+        dialog: bool,
+
+        /// Shell result body on tool_call hits: none (stub `$ cmd [N lines,
+        /// sha256:…]`, default) | head=N | full.
+        #[arg(long, default_value = "none", value_name = "none|head=N|full")]
+        result: String,
+
+        /// Accepted for grammar parity with `extract`; hits are chunks, so
+        /// the parent walk is reported as not applied here.
+        #[arg(long, num_args = 0..=1, default_missing_value = "unbounded", require_equals = true, value_name = "DEPTH")]
+        lineage: Option<String>,
     },
 
     /// Run local evaluation helpers for retrieval/search quality.
@@ -2539,6 +2584,11 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
                         user_only,
                         max_message_chars: max_message_chars.unwrap_or(0),
                         conversation,
+                        hours: 0,
+                        kind: Vec::new(),
+                        dialog: false,
+                        lineage: None,
+                        result: "none".to_string(),
                     };
                     run_extract_target(extract_agent, args)?;
                     return Ok(());
@@ -2985,8 +3035,27 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
             json,
             legacy_dense,
             deep,
+            dialog,
+            result,
+            lineage,
         }) => {
             aicx::search_engine::LEGACY_DENSE_ACTIVE.with(|active| active.set(legacy_dense));
+            let result_body = conv::parse_result_body_token(&result).map_err(anyhow::Error::msg)?;
+            let lineage_depth =
+                parse_lineage_depth(lineage.as_deref()).map_err(anyhow::Error::msg)?;
+            let projection = aicx::search_engine::projection_spec_for_search(
+                &aicx::search_engine::SearchProjectionFlags {
+                    projects: &project,
+                    hours,
+                    since: filters.since.as_deref(),
+                    until: filters.until.as_deref(),
+                    score: filters.score,
+                    frame_kind: filters.frame_kind.map(Into::into),
+                    dialog,
+                    result: result_body,
+                    lineage_depth,
+                },
+            );
             run_search(SearchRunArgs {
                 query: &query,
                 projects: &project,
@@ -3002,6 +3071,7 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
                 evidence,
                 deep,
                 project_match,
+                projection,
             })?;
         }
         Some(Commands::Eval { action }) => match action {
@@ -3493,7 +3563,9 @@ fn load_session_claims(
         resolved.source.logical_session_id.clone(),
         &resolved.source.path,
     )?;
-    let entries = parse_selected_source_once(&handle, true)?;
+    // Claims / results / clarify lanes read every role and kind: full view,
+    // still one `ProjectionSpec`, never a bare `true`.
+    let entries = parse_selected_source_once(&handle, &ProjectionSpec::full())?;
     if entries.is_empty() {
         anyhow::bail!(
             "no entries for session '{session}' (agent {agent_str}, source {}); the source parsed empty within --hours {hours}",
@@ -5434,6 +5506,10 @@ struct ExtractFileOptions {
     max_message_chars: usize,
     redact_secrets: bool,
     conversation: bool,
+    /// The one decision record for what leaves the substrate (W2-T13).
+    /// `include_assistant` / `max_message_chars` above are the legacy axes
+    /// the same flags also feed; the spec is what the render paths consult.
+    projection: ProjectionSpec,
 }
 
 /// Resolve the default output path for `aicx extract --session ...`:
@@ -5893,17 +5969,82 @@ fn write_conversation_batch_session(
     Ok(projection.messages.len())
 }
 
+/// Parse `--lineage` / `--lineage=N`: bare flag = unbounded parent walk.
+fn parse_lineage_depth(raw: Option<&str>) -> Result<Option<usize>, String> {
+    match raw {
+        None => Ok(None),
+        Some("unbounded") | Some("") => Ok(Some(LINEAGE_UNBOUNDED)),
+        Some(depth) => depth.parse::<usize>().map(Some).map_err(|_| {
+            format!("--lineage={depth} is not a depth; use bare --lineage or --lineage=N")
+        }),
+    }
+}
+
+/// Flags -> `ProjectionSpec` for `aicx extract <agent>` (contract:
+/// `docs/OUTPUT_PROJECTION_CONTRACT.md`, "Flag -> field (extract)").
+/// Unknown `--kind` / `--result` / `--lineage` tokens refuse loudly; the view
+/// is never silently widened or narrowed.
+fn projection_spec_for_extract(
+    args: &ExtractAgentArgs,
+) -> Result<ProjectionSpec, aicx::cli::failure::StructuredFailure> {
+    let mut spec = conv::spec_for_user_only(args.user_only);
+    if !args.kind.is_empty() {
+        spec.kinds = conv::parse_kind_tokens(&args.kind).map_err(|reason| {
+            aicx::cli::failure::StructuredFailure::new(
+                "invalid_kind_token",
+                reason,
+                "pass throne kinds: human, echo_seal, shell_action, inject, assistant_final, lineage_meta, inter_agent",
+            )
+        })?;
+    }
+    spec.dialog = args.dialog;
+    spec.result = conv::parse_result_body_token(&args.result).map_err(|reason| {
+        aicx::cli::failure::StructuredFailure::new(
+            "invalid_result_token",
+            reason,
+            "use --result none | head=N | full",
+        )
+    })?;
+    spec.lineage_depth = parse_lineage_depth(args.lineage.as_deref()).map_err(|reason| {
+        aicx::cli::failure::StructuredFailure::new(
+            "invalid_lineage_depth",
+            reason,
+            "use bare --lineage or --lineage=N",
+        )
+    })?;
+    spec.max_message_chars = args.max_message_chars;
+    spec.window = ProjectionWindow {
+        hours: (args.hours > 0).then_some(args.hours),
+        since: None,
+        until: None,
+    };
+    spec.project = args.project.iter().cloned().collect();
+    Ok(spec)
+}
+
 /// Dispatch one canonical `aicx extract <agent> ...` invocation.
 ///
 /// Exactly one addressing mode is accepted: `--session <id>` (catalog
 /// locate-before-parse) or `--file <path>` (direct handle, no discovery).
 fn run_extract_target(agent: ExtractAgent, args: ExtractAgentArgs) -> Result<()> {
     let json = aicx::cli::failure::want_json_envelope(false);
+    let projection = match projection_spec_for_extract(&args) {
+        Ok(spec) => spec,
+        Err(failure) => {
+            aicx::cli::failure::emit_and_error(
+                &format!("aicx extract {}", agent.label()),
+                json,
+                failure,
+            );
+            std::process::exit(2);
+        }
+    };
     let options = ExtractFileOptions {
         include_assistant: !args.user_only,
         max_message_chars: args.max_message_chars,
         redact_secrets: args.redaction.redact_secrets,
         conversation: args.conversation,
+        projection,
     };
     match (args.session, args.file) {
         (Some(session), None) => {
@@ -6066,14 +6207,116 @@ fn grok_direct_source_id(agent: ExtractAgent, path: &Path) -> Option<String> {
 /// the callers.
 fn parse_selected_source_once(
     handle: &aicx::parser::engine::SourceHandle,
-    include_assistant: bool,
+    projection: &ProjectionSpec,
 ) -> Result<Vec<timeline::TimelineEntry>> {
     let session = aicx::parser_dispatch::parse_handle(handle)?;
-    let mut entries = aicx::output::timeline_entries_from_model(session.model());
-    if !include_assistant {
-        entries.retain(|entry| entry.role == "user");
-    }
+    let entries = aicx::output::timeline_entries_from_model(session.model());
+    // Shell actions fold with their retained result first (so the stub /
+    // head / full rendering is one entry), then the spec decides what stays.
+    // No role-string reducer here (W2-T13).
+    let mut entries = conv::fold_shell_results(entries, projection);
+    conv::apply_projection(&mut entries, projection);
     Ok(entries)
+}
+
+/// One hop of the `--lineage` walk plus the catalog source it resolved to.
+struct LineageHop {
+    link: LineageLink,
+    source: aicx::session_catalog::CatalogSource,
+}
+
+/// Bounded header read: the first records of a session source, looking for
+/// `session_meta.payload.forked_from_id` (codex rollout line 1) or a
+/// top-level `forked_from_id`. Meta only — never the filename. Claude sources
+/// carry no session-level fork pointer (`parentUuid` is a per-record chain,
+/// and a fork shares that chain with its origin), so they return `None`.
+fn read_forked_from_id(path: &Path) -> Option<String> {
+    const HEADER_RECORDS: usize = 8;
+    const MAX_HEADER_LINE_BYTES: usize = 16 * 1024 * 1024;
+    let file = fs::File::open(path).ok()?;
+    let mut reader = BufReader::new(file);
+    let mut line = String::new();
+    for _ in 0..HEADER_RECORDS {
+        line.clear();
+        let read = reader.read_line(&mut line).ok()?;
+        if read == 0 {
+            break;
+        }
+        if line.len() > MAX_HEADER_LINE_BYTES {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim_end()) else {
+            continue;
+        };
+        let candidate = value
+            .get("payload")
+            .and_then(|payload| payload.get("forked_from_id"))
+            .or_else(|| value.get("forked_from_id"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|id| !id.trim().is_empty());
+        if let Some(id) = candidate {
+            return Some(id.trim().to_string());
+        }
+        if value.get("type").and_then(serde_json::Value::as_str) == Some("session_meta") {
+            // The meta record exists and names no parent: this is a root.
+            return None;
+        }
+    }
+    None
+}
+
+/// Walk `forked_from_id` parents through the session catalog. `depth` is the
+/// number of parents to expand (`LINEAGE_UNBOUNDED` = until a root). Cycles
+/// and unresolvable parents stop the walk and are reported on the link.
+fn walk_lineage(
+    catalog: &aicx::session_catalog::SessionCatalog,
+    root: &aicx::session_catalog::CatalogSource,
+    depth: usize,
+) -> Vec<LineageHop> {
+    let mut hops = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut current = root.clone();
+    let mut level = 0usize;
+    loop {
+        seen.insert(current.source_id.clone());
+        let parent = read_forked_from_id(&current.path);
+        let (resolved, next) = match parent.as_deref() {
+            Some(parent_id) => match catalog.resolve(parent_id) {
+                Ok(resolved) => (true, Some(resolved.source)),
+                Err(_) => (false, None),
+            },
+            None => (true, None),
+        };
+        hops.push(LineageHop {
+            link: LineageLink {
+                depth: level,
+                session_id: current.source_id.clone(),
+                forked_from_id: parent.clone(),
+                resolved,
+            },
+            source: current.clone(),
+        });
+        let Some(next) = next else {
+            break;
+        };
+        if level >= depth {
+            eprintln!(
+                "extract: lineage depth {depth} reached; parent `{}` not expanded",
+                next.source_id
+            );
+            break;
+        }
+        if seen.contains(&next.source_id) {
+            eprintln!(
+                "extract: lineage cycle at `{}`; walk stopped",
+                next.source_id
+            );
+            break;
+        }
+        level += 1;
+        current = next;
+    }
+    hops
 }
 
 /// Run `aicx extract <agent> --session <id>`: resolve the session catalog
@@ -6139,7 +6382,7 @@ fn run_extract_session(
     // agents stay single-artifact.
     debug_assert!(!handle.artifacts().is_empty());
 
-    let entries = parse_selected_source_once(&handle, options.include_assistant)?;
+    let mut entries = parse_selected_source_once(&handle, &options.projection)?;
     if entries.is_empty() {
         anyhow::bail!(
             "Resolved session `{}` to `{}`, but no entries were extractable from {} for agent `{}`.",
@@ -6148,6 +6391,49 @@ fn run_extract_session(
             resolved.source.path.display(),
             agent.label(),
         );
+    }
+
+    // `--lineage[=N]`: parent sessions from `session_meta.forked_from_id`,
+    // resolved through the same catalog (meta, not names). Parents are
+    // parsed once each through the same projection; the walk itself is
+    // emitted as `LineageMeta` entries the spec already admits.
+    let mut session_ids = vec![resolved.source.source_id.clone()];
+    if let Some(depth) = options.projection.lineage_depth {
+        let hops = walk_lineage(&catalog, &resolved.source, depth);
+        for hop in &hops {
+            eprintln!("extract: {}", hop.link.render());
+        }
+        if hops.len() == 1 && hops[0].link.forked_from_id.is_none() {
+            eprintln!(
+                "extract: lineage: `{}` names no forked_from_id in its session meta ({} sources carry none at session level; codex rollouts do)",
+                resolved.source.source_id,
+                agent.label()
+            );
+        }
+        for hop in hops.iter().skip(1) {
+            let parent_handle = source_handle_for_file(
+                agent,
+                &hop.source.source_id,
+                hop.source.logical_session_id.clone(),
+                &hop.source.path,
+            )?;
+            let parent_entries = parse_selected_source_once(&parent_handle, &options.projection)?;
+            eprintln!(
+                "extract: lineage parent `{}` -> {} entries ({})",
+                hop.source.source_id,
+                parent_entries.len(),
+                hop.source.path.display()
+            );
+            session_ids.push(hop.source.source_id.clone());
+            entries.extend(parent_entries);
+        }
+        let anchor = entries
+            .iter()
+            .map(|entry| entry.timestamp)
+            .min()
+            .unwrap_or_else(Utc::now);
+        let links: Vec<LineageLink> = hops.into_iter().map(|hop| hop.link).collect();
+        entries.extend(conv::lineage_entries(agent.label(), &links, anchor));
     }
 
     let output_path = match output {
@@ -6166,7 +6452,7 @@ fn run_extract_session(
     write_extract_outputs(ExtractRender {
         agent,
         entries,
-        sessions: Some(vec![resolved.source.source_id]),
+        sessions: Some(session_ids),
         explicit_project,
         fallback_identity: format!("{}/{}", agent.label(), session_label),
         output_path: output_path.clone(),
@@ -6217,7 +6503,12 @@ fn run_extract_direct_file(
     debug_assert!(!handle.artifacts().is_empty());
     eprintln!("extract: catalog_files_opened=0 sources_parsed=1");
 
-    let entries = parse_selected_source_once(&handle, options.include_assistant)?;
+    if options.projection.lineage_depth.is_some() {
+        eprintln!(
+            "extract: lineage: --file has no session catalog; the forked_from_id walk needs --session"
+        );
+    }
+    let entries = parse_selected_source_once(&handle, &options.projection)?;
 
     let fallback_identity = if options.conversation {
         "file input".to_string()
@@ -6315,13 +6606,14 @@ fn write_extract_outputs(render: ExtractRender) -> Result<()> {
         .to_lowercase();
 
     if options.conversation {
-        let projection = sources::to_conversation_with_stats(&entries, &[project_identity]);
+        let projection =
+            conv::project_conversation(&entries, &[project_identity], &options.projection);
         let extract_stats = output::ConversationExtractStats {
             aicx_version: env!("CARGO_PKG_VERSION"),
             redaction_enabled: options.redact_secrets,
             raw_entries: entries.len(),
             conversation_messages: projection.messages.len(),
-            conversation_projection: "user_assistant_only",
+            conversation_projection: conv::PROJECTION_LABEL,
             exact_short_duplicates_dropped: projection.exact_short_duplicates_dropped,
             harness_noise_dropped: projection.harness_noise_dropped,
         };
@@ -7815,6 +8107,9 @@ struct SearchRunArgs<'a> {
     evidence: bool,
     deep: bool,
     project_match: legacy_archive::ProjectMatchMode,
+    /// Output projection for hit rendering (W2-T13). Retrieval flags stay
+    /// retrieval; this only decides how an admitted hit looks.
+    projection: ProjectionSpec,
 }
 
 fn validate_cli_search_limit(limit: usize) -> Result<()> {
@@ -8013,6 +8308,7 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
         evidence,
         deep,
         project_match,
+        projection,
     } = args;
     if let Some(session) = session {
         let root = aicx::aicx_home::resolve()?;
@@ -8296,6 +8592,12 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
         sort_label,
         limit,
     );
+    // View over the finalized hits: score floor, frame-kind axis, shell
+    // stub / head / full. The index is untouched.
+    let results = aicx::search_engine::project_search_results(results, &projection);
+    if let Some(note) = aicx::search_engine::render_search_projection_note(&projection) {
+        eprintln!("{note}");
+    }
 
     // Source-chunk count from the hybrid manifest (if this was a hybrid run);
     // borrow so the by-value `match semantic_status` below still owns it.
