@@ -23,6 +23,7 @@ pub mod files;
 mod importer_support;
 pub mod list;
 pub mod project;
+pub mod projection;
 
 pub use conversation::{
     ConversationProjection, is_harness_injected_noise, to_conversation, to_conversation_with_stats,
