@@ -2,7 +2,10 @@
 use super::*;
 
 use super::projection::{ProjectionKind, ProjectionRole, ProjectionSpec, ResultBody};
-use aicx_parser::engine::sha256_hex;
+use aicx_parser::engine::{
+    AgentKind, ContextEpochRef, EntryOrigin, FrameClass, ProviderConversationRef, RefusalEvidence,
+    RefusalReason, ScopeStatus, sha256_hex,
+};
 
 const EXACT_SHORT_DUP_MAX_CHARS: usize = 1000;
 const EXACT_SHORT_DUP_WINDOW_MS: i64 = 2_000;
@@ -12,26 +15,24 @@ const EXACT_SHORT_DUP_WINDOW_MS: i64 = 2_000;
 /// hard-coded `user_assistant_only` reducer.
 pub const PROJECTION_LABEL: &str = "projection_spec";
 
-/// Synthetic role of the parent-pointer entries emitted by `--lineage`.
-/// The flattened model has no `LineageMeta` turn; the CLI materializes the
-/// walk from `session_meta.forked_from_id` as entries with this role so the
-/// bridge below can hand them to the spec as [`ProjectionKind::LineageMeta`].
+/// Synthetic role of the lineage entries emitted by `--lineage` for the
+/// walk itself (graph edges). Entries that came out of the model carry
+/// `frame_class = LineageMeta` and need no synthetic role.
 pub const LINEAGE_ROLE: &str = "lineage";
 
 // ---------------------------------------------------------------------------
-// Bridge: flattened model -> throne vocabulary (single speech decision, W2-T13)
+// Bridge: model -> throne vocabulary (single speech decision, W2-T13 / W2-R1)
 // ---------------------------------------------------------------------------
 //
-// `TimelineEntry` carries `role` + `frame_kind` (`TurnKind` projection), not
-// the `FrameClass` the adapters classified with (`crates/aicx-parser/src/
-// engine/frames.rs`). Three throne classes are therefore invisible here:
-//   * `EchoSeal` arrives as `UserMsg` (same `TurnKind` as `Human`);
-//   * `LineageMeta` arrives as `SystemNote` (same as `Inject`);
-//   * `InterAgent` has no `TurnKind` and never reaches this layer.
-// This bridge is the ONLY place in the consumers that turns a role / frame
-// kind string into a projection decision. Consumers ask the spec; they do
-// not compare role strings themselves. Recovering the three hidden classes
-// needs the model to carry `FrameClass` (BOUNDARY: `crates/**`, W3).
+// Since W2-R1 every throne-owned turn carries its `FrameClass` on
+// `TimelineEntry::frame_class`; the projection kind is read from the class
+// (`ProjectionKind::from_frame_class`) — `EchoSeal`, `LineageMeta` and
+// `InterAgent` are distinguishable here without any local reducer. The
+// role / `frame_kind` fallback below exists ONLY for entries that never went
+// through the model (store chunks, importers, legacy archives, lanes the
+// throne does not own: tool call/result, reasoning, harness events). This
+// bridge stays the one place that turns a role / frame-kind string into a
+// projection decision; consumers ask the spec, never compare role strings.
 
 /// Speaker axis for a role string as the model emits it
 /// (`output::report::role_str_for_turn`).
@@ -68,8 +69,12 @@ pub fn projection_kind_for_role(role: &str) -> Option<ProjectionKind> {
     }
 }
 
-/// Throne kind for one timeline entry: `frame_kind` first, role as fallback.
+/// Throne kind for one timeline entry: the carried `FrameClass` first
+/// (W2-R1), then `frame_kind`, then role as the last fallback.
 pub fn projection_kind_for_entry(entry: &TimelineEntry) -> Option<ProjectionKind> {
+    if let Some(class) = &entry.frame_class {
+        return Some(ProjectionKind::from_frame_class(class));
+    }
     if entry.role.eq_ignore_ascii_case(LINEAGE_ROLE) {
         return Some(ProjectionKind::LineageMeta);
     }
@@ -82,9 +87,28 @@ pub fn projection_kind_for_entry(entry: &TimelineEntry) -> Option<ProjectionKind
     }
 }
 
-/// Speaker axis for one timeline entry.
+/// Speaker axis for one timeline entry: the throne's `turn_role` when the
+/// class is carried, the role string otherwise.
 pub fn projection_role_for_entry(entry: &TimelineEntry) -> Option<ProjectionRole> {
+    if let Some(class) = &entry.frame_class {
+        return Some(match class.turn_role() {
+            aicx_parser::engine::TurnRole::User => ProjectionRole::Human,
+            aicx_parser::engine::TurnRole::Assistant | aicx_parser::engine::TurnRole::Tool => {
+                ProjectionRole::Assistant
+            }
+            aicx_parser::engine::TurnRole::System => ProjectionRole::System,
+        });
+    }
     projection_role_for_role(&entry.role)
+}
+
+/// Human channel of an entry when the model carried it; `None` for
+/// class-less entries (their channel is unknowable here, not `Direct`).
+pub fn human_channel_for_entry(entry: &TimelineEntry) -> Option<aicx_parser::engine::HumanChannel> {
+    entry
+        .frame_class
+        .as_ref()
+        .and_then(FrameClass::human_channel)
 }
 
 /// `true` when the entry is the retained result half of a shell action
@@ -101,7 +125,11 @@ pub fn is_shell_result_entry(entry: &TimelineEntry) -> bool {
 pub fn spec_admits_entry(spec: &ProjectionSpec, entry: &TimelineEntry) -> bool {
     let role_ok = projection_role_for_entry(entry).is_some_and(|role| spec.emits_role(role));
     let kind_ok = projection_kind_for_entry(entry).is_some_and(|kind| spec.emits_kind(kind));
-    role_ok && kind_ok
+    // Human channel (Decision 7): delayed speech (echo bus / queue) is a
+    // channel the spec may withhold even when the kind is admitted.
+    let channel_ok =
+        human_channel_for_entry(entry).is_none_or(|channel| spec.emits_human_channel(channel));
+    role_ok && kind_ok && channel_ok
 }
 
 /// Window axis (`-H` / `--since` / `--until`) evaluated against `now`.
@@ -243,55 +271,226 @@ pub fn parse_kind_tokens(tokens: &[String]) -> Result<Vec<ProjectionKind>, Strin
     Ok(kinds)
 }
 
-/// One hop of the `--lineage` walk: `session_id` and the parent it names in
-/// its `session_meta.forked_from_id`. `resolved` is `false` when the parent
-/// id exists in the meta but the session catalog could not locate it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LineageLink {
-    pub depth: usize,
-    pub session_id: String,
-    pub forked_from_id: Option<String>,
-    pub resolved: bool,
+// ---------------------------------------------------------------------------
+// Lineage: a graph of tagged conversation refs, not a list of ids (W2-R1)
+// ---------------------------------------------------------------------------
+
+/// How a child conversation is attached to its parent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LineageEdgeKind {
+    /// Provider wrote the pointer down (Codex `forked_from_id`).
+    DeclaredFork,
+    /// Sub-agent thread under a parent thread (Codex `parent_thread_id`).
+    ParentThread,
+    /// Established by identical records in both files (Claude `/fork`
+    /// copies the origin's prefix with the same `uuid`s; no pointer exists).
+    SharedPrefix,
 }
 
-impl LineageLink {
-    /// Render the link as the body of a `LineageMeta` entry.
-    pub fn render(&self) -> String {
-        match (&self.forked_from_id, self.resolved) {
-            (Some(parent), true) => {
-                format!(
-                    "lineage[{}]: {} forked_from {}",
-                    self.depth, self.session_id, parent
-                )
-            }
-            (Some(parent), false) => format!(
-                "lineage[{}]: {} forked_from {} (parent not in session catalog)",
-                self.depth, self.session_id, parent
-            ),
-            (None, _) => format!(
-                "lineage[{}]: {} (root; no forked_from_id)",
-                self.depth, self.session_id
-            ),
+impl LineageEdgeKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::DeclaredFork => "declared_fork",
+            Self::ParentThread => "parent_thread",
+            Self::SharedPrefix => "shared_prefix",
         }
     }
 }
 
-/// Materialize lineage links as timeline entries the projection can emit
+/// One conversation in the lineage graph.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LineageNode {
+    /// Hops from the requested conversation (0 = the request itself).
+    pub depth: usize,
+    /// Provider-tagged identity — Codex nodes carry `tree_session_id` /
+    /// `thread_id` / `parent_thread_id`, Claude nodes `session_id`.
+    pub conversation: ProviderConversationRef,
+    /// `false` when a parent is named but the catalog could not locate it.
+    pub resolved: bool,
+    /// Entries native to this node in the merged timeline.
+    pub own_entries: usize,
+    /// Entries this node shares with a parent (counted once, tagged
+    /// `EntryOrigin::InheritedFrom`).
+    pub inherited_entries: usize,
+    /// Compaction boundaries of this node: context epochs, never sources.
+    pub epochs: Vec<ContextEpochRef>,
+}
+
+impl LineageNode {
+    pub fn node_id(&self) -> &str {
+        self.conversation.node_id()
+    }
+}
+
+/// One parent pointer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LineageEdge {
+    pub child: String,
+    pub parent: String,
+    pub kind: LineageEdgeKind,
+    pub resolved: bool,
+}
+
+/// The lineage of one requested conversation: nodes keyed by
+/// `ProviderConversationRef::node_id`, edges child → parent, and the
+/// branch boundary of each node (where its own history starts in the
+/// merged timeline). Inherited history is stored once.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct LineageGraph {
+    pub root: String,
+    pub nodes: Vec<LineageNode>,
+    pub edges: Vec<LineageEdge>,
+}
+
+impl LineageGraph {
+    pub fn new(root: ProviderConversationRef, epochs: Vec<ContextEpochRef>) -> Self {
+        let root_id = root.node_id().to_owned();
+        Self {
+            root: root_id,
+            nodes: vec![LineageNode {
+                depth: 0,
+                conversation: root,
+                resolved: true,
+                own_entries: 0,
+                inherited_entries: 0,
+                epochs,
+            }],
+            edges: Vec::new(),
+        }
+    }
+
+    pub fn node(&self, id: &str) -> Option<&LineageNode> {
+        self.nodes.iter().find(|node| node.node_id() == id)
+    }
+
+    pub fn node_mut(&mut self, id: &str) -> Option<&mut LineageNode> {
+        self.nodes.iter_mut().find(|node| node.node_id() == id)
+    }
+
+    /// Attach `parent` under `child`. Returns `false` (and adds nothing)
+    /// when the parent is already in the graph — a cycle or a diamond is
+    /// reported by the caller, not silently walked twice.
+    pub fn attach_parent(
+        &mut self,
+        child: &str,
+        parent: ProviderConversationRef,
+        kind: LineageEdgeKind,
+        resolved: bool,
+        epochs: Vec<ContextEpochRef>,
+    ) -> bool {
+        let parent_id = parent.node_id().to_owned();
+        if self.node(&parent_id).is_some() {
+            return false;
+        }
+        let depth = self.node(child).map_or(0, |node| node.depth) + 1;
+        self.nodes.push(LineageNode {
+            depth,
+            conversation: parent,
+            resolved,
+            own_entries: 0,
+            inherited_entries: 0,
+            epochs,
+        });
+        self.edges.push(LineageEdge {
+            child: child.to_owned(),
+            parent: parent_id,
+            kind,
+            resolved,
+        });
+        true
+    }
+
+    /// Record an unresolved parent pointer (named in the meta, absent from
+    /// the catalog) as a dangling node so the report says so.
+    pub fn attach_unresolved(&mut self, child: &str, parent_id: &str, kind: LineageEdgeKind) {
+        let agent = self
+            .node(child)
+            .map_or(AgentKind::Codex, |node| node.conversation.agent());
+        let parent = ProviderConversationRef::from_store_id(agent, parent_id);
+        self.attach_parent(child, parent, kind, false, Vec::new());
+    }
+
+    /// The node that owns no parent edge.
+    pub fn is_root_only(&self) -> bool {
+        self.edges.is_empty()
+    }
+
+    /// One line per node/edge, in walk order: what the graph knows.
+    pub fn render_lines(&self) -> Vec<String> {
+        let mut lines = Vec::with_capacity(self.nodes.len() + self.edges.len());
+        for node in &self.nodes {
+            let id = node.node_id();
+            let parents: Vec<&LineageEdge> =
+                self.edges.iter().filter(|edge| edge.child == id).collect();
+            if parents.is_empty() {
+                let unobserved = node.conversation.unobserved();
+                let note = if unobserved.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (unobserved: {})", unobserved.join(","))
+                };
+                lines.push(format!(
+                    "lineage[{}]: {} {} (root; no parent pointer){note}",
+                    node.depth,
+                    node.conversation.agent().as_str(),
+                    id
+                ));
+            }
+            for edge in parents {
+                lines.push(format!(
+                    "lineage[{}]: {} {} <- {} via {}{}",
+                    node.depth,
+                    node.conversation.agent().as_str(),
+                    id,
+                    edge.parent,
+                    edge.kind.as_str(),
+                    if edge.resolved {
+                        ""
+                    } else {
+                        " (parent not in session catalog)"
+                    }
+                ));
+            }
+            for epoch in &node.epochs {
+                lines.push(format!(
+                    "lineage[{}]: {} epoch #{} (compaction; {} replaced ref(s); not a source)",
+                    node.depth,
+                    id,
+                    epoch.compaction_index,
+                    epoch.replacement_refs.len()
+                ));
+            }
+            if node.inherited_entries > 0 {
+                lines.push(format!(
+                    "lineage[{}]: {} shares {} entrie(s) with its parent (counted once)",
+                    node.depth, id, node.inherited_entries
+                ));
+            }
+        }
+        lines
+    }
+}
+
+/// Materialize the lineage graph as timeline entries the projection can emit
 /// under `ProjectionKind::LineageMeta`. Timestamps come from the child's
-/// first entry so the links sort ahead of the session they annotate.
+/// first entry so the lines sort ahead of the history they annotate.
 pub fn lineage_entries(
     agent: &str,
-    links: &[LineageLink],
+    graph: &LineageGraph,
     anchor: DateTime<Utc>,
 ) -> Vec<TimelineEntry> {
-    links
-        .iter()
-        .map(|link| TimelineEntry {
+    graph
+        .render_lines()
+        .into_iter()
+        .map(|line| TimelineEntry {
             timestamp: anchor,
             agent: agent.to_string(),
-            session_id: link.session_id.clone(),
+            session_id: graph.root.clone(),
             role: LINEAGE_ROLE.to_string(),
-            message: link.render(),
+            message: line,
+            frame_class: None,
+            lineage_origin: Some(EntryOrigin::Own),
             frame_kind: Some(FrameKind::SystemNote),
             branch: None,
             cwd: None,
@@ -301,6 +500,172 @@ pub fn lineage_entries(
             source_line_span: None,
         })
         .collect()
+}
+
+/// Result of laying a parent's timeline under a child's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InheritedMerge {
+    pub entries: Vec<TimelineEntry>,
+    /// Child entries that also exist in the parent: kept once, tagged
+    /// `EntryOrigin::InheritedFrom`.
+    pub inherited_from_parent: usize,
+    /// Parent entries beyond the branch point: the parent's own
+    /// continuation, tagged `EntryOrigin::ParentOnly`.
+    pub parent_only: usize,
+}
+
+fn record_key(entry: &TimelineEntry) -> (i64, String, String) {
+    (
+        entry.timestamp.timestamp_millis(),
+        entry.role.to_ascii_lowercase(),
+        entry.message.trim().to_owned(),
+    )
+}
+
+/// Lay `parent` under `child` without doubling the history the child
+/// inherited. A record present in both (same seal timestamp, role and body
+/// — the Claude fork prefix is a byte copy with identical `uuid`s, so this
+/// is exact, not fuzzy) stays once, on the child, tagged
+/// `InheritedFrom { conversation: parent, via }`. Parent records the child
+/// does not carry are the parent's own branch and are tagged `ParentOnly`.
+/// Nothing is dropped and nothing is emitted twice.
+pub fn merge_inherited(
+    child: Vec<TimelineEntry>,
+    parent: Vec<TimelineEntry>,
+    parent_ref: &ProviderConversationRef,
+    via: LineageEdgeKind,
+) -> InheritedMerge {
+    let mut parent_keys: HashMap<(i64, String, String), usize> = HashMap::new();
+    for entry in &parent {
+        *parent_keys.entry(record_key(entry)).or_insert(0) += 1;
+    }
+    let mut inherited_from_parent = 0usize;
+    let mut entries: Vec<TimelineEntry> = Vec::with_capacity(child.len() + parent.len());
+    for mut entry in child {
+        let key = record_key(&entry);
+        if let Some(remaining) = parent_keys.get_mut(&key)
+            && *remaining > 0
+        {
+            *remaining -= 1;
+            inherited_from_parent += 1;
+            entry.lineage_origin = Some(EntryOrigin::InheritedFrom {
+                conversation: parent_ref.clone(),
+                via: via.as_str().to_owned(),
+            });
+        } else if entry.lineage_origin.is_none() {
+            entry.lineage_origin = Some(EntryOrigin::Own);
+        }
+        entries.push(entry);
+    }
+    let mut parent_only = 0usize;
+    for mut entry in parent {
+        let key = record_key(&entry);
+        // Keys still counted here were never matched by a child record.
+        if let Some(remaining) = parent_keys.get_mut(&key)
+            && *remaining > 0
+        {
+            *remaining -= 1;
+            parent_only += 1;
+            entry.lineage_origin = Some(EntryOrigin::ParentOnly {
+                conversation: parent_ref.clone(),
+            });
+            entries.push(entry);
+        }
+    }
+    entries.sort_by(|left, right| left.timestamp.cmp(&right.timestamp));
+    InheritedMerge {
+        entries,
+        inherited_from_parent,
+        parent_only,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Scope: is this span one workstream? (W2-R1)
+// ---------------------------------------------------------------------------
+
+/// Structural scope of a span of entries, with the evidence that produced it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScopeReport {
+    pub status: ScopeStatus,
+    pub cwds: Vec<String>,
+    pub branches: Vec<String>,
+    pub entries: usize,
+}
+
+/// Scope from the entries' own `cwd` / `branch` evidence. Unknown values do
+/// not count as a second workstream; topic-level mixing inside one cwd is
+/// invisible here and is not guessed at.
+pub fn scope_report_for_entries(entries: &[TimelineEntry]) -> ScopeReport {
+    let cwds: BTreeSet<String> = entries
+        .iter()
+        .filter_map(|entry| entry.cwd.as_deref())
+        .map(str::trim)
+        .filter(|cwd| !cwd.is_empty())
+        .map(str::to_owned)
+        .collect();
+    let branches: BTreeSet<String> = entries
+        .iter()
+        .filter_map(|entry| entry.branch.as_deref())
+        .map(str::trim)
+        .filter(|branch| !branch.is_empty())
+        .map(str::to_owned)
+        .collect();
+    let status = ScopeStatus::from_evidence(
+        cwds.iter().map(String::as_str),
+        branches.iter().map(String::as_str),
+    );
+    ScopeReport {
+        status,
+        cwds: cwds.into_iter().collect(),
+        branches: branches.into_iter().collect(),
+        entries: entries.len(),
+    }
+}
+
+/// The refusal a single-history distiller (`continuity`) must return for a
+/// mixed candidate instead of `Ok(empty)` or a braided narrative. `None`
+/// when the scope is not mixed or the caller explicitly asked to distill
+/// mixed spans.
+pub fn refuse_mixed_workstream(
+    agent: AgentKind,
+    session_id: &str,
+    report: &ScopeReport,
+    distill_mixed: bool,
+) -> Option<RefusalReason> {
+    if distill_mixed || report.status != ScopeStatus::MixedCandidate {
+        return None;
+    }
+    let mut consumed_by_kind = std::collections::BTreeMap::new();
+    consumed_by_kind.insert("timeline_entry".to_owned(), report.entries as u64);
+    let mut examined = Vec::with_capacity(report.cwds.len() + report.branches.len() + 1);
+    examined.push(format!(
+        "scope_status={} cwds={} branches={}",
+        report.status.as_str(),
+        report.cwds.len(),
+        report.branches.len()
+    ));
+    examined.extend(report.cwds.iter().map(|cwd| format!("cwd={cwd}")));
+    examined.extend(
+        report
+            .branches
+            .iter()
+            .map(|branch| format!("branch={branch}")),
+    );
+    Some(RefusalReason::MixedWorkstream {
+        agent,
+        session_id: session_id.to_owned(),
+        cwds: report.cwds.clone(),
+        branches: report.branches.clone(),
+        evidence: RefusalEvidence {
+            raw_unit_count: report.entries as u64,
+            consumed_by_kind,
+            known_skipped: std::collections::BTreeMap::new(),
+            threshold: 1,
+            found: report.cwds.len().max(report.branches.len()) as u64,
+            examined,
+        },
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -593,6 +958,8 @@ mod harness_noise_tests {
             session_id: "s1".into(),
             role: role.into(),
             message: message.into(),
+            frame_class: None,
+            lineage_origin: None,
             frame_kind: Some(if role == "user" {
                 FrameKind::UserMsg
             } else {
@@ -637,21 +1004,230 @@ mod harness_noise_tests {
             projection_kind_for_entry(&note),
             Some(ProjectionKind::Inject)
         );
-        let lineage = &lineage_entries(
-            "codex",
-            &[LineageLink {
-                depth: 0,
-                session_id: "child".into(),
-                forked_from_id: Some("parent".into()),
-                resolved: true,
-            }],
-            Utc.timestamp_opt(1, 0).unwrap(),
-        )[0];
+        let mut graph = LineageGraph::new(codex_ref("child", Some("parent")), Vec::new());
+        assert!(graph.attach_parent(
+            "child",
+            codex_ref("parent", None),
+            LineageEdgeKind::DeclaredFork,
+            true,
+            Vec::new(),
+        ));
+        let lineage = lineage_entries("codex", &graph, Utc.timestamp_opt(1, 0).unwrap());
         assert_eq!(
-            projection_kind_for_entry(lineage),
+            projection_kind_for_entry(&lineage[0]),
             Some(ProjectionKind::LineageMeta)
         );
-        assert_eq!(lineage.message, "lineage[0]: child forked_from parent");
+        assert_eq!(
+            lineage[0].message,
+            "lineage[0]: codex child <- parent via declared_fork"
+        );
+        assert!(
+            lineage[1]
+                .message
+                .starts_with("lineage[1]: codex parent (root; no parent pointer)")
+        );
+    }
+
+    fn codex_ref(thread: &str, forked_from: Option<&str>) -> ProviderConversationRef {
+        ProviderConversationRef::Codex {
+            tree_session_id: thread.to_owned(),
+            thread_id: Some(thread.to_owned()),
+            forked_from_id: forked_from.map(str::to_owned),
+            parent_thread_id: None,
+            window_id: None,
+            unobserved: Vec::new(),
+        }
+    }
+
+    fn claude_ref(session: &str) -> ProviderConversationRef {
+        ProviderConversationRef::Claude {
+            session_id: session.to_owned(),
+            agent_id: None,
+            unobserved: Vec::new(),
+        }
+    }
+
+    fn classed(role: &str, message: &str, ts: i64, class: FrameClass) -> TimelineEntry {
+        let mut entry = entry(role, message, ts);
+        entry.frame_kind = class.turn_kind().map(|kind| match kind {
+            aicx_parser::engine::TurnKind::UserMsg => FrameKind::UserMsg,
+            aicx_parser::engine::TurnKind::AgentReply => FrameKind::AgentReply,
+            aicx_parser::engine::TurnKind::InternalThought => FrameKind::InternalThought,
+            aicx_parser::engine::TurnKind::ToolCall | aicx_parser::engine::TurnKind::ToolResult => {
+                FrameKind::ToolCall
+            }
+            aicx_parser::engine::TurnKind::SystemNote => FrameKind::SystemNote,
+        });
+        entry.frame_class = Some(class);
+        entry
+    }
+
+    #[test]
+    fn carried_frame_class_wins_over_frame_kind_and_role() {
+        use aicx_parser::engine::{HumanChannel, Known};
+        // EchoSeal used to arrive as `UserMsg` and was indistinguishable
+        // from direct human speech; with the class carried it is its own
+        // kind, withheld by the razor and revealed by `--dialog`.
+        let echo = classed(
+            "user",
+            "sealed later",
+            1,
+            FrameClass::EchoSeal {
+                seal_ts: Known::unknown(),
+                channel: HumanChannel::EchoBus,
+            },
+        );
+        assert_eq!(
+            projection_kind_for_entry(&echo),
+            Some(ProjectionKind::EchoSeal)
+        );
+        assert!(!spec_admits_entry(&ProjectionSpec::default(), &echo));
+        let mut dialog = ProjectionSpec::default();
+        dialog.dialog = true;
+        assert!(spec_admits_entry(&dialog, &echo));
+
+        // InterAgent rides the system lane (`SystemNote`) but is selected by
+        // class, never rendered as assistant, never admitted by the razor.
+        let inter = classed(
+            "system",
+            "task handed over",
+            2,
+            FrameClass::InterAgent {
+                sender: "codex".into(),
+                task: "t1".into(),
+                message_type: "dispatch".into(),
+            },
+        );
+        assert_eq!(
+            projection_kind_for_entry(&inter),
+            Some(ProjectionKind::InterAgent)
+        );
+        assert_eq!(
+            projection_role_for_entry(&inter),
+            Some(ProjectionRole::System)
+        );
+        assert!(!spec_admits_entry(&ProjectionSpec::default(), &inter));
+        let mut only_inter = ProjectionSpec::default();
+        only_inter.kinds = vec![ProjectionKind::InterAgent];
+        only_inter.roles = vec![ProjectionRole::System];
+        assert!(spec_admits_entry(&only_inter, &inter));
+
+        // LineageMeta from the model is its own kind, not `Inject`.
+        let lineage = classed(
+            "system",
+            "child",
+            3,
+            FrameClass::LineageMeta {
+                session_id: "child".into(),
+                forked_from_id: Some("parent".into()),
+            },
+        );
+        assert_eq!(
+            projection_kind_for_entry(&lineage),
+            Some(ProjectionKind::LineageMeta)
+        );
+        // A class-less entry still goes through the string bridge.
+        let mut plain = entry("system", "reminder", 4);
+        plain.frame_kind = Some(FrameKind::SystemNote);
+        assert_eq!(
+            projection_kind_for_entry(&plain),
+            Some(ProjectionKind::Inject)
+        );
+    }
+
+    /// Fixture shaped after `fork-vs-parent-user-messages-side-by-side.md`
+    /// (2026-08-27): parent `b92324bf` and fork `fbf5c7b2` share a 12-record
+    /// prefix with identical UUIDs; the fork continues with its own turns
+    /// and the parent with its own. The shared prefix is counted once.
+    #[test]
+    fn fork_prefix_is_inherited_once_and_parent_branch_is_tagged() {
+        let shared: Vec<TimelineEntry> = (0..12)
+            .map(|i| entry("user", &format!("shared prefix record {i}"), 1_000 + i))
+            .collect();
+        let mut fork = shared.clone();
+        fork.extend((0..5).map(|i| entry("user", &format!("fork only {i}"), 5_000 + i)));
+        let mut parent = shared.clone();
+        parent.extend((0..3).map(|i| entry("user", &format!("parent only {i}"), 6_000 + i)));
+        for entry in &mut fork {
+            entry.session_id = "fbf5c7b2".into();
+        }
+        for entry in &mut parent {
+            entry.session_id = "b92324bf".into();
+        }
+
+        let parent_ref = claude_ref("b92324bf");
+        let merged = merge_inherited(fork, parent, &parent_ref, LineageEdgeKind::SharedPrefix);
+        assert_eq!(merged.inherited_from_parent, 12);
+        assert_eq!(merged.parent_only, 3);
+        assert_eq!(
+            merged.entries.len(),
+            12 + 5 + 3,
+            "nothing doubled, nothing dropped"
+        );
+        let inherited = merged
+            .entries
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    entry.lineage_origin,
+                    Some(EntryOrigin::InheritedFrom { ref via, .. }) if via == "shared_prefix"
+                )
+            })
+            .count();
+        assert_eq!(inherited, 12);
+        assert_eq!(
+            merged
+                .entries
+                .iter()
+                .filter(|entry| matches!(entry.lineage_origin, Some(EntryOrigin::Own)))
+                .count(),
+            5
+        );
+        assert_eq!(
+            merged
+                .entries
+                .iter()
+                .filter(|entry| matches!(
+                    entry.lineage_origin,
+                    Some(EntryOrigin::ParentOnly { .. })
+                ))
+                .count(),
+            3
+        );
+        // Every inherited record names the parent by its tagged ref.
+        assert!(
+            merged
+                .entries
+                .iter()
+                .all(|entry| match &entry.lineage_origin {
+                    Some(EntryOrigin::InheritedFrom { conversation, .. }) =>
+                        conversation == &parent_ref,
+                    _ => true,
+                })
+        );
+    }
+
+    #[test]
+    fn mixed_scope_refuses_single_history_by_default() {
+        let mut a = entry("user", "work on LV1", 1);
+        a.cwd = Some("/repos/loctree-suite".into());
+        a.branch = Some("main".into());
+        let mut b = entry("user", "fix the installer", 2);
+        b.cwd = Some("/repos/vibecrafted".into());
+        b.branch = Some("main".into());
+        let report = scope_report_for_entries(&[a.clone(), b]);
+        assert_eq!(report.status, ScopeStatus::MixedCandidate);
+        assert_eq!(report.cwds.len(), 2);
+        let refusal = refuse_mixed_workstream(AgentKind::Claude, "s1", &report, false)
+            .expect("mixed candidate refuses by default");
+        assert_eq!(refusal.tag(), "mixed_workstream");
+        assert!(refuse_mixed_workstream(AgentKind::Claude, "s1", &report, true).is_none());
+
+        let homogeneous = scope_report_for_entries(&[a]);
+        assert_eq!(homogeneous.status, ScopeStatus::Homogeneous);
+        assert!(refuse_mixed_workstream(AgentKind::Claude, "s1", &homogeneous, false).is_none());
+        let unknown = scope_report_for_entries(&[entry("user", "no cwd", 3)]);
+        assert_eq!(unknown.status, ScopeStatus::Unknown);
     }
 
     #[test]

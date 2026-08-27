@@ -38,7 +38,7 @@ mod cli_config;
 use aicx::corpus;
 use aicx::dashboard::{self, DashboardConfig, DashboardScope};
 use aicx::dashboard_server::{self, DashboardCorsPolicy, DashboardServerConfig};
-use aicx::extraction::conversation::{self as conv, LineageLink};
+use aicx::extraction::conversation::{self as conv, LineageEdgeKind, LineageGraph};
 use aicx::extraction::projection::{LINEAGE_UNBOUNDED, ProjectionSpec, ProjectionWindow};
 use aicx::extraction::{self as sources, ExtractionConfig};
 use aicx::intents;
@@ -6219,26 +6219,51 @@ fn parse_selected_source_once(
     Ok(entries)
 }
 
-/// One hop of the `--lineage` walk plus the catalog source it resolved to.
+/// One resolved parent of the `--lineage` walk: the catalog source to parse
+/// and the edge that led to it.
 struct LineageHop {
-    link: LineageLink,
+    node_id: String,
+    child_id: String,
+    kind: LineageEdgeKind,
     source: aicx::session_catalog::CatalogSource,
 }
 
-/// Bounded header read: the first records of a session source, looking for
-/// `session_meta.payload.forked_from_id` (codex rollout line 1) or a
-/// top-level `forked_from_id`. Meta only — never the filename. Claude sources
-/// carry no session-level fork pointer (`parentUuid` is a per-record chain,
-/// and a fork shares that chain with its origin), so they return `None`.
-fn read_forked_from_id(path: &Path) -> Option<String> {
+/// Bounded header read: the provider's own statement of which conversation
+/// a source is (W2-R1 `ProviderConversationRef`). Codex: `session_meta`
+/// (`session_id`, `id`, `forked_from_id`, `parent_thread_id`,
+/// `context_window.window_id`). Claude: first row's `sessionId` / `agentId`
+/// — no session-level parent pointer exists (`parentUuid` is a per-record
+/// chain shared by a fork and its origin). Meta only — never the filename.
+fn read_conversation_ref(
+    agent: aicx::parser::engine::AgentKind,
+    store_id: &str,
+    path: &Path,
+) -> aicx::parser::engine::ProviderConversationRef {
+    use aicx::parser::engine::ProviderConversationRef;
     const HEADER_RECORDS: usize = 8;
     const MAX_HEADER_LINE_BYTES: usize = 16 * 1024 * 1024;
-    let file = fs::File::open(path).ok()?;
+    let fallback = ProviderConversationRef::from_store_id(agent, store_id);
+    let Ok(file) = fs::File::open(path) else {
+        return fallback;
+    };
     let mut reader = BufReader::new(file);
     let mut line = String::new();
+    let field = |value: &serde_json::Value, keys: &[&str]| -> Option<String> {
+        let mut current = value;
+        for key in keys {
+            current = current.get(*key)?;
+        }
+        current
+            .as_str()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(str::to_owned)
+    };
     for _ in 0..HEADER_RECORDS {
         line.clear();
-        let read = reader.read_line(&mut line).ok()?;
+        let Ok(read) = reader.read_line(&mut line) else {
+            break;
+        };
         if read == 0 {
             break;
         }
@@ -6248,75 +6273,127 @@ fn read_forked_from_id(path: &Path) -> Option<String> {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim_end()) else {
             continue;
         };
-        let candidate = value
-            .get("payload")
-            .and_then(|payload| payload.get("forked_from_id"))
-            .or_else(|| value.get("forked_from_id"))
-            .and_then(serde_json::Value::as_str)
-            .filter(|id| !id.trim().is_empty());
-        if let Some(id) = candidate {
-            return Some(id.trim().to_string());
-        }
-        if value.get("type").and_then(serde_json::Value::as_str) == Some("session_meta") {
-            // The meta record exists and names no parent: this is a root.
-            return None;
+        match agent {
+            aicx::parser::engine::AgentKind::Codex => {
+                if value.get("type").and_then(serde_json::Value::as_str) != Some("session_meta") {
+                    continue;
+                }
+                let thread_id = field(&value, &["payload", "id"]);
+                let forked_from_id = field(&value, &["payload", "forked_from_id"])
+                    .or_else(|| field(&value, &["forked_from_id"]));
+                let parent_thread_id = field(&value, &["payload", "parent_thread_id"]);
+                let window_id = field(&value, &["payload", "context_window", "window_id"]);
+                let mut unobserved = Vec::new();
+                for (name, present) in [
+                    ("thread_id", thread_id.is_some()),
+                    ("forked_from_id", forked_from_id.is_some()),
+                    ("parent_thread_id", parent_thread_id.is_some()),
+                    ("window_id", window_id.is_some()),
+                ] {
+                    if !present {
+                        unobserved.push(name.to_owned());
+                    }
+                }
+                return ProviderConversationRef::Codex {
+                    tree_session_id: field(&value, &["payload", "session_id"])
+                        .or_else(|| thread_id.clone())
+                        .unwrap_or_else(|| store_id.to_owned()),
+                    thread_id,
+                    forked_from_id,
+                    parent_thread_id,
+                    window_id,
+                    unobserved,
+                };
+            }
+            aicx::parser::engine::AgentKind::Claude => {
+                let Some(session_id) =
+                    field(&value, &["sessionId"]).or_else(|| field(&value, &["session_id"]))
+                else {
+                    continue;
+                };
+                let agent_id = field(&value, &["agentId"]);
+                let unobserved = if agent_id.is_some() {
+                    Vec::new()
+                } else {
+                    vec!["agent_id".to_owned()]
+                };
+                return ProviderConversationRef::Claude {
+                    session_id,
+                    agent_id,
+                    unobserved,
+                };
+            }
+            _ => return fallback,
         }
     }
-    None
+    fallback
 }
 
-/// Walk `forked_from_id` parents through the session catalog. `depth` is the
-/// number of parents to expand (`LINEAGE_UNBOUNDED` = until a root). Cycles
-/// and unresolvable parents stop the walk and are reported on the link.
+/// Walk declared parents (`forked_from_id`, then `parent_thread_id`) through
+/// the session catalog into a [`LineageGraph`]. `depth` is the number of
+/// parents to expand (`LINEAGE_UNBOUNDED` = until a root). Cycles and
+/// unresolvable parents stop the walk and are recorded on the graph.
+/// Claude sources declare no parent; their shared-prefix fork is reported as
+/// such (detection needs a catalog prefix index, not guessed here).
 fn walk_lineage(
     catalog: &aicx::session_catalog::SessionCatalog,
+    agent: aicx::parser::engine::AgentKind,
     root: &aicx::session_catalog::CatalogSource,
     depth: usize,
-) -> Vec<LineageHop> {
-    let mut hops = Vec::new();
+) -> (LineageGraph, Vec<LineageHop>) {
+    let root_ref = read_conversation_ref(agent, &root.source_id, &root.path);
+    let mut graph = LineageGraph::new(root_ref.clone(), Vec::new());
+    let mut hops: Vec<LineageHop> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
-    let mut current = root.clone();
-    let mut level = 0usize;
-    loop {
-        seen.insert(current.source_id.clone());
-        let parent = read_forked_from_id(&current.path);
-        let (resolved, next) = match parent.as_deref() {
-            Some(parent_id) => match catalog.resolve(parent_id) {
-                Ok(resolved) => (true, Some(resolved.source)),
-                Err(_) => (false, None),
-            },
-            None => (true, None),
-        };
-        hops.push(LineageHop {
-            link: LineageLink {
-                depth: level,
-                session_id: current.source_id.clone(),
-                forked_from_id: parent.clone(),
-                resolved,
-            },
-            source: current.clone(),
-        });
-        let Some(next) = next else {
-            break;
-        };
-        if level >= depth {
-            eprintln!(
-                "extract: lineage depth {depth} reached; parent `{}` not expanded",
-                next.source_id
-            );
-            break;
+    seen.insert(root.source_id.clone());
+    // (child node id, child source, child ref, level)
+    let mut frontier = vec![(
+        root_ref.node_id().to_owned(),
+        root.clone(),
+        root_ref,
+        0usize,
+    )];
+    while let Some((child_id, _child_source, child_ref, level)) = frontier.pop() {
+        for (pointer, parent_id) in child_ref.declared_parents() {
+            let kind = match pointer {
+                "parent_thread_id" => LineageEdgeKind::ParentThread,
+                _ => LineageEdgeKind::DeclaredFork,
+            };
+            if level >= depth {
+                eprintln!(
+                    "extract: lineage depth {depth} reached; parent `{parent_id}` not expanded"
+                );
+                graph.attach_unresolved(&child_id, parent_id, kind);
+                continue;
+            }
+            if seen.contains(parent_id) {
+                eprintln!("extract: lineage cycle at `{parent_id}`; walk stopped");
+                continue;
+            }
+            match catalog.resolve(parent_id) {
+                Ok(resolved) => {
+                    let parent_ref = read_conversation_ref(
+                        agent,
+                        &resolved.source.source_id,
+                        &resolved.source.path,
+                    );
+                    let parent_node = parent_ref.node_id().to_owned();
+                    seen.insert(resolved.source.source_id.clone());
+                    if graph.attach_parent(&child_id, parent_ref.clone(), kind, true, Vec::new()) {
+                        hops.push(LineageHop {
+                            node_id: parent_node.clone(),
+                            child_id: child_id.clone(),
+                            kind,
+                            source: resolved.source.clone(),
+                        });
+                        frontier.push((parent_node, resolved.source, parent_ref, level + 1));
+                    }
+                }
+                Err(_) => graph.attach_unresolved(&child_id, parent_id, kind),
+            }
         }
-        if seen.contains(&next.source_id) {
-            eprintln!(
-                "extract: lineage cycle at `{}`; walk stopped",
-                next.source_id
-            );
-            break;
-        }
-        level += 1;
-        current = next;
     }
-    hops
+    (graph, hops)
 }
 
 /// Run `aicx extract <agent> --session <id>`: resolve the session catalog
@@ -6399,18 +6476,25 @@ fn run_extract_session(
     // emitted as `LineageMeta` entries the spec already admits.
     let mut session_ids = vec![resolved.source.source_id.clone()];
     if let Some(depth) = options.projection.lineage_depth {
-        let hops = walk_lineage(&catalog, &resolved.source, depth);
-        for hop in &hops {
-            eprintln!("extract: {}", hop.link.render());
-        }
-        if hops.len() == 1 && hops[0].link.forked_from_id.is_none() {
+        let (mut graph, hops) =
+            walk_lineage(&catalog, agent.parser_kind(), &resolved.source, depth);
+        if graph.is_root_only() {
             eprintln!(
-                "extract: lineage: `{}` names no forked_from_id in its session meta ({} sources carry none at session level; codex rollouts do)",
+                "extract: lineage: `{}` declares no parent in its session meta ({} sources carry none at session level; codex rollouts do — a Claude fork shares its origin's record prefix and is reported as shared_prefix only when both files are laid together)",
                 resolved.source.source_id,
                 agent.label()
             );
         }
-        for hop in hops.iter().skip(1) {
+        // Parents are parsed once each through the same projection and laid
+        // under the child WITHOUT doubling inherited history: shared records
+        // stay once (tagged `inherited_from`), the parent's own branch is
+        // tagged `parent_only`, compactions stay epochs of their node.
+        let own_before = entries.len();
+        let root_id = graph.root.clone();
+        if let Some(root) = graph.node_mut(&root_id) {
+            root.own_entries = own_before;
+        }
+        for hop in &hops {
             let parent_handle = source_handle_for_file(
                 agent,
                 &hop.source.source_id,
@@ -6418,22 +6502,50 @@ fn run_extract_session(
                 &hop.source.path,
             )?;
             let parent_entries = parse_selected_source_once(&parent_handle, &options.projection)?;
+            let parent_ref = graph
+                .node(&hop.node_id)
+                .map(|node| node.conversation.clone())
+                .unwrap_or_else(|| {
+                    aicx::parser::engine::ProviderConversationRef::from_store_id(
+                        agent.parser_kind(),
+                        &hop.source.source_id,
+                    )
+                });
+            let merged = conv::merge_inherited(
+                std::mem::take(&mut entries),
+                parent_entries,
+                &parent_ref,
+                hop.kind,
+            );
             eprintln!(
-                "extract: lineage parent `{}` -> {} entries ({})",
-                hop.source.source_id,
-                parent_entries.len(),
+                "extract: lineage parent `{}` <- `{}`: {} inherited (counted once), {} parent-only ({})",
+                hop.node_id,
+                hop.child_id,
+                merged.inherited_from_parent,
+                merged.parent_only,
                 hop.source.path.display()
             );
+            if let Some(child) = graph.node_mut(&hop.child_id) {
+                child.inherited_entries += merged.inherited_from_parent;
+                child.own_entries = child
+                    .own_entries
+                    .saturating_sub(merged.inherited_from_parent);
+            }
+            if let Some(parent) = graph.node_mut(&hop.node_id) {
+                parent.own_entries = merged.parent_only + merged.inherited_from_parent;
+            }
+            entries = merged.entries;
             session_ids.push(hop.source.source_id.clone());
-            entries.extend(parent_entries);
+        }
+        for line in graph.render_lines() {
+            eprintln!("extract: {line}");
         }
         let anchor = entries
             .iter()
             .map(|entry| entry.timestamp)
             .min()
             .unwrap_or_else(Utc::now);
-        let links: Vec<LineageLink> = hops.into_iter().map(|hop| hop.link).collect();
-        entries.extend(conv::lineage_entries(agent.label(), &links, anchor));
+        entries.extend(conv::lineage_entries(agent.label(), &graph, anchor));
     }
 
     let output_path = match output {
