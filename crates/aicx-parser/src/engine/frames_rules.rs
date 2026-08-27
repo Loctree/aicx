@@ -94,6 +94,27 @@ const GENERIC_INJECT_TAGS: &[InjectTagRule] = &[InjectTagRule {
     kind: InjectRuleKind::TransportControl,
 }];
 
+// # grok
+// Transport idioms for Grok chat_history.jsonl. `synthetic_reason` is a
+// harness inject tag, not human speech. No echo-bus / queue-seal on this
+// transport. `type=reasoning` has no FrameClass (BOUNDARY) and is delivered
+// as Inject tag "reasoning" → Other → SystemNote.
+const GROK_INJECT_TAGS: &[InjectTagRule] = &[
+    InjectTagRule {
+        tag: "system",
+        kind: InjectRuleKind::TransportControl,
+    },
+    InjectTagRule {
+        tag: "system_reminder",
+        kind: InjectRuleKind::TransportControl,
+    },
+    InjectTagRule {
+        tag: "project_instructions",
+        kind: InjectRuleKind::AgentInstructions,
+    },
+];
+// # grok
+
 pub const AGENT_FRAME_RULES: &[AgentFrameRules] = &[
     AgentFrameRules {
         agent: AgentKind::Codex,
@@ -116,13 +137,15 @@ pub const AGENT_FRAME_RULES: &[AgentFrameRules] = &[
         queue_seal: false,
         inject_tags: GENERIC_INJECT_TAGS,
     },
+    // # grok
     AgentFrameRules {
         agent: AgentKind::Grok,
         echo_promotion: false,
         klops_guard: &[],
         queue_seal: false,
-        inject_tags: GENERIC_INJECT_TAGS,
+        inject_tags: GROK_INJECT_TAGS,
     },
+    // # grok
     AgentFrameRules {
         agent: AgentKind::Junie,
         echo_promotion: false,

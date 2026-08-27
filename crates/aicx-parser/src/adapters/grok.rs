@@ -13,9 +13,17 @@
 //! Receipts: every consumed/skipped decision and metadata extraction is
 //! explicitly classified; tool records, title, cwd, model, timestamps are
 //! populated from native Grok artifacts when present.
+//!
+//! Speech class is not decided here. This adapter normalizes Grok transport
+//! records into [`crate::engine::frames::TransportFrame`] values and consumes
+//! [`crate::engine::frames::classify`] output. Local `type=user` → `UserMsg`
+//! mapping is removed, not wrapped.
 
 use crate::adapters::{
     AdapterError, AgentAdapter, ClassifiedDisposition, ClassifiedUnit, RawUnitLevel, sealed::Sealed,
+};
+use crate::engine::frames::{
+    self, FrameClass, TransportFrame, TransportKind, TransportPayload, TransportRole,
 };
 use crate::engine::{
     AgentKind, BoundaryFlags, CoverageReport, ParseStatus, RawUnit, SkippedReason, SourceFraming,
@@ -23,7 +31,7 @@ use crate::engine::{
     identity::{evidence_event_id_from_hash, ordinal_locator, sha256_hex},
     model::{
         Known, Provenance, RawUnitRef, Segment, SessionModel, ToolEvent, ToolEventKind, Turn,
-        TurnKind, TurnRange, TurnRole, UsageEvent,
+        TurnRange, TurnRole, UsageEvent,
     },
 };
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -31,7 +39,7 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 
 /// Adapter version for this cut. Bumped only on contract-visible behavior changes.
-const ADAPTER_VERSION: &str = "c9p-2026-07-24";
+const ADAPTER_VERSION: &str = "throne-w2-t9-2026-08-27";
 
 pub struct GrokAdapter;
 
@@ -215,165 +223,49 @@ impl AgentAdapter for GrokAdapter {
         // Base timestamp for synthetic offsets (stable).
         let base_ts = parse_ts(&started_at).unwrap_or_else(|_| Utc::now());
 
-        // Build turns from chat_history primarily (Grok native readable shape), then events.
+        // Transport records become frames; the throne (`frames::classify`)
+        // is the only speech decision. Empty `turns` is refused by
+        // `validate_model` as `RefusalReason::EmptyConversation` (W1-T5),
+        // never as a validated empty session.
         let mut turns: Vec<Turn> = Vec::new();
         let mut tool_events: Vec<ToolEvent> = Vec::new();
         let usage_events: Vec<UsageEvent> = Vec::new();
-        let mut consumed_ordinals: Vec<u64> = Vec::new();
-
         let mut turn_idx: u64 = 0;
 
-        // Process chat_lines (primary Grok chat_history.jsonl)
         for (ord, v) in &chat_lines {
-            let typ = v.get("type").and_then(|x| x.as_str()).unwrap_or("");
-            let (role, text, kind, tool_name) = match typ {
-                "user" => {
-                    let text = extract_user_text(v);
-                    ("user".to_string(), text, TurnKind::UserMsg, None)
-                }
-                "assistant" => {
-                    let (text, tname) = extract_assistant_text_and_tool(v);
-                    ("assistant".to_string(), text, TurnKind::AgentReply, tname)
-                }
-                "reasoning" => {
-                    let text = extract_reasoning_text(v);
-                    (
-                        "reasoning".to_string(),
-                        text,
-                        TurnKind::InternalThought,
-                        None,
-                    )
-                }
-                "tool_result" => {
-                    let text = v
-                        .get("content")
-                        .and_then(|c| c.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let tname = v
-                        .get("tool_call_id")
-                        .and_then(|c| c.as_str())
-                        .unwrap_or("tool")
-                        .to_string();
-                    ("tool".to_string(), text, TurnKind::ToolResult, Some(tname))
-                }
-                "text" | "summary_text" => {
-                    let text = v
-                        .get("text")
-                        .and_then(|t| t.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    ("assistant".to_string(), text, TurnKind::AgentReply, None)
-                }
-                _ => {
-                    // system or unknown visible -> system note
-                    let text = v
-                        .get("text")
-                        .or_else(|| v.get("message"))
-                        .and_then(|x| x.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    if text.trim().is_empty() {
-                        continue;
-                    }
-                    ("system".to_string(), text, TurnKind::SystemNote, None)
-                }
-            };
-
-            if text.trim().is_empty() {
-                // still record as skipped? for now only non-empty become turns; empty were filtered in classify or here
-                continue;
-            }
-
             let raw_ref = classified
                 .iter()
                 .find(|classified| classified.ordinal == *ord)
                 .map(|classified| classified.evidence.clone())
                 .expect("classified evidence present");
             let ts = base_ts + ChronoDuration::milliseconds(*ord as i64 + 1);
-            let ts_str = ts.to_rfc3339();
-
-            turns.push(Turn {
-                turn_idx,
-                role: match role.as_str() {
-                    "user" => TurnRole::User,
-                    "assistant" => TurnRole::Assistant,
-                    "tool" => TurnRole::Tool,
-                    "system" => TurnRole::System,
-                    _ => TurnRole::Assistant,
-                },
-                timestamp: Known::value(ts_str),
-                kind,
-                text: text.clone(),
-                text_hash: sha256_hex(text.as_bytes()),
-                text_chars: text.chars().count() as u64,
-                tool_name: tool_name
-                    .clone()
-                    .map(Known::value)
-                    .unwrap_or(Known::unknown()),
-                segment_id: 0,
-                raw_unit_refs: vec![raw_ref.clone()],
-            });
-
-            if let Some(tn) = tool_name
-                && (kind == TurnKind::ToolResult || kind == TurnKind::ToolCall)
-            {
-                tool_events.push(ToolEvent {
-                    kind: if kind == TurnKind::ToolCall {
-                        ToolEventKind::Call
-                    } else {
-                        ToolEventKind::Result
-                    },
-                    turn_idx,
-                    tool_name: tn,
-                    correlation_id: Known::unknown(),
-                    payload_hash: raw_ref.content_hash.clone(),
-                    payload_bytes: raw_ref.original_bytes,
-                    raw_unit_refs: vec![raw_ref],
-                });
-            }
-
-            consumed_ordinals.push(*ord);
-            turn_idx += 1;
+            emit_grok_record(
+                v,
+                raw_ref,
+                Known::value(ts.to_rfc3339()),
+                &mut turn_idx,
+                &mut turns,
+                &mut tool_events,
+            );
         }
 
-        // TODO for full events support (v1/responses style) - events_lines processing would go here for dispatched/tool call detailed.
-        // For this cut we prioritize chat_history + summary which is the "Grok native readable".
-        // Additional shapes (hunk, social, system-only, malformed) covered via classify skips + test fixtures.
-
-        // If no turns from chat, fall back to basic event scan (light).
+        // Event artifacts share the same frame path. Used only when chat
+        // produced no turns — not a second speech reducer.
         if turns.is_empty() {
             for (ord, v) in &event_lines {
-                // minimal extraction for dispatched / response_item etc.
-                let (role_str, text, knd) = extract_event_turn(v);
-                if text.trim().is_empty() {
-                    continue;
-                }
-                let unit = units_by_ord.get(ord).unwrap();
                 let raw_ref = classified
                     .iter()
                     .find(|classified| classified.ordinal == *ord)
                     .map(|classified| classified.evidence.clone())
                     .expect("classified evidence present");
-                let ts_str = base_ts.to_rfc3339();
-                let content_hash = sha256_hex(&unit.bytes);
-                turns.push(Turn {
-                    turn_idx,
-                    role: match role_str.as_str() {
-                        "user" => TurnRole::User,
-                        _ => TurnRole::Assistant,
-                    },
-                    timestamp: Known::value(ts_str),
-                    kind: knd,
-                    text,
-                    text_hash: content_hash.clone(),
-                    text_chars: 1,
-                    tool_name: Known::unknown(),
-                    segment_id: 0,
-                    raw_unit_refs: vec![raw_ref],
-                });
-                consumed_ordinals.push(*ord);
-                turn_idx += 1;
+                emit_grok_record(
+                    v,
+                    raw_ref,
+                    Known::value(base_ts.to_rfc3339()),
+                    &mut turn_idx,
+                    &mut turns,
+                    &mut tool_events,
+                );
             }
         }
 
@@ -584,7 +476,7 @@ fn classify_grok_line(line: &str) -> Result<String, SkippedReason> {
 
 fn classify_grok_event(text: &str) -> Result<String, SkippedReason> {
     let v: Value = serde_json::from_str(text).map_err(|_| SkippedReason::Malformed)?;
-    // support rollout event_type or response_item
+    // Coverage kind only — speech class is `frames::classify`.
     if v.get("event_type").is_some()
         || v.get("response_item").is_some()
         || v.get("type").and_then(|t| t.as_str()) == Some("response_item")
@@ -592,14 +484,18 @@ fn classify_grok_event(text: &str) -> Result<String, SkippedReason> {
         if let Some(item) = v.get("payload").or_else(|| v.get("item"))
             && item.get("type").and_then(|t| t.as_str()) == Some("message")
         {
-            return Ok("assistant".to_string());
+            return match item.get("role").and_then(|role| role.as_str()) {
+                Some("user") => Ok("user".to_string()),
+                Some("system") => Ok("system".to_string()),
+                _ => Ok("assistant".to_string()),
+            };
         }
         return Ok("event".to_string());
     }
     if let Some(t) = v.get("type").and_then(|x| x.as_str()) {
         match t {
             "user_message" => return Ok("user".to_string()),
-            "agent_message" => return Ok("assistant".to_string()),
+            "agent_message" => return Ok("event".to_string()),
             "agent_reasoning" | "thinking" => return Ok("reasoning".to_string()),
             "tool_call" | "function_call" | "mcp_tool_call" => return Ok("tool_call".to_string()),
             "tool_result" | "mcp_tool_call_response" => return Ok("tool_result".to_string()),
@@ -670,46 +566,319 @@ fn extract_reasoning_text(v: &Value) -> String {
         .to_string()
 }
 
-fn extract_event_turn(v: &Value) -> (String, String, TurnKind) {
-    // lightweight for rollout events
-    let et = v.get("event_type").and_then(|x| x.as_str()).unwrap_or("");
-    if et == "response_item"
-        && let Some(p) = v.get("payload")
-        && p.get("type").and_then(|t| t.as_str()) == Some("message")
+fn emit_grok_record(
+    value: &Value,
+    evidence: RawUnitRef,
+    timestamp: Known<String>,
+    turn_idx: &mut u64,
+    turns: &mut Vec<Turn>,
+    tool_events: &mut Vec<ToolEvent>,
+) {
+    let Some(frame) = grok_transport_frame(value, evidence, timestamp) else {
+        return;
+    };
+    let classified = frames::classify(&frame);
+    push_classified_turn(classified, turn_idx, turns, tool_events);
+}
+
+fn grok_transport_frame(
+    value: &Value,
+    evidence: RawUnitRef,
+    timestamp: Known<String>,
+) -> Option<TransportFrame> {
+    if let Some(item) = value
+        .get("payload")
+        .or_else(|| value.get("item"))
+        .or_else(|| value.get("response_item"))
+        && let Some(frame) = frame_from_nested_item(item, evidence.clone(), timestamp.clone())
     {
-        let role = p
-            .get("role")
-            .and_then(|r| r.as_str())
-            .unwrap_or("assistant");
-        let msg = p.get("content").and_then(|c| c.as_str()).unwrap_or("");
-        let k = if role == "user" {
-            TurnKind::UserMsg
-        } else {
-            TurnKind::AgentReply
-        };
-        return (role.to_string(), msg.to_string(), k);
+        return Some(frame);
     }
-    // chat style fallback
-    let t = v.get("type").and_then(|x| x.as_str()).unwrap_or("");
-    match t {
-        "user_message" => (
-            "user".into(),
-            v.get("message")
-                .and_then(|x| x.as_str())
-                .unwrap_or("")
-                .into(),
-            TurnKind::UserMsg,
-        ),
-        "agent_message" => (
-            "assistant".into(),
-            v.get("message")
-                .and_then(|x| x.as_str())
-                .unwrap_or("")
-                .into(),
-            TurnKind::AgentReply,
-        ),
-        _ => ("system".into(), "".into(), TurnKind::SystemNote),
+
+    let typ = value.get("type").and_then(Value::as_str).unwrap_or("");
+    if typ == "agent_message" {
+        return Some(TransportFrame {
+            agent: AgentKind::Grok,
+            transport_kind: TransportKind::AgentMessage,
+            timestamp,
+            payload: TransportPayload::InterAgent {
+                sender: json_string(value, "sender"),
+                task: json_string_or(value, &["task", "task_name"]),
+                message_type: typ.to_owned(),
+                content: json_string_or(value, &["content", "message"]),
+            },
+            evidence,
+        });
     }
+
+    let (transport_kind, payload) = grok_chat_payload(typ, value)?;
+    Some(TransportFrame {
+        agent: AgentKind::Grok,
+        transport_kind,
+        timestamp,
+        payload,
+        evidence,
+    })
+}
+
+fn frame_from_nested_item(
+    item: &Value,
+    evidence: RawUnitRef,
+    timestamp: Known<String>,
+) -> Option<TransportFrame> {
+    let typ = item.get("type").and_then(Value::as_str)?;
+    match typ {
+        "agent_message" => Some(TransportFrame {
+            agent: AgentKind::Grok,
+            transport_kind: TransportKind::AgentMessage,
+            timestamp,
+            payload: TransportPayload::InterAgent {
+                sender: json_string(item, "sender"),
+                task: json_string_or(item, &["task", "task_name"]),
+                message_type: typ.to_owned(),
+                content: json_string_or(item, &["content", "message"]),
+            },
+            evidence,
+        }),
+        "message" => {
+            let role = item
+                .get("role")
+                .and_then(Value::as_str)
+                .unwrap_or("assistant");
+            let content = match item.get("content") {
+                Some(Value::String(text)) => text.clone(),
+                Some(Value::Array(_)) => extract_user_text(item),
+                _ => String::new(),
+            };
+            let (transport_kind, payload) = match role {
+                "user" => (
+                    TransportKind::DirectMessage,
+                    TransportPayload::Text {
+                        role: TransportRole::User,
+                        content,
+                    },
+                ),
+                "system" => (
+                    TransportKind::InjectedContext,
+                    TransportPayload::Inject {
+                        tag: "system".to_owned(),
+                        content,
+                    },
+                ),
+                _ => (
+                    TransportKind::AssistantMessage,
+                    TransportPayload::Text {
+                        role: TransportRole::Assistant,
+                        content,
+                    },
+                ),
+            };
+            Some(TransportFrame {
+                agent: AgentKind::Grok,
+                transport_kind,
+                timestamp,
+                payload,
+                evidence,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn grok_chat_payload(typ: &str, value: &Value) -> Option<(TransportKind, TransportPayload)> {
+    match typ {
+        "user" | "user_message" => {
+            let content = if typ == "user_message" {
+                json_string(value, "message")
+            } else {
+                extract_user_text(value)
+            };
+            if let Some(tag) = value.get("synthetic_reason").and_then(Value::as_str) {
+                Some((
+                    TransportKind::InjectedContext,
+                    TransportPayload::Inject {
+                        tag: tag.to_owned(),
+                        content,
+                    },
+                ))
+            } else {
+                Some((
+                    TransportKind::DirectMessage,
+                    TransportPayload::Text {
+                        role: TransportRole::User,
+                        content,
+                    },
+                ))
+            }
+        }
+        "system" | "notification" | "error" => Some((
+            TransportKind::InjectedContext,
+            TransportPayload::Inject {
+                tag: typ.to_owned(),
+                content: json_string_or(value, &["content", "text", "message"]),
+            },
+        )),
+        "assistant" | "text" | "summary_text" => {
+            let raw_content = value.get("content").and_then(Value::as_str).unwrap_or("");
+            let tool_calls = value.get("tool_calls").and_then(Value::as_array);
+            if raw_content.is_empty() && tool_calls.is_some_and(|calls| !calls.is_empty()) {
+                let (_, tname) = extract_assistant_text_and_tool(value);
+                return Some((
+                    TransportKind::UserShellCommand,
+                    TransportPayload::Shell {
+                        command: tname.unwrap_or_else(|| "tool".to_owned()),
+                        result: value
+                            .get("tool_calls")
+                            .map(ToString::to_string)
+                            .unwrap_or_default(),
+                    },
+                ));
+            }
+            let (text, _) = extract_assistant_text_and_tool(value);
+            Some((
+                TransportKind::AssistantMessage,
+                TransportPayload::Text {
+                    role: TransportRole::Assistant,
+                    content: text,
+                },
+            ))
+        }
+        "reasoning" | "agent_reasoning" | "thinking" => Some((
+            TransportKind::InjectedContext,
+            TransportPayload::Inject {
+                tag: "reasoning".to_owned(),
+                content: extract_reasoning_text(value),
+            },
+        )),
+        "tool_result" | "mcp_tool_call_response" => {
+            let command = json_string_or(value, &["tool_call_id", "name"]);
+            let command = if command.is_empty() {
+                "tool".to_owned()
+            } else {
+                command
+            };
+            Some((
+                TransportKind::UserShellCommand,
+                TransportPayload::Shell {
+                    command,
+                    result: json_string(value, "content"),
+                },
+            ))
+        }
+        "tool_call" | "function_call" | "mcp_tool_call" => {
+            let command = json_string_or(value, &["name", "tool_name"]);
+            let command = if command.is_empty() {
+                "tool".to_owned()
+            } else {
+                command
+            };
+            Some((
+                TransportKind::UserShellCommand,
+                TransportPayload::Shell {
+                    command,
+                    result: String::new(),
+                },
+            ))
+        }
+        _ => None,
+    }
+}
+
+fn json_string(value: &Value, key: &str) -> String {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_owned()
+}
+
+fn json_string_or(value: &Value, keys: &[&str]) -> String {
+    keys.iter()
+        .find_map(|key| value.get(*key).and_then(Value::as_str))
+        .unwrap_or("")
+        .to_owned()
+}
+
+fn push_classified_turn(
+    classified: crate::engine::frames::ClassifiedFrame,
+    turn_idx: &mut u64,
+    turns: &mut Vec<Turn>,
+    tool_events: &mut Vec<ToolEvent>,
+) {
+    let Some(kind) = classified.turn_kind else {
+        return;
+    };
+    let evidence = classified.origin.evidence.clone();
+    let (role, text, tool_name, kind) = match &classified.class {
+        FrameClass::Human { .. } | FrameClass::EchoSeal { .. } => (
+            TurnRole::User,
+            classified.content.clone(),
+            Known::unknown(),
+            kind,
+        ),
+        FrameClass::AssistantFinal => (
+            TurnRole::Assistant,
+            classified.content.clone(),
+            Known::unknown(),
+            kind,
+        ),
+        FrameClass::ShellAction { cmd, result } => {
+            // Throne maps every ShellAction to ToolCall (no call/result pair
+            // in FrameClass). Result text stays on the turn for Decision 6;
+            // ToolEventKind distinguishes call vs result without rewriting
+            // classified.turn_kind.
+            let event_kind = if result.text.is_empty() {
+                ToolEventKind::Call
+            } else {
+                ToolEventKind::Result
+            };
+            let text = if result.text.is_empty() {
+                cmd.clone()
+            } else {
+                result.text.clone()
+            };
+            tool_events.push(ToolEvent {
+                kind: event_kind,
+                turn_idx: *turn_idx,
+                tool_name: cmd.clone(),
+                correlation_id: Known::unknown(),
+                payload_hash: result.hash.clone(),
+                payload_bytes: result.text.len() as u64,
+                raw_unit_refs: vec![evidence.clone()],
+            });
+            (TurnRole::Tool, text, Known::value(cmd.clone()), kind)
+        }
+        FrameClass::Inject { .. } | FrameClass::LineageMeta { .. } => (
+            TurnRole::System,
+            classified.content.clone(),
+            Known::unknown(),
+            kind,
+        ),
+        FrameClass::InterAgent { .. } => return,
+    };
+
+    if text.trim().is_empty() {
+        return;
+    }
+
+    let timestamp = match &classified.seal.seal_ts {
+        Known::Value(value) => Known::value(value.clone()),
+        Known::Unknown(unknown) => Known::Unknown(*unknown),
+    };
+
+    turns.push(Turn {
+        turn_idx: *turn_idx,
+        role,
+        timestamp,
+        kind,
+        text: text.clone(),
+        text_hash: sha256_hex(text.as_bytes()),
+        text_chars: text.chars().count() as u64,
+        tool_name,
+        segment_id: 0,
+        raw_unit_refs: vec![evidence],
+    });
+    *turn_idx += 1;
 }
 
 fn parse_ts(s: &str) -> Result<DateTime<Utc>, ()> {
