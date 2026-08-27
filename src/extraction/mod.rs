@@ -1,4 +1,7 @@
 #![allow(unused_imports)]
+use aicx_parser::engine::{
+    DetectionProbe, EngineError, MIN_VISIBLE_TURNS, RefusalEvidence, RefusalReason,
+};
 pub(crate) use anyhow::Context;
 use anyhow::Result;
 pub(crate) use chrono::{DateTime, Utc};
@@ -131,11 +134,22 @@ pub fn extract_agent_sessions(
         crate::session_catalog::AgentKind::Junie => home.join(".junie").join("sessions"),
     };
     if !root.is_dir() {
-        return Ok(SessionExtractionBatch::default());
+        return Err(anyhow::Error::new(RefusalReason::DetectionBelowThreshold {
+            agent: parser_agent(agent),
+            probes: vec![DetectionProbe {
+                name: format!("session_root_exists:{}", root.display()),
+                matched: false,
+                first_ordinal: None,
+            }],
+            score: 0,
+            threshold: 1,
+        }));
     }
     let scan = crate::session_catalog::SessionCatalog::new(agent, &root)?.scan_with_stats();
     let parser_agent = parser_agent(agent);
     let mut batch = SessionExtractionBatch::default();
+    let mut first_refusal = None;
+    let mut projection_basis = None;
     let mut sources: Vec<_> = scan
         .result?
         .into_iter()
@@ -151,6 +165,13 @@ pub fn extract_agent_sessions(
         );
         match parsed {
             Ok(session) => {
+                projection_basis.get_or_insert_with(|| {
+                    (
+                        session.model().session_id.clone(),
+                        session.model().coverage.clone(),
+                        session.model().turns.len() as u64,
+                    )
+                });
                 if !session_matches_project_filter(session.model(), &config.project_filter) {
                     batch.filtered_out_sessions += 1;
                     crate::diagnostics::log_describe(&format!(
@@ -180,6 +201,15 @@ pub fn extract_agent_sessions(
                     .extend(crate::output::timeline_entries_from_model(session.model()));
             }
             Err(error) => {
+                if first_refusal.is_none() {
+                    first_refusal =
+                        error
+                            .downcast_ref::<EngineError>()
+                            .and_then(|engine| match engine {
+                                EngineError::Validation(validation) => validation.refusal.clone(),
+                                _ => None,
+                            });
+                }
                 // A parse failure hides the session's cwd, so an active
                 // `-p` filter cannot prove the session is out of scope.
                 // Keep it selected + skipped: hiding parse failures inside
@@ -204,6 +234,50 @@ pub fn extract_agent_sessions(
                 .watermark
                 .is_none_or(|watermark| entry.timestamp > watermark)
     });
+    if batch.entries.is_empty() {
+        if batch.ingested_sessions == 0
+            && let Some(refusal) = first_refusal
+        {
+            return Err(anyhow::Error::new(refusal));
+        }
+        if let Some((session_id, coverage, turns_before_filter)) = projection_basis {
+            let refusal = RefusalReason::ProjectionFilteredAll {
+                agent: parser_agent(agent),
+                session_id,
+                turns_before_filter,
+                filter: format!(
+                    "cutoff={} include_assistant={} watermark={:?} project_filter={:?}",
+                    config.cutoff,
+                    config.include_assistant,
+                    config.watermark,
+                    config.project_filter
+                ),
+                evidence: RefusalEvidence::from_coverage(
+                    &coverage,
+                    MIN_VISIBLE_TURNS,
+                    0,
+                    vec![format!(
+                        "selected_sessions={}; ingested_sessions={}; filtered_out_sessions={}; skipped_sessions={}",
+                        batch.selected_sessions,
+                        batch.ingested_sessions,
+                        batch.filtered_out_sessions,
+                        batch.skipped.len()
+                    )],
+                ),
+            };
+            return Err(anyhow::Error::new(refusal));
+        }
+        return Err(anyhow::Error::new(RefusalReason::DetectionBelowThreshold {
+            agent: parser_agent(agent),
+            probes: vec![DetectionProbe {
+                name: "selected_source_in_extract_window".to_owned(),
+                matched: false,
+                first_ordinal: None,
+            }],
+            score: 0,
+            threshold: 1,
+        }));
+    }
     Ok(batch)
 }
 
