@@ -1,9 +1,11 @@
 # Compile embargo marker — opened by W0-I-integrate (claude) after W0_GATE=green.
 # W0 integration commit: e499ef97ed9685ffac3bfa7148f09394fb8e6bd6
+# W1 -> W2 by W1-I-integrate (claude) after W1_GATE=green.
+# W1 integration commit: d0ca1a24b80fdf2ded0c7ebc704ddc8961da6cc4
 # Contract (tools/git-hooks/embargo.sh): an open marker keeps signed_by/commit empty;
 # they are filled only by the W2_STRUCTURALLY_CLOSED attestation.
 plan_id = "aicx-one-taxonomy-fusion-260827"
-phase = "W1"
+phase = "W2"
 deferred = ["cargo check", "cargo clippy", "cargo test"]
 attestation = "open"
 branch = "feat/one-taxonomy-fusion"
