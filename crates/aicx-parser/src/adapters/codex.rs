@@ -10,6 +10,10 @@
 use super::{
     AdapterError, AgentAdapter, ClassifiedDisposition, ClassifiedUnit, RawUnitLevel, sealed,
 };
+use crate::engine::frames::{
+    self, FrameClass, InjectKind, TransportFrame, TransportKind, TransportPayload, TransportRole,
+};
+use crate::engine::frames_rules;
 use crate::engine::{
     AgentKind, BoundaryFlags, ConsumedUnit, CounterSemantics, CoverageReport, CoverageWarning,
     Known, ParseStatus, Provenance, RawUnitRef, ReportedCost, Segment, SessionModel,
@@ -19,7 +23,7 @@ use crate::engine::{
     sha256_hex,
 };
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub const CODEX_ADAPTER_VERSION: &str = "codex-rollout-v3";
 
@@ -63,6 +67,7 @@ impl AgentAdapter for CodexAdapter {
             .map(|raw| classify_raw(source, session_id, raw))
             .collect::<Result<Vec<_>, _>>()?;
         let mut next_ordinal = classified.len() as u64 + 1;
+        let mut seen_replay_hashes = BTreeSet::new();
         for raw in &read.units {
             if raw.boundary == UnitBoundary::Oversized {
                 continue;
@@ -75,6 +80,16 @@ impl AgentAdapter for CodexAdapter {
                 classified.push(logical);
                 next_ordinal += 1;
             }
+            let replay = classify_compaction_replays(
+                source,
+                session_id,
+                raw,
+                &value,
+                next_ordinal,
+                &mut seen_replay_hashes,
+            )?;
+            next_ordinal += replay.len() as u64;
+            classified.extend(replay);
         }
         Ok(classified)
     }
@@ -110,6 +125,12 @@ fn classify_logical(
             "message",
             ClassifiedDisposition::Consumed {
                 kind: "message".to_owned(),
+            },
+        ),
+        ("response_item", "agent_message") => (
+            "agent_message",
+            ClassifiedDisposition::Consumed {
+                kind: "agent_message".to_owned(),
             },
         ),
         ("response_item", "function_call") => (
@@ -175,6 +196,74 @@ fn classify_logical(
         },
         disposition,
     }))
+}
+
+fn classify_compaction_replays(
+    source: &SourceHandle,
+    session_id: &str,
+    raw: &crate::engine::RawUnit,
+    event: &Value,
+    first_ordinal: u64,
+    seen_hashes: &mut BTreeSet<String>,
+) -> Result<Vec<ClassifiedUnit>, AdapterError> {
+    let payload = event.get("payload").unwrap_or(event);
+    let is_compaction = string_at(event, &["type"]) == Some("compacted")
+        || (string_at(event, &["type"]) == Some("response_item")
+            && string_at(payload, &["type"]) == Some("compacted"));
+    if !is_compaction {
+        return Ok(Vec::new());
+    }
+    let Some(history) = payload.get("replacement_history").and_then(Value::as_array) else {
+        return Ok(Vec::new());
+    };
+    history
+        .iter()
+        .enumerate()
+        .map(|(index, item)| {
+            let bytes = serde_json::to_vec(item)
+                .map_err(|error| AdapterError::new("classify", error.to_string()))?;
+            let content_hash = sha256_hex(&bytes);
+            let reason = if seen_hashes.insert(content_hash.clone()) {
+                SkippedReason::CompactionReplay
+            } else {
+                SkippedReason::DuplicateBody
+            };
+            let unit_kind = reason.as_str();
+            let ordinal = first_ordinal + index as u64;
+            let locator = format!(
+                "{}:payload.replacement_history[{index}]",
+                ordinal_locator(raw.physical_ordinal)
+            );
+            let evidence_event_id = evidence_event_id_from_hash(
+                source.agent(),
+                session_id,
+                &locator,
+                unit_kind,
+                &content_hash,
+            )
+            .map_err(|error| AdapterError::new("classify", error.to_string()))?;
+            Ok(ClassifiedUnit {
+                ordinal,
+                level: RawUnitLevel::Logical {
+                    parent_ordinal: raw.coverage_ordinal,
+                },
+                evidence: RawUnitRef {
+                    evidence_event_id,
+                    coverage_ordinal: ordinal,
+                    physical_ordinal: raw.physical_ordinal,
+                    locator,
+                    unit_kind: unit_kind.to_owned(),
+                    artifact: raw.artifact_name.clone(),
+                    content_hash,
+                    original_bytes: bytes.len() as u64,
+                },
+                disposition: ClassifiedDisposition::Skipped {
+                    reason,
+                    visible: false,
+                },
+            })
+        })
+        .collect()
 }
 
 fn classify_raw(
@@ -275,6 +364,13 @@ fn assemble_codex(
                 Some("user") | Some("assistant")
             )
     });
+    state.have_response_item_agent_message = read.units.iter().any(|raw| {
+        let Ok(value) = serde_json::from_slice::<Value>(&raw.bytes) else {
+            return false;
+        };
+        string_at(&value, &["type"]) == Some("response_item")
+            && string_at(&value, &["payload", "type"]) == Some("agent_message")
+    });
     for (raw, classified) in read.units.iter().zip(
         classified
             .iter()
@@ -325,8 +421,12 @@ struct Assembly<'a> {
     session_meta_seen: bool,
     /// True when the session contains response_item.message chat ownership.
     have_response_item_chat: bool,
+    /// True when response_item.agent_message owns the inter-agent envelope.
+    have_response_item_agent_message: bool,
     /// At least one compaction marker was consumed (TB context_compacted class).
     compaction_boundary_present: bool,
+    /// Content identity for sticky compaction history; transport ids rotate.
+    seen_replay_hashes: BTreeSet<String>,
 }
 
 #[derive(Clone)]
@@ -368,7 +468,9 @@ impl<'a> Assembly<'a> {
             visible_lost: false,
             session_meta_seen: false,
             have_response_item_chat: false,
+            have_response_item_agent_message: false,
             compaction_boundary_present: false,
+            seen_replay_hashes: BTreeSet::new(),
         }
     }
 
@@ -388,7 +490,7 @@ impl<'a> Assembly<'a> {
             // Top-level Codex compaction envelope (TB counts as context_compacted).
             "compacted" => {
                 self.compaction_boundary_present = true;
-                Ok(())
+                self.consume_compaction_replay(event, timestamp, evidence)
             }
             _ => Ok(()),
         }
@@ -454,23 +556,25 @@ impl<'a> Assembly<'a> {
             }
             // Dual-envelope: response_item.message owns chat; event_msg is footprint.
             "user_message" if self.have_response_item_chat => Ok(()),
-            "agent_message" if self.have_response_item_chat => Ok(()),
-            "user_message" => self.push_turn(
-                TurnRole::User,
-                TurnKind::UserMsg,
+            "agent_message"
+                if self.have_response_item_chat || self.have_response_item_agent_message =>
+            {
+                Ok(())
+            }
+            "user_message" => self.push_classified_frame(text_frame(
+                TransportKind::DirectMessage,
+                TransportRole::User,
                 text_at(event, &["payload", "message"]),
                 timestamp,
-                Known::unknown(),
                 evidence,
-            ),
-            "agent_message" => self.push_turn(
-                TurnRole::Assistant,
-                TurnKind::AgentReply,
+            )),
+            "agent_message" => self.push_classified_frame(text_frame(
+                TransportKind::AssistantMessage,
+                TransportRole::Assistant,
                 text_at(event, &["payload", "message"]),
                 timestamp,
-                Known::unknown(),
                 evidence,
-            ),
+            )),
             "agent_reasoning" | "thinking" | "thinking_delta" => self.push_turn(
                 TurnRole::Assistant,
                 TurnKind::InternalThought,
@@ -578,16 +682,10 @@ impl<'a> Assembly<'a> {
         match string_at(payload, &["type"]).unwrap_or("") {
             "message" => {
                 let role = match string_at(payload, &["role"]).unwrap_or("system") {
-                    "user" => TurnRole::User,
-                    "assistant" => TurnRole::Assistant,
-                    "tool" => TurnRole::Tool,
-                    _ => TurnRole::System,
-                };
-                let kind = match role {
-                    TurnRole::User => TurnKind::UserMsg,
-                    TurnRole::Assistant => TurnKind::AgentReply,
-                    TurnRole::Tool => TurnKind::ToolResult,
-                    TurnRole::System => TurnKind::SystemNote,
+                    "user" => TransportRole::User,
+                    "assistant" => TransportRole::Assistant,
+                    "tool" => TransportRole::Tool,
+                    _ => TransportRole::System,
                 };
                 let text = content_text(&payload["content"]);
                 // The 2026-08 Codex schema change began serializing user-run
@@ -595,24 +693,42 @@ impl<'a> Assembly<'a> {
                 // `role=user` input_text messages. The schema says `user`; the
                 // product semantics say tool/control event, and the adapter
                 // owns that normalization — see
-                // `push_user_message_classified`.
-                if role == TurnRole::User {
-                    return self.push_user_message_classified(text, timestamp, evidence);
+                // `push_user_message_frames`.
+                if role == TransportRole::User {
+                    return self.push_user_message_frames(text, timestamp, evidence);
                 }
-                self.push_turn(role, kind, text, timestamp, Known::unknown(), evidence)
+                let kind = if role == TransportRole::Assistant {
+                    TransportKind::AssistantMessage
+                } else {
+                    TransportKind::DirectMessage
+                };
+                self.push_classified_frame(text_frame(kind, role, text, timestamp, evidence))
             }
             // Agent-to-agent dispatch: `author` hands a task to `recipient`.
             // A third chat envelope, distinct from `message`, so the
             // dual-envelope suppression above does not apply and this is the
             // only place the payload survives.
-            "agent_message" => self.push_turn(
-                TurnRole::Assistant,
-                TurnKind::AgentReply,
-                agent_message_text(payload),
-                timestamp,
-                Known::unknown(),
-                evidence,
-            ),
+            "agent_message" => {
+                let content = content_text(&payload["content"]);
+                let frame = TransportFrame {
+                    agent: AgentKind::Codex,
+                    transport_kind: TransportKind::AgentMessage,
+                    timestamp,
+                    payload: TransportPayload::InterAgent {
+                        sender: labeled_field(&content, "Sender")
+                            .or_else(|| string_at(payload, &["author"]).map(str::to_owned))
+                            .unwrap_or_else(|| "unknown".to_owned()),
+                        task: labeled_field(&content, "Task name")
+                            .or_else(|| string_at(payload, &["recipient"]).map(str::to_owned))
+                            .unwrap_or_else(|| "unknown".to_owned()),
+                        message_type: labeled_field(&content, "Message Type")
+                            .unwrap_or_else(|| "unknown".to_owned()),
+                        content,
+                    },
+                    evidence,
+                };
+                self.push_classified_frame(frame)
+            }
             "function_call" | "custom_tool_call" | "web_search_call" => {
                 self.push_tool_turn(event, timestamp, evidence, ToolEventKind::Call)
             }
@@ -656,7 +772,7 @@ impl<'a> Assembly<'a> {
             // response_item.compacted — TB footprint/context_compacted class.
             "compacted" => {
                 self.compaction_boundary_present = true;
-                Ok(())
+                self.consume_compaction_replay(payload, timestamp, evidence)
             }
             _ => {
                 self.unsupported_visible = true;
@@ -697,6 +813,123 @@ impl<'a> Assembly<'a> {
             segment_id,
             raw_unit_refs: vec![evidence],
         });
+        Ok(())
+    }
+
+    /// Consume the throne's decision into the pre-taxonomy session model.
+    /// This is projection plumbing, not a second content classifier.
+    fn push_classified_frame(&mut self, frame: TransportFrame) -> Result<(), AdapterError> {
+        let classified = frames::classify(&frame);
+        let timestamp = classified.seal.seal_ts.clone();
+        let evidence = classified.origin.evidence.clone();
+        match classified.class {
+            FrameClass::Human { .. } | FrameClass::EchoSeal { .. } => self.push_turn(
+                TurnRole::User,
+                classified
+                    .turn_kind
+                    .expect("human classes have a turn kind"),
+                classified.content,
+                timestamp,
+                Known::unknown(),
+                evidence,
+            ),
+            FrameClass::AssistantFinal => self.push_turn(
+                TurnRole::Assistant,
+                classified
+                    .turn_kind
+                    .expect("assistant class has a turn kind"),
+                classified.content,
+                timestamp,
+                Known::unknown(),
+                evidence,
+            ),
+            FrameClass::ShellAction { cmd, result } => {
+                let marker = shell_action_marker(&cmd);
+                self.push_turn(
+                    TurnRole::Tool,
+                    TurnKind::ToolCall,
+                    marker.clone(),
+                    timestamp.clone(),
+                    Known::value("user_shell_command".to_owned()),
+                    evidence.clone(),
+                )?;
+                let call_idx = self.turns.len() as u64 - 1;
+                self.tools.push(ToolEvent {
+                    kind: ToolEventKind::Call,
+                    turn_idx: call_idx,
+                    tool_name: "user_shell_command".to_owned(),
+                    correlation_id: Known::unknown(),
+                    payload_hash: sha256_hex(marker.as_bytes()),
+                    payload_bytes: marker.len() as u64,
+                    raw_unit_refs: vec![evidence.clone()],
+                });
+                if !result.text.is_empty() {
+                    self.push_turn(
+                        TurnRole::Tool,
+                        TurnKind::ToolResult,
+                        result.text.clone(),
+                        timestamp,
+                        Known::value("user_shell_command".to_owned()),
+                        evidence.clone(),
+                    )?;
+                    let result_idx = self.turns.len() as u64 - 1;
+                    self.tools.push(ToolEvent {
+                        kind: ToolEventKind::Result,
+                        turn_idx: result_idx,
+                        tool_name: "user_shell_command".to_owned(),
+                        correlation_id: Known::unknown(),
+                        payload_hash: result.hash,
+                        payload_bytes: result.text.len() as u64,
+                        raw_unit_refs: vec![evidence],
+                    });
+                }
+                Ok(())
+            }
+            FrameClass::Inject {
+                kind: InjectKind::CompactionReplay,
+            }
+            | FrameClass::InterAgent { .. } => Ok(()),
+            FrameClass::Inject { .. } | FrameClass::LineageMeta { .. } => self.push_turn(
+                TurnRole::System,
+                classified
+                    .turn_kind
+                    .expect("metadata classes have a turn kind"),
+                classified.content,
+                timestamp,
+                Known::unknown(),
+                evidence,
+            ),
+        }
+    }
+
+    fn consume_compaction_replay(
+        &mut self,
+        event_or_payload: &Value,
+        timestamp: Known<String>,
+        evidence: RawUnitRef,
+    ) -> Result<(), AdapterError> {
+        let payload = event_or_payload.get("payload").unwrap_or(event_or_payload);
+        let Some(history) = payload.get("replacement_history").and_then(Value::as_array) else {
+            return Ok(());
+        };
+        for item in history {
+            let content = serde_json::to_string(item)
+                .map_err(|error| AdapterError::new("assemble", error.to_string()))?;
+            let frame = TransportFrame {
+                agent: AgentKind::Codex,
+                transport_kind: TransportKind::InjectedContext,
+                timestamp: timestamp.clone(),
+                payload: TransportPayload::Inject {
+                    tag: "compacted.replacement_history".to_owned(),
+                    content,
+                },
+                evidence: evidence.clone(),
+            };
+            let classified = frames::classify(&frame);
+            if self.seen_replay_hashes.insert(classified.content_hash) {
+                self.push_classified_frame(frame)?;
+            }
+        }
         Ok(())
     }
 
@@ -777,104 +1010,25 @@ impl<'a> Assembly<'a> {
     /// survives as `UserMsg` turns in order. The substrate keeps the full
     /// result; projections filter on frame kind, so reclassified envelopes
     /// vanish from `--conversation` while full extraction retains them.
-    fn push_user_message_classified(
+    fn push_user_message_frames(
         &mut self,
         text: String,
         timestamp: Known<String>,
         evidence: RawUnitRef,
     ) -> Result<(), AdapterError> {
-        let segments = split_user_envelope_segments(&text);
-        let has_envelope = segments
-            .iter()
-            .any(|segment| !matches!(segment, UserSegment::Prose(_)));
-        if !has_envelope {
+        let Some(frames) = normalize_user_envelopes(&text, &timestamp, &evidence) else {
             // Fast path: no envelope anywhere — emit the original body
             // unchanged so ordinary messages keep byte-identical hashes.
-            return self.push_turn(
-                TurnRole::User,
-                TurnKind::UserMsg,
+            return self.push_classified_frame(text_frame(
+                TransportKind::DirectMessage,
+                TransportRole::User,
                 text,
                 timestamp,
-                Known::unknown(),
                 evidence,
-            );
-        }
-        for segment in segments {
-            match segment {
-                UserSegment::Prose(prose) => {
-                    let prose = prose.trim().to_owned();
-                    self.push_turn(
-                        TurnRole::User,
-                        TurnKind::UserMsg,
-                        prose,
-                        timestamp.clone(),
-                        Known::unknown(),
-                        evidence.clone(),
-                    )?;
-                }
-                UserSegment::EchoSeal(text) => {
-                    self.push_turn(
-                        TurnRole::User,
-                        TurnKind::UserMsg,
-                        text,
-                        timestamp.clone(),
-                        Known::unknown(),
-                        evidence.clone(),
-                    )?;
-                }
-                UserSegment::ShellAction { tag, command, body } => {
-                    // Substrate keeps the whole result; projections decide
-                    // what to show. The marker is the timeline anchor, the
-                    // verbatim envelope is the retained evidence.
-                    let marker = shell_action_marker(&command);
-                    self.push_turn(
-                        TurnRole::Tool,
-                        TurnKind::ToolCall,
-                        marker.clone(),
-                        timestamp.clone(),
-                        Known::value(tag.to_owned()),
-                        evidence.clone(),
-                    )?;
-                    let call_idx = self.turns.len() as u64 - 1;
-                    self.tools.push(ToolEvent {
-                        kind: ToolEventKind::Call,
-                        turn_idx: call_idx,
-                        tool_name: tag.to_owned(),
-                        correlation_id: Known::unknown(),
-                        payload_hash: sha256_hex(marker.as_bytes()),
-                        payload_bytes: marker.len() as u64,
-                        raw_unit_refs: vec![evidence.clone()],
-                    });
-                    self.push_turn(
-                        TurnRole::Tool,
-                        TurnKind::ToolResult,
-                        body.clone(),
-                        timestamp.clone(),
-                        Known::value(tag.to_owned()),
-                        evidence.clone(),
-                    )?;
-                    let result_idx = self.turns.len() as u64 - 1;
-                    self.tools.push(ToolEvent {
-                        kind: ToolEventKind::Result,
-                        turn_idx: result_idx,
-                        tool_name: tag.to_owned(),
-                        correlation_id: Known::unknown(),
-                        payload_hash: sha256_hex(body.as_bytes()),
-                        payload_bytes: body.len() as u64,
-                        raw_unit_refs: vec![evidence.clone()],
-                    });
-                }
-                UserSegment::ControlEnvelope { tag: _, body } => {
-                    self.push_turn(
-                        TurnRole::System,
-                        TurnKind::SystemNote,
-                        body,
-                        timestamp.clone(),
-                        Known::unknown(),
-                        evidence.clone(),
-                    )?;
-                }
-            }
+            ));
+        };
+        for frame in frames {
+            self.push_classified_frame(frame)?;
         }
         Ok(())
     }
@@ -985,6 +1139,7 @@ impl<'a> Assembly<'a> {
             SkippedReason::Oversized => WarningKind::OversizedUnit,
             SkippedReason::EncryptedOpaque => WarningKind::OpaqueReasoning,
             SkippedReason::Unsupported => WarningKind::UnsupportedVisibleEvent,
+            SkippedReason::CompactionReplay | SkippedReason::DuplicateBody => return,
         };
         self.warn(kind, unit.ordinal);
         if boundary == UnitBoundary::UnterminatedTail {
@@ -1276,51 +1431,31 @@ fn thread_goal_summary(payload: &Value) -> String {
     }
 }
 
-/// Agent-to-agent dispatch text, prefixed with the routing pair so a reader
-/// can tell who was handed what. Encrypted content blocks carry no text and
-/// drop out through `content_text`.
-fn agent_message_text(payload: &Value) -> String {
-    let body = content_text(&payload["content"]);
-    match (
-        string_at(payload, &["author"]),
-        string_at(payload, &["recipient"]),
-    ) {
-        (Some(author), Some(recipient)) => format!("{author} → {recipient}\n{body}"),
-        _ => body,
+fn text_frame(
+    transport_kind: TransportKind,
+    role: TransportRole,
+    content: String,
+    timestamp: Known<String>,
+    evidence: RawUnitRef,
+) -> TransportFrame {
+    TransportFrame {
+        agent: AgentKind::Codex,
+        transport_kind,
+        timestamp,
+        payload: TransportPayload::Text { role, content },
+        evidence,
     }
 }
 
-/// Reserved Codex envelopes that arrive inside `role=user` message bodies
-/// after the 2026-08 schema change. A plain `echo` command is an operator
-/// utterance sealed at the envelope timestamp. Other shell envelopes are tool
-/// actions, while control envelopes carry injected context or instructions.
-const USER_TOOL_ENVELOPE_TAGS: [&str; 1] = ["user_shell_command"];
-const USER_CONTROL_ENVELOPE_TAGS: [&str; 5] = [
-    "codex_internal_context",
-    "INSTRUCTIONS",
-    "instructions",
-    "user_instructions",
-    "environment_context",
-];
-
-/// One classified span of a `role=user` message body.
-#[derive(Debug, PartialEq, Eq)]
-enum UserSegment {
-    /// Genuine human prose (possibly all of the message).
-    Prose(String),
-    /// Operator prose deliberately sent through a plain `echo` command.
-    EchoSeal(String),
-    /// A user-run command: `command` feeds the `$ cmd` timeline marker,
-    /// `body` is the whole envelope (tags included) retained verbatim as the
-    /// tool result. The canonical model keeps the output; projections
-    /// decide what to show.
-    ShellAction {
-        tag: &'static str,
-        command: String,
-        body: String,
-    },
-    /// A whole control/instruction envelope, tags included.
-    ControlEnvelope { tag: &'static str, body: String },
+fn labeled_field(content: &str, label: &str) -> Option<String> {
+    content.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix(label)
+            .and_then(|tail| tail.strip_prefix(':'))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    })
 }
 
 /// Extract the command payload from a Codex `user_shell_command` envelope.
@@ -1333,47 +1468,6 @@ fn user_shell_command(body: &str) -> Option<&str> {
     let command = body.split_once("<command>")?.1;
     let command = command.split_once("</command>")?.0.trim();
     (!command.is_empty()).then_some(command)
-}
-
-/// Recognize the operator's timestamped echo channel.
-///
-/// The tee/append guard intentionally runs before quote removal. The frozen
-/// session used this shape to discuss a tee command inside an echo payload;
-/// treating it as a shell action is the conservative, golden-compatible cut.
-fn echo_seal_text(command: &str) -> Option<String> {
-    let command = command.trim();
-    let payload = command.strip_prefix("echo")?;
-    if !payload.chars().next().is_some_and(char::is_whitespace)
-        || command.contains("| tee")
-        || command.contains(">>")
-    {
-        return None;
-    }
-    let payload = payload.trim();
-    if payload.is_empty() {
-        return None;
-    }
-    let unquoted = if payload.len() >= 2
-        && ((payload.starts_with('\'') && payload.ends_with('\''))
-            || (payload.starts_with('"') && payload.ends_with('"')))
-    {
-        &payload[1..payload.len() - 1]
-    } else {
-        payload
-    };
-    Some(unquoted.to_owned())
-}
-
-fn classify_user_shell_envelope(tag: &'static str, body: String) -> UserSegment {
-    let command = user_shell_command(&body).unwrap_or("user_shell_command (malformed)");
-    match echo_seal_text(command) {
-        Some(text) => UserSegment::EchoSeal(text),
-        None => UserSegment::ShellAction {
-            tag,
-            command: command.to_owned(),
-            body,
-        },
-    }
 }
 
 fn shell_action_marker(command: &str) -> String {
@@ -1397,10 +1491,12 @@ fn match_envelope_open(trimmed: &str) -> Option<(&'static str, bool, bool)> {
     if !trimmed.starts_with('<') {
         return None;
     }
-    let candidates = USER_TOOL_ENVELOPE_TAGS
-        .iter()
-        .map(|tag| (*tag, true))
-        .chain(USER_CONTROL_ENVELOPE_TAGS.iter().map(|tag| (*tag, false)));
+    let candidates = std::iter::once(("user_shell_command", true)).chain(
+        frames_rules::rules_for(AgentKind::Codex)
+            .inject_tags
+            .iter()
+            .map(|rule| (rule.tag, false)),
+    );
     for (tag, is_tool) in candidates {
         let after = match trimmed[1..].strip_prefix(tag) {
             Some(after) => after,
@@ -1441,31 +1537,57 @@ fn match_envelope_open(trimmed: &str) -> Option<(&'static str, bool, bool)> {
 /// mentions of the literal tag never match. An unterminated envelope runs to
 /// the end of the message — fail closed: leaking a shell result is worse than
 /// over-classifying a malformed envelope.
-fn split_user_envelope_segments(text: &str) -> Vec<UserSegment> {
+fn normalize_user_envelopes(
+    text: &str,
+    timestamp: &Known<String>,
+    evidence: &RawUnitRef,
+) -> Option<Vec<TransportFrame>> {
     fn push_envelope(
-        segments: &mut Vec<UserSegment>,
+        output: &mut Vec<TransportFrame>,
         tag: &'static str,
-        is_tool: bool,
+        is_shell: bool,
         body: String,
+        timestamp: &Known<String>,
+        evidence: &RawUnitRef,
     ) {
-        segments.push(if is_tool {
-            classify_user_shell_envelope(tag, body)
+        let payload = if is_shell {
+            TransportPayload::Shell {
+                command: user_shell_command(&body)
+                    .unwrap_or("user_shell_command (malformed)")
+                    .to_owned(),
+                result: body,
+            }
         } else {
-            UserSegment::ControlEnvelope { tag, body }
+            TransportPayload::Inject {
+                tag: tag.to_owned(),
+                content: body,
+            }
+        };
+        output.push(TransportFrame {
+            agent: AgentKind::Codex,
+            transport_kind: if is_shell {
+                TransportKind::UserShellCommand
+            } else {
+                TransportKind::InjectedContext
+            },
+            timestamp: timestamp.clone(),
+            payload,
+            evidence: evidence.clone(),
         });
     }
 
-    let mut segments = Vec::new();
+    let mut output = Vec::new();
     let mut prose = String::new();
     let mut open: Option<(&'static str, bool, String)> = None;
     let mut in_fence = false;
+    let mut saw_envelope = false;
     for line in text.lines() {
         if let Some((tag, _, body)) = open.as_mut() {
             body.push_str(line);
             body.push('\n');
             if line.trim() == format!("</{tag}>") {
-                let (tag, is_tool, body) = open.take().expect("open envelope");
-                push_envelope(&mut segments, tag, is_tool, body);
+                let (tag, is_shell, body) = open.take().expect("open envelope");
+                push_envelope(&mut output, tag, is_shell, body, timestamp, evidence);
             }
             continue;
         }
@@ -1476,31 +1598,44 @@ fn split_user_envelope_segments(text: &str) -> Vec<UserSegment> {
             prose.push('\n');
             continue;
         }
-        if !in_fence && let Some((tag, is_tool, closes_inline)) = match_envelope_open(trimmed) {
+        if !in_fence && let Some((tag, is_shell, closes_inline)) = match_envelope_open(trimmed) {
+            saw_envelope = true;
             if !prose.trim().is_empty() {
-                segments.push(UserSegment::Prose(std::mem::take(&mut prose)));
+                output.push(text_frame(
+                    TransportKind::DirectMessage,
+                    TransportRole::User,
+                    std::mem::take(&mut prose).trim().to_owned(),
+                    timestamp.clone(),
+                    evidence.clone(),
+                ));
             } else {
                 prose.clear();
             }
             let mut body = String::from(line);
             body.push('\n');
             if closes_inline {
-                push_envelope(&mut segments, tag, is_tool, body);
+                push_envelope(&mut output, tag, is_shell, body, timestamp, evidence);
             } else {
-                open = Some((tag, is_tool, body));
+                open = Some((tag, is_shell, body));
             }
             continue;
         }
         prose.push_str(line);
         prose.push('\n');
     }
-    if let Some((tag, is_tool, body)) = open.take() {
-        push_envelope(&mut segments, tag, is_tool, body);
+    if let Some((tag, is_shell, body)) = open.take() {
+        push_envelope(&mut output, tag, is_shell, body, timestamp, evidence);
     }
     if !prose.trim().is_empty() {
-        segments.push(UserSegment::Prose(prose));
+        output.push(text_frame(
+            TransportKind::DirectMessage,
+            TransportRole::User,
+            prose.trim().to_owned(),
+            timestamp.clone(),
+            evidence.clone(),
+        ));
     }
-    segments
+    saw_envelope.then_some(output)
 }
 
 fn content_text(content: &Value) -> String {

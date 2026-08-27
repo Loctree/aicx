@@ -26,12 +26,25 @@ pub struct AgentFrameRules {
 }
 
 const CODEX_INJECT_TAGS: &[InjectTagRule] = &[
+    // # codex — transport envelope spellings normalized by codex.rs.
     InjectTagRule {
         tag: "codex_internal_context",
         kind: InjectRuleKind::CodexInternalContext,
     },
     InjectTagRule {
         tag: "AGENTS.md",
+        kind: InjectRuleKind::AgentInstructions,
+    },
+    InjectTagRule {
+        tag: "INSTRUCTIONS",
+        kind: InjectRuleKind::AgentInstructions,
+    },
+    InjectTagRule {
+        tag: "instructions",
+        kind: InjectRuleKind::AgentInstructions,
+    },
+    InjectTagRule {
+        tag: "user_instructions",
         kind: InjectRuleKind::AgentInstructions,
     },
     InjectTagRule {

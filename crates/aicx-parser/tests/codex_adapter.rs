@@ -858,3 +858,63 @@ fn codex_frozen_human_shape_has_25_human_plus_9_echo_seals() {
         "the result dump never enters the dialogue channel"
     );
 }
+
+#[test]
+fn codex_multiline_echo_bus_is_one_human_frame() {
+    let body = r#"{"timestamp":"2026-08-27T10:00:00Z","type":"session_meta","payload":{"id":"echo-bus","cwd":"/repo"}}
+{"timestamp":"2026-08-27T10:00:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<user_shell_command>\n<command>\necho 'Monika Szymańska: pierwszy cytat\nMaciej Gad: drugi cytat\nwniosek operatora'\n</command>\n<result>\nquoted transcript\n</result>\n</user_shell_command>"}]}}
+"#;
+    let model = model("echo-bus", body.as_bytes());
+    let users: Vec<_> = model
+        .turns
+        .iter()
+        .filter(|turn| turn.kind == TurnKind::UserMsg)
+        .collect();
+    assert_eq!(users.len(), 1, "one echo envelope is one human frame");
+    assert!(users[0].text.contains("Monika Szymańska:"));
+    assert!(users[0].text.contains("Maciej Gad:"));
+}
+
+#[test]
+fn codex_response_agent_message_is_inter_agent_not_assistant() {
+    let body = br#"{"timestamp":"2026-08-27T11:00:00Z","type":"session_meta","payload":{"id":"inter-agent","cwd":"/repo"}}
+{"timestamp":"2026-08-27T11:00:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"keep the session visible"}]}}
+{"timestamp":"2026-08-27T11:00:02Z","type":"response_item","payload":{"type":"agent_message","author":"/root/worker","recipient":"/root","content":[{"type":"input_text","text":"Message Type: FINAL_ANSWER\nTask name: /root\nSender: /root/worker\nPayload:\nworker result"}]}}
+"#;
+    let model = model("inter-agent", body);
+    assert_eq!(
+        model
+            .turns
+            .iter()
+            .filter(|turn| turn.kind == TurnKind::AgentReply)
+            .count(),
+        0,
+        "agent_message must never leak into the assistant lane"
+    );
+    assert_eq!(model.coverage.consumed_of_kind("agent_message"), 1);
+}
+
+#[test]
+fn codex_compaction_replay_is_hash_deduplicated_and_not_speech() {
+    let body = br#"{"timestamp":"2026-08-27T12:00:00Z","type":"session_meta","payload":{"id":"compaction","cwd":"/repo"}}
+{"timestamp":"2026-08-27T12:00:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"one live utterance"}]}}
+{"timestamp":"2026-08-27T12:00:02Z","type":"compacted","payload":{"replacement_history":[{"type":"message","role":"user","content":[{"type":"input_text","text":"sticky prefix"}]},{"type":"message","role":"user","content":[{"type":"input_text","text":"sticky prefix"}]}]}}
+"#;
+    let model = model("compaction", body);
+    assert_eq!(
+        dialogue_texts(&model),
+        vec!["one live utterance".to_owned()]
+    );
+    assert_eq!(
+        model.coverage.skipped_for(SkippedReason::CompactionReplay),
+        1
+    );
+    assert_eq!(model.coverage.skipped_for(SkippedReason::DuplicateBody), 1);
+    assert!(
+        model
+            .coverage
+            .status
+            .boundary_flags
+            .compaction_boundary_present
+    );
+}
