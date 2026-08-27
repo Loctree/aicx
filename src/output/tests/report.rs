@@ -191,6 +191,8 @@ fn test_no_truncation_by_default() {
         source_path: None,
         source_sha256: None,
         source_line_span: None,
+        frame_class: None,
+        lineage_origin: None,
         frame_kind: None,
     }];
     let metadata = ReportMetadata {
@@ -233,6 +235,8 @@ fn test_truncation_when_configured() {
         source_path: None,
         source_sha256: None,
         source_line_span: None,
+        frame_class: None,
+        lineage_origin: None,
         frame_kind: None,
     }];
     let metadata = ReportMetadata {
@@ -342,6 +346,8 @@ fn test_append_timeline_adds_new_entries() {
         source_path: None,
         source_sha256: None,
         source_line_span: None,
+        frame_class: None,
+        lineage_origin: None,
         frame_kind: None,
     }];
     let metadata1 = ReportMetadata {
@@ -367,6 +373,8 @@ fn test_append_timeline_adds_new_entries() {
             source_path: None,
             source_sha256: None,
             source_line_span: None,
+            frame_class: None,
+            lineage_origin: None,
             frame_kind: None,
         },
         TimelineEntry {
@@ -381,6 +389,8 @@ fn test_append_timeline_adds_new_entries() {
             source_path: None,
             source_sha256: None,
             source_line_span: None,
+            frame_class: None,
+            lineage_origin: None,
             frame_kind: None,
         },
     ];
@@ -429,6 +439,8 @@ fn test_code_blocks_preserved() {
         source_path: None,
         source_sha256: None,
         source_line_span: None,
+        frame_class: None,
+        lineage_origin: None,
         frame_kind: None,
     }];
     let metadata = ReportMetadata {
@@ -546,6 +558,8 @@ fn test_multiline_without_code_uses_blockquote_lines() {
         source_path: None,
         source_sha256: None,
         source_line_span: None,
+        frame_class: None,
+        lineage_origin: None,
         frame_kind: None,
     }];
     let metadata = ReportMetadata {
@@ -675,6 +689,8 @@ fn json_roundtrip_entry(msg: &str) -> serde_json::Value {
         source_path: None,
         source_sha256: None,
         source_line_span: None,
+        frame_class: None,
+        lineage_origin: None,
         frame_kind: None,
     }];
     let metadata = ReportMetadata {

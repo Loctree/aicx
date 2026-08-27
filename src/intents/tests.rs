@@ -31,6 +31,8 @@ fn per_frame_cwd_prevents_cross_repo_session_contamination() {
         session_id: "shared-session".to_string(),
         role: "user".to_string(),
         message: message.to_string(),
+        frame_class: None,
+        lineage_origin: None,
         frame_kind: Some(FrameKind::UserMsg),
         branch: None,
         cwd: cwd.map(str::to_string),
@@ -2076,6 +2078,7 @@ fn build_candidate_threads_sidecar_honesty_into_record() {
         timestamp: Utc::now(),
         session_id: "sess-b2".to_string(),
         honesty: crate::oracle::ClaimHonesty::canonical(),
+        scope: None,
         transcript_entries: None,
         body: None,
     };
@@ -3977,6 +3980,7 @@ mod flexible_dates {
             timestamp: Utc::now(),
             session_id: "sess-1".to_string(),
             honesty: Default::default(),
+            scope: None,
             transcript_entries: None,
             body: None,
         };
@@ -4034,6 +4038,7 @@ mod flexible_dates {
             timestamp: Utc::now(),
             session_id: "sess-gate".to_string(),
             honesty: Default::default(),
+            scope: None,
             transcript_entries: None,
             body: None,
         };
@@ -4266,6 +4271,7 @@ Update Cargo.lock dependencies\n";
             timestamp: Utc::now(),
             session_id: "sess-code".to_string(),
             honesty: Default::default(),
+            scope: None,
             transcript_entries: None,
             body: None,
         };
@@ -4550,6 +4556,7 @@ Results:
             timestamp: Utc::now(),
             session_id: "sess-1".to_string(),
             honesty: Default::default(),
+            scope: None,
             transcript_entries: None,
             body: None,
         };

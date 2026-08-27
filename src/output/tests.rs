@@ -80,6 +80,8 @@ fn sample_entries() -> Vec<TimelineEntry> {
             source_path: None,
             source_sha256: None,
             source_line_span: None,
+            frame_class: None,
+            lineage_origin: None,
             frame_kind: None,
         },
         TimelineEntry {
@@ -94,6 +96,8 @@ fn sample_entries() -> Vec<TimelineEntry> {
             source_path: None,
             source_sha256: None,
             source_line_span: None,
+            frame_class: None,
+            lineage_origin: None,
             frame_kind: None,
         },
         TimelineEntry {
@@ -108,6 +112,8 @@ fn sample_entries() -> Vec<TimelineEntry> {
             source_path: None,
             source_sha256: None,
             source_line_span: None,
+            frame_class: None,
+            lineage_origin: None,
             frame_kind: None,
         },
     ]

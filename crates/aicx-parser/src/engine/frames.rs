@@ -69,7 +69,9 @@ pub struct TransportFrame {
     pub evidence: RawUnitRef,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Human transport channel. The one definition: `src/extraction/projection.rs`
+/// imports this type (W2-R1 closed the twin it used to carry).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HumanChannel {
     Direct,
@@ -134,16 +136,56 @@ pub enum FrameClass {
 }
 
 impl FrameClass {
-    /// Maps the new taxonomy onto the existing model instead of replacing it.
-    /// `InterAgent` deliberately has no `TurnKind`: forcing it into
-    /// `AgentReply` would recreate the assistant-lane leak this taxonomy fixes.
+    /// Maps the taxonomy onto the legacy lane (`TurnKind`) of the model.
+    ///
+    /// Since W2-R1 the class itself travels on `Turn::frame_class`, so the
+    /// lane is a projection for consumers that still read `kind`, not the
+    /// identity. `InterAgent` therefore gets a lane too — `SystemNote`, the
+    /// razor-hidden system lane — instead of `None`: it must reach the
+    /// model to be selectable by `--kind inter_agent`. It is never
+    /// `AgentReply`; the assistant-lane leak this taxonomy fixed stays fixed.
     pub const fn turn_kind(&self) -> Option<TurnKind> {
         match self {
             Self::Human { .. } | Self::EchoSeal { .. } => Some(TurnKind::UserMsg),
             Self::ShellAction { .. } => Some(TurnKind::ToolCall),
-            Self::Inject { .. } | Self::LineageMeta { .. } => Some(TurnKind::SystemNote),
+            Self::Inject { .. } | Self::LineageMeta { .. } | Self::InterAgent { .. } => {
+                Some(TurnKind::SystemNote)
+            }
             Self::AssistantFinal => Some(TurnKind::AgentReply),
-            Self::InterAgent { .. } => None,
+        }
+    }
+
+    /// Speaker lane of the class. One definition, so no adapter re-decides
+    /// which role a class speaks with (T8 boundary closed).
+    pub const fn turn_role(&self) -> super::TurnRole {
+        match self {
+            Self::Human { .. } | Self::EchoSeal { .. } => super::TurnRole::User,
+            Self::AssistantFinal => super::TurnRole::Assistant,
+            Self::ShellAction { .. } => super::TurnRole::Tool,
+            Self::Inject { .. } | Self::LineageMeta { .. } | Self::InterAgent { .. } => {
+                super::TurnRole::System
+            }
+        }
+    }
+
+    /// Stable machine tag, identical to the serde `class` tag.
+    pub const fn tag(&self) -> &'static str {
+        match self {
+            Self::Human { .. } => "human",
+            Self::EchoSeal { .. } => "echo_seal",
+            Self::ShellAction { .. } => "shell_action",
+            Self::Inject { .. } => "inject",
+            Self::AssistantFinal => "assistant_final",
+            Self::LineageMeta { .. } => "lineage_meta",
+            Self::InterAgent { .. } => "inter_agent",
+        }
+    }
+
+    /// Human transport channel when the class is human speech.
+    pub const fn human_channel(&self) -> Option<HumanChannel> {
+        match self {
+            Self::Human { channel } | Self::EchoSeal { channel, .. } => Some(*channel),
+            _ => None,
         }
     }
 }

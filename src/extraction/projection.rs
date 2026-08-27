@@ -5,9 +5,10 @@
 //! the view over that substrate. Flags populate a [`ProjectionSpec`]; they
 //! never rewrite stored frames, extracts, or the index.
 //!
-//! W1-T6 is structure only. Consumers (`extract`, `search`, MCP, intents)
-//! attach in W2-T13. Do not import `engine::frames` here: that crate surface
-//! is a parallel W1 cut and is not a dependency of this layer.
+//! W1-T6 was structure only; consumers attached in W2-T13. Since W2-R1 the
+//! model carries `FrameClass` on every throne-owned turn, and this module
+//! maps that class — not `role`/`frame_kind` strings — onto
+//! [`ProjectionKind`] (`ProjectionKind::from_frame_class`).
 
 /// Unbounded parent walk when `--lineage` is passed without a depth.
 pub const LINEAGE_UNBOUNDED: usize = usize::MAX;
@@ -80,6 +81,23 @@ impl ProjectionKind {
         }
     }
 
+    /// The throne class → projection kind. Total: every `FrameClass` has
+    /// exactly one kind. This is the mapping consumers use once the model
+    /// carries the class (W2-R1); the role/`frame_kind` bridge in
+    /// `conversation.rs` is the fallback for class-less entries only.
+    pub const fn from_frame_class(class: &aicx_parser::engine::FrameClass) -> Self {
+        use aicx_parser::engine::FrameClass;
+        match class {
+            FrameClass::Human { .. } => Self::Human,
+            FrameClass::EchoSeal { .. } => Self::EchoSeal,
+            FrameClass::ShellAction { .. } => Self::ShellAction,
+            FrameClass::Inject { .. } => Self::Inject,
+            FrameClass::AssistantFinal => Self::AssistantFinal,
+            FrameClass::LineageMeta { .. } => Self::LineageMeta,
+            FrameClass::InterAgent { .. } => Self::InterAgent,
+        }
+    }
+
     /// Map the live `search --frame-kind` tokens onto the throne vocabulary.
     pub fn from_legacy_frame_kind(token: &str) -> Option<Self> {
         match token {
@@ -92,14 +110,11 @@ impl ProjectionKind {
     }
 }
 
-/// Human transport channel (Decision 7). Projection metadata, not a substrate
-/// rewrite. `--dialog` reveals EchoBus/Queue as speech with their seals.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum HumanChannel {
-    Direct,
-    EchoBus,
-    Queue,
-}
+/// Human transport channel (Decision 7): the throne's type, re-exported so
+/// the projection speaks the same vocabulary as the substrate. `--dialog`
+/// reveals EchoBus/Queue as speech with their seals. (W2-R1 removed the
+/// local twin of this enum.)
+pub use aicx_parser::engine::HumanChannel;
 
 /// How a retained `ShellAction` result is rendered. The bytes stay in the
 /// substrate regardless of this choice.
