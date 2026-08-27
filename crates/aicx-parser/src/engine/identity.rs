@@ -41,8 +41,13 @@ impl PackageIdentity {
     }
 
     /// Short, stable rendering `<store_id>@<hash[..16]>` for reports.
+    ///
+    /// Fields are public, so an identity may exist without passing through
+    /// [`PackageIdentity::new`]; a hash shorter than 16 bytes is rendered
+    /// whole instead of panicking on the slice.
     pub fn short(&self) -> String {
-        format!("{}@{}", self.store_id, &self.content_hash[..16])
+        let prefix = self.content_hash.get(..16).unwrap_or(&self.content_hash);
+        format!("{}@{prefix}", self.store_id)
     }
 
     /// Same bytes, regardless of which store id they sit under.

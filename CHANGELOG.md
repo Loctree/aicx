@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
+### Added
+
+- parser engine contracts (structure only, compile embargo W1, cut
+  `W1-T5-tb-contracts`): `engine/refusal.rs` with `RefusalReason` (one
+  variant per oracle-manifest case, each carrying `RefusalEvidence`),
+  `AdapterDetection` (detect-with-evidence gate) and `SubstitutionError`
+  (`ExactAlias` is a substitution unless explicitly allowed)
+- `CoverageReport::{consumed_by_kind, known_skipped}` ledger with
+  `check_totality()`; `SkippedReason::{CompactionReplay, DuplicateBody}`
+  counted by body hash, not transport id (A2)
+- `PackageIdentity` = (store id, source content hash) and `FrameIdentity`
+  keyed by body hash; `ValidatedSession::identity()`
+
+### Changed
+
+- `validate_model` refuses `turns = []` with
+  `ValidationError { refusal: Some(RefusalReason::EmptyConversation) }`
+  instead of validating an empty session (grok `019fdeca`)
+
 ### Fixed
 
 - Codex `user_shell_command` envelopes (`codex-rollout-v3`): a plain
