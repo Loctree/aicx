@@ -20,6 +20,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- grok parser adapter (structure only, compile embargo W2, cut
+  `W2-T9-grok-on-throne`): chat/event records become `TransportFrame`s;
+  speech class comes from `engine::frames::classify`. Grok harness
+  `synthetic_reason` tags live in the `# grok` block of `frames_rules.rs`.
+  Degenerate `019fdeca` no longer maps the skills dump to `UserMsg`. Empty
+  `turns` stay a `RefusalReason::EmptyConversation` from `validate_model`
+  (W1-T5), never a validated empty session.
+
 - `validate_model` refuses `turns = []` with
   `ValidationError { refusal: Some(RefusalReason::EmptyConversation) }`
   instead of validating an empty session (grok `019fdeca`)
