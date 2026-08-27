@@ -23,7 +23,10 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::legacy_archive::{self};
-use crate::session_catalog::{AgentKind, CatalogIoStats, CatalogSource, SessionCatalog};
+use crate::session_catalog::{
+    self, AgentKind, CatalogError, CatalogIoStats, CatalogSource, ScopedChildIdentity,
+    SessionCatalog, SourceFingerprint,
+};
 
 pub const CATALOG_DIRNAME: &str = "catalog";
 pub const SESSIONS_FILENAME: &str = "sessions.jsonl";
@@ -1013,45 +1016,62 @@ fn multi_host_notes(by_machine: &BTreeMap<String, usize>, counts: &StalenessCoun
     notes
 }
 
-/// Resolve a session_id → source_path from the durable catalog (exact id match).
+/// Resolve a session id through the canonical live-catalog matching policy.
+///
+/// The durable JSONL remains the source of rows, but it no longer owns a
+/// second exact/prefix algorithm. Any non-canonical match is refused with the
+/// loud substitution receipt produced by `session_catalog`.
 pub fn resolve_session(home: &Path, session_id: &str) -> Result<Option<CatalogEntry>> {
     let needle = session_id.trim();
     if needle.is_empty() {
         return Ok(None);
     }
     let entries = read_entries_at(home)?;
-    for entry in &entries {
-        if entry.session_id == needle
-            || entry
-                .logical_session_id
-                .as_deref()
-                .is_some_and(|id| id == needle)
-        {
-            return Ok(Some(entry.clone()));
+    let mut hits = Vec::new();
+    for agent in AgentKind::ALL {
+        let sources = entries
+            .iter()
+            .filter(|entry| AgentKind::parse(&entry.agent) == Some(agent))
+            .map(|entry| CatalogSource {
+                agent,
+                source_id: entry.session_id.clone(),
+                logical_session_id: entry.logical_session_id.clone(),
+                aliases: Vec::new(),
+                filename_aliases: Vec::new(),
+                scoped_children: Vec::<ScopedChildIdentity>::new(),
+                path: PathBuf::from(&entry.source_path),
+                identity_inferred: entry.logical_session_id.is_none(),
+                fingerprint: SourceFingerprint {
+                    len: entry.source_len.unwrap_or_default(),
+                    modified_unix_nanos: entry.source_mtime_ns.unwrap_or_default() as u128,
+                },
+                header_truncated: false,
+            })
+            .collect::<Vec<_>>();
+        if sources.is_empty() {
+            continue;
+        }
+        match session_catalog::resolve_from_sources(agent, needle.to_owned(), sources) {
+            Ok(resolved) => hits.push(resolved),
+            Err(CatalogError::Missing { .. }) => {}
+            Err(error) => return Err(anyhow::Error::new(error)),
         }
     }
-    let mut prefixes: Vec<_> = entries
-        .into_iter()
-        .filter(|entry| {
-            entry.session_id.starts_with(needle)
-                || entry
-                    .logical_session_id
-                    .as_deref()
-                    .is_some_and(|id| id.starts_with(needle))
-        })
-        .collect();
-    prefixes.sort_by(|left, right| {
-        left.agent
-            .cmp(&right.agent)
-            .then_with(|| left.session_id.cmp(&right.session_id))
-    });
-    prefixes
-        .dedup_by(|left, right| left.agent == right.agent && left.session_id == right.session_id);
-    match prefixes.len() {
+    match hits.len() {
         0 => Ok(None),
-        1 => Ok(prefixes.pop()),
+        1 => {
+            let resolved = hits.pop().expect("one resolver hit");
+            if let Some(notice) = resolved.substitution_notice {
+                anyhow::bail!("{notice}");
+            }
+            Ok(entries.into_iter().find(|entry| {
+                AgentKind::parse(&entry.agent) == Some(resolved.source.agent)
+                    && entry.session_id == resolved.source.source_id
+                    && entry.source_path.as_str() == resolved.source.path.to_string_lossy().as_ref()
+            }))
+        }
         count => anyhow::bail!(
-            "session prefix `{needle}` is ambiguous across {count} catalog entries; use the full id"
+            "session `{needle}` is ambiguous across {count} catalog entries; use the full id and agent"
         ),
     }
 }

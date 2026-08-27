@@ -8,6 +8,9 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
+use aicx_parser::engine::{
+    EngineError, MIN_HUMAN_UTTERANCES, MIN_VISIBLE_TURNS, RefusalEvidence, RefusalReason,
+};
 use anyhow::Result;
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use serde::Serialize;
@@ -120,6 +123,8 @@ pub struct SessionShowPayload {
     pub ok: bool,
     pub session: SessionListItem,
     pub matched_by: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub substitution: Option<String>,
     pub catalog_candidates: usize,
     pub catalog_files_opened: usize,
     pub catalog_body_reads: usize,
@@ -246,31 +251,21 @@ pub fn show_session(
             json!({ "session": req.session }),
         ));
     }
-    let (agent, resolved, stats) = resolve_session(req.user_home, req.session, req.agent)?;
+    let (agent, resolved, stats) =
+        resolve_session_across_agents(req.user_home, req.session, req.agent)?;
     let info = session_info_for_resolved(agent, &resolved);
     let live_paths = BTreeSet::new();
-    let mut warnings = Vec::new();
+    let warnings = Vec::new();
     let conversation = if req.conversation {
-        match extract_conversation(&resolved, agent, req.user_only) {
-            Ok(payload) => Some(payload),
-            Err(error) => {
-                warnings.push(error);
-                None
-            }
-        }
+        Some(extract_conversation(&resolved, agent, req.user_only)?)
     } else {
         None
     };
-    if conversation.is_none() && req.conversation {
-        warnings.push(format!(
-            "session `{}` resolved but conversation extract failed; metadata is still returned",
-            resolved.source.source_id
-        ));
-    }
     Ok(SessionShowPayload {
         ok: true,
         session: session_item(info, &live_paths),
         matched_by: format!("{:?}", resolved.matched_by),
+        substitution: resolved.substitution_notice.clone(),
         catalog_candidates: stats.metadata_candidates,
         catalog_files_opened: stats.files_opened,
         catalog_body_reads: stats.body_reads,
@@ -582,7 +577,7 @@ fn project_error(error: ProjectResolutionError) -> SessionSurfaceError {
     )
 }
 
-fn resolve_session(
+fn resolve_session_across_agents(
     user_home: &Path,
     query: &str,
     agent: Option<&str>,
@@ -762,31 +757,70 @@ fn extract_conversation(
     resolved: &ResolvedSource,
     agent: AgentKind,
     user_only: bool,
-) -> Result<ConversationPayload, String> {
+) -> Result<ConversationPayload, SessionSurfaceError> {
     let parsed = crate::parser_dispatch::parse_file(
         agent.parser_kind(),
         &resolved.source.source_id,
         resolved.source.logical_session_id.clone(),
         &resolved.source.path,
     )
-    .map_err(|error| {
-        format!(
-            "unsupported or unreadable source {}: {error}",
-            resolved.source.path.display()
-        )
-    })?;
+    .map_err(|error| parser_surface_error(&resolved.source.path, &error))?;
     let mut entries = crate::output::timeline_entries_from_model(parsed.model());
+    let turns_before_filter = entries.len() as u64;
     if user_only {
         entries
             .retain(|entry| entry.role == "user" || entry.frame_kind == Some(FrameKind::UserMsg));
     }
     if entries.is_empty() {
-        return Err(format!(
-            "resolved `{}` but no extractable conversation turns were present",
-            resolved.source.source_id
-        ));
+        let evidence = RefusalEvidence::from_coverage(
+            &parsed.model().coverage,
+            if user_only {
+                MIN_HUMAN_UTTERANCES
+            } else {
+                MIN_VISIBLE_TURNS
+            },
+            0,
+            vec![format!(
+                "timeline_entries_before_filter={turns_before_filter}; user_only={user_only}"
+            )],
+        );
+        let refusal = if user_only {
+            RefusalReason::NoHumanUtterance {
+                agent: agent.parser_kind(),
+                session_id: resolved.source.source_id.clone(),
+                evidence,
+            }
+        } else {
+            RefusalReason::ProjectionFilteredAll {
+                agent: agent.parser_kind(),
+                session_id: resolved.source.source_id.clone(),
+                turns_before_filter,
+                filter: "timeline projection".to_owned(),
+                evidence,
+            }
+        };
+        return Err(refusal_surface_error(refusal));
     }
     let projection = extraction::to_conversation_with_stats(&entries, &[]);
+    if projection.messages.is_empty() {
+        let refusal = RefusalReason::ProjectionFilteredAll {
+            agent: agent.parser_kind(),
+            session_id: resolved.source.source_id.clone(),
+            turns_before_filter: entries.len() as u64,
+            filter: "conversation projection (harness/noise/dedupe)".to_owned(),
+            evidence: RefusalEvidence::from_coverage(
+                &parsed.model().coverage,
+                MIN_VISIBLE_TURNS,
+                0,
+                vec![format!(
+                    "timeline_entries={}; projected_messages=0; harness_noise_dropped={}",
+                    entries.len(),
+                    projection.harness_noise_dropped
+                )],
+            ),
+        };
+        return Err(refusal_surface_error(refusal));
+    }
     let markdown = render_conversation_markdown(
         &resolved.source.source_id,
         agent.as_str(),
@@ -798,6 +832,35 @@ fn extract_conversation(
         messages: projection.messages,
         markdown,
     })
+}
+
+fn parser_surface_error(path: &Path, error: &anyhow::Error) -> SessionSurfaceError {
+    if let Some(refusal) = error
+        .downcast_ref::<EngineError>()
+        .and_then(|engine| match engine {
+            EngineError::Validation(validation) => validation.refusal.clone(),
+            _ => None,
+        })
+    {
+        return refusal_surface_error(refusal);
+    }
+    SessionSurfaceError::Internal {
+        message: format!(
+            "unsupported or unreadable source {}: {error}",
+            path.display()
+        ),
+    }
+}
+
+fn refusal_surface_error(refusal: RefusalReason) -> SessionSurfaceError {
+    SessionSurfaceError::invalid(
+        "conversation_refused",
+        refusal.to_string(),
+        json!({
+            "refusal": refusal,
+            "refusal_schema": aicx_parser::engine::REFUSAL_SCHEMA,
+        }),
+    )
 }
 
 fn render_conversation_markdown(
