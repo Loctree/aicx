@@ -8,13 +8,14 @@ pub mod frames_rules;
 pub mod identity;
 pub mod model;
 pub mod reader;
+pub mod refusal;
 pub mod source;
 pub mod validate;
 
 pub use canonical::{CANONICAL_SCHEMA, canonical_bytes, canonical_fingerprint};
 pub use coverage::{
     BoundaryFlags, ConsumedUnit, CoverageReport, CoverageWarning, OrdinalRange, ParseStatus,
-    SkippedReason, SkippedUnit, VisibleCompleteness, WarningKind,
+    SkippedReason, SkippedUnit, TotalityError, VisibleCompleteness, WarningKind,
 };
 pub use frames::{
     ClassifiedFrame, FRAME_TAXONOMY_SCHEMA, FrameClass, FrameOrigin, FrameSeal, HumanChannel,
@@ -24,8 +25,8 @@ pub use frames_rules::{
     AGENT_FRAME_RULES, AgentFrameRules, InjectRuleKind, InjectTagRule, rules_for,
 };
 pub use identity::{
-    EVIDENCE_ID_VERSION, EvidenceIdError, evidence_event_id, evidence_event_id_from_hash,
-    ordinal_locator, sha256_hex,
+    EVIDENCE_ID_VERSION, EvidenceIdError, FrameIdentity, PackageIdentity, evidence_event_id,
+    evidence_event_id_from_hash, ordinal_locator, sha256_hex,
 };
 pub use model::{
     CounterSemantics, Known, Provenance, RawUnitRef, ReportedCost, SESSION_MODEL_SCHEMA, Segment,
@@ -35,6 +36,10 @@ pub use model::{
 pub use reader::{
     DEFAULT_MAX_SOURCE_BYTES, DEFAULT_MAX_UNIT_BYTES, RawUnit, RawUnitReader, ReaderError,
     ReaderPolicy, SourceRead, UnitBoundary,
+};
+pub use refusal::{
+    AdapterDetection, DetectionProbe, MIN_HUMAN_UTTERANCES, MIN_VISIBLE_TURNS, REFUSAL_SCHEMA,
+    RefusalEvidence, RefusalReason, SubstitutionError, SubstitutionKind,
 };
 pub use source::{AgentKind, SourceArtifact, SourceError, SourceFraming, SourceHandle};
 pub use validate::{

@@ -271,7 +271,10 @@ impl RefusalReason {
                     .collect::<Vec<_>>()
                     .join(",")
             ),
-            format!("visible_completeness={:?}", coverage.status.visible_completeness),
+            format!(
+                "visible_completeness={:?}",
+                coverage.status.visible_completeness
+            ),
         ];
         Self::EmptyConversation {
             agent,
@@ -470,7 +473,8 @@ mod tests {
 
     #[test]
     fn empty_conversation_carries_threshold_and_found() {
-        let refusal = RefusalReason::empty_conversation(AgentKind::Grok, "019fdeca", &empty_coverage(0));
+        let refusal =
+            RefusalReason::empty_conversation(AgentKind::Grok, "019fdeca", &empty_coverage(0));
         assert_eq!(refusal.tag(), "empty_conversation");
         let evidence = refusal.evidence().expect("evidence");
         assert_eq!(evidence.threshold, MIN_VISIBLE_TURNS);
