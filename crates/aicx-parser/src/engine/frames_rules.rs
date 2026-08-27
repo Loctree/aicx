@@ -61,6 +61,9 @@ const CODEX_INJECT_TAGS: &[InjectTagRule] = &[
     },
 ];
 
+// # claude — transport idioms (owner: W2-T8). A tag is recognized by the
+// adapter only at the head of an operator-lane payload (`<tag>` / `<tag `);
+// what it means is decided here, by data.
 const CLAUDE_INJECT_TAGS: &[InjectTagRule] = &[
     InjectTagRule {
         tag: "system",
@@ -70,7 +73,21 @@ const CLAUDE_INJECT_TAGS: &[InjectTagRule] = &[
         tag: "compact_boundary",
         kind: InjectRuleKind::CompactionReplay,
     },
+    // Background-task completion pushed by the harness, observed both as a
+    // `queue-operation` enqueue body and as a user-row text block. Machine
+    // chatter: a system note, never operator speech.
+    InjectTagRule {
+        tag: "task-notification",
+        kind: InjectRuleKind::TransportControl,
+    },
+    // Harness-appended context block inside the user lane (hook output,
+    // memory recall, mode reminders). Injected, never spoken.
+    InjectTagRule {
+        tag: "system-reminder",
+        kind: InjectRuleKind::TransportControl,
+    },
 ];
+// # claude — end
 
 const GENERIC_INJECT_TAGS: &[InjectTagRule] = &[InjectTagRule {
     tag: "system",
