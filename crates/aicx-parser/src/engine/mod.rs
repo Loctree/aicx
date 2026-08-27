@@ -3,6 +3,8 @@
 
 pub mod canonical;
 pub mod coverage;
+pub mod frames;
+pub mod frames_rules;
 pub mod identity;
 pub mod model;
 pub mod reader;
@@ -13,6 +15,13 @@ pub use canonical::{CANONICAL_SCHEMA, canonical_bytes, canonical_fingerprint};
 pub use coverage::{
     BoundaryFlags, ConsumedUnit, CoverageReport, CoverageWarning, OrdinalRange, ParseStatus,
     SkippedReason, SkippedUnit, VisibleCompleteness, WarningKind,
+};
+pub use frames::{
+    ClassifiedFrame, FRAME_TAXONOMY_SCHEMA, FrameClass, FrameOrigin, FrameSeal, HumanChannel,
+    InjectKind, Retained, TransportFrame, TransportKind, TransportPayload, TransportRole, classify,
+};
+pub use frames_rules::{
+    AGENT_FRAME_RULES, AgentFrameRules, InjectRuleKind, InjectTagRule, rules_for,
 };
 pub use identity::{
     EVIDENCE_ID_VERSION, EvidenceIdError, evidence_event_id, evidence_event_id_from_hash,
