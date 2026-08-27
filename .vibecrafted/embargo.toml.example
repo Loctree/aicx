@@ -1,0 +1,9 @@
+# Copy to .vibecrafted/embargo.toml only when the operator opens W1 or W2.
+plan_id = "aicx-one-taxonomy-fusion-260827"
+phase = "W1"
+deferred = ["cargo check", "cargo clippy", "cargo test"]
+attestation = "open"
+branch = "feat/one-taxonomy-fusion"
+recovery_ref = "refs/heads/embargo/aicx-one-taxonomy-fusion-260827"
+signed_by = ""
+commit = ""
