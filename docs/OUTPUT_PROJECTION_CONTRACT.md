@@ -1,7 +1,29 @@
 # Output projection contract
 
-Status: W1 structure. Wiring lands in W2-T13. This file is the flag grammar
-and the default rendering; the Rust type is `src/extraction/projection.rs`.
+Status: W1 structure, wired in W2-T13, class-carrying since W2-R1. This file
+is the flag grammar and the default rendering; the Rust type is
+`src/extraction/projection.rs`.
+
+## Identity, class, lineage, scope (W2-R1)
+
+The projection reads four things from the model that used to be flattened
+away:
+
+| Model field | Type | What the view does with it |
+|---|---|---|
+| `SessionModel::conversation` | `ProviderConversationRef` (tagged: Claude `session_id`/`agent_id`; Codex `tree_session_id`/`thread_id`/`forked_from_id`/`parent_thread_id`/`window_id`) | Names the conversation. `session_id` on the model is the store handle, a projection of this ref. Fields a rollout did not carry are `None` and listed in `unobserved`. |
+| `SessionModel::snapshot` | `SourceSnapshotRef { path, content_hash, bytes, observed_at, cutoff }` | Names the bytes. Same hash = identical bytes, never "same event"; an appended turn changes it without a fork. `PackageIdentity` is this pair, not a conversation id. |
+| `Turn::frame_class` → `TimelineEntry::frame_class` | `Option<FrameClass>` | `ProjectionKind::from_frame_class` decides the kind; `--dialog` reveals `EchoSeal` by class, `--kind inter_agent` selects `InterAgent` by class, `LineageMeta` is not `Inject`. The role / `frame_kind` bridge in `conversation.rs` is the fallback for class-less entries only (store chunks, importers, lanes the throne does not own). |
+| `SessionModel::context_epochs` | `Vec<ContextEpochRef>` | A compaction is an epoch of the same conversation (summary provenance + replaced refs + trigger), never a second source in `--lineage`. |
+| `Segment::scope_status` / `SessionModel::scope_status()` | `homogeneous \| mixed_candidate \| unknown` | Structural only (distinct cwds / branch drift). A `mixed_candidate` makes `continuity` refuse a single distilled history (`RefusalReason::MixedWorkstream`) unless `distill_mixed` is passed; `intents` records from such sessions carry a `scope_status=mixed_candidate …` evidence line. Topic-level mixing inside one cwd is not detected and is not guessed. |
+
+`--lineage` builds a `LineageGraph` (nodes = tagged refs, edges =
+`declared_fork` / `parent_thread` / `shared_prefix`). A parent laid under its
+child never doubles inherited history: shared records stay once, tagged
+`lineage_origin = inherited_from { conversation, via }`; the parent's own
+continuation is tagged `parent_only`. Claude declares no session-level
+parent; its fork shares the origin's record prefix (identical `uuid`s), which
+`merge_inherited` counts once whenever both files are laid together.
 
 The throne (W1-T4) keeps the full substrate: every classified frame, every
 seal, every `ShellAction` result as `Retained { text, chars, hash }`.
@@ -16,9 +38,8 @@ drop, hash-away, or restamp a stored frame. Filters populate
 
 `ConversationProjection` in `src/extraction/conversation.rs` is a denoised
 transcript product (2 s short-user dedupe, harness-noise drop). It is not
-this spec. W2-T13 must stop re-deciding projection in
-`conversation.rs` / `mcp_session.rs` / `intents.rs` and read `ProjectionSpec`
-instead.
+this spec. `conversation.rs` / `mcp_session.rs` / `intents.rs` read
+`ProjectionSpec`; none of them decides projection on its own.
 
 Store-side types (`legacy_archive/canonical_projection.rs`,
 `crates/aicx-parser/src/projections`) are a different layer. They are not
@@ -31,7 +52,7 @@ No flags means the razor view — complete, not cropped:
 | Axis | Default | Why |
 |---|---|---|
 | Dialogue | Human (Direct channel) + `AssistantFinal` | Operator speech and the agent's last answers, in full. |
-| Delayed human speech | Hidden until `--dialog` | Echo-bus / `queue-operation` are human, but they are a channel; `--dialog` shows them as speech with their seals. |
+| Delayed human speech | Hidden until `--dialog` | Echo-bus / `queue-operation` are human, but they are a channel (`FrameClass::EchoSeal` / `Human { channel: Queue }` on the entry); `--dialog` shows them as speech with their seals. |
 | `InterAgent` | Hidden until `--kind inter_agent` | Never rendered as `assistant` (Decision 9). |
 | `Inject` / `LineageMeta` | Hidden | Noise and parent pointers; lineage is opt-in. |
 | Shell results | Stub: `$ cmd [N lines, sha256:…]` | Count + command + hash are the facts an agent can act on. The body stays in the substrate. |
@@ -158,8 +179,8 @@ Empty `roles` / `kinds` vectors mean "emit nothing on that axis." They are
 not a shortcut for default. Callers use `ProjectionSpec::default()` (razor)
 or `ProjectionSpec::full()`.
 
-## Out of scope (this cut)
+## Out of scope (W2)
 
-- Wiring `main.rs`, `mcp_session.rs`, `intents.rs`, `conversation.rs`.
-- Changes to the throne.
-- Compilation. `BUILD/LINT/TEST` for this wave is embargoed.
+- Compilation. `BUILD/LINT/TEST` for this wave is embargoed (lifted in W3).
+- Lanes the throne does not own (tool call/result, reasoning, Codex harness
+  events): they carry no `frame_class` and keep `frame_kind` as their lane.

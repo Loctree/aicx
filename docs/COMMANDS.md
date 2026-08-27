@@ -187,7 +187,7 @@ aicx extract codex --session <id> -H 6 --conversation            # window on the
 | (none) | Razor: `human` + `assistant_final` + `shell_action` stubs. Cardinality, seals, `$ cmd [N lines, sha256:…]`. |
 | `--dialog` | Delayed human speech (`echo_seal`: echo-bus / `queue-operation`) as speech, with its seal timestamp. |
 | `--result none\|head=N\|full` | Retained shell result body. `none` is the stub (default); the hash names the same body `full` prints. |
-| `--lineage[=N]` | Parent sessions read from `session_meta.forked_from_id` and resolved through the session catalog — meta, never filenames. Emits `lineage[d]: <id> forked_from <parent>` entries; parents are parsed once each through the same view. Needs `--session`. |
+| `--lineage[=N]` | Lineage **graph** (W2-R1): parents from the provider's declared pointers (Codex `forked_from_id`, `parent_thread_id`) resolved through the session catalog — meta, never filenames. Emits `lineage[d]: <agent> <thread> <- <parent> via declared_fork\|parent_thread\|shared_prefix` lines plus one line per compaction epoch; parents are parsed once each through the same view and laid under the child **without doubling inherited history** (shared records once, tagged `inherited_from`; the parent's own continuation tagged `parent_only`). Needs `--session`. |
 | `--kind <token>` | Throne kind filter: `human`, `echo_seal`, `shell_action`, `inject`, `assistant_final`, `lineage_meta`, `inter_agent`. Unknown tokens refuse (`invalid_kind_token`). |
 | `--user-only` | Role axis `Human` only (also drops shell actions). Same spec on the MCP `aicx_session` surface. |
 | `-H/--hours N` | Window on the view. `0` = unbounded; no silent 30-day default. |
@@ -198,12 +198,15 @@ aicx extract codex --session <id> -H 6 --conversation            # window on the
 enters intent distillation, and neither does the `inter_agent` lane —
 `aicx intents` reads `human` + `echo_seal` only.
 
-Known limits of this wave: the session model flattens the throne
-(`EchoSeal` arrives as `user_msg`, `LineageMeta` as `system_note`,
-`InterAgent` has no turn kind), so `--dialog` and `--kind inter_agent`
-select on the spec but cannot yet separate those classes from `human` /
-`inject` until the model carries `FrameClass`. Claude sources carry no
-session-level `forked_from_id`; `--lineage` reports that instead of guessing.
+Since W2-R1 the model carries the throne's `FrameClass` on every turn it
+owns, so `--dialog` reveals `echo_seal` by class and `--kind inter_agent`
+selects the inter-agent lane by class (it rides the system lane, never
+`assistant`). Claude sources carry no session-level parent pointer; a
+`/fork` shares its origin's record prefix and `--lineage` says so instead
+of guessing. `aicx_session` (MCP) returns the tagged `conversation` ref, the
+session's `scope_status` and its compaction epoch count next to the
+messages. `aicx continuity` refuses to distill one history from a
+`mixed_candidate` session set (`mixed_workstream` refusal) unless asked to.
 
 Batch report export remains available through `aicx claude`, `aicx codex`,
 `aicx all`, and `aicx conversations`. Those commands write requested reports,
