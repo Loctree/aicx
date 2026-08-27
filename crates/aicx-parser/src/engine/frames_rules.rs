@@ -93,6 +93,7 @@ pub const AGENT_FRAME_RULES: &[AgentFrameRules] = &[
         queue_seal: false,
         inject_tags: GENERIC_INJECT_TAGS,
     },
+    // # junie — no transport idioms
     AgentFrameRules {
         agent: AgentKind::Junie,
         echo_promotion: false,
