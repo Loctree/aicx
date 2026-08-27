@@ -114,6 +114,15 @@ pub struct SessionListPayload {
 pub struct ConversationPayload {
     pub message_count: usize,
     pub harness_noise_dropped: usize,
+    /// Provider-tagged identity of the conversation (W2-R1): Claude
+    /// `session_id`, Codex tree `session_id` / `thread_id` /
+    /// `forked_from_id` / `parent_thread_id`. The store id is a handle.
+    pub conversation: aicx_parser::engine::ProviderConversationRef,
+    /// Structural scope of the whole session (`homogeneous` |
+    /// `mixed_candidate` | `unknown`), from its segments' cwd/branch.
+    pub scope_status: aicx_parser::engine::ScopeStatus,
+    /// Compaction boundaries inside the session (epochs, never sources).
+    pub context_epochs: usize,
     pub messages: Vec<ConversationMessage>,
     pub markdown: String,
 }
@@ -829,6 +838,9 @@ fn extract_conversation(
     Ok(ConversationPayload {
         message_count: projection.messages.len(),
         harness_noise_dropped: projection.harness_noise_dropped,
+        conversation: parsed.model().conversation.clone(),
+        scope_status: parsed.model().scope_status(),
+        context_epochs: parsed.model().context_epochs.len(),
         messages: projection.messages,
         markdown,
     })

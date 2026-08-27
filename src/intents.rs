@@ -41,7 +41,7 @@ use self::types::{
 };
 pub use self::types::{
     IntentExtraction, IntentExtractionStats, IntentKind, IntentRecord, IntentsCompleteness,
-    IntentsConfig, MigrationReport, ProjectResolutionScope,
+    IntentsConfig, MigrationReport, MixedScopeSession, ProjectResolutionScope,
 };
 // Lane 2-5 schema anchor (MASTER Phase 2 §3). Stages land incrementally; these
 // types are the convergence point every lane stage must agree on.
@@ -139,6 +139,29 @@ pub(crate) fn extract_intents_from_root_at_with_stats(
         .filter(|file| file.identity_source == PATH_HEURISTIC_IDENTITY_SOURCE)
         .map(|file| file.path.to_string_lossy().into_owned())
         .collect();
+    let mut mixed_scope: Vec<MixedScopeSession> = Vec::new();
+    for file in &files {
+        if let Some(scope) = file.scope.as_ref()
+            && scope.status == aicx_parser::engine::ScopeStatus::MixedCandidate
+            && !mixed_scope
+                .iter()
+                .any(|seen| seen.agent == file.agent && seen.session_id == file.session_id)
+        {
+            crate::diagnostics::log_describe(&format!(
+                "intents_mixed_scope agent={} session_id={} cwds={} branches={}",
+                file.agent,
+                file.session_id,
+                scope.cwds.join(","),
+                scope.branches.join(",")
+            ));
+            mixed_scope.push(MixedScopeSession {
+                agent: file.agent.clone(),
+                session_id: file.session_id.clone(),
+                cwds: scope.cwds.clone(),
+                branches: scope.branches.clone(),
+            });
+        }
+    }
 
     let mut candidates = Vec::new();
     let mut task_events = Vec::new();
@@ -244,7 +267,11 @@ pub(crate) fn extract_intents_from_root_at_with_stats(
         live_sessions,
     };
 
-    Ok(IntentExtraction { records, stats })
+    Ok(IntentExtraction {
+        records,
+        stats,
+        mixed_scope,
+    })
 }
 
 pub(crate) fn extract_intents_from_root_at_for_projects_with_stats(
@@ -267,11 +294,20 @@ pub(crate) fn extract_intents_from_root_at_for_projects_with_stats(
     let mut identity_source = PERSISTED_IDENTITY_SOURCE.to_string();
     let mut path_heuristic_records = 0usize;
     let mut live_sessions = 0usize;
+    let mut mixed_scope: Vec<MixedScopeSession> = Vec::new();
 
     for project in projects {
         let mut scoped = config.clone();
         scoped.project = project.clone();
         let extraction = extract_intents_from_root_at_with_stats(&scoped, aicx_home, now)?;
+        for session in extraction.mixed_scope {
+            if !mixed_scope
+                .iter()
+                .any(|seen| seen.agent == session.agent && seen.session_id == session.session_id)
+            {
+                mixed_scope.push(session);
+            }
+        }
         scanned_count += extraction.stats.scanned_count;
         source_paths_verified &= extraction.stats.source_paths_verified;
         source_errors += extraction.stats.source_errors;
@@ -307,7 +343,11 @@ pub(crate) fn extract_intents_from_root_at_for_projects_with_stats(
         live_sessions,
     };
 
-    Ok(IntentExtraction { records, stats })
+    Ok(IntentExtraction {
+        records,
+        stats,
+        mixed_scope,
+    })
 }
 
 fn sort_intent_records(records: &mut [IntentRecord]) {
@@ -455,6 +495,7 @@ fn collect_intent_files_from_index(
             timestamp,
             session_id: field("session_id"),
             honesty: crate::oracle::ClaimHonesty::canonical(),
+            scope: None,
             transcript_entries: None,
             body: Some(chunk.text),
         });
@@ -555,6 +596,9 @@ fn collect_intent_files(
                     continue;
                 }
             };
+        // Scope is judged on the whole session, before the project filter
+        // narrows the frames to one bucket (W2-R1).
+        let scope = crate::extraction::conversation::scope_report_for_entries(&frames);
         retain_frames_for_project(&mut frames, &identity_project, entry.cwd.as_deref());
         if frames.is_empty() {
             continue;
@@ -595,6 +639,7 @@ fn collect_intent_files(
             } else {
                 crate::oracle::ClaimHonesty::canonical()
             },
+            scope: Some(scope),
             transcript_entries: Some(transcript_entries),
             body: None,
         });
@@ -680,6 +725,9 @@ fn collect_live_unadmitted_files(
                     continue;
                 }
             };
+        // Scope is judged on the whole session, before the project filter
+        // narrows the frames to one bucket (W2-R1).
+        let scope = crate::extraction::conversation::scope_report_for_entries(&frames);
         retain_frames_for_project(&mut frames, &identity_project, entry.cwd.as_deref());
         if frames.is_empty() {
             continue;
@@ -710,6 +758,7 @@ fn collect_live_unadmitted_files(
             timestamp,
             session_id: entry.session_id,
             honesty: crate::oracle::ClaimHonesty::live_open(),
+            scope: Some(scope),
             transcript_entries: Some(transcript_entries),
             body: None,
         });
@@ -887,6 +936,7 @@ fn collect_legacy_chunk_files(
             timestamp,
             session_id: file.session_id,
             honesty,
+            scope: None,
             transcript_entries: None,
             body: None,
         });
@@ -2074,6 +2124,17 @@ fn build_candidate(
     let mut evidence = extract_evidence(&summary);
     if let Some(extra) = context.as_deref() {
         merge_evidence(&mut evidence, extract_evidence(extra));
+    }
+    // W2-R1: a record distilled from a mixed-workstream candidate says so
+    // — the reader must not take it for one homogeneous history.
+    if let Some(scope) = file.scope.as_ref()
+        && scope.status == aicx_parser::engine::ScopeStatus::MixedCandidate
+    {
+        evidence.push(format!(
+            "scope_status=mixed_candidate cwds={} branches={}",
+            scope.cwds.join(","),
+            scope.branches.join(",")
+        ));
     }
 
     // Anti-bełkot sanity gate:
