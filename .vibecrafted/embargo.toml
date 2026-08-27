@@ -3,6 +3,7 @@
 # W1 -> W2 by W1-I-integrate (claude) after W1_GATE=green.
 # W1 integration commit: d0ca1a24b80fdf2ded0c7ebc704ddc8961da6cc4
 # W2/1 checkpoint (W2-I1-integrate-guardians, claude): guardians merged at 1df1c21cd09b505aa12c70768bcab5e0d6607ce4 — baseline for W2-T13.
+# W2/2 checkpoint (W2-I2-integrate-close, claude): adapters T7–T11 + T13 merged at 226c8dc98f6da022f2e5313fab228459d4061da1 — evidence for W2_STRUCTURALLY_CLOSED (attestation stays open, operator signs).
 # Contract (tools/git-hooks/embargo.sh): an open marker keeps signed_by/commit empty;
 # they are filled only by the W2_STRUCTURALLY_CLOSED attestation.
 plan_id = "aicx-one-taxonomy-fusion-260827"
