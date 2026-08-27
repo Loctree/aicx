@@ -30,9 +30,142 @@ use aicx_retrieve::{
     RetrievalOutcome, classify_lexical_evidence, is_lexical_boilerplate,
 };
 
+use crate::extraction::projection::{ProjectionKind, ProjectionSpec, ProjectionWindow, ResultBody};
 use crate::rank::FuzzyResult;
 use crate::sanitize::normalize_query;
 use crate::timeline::FrameKind;
+
+/// Search flags that populate the output projection (W2-T13). Retrieval /
+/// ranking flags (`--limit`, `--sort`, `--agent`, `--deep`, …) are not part
+/// of the spec: they pick hits, they do not decide how a hit renders.
+#[derive(Debug, Clone)]
+pub struct SearchProjectionFlags<'a> {
+    pub projects: &'a [String],
+    /// CLI `-H` (`0` = all time -> unbounded window).
+    pub hours: u64,
+    pub since: Option<&'a str>,
+    pub until: Option<&'a str>,
+    pub score: Option<u8>,
+    /// `--frame-kind`, mapped through `ProjectionKind::from_legacy_frame_kind`.
+    pub frame_kind: Option<FrameKind>,
+    pub dialog: bool,
+    pub result: ResultBody,
+    pub lineage_depth: Option<usize>,
+}
+
+/// Build the `ProjectionSpec` for `aicx search`.
+///
+/// Without `--frame-kind` the kind axis stays wide open: search must not
+/// razor away hits the index already admitted. `--kind` on search is a
+/// document class (`conversations` | `plans` | …), never overloaded onto the
+/// throne vocabulary (contract: collision).
+pub fn projection_spec_for_search(flags: &SearchProjectionFlags<'_>) -> ProjectionSpec {
+    let mut spec = ProjectionSpec::full();
+    spec.result = flags.result;
+    spec.dialog = flags.dialog;
+    spec.lineage_depth = flags.lineage_depth;
+    spec.project = flags.projects.to_vec();
+    spec.score = flags.score;
+    spec.window = ProjectionWindow {
+        hours: (flags.hours > 0).then_some(flags.hours),
+        since: flags.since.map(str::to_string),
+        until: flags.until.map(str::to_string),
+    };
+    if let Some(kind) = flags
+        .frame_kind
+        .and_then(|kind| ProjectionKind::from_legacy_frame_kind(kind.as_str()))
+    {
+        spec.kinds = vec![kind];
+    }
+    spec
+}
+
+/// Apply the output projection to a finalized hit set. View-only: the index
+/// and the stored chunks are untouched; a hit is kept or dropped, and a
+/// `tool_call` hit's matched lines render as stub / head / full per
+/// `spec.result` (`$ cmd [N lines, sha256:…]` is the razor).
+pub fn project_search_results(
+    results: Vec<FuzzyResult>,
+    spec: &ProjectionSpec,
+) -> Vec<FuzzyResult> {
+    results
+        .into_iter()
+        .filter(|hit| spec.score.is_none_or(|floor| hit.score >= floor))
+        .filter(|hit| {
+            match hit
+                .frame_kind
+                .as_deref()
+                .and_then(ProjectionKind::from_legacy_frame_kind)
+            {
+                Some(kind) => spec.emits_kind(kind),
+                // Hits without a frame kind (plans, reports) are documents,
+                // not throne frames; the kind axis does not apply.
+                None => true,
+            }
+        })
+        .map(|mut hit| {
+            let is_shell = hit
+                .frame_kind
+                .as_deref()
+                .and_then(ProjectionKind::from_legacy_frame_kind)
+                == Some(ProjectionKind::ShellAction);
+            if is_shell {
+                let command = hit.matched_lines.first().cloned().unwrap_or_default();
+                let body = hit
+                    .matched_lines
+                    .iter()
+                    .skip(1)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let hash = aicx_parser::engine::sha256_hex(body.as_bytes());
+                hit.matched_lines = spec
+                    .project_shell_result(command.trim_end_matches('\n'), &body, &hash)
+                    .lines()
+                    .map(str::to_string)
+                    .collect();
+            } else if spec.max_message_chars != 0 {
+                hit.matched_lines = hit
+                    .matched_lines
+                    .iter()
+                    .map(|line| spec.project_message_body(line))
+                    .collect();
+            }
+            hit
+        })
+        .collect()
+}
+
+/// Stderr note for a non-razor projection on search, so the operator sees
+/// which view produced the hits. `--lineage` is accepted on search for
+/// grammar parity but hits are chunks, not sessions: the walk is an
+/// extract-side operation and is reported as not applied here.
+pub fn render_search_projection_note(spec: &ProjectionSpec) -> Option<String> {
+    let mut parts = Vec::new();
+    if spec.dialog {
+        parts.push("dialog=on".to_string());
+    }
+    match spec.result {
+        ResultBody::None => {}
+        ResultBody::Head(n) => parts.push(format!("result=head:{n}")),
+        ResultBody::Full => parts.push("result=full".to_string()),
+    }
+    if let Some(depth) = spec.lineage_depth {
+        let depth = if depth == usize::MAX {
+            "unbounded".to_string()
+        } else {
+            depth.to_string()
+        };
+        parts.push(format!(
+            "lineage={depth} (not applied to search hits; use extract --lineage)"
+        ));
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(format!("projection: {}", parts.join(" ")))
+    }
+}
 
 /// Successful semantic search outcome with rendering-ready data.
 #[derive(Debug)]

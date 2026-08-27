@@ -16,11 +16,11 @@ use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use serde::Serialize;
 use serde_json::{Value, json};
 
+use crate::extraction::conversation::{apply_projection, project_conversation, spec_for_user_only};
 use crate::extraction::{self, ConversationMessage};
 use crate::legacy_archive::{self, ProjectMatchMode, ProjectResolutionError};
 use crate::session_catalog::{self, AgentKind, CatalogError, CatalogIoStats, ResolvedSource};
 use crate::sessions::{self, SessionInfo};
-use crate::timeline::FrameKind;
 
 const DEFAULT_LIST_HOURS: u64 = 720;
 const DEFAULT_LIST_LIMIT: usize = 20;
@@ -767,10 +767,10 @@ fn extract_conversation(
     .map_err(|error| parser_surface_error(&resolved.source.path, &error))?;
     let mut entries = crate::output::timeline_entries_from_model(parsed.model());
     let turns_before_filter = entries.len() as u64;
-    if user_only {
-        entries
-            .retain(|entry| entry.role == "user" || entry.frame_kind == Some(FrameKind::UserMsg));
-    }
+    // One projection decision (W2-T13): the MCP `--user-only` axis is the
+    // same `ProjectionSpec` the CLI builds; no string-role reducer here.
+    let spec = spec_for_user_only(user_only);
+    apply_projection(&mut entries, &spec);
     if entries.is_empty() {
         let evidence = RefusalEvidence::from_coverage(
             &parsed.model().coverage,
@@ -801,7 +801,7 @@ fn extract_conversation(
         };
         return Err(refusal_surface_error(refusal));
     }
-    let projection = extraction::to_conversation_with_stats(&entries, &[]);
+    let projection = project_conversation(&entries, &[], &spec);
     if projection.messages.is_empty() {
         let refusal = RefusalReason::ProjectionFilteredAll {
             agent: agent.parser_kind(),

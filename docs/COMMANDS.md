@@ -162,6 +162,49 @@ aicx extract gemini --session <session-id> --conversation
 Use `--output <path>` for an explicit file. Session mode resolves through the
 catalog and opens only an allowlisted, canonical source path.
 
+### Projection flags (W2-T13)
+
+Every extract flag below populates one `ProjectionSpec`
+(`src/extraction/projection.rs`, contract:
+[OUTPUT_PROJECTION_CONTRACT.md](./OUTPUT_PROJECTION_CONTRACT.md)). Flags never
+mutate the substrate: the same session under `--user-only` and under
+`--result full` is one parse, two views.
+
+```bash
+aicx extract codex --session <id> --conversation                 # razor: human + assistant-final + `$ cmd [N lines, sha256:…]`
+aicx extract codex --session <id> --conversation --dialog        # + delayed human speech (echo-bus / queue) with seals
+aicx extract codex --session <id> --conversation --result head=5 # first 5 lines of each retained shell result
+aicx extract codex --session <id> --conversation --result full   # whole retained result bodies
+aicx extract codex --session <id> --lineage                      # walk session_meta.forked_from_id parents (unbounded)
+aicx extract codex --session <id> --lineage=1                    # at most one parent
+aicx extract codex --session <id> --kind human,echo_seal         # throne kinds only
+aicx extract codex --session <id> --kind inter_agent             # inter-agent lane (never rendered as assistant)
+aicx extract codex --session <id> -H 6 --conversation            # window on the view (0 = unbounded, the default)
+```
+
+| Flag | View |
+|---|---|
+| (none) | Razor: `human` + `assistant_final` + `shell_action` stubs. Cardinality, seals, `$ cmd [N lines, sha256:…]`. |
+| `--dialog` | Delayed human speech (`echo_seal`: echo-bus / `queue-operation`) as speech, with its seal timestamp. |
+| `--result none\|head=N\|full` | Retained shell result body. `none` is the stub (default); the hash names the same body `full` prints. |
+| `--lineage[=N]` | Parent sessions read from `session_meta.forked_from_id` and resolved through the session catalog — meta, never filenames. Emits `lineage[d]: <id> forked_from <parent>` entries; parents are parsed once each through the same view. Needs `--session`. |
+| `--kind <token>` | Throne kind filter: `human`, `echo_seal`, `shell_action`, `inject`, `assistant_final`, `lineage_meta`, `inter_agent`. Unknown tokens refuse (`invalid_kind_token`). |
+| `--user-only` | Role axis `Human` only (also drops shell actions). Same spec on the MCP `aicx_session` surface. |
+| `-H/--hours N` | Window on the view. `0` = unbounded; no silent 30-day default. |
+| `-p/--project` | Identity on the view, not on the parse. |
+| `--max-message-chars N` | Dialogue truncation; `0` = unlimited. Never touches result bodies (`--result` does). |
+
+`inject` (harness reminders, compaction replays, agent instructions) never
+enters intent distillation, and neither does the `inter_agent` lane —
+`aicx intents` reads `human` + `echo_seal` only.
+
+Known limits of this wave: the session model flattens the throne
+(`EchoSeal` arrives as `user_msg`, `LineageMeta` as `system_note`,
+`InterAgent` has no turn kind), so `--dialog` and `--kind inter_agent`
+select on the spec but cannot yet separate those classes from `human` /
+`inject` until the model carries `FrameClass`. Claude sources carry no
+session-level `forked_from_id`; `--lineage` reports that instead of guessing.
+
 Batch report export remains available through `aicx claude`, `aicx codex`,
 `aicx all`, and `aicx conversations`. Those commands write requested reports,
 not card-mill files.
@@ -228,6 +271,16 @@ Token matching is the default. `--literal` performs an exact,
 identifier-boundary match. Passages are source ordered, stably numbered, and
 include a line span, source path, and ±2 context lines by default (`--context
 N` overrides it).
+
+Search hits render through the same `ProjectionSpec` as extract: `-p`,
+`-H`, `--since`/`--until`, `--score`, and `--frame-kind` populate the spec;
+`--dialog`, `--result none|head=N|full` apply to hit rendering (a `tool_call`
+hit collapses to `$ cmd [N lines, sha256:…]` by default). `--lineage[=N]` is
+accepted for grammar parity and reported as not applied — hits are chunks,
+the parent walk lives on `extract`. `--kind` on search stays a document class
+(`conversations` | `plans` | `reports` | `other`); throne kinds go through
+`--frame-kind` (`user_msg`→`human`, `agent_reply`→`assistant_final`,
+`internal_thought`→`inject`, `tool_call`→`shell_action`).
 
 Every search prints `scanned N of M sessions; skipped: ...` to stderr.
 Machine-readable output also carries the same structured `coverage` object.

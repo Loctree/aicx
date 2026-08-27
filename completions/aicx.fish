@@ -156,6 +156,11 @@ complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subco
 complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subcommand_from codex" -l max-message-chars -d 'Maximum message characters in markdown (0 = no truncation)' -r
 complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subcommand_from codex" -l no-redact-secrets -d 'Redact secrets (tokens/keys) from outputs before writing/syncing'
 complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subcommand_from codex" -l user-only -d 'Only include user messages (exclude assistant + reasoning)'
+complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subcommand_from codex" -s H -l hours -d 'Hours to look back inside the session view (0 = unbounded)' -r
+complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subcommand_from codex" -l kind -d 'Throne kind filter' -r -f -a "human echo_seal shell_action inject assistant_final lineage_meta inter_agent"
+complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subcommand_from codex" -l dialog -d 'Dialogue view: human speech incl. delayed echo-bus / queued speech with seals, plus assistant-final'
+complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subcommand_from codex" -l lineage -d 'Walk parent sessions via session_meta.forked_from_id (bare = unbounded, =N = depth)'
+complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subcommand_from codex" -l result -d 'Retained shell result body' -r -f -a "none full head="
 complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subcommand_from codex" -l conversation -d 'Conversation-first mode: emit denoised user/assistant transcript only'
 complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subcommand_from codex" -s v -l verbose -d 'Verbose diagnostics: echo per-file extractor warnings to stderr'
 complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subcommand_from codex" -l project-fuzzy -d 'Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed'
@@ -167,6 +172,11 @@ complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subco
 complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subcommand_from claude" -l max-message-chars -d 'Maximum message characters in markdown (0 = no truncation)' -r
 complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subcommand_from claude" -l no-redact-secrets -d 'Redact secrets (tokens/keys) from outputs before writing/syncing'
 complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subcommand_from claude" -l user-only -d 'Only include user messages (exclude assistant + reasoning)'
+complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subcommand_from claude" -s H -l hours -d 'Hours to look back inside the session view (0 = unbounded)' -r
+complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subcommand_from claude" -l kind -d 'Throne kind filter' -r -f -a "human echo_seal shell_action inject assistant_final lineage_meta inter_agent"
+complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subcommand_from claude" -l dialog -d 'Dialogue view: human speech incl. delayed echo-bus / queued speech with seals, plus assistant-final'
+complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subcommand_from claude" -l lineage -d 'Walk parent sessions via session_meta.forked_from_id (bare = unbounded, =N = depth)'
+complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subcommand_from claude" -l result -d 'Retained shell result body' -r -f -a "none full head="
 complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subcommand_from claude" -l conversation -d 'Conversation-first mode: emit denoised user/assistant transcript only'
 complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subcommand_from claude" -s v -l verbose -d 'Verbose diagnostics: echo per-file extractor warnings to stderr'
 complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subcommand_from claude" -l project-fuzzy -d 'Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed'
@@ -178,6 +188,11 @@ complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subco
 complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subcommand_from gemini" -l max-message-chars -d 'Maximum message characters in markdown (0 = no truncation)' -r
 complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subcommand_from gemini" -l no-redact-secrets -d 'Redact secrets (tokens/keys) from outputs before writing/syncing'
 complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subcommand_from gemini" -l user-only -d 'Only include user messages (exclude assistant + reasoning)'
+complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subcommand_from gemini" -s H -l hours -d 'Hours to look back inside the session view (0 = unbounded)' -r
+complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subcommand_from gemini" -l kind -d 'Throne kind filter' -r -f -a "human echo_seal shell_action inject assistant_final lineage_meta inter_agent"
+complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subcommand_from gemini" -l dialog -d 'Dialogue view: human speech incl. delayed echo-bus / queued speech with seals, plus assistant-final'
+complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subcommand_from gemini" -l lineage -d 'Walk parent sessions via session_meta.forked_from_id (bare = unbounded, =N = depth)'
+complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subcommand_from gemini" -l result -d 'Retained shell result body' -r -f -a "none full head="
 complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subcommand_from gemini" -l conversation -d 'Conversation-first mode: emit denoised user/assistant transcript only'
 complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subcommand_from gemini" -s v -l verbose -d 'Verbose diagnostics: echo per-file extractor warnings to stderr'
 complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subcommand_from gemini" -l project-fuzzy -d 'Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed'
@@ -189,6 +204,11 @@ complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subco
 complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subcommand_from grok" -l max-message-chars -d 'Maximum message characters in markdown (0 = no truncation)' -r
 complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subcommand_from grok" -l no-redact-secrets -d 'Redact secrets (tokens/keys) from outputs before writing/syncing'
 complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subcommand_from grok" -l user-only -d 'Only include user messages (exclude assistant + reasoning)'
+complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subcommand_from grok" -s H -l hours -d 'Hours to look back inside the session view (0 = unbounded)' -r
+complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subcommand_from grok" -l kind -d 'Throne kind filter' -r -f -a "human echo_seal shell_action inject assistant_final lineage_meta inter_agent"
+complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subcommand_from grok" -l dialog -d 'Dialogue view: human speech incl. delayed echo-bus / queued speech with seals, plus assistant-final'
+complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subcommand_from grok" -l lineage -d 'Walk parent sessions via session_meta.forked_from_id (bare = unbounded, =N = depth)'
+complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subcommand_from grok" -l result -d 'Retained shell result body' -r -f -a "none full head="
 complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subcommand_from grok" -l conversation -d 'Conversation-first mode: emit denoised user/assistant transcript only'
 complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subcommand_from grok" -s v -l verbose -d 'Verbose diagnostics: echo per-file extractor warnings to stderr'
 complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subcommand_from grok" -l project-fuzzy -d 'Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed'
@@ -200,6 +220,11 @@ complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subco
 complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subcommand_from junie" -l max-message-chars -d 'Maximum message characters in markdown (0 = no truncation)' -r
 complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subcommand_from junie" -l no-redact-secrets -d 'Redact secrets (tokens/keys) from outputs before writing/syncing'
 complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subcommand_from junie" -l user-only -d 'Only include user messages (exclude assistant + reasoning)'
+complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subcommand_from junie" -s H -l hours -d 'Hours to look back inside the session view (0 = unbounded)' -r
+complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subcommand_from junie" -l kind -d 'Throne kind filter' -r -f -a "human echo_seal shell_action inject assistant_final lineage_meta inter_agent"
+complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subcommand_from junie" -l dialog -d 'Dialogue view: human speech incl. delayed echo-bus / queued speech with seals, plus assistant-final'
+complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subcommand_from junie" -l lineage -d 'Walk parent sessions via session_meta.forked_from_id (bare = unbounded, =N = depth)'
+complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subcommand_from junie" -l result -d 'Retained shell result body' -r -f -a "none full head="
 complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subcommand_from junie" -l conversation -d 'Conversation-first mode: emit denoised user/assistant transcript only'
 complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subcommand_from junie" -s v -l verbose -d 'Verbose diagnostics: echo per-file extractor warnings to stderr'
 complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subcommand_from junie" -l project-fuzzy -d 'Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed'
@@ -637,6 +662,9 @@ complete -c aicx -n "__fish_aicx_using_subcommand search" -l session -d 'Search 
 complete -c aicx -n "__fish_aicx_using_subcommand search" -l context -d 'Context lines before and after each passage match (default: 2)' -r
 complete -c aicx -n "__fish_aicx_using_subcommand search" -l literal -d 'Match an exact, identifier-boundary substring inside --session'
 complete -c aicx -n "__fish_aicx_using_subcommand search" -l no-semantic -d 'Force lexical-only retrieval from the published CURRENT index'
+complete -c aicx -n "__fish_aicx_using_subcommand search" -l dialog -d 'Dialogue view of hits: delayed human speech rendered as speech, with seals'
+complete -c aicx -n "__fish_aicx_using_subcommand search" -l result -d 'Shell result body on tool_call hits' -r -f -a "none full head="
+complete -c aicx -n "__fish_aicx_using_subcommand search" -l lineage -d 'Accepted for grammar parity with extract; not applied to hits'
 complete -c aicx -n "__fish_aicx_using_subcommand search" -l evidence -d 'Return an evidence packet: semantic candidates re-ranked by answer/support signals, with source sections and diagnostics'
 complete -c aicx -n "__fish_aicx_using_subcommand search" -s j -l json -d 'Emit compact JSON instead of plain text'
 complete -c aicx -n "__fish_aicx_using_subcommand search" -l legacy-dense -d 'Use legacy NDJSON reader for dense vector search instead of versioned mmap'
