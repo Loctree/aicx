@@ -1,0 +1,255 @@
+# Oracle assertion manifest — W0-T2 freeze.
+# Idiom matches contract/*.toml: schema + array of tables, one row per check.
+# W4-T15 is the runner. This file describes production extract output;
+# it does not invent parser fields (anti-N13).
+#
+# kind: presence | absence | count | seal
+# status: baseline | hypothesis | expected_fail_until_W2-T7 | expected_fail_until_W2-T12 | expected_fail_until_W2-T13
+# Count rows carry baseline_from = engine SHA that produced expected.
+# UserMsg = rendered markdown headings matching `**[HH:MM:SS] user:**`.
+
+schema = "aicx.parser.oracle_assertions.v1"
+baseline_engine = "aicx@a687754"
+
+# ---------------------------------------------------------------- claude 67025fed
+
+[[assertion]]
+id = "claude-67025fed-enqueue-count"
+fixture = "tests/fixtures/parser_engine/claude/human_shape_67025fed.jsonl"
+projection = "raw"
+kind = "count"
+expected = 26
+baseline_from = "aicx@a687754"
+status = "baseline"
+selector = "type == \"queue-operation\" && operation == \"enqueue\""
+note = "Mid-turn queue-operation enqueue records in the bounded projection (equals full source)."
+
+[[assertion]]
+id = "claude-67025fed-enqueue-seal"
+fixture = "tests/fixtures/parser_engine/claude/human_shape_67025fed.jsonl"
+projection = "raw"
+kind = "seal"
+expected = "2026-08-25T19:53:58.988Z"
+baseline_from = "aicx@a687754"
+status = "baseline"
+selector = "queue-operation enqueue[0].timestamp"
+note = "Seal is the transport enqueue timestamp, not extract-render time."
+
+[[assertion]]
+id = "claude-67025fed-user-only-usermsg"
+fixture = "tests/fixtures/parser_engine/claude/human_shape_67025fed.jsonl"
+projection = "extract --conversation --user-only"
+kind = "count"
+expected = 25
+baseline_from = "aicx@a687754"
+status = "baseline"
+note = "Rendered **[HH:MM:SS] user:** headings. 26 enqueue / 25 headings: one enqueue is not a separate utterance."
+
+[[assertion]]
+id = "claude-67025fed-enqueue-content-presence"
+fixture = "tests/fixtures/parser_engine/claude/human_shape_67025fed.jsonl"
+projection = "extract --conversation --user-only"
+kind = "presence"
+expected = "Z mojej rozmowi z codexem"
+status = "baseline"
+note = "First enqueue body is projected as user speech."
+
+[[assertion]]
+id = "claude-67025fed-dequeue-count"
+fixture = "tests/fixtures/parser_engine/claude/human_shape_67025fed.jsonl"
+projection = "raw"
+kind = "count"
+expected = 6
+baseline_from = "aicx@a687754"
+status = "hypothesis"
+selector = "type == \"queue-operation\" && operation == \"dequeue\""
+note = "Records exist. Semantic role (apply-to-turn vs drop) is not settled by the fixture alone."
+
+[[assertion]]
+id = "claude-67025fed-remove-count"
+fixture = "tests/fixtures/parser_engine/claude/human_shape_67025fed.jsonl"
+projection = "raw"
+kind = "count"
+expected = 20
+baseline_from = "aicx@a687754"
+status = "hypothesis"
+selector = "type == \"queue-operation\" && operation == \"remove\""
+note = "Records exist and carry content. Semantic role (cancel vs consume) is not settled by the fixture alone."
+
+# ---------------------------------------------------------------- grok degenerate 019fdeca
+
+[[assertion]]
+id = "grok-019fdeca-typed-refusal"
+fixture = "tests/fixtures/parser_engine/grok/degenerate_019fdeca/chat_history.jsonl"
+projection = "extract --conversation"
+kind = "presence"
+expected = "RefusalReason"
+status = "expected_fail_until_W2-T12"
+note = "2-line degenerate session (system + synthetic user dump). Today aicx@a687754 returns exit 0, Messages=0, empty body (silent empty success). W2-T12 must emit a typed refusal."
+
+[[assertion]]
+id = "grok-019fdeca-usermsg-today"
+fixture = "tests/fixtures/parser_engine/grok/degenerate_019fdeca/chat_history.jsonl"
+projection = "extract --conversation --user-only"
+kind = "count"
+expected = 0
+baseline_from = "aicx@a687754"
+status = "baseline"
+note = "Observed UserMsg headings today. Does not bless the empty success; see grok-019fdeca-typed-refusal."
+
+# ---------------------------------------------------------------- grok healthy 01a038ec
+
+[[assertion]]
+id = "grok-01a038ec-raw-user-records"
+fixture = "tests/fixtures/parser_engine/grok/human_shape_01a038ec/chat_history.jsonl"
+projection = "raw"
+kind = "count"
+expected = 5
+baseline_from = "aicx@a687754"
+status = "baseline"
+selector = "type == \"user\""
+
+[[assertion]]
+id = "grok-01a038ec-user-only-usermsg"
+fixture = "tests/fixtures/parser_engine/grok/human_shape_01a038ec/chat_history.jsonl"
+projection = "extract --conversation --user-only"
+kind = "count"
+expected = 2
+baseline_from = "aicx@a687754"
+status = "baseline"
+note = "Rendered user headings. extract also reports Wrote 5 entries; W4 UserMsg is the heading count."
+
+# ---------------------------------------------------------------- gemini 9048328b
+
+[[assertion]]
+id = "gemini-9048328b-raw-user-records"
+fixture = "tests/fixtures/parser_engine/gemini/human_shape_9048328b.jsonl"
+projection = "raw"
+kind = "count"
+expected = 1
+baseline_from = "aicx@a687754"
+status = "baseline"
+selector = "type == \"user\""
+note = "Raw user record exists (11746-byte content) but is not projected as UserMsg today."
+
+[[assertion]]
+id = "gemini-9048328b-user-only-usermsg"
+fixture = "tests/fixtures/parser_engine/gemini/human_shape_9048328b.jsonl"
+projection = "extract --conversation --user-only"
+kind = "count"
+expected = 0
+baseline_from = "aicx@a687754"
+status = "baseline"
+
+[[assertion]]
+id = "gemini-9048328b-conversation-assistant"
+fixture = "tests/fixtures/parser_engine/gemini/human_shape_9048328b.jsonl"
+projection = "extract --conversation"
+kind = "count"
+expected = 21
+baseline_from = "aicx@a687754"
+status = "baseline"
+note = "Rendered **[HH:MM:SS] assistant:** headings."
+
+# ---------------------------------------------------------------- junie 260528
+
+[[assertion]]
+id = "junie-260528-user-only-usermsg"
+fixture = "tests/fixtures/parser_engine/junie/human_shape_260528.jsonl"
+projection = "extract --conversation --user-only"
+kind = "count"
+expected = 0
+baseline_from = "aicx@a687754"
+status = "baseline"
+note = "Source is A2UX SessionA2uxEvent wrapping; no UserPromptEvent in the golden log."
+
+[[assertion]]
+id = "junie-260528-conversation-assistant"
+fixture = "tests/fixtures/parser_engine/junie/human_shape_260528.jsonl"
+projection = "extract --conversation"
+kind = "count"
+expected = 1
+baseline_from = "aicx@a687754"
+status = "baseline"
+note = "One empty assistant heading."
+
+# ---------------------------------------------------------------- A2 inter-agent 01a042f9
+
+[[assertion]]
+id = "a2-01a042f9-agent-message-raw"
+fixture = "external:inputs/fixtures/codex/diagnostic-01a042f9/rollout-2026-08-27T13-27-04-01a042f9-3803-7772-bf00-1887a50aaf89.jsonl"
+projection = "raw"
+kind = "count"
+expected = 28
+baseline_from = "aicx@a687754"
+status = "baseline"
+selector = "type == \"response_item\" && payload.type == \"agent_message\""
+measure_command = "python3 -c 'import json,sys; n=0\nfor line in open(sys.argv[1]):\n o=json.loads(line)\n pl=o.get(\"payload\") if isinstance(o.get(\"payload\"), dict) else {}\n if o.get(\"type\")==\"response_item\" and pl.get(\"type\")==\"agent_message\":\n  n+=1\nprint(n)' <src>"
+
+[[assertion]]
+id = "a2-01a042f9-conversation-agent-as-assistant"
+fixture = "tests/fixtures/parser_engine/human_shape_01a042f9_interagent.jsonl"
+projection = "extract --conversation"
+kind = "count"
+expected = 0
+baseline_from = "aicx@a687754"
+status = "expected_fail_until_W2-T7"
+selector = "rendered assistant headings sourced from agent_message"
+note = "Want 0 agent_message envelopes in the assistant lane. Today aicx@a687754 renders 28 assistant headings with Message Type / Task name / Sender."
+
+[[assertion]]
+id = "a2-01a042f9-kind-inter-agent"
+fixture = "tests/fixtures/parser_engine/human_shape_01a042f9_interagent.jsonl"
+projection = "extract --conversation --kind inter_agent"
+kind = "count"
+expected = 28
+baseline_from = "aicx@a687754"
+status = "expected_fail_until_W2-T13"
+note = "Flag --kind does not exist on aicx@a687754 (exit 2, unexpected argument '--kind'). W2-T13 adds the lane."
+
+[[assertion]]
+id = "a2-01a042f9-compacted-no-new-utterances"
+fixture = "tests/fixtures/parser_engine/human_shape_01a042f9_interagent.jsonl"
+projection = "extract --conversation"
+kind = "count"
+expected = 0
+baseline_from = "aicx@a687754"
+status = "baseline"
+selector = "extra utterances produced from compacted.replacement_history"
+note = "Brief labelled this expected_fail_until_W2-T7. Measurement on aicx@a687754: session_meta+first compacted → 0 headings; mixed projection assistant count equals the 28 agent_message records. Frozen as expected=0 that W2-T7 must keep (Inject compaction_replay, not new speech)."
+
+# ---------------------------------------------------------------- A1 diagnostic 01a0369f (external raw, not copied)
+
+[[assertion]]
+id = "a1-01a0369f-compacted-markers"
+fixture = "external:inputs/fixtures/codex/rollout-2026-08-25T03-53-42-01a0369f-9313-7592-8303-3db46b6f8b47.jsonl"
+projection = "raw"
+kind = "count"
+expected = 38
+baseline_from = "aicx@a687754"
+status = "hypothesis"
+selector = "type == \"compacted\""
+measure_command = "python3 -c 'import json,sys; print(sum(1 for line in open(sys.argv[1]) if json.loads(line).get(\"type\")==\"compacted\"))' <src>"
+note = "Decision 8 remains open. 38 compaction markers in one session_meta / one cwd is the measured shape, not a designed Boundary kind."
+
+[[assertion]]
+id = "a1-01a0369f-turn-context-cwd-changes"
+fixture = "external:inputs/fixtures/codex/rollout-2026-08-25T03-53-42-01a0369f-9313-7592-8303-3db46b6f8b47.jsonl"
+projection = "raw"
+kind = "count"
+expected = 0
+baseline_from = "aicx@a687754"
+status = "hypothesis"
+selector = "sequential changes of turn_context.payload.cwd"
+measure_command = "python3 -c 'import json,sys\nlast=None; n=0; changes=0\nfor line in open(sys.argv[1]):\n o=json.loads(line)\n if o.get(\"type\")!=\"turn_context\":\n  continue\n cwd=(o.get(\"payload\") or {}).get(\"cwd\")\n n+=1\n if last is not None and cwd!=last:\n  changes+=1\n last=cwd\nprint(changes)' <src>"
+note = "58 turn_context records, 1 unique cwd (/Users/maciejgad/vc-workspace/vetcoders/codescribe), 0 sequential changes. This rollout does not show cwd-change as a work boundary."
+
+[[assertion]]
+id = "a1-01a0369f-multiline-echo-quoted-speakers"
+fixture = "external:inputs/fixtures/codex/rollout-2026-08-25T03-53-42-01a0369f-9313-7592-8303-3db46b6f8b47.jsonl"
+projection = "extract --conversation --user-only"
+kind = "count"
+expected = 1
+baseline_from = "aicx@a687754"
+status = "expected_fail_until_W2-T7"
+note = "Decision 7: one multiline echo that quotes speakers is ONE Human frame, not N speakers. Today echo-bus user_shell commands are not projected into --user-only (0 utterances, not a 3-way split). Exact labels 'Monika Szymańska:' / 'Maciej Gad:' were not found in echo command bodies of this rollout. W2-T7 must emit 1 Human for a multiline echo; splitting quoted names is the forbidden regression."

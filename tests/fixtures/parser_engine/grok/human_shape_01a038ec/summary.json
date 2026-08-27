@@ -1,0 +1,28 @@
+{
+  "info": {
+    "id": "01a038ec-d5f4-7c53-b665-56fa69882572",
+    "cwd": "/Users/maciejgad/vc-workspace/vetcoders/codescribe"
+  },
+  "session_summary": "W2R-C4 Codescribe Structural Closure Diagnosis",
+  "created_at": "2026-08-25T12:37:20.605386Z",
+  "updated_at": "2026-08-25T12:51:11.249800Z",
+  "num_messages": 711,
+  "num_chat_messages": 206,
+  "current_model_id": "grok-4.6",
+  "next_trace_turn": 1,
+  "chat_format_version": 1,
+  "git_root_dir": "/Users/maciejgad/vc-workspace/vetcoders/codescribe/",
+  "git_remotes": [
+    "dragon:/Volumes/vc-workspace/vetcoders/codescribe",
+    "https://github.com/vetcoders/codescribe"
+  ],
+  "head_commit": "cf6e5236b2abdaa5181e50545a6a599c26a170ce",
+  "head_branch": "dbxms-runtime-claude",
+  "request_id": "a62156db-9f63-4699-a981-ebe729bf939e",
+  "grok_home": "/Users/maciejgad/.grok",
+  "last_active_at": "2026-08-25T12:51:11.249800Z",
+  "generated_title": "W2R-C4 Codescribe Structural Closure Diagnosis",
+  "agent_name": "grok-build-plan",
+  "sandbox_profile": "off",
+  "reasoning_effort": "high"
+}
