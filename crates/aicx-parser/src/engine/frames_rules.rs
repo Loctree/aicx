@@ -89,6 +89,26 @@ const CLAUDE_INJECT_TAGS: &[InjectTagRule] = &[
 ];
 // # claude — end
 
+// # gemini
+const GEMINI_INJECT_TAGS: &[InjectTagRule] = &[
+    InjectTagRule {
+        tag: "system",
+        kind: InjectRuleKind::TransportControl,
+    },
+    InjectTagRule {
+        tag: "system_instruction",
+        kind: InjectRuleKind::AgentInstructions,
+    },
+    InjectTagRule {
+        tag: "environment_context",
+        kind: InjectRuleKind::TransportControl,
+    },
+    InjectTagRule {
+        tag: "context",
+        kind: InjectRuleKind::TransportControl,
+    },
+];
+
 const GENERIC_INJECT_TAGS: &[InjectTagRule] = &[InjectTagRule {
     tag: "system",
     kind: InjectRuleKind::TransportControl,
@@ -130,12 +150,13 @@ pub const AGENT_FRAME_RULES: &[AgentFrameRules] = &[
         queue_seal: true,
         inject_tags: CLAUDE_INJECT_TAGS,
     },
+    // # gemini
     AgentFrameRules {
         agent: AgentKind::Gemini,
         echo_promotion: false,
         klops_guard: &[],
         queue_seal: false,
-        inject_tags: GENERIC_INJECT_TAGS,
+        inject_tags: GEMINI_INJECT_TAGS,
     },
     // # grok
     AgentFrameRules {

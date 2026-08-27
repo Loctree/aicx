@@ -10,16 +10,20 @@
 //! No shared dispatch touched. Subformat detection by shape only (no guessing paths).
 
 use super::{AdapterError, AgentAdapter, ClassifiedDisposition, ClassifiedUnit, RawUnitLevel};
+use crate::engine::frames::{
+    self, ClassifiedFrame, FrameClass, TransportFrame, TransportKind, TransportPayload,
+    TransportRole,
+};
 use crate::engine::{
     AgentKind, BoundaryFlags, ConsumedUnit, CounterSemantics, CoverageReport, CoverageWarning,
     Known, ParseStatus, Provenance, RawUnit, RawUnitRef, Segment, SessionModel, SkippedReason,
     SkippedUnit, SourceFraming, SourceHandle, SourceRead, TokenComponents, ToolEvent,
-    ToolEventKind, Turn, TurnKind, TurnRange, TurnRole, UnitBoundary, UnvalidatedParse, UsageEvent,
+    ToolEventKind, Turn, TurnRange, TurnRole, UnitBoundary, UnvalidatedParse, UsageEvent,
     VisibleCompleteness, WarningKind, evidence_event_id_from_hash, ordinal_locator, sha256_hex,
 };
 use serde_json::Value;
 
-pub const GEMINI_ADAPTER_VERSION: &str = "gemini-adapter-v1-c9p";
+pub const GEMINI_ADAPTER_VERSION: &str = "gemini-adapter-v2-throne";
 
 /// Provider for usage events.
 const USAGE_PROVIDER: &str = "google";
@@ -224,22 +228,22 @@ fn walk_physical_unit(
     let shape = detect_shape(&value, raw.framing);
 
     match shape {
-        GeminiShape::WholeFileDocument => {
+        GeminiShape::WholeFileDocument | GeminiShape::AntigravityConversation => {
             consume_physical(raw, "whole_file_document", ctx, analysis)?;
             // Extract top level fields for provenance
             if let Some(obj) = value.as_object() {
                 if let Some(_sid) = string_field(obj, "sessionId") {
                     analysis.session_id_seen = true;
-                    if analysis.started_at == Known::unknown()
-                        && let Some(st) = string_field(obj, "startTime")
-                    {
-                        analysis.started_at = Known::value(st.to_owned());
-                    }
-                    if analysis.ended_at == Known::unknown()
-                        && let Some(lt) = string_field(obj, "lastUpdated")
-                    {
-                        analysis.ended_at = Known::value(lt.to_owned());
-                    }
+                }
+                if analysis.started_at == Known::unknown()
+                    && let Some(st) = string_field(obj, "startTime")
+                {
+                    analysis.started_at = Known::value(st.to_owned());
+                }
+                if analysis.ended_at == Known::unknown()
+                    && let Some(lt) = string_field(obj, "lastUpdated")
+                {
+                    analysis.ended_at = Known::value(lt.to_owned());
                 }
                 // model inference from first gemini message if present
                 if let Some(msgs) = obj.get("messages").and_then(Value::as_array) {
@@ -250,7 +254,6 @@ fn walk_physical_unit(
                             {
                                 analysis.model = Known::value(mdl.to_owned());
                             }
-                            // Also check inside content if object
                             if let Some(c) = mo.get("content")
                                 && let Some(co) = c.as_object()
                                 && let Some(mdl) = string_field(co, "model")
@@ -271,23 +274,7 @@ fn walk_physical_unit(
             // Emit logical units from messages array
             if let Some(msgs) = value.get("messages").and_then(Value::as_array) {
                 for (i, msg) in msgs.iter().enumerate() {
-                    emit_gemini_message(raw, msg, i, ctx, analysis, logical)?;
-                }
-            }
-        }
-        GeminiShape::AntigravityConversation => {
-            consume_physical(raw, "whole_file_document", ctx, analysis)?;
-            analysis.session_id_seen = true;
-            if let Some(obj) = value.as_object() {
-                if let Some(pr) = string_field(obj, "projectRoot")
-                    && analysis.first_cwd == Known::unknown()
-                {
-                    analysis.first_cwd = Known::value(pr.to_owned());
-                }
-                if let Some(msgs) = obj.get("messages").and_then(Value::as_array) {
-                    for (i, msg) in msgs.iter().enumerate() {
-                        emit_antigravity_message(raw, msg, i, ctx, analysis, logical)?;
-                    }
+                    emit_message(raw, msg, i, ctx, analysis, logical)?;
                 }
             }
         }
@@ -298,7 +285,6 @@ fn walk_physical_unit(
                 "state_update"
             };
             consume_physical(raw, kind, ctx, analysis)?;
-            // minimal metadata, may backfill
             if let Some(obj) = value.as_object() {
                 if let Some(_sid) = string_field(obj, "sessionId") {
                     analysis.session_id_seen = true;
@@ -311,9 +297,8 @@ fn walk_physical_unit(
             }
         }
         GeminiShape::JsonlLineMessage => {
-            // treat each line as physical message container
             consume_physical(raw, "message", ctx, analysis)?;
-            emit_gemini_message(raw, &value, 0, ctx, analysis, logical)?;
+            emit_message(raw, &value, 0, ctx, analysis, logical)?;
         }
         GeminiShape::Unknown => {
             if unterminated {
@@ -373,7 +358,6 @@ fn detect_shape(value: &Value, framing: SourceFraming) -> GeminiShape {
         return GeminiShape::StreamHeader;
     }
     if framing == SourceFraming::JsonLines {
-        // heuristic for incremental
         if obj
             .get("type")
             .is_some_and(|t| t.as_str() == Some("gemini") || t.as_str() == Some("user"))
@@ -385,7 +369,7 @@ fn detect_shape(value: &Value, framing: SourceFraming) -> GeminiShape {
     GeminiShape::Unknown
 }
 
-fn emit_gemini_message(
+fn emit_message(
     raw: &RawUnit,
     msg: &Value,
     block_index: usize,
@@ -400,28 +384,42 @@ fn emit_gemini_message(
     let role_str = string_field(obj, "type")
         .or_else(|| string_field(obj, "role"))
         .unwrap_or("unknown");
-    let is_user = role_str == "user";
-    let is_assistant = matches!(role_str, "gemini" | "model" | "assistant");
-    let kind = if is_user { "user" } else { "message" };
+
+    let transport_role = match role_str {
+        "user" => TransportRole::User,
+        "gemini" | "model" | "assistant" => TransportRole::Assistant,
+        "system" | "system_instruction" | "systemInstruction" | "context" => TransportRole::System,
+        "tool" | "function" | "tool_response" => TransportRole::Tool,
+        _ => {
+            if obj.contains_key("toolCalls") || obj.contains_key("functionCall") {
+                TransportRole::Assistant
+            } else {
+                TransportRole::Assistant
+            }
+        }
+    };
+
+    let kind = match transport_role {
+        TransportRole::User => "user",
+        TransportRole::System => "system",
+        _ => "message",
+    };
 
     let evidence = consume_logical(raw, msg, block_index, kind, ctx, logical, analysis)?;
 
-    // text content
     let text = extract_text(obj);
     let timestamp = string_field(obj, "timestamp")
         .or_else(|| string_field(obj, "lastUpdated"))
         .map(|s| Known::value(s.to_owned()))
         .unwrap_or_else(Known::unknown);
 
-    // model from this msg
-    if is_assistant
+    if transport_role == TransportRole::Assistant
         && let Some(mdl) = string_field(obj, "model")
         && analysis.model == Known::unknown()
     {
         analysis.model = Known::value(mdl.to_owned());
     }
 
-    // usage if present
     if let Some(tokens_obj) = obj
         .get("tokens")
         .and_then(Value::as_object)
@@ -446,163 +444,115 @@ fn emit_gemini_message(
         analysis.usage_events.push(ue);
     }
 
-    if !text.is_empty() || is_assistant {
-        let turn_role = if is_user {
-            TurnRole::User
-        } else {
-            TurnRole::Assistant
-        };
-        let turn_kind = if is_assistant && has_thought(obj) {
-            TurnKind::InternalThought
-        } else if is_assistant {
-            TurnKind::AgentReply
-        } else {
-            TurnKind::UserMsg
-        };
-        push_turn(
-            turn_role, turn_kind, &text, None, timestamp, evidence, analysis,
-        );
+    if has_thought(obj) {
+        analysis.opaque_reasoning_present = true;
     }
 
-    // parts for richer shapes (antigravity style or gemini content.parts)
-    if let Some(parts) = get_parts(obj) {
-        for (pi, part) in parts.iter().enumerate() {
-            emit_part(raw, part, block_index, pi, ctx, analysis, logical)?;
-        }
+    // Delivery of normalized message text to the throne classifier
+    if !text.is_empty() || transport_role == TransportRole::Assistant {
+        let (transport_kind, payload) = match transport_role {
+            TransportRole::User => (
+                TransportKind::DirectMessage,
+                TransportPayload::Text {
+                    role: TransportRole::User,
+                    content: text,
+                },
+            ),
+            TransportRole::Assistant => (
+                TransportKind::AssistantMessage,
+                TransportPayload::Text {
+                    role: TransportRole::Assistant,
+                    content: text,
+                },
+            ),
+            TransportRole::System => (
+                TransportKind::InjectedContext,
+                TransportPayload::Inject {
+                    tag: "system".to_owned(),
+                    content: text,
+                },
+            ),
+            TransportRole::Tool => (
+                TransportKind::DirectMessage,
+                TransportPayload::Text {
+                    role: TransportRole::Tool,
+                    content: text,
+                },
+            ),
+        };
+        let frame = TransportFrame {
+            agent: AgentKind::Gemini,
+            transport_kind,
+            timestamp: timestamp.clone(),
+            payload,
+            evidence: evidence.clone(),
+        };
+        let classified = frames::classify(&frame);
+        push_classified_frame(&classified, None, analysis);
     }
 
-    // direct tool in message for some shapes
-    if let Some(fc) = obj.get("functionCall").or_else(|| obj.get("tool_call")) {
-        if let Some(name) = string_field(obj, "name")
-            .or_else(|| fc.as_object().and_then(|f| string_field(f, "name")))
-        {
-            emit_tool_call(raw, name, fc, block_index, ctx, analysis, logical)?;
+    // Tool calls inside message
+    if let Some(tool_calls) = obj.get("toolCalls").and_then(Value::as_array) {
+        for (ti, tc) in tool_calls.iter().enumerate() {
+            emit_tool_call(
+                raw,
+                tc,
+                block_index * 1000 + ti + 1,
+                timestamp.clone(),
+                ctx,
+                analysis,
+                logical,
+            )?;
         }
-    } else if let (Some(name), Some(_args)) = (string_field(obj, "name"), obj.get("args")) {
-        let v = Value::Object(obj.clone());
-        emit_tool_call(raw, name, &v, block_index, ctx, analysis, logical)?;
-    }
-    Ok(())
-}
-
-fn emit_antigravity_message(
-    raw: &RawUnit,
-    msg: &Value,
-    block_index: usize,
-    ctx: &mut Ctx<'_>,
-    analysis: &mut Analysis,
-    logical: &mut Vec<ClassifiedUnit>,
-) -> Result<(), AdapterError> {
-    let obj = match msg.as_object() {
-        Some(o) => o,
-        None => return Ok(()),
-    };
-    let role = string_field(obj, "role").unwrap_or("unknown");
-    let is_user = role == "user";
-    let is_model = role == "model" || role == "assistant";
-
-    let kind = if is_user { "user" } else { "message" };
-    let evidence = consume_logical(raw, msg, block_index, kind, ctx, logical, analysis)?;
-
-    let text = extract_text_from_parts(obj);
-    let timestamp = string_field(obj, "timestamp")
-        .map(|s| Known::value(s.to_owned()))
-        .unwrap_or_else(Known::unknown);
-
-    if !text.is_empty() || is_model {
-        let turn_role = if is_user {
-            TurnRole::User
-        } else {
-            TurnRole::Assistant
-        };
-        let mut turn_kind = if is_model {
-            TurnKind::AgentReply
-        } else {
-            TurnKind::UserMsg
-        };
-        if is_model && has_thought_in_parts(obj) {
-            turn_kind = TurnKind::InternalThought;
-            analysis.opaque_reasoning_present = true; // or thought present
-        }
-        push_turn(
-            turn_role,
-            turn_kind,
-            &text,
-            None,
+    } else if let Some(fc) = obj.get("functionCall") {
+        emit_tool_call(
+            raw,
+            fc,
+            block_index * 1000 + 1,
             timestamp.clone(),
-            evidence.clone(),
+            ctx,
             analysis,
-        );
-    }
-
-    // parts
-    if let Some(parts) = get_parts(obj) {
+            logical,
+        )?;
+    } else if let Some(parts) = get_parts(obj) {
         for (pi, part) in parts.iter().enumerate() {
-            emit_part(raw, part, block_index, pi, ctx, analysis, logical)?;
+            if let Some(fc) = part.get("functionCall") {
+                emit_tool_call(
+                    raw,
+                    fc,
+                    block_index * 1000 + pi + 1,
+                    timestamp.clone(),
+                    ctx,
+                    analysis,
+                    logical,
+                )?;
+            }
         }
     }
-    Ok(())
-}
 
-fn emit_part(
-    raw: &RawUnit,
-    part: &Value,
-    parent_block: usize,
-    part_idx: usize,
-    ctx: &mut Ctx<'_>,
-    analysis: &mut Analysis,
-    logical: &mut Vec<ClassifiedUnit>,
-) -> Result<(), AdapterError> {
-    let obj = match part.as_object() {
-        Some(o) => o,
-        None => return Ok(()),
-    };
-    let is_thought = obj.get("thought").and_then(Value::as_bool).unwrap_or(false)
-        || obj.contains_key("thinking")
-        || string_field(obj, "subject").is_some(); // some thought shapes
-    let text = extract_text(obj);
-    if text.is_empty() && !is_thought {
-        // may be functionCall inside part
-        if let Some(fc) = obj.get("functionCall")
-            && let Some(name) = string_field(obj, "name")
-                .or_else(|| fc.as_object().and_then(|f| string_field(f, "name")))
-        {
-            return emit_tool_call(raw, name, fc, parent_block, ctx, analysis, logical);
-        }
-        return Ok(());
-    }
-    let kind = if is_thought { "thought" } else { "text_block" };
-    let block_val = part.clone();
-    let evidence = consume_logical(
-        raw,
-        &block_val,
-        parent_block * 100 + part_idx,
-        kind,
-        ctx,
-        logical,
-        analysis,
-    )?;
-
-    let turn_kind = if is_thought {
-        TurnKind::InternalThought
-    } else {
-        TurnKind::AgentReply
-    };
-    let role = TurnRole::Assistant;
-    let ts = Known::unknown();
-    push_turn(role, turn_kind, &text, None, ts, evidence, analysis);
     Ok(())
 }
 
 fn emit_tool_call(
     raw: &RawUnit,
-    name: &str,
     call_val: &Value,
     block_index: usize,
+    timestamp: Known<String>,
     ctx: &mut Ctx<'_>,
     analysis: &mut Analysis,
     logical: &mut Vec<ClassifiedUnit>,
 ) -> Result<(), AdapterError> {
+    let call_obj = call_val.as_object();
+    let name = call_obj
+        .and_then(|o| string_field(o, "name"))
+        .or_else(|| {
+            call_obj
+                .and_then(|o| o.get("functionCall"))
+                .and_then(Value::as_object)
+                .and_then(|f| string_field(f, "name"))
+        })
+        .unwrap_or("tool");
+
     let block_val = call_val.clone();
     let evidence = consume_logical(
         raw,
@@ -619,7 +569,7 @@ fn emit_tool_call(
         .or_else(|| call_val.get("arguments"))
         .cloned()
         .unwrap_or(Value::Null);
-    let _payload = canonical_json(&args);
+
     let tool_event = ToolEvent {
         kind: ToolEventKind::Call,
         turn_idx: analysis.turns.len() as u64,
@@ -631,41 +581,129 @@ fn emit_tool_call(
     };
     analysis.tool_events.push(tool_event);
 
-    // also a turn for it?
-    push_turn(
-        TurnRole::Tool,
-        TurnKind::ToolCall,
-        name,
-        Some(name.to_owned()),
-        Known::unknown(),
+    let is_shell = matches!(name, "run_shell_command" | "bash" | "shell");
+    let (transport_kind, payload) = if is_shell {
+        let command = string_field_from_val(&args, "command")
+            .or_else(|| string_field_from_val(&args, "cmd"))
+            .unwrap_or(name)
+            .to_owned();
+        let result = extract_tool_result_string(call_val);
+        (
+            TransportKind::UserShellCommand,
+            TransportPayload::Shell { command, result },
+        )
+    } else {
+        (
+            TransportKind::DirectMessage,
+            TransportPayload::Text {
+                role: TransportRole::Tool,
+                content: name.to_owned(),
+            },
+        )
+    };
+
+    let frame = TransportFrame {
+        agent: AgentKind::Gemini,
+        transport_kind,
+        timestamp,
+        payload,
         evidence,
-        analysis,
-    );
+    };
+    let classified = frames::classify(&frame);
+    push_classified_frame(&classified, Some(name.to_owned()), analysis);
     Ok(())
 }
 
-fn has_thought(obj: &serde_json::Map<String, Value>) -> bool {
-    if let Some(parts) = get_parts_from_map(obj) {
-        return parts
-            .iter()
-            .any(|p| p.get("thought").and_then(|v| v.as_bool()).unwrap_or(false));
+fn push_classified_frame(
+    classified: &ClassifiedFrame,
+    tool_name: Option<String>,
+    analysis: &mut Analysis,
+) {
+    let Some(turn_kind) = classified.turn_kind else {
+        return;
+    };
+    let role = match &classified.class {
+        FrameClass::Human { .. } | FrameClass::EchoSeal { .. } => TurnRole::User,
+        FrameClass::AssistantFinal => TurnRole::Assistant,
+        FrameClass::ShellAction { .. } => TurnRole::Tool,
+        FrameClass::Inject { .. } | FrameClass::LineageMeta { .. } => TurnRole::System,
+        FrameClass::InterAgent { .. } => return,
+    };
+    let turn_idx = analysis.turns.len() as u64;
+    let refs = vec![classified.origin.evidence.clone()];
+    analysis.turns.push(Turn {
+        turn_idx,
+        role,
+        timestamp: classified.seal.seal_ts.clone(),
+        kind: turn_kind,
+        text: classified.content.clone(),
+        text_hash: classified.content_hash.clone(),
+        text_chars: classified.content.chars().count() as u64,
+        tool_name: tool_name.map_or_else(Known::unknown, Known::value),
+        segment_id: 0,
+        raw_unit_refs: refs,
+    });
+    let segment = analysis.segments.last_mut().expect("segment draft");
+    if segment.first_turn.is_none() {
+        segment.first_turn = Some(turn_idx);
+        segment.started_at = classified.seal.seal_ts.clone();
     }
-    false
+    segment.last_turn = turn_idx;
+    if let Known::Value(_) = classified.seal.seal_ts {
+        segment.ended_at = classified.seal.seal_ts.clone();
+    }
 }
 
-fn has_thought_in_parts(obj: &serde_json::Map<String, Value>) -> bool {
-    if let Some(parts) = get_parts_from_map(obj) {
-        parts.iter().any(|p| {
+fn extract_tool_result_string(call_val: &Value) -> String {
+    let Some(obj) = call_val.as_object() else {
+        return String::new();
+    };
+    if let Some(res) = obj.get("result") {
+        if let Some(s) = res.as_str() {
+            return s.to_owned();
+        }
+        if let Some(arr) = res.as_array() {
+            for item in arr {
+                if let Some(iobj) = item.as_object() {
+                    if let Some(fr) = iobj.get("functionResponse").and_then(Value::as_object) {
+                        if let Some(resp) = fr.get("response").and_then(Value::as_object) {
+                            if let Some(out) = string_field(resp, "output") {
+                                return out.to_owned();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    String::new()
+}
+
+fn string_field_from_val<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
+    v.as_object().and_then(|o| string_field(o, key))
+}
+
+fn has_thought(obj: &serde_json::Map<String, Value>) -> bool {
+    if obj.get("thought").and_then(Value::as_bool).unwrap_or(false) || obj.contains_key("thinking")
+    {
+        return true;
+    }
+    if let Some(thoughts) = obj.get("thoughts").and_then(Value::as_array) {
+        if !thoughts.is_empty() {
+            return true;
+        }
+    }
+    if let Some(parts) = get_parts(obj) {
+        return parts.iter().any(|p| {
             if let Some(po) = p.as_object() {
                 po.get("thought").and_then(Value::as_bool).unwrap_or(false)
                     || po.contains_key("thinking")
             } else {
                 false
             }
-        })
-    } else {
-        false
+        });
     }
+    false
 }
 
 fn get_parts(obj: &serde_json::Map<String, Value>) -> Option<&Vec<Value>> {
@@ -673,10 +711,6 @@ fn get_parts(obj: &serde_json::Map<String, Value>) -> Option<&Vec<Value>> {
         .and_then(|c| c.get("parts"))
         .and_then(Value::as_array)
         .or_else(|| obj.get("parts").and_then(Value::as_array))
-}
-
-fn get_parts_from_map(obj: &serde_json::Map<String, Value>) -> Option<&Vec<Value>> {
-    get_parts(obj)
 }
 
 fn extract_text(obj: &serde_json::Map<String, Value>) -> String {
@@ -687,21 +721,28 @@ fn extract_text(obj: &serde_json::Map<String, Value>) -> String {
         if let Some(s) = c.as_str() {
             return s.to_owned();
         }
-        if let Some(parts) = c.get("parts").and_then(Value::as_array) {
-            return parts
-                .iter()
-                .filter_map(|p| {
-                    if let Some(po) = p.as_object() {
-                        if po.get("thought").and_then(Value::as_bool).unwrap_or(false) {
-                            return None;
-                        }
-                        string_field(po, "text").or_else(|| string_field(po, "content"))
-                    } else {
-                        None
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
+        if let Some(arr) = c.as_array() {
+            let extracted = extract_text_from_array(arr);
+            if !extracted.is_empty() {
+                return extracted;
+            }
+        }
+        if let Some(co) = c.as_object() {
+            if let Some(parts) = co.get("parts").and_then(Value::as_array) {
+                let extracted = extract_text_from_array(parts);
+                if !extracted.is_empty() {
+                    return extracted;
+                }
+            }
+            if let Some(t) = string_field(co, "text") {
+                return t.to_owned();
+            }
+        }
+    }
+    if let Some(parts) = obj.get("parts").and_then(Value::as_array) {
+        let extracted = extract_text_from_array(parts);
+        if !extracted.is_empty() {
+            return extracted;
         }
     }
     if let Some(t) = string_field(obj, "text") {
@@ -710,57 +751,25 @@ fn extract_text(obj: &serde_json::Map<String, Value>) -> String {
     String::new()
 }
 
-fn extract_text_from_parts(obj: &serde_json::Map<String, Value>) -> String {
-    let mut out = Vec::new();
-    if let Some(parts) = get_parts_from_map(obj) {
-        for p in parts {
-            if let Some(po) = p.as_object() {
-                if po.get("thought").and_then(Value::as_bool).unwrap_or(false) {
-                    continue;
-                }
-                if let Some(t) = string_field(po, "text") {
-                    out.push(t.to_owned());
+fn extract_text_from_array(arr: &[Value]) -> String {
+    let mut parts = Vec::new();
+    for item in arr {
+        if let Some(s) = item.as_str() {
+            if !s.is_empty() {
+                parts.push(s.to_owned());
+            }
+        } else if let Some(obj) = item.as_object() {
+            if obj.get("thought").and_then(Value::as_bool).unwrap_or(false) {
+                continue;
+            }
+            if let Some(t) = string_field(obj, "text").or_else(|| string_field(obj, "content")) {
+                if !t.is_empty() {
+                    parts.push(t.to_owned());
                 }
             }
         }
-    } else if let Some(t) = string_field(obj, "content") {
-        out.push(t.to_owned());
     }
-    out.join("\n")
-}
-
-fn push_turn(
-    role: TurnRole,
-    kind: TurnKind,
-    text: &str,
-    tool_name: Option<String>,
-    timestamp: Known<String>,
-    evidence: RawUnitRef,
-    analysis: &mut Analysis,
-) {
-    let turn_idx = analysis.turns.len() as u64;
-    let refs = vec![evidence.clone()];
-    analysis.turns.push(Turn {
-        turn_idx,
-        role,
-        timestamp: timestamp.clone(),
-        kind,
-        text: text.to_owned(),
-        text_hash: sha256_hex(text.as_bytes()),
-        text_chars: text.chars().count() as u64,
-        tool_name: tool_name.map_or_else(Known::unknown, Known::value),
-        segment_id: 0, // finalized later
-        raw_unit_refs: refs,
-    });
-    let segment = analysis.segments.last_mut().expect("segment draft");
-    if segment.first_turn.is_none() {
-        segment.first_turn = Some(turn_idx);
-        segment.started_at = timestamp.clone();
-    }
-    segment.last_turn = turn_idx;
-    if let Known::Value(_) = timestamp {
-        segment.ended_at = timestamp;
-    }
+    parts.join("\n")
 }
 
 fn consume_physical(
