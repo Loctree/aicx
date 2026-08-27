@@ -14,6 +14,9 @@
 use super::{
     AdapterError, AgentAdapter, ClassifiedDisposition, ClassifiedUnit, RawUnitLevel, sealed,
 };
+use crate::engine::frames::{
+    self, FrameClass, TransportFrame, TransportKind, TransportPayload, TransportRole,
+};
 use crate::engine::{
     AgentKind, BoundaryFlags, ConsumedUnit, CoverageReport, CoverageWarning, Known, ParseStatus,
     Provenance, RawUnit, RawUnitRef, Segment, SessionModel, SkippedReason, SkippedUnit,
@@ -24,7 +27,7 @@ use crate::engine::{
 use serde_json::Value;
 use std::collections::BTreeMap;
 
-pub const JUNIE_ADAPTER_VERSION: &str = "junie-native-v1";
+pub const JUNIE_ADAPTER_VERSION: &str = "junie-native-v2";
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct JunieAdapter;
@@ -336,7 +339,15 @@ impl<'a> Assembly<'a> {
                         &["data", "content"],
                     ],
                 );
-                self.push_turn(TurnRole::User, TurnKind::UserMsg, timestamp, text, evidence);
+                self.push_classified_frame(
+                    timestamp,
+                    TransportKind::DirectMessage,
+                    TransportPayload::Text {
+                        role: TransportRole::User,
+                        content: text,
+                    },
+                    evidence,
+                );
             }
             "response" => {
                 let text = first_text(
@@ -349,7 +360,15 @@ impl<'a> Assembly<'a> {
                         &["data", "content"],
                     ],
                 );
-                self.push_turn(TurnRole::User, TurnKind::UserMsg, timestamp, text, evidence);
+                self.push_classified_frame(
+                    timestamp,
+                    TransportKind::DirectMessage,
+                    TransportPayload::Text {
+                        role: TransportRole::User,
+                        content: text,
+                    },
+                    evidence,
+                );
             }
             "system_message" | "meta_prompt" => {
                 let text = first_text(
@@ -362,11 +381,13 @@ impl<'a> Assembly<'a> {
                         &["data", "content"],
                     ],
                 );
-                self.push_turn(
-                    TurnRole::System,
-                    TurnKind::SystemNote,
+                self.push_classified_frame(
                     timestamp,
-                    text,
+                    TransportKind::InjectedContext,
+                    TransportPayload::Inject {
+                        tag: kind.to_owned(),
+                        content: text,
+                    },
                     evidence,
                 );
             }
@@ -431,16 +452,18 @@ impl<'a> Assembly<'a> {
         let timestamp = known_option(timestamp);
         match block.flavor {
             BlockFlavor::Text => {
-                self.push_turn(
-                    TurnRole::Assistant,
-                    TurnKind::AgentReply,
+                self.push_classified_frame(
                     timestamp,
-                    block.text,
+                    TransportKind::AssistantMessage,
+                    TransportPayload::Text {
+                        role: TransportRole::Assistant,
+                        content: block.text,
+                    },
                     unit.evidence.clone(),
                 );
             }
             BlockFlavor::Reasoning => {
-                self.push_turn(
+                self.push_model_turn(
                     TurnRole::Assistant,
                     TurnKind::InternalThought,
                     timestamp,
@@ -449,57 +472,135 @@ impl<'a> Assembly<'a> {
                 );
             }
             BlockFlavor::ToolCall => {
-                let turn_idx = self.turns.len() as u64;
                 let tool_name = if block.tool_name.is_empty() {
                     "unknown_junie_tool".to_owned()
                 } else {
                     block.tool_name
                 };
-                self.push_turn(
-                    TurnRole::Tool,
-                    TurnKind::ToolCall,
+                self.push_shell_action(
                     timestamp,
-                    block.text.clone(),
+                    block.text,
+                    block.result,
+                    tool_name,
+                    block.correlation_id,
                     unit.evidence.clone(),
                 );
-                self.tools.push(ToolEvent {
-                    kind: ToolEventKind::Call,
-                    turn_idx,
-                    tool_name,
-                    correlation_id: known_option(block.correlation_id),
-                    payload_hash: sha256_hex(block.text.as_bytes()),
-                    payload_bytes: block.text.len() as u64,
-                    raw_unit_refs: vec![unit.evidence.clone()],
-                });
             }
             BlockFlavor::ToolResult => {
-                let turn_idx = self.turns.len() as u64;
                 let tool_name = if block.tool_name.is_empty() {
                     "unknown_junie_tool".to_owned()
                 } else {
                     block.tool_name
                 };
-                self.push_turn(
-                    TurnRole::Tool,
-                    TurnKind::ToolResult,
+                self.push_shell_action(
                     timestamp,
-                    block.text.clone(),
+                    String::new(),
+                    block.text,
+                    tool_name,
+                    block.correlation_id,
                     unit.evidence.clone(),
                 );
-                self.tools.push(ToolEvent {
-                    kind: ToolEventKind::Result,
-                    turn_idx,
-                    tool_name,
-                    correlation_id: known_option(block.correlation_id),
-                    payload_hash: sha256_hex(block.text.as_bytes()),
-                    payload_bytes: block.text.len() as u64,
-                    raw_unit_refs: vec![unit.evidence.clone()],
-                });
             }
         }
     }
 
-    fn push_turn(
+    fn push_classified_frame(
+        &mut self,
+        timestamp: Known<String>,
+        transport_kind: TransportKind,
+        payload: TransportPayload,
+        evidence: RawUnitRef,
+    ) {
+        let classified = frames::classify(&TransportFrame {
+            agent: AgentKind::Junie,
+            transport_kind,
+            timestamp,
+            payload,
+            evidence,
+        });
+        let role = match classified.class {
+            FrameClass::Human { .. } | FrameClass::EchoSeal { .. } => TurnRole::User,
+            FrameClass::ShellAction { .. } => TurnRole::Tool,
+            FrameClass::Inject { .. } | FrameClass::LineageMeta { .. } => TurnRole::System,
+            FrameClass::AssistantFinal => TurnRole::Assistant,
+            FrameClass::InterAgent { .. } => return,
+        };
+        let Some(kind) = classified.turn_kind else {
+            return;
+        };
+        self.push_model_turn(
+            role,
+            kind,
+            classified.seal.seal_ts,
+            classified.content,
+            classified.origin.evidence,
+        );
+    }
+
+    fn push_shell_action(
+        &mut self,
+        timestamp: Known<String>,
+        command: String,
+        result: String,
+        tool_name: String,
+        correlation_id: Option<String>,
+        evidence: RawUnitRef,
+    ) {
+        let classified = frames::classify(&TransportFrame {
+            agent: AgentKind::Junie,
+            transport_kind: TransportKind::UserShellCommand,
+            timestamp,
+            payload: TransportPayload::Shell { command, result },
+            evidence,
+        });
+        let FrameClass::ShellAction { cmd, result } = classified.class else {
+            return;
+        };
+        let timestamp = classified.seal.seal_ts;
+        let evidence = classified.origin.evidence;
+        let correlation_id = known_option(correlation_id);
+
+        if !cmd.is_empty() {
+            let turn_idx = self.turns.len() as u64;
+            self.push_model_turn(
+                TurnRole::Tool,
+                TurnKind::ToolCall,
+                timestamp.clone(),
+                cmd.clone(),
+                evidence.clone(),
+            );
+            self.tools.push(ToolEvent {
+                kind: ToolEventKind::Call,
+                turn_idx,
+                tool_name: tool_name.clone(),
+                correlation_id: correlation_id.clone(),
+                payload_hash: sha256_hex(cmd.as_bytes()),
+                payload_bytes: cmd.len() as u64,
+                raw_unit_refs: vec![evidence.clone()],
+            });
+        }
+        if !result.text.is_empty() {
+            let turn_idx = self.turns.len() as u64;
+            self.push_model_turn(
+                TurnRole::Tool,
+                TurnKind::ToolResult,
+                timestamp,
+                result.text.clone(),
+                evidence.clone(),
+            );
+            self.tools.push(ToolEvent {
+                kind: ToolEventKind::Result,
+                turn_idx,
+                tool_name,
+                correlation_id,
+                payload_hash: result.hash,
+                payload_bytes: result.text.len() as u64,
+                raw_unit_refs: vec![evidence],
+            });
+        }
+    }
+
+    fn push_model_turn(
         &mut self,
         role: TurnRole,
         kind: TurnKind,
@@ -535,6 +636,7 @@ impl<'a> Assembly<'a> {
             SkippedReason::Oversized => WarningKind::OversizedUnit,
             SkippedReason::EncryptedOpaque => WarningKind::OpaqueReasoning,
             SkippedReason::Unsupported => WarningKind::UnsupportedVisibleEvent,
+            SkippedReason::CompactionReplay | SkippedReason::DuplicateBody => return,
         };
         self.warn(warning, unit.ordinal);
         if visible
@@ -659,6 +761,7 @@ struct LogicalBlock {
     key: BlockKey,
     flavor: BlockFlavor,
     text: String,
+    result: String,
     tool_name: String,
     correlation_id: Option<String>,
     timestamp: Option<String>,
@@ -766,6 +869,21 @@ fn logical_block(value: &Value, event_kind: &str) -> Option<LogicalBlock> {
     } else {
         text
     };
+    let result = match flavor {
+        BlockFlavor::ToolCall => first_text(
+            value,
+            &[
+                &["output"],
+                &["result"],
+                &["presentableOutput"],
+                &["data", "output"],
+                &["data", "result"],
+                &["data", "presentableOutput"],
+            ],
+        ),
+        BlockFlavor::ToolResult => text.clone(),
+        BlockFlavor::Text | BlockFlavor::Reasoning => String::new(),
+    };
     let tool_name = first_present(
         value,
         &[
@@ -796,6 +914,7 @@ fn logical_block(value: &Value, event_kind: &str) -> Option<LogicalBlock> {
         },
         flavor,
         text,
+        result,
         tool_name,
         correlation_id: first_present(
             value,

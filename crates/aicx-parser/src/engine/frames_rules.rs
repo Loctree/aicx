@@ -167,6 +167,7 @@ pub const AGENT_FRAME_RULES: &[AgentFrameRules] = &[
         inject_tags: GROK_INJECT_TAGS,
     },
     // # grok
+    // # junie — no transport idioms
     AgentFrameRules {
         agent: AgentKind::Junie,
         echo_promotion: false,
