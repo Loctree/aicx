@@ -54,13 +54,25 @@ impl ValidatedSession {
         &self.model
     }
 
-    /// The (store id, source content hash) pair this session stands for.
-    /// Infallible: `validate_model` already checked both halves.
+    /// The (store id, source content hash) pair this session stands for —
+    /// the identity of the **snapshot** read. Infallible: `validate_model`
+    /// already checked both halves. For "which conversation" use
+    /// [`ValidatedSession::conversation`].
     pub fn identity(&self) -> PackageIdentity {
         PackageIdentity {
             store_id: self.model.session_id.clone(),
             content_hash: self.model.provenance.original_source_hash.clone(),
         }
+    }
+
+    /// Provider-tagged conversation identity (W2-R1).
+    pub fn conversation(&self) -> &super::model::ProviderConversationRef {
+        &self.model.conversation
+    }
+
+    /// Bytes-level snapshot identity (W2-R1).
+    pub fn snapshot(&self) -> &super::model::SourceSnapshotRef {
+        &self.model.snapshot
     }
 
     pub fn into_model(self) -> SessionModel {

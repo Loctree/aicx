@@ -5,6 +5,13 @@
 //! hash pins which bytes the handle stood for. Frame identity (A2) is the
 //! content hash of the body — transport ids such as codex `msg_*` rotate
 //! after compaction while the body stays identical.
+//!
+//! W2-R1: [`PackageIdentity`] is the identity of a **snapshot** (which
+//! bytes), not of a conversation. Two files can share a 12-record prefix
+//! with identical UUIDs (Claude fork) and have different hashes; one file
+//! changes its hash every time a turn is appended, without any fork.
+//! Conversation identity lives in `model::ProviderConversationRef`; the
+//! bytes-level view of the same snapshot is `model::SourceSnapshotRef`.
 
 use super::source::AgentKind;
 use serde::{Deserialize, Serialize};
@@ -15,8 +22,10 @@ pub const EVIDENCE_ID_VERSION: &str = "ev1";
 /// Identity of one parsed package: which store entry, and which exact bytes.
 ///
 /// Equality is on both halves. Two packages with the same `store_id` and a
-/// different `content_hash` are different packages (fork / rewrite); the
-/// same hash under two store ids is the same source stored twice.
+/// different `content_hash` are different **snapshots** (appended turn,
+/// rewrite, fork copy); the same hash under two store ids is the same bytes
+/// stored twice. Neither half says "same conversation" — that is the
+/// provider-tagged `ProviderConversationRef` on the model.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct PackageIdentity {
     /// Store-side handle (`source_id` / session id as the store keys it).
@@ -50,7 +59,8 @@ impl PackageIdentity {
         format!("{}@{prefix}", self.store_id)
     }
 
-    /// Same bytes, regardless of which store id they sit under.
+    /// Same bytes, regardless of which store id they sit under. Not "same
+    /// conversation": a fork prefix and an appended turn both break this.
     pub fn same_content(&self, other: &Self) -> bool {
         self.content_hash == other.content_hash
     }

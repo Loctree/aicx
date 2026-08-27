@@ -218,6 +218,17 @@ pub enum RefusalReason {
         consumed_total: u64,
         skipped_total: u64,
     },
+    /// The span is a `ScopeStatus::MixedCandidate` (several cwds and/or
+    /// branches) and the caller asked for one distilled history
+    /// (`continuity`). Refused by default instead of braiding workstreams
+    /// into one narrative; the caller may pass `distill_mixed` explicitly.
+    MixedWorkstream {
+        agent: AgentKind,
+        session_id: String,
+        cwds: Vec<String>,
+        branches: Vec<String>,
+        evidence: RefusalEvidence,
+    },
 }
 
 impl RefusalReason {
@@ -233,6 +244,7 @@ impl RefusalReason {
             Self::DetectionAmbiguous { .. } => "detection_ambiguous",
             Self::Substitution(_) => "substitution",
             Self::LedgerNotTotal { .. } => "ledger_not_total",
+            Self::MixedWorkstream { .. } => "mixed_workstream",
         }
     }
 
@@ -243,7 +255,8 @@ impl RefusalReason {
             | Self::NoHumanUtterance { evidence, .. }
             | Self::HumanRecordsDropped { evidence, .. }
             | Self::OnlyReplayedContent { evidence, .. }
-            | Self::ProjectionFilteredAll { evidence, .. } => Some(evidence),
+            | Self::ProjectionFilteredAll { evidence, .. }
+            | Self::MixedWorkstream { evidence, .. } => Some(evidence),
             Self::DetectionBelowThreshold { .. }
             | Self::DetectionAmbiguous { .. }
             | Self::Substitution(_)
@@ -367,6 +380,19 @@ impl fmt::Display for RefusalReason {
                     .join(","),
             ),
             Self::Substitution(error) => write!(formatter, "refused: {error}"),
+            Self::MixedWorkstream {
+                agent,
+                session_id,
+                cwds,
+                branches,
+                ..
+            } => write!(
+                formatter,
+                "refused: {} session {session_id} is a mixed-workstream candidate ({} cwd(s), {} branch(es)); one distilled history would braid them — pass distill_mixed to override",
+                agent.as_str(),
+                cwds.len(),
+                branches.len(),
+            ),
             Self::LedgerNotTotal {
                 agent,
                 session_id,

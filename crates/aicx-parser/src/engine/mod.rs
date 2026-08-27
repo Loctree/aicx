@@ -29,8 +29,9 @@ pub use identity::{
     evidence_event_id_from_hash, ordinal_locator, sha256_hex,
 };
 pub use model::{
-    CounterSemantics, Known, Provenance, RawUnitRef, ReportedCost, SESSION_MODEL_SCHEMA, Segment,
-    SessionModel, SkillInvocation, TokenComponents, ToolEvent, ToolEventKind, Turn, TurnKind,
+    ContextEpochRef, CounterSemantics, EntryOrigin, Known, Provenance, ProviderConversationRef,
+    RawUnitRef, ReportedCost, SESSION_MODEL_SCHEMA, ScopeStatus, Segment, SessionModel,
+    SkillInvocation, SourceSnapshotRef, TokenComponents, ToolEvent, ToolEventKind, Turn, TurnKind,
     TurnRange, TurnRole, UnknownValue, UsageEvent, UsageSpan,
 };
 pub use reader::{
