@@ -25,13 +25,28 @@
 //! - Donor does not model usage; `message.usage` becomes typed `UsageEvent`s
 //!   with delta semantics per the C0A §4 normative extension.
 //! - Donor drops `queue-operation` bodies; the kernel keeps the record's
-//!   `metadata_record` consumption AND projects `enqueue` text as a `user`
-//!   turn. Operator messages typed while a turn is running exist in the JSONL
-//!   only as that record — they never become a `type:"user"` row unless the
-//!   harness delivers them after the turn ends — so dropping the body is a
-//!   silent loss of literal operator input.
+//!   `metadata_record` consumption AND hands `enqueue` text to the throne as a
+//!   `queue_operation` frame (classified `EchoSeal{channel: Queue}`, sealed
+//!   with the enqueue timestamp). Operator messages typed while a turn is
+//!   running exist in the JSONL only as that record — they never become a
+//!   `type:"user"` row unless the harness delivers them after the turn ends —
+//!   so dropping the body is a silent loss of literal operator input.
+//!
+//! Throne contract (W2-T8): this adapter never decides what is human speech.
+//! Every conversational payload (user/assistant/system text, queued text,
+//! harness injections) is normalized into an `engine::frames::TransportFrame`
+//! and classified by `engine::frames::classify`; the resulting `turn_kind`
+//! and seal are what `push_turn` records. Transport idioms (which tags are
+//! injections) live as data in `engine::frames_rules` under `# claude`.
+//! Tool-use / tool-result / thinking blocks are not speech and stay on the
+//! direct tool lane: the taxonomy names no split call/result pair
+//! (`ShellAction` maps to a single `ToolCall` lane) — reported as BOUNDARY.
 
 use super::{AdapterError, AgentAdapter, ClassifiedDisposition, ClassifiedUnit, RawUnitLevel};
+use crate::engine::frames::{
+    self, FrameClass, TransportFrame, TransportKind, TransportPayload, TransportRole,
+};
+use crate::engine::frames_rules::rules_for;
 use crate::engine::{
     AgentKind, BoundaryFlags, ConsumedUnit, CounterSemantics, CoverageReport, CoverageWarning,
     Known, ParseStatus, Provenance, RawUnit, RawUnitRef, ReportedCost, Segment, SessionModel,
@@ -80,9 +95,6 @@ const QUEUE_OPERATION_TYPE: &str = "queue-operation";
 /// Queue operation carrying the operator's literal text. `remove`, `dequeue`
 /// and `popAll` are bookkeeping over text that was already enqueued.
 const QUEUE_ENQUEUE_OPERATION: &str = "enqueue";
-
-/// Queued harness notifications are machine chatter, never operator input.
-const TASK_NOTIFICATION_HEAD: &str = "<task-notification";
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ClaudeAdapter;
@@ -689,6 +701,119 @@ fn walk_content_block(
 // Turn / segment / skill assembly
 // ---------------------------------------------------------------------------
 
+/// Transport role of a Claude row/block, as written by the harness.
+fn transport_role(role: &str) -> TransportRole {
+    match role {
+        "user" => TransportRole::User,
+        "system" => TransportRole::System,
+        _ => TransportRole::Assistant,
+    }
+}
+
+/// Recognize a harness injection at the head of an operator-lane payload.
+///
+/// Pure transport-shape recognition: the tag list is data owned by
+/// `engine::frames_rules` (`# claude` block); what an injection *means* is
+/// the throne's decision. A payload is an injection only when it opens with
+/// `<tag>` or `<tag ` — a mention later in prose is content.
+fn inject_tag(text: &str) -> Option<&'static str> {
+    rules_for(AgentKind::Claude)
+        .inject_tags
+        .iter()
+        .map(|rule| rule.tag)
+        .find(|tag| {
+            text.strip_prefix('<')
+                .and_then(|rest| rest.strip_prefix(tag))
+                .is_some_and(|rest| rest.starts_with('>') || rest.starts_with(char::is_whitespace))
+        })
+}
+
+/// Build the transport frame for one text payload. `None` means no frame:
+/// an empty payload is not an event on any lane.
+fn text_frame(
+    transport_kind: TransportKind,
+    role: &str,
+    text: &str,
+    timestamp: &Known<String>,
+    evidence: &RawUnitRef,
+) -> Option<TransportFrame> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let role = transport_role(role);
+    let payload = match (role, inject_tag(trimmed)) {
+        (TransportRole::User, Some(tag)) => TransportPayload::Inject {
+            tag: tag.to_owned(),
+            content: trimmed.to_owned(),
+        },
+        _ => TransportPayload::Text {
+            role,
+            content: trimmed.to_owned(),
+        },
+    };
+    Some(TransportFrame {
+        agent: AgentKind::Claude,
+        transport_kind,
+        timestamp: timestamp.clone(),
+        payload,
+        evidence: evidence.clone(),
+    })
+}
+
+/// Turn role implied by the throne's class. Mechanical projection of
+/// `FrameClass`; the class itself is never chosen here.
+const fn turn_role_of(class: &FrameClass) -> TurnRole {
+    match class {
+        FrameClass::Human { .. } | FrameClass::EchoSeal { .. } => TurnRole::User,
+        FrameClass::AssistantFinal => TurnRole::Assistant,
+        FrameClass::ShellAction { .. } => TurnRole::Tool,
+        FrameClass::Inject { .. }
+        | FrameClass::LineageMeta { .. }
+        | FrameClass::InterAgent { .. } => TurnRole::System,
+    }
+}
+
+/// The only path from a conversational payload to `push_turn`.
+///
+/// The throne classifies; this records what it said: lane (`turn_kind`),
+/// role, sealed timestamp and content. A class without a turn lane
+/// (`InterAgent`, by design) records no turn — this transport never emits
+/// one, but the accounting stays honest rather than inventing a lane.
+fn emit_frame(
+    frame: &TransportFrame,
+    refs: Vec<RawUnitRef>,
+    analysis: &mut Analysis,
+) -> Option<u64> {
+    let classified = frames::classify(frame);
+    let kind = classified.turn_kind?;
+    let role = turn_role_of(&classified.class);
+    let turn_idx = push_turn(
+        role,
+        kind,
+        &classified.content,
+        &classified.seal.seal_ts,
+        Known::unknown(),
+        refs,
+        analysis,
+    );
+    if matches!(
+        classified.class,
+        FrameClass::Human { .. } | FrameClass::EchoSeal { .. }
+    ) && let Some(skill_name) = detect_skill_marker(&classified.content)
+    {
+        analysis.skill_invocations.push(SkillInvocation {
+            turn_idx,
+            skill_name,
+            payload_hash: sha256_hex(classified.content.as_bytes()),
+            payload_bytes: classified.content.len() as u64,
+            first_invoked_at: classified.seal.seal_ts.clone(),
+        });
+    }
+    Some(turn_idx)
+}
+
+/// Normalize one direct-message text payload and hand it to the throne.
 fn emit_text_turn(
     role: &str,
     text: &str,
@@ -696,45 +821,36 @@ fn emit_text_turn(
     refs: Vec<RawUnitRef>,
     analysis: &mut Analysis,
 ) {
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return;
-    }
-    let (turn_role, kind) = match role {
-        "user" => (TurnRole::User, TurnKind::UserMsg),
-        "system" => (TurnRole::System, TurnKind::SystemNote),
-        _ => (TurnRole::Assistant, TurnKind::AgentReply),
-    };
-    let turn_idx = push_turn(
-        turn_role,
-        kind,
-        trimmed,
+    let evidence = refs
+        .first()
+        .expect("a text payload always carries its physical evidence");
+    if let Some(frame) = text_frame(
+        TransportKind::DirectMessage,
+        role,
+        text,
         timestamp,
-        Known::unknown(),
-        refs,
-        analysis,
-    );
-    if turn_role == TurnRole::User
-        && let Some(skill_name) = detect_skill_marker(trimmed)
-    {
-        analysis.skill_invocations.push(SkillInvocation {
-            turn_idx,
-            skill_name,
-            payload_hash: sha256_hex(trimmed.as_bytes()),
-            payload_bytes: trimmed.len() as u64,
-            first_invoked_at: timestamp.clone(),
-        });
+        evidence,
+    ) {
+        emit_frame(&frame, refs, analysis);
     }
 }
 
-/// Project the operator text carried by a `queue-operation` enqueue as a
-/// `user` turn.
+/// Hand the operator text carried by a `queue-operation` enqueue to the
+/// throne as a `queue_operation` frame.
 ///
 /// The record itself stays consumed as `metadata_record` (frozen taxonomy);
 /// this only recovers its body. A message submitted while a turn is running
 /// lives in the JSONL nowhere else — the harness writes a `type:"user"` row
-/// only for what it delivers between turns — so without this projection the
+/// only for what it delivers between turns — so without this frame the
 /// literal operator input is lost for every downstream consumer.
+///
+/// Fixture `human_shape_67025fed` (26 enqueue / 6 dequeue / 20 remove):
+/// `dequeue` carries no text and follows its enqueue by milliseconds
+/// (immediate delivery on an idle harness); `remove` repeats the text and
+/// arrives in batches sharing one timestamp seconds later (batch delivery at
+/// turn end). Both are consumption bookkeeping over text already enqueued —
+/// neither is a cancellation, neither is a new utterance. Only `enqueue`
+/// becomes a frame; the throne seals it with the enqueue timestamp.
 fn emit_queued_user_turn(
     raw: &RawUnit,
     object: &serde_json::Map<String, Value>,
@@ -750,17 +866,24 @@ fn emit_queued_user_turn(
     else {
         return Ok(());
     };
-    let trimmed = text.trim();
-    if trimmed.is_empty() || trimmed.starts_with(TASK_NOTIFICATION_HEAD) {
-        return Ok(());
-    }
     // Same locator + kind + content hash as the record's own consumption, so
     // the reference resolves to evidence the coverage report already carries.
     let evidence = physical_evidence(raw, "metadata_record", ctx)?;
-    let next_turn = analysis.turns.len() as u64;
-    emit_text_turn("user", trimmed, timestamp, vec![evidence], analysis);
-    if analysis.turns.len() as u64 > next_turn {
-        analysis.queue_turns.push(next_turn);
+    let Some(frame) = text_frame(
+        TransportKind::QueueOperation,
+        "user",
+        text,
+        timestamp,
+        &evidence,
+    ) else {
+        return Ok(());
+    };
+    if let Some(turn_idx) = emit_frame(&frame, vec![evidence], analysis)
+        && analysis.turns[turn_idx as usize].kind == TurnKind::UserMsg
+    {
+        // Only operator speech joins the mid-turn dedupe; a queued harness
+        // injection is a system note and never doubles a delivered row.
+        analysis.queue_turns.push(turn_idx);
     }
     Ok(())
 }

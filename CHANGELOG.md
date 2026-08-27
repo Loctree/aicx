@@ -20,6 +20,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Claude adapter on the throne (structure only, compile embargo W2, cut
+  `W2-T8-claude-on-throne`): every conversational payload (user/assistant
+  text, `queue-operation` enqueue bodies, harness injections) becomes an
+  `engine::frames::TransportFrame` classified by `engine::frames::classify`;
+  the adapter's own role→kind decision is removed. Queued text is
+  `EchoSeal{channel: Queue}` sealed with the enqueue timestamp; `dequeue` /
+  `remove` verified on fixture `human_shape_67025fed` as consumption
+  bookkeeping (no lane). `<task-notification>` / `<system-reminder>` at the
+  head of an operator-lane payload are `Inject` (system note, fully
+  retained) instead of being dropped — rule rows in `frames_rules.rs`
+  `# claude` block
 - `validate_model` refuses `turns = []` with
   `ValidationError { refusal: Some(RefusalReason::EmptyConversation) }`
   instead of validating an empty session (grok `019fdeca`)
