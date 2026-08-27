@@ -103,7 +103,12 @@ if errors:
 
 # A valid marker for another branch is deliberately inactive, not corrupt.
 # That preserves ordinary hooks on every branch not explicitly named.
-if declared_branch != current_branch or attestation != "open":
+# Fleet Worktrees (Living Tree Rule, Mode B) put every worker of the declared
+# plan on a `cut/<cut-id>` branch that forks from the declared branch, so those
+# branches are inside the embargo too: the marker file they carry IS the
+# declared branch's marker. Any other branch stays ordinary.
+in_scope = current_branch == declared_branch or current_branch.startswith("cut/")
+if not in_scope or attestation != "open":
     raise SystemExit(10)
 
 if command == "recovery-ref":
