@@ -1,9 +1,95 @@
 //! Deterministic content and evidence identity.
+//!
+//! Package identity (W1-T5) is the pair (store id, content hash of the
+//! source). A store id alone is a handle the resolver may substitute; the
+//! hash pins which bytes the handle stood for. Frame identity (A2) is the
+//! content hash of the body — transport ids such as codex `msg_*` rotate
+//! after compaction while the body stays identical.
 
 use super::source::AgentKind;
+use serde::{Deserialize, Serialize};
 use std::fmt;
 
 pub const EVIDENCE_ID_VERSION: &str = "ev1";
+
+/// Identity of one parsed package: which store entry, and which exact bytes.
+///
+/// Equality is on both halves. Two packages with the same `store_id` and a
+/// different `content_hash` are different packages (fork / rewrite); the
+/// same hash under two store ids is the same source stored twice.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct PackageIdentity {
+    /// Store-side handle (`source_id` / session id as the store keys it).
+    pub store_id: String,
+    /// SHA-256 of the original source material (`Provenance::original_source_hash`).
+    pub content_hash: String,
+}
+
+impl PackageIdentity {
+    pub fn new(
+        store_id: impl Into<String>,
+        content_hash: impl Into<String>,
+    ) -> Result<Self, EvidenceIdError> {
+        let store_id = store_id.into();
+        let content_hash = content_hash.into();
+        validate_token("store_id", &store_id)?;
+        validate_hash(&content_hash)?;
+        Ok(Self {
+            store_id,
+            content_hash,
+        })
+    }
+
+    /// Short, stable rendering `<store_id>@<hash[..16]>` for reports.
+    ///
+    /// Fields are public, so an identity may exist without passing through
+    /// [`PackageIdentity::new`]; a hash shorter than 16 bytes is rendered
+    /// whole instead of panicking on the slice.
+    pub fn short(&self) -> String {
+        let prefix = self.content_hash.get(..16).unwrap_or(&self.content_hash);
+        format!("{}@{prefix}", self.store_id)
+    }
+
+    /// Same bytes, regardless of which store id they sit under.
+    pub fn same_content(&self, other: &Self) -> bool {
+        self.content_hash == other.content_hash
+    }
+}
+
+impl fmt::Display for PackageIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}@{}", self.store_id, self.content_hash)
+    }
+}
+
+/// Identity of one transport frame inside a package: body hash first,
+/// transport id only as an annotation.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct FrameIdentity {
+    /// The package the frame belongs to.
+    pub package: PackageIdentity,
+    /// SHA-256 of the frame body bytes. This is the identity.
+    pub body_hash: String,
+    /// Transport-level id (`msg_*`, `uuid`, …) if the transport had one.
+    /// Informational: never used for equality or dedup (A2).
+    pub transport_id: Option<String>,
+}
+
+impl FrameIdentity {
+    pub fn from_body(package: PackageIdentity, body: &[u8], transport_id: Option<String>) -> Self {
+        Self {
+            package,
+            body_hash: sha256_hex(body),
+            transport_id,
+        }
+    }
+
+    /// Two frames are the same utterance when package and body hash match,
+    /// whatever their transport ids say.
+    pub fn same_utterance(&self, other: &Self) -> bool {
+        self.package == other.package && self.body_hash == other.body_hash
+    }
+}
 
 pub fn evidence_event_id(
     agent: AgentKind,
@@ -31,9 +117,7 @@ pub fn evidence_event_id_from_hash(
     validate_token("session_id", session_id)?;
     validate_token("locator", locator)?;
     validate_token("unit_kind", unit_kind)?;
-    if content_hash.len() != 64 || !content_hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err(EvidenceIdError::InvalidHash);
-    }
+    validate_hash(content_hash)?;
     Ok(format!(
         "{EVIDENCE_ID_VERSION}:{}:{session_id}:{locator}:{unit_kind}:{}",
         agent.as_str(),
@@ -43,6 +127,13 @@ pub fn evidence_event_id_from_hash(
 
 pub fn ordinal_locator(ordinal: u64) -> String {
     format!("{ordinal:06}")
+}
+
+fn validate_hash(content_hash: &str) -> Result<(), EvidenceIdError> {
+    if content_hash.len() != 64 || !content_hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(EvidenceIdError::InvalidHash);
+    }
+    Ok(())
 }
 
 fn validate_token(label: &'static str, token: &str) -> Result<(), EvidenceIdError> {
@@ -168,7 +259,28 @@ fn sha256(input: &[u8]) -> [u8; 32] {
 
 #[cfg(test)]
 mod tests {
-    use super::sha256_hex;
+    use super::{FrameIdentity, PackageIdentity, sha256_hex};
+
+    #[test]
+    fn package_identity_is_the_pair() {
+        let empty = sha256_hex(b"");
+        let abc = sha256_hex(b"abc");
+        let a = PackageIdentity::new("store", empty.clone()).unwrap();
+        let b = PackageIdentity::new("store", abc).unwrap();
+        let c = PackageIdentity::new("other", empty).unwrap();
+        assert_ne!(a, b, "same store id, different bytes: different package");
+        assert_ne!(a, c, "same bytes, different store id: different handle");
+        assert!(a.same_content(&c));
+        assert_eq!(a.short(), "store@e3b0c44298fc1c14");
+    }
+
+    #[test]
+    fn frame_identity_ignores_rotated_transport_ids() {
+        let package = PackageIdentity::new("store", sha256_hex(b"src")).unwrap();
+        let first = FrameIdentity::from_body(package.clone(), b"body", Some("msg_1".into()));
+        let second = FrameIdentity::from_body(package, b"body", Some("msg_2".into()));
+        assert!(first.same_utterance(&second));
+    }
 
     #[test]
     fn sha256_known_vectors() {
