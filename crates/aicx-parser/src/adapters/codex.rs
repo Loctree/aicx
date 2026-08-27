@@ -21,7 +21,7 @@ use crate::engine::{
 use serde_json::Value;
 use std::collections::BTreeMap;
 
-pub const CODEX_ADAPTER_VERSION: &str = "codex-rollout-v2";
+pub const CODEX_ADAPTER_VERSION: &str = "codex-rollout-v3";
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CodexAdapter;
@@ -767,14 +767,16 @@ impl<'a> Assembly<'a> {
     ///
     /// A plain human message passes through byte-identical to the legacy
     /// path. A body carrying reserved Codex control envelopes (see
-    /// [`match_envelope_open`]) is split: whole-envelope
-    /// `<user_shell_command>` blocks become `Tool`/`ToolResult` turns with a
-    /// registered [`ToolEvent`], control envelopes (`codex_internal_context`,
-    /// `INSTRUCTIONS`, …) become `System`/`SystemNote` turns, and any genuine
-    /// human prose around them survives as `UserMsg` turns in order. The
-    /// conversation projection filters on frame kind, so reclassified
-    /// envelopes vanish from `--conversation` while full extraction retains
-    /// them as correctly-typed turns.
+    /// [`match_envelope_open`]) is split: a plain `echo` envelope is an
+    /// operator utterance sealed at the envelope timestamp (`UserMsg`);
+    /// every other `<user_shell_command>` block becomes a `ToolCall` marker
+    /// (`$ cmd`) followed by a `ToolResult` holding the whole envelope
+    /// verbatim, each with a registered [`ToolEvent`]; control envelopes
+    /// (`codex_internal_context`, `INSTRUCTIONS`, …) become
+    /// `System`/`SystemNote` turns, and any genuine human prose around them
+    /// survives as `UserMsg` turns in order. The substrate keeps the full
+    /// result; projections filter on frame kind, so reclassified envelopes
+    /// vanish from `--conversation` while full extraction retains them.
     fn push_user_message_classified(
         &mut self,
         text: String,
@@ -810,7 +812,39 @@ impl<'a> Assembly<'a> {
                         evidence.clone(),
                     )?;
                 }
-                UserSegment::ToolEnvelope { tag, body } => {
+                UserSegment::EchoSeal(text) => {
+                    self.push_turn(
+                        TurnRole::User,
+                        TurnKind::UserMsg,
+                        text,
+                        timestamp.clone(),
+                        Known::unknown(),
+                        evidence.clone(),
+                    )?;
+                }
+                UserSegment::ShellAction { tag, command, body } => {
+                    // Substrate keeps the whole result; projections decide
+                    // what to show. The marker is the timeline anchor, the
+                    // verbatim envelope is the retained evidence.
+                    let marker = shell_action_marker(&command);
+                    self.push_turn(
+                        TurnRole::Tool,
+                        TurnKind::ToolCall,
+                        marker.clone(),
+                        timestamp.clone(),
+                        Known::value(tag.to_owned()),
+                        evidence.clone(),
+                    )?;
+                    let call_idx = self.turns.len() as u64 - 1;
+                    self.tools.push(ToolEvent {
+                        kind: ToolEventKind::Call,
+                        turn_idx: call_idx,
+                        tool_name: tag.to_owned(),
+                        correlation_id: Known::unknown(),
+                        payload_hash: sha256_hex(marker.as_bytes()),
+                        payload_bytes: marker.len() as u64,
+                        raw_unit_refs: vec![evidence.clone()],
+                    });
                     self.push_turn(
                         TurnRole::Tool,
                         TurnKind::ToolResult,
@@ -819,10 +853,10 @@ impl<'a> Assembly<'a> {
                         Known::value(tag.to_owned()),
                         evidence.clone(),
                     )?;
-                    let turn_idx = self.turns.len() as u64 - 1;
+                    let result_idx = self.turns.len() as u64 - 1;
                     self.tools.push(ToolEvent {
                         kind: ToolEventKind::Result,
-                        turn_idx,
+                        turn_idx: result_idx,
                         tool_name: tag.to_owned(),
                         correlation_id: Known::unknown(),
                         payload_hash: sha256_hex(body.as_bytes()),
@@ -1257,9 +1291,9 @@ fn agent_message_text(payload: &Value) -> String {
 }
 
 /// Reserved Codex envelopes that arrive inside `role=user` message bodies
-/// after the 2026-08 schema change. Tool envelopes carry user-run shell
-/// actions (command + result payload); control envelopes carry injected
-/// context or instructions. Neither is human dialogue.
+/// after the 2026-08 schema change. A plain `echo` command is an operator
+/// utterance sealed at the envelope timestamp. Other shell envelopes are tool
+/// actions, while control envelopes carry injected context or instructions.
 const USER_TOOL_ENVELOPE_TAGS: [&str; 1] = ["user_shell_command"];
 const USER_CONTROL_ENVELOPE_TAGS: [&str; 5] = [
     "codex_internal_context",
@@ -1274,11 +1308,82 @@ const USER_CONTROL_ENVELOPE_TAGS: [&str; 5] = [
 enum UserSegment {
     /// Genuine human prose (possibly all of the message).
     Prose(String),
-    /// A whole `<user_shell_command>…</user_shell_command>` block, tags
-    /// included, preserved verbatim for full-extraction fidelity.
-    ToolEnvelope { tag: &'static str, body: String },
+    /// Operator prose deliberately sent through a plain `echo` command.
+    EchoSeal(String),
+    /// A user-run command: `command` feeds the `$ cmd` timeline marker,
+    /// `body` is the whole envelope (tags included) retained verbatim as the
+    /// tool result. The canonical model keeps the output; projections
+    /// decide what to show.
+    ShellAction {
+        tag: &'static str,
+        command: String,
+        body: String,
+    },
     /// A whole control/instruction envelope, tags included.
     ControlEnvelope { tag: &'static str, body: String },
+}
+
+/// Extract the command payload from a Codex `user_shell_command` envelope.
+///
+/// This parser is deliberately narrower than a shell parser: the Codex
+/// envelope is the grammar boundary, and only a complete `<command>` element
+/// is admitted. Malformed envelopes fail closed to a placeholder marker; the
+/// envelope body itself is still retained as the tool result.
+fn user_shell_command(body: &str) -> Option<&str> {
+    let command = body.split_once("<command>")?.1;
+    let command = command.split_once("</command>")?.0.trim();
+    (!command.is_empty()).then_some(command)
+}
+
+/// Recognize the operator's timestamped echo channel.
+///
+/// The tee/append guard intentionally runs before quote removal. The frozen
+/// session used this shape to discuss a tee command inside an echo payload;
+/// treating it as a shell action is the conservative, golden-compatible cut.
+fn echo_seal_text(command: &str) -> Option<String> {
+    let command = command.trim();
+    let payload = command.strip_prefix("echo")?;
+    if !payload.chars().next().is_some_and(char::is_whitespace)
+        || command.contains("| tee")
+        || command.contains(">>")
+    {
+        return None;
+    }
+    let payload = payload.trim();
+    if payload.is_empty() {
+        return None;
+    }
+    let unquoted = if payload.len() >= 2
+        && ((payload.starts_with('\'') && payload.ends_with('\''))
+            || (payload.starts_with('"') && payload.ends_with('"')))
+    {
+        &payload[1..payload.len() - 1]
+    } else {
+        payload
+    };
+    Some(unquoted.to_owned())
+}
+
+fn classify_user_shell_envelope(tag: &'static str, body: String) -> UserSegment {
+    let command = user_shell_command(&body).unwrap_or("user_shell_command (malformed)");
+    match echo_seal_text(command) {
+        Some(text) => UserSegment::EchoSeal(text),
+        None => UserSegment::ShellAction {
+            tag,
+            command: command.to_owned(),
+            body,
+        },
+    }
+}
+
+fn shell_action_marker(command: &str) -> String {
+    let first_line = command
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .map(str::trim)
+        .unwrap_or("user_shell_command (malformed)");
+    let continuation = command.lines().skip(1).any(|line| !line.trim().is_empty());
+    format!("$ {first_line}{}", if continuation { " …" } else { "" })
 }
 
 /// Typed, whole-envelope opening-tag matcher.
@@ -1344,7 +1449,7 @@ fn split_user_envelope_segments(text: &str) -> Vec<UserSegment> {
         body: String,
     ) {
         segments.push(if is_tool {
-            UserSegment::ToolEnvelope { tag, body }
+            classify_user_shell_envelope(tag, body)
         } else {
             UserSegment::ControlEnvelope { tag, body }
         });

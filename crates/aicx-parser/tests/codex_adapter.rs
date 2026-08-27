@@ -509,9 +509,10 @@ fn codex_compaction_markers_consumed_without_unsupported_or_visible_loss() {
 
 // ---------------------------------------------------------------------------
 // 2026-08 schema change: user-run shell actions and control payloads arrive as
-// `role=user` input_text messages. The adapter must classify them as
-// tool/control turns — `--conversation` filters on frame kind downstream.
-// These tests are RED on codex-rollout-v1 and GREEN on codex-rollout-v2.
+// `role=user` input_text messages. The adapter must classify plain echo as a
+// timestamped human utterance, shell actions as a `$ cmd` ToolCall marker plus
+// a verbatim ToolResult (the substrate keeps the full result), and control
+// payloads as system turns. Projections filter on frame kind downstream.
 // ---------------------------------------------------------------------------
 
 fn dialogue_texts(model: &SessionModel) -> Vec<String> {
@@ -524,7 +525,7 @@ fn dialogue_texts(model: &SessionModel) -> Vec<String> {
 }
 
 #[test]
-fn codex_user_shell_envelope_is_tool_not_dialogue() {
+fn codex_shell_action_keeps_command_marker_and_retains_result() {
     let body = br#"{"timestamp":"2026-08-24T10:00:00Z","type":"session_meta","payload":{"id":"shell-envelope","cwd":"/repo"}}
 {"timestamp":"2026-08-24T10:00:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"sprawdz wersje aicx na dragonie"}]}}
 {"timestamp":"2026-08-24T10:00:02Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<user_shell_command>\n<command>\npsa loctree\n</command>\n<result>\nExit code: 0\nmaciejgad 40740 loctree-lsp --root /private/repo --stdio\n</result>\n</user_shell_command>"}]}}
@@ -548,40 +549,62 @@ fn codex_user_shell_envelope_is_tool_not_dialogue() {
         "no envelope markers may leak into dialogue frames"
     );
 
-    let tool_turns: Vec<_> = model
+    let calls: Vec<_> = model
+        .turns
+        .iter()
+        .filter(|turn| turn.kind == TurnKind::ToolCall)
+        .collect();
+    assert_eq!(calls.len(), 1, "shell action becomes one call marker");
+    assert_eq!(calls[0].role, TurnRole::Tool);
+    assert_eq!(
+        calls[0].tool_name,
+        Known::value("user_shell_command".to_owned())
+    );
+    assert_eq!(calls[0].text, "$ psa loctree");
+    assert!(!calls[0].text.contains("maciejgad 40740"));
+
+    let results: Vec<_> = model
         .turns
         .iter()
         .filter(|turn| turn.kind == TurnKind::ToolResult)
         .collect();
-    assert_eq!(tool_turns.len(), 1, "whole envelope becomes one tool turn");
-    assert_eq!(tool_turns[0].role, TurnRole::Tool);
+    assert_eq!(results.len(), 1, "the result is retained in the substrate");
+    assert_eq!(results[0].role, TurnRole::Tool);
     assert_eq!(
-        tool_turns[0].tool_name,
+        results[0].tool_name,
         Known::value("user_shell_command".to_owned())
     );
-    assert!(tool_turns[0].text.starts_with("<user_shell_command>"));
-    assert!(tool_turns[0].text.contains("psa loctree"));
+    assert!(results[0].text.starts_with("<user_shell_command>"));
+    assert!(results[0].text.contains("maciejgad 40740"));
     assert!(
-        tool_turns[0]
+        results[0]
             .text
             .trim_end()
             .ends_with("</user_shell_command>"),
-        "tool turn preserves the verbatim envelope for full extraction"
+        "result turn preserves the verbatim envelope for full extraction"
     );
-    assert!(
-        model
-            .tool_events
-            .iter()
-            .any(|event| event.tool_name == "user_shell_command"),
-        "reclassified envelope registers a ToolEvent"
+    let events: Vec<_> = model
+        .tool_events
+        .iter()
+        .filter(|event| event.tool_name == "user_shell_command")
+        .map(|event| event.kind)
+        .collect();
+    assert_eq!(
+        events,
+        vec![
+            aicx_parser::engine::ToolEventKind::Call,
+            aicx_parser::engine::ToolEventKind::Result
+        ],
+        "marker and result each register a tool event"
     );
 
-    // Order survives: user prose, tool envelope, assistant reply.
+    // Order survives: user prose, call marker, result, assistant reply.
     let kinds: Vec<TurnKind> = model.turns.iter().map(|turn| turn.kind).collect();
     assert_eq!(
         kinds,
         vec![
             TurnKind::UserMsg,
+            TurnKind::ToolCall,
             TurnKind::ToolResult,
             TurnKind::AgentReply
         ]
@@ -597,12 +620,18 @@ fn codex_mixed_prose_and_envelope_preserves_prose() {
     let kinds: Vec<TurnKind> = model.turns.iter().map(|turn| turn.kind).collect();
     assert_eq!(
         kinds,
-        vec![TurnKind::UserMsg, TurnKind::ToolResult, TurnKind::UserMsg],
+        vec![
+            TurnKind::UserMsg,
+            TurnKind::ToolCall,
+            TurnKind::ToolResult,
+            TurnKind::UserMsg
+        ],
         "prose survives on both sides of the stripped envelope"
     );
     assert_eq!(model.turns[0].text, "zobacz co wyszlo:");
-    assert_eq!(model.turns[2].text, "i powiedz co dalej");
-    assert!(model.turns[1].text.contains("plik.txt"));
+    assert_eq!(model.turns[3].text, "i powiedz co dalej");
+    assert_eq!(model.turns[1].text, "$ ls");
+    assert!(model.turns[2].text.contains("plik.txt"));
 }
 
 #[test]
@@ -653,7 +682,7 @@ fn codex_control_envelopes_become_system_notes() {
 }
 
 #[test]
-fn codex_huge_shell_result_fully_reclassified() {
+fn codex_huge_shell_result_is_retained() {
     let huge = "x".repeat(50_000);
     let text = format!(
         "<user_shell_command>\n<command>\ncat big\n</command>\n<result>\n{huge}\n</result>\n</user_shell_command>"
@@ -673,13 +702,25 @@ fn codex_huge_shell_result_fully_reclassified() {
         dialogue_texts(&model).is_empty(),
         "no dialogue frames at all"
     );
-    let tool_turns: Vec<_> = model
+    let calls: Vec<_> = model
+        .turns
+        .iter()
+        .filter(|turn| turn.kind == TurnKind::ToolCall)
+        .collect();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].text, "$ cat big");
+    assert!(calls[0].text_chars < 50);
+    let results: Vec<_> = model
         .turns
         .iter()
         .filter(|turn| turn.kind == TurnKind::ToolResult)
         .collect();
-    assert_eq!(tool_turns.len(), 1);
-    assert!(tool_turns[0].text_chars > 50_000);
+    assert_eq!(results.len(), 1);
+    assert!(
+        results[0].text_chars > 50_000,
+        "the substrate keeps the whole result; projections decide what to show"
+    );
+    assert!(results[0].text.contains(&huge));
 }
 
 #[test]
@@ -696,8 +737,124 @@ fn codex_unterminated_envelope_fails_closed() {
         model
             .turns
             .iter()
-            .filter(|turn| turn.kind == TurnKind::ToolResult)
+            .filter(|turn| turn.kind == TurnKind::ToolCall)
             .count(),
         1
+    );
+    assert_eq!(
+        model
+            .turns
+            .iter()
+            .filter(|turn| turn.kind == TurnKind::ToolResult)
+            .count(),
+        1,
+        "the unterminated body is retained as a tool result, never as dialogue"
+    );
+}
+
+#[test]
+fn codex_plain_echo_is_timestamped_human_dialogue() {
+    let body = r#"{"timestamp":"2026-08-25T04:37:54Z","type":"session_meta","payload":{"id":"echo-seal","cwd":"/repo"}}
+{"timestamp":"2026-08-25T04:37:55.745Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<user_shell_command>\n<command>\necho 'bo instrument miał być jeden'\n</command>\n<result>\nExit code: 0\nOutput:\nbo instrument miał być jeden\n</result>\n</user_shell_command>"}]}}
+"#;
+    let model = model("echo-seal", body.as_bytes());
+
+    assert_eq!(dialogue_texts(&model), vec!["bo instrument miał być jeden"]);
+    assert_eq!(model.turns[0].role, TurnRole::User);
+    assert_eq!(model.turns[0].kind, TurnKind::UserMsg);
+    assert_eq!(
+        model.turns[0].timestamp,
+        Known::value("2026-08-25T04:37:55.745Z".to_owned())
+    );
+    assert!(model.tool_events.is_empty());
+}
+
+#[test]
+fn codex_echo_with_tee_or_append_stays_shell_action() {
+    let body = br#"{"timestamp":"2026-08-25T19:30:00Z","type":"session_meta","payload":{"id":"echo-guards","cwd":"/repo"}}
+{"timestamp":"2026-08-25T19:30:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<user_shell_command>\n<command>\necho \"$(pbpaste)\" | tee /tmp/crash.log\n</command>\n<result>\nlarge tee output\n</result>\n</user_shell_command>"}]}}
+{"timestamp":"2026-08-25T19:30:02Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<user_shell_command>\n<command>\necho more >> /tmp/crash.log\n</command>\n<result>\n</result>\n</user_shell_command>"}]}}
+"#;
+    let model = model("echo-guards", body);
+
+    assert!(dialogue_texts(&model).is_empty());
+    let markers: Vec<_> = model
+        .turns
+        .iter()
+        .filter(|turn| turn.kind == TurnKind::ToolCall)
+        .map(|turn| turn.text.as_str())
+        .collect();
+    assert_eq!(
+        markers,
+        [
+            "$ echo \"$(pbpaste)\" | tee /tmp/crash.log",
+            "$ echo more >> /tmp/crash.log",
+        ]
+    );
+    let results: Vec<_> = model
+        .turns
+        .iter()
+        .filter(|turn| turn.kind == TurnKind::ToolResult)
+        .collect();
+    assert_eq!(results.len(), 2);
+    assert!(results[0].text.contains("large tee output"));
+    assert!(
+        model
+            .turns
+            .iter()
+            .all(|turn| matches!(turn.kind, TurnKind::ToolCall | TurnKind::ToolResult))
+    );
+}
+
+#[test]
+fn codex_frozen_human_shape_has_25_human_plus_9_echo_seals() {
+    let body = fixture("human_shape_01a0369f.jsonl");
+    let model = model("01a0369f-9313-7592-8303-3db46b6f8b47", &body);
+    let users: Vec<_> = model
+        .turns
+        .iter()
+        .filter(|turn| turn.kind == TurnKind::UserMsg)
+        .collect();
+
+    assert_eq!(users.len(), 34, "25 human + 9 echo-seal utterances");
+    let instrument = users
+        .iter()
+        .find(|turn| turn.text == "bo instrument miał być jeden")
+        .expect("04:37 echo-seal");
+    assert_eq!(
+        instrument.timestamp,
+        Known::value("2026-08-25T04:37:55.745Z".to_owned())
+    );
+    let canary = users
+        .iter()
+        .find(|turn| turn.text == "daj mi prompt canary zatem")
+        .expect("04:40 echo-seal");
+    assert_eq!(
+        canary.timestamp,
+        Known::value("2026-08-25T04:40:59.057Z".to_owned())
+    );
+    assert!(
+        model
+            .turns
+            .iter()
+            .any(|turn| turn.kind == TurnKind::ToolCall
+                && turn.text == "$ ~/.scripts/rust-target-cleaner.sh ~/vc-workspace"),
+        "the command is a timeline marker"
+    );
+    assert!(
+        model
+            .turns
+            .iter()
+            .any(|turn| turn.kind == TurnKind::ToolResult
+                && turn.text.contains("rust-target-cleaner output sentinel")),
+        "the result dump is retained in the substrate (Decision 6)"
+    );
+    assert!(
+        !model
+            .turns
+            .iter()
+            .filter(|turn| turn.kind == TurnKind::UserMsg)
+            .any(|turn| turn.text.contains("rust-target-cleaner output sentinel")),
+        "the result dump never enters the dialogue channel"
     );
 }
