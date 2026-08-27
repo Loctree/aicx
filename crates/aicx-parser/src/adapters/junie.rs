@@ -469,6 +469,7 @@ impl<'a> Assembly<'a> {
                     timestamp,
                     block.text,
                     unit.evidence.clone(),
+                    None,
                 );
             }
             BlockFlavor::ToolCall => {
@@ -518,13 +519,8 @@ impl<'a> Assembly<'a> {
             payload,
             evidence,
         });
-        let role = match classified.class {
-            FrameClass::Human { .. } | FrameClass::EchoSeal { .. } => TurnRole::User,
-            FrameClass::ShellAction { .. } => TurnRole::Tool,
-            FrameClass::Inject { .. } | FrameClass::LineageMeta { .. } => TurnRole::System,
-            FrameClass::AssistantFinal => TurnRole::Assistant,
-            FrameClass::InterAgent { .. } => return,
-        };
+        // Role and lane are the throne's (W2-R1); the class rides on the turn.
+        let role = classified.class.turn_role();
         let Some(kind) = classified.turn_kind else {
             return;
         };
@@ -534,6 +530,7 @@ impl<'a> Assembly<'a> {
             classified.seal.seal_ts,
             classified.content,
             classified.origin.evidence,
+            Some(classified.class),
         );
     }
 
@@ -568,6 +565,10 @@ impl<'a> Assembly<'a> {
                 timestamp.clone(),
                 cmd.clone(),
                 evidence.clone(),
+                Some(FrameClass::ShellAction {
+                    cmd: cmd.clone(),
+                    result: result.clone(),
+                }),
             );
             self.tools.push(ToolEvent {
                 kind: ToolEventKind::Call,
@@ -587,6 +588,7 @@ impl<'a> Assembly<'a> {
                 timestamp,
                 result.text.clone(),
                 evidence.clone(),
+                None,
             );
             self.tools.push(ToolEvent {
                 kind: ToolEventKind::Result,
@@ -607,6 +609,7 @@ impl<'a> Assembly<'a> {
         timestamp: Known<String>,
         text: String,
         evidence: RawUnitRef,
+        frame_class: Option<FrameClass>,
     ) {
         let text_hash = sha256_hex(text.as_bytes());
         self.turns.push(Turn {
@@ -620,6 +623,7 @@ impl<'a> Assembly<'a> {
             tool_name: Known::unknown(),
             segment_id: 0,
             raw_unit_refs: vec![evidence],
+            frame_class,
         });
     }
 
@@ -736,6 +740,16 @@ impl<'a> Assembly<'a> {
         if !model.turns.is_empty() {
             model.segments.push(Segment {
                 segment_id: 0,
+                scope_status: crate::engine::ScopeStatus::from_evidence(
+                    match &self.cwd {
+                        Known::Value(cwd) => Some(cwd.as_str()),
+                        Known::Unknown(_) => None,
+                    },
+                    match &self.branch {
+                        Known::Value(branch) => Some(branch.as_str()),
+                        Known::Unknown(_) => None,
+                    },
+                ),
                 cwd: self.cwd,
                 branch: self.branch,
                 started_at: self.segment_started_at,

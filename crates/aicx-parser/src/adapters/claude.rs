@@ -48,12 +48,12 @@ use crate::engine::frames::{
 };
 use crate::engine::frames_rules::rules_for;
 use crate::engine::{
-    AgentKind, BoundaryFlags, ConsumedUnit, CounterSemantics, CoverageReport, CoverageWarning,
-    Known, ParseStatus, Provenance, RawUnit, RawUnitRef, ReportedCost, Segment, SessionModel,
-    SkillInvocation, SkippedReason, SkippedUnit, SourceFraming, SourceHandle, SourceRead,
-    TokenComponents, ToolEvent, ToolEventKind, Turn, TurnKind, TurnRange, TurnRole, UnitBoundary,
-    UnvalidatedParse, UsageEvent, VisibleCompleteness, WarningKind, evidence_event_id_from_hash,
-    ordinal_locator, sha256_hex,
+    AgentKind, BoundaryFlags, ConsumedUnit, ContextEpochRef, CounterSemantics, CoverageReport,
+    CoverageWarning, Known, ParseStatus, Provenance, ProviderConversationRef, RawUnit, RawUnitRef,
+    ReportedCost, ScopeStatus, Segment, SessionModel, SkillInvocation, SkippedReason, SkippedUnit,
+    SourceFraming, SourceHandle, SourceRead, TokenComponents, ToolEvent, ToolEventKind, Turn,
+    TurnKind, TurnRange, TurnRole, UnitBoundary, UnvalidatedParse, UsageEvent, VisibleCompleteness,
+    WarningKind, evidence_event_id_from_hash, ordinal_locator, sha256_hex,
 };
 use crate::skill_collapse::detect_skill_marker;
 use serde_json::Value;
@@ -154,6 +154,14 @@ struct Analysis {
     skill_invocations: Vec<SkillInvocation>,
     segments: Vec<SegmentDraft>,
     session_id_seen: bool,
+    /// `sessionId` as the rows write it (provider identity, W2-R1). The
+    /// store id stays the resolver's; this is what the file says about
+    /// itself.
+    row_session_id: Option<String>,
+    /// `agentId` when the rows belong to a sub-agent lane.
+    row_agent_id: Option<String>,
+    /// Compaction boundaries (`isCompactSummary` rows), in order.
+    context_epochs: Vec<ContextEpochRef>,
     model: Known<String>,
     cli_version: Known<String>,
     first_cwd: Known<String>,
@@ -173,6 +181,10 @@ struct SegmentDraft {
     last_turn: u64,
     started_at: Known<String>,
     ended_at: Known<String>,
+    /// Every distinct `gitBranch` observed while this draft was open.
+    /// Branch drift without a cwd change does not split the segment; it
+    /// marks it `ScopeStatus::MixedCandidate`.
+    branches_seen: Vec<String>,
 }
 
 struct Ctx<'a> {
@@ -217,6 +229,9 @@ fn analyze(source: &SourceHandle, read: &SourceRead) -> Result<Analysis, Adapter
         skill_invocations: Vec::new(),
         segments: Vec::new(),
         session_id_seen: false,
+        row_session_id: None,
+        row_agent_id: None,
+        context_epochs: Vec::new(),
         model: Known::unknown(),
         cli_version: Known::unknown(),
         first_cwd: Known::unknown(),
@@ -235,6 +250,7 @@ fn analyze(source: &SourceHandle, read: &SourceRead) -> Result<Analysis, Adapter
         last_turn: 0,
         started_at: Known::unknown(),
         ended_at: Known::unknown(),
+        branches_seen: Vec::new(),
     });
 
     // Logical units must come after every physical ordinal, so the walk
@@ -334,8 +350,18 @@ fn walk_physical_unit(
         );
     };
 
-    if string_field(object, "sessionId").is_some() || string_field(object, "session_id").is_some() {
+    if let Some(session_id) =
+        string_field(object, "sessionId").or_else(|| string_field(object, "session_id"))
+    {
         analysis.session_id_seen = true;
+        if analysis.row_session_id.is_none() {
+            analysis.row_session_id = Some(session_id.to_owned());
+        }
+    }
+    if analysis.row_agent_id.is_none()
+        && let Some(agent_id) = string_field(object, "agentId")
+    {
+        analysis.row_agent_id = Some(agent_id.to_owned());
     }
     if analysis.cli_version == Known::unknown()
         && let Some(version) = string_field(object, "version")
@@ -429,6 +455,24 @@ fn walk_conversational_row(
             analysis.model = Known::value(model.to_owned());
         }
         emit_usage_event(object, message, timestamp, &physical_ref, analysis);
+    }
+
+    // Compaction boundary (`isCompactSummary` + `compactMetadata`): the row
+    // that follows is the summary that replaced earlier context. Recorded
+    // as a context epoch of THIS conversation — never a second source.
+    if object.get("isCompactSummary").and_then(Value::as_bool) == Some(true) {
+        let trigger = object
+            .get("compactMetadata")
+            .and_then(Value::as_object)
+            .and_then(|meta| string_field(meta, "trigger"))
+            .map_or_else(Known::unknown, |value| Known::value(value.to_owned()));
+        analysis.context_epochs.push(ContextEpochRef {
+            compaction_index: analysis.context_epochs.len() as u32,
+            summary_provenance: physical_ref.evidence_event_id.clone(),
+            replacement_refs: Vec::new(),
+            trigger,
+            first_turn_after: Some(analysis.turns.len() as u64),
+        });
     }
 
     let role = string_field(message, "role").unwrap_or(top_type);
@@ -563,6 +607,7 @@ fn walk_content_block(
                         timestamp,
                         Known::unknown(),
                         vec![physical_ref.clone(), evidence],
+                        None,
                         analysis,
                     );
                 }
@@ -609,6 +654,7 @@ fn walk_content_block(
                 timestamp,
                 known_nonempty(name),
                 vec![physical_ref.clone(), evidence.clone()],
+                None,
                 analysis,
             );
             let payload = canonical_json(object.get("input").unwrap_or(&Value::Null));
@@ -643,6 +689,7 @@ fn walk_content_block(
                 timestamp,
                 known_nonempty(tool_name.as_deref().unwrap_or_default()),
                 vec![physical_ref.clone(), evidence.clone()],
+                None,
                 analysis,
             );
             let payload = canonical_json(object.get("content").unwrap_or(&Value::Null));
@@ -761,25 +808,11 @@ fn text_frame(
     })
 }
 
-/// Turn role implied by the throne's class. Mechanical projection of
-/// `FrameClass`; the class itself is never chosen here.
-const fn turn_role_of(class: &FrameClass) -> TurnRole {
-    match class {
-        FrameClass::Human { .. } | FrameClass::EchoSeal { .. } => TurnRole::User,
-        FrameClass::AssistantFinal => TurnRole::Assistant,
-        FrameClass::ShellAction { .. } => TurnRole::Tool,
-        FrameClass::Inject { .. }
-        | FrameClass::LineageMeta { .. }
-        | FrameClass::InterAgent { .. } => TurnRole::System,
-    }
-}
-
 /// The only path from a conversational payload to `push_turn`.
 ///
-/// The throne classifies; this records what it said: lane (`turn_kind`),
-/// role, sealed timestamp and content. A class without a turn lane
-/// (`InterAgent`, by design) records no turn — this transport never emits
-/// one, but the accounting stays honest rather than inventing a lane.
+/// The throne classifies; this records what it said: class (carried whole
+/// on the turn), lane (`turn_kind`), role (`turn_role`), sealed timestamp
+/// and content. No role or lane is decided here (W2-R1).
 fn emit_frame(
     frame: &TransportFrame,
     refs: Vec<RawUnitRef>,
@@ -787,7 +820,7 @@ fn emit_frame(
 ) -> Option<u64> {
     let classified = frames::classify(frame);
     let kind = classified.turn_kind?;
-    let role = turn_role_of(&classified.class);
+    let role = classified.class.turn_role();
     let turn_idx = push_turn(
         role,
         kind,
@@ -795,6 +828,7 @@ fn emit_frame(
         &classified.seal.seal_ts,
         Known::unknown(),
         refs,
+        Some(classified.class.clone()),
         analysis,
     );
     if matches!(
@@ -888,6 +922,7 @@ fn emit_queued_user_turn(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn push_turn(
     role: TurnRole,
     kind: TurnKind,
@@ -895,6 +930,7 @@ fn push_turn(
     timestamp: &Known<String>,
     tool_name: Known<String>,
     refs: Vec<RawUnitRef>,
+    frame_class: Option<FrameClass>,
     analysis: &mut Analysis,
 ) -> u64 {
     let turn_idx = analysis.turns.len() as u64;
@@ -910,6 +946,7 @@ fn push_turn(
         tool_name,
         segment_id,
         raw_unit_refs: refs,
+        frame_class,
     });
     let segment = analysis
         .segments
@@ -944,6 +981,7 @@ fn maybe_split_segment(object: &serde_json::Map<String, Value>, analysis: &mut A
             last_turn: 0,
             started_at: Known::unknown(),
             ended_at: Known::unknown(),
+            branches_seen: Vec::new(),
         });
         return;
     }
@@ -952,10 +990,16 @@ fn maybe_split_segment(object: &serde_json::Map<String, Value>, analysis: &mut A
     {
         current.cwd = Known::value(cwd.to_owned());
     }
-    if current.branch == Known::unknown()
-        && let Some(branch) = branch
-    {
-        current.branch = Known::value(branch.to_owned());
+    match (&current.branch, branch) {
+        (Known::Unknown(_), Some(branch)) => current.branch = Known::value(branch.to_owned()),
+        // Branch drift inside one cwd: evidence for `MixedCandidate`, not a
+        // new segment (the cwd is still one place).
+        (Known::Value(existing), Some(branch))
+            if existing != branch && !current.branches_seen.iter().any(|seen| seen == branch) =>
+        {
+            current.branches_seen.push(branch.to_owned());
+        }
+        _ => {}
     }
 }
 
@@ -1403,6 +1447,20 @@ impl Analysis {
             original_source_bytes: read.source_bytes,
         };
         let mut model = SessionModel::new(session_id, provenance, coverage);
+        // Provider identity as the rows state it (W2-R1). The store id above
+        // is the resolver's handle; `sessionId` is what the file says.
+        let mut unobserved = Vec::new();
+        if self.row_agent_id.is_none() {
+            unobserved.push("agent_id".to_owned());
+        }
+        model.conversation = ProviderConversationRef::Claude {
+            session_id: self
+                .row_session_id
+                .unwrap_or_else(|| model.session_id.clone()),
+            agent_id: self.row_agent_id,
+            unobserved,
+        };
+        model.context_epochs = self.context_epochs;
         model.segments = finalize_segments(std::mem::take(&mut self.segments), &self.turns);
         model.turns = self.turns;
         model.tool_events = self.tool_events;
@@ -1425,6 +1483,7 @@ fn finalize_segments(drafts: Vec<SegmentDraft>, turns: &[Turn]) -> Vec<Segment> 
         .enumerate()
         .map(|(index, draft)| Segment {
             segment_id: index as u32,
+            scope_status: draft.scope_status(),
             cwd: draft.cwd,
             branch: draft.branch,
             started_at: draft.started_at,
@@ -1435,6 +1494,23 @@ fn finalize_segments(drafts: Vec<SegmentDraft>, turns: &[Turn]) -> Vec<Segment> 
             },
         })
         .collect()
+}
+
+impl SegmentDraft {
+    /// Structural scope of the draft: the cwd is constant by construction
+    /// (a cwd change opens a new draft); branch drift inside the draft is
+    /// the mixed-candidate signal this adapter can observe.
+    fn scope_status(&self) -> ScopeStatus {
+        let cwd = match &self.cwd {
+            Known::Value(cwd) => Some(cwd.as_str()),
+            Known::Unknown(_) => None,
+        };
+        let mut branches: Vec<&str> = self.branches_seen.iter().map(String::as_str).collect();
+        if let Known::Value(branch) = &self.branch {
+            branches.push(branch.as_str());
+        }
+        ScopeStatus::from_evidence(cwd, branches)
+    }
 }
 
 // ---------------------------------------------------------------------------

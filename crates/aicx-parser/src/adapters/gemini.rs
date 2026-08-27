@@ -622,13 +622,8 @@ fn push_classified_frame(
     let Some(turn_kind) = classified.turn_kind else {
         return;
     };
-    let role = match &classified.class {
-        FrameClass::Human { .. } | FrameClass::EchoSeal { .. } => TurnRole::User,
-        FrameClass::AssistantFinal => TurnRole::Assistant,
-        FrameClass::ShellAction { .. } => TurnRole::Tool,
-        FrameClass::Inject { .. } | FrameClass::LineageMeta { .. } => TurnRole::System,
-        FrameClass::InterAgent { .. } => return,
-    };
+    // Role and lane are the throne's (W2-R1); the class rides on the turn.
+    let role = classified.class.turn_role();
     let turn_idx = analysis.turns.len() as u64;
     let refs = vec![classified.origin.evidence.clone()];
     analysis.turns.push(Turn {
@@ -642,6 +637,7 @@ fn push_classified_frame(
         tool_name: tool_name.map_or_else(Known::unknown, Known::value),
         segment_id: 0,
         raw_unit_refs: refs,
+        frame_class: Some(classified.class.clone()),
     });
     let segment = analysis.segments.last_mut().expect("segment draft");
     if segment.first_turn.is_none() {
@@ -1006,6 +1002,16 @@ fn finalize_segments(drafts: Vec<SegmentDraft>, turns: &[Turn]) -> Vec<Segment> 
         .enumerate()
         .map(|(i, d)| Segment {
             segment_id: i as u32,
+            scope_status: crate::engine::ScopeStatus::from_evidence(
+                match &d.cwd {
+                    Known::Value(cwd) => Some(cwd.as_str()),
+                    Known::Unknown(_) => None,
+                },
+                match &d.branch {
+                    Known::Value(branch) => Some(branch.as_str()),
+                    Known::Unknown(_) => None,
+                },
+            ),
             cwd: d.cwd,
             branch: d.branch,
             started_at: d.started_at,

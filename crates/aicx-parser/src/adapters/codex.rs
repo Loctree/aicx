@@ -15,12 +15,12 @@ use crate::engine::frames::{
 };
 use crate::engine::frames_rules;
 use crate::engine::{
-    AgentKind, BoundaryFlags, ConsumedUnit, CounterSemantics, CoverageReport, CoverageWarning,
-    Known, ParseStatus, Provenance, RawUnitRef, ReportedCost, Segment, SessionModel,
-    SkillInvocation, SkippedReason, SkippedUnit, SourceHandle, SourceRead, TokenComponents,
-    ToolEvent, ToolEventKind, Turn, TurnKind, TurnRange, TurnRole, UnitBoundary, UnvalidatedParse,
-    UsageEvent, VisibleCompleteness, WarningKind, evidence_event_id_from_hash, ordinal_locator,
-    sha256_hex,
+    AgentKind, BoundaryFlags, ConsumedUnit, ContextEpochRef, CounterSemantics, CoverageReport,
+    CoverageWarning, Known, ParseStatus, Provenance, ProviderConversationRef, RawUnitRef,
+    ReportedCost, ScopeStatus, Segment, SessionModel, SkillInvocation, SkippedReason, SkippedUnit,
+    SourceHandle, SourceRead, TokenComponents, ToolEvent, ToolEventKind, Turn, TurnKind, TurnRange,
+    TurnRole, UnitBoundary, UnvalidatedParse, UsageEvent, VisibleCompleteness, WarningKind,
+    evidence_event_id_from_hash, ordinal_locator, sha256_hex,
 };
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -427,6 +427,12 @@ struct Assembly<'a> {
     compaction_boundary_present: bool,
     /// Content identity for sticky compaction history; transport ids rotate.
     seen_replay_hashes: BTreeSet<String>,
+    /// Provider identity from `session_meta.payload` (W2-R1); `None` until
+    /// the meta record has been read.
+    conversation: Option<ProviderConversationRef>,
+    /// Compaction boundaries, in order, with the physical ordinal of the
+    /// record that carried each boundary (to locate the first turn after).
+    context_epochs: Vec<(ContextEpochRef, u64)>,
 }
 
 #[derive(Clone)]
@@ -471,6 +477,8 @@ impl<'a> Assembly<'a> {
             have_response_item_agent_message: false,
             compaction_boundary_present: false,
             seen_replay_hashes: BTreeSet::new(),
+            conversation: None,
+            context_epochs: Vec::new(),
         }
     }
 
@@ -483,7 +491,7 @@ impl<'a> Assembly<'a> {
             self.ended_at = timestamp.clone();
         }
         match string_at(event, &["type"]).unwrap_or("") {
-            "session_meta" => self.session_meta(event),
+            "session_meta" => self.session_meta(event, timestamp, evidence),
             "turn_context" => self.turn_context(event, timestamp),
             "event_msg" => self.event_msg(event, timestamp, evidence),
             "response_item" => self.response_item(event, timestamp, evidence),
@@ -496,19 +504,80 @@ impl<'a> Assembly<'a> {
         }
     }
 
-    fn session_meta(&mut self, event: &Value) -> Result<(), AdapterError> {
+    fn session_meta(
+        &mut self,
+        event: &Value,
+        timestamp: Known<String>,
+        evidence: RawUnitRef,
+    ) -> Result<(), AdapterError> {
         if self.session_meta_seen {
             return Ok(());
         }
         self.session_meta_seen = true;
-        // The resolved SourceHandle owns identity. Direct-file mode has no
-        // catalog and may use a filename-derived physical id; an embedded
-        // session_meta id is payload data, not authority to rewrite or reject
-        // the already-selected source.
+        // The resolved SourceHandle owns the STORE identity. Direct-file mode
+        // has no catalog and may use a filename-derived physical id; an
+        // embedded session_meta id is payload data, not authority to rewrite
+        // or reject the already-selected source. It IS, however, the
+        // provider's own statement of which conversation this is (W2-R1):
+        // `session_id` = tree root, `id` = this thread, `forked_from_id` =
+        // fork origin, `parent_thread_id` = sub-agent parent.
         self.cwd = known_string(string_at(event, &["payload", "cwd"]));
         self.current_cwd = self.cwd.clone();
+        self.current_branch = known_string(string_at(event, &["payload", "git", "branch"]));
+        self.branch = self.current_branch.clone();
         self.model = known_string(string_at(event, &["payload", "model"]));
         self.cli_version = known_string(string_at(event, &["payload", "cli_version"]));
+
+        let field = |key: &str| {
+            string_at(event, &["payload", key])
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+        };
+        let thread_id = field("id");
+        let tree_session_id = field("session_id")
+            .or_else(|| thread_id.clone())
+            .unwrap_or_else(|| self.session_id.clone());
+        let forked_from_id = field("forked_from_id");
+        let parent_thread_id = field("parent_thread_id");
+        let window_id = string_at(event, &["payload", "context_window", "window_id"])
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_owned);
+        let mut unobserved = Vec::new();
+        for (name, present) in [
+            ("thread_id", thread_id.is_some()),
+            ("forked_from_id", forked_from_id.is_some()),
+            ("parent_thread_id", parent_thread_id.is_some()),
+            ("window_id", window_id.is_some()),
+        ] {
+            if !present {
+                unobserved.push(name.to_owned());
+            }
+        }
+        self.conversation = Some(ProviderConversationRef::Codex {
+            tree_session_id,
+            thread_id: thread_id.clone(),
+            forked_from_id: forked_from_id.clone(),
+            parent_thread_id,
+            window_id,
+            unobserved,
+        });
+
+        // A declared fork origin is lineage speech for the throne
+        // (`FrameClass::LineageMeta`), not a local system note.
+        if forked_from_id.is_some() {
+            let frame = TransportFrame {
+                agent: AgentKind::Codex,
+                transport_kind: TransportKind::Lineage,
+                timestamp,
+                payload: TransportPayload::Lineage {
+                    session_id: thread_id.unwrap_or_else(|| self.session_id.clone()),
+                    forked_from_id,
+                },
+                evidence,
+            };
+            self.push_classified_frame(frame)?;
+        }
         Ok(())
     }
 
@@ -588,6 +657,7 @@ impl<'a> Assembly<'a> {
                 timestamp,
                 Known::unknown(),
                 evidence,
+                None,
             ),
             "token_count" => {
                 self.push_usage(event, timestamp, evidence);
@@ -613,6 +683,7 @@ impl<'a> Assembly<'a> {
                 timestamp,
                 Known::unknown(),
                 evidence,
+                None,
             ),
             // Codex fans out to subagents now. Without this the transcript of
             // a session that dispatched a dozen of them reads as one agent
@@ -624,6 +695,7 @@ impl<'a> Assembly<'a> {
                 timestamp,
                 Known::unknown(),
                 evidence,
+                None,
             ),
             "thread_goal_updated" => self.push_turn(
                 TurnRole::System,
@@ -632,6 +704,7 @@ impl<'a> Assembly<'a> {
                 timestamp,
                 Known::unknown(),
                 evidence,
+                None,
             ),
             // An interrupted turn is operator behaviour worth keeping.
             "turn_aborted" => self.push_turn(
@@ -644,6 +717,7 @@ impl<'a> Assembly<'a> {
                 timestamp,
                 Known::unknown(),
                 evidence,
+                None,
             ),
             // Thread configuration echo — consumed, carries no conversation.
             "thread_settings_applied" => Ok(()),
@@ -660,6 +734,7 @@ impl<'a> Assembly<'a> {
                 timestamp,
                 Known::unknown(),
                 evidence,
+                None,
             ),
             _ => {
                 self.unsupported_visible = true;
@@ -753,6 +828,7 @@ impl<'a> Assembly<'a> {
                         timestamp,
                         Known::unknown(),
                         evidence,
+                        None,
                     )
                 }
             }
@@ -763,6 +839,7 @@ impl<'a> Assembly<'a> {
                 timestamp,
                 Known::unknown(),
                 evidence,
+                None,
             ),
             "encrypted_reasoning" => {
                 self.opaque_reasoning = true;
@@ -785,6 +862,7 @@ impl<'a> Assembly<'a> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn push_turn(
         &mut self,
         role: TurnRole,
@@ -793,6 +871,7 @@ impl<'a> Assembly<'a> {
         timestamp: Known<String>,
         tool_name: Known<String>,
         evidence: RawUnitRef,
+        frame_class: Option<FrameClass>,
     ) -> Result<(), AdapterError> {
         if text.is_empty() {
             return Ok(());
@@ -812,39 +891,42 @@ impl<'a> Assembly<'a> {
             tool_name,
             segment_id,
             raw_unit_refs: vec![evidence],
+            frame_class,
         });
         Ok(())
     }
 
-    /// Consume the throne's decision into the pre-taxonomy session model.
-    /// This is projection plumbing, not a second content classifier.
+    /// Consume the throne's decision into the session model. This is
+    /// projection plumbing, not a second content classifier: role and lane
+    /// come from the class (`turn_role` / `turn_kind`), and the class itself
+    /// rides on the turn (W2-R1).
     fn push_classified_frame(&mut self, frame: TransportFrame) -> Result<(), AdapterError> {
         let classified = frames::classify(&frame);
         let timestamp = classified.seal.seal_ts.clone();
         let evidence = classified.origin.evidence.clone();
+        let role = classified.class.turn_role();
+        let class_for_turn = Some(classified.class.clone());
         match classified.class {
-            FrameClass::Human { .. } | FrameClass::EchoSeal { .. } => self.push_turn(
-                TurnRole::User,
+            FrameClass::Human { .. }
+            | FrameClass::EchoSeal { .. }
+            | FrameClass::AssistantFinal
+            | FrameClass::InterAgent { .. } => self.push_turn(
+                role,
                 classified
                     .turn_kind
-                    .expect("human classes have a turn kind"),
+                    .expect("speech and inter-agent classes have a turn lane"),
                 classified.content,
                 timestamp,
                 Known::unknown(),
                 evidence,
+                class_for_turn,
             ),
-            FrameClass::AssistantFinal => self.push_turn(
-                TurnRole::Assistant,
-                classified
-                    .turn_kind
-                    .expect("assistant class has a turn kind"),
-                classified.content,
-                timestamp,
-                Known::unknown(),
-                evidence,
-            ),
-            FrameClass::ShellAction { cmd, result } => {
-                let marker = shell_action_marker(&cmd);
+            FrameClass::ShellAction {
+                ref cmd,
+                ref result,
+            } => {
+                let marker = shell_action_marker(cmd);
+                let result = result.clone();
                 self.push_turn(
                     TurnRole::Tool,
                     TurnKind::ToolCall,
@@ -852,6 +934,7 @@ impl<'a> Assembly<'a> {
                     timestamp.clone(),
                     Known::value("user_shell_command".to_owned()),
                     evidence.clone(),
+                    class_for_turn,
                 )?;
                 let call_idx = self.turns.len() as u64 - 1;
                 self.tools.push(ToolEvent {
@@ -871,6 +954,7 @@ impl<'a> Assembly<'a> {
                         timestamp,
                         Known::value("user_shell_command".to_owned()),
                         evidence.clone(),
+                        None,
                     )?;
                     let result_idx = self.turns.len() as u64 - 1;
                     self.tools.push(ToolEvent {
@@ -885,12 +969,13 @@ impl<'a> Assembly<'a> {
                 }
                 Ok(())
             }
+            // Replayed history is referenced by the context epoch
+            // (`consume_compaction_replay`), never re-emitted as speech.
             FrameClass::Inject {
                 kind: InjectKind::CompactionReplay,
-            }
-            | FrameClass::InterAgent { .. } => Ok(()),
+            } => Ok(()),
             FrameClass::Inject { .. } | FrameClass::LineageMeta { .. } => self.push_turn(
-                TurnRole::System,
+                role,
                 classified
                     .turn_kind
                     .expect("metadata classes have a turn kind"),
@@ -898,6 +983,7 @@ impl<'a> Assembly<'a> {
                 timestamp,
                 Known::unknown(),
                 evidence,
+                class_for_turn,
             ),
         }
     }
@@ -909,27 +995,39 @@ impl<'a> Assembly<'a> {
         evidence: RawUnitRef,
     ) -> Result<(), AdapterError> {
         let payload = event_or_payload.get("payload").unwrap_or(event_or_payload);
-        let Some(history) = payload.get("replacement_history").and_then(Value::as_array) else {
-            return Ok(());
+        // Every compaction record is one context epoch of THIS conversation
+        // (W2-R1): the boundary is recorded even when no history is replayed.
+        let trigger = string_at(payload, &["reason"])
+            .map_or_else(Known::unknown, |value| Known::value(value.to_owned()));
+        let mut epoch = ContextEpochRef {
+            compaction_index: self.context_epochs.len() as u32,
+            summary_provenance: evidence.evidence_event_id.clone(),
+            replacement_refs: Vec::new(),
+            trigger,
+            first_turn_after: None,
         };
-        for item in history {
-            let content = serde_json::to_string(item)
-                .map_err(|error| AdapterError::new("assemble", error.to_string()))?;
-            let frame = TransportFrame {
-                agent: AgentKind::Codex,
-                transport_kind: TransportKind::InjectedContext,
-                timestamp: timestamp.clone(),
-                payload: TransportPayload::Inject {
-                    tag: "compacted.replacement_history".to_owned(),
-                    content,
-                },
-                evidence: evidence.clone(),
-            };
-            let classified = frames::classify(&frame);
-            if self.seen_replay_hashes.insert(classified.content_hash) {
-                self.push_classified_frame(frame)?;
+        if let Some(history) = payload.get("replacement_history").and_then(Value::as_array) {
+            for item in history {
+                let content = serde_json::to_string(item)
+                    .map_err(|error| AdapterError::new("assemble", error.to_string()))?;
+                let frame = TransportFrame {
+                    agent: AgentKind::Codex,
+                    transport_kind: TransportKind::InjectedContext,
+                    timestamp: timestamp.clone(),
+                    payload: TransportPayload::Inject {
+                        tag: "compacted.replacement_history".to_owned(),
+                        content,
+                    },
+                    evidence: evidence.clone(),
+                };
+                let classified = frames::classify(&frame);
+                epoch.replacement_refs.push(classified.content_hash.clone());
+                if self.seen_replay_hashes.insert(classified.content_hash) {
+                    self.push_classified_frame(frame)?;
+                }
             }
         }
+        self.context_epochs.push((epoch, evidence.physical_ordinal));
         Ok(())
     }
 
@@ -982,6 +1080,7 @@ impl<'a> Assembly<'a> {
             timestamp,
             Known::value(name.clone()),
             evidence.clone(),
+            None,
         )?;
         let turn_idx = self.turns.len() as u64 - 1;
         self.tools.push(ToolEvent {
@@ -1235,6 +1334,25 @@ impl<'a> Assembly<'a> {
             original_source_bytes: self.read.source_bytes,
         };
         let mut model = SessionModel::new(self.session_id, provenance, coverage);
+        if let Some(conversation) = self.conversation {
+            model.conversation = conversation;
+        }
+        // Epochs learn their first following turn once the turn stream is
+        // final: the boundary's own record carries no turn.
+        let mut context_epochs = Vec::with_capacity(self.context_epochs.len());
+        for (mut epoch, boundary_ordinal) in self.context_epochs {
+            epoch.first_turn_after = self
+                .turns
+                .iter()
+                .find(|turn| {
+                    turn.raw_unit_refs
+                        .iter()
+                        .any(|reference| reference.physical_ordinal > boundary_ordinal)
+                })
+                .map(|turn| turn.turn_idx);
+            context_epochs.push(epoch);
+        }
+        model.context_epochs = context_epochs;
         model.turns = self.turns;
         model.tool_events = self.tools;
         model.usage_events = self.usage;
@@ -1246,6 +1364,19 @@ impl<'a> Assembly<'a> {
                 .enumerate()
                 .filter_map(|(id, segment)| {
                     let end = model.turns.len() as u64 - 1;
+                    // cwd/branch are constant inside a Codex segment by
+                    // construction (`turn_context` drift opens a new one), so
+                    // the verdict is homogeneous-or-unknown.
+                    let scope_status = ScopeStatus::from_evidence(
+                        match &segment.cwd {
+                            Known::Value(cwd) => Some(cwd.as_str()),
+                            Known::Unknown(_) => None,
+                        },
+                        match &segment.branch {
+                            Known::Value(branch) => Some(branch.as_str()),
+                            Known::Unknown(_) => None,
+                        },
+                    );
                     (segment.start_turn <= end).then_some(Segment {
                         segment_id: id as u32,
                         cwd: segment.cwd,
@@ -1256,6 +1387,7 @@ impl<'a> Assembly<'a> {
                             start: segment.start_turn,
                             end,
                         },
+                        scope_status,
                     })
                 })
                 .collect();

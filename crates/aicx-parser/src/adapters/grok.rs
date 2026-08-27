@@ -378,6 +378,10 @@ impl AgentAdapter for GrokAdapter {
         if !turns.is_empty() {
             model.segments.push(Segment {
                 segment_id: 0,
+                scope_status: crate::engine::ScopeStatus::from_evidence(
+                    Some(cwd.as_str()),
+                    branch.as_deref(),
+                ),
                 cwd: Known::value(cwd),
                 branch: branch.clone().map(Known::value).unwrap_or(Known::unknown()),
                 started_at: Known::value(started_at),
@@ -809,19 +813,16 @@ fn push_classified_turn(
         return;
     };
     let evidence = classified.origin.evidence.clone();
+    // Role is the throne's (`turn_role`, W2-R1); only the shell lane still
+    // chooses its text/tool name here.
+    let role = classified.class.turn_role();
     let (role, text, tool_name, kind) = match &classified.class {
-        FrameClass::Human { .. } | FrameClass::EchoSeal { .. } => (
-            TurnRole::User,
-            classified.content.clone(),
-            Known::unknown(),
-            kind,
-        ),
-        FrameClass::AssistantFinal => (
-            TurnRole::Assistant,
-            classified.content.clone(),
-            Known::unknown(),
-            kind,
-        ),
+        FrameClass::Human { .. }
+        | FrameClass::EchoSeal { .. }
+        | FrameClass::AssistantFinal
+        | FrameClass::InterAgent { .. } => {
+            (role, classified.content.clone(), Known::unknown(), kind)
+        }
         FrameClass::ShellAction { cmd, result } => {
             // Throne maps every ShellAction to ToolCall (no call/result pair
             // in FrameClass). Result text stays on the turn for Decision 6;
@@ -846,15 +847,11 @@ fn push_classified_turn(
                 payload_bytes: result.text.len() as u64,
                 raw_unit_refs: vec![evidence.clone()],
             });
-            (TurnRole::Tool, text, Known::value(cmd.clone()), kind)
+            (role, text, Known::value(cmd.clone()), kind)
         }
-        FrameClass::Inject { .. } | FrameClass::LineageMeta { .. } => (
-            TurnRole::System,
-            classified.content.clone(),
-            Known::unknown(),
-            kind,
-        ),
-        FrameClass::InterAgent { .. } => return,
+        FrameClass::Inject { .. } | FrameClass::LineageMeta { .. } => {
+            (role, classified.content.clone(), Known::unknown(), kind)
+        }
     };
 
     if text.trim().is_empty() {
@@ -877,6 +874,7 @@ fn push_classified_turn(
         tool_name,
         segment_id: 0,
         raw_unit_refs: vec![evidence],
+        frame_class: Some(classified.class.clone()),
     });
     *turn_idx += 1;
 }
