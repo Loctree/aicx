@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
+## [0.12.6] - 2026-08-28
+
+### Changed
+- seed AGENT_CANARY.md — truth-competition census charter for aicx
+
+## [0.13.0] - 2026-08-28
+
 ### One taxonomy for every agent (mission `aicx-one-taxonomy-fusion-260827`)
 
 Five adapters (Claude, Codex, Gemini, Grok, Junie) used to decide on their
