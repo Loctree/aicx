@@ -288,10 +288,9 @@ fn first_enqueue_timestamp(path: &Path) -> Result<String, String> {
         if line_matches_selector(
             &line,
             r#"type == "queue-operation" && operation == "enqueue""#,
-        ) {
-            if let Some(ts) = first_json_string_field(&line, "timestamp") {
-                return Ok(ts);
-            }
+        ) && let Some(ts) = first_json_string_field(&line, "timestamp")
+        {
+            return Ok(ts);
         }
     }
     Err("no queue-operation enqueue timestamp in source".into())
@@ -610,9 +609,12 @@ fn count_for_extract_projection(flags: &[String], body: &str) -> i64 {
 
 fn print_table(title: &str, rows: &[Eval]) {
     println!("\n=== {title} ===");
+    let header = [
+        "id", "alias", "status", "verdict", "expected", "observed", "reason",
+    ];
     println!(
         "{:<48} {:<28} {:<12} {:<10} {:<22} {:<22} {}",
-        "id", "alias", "status", "verdict", "expected", "observed", "reason"
+        header[0], header[1], header[2], header[3], header[4], header[5], header[6]
     );
     for row in rows {
         println!(
