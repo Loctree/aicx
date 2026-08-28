@@ -271,6 +271,29 @@ pub fn parse_kind_tokens(tokens: &[String]) -> Result<Vec<ProjectionKind>, Strin
     Ok(kinds)
 }
 
+/// Roles a set of throne kinds speaks with. `--kind` names lanes, and a lane
+/// carries its speaker: asking for `inter_agent` (system lane) while the
+/// role axis still says "human + assistant" would admit nothing. The role
+/// axis therefore follows the kinds; `--user-only` narrows it afterwards.
+pub fn roles_for_kinds(kinds: &[ProjectionKind]) -> Vec<ProjectionRole> {
+    let mut roles = Vec::with_capacity(3);
+    for kind in kinds {
+        let role = match kind {
+            ProjectionKind::Human | ProjectionKind::EchoSeal => ProjectionRole::Human,
+            ProjectionKind::AssistantFinal | ProjectionKind::ShellAction => {
+                ProjectionRole::Assistant
+            }
+            ProjectionKind::Inject | ProjectionKind::LineageMeta | ProjectionKind::InterAgent => {
+                ProjectionRole::System
+            }
+        };
+        if !roles.contains(&role) {
+            roles.push(role);
+        }
+    }
+    roles
+}
+
 // ---------------------------------------------------------------------------
 // Lineage: a graph of tagged conversation refs, not a list of ids (W2-R1)
 // ---------------------------------------------------------------------------
@@ -1067,7 +1090,8 @@ mod harness_noise_tests {
         use aicx_parser::engine::{HumanChannel, Known};
         // EchoSeal used to arrive as `UserMsg` and was indistinguishable
         // from direct human speech; with the class carried it is its own
-        // kind, withheld by the razor and revealed by `--dialog`.
+        // kind. The razor admits it (it is the operator's speech, W4
+        // recovery); `--kind human` narrows to the direct channel.
         let echo = classed(
             "user",
             "sealed later",
@@ -1081,7 +1105,12 @@ mod harness_noise_tests {
             projection_kind_for_entry(&echo),
             Some(ProjectionKind::EchoSeal)
         );
-        assert!(!spec_admits_entry(&ProjectionSpec::default(), &echo));
+        assert!(spec_admits_entry(&ProjectionSpec::default(), &echo));
+        let direct_only = ProjectionSpec {
+            kinds: vec![ProjectionKind::Human],
+            ..ProjectionSpec::default()
+        };
+        assert!(!spec_admits_entry(&direct_only, &echo));
         let dialog = ProjectionSpec {
             dialog: true,
             ..ProjectionSpec::default()

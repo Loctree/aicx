@@ -173,13 +173,18 @@ impl Default for ProjectionSpec {
 impl ProjectionSpec {
     /// Razor default (no flags): human speech + final answers + shell stubs.
     ///
-    /// Echo-bus / queued speech is withheld until `--dialog`. `InterAgent`
-    /// is withheld until `--kind inter_agent`. Result bodies stay hashed.
+    /// Human speech includes its delayed channels (`EchoSeal`: echo bus and
+    /// queue-operation) — the operator typed those words, and `--user-only`
+    /// that hides them lies by omission (oracle `claude-67025fed-user-only`
+    /// = 25 on the pre-fusion baseline). `--dialog` additionally reveals the
+    /// seal metadata; `--kind` narrows. `InterAgent` is withheld until
+    /// `--kind inter_agent`. Result bodies stay hashed.
     pub fn razor() -> Self {
         Self {
             roles: vec![ProjectionRole::Human, ProjectionRole::Assistant],
             kinds: vec![
                 ProjectionKind::Human,
+                ProjectionKind::EchoSeal,
                 ProjectionKind::AssistantFinal,
                 ProjectionKind::ShellAction,
             ],
@@ -336,6 +341,7 @@ mod tests {
             spec.kinds,
             vec![
                 ProjectionKind::Human,
+                ProjectionKind::EchoSeal,
                 ProjectionKind::AssistantFinal,
                 ProjectionKind::ShellAction,
             ]
@@ -349,8 +355,10 @@ mod tests {
         assert_eq!(spec.lineage_depth, None);
         assert!(spec.emits_kind(ProjectionKind::ShellAction));
         assert!(!spec.emits_kind(ProjectionKind::InterAgent));
-        assert!(!spec.emits_kind(ProjectionKind::EchoSeal));
-        assert!(!spec.emits_human_channel(HumanChannel::EchoBus));
+        // Delayed human speech is human speech: the razor admits it.
+        assert!(spec.emits_kind(ProjectionKind::EchoSeal));
+        assert!(spec.emits_human_channel(HumanChannel::EchoBus));
+        assert!(spec.emits_human_channel(HumanChannel::Queue));
         assert_eq!(
             FLAGS_NEVER_MUTATE_THE_SUBSTRATE,
             "flags never mutate the substrate"

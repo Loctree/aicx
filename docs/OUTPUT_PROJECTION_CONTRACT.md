@@ -51,8 +51,8 @@ No flags means the razor view — complete, not cropped:
 
 | Axis | Default | Why |
 |---|---|---|
-| Dialogue | Human (Direct channel) + `AssistantFinal` | Operator speech and the agent's last answers, in full. |
-| Delayed human speech | Hidden until `--dialog` | Echo-bus / `queue-operation` are human, but they are a channel (`FrameClass::EchoSeal` / `Human { channel: Queue }` on the entry); `--dialog` shows them as speech with their seals. |
+| Dialogue | Human (every channel) + `AssistantFinal` | Operator speech and the agent's last answers, in full. |
+| Delayed human speech | **Shown** (W4 recovery) | Echo-bus / `queue-operation` are the operator's own words (`FrameClass::EchoSeal` / `Human { channel: Queue }` on the entry). `--user-only` that hid them returned 0 of the 25 messages the operator typed on `claude-67025fed`; the razor admits `EchoSeal`. `--dialog` additionally renders the seal/channel; `--kind human` narrows to the direct channel. |
 | `InterAgent` | Hidden until `--kind inter_agent` | Never rendered as `assistant` (Decision 9). |
 | `Inject` / `LineageMeta` | Hidden | Noise and parent pointers; lineage is opt-in. |
 | Shell results | Stub: `$ cmd [N lines, sha256:…]` | Count + command + hash are the facts an agent can act on. The body stays in the substrate. |
@@ -68,8 +68,8 @@ hash. It is not "write a file and hope the agent opens it."
 |---|---|---|
 | Shell result body | `--result full` | `result = Full` |
 | First N lines of a result | `--result head=N` | `result = Head(N)` |
-| Echo-bus / queued speech | `--dialog` | `dialog = true` (kind `echo_seal` also works) |
-| Inter-agent lane | `--kind inter_agent` | `kinds` includes `InterAgent` |
+| Echo-bus / queued speech with seals | `--dialog` | `dialog = true` (the speech itself is already in the razor) |
+| Inter-agent lane | `--kind inter_agent` | `kinds` includes `InterAgent`; `roles` follows the kinds (`System` opens), so the lane is not empty by construction |
 | Parent sessions | `--lineage` / `--lineage=N` | `lineage_depth = Some(UNBOUNDED)` / `Some(N)` |
 | Every kind, full bodies | combine the above, or construct `ProjectionSpec::full()` | not a CLI alias in W1 |
 
@@ -86,12 +86,12 @@ wired to this type until W2-T13.
 | Flag | `ProjectionSpec` field | Notes |
 |---|---|---|
 | `--user-only` | `roles = [Human]` | Today also applied in `mcp_session.rs` by string role. That copy goes away in W2-T13. |
-| `--conversation` | `kinds` razor (Human + AssistantFinal + ShellAction stubs) | Today's conversation-first path. Not a second taxonomy. |
+| `--conversation` | `kinds` razor (Human + EchoSeal + AssistantFinal + ShellAction stubs) | Today's conversation-first path. Not a second taxonomy. |
 | `--max-message-chars N` | `max_message_chars` | `0` = unlimited dialogue. Does not change `result`. |
 | `-p` / `--project` | `project` | Identity filter on the view, not on the parse. |
 | `-H` / `--hours` | `window.hours` | Present but hidden on `Commands::Extract`. |
 | `--since` / `--until` | `window.since` / `window.until` | Not on extract today; same window type as search. |
-| `--kind <token>` | `kinds` | **W2.** Tokens: `human`, `echo_seal`, `shell_action`, `inject`, `assistant_final`, `lineage_meta`, `inter_agent`. |
+| `--kind <token>` | `kinds` (+ `roles` implied by the kinds) | **W2.** Tokens: `human`, `echo_seal`, `shell_action`, `inject`, `assistant_final`, `lineage_meta`, `inter_agent`. A lane carries its speaker: `inter_agent` / `inject` / `lineage_meta` open the `System` role; `--user-only` narrows back to `Human`. |
 | `--dialog` | `dialog` | **W2.** Delayed human speech as speech, with channel/seal. |
 | `--lineage[=N]` | `lineage_depth` | **W2.** `Some(usize::MAX)` when the flag is bare. |
 | `--result none\|head=N\|full` | `result` | **W2.** See shell examples below. |
@@ -166,7 +166,7 @@ Canonical type: `src/extraction/projection.rs`.
 | Field | Type | Razor default |
 |---|---|---|
 | `roles` | `Vec<ProjectionRole>` | `Human`, `Assistant` |
-| `kinds` | `Vec<ProjectionKind>` | `Human`, `AssistantFinal`, `ShellAction` |
+| `kinds` | `Vec<ProjectionKind>` | `Human`, `EchoSeal`, `AssistantFinal`, `ShellAction` |
 | `result` | `None \| Head(n) \| Full` | `None` |
 | `max_message_chars` | `usize` | `0` (unlimited) |
 | `window` | `ProjectionWindow { hours, since, until }` | all `None` |

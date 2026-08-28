@@ -39,12 +39,15 @@ use aicx::corpus;
 use aicx::dashboard::{self, DashboardConfig, DashboardScope};
 use aicx::dashboard_server::{self, DashboardCorsPolicy, DashboardServerConfig};
 use aicx::extraction::conversation::{self as conv, LineageEdgeKind, LineageGraph};
-use aicx::extraction::projection::{LINEAGE_UNBOUNDED, ProjectionSpec, ProjectionWindow};
+use aicx::extraction::projection::{
+    LINEAGE_UNBOUNDED, ProjectionRole, ProjectionSpec, ProjectionWindow,
+};
 use aicx::extraction::{self as sources, ExtractionConfig};
 use aicx::intents;
 use aicx::legacy_archive;
 use aicx::mcp::{self, McpHttpConfig, McpLifecycleConfig, McpTransport};
 use aicx::output::{self, OutputConfig, OutputFormat, OutputMode, ReportMetadata};
+use aicx::parser::engine::{MIN_VISIBLE_TURNS, RefusalEvidence, RefusalReason};
 use aicx::rank;
 use aicx::reports_extractor::{self, ReportsExtractorConfig};
 use aicx::sessions;
@@ -5996,6 +5999,18 @@ fn projection_spec_for_extract(
                 "pass throne kinds: human, echo_seal, shell_action, inject, assistant_final, lineage_meta, inter_agent",
             )
         })?;
+        // A lane carries its speaker: `--kind inter_agent` opens the system
+        // role, `--kind human` closes the assistant one. `--user-only` still
+        // narrows to human speech afterwards.
+        let implied = conv::roles_for_kinds(&spec.kinds);
+        spec.roles = if args.user_only {
+            implied
+                .into_iter()
+                .filter(|role| *role == ProjectionRole::Human)
+                .collect()
+        } else {
+            implied
+        };
     }
     spec.dialog = args.dialog;
     spec.result = conv::parse_result_body_token(&args.result).map_err(|reason| {
@@ -6209,14 +6224,76 @@ fn parse_selected_source_once(
     handle: &aicx::parser::engine::SourceHandle,
     projection: &ProjectionSpec,
 ) -> Result<Vec<timeline::TimelineEntry>> {
+    parse_selected_source_with_basis(handle, projection).map(|parsed| parsed.entries)
+}
+
+/// The projected entries of one source plus the evidence a typed refusal
+/// needs when the projection comes back empty (W2-T12 guardian on the
+/// `extract --file` / `--session` seam: no silent `Wrote 0 entries`).
+struct ProjectedSource {
+    entries: Vec<timeline::TimelineEntry>,
+    agent: aicx::parser::engine::AgentKind,
+    session_id: String,
+    coverage: aicx::parser::engine::CoverageReport,
+    turns_before_filter: u64,
+}
+
+impl ProjectedSource {
+    /// Typed refusal for an empty projection: no speech at all in the model
+    /// is `EmptyConversation`; speech that the spec filtered away is
+    /// `ProjectionFilteredAll`. Both carry the coverage evidence.
+    fn refusal_if_empty(&self, projection: &ProjectionSpec) -> Option<RefusalReason> {
+        if !self.entries.is_empty() {
+            return None;
+        }
+        Some(if self.turns_before_filter == 0 {
+            RefusalReason::empty_conversation(self.agent, self.session_id.clone(), &self.coverage)
+        } else {
+            RefusalReason::ProjectionFilteredAll {
+                agent: self.agent,
+                session_id: self.session_id.clone(),
+                turns_before_filter: self.turns_before_filter,
+                filter: format!(
+                    "kinds={:?} roles={:?} dialog={} user_only={}",
+                    projection.kinds,
+                    projection.roles,
+                    projection.dialog,
+                    !projection.emits_role(ProjectionRole::Assistant)
+                ),
+                evidence: RefusalEvidence::from_coverage(
+                    &self.coverage,
+                    MIN_VISIBLE_TURNS,
+                    0,
+                    vec![format!(
+                        "timeline_entries_before_filter={}",
+                        self.turns_before_filter
+                    )],
+                ),
+            }
+        })
+    }
+}
+
+fn parse_selected_source_with_basis(
+    handle: &aicx::parser::engine::SourceHandle,
+    projection: &ProjectionSpec,
+) -> Result<ProjectedSource> {
     let session = aicx::parser_dispatch::parse_handle(handle)?;
-    let entries = aicx::output::timeline_entries_from_model(session.model());
+    let model = session.model();
+    let entries = aicx::output::timeline_entries_from_model(model);
+    let turns_before_filter = entries.len() as u64;
     // Shell actions fold with their retained result first (so the stub /
     // head / full rendering is one entry), then the spec decides what stays.
     // No role-string reducer here (W2-T13).
     let mut entries = conv::fold_shell_results(entries, projection);
     conv::apply_projection(&mut entries, projection);
-    Ok(entries)
+    Ok(ProjectedSource {
+        entries,
+        agent: model.provenance.agent,
+        session_id: model.session_id.clone(),
+        coverage: model.coverage.clone(),
+        turns_before_filter,
+    })
 }
 
 /// One resolved parent of the `--lineage` walk: the catalog source to parse
@@ -6620,7 +6697,13 @@ fn run_extract_direct_file(
             "extract: lineage: --file has no session catalog; the forked_from_id walk needs --session"
         );
     }
-    let entries = parse_selected_source_once(&handle, &options.projection)?;
+    let parsed = parse_selected_source_with_basis(&handle, &options.projection)?;
+    if let Some(refusal) = parsed.refusal_if_empty(&options.projection) {
+        // Typed refusal instead of a silent `Wrote 0 entries` (W2-T12 on the
+        // direct-file seam; oracle `grok-019fdeca-typed-refusal`).
+        return Err(anyhow::Error::new(refusal));
+    }
+    let entries = parsed.entries;
 
     let fallback_identity = if options.conversation {
         "file input".to_string()
