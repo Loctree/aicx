@@ -317,6 +317,9 @@ mod tests {
                 end: turns as u64,
             }]
         };
+        // The fixture mutates the coverage records by hand; the ledger is
+        // derived from them and must be rebuilt before validation.
+        model.coverage.rebuild_ledger();
         match validate_parse(UnvalidatedParse::from_model(model)).unwrap() {
             crate::engine::ValidatedParse::Session(session) => *session,
             crate::engine::ValidatedParse::Fatal(_) => panic!("fixture unexpectedly fatal"),

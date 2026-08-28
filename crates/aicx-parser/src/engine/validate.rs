@@ -137,10 +137,6 @@ pub fn validate_coverage(
             "raw_line_count cannot exceed raw_unit_count",
         ));
     }
-    coverage
-        .check_totality()
-        .map_err(|totality| totality_error(coverage, totality))?;
-
     let mut ordinals = BTreeSet::new();
     let mut evidence_ids = BTreeSet::new();
     for unit in &coverage.consumed {
@@ -185,7 +181,6 @@ pub fn validate_coverage(
             "consumed_ranges do not exactly encode consumed ordinals",
         ));
     }
-
     for warning in &coverage.warnings {
         if warning.count == 0
             || warning.first_ordinal == 0
@@ -297,6 +292,12 @@ pub fn validate_coverage(
             "non-fatal parse must preserve its valid model",
         ));
     }
+    // Ledger totality is checked last: a structural defect (overlap, gap,
+    // silent skip, bad evidence) names itself first, and the ledger only ever
+    // drifts as a consequence of one of those.
+    coverage
+        .check_totality()
+        .map_err(|totality| totality_error(coverage, totality))?;
     Ok(())
 }
 
@@ -366,16 +367,12 @@ pub fn validate_model(model: &SessionModel) -> Result<(), ValidationError> {
         }
     }
 
-    if model.turns.is_empty() {
-        return Err(ValidationError::refusal(
-            "empty_conversation",
-            RefusalReason::empty_conversation(
-                model.provenance.agent,
-                model.session_id.clone(),
-                &model.coverage,
-            ),
-        ));
-    }
+    // A model with zero turns is *consistent* (usage-only rollouts, harness
+    // bookkeeping, adversarially truncated sources all validate). Whether it is
+    // *sufficient* for a consumer is decided at the projection seams
+    // (`extraction`, `mcp_session`, `extract --file`), which raise the typed
+    // `RefusalReason::EmptyConversation` / `ProjectionFilteredAll` with the
+    // coverage evidence. The kernel never hides a valid model behind a refusal.
 
     let known_evidence: BTreeSet<_> = model
         .coverage

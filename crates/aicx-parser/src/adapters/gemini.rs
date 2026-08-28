@@ -234,6 +234,13 @@ fn walk_physical_unit(
                 if let Some(_sid) = string_field(obj, "sessionId") {
                     analysis.session_id_seen = true;
                 }
+                // An Antigravity conversation export carries no `sessionId`:
+                // its identity is the artifact itself (`projectRoot` +
+                // `messages`), so the document is the session, not a fatal
+                // headless stream.
+                if matches!(shape, GeminiShape::AntigravityConversation) {
+                    analysis.session_id_seen = true;
+                }
                 if analysis.started_at == Known::unknown()
                     && let Some(st) = string_field(obj, "startTime")
                 {
