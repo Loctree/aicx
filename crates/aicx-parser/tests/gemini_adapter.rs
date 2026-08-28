@@ -85,8 +85,8 @@ impl std::error::Error for AdapterError {}
 mod gemini;
 
 use aicx_parser::engine::{
-    Known, ParseStatus, RawUnitReader, ReaderPolicy, SessionModel, SourceArtifact, SourceFraming,
-    TurnKind, TurnRole, ValidatedParse, VisibleCompleteness, validate_parse,
+    RawUnitReader, ReaderPolicy, SourceArtifact, SourceFraming, TurnKind, TurnRole, ValidatedParse,
+    validate_parse,
 };
 use gemini::{GEMINI_ADAPTER_VERSION, GeminiAdapter};
 use std::fs;

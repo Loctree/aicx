@@ -564,6 +564,7 @@ fn run_search_rejects_limit_over_hard_cap_before_store_access() {
         evidence: false,
         deep: false,
         project_match: legacy_archive::ProjectMatchMode::Exact,
+        projection: ProjectionSpec::default(),
     })
     .expect_err("oversized search limit must fail before reading the store");
 
@@ -2981,6 +2982,7 @@ fn direct_file_boundary_rejects_directory_without_output() {
             max_message_chars: 0,
             redact_secrets: false,
             conversation: false,
+            projection: ProjectionSpec::default(),
         },
     )
     .expect_err("directory input must be rejected before parser dispatch");

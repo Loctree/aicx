@@ -206,7 +206,9 @@ pub fn extract_agent_sessions(
                         error
                             .downcast_ref::<EngineError>()
                             .and_then(|engine| match engine {
-                                EngineError::Validation(validation) => validation.refusal.clone(),
+                                EngineError::Validation(validation) => {
+                                    validation.refusal.as_deref().cloned()
+                                }
                                 _ => None,
                             });
                 }

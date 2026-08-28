@@ -9,7 +9,7 @@
 //!   cutoff — a content hash says "identical bytes", never "same event";
 //! * [`ContextEpochRef`]: a compaction boundary inside one conversation,
 //!   which is never a second source.
-//! `SessionModel::session_id` stays as the store-side display handle.
+//!   `SessionModel::session_id` stays as the store-side display handle.
 
 use super::coverage::CoverageReport;
 use super::frames::FrameClass;

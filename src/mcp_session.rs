@@ -850,7 +850,7 @@ fn parser_surface_error(path: &Path, error: &anyhow::Error) -> SessionSurfaceErr
     if let Some(refusal) = error
         .downcast_ref::<EngineError>()
         .and_then(|engine| match engine {
-            EngineError::Validation(validation) => validation.refusal.clone(),
+            EngineError::Validation(validation) => validation.refusal.as_deref().cloned(),
             _ => None,
         })
     {

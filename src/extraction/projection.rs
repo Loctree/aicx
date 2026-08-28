@@ -359,8 +359,10 @@ mod tests {
 
     #[test]
     fn dialog_reveals_echo_seal_without_opening_inter_agent() {
-        let mut spec = ProjectionSpec::default();
-        spec.dialog = true;
+        let spec = ProjectionSpec {
+            dialog: true,
+            ..ProjectionSpec::default()
+        };
         assert!(spec.emits_kind(ProjectionKind::EchoSeal));
         assert!(spec.emits_human_channel(HumanChannel::Queue));
         assert!(!spec.emits_kind(ProjectionKind::InterAgent));
@@ -395,8 +397,10 @@ mod tests {
 
     #[test]
     fn result_head_keeps_hash_and_omitted_count() {
-        let mut spec = ProjectionSpec::default();
-        spec.result = ResultBody::Head(2);
+        let spec = ProjectionSpec {
+            result: ResultBody::Head(2),
+            ..ProjectionSpec::default()
+        };
         let body = "one\ntwo\nthree\nfour";
         let rendered = spec.project_shell_result("cargo test", body, "abc");
         assert_eq!(
@@ -407,8 +411,10 @@ mod tests {
 
     #[test]
     fn max_message_chars_is_character_safe() {
-        let mut spec = ProjectionSpec::default();
-        spec.max_message_chars = 3;
+        let mut spec = ProjectionSpec {
+            max_message_chars: 3,
+            ..ProjectionSpec::default()
+        };
         assert_eq!(spec.project_message_body("żółw"), "żół…");
         spec.max_message_chars = 0;
         assert_eq!(spec.project_message_body("żółw"), "żółw");

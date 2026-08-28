@@ -1351,12 +1351,13 @@ fn revalidate_signal_kind(declared: IntentKind, payload: &str) -> Option<SignalV
 /// the assistant. Intents own no speech reducer of their own: this spec is
 /// asked, role strings are not compared here.
 fn intent_signal_spec() -> ProjectionSpec {
-    let mut spec = ProjectionSpec::default();
-    spec.roles = vec![ProjectionRole::Human];
-    spec.kinds = vec![ProjectionKind::Human, ProjectionKind::EchoSeal];
-    // Delayed human speech (echo bus / queue) is still the human speaking.
-    spec.dialog = true;
-    spec
+    ProjectionSpec {
+        roles: vec![ProjectionRole::Human],
+        kinds: vec![ProjectionKind::Human, ProjectionKind::EchoSeal],
+        // Delayed human speech (echo bus / queue) is still the human speaking.
+        dialog: true,
+        ..ProjectionSpec::default()
+    }
 }
 
 /// Does the signal lane emit this transcript role?

@@ -933,7 +933,7 @@ impl DispositionExt for ClassifiedDisposition {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::{SourceArtifact, SourceFraming, SourceHandle};
+    use crate::engine::{SourceArtifact, SourceFraming, SourceHandle, TurnRole};
 
     fn make_handle_with_jsonl(bytes: &[u8]) -> SourceHandle {
         let art = SourceArtifact::memory(

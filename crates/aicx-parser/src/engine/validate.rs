@@ -583,7 +583,7 @@ pub struct ValidationError {
     pub detail: String,
     /// Set when the failure is a typed refusal (the input was understood and
     /// rejected) rather than a broken invariant (the input was inconsistent).
-    pub refusal: Option<RefusalReason>,
+    pub refusal: Option<Box<RefusalReason>>,
 }
 
 impl ValidationError {
@@ -591,7 +591,7 @@ impl ValidationError {
         Self {
             invariant,
             detail: refusal.to_string(),
-            refusal: Some(refusal),
+            refusal: Some(Box::new(refusal)),
         }
     }
 

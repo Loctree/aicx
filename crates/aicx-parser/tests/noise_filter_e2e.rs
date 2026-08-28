@@ -18,6 +18,8 @@ fn entry(seconds_offset: i64, role: &str, message: &str) -> TimelineEntry {
         session_id: "noise-filter-e2e".to_string(),
         role: role.to_string(),
         message: message.to_string(),
+        frame_class: None,
+        lineage_origin: None,
         frame_kind: None,
         branch: None,
         cwd: None,

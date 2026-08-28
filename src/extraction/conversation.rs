@@ -572,7 +572,7 @@ pub fn merge_inherited(
             entries.push(entry);
         }
     }
-    entries.sort_by(|left, right| left.timestamp.cmp(&right.timestamp));
+    entries.sort_by_key(|entry| entry.timestamp);
     InheritedMerge {
         entries,
         inherited_from_parent,
@@ -1082,8 +1082,10 @@ mod harness_noise_tests {
             Some(ProjectionKind::EchoSeal)
         );
         assert!(!spec_admits_entry(&ProjectionSpec::default(), &echo));
-        let mut dialog = ProjectionSpec::default();
-        dialog.dialog = true;
+        let dialog = ProjectionSpec {
+            dialog: true,
+            ..ProjectionSpec::default()
+        };
         assert!(spec_admits_entry(&dialog, &echo));
 
         // InterAgent rides the system lane (`SystemNote`) but is selected by
@@ -1107,9 +1109,11 @@ mod harness_noise_tests {
             Some(ProjectionRole::System)
         );
         assert!(!spec_admits_entry(&ProjectionSpec::default(), &inter));
-        let mut only_inter = ProjectionSpec::default();
-        only_inter.kinds = vec![ProjectionKind::InterAgent];
-        only_inter.roles = vec![ProjectionRole::System];
+        let only_inter = ProjectionSpec {
+            kinds: vec![ProjectionKind::InterAgent],
+            roles: vec![ProjectionRole::System],
+            ..ProjectionSpec::default()
+        };
         assert!(spec_admits_entry(&only_inter, &inter));
 
         // LineageMeta from the model is its own kind, not `Inject`.
@@ -1258,8 +1262,10 @@ mod harness_noise_tests {
                 .message
                 .starts_with("$ cargo test --workspace [3 lines, sha256:")
         );
-        let mut full = ProjectionSpec::default();
-        full.result = ResultBody::Full;
+        let full = ProjectionSpec {
+            result: ResultBody::Full,
+            ..ProjectionSpec::default()
+        };
         let folded = fold_shell_results(vec![call, retained], &full);
         assert_eq!(
             folded[0].message,

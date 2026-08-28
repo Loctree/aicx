@@ -356,14 +356,13 @@ fn detect_shape(value: &Value, framing: SourceFraming) -> GeminiShape {
     if obj.contains_key("sessionId") && obj.contains_key("startTime") {
         return GeminiShape::StreamHeader;
     }
-    if framing == SourceFraming::JsonLines {
-        if obj
+    if framing == SourceFraming::JsonLines
+        && (obj
             .get("type")
             .is_some_and(|t| t.as_str() == Some("gemini") || t.as_str() == Some("user"))
-            || obj.contains_key("role")
-        {
-            return GeminiShape::JsonlLineMessage;
-        }
+            || obj.contains_key("role"))
+    {
+        return GeminiShape::JsonlLineMessage;
     }
     GeminiShape::Unknown
 }
@@ -389,13 +388,7 @@ fn emit_message(
         "gemini" | "model" | "assistant" => TransportRole::Assistant,
         "system" | "system_instruction" | "systemInstruction" | "context" => TransportRole::System,
         "tool" | "function" | "tool_response" => TransportRole::Tool,
-        _ => {
-            if obj.contains_key("toolCalls") || obj.contains_key("functionCall") {
-                TransportRole::Assistant
-            } else {
-                TransportRole::Assistant
-            }
-        }
+        _ => TransportRole::Assistant,
     };
 
     let kind = match transport_role {
@@ -659,14 +652,12 @@ fn extract_tool_result_string(call_val: &Value) -> String {
         }
         if let Some(arr) = res.as_array() {
             for item in arr {
-                if let Some(iobj) = item.as_object() {
-                    if let Some(fr) = iobj.get("functionResponse").and_then(Value::as_object) {
-                        if let Some(resp) = fr.get("response").and_then(Value::as_object) {
-                            if let Some(out) = string_field(resp, "output") {
-                                return out.to_owned();
-                            }
-                        }
-                    }
+                if let Some(iobj) = item.as_object()
+                    && let Some(fr) = iobj.get("functionResponse").and_then(Value::as_object)
+                    && let Some(resp) = fr.get("response").and_then(Value::as_object)
+                    && let Some(out) = string_field(resp, "output")
+                {
+                    return out.to_owned();
                 }
             }
         }
@@ -683,10 +674,10 @@ fn has_thought(obj: &serde_json::Map<String, Value>) -> bool {
     {
         return true;
     }
-    if let Some(thoughts) = obj.get("thoughts").and_then(Value::as_array) {
-        if !thoughts.is_empty() {
-            return true;
-        }
+    if let Some(thoughts) = obj.get("thoughts").and_then(Value::as_array)
+        && !thoughts.is_empty()
+    {
+        return true;
     }
     if let Some(parts) = get_parts(obj) {
         return parts.iter().any(|p| {
@@ -757,10 +748,10 @@ fn extract_text_from_array(arr: &[Value]) -> String {
             if obj.get("thought").and_then(Value::as_bool).unwrap_or(false) {
                 continue;
             }
-            if let Some(t) = string_field(obj, "text").or_else(|| string_field(obj, "content")) {
-                if !t.is_empty() {
-                    parts.push(t.to_owned());
-                }
+            if let Some(t) = string_field(obj, "text").or_else(|| string_field(obj, "content"))
+                && !t.is_empty()
+            {
+                parts.push(t.to_owned());
             }
         }
     }
