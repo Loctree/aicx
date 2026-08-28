@@ -146,7 +146,7 @@ pub fn extract_agent_sessions(
         }));
     }
     let scan = crate::session_catalog::SessionCatalog::new(agent, &root)?.scan_with_stats();
-    let parser_agent = parser_agent(agent);
+    let parser_agent_kind = parser_agent(agent);
     let mut batch = SessionExtractionBatch::default();
     let mut first_refusal = None;
     let mut projection_basis = None;
@@ -158,7 +158,7 @@ pub fn extract_agent_sessions(
     order_sources_freshest_first(&mut sources);
     for source in sources {
         let parsed = crate::parser_dispatch::parse_file(
-            parser_agent,
+            parser_agent_kind,
             &source.source_id,
             source.logical_session_id.clone(),
             &source.path,

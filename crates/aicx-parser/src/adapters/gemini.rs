@@ -11,14 +11,13 @@
 
 use super::{AdapterError, AgentAdapter, ClassifiedDisposition, ClassifiedUnit, RawUnitLevel};
 use crate::engine::frames::{
-    self, ClassifiedFrame, FrameClass, TransportFrame, TransportKind, TransportPayload,
-    TransportRole,
+    self, ClassifiedFrame, TransportFrame, TransportKind, TransportPayload, TransportRole,
 };
 use crate::engine::{
     AgentKind, BoundaryFlags, ConsumedUnit, CounterSemantics, CoverageReport, CoverageWarning,
     Known, ParseStatus, Provenance, RawUnit, RawUnitRef, Segment, SessionModel, SkippedReason,
     SkippedUnit, SourceFraming, SourceHandle, SourceRead, TokenComponents, ToolEvent,
-    ToolEventKind, Turn, TurnRange, TurnRole, UnitBoundary, UnvalidatedParse, UsageEvent,
+    ToolEventKind, Turn, TurnRange, UnitBoundary, UnvalidatedParse, UsageEvent,
     VisibleCompleteness, WarningKind, evidence_event_id_from_hash, ordinal_locator, sha256_hex,
 };
 use serde_json::Value;

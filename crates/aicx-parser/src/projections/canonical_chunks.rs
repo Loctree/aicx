@@ -235,7 +235,7 @@ mod tests {
         if turns > 0 {
             model.segments.push(crate::engine::Segment {
                 segment_id: 0,
-                scope_status: crate::engine::ScopeStatus::Homogeneous,
+                scope_status: crate::engine::ScopeStatus::NoDriftObserved,
                 cwd: Known::value(cwd.to_owned()),
                 branch: Known::unknown(),
                 started_at: Known::unknown(),

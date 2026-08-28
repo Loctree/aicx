@@ -503,7 +503,7 @@ pub fn lineage_entries(
 }
 
 /// Result of laying a parent's timeline under a child's.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct InheritedMerge {
     pub entries: Vec<TimelineEntry>,
     /// Child entries that also exist in the parent: kept once, tagged
@@ -1224,7 +1224,7 @@ mod harness_noise_tests {
         assert!(refuse_mixed_workstream(AgentKind::Claude, "s1", &report, true).is_none());
 
         let homogeneous = scope_report_for_entries(&[a]);
-        assert_eq!(homogeneous.status, ScopeStatus::Homogeneous);
+        assert_eq!(homogeneous.status, ScopeStatus::NoDriftObserved);
         assert!(refuse_mixed_workstream(AgentKind::Claude, "s1", &homogeneous, false).is_none());
         let unknown = scope_report_for_entries(&[entry("user", "no cwd", 3)]);
         assert_eq!(unknown.status, ScopeStatus::Unknown);

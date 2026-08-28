@@ -31,7 +31,7 @@ use crate::engine::{
     identity::{evidence_event_id_from_hash, ordinal_locator, sha256_hex},
     model::{
         Known, Provenance, RawUnitRef, Segment, SessionModel, ToolEvent, ToolEventKind, Turn,
-        TurnRange, TurnRole, UsageEvent,
+        TurnRange, UsageEvent,
     },
 };
 use chrono::{DateTime, Duration as ChronoDuration, Utc};

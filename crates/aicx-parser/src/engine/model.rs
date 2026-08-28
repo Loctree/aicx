@@ -83,13 +83,15 @@ pub struct Segment {
 /// braid more than one workstream. Consumers that distill *one* history
 /// (`continuity`) must not do so silently on a candidate; they refuse with
 /// `RefusalReason::MixedWorkstream` unless told to distill anyway.
-/// Topic-level mixing inside one cwd/branch is not detectable here and is
-/// reported as `Homogeneous` — that limit is documented, not hidden.
+/// Topic-level mixing inside one cwd/branch is not detectable here. Absence of
+/// drift evidence is not evidence of homogeneity, so the non-mixed state only
+/// reports that no drift was observed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ScopeStatus {
-    /// One known cwd, no branch drift inside the span.
-    Homogeneous,
+    /// One known cwd and no observed branch drift inside the span. This does
+    /// not prove that the span contains only one logical workstream.
+    NoDriftObserved,
     /// Several cwds and/or branches inside the span.
     MixedCandidate,
     /// No cwd/branch evidence at all: scope cannot be judged.
@@ -100,18 +102,18 @@ pub enum ScopeStatus {
 impl ScopeStatus {
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::Homogeneous => "homogeneous",
+            Self::NoDriftObserved => "no_drift_observed",
             Self::MixedCandidate => "mixed_candidate",
             Self::Unknown => "unknown",
         }
     }
 
     /// Combine two spans: any mixed → mixed; otherwise unknown dominates
-    /// homogeneous only when nothing is known at all.
+    /// no-drift evidence only when nothing is known at all.
     pub const fn join(self, other: Self) -> Self {
         match (self, other) {
             (Self::MixedCandidate, _) | (_, Self::MixedCandidate) => Self::MixedCandidate,
-            (Self::Homogeneous, _) | (_, Self::Homogeneous) => Self::Homogeneous,
+            (Self::NoDriftObserved, _) | (_, Self::NoDriftObserved) => Self::NoDriftObserved,
             (Self::Unknown, Self::Unknown) => Self::Unknown,
         }
     }
@@ -140,7 +142,7 @@ impl ScopeStatus {
         if seen_cwd.len() > 1 || seen_branch.len() > 1 {
             Self::MixedCandidate
         } else if seen_cwd.len() == 1 {
-            Self::Homogeneous
+            Self::NoDriftObserved
         } else {
             Self::Unknown
         }
