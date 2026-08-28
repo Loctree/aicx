@@ -93,7 +93,7 @@ fn synthetic_model() -> SessionModel {
     let mut model = SessionModel::new("019f0000-1111-7111-8111-000000000001", provenance, coverage);
     model.segments.push(Segment {
         segment_id: 1,
-        scope_status: aicx::parser::engine::ScopeStatus::Homogeneous,
+        scope_status: aicx::parser::engine::ScopeStatus::NoDriftObserved,
         cwd: Known::value("/work/space/aicx".to_owned()),
         branch: Known::value("fix/aicx-daily-usefulness".to_owned()),
         started_at: Known::value("2026-07-13T04:00:00Z".to_owned()),
