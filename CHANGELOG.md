@@ -5,6 +5,37 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
+### Mission `aicx-one-taxonomy-fusion-260827` — W4-T16 regression state (2026-08-28)
+
+Measured on `cut/W4-T16-regression-honest-state` @ `eb9d5a3` (repair round;
+first round @ `da4aa9a`) with the tree binary (`aicx 0.12.5+geb9d5a36`), never
+the installed one. Honest state, not a release note:
+
+- gates: `cargo fmt --check` green · `cargo clippy --workspace -- -D warnings`
+  green · `semgrep --config auto --error` green · `cargo build --workspace`
+  green · `cargo check --workspace --all-targets` green after cherry-picking
+  `a970180` (`tests/frame_kind_contract.rs:96` `ScopeStatus::Homogeneous` →
+  `NoDriftObserved`, A3 rename; the dispatch baseline `da4aa9a` predated the
+  integrator fix) · `cargo test --workspace` **red**: 22 tests fail across
+  10 targets, the workspace compiles; `make check` reaches `[8/11] tests`
+- `aicx-parser` tests: 10 red (5 lib: `empty_conversation` /
+  `ledger_consumed_by_kind` invariants from W1-T5 hit adapter fixtures; 5
+  integration: claude queue bookkeeping, codex usage, gemini antigravity,
+  adversarial mutation matrix, kernel `coverage_overlap` → `ledger_known_skipped`)
+- `aicx` tests: 12 red, all one shape — `refused: adapter claude scored 0/1
+  over 1 probe(s)` from the W2-T12 detection gate on the CLI
+  `conversations` / `all` / `session_passage_search` fixtures
+- oracle `tests/fixtures/parser_engine/assertions.toml` vs tree binary:
+  claude `67025fed` UserMsg **25 → 0** (exit 0, "Wrote 0 entries"), gemini
+  `9048328b` UserMsg 0 → 1 (assistant 21 unchanged), grok `01a038ec` 2 → 2,
+  junie `260528` 0/1 unchanged, codex `01a0369f` (Monika shape) 25 → 25;
+  `--kind inter_agent` on `01a042f9` renders 0 (expected 28); grok
+  degenerate `019fdeca` still exits 0 with an empty body — the typed
+  `RefusalReason` does not reach `extract --file`
+- no adapter `expected` was rewritten; no `src/**` edit — findings are the
+  deliverable (report `W4-T16-regression-honest-state_report.md`)
+
+
 ### Added
 
 - parser engine contracts (structure only, compile embargo W1, cut
