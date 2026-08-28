@@ -134,16 +134,15 @@ pub fn extract_agent_sessions(
         crate::session_catalog::AgentKind::Junie => home.join(".junie").join("sessions"),
     };
     if !root.is_dir() {
-        return Err(anyhow::Error::new(RefusalReason::DetectionBelowThreshold {
-            agent: parser_agent(agent),
-            probes: vec![DetectionProbe {
-                name: format!("session_root_exists:{}", root.display()),
-                matched: false,
-                first_ordinal: None,
-            }],
-            score: 0,
-            threshold: 1,
-        }));
+        // No session root means this agent has never written a session on
+        // this host: zero sources, not a failed adapter claim. Typed refusals
+        // are reserved for sources that exist and were understood.
+        crate::diagnostics::log_describe(&format!(
+            "session_root_missing agent={} root={}",
+            agent,
+            root.display()
+        ));
+        return Ok(SessionExtractionBatch::default());
     }
     let scan = crate::session_catalog::SessionCatalog::new(agent, &root)?.scan_with_stats();
     let parser_agent_kind = parser_agent(agent);
@@ -242,43 +241,27 @@ pub fn extract_agent_sessions(
         {
             return Err(anyhow::Error::new(refusal));
         }
-        if let Some((session_id, coverage, turns_before_filter)) = projection_basis {
-            let refusal = RefusalReason::ProjectionFilteredAll {
-                agent: parser_agent(agent),
+        if let Some((session_id, _coverage, turns_before_filter)) = projection_basis {
+            // A batch filter (`-p`, cutoff, watermark) that removes every
+            // entry is a legitimate zero for `aicx <agent>` / `aicx all`
+            // (incremental runs and project cuts hit it routinely). Say so on
+            // the diagnostics channel; the typed `ProjectionFilteredAll`
+            // refusal belongs to single-session seams (`extract`, MCP).
+            crate::diagnostics::log_describe(&format!(
+                "projection_filtered_all agent={} session_id={} turns_before_filter={} cutoff={} include_assistant={} watermark={:?} project_filter={:?}",
+                agent,
                 session_id,
                 turns_before_filter,
-                filter: format!(
-                    "cutoff={} include_assistant={} watermark={:?} project_filter={:?}",
-                    config.cutoff,
-                    config.include_assistant,
-                    config.watermark,
-                    config.project_filter
-                ),
-                evidence: RefusalEvidence::from_coverage(
-                    &coverage,
-                    MIN_VISIBLE_TURNS,
-                    0,
-                    vec![format!(
-                        "selected_sessions={}; ingested_sessions={}; filtered_out_sessions={}; skipped_sessions={}",
-                        batch.selected_sessions,
-                        batch.ingested_sessions,
-                        batch.filtered_out_sessions,
-                        batch.skipped.len()
-                    )],
-                ),
-            };
-            return Err(anyhow::Error::new(refusal));
+                config.cutoff,
+                config.include_assistant,
+                config.watermark,
+                config.project_filter
+            ));
         }
-        return Err(anyhow::Error::new(RefusalReason::DetectionBelowThreshold {
-            agent: parser_agent(agent),
-            probes: vec![DetectionProbe {
-                name: "selected_source_in_extract_window".to_owned(),
-                matched: false,
-                first_ordinal: None,
-            }],
-            score: 0,
-            threshold: 1,
-        }));
+        // Nothing was selected inside the extract window: an empty batch is
+        // the honest answer (dry-runs, watermark catch-ups and `-H` windows
+        // legitimately see zero sessions). Detection refusals are for sources
+        // the adapter looked at and could not claim.
     }
     Ok(batch)
 }

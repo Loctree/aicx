@@ -1062,7 +1062,12 @@ pub fn resolve_session(home: &Path, session_id: &str) -> Result<Option<CatalogEn
         1 => {
             let resolved = hits.pop().expect("one resolver hit");
             if let Some(notice) = resolved.substitution_notice {
-                anyhow::bail!("{notice}");
+                // Loud, not fatal (W2-T12 → W4 recovery): a unique prefix or
+                // alias resolving to one catalog id is the documented way to
+                // name a session; the operator sees the substitution on
+                // stderr and gets the session. Ambiguity stays an error.
+                eprintln!("{notice}");
+                crate::diagnostics::log_describe(&format!("catalog_resolve {notice}"));
             }
             Ok(entries.into_iter().find(|entry| {
                 AgentKind::parse(&entry.agent) == Some(resolved.source.agent)
