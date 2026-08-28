@@ -7,16 +7,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Mission `aicx-one-taxonomy-fusion-260827` — W4-T16 regression state (2026-08-28)
 
-Measured on `cut/W4-T16-regression-honest-state` @ `da4aa9a` with the tree
-binary (`aicx 0.12.5+gda4aa9af`), never the installed one. Honest state, not a
-release note:
+Measured on `cut/W4-T16-regression-honest-state` @ `eb9d5a3` (repair round;
+first round @ `da4aa9a`) with the tree binary (`aicx 0.12.5+geb9d5a36`), never
+the installed one. Honest state, not a release note:
 
 - gates: `cargo fmt --check` green · `cargo clippy --workspace -- -D warnings`
   green · `semgrep --config auto --error` green · `cargo build --workspace`
-  green · `cargo check/test --workspace --all-targets` **red** (one compile
-  error outside the parser: `tests/frame_kind_contract.rs:96` still names
-  `ScopeStatus::Homogeneous`, renamed to `NoDriftObserved` by A3; the fix
-  exists as `a970180` on the integrator checkout, not on this baseline)
+  green · `cargo check --workspace --all-targets` green after cherry-picking
+  `a970180` (`tests/frame_kind_contract.rs:96` `ScopeStatus::Homogeneous` →
+  `NoDriftObserved`, A3 rename; the dispatch baseline `da4aa9a` predated the
+  integrator fix) · `cargo test --workspace` **red**: 22 tests fail across
+  10 targets, the workspace compiles; `make check` reaches `[8/11] tests`
 - `aicx-parser` tests: 10 red (5 lib: `empty_conversation` /
   `ledger_consumed_by_kind` invariants from W1-T5 hit adapter fixtures; 5
   integration: claude queue bookkeeping, codex usage, gemini antigravity,
