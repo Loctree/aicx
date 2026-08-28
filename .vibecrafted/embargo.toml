@@ -5,13 +5,14 @@
 # W2/1 checkpoint (W2-I1-integrate-guardians, claude): guardians merged at 1df1c21cd09b505aa12c70768bcab5e0d6607ce4 — baseline for W2-T13.
 # W2/2 checkpoint (W2-I2-integrate-close, claude): adapters T7–T11 + T13 merged at 226c8dc98f6da022f2e5313fab228459d4061da1 — evidence for W2_STRUCTURALLY_CLOSED (attestation stays open, operator signs).
 # W2 re-entry checkpoint (W2-R1-identity-frames-lineage-scope, claude): tagged identity, FrameClass to consumers, one HumanChannel, lineage graph, scope_status at d1a7ae9b57b004242e9ee78eb0a2ed35c9e0e0d4 — evidence for W2_EVIDENCE_READY_v2 (attestation stays open, operator signs).
+# W2_STRUCTURALLY_CLOSED signed by Founder (Maciej Gad) 2026-08-28 03:5x CEST on efea2c3c438ed6f07ca3de7b366868797ff8e41a; wording of the signature: "Joł joł - Maciej Gad xoxo" (/goal in session 7fff9da5); marker filled by claude on explicit authorization ("podpisz się za mnie - autoryzuję").
 # Contract (tools/git-hooks/embargo.sh): an open marker keeps signed_by/commit empty;
 # they are filled only by the W2_STRUCTURALLY_CLOSED attestation.
 plan_id = "aicx-one-taxonomy-fusion-260827"
 phase = "W2"
 deferred = ["cargo check", "cargo clippy", "cargo test"]
-attestation = "open"
+attestation = "W2_STRUCTURALLY_CLOSED"
 branch = "feat/one-taxonomy-fusion"
 recovery_ref = "refs/heads/embargo/aicx-one-taxonomy-fusion-260827"
-signed_by = ""
-commit = ""
+signed_by = "maciej"
+commit = "efea2c3c438ed6f07ca3de7b366868797ff8e41a"
