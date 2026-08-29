@@ -16,7 +16,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -1551,7 +1550,7 @@ fn project_from_git_remote(cwd: &str) -> Option<String> {
     if !path.is_dir() {
         return None;
     }
-    let output = Command::new("git")
+    let output = crate::git_env::git_command_isolated()
         .arg("-C")
         .arg(path)
         .args(["remote", "get-url", "origin"])
@@ -2012,7 +2011,7 @@ mod tests {
         fs::create_dir_all(&repo).unwrap();
         fs::create_dir_all(&user).unwrap();
         assert!(
-            Command::new("git")
+            crate::git_env::git_command_isolated()
                 .arg("-C")
                 .arg(&repo)
                 .args(["init", "--quiet"])
@@ -2021,7 +2020,7 @@ mod tests {
                 .success()
         );
         assert!(
-            Command::new("git")
+            crate::git_env::git_command_isolated()
                 .arg("-C")
                 .arg(&repo)
                 .args([
