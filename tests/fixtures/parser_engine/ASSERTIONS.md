@@ -18,6 +18,7 @@ UserMsg means rendered markdown headings of the form `**[HH:MM:SS] user:**` from
 | junie 260528 | `junie/human_shape_260528.jsonl` | selected A2UX kinds | no UserPromptEvent |
 | gemini 9048328b | `gemini/human_shape_9048328b.jsonl` | whole file 150034 B | 1 raw user, dropped by extract |
 | A2 01a042f9 | `human_shape_01a042f9_interagent.jsonl` | 28 agent_message + 1 compacted | not under `codex/` (W0-T1) |
+| cursor 004ffd2e | `cursor/human_shape_004ffd2e.jsonl` | 5-line projection of first cursor-agent session | wrapper strip + timestamp parse lanes |
 
 Derivation commands live in the sibling `*.README.md` / `README.md` files.
 
@@ -52,6 +53,10 @@ External (not copied):
 | a1-01a0369f-compacted-markers | count | 38 | hypothesis |
 | a1-01a0369f-turn-context-cwd-changes | count | 0 | hypothesis |
 | a1-01a0369f-multiline-echo-quoted-speakers | count | 1 | expected_fail_until_W2-T7 |
+| cursor-004ffd2e-raw-user-records | count | 2 | hypothesis (frozen from cut/cursor-on-throne) |
+| cursor-004ffd2e-user-only-usermsg | count | 2 | hypothesis (frozen from cut/cursor-on-throne) |
+| cursor-004ffd2e-user-query-unwrap-presence | presence | `!security unlock-keychain` | hypothesis |
+| cursor-004ffd2e-conversation-assistant | count | 1 | hypothesis (frozen from cut/cursor-on-throne) |
 
 ## Measurement notes (not status theatre)
 
