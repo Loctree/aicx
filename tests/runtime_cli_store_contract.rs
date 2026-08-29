@@ -495,7 +495,7 @@ fn sources_protect_apply_creates_only_local_git_without_remote() {
     assert!(source_root.join(".git").is_dir());
     assert!(source_root.join(".gitignore").is_file());
 
-    let remotes = Command::new("git")
+    let remotes = aicx::git_env::git_command_isolated()
         .arg("-C")
         .arg(&source_root)
         .args(["remote", "-v"])
