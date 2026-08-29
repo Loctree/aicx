@@ -17,7 +17,7 @@ pub struct AgentCase {
     pub mutation_needle: &'static str,
 }
 
-pub fn cases() -> [AgentCase; 5] {
+pub fn cases() -> [AgentCase; 6] {
     [
         AgentCase {
             agent: AgentKind::Codex,
@@ -25,6 +25,13 @@ pub fn cases() -> [AgentCase; 5] {
             source_id: "adversarial-codex",
             base: include_bytes!("../../../tests/fixtures/parser_engine/codex/minimal.jsonl"),
             mutation_needle: "Build the parser oracle harness.",
+        },
+        AgentCase {
+            agent: AgentKind::Cursor,
+            artifact: "session.jsonl",
+            source_id: "adversarial-cursor",
+            base: include_bytes!("../../../tests/fixtures/parser_engine/cursor/minimal.jsonl"),
+            mutation_needle: "Build the Cursor oracle.",
         },
         AgentCase {
             agent: AgentKind::Claude,
@@ -197,6 +204,9 @@ pub fn opaque_event(case: AgentCase) -> Vec<u8> {
         }
         AgentKind::Junie => {
             format!(r#"{{"kind":"FutureOpaqueEvent","ciphertext":"{SECRET_SENTINEL}"}}"#)
+        }
+        AgentKind::Cursor => {
+            format!(r#"{{"type":"future_opaque_event","ciphertext":"{SECRET_SENTINEL}"}}"#)
         }
     };
     bytes.extend_from_slice(line.as_bytes());
