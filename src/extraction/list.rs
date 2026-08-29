@@ -40,7 +40,7 @@ fn discover_protecting_git_root(path: &Path, home: &Path) -> Option<PathBuf> {
 }
 
 fn git_remote_lines(root: &Path) -> Vec<String> {
-    let Ok(output) = Command::new("git")
+    let Ok(output) = crate::git_env::git_command_isolated()
         .args(["-C"])
         .arg(root)
         .args(["remote", "-v"])

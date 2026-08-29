@@ -4500,7 +4500,7 @@ fn run_source_protect(
 }
 
 fn run_git(root: &Path, args: &[&str]) -> Result<()> {
-    let output = ProcessCommand::new("git")
+    let output = aicx::git_env::git_command_isolated()
         .arg("-C")
         .arg(root)
         .args(args)
@@ -4545,7 +4545,7 @@ fn add_source_protection_gitignore(root: &Path) -> Result<()> {
 
 fn create_initial_source_snapshot(root: &Path) -> Result<()> {
     run_git(root, &["add", "-A"])?;
-    let diff_status = ProcessCommand::new("git")
+    let diff_status = aicx::git_env::git_command_isolated()
         .arg("-C")
         .arg(root)
         .args(["diff", "--cached", "--quiet"])
@@ -4637,7 +4637,7 @@ fn resolve_intents_project_filters_at(
 /// already-persisted bucket to query.
 fn current_checkout_project() -> Result<String> {
     let cwd = std::env::current_dir().context("resolve current checkout directory")?;
-    let output = ProcessCommand::new("git")
+    let output = aicx::git_env::git_command_isolated()
         .arg("-C")
         .arg(&cwd)
         .args(["remote", "get-url", "origin"])
