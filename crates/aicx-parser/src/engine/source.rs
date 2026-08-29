@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 pub enum AgentKind {
     Codex,
     Claude,
+    Cursor,
     Gemini,
     Grok,
     Junie,
@@ -22,6 +23,7 @@ impl AgentKind {
         match self {
             Self::Codex => "codex",
             Self::Claude => "claude",
+            Self::Cursor => "cursor",
             Self::Gemini => "gemini",
             Self::Grok => "grok",
             Self::Junie => "junie",

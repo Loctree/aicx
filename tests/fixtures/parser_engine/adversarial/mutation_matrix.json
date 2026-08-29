@@ -1,6 +1,6 @@
 {
   "schema": "aicx.parser_adversarial_matrix.v1",
-  "agents": ["codex", "claude", "gemini", "grok", "junie"],
+  "agents": ["codex", "claude", "cursor", "gemini", "grok", "junie"],
   "mutations": [
     "baseline",
     "truncated_tail",

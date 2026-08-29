@@ -114,6 +114,32 @@ const GENERIC_INJECT_TAGS: &[InjectTagRule] = &[InjectTagRule {
     kind: InjectRuleKind::TransportControl,
 }];
 
+// # cursor — harness wrappers observed in agent-transcripts JSONL.
+// `<timestamp>` carries turn wall-clock (the adapter parses it into the turn
+// timestamp; as a bare head-tag it is transport control), `<system_notification>`
+// is harness background-task chatter, `<manually_attached_skills>` is an
+// operator-pinned skill payload. `<user_query>` is NOT here on purpose: it
+// wraps operator speech and the adapter unwraps it before framing.
+const CURSOR_INJECT_TAGS: &[InjectTagRule] = &[
+    InjectTagRule {
+        tag: "timestamp",
+        kind: InjectRuleKind::TransportControl,
+    },
+    InjectTagRule {
+        tag: "system_notification",
+        kind: InjectRuleKind::TransportControl,
+    },
+    InjectTagRule {
+        tag: "system-reminder",
+        kind: InjectRuleKind::TransportControl,
+    },
+    InjectTagRule {
+        tag: "manually_attached_skills",
+        kind: InjectRuleKind::AgentInstructions,
+    },
+];
+// # cursor — end
+
 // # grok
 // Transport idioms for Grok chat_history.jsonl. `synthetic_reason` is a
 // harness inject tag, not human speech. No echo-bus / queue-seal on this
@@ -175,6 +201,15 @@ pub const AGENT_FRAME_RULES: &[AgentFrameRules] = &[
         queue_seal: false,
         inject_tags: GENERIC_INJECT_TAGS,
     },
+    // # cursor — no echo bus, no queue seal; wrappers listed above
+    AgentFrameRules {
+        agent: AgentKind::Cursor,
+        echo_promotion: false,
+        klops_guard: &[],
+        queue_seal: false,
+        inject_tags: CURSOR_INJECT_TAGS,
+    },
+    // # cursor — end
 ];
 
 pub fn rules_for(agent: AgentKind) -> &'static AgentFrameRules {

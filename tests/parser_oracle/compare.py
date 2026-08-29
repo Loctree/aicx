@@ -17,7 +17,7 @@ from typing import Any
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-SUPPORTED_AGENTS = {"codex", "grok", "claude", "gemini", "junie"}
+SUPPORTED_AGENTS = {"codex", "grok", "claude", "cursor", "gemini", "junie"}
 DONOR_AGENTS = {"codex", "grok", "claude", "gemini"}
 REQUIRED_CONTRACT_SECTIONS = (
     "## Ownership and source of truth",
