@@ -112,6 +112,10 @@ RUST_LOG_XML="$(printf '%s' "$RUST_LOG_VALUE" | sed -e 's/&/\&amp;/g' -e 's/</\&
 
 mkdir -p "$HOME/Library/LaunchAgents" "$LOG_DIR"
 
+# `--no-auto-refresh` is deliberately kept even though the binary's default is
+# already reader-only: it keeps the LaunchAgent safe if it ever runs against an
+# older aicx whose default embedded the periodic writer. Do not remove it as
+# "redundant"; the flag is a compatibility no-op on current builds.
 cat > "$PLIST" <<PLIST_EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
