@@ -1621,12 +1621,24 @@ enum Commands {
         #[arg(long = "no-require-auth", action = clap::ArgAction::SetTrue)]
         no_require_auth: bool,
 
-        /// Refresh the hot catalog and lexical index in the background at this cadence.
+        /// Explicitly opt in to the legacy embedded HTTP catalog/index writer.
+        ///
+        /// A normal long-lived MCP service is reader-only and index maintenance
+        /// has a separate process owner. This flag is experimental and
+        /// intentionally loud: it hands periodic index ownership back to the
+        /// server process.
+        #[arg(long, conflicts_with = "no_auto_refresh")]
+        experimental_auto_refresh: bool,
+
+        /// Cadence for `--experimental-auto-refresh` in seconds (default: 300).
+        ///
+        /// Supplying this option without `--experimental-auto-refresh` only
+        /// records a cadence value; it never grants writer ownership.
         #[arg(long, default_value_t = 300, value_parser = clap::value_parser!(u64).range(10..))]
         refresh_interval_seconds: u64,
 
-        /// Disable the HTTP server's background catalog/index refresh loop.
-        #[arg(long)]
+        /// Deprecated compatibility flag: auto-refresh is already disabled by default.
+        #[arg(long, conflicts_with = "experimental_auto_refresh")]
         no_auto_refresh: bool,
     },
 
@@ -2274,6 +2286,22 @@ fn restore_default_sigpipe() {
 #[cfg(not(unix))]
 fn restore_default_sigpipe() {}
 
+/// Lifecycle configuration for `aicx serve`.
+///
+/// Reader-only unless the operator explicitly opts in with
+/// `--experimental-auto-refresh`. `--refresh-interval-seconds` on its own only
+/// configures cadence and can never hand index ownership to the server.
+fn serve_lifecycle(
+    experimental_auto_refresh: bool,
+    refresh_interval_seconds: u64,
+) -> McpLifecycleConfig {
+    McpLifecycleConfig {
+        auto_refresh_interval: experimental_auto_refresh
+            .then(|| Duration::from_secs(refresh_interval_seconds)),
+        ..McpLifecycleConfig::default()
+    }
+}
+
 fn main() -> Result<()> {
     restore_default_sigpipe();
 
@@ -2918,8 +2946,11 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
             auth_token,
             require_auth,
             no_require_auth,
+            experimental_auto_refresh,
             refresh_interval_seconds,
-            no_auto_refresh,
+            // Deprecated compatibility flag; the default is already reader-only,
+            // so safety must never depend on it being passed.
+            no_auto_refresh: _,
         }) => {
             let require_auth = require_auth && !no_require_auth;
             let auth_config = aicx::auth::load_auth_config(auth_token.as_deref(), require_auth)?;
@@ -2931,6 +2962,11 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
             if matches!(transport, McpTransport::Http) && allow_any_host {
                 eprintln!("! Warning: MCP HTTP Host validation disabled (--allow-any-host).");
             }
+            if matches!(transport, McpTransport::Http) && experimental_auto_refresh {
+                eprintln!(
+                    "! Warning: EXPERIMENTAL embedded auto-refresh writer enabled — a normal HTTP MCP server is reader-only."
+                );
+            }
             let http_config = McpHttpConfig {
                 host,
                 port,
@@ -2938,11 +2974,7 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
                 allow_any_host,
             };
             let rt = tokio::runtime::Runtime::new()?;
-            let lifecycle = McpLifecycleConfig {
-                auto_refresh_interval: (!no_auto_refresh)
-                    .then(|| Duration::from_secs(refresh_interval_seconds)),
-                ..McpLifecycleConfig::default()
-            };
+            let lifecycle = serve_lifecycle(experimental_auto_refresh, refresh_interval_seconds);
             rt.block_on(async {
                 mcp::run_transport_with_lifecycle(transport, http_config, auth_config, lifecycle)
                     .await

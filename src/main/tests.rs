@@ -3438,3 +3438,136 @@ fn lane_claim_source_filter_uses_shared_agent_role_predicate() {
 // The retired card-mill route and its argument types are deleted from main.rs.
 // Identity path: catalog rebuild → extract → source-driven index.
 // Runtime grammar coverage: `tests/runtime_cli_store_contract.rs`.
+
+// ---------------------------------------------------------------------------
+// `aicx serve` reader/writer ownership contract (Loctree/aicx#68)
+// ---------------------------------------------------------------------------
+
+fn serve_args(argv: &[&str]) -> (bool, u64, bool) {
+    let cli = Cli::try_parse_from(argv).expect("serve command should parse");
+    match cli.command {
+        Some(Commands::Serve {
+            experimental_auto_refresh,
+            refresh_interval_seconds,
+            no_auto_refresh,
+            ..
+        }) => (
+            experimental_auto_refresh,
+            refresh_interval_seconds,
+            no_auto_refresh,
+        ),
+        other => panic!("expected serve command, got {other:?}"),
+    }
+}
+
+#[test]
+fn serve_default_http_is_reader_only() {
+    let (experimental, interval, legacy) =
+        serve_args(["aicx", "serve", "--transport", "http"].as_slice());
+    assert!(!experimental);
+    assert!(!legacy);
+    assert_eq!(
+        serve_lifecycle(experimental, interval).auto_refresh_interval,
+        None,
+        "default `aicx serve --transport http` must not own index maintenance"
+    );
+}
+
+#[test]
+fn serve_refresh_interval_alone_cannot_enable_writer() {
+    let (experimental, interval, _) = serve_args(
+        [
+            "aicx",
+            "serve",
+            "--transport",
+            "http",
+            "--refresh-interval-seconds",
+            "1800",
+        ]
+        .as_slice(),
+    );
+    assert!(!experimental);
+    assert_eq!(interval, 1800, "cadence is recorded");
+    assert_eq!(
+        serve_lifecycle(experimental, interval).auto_refresh_interval,
+        None,
+        "a stale --refresh-interval-seconds invocation must never resurrect the writer"
+    );
+}
+
+#[test]
+fn serve_experimental_opt_in_enables_writer_with_requested_cadence() {
+    let (experimental, interval, _) = serve_args(
+        [
+            "aicx",
+            "serve",
+            "--transport",
+            "http",
+            "--experimental-auto-refresh",
+            "--refresh-interval-seconds",
+            "900",
+        ]
+        .as_slice(),
+    );
+    assert!(experimental);
+    assert_eq!(
+        serve_lifecycle(experimental, interval).auto_refresh_interval,
+        Some(Duration::from_secs(900))
+    );
+}
+
+#[test]
+fn serve_experimental_opt_in_uses_bounded_default_cadence() {
+    let (experimental, interval, _) = serve_args(
+        [
+            "aicx",
+            "serve",
+            "--transport",
+            "http",
+            "--experimental-auto-refresh",
+        ]
+        .as_slice(),
+    );
+    assert_eq!(
+        serve_lifecycle(experimental, interval).auto_refresh_interval,
+        Some(Duration::from_secs(300))
+    );
+}
+
+#[test]
+fn serve_stdio_is_reader_only() {
+    let (experimental, interval, _) =
+        serve_args(["aicx", "serve", "--transport", "stdio"].as_slice());
+    assert_eq!(
+        serve_lifecycle(experimental, interval).auto_refresh_interval,
+        None
+    );
+}
+
+#[test]
+fn serve_legacy_no_auto_refresh_remains_accepted_and_safe() {
+    let (experimental, interval, legacy) =
+        serve_args(["aicx", "serve", "--transport", "http", "--no-auto-refresh"].as_slice());
+    assert!(legacy, "compatibility flag is still accepted");
+    assert!(!experimental);
+    assert_eq!(
+        serve_lifecycle(experimental, interval).auto_refresh_interval,
+        None
+    );
+}
+
+#[test]
+fn serve_rejects_contradictory_auto_refresh_flags() {
+    assert!(
+        Cli::try_parse_from([
+            "aicx",
+            "serve",
+            "--transport",
+            "http",
+            "--experimental-auto-refresh",
+            "--no-auto-refresh",
+        ])
+        .is_err(),
+        "opting in and out at the same time must be a parse error, not a silent winner"
+    );
+}
