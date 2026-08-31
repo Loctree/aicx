@@ -183,13 +183,13 @@ fn main() -> ExitCode {
             "[aicx-mcp] WARNING: EXPERIMENTAL embedded auto-refresh writer enabled; normal HTTP MCP is reader-only",
         );
     }
+    let lifecycle = lifecycle_from_args(&args);
     let http_config = McpHttpConfig {
         host: args.host,
         port: args.port,
         allowed_hosts: args.allowed_hosts,
         allow_any_host: args.allow_any_host,
     };
-    let lifecycle = lifecycle_from_args(&args);
     match rt.block_on(async {
         mcp::run_transport_with_lifecycle(args.transport, http_config, auth_config, lifecycle).await
     }) {
