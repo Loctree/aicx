@@ -79,10 +79,12 @@ struct Args {
     #[arg(long, conflicts_with = "no_auto_refresh")]
     experimental_auto_refresh: bool,
 
-    /// Cadence for `--experimental-auto-refresh` in seconds (default: 300).
+    /// Accepted for compatibility; ignored unless
+    /// `--experimental-auto-refresh` is set.
     ///
-    /// Supplying this option without `--experimental-auto-refresh` only records
-    /// a cadence value; it never grants writer ownership.
+    /// With `--experimental-auto-refresh` it tunes the embedded refresh cadence;
+    /// unset, that opt-in falls back to a bounded default. On its own it changes
+    /// nothing and never grants writer ownership.
     #[arg(long, value_parser = clap::value_parser!(u64).range(10..))]
     refresh_interval_seconds: Option<u64>,
 

@@ -1632,10 +1632,12 @@ enum Commands {
         #[arg(long, conflicts_with = "no_auto_refresh")]
         experimental_auto_refresh: bool,
 
-        /// Cadence for `--experimental-auto-refresh` in seconds (default: 300).
+        /// Accepted for compatibility; ignored unless
+        /// `--experimental-auto-refresh` is set.
         ///
-        /// Supplying this option without `--experimental-auto-refresh` only
-        /// records a cadence value; it never grants writer ownership.
+        /// With `--experimental-auto-refresh` it tunes the embedded refresh
+        /// cadence. On its own it changes nothing and never grants writer
+        /// ownership.
         #[arg(
             long,
             default_value_t = MCP_AUTO_REFRESH_INTERVAL_SECONDS,
