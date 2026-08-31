@@ -100,10 +100,10 @@ fn validate_auto_refresh_transport(
     transport: McpTransport,
     experimental_auto_refresh: bool,
 ) -> Result<(), &'static str> {
-    if experimental_auto_refresh && !matches!(transport, McpTransport::Http) {
-        return Err("--experimental-auto-refresh requires --transport http");
-    }
-    Ok(())
+    mcp::validate_experimental_auto_refresh(
+        matches!(transport, McpTransport::Http),
+        experimental_auto_refresh,
+    )
 }
 
 fn lifecycle_from_args(args: &Args) -> McpLifecycleConfig {

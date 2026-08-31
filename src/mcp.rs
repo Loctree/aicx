@@ -92,6 +92,21 @@ impl Default for McpLifecycleConfig {
     }
 }
 
+/// Shared transport policy for the experimental embedded-writer opt-in.
+///
+/// Both `aicx serve` and the standalone `aicx-mcp` binary refuse
+/// `--experimental-auto-refresh` unless the server is the long-lived HTTP one:
+/// an ephemeral stdio server must never take periodic catalog/index ownership.
+pub fn validate_experimental_auto_refresh(
+    transport_is_http: bool,
+    experimental_auto_refresh: bool,
+) -> Result<(), &'static str> {
+    if experimental_auto_refresh && !transport_is_http {
+        return Err("--experimental-auto-refresh requires --transport http");
+    }
+    Ok(())
+}
+
 fn refresh_catalog_and_index(hours: u64) -> anyhow::Result<()> {
     let aicx_home = crate::aicx_home::resolve()?;
     let user_home = crate::os_user_home()
@@ -2373,8 +2388,8 @@ mod tests {
         build_mcp_semantic_filters, configured_mcp_session_manager,
         inject_mcp_filter_pushdown_payload, inject_mcp_semantic_fallback_payload,
         parse_date_filter_mcp, parse_project_match, resolve_mcp_projects,
-        spawn_mcp_session_cleanup, validate_http_auth_policy, validate_score_filter,
-        validate_string_len,
+        spawn_mcp_session_cleanup, validate_experimental_auto_refresh, validate_http_auth_policy,
+        validate_score_filter, validate_string_len,
     };
 
     use crate::auth::{AuthConfig, AuthSource};
@@ -2388,6 +2403,26 @@ mod tests {
         sync::Arc,
         time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
+
+    #[test]
+    fn experimental_auto_refresh_is_http_only() {
+        assert_eq!(
+            validate_experimental_auto_refresh(true, true),
+            Ok(()),
+            "the long-lived HTTP service is the only place the embedded writer may be requested"
+        );
+        assert_eq!(
+            validate_experimental_auto_refresh(false, true),
+            Err("--experimental-auto-refresh requires --transport http"),
+            "an ephemeral stdio server must never take embedded writer ownership"
+        );
+        assert_eq!(
+            validate_experimental_auto_refresh(true, false),
+            Ok(()),
+            "without the opt-in every transport stays reader-only"
+        );
+        assert_eq!(validate_experimental_auto_refresh(false, false), Ok(()));
+    }
 
     #[test]
     fn lifecycle_defaults_to_reader_only() {

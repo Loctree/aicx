@@ -2317,10 +2317,11 @@ fn validate_serve_auto_refresh_transport(
     transport: McpTransport,
     experimental_auto_refresh: bool,
 ) -> Result<()> {
-    if experimental_auto_refresh && !matches!(transport, McpTransport::Http) {
-        anyhow::bail!("--experimental-auto-refresh requires --transport http");
-    }
-    Ok(())
+    mcp::validate_experimental_auto_refresh(
+        matches!(transport, McpTransport::Http),
+        experimental_auto_refresh,
+    )
+    .map_err(|message| anyhow::anyhow!(message))
 }
 
 fn main() -> Result<()> {
