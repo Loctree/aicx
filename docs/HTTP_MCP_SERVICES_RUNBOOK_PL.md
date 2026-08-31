@@ -38,7 +38,7 @@ pliku tokena albo mechanizmu zmiennej/nagłówka danego klienta.
 
 ### 2.1. Odświeżanie na Żywo (Live Refresh)
 * **Czy `aicx serve` odświeża się na żywo?** **Tak.** `aicx serve` nie zamraża stanu indeksu w RAM na stałe. Każde zapytanie narzędzia (`aicx_search`, `aicx_steer`, `aicx_intents`) odpytuje bezpośrednio bieżący stan bazy Tantivy oraz wektorów z dysku (`~/.aicx/`).
-* **Cykl indeksowania:** Tryb HTTP ma własną ograniczoną pętlę async: co 5 minut odświeża gorące 48 godzin katalogu i inkrementalnie publikuje indeks leksykalny. Blokująca praca plikowa i indeksowanie wykonują się poza workerami requestów Tokio. Interwał zmienisz przez `--refresh-interval-seconds`; `--no-auto-refresh` ma sens tylko wtedy, gdy świeżość ma innego jawnego właściciela.
+* **Cykl indeksowania:** długo żyjący serwer HTTP jest **czytelnikiem**, nie writerem indeksu. Domyślnie nie ma własnej pętli odświeżania — świeżość należy do osobnego właściciela maintenance (`tools/install-reindex-schedule.sh`, czyli `aicx catalog rebuild && aicx index`). Wbudowany writer nadal istnieje, ale wyłącznie za jawnym, eksperymentalnym opt-inem (`--experimental-auto-refresh`, kadencja przez `--refresh-interval-seconds`); samo `--refresh-interval-seconds` nigdy nie nadaje własności writera. `--no-auto-refresh` zostaje wyłącznie jako przestarzała flaga kompatybilności — domyślnie i tak jest wyłączone.
 
 ### 2.2. Instalacja i Cele w Makefile
 * **Standardowa instalacja (z kreatorem):**
@@ -46,7 +46,7 @@ pliku tokena albo mechanizmu zmiennej/nagłówka danego klienta.
   cd /Volumes/vc-workspace/Loctree/aicx
   make install
   ```
-  *(Uruchamia `install.sh`, instaluje binarki, rejestruje `com.loctree.aicx.mcp` i zapisuje klientom Claude/Codex/Gemini `mcpServers.aicx` jako `{"url":"http://127.0.0.1:8044/mcp"}` — nie stdio `command`. Ten serwer jest właścicielem odświeżania indeksu. `AICX_SKIP_MCP_SERVICE=1` zostawia stdio.)*
+  *(Uruchamia `install.sh`, instaluje binarki, rejestruje `com.loctree.aicx.mcp` i zapisuje klientom Claude/Codex/Gemini `mcpServers.aicx` jako `{"url":"http://127.0.0.1:8044/mcp"}` — nie stdio `command`. Ten serwer jest czytelnikiem; odświeżanie indeksu zostaje przy osobnym właścicielu maintenance. `AICX_SKIP_MCP_SERVICE=1` zostawia stdio.)*
 
 * **Zarządzanie serwisem LaunchAgent:**
   ```bash

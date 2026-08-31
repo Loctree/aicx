@@ -38,7 +38,7 @@ client-specific environment/header mechanism.
 
 ### 2.1. Live Refresh Behavior
 * **Is `aicx serve` live?** **Yes.** `aicx serve` does not freeze a stale in-memory copy of the index. Every tool invocation (`aicx_search`, `aicx_steer`, `aicx_intents`) reads the live Tantivy and vector store state from disk (`~/.aicx/`).
-* **Ingestion cadence:** HTTP mode owns a bounded async refresh loop: every 5 minutes it refreshes the hot 48-hour catalog window and incrementally publishes the lexical index. The blocking filesystem/index work runs outside Tokio request workers. Use `--refresh-interval-seconds` to tune it or `--no-auto-refresh` only when another explicit writer owns freshness.
+* **Ingestion cadence:** the long-lived HTTP server is a **reader**, not an index writer. It owns no periodic refresh loop by default; freshness belongs to a separate maintenance owner (`tools/install-reindex-schedule.sh`, i.e. `aicx catalog rebuild && aicx index`). The legacy embedded writer still exists behind an explicit, experimental opt-in (`--experimental-auto-refresh`, cadence tuned with `--refresh-interval-seconds`); `--refresh-interval-seconds` on its own never grants writer ownership. `--no-auto-refresh` is kept only as a deprecated compatibility flag — the default is already off.
 
 ### 2.2. Installation & Makefile Targets
 * **Standard install (with wizard):**
@@ -46,7 +46,7 @@ client-specific environment/header mechanism.
   cd /Volumes/vc-workspace/Loctree/aicx
   make install
   ```
-  *(Runs `install.sh`, installs binaries, registers `com.loctree.aicx.mcp`, and writes Claude/Codex/Gemini `mcpServers.aicx` as `{"url":"http://127.0.0.1:8044/mcp"}` — not stdio `command`. That server owns index refresh. `AICX_SKIP_MCP_SERVICE=1` keeps stdio.)*
+  *(Runs `install.sh`, installs binaries, registers `com.loctree.aicx.mcp`, and writes Claude/Codex/Gemini `mcpServers.aicx` as `{"url":"http://127.0.0.1:8044/mcp"}` — not stdio `command`. That server is a reader; index refresh stays with the separate maintenance owner. `AICX_SKIP_MCP_SERVICE=1` keeps stdio.)*
 
 * **Explicit service management:**
   ```bash
