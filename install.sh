@@ -1090,7 +1090,7 @@ maybe_configure_aicx_home
 
 MCP_CLIENTS_HELPER="$SCRIPT_DIR/tools/configure_mcp_clients.py"
 MCP_SERVICE_SCRIPT="$SCRIPT_DIR/tools/install-mcp-service.sh"
-MCP_SERVICE_PLIST="$HOME/Library/LaunchAgents/io.vetcoders.aicx.mcp.plist"
+MCP_SERVICE_PLIST="$HOME/Library/LaunchAgents/com.loctree.aicx.mcp.plist"
 MCP_TRANSPORT="stdio"
 
 # Background HTTP MCP service first (macOS launchd; no-op elsewhere). Clients
