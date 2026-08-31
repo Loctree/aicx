@@ -102,8 +102,9 @@ install-service:
 uninstall-service:
 	bash ./tools/install-mcp-service.sh --uninstall
 
-# Legacy standalone reindex cadence. HTTP service installations use the
-# server-owned async refresh loop; keep these targets only for headless setups.
+# Separate index-maintenance owner (catalog rebuild + index on a cadence).
+# The HTTP MCP service is reader-only and owns no refresh loop; install this
+# schedule (or run your own maintenance) to keep the index fresh.
 install-schedule:
 	bash ./tools/install-reindex-schedule.sh
 
@@ -445,8 +446,8 @@ help:
 	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'install-cargo' '- Explain why crates.io install is not the active path'
 	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'install-service' '- Install & start local AICX Streamable HTTP service (:8044)'
 	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'uninstall-service' '- Stop & remove the AICX Streamable HTTP service'
-	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'install-schedule' '- Install legacy standalone reindex schedule (without HTTP service)'
-	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'uninstall-schedule' '- Remove the legacy standalone reindex schedule'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'install-schedule' '- Install the separate index-maintenance schedule (HTTP service is reader-only)'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'uninstall-schedule' '- Remove the separate index-maintenance schedule'
 	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'git-hooks' '- Install repo-local pre-commit + pre-push hooks'
 	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'precheck' '- Quick default cargo check'
 	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'precheck-native' 'Quick native GGUF cargo check'

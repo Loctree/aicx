@@ -1106,6 +1106,11 @@ if [ "${AICX_SKIP_MCP_SERVICE:-0}" != "1" ]; then
   if [ "$(uname -s)" = "Darwin" ] && [ -f "$MCP_SERVICE_PLIST" ]; then
     MCP_TRANSPORT="http"
   fi
+  if [ "$MCP_TRANSPORT" = "http" ]; then
+    echo "  Note: the HTTP MCP service is a reader and does not refresh the index."
+    echo "  For periodic freshness install the separate maintenance schedule:"
+    echo "    make install-schedule   # aicx catalog rebuild && aicx index on a cadence"
+  fi
 fi
 
 configure_mcp_clients() {

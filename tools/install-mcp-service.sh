@@ -216,3 +216,7 @@ else
   note "mcp service: do not run as root — this is a per-user LaunchAgent"
   note "index maintenance: separate; this reader never owns refresh"
 fi
+
+note "Note: the HTTP MCP service is a reader and does not refresh the index."
+note "For periodic freshness install the separate maintenance schedule:"
+note "  make install-schedule   # aicx catalog rebuild && aicx index on a cadence"
