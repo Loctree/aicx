@@ -45,6 +45,11 @@ const MCP_SESSION_IDLE_TTL: Duration = Duration::from_secs(30 * 60);
 const MCP_SESSION_MAX_SESSIONS: usize = 1000;
 const MCP_SESSION_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 const MCP_IDLE_MEMORY_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+/// Cadence used when an embedded catalog/index writer is explicitly requested.
+///
+/// This is not a default. `McpLifecycleConfig::default()` is reader-only and
+/// leaves index maintenance to a separate process owner; the value below only
+/// applies once a caller deliberately opts in.
 pub const MCP_AUTO_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 pub const MCP_AUTO_REFRESH_HOURS: u64 = 48;
 
@@ -65,15 +70,20 @@ const MCP_EMBEDDER_NEGATIVE_TTL: Duration = Duration::from_secs(5 * 60);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct McpLifecycleConfig {
     pub idle_memory_drop_after: Duration,
+    /// `Some(interval)` makes this server own periodic catalog/index refresh.
+    /// `None` — the default — keeps it a reader.
     pub auto_refresh_interval: Option<Duration>,
     pub auto_refresh_hours: u64,
 }
 
 impl Default for McpLifecycleConfig {
+    /// Reader-only by default: a normal long-lived MCP server never owns
+    /// periodic index maintenance. Embedded refresh stays available, but only
+    /// when a caller sets `auto_refresh_interval` to `Some(interval)` on purpose.
     fn default() -> Self {
         Self {
             idle_memory_drop_after: MCP_IDLE_MEMORY_DROP_AFTER,
-            auto_refresh_interval: Some(MCP_AUTO_REFRESH_INTERVAL),
+            auto_refresh_interval: None,
             auto_refresh_hours: MCP_AUTO_REFRESH_HOURS,
         }
     }
@@ -2377,13 +2387,25 @@ mod tests {
     };
 
     #[test]
-    fn http_lifecycle_defaults_to_bounded_auto_refresh() {
+    fn lifecycle_defaults_to_reader_only() {
         let lifecycle = McpLifecycleConfig::default();
+        assert_eq!(
+            lifecycle.auto_refresh_interval, None,
+            "default MCP lifecycle must never own periodic index maintenance"
+        );
+        assert_eq!(lifecycle.auto_refresh_hours, MCP_AUTO_REFRESH_HOURS);
+    }
+
+    #[test]
+    fn explicit_lifecycle_can_still_request_embedded_refresh() {
+        let lifecycle = McpLifecycleConfig {
+            auto_refresh_interval: Some(MCP_AUTO_REFRESH_INTERVAL),
+            ..McpLifecycleConfig::default()
+        };
         assert_eq!(
             lifecycle.auto_refresh_interval,
             Some(MCP_AUTO_REFRESH_INTERVAL)
         );
-        assert_eq!(lifecycle.auto_refresh_hours, MCP_AUTO_REFRESH_HOURS);
     }
 
     fn project_store_root(label: &str) -> PathBuf {
