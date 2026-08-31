@@ -72,7 +72,7 @@ for arg in "$@"; do
     --help|-h)
       echo "Usage: install.sh [--skip-install] [--dry-run] [--force]"
       echo "  Install aicx + aicx-mcp and configure MCP for Claude Code, Codex, and Gemini."
-      echo "  On Darwin, a full install starts io.vetcoders.aicx.mcp and writes client"
+      echo "  On Darwin, a full install starts com.loctree.aicx.mcp and writes client"
       echo "  {\"url\": \"http://127.0.0.1:8044/mcp\"} (or AICX_MCP_HOST/PORT). Stdio remains"
       echo "  only when AICX_SKIP_MCP_SERVICE=1 or the LaunchAgent is not installed."
       echo "  Run from a release bundle or the repo root / local checkout."
@@ -1127,7 +1127,7 @@ configure_mcp_clients() {
         echo "  Warning: MCP HTTP client wiring failed (non-fatal)."
         return
       }
-    echo "  MCP clients: Streamable HTTP (same endpoint as io.vetcoders.aicx.mcp)"
+    echo "  MCP clients: Streamable HTTP (same endpoint as com.loctree.aicx.mcp)"
     return
   fi
   if [ -z "$AICX_MCP_COMMAND" ]; then
@@ -1173,7 +1173,7 @@ echo "  aicx      - command-line tool for indexing and searching agent history"
 echo "  aicx-mcp  - stdio MCP binary (used when HTTP service is skipped)"
 if [ "$MCP_TRANSPORT" = "http" ]; then
   MCP_CLIENT_URL="$(python3 "$MCP_CLIENTS_HELPER" --print-url --plist "$MCP_SERVICE_PLIST" 2>/dev/null || true)"
-  echo "  MCP HTTP  - LaunchAgent io.vetcoders.aicx.mcp"
+  echo "  MCP HTTP  - LaunchAgent com.loctree.aicx.mcp"
   echo "              clients: ${MCP_CLIENT_URL:-http://127.0.0.1:8044/mcp}"
 else
   echo "  MCP stdio - Claude/Codex/Gemini still spawn aicx-mcp (HTTP service skipped)"
