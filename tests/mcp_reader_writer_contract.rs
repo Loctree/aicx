@@ -10,6 +10,20 @@ fn default_mcp_lifecycle_is_reader_only() {
 }
 
 #[test]
+fn aicx_serve_requires_explicit_writer_opt_in_in_source_contract() {
+    let source = include_str!("../src/main.rs");
+
+    assert!(
+        source.contains("experimental_auto_refresh"),
+        "aicx serve must expose an explicit embedded-writer opt-in"
+    );
+    assert!(
+        !source.contains("auto_refresh_interval: (!no_auto_refresh)"),
+        "aicx serve must not infer writer ownership from the absence of --no-auto-refresh"
+    );
+}
+
+#[test]
 fn http_service_installer_does_not_take_over_index_maintenance() {
     let installer = include_str!("../tools/install-mcp-service.sh");
 
