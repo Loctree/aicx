@@ -5,9 +5,10 @@
 //!
 //! Usage:
 //!   aicx-mcp                          # stdio transport
-//!   aicx-mcp --transport http         # streamable HTTP on port 8044
+//!   aicx-mcp --transport http         # reader-only HTTP on port 8044
 //!   aicx-mcp --transport http --port 9000
 //!   aicx-mcp --transport http --host 0.0.0.0 --port 9000 --auth-token "$TOKEN"
+//!   aicx-mcp --transport http --experimental-auto-refresh # explicit legacy writer opt-in
 //!
 //! Vibecrafted with AI Agents by Vetcoders (c)2026 Vetcoders
 
@@ -17,8 +18,11 @@ use std::io::Write as _;
 use std::net::IpAddr;
 use std::panic;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use clap::Parser;
+
+const EXPERIMENTAL_AUTO_REFRESH_DEFAULT_SECONDS: u64 = 300;
 
 /// aicx MCP server — AI session context as MCP tools
 #[derive(Parser)]
@@ -67,13 +71,39 @@ struct Args {
     #[arg(long, default_value_t = 15, value_parser = clap::value_parser!(u64).range(1..))]
     idle_drop_minutes: u64,
 
-    /// Refresh the hot catalog and lexical index in the background at this cadence.
-    #[arg(long, default_value_t = 300, value_parser = clap::value_parser!(u64).range(10..))]
-    refresh_interval_seconds: u64,
+    /// Explicitly opt in to the legacy embedded HTTP catalog/index writer.
+    ///
+    /// Normal long-lived MCP service is reader-only. This flag is experimental
+    /// and intentionally loud because it makes the reader own periodic index
+    /// maintenance again.
+    #[arg(long, conflicts_with = "no_auto_refresh")]
+    experimental_auto_refresh: bool,
 
-    /// Disable the HTTP server's background catalog/index refresh loop.
-    #[arg(long)]
+    /// Cadence for `--experimental-auto-refresh` in seconds (default: 300).
+    ///
+    /// Supplying this option without `--experimental-auto-refresh` only records
+    /// a cadence value; it never grants writer ownership.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(10..))]
+    refresh_interval_seconds: Option<u64>,
+
+    /// Deprecated compatibility flag: auto-refresh is already disabled by default.
+    #[arg(long, conflicts_with = "experimental_auto_refresh")]
     no_auto_refresh: bool,
+}
+
+fn lifecycle_from_args(args: &Args) -> McpLifecycleConfig {
+    let auto_refresh_interval = args.experimental_auto_refresh.then(|| {
+        Duration::from_secs(
+            args.refresh_interval_seconds
+                .unwrap_or(EXPERIMENTAL_AUTO_REFRESH_DEFAULT_SECONDS),
+        )
+    });
+
+    McpLifecycleConfig {
+        idle_memory_drop_after: Duration::from_secs(args.idle_drop_minutes.saturating_mul(60)),
+        auto_refresh_interval,
+        ..McpLifecycleConfig::default()
+    }
 }
 
 // Safe stderr logging — never panics, even if stderr is closed.
@@ -148,20 +178,18 @@ fn main() -> ExitCode {
     if matches!(args.transport, McpTransport::Http) && args.allow_any_host {
         safe_stderr_log("[aicx-mcp] WARNING: HTTP Host validation disabled (--allow-any-host)");
     }
+    if matches!(args.transport, McpTransport::Http) && args.experimental_auto_refresh {
+        safe_stderr_log(
+            "[aicx-mcp] WARNING: EXPERIMENTAL embedded auto-refresh writer enabled; normal HTTP MCP is reader-only",
+        );
+    }
     let http_config = McpHttpConfig {
         host: args.host,
         port: args.port,
         allowed_hosts: args.allowed_hosts,
         allow_any_host: args.allow_any_host,
     };
-    let lifecycle = McpLifecycleConfig {
-        idle_memory_drop_after: std::time::Duration::from_secs(
-            args.idle_drop_minutes.saturating_mul(60),
-        ),
-        auto_refresh_interval: (!args.no_auto_refresh)
-            .then(|| std::time::Duration::from_secs(args.refresh_interval_seconds)),
-        ..McpLifecycleConfig::default()
-    };
+    let lifecycle = lifecycle_from_args(&args);
     match rt.block_on(async {
         mcp::run_transport_with_lifecycle(args.transport, http_config, auth_config, lifecycle).await
     }) {
@@ -194,15 +222,76 @@ mod tests {
     }
 
     #[test]
-    fn http_host_defaults_to_loopback() {
+    fn http_host_defaults_to_loopback_and_reader_only() {
         let args = Args::try_parse_from(["aicx-mcp", "--transport", "http"])
             .expect("http transport should parse with default host");
 
         assert_eq!(args.host, IpAddr::V4(Ipv4Addr::LOCALHOST));
         assert_eq!(args.port, 8044);
         assert_eq!(args.idle_drop_minutes, 15);
-        assert_eq!(args.refresh_interval_seconds, 300);
+        assert_eq!(args.refresh_interval_seconds, None);
+        assert!(!args.experimental_auto_refresh);
         assert!(!args.no_auto_refresh);
+        assert_eq!(lifecycle_from_args(&args).auto_refresh_interval, None);
+    }
+
+    #[test]
+    fn refresh_interval_alone_does_not_grant_writer_ownership() {
+        let args = Args::try_parse_from([
+            "aicx-mcp",
+            "--transport",
+            "http",
+            "--refresh-interval-seconds",
+            "1800",
+        ])
+        .expect("legacy cadence-only invocation must parse safely");
+
+        assert_eq!(args.refresh_interval_seconds, Some(1800));
+        assert!(!args.experimental_auto_refresh);
+        assert_eq!(lifecycle_from_args(&args).auto_refresh_interval, None);
+    }
+
+    #[test]
+    fn experimental_auto_refresh_requires_explicit_opt_in() {
+        let args = Args::try_parse_from([
+            "aicx-mcp",
+            "--transport",
+            "http",
+            "--experimental-auto-refresh",
+            "--refresh-interval-seconds",
+            "900",
+        ])
+        .expect("explicit experimental writer opt-in should parse");
+
+        assert_eq!(
+            lifecycle_from_args(&args).auto_refresh_interval,
+            Some(Duration::from_secs(900))
+        );
+    }
+
+    #[test]
+    fn experimental_auto_refresh_uses_bounded_default_cadence() {
+        let args = Args::try_parse_from([
+            "aicx-mcp",
+            "--transport",
+            "http",
+            "--experimental-auto-refresh",
+        ])
+        .expect("explicit experimental writer opt-in should parse");
+
+        assert_eq!(
+            lifecycle_from_args(&args).auto_refresh_interval,
+            Some(Duration::from_secs(
+                EXPERIMENTAL_AUTO_REFRESH_DEFAULT_SECONDS
+            ))
+        );
+    }
+
+    #[test]
+    fn stdio_remains_non_auto_refresh_by_default() {
+        let args = Args::try_parse_from(["aicx-mcp"]).expect("stdio default should parse");
+        assert!(matches!(args.transport, McpTransport::Stdio));
+        assert_eq!(lifecycle_from_args(&args).auto_refresh_interval, None);
     }
 
     #[test]
@@ -251,7 +340,27 @@ mod tests {
     }
 
     #[test]
-    fn help_shows_http_host_flag() {
+    fn legacy_no_auto_refresh_remains_safe_compatibility() {
+        let args = Args::try_parse_from(["aicx-mcp", "--transport", "http", "--no-auto-refresh"])
+            .expect("legacy no-auto-refresh should remain accepted");
+
+        assert!(args.no_auto_refresh);
+        assert_eq!(lifecycle_from_args(&args).auto_refresh_interval, None);
+        assert!(
+            Args::try_parse_from([
+                "aicx-mcp",
+                "--transport",
+                "http",
+                "--experimental-auto-refresh",
+                "--no-auto-refresh",
+            ])
+            .is_err(),
+            "explicit writer opt-in and explicit disable must conflict"
+        );
+    }
+
+    #[test]
+    fn help_shows_reader_only_and_experimental_writer_flags() {
         let mut cmd = Args::command();
         let rendered = cmd.render_long_help().to_string();
 
@@ -259,8 +368,9 @@ mod tests {
         assert!(rendered.contains("Bind address for streamable HTTP transport"));
         assert!(rendered.contains("--no-require-auth"));
         assert!(rendered.contains("--idle-drop-minutes"));
+        assert!(rendered.contains("--experimental-auto-refresh"));
         assert!(rendered.contains("--refresh-interval-seconds"));
-        assert!(rendered.contains("--no-auto-refresh"));
+        assert!(rendered.contains("auto-refresh is already disabled by default"));
     }
 
     #[test]
