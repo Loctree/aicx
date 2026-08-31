@@ -2302,6 +2302,19 @@ fn serve_lifecycle(
     }
 }
 
+/// `--experimental-auto-refresh` only makes sense for the long-lived HTTP
+/// service. A stdio server is per-client and short-lived, so an embedded writer
+/// there would hand periodic index ownership to an ephemeral reader.
+fn validate_serve_auto_refresh_transport(
+    transport: McpTransport,
+    experimental_auto_refresh: bool,
+) -> Result<()> {
+    if experimental_auto_refresh && !matches!(transport, McpTransport::Http) {
+        anyhow::bail!("--experimental-auto-refresh requires --transport http");
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     restore_default_sigpipe();
 
@@ -2952,6 +2965,7 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
             // so safety must never depend on it being passed.
             no_auto_refresh: _,
         }) => {
+            validate_serve_auto_refresh_transport(transport, experimental_auto_refresh)?;
             let require_auth = require_auth && !no_require_auth;
             let auth_config = aicx::auth::load_auth_config(auth_token.as_deref(), require_auth)?;
             if matches!(transport, McpTransport::Http) && !require_auth && host.is_loopback() {

@@ -3460,6 +3460,53 @@ fn serve_args(argv: &[&str]) -> (bool, u64, bool) {
     }
 }
 
+fn serve_transport_args(argv: &[&str]) -> (McpTransport, bool) {
+    let cli = Cli::try_parse_from(argv).expect("serve command should parse");
+    match cli.command {
+        Some(Commands::Serve {
+            transport,
+            experimental_auto_refresh,
+            ..
+        }) => (transport, experimental_auto_refresh),
+        other => panic!("expected serve command, got {other:?}"),
+    }
+}
+
+#[test]
+fn serve_experimental_opt_in_requires_http_transport() {
+    let (transport, experimental) = serve_transport_args(
+        [
+            "aicx",
+            "serve",
+            "--transport",
+            "stdio",
+            "--experimental-auto-refresh",
+        ]
+        .as_slice(),
+    );
+    let error = validate_serve_auto_refresh_transport(transport, experimental)
+        .expect_err("an ephemeral stdio server must never take embedded writer ownership");
+    assert_eq!(
+        error.to_string(),
+        "--experimental-auto-refresh requires --transport http"
+    );
+
+    let (transport, experimental) = serve_transport_args(
+        [
+            "aicx",
+            "serve",
+            "--transport",
+            "http",
+            "--experimental-auto-refresh",
+        ]
+        .as_slice(),
+    );
+    assert!(
+        validate_serve_auto_refresh_transport(transport, experimental).is_ok(),
+        "the long-lived HTTP service remains the only place the opt-in is allowed"
+    );
+}
+
 #[test]
 fn serve_default_http_is_reader_only() {
     let (experimental, interval, legacy) =

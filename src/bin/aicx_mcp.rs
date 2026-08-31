@@ -91,6 +91,19 @@ struct Args {
     no_auto_refresh: bool,
 }
 
+/// `--experimental-auto-refresh` only makes sense for the long-lived HTTP
+/// service. A stdio server is per-client and short-lived, so an embedded writer
+/// there would hand periodic index ownership to an ephemeral reader.
+fn validate_auto_refresh_transport(
+    transport: McpTransport,
+    experimental_auto_refresh: bool,
+) -> Result<(), &'static str> {
+    if experimental_auto_refresh && !matches!(transport, McpTransport::Http) {
+        return Err("--experimental-auto-refresh requires --transport http");
+    }
+    Ok(())
+}
+
 fn lifecycle_from_args(args: &Args) -> McpLifecycleConfig {
     let auto_refresh_interval = args.experimental_auto_refresh.then(|| {
         Duration::from_secs(
@@ -152,6 +165,13 @@ fn main() -> ExitCode {
     install_panic_hook();
 
     let args = Args::parse();
+
+    if let Err(message) =
+        validate_auto_refresh_transport(args.transport, args.experimental_auto_refresh)
+    {
+        safe_stderr_log(&format!("[aicx-mcp] {message}"));
+        return ExitCode::FAILURE;
+    }
 
     let rt = match tokio::runtime::Runtime::new() {
         Ok(rt) => rt,
@@ -337,6 +357,31 @@ mod tests {
             .expect("no-require-auth alias should parse");
 
         assert!(!args.require_auth || args.no_require_auth);
+    }
+
+    #[test]
+    fn experimental_auto_refresh_requires_http_transport() {
+        let stdio = Args::try_parse_from(["aicx-mcp", "--experimental-auto-refresh"])
+            .expect("the opt-in flag still parses on the default stdio transport");
+
+        assert_eq!(
+            validate_auto_refresh_transport(stdio.transport, stdio.experimental_auto_refresh),
+            Err("--experimental-auto-refresh requires --transport http"),
+            "an ephemeral stdio server must never take embedded writer ownership"
+        );
+
+        let http = Args::try_parse_from([
+            "aicx-mcp",
+            "--transport",
+            "http",
+            "--experimental-auto-refresh",
+        ])
+        .expect("http transport should parse with the experimental opt-in");
+
+        assert!(
+            validate_auto_refresh_transport(http.transport, http.experimental_auto_refresh).is_ok(),
+            "the long-lived HTTP service remains the only place the opt-in is allowed"
+        );
     }
 
     #[test]
