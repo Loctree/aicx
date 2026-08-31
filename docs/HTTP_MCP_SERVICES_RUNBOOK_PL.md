@@ -52,7 +52,7 @@ pliku tokena albo mechanizmu zmiennej/nagłówka danego klienta.
   ```bash
   make install-service    # Instaluje i startuje LaunchAgent com.loctree.aicx.mcp
   make uninstall-service  # Zatrzymuje i wyrejestrowuje LaunchAgent com.loctree.aicx.mcp
-  make install-schedule   # Legacy: osobny refresh tylko gdy nie działa serwer HTTP
+  make install-schedule   # Osobny właściciel maintenance: cykliczny rebuild katalogu + index (wymagany dla świeżości; serwis HTTP jest czytelnikiem)
   ```
 
 ### 2.3. Weryfikacja Działania (Smoke Test)
@@ -194,7 +194,7 @@ Serwisy są zarejestrowane jako per-user LaunchAgents w `~/Library/LaunchAgents/
 | **`com.loctree.aicx.mcp`** | `aicx serve --transport http` | `8044` | `~/.aicx/logs/aicx-serve-http.log` |
 | **`com.loctree.loctree.mcp`** | `loctree-mcp --transport http` | `5174` | `~/.loctree/logs/loctree-serve-http.log` |
 
-Poprzedni timer `io.vetcoders.aicx.reindex` jest usuwany przy instalacji serwera HTTP, aby nie utrzymywać dwóch konkurujących writerów indeksu.
+Instalator serwisu HTTP nie dotyka już etykiet maintenance: serwer jest czytelnikiem, więc osobny harmonogram reindeksacji współistnieje z nim z założenia. (Historycznie starsze instalatory usuwały timer `io.vetcoders.aicx.reindex`, ponieważ sam serwer był writerem.)
 
 ---
 
