@@ -41,7 +41,9 @@ use aicx::dashboard_server::{self, DashboardCorsPolicy, DashboardServerConfig};
 use aicx::extraction::{self as sources, ExtractionConfig};
 use aicx::intents;
 use aicx::legacy_archive;
-use aicx::mcp::{self, McpHttpConfig, McpLifecycleConfig, McpTransport};
+use aicx::mcp::{
+    self, MCP_AUTO_REFRESH_INTERVAL_SECONDS, McpHttpConfig, McpLifecycleConfig, McpTransport,
+};
 use aicx::output::{self, OutputConfig, OutputFormat, OutputMode, ReportMetadata};
 use aicx::rank;
 use aicx::reports_extractor::{self, ReportsExtractorConfig};
@@ -1634,7 +1636,11 @@ enum Commands {
         ///
         /// Supplying this option without `--experimental-auto-refresh` only
         /// records a cadence value; it never grants writer ownership.
-        #[arg(long, default_value_t = 300, value_parser = clap::value_parser!(u64).range(10..))]
+        #[arg(
+            long,
+            default_value_t = MCP_AUTO_REFRESH_INTERVAL_SECONDS,
+            value_parser = clap::value_parser!(u64).range(10..)
+        )]
         refresh_interval_seconds: u64,
 
         /// Deprecated compatibility flag: auto-refresh is already disabled by default.

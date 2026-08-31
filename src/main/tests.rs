@@ -3577,7 +3577,7 @@ fn serve_experimental_opt_in_uses_bounded_default_cadence() {
     );
     assert_eq!(
         serve_lifecycle(experimental, interval).auto_refresh_interval,
-        Some(Duration::from_secs(300))
+        Some(Duration::from_secs(MCP_AUTO_REFRESH_INTERVAL_SECONDS))
     );
 }
 

@@ -13,7 +13,9 @@
 //! Vibecrafted with AI Agents by Vetcoders (c)2026 Vetcoders
 
 use aicx::auth;
-use aicx::mcp::{self, McpHttpConfig, McpLifecycleConfig, McpTransport};
+use aicx::mcp::{
+    self, MCP_AUTO_REFRESH_INTERVAL_SECONDS, McpHttpConfig, McpLifecycleConfig, McpTransport,
+};
 use std::io::Write as _;
 use std::net::IpAddr;
 use std::panic;
@@ -21,8 +23,6 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::Parser;
-
-const EXPERIMENTAL_AUTO_REFRESH_DEFAULT_SECONDS: u64 = 300;
 
 /// aicx MCP server — AI session context as MCP tools
 #[derive(Parser)]
@@ -108,7 +108,7 @@ fn lifecycle_from_args(args: &Args) -> McpLifecycleConfig {
     let auto_refresh_interval = args.experimental_auto_refresh.then(|| {
         Duration::from_secs(
             args.refresh_interval_seconds
-                .unwrap_or(EXPERIMENTAL_AUTO_REFRESH_DEFAULT_SECONDS),
+                .unwrap_or(MCP_AUTO_REFRESH_INTERVAL_SECONDS),
         )
     });
 
@@ -301,9 +301,7 @@ mod tests {
 
         assert_eq!(
             lifecycle_from_args(&args).auto_refresh_interval,
-            Some(Duration::from_secs(
-                EXPERIMENTAL_AUTO_REFRESH_DEFAULT_SECONDS
-            ))
+            Some(Duration::from_secs(MCP_AUTO_REFRESH_INTERVAL_SECONDS))
         );
     }
 

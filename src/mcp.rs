@@ -51,6 +51,9 @@ const MCP_IDLE_MEMORY_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 /// leaves index maintenance to a separate process owner; the value below only
 /// applies once a caller deliberately opts in.
 pub const MCP_AUTO_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
+/// The same cadence in whole seconds, for CLI surfaces that take a `u64`
+/// seconds argument. Derived so no binary restates the number.
+pub const MCP_AUTO_REFRESH_INTERVAL_SECONDS: u64 = MCP_AUTO_REFRESH_INTERVAL.as_secs();
 pub const MCP_AUTO_REFRESH_HOURS: u64 = 48;
 
 /// Default time without an MCP tool request before request-derived memory is
