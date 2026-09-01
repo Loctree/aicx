@@ -129,6 +129,7 @@ pub fn extract_agent_sessions(
     let root = match agent {
         crate::session_catalog::AgentKind::Claude => home.join(".claude").join("projects"),
         crate::session_catalog::AgentKind::Codex => home.join(".codex").join("sessions"),
+        crate::session_catalog::AgentKind::Cursor => home.join(".cursor").join("projects"),
         crate::session_catalog::AgentKind::Gemini => home.join(".gemini").join("tmp"),
         crate::session_catalog::AgentKind::Grok => home.join(".grok"),
         crate::session_catalog::AgentKind::Junie => home.join(".junie").join("sessions"),
@@ -370,6 +371,7 @@ const fn parser_agent(agent: crate::session_catalog::AgentKind) -> aicx_parser::
     match agent {
         crate::session_catalog::AgentKind::Claude => aicx_parser::engine::AgentKind::Claude,
         crate::session_catalog::AgentKind::Codex => aicx_parser::engine::AgentKind::Codex,
+        crate::session_catalog::AgentKind::Cursor => aicx_parser::engine::AgentKind::Cursor,
         crate::session_catalog::AgentKind::Gemini => aicx_parser::engine::AgentKind::Gemini,
         crate::session_catalog::AgentKind::Grok => aicx_parser::engine::AgentKind::Grok,
         crate::session_catalog::AgentKind::Junie => aicx_parser::engine::AgentKind::Junie,

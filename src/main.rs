@@ -11,6 +11,7 @@
 //! Supported sources:
 //! - Claude Code: ~/.claude/projects/*/*.jsonl
 //! - Codex: ~/.codex/history.jsonl
+//! - Cursor: ~/.cursor/projects/*/agent-transcripts/<uuid>/<uuid>.jsonl
 //! - Gemini: ~/.gemini/tmp/<hash>/chats/session-*.json
 //! - Gemini Antigravity: ~/.gemini/antigravity/{conversations/<uuid>.pb,brain/<uuid>/}
 //! - Junie: ~/.junie/sessions/session-*/events.jsonl
@@ -160,6 +161,7 @@ enum OverlayFormat {
 enum ExtractAgent {
     Codex,
     Claude,
+    Cursor,
     Gemini,
     Grok,
     Junie,
@@ -170,6 +172,7 @@ impl ExtractAgent {
         match self {
             Self::Codex => "codex",
             Self::Claude => "claude",
+            Self::Cursor => "cursor",
             Self::Gemini => "gemini",
             Self::Grok => "grok",
             Self::Junie => "junie",
@@ -180,6 +183,7 @@ impl ExtractAgent {
         match self {
             Self::Codex => aicx::session_catalog::AgentKind::Codex,
             Self::Claude => aicx::session_catalog::AgentKind::Claude,
+            Self::Cursor => aicx::session_catalog::AgentKind::Cursor,
             Self::Gemini => aicx::session_catalog::AgentKind::Gemini,
             Self::Grok => aicx::session_catalog::AgentKind::Grok,
             Self::Junie => aicx::session_catalog::AgentKind::Junie,
@@ -190,6 +194,7 @@ impl ExtractAgent {
         match self {
             Self::Codex => aicx::parser::engine::AgentKind::Codex,
             Self::Claude => aicx::parser::engine::AgentKind::Claude,
+            Self::Cursor => aicx::parser::engine::AgentKind::Cursor,
             Self::Gemini => aicx::parser::engine::AgentKind::Gemini,
             Self::Grok => aicx::parser::engine::AgentKind::Grok,
             Self::Junie => aicx::parser::engine::AgentKind::Junie,
@@ -201,6 +206,7 @@ impl ExtractAgent {
         match self {
             Self::Codex => home.join(".codex").join("sessions"),
             Self::Claude => home.join(".claude").join("projects"),
+            Self::Cursor => home.join(".cursor").join("projects"),
             Self::Gemini => home.join(".gemini").join("tmp"),
             // Match durable catalog rebuild: sessions live under
             // `~/.grok/sessions/<cwd-encoded>/<uuid>/…`, not the bare `~/.grok`
@@ -214,6 +220,7 @@ impl ExtractAgent {
         match value.trim().to_ascii_lowercase().as_str() {
             "codex" => Some(Self::Codex),
             "claude" => Some(Self::Claude),
+            "cursor" | "cursor-agent" => Some(Self::Cursor),
             "gemini" | "gemini-antigravity" => Some(Self::Gemini),
             "grok" => Some(Self::Grok),
             "junie" => Some(Self::Junie),
@@ -228,6 +235,8 @@ enum ExtractTarget {
     Codex(ExtractAgentArgs),
     /// Claude Code sessions (~/.claude/projects)
     Claude(ExtractAgentArgs),
+    /// Cursor agent transcripts (~/.cursor/projects/*/agent-transcripts)
+    Cursor(ExtractAgentArgs),
     /// Gemini CLI chats (~/.gemini/tmp/<hash>/chats)
     Gemini(ExtractAgentArgs),
     /// Grok CLI sessions (~/.grok)
@@ -241,6 +250,7 @@ impl ExtractTarget {
         match self {
             Self::Codex(args) => (ExtractAgent::Codex, args),
             Self::Claude(args) => (ExtractAgent::Claude, args),
+            Self::Cursor(args) => (ExtractAgent::Cursor, args),
             Self::Gemini(args) => (ExtractAgent::Gemini, args),
             Self::Grok(args) => (ExtractAgent::Grok, args),
             Self::Junie(args) => (ExtractAgent::Junie, args),
@@ -410,8 +420,8 @@ enum SessionsCommand {
         #[arg(short, long, value_delimiter = ',')]
         project: Vec<String>,
 
-        /// Filter by agent (claude | codex | gemini | junie | grok).
-        #[arg(long, value_parser = ["claude", "codex", "gemini", "junie", "grok"])]
+        /// Filter by agent (claude | codex | cursor | gemini | junie | grok).
+        #[arg(long, value_parser = ["claude", "codex", "cursor", "gemini", "junie", "grok"])]
         agent: Option<String>,
 
         /// Only sessions updated on/after this date (YYYY-MM-DD). Defaults to the
@@ -2579,7 +2589,15 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
             warn_incremental_legacy_flag(incremental);
             warn_pending_mutation("all");
             run_extraction(ExtractionParams {
-                agents: &["claude", "codex", "gemini", "junie", "grok", "codescribe"],
+                agents: &[
+                    "claude",
+                    "codex",
+                    "cursor",
+                    "gemini",
+                    "junie",
+                    "grok",
+                    "codescribe",
+                ],
                 project,
                 hours,
                 output_dir: output.as_deref(),
@@ -4117,6 +4135,7 @@ const CURRENT_SESSION_ENV_KEYS: &[(&str, Option<&str>)] = &[
     ("CODEX_SESSION_ID", Some("codex")),
     ("CLAUDE_SESSION_ID", Some("claude")),
     ("CLAUDE_CODE_SESSION_ID", Some("claude")),
+    ("CURSOR_CONVERSATION_ID", Some("cursor")),
     ("GEMINI_SESSION_ID", Some("gemini")),
     ("JUNIE_SESSION_ID", Some("junie")),
     ("GROK_SESSION_ID", Some("grok")),
@@ -4208,6 +4227,11 @@ fn current_session_from_disk() -> Result<Option<CurrentSessionPayload>> {
         &home.join(".codex").join("sessions"),
         Some(modified_after),
     ));
+    discovered.extend(sessions::discover_cursor_sessions(
+        &home.join(".cursor").join("projects"),
+        Some(modified_after),
+        Some(&here),
+    ));
     discovered.extend(sessions::discover_gemini_sessions(
         &home.join(".gemini").join("tmp"),
         Some(modified_after),
@@ -4292,6 +4316,13 @@ fn run_sessions_list(
         discovered.extend(sessions::discover_codex_sessions(
             &home.join(".codex").join("sessions"),
             modified_after,
+        ));
+    }
+    if want_agent.is_none_or(|a| a == "cursor" || a == "cursor-agent") {
+        discovered.extend(sessions::discover_cursor_sessions(
+            &home.join(".cursor").join("projects"),
+            modified_after,
+            here.as_deref(),
         ));
     }
     if want_agent.is_none_or(|a| a == "gemini") {
@@ -6957,8 +6988,18 @@ fn render_requested_source_filters(requested_filters: &[String]) -> String {
 
 const INCREMENTAL_LEGACY_NOTE: &str =
     "# Note: --incremental is now the default and will be removed in 0.8.0";
-const LEGACY_ALL_WATERMARK_AGENTS: &[&str] =
-    &["claude", "codex", "gemini", "junie", "grok", "codescribe"];
+// The legacy key is a frozen stored-state string: extending the default `all`
+// set (cursor joined 2026-09) must NOT rename it, or every operator's
+// incremental watermark would reset to a full rescan.
+const LEGACY_ALL_WATERMARK_AGENTS: &[&str] = &[
+    "claude",
+    "codex",
+    "cursor",
+    "gemini",
+    "junie",
+    "grok",
+    "codescribe",
+];
 const LEGACY_ALL_WATERMARK_KEY: &str = "claude+codex+gemini+junie+grok+codescribe";
 
 fn normalized_source_key_parts<'a>(parts: impl IntoIterator<Item = &'a str>) -> Vec<String> {
@@ -7372,6 +7413,9 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
             }
             "codex" => {
                 sources::extract_agent_sessions(aicx::session_catalog::AgentKind::Codex, &config)
+            }
+            "cursor" => {
+                sources::extract_agent_sessions(aicx::session_catalog::AgentKind::Cursor, &config)
             }
             "gemini" => {
                 sources::extract_agent_sessions(aicx::session_catalog::AgentKind::Gemini, &config)

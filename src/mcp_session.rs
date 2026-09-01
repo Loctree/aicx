@@ -748,6 +748,7 @@ fn guess_user_home(source: &Path, agent: AgentKind) -> PathBuf {
     let marker = match agent {
         AgentKind::Claude => ".claude",
         AgentKind::Codex => ".codex",
+        AgentKind::Cursor => ".cursor",
         AgentKind::Gemini => ".gemini",
         AgentKind::Grok => ".grok",
         AgentKind::Junie => ".junie",

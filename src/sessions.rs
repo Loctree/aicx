@@ -1166,6 +1166,385 @@ fn scan_junie_session_file(path: &Path, session_id: &str) -> Option<SessionInfo>
     })
 }
 
+/// Discover Cursor CLI agent sessions under a `projects` root
+/// (`~/.cursor/projects`). Layout: `<slug>/agent-transcripts/<uuid>/<uuid>.jsonl`.
+/// Rows carry no cwd or timestamps; the slug is the only on-disk cwd evidence
+/// (lossy — dots and separators both became `-`), so the association is
+/// [`Association::Inferred`], mirroring the Claude dir-name fallback. Absolute
+/// time comes from the harness `<timestamp>` wrapper inside operator text when
+/// present. Tolerant: unreadable files are counted and skipped, never abort
+/// the scan.
+pub fn discover_cursor_sessions(
+    projects_root: &Path,
+    modified_after: Option<SystemTime>,
+    cwd_filter: Option<&str>,
+) -> Vec<SessionInfo> {
+    let mut out = Vec::new();
+    let mut skipped = 0usize;
+    let Ok(dirs) = fs::read_dir(projects_root) else {
+        return out;
+    };
+    for dir_entry in dirs.flatten() {
+        let dir_path = dir_entry.path();
+        if !dir_path.is_dir() {
+            continue;
+        }
+        let dir_name = dir_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_string();
+        let transcripts_dir = dir_path.join("agent-transcripts");
+        if !transcripts_dir.is_dir() {
+            continue;
+        }
+
+        // cwd prune in ENCODED space, mirroring the Claude pre-read prune:
+        // the slug maps every non-alphanumeric run to one `-` (dots included),
+        // so decoding before comparing would mis-prune hyphenated real paths.
+        if let Some(want) = cwd_filter {
+            let want_enc = encode_cursor_project_slug(want);
+            let dir_lc = dir_name.to_lowercase();
+            if !nests_under(&dir_lc, &want_enc, '-') && !nests_under(&want_enc, &dir_lc, '-') {
+                continue;
+            }
+        }
+        let decoded_cwd = decode_cursor_project_slug(&dir_name);
+
+        let Ok(sessions) = fs::read_dir(&transcripts_dir) else {
+            continue;
+        };
+        for session_entry in sessions.flatten() {
+            let session_dir = session_entry.path();
+            if !session_dir.is_dir() {
+                continue;
+            }
+            let Some(uuid) = session_dir.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            let path = session_dir.join(format!("{uuid}.jsonl"));
+            if !path.is_file() || older_than(&path, modified_after) {
+                continue;
+            }
+            match scan_cursor_session_file(&path, decoded_cwd.as_deref()) {
+                Some(info) => out.push(info),
+                None => skipped += 1,
+            }
+        }
+    }
+    if skipped > 0 {
+        eprintln!("aicx: sessions: skipped {skipped} unreadable file(s) (cursor)");
+    }
+    out
+}
+
+/// Encode a cwd the way Cursor names `~/.cursor/projects/<slug>`: every run of
+/// non-alphanumeric characters collapses to one `-`, edges trimmed
+/// (`/Users/x/.vibecrafted` → `Users-x-vibecrafted`). Used for ENCODED-space
+/// cwd pruning; decoding stays lossy inference.
+fn encode_cursor_project_slug(path: &str) -> String {
+    let mut out = String::new();
+    let mut last_was_dash = true;
+    for ch in path.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            last_was_dash = false;
+        } else if !last_was_dash {
+            out.push('-');
+            last_was_dash = true;
+        }
+    }
+    out.trim_end_matches('-').to_string()
+}
+
+/// Lossy slug → cwd inference (`Users-x-vibecrafted` → `/Users/x/vibecrafted`).
+/// Real hyphens and dots are indistinguishable from separators — callers mark
+/// the result [`Association::Inferred`] and never compare it decoded.
+fn decode_cursor_project_slug(slug: &str) -> Option<String> {
+    if slug.is_empty() {
+        return None;
+    }
+    Some(format!("/{}", slug.replace('-', "/")))
+}
+
+/// Parse a single Cursor transcript (`<uuid>.jsonl`) into a [`SessionInfo`].
+/// Conversation rows are `{"role":"user"|"assistant","message":{"content":[…]}}`;
+/// `{"type":"turn_ended"}` is a control row, not conversation.
+fn scan_cursor_session_file(path: &Path, decoded_cwd: Option<&str>) -> Option<SessionInfo> {
+    let file = fs::File::open(path).ok()?;
+    let reader = BufReader::new(file);
+    let session_id = path.file_stem().and_then(|s| s.to_str())?.to_string();
+
+    let mut started_at: Option<DateTime<Utc>> = None;
+    let mut updated_at: Option<DateTime<Utc>> = None;
+    let mut message_count = 0usize;
+    let mut user_message_count = 0usize;
+    let mut agent_message_count = 0usize;
+    let mut title: Option<String> = None;
+    // Set only after a line actually parses (TemporalConfidence idiom shared
+    // with claude/codex/junie).
+    let mut saw_parsable_line = false;
+
+    for line in reader.lines().map_while(Result::ok) {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        saw_parsable_line = true;
+
+        let role = value.get("role").and_then(|v| v.as_str());
+        let Some(blocks) = value
+            .get("message")
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_array())
+        else {
+            continue;
+        };
+        match role {
+            Some("user") => {
+                message_count += 1;
+                user_message_count += 1;
+                for block in blocks {
+                    if block.get("type").and_then(|v| v.as_str()) != Some("text") {
+                        continue;
+                    }
+                    let Some(text) = block.get("text").and_then(|v| v.as_str()) else {
+                        continue;
+                    };
+                    if let Some(ts) = extract_cursor_wrapper_timestamp(text) {
+                        started_at = Some(started_at.map_or(ts, |cur| cur.min(ts)));
+                        updated_at = Some(updated_at.map_or(ts, |cur| cur.max(ts)));
+                    }
+                    if title.is_none() {
+                        let speech = strip_cursor_wrappers(text);
+                        if !speech.is_empty() {
+                            title = Some(short_title(&speech));
+                        }
+                    }
+                }
+            }
+            Some("assistant") => {
+                message_count += 1;
+                agent_message_count += 1;
+            }
+            _ => {}
+        }
+    }
+
+    let (repo_path, association) = match decoded_cwd {
+        Some(decoded) => (Some(decoded.to_string()), Association::Inferred),
+        None => (None, Association::Unknown),
+    };
+    let project = repo_path.as_deref().and_then(project_label_from_cwd);
+    let temporal_confidence = if started_at.is_some() {
+        TemporalConfidence::Full
+    } else if saw_parsable_line {
+        TemporalConfidence::Partial
+    } else {
+        TemporalConfidence::None
+    };
+
+    Some(SessionInfo {
+        session_id,
+        agent: "cursor".to_string(),
+        project,
+        repo_path,
+        started_at,
+        updated_at,
+        message_count,
+        user_message_count,
+        agent_message_count,
+        title,
+        source_path: path.to_path_buf(),
+        association,
+        temporal_confidence,
+    })
+}
+
+/// Harness wrappers observed in Cursor operator text. `<user_query>` wraps
+/// speech (unwrapped, kept); the rest are harness metadata (dropped from the
+/// title lane). Mirrors the parser adapter's taxonomy on purpose.
+const CURSOR_WRAPPER_TAGS: &[&str] = &[
+    "timestamp",
+    "user_query",
+    "system_notification",
+    "system_reminder",
+    "system-reminder",
+    "manually_attached_skills",
+];
+
+/// Strip harness wrappers from operator text, keeping actual speech.
+fn strip_cursor_wrappers(text: &str) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let mut rest = text;
+    while let Some((start, tag, inner, end)) = find_cursor_wrapper(rest) {
+        let before = rest[..start].trim();
+        if !before.is_empty() {
+            parts.push(before.to_owned());
+        }
+        if tag == "user_query" {
+            let inner = inner.trim();
+            if !inner.is_empty() {
+                parts.push(inner.to_owned());
+            }
+        }
+        rest = &rest[end..];
+    }
+    let tail = rest.trim();
+    if !tail.is_empty() {
+        parts.push(tail.to_owned());
+    }
+    parts.join("\n")
+}
+
+/// Locate the next recognized `<tag>…</tag>` span, returning the span start,
+/// tag, inner body, and span end. Unrecognized tags stay text.
+fn find_cursor_wrapper(text: &str) -> Option<(usize, &str, &str, usize)> {
+    let bytes = text.as_bytes();
+    let mut at = 0;
+    while at < bytes.len() {
+        if bytes[at] != b'<' {
+            at += 1;
+            continue;
+        }
+        let name_start = at + 1;
+        let mut name_end = name_start;
+        while name_end < bytes.len()
+            && (bytes[name_end].is_ascii_alphanumeric()
+                || bytes[name_end] == b'_'
+                || bytes[name_end] == b'-')
+        {
+            name_end += 1;
+        }
+        if name_end == name_start || bytes.get(name_end) != Some(&b'>') {
+            at += 1;
+            continue;
+        }
+        let tag = &text[name_start..name_end];
+        if !CURSOR_WRAPPER_TAGS.contains(&tag) {
+            at = name_end + 1;
+            continue;
+        }
+        let closing = format!("</{tag}>");
+        let body_start = name_end + 1;
+        let close_at = text[body_start..].find(closing.as_str())?;
+        let body_end = body_start + close_at;
+        return Some((
+            at,
+            tag,
+            &text[body_start..body_end],
+            body_end + closing.len(),
+        ));
+    }
+    None
+}
+
+/// Pull the harness `<timestamp>` wrapper out of operator text and parse it.
+fn extract_cursor_wrapper_timestamp(text: &str) -> Option<DateTime<Utc>> {
+    let start = text.find("<timestamp>")?;
+    let rest = &text[start + "<timestamp>".len()..];
+    let end = rest.find("</timestamp>")?;
+    parse_cursor_harness_timestamp(rest[..end].trim())
+}
+
+/// Parse the Cursor harness timestamp idiom
+/// (`Saturday, Aug 29, 2026, 8:50 AM (UTC+2)`) into absolute time.
+/// Hand-parsed and fail-closed: anything off-shape is `None`, never a guess.
+fn parse_cursor_harness_timestamp(raw: &str) -> Option<DateTime<Utc>> {
+    let trimmed = raw.trim();
+    let without_weekday = match trimmed.split_once(',') {
+        Some((head, tail))
+            if matches!(
+                head.trim(),
+                "Monday" | "Tuesday" | "Wednesday" | "Thursday" | "Friday" | "Saturday" | "Sunday"
+            ) =>
+        {
+            tail.trim()
+        }
+        _ => trimmed,
+    };
+    let (date_time, zone) = without_weekday.split_once('(')?;
+    let offset_seconds = parse_cursor_utc_offset(zone.trim_end_matches(')').trim())?;
+
+    let mut parts = date_time.trim().split(',');
+    let month_day = parts.next()?.trim();
+    let year: i32 = parts.next()?.trim().parse().ok()?;
+    let time_ampm = parts.next()?.trim();
+    if parts.next().is_some() {
+        return None;
+    }
+
+    let (month_name, day_text) = month_day.split_once(' ')?;
+    let month: u32 = match month_name {
+        "Jan" => 1,
+        "Feb" => 2,
+        "Mar" => 3,
+        "Apr" => 4,
+        "May" => 5,
+        "Jun" => 6,
+        "Jul" => 7,
+        "Aug" => 8,
+        "Sep" => 9,
+        "Oct" => 10,
+        "Nov" => 11,
+        "Dec" => 12,
+        _ => return None,
+    };
+    let day: u32 = day_text.trim().parse().ok()?;
+
+    let (clock, meridiem) = time_ampm.rsplit_once(' ')?;
+    let (hour_text, minute_text) = clock.split_once(':')?;
+    let mut hour: u32 = hour_text.parse().ok()?;
+    let minute: u32 = minute_text.parse().ok()?;
+    match meridiem {
+        "AM" => {
+            if hour == 12 {
+                hour = 0;
+            }
+        }
+        "PM" => {
+            if hour != 12 {
+                hour += 12;
+            }
+        }
+        _ => return None,
+    }
+
+    let date = chrono::NaiveDate::from_ymd_opt(year, month, day)?;
+    let time = chrono::NaiveTime::from_hms_opt(hour, minute, 0)?;
+    let naive = date.and_time(time);
+    Some(DateTime::from_naive_utc_and_offset(
+        naive - chrono::Duration::seconds(offset_seconds),
+        Utc,
+    ))
+}
+
+/// `UTC+2` / `UTC-5:30` / `UTC` → seconds east of Greenwich.
+fn parse_cursor_utc_offset(zone: &str) -> Option<i64> {
+    let rest = zone.strip_prefix("UTC")?;
+    if rest.is_empty() {
+        return Some(0);
+    }
+    let (sign, digits) = match rest.as_bytes().first()? {
+        b'+' => (1i64, &rest[1..]),
+        b'-' => (-1i64, &rest[1..]),
+        _ => return None,
+    };
+    let (hours, minutes) = match digits.split_once(':') {
+        Some((hours, minutes)) => (hours, minutes),
+        None => (digits, "0"),
+    };
+    let hours: i64 = hours.parse().ok()?;
+    let minutes: i64 = minutes.parse().ok()?;
+    if hours > 14 || minutes > 59 {
+        return None;
+    }
+    Some(sign * (hours * 3600 + minutes * 60))
+}
+
 /// Discover every first-class session source under `home`.
 ///
 /// This is the shared discovery core for status surfaces that need to reason
@@ -1190,6 +1569,13 @@ pub fn discover_sessions_at(
         discovered.extend(discover_codex_sessions(
             &home.join(".codex").join("sessions"),
             modified_after,
+        ));
+    }
+    if agent.is_none_or(|a| a == "cursor" || a == "cursor-agent") {
+        discovered.extend(discover_cursor_sessions(
+            &home.join(".cursor").join("projects"),
+            modified_after,
+            cwd_filter,
         ));
     }
     if agent.is_none_or(|a| a == "grok") {

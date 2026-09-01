@@ -203,7 +203,7 @@ impl RebuildProgress {
             stage: RebuildStage::Preparing,
             agent: None,
             agent_index: 0,
-            agent_total: 5,
+            agent_total: 6,
             io: CatalogIoStats::default(),
             sessions: 0,
             elapsed_ms: 0,
@@ -623,6 +623,7 @@ fn live_delta_uncached(home: &Path, user_home: &Path, cutoff_unix_ns: u128) -> R
     let agents = [
         AgentKind::Claude,
         AgentKind::Codex,
+        AgentKind::Cursor,
         AgentKind::Gemini,
         AgentKind::Grok,
         AgentKind::Junie,
@@ -806,6 +807,7 @@ fn scan_live_entries_with_progress(
     let agents = [
         AgentKind::Claude,
         AgentKind::Codex,
+        AgentKind::Cursor,
         AgentKind::Gemini,
         AgentKind::Grok,
         AgentKind::Junie,
@@ -1084,6 +1086,9 @@ fn agent_source_root(agent: AgentKind, user_home: &Path) -> PathBuf {
     match agent {
         AgentKind::Claude => user_home.join(".claude").join("projects"),
         AgentKind::Codex => user_home.join(".codex").join("sessions"),
+        // Cursor transcripts live under `~/.cursor/projects/<slug>/agent-transcripts/<uuid>/`
+        // (the projects tree also holds non-transcript dirs).
+        AgentKind::Cursor => user_home.join(".cursor").join("projects"),
         AgentKind::Gemini => user_home.join(".gemini").join("tmp"),
         // Grok sessions live under `~/.grok/sessions/<cwd-encoded>/…`
         // (not the bare `~/.grok` tree, which also holds config noise).
@@ -1093,8 +1098,23 @@ fn agent_source_root(agent: AgentKind, user_home: &Path) -> PathBuf {
 }
 
 fn is_primary_catalog_source(agent: AgentKind, path: &Path) -> bool {
-    agent != AgentKind::Grok
-        || path.file_name().and_then(|name| name.to_str()) == Some("chat_history.jsonl")
+    match agent {
+        AgentKind::Grok => {
+            path.file_name().and_then(|name| name.to_str()) == Some("chat_history.jsonl")
+        }
+        AgentKind::Cursor => {
+            let has_transcripts_component = path
+                .components()
+                .any(|component| component.as_os_str() == "agent-transcripts");
+            let stem = path.file_stem().and_then(|name| name.to_str());
+            let parent = path
+                .parent()
+                .and_then(|dir| dir.file_name())
+                .and_then(|name| name.to_str());
+            has_transcripts_component && stem.is_some() && stem == parent
+        }
+        _ => true,
+    }
 }
 
 fn entry_from_source(agent: AgentKind, source: &CatalogSource) -> CatalogEntry {
@@ -1293,6 +1313,25 @@ fn infer_cwd_from_path(agent: AgentKind, path: &Path) -> Option<String> {
                     .and_then(|n| n.to_str())
                     .map(|encoded| encoded.replace('-', "/"))
             })
+        }
+        AgentKind::Cursor => {
+            // ~/.cursor/projects/<slug>/agent-transcripts/<uuid>/<uuid>.jsonl —
+            // the slug is the only cwd evidence on disk (rows carry none).
+            // Same lossy idiom as the Claude fallback: every `-` inside a real
+            // path component decodes into a bogus `/`.
+            let slug = path
+                .ancestors()
+                .find(|ancestor| {
+                    ancestor
+                        .parent()
+                        .and_then(Path::file_name)
+                        .and_then(|name| name.to_str())
+                        == Some("projects")
+                })
+                .and_then(|ancestor| ancestor.file_name().map(|name| name.to_owned()))?
+                .into_string()
+                .ok()?;
+            Some(format!("/{}", slug.replace('-', "/")))
         }
         AgentKind::Grok => {
             // ~/.grok/sessions/<cwd-encoded>/<session>/...
