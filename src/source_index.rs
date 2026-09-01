@@ -1031,11 +1031,11 @@ fn parse_catalog_source(
     let agent = match entry.agent.as_str() {
         "claude" => aicx_parser::engine::AgentKind::Claude,
         "codex" => aicx_parser::engine::AgentKind::Codex,
+        "cursor" => aicx_parser::engine::AgentKind::Cursor,
         "gemini" => aicx_parser::engine::AgentKind::Gemini,
         "grok" => aicx_parser::engine::AgentKind::Grok,
         "junie" => aicx_parser::engine::AgentKind::Junie,
         "kimi" => aicx_parser::engine::AgentKind::Kimi,
-        "cursor" => aicx_parser::engine::AgentKind::Cursor,
         other => anyhow::bail!("unsupported catalog agent `{other}`"),
     };
     let parsed = crate::parser_dispatch::parse_file(

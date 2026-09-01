@@ -11,6 +11,7 @@
 //! Supported sources:
 //! - Claude Code: ~/.claude/projects/*/*.jsonl
 //! - Codex: ~/.codex/history.jsonl
+//! - Cursor: ~/.cursor/projects/*/agent-transcripts/<uuid>/<uuid>.jsonl
 //! - Gemini: ~/.gemini/tmp/<hash>/chats/session-*.json
 //! - Gemini Antigravity: ~/.gemini/antigravity/{conversations/<uuid>.pb,brain/<uuid>/}
 //! - Junie: ~/.junie/sessions/session-*/events.jsonl
@@ -167,11 +168,11 @@ enum OverlayFormat {
 enum ExtractAgent {
     Codex,
     Claude,
+    Cursor,
     Gemini,
     Grok,
     Junie,
     Kimi,
-    Cursor,
 }
 
 impl ExtractAgent {
@@ -179,11 +180,11 @@ impl ExtractAgent {
         match self {
             Self::Codex => "codex",
             Self::Claude => "claude",
+            Self::Cursor => "cursor",
             Self::Gemini => "gemini",
             Self::Grok => "grok",
             Self::Junie => "junie",
             Self::Kimi => "kimi",
-            Self::Cursor => "cursor",
         }
     }
 
@@ -191,11 +192,11 @@ impl ExtractAgent {
         match self {
             Self::Codex => aicx::session_catalog::AgentKind::Codex,
             Self::Claude => aicx::session_catalog::AgentKind::Claude,
+            Self::Cursor => aicx::session_catalog::AgentKind::Cursor,
             Self::Gemini => aicx::session_catalog::AgentKind::Gemini,
             Self::Grok => aicx::session_catalog::AgentKind::Grok,
             Self::Junie => aicx::session_catalog::AgentKind::Junie,
             Self::Kimi => aicx::session_catalog::AgentKind::Kimi,
-            Self::Cursor => aicx::session_catalog::AgentKind::Cursor,
         }
     }
 
@@ -203,11 +204,11 @@ impl ExtractAgent {
         match self {
             Self::Codex => aicx::parser::engine::AgentKind::Codex,
             Self::Claude => aicx::parser::engine::AgentKind::Claude,
+            Self::Cursor => aicx::parser::engine::AgentKind::Cursor,
             Self::Gemini => aicx::parser::engine::AgentKind::Gemini,
             Self::Grok => aicx::parser::engine::AgentKind::Grok,
             Self::Junie => aicx::parser::engine::AgentKind::Junie,
             Self::Kimi => aicx::parser::engine::AgentKind::Kimi,
-            Self::Cursor => aicx::parser::engine::AgentKind::Cursor,
         }
     }
 
@@ -216,6 +217,7 @@ impl ExtractAgent {
         match self {
             Self::Codex => home.join(".codex").join("sessions"),
             Self::Claude => home.join(".claude").join("projects"),
+            Self::Cursor => home.join(".cursor").join("projects"),
             Self::Gemini => home.join(".gemini").join("tmp"),
             // Match durable catalog rebuild: sessions live under
             // `~/.grok/sessions/<cwd-encoded>/<uuid>/…`, not the bare `~/.grok`
@@ -223,7 +225,6 @@ impl ExtractAgent {
             Self::Grok => home.join(".grok").join("sessions"),
             Self::Junie => home.join(".junie").join("sessions"),
             Self::Kimi => home.join(".kimi-code").join("sessions"),
-            Self::Cursor => home.join(".cursor").join("projects"),
         }
     }
 
@@ -231,11 +232,11 @@ impl ExtractAgent {
         match value.trim().to_ascii_lowercase().as_str() {
             "codex" => Some(Self::Codex),
             "claude" => Some(Self::Claude),
+            "cursor" | "cursor-agent" => Some(Self::Cursor),
             "gemini" | "gemini-antigravity" => Some(Self::Gemini),
             "grok" => Some(Self::Grok),
             "junie" => Some(Self::Junie),
             "kimi" => Some(Self::Kimi),
-            "cursor" => Some(Self::Cursor),
             _ => None,
         }
     }
@@ -247,6 +248,8 @@ enum ExtractTarget {
     Codex(ExtractAgentArgs),
     /// Claude Code sessions (~/.claude/projects)
     Claude(ExtractAgentArgs),
+    /// Cursor agent transcripts (~/.cursor/projects/*/agent-transcripts)
+    Cursor(ExtractAgentArgs),
     /// Gemini CLI chats (~/.gemini/tmp/<hash>/chats)
     Gemini(ExtractAgentArgs),
     /// Grok CLI sessions (~/.grok)
@@ -255,8 +258,6 @@ enum ExtractTarget {
     Junie(ExtractAgentArgs),
     /// Kimi Code CLI wire files (~/.kimi-code/sessions)
     Kimi(ExtractAgentArgs),
-    /// Cursor agent transcripts (~/.cursor/projects/<slug>/agent-transcripts)
-    Cursor(ExtractAgentArgs),
     /// Every compatible source on this machine, in one incremental pass.
     All(ExtractAllArgs),
 }
@@ -266,11 +267,11 @@ impl ExtractTarget {
         match self {
             Self::Codex(args) => (ExtractAgent::Codex, args),
             Self::Claude(args) => (ExtractAgent::Claude, args),
+            Self::Cursor(args) => (ExtractAgent::Cursor, args),
             Self::Gemini(args) => (ExtractAgent::Gemini, args),
             Self::Grok(args) => (ExtractAgent::Grok, args),
             Self::Junie(args) => (ExtractAgent::Junie, args),
             Self::Kimi(args) => (ExtractAgent::Kimi, args),
-            Self::Cursor(args) => (ExtractAgent::Cursor, args),
             Self::All(_) => unreachable!("`extract all` is dispatched before split()"),
         }
     }
@@ -2752,6 +2753,7 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
                     "junie",
                     "grok",
                     "kimi",
+                    "cursor",
                     "codescribe",
                 ],
                 project,
@@ -4292,6 +4294,7 @@ const CURRENT_SESSION_ENV_KEYS: &[(&str, Option<&str>)] = &[
     ("CODEX_SESSION_ID", Some("codex")),
     ("CLAUDE_SESSION_ID", Some("claude")),
     ("CLAUDE_CODE_SESSION_ID", Some("claude")),
+    ("CURSOR_CONVERSATION_ID", Some("cursor")),
     ("GEMINI_SESSION_ID", Some("gemini")),
     ("JUNIE_SESSION_ID", Some("junie")),
     ("KIMI_SESSION_ID", Some("kimi")),
@@ -4384,6 +4387,11 @@ fn current_session_from_disk() -> Result<Option<CurrentSessionPayload>> {
         &home.join(".codex").join("sessions"),
         Some(modified_after),
     ));
+    discovered.extend(sessions::discover_cursor_sessions(
+        &home.join(".cursor").join("projects"),
+        Some(modified_after),
+        Some(&here),
+    ));
     discovered.extend(sessions::discover_gemini_sessions(
         &home.join(".gemini").join("tmp"),
         Some(modified_after),
@@ -4470,6 +4478,13 @@ fn run_sessions_list(
             modified_after,
         ));
     }
+    if want_agent.is_none_or(|a| a == "cursor" || a == "cursor-agent") {
+        discovered.extend(sessions::discover_cursor_sessions(
+            &home.join(".cursor").join("projects"),
+            modified_after,
+            here.as_deref(),
+        ));
+    }
     if want_agent.is_none_or(|a| a == "gemini") {
         discovered.extend(sessions::discover_gemini_sessions(
             &home.join(".gemini").join("tmp"),
@@ -4509,6 +4524,7 @@ fn run_sessions_list(
         discovered.extend(sessions::discover_cursor_sessions(
             &home.join(".cursor").join("projects"),
             modified_after,
+            here.as_deref(),
         ));
     }
 
@@ -8330,6 +8346,10 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
             ),
             "kimi" => sources::extract_agent_sessions(
                 aicx::session_catalog::AgentKind::Kimi,
+                agent_config,
+            ),
+            "cursor" => sources::extract_agent_sessions(
+                aicx::session_catalog::AgentKind::Cursor,
                 agent_config,
             ),
             "grok" => sources::extract_agent_sessions(

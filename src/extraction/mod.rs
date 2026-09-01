@@ -386,11 +386,11 @@ const fn parser_agent(agent: crate::session_catalog::AgentKind) -> aicx_parser::
     match agent {
         crate::session_catalog::AgentKind::Claude => aicx_parser::engine::AgentKind::Claude,
         crate::session_catalog::AgentKind::Codex => aicx_parser::engine::AgentKind::Codex,
+        crate::session_catalog::AgentKind::Cursor => aicx_parser::engine::AgentKind::Cursor,
         crate::session_catalog::AgentKind::Gemini => aicx_parser::engine::AgentKind::Gemini,
         crate::session_catalog::AgentKind::Grok => aicx_parser::engine::AgentKind::Grok,
         crate::session_catalog::AgentKind::Junie => aicx_parser::engine::AgentKind::Junie,
         crate::session_catalog::AgentKind::Kimi => aicx_parser::engine::AgentKind::Kimi,
-        crate::session_catalog::AgentKind::Cursor => aicx_parser::engine::AgentKind::Cursor,
     }
 }
 

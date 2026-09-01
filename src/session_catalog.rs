@@ -68,7 +68,7 @@ impl AgentKind {
             "junie" => Some(Self::Junie),
             "grok" => Some(Self::Grok),
             "kimi" => Some(Self::Kimi),
-            "cursor" => Some(Self::Cursor),
+            "cursor" | "cursor-agent" => Some(Self::Cursor),
             _ => None,
         }
     }
@@ -136,11 +136,22 @@ impl AgentKind {
                 path.file_name().and_then(|name| name.to_str()) == Some("chat_history.jsonl")
             }
             Self::Cursor => {
-                path.ancestors()
-                    .nth(2)
-                    .and_then(|dir| dir.file_name())
-                    .and_then(|name| name.to_str())
-                    == Some("agent-transcripts")
+                let stem_owns_session_dir = path
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .zip(
+                        path.parent()
+                            .and_then(|dir| dir.file_name())
+                            .and_then(|name| name.to_str()),
+                    )
+                    .is_some_and(|(stem, dir)| stem == dir);
+                stem_owns_session_dir
+                    && path
+                        .ancestors()
+                        .nth(2)
+                        .and_then(|dir| dir.file_name())
+                        .and_then(|name| name.to_str())
+                        == Some("agent-transcripts")
             }
             Self::Gemini => path
                 .ancestors()
