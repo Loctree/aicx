@@ -5,12 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
-## [0.12.6] - 2026-08-28
-
-### Changed
-- seed AGENT_CANARY.md — truth-competition census charter for aicx
-
-## [0.13.0] - 2026-08-28
+## [0.13.0] - 2026-09-01
 
 ### One taxonomy for every agent (mission `aicx-one-taxonomy-fusion-260827`)
 
@@ -97,6 +92,7 @@ fail, 2 not assessable.
 - `--kind` opens the roles its lanes speak with (`inter_agent` / `inject` /
   `lineage_meta` → system), so a lane asked for by name is never empty by
   construction.
+- seed AGENT_CANARY.md — truth-competition census charter for aicx
 
 ### Fixed
 

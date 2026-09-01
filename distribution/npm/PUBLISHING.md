@@ -37,9 +37,9 @@ propagation. The workflow never creates a release, tag, or version bump.
 After staging the current host's signed release asset:
 
 ```bash
-node distribution/npm/sync-version.mjs 0.12.6
-node distribution/npm/stage-platform-package.mjs 0.12.6 darwin-arm64 /path/to/release-input
-node distribution/npm/verify-metadata.mjs 0.12.6 --platform=darwin-arm64
+node distribution/npm/sync-version.mjs 0.13.0
+node distribution/npm/stage-platform-package.mjs 0.13.0 darwin-arm64 /path/to/release-input
+node distribution/npm/verify-metadata.mjs 0.13.0 --platform=darwin-arm64
 ```
 
 Use the matching platform key on Linux or Windows. The verifier requires zero
