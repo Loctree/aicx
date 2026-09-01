@@ -38,7 +38,7 @@ pliku tokena albo mechanizmu zmiennej/nagłówka danego klienta.
 
 ### 2.1. Odświeżanie na Żywo (Live Refresh)
 * **Czy `aicx serve` odświeża się na żywo?** **Tak.** `aicx serve` nie zamraża stanu indeksu w RAM na stałe. Każde zapytanie narzędzia (`aicx_search`, `aicx_steer`, `aicx_intents`) odpytuje bezpośrednio bieżący stan bazy Tantivy oraz wektorów z dysku (`~/.aicx/`).
-* **Cykl indeksowania:** Długowieczny serwer MCP nigdy nie przebudowuje indeksów we własnym procesie. Co 8640 sekund (2 godz. 24 min) `com.loctree.aicx.reindex` przyjmuje ograniczoną gorącą deltę katalogu i prosi krótkowieczny proces o publikację tylko wtedy, gdy fingerprint indeksu się zmienił. Scheduler wykonuje jedyny wymagany pełny census wyłącznie wtedy, gdy katalogu jeszcze nie ma. Wycofane flagi `--refresh-interval-seconds` i `--no-auto-refresh` są nadal akceptowane wyłącznie po to, żeby starsze konfiguracje startowe nie przestały działać.
+* **Cykl indeksowania:** długo żyjący serwer HTTP jest **czytelnikiem**, nie writerem indeksu. Domyślnie nie ma własnej pętli odświeżania — świeżość należy do osobnego właściciela maintenance (`tools/install-reindex-schedule.sh`, czyli `aicx catalog rebuild && aicx index`). Wbudowany writer nadal istnieje, ale wyłącznie za jawnym, eksperymentalnym opt-inem (`--experimental-auto-refresh`, kadencja przez `--refresh-interval-seconds`); samo `--refresh-interval-seconds` nigdy nie nadaje własności writera. `--no-auto-refresh` zostaje wyłącznie jako przestarzała flaga kompatybilności — domyślnie i tak jest wyłączone. Instalator nadal przekazuje ją celowo i defensywnie, żeby LaunchAgent pozostał czytelnikiem nawet wtedy, gdy trafiłby na starszą wersję binarki z domyślnie włączonym writerem; nowe wywołania nie powinny jej używać.
 
 ### 2.2. Instalacja i Cele w Makefile
 * **Standardowa instalacja (z kreatorem):**
@@ -46,13 +46,13 @@ pliku tokena albo mechanizmu zmiennej/nagłówka danego klienta.
   cd /Volumes/vc-workspace/Loctree/aicx
   make install
   ```
-  *(Uruchamia `install.sh`, instaluje binarki, rejestruje `com.loctree.aicx.mcp` i zapisuje klientom Claude/Codex/Gemini `mcpServers.aicx` jako `{"url":"http://127.0.0.1:8044/mcp"}` — nie stdio `command`. Ten serwer jest właścicielem odświeżania indeksu. `AICX_SKIP_MCP_SERVICE=1` zostawia stdio.)*
+  *(Uruchamia `install.sh`, instaluje binarki, rejestruje `com.loctree.aicx.mcp` i zapisuje klientom Claude/Codex/Gemini `mcpServers.aicx` jako `{"url":"http://127.0.0.1:8044/mcp"}` — nie stdio `command`. Ten serwer jest czytelnikiem; odświeżanie indeksu zostaje przy osobnym właścicielu maintenance. `AICX_SKIP_MCP_SERVICE=1` zostawia stdio.)*
 
 * **Zarządzanie serwisem LaunchAgent:**
   ```bash
   make install-service    # Instaluje i startuje LaunchAgent com.loctree.aicx.mcp
   make uninstall-service  # Zatrzymuje i wyrejestrowuje LaunchAgent com.loctree.aicx.mcp
-  make install-schedule   # Legacy: osobny refresh tylko gdy nie działa serwer HTTP
+  make install-schedule   # Osobny właściciel maintenance: cykliczny rebuild katalogu + index (wymagany dla świeżości; serwis HTTP jest czytelnikiem)
   ```
 
 ### 2.3. Weryfikacja Działania (Smoke Test)
@@ -196,10 +196,7 @@ Długowieczne serwisy MCP są zarejestrowane jako per-user LaunchAgents w
 | **`com.loctree.loctree.mcp`** | `loctree-mcp --transport http` | `5174` | `~/.loctree/logs/loctree-serve-http.log` |
 | **`com.loctree.aicx.reindex`** | hot refresh; bootstrap gdy brak; index | co 8640 s | `~/.aicx/logs/aicx-reindex.*.log` |
 
-Serwis AICX MCP działa z `--no-auto-refresh`. Osobny, krótkowieczny publisher
-co 8640 sekund przyjmuje wyłącznie ograniczoną gorącą deltę (pełny census buduje tylko przy bootstrapie), publikuje indeks wyłącznie po zmianie fingerprintu i zwalnia pamięć po zakończeniu.
-Starszą instalację migruje jednokrotnie `aicx doctor --repair-runtime`, zachowując
-host, port i listę allowed-hosts MCP.
+Instalator serwisu HTTP nie dotyka już etykiet maintenance: serwer jest czytelnikiem, więc osobny harmonogram reindeksacji współistnieje z nim z założenia. (Historycznie starsze instalatory usuwały timer `io.vetcoders.aicx.reindex`, ponieważ sam serwer był writerem.)
 
 ---
 

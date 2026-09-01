@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
-# install-mcp-service.sh — background HTTP MCP server daemon for AICX (macOS launchd).
+# install-mcp-service.sh — background reader-only HTTP MCP server for AICX (macOS launchd).
 #
 # Installs a per-user LaunchAgent that runs
-#   aicx serve --transport http
-# with KeepAlive=true, so the Streamable HTTP MCP service stays available 24/7
-# across machine restarts without manual intervention.
+#   aicx serve --transport http --no-auto-refresh
+# with KeepAlive=true, so the Streamable HTTP MCP reader stays available 24/7
+# across machine restarts without taking ownership of catalog/index maintenance.
+# Index maintenance is a separate process boundary; see install-reindex-schedule.sh
+# for the baseline scheduler.
 #
 # Usage:
 #   bash tools/install-mcp-service.sh              # install / refresh service
@@ -41,9 +43,10 @@ fi
 
 gui_domain() { printf 'gui/%s' "$(id -u)"; }
 
-# Boot out a launchd label and delete its plist if present. Used for the
-# canonical label and to migrate machines still running the legacy
-# io.vetcoders.aicx.mcp agent so install/uninstall never leave two servers.
+# Boot out an MCP launchd label and delete its plist if present. Used for the
+# canonical MCP label and to migrate machines still running the legacy
+# io.vetcoders.aicx.mcp agent so install/uninstall never leave two readers.
+# This helper is deliberately NOT used for reindex/maintenance labels.
 retire_launchd_label() {
   local label="$1"
   launchctl bootout "$(gui_domain)/$label" 2>/dev/null || true
@@ -54,6 +57,7 @@ if [ "${1:-}" = "--uninstall" ]; then
   retire_launchd_label "$LABEL"
   retire_launchd_label "$LEGACY_LABEL"
   note "mcp service: removed ($LABEL)"
+  note "index maintenance: unchanged (owned separately from the MCP reader)"
   exit 0
 fi
 
@@ -100,13 +104,18 @@ AICX_BIN_XML="$(printf '%s' "$AICX_BIN" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g'
 HOST_XML="$(printf '%s' "$HOST" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g' -e "s/'/\&apos;/g")"
 PORT_XML="$(printf '%s' "$PORT" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g' -e "s/'/\&apos;/g")"
 PATH_XML="$(printf '%s' "$AICX_DIR:/usr/bin:/bin:$HOME/.local/bin:$HOME/.cargo/bin:/opt/homebrew/bin" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g' -e "s/'/\&apos;/g")"
-# Default: tool-name audit + refresh ticks + rmcp session lifecycle.
+# Default: tool-name audit + rmcp session lifecycle. The reader does not own
+# periodic refresh, so mcp.refresh logging is intentionally absent here.
 # Not `info` globally — that floods hyper/h2. Not `--verbose` — extractor only.
-RUST_LOG_VALUE="${AICX_MCP_RUST_LOG:-mcp.audit=info,mcp.refresh=debug,mcp.lifecycle=info,rmcp=info}"
+RUST_LOG_VALUE="${AICX_MCP_RUST_LOG:-mcp.audit=info,mcp.lifecycle=info,rmcp=info}"
 RUST_LOG_XML="$(printf '%s' "$RUST_LOG_VALUE" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g' -e "s/'/\&apos;/g")"
 
 mkdir -p "$HOME/Library/LaunchAgents" "$LOG_DIR"
 
+# `--no-auto-refresh` is deliberately kept even though the binary's default is
+# already reader-only: it keeps the LaunchAgent safe if it ever runs against an
+# older aicx whose default embedded the periodic writer. Do not remove it as
+# "redundant"; the flag is a compatibility no-op on current builds.
 cat > "$PLIST" <<PLIST_EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -120,6 +129,7 @@ cat > "$PLIST" <<PLIST_EOF
     <string>serve</string>
     <string>--transport</string>
     <string>http</string>
+    <string>--no-auto-refresh</string>
     <string>--host</string>
     <string>$HOST_XML</string>
     <string>--port</string>
@@ -196,11 +206,12 @@ if [ "$MANAGER" != "Aqua" ]; then
   note "mcp service: load from Terminal.app / a GUI session:"
   note "  launchctl bootstrap gui/$(id -u) $PLIST"
   note "mcp service: otherwise it loads at the next GUI login. Do not run this as root."
+  note "index maintenance: separate; this reader never owns refresh"
   exit 0
 fi
 
 # Migrate machines still running the legacy io.vetcoders.aicx.mcp agent so
-# install never leaves two HTTP MCP servers. Then idempotent refresh of the
+# install never leaves two HTTP MCP readers. Then idempotent refresh of the
 # canonical label without deleting the plist we just wrote.
 retire_launchd_label "$LEGACY_LABEL"
 launchctl bootout "$(gui_domain)/$LABEL" 2>/dev/null || true
@@ -210,10 +221,16 @@ if ! try_bootstrap; then
 fi
 
 if service_loaded; then
-  note "mcp service: running on http://$HOST:$PORT/mcp via $LABEL"
+  note "mcp service: running reader-only on http://$HOST:$PORT/mcp via $LABEL"
+  note "index maintenance: separate process owner; MCP auto-refresh disabled"
   note "mcp service logs: $LOG_DIR/aicx-serve-http.log"
 else
   note "mcp service: plist written to $PLIST (bootstrap failed in this Aqua session)"
   note "mcp service: retry: launchctl bootstrap gui/$(id -u) $PLIST"
   note "mcp service: do not run as root — this is a per-user LaunchAgent"
+  note "index maintenance: separate; this reader never owns refresh"
 fi
+
+note "Note: the HTTP MCP service is a reader and does not refresh the index."
+note "For periodic freshness install the separate maintenance schedule:"
+note "  make install-schedule   # aicx catalog rebuild && aicx index on a cadence"

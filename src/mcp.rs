@@ -45,6 +45,16 @@ const MCP_SESSION_IDLE_TTL: Duration = Duration::from_secs(30 * 60);
 const MCP_SESSION_MAX_SESSIONS: usize = 1000;
 const MCP_SESSION_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 const MCP_IDLE_MEMORY_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+/// Cadence used when an embedded catalog/index writer is explicitly requested.
+///
+/// This is not a default. `McpLifecycleConfig::default()` is reader-only and
+/// leaves index maintenance to a separate process owner; the value below only
+/// applies once a caller deliberately opts in.
+pub const MCP_AUTO_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
+/// The same cadence in whole seconds, for CLI surfaces that take a `u64`
+/// seconds argument. Derived so no binary restates the number.
+pub const MCP_AUTO_REFRESH_INTERVAL_SECONDS: u64 = MCP_AUTO_REFRESH_INTERVAL.as_secs();
+pub const MCP_AUTO_REFRESH_HOURS: u64 = 48;
 
 /// Default time without an MCP tool request before request-derived memory is
 /// reclaimed. Search/index/corpus data is loaded inside each request rather
@@ -63,14 +73,102 @@ const MCP_EMBEDDER_NEGATIVE_TTL: Duration = Duration::from_secs(5 * 60);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct McpLifecycleConfig {
     pub idle_memory_drop_after: Duration,
+    /// `Some(interval)` makes this server own periodic catalog/index refresh.
+    /// `None` — the default — keeps it a reader.
+    pub auto_refresh_interval: Option<Duration>,
+    pub auto_refresh_hours: u64,
 }
 
 impl Default for McpLifecycleConfig {
+    /// Reader-only by default: a normal long-lived MCP server never owns
+    /// periodic index maintenance. Embedded refresh stays available, but only
+    /// when a caller sets `auto_refresh_interval` to `Some(interval)` on purpose.
     fn default() -> Self {
         Self {
             idle_memory_drop_after: MCP_IDLE_MEMORY_DROP_AFTER,
+            auto_refresh_interval: None,
+            auto_refresh_hours: MCP_AUTO_REFRESH_HOURS,
         }
     }
+}
+
+/// Shared transport policy for the experimental embedded-writer opt-in.
+///
+/// Both `aicx serve` and the standalone `aicx-mcp` binary refuse
+/// `--experimental-auto-refresh` unless the server is the long-lived HTTP one:
+/// an ephemeral stdio server must never take periodic catalog/index ownership.
+pub fn validate_experimental_auto_refresh(
+    transport_is_http: bool,
+    experimental_auto_refresh: bool,
+) -> Result<(), &'static str> {
+    if experimental_auto_refresh && !transport_is_http {
+        return Err("--experimental-auto-refresh requires --transport http");
+    }
+    Ok(())
+}
+
+fn refresh_catalog_and_index(hours: u64) -> anyhow::Result<()> {
+    let aicx_home = crate::aicx_home::resolve()?;
+    let user_home = crate::os_user_home()
+        .ok_or_else(|| anyhow::anyhow!("cannot resolve user home for MCP auto-refresh"))?;
+    let cutoff = chrono::Utc::now() - chrono::Duration::hours(hours.min(720) as i64);
+    let cutoff_ns = cutoff
+        .timestamp_nanos_opt()
+        .map(|value| value.max(0) as u128)
+        .unwrap_or(0);
+    let refresh = crate::catalog::refresh_hot(&aicx_home, &user_home, cutoff_ns)?;
+    let status = crate::api::index_status_at(&aicx_home, None).ok();
+    let pending = status
+        .as_ref()
+        .map(|status| status.pending_chunks)
+        .unwrap_or(0);
+    let index_current = status.as_ref().is_some_and(|status| {
+        status.readiness == crate::api::IndexReadiness::Ready && status.lexical_status == "ready"
+    });
+
+    if refresh.changed_sessions == 0
+        && refresh.admitted_sessions == 0
+        && refresh.reattributed_sessions == 0
+        && pending == 0
+        && index_current
+    {
+        tracing::debug!(target: "mcp.refresh", "MCP auto-refresh: catalog and index already current");
+        return Ok(());
+    }
+
+    let _lock = crate::locks::acquire_exclusive(crate::locks::lance_lock_path()?)?;
+    let report = crate::source_index::build(&aicx_home, &[], false, false, false, false)?;
+    tracing::info!(
+        target: "mcp.refresh",
+        changed_sessions = refresh.changed_sessions,
+        admitted_sessions = refresh.admitted_sessions,
+        reattributed_sessions = refresh.reattributed_sessions,
+        pending_chunks_before = pending,
+        lexical_docs = report.lexical_docs,
+        unchanged = report.unchanged,
+        wall_ms = report.wall_ms,
+        "MCP auto-refresh published the current lexical index"
+    );
+    Ok(())
+}
+
+fn spawn_mcp_auto_refresh(interval: Duration, hours: u64) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            ticker.tick().await;
+            match tokio::task::spawn_blocking(move || refresh_catalog_and_index(hours)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    tracing::warn!(target: "mcp.refresh", %error, "MCP auto-refresh failed")
+                }
+                Err(error) => {
+                    tracing::warn!(target: "mcp.refresh", %error, "MCP auto-refresh worker failed")
+                }
+            }
+        }
+    });
 }
 
 #[derive(Debug)]
@@ -2131,6 +2229,9 @@ pub async fn run_http_config_with_lifecycle(
     spawn_mcp_session_cleanup(session_manager.clone(), MCP_SESSION_SWEEP_INTERVAL);
     let idle_memory = Arc::new(McpIdleMemoryManager::new(lifecycle.idle_memory_drop_after));
     spawn_mcp_idle_memory_cleanup(idle_memory.clone(), MCP_IDLE_MEMORY_SWEEP_INTERVAL);
+    if let Some(interval) = lifecycle.auto_refresh_interval {
+        spawn_mcp_auto_refresh(interval, lifecycle.auto_refresh_hours);
+    }
     let service = rmcp::transport::streamable_http_server::StreamableHttpService::new(
         move || Ok(AicxMcpServer::with_idle_memory(idle_memory.clone())),
         session_manager,
@@ -2280,14 +2381,15 @@ fn validate_score_filter(score: Option<u8>) -> Result<Option<u8>, McpError> {
 mod tests {
     use super::{
         AicxMcpServer, AicxSessionManager, AicxSessionManagerError, MAX_SCORE_FILTER,
-        MCP_EMBEDDER_NEGATIVE_TTL, MCP_SESSION_IDLE_TTL, MCP_SESSION_MAX_SESSIONS,
-        MCP_SESSION_SWEEP_INTERVAL, McpHttpConfig, McpIdleMemoryManager, McpSemanticFallbackNotice,
-        McpTransport, RankItem, RankResponse, SearchParams, SteerResponse, background_refresh_args,
+        MCP_AUTO_REFRESH_HOURS, MCP_AUTO_REFRESH_INTERVAL, MCP_EMBEDDER_NEGATIVE_TTL,
+        MCP_SESSION_IDLE_TTL, MCP_SESSION_MAX_SESSIONS, MCP_SESSION_SWEEP_INTERVAL, McpHttpConfig,
+        McpIdleMemoryManager, McpLifecycleConfig, McpSemanticFallbackNotice, McpTransport,
+        RankItem, RankResponse, SearchParams, SteerResponse, background_refresh_args,
         build_mcp_semantic_filters, configured_mcp_session_manager,
         inject_mcp_filter_pushdown_payload, inject_mcp_semantic_fallback_payload,
         parse_date_filter_mcp, parse_project_match, resolve_mcp_projects,
-        spawn_mcp_session_cleanup, validate_http_auth_policy, validate_score_filter,
-        validate_string_len,
+        spawn_mcp_session_cleanup, validate_experimental_auto_refresh, validate_http_auth_policy,
+        validate_score_filter, validate_string_len,
     };
 
     use crate::auth::{AuthConfig, AuthSource};
@@ -2301,6 +2403,48 @@ mod tests {
         sync::Arc,
         time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
+
+    #[test]
+    fn experimental_auto_refresh_is_http_only() {
+        assert_eq!(
+            validate_experimental_auto_refresh(true, true),
+            Ok(()),
+            "the long-lived HTTP service is the only place the embedded writer may be requested"
+        );
+        assert_eq!(
+            validate_experimental_auto_refresh(false, true),
+            Err("--experimental-auto-refresh requires --transport http"),
+            "an ephemeral stdio server must never take embedded writer ownership"
+        );
+        assert_eq!(
+            validate_experimental_auto_refresh(true, false),
+            Ok(()),
+            "without the opt-in every transport stays reader-only"
+        );
+        assert_eq!(validate_experimental_auto_refresh(false, false), Ok(()));
+    }
+
+    #[test]
+    fn lifecycle_defaults_to_reader_only() {
+        let lifecycle = McpLifecycleConfig::default();
+        assert_eq!(
+            lifecycle.auto_refresh_interval, None,
+            "default MCP lifecycle must never own periodic index maintenance"
+        );
+        assert_eq!(lifecycle.auto_refresh_hours, MCP_AUTO_REFRESH_HOURS);
+    }
+
+    #[test]
+    fn explicit_lifecycle_can_still_request_embedded_refresh() {
+        let lifecycle = McpLifecycleConfig {
+            auto_refresh_interval: Some(MCP_AUTO_REFRESH_INTERVAL),
+            ..McpLifecycleConfig::default()
+        };
+        assert_eq!(
+            lifecycle.auto_refresh_interval,
+            Some(MCP_AUTO_REFRESH_INTERVAL)
+        );
+    }
 
     fn project_store_root(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!(

@@ -38,7 +38,7 @@ client-specific environment/header mechanism.
 
 ### 2.1. Live Refresh Behavior
 * **Is `aicx serve` live?** **Yes.** `aicx serve` does not freeze a stale in-memory copy of the index. Every tool invocation (`aicx_search`, `aicx_steer`, `aicx_intents`) reads the live Tantivy and vector store state from disk (`~/.aicx/`).
-* **Ingestion cadence:** The long-lived MCP server never rebuilds indexes in-process. Every 8640 seconds (2 h 24 min), `com.loctree.aicx.reindex` admits the bounded hot catalog delta and asks a short-lived process to publish only when the index fingerprint changed. The scheduler performs the one required full census only when the catalog is absent. The retired `--refresh-interval-seconds` and `--no-auto-refresh` flags remain accepted only so older launch configurations do not break.
+* **Ingestion cadence:** the long-lived HTTP server is a **reader**, not an index writer. It owns no periodic refresh loop by default; freshness belongs to a separate maintenance owner (`tools/install-reindex-schedule.sh`, i.e. `aicx catalog rebuild && aicx index`). The legacy embedded writer still exists behind an explicit, experimental opt-in (`--experimental-auto-refresh`, cadence tuned with `--refresh-interval-seconds`); `--refresh-interval-seconds` on its own never grants writer ownership. `--no-auto-refresh` is kept only as a deprecated compatibility flag — the default is already off. The installer still passes it deliberately and defensively, so the LaunchAgent stays reader-only even if it ever runs against an older binary whose default was writer-on; new callers should not use it.
 
 ### 2.2. Installation & Makefile Targets
 * **Standard install (with wizard):**
@@ -46,13 +46,13 @@ client-specific environment/header mechanism.
   cd /Volumes/vc-workspace/Loctree/aicx
   make install
   ```
-  *(Runs `install.sh`, installs binaries, registers `com.loctree.aicx.mcp`, and writes Claude/Codex/Gemini `mcpServers.aicx` as `{"url":"http://127.0.0.1:8044/mcp"}` — not stdio `command`. That server owns index refresh. `AICX_SKIP_MCP_SERVICE=1` keeps stdio.)*
+  *(Runs `install.sh`, installs binaries, registers `com.loctree.aicx.mcp`, and writes Claude/Codex/Gemini `mcpServers.aicx` as `{"url":"http://127.0.0.1:8044/mcp"}` — not stdio `command`. That server is a reader; index refresh stays with the separate maintenance owner. `AICX_SKIP_MCP_SERVICE=1` keeps stdio.)*
 
 * **Explicit service management:**
   ```bash
   make install-service    # Installs and starts com.loctree.aicx.mcp LaunchAgent
   make uninstall-service  # Stops and unregisters com.loctree.aicx.mcp LaunchAgent
-  make install-schedule   # Legacy: standalone refresh only when no HTTP server is installed
+  make install-schedule   # Separate maintenance owner: periodic catalog rebuild + index (required for freshness; the HTTP service is a reader)
   ```
 
 ### 2.3. Smoke Test
@@ -186,10 +186,7 @@ The long-lived MCP services are configured as LaunchAgents in
 | **`com.loctree.loctree.mcp`** | `loctree-mcp --transport http` | `5174` | `~/.loctree/logs/loctree-serve-http.log` |
 | **`com.loctree.aicx.reindex`** | hot refresh; bootstrap if absent; index | every 8640s | `~/.aicx/logs/aicx-reindex.*.log` |
 
-The AICX MCP service runs with `--no-auto-refresh`. The separate, short-lived
-8640-second publisher admits only the bounded hot delta (bootstrapping a full census once), publishes the index only when its fingerprint changed, and releases its heap when it exits.
-Run `aicx doctor --repair-runtime` once to migrate an older installation while
-preserving its MCP host, port, and allowed-host configuration.
+The HTTP service installer no longer touches maintenance labels: the server is a reader, so the separate reindex schedule coexists with it by design. (Historically, older installers removed the `io.vetcoders.aicx.reindex` timer because the server itself was a writer.)
 
 ---
 

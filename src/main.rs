@@ -45,7 +45,9 @@ use aicx::extraction::projection::{
 use aicx::extraction::{self as sources, ExtractionConfig};
 use aicx::intents;
 use aicx::legacy_archive;
-use aicx::mcp::{self, McpHttpConfig, McpLifecycleConfig, McpTransport};
+use aicx::mcp::{
+    self, MCP_AUTO_REFRESH_INTERVAL_SECONDS, McpHttpConfig, McpLifecycleConfig, McpTransport,
+};
 use aicx::output::{self, OutputConfig, OutputFormat, OutputMode, ReportMetadata};
 use aicx::parser::engine::{MIN_VISIBLE_TURNS, RefusalEvidence, RefusalReason};
 use aicx::rank;
@@ -1654,12 +1656,30 @@ enum Commands {
         #[arg(long = "no-require-auth", action = clap::ArgAction::SetTrue)]
         no_require_auth: bool,
 
-        /// Retired compatibility option. Index publication is owned by the short-lived scheduler.
-        #[arg(long, hide = true, default_value_t = 300, value_parser = clap::value_parser!(u64).range(10..))]
+        /// Explicitly opt in to the legacy embedded HTTP catalog/index writer.
+        ///
+        /// A normal long-lived MCP service is reader-only and index maintenance
+        /// has a separate process owner. This flag is experimental and
+        /// intentionally loud: it hands periodic index ownership back to the
+        /// server process.
+        #[arg(long, conflicts_with = "no_auto_refresh")]
+        experimental_auto_refresh: bool,
+
+        /// Accepted for compatibility; ignored unless
+        /// `--experimental-auto-refresh` is set.
+        ///
+        /// With `--experimental-auto-refresh` it tunes the embedded refresh
+        /// cadence. On its own it changes nothing and never grants writer
+        /// ownership.
+        #[arg(
+            long,
+            default_value_t = MCP_AUTO_REFRESH_INTERVAL_SECONDS,
+            value_parser = clap::value_parser!(u64).range(10..)
+        )]
         refresh_interval_seconds: u64,
 
-        /// Retired compatibility option. MCP no longer refreshes indexes in-process.
-        #[arg(long, hide = true)]
+        /// Deprecated compatibility flag: auto-refresh is already disabled by default.
+        #[arg(long, conflicts_with = "experimental_auto_refresh")]
         no_auto_refresh: bool,
     },
 
@@ -2348,6 +2368,36 @@ fn restore_default_sigpipe() {
 #[cfg(not(unix))]
 fn restore_default_sigpipe() {}
 
+/// Lifecycle configuration for `aicx serve`.
+///
+/// Reader-only unless the operator explicitly opts in with
+/// `--experimental-auto-refresh`. `--refresh-interval-seconds` on its own only
+/// configures cadence and can never hand index ownership to the server.
+fn serve_lifecycle(
+    experimental_auto_refresh: bool,
+    refresh_interval_seconds: u64,
+) -> McpLifecycleConfig {
+    McpLifecycleConfig {
+        auto_refresh_interval: experimental_auto_refresh
+            .then(|| Duration::from_secs(refresh_interval_seconds)),
+        ..McpLifecycleConfig::default()
+    }
+}
+
+/// `--experimental-auto-refresh` only makes sense for the long-lived HTTP
+/// service. A stdio server is per-client and short-lived, so an embedded writer
+/// there would hand periodic index ownership to an ephemeral reader.
+fn validate_serve_auto_refresh_transport(
+    transport: McpTransport,
+    experimental_auto_refresh: bool,
+) -> Result<()> {
+    mcp::validate_experimental_auto_refresh(
+        matches!(transport, McpTransport::Http),
+        experimental_auto_refresh,
+    )
+    .map_err(|message| anyhow::anyhow!(message))
+}
+
 fn main() -> Result<()> {
     restore_default_sigpipe();
 
@@ -2997,9 +3047,13 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
             auth_token,
             require_auth,
             no_require_auth,
-            refresh_interval_seconds: _,
+            experimental_auto_refresh,
+            refresh_interval_seconds,
+            // Deprecated compatibility flag; the default is already reader-only,
+            // so safety must never depend on it being passed.
             no_auto_refresh: _,
         }) => {
+            validate_serve_auto_refresh_transport(transport, experimental_auto_refresh)?;
             let require_auth = require_auth && !no_require_auth;
             let auth_config = aicx::auth::load_auth_config(auth_token.as_deref(), require_auth)?;
             if matches!(transport, McpTransport::Http) && !require_auth && host.is_loopback() {
@@ -3010,6 +3064,11 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
             if matches!(transport, McpTransport::Http) && allow_any_host {
                 eprintln!("! Warning: MCP HTTP Host validation disabled (--allow-any-host).");
             }
+            if matches!(transport, McpTransport::Http) && experimental_auto_refresh {
+                eprintln!(
+                    "! Warning: EXPERIMENTAL embedded auto-refresh writer enabled — a normal HTTP MCP server is reader-only."
+                );
+            }
             let http_config = McpHttpConfig {
                 host,
                 port,
@@ -3017,7 +3076,7 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
                 allow_any_host,
             };
             let rt = tokio::runtime::Runtime::new()?;
-            let lifecycle = McpLifecycleConfig::default();
+            let lifecycle = serve_lifecycle(experimental_auto_refresh, refresh_interval_seconds);
             rt.block_on(async {
                 mcp::run_transport_with_lifecycle(transport, http_config, auth_config, lifecycle)
                     .await

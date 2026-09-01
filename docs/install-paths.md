@@ -135,6 +135,18 @@ Binding `0.0.0.0` still writes `127.0.0.1` into clients. A leftover
 `command`/`args` pair is dropped when replacing an `aicx` entry. Opt out of
 the daemon (and keep stdio clients) with `AICX_SKIP_MCP_SERVICE=1`.
 
+## Index Maintenance on non-macOS
+
+The default MCP lifecycle is reader-only on every platform: the long-lived HTTP
+server owns no periodic refresh. `tools/install-reindex-schedule.sh` provisions
+the separate maintenance owner on macOS only and exits successfully elsewhere.
+A systemd unit or hand-written wrapper upgrading from a build whose default
+lifecycle embedded the writer must add its own maintenance step — for example a
+systemd timer or cron job running `aicx catalog rebuild && aicx index` — or
+explicitly opt back in with `--experimental-auto-refresh`; otherwise the catalog
+and index go silently stale. A packaged cross-platform maintenance owner is a
+planned follow-up, not part of this change.
+
 ## MCP Runtime Drift
 
 The CLI and MCP server are shipped as one versioned pair. Any long-running MCP
