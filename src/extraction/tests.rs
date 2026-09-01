@@ -102,6 +102,8 @@ fn test_conversation_first_excludes_reasoning() {
             source_path: None,
             source_sha256: None,
             source_line_span: None,
+            frame_class: None,
+            lineage_origin: None,
             frame_kind: None,
         },
         TimelineEntry {
@@ -116,6 +118,8 @@ fn test_conversation_first_excludes_reasoning() {
             source_path: None,
             source_sha256: None,
             source_line_span: None,
+            frame_class: None,
+            lineage_origin: None,
             frame_kind: None,
         },
         TimelineEntry {
@@ -130,6 +134,8 @@ fn test_conversation_first_excludes_reasoning() {
             source_path: None,
             source_sha256: None,
             source_line_span: None,
+            frame_class: None,
+            lineage_origin: None,
             frame_kind: None,
         },
         TimelineEntry {
@@ -144,6 +150,8 @@ fn test_conversation_first_excludes_reasoning() {
             source_path: None,
             source_sha256: None,
             source_line_span: None,
+            frame_class: None,
+            lineage_origin: None,
             frame_kind: None,
         },
     ];
@@ -175,6 +183,8 @@ fn test_conversation_first_preserves_full_messages() {
         source_path: None,
         source_sha256: None,
         source_line_span: None,
+        frame_class: None,
+        lineage_origin: None,
         frame_kind: None,
     }];
 
@@ -199,6 +209,8 @@ fn test_conversation_first_repo_project_identity() {
             source_path: None,
             source_sha256: None,
             source_line_span: None,
+            frame_class: None,
+            lineage_origin: None,
             frame_kind: None,
         },
         TimelineEntry {
@@ -213,6 +225,8 @@ fn test_conversation_first_repo_project_identity() {
             source_path: None,
             source_sha256: None,
             source_line_span: None,
+            frame_class: None,
+            lineage_origin: None,
             frame_kind: None,
         },
     ];
@@ -241,6 +255,8 @@ fn test_conversation_first_preserves_provenance() {
         source_path: None,
         source_sha256: None,
         source_line_span: None,
+        frame_class: None,
+        lineage_origin: None,
         frame_kind: None,
     }];
 
@@ -279,6 +295,8 @@ fn conversation_entry_agent(
         source_path: None,
         source_sha256: None,
         source_line_span: None,
+        frame_class: None,
+        lineage_origin: None,
         frame_kind: None,
     }
 }

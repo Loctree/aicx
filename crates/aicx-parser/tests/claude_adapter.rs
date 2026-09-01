@@ -1016,10 +1016,20 @@ fn claude_queue_enqueue_of_a_task_notification_is_not_operator_input() {
     );
     let model = session_model(QUEUE_SESSION, &body);
 
+    // W2-T8: the throne classifies the queued body as an injection
+    // (`# claude` rule `task-notification` → TransportControl), so it lands
+    // on the system lane with total accounting — never on the operator lane.
     assert!(
-        model.turns.is_empty(),
-        "harness notifications are machine chatter, not a chat turn"
+        user_turn_texts(&model).is_empty(),
+        "harness notifications are machine chatter, not operator speech"
     );
+    assert_eq!(
+        model.turns.len(),
+        1,
+        "accounted as a system note, not dropped"
+    );
+    assert_eq!(model.turns[0].kind, TurnKind::SystemNote);
+    assert_eq!(model.turns[0].role, TurnRole::System);
     assert_eq!(
         model.coverage.consumed_count, 1,
         "still consumed as metadata"
@@ -1135,4 +1145,135 @@ fn claude_queued_text_delivered_before_the_enqueue_is_a_separate_message() {
         2,
         "an earlier identical row cannot be the delivery of a later enqueue"
     );
+}
+
+// ---------------------------------------------------------------------------
+// W2-T8 — throne contract (structural; not run under the W2 embargo)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn claude_queue_enqueue_is_sealed_with_the_enqueue_timestamp_on_the_fixture() {
+    // Oracle: tests/fixtures/parser_engine/assertions.toml
+    // (claude-67025fed-enqueue-count = 26, user-only-usermsg = 25,
+    //  enqueue-seal = 2026-08-25T19:53:58.988Z, content presence).
+    let body = fixture("human_shape_67025fed.jsonl");
+    let model = session_model("67025fed-6f58-4077-8472-f41a099dd498", &body);
+
+    let user_turns = user_turn_texts(&model);
+    assert_eq!(
+        user_turns.len(),
+        25,
+        "26 enqueue records, one empty body: 25 operator utterances"
+    );
+    assert!(
+        user_turns[0].starts_with("Z mojej rozmowi z codexem"),
+        "first enqueue body is projected as operator speech"
+    );
+    assert_eq!(
+        model.turns[0].timestamp,
+        Known::value("2026-08-25T19:53:58.988Z".to_owned()),
+        "seal = transport enqueue timestamp, not render time"
+    );
+    assert!(
+        model
+            .turns
+            .iter()
+            .filter(|turn| turn.kind == TurnKind::UserMsg)
+            .all(|turn| !turn.text.trim().is_empty()),
+        "an empty enqueue is not an utterance"
+    );
+    // dequeue (6) and remove (20) are consumption bookkeeping: no lane.
+    assert_eq!(model.turns.len(), 25, "only enqueue bodies become turns");
+    assert_eq!(
+        model.coverage.consumed_count, 52,
+        "every record is accounted"
+    );
+}
+
+#[test]
+fn claude_system_reminder_block_in_the_user_lane_is_an_injection() {
+    let body = format!(
+        "{}\n",
+        serde_json::json!({
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "<system-reminder>\nhook output\n</system-reminder>"},
+                    {"type": "text", "text": "a teraz naprawdę: popraw ten plik"},
+                ]
+            },
+            "sessionId": QUEUE_SESSION,
+            "timestamp": "2026-07-30T10:24:23.406Z",
+        })
+    );
+    let model = session_model(QUEUE_SESSION, &body);
+
+    assert_eq!(
+        user_turn_texts(&model),
+        vec!["a teraz naprawdę: popraw ten plik"],
+        "only the operator's own block is speech"
+    );
+    let notes: Vec<&str> = model
+        .turns
+        .iter()
+        .filter(|turn| turn.kind == TurnKind::SystemNote)
+        .map(|turn| turn.text.as_str())
+        .collect();
+    assert_eq!(
+        notes,
+        vec!["<system-reminder>\nhook output\n</system-reminder>"],
+        "the injection is retained in full on the system lane (Decision 6)"
+    );
+}
+
+#[test]
+fn claude_tag_mentioned_inside_prose_stays_operator_speech() {
+    let body = user_row(
+        "dlaczego <system-reminder> pojawia się w moim extractcie?",
+        "2026-07-30T10:24:23.406Z",
+    );
+    let model = session_model(QUEUE_SESSION, &body);
+
+    assert_eq!(
+        user_turn_texts(&model),
+        vec!["dlaczego <system-reminder> pojawia się w moim extractcie?"],
+        "an injection is recognized only at the head of the payload"
+    );
+}
+
+#[test]
+fn claude_direct_user_text_is_human_direct_through_the_throne() {
+    use aicx_parser::engine::{
+        AgentKind, FrameClass, HumanChannel, TransportFrame, TransportKind, TransportPayload,
+        TransportRole, classify,
+    };
+    let body = user_row("zwykła wiadomość", "2026-07-30T10:24:23.406Z");
+    let model = session_model(QUEUE_SESSION, &body);
+    let turn = &model.turns[0];
+    assert_eq!(turn.kind, TurnKind::UserMsg);
+    assert_eq!(turn.role, TurnRole::User);
+
+    // The adapter's frame and the throne's verdict agree: same content hash,
+    // same seal, `Human{Direct}` for a delivered row.
+    let frame = TransportFrame {
+        agent: AgentKind::Claude,
+        transport_kind: TransportKind::DirectMessage,
+        timestamp: turn.timestamp.clone(),
+        payload: TransportPayload::Text {
+            role: TransportRole::User,
+            content: turn.text.clone(),
+        },
+        evidence: turn.raw_unit_refs[0].clone(),
+    };
+    let classified = classify(&frame);
+    assert_eq!(
+        classified.class,
+        FrameClass::Human {
+            channel: HumanChannel::Direct
+        }
+    );
+    assert_eq!(classified.content_hash, turn.text_hash);
+    assert_eq!(classified.seal.seal_ts, turn.timestamp);
+    assert_eq!(classified.turn_kind, Some(TurnKind::UserMsg));
 }

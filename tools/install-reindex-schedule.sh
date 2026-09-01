@@ -3,8 +3,8 @@ set -euo pipefail
 # install-reindex-schedule.sh — background reindex cadence for AICX (macOS).
 #
 # Installs a per-user LaunchAgent that runs
-#   aicx catalog rebuild && aicx index
-# every AICX_REINDEX_INTERVAL seconds (default 7200 = 2 h), so the catalog
+#   aicx catalog refresh && aicx index
+# every AICX_REINDEX_INTERVAL seconds (default 8640 = 2 h 24 min), so the catalog
 # admits new sessions and the lexical index republishes without anyone
 # remembering to run it. launchd serializes per-label, so a long rebuild
 # never overlaps the next tick.
@@ -14,7 +14,7 @@ set -euo pipefail
 #   bash tools/install-reindex-schedule.sh --uninstall  # remove agent + plist
 #
 # Env:
-#   AICX_REINDEX_INTERVAL  seconds between runs (default 7200)
+#   AICX_REINDEX_INTERVAL  seconds between runs (default 8640)
 #   AICX_BIN               explicit aicx binary (default: resolve from PATH)
 #
 # Non-macOS hosts: prints a note and exits 0 (the schedule is launchd-only
@@ -23,8 +23,8 @@ set -euo pipefail
 LABEL="com.loctree.aicx.reindex"
 LEGACY_LABEL="io.vetcoders.aicx.reindex"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
-LOG_DIR="$HOME/Library/Logs/vetcoders"
-INTERVAL="${AICX_REINDEX_INTERVAL:-7200}"
+LOG_DIR="$HOME/.aicx/logs"
+INTERVAL="${AICX_REINDEX_INTERVAL:-8640}"
 
 note() { printf '  %s\n' "$*"; }
 
@@ -73,7 +73,7 @@ cat > "$PLIST" <<PLIST_EOF
   <array>
     <string>/bin/sh</string>
     <string>-c</string>
-    <string>export PATH="$AICX_DIR:/usr/bin:/bin:\$HOME/.local/bin:\$HOME/.cargo/bin"; "$AICX_BIN" catalog rebuild &amp;&amp; "$AICX_BIN" index</string>
+    <string>export PATH="$AICX_DIR:/usr/bin:/bin:\$HOME/.local/bin:\$HOME/.cargo/bin"; refresh_report="\$("$AICX_BIN" catalog refresh --json)" || exit 1; printf '%s\n' "\$refresh_report"; if printf '%s\n' "\$refresh_report" | /usr/bin/grep -q '"catalog_present": false'; then "$AICX_BIN" catalog rebuild || exit 1; fi; exec "$AICX_BIN" index</string>
   </array>
   <key>StartInterval</key>
   <integer>$INTERVAL</integer>
@@ -94,6 +94,14 @@ cat > "$PLIST" <<PLIST_EOF
 PLIST_EOF
 
 plutil -lint "$PLIST" >/dev/null
+
+MANAGER="$(launchctl managername 2>/dev/null || true)"
+if [ "$MANAGER" != "Aqua" ]; then
+  note "reindex schedule: plist written to $PLIST"
+  note "reindex schedule: not loaded — this shell is not an Aqua login (launchctl managername=${MANAGER:-unknown})"
+  note "reindex schedule: it loads at the next GUI login; do not run this as root"
+  exit 0
+fi
 
 # Idempotent refresh: drop any prior registration (including the legacy
 # io.vetcoders.aicx.reindex label), then bootstrap the new one.

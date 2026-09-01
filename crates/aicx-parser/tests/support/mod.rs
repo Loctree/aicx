@@ -63,6 +63,7 @@ pub fn model_with_text(text: &str) -> SessionModel {
     let mut model = SessionModel::new("session-test", provenance, coverage);
     model.segments.push(Segment {
         segment_id: 0,
+        scope_status: ScopeStatus::NoDriftObserved,
         cwd: Known::value("repo".to_owned()),
         branch: Known::value("main".to_owned()),
         started_at: Known::value("2026-07-13T00:00:00Z".to_owned()),
@@ -80,6 +81,7 @@ pub fn model_with_text(text: &str) -> SessionModel {
         tool_name: Known::unknown(),
         segment_id: 0,
         raw_unit_refs: vec![evidence.clone()],
+        frame_class: None,
     });
     model.tool_events.push(ToolEvent {
         kind: ToolEventKind::Call,

@@ -25,6 +25,8 @@ mod checks;
 mod cleanup;
 mod quarantine;
 mod report;
+#[cfg(feature = "app")]
+mod runtime;
 mod types;
 
 pub use checks::{run, run_at};
@@ -34,6 +36,8 @@ pub use quarantine::{
     restore_quarantine, restore_quarantine_at,
 };
 pub use report::{format_oracle_readiness_text, format_report_text, oracle_readiness};
+#[cfg(feature = "app")]
+pub use runtime::{RuntimeRepairReport, format_runtime_repair_text, repair_runtime};
 pub use types::{
     CheckResult, DoctorApplyPhase, DoctorCleanupRunReport, DoctorDryRunPreview, DoctorFixId,
     DoctorOptions, DoctorReport, OracleReadinessReport, QuarantineManifest, QuarantineManifestItem,

@@ -33,6 +33,12 @@ pub struct ContinuityPack {
     pub records: Vec<IntentRecord>,
     pub sources: Vec<SourceLine>,
     pub index_health: IndexHealthLine,
+    /// Sessions whose structural scope is a mixed-workstream candidate
+    /// (W2-R1). Their records are NOT distilled into NOW/DECISIONS unless
+    /// the caller passed `distill_mixed`; they are listed instead.
+    pub mixed_scope: Vec<crate::intents::MixedScopeSession>,
+    /// Whether mixed candidates were distilled on explicit request.
+    pub distilled_mixed: bool,
 }
 
 pub struct SourceLine {
@@ -54,7 +60,24 @@ pub struct IndexHealthLine {
 /// Collect the continuity pack for one window. Source order is the doctrine:
 /// live parse (intents live window) → census fingerprints → index status.
 /// No embedder involvement anywhere on this path.
+///
+/// Default = do not distill mixed-workstream candidates into one history
+/// (`ScopeStatus::MixedCandidate`, W2-R1). When every session in the window
+/// is such a candidate the pack refuses with `RefusalReason::MixedWorkstream`
+/// instead of returning an empty or braided narrative.
 pub fn build(aicx_home: &Path, projects: &[String], hours: u64) -> Result<ContinuityPack> {
+    build_with_scope(aicx_home, projects, hours, false)
+}
+
+/// [`build`] with the mixed-scope decision explicit. `distill_mixed = true`
+/// is the operator's override: mixed candidates are distilled and the pack
+/// says so.
+pub fn build_with_scope(
+    aicx_home: &Path,
+    projects: &[String],
+    hours: u64,
+    distill_mixed: bool,
+) -> Result<ContinuityPack> {
     let config = IntentsConfig {
         project: projects.first().cloned().unwrap_or_default(),
         hours,
@@ -75,6 +98,43 @@ pub fn build(aicx_home: &Path, projects: &[String], hours: u64) -> Result<Contin
     let sources = collect_sources(aicx_home, projects, cutoff);
     let index_health = collect_index_health(aicx_home, projects, extraction.stats.live_sessions);
 
+    // Scope gate (W2-R1): a mixed candidate is not distilled into one
+    // history by default. Records from those sessions are withheld from
+    // the narrative and the sessions are listed; when nothing else is left
+    // the pack refuses loudly rather than rendering an empty NOW.
+    let mixed_scope = extraction.mixed_scope;
+    let mut records = extraction.records;
+    if !distill_mixed && !mixed_scope.is_empty() {
+        let mixed_keys: std::collections::BTreeSet<(&str, &str)> = mixed_scope
+            .iter()
+            .map(|session| (session.agent.as_str(), session.session_id.as_str()))
+            .collect();
+        let before = records.len();
+        records.retain(|record| {
+            !mixed_keys.contains(&(record.agent.as_str(), record.session_id.as_str()))
+        });
+        if records.is_empty() && before > 0 {
+            let first = &mixed_scope[0];
+            let report = crate::extraction::conversation::ScopeReport {
+                status: aicx_parser::engine::ScopeStatus::MixedCandidate,
+                cwds: first.cwds.clone(),
+                branches: first.branches.clone(),
+                entries: before,
+            };
+            let refusal = crate::extraction::conversation::refuse_mixed_workstream(
+                first.agent_kind(),
+                &first.session_id,
+                &report,
+                false,
+            )
+            .expect("mixed candidate refuses by default");
+            return Err(anyhow::Error::new(refusal).context(format!(
+                "continuity: {} mixed-workstream session(s) in the window and nothing homogeneous to distill; pass distill_mixed to override",
+                mixed_scope.len()
+            )));
+        }
+    }
+
     Ok(ContinuityPack {
         project_label: if projects.is_empty() {
             "(all projects)".to_string()
@@ -83,9 +143,11 @@ pub fn build(aicx_home: &Path, projects: &[String], hours: u64) -> Result<Contin
         },
         hours,
         live_sessions: extraction.stats.live_sessions,
-        records: extraction.records,
+        records,
         sources,
         index_health,
+        mixed_scope,
+        distilled_mixed: distill_mixed,
     })
 }
 
@@ -246,6 +308,26 @@ pub fn render(pack: &ContinuityPack, for_inject: bool) -> String {
             "- unresolved intent ({}): {}\n",
             record.agent, record.summary
         ));
+    }
+    if !pack.mixed_scope.is_empty() {
+        out.push_str(&format!(
+            "- mixed-workstream candidates: {} session(s) {} (scope_status=mixed_candidate)\n",
+            pack.mixed_scope.len(),
+            if pack.distilled_mixed {
+                "distilled on request"
+            } else {
+                "NOT distilled into this pack"
+            }
+        ));
+        for session in pack.mixed_scope.iter().take(NOW_CAP) {
+            out.push_str(&format!(
+                "  - {} · {} · cwds={} branches={}\n",
+                session.agent,
+                session.session_id,
+                session.cwds.join(","),
+                session.branches.join(",")
+            ));
+        }
     }
     out.push('\n');
 
@@ -523,6 +605,8 @@ mod tests {
                 readiness: "ready".into(),
                 mode: "live",
             },
+            mixed_scope: Vec::new(),
+            distilled_mixed: false,
         };
         let rendered = render(&pack, false);
         assert!(rendered.contains("open: claude · hot-open"));
@@ -545,6 +629,8 @@ mod tests {
                 readiness: "stale_chunks".into(),
                 mode: "live",
             },
+            mixed_scope: Vec::new(),
+            distilled_mixed: false,
         };
         let rendered = render(&pack, false);
         assert!(rendered.contains("newest_session_updated: 2026-08-13T01:48:00Z"));

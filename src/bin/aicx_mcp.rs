@@ -67,12 +67,12 @@ struct Args {
     #[arg(long, default_value_t = 15, value_parser = clap::value_parser!(u64).range(1..))]
     idle_drop_minutes: u64,
 
-    /// Refresh the hot catalog and lexical index in the background at this cadence.
-    #[arg(long, default_value_t = 300, value_parser = clap::value_parser!(u64).range(10..))]
+    /// Retired compatibility option. Index publication is owned by the short-lived scheduler.
+    #[arg(long, hide = true, default_value_t = 300, value_parser = clap::value_parser!(u64).range(10..))]
     refresh_interval_seconds: u64,
 
-    /// Disable the HTTP server's background catalog/index refresh loop.
-    #[arg(long)]
+    /// Retired compatibility option. MCP no longer refreshes indexes in-process.
+    #[arg(long, hide = true)]
     no_auto_refresh: bool,
 }
 
@@ -154,13 +154,11 @@ fn main() -> ExitCode {
         allowed_hosts: args.allowed_hosts,
         allow_any_host: args.allow_any_host,
     };
+    let _retired_refresh_flags = (args.refresh_interval_seconds, args.no_auto_refresh);
     let lifecycle = McpLifecycleConfig {
         idle_memory_drop_after: std::time::Duration::from_secs(
             args.idle_drop_minutes.saturating_mul(60),
         ),
-        auto_refresh_interval: (!args.no_auto_refresh)
-            .then(|| std::time::Duration::from_secs(args.refresh_interval_seconds)),
-        ..McpLifecycleConfig::default()
     };
     match rt.block_on(async {
         mcp::run_transport_with_lifecycle(args.transport, http_config, auth_config, lifecycle).await
@@ -259,8 +257,21 @@ mod tests {
         assert!(rendered.contains("Bind address for streamable HTTP transport"));
         assert!(rendered.contains("--no-require-auth"));
         assert!(rendered.contains("--idle-drop-minutes"));
-        assert!(rendered.contains("--refresh-interval-seconds"));
-        assert!(rendered.contains("--no-auto-refresh"));
+        assert!(!rendered.contains("--refresh-interval-seconds"));
+        assert!(!rendered.contains("--no-auto-refresh"));
+    }
+
+    #[test]
+    fn retired_refresh_flags_remain_parse_compatible() {
+        let args = Args::try_parse_from([
+            "aicx-mcp",
+            "--refresh-interval-seconds",
+            "600",
+            "--no-auto-refresh",
+        ])
+        .expect("retired refresh flags should remain parse-compatible");
+        assert_eq!(args.refresh_interval_seconds, 600);
+        assert!(args.no_auto_refresh);
     }
 
     #[test]

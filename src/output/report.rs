@@ -816,6 +816,10 @@ pub fn timeline_entries_from_model(model: &SessionModel) -> Vec<TimelineEntry> {
                 session_id: model.session_id.clone(),
                 role: role_str_for_turn(turn.role).to_string(),
                 message: turn.text.clone(),
+                // W2-R1: the throne's class travels with the entry; the
+                // `frame_kind` lane stays for class-less consumers.
+                frame_class: turn.frame_class.clone(),
+                lineage_origin: Some(aicx_parser::engine::EntryOrigin::Own),
                 frame_kind: Some(frame_kind_for_turn(turn.kind)),
                 branch: segment
                     .and_then(|segment| known_str(&segment.branch))

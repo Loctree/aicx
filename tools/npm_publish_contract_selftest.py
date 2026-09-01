@@ -26,6 +26,13 @@ def main() -> None:
     for platform in PLATFORMS:
         assert_script_free(PLATFORM_ROOT / platform / "package.json")
 
+    wrapper_source = (WRAPPER.parent / "index.js").read_text(encoding="utf-8")
+    wrapper_readme = (WRAPPER.parent / "README.md").read_text(encoding="utf-8")
+    if "aicx doctor --repair-runtime" not in wrapper_source:
+        raise SystemExit("npm wrapper lost the script-free runtime migration hint")
+    if "aicx doctor --repair-runtime" not in wrapper_readme:
+        raise SystemExit("npm README lost the runtime migration command")
+
     workflow = WORKFLOW.read_text(encoding="utf-8")
     required = (
         "pack-platform-packages:",

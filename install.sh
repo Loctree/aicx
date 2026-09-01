@@ -72,7 +72,7 @@ for arg in "$@"; do
     --help|-h)
       echo "Usage: install.sh [--skip-install] [--dry-run] [--force]"
       echo "  Install aicx + aicx-mcp and configure MCP for Claude Code, Codex, and Gemini."
-      echo "  On Darwin, a full install starts io.vetcoders.aicx.mcp and writes client"
+      echo "  On Darwin, a full install starts com.loctree.aicx.mcp and writes client"
       echo "  {\"url\": \"http://127.0.0.1:8044/mcp\"} (or AICX_MCP_HOST/PORT). Stdio remains"
       echo "  only when AICX_SKIP_MCP_SERVICE=1 or the LaunchAgent is not installed."
       echo "  Run from a release bundle or the repo root / local checkout."
@@ -1090,7 +1090,7 @@ maybe_configure_aicx_home
 
 MCP_CLIENTS_HELPER="$SCRIPT_DIR/tools/configure_mcp_clients.py"
 MCP_SERVICE_SCRIPT="$SCRIPT_DIR/tools/install-mcp-service.sh"
-MCP_SERVICE_PLIST="$HOME/Library/LaunchAgents/io.vetcoders.aicx.mcp.plist"
+MCP_SERVICE_PLIST="$HOME/Library/LaunchAgents/com.loctree.aicx.mcp.plist"
 MCP_TRANSPORT="stdio"
 
 # Background HTTP MCP service first (macOS launchd; no-op elsewhere). Clients
@@ -1101,7 +1101,7 @@ if [ "${AICX_SKIP_MCP_SERVICE:-0}" != "1" ]; then
   if [ -f "$MCP_SERVICE_SCRIPT" ]; then
     # AICX_SKIP_MCP_CLIENTS=1: this call only writes the LaunchAgent. Client
     # JSON is applied once below so install.sh owns the status lines.
-    AICX_SKIP_MCP_CLIENTS=1 bash "$MCP_SERVICE_SCRIPT" || echo "  Warning: MCP HTTP service install failed (non-fatal)."
+    AICX_BIN="$INSTALL_TARGET_AICX" AICX_SKIP_MCP_CLIENTS=1 bash "$MCP_SERVICE_SCRIPT" || echo "  Warning: MCP HTTP service install failed (non-fatal)."
   fi
   if [ "$(uname -s)" = "Darwin" ] && [ -f "$MCP_SERVICE_PLIST" ]; then
     MCP_TRANSPORT="http"
@@ -1122,7 +1122,7 @@ configure_mcp_clients() {
         echo "  Warning: MCP HTTP client wiring failed (non-fatal)."
         return
       }
-    echo "  MCP clients: Streamable HTTP (same endpoint as io.vetcoders.aicx.mcp)"
+    echo "  MCP clients: Streamable HTTP (same endpoint as com.loctree.aicx.mcp)"
     return
   fi
   if [ -z "$AICX_MCP_COMMAND" ]; then
@@ -1168,7 +1168,7 @@ echo "  aicx      - command-line tool for indexing and searching agent history"
 echo "  aicx-mcp  - stdio MCP binary (used when HTTP service is skipped)"
 if [ "$MCP_TRANSPORT" = "http" ]; then
   MCP_CLIENT_URL="$(python3 "$MCP_CLIENTS_HELPER" --print-url --plist "$MCP_SERVICE_PLIST" 2>/dev/null || true)"
-  echo "  MCP HTTP  - LaunchAgent io.vetcoders.aicx.mcp"
+  echo "  MCP HTTP  - LaunchAgent com.loctree.aicx.mcp"
   echo "              clients: ${MCP_CLIENT_URL:-http://127.0.0.1:8044/mcp}"
 else
   echo "  MCP stdio - Claude/Codex/Gemini still spawn aicx-mcp (HTTP service skipped)"

@@ -245,6 +245,37 @@ impl IntentExtractionStats {
 pub struct IntentExtraction {
     pub records: Vec<IntentRecord>,
     pub stats: IntentExtractionStats,
+    /// Sessions in the window whose structural scope is a mixed-workstream
+    /// candidate (W2-R1): several cwds and/or branches in one conversation.
+    /// Their records are still returned (each carries a
+    /// `scope_status=mixed_candidate` evidence line); single-history
+    /// distillers (`continuity`) use this list to refuse by default.
+    pub mixed_scope: Vec<MixedScopeSession>,
+}
+
+/// One mixed-workstream candidate session, with the evidence that made it one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MixedScopeSession {
+    pub agent: String,
+    pub session_id: String,
+    pub cwds: Vec<String>,
+    pub branches: Vec<String>,
+}
+
+impl MixedScopeSession {
+    /// Parser agent for the refusal payload; unknown labels (importers such
+    /// as codescribe) fall back to Claude only for the enum slot — the
+    /// `agent` string above stays the truth.
+    pub fn agent_kind(&self) -> aicx_parser::engine::AgentKind {
+        use aicx_parser::engine::AgentKind;
+        match self.agent.to_ascii_lowercase().as_str() {
+            "codex" => AgentKind::Codex,
+            "gemini" | "agy" => AgentKind::Gemini,
+            "grok" => AgentKind::Grok,
+            "junie" => AgentKind::Junie,
+            _ => AgentKind::Claude,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -258,6 +289,10 @@ pub(super) struct StoredChunkFile {
     pub(super) timestamp: DateTime<Utc>,
     pub(super) session_id: String,
     pub(super) honesty: ClaimHonesty,
+    /// Structural scope of the session the frames came from, computed
+    /// BEFORE the project filter narrows them (W2-R1). `None` for chunk
+    /// documents that carry no cwd/branch evidence.
+    pub(super) scope: Option<crate::extraction::conversation::ScopeReport>,
     pub(super) transcript_entries: Option<Vec<TranscriptEntry>>,
     /// Chunk document already held in memory, read from the committed lexical
     /// index instead of the original transcript.

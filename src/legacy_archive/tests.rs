@@ -318,6 +318,8 @@ fn test_write_context_creates_both_files() {
             source_path: None,
             source_sha256: None,
             source_line_span: None,
+            frame_class: None,
+            lineage_origin: None,
             frame_kind: None,
         },
         TimelineEntry {
@@ -332,6 +334,8 @@ fn test_write_context_creates_both_files() {
             source_path: None,
             source_sha256: None,
             source_line_span: None,
+            frame_class: None,
+            lineage_origin: None,
             frame_kind: None,
         },
     ];
@@ -383,6 +387,8 @@ fn make_entry(role: &str, message: &str) -> TimelineEntry {
         source_path: None,
         source_sha256: None,
         source_line_span: None,
+        frame_class: None,
+        lineage_origin: None,
         frame_kind: None,
     }
 }

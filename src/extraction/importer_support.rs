@@ -39,6 +39,8 @@ pub(crate) fn build_timeline_entry(
         session_id: session_id.to_string(),
         role: role.to_string(),
         message: sanitized.text.into_owned(),
+        frame_class: None,
+        lineage_origin: None,
         frame_kind: meta.frame_kind,
         branch: meta.branch,
         cwd: meta.cwd,

@@ -86,6 +86,16 @@ use aicx_parser::engine::{
 use junie::JunieAdapter;
 
 #[test]
+fn junie_routes_human_and_tool_frames_through_the_taxonomy_throne() {
+    let source = include_str!("../src/adapters/junie.rs");
+
+    assert!(source.contains("use crate::engine::frames"));
+    assert!(source.contains("frames::classify"));
+    assert!(source.contains("TransportPayload::Shell"));
+    assert!(!source.contains("self.push_turn(TurnRole::User"));
+}
+
+#[test]
 fn junie_native_matrix_models_core_shapes_and_coverage() {
     let source = fixture_source(
         "matrix",
@@ -96,7 +106,7 @@ fn junie_native_matrix_models_core_shapes_and_coverage() {
         .unwrap();
     let adapter = JunieAdapter;
     assert_eq!(adapter.agent(), AgentKind::Junie);
-    assert_eq!(adapter.adapter_version(), "junie-native-v1");
+    assert_eq!(adapter.adapter_version(), "junie-native-v2");
 
     let classified = adapter.classify(&source, &read).unwrap();
     let physical = classified
@@ -215,7 +225,7 @@ fn junie_a2ux_live_envelope_maps_roles_and_latest_snapshots() {
         .iter()
         .map(|turn| (turn.role, turn.kind, turn.text.as_str()))
         .collect::<Vec<_>>();
-    assert_eq!(turns.len(), 3);
+    assert_eq!(turns.len(), 4);
     assert!(turns.contains(&(
         TurnRole::Assistant,
         TurnKind::InternalThought,
@@ -226,6 +236,7 @@ fn junie_a2ux_live_envelope_maps_roles_and_latest_snapshots() {
         TurnKind::ToolCall,
         "cargo test -p aicx-parser junie"
     )));
+    assert!(turns.contains(&(TurnRole::Tool, TurnKind::ToolResult, "test result")));
     assert!(turns.contains(&(
         TurnRole::Assistant,
         TurnKind::AgentReply,
@@ -268,6 +279,40 @@ fn junie_native_golden_matches_reviewed_fixture() {
         envelope["heuristic"]["intent_summary"]
             .as_str()
             .is_some_and(|text| text.contains("Junie oracle"))
+    );
+}
+
+#[test]
+fn junie_human_shape_260528_does_not_drop_below_frozen_cardinality() {
+    let source = fixture_source_with_session(
+        "human-shape-260528",
+        include_str!("../../../tests/fixtures/parser_engine/junie/human_shape_260528.jsonl"),
+        "session-260528-231721-1ksa",
+    );
+    let read = RawUnitReader::new(ReaderPolicy::default())
+        .read(&source)
+        .unwrap();
+    let adapter = JunieAdapter;
+    let model = adapter
+        .assemble(&source, &read, adapter.classify(&source, &read).unwrap())
+        .unwrap()
+        .into_model();
+
+    assert_eq!(
+        model
+            .turns
+            .iter()
+            .filter(|turn| turn.kind == TurnKind::UserMsg)
+            .count(),
+        0
+    );
+    assert_eq!(
+        model
+            .turns
+            .iter()
+            .filter(|turn| turn.kind == TurnKind::AgentReply)
+            .count(),
+        1
     );
 }
 

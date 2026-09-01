@@ -1,4 +1,7 @@
 #![allow(unused_imports)]
+use aicx_parser::engine::{
+    DetectionProbe, EngineError, MIN_VISIBLE_TURNS, RefusalEvidence, RefusalReason,
+};
 pub(crate) use anyhow::Context;
 use anyhow::Result;
 pub(crate) use chrono::{DateTime, Utc};
@@ -23,6 +26,7 @@ pub mod files;
 mod importer_support;
 pub mod list;
 pub mod project;
+pub mod projection;
 
 pub use conversation::{
     ConversationProjection, is_harness_injected_noise, to_conversation, to_conversation_with_stats,
@@ -130,11 +134,21 @@ pub fn extract_agent_sessions(
         crate::session_catalog::AgentKind::Junie => home.join(".junie").join("sessions"),
     };
     if !root.is_dir() {
+        // No session root means this agent has never written a session on
+        // this host: zero sources, not a failed adapter claim. Typed refusals
+        // are reserved for sources that exist and were understood.
+        crate::diagnostics::log_describe(&format!(
+            "session_root_missing agent={} root={}",
+            agent,
+            root.display()
+        ));
         return Ok(SessionExtractionBatch::default());
     }
     let scan = crate::session_catalog::SessionCatalog::new(agent, &root)?.scan_with_stats();
-    let parser_agent = parser_agent(agent);
+    let parser_agent_kind = parser_agent(agent);
     let mut batch = SessionExtractionBatch::default();
+    let mut first_refusal = None;
+    let mut projection_basis = None;
     let mut sources: Vec<_> = scan
         .result?
         .into_iter()
@@ -143,13 +157,20 @@ pub fn extract_agent_sessions(
     order_sources_freshest_first(&mut sources);
     for source in sources {
         let parsed = crate::parser_dispatch::parse_file(
-            parser_agent,
+            parser_agent_kind,
             &source.source_id,
             source.logical_session_id.clone(),
             &source.path,
         );
         match parsed {
             Ok(session) => {
+                projection_basis.get_or_insert_with(|| {
+                    (
+                        session.model().session_id.clone(),
+                        session.model().coverage.clone(),
+                        session.model().turns.len() as u64,
+                    )
+                });
                 if !session_matches_project_filter(session.model(), &config.project_filter) {
                     batch.filtered_out_sessions += 1;
                     crate::diagnostics::log_describe(&format!(
@@ -179,6 +200,17 @@ pub fn extract_agent_sessions(
                     .extend(crate::output::timeline_entries_from_model(session.model()));
             }
             Err(error) => {
+                if first_refusal.is_none() {
+                    first_refusal =
+                        error
+                            .downcast_ref::<EngineError>()
+                            .and_then(|engine| match engine {
+                                EngineError::Validation(validation) => {
+                                    validation.refusal.as_deref().cloned()
+                                }
+                                _ => None,
+                            });
+                }
                 // A parse failure hides the session's cwd, so an active
                 // `-p` filter cannot prove the session is out of scope.
                 // Keep it selected + skipped: hiding parse failures inside
@@ -203,6 +235,34 @@ pub fn extract_agent_sessions(
                 .watermark
                 .is_none_or(|watermark| entry.timestamp > watermark)
     });
+    if batch.entries.is_empty() {
+        if batch.ingested_sessions == 0
+            && let Some(refusal) = first_refusal
+        {
+            return Err(anyhow::Error::new(refusal));
+        }
+        if let Some((session_id, _coverage, turns_before_filter)) = projection_basis {
+            // A batch filter (`-p`, cutoff, watermark) that removes every
+            // entry is a legitimate zero for `aicx <agent>` / `aicx all`
+            // (incremental runs and project cuts hit it routinely). Say so on
+            // the diagnostics channel; the typed `ProjectionFilteredAll`
+            // refusal belongs to single-session seams (`extract`, MCP).
+            crate::diagnostics::log_describe(&format!(
+                "projection_filtered_all agent={} session_id={} turns_before_filter={} cutoff={} include_assistant={} watermark={:?} project_filter={:?}",
+                agent,
+                session_id,
+                turns_before_filter,
+                config.cutoff,
+                config.include_assistant,
+                config.watermark,
+                config.project_filter
+            ));
+        }
+        // Nothing was selected inside the extract window: an empty batch is
+        // the honest answer (dry-runs, watermark catch-ups and `-H` windows
+        // legitimately see zero sessions). Detection refusals are for sources
+        // the adapter looked at and could not claim.
+    }
     Ok(batch)
 }
 

@@ -38,7 +38,7 @@ client-specific environment/header mechanism.
 
 ### 2.1. Live Refresh Behavior
 * **Is `aicx serve` live?** **Yes.** `aicx serve` does not freeze a stale in-memory copy of the index. Every tool invocation (`aicx_search`, `aicx_steer`, `aicx_intents`) reads the live Tantivy and vector store state from disk (`~/.aicx/`).
-* **Ingestion cadence:** HTTP mode owns a bounded async refresh loop: every 5 minutes it refreshes the hot 48-hour catalog window and incrementally publishes the lexical index. The blocking filesystem/index work runs outside Tokio request workers. Use `--refresh-interval-seconds` to tune it or `--no-auto-refresh` only when another explicit writer owns freshness.
+* **Ingestion cadence:** The long-lived MCP server never rebuilds indexes in-process. Every 8640 seconds (2 h 24 min), `com.loctree.aicx.reindex` admits the bounded hot catalog delta and asks a short-lived process to publish only when the index fingerprint changed. The scheduler performs the one required full census only when the catalog is absent. The retired `--refresh-interval-seconds` and `--no-auto-refresh` flags remain accepted only so older launch configurations do not break.
 
 ### 2.2. Installation & Makefile Targets
 * **Standard install (with wizard):**
@@ -177,14 +177,19 @@ url = "http://127.0.0.1:5174/mcp"
 
 ## 5. macOS launchd LaunchAgents
 
-The services are configured as LaunchAgents in `~/Library/LaunchAgents/` with `RunAtLoad=true` and `KeepAlive=true`:
+The long-lived MCP services are configured as LaunchAgents in
+`~/Library/LaunchAgents/` with `RunAtLoad=true` and `KeepAlive=true`:
 
-| Service Label | Command | Default Port | Log Destination |
+| Service Label | Command | Port / Cadence | Log Destination |
 | :--- | :--- | :--- | :--- |
 | **`com.loctree.aicx.mcp`** | `aicx serve --transport http` | `8044` | `~/.aicx/logs/aicx-serve-http.log` |
 | **`com.loctree.loctree.mcp`** | `loctree-mcp --transport http` | `5174` | `~/.loctree/logs/loctree-serve-http.log` |
+| **`com.loctree.aicx.reindex`** | hot refresh; bootstrap if absent; index | every 8640s | `~/.aicx/logs/aicx-reindex.*.log` |
 
-The former `io.vetcoders.aicx.reindex` timer is removed when the HTTP service is installed, preventing two competing index writers.
+The AICX MCP service runs with `--no-auto-refresh`. The separate, short-lived
+8640-second publisher admits only the bounded hot delta (bootstrapping a full census once), publishes the index only when its fingerprint changed, and releases its heap when it exits.
+Run `aicx doctor --repair-runtime` once to migrate an older installation while
+preserving its MCP host, port, and allowed-host configuration.
 
 ---
 

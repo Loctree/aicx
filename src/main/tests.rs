@@ -564,6 +564,7 @@ fn run_search_rejects_limit_over_hard_cap_before_store_access() {
         evidence: false,
         deep: false,
         project_match: legacy_archive::ProjectMatchMode::Exact,
+        projection: ProjectionSpec::default(),
     })
     .expect_err("oversized search limit must fail before reading the store");
 
@@ -2415,6 +2416,24 @@ fn doctor_deep_flag_parses_and_defaults_off() {
 }
 
 #[test]
+fn doctor_repair_runtime_parses_as_explicit_action() {
+    let cli = Cli::try_parse_from(["aicx", "doctor", "--repair-runtime"])
+        .expect("doctor runtime repair should parse");
+    match cli.command {
+        Some(Commands::Doctor { repair_runtime, .. }) => assert!(repair_runtime),
+        _ => panic!("expected doctor command"),
+    }
+}
+
+#[test]
+fn doctor_repair_runtime_rejects_silent_mixed_actions() {
+    assert!(
+        Cli::try_parse_from(["aicx", "doctor", "--repair-runtime", "--deep"]).is_err(),
+        "runtime repair must not silently discard another doctor action"
+    );
+}
+
+#[test]
 fn doctor_deep_routing_covers_fix_scan_and_oracle_requests() {
     // W2-04: the fast pass can neither fix nor certify — every remediation,
     // script-rendering, full-scan, or oracle request must route deep; a
@@ -2772,6 +2791,8 @@ fn conversations_batch_writes_synthetic_sessions_without_store_path() {
             session_id: "session-one".to_string(),
             role: "user".to_string(),
             message: "hello one".to_string(),
+            frame_class: None,
+            lineage_origin: None,
             frame_kind: None,
             branch: Some("main".to_string()),
             cwd: Some("/tmp/project-one".to_string()),
@@ -2786,6 +2807,8 @@ fn conversations_batch_writes_synthetic_sessions_without_store_path() {
             session_id: "session-two/unsafe".to_string(),
             role: "assistant".to_string(),
             message: "hello two".to_string(),
+            frame_class: None,
+            lineage_origin: None,
             frame_kind: None,
             branch: None,
             cwd: Some("/tmp/project-two".to_string()),
@@ -2959,6 +2982,7 @@ fn direct_file_boundary_rejects_directory_without_output() {
             max_message_chars: 0,
             redact_secrets: false,
             conversation: false,
+            projection: ProjectionSpec::default(),
         },
     )
     .expect_err("directory input must be rejected before parser dispatch");
@@ -3007,6 +3031,8 @@ fn mk_entry(
         session_id: session.to_string(),
         role: "user".to_string(),
         message: message.to_string(),
+        frame_class: None,
+        lineage_origin: None,
         frame_kind: None,
         branch: None,
         cwd: cwd.map(str::to_string),

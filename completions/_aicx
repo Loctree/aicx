@@ -186,6 +186,12 @@ _arguments "${_arguments_options[@]}" : \
 '--max-message-chars=[Maximum message characters in markdown (0 = no truncation)]:MAX_MESSAGE_CHARS:_default' \
 '--no-redact-secrets[Redact secrets (tokens/keys) from outputs before writing/syncing]' \
 '--user-only[Only include user messages (exclude assistant + reasoning)]' \
+'-H+[Hours to look back inside the session view (0 = unbounded)]:HOURS:_default' \
+'--hours=[Hours to look back inside the session view (0 = unbounded)]:HOURS:_default' \
+'*--kind=[Throne kind filter]:KIND:(human echo_seal shell_action inject assistant_final lineage_meta inter_agent)' \
+'--dialog[Dialogue view: human speech incl. delayed echo-bus / queued speech with seals, plus assistant-final]' \
+'--lineage=-[Walk parent sessions via session_meta.forked_from_id (bare = unbounded, =N = depth)]:DEPTH:_default' \
+'--result=[Retained shell result body]:none|head=N|full:(none full head=)' \
 '--conversation[Conversation-first mode\: emit denoised user/assistant transcript only]' \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
@@ -205,6 +211,12 @@ _arguments "${_arguments_options[@]}" : \
 '--max-message-chars=[Maximum message characters in markdown (0 = no truncation)]:MAX_MESSAGE_CHARS:_default' \
 '--no-redact-secrets[Redact secrets (tokens/keys) from outputs before writing/syncing]' \
 '--user-only[Only include user messages (exclude assistant + reasoning)]' \
+'-H+[Hours to look back inside the session view (0 = unbounded)]:HOURS:_default' \
+'--hours=[Hours to look back inside the session view (0 = unbounded)]:HOURS:_default' \
+'*--kind=[Throne kind filter]:KIND:(human echo_seal shell_action inject assistant_final lineage_meta inter_agent)' \
+'--dialog[Dialogue view: human speech incl. delayed echo-bus / queued speech with seals, plus assistant-final]' \
+'--lineage=-[Walk parent sessions via session_meta.forked_from_id (bare = unbounded, =N = depth)]:DEPTH:_default' \
+'--result=[Retained shell result body]:none|head=N|full:(none full head=)' \
 '--conversation[Conversation-first mode\: emit denoised user/assistant transcript only]' \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
@@ -224,6 +236,12 @@ _arguments "${_arguments_options[@]}" : \
 '--max-message-chars=[Maximum message characters in markdown (0 = no truncation)]:MAX_MESSAGE_CHARS:_default' \
 '--no-redact-secrets[Redact secrets (tokens/keys) from outputs before writing/syncing]' \
 '--user-only[Only include user messages (exclude assistant + reasoning)]' \
+'-H+[Hours to look back inside the session view (0 = unbounded)]:HOURS:_default' \
+'--hours=[Hours to look back inside the session view (0 = unbounded)]:HOURS:_default' \
+'*--kind=[Throne kind filter]:KIND:(human echo_seal shell_action inject assistant_final lineage_meta inter_agent)' \
+'--dialog[Dialogue view: human speech incl. delayed echo-bus / queued speech with seals, plus assistant-final]' \
+'--lineage=-[Walk parent sessions via session_meta.forked_from_id (bare = unbounded, =N = depth)]:DEPTH:_default' \
+'--result=[Retained shell result body]:none|head=N|full:(none full head=)' \
 '--conversation[Conversation-first mode\: emit denoised user/assistant transcript only]' \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
@@ -243,6 +261,12 @@ _arguments "${_arguments_options[@]}" : \
 '--max-message-chars=[Maximum message characters in markdown (0 = no truncation)]:MAX_MESSAGE_CHARS:_default' \
 '--no-redact-secrets[Redact secrets (tokens/keys) from outputs before writing/syncing]' \
 '--user-only[Only include user messages (exclude assistant + reasoning)]' \
+'-H+[Hours to look back inside the session view (0 = unbounded)]:HOURS:_default' \
+'--hours=[Hours to look back inside the session view (0 = unbounded)]:HOURS:_default' \
+'*--kind=[Throne kind filter]:KIND:(human echo_seal shell_action inject assistant_final lineage_meta inter_agent)' \
+'--dialog[Dialogue view: human speech incl. delayed echo-bus / queued speech with seals, plus assistant-final]' \
+'--lineage=-[Walk parent sessions via session_meta.forked_from_id (bare = unbounded, =N = depth)]:DEPTH:_default' \
+'--result=[Retained shell result body]:none|head=N|full:(none full head=)' \
 '--conversation[Conversation-first mode\: emit denoised user/assistant transcript only]' \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
@@ -262,6 +286,12 @@ _arguments "${_arguments_options[@]}" : \
 '--max-message-chars=[Maximum message characters in markdown (0 = no truncation)]:MAX_MESSAGE_CHARS:_default' \
 '--no-redact-secrets[Redact secrets (tokens/keys) from outputs before writing/syncing]' \
 '--user-only[Only include user messages (exclude assistant + reasoning)]' \
+'-H+[Hours to look back inside the session view (0 = unbounded)]:HOURS:_default' \
+'--hours=[Hours to look back inside the session view (0 = unbounded)]:HOURS:_default' \
+'*--kind=[Throne kind filter]:KIND:(human echo_seal shell_action inject assistant_final lineage_meta inter_agent)' \
+'--dialog[Dialogue view: human speech incl. delayed echo-bus / queued speech with seals, plus assistant-final]' \
+'--lineage=-[Walk parent sessions via session_meta.forked_from_id (bare = unbounded, =N = depth)]:DEPTH:_default' \
+'--result=[Retained shell result body]:none|head=N|full:(none full head=)' \
 '--conversation[Conversation-first mode\: emit denoised user/assistant transcript only]' \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
@@ -1391,6 +1421,9 @@ _arguments "${_arguments_options[@]}" : \
 '--context=[Context lines before and after each passage match (default\: 2)]:N:_default' \
 '--literal[Match an exact, identifier-boundary substring inside --session]' \
 '(--evidence)--no-semantic[Force lexical-only retrieval from the published CURRENT index]' \
+'--dialog[Dialogue view of hits: delayed human speech rendered as speech, with seals]' \
+'--result=[Shell result body on tool_call hits]:none|head=N|full:(none full head=)' \
+'--lineage=-[Accepted for grammar parity with extract; not applied to hits]:DEPTH:_default' \
 '--evidence[Return an evidence packet\: semantic candidates re-ranked by answer/support signals, with source sections and diagnostics]' \
 '-j[Emit compact JSON instead of plain text]' \
 '--json[Emit compact JSON instead of plain text]' \
