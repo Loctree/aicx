@@ -30,15 +30,17 @@ const MAX_ID_BYTES: usize = 256;
 pub enum AgentKind {
     Claude,
     Codex,
+    Cursor,
     Gemini,
     Junie,
     Grok,
 }
 
 impl AgentKind {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Claude,
         Self::Codex,
+        Self::Cursor,
         Self::Gemini,
         Self::Junie,
         Self::Grok,
@@ -48,6 +50,7 @@ impl AgentKind {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
+            Self::Cursor => "cursor",
             Self::Gemini => "gemini",
             Self::Junie => "junie",
             Self::Grok => "grok",
@@ -58,6 +61,7 @@ impl AgentKind {
         match value.trim().to_ascii_lowercase().as_str() {
             "claude" => Some(Self::Claude),
             "codex" => Some(Self::Codex),
+            "cursor" | "cursor-agent" => Some(Self::Cursor),
             "gemini" | "gemini-antigravity" => Some(Self::Gemini),
             "junie" => Some(Self::Junie),
             "grok" => Some(Self::Grok),
@@ -70,6 +74,7 @@ impl AgentKind {
         match self {
             Self::Claude => home.join(".claude").join("projects"),
             Self::Codex => home.join(".codex").join("sessions"),
+            Self::Cursor => home.join(".cursor").join("projects"),
             Self::Gemini => home.join(".gemini").join("tmp"),
             Self::Grok => home.join(".grok").join("sessions"),
             Self::Junie => home.join(".junie").join("sessions"),
@@ -80,6 +85,7 @@ impl AgentKind {
         match self {
             Self::Claude => aicx_parser::engine::AgentKind::Claude,
             Self::Codex => aicx_parser::engine::AgentKind::Codex,
+            Self::Cursor => aicx_parser::engine::AgentKind::Cursor,
             Self::Gemini => aicx_parser::engine::AgentKind::Gemini,
             Self::Grok => aicx_parser::engine::AgentKind::Grok,
             Self::Junie => aicx_parser::engine::AgentKind::Junie,
@@ -89,17 +95,34 @@ impl AgentKind {
     fn accepts_extension(self, extension: Option<&str>) -> bool {
         match self {
             Self::Gemini => matches!(extension, Some("json" | "jsonl")),
-            Self::Claude | Self::Codex | Self::Junie | Self::Grok => extension == Some("jsonl"),
+            Self::Claude | Self::Codex | Self::Cursor | Self::Junie | Self::Grok => {
+                extension == Some("jsonl")
+            }
         }
     }
 
     /// Grok session dirs carry multiple JSONL streams (chat, events, updates,
     /// hunks, rewind). Only `chat_history.jsonl` is conversation content;
     /// telemetry streams must not become catalog identity.
+    ///
+    /// Cursor keeps transcripts under `<slug>/agent-transcripts/<uuid>/<uuid>.jsonl`;
+    /// `~/.cursor/projects` also carries non-transcript content, so only the
+    /// per-session file whose stem equals its parent directory is primary.
     fn is_primary_source_file(self, path: &Path) -> bool {
         match self {
             Self::Grok => {
                 path.file_name().and_then(|name| name.to_str()) == Some("chat_history.jsonl")
+            }
+            Self::Cursor => {
+                let has_transcripts_component = path
+                    .components()
+                    .any(|component| component.as_os_str() == "agent-transcripts");
+                let stem = path.file_stem().and_then(|name| name.to_str());
+                let parent = path
+                    .parent()
+                    .and_then(|dir| dir.file_name())
+                    .and_then(|name| name.to_str());
+                has_transcripts_component && stem.is_some() && stem == parent
             }
             _ => true,
         }
