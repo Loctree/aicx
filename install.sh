@@ -1101,7 +1101,7 @@ if [ "${AICX_SKIP_MCP_SERVICE:-0}" != "1" ]; then
   if [ -f "$MCP_SERVICE_SCRIPT" ]; then
     # AICX_SKIP_MCP_CLIENTS=1: this call only writes the LaunchAgent. Client
     # JSON is applied once below so install.sh owns the status lines.
-    AICX_SKIP_MCP_CLIENTS=1 bash "$MCP_SERVICE_SCRIPT" || echo "  Warning: MCP HTTP service install failed (non-fatal)."
+    AICX_BIN="$INSTALL_TARGET_AICX" AICX_SKIP_MCP_CLIENTS=1 bash "$MCP_SERVICE_SCRIPT" || echo "  Warning: MCP HTTP service install failed (non-fatal)."
   fi
   if [ "$(uname -s)" = "Darwin" ] && [ -f "$MCP_SERVICE_PLIST" ]; then
     MCP_TRANSPORT="http"

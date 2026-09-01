@@ -10,18 +10,22 @@
 use super::{
     AdapterError, AgentAdapter, ClassifiedDisposition, ClassifiedUnit, RawUnitLevel, sealed,
 };
+use crate::engine::frames::{
+    self, FrameClass, InjectKind, TransportFrame, TransportKind, TransportPayload, TransportRole,
+};
+use crate::engine::frames_rules;
 use crate::engine::{
-    AgentKind, BoundaryFlags, ConsumedUnit, CounterSemantics, CoverageReport, CoverageWarning,
-    Known, ParseStatus, Provenance, RawUnitRef, ReportedCost, Segment, SessionModel,
-    SkillInvocation, SkippedReason, SkippedUnit, SourceHandle, SourceRead, TokenComponents,
-    ToolEvent, ToolEventKind, Turn, TurnKind, TurnRange, TurnRole, UnitBoundary, UnvalidatedParse,
-    UsageEvent, VisibleCompleteness, WarningKind, evidence_event_id_from_hash, ordinal_locator,
-    sha256_hex,
+    AgentKind, BoundaryFlags, ConsumedUnit, ContextEpochRef, CounterSemantics, CoverageReport,
+    CoverageWarning, Known, ParseStatus, Provenance, ProviderConversationRef, RawUnitRef,
+    ReportedCost, ScopeStatus, Segment, SessionModel, SkillInvocation, SkippedReason, SkippedUnit,
+    SourceHandle, SourceRead, TokenComponents, ToolEvent, ToolEventKind, Turn, TurnKind, TurnRange,
+    TurnRole, UnitBoundary, UnvalidatedParse, UsageEvent, VisibleCompleteness, WarningKind,
+    evidence_event_id_from_hash, ordinal_locator, sha256_hex,
 };
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
-pub const CODEX_ADAPTER_VERSION: &str = "codex-rollout-v1";
+pub const CODEX_ADAPTER_VERSION: &str = "codex-rollout-v3";
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CodexAdapter;
@@ -63,6 +67,7 @@ impl AgentAdapter for CodexAdapter {
             .map(|raw| classify_raw(source, session_id, raw))
             .collect::<Result<Vec<_>, _>>()?;
         let mut next_ordinal = classified.len() as u64 + 1;
+        let mut seen_replay_hashes = BTreeSet::new();
         for raw in &read.units {
             if raw.boundary == UnitBoundary::Oversized {
                 continue;
@@ -75,6 +80,16 @@ impl AgentAdapter for CodexAdapter {
                 classified.push(logical);
                 next_ordinal += 1;
             }
+            let replay = classify_compaction_replays(
+                source,
+                session_id,
+                raw,
+                &value,
+                next_ordinal,
+                &mut seen_replay_hashes,
+            )?;
+            next_ordinal += replay.len() as u64;
+            classified.extend(replay);
         }
         Ok(classified)
     }
@@ -110,6 +125,12 @@ fn classify_logical(
             "message",
             ClassifiedDisposition::Consumed {
                 kind: "message".to_owned(),
+            },
+        ),
+        ("response_item", "agent_message") => (
+            "agent_message",
+            ClassifiedDisposition::Consumed {
+                kind: "agent_message".to_owned(),
             },
         ),
         ("response_item", "function_call") => (
@@ -175,6 +196,74 @@ fn classify_logical(
         },
         disposition,
     }))
+}
+
+fn classify_compaction_replays(
+    source: &SourceHandle,
+    session_id: &str,
+    raw: &crate::engine::RawUnit,
+    event: &Value,
+    first_ordinal: u64,
+    seen_hashes: &mut BTreeSet<String>,
+) -> Result<Vec<ClassifiedUnit>, AdapterError> {
+    let payload = event.get("payload").unwrap_or(event);
+    let is_compaction = string_at(event, &["type"]) == Some("compacted")
+        || (string_at(event, &["type"]) == Some("response_item")
+            && string_at(payload, &["type"]) == Some("compacted"));
+    if !is_compaction {
+        return Ok(Vec::new());
+    }
+    let Some(history) = payload.get("replacement_history").and_then(Value::as_array) else {
+        return Ok(Vec::new());
+    };
+    history
+        .iter()
+        .enumerate()
+        .map(|(index, item)| {
+            let bytes = serde_json::to_vec(item)
+                .map_err(|error| AdapterError::new("classify", error.to_string()))?;
+            let content_hash = sha256_hex(&bytes);
+            let reason = if seen_hashes.insert(content_hash.clone()) {
+                SkippedReason::CompactionReplay
+            } else {
+                SkippedReason::DuplicateBody
+            };
+            let unit_kind = reason.as_str();
+            let ordinal = first_ordinal + index as u64;
+            let locator = format!(
+                "{}:payload.replacement_history[{index}]",
+                ordinal_locator(raw.physical_ordinal)
+            );
+            let evidence_event_id = evidence_event_id_from_hash(
+                source.agent(),
+                session_id,
+                &locator,
+                unit_kind,
+                &content_hash,
+            )
+            .map_err(|error| AdapterError::new("classify", error.to_string()))?;
+            Ok(ClassifiedUnit {
+                ordinal,
+                level: RawUnitLevel::Logical {
+                    parent_ordinal: raw.coverage_ordinal,
+                },
+                evidence: RawUnitRef {
+                    evidence_event_id,
+                    coverage_ordinal: ordinal,
+                    physical_ordinal: raw.physical_ordinal,
+                    locator,
+                    unit_kind: unit_kind.to_owned(),
+                    artifact: raw.artifact_name.clone(),
+                    content_hash,
+                    original_bytes: bytes.len() as u64,
+                },
+                disposition: ClassifiedDisposition::Skipped {
+                    reason,
+                    visible: false,
+                },
+            })
+        })
+        .collect()
 }
 
 fn classify_raw(
@@ -275,6 +364,13 @@ fn assemble_codex(
                 Some("user") | Some("assistant")
             )
     });
+    state.have_response_item_agent_message = read.units.iter().any(|raw| {
+        let Ok(value) = serde_json::from_slice::<Value>(&raw.bytes) else {
+            return false;
+        };
+        string_at(&value, &["type"]) == Some("response_item")
+            && string_at(&value, &["payload", "type"]) == Some("agent_message")
+    });
     for (raw, classified) in read.units.iter().zip(
         classified
             .iter()
@@ -325,8 +421,18 @@ struct Assembly<'a> {
     session_meta_seen: bool,
     /// True when the session contains response_item.message chat ownership.
     have_response_item_chat: bool,
+    /// True when response_item.agent_message owns the inter-agent envelope.
+    have_response_item_agent_message: bool,
     /// At least one compaction marker was consumed (TB context_compacted class).
     compaction_boundary_present: bool,
+    /// Content identity for sticky compaction history; transport ids rotate.
+    seen_replay_hashes: BTreeSet<String>,
+    /// Provider identity from `session_meta.payload` (W2-R1); `None` until
+    /// the meta record has been read.
+    conversation: Option<ProviderConversationRef>,
+    /// Compaction boundaries, in order, with the physical ordinal of the
+    /// record that carried each boundary (to locate the first turn after).
+    context_epochs: Vec<(ContextEpochRef, u64)>,
 }
 
 #[derive(Clone)]
@@ -368,7 +474,11 @@ impl<'a> Assembly<'a> {
             visible_lost: false,
             session_meta_seen: false,
             have_response_item_chat: false,
+            have_response_item_agent_message: false,
             compaction_boundary_present: false,
+            seen_replay_hashes: BTreeSet::new(),
+            conversation: None,
+            context_epochs: Vec::new(),
         }
     }
 
@@ -381,32 +491,93 @@ impl<'a> Assembly<'a> {
             self.ended_at = timestamp.clone();
         }
         match string_at(event, &["type"]).unwrap_or("") {
-            "session_meta" => self.session_meta(event),
+            "session_meta" => self.session_meta(event, timestamp, evidence),
             "turn_context" => self.turn_context(event, timestamp),
             "event_msg" => self.event_msg(event, timestamp, evidence),
             "response_item" => self.response_item(event, timestamp, evidence),
             // Top-level Codex compaction envelope (TB counts as context_compacted).
             "compacted" => {
                 self.compaction_boundary_present = true;
-                Ok(())
+                self.consume_compaction_replay(event, timestamp, evidence)
             }
             _ => Ok(()),
         }
     }
 
-    fn session_meta(&mut self, event: &Value) -> Result<(), AdapterError> {
+    fn session_meta(
+        &mut self,
+        event: &Value,
+        timestamp: Known<String>,
+        evidence: RawUnitRef,
+    ) -> Result<(), AdapterError> {
         if self.session_meta_seen {
             return Ok(());
         }
         self.session_meta_seen = true;
-        // The resolved SourceHandle owns identity. Direct-file mode has no
-        // catalog and may use a filename-derived physical id; an embedded
-        // session_meta id is payload data, not authority to rewrite or reject
-        // the already-selected source.
+        // The resolved SourceHandle owns the STORE identity. Direct-file mode
+        // has no catalog and may use a filename-derived physical id; an
+        // embedded session_meta id is payload data, not authority to rewrite
+        // or reject the already-selected source. It IS, however, the
+        // provider's own statement of which conversation this is (W2-R1):
+        // `session_id` = tree root, `id` = this thread, `forked_from_id` =
+        // fork origin, `parent_thread_id` = sub-agent parent.
         self.cwd = known_string(string_at(event, &["payload", "cwd"]));
         self.current_cwd = self.cwd.clone();
+        self.current_branch = known_string(string_at(event, &["payload", "git", "branch"]));
+        self.branch = self.current_branch.clone();
         self.model = known_string(string_at(event, &["payload", "model"]));
         self.cli_version = known_string(string_at(event, &["payload", "cli_version"]));
+
+        let field = |key: &str| {
+            string_at(event, &["payload", key])
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+        };
+        let thread_id = field("id");
+        let tree_session_id = field("session_id")
+            .or_else(|| thread_id.clone())
+            .unwrap_or_else(|| self.session_id.clone());
+        let forked_from_id = field("forked_from_id");
+        let parent_thread_id = field("parent_thread_id");
+        let window_id = string_at(event, &["payload", "context_window", "window_id"])
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_owned);
+        let mut unobserved = Vec::new();
+        for (name, present) in [
+            ("thread_id", thread_id.is_some()),
+            ("forked_from_id", forked_from_id.is_some()),
+            ("parent_thread_id", parent_thread_id.is_some()),
+            ("window_id", window_id.is_some()),
+        ] {
+            if !present {
+                unobserved.push(name.to_owned());
+            }
+        }
+        self.conversation = Some(ProviderConversationRef::Codex {
+            tree_session_id,
+            thread_id: thread_id.clone(),
+            forked_from_id: forked_from_id.clone(),
+            parent_thread_id,
+            window_id,
+            unobserved,
+        });
+
+        // A declared fork origin is lineage speech for the throne
+        // (`FrameClass::LineageMeta`), not a local system note.
+        if forked_from_id.is_some() {
+            let frame = TransportFrame {
+                agent: AgentKind::Codex,
+                transport_kind: TransportKind::Lineage,
+                timestamp,
+                payload: TransportPayload::Lineage {
+                    session_id: thread_id.unwrap_or_else(|| self.session_id.clone()),
+                    forked_from_id,
+                },
+                evidence,
+            };
+            self.push_classified_frame(frame)?;
+        }
         Ok(())
     }
 
@@ -454,23 +625,25 @@ impl<'a> Assembly<'a> {
             }
             // Dual-envelope: response_item.message owns chat; event_msg is footprint.
             "user_message" if self.have_response_item_chat => Ok(()),
-            "agent_message" if self.have_response_item_chat => Ok(()),
-            "user_message" => self.push_turn(
-                TurnRole::User,
-                TurnKind::UserMsg,
+            "agent_message"
+                if self.have_response_item_chat || self.have_response_item_agent_message =>
+            {
+                Ok(())
+            }
+            "user_message" => self.push_classified_frame(text_frame(
+                TransportKind::DirectMessage,
+                TransportRole::User,
                 text_at(event, &["payload", "message"]),
                 timestamp,
-                Known::unknown(),
                 evidence,
-            ),
-            "agent_message" => self.push_turn(
-                TurnRole::Assistant,
-                TurnKind::AgentReply,
+            )),
+            "agent_message" => self.push_classified_frame(text_frame(
+                TransportKind::AssistantMessage,
+                TransportRole::Assistant,
                 text_at(event, &["payload", "message"]),
                 timestamp,
-                Known::unknown(),
                 evidence,
-            ),
+            )),
             "agent_reasoning" | "thinking" | "thinking_delta" => self.push_turn(
                 TurnRole::Assistant,
                 TurnKind::InternalThought,
@@ -484,6 +657,7 @@ impl<'a> Assembly<'a> {
                 timestamp,
                 Known::unknown(),
                 evidence,
+                None,
             ),
             "token_count" => {
                 self.push_usage(event, timestamp, evidence);
@@ -509,6 +683,7 @@ impl<'a> Assembly<'a> {
                 timestamp,
                 Known::unknown(),
                 evidence,
+                None,
             ),
             // Codex fans out to subagents now. Without this the transcript of
             // a session that dispatched a dozen of them reads as one agent
@@ -520,6 +695,7 @@ impl<'a> Assembly<'a> {
                 timestamp,
                 Known::unknown(),
                 evidence,
+                None,
             ),
             "thread_goal_updated" => self.push_turn(
                 TurnRole::System,
@@ -528,6 +704,7 @@ impl<'a> Assembly<'a> {
                 timestamp,
                 Known::unknown(),
                 evidence,
+                None,
             ),
             // An interrupted turn is operator behaviour worth keeping.
             "turn_aborted" => self.push_turn(
@@ -540,6 +717,7 @@ impl<'a> Assembly<'a> {
                 timestamp,
                 Known::unknown(),
                 evidence,
+                None,
             ),
             // Thread configuration echo — consumed, carries no conversation.
             "thread_settings_applied" => Ok(()),
@@ -556,6 +734,7 @@ impl<'a> Assembly<'a> {
                 timestamp,
                 Known::unknown(),
                 evidence,
+                None,
             ),
             _ => {
                 self.unsupported_visible = true;
@@ -578,38 +757,53 @@ impl<'a> Assembly<'a> {
         match string_at(payload, &["type"]).unwrap_or("") {
             "message" => {
                 let role = match string_at(payload, &["role"]).unwrap_or("system") {
-                    "user" => TurnRole::User,
-                    "assistant" => TurnRole::Assistant,
-                    "tool" => TurnRole::Tool,
-                    _ => TurnRole::System,
+                    "user" => TransportRole::User,
+                    "assistant" => TransportRole::Assistant,
+                    "tool" => TransportRole::Tool,
+                    _ => TransportRole::System,
                 };
-                let kind = match role {
-                    TurnRole::User => TurnKind::UserMsg,
-                    TurnRole::Assistant => TurnKind::AgentReply,
-                    TurnRole::Tool => TurnKind::ToolResult,
-                    TurnRole::System => TurnKind::SystemNote,
+                let text = content_text(&payload["content"]);
+                // The 2026-08 Codex schema change began serializing user-run
+                // shell actions and internal control payloads as ordinary
+                // `role=user` input_text messages. The schema says `user`; the
+                // product semantics say tool/control event, and the adapter
+                // owns that normalization — see
+                // `push_user_message_frames`.
+                if role == TransportRole::User {
+                    return self.push_user_message_frames(text, timestamp, evidence);
+                }
+                let kind = if role == TransportRole::Assistant {
+                    TransportKind::AssistantMessage
+                } else {
+                    TransportKind::DirectMessage
                 };
-                self.push_turn(
-                    role,
-                    kind,
-                    content_text(&payload["content"]),
-                    timestamp,
-                    Known::unknown(),
-                    evidence,
-                )
+                self.push_classified_frame(text_frame(kind, role, text, timestamp, evidence))
             }
             // Agent-to-agent dispatch: `author` hands a task to `recipient`.
             // A third chat envelope, distinct from `message`, so the
             // dual-envelope suppression above does not apply and this is the
             // only place the payload survives.
-            "agent_message" => self.push_turn(
-                TurnRole::Assistant,
-                TurnKind::AgentReply,
-                agent_message_text(payload),
-                timestamp,
-                Known::unknown(),
-                evidence,
-            ),
+            "agent_message" => {
+                let content = content_text(&payload["content"]);
+                let frame = TransportFrame {
+                    agent: AgentKind::Codex,
+                    transport_kind: TransportKind::AgentMessage,
+                    timestamp,
+                    payload: TransportPayload::InterAgent {
+                        sender: labeled_field(&content, "Sender")
+                            .or_else(|| string_at(payload, &["author"]).map(str::to_owned))
+                            .unwrap_or_else(|| "unknown".to_owned()),
+                        task: labeled_field(&content, "Task name")
+                            .or_else(|| string_at(payload, &["recipient"]).map(str::to_owned))
+                            .unwrap_or_else(|| "unknown".to_owned()),
+                        message_type: labeled_field(&content, "Message Type")
+                            .unwrap_or_else(|| "unknown".to_owned()),
+                        content,
+                    },
+                    evidence,
+                };
+                self.push_classified_frame(frame)
+            }
             "function_call" | "custom_tool_call" | "web_search_call" => {
                 self.push_tool_turn(event, timestamp, evidence, ToolEventKind::Call)
             }
@@ -634,6 +828,7 @@ impl<'a> Assembly<'a> {
                         timestamp,
                         Known::unknown(),
                         evidence,
+                        None,
                     )
                 }
             }
@@ -644,6 +839,7 @@ impl<'a> Assembly<'a> {
                 timestamp,
                 Known::unknown(),
                 evidence,
+                None,
             ),
             "encrypted_reasoning" => {
                 self.opaque_reasoning = true;
@@ -653,7 +849,7 @@ impl<'a> Assembly<'a> {
             // response_item.compacted — TB footprint/context_compacted class.
             "compacted" => {
                 self.compaction_boundary_present = true;
-                Ok(())
+                self.consume_compaction_replay(payload, timestamp, evidence)
             }
             _ => {
                 self.unsupported_visible = true;
@@ -666,6 +862,7 @@ impl<'a> Assembly<'a> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn push_turn(
         &mut self,
         role: TurnRole,
@@ -674,6 +871,7 @@ impl<'a> Assembly<'a> {
         timestamp: Known<String>,
         tool_name: Known<String>,
         evidence: RawUnitRef,
+        frame_class: Option<FrameClass>,
     ) -> Result<(), AdapterError> {
         if text.is_empty() {
             return Ok(());
@@ -693,7 +891,143 @@ impl<'a> Assembly<'a> {
             tool_name,
             segment_id,
             raw_unit_refs: vec![evidence],
+            frame_class,
         });
+        Ok(())
+    }
+
+    /// Consume the throne's decision into the session model. This is
+    /// projection plumbing, not a second content classifier: role and lane
+    /// come from the class (`turn_role` / `turn_kind`), and the class itself
+    /// rides on the turn (W2-R1).
+    fn push_classified_frame(&mut self, frame: TransportFrame) -> Result<(), AdapterError> {
+        let classified = frames::classify(&frame);
+        let timestamp = classified.seal.seal_ts.clone();
+        let evidence = classified.origin.evidence.clone();
+        let role = classified.class.turn_role();
+        let class_for_turn = Some(classified.class.clone());
+        match classified.class {
+            FrameClass::Human { .. }
+            | FrameClass::EchoSeal { .. }
+            | FrameClass::AssistantFinal
+            | FrameClass::InterAgent { .. } => self.push_turn(
+                role,
+                classified
+                    .turn_kind
+                    .expect("speech and inter-agent classes have a turn lane"),
+                classified.content,
+                timestamp,
+                Known::unknown(),
+                evidence,
+                class_for_turn,
+            ),
+            FrameClass::ShellAction {
+                ref cmd,
+                ref result,
+            } => {
+                let marker = shell_action_marker(cmd);
+                let result = result.clone();
+                self.push_turn(
+                    TurnRole::Tool,
+                    TurnKind::ToolCall,
+                    marker.clone(),
+                    timestamp.clone(),
+                    Known::value("user_shell_command".to_owned()),
+                    evidence.clone(),
+                    class_for_turn,
+                )?;
+                let call_idx = self.turns.len() as u64 - 1;
+                self.tools.push(ToolEvent {
+                    kind: ToolEventKind::Call,
+                    turn_idx: call_idx,
+                    tool_name: "user_shell_command".to_owned(),
+                    correlation_id: Known::unknown(),
+                    payload_hash: sha256_hex(marker.as_bytes()),
+                    payload_bytes: marker.len() as u64,
+                    raw_unit_refs: vec![evidence.clone()],
+                });
+                if !result.text.is_empty() {
+                    self.push_turn(
+                        TurnRole::Tool,
+                        TurnKind::ToolResult,
+                        result.text.clone(),
+                        timestamp,
+                        Known::value("user_shell_command".to_owned()),
+                        evidence.clone(),
+                        None,
+                    )?;
+                    let result_idx = self.turns.len() as u64 - 1;
+                    self.tools.push(ToolEvent {
+                        kind: ToolEventKind::Result,
+                        turn_idx: result_idx,
+                        tool_name: "user_shell_command".to_owned(),
+                        correlation_id: Known::unknown(),
+                        payload_hash: result.hash,
+                        payload_bytes: result.text.len() as u64,
+                        raw_unit_refs: vec![evidence],
+                    });
+                }
+                Ok(())
+            }
+            // Replayed history is referenced by the context epoch
+            // (`consume_compaction_replay`), never re-emitted as speech.
+            FrameClass::Inject {
+                kind: InjectKind::CompactionReplay,
+            } => Ok(()),
+            FrameClass::Inject { .. } | FrameClass::LineageMeta { .. } => self.push_turn(
+                role,
+                classified
+                    .turn_kind
+                    .expect("metadata classes have a turn kind"),
+                classified.content,
+                timestamp,
+                Known::unknown(),
+                evidence,
+                class_for_turn,
+            ),
+        }
+    }
+
+    fn consume_compaction_replay(
+        &mut self,
+        event_or_payload: &Value,
+        timestamp: Known<String>,
+        evidence: RawUnitRef,
+    ) -> Result<(), AdapterError> {
+        let payload = event_or_payload.get("payload").unwrap_or(event_or_payload);
+        // Every compaction record is one context epoch of THIS conversation
+        // (W2-R1): the boundary is recorded even when no history is replayed.
+        let trigger = string_at(payload, &["reason"])
+            .map_or_else(Known::unknown, |value| Known::value(value.to_owned()));
+        let mut epoch = ContextEpochRef {
+            compaction_index: self.context_epochs.len() as u32,
+            summary_provenance: evidence.evidence_event_id.clone(),
+            replacement_refs: Vec::new(),
+            trigger,
+            first_turn_after: None,
+        };
+        if let Some(history) = payload.get("replacement_history").and_then(Value::as_array) {
+            for item in history {
+                let content = serde_json::to_string(item)
+                    .map_err(|error| AdapterError::new("assemble", error.to_string()))?;
+                let frame = TransportFrame {
+                    agent: AgentKind::Codex,
+                    transport_kind: TransportKind::InjectedContext,
+                    timestamp: timestamp.clone(),
+                    payload: TransportPayload::Inject {
+                        tag: "compacted.replacement_history".to_owned(),
+                        content,
+                    },
+                    evidence: evidence.clone(),
+                };
+                let classified = frames::classify(&frame);
+                epoch.replacement_refs.push(classified.content_hash.clone());
+                if self.seen_replay_hashes.insert(classified.content_hash) {
+                    self.push_classified_frame(frame)?;
+                }
+            }
+        }
+        self.context_epochs.push((epoch, evidence.physical_ordinal));
         Ok(())
     }
 
@@ -746,6 +1080,7 @@ impl<'a> Assembly<'a> {
             timestamp,
             Known::value(name.clone()),
             evidence.clone(),
+            None,
         )?;
         let turn_idx = self.turns.len() as u64 - 1;
         self.tools.push(ToolEvent {
@@ -757,6 +1092,43 @@ impl<'a> Assembly<'a> {
             payload_bytes: body.len() as u64,
             raw_unit_refs: vec![evidence],
         });
+        Ok(())
+    }
+
+    /// Classify a `role=user` message body before it reaches the turn stream.
+    ///
+    /// A plain human message passes through byte-identical to the legacy
+    /// path. A body carrying reserved Codex control envelopes (see
+    /// [`match_envelope_open`]) is split: a plain `echo` envelope is an
+    /// operator utterance sealed at the envelope timestamp (`UserMsg`);
+    /// every other `<user_shell_command>` block becomes a `ToolCall` marker
+    /// (`$ cmd`) followed by a `ToolResult` holding the whole envelope
+    /// verbatim, each with a registered [`ToolEvent`]; control envelopes
+    /// (`codex_internal_context`, `INSTRUCTIONS`, …) become
+    /// `System`/`SystemNote` turns, and any genuine human prose around them
+    /// survives as `UserMsg` turns in order. The substrate keeps the full
+    /// result; projections filter on frame kind, so reclassified envelopes
+    /// vanish from `--conversation` while full extraction retains them.
+    fn push_user_message_frames(
+        &mut self,
+        text: String,
+        timestamp: Known<String>,
+        evidence: RawUnitRef,
+    ) -> Result<(), AdapterError> {
+        let Some(frames) = normalize_user_envelopes(&text, &timestamp, &evidence) else {
+            // Fast path: no envelope anywhere — emit the original body
+            // unchanged so ordinary messages keep byte-identical hashes.
+            return self.push_classified_frame(text_frame(
+                TransportKind::DirectMessage,
+                TransportRole::User,
+                text,
+                timestamp,
+                evidence,
+            ));
+        };
+        for frame in frames {
+            self.push_classified_frame(frame)?;
+        }
         Ok(())
     }
 
@@ -866,6 +1238,7 @@ impl<'a> Assembly<'a> {
             SkippedReason::Oversized => WarningKind::OversizedUnit,
             SkippedReason::EncryptedOpaque => WarningKind::OpaqueReasoning,
             SkippedReason::Unsupported => WarningKind::UnsupportedVisibleEvent,
+            SkippedReason::CompactionReplay | SkippedReason::DuplicateBody => return,
         };
         self.warn(kind, unit.ordinal);
         if boundary == UnitBoundary::UnterminatedTail {
@@ -961,6 +1334,25 @@ impl<'a> Assembly<'a> {
             original_source_bytes: self.read.source_bytes,
         };
         let mut model = SessionModel::new(self.session_id, provenance, coverage);
+        if let Some(conversation) = self.conversation {
+            model.conversation = conversation;
+        }
+        // Epochs learn their first following turn once the turn stream is
+        // final: the boundary's own record carries no turn.
+        let mut context_epochs = Vec::with_capacity(self.context_epochs.len());
+        for (mut epoch, boundary_ordinal) in self.context_epochs {
+            epoch.first_turn_after = self
+                .turns
+                .iter()
+                .find(|turn| {
+                    turn.raw_unit_refs
+                        .iter()
+                        .any(|reference| reference.physical_ordinal > boundary_ordinal)
+                })
+                .map(|turn| turn.turn_idx);
+            context_epochs.push(epoch);
+        }
+        model.context_epochs = context_epochs;
         model.turns = self.turns;
         model.tool_events = self.tools;
         model.usage_events = self.usage;
@@ -972,6 +1364,19 @@ impl<'a> Assembly<'a> {
                 .enumerate()
                 .filter_map(|(id, segment)| {
                     let end = model.turns.len() as u64 - 1;
+                    // cwd/branch are constant inside a Codex segment by
+                    // construction (`turn_context` drift opens a new one), so
+                    // the verdict is homogeneous-or-unknown.
+                    let scope_status = ScopeStatus::from_evidence(
+                        match &segment.cwd {
+                            Known::Value(cwd) => Some(cwd.as_str()),
+                            Known::Unknown(_) => None,
+                        },
+                        match &segment.branch {
+                            Known::Value(branch) => Some(branch.as_str()),
+                            Known::Unknown(_) => None,
+                        },
+                    );
                     (segment.start_turn <= end).then_some(Segment {
                         segment_id: id as u32,
                         cwd: segment.cwd,
@@ -982,6 +1387,7 @@ impl<'a> Assembly<'a> {
                             start: segment.start_turn,
                             end,
                         },
+                        scope_status,
                     })
                 })
                 .collect();
@@ -1157,18 +1563,211 @@ fn thread_goal_summary(payload: &Value) -> String {
     }
 }
 
-/// Agent-to-agent dispatch text, prefixed with the routing pair so a reader
-/// can tell who was handed what. Encrypted content blocks carry no text and
-/// drop out through `content_text`.
-fn agent_message_text(payload: &Value) -> String {
-    let body = content_text(&payload["content"]);
-    match (
-        string_at(payload, &["author"]),
-        string_at(payload, &["recipient"]),
-    ) {
-        (Some(author), Some(recipient)) => format!("{author} → {recipient}\n{body}"),
-        _ => body,
+fn text_frame(
+    transport_kind: TransportKind,
+    role: TransportRole,
+    content: String,
+    timestamp: Known<String>,
+    evidence: RawUnitRef,
+) -> TransportFrame {
+    TransportFrame {
+        agent: AgentKind::Codex,
+        transport_kind,
+        timestamp,
+        payload: TransportPayload::Text { role, content },
+        evidence,
     }
+}
+
+fn labeled_field(content: &str, label: &str) -> Option<String> {
+    content.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix(label)
+            .and_then(|tail| tail.strip_prefix(':'))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    })
+}
+
+/// Extract the command payload from a Codex `user_shell_command` envelope.
+///
+/// This parser is deliberately narrower than a shell parser: the Codex
+/// envelope is the grammar boundary, and only a complete `<command>` element
+/// is admitted. Malformed envelopes fail closed to a placeholder marker; the
+/// envelope body itself is still retained as the tool result.
+fn user_shell_command(body: &str) -> Option<&str> {
+    let command = body.split_once("<command>")?.1;
+    let command = command.split_once("</command>")?.0.trim();
+    (!command.is_empty()).then_some(command)
+}
+
+fn shell_action_marker(command: &str) -> String {
+    let first_line = command
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .map(str::trim)
+        .unwrap_or("user_shell_command (malformed)");
+    let continuation = command.lines().skip(1).any(|line| !line.trim().is_empty());
+    format!("$ {first_line}{}", if continuation { " …" } else { "" })
+}
+
+/// Typed, whole-envelope opening-tag matcher.
+///
+/// Returns `(tag, is_tool, closes_on_same_line)` when the trimmed line is a
+/// complete opening tag for a known envelope: `<tag>` or `<tag attrs…>`,
+/// optionally terminated by the matching `</tag>` on the same line. A line
+/// where the tag is followed by same-line prose is NOT an envelope — that is
+/// a human mentioning the literal tag, and it stays in the conversation.
+fn match_envelope_open(trimmed: &str) -> Option<(&'static str, bool, bool)> {
+    if !trimmed.starts_with('<') {
+        return None;
+    }
+    let candidates = std::iter::once(("user_shell_command", true)).chain(
+        frames_rules::rules_for(AgentKind::Codex)
+            .inject_tags
+            .iter()
+            .map(|rule| (rule.tag, false)),
+    );
+    for (tag, is_tool) in candidates {
+        let after = match trimmed[1..].strip_prefix(tag) {
+            Some(after) => after,
+            None => continue,
+        };
+        // The character after the tag name must terminate or extend the tag
+        // (`>` or whitespace before attributes) — `<user_shell_commandX>`
+        // must not match.
+        let attrs_ok = match after.chars().next() {
+            Some('>') => true,
+            Some(c) if c.is_whitespace() => true,
+            _ => false,
+        };
+        if !attrs_ok {
+            continue;
+        }
+        // The opening tag must close on this line.
+        let Some(gt) = after.find('>') else { continue };
+        let tail = after[gt + 1..].trim();
+        if tail.is_empty() {
+            return Some((tag, is_tool, false));
+        }
+        let close = format!("</{tag}>");
+        if tail.ends_with(close.as_str()) {
+            return Some((tag, is_tool, true));
+        }
+        // Opening tag followed by same-line prose: human mention, not an
+        // envelope.
+    }
+    None
+}
+
+/// Split a `role=user` message body into prose and whole-envelope segments.
+///
+/// Line-anchored and fence-aware: an envelope starts only at a line that is a
+/// complete opening tag (see [`match_envelope_open`]) outside a markdown code
+/// fence, and runs through the line holding its matching close tag. Inline
+/// mentions of the literal tag never match. An unterminated envelope runs to
+/// the end of the message — fail closed: leaking a shell result is worse than
+/// over-classifying a malformed envelope.
+fn normalize_user_envelopes(
+    text: &str,
+    timestamp: &Known<String>,
+    evidence: &RawUnitRef,
+) -> Option<Vec<TransportFrame>> {
+    fn push_envelope(
+        output: &mut Vec<TransportFrame>,
+        tag: &'static str,
+        is_shell: bool,
+        body: String,
+        timestamp: &Known<String>,
+        evidence: &RawUnitRef,
+    ) {
+        let payload = if is_shell {
+            TransportPayload::Shell {
+                command: user_shell_command(&body)
+                    .unwrap_or("user_shell_command (malformed)")
+                    .to_owned(),
+                result: body,
+            }
+        } else {
+            TransportPayload::Inject {
+                tag: tag.to_owned(),
+                content: body,
+            }
+        };
+        output.push(TransportFrame {
+            agent: AgentKind::Codex,
+            transport_kind: if is_shell {
+                TransportKind::UserShellCommand
+            } else {
+                TransportKind::InjectedContext
+            },
+            timestamp: timestamp.clone(),
+            payload,
+            evidence: evidence.clone(),
+        });
+    }
+
+    let mut output = Vec::new();
+    let mut prose = String::new();
+    let mut open: Option<(&'static str, bool, String)> = None;
+    let mut in_fence = false;
+    let mut saw_envelope = false;
+    for line in text.lines() {
+        if let Some((tag, _, body)) = open.as_mut() {
+            body.push_str(line);
+            body.push('\n');
+            if line.trim() == format!("</{tag}>") {
+                let (tag, is_shell, body) = open.take().expect("open envelope");
+                push_envelope(&mut output, tag, is_shell, body, timestamp, evidence);
+            }
+            continue;
+        }
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+            prose.push_str(line);
+            prose.push('\n');
+            continue;
+        }
+        if !in_fence && let Some((tag, is_shell, closes_inline)) = match_envelope_open(trimmed) {
+            saw_envelope = true;
+            if !prose.trim().is_empty() {
+                output.push(text_frame(
+                    TransportKind::DirectMessage,
+                    TransportRole::User,
+                    std::mem::take(&mut prose).trim().to_owned(),
+                    timestamp.clone(),
+                    evidence.clone(),
+                ));
+            } else {
+                prose.clear();
+            }
+            let mut body = String::from(line);
+            body.push('\n');
+            if closes_inline {
+                push_envelope(&mut output, tag, is_shell, body, timestamp, evidence);
+            } else {
+                open = Some((tag, is_shell, body));
+            }
+            continue;
+        }
+        prose.push_str(line);
+        prose.push('\n');
+    }
+    if let Some((tag, is_shell, body)) = open.take() {
+        push_envelope(&mut output, tag, is_shell, body, timestamp, evidence);
+    }
+    if !prose.trim().is_empty() {
+        output.push(text_frame(
+            TransportKind::DirectMessage,
+            TransportRole::User,
+            prose.trim().to_owned(),
+            timestamp.clone(),
+            evidence.clone(),
+        ));
+    }
+    saw_envelope.then_some(output)
 }
 
 fn content_text(content: &Value) -> String {

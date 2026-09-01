@@ -187,12 +187,14 @@ url = "http://127.0.0.1:5174/mcp"
 
 ## 5. Serwisy macOS launchd LaunchAgents
 
-Serwisy są zarejestrowane jako per-user LaunchAgents w `~/Library/LaunchAgents/` z parametrami `RunAtLoad=true` i `KeepAlive=true`:
+Długowieczne serwisy MCP są zarejestrowane jako per-user LaunchAgents w
+`~/Library/LaunchAgents/` z parametrami `RunAtLoad=true` i `KeepAlive=true`:
 
-| Identyfikator Serwisu | Polecenie | Domyślny Port | Cel Logowania |
+| Identyfikator Serwisu | Polecenie | Port / Częstotliwość | Cel Logowania |
 | :--- | :--- | :--- | :--- |
 | **`com.loctree.aicx.mcp`** | `aicx serve --transport http` | `8044` | `~/.aicx/logs/aicx-serve-http.log` |
 | **`com.loctree.loctree.mcp`** | `loctree-mcp --transport http` | `5174` | `~/.loctree/logs/loctree-serve-http.log` |
+| **`com.loctree.aicx.reindex`** | hot refresh; bootstrap gdy brak; index | co 8640 s | `~/.aicx/logs/aicx-reindex.*.log` |
 
 Instalator serwisu HTTP nie dotyka już etykiet maintenance: serwer jest czytelnikiem, więc osobny harmonogram reindeksacji współistnieje z nim z założenia. (Historycznie starsze instalatory usuwały timer `io.vetcoders.aicx.reindex`, ponieważ sam serwer był writerem.)
 

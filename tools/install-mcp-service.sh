@@ -134,6 +134,7 @@ cat > "$PLIST" <<PLIST_EOF
     <string>$HOST_XML</string>
     <string>--port</string>
     <string>$PORT_XML</string>$ALLOWED_ARGS_XML
+    <string>--no-auto-refresh</string>
   </array>
   <key>EnvironmentVariables</key>
   <dict>
@@ -155,6 +156,15 @@ cat > "$PLIST" <<PLIST_EOF
 PLIST_EOF
 
 plutil -lint "$PLIST" >/dev/null
+
+# Keep expensive corpus publication outside the long-lived server. The helper
+# also writes its plist when launchctl cannot bootstrap from the current shell.
+REINDEX_INSTALLER="$(cd "$(dirname "$0")" && pwd)/install-reindex-schedule.sh"
+if [ -f "$REINDEX_INSTALLER" ]; then
+  AICX_BIN="$AICX_BIN" bash "$REINDEX_INSTALLER"
+else
+  note "index refresh: run 'aicx doctor --repair-runtime' once to install the 8640s scheduler"
+fi
 
 # Point Claude/Codex/Gemini at this LaunchAgent URL (not stdio aicx-mcp).
 # install.sh sets AICX_SKIP_MCP_CLIENTS=1 and applies the same helper once.

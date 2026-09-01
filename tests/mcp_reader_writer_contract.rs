@@ -49,7 +49,7 @@ fn http_service_installer_does_not_take_over_index_maintenance() {
 fn separate_maintenance_process_boundary_remains_available() {
     let maintenance = include_str!("../tools/install-reindex-schedule.sh");
 
-    assert!(maintenance.contains("aicx catalog rebuild"));
+    assert!(maintenance.contains("aicx catalog refresh"));
     assert!(maintenance.contains("aicx index"));
     assert!(maintenance.contains("StartInterval"));
     assert!(maintenance.contains("LowPriorityBackgroundIO"));

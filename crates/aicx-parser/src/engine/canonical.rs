@@ -20,7 +20,7 @@ struct CanonicalSession<'a> {
     schema: &'static str,
     session_id: &'a str,
     provenance: CanonicalProvenance<'a>,
-    segments: &'a [Segment],
+    segments: Vec<CanonicalSegment<'a>>,
     skill_invocations: &'a [SkillInvocation],
     turns: Vec<CanonicalTurn<'a>>,
     usage_events: Vec<CanonicalUsageEvent<'a>>,
@@ -38,6 +38,31 @@ struct CanonicalProvenance<'a> {
     ended_at: &'a Known<String>,
     original_jsonl_hash: &'a str,
     original_jsonl_bytes: u64,
+}
+
+/// C0A segment fields only. `Segment::scope_status` (W2-R1) is derived
+/// evidence and stays out of the frozen fingerprint.
+#[derive(Serialize)]
+struct CanonicalSegment<'a> {
+    segment_id: u32,
+    cwd: &'a Known<String>,
+    branch: &'a Known<String>,
+    started_at: &'a Known<String>,
+    ended_at: &'a Known<String>,
+    turn_range: super::model::TurnRange,
+}
+
+impl<'a> CanonicalSegment<'a> {
+    fn of(segment: &'a Segment) -> Self {
+        Self {
+            segment_id: segment.segment_id,
+            cwd: &segment.cwd,
+            branch: &segment.branch,
+            started_at: &segment.started_at,
+            ended_at: &segment.ended_at,
+            turn_range: segment.turn_range,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -96,7 +121,7 @@ pub fn canonical_bytes(session: &ValidatedSession) -> Result<Vec<u8>, serde_json
         schema: CANONICAL_SCHEMA,
         session_id: &model.session_id,
         provenance: canonical_provenance(&model.provenance),
-        segments: &model.segments,
+        segments: model.segments.iter().map(CanonicalSegment::of).collect(),
         skill_invocations: &model.skill_invocations,
         turns: model.turns.iter().map(canonical_turn).collect(),
         usage_events: model.usage_events.iter().map(canonical_usage).collect(),

@@ -131,6 +131,15 @@ pub struct TimelineEntry {
     pub session_id: String,
     pub role: String,
     pub message: String,
+    /// Throne class of the turn this entry projects (W2-R1). `None` for
+    /// entries that never went through the model (store chunks, importers,
+    /// legacy archives); consumers then fall back to `frame_kind` + `role`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame_class: Option<crate::engine::FrameClass>,
+    /// Which conversation this entry is native to when several are laid out
+    /// together (`--lineage`). `None` = single-conversation view.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lineage_origin: Option<crate::engine::EntryOrigin>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frame_kind: Option<FrameKind>,
     #[serde(skip_serializing_if = "Option::is_none")]

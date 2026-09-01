@@ -5,6 +5,107 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
+## [0.13.0] - 2026-09-01
+
+### One taxonomy for every agent (mission `aicx-one-taxonomy-fusion-260827`)
+
+Five adapters (Claude, Codex, Gemini, Grok, Junie) used to decide on their
+own what a record *was*. They now hand every conversational payload to one
+classifier (`engine::frames::classify`) and record what it said: seven frame
+classes (`Human`, `EchoSeal`, `ShellAction`, `Inject`, `AssistantFinal`,
+`LineageMeta`, `InterAgent`), one seal per frame, one identity per body.
+Consumers read the class, not a per-adapter role string. Every claim below
+was measured against a frozen oracle of real session files
+(`tests/fixtures/parser_engine/assertions.toml`, harness
+`tests/oracle_assertions.rs` running the production binary): 23 pass, 0
+fail, 2 not assessable.
+
+- **Your own words are never hidden.** Text typed while the agent was busy
+  (Claude `queue-operation`, Codex echo bus) is the operator's speech. On
+  session `67025fed` the default `--user-only` view used to return 0 of the
+  25 messages the operator typed; it returns 25. `--dialog` adds the seal
+  and channel, `--kind human` narrows to the direct channel.
+- **Agent-to-agent messages are never the assistant.** Codex
+  `agent_message` (28 in one 34 MB rollout) is its own lane, `--kind
+  inter_agent`; the compactor no longer summarizes another agent's report
+  as this agent's answer.
+- **Empty is loud.** A source that parses but projects nothing exits 1 with
+  a typed `refused: …` line (`extract --file`, `--session`, MCP) instead of
+  `Wrote 0 entries`. Batch commands (`aicx all`, `aicx <agent> -p …`) keep
+  a legitimate zero as zero.
+- **Identity is tagged.** `ProviderConversationRef` (Claude `session_id` /
+  `agent_id`; Codex `thread_id` / `forked_from_id` / `parent_thread_id` /
+  `window_id`) and `SourceSnapshotRef` (path + content hash) replace the
+  bare store id; `--lineage` walks a graph and counts inherited history
+  once. Sessions that drift across checkouts carry `scope_status =
+  mixed_candidate` and `continuity` refuses to distill them silently.
+- **The kernel validates consistency, the seams decide sufficiency.** A
+  zero-turn model (usage-only rollout, harness bookkeeping) validates;
+  whether it is enough for a consumer is that consumer's typed refusal.
+  Coverage ledgers (`consumed_by_kind`, `known_skipped`) are derived and
+  checked for totality.
+
+
+### Added
+
+- parser engine contracts (structure only, compile embargo W1, cut
+  `W1-T5-tb-contracts`): `engine/refusal.rs` with `RefusalReason` (one
+  variant per oracle-manifest case, each carrying `RefusalEvidence`),
+  `AdapterDetection` (detect-with-evidence gate) and `SubstitutionError`
+  (`ExactAlias` is a substitution unless explicitly allowed)
+- `CoverageReport::{consumed_by_kind, known_skipped}` ledger with
+  `check_totality()`; `SkippedReason::{CompactionReplay, DuplicateBody}`
+  counted by body hash, not transport id (A2)
+- `PackageIdentity` = (store id, source content hash) and `FrameIdentity`
+  keyed by body hash; `ValidatedSession::identity()`
+
+### Changed
+
+- Claude adapter on the throne (structure only, compile embargo W2, cut
+  `W2-T8-claude-on-throne`): every conversational payload (user/assistant
+  text, `queue-operation` enqueue bodies, harness injections) becomes an
+  `engine::frames::TransportFrame` classified by `engine::frames::classify`;
+  the adapter's own role→kind decision is removed. Queued text is
+  `EchoSeal{channel: Queue}` sealed with the enqueue timestamp; `dequeue` /
+  `remove` verified on fixture `human_shape_67025fed` as consumption
+  bookkeeping (no lane). `<task-notification>` / `<system-reminder>` at the
+  head of an operator-lane payload are `Inject` (system note, fully
+  retained) instead of being dropped — rule rows in `frames_rules.rs`
+  `# claude` block
+- grok parser adapter (structure only, compile embargo W2, cut
+  `W2-T9-grok-on-throne`): chat/event records become `TransportFrame`s;
+  speech class comes from `engine::frames::classify`. Grok harness
+  `synthetic_reason` tags live in the `# grok` block of `frames_rules.rs`.
+  Degenerate `019fdeca` no longer maps the skills dump to `UserMsg`; the
+  `extract --file` seam answers it with a typed `refused:` line and exit 1.
+
+- `validate_model` keeps a zero-turn model as a valid (consistent) model;
+  the `EmptyConversation` / `ProjectionFilteredAll` refusals are raised at
+  the projection seams (`extraction`, `mcp_session`, `extract --file`) where
+  the coverage evidence and the applied filter are known. `check_totality`
+  runs last in `validate_coverage`, so a structural defect names itself
+  before the derived ledger.
+- guardians from `W2-T12` are loud, not fatal: a missing session root is
+  zero sources; a batch filter that removes everything is zero entries; a
+  unique `--session <prefix>` prints the substitution and proceeds.
+  Ambiguity, unreadable sources and parse-level refusals still fail closed.
+- `--kind` opens the roles its lanes speak with (`inter_agent` / `inject` /
+  `lineage_meta` → system), so a lane asked for by name is never empty by
+  construction.
+- seed AGENT_CANARY.md — truth-competition census charter for aicx
+
+### Fixed
+
+- Codex `user_shell_command` envelopes (`codex-rollout-v3`): a plain
+  `echo` is operator speech sealed at the envelope timestamp (`UserMsg`);
+  `echo … | tee` and `echo … >>` stay shell actions
+- every other shell action emits a `$ cmd` `ToolCall` marker followed by
+  the verbatim envelope as `ToolResult` — the substrate keeps the full
+  result, projections decide what to show (Decision 6, 2026-08-27)
+- frozen golden `tests/fixtures/parser_engine/codex/human_shape_01a0369f.jsonl`
+  (25 human + 9 echo-seal utterances) with a derivation note in the
+  fixture README
+
 ## [0.12.5] - 2026-08-23
 
 ### Fixed

@@ -2,4 +2,5 @@
 
 const { execAicx } = require("../index.js");
 
+process.env.AICX_RUNTIME_BIN ||= process.argv[1];
 execAicx(process.argv.slice(2));

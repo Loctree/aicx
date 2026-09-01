@@ -177,12 +177,14 @@ url = "http://127.0.0.1:5174/mcp"
 
 ## 5. macOS launchd LaunchAgents
 
-The services are configured as LaunchAgents in `~/Library/LaunchAgents/` with `RunAtLoad=true` and `KeepAlive=true`:
+The long-lived MCP services are configured as LaunchAgents in
+`~/Library/LaunchAgents/` with `RunAtLoad=true` and `KeepAlive=true`:
 
-| Service Label | Command | Default Port | Log Destination |
+| Service Label | Command | Port / Cadence | Log Destination |
 | :--- | :--- | :--- | :--- |
 | **`com.loctree.aicx.mcp`** | `aicx serve --transport http` | `8044` | `~/.aicx/logs/aicx-serve-http.log` |
 | **`com.loctree.loctree.mcp`** | `loctree-mcp --transport http` | `5174` | `~/.loctree/logs/loctree-serve-http.log` |
+| **`com.loctree.aicx.reindex`** | hot refresh; bootstrap if absent; index | every 8640s | `~/.aicx/logs/aicx-reindex.*.log` |
 
 The HTTP service installer no longer touches maintenance labels: the server is a reader, so the separate reindex schedule coexists with it by design. (Historically, older installers removed the `io.vetcoders.aicx.reindex` timer because the server itself was a writer.)
 

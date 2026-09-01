@@ -419,6 +419,19 @@ mod tests {
     }
 
     #[test]
+    fn retired_refresh_flags_remain_parse_compatible() {
+        let args = Args::try_parse_from([
+            "aicx-mcp",
+            "--refresh-interval-seconds",
+            "600",
+            "--no-auto-refresh",
+        ])
+        .expect("retired refresh flags should remain parse-compatible");
+        assert_eq!(args.refresh_interval_seconds, Some(600));
+        assert!(args.no_auto_refresh);
+    }
+
+    #[test]
     fn idle_drop_minutes_accepts_positive_override_and_rejects_zero() {
         let args = Args::try_parse_from(["aicx-mcp", "--idle-drop-minutes", "3"])
             .expect("positive idle drop override should parse");

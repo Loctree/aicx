@@ -1,10 +1,17 @@
 //! Invariant validator. Projection is possible only through [`ValidatedSession`].
+//!
+//! W1-T5 contract: a model with `turns = []` is not a valid session. It used
+//! to validate (silent empty success — grok `019fdeca`, every adapter's
+//! metadata-only path). Now it is `Err` carrying
+//! [`RefusalReason::EmptyConversation`] with the coverage evidence. The
+//! coverage ledger must also be total (`CoverageReport::check_totality`).
 
 use super::coverage::{
-    CoverageReport, SkippedReason, VisibleCompleteness, WarningKind, ranges_for,
+    CoverageReport, SkippedReason, TotalityError, VisibleCompleteness, WarningKind, ranges_for,
 };
-use super::identity::{evidence_event_id_from_hash, sha256_hex};
+use super::identity::{PackageIdentity, evidence_event_id_from_hash, sha256_hex};
 use super::model::{Known, RawUnitRef, SESSION_MODEL_SCHEMA, SessionModel, UsageEvent};
+use super::refusal::RefusalReason;
 use chrono::DateTime;
 use std::collections::BTreeSet;
 use std::fmt;
@@ -45,6 +52,27 @@ pub struct ValidatedSession {
 impl ValidatedSession {
     pub fn model(&self) -> &SessionModel {
         &self.model
+    }
+
+    /// The (store id, source content hash) pair this session stands for —
+    /// the identity of the **snapshot** read. Infallible: `validate_model`
+    /// already checked both halves. For "which conversation" use
+    /// [`ValidatedSession::conversation`].
+    pub fn identity(&self) -> PackageIdentity {
+        PackageIdentity {
+            store_id: self.model.session_id.clone(),
+            content_hash: self.model.provenance.original_source_hash.clone(),
+        }
+    }
+
+    /// Provider-tagged conversation identity (W2-R1).
+    pub fn conversation(&self) -> &super::model::ProviderConversationRef {
+        &self.model.conversation
+    }
+
+    /// Bytes-level snapshot identity (W2-R1).
+    pub fn snapshot(&self) -> &super::model::SourceSnapshotRef {
+        &self.model.snapshot
     }
 
     pub fn into_model(self) -> SessionModel {
@@ -109,7 +137,6 @@ pub fn validate_coverage(
             "raw_line_count cannot exceed raw_unit_count",
         ));
     }
-
     let mut ordinals = BTreeSet::new();
     let mut evidence_ids = BTreeSet::new();
     for unit in &coverage.consumed {
@@ -154,7 +181,6 @@ pub fn validate_coverage(
             "consumed_ranges do not exactly encode consumed ordinals",
         ));
     }
-
     for warning in &coverage.warnings {
         if warning.count == 0
             || warning.first_ordinal == 0
@@ -201,6 +227,14 @@ pub fn validate_coverage(
         return Err(error(
             "opaque_boundary",
             "encrypted opaque units require opaque_reasoning_present",
+        ));
+    }
+    if skipped_count(SkippedReason::CompactionReplay) > 0
+        && !coverage.status.boundary_flags.compaction_boundary_present
+    {
+        return Err(error(
+            "compaction_boundary",
+            "compaction_replay skips require compaction_boundary_present",
         ));
     }
     let unsupported_visible = coverage.skipped.iter().any(|unit| {
@@ -258,6 +292,12 @@ pub fn validate_coverage(
             "non-fatal parse must preserve its valid model",
         ));
     }
+    // Ledger totality is checked last: a structural defect (overlap, gap,
+    // silent skip, bad evidence) names itself first, and the ledger only ever
+    // drifts as a consequence of one of those.
+    coverage
+        .check_totality()
+        .map_err(|totality| totality_error(coverage, totality))?;
     Ok(())
 }
 
@@ -317,6 +357,7 @@ pub fn validate_model(model: &SessionModel) -> Result<(), ValidationError> {
         .map_err(|error| ValidationError {
             invariant: "evidence_derivation",
             detail: error.to_string(),
+            refusal: None,
         })?;
         if evidence.evidence_event_id != expected {
             return Err(error(
@@ -325,6 +366,13 @@ pub fn validate_model(model: &SessionModel) -> Result<(), ValidationError> {
             ));
         }
     }
+
+    // A model with zero turns is *consistent* (usage-only rollouts, harness
+    // bookkeeping, adversarially truncated sources all validate). Whether it is
+    // *sufficient* for a consumer is decided at the projection seams
+    // (`extraction`, `mcp_session`, `extract --file`), which raise the typed
+    // `RefusalReason::EmptyConversation` / `ProjectionFilteredAll` with the
+    // coverage evidence. The kernel never hides a valid model behind a refusal.
 
     let known_evidence: BTreeSet<_> = model
         .coverage
@@ -390,12 +438,7 @@ pub fn validate_model(model: &SessionModel) -> Result<(), ValidationError> {
 }
 
 fn validate_segments(model: &SessionModel) -> Result<(), ValidationError> {
-    if model.turns.is_empty() {
-        if !model.segments.is_empty() {
-            return Err(error("segment_empty", "empty chat cannot have turn ranges"));
-        }
-        return Ok(());
-    }
+    // `turns = []` is refused upstream in `validate_model`; no empty-chat path.
     let mut next_turn = 0_u64;
     let mut segment_ids = BTreeSet::new();
     for segment in &model.segments {
@@ -510,6 +553,24 @@ fn error(invariant: &'static str, detail: impl Into<String>) -> ValidationError 
     ValidationError {
         invariant,
         detail: detail.into(),
+        refusal: None,
+    }
+}
+
+fn totality_error(coverage: &CoverageReport, totality: TotalityError) -> ValidationError {
+    let invariant = match totality {
+        TotalityError::ConsumedByKind { .. } => "ledger_consumed_by_kind",
+        TotalityError::KnownSkipped { .. } => "ledger_known_skipped",
+        TotalityError::Partition { .. } => "coverage_partition_count",
+        TotalityError::LedgerDrift { .. } => "ledger_drift",
+    };
+    ValidationError {
+        invariant,
+        detail: format!(
+            "{totality} (raw {} / consumed {} / skipped {})",
+            coverage.raw_unit_count, coverage.consumed_count, coverage.skipped_count
+        ),
+        refusal: None,
     }
 }
 
@@ -517,6 +578,23 @@ fn error(invariant: &'static str, detail: impl Into<String>) -> ValidationError 
 pub struct ValidationError {
     pub invariant: &'static str,
     pub detail: String,
+    /// Set when the failure is a typed refusal (the input was understood and
+    /// rejected) rather than a broken invariant (the input was inconsistent).
+    pub refusal: Option<Box<RefusalReason>>,
+}
+
+impl ValidationError {
+    pub fn refusal(invariant: &'static str, refusal: RefusalReason) -> Self {
+        Self {
+            invariant,
+            detail: refusal.to_string(),
+            refusal: Some(Box::new(refusal)),
+        }
+    }
+
+    pub const fn is_refusal(&self) -> bool {
+        self.refusal.is_some()
+    }
 }
 
 impl fmt::Display for ValidationError {

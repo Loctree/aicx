@@ -235,6 +235,7 @@ mod tests {
         if turns > 0 {
             model.segments.push(crate::engine::Segment {
                 segment_id: 0,
+                scope_status: crate::engine::ScopeStatus::NoDriftObserved,
                 cwd: Known::value(cwd.to_owned()),
                 branch: Known::unknown(),
                 started_at: Known::unknown(),
@@ -276,6 +277,7 @@ mod tests {
                 tool_name: Known::unknown(),
                 segment_id: 0,
                 raw_unit_refs: vec![evidence.clone()],
+                frame_class: None,
             });
             model.usage_events.push(UsageEvent {
                 provider: "openai".to_owned(),
@@ -315,6 +317,9 @@ mod tests {
                 end: turns as u64,
             }]
         };
+        // The fixture mutates the coverage records by hand; the ledger is
+        // derived from them and must be rebuilt before validation.
+        model.coverage.rebuild_ledger();
         match validate_parse(UnvalidatedParse::from_model(model)).unwrap() {
             crate::engine::ValidatedParse::Session(session) => *session,
             crate::engine::ValidatedParse::Fatal(_) => panic!("fixture unexpectedly fatal"),

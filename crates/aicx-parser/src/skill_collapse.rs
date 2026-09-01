@@ -139,6 +139,8 @@ mod tests {
             session_id: "test-session".into(),
             role: role.into(),
             message: message.into(),
+            frame_class: None,
+            lineage_origin: None,
             frame_kind: None,
             branch: None,
             cwd: None,

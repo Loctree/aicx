@@ -184,6 +184,10 @@ pub struct ResolvedSource {
     pub query: String,
     pub matched_by: MatchKind,
     pub source: CatalogSource,
+    /// Loud identity drift receipt for every non-canonical resolver match.
+    /// Consumers must render this or refuse; silently discarding it recreates
+    /// the alias-substitution bug this catalog exists to prevent.
+    pub substitution_notice: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -395,6 +399,7 @@ impl SessionCatalog {
                 query,
                 matched_by: MatchKind::ExactSourceId,
                 source,
+                substitution_notice: None,
             });
         }
 
@@ -668,7 +673,7 @@ impl SessionCatalog {
     }
 }
 
-fn resolve_from_sources(
+pub(crate) fn resolve_from_sources(
     agent: AgentKind,
     query: String,
     sources: Vec<CatalogSource>,
@@ -723,10 +728,20 @@ fn one_or_ambiguous(
     matches: Vec<&CatalogSource>,
 ) -> Result<ResolvedSource, CatalogError> {
     if matches.len() == 1 {
+        let source = matches[0].clone();
+        let substitution_notice = matches!(
+            kind,
+            MatchKind::ExactAlias
+                | MatchKind::ExactFilenameAlias
+                | MatchKind::UuidSuffix
+                | MatchKind::UniquePrefix
+        )
+        .then(|| format!("substituted: {query} → {}", source.source_id));
         return Ok(ResolvedSource {
             query,
             matched_by: kind,
-            source: matches[0].clone(),
+            source,
+            substitution_notice,
         });
     }
     let mut candidates = matches
