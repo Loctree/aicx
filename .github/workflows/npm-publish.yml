@@ -1,6 +1,11 @@
 name: Publish npm
 
+# Publishes automatically when a GitHub Release is published (the npm package
+# is a thin wrapper around Release assets, so the Release must exist first);
+# workflow_dispatch stays as the manual fallback/re-run path.
 on:
+  release:
+    types: [published]
   workflow_dispatch:
     inputs:
       version:
@@ -21,14 +26,18 @@ jobs:
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
-          ref: v${{ inputs.version }}
+          ref: ${{ github.event_name == 'release' && github.event.release.tag_name || format('v{0}', inputs.version) }}
 
       - name: Validate requested version and release tag
         id: meta
         env:
           INPUT_VERSION: ${{ inputs.version }}
+          RELEASE_TAG_NAME: ${{ github.event.release.tag_name }}
         run: |
           version="${INPUT_VERSION}"
+          if [[ -z "${version}" && -n "${RELEASE_TAG_NAME}" ]]; then
+            version="${RELEASE_TAG_NAME#v}"
+          fi
           if [[ ! "${version}" =~ ^[0-9]+[.][0-9]+[.][0-9]+$ ]]; then
             echo "version must look like x.y.z" >&2
             exit 1
