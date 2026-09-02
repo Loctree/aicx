@@ -1,5 +1,13 @@
 name: Release
 
+# DOCTRINE EXCEPTION (operator decision, 2026-09-02): the standing order of
+# 2026-08-02 bans self-hosted runners from public-repo jobs (free hosted
+# runners + fork-PR code execution risk). release.yml is the one sanctioned
+# exception: it triggers only on tag push / manual dispatch — never on
+# pull_request, so foreign fork code cannot reach these runners — and the
+# GPG release-signing keys stay on operator hardware instead of GitHub
+# secrets. Every other workflow in this repo runs on GitHub-hosted runners.
+
 on:
   push:
     tags:
@@ -224,7 +232,11 @@ jobs:
           targets: ${{ matrix.target }}
 
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
-        if: matrix.runner_name == 'ops-linux'
+        # ops-linux needs it for cargo-zigbuild; windows-pc has no system
+        # Python 3.11+ visible from Git-bash and release_bundle.sh needs
+        # stdlib tomllib — the Windows leg of run 33598292973 died on the
+        # probe before the build started, skipping Publish.
+        if: matrix.runner_name == 'ops-linux' || matrix.runner_name == 'windows-pc'
         with:
           python-version: '3.12'
 
