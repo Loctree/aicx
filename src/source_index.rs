@@ -930,11 +930,11 @@ fn parse_catalog_source_checked(
         if message.trim().is_empty() {
             return Ok((Vec::new(), ConversationCoverage::CompleteVisible));
         }
-        let timestamp = fs::metadata(&path)
+        let modified = fs::metadata(&path)
             .ok()
-            .and_then(|metadata| metadata.modified().ok())
-            .map(chrono::DateTime::<chrono::Utc>::from)
-            .unwrap_or_else(chrono::Utc::now);
+            .and_then(|metadata| metadata.modified().ok());
+        let (timestamp, timestamp_source, coverage) =
+            vibecrafted_timestamp(modified, chrono::Utc::now());
         return Ok((
             vec![TimelineEntry {
                 timestamp,
@@ -947,12 +947,12 @@ fn parse_catalog_source_checked(
                 frame_kind: Some(FrameKind::AgentReply),
                 branch: None,
                 cwd: entry.cwd.clone(),
-                timestamp_source: Some("source_mtime".to_string()),
+                timestamp_source: Some(timestamp_source.to_owned()),
                 source_path: Some(entry.source_path.clone()),
                 source_sha256: None,
                 source_line_span: None,
             }],
-            ConversationCoverage::CompleteVisible,
+            coverage,
         ));
     }
 
@@ -997,17 +997,41 @@ fn model_conversation_coverage(model: &aicx_parser::engine::SessionModel) -> Con
         == aicx_parser::engine::VisibleCompleteness::CompleteVisible
         && !status.malformed_tail_present
         && !status.visible_event_lost;
-    // Adapters that must fall back to wall-clock time expose that uncertainty
-    // through typed provenance. Apply the trust rule generically rather than
-    // maintaining an adapter-name exception list.
-    let time_dependent = matches!(
-        model.provenance.started_at,
-        aicx_parser::engine::Known::Unknown(_)
-    );
+    // Grok reserves Unknown start provenance for invalid non-empty created_at
+    // that selected its wall-clock fallback. Other adapters (notably stable
+    // Gemini Antigravity) may legitimately have no session-level start while
+    // carrying deterministic timestamps on every turn.
+    let time_dependent = model.provenance.agent == aicx_parser::engine::AgentKind::Grok
+        && matches!(
+            model.provenance.started_at,
+            aicx_parser::engine::Known::Unknown(_)
+        );
     if complete && !time_dependent {
         ConversationCoverage::CompleteVisible
     } else {
         ConversationCoverage::Uncacheable
+    }
+}
+
+fn vibecrafted_timestamp(
+    modified: Option<std::time::SystemTime>,
+    wall_clock: chrono::DateTime<chrono::Utc>,
+) -> (
+    chrono::DateTime<chrono::Utc>,
+    &'static str,
+    ConversationCoverage,
+) {
+    match modified {
+        Some(modified) => (
+            chrono::DateTime::<chrono::Utc>::from(modified),
+            "source_mtime",
+            ConversationCoverage::CompleteVisible,
+        ),
+        None => (
+            wall_clock,
+            "wall_clock_fallback",
+            ConversationCoverage::Uncacheable,
+        ),
     }
 }
 
@@ -1653,6 +1677,64 @@ fn write_if_changed(aicx_home: &Path, path: &Path, bytes: &[u8]) -> Result<bool>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vibecrafted_wall_clock_fallback_is_labeled_and_uncacheable() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-09-03T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let (fallback, source, coverage) = vibecrafted_timestamp(None, now);
+        assert_eq!(fallback, now);
+        assert_eq!(source, "wall_clock_fallback");
+        assert_eq!(coverage, ConversationCoverage::Uncacheable);
+
+        let modified = std::time::UNIX_EPOCH + std::time::Duration::from_secs(123);
+        let (timestamp, source, coverage) = vibecrafted_timestamp(Some(modified), now);
+        assert_eq!(timestamp.timestamp(), 123);
+        assert_eq!(source, "source_mtime");
+        assert_eq!(coverage, ConversationCoverage::CompleteVisible);
+    }
+
+    #[test]
+    fn gemini_antigravity_unknown_session_start_remains_cacheable() {
+        use aicx_parser::engine::{
+            ParserEngine, SourceArtifact, SourceFraming, SourceHandle, ValidatedParse,
+        };
+        let parse = || {
+            let artifact = SourceArtifact::memory(
+                "gemini_antigravity_conversation.json",
+                include_bytes!("../tests/fixtures/frame_kind/gemini_antigravity_conversation.json")
+                    .to_vec(),
+                SourceFraming::WholeDocument,
+            )
+            .unwrap();
+            let handle = SourceHandle::new(
+                aicx_parser::engine::AgentKind::Gemini,
+                "antigravity-cache",
+                Some("antigravity-cache".to_owned()),
+                vec![artifact],
+            )
+            .unwrap();
+            match ParserEngine::default().parse_registered(&handle).unwrap() {
+                ValidatedParse::Session(session) => session.into_model(),
+                ValidatedParse::Fatal(_) => panic!("Antigravity fixture must parse"),
+            }
+        };
+        let first = parse();
+        assert!(matches!(
+            first.provenance.started_at,
+            aicx_parser::engine::Known::Unknown(_)
+        ));
+        assert_eq!(
+            model_conversation_coverage(&first),
+            ConversationCoverage::CompleteVisible
+        );
+        let second = parse();
+        assert_eq!(
+            serde_json::to_value(crate::output::timeline_entries_from_model(&first)).unwrap(),
+            serde_json::to_value(crate::output::timeline_entries_from_model(&second)).unwrap()
+        );
+    }
 
     #[test]
     fn grok_wall_clock_timestamp_fallback_is_not_cacheable_until_repaired() {

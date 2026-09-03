@@ -160,6 +160,12 @@ provenance. The visible one-shot parse may retain its prior wall-clock fallback,
 but that projection and the complete feed are not cacheable until the source
 provides a deterministic timestamp.
 
+The Vibecrafted fast path likewise distinguishes a real `source_mtime` from a
+`wall_clock_fallback`; only the former is cacheable. An unknown session-level
+start is not by itself time-dependent: Gemini Antigravity exports with stable
+per-message timestamps remain cacheable even when top-level `startTime` is
+absent.
+
 After a complete cacheable feed is published, AICX removes only immediate,
 regular, non-symlink `catalog-source-v1-<64 lowercase hex>.json` slots that no
 longer correspond to a current readable catalog source. This covers a removed
