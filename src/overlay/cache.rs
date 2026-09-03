@@ -115,7 +115,6 @@ pub(super) fn load_catalog_feed(
     rebuild: bool,
 ) -> Result<(Vec<OverlayFeedItem>, OverlayBuildStats)> {
     let before = snapshot(home, repo_id)?;
-    ensure_cache_owner(root, home, repo_id)?;
     let mut stats = OverlayBuildStats::default();
     let feed_path = root.join("catalog-feed-v1.json");
     let mut cacheable = true;
@@ -442,6 +441,18 @@ fn ensure_unchanged(before: &Snapshot, after: &Snapshot) -> Result<()> {
     Ok(())
 }
 
+pub(super) fn claim_cache_owner(root: &Path, home: &Path, repo_id: &str) -> Result<()> {
+    let lock_path = root.join("catalog-cache-owner.lock");
+    validate_cache_path(root, &lock_path)?;
+    let holder_path = lock_path.with_file_name("catalog-cache-owner.lock.holder");
+    validate_cache_path(root, &holder_path)?;
+    let owner_lock = crate::locks::acquire_exclusive(&lock_path)
+        .context("wait for overlay cache owner claim")?;
+    let result = ensure_cache_owner(root, home, repo_id);
+    drop(owner_lock);
+    result
+}
+
 fn ensure_cache_owner(root: &Path, home: &Path, repo_id: &str) -> Result<()> {
     let canonical_home = home
         .canonicalize()
@@ -455,7 +466,7 @@ fn ensure_cache_owner(root: &Path, home: &Path, repo_id: &str) -> Result<()> {
         ))?,
     };
     let marker = root.join("catalog-cache-owner-v1.json");
-    if let Some(actual) = read_json::<CacheOwner>(root, &marker)? {
+    if let Some(actual) = read_json_strict::<CacheOwner>(root, &marker, "cache-owner")? {
         if actual != expected {
             bail!(
                 "overlay catalog cache owner mismatch under {}; refusing source-cache reads, writes, or cleanup",
@@ -615,7 +626,7 @@ pub(super) fn validate_cache_path(root: &Path, path: &Path) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn read_json<T: DeserializeOwned>(root: &Path, path: &Path) -> Result<Option<T>> {
+fn read_cache_bytes(root: &Path, path: &Path) -> Result<Option<Vec<u8>>> {
     validate_cache_path(root, path)?;
     let mut options = fs::OpenOptions::new();
     options.read(true);
@@ -635,8 +646,33 @@ pub(super) fn read_json<T: DeserializeOwned>(root: &Path, path: &Path) -> Result
     let mut bytes = Vec::new();
     use std::io::Read;
     file.read_to_end(&mut bytes)?;
-    // Invalid derived JSON is a cache miss, never a stale result or lost source.
-    Ok(serde_json::from_slice(&bytes).ok())
+    Ok(Some(bytes))
+}
+
+pub(super) fn read_json<T: DeserializeOwned>(root: &Path, path: &Path) -> Result<Option<T>> {
+    // Invalid disposable derived JSON is a cache miss, never stale output.
+    Ok(read_cache_bytes(root, path)?.and_then(|bytes| serde_json::from_slice(&bytes).ok()))
+}
+
+pub(super) fn read_json_strict<T: DeserializeOwned>(
+    root: &Path,
+    path: &Path,
+    registry: &'static str,
+) -> Result<Option<T>> {
+    let path_ref = diagnostic_path_ref(path);
+    let Some(bytes) = read_cache_bytes(root, path).map_err(|_| {
+        anyhow::anyhow!("read protected overlay registry {registry} path_ref={path_ref} failed")
+    })?
+    else {
+        return Ok(None);
+    };
+    serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse protected overlay registry {registry} path_ref={path_ref}"))
+        .map(Some)
+}
+
+fn diagnostic_path_ref(path: &Path) -> String {
+    hex::encode(Sha256::digest(path.to_string_lossy().as_bytes()))[..16].to_owned()
 }
 
 #[cfg(test)]
@@ -710,6 +746,7 @@ mod tests {
         }
 
         fn load(&self, rebuild: bool) -> (Vec<OverlayFeedItem>, OverlayBuildStats) {
+            claim_cache_owner(&self.root, &self.home, "Loctree/aicx").unwrap();
             load_catalog_feed(&self.home, "Loctree/aicx", &self.root, rebuild).unwrap()
         }
 
@@ -809,10 +846,75 @@ mod tests {
             canonical_home_digest: "wrong-home".to_owned(),
         };
         atomic_write_json(&marker, &wrong).unwrap();
-        let error =
-            load_catalog_feed(&fixture.home, "Loctree/aicx", &fixture.root, false).unwrap_err();
+        let error = claim_cache_owner(&fixture.root, &fixture.home, "Loctree/aicx").unwrap_err();
         assert!(error.to_string().contains("owner mismatch"));
         assert!(fixture.source_slot(&fixture.rows[0]).is_file());
+    }
+
+    #[test]
+    fn malformed_side_index_is_strict_and_never_overwritten_as_a_cache_miss() {
+        let fixture = Fixture::new();
+        claim_cache_owner(&fixture.root, &fixture.home, "Loctree/aicx").unwrap();
+        let side_index = fixture.root.join("side-index.json");
+        let output = fixture.root.join("ov1-existing.json");
+        let malformed = b"{\"schema\":\"aicx.overlay.side_index.v1\"";
+        fs::write(&side_index, malformed).unwrap();
+        fs::write(&output, b"existing output").unwrap();
+        let error = super::super::read_side_index(&side_index, "Loctree/aicx").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("protected overlay registry side-index")
+        );
+        assert!(
+            !error
+                .to_string()
+                .contains(&fixture.home.to_string_lossy().to_string())
+        );
+        assert_eq!(fs::read(&side_index).unwrap(), malformed);
+        assert_eq!(fs::read(&output).unwrap(), b"existing output");
+    }
+
+    #[test]
+    fn shared_root_owner_claim_is_serialized_and_has_one_coherent_winner() {
+        use std::sync::{Arc, Barrier};
+        let fixture = Fixture::new();
+        let other_home = fixture.temp_root.join("other-home");
+        fs::create_dir_all(&other_home).unwrap();
+        let barrier = Arc::new(Barrier::new(3));
+        let spawn = |home: PathBuf, repo: &'static str| {
+            let root = fixture.root.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                claim_cache_owner(&root, &home, repo)
+            })
+        };
+        let first = spawn(fixture.home.clone(), "Loctree/aicx");
+        let second = spawn(other_home.clone(), "Other/repo");
+        barrier.wait();
+        let results = [first.join().unwrap(), second.join().unwrap()];
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
+
+        let marker: CacheOwner = read_json_strict(
+            &fixture.root,
+            &fixture.root.join("catalog-cache-owner-v1.json"),
+            "cache-owner",
+        )
+        .unwrap()
+        .unwrap();
+        let winner_is_first = marker.repo_id == "Loctree/aicx";
+        assert!(winner_is_first || marker.repo_id == "Other/repo");
+        let winner_home = if winner_is_first {
+            fixture.home.canonicalize().unwrap()
+        } else {
+            other_home.canonicalize().unwrap()
+        };
+        assert_eq!(
+            marker.canonical_home_digest,
+            digest(&(CACHE_OWNER_SCHEMA, winner_home.to_string_lossy().as_ref())).unwrap()
+        );
     }
 
     #[test]
@@ -822,8 +924,7 @@ mod tests {
             .root
             .join(format!("catalog-source-v1-{}.json", "c".repeat(64)));
         fs::write(&slot, "unowned private cache").unwrap();
-        let error =
-            load_catalog_feed(&fixture.home, "Loctree/aicx", &fixture.root, false).unwrap_err();
+        let error = claim_cache_owner(&fixture.root, &fixture.home, "Loctree/aicx").unwrap_err();
         assert!(error.to_string().contains("no valid owner marker"));
         assert_eq!(fs::read_to_string(slot).unwrap(), "unowned private cache");
         assert!(!fixture.root.join("catalog-cache-owner-v1.json").exists());

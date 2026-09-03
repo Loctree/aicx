@@ -303,6 +303,9 @@ pub fn build_overlay(options: &OverlayOptions) -> Result<(OverlayDocument, Overl
     let index_root = index_root
         .canonicalize()
         .context("overlay index root is unreadable after creation")?;
+    // A custom index root can be shared across repositories. Serialize its
+    // one-time owner marker before taking any repo-scoped producer lock.
+    cache::claim_cache_owner(&index_root, &aicx_home, &catalog.repo_id)?;
     let lock_path = index_root.join(format!("producer-{}.lock", short_hash(&catalog.repo_id)));
     cache::validate_cache_path(&index_root, &lock_path)?;
     cache::validate_cache_path(
@@ -333,6 +336,10 @@ pub fn build_overlay(options: &OverlayOptions) -> Result<(OverlayDocument, Overl
     let embedding_model = configured_embedding_model_key();
     let overlay_revision = overlay_revision(&catalog, &store_revision, &embedding_model);
     let output_path = index_root.join(format!("{overlay_revision}.json"));
+    // Identity registry integrity is a prerequisite even for a materialized
+    // output hit. A corrupt side-index must never be bypassed as disposable.
+    let side_index_path = index_root.join("side-index.json");
+    let mut previous = read_side_index(&side_index_path, &catalog.repo_id)?;
     if !options.rebuild
         && let Some(output) = cache::read_json::<OverlayDocument>(&index_root, &output_path)?
         && output.schema == OVERLAY_SCHEMA
@@ -353,8 +360,6 @@ pub fn build_overlay(options: &OverlayOptions) -> Result<(OverlayDocument, Overl
             },
         ));
     }
-    let side_index_path = index_root.join("side-index.json");
-    let mut previous = read_side_index(&side_index_path, &catalog.repo_id)?;
     if feed_source == OverlayFeedSource::ResidualC6
         && options.rebuild
         && let Some(index) = &mut previous
@@ -847,7 +852,7 @@ fn configured_embedding_model_key() -> String {
 
 fn read_side_index(path: &Path, repo_id: &str) -> Result<Option<SideIndex>> {
     let root = path.parent().context("side-index has no parent")?;
-    let Some(index) = cache::read_json::<SideIndex>(root, path)? else {
+    let Some(index) = cache::read_json_strict::<SideIndex>(root, path, "side-index")? else {
         return Ok(None);
     };
     if index.schema != OVERLAY_INDEX_SCHEMA || index.repo_id != repo_id {

@@ -984,19 +984,31 @@ fn parse_catalog_source_checked(
         entry.logical_session_id.clone(),
         &path,
     )?;
-    let status = &parsed.model().coverage.status;
+    let coverage = model_conversation_coverage(parsed.model());
+    Ok((
+        crate::output::timeline_entries_from_model(parsed.model()),
+        coverage,
+    ))
+}
+
+fn model_conversation_coverage(model: &aicx_parser::engine::SessionModel) -> ConversationCoverage {
+    let status = &model.coverage.status;
     let complete = status.visible_completeness
         == aicx_parser::engine::VisibleCompleteness::CompleteVisible
         && !status.malformed_tail_present
         && !status.visible_event_lost;
-    Ok((
-        crate::output::timeline_entries_from_model(parsed.model()),
-        if complete {
-            ConversationCoverage::CompleteVisible
-        } else {
-            ConversationCoverage::Uncacheable
-        },
-    ))
+    // Adapters that must fall back to wall-clock time expose that uncertainty
+    // through typed provenance. Apply the trust rule generically rather than
+    // maintaining an adapter-name exception list.
+    let time_dependent = matches!(
+        model.provenance.started_at,
+        aicx_parser::engine::Known::Unknown(_)
+    );
+    if complete && !time_dependent {
+        ConversationCoverage::CompleteVisible
+    } else {
+        ConversationCoverage::Uncacheable
+    }
 }
 
 /// Read one cataloged session through the same allowlisted, signal-only parser
@@ -1641,6 +1653,56 @@ fn write_if_changed(aicx_home: &Path, path: &Path, bytes: &[u8]) -> Result<bool>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn grok_wall_clock_timestamp_fallback_is_not_cacheable_until_repaired() {
+        use aicx_parser::engine::{
+            ParserEngine, SourceArtifact, SourceFraming, SourceHandle, ValidatedParse,
+        };
+        let parse = || {
+            let chat = SourceArtifact::memory(
+                "chat_history.jsonl",
+                b"{\"type\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"DECISION: keep Grok evidence\"}]}\n".to_vec(),
+                SourceFraming::JsonLines,
+            )
+            .unwrap();
+            let handle = SourceHandle::new(
+                aicx_parser::engine::AgentKind::Grok,
+                "grok-cache",
+                Some("grok-cache".to_owned()),
+                vec![chat],
+            )
+            .unwrap();
+            match ParserEngine::default().parse_registered(&handle).unwrap() {
+                ValidatedParse::Session(session) => session.into_model(),
+                ValidatedParse::Fatal(_) => panic!("Grok fixture must emit a current result"),
+            }
+        };
+
+        // Adapter provenance uses Unknown when invalid non-empty created_at
+        // selected a wall-clock base (covered at the adapter boundary). This
+        // canonical state must remain visible but never trusted as cache input.
+        let mut inferred = parse();
+        inferred.provenance.started_at = aicx_parser::engine::Known::unknown();
+        assert!(!crate::output::timeline_entries_from_model(&inferred).is_empty());
+        assert_eq!(
+            model_conversation_coverage(&inferred),
+            ConversationCoverage::Uncacheable
+        );
+
+        let repaired = parse();
+        assert_eq!(
+            model_conversation_coverage(&repaired),
+            ConversationCoverage::CompleteVisible
+        );
+        let repaired_again = parse();
+        assert_eq!(
+            serde_json::to_value(crate::output::timeline_entries_from_model(&repaired)).unwrap(),
+            serde_json::to_value(crate::output::timeline_entries_from_model(&repaired_again))
+                .unwrap(),
+            "repaired timestamp must yield a stable warm-cache input"
+        );
+    }
 
     #[test]
     fn persistent_project_slice_cannot_replace_the_global_generation() {

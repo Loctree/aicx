@@ -71,7 +71,9 @@ not claim a new Windows ACL policy.
 repository identity and a SHA-256 digest of the canonical AICX home. A custom
 index root owned by another home/repository fails closed. A legacy root without
 private source slots may adopt the marker; an unowned root already containing
-source-shaped slots is never adopted implicitly.
+source-shaped slots is never adopted implicitly. A fixed root-wide advisory
+lock serializes the first ownership claim before any repo-scoped producer lock,
+so two repositories cannot concurrently adopt the same explicit index root.
 
 ## Identity and publication rules
 
@@ -149,6 +151,14 @@ on warm calls, never upgraded to complete-visible coverage. The original full
 source remains untouched. Corrupt private cache JSON or checksums are cache
 misses, not trusted claims. Symlink cache entries are rejected. Source or policy
 mutation during a build fails visibly instead of publishing a mixed snapshot.
+The side index and cache-owner marker are protected registries rather than
+disposable caches: malformed JSON is a hard error and is never overwritten as
+an apparent cache miss.
+
+An invalid, non-empty Grok `created_at` remains `unknown` in typed parser
+provenance. The visible one-shot parse may retain its prior wall-clock fallback,
+but that projection and the complete feed are not cacheable until the source
+provides a deterministic timestamp.
 
 After a complete cacheable feed is published, AICX removes only immediate,
 regular, non-symlink `catalog-source-v1-<64 lowercase hex>.json` slots that no
