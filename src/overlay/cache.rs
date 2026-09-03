@@ -224,8 +224,8 @@ pub(super) fn load_catalog_feed(
         };
         if let ConversationCoverage::BoundedProjection { skipped_records } = coverage {
             let note = format!(
-                "bounded_projection agent={} session_id={} skipped_oversized_records={skipped_records}; cached coverage is not CompleteVisible",
-                row.entry.agent, row.entry.session_id
+                "bounded_projection source_ref={} skipped_oversized_records={skipped_records}; cached coverage is not CompleteVisible",
+                diagnostic_source_ref(&row.entry)
             );
             eprintln!("overlay: {note}");
             coverage_notes.push(note);
@@ -559,11 +559,28 @@ fn is_source_slot_name(name: &str) -> bool {
 
 fn report_skip(entry: &CatalogEntry, reason: &str) {
     let message = format!(
-        "intents_source_skip agent={} session_id={} path={} error={reason}",
-        entry.agent, entry.session_id, entry.source_path
+        "intents_source_skip source_ref={} error={}",
+        diagnostic_source_ref(entry),
+        if reason.contains("missing") {
+            "source file is missing"
+        } else if reason.contains("partial parser coverage") {
+            "partial parser coverage; current claims are not cached"
+        } else {
+            "source unavailable or invalid; current claims are not cached"
+        }
     );
     crate::diagnostics::log_describe(&message);
     eprintln!("overlay: {message}");
+}
+
+fn diagnostic_source_ref(entry: &CatalogEntry) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(entry.agent.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(entry.session_id.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(entry.source_path.as_bytes());
+    hex::encode(hasher.finalize())[..16].to_owned()
 }
 
 fn digest(value: &impl Serialize) -> Result<String> {

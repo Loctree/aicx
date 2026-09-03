@@ -349,6 +349,8 @@ fn oversized_codex_projection_is_warm_without_rereading_its_records() {
         warm_stats.contains("bounded"),
         "warm hit must retain bounded-coverage warning: {warm_stats}"
     );
+    assert!(!warm_stats.contains("019f1111"));
+    assert!(!warm_stats.contains(fixture.home.to_string_lossy().as_ref()));
     eprintln!("65MiB CLI fixture: cold={cold_elapsed:?}, warm={warm_elapsed:?}, warm parsed=0");
 }
 
@@ -393,6 +395,8 @@ fn missing_catalog_source_is_rechecked_without_disabling_warm_cache() {
         stats.contains("source file is missing"),
         "cached absence must remain visible"
     );
+    assert!(!stats.contains("019f1111"));
+    assert!(!stats.contains(fixture.home.to_string_lossy().as_ref()));
     fixture.write_source(1, "retain operator decisions");
     let (restored, stats) = fixture.run(false);
     assert_eq!(parsed(&stats), 1);
