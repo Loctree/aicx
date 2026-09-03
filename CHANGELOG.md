@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
+### Fixed
+
+- Avoid re-parsing full project history before an unchanged `overlay` cache hit.
+  Reuse fingerprinted conversation frames across both intent lanes, preserve
+  full-history evidence, and serialize concurrent producers with advisory locks.
+  Add CLI parse/reuse counters and isolated warm/incremental/concurrency tests.
+  Protect persistent identity registries from malformed-cache replacement,
+  serialize custom-root ownership, refuse time-dependent Grok projections, and
+  redact source/session identifiers from cache diagnostics.
+
 ## [0.13.0] - 2026-09-01
 
 ### One taxonomy for every agent (mission `aicx-one-taxonomy-fusion-260827`)

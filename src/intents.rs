@@ -113,6 +113,22 @@ pub(crate) fn extract_intents_from_root_at_with_stats(
         config.live,
         config.hours == 0,
     )?;
+    extract_intents_from_files_with_stats(
+        config,
+        files,
+        source_errors,
+        corpus_identity_source,
+        live_sessions,
+    )
+}
+
+fn extract_intents_from_files_with_stats(
+    config: &IntentsConfig,
+    files: Vec<StoredChunkFile>,
+    source_errors: usize,
+    corpus_identity_source: &str,
+    live_sessions: usize,
+) -> Result<IntentExtraction> {
     let scanned_count = files.len();
     let source_paths_verified = source_errors == 0 && verify_stored_chunk_paths(&files);
     let matched_project_buckets = files
@@ -584,7 +600,7 @@ fn collect_intent_files(
         }
         let live_row = session_is_hot_live(live, hot);
 
-        let (source_path, mut frames) =
+        let (source_path, frames) =
             match crate::source_index::read_catalog_signal_at(aicx_home, &entry, frame_kind) {
                 Ok(result) => result,
                 Err(error) => {
@@ -596,53 +612,16 @@ fn collect_intent_files(
                     continue;
                 }
             };
-        // Scope is judged on the whole session, before the project filter
-        // narrows the frames to one bucket (W2-R1).
-        let scope = crate::extraction::conversation::scope_report_for_entries(&frames);
-        retain_frames_for_project(&mut frames, &identity_project, entry.cwd.as_deref());
-        if frames.is_empty() {
+        let Some(file) =
+            catalog_frames_to_intent_file(&entry, source_path, frames, cutoff, live_row)
+        else {
             continue;
-        }
-        let timestamp = frames
-            .last()
-            .map(|frame| frame.timestamp)
-            .expect("non-empty frames have a last timestamp");
-        if canonical_date.is_none() && timestamp < cutoff {
-            continue;
-        }
-        let date = entry
-            .date
-            .clone()
-            .unwrap_or_else(|| timestamp.format("%Y-%m-%d").to_string());
-        let transcript_entries = frames
-            .into_iter()
-            .map(|frame| TranscriptEntry {
-                role: frame.role,
-                lines: frame.message.lines().map(str::to_string).collect(),
-            })
-            .collect();
+        };
         seen_sessions.insert((entry.agent.clone(), entry.session_id.clone()));
         if live_row {
             live_sessions += 1;
         }
-        files.push(StoredChunkFile {
-            agent: entry.agent,
-            date,
-            path: source_path,
-            project: identity_project,
-            identity_source: CATALOG_IDENTITY_SOURCE.to_string(),
-            sequence: 0,
-            timestamp,
-            session_id: entry.session_id,
-            honesty: if live_row {
-                crate::oracle::ClaimHonesty::live_open()
-            } else {
-                crate::oracle::ClaimHonesty::canonical()
-            },
-            scope: Some(scope),
-            transcript_entries: Some(transcript_entries),
-            body: None,
-        });
+        files.push(file);
     }
 
     if live {
@@ -663,6 +642,106 @@ fn collect_intent_files(
             .then_with(|| left.path.cmp(&right.path))
     });
     Ok((files, source_errors, CATALOG_IDENTITY_SOURCE, live_sessions))
+}
+
+#[cfg(feature = "app")]
+fn catalog_frames_to_intent_file(
+    entry: &crate::catalog::CatalogEntry,
+    source_path: PathBuf,
+    mut frames: Vec<TimelineEntry>,
+    cutoff: DateTime<Utc>,
+    live_row: bool,
+) -> Option<StoredChunkFile> {
+    let project = entry.project.as_ref()?;
+    // Preserve the census lane's scope/filter/date ordering exactly.
+    let scope = crate::extraction::conversation::scope_report_for_entries(&frames);
+    retain_frames_for_project(&mut frames, project, entry.cwd.as_deref());
+    let timestamp = frames.last()?.timestamp;
+    let canonical_date = entry
+        .date
+        .as_deref()
+        .and_then(|date| NaiveDate::parse_from_str(date, "%Y-%m-%d").ok());
+    if canonical_date.is_none() && timestamp < cutoff {
+        return None;
+    }
+    Some(StoredChunkFile {
+        agent: entry.agent.clone(),
+        date: entry
+            .date
+            .clone()
+            .unwrap_or_else(|| timestamp.format("%Y-%m-%d").to_string()),
+        path: source_path,
+        project: project.clone(),
+        identity_source: CATALOG_IDENTITY_SOURCE.to_string(),
+        sequence: 0,
+        timestamp,
+        session_id: entry.session_id.clone(),
+        honesty: if live_row {
+            crate::oracle::ClaimHonesty::live_open()
+        } else {
+            crate::oracle::ClaimHonesty::canonical()
+        },
+        scope: Some(scope),
+        transcript_entries: Some(
+            frames
+                .into_iter()
+                .map(|frame| TranscriptEntry {
+                    role: frame.role,
+                    lines: frame.message.lines().map(str::to_string).collect(),
+                })
+                .collect(),
+        ),
+        body: None,
+    })
+}
+
+/// Overlay's full-history census uses the same per-lane global caps, task
+/// reconciliation and dedup as `intents`. Only the source-read boundary differs:
+/// a cleaned conversation can be reused for both lanes, including from cache.
+#[cfg(feature = "app")]
+pub(crate) fn extract_overlay_intents_from_conversations(
+    project: &str,
+    conversations: &[(crate::catalog::CatalogEntry, PathBuf, Vec<TimelineEntry>)],
+) -> Result<Vec<IntentRecord>> {
+    let cutoff = DateTime::<Utc>::from_timestamp(0, 0).expect("valid Unix epoch");
+    let mut records = Vec::new();
+    for kind in [FrameKind::UserMsg, FrameKind::AgentReply] {
+        let config = IntentsConfig {
+            project: project.to_owned(),
+            hours: 0,
+            strict: false,
+            min_confidence: None,
+            kind_filter: None,
+            frame_kind: Some(kind),
+            live: false,
+        };
+        let mut files = conversations
+            .iter()
+            .filter_map(|(entry, path, frames)| {
+                let frames = frames
+                    .iter()
+                    .filter(|frame| {
+                        frame.frame_kind.unwrap_or(match frame.role.as_str() {
+                            "user" => FrameKind::UserMsg,
+                            "assistant" => FrameKind::AgentReply,
+                            _ => FrameKind::SystemNote,
+                        }) == kind
+                    })
+                    .cloned()
+                    .collect();
+                catalog_frames_to_intent_file(entry, path.clone(), frames, cutoff, false)
+            })
+            .collect::<Vec<_>>();
+        files.sort_by(|left, right| {
+            left.timestamp
+                .cmp(&right.timestamp)
+                .then_with(|| left.path.cmp(&right.path))
+        });
+        let extraction =
+            extract_intents_from_files_with_stats(&config, files, 0, CATALOG_IDENTITY_SOURCE, 0)?;
+        records.extend(extraction.records);
+    }
+    Ok(records)
 }
 
 /// Admit sessions the durable catalog census does not know yet (P0 live

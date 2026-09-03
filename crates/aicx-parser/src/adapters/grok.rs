@@ -220,8 +220,16 @@ impl AgentAdapter for GrokAdapter {
         let started_at = started_at.unwrap_or_else(|| "2026-07-13T00:00:00Z".to_owned());
         let ended_at = ended_at.unwrap_or_else(|| started_at.clone());
 
-        // Base timestamp for synthetic offsets (stable).
-        let base_ts = parse_ts(&started_at).unwrap_or_else(|_| Utc::now());
+        // Invalid non-empty provider timestamps historically fell back to
+        // wall-clock time. Preserve the visible first-run result, but carry an
+        // explicit Unknown in typed provenance so derived caches cannot treat
+        // that time-dependent projection as stable.
+        let (base_ts, known_started_at) = grok_base_timestamp(&started_at);
+        let known_ended_at = if parse_ts(&ended_at).is_ok() {
+            Known::value(ended_at.clone())
+        } else {
+            Known::unknown()
+        };
 
         // Transport records become frames; the throne (`frames::classify`)
         // is the only speech decision. Empty `turns` is refused by
@@ -366,8 +374,8 @@ impl AgentAdapter for GrokAdapter {
             cli_version: Known::unknown(),
             cwd: Known::value(cwd.clone()),
             branch: branch.clone().map(Known::value).unwrap_or(Known::unknown()),
-            started_at: Known::value(started_at.clone()),
-            ended_at: Known::value(ended_at.clone()),
+            started_at: known_started_at.clone(),
+            ended_at: known_ended_at.clone(),
             original_source_hash: read.source_hash.clone(),
             original_source_bytes: read.source_bytes,
         };
@@ -384,8 +392,8 @@ impl AgentAdapter for GrokAdapter {
                 ),
                 cwd: Known::value(cwd),
                 branch: branch.clone().map(Known::value).unwrap_or(Known::unknown()),
-                started_at: Known::value(started_at),
-                ended_at: Known::value(ended_at),
+                started_at: known_started_at,
+                ended_at: known_ended_at,
                 turn_range: TurnRange {
                     start: 0,
                     end: turns.last().map(|t| t.turn_idx).unwrap_or(0),
@@ -890,6 +898,13 @@ fn parse_ts(s: &str) -> Result<DateTime<Utc>, ()> {
         })
 }
 
+fn grok_base_timestamp(started_at: &str) -> (DateTime<Utc>, Known<String>) {
+    match parse_ts(started_at) {
+        Ok(timestamp) => (timestamp, Known::value(started_at.to_owned())),
+        Err(()) => (Utc::now(), Known::unknown()),
+    }
+}
+
 fn make_evidence_ref(
     source: &SourceHandle,
     unit: &RawUnit,
@@ -971,6 +986,14 @@ mod tests {
             vec![s, c],
         )
         .unwrap()
+    }
+
+    #[test]
+    fn invalid_created_at_marks_wall_clock_fallback_as_unknown_provenance() {
+        let (_, invalid) = grok_base_timestamp("not-a-timestamp");
+        assert_eq!(invalid, Known::unknown());
+        let (_, valid) = grok_base_timestamp("2026-09-03T12:00:00Z");
+        assert_eq!(valid, Known::value("2026-09-03T12:00:00Z".to_owned()));
     }
 
     #[test]

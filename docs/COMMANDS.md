@@ -293,6 +293,22 @@ Missing CURRENT rows are counted per extractor (for example,
 Project filters are exact by default. Ambiguous bare repository names fail
 closed; `--project-fuzzy` is an explicit opt-in.
 
+## Intent overlay
+
+```bash
+aicx overlay --repo /path/to/repository --format json
+# Explicitly bypass derived feed/conversation and output caches:
+aicx overlay --repo /path/to/repository --format json --rebuild
+```
+
+The published `loctree.overlay.intent.v1` JSON and full-history evidence are
+unchanged. Warm calls validate live source fingerprints before using cached
+catalog intents. Changed sessions are parsed once for both message lanes;
+concurrent producers serialize through an advisory lock. Stderr reports
+`source_sessions_parsed`, `source_sessions_reused`, and `feed_cache_hit` without
+polluting stdout JSON. This command does not rebuild or publish the search
+index. See [OVERLAY.md](./OVERLAY.md) for the complete cache contract.
+
 ## Status and diagnostics
 
 ```bash

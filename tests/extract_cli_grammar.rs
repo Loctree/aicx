@@ -66,6 +66,9 @@ fn rollout_fixture(session_id: &str) -> String {
 fn run_extract(home: &Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_aicx"))
         .env("HOME", home)
+        // The child must own the same scratch root through every AICX home
+        // precedence branch; never inherit an operator or parent-test store.
+        .env("AICX_HOME", home.join(".aicx"))
         .env("AICX_NO_MUTATION_WARN", "1")
         .args(args)
         .output()
