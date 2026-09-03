@@ -33,10 +33,26 @@ const MAX_JSONL_RECORD_BYTES: usize = 2 * 1024 * 1024;
 /// short-circuited forever, leaving search previews full of
 /// `{"type":"thought","data":"..."}` spam. Including this constant forces a
 /// one-shot rebuild so index truth tracks filter truth.
-const SIGNAL_FILTER_VERSION: &str = "signal-v3-workspace-metadata-strip";
+pub(crate) const SIGNAL_FILTER_VERSION: &str = "signal-v3-workspace-metadata-strip";
 
 const PARSE_STATE_SCHEMA: &str = "aicx.source_parse_state.v1";
 const PARSE_STATE_RELPATH: &str = "indexed/_all/source_parse_state.v1.json";
+
+/// Coverage of a cached conversation, not a promise about the original source.
+/// A settled bounded projection retains its limitation explicitly; transient
+/// partial reads and time-dependent timestamp inference are never cacheable.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) enum ConversationCoverage {
+    CompleteVisible,
+    BoundedProjection { skipped_records: usize },
+    Uncacheable,
+}
+
+impl ConversationCoverage {
+    pub(crate) fn cacheable(&self) -> bool {
+        !matches!(self, Self::Uncacheable)
+    }
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SourceIndexReport {
@@ -890,6 +906,14 @@ fn parse_catalog_source(
     path: &Path,
     allow: &crate::source_path::SourceAllowlist,
 ) -> Result<Vec<TimelineEntry>> {
+    Ok(parse_catalog_source_checked(entry, path, allow)?.0)
+}
+
+fn parse_catalog_source_checked(
+    entry: &CatalogEntry,
+    path: &Path,
+    allow: &crate::source_path::SourceAllowlist,
+) -> Result<(Vec<TimelineEntry>, ConversationCoverage)> {
     // Canonicalize + prove containment under approved source roots before any open.
     let path = allow
         .resolve_file(path)
@@ -904,36 +928,39 @@ fn parse_catalog_source(
         // `{"type":"thought","data":"The"}` spam over real operator answers.
         let message = vibecrafted_signal_body(&body);
         if message.trim().is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), ConversationCoverage::CompleteVisible));
         }
         let timestamp = fs::metadata(&path)
             .ok()
             .and_then(|metadata| metadata.modified().ok())
             .map(chrono::DateTime::<chrono::Utc>::from)
             .unwrap_or_else(chrono::Utc::now);
-        return Ok(vec![TimelineEntry {
-            timestamp,
-            agent: entry.agent.clone(),
-            session_id: entry.session_id.clone(),
-            role: "assistant".to_string(),
-            message,
-            frame_class: None,
-            lineage_origin: None,
-            frame_kind: Some(FrameKind::AgentReply),
-            branch: None,
-            cwd: entry.cwd.clone(),
-            timestamp_source: Some("source_mtime".to_string()),
-            source_path: Some(entry.source_path.clone()),
-            source_sha256: None,
-            source_line_span: None,
-        }]);
+        return Ok((
+            vec![TimelineEntry {
+                timestamp,
+                agent: entry.agent.clone(),
+                session_id: entry.session_id.clone(),
+                role: "assistant".to_string(),
+                message,
+                frame_class: None,
+                lineage_origin: None,
+                frame_kind: Some(FrameKind::AgentReply),
+                branch: None,
+                cwd: entry.cwd.clone(),
+                timestamp_source: Some("source_mtime".to_string()),
+                source_path: Some(entry.source_path.clone()),
+                source_sha256: None,
+                source_line_span: None,
+            }],
+            ConversationCoverage::CompleteVisible,
+        ));
     }
 
     let source_bytes = fs::metadata(&path)
         .with_context(|| format!("stat source {}", path.display()))?
         .len();
     if entry.agent == "codex" && source_bytes > MAX_FULL_PARSE_BYTES {
-        return parse_large_codex_signal(entry, &path, allow);
+        return parse_large_codex_signal_checked(entry, &path, allow);
     }
     if source_bytes > MAX_FULL_PARSE_BYTES {
         anyhow::bail!(
@@ -957,7 +984,19 @@ fn parse_catalog_source(
         entry.logical_session_id.clone(),
         &path,
     )?;
-    Ok(crate::output::timeline_entries_from_model(parsed.model()))
+    let status = &parsed.model().coverage.status;
+    let complete = status.visible_completeness
+        == aicx_parser::engine::VisibleCompleteness::CompleteVisible
+        && !status.malformed_tail_present
+        && !status.visible_event_lost;
+    Ok((
+        crate::output::timeline_entries_from_model(parsed.model()),
+        if complete {
+            ConversationCoverage::CompleteVisible
+        } else {
+            ConversationCoverage::Uncacheable
+        },
+    ))
 }
 
 /// Read one cataloged session through the same allowlisted, signal-only parser
@@ -983,6 +1022,17 @@ pub(crate) fn read_catalog_conversation_at(
     aicx_home: &Path,
     entry: &CatalogEntry,
 ) -> Result<(PathBuf, Vec<TimelineEntry>)> {
+    let (path, frames, _) = read_catalog_conversation_checked_at(aicx_home, entry)?;
+    Ok((path, frames))
+}
+
+/// Same reader as the public conversation path, with parser coverage retained
+/// for callers that persist derived claims. Partial visible reads remain usable
+/// for this request, but must not become a trusted warm cache.
+pub(crate) fn read_catalog_conversation_checked_at(
+    aicx_home: &Path,
+    entry: &CatalogEntry,
+) -> Result<(PathBuf, Vec<TimelineEntry>, ConversationCoverage)> {
     let user_home = crate::os_user_home().unwrap_or_else(|| aicx_home.to_path_buf());
     let source_allow = crate::source_path::SourceAllowlist::for_operator(&user_home, aicx_home);
     let source_path = source_allow
@@ -993,7 +1043,7 @@ pub(crate) fn read_catalog_conversation_at(
                 entry.agent, entry.session_id
             )
         })?;
-    let mut frames = parse_catalog_source(entry, &source_path, &source_allow)?;
+    let (mut frames, complete) = parse_catalog_source_checked(entry, &source_path, &source_allow)?;
     frames.sort_by_key(|frame| frame.timestamp);
     frames.retain(is_signal_frame);
     for frame in &mut frames {
@@ -1002,7 +1052,7 @@ pub(crate) fn read_catalog_conversation_at(
     frames.retain(|frame| !frame.message.trim().is_empty());
     let ignore = crate::legacy_archive::load_repo_path_ignore(aicx_home, &user_home)?;
     drop_ignored_cwd_frames(&mut frames, &ignore);
-    Ok((source_path, frames))
+    Ok((source_path, frames, complete))
 }
 
 fn drop_ignored_cwd_frames(
@@ -1029,26 +1079,52 @@ fn frame_matches_kind(frame: &TimelineEntry, requested: FrameKind) -> bool {
 /// pasted artifacts share the JSONL. The full canonical projection pays for
 /// all of that noise. This path drains over-cap records without allocating
 /// them and deserializes only bounded message records.
+#[cfg(test)]
 fn parse_large_codex_signal(
     entry: &CatalogEntry,
     path: &Path,
     allow: &crate::source_path::SourceAllowlist,
 ) -> Result<Vec<TimelineEntry>> {
+    Ok(parse_large_codex_signal_checked(entry, path, allow)?.0)
+}
+
+fn parse_large_codex_signal_checked(
+    entry: &CatalogEntry,
+    path: &Path,
+    allow: &crate::source_path::SourceAllowlist,
+) -> Result<(Vec<TimelineEntry>, ConversationCoverage)> {
     // `path` is already resolve_file'd by the caller; open through the allowlist.
-    let file = allow
+    let mut file = allow
         .open_file(path)
         .with_context(|| format!("open source {}", path.display()))?;
+    // read_line_capped drains oversized records without exposing whether the
+    // drained tail was terminated. Check EOF on this same descriptor first.
+    use std::io::{Read, Seek, SeekFrom};
+    let mut stable = true;
+    if file.metadata()?.len() > 0 {
+        file.seek(SeekFrom::End(-1))?;
+        let mut last = [0u8];
+        file.read_exact(&mut last)?;
+        stable = last[0] == b'\n';
+        file.seek(SeekFrom::Start(0))?;
+    }
     let mut reader = BufReader::new(file);
     let mut frames = Vec::new();
     let mut line_no = 0u64;
     let mut current_cwd = entry.cwd.clone();
+    let mut skipped_records = 0usize;
     while let Some(record) = crate::sanitize::read_line_capped(&mut reader, MAX_JSONL_RECORD_BYTES)?
     {
         line_no += 1;
-        if record.exceeded || record.line.trim().is_empty() {
+        if record.exceeded {
+            skipped_records += 1;
+            continue;
+        }
+        if record.line.trim().is_empty() {
             continue;
         }
         let Ok(value) = serde_json::from_str::<serde_json::Value>(&record.line) else {
+            stable = false;
             continue;
         };
         if value.get("type").and_then(serde_json::Value::as_str) == Some("turn_context") {
@@ -1102,7 +1178,10 @@ fn parse_large_codex_signal(
             .and_then(serde_json::Value::as_str)
             .and_then(|raw| chrono::DateTime::parse_from_rfc3339(raw).ok())
             .map(|timestamp| timestamp.with_timezone(&chrono::Utc))
-            .unwrap_or_else(chrono::Utc::now);
+            .unwrap_or_else(|| {
+                stable = false;
+                chrono::Utc::now()
+            });
         frames.push(TimelineEntry {
             timestamp,
             agent: entry.agent.clone(),
@@ -1120,7 +1199,14 @@ fn parse_large_codex_signal(
             source_line_span: Some((line_no, line_no)),
         });
     }
-    Ok(frames)
+    Ok((
+        frames,
+        if stable {
+            ConversationCoverage::BoundedProjection { skipped_records }
+        } else {
+            ConversationCoverage::Uncacheable
+        },
+    ))
 }
 
 fn is_signal_frame(frame: &TimelineEntry) -> bool {

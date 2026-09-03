@@ -15,16 +15,12 @@
 //! Overlay never opens agent sessions or rendered conversation Markdown
 //! as a fallback feed; every emitted claim carries a frozen `evidence_ref`.
 
-use crate::intents::{
-    IntentKind, IntentRecord, IntentsConfig, extract_intents_from_root_at_with_stats,
-};
+use crate::intents::{IntentKind, IntentRecord};
 use crate::legacy_archive::read_canonical_projection_at;
 use crate::rank::{SEMANTIC_INTENT_CANDIDATE_THRESHOLD, intent_candidate_similarity};
-use crate::timeline::FrameKind;
 use aicx_parser::engine::{Known, TurnRole};
 use aicx_parser::projections::CanonicalCard;
 use anyhow::{Context, Result, anyhow, bail};
-use chrono::Utc;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -33,6 +29,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
+
+mod cache;
 
 pub const OVERLAY_SCHEMA: &str = "loctree.overlay.intent.v1";
 pub const OVERLAY_INDEX_SCHEMA: &str = "aicx.overlay.side_index.v1";
@@ -224,10 +222,14 @@ pub struct OverlayBuildStats {
     pub unresolved_attributions: usize,
     pub files_opened: usize,
     pub raw_session_files_opened: usize,
+    /// Catalog sources parsed by the authorized feed reader (not raw fallback).
+    pub source_sessions_parsed: usize,
+    pub source_sessions_reused: usize,
+    pub feed_cache_hit: bool,
 }
 
 /// Normalized claim seed for the side-index (catalog intents or residual C6).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct OverlayFeedItem {
     evidence_event_id: String,
     session_id: String,
@@ -273,8 +275,52 @@ pub fn build_overlay(options: &OverlayOptions) -> Result<(OverlayDocument, Overl
         )
     })?;
 
-    let (feed, store_revision, feed_source, mut files_opened) =
-        load_overlay_feed(&aicx_home, &catalog.repo_id)?;
+    // One producer per resolved cache/repo, shared by all worktrees. The OS
+    // lock does not expire while its owner is still doing expensive work.
+    let index_root = options.index_root.clone().unwrap_or_else(|| {
+        aicx_home
+            .join("overlay-index-v1")
+            .join(short_hash(&catalog.repo_id))
+    });
+    if options.index_root.is_none() {
+        // A default cache belongs to this AICX home; do not follow a planted
+        // parent/leaf symlink and create derived data outside that boundary.
+        for path in [aicx_home.join("overlay-index-v1"), index_root.clone()] {
+            match fs::symlink_metadata(&path) {
+                Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                    bail!(
+                        "default overlay cache directory must not be a symlink or file: {}",
+                        path.display()
+                    );
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+    fs::create_dir_all(&index_root)?;
+    let index_root = index_root
+        .canonicalize()
+        .context("overlay index root is unreadable after creation")?;
+    let lock_path = index_root.join(format!("producer-{}.lock", short_hash(&catalog.repo_id)));
+    cache::validate_cache_path(&index_root, &lock_path)?;
+    cache::validate_cache_path(
+        &index_root,
+        &lock_path.with_file_name(format!(
+            "{}.holder",
+            lock_path
+                .file_name()
+                .expect("lock filename")
+                .to_string_lossy()
+        )),
+    )?;
+    let _producer = crate::locks::acquire_exclusive(&lock_path)
+        .context("wait for overlay producer (retry after the current build completes)")?;
+    // Waiters inspect live sources and the newly published feed only AFTER
+    // taking the lock, so they never repeat the previous producer's work.
+    let (feed, store_revision, feed_source, mut files_opened, feed_stats) =
+        load_overlay_feed(&aicx_home, &catalog.repo_id, &index_root, options.rebuild)?;
     if feed.is_empty() {
         bail!(
             "{} (searched under {}; repo_id={})",
@@ -286,55 +332,53 @@ pub fn build_overlay(options: &OverlayOptions) -> Result<(OverlayDocument, Overl
 
     let embedding_model = configured_embedding_model_key();
     let overlay_revision = overlay_revision(&catalog, &store_revision, &embedding_model);
-    // Prefer the same resolved AICX home used for the feed so isolated
-    // `AICX_HOME` / `--aicx-home` runs never spill side-index into the operator
-    // default home.
-    let index_root = options.index_root.clone().unwrap_or_else(|| {
-        aicx_home
-            .join("overlay-index-v1")
-            .join(short_hash(&catalog.repo_id))
-    });
-    fs::create_dir_all(&index_root)?;
-    let index_root = index_root
-        .canonicalize()
-        .context("overlay index root is unreadable after creation")?;
     let output_path = index_root.join(format!("{overlay_revision}.json"));
-    if !options.rebuild && output_path.exists() {
-        // index_root is already canonicalized; open via OpenOptions after
-        // rebuild under index_root (Normal components only).
-        let open_path = rebuild_under_root(&index_root, &output_path)?;
-        let bytes = {
-            let mut file = std::fs::OpenOptions::new()
-                .read(true)
-                .open(&open_path)
-                .with_context(|| format!("open overlay cache {}", open_path.display()))?;
-            let mut buf = Vec::new();
-            use std::io::Read;
-            file.read_to_end(&mut buf)
-                .with_context(|| format!("read overlay cache {}", open_path.display()))?;
-            buf
-        };
-        let output: OverlayDocument = serde_json::from_slice(&bytes)?;
+    if !options.rebuild
+        && let Some(output) = cache::read_json::<OverlayDocument>(&index_root, &output_path)?
+        && output.schema == OVERLAY_SCHEMA
+        && output.repo_id == catalog.repo_id
+        && output.snapshot_commit == catalog.snapshot_commit
+        && output.anchor_catalog_revision == catalog.anchor_catalog_revision
+        && output.store_revision == store_revision
+        && output.overlay_revision == overlay_revision
+        && output.producer_version == env!("CARGO_PKG_VERSION")
+        && cache::output_has_receipt(&index_root, &output)?
+    {
         return Ok((
             output,
             OverlayBuildStats {
                 canonical_cards_seen: feed.len(),
                 files_opened: files_opened + 2,
-                ..OverlayBuildStats::default()
+                ..feed_stats
             },
         ));
     }
     let side_index_path = index_root.join("side-index.json");
-    let previous = read_side_index(&side_index_path, &catalog.repo_id)?;
+    let mut previous = read_side_index(&side_index_path, &catalog.repo_id)?;
+    if feed_source == OverlayFeedSource::ResidualC6
+        && options.rebuild
+        && let Some(index) = &mut previous
+    {
+        retire_absent_residual_claims(index, &feed);
+    }
     let (mut index, new_intents, retained_intents) = update_side_index(
         previous,
         &feed,
         &catalog.repo_id,
         &store_revision,
         &embedding_model,
+        // Refresh metadata for current claims without discarding historical
+        // claim identities. Only active claims are materialized below.
+        options.rebuild || feed_source == OverlayFeedSource::Catalog,
+    )?;
+    materialize_side_index(
+        &mut index,
+        &catalog,
+        &repo,
+        &feed,
+        feed_source,
         options.rebuild,
     )?;
-    materialize_side_index(&mut index, &catalog, &repo)?;
     atomic_write_json(&side_index_path, &index)?;
     files_opened += usize::from(side_index_path.exists()) + 1;
     let entries = index.groups.clone();
@@ -348,6 +392,7 @@ pub fn build_overlay(options: &OverlayOptions) -> Result<(OverlayDocument, Overl
         unresolved_attributions: unresolved.len(),
         files_opened,
         raw_session_files_opened: 0,
+        ..feed_stats
     };
     let output = OverlayDocument {
         schema: OVERLAY_SCHEMA.to_owned(),
@@ -361,6 +406,7 @@ pub fn build_overlay(options: &OverlayOptions) -> Result<(OverlayDocument, Overl
         unresolved_attributions: unresolved,
     };
     atomic_write_json(&output_path, &output)?;
+    cache::write_output_receipt(&index_root, &output)?;
     tracing::debug!(
         elapsed_ms = started.elapsed().as_millis(),
         feed_source = feed_source.as_str(),
@@ -374,8 +420,17 @@ pub fn build_overlay(options: &OverlayOptions) -> Result<(OverlayDocument, Overl
 fn load_overlay_feed(
     aicx_home: &Path,
     repo_id: &str,
-) -> Result<(Vec<OverlayFeedItem>, String, OverlayFeedSource, usize)> {
-    let (catalog_items, catalog_files) = load_catalog_intent_feed(aicx_home, repo_id)?;
+    index_root: &Path,
+    rebuild: bool,
+) -> Result<(
+    Vec<OverlayFeedItem>,
+    String,
+    OverlayFeedSource,
+    usize,
+    OverlayBuildStats,
+)> {
+    let (catalog_items, stats) = cache::load_catalog_feed(aicx_home, repo_id, index_root, rebuild)?;
+    let catalog_files = stats.source_sessions_parsed;
     if !catalog_items.is_empty() {
         let store_revision = catalog_feed_revision(&catalog_items);
         return Ok((
@@ -383,6 +438,7 @@ fn load_overlay_feed(
             store_revision,
             OverlayFeedSource::Catalog,
             catalog_files,
+            stats,
         ));
     }
 
@@ -392,57 +448,14 @@ fn load_overlay_feed(
         store_revision,
         OverlayFeedSource::ResidualC6,
         catalog_files + c6_files,
+        stats,
     ))
 }
 
-fn load_catalog_intent_feed(
-    aicx_home: &Path,
+fn deduplicated_catalog_feed(
+    mut records: Vec<IntentRecord>,
     repo_id: &str,
-) -> Result<(Vec<OverlayFeedItem>, usize)> {
-    // Extract-era purity: empty catalog means empty *catalog* feed.
-    // Do not fall through into residual store context.md mill via
-    // `extract_intents_from_root_at_with_stats` (that path is for `aicx
-    // intents` recovery). Overlay's only non-catalog fallback is residual
-    // C6 fixtures below in `load_overlay_feed`.
-    let catalog_entries = crate::catalog::read_entries_at(aicx_home).with_context(|| {
-        format!(
-            "read catalog sessions under {} for overlay feed",
-            aicx_home.display()
-        )
-    })?;
-    if catalog_entries.is_empty() {
-        return Ok((Vec::new(), 0));
-    }
-
-    // Overlay needs the durable project identity, not a short rolling window.
-    // Catalog signal frames are partitioned by frame_kind (user_msg vs
-    // agent_reply). Overlay joins both signal lanes so operator decisions and
-    // agent outcomes can attribute — without inventing a third extraction API.
-    let mut records = Vec::new();
-    let mut files_opened = 0usize;
-    for frame_kind in [FrameKind::UserMsg, FrameKind::AgentReply] {
-        let config = IntentsConfig {
-            project: repo_id.to_owned(),
-            hours: 0,
-            strict: false,
-            min_confidence: None,
-            kind_filter: None,
-            frame_kind: Some(frame_kind),
-            // Overlay is a durable-identity join over the full census; the
-            // hot live window has no meaning at hours=0.
-            live: false,
-        };
-        let extraction = extract_intents_from_root_at_with_stats(&config, aicx_home, Utc::now())
-            .with_context(|| {
-                format!(
-                    "catalog intent extraction failed under {} for repo_id={} frame={frame_kind:?}",
-                    aicx_home.display(),
-                    repo_id
-                )
-            })?;
-        files_opened = files_opened.max(extraction.stats.scanned_count);
-        records.extend(extraction.records);
-    }
+) -> Vec<OverlayFeedItem> {
     // Stable dedup before feed conversion (same claim may appear on both lanes
     // only via dual-source rows; evidence_ref still fail-closes empty sources).
     records.sort_by(|left, right| {
@@ -465,8 +478,7 @@ fn load_catalog_intent_feed(
             && left.kind == right.kind
             && left.summary == right.summary
     });
-    let items = intent_records_to_feed(&records, repo_id);
-    Ok((items, files_opened))
+    intent_records_to_feed(&records, repo_id)
 }
 
 fn intent_records_to_feed(records: &[IntentRecord], repo_id: &str) -> Vec<OverlayFeedItem> {
@@ -567,17 +579,14 @@ fn frozen_intent_evidence_ref(record: &IntentRecord) -> String {
 
 fn catalog_feed_revision(items: &[OverlayFeedItem]) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(FEED_SOURCE_CATALOG.as_bytes());
-    for item in items {
-        hasher.update(item.evidence_event_id.as_bytes());
-        hasher.update(b"\0");
-        hasher.update(item.session_id.as_bytes());
-        hasher.update(b"\0");
-        for thesis in &item.theses {
-            hasher.update(thesis.as_bytes());
-            hasher.update(b"\0");
-        }
-    }
+    // v1 omitted temporal/authority fields and could serve a stale document
+    // after a correctly invalidated feed. Keep sr1 wire format, but version
+    // the hash material and cover ALL fields that shape the output.
+    hasher.update(b"aicx.catalog-feed-material.v2\0");
+    hasher.update(
+        serde_json::to_vec(items)
+            .expect("overlay feed contains only JSON-serializable strings and integers"),
+    );
     format!("sr1:{}", hex::encode(hasher.finalize()))
 }
 
@@ -837,25 +846,10 @@ fn configured_embedding_model_key() -> String {
 }
 
 fn read_side_index(path: &Path, repo_id: &str) -> Result<Option<SideIndex>> {
-    if !path.exists() {
+    let root = path.parent().context("side-index has no parent")?;
+    let Some(index) = cache::read_json::<SideIndex>(root, path)? else {
         return Ok(None);
-    }
-    // Fixed `side-index.json` child: open via OpenOptions on the path after
-    // canonicalize (SHA/name controlled by this module, not user input).
-    let open_path = fs::canonicalize(path)
-        .with_context(|| format!("canonicalize side-index {}", path.display()))?;
-    let bytes = {
-        let mut file = std::fs::OpenOptions::new()
-            .read(true)
-            .open(&open_path)
-            .with_context(|| format!("open side-index {}", open_path.display()))?;
-        let mut buf = Vec::new();
-        use std::io::Read;
-        file.read_to_end(&mut buf)
-            .with_context(|| format!("read side-index {}", open_path.display()))?;
-        buf
     };
-    let index: SideIndex = serde_json::from_slice(&bytes)?;
     if index.schema != OVERLAY_INDEX_SCHEMA || index.repo_id != repo_id {
         return Ok(None);
     }
@@ -924,7 +918,7 @@ fn update_side_index(
     repo_id: &str,
     store_revision: &str,
     embedding_model: &str,
-    rebuild: bool,
+    refresh_existing: bool,
 ) -> Result<(SideIndex, usize, usize)> {
     let mut previous = previous;
     if previous
@@ -951,17 +945,6 @@ fn update_side_index(
                 .collect()
         })
         .unwrap_or_default();
-    if rebuild {
-        let current: BTreeSet<_> = feed
-            .iter()
-            .flat_map(|item| {
-                item.theses
-                    .iter()
-                    .map(|thesis| claim_key(&item.evidence_event_id, thesis))
-            })
-            .collect();
-        existing_by_claim.retain(|key, _| current.contains(key));
-    }
     let retained = existing_by_claim.len();
     let mut new_intents = 0usize;
     for item in feed {
@@ -973,7 +956,15 @@ fn update_side_index(
                 continue;
             }
             let key = claim_key(&item.evidence_event_id, thesis);
-            if existing_by_claim.contains_key(&key) {
+            if let Some(existing) = existing_by_claim.get_mut(&key) {
+                if refresh_existing {
+                    // Keep stable identity/embedding, but do not freeze stale
+                    // provenance after a catalog metadata correction.
+                    existing.session_id = item.session_id.clone();
+                    existing.turn_idx = item.turn_idx;
+                    existing.valid_from = item.valid_from.clone();
+                    existing.authority = item.authority.clone();
+                }
                 continue;
             }
             let intent_id = random_intent_id()?;
@@ -1093,8 +1084,12 @@ fn materialize_side_index(
     index: &mut SideIndex,
     catalog: &AnchorCatalog,
     repo: &Path,
+    feed: &[OverlayFeedItem],
+    feed_source: OverlayFeedSource,
+    rebuild: bool,
 ) -> Result<()> {
-    let (entries, unresolved) = resolve_entries(&index.entries, catalog, repo);
+    let active = active_side_index_entries(index, feed, feed_source, rebuild);
+    let (entries, unresolved) = resolve_entries(&active, catalog, repo);
     // Attribution is the precision gate for overlay emission. Embed only the
     // typed claims which survived it: unresolved claims cannot participate in
     // a same-target semantic group, and eagerly embedding them makes a cold
@@ -1133,6 +1128,57 @@ fn materialize_side_index(
     index.groups = groups;
     index.unresolved_attributions = unresolved;
     Ok(())
+}
+
+/// Retain the durable identity/embedding registry, but never emit a catalog
+/// claim whose evidence is no longer in the current authorized census. This
+/// also allows A -> missing -> A to recover the SAME intent and group IDs.
+fn active_side_index_entries(
+    index: &SideIndex,
+    feed: &[OverlayFeedItem],
+    feed_source: OverlayFeedSource,
+    rebuild: bool,
+) -> Vec<IndexedIntent> {
+    let current: BTreeSet<_> = feed
+        .iter()
+        .flat_map(|item| {
+            item.theses
+                .iter()
+                .map(|thesis| claim_key(&item.evidence_event_id, thesis))
+        })
+        .collect();
+    index
+        .entries
+        .iter()
+        .filter(|entry| match feed_source {
+            OverlayFeedSource::Catalog => {
+                current.contains(&claim_key(&entry.evidence_event_id, &entry.thesis))
+            }
+            OverlayFeedSource::ResidualC6 => {
+                !entry.evidence_event_id.starts_with("intent1:")
+                    && (!rebuild
+                        || current.contains(&claim_key(&entry.evidence_event_id, &entry.thesis)))
+            }
+        })
+        .cloned()
+        .collect()
+}
+
+fn retire_absent_residual_claims(index: &mut SideIndex, feed: &[OverlayFeedItem]) {
+    let current: BTreeSet<_> = feed
+        .iter()
+        .flat_map(|item| {
+            item.theses
+                .iter()
+                .map(|thesis| claim_key(&item.evidence_event_id, thesis))
+        })
+        .collect();
+    // Explicit C6 rebuild historically prunes absent residual claims. Preserve
+    // that behavior without erasing inactive catalog identity registrations.
+    index.entries.retain(|entry| {
+        entry.evidence_event_id.starts_with("intent1:")
+            || current.contains(&claim_key(&entry.evidence_event_id, &entry.thesis))
+    });
 }
 
 fn ensure_embeddings(entries: &mut [IndexedIntent], emitted_ids: &BTreeSet<String>) -> Result<()> {
@@ -1879,9 +1925,11 @@ fn truncate_chars(value: &str, max: usize) -> String {
 fn atomic_write_json(path: &Path, value: &impl Serialize) -> Result<()> {
     let parent = path.parent().context("overlay index path has no parent")?;
     fs::create_dir_all(parent)?;
-    let temp = parent.join(format!(".overlay-{}.tmp", std::process::id()));
-    fs::write(&temp, serde_json::to_vec_pretty(value)?)?;
-    fs::rename(&temp, path)?;
+    cache::validate_cache_path(parent, path)?;
+    crate::legacy_archive::atomic_write::atomic_write_private(
+        path,
+        &serde_json::to_vec_pretty(value)?,
+    )?;
     Ok(())
 }
 

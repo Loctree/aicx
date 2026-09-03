@@ -2467,14 +2467,17 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
             serde_json::to_writer_pretty(io::stdout().lock(), &overlay)?;
             println!();
             eprintln!(
-                "overlay: cards={} new={} retained={} attributions={} unresolved={} files_opened={} raw_session_files_opened={}",
+                "overlay: cards={} new={} retained={} attributions={} unresolved={} files_opened={} raw_session_files_opened={} source_sessions_parsed={} source_sessions_reused={} feed_cache_hit={}",
                 stats.canonical_cards_seen,
                 stats.new_intents,
                 stats.retained_intents,
                 stats.emitted_attributions,
                 stats.unresolved_attributions,
                 stats.files_opened,
-                stats.raw_session_files_opened
+                stats.raw_session_files_opened,
+                stats.source_sessions_parsed,
+                stats.source_sessions_reused,
+                stats.feed_cache_hit,
             );
         }
         Some(Commands::Claude {
