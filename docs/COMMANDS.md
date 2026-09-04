@@ -132,7 +132,7 @@ not reused while ignore rules are present).
 ### Multi-machine / sync (operator truth)
 
 1. **Session JSONL sync** — catalog only discovers files under this host's agent
-   roots (`~/.claude/projects`, `~/.codex/sessions`, `~/.gemini/tmp`,
+   roots (`~/.claude/projects`, `~/.codex/sessions`, `~/.cursor/projects`, `~/.gemini/tmp`,
    `~/.grok/sessions`, `~/.junie/sessions`, `~/.vibecrafted/control_plane/runtime_runs`).
    Drop synced JSONL into those trees, then `catalog status` → `catalog rebuild`.
 2. **No alternate daily store intake** — there is no second "drop folder" for
@@ -155,6 +155,7 @@ not reused while ignore rules are present).
 ```bash
 aicx extract claude --session <session-id> --conversation
 aicx extract codex --session <session-id> --conversation
+aicx extract cursor --session <session-id> --conversation
 aicx extract grok --session <session-id> --conversation
 aicx extract gemini --session <session-id> --conversation
 ```

@@ -2406,6 +2406,15 @@ pub struct SemanticSearchFilters {
     pub deep: bool,
 }
 
+/// Canonical agent slug for filter comparisons: accepted aliases collapse to
+/// the stored discovery name; unknown strings pass through unchanged (they
+/// simply match nothing, same as before).
+pub fn canonical_agent_slug(raw: &str) -> String {
+    aicx_parser::engine::AgentKind::parse(raw)
+        .map(|kind| kind.as_str().to_owned())
+        .unwrap_or_else(|| raw.to_owned())
+}
+
 impl SemanticSearchFilters {
     /// True iff at least one post-fetch filter is active.
     pub fn is_active(&self) -> bool {
@@ -3019,7 +3028,10 @@ pub(crate) fn apply_semantic_post_filters(
         results.retain(|r| r.score >= min);
     }
     if let Some(ref agent) = filters.agent {
-        results.retain(|r| r.agent == *agent);
+        // Aliases ("cursor-agent", "gemini-antigravity") must match canonical
+        // stored slugs; raw equality made alias filters silently empty.
+        let want = canonical_agent_slug(agent);
+        results.retain(|r| r.agent == want);
     }
     if filters.date_lo.is_some() || filters.date_hi.is_some() {
         let lo = filters.date_lo.as_deref();
@@ -3171,7 +3183,8 @@ fn apply_fuzzy_post_filters(
         results.retain(|r| r.score >= min_score);
     }
     if let Some(ref agent_filter) = post_filters.agent {
-        results.retain(|r| r.agent == *agent_filter);
+        let want = canonical_agent_slug(agent_filter);
+        results.retain(|r| r.agent == want);
     }
     if post_filters.date_lo.is_some() || post_filters.date_hi.is_some() {
         let lo = post_filters.date_lo.as_deref();

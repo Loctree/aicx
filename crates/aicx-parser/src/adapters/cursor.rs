@@ -157,7 +157,7 @@ fn assemble_cursor(
                 state.consume_physical(kind, &value, classified_unit.evidence.clone());
             }
             ClassifiedDisposition::Skipped { reason, visible } => {
-                state.observe_skip(classified_unit, *reason, *visible, unit.boundary);
+                state.observe_skip(classified_unit, *reason, *visible);
             }
         }
     }
@@ -216,9 +216,10 @@ impl<'a> Assembly<'a> {
             .and_then(|message| message.get("content"))
             .and_then(Value::as_array)
         else {
-            if value.get("message").is_some() {
-                self.lose_visible(ordinal);
-            }
+            // A consumed user/assistant unit with no content array lost its
+            // whole visible payload — whether `message` is malformed or
+            // absent entirely. Never a silent CompleteVisible.
+            self.lose_visible(ordinal);
             return;
         };
         for block in blocks {
@@ -299,7 +300,12 @@ impl<'a> Assembly<'a> {
             return;
         };
         let tool_name = tool_name.to_owned();
-        let input = block.get("input").cloned().unwrap_or(Value::Null);
+        // Missing `input` is a malformed tool_use, not an implicit null call —
+        // serializing a fabricated Null would hash "null" as payload truth.
+        let Some(input) = block.get("input").cloned() else {
+            self.lose_visible(evidence.coverage_ordinal);
+            return;
+        };
         let text = if tool_name == "Shell" {
             let Some(command) = input.get("command").and_then(Value::as_str) else {
                 self.lose_visible(evidence.coverage_ordinal);
@@ -372,13 +378,7 @@ impl<'a> Assembly<'a> {
         });
     }
 
-    fn observe_skip(
-        &mut self,
-        unit: &ClassifiedUnit,
-        reason: SkippedReason,
-        visible: bool,
-        boundary: UnitBoundary,
-    ) {
+    fn observe_skip(&mut self, unit: &ClassifiedUnit, reason: SkippedReason, visible: bool) {
         let warning = match reason {
             SkippedReason::UnknownPayloadType => WarningKind::UnknownPayloadType,
             SkippedReason::Malformed => WarningKind::MalformedUnit,
@@ -400,11 +400,9 @@ impl<'a> Assembly<'a> {
         if visible && matches!(reason, SkippedReason::Malformed | SkippedReason::Oversized) {
             self.visible_lost = true;
         }
-        if boundary == UnitBoundary::UnterminatedTail {
-            self.malformed_tail = true;
-            self.visible_lost |= visible;
-            self.warn(WarningKind::UnterminatedTail, unit.ordinal);
-        }
+        // UnterminatedTail flags/warning are handled once in the assembly
+        // loop for every unit (consumed and skipped alike) — warning again
+        // here double-counted skipped tails.
     }
 
     fn warn(&mut self, kind: WarningKind, ordinal: u64) {
@@ -596,7 +594,13 @@ fn find_next_wrapper(text: &str) -> Option<(usize, &str, &str, usize)> {
         }
         let closing = format!("</{tag}>");
         let body_start = name_end + 1;
-        let close_at = text[body_start..].find(closing.as_str())?;
+        // An unclosed recognized tag is content, not transport: skip just this
+        // opening tag and keep scanning — aborting here would disable wrapper
+        // parsing for the rest of the text.
+        let Some(close_at) = text[body_start..].find(closing.as_str()) else {
+            at = name_end + 1;
+            continue;
+        };
         let body_end = body_start + close_at;
         return Some((
             at,
@@ -630,7 +634,7 @@ fn parse_harness_timestamp(raw: &str) -> Option<String> {
     let (month_name, day_text) = month_day.split_once(' ')?;
     let month = month_number(month_name)?;
     let day: u32 = day_text.trim().parse().ok()?;
-    if !(1..=31).contains(&day) {
+    if day == 0 || day > days_in_month(year, month) {
         return None;
     }
 
@@ -639,6 +643,11 @@ fn parse_harness_timestamp(raw: &str) -> Option<String> {
     let mut hour: u32 = hour_text.parse().ok()?;
     let minute: u32 = minute_text.parse().ok()?;
     if minute > 59 {
+        return None;
+    }
+    // 12-hour clock: only 1..=12 make sense next to AM/PM ("23:59 PM" is
+    // off-shape, never a guess).
+    if !(1..=12).contains(&hour) {
         return None;
     }
     match meridiem {
@@ -654,9 +663,6 @@ fn parse_harness_timestamp(raw: &str) -> Option<String> {
         }
         _ => return None,
     }
-    if hour > 23 {
-        return None;
-    }
 
     Some(format!(
         "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:00{offset}"
@@ -668,6 +674,19 @@ fn is_weekday(value: &str) -> bool {
         value,
         "Monday" | "Tuesday" | "Wednesday" | "Thursday" | "Friday" | "Saturday" | "Sunday"
     )
+}
+
+fn days_in_month(year: u32, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            let leap =
+                (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400);
+            if leap { 29 } else { 28 }
+        }
+        _ => 0,
+    }
 }
 
 fn month_number(name: &str) -> Option<u32> {
@@ -704,7 +723,8 @@ fn parse_utc_offset(zone: &str) -> Option<String> {
     };
     let hours: u32 = hours.parse().ok()?;
     let minutes: u32 = minutes.parse().ok()?;
-    if hours > 14 || minutes > 59 {
+    // Real UTC offsets top out at ±14:00 exactly — 14:59 is off-shape.
+    if hours > 14 || minutes > 59 || (hours == 14 && minutes > 0) {
         return None;
     }
     Some(format!("{sign}{hours:02}:{minutes:02}"))

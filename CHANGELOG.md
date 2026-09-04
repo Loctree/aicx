@@ -5,8 +5,30 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
+### Added
+
+- Cursor CLI (`cursor-agent`) as a first-class agent: discovery under
+  `~/.cursor/projects/*/agent-transcripts`, parser adapter `cursor-native-v1`,
+  catalog wiring/enrichment, `aicx extract cursor`, oracle golden lane, and a
+  production E2E (`tests/cursor_e2e.rs`). Serde note: `AgentKind`/
+  `ProviderConversationRef` gain a `cursor` variant — older binaries will not
+  deserialize artifacts that carry it.
+- `--agent` filters accept canonical aliases (`cursor-agent`,
+  `gemini-antigravity`) across sessions list, search, and intents.
+
 ### Fixed
 
+- Sessions without an in-band wall clock (cursor transcripts lacking the
+  harness `<timestamp>` wrapper) no longer vanish from batch extraction:
+  entries fall back to the source file mtime (`timestamp_source: file_mtime`)
+  instead of UNIX_EPOCH that cutoff/watermark always removed.
+- Cursor adapter loss accounting is fail-closed for malformed nested shapes
+  (missing content array, text without string `text`, tool_use without `name`
+  or `input`, Shell without `command`); warnings carry real ordinals and
+  UnterminatedTail is counted once.
+- Note: the frozen `extract all` watermark key predates cursor; an existing
+  watermark will not backfill cursor history — run `aicx extract cursor` /
+  a fresh source key once to backfill.
 - Avoid re-parsing full project history before an unchanged `overlay` cache hit.
   Reuse fingerprinted conversation frames across both intent lanes, preserve
   full-history evidence, and serialize concurrent producers with advisory locks.

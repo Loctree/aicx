@@ -7,9 +7,9 @@
 use aicx_parser::adapters::cursor::CURSOR_ADAPTER_VERSION;
 use aicx_parser::adapters::{AgentAdapter, CursorAdapter};
 use aicx_parser::engine::{
-    AgentKind, Known, RawUnitReader, ReaderPolicy, SkippedReason, SourceArtifact, SourceFraming,
-    SourceHandle, TurnKind, TurnRole, ValidatedParse, VisibleCompleteness, WarningKind,
-    validate_parse,
+    AgentKind, Known, RawUnitReader, ReaderPolicy, SessionModel, SkippedReason, SourceArtifact,
+    SourceFraming, SourceHandle, TurnKind, TurnRole, ValidatedParse, VisibleCompleteness,
+    WarningKind, validate_parse,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -46,6 +46,100 @@ fn parse_session(session_id: &str, body: &str) -> ValidatedParse {
         .assemble(&source, &read, classified)
         .expect("assemble");
     validate_parse(parse).expect("validation")
+}
+
+/// Oracle envelope projection (`parser_oracle.envelope.v1`) — same shape the
+/// junie/claude/codex native golden lanes emit, so `compare.py --all` can run
+/// the cursor `rust_golden` case against `cursor/expected.json`.
+fn envelope_from(model: &SessionModel) -> serde_json::Value {
+    let physical = model.coverage.raw_line_count;
+    let visible_turns = model
+        .turns
+        .iter()
+        .filter(|turn| matches!(turn.kind, TurnKind::UserMsg | TurnKind::AgentReply))
+        .enumerate()
+        .map(|(ordinal, turn)| {
+            serde_json::json!({
+                "ordinal": ordinal as u64,
+                "role": if turn.role == TurnRole::User { "user" } else { "assistant" },
+                "kind": "message",
+                "text": turn.text,
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut boundaries = Vec::new();
+    if model
+        .coverage
+        .status
+        .boundary_flags
+        .opaque_reasoning_present
+    {
+        boundaries.push("opaque_reasoning_present");
+    }
+    if model
+        .coverage
+        .status
+        .boundary_flags
+        .unsupported_visible_event
+    {
+        boundaries.push("unsupported_visible_event");
+    }
+    let visible = match model.coverage.status.visible_completeness {
+        VisibleCompleteness::CompleteVisible => "complete_visible",
+        VisibleCompleteness::PartialVisible => "partial_visible",
+        VisibleCompleteness::Fatal => "fatal",
+    };
+    let intent_summary = model
+        .turns
+        .iter()
+        .find(|turn| turn.kind == TurnKind::UserMsg)
+        .map(|turn| turn.text.clone())
+        .unwrap_or_default();
+
+    serde_json::json!({
+        "schema": "parser_oracle.envelope.v1",
+        "agent": "cursor",
+        "session_id": model.session_id,
+        "visible_turns": visible_turns,
+        "coverage": {
+            "raw_units": physical,
+            "consumed": model.coverage.consumed.iter().filter(|unit| unit.ordinal <= physical).count(),
+            "skipped": model.coverage.skipped.iter().filter(|unit| unit.ordinal <= physical).count(),
+        },
+        "status": { "visible": visible, "boundaries": boundaries },
+        "usage": model.usage_events,
+        "heuristic": { "intent_summary": intent_summary },
+    })
+}
+
+#[test]
+fn cursor_native_golden_matches_reviewed_fixture() {
+    let body = fixture("parser_engine/cursor/minimal.jsonl");
+    let parse = parse_session("44444444-4444-4444-8444-444444444444", &body);
+    let ValidatedParse::Session(session) = parse else {
+        panic!("expected validated session");
+    };
+    let envelope = envelope_from(session.model());
+    let expected: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../tests/fixtures/parser_engine/cursor/expected.json"
+    ))
+    .expect("cursor native golden");
+
+    for field in [
+        "agent",
+        "session_id",
+        "visible_turns",
+        "coverage",
+        "status",
+        "usage",
+    ] {
+        assert_eq!(envelope.get(field), expected.get(field), "$.{field}");
+    }
+    assert!(
+        envelope["heuristic"]["intent_summary"]
+            .as_str()
+            .is_some_and(|text| text.contains("oracle") || text.contains("Cursor"))
+    );
 }
 
 #[test]
@@ -212,6 +306,8 @@ fn cursor_malformed_nested_shapes_are_accounted_not_defaulted() {
         "{\"role\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":42}]}}\n",
         "{\"role\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"input\":{\"command\":\"ls\"}}]}}\n",
         "{\"role\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"name\":\"Shell\",\"input\":{}}]}}\n",
+        "{\"role\":\"user\"}\n",
+        "{\"role\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"name\":\"Read\"}]}}\n",
     );
     let parse = parse_session("88888888-8888-4888-8888-888888888888", body);
     let ValidatedParse::Session(session) = parse else {
@@ -230,8 +326,8 @@ fn cursor_malformed_nested_shapes_are_accounted_not_defaulted() {
 
     // Physical units stay consumed, but the lost visible payloads are
     // accounted: partial visibility, loss flags up, warnings at real ordinals.
-    assert_eq!(model.coverage.raw_line_count, 5);
-    assert_eq!(model.coverage.consumed.len(), 5);
+    assert_eq!(model.coverage.raw_line_count, 7);
+    assert_eq!(model.coverage.consumed.len(), 7);
     assert_eq!(
         model.coverage.status.visible_completeness,
         VisibleCompleteness::PartialVisible
@@ -250,7 +346,7 @@ fn cursor_malformed_nested_shapes_are_accounted_not_defaulted() {
         .iter()
         .find(|w| w.kind == WarningKind::UnsupportedVisibleEvent)
         .expect("unsupported visible warning");
-    assert_eq!(warning.count, 4);
+    assert_eq!(warning.count, 6);
     // The first malformed unit is the SECOND physical line: its real ordinal
     // (whatever base the reader uses) must ride the warning — never a flat 0.
     assert_eq!(

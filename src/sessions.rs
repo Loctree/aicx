@@ -1301,6 +1301,21 @@ fn scan_cursor_session_file(path: &Path, decoded_cwd: Option<&str>) -> Option<Se
             .and_then(|m| m.get("content"))
             .and_then(|c| c.as_array())
         else {
+            // A role row with a malformed/missing content array is still a
+            // conversation row: count it so the session's message counts do
+            // not silently understate the transcript (adapter-side coverage
+            // reports the loss in detail).
+            match role {
+                Some("user") => {
+                    message_count += 1;
+                    user_message_count += 1;
+                }
+                Some("assistant") => {
+                    message_count += 1;
+                    agent_message_count += 1;
+                }
+                _ => {}
+            }
             continue;
         };
         match role {
@@ -1430,7 +1445,12 @@ fn find_cursor_wrapper(text: &str) -> Option<(usize, &str, &str, usize)> {
         }
         let closing = format!("</{tag}>");
         let body_start = name_end + 1;
-        let close_at = text[body_start..].find(closing.as_str())?;
+        // Unclosed recognized tag = content; skip it and keep scanning
+        // (mirrors the adapter's find_next_wrapper).
+        let Some(close_at) = text[body_start..].find(closing.as_str()) else {
+            at = name_end + 1;
+            continue;
+        };
         let body_end = body_start + close_at;
         return Some((
             at,
@@ -1499,6 +1519,10 @@ fn parse_cursor_harness_timestamp(raw: &str) -> Option<DateTime<Utc>> {
     let (hour_text, minute_text) = clock.split_once(':')?;
     let mut hour: u32 = hour_text.parse().ok()?;
     let minute: u32 = minute_text.parse().ok()?;
+    // 12-hour clock: only 1..=12 make sense next to AM/PM.
+    if !(1..=12).contains(&hour) {
+        return None;
+    }
     match meridiem {
         "AM" => {
             if hour == 12 {
@@ -1539,7 +1563,8 @@ fn parse_cursor_utc_offset(zone: &str) -> Option<i64> {
     };
     let hours: i64 = hours.parse().ok()?;
     let minutes: i64 = minutes.parse().ok()?;
-    if hours > 14 || minutes > 59 {
+    // Real UTC offsets top out at ±14:00 exactly — 14:59 is off-shape.
+    if hours > 14 || minutes > 59 || (hours == 14 && minutes > 0) {
         return None;
     }
     Some(sign * (hours * 3600 + minutes * 60))
@@ -1853,7 +1878,14 @@ pub fn select_sessions(
     limit: usize,
 ) -> Vec<SessionInfo> {
     if let Some(agent) = agent {
-        sessions.retain(|s| s.agent == agent);
+        // Canonicalize before comparing: discovery stores canonical names
+        // ("cursor"), while callers may pass accepted aliases ("cursor-agent",
+        // "gemini-antigravity"). Raw string equality made every alias filter
+        // silently empty.
+        let want = aicx_parser::engine::AgentKind::parse(agent)
+            .map(|kind| kind.as_str())
+            .unwrap_or(agent);
+        sessions.retain(|s| s.agent == want);
     }
     if let Some(since) = since {
         // A session with NO timestamp survives the since-window: it is marked
@@ -2841,6 +2873,39 @@ mod tests {
         );
         assert!(other.is_empty());
         let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn select_sessions_accepts_agent_aliases() {
+        // Regression for the alias hole: clap accepted `cursor-agent` but the
+        // raw string filter matched nothing, so every alias listing was empty.
+        let mk = |agent: &str| SessionInfo {
+            session_id: format!("{agent}-s1"),
+            agent: agent.to_string(),
+            project: None,
+            repo_path: None,
+            started_at: None,
+            updated_at: None,
+            message_count: 1,
+            user_message_count: 1,
+            agent_message_count: 0,
+            title: None,
+            source_path: PathBuf::from("/dev/null"),
+            association: Association::Inferred,
+            temporal_confidence: TemporalConfidence::None,
+        };
+        let sessions = vec![mk("cursor"), mk("claude"), mk("gemini")];
+        let cursor = select_sessions(sessions.clone(), None, Some("cursor-agent"), None, 0);
+        assert_eq!(cursor.len(), 1, "cursor-agent alias must match cursor rows");
+        assert_eq!(cursor[0].agent, "cursor");
+        let gemini = select_sessions(sessions.clone(), None, Some("gemini-antigravity"), None, 0);
+        assert_eq!(
+            gemini.len(),
+            1,
+            "gemini-antigravity alias must match gemini rows"
+        );
+        let unknown = select_sessions(sessions, None, Some("not-an-agent"), None, 0);
+        assert!(unknown.is_empty(), "unknown agent still matches nothing");
     }
 
     #[test]

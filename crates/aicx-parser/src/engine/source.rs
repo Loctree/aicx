@@ -19,6 +19,21 @@ pub enum AgentKind {
 }
 
 impl AgentKind {
+    /// Canonical parse including accepted CLI aliases (`cursor-agent`,
+    /// `gemini-antigravity`). Single source of truth for alias → canonical
+    /// agent mapping; feature-gated app modules delegate here.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "claude" => Some(Self::Claude),
+            "codex" => Some(Self::Codex),
+            "cursor" | "cursor-agent" => Some(Self::Cursor),
+            "gemini" | "gemini-antigravity" => Some(Self::Gemini),
+            "junie" => Some(Self::Junie),
+            "grok" => Some(Self::Grok),
+            _ => None,
+        }
+    }
+
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Codex => "codex",

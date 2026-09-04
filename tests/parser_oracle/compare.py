@@ -441,7 +441,18 @@ def run_all(cases: list[Case]) -> None:
             "junie_native_golden_matches_reviewed_fixture",
             "--",
             "--exact",
-        )
+        ),
+        "cursor_minimal": (
+            "cargo",
+            "test",
+            "-p",
+            "aicx-parser",
+            "--test",
+            "cursor_adapter",
+            "cursor_native_golden_matches_reviewed_fixture",
+            "--",
+            "--exact",
+        ),
     }
     for case in native_cases:
         command = native_tests.get(case.id)

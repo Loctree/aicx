@@ -1185,6 +1185,12 @@ fn enrich_from_sessions_discovery(
             merge_session_info(by_id, &info);
         }
     }
+    let cursor_root = user_home.join(".cursor").join("projects");
+    if cursor_root.is_dir() {
+        for info in crate::sessions::discover_cursor_sessions(&cursor_root, None, None) {
+            merge_session_info(by_id, &info);
+        }
+    }
 }
 
 fn merge_session_info(

@@ -5536,7 +5536,8 @@ fn run_tail(
             let mut records = extraction.records;
             // Apply filtering identical to run_intents
             if let Some(agent_filter) = &filters.agent {
-                records.retain(|r| r.agent == *agent_filter);
+                let want = aicx::search_engine::canonical_agent_slug(agent_filter);
+                records.retain(|r| r.agent == want);
             }
             let (lo, hi) = if let Some(ref d) = filters.since {
                 (

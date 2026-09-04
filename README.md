@@ -57,6 +57,7 @@ First-class roots include:
 
 - `~/.claude/projects`
 - `~/.codex/sessions`
+- `~/.cursor/projects/*/agent-transcripts/<uuid>/<uuid>.jsonl`
 - `~/.grok/sessions/*/chat_history.jsonl`
 - `~/.gemini/tmp/*/chats/session-*.json`
 - Junie sources
