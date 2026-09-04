@@ -1,4 +1,4 @@
-# human_shape_004ffd2e
+# human_shape_wrapped
 
 Bounded, sanitized projection of a Cursor CLI agent transcript
 (first cursor-agent session on the capture host, 2026-08-29).
@@ -28,5 +28,5 @@ same block types, same wrappers, same timestamp text).
 ## Assertions of record
 
 Live in `crates/aicx-parser/tests/cursor_adapter.rs`
-(`cursor_human_shape_004ffd2e_*`): wrapper-free operator text, parsed RFC 3339
+(`cursor_human_shape_wrapped_*`): wrapper-free operator text, parsed RFC 3339
 turn timestamp, `Shell` tool events, full visible coverage with zero skips.

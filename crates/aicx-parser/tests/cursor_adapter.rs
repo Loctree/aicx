@@ -4,92 +4,13 @@
 //! JSONL plus `turn_ended` control rows) against the shared frame taxonomy
 //! throne, including the harness `<timestamp>` / `<user_query>` wrapper idiom.
 
-mod engine {
-    pub use aicx_parser::engine::*;
-}
-
-mod sealed {
-    pub trait Sealed {}
-}
-
-use engine::{AgentKind, RawUnitRef, SkippedReason, SourceHandle, SourceRead, UnvalidatedParse};
-use std::fmt;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ClassifiedUnit {
-    pub ordinal: u64,
-    pub level: RawUnitLevel,
-    pub evidence: RawUnitRef,
-    pub disposition: ClassifiedDisposition,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RawUnitLevel {
-    Physical,
-    Logical { parent_ordinal: u64 },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ClassifiedDisposition {
-    Consumed {
-        kind: String,
-    },
-    Skipped {
-        reason: SkippedReason,
-        visible: bool,
-    },
-}
-
-pub trait AgentAdapter: sealed::Sealed + Send + Sync {
-    fn agent(&self) -> AgentKind;
-
-    fn adapter_version(&self) -> &'static str;
-
-    fn classify(
-        &self,
-        source: &SourceHandle,
-        read: &SourceRead,
-    ) -> Result<Vec<ClassifiedUnit>, AdapterError>;
-
-    fn assemble(
-        &self,
-        source: &SourceHandle,
-        read: &SourceRead,
-        classified: Vec<ClassifiedUnit>,
-    ) -> Result<UnvalidatedParse, AdapterError>;
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AdapterError {
-    pub stage: &'static str,
-    pub detail: String,
-}
-
-impl AdapterError {
-    pub fn new(stage: &'static str, detail: impl Into<String>) -> Self {
-        Self {
-            stage,
-            detail: detail.into(),
-        }
-    }
-}
-
-impl fmt::Display for AdapterError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "adapter {} failed: {}", self.stage, self.detail)
-    }
-}
-
-impl std::error::Error for AdapterError {}
-
-#[path = "../src/adapters/cursor.rs"]
-mod cursor;
-
+use aicx_parser::adapters::cursor::CURSOR_ADAPTER_VERSION;
+use aicx_parser::adapters::{AgentAdapter, CursorAdapter};
 use aicx_parser::engine::{
-    Known, RawUnitReader, ReaderPolicy, SourceArtifact, SourceFraming, TurnKind, TurnRole,
-    ValidatedParse, VisibleCompleteness, validate_parse,
+    AgentKind, Known, RawUnitReader, ReaderPolicy, SkippedReason, SourceArtifact, SourceFraming,
+    SourceHandle, TurnKind, TurnRole, ValidatedParse, VisibleCompleteness, WarningKind,
+    validate_parse,
 };
-use cursor::{CURSOR_ADAPTER_VERSION, CursorAdapter};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -178,9 +99,9 @@ fn cursor_minimal_jsonl_matches_oracle_envelope() {
 }
 
 #[test]
-fn cursor_human_shape_004ffd2e_unwraps_operator_speech() {
-    let body = fixture("parser_engine/cursor/human_shape_004ffd2e.jsonl");
-    let parse = parse_session("004ffd2e-8b2a-4a41-bd7d-dee9f7df9950", &body);
+fn cursor_human_shape_wrapped_unwraps_operator_speech() {
+    let body = fixture("parser_engine/cursor/human_shape_wrapped.jsonl");
+    let parse = parse_session("77777777-7777-4777-8777-777777777777", &body);
     let ValidatedParse::Session(session) = parse else {
         panic!("expected validated session");
     };
@@ -277,6 +198,69 @@ fn cursor_malformed_and_unknown_lines_are_accounted() {
         .collect();
     assert!(reasons.contains(&SkippedReason::Malformed));
     assert!(reasons.contains(&SkippedReason::UnknownPayloadType));
+}
+
+#[test]
+fn cursor_malformed_nested_shapes_are_accounted_not_defaulted() {
+    // Consumed physical units with malformed visible payloads inside:
+    // a text block without a string `text`, a tool_use without a string
+    // `name`, and a Shell tool_use without a string `command`. Fail-closed
+    // contract: no fabricated empty turns, coverage degrades honestly.
+    let body = concat!(
+        "{\"role\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"real reply\"}]}}\n",
+        "{\"role\":\"user\",\"message\":{\"content\":[{\"type\":\"text\"}]}}\n",
+        "{\"role\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":42}]}}\n",
+        "{\"role\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"input\":{\"command\":\"ls\"}}]}}\n",
+        "{\"role\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"name\":\"Shell\",\"input\":{}}]}}\n",
+    );
+    let parse = parse_session("88888888-8888-4888-8888-888888888888", body);
+    let ValidatedParse::Session(session) = parse else {
+        panic!("expected validated session");
+    };
+    let model = session.model();
+
+    // Only the one well-formed block projects a turn.
+    assert_eq!(
+        model.turns.len(),
+        1,
+        "malformed blocks must not fabricate turns"
+    );
+    assert_eq!(model.turns[0].text, "real reply");
+    assert!(model.tool_events.is_empty());
+
+    // Physical units stay consumed, but the lost visible payloads are
+    // accounted: partial visibility, loss flags up, warnings at real ordinals.
+    assert_eq!(model.coverage.raw_line_count, 5);
+    assert_eq!(model.coverage.consumed.len(), 5);
+    assert_eq!(
+        model.coverage.status.visible_completeness,
+        VisibleCompleteness::PartialVisible
+    );
+    assert!(model.coverage.status.visible_event_lost);
+    assert!(
+        model
+            .coverage
+            .status
+            .boundary_flags
+            .unsupported_visible_event
+    );
+    let warning = model
+        .coverage
+        .warnings
+        .iter()
+        .find(|w| w.kind == WarningKind::UnsupportedVisibleEvent)
+        .expect("unsupported visible warning");
+    assert_eq!(warning.count, 4);
+    // The first malformed unit is the SECOND physical line: its real ordinal
+    // (whatever base the reader uses) must ride the warning — never a flat 0.
+    assert_eq!(
+        warning.first_ordinal, model.coverage.consumed[1].ordinal,
+        "warning must carry the real ordinal of the lossy unit"
+    );
+    assert!(
+        warning.first_ordinal > model.coverage.consumed[0].ordinal,
+        "ordinal must not collapse to the buggy constant 0"
+    );
 }
 
 #[test]

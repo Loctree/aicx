@@ -255,11 +255,11 @@ baseline_from = "aicx@a687754"
 status = "hypothesis"
 note = "W4 recovery (claude): this row counts EVERY --user-only heading in the 262 MB rollout, so `expected = 1` never measured the echo (the baseline projected 0 because echo-bus speech was not projected at all). Observed after fusion: 27 direct user utterances; 44 once the razor admits the echo bus (EchoSeal) as the operator's speech. Kept as a hypothesis-grade cardinality watch; the one-frame-per-multiline-echo claim needs a selector on the echo command body (W5 backlog). Original Decision 7 text: one multiline echo that quotes speakers is ONE Human frame, not N speakers. Today echo-bus user_shell commands are not projected into --user-only (0 utterances, not a 3-way split). Exact labels 'Monika Szymańska:' / 'Maciej Gad:' were not found in echo command bodies of this rollout. W2-T7 must emit 1 Human for a multiline echo; splitting quoted names is the forbidden regression."
 
-# ---------------------------------------------------------------- cursor 004ffd2e
+# ---------------------------------------------------------------- cursor wrapped
 
 [[assertion]]
-id = "cursor-004ffd2e-raw-user-records"
-fixture = "tests/fixtures/parser_engine/cursor/human_shape_004ffd2e.jsonl"
+id = "cursor-wrapped-raw-user-records"
+fixture = "tests/fixtures/parser_engine/cursor/human_shape_wrapped.jsonl"
 projection = "raw"
 kind = "count"
 expected = 2
@@ -269,8 +269,8 @@ selector = "role == \"user\""
 note = "Two raw user records: one plain, one wrapped in <timestamp>+<user_query>. Cursor has no a687754 baseline; frozen from this cut."
 
 [[assertion]]
-id = "cursor-004ffd2e-user-only-usermsg"
-fixture = "tests/fixtures/parser_engine/cursor/human_shape_004ffd2e.jsonl"
+id = "cursor-wrapped-user-only-usermsg"
+fixture = "tests/fixtures/parser_engine/cursor/human_shape_wrapped.jsonl"
 projection = "extract --conversation --user-only"
 kind = "count"
 expected = 2
@@ -279,8 +279,8 @@ status = "hypothesis"
 note = "Both raw user records project as UserMsg; the wrapped one is unwrapped to operator speech (no tag residue)."
 
 [[assertion]]
-id = "cursor-004ffd2e-user-query-unwrap-presence"
-fixture = "tests/fixtures/parser_engine/cursor/human_shape_004ffd2e.jsonl"
+id = "cursor-wrapped-user-query-unwrap-presence"
+fixture = "tests/fixtures/parser_engine/cursor/human_shape_wrapped.jsonl"
 projection = "extract --conversation --user-only"
 kind = "presence"
 expected = "!git log --oneline -5"
@@ -288,8 +288,8 @@ status = "hypothesis"
 note = "Operator speech survives wrapper stripping; a rendered '<user_query>' tag here is the forbidden regression."
 
 [[assertion]]
-id = "cursor-004ffd2e-conversation-assistant"
-fixture = "tests/fixtures/parser_engine/cursor/human_shape_004ffd2e.jsonl"
+id = "cursor-wrapped-conversation-assistant"
+fixture = "tests/fixtures/parser_engine/cursor/human_shape_wrapped.jsonl"
 projection = "extract --conversation"
 kind = "count"
 expected = 1
