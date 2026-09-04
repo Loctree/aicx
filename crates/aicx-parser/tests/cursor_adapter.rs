@@ -202,10 +202,7 @@ fn cursor_human_shape_004ffd2e_unwraps_operator_speech() {
     // The wrapped record is stripped to operator speech: no <timestamp> or
     // <user_query> residue in the human lane.
     let wrapped = user_turns[1];
-    assert_eq!(
-        wrapped.text,
-        "!security unlock-keychain -p \"$(pbpaste)\" \"$HOME/Library/Keychains/login.keychain-db\""
-    );
+    assert_eq!(wrapped.text, "!git log --oneline -5");
     assert!(!wrapped.text.contains("<user_query>"));
     assert!(!wrapped.text.contains("<timestamp>"));
 

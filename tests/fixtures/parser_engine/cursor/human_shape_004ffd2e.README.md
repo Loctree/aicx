@@ -1,12 +1,14 @@
 # human_shape_004ffd2e
 
-Bounded projection of Cursor CLI agent transcript `004ffd2e-8b2a-4a41-bd7d-dee9f7df9950`
-(first cursor-agent session on this host, 2026-08-29).
+Bounded, sanitized projection of a Cursor CLI agent transcript
+(first cursor-agent session on the capture host, 2026-08-29).
 
 ## Source (not in repo)
 
-`~/.cursor/projects/Users-polyversai-vibecrafted/agent-transcripts/004ffd2e-8b2a-4a41-bd7d-dee9f7df9950/004ffd2e-8b2a-4a41-bd7d-dee9f7df9950.jsonl`
-(130 lines at capture time).
+`~/.cursor/projects/<project-slug>/agent-transcripts/<session-id>/<session-id>.jsonl`
+(130 lines at capture time). Command payloads and assistant prose were replaced
+with neutral equivalents; the structural shape of each line is preserved
+verbatim from the source session.
 
 ## Shape kept, in source order
 
@@ -15,18 +17,16 @@ Bounded projection of Cursor CLI agent transcript `004ffd2e-8b2a-4a41-bd7d-dee9f
 3. user text with `<timestamp>` + `<user_query>` wrappers — the wrapper
    stripping and timestamp parsing lanes
 4. assistant `text` + `tool_use` in one record (multi-block line)
-5. `{"type":"turn_ended","status":"success"}` control row
+5. assistant `text`-only record
 
-## Derivation (deterministic)
+## Derivation
 
-```bash
-SRC=~/.cursor/projects/Users-polyversai-vibecrafted/agent-transcripts/004ffd2e-8b2a-4a41-bd7d-dee9f7df9950/004ffd2e-8b2a-4a41-bd7d-dee9f7df9950.jsonl
-DST=tests/fixtures/parser_engine/cursor/human_shape_004ffd2e.jsonl
-{ sed -n '1p;2p;5p;6p' "$SRC"; grep -m1 "turn_ended" "$SRC"; } > "$DST"
-```
+Lines 1, 2, 5, 6 and one later assistant record of the source transcript,
+projected in source order, then content-sanitized (structure untouched:
+same block types, same wrappers, same timestamp text).
 
 ## Assertions of record
 
 Live in `crates/aicx-parser/tests/cursor_adapter.rs`
 (`cursor_human_shape_004ffd2e_*`): wrapper-free operator text, parsed RFC 3339
-turn timestamp, `Shell` tool events, `turn_ended` consumed with zero skips.
+turn timestamp, `Shell` tool events, full visible coverage with zero skips.

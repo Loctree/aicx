@@ -55,7 +55,7 @@ External (not copied):
 | a1-01a0369f-multiline-echo-quoted-speakers | count | 1 | expected_fail_until_W2-T7 |
 | cursor-004ffd2e-raw-user-records | count | 2 | hypothesis (frozen from cut/cursor-on-throne) |
 | cursor-004ffd2e-user-only-usermsg | count | 2 | hypothesis (frozen from cut/cursor-on-throne) |
-| cursor-004ffd2e-user-query-unwrap-presence | presence | `!security unlock-keychain` | hypothesis |
+| cursor-004ffd2e-user-query-unwrap-presence | presence | `!git log --oneline -5` | hypothesis |
 | cursor-004ffd2e-conversation-assistant | count | 1 | hypothesis (frozen from cut/cursor-on-throne) |
 
 ## Measurement notes (not status theatre)
