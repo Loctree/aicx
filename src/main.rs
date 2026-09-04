@@ -421,7 +421,9 @@ enum SessionsCommand {
         project: Vec<String>,
 
         /// Filter by agent (claude | codex | cursor | gemini | junie | grok).
-        #[arg(long, value_parser = ["claude", "codex", "cursor", "gemini", "junie", "grok"])]
+        /// `cursor-agent` is accepted as an alias for `cursor`, matching
+        /// `AgentKind::parse` and discovery.
+        #[arg(long, value_parser = ["claude", "codex", "cursor", "cursor-agent", "gemini", "junie", "grok"])]
         agent: Option<String>,
 
         /// Only sessions updated on/after this date (YYYY-MM-DD). Defaults to the

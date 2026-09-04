@@ -2842,4 +2842,51 @@ mod tests {
         assert!(other.is_empty());
         let _ = fs::remove_dir_all(&home);
     }
+
+    #[test]
+    fn discovers_cursor_session_with_wrapper_timestamp_and_prunes() {
+        let root = temp_root("cursor");
+        let session_dir = root
+            .join("users-user-example-project")
+            .join("agent-transcripts")
+            .join("11111111-1111-4111-8111-111111111111");
+        fs::create_dir_all(&session_dir).unwrap();
+        write_session(
+            &session_dir,
+            "11111111-1111-4111-8111-111111111111.jsonl",
+            &[
+                r#"{"role":"user","message":{"content":[{"type":"text","text":"<timestamp>Saturday, Aug 29, 2026, 8:50 AM (UTC+2)</timestamp>\n<user_query>\nhello cursor\n</user_query>"}]}}"#,
+                r#"{"role":"assistant","message":{"content":[{"type":"text","text":"hello operator"}]}}"#,
+                r#"{"type":"turn_ended","status":"success"}"#,
+            ],
+        );
+
+        let sessions = discover_cursor_sessions(&root, None, None);
+        assert_eq!(sessions.len(), 1);
+        let s = &sessions[0];
+        assert_eq!(s.session_id, "11111111-1111-4111-8111-111111111111");
+        assert_eq!(s.agent, "cursor");
+        assert_eq!(s.user_message_count, 1);
+        assert_eq!(s.agent_message_count, 1);
+        assert_eq!(s.association, Association::Inferred);
+        // Wrapper timestamp is the only wall-clock evidence on this transport.
+        assert_eq!(
+            s.started_at.unwrap().to_rfc3339(),
+            "2026-08-29T06:50:00+00:00"
+        );
+
+        // cwd prune happens in ENCODED slug space: a matching cwd keeps the
+        // session, a foreign cwd prunes the whole project dir.
+        let kept = discover_cursor_sessions(&root, None, Some("/users/user/example/project"));
+        assert_eq!(kept.len(), 1);
+        let pruned = discover_cursor_sessions(&root, None, Some("/somewhere/else/entirely"));
+        assert!(pruned.is_empty());
+
+        // modified_after cutoff: a future cutoff excludes the file.
+        let future = SystemTime::now() + std::time::Duration::from_secs(3600);
+        let cut = discover_cursor_sessions(&root, Some(future), None);
+        assert!(cut.is_empty());
+
+        let _ = fs::remove_dir_all(&root);
+    }
 }

@@ -25,6 +25,7 @@ use crate::engine::{
     ordinal_locator, sha256_hex,
 };
 use serde_json::Value;
+use std::collections::HashMap;
 
 pub const CURSOR_ADAPTER_VERSION: &str = "cursor-native-v1";
 
@@ -132,10 +133,16 @@ fn assemble_cursor(
     let session_id = session_id(source);
     let mut state = Assembly::new(read, session_id);
 
+    // Index once by ordinal: transcripts run to thousands of lines and a
+    // per-unit linear scan turns assembly quadratic.
+    let mut by_ordinal: HashMap<u64, &ClassifiedUnit> = HashMap::with_capacity(classified.len());
+    for item in &classified {
+        if matches!(item.level, RawUnitLevel::Physical) {
+            by_ordinal.insert(item.ordinal, item);
+        }
+    }
     for unit in &read.units {
-        let Some(classified_unit) = classified.iter().find(|item| {
-            item.ordinal == unit.coverage_ordinal && matches!(item.level, RawUnitLevel::Physical)
-        }) else {
+        let Some(classified_unit) = by_ordinal.get(&unit.coverage_ordinal).copied() else {
             continue;
         };
         if unit.boundary == UnitBoundary::UnterminatedTail {
@@ -155,6 +162,7 @@ fn assemble_cursor(
         }
     }
 
+    drop(by_ordinal);
     let model = state.finish(classified);
     if model.coverage.status.visible_completeness == VisibleCompleteness::Fatal {
         Ok(UnvalidatedParse::fatal(model.coverage))
@@ -202,25 +210,26 @@ impl<'a> Assembly<'a> {
     }
 
     fn consume_message(&mut self, value: &Value, role: TransportRole, evidence: RawUnitRef) {
+        let ordinal = evidence.coverage_ordinal;
         let Some(blocks) = value
             .get("message")
             .and_then(|message| message.get("content"))
             .and_then(Value::as_array)
         else {
             if value.get("message").is_some() {
-                self.warn(WarningKind::UnsupportedVisibleEvent, 0);
-                self.unsupported_visible = true;
-                self.visible_lost = true;
+                self.lose_visible(ordinal);
             }
             return;
         };
         for block in blocks {
             match block.get("type").and_then(Value::as_str) {
                 Some("text") => {
-                    let text = block
-                        .get("text")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default();
+                    // Fail closed: a text block without a string `text` field is
+                    // a malformed visible shape, not an empty utterance.
+                    let Some(text) = block.get("text").and_then(Value::as_str) else {
+                        self.lose_visible(ordinal);
+                        continue;
+                    };
                     match role {
                         TransportRole::User => self.consume_operator_text(text, evidence.clone()),
                         _ => self.push_classified_frame(
@@ -238,12 +247,18 @@ impl<'a> Assembly<'a> {
                     self.consume_tool_use(block, evidence.clone());
                 }
                 _ => {
-                    self.warn(WarningKind::UnsupportedVisibleEvent, 0);
-                    self.unsupported_visible = true;
-                    self.visible_lost = true;
+                    self.lose_visible(ordinal);
                 }
             }
         }
+    }
+
+    /// Record a lost visible payload honestly: warning at the real ordinal,
+    /// coverage flags flipped, no fabricated turn.
+    fn lose_visible(&mut self, ordinal: u64) {
+        self.warn(WarningKind::UnsupportedVisibleEvent, ordinal);
+        self.unsupported_visible = true;
+        self.visible_lost = true;
     }
 
     fn consume_operator_text(&mut self, text: &str, evidence: RawUnitRef) {
@@ -276,18 +291,21 @@ impl<'a> Assembly<'a> {
     }
 
     fn consume_tool_use(&mut self, block: &Value, evidence: RawUnitRef) {
-        let tool_name = block
-            .get("name")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown_cursor_tool")
-            .to_owned();
+        // Fail closed: a tool_use block without a string `name`, or a Shell
+        // call without a string `command`, is a malformed visible shape.
+        // Account the loss instead of fabricating defaults.
+        let Some(tool_name) = block.get("name").and_then(Value::as_str) else {
+            self.lose_visible(evidence.coverage_ordinal);
+            return;
+        };
+        let tool_name = tool_name.to_owned();
         let input = block.get("input").cloned().unwrap_or(Value::Null);
         let text = if tool_name == "Shell" {
-            input
-                .get("command")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned()
+            let Some(command) = input.get("command").and_then(Value::as_str) else {
+                self.lose_visible(evidence.coverage_ordinal);
+                return;
+            };
+            command.to_owned()
         } else {
             serde_json::to_string(&input).unwrap_or_default()
         };

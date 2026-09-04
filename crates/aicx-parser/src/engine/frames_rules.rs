@@ -133,6 +133,12 @@ const CURSOR_INJECT_TAGS: &[InjectTagRule] = &[
         tag: "system-reminder",
         kind: InjectRuleKind::TransportControl,
     },
+    // Both separator spellings ride the wire; WRAPPER_TAGS in the adapter
+    // accepts both, so both must resolve to transport control here.
+    InjectTagRule {
+        tag: "system_reminder",
+        kind: InjectRuleKind::TransportControl,
+    },
     InjectTagRule {
         tag: "manually_attached_skills",
         kind: InjectRuleKind::AgentInstructions,
