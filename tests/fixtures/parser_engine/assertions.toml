@@ -283,7 +283,7 @@ id = "cursor-wrapped-user-query-unwrap-presence"
 fixture = "tests/fixtures/parser_engine/cursor/human_shape_wrapped.jsonl"
 projection = "extract --conversation --user-only"
 kind = "presence"
-expected = "[REDACTED]"
+expected = "!git log --oneline -5"
 status = "hypothesis"
 note = "Operator speech survives wrapper stripping; a rendered '<user_query>' tag here is the forbidden regression."
 

@@ -55,7 +55,7 @@ External (not copied):
 | a1-01a0369f-multiline-echo-quoted-speakers | count | 1 | expected_fail_until_W2-T7 |
 | cursor-wrapped-raw-user-records | count | 2 | hypothesis (frozen from cut/cursor-on-throne) |
 | cursor-wrapped-user-only-usermsg | count | 2 | hypothesis (frozen from cut/cursor-on-throne) |
-| cursor-wrapped-user-query-unwrap-presence | presence | `[REDACTED]` | hypothesis |
+| cursor-wrapped-user-query-unwrap-presence | presence | `!git log --oneline -5` | hypothesis |
 | cursor-wrapped-conversation-assistant | count | 1 | hypothesis (frozen from cut/cursor-on-throne) |
 
 ## Measurement notes (not status theatre)
