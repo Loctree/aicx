@@ -122,6 +122,8 @@ fn infer_agent(fixture: &str, id: &str) -> Result<&'static str, String> {
         Ok("gemini")
     } else if fixture.contains("/junie/") || id.starts_with("junie-") {
         Ok("junie")
+    } else if fixture.contains("/cursor/") || id.starts_with("cursor-") {
+        Ok("cursor")
     } else if fixture.contains("/codex/")
         || id.starts_with("a1-")
         || id.starts_with("a2-")

@@ -785,7 +785,7 @@ pub struct SteerParams {
     pub run_id: Option<String>,
     /// Filter by prompt_id (exact match against sidecar metadata)
     pub prompt_id: Option<String>,
-    /// Filter by agent name: claude, codex, gemini, junie, grok (case-insensitive)
+    /// Filter by agent name: claude, codex, cursor, gemini, junie, grok (case-insensitive)
     pub agent: Option<String>,
     /// Filter by kind: conversations, plans, reports, other
     pub kind: Option<String>,
@@ -859,7 +859,7 @@ pub struct IntentsParams {
     /// Collapse multiple intents from the same session into one entry with count
     #[serde(default)]
     pub collapse_session: bool,
-    /// Optional agent filter (claude, codex, gemini, junie, grok)
+    /// Optional agent filter (claude, codex, cursor, gemini, junie, grok)
     pub agent: Option<String>,
     /// Optional lower date bound (YYYY-MM-DD or single-day shorthand like 2026-04-23..)
     pub since: Option<String>,
@@ -912,7 +912,7 @@ pub struct SessionsParams {
     pub projects: Option<Vec<String>>,
     /// Project identity matching: `exact` (default) or explicit `fuzzy`.
     pub project_match: Option<String>,
-    /// Filter by agent: claude, codex, gemini, junie, grok.
+    /// Filter by agent: claude, codex, cursor, gemini, junie, grok.
     pub agent: Option<String>,
     /// Hours to look back (default 720 = 30 days, 0 = all time).
     #[serde(default = "mcp_session::default_list_hours")]
