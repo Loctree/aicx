@@ -196,9 +196,26 @@ pub fn extract_agent_sessions(
                 batch
                     .ingested_session_ids
                     .insert(session.model().session_id.clone());
-                batch
-                    .entries
-                    .extend(crate::output::timeline_entries_from_model(session.model()));
+                let mut session_entries =
+                    crate::output::timeline_entries_from_model(session.model());
+                // Transports with no in-band wall clock (cursor without a
+                // harness <timestamp> wrapper) project UNIX_EPOCH entries,
+                // which the cutoff/watermark retain below would delete in
+                // full — a "CompleteVisible parse, zero output" lie. Fall
+                // back to the source file's mtime and say so.
+                if let Some(mtime) =
+                    datetime_from_unix_nanos(source.fingerprint.modified_unix_nanos)
+                {
+                    for entry in &mut session_entries {
+                        if entry.timestamp == DateTime::<Utc>::UNIX_EPOCH
+                            && entry.timestamp_source.as_deref() == Some("unknown")
+                        {
+                            entry.timestamp = mtime;
+                            entry.timestamp_source = Some("file_mtime".to_string());
+                        }
+                    }
+                }
+                batch.entries.extend(session_entries);
             }
             Err(error) => {
                 if first_refusal.is_none() {
@@ -335,6 +352,16 @@ fn session_matches_project_filter(
         .into_iter()
         .chain(segment_cwds)
         .any(|cwd| project_filter_matches_path(cwd, filters))
+}
+
+/// Source-file mtime as a UTC instant; `None` for a zero/overflowed stamp.
+fn datetime_from_unix_nanos(nanos: u128) -> Option<DateTime<Utc>> {
+    if nanos == 0 {
+        return None;
+    }
+    let secs = i64::try_from(nanos / 1_000_000_000).ok()?;
+    let subsec = (nanos % 1_000_000_000) as u32;
+    DateTime::<Utc>::from_timestamp(secs, subsec)
 }
 
 #[cfg(feature = "app")]

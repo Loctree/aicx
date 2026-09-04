@@ -31,6 +31,7 @@ the command:
 
 - `~/.claude/projects`
 - `~/.codex/sessions`
+- `~/.cursor/projects`
 - `~/.gemini/tmp`
 - `~/.grok/sessions`
 - `~/.junie/sessions`
