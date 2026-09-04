@@ -547,7 +547,7 @@ enum SessionsCommand {
         project: Vec<String>,
 
         /// Filter by agent (claude | codex | gemini | junie | grok | kimi | cursor).
-        #[arg(long, value_parser = ["claude", "codex", "gemini", "junie", "grok", "kimi", "cursor"])]
+        #[arg(long, value_parser = ["claude", "codex", "gemini", "junie", "grok", "kimi", "cursor", "cursor-agent"])]
         agent: Option<String>,
 
         /// Only sessions updated on/after this date (YYYY-MM-DD). Defaults to the

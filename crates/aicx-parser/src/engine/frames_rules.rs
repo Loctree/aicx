@@ -114,6 +114,25 @@ const GENERIC_INJECT_TAGS: &[InjectTagRule] = &[InjectTagRule {
     kind: InjectRuleKind::TransportControl,
 }];
 
+// # cursor — harness notifications and skill attachments ride the wire as
+// injected wrappers, never operator speech; both reminder spellings resolve
+// through WRAPPER peeling in the adapter, so only the cursor-specific tags
+// live here on top of the generic system control.
+const CURSOR_INJECT_TAGS: &[InjectTagRule] = &[
+    InjectTagRule {
+        tag: "system",
+        kind: InjectRuleKind::TransportControl,
+    },
+    InjectTagRule {
+        tag: "system_notification",
+        kind: InjectRuleKind::TransportControl,
+    },
+    InjectTagRule {
+        tag: "manually_attached_skills",
+        kind: InjectRuleKind::AgentInstructions,
+    },
+];
+
 // # kimi — the compaction summary is epoch context, never re-emitted speech.
 const KIMI_INJECT_TAGS: &[InjectTagRule] = &[
     InjectTagRule {
@@ -202,7 +221,7 @@ pub const AGENT_FRAME_RULES: &[AgentFrameRules] = &[
         echo_promotion: false,
         klops_guard: &[],
         queue_seal: false,
-        inject_tags: GENERIC_INJECT_TAGS,
+        inject_tags: CURSOR_INJECT_TAGS,
     },
 ];
 
