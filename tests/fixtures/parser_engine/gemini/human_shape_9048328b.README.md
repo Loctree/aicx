@@ -4,12 +4,12 @@ Whole-file copy of Gemini session `9048328b` (150034 bytes, under 200 KiB).
 
 ## Source
 
-`/Users/polyversai/.vibecrafted/artifacts/Loctree/aicx/2026_0827/plans/aicx-one-taxonomy-fusion-260827/inputs/fixtures/gemini/session-2026-06-01T01-46-9048328b.jsonl`
+`~/.vibecrafted/artifacts/Loctree/aicx/2026_0827/plans/aicx-one-taxonomy-fusion-260827/inputs/fixtures/gemini/session-2026-06-01T01-46-9048328b.jsonl`
 
 ## Derivation (deterministic)
 
 ```bash
-SRC=/Users/polyversai/.vibecrafted/artifacts/Loctree/aicx/2026_0827/plans/aicx-one-taxonomy-fusion-260827/inputs/fixtures/gemini/session-2026-06-01T01-46-9048328b.jsonl
+SRC=~/.vibecrafted/artifacts/Loctree/aicx/2026_0827/plans/aicx-one-taxonomy-fusion-260827/inputs/fixtures/gemini/session-2026-06-01T01-46-9048328b.jsonl
 DST=tests/fixtures/parser_engine/gemini/human_shape_9048328b.jsonl
 cp -p "$SRC" "$DST"
 ```
