@@ -91,6 +91,28 @@ fn cursor_session_is_discovered_via_alias_and_extracts_real_output() {
         "canonical cursor listing must include the session, got:\n{canonical_stdout}"
     );
 
+    // Project filter on a HYPHENATED repo name: the cursor slug is lossy
+    // (`users-user-example-project` decodes to `/users/user/example/project`),
+    // so this only works through ENCODED-space matching.
+    let filtered = run_aicx(
+        &home,
+        &[
+            "sessions",
+            "list",
+            "--agent",
+            "cursor",
+            "--project",
+            "/example-project",
+            "--all",
+        ],
+    );
+    let filtered_stdout = String::from_utf8_lossy(&filtered.stdout);
+    assert!(
+        filtered_stdout.contains(SESSION_ID) || filtered_stdout.contains(&SESSION_ID[..8]),
+        "hyphenated --project filter must match the cursor session, got:\nstdout={filtered_stdout}\nstderr={}",
+        String::from_utf8_lossy(&filtered.stderr)
+    );
+
     // Extraction through the production path: wrapperless transcript must
     // still produce conversation output (file mtime is the fallback clock).
     let out_path = home.join("out").join("cursor_e2e_conversation.md");
