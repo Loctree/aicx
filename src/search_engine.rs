@@ -2681,6 +2681,7 @@ fn semantic_quality_score(query: &str, result: &FuzzyResult) -> u8 {
         .filter(|term| term.len() >= 3)
         .collect();
     let mut full_query_coverage = false;
+    let mut matched_terms_count = 0usize;
     let haystack = semantic_result_haystack(result);
     let anchors = query_anchors(&normalized_query);
     if !normalized_query.is_empty() && haystack.contains(&normalized_query) {
@@ -2708,6 +2709,7 @@ fn semantic_quality_score(query: &str, result: &FuzzyResult) -> u8 {
                         && haystack.contains(&term.chars().take(5).collect::<String>()))
             })
             .count();
+        matched_terms_count = matched_terms;
         full_query_coverage = matched_terms >= 2 && matched_terms == query_terms.len();
         score += (matched_terms.saturating_mul(3).min(12)) as i16;
         if lexical && matched_terms >= 2 {
@@ -2745,6 +2747,15 @@ fn semantic_quality_score(query: &str, result: &FuzzyResult) -> u8 {
     // `--score 70` threshold without being mislabeled as a decision.
     if evidence_class == LexicalEvidenceClass::Substantive && full_query_coverage {
         calibrated.max(70)
+    } else if evidence_class == LexicalEvidenceClass::Substantive
+        && matched_terms_count >= 2
+        && answer_delta >= 8
+    {
+        // An agent reply that actually explains the subject (causal answer
+        // markers, real length) must be able to clear the operator's common
+        // `--score 60` threshold even without a decision marker — otherwise
+        // any shouted header outranks the best genuine answer forever.
+        calibrated.max(65)
     } else {
         calibrated
     }

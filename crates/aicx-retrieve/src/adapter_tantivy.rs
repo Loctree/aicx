@@ -776,20 +776,59 @@ fn has_explicit_marker(candidate: &str, normalized: &str) -> bool {
     ]
     .iter()
     .any(|marker| normalized.contains(marker))
-        || candidate
-            .split_whitespace()
-            .take(3)
-            .filter(|token| {
-                let token = trim_subject_token(token);
-                token.len() >= 3
-                    && token.chars().any(|ch| ch.is_ascii_alphabetic())
-                    && token
-                        .chars()
-                        .filter(|ch| ch.is_ascii_alphabetic())
-                        .all(|ch| ch.is_ascii_uppercase())
-            })
-            .count()
-            >= 2
+        || caps_header_is_invariant(candidate)
+}
+
+/// ALL-CAPS header lane of the explicit-marker gate. A shouted prefix is only
+/// an invariant when it is header-shaped (the caps run ends with `:`) AND none
+/// of the caps tokens is generic process chatter — "FINAL ACTIVE REQUEST:" is
+/// a request, "TODO NOTE" is a reminder; neither is durable doctrine. This
+/// lane previously fired on ANY two caps tokens, which pushed request/status
+/// headers into the 85–95 invariant band above real answers.
+fn caps_header_is_invariant(candidate: &str) -> bool {
+    const GENERIC_CAPS: &[&str] = &[
+        "REQUEST",
+        "TODO",
+        "FIXME",
+        "NOTE",
+        "NOTES",
+        "WARNING",
+        "STATUS",
+        "UPDATE",
+        "WIP",
+        "ASAP",
+        "FINAL",
+        "ACTIVE",
+        "IMPORTANT",
+        "URGENT",
+    ];
+    let head: Vec<&str> = candidate.split_whitespace().take(3).collect();
+    let caps: Vec<&str> = head
+        .iter()
+        .copied()
+        .take_while(|token| {
+            let trimmed = trim_subject_token(token);
+            trimmed.len() >= 3
+                && trimmed.chars().any(|ch| ch.is_ascii_alphabetic())
+                && trimmed
+                    .chars()
+                    .filter(|ch| ch.is_ascii_alphabetic())
+                    .all(|ch| ch.is_ascii_uppercase())
+        })
+        .collect();
+    if caps.len() < 2 {
+        return false;
+    }
+    let header_shaped = caps
+        .last()
+        .is_some_and(|token| token.trim_end_matches(['*', '_', '`']).ends_with(':'));
+    header_shaped
+        && !caps.iter().any(|token| {
+            let word = trim_subject_token(token)
+                .trim_end_matches(':')
+                .to_ascii_uppercase();
+            GENERIC_CAPS.contains(&word.as_str())
+        })
 }
 
 fn has_strong_decision_language(normalized: &str) -> bool {
@@ -1854,6 +1893,36 @@ mod swap_tests {
             classify_lexical_evidence("This must remain fast and reliable for operators."),
             LexicalEvidenceClass::Substantive,
             "bare modal language without a concrete subject is not a decision"
+        );
+    }
+
+    #[test]
+    fn caps_request_headers_are_not_invariants() {
+        // Live regression (operator query 2026-09-05): a shouted request
+        // header scored 91 while the actual causal answer scored 46.
+        assert_ne!(
+            classify_lexical_evidence(
+                "**FINAL ACTIVE REQUEST**: \"dobra - to w tym duchu napisz /vc-scaffold dla aicx\""
+            ),
+            LexicalEvidenceClass::ExplicitInvariant,
+            "a request header is not durable doctrine"
+        );
+        assert_ne!(
+            classify_lexical_evidence("TODO NOTE: rewrite the cursor adapter warning lane"),
+            LexicalEvidenceClass::ExplicitInvariant
+        );
+        // Caps headers without the `:` header shape are not invariants either.
+        assert_ne!(
+            classify_lexical_evidence("FINAL VERDICT pending for aicx-parser gates"),
+            LexicalEvidenceClass::ExplicitInvariant
+        );
+        // A header-shaped caps run with a concrete subject and no generic
+        // chatter still qualifies.
+        assert_eq!(
+            classify_lexical_evidence(
+                "ONE TAXONOMY: every adapter hands frames to engine::frames::classify"
+            ),
+            LexicalEvidenceClass::ExplicitInvariant
         );
     }
 
