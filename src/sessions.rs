@@ -222,10 +222,28 @@ fn project_label_from_cwd(cwd: &str) -> Option<String> {
     if let Some(label) = repo_label_from_disk(Path::new(cwd)) {
         return Some(label);
     }
+    if let Some(label) = worktree_layout_label(cwd) {
+        return Some(label);
+    }
     cwd.trim_end_matches(['/', '\\'])
         .rsplit(['/', '\\'])
         .find(|seg| !seg.is_empty())
         .map(str::to_string)
+}
+
+/// Path-shape fallback for cwds that do not exist on this host (sessions
+/// synced from another machine): the fleet worktree layout is
+/// `…/<repo>/<stamp>/worktrees/<task-dir>`, so a `worktrees` segment means
+/// the task dir is NOT the project. Label with the nearest preceding segment
+/// that does not look like a date stamp (leading digit).
+fn worktree_layout_label(cwd: &str) -> Option<String> {
+    let segments: Vec<&str> = cwd.split(['/', '\\']).filter(|s| !s.is_empty()).collect();
+    let worktrees_at = segments.iter().rposition(|s| *s == "worktrees")?;
+    segments[..worktrees_at]
+        .iter()
+        .rev()
+        .find(|s| !s.chars().next().is_some_and(|c| c.is_ascii_digit()))
+        .map(|s| (*s).to_string())
 }
 
 /// Walk up from an existing cwd to the first `.git` entry. A `.git`
@@ -2969,6 +2987,18 @@ mod tests {
         assert_eq!(
             project_label_from_cwd("/no/such/dir/lastseg"),
             Some("lastseg".to_string())
+        );
+        // Nonexistent fleet-worktree paths (sessions synced from another
+        // machine) label as the repo, skipping the date-stamp segment.
+        assert_eq!(
+            project_label_from_cwd(
+                "/Users/user/vc-workspace/vetcoders/codescribe/2026_0904/worktrees/W3-T6-window-mechanics"
+            ),
+            Some("codescribe".to_string())
+        );
+        assert_eq!(
+            project_label_from_cwd("/no/such/repo/worktrees/task-dir"),
+            Some("repo".to_string())
         );
         let _ = fs::remove_dir_all(&root);
     }
