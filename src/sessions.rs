@@ -219,10 +219,49 @@ fn grok_dir_matches_cwd(encoded_dir_name: &str, want: &str) -> bool {
 /// it is `\`-separated (e.g. `C:\Users\x\Compass`) and a `/`-only split would
 /// return the whole path as the "label" instead of the trailing segment.
 fn project_label_from_cwd(cwd: &str) -> Option<String> {
+    if let Some(label) = repo_label_from_disk(Path::new(cwd)) {
+        return Some(label);
+    }
     cwd.trim_end_matches(['/', '\\'])
         .rsplit(['/', '\\'])
         .find(|seg| !seg.is_empty())
         .map(str::to_string)
+}
+
+/// Walk up from an existing cwd to the first `.git` entry. A `.git`
+/// directory names the repo directly (a session cwd deep inside a repo used
+/// to be labeled with the subdirectory name); a `.git` FILE is a linked
+/// worktree marker whose `gitdir:` points into `<main>/.git/worktrees/<id>`
+/// — the session belongs to `<main>`, not to the worktree directory.
+/// Filesystem-only, bounded, no subprocess; `None` when the path does not
+/// exist locally (lossy decoded paths fall back to the last segment).
+fn repo_label_from_disk(start: &Path) -> Option<String> {
+    if !start.is_dir() {
+        return None;
+    }
+    let mut dir = start;
+    for _ in 0..64 {
+        let git = dir.join(".git");
+        if git.is_dir() {
+            return dir.file_name()?.to_str().map(str::to_string);
+        }
+        if git.is_file() {
+            let content = fs::read_to_string(&git).ok()?;
+            let gitdir_raw = content.strip_prefix("gitdir:")?.lines().next()?.trim();
+            let gitdir = if Path::new(gitdir_raw).is_absolute() {
+                PathBuf::from(gitdir_raw)
+            } else {
+                dir.join(gitdir_raw)
+            };
+            let main = gitdir
+                .ancestors()
+                .find(|a| a.file_name().is_some_and(|n| n == ".git"))
+                .and_then(Path::parent)?;
+            return main.file_name()?.to_str().map(str::to_string);
+        }
+        dir = dir.parent()?;
+    }
+    None
 }
 
 /// Discover Claude Code sessions under a `projects` root
@@ -1242,7 +1281,7 @@ pub fn discover_cursor_sessions(
 /// non-alphanumeric characters collapses to one `-`, edges trimmed
 /// (`/Users/x/.vibecrafted` → `Users-x-vibecrafted`). Used for ENCODED-space
 /// cwd pruning; decoding stays lossy inference.
-fn encode_cursor_project_slug(path: &str) -> String {
+pub(crate) fn encode_cursor_project_slug(path: &str) -> String {
     let mut out = String::new();
     let mut last_was_dash = true;
     for ch in path.chars() {
@@ -1255,6 +1294,32 @@ fn encode_cursor_project_slug(path: &str) -> String {
         }
     }
     out.trim_end_matches('-').to_string()
+}
+
+/// ENCODED-space repo-name containment for cursor-inferred paths: does the
+/// encoded form of `path` carry the encoded `repo` name on `-` boundaries?
+/// The slug is lossy (a hyphenated repo name decodes into path segments), so
+/// decoded-space label/path comparisons can never re-find `mlx-batch-server`
+/// — this is the only honest way to match a project filter against it.
+#[cfg(any(feature = "app", test))]
+pub(crate) fn encoded_slug_contains_repo(path: &str, repo: &str) -> bool {
+    let hay = encode_cursor_project_slug(path);
+    let want = encode_cursor_project_slug(repo);
+    if want.is_empty() {
+        return false;
+    }
+    let mut start = 0;
+    while let Some(pos) = hay[start..].find(&want) {
+        let begin = start + pos;
+        let end = begin + want.len();
+        let left_ok = begin == 0 || hay.as_bytes()[begin - 1] == b'-';
+        let right_ok = end == hay.len() || hay.as_bytes()[end] == b'-';
+        if left_ok && right_ok {
+            return true;
+        }
+        start = begin + 1;
+    }
+    false
 }
 
 /// Lossy slug → cwd inference (`Users-x-vibecrafted` → `/Users/x/vibecrafted`).
@@ -2873,6 +2938,56 @@ mod tests {
         );
         assert!(other.is_empty());
         let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn project_label_resolves_worktrees_and_subdirs_to_the_main_repo() {
+        let root = temp_root("wtlabel");
+        let main = root.join("myrepo");
+        fs::create_dir_all(main.join(".git").join("worktrees").join("W3-T6")).unwrap();
+        let wt = root.join("wt").join("W3-T6-window-mechanics");
+        fs::create_dir_all(&wt).unwrap();
+        fs::write(
+            wt.join(".git"),
+            format!("gitdir: {}\n", main.join(".git/worktrees/W3-T6").display()),
+        )
+        .unwrap();
+        let sub = main.join("src").join("nested");
+        fs::create_dir_all(&sub).unwrap();
+
+        // Linked worktree cwd labels as the MAIN repo, not the worktree dir.
+        assert_eq!(
+            project_label_from_cwd(&wt.to_string_lossy()),
+            Some("myrepo".to_string())
+        );
+        // A cwd deep inside the repo labels as the repo, not the subdir.
+        assert_eq!(
+            project_label_from_cwd(&sub.to_string_lossy()),
+            Some("myrepo".to_string())
+        );
+        // Nonexistent paths keep the last-segment fallback.
+        assert_eq!(
+            project_label_from_cwd("/no/such/dir/lastseg"),
+            Some("lastseg".to_string())
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn encoded_slug_matching_refinds_hyphenated_repo_names() {
+        // The decoded path lost the hyphens ("/users/x/libraxis/mlx/batch/server");
+        // only ENCODED-space containment can re-find the repo name.
+        let decoded = "/users/x/libraxis/mlx/batch/server";
+        assert!(encoded_slug_contains_repo(decoded, "mlx-batch-server"));
+        assert!(encoded_slug_contains_repo(decoded, "libraxis"));
+        assert!(!encoded_slug_contains_repo(decoded, "batch-server-extra"));
+        assert!(!encoded_slug_contains_repo(decoded, "atch-server"));
+        assert!(!encoded_slug_contains_repo(decoded, ""));
+        // Deep worktree path: repo name sits mid-slug, still on boundaries.
+        assert!(encoded_slug_contains_repo(
+            "/volumes/vc/workspace/mtplx/engine/2026/worktrees/runner",
+            "mtplx-engine"
+        ));
     }
 
     #[test]
