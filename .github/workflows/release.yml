@@ -1,12 +1,18 @@
 name: Release
 
-# DOCTRINE EXCEPTION (operator decision, 2026-09-02): the standing order of
-# 2026-08-02 bans self-hosted runners from public-repo jobs (free hosted
-# runners + fork-PR code execution risk). release.yml is the one sanctioned
-# exception: it triggers only on tag push / manual dispatch — never on
-# pull_request, so foreign fork code cannot reach these runners — and the
-# GPG release-signing keys stay on operator hardware instead of GitHub
-# secrets. Every other workflow in this repo runs on GitHub-hosted runners.
+# EXCEPTION RETIRED (operator decision, 2026-09-05): release builds moved to
+# GitHub-hosted runners. Signing material comes from ORGANIZATION secrets
+# shared across Loctree repos (aicx, loctree):
+#   secrets.LOCTREE_GPG_PRIVATE_KEY        armored GPG secret key
+#   secrets.LOCTREE_GPG_PASSPHRASE         passphrase for that key
+#   secrets.LOCTREE_MACOS_CERT_P12_BASE64  Developer ID Application .p12, base64
+#   secrets.LOCTREE_MACOS_CERT_PASSWORD    password for the .p12
+#   secrets.LOCTREE_MACOS_SIGNING_IDENTITY full identity string
+#   secrets.LOCTREE_NOTARY_APPLE_ID / _TEAM_ID / _PASSWORD  notarytool auth
+#   vars.LOCTREE_GPG_KEY_ID                public key id (not secret)
+# Each job materializes $HOME/.keys in exactly the shape release_bundle.sh
+# expects, so the tooling contract is unchanged. Triggers stay tag push /
+# manual dispatch only — fork PRs never reach these jobs or secrets.
 
 on:
   push:
@@ -174,19 +180,19 @@ jobs:
   build:
     name: Build ${{ matrix.target }} on ${{ matrix.runner_name }}
     needs: verify
-    runs-on: ${{ fromJSON(matrix.runner) }}
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - runner_name: ops-linux
-            runner: '["self-hosted","ops-linux"]'
+          - runner_name: linux-x64
+            runner: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-          - runner_name: dragon-macos
-            runner: '["self-hosted","dragon-macos"]'
+          - runner_name: macos-arm64
+            runner: macos-15
             target: aarch64-apple-darwin
-          - runner_name: windows-pc
-            runner: '["self-hosted","windows-pc"]'
+          - runner_name: windows-x64
+            runner: windows-latest
             target: x86_64-pc-windows-msvc
 
     steps:
@@ -204,12 +210,12 @@ jobs:
 
       - name: Install protoc
         # Manual install — see ci.yml for rationale (arduino/setup-protoc#108).
-        # Skipped on windows-pc: the slim Windows bundle builds default
+        # Skipped on Windows: the slim Windows bundle builds default
         # features only (no `lance`), so rust-memex/grpc — the sole protoc
         # consumer — is never compiled. Running it on Windows previously hit
         # the `else` branch and exited 1, blocking the Windows leg before the
         # build even started.
-        if: matrix.runner_name != 'windows-pc'
+        if: matrix.runner_name != 'windows-x64'
         shell: bash
         run: |
           if command -v protoc >/dev/null 2>&1; then
@@ -232,16 +238,61 @@ jobs:
           targets: ${{ matrix.target }}
 
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
-        # ops-linux needs it for cargo-zigbuild; windows-pc has no system
-        # Python 3.11+ visible from Git-bash and release_bundle.sh needs
-        # stdlib tomllib — the Windows leg of run 33598292973 died on the
-        # probe before the build started, skipping Publish.
-        if: matrix.runner_name == 'ops-linux' || matrix.runner_name == 'windows-pc'
+        # Linux needs it for cargo-zigbuild; on Windows release_bundle.sh
+        # needs a Python 3.11+ with stdlib tomllib visible from Git-bash.
+        if: matrix.runner_name == 'linux-x64' || matrix.runner_name == 'windows-x64'
         with:
           python-version: '3.12'
 
+      - name: Materialize signing keys from organization secrets
+        shell: bash
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.LOCTREE_GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.LOCTREE_GPG_PASSPHRASE }}
+          MACOS_CERT_P12_BASE64: ${{ secrets.LOCTREE_MACOS_CERT_P12_BASE64 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.LOCTREE_MACOS_CERT_PASSWORD }}
+          MACOS_SIGNING_IDENTITY: ${{ secrets.LOCTREE_MACOS_SIGNING_IDENTITY }}
+          NOTARY_APPLE_ID: ${{ secrets.LOCTREE_NOTARY_APPLE_ID }}
+          NOTARY_TEAM_ID: ${{ secrets.LOCTREE_NOTARY_TEAM_ID }}
+          NOTARY_PASSWORD: ${{ secrets.LOCTREE_NOTARY_PASSWORD }}
+          RUNNER_NAME: ${{ matrix.runner_name }}
+        run: |
+          # $HOME/.keys in exactly the shape tools/release_bundle.sh expects —
+          # the script contract stays identical to an operator-machine run.
+          if [[ -z "${GPG_PRIVATE_KEY}" || -z "${GPG_PASSPHRASE}" ]]; then
+            echo "::error::LOCTREE_GPG_PRIVATE_KEY / LOCTREE_GPG_PASSPHRASE org secrets are not visible to this repo — releases are never unsigned." >&2
+            exit 1
+          fi
+          mkdir -p "${HOME}/.keys"
+          chmod 700 "${HOME}/.keys"
+          printf '%s' "${GPG_PASSPHRASE}" > "${HOME}/.keys/.gpg.passphrase"
+          chmod 600 "${HOME}/.keys/.gpg.passphrase"
+          printf '%s\n' "${GPG_PRIVATE_KEY}" | gpg --batch --import
+          if [[ "${RUNNER_NAME}" == "macos-arm64" ]]; then
+            for pair in "LOCTREE_MACOS_CERT_P12_BASE64:${MACOS_CERT_P12_BASE64}" \
+                        "LOCTREE_MACOS_CERT_PASSWORD:${MACOS_CERT_PASSWORD}" \
+                        "LOCTREE_MACOS_SIGNING_IDENTITY:${MACOS_SIGNING_IDENTITY}" \
+                        "LOCTREE_NOTARY_APPLE_ID:${NOTARY_APPLE_ID}" \
+                        "LOCTREE_NOTARY_TEAM_ID:${NOTARY_TEAM_ID}" \
+                        "LOCTREE_NOTARY_PASSWORD:${NOTARY_PASSWORD}"; do
+              if [[ -z "${pair#*:}" ]]; then
+                echo "::error::org secret ${pair%%:*} is not visible to this repo — cannot codesign/notarize the macOS bundle." >&2
+                exit 1
+              fi
+            done
+            printf '%s' "${MACOS_CERT_P12_BASE64}" | base64 -d > "${HOME}/.keys/Certificates.p12"
+            printf '%s\n' "${MACOS_CERT_PASSWORD}" > "${HOME}/.keys/cert_password.txt"
+            printf '%s\n' "${MACOS_SIGNING_IDENTITY}" > "${HOME}/.keys/signing-identity.txt"
+            {
+              printf 'NOTARY_APPLE_ID=%s\n' "${NOTARY_APPLE_ID}"
+              printf 'NOTARY_TEAM_ID=%s\n' "${NOTARY_TEAM_ID}"
+              printf 'NOTARY_PASSWORD=%s\n' "${NOTARY_PASSWORD}"
+            } > "${HOME}/.keys/.notary.env"
+            chmod 600 "${HOME}/.keys"/*
+          fi
+
       - name: Install pinned glibc-floor build tool
-        if: matrix.runner_name == 'ops-linux'
+        if: matrix.runner_name == 'linux-x64'
         shell: bash
         run: |
           python3 -m pip install --disable-pip-version-check cargo-zigbuild==0.23.0
@@ -250,8 +301,8 @@ jobs:
           # not fail before the actual glibc-floor build starts.
           cargo zigbuild --help >/dev/null
 
-      - name: Build signed + notarized macOS bundle (dragon-macos)
-        if: matrix.runner_name == 'dragon-macos'
+      - name: Build signed + notarized macOS bundle (macos-arm64)
+        if: matrix.runner_name == 'macos-arm64'
         shell: bash
         working-directory: aicx
         env:
@@ -262,11 +313,11 @@ jobs:
           PACKAGE_NAME: ${{ env.PACKAGE_NAME }}
           LOCTREE_GPG_KEY_ID: ${{ vars.LOCTREE_GPG_KEY_ID }}
         run: |
-          # KEYS dir + .notary.env live on the signing runner under $HOME/.keys.
+          # KEYS dir + .notary.env materialized from org secrets above.
           KEYS="$HOME/.keys" ./tools/release_bundle.sh
 
-      - name: Build binaries-only release (ops-linux, GPG-detached)
-        if: matrix.runner_name == 'ops-linux'
+      - name: Build binaries-only release (linux-x64, GPG-detached)
+        if: matrix.runner_name == 'linux-x64'
         shell: bash
         working-directory: aicx
         env:
@@ -282,42 +333,29 @@ jobs:
         run: |
           ./tools/release_bundle.sh
 
-      - name: Build binaries-only release (windows-pc, GPG-detached .zip)
-        if: matrix.runner_name == 'windows-pc'
-        # Plain `shell: bash`. The runner host PATH puts Git for Windows
-        # (`C:\Program Files\Git\bin`) ahead of System32, so `bash` resolves to
-        # Git Bash, not the WSL stub. A custom absolute-path `shell:` with `{0}`
-        # made the runner throw "Second path fragment must not be a drive or UNC
-        # name" before the script ran; `shell: bash` avoids that path-combine.
+      - name: Build binaries-only release (windows-x64, GPG-detached .zip)
+        if: matrix.runner_name == 'windows-x64'
         shell: bash
         env:
           TARGET: ${{ matrix.target }}
           DIST_DIR: ${{ github.workspace }}/aicx/dist
           AICX_RELEASE_BUNDLE_ONLY_BINARIES: "1"
           AICX_BUNDLE_FLAVOR: slim
-          # Windows release runners have no LLVM, so drop the default
-          # `native-embedder` feature (it pulls llama-cpp-sys -> bindgen ->
-          # libclang). The slim Windows binary keeps the cloud embedder; in-process
-          # GGUF stays a Unix/native-runner capability.
+          # The slim Windows leg drops the default `native-embedder` feature
+          # (it pulls llama-cpp-sys -> bindgen -> libclang). The slim Windows
+          # binary keeps the cloud embedder; in-process GGUF stays a
+          # Unix/native capability.
           NO_DEFAULT_FEATURES: "1"
           FEATURES: app,cloud-embedder
-          # windows-pc is the operator's lower-resource self-hosted machine.
-          # Serialize compilation and disable cross-crate LTO for this target:
-          # full LTO still puts the entire final aicx link in one rustc process
-          # and exhausted the host even with CARGO_BUILD_JOBS=1. opt-level=3
-          # and stripping remain inherited from [profile.release]. The hosted
-          # exact-main Windows gate proves the same MSVC source independently.
-          CARGO_BUILD_JOBS: "1"
+          # LTO stays off on this target for artifact parity with every
+          # published Windows slim build to date; opt-level=3 and stripping
+          # remain inherited from [profile.release].
           CARGO_PROFILE_RELEASE_LTO: "false"
           AICX_CLEAN_AFTER_BUILD: "0"
           PACKAGE_NAME: ${{ env.PACKAGE_NAME }}
           LOCTREE_GPG_KEY_ID: ${{ vars.LOCTREE_GPG_KEY_ID }}
         run: |
           cd "$GITHUB_WORKSPACE/aicx"
-          # Prepend GnuPG to PATH without clobbering the runner's real PATH.
-          # (Strawberry Perl /c/Strawberry/c/bin was only needed for the old
-          # MinGW/gnu target; the runner now builds the native msvc target.)
-          export PATH="/c/Program Files (x86)/GnuPG/bin:$PATH"
           ./tools/release_bundle.sh
 
       - name: Smoke extracted release archive
@@ -339,9 +377,8 @@ jobs:
           archive="${archives[0]}"
           case "${archive}" in
             *.tar.gz) tar -xzf "${archive}" -C "${smoke_dir}" ;;
-            # Git Bash on the self-hosted signing machine provides GNU tar,
-            # which cannot extract zip files (hosted Windows happens to find
-            # bsdtar first). Python 3.11+ is already a hard requirement of the
+            # Git Bash can resolve GNU tar first, which cannot extract zip
+            # files. Python 3.11+ is already a hard requirement of the
             # Windows bundle step, so use its portable stdlib zip reader there.
             # macOS has bsdtar but no guaranteed `python` alias; retain tar.
             *.zip)
@@ -394,9 +431,8 @@ jobs:
           DIST_DIR: ${{ github.workspace }}/aicx/dist
           LOCTREE_GPG_KEY_ID: ${{ vars.LOCTREE_GPG_KEY_ID }}
         run: |
-          # Idempotent: a previous successful run leaves cargo-deb installed on
-          # this self-hosted runner, and `cargo install` errors with "binary
-          # already exists". Only install when it is missing.
+          # Idempotent: only install cargo-deb when missing ("binary already
+          # exists" would fail the step on a warm runner image).
           command -v cargo-deb >/dev/null 2>&1 \
             || cargo install --quiet cargo-deb --locked \
             || cargo install --quiet cargo-deb
@@ -441,24 +477,40 @@ jobs:
             aicx/dist/*.deb.asc
           if-no-files-found: error
 
-      - name: Clean local build artifacts
+      - name: Clean local build artifacts and key material
         if: always()
         shell: bash
         working-directory: aicx
         run: |
           cargo clean --target "${{ matrix.target }}" || true
           rm -rf dist
+          rm -rf "${HOME}/.keys"
 
   github-release:
     name: Publish GitHub Release
     needs: [verify, build]
-    runs-on: [self-hosted, ops-linux]
+    runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           fetch-depth: 0
           ref: ${{ needs.verify.outputs.release_tag }}
+
+      - name: Materialize GPG release key from organization secrets
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.LOCTREE_GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.LOCTREE_GPG_PASSPHRASE }}
+        run: |
+          if [[ -z "${GPG_PRIVATE_KEY}" || -z "${GPG_PASSPHRASE}" ]]; then
+            echo "::error::LOCTREE_GPG_PRIVATE_KEY / LOCTREE_GPG_PASSPHRASE org secrets are not visible to this repo — releases are never unsigned." >&2
+            exit 1
+          fi
+          mkdir -p "${HOME}/.keys"
+          chmod 700 "${HOME}/.keys"
+          printf '%s' "${GPG_PASSPHRASE}" > "${HOME}/.keys/.gpg.passphrase"
+          chmod 600 "${HOME}/.keys/.gpg.passphrase"
+          printf '%s\n' "${GPG_PRIVATE_KEY}" | gpg --batch --import
 
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
@@ -535,8 +587,9 @@ jobs:
             gh release create "${RELEASE_TAG}" "${assets[@]}" --notes-file "${RELEASE_NOTES_PATH}"
           fi
 
-      - name: Clean downloaded release artifacts
+      - name: Clean downloaded release artifacts and key material
         if: always()
         run: |
           rm -rf dist
           rm -f "${RUNNER_TEMP}/release-notes.md"
+          rm -rf "${HOME}/.keys"
