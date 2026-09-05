@@ -129,6 +129,7 @@ pub fn extract_agent_sessions(
     let root = match agent {
         crate::session_catalog::AgentKind::Claude => home.join(".claude").join("projects"),
         crate::session_catalog::AgentKind::Codex => home.join(".codex").join("sessions"),
+        crate::session_catalog::AgentKind::Cursor => home.join(".cursor").join("projects"),
         crate::session_catalog::AgentKind::Gemini => home.join(".gemini").join("tmp"),
         crate::session_catalog::AgentKind::Grok => home.join(".grok"),
         crate::session_catalog::AgentKind::Junie => home.join(".junie").join("sessions"),
@@ -195,9 +196,26 @@ pub fn extract_agent_sessions(
                 batch
                     .ingested_session_ids
                     .insert(session.model().session_id.clone());
-                batch
-                    .entries
-                    .extend(crate::output::timeline_entries_from_model(session.model()));
+                let mut session_entries =
+                    crate::output::timeline_entries_from_model(session.model());
+                // Transports with no in-band wall clock (cursor without a
+                // harness <timestamp> wrapper) project UNIX_EPOCH entries,
+                // which the cutoff/watermark retain below would delete in
+                // full — a "CompleteVisible parse, zero output" lie. Fall
+                // back to the source file's mtime and say so.
+                if let Some(mtime) =
+                    datetime_from_unix_nanos(source.fingerprint.modified_unix_nanos)
+                {
+                    for entry in &mut session_entries {
+                        if entry.timestamp == DateTime::<Utc>::UNIX_EPOCH
+                            && entry.timestamp_source.as_deref() == Some("unknown")
+                        {
+                            entry.timestamp = mtime;
+                            entry.timestamp_source = Some("file_mtime".to_string());
+                        }
+                    }
+                }
+                batch.entries.extend(session_entries);
             }
             Err(error) => {
                 if first_refusal.is_none() {
@@ -336,6 +354,16 @@ fn session_matches_project_filter(
         .any(|cwd| project_filter_matches_path(cwd, filters))
 }
 
+/// Source-file mtime as a UTC instant; `None` for a zero/overflowed stamp.
+fn datetime_from_unix_nanos(nanos: u128) -> Option<DateTime<Utc>> {
+    if nanos == 0 {
+        return None;
+    }
+    let secs = i64::try_from(nanos / 1_000_000_000).ok()?;
+    let subsec = (nanos % 1_000_000_000) as u32;
+    DateTime::<Utc>::from_timestamp(secs, subsec)
+}
+
 #[cfg(feature = "app")]
 fn source_is_selected(modified_unix_nanos: u128, config: &ExtractionConfig) -> bool {
     let lower_bound = config.watermark.unwrap_or(config.cutoff);
@@ -370,6 +398,7 @@ const fn parser_agent(agent: crate::session_catalog::AgentKind) -> aicx_parser::
     match agent {
         crate::session_catalog::AgentKind::Claude => aicx_parser::engine::AgentKind::Claude,
         crate::session_catalog::AgentKind::Codex => aicx_parser::engine::AgentKind::Codex,
+        crate::session_catalog::AgentKind::Cursor => aicx_parser::engine::AgentKind::Cursor,
         crate::session_catalog::AgentKind::Gemini => aicx_parser::engine::AgentKind::Gemini,
         crate::session_catalog::AgentKind::Grok => aicx_parser::engine::AgentKind::Grok,
         crate::session_catalog::AgentKind::Junie => aicx_parser::engine::AgentKind::Junie,

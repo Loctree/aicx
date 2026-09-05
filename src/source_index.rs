@@ -973,6 +973,7 @@ fn parse_catalog_source_checked(
     let agent = match entry.agent.as_str() {
         "claude" => aicx_parser::engine::AgentKind::Claude,
         "codex" => aicx_parser::engine::AgentKind::Codex,
+        "cursor" => aicx_parser::engine::AgentKind::Cursor,
         "gemini" => aicx_parser::engine::AgentKind::Gemini,
         "grok" => aicx_parser::engine::AgentKind::Grok,
         "junie" => aicx_parser::engine::AgentKind::Junie,

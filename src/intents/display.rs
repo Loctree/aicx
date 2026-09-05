@@ -284,7 +284,10 @@ pub fn apply_display_filters_with_completeness(
     }
 
     if let Some(agent_filter) = &filters.agent {
-        records.retain(|r| &r.agent == agent_filter);
+        let want = aicx_parser::engine::AgentKind::parse(agent_filter)
+            .map(|kind| kind.as_str().to_owned())
+            .unwrap_or_else(|| agent_filter.clone());
+        records.retain(|r| r.agent == want);
     }
 
     if filters.date_lo.is_some() || filters.date_hi.is_some() {

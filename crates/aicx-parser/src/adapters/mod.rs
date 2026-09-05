@@ -2,12 +2,14 @@
 
 pub mod claude;
 pub mod codex;
+pub mod cursor;
 pub mod gemini;
 pub mod grok;
 pub mod junie;
 
 pub use claude::ClaudeAdapter;
 pub use codex::CodexAdapter;
+pub use cursor::CursorAdapter;
 pub use gemini::GeminiAdapter;
 pub use grok::GrokAdapter;
 pub use junie::JunieAdapter;
@@ -79,6 +81,7 @@ pub trait AgentAdapter: sealed::Sealed + Send + Sync {
 
 static CODEX: CodexAdapter = CodexAdapter;
 static CLAUDE: ClaudeAdapter = ClaudeAdapter;
+static CURSOR: CursorAdapter = CursorAdapter;
 static GEMINI: GeminiAdapter = GeminiAdapter;
 static GROK: GrokAdapter = GrokAdapter;
 static JUNIE: JunieAdapter = JunieAdapter;
@@ -88,6 +91,7 @@ pub const fn registered_adapter(agent: AgentKind) -> &'static dyn AgentAdapter {
     match agent {
         AgentKind::Codex => &CODEX,
         AgentKind::Claude => &CLAUDE,
+        AgentKind::Cursor => &CURSOR,
         AgentKind::Gemini => &GEMINI,
         AgentKind::Grok => &GROK,
         AgentKind::Junie => &JUNIE,
@@ -103,6 +107,7 @@ mod registry_tests {
         for agent in [
             AgentKind::Codex,
             AgentKind::Claude,
+            AgentKind::Cursor,
             AgentKind::Gemini,
             AgentKind::Grok,
             AgentKind::Junie,

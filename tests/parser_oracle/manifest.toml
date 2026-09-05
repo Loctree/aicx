@@ -69,3 +69,16 @@ exact_fields = ["agent", "session_id", "visible_turns", "coverage", "status", "u
 path = "heuristic.intent_summary"
 op = "contains_any"
 values = ["oracle", "junie"]
+
+[[case]]
+id = "cursor_minimal"
+agent = "cursor"
+fixture = "tests/fixtures/parser_engine/cursor/minimal.jsonl"
+expected = "tests/fixtures/parser_engine/cursor/expected.json"
+oracle_kind = "rust_golden"
+exact_fields = ["agent", "session_id", "visible_turns", "coverage", "status", "usage"]
+
+[[case.heuristic_assertions]]
+path = "heuristic.intent_summary"
+op = "contains_any"
+values = ["oracle", "cursor"]

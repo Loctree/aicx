@@ -2406,6 +2406,15 @@ pub struct SemanticSearchFilters {
     pub deep: bool,
 }
 
+/// Canonical agent slug for filter comparisons: accepted aliases collapse to
+/// the stored discovery name; unknown strings pass through unchanged (they
+/// simply match nothing, same as before).
+pub fn canonical_agent_slug(raw: &str) -> String {
+    aicx_parser::engine::AgentKind::parse(raw)
+        .map(|kind| kind.as_str().to_owned())
+        .unwrap_or_else(|| raw.to_owned())
+}
+
 impl SemanticSearchFilters {
     /// True iff at least one post-fetch filter is active.
     pub fn is_active(&self) -> bool {
@@ -2672,6 +2681,7 @@ fn semantic_quality_score(query: &str, result: &FuzzyResult) -> u8 {
         .filter(|term| term.len() >= 3)
         .collect();
     let mut full_query_coverage = false;
+    let mut matched_terms_count = 0usize;
     let haystack = semantic_result_haystack(result);
     let anchors = query_anchors(&normalized_query);
     if !normalized_query.is_empty() && haystack.contains(&normalized_query) {
@@ -2699,6 +2709,7 @@ fn semantic_quality_score(query: &str, result: &FuzzyResult) -> u8 {
                         && haystack.contains(&term.chars().take(5).collect::<String>()))
             })
             .count();
+        matched_terms_count = matched_terms;
         full_query_coverage = matched_terms >= 2 && matched_terms == query_terms.len();
         score += (matched_terms.saturating_mul(3).min(12)) as i16;
         if lexical && matched_terms >= 2 {
@@ -2736,6 +2747,15 @@ fn semantic_quality_score(query: &str, result: &FuzzyResult) -> u8 {
     // `--score 70` threshold without being mislabeled as a decision.
     if evidence_class == LexicalEvidenceClass::Substantive && full_query_coverage {
         calibrated.max(70)
+    } else if evidence_class == LexicalEvidenceClass::Substantive
+        && matched_terms_count >= 2
+        && answer_delta >= 8
+    {
+        // An agent reply that actually explains the subject (causal answer
+        // markers, real length) must be able to clear the operator's common
+        // `--score 60` threshold even without a decision marker — otherwise
+        // any shouted header outranks the best genuine answer forever.
+        calibrated.max(65)
     } else {
         calibrated
     }
@@ -3019,7 +3039,10 @@ pub(crate) fn apply_semantic_post_filters(
         results.retain(|r| r.score >= min);
     }
     if let Some(ref agent) = filters.agent {
-        results.retain(|r| r.agent == *agent);
+        // Aliases ("cursor-agent", "gemini-antigravity") must match canonical
+        // stored slugs; raw equality made alias filters silently empty.
+        let want = canonical_agent_slug(agent);
+        results.retain(|r| r.agent == want);
     }
     if filters.date_lo.is_some() || filters.date_hi.is_some() {
         let lo = filters.date_lo.as_deref();
@@ -3171,7 +3194,8 @@ fn apply_fuzzy_post_filters(
         results.retain(|r| r.score >= min_score);
     }
     if let Some(ref agent_filter) = post_filters.agent {
-        results.retain(|r| r.agent == *agent_filter);
+        let want = canonical_agent_slug(agent_filter);
+        results.retain(|r| r.agent == want);
     }
     if post_filters.date_lo.is_some() || post_filters.date_hi.is_some() {
         let lo = post_filters.date_lo.as_deref();

@@ -7,6 +7,7 @@
 //! Approved roots (when present on the machine):
 //! - `~/.claude/projects`
 //! - `~/.codex/sessions`
+//! - `~/.cursor/projects`
 //! - `~/.grok/sessions`
 //! - `~/.gemini/tmp`
 //! - `~/.junie/sessions`
@@ -26,6 +27,7 @@ use anyhow::{Context, Result, anyhow};
 pub const DEFAULT_SOURCE_ROOT_RELATIVE: &[&str] = &[
     ".claude/projects",
     ".codex/sessions",
+    ".cursor/projects",
     ".grok/sessions",
     ".gemini/tmp",
     ".junie/sessions",

@@ -361,10 +361,10 @@ fn parse_optional_agent(agent: Option<&str>) -> Result<Option<AgentKind>, Sessio
         Some(value) => AgentKind::parse(value).map(Some).ok_or_else(|| {
             SessionSurfaceError::invalid(
                 "invalid_agent",
-                format!("unknown agent `{value}`; expected claude, codex, gemini, junie, or grok"),
+                format!("unknown agent `{value}`; expected claude, codex, cursor, gemini, junie, or grok"),
                 json!({
                     "agent": value,
-                    "expected": ["claude", "codex", "gemini", "junie", "grok"],
+                    "expected": ["claude", "codex", "cursor", "gemini", "junie", "grok"],
                 }),
             )
         }),
@@ -498,6 +498,28 @@ pub fn session_matches_project(session: &SessionInfo, filters: &[String]) -> boo
         && extraction::project_filter_matches_path(project, filters)
     {
         return true;
+    }
+    // Cursor slugs are lossy: every non-alphanumeric run became `-`, so a
+    // hyphenated repo name (`mlx-batch-server`) decoded into path segments
+    // and neither the label nor the decoded path can ever match the filter.
+    // Fall back to ENCODED-space containment, mirroring the discovery prune.
+    if session.agent == "cursor"
+        && session.association == crate::sessions::Association::Inferred
+        && let Some(path) = session.repo_path.as_deref()
+    {
+        for filter in filters {
+            let trimmed = filter.trim();
+            // Org wildcards (`owner/`) carry no repo name to encode.
+            if trimmed.ends_with('/') {
+                continue;
+            }
+            let repo = trimmed.rsplit('/').find(|seg| !seg.is_empty());
+            if let Some(repo) = repo
+                && crate::sessions::encoded_slug_contains_repo(path, repo)
+            {
+                return true;
+            }
+        }
     }
     false
 }
@@ -748,6 +770,7 @@ fn guess_user_home(source: &Path, agent: AgentKind) -> PathBuf {
     let marker = match agent {
         AgentKind::Claude => ".claude",
         AgentKind::Codex => ".codex",
+        AgentKind::Cursor => ".cursor",
         AgentKind::Gemini => ".gemini",
         AgentKind::Grok => ".grok",
         AgentKind::Junie => ".junie",

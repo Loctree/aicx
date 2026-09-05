@@ -15,7 +15,10 @@ use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const MANIFEST_REL: &str = "tests/fixtures/parser_engine/assertions.toml";
-const PLAN_INPUTS: &str = "/Users/polyversai/.vibecrafted/artifacts/Loctree/aicx/2026_0827/plans/aicx-one-taxonomy-fusion-260827/inputs";
+/// Plan-inputs root for `external:` fixtures, resolved under `$HOME` — the
+/// artifacts store is per-operator, never a hardcoded home path.
+const PLAN_INPUTS_UNDER_HOME: &str =
+    ".vibecrafted/artifacts/Loctree/aicx/2026_0827/plans/aicx-one-taxonomy-fusion-260827/inputs";
 const RAW_EXTRACT_SIZE_CAP: u64 = 2_000_000;
 const USER_HEADING: &str = "] user:**";
 const ASSISTANT_HEADING: &str = "] assistant:**";
@@ -119,6 +122,8 @@ fn infer_agent(fixture: &str, id: &str) -> Result<&'static str, String> {
         Ok("gemini")
     } else if fixture.contains("/junie/") || id.starts_with("junie-") {
         Ok("junie")
+    } else if fixture.contains("/cursor/") || id.starts_with("cursor-") {
+        Ok("cursor")
     } else if fixture.contains("/codex/")
         || id.starts_with("a1-")
         || id.starts_with("a2-")
@@ -154,11 +159,16 @@ fn resolve_fixture(raw: &str) -> Result<PathBuf, String> {
             .or_else(|| rest.strip_prefix("inputs"))
             .unwrap_or(rest)
             .trim_start_matches('/');
-        let candidates = [
-            PathBuf::from(PLAN_INPUTS).join(under_inputs),
-            manifest.join(rest),
-            PathBuf::from(rest),
-        ];
+        let mut candidates = Vec::new();
+        if let Some(home) = std::env::var_os("HOME") {
+            candidates.push(
+                PathBuf::from(home)
+                    .join(PLAN_INPUTS_UNDER_HOME)
+                    .join(under_inputs),
+            );
+        }
+        candidates.push(manifest.join(rest));
+        candidates.push(PathBuf::from(rest));
         for candidate in candidates {
             if candidate.is_file() {
                 return Ok(candidate);
