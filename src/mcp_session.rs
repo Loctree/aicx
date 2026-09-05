@@ -499,6 +499,28 @@ pub fn session_matches_project(session: &SessionInfo, filters: &[String]) -> boo
     {
         return true;
     }
+    // Cursor slugs are lossy: every non-alphanumeric run became `-`, so a
+    // hyphenated repo name (`mlx-batch-server`) decoded into path segments
+    // and neither the label nor the decoded path can ever match the filter.
+    // Fall back to ENCODED-space containment, mirroring the discovery prune.
+    if session.agent == "cursor"
+        && session.association == crate::sessions::Association::Inferred
+        && let Some(path) = session.repo_path.as_deref()
+    {
+        for filter in filters {
+            let trimmed = filter.trim();
+            // Org wildcards (`owner/`) carry no repo name to encode.
+            if trimmed.ends_with('/') {
+                continue;
+            }
+            let repo = trimmed.rsplit('/').find(|seg| !seg.is_empty());
+            if let Some(repo) = repo
+                && crate::sessions::encoded_slug_contains_repo(path, repo)
+            {
+                return true;
+            }
+        }
+    }
     false
 }
 
