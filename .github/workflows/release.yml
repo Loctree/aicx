@@ -593,3 +593,15 @@ jobs:
           rm -rf dist
           rm -f "${RUNNER_TEMP}/release-notes.md"
           rm -rf "${HOME}/.keys"
+
+  # Chained explicitly: the Release above is created with GITHUB_TOKEN, and
+  # GitHub does not start other workflows from events made with that token, so
+  # npm-publish.yml's `release: published` trigger never sees our releases.
+  npm-publish:
+    name: Publish npm
+    needs: [verify, github-release]
+    uses: ./.github/workflows/npm-publish.yml
+    with:
+      version: ${{ needs.verify.outputs.version }}
+    secrets:
+      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}

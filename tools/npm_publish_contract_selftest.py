@@ -7,6 +7,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).parents[1]
 WORKFLOW = ROOT / ".github/workflows/npm-publish.yml"
+RELEASE_WORKFLOW = ROOT / ".github/workflows/release.yml"
 WRAPPER = ROOT / "distribution/npm/aicx/package.json"
 PLATFORM_ROOT = ROOT / "distribution/npm/aicx/platform-packages"
 PLATFORMS = ("darwin-arm64", "linux-x64-gnu", "win32-x64-gnu")
@@ -58,6 +59,17 @@ def main() -> None:
     publish_tail = workflow.split("publish-platform-packages:", 1)[1]
     if "working-directory: distribution/npm/aicx/platform-packages" in publish_tail:
         raise SystemExit("publish jobs must consume prepacked tgz artifacts, not mutable directories")
+
+    # release.yml creates the GitHub Release with GITHUB_TOKEN, and GitHub never
+    # starts workflows from events made with that token, so `release: published`
+    # alone leaves npm behind (v0.13.0, 2026-09-02). The chain must be explicit.
+    if "workflow_call:" not in workflow:
+        raise SystemExit("npm publish workflow must be callable from release.yml (workflow_call)")
+    release_workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+    if "uses: ./.github/workflows/npm-publish.yml" not in release_workflow:
+        raise SystemExit("release.yml lost the npm-publish chain job")
+    if "needs: [verify, github-release]" not in release_workflow:
+        raise SystemExit("npm publish must run after the signed GitHub Release exists")
     print("npm zero-lifecycle publish contract passed")
 
 

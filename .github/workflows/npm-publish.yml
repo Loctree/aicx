@@ -1,9 +1,22 @@
 name: Publish npm
 
-# Publishes automatically when a GitHub Release is published (the npm package
-# is a thin wrapper around Release assets, so the Release must exist first);
+# Runs as the last job of release.yml through `workflow_call` once the signed
+# GitHub Release exists. A plain `release: published` trigger cannot do this:
+# release.yml creates the Release with the workflow's own GITHUB_TOKEN, and
+# GitHub never starts workflows from events made with that token — v0.13.0 was
+# released on 2026-09-02 and npm stayed at 0.12.5 because nothing fired.
+# `release: published` is kept for a Release a human publishes by hand;
 # workflow_dispatch stays as the manual fallback/re-run path.
 on:
+  workflow_call:
+    inputs:
+      version:
+        description: "Version to publish (x.y.z, without leading v)"
+        required: true
+        type: string
+    secrets:
+      NPM_TOKEN:
+        required: true
   release:
     types: [published]
   workflow_dispatch:
