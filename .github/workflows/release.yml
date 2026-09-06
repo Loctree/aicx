@@ -597,11 +597,15 @@ jobs:
   # Chained explicitly: the Release above is created with GITHUB_TOKEN, and
   # GitHub does not start other workflows from events made with that token, so
   # npm-publish.yml's `release: published` trigger never sees our releases.
+  # npm authenticates via OIDC trusted publishing: the called workflow needs
+  # `id-token: write`, and a reusable workflow can only hold what its caller
+  # grants, so the grant lives here. No NPM_TOKEN is passed.
   npm-publish:
     name: Publish npm
     needs: [verify, github-release]
+    permissions:
+      contents: read
+      id-token: write
     uses: ./.github/workflows/npm-publish.yml
     with:
       version: ${{ needs.verify.outputs.version }}
-    secrets:
-      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}

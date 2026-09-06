@@ -70,6 +70,17 @@ def main() -> None:
         raise SystemExit("release.yml lost the npm-publish chain job")
     if "needs: [verify, github-release]" not in release_workflow:
         raise SystemExit("npm publish must run after the signed GitHub Release exists")
+
+    # npm trusted publishing (OIDC): the run authenticates itself, so no long-lived
+    # token may appear, and both the publish jobs and the caller job must be able
+    # to mint an id-token.
+    if "NPM_TOKEN" in workflow or "NODE_AUTH_TOKEN" in workflow:
+        raise SystemExit("npm publish workflow must not use a long-lived npm token (OIDC trusted publishing)")
+    if workflow.count("id-token: write") < 2:
+        raise SystemExit("both npm publish jobs must request id-token: write")
+    chain_job = release_workflow.split("npm-publish:", 1)[1]
+    if "id-token: write" not in chain_job:
+        raise SystemExit("release.yml npm-publish job must grant id-token: write to the reusable workflow")
     print("npm zero-lifecycle publish contract passed")
 
 

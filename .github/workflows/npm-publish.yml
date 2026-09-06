@@ -14,9 +14,6 @@ on:
         description: "Version to publish (x.y.z, without leading v)"
         required: true
         type: string
-    secrets:
-      NPM_TOKEN:
-        required: true
   release:
     types: [published]
   workflow_dispatch:
@@ -187,6 +184,13 @@ jobs:
     name: Publish platform package ${{ matrix.platform }}
     needs: [verify, pack-platform-packages]
     runs-on: ubuntu-latest
+    # npm authenticates the run itself through the GitHub OIDC token; no
+    # long-lived npm token exists in this workflow. The trusted publisher on npmjs.com
+    # must name the *calling* workflow file (release.yml for the release chain,
+    # npm-publish.yml for a manual dispatch) — see distribution/npm/PUBLISHING.md.
+    permissions:
+      contents: read
+      id-token: write
     strategy:
       fail-fast: false
       matrix:
@@ -200,15 +204,18 @@ jobs:
         with:
           node-version: 24
           registry-url: "https://registry.npmjs.org"
-      - name: Publish attested tgz
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - name: Pin npm 11.17.0 (trusted publishing needs >= 11.5.1)
+        run: npm install --global npm@11.17.0
+      - name: Publish attested tgz (OIDC trusted publisher)
         run: npm publish npm-package/*.tgz --access public --ignore-scripts
 
   publish-wrapper:
     name: Publish wrapper package
     needs: [verify, pack-wrapper, publish-platform-packages]
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
@@ -241,9 +248,9 @@ jobs:
             fi
             sleep 15
           done
-      - name: Publish attested wrapper tgz
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - name: Pin npm 11.17.0 (trusted publishing needs >= 11.5.1)
+        run: npm install --global npm@11.17.0
+      - name: Publish attested wrapper tgz (OIDC trusted publisher)
         run: npm publish npm-package/*.tgz --access public --ignore-scripts
 
   smoke-cold-install:
