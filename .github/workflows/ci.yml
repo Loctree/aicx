@@ -85,10 +85,20 @@ jobs:
           cargo clippy --locked -p aicx --features native-embedder --all-targets -- -D warnings
 
       - name: cargo test
+        if: runner.os != 'Linux'
         working-directory: aicx
         # Keep serialized until remaining AICX_HOME-mutating tests share one
         # root-crate lock or move to explicit-home helpers (Wave F).
         run: cargo test --locked --all-targets --no-fail-fast -- --test-threads=2
+
+      - name: cargo test with coverage
+        if: runner.os == 'Linux'
+        working-directory: aicx
+        # Keep serialized until remaining AICX_HOME-mutating tests share one
+        # root-crate lock or move to explicit-home helpers (Wave F).
+        run: |
+          cargo install cargo-llvm-cov --locked
+          cargo llvm-cov --locked --all-targets --no-fail-fast --cobertura --output-path coverage.xml -- --test-threads=2
 
       - name: cargo test native GGUF
         working-directory: aicx
@@ -99,3 +109,28 @@ jobs:
       - name: cargo fmt
         working-directory: aicx
         run: cargo fmt -- --check
+
+      - name: Upload coverage artifact
+        if: runner.os == 'Linux' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-report-rust
+          path: aicx/coverage.xml
+
+  upload-coverage-rust:
+    needs: check
+    if: ${{ !cancelled() && needs.check.result == 'success' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      code-quality: write
+    steps:
+      - name: Download coverage artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: coverage-report-rust
+      - uses: actions/upload-code-coverage@v1
+        with:
+          file: coverage.xml
+          language: Rust
+          label: code-coverage-agent
