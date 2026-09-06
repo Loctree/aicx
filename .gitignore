@@ -30,3 +30,7 @@ CLAUDE.md
 /reports/agent-runs
 /.home-storage-smoke.m9djdz
 /reports
+
+# Coverage artifacts
+coverage.xml
+/target/llvm-cov-target/
