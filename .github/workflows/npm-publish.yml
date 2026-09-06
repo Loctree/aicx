@@ -90,9 +90,10 @@ jobs:
             asset_triple: x86_64-pc-windows-msvc
             asset_ext: zip
     steps:
+      # Keep retry tooling on the revision that was dispatched. Release inputs
+      # remain tag-addressed below and are independently checksum/GPG verified.
+      # Checking out the tag here made post-release workflow fixes unreachable.
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
-        with:
-          ref: ${{ needs.verify.outputs.release_tag }}
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
@@ -160,9 +161,9 @@ jobs:
     needs: verify
     runs-on: ubuntu-latest
     steps:
+      # Manual retries must package with the dispatched workflow revision; the
+      # requested release version is still validated by the verify job.
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
-        with:
-          ref: ${{ needs.verify.outputs.release_tag }}
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24

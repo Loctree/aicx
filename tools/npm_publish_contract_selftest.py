@@ -56,6 +56,17 @@ def main() -> None:
         if contract not in workflow:
             raise SystemExit(f"npm publish workflow lost contract: {contract}")
 
+    pack_platform = workflow.split("pack-platform-packages:", 1)[1].split("pack-wrapper:", 1)[0]
+    pack_wrapper = workflow.split("pack-wrapper:", 1)[1].split("publish-platform-packages:", 1)[0]
+    for job_name, job_source in (
+        ("pack-platform-packages", pack_platform),
+        ("pack-wrapper", pack_wrapper),
+    ):
+        if "ref: ${{ needs.verify.outputs.release_tag }}" in job_source:
+            raise SystemExit(
+                f"{job_name} must use the dispatched workflow revision so post-release fixes reach retries"
+            )
+
     publish_tail = workflow.split("publish-platform-packages:", 1)[1]
     if "working-directory: distribution/npm/aicx/platform-packages" in publish_tail:
         raise SystemExit("publish jobs must consume prepacked tgz artifacts, not mutable directories")
