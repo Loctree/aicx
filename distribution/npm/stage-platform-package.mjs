@@ -78,12 +78,38 @@ function listFiles(root, output = []) {
   return output;
 }
 
+// windows-latest resolves `gpg` to Git for Windows' MSYS build. Spawned from
+// node (no MSYS shell in between) it receives Windows paths verbatim and treats
+// `C:\Users\...` as a relative name — the 0.13.0 publish run died importing the
+// release key into `/d/a/aicx/aicx/C:\Users\RUNNER~1\...`. That gpg understands
+// POSIX paths, and ships `cygpath` to produce them; a native gpg (Gpg4win) takes
+// Windows paths as-is, so convert only when the resolved gpg is the MSYS one.
+let gpgWantsPosixPaths;
+function gpgPath(candidate) {
+  if (process.platform !== "win32") return candidate;
+  if (gpgWantsPosixPaths === undefined) {
+    let resolved = "";
+    try {
+      resolved = execFileSync("where.exe", ["gpg"], { encoding: "utf8" }).split(/\r?\n/, 1)[0].trim();
+    } catch {
+      resolved = "";
+    }
+    gpgWantsPosixPaths = /[\\/]usr[\\/]bin[\\/]gpg(\.exe)?$/i.test(resolved);
+  }
+  if (!gpgWantsPosixPaths) return candidate;
+  return execFileSync("cygpath", ["-u", candidate], { encoding: "utf8" }).trim();
+}
+
 try {
   if (verificationMode === "signed-release") {
-    execFileSync("gpg", ["--batch", "--homedir", gpgHome, "--import", publicKeyPath], { stdio: "inherit" });
-    execFileSync("gpg", ["--batch", "--homedir", gpgHome, "--verify", signaturePath, archivePath], {
+    execFileSync("gpg", ["--batch", "--homedir", gpgPath(gpgHome), "--import", gpgPath(publicKeyPath)], {
       stdio: "inherit",
     });
+    execFileSync(
+      "gpg",
+      ["--batch", "--homedir", gpgPath(gpgHome), "--verify", gpgPath(signaturePath), gpgPath(archivePath)],
+      { stdio: "inherit" },
+    );
   }
 
   if (assetName.endsWith(".tar.gz")) {
