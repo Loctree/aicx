@@ -67,14 +67,38 @@ function assertNoLifecycleScripts(label, pkg) {
   }
 }
 
+// npm on Windows is `npm.cmd`, and Node >= 20.12 refuses to spawn .cmd/.bat
+// files without a shell (CVE-2024-27980), which surfaced as
+// "npm pack inspection failed ...: undefined" on windows-latest. Instead of a
+// shell, run the npm CLI entry point that `npm.cmd` itself would run: the
+// `npm-cli.js` living next to whichever `npm.cmd` is first on PATH (the
+// pinned 11.17.0 in CI).
+let npmInvocation;
+function npmCommand() {
+  if (npmInvocation) return npmInvocation;
+  if (process.platform !== "win32") {
+    npmInvocation = { command: "npm", prefix: [] };
+    return npmInvocation;
+  }
+  const located = spawnSync("where.exe", ["npm.cmd"], { encoding: "utf8" });
+  const npmCmd = (located.stdout || "").split(/\r?\n/, 1)[0].trim();
+  const cli = npmCmd ? path.join(path.dirname(npmCmd), "node_modules", "npm", "bin", "npm-cli.js") : "";
+  if (!cli || !fs.existsSync(cli)) {
+    throw new Error(`cannot locate npm-cli.js next to ${npmCmd || "npm.cmd (not on PATH)"}`);
+  }
+  npmInvocation = { command: process.execPath, prefix: [cli] };
+  return npmInvocation;
+}
+
 function verifyPackedFiles(packageRoot, expectedFiles) {
-  const npm = process.platform === "win32" ? "npm.cmd" : "npm";
-  const result = spawnSync(npm, ["pack", "--dry-run", "--json", "--ignore-scripts"], {
+  const npm = npmCommand();
+  const result = spawnSync(npm.command, [...npm.prefix, "pack", "--dry-run", "--json", "--ignore-scripts"], {
     cwd: packageRoot,
     encoding: "utf8",
   });
   if (result.status !== 0) {
-    fail(`npm pack inspection failed in ${packageRoot}: ${result.stderr || result.stdout}`);
+    const detail = result.error?.message || result.stderr || result.stdout || `status ${result.status}`;
+    fail(`npm pack inspection failed in ${packageRoot}: ${detail}`);
     return;
   }
   try {
@@ -103,10 +127,13 @@ function verifyHoistedPlatformResolution() {
     );
     const resolvedRoot = resolvePlatformPackageRoot("@loctree/aicx-darwin-arm64", wrapperRoot);
     assertEqual("hoisted platform package resolution", resolvedRoot, fs.realpathSync(platformRoot));
+    // The wrapper's allowlist is host-specific: on Windows it only knows the
+    // `.exe` spellings, so probe with the name this host would actually use.
+    const hostBinary = process.platform === "win32" ? "aicx.exe" : "aicx";
     assertEqual(
       "platform binary bin-directory resolution",
-      resolvePlatformBinaryPath(resolvedRoot, "aicx"),
-      path.join(resolvedRoot, "bin", "aicx"),
+      resolvePlatformBinaryPath(resolvedRoot, hostBinary),
+      path.join(resolvedRoot, "bin", hostBinary),
     );
     let traversalRejected = false;
     try {
