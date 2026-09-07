@@ -318,6 +318,16 @@ impl<'a> Assembly<'a> {
         let turn_idx = self.turns.len() as u64;
         let text_hash = sha256_hex(text.as_bytes());
         let payload_bytes = text.len() as u64;
+        // Contract boundary, stated rather than papered over: agent-issued tool
+        // calls carry no frame class on any adapter (codex `push_turn(.., None)`
+        // for function calls, claude the same). The shared taxonomy has no
+        // `ToolCall` class, and `TransportPayload::Shell` is the *user* shell
+        // lane with echo-seal promotion — routing an agent's `Shell` call
+        // through it would let `echo …` commands surface as human speech.
+        // Adding a tool-call class to `frames` is a repo-wide migration for all
+        // three adapters, tracked outside the Cursor lane; until then the turn
+        // is typed by `TurnKind::ToolCall` + `tool_name`, and
+        // `tests/cursor_adapter.rs` pins this shape.
         self.turns.push(Turn {
             turn_idx,
             role: TurnRole::Tool,

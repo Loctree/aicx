@@ -1373,6 +1373,11 @@ fn scan_cursor_session_file(path: &Path, decoded_cwd: Option<&str>) -> Option<Se
     let mut user_message_count = 0usize;
     let mut agent_message_count = 0usize;
     let mut title: Option<String> = None;
+    // A real Cursor transcript can open with harness bootstrap text ("Run the
+    // following command: …") and carry the operator's intent later inside a
+    // `<user_query>` wrapper. The first explicit query wins the title; the
+    // first free-text speech is only the fallback.
+    let mut query_title: Option<String> = None;
     // Set only after a line actually parses (TemporalConfidence idiom shared
     // with claude/codex/junie).
     let mut saw_parsable_line = false;
@@ -1425,6 +1430,11 @@ fn scan_cursor_session_file(path: &Path, decoded_cwd: Option<&str>) -> Option<Se
                         started_at = Some(started_at.map_or(ts, |cur| cur.min(ts)));
                         updated_at = Some(updated_at.map_or(ts, |cur| cur.max(ts)));
                     }
+                    if query_title.is_none()
+                        && let Some(query) = cursor_user_query(text)
+                    {
+                        query_title = Some(short_title(&query));
+                    }
                     if title.is_none() {
                         let speech = strip_cursor_wrappers(text);
                         if !speech.is_empty() {
@@ -1439,6 +1449,9 @@ fn scan_cursor_session_file(path: &Path, decoded_cwd: Option<&str>) -> Option<Se
             }
             _ => {}
         }
+    }
+    if let Some(query) = query_title {
+        title = Some(query);
     }
 
     let (repo_path, association) = match decoded_cwd {
@@ -1484,6 +1497,23 @@ const CURSOR_WRAPPER_TAGS: &[&str] = &[
 ];
 
 /// Strip harness wrappers from operator text, keeping actual speech.
+/// The operator's explicit intent on this transport: the first non-empty
+/// `<user_query>` body, if the text carries one. `None` for pure bootstrap or
+/// free text, so callers can fall back to [`strip_cursor_wrappers`].
+fn cursor_user_query(text: &str) -> Option<String> {
+    let mut rest = text;
+    while let Some((_, tag, inner, end)) = find_cursor_wrapper(rest) {
+        if tag == "user_query" {
+            let inner = inner.trim();
+            if !inner.is_empty() {
+                return Some(inner.to_owned());
+            }
+        }
+        rest = &rest[end..];
+    }
+    None
+}
+
 fn strip_cursor_wrappers(text: &str) -> String {
     let mut parts: Vec<String> = Vec::new();
     let mut rest = text;
@@ -2021,6 +2051,35 @@ pub fn select_sessions(
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn cursor_title_prefers_user_query_over_bootstrap_text() {
+        let root = temp_root("cursor-title");
+        let session = "22222222-2222-4222-8222-222222222222";
+        let session_dir = root
+            .join("users-op-repo")
+            .join("agent-transcripts")
+            .join(session);
+        fs::create_dir_all(&session_dir).unwrap();
+        write_session(
+            &session_dir,
+            &format!("{session}.jsonl"),
+            &[
+                // Harness bootstrap arrives first and carries no <user_query>.
+                r#"{"role":"user","message":{"content":[{"type":"text","text":"Run the following command: cargo test --workspace"}]}}"#,
+                r#"{"role":"assistant","message":{"content":[{"type":"text","text":"running"}]}}"#,
+                // The operator's actual ask comes later, wrapped.
+                r#"{"role":"user","message":{"content":[{"type":"text","text":"<timestamp>Saturday, Aug 29, 2026, 9:00 AM (UTC+2)</timestamp>\n<user_query>\nfix the flaky discovery test\n</user_query>"}]}}"#,
+            ],
+        );
+        let sessions = discover_cursor_sessions(&root, None, None);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(
+            sessions[0].title.as_deref(),
+            Some("fix the flaky discovery test")
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn cursor_inferred_cwd_filter_survives_dots_and_underscores() {

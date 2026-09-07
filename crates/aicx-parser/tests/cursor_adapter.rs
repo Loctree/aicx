@@ -240,6 +240,27 @@ fn cursor_human_shape_wrapped_unwraps_operator_speech() {
         "git status -sb && git fetch --all --prune -f -v"
     );
     assert_eq!(model.tool_events.len(), 2);
+    // Contract pin (review axis 4): agent-issued tool calls are typed by
+    // `TurnKind::ToolCall` + `tool_name` and carry no frame class, on every
+    // adapter, because the shared taxonomy has no tool-call class yet and the
+    // `Shell` payload is the user shell lane. Human/inject/assistant frames on
+    // the same transcript DO go through the classifier. When a ToolCall class
+    // lands in `frames`, this assertion is the one to flip.
+    for turn in &tool_turns {
+        assert!(
+            turn.frame_class.is_none(),
+            "tool call {} must not borrow a user-lane frame class",
+            turn.turn_idx
+        );
+    }
+    assert!(
+        model
+            .turns
+            .iter()
+            .filter(|turn| turn.kind != TurnKind::ToolCall)
+            .all(|turn| turn.frame_class.is_some()),
+        "every non-tool turn is classified by the shared throne"
+    );
 
     // turn_ended is consumed, not skipped: full visible coverage.
     assert_eq!(model.coverage.raw_line_count, 5);
