@@ -432,8 +432,10 @@ fn hot_window_scan_probes_only_fresh_candidates() {
 
 #[test]
 fn agent_kind_exposes_session_roots_and_parser_kinds() {
-    assert_eq!(AgentKind::ALL.len(), 5);
+    assert_eq!(AgentKind::ALL.len(), 6);
     assert_eq!(AgentKind::parse("claude"), Some(AgentKind::Claude));
+    assert_eq!(AgentKind::parse("cursor"), Some(AgentKind::Cursor));
+    assert_eq!(AgentKind::parse("cursor-agent"), Some(AgentKind::Cursor));
     assert_eq!(
         AgentKind::parse("gemini-antigravity"),
         Some(AgentKind::Gemini)
@@ -445,11 +447,19 @@ fn agent_kind_exposes_session_roots_and_parser_kinds() {
         home.join(".claude").join("projects")
     );
     assert_eq!(
+        AgentKind::Cursor.session_root(home),
+        home.join(".cursor").join("projects")
+    );
+    assert_eq!(
         AgentKind::Grok.session_root(home),
         home.join(".grok").join("sessions")
     );
     assert_eq!(
         AgentKind::Claude.parser_kind(),
         aicx::parser::engine::AgentKind::Claude
+    );
+    assert_eq!(
+        AgentKind::Cursor.parser_kind(),
+        aicx::parser::engine::AgentKind::Cursor
     );
 }

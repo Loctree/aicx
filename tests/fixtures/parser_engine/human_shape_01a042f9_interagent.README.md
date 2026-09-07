@@ -6,7 +6,7 @@ Parked next to `ASSERTIONS.md`, not under `tests/fixtures/parser_engine/codex/` 
 
 ## Source (34.7 MB, not in repo)
 
-`/Users/polyversai/.vibecrafted/artifacts/Loctree/aicx/2026_0827/plans/aicx-one-taxonomy-fusion-260827/inputs/fixtures/codex/diagnostic-01a042f9/rollout-2026-08-27T13-27-04-01a042f9-3803-7772-bf00-1887a50aaf89.jsonl`
+`~/.vibecrafted/artifacts/Loctree/aicx/2026_0827/plans/aicx-one-taxonomy-fusion-260827/inputs/fixtures/codex/diagnostic-01a042f9/rollout-2026-08-27T13-27-04-01a042f9-3803-7772-bf00-1887a50aaf89.jsonl`
 
 This file keeps, in source order: `session_meta`, every `response_item.payload.type == "agent_message"` (28), every `inter_agent_communication_metadata` (28), and the first `type == "compacted"` (one window with `replacement_history` length 8). Size 188439 bytes.
 
@@ -15,7 +15,7 @@ Raw `agent_message` count 28 is an assertion on the **external** source, not on 
 ## Derivation (deterministic)
 
 ```bash
-SRC=/Users/polyversai/.vibecrafted/artifacts/Loctree/aicx/2026_0827/plans/aicx-one-taxonomy-fusion-260827/inputs/fixtures/codex/diagnostic-01a042f9/rollout-2026-08-27T13-27-04-01a042f9-3803-7772-bf00-1887a50aaf89.jsonl
+SRC=~/.vibecrafted/artifacts/Loctree/aicx/2026_0827/plans/aicx-one-taxonomy-fusion-260827/inputs/fixtures/codex/diagnostic-01a042f9/rollout-2026-08-27T13-27-04-01a042f9-3803-7772-bf00-1887a50aaf89.jsonl
 DST=tests/fixtures/parser_engine/human_shape_01a042f9_interagent.jsonl
 python3 -c '
 import json, sys

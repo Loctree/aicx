@@ -528,7 +528,7 @@ fn dialogue_texts(model: &SessionModel) -> Vec<String> {
 fn codex_shell_action_keeps_command_marker_and_retains_result() {
     let body = br#"{"timestamp":"2026-08-24T10:00:00Z","type":"session_meta","payload":{"id":"shell-envelope","cwd":"/repo"}}
 {"timestamp":"2026-08-24T10:00:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"sprawdz wersje aicx na dragonie"}]}}
-{"timestamp":"2026-08-24T10:00:02Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<user_shell_command>\n<command>\npsa loctree\n</command>\n<result>\nExit code: 0\nmaciejgad 40740 loctree-lsp --root /private/repo --stdio\n</result>\n</user_shell_command>"}]}}
+{"timestamp":"2026-08-24T10:00:02Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<user_shell_command>\n<command>\npsa loctree\n</command>\n<result>\nExit code: 0\ndevuser 40740 loctree-lsp --root /private/repo --stdio\n</result>\n</user_shell_command>"}]}}
 {"timestamp":"2026-08-24T10:00:03Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"widze wynik, wersja siedzi"}]}}
 "#;
     let model = model("shell-envelope", body);
@@ -561,7 +561,7 @@ fn codex_shell_action_keeps_command_marker_and_retains_result() {
         Known::value("user_shell_command".to_owned())
     );
     assert_eq!(calls[0].text, "$ psa loctree");
-    assert!(!calls[0].text.contains("maciejgad 40740"));
+    assert!(!calls[0].text.contains("devuser 40740"));
 
     let results: Vec<_> = model
         .turns
@@ -575,7 +575,7 @@ fn codex_shell_action_keeps_command_marker_and_retains_result() {
         Known::value("user_shell_command".to_owned())
     );
     assert!(results[0].text.starts_with("<user_shell_command>"));
-    assert!(results[0].text.contains("maciejgad 40740"));
+    assert!(results[0].text.contains("devuser 40740"));
     assert!(
         results[0]
             .text

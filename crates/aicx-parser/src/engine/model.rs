@@ -325,6 +325,14 @@ pub enum ProviderConversationRef {
         session_id: String,
         unobserved: Vec<String>,
     },
+    /// Cursor CLI agent transcript
+    /// (`agent-transcripts/<uuid>/<uuid>.jsonl`): the store-side UUID in the
+    /// file/directory name is the only identity; rows carry no session, cwd,
+    /// or model fields.
+    Cursor {
+        session_id: String,
+        unobserved: Vec<String>,
+    },
 }
 
 impl ProviderConversationRef {
@@ -365,6 +373,10 @@ impl ProviderConversationRef {
                 session_id: store_id,
                 unobserved: Vec::new(),
             },
+            AgentKind::Cursor => Self::Cursor {
+                session_id: store_id,
+                unobserved: Vec::new(),
+            },
         }
     }
 
@@ -372,6 +384,7 @@ impl ProviderConversationRef {
         match self {
             Self::Claude { .. } => AgentKind::Claude,
             Self::Codex { .. } => AgentKind::Codex,
+            Self::Cursor { .. } => AgentKind::Cursor,
             Self::Gemini { .. } => AgentKind::Gemini,
             Self::Grok { .. } => AgentKind::Grok,
             Self::Junie { .. } => AgentKind::Junie,
@@ -383,6 +396,7 @@ impl ProviderConversationRef {
     pub fn node_id(&self) -> &str {
         match self {
             Self::Claude { session_id, .. }
+            | Self::Cursor { session_id, .. }
             | Self::Gemini { session_id, .. }
             | Self::Grok { session_id, .. }
             | Self::Junie { session_id, .. } => session_id,
@@ -421,6 +435,7 @@ impl ProviderConversationRef {
         match self {
             Self::Claude { unobserved, .. }
             | Self::Codex { unobserved, .. }
+            | Self::Cursor { unobserved, .. }
             | Self::Gemini { unobserved, .. }
             | Self::Grok { unobserved, .. }
             | Self::Junie { unobserved, .. } => unobserved,

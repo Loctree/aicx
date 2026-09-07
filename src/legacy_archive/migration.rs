@@ -179,6 +179,7 @@ struct LegacyBundleDescriptor {
 enum SourceFormat {
     Claude,
     Codex,
+    Cursor,
     Gemini,
     GeminiAntigravity,
     Junie,
@@ -646,6 +647,14 @@ fn collect_source_hints_from_text(
     }
 }
 
+/// Cursor transcript contract: `~/.cursor/projects/<slug>/agent-transcripts/<uuid>/<uuid>.jsonl`.
+/// `path_str` is the lowercased, forward-slash form used by [`source_format_hint`].
+fn is_cursor_transcript_path(path_str: &str, extension: Option<&str>) -> bool {
+    extension == Some("jsonl")
+        && path_str.contains("/.cursor/projects/")
+        && path_str.contains("/agent-transcripts/")
+}
+
 fn source_format_hint(path: &Path, agent_hint: Option<&str>) -> Option<SourceFormat> {
     // Source detection matches provider markers (`/.claude/`, `/antigravity/brain/`,
     // `/.gemini/tmp/`, …) as forward-slash substrings. On Windows the native path
@@ -719,8 +728,21 @@ fn source_format_hint(path: &Path, agent_hint: Option<&str>) -> Option<SourceFor
             }
             return None;
         }
+        Some("cursor") => {
+            if is_cursor_transcript_path(&path_str, extension.as_deref()) {
+                return Some(SourceFormat::Cursor);
+            }
+            return None;
+        }
         Some(_) => return None,
         None => {}
+    }
+
+    // Cursor before the generic `.jsonl` rules: its transcripts are plain
+    // `<uuid>.jsonl` files that only the `agent-transcripts` path segment
+    // identifies.
+    if is_cursor_transcript_path(&path_str, extension.as_deref()) {
+        return Some(SourceFormat::Cursor);
     }
 
     if extension.as_deref() == Some("pb")
@@ -889,6 +911,7 @@ fn extract_entries_from_source(source: &ResolvedSource) -> Result<Vec<TimelineEn
         }
         SourceFormat::Junie => aicx_parser::engine::AgentKind::Junie,
         SourceFormat::Grok => aicx_parser::engine::AgentKind::Grok,
+        SourceFormat::Cursor => aicx_parser::engine::AgentKind::Cursor,
     };
     if source.path.is_dir() {
         anyhow::bail!("migration source must resolve to a concrete session artifact");
@@ -1034,6 +1057,28 @@ fn register_lookup_keys(path: &Path, handled_lookup_hints: &mut BTreeSet<String>
 #[cfg(test)]
 mod hint_tests {
     use super::*;
+
+    #[test]
+    fn cursor_transcripts_are_a_migration_source_format() {
+        let transcript = Path::new(
+            "/Users/op/.cursor/projects/users-op-repo/agent-transcripts/11111111-1111-4111-8111-111111111111/11111111-1111-4111-8111-111111111111.jsonl",
+        );
+        assert!(matches!(
+            source_format_hint(transcript, None),
+            Some(SourceFormat::Cursor)
+        ));
+        assert!(matches!(
+            source_format_hint(transcript, Some("cursor")),
+            Some(SourceFormat::Cursor)
+        ));
+        // A `.jsonl` elsewhere under ~/.cursor/projects is IDE state, not a session.
+        let terminal_log =
+            Path::new("/Users/op/.cursor/projects/users-op-repo/terminals/log.jsonl");
+        assert!(source_format_hint(terminal_log, Some("cursor")).is_none());
+        assert!(source_format_hint(terminal_log, None).is_none());
+        // Note: an explicit foreign hint (`Some("codex")`) still wins for any
+        // `.jsonl` — hints are trusted by design in this resolver, unchanged here.
+    }
 
     fn collect(text: &str, agent: Option<&str>) -> (BTreeSet<PathBuf>, BTreeSet<String>) {
         let mut direct = BTreeSet::new();

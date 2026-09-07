@@ -226,7 +226,7 @@ fn three_thousand_unrelated_files_do_not_expand_selected_source_bytes() {
         assert_eq!(opened_source_bytes, case.base.len() as u64);
     }
     assert_eq!(
-        checked, 5,
+        checked, 6,
         "all production adapters must prove selected-source isolation"
     );
 
@@ -243,6 +243,6 @@ fn fixture_declares_complete_mutation_matrix() {
     let matrix =
         include_str!("../../../tests/fixtures/parser_engine/adversarial/mutation_matrix.json");
     let value: serde_json::Value = serde_json::from_str(matrix).expect("mutation matrix JSON");
-    assert_eq!(value["agents"].as_array().expect("agents").len(), 5);
+    assert_eq!(value["agents"].as_array().expect("agents").len(), 6);
     assert_eq!(value["mutations"].as_array().expect("mutations").len(), 5);
 }

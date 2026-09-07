@@ -7,6 +7,7 @@
 //! Approved roots (when present on the machine):
 //! - `~/.claude/projects`
 //! - `~/.codex/sessions`
+//! - `~/.cursor/projects`
 //! - `~/.grok/sessions`
 //! - `~/.gemini/tmp`
 //! - `~/.junie/sessions`
@@ -26,6 +27,7 @@ use anyhow::{Context, Result, anyhow};
 pub const DEFAULT_SOURCE_ROOT_RELATIVE: &[&str] = &[
     ".claude/projects",
     ".codex/sessions",
+    ".cursor/projects",
     ".grok/sessions",
     ".gemini/tmp",
     ".junie/sessions",
@@ -128,12 +130,46 @@ impl SourceAllowlist {
         // scratch aicx_home / agent roots). A bare `/tmp` free-for-all would
         // re-open symlink and outside-root escapes.
         for root in &self.roots {
-            if is_path_within_root(canonical_path, root)? {
+            if is_path_within_root(canonical_path, root)?
+                && root_shape_allows(root, canonical_path)?
+            {
                 return Ok(true);
             }
         }
         Ok(false)
     }
+}
+
+/// Containment is not enough for roots that hold more than transcripts.
+/// `~/.cursor/projects` also carries IDE state (`canvases/`, `terminals/`, …);
+/// the readable Cursor surface is exactly
+/// `<slug>/agent-transcripts/<uuid>/<uuid>.jsonl`. Other roots keep plain
+/// containment.
+fn root_shape_allows(root: &Path, canonical_path: &Path) -> Result<bool> {
+    if !root.ends_with(Path::new(".cursor").join("projects")) {
+        return Ok(true);
+    }
+    let canonical_root = root
+        .canonicalize()
+        .with_context(|| format!("canonicalize approved root {}", root.display()))?;
+    let Ok(relative) = canonical_path.strip_prefix(&canonical_root) else {
+        return Ok(false);
+    };
+    Ok(is_cursor_transcript_shape(relative))
+}
+
+/// `<slug>/agent-transcripts/<uuid>/<uuid>.jsonl`, relative to the projects root.
+fn is_cursor_transcript_shape(relative: &Path) -> bool {
+    let parts: Vec<&str> = relative
+        .components()
+        .map(|component| component.as_os_str().to_str().unwrap_or(""))
+        .collect();
+    let [_slug, transcripts, session_dir, file] = parts.as_slice() else {
+        return false;
+    };
+    *transcripts == "agent-transcripts"
+        && !session_dir.is_empty()
+        && file.strip_suffix(".jsonl") == Some(session_dir)
 }
 
 /// Convenience: resolve + open using the live operator home + AICX home.
@@ -250,6 +286,40 @@ mod tests {
         assert_eq!(fs::read_to_string(&resolved).unwrap(), "hello");
         let body = allow.read_to_string(&file).unwrap();
         assert_eq!(body, "hello");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cursor_root_admits_only_agent_transcripts() {
+        let root = test_dir("cursor-shape");
+        let aicx = root.join(".aicx");
+        let projects = root.join(".cursor").join("projects");
+        let session = "11111111-1111-4111-8111-111111111111";
+        let transcript_dir = projects
+            .join("users-op-repo")
+            .join("agent-transcripts")
+            .join(session);
+        fs::create_dir_all(&transcript_dir).unwrap();
+        let transcript = transcript_dir.join(format!("{session}.jsonl"));
+        fs::write(&transcript, b"{}").unwrap();
+        // IDE state living next to the transcripts under the same root.
+        let terminals = projects.join("users-op-repo").join("terminals");
+        fs::create_dir_all(&terminals).unwrap();
+        let terminal_log = terminals.join("log.jsonl");
+        fs::write(&terminal_log, b"{}").unwrap();
+        let stray = transcript_dir.join("notes.jsonl");
+        fs::write(&stray, b"{}").unwrap();
+
+        let allow = SourceAllowlist::for_operator(&root, &aicx);
+        assert!(allow.resolve_file(&transcript).is_ok());
+        for rejected in [&terminal_log, &stray] {
+            let err = allow.resolve_file(rejected).unwrap_err();
+            assert!(
+                err.to_string().contains("escapes approved roots"),
+                "{} must be refused, got {err}",
+                rejected.display()
+            );
+        }
         let _ = fs::remove_dir_all(&root);
     }
 

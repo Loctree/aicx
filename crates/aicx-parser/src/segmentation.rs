@@ -10,7 +10,6 @@ use crate::timeline::{Kind, RepoIdentity, SemanticSegment, SourceTier, TimelineE
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 // ============================================================================
 // Source trust model
@@ -494,7 +493,7 @@ fn discover_git_root(path: &Path) -> Option<PathBuf> {
 }
 
 fn infer_repo_identity_from_git_remote(repo_root: &Path) -> Option<RepoIdentity> {
-    let output = Command::new("git")
+    let output = crate::git_env::git_command_isolated()
         .arg("-C")
         .arg(repo_root)
         .args(["remote", "get-url", "origin"])
@@ -692,6 +691,66 @@ mod tests {
     use super::*;
     use chrono::{TimeZone, Utc};
     use std::fs;
+    use std::process::Command;
+
+    /// The hazard `git_env::git_command_isolated` closes: with `GIT_DIR`
+    /// pointing at another repository, a raw `git -C <path>` answers for that
+    /// other repository. The isolated spawn used by
+    /// `infer_repo_identity_from_git_remote` strips the variable, so the
+    /// remote of `<path>` is what comes back.
+    #[test]
+    fn repo_identity_from_remote_survives_poisoned_git_session_env() {
+        let base = std::env::temp_dir().join(format!(
+            "aicx-git-env-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let target = base.join("target");
+        let other = base.join("other");
+        for (repo, remote) in [
+            (&target, "https://github.com/acme/widgets.git"),
+            (&other, "https://github.com/evil/hooks.git"),
+        ] {
+            fs::create_dir_all(repo).unwrap();
+            let init = crate::git_env::git_command_isolated()
+                .args(["init", "-q"])
+                .current_dir(repo)
+                .status();
+            let Ok(status) = init else {
+                let _ = fs::remove_dir_all(&base);
+                return; // no git on this host: nothing to prove here
+            };
+            assert!(status.success());
+            let added = crate::git_env::git_command_isolated()
+                .args(["remote", "add", "origin", remote])
+                .current_dir(repo)
+                .status()
+                .unwrap();
+            assert!(added.success());
+        }
+
+        // Raw spawn under a poisoned session: GIT_DIR wins over -C.
+        let poisoned = Command::new("git")
+            .env("GIT_DIR", other.join(".git"))
+            .arg("-C")
+            .arg(&target)
+            .args(["remote", "get-url", "origin"])
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&poisoned.stdout).contains("evil/hooks"),
+            "precondition: a raw spawn must be hijackable for this test to mean anything"
+        );
+
+        // Production path answers for the repository it was asked about.
+        let identity = infer_repo_identity_from_git_remote(&target).expect("remote identity");
+        assert_eq!(identity.organization, "acme");
+        assert_eq!(identity.repository, "widgets");
+        let _ = fs::remove_dir_all(&base);
+    }
 
     fn entry(
         ts: (i32, u32, u32, u32, u32, u32),

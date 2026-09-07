@@ -17,7 +17,7 @@ from typing import Any
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-SUPPORTED_AGENTS = {"codex", "grok", "claude", "gemini", "junie"}
+SUPPORTED_AGENTS = {"codex", "grok", "claude", "cursor", "gemini", "junie"}
 DONOR_AGENTS = {"codex", "grok", "claude", "gemini"}
 REQUIRED_CONTRACT_SECTIONS = (
     "## Ownership and source of truth",
@@ -441,7 +441,18 @@ def run_all(cases: list[Case]) -> None:
             "junie_native_golden_matches_reviewed_fixture",
             "--",
             "--exact",
-        )
+        ),
+        "cursor_minimal": (
+            "cargo",
+            "test",
+            "-p",
+            "aicx-parser",
+            "--test",
+            "cursor_adapter",
+            "cursor_native_golden_matches_reviewed_fixture",
+            "--",
+            "--exact",
+        ),
     }
     for case in native_cases:
         command = native_tests.get(case.id)

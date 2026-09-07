@@ -43,6 +43,7 @@ fn main() -> ExitCode {
     let agent_kind = match agent.as_str() {
         "codex" => AgentKind::Codex,
         "claude" => AgentKind::Claude,
+        "cursor" => AgentKind::Cursor,
         "gemini" => AgentKind::Gemini,
         "grok" => AgentKind::Grok,
         "junie" => AgentKind::Junie,
