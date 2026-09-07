@@ -208,7 +208,9 @@ jobs:
       - name: Pin npm 11.17.0 (trusted publishing needs >= 11.5.1)
         run: npm install --global npm@11.17.0
       - name: Publish attested tgz (OIDC trusted publisher)
-        run: npm publish npm-package/*.tgz --access public --ignore-scripts
+        # Leading ./ matters: npm reads a bare `dir/file.tgz` as a GitHub `owner/repo`
+        # shorthand and runs git ls-remote (run 34098919609 died on exit 128).
+        run: npm publish ./npm-package/*.tgz --access public --ignore-scripts
 
   publish-wrapper:
     name: Publish wrapper package
@@ -252,7 +254,9 @@ jobs:
       - name: Pin npm 11.17.0 (trusted publishing needs >= 11.5.1)
         run: npm install --global npm@11.17.0
       - name: Publish attested wrapper tgz (OIDC trusted publisher)
-        run: npm publish npm-package/*.tgz --access public --ignore-scripts
+        # Leading ./ matters: npm reads a bare `dir/file.tgz` as a GitHub `owner/repo`
+        # shorthand and runs git ls-remote (run 34098919609 died on exit 128).
+        run: npm publish ./npm-package/*.tgz --access public --ignore-scripts
 
   smoke-cold-install:
     name: Cold npm install (${{ matrix.os }}, ${{ matrix.install_mode }})

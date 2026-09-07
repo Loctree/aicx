@@ -42,7 +42,7 @@ def main() -> None:
         "runs_on: windows-latest",
         "stage-platform-package.mjs",
         "verify-metadata.mjs",
-        "npm publish npm-package/*.tgz",
+        "npm publish ./npm-package/*.tgz",
         'npm view "${package}@${RELEASE_VERSION}" version',
         "@loctree/aicx-darwin-arm64",
         "@loctree/aicx-linux-x64-gnu",
