@@ -210,7 +210,19 @@ jobs:
       - name: Publish attested tgz (OIDC trusted publisher)
         # Leading ./ matters: npm reads a bare `dir/file.tgz` as a GitHub `owner/repo`
         # shorthand and runs git ls-remote (run 34098919609 died on exit 128).
-        run: npm publish ./npm-package/*.tgz --access public --ignore-scripts
+        # Retries are a real path (a later job can fail after this one published),
+        # and npm refuses to publish over an existing version, so skip when the
+        # registry already has it.
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ needs.verify.outputs.version }}
+          PACKAGE: "@loctree/aicx-${{ matrix.platform }}"
+        run: |
+          if [[ "$(npm view "${PACKAGE}@${RELEASE_VERSION}" version 2>/dev/null || true)" == "${RELEASE_VERSION}" ]]; then
+            echo "${PACKAGE}@${RELEASE_VERSION} is already on the registry; nothing to publish"
+            exit 0
+          fi
+          npm publish ./npm-package/*.tgz --access public --ignore-scripts
 
   publish-wrapper:
     name: Publish wrapper package
@@ -238,14 +250,16 @@ jobs:
             "@loctree/aicx-linux-x64-gnu"
             "@loctree/aicx-win32-x64-gnu"
           )
-          for attempt in {1..20}; do
+          # ~50 MB platform tarballs took longer than 5 minutes to surface via
+          # `npm view` (run 34099268458); allow 15 minutes.
+          for attempt in {1..60}; do
             missing=()
             for package in "${packages[@]}"; do
               published=$(npm view "${package}@${RELEASE_VERSION}" version 2>/dev/null || true)
               [[ "${published}" == "${RELEASE_VERSION}" ]] || missing+=("${package}")
             done
             [[ "${#missing[@]}" == 0 ]] && break
-            if [[ "${attempt}" == 20 ]]; then
+            if [[ "${attempt}" == 60 ]]; then
               echo "npm registry did not expose ${missing[*]} at ${RELEASE_VERSION}" >&2
               exit 1
             fi
@@ -254,9 +268,17 @@ jobs:
       - name: Pin npm 11.17.0 (trusted publishing needs >= 11.5.1)
         run: npm install --global npm@11.17.0
       - name: Publish attested wrapper tgz (OIDC trusted publisher)
-        # Leading ./ matters: npm reads a bare `dir/file.tgz` as a GitHub `owner/repo`
-        # shorthand and runs git ls-remote (run 34098919609 died on exit 128).
-        run: npm publish ./npm-package/*.tgz --access public --ignore-scripts
+        # Same rules as the platform publish: `./` prefix, and a no-op when the
+        # registry already carries this version.
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          if [[ "$(npm view "@loctree/aicx@${RELEASE_VERSION}" version 2>/dev/null || true)" == "${RELEASE_VERSION}" ]]; then
+            echo "@loctree/aicx@${RELEASE_VERSION} is already on the registry; nothing to publish"
+            exit 0
+          fi
+          npm publish ./npm-package/*.tgz --access public --ignore-scripts
 
   smoke-cold-install:
     name: Cold npm install (${{ matrix.os }}, ${{ matrix.install_mode }})
@@ -286,14 +308,14 @@ jobs:
             Windows) platform_package="@loctree/aicx-win32-x64-gnu" ;;
           esac
           packages=("@loctree/aicx" "${platform_package}")
-          for attempt in {1..20}; do
+          for attempt in {1..60}; do
             missing=()
             for package in "${packages[@]}"; do
               published=$(npm view "${package}@${RELEASE_VERSION}" version 2>/dev/null || true)
               [[ "${published}" == "${RELEASE_VERSION}" ]] || missing+=("${package}")
             done
             [[ "${#missing[@]}" == 0 ]] && break
-            if [[ "${attempt}" == 20 ]]; then
+            if [[ "${attempt}" == 60 ]]; then
               echo "npm registry did not expose ${missing[*]} at ${RELEASE_VERSION}" >&2
               exit 1
             fi
