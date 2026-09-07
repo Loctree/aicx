@@ -34,7 +34,15 @@ hosted runner:
 
 Publish jobs consume those immutable tgz artifacts rather than repacking a
 checkout. Platform packages publish first; the wrapper publishes after registry
-propagation. The workflow never creates a release, tag, or version bump.
+propagation (up to 15 minutes — the ~50 MB platform tarballs have taken more
+than 5 minutes to become visible through `npm view`). The workflow never
+creates a release, tag, or version bump.
+
+Re-dispatching is safe after a partial run: packaging always runs from the
+dispatched workflow revision (only the release assets are tag-addressed), and
+every publish step is a no-op when the registry already carries that exact
+version, so a retry finishes the packages that are still missing instead of
+failing on the ones already published.
 
 ## Trusted publishers (OIDC)
 
