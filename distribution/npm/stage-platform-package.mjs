@@ -100,6 +100,15 @@ function gpgPath(candidate) {
   return execFileSync("cygpath", ["-u", candidate], { encoding: "utf8" }).trim();
 }
 
+// The same `shell: bash` step puts Git for Windows' GNU tar first on PATH. It
+// cannot read zip archives and parses `D:\...` as a remote host ("Cannot
+// connect to D: resolve failed"). Windows ships bsdtar in System32, which
+// handles both, so address it by absolute path instead of trusting PATH.
+function tarBinary() {
+  if (process.platform !== "win32") return "tar";
+  return path.join(process.env.SystemRoot ?? "C:\\Windows", "System32", "tar.exe");
+}
+
 try {
   if (verificationMode === "signed-release") {
     execFileSync("gpg", ["--batch", "--homedir", gpgPath(gpgHome), "--import", gpgPath(publicKeyPath)], {
@@ -113,9 +122,9 @@ try {
   }
 
   if (assetName.endsWith(".tar.gz")) {
-    execFileSync("tar", ["-xzf", archivePath, "-C", extractRoot], { stdio: "inherit" });
+    execFileSync(tarBinary(), ["-xzf", archivePath, "-C", extractRoot], { stdio: "inherit" });
   } else if (process.platform === "win32") {
-    execFileSync("tar", ["-xf", archivePath, "-C", extractRoot], { stdio: "inherit" });
+    execFileSync(tarBinary(), ["-xf", archivePath, "-C", extractRoot], { stdio: "inherit" });
   } else {
     execFileSync("unzip", ["-q", archivePath, "-d", extractRoot], { stdio: "inherit" });
   }
