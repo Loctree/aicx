@@ -1,9 +1,19 @@
 name: Publish npm
 
-# Publishes automatically when a GitHub Release is published (the npm package
-# is a thin wrapper around Release assets, so the Release must exist first);
+# Runs as the last job of release.yml through `workflow_call` once the signed
+# GitHub Release exists. A plain `release: published` trigger cannot do this:
+# release.yml creates the Release with the workflow's own GITHUB_TOKEN, and
+# GitHub never starts workflows from events made with that token — v0.13.0 was
+# released on 2026-09-02 and npm stayed at 0.12.5 because nothing fired.
+# `release: published` is kept for a Release a human publishes by hand;
 # workflow_dispatch stays as the manual fallback/re-run path.
 on:
+  workflow_call:
+    inputs:
+      version:
+        description: "Version to publish (x.y.z, without leading v)"
+        required: true
+        type: string
   release:
     types: [published]
   workflow_dispatch:
@@ -80,9 +90,10 @@ jobs:
             asset_triple: x86_64-pc-windows-msvc
             asset_ext: zip
     steps:
+      # Keep retry tooling on the revision that was dispatched. Release inputs
+      # remain tag-addressed below and are independently checksum/GPG verified.
+      # Checking out the tag here made post-release workflow fixes unreachable.
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
-        with:
-          ref: ${{ needs.verify.outputs.release_tag }}
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
@@ -150,9 +161,9 @@ jobs:
     needs: verify
     runs-on: ubuntu-latest
     steps:
+      # Manual retries must package with the dispatched workflow revision; the
+      # requested release version is still validated by the verify job.
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
-        with:
-          ref: ${{ needs.verify.outputs.release_tag }}
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24
@@ -174,6 +185,13 @@ jobs:
     name: Publish platform package ${{ matrix.platform }}
     needs: [verify, pack-platform-packages]
     runs-on: ubuntu-latest
+    # npm authenticates the run itself through the GitHub OIDC token; no
+    # long-lived npm token exists in this workflow. The trusted publisher on npmjs.com
+    # must name the *calling* workflow file (release.yml for the release chain,
+    # npm-publish.yml for a manual dispatch) — see distribution/npm/PUBLISHING.md.
+    permissions:
+      contents: read
+      id-token: write
     strategy:
       fail-fast: false
       matrix:
@@ -187,15 +205,32 @@ jobs:
         with:
           node-version: 24
           registry-url: "https://registry.npmjs.org"
-      - name: Publish attested tgz
+      - name: Pin npm 11.17.0 (trusted publishing needs >= 11.5.1)
+        run: npm install --global npm@11.17.0
+      - name: Publish attested tgz (OIDC trusted publisher)
+        # Leading ./ matters: npm reads a bare `dir/file.tgz` as a GitHub `owner/repo`
+        # shorthand and runs git ls-remote (run 34098919609 died on exit 128).
+        # Retries are a real path (a later job can fail after this one published),
+        # and npm refuses to publish over an existing version, so skip when the
+        # registry already has it.
+        shell: bash
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npm publish npm-package/*.tgz --access public --ignore-scripts
+          RELEASE_VERSION: ${{ needs.verify.outputs.version }}
+          PACKAGE: "@loctree/aicx-${{ matrix.platform }}"
+        run: |
+          if [[ "$(npm view "${PACKAGE}@${RELEASE_VERSION}" version 2>/dev/null || true)" == "${RELEASE_VERSION}" ]]; then
+            echo "${PACKAGE}@${RELEASE_VERSION} is already on the registry; nothing to publish"
+            exit 0
+          fi
+          npm publish ./npm-package/*.tgz --access public --ignore-scripts
 
   publish-wrapper:
     name: Publish wrapper package
     needs: [verify, pack-wrapper, publish-platform-packages]
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
@@ -215,23 +250,35 @@ jobs:
             "@loctree/aicx-linux-x64-gnu"
             "@loctree/aicx-win32-x64-gnu"
           )
-          for attempt in {1..20}; do
+          # ~50 MB platform tarballs took longer than 5 minutes to surface via
+          # `npm view` (run 34099268458); allow 15 minutes.
+          for attempt in {1..60}; do
             missing=()
             for package in "${packages[@]}"; do
               published=$(npm view "${package}@${RELEASE_VERSION}" version 2>/dev/null || true)
               [[ "${published}" == "${RELEASE_VERSION}" ]] || missing+=("${package}")
             done
             [[ "${#missing[@]}" == 0 ]] && break
-            if [[ "${attempt}" == 20 ]]; then
+            if [[ "${attempt}" == 60 ]]; then
               echo "npm registry did not expose ${missing[*]} at ${RELEASE_VERSION}" >&2
               exit 1
             fi
             sleep 15
           done
-      - name: Publish attested wrapper tgz
+      - name: Pin npm 11.17.0 (trusted publishing needs >= 11.5.1)
+        run: npm install --global npm@11.17.0
+      - name: Publish attested wrapper tgz (OIDC trusted publisher)
+        # Same rules as the platform publish: `./` prefix, and a no-op when the
+        # registry already carries this version.
+        shell: bash
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npm publish npm-package/*.tgz --access public --ignore-scripts
+          RELEASE_VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          if [[ "$(npm view "@loctree/aicx@${RELEASE_VERSION}" version 2>/dev/null || true)" == "${RELEASE_VERSION}" ]]; then
+            echo "@loctree/aicx@${RELEASE_VERSION} is already on the registry; nothing to publish"
+            exit 0
+          fi
+          npm publish ./npm-package/*.tgz --access public --ignore-scripts
 
   smoke-cold-install:
     name: Cold npm install (${{ matrix.os }}, ${{ matrix.install_mode }})
@@ -261,14 +308,14 @@ jobs:
             Windows) platform_package="@loctree/aicx-win32-x64-gnu" ;;
           esac
           packages=("@loctree/aicx" "${platform_package}")
-          for attempt in {1..20}; do
+          for attempt in {1..60}; do
             missing=()
             for package in "${packages[@]}"; do
               published=$(npm view "${package}@${RELEASE_VERSION}" version 2>/dev/null || true)
               [[ "${published}" == "${RELEASE_VERSION}" ]] || missing+=("${package}")
             done
             [[ "${#missing[@]}" == 0 ]] && break
-            if [[ "${attempt}" == 20 ]]; then
+            if [[ "${attempt}" == 60 ]]; then
               echo "npm registry did not expose ${missing[*]} at ${RELEASE_VERSION}" >&2
               exit 1
             fi

@@ -17,9 +17,13 @@ MSVC release binaries.
 
 ## Publish contract
 
-Publication is available only through the manual `npm-publish.yml` operator
-button after the matching signed GitHub Release exists. For each platform, a
-native runner:
+Publication runs as the last job of `release.yml` (`npm-publish` →
+`uses: ./.github/workflows/npm-publish.yml`) once the signed GitHub Release
+exists; `workflow_dispatch` on `npm-publish.yml` stays as the manual fallback
+and re-run path. The chain is explicit because GitHub never starts workflows
+from events created with `GITHUB_TOKEN`, so a `release: published` trigger
+cannot see releases that `release.yml` itself creates. For each platform, a
+hosted runner:
 
 1. downloads the archive, `.sha256`, `.asc`, and release public key;
 2. verifies SHA-256 and the detached GPG signature;
@@ -30,7 +34,46 @@ native runner:
 
 Publish jobs consume those immutable tgz artifacts rather than repacking a
 checkout. Platform packages publish first; the wrapper publishes after registry
-propagation. The workflow never creates a release, tag, or version bump.
+propagation (up to 15 minutes — the ~50 MB platform tarballs have taken more
+than 5 minutes to become visible through `npm view`). The workflow never
+creates a release, tag, or version bump.
+
+Re-dispatching is safe after a partial run: packaging always runs from the
+dispatched workflow revision (only the release assets are tag-addressed), and
+every publish step is a no-op when the registry already carries that exact
+version, so a retry finishes the packages that are still missing instead of
+failing on the ones already published.
+
+## Trusted publishers (OIDC)
+
+The publish jobs carry no npm token. They authenticate with the GitHub OIDC
+token (`permissions: id-token: write`, granted on the publish jobs and on the
+`npm-publish` caller job in `release.yml`), and npm accepts it only when the
+package lists a matching trusted publisher. npm validates the **calling**
+workflow file, so every package needs two GitHub Actions publishers on
+npmjs.com (Settings → Trusted Publisher), each with `Allow npm publish` on
+and no environment name:
+
+| Organization / Repository | Workflow filename | Covers |
+| --- | --- | --- |
+| `Loctree` / `aicx` | `release.yml` | the automatic chain after a signed Release |
+| `Loctree` / `aicx` | `npm-publish.yml` | manual `workflow_dispatch` re-runs |
+
+Repeat for `@loctree/aicx`, `@loctree/aicx-darwin-arm64`,
+`@loctree/aicx-linux-x64-gnu`, and `@loctree/aicx-win32-x64-gnu` (eight
+entries). From a web-authenticated npm login (`npm login`, 2FA):
+
+```bash
+for p in @loctree/aicx @loctree/aicx-darwin-arm64 @loctree/aicx-linux-x64-gnu @loctree/aicx-win32-x64-gnu; do
+  npm trust github "$p" --file release.yml     --repo Loctree/aicx --allow-publish --yes
+  npm trust github "$p" --file npm-publish.yml --repo Loctree/aicx --allow-publish --yes
+done
+```
+
+Tokens that bypass 2FA cannot manage trusted publishers (the registry answers
+403 on the trust endpoint). After the first OIDC publish succeeds, switch each
+package's publishing access to "Require two-factor authentication and disallow
+bypass 2fa tokens" — that retires the old `NPM_TOKEN` path for good.
 
 ## Local metadata gate
 
