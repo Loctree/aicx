@@ -69,6 +69,15 @@ fn cwd_nests_encoded(here: &str, repo: &str) -> bool {
     nests_under(&here, &repo, '-') || nests_under(&repo, &here, '-')
 }
 
+/// Cursor flavour of [`cwd_nests_encoded`]: both sides go through
+/// [`encode_cursor_project_slug`] (every non-alphanumeric run → `-`), the
+/// same projection the pre-read directory prune uses.
+fn cwd_nests_cursor_encoded(here: &str, repo: &str) -> bool {
+    let here = encode_cursor_project_slug(here);
+    let repo = encode_cursor_project_slug(repo);
+    nests_under(&here, &repo, '-') || nests_under(&repo, &here, '-')
+}
+
 /// How a session was associated with a project/repo: directly read from the
 /// session's own `cwd`, or inferred from the on-disk directory encoding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -1297,7 +1306,7 @@ pub fn discover_cursor_sessions(
 
 /// Encode a cwd the way Cursor names `~/.cursor/projects/<slug>`: every run of
 /// non-alphanumeric characters collapses to one `-`, edges trimmed
-/// (`/Users/x/.vibecrafted` → `Users-x-vibecrafted`). Used for ENCODED-space
+/// (`/Users/x/.vibecrafted` → `users-x-vibecrafted`, lowercased). Used for ENCODED-space
 /// cwd pruning; decoding stays lossy inference.
 pub(crate) fn encode_cursor_project_slug(path: &str) -> String {
     let mut out = String::new();
@@ -1981,8 +1990,13 @@ pub fn select_sessions(
             s.repo_path.as_deref().is_some_and(|p| {
                 // Inferred repo paths were decoded from a lossy dir encoding
                 // ('-' -> '/'), so compare those in the ENCODED space; exact
-                // recorded cwds compare as real paths.
-                if s.association == Association::Inferred {
+                // recorded cwds compare as real paths. Cursor's slug collapses
+                // every non-alphanumeric run (dots, underscores too), so its
+                // inferred paths need the cursor encoder on both sides — the
+                // Claude '/'→'-' encoder would drop `/Users/x/.vibecrafted`.
+                if s.association == Association::Inferred && s.agent == "cursor" {
+                    cwd_nests_cursor_encoded(here, p)
+                } else if s.association == Association::Inferred {
                     cwd_nests_encoded(here, p)
                 } else {
                     cwd_nests(here, p)
@@ -2007,6 +2021,29 @@ pub fn select_sessions(
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn cursor_inferred_cwd_filter_survives_dots_and_underscores() {
+        // Cursor slug: `/Users/x/.vibecrafted/my_repo` -> `users-x-vibecrafted-my-repo`,
+        // decoded back (lossy) as `Users/x/vibecrafted/my/repo`. The Claude-style
+        // encoder keeps the dot and underscore in `here`, so it can never match.
+        let decoded = decode_cursor_project_slug("Users-x-vibecrafted-my-repo")
+            .expect("slug with a leading Users segment decodes");
+        assert!(!cwd_nests_encoded(
+            "/Users/x/.vibecrafted/my_repo",
+            &decoded
+        ));
+        assert!(cwd_nests_cursor_encoded(
+            "/Users/x/.vibecrafted/my_repo",
+            &decoded
+        ));
+        // Nesting works both ways and a sibling never matches.
+        assert!(cwd_nests_cursor_encoded("/Users/x/.vibecrafted", &decoded));
+        assert!(!cwd_nests_cursor_encoded(
+            "/Users/x/.vibecrafted/other",
+            &decoded
+        ));
+    }
 
     fn write_session(dir: &Path, name: &str, lines: &[&str]) {
         let path = dir.join(name);

@@ -202,9 +202,15 @@ pub fn extract_agent_sessions(
                 // harness <timestamp> wrapper) project UNIX_EPOCH entries,
                 // which the cutoff/watermark retain below would delete in
                 // full — a "CompleteVisible parse, zero output" lie. Fall
-                // back to the source file's mtime and say so.
+                // back to the source file's mtime and say so. Cursor only:
+                // other transports carry their own clocks, and an UNIX_EPOCH
+                // entry there is a genuinely unknown timestamp that the
+                // cutoff/watermark semantics must keep treating as unknown.
+                let cursor_wallclock_fallback =
+                    matches!(agent, crate::session_catalog::AgentKind::Cursor);
                 if let Some(mtime) =
                     datetime_from_unix_nanos(source.fingerprint.modified_unix_nanos)
+                        .filter(|_| cursor_wallclock_fallback)
                 {
                     for entry in &mut session_entries {
                         if entry.timestamp == DateTime::<Utc>::UNIX_EPOCH
