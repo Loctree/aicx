@@ -137,7 +137,7 @@ fn refresh_catalog_and_index(hours: u64) -> anyhow::Result<()> {
     }
 
     let _lock = crate::locks::acquire_exclusive(crate::locks::lance_lock_path()?)?;
-    let report = crate::source_index::build(&aicx_home, &[], false, false, false, false)?;
+    let report = crate::source_index::build(&aicx_home, &[], false, false, false)?;
     tracing::info!(
         target: "mcp.refresh",
         changed_sessions = refresh.changed_sessions,

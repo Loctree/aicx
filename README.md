@@ -24,12 +24,10 @@ There is no per-frame card mill and no `aicx store` command.
    recency prior. `--deep` explicitly adds dense mmap re-ranking.
 
 ```bash
-aicx catalog status          # granular identity staleness (no write)
-aicx catalog refresh         # bounded daily admission + remote identity repair
-aicx catalog rebuild
+aicx index                   # the one rebuild command: census + incremental parse + publish
 aicx index status            # lexical_status + dense_status planes
-aicx index                   # lexical CURRENT (every machine)
 aicx index --semantic        # opt-in dense on owner workstation
+aicx catalog status          # power user: identity staleness without a write (see --help-full)
 aicx search 'arrows vc-frame'
 aicx search --deep '…'       # needs --semantic on this home
 aicx search -p vetcoders/vibecrafted 'routing strzałek taby'

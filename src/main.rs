@@ -84,8 +84,9 @@ fn print_intent_schema_migration_report(report: &intents::MigrationReport) {
 ///   Extracts: render one readable user/assistant transcript per session.
 ///   Index: lexical-first Tantivy over extracts; dense rerank is optional.
 /// Quick start:
-///   aicx catalog rebuild
-///   aicx index
+///   aicx index                 # census + incremental parse + publish (one command)
+///   aicx search '<query>'
+/// Power-user surfaces (catalog, extracts, intents, migrations): aicx --help-full
 #[derive(Debug, Parser)]
 #[command(name = "aicx")]
 #[command(author = "(c)2026 Vetcoders")]
@@ -105,6 +106,12 @@ struct Cli {
     /// and an ambiguous bare repository name fails closed.
     #[arg(long, global = true)]
     project_fuzzy: bool,
+
+    /// Show every command, including the power-user surfaces hidden from
+    /// the short help (catalog internals, per-agent extractors, intents,
+    /// migrations, archive readers).
+    #[arg(long)]
+    help_full: bool,
 
     #[command(subcommand)]
     command: Option<Commands>,
@@ -997,6 +1004,7 @@ enum Commands {
     /// is **retired**. There is no palette command named "canonical ingest".
     /// Recovery: `aicx catalog rebuild` then `aicx intents -p <owner/repo>`,
     /// then re-run overlay. `aicx ingest` is operator-md / loct-context-pack only.
+    #[command(hide = true)]
     Overlay {
         /// Repository whose `loct anchors` catalog is the attribution target.
         #[arg(long)]
@@ -1016,7 +1024,7 @@ enum Commands {
     ///
     /// Reads claude-code session files, then
     /// writes readable Markdown/JSON reports only when an output is requested.
-    #[command(display_order = 2)]
+    #[command(hide = true, display_order = 2)]
     Claude {
         #[command(flatten)]
         redaction: RedactionArgs,
@@ -1086,7 +1094,7 @@ enum Commands {
     ///
     /// Reads codex session files, then
     /// writes readable Markdown/JSON reports only when an output is requested.
-    #[command(display_order = 3)]
+    #[command(hide = true, display_order = 3)]
     Codex {
         #[command(flatten)]
         redaction: RedactionArgs,
@@ -1158,7 +1166,7 @@ enum Commands {
     /// writes steerable markdown to ~/.aicx/. By default, uses per-source
     /// watermarks to skip already-processed entries. Use --full-rescan to
     /// ignore the watermark and scan the full lookback window again.
-    #[command(display_order = 1)]
+    #[command(hide = true, display_order = 1)]
     All {
         #[command(flatten)]
         redaction: RedactionArgs,
@@ -1276,7 +1284,7 @@ enum Commands {
     ///
     /// Thin wrapper around `aicx extract --conversation` semantics: scans source
     /// sessions, groups by session_id, and writes one JSON file per session.
-    #[command(display_order = 6)]
+    #[command(hide = true, display_order = 6)]
     Conversations {
         #[command(flatten)]
         redaction: RedactionArgs,
@@ -1325,14 +1333,14 @@ enum Commands {
     /// name now points at this catalog engine (readable extract-era catalog,
     /// no `~/.aicx/store/` card materialization) rather than the removed
     /// card-writing engine.
-    #[command(display_order = 3, visible_alias = "store")]
+    #[command(hide = true, display_order = 3, visible_alias = "store")]
     Catalog {
         #[command(subcommand)]
         action: CatalogAction,
     },
 
     /// Ingest operator-owned source documents into the canonical corpus.
-    #[command(display_order = 5)]
+    #[command(hide = true, display_order = 5)]
     Ingest {
         #[command(flatten)]
         redaction: RedactionArgs,
@@ -1376,11 +1384,11 @@ enum Commands {
     /// Shows Claude Code, Codex, Gemini, Junie, and Grok log paths with session
     /// counts and sizes. This is what extractors will read from — use
     /// `catalog resolve` / `extract` to inspect identity and readable transcripts.
-    #[command(display_order = 10)]
+    #[command(hide = true, display_order = 10)]
     List,
 
     /// Audit and explicitly protect raw source roots.
-    #[command(display_order = 10)]
+    #[command(hide = true, display_order = 10)]
     Sources {
         #[command(subcommand)]
         command: SourcesCommands,
@@ -1394,21 +1402,21 @@ enum Commands {
     },
 
     /// Lane 2: extract agent claims (audit targets) from a session.
-    #[command(display_order = 6)]
+    #[command(hide = true, display_order = 6)]
     Claims {
         #[command(subcommand)]
         command: ClaimsCommand,
     },
 
     /// Lane 3: collect repo evidence for a session's claims and verify them.
-    #[command(display_order = 6)]
+    #[command(hide = true, display_order = 6)]
     Results {
         #[command(subcommand)]
         command: ResultsCommand,
     },
 
     /// Lane 5: generate at most 5 A/B/C decision questions from verified gaps.
-    #[command(display_order = 6)]
+    #[command(hide = true, display_order = 6)]
     Clarify {
         /// Session id (or unique prefix).
         #[arg(long)]
@@ -1468,7 +1476,7 @@ enum Commands {
     ///
     /// Shows what the extract-era identity path has already materialised
     /// (extracts cache and legacy card trees if still present on disk).
-    #[command(display_order = 11)]
+    #[command(hide = true, display_order = 11)]
     Refs {
         /// Hours to look back (filter by canonical chunk date)
         #[arg(short = 'H', long, default_value = "48")]
@@ -1495,6 +1503,7 @@ enum Commands {
     },
 
     /// Manage extraction dedup state (watermarks and hashes).
+    #[command(hide = true)]
     State {
         /// Reset all dedup hashes
         #[arg(long)]
@@ -1512,12 +1521,15 @@ enum Commands {
     },
 
     /// Generate a searchable HTML dashboard from extracts/catalog, or serve it locally.
+    #[command(hide = true)]
     Dashboard(#[command(flatten)] DashboardArgs),
 
     /// Extract Vibecrafted workflow and marbles reports into a standalone HTML explorer.
+    #[command(hide = true)]
     Reports(#[command(flatten)] ReportsArgs),
 
     /// Audit or repair derived corpus markdown.
+    #[command(hide = true)]
     Corpus(#[command(flatten)] CorpusArgs),
 
     /// Deprecated compatibility shim for `aicx reports`.
@@ -1529,6 +1541,7 @@ enum Commands {
     DashboardServeLegacy(#[command(flatten)] DashboardServeLegacyArgs),
 
     /// Extract structured intents from the durable catalog and allowlisted session sources.
+    #[command(hide = true)]
     Intents {
         /// Catalog project filters. Omit to scan all projects.
         /// Repeated `-p` flags or comma list (`-p a,b`) form a union.
@@ -1595,6 +1608,7 @@ enum Commands {
     },
 
     /// Print recent intents/chunks (snapshot mode); add --follow to stream new arrivals.
+    #[command(hide = true)]
     Tail {
         /// Catalog project filters. Omit to scan all projects.
         /// Repeated `-p` flags or comma list (`-p a,b`) form a union.
@@ -1834,7 +1848,7 @@ enum Commands {
     },
 
     /// Run local evaluation helpers for retrieval/search quality.
-    #[command(display_order = 13)]
+    #[command(hide = true, display_order = 13)]
     Eval {
         #[command(subcommand)]
         action: EvalAction,
@@ -1894,10 +1908,10 @@ enum Commands {
         #[arg(long)]
         full_rescan: bool,
 
-        /// Cache one readable conversation extract per indexed session under
-        /// `~/.aicx/extracts/`. Omit to keep content only in live sources and
-        /// Tantivy (zero filesystem content duplication).
-        #[arg(long)]
+        /// Compatibility no-op: extracts and the reuse ledger are always
+        /// written now, so a second `aicx index` re-parses only changed
+        /// sessions. Accepted so wizard and scripts keep working.
+        #[arg(long, hide = true)]
         cache_extracts: bool,
 
         /// Opt-in dense semantic generation: embed session extracts and publish
@@ -1918,7 +1932,7 @@ enum Commands {
     ///
     /// This closes the discover -> read loop: pass a path from `aicx search`,
     /// `aicx refs --emit paths`, dashboard `/api/chunk`, or MCP search results.
-    #[command(display_order = 14, visible_alias = "open")]
+    #[command(hide = true, display_order = 14, visible_alias = "open")]
     Read {
         /// Absolute path, archive-relative path, file name, legacy compact ref, or `chunk:<id>`
         reference: String,
@@ -1933,6 +1947,7 @@ enum Commands {
     },
 
     /// Retrieve chunks by metadata from the published CURRENT index.
+    #[command(hide = true)]
     Steer {
         /// Filter by run_id (exact match)
         #[arg(long)]
@@ -1965,6 +1980,7 @@ enum Commands {
     },
 
     /// Migrate legacy ~/.ai-contexters/ artifacts into the AICX legacy archive.
+    #[command(hide = true)]
     Migrate {
         /// Dry run: show what would be moved without modifying files
         #[arg(long)]
@@ -1995,7 +2011,7 @@ enum Commands {
     },
 
     /// Classify legacy archive chunks into 11-type intent entries and report counts.
-    #[command(name = "migrate-intent-schema")]
+    #[command(hide = true, name = "migrate-intent-schema")]
     MigrateIntentSchema {
         /// Strict project filter: `owner/repo`, `/repo` (cross-org repo
         /// name), `owner/` (org wildcard), or a unique exact `name`.
@@ -2174,11 +2190,11 @@ enum Commands {
     /// diagnostics write. Checks whose truth needs the recursive pass are
     /// reported with `"severity": "unknown"` plus the exact deep command
     /// (`aicx doctor --deep`); unknown is never upgraded to healthy.
-    #[command(display_order = 11)]
+    #[command(hide = true, display_order = 11)]
     Health,
 
     /// Warm/probe the configured local embedder before interactive search.
-    #[command(display_order = 15)]
+    #[command(hide = true, display_order = 15)]
     Warmup {
         /// Emit JSON instead of readable text
         #[arg(short = 'j', long)]
@@ -2432,6 +2448,14 @@ fn main() -> Result<()> {
     }
 
     let cli = Cli::parse();
+    if cli.help_full {
+        let mut full = full_help_command();
+        if let Err(error) = full.print_long_help() {
+            eprintln!("aicx: cannot render full help: {error}");
+            std::process::exit(2);
+        }
+        return Ok(());
+    }
 
     let diagnostics_state_dir = aicx::aicx_home::ensure().ok().map(|d| d.join("state"));
     let _ = aicx::diagnostics::init(cli.verbose, diagnostics_state_dir);
@@ -3146,7 +3170,7 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
             json,
             dry_run,
             full_rescan,
-            cache_extracts,
+            cache_extracts: _always_on,
             semantic,
         }) => match action {
             Some(IndexAction::Status { project, json }) => {
@@ -3167,15 +3191,7 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
                         "index"
                     });
                 }
-                run_index(
-                    &project,
-                    sample,
-                    json,
-                    dry_run,
-                    full_rescan,
-                    cache_extracts,
-                    semantic,
-                )?
+                run_index(&project, sample, json, dry_run, full_rescan, semantic)?
             }
         },
         Some(Commands::Config { action }) => {
@@ -7040,6 +7056,20 @@ const MUTATION_WARN_DELAY_SECONDS_DEFAULT: u64 = 3;
 /// The delay (default 3s) is configurable via
 /// `AICX_MUTATION_WARN_DELAY_SECONDS`. A value of `0` keeps the warning
 /// but skips the sleep entirely.
+/// Legacy spellings kept only so old scripts keep resolving; they never show
+/// up in any help, short or full.
+const ALWAYS_HIDDEN_COMMANDS: &[&str] = &["dashboard-serve", "reports-extractor"];
+
+/// Daily drivers stay on `--help`; every power-user surface is one flag away
+/// (`--help-full`) instead of being deleted, so scripts and the wizard keep
+/// working while the front door lists what a newcomer needs.
+fn full_help_command() -> clap::Command {
+    Cli::command().mut_subcommands(|sub| {
+        let legacy = ALWAYS_HIDDEN_COMMANDS.contains(&sub.get_name());
+        sub.hide(legacy)
+    })
+}
+
 fn warn_pending_mutation(cmd: &str) {
     if mutation_warn_suppressed() {
         return;
@@ -8025,7 +8055,7 @@ fn run_catalog_rebuild(json: bool, with_chunks: bool) -> Result<()> {
             "aicx catalog rebuild: draining {} pending chunk(s) via `aicx index`",
             report.pending_chunks
         );
-        run_index(&[], 0, json, false, false, false, false)?;
+        run_index(&[], 0, json, false, false, false)?;
         report.pending_chunks = aicx::api::index_status_at(&aicx_home_for_status, None)
             .map(|status| status.pending_chunks)
             .unwrap_or(report.pending_chunks);
@@ -9013,18 +9043,68 @@ impl SemanticFallbackNotice {
 /// in-memory extract per session and publishes Tantivy directly; it writes
 /// readable extract files only with `--cache-extracts`, and never materializes
 /// per-frame cards or embedding NDJSON intermediates.
+/// Hot window for the census `aicx index` runs before parsing. Mirrors the
+/// wizard's refresh screen so both entry points admit the same sessions.
+const INDEX_CENSUS_HOURS: u64 = 48;
+
+/// `aicx index` is the one rebuild command. Before parsing it refreshes the
+/// session census itself (a missing catalog gets the full first census), so
+/// nobody has to remember `catalog refresh` as a separate step — running
+/// only the refresh and seeing no new search hits was the most common
+/// "aicx does nothing" report.
+fn run_index_census(aicx_home: &Path, reporter: Arc<dyn aicx::progress::Reporter>) -> Result<()> {
+    let user_home = aicx::os_user_home().context("No home dir")?;
+    let phase = aicx::progress::Phase::start(reporter, "census", None);
+    let hb = aicx::progress::Heartbeat::spawn_with_backoff(
+        phase.clone(),
+        Duration::from_secs(2),
+        Duration::from_secs(15),
+    );
+    let outcome = if aicx::catalog::sessions_path_for(aicx_home).is_file() {
+        let cutoff_ns = lookback_cutoff(INDEX_CENSUS_HOURS)
+            .timestamp_nanos_opt()
+            .map(|value| value.max(0) as u128)
+            .unwrap_or(0);
+        aicx::catalog::refresh_hot(aicx_home, &user_home, cutoff_ns).map(|report| {
+            format!(
+                "hot={INDEX_CENSUS_HOURS}h changed={} admitted={} total={}",
+                report.changed_sessions, report.admitted_sessions, report.total_sessions
+            )
+        })
+    } else {
+        aicx::catalog::rebuild_with_progress(aicx_home, &user_home, |_| {})
+            .map(|report| format!("first census: {} session(s)", report.total_sessions))
+    };
+    hb.stop();
+    match outcome {
+        Ok(summary) => {
+            phase.finish_ok(summary);
+            Ok(())
+        }
+        Err(error) => {
+            phase.finish_err(&error, aicx::progress::recovery_hint_for("census"));
+            Err(error)
+        }
+    }
+}
+
 fn run_index(
     projects: &[String],
     _sample: usize,
     json: bool,
     dry_run: bool,
     full_rescan: bool,
-    cache_extracts: bool,
     semantic: bool,
 ) -> Result<()> {
     let resolved_scopes = resolve_index_scopes(projects)?;
     let filters: Vec<String> = resolved_scopes.into_iter().flatten().collect();
     let aicx_home = aicx::aicx_home::resolve()?;
+    // Terminal: live `[aicx][phase=...]` lines with a heartbeat. --json keeps
+    // stdout for the report and moves the phase events to stderr.
+    let reporter = aicx::progress::select_reporter(json);
+    if !dry_run {
+        run_index_census(&aicx_home, reporter.clone())?;
+    }
     let _lock = if dry_run {
         None
     } else {
@@ -9032,13 +9112,13 @@ fn run_index(
             aicx::locks::lance_lock_path()?,
         )?)
     };
-    let report = aicx::source_index::build(
+    let report = aicx::source_index::build_with_reporter(
         &aicx_home,
         &filters,
         dry_run,
         full_rescan,
-        cache_extracts,
         semantic,
+        reporter,
     )?;
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -9083,7 +9163,7 @@ fn run_index(
             eprintln!("  next: aicx search --deep '<query>' uses dense RRF on this CURRENT");
         } else if !report.semantic_requested {
             eprintln!(
-                "  note: dense not built (feature). Opt in with `aicx index --semantic` on the owner host."
+                "  lexical index ready for `aicx search`. Dense rerank is opt-in: `aicx index --semantic`."
             );
         }
     }

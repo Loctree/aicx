@@ -2176,14 +2176,56 @@ fn steer_help_stays_short_and_scope_oriented() {
 }
 
 #[test]
-fn top_level_help_hides_legacy_dashboard_and_reports_commands() {
+fn top_level_help_lists_daily_drivers_only() {
     let mut cmd = Cli::command();
     let rendered = cmd.render_long_help().to_string();
 
+    // The one rebuild command and the reader are the front door.
+    assert!(rendered.contains("\n  index "));
+    assert!(rendered.contains("\n  search "));
+    assert!(rendered.contains("aicx index                 # census + incremental parse + publish"));
+    assert!(!rendered.contains("aicx catalog rebuild"));
+
+    // Power-user surfaces move behind --help-full instead of being removed.
+    for hidden in [
+        "catalog",
+        "dashboard",
+        "reports",
+        "intents",
+        "migrate",
+        "claude",
+        "codex",
+    ] {
+        assert!(
+            !rendered.contains(&format!("\n  {hidden} ")),
+            "{hidden} must not appear in the short help"
+        );
+    }
     assert!(!rendered.contains("dashboard-serve"));
     assert!(!rendered.contains("reports-extractor"));
-    assert!(rendered.contains("\n  dashboard "));
-    assert!(rendered.contains("\n  reports "));
+}
+
+#[test]
+fn help_full_reveals_power_user_commands_but_never_legacy_spellings() {
+    let mut cmd = full_help_command();
+    let rendered = cmd.render_long_help().to_string();
+
+    for shown in [
+        "catalog",
+        "dashboard",
+        "reports",
+        "intents",
+        "migrate",
+        "index",
+        "search",
+    ] {
+        assert!(
+            rendered.contains(&format!("\n  {shown} ")),
+            "{shown} must appear in --help-full"
+        );
+    }
+    assert!(!rendered.contains("dashboard-serve"));
+    assert!(!rendered.contains("reports-extractor"));
 }
 
 #[test]

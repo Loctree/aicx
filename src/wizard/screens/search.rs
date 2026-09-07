@@ -311,10 +311,8 @@ impl SearchScreen {
                             "missing"
                         }
                     ));
-                    self.repair_hint = Some(
-                        "Repair: aicx catalog rebuild && aicx index   (wizard: screen 4 → s)"
-                            .to_string(),
-                    );
+                    self.repair_hint =
+                        Some("Repair: aicx index   (wizard: screen 4 → s)".to_string());
                 } else if matches!(
                     status.readiness,
                     IndexReadiness::StaleIndex
@@ -322,11 +320,11 @@ impl SearchScreen {
                         | IndexReadiness::PendingScanTimeout
                 ) {
                     self.drift_banner = Some(format!(
-                        "NOTE: index readiness={readiness} host={host} gen={generation} committed={committed} pending={}",
+                        "NOTE: {} session(s) changed since index gen={generation} committed={committed} host={host} (readiness={readiness})",
                         status.pending_chunks
                     ));
                     self.repair_hint = Some(
-                        "Lexical may still work. If search fails schema/stale: aicx index"
+                        "Search works on the committed generation; `aicx index` folds the changed sessions in"
                             .to_string(),
                     );
                 } else if !catalog_present {

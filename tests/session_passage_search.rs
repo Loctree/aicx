@@ -31,9 +31,15 @@ fn write_file(path: &Path, content: &str) {
 
 fn run_aicx(aicx_home: &Path, args: &[&str]) -> Output {
     fs::create_dir_all(aicx_home).expect("create scratch AICX_HOME");
+    // `aicx index` runs the session census itself; pin HOME to the scratch
+    // root so it sees no real agent trees and the corpus stays exactly the
+    // seeded session (same isolation as the other e2e suites).
+    let scratch_home = aicx_home.parent().unwrap_or(aicx_home);
     Command::new(env!("CARGO_BIN_EXE_aicx"))
         .args(args)
         .env("AICX_HOME", aicx_home)
+        .env("HOME", scratch_home)
+        .env("USERPROFILE", scratch_home)
         .env("AICX_ALLOW_TMP", "1")
         .output()
         .expect("run aicx")

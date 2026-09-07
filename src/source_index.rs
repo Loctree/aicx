@@ -10,7 +10,8 @@ use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use chrono::SecondsFormat;
@@ -18,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::catalog::CatalogEntry;
+use crate::progress::{Heartbeat, NoopReporter, Phase, Reporter};
 use crate::timeline::{FrameKind, TimelineEntry};
 
 const MAX_MESSAGE_CHARS: usize = 256 * 1024;
@@ -189,13 +191,41 @@ struct SessionParseRecord {
 /// selected source fingerprint match the CURRENT generation, reuse is free.
 /// A catalog rebuild that re-stats sources admits appends/edits; per-session
 /// parse state reuses only extracts whose source fingerprint still matches.
+/// Silent form of [`build_with_reporter`] for callers with no terminal (MCP
+/// auto-refresh, scheduler): progress goes nowhere, the report is identical.
 pub fn build(
     aicx_home: &Path,
     project_filters: &[String],
     dry_run: bool,
     full_rescan: bool,
-    cache_extracts: bool,
     semantic: bool,
+) -> Result<SourceIndexReport> {
+    build_with_reporter(
+        aicx_home,
+        project_filters,
+        dry_run,
+        full_rescan,
+        semantic,
+        Arc::new(NoopReporter),
+    )
+}
+
+/// Build the source-driven index and narrate it through `reporter`: an
+/// `index_parse` phase ticking once per cataloged source (heartbeat keeps a
+/// slow parse visibly alive) and an `index_publish` phase for the generation
+/// flip. A full pass over ~14k sessions is a six-to-twelve minute job; before
+/// this the command printed nothing between the mutation note and the summary.
+///
+/// Extracts and the reuse ledger are always written: without the ledger every
+/// run re-parsed the whole catalog (`reused=0`), which is what made `index`
+/// feel broken on every laptop.
+pub fn build_with_reporter(
+    aicx_home: &Path,
+    project_filters: &[String],
+    dry_run: bool,
+    full_rescan: bool,
+    semantic: bool,
+    reporter: Arc<dyn Reporter>,
 ) -> Result<SourceIndexReport> {
     let started = Instant::now();
     if !dry_run && !project_filters.is_empty() {
@@ -215,7 +245,8 @@ pub fn build(
     let entries = crate::catalog::read_entries_at(aicx_home)?;
     if entries.is_empty() {
         anyhow::bail!(
-            "session catalog is empty at {}; run `aicx catalog rebuild` first",
+            "session catalog is empty at {}; no agent sessions were discovered under the known \
+             roots (see `aicx sources`)",
             catalog_path.display()
         );
     }
@@ -299,7 +330,14 @@ pub fn build(
         load_parse_state(aicx_home, &repo_path_ignore_fingerprint)
     };
 
+    let parse_phase = Phase::start(reporter.clone(), "index_parse", Some(selected.len() as u64));
+    let parse_hb = Heartbeat::spawn_with_backoff(
+        parse_phase.clone(),
+        Duration::from_secs(2),
+        Duration::from_secs(15),
+    );
     for entry in &selected {
+        parse_phase.tick((sources_parsed + sources_reused + sources_skipped) as u64);
         let session_key = session_state_key(&entry.agent, &entry.session_id);
 
         // True incremental: reuse a prior extract only when the source
@@ -379,13 +417,10 @@ pub fn build(
             continue;
         }
         let extract_path = extract_path_for(aicx_home, &entry.agent, &entry.session_id);
-        if !dry_run
-            && cache_extracts
-            && write_if_changed(aicx_home, &extract_path, extract.as_bytes())?
-        {
+        if !dry_run && write_if_changed(aicx_home, &extract_path, extract.as_bytes())? {
             extracts_written += 1;
         }
-        let indexed_path = if !dry_run && cache_extracts {
+        let indexed_path = if !dry_run {
             extract_path.clone()
         } else {
             source_path.to_path_buf()
@@ -419,35 +454,36 @@ pub fn build(
             metadata,
         });
 
-        if cache_extracts {
-            let rel = extract_path
-                .strip_prefix(aicx_home)
-                .map(|p| p.to_path_buf())
-                .unwrap_or_else(|_| extract_path.clone());
-            // Always stamp LIVE stats into the parse ledger so reuse survives
-            // catalog lag (append without catalog rebuild still reuses later
-            // once CURRENT has the new extract).
-            let (source_len, source_mtime_ns) =
-                crate::catalog::live_source_fingerprint(&source_path)
-                    .unwrap_or_else(|| resolve_entry_fingerprint(entry, &source_path));
-            next_state.sessions.insert(
-                session_key,
-                SessionParseRecord {
-                    source_path: entry.source_path.clone(),
-                    source_len,
-                    source_mtime_ns,
-                    extract_relpath: rel.to_string_lossy().replace('\\', "/"),
-                    extract_sha256: sha256_hex(extract.as_bytes()),
-                    raw_frames: raw_count,
-                    signal_frames: signal_count,
-                    filtered_frames: filtered_count,
-                    project: entry.project.clone(),
-                    date: entry.date.clone().or(Some(date)),
-                    cwd: entry.cwd.clone(),
-                },
-            );
-        }
+        let rel = extract_path
+            .strip_prefix(aicx_home)
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|_| extract_path.clone());
+        // Always stamp LIVE stats into the parse ledger so reuse survives
+        // catalog lag (append without catalog rebuild still reuses later
+        // once CURRENT has the new extract).
+        let (source_len, source_mtime_ns) = crate::catalog::live_source_fingerprint(&source_path)
+            .unwrap_or_else(|| resolve_entry_fingerprint(entry, &source_path));
+        next_state.sessions.insert(
+            session_key,
+            SessionParseRecord {
+                source_path: entry.source_path.clone(),
+                source_len,
+                source_mtime_ns,
+                extract_relpath: rel.to_string_lossy().replace('\\', "/"),
+                extract_sha256: sha256_hex(extract.as_bytes()),
+                raw_frames: raw_count,
+                signal_frames: signal_count,
+                filtered_frames: filtered_count,
+                project: entry.project.clone(),
+                date: entry.date.clone().or(Some(date)),
+                cwd: entry.cwd.clone(),
+            },
+        );
     }
+    parse_hb.stop();
+    parse_phase.finish_ok(format!(
+        "parsed={sources_parsed} reused={sources_reused} skipped={sources_skipped}"
+    ));
 
     if chunks.is_empty() {
         anyhow::bail!(
@@ -456,6 +492,12 @@ pub fn build(
         );
     }
 
+    let publish_phase = Phase::start(reporter.clone(), "index_publish", None);
+    let publish_hb = Heartbeat::spawn_with_backoff(
+        publish_phase.clone(),
+        Duration::from_secs(2),
+        Duration::from_secs(15),
+    );
     let (manifest_path, dense_docs, dense_kind) = if dry_run {
         (
             None,
@@ -474,7 +516,7 @@ pub fn build(
             &source_fingerprint,
             &fingerprint,
         )?;
-        if cache_extracts && project_filters.is_empty() {
+        if project_filters.is_empty() {
             write_parse_state(aicx_home, &next_state)?;
         }
         let path = crate::vector_index::hybrid_manifest_path(None)?
@@ -490,7 +532,7 @@ pub fn build(
             crate::vector_index::publish_source_lexical_generation(&chunks, &source_fingerprint)?;
         // Persist parse state only after a successful publish so a killed build
         // cannot claim sessions are current when CURRENT never flipped.
-        if cache_extracts && project_filters.is_empty() {
+        if project_filters.is_empty() {
             write_parse_state(aicx_home, &next_state)?;
         }
         let path = crate::vector_index::hybrid_manifest_path(None)?
@@ -502,6 +544,12 @@ pub fn build(
             "optional_not_built".to_string(),
         )
     };
+    publish_hb.stop();
+    publish_phase.finish_ok(format!(
+        "lexical_docs={} dense_docs={dense_docs}{}",
+        chunks.len(),
+        if dry_run { " (dry run)" } else { "" }
+    ));
 
     Ok(SourceIndexReport {
         catalog_path: catalog_path.display().to_string(),
@@ -1565,7 +1613,6 @@ mod tests {
         let error = build(
             &root,
             &["vetcoders/vibecrafted".to_string()],
-            false,
             false,
             false,
             false,
