@@ -267,7 +267,15 @@ jobs:
           chmod 700 "${HOME}/.keys"
           printf '%s' "${GPG_PASSPHRASE}" > "${HOME}/.keys/.gpg.passphrase"
           chmod 600 "${HOME}/.keys/.gpg.passphrase"
-          printf '%s\n' "${GPG_PRIVATE_KEY}" | gpg --batch --import
+          # Dedicated keyring under ~/.keys so the "Scrub signing keys" step
+          # removes the secret key too (the default ~/.gnupg would outlive it).
+          # GNUPGHOME is exported for every later step, so release_bundle.sh
+          # signs from the same isolated keyring.
+          export GNUPGHOME="${HOME}/.keys/gnupg"
+          mkdir -p "${GNUPGHOME}"
+          chmod 700 "${GNUPGHOME}"
+          echo "GNUPGHOME=${GNUPGHOME}" >> "${GITHUB_ENV}"
+          printf '%s\n' "${GPG_PRIVATE_KEY}" | gpg --batch --homedir "${GNUPGHOME}" --import
           if [[ "${RUNNER_NAME}" == "macos-arm64" ]]; then
             for pair in "LOCTREE_MACOS_CERT_P12_BASE64:${MACOS_CERT_P12_BASE64}" \
                         "LOCTREE_MACOS_CERT_PASSWORD:${MACOS_CERT_PASSWORD}" \
@@ -280,7 +288,8 @@ jobs:
                 exit 1
               fi
             done
-            printf '%s' "${MACOS_CERT_P12_BASE64}" | base64 -d > "${HOME}/.keys/Certificates.p12"
+            # --decode is the spelling both GNU and BSD base64 accept.
+            printf '%s' "${MACOS_CERT_P12_BASE64}" | base64 --decode > "${HOME}/.keys/Certificates.p12"
             printf '%s\n' "${MACOS_CERT_PASSWORD}" > "${HOME}/.keys/cert_password.txt"
             printf '%s\n' "${MACOS_SIGNING_IDENTITY}" > "${HOME}/.keys/signing-identity.txt"
             {
@@ -510,7 +519,12 @@ jobs:
           chmod 700 "${HOME}/.keys"
           printf '%s' "${GPG_PASSPHRASE}" > "${HOME}/.keys/.gpg.passphrase"
           chmod 600 "${HOME}/.keys/.gpg.passphrase"
-          printf '%s\n' "${GPG_PRIVATE_KEY}" | gpg --batch --import
+          # Same isolated keyring as the build job — scrubbed with ~/.keys.
+          export GNUPGHOME="${HOME}/.keys/gnupg"
+          mkdir -p "${GNUPGHOME}"
+          chmod 700 "${GNUPGHOME}"
+          echo "GNUPGHOME=${GNUPGHOME}" >> "${GITHUB_ENV}"
+          printf '%s\n' "${GPG_PRIVATE_KEY}" | gpg --batch --homedir "${GNUPGHOME}" --import
 
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:

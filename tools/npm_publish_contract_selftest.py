@@ -36,7 +36,12 @@ def main() -> None:
 
     workflow = WORKFLOW.read_text(encoding="utf-8")
     required = (
+        # Job markers first: the section splits below index on them, and a
+        # missing marker must read as a lost contract, not an IndexError.
         "pack-platform-packages:",
+        "pack-wrapper:",
+        "publish-platform-packages:",
+        "publish-wrapper:",
         "runs_on: macos-15",
         "runs_on: ubuntu-latest",
         "runs_on: windows-latest",
@@ -89,6 +94,8 @@ def main() -> None:
         raise SystemExit("npm publish workflow must not use a long-lived npm token (OIDC trusted publishing)")
     if workflow.count("id-token: write") < 2:
         raise SystemExit("both npm publish jobs must request id-token: write")
+    if "npm-publish:" not in release_workflow:
+        raise SystemExit("release.yml lost the npm-publish job marker")
     chain_job = release_workflow.split("npm-publish:", 1)[1]
     if "id-token: write" not in chain_job:
         raise SystemExit("release.yml npm-publish job must grant id-token: write to the reusable workflow")
