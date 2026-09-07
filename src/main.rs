@@ -6125,21 +6125,19 @@ fn run_extract_target(agent: ExtractAgent, args: ExtractAgentArgs) -> Result<()>
             run_extract_session(agent, &session, args.output, args.project, options)
         }
         (None, Some(file)) => {
-            let Some(output) = args.output else {
-                aicx::cli::failure::emit_and_error(
-                    &format!("aicx extract {}", agent.label()),
-                    json,
-                    aicx::cli::failure::StructuredFailure::new(
-                        "output_path_required",
-                        "--file extraction requires -o/--output <FILE>",
-                        "add -o /path/to/out.md to write the extracted markdown",
-                    )
-                    .with_fallback(format!(
-                        "aicx extract {} --file <path> --conversation -o <path>",
-                        agent.label()
-                    )),
-                );
-                std::process::exit(2);
+            // Same default as `--session`: without -o the extract lands in the
+            // central store, `<AICX_HOME>/extracts/<agent>/<source_id>[…].md`,
+            // keyed by the file's own identity (stem, or the Grok session-dir
+            // UUID). An explicit -o keeps direct-file mode free of any global
+            // AICX state, which the C7H compact-recall contract relies on.
+            let output = match args.output {
+                Some(path) => path,
+                None => default_session_extract_path_for(
+                    agent.label(),
+                    &direct_source_id(agent, &file),
+                    options.conversation,
+                    !options.include_assistant,
+                )?,
             };
             run_extract_direct_file(agent, file, output, args.project, options)
         }
@@ -6236,6 +6234,21 @@ fn source_handle_for_file(
 
 /// For Grok `…/<uuid>/chat_history.jsonl`, prefer the parent directory UUID as
 /// the source identity instead of the filename stem `chat_history`.
+/// Identity of a direct-file source: the Grok session-dir UUID when the file is
+/// `chat_history.jsonl` (the stem alone would be the meaningless
+/// `chat_history`), otherwise the file stem. Shared by the parse path and the
+/// default output path so both name the same session.
+fn direct_source_id(agent: ExtractAgent, input: &Path) -> String {
+    grok_direct_source_id(agent, input).unwrap_or_else(|| {
+        input
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .filter(|stem| !stem.is_empty())
+            .unwrap_or("direct-source")
+            .to_string()
+    })
+}
+
 fn grok_direct_source_id(agent: ExtractAgent, path: &Path) -> Option<String> {
     if agent != ExtractAgent::Grok {
         return None;
@@ -6729,16 +6742,7 @@ fn run_extract_direct_file(
         .file_name()
         .map(|name| name.to_string_lossy().to_string())
         .unwrap_or_else(|| "(unknown)".to_string());
-    // Grok layout: identity is the parent session-dir UUID when the file is
-    // `chat_history.jsonl` — not the truncated stem `chat_history`.
-    let source_id = grok_direct_source_id(agent, &input).unwrap_or_else(|| {
-        input
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .filter(|stem| !stem.is_empty())
-            .unwrap_or("direct-source")
-            .to_string()
-    });
+    let source_id = direct_source_id(agent, &input);
 
     // Direct mode accepts exactly one finite parser artifact. Directory
     // discovery belongs to the catalog/importer boundary.

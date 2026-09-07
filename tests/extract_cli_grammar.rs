@@ -322,20 +322,61 @@ fn session_mode_ambiguous_reference_is_structured_not_first_wins() {
 }
 
 #[test]
-fn direct_file_mode_requires_output_and_skips_catalog() {
-    let home = unique_test_dir("direct-file");
+fn direct_file_mode_defaults_to_central_extracts() {
+    let home = unique_test_dir("direct-file-default");
     let rollout = home.join("standalone-rollout.jsonl");
     write_file(&rollout, &rollout_fixture(SESSION_UUID));
     let file_arg = rollout.display().to_string();
 
-    // Missing -o is a structured failure before any parse.
+    // Without -o the extract lands in the central store under the file's own
+    // identity, exactly where `--session` would put it — still without
+    // touching the catalog.
     let output = run_extract(&home, &["extract", "codex", "--file", &file_arg]);
-    assert_eq!(output.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("output_path_required"),
-        "missing -o must be structured:\n{stderr}"
+        output.status.success(),
+        "direct-file without -o must succeed:\n{stderr}"
     );
+    assert!(
+        stderr.contains("catalog_files_opened=0"),
+        "default-output mode must not touch the catalog:\n{stderr}"
+    );
+    let default_path = home
+        .join(".aicx")
+        .join("extracts")
+        .join("codex")
+        .join("standalone-rollout.md");
+    assert!(
+        default_path.is_file(),
+        "expected central extract at {}",
+        default_path.display()
+    );
+    // The two output axes stay distinct on disk, as for `--session`.
+    let output = run_extract(
+        &home,
+        &[
+            "extract",
+            "codex",
+            "--file",
+            &file_arg,
+            "--conversation",
+            "--user-only",
+        ],
+    );
+    assert!(output.status.success());
+    assert!(
+        home.join(".aicx/extracts/codex/standalone-rollout_conversation_user.md")
+            .is_file()
+    );
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn direct_file_mode_with_output_skips_catalog_and_global_state() {
+    let home = unique_test_dir("direct-file");
+    let rollout = home.join("standalone-rollout.jsonl");
+    write_file(&rollout, &rollout_fixture(SESSION_UUID));
+    let file_arg = rollout.display().to_string();
 
     // Frozen compact-recall argv (C7H): direct handle, zero catalog work,
     // exactly one parse pass, and no global AICX state required.
