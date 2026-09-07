@@ -562,6 +562,7 @@ async fn run_deep_impl(
         let base = base.to_path_buf();
         check_continuity_freshness(&base)
     };
+    let reindex_schedule = check_reindex_schedule();
 
     let overall = max_severity(&[
         canonical_store.severity,
@@ -579,6 +580,7 @@ async fn run_deep_impl(
         content_dedup.severity,
         context_corpus.severity,
         continuity_freshness.severity,
+        reindex_schedule.severity,
     ]);
 
     Ok(Some(DoctorReport {
@@ -599,6 +601,7 @@ async fn run_deep_impl(
         content_dedup,
         context_corpus,
         continuity_freshness,
+        reindex_schedule,
         aicx_home,
         binary_pair,
         http_auth_token,
@@ -908,6 +911,7 @@ pub(crate) async fn run_fast_impl(
     };
     let context_corpus = check_context_corpus_fast(base, budget);
     let continuity_freshness = check_continuity_freshness(base);
+    let reindex_schedule = check_reindex_schedule();
     let aicx_home = check_aicx_home(base);
     let binary_pair = check_binary_pair();
     let http_auth_token = check_http_auth_token();
@@ -929,6 +933,7 @@ pub(crate) async fn run_fast_impl(
         content_dedup.severity,
         context_corpus.severity,
         continuity_freshness.severity,
+        reindex_schedule.severity,
     ]);
 
     DoctorReport {
@@ -949,6 +954,7 @@ pub(crate) async fn run_fast_impl(
         content_dedup,
         context_corpus,
         continuity_freshness,
+        reindex_schedule,
         aicx_home,
         binary_pair,
         http_auth_token,
@@ -1084,6 +1090,117 @@ pub(crate) fn check_aicx_home(base: &Path) -> CheckResult {
 /// companion resolved on PATH. Surfaces the "fresh CLI, stale MCP" drift class
 /// where a long-running MCP service answers health checks while serving older
 /// search behavior. Diagnostic only — not part of `overall`.
+/// launchd label and log names written by `tools/install-reindex-schedule.sh`
+/// (`aicx doctor --repair-runtime`). Kept literal here so a rename in the
+/// installer surfaces as a doctor regression, not a silent Green.
+pub(crate) const REINDEX_LAUNCHD_LABEL: &str = "com.loctree.aicx.reindex";
+const REINDEX_DEFAULT_INTERVAL_SECS: u64 = 8640;
+
+/// Liveness of the background `catalog refresh -> index` schedule.
+///
+/// `catalog refresh` only maintains the session census; the index that search
+/// and intents read advances only when `aicx index` runs, and on macOS that is
+/// the launchd job installed by `--repair-runtime`. When that job stops firing
+/// the user sees "refresh says ok, search sees nothing new" with no signal
+/// anywhere — this check is that signal. File-based on purpose (plist +
+/// the job's own log mtimes), so it is deterministic and testable; it does
+/// not ask launchd.
+pub(crate) fn check_reindex_schedule() -> CheckResult {
+    if !cfg!(target_os = "macos") {
+        return CheckResult {
+            name: "reindex_schedule".to_string(),
+            severity: Severity::Skipped,
+            detail: "launchd reindex schedule is macOS-only; run `aicx catalog refresh && aicx index` from your own scheduler".to_string(),
+            recommendation: None,
+        };
+    }
+    match crate::os_user_home() {
+        Some(home) => check_reindex_schedule_at(&home, SystemTime::now()),
+        None => CheckResult {
+            name: "reindex_schedule".to_string(),
+            severity: Severity::Unknown,
+            detail: "cannot resolve the user home to inspect the launchd schedule".to_string(),
+            recommendation: None,
+        },
+    }
+}
+
+pub(crate) fn check_reindex_schedule_at(user_home: &Path, now: SystemTime) -> CheckResult {
+    let name = "reindex_schedule".to_string();
+    let plist = user_home
+        .join("Library")
+        .join("LaunchAgents")
+        .join(format!("{REINDEX_LAUNCHD_LABEL}.plist"));
+    if !plist.is_file() {
+        return CheckResult {
+            name,
+            severity: Severity::NotConfigured,
+            detail: "no launchd reindex schedule installed; the index only advances when you run `aicx index` yourself".to_string(),
+            recommendation: Some(
+                "Run `aicx doctor --repair-runtime` to install the `catalog refresh -> index` schedule (every 8640s)."
+                    .to_string(),
+            ),
+        };
+    }
+    let interval_secs = std::fs::read_to_string(&plist)
+        .ok()
+        .and_then(|text| launchd_start_interval_secs(&text))
+        .unwrap_or(REINDEX_DEFAULT_INTERVAL_SECS);
+    let log_dir = user_home.join(".aicx").join("logs");
+    let last_run = ["aicx-reindex.out.log", "aicx-reindex.err.log"]
+        .iter()
+        .filter_map(|log| std::fs::metadata(log_dir.join(log)).ok())
+        .filter_map(|meta| meta.modified().ok())
+        .max();
+    let Some(last_run) = last_run else {
+        return CheckResult {
+            name,
+            severity: Severity::Warning,
+            detail: format!(
+                "launchd schedule installed (every {interval_secs}s) but it has never written a log: the job has not run yet"
+            ),
+            recommendation: Some(reindex_kick_hint()),
+        };
+    };
+    let age = now.duration_since(last_run).unwrap_or(Duration::ZERO);
+    let tolerated = Duration::from_secs(interval_secs.saturating_mul(2));
+    if age > tolerated {
+        return CheckResult {
+            name,
+            severity: Severity::Warning,
+            detail: format!(
+                "launchd reindex schedule (every {interval_secs}s) last ran {}h ago; search/intents are only as fresh as that run",
+                age.as_secs() / 3600
+            ),
+            recommendation: Some(reindex_kick_hint()),
+        };
+    }
+    CheckResult {
+        name,
+        severity: Severity::Green,
+        detail: format!(
+            "launchd reindex schedule live (every {interval_secs}s, last run {}m ago)",
+            age.as_secs() / 60
+        ),
+        recommendation: None,
+    }
+}
+
+fn reindex_kick_hint() -> String {
+    format!(
+        "Run `aicx index` now, then `launchctl kickstart -k gui/$(id -u)/{REINDEX_LAUNCHD_LABEL}`; if it stays silent, `aicx doctor --repair-runtime` reinstalls the schedule."
+    )
+}
+
+/// `<key>StartInterval</key>` followed by `<integer>N</integer>` in the plist
+/// text. Anything else falls back to the installer default.
+pub(crate) fn launchd_start_interval_secs(plist_text: &str) -> Option<u64> {
+    let after_key = plist_text.split("<key>StartInterval</key>").nth(1)?;
+    let start = after_key.find("<integer>")? + "<integer>".len();
+    let end = after_key[start..].find("</integer>")? + start;
+    after_key[start..end].trim().parse().ok()
+}
+
 pub(crate) fn check_binary_pair() -> CheckResult {
     let cli_version = crate::BUILD_VERSION;
     let probed = std::process::Command::new("aicx-mcp")

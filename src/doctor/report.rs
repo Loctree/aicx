@@ -43,6 +43,7 @@ pub fn format_report_text(report: &DoctorReport, verbose: bool) -> String {
         &report.content_dedup,
         &report.context_corpus,
         &report.continuity_freshness,
+        &report.reindex_schedule,
         &report.aicx_home,
         &report.binary_pair,
         &report.http_auth_token,

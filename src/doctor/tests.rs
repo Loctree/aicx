@@ -223,6 +223,12 @@ fn oracle_readiness_is_ready_when_semantic_and_freshness_are_green() {
             detail: "ok".to_string(),
             recommendation: None,
         },
+        reindex_schedule: CheckResult {
+            name: "reindex_schedule".to_string(),
+            severity: Severity::Green,
+            detail: "ok".to_string(),
+            recommendation: None,
+        },
         aicx_home: CheckResult::default(),
         binary_pair: CheckResult::default(),
         http_auth_token: CheckResult::default(),
@@ -1224,4 +1230,78 @@ fn unique_test_dir(label: &str) -> PathBuf {
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).unwrap();
     tmp
+}
+
+fn write_reindex_plist(user_home: &std::path::Path, interval: u64) {
+    let dir = user_home.join("Library").join("LaunchAgents");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join(format!("{}.plist", REINDEX_LAUNCHD_LABEL)),
+        format!(
+            "<plist><dict><key>Label</key><string>{}</string><key>StartInterval</key><integer>{interval}</integer></dict></plist>",
+            REINDEX_LAUNCHD_LABEL
+        ),
+    )
+    .unwrap();
+}
+
+#[test]
+fn reindex_schedule_not_configured_without_plist() {
+    let home = unique_test_dir("reindex-none");
+    let result = check_reindex_schedule_at(&home, std::time::SystemTime::now());
+    assert_eq!(result.name, "reindex_schedule");
+    assert_eq!(result.severity, Severity::NotConfigured);
+    assert!(result.recommendation.unwrap().contains("--repair-runtime"));
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn reindex_schedule_warns_when_installed_but_never_ran() {
+    let home = unique_test_dir("reindex-never");
+    write_reindex_plist(&home, 8640);
+    let result = check_reindex_schedule_at(&home, std::time::SystemTime::now());
+    assert_eq!(result.severity, Severity::Warning);
+    assert!(
+        result.detail.contains("has not run yet"),
+        "{}",
+        result.detail
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn reindex_schedule_warns_past_two_intervals_and_is_green_within() {
+    let home = unique_test_dir("reindex-age");
+    write_reindex_plist(&home, 600);
+    let logs = home.join(".aicx").join("logs");
+    std::fs::create_dir_all(&logs).unwrap();
+    std::fs::write(logs.join("aicx-reindex.out.log"), b"{}\n").unwrap();
+    let written = std::fs::metadata(logs.join("aicx-reindex.out.log"))
+        .unwrap()
+        .modified()
+        .unwrap();
+
+    // 5 minutes after the run, inside a 600s interval: live.
+    let fresh = check_reindex_schedule_at(&home, written + std::time::Duration::from_secs(300));
+    assert_eq!(fresh.severity, Severity::Green, "{}", fresh.detail);
+
+    // Three intervals of silence: the scheduler is dead, say so and how to kick it.
+    let stale = check_reindex_schedule_at(&home, written + std::time::Duration::from_secs(1800));
+    assert_eq!(stale.severity, Severity::Warning, "{}", stale.detail);
+    assert!(stale.detail.contains("last ran"));
+    let hint = stale.recommendation.unwrap();
+    assert!(hint.contains("launchctl kickstart"), "{hint}");
+    assert!(hint.contains(REINDEX_LAUNCHD_LABEL), "{hint}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn launchd_start_interval_is_parsed_from_plist_text() {
+    let text =
+        "<key>Nice</key><integer>10</integer><key>StartInterval</key>\n  <integer>8640</integer>";
+    assert_eq!(super::checks::launchd_start_interval_secs(text), Some(8640));
+    assert_eq!(
+        super::checks::launchd_start_interval_secs("<key>Label</key>"),
+        None
+    );
 }

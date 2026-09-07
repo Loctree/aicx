@@ -117,6 +117,13 @@ pub struct DoctorReport {
     /// window has no unexplained census/index hole.
     #[serde(default)]
     pub continuity_freshness: CheckResult,
+    /// Product-surface liveness of the background pipeline: is the launchd
+    /// `catalog refresh -> index` schedule installed, and has it actually run
+    /// within two intervals? A dead scheduler is the difference between
+    /// "refresh says ok" and "search never sees new sessions". Part of
+    /// `overall`.
+    #[serde(default)]
+    pub reindex_schedule: CheckResult,
     /// Informational: which AICX_HOME the runtime resolved, whether it is
     /// pinned via env, and whether store/indexed live there. Not part of
     /// `overall` — diagnostic, not a gate.
