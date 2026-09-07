@@ -101,7 +101,7 @@ GitHub Release bundles are the supported user-facing path:
 
 ```bash
 curl -fsSLO https://raw.githubusercontent.com/Loctree/aicx/v0.12.0/install.sh
-AICX_INSTALL_MODE=release AICX_RELEASE_TAG=v0.13.0 bash install.sh
+AICX_INSTALL_MODE=release AICX_RELEASE_TAG=v0.13.1 bash install.sh
 ```
 
 The installer selects the published bundle for the current platform, verifies
