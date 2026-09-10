@@ -6544,6 +6544,24 @@ fn print_bulk_summary(
             );
         }
     }
+    // Unsupported sources get a bounded per-provider rollup, never a path
+    // dump: on a real archive this bucket is dominated by log and checkpoint
+    // files that merely live in the provider's directory, and printing 32 of
+    // them would bury the failures directly above. The manifest holds the
+    // paths.
+    let mut unsupported_by_provider: BTreeMap<&str, u64> = BTreeMap::new();
+    for row in &manifest.entries {
+        if matches!(row.outcome, SourceOutcome::Unsupported { .. }) {
+            *unsupported_by_provider
+                .entry(row.provider.as_str())
+                .or_default() += 1;
+        }
+    }
+    for (provider, count) in unsupported_by_provider {
+        println!(
+            "unsupported\t{provider}\t{count} source(s) held nothing the adapter claims as a conversation (paths in the manifest)"
+        );
+    }
     if !dry_run {
         println!(
             "manifest: {}",
@@ -6738,33 +6756,63 @@ fn extract_one_source_for_bulk(
         }
     };
 
-    let parsed =
-        match parse_selected_source_with_basis(&handle, &options.projection, options.cutoff) {
-            Ok(parsed) => parsed,
-            Err(error) => {
-                let text = error.to_string();
-                let in_flight = aicx::extraction::is_in_flight_failure(
-                    source.fingerprint.modified_unix_nanos,
-                    &text,
-                );
-                let reason = if in_flight {
-                    format!(
-                        "in-flight: source is still being written ({})",
-                        one_line(&text)
-                    )
-                } else {
-                    one_line(&text)
-                };
-                return row(SourceOutcome::Failed {
-                    reason,
-                    recover: format!(
-                        "aicx extract {} --file '{}' --conversation -o <output>",
-                        extract_agent.label(),
-                        source.path.display()
+    let parsed = match parse_selected_source_with_basis(
+        &handle,
+        &options.projection,
+        options.cutoff,
+    ) {
+        Ok(parsed) => parsed,
+        Err(refusal) => {
+            let text = refusal.to_string();
+            // Handle construction (above) is only the *shape* boundary: a
+            // `.json` under a provider directory gets a handle whatever it
+            // holds. Whether the adapter ever claimed the payload as its
+            // own is a separate question, and only its coverage ledger can
+            // answer it — see `ParseRefusal::is_structural_non_match`.
+            if refusal.is_structural_non_match() {
+                let (raw, _, skipped) = refusal.evidence().unwrap_or((0, 0, String::new()));
+                return row(SourceOutcome::Unsupported {
+                    reason: format!(
+                        "not a {} conversation: 0 of {raw} raw unit(s) claimed by the adapter ({skipped})",
+                        extract_agent.label()
                     ),
                 });
             }
-        };
+            let in_flight = aicx::extraction::is_in_flight_failure(
+                source.fingerprint.modified_unix_nanos,
+                &text,
+            );
+            // Publish how far the adapter actually got, so triage never
+            // has to re-run the parse to find out.
+            let progress = refusal
+                .evidence()
+                .map(|(raw, consumed, skipped)| {
+                    let trail = if skipped.is_empty() {
+                        String::new()
+                    } else {
+                        format!("; skipped {skipped}")
+                    };
+                    format!(" ({consumed} of {raw} raw unit(s) consumed{trail})")
+                })
+                .unwrap_or_default();
+            let reason = if in_flight {
+                format!(
+                    "in-flight: source is still being written ({}){progress}",
+                    one_line(&text)
+                )
+            } else {
+                format!("{}{progress}", one_line(&text))
+            };
+            return row(SourceOutcome::Failed {
+                reason,
+                recover: format!(
+                    "aicx extract {} --file '{}' --conversation -o <output>",
+                    extract_agent.label(),
+                    source.path.display()
+                ),
+            });
+        }
+    };
 
     if parsed.entries.is_empty() {
         return row(SourceOutcome::EmptyAfterFilter {
@@ -6973,7 +7021,9 @@ fn parse_selected_source_once(
     projection: &ProjectionSpec,
     cutoff: DateTime<Utc>,
 ) -> Result<Vec<timeline::TimelineEntry>> {
-    parse_selected_source_with_basis(handle, projection, cutoff).map(|parsed| parsed.entries)
+    parse_selected_source_with_basis(handle, projection, cutoff)
+        .map(|parsed| parsed.entries)
+        .map_err(anyhow::Error::from)
 }
 
 /// The projected entries of one source plus the evidence a typed refusal
@@ -7027,8 +7077,8 @@ fn parse_selected_source_with_basis(
     handle: &aicx::parser::engine::SourceHandle,
     projection: &ProjectionSpec,
     cutoff: DateTime<Utc>,
-) -> Result<ProjectedSource> {
-    let session = aicx::parser_dispatch::parse_handle(handle)?;
+) -> std::result::Result<ProjectedSource, aicx::parser_dispatch::ParseRefusal> {
+    let session = aicx::parser_dispatch::parse_handle_detailed(handle)?;
     let model = session.model();
     let entries = aicx::output::timeline_entries_from_model(model);
     let turns_before_filter = entries.len() as u64;
@@ -7448,7 +7498,8 @@ fn run_extract_direct_file(
             "extract: lineage: --file has no session catalog; the forked_from_id walk needs --session"
         );
     }
-    let parsed = parse_selected_source_with_basis(&handle, &options.projection, options.cutoff)?;
+    let parsed = parse_selected_source_with_basis(&handle, &options.projection, options.cutoff)
+        .map_err(anyhow::Error::from)?;
     if let Some(refusal) = parsed.refusal_if_empty(&options.projection) {
         // Typed refusal instead of a silent `Wrote 0 entries` (W2-T12 on the
         // direct-file seam; oracle `grok-019fdeca-typed-refusal`).

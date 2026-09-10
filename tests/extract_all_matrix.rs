@@ -928,6 +928,88 @@ fn a_broken_source_makes_the_run_partial_with_a_distinct_exit_code() {
 }
 
 #[test]
+fn a_stray_file_in_the_session_directory_is_unsupported_not_failed() {
+    let sandbox = Sandbox::new("unsupported");
+    codex_fixture(&sandbox);
+    // Shaped like the real archive's strays: gemini writes a `logs.json` next
+    // to its chats whose records *look* like a conversation — sessionId,
+    // messageId, type, message, timestamp — and which no adapter claims. On a
+    // real gemini tree these strays are 32 of 397 discovered sources.
+    // Reporting them as failed sessions buries the ones that genuinely broke.
+    sandbox.write(
+        ".gemini/tmp/some-project/logs.json",
+        concat!(
+            r#"[{"sessionId":"11111111-2222-4333-8444-555555555555","messageId":1,"#,
+            r#""type":"user","message":"zapis do logu, nie tura rozmowy","#,
+            r#""timestamp":"2026-09-10T08:00:00.000Z"}]"#,
+        ),
+    );
+
+    let output = sandbox.run(&[
+        "extract",
+        "all",
+        "--provider",
+        "codex",
+        "--provider",
+        "gemini",
+    ]);
+    let manifest = sandbox.manifest();
+    assert_totals_reconcile(&manifest);
+
+    assert_eq!(
+        count(&manifest, "unsupported"),
+        1,
+        "the stray belongs in its own bucket:\n{}",
+        serde_json::to_string_pretty(totals(&manifest)).unwrap()
+    );
+    assert_eq!(
+        count(&manifest, "failed"),
+        0,
+        "nothing broke: no adapter ever claimed the stray"
+    );
+    assert_eq!(
+        count(&manifest, "extracted"),
+        1,
+        "the healthy source in the same run must still land"
+    );
+    assert!(
+        output.status.success(),
+        "a run whose only anomaly is an unclaimed file is not a partial failure; stderr:\n{}",
+        stderr(&output)
+    );
+
+    // The verdict must cite the adapter's ledger, not the file name.
+    let stray = manifest["entries"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .find(|entry| entry["outcome"] == "unsupported")
+        .expect("the stray is in the manifest");
+    let reason = stray["reason"]
+        .as_str()
+        .expect("unsupported carries a reason");
+    assert!(
+        reason.contains("claimed by the adapter"),
+        "reason must name the evidence: {reason}"
+    );
+    assert!(
+        reason.contains("raw unit(s)"),
+        "reason must report what was actually read: {reason}"
+    );
+
+    // Visible without --json, and bounded: a rollup, not a path dump.
+    let body = stdout(&output);
+    assert!(
+        body.contains("unsupported\tgemini\t1 source(s)"),
+        "the summary must name the bucket:\n{body}"
+    );
+    assert!(
+        !body.contains("some-project"),
+        "the rollup must not dump stray paths:\n{body}"
+    );
+}
+
+#[test]
 fn a_trailing_partial_line_does_not_lose_the_completed_records() {
     let sandbox = Sandbox::new("inflight");
     let path = sandbox.home().join(format!(
