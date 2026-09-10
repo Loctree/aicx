@@ -19,7 +19,8 @@ pub use coverage::{
 };
 pub use frames::{
     ClassifiedFrame, FRAME_TAXONOMY_SCHEMA, FrameClass, FrameOrigin, FrameSeal, HumanChannel,
-    InjectKind, Retained, TransportFrame, TransportKind, TransportPayload, TransportRole, classify,
+    InjectKind, Retained, ShellExecutor, TransportFrame, TransportKind, TransportPayload,
+    TransportRole, classify,
 };
 pub use frames_rules::{
     AGENT_FRAME_RULES, AgentFrameRules, InjectRuleKind, InjectTagRule, rules_for,

@@ -728,7 +728,7 @@ fn grok_chat_payload(typ: &str, value: &Value) -> Option<(TransportKind, Transpo
             if raw_content.is_empty() && tool_calls.is_some_and(|calls| !calls.is_empty()) {
                 let (_, tname) = extract_assistant_text_and_tool(value);
                 return Some((
-                    TransportKind::UserShellCommand,
+                    TransportKind::AgentToolCall,
                     TransportPayload::Shell {
                         command: tname.unwrap_or_else(|| "tool".to_owned()),
                         result: value
@@ -762,7 +762,7 @@ fn grok_chat_payload(typ: &str, value: &Value) -> Option<(TransportKind, Transpo
                 command
             };
             Some((
-                TransportKind::UserShellCommand,
+                TransportKind::AgentToolCall,
                 TransportPayload::Shell {
                     command,
                     result: json_string(value, "content"),
@@ -777,7 +777,7 @@ fn grok_chat_payload(typ: &str, value: &Value) -> Option<(TransportKind, Transpo
                 command
             };
             Some((
-                TransportKind::UserShellCommand,
+                TransportKind::AgentToolCall,
                 TransportPayload::Shell {
                     command,
                     result: String::new(),
@@ -823,7 +823,7 @@ fn push_classified_turn(
         | FrameClass::InterAgent { .. } => {
             (role, classified.content.clone(), Known::unknown(), kind)
         }
-        FrameClass::ShellAction { cmd, result } => {
+        FrameClass::ShellAction { cmd, result, .. } => {
             // Throne maps every ShellAction to ToolCall (no call/result pair
             // in FrameClass). Result text stays on the turn for Decision 6;
             // ToolEventKind distinguishes call vs result without rewriting

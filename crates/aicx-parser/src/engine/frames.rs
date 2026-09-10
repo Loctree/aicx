@@ -14,7 +14,14 @@ pub const FRAME_TAXONOMY_SCHEMA: &str = "aicx.parser.frame_taxonomy.v1";
 #[serde(rename_all = "snake_case")]
 pub enum TransportKind {
     DirectMessage,
+    /// A shell command the *human* submitted, e.g. Codex's
+    /// `<user_shell_command>` envelope. Never an agent tool call: that lane
+    /// is [`TransportKind::AgentToolCall`].
     UserShellCommand,
+    /// A tool / shell invocation the *agent* made. Split out of
+    /// `UserShellCommand`, which gemini, grok and junie were using for agent
+    /// tool calls — the name claimed a human executor the evidence never had.
+    AgentToolCall,
     QueueOperation,
     InjectedContext,
     AssistantMessage,
@@ -79,6 +86,50 @@ pub enum HumanChannel {
     Queue,
 }
 
+/// Who ran a [`FrameClass::ShellAction`].
+///
+/// Derived from the transport at classification time, never re-guessed from
+/// command text later: a command *quoted* inside prose is not an execution,
+/// and a proposal an assistant writes out is not a run. `--user-commands` /
+/// `--agent-commands` project on this axis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShellExecutor {
+    /// The operator submitted the command (Codex `<user_shell_command>`).
+    Human,
+    /// The agent invoked a tool / shell.
+    Agent,
+}
+
+impl ShellExecutor {
+    /// serde default for frames persisted before the executor axis existed.
+    const fn default_agent() -> Self {
+        Self::Agent
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Human => "human",
+            Self::Agent => "agent",
+        }
+    }
+
+    /// The executor a transport proves. Kept total so a new [`TransportKind`]
+    /// cannot silently inherit "agent" without a decision here.
+    const fn from_transport(kind: TransportKind) -> Self {
+        match kind {
+            TransportKind::UserShellCommand => Self::Human,
+            TransportKind::AgentToolCall
+            | TransportKind::DirectMessage
+            | TransportKind::QueueOperation
+            | TransportKind::InjectedContext
+            | TransportKind::AssistantMessage
+            | TransportKind::Lineage
+            | TransportKind::AgentMessage => Self::Agent,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Retained {
     pub text: String,
@@ -119,6 +170,11 @@ pub enum FrameClass {
     ShellAction {
         cmd: String,
         result: Retained,
+        /// Who ran it. `#[serde(default)]` keeps older persisted frames
+        /// readable; they decode as `Agent`, which is what every pre-split
+        /// producer but Codex's user envelope actually meant.
+        #[serde(default = "ShellExecutor::default_agent")]
+        executor: ShellExecutor,
     },
     Inject {
         kind: InjectKind,
@@ -181,6 +237,14 @@ impl FrameClass {
         }
     }
 
+    /// Who ran this shell action; `None` when the class is not a shell action.
+    pub const fn shell_executor(&self) -> Option<ShellExecutor> {
+        match self {
+            Self::ShellAction { executor, .. } => Some(*executor),
+            _ => None,
+        }
+    }
+
     /// Human transport channel when the class is human speech.
     pub const fn human_channel(&self) -> Option<HumanChannel> {
         match self {
@@ -232,6 +296,7 @@ pub fn classify(frame: &TransportFrame) -> ClassifiedFrame {
                     FrameClass::ShellAction {
                         cmd: command.clone(),
                         result: Retained::new(result.clone()),
+                        executor: ShellExecutor::from_transport(frame.transport_kind),
                     },
                     command.clone(),
                 )
@@ -293,10 +358,13 @@ pub fn classify(frame: &TransportFrame) -> ClassifiedFrame {
                 },
                 content.clone(),
             ),
+            // A `role=tool` text frame is the agent's tool lane; a human
+            // never speaks through it.
             TransportRole::Tool => (
                 FrameClass::ShellAction {
                     cmd: content.clone(),
                     result: Retained::new(String::new()),
+                    executor: ShellExecutor::Agent,
                 },
                 content.clone(),
             ),

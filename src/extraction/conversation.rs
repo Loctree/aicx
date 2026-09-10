@@ -1,7 +1,9 @@
 #![allow(unused_imports)]
 use super::*;
 
-use super::projection::{ProjectionKind, ProjectionRole, ProjectionSpec, ResultBody};
+use super::projection::{
+    ProjectionKind, ProjectionRole, ProjectionSpec, ResultBody, ShellExecutor,
+};
 use aicx_parser::engine::{
     AgentKind, ContextEpochRef, EntryOrigin, FrameClass, ProviderConversationRef, RefusalEvidence,
     RefusalReason, ScopeStatus, sha256_hex,
@@ -111,11 +113,37 @@ pub fn human_channel_for_entry(entry: &TimelineEntry) -> Option<aicx_parser::eng
         .and_then(FrameClass::human_channel)
 }
 
-/// `true` when the entry is the retained result half of a shell action
-/// (`TurnKind::ToolResult`, role `tool`), i.e. the body that
-/// `ProjectionSpec::project_shell_result` renders as stub / head / full.
+/// Who ran this shell action, when the entry carries the class that proves it.
+///
+/// `None` means unprovable, not "agent": entries from lanes the throne does
+/// not own yet (legacy archives, importers, Claude's tool lane) never carried
+/// an executor. A narrowed executor axis withholds those rather than guessing
+/// — see [`spec_admits_entry`].
+pub fn shell_executor_for_entry(entry: &TimelineEntry) -> Option<ShellExecutor> {
+    entry
+        .frame_class
+        .as_ref()
+        .and_then(FrameClass::shell_executor)
+}
+
+/// `true` when the entry is the retained result *half* of a shell action —
+/// the twin record adapters emit alongside the command.
+///
+/// The discriminator is the carried class, not the lane: `frame_kind` flattens
+/// `TurnKind::ToolCall` and `TurnKind::ToolResult` onto one `FrameKind`, and
+/// both halves speak with role `tool`. Adapters attach
+/// [`FrameClass::ShellAction`] to the command and leave the result twin
+/// class-less (codex `push_envelope`, junie `push_shell_action`), so class
+/// absence is the precise signal.
+///
+/// Before this discriminator existed the predicate matched *both* halves and
+/// `fold_shell_results` dropped the command with them: every shell action
+/// vanished from codex and junie extracts, and `--result full` rendered
+/// nothing at all.
 pub fn is_shell_result_entry(entry: &TimelineEntry) -> bool {
-    entry.frame_kind == Some(FrameKind::ToolCall) && entry.role.eq_ignore_ascii_case("tool")
+    entry.frame_kind == Some(FrameKind::ToolCall)
+        && entry.role.eq_ignore_ascii_case("tool")
+        && entry.frame_class.is_none()
 }
 
 /// Does the spec emit this entry on both axes (role AND kind)?
@@ -129,7 +157,23 @@ pub fn spec_admits_entry(spec: &ProjectionSpec, entry: &TimelineEntry) -> bool {
     // channel the spec may withhold even when the kind is admitted.
     let channel_ok =
         human_channel_for_entry(entry).is_none_or(|channel| spec.emits_human_channel(channel));
-    role_ok && kind_ok && channel_ok
+    // Executor axis (Decision 5): only shell actions carry it. When the axis
+    // is unnarrowed an unprovable executor is admitted; when the caller asked
+    // for one executor specifically, an entry that cannot prove which one it
+    // is stays out — showing an agent tool run under `--user-commands` would
+    // be a lie, and guessing from the command text is exactly the heuristic
+    // this axis replaces.
+    let executor_ok = if kind_ok
+        && projection_kind_for_entry(entry) == Some(ProjectionKind::ShellAction)
+    {
+        match shell_executor_for_entry(entry) {
+            Some(executor) => spec.emits_shell_executor(executor),
+            None => spec.shell_executors.len() == super::projection::all_shell_executors().len(),
+        }
+    } else {
+        true
+    };
+    role_ok && kind_ok && channel_ok && executor_ok
 }
 
 /// Window axis (`-H` / `--since` / `--until`) evaluated against `now`.
@@ -170,12 +214,51 @@ fn window_bound(day: &str, end_of_day: bool) -> Option<DateTime<Utc>> {
     Some(Utc.from_utc_datetime(&NaiveDateTime::new(date, time)))
 }
 
-/// Retain only the entries the spec emits (role, kind, window). The vector
+/// Project axis (`-p` / `--project`): does this entry's working directory
+/// belong to one of the requested projects?
+///
+/// Repeatable `-p` is an OR across projects; the result ANDs with every other
+/// axis because [`apply_projection_at`] evaluates them together. Fail-closed
+/// on purpose: with an active filter an entry whose cwd is unknown cannot be
+/// *shown* to belong to the requested project, and the same rule already
+/// governs session-level discovery (`session_matches_project_filter`).
+pub fn entry_in_project(spec: &ProjectionSpec, entry: &TimelineEntry) -> bool {
+    if spec.project.is_empty() {
+        return true;
+    }
+    match entry.cwd.as_deref() {
+        Some(cwd) => super::project_filter_matches_path(cwd, &spec.project),
+        None => false,
+    }
+}
+
+/// Retain only the entries the spec emits (role, kind, executor, project,
+/// window), against one explicit `now`.
+///
+/// The cutoff is a parameter rather than a `Utc::now()` read inside the loop:
+/// a bulk run projects hundreds of sessions, and re-reading the clock per
+/// session would give each one a slightly different `-H` boundary. One command
+/// = one cutoff.
+pub fn apply_projection_at(
+    entries: &mut Vec<TimelineEntry>,
+    spec: &ProjectionSpec,
+    now: DateTime<Utc>,
+) {
+    entries.retain(|entry| {
+        spec_admits_entry(spec, entry)
+            && entry_in_project(spec, entry)
+            && entry_in_window(spec, entry, now)
+    });
+}
+
+/// Retain only the entries the spec emits, reading the clock now. The vector
 /// is a view being narrowed; the stored substrate is untouched
 /// ([`super::projection::FLAGS_NEVER_MUTATE_THE_SUBSTRATE`]).
+///
+/// Prefer [`apply_projection_at`] when the caller already holds the
+/// command-start cutoff.
 pub fn apply_projection(entries: &mut Vec<TimelineEntry>, spec: &ProjectionSpec) {
-    let now = Utc::now();
-    entries.retain(|entry| spec_admits_entry(spec, entry) && entry_in_window(spec, entry, now));
+    apply_projection_at(entries, spec, Utc::now());
 }
 
 /// Spec for the `--user-only` axis shared by extract and the MCP session
@@ -207,18 +290,35 @@ pub fn fold_shell_results(
             continue;
         }
         if projection_kind_for_entry(&entry) == Some(ProjectionKind::ShellAction) {
-            let retained = match iter.peek() {
-                Some(next)
-                    if is_shell_result_entry(next) && next.session_id == entry.session_id =>
-                {
-                    iter.next().map(|next| next.message)
+            // Substrate first: when the class is carried it already holds both
+            // halves (`cmd` + `Retained`), so the separate result record is a
+            // twin of bytes we already have. Rendering from the class keeps
+            // exactly one copy without comparing any text.
+            if let Some(FrameClass::ShellAction { cmd, result, .. }) = entry.frame_class.clone() {
+                // Consume an adjacent class-less twin so it is not re-emitted.
+                if iter.peek().is_some_and(|next| {
+                    is_shell_result_entry(next) && next.session_id == entry.session_id
+                }) {
+                    iter.next();
                 }
-                _ => None,
-            };
-            let retained_text = retained.as_deref().unwrap_or("");
-            let hash = sha256_hex(retained_text.as_bytes());
-            entry.message =
-                spec.project_shell_result(entry.message.trim_end(), retained_text, &hash);
+                entry.message =
+                    spec.project_shell_result(cmd.trim_end(), &result.text, &result.hash);
+            } else {
+                // Class-less lane (legacy archives, importers): the adjacent
+                // record is the only evidence of the result body.
+                let retained = match iter.peek() {
+                    Some(next)
+                        if is_shell_result_entry(next) && next.session_id == entry.session_id =>
+                    {
+                        iter.next().map(|next| next.message)
+                    }
+                    _ => None,
+                };
+                let retained_text = retained.as_deref().unwrap_or("");
+                let hash = sha256_hex(retained_text.as_bytes());
+                entry.message =
+                    spec.project_shell_result(entry.message.trim_end(), retained_text, &hash);
+            }
         }
         folded.push(entry);
     }
@@ -275,6 +375,150 @@ pub fn parse_kind_tokens(tokens: &[String]) -> Result<Vec<ProjectionKind>, Strin
 /// carries its speaker: asking for `inter_agent` (system lane) while the
 /// role axis still says "human + assistant" would admit nothing. The role
 /// axis therefore follows the kinds; `--user-only` narrows it afterwards.
+/// The role / kind / executor flags of one extract invocation, before they
+/// become a [`ProjectionSpec`].
+///
+/// One struct for `aicx extract <agent>` and `aicx extract all` so the two
+/// surfaces cannot drift into different meanings for the same word.
+#[derive(Debug, Default, Clone)]
+pub struct AxisFlags {
+    pub user_only: bool,
+    pub agent_only: bool,
+    pub user_commands: bool,
+    pub agent_commands: bool,
+    pub kinds: Vec<String>,
+    /// `--conversation`: the denoised speech view. It has no shell lane (see
+    /// [`project_conversation`]), so the resolver can refuse a command filter
+    /// here instead of returning an empty transcript.
+    pub conversation: bool,
+}
+
+/// A flag combination that can only ever produce an empty projection.
+///
+/// Emitted instead of returning zero entries: a silent empty result is
+/// indistinguishable from "this session really had nothing", and the operator
+/// cannot tell which one they got.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AxisConflict {
+    pub code: &'static str,
+    pub message: String,
+    pub fix: &'static str,
+}
+
+impl AxisConflict {
+    fn new(code: &'static str, message: impl Into<String>, fix: &'static str) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            fix,
+        }
+    }
+}
+
+/// Fold the role / kind / command flags onto a spec.
+///
+/// Rules, in the order they are applied:
+/// 1. `--kind` (when given) is the explicit kind set and implies its roles.
+/// 2. `--user-commands` / `--agent-commands` select the `shell_action` lane
+///    and narrow its executor axis. Passing both means both executors, not a
+///    conflict — an operator asking for every command is asking one question.
+/// 3. `--user-only` / `--agent-only` narrow the speaker axis.
+/// 4. A command flag combined with a speaker-only flag is a contradiction:
+///    shell actions render on the assistant lane, `--user-only` keeps only the
+///    human lane, and `--agent-only` keeps only assistant *speech*. Each of
+///    those intersections is provably empty, so it is refused loudly.
+pub fn apply_axis_flags(spec: &mut ProjectionSpec, flags: &AxisFlags) -> Result<(), AxisConflict> {
+    let wants_commands = flags.user_commands || flags.agent_commands;
+
+    if flags.user_only && flags.agent_only {
+        return Err(AxisConflict::new(
+            "conflicting_role_filters",
+            "--user-only and --agent-only select disjoint speakers; nothing can satisfy both",
+            "pick one speaker axis, or drop both to keep the razor default",
+        ));
+    }
+    if wants_commands && (flags.user_only || flags.agent_only) {
+        let role_flag = if flags.user_only {
+            "--user-only"
+        } else {
+            "--agent-only"
+        };
+        return Err(AxisConflict::new(
+            "conflicting_role_and_command_filters",
+            format!(
+                "{role_flag} selects speech only, while --user-commands/--agent-commands select the shell_action lane; the intersection is always empty"
+            ),
+            "drop the speaker flag, or ask for both lanes with `--kind human,shell_action`",
+        ));
+    }
+
+    if flags.conversation && wants_commands {
+        return Err(AxisConflict::new(
+            "conflicting_conversation_and_command_filters",
+            "--conversation is the denoised speech view and carries no shell_action lane, so it cannot be combined with --user-commands/--agent-commands",
+            "drop --conversation to get the command lane, or drop the command flag",
+        ));
+    }
+
+    if !flags.kinds.is_empty() {
+        spec.kinds = parse_kind_tokens(&flags.kinds).map_err(|reason| {
+            AxisConflict::new(
+                "invalid_kind_token",
+                reason,
+                "pass throne kinds: human, echo_seal, shell_action, inject, assistant_final, lineage_meta, inter_agent",
+            )
+        })?;
+        spec.roles = roles_for_kinds(&spec.kinds);
+    }
+
+    if wants_commands {
+        if !flags.kinds.is_empty() && !spec.kinds.contains(&ProjectionKind::ShellAction) {
+            return Err(AxisConflict::new(
+                "conflicting_kind_and_command_filters",
+                "--user-commands/--agent-commands need the shell_action lane, which the given --kind excludes",
+                "add shell_action to --kind, or drop the command flag",
+            ));
+        }
+        if flags.kinds.is_empty() {
+            spec.kinds = vec![ProjectionKind::ShellAction];
+            spec.roles = roles_for_kinds(&spec.kinds);
+        }
+        spec.shell_executors = match (flags.user_commands, flags.agent_commands) {
+            (true, true) => super::projection::all_shell_executors(),
+            (true, false) => vec![ShellExecutor::Human],
+            (false, true) => vec![ShellExecutor::Agent],
+            (false, false) => unreachable!("wants_commands implies one of the two"),
+        };
+    }
+
+    if flags.user_only {
+        spec.roles.retain(|role| *role == ProjectionRole::Human);
+        if spec.roles.is_empty() {
+            return Err(AxisConflict::new(
+                "conflicting_role_and_kind_filters",
+                "--user-only keeps the human lane, which the given --kind excludes",
+                "add human (or echo_seal) to --kind, or drop --user-only",
+            ));
+        }
+    }
+    if flags.agent_only {
+        // Assistant speech, deliberately narrow: reasoning (`inject`),
+        // inter-agent traffic and lineage metadata are not the assistant
+        // talking to the operator and must not be dressed up as if they were.
+        spec.roles.retain(|role| *role == ProjectionRole::Assistant);
+        spec.kinds
+            .retain(|kind| *kind == ProjectionKind::AssistantFinal);
+        if spec.kinds.is_empty() {
+            return Err(AxisConflict::new(
+                "conflicting_role_and_kind_filters",
+                "--agent-only keeps assistant_final, which the given --kind excludes",
+                "add assistant_final to --kind, or drop --agent-only",
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub fn roles_for_kinds(kinds: &[ProjectionKind]) -> Vec<ProjectionRole> {
     let mut roles = Vec::with_capacity(3);
     for kind in kinds {
@@ -834,6 +1078,21 @@ pub fn project_conversation(
         let Some(kind) = projection_kind_for_entry(entry) else {
             continue;
         };
+        // The conversation view renders every kept entry under a speaker
+        // heading (`assistant:` for the tool lane). A tool run printed under
+        // that heading claims the assistant *said* it, which is a lie the
+        // substrate can disprove: an entry carrying `FrameClass::ShellAction`
+        // is a proven tool action and stays out of the speech view.
+        //
+        // Class-less shell stubs are a different case. Nothing proves what
+        // they are, the legacy lane has always shown them, and withholding
+        // them would drop material on a guess — so they stay (razor:
+        // "human speech + final answers + shell stubs"). Either way the
+        // action itself is never lost: the report view and
+        // `--kind shell_action` render it from the substrate.
+        if kind == ProjectionKind::ShellAction && entry.frame_class.is_some() {
+            continue;
+        }
         if !spec_admits_entry(spec, entry) {
             continue;
         }

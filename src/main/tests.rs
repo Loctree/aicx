@@ -2733,9 +2733,36 @@ fn extract_help_hides_removed_flag_grammar() {
         );
     }
     assert!(
-        !rendered.contains("--agent") && !rendered.contains("--format"),
+        !offers_removed_flag_grammar(&rendered),
         "removed flag grammar must not appear in extract --help:\n{rendered}"
     );
+}
+
+/// Does `help` offer the removed `--agent <name>` / `--format <name>` flag
+/// grammar?
+///
+/// Token-boundary, not substring: `--agent-only` and `--agent-commands` are
+/// legitimate projection flags in the current grammar, and a bare
+/// `contains("--agent")` would forbid the whole namespace instead of the one
+/// removed spelling this guard exists for.
+fn offers_removed_flag_grammar(help: &str) -> bool {
+    ["--agent", "--format"].iter().any(|flag| {
+        help.match_indices(flag).any(|(index, _)| {
+            let rest = &help[index + flag.len()..];
+            !rest.starts_with('-')
+        })
+    })
+}
+
+#[test]
+fn removed_flag_grammar_guard_distinguishes_longer_flag_names() {
+    assert!(offers_removed_flag_grammar(
+        "  --agent <AGENT>  pick an agent"
+    ));
+    assert!(offers_removed_flag_grammar("--format md"));
+    assert!(!offers_removed_flag_grammar(
+        "--agent-only and --agent-commands select lanes"
+    ));
 }
 
 #[test]
@@ -3025,6 +3052,7 @@ fn direct_file_boundary_rejects_directory_without_output() {
             redact_secrets: false,
             conversation: false,
             projection: ProjectionSpec::default(),
+            cutoff: Utc::now(),
         },
     )
     .expect_err("directory input must be rejected before parser dispatch");

@@ -545,12 +545,18 @@ impl<'a> Assembly<'a> {
     ) {
         let classified = frames::classify(&TransportFrame {
             agent: AgentKind::Junie,
-            transport_kind: TransportKind::UserShellCommand,
+            // Junie event logs record the agent's own tool runs here.
+            transport_kind: TransportKind::AgentToolCall,
             timestamp,
             payload: TransportPayload::Shell { command, result },
             evidence,
         });
-        let FrameClass::ShellAction { cmd, result } = classified.class else {
+        let FrameClass::ShellAction {
+            cmd,
+            result,
+            executor,
+        } = classified.class
+        else {
             return;
         };
         let timestamp = classified.seal.seal_ts;
@@ -568,6 +574,7 @@ impl<'a> Assembly<'a> {
                 Some(FrameClass::ShellAction {
                     cmd: cmd.clone(),
                     result: result.clone(),
+                    executor,
                 }),
             );
             self.tools.push(ToolEvent {

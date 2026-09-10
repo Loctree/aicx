@@ -235,7 +235,9 @@ fn extract_without_agent_subcommand_emits_structured_failure() {
         &stderr,
         "aicx extract",
         "missing_agent_subcommand",
-        "extract requires an agent subcommand",
+        // `all` joined the target list; the kind stays stable so consumers
+        // that branch on it are unaffected.
+        "extract requires a target: all | codex | claude | gemini | grok | junie",
         "aicx extract codex --session <id> --conversation",
     );
 }

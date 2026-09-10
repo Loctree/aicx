@@ -86,10 +86,13 @@ wired to this type until W2-T13.
 | Flag | `ProjectionSpec` field | Notes |
 |---|---|---|
 | `--user-only` | `roles = [Human]` | Today also applied in `mcp_session.rs` by string role. That copy goes away in W2-T13. |
-| `--conversation` | `kinds` razor (Human + EchoSeal + AssistantFinal + ShellAction stubs) | Today's conversation-first path. Not a second taxonomy. |
+| `--agent-only` | `roles = [Assistant]`, `kinds = [AssistantFinal]` | Assistant **speech**. Reasoning (`inject`), `inter_agent` and `lineage_meta` are deliberately excluded: they are not the assistant talking to the operator. |
+| `--user-commands` | `kinds = [ShellAction]`, `shell_executors = [Human]` | Commands the operator submitted (Codex `<user_shell_command>`). A command quoted in prose or proposed in an answer is not an execution. |
+| `--agent-commands` | `kinds = [ShellAction]`, `shell_executors = [Agent]` | Tool / shell invocations the agent made. |
+| `--conversation` | `kinds` razor minus `ShellAction` | The denoised speech view. It has **no** shell lane by contract, so it cannot be combined with the command flags — that pair is refused, not silently emptied. |
 | `--max-message-chars N` | `max_message_chars` | `0` = unlimited dialogue. Does not change `result`. |
-| `-p` / `--project` | `project` | Identity filter on the view, not on the parse. |
-| `-H` / `--hours` | `window.hours` | Present but hidden on `Commands::Extract`. |
+| `-p` / `--project` | `project` | Repeatable identity filter on the view (**OR** across projects, **AND** with every other axis), matched against each entry's recorded `cwd` via `project_filter_matches_path`. Fail-closed: an entry with no known cwd cannot be shown to belong to the requested project and is filtered out. A single value additionally names the output's project identity. |
+| `-H` / `--hours` | `window.hours` | Filters **event** timestamps, never file mtimes, against one cutoff captured when the command starts (`apply_projection_at`). CLI `0` means unbounded → spec `None`; absence is never a silent lookback default. |
 | `--since` / `--until` | `window.since` / `window.until` | Not on extract today; same window type as search. |
 | `--kind <token>` | `kinds` (+ `roles` implied by the kinds) | **W2.** Tokens: `human`, `echo_seal`, `shell_action`, `inject`, `assistant_final`, `lineage_meta`, `inter_agent`. A lane carries its speaker: `inter_agent` / `inject` / `lineage_meta` open the `System` role; `--user-only` narrows back to `Human`. |
 | `--dialog` | `dialog` | **W2.** Delayed human speech as speech, with channel/seal. |
@@ -122,9 +125,18 @@ Substrate (always, regardless of flags):
 ```text
 ShellAction {
   cmd: "cargo test --workspace --offline",
-  result: Retained { text: "<412 lines of cargo output>", chars: …, hash: "c0ffee…" }
+  result: Retained { text: "<412 lines of cargo output>", chars: …, hash: "c0ffee…" },
+  executor: Human | Agent,
 }
 ```
+
+`executor` is decided once, at classification time, from the transport that
+carried the frame — `TransportKind::UserShellCommand` proves a human
+submission, `TransportKind::AgentToolCall` proves an agent invocation. It is
+never re-derived from command text downstream: a command quoted in prose is
+not an execution, and a proposal in an answer is not a run. Frames persisted
+before this field decode as `Agent`, which is what every pre-split producer
+except Codex's user envelope actually meant.
 
 ### Default (`result = None`)
 
@@ -174,6 +186,7 @@ Canonical type: `src/extraction/projection.rs`.
 | `score` | `Option<u8>` | `None` |
 | `dialog` | `bool` | `false` |
 | `lineage_depth` | `Option<usize>` | `None` |
+| `shell_executors` | `Vec<ShellExecutor>` | `Human`, `Agent` |
 
 Empty `roles` / `kinds` vectors mean "emit nothing on that axis." They are
 not a shortcut for default. Callers use `ProjectionSpec::default()` (razor)
@@ -184,3 +197,26 @@ or `ProjectionSpec::full()`.
 - Compilation. `BUILD/LINT/TEST` for this wave is embargoed (lifted in W3).
 - Lanes the throne does not own (tool call/result, reasoning, Codex harness
   events): they carry no `frame_class` and keep `frame_kind` as their lane.
+
+## Bulk projection (`aicx extract all`)
+
+`aicx extract all` is the same projection applied to every compatible source
+on the machine. It adds accounting, not a second taxonomy: discovery is the
+session catalog, parsing is `parser_dispatch`, and the view is the
+`ProjectionSpec` the flags above build.
+
+Canonical types: `src/extraction/bulk.rs`.
+
+| Concern | Rule |
+|---|---|
+| Agents | Enumerated from the parser registry (`bulk::ALL_AGENTS`), so a provider added to the registry is picked up without a second edit — and a provider that only exists in help text is not. |
+| Incremental key | `source_fingerprint` (size + mtime) × `parser_version` × `projection_fingerprint`. Any of the three changing re-materializes; `--rebuild` ignores the state entirely. |
+| Output paths | `<AICX_HOME>/extracts/<agent>/<session>[_conversation][_user][_<projection_fingerprint>].md`. Two filter sets over one session never overwrite each other. |
+| Writes | Atomic (`legacy_archive::atomic_write`), and only after the parse succeeded. A fatal parse leaves nothing behind. |
+| Manifest | `<AICX_HOME>/extracts/_bulk/manifest-<utc>.json` plus `manifest-latest.json`, schema `aicx.extract.all.manifest.v1`. |
+| Buckets | `extracted`, `unchanged`, `empty_after_filter`, `unsupported`, `filtered_out`, `failed`. Every discovered source lands in exactly one; the totals reconcile against `discovered`. |
+| `-H` fast path | A file's mtime is an upper bound on the newest event it can hold, so `mtime < cutoff - hours` **proves** the source has no in-window event and it is skipped without being opened. The row records which proof was used, so a deduction is never confused with "parsed and found nothing". A freshly copied archive of old events has a fresh mtime and is still parsed — this is a deduction, not the "select files by mtime" shortcut. |
+| Exit status | `0` clean (**including an empty archive** — having no sessions is not an error), `3` partial, `4` every selected source failed. A partial run is never reported as overall success. |
+| Streams | stdout carries the summary or, with `--json`, exactly one manifest document. Discovery and failure diagnostics go to stderr. Private session bodies are written to files, never dumped to stdout. |
+| Sources | Read-only. A pass never rewrites, truncates or deletes a source. |
+

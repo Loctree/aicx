@@ -924,6 +924,10 @@ impl<'a> Assembly<'a> {
             FrameClass::ShellAction {
                 ref cmd,
                 ref result,
+                // Codex reaches this arm only from the `<user_shell_command>`
+                // envelope, so the executor is Human; it travels to the model
+                // on `class_for_turn` below.
+                executor: _,
             } => {
                 let marker = shell_action_marker(cmd);
                 let result = result.clone();

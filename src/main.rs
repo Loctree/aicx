@@ -241,6 +241,8 @@ enum ExtractTarget {
     Grok(ExtractAgentArgs),
     /// JetBrains Junie event logs (~/.junie/sessions)
     Junie(ExtractAgentArgs),
+    /// Every compatible source on this machine, in one incremental pass.
+    All(ExtractAllArgs),
 }
 
 impl ExtractTarget {
@@ -251,8 +253,89 @@ impl ExtractTarget {
             Self::Gemini(args) => (ExtractAgent::Gemini, args),
             Self::Grok(args) => (ExtractAgent::Grok, args),
             Self::Junie(args) => (ExtractAgent::Junie, args),
+            Self::All(_) => unreachable!("`extract all` is dispatched before split()"),
         }
     }
+}
+
+/// `aicx extract all` — the bulk axes.
+///
+/// The projection flags are deliberately the *same* words as the per-agent
+/// form, resolved by the same `apply_axis_flags`. A second vocabulary for
+/// bulk would be a second contract to keep true.
+#[derive(Debug, Args)]
+struct ExtractAllArgs {
+    #[command(flatten)]
+    redaction: RedactionArgs,
+
+    /// Restrict the pass to these providers (repeatable / comma list).
+    /// Default: every provider the parser registry claims.
+    ///
+    /// Spelled `--provider`, not `--agent`: `--agent` is the removed
+    /// flag-grammar spelling of the per-session form and must not come back
+    /// carrying a different meaning.
+    #[arg(long, value_delimiter = ',', value_name = "PROVIDER")]
+    provider: Vec<String>,
+
+    /// Project/repo filter, repeatable (OR across projects, AND with the
+    /// other axes). A session whose cwd is unknown is filtered out, not
+    /// guessed into the result.
+    #[arg(short, long, value_delimiter = ',')]
+    project: Vec<String>,
+
+    /// Hours to look back over *event* timestamps (0 = unbounded). One cutoff
+    /// is captured when the command starts and every session shares it.
+    #[arg(short = 'H', long, default_value = "0")]
+    hours: u64,
+
+    /// Only user messages.
+    #[arg(long, conflicts_with = "agent_only")]
+    user_only: bool,
+
+    /// Only assistant answers (`assistant_final`).
+    #[arg(long)]
+    agent_only: bool,
+
+    /// Only shell commands the human submitted.
+    #[arg(long)]
+    user_commands: bool,
+
+    /// Only tool / shell invocations the agent made.
+    #[arg(long)]
+    agent_commands: bool,
+
+    /// Throne kind filter (repeatable / comma list), same vocabulary as
+    /// `aicx extract <agent> --kind`.
+    #[arg(long, value_delimiter = ',', value_name = "KIND")]
+    kind: Vec<String>,
+
+    /// Retained shell result body: none (default) | head=N | full.
+    #[arg(long, default_value = "none", value_name = "none|head=N|full")]
+    result: String,
+
+    /// Conversation-first rendering.
+    #[arg(long)]
+    conversation: bool,
+
+    /// Maximum message characters (0 = no truncation).
+    #[arg(long, default_value = "0")]
+    max_message_chars: usize,
+
+    /// Output root for the extracts. Defaults to `<AICX_HOME>/extracts`.
+    #[arg(short, long, value_name = "DIR")]
+    output: Option<PathBuf>,
+
+    /// Re-materialize every selected session, ignoring the incremental state.
+    #[arg(long, visible_alias = "force")]
+    rebuild: bool,
+
+    /// Plan only: report what each source would become, write nothing.
+    #[arg(long)]
+    dry_run: bool,
+
+    /// Emit the run manifest as JSON on stdout instead of the human summary.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -276,13 +359,32 @@ struct ExtractAgentArgs {
     #[arg(short, long)]
     output: Option<PathBuf>,
 
-    /// Explicit project/repo name (overrides inference)
-    #[arg(short, long)]
-    project: Option<String>,
+    /// Project/repo filter, repeatable or comma-separated (OR across
+    /// projects, AND with every other axis). Entries are kept when their
+    /// recorded cwd belongs to one of them; an entry with no known cwd is
+    /// filtered out rather than guessed. A single value also names the
+    /// output's project identity, as before.
+    #[arg(short, long, value_delimiter = ',')]
+    project: Vec<String>,
 
     /// Only include user messages (exclude assistant + reasoning)
-    #[arg(long)]
+    #[arg(long, conflicts_with = "agent_only")]
     user_only: bool,
+
+    /// Only include assistant answers (`assistant_final`). Reasoning,
+    /// inter-agent traffic and lineage metadata are excluded: they are not
+    /// the assistant speaking to the operator.
+    #[arg(long)]
+    agent_only: bool,
+
+    /// Only shell commands the human submitted (e.g. Codex
+    /// `<user_shell_command>`). A command quoted in prose is not an execution.
+    #[arg(long)]
+    user_commands: bool,
+
+    /// Only tool / shell invocations the agent made.
+    #[arg(long)]
+    agent_commands: bool,
 
     /// Maximum message characters in markdown (0 = no truncation)
     #[arg(long, default_value = "0")]
@@ -1228,17 +1330,32 @@ enum Commands {
         conversation: bool,
     },
 
-    /// Extract a single session for one agent — by session id or direct file.
+    /// Extract sessions — one at a time, or every compatible source at once.
     ///
-    /// Canonical grammar (the agent is a required subcommand):
+    /// Canonical grammar (the target is a required subcommand):
+    ///   aicx extract all [-p PROJECT]... [-H HOURS] [--provider NAME]... [--rebuild]
     ///   aicx extract {codex|claude|gemini|grok|junie} --session <id> [--conversation] [-o FILE]
     ///   aicx extract {codex|claude|gemini|grok|junie} --file <path> --conversation -o <path>
+    ///
+    /// `all` walks every registered agent, projects each session through the
+    /// same filters, and writes a run manifest under
+    /// `<AICX_HOME>/extracts/_bulk/`. It is incremental: an unchanged source
+    /// under an unchanged parser and filter set is reported `unchanged` and
+    /// re-materialized only by `--rebuild`.
     ///
     /// `--session` resolves the session catalog first (bounded identity headers,
     /// no body parse), then parses exactly one resolved source. `--file` builds a
     /// direct source handle from the supplied path with no catalog scan and no
     /// global AICX state. Default output paths encode the mode axes:
-    /// `~/.aicx/extracts/<agent>/<session_id>[_conversation][_user].md`.
+    /// `~/.aicx/extracts/<agent>/<session_id>[_conversation][_user][_<variant>].md`,
+    /// where `<variant>` is the projection fingerprint of any further narrowing
+    /// so two filter sets never overwrite each other.
+    ///
+    /// Projection axes (identical on both forms): `--user-only` / `--agent-only`
+    /// select a speaker; `--user-commands` / `--agent-commands` select the
+    /// shell lane by who executed; `--kind` and `--result` stay the throne
+    /// vocabulary. Contradictory combinations fail with a named reason rather
+    /// than returning an empty result.
     #[command(display_order = 5)]
     Extract {
         #[command(subcommand)]
@@ -2657,8 +2774,12 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
                         session,
                         file: input,
                         output,
-                        project,
+                        // The removed flag grammar only ever carried one -p.
+                        project: project.into_iter().collect(),
                         user_only,
+                        agent_only: false,
+                        user_commands: false,
+                        agent_commands: false,
                         max_message_chars: max_message_chars.unwrap_or(0),
                         conversation,
                         hours: 0,
@@ -2715,14 +2836,18 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
                     json,
                     aicx::cli::failure::StructuredFailure::new(
                         "missing_agent_subcommand",
-                        "extract requires an agent subcommand: codex | claude | gemini | grok | junie",
-                        "rerun as `aicx extract codex --session <id> --conversation` or `aicx extract codex --file <path> --conversation -o <path>`",
+                        "extract requires a target: all | codex | claude | gemini | grok | junie",
+                        "rerun as `aicx extract all`, `aicx extract codex --session <id> --conversation`, or `aicx extract codex --file <path> --conversation -o <path>`",
                     )
-                    .with_fallback("aicx extract codex --session <ID> --conversation"),
+                    .with_fallback("aicx extract all"),
                 );
                 std::process::exit(2);
             };
 
+            if let ExtractTarget::All(all_args) = target {
+                run_extract_all(all_args)?;
+                return Ok(());
+            }
             let (extract_agent, args) = target.split();
             run_extract_target(extract_agent, args)?;
         }
@@ -3643,7 +3768,7 @@ fn load_session_claims(
     )?;
     // Claims / results / clarify lanes read every role and kind: full view,
     // still one `ProjectionSpec`, never a bare `true`.
-    let entries = parse_selected_source_once(&handle, &ProjectionSpec::full())?;
+    let entries = parse_selected_source_once(&handle, &ProjectionSpec::full(), Utc::now())?;
     if entries.is_empty() {
         anyhow::bail!(
             "no entries for session '{session}' (agent {agent_str}, source {}); the source parsed empty within --hours {hours}",
@@ -5588,6 +5713,10 @@ struct ExtractFileOptions {
     /// `include_assistant` / `max_message_chars` above are the legacy axes
     /// the same flags also feed; the spec is what the render paths consult.
     projection: ProjectionSpec,
+    /// `now` captured once when the command started. Every session, and every
+    /// `--lineage` parent, is windowed against this same instant — re-reading
+    /// the clock per parse would give a long run a drifting `-H` boundary.
+    cutoff: DateTime<Utc>,
 }
 
 /// Resolve the default output path for `aicx extract --session ...`:
@@ -6065,28 +6194,24 @@ fn parse_lineage_depth(raw: Option<&str>) -> Result<Option<usize>, String> {
 fn projection_spec_for_extract(
     args: &ExtractAgentArgs,
 ) -> Result<ProjectionSpec, aicx::cli::failure::StructuredFailure> {
-    let mut spec = conv::spec_for_user_only(args.user_only);
-    if !args.kind.is_empty() {
-        spec.kinds = conv::parse_kind_tokens(&args.kind).map_err(|reason| {
-            aicx::cli::failure::StructuredFailure::new(
-                "invalid_kind_token",
-                reason,
-                "pass throne kinds: human, echo_seal, shell_action, inject, assistant_final, lineage_meta, inter_agent",
-            )
-        })?;
-        // A lane carries its speaker: `--kind inter_agent` opens the system
-        // role, `--kind human` closes the assistant one. `--user-only` still
-        // narrows to human speech afterwards.
-        let implied = conv::roles_for_kinds(&spec.kinds);
-        spec.roles = if args.user_only {
-            implied
-                .into_iter()
-                .filter(|role| *role == ProjectionRole::Human)
-                .collect()
-        } else {
-            implied
-        };
-    }
+    let mut spec = ProjectionSpec::default();
+    // One resolver for `extract <agent>` and `extract all`: the words mean the
+    // same thing on both surfaces, and a contradiction is refused loudly
+    // instead of returning a silently empty projection.
+    conv::apply_axis_flags(
+        &mut spec,
+        &conv::AxisFlags {
+            user_only: args.user_only,
+            agent_only: args.agent_only,
+            user_commands: args.user_commands,
+            agent_commands: args.agent_commands,
+            kinds: args.kind.clone(),
+            conversation: args.conversation,
+        },
+    )
+    .map_err(|conflict| {
+        aicx::cli::failure::StructuredFailure::new(conflict.code, conflict.message, conflict.fix)
+    })?;
     spec.dialog = args.dialog;
     spec.result = conv::parse_result_body_token(&args.result).map_err(|reason| {
         aicx::cli::failure::StructuredFailure::new(
@@ -6108,8 +6233,20 @@ fn projection_spec_for_extract(
         since: None,
         until: None,
     };
-    spec.project = args.project.iter().cloned().collect();
+    spec.project = args.project.clone();
     Ok(spec)
+}
+
+/// The output's project identity label from a repeatable `-p`.
+///
+/// Exactly one filter names the identity unambiguously. With several, the
+/// label is left to inference from the entries themselves — asserting the
+/// first one would silently pick a winner the operator never chose.
+fn single_project_label(projects: &[String]) -> Option<String> {
+    match projects {
+        [only] => Some(only.clone()),
+        _ => None,
+    }
 }
 
 /// Dispatch one canonical `aicx extract <agent> ...` invocation.
@@ -6118,6 +6255,8 @@ fn projection_spec_for_extract(
 /// locate-before-parse) or `--file <path>` (direct handle, no discovery).
 fn run_extract_target(agent: ExtractAgent, args: ExtractAgentArgs) -> Result<()> {
     let json = aicx::cli::failure::want_json_envelope(false);
+    // One clock read for the whole command (Decision 4).
+    let cutoff = Utc::now();
     let projection = match projection_spec_for_extract(&args) {
         Ok(spec) => spec,
         Err(failure) => {
@@ -6135,10 +6274,12 @@ fn run_extract_target(agent: ExtractAgent, args: ExtractAgentArgs) -> Result<()>
         redact_secrets: args.redaction.redact_secrets,
         conversation: args.conversation,
         projection,
+        cutoff,
     };
     match (args.session, args.file) {
         (Some(session), None) => {
-            run_extract_session(agent, &session, args.output, args.project, options)
+            let label = single_project_label(&args.project);
+            run_extract_session(agent, &session, args.output, label, options)
         }
         (None, Some(file)) => {
             let Some(output) = args.output else {
@@ -6157,7 +6298,8 @@ fn run_extract_target(agent: ExtractAgent, args: ExtractAgentArgs) -> Result<()>
                 );
                 std::process::exit(2);
             };
-            run_extract_direct_file(agent, file, output, args.project, options)
+            let label = single_project_label(&args.project);
+            run_extract_direct_file(agent, file, output, label, options)
         }
         _ => {
             aicx::cli::failure::emit_and_error(
@@ -6176,6 +6318,537 @@ fn run_extract_target(agent: ExtractAgent, args: ExtractAgentArgs) -> Result<()>
             std::process::exit(2);
         }
     }
+}
+
+/// Run `aicx extract all`: one incremental projection pass over every
+/// compatible source on this machine.
+///
+/// Call chain per source:
+/// `SessionCatalog::scan` -> `source_handle_for_file` -> `parse_handle`
+/// -> `timeline_entries_from_model` -> `fold_shell_results`
+/// -> `apply_projection_at(cutoff)` -> `write_extract_outputs`.
+///
+/// Everything the pass decides is recorded in the manifest, including the
+/// sources it deliberately did nothing to.
+fn run_extract_all(args: ExtractAllArgs) -> Result<()> {
+    use aicx::extraction::bulk;
+
+    let json_failure = aicx::cli::failure::want_json_envelope(false);
+    // Decision 4: one clock read, shared by every session in the run.
+    let cutoff = Utc::now();
+
+    let agents = match resolve_bulk_agents(&args.provider) {
+        Ok(agents) => agents,
+        Err(failure) => {
+            aicx::cli::failure::emit_and_error("aicx extract all", json_failure, failure);
+            std::process::exit(2);
+        }
+    };
+
+    let projection = match projection_spec_for_extract_all(&args) {
+        Ok(spec) => spec,
+        Err(failure) => {
+            aicx::cli::failure::emit_and_error("aicx extract all", json_failure, failure);
+            std::process::exit(2);
+        }
+    };
+
+    let extracts_root = match &args.output {
+        Some(dir) => dir.clone(),
+        None => aicx::aicx_home::ensure()?.join("extracts"),
+    };
+    let projection_fingerprint = bulk::projection_fingerprint(&projection, args.conversation);
+    let mut state = bulk::load_state(&extracts_root);
+    let mut rows: Vec<bulk::ManifestEntry> = Vec::new();
+
+    let options = ExtractFileOptions {
+        include_assistant: !args.user_only,
+        max_message_chars: args.max_message_chars,
+        redact_secrets: args.redaction.redact_secrets,
+        conversation: args.conversation,
+        projection: projection.clone(),
+        cutoff,
+    };
+
+    for agent in &agents {
+        let extract_agent = bulk_agent_to_extract_agent(*agent);
+        let home = aicx::os_user_home().context("No home dir")?;
+        let root = extract_agent.session_root(&home);
+        if !root.is_dir() {
+            // A provider that never ran on this host contributes zero sources.
+            // That is not "unsupported" and not a failure — it is silence, and
+            // the manifest shows it as an absent provider rather than a lie.
+            eprintln!(
+                "extract all: {agent}: no session root at {} (provider never used here)",
+                root.display()
+            );
+            continue;
+        }
+        let sources = match aicx::session_catalog::SessionCatalog::new(*agent, &root) {
+            Ok(catalog) => match catalog.scan_with_stats().result {
+                Ok(sources) => sources,
+                Err(error) => {
+                    eprintln!("extract all: {agent}: catalog scan failed: {error}");
+                    rows.push(bulk::ManifestEntry {
+                        provider: agent.to_string(),
+                        source_id: format!("<{agent}-catalog>"),
+                        logical_session_id: None,
+                        source_path: root.display().to_string(),
+                        source_fingerprint: String::new(),
+                        parser_version: parser_version_for(*agent).to_owned(),
+                        outcome: bulk::SourceOutcome::Failed {
+                            reason: error.to_string(),
+                            recover: format!("aicx catalog rebuild --agent {agent}"),
+                        },
+                    });
+                    continue;
+                }
+            },
+            Err(error) => {
+                rows.push(bulk::ManifestEntry {
+                    provider: agent.to_string(),
+                    source_id: format!("<{agent}-catalog>"),
+                    logical_session_id: None,
+                    source_path: root.display().to_string(),
+                    source_fingerprint: String::new(),
+                    parser_version: parser_version_for(*agent).to_owned(),
+                    outcome: bulk::SourceOutcome::Failed {
+                        reason: error.to_string(),
+                        recover: format!("aicx catalog rebuild --agent {agent}"),
+                    },
+                });
+                continue;
+            }
+        };
+
+        eprintln!(
+            "extract all: {agent}: {} source(s) discovered under {}",
+            sources.len(),
+            root.display()
+        );
+
+        for source in sources {
+            let row = extract_one_source_for_bulk(
+                extract_agent,
+                *agent,
+                &source,
+                &options,
+                &extracts_root,
+                &projection_fingerprint,
+                &mut state,
+                args.rebuild,
+                args.dry_run,
+            );
+            rows.push(row);
+        }
+    }
+
+    let filters = bulk::ManifestFilters {
+        roles: projection
+            .roles
+            .iter()
+            .map(|role| role.as_cli_token().to_owned())
+            .collect(),
+        kinds: projection
+            .kinds
+            .iter()
+            .map(|kind| kind.as_cli_token().to_owned())
+            .collect(),
+        shell_executors: projection
+            .shell_executors
+            .iter()
+            .map(|executor| executor.as_str().to_owned())
+            .collect(),
+        projects: projection.project.clone(),
+        hours: projection.window.hours,
+        result_body: args.result.clone(),
+        conversation: args.conversation,
+        cutoff_utc: cutoff.to_rfc3339(),
+        projection_fingerprint: projection_fingerprint.clone(),
+    };
+    let manifest = bulk::build_manifest(cutoff, &agents, filters, rows);
+    debug_assert!(
+        manifest.totals.reconciles(),
+        "every discovered source must land in exactly one bucket"
+    );
+
+    if !args.dry_run {
+        bulk::save_state(&extracts_root, &state)?;
+        let manifest_path = bulk::save_manifest(&extracts_root, &manifest)?;
+        eprintln!("extract all: manifest -> {}", manifest_path.display());
+    }
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&manifest)?);
+    } else {
+        print_bulk_summary(&manifest, &extracts_root, args.dry_run);
+    }
+
+    let code = manifest.exit_code();
+    if code != 0 {
+        // Partial is never overall success: automation must be able to see
+        // "some sources are broken" without parsing prose.
+        eprintln!(
+            "extract all: PARTIAL — {} of {} selected source(s) failed (exit {code})",
+            manifest.totals.failed, manifest.totals.selected
+        );
+        std::process::exit(code);
+    }
+    Ok(())
+}
+
+/// Human-readable run summary on stdout: the useful result, not diagnostics.
+fn print_bulk_summary(
+    manifest: &aicx::extraction::bulk::BulkManifest,
+    extracts_root: &Path,
+    dry_run: bool,
+) {
+    use aicx::extraction::bulk::SourceOutcome;
+    let totals = &manifest.totals;
+    if dry_run {
+        println!("aicx extract all — DRY RUN (nothing written)");
+    }
+    println!(
+        "discovered {} · extracted {} · unchanged {} · empty-after-filter {} · filtered-out {} · unsupported {} · failed {}",
+        totals.discovered,
+        totals.extracted,
+        totals.unchanged,
+        totals.empty_after_filter,
+        totals.filtered_out,
+        totals.unsupported,
+        totals.failed
+    );
+    if totals.discovered == 0 {
+        println!(
+            "no sessions found for the requested agents — this is an empty archive, not an error"
+        );
+        return;
+    }
+    for row in &manifest.entries {
+        if let SourceOutcome::Extracted {
+            output_path,
+            entries,
+        } = &row.outcome
+        {
+            println!(
+                "{}\t{}\t{entries} entries\t{output_path}",
+                row.provider, row.source_id
+            );
+        }
+    }
+    for row in &manifest.entries {
+        if let SourceOutcome::Failed { reason, recover } = &row.outcome {
+            println!(
+                "FAILED\t{}\t{}\t{reason}\n  recover: {recover}",
+                row.provider, row.source_id
+            );
+        }
+    }
+    if !dry_run {
+        println!(
+            "manifest: {}",
+            extracts_root
+                .join("_bulk")
+                .join("manifest-latest.json")
+                .display()
+        );
+    }
+}
+
+/// Adapter version string reported in the manifest and used as half of the
+/// incremental cache key: a parser change invalidates cached extracts.
+fn parser_version_for(agent: aicx::session_catalog::AgentKind) -> &'static str {
+    aicx::parser::adapters::registered_adapter(bulk_agent_to_parser_agent(agent)).adapter_version()
+}
+
+const fn bulk_agent_to_parser_agent(
+    agent: aicx::session_catalog::AgentKind,
+) -> aicx::parser::engine::AgentKind {
+    match agent {
+        aicx::session_catalog::AgentKind::Claude => aicx::parser::engine::AgentKind::Claude,
+        aicx::session_catalog::AgentKind::Codex => aicx::parser::engine::AgentKind::Codex,
+        aicx::session_catalog::AgentKind::Gemini => aicx::parser::engine::AgentKind::Gemini,
+        aicx::session_catalog::AgentKind::Grok => aicx::parser::engine::AgentKind::Grok,
+        aicx::session_catalog::AgentKind::Junie => aicx::parser::engine::AgentKind::Junie,
+    }
+}
+
+const fn bulk_agent_to_extract_agent(agent: aicx::session_catalog::AgentKind) -> ExtractAgent {
+    match agent {
+        aicx::session_catalog::AgentKind::Claude => ExtractAgent::Claude,
+        aicx::session_catalog::AgentKind::Codex => ExtractAgent::Codex,
+        aicx::session_catalog::AgentKind::Gemini => ExtractAgent::Gemini,
+        aicx::session_catalog::AgentKind::Grok => ExtractAgent::Grok,
+        aicx::session_catalog::AgentKind::Junie => ExtractAgent::Junie,
+    }
+}
+
+/// `--provider` selection, or every registered provider when absent.
+fn resolve_bulk_agents(
+    requested: &[String],
+) -> Result<Vec<aicx::session_catalog::AgentKind>, aicx::cli::failure::StructuredFailure> {
+    use aicx::extraction::bulk::ALL_AGENTS;
+    if requested.is_empty() {
+        return Ok(ALL_AGENTS.to_vec());
+    }
+    let mut agents = Vec::with_capacity(requested.len());
+    for token in requested {
+        let token = token.trim();
+        if token.is_empty() {
+            continue;
+        }
+        let Some(agent) = ExtractAgent::from_str(token) else {
+            return Err(aicx::cli::failure::StructuredFailure::new(
+                "unknown_provider",
+                format!("`{token}` is not a supported provider"),
+                "pass one of: claude, codex, gemini, grok, junie",
+            ));
+        };
+        let agent = agent.catalog_kind();
+        if !agents.contains(&agent) {
+            agents.push(agent);
+        }
+    }
+    if agents.is_empty() {
+        return Err(aicx::cli::failure::StructuredFailure::new(
+            "empty_provider_selection",
+            "--provider was given but selected no provider",
+            "drop --provider to select every provider, or name at least one",
+        ));
+    }
+    Ok(agents)
+}
+
+/// The bulk spec: same axis resolver as the per-agent form, so the flags
+/// cannot mean two different things on two surfaces.
+fn projection_spec_for_extract_all(
+    args: &ExtractAllArgs,
+) -> Result<ProjectionSpec, aicx::cli::failure::StructuredFailure> {
+    let mut spec = ProjectionSpec::default();
+    conv::apply_axis_flags(
+        &mut spec,
+        &conv::AxisFlags {
+            user_only: args.user_only,
+            agent_only: args.agent_only,
+            user_commands: args.user_commands,
+            agent_commands: args.agent_commands,
+            kinds: args.kind.clone(),
+            conversation: args.conversation,
+        },
+    )
+    .map_err(|conflict| {
+        aicx::cli::failure::StructuredFailure::new(conflict.code, conflict.message, conflict.fix)
+    })?;
+    spec.result = conv::parse_result_body_token(&args.result).map_err(|reason| {
+        aicx::cli::failure::StructuredFailure::new(
+            "invalid_result_token",
+            reason,
+            "use --result none | head=N | full",
+        )
+    })?;
+    spec.max_message_chars = args.max_message_chars;
+    spec.window = ProjectionWindow {
+        hours: (args.hours > 0).then_some(args.hours),
+        since: None,
+        until: None,
+    };
+    spec.project = args.project.clone();
+    Ok(spec)
+}
+
+/// One source, start to finish, never propagating a failure out of the batch.
+#[allow(clippy::too_many_arguments)]
+fn extract_one_source_for_bulk(
+    extract_agent: ExtractAgent,
+    agent: aicx::session_catalog::AgentKind,
+    source: &aicx::session_catalog::CatalogSource,
+    options: &ExtractFileOptions,
+    extracts_root: &Path,
+    projection_fingerprint: &str,
+    state: &mut aicx::extraction::bulk::BulkState,
+    rebuild: bool,
+    dry_run: bool,
+) -> aicx::extraction::bulk::ManifestEntry {
+    use aicx::extraction::bulk::{self, ManifestEntry, SourceOutcome};
+
+    let provider = agent.to_string();
+    let parser_version = parser_version_for(agent).to_owned();
+    let source_fingerprint = bulk::source_fingerprint(
+        source.fingerprint.len,
+        source.fingerprint.modified_unix_nanos,
+    );
+    let row = |outcome: SourceOutcome| ManifestEntry {
+        provider: provider.clone(),
+        source_id: source.source_id.clone(),
+        logical_session_id: source.logical_session_id.clone(),
+        source_path: source.path.display().to_string(),
+        source_fingerprint: source_fingerprint.clone(),
+        parser_version: parser_version.clone(),
+        outcome,
+    };
+
+    // Deduction before work: an mtime older than the `-H` lower bound proves
+    // the source cannot hold an in-window event, so it is neither opened nor
+    // cached. Recorded with its proof so the manifest does not conflate it
+    // with "parsed and found nothing".
+    if bulk::window_proves_empty(
+        source.fingerprint.modified_unix_nanos,
+        options.projection.window.hours,
+        options.cutoff,
+    ) {
+        return row(SourceOutcome::EmptyAfterFilter {
+            reason: bulk::EMPTY_BY_WINDOW_PROOF.to_owned(),
+        });
+    }
+
+    let output_path = bulk_output_path(
+        extracts_root,
+        extract_agent.label(),
+        &source.source_id,
+        options,
+        projection_fingerprint,
+    );
+    let key = bulk::state_key(&provider, &source.source_id, projection_fingerprint);
+
+    // Incremental skip: same bytes, same parser, same view, output still there.
+    if !rebuild
+        && let Some(previous) = state.entries.get(&key)
+        && previous.source_fingerprint == source_fingerprint
+        && previous.parser_version == parser_version
+        && Path::new(&previous.output_path).exists()
+    {
+        return row(SourceOutcome::Unchanged {
+            output_path: previous.output_path.clone(),
+        });
+    }
+
+    // Handle construction is the structural support boundary: a shape the
+    // engine has no framing for is unsupported, not broken.
+    let handle = match aicx::parser_dispatch::source_handle_for_file(
+        extract_agent.parser_kind(),
+        &source.source_id,
+        source.logical_session_id.clone(),
+        &source.path,
+    ) {
+        Ok(handle) => handle,
+        Err(error) => {
+            return row(SourceOutcome::Unsupported {
+                reason: one_line(&error.to_string()),
+            });
+        }
+    };
+
+    let parsed =
+        match parse_selected_source_with_basis(&handle, &options.projection, options.cutoff) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                let text = error.to_string();
+                let in_flight = aicx::extraction::is_in_flight_failure(
+                    source.fingerprint.modified_unix_nanos,
+                    &text,
+                );
+                let reason = if in_flight {
+                    format!(
+                        "in-flight: source is still being written ({})",
+                        one_line(&text)
+                    )
+                } else {
+                    one_line(&text)
+                };
+                return row(SourceOutcome::Failed {
+                    reason,
+                    recover: format!(
+                        "aicx extract {} --file '{}' --conversation -o <output>",
+                        extract_agent.label(),
+                        source.path.display()
+                    ),
+                });
+            }
+        };
+
+    if parsed.entries.is_empty() {
+        return row(SourceOutcome::EmptyAfterFilter {
+            reason: bulk::EMPTY_AFTER_PROJECTION.to_owned(),
+        });
+    }
+
+    if dry_run {
+        return row(SourceOutcome::Extracted {
+            output_path: output_path.display().to_string(),
+            entries: parsed.entries.len(),
+        });
+    }
+
+    let entries = parsed.entries.len();
+    let render = ExtractRender {
+        agent: extract_agent,
+        entries: parsed.entries,
+        sessions: Some(vec![source.source_id.clone()]),
+        explicit_project: single_project_label(&options.projection.project),
+        fallback_identity: format!("{}/{}", extract_agent.label(), source.source_id),
+        output_path: output_path.clone(),
+        options: ExtractFileOptions {
+            projection: options.projection.clone(),
+            ..*options
+        },
+    };
+    match write_extract_outputs(render) {
+        Ok(()) => {
+            state.schema = bulk::BULK_STATE_SCHEMA.to_owned();
+            state.entries.insert(
+                key,
+                bulk::BulkStateEntry {
+                    source_fingerprint: source_fingerprint.clone(),
+                    parser_version: parser_version.clone(),
+                    output_path: output_path.display().to_string(),
+                    extracted_at: options.cutoff.to_rfc3339(),
+                },
+            );
+            row(SourceOutcome::Extracted {
+                output_path: output_path.display().to_string(),
+                entries,
+            })
+        }
+        Err(error) => row(SourceOutcome::Failed {
+            reason: one_line(&error.to_string()),
+            recover: format!(
+                "aicx extract {} --file '{}' --conversation -o <output>",
+                extract_agent.label(),
+                source.path.display()
+            ),
+        }),
+    }
+}
+
+/// Where one bulk extract lands.
+///
+/// The projection fingerprint is appended whenever the view is narrower than
+/// the razor default, so `--agent-only` and `--user-commands` runs over the
+/// same session never overwrite each other's file.
+fn bulk_output_path(
+    extracts_root: &Path,
+    agent_label: &str,
+    session_id: &str,
+    options: &ExtractFileOptions,
+    projection_fingerprint: &str,
+) -> PathBuf {
+    let user_only = !options.include_assistant;
+    let default_fingerprint = aicx::extraction::bulk::projection_fingerprint(
+        &ProjectionSpec::default(),
+        options.conversation,
+    );
+    let extra = (projection_fingerprint != default_fingerprint).then_some(projection_fingerprint);
+    let stem = aicx::extraction::bulk::variant_stem(
+        &safe_session_extract_stem(session_id),
+        options.conversation,
+        user_only,
+        extra,
+    );
+    extracts_root.join(agent_label).join(format!("{stem}.md"))
+}
+
+fn one_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Map a catalog resolution failure into the structured CLI failure surface.
@@ -6298,8 +6971,9 @@ fn grok_direct_source_id(agent: ExtractAgent, path: &Path) -> Option<String> {
 fn parse_selected_source_once(
     handle: &aicx::parser::engine::SourceHandle,
     projection: &ProjectionSpec,
+    cutoff: DateTime<Utc>,
 ) -> Result<Vec<timeline::TimelineEntry>> {
-    parse_selected_source_with_basis(handle, projection).map(|parsed| parsed.entries)
+    parse_selected_source_with_basis(handle, projection, cutoff).map(|parsed| parsed.entries)
 }
 
 /// The projected entries of one source plus the evidence a typed refusal
@@ -6352,6 +7026,7 @@ impl ProjectedSource {
 fn parse_selected_source_with_basis(
     handle: &aicx::parser::engine::SourceHandle,
     projection: &ProjectionSpec,
+    cutoff: DateTime<Utc>,
 ) -> Result<ProjectedSource> {
     let session = aicx::parser_dispatch::parse_handle(handle)?;
     let model = session.model();
@@ -6361,7 +7036,7 @@ fn parse_selected_source_with_basis(
     // head / full rendering is one entry), then the spec decides what stays.
     // No role-string reducer here (W2-T13).
     let mut entries = conv::fold_shell_results(entries, projection);
-    conv::apply_projection(&mut entries, projection);
+    conv::apply_projection_at(&mut entries, projection, cutoff);
     Ok(ProjectedSource {
         entries,
         agent: model.provenance.agent,
@@ -6611,7 +7286,7 @@ fn run_extract_session(
     // agents stay single-artifact.
     debug_assert!(!handle.artifacts().is_empty());
 
-    let mut entries = parse_selected_source_once(&handle, &options.projection)?;
+    let mut entries = parse_selected_source_once(&handle, &options.projection, options.cutoff)?;
     if entries.is_empty() {
         anyhow::bail!(
             "Resolved session `{}` to `{}`, but no entries were extractable from {} for agent `{}`.",
@@ -6653,7 +7328,8 @@ fn run_extract_session(
                 hop.source.logical_session_id.clone(),
                 &hop.source.path,
             )?;
-            let parent_entries = parse_selected_source_once(&parent_handle, &options.projection)?;
+            let parent_entries =
+                parse_selected_source_once(&parent_handle, &options.projection, options.cutoff)?;
             let parent_ref = graph
                 .node(&hop.node_id)
                 .map(|node| node.conversation.clone())
@@ -6772,7 +7448,7 @@ fn run_extract_direct_file(
             "extract: lineage: --file has no session catalog; the forked_from_id walk needs --session"
         );
     }
-    let parsed = parse_selected_source_with_basis(&handle, &options.projection)?;
+    let parsed = parse_selected_source_with_basis(&handle, &options.projection, options.cutoff)?;
     if let Some(refusal) = parsed.refusal_if_empty(&options.projection) {
         // Typed refusal instead of a silent `Wrote 0 entries` (W2-T12 on the
         // direct-file seam; oracle `grok-019fdeca-typed-refusal`).

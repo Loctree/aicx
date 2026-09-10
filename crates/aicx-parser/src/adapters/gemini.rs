@@ -587,8 +587,9 @@ fn emit_tool_call(
             .unwrap_or(name)
             .to_owned();
         let result = extract_tool_result_string(call_val);
+        // The agent invoked the shell tool; the operator did not type it.
         (
-            TransportKind::UserShellCommand,
+            TransportKind::AgentToolCall,
             TransportPayload::Shell { command, result },
         )
     } else {

@@ -21,6 +21,7 @@ pub use crate::timeline::{
     CollapseStubKind, ConversationMessage, ExtractionConfig, MessageKind, SourceInfo, TimelineEntry,
 };
 
+pub mod bulk;
 pub mod conversation;
 pub mod files;
 mod importer_support;
@@ -345,8 +346,13 @@ fn source_is_selected(modified_unix_nanos: u128, config: &ExtractionConfig) -> b
     modified_unix_nanos > lower_bound_nanos
 }
 
+/// Is this failure the signature of a source still being written?
+///
+/// Shared with the bulk pass: an actively-appended JSONL whose last line is a
+/// half-written record is not a broken source, and reporting it as one would
+/// train operators to ignore real failures.
 #[cfg(feature = "app")]
-fn is_in_flight_failure(modified_unix_nanos: u128, error: &str) -> bool {
+pub fn is_in_flight_failure(modified_unix_nanos: u128, error: &str) -> bool {
     if !error.contains("Fatal completeness") {
         return false;
     }

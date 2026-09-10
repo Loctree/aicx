@@ -63,6 +63,24 @@ fn rollout_fixture(session_id: &str) -> String {
     )
 }
 
+/// Does `help` offer the removed `--agent <name>` / `--format <name>` flag
+/// grammar?
+///
+/// Token-boundary, not substring: `--agent-only` and `--agent-commands` are
+/// legitimate projection flags in the current grammar, and a bare
+/// `contains("--agent")` would forbid the whole namespace instead of the one
+/// removed spelling this guard exists for.
+fn offers_removed_flag_grammar(help: &str) -> bool {
+    ["--agent", "--format"].iter().any(|flag| {
+        help.match_indices(flag).any(|(index, _)| {
+            let rest = &help[index + flag.len()..];
+            // A following `-` means a longer flag name (`--agent-only`);
+            // anything else means the removed flag itself is on offer.
+            !rest.starts_with('-')
+        })
+    })
+}
+
 fn run_extract(home: &Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_aicx"))
         .env("HOME", home)
@@ -86,7 +104,7 @@ fn help_lists_agent_subcommands_and_hides_flag_grammar() {
         );
     }
     assert!(
-        !stdout.contains("--agent") && !stdout.contains("--format"),
+        !offers_removed_flag_grammar(&stdout),
         "removed flag grammar leaked into help:\n{stdout}"
     );
     let _ = fs::remove_dir_all(&home);
