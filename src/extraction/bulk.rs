@@ -35,16 +35,11 @@ pub const BULK_DIRNAME: &str = "_bulk";
 
 /// Every agent the parser registry can actually claim.
 ///
-/// Enumerated from [`AgentKind`] rather than a hand-written list so a provider
-/// added to the registry is picked up here without a second edit — and a
-/// provider that only exists in help text is not.
-pub const ALL_AGENTS: [AgentKind; 5] = [
-    AgentKind::Claude,
-    AgentKind::Codex,
-    AgentKind::Gemini,
-    AgentKind::Grok,
-    AgentKind::Junie,
-];
+/// The catalog's own list ([`AgentKind::ALL`]), not a copy of it: a provider
+/// added to the registry is picked up here without a second edit, and a
+/// provider that only exists in help text is not. The previous hand-written
+/// five-entry array claimed to be derived and was not.
+pub const ALL_AGENTS: [AgentKind; AgentKind::ALL.len()] = AgentKind::ALL;
 
 /// What happened to one discovered source.
 ///

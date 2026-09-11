@@ -96,12 +96,26 @@ impl AgentKind {
     /// Grok session dirs carry multiple JSONL streams (chat, events, updates,
     /// hunks, rewind). Only `chat_history.jsonl` is conversation content;
     /// telemetry streams must not become catalog identity.
+    ///
+    /// Gemini CLI keeps a conversation only under `<project>/chats/`: either
+    /// `chats/session-*.json[l]` or, for resumed sessions, `chats/<uuid>/<id>.json`.
+    /// The same project directory also holds `logs.json`, `checkpoint-*.json`,
+    /// `.extraction-state.json` and `formatted_context.json`, which are JSON but
+    /// were never a session. Measured on a real tree (2026-09-10) they were 32
+    /// of 397 candidates and every one of them reached the adapter as an
+    /// `unknown_payload_type` refusal. Discovery decides here, by shape of the
+    /// path, so the adapter is never asked about them.
     fn is_primary_source_file(self, path: &Path) -> bool {
         match self {
             Self::Grok => {
                 path.file_name().and_then(|name| name.to_str()) == Some("chat_history.jsonl")
             }
-            _ => true,
+            Self::Gemini => path
+                .ancestors()
+                .skip(1)
+                .take(2)
+                .any(|dir| dir.file_name().and_then(|name| name.to_str()) == Some("chats")),
+            Self::Claude | Self::Codex | Self::Junie => true,
         }
     }
 }

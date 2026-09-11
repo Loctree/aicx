@@ -5,6 +5,42 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
+### A Gemini session is no longer lost because one tool result was large
+
+Gemini stores a whole conversation as one JSON document, and the reader
+bounded every physical unit — a JSONL line *or* a whole file — at 8 MiB. So a
+281 MB `chats/session-*.json` holding 39 messages, 228 bytes of speech and one
+298 MB tool result was refused entirely as `Fatal completeness`. On one real
+tree that was 6 of 397 sessions, indistinguishable from the 32 `logs.json` /
+checkpoint files the catalog offered next to them.
+
+- **Documents have their own bound.** `ReaderPolicy` gains
+  `max_document_bytes` (default 1 GiB, below the 2 GiB source cap); the 8 MiB
+  `max_unit_bytes` now means what it says — one line. A whole-document unit
+  moves into its `RawUnit` instead of being copied. Physical accounting is
+  unchanged: one document, one physical unit (taxonomy §2 stands).
+- **Nested blocks are bounded instead.** The Gemini adapter measures every
+  logical unit in canonical bytes against the same 8 MiB. An oversized
+  `toolCalls[i]` / `parts[i]` terminates as `skipped(oversized)` with its own
+  evidence (locator, hash, byte count) and the typed warning; the message
+  that carried it is consumed without it, an index-stable marker
+  (`aicx_oversized_block`) keeping every sibling's locator and hash exactly
+  what it would have been. A message whose *speech* is over the cap is the
+  unit that skips; the session stays a session (`partial_visible`,
+  `visible_event_lost`), never `Fatal`.
+- **Hashing streams.** `engine::Sha256Stream` is the frozen SHA-256 as an
+  incremental writer; logical evidence is measured by serializing into it, so
+  a 300 MB block costs a pass, not a copy. Digests are byte-identical to
+  `sha256_hex` (block-edge vectors pinned).
+- **Discovery stops offering non-conversations.** A Gemini catalog source
+  must live under `<project>/chats/` (top-level `session-*.json[l]` or resumed
+  `chats/<uuid>/<id>.json`). `logs.json`, `checkpoint-*.json`,
+  `.extraction-state.json` and `formatted_context.json` no longer reach the
+  adapter to be refused; on the measured tree the 32 `unsupported` rows leave
+  the manifest and `discovered` reconciles to the 365 conversations.
+- `extract all` enumerates providers from the catalog's `AgentKind::ALL`
+  instead of a hand-written copy that claimed to be derived.
+
 ## [0.13.0] - 2026-09-01
 
 ### One taxonomy for every agent (mission `aicx-one-taxonomy-fusion-260827`)

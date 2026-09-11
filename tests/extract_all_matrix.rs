@@ -932,18 +932,23 @@ fn a_stray_file_in_the_session_directory_is_unsupported_not_failed() {
     let sandbox = Sandbox::new("unsupported");
     codex_fixture(&sandbox);
     // Shaped like the real archive's strays: gemini writes a `logs.json` next
-    // to its chats whose records *look* like a conversation — sessionId,
+    // to its `chats/` whose records *look* like a conversation — sessionId,
     // messageId, type, message, timestamp — and which no adapter claims. On a
-    // real gemini tree these strays are 32 of 397 discovered sources.
-    // Reporting them as failed sessions buries the ones that genuinely broke.
-    sandbox.write(
-        ".gemini/tmp/some-project/logs.json",
-        concat!(
-            r#"[{"sessionId":"11111111-2222-4333-8444-555555555555","messageId":1,"#,
-            r#""type":"user","message":"zapis do logu, nie tura rozmowy","#,
-            r#""timestamp":"2026-09-10T08:00:00.000Z"}]"#,
-        ),
+    // real gemini tree these strays were 32 of 397 discovered sources.
+    //
+    // Two contracts meet here. Discovery knows the gemini layout: a `.json`
+    // that is not under `chats/` is never a candidate, so the real stray does
+    // not reach the manifest at all. And the `unsupported` bucket still
+    // exists for what discovery cannot rule out by path — a file under
+    // `chats/` that no adapter claims — because reporting that as a failed
+    // session would bury the ones that genuinely broke.
+    let stray_records = concat!(
+        r#"[{"sessionId":"11111111-2222-4333-8444-555555555555","messageId":1,"#,
+        r#""type":"user","message":"zapis do logu, nie tura rozmowy","#,
+        r#""timestamp":"2026-09-10T08:00:00.000Z"}]"#,
     );
+    sandbox.write(".gemini/tmp/some-project/logs.json", stray_records);
+    sandbox.write(".gemini/tmp/some-project/chats/notes.json", stray_records);
 
     let output = sandbox.run(&[
         "extract",
@@ -957,9 +962,26 @@ fn a_stray_file_in_the_session_directory_is_unsupported_not_failed() {
     assert_totals_reconcile(&manifest);
 
     assert_eq!(
+        count(&manifest, "discovered"),
+        2,
+        "the stray next to chats/ is not a candidate at all:\n{}",
+        serde_json::to_string_pretty(totals(&manifest)).unwrap()
+    );
+    assert!(
+        manifest["entries"]
+            .as_array()
+            .expect("entries")
+            .iter()
+            .all(|entry| !entry["source_path"]
+                .as_str()
+                .unwrap_or_default()
+                .ends_with("some-project/logs.json")),
+        "a log next to chats/ must never reach the manifest"
+    );
+    assert_eq!(
         count(&manifest, "unsupported"),
         1,
-        "the stray belongs in its own bucket:\n{}",
+        "the stray under chats/ belongs in its own bucket:\n{}",
         serde_json::to_string_pretty(totals(&manifest)).unwrap()
     );
     assert_eq!(
@@ -985,6 +1007,12 @@ fn a_stray_file_in_the_session_directory_is_unsupported_not_failed() {
         .iter()
         .find(|entry| entry["outcome"] == "unsupported")
         .expect("the stray is in the manifest");
+    assert!(
+        stray["source_path"]
+            .as_str()
+            .unwrap_or_default()
+            .ends_with("some-project/chats/notes.json")
+    );
     let reason = stray["reason"]
         .as_str()
         .expect("unsupported carries a reason");

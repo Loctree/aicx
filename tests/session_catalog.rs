@@ -364,12 +364,14 @@ fn scan_matrix_covers_all_agent_header_shapes() {
 
     for (agent, stem, content, logical) in fixtures {
         let root = TestRoot::new(agent.as_str());
-        let extension = if agent == AgentKind::Gemini {
-            "json"
+        // Gemini conversations live under `<project>/chats/`; a `.json` at any
+        // other depth is a log or a checkpoint and is not a catalog candidate.
+        let relative = if agent == AgentKind::Gemini {
+            format!("proj/chats/{stem}.json")
         } else {
-            "jsonl"
+            format!("{stem}.jsonl")
         };
-        root.write(format!("{stem}.{extension}"), &content);
+        root.write(relative, &content);
         let catalog = SessionCatalog::new(agent, root.path()).unwrap();
         let resolved = catalog.resolve(logical).unwrap();
         assert_eq!(
@@ -428,6 +430,53 @@ fn hot_window_scan_probes_only_fresh_candidates() {
         none_fresh.newest_modified_unix_nanos,
         all_fresh.newest_modified_unix_nanos
     );
+}
+
+#[test]
+fn gemini_catalog_admits_only_conversations_under_chats() {
+    // Real `~/.gemini/tmp/<project>/` layout, measured 2026-09-10: 365 of 397
+    // JSON files were conversations under `chats/` (top-level `session-*.json`
+    // and resumed `chats/<uuid>/<id>.json`); the other 32 were `logs.json`,
+    // checkpoints, extraction state and formatted context living next to
+    // `chats/`. None of those 32 is a session, and every one of them used to
+    // reach the adapter only to be refused as `unknown_payload_type`.
+    let root = TestRoot::new("gemini-chats-only");
+    let session = |id: &str| {
+        format!(
+            r#"{{"sessionId":"{id}","startTime":"2026-03-09T19:37:43.121Z","lastUpdated":"2026-03-09T19:40:00.000Z","messages":[{{"type":"user","content":"hi"}}]}}"#
+        )
+    };
+    let top_level = "proj/chats/session-2026-03-09T19-37-aaaa1111.json";
+    let nested = format!("proj/chats/{UUID_B}/8a8cyl.json");
+    root.write(top_level, &session(UUID_A));
+    root.write(&nested, &session("8a8cyl"));
+    root.write(
+        "proj/logs.json",
+        r#"[{"sessionId":"x","messageId":1,"type":"user","message":"hi","timestamp":"2026-03-09T19:37:43.121Z"}]"#,
+    );
+    root.write("proj/checkpoint-pr-544-p1.json", "[]");
+    root.write("proj/.extraction-state.json", "{}");
+    root.write("proj/formatted_context.json", "{}");
+    root.write("proj/notes.jsonl", "{\"sessionId\":\"not-a-chat\"}\n");
+
+    let catalog = SessionCatalog::new(AgentKind::Gemini, root.path()).unwrap();
+    let scanned = catalog.scan_with_stats_and_progress(|_| {}).result.unwrap();
+    // Catalog paths are validated (canonical); the temp root may be a symlink
+    // alias of the same directory, so compare under the canonical root.
+    let canonical_root = root.path().canonicalize().unwrap();
+    let mut relative: Vec<String> = scanned
+        .iter()
+        .map(|source| {
+            source
+                .path
+                .strip_prefix(&canonical_root)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    relative.sort();
+    assert_eq!(relative, vec![nested, top_level.to_string()]);
 }
 
 #[test]
