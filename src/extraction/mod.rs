@@ -21,6 +21,9 @@ pub use crate::timeline::{
     CollapseStubKind, ConversationMessage, ExtractionConfig, MessageKind, SourceInfo, TimelineEntry,
 };
 
+/// Bulk `extract all` bookkeeping: a CLI surface, absent from the slim
+/// `loctree-consumer` profile (it reaches the `app`-gated session catalog).
+#[cfg(feature = "app")]
 pub mod bulk;
 pub mod conversation;
 pub mod files;
