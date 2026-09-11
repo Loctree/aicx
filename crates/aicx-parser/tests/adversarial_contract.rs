@@ -33,6 +33,7 @@ fn mutation_matrix_closes_every_adapter_boundary() {
                 ReaderPolicy {
                     max_source_bytes: 1024 * 1024,
                     max_unit_bytes: 32,
+                    max_document_bytes: 32,
                 },
             ),
         ];
