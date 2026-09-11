@@ -125,6 +125,41 @@ on live sessions:
    also becomes a real `user` row — the projection loses to the real row, on
    equal trimmed text with a delivery timestamp at or after the enqueue.
 
+### 2.2 Unit bounds — a unit is refused, never a session
+
+Every raw unit is bounded, and the bound follows the unit's shape, not the
+file's:
+
+| Unit | Bound | Where decided |
+|---|---|---|
+| physical, line-framed (`JsonLines`) | `ReaderPolicy::max_unit_bytes` (8 MiB) | reader |
+| physical, whole-document (`WholeDocument` / `Opaque`) | `ReaderPolicy::max_document_bytes` (1 GiB, below the 2 GiB source cap) | reader |
+| logical (adapter-declared nested block) | 8 MiB of canonical JSON | adapter |
+
+A unit over its bound terminates as `skipped(oversized)` with full evidence
+(locator, content hash of the *whole* unit, original byte count) and one
+`oversized_unit` warning — the same contract for a line, a document and a
+nested block. The reader hashes the whole unit and keeps at most the bound.
+
+The rule this encodes: **an oversized unit costs exactly itself.** A whole-file
+Gemini session is one physical unit however large it is, so applying the line
+bound to it made one 298 MB tool result refuse a 39-message conversation as
+`Fatal`. The document bound admits the file; the adapter then bounds the
+nested blocks and drops only the one that is over. Concretely, for Gemini:
+
+- an oversized `toolCalls[i]` (or `parts[i]`) is skipped under the locator it
+  would have consumed under (`<ordinal>:blk:<msg*1000+i+1>`), and the parent
+  message is consumed with an index-stable marker
+  (`{"aicx_oversized_block":{"bytes":…,"sha256":…}}`) in its place — every
+  sibling keeps its locator and its hash, so survivor identity is untouched;
+- a message whose own body is over the bound after that reduction is the
+  unit that skips; its neighbours are consumed;
+- the session's status becomes `partial_visible` with `visible_event_lost`,
+  never `Fatal`, because the header and the other messages were seen.
+
+Physical accounting does not move: one document is still one physical unit
+(§2 table), and frozen oracles keep their coverage counts.
+
 ---
 
 ## 3. Parse status — an orthogonal contract

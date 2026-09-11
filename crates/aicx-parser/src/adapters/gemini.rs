@@ -7,6 +7,12 @@
 //! Raw accounting stays honest: physical units reflect framing (1 for WholeDocument,
 //! 1-per-line for JsonLines); logical ordinals are post-physical with parent links.
 //!
+//! Logical units are bounded too. A whole-file session is one physical unit
+//! whatever its size, so the only place a 300 MB tool result can be refused
+//! without taking the conversation with it is here: an oversized nested block
+//! terminates as `skipped(oversized)` with its own evidence, and the message
+//! that carried it is consumed without it (see [`reduce_oversized_message`]).
+//!
 //! No shared dispatch touched. Subformat detection by shape only (no guessing paths).
 
 use super::{AdapterError, AgentAdapter, ClassifiedDisposition, ClassifiedUnit, RawUnitLevel};
@@ -15,17 +21,31 @@ use crate::engine::frames::{
 };
 use crate::engine::{
     AgentKind, BoundaryFlags, ConsumedUnit, CounterSemantics, CoverageReport, CoverageWarning,
-    Known, ParseStatus, Provenance, RawUnit, RawUnitRef, Segment, SessionModel, SkippedReason,
-    SkippedUnit, SourceFraming, SourceHandle, SourceRead, TokenComponents, ToolEvent,
-    ToolEventKind, Turn, TurnRange, UnitBoundary, UnvalidatedParse, UsageEvent,
-    VisibleCompleteness, WarningKind, evidence_event_id_from_hash, ordinal_locator, sha256_hex,
+    DEFAULT_MAX_UNIT_BYTES, Known, ParseStatus, Provenance, RawUnit, RawUnitRef, Segment,
+    SessionModel, Sha256Stream, SkippedReason, SkippedUnit, SourceFraming, SourceHandle,
+    SourceRead, TokenComponents, ToolEvent, ToolEventKind, Turn, TurnRange, UnitBoundary,
+    UnvalidatedParse, UsageEvent, VisibleCompleteness, WarningKind, evidence_event_id_from_hash,
+    ordinal_locator, sha256_hex,
 };
 use serde_json::Value;
+use std::borrow::Cow;
 
 pub const GEMINI_ADAPTER_VERSION: &str = "gemini-adapter-v2-throne";
 
 /// Provider for usage events.
 const USAGE_PROVIDER: &str = "google";
+
+/// Bound on one logical unit this adapter will consume, in canonical JSON
+/// bytes. The same number as the reader's per-line cap: a nested block is a
+/// unit like any other and gets the same bound. Gemini stores a whole
+/// conversation in one JSON document, so this is what decides how much of a
+/// session one oversized tool result takes down with it — exactly itself.
+const MAX_LOGICAL_UNIT_BYTES: u64 = DEFAULT_MAX_UNIT_BYTES as u64;
+
+/// Key of the marker left where an oversized nested block was refused. It
+/// keeps sibling indices — and so every survivor's locator — stable, and lets
+/// the reduced parent carry a reference to the evidence of what was dropped.
+const OVERSIZED_MARKER_KEY: &str = "aicx_oversized_block";
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct GeminiAdapter;
@@ -404,7 +424,24 @@ fn emit_message(
         _ => "message",
     };
 
-    let evidence = consume_logical(raw, msg, block_index, kind, ctx, logical, analysis)?;
+    // Bound the unit before consuming it. A message over the cap is not
+    // refused outright: on the tree that motivated this, a 298 MB message was
+    // 228 bytes of speech plus one tool result, and the speech is the point.
+    let measured = measure(msg);
+    let (msg, measured): (Cow<'_, Value>, Measured) = if measured.bytes > MAX_LOGICAL_UNIT_BYTES {
+        match reduce_oversized_message(raw, obj, block_index, kind, ctx, analysis, logical)? {
+            Some((reduced, measured)) => (Cow::Owned(reduced), measured),
+            None => return Ok(()),
+        }
+    } else {
+        (Cow::Borrowed(msg), measured)
+    };
+    let Some(obj) = msg.as_object() else {
+        return Ok(());
+    };
+
+    let evidence =
+        consume_logical_measured(raw, measured, block_index, kind, ctx, logical, analysis)?;
 
     let text = extract_text(obj);
     let timestamp = string_field(obj, "timestamp")
@@ -493,6 +530,10 @@ fn emit_message(
     // Tool calls inside message
     if let Some(tool_calls) = obj.get("toolCalls").and_then(Value::as_array) {
         for (ti, tc) in tool_calls.iter().enumerate() {
+            if is_oversized_marker(tc) {
+                // Already terminated as skipped(oversized) during reduction.
+                continue;
+            }
             emit_tool_call(
                 raw,
                 tc,
@@ -823,9 +864,23 @@ fn consume_logical(
     logical: &mut Vec<ClassifiedUnit>,
     analysis: &mut Analysis,
 ) -> Result<RawUnitRef, AdapterError> {
+    let measured = measure(block);
+    consume_logical_measured(raw, measured, block_index, kind, ctx, logical, analysis)
+}
+
+/// Consume a logical unit that has already been measured.
+fn consume_logical_measured(
+    raw: &RawUnit,
+    measured: Measured,
+    block_index: usize,
+    kind: &str,
+    ctx: &mut Ctx<'_>,
+    logical: &mut Vec<ClassifiedUnit>,
+    analysis: &mut Analysis,
+) -> Result<RawUnitRef, AdapterError> {
     let ordinal = ctx.next_logical_ordinal;
     ctx.next_logical_ordinal += 1;
-    let evidence = logical_evidence(raw, block, block_index, kind, ordinal, ctx)?;
+    let evidence = logical_evidence(raw, block_index, kind, ordinal, ctx, measured)?;
     logical.push(ClassifiedUnit {
         ordinal,
         level: RawUnitLevel::Logical {
@@ -842,6 +897,207 @@ fn consume_logical(
         evidence: evidence.clone(),
     });
     Ok(evidence)
+}
+
+/// Terminate a logical unit as `skipped(oversized)`: evidence over the block
+/// it would have been, the typed warning the validator requires, and the
+/// `visible_event_lost` flag, because something the operator could have seen
+/// is not in the model.
+fn skip_logical_oversized(
+    raw: &RawUnit,
+    measured: Measured,
+    block_index: usize,
+    unit_kind: &str,
+    ctx: &mut Ctx<'_>,
+    logical: &mut Vec<ClassifiedUnit>,
+    analysis: &mut Analysis,
+) -> Result<(), AdapterError> {
+    let ordinal = ctx.next_logical_ordinal;
+    ctx.next_logical_ordinal += 1;
+    let bytes = measured.bytes;
+    let evidence = logical_evidence(raw, block_index, unit_kind, ordinal, ctx, measured)?;
+    logical.push(ClassifiedUnit {
+        ordinal,
+        level: RawUnitLevel::Logical {
+            parent_ordinal: raw.coverage_ordinal,
+        },
+        evidence: evidence.clone(),
+        disposition: ClassifiedDisposition::Skipped {
+            reason: SkippedReason::Oversized,
+            visible: true,
+        },
+    });
+    analysis.skipped.push(SkippedUnit {
+        ordinal,
+        reason: SkippedReason::Oversized,
+        bytes,
+        visible: true,
+        evidence,
+    });
+    warn(analysis, WarningKind::OversizedUnit, ordinal);
+    analysis.visible_event_lost = true;
+    Ok(())
+}
+
+/// Rebuild an oversized message without the nested blocks that are themselves
+/// oversized, recording each of those as a skipped logical unit with its own
+/// evidence and leaving an index-stable marker in its place. Returns the
+/// reduced message with its canonical length and hash, or `None` — after
+/// recording the message itself as skipped — when nothing removable explains
+/// its size (a single enormous text body, say).
+///
+/// Only one child array is reduced, mirroring the precedence
+/// [`emit_message`] uses to emit tool calls (`toolCalls`, else `parts`, else
+/// `content.parts`), so a skipped child's locator is exactly the locator it
+/// would have consumed under.
+fn reduce_oversized_message(
+    raw: &RawUnit,
+    obj: &serde_json::Map<String, Value>,
+    block_index: usize,
+    kind: &str,
+    ctx: &mut Ctx<'_>,
+    analysis: &mut Analysis,
+    logical: &mut Vec<ClassifiedUnit>,
+) -> Result<Option<(Value, Measured)>, AdapterError> {
+    let mut reduced = serde_json::Map::with_capacity(obj.len());
+    let has_tool_calls = obj.get("toolCalls").is_some_and(Value::is_array);
+    let has_parts = obj.get("parts").is_some_and(Value::is_array);
+    for (key, value) in obj {
+        let value = match (key.as_str(), value) {
+            ("toolCalls", Value::Array(items)) => Value::Array(reduce_children(
+                raw,
+                items,
+                block_index,
+                |_| "tool_call",
+                ctx,
+                analysis,
+                logical,
+            )?),
+            ("parts", Value::Array(items)) if !has_tool_calls => Value::Array(reduce_children(
+                raw,
+                items,
+                block_index,
+                part_kind,
+                ctx,
+                analysis,
+                logical,
+            )?),
+            ("content", Value::Object(content))
+                if !has_tool_calls
+                    && !has_parts
+                    && content.get("parts").is_some_and(Value::is_array) =>
+            {
+                let mut content_reduced = serde_json::Map::with_capacity(content.len());
+                for (content_key, content_value) in content {
+                    let content_value = match (content_key.as_str(), content_value) {
+                        ("parts", Value::Array(items)) => Value::Array(reduce_children(
+                            raw,
+                            items,
+                            block_index,
+                            part_kind,
+                            ctx,
+                            analysis,
+                            logical,
+                        )?),
+                        _ => content_value.clone(),
+                    };
+                    content_reduced.insert(content_key.clone(), content_value);
+                }
+                Value::Object(content_reduced)
+            }
+            _ => value.clone(),
+        };
+        reduced.insert(key.clone(), value);
+    }
+    let reduced = Value::Object(reduced);
+    let measured = measure(&reduced);
+    if measured.bytes > MAX_LOGICAL_UNIT_BYTES {
+        skip_logical_oversized(raw, measured, block_index, kind, ctx, logical, analysis)?;
+        return Ok(None);
+    }
+    Ok(Some((reduced, measured)))
+}
+
+/// Copy `items`, replacing every child over the unit cap with a marker after
+/// terminating it as `skipped(oversized)`. Child locators follow the
+/// `block_index * 1000 + index + 1` scheme [`emit_tool_call`] consumes under.
+fn reduce_children(
+    raw: &RawUnit,
+    items: &[Value],
+    block_index: usize,
+    kind_of: fn(&Value) -> &'static str,
+    ctx: &mut Ctx<'_>,
+    analysis: &mut Analysis,
+    logical: &mut Vec<ClassifiedUnit>,
+) -> Result<Vec<Value>, AdapterError> {
+    let mut out = Vec::with_capacity(items.len());
+    for (index, item) in items.iter().enumerate() {
+        let measured = measure(item);
+        if measured.bytes > MAX_LOGICAL_UNIT_BYTES {
+            let marker = oversized_marker(measured.bytes, &measured.hash);
+            skip_logical_oversized(
+                raw,
+                measured,
+                block_index * 1000 + index + 1,
+                kind_of(item),
+                ctx,
+                logical,
+                analysis,
+            )?;
+            out.push(marker);
+        } else {
+            out.push(item.clone());
+        }
+    }
+    Ok(out)
+}
+
+fn part_kind(part: &Value) -> &'static str {
+    if part.get("functionCall").is_some() {
+        "tool_call"
+    } else {
+        "part"
+    }
+}
+
+fn oversized_marker(bytes: u64, sha256: &str) -> Value {
+    let mut evidence = serde_json::Map::with_capacity(2);
+    evidence.insert("bytes".to_owned(), Value::from(bytes));
+    evidence.insert("sha256".to_owned(), Value::from(sha256));
+    let mut marker = serde_json::Map::with_capacity(1);
+    marker.insert(OVERSIZED_MARKER_KEY.to_owned(), Value::Object(evidence));
+    Value::Object(marker)
+}
+
+fn is_oversized_marker(value: &Value) -> bool {
+    value
+        .as_object()
+        .is_some_and(|obj| obj.len() == 1 && obj.contains_key(OVERSIZED_MARKER_KEY))
+}
+
+/// Canonical length and SHA-256 of one logical block: the two facts its
+/// evidence needs and the one fact the unit bound is decided on.
+#[derive(Debug, Clone)]
+struct Measured {
+    bytes: u64,
+    hash: String,
+}
+
+/// Measure `canonical_json(value)` without materializing it. Byte-identical
+/// to hashing [`canonical_json`]'s output, including the empty-bytes fallback
+/// when serialization fails.
+fn measure(value: &Value) -> Measured {
+    let mut sink = Sha256Stream::new();
+    if serde_json::to_writer(&mut sink, value).is_err() {
+        return Measured {
+            bytes: 0,
+            hash: sha256_hex(&[]),
+        };
+    }
+    Measured {
+        bytes: sink.bytes_hashed(),
+        hash: sink.finalize_hex(),
+    }
 }
 
 fn physical_evidence(
@@ -872,15 +1128,17 @@ fn physical_evidence(
 
 fn logical_evidence(
     raw: &RawUnit,
-    block: &Value,
     block_index: usize,
     unit_kind: &str,
     ordinal: u64,
     ctx: &Ctx<'_>,
+    measured: Measured,
 ) -> Result<RawUnitRef, AdapterError> {
+    let Measured {
+        bytes: payload_len,
+        hash: content_hash,
+    } = measured;
     let locator = format!("{:06}:blk:{block_index}", raw.physical_ordinal);
-    let payload = canonical_json(block);
-    let content_hash = sha256_hex(&payload);
     let evidence_event_id = evidence_event_id_from_hash(
         ctx.agent,
         ctx.session_id,
@@ -897,7 +1155,7 @@ fn logical_evidence(
         unit_kind: unit_kind.to_owned(),
         artifact: raw.artifact_name.clone(),
         content_hash,
-        original_bytes: payload.len() as u64,
+        original_bytes: payload_len,
     })
 }
 

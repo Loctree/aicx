@@ -85,8 +85,8 @@ impl std::error::Error for AdapterError {}
 mod gemini;
 
 use aicx_parser::engine::{
-    RawUnitReader, ReaderPolicy, SourceArtifact, SourceFraming, TurnKind, TurnRole, ValidatedParse,
-    validate_parse,
+    DEFAULT_MAX_UNIT_BYTES, Known, RawUnitReader, ReaderPolicy, SourceArtifact, SourceFraming,
+    TurnKind, TurnRole, ValidatedParse, VisibleCompleteness, WarningKind, validate_parse,
 };
 use gemini::{GEMINI_ADAPTER_VERSION, GeminiAdapter};
 use std::fs;
@@ -210,6 +210,183 @@ fn gemini_human_shape_9048328b_preserves_assistant_count_and_projects_user() {
 
     // Shell tool events captured
     assert!(!model.tool_events.is_empty(), "shell tool events captured");
+}
+
+/// One whole-file session, shaped like the real `chats/session-*.json` that
+/// motivated the bound: a few hundred bytes of speech and one tool result far
+/// over the unit cap.
+fn whale_session(session_id: &str, huge_result: &str, extra_message: Option<&str>) -> String {
+    let mut messages = vec![
+        serde_json::json!({
+            "id": "m1",
+            "timestamp": "2026-03-09T19:37:44.370Z",
+            "type": "user",
+            "content": [{"text": "resume"}]
+        }),
+        serde_json::json!({
+            "id": "m2",
+            "timestamp": "2026-03-09T19:37:49.214Z",
+            "type": "gemini",
+            "content": "Reading the file now.",
+            "model": "gemini-2.5-pro",
+            "toolCalls": [
+                {"name": "run_shell_command", "args": {"command": "ls"}, "result": "ok"},
+                {"name": "read_file", "args": {"path": "big.bin"}, "result": huge_result}
+            ]
+        }),
+        serde_json::json!({
+            "id": "m3",
+            "timestamp": "2026-03-09T19:38:00.000Z",
+            "type": "gemini",
+            "content": "Done."
+        }),
+    ];
+    if let Some(text) = extra_message {
+        messages.push(serde_json::json!({
+            "id": "m4",
+            "timestamp": "2026-03-09T19:38:05.000Z",
+            "type": "user",
+            "content": text
+        }));
+    }
+    serde_json::json!({
+        "sessionId": session_id,
+        "projectHash": "6ecfd1eb2c47ae58fb4b79b7210b8721bbb8af48123b428beab936ab3d619489",
+        "startTime": "2026-03-09T19:37:43.121Z",
+        "lastUpdated": "2026-03-13T01:08:28.570Z",
+        "messages": messages
+    })
+    .to_string()
+}
+
+#[test]
+fn gemini_oversized_tool_result_loses_only_itself() {
+    let session_id = "44444444-4444-4444-8444-444444444444";
+    let huge = "x".repeat(DEFAULT_MAX_UNIT_BYTES + 4096);
+    let body = whale_session(session_id, &huge, None);
+    assert!(
+        body.len() > DEFAULT_MAX_UNIT_BYTES,
+        "the document itself must be over the line cap for this to prove anything"
+    );
+
+    let parse = parse_session(session_id, &body, SourceFraming::WholeDocument);
+    let ValidatedParse::Session(session) = parse else {
+        panic!("a session with one oversized tool result is still a session");
+    };
+    let model = session.model();
+
+    // Every word of speech survives, in order.
+    let texts: Vec<&str> = model
+        .turns
+        .iter()
+        .filter(|turn| matches!(turn.kind, TurnKind::UserMsg | TurnKind::AgentReply))
+        .map(|turn| turn.text.as_str())
+        .collect();
+    assert_eq!(texts, vec!["resume", "Reading the file now.", "Done."]);
+    assert_eq!(
+        model.provenance.model,
+        Known::value("gemini-2.5-pro".to_owned())
+    );
+
+    // The small tool call next to the whale survives; the whale does not.
+    let tool_names: Vec<&str> = model
+        .tool_events
+        .iter()
+        .map(|event| event.tool_name.as_str())
+        .collect();
+    assert_eq!(tool_names, vec!["run_shell_command"]);
+
+    // The loss is recorded exactly once, as the unit it was, at the locator
+    // it would have consumed under (message 1, second tool call).
+    let coverage = &model.coverage;
+    let oversized: Vec<_> = coverage
+        .skipped
+        .iter()
+        .filter(|unit| unit.reason == aicx_parser::engine::SkippedReason::Oversized)
+        .collect();
+    assert_eq!(oversized.len(), 1);
+    assert!(oversized[0].bytes > DEFAULT_MAX_UNIT_BYTES as u64);
+    assert_eq!(oversized[0].evidence.locator, "000001:blk:1002");
+    assert_eq!(oversized[0].evidence.unit_kind, "tool_call");
+    assert!(oversized[0].visible);
+    assert_eq!(
+        coverage
+            .warnings
+            .iter()
+            .filter(|warning| warning.kind == WarningKind::OversizedUnit)
+            .map(|warning| warning.count)
+            .sum::<u64>(),
+        1
+    );
+    assert_eq!(
+        coverage.status.visible_completeness,
+        VisibleCompleteness::PartialVisible
+    );
+    assert!(coverage.status.visible_event_lost);
+
+    // Every message that did not carry the whale hashes exactly as it would
+    // have without the bound: identity of the survivors is untouched.
+    let plain = whale_session(session_id, "tiny", None);
+    let ValidatedParse::Session(plain_session) =
+        parse_session(session_id, &plain, SourceFraming::WholeDocument)
+    else {
+        panic!("control session");
+    };
+    let hash_of = |session: &aicx_parser::engine::ValidatedSession, locator: &str| {
+        session
+            .model()
+            .coverage
+            .consumed
+            .iter()
+            .find(|unit| unit.evidence.locator == locator)
+            .map(|unit| unit.evidence.content_hash.clone())
+            .unwrap_or_else(|| panic!("consumed unit at {locator}"))
+    };
+    for locator in ["000001:blk:0", "000001:blk:2", "000001:blk:1001"] {
+        assert_eq!(
+            hash_of(&session, locator),
+            hash_of(&plain_session, locator),
+            "{locator} must not change identity because a sibling was oversized"
+        );
+    }
+}
+
+#[test]
+fn gemini_oversized_speech_skips_that_message_and_keeps_the_session() {
+    let session_id = "55555555-5555-4555-8555-555555555555";
+    let wall_of_text = "y".repeat(DEFAULT_MAX_UNIT_BYTES + 4096);
+    let body = whale_session(session_id, "tiny", Some(&wall_of_text));
+
+    let parse = parse_session(session_id, &body, SourceFraming::WholeDocument);
+    let ValidatedParse::Session(session) = parse else {
+        panic!("one oversized message must not sink the session");
+    };
+    let model = session.model();
+    let texts: Vec<&str> = model
+        .turns
+        .iter()
+        .filter(|turn| matches!(turn.kind, TurnKind::UserMsg | TurnKind::AgentReply))
+        .map(|turn| turn.text.as_str())
+        .collect();
+    assert_eq!(texts, vec!["resume", "Reading the file now.", "Done."]);
+
+    let oversized: Vec<_> = model
+        .coverage
+        .skipped
+        .iter()
+        .filter(|unit| unit.reason == aicx_parser::engine::SkippedReason::Oversized)
+        .collect();
+    assert_eq!(
+        oversized.len(),
+        1,
+        "nothing removable explains the size: the message is the unit"
+    );
+    assert_eq!(oversized[0].evidence.locator, "000001:blk:3");
+    assert_eq!(oversized[0].evidence.unit_kind, "user");
+    assert_eq!(
+        model.coverage.status.visible_completeness,
+        VisibleCompleteness::PartialVisible
+    );
 }
 
 #[test]
