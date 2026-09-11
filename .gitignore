@@ -6,7 +6,8 @@
 agents/state/
 
 # AI Context
-/.vibecrafted
+/.vibecrafted/*
+!/.vibecrafted/JOURNAL.md
 *.log
 /.ai-context*
 *.zip
