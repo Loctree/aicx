@@ -402,6 +402,63 @@ fn scan_matrix_covers_all_agent_header_shapes() {
 }
 
 #[test]
+fn kimi_wire_identity_lives_on_session_dir_scoped_by_lane() {
+    let root = TestRoot::new("kimi-wire-shape");
+    let session_rel = format!("wd_proj_deadbeef/session_{UUID_A}");
+    root.write(
+        format!("{session_rel}/agents/main/wire.jsonl"),
+        r#"{"type":"metadata","protocol_version":"1.5","created_at":1789296071162}
+{"type":"context.append_message","agentId":"main","message":{"role":"user","content":[{"type":"text","text":"hej"}]},"time":1789296071200}
+"#,
+    );
+    root.write(
+        format!("{session_rel}/agents/agent-0/wire.jsonl"),
+        r#"{"type":"metadata","protocol_version":"1.5","created_at":1789296071162}
+"#,
+    );
+    // Non-conversation material inside the session dir is never a candidate.
+    root.write(
+        format!("{session_rel}/state.json"),
+        r#"{"session":"state"}"#,
+    );
+    root.write(
+        format!("{session_rel}/logs/kimi-code.log"),
+        "2026-09-13 log line",
+    );
+
+    let catalog = SessionCatalog::new(AgentKind::Kimi, root.path()).unwrap();
+    let scanned = catalog.scan_with_stats().result.unwrap();
+    assert_eq!(scanned.len(), 2, "one source per agent lane wire");
+
+    // The bare session uuid resolves exactly to the operator (main) lane.
+    let resolved = catalog.resolve(UUID_A).unwrap();
+    assert_eq!(resolved.matched_by, MatchKind::ExactSourceId);
+    assert_eq!(resolved.source.source_id, UUID_A);
+    assert!(
+        resolved
+            .source
+            .path
+            .ends_with(format!("{session_rel}/agents/main/wire.jsonl")),
+        "expected main lane wire, got {}",
+        resolved.source.path.display()
+    );
+
+    // Subagent lanes keep their own append-only wire under a scoped id.
+    let scoped = format!("{UUID_A}:agent-0");
+    let resolved = catalog.resolve(&scoped).unwrap();
+    assert_eq!(resolved.matched_by, MatchKind::ExactSourceId);
+    assert_eq!(resolved.source.source_id, scoped);
+    assert!(
+        resolved
+            .source
+            .path
+            .ends_with(format!("{session_rel}/agents/agent-0/wire.jsonl")),
+        "expected subagent lane wire, got {}",
+        resolved.source.path.display()
+    );
+}
+
+#[test]
 fn hot_window_scan_probes_only_fresh_candidates() {
     let root = TestRoot::new("hot-window");
     root.write(
@@ -481,7 +538,7 @@ fn gemini_catalog_admits_only_conversations_under_chats() {
 
 #[test]
 fn agent_kind_exposes_session_roots_and_parser_kinds() {
-    assert_eq!(AgentKind::ALL.len(), 5);
+    assert_eq!(AgentKind::ALL.len(), 6);
     assert_eq!(AgentKind::parse("claude"), Some(AgentKind::Claude));
     assert_eq!(
         AgentKind::parse("gemini-antigravity"),
@@ -496,6 +553,10 @@ fn agent_kind_exposes_session_roots_and_parser_kinds() {
     assert_eq!(
         AgentKind::Grok.session_root(home),
         home.join(".grok").join("sessions")
+    );
+    assert_eq!(
+        AgentKind::Kimi.session_root(home),
+        home.join(".kimi-code").join("sessions")
     );
     assert_eq!(
         AgentKind::Claude.parser_kind(),

@@ -957,7 +957,7 @@ fn all_cli_defaults_to_incremental_and_full_rescan_recovers_backfill() {
         .expect("valid timestamp")
         .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     assert_eq!(
-        state["last_processed"]["claude+codex+gemini+junie+grok+codescribe:all"].as_str(),
+        state["last_processed"]["claude+codescribe+codex+gemini+grok+junie+kimi:all"].as_str(),
         Some(expected_watermark.as_str())
     );
 

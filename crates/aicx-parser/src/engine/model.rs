@@ -325,6 +325,14 @@ pub enum ProviderConversationRef {
         session_id: String,
         unobserved: Vec<String>,
     },
+    /// Kimi Code CLI `wire.jsonl`: one file per agent lane under
+    /// `session_<uuid>/agents/<agentId>/`; `session_id` names the session
+    /// directory (tree root), `agent_id` the lane (`main` or a subagent id).
+    Kimi {
+        session_id: String,
+        agent_id: Option<String>,
+        unobserved: Vec<String>,
+    },
 }
 
 impl ProviderConversationRef {
@@ -365,6 +373,11 @@ impl ProviderConversationRef {
                 session_id: store_id,
                 unobserved: Vec::new(),
             },
+            AgentKind::Kimi => Self::Kimi {
+                session_id: store_id,
+                agent_id: None,
+                unobserved: vec!["agent_id".to_owned()],
+            },
         }
     }
 
@@ -375,6 +388,7 @@ impl ProviderConversationRef {
             Self::Gemini { .. } => AgentKind::Gemini,
             Self::Grok { .. } => AgentKind::Grok,
             Self::Junie { .. } => AgentKind::Junie,
+            Self::Kimi { .. } => AgentKind::Kimi,
         }
     }
 
@@ -385,7 +399,8 @@ impl ProviderConversationRef {
             Self::Claude { session_id, .. }
             | Self::Gemini { session_id, .. }
             | Self::Grok { session_id, .. }
-            | Self::Junie { session_id, .. } => session_id,
+            | Self::Junie { session_id, .. }
+            | Self::Kimi { session_id, .. } => session_id,
             Self::Codex {
                 tree_session_id,
                 thread_id,
@@ -423,7 +438,8 @@ impl ProviderConversationRef {
             | Self::Codex { unobserved, .. }
             | Self::Gemini { unobserved, .. }
             | Self::Grok { unobserved, .. }
-            | Self::Junie { unobserved, .. } => unobserved,
+            | Self::Junie { unobserved, .. }
+            | Self::Kimi { unobserved, .. } => unobserved,
         }
     }
 }

@@ -114,6 +114,18 @@ const GENERIC_INJECT_TAGS: &[InjectTagRule] = &[InjectTagRule {
     kind: InjectRuleKind::TransportControl,
 }];
 
+// # kimi — the compaction summary is epoch context, never re-emitted speech.
+const KIMI_INJECT_TAGS: &[InjectTagRule] = &[
+    InjectTagRule {
+        tag: "system",
+        kind: InjectRuleKind::TransportControl,
+    },
+    InjectTagRule {
+        tag: "context.apply_compaction.summary",
+        kind: InjectRuleKind::CompactionReplay,
+    },
+];
+
 // # grok
 // Transport idioms for Grok chat_history.jsonl. `synthetic_reason` is a
 // harness inject tag, not human speech. No echo-bus / queue-seal on this
@@ -174,6 +186,14 @@ pub const AGENT_FRAME_RULES: &[AgentFrameRules] = &[
         klops_guard: &[],
         queue_seal: false,
         inject_tags: GENERIC_INJECT_TAGS,
+    },
+    // # kimi — no transport idioms
+    AgentFrameRules {
+        agent: AgentKind::Kimi,
+        echo_promotion: false,
+        klops_guard: &[],
+        queue_seal: false,
+        inject_tags: KIMI_INJECT_TAGS,
     },
 ];
 

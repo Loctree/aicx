@@ -17,7 +17,7 @@ pub struct AgentCase {
     pub mutation_needle: &'static str,
 }
 
-pub fn cases() -> [AgentCase; 5] {
+pub fn cases() -> [AgentCase; 6] {
     [
         AgentCase {
             agent: AgentKind::Codex,
@@ -57,6 +57,13 @@ pub fn cases() -> [AgentCase; 5] {
                 "../../../tests/fixtures/parser_engine/junie/session-20260713/events.jsonl"
             ),
             mutation_needle: "Build the Junie oracle.",
+        },
+        AgentCase {
+            agent: AgentKind::Kimi,
+            artifact: "wire.jsonl",
+            source_id: "adversarial-kimi",
+            base: include_bytes!("../../../tests/fixtures/parser_engine/kimi/minimal.jsonl"),
+            mutation_needle: "Zbuduj parser kimi.",
         },
     ]
 }
@@ -197,6 +204,9 @@ pub fn opaque_event(case: AgentCase) -> Vec<u8> {
         }
         AgentKind::Junie => {
             format!(r#"{{"kind":"FutureOpaqueEvent","ciphertext":"{SECRET_SENTINEL}"}}"#)
+        }
+        AgentKind::Kimi => {
+            format!(r#"{{"type":"future_opaque_event","ciphertext":"{SECRET_SENTINEL}"}}"#)
         }
     };
     bytes.extend_from_slice(line.as_bytes());

@@ -170,6 +170,7 @@ enum ExtractAgent {
     Gemini,
     Grok,
     Junie,
+    Kimi,
 }
 
 impl ExtractAgent {
@@ -180,6 +181,7 @@ impl ExtractAgent {
             Self::Gemini => "gemini",
             Self::Grok => "grok",
             Self::Junie => "junie",
+            Self::Kimi => "kimi",
         }
     }
 
@@ -190,6 +192,7 @@ impl ExtractAgent {
             Self::Gemini => aicx::session_catalog::AgentKind::Gemini,
             Self::Grok => aicx::session_catalog::AgentKind::Grok,
             Self::Junie => aicx::session_catalog::AgentKind::Junie,
+            Self::Kimi => aicx::session_catalog::AgentKind::Kimi,
         }
     }
 
@@ -200,6 +203,7 @@ impl ExtractAgent {
             Self::Gemini => aicx::parser::engine::AgentKind::Gemini,
             Self::Grok => aicx::parser::engine::AgentKind::Grok,
             Self::Junie => aicx::parser::engine::AgentKind::Junie,
+            Self::Kimi => aicx::parser::engine::AgentKind::Kimi,
         }
     }
 
@@ -214,6 +218,7 @@ impl ExtractAgent {
             // tree (config, relocations, assets).
             Self::Grok => home.join(".grok").join("sessions"),
             Self::Junie => home.join(".junie").join("sessions"),
+            Self::Kimi => home.join(".kimi-code").join("sessions"),
         }
     }
 
@@ -224,6 +229,7 @@ impl ExtractAgent {
             "gemini" | "gemini-antigravity" => Some(Self::Gemini),
             "grok" => Some(Self::Grok),
             "junie" => Some(Self::Junie),
+            "kimi" => Some(Self::Kimi),
             _ => None,
         }
     }
@@ -241,6 +247,8 @@ enum ExtractTarget {
     Grok(ExtractAgentArgs),
     /// JetBrains Junie event logs (~/.junie/sessions)
     Junie(ExtractAgentArgs),
+    /// Kimi Code CLI wire files (~/.kimi-code/sessions)
+    Kimi(ExtractAgentArgs),
     /// Every compatible source on this machine, in one incremental pass.
     All(ExtractAllArgs),
 }
@@ -253,6 +261,7 @@ impl ExtractTarget {
             Self::Gemini(args) => (ExtractAgent::Gemini, args),
             Self::Grok(args) => (ExtractAgent::Grok, args),
             Self::Junie(args) => (ExtractAgent::Junie, args),
+            Self::Kimi(args) => (ExtractAgent::Kimi, args),
             Self::All(_) => unreachable!("`extract all` is dispatched before split()"),
         }
     }
@@ -519,8 +528,8 @@ enum SessionsCommand {
         #[arg(short, long, value_delimiter = ',')]
         project: Vec<String>,
 
-        /// Filter by agent (claude | codex | gemini | junie | grok).
-        #[arg(long, value_parser = ["claude", "codex", "gemini", "junie", "grok"])]
+        /// Filter by agent (claude | codex | gemini | junie | grok | kimi).
+        #[arg(long, value_parser = ["claude", "codex", "gemini", "junie", "grok", "kimi"])]
         agent: Option<String>,
 
         /// Only sessions updated on/after this date (YYYY-MM-DD). Defaults to the
@@ -2717,7 +2726,15 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
             warn_incremental_legacy_flag(incremental);
             warn_pending_mutation("all");
             run_extraction(ExtractionParams {
-                agents: &["claude", "codex", "gemini", "junie", "grok", "codescribe"],
+                agents: &[
+                    "claude",
+                    "codex",
+                    "gemini",
+                    "junie",
+                    "grok",
+                    "kimi",
+                    "codescribe",
+                ],
                 project,
                 hours,
                 output_dir: output.as_deref(),
@@ -4257,6 +4274,7 @@ const CURRENT_SESSION_ENV_KEYS: &[(&str, Option<&str>)] = &[
     ("CLAUDE_CODE_SESSION_ID", Some("claude")),
     ("GEMINI_SESSION_ID", Some("gemini")),
     ("JUNIE_SESSION_ID", Some("junie")),
+    ("KIMI_SESSION_ID", Some("kimi")),
     ("GROK_SESSION_ID", Some("grok")),
     ("GROK_THREAD_ID", Some("grok")),
 ];
@@ -4452,6 +4470,15 @@ fn run_sessions_list(
         // against the recorded CurrentDirectoryUpdatedEvent cwd afterwards.
         discovered.extend(sessions::discover_junie_sessions(
             &home.join(".junie").join("sessions"),
+            modified_after,
+        ));
+    }
+    if want_agent.is_none_or(|a| a == "kimi") {
+        // Kimi encodes the workspace in the `wd_<slug>_<hex>` grandparent
+        // dir; the slug is lossy (dashes inside path components), so --cwd
+        // filtering stays on the post-discovery select_sessions pass.
+        discovered.extend(sessions::discover_kimi_sessions(
+            &home.join(".kimi-code").join("sessions"),
             modified_after,
         ));
     }
@@ -6588,6 +6615,7 @@ const fn bulk_agent_to_parser_agent(
         aicx::session_catalog::AgentKind::Gemini => aicx::parser::engine::AgentKind::Gemini,
         aicx::session_catalog::AgentKind::Grok => aicx::parser::engine::AgentKind::Grok,
         aicx::session_catalog::AgentKind::Junie => aicx::parser::engine::AgentKind::Junie,
+        aicx::session_catalog::AgentKind::Kimi => aicx::parser::engine::AgentKind::Kimi,
     }
 }
 
@@ -6598,6 +6626,7 @@ const fn bulk_agent_to_extract_agent(agent: aicx::session_catalog::AgentKind) ->
         aicx::session_catalog::AgentKind::Gemini => ExtractAgent::Gemini,
         aicx::session_catalog::AgentKind::Grok => ExtractAgent::Grok,
         aicx::session_catalog::AgentKind::Junie => ExtractAgent::Junie,
+        aicx::session_catalog::AgentKind::Kimi => ExtractAgent::Kimi,
     }
 }
 
@@ -6619,7 +6648,7 @@ fn resolve_bulk_agents(
             return Err(aicx::cli::failure::StructuredFailure::new(
                 "unknown_provider",
                 format!("`{token}` is not a supported provider"),
-                "pass one of: claude, codex, gemini, grok, junie",
+                "pass one of: claude, codex, gemini, grok, junie, kimi",
             ));
         };
         let agent = agent.catalog_kind();
@@ -7700,6 +7729,19 @@ const INCREMENTAL_LEGACY_NOTE: &str =
 const LEGACY_ALL_WATERMARK_AGENTS: &[&str] =
     &["claude", "codex", "gemini", "junie", "grok", "codescribe"];
 const LEGACY_ALL_WATERMARK_KEY: &str = "claude+codex+gemini+junie+grok+codescribe";
+/// The `all` composition since kimi joined the extractor fleet. Watermarks
+/// keyed by the older composition migrate forward through
+/// [`extraction_source_key_aliases`], so the first kimi-aware `all` run stays
+/// incremental instead of rescanning every source from scratch.
+const ALL_WATERMARK_AGENTS: &[&str] = &[
+    "claude",
+    "codex",
+    "gemini",
+    "junie",
+    "grok",
+    "kimi",
+    "codescribe",
+];
 
 fn normalized_source_key_parts<'a>(parts: impl IntoIterator<Item = &'a str>) -> Vec<String> {
     let mut normalized = parts
@@ -7738,9 +7780,20 @@ fn extraction_source_key(agents: &[&str], project: &[String]) -> String {
 fn extraction_source_key_aliases(agents: &[&str], project: &[String]) -> Vec<String> {
     let project_key = normalized_project_source_key(project);
     let mut aliases = Vec::new();
-    if normalized_source_key_parts(agents.iter().copied())
-        == normalized_source_key_parts(LEGACY_ALL_WATERMARK_AGENTS.iter().copied())
-    {
+    let requested = normalized_source_key_parts(agents.iter().copied());
+    if requested == normalized_source_key_parts(ALL_WATERMARK_AGENTS.iter().copied()) {
+        // The kimi-aware `all` inherits the newest watermark any older `all`
+        // composition recorded; without this the upgrade would force a full
+        // rescan of every provider it already processed.
+        aliases.push(format!("{LEGACY_ALL_WATERMARK_KEY}:{project_key}"));
+        aliases.push(format!(
+            "claude+codex+gemini+junie+codescribe:{project_key}"
+        ));
+        aliases.push(format!("claude+codex+gemini:{project_key}"));
+        aliases.push(format!("claude+codex+gemini+junie:{project_key}"));
+        return aliases;
+    }
+    if requested == normalized_source_key_parts(LEGACY_ALL_WATERMARK_AGENTS.iter().copied()) {
         aliases.push(format!(
             "claude+codex+gemini+junie+codescribe:{project_key}"
         ));
@@ -8132,6 +8185,9 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
             }
             "junie" => {
                 sources::extract_agent_sessions(aicx::session_catalog::AgentKind::Junie, &config)
+            }
+            "kimi" => {
+                sources::extract_agent_sessions(aicx::session_catalog::AgentKind::Kimi, &config)
             }
             "grok" => {
                 sources::extract_agent_sessions(aicx::session_catalog::AgentKind::Grok, &config)

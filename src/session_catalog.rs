@@ -33,15 +33,17 @@ pub enum AgentKind {
     Gemini,
     Junie,
     Grok,
+    Kimi,
 }
 
 impl AgentKind {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Claude,
         Self::Codex,
         Self::Gemini,
         Self::Junie,
         Self::Grok,
+        Self::Kimi,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -51,6 +53,7 @@ impl AgentKind {
             Self::Gemini => "gemini",
             Self::Junie => "junie",
             Self::Grok => "grok",
+            Self::Kimi => "kimi",
         }
     }
 
@@ -61,6 +64,7 @@ impl AgentKind {
             "gemini" | "gemini-antigravity" => Some(Self::Gemini),
             "junie" => Some(Self::Junie),
             "grok" => Some(Self::Grok),
+            "kimi" => Some(Self::Kimi),
             _ => None,
         }
     }
@@ -73,6 +77,7 @@ impl AgentKind {
             Self::Gemini => home.join(".gemini").join("tmp"),
             Self::Grok => home.join(".grok").join("sessions"),
             Self::Junie => home.join(".junie").join("sessions"),
+            Self::Kimi => home.join(".kimi-code").join("sessions"),
         }
     }
 
@@ -83,13 +88,16 @@ impl AgentKind {
             Self::Gemini => aicx_parser::engine::AgentKind::Gemini,
             Self::Grok => aicx_parser::engine::AgentKind::Grok,
             Self::Junie => aicx_parser::engine::AgentKind::Junie,
+            Self::Kimi => aicx_parser::engine::AgentKind::Kimi,
         }
     }
 
     fn accepts_extension(self, extension: Option<&str>) -> bool {
         match self {
             Self::Gemini => matches!(extension, Some("json" | "jsonl")),
-            Self::Claude | Self::Codex | Self::Junie | Self::Grok => extension == Some("jsonl"),
+            Self::Claude | Self::Codex | Self::Junie | Self::Grok | Self::Kimi => {
+                extension == Some("jsonl")
+            }
         }
     }
 
@@ -105,6 +113,11 @@ impl AgentKind {
     /// of 397 candidates and every one of them reached the adapter as an
     /// `unknown_payload_type` refusal. Discovery decides here, by shape of the
     /// path, so the adapter is never asked about them.
+    ///
+    /// Kimi session dirs hold one `wire.jsonl` per agent lane
+    /// (`session_<uuid>/agents/<agentId>/wire.jsonl`) plus non-conversation
+    /// material (`state.json`, `logs/`, `tasks/`, `file-history/`). Only the
+    /// per-lane wire file is a session source.
     fn is_primary_source_file(self, path: &Path) -> bool {
         match self {
             Self::Grok => {
@@ -115,6 +128,7 @@ impl AgentKind {
                 .skip(1)
                 .take(2)
                 .any(|dir| dir.file_name().and_then(|name| name.to_str()) == Some("chats")),
+            Self::Kimi => path.file_name().and_then(|name| name.to_str()) == Some("wire.jsonl"),
             Self::Claude | Self::Codex | Self::Junie => true,
         }
     }
@@ -507,6 +521,17 @@ impl SessionCatalog {
                     } else {
                         None
                     }
+                })
+                .or_else(|| {
+                    // Kimi layout: `…/wd_<slug>_<hex>/session_<uuid>/agents/<agentId>/wire.jsonl`.
+                    // The session uuid lives three directories up and every lane
+                    // shares it, so the main lane claims the bare uuid while
+                    // subagent lanes take the scoped `<uuid>:<agentId>` form —
+                    // an ExactSourceId query for the session uuid lands on the
+                    // operator conversation, never ambiguous across lanes.
+                    (self.agent == AgentKind::Kimi)
+                        .then(|| kimi_source_identity(&path))
+                        .flatten()
                 });
             if let Some(ref uuid) = filename_uuid {
                 filename_aliases.push(uuid.clone());
@@ -918,6 +943,33 @@ fn uuid_from_filename(stem: &str) -> Option<&str> {
             .get(boundary)
             .is_some_and(|byte| matches!(*byte, b'-' | b'_' | b'.')))
     .then_some(suffix)
+}
+
+/// Physical source identity for a Kimi `wire.jsonl`: the session uuid from
+/// the `session_<uuid>` grandparent directory, scoped by the agent lane from
+/// the parent directory. `agents/main` is the operator conversation and owns
+/// the bare uuid; every other lane keeps its own append-only wire and gets
+/// the `<uuid>:<agentId>` identity.
+fn kimi_source_identity(path: &Path) -> Option<String> {
+    // `…/wd_<slug>_<hex>/session_<uuid>/agents/<agentId>/wire.jsonl` — the
+    // session uuid lives three directories up, behind a mandatory `agents/`
+    // level that separates the operator lane (`main`) from subagent lanes.
+    let agent_dir = path.parent()?.file_name()?.to_str()?;
+    let agents_dir = path.parent()?.parent()?.file_name()?.to_str()?;
+    if agents_dir != "agents" {
+        return None;
+    }
+    let session_dir = path.parent()?.parent()?.parent()?.file_name()?.to_str()?;
+    let uuid = session_dir.strip_prefix("session_")?;
+    if !is_uuid(uuid) || validate_identity(agent_dir).is_none_or(|id| id != agent_dir) {
+        return None;
+    }
+    let uuid = uuid.to_ascii_lowercase();
+    if agent_dir == "main" {
+        Some(uuid)
+    } else {
+        Some(format!("{uuid}:{agent_dir}"))
+    }
 }
 
 fn is_uuid(value: &str) -> bool {

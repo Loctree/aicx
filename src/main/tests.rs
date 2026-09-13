@@ -683,7 +683,7 @@ fn sessions_list_agent_filter_rejects_typos_at_parse_time() {
         .expect_err("unknown agent must fail parsing");
     assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue);
 
-    for agent in ["claude", "codex", "gemini", "junie"] {
+    for agent in ["claude", "codex", "gemini", "junie", "grok", "kimi"] {
         Cli::try_parse_from(["aicx", "sessions", "list", "--agent", agent])
             .unwrap_or_else(|e| panic!("agent '{agent}' must parse: {e}"));
     }
@@ -2689,6 +2689,7 @@ fn extract_every_agent_subcommand_parses() {
         ("gemini", ExtractAgent::Gemini),
         ("grok", ExtractAgent::Grok),
         ("junie", ExtractAgent::Junie),
+        ("kimi", ExtractAgent::Kimi),
     ] {
         let cli = Cli::try_parse_from(["aicx", "extract", name, "--session", "abc12345"])
             .unwrap_or_else(|error| panic!("agent subcommand `{name}` must parse: {error}"));
@@ -2726,7 +2727,7 @@ fn extract_help_hides_removed_flag_grammar() {
         .find_subcommand_mut("extract")
         .expect("extract subcommand should exist");
     let rendered = extract.render_long_help().to_string();
-    for agent in ["codex", "claude", "gemini", "grok", "junie"] {
+    for agent in ["codex", "claude", "gemini", "grok", "junie", "kimi"] {
         assert!(
             rendered.contains(agent),
             "extract --help must list the `{agent}` subcommand"

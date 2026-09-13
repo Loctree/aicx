@@ -1166,6 +1166,205 @@ fn scan_junie_session_file(path: &Path, session_id: &str) -> Option<SessionInfo>
     })
 }
 
+const KIMI_WIRE_FILENAME: &str = "wire.jsonl";
+
+/// Discover Kimi Code CLI sessions under a sessions root
+/// (`~/.kimi-code/sessions`). Each lane of a session is
+/// `wd_<slug>_<hex>/session_<uuid>/agents/<agentId>/wire.jsonl`; the main
+/// lane owns the bare session uuid, subagent lanes report the scoped
+/// `<uuid>:<agentId>` — the same identities the session catalog and
+/// `aicx extract kimi ...` use. Absolute time comes from the per-record
+/// `time` epoch-millis stamps the wire carries. Tolerant: unreadable files
+/// are counted and skipped, never abort the scan.
+pub fn discover_kimi_sessions(
+    sessions_root: &Path,
+    modified_after: Option<SystemTime>,
+) -> Vec<SessionInfo> {
+    let mut out = Vec::new();
+    let mut skipped = 0usize;
+    let Ok(workspaces) = fs::read_dir(sessions_root) else {
+        return out;
+    };
+    for workspace in workspaces.flatten() {
+        let workspace_path = workspace.path();
+        if !workspace_path.is_dir() {
+            continue;
+        }
+        let project = workspace_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(kimi_project_from_workspace_dir);
+        let Ok(sessions) = fs::read_dir(&workspace_path) else {
+            continue;
+        };
+        for session in sessions.flatten() {
+            let session_path = session.path();
+            if !session_path.is_dir() {
+                continue;
+            }
+            let Some(uuid) = session_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|n| n.strip_prefix("session_"))
+                .filter(|id| !id.is_empty())
+            else {
+                continue;
+            };
+            let Ok(lanes) = fs::read_dir(session_path.join("agents")) else {
+                continue;
+            };
+            for lane in lanes.flatten() {
+                let lane_path = lane.path();
+                if !lane_path.is_dir() {
+                    continue;
+                }
+                let agent_id = lane_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or_default();
+                if agent_id.is_empty() {
+                    continue;
+                }
+                let wire = lane_path.join(KIMI_WIRE_FILENAME);
+                if !wire.is_file() || older_than(&wire, modified_after) {
+                    continue;
+                }
+                let session_id = if agent_id == "main" {
+                    uuid.to_ascii_lowercase()
+                } else {
+                    format!("{}:{agent_id}", uuid.to_ascii_lowercase())
+                };
+                match scan_kimi_session_file(&wire, &session_id, project.as_deref()) {
+                    Some(info) => out.push(info),
+                    None => skipped += 1,
+                }
+            }
+        }
+    }
+    if skipped > 0 {
+        eprintln!("aicx: sessions: skipped {skipped} unreadable file(s) (kimi)");
+    }
+    out
+}
+
+/// `wd_<slug>_<hex>` → `<slug>`: the workspace slug is the project label
+/// kimi itself chose; the trailing hex block is a content hash, not a name
+/// segment. The slug is lossy (dashes inside path components are literal),
+/// so it stays a label and never becomes a cwd claim.
+fn kimi_project_from_workspace_dir(name: &str) -> Option<String> {
+    let rest = name.strip_prefix("wd_")?;
+    let slug = rest
+        .rsplit_once('_')
+        .filter(|(_, hex)| !hex.is_empty() && hex.chars().all(|c| c.is_ascii_hexdigit()))
+        .map(|(slug, _)| slug)
+        .unwrap_or(rest);
+    (!slug.is_empty()).then(|| slug.to_string())
+}
+
+/// Parse a single Kimi `wire.jsonl` into a [`SessionInfo`].
+///
+/// Conversation envelopes (same contract the `kimi` parser adapter
+/// consumes): `context.append_message` carries the operator prompt
+/// (`message.role = "user"`); `context.append_loop_event` carries the agent
+/// surface, where `content.part` with `part.type = "text"` is the visible
+/// assistant reply. Everything else is bookkeeping and counts toward
+/// neither lane.
+fn scan_kimi_session_file(
+    path: &Path,
+    session_id: &str,
+    project: Option<&str>,
+) -> Option<SessionInfo> {
+    let file = fs::File::open(path).ok()?;
+    let reader = BufReader::new(file);
+    let mut started_at: Option<DateTime<Utc>> = None;
+    let mut updated_at: Option<DateTime<Utc>> = None;
+    let mut user_message_count = 0usize;
+    let mut agent_message_count = 0usize;
+    let mut title: Option<String> = None;
+    let mut saw_parsable_line = false;
+
+    for line in reader.lines() {
+        let Ok(line) = line else { break };
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            continue;
+        };
+        saw_parsable_line = true;
+        let stamp = value
+            .get("time")
+            .or_else(|| value.get("created_at"))
+            .and_then(|t| t.as_u64())
+            .and_then(|ms| DateTime::from_timestamp_millis(ms as i64));
+        if let Some(stamp) = stamp {
+            started_at.get_or_insert(stamp);
+            updated_at = Some(stamp);
+        }
+        match value.get("type").and_then(|t| t.as_str()) {
+            Some("context.append_message") => {
+                let Some(message) = value.get("message") else {
+                    continue;
+                };
+                if message.get("role").and_then(|r| r.as_str()) != Some("user") {
+                    continue;
+                }
+                user_message_count += 1;
+                if title.is_none() {
+                    title = message
+                        .get("content")
+                        .and_then(|c| c.as_array())
+                        .and_then(|parts| {
+                            parts.iter().find_map(|p| {
+                                p.get("text").and_then(|t| t.as_str()).map(short_title)
+                            })
+                        });
+                }
+            }
+            Some("context.append_loop_event") => {
+                let Some(event) = value.get("event") else {
+                    continue;
+                };
+                if event.get("type").and_then(|t| t.as_str()) == Some("content.part")
+                    && event
+                        .get("part")
+                        .and_then(|p| p.get("type"))
+                        .and_then(|t| t.as_str())
+                        == Some("text")
+                {
+                    agent_message_count += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let temporal_confidence = if started_at.is_some() {
+        TemporalConfidence::Full
+    } else if saw_parsable_line {
+        TemporalConfidence::Partial
+    } else {
+        TemporalConfidence::None
+    };
+
+    Some(SessionInfo {
+        session_id: session_id.to_string(),
+        agent: "kimi".to_string(),
+        project: project.map(str::to_string),
+        repo_path: None,
+        started_at,
+        updated_at,
+        message_count: user_message_count + agent_message_count,
+        user_message_count,
+        agent_message_count,
+        title,
+        source_path: path.to_path_buf(),
+        association: Association::Unknown,
+        temporal_confidence,
+    })
+}
+
 /// Discover every first-class session source under `home`.
 ///
 /// This is the shared discovery core for status surfaces that need to reason
@@ -1209,6 +1408,12 @@ pub fn discover_sessions_at(
     if agent.is_none_or(|a| a == "junie") {
         discovered.extend(discover_junie_sessions(
             &home.join(".junie").join("sessions"),
+            modified_after,
+        ));
+    }
+    if agent.is_none_or(|a| a == "kimi") {
+        discovered.extend(discover_kimi_sessions(
+            &home.join(".kimi-code").join("sessions"),
             modified_after,
         ));
     }
@@ -1432,6 +1637,32 @@ pub fn find_session_by_id(home: &Path, id: &str) -> Option<SessionInfo> {
         if candidates.len() > 1 {
             eprintln!(
                 "aicx: session: id '{id}' matches {} grok sessions; using the first (sorted)",
+                candidates.len()
+            );
+        }
+        if let Some(info) = candidates.into_iter().next() {
+            return Some(info);
+        }
+    }
+
+    // Kimi: the session uuid lives on the `session_<uuid>` dir three levels
+    // above `wire.jsonl` (`wire.jsonl` → `<agentId>` → `agents` →
+    // `session_<uuid>`); discovery maps each lane to its catalog identity
+    // (bare uuid for `main`, `<uuid>:<agentId>` for subagents).
+    let kimi_root = home.join(".kimi-code").join("sessions");
+    if kimi_root.is_dir() {
+        let mut candidates: Vec<SessionInfo> = discover_kimi_sessions(&kimi_root, None)
+            .into_iter()
+            .filter(|info| info.session_id.starts_with(id))
+            .collect();
+        candidates.sort_by(|a, b| {
+            a.session_id
+                .cmp(&b.session_id)
+                .then_with(|| a.source_path.cmp(&b.source_path))
+        });
+        if candidates.len() > 1 {
+            eprintln!(
+                "aicx: session: id '{id}' matches {} kimi sessions; using the first (sorted)",
                 candidates.len()
             );
         }

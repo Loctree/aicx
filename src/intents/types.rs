@@ -273,6 +273,7 @@ impl MixedScopeSession {
             "gemini" | "agy" => AgentKind::Gemini,
             "grok" => AgentKind::Grok,
             "junie" => AgentKind::Junie,
+            "kimi" => AgentKind::Kimi,
             _ => AgentKind::Claude,
         }
     }

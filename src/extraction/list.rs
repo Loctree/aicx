@@ -5,6 +5,7 @@ use crate::importers::codescribe::CODESCRIBE_AGENT;
 use crate::importers::{discover_codescribe_transcripts, discover_operator_markdown};
 
 const JUNIE_EVENTS_FILENAME: &str = "events.jsonl";
+const KIMI_WIRE_FILENAME: &str = "wire.jsonl";
 
 fn is_gemini_session_file(path: &Path) -> bool {
     path.extension()
@@ -268,6 +269,31 @@ pub fn list_available_sources() -> Result<Vec<SourceInfo>> {
                 &home,
                 "junie",
                 junie_sessions,
+                files.len(),
+                total_size,
+            ));
+        }
+    }
+
+    // Kimi sessions: ~/.kimi-code/sessions/wd_*/session_*/agents/*/wire.jsonl
+    let kimi_sessions = home.join(".kimi-code").join("sessions");
+    if kimi_sessions.exists() && kimi_sessions.is_dir() {
+        let files: Vec<PathBuf> = walk_jsonl_files(&kimi_sessions)
+            .into_iter()
+            .filter(|path| {
+                path.file_name().and_then(|name| name.to_str()) == Some(KIMI_WIRE_FILENAME)
+            })
+            .collect();
+        let total_size: u64 = files
+            .iter()
+            .filter_map(|file| fs::metadata(file).ok())
+            .map(|metadata| metadata.len())
+            .sum();
+        if !files.is_empty() {
+            sources.push(source_info(
+                &home,
+                "kimi",
+                kimi_sessions,
                 files.len(),
                 total_size,
             ));

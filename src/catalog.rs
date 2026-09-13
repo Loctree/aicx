@@ -627,6 +627,7 @@ fn live_delta_uncached(home: &Path, user_home: &Path, cutoff_unix_ns: u128) -> R
         AgentKind::Gemini,
         AgentKind::Grok,
         AgentKind::Junie,
+        AgentKind::Kimi,
     ];
     for agent in agents {
         let root = agent_source_root(agent, user_home);
@@ -810,6 +811,7 @@ fn scan_live_entries_with_progress(
         AgentKind::Gemini,
         AgentKind::Grok,
         AgentKind::Junie,
+        AgentKind::Kimi,
     ];
     for (agent_offset, agent) in agents.into_iter().enumerate() {
         progress.stage = RebuildStage::ScanningSources;
@@ -1090,6 +1092,7 @@ fn agent_source_root(agent: AgentKind, user_home: &Path) -> PathBuf {
         // (not the bare `~/.grok` tree, which also holds config noise).
         AgentKind::Grok => user_home.join(".grok").join("sessions"),
         AgentKind::Junie => user_home.join(".junie").join("sessions"),
+        AgentKind::Kimi => user_home.join(".kimi-code").join("sessions"),
     }
 }
 

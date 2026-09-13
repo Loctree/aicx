@@ -1,0 +1,11 @@
+{"type":"metadata","protocol_version":"1.5","created_at":1789296071162}
+{"type":"profile.bind","agentId":"main","modelAlias":"kimi-code/k3-256k","profileName":"coder","time":1789296071163}
+{"type":"context.append_message","agentId":"main","message":{"role":"user","content":[{"type":"text","text":"Zbuduj parser kimi."}]},"time":1789296071200}
+{"type":"context.append_loop_event","agentId":"main","event":{"type":"step.begin","uuid":"a5c6e3fb-5359-4f21-a294-6cf993d40029","turnId":"0","step":1},"time":1789296071210}
+{"type":"context.append_loop_event","agentId":"main","event":{"type":"content.part","uuid":"8b7fbdf0-3eed-4726-965b-5613d3f1514b","turnId":"0","step":1,"stepUuid":"a5c6e3fb-5359-4f21-a294-6cf993d40029","part":{"type":"think","think":"Najpierw fixture, potem adapter."}},"time":1789296071220}
+{"type":"context.append_loop_event","agentId":"main","event":{"type":"content.part","uuid":"aabb44b9-3247-40d4-b9a8-dfe80062b217","turnId":"0","step":1,"stepUuid":"a5c6e3fb-5359-4f21-a294-6cf993d40029","part":{"type":"text","text":"Parser gotowy."}},"time":1789296071230}
+{"type":"context.append_loop_event","agentId":"main","event":{"type":"tool.call","uuid":"56e1bfbb-d782-4311-a23c-146c676ecf31","turnId":"0","step":1,"stepUuid":"a5c6e3fb-5359-4f21-a294-6cf993d40029","toolCallId":"tool_U4miU8WzxLjAZVfgVHK29mw2","name":"Bash","args":{"command":"cargo test -p aicx-parser"}},"time":1789296071240}
+{"type":"context.append_loop_event","agentId":"main","event":{"type":"tool.result","parentUuid":"56e1bfbb-d782-4311-a23c-146c676ecf31","toolCallId":"tool_U4miU8WzxLjAZVfgVHK29mw2","result":{"output":"test result: ok. 3 passed"}},"time":1789296071250}
+{"type":"context.append_loop_event","agentId":"main","event":{"type":"step.end","uuid":"a5c6e3fb-5359-4f21-a294-6cf993d40029","turnId":"0","step":1,"finishReason":"stop"},"time":1789296071260}
+{"type":"usage.record","agentId":"main","model":"kimi-code/k3-256k","usage":{"inputOther":12893,"output":353,"inputCacheRead":15360,"inputCacheCreation":0},"usageScope":"turn","time":1789296071270}
+{"type":"context.apply_compaction","agentId":"main","summary":"Handoff: fixture zbudowany, adapter zielony.","time":1789296071280}
