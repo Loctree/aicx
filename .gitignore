@@ -1,13 +1,13 @@
 /target
-/.loctree
+.loctree/
 .DS_Store
 
 # agents
 agents/state/
 
 # AI Context
-/.vibecrafted/*
-!/.vibecrafted/JOURNAL.md
+/.vibecrafted/
+
 *.log
 /.ai-context*
 *.zip
@@ -27,7 +27,7 @@ CLAUDE.md
 /.junie/
 /*.txt
 /*.py
-/tools/__pycache__
-/reports/agent-runs
-/.home-storage-smoke.m9djdz
+__pycache__/
 /reports
+
+
