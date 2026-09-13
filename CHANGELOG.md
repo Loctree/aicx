@@ -5,6 +5,8 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
+## [0.13.1] - 2026-09-13
+
 ### A Gemini session is no longer lost because one tool result was large
 
 Gemini stores a whole conversation as one JSON document, and the reader
