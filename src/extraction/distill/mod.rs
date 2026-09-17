@@ -284,6 +284,7 @@ impl LaneRegistry {
         let mut registry = Self::new();
         // W1 append zone — one `registry.register(Box::new(...))` per lane.
         registry.register(Box::new(claude_lane::ClaudeLane));
+        registry.register(Box::new(codex_lane::CodexLane));
         registry
     }
 }
@@ -297,6 +298,7 @@ impl Default for LaneRegistry {
 // W1 append zone — one `pub mod <agent>_lane;` per worker, added below this
 // line without touching the shared contract above.
 pub mod claude_lane;
+pub mod codex_lane;
 
 #[cfg(test)]
 mod tests {

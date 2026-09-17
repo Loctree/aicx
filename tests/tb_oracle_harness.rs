@@ -292,6 +292,143 @@ fn aicx_model_agrees_with_tb_claude_package() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// W1-02 — codex lane: aicx-side of the differential oracle.
+//
+// TB package generated with `tbflow tests/fixtures/tb_oracle/codex/
+// rollout-2026-08-04-019fc9dd.jsonl` (TB 0.6.0) from the redacted real
+// rollout fixture. This is the first test that feeds the *aicx-parsed* side
+// into `diff_common_fields` (W0 proved the loader on TB-internal consistency).
+// ---------------------------------------------------------------------------
+
+fn codex_fixture_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tb_oracle/codex")
+}
+
+/// Common fields as the aicx parser derives them from the raw rollout.
+///
+/// Two fields are deliberately normalized to empty on BOTH sides before
+/// diffing, because only one tool claims them for this package:
+/// * `map_id` — a TB-minted artifact id (agent + date + TB fingerprint);
+///   aicx does not mint TB map ids and porting the fingerprint would make TB
+///   a runtime dependency, which the contract forbids.
+/// * `branch` — the TB codex package disagrees with itself here (human.md
+///   frontmatter carries a branch, index_payload records carry `null`), so
+///   there is no single TB-side truth to diff against.
+fn codex_common_fields_from_aicx() -> CommonFields {
+    use aicx_parser::engine::{
+        AgentKind, Known, ParserEngine, SourceArtifact, SourceFraming, SourceHandle, ValidatedParse,
+    };
+    // Memory artifact (like the claude test above): `validated_file` enforces
+    // the runtime allowed-roots policy, which rejects checkouts outside the
+    // session-store roots (e.g. /Volumes/...) and would make this test
+    // depend on where the repo is cloned.
+    let fixture = codex_fixture_dir().join("rollout-2026-08-04-019fc9dd.jsonl");
+    let body = std::fs::read(&fixture)
+        .unwrap_or_else(|error| panic!("cannot read fixture {}: {error}", fixture.display()));
+    let artifact = SourceArtifact::memory(
+        "rollout-2026-08-04-019fc9dd.jsonl",
+        body,
+        SourceFraming::JsonLines,
+    )
+    .expect("codex fixture readable");
+    let handle = SourceHandle::new(
+        AgentKind::Codex,
+        "019fc9dd-codex-fixture",
+        None,
+        vec![artifact],
+    )
+    .expect("valid source handle");
+    let parse = ParserEngine::default()
+        .parse_registered(&handle)
+        .expect("codex fixture parses");
+    let ValidatedParse::Session(session) = parse else {
+        panic!("codex fixture must parse to a session");
+    };
+    let model = session.into_model();
+    let cwd = match &model.provenance.cwd {
+        Known::Value(value) => value.clone(),
+        Known::Unknown(_) => String::new(),
+    };
+    CommonFields {
+        agent: "codex".to_owned(),
+        map_id: String::new(),
+        cwd,
+        branch: String::new(),
+        source_sha256: normalize_sha(&model.provenance.original_source_hash),
+        segments: model.segments.len() as u64,
+    }
+}
+
+fn load_codex_fixture(name: &str) -> String {
+    let path = codex_fixture_dir().join(name);
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("cannot read fixture {}: {error}", path.display()))
+}
+
+/// aicx vs TB on the codex fixture: identity fields (agent, cwd, source
+/// sha256) must agree exactly. `segments` is a KNOWN, pinned divergence:
+/// the aicx codex adapter opens a segment boundary at the first
+/// `turn_context` cwd/branch materialization, so the pre-context prologue
+/// turns form segment 0 (aicx = 2); TB counts the conversation as one
+/// segment (TB = 1). The assertion pins both values so any drift on either
+/// side turns this red — resolution of the divergence itself belongs to the
+/// integrator (W1-02 report, field marked [?]).
+#[test]
+fn codex_package_common_fields_agree_with_aicx() {
+    let mut tb = common_fields_from_human(&load_codex_fixture("019fc9dd_human.md"));
+    tb.map_id = String::new();
+    tb.branch = String::new();
+    let aicx = codex_common_fields_from_aicx();
+    let diffs = diff_common_fields(&aicx, &tb);
+    let fields: Vec<&str> = diffs.iter().map(|diff| diff.field).collect();
+    assert_eq!(
+        fields,
+        ["segments"],
+        "identity fields drifted between aicx and TB:\n{}",
+        diffs
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    assert_eq!(
+        (aicx.segments, tb.segments),
+        (2, 1),
+        "pinned segments divergence moved — re-judge the boundary semantics"
+    );
+}
+
+/// The TB codex package's index payload names the same session the human.md
+/// does (agent + map_id + cwd + sha); `branch`/`segments` are excluded — the
+/// codex package carries `branch: null` records and no per-record segment
+/// row contract beyond `segment_id` distinctness, which
+/// `codex_package_common_fields_agree_with_aicx` already pins.
+#[test]
+fn codex_package_index_payload_names_same_session() {
+    let human = common_fields_from_human(&load_codex_fixture("019fc9dd_human.md"));
+    let text = load_codex_fixture("019fc9dd_index-payload.jsonl");
+    let mut segments = BTreeSet::new();
+    let mut first: Option<serde_json::Value> = None;
+    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        let record: serde_json::Value =
+            serde_json::from_str(line).expect("index_payload line parses as JSON");
+        segments.insert(payload_str(&record, "segment_id"));
+        first.get_or_insert(record);
+    }
+    let first = first.expect("index_payload carries at least one record");
+    assert_eq!(payload_str(&first, "agent"), human.agent);
+    assert_eq!(payload_str(&first, "map_id"), human.map_id);
+    assert_eq!(payload_str(&first, "cwd"), human.cwd);
+    let sha = first
+        .get("source")
+        .and_then(|source| source.get("raw_sha256"))
+        .and_then(serde_json::Value::as_str)
+        .expect("index_payload record carries source.raw_sha256");
+    assert_eq!(normalize_sha(sha), human.source_sha256);
+    assert_eq!(segments.len() as u64, human.segments);
+}
+
 /// Smoke: the written contract exists and carries the sections the W1 wave
 /// builds on (TB→aicx mapping table + append-only rule).
 #[test]
