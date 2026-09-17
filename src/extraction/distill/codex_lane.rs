@@ -649,9 +649,14 @@ mod tests {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let fixture = root.join("tests/fixtures/tb_oracle/codex/rollout-2026-08-04-019fc9dd.jsonl");
         let golden_path = root.join("tests/fixtures/tb_oracle/codex/019fc9dd_golden.json");
-        let artifact = SourceArtifact::validated_file(
-            "rollout-2026-08-04-019fc9dd.jsonl".to_owned(),
-            &fixture,
+        // Memory artifact: `validated_file` enforces the runtime allowed-roots
+        // policy and rejects checkouts outside the session-store roots
+        // (e.g. /Volumes/...), which would tie this test to the clone path.
+        let body = std::fs::read(&fixture)
+            .unwrap_or_else(|error| panic!("cannot read fixture {}: {error}", fixture.display()));
+        let artifact = SourceArtifact::memory(
+            "rollout-2026-08-04-019fc9dd.jsonl",
+            body,
             SourceFraming::JsonLines,
         )
         .expect("fixture readable");
