@@ -3119,6 +3119,7 @@ fn direct_file_boundary_rejects_directory_without_output() {
             redact_secrets: false,
             conversation: false,
             projection: ProjectionSpec::default(),
+            brief: false,
             cutoff: Utc::now(),
         },
     )

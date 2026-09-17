@@ -420,6 +420,14 @@ struct ExtractAgentArgs {
     #[arg(long)]
     dialog: bool,
 
+    /// Distilled handoff brief (inverted pyramid, one section per segment):
+    /// outcome first, then decision candidates, gates, open questions and
+    /// handoff signals, each with an evidence locator into the substrate.
+    /// Rendered from the agent's distiller lane (`GenericLane` fail-open);
+    /// mixed sessions get a multi-workstream header, never averaged outcomes.
+    #[arg(long, conflicts_with_all = ["conversation", "dialog", "user_only", "agent_only", "user_commands", "agent_commands"])]
+    brief: bool,
+
     /// Walk parent sessions through `session_meta.forked_from_id` (session
     /// catalog lookup, never filename guessing). Bare `--lineage` = unbounded;
     /// `--lineage=N` = at most N parents. Needs --session (catalog).
@@ -2804,6 +2812,7 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
                         dialog: false,
                         lineage: None,
                         result: "none".to_string(),
+                        brief: false,
                     };
                     run_extract_target(extract_agent, args)?;
                     return Ok(());
@@ -5740,6 +5749,9 @@ struct ExtractFileOptions {
     /// `include_assistant` / `max_message_chars` above are the legacy axes
     /// the same flags also feed; the spec is what the render paths consult.
     projection: ProjectionSpec,
+    /// `--brief`: distilled handoff rendering instead of the timeline
+    /// projection (W2-01; brief and card read the same distillate).
+    brief: bool,
     /// `now` captured once when the command started. Every session, and every
     /// `--lineage` parent, is windowed against this same instant — re-reading
     /// the clock per parse would give a long run a drifting `-H` boundary.
@@ -6301,6 +6313,7 @@ fn run_extract_target(agent: ExtractAgent, args: ExtractAgentArgs) -> Result<()>
         redact_secrets: args.redaction.redact_secrets,
         conversation: args.conversation,
         projection,
+        brief: args.brief,
         cutoff,
     };
     match (args.session, args.file) {
@@ -6394,6 +6407,7 @@ fn run_extract_all(args: ExtractAllArgs) -> Result<()> {
         redact_secrets: args.redaction.redact_secrets,
         conversation: args.conversation,
         projection: projection.clone(),
+        brief: false,
         cutoff,
     };
 
@@ -7365,6 +7379,20 @@ fn run_extract_session(
     // agents stay single-artifact.
     debug_assert!(!handle.artifacts().is_empty());
 
+    if options.brief {
+        let output = match output {
+            Some(path) => path,
+            None => {
+                let stem = format!(
+                    "{}_brief",
+                    safe_session_extract_stem(&resolved.source.source_id)
+                );
+                default_session_extract_path_for_stem(agent.label(), &stem)?
+            }
+        };
+        return run_extract_brief(&handle, &output);
+    }
+
     let mut entries = parse_selected_source_once(&handle, &options.projection, options.cutoff)?;
     if entries.is_empty() {
         anyhow::bail!(
@@ -7489,6 +7517,32 @@ fn run_extract_session(
 
 /// Run `aicx extract <agent> --file <path> -o <out>`: direct handle from the
 /// supplied path, no catalog scan, no global AICX state, single parse pass.
+/// `extract … --brief`: parse once to the [`SessionModel`], distill through
+/// the agent's registered lane (`GenericLane` fail-open for lanes that have
+/// not landed), and write the inverted-pyramid brief. The distillate values
+/// are the same ones the card/index materialization consumes — one
+/// implementation, two consumers (`docs/DISTILL_CONTRACT.md`).
+fn run_extract_brief(handle: &aicx::parser::engine::SourceHandle, output: &Path) -> Result<()> {
+    let session = aicx::parser_dispatch::parse_handle(handle)?;
+    let model = session.into_model();
+    let registry = aicx::extraction::distill::LaneRegistry::with_default_lanes();
+    let lane = registry.lane_for(model.provenance.agent);
+    let distillates = lane.distill(&model);
+    let brief = aicx::extraction::brief::render_brief(&model, &distillates);
+    if let Some(parent) = output.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(output, &brief)
+        .with_context(|| format!("cannot write brief to {}", output.display()))?;
+    println!(
+        "Wrote brief: {} ({} segment(s), lane `{}`)",
+        output.display(),
+        distillates.len(),
+        lane.lane_name()
+    );
+    Ok(())
+}
+
 fn run_extract_direct_file(
     agent: ExtractAgent,
     input: PathBuf,
@@ -7526,6 +7580,9 @@ fn run_extract_direct_file(
         eprintln!(
             "extract: lineage: --file has no session catalog; the forked_from_id walk needs --session"
         );
+    }
+    if options.brief {
+        return run_extract_brief(&handle, &output_path);
     }
     let parsed = parse_selected_source_with_basis(&handle, &options.projection, options.cutoff)
         .map_err(anyhow::Error::from)?;
