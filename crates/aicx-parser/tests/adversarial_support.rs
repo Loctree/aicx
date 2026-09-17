@@ -208,6 +208,9 @@ pub fn opaque_event(case: AgentCase) -> Vec<u8> {
         AgentKind::Kimi => {
             format!(r#"{{"type":"future_opaque_event","ciphertext":"{SECRET_SENTINEL}"}}"#)
         }
+        AgentKind::Cursor => {
+            format!(r#"{{"type":"future_opaque_event","ciphertext":"{SECRET_SENTINEL}"}}"#)
+        }
     };
     bytes.extend_from_slice(line.as_bytes());
     bytes.push(b'\n');
