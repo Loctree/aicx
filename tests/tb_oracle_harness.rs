@@ -188,6 +188,110 @@ fn perturbed_field_reports_red_diff() {
     assert_eq!(fields, ["branch", "segments"], "diffs: {diffs:?}");
 }
 
+// ---------------------------------------------------------------------------
+// W1-01 — claude lane fixture package (tests/fixtures/tb_oracle/claude/)
+// ---------------------------------------------------------------------------
+
+fn claude_fixture_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tb_oracle/claude")
+}
+
+fn load_claude_fixture(name: &str) -> String {
+    let path = claude_fixture_dir().join(name);
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("cannot read fixture {}: {error}", path.display()))
+}
+
+/// Parse the claude fixture session through the public kernel surface.
+fn parse_claude_fixture_model() -> aicx_parser::engine::SessionModel {
+    use aicx_parser::adapters::registered_adapter;
+    use aicx_parser::engine::{
+        AgentKind, RawUnitReader, ReaderPolicy, SourceArtifact, SourceFraming, SourceHandle,
+        ValidatedParse, validate_parse,
+    };
+    let path = claude_fixture_dir().join("6abdbe22_session.jsonl");
+    let body = std::fs::read(&path)
+        .unwrap_or_else(|error| panic!("cannot read fixture {}: {error}", path.display()));
+    let artifact = SourceArtifact::memory("session.jsonl", body, SourceFraming::JsonLines)
+        .expect("memory artifact");
+    let session_id = "6abdbe22-43e0-4544-a5ef-7314ece85078";
+    let source = SourceHandle::new(
+        AgentKind::Claude,
+        session_id,
+        Some(session_id.to_owned()),
+        vec![artifact],
+    )
+    .expect("source handle");
+    let read = RawUnitReader::new(ReaderPolicy::default())
+        .read(&source)
+        .expect("bounded read");
+    let adapter = registered_adapter(AgentKind::Claude);
+    let classified = adapter.classify(&source, &read).expect("classification");
+    let parse = adapter
+        .assemble(&source, &read, classified)
+        .expect("assembly");
+    match validate_parse(parse).expect("kernel validation") {
+        ValidatedParse::Session(session) => session.into_model(),
+        ValidatedParse::Fatal(fatal) => {
+            panic!("unexpected fatal parse: {:?}", fatal.coverage().status)
+        }
+    }
+}
+
+/// The TB package generated from the claude lane fixture agrees with itself —
+/// same green direction as `tb_package_common_fields_agree`, on the W1-01
+/// package.
+#[test]
+fn tb_claude_package_common_fields_agree() {
+    let human = common_fields_from_human(&load_claude_fixture("6abdbe22_human.md"));
+    let payload =
+        common_fields_from_index_payload(&load_claude_fixture("6abdbe22_index-payload.jsonl"));
+    let diffs = diff_common_fields(&human, &payload);
+    assert!(
+        diffs.is_empty(),
+        "claude TB package disagrees with itself on common fields:\n{}",
+        diffs
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
+
+/// Differential direction for the claude lane: the aicx-parsed model agrees
+/// with the frozen `tbflow claude` package on every common field both tools
+/// claim to know about the same fixture bytes. `map_id` is TB vocabulary with
+/// no aicx counterpart, so the TB value is carried through as the neutral
+/// element rather than invented on the aicx side.
+#[test]
+fn aicx_model_agrees_with_tb_claude_package() {
+    use aicx_parser::engine::Known;
+    let tb = common_fields_from_index_payload(&load_claude_fixture("6abdbe22_index-payload.jsonl"));
+    let model = parse_claude_fixture_model();
+    let known = |value: &Known<String>, field: &str| match value {
+        Known::Value(value) => value.clone(),
+        Known::Unknown(_) => panic!("aicx model has no {field} for the claude fixture"),
+    };
+    let aicx = CommonFields {
+        agent: model.provenance.agent.as_str().to_owned(),
+        map_id: tb.map_id.clone(),
+        cwd: known(&model.provenance.cwd, "cwd"),
+        branch: known(&model.provenance.branch, "branch"),
+        source_sha256: normalize_sha(&model.provenance.original_source_hash),
+        segments: model.segments.len() as u64,
+    };
+    let diffs = diff_common_fields(&aicx, &tb);
+    assert!(
+        diffs.is_empty(),
+        "aicx model disagrees with TB claude package:\n{}",
+        diffs
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
+
 /// Smoke: the written contract exists and carries the sections the W1 wave
 /// builds on (TB→aicx mapping table + append-only rule).
 #[test]

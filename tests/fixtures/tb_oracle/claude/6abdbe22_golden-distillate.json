@@ -1,0 +1,81 @@
+[
+  {
+    "schema": "aicx.distill.segment_distillate.v1",
+    "agent": "claude",
+    "segment_id": 0,
+    "scope_status": "no_drift_observed",
+    "decision_candidates": [
+      {
+        "text": "Ruszam z cutem W0-01: kontrakt destylatu + harness wyroczni TB. Najpierw orientacja (vc-init pass): plan-root, struktura `src/extraction`, kontrakty w docs, potem implementacja.",
+        "kind": "plan_commitment",
+        "evidence": {
+          "segment_id": 0,
+          "turn_idx": 1,
+          "timestamp": "2026-09-17T20:32:37.409Z"
+        }
+      }
+    ],
+    "gates": [
+      {
+        "command": "echo \"today: $(date +%F)\" && cargo fmt --check 2>&1 | head -20",
+        "outcome": "unknown",
+        "evidence": {
+          "segment_id": 0,
+          "turn_idx": 79,
+          "timestamp": "2026-09-17T20:38:20.727Z"
+        }
+      },
+      {
+        "command": "cargo clippy -p aicx --all-targets -- -D warnings 2>&1 | tail -25",
+        "outcome": "pass",
+        "evidence": {
+          "segment_id": 0,
+          "turn_idx": 81,
+          "timestamp": "2026-09-17T20:38:25.249Z"
+        }
+      },
+      {
+        "command": "cargo test -p aicx --test tb_oracle_harness 2>&1 | tail -12 && cargo test -p aicx distill 2>&1 | tail -8",
+        "outcome": "pass",
+        "evidence": {
+          "segment_id": 0,
+          "turn_idx": 83,
+          "timestamp": "2026-09-17T20:38:43.069Z"
+        }
+      },
+      {
+        "command": "cargo test -p aicx --lib distill 2>&1 | tail -8",
+        "outcome": "pass",
+        "evidence": {
+          "segment_id": 0,
+          "turn_idx": 86,
+          "timestamp": "2026-09-17T20:39:40.607Z"
+        }
+      },
+      {
+        "command": "cargo doc -p aicx --no-deps 2>&1 | grep -iE 'distill|SessionModel|warnings' | head; cargo fmt --check && echo FMT_OK",
+        "outcome": "pass",
+        "evidence": {
+          "segment_id": 0,
+          "turn_idx": 93,
+          "timestamp": "2026-09-17T20:40:11.330Z"
+        }
+      }
+    ],
+    "open_questions": [],
+    "handoff_signals": [
+      {
+        "text": "Cut W0-01 dowieziony i zacommitowany na baseline. **Commit: 8ea2c26** (`[claude/vc-implement] feat(distill): shared lane contract + TB oracle harness [W0-01]` na `feat/index-single-command`, bez pusha — publikacja jest własnością operatora).\n\n**Co wylądowało:**\n- `src/extraction/distill/mod.rs` — zamrożony kontrakt: trait `AgentLaneDistiller` (`&SessionModel` + `&Segment` → `SegmentDistillate`, brief per segment zgodnie z decyzją 4 Design Contract) + typy `DecisionCandidate`, `GateObservation`, `OpenQuestion`, `HandoffSignal`, `LaneOutcome` z `EvidenceLocator` przy każdym roszczeniu. `LaneRegi\n[...trimmed for fixture: middle elided...]\nession_id` w rekordach — osią tożsamości jest `map_id`. Harness świadomie diffuje po `map_id`, żeby nie powtórzyć buga TB z konflacją `sessionId`/`session_id`.\n- Rejestr trzyma dwie mapy (`lanes` + pre-zasiane `fallbacks` per `AgentKind`), bo `lane_for` zwraca `&dyn` — fallback musi mieć stały adres w rejestrze, nie być tworzony ad hoc.\n- Doc-linki w module pod cfg-dublowaną deklaracją (`pub mod extraction` pod `app`, prywatny bez) gubią spany rustdoc — stąd w pełni kwalifikowany link do `SessionModel`; to landmine dla W1 zapisany w raporcie.\n`─────────────────────────────────────────────────`",
+        "evidence": {
+          "segment_id": 0,
+          "turn_idx": 113,
+          "timestamp": "2026-09-17T20:42:28.881Z"
+        }
+      }
+    ],
+    "outcome": {
+      "agent_outcome": "complete",
+      "ending": null
+    }
+  }
+]
