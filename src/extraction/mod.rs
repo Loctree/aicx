@@ -21,10 +21,11 @@ pub use crate::timeline::{
     CollapseStubKind, ConversationMessage, ExtractionConfig, MessageKind, SourceInfo, TimelineEntry,
 };
 
+/// `extract --brief` rendering over the distill layer (W2-01).
+pub mod brief;
 /// Bulk `extract all` bookkeeping: a CLI surface, absent from the slim
 /// `loctree-consumer` profile (it reaches the `app`-gated session catalog).
 #[cfg(feature = "app")]
-pub mod brief;
 pub mod bulk;
 pub mod conversation;
 /// Per-agent lane distillation contract (W0) — projection layer over the
