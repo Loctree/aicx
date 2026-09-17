@@ -26,6 +26,9 @@ pub use crate::timeline::{
 #[cfg(feature = "app")]
 pub mod bulk;
 pub mod conversation;
+/// Per-agent lane distillation contract (W0) — projection layer over the
+/// parsed session model; see `docs/DISTILL_CONTRACT.md`.
+pub mod distill;
 pub mod files;
 mod importer_support;
 pub mod list;
