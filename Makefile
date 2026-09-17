@@ -133,6 +133,13 @@ precheck:
 	cargo check --locked -p aicx --all-targets
 	cargo check --locked -p aicx-embeddings
 
+# TB differential oracle (distill contract W0/W1): frozen tbflow packages
+# diffed field-by-field against the aicx-parsed model. Part of `make test`
+# via --all-targets; standalone target for the dispatch/CI gate line.
+.PHONY: oracle-diff
+oracle-diff:
+	cargo test --locked -p aicx --test tb_oracle_harness
+
 precheck-native:
 	cargo check --locked -p aicx-embeddings --features gguf
 	cargo check --locked -p aicx --features native-embedder --all-targets
