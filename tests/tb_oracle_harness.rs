@@ -73,6 +73,10 @@ fn fixture_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tb_oracle/_shared")
 }
 
+fn grok_fixture_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tb_oracle/grok")
+}
+
 fn normalize_sha(value: &str) -> String {
     value.trim_start_matches("sha256:").to_owned()
 }
@@ -206,4 +210,59 @@ fn distill_contract_doc_sections_present() {
             "docs/DISTILL_CONTRACT.md missing section marker {needle:?}"
         );
     }
+}
+
+fn load_grok_fixture(name: &str) -> String {
+    let path = grok_fixture_dir().join(name);
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("cannot read grok fixture {}: {error}", path.display()))
+}
+
+/// Green: the grok TB package agrees with itself on the W0 common field set.
+#[test]
+fn grok_tb_package_common_fields_agree() {
+    let human = common_fields_from_human(&load_grok_fixture("human.md"));
+    let payload = common_fields_from_index_payload(&load_grok_fixture("index-payload.jsonl"));
+    let diffs = diff_common_fields(&human, &payload);
+    assert!(
+        diffs.is_empty(),
+        "grok TB package disagrees with itself on common fields:\n{}",
+        diffs
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
+
+/// The grok TB package common fields match the redacted session fixture
+/// (summary.json cwd/branch + chat_history sha256 + one segment).
+#[test]
+fn grok_tb_package_matches_session_fixture() {
+    let human = common_fields_from_human(&load_grok_fixture("human.md"));
+    let summary: serde_json::Value =
+        serde_json::from_str(&load_grok_fixture("summary.json")).expect("summary.json parses");
+    let cwd = summary
+        .pointer("/info/cwd")
+        .and_then(serde_json::Value::as_str)
+        .expect("summary.info.cwd");
+    let branch = summary
+        .get("head_branch")
+        .and_then(serde_json::Value::as_str)
+        .expect("summary.head_branch");
+    let chat = grok_fixture_dir().join("chat_history.jsonl");
+    let bytes = std::fs::read(&chat).expect("read grok chat_history.jsonl");
+    let sha = sha256_hex(&bytes);
+    assert_eq!(human.agent, "grok");
+    assert_eq!(human.cwd, cwd);
+    assert_eq!(human.branch, branch);
+    assert_eq!(human.source_sha256, sha);
+    assert_eq!(human.segments, 1);
+    assert_eq!(human.map_id, "grok__01a04490__2026-08-27__w2t9");
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(bytes);
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }

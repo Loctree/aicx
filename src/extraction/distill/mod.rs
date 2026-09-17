@@ -282,7 +282,9 @@ impl LaneRegistry {
     /// keeping existing registrations untouched (append-only etiquette).
     pub fn with_default_lanes() -> Self {
         // W1 append zone — one `registry.register(Box::new(...))` per lane.
-        Self::new()
+        let mut registry = Self::new();
+        registry.register(Box::new(grok_lane::GrokLane));
+        registry
     }
 }
 
@@ -294,6 +296,7 @@ impl Default for LaneRegistry {
 
 // W1 append zone — one `pub mod <agent>_lane;` per worker, added below this
 // line without touching the shared contract above.
+pub mod grok_lane;
 
 #[cfg(test)]
 mod tests {
