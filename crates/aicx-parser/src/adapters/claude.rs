@@ -59,7 +59,7 @@ use crate::skill_collapse::detect_skill_marker;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
-pub const CLAUDE_ADAPTER_VERSION: &str = "claude-adapter-v1";
+pub const CLAUDE_ADAPTER_VERSION: &str = "claude-adapter-v2";
 
 /// Anthropic usage provider token for typed `UsageEvent`s.
 const USAGE_PROVIDER: &str = "anthropic";
@@ -647,17 +647,29 @@ fn walk_content_block(
             if !name.is_empty() && !call_id.is_empty() {
                 ctx.tool_names.insert(call_id.to_owned(), name.to_owned());
             }
+            // Verbatim `input.command` (Bash and shell-shaped tools) is
+            // raw-source truth: surfacing it as the turn body lets the
+            // shell-action projection render `$ cmd [N lines, sha256:…]`
+            // instead of an empty `$ `. Other tools keep an empty body —
+            // a synthesized summary would be heuristic, and heuristics
+            // never enter the kernel (C0A §1.1).
+            let input = object.get("input").unwrap_or(&Value::Null);
+            let command = input
+                .get("command")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .unwrap_or_default();
             let turn_idx = push_turn(
                 TurnRole::Assistant,
                 TurnKind::ToolCall,
-                "",
+                command,
                 timestamp,
                 known_nonempty(name),
                 vec![physical_ref.clone(), evidence.clone()],
                 None,
                 analysis,
             );
-            let payload = canonical_json(object.get("input").unwrap_or(&Value::Null));
+            let payload = canonical_json(input);
             analysis.tool_events.push(ToolEvent {
                 kind: ToolEventKind::Call,
                 turn_idx,
