@@ -281,8 +281,10 @@ impl LaneRegistry {
     /// W1 workers: append your lane's `registry.register(...)` line below,
     /// keeping existing registrations untouched (append-only etiquette).
     pub fn with_default_lanes() -> Self {
+        let mut registry = Self::new();
         // W1 append zone — one `registry.register(Box::new(...))` per lane.
-        Self::new()
+        registry.register(Box::new(gemini::GeminiLane::new()));
+        registry
     }
 }
 
@@ -294,6 +296,7 @@ impl Default for LaneRegistry {
 
 // W1 append zone — one `pub mod <agent>_lane;` per worker, added below this
 // line without touching the shared contract above.
+pub mod gemini;
 
 #[cfg(test)]
 mod tests {

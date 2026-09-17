@@ -1,0 +1,43 @@
+{
+  "schema": "aicx.distill.segment_distillate.v1",
+  "agent": "gemini",
+  "segment_id": 0,
+  "scope_status": "unknown",
+  "decision_candidates": [
+    {
+      "text": "Przystępuję do wdrożenia pierwszych czterech Quick Wins dla prview",
+      "kind": "plan_commitment",
+      "evidence": {
+        "segment_id": 0,
+        "turn_idx": 3,
+        "timestamp": "2026-04-15T03:18:10.000Z"
+      }
+    }
+  ],
+  "gates": [
+    {
+      "command": "cargo check && git status",
+      "outcome": "pass",
+      "evidence": {
+        "segment_id": 0,
+        "turn_idx": 2,
+        "timestamp": "2026-04-15T03:18:02.576Z"
+      }
+    }
+  ],
+  "open_questions": [],
+  "handoff_signals": [
+    {
+      "text": "Zrealizowano wstępną weryfikację: cargo check przechodzi pomyślnie, drzewo robocze czyste. Przystępuję do wdrożenia pierwszych czterech Quick Wins dla prview.",
+      "evidence": {
+        "segment_id": 0,
+        "turn_idx": 3,
+        "timestamp": "2026-04-15T03:18:10.000Z"
+      }
+    }
+  ],
+  "outcome": {
+    "agent_outcome": "complete",
+    "ending": null
+  }
+}
