@@ -993,7 +993,7 @@ fn recommendations_for(readiness: CatalogReadiness, counts: &StalenessCounts) ->
 fn multi_host_notes(by_machine: &BTreeMap<String, usize>, counts: &StalenessCounts) -> Vec<String> {
     let mut notes = vec![
         "Catalog discovers only local agent source roots on the host running rebuild/status.".into(),
-        "Alternative store drop dirs are not scanned; put JSONL under ~/.claude/projects, ~/.codex/sessions, ~/.gemini/tmp, ~/.grok/sessions, ~/.junie/sessions, or ~/.vibecrafted/control_plane/runtime_runs.".into(),
+        "Alternative store drop dirs are not scanned; put JSONL under ~/.claude/projects, ~/.codex/sessions, ~/.gemini/tmp, ~/.grok/sessions, ~/.junie/sessions, ~/.kimi-code/sessions, or ~/.vibecrafted/control_plane/runtime_runs.".into(),
         "AICX_HOME / [storage].home relocates the whole home (catalog+index+extracts), not a second session intake path.".into(),
         "Dense indexes are model+dimension locked. Laptop 0.6b vectors must not merge into the owner's 8b CURRENT — lexical Tantivy can be rebuilt on the owner host from shared sources.".into(),
         "Remote agents: `aicx serve --transport http` with Bearer token (not OAuth). Prefer one index owner and point remotes at its streamable HTTP + embedder URL.".into(),

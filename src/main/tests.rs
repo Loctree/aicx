@@ -345,6 +345,72 @@ fn test_extraction_source_key_is_case_insensitive() {
     );
 }
 
+#[test]
+fn watermark_coverage_follows_the_recording_key_agents() {
+    let agents: &[&str] = &[
+        "claude",
+        "codex",
+        "gemini",
+        "junie",
+        "grok",
+        "kimi",
+        "codescribe",
+    ];
+    let project = Vec::new();
+    let key = extraction_source_key(agents, &project);
+    let aliases = extraction_source_key_aliases(agents, &project);
+
+    // No watermark anywhere: nothing is covered.
+    let state = StateManager::default();
+    assert!(watermark_covered_agents(&state, &key, &aliases).is_empty());
+
+    // A watermark recorded under a pre-kimi key covers the incumbents, not
+    // kimi — the newcomer's sources must fall back to the raw cutoff instead
+    // of skipping their whole pre-upgrade history as if already ingested.
+    let mut state = StateManager::default();
+    state.update_watermark(&format!("{LEGACY_ALL_WATERMARK_KEY}:all"), Utc::now());
+    let covered = watermark_covered_agents(&state, &key, &aliases);
+    assert!(covered.contains("claude"));
+    assert!(covered.contains("codescribe"));
+    assert!(!covered.contains("kimi"));
+
+    // Once the canonical key itself holds a watermark (a run of the current
+    // composition recorded it), every requested agent is covered.
+    let mut state = StateManager::default();
+    state.update_watermark(&key, Utc::now());
+    let covered = watermark_covered_agents(&state, &key, &aliases);
+    assert!(covered.contains("kimi"));
+    assert_eq!(covered.len(), agents.len());
+}
+
+#[test]
+fn watermark_coverage_unions_alias_generations() {
+    // A state file can hold watermarks under more than one legacy
+    // composition; coverage is the union of the agents those keys name.
+    let agents: &[&str] = &[
+        "claude",
+        "codex",
+        "gemini",
+        "junie",
+        "grok",
+        "kimi",
+        "codescribe",
+    ];
+    let project = Vec::new();
+    let key = extraction_source_key(agents, &project);
+    let aliases = extraction_source_key_aliases(agents, &project);
+    let mut state = StateManager::default();
+    state.update_watermark("claude+codex+gemini:all", Utc::now());
+    let covered = watermark_covered_agents(&state, &key, &aliases);
+    assert_eq!(
+        covered,
+        ["claude", "codex", "gemini"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>()
+    );
+}
+
 /// Bug #36 regression: prove `aicx index status -p X` and
 /// `aicx index -p X` produce the same bucket set for every canonical
 /// filter shape. Both surfaces must canonicalize through

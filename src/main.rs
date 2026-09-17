@@ -7784,7 +7784,10 @@ fn extraction_source_key_aliases(agents: &[&str], project: &[String]) -> Vec<Str
     if requested == normalized_source_key_parts(ALL_WATERMARK_AGENTS.iter().copied()) {
         // The kimi-aware `all` inherits the newest watermark any older `all`
         // composition recorded; without this the upgrade would force a full
-        // rescan of every provider it already processed.
+        // rescan of every provider it already processed. The inherited
+        // watermark covers only the agents named in the recording key —
+        // `watermark_covered_agents` exempts the newcomer, or its whole
+        // pre-upgrade history would be skipped as if already ingested.
         aliases.push(format!("{LEGACY_ALL_WATERMARK_KEY}:{project_key}"));
         aliases.push(format!(
             "claude+codex+gemini+junie+codescribe:{project_key}"
@@ -7804,6 +7807,34 @@ fn extraction_source_key_aliases(agents: &[&str], project: &[String]) -> Vec<Str
         aliases.push(format!("claude+codex+gemini+junie:{project_key}"));
     }
     aliases
+}
+
+/// Agent names the stored watermark for `source_key` honestly covers.
+///
+/// A composite watermark key (`claude+codex+…:all`) claims coverage only for
+/// the agents named in the key that recorded it. When the `all` composition
+/// grows, alias migration carries the old watermark forward for the
+/// incumbents, but a newcomer has no extraction history behind that
+/// timestamp — its sources must fall back to the raw cutoff, or their whole
+/// pre-upgrade history is skipped as if already ingested.
+fn watermark_covered_agents(
+    state: &StateManager,
+    source_key: &str,
+    source_aliases: &[String],
+) -> BTreeSet<String> {
+    if state.get_watermark(source_key).is_some() {
+        return agent_names_in_watermark_key(source_key);
+    }
+    source_aliases
+        .iter()
+        .filter(|alias| state.get_watermark(alias).is_some())
+        .flat_map(|alias| agent_names_in_watermark_key(alias))
+        .collect()
+}
+
+fn agent_names_in_watermark_key(key: &str) -> BTreeSet<String> {
+    let agents = key.split_once(':').map_or(key, |(agents, _)| agents);
+    agents.split('+').map(str::to_owned).collect()
 }
 
 fn warn_incremental_legacy_flag(flag_used: bool) {
@@ -8131,6 +8162,9 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
     // escape hatch both mean "scan the full lookback window".
     let source_key = extraction_source_key(agents, &project);
     let source_aliases = extraction_source_key_aliases(agents, &project);
+    // Compute coverage BEFORE migration writes the canonical key: a watermark
+    // covers only the agents named in the key that recorded it.
+    let watermark_covered = watermark_covered_agents(&state, &source_key, &source_aliases);
     state.migrate_watermark_aliases(&source_key, &source_aliases);
     let watermark = if full_rescan || force {
         None
@@ -8173,28 +8207,51 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
             std::time::Duration::from_secs(2),
             std::time::Duration::from_secs(60),
         );
+        // A watermark recorded before this agent joined the composition says
+        // nothing about its sources: they scan against the raw cutoff, or the
+        // run silently skips the agent's whole pre-upgrade history (kimi
+        // lanes on the first kimi-aware `all` run).
+        let uncovered_config;
+        let agent_config = if watermark.is_some() && !watermark_covered.contains(agent) {
+            eprintln!(
+                "  [{agent}] no extraction watermark covers this agent yet; scanning the full window"
+            );
+            uncovered_config = ExtractionConfig {
+                watermark: None,
+                ..config.clone()
+            };
+            &uncovered_config
+        } else {
+            &config
+        };
         let agent_entries_result = match agent {
-            "claude" => {
-                sources::extract_agent_sessions(aicx::session_catalog::AgentKind::Claude, &config)
-            }
-            "codex" => {
-                sources::extract_agent_sessions(aicx::session_catalog::AgentKind::Codex, &config)
-            }
-            "gemini" => {
-                sources::extract_agent_sessions(aicx::session_catalog::AgentKind::Gemini, &config)
-            }
-            "junie" => {
-                sources::extract_agent_sessions(aicx::session_catalog::AgentKind::Junie, &config)
-            }
-            "kimi" => {
-                sources::extract_agent_sessions(aicx::session_catalog::AgentKind::Kimi, &config)
-            }
-            "grok" => {
-                sources::extract_agent_sessions(aicx::session_catalog::AgentKind::Grok, &config)
-            }
-            "codescribe" => aicx::importers::extract_codescribe(&config)
+            "claude" => sources::extract_agent_sessions(
+                aicx::session_catalog::AgentKind::Claude,
+                agent_config,
+            ),
+            "codex" => sources::extract_agent_sessions(
+                aicx::session_catalog::AgentKind::Codex,
+                agent_config,
+            ),
+            "gemini" => sources::extract_agent_sessions(
+                aicx::session_catalog::AgentKind::Gemini,
+                agent_config,
+            ),
+            "junie" => sources::extract_agent_sessions(
+                aicx::session_catalog::AgentKind::Junie,
+                agent_config,
+            ),
+            "kimi" => sources::extract_agent_sessions(
+                aicx::session_catalog::AgentKind::Kimi,
+                agent_config,
+            ),
+            "grok" => sources::extract_agent_sessions(
+                aicx::session_catalog::AgentKind::Grok,
+                agent_config,
+            ),
+            "codescribe" => aicx::importers::extract_codescribe(agent_config)
                 .map(sources::SessionExtractionBatch::from_entries),
-            "operator-md" => aicx::importers::extract_operator_markdown(&config)
+            "operator-md" => aicx::importers::extract_operator_markdown(agent_config)
                 .map(sources::SessionExtractionBatch::from_entries),
             _ => Ok(sources::SessionExtractionBatch::default()),
         };
