@@ -1,0 +1,73 @@
+[
+  {
+    "schema": "aicx.distill.segment_distillate.v1",
+    "agent": "kimi",
+    "segment_id": 0,
+    "scope_status": "unknown",
+    "decision_candidates": [
+      {
+        "text": "Decision: lane file is `kimi_lane.rs`, not `kimi.rs`** — the W0 contract (`docs/DISTILL_CONTRACT.md` rule 4: `src/extraction/distill/<agent>_lane.rs`) is frozen and wins over the brief's loose naming.",
+        "kind": "explicit_choice",
+        "evidence": {
+          "segment_id": 0,
+          "turn_idx": 6,
+          "timestamp": "2026-09-17T20:58:48.876Z"
+        }
+      },
+      {
+        "text": "Decision: gates come only from the `Bash` tool** (kimi's sole shell-shaped tool), matched against a gate-command vocabulary (`cargo test/clippy/fmt/build/check`, `npm test`, `make test/check`); verdict is read from the correlated `tool.result` body via explicit pass/fail markers, else `Unknown` — never guessed.",
+        "kind": "explicit_choice",
+        "evidence": {
+          "segment_id": 0,
+          "turn_idx": 6,
+          "timestamp": "2026-09-17T20:58:48.876Z"
+        }
+      },
+      {
+        "text": "Decision: `agent_outcome` stays `Unknown` in v1**; the only upgrade-with-evidence is `ending: \"interrupted\"` when the substrate reports a malformed tail.",
+        "kind": "explicit_choice",
+        "evidence": {
+          "segment_id": 0,
+          "turn_idx": 6,
+          "timestamp": "2026-09-17T20:58:48.876Z"
+        }
+      }
+    ],
+    "gates": [
+      {
+        "command": "cargo check -p aicx 2>&1 | tail -20",
+        "outcome": "pass",
+        "evidence": {
+          "segment_id": 0,
+          "turn_idx": 7,
+          "timestamp": "2026-09-17T21:04:11.289Z"
+        }
+      }
+    ],
+    "open_questions": [
+      {
+        "kind": "user_question",
+        "text": "Czemu kimi nie boi się watermarku?",
+        "evidence": {
+          "segment_id": 0,
+          "turn_idx": 0,
+          "timestamp": "2026-09-17T20:43:40.802Z"
+        }
+      }
+    ],
+    "handoff_signals": [
+      {
+        "text": "The wire now holds a real `cargo check -p aicx` gate (line 430). One gap: a passing `cargo check` prints `Finished ...`, not `test result: ok` — extending pass markers so that real pass is read as `Pass`, not `Unknown`:",
+        "evidence": {
+          "segment_id": 0,
+          "turn_idx": 9,
+          "timestamp": "2026-09-17T21:06:47.480Z"
+        }
+      }
+    ],
+    "outcome": {
+      "agent_outcome": "unknown",
+      "ending": null
+    }
+  }
+]
