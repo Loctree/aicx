@@ -448,3 +448,27 @@ fn distill_contract_doc_sections_present() {
         );
     }
 }
+
+/// Frozen Gemini TB package agrees on common fields.
+#[test]
+fn gemini_tb_package_common_fields_agree() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tb_oracle/gemini");
+    let human = common_fields_from_human(
+        &std::fs::read_to_string(dir.join("gemini_human.md"))
+            .expect("read gemini_human.md fixture"),
+    );
+    let payload = common_fields_from_index_payload(
+        &std::fs::read_to_string(dir.join("gemini_index-payload.jsonl"))
+            .expect("read gemini_index-payload.jsonl fixture"),
+    );
+    let diffs = diff_common_fields(&human, &payload);
+    assert!(
+        diffs.is_empty(),
+        "Gemini TB package disagrees with itself on common fields:\n{}",
+        diffs
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}

@@ -285,6 +285,7 @@ impl LaneRegistry {
         // W1 append zone — one `registry.register(Box::new(...))` per lane.
         registry.register(Box::new(claude_lane::ClaudeLane));
         registry.register(Box::new(codex_lane::CodexLane));
+        registry.register(Box::new(gemini::GeminiLane::new()));
         registry
     }
 }
@@ -299,6 +300,7 @@ impl Default for LaneRegistry {
 // line without touching the shared contract above.
 pub mod claude_lane;
 pub mod codex_lane;
+pub mod gemini;
 
 #[cfg(test)]
 mod tests {
