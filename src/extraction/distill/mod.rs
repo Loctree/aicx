@@ -287,6 +287,7 @@ impl LaneRegistry {
         registry.register(Box::new(codex_lane::CodexLane));
         registry.register(Box::new(gemini::GeminiLane::new()));
         registry.register(Box::new(grok_lane::GrokLane));
+        registry.register(Box::new(junie::JunieLane::new()));
         registry
     }
 }
@@ -303,6 +304,7 @@ pub mod claude_lane;
 pub mod codex_lane;
 pub mod gemini;
 pub mod grok_lane;
+pub mod junie;
 
 #[cfg(test)]
 mod tests {
