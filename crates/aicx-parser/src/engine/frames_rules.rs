@@ -195,6 +195,15 @@ pub const AGENT_FRAME_RULES: &[AgentFrameRules] = &[
         queue_seal: false,
         inject_tags: KIMI_INJECT_TAGS,
     },
+    // # cursor — user wrappers (<timestamp>/<user_query>) are peeled in the
+    // adapter; no echo-bus / queue-seal on this transport.
+    AgentFrameRules {
+        agent: AgentKind::Cursor,
+        echo_promotion: false,
+        klops_guard: &[],
+        queue_seal: false,
+        inject_tags: GENERIC_INJECT_TAGS,
+    },
 ];
 
 pub fn rules_for(agent: AgentKind) -> &'static AgentFrameRules {

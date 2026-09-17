@@ -47,6 +47,7 @@ fn main() -> ExitCode {
         "grok" => AgentKind::Grok,
         "junie" => AgentKind::Junie,
         "kimi" => AgentKind::Kimi,
+        "cursor" => AgentKind::Cursor,
         other => {
             eprintln!("unsupported agent: {other}");
             return ExitCode::from(2);

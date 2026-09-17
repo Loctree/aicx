@@ -333,6 +333,15 @@ pub enum ProviderConversationRef {
         agent_id: Option<String>,
         unobserved: Vec<String>,
     },
+    /// Cursor agent-transcript JSONL: store id is the filename UUID
+    /// (`~/.cursor/projects/<slug>/agent-transcripts/<uuid>/<uuid>.jsonl`).
+    /// Records do not carry a session field; `worker_id` lives on the
+    /// cursor-agent-worker process, not in the transcript.
+    Cursor {
+        session_id: String,
+        worker_id: Option<String>,
+        unobserved: Vec<String>,
+    },
 }
 
 impl ProviderConversationRef {
@@ -378,6 +387,11 @@ impl ProviderConversationRef {
                 agent_id: None,
                 unobserved: vec!["agent_id".to_owned()],
             },
+            AgentKind::Cursor => Self::Cursor {
+                session_id: store_id,
+                worker_id: None,
+                unobserved: vec!["worker_id".to_owned()],
+            },
         }
     }
 
@@ -389,6 +403,7 @@ impl ProviderConversationRef {
             Self::Grok { .. } => AgentKind::Grok,
             Self::Junie { .. } => AgentKind::Junie,
             Self::Kimi { .. } => AgentKind::Kimi,
+            Self::Cursor { .. } => AgentKind::Cursor,
         }
     }
 
@@ -400,7 +415,8 @@ impl ProviderConversationRef {
             | Self::Gemini { session_id, .. }
             | Self::Grok { session_id, .. }
             | Self::Junie { session_id, .. }
-            | Self::Kimi { session_id, .. } => session_id,
+            | Self::Kimi { session_id, .. }
+            | Self::Cursor { session_id, .. } => session_id,
             Self::Codex {
                 tree_session_id,
                 thread_id,
@@ -439,7 +455,8 @@ impl ProviderConversationRef {
             | Self::Gemini { unobserved, .. }
             | Self::Grok { unobserved, .. }
             | Self::Junie { unobserved, .. }
-            | Self::Kimi { unobserved, .. } => unobserved,
+            | Self::Kimi { unobserved, .. }
+            | Self::Cursor { unobserved, .. } => unobserved,
         }
     }
 }

@@ -16,6 +16,7 @@ pub enum AgentKind {
     Grok,
     Junie,
     Kimi,
+    Cursor,
 }
 
 impl AgentKind {
@@ -27,6 +28,7 @@ impl AgentKind {
             Self::Grok => "grok",
             Self::Junie => "junie",
             Self::Kimi => "kimi",
+            Self::Cursor => "cursor",
         }
     }
 }
