@@ -4517,16 +4517,6 @@ fn run_sessions_list(
             modified_after,
         ));
     }
-    if want_agent.is_none_or(|a| a == "cursor") {
-        // Cursor's project slug is dash-encoded like Claude's but without the
-        // leading dash — lossy, so --cwd filtering stays on the
-        // post-discovery select_sessions pass (Association::Inferred).
-        discovered.extend(sessions::discover_cursor_sessions(
-            &home.join(".cursor").join("projects"),
-            modified_after,
-            here.as_deref(),
-        ));
-    }
 
     let scanned = discovered.len();
     let project_filters = project
