@@ -1007,10 +1007,13 @@ fn a_stray_file_in_the_session_directory_is_unsupported_not_failed() {
         .iter()
         .find(|entry| entry["outcome"] == "unsupported")
         .expect("the stray is in the manifest");
+    // Manifest paths are OS-native; normalize separators before the check so
+    // the assertion holds on Windows too.
     assert!(
         stray["source_path"]
             .as_str()
             .unwrap_or_default()
+            .replace('\\', "/")
             .ends_with("some-project/chats/notes.json")
     );
     let reason = stray["reason"]

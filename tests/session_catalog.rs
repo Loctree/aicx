@@ -609,7 +609,9 @@ fn gemini_catalog_admits_only_conversations_under_chats() {
                 .strip_prefix(&canonical_root)
                 .unwrap()
                 .to_string_lossy()
-                .into_owned()
+                // Catalog paths are OS-native; the expectation below is
+                // written with `/`, so normalize for Windows.
+                .replace('\\', "/")
         })
         .collect();
     relative.sort();
