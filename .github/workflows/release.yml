@@ -297,7 +297,14 @@ jobs:
               printf 'NOTARY_TEAM_ID=%s\n' "${NOTARY_TEAM_ID}"
               printf 'NOTARY_PASSWORD=%s\n' "${NOTARY_PASSWORD}"
             } > "${HOME}/.keys/.notary.env"
-            chmod 600 "${HOME}/.keys"/*
+            # Enumerate the secret files explicitly: a bare `.keys/*` glob
+            # would strip the execute bit from the gnupg dir (breaking gpg)
+            # and would never match the dotfile holding notary credentials.
+            chmod 600 \
+              "${HOME}/.keys/Certificates.p12" \
+              "${HOME}/.keys/cert_password.txt" \
+              "${HOME}/.keys/signing-identity.txt" \
+              "${HOME}/.keys/.notary.env"
           fi
 
       - name: Install pinned glibc-floor build tool
