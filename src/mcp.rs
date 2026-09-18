@@ -1387,7 +1387,7 @@ impl AicxMcpServer {
                     return Err(mcp_semantic_unavailable_error(&fallback));
                 }
                 let payload = render_mcp_fuzzy_fallback_payload(&fallback_request, &fallback)?;
-                return Ok(CallToolResult::success(vec![Content::text(payload)]));
+                return Ok(CallToolResult::success(vec![ContentBlock::text(payload)]));
             }
         };
         let crate::search_engine::FilteredSemanticOutcome {
@@ -1434,7 +1434,7 @@ impl AicxMcpServer {
             let payload =
                 inject_mcp_filter_pushdown_payload(&rendered, pushdown_diagnostic.as_ref())?;
 
-            return Ok(CallToolResult::success(vec![Content::text(payload)]));
+            return Ok(CallToolResult::success(vec![ContentBlock::text(payload)]));
         }
 
         // Shared finalize keeps MCP success ordering identical to the CLI and
@@ -1497,7 +1497,7 @@ impl AicxMcpServer {
             payload
         };
 
-        Ok(CallToolResult::success(vec![Content::text(payload)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(payload)]))
     }
 
     #[tool(
@@ -1515,7 +1515,7 @@ impl AicxMcpServer {
         let json = serde_json::to_string(&chunk)
             .map_err(|e| McpError::internal_error(format!("Serialize chunk JSON: {e}"), None))?;
 
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
     }
 
     #[tool(
@@ -1670,7 +1670,7 @@ impl AicxMcpServer {
         })
         .map_err(|e| McpError::internal_error(format!("Serialize rank JSON: {e}"), None))?;
 
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
     }
 
     #[tool(
@@ -1809,7 +1809,7 @@ impl AicxMcpServer {
             .map_err(|e| McpError::internal_error(format!("Serialize steer JSON: {e}"), None))?
         };
 
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
     }
 
     #[tool(
@@ -1950,7 +1950,7 @@ impl AicxMcpServer {
             }
         };
 
-        Ok(CallToolResult::success(vec![Content::text(body)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(body)]))
     }
 
     #[tool(
@@ -1970,7 +1970,7 @@ impl AicxMcpServer {
         let json = serde_json::to_string(&status).map_err(|e| {
             McpError::internal_error(format!("Serialize index status JSON: {e}"), None)
         })?;
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
     }
 
     #[tool(
@@ -2012,7 +2012,7 @@ impl AicxMcpServer {
         .map_err(mcp_session::SessionSurfaceError::into_mcp)?;
         let json = serde_json::to_string(&payload)
             .map_err(|e| McpError::internal_error(format!("Serialize sessions JSON: {e}"), None))?;
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
     }
 
     #[tool(
@@ -2039,7 +2039,7 @@ impl AicxMcpServer {
         .map_err(mcp_session::SessionSurfaceError::into_mcp)?;
         let json = serde_json::to_string(&payload)
             .map_err(|e| McpError::internal_error(format!("Serialize session JSON: {e}"), None))?;
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
     }
 
     #[tool(
@@ -2075,7 +2075,7 @@ impl AicxMcpServer {
         let json = serde_json::to_string(&payload).map_err(|e| {
             McpError::internal_error(format!("Serialize continuity JSON: {e}"), None)
         })?;
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
     }
 }
 
