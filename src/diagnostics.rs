@@ -60,7 +60,9 @@ impl DiagnosticKind {
     }
 }
 
-const EXTRACTOR_ORDER: &[&str] = &["claude", "codex", "gemini", "junie", "grok", "kimi"];
+const EXTRACTOR_ORDER: &[&str] = &[
+    "claude", "codex", "gemini", "junie", "grok", "kimi", "cursor",
+];
 
 #[derive(Default)]
 struct ExtractorCounters {
@@ -606,6 +608,7 @@ fn canonical_extractor_key(extractor: &str) -> &'static str {
         "junie" => "junie",
         "grok" => "grok",
         "kimi" => "kimi",
+        "cursor" => "cursor",
         _ => {
             // Unknown extractor → explicit "unknown" bucket, never silent
             // attribution to claude. Drop the debug_assert because legit

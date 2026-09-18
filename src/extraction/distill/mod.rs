@@ -233,13 +233,14 @@ impl AgentLaneDistiller for GenericLane {
 
 /// All parser-supported agents, in registry iteration order. W1 lanes cover
 /// this list; anything absent from the registry falls back to [`GenericLane`].
-const ALL_AGENTS: [AgentKind; 6] = [
+const ALL_AGENTS: [AgentKind; 7] = [
     AgentKind::Claude,
     AgentKind::Codex,
     AgentKind::Gemini,
     AgentKind::Grok,
     AgentKind::Junie,
     AgentKind::Kimi,
+    AgentKind::Cursor,
 ];
 
 /// Registry mapping [`AgentKind`] to its distiller lane.

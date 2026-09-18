@@ -300,6 +300,35 @@ pub fn list_available_sources() -> Result<Vec<SourceInfo>> {
         }
     }
 
+    // Cursor transcripts: ~/.cursor/projects/<slug>/agent-transcripts/<uuid>/<uuid>.jsonl
+    let cursor_projects = home.join(".cursor").join("projects");
+    if cursor_projects.exists() && cursor_projects.is_dir() {
+        let files: Vec<PathBuf> = walk_jsonl_files(&cursor_projects)
+            .into_iter()
+            .filter(|path| {
+                path.ancestors()
+                    .nth(2)
+                    .and_then(|dir| dir.file_name())
+                    .and_then(|name| name.to_str())
+                    == Some("agent-transcripts")
+            })
+            .collect();
+        let total_size: u64 = files
+            .iter()
+            .filter_map(|file| fs::metadata(file).ok())
+            .map(|metadata| metadata.len())
+            .sum();
+        if !files.is_empty() {
+            sources.push(source_info(
+                &home,
+                "cursor",
+                cursor_projects,
+                files.len(),
+                total_size,
+            ));
+        }
+    }
+
     // Codescribe transcripts: ~/.codescribe/transcriptions/YYYY-MM-DD/*.{txt,md,json}
     let codescribe_transcripts = discover_codescribe_transcripts(&home);
     if !codescribe_transcripts.is_empty() {

@@ -274,6 +274,7 @@ impl MixedScopeSession {
             "grok" => AgentKind::Grok,
             "junie" => AgentKind::Junie,
             "kimi" => AgentKind::Kimi,
+            "cursor" => AgentKind::Cursor,
             _ => AgentKind::Claude,
         }
     }

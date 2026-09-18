@@ -171,6 +171,7 @@ enum ExtractAgent {
     Grok,
     Junie,
     Kimi,
+    Cursor,
 }
 
 impl ExtractAgent {
@@ -182,6 +183,7 @@ impl ExtractAgent {
             Self::Grok => "grok",
             Self::Junie => "junie",
             Self::Kimi => "kimi",
+            Self::Cursor => "cursor",
         }
     }
 
@@ -193,6 +195,7 @@ impl ExtractAgent {
             Self::Grok => aicx::session_catalog::AgentKind::Grok,
             Self::Junie => aicx::session_catalog::AgentKind::Junie,
             Self::Kimi => aicx::session_catalog::AgentKind::Kimi,
+            Self::Cursor => aicx::session_catalog::AgentKind::Cursor,
         }
     }
 
@@ -204,6 +207,7 @@ impl ExtractAgent {
             Self::Grok => aicx::parser::engine::AgentKind::Grok,
             Self::Junie => aicx::parser::engine::AgentKind::Junie,
             Self::Kimi => aicx::parser::engine::AgentKind::Kimi,
+            Self::Cursor => aicx::parser::engine::AgentKind::Cursor,
         }
     }
 
@@ -219,6 +223,7 @@ impl ExtractAgent {
             Self::Grok => home.join(".grok").join("sessions"),
             Self::Junie => home.join(".junie").join("sessions"),
             Self::Kimi => home.join(".kimi-code").join("sessions"),
+            Self::Cursor => home.join(".cursor").join("projects"),
         }
     }
 
@@ -230,6 +235,7 @@ impl ExtractAgent {
             "grok" => Some(Self::Grok),
             "junie" => Some(Self::Junie),
             "kimi" => Some(Self::Kimi),
+            "cursor" => Some(Self::Cursor),
             _ => None,
         }
     }
@@ -249,6 +255,8 @@ enum ExtractTarget {
     Junie(ExtractAgentArgs),
     /// Kimi Code CLI wire files (~/.kimi-code/sessions)
     Kimi(ExtractAgentArgs),
+    /// Cursor agent transcripts (~/.cursor/projects/<slug>/agent-transcripts)
+    Cursor(ExtractAgentArgs),
     /// Every compatible source on this machine, in one incremental pass.
     All(ExtractAllArgs),
 }
@@ -262,6 +270,7 @@ impl ExtractTarget {
             Self::Grok(args) => (ExtractAgent::Grok, args),
             Self::Junie(args) => (ExtractAgent::Junie, args),
             Self::Kimi(args) => (ExtractAgent::Kimi, args),
+            Self::Cursor(args) => (ExtractAgent::Cursor, args),
             Self::All(_) => unreachable!("`extract all` is dispatched before split()"),
         }
     }
@@ -536,8 +545,8 @@ enum SessionsCommand {
         #[arg(short, long, value_delimiter = ',')]
         project: Vec<String>,
 
-        /// Filter by agent (claude | codex | gemini | junie | grok | kimi).
-        #[arg(long, value_parser = ["claude", "codex", "gemini", "junie", "grok", "kimi"])]
+        /// Filter by agent (claude | codex | gemini | junie | grok | kimi | cursor).
+        #[arg(long, value_parser = ["claude", "codex", "gemini", "junie", "grok", "kimi", "cursor"])]
         agent: Option<String>,
 
         /// Only sessions updated on/after this date (YYYY-MM-DD). Defaults to the
@@ -4493,6 +4502,15 @@ fn run_sessions_list(
             modified_after,
         ));
     }
+    if want_agent.is_none_or(|a| a == "cursor") {
+        // Cursor's project slug is dash-encoded like Claude's but without the
+        // leading dash — lossy, so --cwd filtering stays on the
+        // post-discovery select_sessions pass (Association::Inferred).
+        discovered.extend(sessions::discover_cursor_sessions(
+            &home.join(".cursor").join("projects"),
+            modified_after,
+        ));
+    }
 
     let scanned = discovered.len();
     let project_filters = project
@@ -6632,6 +6650,7 @@ const fn bulk_agent_to_parser_agent(
         aicx::session_catalog::AgentKind::Grok => aicx::parser::engine::AgentKind::Grok,
         aicx::session_catalog::AgentKind::Junie => aicx::parser::engine::AgentKind::Junie,
         aicx::session_catalog::AgentKind::Kimi => aicx::parser::engine::AgentKind::Kimi,
+        aicx::session_catalog::AgentKind::Cursor => aicx::parser::engine::AgentKind::Cursor,
     }
 }
 
@@ -6643,6 +6662,7 @@ const fn bulk_agent_to_extract_agent(agent: aicx::session_catalog::AgentKind) ->
         aicx::session_catalog::AgentKind::Grok => ExtractAgent::Grok,
         aicx::session_catalog::AgentKind::Junie => ExtractAgent::Junie,
         aicx::session_catalog::AgentKind::Kimi => ExtractAgent::Kimi,
+        aicx::session_catalog::AgentKind::Cursor => ExtractAgent::Cursor,
     }
 }
 
@@ -7799,8 +7819,15 @@ const ALL_WATERMARK_AGENTS: &[&str] = &[
     "junie",
     "grok",
     "kimi",
+    "cursor",
     "codescribe",
 ];
+
+/// The `all` composition the kimi-aware build recorded under (normalized:
+/// sorted + `+`-joined). The first cursor-aware `all` run inherits this
+/// watermark through [`extraction_source_key_aliases`] instead of rescanning
+/// every incumbent provider from scratch.
+const KIMI_ALL_WATERMARK_KEY: &str = "claude+codescribe+codex+gemini+grok+junie+kimi";
 
 fn normalized_source_key_parts<'a>(parts: impl IntoIterator<Item = &'a str>) -> Vec<String> {
     let mut normalized = parts
@@ -7841,12 +7868,13 @@ fn extraction_source_key_aliases(agents: &[&str], project: &[String]) -> Vec<Str
     let mut aliases = Vec::new();
     let requested = normalized_source_key_parts(agents.iter().copied());
     if requested == normalized_source_key_parts(ALL_WATERMARK_AGENTS.iter().copied()) {
-        // The kimi-aware `all` inherits the newest watermark any older `all`
+        // The current `all` inherits the newest watermark any older `all`
         // composition recorded; without this the upgrade would force a full
         // rescan of every provider it already processed. The inherited
         // watermark covers only the agents named in the recording key —
         // `watermark_covered_agents` exempts the newcomer, or its whole
         // pre-upgrade history would be skipped as if already ingested.
+        aliases.push(format!("{KIMI_ALL_WATERMARK_KEY}:{project_key}"));
         aliases.push(format!("{LEGACY_ALL_WATERMARK_KEY}:{project_key}"));
         aliases.push(format!(
             "claude+codex+gemini+junie+codescribe:{project_key}"

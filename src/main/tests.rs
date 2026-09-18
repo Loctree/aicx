@@ -354,6 +354,7 @@ fn watermark_coverage_follows_the_recording_key_agents() {
         "junie",
         "grok",
         "kimi",
+        "cursor",
         "codescribe",
     ];
     let project = Vec::new();
@@ -365,7 +366,7 @@ fn watermark_coverage_follows_the_recording_key_agents() {
     assert!(watermark_covered_agents(&state, &key, &aliases).is_empty());
 
     // A watermark recorded under a pre-kimi key covers the incumbents, not
-    // kimi — the newcomer's sources must fall back to the raw cutoff instead
+    // the newcomers — their sources must fall back to the raw cutoff instead
     // of skipping their whole pre-upgrade history as if already ingested.
     let mut state = StateManager::default();
     state.update_watermark(&format!("{LEGACY_ALL_WATERMARK_KEY}:all"), Utc::now());
@@ -373,6 +374,15 @@ fn watermark_coverage_follows_the_recording_key_agents() {
     assert!(covered.contains("claude"));
     assert!(covered.contains("codescribe"));
     assert!(!covered.contains("kimi"));
+    assert!(!covered.contains("cursor"));
+
+    // A watermark recorded by the kimi-aware composition covers kimi, but
+    // still not cursor (the newest newcomer).
+    let mut state = StateManager::default();
+    state.update_watermark(&format!("{KIMI_ALL_WATERMARK_KEY}:all"), Utc::now());
+    let covered = watermark_covered_agents(&state, &key, &aliases);
+    assert!(covered.contains("kimi"));
+    assert!(!covered.contains("cursor"));
 
     // Once the canonical key itself holds a watermark (a run of the current
     // composition recorded it), every requested agent is covered.
@@ -380,6 +390,7 @@ fn watermark_coverage_follows_the_recording_key_agents() {
     state.update_watermark(&key, Utc::now());
     let covered = watermark_covered_agents(&state, &key, &aliases);
     assert!(covered.contains("kimi"));
+    assert!(covered.contains("cursor"));
     assert_eq!(covered.len(), agents.len());
 }
 
@@ -394,6 +405,7 @@ fn watermark_coverage_unions_alias_generations() {
         "junie",
         "grok",
         "kimi",
+        "cursor",
         "codescribe",
     ];
     let project = Vec::new();
