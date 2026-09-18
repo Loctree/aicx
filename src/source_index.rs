@@ -1035,6 +1035,7 @@ fn parse_catalog_source(
         "grok" => aicx_parser::engine::AgentKind::Grok,
         "junie" => aicx_parser::engine::AgentKind::Junie,
         "kimi" => aicx_parser::engine::AgentKind::Kimi,
+        "cursor" => aicx_parser::engine::AgentKind::Cursor,
         other => anyhow::bail!("unsupported catalog agent `{other}`"),
     };
     let parsed = crate::parser_dispatch::parse_file(

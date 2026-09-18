@@ -1093,6 +1093,7 @@ fn agent_source_root(agent: AgentKind, user_home: &Path) -> PathBuf {
         AgentKind::Grok => user_home.join(".grok").join("sessions"),
         AgentKind::Junie => user_home.join(".junie").join("sessions"),
         AgentKind::Kimi => user_home.join(".kimi-code").join("sessions"),
+        AgentKind::Cursor => user_home.join(".cursor").join("projects"),
     }
 }
 

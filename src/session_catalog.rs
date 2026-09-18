@@ -34,16 +34,18 @@ pub enum AgentKind {
     Junie,
     Grok,
     Kimi,
+    Cursor,
 }
 
 impl AgentKind {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Claude,
         Self::Codex,
         Self::Gemini,
         Self::Junie,
         Self::Grok,
         Self::Kimi,
+        Self::Cursor,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -54,6 +56,7 @@ impl AgentKind {
             Self::Junie => "junie",
             Self::Grok => "grok",
             Self::Kimi => "kimi",
+            Self::Cursor => "cursor",
         }
     }
 
@@ -65,6 +68,7 @@ impl AgentKind {
             "junie" => Some(Self::Junie),
             "grok" => Some(Self::Grok),
             "kimi" => Some(Self::Kimi),
+            "cursor" => Some(Self::Cursor),
             _ => None,
         }
     }
@@ -78,6 +82,7 @@ impl AgentKind {
             Self::Grok => home.join(".grok").join("sessions"),
             Self::Junie => home.join(".junie").join("sessions"),
             Self::Kimi => home.join(".kimi-code").join("sessions"),
+            Self::Cursor => home.join(".cursor").join("projects"),
         }
     }
 
@@ -89,13 +94,14 @@ impl AgentKind {
             Self::Grok => aicx_parser::engine::AgentKind::Grok,
             Self::Junie => aicx_parser::engine::AgentKind::Junie,
             Self::Kimi => aicx_parser::engine::AgentKind::Kimi,
+            Self::Cursor => aicx_parser::engine::AgentKind::Cursor,
         }
     }
 
     fn accepts_extension(self, extension: Option<&str>) -> bool {
         match self {
             Self::Gemini => matches!(extension, Some("json" | "jsonl")),
-            Self::Claude | Self::Codex | Self::Junie | Self::Grok | Self::Kimi => {
+            Self::Claude | Self::Codex | Self::Junie | Self::Grok | Self::Kimi | Self::Cursor => {
                 extension == Some("jsonl")
             }
         }
@@ -118,10 +124,23 @@ impl AgentKind {
     /// (`session_<uuid>/agents/<agentId>/wire.jsonl`) plus non-conversation
     /// material (`state.json`, `logs/`, `tasks/`, `file-history/`). Only the
     /// per-lane wire file is a session source.
+    ///
+    /// Cursor project dirs hold the conversation only under
+    /// `agent-transcripts/<uuid>/<uuid>.jsonl`; siblings (`agent-tools/`,
+    /// `terminals/`, `repo.json`, `worker.log`) are never a session. The
+    /// shape check keeps any future non-transcript `.jsonl` from becoming
+    /// catalog identity.
     fn is_primary_source_file(self, path: &Path) -> bool {
         match self {
             Self::Grok => {
                 path.file_name().and_then(|name| name.to_str()) == Some("chat_history.jsonl")
+            }
+            Self::Cursor => {
+                path.ancestors()
+                    .nth(2)
+                    .and_then(|dir| dir.file_name())
+                    .and_then(|name| name.to_str())
+                    == Some("agent-transcripts")
             }
             Self::Gemini => path
                 .ancestors()

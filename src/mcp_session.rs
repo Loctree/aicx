@@ -362,11 +362,11 @@ fn parse_optional_agent(agent: Option<&str>) -> Result<Option<AgentKind>, Sessio
             SessionSurfaceError::invalid(
                 "invalid_agent",
                 format!(
-                    "unknown agent `{value}`; expected claude, codex, gemini, junie, grok, or kimi"
+                    "unknown agent `{value}`; expected claude, codex, gemini, junie, grok, kimi, or cursor"
                 ),
                 json!({
                     "agent": value,
-                    "expected": ["claude", "codex", "gemini", "junie", "grok", "kimi"],
+                    "expected": ["claude", "codex", "gemini", "junie", "grok", "kimi", "cursor"],
                 }),
             )
         }),
@@ -754,6 +754,7 @@ fn guess_user_home(source: &Path, agent: AgentKind) -> PathBuf {
         AgentKind::Grok => ".grok",
         AgentKind::Junie => ".junie",
         AgentKind::Kimi => ".kimi-code",
+        AgentKind::Cursor => ".cursor",
     };
     let mut current = source;
     while let Some(parent) = current.parent() {

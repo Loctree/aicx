@@ -142,6 +142,7 @@ pub fn extract_agent_sessions(
         crate::session_catalog::AgentKind::Grok => home.join(".grok"),
         crate::session_catalog::AgentKind::Junie => home.join(".junie").join("sessions"),
         crate::session_catalog::AgentKind::Kimi => home.join(".kimi-code").join("sessions"),
+        crate::session_catalog::AgentKind::Cursor => home.join(".cursor").join("projects"),
     };
     if !root.is_dir() {
         // No session root means this agent has never written a session on
@@ -389,6 +390,7 @@ const fn parser_agent(agent: crate::session_catalog::AgentKind) -> aicx_parser::
         crate::session_catalog::AgentKind::Grok => aicx_parser::engine::AgentKind::Grok,
         crate::session_catalog::AgentKind::Junie => aicx_parser::engine::AgentKind::Junie,
         crate::session_catalog::AgentKind::Kimi => aicx_parser::engine::AgentKind::Kimi,
+        crate::session_catalog::AgentKind::Cursor => aicx_parser::engine::AgentKind::Cursor,
     }
 }
 

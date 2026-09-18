@@ -402,6 +402,48 @@ fn scan_matrix_covers_all_agent_header_shapes() {
 }
 
 #[test]
+fn cursor_transcript_identity_lives_on_filename_under_agent_transcripts() {
+    let root = TestRoot::new("cursor-transcript-shape");
+    let project_rel = "Volumes-vc-workspace-vetcoders-vc-frame";
+    root.write(
+        format!("{project_rel}/agent-transcripts/{UUID_A}/{UUID_A}.jsonl"),
+        r#"{"role":"user","message":{"content":[{"type":"text","text":"hej"}]}}
+{"role":"assistant","message":{"content":[{"type":"text","text":"ack"}]}}
+{"type":"turn_ended","status":"success"}
+"#,
+    );
+    // Sibling project material is never a candidate: agent-tools output is a
+    // jsonl OUTSIDE agent-transcripts, repo.json fails the extension filter.
+    root.write(
+        format!("{project_rel}/agent-tools/{UUID_B}.jsonl"),
+        r#"{"tool":"call","output":"noise"}"#,
+    );
+    root.write(format!("{project_rel}/repo.json"), r#"{"repo":"meta"}"#);
+
+    let catalog = SessionCatalog::new(AgentKind::Cursor, root.path()).unwrap();
+    let scanned = catalog.scan_with_stats().result.unwrap();
+    assert_eq!(scanned.len(), 1, "only the agent-transcripts stream admits");
+
+    // Round-trip contract: the transcript filename IS the session id.
+    let resolved = catalog.resolve(UUID_A).unwrap();
+    assert_eq!(resolved.matched_by, MatchKind::ExactSourceId);
+    assert_eq!(resolved.source.source_id, UUID_A);
+    assert!(
+        resolved.source.path.ends_with(format!(
+            "{project_rel}/agent-transcripts/{UUID_A}/{UUID_A}.jsonl"
+        )),
+        "expected transcript stream, got {}",
+        resolved.source.path.display()
+    );
+
+    // The agent-tools jsonl never became identity: its uuid resolves nowhere.
+    assert!(matches!(
+        catalog.resolve(UUID_B),
+        Err(CatalogError::Missing { .. })
+    ));
+}
+
+#[test]
 fn kimi_wire_identity_lives_on_session_dir_scoped_by_lane() {
     let root = TestRoot::new("kimi-wire-shape");
     let session_rel = format!("wd_proj_deadbeef/session_{UUID_A}");
@@ -576,8 +618,9 @@ fn gemini_catalog_admits_only_conversations_under_chats() {
 
 #[test]
 fn agent_kind_exposes_session_roots_and_parser_kinds() {
-    assert_eq!(AgentKind::ALL.len(), 6);
+    assert_eq!(AgentKind::ALL.len(), 7);
     assert_eq!(AgentKind::parse("claude"), Some(AgentKind::Claude));
+    assert_eq!(AgentKind::parse("cursor"), Some(AgentKind::Cursor));
     assert_eq!(
         AgentKind::parse("gemini-antigravity"),
         Some(AgentKind::Gemini)
@@ -595,6 +638,10 @@ fn agent_kind_exposes_session_roots_and_parser_kinds() {
     assert_eq!(
         AgentKind::Kimi.session_root(home),
         home.join(".kimi-code").join("sessions")
+    );
+    assert_eq!(
+        AgentKind::Cursor.session_root(home),
+        home.join(".cursor").join("projects")
     );
     assert_eq!(
         AgentKind::Claude.parser_kind(),
