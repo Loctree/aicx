@@ -270,9 +270,11 @@ impl MixedScopeSession {
         use aicx_parser::engine::AgentKind;
         match self.agent.to_ascii_lowercase().as_str() {
             "codex" => AgentKind::Codex,
+            "cursor" | "cursor-agent" => AgentKind::Cursor,
             "gemini" | "agy" => AgentKind::Gemini,
             "grok" => AgentKind::Grok,
             "junie" => AgentKind::Junie,
+            "kimi" => AgentKind::Kimi,
             _ => AgentKind::Claude,
         }
     }

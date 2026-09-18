@@ -20,6 +20,7 @@ pub const ALLOWED_AGENTS: &[&str] = &[
     "codex",
     "gemini",
     "junie",
+    "kimi",
     "codescribe",
     "operator-md",
 ];
@@ -1038,6 +1039,7 @@ mod tests {
         assert_eq!(safe_agent_name("codex").unwrap(), "codex");
         assert_eq!(safe_agent_name("gemini").unwrap(), "gemini");
         assert_eq!(safe_agent_name("junie").unwrap(), "junie");
+        assert_eq!(safe_agent_name("kimi").unwrap(), "kimi");
         assert_eq!(safe_agent_name("codescribe").unwrap(), "codescribe");
         assert_eq!(safe_agent_name("operator-md").unwrap(), "operator-md");
     }

@@ -364,12 +364,14 @@ fn scan_matrix_covers_all_agent_header_shapes() {
 
     for (agent, stem, content, logical) in fixtures {
         let root = TestRoot::new(agent.as_str());
-        let extension = if agent == AgentKind::Gemini {
-            "json"
+        // Gemini conversations live under `<project>/chats/`; a `.json` at any
+        // other depth is a log or a checkpoint and is not a catalog candidate.
+        let relative = if agent == AgentKind::Gemini {
+            format!("proj/chats/{stem}.json")
         } else {
-            "jsonl"
+            format!("{stem}.jsonl")
         };
-        root.write(format!("{stem}.{extension}"), &content);
+        root.write(relative, &content);
         let catalog = SessionCatalog::new(agent, root.path()).unwrap();
         let resolved = catalog.resolve(logical).unwrap();
         assert_eq!(
@@ -397,6 +399,143 @@ fn scan_matrix_covers_all_agent_header_shapes() {
             .path
             .ends_with(format!("{UUID_A}/chat_history.jsonl"))
     );
+}
+
+#[test]
+fn cursor_transcript_identity_lives_on_filename_under_agent_transcripts() {
+    let root = TestRoot::new("cursor-transcript-shape");
+    let project_rel = "Volumes-vc-workspace-vetcoders-vc-frame";
+    root.write(
+        format!("{project_rel}/agent-transcripts/{UUID_A}/{UUID_A}.jsonl"),
+        r#"{"role":"user","message":{"content":[{"type":"text","text":"hej"}]}}
+{"role":"assistant","message":{"content":[{"type":"text","text":"ack"}]}}
+{"type":"turn_ended","status":"success"}
+"#,
+    );
+    // Sibling project material is never a candidate: agent-tools output is a
+    // jsonl OUTSIDE agent-transcripts, repo.json fails the extension filter.
+    root.write(
+        format!("{project_rel}/agent-tools/{UUID_B}.jsonl"),
+        r#"{"tool":"call","output":"noise"}"#,
+    );
+    root.write(format!("{project_rel}/repo.json"), r#"{"repo":"meta"}"#);
+
+    let catalog = SessionCatalog::new(AgentKind::Cursor, root.path()).unwrap();
+    let scanned = catalog.scan_with_stats().result.unwrap();
+    assert_eq!(scanned.len(), 1, "only the agent-transcripts stream admits");
+
+    // Round-trip contract: the transcript filename IS the session id.
+    let resolved = catalog.resolve(UUID_A).unwrap();
+    assert_eq!(resolved.matched_by, MatchKind::ExactSourceId);
+    assert_eq!(resolved.source.source_id, UUID_A);
+    assert!(
+        resolved.source.path.ends_with(format!(
+            "{project_rel}/agent-transcripts/{UUID_A}/{UUID_A}.jsonl"
+        )),
+        "expected transcript stream, got {}",
+        resolved.source.path.display()
+    );
+
+    // The agent-tools jsonl never became identity: its uuid resolves nowhere.
+    assert!(matches!(
+        catalog.resolve(UUID_B),
+        Err(CatalogError::Missing { .. })
+    ));
+}
+
+#[test]
+fn kimi_wire_identity_lives_on_session_dir_scoped_by_lane() {
+    let root = TestRoot::new("kimi-wire-shape");
+    let session_rel = format!("wd_proj_deadbeef/session_{UUID_A}");
+    root.write(
+        format!("{session_rel}/agents/main/wire.jsonl"),
+        r#"{"type":"metadata","protocol_version":"1.5","created_at":1789296071162}
+{"type":"context.append_message","agentId":"main","message":{"role":"user","content":[{"type":"text","text":"hej"}]},"time":1789296071200}
+"#,
+    );
+    root.write(
+        format!("{session_rel}/agents/agent-0/wire.jsonl"),
+        r#"{"type":"metadata","protocol_version":"1.5","created_at":1789296071162}
+"#,
+    );
+    // Non-conversation material inside the session dir is never a candidate.
+    root.write(
+        format!("{session_rel}/state.json"),
+        r#"{"session":"state"}"#,
+    );
+    root.write(
+        format!("{session_rel}/logs/kimi-code.log"),
+        "2026-09-13 log line",
+    );
+
+    let catalog = SessionCatalog::new(AgentKind::Kimi, root.path()).unwrap();
+    let scanned = catalog.scan_with_stats().result.unwrap();
+    assert_eq!(scanned.len(), 2, "one source per agent lane wire");
+
+    // The bare session uuid resolves exactly to the operator (main) lane.
+    let resolved = catalog.resolve(UUID_A).unwrap();
+    assert_eq!(resolved.matched_by, MatchKind::ExactSourceId);
+    assert_eq!(resolved.source.source_id, UUID_A);
+    assert!(
+        resolved
+            .source
+            .path
+            .ends_with(format!("{session_rel}/agents/main/wire.jsonl")),
+        "expected main lane wire, got {}",
+        resolved.source.path.display()
+    );
+
+    // Subagent lanes keep their own append-only wire under a scoped id.
+    let scoped = format!("{UUID_A}:agent-0");
+    let resolved = catalog.resolve(&scoped).unwrap();
+    assert_eq!(resolved.matched_by, MatchKind::ExactSourceId);
+    assert_eq!(resolved.source.source_id, scoped);
+    assert!(
+        resolved
+            .source
+            .path
+            .ends_with(format!("{session_rel}/agents/agent-0/wire.jsonl")),
+        "expected subagent lane wire, got {}",
+        resolved.source.path.display()
+    );
+}
+
+#[test]
+fn junie_session_identity_lives_on_session_dir() {
+    let root = TestRoot::new("junie-session-shape");
+    let session_id = "260917-071328-172v";
+    let session_rel = format!("session-{session_id}");
+    root.write(
+        format!("{session_rel}/events.jsonl"),
+        r#"{"type":"event","timestamp":"2026-09-17T07:13:28Z","payload":{"kind":"session.start"}}
+{"type":"event","timestamp":"2026-09-17T07:13:29Z","payload":{"kind":"user.message","text":"hej"}}
+"#,
+    );
+    // Sibling material in the session dir is never a candidate (.md extension).
+    root.write(format!("{session_rel}/transcript.md"), "# transcript\n");
+
+    let catalog = SessionCatalog::new(AgentKind::Junie, root.path()).unwrap();
+    let scanned = catalog.scan_with_stats().result.unwrap();
+    assert_eq!(scanned.len(), 1, "one source per junie session dir");
+
+    // Round-trip contract: the bare id every catalog surface prints resolves
+    // exactly, without any `session-` prefix archaeology.
+    let resolved = catalog.resolve(session_id).unwrap();
+    assert_eq!(resolved.matched_by, MatchKind::ExactSourceId);
+    assert_eq!(resolved.source.source_id, session_id);
+    assert!(
+        resolved
+            .source
+            .path
+            .ends_with(format!("{session_rel}/events.jsonl")),
+        "expected session events stream, got {}",
+        resolved.source.path.display()
+    );
+
+    // The prefixed directory name stays paste-friendly as a filename alias.
+    let resolved = catalog.resolve(&session_rel).unwrap();
+    assert_eq!(resolved.matched_by, MatchKind::ExactFilenameAlias);
+    assert_eq!(resolved.source.source_id, session_id);
 }
 
 #[test]
@@ -431,9 +570,60 @@ fn hot_window_scan_probes_only_fresh_candidates() {
 }
 
 #[test]
+fn gemini_catalog_admits_only_conversations_under_chats() {
+    // Real `~/.gemini/tmp/<project>/` layout, measured 2026-09-10: 365 of 397
+    // JSON files were conversations under `chats/` (top-level `session-*.json`
+    // and resumed `chats/<uuid>/<id>.json`); the other 32 were `logs.json`,
+    // checkpoints, extraction state and formatted context living next to
+    // `chats/`. None of those 32 is a session, and every one of them used to
+    // reach the adapter only to be refused as `unknown_payload_type`.
+    let root = TestRoot::new("gemini-chats-only");
+    let session = |id: &str| {
+        format!(
+            r#"{{"sessionId":"{id}","startTime":"2026-03-09T19:37:43.121Z","lastUpdated":"2026-03-09T19:40:00.000Z","messages":[{{"type":"user","content":"hi"}}]}}"#
+        )
+    };
+    let top_level = "proj/chats/session-2026-03-09T19-37-aaaa1111.json";
+    let nested = format!("proj/chats/{UUID_B}/8a8cyl.json");
+    root.write(top_level, &session(UUID_A));
+    root.write(&nested, &session("8a8cyl"));
+    root.write(
+        "proj/logs.json",
+        r#"[{"sessionId":"x","messageId":1,"type":"user","message":"hi","timestamp":"2026-03-09T19:37:43.121Z"}]"#,
+    );
+    root.write("proj/checkpoint-pr-544-p1.json", "[]");
+    root.write("proj/.extraction-state.json", "{}");
+    root.write("proj/formatted_context.json", "{}");
+    root.write("proj/notes.jsonl", "{\"sessionId\":\"not-a-chat\"}\n");
+
+    let catalog = SessionCatalog::new(AgentKind::Gemini, root.path()).unwrap();
+    let scanned = catalog.scan_with_stats_and_progress(|_| {}).result.unwrap();
+    // Catalog paths are validated (canonical); the temp root may be a symlink
+    // alias of the same directory, so compare under the canonical root.
+    let canonical_root = root.path().canonicalize().unwrap();
+    let mut relative: Vec<String> = scanned
+        .iter()
+        .map(|source| {
+            source
+                .path
+                .strip_prefix(&canonical_root)
+                .unwrap()
+                .to_string_lossy()
+                // Catalog paths are OS-native; the expectation below is
+                // written with `/`, so normalize for Windows.
+                .replace('\\', "/")
+        })
+        .collect();
+    relative.sort();
+    assert_eq!(relative, vec![nested, top_level.to_string()]);
+}
+
+#[test]
 fn agent_kind_exposes_session_roots_and_parser_kinds() {
-    assert_eq!(AgentKind::ALL.len(), 5);
+    assert_eq!(AgentKind::ALL.len(), 7);
     assert_eq!(AgentKind::parse("claude"), Some(AgentKind::Claude));
+    assert_eq!(AgentKind::parse("cursor"), Some(AgentKind::Cursor));
+    assert_eq!(AgentKind::parse("cursor-agent"), Some(AgentKind::Cursor));
     assert_eq!(
         AgentKind::parse("gemini-antigravity"),
         Some(AgentKind::Gemini)
@@ -445,11 +635,27 @@ fn agent_kind_exposes_session_roots_and_parser_kinds() {
         home.join(".claude").join("projects")
     );
     assert_eq!(
+        AgentKind::Cursor.session_root(home),
+        home.join(".cursor").join("projects")
+    );
+    assert_eq!(
         AgentKind::Grok.session_root(home),
         home.join(".grok").join("sessions")
     );
     assert_eq!(
+        AgentKind::Kimi.session_root(home),
+        home.join(".kimi-code").join("sessions")
+    );
+    assert_eq!(
+        AgentKind::Cursor.session_root(home),
+        home.join(".cursor").join("projects")
+    );
+    assert_eq!(
         AgentKind::Claude.parser_kind(),
         aicx::parser::engine::AgentKind::Claude
+    );
+    assert_eq!(
+        AgentKind::Cursor.parser_kind(),
+        aicx::parser::engine::AgentKind::Cursor
     );
 }

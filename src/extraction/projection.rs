@@ -116,6 +116,11 @@ impl ProjectionKind {
 /// local twin of this enum.)
 pub use aicx_parser::engine::HumanChannel;
 
+/// Who ran a shell action (Decision 5). Re-exported from the throne for the
+/// same reason as [`HumanChannel`]: the projection must not own a second
+/// definition of an axis the substrate already decided.
+pub use aicx_parser::engine::ShellExecutor;
+
 /// How a retained `ShellAction` result is rendered. The bytes stay in the
 /// substrate regardless of this choice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -162,6 +167,16 @@ pub struct ProjectionSpec {
     pub score: Option<u8>,
     pub dialog: bool,
     pub lineage_depth: Option<usize>,
+    /// Executor axis for `ProjectionKind::ShellAction`. Both executors by
+    /// default: narrowing is what `--user-commands` / `--agent-commands` do.
+    /// An empty vector means "emit no shell action", the same "empty is not
+    /// default" rule `roles` / `kinds` follow.
+    pub shell_executors: Vec<ShellExecutor>,
+}
+
+/// Both executors — the default breadth of the shell-action lane.
+pub fn all_shell_executors() -> Vec<ShellExecutor> {
+    vec![ShellExecutor::Human, ShellExecutor::Agent]
 }
 
 impl Default for ProjectionSpec {
@@ -195,6 +210,7 @@ impl ProjectionSpec {
             score: None,
             dialog: false,
             lineage_depth: None,
+            shell_executors: all_shell_executors(),
         }
     }
 
@@ -223,6 +239,7 @@ impl ProjectionSpec {
             score: None,
             dialog: true,
             lineage_depth: Some(LINEAGE_UNBOUNDED),
+            shell_executors: all_shell_executors(),
         }
     }
 
@@ -243,6 +260,14 @@ impl ProjectionSpec {
             return true;
         }
         false
+    }
+
+    /// Does the spec emit a shell action run by `executor`?
+    ///
+    /// Only consulted for `ProjectionKind::ShellAction` entries; every other
+    /// kind is unaffected by the executor axis.
+    pub fn emits_shell_executor(&self, executor: ShellExecutor) -> bool {
+        self.shell_executors.contains(&executor)
     }
 
     pub fn emits_human_channel(&self, channel: HumanChannel) -> bool {

@@ -345,6 +345,84 @@ fn test_extraction_source_key_is_case_insensitive() {
     );
 }
 
+#[test]
+fn watermark_coverage_follows_the_recording_key_agents() {
+    let agents: &[&str] = &[
+        "claude",
+        "codex",
+        "gemini",
+        "junie",
+        "grok",
+        "kimi",
+        "cursor",
+        "codescribe",
+    ];
+    let project = Vec::new();
+    let key = extraction_source_key(agents, &project);
+    let aliases = extraction_source_key_aliases(agents, &project);
+
+    // No watermark anywhere: nothing is covered.
+    let state = StateManager::default();
+    assert!(watermark_covered_agents(&state, &key, &aliases).is_empty());
+
+    // A watermark recorded under a pre-kimi key covers the incumbents, not
+    // the newcomers — their sources must fall back to the raw cutoff instead
+    // of skipping their whole pre-upgrade history as if already ingested.
+    let mut state = StateManager::default();
+    state.update_watermark(&format!("{LEGACY_ALL_WATERMARK_KEY}:all"), Utc::now());
+    let covered = watermark_covered_agents(&state, &key, &aliases);
+    assert!(covered.contains("claude"));
+    assert!(covered.contains("codescribe"));
+    assert!(!covered.contains("kimi"));
+    assert!(!covered.contains("cursor"));
+
+    // A watermark recorded by the kimi-aware composition covers kimi, but
+    // still not cursor (the newest newcomer).
+    let mut state = StateManager::default();
+    state.update_watermark(&format!("{KIMI_ALL_WATERMARK_KEY}:all"), Utc::now());
+    let covered = watermark_covered_agents(&state, &key, &aliases);
+    assert!(covered.contains("kimi"));
+    assert!(!covered.contains("cursor"));
+
+    // Once the canonical key itself holds a watermark (a run of the current
+    // composition recorded it), every requested agent is covered.
+    let mut state = StateManager::default();
+    state.update_watermark(&key, Utc::now());
+    let covered = watermark_covered_agents(&state, &key, &aliases);
+    assert!(covered.contains("kimi"));
+    assert!(covered.contains("cursor"));
+    assert_eq!(covered.len(), agents.len());
+}
+
+#[test]
+fn watermark_coverage_unions_alias_generations() {
+    // A state file can hold watermarks under more than one legacy
+    // composition; coverage is the union of the agents those keys name.
+    let agents: &[&str] = &[
+        "claude",
+        "codex",
+        "gemini",
+        "junie",
+        "grok",
+        "kimi",
+        "cursor",
+        "codescribe",
+    ];
+    let project = Vec::new();
+    let key = extraction_source_key(agents, &project);
+    let aliases = extraction_source_key_aliases(agents, &project);
+    let mut state = StateManager::default();
+    state.update_watermark("claude+codex+gemini:all", Utc::now());
+    let covered = watermark_covered_agents(&state, &key, &aliases);
+    assert_eq!(
+        covered,
+        ["claude", "codex", "gemini"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>()
+    );
+}
+
 /// Bug #36 regression: prove `aicx index status -p X` and
 /// `aicx index -p X` produce the same bucket set for every canonical
 /// filter shape. Both surfaces must canonicalize through
@@ -683,7 +761,7 @@ fn sessions_list_agent_filter_rejects_typos_at_parse_time() {
         .expect_err("unknown agent must fail parsing");
     assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue);
 
-    for agent in ["claude", "codex", "gemini", "junie"] {
+    for agent in ["claude", "codex", "gemini", "junie", "grok", "kimi"] {
         Cli::try_parse_from(["aicx", "sessions", "list", "--agent", agent])
             .unwrap_or_else(|e| panic!("agent '{agent}' must parse: {e}"));
     }
@@ -2176,14 +2254,56 @@ fn steer_help_stays_short_and_scope_oriented() {
 }
 
 #[test]
-fn top_level_help_hides_legacy_dashboard_and_reports_commands() {
+fn top_level_help_lists_daily_drivers_only() {
     let mut cmd = Cli::command();
     let rendered = cmd.render_long_help().to_string();
 
+    // The one rebuild command and the reader are the front door.
+    assert!(rendered.contains("\n  index "));
+    assert!(rendered.contains("\n  search "));
+    assert!(rendered.contains("aicx index                 # census + incremental parse + publish"));
+    assert!(!rendered.contains("aicx catalog rebuild"));
+
+    // Power-user surfaces move behind --help-full instead of being removed.
+    for hidden in [
+        "catalog",
+        "dashboard",
+        "reports",
+        "intents",
+        "migrate",
+        "claude",
+        "codex",
+    ] {
+        assert!(
+            !rendered.contains(&format!("\n  {hidden} ")),
+            "{hidden} must not appear in the short help"
+        );
+    }
     assert!(!rendered.contains("dashboard-serve"));
     assert!(!rendered.contains("reports-extractor"));
-    assert!(rendered.contains("\n  dashboard "));
-    assert!(rendered.contains("\n  reports "));
+}
+
+#[test]
+fn help_full_reveals_power_user_commands_but_never_legacy_spellings() {
+    let mut cmd = full_help_command();
+    let rendered = cmd.render_long_help().to_string();
+
+    for shown in [
+        "catalog",
+        "dashboard",
+        "reports",
+        "intents",
+        "migrate",
+        "index",
+        "search",
+    ] {
+        assert!(
+            rendered.contains(&format!("\n  {shown} ")),
+            "{shown} must appear in --help-full"
+        );
+    }
+    assert!(!rendered.contains("dashboard-serve"));
+    assert!(!rendered.contains("reports-extractor"));
 }
 
 #[test]
@@ -2647,6 +2767,7 @@ fn extract_every_agent_subcommand_parses() {
         ("gemini", ExtractAgent::Gemini),
         ("grok", ExtractAgent::Grok),
         ("junie", ExtractAgent::Junie),
+        ("kimi", ExtractAgent::Kimi),
     ] {
         let cli = Cli::try_parse_from(["aicx", "extract", name, "--session", "abc12345"])
             .unwrap_or_else(|error| panic!("agent subcommand `{name}` must parse: {error}"));
@@ -2684,16 +2805,43 @@ fn extract_help_hides_removed_flag_grammar() {
         .find_subcommand_mut("extract")
         .expect("extract subcommand should exist");
     let rendered = extract.render_long_help().to_string();
-    for agent in ["codex", "claude", "gemini", "grok", "junie"] {
+    for agent in ["codex", "claude", "gemini", "grok", "junie", "kimi"] {
         assert!(
             rendered.contains(agent),
             "extract --help must list the `{agent}` subcommand"
         );
     }
     assert!(
-        !rendered.contains("--agent") && !rendered.contains("--format"),
+        !offers_removed_flag_grammar(&rendered),
         "removed flag grammar must not appear in extract --help:\n{rendered}"
     );
+}
+
+/// Does `help` offer the removed `--agent <name>` / `--format <name>` flag
+/// grammar?
+///
+/// Token-boundary, not substring: `--agent-only` and `--agent-commands` are
+/// legitimate projection flags in the current grammar, and a bare
+/// `contains("--agent")` would forbid the whole namespace instead of the one
+/// removed spelling this guard exists for.
+fn offers_removed_flag_grammar(help: &str) -> bool {
+    ["--agent", "--format"].iter().any(|flag| {
+        help.match_indices(flag).any(|(index, _)| {
+            let rest = &help[index + flag.len()..];
+            !rest.starts_with('-')
+        })
+    })
+}
+
+#[test]
+fn removed_flag_grammar_guard_distinguishes_longer_flag_names() {
+    assert!(offers_removed_flag_grammar(
+        "  --agent <AGENT>  pick an agent"
+    ));
+    assert!(offers_removed_flag_grammar("--format md"));
+    assert!(!offers_removed_flag_grammar(
+        "--agent-only and --agent-commands select lanes"
+    ));
 }
 
 #[test]
@@ -2983,6 +3131,8 @@ fn direct_file_boundary_rejects_directory_without_output() {
             redact_secrets: false,
             conversation: false,
             projection: ProjectionSpec::default(),
+            brief: false,
+            cutoff: Utc::now(),
         },
     )
     .expect_err("directory input must be rejected before parser dispatch");

@@ -33,15 +33,19 @@ pub enum AgentKind {
     Gemini,
     Junie,
     Grok,
+    Kimi,
+    Cursor,
 }
 
 impl AgentKind {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 7] = [
         Self::Claude,
         Self::Codex,
         Self::Gemini,
         Self::Junie,
         Self::Grok,
+        Self::Kimi,
+        Self::Cursor,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -51,6 +55,8 @@ impl AgentKind {
             Self::Gemini => "gemini",
             Self::Junie => "junie",
             Self::Grok => "grok",
+            Self::Kimi => "kimi",
+            Self::Cursor => "cursor",
         }
     }
 
@@ -61,6 +67,8 @@ impl AgentKind {
             "gemini" | "gemini-antigravity" => Some(Self::Gemini),
             "junie" => Some(Self::Junie),
             "grok" => Some(Self::Grok),
+            "kimi" => Some(Self::Kimi),
+            "cursor" | "cursor-agent" => Some(Self::Cursor),
             _ => None,
         }
     }
@@ -73,6 +81,8 @@ impl AgentKind {
             Self::Gemini => home.join(".gemini").join("tmp"),
             Self::Grok => home.join(".grok").join("sessions"),
             Self::Junie => home.join(".junie").join("sessions"),
+            Self::Kimi => home.join(".kimi-code").join("sessions"),
+            Self::Cursor => home.join(".cursor").join("projects"),
         }
     }
 
@@ -83,25 +93,73 @@ impl AgentKind {
             Self::Gemini => aicx_parser::engine::AgentKind::Gemini,
             Self::Grok => aicx_parser::engine::AgentKind::Grok,
             Self::Junie => aicx_parser::engine::AgentKind::Junie,
+            Self::Kimi => aicx_parser::engine::AgentKind::Kimi,
+            Self::Cursor => aicx_parser::engine::AgentKind::Cursor,
         }
     }
 
     fn accepts_extension(self, extension: Option<&str>) -> bool {
         match self {
             Self::Gemini => matches!(extension, Some("json" | "jsonl")),
-            Self::Claude | Self::Codex | Self::Junie | Self::Grok => extension == Some("jsonl"),
+            Self::Claude | Self::Codex | Self::Junie | Self::Grok | Self::Kimi | Self::Cursor => {
+                extension == Some("jsonl")
+            }
         }
     }
 
     /// Grok session dirs carry multiple JSONL streams (chat, events, updates,
     /// hunks, rewind). Only `chat_history.jsonl` is conversation content;
     /// telemetry streams must not become catalog identity.
+    ///
+    /// Gemini CLI keeps a conversation only under `<project>/chats/`: either
+    /// `chats/session-*.json[l]` or, for resumed sessions, `chats/<uuid>/<id>.json`.
+    /// The same project directory also holds `logs.json`, `checkpoint-*.json`,
+    /// `.extraction-state.json` and `formatted_context.json`, which are JSON but
+    /// were never a session. Measured on a real tree (2026-09-10) they were 32
+    /// of 397 candidates and every one of them reached the adapter as an
+    /// `unknown_payload_type` refusal. Discovery decides here, by shape of the
+    /// path, so the adapter is never asked about them.
+    ///
+    /// Kimi session dirs hold one `wire.jsonl` per agent lane
+    /// (`session_<uuid>/agents/<agentId>/wire.jsonl`) plus non-conversation
+    /// material (`state.json`, `logs/`, `tasks/`, `file-history/`). Only the
+    /// per-lane wire file is a session source.
+    ///
+    /// Cursor project dirs hold the conversation only under
+    /// `agent-transcripts/<uuid>/<uuid>.jsonl`; siblings (`agent-tools/`,
+    /// `terminals/`, `repo.json`, `worker.log`) are never a session. The
+    /// shape check keeps any future non-transcript `.jsonl` from becoming
+    /// catalog identity.
     fn is_primary_source_file(self, path: &Path) -> bool {
         match self {
             Self::Grok => {
                 path.file_name().and_then(|name| name.to_str()) == Some("chat_history.jsonl")
             }
-            _ => true,
+            Self::Cursor => {
+                let stem_owns_session_dir = path
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .zip(
+                        path.parent()
+                            .and_then(|dir| dir.file_name())
+                            .and_then(|name| name.to_str()),
+                    )
+                    .is_some_and(|(stem, dir)| stem == dir);
+                stem_owns_session_dir
+                    && path
+                        .ancestors()
+                        .nth(2)
+                        .and_then(|dir| dir.file_name())
+                        .and_then(|name| name.to_str())
+                        == Some("agent-transcripts")
+            }
+            Self::Gemini => path
+                .ancestors()
+                .skip(1)
+                .take(2)
+                .any(|dir| dir.file_name().and_then(|name| name.to_str()) == Some("chats")),
+            Self::Kimi => path.file_name().and_then(|name| name.to_str()) == Some("wire.jsonl"),
+            Self::Claude | Self::Codex | Self::Junie => true,
         }
     }
 }
@@ -493,9 +551,42 @@ impl SessionCatalog {
                     } else {
                         None
                     }
+                })
+                .or_else(|| {
+                    // Kimi layout: `…/wd_<slug>_<hex>/session_<uuid>/agents/<agentId>/wire.jsonl`.
+                    // The session uuid lives three directories up and every lane
+                    // shares it, so the main lane claims the bare uuid while
+                    // subagent lanes take the scoped `<uuid>:<agentId>` form —
+                    // an ExactSourceId query for the session uuid lands on the
+                    // operator conversation, never ambiguous across lanes.
+                    (self.agent == AgentKind::Kimi)
+                        .then(|| kimi_source_identity(&path))
+                        .flatten()
+                })
+                .or_else(|| {
+                    // Junie layout: `…/sessions/session-<id>/events.jsonl`. The
+                    // session id lives on the parent directory behind a
+                    // `session-` prefix, and the bare `<id>` is what junie
+                    // tooling and `aicx sessions list` print — so it must
+                    // resolve as ExactSourceId (round-trip contract: every id
+                    // the catalog surface prints is accepted back).
+                    (self.agent == AgentKind::Junie)
+                        .then(|| junie_source_identity(&path))
+                        .flatten()
                 });
             if let Some(ref uuid) = filename_uuid {
                 filename_aliases.push(uuid.clone());
+            }
+            if self.agent == AgentKind::Junie
+                && let Some(session_dir) = path
+                    .parent()
+                    .and_then(|parent| parent.file_name())
+                    .and_then(|name| name.to_str())
+                    .filter(|name| name.starts_with("session-"))
+                    .and_then(validate_identity)
+            {
+                // The prefixed directory name stays a paste-friendly alias.
+                filename_aliases.push(session_dir);
             }
             dedupe_ordered(&mut filename_aliases);
             if filename_aliases.is_empty() {
@@ -904,6 +995,42 @@ fn uuid_from_filename(stem: &str) -> Option<&str> {
             .get(boundary)
             .is_some_and(|byte| matches!(*byte, b'-' | b'_' | b'.')))
     .then_some(suffix)
+}
+
+/// Physical source identity for a Kimi `wire.jsonl`: the session uuid from
+/// the `session_<uuid>` grandparent directory, scoped by the agent lane from
+/// the parent directory. `agents/main` is the operator conversation and owns
+/// the bare uuid; every other lane keeps its own append-only wire and gets
+/// the `<uuid>:<agentId>` identity.
+/// Physical source identity for a Junie session stream: the `<id>` from the
+/// `session-<id>` parent directory. Junie addresses sessions by that bare id
+/// (its own directory prefix is decoration), so the catalog resolves it as
+/// ExactSourceId instead of demanding an id no surface ever prints.
+fn junie_source_identity(path: &Path) -> Option<String> {
+    let session_dir = path.parent()?.file_name()?.to_str()?;
+    validate_identity(session_dir.strip_prefix("session-")?)
+}
+
+fn kimi_source_identity(path: &Path) -> Option<String> {
+    // `…/wd_<slug>_<hex>/session_<uuid>/agents/<agentId>/wire.jsonl` — the
+    // session uuid lives three directories up, behind a mandatory `agents/`
+    // level that separates the operator lane (`main`) from subagent lanes.
+    let agent_dir = path.parent()?.file_name()?.to_str()?;
+    let agents_dir = path.parent()?.parent()?.file_name()?.to_str()?;
+    if agents_dir != "agents" {
+        return None;
+    }
+    let session_dir = path.parent()?.parent()?.parent()?.file_name()?.to_str()?;
+    let uuid = session_dir.strip_prefix("session_")?;
+    if !is_uuid(uuid) || validate_identity(agent_dir).is_none_or(|id| id != agent_dir) {
+        return None;
+    }
+    let uuid = uuid.to_ascii_lowercase();
+    if agent_dir == "main" {
+        Some(uuid)
+    } else {
+        Some(format!("{uuid}:{agent_dir}"))
+    }
 }
 
 fn is_uuid(value: &str) -> bool {

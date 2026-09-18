@@ -126,17 +126,39 @@ fn top_level_help_drops_layer_1_jargon_and_store_command() {
         .args(["--help"])
         .output()
         .expect("run aicx --help");
-
     let stdout = String::from_utf8_lossy(&output.stdout);
-    // Top-level help shows the short description for each subcommand. The
-    // current extraction/catalog set must not show the bare
-    // "(layer 1)" jargon — they should use a plain or "canonical corpus
-    // extraction" phrasing instead.
-    //
-    // We grep line-by-line for the subcommand row and assert no "(layer 1)"
-    // suffix is present on it.
+
+    // The short help is the front door: one rebuild command, the reader, and
+    // the daily drivers. Extractors and catalog internals live behind
+    // --help-full so a newcomer is not told to run two commands where one does.
+    for hidden in ["all", "claude", "codex", "catalog"] {
+        assert!(
+            !stdout
+                .lines()
+                .any(|line| line.trim_start().starts_with(&format!("{hidden} "))),
+            "power-user command `{hidden}` must not appear in the short `aicx --help`:\n{stdout}"
+        );
+    }
+    assert!(
+        stdout.contains("aicx index                 # census + incremental parse + publish"),
+        "quick start must name `aicx index` as the one rebuild command:\n{stdout}"
+    );
+
+    let output = Command::new(&bin)
+        .args(["--help-full"])
+        .output()
+        .expect("run aicx --help-full");
+    assert!(
+        output.status.success(),
+        "aicx --help-full exited non-zero: {}",
+        output.status
+    );
+    let full = String::from_utf8_lossy(&output.stdout);
+    // Full help shows the short description for each subcommand. The
+    // extraction/catalog set must not show the bare "(layer 1)" jargon —
+    // they should use a plain or "canonical corpus extraction" phrasing.
     for cmd in ["all", "claude", "codex", "catalog"] {
-        let line = stdout
+        let line = full
             .lines()
             .find(|line| {
                 line.trim_start().starts_with(&format!("{cmd} "))
@@ -145,7 +167,7 @@ fn top_level_help_drops_layer_1_jargon_and_store_command() {
             })
             .unwrap_or_else(|| {
                 panic!(
-                    "could not find row for subcommand `{cmd}` in `aicx --help` output:\n{stdout}"
+                    "could not find row for subcommand `{cmd}` in `aicx --help-full` output:\n{full}"
                 )
             });
         assert!(
@@ -153,10 +175,12 @@ fn top_level_help_drops_layer_1_jargon_and_store_command() {
             "subcommand `{cmd}` row still mentions `(layer 1)` jargon: {line}"
         );
     }
-    assert!(
-        !stdout
-            .lines()
-            .any(|line| line.trim_start().starts_with("store ")),
-        "retired `store` command must not return to primary help"
-    );
+    for rendered in [&stdout, &full] {
+        assert!(
+            !rendered
+                .lines()
+                .any(|line| line.trim_start().starts_with("store ")),
+            "retired `store` command must not return to any help"
+        );
+    }
 }

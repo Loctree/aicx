@@ -348,6 +348,11 @@ fn claude_rich_session_models_blocks_tools_usage_segments() {
         assert_eq!(refs[0].physical_ordinal, refs[1].physical_ordinal);
     }
 
+    // A Bash tool_use surfaces its verbatim `input.command` as the turn
+    // body — the shell-action projection renders it as `$ cargo test [...]`.
+    // An empty body here regresses every extract to `$ ` (2026-09-17 hak).
+    assert_eq!(model.turns[3].text, "cargo test");
+
     // Tool pair correlated by tool_use id, result resolves the tool name.
     assert_eq!(model.tool_events.len(), 2);
     let call = &model.tool_events[0];

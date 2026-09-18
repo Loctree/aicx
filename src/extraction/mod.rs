@@ -21,7 +21,16 @@ pub use crate::timeline::{
     CollapseStubKind, ConversationMessage, ExtractionConfig, MessageKind, SourceInfo, TimelineEntry,
 };
 
+/// `extract --brief` rendering over the distill layer (W2-01).
+pub mod brief;
+/// Bulk `extract all` bookkeeping: a CLI surface, absent from the slim
+/// `loctree-consumer` profile (it reaches the `app`-gated session catalog).
+#[cfg(feature = "app")]
+pub mod bulk;
 pub mod conversation;
+/// Per-agent lane distillation contract (W0) — projection layer over the
+/// parsed session model; see `docs/DISTILL_CONTRACT.md`.
+pub mod distill;
 pub mod files;
 mod importer_support;
 pub mod list;
@@ -132,6 +141,8 @@ pub fn extract_agent_sessions(
         crate::session_catalog::AgentKind::Gemini => home.join(".gemini").join("tmp"),
         crate::session_catalog::AgentKind::Grok => home.join(".grok"),
         crate::session_catalog::AgentKind::Junie => home.join(".junie").join("sessions"),
+        crate::session_catalog::AgentKind::Kimi => home.join(".kimi-code").join("sessions"),
+        crate::session_catalog::AgentKind::Cursor => home.join(".cursor").join("projects"),
     };
     if !root.is_dir() {
         // No session root means this agent has never written a session on
@@ -195,9 +206,32 @@ pub fn extract_agent_sessions(
                 batch
                     .ingested_session_ids
                     .insert(session.model().session_id.clone());
-                batch
-                    .entries
-                    .extend(crate::output::timeline_entries_from_model(session.model()));
+                let mut session_entries =
+                    crate::output::timeline_entries_from_model(session.model());
+                // Transports with no in-band wall clock (cursor without a
+                // harness <timestamp> wrapper) project UNIX_EPOCH entries,
+                // which the cutoff/watermark retain below would delete in
+                // full — a "CompleteVisible parse, zero output" lie. Fall
+                // back to the source file's mtime and say so. Cursor only:
+                // other transports carry their own clocks, and an UNIX_EPOCH
+                // entry there is a genuinely unknown timestamp that the
+                // cutoff/watermark semantics must keep treating as unknown.
+                let cursor_wallclock_fallback =
+                    matches!(agent, crate::session_catalog::AgentKind::Cursor);
+                if let Some(mtime) =
+                    datetime_from_unix_nanos(source.fingerprint.modified_unix_nanos)
+                        .filter(|_| cursor_wallclock_fallback)
+                {
+                    for entry in &mut session_entries {
+                        if entry.timestamp == DateTime::<Utc>::UNIX_EPOCH
+                            && entry.timestamp_source.as_deref() == Some("unknown")
+                        {
+                            entry.timestamp = mtime;
+                            entry.timestamp_source = Some("file_mtime".to_string());
+                        }
+                    }
+                }
+                batch.entries.extend(session_entries);
             }
             Err(error) => {
                 if first_refusal.is_none() {
@@ -336,6 +370,16 @@ fn session_matches_project_filter(
         .any(|cwd| project_filter_matches_path(cwd, filters))
 }
 
+/// Source-file mtime as a UTC instant; `None` for a zero/overflowed stamp.
+fn datetime_from_unix_nanos(nanos: u128) -> Option<DateTime<Utc>> {
+    if nanos == 0 {
+        return None;
+    }
+    let secs = i64::try_from(nanos / 1_000_000_000).ok()?;
+    let subsec = (nanos % 1_000_000_000) as u32;
+    DateTime::<Utc>::from_timestamp(secs, subsec)
+}
+
 #[cfg(feature = "app")]
 fn source_is_selected(modified_unix_nanos: u128, config: &ExtractionConfig) -> bool {
     let lower_bound = config.watermark.unwrap_or(config.cutoff);
@@ -345,8 +389,13 @@ fn source_is_selected(modified_unix_nanos: u128, config: &ExtractionConfig) -> b
     modified_unix_nanos > lower_bound_nanos
 }
 
+/// Is this failure the signature of a source still being written?
+///
+/// Shared with the bulk pass: an actively-appended JSONL whose last line is a
+/// half-written record is not a broken source, and reporting it as one would
+/// train operators to ignore real failures.
 #[cfg(feature = "app")]
-fn is_in_flight_failure(modified_unix_nanos: u128, error: &str) -> bool {
+pub fn is_in_flight_failure(modified_unix_nanos: u128, error: &str) -> bool {
     if !error.contains("Fatal completeness") {
         return false;
     }
@@ -370,9 +419,11 @@ const fn parser_agent(agent: crate::session_catalog::AgentKind) -> aicx_parser::
     match agent {
         crate::session_catalog::AgentKind::Claude => aicx_parser::engine::AgentKind::Claude,
         crate::session_catalog::AgentKind::Codex => aicx_parser::engine::AgentKind::Codex,
+        crate::session_catalog::AgentKind::Cursor => aicx_parser::engine::AgentKind::Cursor,
         crate::session_catalog::AgentKind::Gemini => aicx_parser::engine::AgentKind::Gemini,
         crate::session_catalog::AgentKind::Grok => aicx_parser::engine::AgentKind::Grok,
         crate::session_catalog::AgentKind::Junie => aicx_parser::engine::AgentKind::Junie,
+        crate::session_catalog::AgentKind::Kimi => aicx_parser::engine::AgentKind::Kimi,
     }
 }
 

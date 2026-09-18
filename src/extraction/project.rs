@@ -282,7 +282,7 @@ pub fn repo_labels_from_entries(
 /// Strategy: git repo root dirname → cwd dirname → "unknown".
 pub fn detect_project_name() -> String {
     // Try git repo root
-    if let Ok(output) = std::process::Command::new("git")
+    if let Ok(output) = crate::git_env::git_command_isolated()
         .args(["rev-parse", "--show-toplevel"])
         .output()
         && output.status.success()

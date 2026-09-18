@@ -1430,7 +1430,8 @@ pub(crate) fn check_continuity_freshness(base: &Path) -> CheckResult {
                 "{hot_sources} live source(s) in 24h window, but index lag pending_chunks={pending} sessions_newer_than_chunks={newer}"
             ),
             recommendation: Some(
-                "Run `aicx catalog rebuild --with-chunks` or `aicx index` so continuity is not census-blind".to_string(),
+                "Run `aicx index` (census + incremental parse; only changed sessions are re-read)"
+                    .to_string(),
             ),
         };
     }

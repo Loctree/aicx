@@ -1,0 +1,67 @@
+[
+  {
+    "schema": "aicx.distill.segment_distillate.v1",
+    "agent": "codex",
+    "segment_id": 0,
+    "scope_status": "no_drift_observed",
+    "decision_candidates": [],
+    "gates": [],
+    "open_questions": [],
+    "handoff_signals": [],
+    "outcome": {
+      "agent_outcome": "unknown",
+      "ending": null
+    }
+  },
+  {
+    "schema": "aicx.distill.segment_distillate.v1",
+    "agent": "codex",
+    "segment_id": 1,
+    "scope_status": "no_drift_observed",
+    "decision_candidates": [],
+    "gates": [
+      {
+        "command": "cargo check --workspace",
+        "outcome": "unknown",
+        "evidence": {
+          "segment_id": 1,
+          "turn_idx": 67,
+          "timestamp": "2026-08-03T23:07:16.687Z"
+        }
+      },
+      {
+        "command": "cargo clippy --workspace --all-targets -- -D warnings",
+        "outcome": "unknown",
+        "evidence": {
+          "segment_id": 1,
+          "turn_idx": 71,
+          "timestamp": "2026-08-03T23:07:44.925Z"
+        }
+      },
+      {
+        "command": "cargo test --workspace",
+        "outcome": "unknown",
+        "evidence": {
+          "segment_id": 1,
+          "turn_idx": 73,
+          "timestamp": "2026-08-03T23:07:48.089Z"
+        }
+      }
+    ],
+    "open_questions": [],
+    "handoff_signals": [
+      {
+        "text": "Audyt zakończony. [Pełny raport decyzyjny](/Users/polyversai/.vibecrafted/artifacts/vetcoders/codescribe/2026_0804/reports/research/2026-08-04_codex_przeprowad-obiektywny-oparty_report.md).\n\nNajważniejszy werdykt: **Codescribe nie jest obecnie gotowy do płatnego publicznego launchu w żadnym z trzech kanałów.** Jest blisko kontrolowanego, bezpłatnego pilota przez notarized DMG.\n\nRekomendowana kolejność:\n\n1. Direct DMG → zamknięty pilot.\n2. Płatny direct launch po domknięciu artefaktu, aktualizacji, płatności i funnelu.\n3. Product Hunt dopiero po potwierdzonej aktywacji i pierwszych zakupach.\n4. Mac App Store później, wyłącznie jako osobny, ograniczony Basic SKU.\n\nNajmocniejsze dowody:\n\n- Najnowszy lokalny DMG 0.13.2 jest prawidłowo podpisany, notarized i zaakceptowany przez Gatekeepera, ale nie zawiera wymaganego payloadu MiniLM. **Nie wolno go publikować.**\n- Publiczny release, źródło i strona pokazują różne wersje; lokalny link strony do 0.13.2 zwraca 404.\n- Pipeline release nie stanowi dziś wiarygodnego authority: ostatnie tagowe runy zawiodły, repo nie ma wymaganych sekretów.\n- Brakuje produkcyjnego updatera, checkoutu/licencji, mierzalnej aktywacji oraz kompletnego Privacy/Terms/Support.\n- Pełny Codescribe jest funkcjonalnie niezgodny z App Sandbox; App Store wymagałby osobnego produktu.\n- Product Hunt nie naprawi niesprawnego lejka ani artefaktu — może jedynie skumulować uwagę wokół gotowego funnelu.\n\nBramki źródłowe są zielone: workspace check, Clippy z `-D warnings`, pełne testy, Semgrep oraz check/build strony przeszły. Raport zawiera macierz go/no-go, P0/P1/P2, 30-dniowy harmonogram, social plan, funnel `8000 → 400 → 100 → 60 → 12`, segment początkowy, komunikat wartości oraz źródła pierwotne z oddzieleniem faktów od hipotez.\n\nRepo pozostało nietknięte; wcześniejsze zmiany w trzech plikach są nadal obecne. Nie powstał commit, ponieważ `vc-research` był audytem read-only, a jedynym trwałym wynikiem jest raport.\n\n<oai-mem-citation>\n<citation_entries>\nMEMORY.md:150-160|note=[prior artifact audit sequence and payload regression clue]\nrollout_summaries/2026-07-30T23-41-33-JLjE-codescribe_0132_slim_dmg_missing_minilm_regression.md:19-36|note=[historical 0.13.2 payload evidence reverified against current artifact]\n</citation_entries>\n<rollout_ids>\n019fb567-99c0-7091-8131-39a9b370a0c6\n</rollout_ids>\n</oai-mem-citation>",
+        "evidence": {
+          "segment_id": 1,
+          "turn_idx": 132,
+          "timestamp": "2026-08-03T23:18:03.142Z"
+        }
+      }
+    ],
+    "outcome": {
+      "agent_outcome": "unknown",
+      "ending": "interrupted"
+    }
+  }
+]

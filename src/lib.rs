@@ -56,6 +56,7 @@ pub mod extraction;
 #[cfg(not(feature = "app"))]
 #[allow(dead_code, unused_imports)]
 mod extraction;
+pub mod git_env;
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
 pub mod hf_cache;
 #[cfg(feature = "app")]
