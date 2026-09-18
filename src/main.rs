@@ -6351,14 +6351,15 @@ fn run_extract_target(agent: ExtractAgent, args: ExtractAgentArgs) -> Result<()>
         (None, Some(file)) => {
             // Same default as `--session`: without -o the extract lands in the
             // central store, `<AICX_HOME>/extracts/<agent>/<source_id>[…].md`,
-            // keyed by the file's own identity (stem, or the Grok session-dir
-            // UUID). An explicit -o keeps direct-file mode free of any global
-            // AICX state, which the C7H compact-recall contract relies on.
+            // keyed by the file's own identity (stem plus a short path hash,
+            // or the Grok session-dir UUID). An explicit -o keeps direct-file
+            // mode free of any global AICX state, which the C7H compact-recall
+            // contract relies on.
             let output = match args.output {
                 Some(path) => path,
                 None => default_session_extract_path_for(
                     agent.label(),
-                    &direct_source_id(agent, &file),
+                    &default_output_source_id(agent, &file),
                     options.conversation,
                     !options.include_assistant,
                 )?,
@@ -7056,6 +7057,31 @@ fn direct_source_id(agent: ExtractAgent, input: &Path) -> String {
             .unwrap_or("direct-source")
             .to_string()
     })
+}
+
+/// Central-store identity for `--file` without `-o`. The direct source id is
+/// a bare file stem for non-Grok inputs, so two different files with the same
+/// stem (`/tmp/foo/session.jsonl`, `/tmp/bar/session.jsonl`) would map to the
+/// same central-store path and the later run would silently overwrite the
+/// earlier extract. Suffix a short stable hash of the canonical path so
+/// distinct files keep distinct extracts while re-extracting the same file
+/// still lands on the same path. Grok's session-dir UUID is already unique
+/// and stays unsuffixed.
+fn default_output_source_id(agent: ExtractAgent, input: &Path) -> String {
+    if let Some(uuid) = grok_direct_source_id(agent, input) {
+        return uuid;
+    }
+    let stem = direct_source_id(agent, input);
+    let canonical = input.canonicalize().unwrap_or_else(|_| input.to_path_buf());
+    // FNV-1a, folded to 32 bits: stable across releases and platforms,
+    // unlike `DefaultHasher`.
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in canonical.as_os_str().as_encoded_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    let short = (hash as u32) ^ ((hash >> 32) as u32);
+    format!("{stem}-{short:08x}")
 }
 
 fn grok_direct_source_id(agent: ExtractAgent, path: &Path) -> Option<String> {

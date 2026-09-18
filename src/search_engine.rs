@@ -2765,7 +2765,9 @@ fn semantic_quality_score(query: &str, result: &FuzzyResult) -> u8 {
         // An agent reply that actually explains the subject (causal answer
         // markers, real length) must be able to clear the operator's common
         // `--score 60` threshold even without a decision marker — otherwise
-        // any shouted header outranks the best genuine answer forever.
+        // any shouted header outranks the best genuine answer forever. The
+        // floor sits at 65, not 60, to clear that threshold with margin
+        // while staying below the full-coverage floor of 70 above.
         calibrated.max(65)
     } else {
         calibrated

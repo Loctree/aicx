@@ -824,8 +824,13 @@ fn caps_header_is_invariant(candidate: &str) -> bool {
         .is_some_and(|token| token.trim_end_matches(['*', '_', '`']).ends_with(':'));
     header_shaped
         && !caps.iter().any(|token| {
+            // `trim_subject_token` keeps `:` (and thus any emphasis glued to
+            // it): `**IMPORTANT**:` arrives here as `IMPORTANT**:`. Strip the
+            // colon first, then leftover Markdown emphasis, so shouted headers
+            // stay generic even when they are bold/italic/code-fenced.
             let word = trim_subject_token(token)
                 .trim_end_matches(':')
+                .trim_matches(['*', '_', '`'])
                 .to_ascii_uppercase();
             GENERIC_CAPS.contains(&word.as_str())
         })
@@ -1910,6 +1915,13 @@ mod swap_tests {
         assert_ne!(
             classify_lexical_evidence("TODO NOTE: rewrite the cursor adapter warning lane"),
             LexicalEvidenceClass::ExplicitInvariant
+        );
+        // Markdown emphasis glued to the colon must not smuggle a generic
+        // caps token past the filter (`IMPORTANT**` != `IMPORTANT`).
+        assert_ne!(
+            classify_lexical_evidence("**IMPORTANT NOTE**: remember to rerun the index census"),
+            LexicalEvidenceClass::ExplicitInvariant,
+            "emphasized generic caps headers are not durable doctrine"
         );
         // Caps headers without the `:` header shape are not invariants either.
         assert_ne!(

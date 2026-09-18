@@ -347,8 +347,9 @@ fn direct_file_mode_defaults_to_central_extracts() {
     let file_arg = rollout.display().to_string();
 
     // Without -o the extract lands in the central store under the file's own
-    // identity, exactly where `--session` would put it — still without
-    // touching the catalog.
+    // identity — the stem plus a short path hash, so two different files with
+    // the same stem never overwrite each other — exactly where `--session`
+    // would put it, still without touching the catalog.
     let output = run_extract(&home, &["extract", "codex", "--file", &file_arg]);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -359,15 +360,23 @@ fn direct_file_mode_defaults_to_central_extracts() {
         stderr.contains("catalog_files_opened=0"),
         "default-output mode must not touch the catalog:\n{stderr}"
     );
-    let default_path = home
-        .join(".aicx")
-        .join("extracts")
-        .join("codex")
-        .join("standalone-rollout.md");
+    let extracts_dir = home.join(".aicx").join("extracts").join("codex");
+    let central_names = |dir: &std::path::Path| -> Vec<String> {
+        fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .filter_map(|entry| entry.ok())
+                    .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let names = central_names(&extracts_dir);
     assert!(
-        default_path.is_file(),
-        "expected central extract at {}",
-        default_path.display()
+        names
+            .iter()
+            .any(|name| name.starts_with("standalone-rollout-") && name.ends_with(".md")),
+        "expected central extract named after the file identity, found: {names:?}"
     );
     // The two output axes stay distinct on disk, as for `--session`.
     let output = run_extract(
@@ -382,9 +391,39 @@ fn direct_file_mode_defaults_to_central_extracts() {
         ],
     );
     assert!(output.status.success());
+    let names = central_names(&extracts_dir);
     assert!(
-        home.join(".aicx/extracts/codex/standalone-rollout_conversation_user.md")
-            .is_file()
+        names
+            .iter()
+            .any(|name| name.starts_with("standalone-rollout-")
+                && name.ends_with("_conversation_user.md")),
+        "expected conversation/user extract alongside the full one, found: {names:?}"
+    );
+    // Re-extracting the same file lands on the same identity (no new file);
+    // a different file with the same stem lands on a different one.
+    let count_full = names
+        .iter()
+        .filter(|name| name.ends_with(".md") && !name.contains("_conversation"))
+        .count();
+    assert_eq!(
+        count_full, 1,
+        "same input must reuse its extract: {names:?}"
+    );
+    let twin = home.join("twin").join("standalone-rollout.jsonl");
+    write_file(&twin, &rollout_fixture(SESSION_UUID));
+    let output = run_extract(
+        &home,
+        &["extract", "codex", "--file", &twin.display().to_string()],
+    );
+    assert!(output.status.success());
+    let names = central_names(&extracts_dir);
+    let count_full = names
+        .iter()
+        .filter(|name| name.ends_with(".md") && !name.contains("_conversation"))
+        .count();
+    assert_eq!(
+        count_full, 2,
+        "same-stem file from another directory must not overwrite: {names:?}"
     );
     let _ = fs::remove_dir_all(&home);
 }

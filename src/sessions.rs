@@ -228,10 +228,16 @@ fn grok_dir_matches_cwd(encoded_dir_name: &str, want: &str) -> bool {
 /// it is `\`-separated (e.g. `C:\Users\x\Compass`) and a `/`-only split would
 /// return the whole path as the "label" instead of the trailing segment.
 fn project_label_from_cwd(cwd: &str) -> Option<String> {
-    if let Some(label) = repo_label_from_disk(Path::new(cwd)) {
+    let path = Path::new(cwd);
+    if let Some(label) = repo_label_from_disk(path) {
         return Some(label);
     }
-    if let Some(label) = worktree_layout_label(cwd) {
+    // Path-shape heuristics only apply to cwds that do not exist on this
+    // host; an existing non-git directory keeps its own last segment even
+    // when the path happens to contain a `worktrees` component.
+    if !path.is_dir()
+        && let Some(label) = worktree_layout_label(cwd)
+    {
         return Some(label);
     }
     cwd.trim_end_matches(['/', '\\'])
@@ -3267,6 +3273,15 @@ mod tests {
         assert_eq!(
             project_label_from_cwd("/no/such/repo/worktrees/task-dir"),
             Some("repo".to_string())
+        );
+        // An EXISTING non-git directory keeps its own last segment even when
+        // the path contains a `worktrees` component — the layout heuristic is
+        // reserved for paths that do not exist on this host.
+        let plain = root.join("stash").join("worktrees").join("plain-dir");
+        fs::create_dir_all(&plain).unwrap();
+        assert_eq!(
+            project_label_from_cwd(&plain.to_string_lossy()),
+            Some("plain-dir".to_string())
         );
         let _ = fs::remove_dir_all(&root);
     }

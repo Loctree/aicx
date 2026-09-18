@@ -75,6 +75,10 @@ else
       RUST_TOUCHED=1
     fi
   done <"$ref_input"
+  # Deliberate exception to the unconditional manifest/format/semgrep policy
+  # above: a delete-only push transfers no commits, so there is no tree state
+  # to validate — the gates would only re-check whatever happens to sit in the
+  # local worktree, which the push does not publish.
   if [ "$REF_LINES" -gt 0 ] && [ "$REF_LINES" -eq "$DELETE_LINES" ]; then
     echo "Ref deletion only ($DELETE_LINES ref(s)) -> nothing to validate."
     exit 0
