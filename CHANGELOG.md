@@ -5,6 +5,54 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
+## [0.14.0] - 2026-09-18
+
+### Cursor is a first-class agent lane
+
+The parser kernel had a finished Cursor adapter (`cursor-transcript-v1`)
+that nothing in the binary used. It is now wired end-to-end: catalog
+discovery under `~/.cursor/projects/<slug>/agent-transcripts/<uuid>/<uuid>.jsonl`
+(strict shape — sibling IDE/state JSONL never becomes catalog identity),
+`extract cursor`, `sessions list`, index census with cursor-aware watermark
+generation and alias migration, MCP, and diagnostics. The parked PR #73
+campaign was absorbed with authorship preserved: encoded-space cwd pruning,
+slug round-trip discovery, the `cursor-agent` alias, honest project
+attribution with worktree labels, `cursor_e2e`, and git-env isolation.
+
+- Project labels: the fleet worktree-layout heuristic
+  (`…/<repo>/<stamp>/worktrees/<task>`) now applies only to cwds that do
+  not exist on this host; an existing non-git directory keeps its own
+  last path segment.
+
+### Distill: `extract --brief` and decision retrieval
+
+- `extract --brief` renders an inverted-pyramid handoff of a session.
+- card.v3 index materialization and `search --kind decision`.
+- Shouted request headers (`**FINAL ACTIVE REQUEST:**`, `TODO NOTE:` …)
+  no longer score as explicit invariants — including when Markdown
+  emphasis is glued to the colon — so genuine causal answers outrank
+  process chatter.
+
+### Round-trip fixes
+
+- Junie: the id printed by `sessions list` now resolves in
+  `extract junie --session` (identity lives on the `session-<id>/`
+  directory); regression-tested against a live repro (0 → 565 entries).
+- `extract <agent> --file` without `-o` lands in the central store under
+  the file stem plus a short stable hash of the canonical path, so two
+  different files with the same stem never overwrite each other's
+  extract; re-extracting the same file reuses its path.
+- `sessions list` duplicate-row regression caught and fixed before
+  release.
+
+### CI
+
+- Release workflow: hosted signing with isolated GNUPGHOME, portable
+  base64, enumerated secret-file permissions, and npm publish via OIDC
+  trusted publishers (PR #76).
+- Rust code coverage reporting via cargo-llvm-cov on the Linux lane
+  (PR #75).
+
 ## [0.13.1] - 2026-09-13
 
 ### A Gemini session is no longer lost because one tool result was large
