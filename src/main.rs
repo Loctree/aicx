@@ -2875,7 +2875,7 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
                     json,
                     aicx::cli::failure::StructuredFailure::new(
                         "missing_agent_subcommand",
-                        "extract requires a target: all | codex | claude | gemini | grok | junie",
+                        "extract requires a target: all | codex | claude | cursor | gemini | grok | junie | kimi",
                         "rerun as `aicx extract all`, `aicx extract codex --session <id> --conversation`, or `aicx extract codex --file <path> --conversation -o <path>`",
                     )
                     .with_fallback("aicx extract all"),

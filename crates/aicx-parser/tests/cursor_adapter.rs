@@ -196,8 +196,14 @@ fn unknown_payload_is_skipped_visible_not_panic() {
 
 /// Walk-around: parse a full live Cursor transcript when present on this
 /// machine. Absence is not a failure — CI does not carry operator stores.
+/// Explicitly opt-in (`AICX_WALKAROUND_LIVE=1`): a live read prints real
+/// conversation previews to stderr, which must never leak into local or CI
+/// logs from a default test run.
 #[test]
 fn walk_around_live_own_session_if_present() {
+    if std::env::var_os("AICX_WALKAROUND_LIVE").is_none() {
+        return;
+    }
     let path = std::path::PathBuf::from(env!("HOME")).join(
         ".cursor/projects/Users-polyversai-vibecrafted-worktrees-vetcoders-vibecrafted-2026-0829-cursor-260829/agent-transcripts/e1789670-9ae3-4e58-8d2d-9becef7add4a/e1789670-9ae3-4e58-8d2d-9becef7add4a.jsonl",
     );

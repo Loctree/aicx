@@ -442,17 +442,11 @@ def run_all(cases: list[Case]) -> None:
             "--",
             "--exact",
         ),
-        "cursor_minimal": (
-            "cargo",
-            "test",
-            "-p",
-            "aicx-parser",
-            "--test",
-            "cursor_adapter",
-            "cursor_native_golden_matches_reviewed_fixture",
-            "--",
-            "--exact",
-        ),
+        # Cursor native-golden case intentionally absent: no reviewed
+        # expected-envelope fixture exists yet, so a mapping here would be
+        # dead (no manifest case) and would fail the moment one was added.
+        # Adding `cursor_minimal` means fixture + expected.json + manifest
+        # case + `cursor_native_golden_matches_reviewed_fixture` together.
     }
     for case in native_cases:
         command = native_tests.get(case.id)

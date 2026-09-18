@@ -237,7 +237,7 @@ fn extract_without_agent_subcommand_emits_structured_failure() {
         "missing_agent_subcommand",
         // `all` joined the target list; the kind stays stable so consumers
         // that branch on it are unaffected.
-        "extract requires a target: all | codex | claude | gemini | grok | junie",
+        "extract requires a target: all | codex | claude | cursor | gemini | grok | junie | kimi",
         "aicx extract codex --session <id> --conversation",
     );
 }

@@ -31,6 +31,7 @@ impl AgentKind {
             "gemini" | "gemini-antigravity" => Some(Self::Gemini),
             "junie" => Some(Self::Junie),
             "grok" => Some(Self::Grok),
+            "kimi" => Some(Self::Kimi),
             _ => None,
         }
     }

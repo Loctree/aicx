@@ -12,6 +12,7 @@
 use super::{
     AdapterError, AgentAdapter, ClassifiedDisposition, ClassifiedUnit, RawUnitLevel, sealed,
 };
+use crate::engine::frames::{self, FrameClass, TransportFrame, TransportKind, TransportPayload};
 use crate::engine::{
     AgentKind, BoundaryFlags, ConsumedUnit, CoverageReport, CoverageWarning, Known, ParseStatus,
     Provenance, ProviderConversationRef, RawUnitRef, Segment, SessionModel, SkippedReason,
@@ -440,6 +441,24 @@ fn push_speech_turn(role: TurnRole, text: &str, evidence: &RawUnitRef, analysis:
 }
 
 fn push_tool_call(name: &str, body: String, evidence: &RawUnitRef, analysis: &mut Analysis) {
+    // A `tool_use` block is the agent's own tool lane; route it through the
+    // shared frame taxonomy so the executor axis (`--agent-commands`) can
+    // prove who ran it — a class-less shell action is dropped whenever a
+    // specific executor is requested.
+    let classified = frames::classify(&TransportFrame {
+        agent: AgentKind::Cursor,
+        transport_kind: TransportKind::AgentToolCall,
+        timestamp: Known::unknown(),
+        payload: TransportPayload::Shell {
+            command: body.clone(),
+            result: String::new(),
+        },
+        evidence: evidence.clone(),
+    });
+    let frame_class = match classified.class {
+        class @ FrameClass::ShellAction { .. } => Some(class),
+        _ => None,
+    };
     let turn_idx = analysis.turns.len() as u64;
     analysis.turns.push(Turn {
         turn_idx,
@@ -452,7 +471,7 @@ fn push_tool_call(name: &str, body: String, evidence: &RawUnitRef, analysis: &mu
         tool_name: Known::value(name.to_owned()),
         segment_id: 0,
         raw_unit_refs: vec![evidence.clone()],
-        frame_class: None,
+        frame_class,
     });
     analysis.tools.push(ToolEvent {
         kind: ToolEventKind::Call,
