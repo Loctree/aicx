@@ -299,6 +299,9 @@ impl Default for LaneRegistry {
     }
 }
 
+/// card.v3 materialization for the index document (W2-02) — not a lane.
+pub mod materialize;
+
 // W1 append zone — one `pub mod <agent>_lane;` per worker, added below this
 // line without touching the shared contract above.
 pub mod claude_lane;

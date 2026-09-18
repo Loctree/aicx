@@ -1925,8 +1925,10 @@ enum Commands {
         #[command(flatten)]
         filters: RetrievalFilters,
 
-        /// Filter by indexed document kind: conversations, plans, reports, other.
-        #[arg(long, value_parser = ["conversations", "conversation", "plans", "plan", "reports", "report", "other"])]
+        /// Filter by indexed document kind: conversations, plans, reports,
+        /// other — or a distilled card.v3 axis: `decision` (documents whose
+        /// session distilled at least one decision candidate).
+        #[arg(long, value_parser = ["conversations", "conversation", "plans", "plan", "reports", "report", "other", "decision", "decisions"])]
         kind: Option<String>,
 
         /// Search passages inside one catalog session instead of ranking sessions.
@@ -9500,6 +9502,15 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
     if evidence && no_semantic {
         anyhow::bail!("search --evidence requires semantic search; remove --no-semantic");
     }
+    // card.v3 distill axes bypass the document-class vocabulary: they
+    // translate to flat metadata scalars the index materializes (W2-02).
+    let distill_kind = matches!(kind, Some("decision" | "decisions"));
+    if distill_kind {
+        eprintln!(
+            "search: --kind decision selects card.v3 documents (has_decisions=true);              documents indexed before the distill cut are v2 and invisible on this axis —              coverage grows incrementally with `aicx index` (see distill line in its report)"
+        );
+    }
+    let kind = if distill_kind { None } else { kind };
     let kind_filter = kind.and_then(aicx::timeline::Kind::parse);
     // Extract inline date hints from query if no explicit --date given
     let (effective_query, inline_date) = if date.is_none() {
@@ -9560,7 +9571,11 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
             limit,
             &scopes,
             filters.frame_kind.map(Into::into),
-            kind_filter.map(|kind| kind.dir_name()),
+            if distill_kind {
+                Some("distill:decision")
+            } else {
+                kind_filter.map(|kind| kind.dir_name())
+            },
             &index_filters,
         ) {
             Ok(filtered) => {
@@ -10049,6 +10064,10 @@ fn run_index(
             report.raw_frames, report.signal_frames, report.filtered_frames
         );
         eprintln!("  extracts_written: {}", report.extracts_written);
+        eprintln!(
+            "  distill (card.v3): {} doc(s) materialized this run; reused docs stay v2 until re-parsed",
+            report.distill_docs
+        );
         eprintln!(
             "  dense: kind={} docs={}",
             report.dense_kind, report.dense_docs

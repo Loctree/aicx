@@ -178,6 +178,7 @@ aicx extract codex --session <id> --conversation --result full   # whole retaine
 aicx extract codex --session <id> --lineage                      # walk session_meta.forked_from_id parents (unbounded)
 aicx extract codex --session <id> --lineage=1                    # at most one parent
 aicx extract claude --session <id> --brief                       # distilled handoff brief: outcome → decisions → gates → open questions, per segment
+aicx search "watermark" --kind decision -p Loctree/aicx          # card.v3 axis: only sessions that distilled a decision candidate
 aicx extract codex --session <id> --kind human,echo_seal         # throne kinds only
 aicx extract codex --session <id> --kind inter_agent             # inter-agent lane (never rendered as assistant)
 aicx extract codex --session <id> -H 6 --conversation            # window on the view (0 = unbounded, the default)

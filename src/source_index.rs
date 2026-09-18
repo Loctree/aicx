@@ -52,6 +52,11 @@ pub struct SourceIndexReport {
     pub signal_frames: usize,
     pub filtered_frames: usize,
     pub extracts_written: usize,
+    /// Documents this run materialized with the card.v3 distill block
+    /// (W2-02). Reused cached extracts stay v2 until re-parsed, so this is
+    /// the incremental coverage delta, not the corpus total.
+    #[serde(default)]
+    pub distill_docs: usize,
     pub lexical_docs: usize,
     /// Dense vectors published when `semantic` was requested; 0 for lexical-only.
     #[serde(default)]
@@ -295,6 +300,7 @@ pub fn build_with_reporter(
             signal_frames: 0,
             filtered_frames: 0,
             extracts_written: 0,
+            distill_docs: 0,
             lexical_docs: crate::vector_index::current_lexical_doc_count()?.unwrap_or(0),
             dense_docs,
             dense_kind,
@@ -316,6 +322,7 @@ pub fn build_with_reporter(
     let mut signal_frames = 0usize;
     let mut filtered_frames = 0usize;
     let mut extracts_written = 0usize;
+    let mut distill_docs = 0usize;
     let mut skipped_by_agent = BTreeMap::new();
     let mut next_state = SourceParseState {
         schema: PARSE_STATE_SCHEMA.to_string(),
@@ -379,8 +386,8 @@ pub fn build_with_reporter(
                 continue;
             }
         };
-        let mut frames = match parse_catalog_source(entry, &source_path, &source_allow) {
-            Ok(frames) => frames,
+        let parsed_source = match parse_catalog_source(entry, &source_path, &source_allow) {
+            Ok(parsed) => parsed,
             Err(error) => {
                 crate::diagnostics::log_describe(&format!(
                     "source_index_skip agent={} session_id={} path={} error={error:#}",
@@ -393,6 +400,10 @@ pub fn build_with_reporter(
                 continue;
             }
         };
+        let ParsedCatalogSource {
+            mut frames,
+            distill,
+        } = parsed_source;
         sources_parsed += 1;
         let raw_count = frames.len();
         raw_frames += raw_count;
@@ -434,7 +445,7 @@ pub fn build_with_reporter(
             .project
             .clone()
             .unwrap_or_else(|| "_unknown".to_string());
-        let metadata = serde_json::json!({
+        let mut metadata = serde_json::json!({
             "source_path": indexed_path.to_string_lossy(),
             "project": project,
             "agent": entry.agent,
@@ -447,6 +458,13 @@ pub fn build_with_reporter(
             "source_catalog_path": entry.source_path,
             "preview_lines": extract_preview_lines(&frames),
         });
+        if let Some(distill) = &distill {
+            // card.v3 (W2-02): distill block + flat filter scalars. Reused
+            // cached extracts skip this branch, so their documents stay v2
+            // until re-parsed — incremental coverage, reported not faked.
+            distill.merge_into(&mut metadata);
+            distill_docs += 1;
+        }
         chunks.push(aicx_retrieve::ChunkRef {
             id: format!("{}:{}", entry.agent, entry.session_id),
             source_path: indexed_path.display().to_string(),
@@ -561,6 +579,7 @@ pub fn build_with_reporter(
         signal_frames,
         filtered_frames,
         extracts_written,
+        distill_docs,
         lexical_docs: chunks.len(),
         dense_docs,
         dense_kind,
@@ -842,7 +861,7 @@ fn read_session_document(aicx_home: &Path, entry: &CatalogEntry) -> Result<Sessi
                 entry.agent, entry.session_id
             )
         })?;
-    let mut frames = parse_catalog_source(entry, &source_path, &source_allow)?;
+    let mut frames = parse_catalog_source(entry, &source_path, &source_allow)?.frames;
     frames.sort_by_key(|frame| frame.timestamp);
     frames.retain(is_signal_frame);
     for frame in &mut frames {
@@ -933,11 +952,20 @@ fn merge_context_spans(
     spans
 }
 
+/// One parsed catalog source: the signal timeline plus, when the source went
+/// through the full session parser, the card.v3 distillate materialization
+/// (W2-02). Signal-only fast paths (vibecrafted transcripts, oversized codex
+/// rollouts) carry no model, so they stay v2-coverage — reported, not faked.
+struct ParsedCatalogSource {
+    frames: Vec<TimelineEntry>,
+    distill: Option<crate::extraction::distill::materialize::IndexDistillate>,
+}
+
 fn parse_catalog_source(
     entry: &CatalogEntry,
     path: &Path,
     allow: &crate::source_path::SourceAllowlist,
-) -> Result<Vec<TimelineEntry>> {
+) -> Result<ParsedCatalogSource> {
     // Canonicalize + prove containment under approved source roots before any open.
     let path = allow
         .resolve_file(path)
@@ -952,36 +980,45 @@ fn parse_catalog_source(
         // `{"type":"thought","data":"The"}` spam over real operator answers.
         let message = vibecrafted_signal_body(&body);
         if message.trim().is_empty() {
-            return Ok(Vec::new());
+            return Ok(ParsedCatalogSource {
+                frames: Vec::new(),
+                distill: None,
+            });
         }
         let timestamp = fs::metadata(&path)
             .ok()
             .and_then(|metadata| metadata.modified().ok())
             .map(chrono::DateTime::<chrono::Utc>::from)
             .unwrap_or_else(chrono::Utc::now);
-        return Ok(vec![TimelineEntry {
-            timestamp,
-            agent: entry.agent.clone(),
-            session_id: entry.session_id.clone(),
-            role: "assistant".to_string(),
-            message,
-            frame_class: None,
-            lineage_origin: None,
-            frame_kind: Some(FrameKind::AgentReply),
-            branch: None,
-            cwd: entry.cwd.clone(),
-            timestamp_source: Some("source_mtime".to_string()),
-            source_path: Some(entry.source_path.clone()),
-            source_sha256: None,
-            source_line_span: None,
-        }]);
+        return Ok(ParsedCatalogSource {
+            distill: None,
+            frames: vec![TimelineEntry {
+                timestamp,
+                agent: entry.agent.clone(),
+                session_id: entry.session_id.clone(),
+                role: "assistant".to_string(),
+                message,
+                frame_class: None,
+                lineage_origin: None,
+                frame_kind: Some(FrameKind::AgentReply),
+                branch: None,
+                cwd: entry.cwd.clone(),
+                timestamp_source: Some("source_mtime".to_string()),
+                source_path: Some(entry.source_path.clone()),
+                source_sha256: None,
+                source_line_span: None,
+            }],
+        });
     }
 
     let source_bytes = fs::metadata(&path)
         .with_context(|| format!("stat source {}", path.display()))?
         .len();
     if entry.agent == "codex" && source_bytes > MAX_FULL_PARSE_BYTES {
-        return parse_large_codex_signal(entry, &path, allow);
+        return Ok(ParsedCatalogSource {
+            frames: parse_large_codex_signal(entry, &path, allow)?,
+            distill: None,
+        });
     }
     if source_bytes > MAX_FULL_PARSE_BYTES {
         anyhow::bail!(
@@ -1006,7 +1043,14 @@ fn parse_catalog_source(
         entry.logical_session_id.clone(),
         &path,
     )?;
-    Ok(crate::output::timeline_entries_from_model(parsed.model()))
+    let distillates = crate::extraction::distill::materialize::session_distillates(parsed.model());
+    let distill = Some(crate::extraction::distill::materialize::index_metadata(
+        &distillates,
+    ));
+    Ok(ParsedCatalogSource {
+        frames: crate::output::timeline_entries_from_model(parsed.model()),
+        distill,
+    })
 }
 
 /// Read one cataloged session through the same allowlisted, signal-only parser
@@ -1042,7 +1086,7 @@ pub(crate) fn read_catalog_conversation_at(
                 entry.agent, entry.session_id
             )
         })?;
-    let mut frames = parse_catalog_source(entry, &source_path, &source_allow)?;
+    let mut frames = parse_catalog_source(entry, &source_path, &source_allow)?.frames;
     frames.sort_by_key(|frame| frame.timestamp);
     frames.retain(is_signal_frame);
     for frame in &mut frames {

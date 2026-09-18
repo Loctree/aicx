@@ -2029,10 +2029,21 @@ fn hybrid_filters(filters: SemanticRetrievalFilters<'_>) -> aicx_retrieve::Filte
         );
     }
     if let Some(kind) = filters.kind {
-        set.values.insert(
-            "kind".to_string(),
-            serde_json::Value::String(kind.to_string()),
-        );
+        if kind == "distill:decision" {
+            // card.v3 distill axis (W2-02): filter on the flat scalar the
+            // index materializer stamps; documents indexed before the
+            // distill cut carry no scalar and are invisible here — that is
+            // the reported v2 gap, closed incrementally by reindexing.
+            set.values.insert(
+                "has_decisions".to_string(),
+                serde_json::Value::String("true".to_string()),
+            );
+        } else {
+            set.values.insert(
+                "kind".to_string(),
+                serde_json::Value::String(kind.to_string()),
+            );
+        }
     }
     if let Some(frame_kind) = filters.frame_kind {
         set.values.insert(
