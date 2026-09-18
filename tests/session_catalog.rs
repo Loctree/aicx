@@ -459,6 +459,44 @@ fn kimi_wire_identity_lives_on_session_dir_scoped_by_lane() {
 }
 
 #[test]
+fn junie_session_identity_lives_on_session_dir() {
+    let root = TestRoot::new("junie-session-shape");
+    let session_id = "260917-071328-172v";
+    let session_rel = format!("session-{session_id}");
+    root.write(
+        format!("{session_rel}/events.jsonl"),
+        r#"{"type":"event","timestamp":"2026-09-17T07:13:28Z","payload":{"kind":"session.start"}}
+{"type":"event","timestamp":"2026-09-17T07:13:29Z","payload":{"kind":"user.message","text":"hej"}}
+"#,
+    );
+    // Sibling material in the session dir is never a candidate (.md extension).
+    root.write(format!("{session_rel}/transcript.md"), "# transcript\n");
+
+    let catalog = SessionCatalog::new(AgentKind::Junie, root.path()).unwrap();
+    let scanned = catalog.scan_with_stats().result.unwrap();
+    assert_eq!(scanned.len(), 1, "one source per junie session dir");
+
+    // Round-trip contract: the bare id every catalog surface prints resolves
+    // exactly, without any `session-` prefix archaeology.
+    let resolved = catalog.resolve(session_id).unwrap();
+    assert_eq!(resolved.matched_by, MatchKind::ExactSourceId);
+    assert_eq!(resolved.source.source_id, session_id);
+    assert!(
+        resolved
+            .source
+            .path
+            .ends_with(format!("{session_rel}/events.jsonl")),
+        "expected session events stream, got {}",
+        resolved.source.path.display()
+    );
+
+    // The prefixed directory name stays paste-friendly as a filename alias.
+    let resolved = catalog.resolve(&session_rel).unwrap();
+    assert_eq!(resolved.matched_by, MatchKind::ExactFilenameAlias);
+    assert_eq!(resolved.source.source_id, session_id);
+}
+
+#[test]
 fn hot_window_scan_probes_only_fresh_candidates() {
     let root = TestRoot::new("hot-window");
     root.write(

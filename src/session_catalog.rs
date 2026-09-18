@@ -532,9 +532,31 @@ impl SessionCatalog {
                     (self.agent == AgentKind::Kimi)
                         .then(|| kimi_source_identity(&path))
                         .flatten()
+                })
+                .or_else(|| {
+                    // Junie layout: `…/sessions/session-<id>/events.jsonl`. The
+                    // session id lives on the parent directory behind a
+                    // `session-` prefix, and the bare `<id>` is what junie
+                    // tooling and `aicx sessions list` print — so it must
+                    // resolve as ExactSourceId (round-trip contract: every id
+                    // the catalog surface prints is accepted back).
+                    (self.agent == AgentKind::Junie)
+                        .then(|| junie_source_identity(&path))
+                        .flatten()
                 });
             if let Some(ref uuid) = filename_uuid {
                 filename_aliases.push(uuid.clone());
+            }
+            if self.agent == AgentKind::Junie
+                && let Some(session_dir) = path
+                    .parent()
+                    .and_then(|parent| parent.file_name())
+                    .and_then(|name| name.to_str())
+                    .filter(|name| name.starts_with("session-"))
+                    .and_then(validate_identity)
+            {
+                // The prefixed directory name stays a paste-friendly alias.
+                filename_aliases.push(session_dir);
             }
             dedupe_ordered(&mut filename_aliases);
             if filename_aliases.is_empty() {
@@ -950,6 +972,15 @@ fn uuid_from_filename(stem: &str) -> Option<&str> {
 /// the parent directory. `agents/main` is the operator conversation and owns
 /// the bare uuid; every other lane keeps its own append-only wire and gets
 /// the `<uuid>:<agentId>` identity.
+/// Physical source identity for a Junie session stream: the `<id>` from the
+/// `session-<id>` parent directory. Junie addresses sessions by that bare id
+/// (its own directory prefix is decoration), so the catalog resolves it as
+/// ExactSourceId instead of demanding an id no surface ever prints.
+fn junie_source_identity(path: &Path) -> Option<String> {
+    let session_dir = path.parent()?.file_name()?.to_str()?;
+    validate_identity(session_dir.strip_prefix("session-")?)
+}
+
 fn kimi_source_identity(path: &Path) -> Option<String> {
     // `…/wd_<slug>_<hex>/session_<uuid>/agents/<agentId>/wire.jsonl` — the
     // session uuid lives three directories up, behind a mandatory `agents/`
