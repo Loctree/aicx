@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use crate::legacy_archive::{self};
 use crate::session_catalog::{
     self, AgentKind, CatalogError, CatalogIoStats, CatalogSource, ScopedChildIdentity,
-    SessionCatalog, SourceFingerprint,
+    SessionCatalog, SourceFingerprint, is_uuid,
 };
 
 pub const CATALOG_DIRNAME: &str = "catalog";
@@ -994,7 +994,7 @@ fn recommendations_for(readiness: CatalogReadiness, counts: &StalenessCounts) ->
 fn multi_host_notes(by_machine: &BTreeMap<String, usize>, counts: &StalenessCounts) -> Vec<String> {
     let mut notes = vec![
         "Catalog discovers only local agent source roots on the host running rebuild/status.".into(),
-        "Alternative store drop dirs are not scanned; put JSONL under ~/.claude/projects, ~/.codex/sessions, ~/.gemini/tmp, ~/.grok/sessions, ~/.junie/sessions, ~/.kimi-code/sessions, or ~/.vibecrafted/control_plane/runtime_runs.".into(),
+        "Alternative store drop dirs are not scanned; put JSONL under ~/.claude/projects, ~/.codex/sessions, ~/.cursor/projects, ~/.gemini/tmp, ~/.grok/sessions, ~/.junie/sessions, ~/.kimi-code/sessions, or ~/.vibecrafted/control_plane/runtime_runs.".into(),
         "AICX_HOME / [storage].home relocates the whole home (catalog+index+extracts), not a second session intake path.".into(),
         "Dense indexes are model+dimension locked. Laptop 0.6b vectors must not merge into the owner's 8b CURRENT — lexical Tantivy can be rebuilt on the owner host from shared sources.".into(),
         "Remote agents: `aicx serve --transport http` with Bearer token (not OAuth). Prefer one index owner and point remotes at its streamable HTTP + embedder URL.".into(),
@@ -1114,7 +1114,13 @@ fn is_primary_catalog_source(agent: AgentKind, path: &Path) -> bool {
                 .parent()
                 .and_then(|dir| dir.file_name())
                 .and_then(|name| name.to_str());
-            has_transcripts_component && stem.is_some() && stem == parent
+            // The layout contract is `<uuid>/<same uuid>.jsonl` — without the
+            // UUID shape check a state file like `metadata/metadata.jsonl`
+            // would acquire session identity and get indexed/extracted.
+            has_transcripts_component
+                && stem.is_some()
+                && stem == parent
+                && stem.is_some_and(is_uuid)
         }
         _ => true,
     }
@@ -1870,6 +1876,26 @@ mod tests {
             grok_session_id_from_path(path).as_deref(),
             Some("019f5407-5b0c-7363-b210-1093f26a41f7")
         );
+    }
+
+    #[test]
+    fn cursor_catalog_requires_uuid_transcript_identity() {
+        let legit = Path::new(
+            "/Users/test/.cursor/projects/proj/agent-transcripts/\
+             019f5407-5b0c-7363-b210-1093f26a41f7/019f5407-5b0c-7363-b210-1093f26a41f7.jsonl",
+        );
+        assert!(is_primary_catalog_source(AgentKind::Cursor, legit));
+        // State files that happen to mirror their parent dir name must not
+        // acquire session identity (Copilot review on PR #81).
+        let state_file = Path::new(
+            "/Users/test/.cursor/projects/proj/agent-transcripts/metadata/metadata.jsonl",
+        );
+        assert!(!is_primary_catalog_source(AgentKind::Cursor, state_file));
+        let mismatched = Path::new(
+            "/Users/test/.cursor/projects/proj/agent-transcripts/\
+             019f5407-5b0c-7363-b210-1093f26a41f7/other.jsonl",
+        );
+        assert!(!is_primary_catalog_source(AgentKind::Cursor, mismatched));
     }
 
     #[test]

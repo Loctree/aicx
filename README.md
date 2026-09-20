@@ -58,6 +58,7 @@ First-class roots include:
 - `~/.cursor/projects/*/agent-transcripts/<uuid>/<uuid>.jsonl`
 - `~/.grok/sessions/*/chat_history.jsonl`
 - `~/.gemini/tmp/*/chats/session-*.json`
+- `~/.kimi-code/sessions/**/wire.jsonl`
 - Junie sources
 - Vibecrafted `control_plane/runtime_runs/*/transcript.log`
 - explicit operator markdown and Codescribe imports

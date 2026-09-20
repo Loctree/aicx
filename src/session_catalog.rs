@@ -144,7 +144,7 @@ impl AgentKind {
                             .and_then(|dir| dir.file_name())
                             .and_then(|name| name.to_str()),
                     )
-                    .is_some_and(|(stem, dir)| stem == dir);
+                    .is_some_and(|(stem, dir)| stem == dir && is_uuid(stem));
                 stem_owns_session_dir
                     && path
                         .ancestors()
@@ -1033,7 +1033,7 @@ fn kimi_source_identity(path: &Path) -> Option<String> {
     }
 }
 
-fn is_uuid(value: &str) -> bool {
+pub(crate) fn is_uuid(value: &str) -> bool {
     value.len() == 36
         && value.as_bytes().iter().enumerate().all(|(index, byte)| {
             if matches!(index, 8 | 13 | 18 | 23) {
