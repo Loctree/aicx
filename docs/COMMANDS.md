@@ -133,7 +133,7 @@ not reused while ignore rules are present).
 
 1. **Session JSONL sync** — catalog only discovers files under this host's agent
    roots (`~/.claude/projects`, `~/.codex/sessions`, `~/.cursor/projects`, `~/.gemini/tmp`,
-   `~/.grok/sessions`, `~/.junie/sessions`, `~/.vibecrafted/control_plane/runtime_runs`).
+   `~/.grok/sessions`, `~/.junie/sessions`, `~/.kimi-code/sessions`, `~/.vibecrafted/control_plane/runtime_runs`).
    Drop synced JSONL into those trees, then `catalog status` → `catalog rebuild`.
 2. **No alternate daily store intake** — there is no second "drop folder" for
    sessions. `AICX_HOME` / `[storage].home` relocates the **whole** home

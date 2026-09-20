@@ -35,6 +35,7 @@ the command:
 - `~/.gemini/tmp`
 - `~/.grok/sessions`
 - `~/.junie/sessions`
+- `~/.kimi-code/sessions`
 - `~/.vibecrafted/control_plane/runtime_runs` (transcript identity)
 
 There is **no** alternate session drop directory and no mill-era store intake.

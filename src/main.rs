@@ -7458,7 +7458,7 @@ fn run_extract_session(
                 default_session_extract_path_for_stem(agent.label(), &stem)?
             }
         };
-        return run_extract_brief(&handle, &output);
+        return run_extract_brief(&handle, &output, options.redact_secrets);
     }
 
     let mut entries = parse_selected_source_once(&handle, &options.projection, options.cutoff)?;
@@ -7590,13 +7590,24 @@ fn run_extract_session(
 /// not landed), and write the inverted-pyramid brief. The distillate values
 /// are the same ones the card/index materialization consumes — one
 /// implementation, two consumers (`docs/DISTILL_CONTRACT.md`).
-fn run_extract_brief(handle: &aicx::parser::engine::SourceHandle, output: &Path) -> Result<()> {
+fn run_extract_brief(
+    handle: &aicx::parser::engine::SourceHandle,
+    output: &Path,
+    redact: bool,
+) -> Result<()> {
     let session = aicx::parser_dispatch::parse_handle(handle)?;
     let model = session.into_model();
     let registry = aicx::extraction::distill::LaneRegistry::with_default_lanes();
     let lane = registry.lane_for(model.provenance.agent);
     let distillates = lane.distill(&model);
     let brief = aicx::extraction::brief::render_brief(&model, &distillates);
+    // --brief inherits the default-on redaction contract: the distillate
+    // text must not persist source secrets the timeline path would scrub.
+    let brief = if redact {
+        aicx::redact::redact_secrets(&brief)
+    } else {
+        brief
+    };
     if let Some(parent) = output.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -7641,7 +7652,7 @@ fn run_extract_direct_file(
         );
     }
     if options.brief {
-        return run_extract_brief(&handle, &output_path);
+        return run_extract_brief(&handle, &output_path, options.redact_secrets);
     }
     let parsed = parse_selected_source_with_basis(&handle, &options.projection, options.cutoff)
         .map_err(anyhow::Error::from)?;

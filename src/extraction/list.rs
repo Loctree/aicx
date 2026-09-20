@@ -3,6 +3,7 @@ use super::*;
 use crate::extraction::UNPROTECTED_SOURCE_WARNING;
 use crate::importers::codescribe::CODESCRIBE_AGENT;
 use crate::importers::{discover_codescribe_transcripts, discover_operator_markdown};
+use crate::session_catalog::is_uuid;
 
 const JUNIE_EVENTS_FILENAME: &str = "events.jsonl";
 const KIMI_WIRE_FILENAME: &str = "wire.jsonl";
@@ -306,11 +307,25 @@ pub fn list_available_sources() -> Result<Vec<SourceInfo>> {
         let files: Vec<PathBuf> = walk_jsonl_files(&cursor_projects)
             .into_iter()
             .filter(|path| {
-                path.ancestors()
+                let in_transcripts = path
+                    .ancestors()
                     .nth(2)
                     .and_then(|dir| dir.file_name())
                     .and_then(|name| name.to_str())
-                    == Some("agent-transcripts")
+                    == Some("agent-transcripts");
+                // Same admission contract as the catalog: the file stem must
+                // be the session dir's UUID, or mirrored state files like
+                // metadata/metadata.jsonl would count as Cursor sessions.
+                let stem_owns_uuid_dir = path
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .zip(
+                        path.parent()
+                            .and_then(|dir| dir.file_name())
+                            .and_then(|name| name.to_str()),
+                    )
+                    .is_some_and(|(stem, dir)| stem == dir && is_uuid(stem));
+                in_transcripts && stem_owns_uuid_dir
             })
             .collect();
         let total_size: u64 = files
