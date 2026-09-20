@@ -190,86 +190,208 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 // Small self-contained SHA-256 keeps the frozen identity contract inside the
 // parser crate without adding a runtime process or a new package dependency.
 fn sha256(input: &[u8]) -> [u8; 32] {
-    const INITIAL: [u32; 8] = [
-        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
-        0x5be0cd19,
-    ];
-    const K: [u32; 64] = [
-        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
-        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
-        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
-        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
-        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
-        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
-        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
-        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
-        0xc67178f2,
-    ];
+    let mut stream = Sha256Stream::new();
+    stream.update(input);
+    stream.finalize()
+}
 
-    let bit_len = (input.len() as u64).wrapping_mul(8);
-    let padded_len = (input.len() + 9).div_ceil(64) * 64;
-    let mut padded = Vec::with_capacity(padded_len);
-    padded.extend_from_slice(input);
-    padded.push(0x80);
-    padded.resize(padded_len - 8, 0);
-    padded.extend_from_slice(&bit_len.to_be_bytes());
+const SHA256_INITIAL: [u32; 8] = [
+    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+];
 
-    let mut state = INITIAL;
-    for chunk in padded.chunks_exact(64) {
-        let mut schedule = [0_u32; 64];
-        for (index, word) in chunk.chunks_exact(4).enumerate() {
-            schedule[index] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
-        }
-        for index in 16..64 {
-            let s0 = schedule[index - 15].rotate_right(7)
-                ^ schedule[index - 15].rotate_right(18)
-                ^ (schedule[index - 15] >> 3);
-            let s1 = schedule[index - 2].rotate_right(17)
-                ^ schedule[index - 2].rotate_right(19)
-                ^ (schedule[index - 2] >> 10);
-            schedule[index] = schedule[index - 16]
-                .wrapping_add(s0)
-                .wrapping_add(schedule[index - 7])
-                .wrapping_add(s1);
-        }
+const SHA256_K: [u32; 64] = [
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+];
 
-        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = state;
-        for index in 0..64 {
-            let sigma1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
-            let choice = (e & f) ^ ((!e) & g);
-            let temp1 = h
-                .wrapping_add(sigma1)
-                .wrapping_add(choice)
-                .wrapping_add(K[index])
-                .wrapping_add(schedule[index]);
-            let sigma0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
-            let majority = (a & b) ^ (a & c) ^ (b & c);
-            let temp2 = sigma0.wrapping_add(majority);
-            h = g;
-            g = f;
-            f = e;
-            e = d.wrapping_add(temp1);
-            d = c;
-            c = b;
-            b = a;
-            a = temp1.wrapping_add(temp2);
-        }
-        for (slot, value) in state.iter_mut().zip([a, b, c, d, e, f, g, h]) {
-            *slot = slot.wrapping_add(value);
+/// Incremental SHA-256 over the same frozen implementation [`sha256_hex`]
+/// uses, so a unit's canonical bytes can be hashed as they are produced
+/// (`serde_json::to_writer` into this sink) instead of being materialized
+/// first. A 300 MB nested block should cost one pass, not one copy.
+///
+/// Feeding the same bytes in any chunking yields the digest of the
+/// concatenation; the one-shot [`sha256_hex`] is this stream fed once.
+#[derive(Debug, Clone)]
+pub struct Sha256Stream {
+    state: [u32; 8],
+    block: [u8; 64],
+    buffered: usize,
+    total_bytes: u64,
+}
+
+impl Default for Sha256Stream {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Sha256Stream {
+    pub const fn new() -> Self {
+        Self {
+            state: SHA256_INITIAL,
+            block: [0; 64],
+            buffered: 0,
+            total_bytes: 0,
         }
     }
 
-    let mut digest = [0_u8; 32];
-    for (chunk, word) in digest.chunks_exact_mut(4).zip(state) {
-        chunk.copy_from_slice(&word.to_be_bytes());
+    /// Bytes fed so far.
+    pub const fn bytes_hashed(&self) -> u64 {
+        self.total_bytes
     }
-    digest
+
+    pub fn update(&mut self, mut input: &[u8]) {
+        self.total_bytes = self.total_bytes.wrapping_add(input.len() as u64);
+        if self.buffered > 0 {
+            let take = (64 - self.buffered).min(input.len());
+            self.block[self.buffered..self.buffered + take].copy_from_slice(&input[..take]);
+            self.buffered += take;
+            input = &input[take..];
+            if self.buffered < 64 {
+                return;
+            }
+            sha256_compress(&mut self.state, &self.block);
+            self.buffered = 0;
+        }
+        let mut chunks = input.chunks_exact(64);
+        for chunk in &mut chunks {
+            let block: &[u8; 64] = chunk.try_into().expect("chunks_exact yields 64 bytes");
+            sha256_compress(&mut self.state, block);
+        }
+        let rest = chunks.remainder();
+        self.block[..rest.len()].copy_from_slice(rest);
+        self.buffered = rest.len();
+    }
+
+    pub fn finalize(mut self) -> [u8; 32] {
+        let bit_len = self.total_bytes.wrapping_mul(8);
+        // Padding is decided by the leftover length alone: every full block
+        // is already compressed and `total_bytes ≡ buffered (mod 64)`, so
+        // this is byte-for-byte the one-shot padding of the whole input.
+        let mut tail = [0_u8; 128];
+        tail[..self.buffered].copy_from_slice(&self.block[..self.buffered]);
+        tail[self.buffered] = 0x80;
+        let padded_len = (self.buffered + 9).div_ceil(64) * 64;
+        tail[padded_len - 8..padded_len].copy_from_slice(&bit_len.to_be_bytes());
+        for chunk in tail[..padded_len].chunks_exact(64) {
+            let block: &[u8; 64] = chunk.try_into().expect("chunks_exact yields 64 bytes");
+            sha256_compress(&mut self.state, block);
+        }
+        let mut digest = [0_u8; 32];
+        for (chunk, word) in digest.chunks_exact_mut(4).zip(self.state) {
+            chunk.copy_from_slice(&word.to_be_bytes());
+        }
+        digest
+    }
+
+    pub fn finalize_hex(self) -> String {
+        let digest = self.finalize();
+        let mut output = String::with_capacity(64);
+        for byte in digest {
+            use std::fmt::Write as _;
+            write!(&mut output, "{byte:02x}").expect("writing to String cannot fail");
+        }
+        output
+    }
+}
+
+impl std::io::Write for Sha256Stream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.update(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn sha256_compress(state: &mut [u32; 8], chunk: &[u8; 64]) {
+    let mut schedule = [0_u32; 64];
+    for (index, word) in chunk.chunks_exact(4).enumerate() {
+        schedule[index] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
+    }
+    for index in 16..64 {
+        let s0 = schedule[index - 15].rotate_right(7)
+            ^ schedule[index - 15].rotate_right(18)
+            ^ (schedule[index - 15] >> 3);
+        let s1 = schedule[index - 2].rotate_right(17)
+            ^ schedule[index - 2].rotate_right(19)
+            ^ (schedule[index - 2] >> 10);
+        schedule[index] = schedule[index - 16]
+            .wrapping_add(s0)
+            .wrapping_add(schedule[index - 7])
+            .wrapping_add(s1);
+    }
+
+    let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = *state;
+    for index in 0..64 {
+        let sigma1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+        let choice = (e & f) ^ ((!e) & g);
+        let temp1 = h
+            .wrapping_add(sigma1)
+            .wrapping_add(choice)
+            .wrapping_add(SHA256_K[index])
+            .wrapping_add(schedule[index]);
+        let sigma0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+        let majority = (a & b) ^ (a & c) ^ (b & c);
+        let temp2 = sigma0.wrapping_add(majority);
+        h = g;
+        g = f;
+        f = e;
+        e = d.wrapping_add(temp1);
+        d = c;
+        c = b;
+        b = a;
+        a = temp1.wrapping_add(temp2);
+    }
+    for (slot, value) in state.iter_mut().zip([a, b, c, d, e, f, g, h]) {
+        *slot = slot.wrapping_add(value);
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{FrameIdentity, PackageIdentity, sha256_hex};
+    use super::{FrameIdentity, PackageIdentity, Sha256Stream, sha256_hex};
+
+    #[test]
+    fn streamed_digest_equals_one_shot_across_chunkings_and_block_edges() {
+        // Lengths straddling every padding branch: empty, under one block,
+        // the 55/56 padding boundary, exactly one block, just over, and
+        // many blocks with a ragged tail.
+        for len in [
+            0usize, 1, 3, 55, 56, 63, 64, 65, 119, 120, 127, 128, 1000, 4097,
+        ] {
+            let input: Vec<u8> = (0..len).map(|i| (i * 31 % 251) as u8).collect();
+            let expected = sha256_hex(&input);
+            for chunk in [1usize, 7, 64, 65, 1000] {
+                let mut stream = Sha256Stream::new();
+                for piece in input.chunks(chunk.max(1)) {
+                    stream.update(piece);
+                }
+                assert_eq!(stream.bytes_hashed(), len as u64);
+                assert_eq!(stream.finalize_hex(), expected, "len={len} chunk={chunk}");
+            }
+        }
+    }
+
+    #[test]
+    fn stream_is_an_io_writer_for_serializers() {
+        use std::io::Write as _;
+        let value = serde_json::json!({"a": [1, 2, 3], "b": "streamed"});
+        let materialized = serde_json::to_vec(&value).unwrap();
+        let mut stream = Sha256Stream::new();
+        serde_json::to_writer(&mut stream, &value).unwrap();
+        stream.flush().unwrap();
+        assert_eq!(stream.bytes_hashed(), materialized.len() as u64);
+        assert_eq!(stream.finalize_hex(), sha256_hex(&materialized));
+    }
 
     #[test]
     fn package_identity_is_the_pair() {

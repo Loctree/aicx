@@ -1,0 +1,6 @@
+{"type":"user","content":[{"type":"text","text":"<user_query>Implement W2-T9 grok-on-throne: speech class through the taxonomy throne.</user_query>"}]}
+{"type":"reasoning","id":"rsn_w2t9","summary":[{"type":"summary_text","text":"The user wants me to implement a specific cut as a dispatched worker under the vc-implement skill."}],"encrypted_content":"OPAQUE_ENCRYPTED_SENTINEL_DO_NOT_DISTILL","status":"completed"}
+{"type":"assistant","content":"","tool_calls":[{"name":"run_terminal_command","arguments":"{\"command\":\"cargo test -p aicx-parser --test grok_adapter\",\"description\":\"Run grok adapter tests\"}"}]}
+{"type":"tool_result","tool_call_id":"call-w2t9-gate","content":"running 12 tests\ntest result: ok. 12 passed; 0 failed; 0 ignored\nFinished `test` profile"}
+{"type":"assistant","content":"Grok speech class now goes through the taxonomy throne. Local `type=user` → `UserMsg` mapping is gone.\n\n**Commit:** `252caef` on `cut/W2-T9-grok-on-throne` — not pushed.\nGATE=green PHASE=W2 BUILD/LINT/TEST=NOT_ASSESSED (embargo W2)"}
+{"type":"user","content":[{"type":"text","text":"Do we still need a W2-T12 extract-level refusal for degenerate 019fdeca?"}]}

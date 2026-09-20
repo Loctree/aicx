@@ -19,14 +19,15 @@ pub use coverage::{
 };
 pub use frames::{
     ClassifiedFrame, FRAME_TAXONOMY_SCHEMA, FrameClass, FrameOrigin, FrameSeal, HumanChannel,
-    InjectKind, Retained, TransportFrame, TransportKind, TransportPayload, TransportRole, classify,
+    InjectKind, Retained, ShellExecutor, TransportFrame, TransportKind, TransportPayload,
+    TransportRole, classify,
 };
 pub use frames_rules::{
     AGENT_FRAME_RULES, AgentFrameRules, InjectRuleKind, InjectTagRule, rules_for,
 };
 pub use identity::{
-    EVIDENCE_ID_VERSION, EvidenceIdError, FrameIdentity, PackageIdentity, evidence_event_id,
-    evidence_event_id_from_hash, ordinal_locator, sha256_hex,
+    EVIDENCE_ID_VERSION, EvidenceIdError, FrameIdentity, PackageIdentity, Sha256Stream,
+    evidence_event_id, evidence_event_id_from_hash, ordinal_locator, sha256_hex,
 };
 pub use model::{
     ContextEpochRef, CounterSemantics, EntryOrigin, Known, Provenance, ProviderConversationRef,
@@ -35,8 +36,8 @@ pub use model::{
     TurnRange, TurnRole, UnknownValue, UsageEvent, UsageSpan,
 };
 pub use reader::{
-    DEFAULT_MAX_SOURCE_BYTES, DEFAULT_MAX_UNIT_BYTES, RawUnit, RawUnitReader, ReaderError,
-    ReaderPolicy, SourceRead, UnitBoundary,
+    DEFAULT_MAX_DOCUMENT_BYTES, DEFAULT_MAX_SOURCE_BYTES, DEFAULT_MAX_UNIT_BYTES, RawUnit,
+    RawUnitReader, ReaderError, ReaderPolicy, SourceRead, UnitBoundary,
 };
 pub use refusal::{
     AdapterDetection, DetectionProbe, MIN_HUMAN_UTTERANCES, MIN_VISIBLE_TURNS, REFUSAL_SCHEMA,

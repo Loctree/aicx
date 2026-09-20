@@ -18,6 +18,7 @@ _aicx() {
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
+'--help-full[Show every command, including the power-user surfaces hidden from the short help (catalog internals, per-agent extractors, intents, migrations, archive readers)]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 '-V[Print version]' \
@@ -181,18 +182,21 @@ _arguments "${_arguments_options[@]}" : \
 '--file=[Direct source file. Builds a source handle from this path only — no catalog scan, no global AICX state. Requires \`-o/--output\`]:FILE:_files' \
 '-o+[Output file path. Required with \`--file\`; defaults to \`~/.aicx/extracts/<agent>/<session_id>\[_conversation\]\[_user\].md\` in session mode]:OUTPUT:_files' \
 '--output=[Output file path. Required with \`--file\`; defaults to \`~/.aicx/extracts/<agent>/<session_id>\[_conversation\]\[_user\].md\` in session mode]:OUTPUT:_files' \
-'-p+[Explicit project/repo name (overrides inference)]:PROJECT:_default' \
-'--project=[Explicit project/repo name (overrides inference)]:PROJECT:_default' \
+'*-p+[Project/repo filter, repeatable or comma-separated (OR across projects, AND with every other axis). Entries are kept when their recorded cwd belongs to one of them; an entry with no known cwd is filtered out rather than guessed. A single value also names the output'\''s project identity, as before]:PROJECT:_default' \
+'*--project=[Project/repo filter, repeatable or comma-separated (OR across projects, AND with every other axis). Entries are kept when their recorded cwd belongs to one of them; an entry with no known cwd is filtered out rather than guessed. A single value also names the output'\''s project identity, as before]:PROJECT:_default' \
 '--max-message-chars=[Maximum message characters in markdown (0 = no truncation)]:MAX_MESSAGE_CHARS:_default' \
+'-H+[Hours to look back inside the session view (0 = unbounded). A window on the projection, not a re-parse; absence is never a silent default]:HOURS:_default' \
+'--hours=[Hours to look back inside the session view (0 = unbounded). A window on the projection, not a re-parse; absence is never a silent default]:HOURS:_default' \
+'*--kind=[Throne kind filter (repeatable / comma list)\: human | echo_seal | shell_action | inject | assistant_final | lineage_meta | inter_agent. \`inter_agent\` opens the inter-agent lane; it is never rendered as assistant and stays outside --conversation / --dialog by default]:KIND:_default' \
+'--lineage=[Walk parent sessions through \`session_meta.forked_from_id\` (session catalog lookup, never filename guessing). Bare \`--lineage\` = unbounded; \`--lineage=N\` = at most N parents. Needs --session (catalog)]::DEPTH:_default' \
+'--result=[Retained shell result body\: none (\`\$ cmd \[N lines, sha256\:…\]\`, default) | head=N | full. The body stays in the substrate either way]:none|head=N|full:_default' \
 '--no-redact-secrets[Redact secrets (tokens/keys) from outputs before writing/syncing]' \
-'--user-only[Only include user messages (exclude assistant + reasoning)]' \
-'-H+[Hours to look back inside the session view (0 = unbounded)]:HOURS:_default' \
-'--hours=[Hours to look back inside the session view (0 = unbounded)]:HOURS:_default' \
-'*--kind=[Throne kind filter]:KIND:(human echo_seal shell_action inject assistant_final lineage_meta inter_agent)' \
-'--dialog[Dialogue view: human speech incl. delayed echo-bus / queued speech with seals, plus assistant-final]' \
-'--lineage=-[Walk parent sessions via session_meta.forked_from_id (bare = unbounded, =N = depth)]:DEPTH:_default' \
-'--result=[Retained shell result body]:none|head=N|full:(none full head=)' \
+'(--agent-only)--user-only[Only include user messages (exclude assistant + reasoning)]' \
+'--agent-only[Only include assistant answers (\`assistant_final\`). Reasoning, inter-agent traffic and lineage metadata are excluded\: they are not the assistant speaking to the operator]' \
+'--user-commands[Only shell commands the human submitted (e.g. Codex \`<user_shell_command>\`). A command quoted in prose is not an execution]' \
+'--agent-commands[Only tool / shell invocations the agent made]' \
 '--conversation[Conversation-first mode\: emit denoised user/assistant transcript only]' \
+'--dialog[Dialogue view\: human speech (direct + delayed echo-bus / queued, with their seals) plus assistant-final answers]' \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
@@ -206,18 +210,21 @@ _arguments "${_arguments_options[@]}" : \
 '--file=[Direct source file. Builds a source handle from this path only — no catalog scan, no global AICX state. Requires \`-o/--output\`]:FILE:_files' \
 '-o+[Output file path. Required with \`--file\`; defaults to \`~/.aicx/extracts/<agent>/<session_id>\[_conversation\]\[_user\].md\` in session mode]:OUTPUT:_files' \
 '--output=[Output file path. Required with \`--file\`; defaults to \`~/.aicx/extracts/<agent>/<session_id>\[_conversation\]\[_user\].md\` in session mode]:OUTPUT:_files' \
-'-p+[Explicit project/repo name (overrides inference)]:PROJECT:_default' \
-'--project=[Explicit project/repo name (overrides inference)]:PROJECT:_default' \
+'*-p+[Project/repo filter, repeatable or comma-separated (OR across projects, AND with every other axis). Entries are kept when their recorded cwd belongs to one of them; an entry with no known cwd is filtered out rather than guessed. A single value also names the output'\''s project identity, as before]:PROJECT:_default' \
+'*--project=[Project/repo filter, repeatable or comma-separated (OR across projects, AND with every other axis). Entries are kept when their recorded cwd belongs to one of them; an entry with no known cwd is filtered out rather than guessed. A single value also names the output'\''s project identity, as before]:PROJECT:_default' \
 '--max-message-chars=[Maximum message characters in markdown (0 = no truncation)]:MAX_MESSAGE_CHARS:_default' \
+'-H+[Hours to look back inside the session view (0 = unbounded). A window on the projection, not a re-parse; absence is never a silent default]:HOURS:_default' \
+'--hours=[Hours to look back inside the session view (0 = unbounded). A window on the projection, not a re-parse; absence is never a silent default]:HOURS:_default' \
+'*--kind=[Throne kind filter (repeatable / comma list)\: human | echo_seal | shell_action | inject | assistant_final | lineage_meta | inter_agent. \`inter_agent\` opens the inter-agent lane; it is never rendered as assistant and stays outside --conversation / --dialog by default]:KIND:_default' \
+'--lineage=[Walk parent sessions through \`session_meta.forked_from_id\` (session catalog lookup, never filename guessing). Bare \`--lineage\` = unbounded; \`--lineage=N\` = at most N parents. Needs --session (catalog)]::DEPTH:_default' \
+'--result=[Retained shell result body\: none (\`\$ cmd \[N lines, sha256\:…\]\`, default) | head=N | full. The body stays in the substrate either way]:none|head=N|full:_default' \
 '--no-redact-secrets[Redact secrets (tokens/keys) from outputs before writing/syncing]' \
-'--user-only[Only include user messages (exclude assistant + reasoning)]' \
-'-H+[Hours to look back inside the session view (0 = unbounded)]:HOURS:_default' \
-'--hours=[Hours to look back inside the session view (0 = unbounded)]:HOURS:_default' \
-'*--kind=[Throne kind filter]:KIND:(human echo_seal shell_action inject assistant_final lineage_meta inter_agent)' \
-'--dialog[Dialogue view: human speech incl. delayed echo-bus / queued speech with seals, plus assistant-final]' \
-'--lineage=-[Walk parent sessions via session_meta.forked_from_id (bare = unbounded, =N = depth)]:DEPTH:_default' \
-'--result=[Retained shell result body]:none|head=N|full:(none full head=)' \
+'(--agent-only)--user-only[Only include user messages (exclude assistant + reasoning)]' \
+'--agent-only[Only include assistant answers (\`assistant_final\`). Reasoning, inter-agent traffic and lineage metadata are excluded\: they are not the assistant speaking to the operator]' \
+'--user-commands[Only shell commands the human submitted (e.g. Codex \`<user_shell_command>\`). A command quoted in prose is not an execution]' \
+'--agent-commands[Only tool / shell invocations the agent made]' \
 '--conversation[Conversation-first mode\: emit denoised user/assistant transcript only]' \
+'--dialog[Dialogue view\: human speech (direct + delayed echo-bus / queued, with their seals) plus assistant-final answers]' \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
@@ -231,18 +238,21 @@ _arguments "${_arguments_options[@]}" : \
 '--file=[Direct source file. Builds a source handle from this path only — no catalog scan, no global AICX state. Requires \`-o/--output\`]:FILE:_files' \
 '-o+[Output file path. Required with \`--file\`; defaults to \`~/.aicx/extracts/<agent>/<session_id>\[_conversation\]\[_user\].md\` in session mode]:OUTPUT:_files' \
 '--output=[Output file path. Required with \`--file\`; defaults to \`~/.aicx/extracts/<agent>/<session_id>\[_conversation\]\[_user\].md\` in session mode]:OUTPUT:_files' \
-'-p+[Explicit project/repo name (overrides inference)]:PROJECT:_default' \
-'--project=[Explicit project/repo name (overrides inference)]:PROJECT:_default' \
+'*-p+[Project/repo filter, repeatable or comma-separated (OR across projects, AND with every other axis). Entries are kept when their recorded cwd belongs to one of them; an entry with no known cwd is filtered out rather than guessed. A single value also names the output'\''s project identity, as before]:PROJECT:_default' \
+'*--project=[Project/repo filter, repeatable or comma-separated (OR across projects, AND with every other axis). Entries are kept when their recorded cwd belongs to one of them; an entry with no known cwd is filtered out rather than guessed. A single value also names the output'\''s project identity, as before]:PROJECT:_default' \
 '--max-message-chars=[Maximum message characters in markdown (0 = no truncation)]:MAX_MESSAGE_CHARS:_default' \
+'-H+[Hours to look back inside the session view (0 = unbounded). A window on the projection, not a re-parse; absence is never a silent default]:HOURS:_default' \
+'--hours=[Hours to look back inside the session view (0 = unbounded). A window on the projection, not a re-parse; absence is never a silent default]:HOURS:_default' \
+'*--kind=[Throne kind filter (repeatable / comma list)\: human | echo_seal | shell_action | inject | assistant_final | lineage_meta | inter_agent. \`inter_agent\` opens the inter-agent lane; it is never rendered as assistant and stays outside --conversation / --dialog by default]:KIND:_default' \
+'--lineage=[Walk parent sessions through \`session_meta.forked_from_id\` (session catalog lookup, never filename guessing). Bare \`--lineage\` = unbounded; \`--lineage=N\` = at most N parents. Needs --session (catalog)]::DEPTH:_default' \
+'--result=[Retained shell result body\: none (\`\$ cmd \[N lines, sha256\:…\]\`, default) | head=N | full. The body stays in the substrate either way]:none|head=N|full:_default' \
 '--no-redact-secrets[Redact secrets (tokens/keys) from outputs before writing/syncing]' \
-'--user-only[Only include user messages (exclude assistant + reasoning)]' \
-'-H+[Hours to look back inside the session view (0 = unbounded)]:HOURS:_default' \
-'--hours=[Hours to look back inside the session view (0 = unbounded)]:HOURS:_default' \
-'*--kind=[Throne kind filter]:KIND:(human echo_seal shell_action inject assistant_final lineage_meta inter_agent)' \
-'--dialog[Dialogue view: human speech incl. delayed echo-bus / queued speech with seals, plus assistant-final]' \
-'--lineage=-[Walk parent sessions via session_meta.forked_from_id (bare = unbounded, =N = depth)]:DEPTH:_default' \
-'--result=[Retained shell result body]:none|head=N|full:(none full head=)' \
+'(--agent-only)--user-only[Only include user messages (exclude assistant + reasoning)]' \
+'--agent-only[Only include assistant answers (\`assistant_final\`). Reasoning, inter-agent traffic and lineage metadata are excluded\: they are not the assistant speaking to the operator]' \
+'--user-commands[Only shell commands the human submitted (e.g. Codex \`<user_shell_command>\`). A command quoted in prose is not an execution]' \
+'--agent-commands[Only tool / shell invocations the agent made]' \
 '--conversation[Conversation-first mode\: emit denoised user/assistant transcript only]' \
+'--dialog[Dialogue view\: human speech (direct + delayed echo-bus / queued, with their seals) plus assistant-final answers]' \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
@@ -256,18 +266,21 @@ _arguments "${_arguments_options[@]}" : \
 '--file=[Direct source file. Builds a source handle from this path only — no catalog scan, no global AICX state. Requires \`-o/--output\`]:FILE:_files' \
 '-o+[Output file path. Required with \`--file\`; defaults to \`~/.aicx/extracts/<agent>/<session_id>\[_conversation\]\[_user\].md\` in session mode]:OUTPUT:_files' \
 '--output=[Output file path. Required with \`--file\`; defaults to \`~/.aicx/extracts/<agent>/<session_id>\[_conversation\]\[_user\].md\` in session mode]:OUTPUT:_files' \
-'-p+[Explicit project/repo name (overrides inference)]:PROJECT:_default' \
-'--project=[Explicit project/repo name (overrides inference)]:PROJECT:_default' \
+'*-p+[Project/repo filter, repeatable or comma-separated (OR across projects, AND with every other axis). Entries are kept when their recorded cwd belongs to one of them; an entry with no known cwd is filtered out rather than guessed. A single value also names the output'\''s project identity, as before]:PROJECT:_default' \
+'*--project=[Project/repo filter, repeatable or comma-separated (OR across projects, AND with every other axis). Entries are kept when their recorded cwd belongs to one of them; an entry with no known cwd is filtered out rather than guessed. A single value also names the output'\''s project identity, as before]:PROJECT:_default' \
 '--max-message-chars=[Maximum message characters in markdown (0 = no truncation)]:MAX_MESSAGE_CHARS:_default' \
+'-H+[Hours to look back inside the session view (0 = unbounded). A window on the projection, not a re-parse; absence is never a silent default]:HOURS:_default' \
+'--hours=[Hours to look back inside the session view (0 = unbounded). A window on the projection, not a re-parse; absence is never a silent default]:HOURS:_default' \
+'*--kind=[Throne kind filter (repeatable / comma list)\: human | echo_seal | shell_action | inject | assistant_final | lineage_meta | inter_agent. \`inter_agent\` opens the inter-agent lane; it is never rendered as assistant and stays outside --conversation / --dialog by default]:KIND:_default' \
+'--lineage=[Walk parent sessions through \`session_meta.forked_from_id\` (session catalog lookup, never filename guessing). Bare \`--lineage\` = unbounded; \`--lineage=N\` = at most N parents. Needs --session (catalog)]::DEPTH:_default' \
+'--result=[Retained shell result body\: none (\`\$ cmd \[N lines, sha256\:…\]\`, default) | head=N | full. The body stays in the substrate either way]:none|head=N|full:_default' \
 '--no-redact-secrets[Redact secrets (tokens/keys) from outputs before writing/syncing]' \
-'--user-only[Only include user messages (exclude assistant + reasoning)]' \
-'-H+[Hours to look back inside the session view (0 = unbounded)]:HOURS:_default' \
-'--hours=[Hours to look back inside the session view (0 = unbounded)]:HOURS:_default' \
-'*--kind=[Throne kind filter]:KIND:(human echo_seal shell_action inject assistant_final lineage_meta inter_agent)' \
-'--dialog[Dialogue view: human speech incl. delayed echo-bus / queued speech with seals, plus assistant-final]' \
-'--lineage=-[Walk parent sessions via session_meta.forked_from_id (bare = unbounded, =N = depth)]:DEPTH:_default' \
-'--result=[Retained shell result body]:none|head=N|full:(none full head=)' \
+'(--agent-only)--user-only[Only include user messages (exclude assistant + reasoning)]' \
+'--agent-only[Only include assistant answers (\`assistant_final\`). Reasoning, inter-agent traffic and lineage metadata are excluded\: they are not the assistant speaking to the operator]' \
+'--user-commands[Only shell commands the human submitted (e.g. Codex \`<user_shell_command>\`). A command quoted in prose is not an execution]' \
+'--agent-commands[Only tool / shell invocations the agent made]' \
 '--conversation[Conversation-first mode\: emit denoised user/assistant transcript only]' \
+'--dialog[Dialogue view\: human speech (direct + delayed echo-bus / queued, with their seals) plus assistant-final answers]' \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
@@ -281,18 +294,78 @@ _arguments "${_arguments_options[@]}" : \
 '--file=[Direct source file. Builds a source handle from this path only — no catalog scan, no global AICX state. Requires \`-o/--output\`]:FILE:_files' \
 '-o+[Output file path. Required with \`--file\`; defaults to \`~/.aicx/extracts/<agent>/<session_id>\[_conversation\]\[_user\].md\` in session mode]:OUTPUT:_files' \
 '--output=[Output file path. Required with \`--file\`; defaults to \`~/.aicx/extracts/<agent>/<session_id>\[_conversation\]\[_user\].md\` in session mode]:OUTPUT:_files' \
-'-p+[Explicit project/repo name (overrides inference)]:PROJECT:_default' \
-'--project=[Explicit project/repo name (overrides inference)]:PROJECT:_default' \
+'*-p+[Project/repo filter, repeatable or comma-separated (OR across projects, AND with every other axis). Entries are kept when their recorded cwd belongs to one of them; an entry with no known cwd is filtered out rather than guessed. A single value also names the output'\''s project identity, as before]:PROJECT:_default' \
+'*--project=[Project/repo filter, repeatable or comma-separated (OR across projects, AND with every other axis). Entries are kept when their recorded cwd belongs to one of them; an entry with no known cwd is filtered out rather than guessed. A single value also names the output'\''s project identity, as before]:PROJECT:_default' \
 '--max-message-chars=[Maximum message characters in markdown (0 = no truncation)]:MAX_MESSAGE_CHARS:_default' \
+'-H+[Hours to look back inside the session view (0 = unbounded). A window on the projection, not a re-parse; absence is never a silent default]:HOURS:_default' \
+'--hours=[Hours to look back inside the session view (0 = unbounded). A window on the projection, not a re-parse; absence is never a silent default]:HOURS:_default' \
+'*--kind=[Throne kind filter (repeatable / comma list)\: human | echo_seal | shell_action | inject | assistant_final | lineage_meta | inter_agent. \`inter_agent\` opens the inter-agent lane; it is never rendered as assistant and stays outside --conversation / --dialog by default]:KIND:_default' \
+'--lineage=[Walk parent sessions through \`session_meta.forked_from_id\` (session catalog lookup, never filename guessing). Bare \`--lineage\` = unbounded; \`--lineage=N\` = at most N parents. Needs --session (catalog)]::DEPTH:_default' \
+'--result=[Retained shell result body\: none (\`\$ cmd \[N lines, sha256\:…\]\`, default) | head=N | full. The body stays in the substrate either way]:none|head=N|full:_default' \
 '--no-redact-secrets[Redact secrets (tokens/keys) from outputs before writing/syncing]' \
-'--user-only[Only include user messages (exclude assistant + reasoning)]' \
-'-H+[Hours to look back inside the session view (0 = unbounded)]:HOURS:_default' \
-'--hours=[Hours to look back inside the session view (0 = unbounded)]:HOURS:_default' \
-'*--kind=[Throne kind filter]:KIND:(human echo_seal shell_action inject assistant_final lineage_meta inter_agent)' \
-'--dialog[Dialogue view: human speech incl. delayed echo-bus / queued speech with seals, plus assistant-final]' \
-'--lineage=-[Walk parent sessions via session_meta.forked_from_id (bare = unbounded, =N = depth)]:DEPTH:_default' \
-'--result=[Retained shell result body]:none|head=N|full:(none full head=)' \
+'(--agent-only)--user-only[Only include user messages (exclude assistant + reasoning)]' \
+'--agent-only[Only include assistant answers (\`assistant_final\`). Reasoning, inter-agent traffic and lineage metadata are excluded\: they are not the assistant speaking to the operator]' \
+'--user-commands[Only shell commands the human submitted (e.g. Codex \`<user_shell_command>\`). A command quoted in prose is not an execution]' \
+'--agent-commands[Only tool / shell invocations the agent made]' \
 '--conversation[Conversation-first mode\: emit denoised user/assistant transcript only]' \
+'--dialog[Dialogue view\: human speech (direct + delayed echo-bus / queued, with their seals) plus assistant-final answers]' \
+'-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(kimi)
+_arguments "${_arguments_options[@]}" : \
+'(--file)--session=[Session id\: source id, logical id, alias, UUID suffix (≥8 chars), or unique prefix. Resolved through the session catalog before any parse]:SESSION:_default' \
+'--file=[Direct source file. Builds a source handle from this path only — no catalog scan, no global AICX state. Requires \`-o/--output\`]:FILE:_files' \
+'-o+[Output file path. Required with \`--file\`; defaults to \`~/.aicx/extracts/<agent>/<session_id>\[_conversation\]\[_user\].md\` in session mode]:OUTPUT:_files' \
+'--output=[Output file path. Required with \`--file\`; defaults to \`~/.aicx/extracts/<agent>/<session_id>\[_conversation\]\[_user\].md\` in session mode]:OUTPUT:_files' \
+'*-p+[Project/repo filter, repeatable or comma-separated (OR across projects, AND with every other axis). Entries are kept when their recorded cwd belongs to one of them; an entry with no known cwd is filtered out rather than guessed. A single value also names the output'\''s project identity, as before]:PROJECT:_default' \
+'*--project=[Project/repo filter, repeatable or comma-separated (OR across projects, AND with every other axis). Entries are kept when their recorded cwd belongs to one of them; an entry with no known cwd is filtered out rather than guessed. A single value also names the output'\''s project identity, as before]:PROJECT:_default' \
+'--max-message-chars=[Maximum message characters in markdown (0 = no truncation)]:MAX_MESSAGE_CHARS:_default' \
+'-H+[Hours to look back inside the session view (0 = unbounded). A window on the projection, not a re-parse; absence is never a silent default]:HOURS:_default' \
+'--hours=[Hours to look back inside the session view (0 = unbounded). A window on the projection, not a re-parse; absence is never a silent default]:HOURS:_default' \
+'*--kind=[Throne kind filter (repeatable / comma list)\: human | echo_seal | shell_action | inject | assistant_final | lineage_meta | inter_agent. \`inter_agent\` opens the inter-agent lane; it is never rendered as assistant and stays outside --conversation / --dialog by default]:KIND:_default' \
+'--lineage=[Walk parent sessions through \`session_meta.forked_from_id\` (session catalog lookup, never filename guessing). Bare \`--lineage\` = unbounded; \`--lineage=N\` = at most N parents. Needs --session (catalog)]::DEPTH:_default' \
+'--result=[Retained shell result body\: none (\`\$ cmd \[N lines, sha256\:…\]\`, default) | head=N | full. The body stays in the substrate either way]:none|head=N|full:_default' \
+'--no-redact-secrets[Redact secrets (tokens/keys) from outputs before writing/syncing]' \
+'(--agent-only)--user-only[Only include user messages (exclude assistant + reasoning)]' \
+'--agent-only[Only include assistant answers (\`assistant_final\`). Reasoning, inter-agent traffic and lineage metadata are excluded\: they are not the assistant speaking to the operator]' \
+'--user-commands[Only shell commands the human submitted (e.g. Codex \`<user_shell_command>\`). A command quoted in prose is not an execution]' \
+'--agent-commands[Only tool / shell invocations the agent made]' \
+'--conversation[Conversation-first mode\: emit denoised user/assistant transcript only]' \
+'--dialog[Dialogue view\: human speech (direct + delayed echo-bus / queued, with their seals) plus assistant-final answers]' \
+'-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(all)
+_arguments "${_arguments_options[@]}" : \
+'*--provider=[Restrict the pass to these providers (repeatable / comma list). Default\: every provider the parser registry claims]:PROVIDER:_default' \
+'*-p+[Project/repo filter, repeatable (OR across projects, AND with the other axes). A session whose cwd is unknown is filtered out, not guessed into the result]:PROJECT:_default' \
+'*--project=[Project/repo filter, repeatable (OR across projects, AND with the other axes). A session whose cwd is unknown is filtered out, not guessed into the result]:PROJECT:_default' \
+'-H+[Hours to look back over *event* timestamps (0 = unbounded). One cutoff is captured when the command starts and every session shares it]:HOURS:_default' \
+'--hours=[Hours to look back over *event* timestamps (0 = unbounded). One cutoff is captured when the command starts and every session shares it]:HOURS:_default' \
+'*--kind=[Throne kind filter (repeatable / comma list), same vocabulary as \`aicx extract <agent> --kind\`]:KIND:_default' \
+'--result=[Retained shell result body\: none (default) | head=N | full]:none|head=N|full:_default' \
+'--max-message-chars=[Maximum message characters (0 = no truncation)]:MAX_MESSAGE_CHARS:_default' \
+'-o+[Output root for the extracts. Defaults to \`<AICX_HOME>/extracts\`]:DIR:_files' \
+'--output=[Output root for the extracts. Defaults to \`<AICX_HOME>/extracts\`]:DIR:_files' \
+'--no-redact-secrets[Redact secrets (tokens/keys) from outputs before writing/syncing]' \
+'(--agent-only)--user-only[Only user messages]' \
+'--agent-only[Only assistant answers (\`assistant_final\`)]' \
+'--user-commands[Only shell commands the human submitted]' \
+'--agent-commands[Only tool / shell invocations the agent made]' \
+'--conversation[Conversation-first rendering]' \
+'--rebuild[Re-materialize every selected session, ignoring the incremental state]' \
+'--force[Re-materialize every selected session, ignoring the incremental state]' \
+'--dry-run[Plan only\: report what each source would become, write nothing]' \
+'--json[Emit the run manifest as JSON on stdout instead of the human summary]' \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
@@ -329,6 +402,14 @@ _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
 (junie)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(kimi)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(all)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
@@ -382,6 +463,7 @@ _arguments "${_arguments_options[@]}" : \
             (rebuild)
 _arguments "${_arguments_options[@]}" : \
 '--json[Emit JSON report to stdout]' \
+'--with-chunks[After rewriting the catalog, drain pending chunks through \`aicx index\` (lexical CURRENT) and print the remaining lag]' \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
@@ -482,106 +564,7 @@ _arguments "${_arguments_options[@]}" : \
             (rebuild)
 _arguments "${_arguments_options[@]}" : \
 '--json[Emit JSON report to stdout]' \
-'-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
-'--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
-'--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
-'-h[Print help (see more with '\''--help'\'')]' \
-'--help[Print help (see more with '\''--help'\'')]' \
-&& ret=0
-;;
-(refresh)
-_arguments "${_arguments_options[@]}" : \
-'-H+[Window in hours]:HOURS:_default' \
-'--hours=[Window in hours]:HOURS:_default' \
-'--json[Emit JSON report to stdout]' \
-'-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
-'--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
-'--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
-'-h[Print help (see more with '\''--help'\'')]' \
-'--help[Print help (see more with '\''--help'\'')]' \
-&& ret=0
-;;
-(status)
-_arguments "${_arguments_options[@]}" : \
-'--json[Emit JSON (\`aicx.catalog.status.v1\`)]' \
-'-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
-'--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
-'--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
-'-h[Print help (see more with '\''--help'\'')]' \
-'--help[Print help (see more with '\''--help'\'')]' \
-&& ret=0
-;;
-(resolve)
-_arguments "${_arguments_options[@]}" : \
-'--json[Emit JSON]' \
-'-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
-'--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
-'--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
-'-h[Print help (see more with '\''--help'\'')]' \
-'--help[Print help (see more with '\''--help'\'')]' \
-':session -- Session id (exact, logical, or unique prefix):_default' \
-&& ret=0
-;;
-(help)
-_arguments "${_arguments_options[@]}" : \
-":: :_aicx__subcmd__catalog__subcmd__help_commands" \
-"*::: :->help" \
-&& ret=0
-
-    case $state in
-    (help)
-        words=($line[1] "${words[@]}")
-        (( CURRENT += 1 ))
-        curcontext="${curcontext%:*:*}:aicx-catalog-help-command-$line[1]:"
-        case $line[1] in
-            (rebuild)
-_arguments "${_arguments_options[@]}" : \
-&& ret=0
-;;
-(refresh)
-_arguments "${_arguments_options[@]}" : \
-&& ret=0
-;;
-(status)
-_arguments "${_arguments_options[@]}" : \
-&& ret=0
-;;
-(resolve)
-_arguments "${_arguments_options[@]}" : \
-&& ret=0
-;;
-(help)
-_arguments "${_arguments_options[@]}" : \
-&& ret=0
-;;
-        esac
-    ;;
-esac
-;;
-        esac
-    ;;
-esac
-;;
-(store)
-_arguments "${_arguments_options[@]}" : \
-'-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
-'--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
-'--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
-'-h[Print help (see more with '\''--help'\'')]' \
-'--help[Print help (see more with '\''--help'\'')]' \
-":: :_aicx__subcmd__catalog_commands" \
-"*::: :->catalog" \
-&& ret=0
-
-    case $state in
-    (catalog)
-        words=($line[1] "${words[@]}")
-        (( CURRENT += 1 ))
-        curcontext="${curcontext%:*:*}:aicx-catalog-command-$line[1]:"
-        case $line[1] in
-            (rebuild)
-_arguments "${_arguments_options[@]}" : \
-'--json[Emit JSON report to stdout]' \
+'--with-chunks[After rewriting the catalog, drain pending chunks through \`aicx index\` (lexical CURRENT) and print the remaining lag]' \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
@@ -782,12 +765,12 @@ _arguments "${_arguments_options[@]}" : \
 ;;
 (list)
 _arguments "${_arguments_options[@]}" : \
-'--agent=[Filter by agent (claude | codex | gemini | junie | grok)]:AGENT:(claude codex gemini junie grok)' \
+'*-p+[Exact project filter, same shapes as search/intents/MCP\: \`owner/repo\`, \`/repo\` (cross-org repo), \`owner/\` (org wildcard), or a unique bare \`name\`. Empty is a numbered miss, not silence]:PROJECT:_default' \
+'*--project=[Exact project filter, same shapes as search/intents/MCP\: \`owner/repo\`, \`/repo\` (cross-org repo), \`owner/\` (org wildcard), or a unique bare \`name\`. Empty is a numbered miss, not silence]:PROJECT:_default' \
+'--agent=[Filter by agent (claude | codex | gemini | junie | grok | kimi)]:AGENT:(claude codex gemini junie grok kimi)' \
 '--since=[Only sessions updated on/after this date (YYYY-MM-DD). Defaults to the last 30 days; pass --all to scan the full history]:SINCE:_default' \
 '--limit=[Max sessions to show (0 = all)]:LIMIT:_default' \
 '--format=[Output format\: table | json]:FORMAT:_default' \
-'-p+[Exact project filter]:PROJECT:_default' \
-'--project=[Exact project filter]:PROJECT:_default' \
 '--cwd[Restrict to sessions whose repo/cwd matches the current directory]' \
 '--all[Scan the full session history (slower) instead of the default last-30-days window]' \
 '-j[Alias for \`--format json\` (vc-frame / plugin assimilation)]' \
@@ -1367,8 +1350,11 @@ _arguments "${_arguments_options[@]}" : \
 '*--allowed-host=[Allowed HTTP Host header for streamable HTTP clients. Repeat for remote hostnames/IPs]:HOST:_default' \
 '--auth-token=[Optional explicit auth token (overrides env / file / generated). HTTP transport only]:TOKEN:_default' \
 '(--no-require-auth)--require-auth=[Require Bearer auth on HTTP transport (default\: true). Pass \`--no-require-auth\` to opt out]:REQUIRE_AUTH:(true false)' \
+'--refresh-interval-seconds=[Accepted for compatibility; ignored unless \`--experimental-auto-refresh\` is set]:REFRESH_INTERVAL_SECONDS:_default' \
 '--allow-any-host[Disable HTTP Host header validation. Not recommended outside trusted networks]' \
 '--no-require-auth[Disable Bearer auth on HTTP transport. Only allowed on loopback binds]' \
+'(--no-auto-refresh)--experimental-auto-refresh[Explicitly opt in to the legacy embedded HTTP catalog/index writer]' \
+'(--experimental-auto-refresh)--no-auto-refresh[Deprecated compatibility flag\: auto-refresh is already disabled by default]' \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
@@ -1419,16 +1405,16 @@ _arguments "${_arguments_options[@]}" : \
 '--kind=[Filter by indexed document kind\: conversations, plans, reports, other]:KIND:(conversations conversation plans plan reports report other)' \
 '--session=[Search passages inside one catalog session instead of ranking sessions]:SESSION:_default' \
 '--context=[Context lines before and after each passage match (default\: 2)]:N:_default' \
+'--result=[Shell result body on tool_call hits\: none (stub \`\$ cmd \[N lines, sha256\:…\]\`, default) | head=N | full]:none|head=N|full:_default' \
+'--lineage=[Accepted for grammar parity with \`extract\`; hits are chunks, so the parent walk is reported as not applied here]::DEPTH:_default' \
 '--literal[Match an exact, identifier-boundary substring inside --session]' \
 '(--evidence)--no-semantic[Force lexical-only retrieval from the published CURRENT index]' \
-'--dialog[Dialogue view of hits: delayed human speech rendered as speech, with seals]' \
-'--result=[Shell result body on tool_call hits]:none|head=N|full:(none full head=)' \
-'--lineage=-[Accepted for grammar parity with extract; not applied to hits]:DEPTH:_default' \
 '--evidence[Return an evidence packet\: semantic candidates re-ranked by answer/support signals, with source sections and diagnostics]' \
 '-j[Emit compact JSON instead of plain text]' \
 '--json[Emit compact JSON instead of plain text]' \
 '--legacy-dense[Use legacy NDJSON reader for dense vector search instead of versioned mmap]' \
 '--deep[Dense re-rank (hybrid RRF over tantivy + mmap). Default is lexical-first with a recency prior against the published \`_all\` CURRENT generation — sub-second answers without loading the embedder or dense vectors]' \
+'--dialog[Dialogue view of hits\: delayed human speech (echo-bus / queue) rendered as speech, with its seals]' \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
@@ -1509,7 +1495,7 @@ _arguments "${_arguments_options[@]}" : \
 '-j[Emit JSON stats instead of plain text]' \
 '--json[Emit JSON stats instead of plain text]' \
 '--full-rescan[Ignore the source fingerprint and rebuild the selected lexical generation from every cataloged source]' \
-'--cache-extracts[Cache one readable conversation extract per indexed session under \`~/.aicx/extracts/\`. Omit to keep content only in live sources and Tantivy (zero filesystem content duplication)]' \
+'--cache-extracts[Compatibility no-op\: extracts and the reuse ledger are always written now, so a second \`aicx index\` re-parses only changed sessions. Accepted so wizard and scripts keep working]' \
 '--semantic[Opt-in dense semantic generation\: embed session extracts and publish \`dense.exact_mmap_v1.bin\` beside Tantivy in CURRENT. Prefer one workstation owner; laptops stay on plain \`aicx index\`]' \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
@@ -1765,6 +1751,7 @@ _arguments "${_arguments_options[@]}" : \
 '(--dry-run)--apply[With --prune-empty-bodies, move empty-body chunks into recoverable quarantine. With --migrate-identities, execute the planned identity renames. Refuses to combine with --dry-run\: on a archive-mutating surface the preview flag must always win, so the ambiguous combination is a parse error]' \
 '-y[Assume yes on doctor cleanup prompts]' \
 '--yes[Assume yes on doctor cleanup prompts]' \
+'(--clean-retired-steer --fix-buckets --dry-run --rebuild-sidecars --prune-empty-bodies --migrate-identities --apply --restore-quarantine -y --yes --force --check-dedup -v --verbose --smoke --deep --oracle)--repair-runtime[Repair the macOS background runtime in one pass\: preserve the existing MCP bind configuration, point launchd at the public AICX launcher, disable in-process refresh, reload the service, and install the short-lived catalog/index scheduler (every 8640s)]' \
 '--force[Skip dry-run preview and prompts; intended for CI cleanup runs]' \
 '--check-dedup[Report duplicate content_sha256 groups across legacy archive and context-corpus]' \
 '-v[Print recommendations for green checks too]' \
@@ -1858,6 +1845,14 @@ _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
 (junie)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(kimi)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(all)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
@@ -2226,7 +2221,7 @@ _aicx_commands() {
 'claude:Extract Claude sessions into local reports' \
 'codex:Extract Codex sessions into local reports' \
 'all:Extract sessions from all supported agents into local reports' \
-'extract:Extract a single session for one agent — by session id or direct file' \
+'extract:Extract sessions — one at a time, or every compatible source at once' \
 'conversations:Batch-export conversation JSON files without writing per-frame card files' \
 'catalog:Rebuild the durable extract-era session catalog (no per-frame cards)' \
 'store:Rebuild the durable extract-era session catalog (no per-frame cards)' \
@@ -2601,9 +2596,16 @@ _aicx__subcmd__extract_commands() {
 'gemini:Gemini CLI chats (~/.gemini/tmp/<hash>/chats)' \
 'grok:Grok CLI sessions (~/.grok)' \
 'junie:JetBrains Junie event logs (~/.junie/sessions)' \
+'kimi:Kimi Code CLI wire files (~/.kimi-code/sessions)' \
+'all:Every compatible source on this machine, in one incremental pass' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'aicx extract commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__extract__subcmd__all_commands] )) ||
+_aicx__subcmd__extract__subcmd__all_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx extract all commands' commands "$@"
 }
 (( $+functions[_aicx__subcmd__extract__subcmd__claude_commands] )) ||
 _aicx__subcmd__extract__subcmd__claude_commands() {
@@ -2633,9 +2635,16 @@ _aicx__subcmd__extract__subcmd__help_commands() {
 'gemini:Gemini CLI chats (~/.gemini/tmp/<hash>/chats)' \
 'grok:Grok CLI sessions (~/.grok)' \
 'junie:JetBrains Junie event logs (~/.junie/sessions)' \
+'kimi:Kimi Code CLI wire files (~/.kimi-code/sessions)' \
+'all:Every compatible source on this machine, in one incremental pass' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'aicx extract help commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__extract__subcmd__help__subcmd__all_commands] )) ||
+_aicx__subcmd__extract__subcmd__help__subcmd__all_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx extract help all commands' commands "$@"
 }
 (( $+functions[_aicx__subcmd__extract__subcmd__help__subcmd__claude_commands] )) ||
 _aicx__subcmd__extract__subcmd__help__subcmd__claude_commands() {
@@ -2667,10 +2676,20 @@ _aicx__subcmd__extract__subcmd__help__subcmd__junie_commands() {
     local commands; commands=()
     _describe -t commands 'aicx extract help junie commands' commands "$@"
 }
+(( $+functions[_aicx__subcmd__extract__subcmd__help__subcmd__kimi_commands] )) ||
+_aicx__subcmd__extract__subcmd__help__subcmd__kimi_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx extract help kimi commands' commands "$@"
+}
 (( $+functions[_aicx__subcmd__extract__subcmd__junie_commands] )) ||
 _aicx__subcmd__extract__subcmd__junie_commands() {
     local commands; commands=()
     _describe -t commands 'aicx extract junie commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__extract__subcmd__kimi_commands] )) ||
+_aicx__subcmd__extract__subcmd__kimi_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx extract kimi commands' commands "$@"
 }
 (( $+functions[_aicx__subcmd__health_commands] )) ||
 _aicx__subcmd__health_commands() {
@@ -2685,7 +2704,7 @@ _aicx__subcmd__help_commands() {
 'claude:Extract Claude sessions into local reports' \
 'codex:Extract Codex sessions into local reports' \
 'all:Extract sessions from all supported agents into local reports' \
-'extract:Extract a single session for one agent — by session id or direct file' \
+'extract:Extract sessions — one at a time, or every compatible source at once' \
 'conversations:Batch-export conversation JSON files without writing per-frame card files' \
 'catalog:Rebuild the durable extract-era session catalog (no per-frame cards)' \
 'ingest:Ingest operator-owned source documents into the canonical corpus' \
@@ -2896,8 +2915,15 @@ _aicx__subcmd__help__subcmd__extract_commands() {
 'gemini:Gemini CLI chats (~/.gemini/tmp/<hash>/chats)' \
 'grok:Grok CLI sessions (~/.grok)' \
 'junie:JetBrains Junie event logs (~/.junie/sessions)' \
+'kimi:Kimi Code CLI wire files (~/.kimi-code/sessions)' \
+'all:Every compatible source on this machine, in one incremental pass' \
     )
     _describe -t commands 'aicx help extract commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__help__subcmd__extract__subcmd__all_commands] )) ||
+_aicx__subcmd__help__subcmd__extract__subcmd__all_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx help extract all commands' commands "$@"
 }
 (( $+functions[_aicx__subcmd__help__subcmd__extract__subcmd__claude_commands] )) ||
 _aicx__subcmd__help__subcmd__extract__subcmd__claude_commands() {
@@ -2923,6 +2949,11 @@ _aicx__subcmd__help__subcmd__extract__subcmd__grok_commands() {
 _aicx__subcmd__help__subcmd__extract__subcmd__junie_commands() {
     local commands; commands=()
     _describe -t commands 'aicx help extract junie commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__help__subcmd__extract__subcmd__kimi_commands] )) ||
+_aicx__subcmd__help__subcmd__extract__subcmd__kimi_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx help extract kimi commands' commands "$@"
 }
 (( $+functions[_aicx__subcmd__help__subcmd__health_commands] )) ||
 _aicx__subcmd__help__subcmd__health_commands() {

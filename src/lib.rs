@@ -56,6 +56,7 @@ pub mod extraction;
 #[cfg(not(feature = "app"))]
 #[allow(dead_code, unused_imports)]
 mod extraction;
+pub mod git_env;
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
 pub mod hf_cache;
 #[cfg(feature = "app")]
@@ -119,6 +120,7 @@ pub mod state;
 pub mod steer_index;
 #[cfg(feature = "app")]
 mod steer_index_contract;
+mod uuid_shape;
 #[cfg(feature = "app")]
 pub mod validation;
 #[cfg(not(feature = "app"))]

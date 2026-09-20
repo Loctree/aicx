@@ -1,0 +1,62 @@
+{
+  "schema": "aicx.distill.segment_distillate.v1",
+  "agent": "grok",
+  "segment_id": 0,
+  "scope_status": "no_drift_observed",
+  "decision_candidates": [
+    {
+      "text": "Grok speech class now goes through the taxonomy throne. Local `type=user` → `UserMsg` mapping is gone.",
+      "kind": "explicit_choice",
+      "evidence": {
+        "segment_id": 0,
+        "turn_idx": 5,
+        "timestamp": "2026-08-27T18:51:24Z"
+      }
+    },
+    {
+      "text": "LaneOutcome sourced from summary.json",
+      "kind": "summary_json",
+      "evidence": {
+        "segment_id": 0,
+        "turn_idx": 0,
+        "timestamp": "2026-08-27T18:51:24Z"
+      }
+    }
+  ],
+  "gates": [
+    {
+      "command": "cargo test -p aicx-parser --test grok_adapter",
+      "outcome": "pass",
+      "evidence": {
+        "segment_id": 0,
+        "turn_idx": 3,
+        "timestamp": "2026-08-27T18:51:24Z"
+      }
+    }
+  ],
+  "open_questions": [
+    {
+      "kind": "user_report",
+      "text": "Do we still need a W2-T12 extract-level refusal for degenerate 019fdeca?",
+      "evidence": {
+        "segment_id": 0,
+        "turn_idx": 6,
+        "timestamp": "2026-08-27T18:51:24Z"
+      }
+    }
+  ],
+  "handoff_signals": [
+    {
+      "text": "Grok speech class now goes through the taxonomy throne. Local `type=user` → `UserMsg` mapping is gone.\n\n**Commit:** `252caef` on `cut/W2-T9-grok-on-throne` — not pushed.\nGATE=green PHASE=W2 BUILD/LINT/TEST=NOT_ASSESSED (embargo W2)",
+      "evidence": {
+        "segment_id": 0,
+        "turn_idx": 5,
+        "timestamp": "2026-08-27T18:51:24Z"
+      }
+    }
+  ],
+  "outcome": {
+    "agent_outcome": "partial",
+    "ending": null
+  }
+}

@@ -12,12 +12,29 @@ use std::io::Read;
 /// a stale extract. Cap is high enough for current operator sessions; unit
 /// lines are still bounded by [`DEFAULT_MAX_UNIT_BYTES`].
 pub const DEFAULT_MAX_SOURCE_BYTES: usize = 2 * 1024 * 1024 * 1024;
+/// Per-unit cap for line-framed sources: one JSONL record.
 pub const DEFAULT_MAX_UNIT_BYTES: usize = 8 * 1024 * 1024;
+/// Per-unit cap for whole-document sources.
+///
+/// A whole-document artifact is one physical unit by contract (taxonomy §2:
+/// physical = line or whole file), so applying the line cap to it made the
+/// file's size the session's fate: a Gemini conversation lives in one JSON
+/// document, and a 281 MB document holding 39 messages was refused entirely
+/// because one tool result inside it weighed 298 MB. The document is not the
+/// unit that should be bounded at 8 MiB — its nested blocks are, and the
+/// adapter bounds those. This cap only keeps a document from outgrowing what
+/// the process is willing to hold; it sits below the source cap on purpose so
+/// a multi-artifact source still has room for its siblings.
+pub const DEFAULT_MAX_DOCUMENT_BYTES: usize = 1024 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReaderPolicy {
     pub max_source_bytes: usize,
+    /// Bound on one line of a [`SourceFraming::JsonLines`] artifact.
     pub max_unit_bytes: usize,
+    /// Bound on the single unit of a [`SourceFraming::WholeDocument`] or
+    /// [`SourceFraming::Opaque`] artifact.
+    pub max_document_bytes: usize,
 }
 
 impl Default for ReaderPolicy {
@@ -25,6 +42,7 @@ impl Default for ReaderPolicy {
         Self {
             max_source_bytes: DEFAULT_MAX_SOURCE_BYTES,
             max_unit_bytes: DEFAULT_MAX_UNIT_BYTES,
+            max_document_bytes: DEFAULT_MAX_DOCUMENT_BYTES,
         }
     }
 }
@@ -72,7 +90,10 @@ impl RawUnitReader {
     }
 
     pub fn read(&self, source: &SourceHandle) -> Result<SourceRead, ReaderError> {
-        if self.policy.max_source_bytes == 0 || self.policy.max_unit_bytes == 0 {
+        if self.policy.max_source_bytes == 0
+            || self.policy.max_unit_bytes == 0
+            || self.policy.max_document_bytes == 0
+        {
             return Err(ReaderError::InvalidPolicy);
         }
         let mut units = Vec::new();
@@ -103,7 +124,7 @@ impl RawUnitReader {
                 source_material.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
                 source_material.extend_from_slice(artifact_hash.as_bytes());
             }
-            append_units(artifact, &bytes, self.policy.max_unit_bytes, &mut units);
+            append_units(artifact, bytes, self.policy, &mut units);
         }
         Ok(SourceRead {
             units,
@@ -157,10 +178,15 @@ fn read_artifact(artifact: &SourceArtifact, max_bytes: usize) -> Result<Vec<u8>,
     Ok(bytes)
 }
 
+/// Split one artifact's bytes into physical units under `policy`.
+///
+/// Takes the buffer by value: a whole-document artifact *is* its one unit, so
+/// the buffer moves into it instead of being copied. For a 281 MB document
+/// that is the difference between holding it once and holding it twice.
 fn append_units(
     artifact: &SourceArtifact,
-    bytes: &[u8],
-    max_unit_bytes: usize,
+    bytes: Vec<u8>,
+    policy: ReaderPolicy,
     output: &mut Vec<RawUnit>,
 ) {
     match artifact.framing() {
@@ -176,32 +202,59 @@ fn append_units(
                 index += 1;
                 let raw = raw.strip_suffix(b"\r").unwrap_or(raw);
                 let tail = !terminated && is_last;
-                push_unit(artifact, raw, index, tail, max_unit_bytes, output);
+                push_unit(
+                    artifact,
+                    raw.to_vec(),
+                    raw.len(),
+                    index,
+                    tail,
+                    policy.max_unit_bytes,
+                    output,
+                );
             }
         }
         SourceFraming::WholeDocument | SourceFraming::Opaque => {
-            push_unit(artifact, bytes, 1, false, max_unit_bytes, output);
+            let original_len = bytes.len();
+            push_unit(
+                artifact,
+                bytes,
+                original_len,
+                1,
+                false,
+                policy.max_document_bytes,
+                output,
+            );
         }
     }
 }
 
+/// Record one physical unit. `raw` is the unit's full content; it is hashed
+/// whole and then truncated in place to `max_bytes` when oversized, so the
+/// bounded representation never holds more than the cap.
 fn push_unit(
     artifact: &SourceArtifact,
-    raw: &[u8],
+    mut raw: Vec<u8>,
+    original_len: usize,
     physical_ordinal: u64,
     unterminated_tail: bool,
-    max_unit_bytes: usize,
+    max_bytes: usize,
     output: &mut Vec<RawUnit>,
 ) {
-    let oversized = raw.len() > max_unit_bytes;
+    debug_assert_eq!(raw.len(), original_len);
+    let content_hash = sha256_hex(&raw);
+    let oversized = original_len > max_bytes;
+    if oversized {
+        raw.truncate(max_bytes);
+        raw.shrink_to_fit();
+    }
     output.push(RawUnit {
         coverage_ordinal: output.len() as u64 + 1,
         physical_ordinal,
         artifact_name: artifact.name().to_owned(),
         framing: artifact.framing(),
-        bytes: raw[..raw.len().min(max_unit_bytes)].to_vec(),
-        original_bytes: raw.len() as u64,
-        content_hash: sha256_hex(raw),
+        bytes: raw,
+        original_bytes: original_len as u64,
+        content_hash,
         boundary: if oversized {
             UnitBoundary::Oversized
         } else if unterminated_tail {

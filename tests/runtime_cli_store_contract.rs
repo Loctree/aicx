@@ -495,7 +495,7 @@ fn sources_protect_apply_creates_only_local_git_without_remote() {
     assert!(source_root.join(".git").is_dir());
     assert!(source_root.join(".gitignore").is_file());
 
-    let remotes = Command::new("git")
+    let remotes = aicx::git_env::git_command_isolated()
         .arg("-C")
         .arg(&source_root)
         .args(["remote", "-v"])
@@ -957,7 +957,8 @@ fn all_cli_defaults_to_incremental_and_full_rescan_recovers_backfill() {
         .expect("valid timestamp")
         .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     assert_eq!(
-        state["last_processed"]["claude+codex+gemini+junie+grok+codescribe:all"].as_str(),
+        state["last_processed"]["claude+codescribe+codex+cursor+gemini+grok+junie+kimi:all"]
+            .as_str(),
         Some(expected_watermark.as_str())
     );
 

@@ -182,7 +182,9 @@ fn render_mcp_api_payload(root: &std::path::Path, project: &str) -> Value {
 }
 
 fn run_git(checkout: &std::path::Path, args: &[&str]) {
-    let output = Command::new("git")
+    // Git hook session env (GIT_DIR & friends) must not leak into fixture
+    // repos — otherwise `git -C` operates on the caller's repo.
+    let output = aicx::git_env::git_command_isolated()
         .arg("-C")
         .arg(checkout)
         .args(args)

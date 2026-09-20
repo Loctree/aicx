@@ -19,6 +19,8 @@ pub(super) fn infer_agent(path: &Path, content: &str) -> String {
         "codex",
         "gemini",
         "junie",
+        "kimi",
+        "cursor",
         "codescribe",
         "operator-md",
     ] {
