@@ -144,15 +144,19 @@ node -e 'const fs=require("fs");const p=process.argv[1],v=process.argv[2];const 
 exe_suffix=""
 case "$PLATFORM_KEY" in win32-*) exe_suffix=".exe" ;; esac
 for bin in $platform_bins; do
-  src="$NATIVE_BIN_DIR/${bin}${exe_suffix}"
+  # Skeleton files[] carry the .exe suffix on Windows; the native cargo
+  # output name derives from the bare bin name + suffix exactly once.
+  base="${bin%.exe}"
+  src="$NATIVE_BIN_DIR/${base}${exe_suffix}"
   [ -f "$src" ] || die "missing native binary: $src"
-  install -m 0755 "$src" "$work/platform/bin/${bin}${exe_suffix}"
+  install -m 0755 "$src" "$work/platform/bin/${base}${exe_suffix}"
 done
 
 if [ "${SKIP_BIN_CHECK:-0}" != "1" ]; then
   say "binary smoke check (--version)"
   for bin in $platform_bins; do
-    "$work/platform/bin/${bin}${exe_suffix}" --version >/dev/null 2>&1 \
+    base="${bin%.exe}"
+    "$work/platform/bin/${base}${exe_suffix}" --version >/dev/null 2>&1 \
       || die "staged binary failed --version: $bin (SKIP_BIN_CHECK=1 to bypass)"
   done
 fi
