@@ -11,7 +11,7 @@ ifeq (,$(shell command -v cargo 2>/dev/null))
   endif
 endif
 
-.PHONY: all build build-native completions release-binaries install install-bin install-config install-cargo git-hooks install-schedule uninstall-schedule install-service uninstall-service
+.PHONY: all build build-native completions release-binaries install install-npm npm-install install-bin install-config install-cargo git-hooks install-schedule uninstall-schedule install-service uninstall-service
 .PHONY: precheck precheck-native loctree-consumer-check test test-native check fmt fmt-check clippy clippy-native semgrep ci clean help manifest-check
 .PHONY: embeddings-check embeddings-test embeddings-clippy embeddings-hydrate embeddings-info
 .PHONY: version version-show version-check version-check-selftest version-bump version-patch bump-patch changelog-close release-notes release-plan release-prepare release-check release-tag release-push package-check release-bundle release-bundle-only-binaries test-e2e
@@ -90,6 +90,22 @@ release-binaries:
 			fi ;; \
 	esac
 	@$(PYTHON) -c 'import json, pathlib, sys; staging=pathlib.Path(sys.argv[1]); version=sys.argv[2]; commit=sys.argv[3]; data={"source":"loctree-aicx","commit":commit,"components":[{"name":"aicx","version":version,"source":"loctree-aicx"},{"name":"aicx-mcp","version":version,"source":"loctree-aicx"}]}; path=staging/"components"/"loctree-aicx.json"; path.write_text(json.dumps(data, indent=2)+"\n", encoding="utf-8"); print(f"  metadata -> {path}")' "$(STAGING_DIR)" "$(VERSION)" "$$(git rev-parse --short=12 HEAD)"
+
+# Daily dev loop: build the release binaries and reinstall the global npm
+# package from THIS checkout — same on-disk layout as `npm install -g
+# @loctree/aicx` (bin symlinks in <npm prefix>/bin, natives in the scoped
+# platform package). install-npm is an alias of npm-install. Throwaway prefix
+# for testing:
+#   npm_config_prefix=/tmp/aicx-npm make npm-install
+NPM_INSTALL_WORK ?= $(or $(TMPDIR),/tmp)/aicx-npm-install
+
+install-npm: npm-install
+
+npm-install:
+	$(MAKE) release-binaries STAGING_DIR="$(NPM_INSTALL_WORK)/native"
+	bash distribution/npm/install-local.sh \
+		--wrapper distribution/npm/aicx \
+		--native-bin-dir "$(NPM_INSTALL_WORK)/native/bin"
 
 install:
 	./install.sh
