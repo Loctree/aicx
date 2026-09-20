@@ -120,6 +120,7 @@ pub mod state;
 pub mod steer_index;
 #[cfg(feature = "app")]
 mod steer_index_contract;
+mod uuid_shape;
 #[cfg(feature = "app")]
 pub mod validation;
 #[cfg(not(feature = "app"))]

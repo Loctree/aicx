@@ -1033,16 +1033,7 @@ fn kimi_source_identity(path: &Path) -> Option<String> {
     }
 }
 
-pub(crate) fn is_uuid(value: &str) -> bool {
-    value.len() == 36
-        && value.as_bytes().iter().enumerate().all(|(index, byte)| {
-            if matches!(index, 8 | 13 | 18 | 23) {
-                *byte == b'-'
-            } else {
-                byte.is_ascii_hexdigit()
-            }
-        })
-}
+pub(crate) use crate::uuid_shape::is_uuid;
 
 fn validate_identity(raw: &str) -> Option<String> {
     let value = raw.trim();

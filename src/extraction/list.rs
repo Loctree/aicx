@@ -3,7 +3,6 @@ use super::*;
 use crate::extraction::UNPROTECTED_SOURCE_WARNING;
 use crate::importers::codescribe::CODESCRIBE_AGENT;
 use crate::importers::{discover_codescribe_transcripts, discover_operator_markdown};
-use crate::session_catalog::is_uuid;
 
 const JUNIE_EVENTS_FILENAME: &str = "events.jsonl";
 const KIMI_WIRE_FILENAME: &str = "wire.jsonl";

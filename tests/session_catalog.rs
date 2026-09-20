@@ -1,5 +1,7 @@
 #[path = "../src/session_catalog.rs"]
 mod session_catalog;
+#[path = "../src/uuid_shape.rs"]
+mod uuid_shape;
 
 use std::fs;
 use std::path::{Path, PathBuf};

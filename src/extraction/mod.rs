@@ -54,6 +54,8 @@ pub use project::{
 
 const UNPROTECTED_SOURCE_WARNING: &str = "unprotected source material; run `aicx sources protect --root <path> --backend git-local --apply` to opt in";
 
+pub(crate) use crate::uuid_shape::is_uuid;
+
 #[cfg(feature = "app")]
 const IN_FLIGHT_GRACE: StdDuration = StdDuration::from_secs(5 * 60);
 
