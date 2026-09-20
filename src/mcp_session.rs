@@ -515,9 +515,19 @@ pub fn session_matches_project(session: &SessionInfo, filters: &[String]) -> boo
             if trimmed.ends_with('/') {
                 continue;
             }
-            let repo = trimmed.rsplit('/').find(|seg| !seg.is_empty());
-            if let Some(repo) = repo
-                && crate::sessions::encoded_slug_contains_repo(path, repo)
+            // Slash-shaped exact filters (`owner/repo`) keep the FULL needle:
+            // encoded, `owner/repo` becomes `owner-repo`, anchoring the org so
+            // one owner's `mlx-batch-server` cannot match another's when the
+            // decoded path fails. Repo-only matching stays for bare names and
+            // `/repo` wildcards.
+            let slash_shaped = trimmed.contains('/') && !trimmed.starts_with('/');
+            let needle = if slash_shaped {
+                Some(trimmed)
+            } else {
+                trimmed.rsplit('/').find(|seg| !seg.is_empty())
+            };
+            if let Some(needle) = needle
+                && crate::sessions::encoded_slug_contains_repo(path, needle)
             {
                 return true;
             }
@@ -957,6 +967,42 @@ mod tests {
             r#"{{"type":"assistant","message":{{"role":"assistant","content":[{{"type":"text","text":"ok"}}]}},"timestamp":"2026-08-16T12:00:01.000Z"}}"#
         )
         .expect("write assistant");
+    }
+
+    #[test]
+    fn cursor_encoded_fallback_anchors_owner_for_slash_shaped_filters() {
+        let cursor_session = |repo_path: &str| SessionInfo {
+            session_id: "s".into(),
+            agent: "cursor".into(),
+            project: None,
+            repo_path: Some(repo_path.into()),
+            started_at: None,
+            updated_at: None,
+            message_count: 0,
+            user_message_count: 0,
+            agent_message_count: 0,
+            title: None,
+            source_path: PathBuf::from("/tmp/x.jsonl"),
+            association: crate::sessions::Association::Inferred,
+            temporal_confidence: crate::sessions::TemporalConfidence::None,
+        };
+        // Decoded cursor paths lost the real hyphens; only the encoded
+        // fallback can re-find the filter at all.
+        let ours = cursor_session("/users/x/libraxis/mlx/batch/server");
+        let foreign = cursor_session("/users/y/otherorg/mlx/batch/server");
+        let exact = vec!["libraxis/mlx-batch-server".to_string()];
+        assert!(session_matches_project(&ours, &exact));
+        assert!(
+            !session_matches_project(&foreign, &exact),
+            "owner/repo filter must not cross-match another owner's repo (Copilot PR #81)"
+        );
+        // Bare names and /repo wildcards keep repo-only matching.
+        let bare = vec!["mlx-batch-server".to_string()];
+        assert!(session_matches_project(&ours, &bare));
+        assert!(session_matches_project(&foreign, &bare));
+        let wildcard = vec!["/mlx-batch-server".to_string()];
+        assert!(session_matches_project(&ours, &wildcard));
+        assert!(session_matches_project(&foreign, &wildcard));
     }
 
     #[test]
