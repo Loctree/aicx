@@ -36,6 +36,7 @@ fn per_frame_cwd_prevents_cross_repo_session_contamination() {
         frame_kind: Some(FrameKind::UserMsg),
         branch: None,
         cwd: cwd.map(str::to_string),
+        scope_conflict: false,
         timestamp_source: None,
         source_path: None,
         source_sha256: None,
@@ -50,7 +51,7 @@ fn per_frame_cwd_prevents_cross_repo_session_contamination() {
         frame(None, "legacy frame without cwd"),
     ];
 
-    retain_frames_for_project(&mut frames, "Loctree/aicx", None);
+    retain_frames_for_project(&mut frames, "Loctree/aicx", None, false);
 
     assert_eq!(frames.len(), 2);
     assert!(frames.iter().any(|frame| frame.message == "aicx decision"));
@@ -86,7 +87,12 @@ fn per_frame_cwd_prevents_cross_repo_session_contamination() {
         ),
     ];
 
-    retain_frames_for_project(&mut frames, "vetcoders/vibecrafted", Some(suite_checkout));
+    retain_frames_for_project(
+        &mut frames,
+        "vetcoders/vibecrafted",
+        Some(suite_checkout),
+        false,
+    );
 
     assert_eq!(frames.len(), 2, "{frames:?}");
     assert!(frames.iter().any(|frame| frame.message == "suite decision"));
@@ -95,6 +101,53 @@ fn per_frame_cwd_prevents_cross_repo_session_contamination() {
             .iter()
             .any(|frame| frame.message == "suite subdir decision")
     );
+}
+
+#[cfg(feature = "app")]
+#[test]
+fn mixed_session_filter_is_fail_closed_for_unproven_frames() {
+    let frame = |cwd: Option<&str>, conflict: bool, message: &str| crate::timeline::TimelineEntry {
+        timestamp: Utc::now(),
+        agent: "codex".to_string(),
+        session_id: "mixed-session".to_string(),
+        role: "user".to_string(),
+        message: message.to_string(),
+        frame_class: None,
+        lineage_origin: None,
+        frame_kind: Some(FrameKind::UserMsg),
+        branch: None,
+        cwd: cwd.map(str::to_string),
+        scope_conflict: conflict,
+        timestamp_source: None,
+        source_path: None,
+        source_sha256: None,
+        source_line_span: None,
+    };
+    let mut frames = vec![
+        frame(Some("/Users/silver/Git/vista"), false, "vista opening"),
+        frame(Some("/Users/silver/Git/fleet-bus"), false, "fleet-bus turn"),
+        frame(None, false, "no evidence frame"),
+        frame(None, true, "conflicting workdirs frame"),
+    ];
+
+    // Mixed session: only positively Vista-scoped frames survive `-p /vista`.
+    retain_frames_for_project(&mut frames, "/vista", Some("/Users/silver/Git/vista"), true);
+
+    assert_eq!(frames.len(), 1, "{frames:?}");
+    assert_eq!(frames[0].message, "vista opening");
+
+    // Homogeneous session: a no-evidence frame still inherits the bucket.
+    let mut frames = vec![
+        frame(Some("/Users/silver/Git/vista"), false, "vista opening"),
+        frame(None, false, "legacy frame without cwd"),
+    ];
+    retain_frames_for_project(
+        &mut frames,
+        "/vista",
+        Some("/Users/silver/Git/vista"),
+        false,
+    );
+    assert_eq!(frames.len(), 2, "{frames:?}");
 }
 
 fn chunk_path(root: &Path, project: &str, date: &str, name: &str) -> PathBuf {

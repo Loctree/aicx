@@ -44,6 +44,7 @@ pub(crate) fn build_timeline_entry(
         frame_kind: meta.frame_kind,
         branch: meta.branch,
         cwd: meta.cwd,
+        scope_conflict: false,
         timestamp_source: meta.timestamp_source,
         source_path: meta.source_path,
         source_sha256: meta.source_sha256,

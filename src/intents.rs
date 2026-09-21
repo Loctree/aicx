@@ -105,6 +105,7 @@ pub(crate) fn extract_intents_from_root_at_with_stats(
         let cutoff_hours = config.hours.min(i64::MAX as u64) as i64;
         now - Duration::hours(cutoff_hours)
     };
+    let mut mixed_scope = Vec::new();
     let (files, source_errors, corpus_identity_source, live_sessions) = collect_intent_files(
         aicx_home,
         &config.project,
@@ -112,7 +113,60 @@ pub(crate) fn extract_intents_from_root_at_with_stats(
         config.effective_frame_kind(),
         config.live,
         config.hours == 0,
+        &mut mixed_scope,
     )?;
+    extract_intents_from_files_with_stats(
+        config,
+        files,
+        source_errors,
+        corpus_identity_source,
+        live_sessions,
+        mixed_scope,
+    )
+}
+
+/// Record a mixed-workstream candidate once per (agent, session). Called both
+/// from surviving files and from the lanes' pre-filter scope reports, so the
+/// telemetry survives even when the fail-closed project filter removes every
+/// frame of the session from the requested bucket.
+fn note_mixed_scope(
+    mixed_scope: &mut Vec<MixedScopeSession>,
+    agent: &str,
+    session_id: &str,
+    scope: &crate::extraction::conversation::ScopeReport,
+) {
+    if scope.status != aicx_parser::engine::ScopeStatus::MixedCandidate {
+        return;
+    }
+    if mixed_scope
+        .iter()
+        .any(|seen| seen.agent == agent && seen.session_id == session_id)
+    {
+        return;
+    }
+    crate::diagnostics::log_describe(&format!(
+        "intents_mixed_scope agent={} session_id={} cwds={} branches={}",
+        agent,
+        session_id,
+        scope.cwds.join(","),
+        scope.branches.join(",")
+    ));
+    mixed_scope.push(MixedScopeSession {
+        agent: agent.to_string(),
+        session_id: session_id.to_string(),
+        cwds: scope.cwds.clone(),
+        branches: scope.branches.clone(),
+    });
+}
+
+fn extract_intents_from_files_with_stats(
+    config: &IntentsConfig,
+    files: Vec<StoredChunkFile>,
+    source_errors: usize,
+    corpus_identity_source: &str,
+    live_sessions: usize,
+    mut mixed_scope: Vec<MixedScopeSession>,
+) -> Result<IntentExtraction> {
     let scanned_count = files.len();
     let source_paths_verified = source_errors == 0 && verify_stored_chunk_paths(&files);
     let matched_project_buckets = files
@@ -139,27 +193,9 @@ pub(crate) fn extract_intents_from_root_at_with_stats(
         .filter(|file| file.identity_source == PATH_HEURISTIC_IDENTITY_SOURCE)
         .map(|file| file.path.to_string_lossy().into_owned())
         .collect();
-    let mut mixed_scope: Vec<MixedScopeSession> = Vec::new();
     for file in &files {
-        if let Some(scope) = file.scope.as_ref()
-            && scope.status == aicx_parser::engine::ScopeStatus::MixedCandidate
-            && !mixed_scope
-                .iter()
-                .any(|seen| seen.agent == file.agent && seen.session_id == file.session_id)
-        {
-            crate::diagnostics::log_describe(&format!(
-                "intents_mixed_scope agent={} session_id={} cwds={} branches={}",
-                file.agent,
-                file.session_id,
-                scope.cwds.join(","),
-                scope.branches.join(",")
-            ));
-            mixed_scope.push(MixedScopeSession {
-                agent: file.agent.clone(),
-                session_id: file.session_id.clone(),
-                cwds: scope.cwds.clone(),
-                branches: scope.branches.clone(),
-            });
+        if let Some(scope) = file.scope.as_ref() {
+            note_mixed_scope(&mut mixed_scope, &file.agent, &file.session_id, scope);
         }
     }
 
@@ -517,6 +553,7 @@ fn collect_intent_files(
     frame_kind: FrameKind,
     live: bool,
     full_history: bool,
+    mixed_scope: &mut Vec<MixedScopeSession>,
 ) -> Result<(Vec<StoredChunkFile>, usize, &'static str, usize)> {
     // Prefer the committed index: same documents, no transcript re-parse.
     if let Some(files) =
@@ -596,53 +633,17 @@ fn collect_intent_files(
                     continue;
                 }
             };
-        // Scope is judged on the whole session, before the project filter
-        // narrows the frames to one bucket (W2-R1).
-        let scope = crate::extraction::conversation::scope_report_for_entries(&frames);
-        retain_frames_for_project(&mut frames, &identity_project, entry.cwd.as_deref());
-        if frames.is_empty() {
+        let (file, scope) =
+            catalog_frames_to_intent_file(&entry, source_path, frames, cutoff, live_row);
+        note_mixed_scope(mixed_scope, &entry.agent, &entry.session_id, &scope);
+        let Some(file) = file else {
             continue;
-        }
-        let timestamp = frames
-            .last()
-            .map(|frame| frame.timestamp)
-            .expect("non-empty frames have a last timestamp");
-        if canonical_date.is_none() && timestamp < cutoff {
-            continue;
-        }
-        let date = entry
-            .date
-            .clone()
-            .unwrap_or_else(|| timestamp.format("%Y-%m-%d").to_string());
-        let transcript_entries = frames
-            .into_iter()
-            .map(|frame| TranscriptEntry {
-                role: frame.role,
-                lines: frame.message.lines().map(str::to_string).collect(),
-            })
-            .collect();
+        };
         seen_sessions.insert((entry.agent.clone(), entry.session_id.clone()));
         if live_row {
             live_sessions += 1;
         }
-        files.push(StoredChunkFile {
-            agent: entry.agent,
-            date,
-            path: source_path,
-            project: identity_project,
-            identity_source: CATALOG_IDENTITY_SOURCE.to_string(),
-            sequence: 0,
-            timestamp,
-            session_id: entry.session_id,
-            honesty: if live_row {
-                crate::oracle::ClaimHonesty::live_open()
-            } else {
-                crate::oracle::ClaimHonesty::canonical()
-            },
-            scope: Some(scope),
-            transcript_entries: Some(transcript_entries),
-            body: None,
-        });
+        files.push(file);
     }
 
     if live {
@@ -654,6 +655,7 @@ fn collect_intent_files(
             &seen_sessions,
             &mut files,
             &mut source_errors,
+            mixed_scope,
         )?;
     }
 
@@ -663,6 +665,130 @@ fn collect_intent_files(
             .then_with(|| left.path.cmp(&right.path))
     });
     Ok((files, source_errors, CATALOG_IDENTITY_SOURCE, live_sessions))
+}
+
+#[cfg(feature = "app")]
+fn catalog_frames_to_intent_file(
+    entry: &crate::catalog::CatalogEntry,
+    source_path: PathBuf,
+    mut frames: Vec<TimelineEntry>,
+    cutoff: DateTime<Utc>,
+    live_row: bool,
+) -> (
+    Option<StoredChunkFile>,
+    crate::extraction::conversation::ScopeReport,
+) {
+    let scope = crate::extraction::conversation::scope_report_for_entries(&frames);
+    let no_file = |scope: crate::extraction::conversation::ScopeReport| (None, scope);
+    let Some(project) = entry.project.clone() else {
+        return no_file(scope);
+    };
+    // Scope is judged on the whole session, before the project filter narrows
+    // the frames to one bucket — and the report travels even when the filter
+    // removes every frame (fail-closed must not silence mixed evidence).
+    retain_frames_for_project(
+        &mut frames,
+        &project,
+        entry.cwd.as_deref(),
+        scope.status == aicx_parser::engine::ScopeStatus::MixedCandidate,
+    );
+    let Some(timestamp) = frames.last().map(|frame| frame.timestamp) else {
+        return (None, scope);
+    };
+    let canonical_date = entry
+        .date
+        .as_deref()
+        .and_then(|date| NaiveDate::parse_from_str(date, "%Y-%m-%d").ok());
+    if canonical_date.is_none() && timestamp < cutoff {
+        return (None, scope);
+    }
+    (
+        Some(StoredChunkFile {
+            agent: entry.agent.clone(),
+            date: entry
+                .date
+                .clone()
+                .unwrap_or_else(|| timestamp.format("%Y-%m-%d").to_string()),
+            path: source_path,
+            project: project.clone(),
+            identity_source: CATALOG_IDENTITY_SOURCE.to_string(),
+            sequence: 0,
+            timestamp,
+            session_id: entry.session_id.clone(),
+            honesty: if live_row {
+                crate::oracle::ClaimHonesty::live_open()
+            } else {
+                crate::oracle::ClaimHonesty::canonical()
+            },
+            scope: Some(scope.clone()),
+            transcript_entries: Some(
+                frames
+                    .into_iter()
+                    .map(|frame| TranscriptEntry {
+                        role: frame.role,
+                        lines: frame.message.lines().map(str::to_string).collect(),
+                    })
+                    .collect(),
+            ),
+            body: None,
+        }),
+        scope,
+    )
+}
+
+/// Overlay's full-history census uses the same per-lane global caps, task
+/// reconciliation and dedup as `intents`. Only the source-read boundary differs:
+/// a cleaned conversation can be reused for both lanes, including from cache.
+#[cfg(feature = "app")]
+pub(crate) fn extract_overlay_intents_from_conversations(
+    project: &str,
+    conversations: &[(crate::catalog::CatalogEntry, PathBuf, Vec<TimelineEntry>)],
+) -> Result<Vec<IntentRecord>> {
+    let cutoff = DateTime::<Utc>::from_timestamp(0, 0).expect("valid Unix epoch");
+    let mut records = Vec::new();
+    for kind in [FrameKind::UserMsg, FrameKind::AgentReply] {
+        let config = IntentsConfig {
+            project: project.to_owned(),
+            hours: 0,
+            strict: false,
+            min_confidence: None,
+            kind_filter: None,
+            frame_kind: Some(kind),
+            live: false,
+        };
+        let mut files = conversations
+            .iter()
+            .filter_map(|(entry, path, frames)| {
+                let frames = frames
+                    .iter()
+                    .filter(|frame| {
+                        frame.frame_kind.unwrap_or(match frame.role.as_str() {
+                            "user" => FrameKind::UserMsg,
+                            "assistant" => FrameKind::AgentReply,
+                            _ => FrameKind::SystemNote,
+                        }) == kind
+                    })
+                    .cloned()
+                    .collect();
+                catalog_frames_to_intent_file(entry, path.clone(), frames, cutoff, false).0
+            })
+            .collect::<Vec<_>>();
+        files.sort_by(|left, right| {
+            left.timestamp
+                .cmp(&right.timestamp)
+                .then_with(|| left.path.cmp(&right.path))
+        });
+        let extraction = extract_intents_from_files_with_stats(
+            &config,
+            files,
+            0,
+            CATALOG_IDENTITY_SOURCE,
+            0,
+            Vec::new(),
+        )?;
+        records.extend(extraction.records);
+    }
+    Ok(records)
 }
 
 /// Admit sessions the durable catalog census does not know yet (P0 live
@@ -679,6 +805,7 @@ fn collect_live_unadmitted_files(
     seen_sessions: &BTreeSet<(String, String)>,
     files: &mut Vec<StoredChunkFile>,
     source_errors: &mut usize,
+    mixed_scope: &mut Vec<MixedScopeSession>,
 ) -> Result<usize> {
     let user_home = crate::os_user_home().unwrap_or_else(|| aicx_home.to_path_buf());
     let cutoff_unix_ns = cutoff
@@ -728,7 +855,13 @@ fn collect_live_unadmitted_files(
         // Scope is judged on the whole session, before the project filter
         // narrows the frames to one bucket (W2-R1).
         let scope = crate::extraction::conversation::scope_report_for_entries(&frames);
-        retain_frames_for_project(&mut frames, &identity_project, entry.cwd.as_deref());
+        note_mixed_scope(mixed_scope, &entry.agent, &entry.session_id, &scope);
+        retain_frames_for_project(
+            &mut frames,
+            &identity_project,
+            entry.cwd.as_deref(),
+            scope.status == aicx_parser::engine::ScopeStatus::MixedCandidate,
+        );
         if frames.is_empty() {
             continue;
         }
@@ -766,12 +899,17 @@ fn collect_live_unadmitted_files(
     Ok(admitted)
 }
 
-/// Keep per-frame checkout truth ahead of a session's start-directory label.
+/// Keep per-frame checkout truth ahead of a session's start-directory label —
+/// fail-closed inside mixed sessions.
 ///
 /// Agents can `cd` into another repository without starting a new session.
 /// Frames that carry an explicit cwd must therefore prove they still belong
-/// to the requested canonical bucket. Older sources without per-frame cwd
-/// retain the catalog attribution instead of being silently discarded.
+/// to the requested canonical bucket. A frame whose turn-window workdir
+/// evidence conflicted (`scope_conflict`) never proves membership and is
+/// always dropped from a project-filtered query. A frame with NO cwd evidence
+/// inherits the catalog attribution only while the session scope is
+/// homogeneous; once the session is a mixed candidate, silence is not proof
+/// and the frame stays unattributed instead of leaking into the project.
 ///
 /// Membership has two proofs, either suffices:
 /// 1. the frame cwd is the session checkout (or a subdirectory of it) —
@@ -785,22 +923,30 @@ fn retain_frames_for_project(
     frames: &mut Vec<TimelineEntry>,
     project: &str,
     session_cwd: Option<&str>,
+    session_mixed: bool,
 ) {
     let filters = [project.to_string()];
     let session_root = session_cwd
         .map(|cwd| cwd.trim_end_matches(['/', '\\']))
         .filter(|cwd| !cwd.is_empty());
     frames.retain(|frame| {
-        frame.cwd.as_deref().is_none_or(|cwd| {
-            let inside_session_checkout = session_root.is_some_and(|root| {
-                let cwd = cwd.trim_end_matches(['/', '\\']);
-                cwd == root
-                    || cwd
-                        .strip_prefix(root)
-                        .is_some_and(|rest| rest.starts_with('/') || rest.starts_with('\\'))
-            });
-            inside_session_checkout || crate::extraction::project_filter_matches_path(cwd, &filters)
-        })
+        if frame.scope_conflict {
+            return false;
+        }
+        match frame.cwd.as_deref() {
+            Some(cwd) => {
+                let inside_session_checkout = session_root.is_some_and(|root| {
+                    let cwd = cwd.trim_end_matches(['/', '\\']);
+                    cwd == root
+                        || cwd
+                            .strip_prefix(root)
+                            .is_some_and(|rest| rest.starts_with('/') || rest.starts_with('\\'))
+                });
+                inside_session_checkout
+                    || crate::extraction::project_filter_matches_path(cwd, &filters)
+            }
+            None => !session_mixed,
+        }
     });
 }
 
@@ -827,6 +973,7 @@ fn collect_intent_files(
     frame_kind: FrameKind,
     _live: bool,
     _full_history: bool,
+    _mixed_scope: &mut Vec<MixedScopeSession>,
 ) -> Result<(Vec<StoredChunkFile>, usize, &'static str, usize)> {
     // `loctree-consumer` is the legacy read-core profile: it deliberately
     // excludes app-only source discovery and catalog parsing — including the

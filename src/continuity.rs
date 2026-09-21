@@ -120,6 +120,7 @@ pub fn build_with_scope(
                 cwds: first.cwds.clone(),
                 branches: first.branches.clone(),
                 entries: before,
+                conflicts: 0,
             };
             let refusal = crate::extraction::conversation::refuse_mixed_workstream(
                 first.agent_kind(),

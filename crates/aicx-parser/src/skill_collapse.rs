@@ -144,6 +144,7 @@ mod tests {
             frame_kind: None,
             branch: None,
             cwd: None,
+            scope_conflict: false,
             timestamp_source: None,
             source_path: None,
             source_sha256: None,

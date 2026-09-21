@@ -14,6 +14,7 @@ use crate::engine::frames::{
     self, FrameClass, InjectKind, TransportFrame, TransportKind, TransportPayload, TransportRole,
 };
 use crate::engine::frames_rules;
+use crate::engine::scope_evidence::{WindowScope, effective_window_scope, tool_call_workdir};
 use crate::engine::{
     AgentKind, BoundaryFlags, ConsumedUnit, ContextEpochRef, CounterSemantics, CoverageReport,
     CoverageWarning, Known, ParseStatus, Provenance, ProviderConversationRef, RawUnitRef,
@@ -408,6 +409,9 @@ struct Assembly<'a> {
     current_branch: Known<String>,
     segment_started_at: Known<String>,
     segments: Vec<SegmentDraft>,
+    /// Explicit tool-call `workdir` evidence of the open turn window; stronger
+    /// than the `turn_context` baseline when it points at another repo.
+    window_workdirs: Vec<String>,
     turns: Vec<Turn>,
     tools: Vec<ToolEvent>,
     tool_names: BTreeMap<String, String>,
@@ -442,6 +446,9 @@ struct SegmentDraft {
     started_at: Known<String>,
     ended_at: Known<String>,
     start_turn: u64,
+    /// The window's explicit workdir evidence pointed at more than one repo
+    /// identity — mixed/unattributed, never guessed into a project bucket.
+    scope_conflict: bool,
 }
 
 impl<'a> Assembly<'a> {
@@ -462,6 +469,7 @@ impl<'a> Assembly<'a> {
             current_branch: Known::unknown(),
             segment_started_at: Known::unknown(),
             segments: Vec::new(),
+            window_workdirs: Vec::new(),
             turns: Vec::new(),
             tools: Vec::new(),
             tool_names: BTreeMap::new(),
@@ -592,22 +600,54 @@ impl<'a> Assembly<'a> {
         if matches!(model, Known::Value(_)) {
             self.model = model;
         }
-        if cwd != self.current_cwd || branch != self.current_branch {
-            self.close_segment(timestamp.clone());
-            self.current_cwd = cwd;
-            self.current_branch = branch;
-            self.segment_started_at = timestamp;
-            if !self.turns.is_empty() {
-                self.segments.push(SegmentDraft {
-                    cwd: self.current_cwd.clone(),
-                    branch: self.current_branch.clone(),
-                    started_at: self.segment_started_at.clone(),
-                    ended_at: Known::unknown(),
-                    start_turn: self.turns.len() as u64,
-                });
-            }
+        // Every turn_context closes the current turn window for effective-scope
+        // purposes, even without cwd/branch drift: explicit tool-call workdirs
+        // are scoped to the window they ran in. Adjacent windows with identical
+        // effective scope merge back at `finish`, so the segment count only
+        // grows where the scope actually changed.
+        self.finalize_window();
+        self.close_segment(timestamp.clone());
+        self.window_workdirs.clear();
+        self.current_cwd = cwd;
+        self.current_branch = branch;
+        self.segment_started_at = timestamp;
+        if !self.turns.is_empty() {
+            self.segments.push(SegmentDraft {
+                cwd: self.current_cwd.clone(),
+                branch: self.current_branch.clone(),
+                started_at: self.segment_started_at.clone(),
+                ended_at: Known::unknown(),
+                start_turn: self.turns.len() as u64,
+                scope_conflict: false,
+            });
         }
         Ok(())
+    }
+
+    /// Stamp the closing turn window with its effective scope: a window whose
+    /// explicit workdirs all normalize to one repo identity belongs to that
+    /// repo (even when the `turn_context` baseline says otherwise); conflicting
+    /// evidence makes the window mixed/unattributed.
+    fn finalize_window(&mut self) {
+        if self.window_workdirs.is_empty() {
+            return;
+        }
+        let (scope, path) = effective_window_scope(&self.window_workdirs);
+        let Some(segment) = self.segments.last_mut() else {
+            return;
+        };
+        match scope {
+            WindowScope::Baseline => {}
+            WindowScope::Consistent => {
+                if let Some(path) = path {
+                    segment.cwd = Known::value(path);
+                }
+            }
+            WindowScope::Conflict => {
+                segment.cwd = Known::unknown();
+                segment.scope_conflict = true;
+            }
+        }
     }
 
     fn event_msg(
@@ -1043,6 +1083,12 @@ impl<'a> Assembly<'a> {
         kind: ToolEventKind,
     ) -> Result<(), AdapterError> {
         let payload = &event["payload"];
+        if kind == ToolEventKind::Call
+            && let Some(workdir) = tool_call_workdir(payload)
+            && !self.window_workdirs.contains(&workdir)
+        {
+            self.window_workdirs.push(workdir);
+        }
         let correlation_raw = string_at(payload, &["call_id"])
             .or_else(|| string_at(payload, &["id"]))
             .map(str::to_owned);
@@ -1219,6 +1265,7 @@ impl<'a> Assembly<'a> {
                 started_at: self.segment_started_at.clone(),
                 ended_at: Known::unknown(),
                 start_turn: 0,
+                scope_conflict: false,
             });
         }
     }
@@ -1227,6 +1274,34 @@ impl<'a> Assembly<'a> {
         if let Some(segment) = self.segments.last_mut() {
             segment.ended_at = ended_at;
         }
+    }
+
+    /// Merge adjacent finalized turn windows with identical effective scope so
+    /// per-`turn_context` windowing never multiplies the session's segment
+    /// count on its own. Returns the merged drafts plus the old→new index
+    /// remap used to retarget `Turn::segment_id`.
+    fn merge_scope_windows(drafts: &[SegmentDraft]) -> (Vec<SegmentDraft>, Vec<u32>) {
+        let mut merged: Vec<SegmentDraft> = Vec::new();
+        let mut remap = Vec::with_capacity(drafts.len());
+        for draft in drafts {
+            let mergeable = matches!(
+                merged.last(),
+                Some(last)
+                    if last.cwd == draft.cwd
+                        && last.branch == draft.branch
+                        && last.scope_conflict == draft.scope_conflict
+            );
+            if mergeable {
+                if let Some(last) = merged.last_mut() {
+                    last.ended_at = draft.ended_at.clone();
+                }
+                remap.push(merged.len().saturating_sub(1) as u32);
+            } else {
+                remap.push(merged.len() as u32);
+                merged.push(draft.clone());
+            }
+        }
+        (merged, remap)
     }
 
     fn observe_skip(
@@ -1281,6 +1356,7 @@ impl<'a> Assembly<'a> {
     }
 
     fn finish(mut self, classified: Vec<ClassifiedUnit>) -> Result<UnvalidatedParse, AdapterError> {
+        self.finalize_window();
         if let Some(last) = self.segments.last_mut() {
             last.ended_at = self.ended_at.clone();
         }
@@ -1362,25 +1438,35 @@ impl<'a> Assembly<'a> {
         model.usage_events = self.usage;
         model.skill_invocations = self.skills;
         if !model.turns.is_empty() {
-            model.segments = self
-                .segments
+            let (drafts, remap) = Self::merge_scope_windows(&self.segments);
+            for turn in &mut model.turns {
+                if let Some(mapped) = remap.get(turn.segment_id as usize) {
+                    turn.segment_id = *mapped;
+                }
+            }
+            model.segments = drafts
                 .into_iter()
                 .enumerate()
                 .filter_map(|(id, segment)| {
                     let end = model.turns.len() as u64 - 1;
-                    // cwd/branch are constant inside a Codex segment by
-                    // construction (`turn_context` drift opens a new one), so
-                    // the verdict is homogeneous-or-unknown.
-                    let scope_status = ScopeStatus::from_evidence(
-                        match &segment.cwd {
-                            Known::Value(cwd) => Some(cwd.as_str()),
-                            Known::Unknown(_) => None,
-                        },
-                        match &segment.branch {
-                            Known::Value(branch) => Some(branch.as_str()),
-                            Known::Unknown(_) => None,
-                        },
-                    );
+                    // A conflict window is mixed by construction. Otherwise
+                    // cwd/branch are constant inside a Codex segment (the
+                    // effective scope was resolved per turn window), so the
+                    // verdict is homogeneous-or-unknown.
+                    let scope_status = if segment.scope_conflict {
+                        ScopeStatus::MixedCandidate
+                    } else {
+                        ScopeStatus::from_evidence(
+                            match &segment.cwd {
+                                Known::Value(cwd) => Some(cwd.as_str()),
+                                Known::Unknown(_) => None,
+                            },
+                            match &segment.branch {
+                                Known::Value(branch) => Some(branch.as_str()),
+                                Known::Unknown(_) => None,
+                            },
+                        )
+                    };
                     (segment.start_turn <= end).then_some(Segment {
                         segment_id: id as u32,
                         cwd: segment.cwd,
@@ -1933,6 +2019,104 @@ mod tests {
             1
         );
         assert!(base_ids.iter().all(|id| !id.contains('/')));
+    }
+
+    fn temp_repo(label: &str) -> std::path::PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("aicx-codex-scope-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".git")).expect("temp repo git dir");
+        root
+    }
+
+    /// 60b7-shaped: the session baseline stays `vista` in every turn_context,
+    /// but one turn window runs its executable tool calls with an explicit
+    /// foreign workdir. The whole window — including the message BEFORE the
+    /// first tool call — takes the workdir's repo scope.
+    #[test]
+    fn tool_call_workdir_rescopes_the_whole_turn_window() {
+        let fleet = temp_repo("fleet");
+        let fleet_str = fleet.to_string_lossy().into_owned();
+        let template = r#"{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"s1","cwd":"/sessions/vista"}}
+{"timestamp":"2026-01-01T00:01:00Z","type":"turn_context","payload":{"cwd":"/sessions/vista"}}
+{"timestamp":"2026-01-01T00:01:10Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"vista opening question"}]}}
+{"timestamp":"2026-01-01T00:02:00Z","type":"turn_context","payload":{"cwd":"/sessions/vista"}}
+{"timestamp":"2026-01-01T00:02:05Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Biore fleet task"}]}}
+{"timestamp":"2026-01-01T00:02:10Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"c1","input":"const r = await tools.exec_command({cmd:\"npm test\",\"workdir\":\"@FLEET@\"});"}}
+{"timestamp":"2026-01-01T00:03:00Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"fleet summary"}]}}
+{"timestamp":"2026-01-01T00:04:00Z","type":"turn_context","payload":{"cwd":"/sessions/vista"}}
+{"timestamp":"2026-01-01T00:04:10Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"back to vista"}]}}
+"#;
+        let bytes = template.replace("@FLEET@", &fleet_str);
+        let model = parse(bytes.as_bytes(), "s1");
+        assert_eq!(model.segments.len(), 3, "{:?}", model.segments);
+        let seg_cwds: Vec<Option<&str>> = model
+            .segments
+            .iter()
+            .map(|segment| known_value(&segment.cwd))
+            .collect();
+        assert_eq!(
+            seg_cwds,
+            vec![
+                Some("/sessions/vista"),
+                Some(fleet_str.as_str()),
+                Some("/sessions/vista")
+            ]
+        );
+        let fleet_window_turns: Vec<&Turn> = model
+            .turns
+            .iter()
+            .filter(|turn| turn.segment_id == 1)
+            .collect();
+        assert!(
+            fleet_window_turns
+                .iter()
+                .any(|turn| turn.text.contains("Biore fleet task")),
+            "message before the first tool call shares the window scope"
+        );
+        let _ = std::fs::remove_dir_all(&fleet);
+    }
+
+    /// Two explicit workdirs resolving to two real repo roots inside one turn
+    /// window: mixed/unattributed, never guessed into either project.
+    #[test]
+    fn conflicting_workdirs_mark_the_window_mixed() {
+        let repo_a = temp_repo("conflict-a");
+        let repo_b = temp_repo("conflict-b");
+        let template = r#"{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"s1","cwd":"/sessions/vista"}}
+{"timestamp":"2026-01-01T00:01:00Z","type":"turn_context","payload":{"cwd":"/sessions/vista"}}
+{"timestamp":"2026-01-01T00:01:10Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"c1","input":"const a = await tools.exec_command({cmd:\"ls\",\"workdir\":\"@A@\"});"}}
+{"timestamp":"2026-01-01T00:01:20Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"c2","input":"const b = await tools.exec_command({cmd:\"ls\",\"workdir\":\"@B@\"});"}}
+{"timestamp":"2026-01-01T00:02:00Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"worked in two repos"}]}}
+"#;
+        let bytes = template
+            .replace("@A@", &repo_a.to_string_lossy().into_owned())
+            .replace("@B@", &repo_b.to_string_lossy().into_owned());
+        let model = parse(bytes.as_bytes(), "s1");
+        assert_eq!(model.segments.len(), 1, "{:?}", model.segments);
+        assert_eq!(known_value(&model.segments[0].cwd), None);
+        assert_eq!(model.segments[0].scope_status, ScopeStatus::MixedCandidate);
+        let _ = std::fs::remove_dir_all(&repo_a);
+        let _ = std::fs::remove_dir_all(&repo_b);
+    }
+
+    /// Turn windows never multiply segments on their own: repeated
+    /// turn_context records with one homogeneous scope merge back into the
+    /// single segment the session had before windowing.
+    #[test]
+    fn homogeneous_windows_merge_back_into_one_segment() {
+        let bytes = br#"{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"s1","cwd":"/sessions/vista"}}
+{"timestamp":"2026-01-01T00:01:00Z","type":"turn_context","payload":{"cwd":"/sessions/vista"}}
+{"timestamp":"2026-01-01T00:01:10Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"first question"}]}}
+{"timestamp":"2026-01-01T00:02:00Z","type":"turn_context","payload":{"cwd":"/sessions/vista"}}
+{"timestamp":"2026-01-01T00:02:10Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"first answer"}]}}
+{"timestamp":"2026-01-01T00:03:00Z","type":"turn_context","payload":{"cwd":"/sessions/vista"}}
+{"timestamp":"2026-01-01T00:03:10Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"second question"}]}}
+"#;
+        let model = parse(bytes, "s1");
+        assert_eq!(model.segments.len(), 1, "{:?}", model.segments);
+        assert_eq!(known_value(&model.segments[0].cwd), Some("/sessions/vista"));
+        assert!(model.turns.iter().all(|turn| turn.segment_id == 0));
     }
 
     #[test]

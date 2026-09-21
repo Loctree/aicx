@@ -827,6 +827,9 @@ pub fn timeline_entries_from_model(model: &SessionModel) -> Vec<TimelineEntry> {
                 cwd: segment
                     .and_then(|segment| known_str(&segment.cwd))
                     .map(str::to_string),
+                scope_conflict: segment.is_some_and(|segment| {
+                    segment.scope_status == aicx_parser::engine::ScopeStatus::MixedCandidate
+                }),
                 timestamp_source,
                 // The typed model is deliberately path-free; source identity
                 // travels as the provenance content hash.

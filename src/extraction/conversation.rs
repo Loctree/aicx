@@ -761,6 +761,7 @@ pub fn lineage_entries(
             frame_kind: Some(FrameKind::SystemNote),
             branch: None,
             cwd: None,
+            scope_conflict: false,
             timestamp_source: Some("lineage_walk".to_string()),
             source_path: None,
             source_sha256: None,
@@ -858,6 +859,10 @@ pub struct ScopeReport {
     pub cwds: Vec<String>,
     pub branches: Vec<String>,
     pub entries: usize,
+    /// Entries whose turn-window workdir evidence conflicted (more than one
+    /// repo identity). Any conflict makes the span a mixed candidate on its
+    /// own — unknown scope never inherits a project bucket by silence.
+    pub conflicts: usize,
 }
 
 /// Scope from the entries' own `cwd` / `branch` evidence. Unknown values do
@@ -878,15 +883,21 @@ pub fn scope_report_for_entries(entries: &[TimelineEntry]) -> ScopeReport {
         .filter(|branch| !branch.is_empty())
         .map(str::to_owned)
         .collect();
-    let status = ScopeStatus::from_evidence(
-        cwds.iter().map(String::as_str),
-        branches.iter().map(String::as_str),
-    );
+    let conflicts = entries.iter().filter(|entry| entry.scope_conflict).count();
+    let status = if conflicts > 0 {
+        ScopeStatus::MixedCandidate
+    } else {
+        ScopeStatus::from_evidence(
+            cwds.iter().map(String::as_str),
+            branches.iter().map(String::as_str),
+        )
+    };
     ScopeReport {
         status,
         cwds: cwds.into_iter().collect(),
         branches: branches.into_iter().collect(),
         entries: entries.len(),
+        conflicts,
     }
 }
 
@@ -1249,6 +1260,7 @@ mod harness_noise_tests {
             }),
             branch: None,
             cwd: None,
+            scope_conflict: false,
             timestamp_source: None,
             source_path: None,
             source_sha256: None,
@@ -1520,6 +1532,22 @@ mod harness_noise_tests {
         assert!(refuse_mixed_workstream(AgentKind::Claude, "s1", &homogeneous, false).is_none());
         let unknown = scope_report_for_entries(&[entry("user", "no cwd", 3)]);
         assert_eq!(unknown.status, ScopeStatus::Unknown);
+    }
+
+    #[test]
+    fn scope_conflict_frames_make_the_span_a_mixed_candidate() {
+        let mut conflicted = entry("user", "worked in two repos at once", 1);
+        conflicted.cwd = None;
+        conflicted.scope_conflict = true;
+        let report = scope_report_for_entries(std::slice::from_ref(&conflicted));
+        assert_eq!(report.status, ScopeStatus::MixedCandidate);
+        assert_eq!(report.conflicts, 1);
+        // A conflict counts even beside otherwise homogeneous evidence.
+        let mut vista = entry("user", "regular vista turn", 2);
+        vista.cwd = Some("/repos/vista".into());
+        let report = scope_report_for_entries(&[conflicted, vista]);
+        assert_eq!(report.status, ScopeStatus::MixedCandidate);
+        assert_eq!(report.conflicts, 1);
     }
 
     #[test]

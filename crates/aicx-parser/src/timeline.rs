@@ -123,6 +123,10 @@ pub enum CollapseStubKind {
     DedupRef,
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 /// Unified timeline entry from any AI agent source.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TimelineEntry {
@@ -146,6 +150,11 @@ pub struct TimelineEntry {
     pub branch: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    /// The turn window's explicit workdir evidence pointed at more than one
+    /// repo identity — mixed/unattributed scope, never assigned to a project
+    /// bucket by inheritance.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub scope_conflict: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timestamp_source: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

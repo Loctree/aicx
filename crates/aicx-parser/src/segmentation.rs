@@ -481,7 +481,7 @@ fn infer_repo_identity_from_local_git(path: &Path) -> Option<RepoIdentity> {
         })
 }
 
-fn discover_git_root(path: &Path) -> Option<PathBuf> {
+pub(crate) fn discover_git_root(path: &Path) -> Option<PathBuf> {
     let seed = if path.is_file() {
         path.parent()?.to_path_buf()
     } else {
@@ -710,6 +710,7 @@ mod tests {
             message: message.to_string(),
             branch: None,
             cwd: cwd.map(ToOwned::to_owned),
+            scope_conflict: false,
             timestamp_source: None,
             source_path: None,
             source_sha256: None,

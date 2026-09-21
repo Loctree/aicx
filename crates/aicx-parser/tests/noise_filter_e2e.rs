@@ -23,6 +23,7 @@ fn entry(seconds_offset: i64, role: &str, message: &str) -> TimelineEntry {
         frame_kind: None,
         branch: None,
         cwd: None,
+        scope_conflict: false,
         timestamp_source: None,
         source_path: None,
         source_sha256: None,

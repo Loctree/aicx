@@ -211,6 +211,15 @@ session's `scope_status` and its compaction epoch count next to the
 messages. `aicx continuity` refuses to distill one history from a
 `mixed_candidate` session set (`mixed_workstream` refusal) unless asked to.
 
+Project-filtered queries (`-p`) are fail-closed inside mixed sessions. A turn
+window whose executable tool calls consistently name one foreign `workdir`
+takes that repo as its effective scope (the `turn_context` baseline is only
+the default); conflicting workdir evidence makes the window
+mixed/unattributed. Within a mixed session a frame must positively prove
+membership in the requested project — silence and conflicting evidence never
+inherit the session bucket — while homogeneous sessions keep the legacy
+bucket inheritance.
+
 Batch report export remains available through `aicx claude`, `aicx codex`,
 `aicx all`, and `aicx conversations`. Those commands write requested reports,
 not card-mill files.

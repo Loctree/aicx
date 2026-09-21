@@ -18,6 +18,8 @@ use chrono::SecondsFormat;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use aicx_parser::engine::scope_evidence::{WindowScope, effective_window_scope, tool_call_workdir};
+
 use crate::catalog::CatalogEntry;
 use crate::progress::{Heartbeat, NoopReporter, Phase, Reporter};
 use crate::timeline::{FrameKind, TimelineEntry};
@@ -1003,6 +1005,7 @@ fn parse_catalog_source(
                 frame_kind: Some(FrameKind::AgentReply),
                 branch: None,
                 cwd: entry.cwd.clone(),
+                scope_conflict: false,
                 timestamp_source: Some("source_mtime".to_string()),
                 source_path: Some(entry.source_path.clone()),
                 source_sha256: None,
@@ -1135,7 +1138,12 @@ fn parse_large_codex_signal(
     let mut reader = BufReader::new(file);
     let mut frames = Vec::new();
     let mut line_no = 0u64;
-    let mut current_cwd = entry.cwd.clone();
+    // Turn-window effective scope: message frames buffer per window between
+    // `turn_context` records; explicit tool-call workdirs collected inside the
+    // window can re-scope the whole window (never per-frame flip-flop).
+    let mut baseline_cwd = entry.cwd.clone();
+    let mut window_frames: Vec<TimelineEntry> = Vec::new();
+    let mut window_workdirs: Vec<String> = Vec::new();
     while let Some(record) = crate::sanitize::read_line_capped(&mut reader, MAX_JSONL_RECORD_BYTES)?
     {
         line_no += 1;
@@ -1146,6 +1154,7 @@ fn parse_large_codex_signal(
             continue;
         };
         if value.get("type").and_then(serde_json::Value::as_str) == Some("turn_context") {
+            flush_scope_window(&mut window_frames, &mut window_workdirs, &mut frames);
             if let Some(cwd) = value
                 .get("payload")
                 .and_then(|payload| payload.get("cwd"))
@@ -1153,7 +1162,7 @@ fn parse_large_codex_signal(
                 .map(str::trim)
                 .filter(|cwd| !cwd.is_empty())
             {
-                current_cwd = Some(cwd.to_string());
+                baseline_cwd = Some(cwd.to_string());
             }
             continue;
         }
@@ -1163,7 +1172,19 @@ fn parse_large_codex_signal(
         let Some(payload) = value.get("payload") else {
             continue;
         };
-        if payload.get("type").and_then(serde_json::Value::as_str) != Some("message") {
+        let payload_type = payload.get("type").and_then(serde_json::Value::as_str);
+        if matches!(
+            payload_type,
+            Some("function_call") | Some("custom_tool_call")
+        ) {
+            if let Some(workdir) = tool_call_workdir(payload)
+                && !window_workdirs.contains(&workdir)
+            {
+                window_workdirs.push(workdir);
+            }
+            continue;
+        }
+        if payload_type != Some("message") {
             continue;
         }
         let Some(role) = payload.get("role").and_then(serde_json::Value::as_str) else {
@@ -1197,7 +1218,7 @@ fn parse_large_codex_signal(
             .and_then(|raw| chrono::DateTime::parse_from_rfc3339(raw).ok())
             .map(|timestamp| timestamp.with_timezone(&chrono::Utc))
             .unwrap_or_else(chrono::Utc::now);
-        frames.push(TimelineEntry {
+        window_frames.push(TimelineEntry {
             timestamp,
             agent: entry.agent.clone(),
             session_id: entry.session_id.clone(),
@@ -1207,14 +1228,48 @@ fn parse_large_codex_signal(
             lineage_origin: None,
             frame_kind: Some(frame_kind),
             branch: None,
-            cwd: current_cwd.clone(),
+            cwd: baseline_cwd.clone(),
+            scope_conflict: false,
             timestamp_source: Some("record".to_string()),
             source_path: Some(entry.source_path.clone()),
             source_sha256: None,
             source_line_span: Some((line_no, line_no)),
         });
     }
+    flush_scope_window(&mut window_frames, &mut window_workdirs, &mut frames);
     Ok(frames)
+}
+
+/// Stamp a buffered turn window with its effective scope and drain it into the
+/// session frame list: one consistent foreign repo re-scopes the whole window
+/// (including messages before the first tool call); conflicting workdir
+/// evidence marks every frame mixed/unattributed.
+fn flush_scope_window(
+    window_frames: &mut Vec<TimelineEntry>,
+    window_workdirs: &mut Vec<String>,
+    frames: &mut Vec<TimelineEntry>,
+) {
+    if !window_frames.is_empty() {
+        let (scope, path) = effective_window_scope(window_workdirs);
+        match scope {
+            WindowScope::Baseline => {}
+            WindowScope::Consistent => {
+                if let Some(path) = path {
+                    for frame in window_frames.iter_mut() {
+                        frame.cwd = Some(path.clone());
+                    }
+                }
+            }
+            WindowScope::Conflict => {
+                for frame in window_frames.iter_mut() {
+                    frame.cwd = None;
+                    frame.scope_conflict = true;
+                }
+            }
+        }
+        frames.append(window_frames);
+    }
+    window_workdirs.clear();
 }
 
 fn is_signal_frame(frame: &TimelineEntry) -> bool {
@@ -1818,6 +1873,7 @@ mod tests {
             frame_kind: Some(FrameKind::UserMsg),
             branch: None,
             cwd: Some(cwd.to_string()),
+            scope_conflict: false,
             timestamp_source: Some("record".to_string()),
             source_path: None,
             source_sha256: None,
@@ -1983,6 +2039,79 @@ mod tests {
             try_reuse_cached_extract(&root, &entry, &prior, &key, &allow, "ignore-fingerprint")
                 .is_none()
         );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn bounded_reader_stamps_turn_window_effective_scope() {
+        let root = std::env::temp_dir().join(format!(
+            "aicx-bounded-scope-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let fleet = root.join("fleet-bus");
+        let other = root.join("other-repo");
+        fs::create_dir_all(fleet.join(".git")).unwrap();
+        fs::create_dir_all(other.join(".git")).unwrap();
+        let source_path = root
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("rollout.jsonl");
+        fs::create_dir_all(source_path.parent().unwrap()).unwrap();
+        let template = r#"{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"s1","cwd":"/sessions/vista"}}
+{"timestamp":"2026-01-01T00:01:00Z","type":"turn_context","payload":{"cwd":"/sessions/vista"}}
+{"timestamp":"2026-01-01T00:01:10Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"vista opening"}]}}
+{"timestamp":"2026-01-01T00:02:00Z","type":"turn_context","payload":{"cwd":"/sessions/vista"}}
+{"timestamp":"2026-01-01T00:02:05Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Biore fleet task"}]}}
+{"timestamp":"2026-01-01T00:02:10Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"c1","input":"const r = await tools.exec_command({cmd:\"npm test\",\"workdir\":\"@FLEET@\"});"}}
+{"timestamp":"2026-01-01T00:03:00Z","type":"turn_context","payload":{"cwd":"/sessions/vista"}}
+{"timestamp":"2026-01-01T00:03:05Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"c2","input":"const a = await tools.exec_command({cmd:\"ls\",\"workdir\":\"@FLEET@\"});"}}
+{"timestamp":"2026-01-01T00:03:10Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"c3","input":"const b = await tools.exec_command({cmd:\"ls\",\"workdir\":\"@OTHER@\"});"}}
+{"timestamp":"2026-01-01T00:03:20Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"conflicted turn"}]}}
+"#;
+        let body = template
+            .replace("@FLEET@", &fleet.display().to_string())
+            .replace("@OTHER@", &other.display().to_string());
+        fs::write(&source_path, body).unwrap();
+
+        let entry = CatalogEntry {
+            schema: crate::catalog::CATALOG_SCHEMA.to_string(),
+            session_id: "s1".to_string(),
+            agent: "codex".to_string(),
+            project: Some("vista".to_string()),
+            date: Some("2026-01-01".to_string()),
+            cwd: Some("/sessions/vista".to_string()),
+            source_path: source_path.display().to_string(),
+            source_len: None,
+            source_mtime_ns: None,
+            title: None,
+            machine: None,
+            logical_session_id: None,
+        };
+        let allow = crate::source_path::SourceAllowlist::for_operator(&root, &root);
+        let resolved = allow.resolve_file(&source_path).expect("resolve rollout");
+        let frames = parse_large_codex_signal(&entry, &resolved, &allow).expect("bounded parse");
+
+        assert_eq!(frames.len(), 3, "{frames:?}");
+        assert_eq!(frames[0].message, "vista opening");
+        assert_eq!(frames[0].cwd.as_deref(), Some("/sessions/vista"));
+        assert!(!frames[0].scope_conflict);
+        assert_eq!(frames[1].message, "Biore fleet task");
+        assert_eq!(
+            frames[1].cwd.as_deref(),
+            Some(fleet.to_string_lossy().as_ref()),
+            "message before the first tool call shares the window scope"
+        );
+        assert!(!frames[1].scope_conflict);
+        assert_eq!(frames[2].message, "conflicted turn");
+        assert_eq!(frames[2].cwd, None);
+        assert!(frames[2].scope_conflict);
 
         let _ = fs::remove_dir_all(&root);
     }
