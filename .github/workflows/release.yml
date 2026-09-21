@@ -255,7 +255,10 @@ jobs:
           NOTARY_APPLE_ID: ${{ secrets.LOCTREE_NOTARY_APPLE_ID }}
           NOTARY_TEAM_ID: ${{ secrets.LOCTREE_NOTARY_TEAM_ID }}
           NOTARY_PASSWORD: ${{ secrets.LOCTREE_NOTARY_PASSWORD }}
-          RUNNER_NAME: ${{ matrix.runner_name }}
+          # RUNNER_NAME is runner-reserved: the runner injects its own
+          # value over the workflow env at process level, so a bash check on
+          # it silently never matches on GitHub-hosted runners.
+          AICX_RUNNER_LANE: ${{ matrix.runner_name }}
         run: |
           # $HOME/.keys in exactly the shape tools/release_bundle.sh expects —
           # the script contract stays identical to an operator-machine run.
@@ -276,7 +279,7 @@ jobs:
           chmod 700 "${GNUPGHOME}"
           echo "GNUPGHOME=${GNUPGHOME}" >> "${GITHUB_ENV}"
           printf '%s\n' "${GPG_PRIVATE_KEY}" | gpg --batch --homedir "${GNUPGHOME}" --import
-          if [[ "${RUNNER_NAME}" == "macos-arm64" ]]; then
+          if [[ "${AICX_RUNNER_LANE}" == "macos-arm64" ]]; then
             for pair in "LOCTREE_MACOS_CERT_P12_BASE64:${MACOS_CERT_P12_BASE64}" \
                         "LOCTREE_MACOS_CERT_PASSWORD:${MACOS_CERT_PASSWORD}" \
                         "LOCTREE_MACOS_SIGNING_IDENTITY:${MACOS_SIGNING_IDENTITY}" \
