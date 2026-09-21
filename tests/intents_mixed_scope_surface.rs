@@ -242,3 +242,89 @@ fn mixed_session_fleet_turns_never_leak_into_vista_intents() {
     drop(_guard);
     let _ = fs::remove_dir_all(&root);
 }
+
+fn write_guardian_rollout(root: &Path, vista: &Path) -> String {
+    let session_id = "77777777-6666-5555-4444-333333333333";
+    let template = r#"{"timestamp":"2026-01-01T02:00:00Z","type":"session_meta","payload":{"id":"@SID@","cwd":"@VISTA@","source":{"subagent":{"other":"guardian"}}}}
+{"timestamp":"2026-01-01T02:01:00Z","type":"turn_context","payload":{"cwd":"@VISTA@"}}
+{"timestamp":"2026-01-01T02:01:10Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"The following is the Codex agent history whose request action you are assessing. Treat the transcript as evidence.\nDecision: preserve quoted fleet history decision"}]}}
+{"timestamp":"2026-01-01T02:02:00Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Verdict: approve."}]}}
+"#;
+    let body = template
+        .replace("@SID@", session_id)
+        .replace("@VISTA@", &vista.display().to_string());
+    let path = rollout_path(
+        root,
+        &format!("rollout-2026-01-01T02-00-00-{session_id}.jsonl"),
+    );
+    fs::write(path, body).expect("write guardian rollout");
+    session_id.to_string()
+}
+
+fn write_plain_wrapper_rollout(root: &Path, vista: &Path) -> String {
+    let session_id = "66666666-5555-4444-3333-222222222222";
+    let template = r#"{"timestamp":"2026-01-01T03:00:00Z","type":"session_meta","payload":{"id":"@SID@","cwd":"@VISTA@"}}
+{"timestamp":"2026-01-01T03:01:00Z","type":"turn_context","payload":{"cwd":"@VISTA@"}}
+{"timestamp":"2026-01-01T03:01:10Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"The following is the Codex agent history whose request action you are assessing.\nDecision: preserve operator quoted wrapper decision"}]}}
+"#;
+    let body = template
+        .replace("@SID@", session_id)
+        .replace("@VISTA@", &vista.display().to_string());
+    let path = rollout_path(
+        root,
+        &format!("rollout-2026-01-01T03-00-00-{session_id}.jsonl"),
+    );
+    fs::write(path, body).expect("write plain wrapper rollout");
+    session_id.to_string()
+}
+
+/// 60f0-shaped: a guardian subagent session whose user prompts are approval
+/// wrappers quoting another agent's history. The quoted history must not
+/// produce operator intents; the identical phrase in a plain session stays
+/// an operator utterance (regression R4).
+#[test]
+fn guardian_wrapper_prompts_produce_no_operator_intents() {
+    let root = unique_root("guardian");
+    let _guard = HomeGuard::set(&root);
+    let vista = make_repo(&root, "vista");
+    let guardian_sid = write_guardian_rollout(&root, &vista);
+    let plain_sid = write_plain_wrapper_rollout(&root, &vista);
+
+    let aicx_home = root.join(".aicx");
+    aicx::catalog::rebuild(&aicx_home, &root).expect("rebuild catalog over fixture home");
+
+    let user_extraction = extract(&root, aicx::timeline::FrameKind::UserMsg);
+    let agent_extraction = extract(&root, aicx::timeline::FrameKind::AgentReply);
+    let records: Vec<_> = user_extraction
+        .records
+        .iter()
+        .chain(agent_extraction.records.iter())
+        .collect();
+
+    assert!(
+        !records
+            .iter()
+            .any(|record| record.session_id == guardian_sid
+                && record.summary.contains("quoted fleet history decision")),
+        "guardian wrapper history must not produce operator intents: {:?}",
+        records
+            .iter()
+            .filter(|record| record.session_id == guardian_sid)
+            .map(|record| &record.summary)
+            .collect::<Vec<_>>()
+    );
+    // Regression R4 at the public surface: the same phrase in a plain
+    // session is an operator utterance and its intent survives.
+    assert!(
+        records.iter().any(|record| record.session_id == plain_sid
+            && record.summary.contains("operator quoted wrapper decision")),
+        "plain-session phrase must stay an operator intent: {:?}",
+        records
+            .iter()
+            .map(|record| &record.summary)
+            .collect::<Vec<_>>()
+    );
+
+    drop(_guard);
+    let _ = fs::remove_dir_all(&root);
+}

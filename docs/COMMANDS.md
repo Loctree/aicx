@@ -41,7 +41,7 @@ indexing without the deny list.
 
 | Surface | Purpose |
 |---|---|
-| `~/.aicx/catalog/sessions.jsonl` | Session identity, project, agent, date, cwd, source path, title, machine, and source fingerprint |
+| `~/.aicx/catalog/sessions.jsonl` | Session identity, project, agent, date, cwd, source path, title, machine, source fingerprint, and subagent provenance (`session_kind`) |
 | `~/.aicx/extracts/` | Optional whole-session readable extract cache |
 | `~/.aicx/indexed/_all/hybrid/CURRENT` | Pointer to the published global search generation |
 | live agent source roots | Canonical session content |
@@ -218,7 +218,9 @@ the default); conflicting workdir evidence makes the window
 mixed/unattributed. Within a mixed session a frame must positively prove
 membership in the requested project — silence and conflicting evidence never
 inherit the session bucket — while homogeneous sessions keep the legacy
-bucket inheritance.
+bucket inheritance. Codex approval/guardian subagent sessions
+(`session_meta.source.subagent`, cataloged as `session_kind`) classify their
+assessment-wrapper prompts as harness noise, not operator utterances.
 
 Batch report export remains available through `aicx claude`, `aicx codex`,
 `aicx all`, and `aicx conversations`. Those commands write requested reports,

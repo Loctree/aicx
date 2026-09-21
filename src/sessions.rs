@@ -126,6 +126,11 @@ pub struct SessionInfo {
     pub source_path: PathBuf,
     pub association: Association,
     pub temporal_confidence: TemporalConfidence,
+    /// Structural subagent provenance (e.g. `subagent:guardian` from Codex
+    /// `session_meta.source.subagent`): the session's user prompts may be
+    /// harness-generated wrappers rather than operator utterances.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_kind: Option<String>,
 }
 
 /// Decode a Claude project directory name back into a cwd path.
@@ -468,6 +473,7 @@ fn scan_claude_session_file(path: &Path, decoded_cwd: Option<&str>) -> Option<Se
         source_path: path.to_path_buf(),
         association,
         temporal_confidence,
+        session_kind: None,
     })
 }
 
@@ -534,6 +540,7 @@ fn scan_codex_session_file(path: &Path) -> Option<SessionInfo> {
     let mut user_message_count = 0usize;
     let mut agent_message_count = 0usize;
     let mut title: Option<String> = None;
+    let mut session_kind: Option<String> = None;
     // Set only after a line actually parses (see scan_claude_session_file): a
     // garbage-only file reports TemporalConfidence::None, not Partial.
     let mut saw_parsable_line = false;
@@ -572,6 +579,9 @@ fn scan_codex_session_file(path: &Path) -> Option<SessionInfo> {
                     .and_then(|p| p.get("cwd"))
                     .and_then(|c| c.as_str())
                     .map(String::from);
+            }
+            if session_kind.is_none() {
+                session_kind = codex_subagent_session_kind(payload);
             }
             continue;
         }
@@ -624,7 +634,44 @@ fn scan_codex_session_file(path: &Path) -> Option<SessionInfo> {
         source_path: path.to_path_buf(),
         association,
         temporal_confidence,
+        session_kind,
     })
+}
+
+/// Subagent provenance from Codex `session_meta.payload.source.subagent`
+/// (e.g. `{"other": "guardian"}`): the structural marker that the session's
+/// user prompts may be harness-generated wrappers, not operator utterances.
+pub(crate) fn codex_subagent_session_kind(payload: Option<&serde_json::Value>) -> Option<String> {
+    let subagent = payload?.get("source")?.get("subagent")?;
+    match subagent {
+        serde_json::Value::String(name) => Some(format!("subagent:{name}")),
+        serde_json::Value::Object(map) => map
+            .get("other")
+            .and_then(serde_json::Value::as_str)
+            .map(|name| format!("subagent:{name}"))
+            .or_else(|| Some("subagent".to_string())),
+        _ => Some("subagent".to_string()),
+    }
+}
+
+/// Light provenance probe for the catalog hot path: read only until the
+/// first `session_meta` record (bounded) instead of scanning the rollout.
+pub(crate) fn codex_session_kind_from_source(path: &Path) -> Option<String> {
+    let file = fs::File::open(path).ok()?;
+    let reader = BufReader::new(file);
+    for line in reader.lines().map_while(Result::ok).take(64) {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if value.get("type").and_then(|t| t.as_str()) == Some("session_meta") {
+            return codex_subagent_session_kind(value.get("payload"));
+        }
+    }
+    None
 }
 
 /// Discover Grok sessions under `~/.grok/sessions`.
@@ -778,6 +825,7 @@ fn scan_grok_session_file(path: &Path) -> Option<SessionInfo> {
         source_path: path.to_path_buf(),
         association,
         temporal_confidence,
+        session_kind: None,
     })
 }
 
@@ -986,6 +1034,7 @@ fn scan_gemini_session_file(path: &Path, dir_name: &str) -> Option<SessionInfo> 
         source_path: path.to_path_buf(),
         association,
         temporal_confidence,
+        session_kind: None,
     })
 }
 
@@ -1235,6 +1284,7 @@ fn scan_junie_session_file(path: &Path, session_id: &str) -> Option<SessionInfo>
         source_path: path.to_path_buf(),
         association,
         temporal_confidence,
+        session_kind: None,
     })
 }
 
@@ -1434,6 +1484,7 @@ fn scan_kimi_session_file(
         source_path: path.to_path_buf(),
         association: Association::Unknown,
         temporal_confidence,
+        session_kind: None,
     })
 }
 
@@ -1673,6 +1724,7 @@ fn scan_cursor_session_file(path: &Path, decoded_cwd: Option<&str>) -> Option<Se
         source_path: path.to_path_buf(),
         association,
         temporal_confidence,
+        session_kind: None,
     })
 }
 
@@ -2476,6 +2528,49 @@ mod tests {
     }
 
     #[test]
+    fn codex_subagent_provenance_becomes_session_kind() {
+        let root = temp_root("codex_subagent");
+        let day = root.join("2026").join("08").join("27");
+        fs::create_dir_all(&day).unwrap();
+        write_session(
+            &day,
+            "rollout-2026-08-27T03-35-14-01a040db.jsonl",
+            &[
+                r#"{"timestamp":"2026-08-27T01:35:45.863Z","type":"session_meta","payload":{"id":"01a040db-child","cwd":"/Users/tester/Git/vista","source":{"subagent":{"other":"guardian"}}}}"#,
+                r#"{"timestamp":"2026-08-27T01:35:46.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"text":"The following is the Codex agent history whose request action you are assessing."}]}}"#,
+            ],
+        );
+        let sessions = discover_codex_sessions(&root, None);
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(
+            sessions[0].session_kind.as_deref(),
+            Some("subagent:guardian")
+        );
+    }
+
+    #[test]
+    fn codex_plain_session_has_no_session_kind() {
+        let root = temp_root("codex_plain_kind");
+        let day = root.join("2026").join("08").join("27");
+        fs::create_dir_all(&day).unwrap();
+        write_session(
+            &day,
+            "rollout-2026-08-27T04-00-00-02b151ec.jsonl",
+            &[
+                r#"{"timestamp":"2026-08-27T02:00:00.000Z","type":"session_meta","payload":{"id":"02b151ec-plain","cwd":"/Users/tester/Git/vista"}}"#,
+                r#"{"timestamp":"2026-08-27T02:00:01.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"text":"hej"}]}}"#,
+            ],
+        );
+        let sessions = discover_codex_sessions(&root, None);
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session_kind, None);
+    }
+
+    #[test]
     fn discovers_codex_session_from_meta_and_message_stream() {
         let root = temp_root("codex");
         let day = root.join("2026").join("01").join("29");
@@ -2531,6 +2626,7 @@ mod tests {
             source_path: PathBuf::from(format!("/x/{id}.jsonl")),
             association: Association::Exact,
             temporal_confidence: TemporalConfidence::Full,
+            session_kind: None,
         }
     }
 
@@ -3321,6 +3417,7 @@ mod tests {
             source_path: PathBuf::from("/dev/null"),
             association: Association::Inferred,
             temporal_confidence: TemporalConfidence::None,
+            session_kind: None,
         };
         let sessions = vec![mk("cursor"), mk("claude"), mk("gemini")];
         let cursor = select_sessions(sessions.clone(), None, Some("cursor-agent"), None, 0);

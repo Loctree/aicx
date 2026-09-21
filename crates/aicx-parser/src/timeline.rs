@@ -155,6 +155,10 @@ pub struct TimelineEntry {
     /// bucket by inheritance.
     #[serde(default, skip_serializing_if = "is_false")]
     pub scope_conflict: bool,
+    /// Structural subagent provenance of the session (e.g. `subagent:guardian`)
+    /// when known from the catalog; harness-wrapper classification keys on it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_kind: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timestamp_source: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

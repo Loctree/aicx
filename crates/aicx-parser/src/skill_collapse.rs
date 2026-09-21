@@ -145,6 +145,7 @@ mod tests {
             branch: None,
             cwd: None,
             scope_conflict: false,
+            session_kind: None,
             timestamp_source: None,
             source_path: None,
             source_sha256: None,

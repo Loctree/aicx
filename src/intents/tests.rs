@@ -37,6 +37,7 @@ fn per_frame_cwd_prevents_cross_repo_session_contamination() {
         branch: None,
         cwd: cwd.map(str::to_string),
         scope_conflict: false,
+        session_kind: None,
         timestamp_source: None,
         source_path: None,
         source_sha256: None,
@@ -118,6 +119,7 @@ fn mixed_session_filter_is_fail_closed_for_unproven_frames() {
         branch: None,
         cwd: cwd.map(str::to_string),
         scope_conflict: conflict,
+        session_kind: None,
         timestamp_source: None,
         source_path: None,
         source_sha256: None,
@@ -294,6 +296,7 @@ fn live_window_admits_fresh_mtime_rows_and_unadmitted_sessions() {
         title: None,
         machine: Some("test".to_string()),
         logical_session_id: None,
+        session_kind: None,
     };
     fs::write(
         &catalog_path,
@@ -330,6 +333,7 @@ fn live_window_admits_fresh_mtime_rows_and_unadmitted_sessions() {
         title: None,
         machine: Some("test".to_string()),
         logical_session_id: None,
+        session_kind: None,
     };
     let production_user_home = crate::os_user_home().unwrap_or_else(|| root.clone());
     let cutoff_ns = (Utc::now() - chrono::Duration::hours(24))
@@ -425,6 +429,7 @@ fn catalog_source_replaces_retired_cards_for_intent_extraction() {
         title: Some("catalog hydration".to_string()),
         machine: Some("test".to_string()),
         logical_session_id: None,
+        session_kind: None,
     };
     fs::write(
         &catalog_path,

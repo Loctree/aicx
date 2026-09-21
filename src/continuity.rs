@@ -527,6 +527,7 @@ mod tests {
             title: None,
             machine: Some("test".to_string()),
             logical_session_id: None,
+            session_kind: None,
         };
         fs::write(
             &catalog_path,

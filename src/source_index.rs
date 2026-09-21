@@ -37,7 +37,7 @@ const MAX_JSONL_RECORD_BYTES: usize = 2 * 1024 * 1024;
 /// short-circuited forever, leaving search previews full of
 /// `{"type":"thought","data":"..."}` spam. Including this constant forces a
 /// one-shot rebuild so index truth tracks filter truth.
-const SIGNAL_FILTER_VERSION: &str = "signal-v3-workspace-metadata-strip";
+pub(crate) const SIGNAL_FILTER_VERSION: &str = "signal-v4-subagent-provenance";
 
 const PARSE_STATE_SCHEMA: &str = "aicx.source_parse_state.v1";
 const PARSE_STATE_RELPATH: &str = "indexed/_all/source_parse_state.v1.json";
@@ -1006,6 +1006,7 @@ fn parse_catalog_source(
                 branch: None,
                 cwd: entry.cwd.clone(),
                 scope_conflict: false,
+                session_kind: entry.session_kind.clone(),
                 timestamp_source: Some("source_mtime".to_string()),
                 source_path: Some(entry.source_path.clone()),
                 source_sha256: None,
@@ -1051,10 +1052,11 @@ fn parse_catalog_source(
     let distill = Some(crate::extraction::distill::materialize::index_metadata(
         &distillates,
     ));
-    Ok(ParsedCatalogSource {
-        frames: crate::output::timeline_entries_from_model(parsed.model()),
-        distill,
-    })
+    let mut frames = crate::output::timeline_entries_from_model(parsed.model());
+    for frame in &mut frames {
+        frame.session_kind = entry.session_kind.clone();
+    }
+    Ok(ParsedCatalogSource { frames, distill })
 }
 
 /// Read one cataloged session through the same allowlisted, signal-only parser
@@ -1230,6 +1232,7 @@ fn parse_large_codex_signal(
             branch: None,
             cwd: baseline_cwd.clone(),
             scope_conflict: false,
+            session_kind: entry.session_kind.clone(),
             timestamp_source: Some("record".to_string()),
             source_path: Some(entry.source_path.clone()),
             source_sha256: None,
@@ -1279,7 +1282,11 @@ fn is_signal_frame(frame: &TimelineEntry) -> bool {
         None => matches!(frame.role.as_str(), "user" | "assistant"),
     };
     signal_kind
-        && !crate::extraction::is_harness_injected_noise(&frame.role, &frame.message)
+        && crate::extraction::classify_frame_signal(
+            &frame.role,
+            &frame.message,
+            frame.session_kind.as_deref(),
+        ) == crate::extraction::FrameSignalClass::Operator
         && !looks_like_binary_payload(&frame.message)
 }
 
@@ -1809,6 +1816,7 @@ mod tests {
             title: None,
             machine: None,
             logical_session_id: None,
+            session_kind: None,
         };
         let allow = crate::source_path::SourceAllowlist::from_roots([root.clone()]);
 
@@ -1874,6 +1882,7 @@ mod tests {
             branch: None,
             cwd: Some(cwd.to_string()),
             scope_conflict: false,
+            session_kind: None,
             timestamp_source: Some("record".to_string()),
             source_path: None,
             source_sha256: None,
@@ -1934,6 +1943,7 @@ mod tests {
             title: Some("routing".to_string()),
             machine: None,
             logical_session_id: None,
+            session_kind: None,
         };
         let mut prior = SourceParseState {
             schema: PARSE_STATE_SCHEMA.to_string(),
@@ -2093,6 +2103,7 @@ mod tests {
             title: None,
             machine: None,
             logical_session_id: None,
+            session_kind: None,
         };
         let allow = crate::source_path::SourceAllowlist::for_operator(&root, &root);
         let resolved = allow.resolve_file(&source_path).expect("resolve rollout");

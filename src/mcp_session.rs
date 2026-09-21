@@ -773,6 +773,7 @@ fn session_info_for_resolved(agent: AgentKind, resolved: &ResolvedSource) -> Ses
         source_path: path.clone(),
         association: sessions::Association::Unknown,
         temporal_confidence: sessions::TemporalConfidence::None,
+        session_kind: None,
     };
     sessions::find_session_by_id(&guess_user_home(path, agent), &fallback.session_id)
         .unwrap_or(fallback)

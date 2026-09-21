@@ -830,6 +830,9 @@ pub fn timeline_entries_from_model(model: &SessionModel) -> Vec<TimelineEntry> {
                 scope_conflict: segment.is_some_and(|segment| {
                     segment.scope_status == aicx_parser::engine::ScopeStatus::MixedCandidate
                 }),
+                // Catalog provenance is stamped by the catalog read path
+                // (`parse_catalog_source_checked`), which owns the entry.
+                session_kind: None,
                 timestamp_source,
                 // The typed model is deliberately path-free; source identity
                 // travels as the provenance content hash.

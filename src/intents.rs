@@ -621,7 +621,7 @@ fn collect_intent_files(
         }
         let live_row = session_is_hot_live(live, hot);
 
-        let (source_path, mut frames) =
+        let (source_path, frames) =
             match crate::source_index::read_catalog_signal_at(aicx_home, &entry, frame_kind) {
                 Ok(result) => result,
                 Err(error) => {
@@ -734,61 +734,6 @@ fn catalog_frames_to_intent_file(
         }),
         scope,
     )
-}
-
-/// Overlay's full-history census uses the same per-lane global caps, task
-/// reconciliation and dedup as `intents`. Only the source-read boundary differs:
-/// a cleaned conversation can be reused for both lanes, including from cache.
-#[cfg(feature = "app")]
-pub(crate) fn extract_overlay_intents_from_conversations(
-    project: &str,
-    conversations: &[(crate::catalog::CatalogEntry, PathBuf, Vec<TimelineEntry>)],
-) -> Result<Vec<IntentRecord>> {
-    let cutoff = DateTime::<Utc>::from_timestamp(0, 0).expect("valid Unix epoch");
-    let mut records = Vec::new();
-    for kind in [FrameKind::UserMsg, FrameKind::AgentReply] {
-        let config = IntentsConfig {
-            project: project.to_owned(),
-            hours: 0,
-            strict: false,
-            min_confidence: None,
-            kind_filter: None,
-            frame_kind: Some(kind),
-            live: false,
-        };
-        let mut files = conversations
-            .iter()
-            .filter_map(|(entry, path, frames)| {
-                let frames = frames
-                    .iter()
-                    .filter(|frame| {
-                        frame.frame_kind.unwrap_or(match frame.role.as_str() {
-                            "user" => FrameKind::UserMsg,
-                            "assistant" => FrameKind::AgentReply,
-                            _ => FrameKind::SystemNote,
-                        }) == kind
-                    })
-                    .cloned()
-                    .collect();
-                catalog_frames_to_intent_file(entry, path.clone(), frames, cutoff, false).0
-            })
-            .collect::<Vec<_>>();
-        files.sort_by(|left, right| {
-            left.timestamp
-                .cmp(&right.timestamp)
-                .then_with(|| left.path.cmp(&right.path))
-        });
-        let extraction = extract_intents_from_files_with_stats(
-            &config,
-            files,
-            0,
-            CATALOG_IDENTITY_SOURCE,
-            0,
-            Vec::new(),
-        )?;
-        records.extend(extraction.records);
-    }
-    Ok(records)
 }
 
 /// Admit sessions the durable catalog census does not know yet (P0 live
