@@ -4767,8 +4767,10 @@ fn full_history_requests_never_take_the_index_path() {
             &home,
             "vetcoders/aicx",
             chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0).expect("epoch"),
+            crate::timeline::FrameKind::UserMsg,
             false,
             true,
+            &mut Vec::new(),
         )
         .is_none(),
         "full-history requests must fall through to the census"
@@ -4781,8 +4783,10 @@ fn full_history_requests_never_take_the_index_path() {
             &home,
             "vetcoders/aicx",
             chrono::Utc::now(),
+            crate::timeline::FrameKind::UserMsg,
             true,
             false,
+            &mut Vec::new(),
         )
         .is_none(),
         "hot-window requests must fall through to the census"

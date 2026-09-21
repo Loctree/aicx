@@ -626,8 +626,9 @@ impl<'a> Assembly<'a> {
 
     /// Stamp the closing turn window with its effective scope: a window whose
     /// explicit workdirs all normalize to one repo identity belongs to that
-    /// repo (even when the `turn_context` baseline says otherwise); conflicting
-    /// evidence makes the window mixed/unattributed.
+    /// repo (even when the `turn_context` baseline says otherwise); proven
+    /// divergence marks the window conflicted, while unresolved evidence keeps
+    /// the baseline without ever stamping the raw path.
     fn finalize_window(&mut self) {
         if self.window_workdirs.is_empty() {
             return;
@@ -637,7 +638,6 @@ impl<'a> Assembly<'a> {
             return;
         };
         match scope {
-            WindowScope::Baseline => {}
             WindowScope::Consistent => {
                 if let Some(path) = path {
                     segment.cwd = Known::value(path);
@@ -647,6 +647,9 @@ impl<'a> Assembly<'a> {
                 segment.cwd = Known::unknown();
                 segment.scope_conflict = true;
             }
+            // Unresolved evidence says nothing: keep the baseline scope, never
+            // stamp the raw unresolvable path.
+            WindowScope::Baseline | WindowScope::Unattributed => {}
         }
     }
 

@@ -472,8 +472,10 @@ fn collect_intent_files_from_index(
     aicx_home: &Path,
     project: &str,
     cutoff: DateTime<Utc>,
+    frame_kind: FrameKind,
     live: bool,
     full_history: bool,
+    mixed_scope: &mut Vec<MixedScopeSession>,
 ) -> Option<Vec<StoredChunkFile>> {
     if live || full_history {
         return None;
@@ -504,6 +506,7 @@ fn collect_intent_files_from_index(
         .ok()?;
 
     let mut files = Vec::with_capacity(chunks.len());
+    let mut mixed_ids: BTreeSet<(String, String)> = BTreeSet::new();
     for chunk in chunks {
         let metadata = &chunk.metadata;
         let field = |key: &str| {
@@ -513,6 +516,26 @@ fn collect_intent_files_from_index(
                 .unwrap_or_default()
                 .to_string()
         };
+        // Guardian sessions are control-plane evidence: kept whole in the
+        // index for forensic search, never served as operator intents.
+        if crate::sessions::is_guardian_session_kind(
+            metadata
+                .get("session_kind")
+                .and_then(|value| value.as_str()),
+        ) {
+            continue;
+        }
+        // Whole-session chunks cannot express per-frame scope. A session
+        // flagged mixed at index build is re-sourced through the census lane
+        // (fail-closed per-frame filter) instead of being served raw.
+        if metadata
+            .get("scope_conflict")
+            .and_then(|value| value.as_bool())
+            == Some(true)
+        {
+            mixed_ids.insert((field("agent"), field("session_id")));
+            continue;
+        }
         let date = field("date");
         let Some(timestamp) = NaiveDate::parse_from_str(&date, "%Y-%m-%d")
             .ok()
@@ -537,6 +560,27 @@ fn collect_intent_files_from_index(
         });
     }
 
+    if !mixed_ids.is_empty()
+        && let Ok(entries) = crate::catalog::read_entries_at(aicx_home)
+    {
+        for entry in entries {
+            if !mixed_ids.contains(&(entry.agent.clone(), entry.session_id.clone())) {
+                continue;
+            }
+            let Ok((source_path, frames)) =
+                crate::source_index::read_catalog_signal_at(aicx_home, &entry, frame_kind)
+            else {
+                continue;
+            };
+            let (file, scope) =
+                catalog_frames_to_intent_file(&entry, source_path, frames, cutoff, false);
+            note_mixed_scope(mixed_scope, &entry.agent, &entry.session_id, &scope);
+            if let Some(file) = file {
+                files.push(file);
+            }
+        }
+    }
+
     files.sort_by(|left, right| {
         left.timestamp
             .cmp(&right.timestamp)
@@ -556,9 +600,15 @@ fn collect_intent_files(
     mixed_scope: &mut Vec<MixedScopeSession>,
 ) -> Result<(Vec<StoredChunkFile>, usize, &'static str, usize)> {
     // Prefer the committed index: same documents, no transcript re-parse.
-    if let Some(files) =
-        collect_intent_files_from_index(aicx_home, project, cutoff, live, full_history)
-    {
+    if let Some(files) = collect_intent_files_from_index(
+        aicx_home,
+        project,
+        cutoff,
+        frame_kind,
+        live,
+        full_history,
+        mixed_scope,
+    ) {
         return Ok((files, 0, INDEX_IDENTITY_SOURCE, 0));
     }
 
@@ -591,6 +641,12 @@ fn collect_intent_files(
         if !project.trim().is_empty()
             && !legacy_archive::project_filter_matches(organization, repository, project)
         {
+            continue;
+        }
+        // Guardian sessions are control-plane approval machinery: kept whole
+        // in the catalog, extract and forensic search, but never part of the
+        // operator project-intent stream.
+        if crate::sessions::is_guardian_session_kind(entry.session_kind.as_deref()) {
             continue;
         }
 
@@ -680,6 +736,11 @@ fn catalog_frames_to_intent_file(
 ) {
     let scope = crate::extraction::conversation::scope_report_for_entries(&frames);
     let no_file = |scope: crate::extraction::conversation::ScopeReport| (None, scope);
+    // Defensive: guardian sessions are control-plane evidence and never enter
+    // the intent stream, regardless of which lane called us.
+    if crate::sessions::is_guardian_session_kind(entry.session_kind.as_deref()) {
+        return no_file(scope);
+    }
     let Some(project) = entry.project.clone() else {
         return no_file(scope);
     };
@@ -783,6 +844,11 @@ fn collect_live_unadmitted_files(
         if !project.trim().is_empty()
             && !legacy_archive::project_filter_matches(organization, repository, project)
         {
+            continue;
+        }
+        // Same control-plane exclusion as the census lane: guardian sessions
+        // never enter the operator project-intent stream.
+        if crate::sessions::is_guardian_session_kind(entry.session_kind.as_deref()) {
             continue;
         }
         let (source_path, mut frames) =

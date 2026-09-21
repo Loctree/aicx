@@ -654,6 +654,14 @@ pub(crate) fn codex_subagent_session_kind(payload: Option<&serde_json::Value>) -
     }
 }
 
+/// Guardian/approval-assessor provenance: the session is control-plane
+/// machinery (wrapper prompts in, verdicts out) — meaningful audit evidence,
+/// but never operator project-intent. Generic subagents do real work and are
+/// NOT covered by this predicate.
+pub(crate) fn is_guardian_session_kind(session_kind: Option<&str>) -> bool {
+    session_kind.is_some_and(|kind| kind.starts_with("subagent:guardian"))
+}
+
 /// Light provenance probe for the catalog hot path: read only until the
 /// first `session_meta` record (bounded) instead of scanning the rollout.
 pub(crate) fn codex_session_kind_from_source(path: &Path) -> Option<String> {

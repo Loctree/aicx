@@ -38,8 +38,7 @@ pub mod project;
 pub mod projection;
 
 pub use conversation::{
-    ConversationProjection, FrameSignalClass, classify_frame_signal, is_harness_injected_noise,
-    to_conversation, to_conversation_with_stats,
+    ConversationProjection, is_harness_injected_noise, to_conversation, to_conversation_with_stats,
 };
 pub(crate) use conversation::{IntentLineModality, intent_line_modality};
 pub(crate) use files::{MAX_LINE_BYTES, walk_jsonl_files};

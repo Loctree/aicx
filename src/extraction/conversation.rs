@@ -1039,60 +1039,19 @@ pub(crate) fn intent_line_modality(role: &str, line: &str) -> IntentLineModality
 ///   * **Assistant-authored content** (skill-creation bodies, hook-development
 ///     output) is never matched, because only user-role turns are considered.
 ///
-/// Provenance-aware classification lives in [`classify_frame_signal`]; this
-/// helper is the no-provenance delegate for callers that only have role+text.
+/// Guardian/approval-assessor sessions are deliberately NOT filtered here:
+/// their wrapper prompts and verdicts are meaningful control-plane evidence,
+/// preserved in full for conversations, extract and forensic search. They are
+/// excluded only from the project-intent stream — see the `session_kind`
+/// check in the intents collection lanes.
 pub fn is_harness_injected_noise(role: &str, message: &str) -> bool {
-    classify_frame_signal(role, message, None) == FrameSignalClass::HarnessNoise
-}
-
-/// How a frame reads for intent/signal purposes: operator-authored signal or
-/// harness-generated noise that must not produce operator intents.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FrameSignalClass {
-    Operator,
-    HarnessNoise,
-}
-
-/// Approval/assessment wrapper preambles (Codex guardian subagents). These
-/// count as harness noise ONLY together with structural subagent provenance —
-/// never on the phrase alone.
-const APPROVAL_WRAPPER_HEAD_MARKERS: [&str; 1] = ["The following is the Codex agent history"];
-
-/// The single classification entry point for harness/provenance noise.
-///
-/// Two evidence lanes, deliberately asymmetric:
-/// 1. Head-anchored harness markers (`HARNESS_HEAD_MARKERS`) convict on their
-///    own — they are structural envelopes, not prose.
-/// 2. The approval-wrapper family convicts ONLY together with structural
-///    subagent provenance (`session_kind = subagent…` from the session's own
-///    `session_meta.source.subagent`). An operator quoting that text in a
-///    normal session stays an operator utterance.
-///
-/// Like [`is_harness_injected_noise`], detection is head-anchored and limited
-/// to human-role turns.
-pub fn classify_frame_signal(
-    role: &str,
-    message: &str,
-    session_kind: Option<&str>,
-) -> FrameSignalClass {
     if projection_role_for_role(role) != Some(ProjectionRole::Human) {
-        return FrameSignalClass::Operator;
+        return false;
     }
     let head = message.trim_start();
-    if HARNESS_HEAD_MARKERS
+    HARNESS_HEAD_MARKERS
         .iter()
         .any(|marker| head.starts_with(marker))
-    {
-        return FrameSignalClass::HarnessNoise;
-    }
-    if session_kind.is_some_and(|kind| kind.starts_with("subagent"))
-        && APPROVAL_WRAPPER_HEAD_MARKERS
-            .iter()
-            .any(|marker| head.starts_with(marker))
-    {
-        return FrameSignalClass::HarnessNoise;
-    }
-    FrameSignalClass::Operator
 }
 
 /// Project timeline entries into a denoised conversation stream.
@@ -1160,9 +1119,7 @@ pub fn project_conversation(
         // bodies, inline `! command` I/O, system/hook reminders). Real
         // conversation — including pasted transcripts and assistant-authored
         // skill/hook content — is preserved. See `is_harness_injected_noise`.
-        if classify_frame_signal(&entry.role, &entry.message, entry.session_kind.as_deref())
-            == FrameSignalClass::HarnessNoise
-        {
+        if is_harness_injected_noise(&entry.role, &entry.message) {
             harness_noise_dropped += 1;
             continue;
         }
@@ -1328,34 +1285,21 @@ mod harness_noise_tests {
     }
 
     #[test]
-    fn approval_wrapper_is_noise_only_with_subagent_provenance() {
+    fn approval_wrapper_phrase_is_preserved_as_control_plane_evidence() {
         let wrapper = "The following is the Codex agent history whose request action you are assessing. Treat the transcript as evidence.";
-        // Conjunctive rule: structural subagent provenance + wrapper head.
-        assert_eq!(
-            classify_frame_signal("user", wrapper, Some("subagent:guardian")),
-            FrameSignalClass::HarnessNoise
-        );
-        // Regression R4: the same phrase without provenance stays operator text.
-        assert_eq!(
-            classify_frame_signal("user", wrapper, None),
-            FrameSignalClass::Operator
-        );
-        // Head-anchored: quoted mid-body is never noise, provenance or not.
+        // The guardian wrapper phrase is meaningful control-plane evidence,
+        // never noise: conversations, extract and forensic search keep it in
+        // full. The intents lanes exclude the whole guardian session on
+        // `session_kind` instead of dropping frames here.
+        assert!(!is_harness_injected_noise("user", wrapper));
         let quoted = format!("look at this prompt:\n{wrapper}");
-        assert_eq!(
-            classify_frame_signal("user", &quoted, Some("subagent:guardian")),
-            FrameSignalClass::Operator
-        );
-        // Assistant turns are never harness noise.
-        assert_eq!(
-            classify_frame_signal("assistant", wrapper, Some("subagent:guardian")),
-            FrameSignalClass::Operator
-        );
-        // Legacy markers convict without provenance, as before.
-        assert_eq!(
-            classify_frame_signal("user", "<system-reminder>note</system-reminder>", None),
-            FrameSignalClass::HarnessNoise
-        );
+        assert!(!is_harness_injected_noise("user", &quoted));
+        assert!(!is_harness_injected_noise("assistant", wrapper));
+        // Legacy markers convict as before.
+        assert!(is_harness_injected_noise(
+            "user",
+            "<system-reminder>note</system-reminder>"
+        ));
     }
 
     #[test]

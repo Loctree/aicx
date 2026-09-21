@@ -39,10 +39,15 @@ impl WorkdirIdentity {
 pub enum WindowScope {
     /// No explicit workdir evidence — keep the `turn_context` baseline.
     Baseline,
-    /// Every explicit workdir in the window normalizes to one identity.
+    /// Every explicit workdir in the window normalizes to one resolved repo
+    /// identity — positive attribution at the repo root.
     Consistent,
-    /// More than one distinct repo identity — mixed/unattributed, no guessing.
+    /// Two or more distinct resolved repo identities — proven divergence.
     Conflict,
+    /// Workdir evidence exists but does not resolve to a git checkout
+    /// (historical/deleted/foreign path). "I don't know" — never a positive
+    /// attribution, and not proof of divergence either.
+    Unattributed,
 }
 
 /// Extract an explicit `workdir` from an executable tool call payload.
@@ -100,8 +105,10 @@ pub fn normalize_workdir(path: &str) -> WorkdirIdentity {
 /// checkout are one scope). Unresolved paths stay distinct unless nested under
 /// a resolved root from the same window. The caller keeps the `turn_context`
 /// baseline on [`WindowScope::Baseline`], stamps the [`WindowScope::Consistent`]
-/// identity path on the whole window, and marks the window mixed/unattributed
-/// on [`WindowScope::Conflict`].
+/// identity path on the whole window, marks the window proven-divergent on
+/// [`WindowScope::Conflict`] (two or more resolved roots), and treats
+/// [`WindowScope::Unattributed`] as "evidence exists but says nothing": never a
+/// positive attribution, never proof of divergence.
 pub fn effective_window_scope(workdirs: &[String]) -> (WindowScope, Option<String>) {
     let identities: Vec<WorkdirIdentity> =
         workdirs.iter().map(|raw| normalize_workdir(raw)).collect();
@@ -130,13 +137,26 @@ pub fn effective_window_scope(workdirs: &[String]) -> (WindowScope, Option<Strin
             distinct.push(identity);
         }
     }
+    let resolved_count = distinct
+        .iter()
+        .filter(|identity| matches!(identity, WorkdirIdentity::Resolved(_)))
+        .count();
+    if resolved_count >= 2 {
+        return (WindowScope::Conflict, None);
+    }
+    if distinct
+        .iter()
+        .any(|identity| matches!(identity, WorkdirIdentity::Unresolved(_)))
+    {
+        return (WindowScope::Unattributed, None);
+    }
     match distinct.len() {
         0 => (WindowScope::Baseline, None),
         1 => (
             WindowScope::Consistent,
             distinct.first().map(WorkdirIdentity::scope_path),
         ),
-        _ => (WindowScope::Conflict, None),
+        _ => unreachable!("two distinct identities with fewer than two resolved"),
     }
 }
 
@@ -208,14 +228,33 @@ mod tests {
     }
 
     #[test]
-    fn unresolved_paths_stay_conservatively_distinct() {
+    fn unresolved_paths_are_unattributed_never_positive_never_conflict() {
         let missing_a = "/definitely/missing/aicx-scope-a";
         let missing_b = "/definitely/missing/aicx-scope-b";
-        let (scope, _) = effective_window_scope(&[missing_a.to_string(), missing_b.to_string()]);
-        assert_eq!(scope, WindowScope::Conflict);
+        // One unresolved workdir: not a positive attribution (no scope path
+        // stamped), and not proof of divergence either — just "unknown".
         let (single, path) = effective_window_scope(std::slice::from_ref(&missing_a.to_string()));
-        assert_eq!(single, WindowScope::Consistent);
-        assert_eq!(path.as_deref(), Some(missing_a));
+        assert_eq!(single, WindowScope::Unattributed);
+        assert_eq!(path, None);
+        // Two distinct unresolved paths: still unknown, not a proven conflict.
+        let (scope, path) = effective_window_scope(&[missing_a.to_string(), missing_b.to_string()]);
+        assert_eq!(scope, WindowScope::Unattributed);
+        assert_eq!(path, None);
+    }
+
+    #[test]
+    fn resolved_plus_unresolved_is_unattributed_not_conflict() {
+        let root = std::env::temp_dir().join(format!("aicx-scope-mixed-{}", std::process::id()));
+        let repo = root.join("repo");
+        std::fs::create_dir_all(repo.join(".git")).expect("git dir");
+        let workdirs = vec![
+            repo.to_string_lossy().into_owned(),
+            "/definitely/missing/aicx-scope-elsewhere".to_string(),
+        ];
+        let (scope, path) = effective_window_scope(&workdirs);
+        assert_eq!(scope, WindowScope::Unattributed);
+        assert_eq!(path, None);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

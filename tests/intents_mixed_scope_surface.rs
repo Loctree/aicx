@@ -278,10 +278,11 @@ fn write_plain_wrapper_rollout(root: &Path, vista: &Path) -> String {
     session_id.to_string()
 }
 
-/// 60f0-shaped: a guardian subagent session whose user prompts are approval
-/// wrappers quoting another agent's history. The quoted history must not
-/// produce operator intents; the identical phrase in a plain session stays
-/// an operator utterance (regression R4).
+/// 60f0-shaped: a guardian subagent session is control-plane approval
+/// machinery — wrapper prompts in, verdicts out. The whole session is
+/// preserved in the catalog/extract/search as audit evidence but yields zero
+/// operator intents; the identical wrapper phrase in a plain session stays an
+/// operator utterance (regression R4).
 #[test]
 fn guardian_wrapper_prompts_produce_no_operator_intents() {
     let root = unique_root("guardian");
@@ -304,9 +305,8 @@ fn guardian_wrapper_prompts_produce_no_operator_intents() {
     assert!(
         !records
             .iter()
-            .any(|record| record.session_id == guardian_sid
-                && record.summary.contains("quoted fleet history decision")),
-        "guardian wrapper history must not produce operator intents: {:?}",
+            .any(|record| record.session_id == guardian_sid),
+        "guardian session is control-plane evidence and must produce no operator intents at all: {:?}",
         records
             .iter()
             .filter(|record| record.session_id == guardian_sid)
@@ -323,6 +323,127 @@ fn guardian_wrapper_prompts_produce_no_operator_intents() {
             .iter()
             .map(|record| &record.summary)
             .collect::<Vec<_>>()
+    );
+
+    drop(_guard);
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// The production read path: a committed CURRENT index plus a finite,
+/// non-live window. Whole-session index chunks cannot express per-frame
+/// scope, so a session flagged mixed at index build must fall back to the
+/// census lane (fail-closed per frame), and guardian sessions must not
+/// surface at all. `identity_source == "index-v1"` proves this run really
+/// went through the index lane — the complaint class the first test (which
+/// forces the census path with `hours: 0`) cannot see.
+#[test]
+fn index_lane_falls_back_to_census_for_mixed_and_drops_guardian() {
+    let root = unique_root("indexlane");
+    let _guard = HomeGuard::set(&root);
+    let vista = make_repo(&root, "vista");
+    let fleet = make_repo(&root, "fleet-bus");
+    let other = make_repo(&root, "other-repo");
+    let mixed_sid = write_mixed_rollout(&root, &vista, &fleet, &other);
+    let control_sid = write_homogeneous_rollout(&root, &vista);
+    let guardian_sid = write_guardian_rollout(&root, &vista);
+
+    let aicx_home = root.join(".aicx");
+    aicx::catalog::rebuild(&aicx_home, &root).expect("rebuild catalog over fixture home");
+    aicx::source_index::build(&aicx_home, &[], false, true, false)
+        .expect("publish CURRENT index over fixture home");
+
+    let config = |frame_kind: aicx::timeline::FrameKind| IntentsConfig {
+        project: "vista".to_string(),
+        // Finite window covering the 2026-01 fixture dates; not 0 (would
+        // disable the index lane) and not ≤48h (would trigger live scan).
+        hours: 100_000,
+        strict: false,
+        min_confidence: None,
+        kind_filter: None,
+        frame_kind: Some(frame_kind),
+        live: false,
+    };
+    let user_extraction = Aicx::with_aicx_home(&aicx_home)
+        .extract_intents(&config(aicx::timeline::FrameKind::UserMsg))
+        .expect("extract user intents through public API");
+    let agent_extraction = Aicx::with_aicx_home(&aicx_home)
+        .extract_intents(&config(aicx::timeline::FrameKind::AgentReply))
+        .expect("extract agent intents through public API");
+
+    // The committed index served this run — the production lane under test.
+    assert_eq!(
+        user_extraction.stats.identity_source, "index-v1",
+        "test must exercise the index lane, not the census fallback"
+    );
+
+    let records: Vec<_> = user_extraction
+        .records
+        .iter()
+        .chain(agent_extraction.records.iter())
+        .collect();
+
+    // Guardian sessions are control-plane evidence: zero operator intents
+    // through the index lane as well.
+    assert!(
+        !records
+            .iter()
+            .any(|record| record.session_id == guardian_sid),
+        "guardian session leaked through the index lane: {:?}",
+        records
+            .iter()
+            .filter(|record| record.session_id == guardian_sid)
+            .map(|record| &record.summary)
+            .collect::<Vec<_>>()
+    );
+
+    // The mixed session is re-sourced through the census lane: fleet and
+    // conflicted windows stay out of `-p vista`, the vista opening survives.
+    let mixed_records: Vec<_> = records
+        .iter()
+        .filter(|record| record.session_id == mixed_sid)
+        .collect();
+    for record in &mixed_records {
+        let text = format!("{} {:?}", record.summary, record.evidence);
+        assert!(
+            !text.contains("fleet bus decision"),
+            "fleet window leaked through the index lane: {text}"
+        );
+        assert!(
+            !text.contains("conflicted turn decision"),
+            "conflicted window leaked through the index lane: {text}"
+        );
+    }
+    assert!(
+        mixed_records
+            .iter()
+            .any(|record| record.summary.contains("vista opening decision")),
+        "vista opening must survive the census fallback: {:?}",
+        mixed_records
+            .iter()
+            .map(|record| &record.summary)
+            .collect::<Vec<_>>()
+    );
+
+    // The census fallback reports the mixed session, the homogeneous
+    // control keeps bucket inheritance.
+    let mixed_scope: Vec<_> = user_extraction
+        .mixed_scope
+        .iter()
+        .chain(agent_extraction.mixed_scope.iter())
+        .collect();
+    assert!(
+        mixed_scope
+            .iter()
+            .any(|session| session.agent == "codex" && session.session_id == mixed_sid),
+        "mixed_scope must name the mixed session through the index lane: {:?}",
+        mixed_scope
+    );
+    assert!(
+        records.iter().any(|record| record.session_id == control_sid
+            && record
+                .summary
+                .contains("homogeneous vista control decision")),
+        "homogeneous control intent must be present through the index lane"
     );
 
     drop(_guard);

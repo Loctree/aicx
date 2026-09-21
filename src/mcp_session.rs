@@ -986,6 +986,7 @@ mod tests {
             source_path: PathBuf::from("/tmp/x.jsonl"),
             association: crate::sessions::Association::Inferred,
             temporal_confidence: crate::sessions::TemporalConfidence::None,
+            session_kind: None,
         };
         // Decoded cursor paths lost the real hyphens; only the encoded
         // fallback can re-find the filter at all.

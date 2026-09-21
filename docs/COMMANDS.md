@@ -214,13 +214,21 @@ messages. `aicx continuity` refuses to distill one history from a
 Project-filtered queries (`-p`) are fail-closed inside mixed sessions. A turn
 window whose executable tool calls consistently name one foreign `workdir`
 takes that repo as its effective scope (the `turn_context` baseline is only
-the default); conflicting workdir evidence makes the window
-mixed/unattributed. Within a mixed session a frame must positively prove
-membership in the requested project — silence and conflicting evidence never
-inherit the session bucket — while homogeneous sessions keep the legacy
-bucket inheritance. Codex approval/guardian subagent sessions
-(`session_meta.source.subagent`, cataloged as `session_kind`) classify their
-assessment-wrapper prompts as harness noise, not operator utterances.
+the default); two proven repo identities make the window a conflict, while
+unresolvable (historical or foreign-machine) workdirs stay unattributed —
+never a positive attribution, never proof of divergence. Within a mixed
+session a frame must positively prove membership in the requested project —
+silence and conflicting evidence never inherit the session bucket — while
+homogeneous sessions keep the legacy bucket inheritance. The committed index
+stores whole-session chunks, so it cannot express that per-frame verdict:
+chunks flagged mixed at index build are re-sourced through the census lane,
+and chunks from `session_kind = subagent:guardian` sessions are skipped.
+Codex approval/guardian subagent sessions
+(`session_meta.source.subagent`, cataloged as `session_kind`) are control-plane
+machinery: their wrapper prompts and verdicts are preserved whole in the
+catalog, extracts and forensic search as audit evidence, but
+`session_kind = subagent:guardian` sessions never enter the operator
+project-intent stream.
 
 Batch report export remains available through `aicx claude`, `aicx codex`,
 `aicx all`, and `aicx conversations`. Those commands write requested reports,

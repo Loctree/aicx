@@ -37,7 +37,7 @@ const MAX_JSONL_RECORD_BYTES: usize = 2 * 1024 * 1024;
 /// short-circuited forever, leaving search previews full of
 /// `{"type":"thought","data":"..."}` spam. Including this constant forces a
 /// one-shot rebuild so index truth tracks filter truth.
-pub(crate) const SIGNAL_FILTER_VERSION: &str = "signal-v4-subagent-provenance";
+pub(crate) const SIGNAL_FILTER_VERSION: &str = "signal-v4-scope-chunk-metadata";
 
 const PARSE_STATE_SCHEMA: &str = "aicx.source_parse_state.v1";
 const PARSE_STATE_RELPATH: &str = "indexed/_all/source_parse_state.v1.json";
@@ -189,6 +189,15 @@ struct SessionParseRecord {
     project: Option<String>,
     date: Option<String>,
     cwd: Option<String>,
+    /// Whole-session mixed-workstream verdict at parse time; reused chunks
+    /// re-stamp it into metadata so the intents index lane can fall back to
+    /// the census for mixed sessions.
+    #[serde(default)]
+    scope_conflict: bool,
+    /// Subagent provenance (e.g. `subagent:guardian`); reused chunks re-stamp
+    /// it so the intents index lane can exclude control-plane sessions.
+    #[serde(default)]
+    session_kind: Option<String>,
 }
 
 /// Build or preview the global lexical index from the durable catalog.
@@ -447,6 +456,8 @@ pub fn build_with_reporter(
             .project
             .clone()
             .unwrap_or_else(|| "_unknown".to_string());
+        let scope = crate::extraction::conversation::scope_report_for_entries(&frames);
+        let session_mixed = scope.status == aicx_parser::engine::ScopeStatus::MixedCandidate;
         let mut metadata = serde_json::json!({
             "source_path": indexed_path.to_string_lossy(),
             "project": project,
@@ -459,6 +470,8 @@ pub fn build_with_reporter(
             "cwd": entry.cwd,
             "source_catalog_path": entry.source_path,
             "preview_lines": extract_preview_lines(&frames),
+            "scope_conflict": session_mixed,
+            "session_kind": entry.session_kind,
         });
         if let Some(distill) = &distill {
             // card.v3 (W2-02): distill block + flat filter scalars. Reused
@@ -497,6 +510,8 @@ pub fn build_with_reporter(
                 project: entry.project.clone(),
                 date: entry.date.clone().or(Some(date)),
                 cwd: entry.cwd.clone(),
+                scope_conflict: session_mixed,
+                session_kind: entry.session_kind.clone(),
             },
         );
     }
@@ -1245,8 +1260,9 @@ fn parse_large_codex_signal(
 
 /// Stamp a buffered turn window with its effective scope and drain it into the
 /// session frame list: one consistent foreign repo re-scopes the whole window
-/// (including messages before the first tool call); conflicting workdir
-/// evidence marks every frame mixed/unattributed.
+/// (including messages before the first tool call); proven-divergent evidence
+/// marks every frame conflicted, while unresolved evidence keeps the baseline
+/// without ever stamping the raw path as a positive scope.
 fn flush_scope_window(
     window_frames: &mut Vec<TimelineEntry>,
     window_workdirs: &mut Vec<String>,
@@ -1255,7 +1271,6 @@ fn flush_scope_window(
     if !window_frames.is_empty() {
         let (scope, path) = effective_window_scope(window_workdirs);
         match scope {
-            WindowScope::Baseline => {}
             WindowScope::Consistent => {
                 if let Some(path) = path {
                     for frame in window_frames.iter_mut() {
@@ -1269,6 +1284,9 @@ fn flush_scope_window(
                     frame.scope_conflict = true;
                 }
             }
+            // Unresolved evidence says nothing: keep the baseline, but never
+            // stamp the raw unresolvable path as a positive scope.
+            WindowScope::Baseline | WindowScope::Unattributed => {}
         }
         frames.append(window_frames);
     }
@@ -1282,11 +1300,7 @@ fn is_signal_frame(frame: &TimelineEntry) -> bool {
         None => matches!(frame.role.as_str(), "user" | "assistant"),
     };
     signal_kind
-        && crate::extraction::classify_frame_signal(
-            &frame.role,
-            &frame.message,
-            frame.session_kind.as_deref(),
-        ) == crate::extraction::FrameSignalClass::Operator
+        && !crate::extraction::is_harness_injected_noise(&frame.role, &frame.message)
         && !looks_like_binary_payload(&frame.message)
 }
 
@@ -1580,6 +1594,8 @@ fn try_reuse_cached_extract(
         "source_catalog_path": entry.source_path,
         "preview_lines": preview_lines,
         "incremental_reuse": true,
+        "scope_conflict": record.scope_conflict,
+        "session_kind": record.session_kind.clone().or_else(|| entry.session_kind.clone()),
     });
     Some(aicx_retrieve::ChunkRef {
         id: format!("{}:{}", entry.agent, entry.session_id),
@@ -1965,6 +1981,8 @@ mod tests {
                 project: entry.project.clone(),
                 date: entry.date.clone(),
                 cwd: entry.cwd.clone(),
+                scope_conflict: false,
+                session_kind: None,
             },
         );
 
