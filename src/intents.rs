@@ -526,13 +526,18 @@ fn collect_intent_files_from_index(
             continue;
         }
         // Whole-session chunks cannot express per-frame scope. A session
-        // flagged mixed at index build is re-sourced through the census lane
-        // (fail-closed per-frame filter) instead of being served raw.
-        if metadata
+        // flagged mixed or unattributed at index build is re-sourced through
+        // the census lane (fail-closed per-frame filter) instead of being
+        // served raw.
+        let scope_flagged = metadata
             .get("scope_conflict")
             .and_then(|value| value.as_bool())
             == Some(true)
-        {
+            || metadata
+                .get("scope_unattributed")
+                .and_then(|value| value.as_bool())
+                == Some(true);
+        if scope_flagged {
             mixed_ids.insert((field("agent"), field("session_id")));
             continue;
         }
@@ -941,7 +946,9 @@ fn retain_frames_for_project(
         .map(|cwd| cwd.trim_end_matches(['/', '\\']))
         .filter(|cwd| !cwd.is_empty());
     frames.retain(|frame| {
-        if frame.scope_conflict {
+        // Durable "do not inherit" states: proven divergence and unresolved
+        // foreign evidence never join a project bucket.
+        if frame.scope_conflict || frame.scope_unattributed {
             return false;
         }
         match frame.cwd.as_deref() {

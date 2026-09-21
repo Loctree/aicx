@@ -102,16 +102,36 @@ pub fn normalize_workdir(path: &str) -> WorkdirIdentity {
 /// Reduce a window's explicit workdirs to one effective-scope verdict.
 ///
 /// A resolved repo root absorbs every workdir nested under it (subdirs of one
-/// checkout are one scope). Unresolved paths stay distinct unless nested under
-/// a resolved root from the same window. The caller keeps the `turn_context`
-/// baseline on [`WindowScope::Baseline`], stamps the [`WindowScope::Consistent`]
-/// identity path on the whole window, marks the window proven-divergent on
-/// [`WindowScope::Conflict`] (two or more resolved roots), and treats
-/// [`WindowScope::Unattributed`] as "evidence exists but says nothing": never a
-/// positive attribution, never proof of divergence.
-pub fn effective_window_scope(workdirs: &[String]) -> (WindowScope, Option<String>) {
-    let identities: Vec<WorkdirIdentity> =
-        workdirs.iter().map(|raw| normalize_workdir(raw)).collect();
+/// checkout are one scope). An unresolvable workdir that matches the
+/// `baseline` (same path or nested under it) is baseline evidence — the
+/// window's `turn_context` already says the same thing, so nothing changes.
+/// An unresolvable workdir pointing ELSEWHERE (historical or foreign-machine
+/// path) is [`WindowScope::Unattributed`]: a durable "evidence exists but says
+/// nothing" state — never a positive attribution, never proof of divergence,
+/// and never eligible for bucket inheritance downstream. Two or more resolved
+/// repo identities are [`WindowScope::Conflict`].
+pub fn effective_window_scope(
+    workdirs: &[String],
+    baseline: Option<&str>,
+) -> (WindowScope, Option<String>) {
+    let baseline = baseline.map(str::trim).filter(|value| !value.is_empty());
+    let matches_baseline = |path: &str| {
+        let Some(baseline) = baseline else {
+            return false;
+        };
+        let candidate = path.trim_end_matches(['/', '\\']);
+        let base = baseline.trim_end_matches(['/', '\\']);
+        candidate == base
+            || candidate
+                .strip_prefix(base)
+                .is_some_and(|rest| rest.starts_with('/') || rest.starts_with('\\'))
+    };
+    let identities: Vec<WorkdirIdentity> = workdirs
+        .iter()
+        .map(|raw| raw.as_str())
+        .filter(|raw| !matches_baseline(raw))
+        .map(normalize_workdir)
+        .collect();
     let roots: Vec<PathBuf> = identities
         .iter()
         .filter_map(|identity| match identity {
@@ -203,7 +223,7 @@ mod tests {
             repo.join("packages/a").to_string_lossy().into_owned(),
             repo.join("packages/b").to_string_lossy().into_owned(),
         ];
-        let (scope, path) = effective_window_scope(&workdirs);
+        let (scope, path) = effective_window_scope(&workdirs, None);
         assert_eq!(scope, WindowScope::Consistent);
         assert_eq!(path.as_deref(), Some(repo.to_string_lossy().as_ref()));
         let _ = std::fs::remove_dir_all(&root);
@@ -221,7 +241,7 @@ mod tests {
             repo_a.to_string_lossy().into_owned(),
             repo_b.to_string_lossy().into_owned(),
         ];
-        let (scope, path) = effective_window_scope(&workdirs);
+        let (scope, path) = effective_window_scope(&workdirs, None);
         assert_eq!(scope, WindowScope::Conflict);
         assert_eq!(path, None);
         let _ = std::fs::remove_dir_all(&root);
@@ -233,11 +253,13 @@ mod tests {
         let missing_b = "/definitely/missing/aicx-scope-b";
         // One unresolved workdir: not a positive attribution (no scope path
         // stamped), and not proof of divergence either — just "unknown".
-        let (single, path) = effective_window_scope(std::slice::from_ref(&missing_a.to_string()));
+        let (single, path) =
+            effective_window_scope(std::slice::from_ref(&missing_a.to_string()), None);
         assert_eq!(single, WindowScope::Unattributed);
         assert_eq!(path, None);
         // Two distinct unresolved paths: still unknown, not a proven conflict.
-        let (scope, path) = effective_window_scope(&[missing_a.to_string(), missing_b.to_string()]);
+        let (scope, path) =
+            effective_window_scope(&[missing_a.to_string(), missing_b.to_string()], None);
         assert_eq!(scope, WindowScope::Unattributed);
         assert_eq!(path, None);
     }
@@ -251,7 +273,7 @@ mod tests {
             repo.to_string_lossy().into_owned(),
             "/definitely/missing/aicx-scope-elsewhere".to_string(),
         ];
-        let (scope, path) = effective_window_scope(&workdirs);
+        let (scope, path) = effective_window_scope(&workdirs, None);
         assert_eq!(scope, WindowScope::Unattributed);
         assert_eq!(path, None);
         let _ = std::fs::remove_dir_all(&root);
@@ -259,8 +281,37 @@ mod tests {
 
     #[test]
     fn no_workdirs_keeps_the_baseline() {
-        let (scope, path) = effective_window_scope(&[]);
+        let (scope, path) = effective_window_scope(&[], None);
         assert_eq!(scope, WindowScope::Baseline);
+        assert_eq!(path, None);
+    }
+
+    #[test]
+    fn unresolved_workdir_matching_baseline_is_baseline_evidence() {
+        // The codescribe-golden shape: the explicit workdir IS the
+        // turn_context cwd (or nests under it) but does not exist on this
+        // machine. Nothing foreign happened — the window stays baseline.
+        let (scope, path) = effective_window_scope(
+            &["/Volumes/vc-workspace/vetcoders/codescribe".to_string()],
+            Some("/Volumes/vc-workspace/vetcoders/codescribe"),
+        );
+        assert_eq!(scope, WindowScope::Baseline);
+        assert_eq!(path, None);
+        let (nested, _) = effective_window_scope(
+            &["/Volumes/vc-workspace/vetcoders/codescribe/site".to_string()],
+            Some("/Volumes/vc-workspace/vetcoders/codescribe"),
+        );
+        assert_eq!(nested, WindowScope::Baseline);
+    }
+
+    #[test]
+    fn unresolved_workdir_foreign_to_baseline_is_unattributed() {
+        // The 60b7 shape under a missing checkout: turn_context says vista,
+        // the explicit workdir points at a fleet-bus path that does not
+        // resolve here. Durable do-not-inherit, never a positive vista stamp.
+        let (scope, path) =
+            effective_window_scope(&["/missing/fleet-bus".to_string()], Some("/present/vista"));
+        assert_eq!(scope, WindowScope::Unattributed);
         assert_eq!(path, None);
     }
 }

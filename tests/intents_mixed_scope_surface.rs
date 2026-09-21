@@ -449,3 +449,114 @@ fn index_lane_falls_back_to_census_for_mixed_and_drops_guardian() {
     drop(_guard);
     let _ = fs::remove_dir_all(&root);
 }
+
+fn write_unresolved_foreign_rollout(root: &Path, vista: &Path) -> String {
+    let session_id = "55555555-4444-3333-2222-111111111111";
+    let template = r#"{"timestamp":"2026-01-01T04:00:00Z","type":"session_meta","payload":{"id":"@SID@","cwd":"@VISTA@"}}
+{"timestamp":"2026-01-01T04:01:00Z","type":"turn_context","payload":{"cwd":"@VISTA@"}}
+{"timestamp":"2026-01-01T04:01:10Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Otwieramy viste.\nDecision: preserve vista baseline opening"}]}}
+{"timestamp":"2026-01-01T04:02:00Z","type":"turn_context","payload":{"cwd":"@VISTA@"}}
+{"timestamp":"2026-01-01T04:02:05Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Pisze z unresolved workdir.\nDecision: preserve unresolved foreign turn"}]}}
+{"timestamp":"2026-01-01T04:02:10Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"c9","input":"const r = await tools.exec_command({cmd:\"npm test\",\"workdir\":\"/definitely/missing/fleet-bus\"});"}}
+"#;
+    let body = template
+        .replace("@SID@", session_id)
+        .replace("@VISTA@", &vista.display().to_string());
+    let path = rollout_path(
+        root,
+        &format!("rollout-2026-01-01T04-00-00-{session_id}.jsonl"),
+    );
+    fs::write(path, body).expect("write unresolved foreign rollout");
+    session_id.to_string()
+}
+
+/// Follow-up regression: `turn_context` baseline is vista, but one turn
+/// window's explicit workdir is an unresolvable foreign path
+/// (`/definitely/missing/fleet-bus`). That window is durably unattributed —
+/// it must NOT inherit the vista bucket, in either read lane, and the
+/// session must not be over-convicted as mixed either.
+#[test]
+fn unresolved_foreign_window_inherits_nothing_in_any_lane() {
+    let root = unique_root("unresolved");
+    let _guard = HomeGuard::set(&root);
+    let vista = make_repo(&root, "vista");
+    let unresolved_sid = write_unresolved_foreign_rollout(&root, &vista);
+
+    let aicx_home = root.join(".aicx");
+    aicx::catalog::rebuild(&aicx_home, &root).expect("rebuild catalog over fixture home");
+    aicx::source_index::build(&aicx_home, &[], false, true, false)
+        .expect("publish CURRENT index over fixture home");
+
+    let config = |hours: u64, frame_kind: aicx::timeline::FrameKind| IntentsConfig {
+        project: "vista".to_string(),
+        hours,
+        strict: false,
+        min_confidence: None,
+        kind_filter: None,
+        frame_kind: Some(frame_kind),
+        live: false,
+    };
+    let run = |hours: u64| {
+        let user = Aicx::with_aicx_home(&aicx_home)
+            .extract_intents(&config(hours, aicx::timeline::FrameKind::UserMsg))
+            .expect("extract user intents");
+        let agent = Aicx::with_aicx_home(&aicx_home)
+            .extract_intents(&config(hours, aicx::timeline::FrameKind::AgentReply))
+            .expect("extract agent intents");
+        (user, agent)
+    };
+
+    for (lane, hours) in [("census", 0), ("index", 100_000)] {
+        let (user_extraction, agent_extraction) = run(hours);
+        if lane == "index" {
+            assert_eq!(
+                user_extraction.stats.identity_source, "index-v1",
+                "index lane must serve the finite-window run"
+            );
+        }
+        let records: Vec<_> = user_extraction
+            .records
+            .iter()
+            .chain(agent_extraction.records.iter())
+            .collect();
+        let session_records: Vec<_> = records
+            .iter()
+            .filter(|record| record.session_id == unresolved_sid)
+            .collect();
+        assert!(
+            !session_records
+                .iter()
+                .any(|record| record.summary.contains("unresolved foreign turn")),
+            "{lane} lane: unattributed window must not inherit the vista bucket: {:?}",
+            session_records
+                .iter()
+                .map(|record| &record.summary)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            session_records
+                .iter()
+                .any(|record| record.summary.contains("vista baseline opening")),
+            "{lane} lane: the positively vista-scoped window must survive: {:?}",
+            session_records
+                .iter()
+                .map(|record| &record.summary)
+                .collect::<Vec<_>>()
+        );
+        let mixed_scope: Vec<_> = user_extraction
+            .mixed_scope
+            .iter()
+            .chain(agent_extraction.mixed_scope.iter())
+            .collect();
+        assert!(
+            !mixed_scope
+                .iter()
+                .any(|session| session.session_id == unresolved_sid),
+            "{lane} lane: unattributed evidence must not convict the session as mixed: {:?}",
+            mixed_scope
+        );
+    }
+
+    drop(_guard);
+    let _ = fs::remove_dir_all(&root);
+}

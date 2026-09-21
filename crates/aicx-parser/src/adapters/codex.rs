@@ -449,6 +449,9 @@ struct SegmentDraft {
     /// The window's explicit workdir evidence pointed at more than one repo
     /// identity — mixed/unattributed, never guessed into a project bucket.
     scope_conflict: bool,
+    /// The window's explicit workdir evidence does not resolve and is not the
+    /// baseline — durable "unknown, do not inherit" state.
+    scope_unattributed: bool,
 }
 
 impl<'a> Assembly<'a> {
@@ -619,6 +622,7 @@ impl<'a> Assembly<'a> {
                 ended_at: Known::unknown(),
                 start_turn: self.turns.len() as u64,
                 scope_conflict: false,
+                scope_unattributed: false,
             });
         }
         Ok(())
@@ -627,16 +631,20 @@ impl<'a> Assembly<'a> {
     /// Stamp the closing turn window with its effective scope: a window whose
     /// explicit workdirs all normalize to one repo identity belongs to that
     /// repo (even when the `turn_context` baseline says otherwise); proven
-    /// divergence marks the window conflicted, while unresolved evidence keeps
-    /// the baseline without ever stamping the raw path.
+    /// divergence marks the window conflicted, while unresolved foreign
+    /// evidence leaves a durable do-not-inherit mark.
     fn finalize_window(&mut self) {
         if self.window_workdirs.is_empty() {
             return;
         }
-        let (scope, path) = effective_window_scope(&self.window_workdirs);
         let Some(segment) = self.segments.last_mut() else {
             return;
         };
+        let baseline = match &segment.cwd {
+            Known::Value(cwd) => Some(cwd.as_str()),
+            Known::Unknown(_) => None,
+        };
+        let (scope, path) = effective_window_scope(&self.window_workdirs, baseline);
         match scope {
             WindowScope::Consistent => {
                 if let Some(path) = path {
@@ -647,9 +655,13 @@ impl<'a> Assembly<'a> {
                 segment.cwd = Known::unknown();
                 segment.scope_conflict = true;
             }
-            // Unresolved evidence says nothing: keep the baseline scope, never
-            // stamp the raw unresolvable path.
-            WindowScope::Baseline | WindowScope::Unattributed => {}
+            // Unresolved foreign evidence is a durable "do not inherit" mark:
+            // the window keeps its baseline cwd for structure, but downstream
+            // filters must never count it as positive project evidence.
+            WindowScope::Unattributed => {
+                segment.scope_unattributed = true;
+            }
+            WindowScope::Baseline => {}
         }
     }
 
@@ -1269,6 +1281,7 @@ impl<'a> Assembly<'a> {
                 ended_at: Known::unknown(),
                 start_turn: 0,
                 scope_conflict: false,
+                scope_unattributed: false,
             });
         }
     }
@@ -1293,6 +1306,7 @@ impl<'a> Assembly<'a> {
                     if last.cwd == draft.cwd
                         && last.branch == draft.branch
                         && last.scope_conflict == draft.scope_conflict
+                        && last.scope_unattributed == draft.scope_unattributed
             );
             if mergeable {
                 if let Some(last) = merged.last_mut() {
@@ -1458,6 +1472,8 @@ impl<'a> Assembly<'a> {
                     // verdict is homogeneous-or-unknown.
                     let scope_status = if segment.scope_conflict {
                         ScopeStatus::MixedCandidate
+                    } else if segment.scope_unattributed {
+                        ScopeStatus::Unattributed
                     } else {
                         ScopeStatus::from_evidence(
                             match &segment.cwd {

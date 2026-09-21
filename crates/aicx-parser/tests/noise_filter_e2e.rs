@@ -24,6 +24,7 @@ fn entry(seconds_offset: i64, role: &str, message: &str) -> TimelineEntry {
         branch: None,
         cwd: None,
         scope_conflict: false,
+        scope_unattributed: false,
         session_kind: None,
         timestamp_source: None,
         source_path: None,

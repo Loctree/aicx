@@ -94,6 +94,10 @@ pub enum ScopeStatus {
     NoDriftObserved,
     /// Several cwds and/or branches inside the span.
     MixedCandidate,
+    /// Explicit scope evidence exists but does not resolve (historical or
+    /// foreign-machine workdir that is not the baseline): the span must not
+    /// inherit any project bucket downstream.
+    Unattributed,
     /// No cwd/branch evidence at all: scope cannot be judged.
     #[default]
     Unknown,
@@ -104,6 +108,7 @@ impl ScopeStatus {
         match self {
             Self::NoDriftObserved => "no_drift_observed",
             Self::MixedCandidate => "mixed_candidate",
+            Self::Unattributed => "unattributed",
             Self::Unknown => "unknown",
         }
     }
@@ -113,6 +118,7 @@ impl ScopeStatus {
     pub const fn join(self, other: Self) -> Self {
         match (self, other) {
             (Self::MixedCandidate, _) | (_, Self::MixedCandidate) => Self::MixedCandidate,
+            (Self::Unattributed, _) | (_, Self::Unattributed) => Self::Unattributed,
             (Self::NoDriftObserved, _) | (_, Self::NoDriftObserved) => Self::NoDriftObserved,
             (Self::Unknown, Self::Unknown) => Self::Unknown,
         }

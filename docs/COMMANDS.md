@@ -215,13 +215,16 @@ Project-filtered queries (`-p`) are fail-closed inside mixed sessions. A turn
 window whose executable tool calls consistently name one foreign `workdir`
 takes that repo as its effective scope (the `turn_context` baseline is only
 the default); two proven repo identities make the window a conflict, while
-unresolvable (historical or foreign-machine) workdirs stay unattributed —
-never a positive attribution, never proof of divergence. Within a mixed
+unresolvable (historical or foreign-machine) workdirs that are not the
+baseline leave a durable unattributed mark — never a positive attribution,
+never proof of divergence, and frames carrying it never inherit any project
+bucket. Within a mixed
 session a frame must positively prove membership in the requested project —
 silence and conflicting evidence never inherit the session bucket — while
 homogeneous sessions keep the legacy bucket inheritance. The committed index
 stores whole-session chunks, so it cannot express that per-frame verdict:
-chunks flagged mixed at index build are re-sourced through the census lane,
+chunks flagged mixed or unattributed at index build are re-sourced through
+the census lane,
 and chunks from `session_kind = subagent:guardian` sessions are skipped.
 Codex approval/guardian subagent sessions
 (`session_meta.source.subagent`, cataloged as `session_kind`) are control-plane

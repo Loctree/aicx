@@ -194,6 +194,11 @@ struct SessionParseRecord {
     /// the census for mixed sessions.
     #[serde(default)]
     scope_conflict: bool,
+    /// Any frame carried unresolved foreign workdir evidence; reused chunks
+    /// re-stamp it so the index lane falls back to the census lane, which
+    /// applies the do-not-inherit filter per frame.
+    #[serde(default)]
+    scope_unattributed: bool,
     /// Subagent provenance (e.g. `subagent:guardian`); reused chunks re-stamp
     /// it so the intents index lane can exclude control-plane sessions.
     #[serde(default)]
@@ -458,6 +463,7 @@ pub fn build_with_reporter(
             .unwrap_or_else(|| "_unknown".to_string());
         let scope = crate::extraction::conversation::scope_report_for_entries(&frames);
         let session_mixed = scope.status == aicx_parser::engine::ScopeStatus::MixedCandidate;
+        let session_unattributed = frames.iter().any(|frame| frame.scope_unattributed);
         let mut metadata = serde_json::json!({
             "source_path": indexed_path.to_string_lossy(),
             "project": project,
@@ -471,6 +477,7 @@ pub fn build_with_reporter(
             "source_catalog_path": entry.source_path,
             "preview_lines": extract_preview_lines(&frames),
             "scope_conflict": session_mixed,
+            "scope_unattributed": session_unattributed,
             "session_kind": entry.session_kind,
         });
         if let Some(distill) = &distill {
@@ -511,6 +518,7 @@ pub fn build_with_reporter(
                 date: entry.date.clone().or(Some(date)),
                 cwd: entry.cwd.clone(),
                 scope_conflict: session_mixed,
+                scope_unattributed: session_unattributed,
                 session_kind: entry.session_kind.clone(),
             },
         );
@@ -1021,6 +1029,7 @@ fn parse_catalog_source(
                 branch: None,
                 cwd: entry.cwd.clone(),
                 scope_conflict: false,
+                scope_unattributed: false,
                 session_kind: entry.session_kind.clone(),
                 timestamp_source: Some("source_mtime".to_string()),
                 source_path: Some(entry.source_path.clone()),
@@ -1171,7 +1180,12 @@ fn parse_large_codex_signal(
             continue;
         };
         if value.get("type").and_then(serde_json::Value::as_str) == Some("turn_context") {
-            flush_scope_window(&mut window_frames, &mut window_workdirs, &mut frames);
+            flush_scope_window(
+                &mut window_frames,
+                &mut window_workdirs,
+                baseline_cwd.as_deref(),
+                &mut frames,
+            );
             if let Some(cwd) = value
                 .get("payload")
                 .and_then(|payload| payload.get("cwd"))
@@ -1247,6 +1261,7 @@ fn parse_large_codex_signal(
             branch: None,
             cwd: baseline_cwd.clone(),
             scope_conflict: false,
+            scope_unattributed: false,
             session_kind: entry.session_kind.clone(),
             timestamp_source: Some("record".to_string()),
             source_path: Some(entry.source_path.clone()),
@@ -1254,22 +1269,28 @@ fn parse_large_codex_signal(
             source_line_span: Some((line_no, line_no)),
         });
     }
-    flush_scope_window(&mut window_frames, &mut window_workdirs, &mut frames);
+    flush_scope_window(
+        &mut window_frames,
+        &mut window_workdirs,
+        baseline_cwd.as_deref(),
+        &mut frames,
+    );
     Ok(frames)
 }
 
 /// Stamp a buffered turn window with its effective scope and drain it into the
 /// session frame list: one consistent foreign repo re-scopes the whole window
 /// (including messages before the first tool call); proven-divergent evidence
-/// marks every frame conflicted, while unresolved evidence keeps the baseline
-/// without ever stamping the raw path as a positive scope.
+/// marks every frame conflicted, while unresolved foreign evidence leaves a
+/// durable do-not-inherit mark on every frame of the window.
 fn flush_scope_window(
     window_frames: &mut Vec<TimelineEntry>,
     window_workdirs: &mut Vec<String>,
+    baseline: Option<&str>,
     frames: &mut Vec<TimelineEntry>,
 ) {
     if !window_frames.is_empty() {
-        let (scope, path) = effective_window_scope(window_workdirs);
+        let (scope, path) = effective_window_scope(window_workdirs, baseline);
         match scope {
             WindowScope::Consistent => {
                 if let Some(path) = path {
@@ -1284,9 +1305,15 @@ fn flush_scope_window(
                     frame.scope_conflict = true;
                 }
             }
-            // Unresolved evidence says nothing: keep the baseline, but never
-            // stamp the raw unresolvable path as a positive scope.
-            WindowScope::Baseline | WindowScope::Unattributed => {}
+            // Unresolved foreign evidence: durable do-not-inherit mark. The
+            // baseline cwd stays for structure, but the frame never counts as
+            // positive project evidence downstream.
+            WindowScope::Unattributed => {
+                for frame in window_frames.iter_mut() {
+                    frame.scope_unattributed = true;
+                }
+            }
+            WindowScope::Baseline => {}
         }
         frames.append(window_frames);
     }
@@ -1595,6 +1622,7 @@ fn try_reuse_cached_extract(
         "preview_lines": preview_lines,
         "incremental_reuse": true,
         "scope_conflict": record.scope_conflict,
+        "scope_unattributed": record.scope_unattributed,
         "session_kind": record.session_kind.clone().or_else(|| entry.session_kind.clone()),
     });
     Some(aicx_retrieve::ChunkRef {
@@ -1898,6 +1926,7 @@ mod tests {
             branch: None,
             cwd: Some(cwd.to_string()),
             scope_conflict: false,
+            scope_unattributed: false,
             session_kind: None,
             timestamp_source: Some("record".to_string()),
             source_path: None,
@@ -1982,6 +2011,7 @@ mod tests {
                 date: entry.date.clone(),
                 cwd: entry.cwd.clone(),
                 scope_conflict: false,
+                scope_unattributed: false,
                 session_kind: None,
             },
         );

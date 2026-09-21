@@ -155,6 +155,11 @@ pub struct TimelineEntry {
     /// bucket by inheritance.
     #[serde(default, skip_serializing_if = "is_false")]
     pub scope_conflict: bool,
+    /// Explicit workdir evidence exists but does not resolve and is not the
+    /// session baseline — durable "unknown scope" state: the frame must never
+    /// inherit a project bucket.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub scope_unattributed: bool,
     /// Structural subagent provenance of the session (e.g. `subagent:guardian`)
     /// when known from the catalog; harness-wrapper classification keys on it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
