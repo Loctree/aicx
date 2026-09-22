@@ -555,11 +555,6 @@ fn collect_intent_files(
     let mut source_errors = 0usize;
     let mut live_sessions = 0usize;
     let mut seen_sessions: BTreeSet<(String, String)> = BTreeSet::new();
-    // Census paths are only ever touched through the operator allowlist —
-    // the same containment contract as read_catalog_signal_at.
-    let allow_user_home = crate::os_user_home().unwrap_or_else(|| aicx_home.to_path_buf());
-    let source_allow =
-        crate::source_path::SourceAllowlist::for_operator(&allow_user_home, aicx_home);
     for entry in entries {
         let Some(identity_project) = entry.project.clone() else {
             continue;
@@ -577,28 +572,12 @@ fn collect_intent_files(
             .date
             .as_deref()
             .and_then(|date| NaiveDate::parse_from_str(date, "%Y-%m-%d").ok());
-        // Live window is mtime-in-window, not "newer than census fingerprint".
-        // A catalog rebuild stamps every row current, which used to collapse
-        // the hot set to zero and leave NOW/PEERS empty. Prefer a live stat;
-        // fall back to the census fingerprint so a just-rebuilt hot row
-        // still counts. Paths the operator allowlist refuses are NEVER
-        // stat'ed raw (a poisoned census row could point anywhere — the
-        // same containment contract as read_catalog_signal_at); they fall
-        // through to the census fingerprint instead.
-        let hot = if live {
-            source_allow
-                .resolve_file(entry.source_path.as_str())
-                .ok()
-                .and_then(|path| crate::catalog::live_source_fingerprint(&path))
-                .or_else(|| entry.source_mtime_ns.map(|mtime_ns| (0, mtime_ns)))
-                .is_some_and(|(_, mtime_ns)| mtime_ns_within_window(mtime_ns, cutoff))
-        } else {
-            false
-        };
-        if canonical_date.is_some_and(|date| date < cutoff.date_naive()) && (!live || !hot) {
+        // Window membership is conversation time (catalog session date, then
+        // last frame). Source mtime is a reparse fingerprint, not age: a
+        // touched 2026-09-18 transcript must not enter a 24h NOW on 09-21.
+        if canonical_date.is_some_and(|date| date < cutoff.date_naive()) {
             continue;
         }
-        let live_row = session_is_hot_live(live, hot);
 
         let (source_path, frames) =
             match crate::source_index::read_catalog_signal_at(aicx_home, &entry, frame_kind) {
@@ -612,6 +591,8 @@ fn collect_intent_files(
                     continue;
                 }
             };
+        let in_window = conversation_activity_in_window(cutoff, canonical_date, frames.last());
+        let live_row = session_is_hot_live(live, in_window);
         let Some(file) =
             catalog_frames_to_intent_file(&entry, source_path, frames, cutoff, live_row)
         else {
@@ -745,9 +726,10 @@ pub(crate) fn extract_overlay_intents_from_conversations(
 }
 
 /// Admit sessions the durable catalog census does not know yet (P0 live
-/// window): scan live source roots, keep entries inside the mtime window and
-/// project filter, parse them through the same catalog-source reader, and
-/// stamp records with the `open_session` honesty frame.
+/// window): scan live source roots, keep entries whose conversation date
+/// (or last frame, when undated) is inside the window, parse them through
+/// the same catalog-source reader, and stamp records with the `open_session`
+/// honesty frame. Source mtime is not a membership clock.
 #[cfg(feature = "app")]
 #[allow(clippy::too_many_arguments)]
 fn collect_live_unadmitted_files(
@@ -770,13 +752,11 @@ fn collect_live_unadmitted_files(
         if seen_sessions.contains(&(entry.agent.clone(), entry.session_id.clone())) {
             continue;
         }
-        // Live scan only serves the hot window: skip anything whose source
-        // mtime is older than the cutoff (or unreadable — the census will
-        // pick it up at next rebuild).
-        if !entry
-            .source_mtime_ns
-            .is_some_and(|mtime_ns| mtime_ns_within_window(mtime_ns, cutoff))
-        {
+        let canonical_date = entry
+            .date
+            .as_deref()
+            .and_then(|date| NaiveDate::parse_from_str(date, "%Y-%m-%d").ok());
+        if canonical_date.is_some_and(|date| date < cutoff.date_naive()) {
             continue;
         }
         let Some(identity_project) = entry.project.clone() else {
@@ -809,6 +789,9 @@ fn collect_live_unadmitted_files(
         let scope = crate::extraction::conversation::scope_report_for_entries(&frames);
         retain_frames_for_project(&mut frames, &identity_project, entry.cwd.as_deref());
         if frames.is_empty() {
+            continue;
+        }
+        if !conversation_activity_in_window(cutoff, canonical_date, frames.last()) {
             continue;
         }
         let timestamp = frames
@@ -883,19 +866,25 @@ fn retain_frames_for_project(
     });
 }
 
-/// Catalog-admitted sessions stay live when they are still inside the
-/// requested mtime window. Rebuild fingerprint equality must not demote them.
+/// Catalog-admitted sessions stay live when conversation activity is inside
+/// the requested window. Source mtime must not promote a stale session.
 #[cfg(feature = "app")]
-pub(crate) fn session_is_hot_live(live: bool, mtime_in_window: bool) -> bool {
-    live && mtime_in_window
+pub(crate) fn session_is_hot_live(live: bool, conversation_in_window: bool) -> bool {
+    live && conversation_in_window
 }
 
-/// True when a unix-nanosecond mtime falls at or after the window cutoff.
+/// Window clock: catalog session date first, last frame only when the row
+/// has no date. File mtime is never an input.
 #[cfg(feature = "app")]
-fn mtime_ns_within_window(mtime_ns: u64, cutoff: DateTime<Utc>) -> bool {
-    let secs = (mtime_ns / 1_000_000_000) as i64;
-    let nanos = (mtime_ns % 1_000_000_000) as u32;
-    DateTime::<Utc>::from_timestamp(secs, nanos).is_some_and(|mtime| mtime >= cutoff)
+fn conversation_activity_in_window(
+    cutoff: DateTime<Utc>,
+    canonical_date: Option<NaiveDate>,
+    last_frame: Option<&TimelineEntry>,
+) -> bool {
+    if let Some(date) = canonical_date {
+        return date >= cutoff.date_naive();
+    }
+    last_frame.is_some_and(|frame| frame.timestamp >= cutoff)
 }
 
 #[cfg(not(feature = "app"))]

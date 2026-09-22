@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::Result;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 
 use crate::intents::{self, IntentKind, IntentRecord, IntentsConfig};
 
@@ -179,10 +179,17 @@ fn collect_sources(
         if !project_matches(entry.project.as_deref(), projects) {
             continue;
         }
+        let conversation_date = entry
+            .date
+            .as_deref()
+            .and_then(|date| NaiveDate::parse_from_str(date, "%Y-%m-%d").ok());
+        if conversation_date.is_some_and(|date| date < cutoff.date_naive()) {
+            continue;
+        }
         let mtime_ns = crate::catalog::live_source_fingerprint(Path::new(&entry.source_path))
             .map(|(_, mtime)| mtime)
             .or(entry.source_mtime_ns);
-        if mtime_ns.is_none_or(|mtime| mtime < cutoff_ns) {
+        if conversation_date.is_none() && mtime_ns.is_none_or(|mtime| mtime < cutoff_ns) {
             continue;
         }
         sources.push(SourceLine {
@@ -199,7 +206,16 @@ fn collect_sources(
             if !project_matches(entry.project.as_deref(), projects) {
                 continue;
             }
-            if entry.source_mtime_ns.is_none_or(|mtime| mtime < cutoff_ns) {
+            let conversation_date = entry
+                .date
+                .as_deref()
+                .and_then(|date| NaiveDate::parse_from_str(date, "%Y-%m-%d").ok());
+            if conversation_date.is_some_and(|date| date < cutoff.date_naive()) {
+                continue;
+            }
+            if conversation_date.is_none()
+                && entry.source_mtime_ns.is_none_or(|mtime| mtime < cutoff_ns)
+            {
                 continue;
             }
             sources.push(SourceLine {
