@@ -432,7 +432,10 @@ pub fn build_with_reporter(
             frame.message = clean_message(&frame.message);
         }
         frames.retain(|frame| !frame.message.trim().is_empty());
-        drop_ignored_cwd_frames(&mut frames, &ignore);
+        // Same one step as the intent lane: whatever `.aicxignore` hides is
+        // counted into the report here, or this chunk's scope silently forgets
+        // the session's own baseline.
+        let scope = scope_report_excluding_ignored(&mut frames, &ignore);
         let signal_count = frames.len();
         signal_frames += signal_count;
         let filtered_count = before.saturating_sub(frames.len());
@@ -463,12 +466,15 @@ pub fn build_with_reporter(
             .project
             .clone()
             .unwrap_or_else(|| "_unknown".to_string());
-        let scope = crate::extraction::conversation::scope_report_for_entries(&frames);
         // Whole-session chunks cannot express per-frame scope, so this flag
         // routes the session to the per-frame census lane. It must mean
         // "more than one scope", not "MixedCandidate": a same-repo branch
         // switch is mixed by status and perfectly servable as one bucket.
-        let session_mixed = scope.scope_mixed();
+        // It must also catch the homogeneous case: every frame re-scoped to
+        // ONE foreign checkout is a consistent session that belongs to another
+        // repository, and serving it whole would stamp all of it with this
+        // catalog row's project.
+        let session_mixed = scope.scope_foreign_to(entry.cwd.as_deref());
         let session_unattributed = frames.iter().any(|frame| frame.scope_unattributed);
         // Frames carry the provenance resolved at the source, which is the
         // only lane that can see it for a catalog row cataloged before the
@@ -906,7 +912,7 @@ fn read_session_document(aicx_home: &Path, entry: &CatalogEntry) -> Result<Sessi
         frame.message = clean_message(&frame.message);
     }
     frames.retain(|frame| !frame.message.trim().is_empty());
-    drop_ignored_cwd_frames(&mut frames, &ignore);
+    let _ = scope_report_excluding_ignored(&mut frames, &ignore);
     let body = render_extract(entry, &frames);
     Ok(SessionDocument {
         body,
@@ -1115,6 +1121,10 @@ fn parse_catalog_source(
 /// its user turns carry the baseline would then look homogeneous to both
 /// passes — unreported as mixed, and cwd-less frames inheriting the catalog
 /// project on the strength of evidence that was filtered away.
+///
+/// `.aicxignore` narrows the same evidence one layer deeper, so the count of
+/// scopes it hid travels with the report: an ignored BASELINE would otherwise
+/// leave a foreign cwd looking like the session's only scope.
 pub(crate) fn read_catalog_signal_with_scope_at(
     aicx_home: &Path,
     entry: &CatalogEntry,
@@ -1124,8 +1134,9 @@ pub(crate) fn read_catalog_signal_with_scope_at(
     Vec<TimelineEntry>,
     crate::extraction::conversation::ScopeReport,
 )> {
-    let (source_path, mut frames) = read_catalog_conversation_at(aicx_home, entry)?;
-    let scope = crate::extraction::conversation::scope_report_for_entries(&frames);
+    // The report arrives already built, on the whole session and on the
+    // evidence the privacy filter removed; there is nothing here to re-attach.
+    let (source_path, mut frames, scope) = read_catalog_conversation_at(aicx_home, entry)?;
     frames.retain(|frame| frame_matches_kind(frame, frame_kind));
     Ok((source_path, frames, scope))
 }
@@ -1136,7 +1147,11 @@ pub(crate) fn read_catalog_signal_with_scope_at(
 pub(crate) fn read_catalog_conversation_at(
     aicx_home: &Path,
     entry: &CatalogEntry,
-) -> Result<(PathBuf, Vec<TimelineEntry>)> {
+) -> Result<(
+    PathBuf,
+    Vec<TimelineEntry>,
+    crate::extraction::conversation::ScopeReport,
+)> {
     let user_home = crate::os_user_home().unwrap_or_else(|| aicx_home.to_path_buf());
     let source_allow = crate::source_path::SourceAllowlist::for_operator(&user_home, aicx_home);
     let source_path = source_allow
@@ -1155,18 +1170,39 @@ pub(crate) fn read_catalog_conversation_at(
     }
     frames.retain(|frame| !frame.message.trim().is_empty());
     let ignore = crate::legacy_archive::load_repo_path_ignore(aicx_home, &user_home)?;
-    drop_ignored_cwd_frames(&mut frames, &ignore);
-    Ok((source_path, frames))
+    let scope = scope_report_excluding_ignored(&mut frames, &ignore);
+    Ok((source_path, frames, scope))
 }
 
-fn drop_ignored_cwd_frames(
+/// Drop frames whose cwd the operator hid, and report the session's scope.
+///
+/// The privacy filter and the scope report are deliberately ONE step. A report
+/// built after the filter has already lost the hidden evidence, and a caller
+/// that has to remember to re-attach it is a caller that can forget: that is
+/// precisely how a session whose baseline is hidden comes back looking
+/// homogeneous, letting its remaining frames inherit the cataloged project.
+///
+/// The hidden repositories are counted, never named — scope honesty must not
+/// re-publish a path `.aicxignore` exists to hide.
+fn scope_report_excluding_ignored(
     frames: &mut Vec<TimelineEntry>,
     ignore: &crate::legacy_archive::RepoPathIgnoreMatcher,
-) {
+) -> crate::extraction::conversation::ScopeReport {
     if ignore.is_empty() {
-        return;
+        return crate::extraction::conversation::scope_report_for_entries(frames);
     }
+    let hidden: std::collections::BTreeSet<String> = frames
+        .iter()
+        .filter(|frame| ignore.ignores_cwd(frame.cwd.as_deref()))
+        .filter_map(|frame| frame.cwd.as_deref())
+        .map(str::trim)
+        .filter(|cwd| !cwd.is_empty())
+        .map(str::to_owned)
+        .collect();
     frames.retain(|frame| !ignore.ignores_cwd(frame.cwd.as_deref()));
+    let mut report = crate::extraction::conversation::scope_report_for_entries(frames);
+    report.hidden_scopes = hidden.len();
+    report
 }
 
 fn frame_matches_kind(frame: &TimelineEntry, requested: FrameKind) -> bool {
@@ -2041,10 +2077,17 @@ mod tests {
             frame("keep public again", "/repo/public"),
         ];
 
-        drop_ignored_cwd_frames(&mut frames, &ignore);
+        let report = scope_report_excluding_ignored(&mut frames, &ignore);
         assert_eq!(frames.len(), 2);
         assert_eq!(frames[0].message, "keep public");
         assert_eq!(frames[1].message, "keep public again");
+        // The hidden checkout is counted, and its path is not in the report.
+        assert_eq!(report.hidden_scopes, 1);
+        assert_eq!(report.cwds, vec!["/repo/public".to_string()]);
+        assert!(
+            report.scope_mixed(),
+            "a session is not homogeneous just because the other scope was hidden"
+        );
 
         let _ = fs::remove_dir_all(&root);
     }

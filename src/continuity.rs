@@ -116,6 +116,7 @@ pub fn build_with_scope(
         if records.is_empty() && before > 0 {
             let first = &mixed_scope[0];
             let report = crate::extraction::conversation::ScopeReport {
+                hidden_scopes: 0,
                 status: aicx_parser::engine::ScopeStatus::MixedCandidate,
                 cwds: first.cwds.clone(),
                 branches: first.branches.clone(),

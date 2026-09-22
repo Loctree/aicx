@@ -238,7 +238,28 @@ runs in. A window that ran tools in both the baseline and another checkout is
 a conflict, not a re-scope. Branch drift is not scope drift: a session that
 switches branch inside one unchanged checkout stays a normal, fully attributed
 session, and scope is judged on the whole session before the frame-kind filter
-narrows it to one role.
+narrows it to one role — and before `.aicxignore` hides a checkout. A hidden
+repository is counted as a scope and never named, so a session whose own
+baseline is hidden cannot pass as homogeneous and hand its remaining frames to
+the cataloged project.
+
+**Membership fails closed; identity fails open.** These are different
+questions, and a path that no longer exists gets a different answer from each.
+May this frame be served as project P? Only if membership can be proven, so a
+live checkout never claims a path it cannot prove. Is this a *second*
+repository? Only if that can be proven too — an unattributed window has its
+frames dropped outright, so counting every deleted `target/`, cleaned-up
+worktree or removed temp directory as a foreign repo would silently delete
+ordinary operator evidence. The one missing path that keeps its own identity
+is a submodule the parent still declares in `.gitmodules`. A bare nested
+checkout that was deleted leaves no such trace, is indistinguishable from any
+other deleted directory, and is absorbed by its parent: a deliberate trade,
+made in favour of keeping evidence over chasing a leak that only exists for
+repositories that are already gone.
+
+A session whose frames are *consistently* re-scoped to one foreign checkout is
+internally homogeneous and still foreign: whole-session attribution applies
+only when the observed scope is also the cataloged one.
 
 **What this removes, and what it does not re-home.** Foreign frames are
 removed from the parent project's answer; they are *not* re-filed under the

@@ -33,6 +33,18 @@ both the baseline and another checkout is a conflict, not a wholesale re-scope
 to the foreign root, and every `workdir` in an orchestrated tool call is read,
 not just the first.
 
+Membership and identity-counting are now separate judgements. A path that no
+longer exists cannot be served as a project (membership fails closed) and is
+not counted as a second repository either (identity fails open), because an
+unattributed window has its frames dropped outright — so a deleted `target/`
+or a cleaned-up worktree no longer deletes ordinary operator evidence. The
+exception is a submodule the parent still declares in `.gitmodules`, which
+keeps its own identity after its working tree is gone. Scope is judged before
+`.aicxignore` hides a checkout: hidden repositories are counted, never named.
+A session consistently re-scoped to a single foreign checkout is flagged as
+foreign instead of passing as homogeneous. The Codex provenance probe is now
+bounded in bytes as well as records.
+
 `SIGNAL_FILTER_VERSION` is `signal-v5-scope-repo-identity`: one `aicx index`
 rebuild re-stamps chunk scope metadata. Frames re-scoped by explicit workdir
 evidence now carry the CANONICAL repo root as their cwd.
@@ -52,6 +64,10 @@ evidence now carry the CANONICAL repo root as their cwd.
   filters read instead of inferring it from `ScopeStatus::MixedCandidate` —
   that status is also how ordinary branch drift is recorded. Code that builds
   `Segment` with a literal must add the field.
+- `aicx::extraction::conversation::ScopeReport` gains `hidden_scopes: usize`
+  (distinct cwds removed by `.aicxignore` before the report was built) and the
+  `scope_foreign_to(baseline)` method; `scope_mixed()` now counts hidden
+  scopes. Code that builds `ScopeReport` with a literal must add the field.
 - `aicx_parser::engine` exports `WorkdirEvidence`, `workdir_within_scope` and
   `distinct_repo_identity`; `effective_window_scope` takes
   `&[WorkdirEvidence]` instead of `&[String]`; `normalize_workdir` takes the

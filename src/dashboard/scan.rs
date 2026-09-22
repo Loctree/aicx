@@ -411,7 +411,8 @@ fn read_catalog_conversation_preview(
     entry: &crate::catalog::CatalogEntry,
     preview_chars: usize,
 ) -> Option<ConversationPreview> {
-    let (_, frames) = crate::source_index::read_catalog_conversation_at(aicx_home, entry).ok()?;
+    let (_, frames, _scope) =
+        crate::source_index::read_catalog_conversation_at(aicx_home, entry).ok()?;
     if frames.is_empty() {
         return None;
     }

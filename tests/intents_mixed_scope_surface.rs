@@ -899,6 +899,61 @@ fn whole_session_scope_is_judged_before_the_frame_kind_filter() {
     let _ = fs::remove_dir_all(&root);
 }
 
+/// `.aicxignore` removes frames one layer BELOW the scope report, so a session
+/// whose baseline checkout is hidden arrives looking homogeneous: one foreign
+/// cwd, no conflict. The report has to carry the fact that evidence was
+/// removed — as a count, never as the hidden path — or the surviving cwd-less
+/// frames inherit the cataloged project on evidence nobody can see.
+#[test]
+fn a_hidden_baseline_cannot_silence_mixed_scope() {
+    let root = unique_root("hiddenbaseline");
+    let _guard = HomeGuard::set(&root);
+    let vista = make_repo(&root, "vista");
+    let fleet = make_repo(&root, "fleet-bus");
+    let other = make_repo(&root, "other-repo");
+    let mixed_sid = write_mixed_rollout(&root, &vista, &fleet, &other);
+
+    let aicx_home = root.join(".aicx");
+    fs::create_dir_all(&aicx_home).expect("aicx home");
+    // The operator hides the session's own checkout.
+    fs::write(
+        aicx_home.join(".aicxignore"),
+        format!("{}\n", vista.display()),
+    )
+    .expect("write .aicxignore");
+    aicx::catalog::rebuild(&aicx_home, &root).expect("rebuild catalog over fixture home");
+
+    let user_extraction = extract(&root, aicx::timeline::FrameKind::UserMsg);
+    let agent_extraction = extract(&root, aicx::timeline::FrameKind::AgentReply);
+
+    // Whatever survives the privacy filter, none of it may be served as vista.
+    let leaked: Vec<&str> = user_extraction
+        .records
+        .iter()
+        .chain(agent_extraction.records.iter())
+        .map(|record| record.summary.as_str())
+        .collect();
+    assert!(
+        leaked.is_empty(),
+        "a session whose baseline is hidden must not hand its remaining frames to that project: {leaked:?}"
+    );
+    // ... and the session is still named as mixed rather than passing as clean.
+    let mixed: Vec<_> = user_extraction
+        .mixed_scope
+        .iter()
+        .chain(agent_extraction.mixed_scope.iter())
+        .collect();
+    assert!(
+        mixed
+            .iter()
+            .any(|session| session.agent == "codex" && session.session_id == mixed_sid),
+        "hidden evidence must still count as a scope: {mixed:?}"
+    );
+
+    drop(_guard);
+    let _ = fs::remove_dir_all(&root);
+}
+
 /// A chunk flagged in the index whose catalog row is gone cannot be
 /// re-sourced at all — the loop never reaches a read, so a per-read error
 /// counter never fires. The session still left the answer, and completeness

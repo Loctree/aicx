@@ -677,16 +677,31 @@ pub(crate) const GUARDIAN_SESSION_KIND: &str = "subagent:guardian";
 
 /// Light provenance probe for the catalog hot path: read only until the
 /// first `session_meta` record (bounded) instead of scanning the rollout.
+///
+/// Bounded in BYTES as well as records. A rollout may open with a malformed or
+/// oversized record — the same shape `parse_large_codex_signal` exists for —
+/// and `BufRead::lines()` would allocate all of it before any record limit
+/// applied, turning a probe the catalog runs per session into hundreds of
+/// megabytes. An over-cap record cannot be a `session_meta` header worth
+/// parsing, so it is skipped rather than reassembled.
 #[cfg(feature = "app")]
 pub(crate) fn codex_session_kind_from_source(path: &Path) -> Option<String> {
     let file = fs::File::open(path).ok()?;
-    let reader = BufReader::new(file);
-    for line in reader.lines().map_while(Result::ok).take(64) {
-        let line = line.trim();
-        if line.is_empty() {
+    let mut reader = BufReader::new(file);
+    for _ in 0..64 {
+        let line = aicx_parser::sanitize::read_line_capped(
+            &mut reader,
+            crate::session_catalog::MAX_HEADER_LINE_BYTES,
+        )
+        .ok()??;
+        if line.exceeded {
             continue;
         }
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+        let text = line.line.trim();
+        if text.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
             continue;
         };
         if value.get("type").and_then(|t| t.as_str()) == Some("session_meta") {
@@ -2645,6 +2660,42 @@ mod tests {
         );
         // Only Codex carries this provenance shape.
         assert_eq!(resolve_session_kind("claude", None, &path), None);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Finding: the probe is documented as bounded, but `BufRead::lines()`
+    /// bounds only the record COUNT. A rollout that opens with an oversized or
+    /// malformed record made the catalog allocate all of it per session.
+    #[test]
+    #[cfg(feature = "app")]
+    fn an_oversized_leading_record_does_not_defeat_the_bounded_probe() {
+        let root = temp_root("capped_probe");
+        let day = root.join("2026").join("08").join("27");
+        fs::create_dir_all(&day).unwrap();
+        // An over-cap record that WOULD answer the probe if it were parsed,
+        // followed by the real header. Reading it whole is not just expensive,
+        // it is the wrong answer: a record too large to be a session header is
+        // not the session header.
+        let bloat = format!(
+            r#"{{"timestamp":"2026-08-27T01:35:44.000Z","type":"session_meta","payload":{{"id":"padded","source":{{"subagent":{{"other":"from-the-oversized-record"}}}},"junk":"{}"}}}}"#,
+            "x".repeat(crate::session_catalog::MAX_HEADER_LINE_BYTES * 2)
+        );
+        write_session(
+            &day,
+            "rollout-2026-08-27T03-35-44-01a040dc.jsonl",
+            &[
+                &bloat,
+                r#"{"timestamp":"2026-08-27T01:35:45.000Z","type":"session_meta","payload":{"id":"01a040dc-60f0","cwd":"/Users/tester/Git/vista","source":{"subagent":{"other":"guardian"}}}}"#,
+            ],
+        );
+        let path = day.join("rollout-2026-08-27T03-35-44-01a040dc.jsonl");
+
+        // The over-cap record is skipped rather than reassembled, so the
+        // answer comes from the header that follows it.
+        assert_eq!(
+            resolve_session_kind("codex", None, &path).as_deref(),
+            Some("subagent:guardian")
+        );
         let _ = fs::remove_dir_all(&root);
     }
 

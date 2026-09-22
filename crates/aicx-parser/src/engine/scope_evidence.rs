@@ -181,15 +181,48 @@ fn resolve_candidate(path: &str, baseline: Option<&str>) -> Option<PathBuf> {
 /// `/repo-b/deleted-fleet` as `/repo-b` would stamp positive scope on a
 /// workdir the contract calls unattributable.
 pub fn normalize_workdir(path: &str, baseline: Option<&str>) -> WorkdirIdentity {
-    if let Some(candidate) = resolve_candidate(path, baseline)
-        && candidate.exists()
+    let Some(candidate) = resolve_candidate(path, baseline) else {
+        // Nothing to resolve a bare relative token against; it stays as-is.
+        return WorkdirIdentity::Unresolved(trim_path(path).to_string());
+    };
+    let candidate = lexically_normalized(&candidate);
+    if candidate.exists()
         && let Some(root) = discover_git_root(&candidate)
     {
         // Canonical form, so one checkout reached through a symlink or a
         // `/var` vs `/private/var` spelling is one identity.
         return WorkdirIdentity::Resolved(std::fs::canonicalize(&root).unwrap_or(root));
     }
-    WorkdirIdentity::Unresolved(path.to_string())
+    // Unresolvable, but not unknown: a replayed session whose checkout is gone
+    // from this machine still told us `.` or `packages/api` RELATIVE TO its
+    // baseline. Discarding that join and keeping the bare token would compare
+    // `.` against `/old/repo` and throw away turns that are plainly in scope.
+    WorkdirIdentity::Unresolved(candidate.to_string_lossy().into_owned())
+}
+
+/// Collapse `.` and `..` without touching the filesystem.
+///
+/// The lexical comparison below is the last resort for paths that do not exist
+/// here, so it must at least compare like with like: `/old/repo` joined with
+/// `.` is `/old/repo`, not `/old/repo/.`.
+fn lexically_normalized(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !out.pop() {
+                    out.push(component.as_os_str());
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    if out.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        out
+    }
 }
 
 fn trim_path(path: &str) -> &str {
@@ -233,9 +266,73 @@ pub fn workdir_within_scope(candidate: &str, scope_root: &str) -> bool {
                 trim_path(&candidate_root.to_string_lossy()) == trim_path(&scope)
             }
         },
-        // Unknowable path: the declared scope is all the evidence there is.
-        WorkdirIdentity::Unresolved(candidate) => lexically_within(&candidate, scope_root),
+        // Unknowable path. The declared scope is the only evidence there is,
+        // but it is evidence ONLY where the scope root is equally unknowable.
+        // A scope root that resolves here cannot adopt a path it cannot prove:
+        // a removed nested checkout or submodule sits lexically below its
+        // parent and is still a different repository, so lexical containment
+        // would re-open exactly the leak identity checking exists to close.
+        WorkdirIdentity::Unresolved(candidate) => match normalize_workdir(scope_root, None) {
+            WorkdirIdentity::Resolved(_) => false,
+            WorkdirIdentity::Unresolved(scope) => lexically_within(&candidate, &scope),
+        },
     }
+}
+
+/// Is `candidate` plausibly INSIDE `scope_root`, for the purpose of counting
+/// how many repository identities a turn window touched?
+///
+/// Deliberately more tolerant than [`workdir_within_scope`], because the two
+/// answer different questions. Membership asks "may this frame be served as
+/// project P?", where an unprovable claim must fail closed. Reduction asks "is
+/// this a SECOND repository?", where an unprovable claim must fail OPEN: a
+/// window judged [`WindowScope::Unattributed`] has its frames dropped outright
+/// by the project filter, so calling every vanished path a second identity
+/// silently deletes ordinary operator evidence — a deleted `target/`, a
+/// removed temp dir, a worktree that has been cleaned up.
+///
+/// The one case where a missing path IS provably its own repository is a
+/// declared submodule: the parent's `.gitmodules` still names it after the
+/// working tree is gone. That is read here, bounded and filesystem-only, so
+/// the common case keeps its evidence and the provable case keeps its
+/// identity. A bare nested checkout that was deleted leaves no such trace and
+/// is genuinely indistinguishable from a deleted directory; it is absorbed,
+/// and that trade is deliberate.
+fn plausibly_within_scope(candidate: &str, scope_root: &str) -> bool {
+    match normalize_workdir(candidate, Some(scope_root)) {
+        // Provable on both sides: identity decides, exactly as for membership.
+        WorkdirIdentity::Resolved(_) => workdir_within_scope(candidate, scope_root),
+        WorkdirIdentity::Unresolved(path) => {
+            if !lexically_within(&path, trim_path(scope_root)) {
+                return false;
+            }
+            !declared_submodule(scope_root, &path)
+        }
+    }
+}
+
+/// Is `path` a submodule the checkout at `scope_root` declares?
+///
+/// Bounded and offline: one `.gitmodules` read, no subprocess, no network. A
+/// missing or unreadable file simply means "not declared".
+fn declared_submodule(scope_root: &str, path: &str) -> bool {
+    // Both sides stay in the spelling the caller used: the candidate could not
+    // be canonicalized (it does not exist), so canonicalizing only the root
+    // would leave the two incomparable on any host where the scope path runs
+    // through a symlink.
+    let root = Path::new(trim_path(scope_root));
+    let Ok(raw) = std::fs::read_to_string(root.join(".gitmodules")) else {
+        return false;
+    };
+    let relative = match Path::new(trim_path(path)).strip_prefix(root) {
+        Ok(relative) => relative.to_string_lossy().replace('\\', "/"),
+        Err(_) => return false,
+    };
+    raw.lines()
+        .map(str::trim)
+        .filter_map(|line| line.strip_prefix("path"))
+        .filter_map(|rest| rest.trim().strip_prefix('='))
+        .any(|declared| trim_path(declared.trim()) == trim_path(&relative))
 }
 
 /// Do these two paths resolve to two DIFFERENT checkouts on this machine?
@@ -259,9 +356,11 @@ pub fn distinct_repo_identity(candidate: &str, scope_root: &str) -> bool {
 /// Evidence naming the baseline checkout counts as an observed identity, not
 /// as noise to drop: a window that ran tools in BOTH the baseline and another
 /// checkout has two proven identities and must not be re-scoped wholesale to
-/// the foreign one. Unresolvable paths nested under a proven root are absorbed
-/// by it, but a resolved root never absorbs another resolved root — a nested
-/// checkout is a repository of its own.
+/// the foreign one. A proven root never absorbs another proven root — a nested
+/// checkout is a repository of its own. It DOES absorb a path that merely no
+/// longer exists inside it, unless `.gitmodules` still declares that path a
+/// submodule: see [`plausibly_within_scope`] for why reduction fails open
+/// where membership fails closed.
 ///
 /// An unresolvable workdir pointing away from the baseline (historical or
 /// foreign-machine path), and evidence that could not be read at all
@@ -283,7 +382,7 @@ pub fn effective_window_scope(
     let mut saw_baseline = false;
     let mut foreign: Vec<WorkdirIdentity> = Vec::new();
     for raw in workdirs.iter().filter_map(WorkdirEvidence::path) {
-        if baseline.is_some_and(|base| workdir_within_scope(raw, base)) {
+        if baseline.is_some_and(|base| plausibly_within_scope(raw, base)) {
             saw_baseline = true;
             continue;
         }
@@ -293,19 +392,20 @@ pub fn effective_window_scope(
         }
     }
 
-    // A proven root absorbs unresolvable paths beneath it (one checkout, one
-    // scope). It never absorbs another proven root.
-    let roots: Vec<PathBuf> = foreign
+    // A proven foreign root absorbs unprovable paths that plausibly sit inside
+    // it, for the same reason the baseline does: a vanished directory is not
+    // evidence of a second repository. It never absorbs another proven root.
+    let roots: Vec<String> = foreign
         .iter()
         .filter_map(|identity| match identity {
-            WorkdirIdentity::Resolved(root) => Some(root.clone()),
+            WorkdirIdentity::Resolved(root) => Some(root.to_string_lossy().into_owned()),
             WorkdirIdentity::Unresolved(_) => None,
         })
         .collect();
     foreign.retain(|identity| match identity {
         WorkdirIdentity::Resolved(_) => true,
         WorkdirIdentity::Unresolved(path) => {
-            !roots.iter().any(|root| Path::new(path).starts_with(root))
+            !roots.iter().any(|root| plausibly_within_scope(path, root))
         }
     });
 
@@ -630,6 +730,91 @@ mod tests {
         assert_eq!(scope, WindowScope::Unattributed);
         assert_eq!(path, None);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Membership and identity-counting are different questions, and this pins
+    /// the split deliberately rather than letting it fall out.
+    ///
+    /// A path under a live checkout that no longer exists cannot be PROVEN to
+    /// belong to it, so the project filter must not serve it (fail closed).
+    /// It equally cannot be proven to be a second repository, and the window
+    /// reduction must not call it one (fail open) — `retain_frames_for_project`
+    /// drops `scope_unattributed` frames outright, so counting every deleted
+    /// `target/` or cleaned-up worktree as a foreign repo would silently
+    /// delete ordinary operator evidence.
+    #[test]
+    fn a_vanished_path_fails_closed_for_membership_and_open_for_identity() {
+        let root = scratch("vanished-under-live");
+        let parent = root.join("vista");
+        std::fs::create_dir_all(parent.join(".git")).expect("parent git dir");
+        let base = parent.to_string_lossy().into_owned();
+        let gone = parent.join("target").join("tmp-build");
+        let gone = gone.to_string_lossy().into_owned();
+
+        assert!(
+            !workdir_within_scope(&gone, &base),
+            "membership: a proven checkout must not claim a path it cannot prove"
+        );
+        let (scope, path) = effective_window_scope(&explicit(&[&gone]), Some(&base));
+        assert_eq!(
+            scope,
+            WindowScope::Baseline,
+            "identity: a vanished directory is not a second repository"
+        );
+        assert_eq!(path, None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The one vanished path that IS provably its own repository: the parent
+    /// still declares it in `.gitmodules` after the working tree is gone. A
+    /// bare nested checkout leaves no such trace and is absorbed — that half
+    /// of the trade is stated in `plausibly_within_scope`, not hidden.
+    #[test]
+    fn a_vanished_declared_submodule_is_still_its_own_repository() {
+        let root = scratch("vanished-submodule");
+        let parent = root.join("vista");
+        std::fs::create_dir_all(parent.join(".git")).expect("parent git dir");
+        std::fs::write(
+            parent.join(".gitmodules"),
+            "[submodule \"fleet-bus\"]\n\tpath = vendor/fleet-bus\n\turl = https://example.invalid/fleet-bus.git\n",
+        )
+        .expect("write .gitmodules");
+        let base = parent.to_string_lossy().into_owned();
+        let gone = parent.join("vendor").join("fleet-bus");
+        let gone = gone.to_string_lossy().into_owned();
+
+        assert!(!workdir_within_scope(&gone, &base));
+        let (scope, path) = effective_window_scope(&explicit(&[&gone]), Some(&base));
+        assert_eq!(
+            scope,
+            WindowScope::Unattributed,
+            "a declared submodule keeps its identity once the tree is gone"
+        );
+        assert_eq!(path, None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Finding: replaying a session whose checkout is gone from this machine.
+    /// Nothing resolves, so lexical comparison is the only evidence there is —
+    /// and it has to compare like with like: the baseline-joined `.`, not the
+    /// bare token, or every turn of the session is discarded as foreign.
+    #[test]
+    fn a_relative_workdir_in_a_vanished_checkout_still_belongs_to_it() {
+        let baseline = "/nonexistent-aicx-scope/old/repo";
+
+        assert_eq!(
+            normalize_workdir(".", Some(baseline)),
+            WorkdirIdentity::Unresolved(baseline.to_string()),
+            "a relative workdir keeps the baseline it was recorded against"
+        );
+        assert!(workdir_within_scope(".", baseline));
+        assert!(workdir_within_scope("packages/api", baseline));
+        assert!(!workdir_within_scope("../sibling", baseline));
+
+        let (scope, path) =
+            effective_window_scope(&explicit(&[".", "packages/api"]), Some(baseline));
+        assert_eq!(scope, WindowScope::Baseline);
+        assert_eq!(path, None);
     }
 
     #[test]

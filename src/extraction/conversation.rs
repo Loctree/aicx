@@ -865,6 +865,14 @@ pub struct ScopeReport {
     /// repo identity). Any conflict makes the span a mixed candidate on its
     /// own — unknown scope never inherits a project bucket by silence.
     pub conflicts: usize,
+    /// Distinct cwds that existed in the session but were removed before this
+    /// report was built, because `.aicxignore` hides those repositories.
+    ///
+    /// The COUNT is kept and the path deliberately is not: a hidden repository
+    /// must not be re-published through the scope surface, but a session whose
+    /// baseline was hidden must not look homogeneous either — that is how a
+    /// foreign cwd plus cwd-less frames would inherit the cataloged project.
+    pub hidden_scopes: usize,
 }
 
 impl ScopeReport {
@@ -876,7 +884,28 @@ impl ScopeReport {
     /// workdir conflict or more than one observed cwd makes a session
     /// unservable as one bucket.
     pub fn scope_mixed(&self) -> bool {
-        self.conflicts > 0 || self.cwds.len() > 1
+        self.conflicts > 0 || self.cwds.len() + self.hidden_scopes > 1
+    }
+
+    /// Does this session hold anything the cataloged checkout cannot claim?
+    ///
+    /// [`Self::scope_mixed`] answers "more than one scope", which a session
+    /// re-scoped wholesale to ONE foreign checkout passes: one cwd, no
+    /// conflict, internally perfectly consistent — and every frame of it
+    /// belongs to another repository. Whole-session attribution is only safe
+    /// when the observed scope is also the cataloged one.
+    pub fn scope_foreign_to(&self, baseline: Option<&str>) -> bool {
+        if self.scope_mixed() {
+            return true;
+        }
+        baseline
+            .map(str::trim)
+            .filter(|base| !base.is_empty())
+            .is_some_and(|base| {
+                self.cwds
+                    .iter()
+                    .any(|cwd| !aicx_parser::engine::workdir_within_scope(cwd, base))
+            })
     }
 }
 
@@ -908,6 +937,7 @@ pub fn scope_report_for_entries(entries: &[TimelineEntry]) -> ScopeReport {
         )
     };
     ScopeReport {
+        hidden_scopes: 0,
         status,
         cwds: cwds.into_iter().collect(),
         branches: branches.into_iter().collect(),
@@ -1589,6 +1619,60 @@ mod harness_noise_tests {
         let report = scope_report_for_entries(&[conflicted, vista]);
         assert_eq!(report.status, ScopeStatus::MixedCandidate);
         assert_eq!(report.conflicts, 1);
+    }
+
+    /// Finding: `.aicxignore` removes frames BEFORE the report is built, so a
+    /// session whose baseline is hidden looks homogeneous — one foreign cwd
+    /// plus cwd-less frames — and the cwd-less frames then inherit the
+    /// cataloged project. The count of hidden scopes travels so the report
+    /// stays honest; the hidden path deliberately does not.
+    #[test]
+    fn a_hidden_baseline_cannot_make_a_mixed_session_look_homogeneous() {
+        let mut foreign = entry("user", "work in the other checkout", 1);
+        foreign.cwd = Some("/repos/fleet-bus".into());
+        let mut report = scope_report_for_entries(&[foreign]);
+        assert!(
+            !report.scope_mixed(),
+            "one visible cwd is homogeneous on its own"
+        );
+
+        // The privacy filter removed the baseline's frames before we looked.
+        report.hidden_scopes = 1;
+        assert!(report.scope_mixed());
+        assert_eq!(
+            report.cwds,
+            vec!["/repos/fleet-bus".to_string()],
+            "the hidden repository is counted, never named"
+        );
+    }
+
+    /// Finding: a session re-scoped wholesale to ONE foreign checkout has a
+    /// single cwd and no conflict, so it is internally homogeneous and every
+    /// frame of it belongs to another repository. Whole-session attribution
+    /// must not stamp it with the cataloged row's project.
+    #[test]
+    fn a_session_wholly_inside_a_foreign_checkout_is_still_foreign() {
+        let mut frame = entry("user", "all of this ran elsewhere", 1);
+        frame.cwd = Some("/repos/fleet-bus".into());
+        let report = scope_report_for_entries(&[frame]);
+
+        assert!(!report.scope_mixed(), "one cwd, no conflict");
+        assert!(
+            report.scope_foreign_to(Some("/repos/vista")),
+            "homogeneous is not the same fact as belonging here"
+        );
+        assert!(!report.scope_foreign_to(Some("/repos/fleet-bus")));
+
+        // A frame that ran in a subdirectory of the cataloged checkout is
+        // still that checkout — membership runs observed-cwd INTO baseline.
+        let mut subdir = entry("user", "ran in a crate dir", 2);
+        subdir.cwd = Some("/repos/vista/crates/api".into());
+        let inside = scope_report_for_entries(&[subdir]);
+        assert!(!inside.scope_foreign_to(Some("/repos/vista")));
+
+        // Without a cataloged checkout there is nothing to be foreign to.
+        assert!(!report.scope_foreign_to(None));
+        assert!(!report.scope_foreign_to(Some("   ")));
     }
 
     #[test]

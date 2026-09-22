@@ -826,7 +826,7 @@ fn catalog_frames_to_intent_file(
         &mut frames,
         &project,
         entry.cwd.as_deref(),
-        scope.scope_mixed(),
+        scope.scope_foreign_to(entry.cwd.as_deref()),
     );
     let Some(timestamp) = frames.last().map(|frame| frame.timestamp) else {
         return (None, scope);
@@ -942,7 +942,7 @@ fn collect_live_unadmitted_files(
             &mut frames,
             &identity_project,
             entry.cwd.as_deref(),
-            scope.scope_mixed(),
+            scope.scope_foreign_to(entry.cwd.as_deref()),
         );
         if frames.is_empty() {
             continue;
