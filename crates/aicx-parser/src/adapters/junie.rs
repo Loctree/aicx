@@ -757,6 +757,8 @@ impl<'a> Assembly<'a> {
                         Known::Unknown(_) => None,
                     },
                 ),
+                // Only the Codex adapter observes explicit tool-call workdirs.
+                scope_conflict: false,
                 cwd: self.cwd,
                 branch: self.branch,
                 started_at: self.segment_started_at,

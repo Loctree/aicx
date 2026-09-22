@@ -15,7 +15,7 @@ use crate::engine::frames::{
 };
 use crate::engine::frames_rules;
 use crate::engine::scope_evidence::{
-    WindowScope, WorkdirEvidence, effective_window_scope, tool_call_workdir,
+    WindowScope, WorkdirEvidence, effective_window_scope, tool_call_workdirs,
 };
 use crate::engine::{
     AgentKind, BoundaryFlags, ConsumedUnit, ContextEpochRef, CounterSemantics, CoverageReport,
@@ -1100,12 +1100,12 @@ impl<'a> Assembly<'a> {
         kind: ToolEventKind,
     ) -> Result<(), AdapterError> {
         let payload = &event["payload"];
-        if kind == ToolEventKind::Call
-            && let Some(workdir) = tool_call_workdir(payload)
-        {
-            let evidence = WorkdirEvidence::Explicit(workdir);
-            if !self.window_workdirs.contains(&evidence) {
-                self.window_workdirs.push(evidence);
+        if kind == ToolEventKind::Call {
+            for workdir in tool_call_workdirs(payload) {
+                let evidence = WorkdirEvidence::Explicit(workdir);
+                if !self.window_workdirs.contains(&evidence) {
+                    self.window_workdirs.push(evidence);
+                }
             }
         }
         let correlation_raw = string_at(payload, &["call_id"])
@@ -1501,6 +1501,7 @@ impl<'a> Assembly<'a> {
                             end,
                         },
                         scope_status,
+                        scope_conflict: segment.scope_conflict,
                     })
                 })
                 .collect();
@@ -2067,7 +2068,12 @@ mod tests {
     #[test]
     fn tool_call_workdir_rescopes_the_whole_turn_window() {
         let fleet = temp_repo("fleet");
-        let fleet_str = fleet.to_string_lossy().into_owned();
+        // Identities are canonical, so the stamped scope is the canonical
+        // root (a temp dir is commonly reached through a symlink).
+        let fleet_str = std::fs::canonicalize(&fleet)
+            .unwrap_or_else(|_| fleet.clone())
+            .to_string_lossy()
+            .into_owned();
         let template = r#"{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"s1","cwd":"/sessions/vista"}}
 {"timestamp":"2026-01-01T00:01:00Z","type":"turn_context","payload":{"cwd":"/sessions/vista"}}
 {"timestamp":"2026-01-01T00:01:10Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"vista opening question"}]}}

@@ -1268,6 +1268,8 @@ fn finalize_segments(drafts: Vec<SegmentDraft>, turns: &[Turn]) -> Vec<Segment> 
                     Known::Unknown(_) => None,
                 },
             ),
+            // Only the Codex adapter observes explicit tool-call workdirs.
+            scope_conflict: false,
             cwd: d.cwd,
             branch: d.branch,
             started_at: d.started_at,

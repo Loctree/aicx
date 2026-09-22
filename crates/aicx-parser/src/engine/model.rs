@@ -74,6 +74,14 @@ pub struct Segment {
     /// drift inside the segment); they never guess from content.
     #[serde(default)]
     pub scope_status: ScopeStatus,
+    /// Explicit tool-call workdirs inside this span proved two repository
+    /// identities. This is NOT the same fact as `scope_status`: a segment is
+    /// a `MixedCandidate` for ordinary branch drift inside one unchanged
+    /// checkout, which is fully attributable. Only a proven workdir conflict
+    /// leaves the span with no repository to belong to, so downstream filters
+    /// read this flag instead of inferring it from the generic status.
+    #[serde(default)]
+    pub scope_conflict: bool,
 }
 
 /// Structural scope verdict for a [`Segment`] or a whole conversation.

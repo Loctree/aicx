@@ -227,11 +227,18 @@ homogeneous sessions keep the legacy bucket inheritance.
 
 Membership is decided by **repository identity, never by path prefix**: a
 nested checkout or submodule sits lexically under its parent checkout and is
-a different repo, so its frames do not join the parent's bucket. Lexical
-containment survives only where identity is unknowable — a workdir that does
-not exist on this machine. Branch drift is not scope drift: a session that
+a different repo, so its frames do not join the parent's bucket — and the
+legacy path-segment fallback does not re-admit them either, however the path
+happens to be spelled. Lexical containment survives only where identity is
+unknowable — a workdir that does not exist on this machine. Identity is
+canonical (one checkout reached two ways is one repo) and existence-checked (a
+deleted subdirectory does not inherit its ancestor's `.git`); a relative
+`workdir` resolves against the turn's cwd, never against the directory `aicx`
+runs in. A window that ran tools in both the baseline and another checkout is
+a conflict, not a re-scope. Branch drift is not scope drift: a session that
 switches branch inside one unchanged checkout stays a normal, fully attributed
-session.
+session, and scope is judged on the whole session before the frame-kind filter
+narrows it to one role.
 
 **What this removes, and what it does not re-home.** Foreign frames are
 removed from the parent project's answer; they are *not* re-filed under the

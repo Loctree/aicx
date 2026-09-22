@@ -249,6 +249,7 @@ mod tests {
             ended_at: Known::unknown(),
             turn_range: TurnRange { start: 0, end: 0 },
             scope_status: ScopeStatus::NoDriftObserved,
+            scope_conflict: false,
         }
     }
 

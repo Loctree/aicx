@@ -64,6 +64,7 @@ pub fn model_with_text(text: &str) -> SessionModel {
     model.segments.push(Segment {
         segment_id: 0,
         scope_status: ScopeStatus::NoDriftObserved,
+        scope_conflict: false,
         cwd: Known::value("repo".to_owned()),
         branch: Known::value("main".to_owned()),
         started_at: Known::value("2026-07-13T00:00:00Z".to_owned()),

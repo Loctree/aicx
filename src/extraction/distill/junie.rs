@@ -446,6 +446,7 @@ mod tests {
             Segment {
                 segment_id: 0,
                 scope_status: ScopeStatus::NoDriftObserved,
+                scope_conflict: false,
                 cwd: model.provenance.cwd.clone(),
                 branch: model.provenance.branch.clone(),
                 started_at: model.provenance.started_at.clone(),
@@ -458,6 +459,7 @@ mod tests {
             Segment {
                 segment_id: 1,
                 scope_status: ScopeStatus::NoDriftObserved,
+                scope_conflict: false,
                 cwd: model.provenance.cwd.clone(),
                 branch: model.provenance.branch.clone(),
                 started_at: model.provenance.started_at.clone(),

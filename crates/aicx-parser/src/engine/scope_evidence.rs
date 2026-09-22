@@ -44,7 +44,9 @@ impl WorkdirEvidence {
 /// Repo-level identity of one explicit tool-call working directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkdirIdentity {
-    /// Path resolves to a git checkout; the identity is the repo root.
+    /// Path resolves to a git checkout; the identity is the canonical repo
+    /// root, so two spellings of one checkout (symlink, `/var` vs
+    /// `/private/var`) are one identity rather than a phantom conflict.
     Resolved(PathBuf),
     /// Path does not exist locally or has no `.git` ancestor. Conservative:
     /// never guess a repo — each distinct unresolved path is its own identity.
@@ -60,12 +62,17 @@ impl WorkdirIdentity {
             Self::Unresolved(path) => path.clone(),
         }
     }
+
+    fn is_resolved(&self) -> bool {
+        matches!(self, Self::Resolved(_))
+    }
 }
 
 /// Effective scope of one turn window, from its explicit workdir evidence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WindowScope {
-    /// No explicit workdir evidence — keep the `turn_context` baseline.
+    /// No explicit workdir evidence, or all of it names the baseline checkout
+    /// — keep the `turn_context` baseline.
     Baseline,
     /// Every explicit workdir in the window normalizes to one resolved repo
     /// identity — positive attribution at the repo root.
@@ -79,43 +86,54 @@ pub enum WindowScope {
     Unattributed,
 }
 
-/// Extract an explicit `workdir` from an executable tool call payload.
+/// Every explicit `workdir` in an executable tool call payload, in order.
 ///
 /// Two real shapes exist in Codex rollouts: JSON `function_call.arguments`
 /// (`{"cmd": "...", "workdir": "/abs/path"}`) and a JavaScript literal inside
 /// `custom_tool_call.input` (`tools.exec_command({cmd:"...",workdir:'/abs'})`).
-/// Only non-empty trimmed values count.
-pub fn tool_call_workdir(payload: &Value) -> Option<String> {
+///
+/// ALL occurrences are returned, not the first: one `input` can orchestrate
+/// several `tools.exec_command` calls, and reading only the first hides a
+/// later hop into another repository behind a baseline-looking opener. It also
+/// keeps a `workdir:`-shaped string inside a shell command from deciding the
+/// window on its own — an extra reading makes the window unattributed or
+/// conflicted, never confidently wrong.
+pub fn tool_call_workdirs(payload: &Value) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+    let mut push = |value: String| {
+        let trimmed = value.trim().to_string();
+        if !trimmed.is_empty() && !found.contains(&trimmed) {
+            found.push(trimmed);
+        }
+    };
     if let Some(arguments) = payload.get("arguments") {
         let parsed = match arguments {
             Value::Object(_) => Some(arguments.clone()),
             Value::String(raw) => serde_json::from_str::<Value>(raw).ok(),
             _ => None,
         };
-        if let Some(value) = parsed.and_then(|body| {
-            body.get("workdir")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        }) {
-            let trimmed = value.trim();
-            if !trimmed.is_empty() {
-                return Some(trimmed.to_string());
+        match parsed.as_ref().and_then(|body| body.get("workdir")) {
+            Some(Value::String(workdir)) => push(workdir.clone()),
+            // A JS literal can also arrive as the raw `arguments` string; scan
+            // it rather than declaring no evidence because JSON parsing failed.
+            _ => {
+                if let Value::String(raw) = arguments {
+                    for workdir in workdirs_in_literal(raw) {
+                        push(workdir);
+                    }
+                }
             }
         }
-        // A `custom_tool_call`-style JS literal can also arrive as the raw
-        // `arguments` string; fall through to the literal scanner below rather
-        // than declaring no evidence just because JSON parsing failed.
-        if let Value::String(raw) = arguments
-            && let Some(workdir) = workdir_in_literal(raw)
-        {
-            return Some(workdir);
+    }
+    if let Some(input) = payload.get("input").and_then(Value::as_str) {
+        for workdir in workdirs_in_literal(input) {
+            push(workdir);
         }
     }
-    let input = payload.get("input").and_then(Value::as_str)?;
-    workdir_in_literal(input)
+    found
 }
 
-/// `workdir` key inside an object literal, quote style agnostic:
+/// Every `workdir` key inside an object literal, quote style agnostic:
 /// `workdir:"/p"`, `"workdir": "/p"`, `'workdir': '/p'`.
 ///
 /// Codex writes `custom_tool_call.input` as model-authored JavaScript, so the
@@ -123,26 +141,53 @@ pub fn tool_call_workdir(payload: &Value) -> Option<String> {
 /// quotes silently dropped real evidence and left the window on its baseline
 /// project — the leak this module exists to close.
 ///
-/// The value runs to the closing quote and may contain backslashes: a Windows
+/// A value runs to the closing quote and may contain backslashes: a Windows
 /// workdir is `C:\repo\crate`, and stopping the capture at the first backslash
 /// would reduce it to the drive letter.
-fn workdir_in_literal(input: &str) -> Option<String> {
+fn workdirs_in_literal(input: &str) -> Vec<String> {
     static WORKDIR_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let re = WORKDIR_RE.get_or_init(|| {
         regex::Regex::new(r#"["']?workdir["']?\s*:\s*["']([^"']+)"#).expect("valid regex")
     });
-    let value = re.captures(input)?.get(1)?.as_str().trim();
-    (!value.is_empty()).then(|| value.to_string())
+    re.captures_iter(input)
+        .filter_map(|capture| capture.get(1))
+        .map(|value| value.as_str().trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect()
+}
+
+/// Resolve one workdir string to a filesystem candidate.
+///
+/// A relative workdir (`.`, `packages/api`) belongs to the TURN's cwd, never to
+/// wherever `aicx` happens to be running: resolving it against the process cwd
+/// would let the caller's own checkout adopt a historical rollout's messages.
+/// Without a baseline there is nothing to resolve it against, so it stays
+/// unknown.
+fn resolve_candidate(path: &str, baseline: Option<&str>) -> Option<PathBuf> {
+    let candidate = Path::new(path);
+    if candidate.is_absolute() {
+        return Some(candidate.to_path_buf());
+    }
+    let base = Path::new(baseline?.trim());
+    base.is_absolute().then(|| base.join(candidate))
 }
 
 /// Normalize one explicit workdir to its repo-level identity.
 ///
 /// Filesystem-only and bounded (ancestor walk to the first `.git`); no
-/// subprocess and no remote lookup — the root path is identity enough.
-pub fn normalize_workdir(path: &str) -> WorkdirIdentity {
-    let candidate = Path::new(path);
-    if let Some(root) = discover_git_root(candidate) {
-        return WorkdirIdentity::Resolved(root);
+/// subprocess and no remote lookup — the canonical root path is identity
+/// enough. A path that does not exist here resolves to nothing: an ancestor's
+/// `.git` is not evidence about a directory that was never there, and treating
+/// `/repo-b/deleted-fleet` as `/repo-b` would stamp positive scope on a
+/// workdir the contract calls unattributable.
+pub fn normalize_workdir(path: &str, baseline: Option<&str>) -> WorkdirIdentity {
+    if let Some(candidate) = resolve_candidate(path, baseline)
+        && candidate.exists()
+        && let Some(root) = discover_git_root(&candidate)
+    {
+        // Canonical form, so one checkout reached through a symlink or a
+        // `/var` vs `/private/var` spelling is one identity.
+        return WorkdirIdentity::Resolved(std::fs::canonicalize(&root).unwrap_or(root));
     }
     WorkdirIdentity::Unresolved(path.to_string())
 }
@@ -175,14 +220,14 @@ fn lexically_within(candidate: &str, scope_root: &str) -> bool {
 /// match the scope's resolved repo ROOT, not merely live under its path.
 /// Lexical containment survives only where identity is genuinely unknowable —
 /// a workdir that does not exist on this machine (historical rollouts,
-/// foreign-machine paths), where the declared baseline is the only evidence
+/// foreign-machine paths), where the declared scope is the only evidence
 /// there is.
 pub fn workdir_within_scope(candidate: &str, scope_root: &str) -> bool {
-    match normalize_workdir(candidate) {
+    match normalize_workdir(candidate, Some(scope_root)) {
         // The candidate is a real checkout here: only root identity counts.
         // A nested checkout resolves to ITSELF, so it is never absorbed by
         // the enclosing path.
-        WorkdirIdentity::Resolved(candidate_root) => match normalize_workdir(scope_root) {
+        WorkdirIdentity::Resolved(candidate_root) => match normalize_workdir(scope_root, None) {
             WorkdirIdentity::Resolved(scope) => candidate_root == scope,
             WorkdirIdentity::Unresolved(scope) => {
                 trim_path(&candidate_root.to_string_lossy()) == trim_path(&scope)
@@ -193,19 +238,37 @@ pub fn workdir_within_scope(candidate: &str, scope_root: &str) -> bool {
     }
 }
 
+/// Do these two paths resolve to two DIFFERENT checkouts on this machine?
+///
+/// Only true when both sides are proven, so callers can distinguish "provably
+/// another repository" from "cannot tell". A downstream project filter needs
+/// that distinction: its path-segment fallback would otherwise re-admit a
+/// nested checkout whose path happens to spell the requested project.
+pub fn distinct_repo_identity(candidate: &str, scope_root: &str) -> bool {
+    match (
+        normalize_workdir(candidate, Some(scope_root)),
+        normalize_workdir(scope_root, None),
+    ) {
+        (WorkdirIdentity::Resolved(left), WorkdirIdentity::Resolved(right)) => left != right,
+        _ => false,
+    }
+}
+
 /// Reduce a window's explicit workdir evidence to one effective-scope verdict.
 ///
-/// A resolved repo root absorbs every workdir whose identity is that root
-/// (subdirs of one checkout are one scope; a nested checkout is NOT). An
-/// unresolvable workdir that belongs to the `baseline` checkout is baseline
-/// evidence — the window's `turn_context` already says the same thing, so
-/// nothing changes. An unresolvable workdir pointing ELSEWHERE (historical or
-/// foreign-machine path), or evidence that could not be read at all
-/// ([`WorkdirEvidence::Opaque`]), is [`WindowScope::Unattributed`]: a durable
+/// Evidence naming the baseline checkout counts as an observed identity, not
+/// as noise to drop: a window that ran tools in BOTH the baseline and another
+/// checkout has two proven identities and must not be re-scoped wholesale to
+/// the foreign one. Unresolvable paths nested under a proven root are absorbed
+/// by it, but a resolved root never absorbs another resolved root — a nested
+/// checkout is a repository of its own.
+///
+/// An unresolvable workdir pointing away from the baseline (historical or
+/// foreign-machine path), and evidence that could not be read at all
+/// ([`WorkdirEvidence::Opaque`]), are [`WindowScope::Unattributed`]: a durable
 /// "evidence exists but says nothing" state — never a positive attribution,
 /// never proof of divergence, and never eligible for bucket inheritance
-/// downstream. Two or more resolved repo identities are
-/// [`WindowScope::Conflict`].
+/// downstream.
 pub fn effective_window_scope(
     workdirs: &[WorkdirEvidence],
     baseline: Option<&str>,
@@ -216,57 +279,62 @@ pub fn effective_window_scope(
     if workdirs.contains(&WorkdirEvidence::Opaque) {
         return (WindowScope::Unattributed, None);
     }
-    let identities: Vec<WorkdirIdentity> = workdirs
-        .iter()
-        .filter_map(WorkdirEvidence::path)
-        .filter(|raw| !baseline.is_some_and(|base| workdir_within_scope(raw, base)))
-        .map(normalize_workdir)
-        .collect();
-    let roots: Vec<PathBuf> = identities
+
+    let mut saw_baseline = false;
+    let mut foreign: Vec<WorkdirIdentity> = Vec::new();
+    for raw in workdirs.iter().filter_map(WorkdirEvidence::path) {
+        if baseline.is_some_and(|base| workdir_within_scope(raw, base)) {
+            saw_baseline = true;
+            continue;
+        }
+        let identity = normalize_workdir(raw, baseline);
+        if !foreign.contains(&identity) {
+            foreign.push(identity);
+        }
+    }
+
+    // A proven root absorbs unresolvable paths beneath it (one checkout, one
+    // scope). It never absorbs another proven root.
+    let roots: Vec<PathBuf> = foreign
         .iter()
         .filter_map(|identity| match identity {
             WorkdirIdentity::Resolved(root) => Some(root.clone()),
             WorkdirIdentity::Unresolved(_) => None,
         })
         .collect();
-    let absorbed = |identity: &WorkdirIdentity| -> bool {
-        let own_path = match identity {
-            WorkdirIdentity::Resolved(root) => root.as_path(),
-            WorkdirIdentity::Unresolved(path) => Path::new(path),
-        };
-        roots
-            .iter()
-            .any(|root| root != own_path && own_path.starts_with(root))
-    };
-    let mut distinct: Vec<WorkdirIdentity> = Vec::new();
-    for identity in identities {
-        if absorbed(&identity) {
-            continue;
+    foreign.retain(|identity| match identity {
+        WorkdirIdentity::Resolved(_) => true,
+        WorkdirIdentity::Unresolved(path) => {
+            !roots.iter().any(|root| Path::new(path).starts_with(root))
         }
-        if !distinct.contains(&identity) {
-            distinct.push(identity);
-        }
-    }
-    let resolved_count = distinct
+    });
+
+    let resolved: Vec<&WorkdirIdentity> = foreign
         .iter()
-        .filter(|identity| matches!(identity, WorkdirIdentity::Resolved(_)))
-        .count();
-    if resolved_count >= 2 {
+        .filter(|identity| identity.is_resolved())
+        .collect();
+    if resolved.len() >= 2 {
         return (WindowScope::Conflict, None);
     }
-    if distinct
-        .iter()
-        .any(|identity| matches!(identity, WorkdirIdentity::Unresolved(_)))
-    {
+    if resolved.len() == 1 && saw_baseline {
+        // The window ran in the baseline AND in another checkout. Proven
+        // divergence when the baseline itself is a checkout here; otherwise
+        // the second identity is unproven, which is "unknown", not a verdict.
+        let baseline_resolved = baseline
+            .map(|base| normalize_workdir(base, None).is_resolved())
+            .unwrap_or(false);
+        return if baseline_resolved {
+            (WindowScope::Conflict, None)
+        } else {
+            (WindowScope::Unattributed, None)
+        };
+    }
+    if foreign.iter().any(|identity| !identity.is_resolved()) {
         return (WindowScope::Unattributed, None);
     }
-    match distinct.len() {
-        0 => (WindowScope::Baseline, None),
-        1 => (
-            WindowScope::Consistent,
-            distinct.first().map(WorkdirIdentity::scope_path),
-        ),
-        _ => unreachable!("two distinct identities with fewer than two resolved"),
+    match foreign.first() {
+        None => (WindowScope::Baseline, None),
+        Some(identity) => (WindowScope::Consistent, Some(identity.scope_path())),
     }
 }
 
@@ -281,6 +349,15 @@ mod tests {
             .collect()
     }
 
+    /// Identities are canonical, so a scratch root under a symlinked temp dir
+    /// compares equal to what `normalize_workdir` returns.
+    fn canonical(path: &Path) -> String {
+        std::fs::canonicalize(path)
+            .unwrap_or_else(|_| path.to_path_buf())
+            .to_string_lossy()
+            .into_owned()
+    }
+
     fn scratch(label: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!(
             "aicx-scope-{label}-{}-{:?}",
@@ -291,13 +368,17 @@ mod tests {
         root
     }
 
+    fn first_workdir(payload: &Value) -> Option<String> {
+        tool_call_workdirs(payload).into_iter().next()
+    }
+
     #[test]
     fn workdir_from_json_arguments_string() {
         let payload: Value = serde_json::from_str(
             r#"{"type":"function_call","name":"shell","arguments":"{\"cmd\":\"cargo test\",\"workdir\":\"/repo/a\"}"}"#,
         )
         .expect("fixture payload");
-        assert_eq!(tool_call_workdir(&payload).as_deref(), Some("/repo/a"));
+        assert_eq!(first_workdir(&payload).as_deref(), Some("/repo/a"));
     }
 
     #[test]
@@ -306,7 +387,7 @@ mod tests {
             r#"{"type":"custom_tool_call","name":"exec","input":"const r = await tools.exec_command({cmd:\"npm test\",\"workdir\":\"/repo/b\",\"yield_time_ms\":30000});"}"#,
         )
         .expect("fixture payload");
-        assert_eq!(tool_call_workdir(&payload).as_deref(), Some("/repo/b"));
+        assert_eq!(first_workdir(&payload).as_deref(), Some("/repo/b"));
     }
 
     #[test]
@@ -318,16 +399,13 @@ mod tests {
             r#"{"type":"custom_tool_call","name":"exec","input":"const r = await tools.exec_command({cmd: 'npm test', workdir: '/foreign/repo'});"}"#,
         )
         .expect("fixture payload");
-        assert_eq!(
-            tool_call_workdir(&payload).as_deref(),
-            Some("/foreign/repo")
-        );
+        assert_eq!(first_workdir(&payload).as_deref(), Some("/foreign/repo"));
 
         let mixed: Value = serde_json::from_str(
             r#"{"type":"custom_tool_call","name":"exec","input":"tools.exec_command({'workdir': \"/foreign/other\"})"}"#,
         )
         .expect("fixture payload");
-        assert_eq!(tool_call_workdir(&mixed).as_deref(), Some("/foreign/other"));
+        assert_eq!(first_workdir(&mixed).as_deref(), Some("/foreign/other"));
     }
 
     /// A Windows workdir is `C:\repo\crate`. A capture that stops at the first
@@ -341,8 +419,26 @@ mod tests {
             "input": r#"tools.exec_command({cmd:"cargo test",workdir:"C:\Users\runner\fleet-bus"})"#,
         });
         assert_eq!(
-            tool_call_workdir(&payload).as_deref(),
+            first_workdir(&payload).as_deref(),
             Some(r"C:\Users\runner\fleet-bus")
+        );
+    }
+
+    /// One `input` can orchestrate several `exec_command` calls. Reading only
+    /// the first hides a later hop into another repository behind a
+    /// baseline-looking opener.
+    #[test]
+    fn every_workdir_in_an_orchestrated_tool_call_is_collected() {
+        let payload: Value = serde_json::json!({
+            "type": "custom_tool_call",
+            "name": "exec",
+            "input": "await tools.exec_command({cmd:\"ls\",workdir:\"/repo/vista\"});\n\
+                      await tools.exec_command({cmd:\"ls\",workdir:'/repo/fleet-bus'});",
+        });
+        assert_eq!(
+            tool_call_workdirs(&payload),
+            vec!["/repo/vista".to_string(), "/repo/fleet-bus".to_string()],
+            "a later hop must not hide behind the first call"
         );
     }
 
@@ -352,7 +448,7 @@ mod tests {
             r#"{"type":"custom_tool_call","name":"exec","input":"const r = await tools.exec_command({cmd:\"pwd\"});"}"#,
         )
         .expect("fixture payload");
-        assert_eq!(tool_call_workdir(&payload), None);
+        assert!(tool_call_workdirs(&payload).is_empty());
     }
 
     #[test]
@@ -368,7 +464,7 @@ mod tests {
         ]);
         let (scope, path) = effective_window_scope(&workdirs, None);
         assert_eq!(scope, WindowScope::Consistent);
-        assert_eq!(path.as_deref(), Some(repo.to_string_lossy().as_ref()));
+        assert_eq!(path.as_deref(), Some(canonical(&repo).as_str()));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -399,6 +495,7 @@ mod tests {
         let nested = parent.join("vendor/fleet-bus");
         std::fs::create_dir_all(parent.join(".git")).expect("parent git dir");
         std::fs::create_dir_all(nested.join(".git")).expect("nested git dir");
+        std::fs::create_dir_all(parent.join("crates/core")).expect("parent subdir");
         let baseline = parent.to_string_lossy().into_owned();
 
         assert!(!workdir_within_scope(
@@ -407,6 +504,10 @@ mod tests {
         ));
         assert!(workdir_within_scope(
             parent.join("crates/core").to_string_lossy().as_ref(),
+            &baseline
+        ));
+        assert!(distinct_repo_identity(
+            nested.to_string_lossy().as_ref(),
             &baseline
         ));
 
@@ -419,19 +520,115 @@ mod tests {
             WindowScope::Consistent,
             "the nested checkout is its own repo identity, not the parent's"
         );
-        assert_eq!(path.as_deref(), Some(nested.to_string_lossy().as_ref()));
+        assert_eq!(path.as_deref(), Some(canonical(&nested).as_str()));
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
-        // Parent subdir + nested checkout in one window: two real roots once
-        // the baseline no longer absorbs the nested one.
-        let (mixed, mixed_path) = effective_window_scope(
+    /// Two proven roots in one window are a conflict even when one of them is
+    /// the enclosing checkout: a resolved root never absorbs another resolved
+    /// root by lexical containment.
+    #[test]
+    fn parent_and_nested_checkout_together_are_a_conflict() {
+        let root = scratch("parent-plus-nested");
+        let parent = root.join("vista");
+        let nested = parent.join("vendor/fleet-bus");
+        std::fs::create_dir_all(parent.join(".git")).expect("parent git dir");
+        std::fs::create_dir_all(nested.join(".git")).expect("nested git dir");
+
+        // No baseline: both are ordinary evidence.
+        let (scope, path) = effective_window_scope(
             &explicit(&[
+                parent.to_string_lossy().as_ref(),
                 nested.to_string_lossy().as_ref(),
-                root.join("other").to_string_lossy().as_ref(),
             ]),
-            Some(&baseline),
+            None,
         );
-        assert_eq!(mixed, WindowScope::Unattributed);
-        assert_eq!(mixed_path, None);
+        assert_eq!(scope, WindowScope::Conflict, "two proven roots, one window");
+        assert_eq!(path, None);
+
+        // With the parent as the declared baseline, the window still ran in
+        // two checkouts and must not be re-scoped wholesale to either.
+        let (scoped, scoped_path) = effective_window_scope(
+            &explicit(&[
+                parent.to_string_lossy().as_ref(),
+                nested.to_string_lossy().as_ref(),
+            ]),
+            Some(parent.to_string_lossy().as_ref()),
+        );
+        assert_eq!(scoped, WindowScope::Conflict);
+        assert_eq!(scoped_path, None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An explicit baseline workdir is observed evidence, not noise: dropping
+    /// it before reduction let one foreign root re-scope the whole window,
+    /// including the turns that really did run in the baseline checkout.
+    #[test]
+    fn baseline_plus_foreign_checkout_is_a_conflict_not_a_rescope() {
+        let root = scratch("baseline-plus-foreign");
+        let vista = root.join("vista");
+        let fleet = root.join("fleet-bus");
+        std::fs::create_dir_all(vista.join(".git")).expect("vista git dir");
+        std::fs::create_dir_all(fleet.join(".git")).expect("fleet git dir");
+
+        let (scope, path) = effective_window_scope(
+            &explicit(&[
+                vista.to_string_lossy().as_ref(),
+                fleet.to_string_lossy().as_ref(),
+            ]),
+            Some(vista.to_string_lossy().as_ref()),
+        );
+        assert_eq!(scope, WindowScope::Conflict);
+        assert_eq!(path, None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A relative workdir belongs to the turn's cwd. Resolving it against the
+    /// process cwd would let whichever checkout `aicx` runs from adopt a
+    /// historical rollout's messages.
+    #[test]
+    fn relative_workdirs_resolve_against_the_baseline_not_the_process() {
+        let root = scratch("relative-workdir");
+        let repo = root.join("repo");
+        std::fs::create_dir_all(repo.join(".git")).expect("git dir");
+        std::fs::create_dir_all(repo.join("packages/api")).expect("pkg");
+        let baseline = repo.to_string_lossy().into_owned();
+
+        assert_eq!(
+            normalize_workdir("packages/api", Some(&baseline)),
+            WorkdirIdentity::Resolved(
+                std::fs::canonicalize(&repo).unwrap_or_else(|_| repo.clone())
+            )
+        );
+        // Without a baseline there is nothing to resolve against — never the
+        // process cwd.
+        assert_eq!(
+            normalize_workdir("packages/api", None),
+            WorkdirIdentity::Unresolved("packages/api".to_string())
+        );
+        let (scope, _) = effective_window_scope(&explicit(&["packages/api"]), Some(&baseline));
+        assert_eq!(scope, WindowScope::Baseline);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An ancestor's `.git` says nothing about a directory that is not there.
+    /// Treating `/repo/deleted-subdir` as `/repo` stamps positive scope on a
+    /// workdir the contract calls unattributable.
+    #[test]
+    fn missing_path_under_a_real_checkout_stays_unresolved() {
+        let root = scratch("missing-under-repo");
+        let repo = root.join("repo");
+        std::fs::create_dir_all(repo.join(".git")).expect("git dir");
+        let missing = repo.join("deleted-fleet");
+
+        assert_eq!(
+            normalize_workdir(missing.to_string_lossy().as_ref(), None),
+            WorkdirIdentity::Unresolved(missing.to_string_lossy().into_owned())
+        );
+        let (scope, path) =
+            effective_window_scope(&explicit(&[missing.to_string_lossy().as_ref()]), None);
+        assert_eq!(scope, WindowScope::Unattributed);
+        assert_eq!(path, None);
         let _ = std::fs::remove_dir_all(&root);
     }
 

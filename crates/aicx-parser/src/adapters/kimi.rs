@@ -773,6 +773,8 @@ impl<'a> Assembly<'a> {
                             end,
                         },
                         scope_status: crate::engine::ScopeStatus::from_evidence(None, None),
+                        // Only the Codex adapter observes explicit tool-call workdirs.
+                        scope_conflict: false,
                     })
                 })
                 .collect();

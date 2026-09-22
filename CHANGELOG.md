@@ -24,8 +24,18 @@ conversations, never served as operator intents. The match is exact
 (`subagent:guardian`), and provenance is resolved from the rollout header when
 the catalog column is cold, so no catalog rebuild is a prerequisite.
 
+Repository identity is canonical and existence-checked: a workdir that is not
+there resolves to nothing (an ancestor's `.git` says nothing about a directory
+that was deleted), a relative workdir is resolved against the turn's cwd rather
+than wherever `aicx` runs, and one checkout reached through a symlink or a
+`/var` vs `/private/var` spelling is one identity. A window that ran tools in
+both the baseline and another checkout is a conflict, not a wholesale re-scope
+to the foreign root, and every `workdir` in an orchestrated tool call is read,
+not just the first.
+
 `SIGNAL_FILTER_VERSION` is `signal-v5-scope-repo-identity`: one `aicx index`
-rebuild re-stamps chunk scope metadata.
+rebuild re-stamps chunk scope metadata. Frames re-scoped by explicit workdir
+evidence now carry the CANONICAL repo root as their cwd.
 
 #### Public API (source-breaking for struct-literal construction)
 
@@ -37,9 +47,17 @@ rebuild re-stamps chunk scope metadata.
 - `aicx_parser::engine::ScopeStatus` gains the `Unattributed` variant —
   exhaustive matches over it need a new arm. Older readers deserializing a
   model that contains it will reject the value.
-- `aicx_parser::engine` exports `WorkdirEvidence` and `workdir_within_scope`;
-  `effective_window_scope` now takes `&[WorkdirEvidence]` instead of
-  `&[String]`.
+- `aicx_parser::engine::Segment` gains `scope_conflict: bool` (serde default):
+  the explicit "two proven repository identities" fact, which downstream
+  filters read instead of inferring it from `ScopeStatus::MixedCandidate` —
+  that status is also how ordinary branch drift is recorded. Code that builds
+  `Segment` with a literal must add the field.
+- `aicx_parser::engine` exports `WorkdirEvidence`, `workdir_within_scope` and
+  `distinct_repo_identity`; `effective_window_scope` takes
+  `&[WorkdirEvidence]` instead of `&[String]`; `normalize_workdir` takes the
+  turn baseline (relative workdirs resolve against it, never against the
+  process cwd); `tool_call_workdir` is replaced by `tool_call_workdirs`,
+  which returns every workdir in the payload.
 - `aicx::sessions::SessionInfo` gains `session_kind: Option<String>`
   (serialize-only type; it stays part of the slim `loctree-consumer` read
   core). The slim profile reads legacy chunk artifacts only, so the

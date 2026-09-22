@@ -827,17 +827,13 @@ pub fn timeline_entries_from_model(model: &SessionModel) -> Vec<TimelineEntry> {
                 cwd: segment
                     .and_then(|segment| known_str(&segment.cwd))
                     .map(str::to_string),
-                // `scope_conflict` means one thing: the span's scope is
-                // proven divergent AND no cwd survived to attribute it. It is
-                // NOT the generic mixed status — a Claude segment records
+                // The explicit fact, carried by the model — never inferred
+                // from the generic mixed status. A Claude segment records
                 // `MixedCandidate` for an ordinary branch switch inside one
-                // unchanged checkout, and deriving the flag from that dropped
-                // every intent of a session that merely changed branch. Only
-                // explicit workdir conflicts clear their segment cwd.
-                scope_conflict: segment.is_some_and(|segment| {
-                    segment.scope_status == aicx_parser::engine::ScopeStatus::MixedCandidate
-                        && known_str(&segment.cwd).is_none()
-                }),
+                // unchanged checkout, and a Codex segment can be cwd-less for
+                // reasons that are not proven divergence; both used to be
+                // convicted here, dropping the whole session's intents.
+                scope_conflict: segment.is_some_and(|segment| segment.scope_conflict),
                 scope_unattributed: segment.is_some_and(|segment| {
                     segment.scope_status == aicx_parser::engine::ScopeStatus::Unattributed
                 }),

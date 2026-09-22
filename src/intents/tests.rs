@@ -163,6 +163,22 @@ fn nested_checkout_frames_do_not_inherit_the_parent_project() {
         vec!["vista root turn", "vista subdir turn"],
         "{kept:?}"
     );
+
+    // Bare-name filter: the nested checkout's own path still SPELLS `vista`,
+    // so the legacy path-segment fallback would re-admit exactly what repo
+    // identity just rejected.
+    let mut frames = vec![
+        frame(&parent, "vista root turn"),
+        frame(&nested, "vendored fleet-bus turn"),
+    ];
+    retain_frames_for_project(
+        &mut frames,
+        "/vista",
+        Some(parent.to_string_lossy().as_ref()),
+        false,
+    );
+    let kept: Vec<&str> = frames.iter().map(|frame| frame.message.as_str()).collect();
+    assert_eq!(kept, vec!["vista root turn"], "{kept:?}");
     let _ = fs::remove_dir_all(&root);
 }
 

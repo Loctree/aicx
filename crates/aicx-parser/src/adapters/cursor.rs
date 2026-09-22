@@ -546,6 +546,8 @@ impl Analysis {
                 ended_at: model.provenance.ended_at.clone(),
                 turn_range: TurnRange { start: 0, end },
                 scope_status: crate::engine::ScopeStatus::from_evidence(None, None),
+                // Only the Codex adapter observes explicit tool-call workdirs.
+                scope_conflict: false,
             }];
         }
         Ok(UnvalidatedParse::from_model(model))

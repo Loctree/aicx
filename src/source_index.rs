@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use aicx_parser::engine::scope_evidence::{
-    WindowScope, WorkdirEvidence, effective_window_scope, tool_call_workdir,
+    WindowScope, WorkdirEvidence, effective_window_scope, tool_call_workdirs,
 };
 
 use crate::catalog::CatalogEntry;
@@ -1106,15 +1106,28 @@ fn parse_catalog_source(
 ///
 /// Intent retrieval uses this path directly instead of reconstructing evidence
 /// from retired per-frame cards. The returned path is canonical and proven to
-/// live below one of the operator-approved source roots before any source open.
-pub(crate) fn read_catalog_signal_at(
+/// live under the operator allowlist.
+/// The requested frames PLUS the scope report of the whole session.
+///
+/// Scope is a property of the session, not of one role: the kind filter drops
+/// the opposite role, so a report computed after it can see at most half the
+/// evidence. A session whose assistant turns ran in a foreign checkout while
+/// its user turns carry the baseline would then look homogeneous to both
+/// passes — unreported as mixed, and cwd-less frames inheriting the catalog
+/// project on the strength of evidence that was filtered away.
+pub(crate) fn read_catalog_signal_with_scope_at(
     aicx_home: &Path,
     entry: &CatalogEntry,
     frame_kind: FrameKind,
-) -> Result<(PathBuf, Vec<TimelineEntry>)> {
+) -> Result<(
+    PathBuf,
+    Vec<TimelineEntry>,
+    crate::extraction::conversation::ScopeReport,
+)> {
     let (source_path, mut frames) = read_catalog_conversation_at(aicx_home, entry)?;
+    let scope = crate::extraction::conversation::scope_report_for_entries(&frames);
     frames.retain(|frame| frame_matches_kind(frame, frame_kind));
-    Ok((source_path, frames))
+    Ok((source_path, frames, scope))
 }
 
 /// Read one cataloged session as the clean user/assistant conversation used by
@@ -1243,7 +1256,7 @@ fn parse_large_codex_signal(
         };
         let payload_type = payload.get("type").and_then(serde_json::Value::as_str);
         if is_tool_call_payload_type(payload_type) {
-            if let Some(workdir) = tool_call_workdir(payload) {
+            for workdir in tool_call_workdirs(payload) {
                 let evidence = WorkdirEvidence::Explicit(workdir);
                 if !window_workdirs.contains(&evidence) {
                     window_workdirs.push(evidence);
@@ -1361,10 +1374,15 @@ fn truncated_record_is_tool_call(prefix: &str) -> bool {
     {
         return true;
     }
-    // A discriminator was readable and it was not a call: nothing was lost.
-    // None was readable at all: the record could have been anything, and a
-    // baseline the reader never verified is not a fact.
-    !prefix.contains(r#""type":"#) && !prefix.contains(r#""type": "#)
+    // Otherwise the question is whether the PAYLOAD discriminator was
+    // readable at all. Key order inside a record is not a contract: an
+    // envelope whose own `type` is visible can still be truncated before its
+    // payload type, hiding a tool call behind a megabyte of `arguments`.
+    // Seeing one discriminator (the envelope's) or none is not evidence that
+    // nothing was lost, so it fails closed.
+    let discriminators =
+        prefix.matches(r#""type":"#).count() + prefix.matches(r#""type": "#).count();
+    discriminators < 2
 }
 
 fn flush_scope_window(
@@ -2249,7 +2267,7 @@ mod tests {
         assert_eq!(frames[1].message, "Biore fleet task");
         assert_eq!(
             frames[1].cwd.as_deref(),
-            Some(fleet.to_string_lossy().as_ref()),
+            Some(canonical(&fleet).as_str()),
             "message before the first tool call shares the window scope"
         );
         assert!(!frames[1].scope_conflict);
@@ -2267,6 +2285,15 @@ mod tests {
     fn json_path(path: &Path) -> String {
         let quoted = serde_json::Value::String(path.display().to_string()).to_string();
         quoted[1..quoted.len() - 1].to_string()
+    }
+
+    /// Identities are canonical, so a scratch repo under a symlinked temp
+    /// dir compares equal to the scope this reader stamps.
+    fn canonical(path: &Path) -> String {
+        fs::canonicalize(path)
+            .unwrap_or_else(|_| path.to_path_buf())
+            .to_string_lossy()
+            .into_owned()
     }
 
     fn bounded_scope_root(label: &str) -> std::path::PathBuf {
@@ -2381,7 +2408,7 @@ mod tests {
         assert_eq!(frames[0].message, "biore fleet task");
         assert_eq!(
             frames[0].cwd.as_deref(),
-            Some(fleet.to_string_lossy().as_ref()),
+            Some(canonical(&fleet).as_str()),
             "an event_msg tool call re-scopes its window like a response_item one"
         );
 
@@ -2444,6 +2471,21 @@ mod tests {
             "an oversized tool RESULT carries no workdir and is not lost evidence"
         );
         assert_eq!(result_frames[0].cwd.as_deref(), Some("/sessions/vista"));
+
+        // A recognised envelope whose PAYLOAD discriminator sits after the
+        // oversized body: key order is not a contract, and seeing only the
+        // envelope's own `type` proves nothing about what was lost.
+        let late_discriminator = oversized_window(
+            "oversized-late-type",
+            format!(
+                r#"{{"timestamp":"2026-01-01T00:01:20Z","type":"response_item","payload":{{"arguments":"{filler}","type":"function_call"}}}}"#
+            ),
+        );
+        assert_eq!(late_discriminator.len(), 1, "{late_discriminator:?}");
+        assert!(
+            late_discriminator[0].scope_unattributed,
+            "an envelope truncated before its payload type must fail closed"
+        );
 
         // Pathological writer: nothing identifiable survives the cap. The
         // record could have been a tool call, so the window cannot claim the

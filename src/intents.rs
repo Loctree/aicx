@@ -566,9 +566,22 @@ fn collect_intent_files_from_index(
     }
 
     let mut source_errors = 0usize;
-    if !mixed_ids.is_empty()
-        && let Ok(entries) = crate::catalog::read_entries_at(aicx_home)
-    {
+    if !mixed_ids.is_empty() {
+        // Every flagged chunk has to end somewhere: re-sourced, deliberately
+        // excluded by the project filter, or counted as a hole. Anything
+        // else is a session that silently left the answer while
+        // `completeness` still called it complete.
+        let mut accounted: BTreeSet<(String, String)> = BTreeSet::new();
+        let entries = match crate::catalog::read_entries_at(aicx_home) {
+            Ok(entries) => entries,
+            Err(error) => {
+                crate::diagnostics::log_describe(&format!(
+                    "intents_index_catalog_unreadable flagged={} error={error:#}",
+                    mixed_ids.len()
+                ));
+                Vec::new()
+            }
+        };
         for entry in entries {
             if !mixed_ids.contains(&(entry.agent.clone(), entry.session_id.clone())) {
                 continue;
@@ -579,31 +592,44 @@ fn collect_intent_files_from_index(
             // without re-applying the caller's predicate a rehydrated session
             // could carry another repo's frames into this result.
             if !entry_matches_project(entry.project.as_deref(), project) {
+                // Deliberately out of this answer, not lost from it.
+                accounted.insert((entry.agent.clone(), entry.session_id.clone()));
                 continue;
             }
-            let (source_path, frames) = match crate::source_index::read_catalog_signal_at(
-                aicx_home, &entry, frame_kind,
-            ) {
-                Ok(result) => result,
-                Err(error) => {
-                    // A flagged chunk that cannot be re-sourced is a hole
-                    // in the answer, not an empty session: the census lane
-                    // reports the same failure, and `completeness` must
-                    // not claim a complete result over a lost source.
-                    source_errors += 1;
-                    crate::diagnostics::log_describe(&format!(
-                        "intents_index_resource_skip agent={} session_id={} path={} error={error:#}",
-                        entry.agent, entry.session_id, entry.source_path
-                    ));
-                    continue;
-                }
-            };
+            let (source_path, frames, scope) =
+                match crate::source_index::read_catalog_signal_with_scope_at(
+                    aicx_home, &entry, frame_kind,
+                ) {
+                    Ok(result) => result,
+                    Err(error) => {
+                        // A flagged chunk that cannot be re-sourced is a hole
+                        // in the answer, not an empty session: the census lane
+                        // reports the same failure, and `completeness` must
+                        // not claim a complete result over a lost source.
+                        source_errors += 1;
+                        crate::diagnostics::log_describe(&format!(
+                            "intents_index_resource_skip agent={} session_id={} path={} error={error:#}",
+                            entry.agent, entry.session_id, entry.source_path
+                        ));
+                        continue;
+                    }
+                };
+            accounted.insert((entry.agent.clone(), entry.session_id.clone()));
             let (file, scope) =
-                catalog_frames_to_intent_file(&entry, source_path, frames, cutoff, false);
+                catalog_frames_to_intent_file(&entry, source_path, frames, scope, cutoff, false);
             note_mixed_scope(mixed_scope, &entry.agent, &entry.session_id, &scope);
             if let Some(file) = file {
                 files.push(file);
             }
+        }
+        // Flagged in the index, absent from the catalog (or the catalog could
+        // not be read at all): the session is gone from this answer and the
+        // answer has to say so.
+        for (agent, session_id) in mixed_ids.iter().filter(|key| !accounted.contains(*key)) {
+            source_errors += 1;
+            crate::diagnostics::log_describe(&format!(
+                "intents_index_resource_unmatched agent={agent} session_id={session_id}"
+            ));
         }
     }
 
@@ -714,8 +740,10 @@ fn collect_intent_files(
         }
         let live_row = session_is_hot_live(live, hot);
 
-        let (source_path, frames) =
-            match crate::source_index::read_catalog_signal_at(aicx_home, &entry, frame_kind) {
+        let (source_path, frames, scope) =
+            match crate::source_index::read_catalog_signal_with_scope_at(
+                aicx_home, &entry, frame_kind,
+            ) {
                 Ok(result) => result,
                 Err(error) => {
                     source_errors += 1;
@@ -727,7 +755,7 @@ fn collect_intent_files(
                 }
             };
         let (file, scope) =
-            catalog_frames_to_intent_file(&entry, source_path, frames, cutoff, live_row);
+            catalog_frames_to_intent_file(&entry, source_path, frames, scope, cutoff, live_row);
         note_mixed_scope(mixed_scope, &entry.agent, &entry.session_id, &scope);
         let Some(file) = file else {
             continue;
@@ -765,13 +793,15 @@ fn catalog_frames_to_intent_file(
     entry: &crate::catalog::CatalogEntry,
     source_path: PathBuf,
     mut frames: Vec<TimelineEntry>,
+    // Scope of the WHOLE session, computed before the frame-kind filter: a
+    // per-role view can see at most half the evidence.
+    scope: crate::extraction::conversation::ScopeReport,
     cutoff: DateTime<Utc>,
     live_row: bool,
 ) -> (
     Option<StoredChunkFile>,
     crate::extraction::conversation::ScopeReport,
 ) {
-    let scope = crate::extraction::conversation::scope_report_for_entries(&frames);
     let no_file = |scope: crate::extraction::conversation::ScopeReport| (None, scope);
     // Guardian sessions are control-plane evidence and never enter the intent
     // stream, regardless of which lane called us. The frames are the
@@ -891,8 +921,10 @@ fn collect_live_unadmitted_files(
         if crate::sessions::is_guardian_session_kind(entry.session_kind.as_deref()) {
             continue;
         }
-        let (source_path, mut frames) =
-            match crate::source_index::read_catalog_signal_at(aicx_home, &entry, frame_kind) {
+        let (source_path, mut frames, scope) =
+            match crate::source_index::read_catalog_signal_with_scope_at(
+                aicx_home, &entry, frame_kind,
+            ) {
                 Ok(result) => result,
                 Err(error) => {
                     *source_errors += 1;
@@ -903,15 +935,14 @@ fn collect_live_unadmitted_files(
                     continue;
                 }
             };
-        // Scope is judged on the whole session, before the project filter
-        // narrows the frames to one bucket (W2-R1).
-        let scope = crate::extraction::conversation::scope_report_for_entries(&frames);
+        // `scope` is the WHOLE session's, taken before the frame-kind filter
+        // and before the project filter narrows the frames to one bucket.
         note_mixed_scope(mixed_scope, &entry.agent, &entry.session_id, &scope);
         retain_frames_for_project(
             &mut frames,
             &identity_project,
             entry.cwd.as_deref(),
-            scope.status == aicx_parser::engine::ScopeStatus::MixedCandidate,
+            scope.scope_mixed(),
         );
         if frames.is_empty() {
             continue;
@@ -992,10 +1023,22 @@ fn retain_frames_for_project(
                 // submodule lives lexically under the session checkout and is
                 // a different repository. Accepting containment by string
                 // shape is the cross-repo leak this filter exists to close.
-                let inside_session_checkout = session_root
-                    .is_some_and(|root| aicx_parser::engine::workdir_within_scope(cwd, root));
-                inside_session_checkout
-                    || crate::extraction::project_filter_matches_path(cwd, &filters)
+                if session_root
+                    .is_some_and(|root| aicx_parser::engine::workdir_within_scope(cwd, root))
+                {
+                    return true;
+                }
+                // Proven another checkout: stop here. The path-segment
+                // fallback below is a legacy heuristic over path spelling,
+                // and a nested checkout at `…/vista/vendor/fleet-bus` still
+                // spells `vista` — it would re-admit exactly what repo
+                // identity just rejected.
+                if session_root
+                    .is_some_and(|root| aicx_parser::engine::distinct_repo_identity(cwd, root))
+                {
+                    return false;
+                }
+                crate::extraction::project_filter_matches_path(cwd, &filters)
             }
             None => !session_mixed,
         }

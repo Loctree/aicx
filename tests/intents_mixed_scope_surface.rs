@@ -863,3 +863,97 @@ fn index_lane_re_source_reapplies_the_project_filter() {
     drop(_guard);
     let _ = fs::remove_dir_all(&root);
 }
+
+/// Scope is a property of the session, not of one role. The frame-kind filter
+/// runs before the frames reach the intent builder, so a report computed from
+/// them sees at most half the evidence: a session whose assistant turns ran in
+/// a foreign checkout while its user turns carry the baseline looked
+/// homogeneous to the user pass — unreported as mixed, and cwd-less frames
+/// inheriting the catalog project on evidence that had been filtered away.
+#[test]
+fn whole_session_scope_is_judged_before_the_frame_kind_filter() {
+    let root = unique_root("scopebeforekind");
+    let _guard = HomeGuard::set(&root);
+    let vista = make_repo(&root, "vista");
+    let fleet = make_repo(&root, "fleet-bus");
+    let other = make_repo(&root, "other-repo");
+    let mixed_sid = write_mixed_rollout(&root, &vista, &fleet, &other);
+
+    let aicx_home = root.join(".aicx");
+    aicx::catalog::rebuild(&aicx_home, &root).expect("rebuild catalog over fixture home");
+
+    // The USER pass alone: every fleet-scoped frame in this fixture is an
+    // assistant turn, so a scope report taken after the kind filter cannot
+    // see the foreign evidence at all.
+    let user_only = extract(&root, aicx::timeline::FrameKind::UserMsg);
+    assert!(
+        user_only
+            .mixed_scope
+            .iter()
+            .any(|session| session.agent == "codex" && session.session_id == mixed_sid),
+        "the user pass must still report the session's whole-session scope: {:?}",
+        user_only.mixed_scope
+    );
+
+    drop(_guard);
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// A chunk flagged in the index whose catalog row is gone cannot be
+/// re-sourced at all — the loop never reaches a read, so a per-read error
+/// counter never fires. The session still left the answer, and completeness
+/// has to say so.
+#[test]
+fn index_lane_counts_flagged_chunks_with_no_catalog_row() {
+    let root = unique_root("resourceunmatched");
+    let _guard = HomeGuard::set(&root);
+    let vista = make_repo(&root, "vista");
+    let fleet = make_repo(&root, "fleet-bus");
+    let other = make_repo(&root, "other-repo");
+    let mixed_sid = write_mixed_rollout(&root, &vista, &fleet, &other);
+    write_homogeneous_rollout(&root, &vista);
+
+    let aicx_home = root.join(".aicx");
+    aicx::catalog::rebuild(&aicx_home, &root).expect("rebuild catalog over fixture home");
+    aicx::source_index::build(&aicx_home, &[], false, true, false)
+        .expect("publish CURRENT index over fixture home");
+
+    // The catalog loses the flagged session entirely (rebuilt elsewhere,
+    // pruned, or written by another host).
+    let catalog = aicx::catalog::sessions_path_for(&aicx_home);
+    let body = fs::read_to_string(&catalog).expect("read catalog");
+    let kept: String = body
+        .lines()
+        .filter(|line| !line.contains(&mixed_sid))
+        .map(|line| format!("{line}\n"))
+        .collect();
+    fs::write(&catalog, kept).expect("write catalog");
+
+    let extraction = Aicx::with_aicx_home(&aicx_home)
+        .extract_intents(&IntentsConfig {
+            project: "vista".to_string(),
+            hours: 100_000,
+            strict: false,
+            min_confidence: None,
+            kind_filter: None,
+            frame_kind: Some(aicx::timeline::FrameKind::UserMsg),
+            live: false,
+        })
+        .expect("extract intents through the index lane");
+
+    assert_eq!(
+        extraction.stats.identity_source, "index-v1",
+        "test must exercise the index lane"
+    );
+    assert!(
+        extraction.stats.source_errors > 0,
+        "a flagged chunk with no catalog row is a hole in the answer, not a silent drop"
+    );
+    let completeness = extraction
+        .stats
+        .completeness(None, extraction.records.len());
+    assert!(!completeness.complete);
+
+    drop(_guard);
+    let _ = fs::remove_dir_all(&root);
+}
