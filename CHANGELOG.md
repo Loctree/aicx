@@ -47,7 +47,39 @@ bounded in bytes as well as records.
 
 `SIGNAL_FILTER_VERSION` is `signal-v5-scope-repo-identity`: one `aicx index`
 rebuild re-stamps chunk scope metadata. Frames re-scoped by explicit workdir
-evidence now carry the CANONICAL repo root as their cwd.
+evidence now carry the CANONICAL repo root as their cwd. Because that canonical
+spelling is what `.aicxignore` is compared against, checkout denials now match
+in every spelling both sides can produce: a rule written as `/var/...` still
+hides a frame stamped `/private/var/...`, and any checkout reached through a
+symlink stays hidden. The deny-list fingerprint is therefore `v2` and one
+rebuild re-filters content admitted under the narrower match.
+
+One question, one predicate. "Is this session's scope mixed?" is answered by
+`ScopeReport::scope_mixed()` everywhere — the single-history refusal, the
+mixed-workstream telemetry and the project filter — instead of the generic
+`ScopeStatus`, which reports an ordinary branch switch inside one checkout as
+mixed and stays silent when `.aicxignore` hid a whole scope. A scope hidden by
+the privacy filter is evidence of another checkout, so it blocks bucket
+inheritance for frames that carry no cwd of their own, even when nothing
+visible remains to compare it against.
+
+Identity is anchored where it is defined and never replaces evidence someone
+else reads. `.gitmodules` is resolved from the checkout ROOT, so a submodule
+declared by a repository is still recognised when the session stood in a
+subdirectory. A frame cwd that resolves to a real checkout here and cannot
+prove membership fails closed instead of falling through to the legacy
+path-spelling filter — which would re-admit `…/vista/vendor/fleet-bus` for
+`-p vista` precisely when the session's own baseline is historical. Cached
+extracts are no longer reused across a change of catalog cwd, since the scope
+verdicts they carry were computed against the previous one.
+
+Two adapter-level repairs in the same area: a Codex rollout with two
+consecutive `turn_context` records and no turn between them no longer produces
+an empty window whose range ends before it starts, which had made the whole
+rollout fail kernel validation; and an over-cap tool call in the full-parser
+lane now contributes the same "unreadable evidence" mark the bounded index
+reader already recorded, so its window fails closed instead of keeping the
+baseline cwd.
 
 #### Public API (source-breaking for struct-literal construction)
 
@@ -68,6 +100,9 @@ evidence now carry the CANONICAL repo root as their cwd.
   (distinct cwds removed by `.aicxignore` before the report was built) and the
   `scope_foreign_to(baseline)` method; `scope_mixed()` now counts hidden
   scopes. Code that builds `ScopeReport` with a literal must add the field.
+- `aicx_parser::engine::truncated_record_is_tool_call` is now public: both the
+  bounded index reader and the full parser decide "did an unreadable record
+  hide a workdir?" from this one implementation.
 - `aicx_parser::engine` exports `WorkdirEvidence`, `workdir_within_scope` and
   `distinct_repo_identity`; `effective_window_scope` takes
   `&[WorkdirEvidence]` instead of `&[String]`; `normalize_workdir` takes the

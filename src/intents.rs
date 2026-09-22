@@ -135,7 +135,10 @@ fn note_mixed_scope(
     session_id: &str,
     scope: &crate::extraction::conversation::ScopeReport,
 ) {
-    if scope.status != aicx_parser::engine::ScopeStatus::MixedCandidate {
+    // Same predicate the distiller's refusal and the project filter use. A
+    // branch switch inside one checkout is one scope, and a scope hidden by
+    // `.aicxignore` is still a scope.
+    if !scope.scope_mixed() {
         return;
     }
     if mixed_scope
@@ -1028,17 +1031,25 @@ fn retain_frames_for_project(
                 {
                     return true;
                 }
-                // Proven another checkout: stop here. The path-segment
-                // fallback below is a legacy heuristic over path spelling,
-                // and a nested checkout at `…/vista/vendor/fleet-bus` still
-                // spells `vista` — it would re-admit exactly what repo
-                // identity just rejected.
-                if session_root
-                    .is_some_and(|root| aicx_parser::engine::distinct_repo_identity(cwd, root))
-                {
-                    return false;
+                // The path-segment fallback below is a legacy heuristic over
+                // path SPELLING, and a nested checkout at
+                // `…/vista/vendor/fleet-bus` still spells `vista` — it
+                // re-admits exactly what repo identity just rejected. Reaching
+                // it is only honest when there was no identity to be had.
+                match aicx_parser::engine::normalize_workdir(cwd, session_root) {
+                    // Resolves to a real checkout here, and the membership test
+                    // above already measured it against the session root. A
+                    // failed proof is an answer, not a gap — including when the
+                    // session's own baseline is historical and no longer
+                    // resolves, which is precisely when spelling is least
+                    // trustworthy.
+                    aicx_parser::engine::WorkdirIdentity::Resolved(_) => false,
+                    // Nothing resolves on this host; spelling is the only
+                    // evidence the session left behind.
+                    aicx_parser::engine::WorkdirIdentity::Unresolved(_) => {
+                        crate::extraction::project_filter_matches_path(cwd, &filters)
+                    }
                 }
-                crate::extraction::project_filter_matches_path(cwd, &filters)
             }
             None => !session_mixed,
         }

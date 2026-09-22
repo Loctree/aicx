@@ -182,6 +182,78 @@ fn nested_checkout_frames_do_not_inherit_the_parent_project() {
     let _ = fs::remove_dir_all(&root);
 }
 
+/// The session's own baseline is historical and no longer exists on this
+/// machine, so no membership proof can succeed. A frame cwd that DOES resolve
+/// to a real checkout here must fail closed — dropping through to the
+/// path-spelling fallback re-admits a foreign repository merely because its
+/// path happens to contain the requested project name.
+#[cfg(feature = "app")]
+#[test]
+fn a_resolvable_frame_fails_closed_against_a_vanished_baseline() {
+    let root = std::env::temp_dir().join(format!(
+        "aicx-intents-vanished-baseline-{}-{}",
+        std::process::id(),
+        Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    ));
+    let _ = fs::remove_dir_all(&root);
+    // A real, resolvable checkout whose path spells the requested project.
+    let foreign = root.join("vista").join("vendor").join("fleet-bus");
+    fs::create_dir_all(foreign.join(".git")).expect("foreign git dir");
+
+    let frame = |cwd: &str, message: &str| crate::timeline::TimelineEntry {
+        timestamp: Utc::now(),
+        agent: "codex".to_string(),
+        session_id: "vanished-baseline".to_string(),
+        role: "user".to_string(),
+        message: message.to_string(),
+        frame_class: None,
+        lineage_origin: None,
+        frame_kind: Some(FrameKind::UserMsg),
+        branch: None,
+        cwd: Some(cwd.to_string()),
+        scope_conflict: false,
+        scope_unattributed: false,
+        session_kind: None,
+        timestamp_source: None,
+        source_path: None,
+        source_sha256: None,
+        source_line_span: None,
+    };
+
+    let mut frames = vec![frame(
+        foreign.to_string_lossy().as_ref(),
+        "foreign checkout turn",
+    )];
+    retain_frames_for_project(
+        &mut frames,
+        "/vista",
+        // The checkout this session was cataloged under is gone.
+        Some("/nonexistent-aicx-scope/vista"),
+        false,
+    );
+    let kept: Vec<&str> = frames.iter().map(|frame| frame.message.as_str()).collect();
+    assert!(
+        kept.is_empty(),
+        "a resolvable foreign checkout must not be re-admitted by path spelling: {kept:?}"
+    );
+
+    // An UNRESOLVABLE cwd is the one case with no identity to be had, so the
+    // legacy spelling fallback is still the only evidence available.
+    let mut frames = vec![frame(
+        "/nonexistent-aicx-scope/vista/crates/core",
+        "replayed turn",
+    )];
+    retain_frames_for_project(
+        &mut frames,
+        "/vista",
+        Some("/nonexistent-aicx-scope/vista"),
+        false,
+    );
+    assert_eq!(frames.len(), 1, "replayed sessions must still be servable");
+
+    let _ = fs::remove_dir_all(&root);
+}
+
 #[cfg(feature = "app")]
 #[test]
 fn mixed_session_filter_is_fail_closed_for_unproven_frames() {

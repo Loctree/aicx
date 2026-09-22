@@ -884,7 +884,12 @@ impl ScopeReport {
     /// workdir conflict or more than one observed cwd makes a session
     /// unservable as one bucket.
     pub fn scope_mixed(&self) -> bool {
-        self.conflicts > 0 || self.cwds.len() + self.hidden_scopes > 1
+        // A hidden scope is evidence of another checkout, not absence of it.
+        // `.aicxignore` can remove a session's ONLY cwd-bearing frames, and
+        // what remains then looks homogeneous while we positively know it is
+        // not — so one hidden scope is already mixed, with or without a second
+        // visible one.
+        self.conflicts > 0 || self.hidden_scopes > 0 || self.cwds.len() > 1
     }
 
     /// Does this session hold anything the cataloged checkout cannot claim?
@@ -956,7 +961,12 @@ pub fn refuse_mixed_workstream(
     report: &ScopeReport,
     distill_mixed: bool,
 ) -> Option<RefusalReason> {
-    if distill_mixed || report.status != ScopeStatus::MixedCandidate {
+    // The report's own scope predicate, not the generic status. `status` is
+    // `MixedCandidate` for an ordinary branch switch inside ONE unchanged
+    // checkout — refusing those is how homogeneous sessions lost their
+    // history — and it stays quiet when `.aicxignore` hid a whole scope,
+    // which is exactly when refusing is right.
+    if distill_mixed || !report.scope_mixed() {
         return None;
     }
     let mut consumed_by_kind = std::collections::BTreeMap::new();
@@ -1605,6 +1615,44 @@ mod harness_noise_tests {
         assert_eq!(unknown.status, ScopeStatus::Unknown);
     }
 
+    /// The refusal gate and the project filter must answer ONE question.
+    /// Gating on `ScopeStatus` convicted an ordinary branch switch inside a
+    /// single checkout, and acquitted a session whose only scope `.aicxignore`
+    /// had hidden — wrong in both directions at once.
+    #[test]
+    fn the_refusal_gate_follows_scope_not_branch_drift() {
+        let mut first = entry("user", "work on main", 1);
+        first.cwd = Some("/repos/vista".into());
+        first.branch = Some("main".into());
+        let mut second = entry("user", "work on the feature branch", 2);
+        second.cwd = Some("/repos/vista".into());
+        second.branch = Some("agent/feature".into());
+        let branch_drift = scope_report_for_entries(&[first, second]);
+
+        assert_eq!(
+            branch_drift.status,
+            ScopeStatus::MixedCandidate,
+            "the generic status still reports branch drift"
+        );
+        assert!(!branch_drift.scope_mixed(), "but it is one checkout");
+        assert!(
+            refuse_mixed_workstream(AgentKind::Claude, "s1", &branch_drift, false).is_none(),
+            "a branch switch inside one checkout must keep its history"
+        );
+
+        let mut hidden = scope_report_for_entries(&[entry("user", "no cwd evidence", 3)]);
+        hidden.hidden_scopes = 1;
+        assert_ne!(
+            hidden.status,
+            ScopeStatus::MixedCandidate,
+            "status cannot see what the privacy filter removed"
+        );
+        assert!(
+            refuse_mixed_workstream(AgentKind::Claude, "s1", &hidden, false).is_some(),
+            "a hidden scope must still refuse a single-history distill"
+        );
+    }
+
     #[test]
     fn scope_conflict_frames_make_the_span_a_mixed_candidate() {
         let mut conflicted = entry("user", "worked in two repos at once", 1);
@@ -1643,6 +1691,34 @@ mod harness_noise_tests {
             report.cwds,
             vec!["/repos/fleet-bus".to_string()],
             "the hidden repository is counted, never named"
+        );
+    }
+
+    /// Finding: `.aicxignore` removes the session's ONLY cwd-bearing frames.
+    /// What is left has no visible scope at all, so every count-based test
+    /// reads homogeneous — while we positively know a hidden checkout was
+    /// here. The cwd-less remainder must not inherit the catalog bucket.
+    #[test]
+    fn a_solely_hidden_scope_still_blocks_bucket_inheritance() {
+        let bare = entry("user", "no cwd evidence on this frame", 1);
+        let mut report = scope_report_for_entries(&[bare]);
+        assert!(
+            report.cwds.is_empty(),
+            "nothing visible survived the filter"
+        );
+        assert!(
+            !report.scope_mixed(),
+            "a single hidden scope is not 'more than one scope'"
+        );
+
+        report.hidden_scopes = 1;
+        assert!(
+            report.scope_foreign_to(Some("/repos/vista")),
+            "a hidden scope is evidence of another checkout, not absence of evidence"
+        );
+        assert!(
+            report.scope_foreign_to(None),
+            "and it holds with no cataloged baseline to compare against"
         );
     }
 

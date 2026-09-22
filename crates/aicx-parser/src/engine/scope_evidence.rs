@@ -172,6 +172,44 @@ fn resolve_candidate(path: &str, baseline: Option<&str>) -> Option<PathBuf> {
     base.is_absolute().then(|| base.join(candidate))
 }
 
+/// Does the readable head of an over-cap record look like a tool-call
+/// envelope? The record is truncated (never valid JSON), so this reads the
+/// visible prefix only: the envelope and payload discriminators are written
+/// before the oversized `arguments`/`input` body, so they survive the cap.
+pub fn truncated_record_is_tool_call(prefix: &str) -> bool {
+    // Key order inside a record is not a contract, so this scans the whole
+    // visible prefix rather than a fixed head: the discriminator can sit
+    // after a megabyte of `arguments`. Over-cap records are rare and their
+    // bytes are already in hand.
+    let has_type = |value: &str| {
+        prefix.contains(&format!(r#""type":"{value}""#))
+            || prefix.contains(&format!(r#""type": "{value}""#))
+    };
+    // `function_call_output` / `mcp_tool_call_end` are RESULTS, not calls:
+    // they carry no workdir, so an oversized one is not lost evidence. The
+    // trailing quote in the needle keeps them out.
+    if [
+        "function_call",
+        "custom_tool_call",
+        "tool_call",
+        "mcp_tool_call",
+    ]
+    .iter()
+    .any(|kind| has_type(kind))
+    {
+        return true;
+    }
+    // Otherwise the question is whether the PAYLOAD discriminator was
+    // readable at all. Key order inside a record is not a contract: an
+    // envelope whose own `type` is visible can still be truncated before its
+    // payload type, hiding a tool call behind a megabyte of `arguments`.
+    // Seeing one discriminator (the envelope's) or none is not evidence that
+    // nothing was lost, so it fails closed.
+    let discriminators =
+        prefix.matches(r#""type":"#).count() + prefix.matches(r#""type": "#).count();
+    discriminators < 2
+}
+
 /// Normalize one explicit workdir to its repo-level identity.
 ///
 /// Filesystem-only and bounded (ancestor walk to the first `.git`); no
@@ -320,10 +358,18 @@ fn declared_submodule(scope_root: &str, path: &str) -> bool {
     // be canonicalized (it does not exist), so canonicalizing only the root
     // would leave the two incomparable on any host where the scope path runs
     // through a symlink.
-    let root = Path::new(trim_path(scope_root));
+    let scope = Path::new(trim_path(scope_root));
+    // `.gitmodules` lives at the CHECKOUT root and spells its paths relative to
+    // it, while the scope root is only a working directory — frequently a
+    // subdirectory. Reading it where the session happened to stand would miss
+    // every declaration and silently absorb the submodule into its parent.
+    // `discover_git_root` walks ancestors without canonicalizing, so the root
+    // it returns stays comparable with the candidate.
+    let root = discover_git_root(scope).unwrap_or_else(|| scope.to_path_buf());
     let Ok(raw) = std::fs::read_to_string(root.join(".gitmodules")) else {
         return false;
     };
+    let root = root.as_path();
     let relative = match Path::new(trim_path(path)).strip_prefix(root) {
         Ok(relative) => relative.to_string_lossy().replace('\\', "/"),
         Err(_) => return false,
@@ -789,6 +835,42 @@ mod tests {
             scope,
             WindowScope::Unattributed,
             "a declared submodule keeps its identity once the tree is gone"
+        );
+        assert_eq!(path, None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The baseline is a working directory, not the checkout root. Reading
+    /// `.gitmodules` where the session happened to stand misses the
+    /// declaration entirely and absorbs the vanished submodule into its
+    /// parent — the exact leak the declaration exists to prevent.
+    #[test]
+    fn a_declared_submodule_is_found_from_a_subdirectory_baseline() {
+        let root = scratch("submodule-subdir-baseline");
+        let parent = root.join("vista");
+        std::fs::create_dir_all(parent.join(".git")).expect("parent git dir");
+        std::fs::create_dir_all(parent.join("packages").join("api")).expect("baseline dir");
+        std::fs::write(
+            parent.join(".gitmodules"),
+            "[submodule \"fleet-bus\"]\n\tpath = packages/api/vendor/fleet-bus\n\turl = https://example.invalid/fleet-bus.git\n",
+        )
+        .expect("write .gitmodules");
+
+        // The session stood in a subdirectory; the submodule tree is gone.
+        let base = parent.join("packages").join("api");
+        let base = base.to_string_lossy().into_owned();
+        let gone = parent
+            .join("packages")
+            .join("api")
+            .join("vendor")
+            .join("fleet-bus");
+        let gone = gone.to_string_lossy().into_owned();
+
+        let (scope, path) = effective_window_scope(&explicit(&[&gone]), Some(&base));
+        assert_eq!(
+            scope,
+            WindowScope::Unattributed,
+            "a declared submodule keeps its identity even when the baseline is a subdirectory"
         );
         assert_eq!(path, None);
         let _ = std::fs::remove_dir_all(&root);

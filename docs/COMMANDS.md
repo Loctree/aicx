@@ -129,6 +129,12 @@ session that wandered in for one turn still indexes its other project
 buckets. Re-run `aicx index` after editing the file (cached extracts are
 not reused while ignore rules are present).
 
+A rule is matched in every spelling both sides can produce. Scope resolution
+stamps frames with the canonical repo root, so a rule written the way you see
+the path (`/var/…`, or a checkout reached through a symlink) still hides the
+frame recorded as `/private/var/…`. Write the path you use; matching resolves
+the rest.
+
 ### Multi-machine / sync (operator truth)
 
 1. **Session JSONL sync** — catalog only discovers files under this host's agent
@@ -259,7 +265,14 @@ repositories that are already gone.
 
 A session whose frames are *consistently* re-scoped to one foreign checkout is
 internally homogeneous and still foreign: whole-session attribution applies
-only when the observed scope is also the cataloged one.
+only when the observed scope is also the cataloged one. A frame whose cwd resolves to a
+real checkout here and cannot prove membership is dropped rather than handed
+to the legacy path-name filter: a checkout at `…/vista/vendor/fleet-bus` spells
+`vista` without being it, and that fallback exists only for paths that resolve
+to nothing at all.
+
+A submodule is recognised from the checkout root's `.gitmodules`, whatever
+subdirectory the session ran in.
 
 **What this removes, and what it does not re-home.** Foreign frames are
 removed from the parent project's answer; they are *not* re-filed under the

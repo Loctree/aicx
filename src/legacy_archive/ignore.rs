@@ -162,6 +162,13 @@ where
 pub struct RepoPathIgnoreMatcher {
     user_home: PathBuf,
     prefixes: Vec<String>,
+    /// Canonical spelling of every prefix that resolves on this host.
+    ///
+    /// Scope normalization stamps frames with the CANONICAL repo root, so a
+    /// deny list written the way the operator types it (`/var/...`, or any
+    /// checkout reached through a symlink) would otherwise never match the
+    /// frame it is meant to hide.
+    canonical_prefixes: Vec<String>,
 }
 
 impl RepoPathIgnoreMatcher {
@@ -176,7 +183,7 @@ impl RepoPathIgnoreMatcher {
     #[cfg(any(feature = "app", test))]
     pub(crate) fn fingerprint(&self) -> String {
         let mut hasher = Sha256::new();
-        hasher.update(b"aicx.repo_path_ignore.v1\0");
+        hasher.update(b"aicx.repo_path_ignore.v2\0");
         for prefix in &self.prefixes {
             hasher.update(prefix.as_bytes());
             hasher.update([0]);
@@ -185,6 +192,11 @@ impl RepoPathIgnoreMatcher {
     }
 
     /// True when `cwd` is the listed path or lives under it.
+    ///
+    /// Compared in every spelling both sides can produce. Privacy is the one
+    /// place that must fail CLOSED: an incoming cwd already rewritten to its
+    /// canonical repo root still has to hit a prefix the operator wrote in the
+    /// pre-symlink spelling, so a miss in one form is not an answer.
     pub fn ignores_cwd(&self, cwd: Option<&str>) -> bool {
         let Some(cwd) = cwd.map(str::trim).filter(|value| !value.is_empty()) else {
             return false;
@@ -192,10 +204,19 @@ impl RepoPathIgnoreMatcher {
         if self.prefixes.is_empty() {
             return false;
         }
-        let normalized = normalize_cwd_display(&expand_tilde(cwd, &self.user_home));
+        let expanded = expand_tilde(cwd, &self.user_home);
+        let literal = normalize_cwd_display(&expanded);
+        let canonical = canonical_cwd_display(&expanded).filter(|form| *form != literal);
+        std::iter::once(&literal)
+            .chain(canonical.iter())
+            .any(|form| self.matches_any_prefix(form))
+    }
+
+    fn matches_any_prefix(&self, value: &str) -> bool {
         self.prefixes
             .iter()
-            .any(|prefix| normalized == *prefix || normalized.starts_with(&format!("{prefix}/")))
+            .chain(self.canonical_prefixes.iter())
+            .any(|prefix| value == prefix || value.starts_with(&format!("{prefix}/")))
     }
 }
 
@@ -207,6 +228,7 @@ pub fn load_repo_path_ignore(aicx_home: &Path, user_home: &Path) -> Result<RepoP
         return Ok(RepoPathIgnoreMatcher {
             user_home: user_home.to_path_buf(),
             prefixes: Vec::new(),
+            canonical_prefixes: Vec::new(),
         });
     }
 
@@ -236,11 +258,30 @@ pub fn load_repo_path_ignore(aicx_home: &Path, user_home: &Path) -> Result<RepoP
     }
     prefixes.sort();
     prefixes.dedup();
+    // Resolved once at load time: the deny list is small and this keeps the
+    // per-frame check free of filesystem work.
+    let mut canonical_prefixes: Vec<String> = prefixes
+        .iter()
+        .filter_map(|prefix| canonical_cwd_display(prefix))
+        .filter(|canonical| !prefixes.contains(canonical))
+        .collect();
+    canonical_prefixes.sort();
+    canonical_prefixes.dedup();
 
     Ok(RepoPathIgnoreMatcher {
         user_home: user_home.to_path_buf(),
         prefixes,
+        canonical_prefixes,
     })
+}
+
+/// Canonical spelling of an existing path, in the same display normalization
+/// the prefixes use. `None` when the path is gone from this host, which is not
+/// an error: the literal comparison still stands on its own.
+fn canonical_cwd_display(path: &str) -> Option<String> {
+    std::fs::canonicalize(path.trim())
+        .ok()
+        .map(|resolved| normalize_cwd_display(&resolved.to_string_lossy()))
 }
 
 fn is_repo_path_pattern(pattern: &str) -> bool {
@@ -284,6 +325,57 @@ mod tests {
     fn write_ignore(home: &Path, body: &str) {
         fs::create_dir_all(home).unwrap();
         fs::write(home.join(AICX_IGNORE_FILENAME), body).unwrap();
+    }
+
+    /// Scope normalization stamps frames with the CANONICAL repo root. A deny
+    /// list naming the same checkout through a symlink must still hide it —
+    /// otherwise the private repository reaches extracts, index and intents.
+    #[cfg(unix)]
+    #[test]
+    fn a_denied_checkout_stays_denied_under_its_canonical_spelling() {
+        let root = std::env::temp_dir().join(format!(
+            "aicx-ignore-symlink-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let aicx_home = root.join(".aicx");
+        let user_home = root.join("user");
+        let real_checkout = root.join("real").join("prywatne");
+        fs::create_dir_all(&real_checkout).unwrap();
+        std::os::unix::fs::symlink(root.join("real"), root.join("link")).unwrap();
+
+        // The operator writes the path they see; the frame carries the path
+        // the repo-identity pass resolved it to.
+        write_ignore(
+            &aicx_home,
+            &format!("{}\n", root.join("link").join("prywatne").display()),
+        );
+        let ignore = load_repo_path_ignore(&aicx_home, &user_home).unwrap();
+        let stamped = fs::canonicalize(&real_checkout).unwrap();
+
+        assert!(
+            ignore.ignores_cwd(Some(&stamped.to_string_lossy())),
+            "canonical spelling of a denied checkout must still be denied"
+        );
+        assert!(
+            ignore.ignores_cwd(Some(&stamped.join("src").to_string_lossy())),
+            "and so must everything under it"
+        );
+        assert!(
+            !ignore.ignores_cwd(Some(
+                &fs::canonicalize(&root)
+                    .unwrap()
+                    .join("real")
+                    .to_string_lossy()
+            )),
+            "resolving spellings must not widen the rule to the parent"
+        );
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

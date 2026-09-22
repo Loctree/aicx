@@ -1247,7 +1247,7 @@ fn parse_large_codex_signal(
             // moved repos and this reader will never know: record unreadable
             // evidence so the window fails closed to unattributed instead of
             // silently keeping the baseline project.
-            if truncated_record_is_tool_call(&record.line)
+            if aicx_parser::engine::truncated_record_is_tool_call(&record.line)
                 && !window_workdirs.contains(&WorkdirEvidence::Opaque)
             {
                 window_workdirs.push(WorkdirEvidence::Opaque);
@@ -1381,44 +1381,6 @@ fn is_tool_call_payload_type(payload_type: Option<&str>) -> bool {
             | Some("tool_call")
             | Some("mcp_tool_call")
     )
-}
-
-/// Does the readable head of an over-cap record look like a tool-call
-/// envelope? The record is truncated (never valid JSON), so this reads the
-/// visible prefix only: the envelope and payload discriminators are written
-/// before the oversized `arguments`/`input` body, so they survive the cap.
-fn truncated_record_is_tool_call(prefix: &str) -> bool {
-    // Key order inside a record is not a contract, so this scans the whole
-    // visible prefix rather than a fixed head: the discriminator can sit
-    // after a megabyte of `arguments`. Over-cap records are rare and their
-    // bytes are already in hand.
-    let has_type = |value: &str| {
-        prefix.contains(&format!(r#""type":"{value}""#))
-            || prefix.contains(&format!(r#""type": "{value}""#))
-    };
-    // `function_call_output` / `mcp_tool_call_end` are RESULTS, not calls:
-    // they carry no workdir, so an oversized one is not lost evidence. The
-    // trailing quote in the needle keeps them out.
-    if [
-        "function_call",
-        "custom_tool_call",
-        "tool_call",
-        "mcp_tool_call",
-    ]
-    .iter()
-    .any(|kind| has_type(kind))
-    {
-        return true;
-    }
-    // Otherwise the question is whether the PAYLOAD discriminator was
-    // readable at all. Key order inside a record is not a contract: an
-    // envelope whose own `type` is visible can still be truncated before its
-    // payload type, hiding a tool call behind a megabyte of `arguments`.
-    // Seeing one discriminator (the envelope's) or none is not evidence that
-    // nothing was lost, so it fails closed.
-    let discriminators =
-        prefix.matches(r#""type":"#).count() + prefix.matches(r#""type": "#).count();
-    discriminators < 2
 }
 
 fn flush_scope_window(
@@ -1701,6 +1663,14 @@ fn try_reuse_cached_extract(
     }
     let record = prior.sessions.get(session_key)?;
     if record.source_path != entry.source_path {
+        return None;
+    }
+    // The stored scope verdicts were computed against the catalog cwd of the
+    // parse that produced them, and this path re-stamps them verbatim. An
+    // unchanged source under a MOVED catalog cwd is a different scope
+    // question, so reusing those flags would serve a now-foreign session
+    // unflagged and bypass per-frame filtering entirely.
+    if record.cwd != entry.cwd {
         return None;
     }
     // Zeroed legacy records (pre-fingerprint schema) never reuse.
@@ -2169,6 +2139,18 @@ mod tests {
                 .expect("matching source fingerprint+hash must reuse");
         assert!(reused.text.contains("arrows vc-frame"));
         assert_eq!(reused.id, "claude:session");
+
+        // The cached record carries scope verdicts computed against the
+        // catalog cwd of its parse. A row whose cwd MOVED is a different
+        // scope question: re-stamping the old flags would serve a now-foreign
+        // session unflagged, straight past per-frame filtering.
+        let mut rescoped = entry.clone();
+        rescoped.cwd = Some("/repos/fleet-bus".to_string());
+        assert!(
+            try_reuse_cached_extract(&root, &rescoped, &prior, &key, &allow, "ignore-fingerprint")
+                .is_none(),
+            "a moved catalog cwd must force a reparse, not reuse stale scope flags"
+        );
 
         // Source path drift invalidates reuse.
         let mut drifted = entry.clone();

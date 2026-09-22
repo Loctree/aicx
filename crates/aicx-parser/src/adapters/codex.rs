@@ -391,6 +391,16 @@ fn assemble_codex(
                 state.consume(&value, classified.evidence.clone())?;
             }
             ClassifiedDisposition::Skipped { reason, visible } => {
+                // An over-cap unit is drained, never parsed, so `push_tool_turn`
+                // never sees its workdir. If the visible head says tool call,
+                // this window MIGHT have moved repos and this lane will never
+                // know — record that ignorance so the window fails closed,
+                // exactly as the bounded index reader already does. Without it
+                // the surrounding messages keep the baseline cwd and a foreign
+                // workdir leaks into the parent project.
+                if *reason == SkippedReason::Oversized {
+                    state.note_opaque_window(&raw.bytes);
+                }
                 state.observe_skip(classified, *reason, *visible, raw.boundary);
             }
         }
@@ -617,7 +627,7 @@ impl<'a> Assembly<'a> {
         self.current_branch = branch;
         self.segment_started_at = timestamp;
         if !self.turns.is_empty() {
-            self.segments.push(SegmentDraft {
+            let draft = SegmentDraft {
                 cwd: self.current_cwd.clone(),
                 branch: self.current_branch.clone(),
                 started_at: self.segment_started_at.clone(),
@@ -625,7 +635,17 @@ impl<'a> Assembly<'a> {
                 start_turn: self.turns.len() as u64,
                 scope_conflict: false,
                 scope_unattributed: false,
-            });
+            };
+            // A draft that never received a turn is not a segment — this
+            // `turn_context` supersedes it. Keeping both would emit two
+            // windows with the same `start_turn`, and `finish` derives each
+            // window's end from the NEXT window's start: the first would end
+            // one turn before it began and validation would reject the whole
+            // rollout over an empty window nobody can observe.
+            match self.segments.last_mut() {
+                Some(last) if last.start_turn == draft.start_turn => *last = draft,
+                _ => self.segments.push(draft),
+            }
         }
         Ok(())
     }
@@ -1090,6 +1110,16 @@ impl<'a> Assembly<'a> {
         }
         self.context_epochs.push((epoch, evidence.physical_ordinal));
         Ok(())
+    }
+
+    /// Record that this window contains evidence we could not read.
+    fn note_opaque_window(&mut self, bytes: &[u8]) {
+        let prefix = String::from_utf8_lossy(bytes);
+        if crate::engine::truncated_record_is_tool_call(&prefix)
+            && !self.window_workdirs.contains(&WorkdirEvidence::Opaque)
+        {
+            self.window_workdirs.push(WorkdirEvidence::Opaque);
+        }
     }
 
     fn push_tool_turn(
@@ -1950,6 +1980,76 @@ mod tests {
         parsed.into_model()
     }
 
+    fn parse_with_unit_cap(bytes: &[u8], id: &str, max_unit_bytes: usize) -> SessionModel {
+        let source = SourceHandle::new(
+            AgentKind::Codex,
+            id,
+            Some(id.to_owned()),
+            vec![
+                SourceArtifact::memory("rollout.jsonl", bytes.to_vec(), SourceFraming::JsonLines)
+                    .unwrap(),
+            ],
+        )
+        .unwrap();
+        let policy = ReaderPolicy {
+            max_unit_bytes,
+            ..ReaderPolicy::default()
+        };
+        let read = RawUnitReader::new(policy).read(&source).unwrap();
+        let adapter = CodexAdapter;
+        let classified = adapter.classify(&source, &read).unwrap();
+        let ValidatedParse::Session(parsed) = validate_parse(
+            adapter
+                .assemble(&source, &read, classified)
+                .expect("Codex assembly"),
+        )
+        .expect("Codex kernel validation") else {
+            panic!("session")
+        };
+        parsed.into_model()
+    }
+
+    /// An over-cap tool call is drained, never parsed, so its workdir never
+    /// reaches the window. Leaving the window looking clean kept the baseline
+    /// cwd on the surrounding messages — a foreign workdir leaking into the
+    /// parent project. The bounded index reader already fails closed here;
+    /// the full-parser lane must not disagree with it.
+    #[test]
+    fn an_oversized_tool_call_makes_its_window_unattributed() {
+        let oversized = format!(
+            r#"{{"timestamp":"2026-07-13T00:00:03Z","type":"response_item","payload":{{"type":"function_call","name":"shell","arguments":"{}"}}}}"#,
+            "x".repeat(2048)
+        );
+        let bytes = [
+            r#"{"timestamp":"2026-07-13T00:00:00Z","type":"session_meta","payload":{"id":"33333333-3333-4333-8333-333333333333","timestamp":"2026-07-13T00:00:00Z","cwd":"/repo/alpha","model":"gpt-test"}}"#,
+            r#"{"timestamp":"2026-07-13T00:00:01Z","type":"turn_context","payload":{"turn_id":"t1","cwd":"/repo/alpha","model":"gpt-test"}}"#,
+            r#"{"timestamp":"2026-07-13T00:00:02Z","type":"event_msg","payload":{"type":"user_message","message":"Run something big."}}"#,
+            &oversized,
+            r#"{"timestamp":"2026-07-13T00:00:04Z","type":"event_msg","payload":{"type":"agent_message","message":"Done."}}"#,
+        ]
+        .join("\n")
+            + "\n";
+
+        let model = parse_with_unit_cap(
+            bytes.as_bytes(),
+            "33333333-3333-4333-8333-333333333333",
+            512,
+        );
+
+        assert!(
+            model
+                .segments
+                .iter()
+                .any(|segment| segment.scope_status == ScopeStatus::Unattributed),
+            "an unreadable tool call must leave its window unattributed, got {:?}",
+            model
+                .segments
+                .iter()
+                .map(|segment| segment.scope_status)
+                .collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn minimal_oracle_and_explicit_source() {
         let bytes = include_bytes!("../../../../tests/fixtures/parser_engine/codex/minimal.jsonl");
@@ -1958,6 +2058,55 @@ mod tests {
         assert_eq!(model.turns[0].role, TurnRole::User);
         assert_eq!(model.coverage.raw_line_count, 4);
         assert_eq!(model.coverage.skipped_count, 0);
+    }
+
+    /// Two `turn_context` records with no turn between them used to leave a
+    /// zero-turn window. `finish` derives each window's end from the NEXT
+    /// window's start, so that window ended one turn before it began and
+    /// kernel validation rejected an otherwise parseable rollout outright.
+    #[test]
+    fn consecutive_turn_contexts_do_not_break_an_otherwise_parseable_rollout() {
+        let bytes = concat!(
+            r#"{"timestamp":"2026-07-13T00:00:00Z","type":"session_meta","payload":{"id":"22222222-2222-4222-8222-222222222222","timestamp":"2026-07-13T00:00:00Z","cwd":"/repo/alpha","model":"gpt-test"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-07-13T00:00:01Z","type":"turn_context","payload":{"turn_id":"t1","cwd":"/repo/alpha","model":"gpt-test"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-07-13T00:00:02Z","type":"event_msg","payload":{"type":"user_message","message":"Work in alpha."}}"#,
+            "\n",
+            r#"{"timestamp":"2026-07-13T00:00:03Z","type":"turn_context","payload":{"turn_id":"t2","cwd":"/repo/beta","model":"gpt-test"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-07-13T00:00:04Z","type":"turn_context","payload":{"turn_id":"t3","cwd":"/repo/gamma","model":"gpt-test"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-07-13T00:00:05Z","type":"event_msg","payload":{"type":"user_message","message":"Now work in gamma."}}"#,
+            "\n",
+        )
+        .as_bytes();
+
+        // `parse` panics on kernel validation failure — surviving it IS the
+        // assertion this finding is about.
+        let model = parse(bytes, "22222222-2222-4222-8222-222222222222");
+        assert_eq!(model.turns.len(), 2);
+        for segment in &model.segments {
+            assert!(
+                segment.turn_range.end >= segment.turn_range.start,
+                "a window must not end before it starts: {:?}",
+                segment.turn_range
+            );
+        }
+        // The superseded `beta` context never held a turn; the last context
+        // before the turn is the one that scopes it.
+        let scopes: Vec<Option<&str>> = model
+            .segments
+            .iter()
+            .map(|segment| match &segment.cwd {
+                Known::Value(cwd) => Some(cwd.as_str()),
+                Known::Unknown(_) => None,
+            })
+            .collect();
+        assert!(
+            !scopes.contains(&Some("/repo/beta")),
+            "a context with no turn must not become a segment: {scopes:?}"
+        );
     }
 
     #[test]
