@@ -327,17 +327,16 @@ fn the_contract_document_declares_every_emitted_scope_status() {
     // A retired value may be NAMED in the history note; it may not still be
     // DECLARED, which is any line that both describes `scope_status` and
     // spells the old value.
-    for retired in ["homogeneous"] {
-        let stale: Vec<&str> = doc
-            .lines()
-            .filter(|line| line.contains("scope_status") && line.contains(retired))
-            .collect();
-        assert!(
-            stale.is_empty(),
-            "docs/OUTPUT_PROJECTION_CONTRACT.md still declares retired `{retired}`:\n{}",
-            stale.join("\n")
-        );
-    }
+    let retired = "homogeneous";
+    let stale: Vec<&str> = doc
+        .lines()
+        .filter(|line| line.contains("scope_status") && line.contains(retired))
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "docs/OUTPUT_PROJECTION_CONTRACT.md still declares retired `{retired}`:\n{}",
+        stale.join("\n")
+    );
     assert!(
         doc.contains(SESSION_MODEL_SCHEMA),
         "the contract document must name the model contract version it describes"
