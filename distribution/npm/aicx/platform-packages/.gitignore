@@ -1,0 +1,4 @@
+# Staged native binaries (stage-platform-package.mjs output). Generated from
+# a verified release archive per host — never committed; CI packs them into
+# attested tgz artifacts instead.
+*/bin/

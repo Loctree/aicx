@@ -33,6 +33,7 @@ fn mutation_matrix_closes_every_adapter_boundary() {
                 ReaderPolicy {
                     max_source_bytes: 1024 * 1024,
                     max_unit_bytes: 32,
+                    max_document_bytes: 32,
                 },
             ),
         ];
@@ -226,7 +227,7 @@ fn three_thousand_unrelated_files_do_not_expand_selected_source_bytes() {
         assert_eq!(opened_source_bytes, case.base.len() as u64);
     }
     assert_eq!(
-        checked, 5,
+        checked, 6,
         "all production adapters must prove selected-source isolation"
     );
 

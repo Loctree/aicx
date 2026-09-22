@@ -16,7 +16,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -25,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use crate::legacy_archive::{self};
 use crate::session_catalog::{
     self, AgentKind, CatalogError, CatalogIoStats, CatalogSource, ScopedChildIdentity,
-    SessionCatalog, SourceFingerprint,
+    SessionCatalog, SourceFingerprint, is_uuid,
 };
 
 pub const CATALOG_DIRNAME: &str = "catalog";
@@ -204,7 +203,7 @@ impl RebuildProgress {
             stage: RebuildStage::Preparing,
             agent: None,
             agent_index: 0,
-            agent_total: 5,
+            agent_total: 7,
             io: CatalogIoStats::default(),
             sessions: 0,
             elapsed_ms: 0,
@@ -624,9 +623,11 @@ fn live_delta_uncached(home: &Path, user_home: &Path, cutoff_unix_ns: u128) -> R
     let agents = [
         AgentKind::Claude,
         AgentKind::Codex,
+        AgentKind::Cursor,
         AgentKind::Gemini,
         AgentKind::Grok,
         AgentKind::Junie,
+        AgentKind::Kimi,
     ];
     for agent in agents {
         let root = agent_source_root(agent, user_home);
@@ -807,9 +808,11 @@ fn scan_live_entries_with_progress(
     let agents = [
         AgentKind::Claude,
         AgentKind::Codex,
+        AgentKind::Cursor,
         AgentKind::Gemini,
         AgentKind::Grok,
         AgentKind::Junie,
+        AgentKind::Kimi,
     ];
     for (agent_offset, agent) in agents.into_iter().enumerate() {
         progress.stage = RebuildStage::ScanningSources;
@@ -991,7 +994,7 @@ fn recommendations_for(readiness: CatalogReadiness, counts: &StalenessCounts) ->
 fn multi_host_notes(by_machine: &BTreeMap<String, usize>, counts: &StalenessCounts) -> Vec<String> {
     let mut notes = vec![
         "Catalog discovers only local agent source roots on the host running rebuild/status.".into(),
-        "Alternative store drop dirs are not scanned; put JSONL under ~/.claude/projects, ~/.codex/sessions, ~/.gemini/tmp, ~/.grok/sessions, ~/.junie/sessions, or ~/.vibecrafted/control_plane/runtime_runs.".into(),
+        "Alternative store drop dirs are not scanned; put JSONL under ~/.claude/projects, ~/.codex/sessions, ~/.cursor/projects, ~/.gemini/tmp, ~/.grok/sessions, ~/.junie/sessions, ~/.kimi-code/sessions, or ~/.vibecrafted/control_plane/runtime_runs.".into(),
         "AICX_HOME / [storage].home relocates the whole home (catalog+index+extracts), not a second session intake path.".into(),
         "Dense indexes are model+dimension locked. Laptop 0.6b vectors must not merge into the owner's 8b CURRENT — lexical Tantivy can be rebuilt on the owner host from shared sources.".into(),
         "Remote agents: `aicx serve --transport http` with Bearer token (not OAuth). Prefer one index owner and point remotes at its streamable HTTP + embedder URL.".into(),
@@ -1085,17 +1088,42 @@ fn agent_source_root(agent: AgentKind, user_home: &Path) -> PathBuf {
     match agent {
         AgentKind::Claude => user_home.join(".claude").join("projects"),
         AgentKind::Codex => user_home.join(".codex").join("sessions"),
+        // Cursor transcripts live under `~/.cursor/projects/<slug>/agent-transcripts/<uuid>/`
+        // (the projects tree also holds non-transcript dirs).
+        AgentKind::Cursor => user_home.join(".cursor").join("projects"),
         AgentKind::Gemini => user_home.join(".gemini").join("tmp"),
         // Grok sessions live under `~/.grok/sessions/<cwd-encoded>/…`
         // (not the bare `~/.grok` tree, which also holds config noise).
         AgentKind::Grok => user_home.join(".grok").join("sessions"),
         AgentKind::Junie => user_home.join(".junie").join("sessions"),
+        AgentKind::Kimi => user_home.join(".kimi-code").join("sessions"),
     }
 }
 
 fn is_primary_catalog_source(agent: AgentKind, path: &Path) -> bool {
-    agent != AgentKind::Grok
-        || path.file_name().and_then(|name| name.to_str()) == Some("chat_history.jsonl")
+    match agent {
+        AgentKind::Grok => {
+            path.file_name().and_then(|name| name.to_str()) == Some("chat_history.jsonl")
+        }
+        AgentKind::Cursor => {
+            let has_transcripts_component = path
+                .components()
+                .any(|component| component.as_os_str() == "agent-transcripts");
+            let stem = path.file_stem().and_then(|name| name.to_str());
+            let parent = path
+                .parent()
+                .and_then(|dir| dir.file_name())
+                .and_then(|name| name.to_str());
+            // The layout contract is `<uuid>/<same uuid>.jsonl` — without the
+            // UUID shape check a state file like `metadata/metadata.jsonl`
+            // would acquire session identity and get indexed/extracted.
+            has_transcripts_component
+                && stem.is_some()
+                && stem == parent
+                && stem.is_some_and(is_uuid)
+        }
+        _ => true,
+    }
 }
 
 fn entry_from_source(agent: AgentKind, source: &CatalogSource) -> CatalogEntry {
@@ -1163,6 +1191,12 @@ fn enrich_from_sessions_discovery(
     let junie_root = user_home.join(".junie").join("sessions");
     if junie_root.is_dir() {
         for info in crate::sessions::discover_junie_sessions(&junie_root, None) {
+            merge_session_info(by_id, &info);
+        }
+    }
+    let cursor_root = user_home.join(".cursor").join("projects");
+    if cursor_root.is_dir() {
+        for info in crate::sessions::discover_cursor_sessions(&cursor_root, None, None) {
             merge_session_info(by_id, &info);
         }
     }
@@ -1294,6 +1328,25 @@ fn infer_cwd_from_path(agent: AgentKind, path: &Path) -> Option<String> {
                     .and_then(|n| n.to_str())
                     .map(|encoded| encoded.replace('-', "/"))
             })
+        }
+        AgentKind::Cursor => {
+            // ~/.cursor/projects/<slug>/agent-transcripts/<uuid>/<uuid>.jsonl —
+            // the slug is the only cwd evidence on disk (rows carry none).
+            // Same lossy idiom as the Claude fallback: every `-` inside a real
+            // path component decodes into a bogus `/`.
+            let slug = path
+                .ancestors()
+                .find(|ancestor| {
+                    ancestor
+                        .parent()
+                        .and_then(Path::file_name)
+                        .and_then(|name| name.to_str())
+                        == Some("projects")
+                })
+                .and_then(|ancestor| ancestor.file_name().map(|name| name.to_owned()))?
+                .into_string()
+                .ok()?;
+            Some(format!("/{}", slug.replace('-', "/")))
         }
         AgentKind::Grok => {
             // ~/.grok/sessions/<cwd-encoded>/<session>/...
@@ -1551,7 +1604,7 @@ fn project_from_git_remote(cwd: &str) -> Option<String> {
     if !path.is_dir() {
         return None;
     }
-    let output = Command::new("git")
+    let output = crate::git_env::git_command_isolated()
         .arg("-C")
         .arg(path)
         .args(["remote", "get-url", "origin"])
@@ -1826,6 +1879,26 @@ mod tests {
     }
 
     #[test]
+    fn cursor_catalog_requires_uuid_transcript_identity() {
+        let legit = Path::new(
+            "/Users/test/.cursor/projects/proj/agent-transcripts/\
+             019f5407-5b0c-7363-b210-1093f26a41f7/019f5407-5b0c-7363-b210-1093f26a41f7.jsonl",
+        );
+        assert!(is_primary_catalog_source(AgentKind::Cursor, legit));
+        // State files that happen to mirror their parent dir name must not
+        // acquire session identity (Copilot review on PR #81).
+        let state_file = Path::new(
+            "/Users/test/.cursor/projects/proj/agent-transcripts/metadata/metadata.jsonl",
+        );
+        assert!(!is_primary_catalog_source(AgentKind::Cursor, state_file));
+        let mismatched = Path::new(
+            "/Users/test/.cursor/projects/proj/agent-transcripts/\
+             019f5407-5b0c-7363-b210-1093f26a41f7/other.jsonl",
+        );
+        assert!(!is_primary_catalog_source(AgentKind::Cursor, mismatched));
+    }
+
+    #[test]
     fn status_reports_missing_catalog_and_unadmitted_live() {
         let dir = test_root("status-unadmitted");
         let home = dir.join(".aicx");
@@ -2012,7 +2085,7 @@ mod tests {
         fs::create_dir_all(&repo).unwrap();
         fs::create_dir_all(&user).unwrap();
         assert!(
-            Command::new("git")
+            crate::git_env::git_command_isolated()
                 .arg("-C")
                 .arg(&repo)
                 .args(["init", "--quiet"])
@@ -2021,7 +2094,7 @@ mod tests {
                 .success()
         );
         assert!(
-            Command::new("git")
+            crate::git_env::git_command_isolated()
                 .arg("-C")
                 .arg(&repo)
                 .args([

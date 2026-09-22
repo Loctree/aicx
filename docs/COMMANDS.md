@@ -132,8 +132,8 @@ not reused while ignore rules are present).
 ### Multi-machine / sync (operator truth)
 
 1. **Session JSONL sync** — catalog only discovers files under this host's agent
-   roots (`~/.claude/projects`, `~/.codex/sessions`, `~/.gemini/tmp`,
-   `~/.grok/sessions`, `~/.junie/sessions`, `~/.vibecrafted/control_plane/runtime_runs`).
+   roots (`~/.claude/projects`, `~/.codex/sessions`, `~/.cursor/projects`, `~/.gemini/tmp`,
+   `~/.grok/sessions`, `~/.junie/sessions`, `~/.kimi-code/sessions`, `~/.vibecrafted/control_plane/runtime_runs`).
    Drop synced JSONL into those trees, then `catalog status` → `catalog rebuild`.
 2. **No alternate daily store intake** — there is no second "drop folder" for
    sessions. `AICX_HOME` / `[storage].home` relocates the **whole** home
@@ -155,6 +155,7 @@ not reused while ignore rules are present).
 ```bash
 aicx extract claude --session <session-id> --conversation
 aicx extract codex --session <session-id> --conversation
+aicx extract cursor --session <session-id> --conversation
 aicx extract grok --session <session-id> --conversation
 aicx extract gemini --session <session-id> --conversation
 ```
@@ -177,6 +178,8 @@ aicx extract codex --session <id> --conversation --result head=5 # first 5 lines
 aicx extract codex --session <id> --conversation --result full   # whole retained result bodies
 aicx extract codex --session <id> --lineage                      # walk session_meta.forked_from_id parents (unbounded)
 aicx extract codex --session <id> --lineage=1                    # at most one parent
+aicx extract claude --session <id> --brief                       # distilled handoff brief: outcome → decisions → gates → open questions, per segment
+aicx search "watermark" --kind decision -p Loctree/aicx          # card.v3 axis: only sessions that distilled a decision candidate
 aicx extract codex --session <id> --kind human,echo_seal         # throne kinds only
 aicx extract codex --session <id> --kind inter_agent             # inter-agent lane (never rendered as assistant)
 aicx extract codex --session <id> -H 6 --conversation            # window on the view (0 = unbounded, the default)

@@ -1,7 +1,7 @@
 {
   "info": {
     "id": "019fdeca-a82d-7e62-b073-fdbf5c32aee9",
-    "cwd": "/Users/maciejgad"
+    "cwd": "/Users/user"
   },
   "session_summary": "",
   "created_at": "2026-08-08T00:34:11.218746Z",
@@ -11,7 +11,7 @@
   "current_model_id": "grok-4.5",
   "next_trace_turn": 0,
   "chat_format_version": 1,
-  "grok_home": "/Users/maciejgad/.grok",
+  "grok_home": "/Users/user/.grok",
   "last_active_at": "2026-08-08T00:34:11.965654Z",
   "agent_name": "grok-build-plan",
   "sandbox_profile": "off",

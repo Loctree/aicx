@@ -1,0 +1,4 @@
+# Byte-exact test fixtures: the tb_oracle differential harness hashes these
+# files and splits on LF-only frontmatter fences; CRLF checkout on Windows
+# broke both. Parser fixtures share the same byte-identity requirement.
+tests/fixtures/** -text

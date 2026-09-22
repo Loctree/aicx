@@ -162,6 +162,7 @@ fn reader_enforces_validated_open_and_max_unit_size() {
     let read = RawUnitReader::new(ReaderPolicy {
         max_source_bytes: 64,
         max_unit_bytes: 1,
+        ..ReaderPolicy::default()
     })
     .read(&source)
     .expect("bounded read");
@@ -178,6 +179,55 @@ fn reader_enforces_validated_open_and_max_unit_size() {
         )
         .is_err()
     );
+}
+
+#[test]
+fn whole_document_is_bounded_by_the_document_cap_not_the_line_cap() {
+    let body = br#"{"sessionId":"doc-cap"}"#;
+    let artifact =
+        SourceArtifact::memory("session.json", body.to_vec(), SourceFraming::WholeDocument)
+            .expect("memory artifact");
+    let source = SourceHandle::new(AgentKind::Gemini, "doc-cap-test", None, vec![artifact])
+        .expect("source handle");
+
+    // The line cap does not apply to a whole-document unit: a 1-byte line cap
+    // leaves the 23-byte document complete and intact.
+    let line_capped = RawUnitReader::new(ReaderPolicy {
+        max_unit_bytes: 1,
+        ..ReaderPolicy::default()
+    })
+    .read(&source)
+    .expect("bounded read");
+    assert_eq!(line_capped.units.len(), 1);
+    assert_eq!(line_capped.units[0].boundary, UnitBoundary::Complete);
+    assert_eq!(line_capped.units[0].bytes, body.to_vec());
+    assert_eq!(line_capped.units[0].original_bytes, body.len() as u64);
+
+    // The document cap does, with the same truncate-and-mark contract as a
+    // line: hash of the whole, bytes bounded to the cap.
+    let doc_capped = RawUnitReader::new(ReaderPolicy {
+        max_document_bytes: 4,
+        ..ReaderPolicy::default()
+    })
+    .read(&source)
+    .expect("bounded read");
+    assert_eq!(doc_capped.units[0].boundary, UnitBoundary::Oversized);
+    assert_eq!(doc_capped.units[0].bytes, body[..4].to_vec());
+    assert_eq!(doc_capped.units[0].original_bytes, body.len() as u64);
+    assert_eq!(
+        doc_capped.units[0].content_hash,
+        line_capped.units[0].content_hash
+    );
+
+    // A zero document cap is as invalid as a zero line or source cap.
+    assert!(matches!(
+        RawUnitReader::new(ReaderPolicy {
+            max_document_bytes: 0,
+            ..ReaderPolicy::default()
+        })
+        .read(&source),
+        Err(ReaderError::InvalidPolicy)
+    ));
 }
 
 #[test]

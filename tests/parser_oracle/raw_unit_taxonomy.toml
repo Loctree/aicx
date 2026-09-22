@@ -415,3 +415,61 @@ locator = "step:<stepId>:<kind>"
 provenance = "aicx_history"
 description = "Streaming block family: ResultBlockUpdatedEvent | AgentThoughtBlockUpdatedEvent | TerminalBlockUpdatedEvent | McpBlockUpdatedEvent | ToolBlockUpdatedEvent | FileChangesBlockUpdatedEvent | ViewFilesBlockUpdatedEvent. Emits repeated snapshots per stepId (IN_PROGRESS→COMPLETED); the LOGICAL unit is the last snapshot per (stepId, kind) — hence the logical locator; earlier snapshots are consumed as stream updates, not duplicates."
 match = { field = "type", equals_any = ["ResultBlockUpdatedEvent", "AgentThoughtBlockUpdatedEvent", "TerminalBlockUpdatedEvent", "McpBlockUpdatedEvent", "ToolBlockUpdatedEvent", "FileChangesBlockUpdatedEvent", "ViewFilesBlockUpdatedEvent"] }
+
+# ================================================================== cursor
+
+[[agent]]
+name = "cursor"
+container = "jsonl_file"
+primary_file = "agent-transcripts/<uuid>/<uuid>.jsonl"
+
+[[agent.kind]]
+name = "user"
+level = "physical"
+locator = "ordinal"
+provenance = "recon"
+description = "Operator row. Role lives in `role` (not `type`). Speech is `message.content[]` text blocks, usually wrapped in <timestamp> + <user_query>. Measured 2026-09-17: 956/14760 lines across 202 live transcripts."
+match = { field = "role", equals = "user" }
+
+[[agent.kind]]
+name = "assistant"
+level = "physical"
+locator = "ordinal"
+provenance = "recon"
+description = "Assistant row. `message.content[]` fans out to text and tool_use logical units. Tool results are NOT in this file (agent-tools/ siblings). Measured 2026-09-17: 13600/14760 lines."
+match = { field = "role", equals = "assistant" }
+
+[[agent.kind]]
+name = "turn_ended"
+level = "physical"
+locator = "ordinal"
+provenance = "recon"
+description = "Recognized bookkeeping envelope `{type:turn_ended,status:success|error}`. Consumed as metadata; status=error may carry a usage-limit string. Measured 2026-09-17: 204/14760 lines."
+match = { field = "type", equals = "turn_ended" }
+
+[[agent.kind]]
+name = "user_text"
+level = "logical"
+parent = "user"
+locator = "<ordinal>:blk:<n>"
+provenance = "recon"
+description = "message.content[] text block on a user row. Adapter peels <user_query> as the operator utterance when present."
+match = { field = "type", equals = "text" }
+
+[[agent.kind]]
+name = "text_block"
+level = "logical"
+parent = "assistant"
+locator = "<ordinal>:blk:<n>"
+provenance = "recon"
+description = "message.content[] text block on an assistant row. Cursor inlines reasoning in the same text type — no separate thinking block on 2026-09-17 live corpus (0 thinking / 0 tool_result blocks in 14760 lines)."
+match = { field = "type", equals = "text" }
+
+[[agent.kind]]
+name = "tool_use_block"
+level = "logical"
+parent = "assistant"
+locator = "<ordinal>:blk:<n>"
+provenance = "recon"
+description = "Tool call block `{type:tool_use,name,input}`. No call id is written; correlation_id stays unknown. Results are out of band."
+match = { field = "type", equals = "tool_use" }

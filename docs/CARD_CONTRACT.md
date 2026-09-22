@@ -169,3 +169,47 @@ above.
   stamped, but no cut re-extracts signals from older cards yet.
 - Retiring the bracket-header read fallback would require a migration
   contract proving no v1 cards remain; no such cut is planned.
+
+## card.v3 — the live card is the index document (W2-02, 2026-09-18)
+
+Decision (signed: claude, plan `aicx-distill-per-agent-v1`): v3 does NOT
+extend the legacy chunk-store card above — that surface is dead (no runtime
+writer). The live card of aicx is the **per-session index document** built by
+`src/source_index.rs` and published to CURRENT; v3 is materialized there.
+
+Shape (document `metadata_json`, additive — no tantivy schema bump, so no
+full-reindex button is required):
+
+```json
+{
+  "card_schema": "card.v3",
+  "distill": {
+    "schema": "aicx.distill.segment_distillate.v1",
+    "segments": 11,
+    "outcomes": ["complete", "unknown"],
+    "decisions":       [{"text", "kind", "segment"}],
+    "gates":           [{"command", "outcome", "segment"}],
+    "open_questions":  [{"text", "kind", "segment"}],
+    "handoff_signals": ["…"]
+  },
+  "has_decisions": "true",
+  "has_failing_gates": "false",
+  "has_open_questions": "true"
+}
+```
+
+Rules:
+
+- **One implementation, two consumers.** `extraction::distill::materialize`
+  and `extraction::brief` read the same `SegmentDistillate` values from the
+  same `LaneRegistry`; a value that differs between `--brief` and the card is
+  a bug, and `distill::materialize::tests::brief_and_card_read_one_distillate`
+  guards it on the frozen claude fixture.
+- **Coverage is reported, never faked.** Only sessions parsed by *this* run
+  get v3 (`aicx index` prints the `distill (card.v3): N doc(s)` line);
+  reused cached extracts stay v2 until re-parsed. `aicx search --kind
+  decision` filters the flat scalar `has_decisions`, so v2 documents are
+  invisible on that axis by design — the CLI says so on stderr.
+- The flat `has_*` scalars exist because the tantivy adapter's metadata
+  filter is a generic equality over top-level keys; they are the filterable
+  projection of `distill`, never independent truth.

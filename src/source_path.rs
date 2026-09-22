@@ -7,9 +7,11 @@
 //! Approved roots (when present on the machine):
 //! - `~/.claude/projects`
 //! - `~/.codex/sessions`
+//! - `~/.cursor/projects`
 //! - `~/.grok/sessions`
 //! - `~/.gemini/tmp`
 //! - `~/.junie/sessions`
+//! - `~/.kimi-code/sessions`
 //! - `~/.vibecrafted/control_plane/runtime_runs`
 //! - the active AICX home (`$AICX_HOME` / `~/.aicx`)
 //!
@@ -26,9 +28,11 @@ use anyhow::{Context, Result, anyhow};
 pub const DEFAULT_SOURCE_ROOT_RELATIVE: &[&str] = &[
     ".claude/projects",
     ".codex/sessions",
+    ".cursor/projects",
     ".grok/sessions",
     ".gemini/tmp",
     ".junie/sessions",
+    ".kimi-code/sessions",
     ".vibecrafted/control_plane/runtime_runs",
 ];
 
@@ -250,6 +254,30 @@ mod tests {
         assert_eq!(fs::read_to_string(&resolved).unwrap(), "hello");
         let body = allow.read_to_string(&file).unwrap();
         assert_eq!(body, "hello");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn accepts_kimi_wire_under_approved_root() {
+        // Regression (kimi_unindexed=N on 0.13.1): the allowlist lacking
+        // `.kimi-code/sessions` made `aicx index` skip every kimi lane at the
+        // containment boundary, so search coverage reported them unindexed
+        // forever no matter how often the index was rebuilt.
+        let root = test_dir("kimi");
+        let aicx = root.join(".aicx");
+        let wire = root
+            .join(".kimi-code")
+            .join("sessions")
+            .join("wd_proj_deadbeef")
+            .join("session_019f0000-1111-7111-8111-000000000001")
+            .join("agents")
+            .join("main")
+            .join("wire.jsonl");
+        fs::create_dir_all(wire.parent().unwrap()).unwrap();
+        fs::write(&wire, b"{}\n").unwrap();
+        let allow = SourceAllowlist::for_operator(&root, &aicx);
+        let resolved = allow.resolve_file(&wire).unwrap();
+        assert_eq!(fs::read_to_string(&resolved).unwrap(), "{}\n");
         let _ = fs::remove_dir_all(&root);
     }
 

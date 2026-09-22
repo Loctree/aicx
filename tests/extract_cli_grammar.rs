@@ -63,6 +63,24 @@ fn rollout_fixture(session_id: &str) -> String {
     )
 }
 
+/// Does `help` offer the removed `--agent <name>` / `--format <name>` flag
+/// grammar?
+///
+/// Token-boundary, not substring: `--agent-only` and `--agent-commands` are
+/// legitimate projection flags in the current grammar, and a bare
+/// `contains("--agent")` would forbid the whole namespace instead of the one
+/// removed spelling this guard exists for.
+fn offers_removed_flag_grammar(help: &str) -> bool {
+    ["--agent", "--format"].iter().any(|flag| {
+        help.match_indices(flag).any(|(index, _)| {
+            let rest = &help[index + flag.len()..];
+            // A following `-` means a longer flag name (`--agent-only`);
+            // anything else means the removed flag itself is on offer.
+            !rest.starts_with('-')
+        })
+    })
+}
+
 fn run_extract(home: &Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_aicx"))
         .env("HOME", home)
@@ -89,7 +107,7 @@ fn help_lists_agent_subcommands_and_hides_flag_grammar() {
         );
     }
     assert!(
-        !stdout.contains("--agent") && !stdout.contains("--format"),
+        !offers_removed_flag_grammar(&stdout),
         "removed flag grammar leaked into help:\n{stdout}"
     );
     let _ = fs::remove_dir_all(&home);
@@ -325,20 +343,100 @@ fn session_mode_ambiguous_reference_is_structured_not_first_wins() {
 }
 
 #[test]
-fn direct_file_mode_requires_output_and_skips_catalog() {
-    let home = unique_test_dir("direct-file");
+fn direct_file_mode_defaults_to_central_extracts() {
+    let home = unique_test_dir("direct-file-default");
     let rollout = home.join("standalone-rollout.jsonl");
     write_file(&rollout, &rollout_fixture(SESSION_UUID));
     let file_arg = rollout.display().to_string();
 
-    // Missing -o is a structured failure before any parse.
+    // Without -o the extract lands in the central store under the file's own
+    // identity — the stem plus a short path hash, so two different files with
+    // the same stem never overwrite each other — exactly where `--session`
+    // would put it, still without touching the catalog.
     let output = run_extract(&home, &["extract", "codex", "--file", &file_arg]);
-    assert_eq!(output.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("output_path_required"),
-        "missing -o must be structured:\n{stderr}"
+        output.status.success(),
+        "direct-file without -o must succeed:\n{stderr}"
     );
+    assert!(
+        stderr.contains("catalog_files_opened=0"),
+        "default-output mode must not touch the catalog:\n{stderr}"
+    );
+    let extracts_dir = home.join(".aicx").join("extracts").join("codex");
+    let central_names = |dir: &std::path::Path| -> Vec<String> {
+        fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .filter_map(|entry| entry.ok())
+                    .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let names = central_names(&extracts_dir);
+    assert!(
+        names
+            .iter()
+            .any(|name| name.starts_with("standalone-rollout-") && name.ends_with(".md")),
+        "expected central extract named after the file identity, found: {names:?}"
+    );
+    // The two output axes stay distinct on disk, as for `--session`.
+    let output = run_extract(
+        &home,
+        &[
+            "extract",
+            "codex",
+            "--file",
+            &file_arg,
+            "--conversation",
+            "--user-only",
+        ],
+    );
+    assert!(output.status.success());
+    let names = central_names(&extracts_dir);
+    assert!(
+        names
+            .iter()
+            .any(|name| name.starts_with("standalone-rollout-")
+                && name.ends_with("_conversation_user.md")),
+        "expected conversation/user extract alongside the full one, found: {names:?}"
+    );
+    // Re-extracting the same file lands on the same identity (no new file);
+    // a different file with the same stem lands on a different one.
+    let count_full = names
+        .iter()
+        .filter(|name| name.ends_with(".md") && !name.contains("_conversation"))
+        .count();
+    assert_eq!(
+        count_full, 1,
+        "same input must reuse its extract: {names:?}"
+    );
+    let twin = home.join("twin").join("standalone-rollout.jsonl");
+    write_file(&twin, &rollout_fixture(SESSION_UUID));
+    let output = run_extract(
+        &home,
+        &["extract", "codex", "--file", &twin.display().to_string()],
+    );
+    assert!(output.status.success());
+    let names = central_names(&extracts_dir);
+    let count_full = names
+        .iter()
+        .filter(|name| name.ends_with(".md") && !name.contains("_conversation"))
+        .count();
+    assert_eq!(
+        count_full, 2,
+        "same-stem file from another directory must not overwrite: {names:?}"
+    );
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn direct_file_mode_with_output_skips_catalog_and_global_state() {
+    let home = unique_test_dir("direct-file");
+    let rollout = home.join("standalone-rollout.jsonl");
+    write_file(&rollout, &rollout_fixture(SESSION_UUID));
+    let file_arg = rollout.display().to_string();
 
     // Frozen compact-recall argv (C7H): direct handle, zero catalog work,
     // exactly one parse pass, and no global AICX state required.

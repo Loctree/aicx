@@ -15,6 +15,92 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   serialize custom-root ownership, refuse time-dependent Grok projections, and
   redact source/session identifiers from cache diagnostics.
 
+## [0.14.0] - 2026-09-18
+
+### Cursor is a first-class agent lane
+
+The parser kernel had a finished Cursor adapter (`cursor-transcript-v1`)
+that nothing in the binary used. It is now wired end-to-end: catalog
+discovery under `~/.cursor/projects/<slug>/agent-transcripts/<uuid>/<uuid>.jsonl`
+(strict shape — sibling IDE/state JSONL never becomes catalog identity),
+`extract cursor`, `sessions list`, index census with cursor-aware watermark
+generation and alias migration, MCP, and diagnostics. The parked PR #73
+campaign was absorbed with authorship preserved: encoded-space cwd pruning,
+slug round-trip discovery, the `cursor-agent` alias, honest project
+attribution with worktree labels, `cursor_e2e`, and git-env isolation.
+
+- Project labels: the fleet worktree-layout heuristic
+  (`…/<repo>/<stamp>/worktrees/<task>`) now applies only to cwds that do
+  not exist on this host; an existing non-git directory keeps its own
+  last path segment.
+
+### Distill: `extract --brief` and decision retrieval
+
+- `extract --brief` renders an inverted-pyramid handoff of a session.
+- card.v3 index materialization and `search --kind decision`.
+- Shouted request headers (`**FINAL ACTIVE REQUEST:**`, `TODO NOTE:` …)
+  no longer score as explicit invariants — including when Markdown
+  emphasis is glued to the colon — so genuine causal answers outrank
+  process chatter.
+
+### Round-trip fixes
+
+- Junie: the id printed by `sessions list` now resolves in
+  `extract junie --session` (identity lives on the `session-<id>/`
+  directory); regression-tested against a live repro (0 → 565 entries).
+- `extract <agent> --file` without `-o` lands in the central store under
+  the file stem plus a short stable hash of the canonical path, so two
+  different files with the same stem never overwrite each other's
+  extract; re-extracting the same file reuses its path.
+- `sessions list` duplicate-row regression caught and fixed before
+  release.
+
+### CI
+
+- Release workflow: hosted signing with isolated GNUPGHOME, portable
+  base64, enumerated secret-file permissions, and npm publish via OIDC
+  trusted publishers (PR #76).
+- Rust code coverage reporting via cargo-llvm-cov on the Linux lane
+  (PR #75).
+
+## [0.13.1] - 2026-09-13
+
+### A Gemini session is no longer lost because one tool result was large
+
+Gemini stores a whole conversation as one JSON document, and the reader
+bounded every physical unit — a JSONL line *or* a whole file — at 8 MiB. So a
+281 MB `chats/session-*.json` holding 39 messages, 228 bytes of speech and one
+298 MB tool result was refused entirely as `Fatal completeness`. On one real
+tree that was 6 of 397 sessions, indistinguishable from the 32 `logs.json` /
+checkpoint files the catalog offered next to them.
+
+- **Documents have their own bound.** `ReaderPolicy` gains
+  `max_document_bytes` (default 1 GiB, below the 2 GiB source cap); the 8 MiB
+  `max_unit_bytes` now means what it says — one line. A whole-document unit
+  moves into its `RawUnit` instead of being copied. Physical accounting is
+  unchanged: one document, one physical unit (taxonomy §2 stands).
+- **Nested blocks are bounded instead.** The Gemini adapter measures every
+  logical unit in canonical bytes against the same 8 MiB. An oversized
+  `toolCalls[i]` / `parts[i]` terminates as `skipped(oversized)` with its own
+  evidence (locator, hash, byte count) and the typed warning; the message
+  that carried it is consumed without it, an index-stable marker
+  (`aicx_oversized_block`) keeping every sibling's locator and hash exactly
+  what it would have been. A message whose *speech* is over the cap is the
+  unit that skips; the session stays a session (`partial_visible`,
+  `visible_event_lost`), never `Fatal`.
+- **Hashing streams.** `engine::Sha256Stream` is the frozen SHA-256 as an
+  incremental writer; logical evidence is measured by serializing into it, so
+  a 300 MB block costs a pass, not a copy. Digests are byte-identical to
+  `sha256_hex` (block-edge vectors pinned).
+- **Discovery stops offering non-conversations.** A Gemini catalog source
+  must live under `<project>/chats/` (top-level `session-*.json[l]` or resumed
+  `chats/<uuid>/<id>.json`). `logs.json`, `checkpoint-*.json`,
+  `.extraction-state.json` and `formatted_context.json` no longer reach the
+  adapter to be refused; on the measured tree the 32 `unsupported` rows leave
+  the manifest and `discovered` reconciles to the 365 conversations.
+- `extract all` enumerates providers from the catalog's `AgentKind::ALL`
+  instead of a hand-written copy that claimed to be derived.
+
 ## [0.13.0] - 2026-09-01
 
 ### One taxonomy for every agent (mission `aicx-one-taxonomy-fusion-260827`)

@@ -11,6 +11,7 @@
 //! Supported sources:
 //! - Claude Code: ~/.claude/projects/*/*.jsonl
 //! - Codex: ~/.codex/history.jsonl
+//! - Cursor: ~/.cursor/projects/*/agent-transcripts/<uuid>/<uuid>.jsonl
 //! - Gemini: ~/.gemini/tmp/<hash>/chats/session-*.json
 //! - Gemini Antigravity: ~/.gemini/antigravity/{conversations/<uuid>.pb,brain/<uuid>/}
 //! - Junie: ~/.junie/sessions/session-*/events.jsonl
@@ -84,8 +85,9 @@ fn print_intent_schema_migration_report(report: &intents::MigrationReport) {
 ///   Extracts: render one readable user/assistant transcript per session.
 ///   Index: lexical-first Tantivy over extracts; dense rerank is optional.
 /// Quick start:
-///   aicx catalog rebuild
-///   aicx index
+///   aicx index                 # census + incremental parse + publish (one command)
+///   aicx search '<query>'
+/// Power-user surfaces (catalog, extracts, intents, migrations): aicx --help-full
 #[derive(Debug, Parser)]
 #[command(name = "aicx")]
 #[command(author = "(c)2026 Vetcoders")]
@@ -105,6 +107,12 @@ struct Cli {
     /// and an ambiguous bare repository name fails closed.
     #[arg(long, global = true)]
     project_fuzzy: bool,
+
+    /// Show every command, including the power-user surfaces hidden from
+    /// the short help (catalog internals, per-agent extractors, intents,
+    /// migrations, archive readers).
+    #[arg(long)]
+    help_full: bool,
 
     #[command(subcommand)]
     command: Option<Commands>,
@@ -160,9 +168,11 @@ enum OverlayFormat {
 enum ExtractAgent {
     Codex,
     Claude,
+    Cursor,
     Gemini,
     Grok,
     Junie,
+    Kimi,
 }
 
 impl ExtractAgent {
@@ -170,9 +180,11 @@ impl ExtractAgent {
         match self {
             Self::Codex => "codex",
             Self::Claude => "claude",
+            Self::Cursor => "cursor",
             Self::Gemini => "gemini",
             Self::Grok => "grok",
             Self::Junie => "junie",
+            Self::Kimi => "kimi",
         }
     }
 
@@ -180,9 +192,11 @@ impl ExtractAgent {
         match self {
             Self::Codex => aicx::session_catalog::AgentKind::Codex,
             Self::Claude => aicx::session_catalog::AgentKind::Claude,
+            Self::Cursor => aicx::session_catalog::AgentKind::Cursor,
             Self::Gemini => aicx::session_catalog::AgentKind::Gemini,
             Self::Grok => aicx::session_catalog::AgentKind::Grok,
             Self::Junie => aicx::session_catalog::AgentKind::Junie,
+            Self::Kimi => aicx::session_catalog::AgentKind::Kimi,
         }
     }
 
@@ -190,9 +204,11 @@ impl ExtractAgent {
         match self {
             Self::Codex => aicx::parser::engine::AgentKind::Codex,
             Self::Claude => aicx::parser::engine::AgentKind::Claude,
+            Self::Cursor => aicx::parser::engine::AgentKind::Cursor,
             Self::Gemini => aicx::parser::engine::AgentKind::Gemini,
             Self::Grok => aicx::parser::engine::AgentKind::Grok,
             Self::Junie => aicx::parser::engine::AgentKind::Junie,
+            Self::Kimi => aicx::parser::engine::AgentKind::Kimi,
         }
     }
 
@@ -201,12 +217,14 @@ impl ExtractAgent {
         match self {
             Self::Codex => home.join(".codex").join("sessions"),
             Self::Claude => home.join(".claude").join("projects"),
+            Self::Cursor => home.join(".cursor").join("projects"),
             Self::Gemini => home.join(".gemini").join("tmp"),
             // Match durable catalog rebuild: sessions live under
             // `~/.grok/sessions/<cwd-encoded>/<uuid>/…`, not the bare `~/.grok`
             // tree (config, relocations, assets).
             Self::Grok => home.join(".grok").join("sessions"),
             Self::Junie => home.join(".junie").join("sessions"),
+            Self::Kimi => home.join(".kimi-code").join("sessions"),
         }
     }
 
@@ -214,9 +232,11 @@ impl ExtractAgent {
         match value.trim().to_ascii_lowercase().as_str() {
             "codex" => Some(Self::Codex),
             "claude" => Some(Self::Claude),
+            "cursor" | "cursor-agent" => Some(Self::Cursor),
             "gemini" | "gemini-antigravity" => Some(Self::Gemini),
             "grok" => Some(Self::Grok),
             "junie" => Some(Self::Junie),
+            "kimi" => Some(Self::Kimi),
             _ => None,
         }
     }
@@ -228,12 +248,18 @@ enum ExtractTarget {
     Codex(ExtractAgentArgs),
     /// Claude Code sessions (~/.claude/projects)
     Claude(ExtractAgentArgs),
+    /// Cursor agent transcripts (~/.cursor/projects/*/agent-transcripts)
+    Cursor(ExtractAgentArgs),
     /// Gemini CLI chats (~/.gemini/tmp/<hash>/chats)
     Gemini(ExtractAgentArgs),
     /// Grok CLI sessions (~/.grok)
     Grok(ExtractAgentArgs),
     /// JetBrains Junie event logs (~/.junie/sessions)
     Junie(ExtractAgentArgs),
+    /// Kimi Code CLI wire files (~/.kimi-code/sessions)
+    Kimi(ExtractAgentArgs),
+    /// Every compatible source on this machine, in one incremental pass.
+    All(ExtractAllArgs),
 }
 
 impl ExtractTarget {
@@ -241,11 +267,94 @@ impl ExtractTarget {
         match self {
             Self::Codex(args) => (ExtractAgent::Codex, args),
             Self::Claude(args) => (ExtractAgent::Claude, args),
+            Self::Cursor(args) => (ExtractAgent::Cursor, args),
             Self::Gemini(args) => (ExtractAgent::Gemini, args),
             Self::Grok(args) => (ExtractAgent::Grok, args),
             Self::Junie(args) => (ExtractAgent::Junie, args),
+            Self::Kimi(args) => (ExtractAgent::Kimi, args),
+            Self::All(_) => unreachable!("`extract all` is dispatched before split()"),
         }
     }
+}
+
+/// `aicx extract all` — the bulk axes.
+///
+/// The projection flags are deliberately the *same* words as the per-agent
+/// form, resolved by the same `apply_axis_flags`. A second vocabulary for
+/// bulk would be a second contract to keep true.
+#[derive(Debug, Args)]
+struct ExtractAllArgs {
+    #[command(flatten)]
+    redaction: RedactionArgs,
+
+    /// Restrict the pass to these providers (repeatable / comma list).
+    /// Default: every provider the parser registry claims.
+    ///
+    /// Spelled `--provider`, not `--agent`: `--agent` is the removed
+    /// flag-grammar spelling of the per-session form and must not come back
+    /// carrying a different meaning.
+    #[arg(long, value_delimiter = ',', value_name = "PROVIDER")]
+    provider: Vec<String>,
+
+    /// Project/repo filter, repeatable (OR across projects, AND with the
+    /// other axes). A session whose cwd is unknown is filtered out, not
+    /// guessed into the result.
+    #[arg(short, long, value_delimiter = ',')]
+    project: Vec<String>,
+
+    /// Hours to look back over *event* timestamps (0 = unbounded). One cutoff
+    /// is captured when the command starts and every session shares it.
+    #[arg(short = 'H', long, default_value = "0")]
+    hours: u64,
+
+    /// Only user messages.
+    #[arg(long, conflicts_with = "agent_only")]
+    user_only: bool,
+
+    /// Only assistant answers (`assistant_final`).
+    #[arg(long)]
+    agent_only: bool,
+
+    /// Only shell commands the human submitted.
+    #[arg(long)]
+    user_commands: bool,
+
+    /// Only tool / shell invocations the agent made.
+    #[arg(long)]
+    agent_commands: bool,
+
+    /// Throne kind filter (repeatable / comma list), same vocabulary as
+    /// `aicx extract <agent> --kind`.
+    #[arg(long, value_delimiter = ',', value_name = "KIND")]
+    kind: Vec<String>,
+
+    /// Retained shell result body: none (default) | head=N | full.
+    #[arg(long, default_value = "none", value_name = "none|head=N|full")]
+    result: String,
+
+    /// Conversation-first rendering.
+    #[arg(long)]
+    conversation: bool,
+
+    /// Maximum message characters (0 = no truncation).
+    #[arg(long, default_value = "0")]
+    max_message_chars: usize,
+
+    /// Output root for the extracts. Defaults to `<AICX_HOME>/extracts`.
+    #[arg(short, long, value_name = "DIR")]
+    output: Option<PathBuf>,
+
+    /// Re-materialize every selected session, ignoring the incremental state.
+    #[arg(long, visible_alias = "force")]
+    rebuild: bool,
+
+    /// Plan only: report what each source would become, write nothing.
+    #[arg(long)]
+    dry_run: bool,
+
+    /// Emit the run manifest as JSON on stdout instead of the human summary.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -269,13 +378,32 @@ struct ExtractAgentArgs {
     #[arg(short, long)]
     output: Option<PathBuf>,
 
-    /// Explicit project/repo name (overrides inference)
-    #[arg(short, long)]
-    project: Option<String>,
+    /// Project/repo filter, repeatable or comma-separated (OR across
+    /// projects, AND with every other axis). Entries are kept when their
+    /// recorded cwd belongs to one of them; an entry with no known cwd is
+    /// filtered out rather than guessed. A single value also names the
+    /// output's project identity, as before.
+    #[arg(short, long, value_delimiter = ',')]
+    project: Vec<String>,
 
     /// Only include user messages (exclude assistant + reasoning)
-    #[arg(long)]
+    #[arg(long, conflicts_with = "agent_only")]
     user_only: bool,
+
+    /// Only include assistant answers (`assistant_final`). Reasoning,
+    /// inter-agent traffic and lineage metadata are excluded: they are not
+    /// the assistant speaking to the operator.
+    #[arg(long)]
+    agent_only: bool,
+
+    /// Only shell commands the human submitted (e.g. Codex
+    /// `<user_shell_command>`). A command quoted in prose is not an execution.
+    #[arg(long)]
+    user_commands: bool,
+
+    /// Only tool / shell invocations the agent made.
+    #[arg(long)]
+    agent_commands: bool,
 
     /// Maximum message characters in markdown (0 = no truncation)
     #[arg(long, default_value = "0")]
@@ -301,6 +429,14 @@ struct ExtractAgentArgs {
     /// their seals) plus assistant-final answers.
     #[arg(long)]
     dialog: bool,
+
+    /// Distilled handoff brief (inverted pyramid, one section per segment):
+    /// outcome first, then decision candidates, gates, open questions and
+    /// handoff signals, each with an evidence locator into the substrate.
+    /// Rendered from the agent's distiller lane (`GenericLane` fail-open);
+    /// mixed sessions get a multi-workstream header, never averaged outcomes.
+    #[arg(long, conflicts_with_all = ["conversation", "dialog", "user_only", "agent_only", "user_commands", "agent_commands"])]
+    brief: bool,
 
     /// Walk parent sessions through `session_meta.forked_from_id` (session
     /// catalog lookup, never filename guessing). Bare `--lineage` = unbounded;
@@ -410,8 +546,8 @@ enum SessionsCommand {
         #[arg(short, long, value_delimiter = ',')]
         project: Vec<String>,
 
-        /// Filter by agent (claude | codex | gemini | junie | grok).
-        #[arg(long, value_parser = ["claude", "codex", "gemini", "junie", "grok"])]
+        /// Filter by agent (claude | codex | gemini | junie | grok | kimi | cursor).
+        #[arg(long, value_parser = ["claude", "codex", "gemini", "junie", "grok", "kimi", "cursor", "cursor-agent"])]
         agent: Option<String>,
 
         /// Only sessions updated on/after this date (YYYY-MM-DD). Defaults to the
@@ -997,6 +1133,7 @@ enum Commands {
     /// is **retired**. There is no palette command named "canonical ingest".
     /// Recovery: `aicx catalog rebuild` then `aicx intents -p <owner/repo>`,
     /// then re-run overlay. `aicx ingest` is operator-md / loct-context-pack only.
+    #[command(hide = true)]
     Overlay {
         /// Repository whose `loct anchors` catalog is the attribution target.
         #[arg(long)]
@@ -1016,7 +1153,7 @@ enum Commands {
     ///
     /// Reads claude-code session files, then
     /// writes readable Markdown/JSON reports only when an output is requested.
-    #[command(display_order = 2)]
+    #[command(hide = true, display_order = 2)]
     Claude {
         #[command(flatten)]
         redaction: RedactionArgs,
@@ -1086,7 +1223,7 @@ enum Commands {
     ///
     /// Reads codex session files, then
     /// writes readable Markdown/JSON reports only when an output is requested.
-    #[command(display_order = 3)]
+    #[command(hide = true, display_order = 3)]
     Codex {
         #[command(flatten)]
         redaction: RedactionArgs,
@@ -1158,7 +1295,7 @@ enum Commands {
     /// writes steerable markdown to ~/.aicx/. By default, uses per-source
     /// watermarks to skip already-processed entries. Use --full-rescan to
     /// ignore the watermark and scan the full lookback window again.
-    #[command(display_order = 1)]
+    #[command(hide = true, display_order = 1)]
     All {
         #[command(flatten)]
         redaction: RedactionArgs,
@@ -1220,17 +1357,32 @@ enum Commands {
         conversation: bool,
     },
 
-    /// Extract a single session for one agent — by session id or direct file.
+    /// Extract sessions — one at a time, or every compatible source at once.
     ///
-    /// Canonical grammar (the agent is a required subcommand):
+    /// Canonical grammar (the target is a required subcommand):
+    ///   aicx extract all [-p PROJECT]... [-H HOURS] [--provider NAME]... [--rebuild]
     ///   aicx extract {codex|claude|gemini|grok|junie} --session <id> [--conversation] [-o FILE]
     ///   aicx extract {codex|claude|gemini|grok|junie} --file <path> --conversation -o <path>
+    ///
+    /// `all` walks every registered agent, projects each session through the
+    /// same filters, and writes a run manifest under
+    /// `<AICX_HOME>/extracts/_bulk/`. It is incremental: an unchanged source
+    /// under an unchanged parser and filter set is reported `unchanged` and
+    /// re-materialized only by `--rebuild`.
     ///
     /// `--session` resolves the session catalog first (bounded identity headers,
     /// no body parse), then parses exactly one resolved source. `--file` builds a
     /// direct source handle from the supplied path with no catalog scan and no
     /// global AICX state. Default output paths encode the mode axes:
-    /// `~/.aicx/extracts/<agent>/<session_id>[_conversation][_user].md`.
+    /// `~/.aicx/extracts/<agent>/<session_id>[_conversation][_user][_<variant>].md`,
+    /// where `<variant>` is the projection fingerprint of any further narrowing
+    /// so two filter sets never overwrite each other.
+    ///
+    /// Projection axes (identical on both forms): `--user-only` / `--agent-only`
+    /// select a speaker; `--user-commands` / `--agent-commands` select the
+    /// shell lane by who executed; `--kind` and `--result` stay the throne
+    /// vocabulary. Contradictory combinations fail with a named reason rather
+    /// than returning an empty result.
     #[command(display_order = 5)]
     Extract {
         #[command(subcommand)]
@@ -1276,7 +1428,7 @@ enum Commands {
     ///
     /// Thin wrapper around `aicx extract --conversation` semantics: scans source
     /// sessions, groups by session_id, and writes one JSON file per session.
-    #[command(display_order = 6)]
+    #[command(hide = true, display_order = 6)]
     Conversations {
         #[command(flatten)]
         redaction: RedactionArgs,
@@ -1325,14 +1477,14 @@ enum Commands {
     /// name now points at this catalog engine (readable extract-era catalog,
     /// no `~/.aicx/store/` card materialization) rather than the removed
     /// card-writing engine.
-    #[command(display_order = 3, visible_alias = "store")]
+    #[command(hide = true, display_order = 3, visible_alias = "store")]
     Catalog {
         #[command(subcommand)]
         action: CatalogAction,
     },
 
     /// Ingest operator-owned source documents into the canonical corpus.
-    #[command(display_order = 5)]
+    #[command(hide = true, display_order = 5)]
     Ingest {
         #[command(flatten)]
         redaction: RedactionArgs,
@@ -1376,11 +1528,11 @@ enum Commands {
     /// Shows Claude Code, Codex, Gemini, Junie, and Grok log paths with session
     /// counts and sizes. This is what extractors will read from — use
     /// `catalog resolve` / `extract` to inspect identity and readable transcripts.
-    #[command(display_order = 10)]
+    #[command(hide = true, display_order = 10)]
     List,
 
     /// Audit and explicitly protect raw source roots.
-    #[command(display_order = 10)]
+    #[command(hide = true, display_order = 10)]
     Sources {
         #[command(subcommand)]
         command: SourcesCommands,
@@ -1394,21 +1546,21 @@ enum Commands {
     },
 
     /// Lane 2: extract agent claims (audit targets) from a session.
-    #[command(display_order = 6)]
+    #[command(hide = true, display_order = 6)]
     Claims {
         #[command(subcommand)]
         command: ClaimsCommand,
     },
 
     /// Lane 3: collect repo evidence for a session's claims and verify them.
-    #[command(display_order = 6)]
+    #[command(hide = true, display_order = 6)]
     Results {
         #[command(subcommand)]
         command: ResultsCommand,
     },
 
     /// Lane 5: generate at most 5 A/B/C decision questions from verified gaps.
-    #[command(display_order = 6)]
+    #[command(hide = true, display_order = 6)]
     Clarify {
         /// Session id (or unique prefix).
         #[arg(long)]
@@ -1468,7 +1620,7 @@ enum Commands {
     ///
     /// Shows what the extract-era identity path has already materialised
     /// (extracts cache and legacy card trees if still present on disk).
-    #[command(display_order = 11)]
+    #[command(hide = true, display_order = 11)]
     Refs {
         /// Hours to look back (filter by canonical chunk date)
         #[arg(short = 'H', long, default_value = "48")]
@@ -1495,6 +1647,7 @@ enum Commands {
     },
 
     /// Manage extraction dedup state (watermarks and hashes).
+    #[command(hide = true)]
     State {
         /// Reset all dedup hashes
         #[arg(long)]
@@ -1512,12 +1665,15 @@ enum Commands {
     },
 
     /// Generate a searchable HTML dashboard from extracts/catalog, or serve it locally.
+    #[command(hide = true)]
     Dashboard(#[command(flatten)] DashboardArgs),
 
     /// Extract Vibecrafted workflow and marbles reports into a standalone HTML explorer.
+    #[command(hide = true)]
     Reports(#[command(flatten)] ReportsArgs),
 
     /// Audit or repair derived corpus markdown.
+    #[command(hide = true)]
     Corpus(#[command(flatten)] CorpusArgs),
 
     /// Deprecated compatibility shim for `aicx reports`.
@@ -1529,6 +1685,7 @@ enum Commands {
     DashboardServeLegacy(#[command(flatten)] DashboardServeLegacyArgs),
 
     /// Extract structured intents from the durable catalog and allowlisted session sources.
+    #[command(hide = true)]
     Intents {
         /// Catalog project filters. Omit to scan all projects.
         /// Repeated `-p` flags or comma list (`-p a,b`) form a union.
@@ -1595,6 +1752,7 @@ enum Commands {
     },
 
     /// Print recent intents/chunks (snapshot mode); add --follow to stream new arrivals.
+    #[command(hide = true)]
     Tail {
         /// Catalog project filters. Omit to scan all projects.
         /// Repeated `-p` flags or comma list (`-p a,b`) form a union.
@@ -1777,8 +1935,10 @@ enum Commands {
         #[command(flatten)]
         filters: RetrievalFilters,
 
-        /// Filter by indexed document kind: conversations, plans, reports, other.
-        #[arg(long, value_parser = ["conversations", "conversation", "plans", "plan", "reports", "report", "other"])]
+        /// Filter by indexed document kind: conversations, plans, reports,
+        /// other — or a distilled card.v3 axis: `decision` (documents whose
+        /// session distilled at least one decision candidate).
+        #[arg(long, value_parser = ["conversations", "conversation", "plans", "plan", "reports", "report", "other", "decision", "decisions"])]
         kind: Option<String>,
 
         /// Search passages inside one catalog session instead of ranking sessions.
@@ -1834,7 +1994,7 @@ enum Commands {
     },
 
     /// Run local evaluation helpers for retrieval/search quality.
-    #[command(display_order = 13)]
+    #[command(hide = true, display_order = 13)]
     Eval {
         #[command(subcommand)]
         action: EvalAction,
@@ -1894,10 +2054,10 @@ enum Commands {
         #[arg(long)]
         full_rescan: bool,
 
-        /// Cache one readable conversation extract per indexed session under
-        /// `~/.aicx/extracts/`. Omit to keep content only in live sources and
-        /// Tantivy (zero filesystem content duplication).
-        #[arg(long)]
+        /// Compatibility no-op: extracts and the reuse ledger are always
+        /// written now, so a second `aicx index` re-parses only changed
+        /// sessions. Accepted so wizard and scripts keep working.
+        #[arg(long, hide = true)]
         cache_extracts: bool,
 
         /// Opt-in dense semantic generation: embed session extracts and publish
@@ -1918,7 +2078,7 @@ enum Commands {
     ///
     /// This closes the discover -> read loop: pass a path from `aicx search`,
     /// `aicx refs --emit paths`, dashboard `/api/chunk`, or MCP search results.
-    #[command(display_order = 14, visible_alias = "open")]
+    #[command(hide = true, display_order = 14, visible_alias = "open")]
     Read {
         /// Absolute path, archive-relative path, file name, legacy compact ref, or `chunk:<id>`
         reference: String,
@@ -1933,6 +2093,7 @@ enum Commands {
     },
 
     /// Retrieve chunks by metadata from the published CURRENT index.
+    #[command(hide = true)]
     Steer {
         /// Filter by run_id (exact match)
         #[arg(long)]
@@ -1965,6 +2126,7 @@ enum Commands {
     },
 
     /// Migrate legacy ~/.ai-contexters/ artifacts into the AICX legacy archive.
+    #[command(hide = true)]
     Migrate {
         /// Dry run: show what would be moved without modifying files
         #[arg(long)]
@@ -1995,7 +2157,7 @@ enum Commands {
     },
 
     /// Classify legacy archive chunks into 11-type intent entries and report counts.
-    #[command(name = "migrate-intent-schema")]
+    #[command(hide = true, name = "migrate-intent-schema")]
     MigrateIntentSchema {
         /// Strict project filter: `owner/repo`, `/repo` (cross-org repo
         /// name), `owner/` (org wildcard), or a unique exact `name`.
@@ -2174,11 +2336,11 @@ enum Commands {
     /// diagnostics write. Checks whose truth needs the recursive pass are
     /// reported with `"severity": "unknown"` plus the exact deep command
     /// (`aicx doctor --deep`); unknown is never upgraded to healthy.
-    #[command(display_order = 11)]
+    #[command(hide = true, display_order = 11)]
     Health,
 
     /// Warm/probe the configured local embedder before interactive search.
-    #[command(display_order = 15)]
+    #[command(hide = true, display_order = 15)]
     Warmup {
         /// Emit JSON instead of readable text
         #[arg(short = 'j', long)]
@@ -2432,6 +2594,14 @@ fn main() -> Result<()> {
     }
 
     let cli = Cli::parse();
+    if cli.help_full {
+        let mut full = full_help_command();
+        if let Err(error) = full.print_long_help() {
+            eprintln!("aicx: cannot render full help: {error}");
+            std::process::exit(2);
+        }
+        return Ok(());
+    }
 
     let diagnostics_state_dir = aicx::aicx_home::ensure().ok().map(|d| d.join("state"));
     let _ = aicx::diagnostics::init(cli.verbose, diagnostics_state_dir);
@@ -2579,7 +2749,16 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
             warn_incremental_legacy_flag(incremental);
             warn_pending_mutation("all");
             run_extraction(ExtractionParams {
-                agents: &["claude", "codex", "gemini", "junie", "grok", "codescribe"],
+                agents: &[
+                    "claude",
+                    "codex",
+                    "gemini",
+                    "junie",
+                    "grok",
+                    "kimi",
+                    "cursor",
+                    "codescribe",
+                ],
                 project,
                 hours,
                 output_dir: output.as_deref(),
@@ -2636,8 +2815,12 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
                         session,
                         file: input,
                         output,
-                        project,
+                        // The removed flag grammar only ever carried one -p.
+                        project: project.into_iter().collect(),
                         user_only,
+                        agent_only: false,
+                        user_commands: false,
+                        agent_commands: false,
                         max_message_chars: max_message_chars.unwrap_or(0),
                         conversation,
                         hours: 0,
@@ -2645,6 +2828,7 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
                         dialog: false,
                         lineage: None,
                         result: "none".to_string(),
+                        brief: false,
                     };
                     run_extract_target(extract_agent, args)?;
                     return Ok(());
@@ -2694,14 +2878,18 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
                     json,
                     aicx::cli::failure::StructuredFailure::new(
                         "missing_agent_subcommand",
-                        "extract requires an agent subcommand: codex | claude | gemini | grok | junie",
-                        "rerun as `aicx extract codex --session <id> --conversation` or `aicx extract codex --file <path> --conversation -o <path>`",
+                        "extract requires a target: all | codex | claude | cursor | gemini | grok | junie | kimi",
+                        "rerun as `aicx extract all`, `aicx extract codex --session <id> --conversation`, or `aicx extract codex --file <path> --conversation -o <path>`",
                     )
-                    .with_fallback("aicx extract codex --session <ID> --conversation"),
+                    .with_fallback("aicx extract all"),
                 );
                 std::process::exit(2);
             };
 
+            if let ExtractTarget::All(all_args) = target {
+                run_extract_all(all_args)?;
+                return Ok(());
+            }
             let (extract_agent, args) = target.split();
             run_extract_target(extract_agent, args)?;
         }
@@ -3149,7 +3337,7 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
             json,
             dry_run,
             full_rescan,
-            cache_extracts,
+            cache_extracts: _always_on,
             semantic,
         }) => match action {
             Some(IndexAction::Status { project, json }) => {
@@ -3170,15 +3358,7 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
                         "index"
                     });
                 }
-                run_index(
-                    &project,
-                    sample,
-                    json,
-                    dry_run,
-                    full_rescan,
-                    cache_extracts,
-                    semantic,
-                )?
+                run_index(&project, sample, json, dry_run, full_rescan, semantic)?
             }
         },
         Some(Commands::Config { action }) => {
@@ -3630,7 +3810,7 @@ fn load_session_claims(
     )?;
     // Claims / results / clarify lanes read every role and kind: full view,
     // still one `ProjectionSpec`, never a bare `true`.
-    let entries = parse_selected_source_once(&handle, &ProjectionSpec::full())?;
+    let entries = parse_selected_source_once(&handle, &ProjectionSpec::full(), Utc::now())?;
     if entries.is_empty() {
         anyhow::bail!(
             "no entries for session '{session}' (agent {agent_str}, source {}); the source parsed empty within --hours {hours}",
@@ -4117,8 +4297,10 @@ const CURRENT_SESSION_ENV_KEYS: &[(&str, Option<&str>)] = &[
     ("CODEX_SESSION_ID", Some("codex")),
     ("CLAUDE_SESSION_ID", Some("claude")),
     ("CLAUDE_CODE_SESSION_ID", Some("claude")),
+    ("CURSOR_CONVERSATION_ID", Some("cursor")),
     ("GEMINI_SESSION_ID", Some("gemini")),
     ("JUNIE_SESSION_ID", Some("junie")),
+    ("KIMI_SESSION_ID", Some("kimi")),
     ("GROK_SESSION_ID", Some("grok")),
     ("GROK_THREAD_ID", Some("grok")),
 ];
@@ -4208,6 +4390,11 @@ fn current_session_from_disk() -> Result<Option<CurrentSessionPayload>> {
         &home.join(".codex").join("sessions"),
         Some(modified_after),
     ));
+    discovered.extend(sessions::discover_cursor_sessions(
+        &home.join(".cursor").join("projects"),
+        Some(modified_after),
+        Some(&here),
+    ));
     discovered.extend(sessions::discover_gemini_sessions(
         &home.join(".gemini").join("tmp"),
         Some(modified_after),
@@ -4294,6 +4481,13 @@ fn run_sessions_list(
             modified_after,
         ));
     }
+    if want_agent.is_none_or(|a| a == "cursor" || a == "cursor-agent") {
+        discovered.extend(sessions::discover_cursor_sessions(
+            &home.join(".cursor").join("projects"),
+            modified_after,
+            here.as_deref(),
+        ));
+    }
     if want_agent.is_none_or(|a| a == "gemini") {
         discovered.extend(sessions::discover_gemini_sessions(
             &home.join(".gemini").join("tmp"),
@@ -4314,6 +4508,15 @@ fn run_sessions_list(
         // against the recorded CurrentDirectoryUpdatedEvent cwd afterwards.
         discovered.extend(sessions::discover_junie_sessions(
             &home.join(".junie").join("sessions"),
+            modified_after,
+        ));
+    }
+    if want_agent.is_none_or(|a| a == "kimi") {
+        // Kimi encodes the workspace in the `wd_<slug>_<hex>` grandparent
+        // dir; the slug is lossy (dashes inside path components), so --cwd
+        // filtering stays on the post-discovery select_sessions pass.
+        discovered.extend(sessions::discover_kimi_sessions(
+            &home.join(".kimi-code").join("sessions"),
             modified_after,
         ));
     }
@@ -4562,7 +4765,7 @@ fn run_source_protect(
 }
 
 fn run_git(root: &Path, args: &[&str]) -> Result<()> {
-    let output = ProcessCommand::new("git")
+    let output = aicx::git_env::git_command_isolated()
         .arg("-C")
         .arg(root)
         .args(args)
@@ -4607,7 +4810,7 @@ fn add_source_protection_gitignore(root: &Path) -> Result<()> {
 
 fn create_initial_source_snapshot(root: &Path) -> Result<()> {
     run_git(root, &["add", "-A"])?;
-    let diff_status = ProcessCommand::new("git")
+    let diff_status = aicx::git_env::git_command_isolated()
         .arg("-C")
         .arg(root)
         .args(["diff", "--cached", "--quiet"])
@@ -4699,7 +4902,7 @@ fn resolve_intents_project_filters_at(
 /// already-persisted bucket to query.
 fn current_checkout_project() -> Result<String> {
     let cwd = std::env::current_dir().context("resolve current checkout directory")?;
-    let output = ProcessCommand::new("git")
+    let output = aicx::git_env::git_command_isolated()
         .arg("-C")
         .arg(&cwd)
         .args(["remote", "get-url", "origin"])
@@ -5503,7 +5706,8 @@ fn run_tail(
             let mut records = extraction.records;
             // Apply filtering identical to run_intents
             if let Some(agent_filter) = &filters.agent {
-                records.retain(|r| r.agent == *agent_filter);
+                let want = aicx::search_engine::canonical_agent_slug(agent_filter);
+                records.retain(|r| r.agent == want);
             }
             let (lo, hi) = if let Some(ref d) = filters.since {
                 (
@@ -5575,6 +5779,13 @@ struct ExtractFileOptions {
     /// `include_assistant` / `max_message_chars` above are the legacy axes
     /// the same flags also feed; the spec is what the render paths consult.
     projection: ProjectionSpec,
+    /// `--brief`: distilled handoff rendering instead of the timeline
+    /// projection (W2-01; brief and card read the same distillate).
+    brief: bool,
+    /// `now` captured once when the command started. Every session, and every
+    /// `--lineage` parent, is windowed against this same instant — re-reading
+    /// the clock per parse would give a long run a drifting `-H` boundary.
+    cutoff: DateTime<Utc>,
 }
 
 /// Resolve the default output path for `aicx extract --session ...`:
@@ -6052,28 +6263,24 @@ fn parse_lineage_depth(raw: Option<&str>) -> Result<Option<usize>, String> {
 fn projection_spec_for_extract(
     args: &ExtractAgentArgs,
 ) -> Result<ProjectionSpec, aicx::cli::failure::StructuredFailure> {
-    let mut spec = conv::spec_for_user_only(args.user_only);
-    if !args.kind.is_empty() {
-        spec.kinds = conv::parse_kind_tokens(&args.kind).map_err(|reason| {
-            aicx::cli::failure::StructuredFailure::new(
-                "invalid_kind_token",
-                reason,
-                "pass throne kinds: human, echo_seal, shell_action, inject, assistant_final, lineage_meta, inter_agent",
-            )
-        })?;
-        // A lane carries its speaker: `--kind inter_agent` opens the system
-        // role, `--kind human` closes the assistant one. `--user-only` still
-        // narrows to human speech afterwards.
-        let implied = conv::roles_for_kinds(&spec.kinds);
-        spec.roles = if args.user_only {
-            implied
-                .into_iter()
-                .filter(|role| *role == ProjectionRole::Human)
-                .collect()
-        } else {
-            implied
-        };
-    }
+    let mut spec = ProjectionSpec::default();
+    // One resolver for `extract <agent>` and `extract all`: the words mean the
+    // same thing on both surfaces, and a contradiction is refused loudly
+    // instead of returning a silently empty projection.
+    conv::apply_axis_flags(
+        &mut spec,
+        &conv::AxisFlags {
+            user_only: args.user_only,
+            agent_only: args.agent_only,
+            user_commands: args.user_commands,
+            agent_commands: args.agent_commands,
+            kinds: args.kind.clone(),
+            conversation: args.conversation,
+        },
+    )
+    .map_err(|conflict| {
+        aicx::cli::failure::StructuredFailure::new(conflict.code, conflict.message, conflict.fix)
+    })?;
     spec.dialog = args.dialog;
     spec.result = conv::parse_result_body_token(&args.result).map_err(|reason| {
         aicx::cli::failure::StructuredFailure::new(
@@ -6095,8 +6302,20 @@ fn projection_spec_for_extract(
         since: None,
         until: None,
     };
-    spec.project = args.project.iter().cloned().collect();
+    spec.project = args.project.clone();
     Ok(spec)
+}
+
+/// The output's project identity label from a repeatable `-p`.
+///
+/// Exactly one filter names the identity unambiguously. With several, the
+/// label is left to inference from the entries themselves — asserting the
+/// first one would silently pick a winner the operator never chose.
+fn single_project_label(projects: &[String]) -> Option<String> {
+    match projects {
+        [only] => Some(only.clone()),
+        _ => None,
+    }
 }
 
 /// Dispatch one canonical `aicx extract <agent> ...` invocation.
@@ -6105,6 +6324,8 @@ fn projection_spec_for_extract(
 /// locate-before-parse) or `--file <path>` (direct handle, no discovery).
 fn run_extract_target(agent: ExtractAgent, args: ExtractAgentArgs) -> Result<()> {
     let json = aicx::cli::failure::want_json_envelope(false);
+    // One clock read for the whole command (Decision 4).
+    let cutoff = Utc::now();
     let projection = match projection_spec_for_extract(&args) {
         Ok(spec) => spec,
         Err(failure) => {
@@ -6122,29 +6343,32 @@ fn run_extract_target(agent: ExtractAgent, args: ExtractAgentArgs) -> Result<()>
         redact_secrets: args.redaction.redact_secrets,
         conversation: args.conversation,
         projection,
+        brief: args.brief,
+        cutoff,
     };
     match (args.session, args.file) {
         (Some(session), None) => {
-            run_extract_session(agent, &session, args.output, args.project, options)
+            let label = single_project_label(&args.project);
+            run_extract_session(agent, &session, args.output, label, options)
         }
         (None, Some(file)) => {
-            let Some(output) = args.output else {
-                aicx::cli::failure::emit_and_error(
-                    &format!("aicx extract {}", agent.label()),
-                    json,
-                    aicx::cli::failure::StructuredFailure::new(
-                        "output_path_required",
-                        "--file extraction requires -o/--output <FILE>",
-                        "add -o /path/to/out.md to write the extracted markdown",
-                    )
-                    .with_fallback(format!(
-                        "aicx extract {} --file <path> --conversation -o <path>",
-                        agent.label()
-                    )),
-                );
-                std::process::exit(2);
+            // Same default as `--session`: without -o the extract lands in the
+            // central store, `<AICX_HOME>/extracts/<agent>/<source_id>[…].md`,
+            // keyed by the file's own identity (stem plus a short path hash,
+            // or the Grok session-dir UUID). An explicit -o keeps direct-file
+            // mode free of any global AICX state, which the C7H compact-recall
+            // contract relies on.
+            let output = match args.output {
+                Some(path) => path,
+                None => default_session_extract_path_for(
+                    agent.label(),
+                    &default_output_source_id(agent, &file),
+                    options.conversation,
+                    !options.include_assistant,
+                )?,
             };
-            run_extract_direct_file(agent, file, output, args.project, options)
+            let label = single_project_label(&args.project);
+            run_extract_direct_file(agent, file, output, label, options)
         }
         _ => {
             aicx::cli::failure::emit_and_error(
@@ -6163,6 +6387,590 @@ fn run_extract_target(agent: ExtractAgent, args: ExtractAgentArgs) -> Result<()>
             std::process::exit(2);
         }
     }
+}
+
+/// Run `aicx extract all`: one incremental projection pass over every
+/// compatible source on this machine.
+///
+/// Call chain per source:
+/// `SessionCatalog::scan` -> `source_handle_for_file` -> `parse_handle`
+/// -> `timeline_entries_from_model` -> `fold_shell_results`
+/// -> `apply_projection_at(cutoff)` -> `write_extract_outputs`.
+///
+/// Everything the pass decides is recorded in the manifest, including the
+/// sources it deliberately did nothing to.
+fn run_extract_all(args: ExtractAllArgs) -> Result<()> {
+    use aicx::extraction::bulk;
+
+    let json_failure = aicx::cli::failure::want_json_envelope(false);
+    // Decision 4: one clock read, shared by every session in the run.
+    let cutoff = Utc::now();
+
+    let agents = match resolve_bulk_agents(&args.provider) {
+        Ok(agents) => agents,
+        Err(failure) => {
+            aicx::cli::failure::emit_and_error("aicx extract all", json_failure, failure);
+            std::process::exit(2);
+        }
+    };
+
+    let projection = match projection_spec_for_extract_all(&args) {
+        Ok(spec) => spec,
+        Err(failure) => {
+            aicx::cli::failure::emit_and_error("aicx extract all", json_failure, failure);
+            std::process::exit(2);
+        }
+    };
+
+    let extracts_root = match &args.output {
+        Some(dir) => dir.clone(),
+        None => aicx::aicx_home::ensure()?.join("extracts"),
+    };
+    let projection_fingerprint = bulk::projection_fingerprint(&projection, args.conversation);
+    let mut state = bulk::load_state(&extracts_root);
+    let mut rows: Vec<bulk::ManifestEntry> = Vec::new();
+
+    let options = ExtractFileOptions {
+        include_assistant: !args.user_only,
+        max_message_chars: args.max_message_chars,
+        redact_secrets: args.redaction.redact_secrets,
+        conversation: args.conversation,
+        projection: projection.clone(),
+        brief: false,
+        cutoff,
+    };
+
+    for agent in &agents {
+        let extract_agent = bulk_agent_to_extract_agent(*agent);
+        let home = aicx::os_user_home().context("No home dir")?;
+        let root = extract_agent.session_root(&home);
+        if !root.is_dir() {
+            // A provider that never ran on this host contributes zero sources.
+            // That is not "unsupported" and not a failure — it is silence, and
+            // the manifest shows it as an absent provider rather than a lie.
+            eprintln!(
+                "extract all: {agent}: no session root at {} (provider never used here)",
+                root.display()
+            );
+            continue;
+        }
+        let sources = match aicx::session_catalog::SessionCatalog::new(*agent, &root) {
+            Ok(catalog) => match catalog.scan_with_stats().result {
+                Ok(sources) => sources,
+                Err(error) => {
+                    eprintln!("extract all: {agent}: catalog scan failed: {error}");
+                    rows.push(bulk::ManifestEntry {
+                        provider: agent.to_string(),
+                        source_id: format!("<{agent}-catalog>"),
+                        logical_session_id: None,
+                        source_path: root.display().to_string(),
+                        source_fingerprint: String::new(),
+                        parser_version: parser_version_for(*agent).to_owned(),
+                        outcome: bulk::SourceOutcome::Failed {
+                            reason: error.to_string(),
+                            recover: format!("aicx catalog rebuild --agent {agent}"),
+                        },
+                    });
+                    continue;
+                }
+            },
+            Err(error) => {
+                rows.push(bulk::ManifestEntry {
+                    provider: agent.to_string(),
+                    source_id: format!("<{agent}-catalog>"),
+                    logical_session_id: None,
+                    source_path: root.display().to_string(),
+                    source_fingerprint: String::new(),
+                    parser_version: parser_version_for(*agent).to_owned(),
+                    outcome: bulk::SourceOutcome::Failed {
+                        reason: error.to_string(),
+                        recover: format!("aicx catalog rebuild --agent {agent}"),
+                    },
+                });
+                continue;
+            }
+        };
+
+        eprintln!(
+            "extract all: {agent}: {} source(s) discovered under {}",
+            sources.len(),
+            root.display()
+        );
+
+        for source in sources {
+            let row = extract_one_source_for_bulk(
+                extract_agent,
+                *agent,
+                &source,
+                &options,
+                &extracts_root,
+                &projection_fingerprint,
+                &mut state,
+                args.rebuild,
+                args.dry_run,
+            );
+            rows.push(row);
+        }
+    }
+
+    let filters = bulk::ManifestFilters {
+        roles: projection
+            .roles
+            .iter()
+            .map(|role| role.as_cli_token().to_owned())
+            .collect(),
+        kinds: projection
+            .kinds
+            .iter()
+            .map(|kind| kind.as_cli_token().to_owned())
+            .collect(),
+        shell_executors: projection
+            .shell_executors
+            .iter()
+            .map(|executor| executor.as_str().to_owned())
+            .collect(),
+        projects: projection.project.clone(),
+        hours: projection.window.hours,
+        result_body: args.result.clone(),
+        conversation: args.conversation,
+        cutoff_utc: cutoff.to_rfc3339(),
+        projection_fingerprint: projection_fingerprint.clone(),
+    };
+    let manifest = bulk::build_manifest(cutoff, &agents, filters, rows);
+    debug_assert!(
+        manifest.totals.reconciles(),
+        "every discovered source must land in exactly one bucket"
+    );
+
+    if !args.dry_run {
+        bulk::save_state(&extracts_root, &state)?;
+        let manifest_path = bulk::save_manifest(&extracts_root, &manifest)?;
+        eprintln!("extract all: manifest -> {}", manifest_path.display());
+    }
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&manifest)?);
+    } else {
+        print_bulk_summary(&manifest, &extracts_root, args.dry_run);
+    }
+
+    let code = manifest.exit_code();
+    if code != 0 {
+        // Partial is never overall success: automation must be able to see
+        // "some sources are broken" without parsing prose.
+        eprintln!(
+            "extract all: PARTIAL — {} of {} selected source(s) failed (exit {code})",
+            manifest.totals.failed, manifest.totals.selected
+        );
+        std::process::exit(code);
+    }
+    Ok(())
+}
+
+/// Human-readable run summary on stdout: the useful result, not diagnostics.
+fn print_bulk_summary(
+    manifest: &aicx::extraction::bulk::BulkManifest,
+    extracts_root: &Path,
+    dry_run: bool,
+) {
+    use aicx::extraction::bulk::SourceOutcome;
+    let totals = &manifest.totals;
+    if dry_run {
+        println!("aicx extract all — DRY RUN (nothing written)");
+    }
+    println!(
+        "discovered {} · extracted {} · unchanged {} · empty-after-filter {} · filtered-out {} · unsupported {} · failed {}",
+        totals.discovered,
+        totals.extracted,
+        totals.unchanged,
+        totals.empty_after_filter,
+        totals.filtered_out,
+        totals.unsupported,
+        totals.failed
+    );
+    if totals.discovered == 0 {
+        println!(
+            "no sessions found for the requested agents — this is an empty archive, not an error"
+        );
+        return;
+    }
+    for row in &manifest.entries {
+        if let SourceOutcome::Extracted {
+            output_path,
+            entries,
+        } = &row.outcome
+        {
+            println!(
+                "{}\t{}\t{entries} entries\t{output_path}",
+                row.provider, row.source_id
+            );
+        }
+    }
+    for row in &manifest.entries {
+        if let SourceOutcome::Failed { reason, recover } = &row.outcome {
+            println!(
+                "FAILED\t{}\t{}\t{reason}\n  recover: {recover}",
+                row.provider, row.source_id
+            );
+        }
+    }
+    // Unsupported sources get a bounded per-provider rollup, never a path
+    // dump: on a real archive this bucket is dominated by log and checkpoint
+    // files that merely live in the provider's directory, and printing 32 of
+    // them would bury the failures directly above. The manifest holds the
+    // paths.
+    let mut unsupported_by_provider: BTreeMap<&str, u64> = BTreeMap::new();
+    for row in &manifest.entries {
+        if matches!(row.outcome, SourceOutcome::Unsupported { .. }) {
+            *unsupported_by_provider
+                .entry(row.provider.as_str())
+                .or_default() += 1;
+        }
+    }
+    for (provider, count) in unsupported_by_provider {
+        println!(
+            "unsupported\t{provider}\t{count} source(s) held nothing the adapter claims as a conversation (paths in the manifest)"
+        );
+    }
+    if !dry_run {
+        println!(
+            "manifest: {}",
+            extracts_root
+                .join("_bulk")
+                .join("manifest-latest.json")
+                .display()
+        );
+    }
+}
+
+/// Adapter version string reported in the manifest and used as half of the
+/// incremental cache key: a parser change invalidates cached extracts.
+fn parser_version_for(agent: aicx::session_catalog::AgentKind) -> &'static str {
+    aicx::parser::adapters::registered_adapter(bulk_agent_to_parser_agent(agent)).adapter_version()
+}
+
+const fn bulk_agent_to_parser_agent(
+    agent: aicx::session_catalog::AgentKind,
+) -> aicx::parser::engine::AgentKind {
+    match agent {
+        aicx::session_catalog::AgentKind::Claude => aicx::parser::engine::AgentKind::Claude,
+        aicx::session_catalog::AgentKind::Codex => aicx::parser::engine::AgentKind::Codex,
+        aicx::session_catalog::AgentKind::Gemini => aicx::parser::engine::AgentKind::Gemini,
+        aicx::session_catalog::AgentKind::Grok => aicx::parser::engine::AgentKind::Grok,
+        aicx::session_catalog::AgentKind::Junie => aicx::parser::engine::AgentKind::Junie,
+        aicx::session_catalog::AgentKind::Kimi => aicx::parser::engine::AgentKind::Kimi,
+        aicx::session_catalog::AgentKind::Cursor => aicx::parser::engine::AgentKind::Cursor,
+    }
+}
+
+const fn bulk_agent_to_extract_agent(agent: aicx::session_catalog::AgentKind) -> ExtractAgent {
+    match agent {
+        aicx::session_catalog::AgentKind::Claude => ExtractAgent::Claude,
+        aicx::session_catalog::AgentKind::Codex => ExtractAgent::Codex,
+        aicx::session_catalog::AgentKind::Gemini => ExtractAgent::Gemini,
+        aicx::session_catalog::AgentKind::Grok => ExtractAgent::Grok,
+        aicx::session_catalog::AgentKind::Junie => ExtractAgent::Junie,
+        aicx::session_catalog::AgentKind::Kimi => ExtractAgent::Kimi,
+        aicx::session_catalog::AgentKind::Cursor => ExtractAgent::Cursor,
+    }
+}
+
+/// `--provider` selection, or every registered provider when absent.
+fn resolve_bulk_agents(
+    requested: &[String],
+) -> Result<Vec<aicx::session_catalog::AgentKind>, aicx::cli::failure::StructuredFailure> {
+    use aicx::extraction::bulk::ALL_AGENTS;
+    if requested.is_empty() {
+        return Ok(ALL_AGENTS.to_vec());
+    }
+    let mut agents = Vec::with_capacity(requested.len());
+    for token in requested {
+        let token = token.trim();
+        if token.is_empty() {
+            continue;
+        }
+        let Some(agent) = ExtractAgent::from_str(token) else {
+            return Err(aicx::cli::failure::StructuredFailure::new(
+                "unknown_provider",
+                format!("`{token}` is not a supported provider"),
+                "pass one of: claude, codex, gemini, grok, junie, kimi",
+            ));
+        };
+        let agent = agent.catalog_kind();
+        if !agents.contains(&agent) {
+            agents.push(agent);
+        }
+    }
+    if agents.is_empty() {
+        return Err(aicx::cli::failure::StructuredFailure::new(
+            "empty_provider_selection",
+            "--provider was given but selected no provider",
+            "drop --provider to select every provider, or name at least one",
+        ));
+    }
+    Ok(agents)
+}
+
+/// The bulk spec: same axis resolver as the per-agent form, so the flags
+/// cannot mean two different things on two surfaces.
+fn projection_spec_for_extract_all(
+    args: &ExtractAllArgs,
+) -> Result<ProjectionSpec, aicx::cli::failure::StructuredFailure> {
+    let mut spec = ProjectionSpec::default();
+    conv::apply_axis_flags(
+        &mut spec,
+        &conv::AxisFlags {
+            user_only: args.user_only,
+            agent_only: args.agent_only,
+            user_commands: args.user_commands,
+            agent_commands: args.agent_commands,
+            kinds: args.kind.clone(),
+            conversation: args.conversation,
+        },
+    )
+    .map_err(|conflict| {
+        aicx::cli::failure::StructuredFailure::new(conflict.code, conflict.message, conflict.fix)
+    })?;
+    spec.result = conv::parse_result_body_token(&args.result).map_err(|reason| {
+        aicx::cli::failure::StructuredFailure::new(
+            "invalid_result_token",
+            reason,
+            "use --result none | head=N | full",
+        )
+    })?;
+    spec.max_message_chars = args.max_message_chars;
+    spec.window = ProjectionWindow {
+        hours: (args.hours > 0).then_some(args.hours),
+        since: None,
+        until: None,
+    };
+    spec.project = args.project.clone();
+    Ok(spec)
+}
+
+/// One source, start to finish, never propagating a failure out of the batch.
+#[allow(clippy::too_many_arguments)]
+fn extract_one_source_for_bulk(
+    extract_agent: ExtractAgent,
+    agent: aicx::session_catalog::AgentKind,
+    source: &aicx::session_catalog::CatalogSource,
+    options: &ExtractFileOptions,
+    extracts_root: &Path,
+    projection_fingerprint: &str,
+    state: &mut aicx::extraction::bulk::BulkState,
+    rebuild: bool,
+    dry_run: bool,
+) -> aicx::extraction::bulk::ManifestEntry {
+    use aicx::extraction::bulk::{self, ManifestEntry, SourceOutcome};
+
+    let provider = agent.to_string();
+    let parser_version = parser_version_for(agent).to_owned();
+    let source_fingerprint = bulk::source_fingerprint(
+        source.fingerprint.len,
+        source.fingerprint.modified_unix_nanos,
+    );
+    let row = |outcome: SourceOutcome| ManifestEntry {
+        provider: provider.clone(),
+        source_id: source.source_id.clone(),
+        logical_session_id: source.logical_session_id.clone(),
+        source_path: source.path.display().to_string(),
+        source_fingerprint: source_fingerprint.clone(),
+        parser_version: parser_version.clone(),
+        outcome,
+    };
+
+    // Deduction before work: an mtime older than the `-H` lower bound proves
+    // the source cannot hold an in-window event, so it is neither opened nor
+    // cached. Recorded with its proof so the manifest does not conflate it
+    // with "parsed and found nothing".
+    if bulk::window_proves_empty(
+        source.fingerprint.modified_unix_nanos,
+        options.projection.window.hours,
+        options.cutoff,
+    ) {
+        return row(SourceOutcome::EmptyAfterFilter {
+            reason: bulk::EMPTY_BY_WINDOW_PROOF.to_owned(),
+        });
+    }
+
+    let output_path = bulk_output_path(
+        extracts_root,
+        extract_agent.label(),
+        &source.source_id,
+        options,
+        projection_fingerprint,
+    );
+    let key = bulk::state_key(&provider, &source.source_id, projection_fingerprint);
+
+    // Incremental skip: same bytes, same parser, same view, output still there.
+    if !rebuild
+        && let Some(previous) = state.entries.get(&key)
+        && previous.source_fingerprint == source_fingerprint
+        && previous.parser_version == parser_version
+        && Path::new(&previous.output_path).exists()
+    {
+        return row(SourceOutcome::Unchanged {
+            output_path: previous.output_path.clone(),
+        });
+    }
+
+    // Handle construction is the structural support boundary: a shape the
+    // engine has no framing for is unsupported, not broken.
+    let handle = match aicx::parser_dispatch::source_handle_for_file(
+        extract_agent.parser_kind(),
+        &source.source_id,
+        source.logical_session_id.clone(),
+        &source.path,
+    ) {
+        Ok(handle) => handle,
+        Err(error) => {
+            return row(SourceOutcome::Unsupported {
+                reason: one_line(&error.to_string()),
+            });
+        }
+    };
+
+    let parsed = match parse_selected_source_with_basis(
+        &handle,
+        &options.projection,
+        options.cutoff,
+    ) {
+        Ok(parsed) => parsed,
+        Err(refusal) => {
+            let text = refusal.to_string();
+            // Handle construction (above) is only the *shape* boundary: a
+            // `.json` under a provider directory gets a handle whatever it
+            // holds. Whether the adapter ever claimed the payload as its
+            // own is a separate question, and only its coverage ledger can
+            // answer it — see `ParseRefusal::is_structural_non_match`.
+            if refusal.is_structural_non_match() {
+                let (raw, _, skipped) = refusal.evidence().unwrap_or((0, 0, String::new()));
+                return row(SourceOutcome::Unsupported {
+                    reason: format!(
+                        "not a {} conversation: 0 of {raw} raw unit(s) claimed by the adapter ({skipped})",
+                        extract_agent.label()
+                    ),
+                });
+            }
+            let in_flight = aicx::extraction::is_in_flight_failure(
+                source.fingerprint.modified_unix_nanos,
+                &text,
+            );
+            // Publish how far the adapter actually got, so triage never
+            // has to re-run the parse to find out.
+            let progress = refusal
+                .evidence()
+                .map(|(raw, consumed, skipped)| {
+                    let trail = if skipped.is_empty() {
+                        String::new()
+                    } else {
+                        format!("; skipped {skipped}")
+                    };
+                    format!(" ({consumed} of {raw} raw unit(s) consumed{trail})")
+                })
+                .unwrap_or_default();
+            let reason = if in_flight {
+                format!(
+                    "in-flight: source is still being written ({}){progress}",
+                    one_line(&text)
+                )
+            } else {
+                format!("{}{progress}", one_line(&text))
+            };
+            return row(SourceOutcome::Failed {
+                reason,
+                recover: format!(
+                    "aicx extract {} --file '{}' --conversation -o <output>",
+                    extract_agent.label(),
+                    source.path.display()
+                ),
+            });
+        }
+    };
+
+    if parsed.entries.is_empty() {
+        return row(SourceOutcome::EmptyAfterFilter {
+            reason: bulk::EMPTY_AFTER_PROJECTION.to_owned(),
+        });
+    }
+
+    if dry_run {
+        return row(SourceOutcome::Extracted {
+            output_path: output_path.display().to_string(),
+            entries: parsed.entries.len(),
+        });
+    }
+
+    let entries = parsed.entries.len();
+    let render = ExtractRender {
+        agent: extract_agent,
+        entries: parsed.entries,
+        sessions: Some(vec![source.source_id.clone()]),
+        explicit_project: single_project_label(&options.projection.project),
+        fallback_identity: format!("{}/{}", extract_agent.label(), source.source_id),
+        output_path: output_path.clone(),
+        options: ExtractFileOptions {
+            projection: options.projection.clone(),
+            ..*options
+        },
+    };
+    match write_extract_outputs(render) {
+        Ok(()) => {
+            state.schema = bulk::BULK_STATE_SCHEMA.to_owned();
+            state.entries.insert(
+                key,
+                bulk::BulkStateEntry {
+                    source_fingerprint: source_fingerprint.clone(),
+                    parser_version: parser_version.clone(),
+                    output_path: output_path.display().to_string(),
+                    extracted_at: options.cutoff.to_rfc3339(),
+                },
+            );
+            row(SourceOutcome::Extracted {
+                output_path: output_path.display().to_string(),
+                entries,
+            })
+        }
+        Err(error) => row(SourceOutcome::Failed {
+            reason: one_line(&error.to_string()),
+            recover: format!(
+                "aicx extract {} --file '{}' --conversation -o <output>",
+                extract_agent.label(),
+                source.path.display()
+            ),
+        }),
+    }
+}
+
+/// Where one bulk extract lands.
+///
+/// The projection fingerprint is appended whenever the view is narrower than
+/// the razor default, so `--agent-only` and `--user-commands` runs over the
+/// same session never overwrite each other's file.
+fn bulk_output_path(
+    extracts_root: &Path,
+    agent_label: &str,
+    session_id: &str,
+    options: &ExtractFileOptions,
+    projection_fingerprint: &str,
+) -> PathBuf {
+    let user_only = !options.include_assistant;
+    let default_fingerprint = aicx::extraction::bulk::projection_fingerprint(
+        &ProjectionSpec::default(),
+        options.conversation,
+    );
+    let extra = (projection_fingerprint != default_fingerprint).then_some(projection_fingerprint);
+    let stem = aicx::extraction::bulk::variant_stem(
+        &safe_session_extract_stem(session_id),
+        options.conversation,
+        user_only,
+        extra,
+    );
+    extracts_root.join(agent_label).join(format!("{stem}.md"))
+}
+
+fn one_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Map a catalog resolution failure into the structured CLI failure surface.
@@ -6239,6 +7047,46 @@ fn source_handle_for_file(
 
 /// For Grok `…/<uuid>/chat_history.jsonl`, prefer the parent directory UUID as
 /// the source identity instead of the filename stem `chat_history`.
+/// Identity of a direct-file source: the Grok session-dir UUID when the file is
+/// `chat_history.jsonl` (the stem alone would be the meaningless
+/// `chat_history`), otherwise the file stem. Shared by the parse path and the
+/// default output path so both name the same session.
+fn direct_source_id(agent: ExtractAgent, input: &Path) -> String {
+    grok_direct_source_id(agent, input).unwrap_or_else(|| {
+        input
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .filter(|stem| !stem.is_empty())
+            .unwrap_or("direct-source")
+            .to_string()
+    })
+}
+
+/// Central-store identity for `--file` without `-o`. The direct source id is
+/// a bare file stem for non-Grok inputs, so two different files with the same
+/// stem (`/tmp/foo/session.jsonl`, `/tmp/bar/session.jsonl`) would map to the
+/// same central-store path and the later run would silently overwrite the
+/// earlier extract. Suffix a short stable hash of the canonical path so
+/// distinct files keep distinct extracts while re-extracting the same file
+/// still lands on the same path. Grok's session-dir UUID is already unique
+/// and stays unsuffixed.
+fn default_output_source_id(agent: ExtractAgent, input: &Path) -> String {
+    if let Some(uuid) = grok_direct_source_id(agent, input) {
+        return uuid;
+    }
+    let stem = direct_source_id(agent, input);
+    let canonical = input.canonicalize().unwrap_or_else(|_| input.to_path_buf());
+    // FNV-1a, folded to 32 bits: stable across releases and platforms,
+    // unlike `DefaultHasher`.
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in canonical.as_os_str().as_encoded_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    let short = (hash as u32) ^ ((hash >> 32) as u32);
+    format!("{stem}-{short:08x}")
+}
+
 fn grok_direct_source_id(agent: ExtractAgent, path: &Path) -> Option<String> {
     if agent != ExtractAgent::Grok {
         return None;
@@ -6285,8 +7133,11 @@ fn grok_direct_source_id(agent: ExtractAgent, path: &Path) -> Option<String> {
 fn parse_selected_source_once(
     handle: &aicx::parser::engine::SourceHandle,
     projection: &ProjectionSpec,
+    cutoff: DateTime<Utc>,
 ) -> Result<Vec<timeline::TimelineEntry>> {
-    parse_selected_source_with_basis(handle, projection).map(|parsed| parsed.entries)
+    parse_selected_source_with_basis(handle, projection, cutoff)
+        .map(|parsed| parsed.entries)
+        .map_err(anyhow::Error::from)
 }
 
 /// The projected entries of one source plus the evidence a typed refusal
@@ -6339,8 +7190,9 @@ impl ProjectedSource {
 fn parse_selected_source_with_basis(
     handle: &aicx::parser::engine::SourceHandle,
     projection: &ProjectionSpec,
-) -> Result<ProjectedSource> {
-    let session = aicx::parser_dispatch::parse_handle(handle)?;
+    cutoff: DateTime<Utc>,
+) -> std::result::Result<ProjectedSource, aicx::parser_dispatch::ParseRefusal> {
+    let session = aicx::parser_dispatch::parse_handle_detailed(handle)?;
     let model = session.model();
     let entries = aicx::output::timeline_entries_from_model(model);
     let turns_before_filter = entries.len() as u64;
@@ -6348,7 +7200,7 @@ fn parse_selected_source_with_basis(
     // head / full rendering is one entry), then the spec decides what stays.
     // No role-string reducer here (W2-T13).
     let mut entries = conv::fold_shell_results(entries, projection);
-    conv::apply_projection(&mut entries, projection);
+    conv::apply_projection_at(&mut entries, projection, cutoff);
     Ok(ProjectedSource {
         entries,
         agent: model.provenance.agent,
@@ -6598,7 +7450,21 @@ fn run_extract_session(
     // agents stay single-artifact.
     debug_assert!(!handle.artifacts().is_empty());
 
-    let mut entries = parse_selected_source_once(&handle, &options.projection)?;
+    if options.brief {
+        let output = match output {
+            Some(path) => path,
+            None => {
+                let stem = format!(
+                    "{}_brief",
+                    safe_session_extract_stem(&resolved.source.source_id)
+                );
+                default_session_extract_path_for_stem(agent.label(), &stem)?
+            }
+        };
+        return run_extract_brief(&handle, &output, options.redact_secrets);
+    }
+
+    let mut entries = parse_selected_source_once(&handle, &options.projection, options.cutoff)?;
     if entries.is_empty() {
         anyhow::bail!(
             "Resolved session `{}` to `{}`, but no entries were extractable from {} for agent `{}`.",
@@ -6640,7 +7506,8 @@ fn run_extract_session(
                 hop.source.logical_session_id.clone(),
                 &hop.source.path,
             )?;
-            let parent_entries = parse_selected_source_once(&parent_handle, &options.projection)?;
+            let parent_entries =
+                parse_selected_source_once(&parent_handle, &options.projection, options.cutoff)?;
             let parent_ref = graph
                 .node(&hop.node_id)
                 .map(|node| node.conversation.clone())
@@ -6721,6 +7588,43 @@ fn run_extract_session(
 
 /// Run `aicx extract <agent> --file <path> -o <out>`: direct handle from the
 /// supplied path, no catalog scan, no global AICX state, single parse pass.
+/// `extract … --brief`: parse once to the [`SessionModel`], distill through
+/// the agent's registered lane (`GenericLane` fail-open for lanes that have
+/// not landed), and write the inverted-pyramid brief. The distillate values
+/// are the same ones the card/index materialization consumes — one
+/// implementation, two consumers (`docs/DISTILL_CONTRACT.md`).
+fn run_extract_brief(
+    handle: &aicx::parser::engine::SourceHandle,
+    output: &Path,
+    redact: bool,
+) -> Result<()> {
+    let session = aicx::parser_dispatch::parse_handle(handle)?;
+    let model = session.into_model();
+    let registry = aicx::extraction::distill::LaneRegistry::with_default_lanes();
+    let lane = registry.lane_for(model.provenance.agent);
+    let distillates = lane.distill(&model);
+    let brief = aicx::extraction::brief::render_brief(&model, &distillates);
+    // --brief inherits the default-on redaction contract: the distillate
+    // text must not persist source secrets the timeline path would scrub.
+    let brief = if redact {
+        aicx::redact::redact_secrets(&brief)
+    } else {
+        brief
+    };
+    if let Some(parent) = output.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(output, &brief)
+        .with_context(|| format!("cannot write brief to {}", output.display()))?;
+    println!(
+        "Wrote brief: {} ({} segment(s), lane `{}`)",
+        output.display(),
+        distillates.len(),
+        lane.lane_name()
+    );
+    Ok(())
+}
+
 fn run_extract_direct_file(
     agent: ExtractAgent,
     input: PathBuf,
@@ -6732,16 +7636,7 @@ fn run_extract_direct_file(
         .file_name()
         .map(|name| name.to_string_lossy().to_string())
         .unwrap_or_else(|| "(unknown)".to_string());
-    // Grok layout: identity is the parent session-dir UUID when the file is
-    // `chat_history.jsonl` — not the truncated stem `chat_history`.
-    let source_id = grok_direct_source_id(agent, &input).unwrap_or_else(|| {
-        input
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .filter(|stem| !stem.is_empty())
-            .unwrap_or("direct-source")
-            .to_string()
-    });
+    let source_id = direct_source_id(agent, &input);
 
     // Direct mode accepts exactly one finite parser artifact. Directory
     // discovery belongs to the catalog/importer boundary.
@@ -6759,7 +7654,11 @@ fn run_extract_direct_file(
             "extract: lineage: --file has no session catalog; the forked_from_id walk needs --session"
         );
     }
-    let parsed = parse_selected_source_with_basis(&handle, &options.projection)?;
+    if options.brief {
+        return run_extract_brief(&handle, &output_path, options.redact_secrets);
+    }
+    let parsed = parse_selected_source_with_basis(&handle, &options.projection, options.cutoff)
+        .map_err(anyhow::Error::from)?;
     if let Some(refusal) = parsed.refusal_if_empty(&options.projection) {
         // Typed refusal instead of a silent `Wrote 0 entries` (W2-T12 on the
         // direct-file seam; oracle `grok-019fdeca-typed-refusal`).
@@ -6960,6 +7859,26 @@ const INCREMENTAL_LEGACY_NOTE: &str =
 const LEGACY_ALL_WATERMARK_AGENTS: &[&str] =
     &["claude", "codex", "gemini", "junie", "grok", "codescribe"];
 const LEGACY_ALL_WATERMARK_KEY: &str = "claude+codex+gemini+junie+grok+codescribe";
+/// The `all` composition since kimi joined the extractor fleet. Watermarks
+/// keyed by the older composition migrate forward through
+/// [`extraction_source_key_aliases`], so the first kimi-aware `all` run stays
+/// incremental instead of rescanning every source from scratch.
+const ALL_WATERMARK_AGENTS: &[&str] = &[
+    "claude",
+    "codex",
+    "gemini",
+    "junie",
+    "grok",
+    "kimi",
+    "cursor",
+    "codescribe",
+];
+
+/// The `all` composition the kimi-aware build recorded under (normalized:
+/// sorted + `+`-joined). The first cursor-aware `all` run inherits this
+/// watermark through [`extraction_source_key_aliases`] instead of rescanning
+/// every incumbent provider from scratch.
+const KIMI_ALL_WATERMARK_KEY: &str = "claude+codescribe+codex+gemini+grok+junie+kimi";
 
 fn normalized_source_key_parts<'a>(parts: impl IntoIterator<Item = &'a str>) -> Vec<String> {
     let mut normalized = parts
@@ -6998,9 +7917,24 @@ fn extraction_source_key(agents: &[&str], project: &[String]) -> String {
 fn extraction_source_key_aliases(agents: &[&str], project: &[String]) -> Vec<String> {
     let project_key = normalized_project_source_key(project);
     let mut aliases = Vec::new();
-    if normalized_source_key_parts(agents.iter().copied())
-        == normalized_source_key_parts(LEGACY_ALL_WATERMARK_AGENTS.iter().copied())
-    {
+    let requested = normalized_source_key_parts(agents.iter().copied());
+    if requested == normalized_source_key_parts(ALL_WATERMARK_AGENTS.iter().copied()) {
+        // The current `all` inherits the newest watermark any older `all`
+        // composition recorded; without this the upgrade would force a full
+        // rescan of every provider it already processed. The inherited
+        // watermark covers only the agents named in the recording key —
+        // `watermark_covered_agents` exempts the newcomer, or its whole
+        // pre-upgrade history would be skipped as if already ingested.
+        aliases.push(format!("{KIMI_ALL_WATERMARK_KEY}:{project_key}"));
+        aliases.push(format!("{LEGACY_ALL_WATERMARK_KEY}:{project_key}"));
+        aliases.push(format!(
+            "claude+codex+gemini+junie+codescribe:{project_key}"
+        ));
+        aliases.push(format!("claude+codex+gemini:{project_key}"));
+        aliases.push(format!("claude+codex+gemini+junie:{project_key}"));
+        return aliases;
+    }
+    if requested == normalized_source_key_parts(LEGACY_ALL_WATERMARK_AGENTS.iter().copied()) {
         aliases.push(format!(
             "claude+codex+gemini+junie+codescribe:{project_key}"
         ));
@@ -7011,6 +7945,34 @@ fn extraction_source_key_aliases(agents: &[&str], project: &[String]) -> Vec<Str
         aliases.push(format!("claude+codex+gemini+junie:{project_key}"));
     }
     aliases
+}
+
+/// Agent names the stored watermark for `source_key` honestly covers.
+///
+/// A composite watermark key (`claude+codex+…:all`) claims coverage only for
+/// the agents named in the key that recorded it. When the `all` composition
+/// grows, alias migration carries the old watermark forward for the
+/// incumbents, but a newcomer has no extraction history behind that
+/// timestamp — its sources must fall back to the raw cutoff, or their whole
+/// pre-upgrade history is skipped as if already ingested.
+fn watermark_covered_agents(
+    state: &StateManager,
+    source_key: &str,
+    source_aliases: &[String],
+) -> BTreeSet<String> {
+    if state.get_watermark(source_key).is_some() {
+        return agent_names_in_watermark_key(source_key);
+    }
+    source_aliases
+        .iter()
+        .filter(|alias| state.get_watermark(alias).is_some())
+        .flat_map(|alias| agent_names_in_watermark_key(alias))
+        .collect()
+}
+
+fn agent_names_in_watermark_key(key: &str) -> BTreeSet<String> {
+    let agents = key.split_once(':').map_or(key, |(agents, _)| agents);
+    agents.split('+').map(str::to_owned).collect()
 }
 
 fn warn_incremental_legacy_flag(flag_used: bool) {
@@ -7043,6 +8005,20 @@ const MUTATION_WARN_DELAY_SECONDS_DEFAULT: u64 = 3;
 /// The delay (default 3s) is configurable via
 /// `AICX_MUTATION_WARN_DELAY_SECONDS`. A value of `0` keeps the warning
 /// but skips the sleep entirely.
+/// Legacy spellings kept only so old scripts keep resolving; they never show
+/// up in any help, short or full.
+const ALWAYS_HIDDEN_COMMANDS: &[&str] = &["dashboard-serve", "reports-extractor"];
+
+/// Daily drivers stay on `--help`; every power-user surface is one flag away
+/// (`--help-full`) instead of being deleted, so scripts and the wizard keep
+/// working while the front door lists what a newcomer needs.
+fn full_help_command() -> clap::Command {
+    Cli::command().mut_subcommands(|sub| {
+        let legacy = ALWAYS_HIDDEN_COMMANDS.contains(&sub.get_name());
+        sub.hide(legacy)
+    })
+}
+
 fn warn_pending_mutation(cmd: &str) {
     if mutation_warn_suppressed() {
         return;
@@ -7324,6 +8300,9 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
     // escape hatch both mean "scan the full lookback window".
     let source_key = extraction_source_key(agents, &project);
     let source_aliases = extraction_source_key_aliases(agents, &project);
+    // Compute coverage BEFORE migration writes the canonical key: a watermark
+    // covers only the agents named in the key that recorded it.
+    let watermark_covered = watermark_covered_agents(&state, &source_key, &source_aliases);
     state.migrate_watermark_aliases(&source_key, &source_aliases);
     let watermark = if full_rescan || force {
         None
@@ -7366,25 +8345,55 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
             std::time::Duration::from_secs(2),
             std::time::Duration::from_secs(60),
         );
+        // A watermark recorded before this agent joined the composition says
+        // nothing about its sources: they scan against the raw cutoff, or the
+        // run silently skips the agent's whole pre-upgrade history (kimi
+        // lanes on the first kimi-aware `all` run).
+        let uncovered_config;
+        let agent_config = if watermark.is_some() && !watermark_covered.contains(agent) {
+            eprintln!(
+                "  [{agent}] no extraction watermark covers this agent yet; scanning the full window"
+            );
+            uncovered_config = ExtractionConfig {
+                watermark: None,
+                ..config.clone()
+            };
+            &uncovered_config
+        } else {
+            &config
+        };
         let agent_entries_result = match agent {
-            "claude" => {
-                sources::extract_agent_sessions(aicx::session_catalog::AgentKind::Claude, &config)
-            }
-            "codex" => {
-                sources::extract_agent_sessions(aicx::session_catalog::AgentKind::Codex, &config)
-            }
-            "gemini" => {
-                sources::extract_agent_sessions(aicx::session_catalog::AgentKind::Gemini, &config)
-            }
-            "junie" => {
-                sources::extract_agent_sessions(aicx::session_catalog::AgentKind::Junie, &config)
-            }
-            "grok" => {
-                sources::extract_agent_sessions(aicx::session_catalog::AgentKind::Grok, &config)
-            }
-            "codescribe" => aicx::importers::extract_codescribe(&config)
+            "claude" => sources::extract_agent_sessions(
+                aicx::session_catalog::AgentKind::Claude,
+                agent_config,
+            ),
+            "codex" => sources::extract_agent_sessions(
+                aicx::session_catalog::AgentKind::Codex,
+                agent_config,
+            ),
+            "gemini" => sources::extract_agent_sessions(
+                aicx::session_catalog::AgentKind::Gemini,
+                agent_config,
+            ),
+            "junie" => sources::extract_agent_sessions(
+                aicx::session_catalog::AgentKind::Junie,
+                agent_config,
+            ),
+            "kimi" => sources::extract_agent_sessions(
+                aicx::session_catalog::AgentKind::Kimi,
+                agent_config,
+            ),
+            "cursor" => sources::extract_agent_sessions(
+                aicx::session_catalog::AgentKind::Cursor,
+                agent_config,
+            ),
+            "grok" => sources::extract_agent_sessions(
+                aicx::session_catalog::AgentKind::Grok,
+                agent_config,
+            ),
+            "codescribe" => aicx::importers::extract_codescribe(agent_config)
                 .map(sources::SessionExtractionBatch::from_entries),
-            "operator-md" => aicx::importers::extract_operator_markdown(&config)
+            "operator-md" => aicx::importers::extract_operator_markdown(agent_config)
                 .map(sources::SessionExtractionBatch::from_entries),
             _ => Ok(sources::SessionExtractionBatch::default()),
         };
@@ -8028,7 +9037,7 @@ fn run_catalog_rebuild(json: bool, with_chunks: bool) -> Result<()> {
             "aicx catalog rebuild: draining {} pending chunk(s) via `aicx index`",
             report.pending_chunks
         );
-        run_index(&[], 0, json, false, false, false, false)?;
+        run_index(&[], 0, json, false, false, false)?;
         report.pending_chunks = aicx::api::index_status_at(&aicx_home_for_status, None)
             .map(|status| status.pending_chunks)
             .unwrap_or(report.pending_chunks);
@@ -8576,6 +9585,15 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
     if evidence && no_semantic {
         anyhow::bail!("search --evidence requires semantic search; remove --no-semantic");
     }
+    // card.v3 distill axes bypass the document-class vocabulary: they
+    // translate to flat metadata scalars the index materializes (W2-02).
+    let distill_kind = matches!(kind, Some("decision" | "decisions"));
+    if distill_kind {
+        eprintln!(
+            "search: --kind decision selects card.v3 documents (has_decisions=true);              documents indexed before the distill cut are v2 and invisible on this axis —              coverage grows incrementally with `aicx index` (see distill line in its report)"
+        );
+    }
+    let kind = if distill_kind { None } else { kind };
     let kind_filter = kind.and_then(aicx::timeline::Kind::parse);
     // Extract inline date hints from query if no explicit --date given
     let (effective_query, inline_date) = if date.is_none() {
@@ -8636,7 +9654,11 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
             limit,
             &scopes,
             filters.frame_kind.map(Into::into),
-            kind_filter.map(|kind| kind.dir_name()),
+            if distill_kind {
+                Some("distill:decision")
+            } else {
+                kind_filter.map(|kind| kind.dir_name())
+            },
             &index_filters,
         ) {
             Ok(filtered) => {
@@ -9016,18 +10038,68 @@ impl SemanticFallbackNotice {
 /// in-memory extract per session and publishes Tantivy directly; it writes
 /// readable extract files only with `--cache-extracts`, and never materializes
 /// per-frame cards or embedding NDJSON intermediates.
+/// Hot window for the census `aicx index` runs before parsing. Mirrors the
+/// wizard's refresh screen so both entry points admit the same sessions.
+const INDEX_CENSUS_HOURS: u64 = 48;
+
+/// `aicx index` is the one rebuild command. Before parsing it refreshes the
+/// session census itself (a missing catalog gets the full first census), so
+/// nobody has to remember `catalog refresh` as a separate step — running
+/// only the refresh and seeing no new search hits was the most common
+/// "aicx does nothing" report.
+fn run_index_census(aicx_home: &Path, reporter: Arc<dyn aicx::progress::Reporter>) -> Result<()> {
+    let user_home = aicx::os_user_home().context("No home dir")?;
+    let phase = aicx::progress::Phase::start(reporter, "census", None);
+    let hb = aicx::progress::Heartbeat::spawn_with_backoff(
+        phase.clone(),
+        Duration::from_secs(2),
+        Duration::from_secs(15),
+    );
+    let outcome = if aicx::catalog::sessions_path_for(aicx_home).is_file() {
+        let cutoff_ns = lookback_cutoff(INDEX_CENSUS_HOURS)
+            .timestamp_nanos_opt()
+            .map(|value| value.max(0) as u128)
+            .unwrap_or(0);
+        aicx::catalog::refresh_hot(aicx_home, &user_home, cutoff_ns).map(|report| {
+            format!(
+                "hot={INDEX_CENSUS_HOURS}h changed={} admitted={} total={}",
+                report.changed_sessions, report.admitted_sessions, report.total_sessions
+            )
+        })
+    } else {
+        aicx::catalog::rebuild_with_progress(aicx_home, &user_home, |_| {})
+            .map(|report| format!("first census: {} session(s)", report.total_sessions))
+    };
+    hb.stop();
+    match outcome {
+        Ok(summary) => {
+            phase.finish_ok(summary);
+            Ok(())
+        }
+        Err(error) => {
+            phase.finish_err(&error, aicx::progress::recovery_hint_for("census"));
+            Err(error)
+        }
+    }
+}
+
 fn run_index(
     projects: &[String],
     _sample: usize,
     json: bool,
     dry_run: bool,
     full_rescan: bool,
-    cache_extracts: bool,
     semantic: bool,
 ) -> Result<()> {
     let resolved_scopes = resolve_index_scopes(projects)?;
     let filters: Vec<String> = resolved_scopes.into_iter().flatten().collect();
     let aicx_home = aicx::aicx_home::resolve()?;
+    // Terminal: live `[aicx][phase=...]` lines with a heartbeat. --json keeps
+    // stdout for the report and moves the phase events to stderr.
+    let reporter = aicx::progress::select_reporter(json);
+    if !dry_run {
+        run_index_census(&aicx_home, reporter.clone())?;
+    }
     let _lock = if dry_run {
         None
     } else {
@@ -9035,13 +10107,13 @@ fn run_index(
             aicx::locks::lance_lock_path()?,
         )?)
     };
-    let report = aicx::source_index::build(
+    let report = aicx::source_index::build_with_reporter(
         &aicx_home,
         &filters,
         dry_run,
         full_rescan,
-        cache_extracts,
         semantic,
+        reporter,
     )?;
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -9076,6 +10148,10 @@ fn run_index(
         );
         eprintln!("  extracts_written: {}", report.extracts_written);
         eprintln!(
+            "  distill (card.v3): {} doc(s) materialized this run; reused docs stay v2 until re-parsed",
+            report.distill_docs
+        );
+        eprintln!(
             "  dense: kind={} docs={}",
             report.dense_kind, report.dense_docs
         );
@@ -9086,7 +10162,7 @@ fn run_index(
             eprintln!("  next: aicx search --deep '<query>' uses dense RRF on this CURRENT");
         } else if !report.semantic_requested {
             eprintln!(
-                "  note: dense not built (feature). Opt in with `aicx index --semantic` on the owner host."
+                "  lexical index ready for `aicx search`. Dense rerank is opt-in: `aicx index --semantic`."
             );
         }
     }

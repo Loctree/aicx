@@ -1,0 +1,533 @@
+//! Differential oracle harness against a frozen Transcript Builder package.
+//!
+//! TB is the *differential oracle*, never a runtime dependency: the harness
+//! reads a real `tbflow` package from `tests/fixtures/tb_oracle/_shared/`
+//! (human.md frontmatter + index_payload.jsonl of session `ae59aa08`),
+//! extracts the common field set both tools claim to know, and reports a
+//! field-by-field diff. W0 proves the loader + diff on the package's own
+//! internal consistency; W2 feeds the aicx-derived side into the same
+//! `diff_common_fields`.
+//!
+//! Contract: `docs/DISTILL_CONTRACT.md` (TB→aicx field mapping).
+
+use std::collections::BTreeSet;
+use std::fmt;
+use std::path::{Path, PathBuf};
+
+/// The fields both TB and aicx claim to know about one session. Everything is
+/// normalized (e.g. sha256 stripped of its `sha256:` prefix) before diffing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CommonFields {
+    agent: String,
+    map_id: String,
+    cwd: String,
+    branch: String,
+    source_sha256: String,
+    segments: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FieldDiff {
+    field: &'static str,
+    left: String,
+    right: String,
+}
+
+impl fmt::Display for FieldDiff {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}: left={:?} right={:?}",
+            self.field, self.left, self.right
+        )
+    }
+}
+
+fn diff_common_fields(left: &CommonFields, right: &CommonFields) -> Vec<FieldDiff> {
+    let mut diffs = Vec::new();
+    let mut push = |field: &'static str, l: &str, r: &str| {
+        if l != r {
+            diffs.push(FieldDiff {
+                field,
+                left: l.to_owned(),
+                right: r.to_owned(),
+            });
+        }
+    };
+    push("agent", &left.agent, &right.agent);
+    push("map_id", &left.map_id, &right.map_id);
+    push("cwd", &left.cwd, &right.cwd);
+    push("branch", &left.branch, &right.branch);
+    push("source_sha256", &left.source_sha256, &right.source_sha256);
+    if left.segments != right.segments {
+        diffs.push(FieldDiff {
+            field: "segments",
+            left: left.segments.to_string(),
+            right: right.segments.to_string(),
+        });
+    }
+    diffs
+}
+
+fn fixture_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tb_oracle/_shared")
+}
+
+fn grok_fixture_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tb_oracle/grok")
+}
+
+fn normalize_sha(value: &str) -> String {
+    value.trim_start_matches("sha256:").to_owned()
+}
+
+fn yaml_str(doc: &serde_yaml::Value, key: &str) -> String {
+    doc.get(key)
+        .and_then(serde_yaml::Value::as_str)
+        .unwrap_or_else(|| panic!("human.md frontmatter missing `{key}`"))
+        .to_owned()
+}
+
+/// Load the common fields from the TB `human.md` artifact: YAML frontmatter
+/// plus the At-A-Glance `| segments | N |` row from the body.
+fn common_fields_from_human(text: &str) -> CommonFields {
+    let mut parts = text.splitn(3, "---\n");
+    let _ = parts.next();
+    let frontmatter = parts
+        .next()
+        .expect("human.md carries a `---` YAML frontmatter block");
+    let body = parts.next().expect("human.md carries a body");
+    let doc: serde_yaml::Value =
+        serde_yaml::from_str(frontmatter).expect("human.md frontmatter parses as YAML");
+    let segments = body
+        .lines()
+        .find_map(|line| {
+            let row = line.trim();
+            row.strip_prefix("| segments |")
+                .map(|rest| rest.trim_matches(['|', ' ']).to_owned())
+        })
+        .expect("human.md body carries a `| segments | N |` row")
+        .parse::<u64>()
+        .expect("segments row parses as a count");
+    CommonFields {
+        agent: yaml_str(&doc, "agent"),
+        map_id: yaml_str(&doc, "map_id"),
+        cwd: yaml_str(&doc, "cwd"),
+        branch: yaml_str(&doc, "branch"),
+        source_sha256: normalize_sha(&yaml_str(&doc, "source_jsonl_sha256")),
+        segments,
+    }
+}
+
+fn payload_str(record: &serde_json::Value, key: &str) -> String {
+    record
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_else(|| panic!("index_payload record missing `{key}`"))
+        .to_owned()
+}
+
+/// Load the common fields from the TB `index_payload.jsonl` artifact: the
+/// session-scoped fields of the first record plus the count of distinct
+/// `segment_id` values across all records.
+fn common_fields_from_index_payload(text: &str) -> CommonFields {
+    let mut segments = BTreeSet::new();
+    let mut first: Option<serde_json::Value> = None;
+    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        let record: serde_json::Value =
+            serde_json::from_str(line).expect("index_payload line parses as JSON");
+        segments.insert(payload_str(&record, "segment_id"));
+        first.get_or_insert(record);
+    }
+    let first = first.expect("index_payload carries at least one record");
+    let source_sha = first
+        .get("source")
+        .and_then(|source| source.get("raw_sha256"))
+        .and_then(serde_json::Value::as_str)
+        .expect("index_payload record carries source.raw_sha256");
+    CommonFields {
+        agent: payload_str(&first, "agent"),
+        map_id: payload_str(&first, "map_id"),
+        cwd: payload_str(&first, "cwd"),
+        branch: payload_str(&first, "branch"),
+        source_sha256: normalize_sha(source_sha),
+        segments: segments.len() as u64,
+    }
+}
+
+fn load_fixture(name: &str) -> String {
+    let path = fixture_dir().join(name);
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("cannot read fixture {}: {error}", path.display()))
+}
+
+/// Green direction: the two artifacts of one frozen TB package agree on
+/// every common field — the loader and the diff see the same session.
+#[test]
+fn tb_package_common_fields_agree() {
+    let human = common_fields_from_human(&load_fixture("ae59aa08_human.md"));
+    let payload = common_fields_from_index_payload(&load_fixture("ae59aa08_index-payload.jsonl"));
+    let diffs = diff_common_fields(&human, &payload);
+    assert!(
+        diffs.is_empty(),
+        "TB package disagrees with itself on common fields:\n{}",
+        diffs
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
+
+/// Red direction: a perturbed field must surface as exactly that field's
+/// diff — the harness cannot go green on detuned data.
+#[test]
+fn perturbed_field_reports_red_diff() {
+    let human = common_fields_from_human(&load_fixture("ae59aa08_human.md"));
+    let mut detuned = human.clone();
+    detuned.branch = "feat/some-other-branch".to_owned();
+    detuned.segments += 1;
+    let diffs = diff_common_fields(&human, &detuned);
+    let fields: Vec<&str> = diffs.iter().map(|diff| diff.field).collect();
+    assert_eq!(fields, ["branch", "segments"], "diffs: {diffs:?}");
+}
+
+// ---------------------------------------------------------------------------
+// W1-01 — claude lane fixture package (tests/fixtures/tb_oracle/claude/)
+// ---------------------------------------------------------------------------
+
+fn claude_fixture_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tb_oracle/claude")
+}
+
+fn load_claude_fixture(name: &str) -> String {
+    let path = claude_fixture_dir().join(name);
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("cannot read fixture {}: {error}", path.display()))
+}
+
+/// Parse the claude fixture session through the public kernel surface.
+fn parse_claude_fixture_model() -> aicx_parser::engine::SessionModel {
+    use aicx_parser::adapters::registered_adapter;
+    use aicx_parser::engine::{
+        AgentKind, RawUnitReader, ReaderPolicy, SourceArtifact, SourceFraming, SourceHandle,
+        ValidatedParse, validate_parse,
+    };
+    let path = claude_fixture_dir().join("6abdbe22_session.jsonl");
+    let body = std::fs::read(&path)
+        .unwrap_or_else(|error| panic!("cannot read fixture {}: {error}", path.display()));
+    let artifact = SourceArtifact::memory("session.jsonl", body, SourceFraming::JsonLines)
+        .expect("memory artifact");
+    let session_id = "6abdbe22-43e0-4544-a5ef-7314ece85078";
+    let source = SourceHandle::new(
+        AgentKind::Claude,
+        session_id,
+        Some(session_id.to_owned()),
+        vec![artifact],
+    )
+    .expect("source handle");
+    let read = RawUnitReader::new(ReaderPolicy::default())
+        .read(&source)
+        .expect("bounded read");
+    let adapter = registered_adapter(AgentKind::Claude);
+    let classified = adapter.classify(&source, &read).expect("classification");
+    let parse = adapter
+        .assemble(&source, &read, classified)
+        .expect("assembly");
+    match validate_parse(parse).expect("kernel validation") {
+        ValidatedParse::Session(session) => session.into_model(),
+        ValidatedParse::Fatal(fatal) => {
+            panic!("unexpected fatal parse: {:?}", fatal.coverage().status)
+        }
+    }
+}
+
+/// The TB package generated from the claude lane fixture agrees with itself —
+/// same green direction as `tb_package_common_fields_agree`, on the W1-01
+/// package.
+#[test]
+fn tb_claude_package_common_fields_agree() {
+    let human = common_fields_from_human(&load_claude_fixture("6abdbe22_human.md"));
+    let payload =
+        common_fields_from_index_payload(&load_claude_fixture("6abdbe22_index-payload.jsonl"));
+    let diffs = diff_common_fields(&human, &payload);
+    assert!(
+        diffs.is_empty(),
+        "claude TB package disagrees with itself on common fields:\n{}",
+        diffs
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
+
+/// Differential direction for the claude lane: the aicx-parsed model agrees
+/// with the frozen `tbflow claude` package on every common field both tools
+/// claim to know about the same fixture bytes. `map_id` is TB vocabulary with
+/// no aicx counterpart, so the TB value is carried through as the neutral
+/// element rather than invented on the aicx side.
+#[test]
+fn aicx_model_agrees_with_tb_claude_package() {
+    use aicx_parser::engine::Known;
+    let tb = common_fields_from_index_payload(&load_claude_fixture("6abdbe22_index-payload.jsonl"));
+    let model = parse_claude_fixture_model();
+    let known = |value: &Known<String>, field: &str| match value {
+        Known::Value(value) => value.clone(),
+        Known::Unknown(_) => panic!("aicx model has no {field} for the claude fixture"),
+    };
+    let aicx = CommonFields {
+        agent: model.provenance.agent.as_str().to_owned(),
+        map_id: tb.map_id.clone(),
+        cwd: known(&model.provenance.cwd, "cwd"),
+        branch: known(&model.provenance.branch, "branch"),
+        source_sha256: normalize_sha(&model.provenance.original_source_hash),
+        segments: model.segments.len() as u64,
+    };
+    let diffs = diff_common_fields(&aicx, &tb);
+    assert!(
+        diffs.is_empty(),
+        "aicx model disagrees with TB claude package:\n{}",
+        diffs
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// W1-02 — codex lane: aicx-side of the differential oracle.
+//
+// TB package generated with `tbflow tests/fixtures/tb_oracle/codex/
+// rollout-2026-08-04-019fc9dd.jsonl` (TB 0.6.0) from the redacted real
+// rollout fixture. This is the first test that feeds the *aicx-parsed* side
+// into `diff_common_fields` (W0 proved the loader on TB-internal consistency).
+// ---------------------------------------------------------------------------
+
+fn codex_fixture_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tb_oracle/codex")
+}
+
+/// Common fields as the aicx parser derives them from the raw rollout.
+///
+/// Two fields are deliberately normalized to empty on BOTH sides before
+/// diffing, because only one tool claims them for this package:
+/// * `map_id` — a TB-minted artifact id (agent + date + TB fingerprint);
+///   aicx does not mint TB map ids and porting the fingerprint would make TB
+///   a runtime dependency, which the contract forbids.
+/// * `branch` — the TB codex package disagrees with itself here (human.md
+///   frontmatter carries a branch, index_payload records carry `null`), so
+///   there is no single TB-side truth to diff against.
+fn codex_common_fields_from_aicx() -> CommonFields {
+    use aicx_parser::engine::{
+        AgentKind, Known, ParserEngine, SourceArtifact, SourceFraming, SourceHandle, ValidatedParse,
+    };
+    // Memory artifact (like the claude test above): `validated_file` enforces
+    // the runtime allowed-roots policy, which rejects checkouts outside the
+    // session-store roots (e.g. /Volumes/...) and would make this test
+    // depend on where the repo is cloned.
+    let fixture = codex_fixture_dir().join("rollout-2026-08-04-019fc9dd.jsonl");
+    let body = std::fs::read(&fixture)
+        .unwrap_or_else(|error| panic!("cannot read fixture {}: {error}", fixture.display()));
+    let artifact = SourceArtifact::memory(
+        "rollout-2026-08-04-019fc9dd.jsonl",
+        body,
+        SourceFraming::JsonLines,
+    )
+    .expect("codex fixture readable");
+    let handle = SourceHandle::new(
+        AgentKind::Codex,
+        "019fc9dd-codex-fixture",
+        None,
+        vec![artifact],
+    )
+    .expect("valid source handle");
+    let parse = ParserEngine::default()
+        .parse_registered(&handle)
+        .expect("codex fixture parses");
+    let ValidatedParse::Session(session) = parse else {
+        panic!("codex fixture must parse to a session");
+    };
+    let model = session.into_model();
+    let cwd = match &model.provenance.cwd {
+        Known::Value(value) => value.clone(),
+        Known::Unknown(_) => String::new(),
+    };
+    CommonFields {
+        agent: "codex".to_owned(),
+        map_id: String::new(),
+        cwd,
+        branch: String::new(),
+        source_sha256: normalize_sha(&model.provenance.original_source_hash),
+        segments: model.segments.len() as u64,
+    }
+}
+
+fn load_codex_fixture(name: &str) -> String {
+    let path = codex_fixture_dir().join(name);
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("cannot read fixture {}: {error}", path.display()))
+}
+
+/// aicx vs TB on the codex fixture: identity fields (agent, cwd, source
+/// sha256) must agree exactly. `segments` is a KNOWN, pinned divergence:
+/// the aicx codex adapter opens a segment boundary at the first
+/// `turn_context` cwd/branch materialization, so the pre-context prologue
+/// turns form segment 0 (aicx = 2); TB counts the conversation as one
+/// segment (TB = 1). The assertion pins both values so any drift on either
+/// side turns this red — resolution of the divergence itself belongs to the
+/// integrator (W1-02 report, field marked [?]).
+#[test]
+fn codex_package_common_fields_agree_with_aicx() {
+    let mut tb = common_fields_from_human(&load_codex_fixture("019fc9dd_human.md"));
+    tb.map_id = String::new();
+    tb.branch = String::new();
+    let aicx = codex_common_fields_from_aicx();
+    let diffs = diff_common_fields(&aicx, &tb);
+    let fields: Vec<&str> = diffs.iter().map(|diff| diff.field).collect();
+    assert_eq!(
+        fields,
+        ["segments"],
+        "identity fields drifted between aicx and TB:\n{}",
+        diffs
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    assert_eq!(
+        (aicx.segments, tb.segments),
+        (2, 1),
+        "pinned segments divergence moved — re-judge the boundary semantics"
+    );
+}
+
+/// The TB codex package's index payload names the same session the human.md
+/// does (agent + map_id + cwd + sha); `branch`/`segments` are excluded — the
+/// codex package carries `branch: null` records and no per-record segment
+/// row contract beyond `segment_id` distinctness, which
+/// `codex_package_common_fields_agree_with_aicx` already pins.
+#[test]
+fn codex_package_index_payload_names_same_session() {
+    let human = common_fields_from_human(&load_codex_fixture("019fc9dd_human.md"));
+    let text = load_codex_fixture("019fc9dd_index-payload.jsonl");
+    let mut segments = BTreeSet::new();
+    let mut first: Option<serde_json::Value> = None;
+    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        let record: serde_json::Value =
+            serde_json::from_str(line).expect("index_payload line parses as JSON");
+        segments.insert(payload_str(&record, "segment_id"));
+        first.get_or_insert(record);
+    }
+    let first = first.expect("index_payload carries at least one record");
+    assert_eq!(payload_str(&first, "agent"), human.agent);
+    assert_eq!(payload_str(&first, "map_id"), human.map_id);
+    assert_eq!(payload_str(&first, "cwd"), human.cwd);
+    let sha = first
+        .get("source")
+        .and_then(|source| source.get("raw_sha256"))
+        .and_then(serde_json::Value::as_str)
+        .expect("index_payload record carries source.raw_sha256");
+    assert_eq!(normalize_sha(sha), human.source_sha256);
+    assert_eq!(segments.len() as u64, human.segments);
+}
+
+/// Smoke: the written contract exists and carries the sections the W1 wave
+/// builds on (TB→aicx mapping table + append-only rule).
+#[test]
+fn distill_contract_doc_sections_present() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/DISTILL_CONTRACT.md");
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display()));
+    for needle in [
+        "## Mapowanie pól TB→aicx",
+        "## Reguła append-only",
+        "| TB (`index_payload.v1`",
+        "AgentLaneDistiller",
+    ] {
+        assert!(
+            text.contains(needle),
+            "docs/DISTILL_CONTRACT.md missing section marker {needle:?}"
+        );
+    }
+}
+
+/// Frozen Gemini TB package agrees on common fields.
+#[test]
+fn gemini_tb_package_common_fields_agree() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tb_oracle/gemini");
+    let human = common_fields_from_human(
+        &std::fs::read_to_string(dir.join("gemini_human.md"))
+            .expect("read gemini_human.md fixture"),
+    );
+    let payload = common_fields_from_index_payload(
+        &std::fs::read_to_string(dir.join("gemini_index-payload.jsonl"))
+            .expect("read gemini_index-payload.jsonl fixture"),
+    );
+    let diffs = diff_common_fields(&human, &payload);
+    assert!(
+        diffs.is_empty(),
+        "Gemini TB package disagrees with itself on common fields:\n{}",
+        diffs
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
+
+fn load_grok_fixture(name: &str) -> String {
+    let path = grok_fixture_dir().join(name);
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("cannot read grok fixture {}: {error}", path.display()))
+}
+
+/// Green: the grok TB package agrees with itself on the W0 common field set.
+#[test]
+fn grok_tb_package_common_fields_agree() {
+    let human = common_fields_from_human(&load_grok_fixture("human.md"));
+    let payload = common_fields_from_index_payload(&load_grok_fixture("index-payload.jsonl"));
+    let diffs = diff_common_fields(&human, &payload);
+    assert!(
+        diffs.is_empty(),
+        "grok TB package disagrees with itself on common fields:\n{}",
+        diffs
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
+
+/// The grok TB package common fields match the redacted session fixture
+/// (summary.json cwd/branch + chat_history sha256 + one segment).
+#[test]
+fn grok_tb_package_matches_session_fixture() {
+    let human = common_fields_from_human(&load_grok_fixture("human.md"));
+    let summary: serde_json::Value =
+        serde_json::from_str(&load_grok_fixture("summary.json")).expect("summary.json parses");
+    let cwd = summary
+        .pointer("/info/cwd")
+        .and_then(serde_json::Value::as_str)
+        .expect("summary.info.cwd");
+    let branch = summary
+        .get("head_branch")
+        .and_then(serde_json::Value::as_str)
+        .expect("summary.head_branch");
+    let chat = grok_fixture_dir().join("chat_history.jsonl");
+    let bytes = std::fs::read(&chat).expect("read grok chat_history.jsonl");
+    let sha = sha256_hex(&bytes);
+    assert_eq!(human.agent, "grok");
+    assert_eq!(human.cwd, cwd);
+    assert_eq!(human.branch, branch);
+    assert_eq!(human.source_sha256, sha);
+    assert_eq!(human.segments, 1);
+    assert_eq!(human.map_id, "grok__01a04490__2026-08-27__w2t9");
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(bytes);
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}

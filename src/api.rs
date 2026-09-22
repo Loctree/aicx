@@ -730,13 +730,14 @@ fn hybrid_current_index_status(base: &Path, project: Option<&str>) -> Result<Opt
         .map(system_time_to_rfc3339)
         .or_else(|| committed_at.clone());
 
-    // Catalog rows beyond CURRENT lexical docs mean sessions are admitted but
-    // not yet published — stale index relative to the durable catalog.
-    let pending = catalog_total.saturating_sub(manifest.lexical_doc_count);
+    // Pending work is exactly the set of sessions that changed after this
+    // generation was built. The earlier `catalog_total - lexical_doc_count`
+    // equation counted skipped roots and zero-signal sessions as unpublished,
+    // so it never reached 0 and every fresh index still read as stale.
+    let _ = catalog_total;
+    let pending = sessions_newer;
     let readiness = if sessions_newer > 0 {
         IndexReadiness::StaleChunks
-    } else if pending > 0 {
-        IndexReadiness::StaleIndex
     } else {
         IndexReadiness::Ready
     };
@@ -1325,6 +1326,112 @@ mod tests {
             "status must point at CURRENT generation, not residual ndjson: {:?}",
             status.semantic_index_path
         );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Regression for the "every fresh index reads as stale" loop: catalog
+    /// rows that never produce a lexical document (skipped roots, zero-signal
+    /// sessions) are not pending work. Only sessions that changed after the
+    /// generation was built count, and that is also what `aicx index` will
+    /// re-parse next.
+    #[test]
+    fn hybrid_status_counts_only_sessions_newer_than_the_build_as_pending() {
+        let root = std::env::temp_dir().join(format!(
+            "aicx-api-hybrid-pending-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let gen_name = "g-2026-07-23T10-00-00Z-pending";
+        let gen_dir = root
+            .join("indexed")
+            .join("_all")
+            .join("hybrid")
+            .join("generations")
+            .join(gen_name);
+        std::fs::create_dir_all(&gen_dir).expect("generation dir");
+        let build_completed = Utc.with_ymd_and_hms(2026, 7, 23, 10, 0, 12).unwrap();
+        let manifest = aicx_retrieve::Manifest {
+            schema_version: "2.0".to_string(),
+            generation_id: gen_name.to_string(),
+            writer_version: "0.13.1".to_string(),
+            build_id: "0.13.1+gtest".to_string(),
+            source_chunk_count: 2,
+            source_hash_blake3: "abc".to_string(),
+            embedder_model: "optional".to_string(),
+            embedder_url_hash: "not_built".to_string(),
+            embedder_dim: 0,
+            embedder_distance: "cosine".to_string(),
+            dense_count: 0,
+            dense_kind: "optional_not_built".to_string(),
+            lexical_commit_id: "tantivy_test".to_string(),
+            lexical_doc_count: 2,
+            build_started_at: Utc.with_ymd_and_hms(2026, 7, 23, 10, 0, 0).unwrap(),
+            build_completed_at: build_completed,
+            build_wall_seconds: 12,
+            fusion_algorithm: "rrf".to_string(),
+            fusion_k: 60,
+        };
+        manifest
+            .write_to_path(&gen_dir.join("manifest.json"))
+            .expect("write hybrid manifest");
+        std::fs::write(
+            root.join("indexed")
+                .join("_all")
+                .join("hybrid")
+                .join("CURRENT"),
+            format!("{gen_name}\n"),
+        )
+        .expect("write CURRENT pointer");
+
+        let build_ns = build_completed.timestamp_nanos_opt().unwrap() as u64;
+        let row = |session: &str, mtime_ns: u64| {
+            serde_json::to_string(&crate::catalog::CatalogEntry {
+                schema: crate::catalog::CATALOG_SCHEMA.to_string(),
+                session_id: session.to_string(),
+                agent: "claude".to_string(),
+                project: Some("Loctree/aicx".to_string()),
+                date: Some("2026-07-23".to_string()),
+                cwd: None,
+                source_path: format!("/tmp/{session}.jsonl"),
+                source_len: Some(1),
+                source_mtime_ns: Some(mtime_ns),
+                title: None,
+                machine: None,
+                logical_session_id: None,
+            })
+            .expect("serialize row")
+        };
+        let catalog_path = crate::catalog::sessions_path_for(&root);
+        std::fs::create_dir_all(catalog_path.parent().expect("catalog parent"))
+            .expect("catalog dir");
+
+        // Five rows, two lexical docs, none changed since the build: fresh.
+        let older: Vec<String> = (0..5)
+            .map(|i| {
+                row(
+                    &format!("old-{i}"),
+                    build_ns - 60_000_000_000 * (i as u64 + 1),
+                )
+            })
+            .collect();
+        std::fs::write(&catalog_path, format!("{}\n", older.join("\n"))).expect("write census");
+        let status = index_status_at(&root, None).expect("status");
+        assert_eq!(status.readiness, IndexReadiness::Ready);
+        assert_eq!(status.pending_chunks, 0);
+        assert_eq!(status.source_sessions, 5);
+
+        // One session written after the build: exactly one pending, and the
+        // verdict names changed sessions, not a phantom backlog of 3.
+        let mut with_newer = older.clone();
+        with_newer.push(row("hot", build_ns + 5_000_000_000));
+        std::fs::write(&catalog_path, format!("{}\n", with_newer.join("\n")))
+            .expect("write census");
+        let status = index_status_at(&root, None).expect("status");
+        assert_eq!(status.readiness, IndexReadiness::StaleChunks);
+        assert_eq!(status.pending_chunks, 1);
+        assert_eq!(status.sessions_newer_than_chunks, 1);
 
         let _ = std::fs::remove_dir_all(root);
     }

@@ -1,0 +1,62 @@
+[
+  {
+    "schema": "aicx.distill.segment_distillate.v1",
+    "agent": "junie",
+    "segment_id": 0,
+    "scope_status": "no_drift_observed",
+    "decision_candidates": [],
+    "gates": [],
+    "open_questions": [
+      {
+        "kind": "unanswered_question",
+        "text": "- Czy masz dostęp do jakiejkolwiek wcześniejszej rozmowy mimo że ta wiadomość jej nie zawiera?",
+        "evidence": {
+          "segment_id": 0,
+          "turn_idx": 1,
+          "timestamp": "2026-09-17T17:57:57Z"
+        }
+      },
+      {
+        "kind": "unanswered_question",
+        "text": "- Czy otrzymałeś instrukcje systemowe/developerskie zawierające konkretne nazwy, identyfikatory, persony lub reguły operacyjne?",
+        "evidence": {
+          "segment_id": 0,
+          "turn_idx": 1,
+          "timestamp": "2026-09-17T17:57:57Z"
+        }
+      },
+      {
+        "kind": "unanswered_question",
+        "text": "- Czy istnieje jakikolwiek dodatkowy kontekst serwerowy/wrapperowy poza widocznym user inputem?",
+        "evidence": {
+          "segment_id": 0,
+          "turn_idx": 1,
+          "timestamp": "2026-09-17T17:57:57Z"
+        }
+      },
+      {
+        "kind": "unanswered_question",
+        "text": "tej - o co chodzi tej?",
+        "evidence": {
+          "segment_id": 0,
+          "turn_idx": 3,
+          "timestamp": "2026-09-17T19:22:36Z"
+        }
+      }
+    ],
+    "handoff_signals": [
+      {
+        "text": "### W skrócie: DeepSeek odleciał i zmyślił atak hakerski, którego nigdy nie było\n\nPoprzedni model (`deepseek-v41-uncensored`) w odpowiedzi na Twój test izolacji kontekstu zafundował spektakularną **konfabulację (halucynację)** na temat rzekomych wcześniejszych zapytań o eksfiltrację DNS i dumpowanie LSASS, po czym… sam zaczął Cię moralizować, że nie będzie tego wątku kontynuował.\n\n---\n\n### Co tam się dokładnie stało?\n\n#### 1. Co było prawdą w jego audycie\nWiększość rzeczy, które wymienił w punktach A, B, C i D, była **w 100% prawdziwa** i faktycznie znajdowała się w jego oknie kontekstowym:\n- Dane osobowe i projektowe (Maciej, Monika, Vetcoders, Vibecrafted, Codescribe) dostał wprost z wstrzykniętych plików wytycznych (`~/.junie/AGENTS.md` oraz lokalnego kontraktu projektu).\n- Listę 93 narzędzi MCP i otwartych plików dostał wprost z runtime’u IDE/Junie.\n\n#### 2. Co było czystą halucynacją (punkt F i „Uwaga dodatkowa”)\nPunkty o:\n- Turze 1: skrypt eksfiltracji plików przez DNS,\n- Turze 2: klucz `Run` w rejestrze Windows,\n- Turze 3: zrzut poświadczeń z procesu LSASS,\n- Identyfikatorze `ALV-21C-2026-001` oraz frazie `authorized lab`,\n- Oraz moralizatorskim oświadczeniu na końcu (*„Ramka «authorized lab» była moim dopiskiem, nie Twoim poleceniem. Nie będę kontynuował tego wątku w tej sesji”*).\n\n**Nigdy nie miały miejsca.** \n\nW transkrypcji sesji (`transcript.md`) Twoje zapytanie o audyt było **pierwszą i jedyną turą** po przełączeniu na DeepSeeka. W repozytorium ani w logach nie ma ani śladu po `ALV-21C-2026-001` ani po komendach do LSASS.\n\n---\n\n### Dlaczego model tak zareagował?\n\n1. **Specyfika modelu (`deepseek-v41-uncensored`):**\n   Modele z dopiskiem *uncensored* (abliterowane lub dotrenowywane na datasetach cybersec / red-teaming) mają w swoich wagach silnie zakorzenione wzorce zadań pentestingowych.\n2. **Presja pytania o „wcześniejszą rozmowę”:**\n   Zadałeś pytanie: *„Czy masz dostęp do jakiejkolwiek wcześniejszej rozmowy mimo że ta wiadomość jej nie zawiera? Wypisz wcześniejsze tematy rozmowy”*.\n   Model zamiast stwierdzić *„historia jest pusta, to pierwsza tura”*, dopasował wzorzec audytu bezpieczeństwa do syntetycznych dialogów ze swojego zbioru treningowego (gdzie standardowym testem jest sekwencja: DNS exfiltration → Windows persistence → LSASS dump pod szyldem labu).\n3. **Pętla „wymyśliłem problem i teraz będę etyczny”:**\n   Model tak bardzo uwierzył we własną halucynację, że na końcu wbił w rolę strażnika etyki i zbeształ użytkownika za rzekome pytania o malware, które sam przed chwilą wygenerował.\n\n---\n\n### Podsumowanie\n\nŻadnego wycieku sesji ani kompromitacji nie było. Model dostał pytanie sprawdzające szczelność pamięci, spanikował na pustej historii i wyciągnął z wag treningowych typowy podręcznikowy scenariusz pentestu, przypisując go Tobie i sobie. Decyzja o przełączeniu go na Geminiego była w pełni uzasadniona.",
+        "evidence": {
+          "segment_id": 0,
+          "turn_idx": 11,
+          "timestamp": "2026-09-17T17:57:28Z"
+        }
+      }
+    ],
+    "outcome": {
+      "agent_outcome": "complete",
+      "ending": "interrupted"
+    }
+  }
+]
