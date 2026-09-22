@@ -658,12 +658,17 @@ pub(crate) fn codex_subagent_session_kind(payload: Option<&serde_json::Value>) -
 /// machinery (wrapper prompts in, verdicts out) — meaningful audit evidence,
 /// but never operator project-intent. Generic subagents do real work and are
 /// NOT covered by this predicate.
+///
+/// Gated to `app`: every call site lives in the app-only intents/catalog
+/// pipeline, so the slim loctree-consumer profile would flag it as dead.
+#[cfg(feature = "app")]
 pub(crate) fn is_guardian_session_kind(session_kind: Option<&str>) -> bool {
     session_kind.is_some_and(|kind| kind.starts_with("subagent:guardian"))
 }
 
 /// Light provenance probe for the catalog hot path: read only until the
 /// first `session_meta` record (bounded) instead of scanning the rollout.
+#[cfg(feature = "app")]
 pub(crate) fn codex_session_kind_from_source(path: &Path) -> Option<String> {
     let file = fs::File::open(path).ok()?;
     let reader = BufReader::new(file);
