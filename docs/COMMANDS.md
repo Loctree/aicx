@@ -218,20 +218,49 @@ the default); two proven repo identities make the window a conflict, while
 unresolvable (historical or foreign-machine) workdirs that are not the
 baseline leave a durable unattributed mark — never a positive attribution,
 never proof of divergence, and frames carrying it never inherit any project
-bucket. Within a mixed
+bucket. Evidence that exists but could not be read — a tool call larger than
+the bounded reader's per-record cap — is unattributed for the same reason.
+Within a mixed
 session a frame must positively prove membership in the requested project —
 silence and conflicting evidence never inherit the session bucket — while
-homogeneous sessions keep the legacy bucket inheritance. The committed index
-stores whole-session chunks, so it cannot express that per-frame verdict:
-chunks flagged mixed or unattributed at index build are re-sourced through
-the census lane,
-and chunks from `session_kind = subagent:guardian` sessions are skipped.
+homogeneous sessions keep the legacy bucket inheritance.
+
+Membership is decided by **repository identity, never by path prefix**: a
+nested checkout or submodule sits lexically under its parent checkout and is
+a different repo, so its frames do not join the parent's bucket. Lexical
+containment survives only where identity is unknowable — a workdir that does
+not exist on this machine. Branch drift is not scope drift: a session that
+switches branch inside one unchanged checkout stays a normal, fully attributed
+session.
+
+**What this removes, and what it does not re-home.** Foreign frames are
+removed from the parent project's answer; they are *not* re-filed under the
+foreign project. Both intent lanes iterate sessions by their cataloged
+project, so a session cataloged as `vista` never appears under
+`-p fleet-bus`, whatever its frames' effective scope. Per-frame re-homing is a
+separate change.
+
+The committed index stores whole-session chunks, so it cannot express that
+per-frame verdict: chunks flagged mixed or unattributed at index build are
+re-sourced through the census lane — a re-source that fails (source moved or
+deleted) is counted in `source_errors` and makes the answer incomplete, never
+silently dropped. A re-sourced session is re-checked against the requested
+project first, because the catalog can have been reattributed since the index
+was built.
+
 Codex approval/guardian subagent sessions
 (`session_meta.source.subagent`, cataloged as `session_kind`) are control-plane
 machinery: their wrapper prompts and verdicts are preserved whole in the
 catalog, extracts and forensic search as audit evidence, but
 `session_kind = subagent:guardian` sessions never enter the operator
-project-intent stream.
+project-intent stream. The match is **exact**: any other subagent nickname
+(`subagent:Hooke`, and even `subagent:guardian-helper`) is an ordinary
+subagent doing real work and keeps its intents. The cataloged `session_kind`
+column is a cache, not the authority — the census hot refresh never revisits
+an unchanged source, so rows cataloged before the column existed keep `null`.
+Both intent lanes therefore resolve provenance from the rollout header when
+the column is empty; no catalog rebuild is a prerequisite for the guardian
+contract, and `aicx catalog rebuild` is what refreshes the stored column.
 
 Batch report export remains available through `aicx claude`, `aicx codex`,
 `aicx all`, and `aicx conversations`. Those commands write requested reports,

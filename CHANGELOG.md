@@ -5,6 +5,46 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
+### Turn-level project scope, decided by repository identity
+
+`aicx intents -p <project>` used to attribute a whole session to the repo its
+`turn_context` declared, so a workstream that moved to another checkout leaked
+into the wrong project. Scope is now a per-turn-window verdict built from the
+explicit `workdir` of executable tool calls, reduced at **repo-root identity**
+— never by path prefix, so a nested checkout or submodule does not join its
+parent's bucket. Unreadable or unresolvable evidence is a durable
+"unattributed" state that inherits nothing, instead of silently keeping the
+baseline. Branch drift inside one checkout is not scope drift and keeps its
+intents. Foreign frames are removed from the parent project; they are not
+re-homed to the foreign one (see `docs/COMMANDS.md`).
+
+Codex guardian/approval subagent sessions (`session_meta.source.subagent`) are
+classified as control-plane evidence: preserved in extract, index and
+conversations, never served as operator intents. The match is exact
+(`subagent:guardian`), and provenance is resolved from the rollout header when
+the catalog column is cold, so no catalog rebuild is a prerequisite.
+
+`SIGNAL_FILTER_VERSION` is `signal-v5-scope-repo-identity`: one `aicx index`
+rebuild re-stamps chunk scope metadata.
+
+#### Public API (source-breaking for struct-literal construction)
+
+- `aicx_parser::timeline::TimelineEntry` gains `scope_conflict: bool`,
+  `scope_unattributed: bool` and `session_kind: Option<String>`. All three
+  serialize only when set and deserialize with defaults, so stored JSON stays
+  compatible in both directions; code that builds the struct with a literal
+  must add the fields.
+- `aicx_parser::engine::ScopeStatus` gains the `Unattributed` variant —
+  exhaustive matches over it need a new arm. Older readers deserializing a
+  model that contains it will reject the value.
+- `aicx_parser::engine` exports `WorkdirEvidence` and `workdir_within_scope`;
+  `effective_window_scope` now takes `&[WorkdirEvidence]` instead of
+  `&[String]`.
+- `aicx::sessions::SessionInfo` gains `session_kind: Option<String>`
+  (serialize-only type; it stays part of the slim `loctree-consumer` read
+  core). The slim profile reads legacy chunk artifacts only, so the
+  catalog/index scope and guardian lanes do not apply to it.
+
 ## [0.14.0] - 2026-09-18
 
 ### Cursor is a first-class agent lane
