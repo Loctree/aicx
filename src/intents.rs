@@ -452,24 +452,6 @@ fn extend_with_cap<T>(
 /// Identity provenance for records served from the committed lexical index.
 pub const INDEX_IDENTITY_SOURCE: &str = "index-v1";
 
-/// Serve chunk documents from the committed lexical index.
-///
-/// The index already stores, per session, the canonical extract verbatim plus
-/// the resolved identity (project, agent, date, session id, cwd) — the exact
-/// inputs this module used to rebuild by re-parsing every original transcript
-/// on every call. Reading them back is the same work `aicx search` does in
-/// milliseconds.
-///
-/// Returns `None` when the index cannot serve the request, so the caller falls
-/// back to the census walk instead of silently reporting an empty timeline:
-/// - no published CURRENT generation (`aicx index` never ran),
-/// - a hot-window request, where freshly written sessions are not committed
-///   yet and only the live source scan can see them, or
-/// - a full-history request (`hours == 0`), which is the durable-identity join
-///   `overlay` performs. Overlay freezes `intent1:` evidence refs, so its input
-///   set must stay the census: the index is signal-filtered at write time and
-///   covers only what was committed, and swapping the source under it would
-///   move revisions that are meant to be stable.
 /// Every metadata key the index lane's scope decisions read.
 #[cfg(feature = "app")]
 const SCOPE_METADATA_CONTRACT: [&str; 3] = ["scope_conflict", "scope_unattributed", "session_kind"];
@@ -494,6 +476,24 @@ fn chunk_states_scope(metadata: &serde_json::Value) -> bool {
         .all(|key| metadata.get(key).is_some())
 }
 
+/// Serve chunk documents from the committed lexical index.
+///
+/// The index already stores, per session, the canonical extract verbatim plus
+/// the resolved identity (project, agent, date, session id, cwd) — the exact
+/// inputs this module used to rebuild by re-parsing every original transcript
+/// on every call. Reading them back is the same work `aicx search` does in
+/// milliseconds.
+///
+/// Returns `None` when the index cannot serve the request, so the caller falls
+/// back to the census walk instead of silently reporting an empty timeline:
+/// - no published CURRENT generation (`aicx index` never ran),
+/// - a hot-window request, where freshly written sessions are not committed
+///   yet and only the live source scan can see them, or
+/// - a full-history request (`hours == 0`), which is the durable-identity join
+///   `overlay` performs. Overlay freezes `intent1:` evidence refs, so its input
+///   set must stay the census: the index is signal-filtered at write time and
+///   covers only what was committed, and swapping the source under it would
+///   move revisions that are meant to be stable.
 #[cfg(feature = "app")]
 fn collect_intent_files_from_index(
     aicx_home: &Path,

@@ -559,7 +559,7 @@ pub fn build_with_reporter(
         // catalog row's project.
         let session_mixed = scope.scope_foreign_to(entry.cwd.as_deref());
         let session_unattributed = frames.iter().any(|frame| frame.scope_unattributed);
-        let scope_cwds: Vec<String> = scope.cwds.iter().cloned().collect();
+        let scope_cwds: Vec<String> = scope.cwds.to_vec();
         // Frames carry the provenance resolved at the source, which is the
         // only lane that can see it for a catalog row cataloged before the
         // column existed.
