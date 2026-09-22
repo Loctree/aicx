@@ -305,3 +305,41 @@ fn normative_contract_taxonomy_fixture_is_exhaustive_across_agents() {
             && matches!(unit["level"].as_str(), Some("physical" | "logical"))
     }));
 }
+
+/// Finding: `ScopeStatus` gained `unattributed` and started reaching
+/// consumers while `docs/OUTPUT_PROJECTION_CONTRACT.md` still declared the
+/// three states of an older grammar — and one of those three,
+/// `homogeneous`, had already been renamed. A decoder written from that
+/// document rejects a valid response.
+///
+/// The document is the published grammar, so the code holds it to account
+/// rather than the other way round.
+#[test]
+fn the_contract_document_declares_every_emitted_scope_status() {
+    let doc = fixture("docs/OUTPUT_PROJECTION_CONTRACT.md");
+    for status in ScopeStatus::ALL {
+        assert!(
+            doc.contains(status.as_str()),
+            "docs/OUTPUT_PROJECTION_CONTRACT.md does not declare `{}`",
+            status.as_str()
+        );
+    }
+    // A retired value may be NAMED in the history note; it may not still be
+    // DECLARED, which is any line that both describes `scope_status` and
+    // spells the old value.
+    for retired in ["homogeneous"] {
+        let stale: Vec<&str> = doc
+            .lines()
+            .filter(|line| line.contains("scope_status") && line.contains(retired))
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "docs/OUTPUT_PROJECTION_CONTRACT.md still declares retired `{retired}`:\n{}",
+            stale.join("\n")
+        );
+    }
+    assert!(
+        doc.contains(SESSION_MODEL_SCHEMA),
+        "the contract document must name the model contract version it describes"
+    );
+}

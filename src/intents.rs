@@ -470,6 +470,30 @@ pub const INDEX_IDENTITY_SOURCE: &str = "index-v1";
 ///   set must stay the census: the index is signal-filtered at write time and
 ///   covers only what was committed, and swapping the source under it would
 ///   move revisions that are meant to be stable.
+/// Every metadata key the index lane's scope decisions read.
+#[cfg(feature = "app")]
+const SCOPE_METADATA_CONTRACT: [&str; 3] = ["scope_conflict", "scope_unattributed", "session_kind"];
+
+/// Does this chunk STATE its scope, or merely omit it?
+///
+/// A chunk written before these keys existed carries none of them, and every
+/// reader below takes absence for a clean answer: not mixed, not
+/// unattributed, not a guardian. The Tantivy schema version does not move for
+/// a metadata addition, so `open_current_adapter_at` admits such a generation
+/// and it keeps serving foreign frames and control-plane prompts until
+/// someone happens to re-run `aicx index`.
+///
+/// Presence is the contract, not truth: the builder writes all three keys on
+/// every chunk it publishes, `null` included. A chunk that cannot state its
+/// scope is re-sourced through the census lane, exactly like one that states
+/// a bad scope.
+#[cfg(feature = "app")]
+fn chunk_states_scope(metadata: &serde_json::Value) -> bool {
+    SCOPE_METADATA_CONTRACT
+        .iter()
+        .all(|key| metadata.get(key).is_some())
+}
+
 #[cfg(feature = "app")]
 fn collect_intent_files_from_index(
     aicx_home: &Path,
@@ -519,13 +543,16 @@ fn collect_intent_files_from_index(
                 .unwrap_or_default()
                 .to_string()
         };
+        let states_scope = chunk_states_scope(metadata);
         // Guardian sessions are control-plane evidence: kept whole in the
         // index for forensic search, never served as operator intents.
-        if crate::sessions::is_guardian_session_kind(
-            metadata
-                .get("session_kind")
-                .and_then(|value| value.as_str()),
-        ) {
+        if states_scope
+            && crate::sessions::is_guardian_session_kind(
+                metadata
+                    .get("session_kind")
+                    .and_then(|value| value.as_str()),
+            )
+        {
             continue;
         }
         // Whole-session chunks cannot express per-frame scope. A session
@@ -540,7 +567,7 @@ fn collect_intent_files_from_index(
                 .get("scope_unattributed")
                 .and_then(|value| value.as_bool())
                 == Some(true);
-        if scope_flagged {
+        if !states_scope || scope_flagged {
             mixed_ids.insert((field("agent"), field("session_id")));
             continue;
         }

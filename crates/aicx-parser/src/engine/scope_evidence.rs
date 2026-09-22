@@ -181,22 +181,16 @@ pub fn truncated_record_is_tool_call(prefix: &str) -> bool {
     // visible prefix rather than a fixed head: the discriminator can sit
     // after a megabyte of `arguments`. Over-cap records are rare and their
     // bytes are already in hand.
-    let has_type = |value: &str| {
-        prefix.contains(&format!(r#""type":"{value}""#))
-            || prefix.contains(&format!(r#""type": "{value}""#))
-    };
+    let discriminators = record_type_discriminators(prefix);
     // `function_call_output` / `mcp_tool_call_end` are RESULTS, not calls:
-    // they carry no workdir, so an oversized one is not lost evidence. The
-    // trailing quote in the needle keeps them out.
-    if [
-        "function_call",
-        "custom_tool_call",
-        "tool_call",
-        "mcp_tool_call",
-    ]
-    .iter()
-    .any(|kind| has_type(kind))
-    {
+    // they carry no workdir, so an oversized one is not lost evidence. Exact
+    // equality against the parsed value keeps them out.
+    if discriminators.iter().any(|value| {
+        matches!(
+            value.as_str(),
+            "function_call" | "custom_tool_call" | "tool_call" | "mcp_tool_call"
+        )
+    }) {
         return true;
     }
     // Otherwise the question is whether the PAYLOAD discriminator was
@@ -205,9 +199,106 @@ pub fn truncated_record_is_tool_call(prefix: &str) -> bool {
     // payload type, hiding a tool call behind a megabyte of `arguments`.
     // Seeing one discriminator (the envelope's) or none is not evidence that
     // nothing was lost, so it fails closed.
-    let discriminators =
-        prefix.matches(r#""type":"#).count() + prefix.matches(r#""type": "#).count();
-    discriminators < 2
+    discriminators.len() < 2
+}
+
+/// Values of every `"type"` key that can be a RECORD discriminator in the
+/// readable head of a truncated record, in order.
+///
+/// A truncated record is never valid JSON, so this is a byte scanner rather
+/// than a parse. Two things make it structural rather than a substring count:
+///
+/// * it tracks JSON string state, so `"type":` written inside an argument
+///   body is text, not a key; and
+/// * it tracks nesting depth and keeps only the envelope (depth 1) and its
+///   payload (depth 2), which is where a Codex record's discriminators live.
+///
+/// Both matter for the same reason: the threshold below decides whether an
+/// unreadable record is allowed to keep its window attributed. A count that
+/// payload CONTENT can raise — an `arguments` object carrying its own
+/// `"type"` field — hands that decision to the very bytes we could not read.
+fn record_type_discriminators(prefix: &str) -> Vec<String> {
+    /// Deepest nesting level at which a `"type"` key is still the record's
+    /// own discriminator: 1 is the envelope, 2 its `payload`.
+    const DISCRIMINATOR_DEPTH: usize = 2;
+
+    let bytes = prefix.as_bytes();
+    // Reads the string token starting at `bytes[at] == b'"'`, returning its
+    // contents and the index just past the closing quote. An unterminated
+    // string (the truncation itself) ends the scan.
+    let read_string = |at: usize| -> Option<(String, usize)> {
+        let mut out = String::new();
+        let mut cursor = at + 1;
+        while cursor < bytes.len() {
+            match bytes[cursor] {
+                b'\\' => cursor += 2,
+                b'"' => return Some((out, cursor + 1)),
+                byte => {
+                    out.push(byte as char);
+                    cursor += 1;
+                }
+            }
+        }
+        None
+    };
+
+    let mut found = Vec::new();
+    let mut depth = 0usize;
+    let mut idx = 0usize;
+    while idx < bytes.len() {
+        match bytes[idx] {
+            b'{' | b'[' => {
+                depth += 1;
+                idx += 1;
+                continue;
+            }
+            b'}' | b']' => {
+                depth = depth.saturating_sub(1);
+                idx += 1;
+                continue;
+            }
+            b'"' => {}
+            _ => {
+                idx += 1;
+                continue;
+            }
+        }
+        let Some((token, after)) = read_string(idx) else {
+            break;
+        };
+        idx = after;
+        if token != "type" || depth > DISCRIMINATOR_DEPTH {
+            continue;
+        }
+        // A `"type"` token is only a discriminator when it is used as a KEY.
+        let mut cursor = idx;
+        while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        if cursor >= bytes.len() || bytes[cursor] != b':' {
+            continue;
+        }
+        cursor += 1;
+        while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        // A discriminator truncated before its value is still a discriminator
+        // that was there: counting it keeps the fail-closed threshold honest.
+        match bytes.get(cursor) {
+            Some(b'"') => match read_string(cursor) {
+                Some((value, after)) => {
+                    found.push(value);
+                    idx = after;
+                }
+                None => {
+                    found.push(String::new());
+                    break;
+                }
+            },
+            _ => found.push(String::new()),
+        }
+    }
+    found
 }
 
 /// Normalize one explicit workdir to its repo-level identity.
@@ -374,11 +465,24 @@ fn declared_submodule(scope_root: &str, path: &str) -> bool {
         Ok(relative) => relative.to_string_lossy().replace('\\', "/"),
         Err(_) => return false,
     };
+    let relative = trim_path(&relative);
     raw.lines()
         .map(str::trim)
         .filter_map(|line| line.strip_prefix("path"))
         .filter_map(|rest| rest.trim().strip_prefix('='))
-        .any(|declared| trim_path(declared.trim()) == trim_path(&relative))
+        .map(|declared| trim_path(declared.trim()))
+        .filter(|declared| !declared.is_empty())
+        // A submodule's DESCENDANTS are the submodule's repository too. A
+        // vanished `vendor/fleet-bus/src` is still inside the declared
+        // `vendor/fleet-bus`, so exact equality alone would let the parent
+        // checkout absorb it. The boundary is a path component, never a
+        // character prefix: `vendor/fleet-bus-old` is a different directory.
+        .any(|declared| {
+            relative == declared
+                || relative
+                    .strip_prefix(declared)
+                    .is_some_and(|rest| rest.starts_with('/'))
+        })
 }
 
 /// Do these two paths resolve to two DIFFERENT checkouts on this machine?
@@ -874,6 +978,85 @@ mod tests {
         );
         assert_eq!(path, None);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Finding: a submodule's DESCENDANTS belong to the submodule, not to the
+    /// parent that declares it. Exact `.gitmodules` matching absorbed a
+    /// vanished `vendor/fleet-bus/src` into the parent checkout and let the
+    /// window keep the parent's positive attribution.
+    #[test]
+    fn a_vanished_path_inside_a_declared_submodule_is_not_the_parent() {
+        let root = scratch("submodule-descendant");
+        let parent = root.join("vista");
+        std::fs::create_dir_all(parent.join(".git")).expect("parent git dir");
+        std::fs::write(
+            parent.join(".gitmodules"),
+            "[submodule \"fleet-bus\"]\n\tpath = vendor/fleet-bus\n\turl = https://example.invalid/fleet-bus.git\n",
+        )
+        .expect("write .gitmodules");
+        let base = parent.to_string_lossy().into_owned();
+
+        let inside = parent.join("vendor").join("fleet-bus").join("src");
+        let (scope, path) =
+            effective_window_scope(&explicit(&[&inside.to_string_lossy()]), Some(&base));
+        assert_eq!(
+            scope,
+            WindowScope::Unattributed,
+            "a path under a declared submodule must not inherit the parent checkout"
+        );
+        assert_eq!(path, None);
+
+        // The boundary is a path COMPONENT: a sibling that merely starts with
+        // the declared spelling is an ordinary vanished directory.
+        let sibling = parent.join("vendor").join("fleet-bus-old");
+        let (scope, _) =
+            effective_window_scope(&explicit(&[&sibling.to_string_lossy()]), Some(&base));
+        assert_eq!(
+            scope,
+            WindowScope::Baseline,
+            "`fleet-bus-old` is not inside the declared `fleet-bus`"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Finding: the fail-closed threshold for an over-cap record counted raw
+    /// `"type":` substrings anywhere in the visible prefix. An `arguments`
+    /// object carrying its own `type` field therefore raised the count past
+    /// the threshold and bought the record a not-a-tool-call verdict — the
+    /// unreadable payload deciding whether it had to be treated as opaque.
+    #[test]
+    fn argument_content_cannot_talk_an_over_cap_record_out_of_being_a_tool_call() {
+        // Envelope discriminator readable, payload discriminator truncated
+        // away, and the visible argument body carries a nested `type` key.
+        let prefix = concat!(
+            r#"{"timestamp":"2026-09-22T00:00:00Z","type":"response_item","payload":{"#,
+            r#""arguments":{"cmd":"deploy","env":{"type":"noise"},"workdir":"/other/checkout"#
+        );
+        assert!(
+            truncated_record_is_tool_call(prefix),
+            "payload content must never satisfy the discriminator threshold"
+        );
+
+        // The same text inside a STRING body is equally inert.
+        let quoted = concat!(
+            r#"{"timestamp":"2026-09-22T00:00:00Z","type":"response_item","payload":{"#,
+            r#""arguments":"{\"cmd\":\"rg 'type': src\",\"workdir\":\"/other/checkout"#
+        );
+        assert!(
+            truncated_record_is_tool_call(quoted),
+            "argument text must never satisfy the discriminator threshold"
+        );
+
+        // A plainly readable non-call record still keeps its evidence: both
+        // real discriminators survived the cap, so nothing was lost.
+        let readable = concat!(
+            r#"{"timestamp":"2026-09-22T00:00:00Z","type":"response_item","payload":{"#,
+            r#""type":"message","role":"assistant","content":[{"#
+        );
+        assert!(
+            !truncated_record_is_tool_call(readable),
+            "two structural discriminators, neither a call"
+        );
     }
 
     /// Finding: replaying a session whose checkout is gone from this machine.

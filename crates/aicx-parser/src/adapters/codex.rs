@@ -391,14 +391,17 @@ fn assemble_codex(
                 state.consume(&value, classified.evidence.clone())?;
             }
             ClassifiedDisposition::Skipped { reason, visible } => {
-                // An over-cap unit is drained, never parsed, so `push_tool_turn`
-                // never sees its workdir. If the visible head says tool call,
-                // this window MIGHT have moved repos and this lane will never
-                // know — record that ignorance so the window fails closed,
-                // exactly as the bounded index reader already does. Without it
-                // the surrounding messages keep the baseline cwd and a foreign
+                // A unit that never became a `Value` never reaches
+                // `push_tool_turn`, so its workdir is invisible to this lane.
+                // Two ways in: an over-cap unit is drained without parsing,
+                // and a malformed one fails to parse at all. Neither is
+                // evidence that nothing moved repos — the difference between
+                // them is only WHY we could not read it, which is no
+                // difference at all from the scope's point of view. Record the
+                // ignorance so the window fails closed. Without it the
+                // surrounding messages keep the baseline cwd and a foreign
                 // workdir leaks into the parent project.
-                if *reason == SkippedReason::Oversized {
+                if matches!(reason, SkippedReason::Oversized | SkippedReason::Malformed) {
                     state.note_opaque_window(&raw.bytes);
                 }
                 state.observe_skip(classified, *reason, *visible, raw.boundary);
@@ -454,6 +457,9 @@ struct Assembly<'a> {
 #[derive(Clone)]
 struct SegmentDraft {
     cwd: Known<String>,
+    /// Host-resolved repository identity for this window; never folded into
+    /// `cwd`, which stays the recorded fact. See `Segment::scope_root`.
+    scope_root: Option<String>,
     branch: Known<String>,
     started_at: Known<String>,
     ended_at: Known<String>,
@@ -629,6 +635,7 @@ impl<'a> Assembly<'a> {
         if !self.turns.is_empty() {
             let draft = SegmentDraft {
                 cwd: self.current_cwd.clone(),
+                scope_root: None,
                 branch: self.current_branch.clone(),
                 started_at: self.segment_started_at.clone(),
                 ended_at: Known::unknown(),
@@ -670,7 +677,11 @@ impl<'a> Assembly<'a> {
         match scope {
             WindowScope::Consistent => {
                 if let Some(path) = path {
-                    segment.cwd = Known::value(path);
+                    // The RECORDED cwd stays untouched: it is what the rollout
+                    // said, and the canonical fingerprint is built from it. The
+                    // resolved identity is host-specific evidence and travels
+                    // beside it.
+                    segment.scope_root = Some(path);
                 }
             }
             WindowScope::Conflict => {
@@ -1310,6 +1321,7 @@ impl<'a> Assembly<'a> {
         if self.segments.is_empty() {
             self.segments.push(SegmentDraft {
                 cwd: self.current_cwd.clone(),
+                scope_root: None,
                 branch: self.current_branch.clone(),
                 started_at: self.segment_started_at.clone(),
                 ended_at: Known::unknown(),
@@ -1338,6 +1350,7 @@ impl<'a> Assembly<'a> {
                 merged.last(),
                 Some(last)
                     if last.cwd == draft.cwd
+                        && last.scope_root == draft.scope_root
                         && last.branch == draft.branch
                         && last.scope_conflict == draft.scope_conflict
                         && last.scope_unattributed == draft.scope_unattributed
@@ -1523,6 +1536,7 @@ impl<'a> Assembly<'a> {
                     (segment.start_turn <= end).then_some(Segment {
                         segment_id: id as u32,
                         cwd: segment.cwd,
+                        scope_root: segment.scope_root,
                         branch: segment.branch,
                         started_at: segment.started_at,
                         ended_at: segment.ended_at,
@@ -2050,6 +2064,44 @@ mod tests {
         );
     }
 
+    /// A malformed tool call never becomes a `Value` either, so its workdir
+    /// is just as invisible as an over-cap one. Only the oversized case was
+    /// routed through the opaque path, so a truncated envelope carrying the
+    /// window's only foreign workdir left the window looking clean and the
+    /// surrounding messages kept the baseline cwd.
+    #[test]
+    fn a_malformed_tool_call_makes_its_window_unattributed() {
+        // Under the cap, but unparseable: the envelope is cut mid-record.
+        let malformed = concat!(
+            r#"{"timestamp":"2026-07-13T00:00:03Z","type":"response_item","payload":"#,
+            r#"{"type":"function_call","name":"shell","arguments":"{\"workdir\":\"/repo/beta\""#
+        );
+        let bytes = [
+            r#"{"timestamp":"2026-07-13T00:00:00Z","type":"session_meta","payload":{"id":"44444444-4444-4444-8444-444444444444","timestamp":"2026-07-13T00:00:00Z","cwd":"/repo/alpha","model":"gpt-test"}}"#,
+            r#"{"timestamp":"2026-07-13T00:00:01Z","type":"turn_context","payload":{"turn_id":"t1","cwd":"/repo/alpha","model":"gpt-test"}}"#,
+            r#"{"timestamp":"2026-07-13T00:00:02Z","type":"event_msg","payload":{"type":"user_message","message":"Run something."}}"#,
+            malformed,
+            r#"{"timestamp":"2026-07-13T00:00:04Z","type":"event_msg","payload":{"type":"agent_message","message":"Done."}}"#,
+        ]
+        .join("\n")
+            + "\n";
+
+        let model = parse(bytes.as_bytes(), "44444444-4444-4444-8444-444444444444");
+
+        assert!(
+            model
+                .segments
+                .iter()
+                .any(|segment| segment.scope_status == ScopeStatus::Unattributed),
+            "an unreadable tool call must leave its window unattributed, got {:?}",
+            model
+                .segments
+                .iter()
+                .map(|segment| segment.scope_status)
+                .collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn minimal_oracle_and_explicit_source() {
         let bytes = include_bytes!("../../../../tests/fixtures/parser_engine/codex/minimal.jsonl");
@@ -2214,6 +2266,10 @@ mod tests {
     /// but one turn window runs its executable tool calls with an explicit
     /// foreign workdir. The whole window — including the message BEFORE the
     /// first tool call — takes the workdir's repo scope.
+    ///
+    /// The scope lands in `scope_root`, NOT in `cwd`: `cwd` is what the
+    /// rollout recorded and feeds the canonical fingerprint, while the repo
+    /// root is this host's resolution of the workdir and must stay out of it.
     #[test]
     fn tool_call_workdir_rescopes_the_whole_turn_window() {
         let fleet = temp_repo("fleet");
@@ -2245,9 +2301,20 @@ mod tests {
             seg_cwds,
             vec![
                 Some("/sessions/vista"),
-                Some(fleet_str.as_str()),
+                Some("/sessions/vista"),
                 Some("/sessions/vista")
-            ]
+            ],
+            "the recorded baseline is a fact and is never overwritten"
+        );
+        let seg_scopes: Vec<Option<&str>> = model
+            .segments
+            .iter()
+            .map(|segment| segment.scope_root.as_deref())
+            .collect();
+        assert_eq!(
+            seg_scopes,
+            vec![None, Some(fleet_str.as_str()), None],
+            "the resolved repo identity rides the non-canonical field"
         );
         let fleet_window_turns: Vec<&Turn> = model
             .turns

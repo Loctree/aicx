@@ -378,6 +378,7 @@ impl AgentAdapter for GrokAdapter {
         if !turns.is_empty() {
             model.segments.push(Segment {
                 segment_id: 0,
+                scope_root: None,
                 scope_status: crate::engine::ScopeStatus::from_evidence(
                     Some(cwd.as_str()),
                     branch.as_deref(),

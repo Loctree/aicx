@@ -540,6 +540,7 @@ impl Analysis {
             let end = model.turns.len() as u64 - 1;
             model.segments = vec![Segment {
                 segment_id: 0,
+                scope_root: None,
                 cwd: Known::unknown(),
                 branch: Known::unknown(),
                 started_at: model.provenance.started_at.clone(),

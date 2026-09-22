@@ -733,6 +733,7 @@ mod tests {
             turn_range: TurnRange { start: 0, end: 6 },
             scope_status: ScopeStatus::NoDriftObserved,
             scope_conflict: false,
+            scope_root: None,
         }];
         model
     }
@@ -789,6 +790,7 @@ mod tests {
                 turn_range: TurnRange { start: 0, end: 1 },
                 scope_status: ScopeStatus::NoDriftObserved,
                 scope_conflict: false,
+                scope_root: None,
             },
             Segment {
                 segment_id: 1,
@@ -799,6 +801,7 @@ mod tests {
                 turn_range: TurnRange { start: 2, end: 3 },
                 scope_status: ScopeStatus::MixedCandidate,
                 scope_conflict: false,
+                scope_root: None,
             },
         ];
         model

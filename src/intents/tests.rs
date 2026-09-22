@@ -4943,3 +4943,44 @@ fn full_history_requests_never_take_the_index_path() {
         "hot-window requests must fall through to the census"
     );
 }
+
+/// Finding: a `CURRENT` generation built before the scope keys existed
+/// carries none of them, and every reader in the index lane took absence for
+/// a clean answer — not mixed, not unattributed, not a guardian. The Tantivy
+/// schema version does not move for a metadata addition, so nothing rejected
+/// such a generation; it kept serving foreign frames and guardian prompts
+/// until an operator happened to re-run `aicx index`.
+#[cfg(feature = "app")]
+#[test]
+fn a_chunk_that_cannot_state_its_scope_is_not_a_clean_chunk() {
+    let current = serde_json::json!({
+        "project": "vetcoders/aicx",
+        "scope_conflict": false,
+        "scope_unattributed": false,
+        "session_kind": serde_json::Value::Null,
+    });
+    assert!(
+        chunk_states_scope(&current),
+        "the builder writes every contract key, `null` included"
+    );
+
+    let pre_upgrade = serde_json::json!({ "project": "vetcoders/aicx" });
+    assert!(
+        !chunk_states_scope(&pre_upgrade),
+        "a chunk from before the contract states nothing about its scope"
+    );
+
+    // One missing key is enough: each carries a different refusal.
+    for key in SCOPE_METADATA_CONTRACT {
+        let mut partial = current.clone();
+        partial
+            .as_object_mut()
+            .expect("object")
+            .remove(key)
+            .expect("key present");
+        assert!(
+            !chunk_states_scope(&partial),
+            "a chunk missing `{key}` does not state its scope"
+        );
+    }
+}

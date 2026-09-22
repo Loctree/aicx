@@ -42,6 +42,12 @@ struct CanonicalProvenance<'a> {
 
 /// C0A segment fields only. `Segment::scope_status` (W2-R1) is derived
 /// evidence and stays out of the frozen fingerprint.
+///
+/// `cwd` is here because it is the fact the rollout RECORDED.
+/// `Segment::scope_root` is deliberately absent: it is this host's
+/// resolution of that fact against the local filesystem, so including it
+/// would give the same source bytes different fingerprints on different
+/// machines — the opposite of what a canonical projection is for.
 #[derive(Serialize)]
 struct CanonicalSegment<'a> {
     segment_id: u32,

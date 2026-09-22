@@ -250,6 +250,7 @@ mod tests {
             turn_range: TurnRange { start: 0, end: 0 },
             scope_status: ScopeStatus::NoDriftObserved,
             scope_conflict: false,
+            scope_root: None,
         }
     }
 

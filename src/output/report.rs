@@ -824,8 +824,17 @@ pub fn timeline_entries_from_model(model: &SessionModel) -> Vec<TimelineEntry> {
                 branch: segment
                     .and_then(|segment| known_str(&segment.branch))
                     .map(str::to_string),
+                // The resolved repository identity when this host could
+                // prove one, otherwise the cwd the rollout recorded. The two
+                // are kept apart in the model so the canonical fingerprint
+                // stays independent of the machine doing the parsing.
                 cwd: segment
-                    .and_then(|segment| known_str(&segment.cwd))
+                    .and_then(|segment| {
+                        segment
+                            .scope_root
+                            .as_deref()
+                            .or_else(|| known_str(&segment.cwd))
+                    })
                     .map(str::to_string),
                 // The explicit fact, carried by the model — never inferred
                 // from the generic mixed status. A Claude segment records

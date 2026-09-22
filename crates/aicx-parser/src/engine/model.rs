@@ -16,7 +16,15 @@ use super::frames::FrameClass;
 use super::source::AgentKind;
 use serde::{Deserialize, Serialize};
 
-pub const SESSION_MODEL_SCHEMA: &str = "aicx.parser.session_model.v1";
+/// Version of the `SessionModel` contract.
+///
+/// `v2` (W2-R1 follow-up) widens [`ScopeStatus`] with `unattributed` and adds
+/// [`Segment::scope_root`]. Both are additive, but a decoder written against
+/// the `v1` grammar treats `ScopeStatus` as closed and rejects the new value
+/// outright, so the widening is announced rather than slipped in. The emitted
+/// grammar itself is [`ScopeStatus::ALL`], which
+/// `docs/OUTPUT_PROJECTION_CONTRACT.md` is held to by a contract test.
+pub const SESSION_MODEL_SCHEMA: &str = "aicx.parser.session_model.v2";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -82,6 +90,18 @@ pub struct Segment {
     /// read this flag instead of inferring it from the generic status.
     #[serde(default)]
     pub scope_conflict: bool,
+    /// Repository identity this span's explicit tool-call workdirs resolved
+    /// to ON THIS HOST, when they agreed on one.
+    ///
+    /// Deliberately separate from [`Self::cwd`], which stays the fact the
+    /// rollout RECORDED. Resolving an identity reads the local filesystem —
+    /// which checkouts exist, how symlinks resolve, what `.gitmodules`
+    /// declares — so folding it into `cwd` made the canonical fingerprint of
+    /// identical source bytes differ from machine to machine. This field is
+    /// excluded from the canonical projection for that reason; consumers that
+    /// want the resolved bucket read it explicitly and fall back to `cwd`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope_root: Option<String>,
 }
 
 /// Structural scope verdict for a [`Segment`] or a whole conversation.
@@ -112,6 +132,28 @@ pub enum ScopeStatus {
 }
 
 impl ScopeStatus {
+    /// Every variant, in the order the contract documents them.
+    ///
+    /// The one place the emitted grammar is enumerated, so that the
+    /// contract document can be held to the code rather than maintained
+    /// beside it: a value listed here and missing from
+    /// `docs/OUTPUT_PROJECTION_CONTRACT.md` fails the contract test in
+    /// `crates/aicx-parser/tests/normative_contract.rs`. The `homogeneous`
+    /// → `no_drift_observed` rename reached consumers with that document
+    /// still naming the old value, and `unattributed` repeated it; this is
+    /// what stops a third round.
+    ///
+    /// Adding a variant means adding it here too — the exhaustive matches
+    /// below name every variant, but nothing forces this array to grow, so
+    /// it is a convention the test enforces one step later, not a compiler
+    /// guarantee.
+    pub const ALL: [Self; 4] = [
+        Self::NoDriftObserved,
+        Self::MixedCandidate,
+        Self::Unattributed,
+        Self::Unknown,
+    ];
+
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::NoDriftObserved => "no_drift_observed",

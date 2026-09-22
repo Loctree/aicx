@@ -764,6 +764,7 @@ impl<'a> Assembly<'a> {
                     let end = model.turns.len() as u64 - 1;
                     (segment.start_turn <= end).then_some(Segment {
                         segment_id: id as u32,
+                        scope_root: None,
                         cwd: Known::unknown(),
                         branch: Known::unknown(),
                         started_at: segment.started_at,

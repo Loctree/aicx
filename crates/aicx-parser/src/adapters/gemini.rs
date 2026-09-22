@@ -1258,6 +1258,7 @@ fn finalize_segments(drafts: Vec<SegmentDraft>, turns: &[Turn]) -> Vec<Segment> 
         .enumerate()
         .map(|(i, d)| Segment {
             segment_id: i as u32,
+            scope_root: None,
             scope_status: crate::engine::ScopeStatus::from_evidence(
                 match &d.cwd {
                     Known::Value(cwd) => Some(cwd.as_str()),

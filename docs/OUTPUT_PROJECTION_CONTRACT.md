@@ -15,7 +15,27 @@ away:
 | `SessionModel::snapshot` | `SourceSnapshotRef { path, content_hash, bytes, observed_at, cutoff }` | Names the bytes. Same hash = identical bytes, never "same event"; an appended turn changes it without a fork. `PackageIdentity` is this pair, not a conversation id. |
 | `Turn::frame_class` → `TimelineEntry::frame_class` | `Option<FrameClass>` | `ProjectionKind::from_frame_class` decides the kind; `--dialog` reveals `EchoSeal` by class, `--kind inter_agent` selects `InterAgent` by class, `LineageMeta` is not `Inject`. The role / `frame_kind` bridge in `conversation.rs` is the fallback for class-less entries only (store chunks, importers, lanes the throne does not own). |
 | `SessionModel::context_epochs` | `Vec<ContextEpochRef>` | A compaction is an epoch of the same conversation (summary provenance + replaced refs + trigger), never a second source in `--lineage`. |
-| `Segment::scope_status` / `SessionModel::scope_status()` | `homogeneous \| mixed_candidate \| unknown` | Structural only (distinct cwds / branch drift). A `mixed_candidate` makes `continuity` refuse a single distilled history (`RefusalReason::MixedWorkstream`) unless `distill_mixed` is passed; `intents` records from such sessions carry a `scope_status=mixed_candidate …` evidence line. Topic-level mixing inside one cwd is not detected and is not guessed. |
+| `Segment::scope_status` / `SessionModel::scope_status()` | `no_drift_observed \| mixed_candidate \| unattributed \| unknown` | Structural only (distinct cwds / branch drift / explicit tool-call workdirs). A `mixed_candidate` makes `continuity` refuse a single distilled history (`RefusalReason::MixedWorkstream`) unless `distill_mixed` is passed; `intents` records from such sessions carry a `scope_status=mixed_candidate …` evidence line. Topic-level mixing inside one cwd is not detected and is not guessed. |
+| `Segment::scope_root` | `Option<String>` | The repo identity a span's explicit tool-call workdirs resolved to **on the reading host**. Deliberately NOT in the canonical projection: resolution reads the local filesystem, so folding it into `Segment::cwd` gave identical source bytes different canonical fingerprints per machine. Consumers that want the resolved bucket read this and fall back to the recorded `cwd`. |
+
+### Scope grammar (`aicx.parser.session_model.v2`)
+
+`ScopeStatus` is a closed enum on the wire, so every value it can take is
+listed here and a contract test
+(`crates/aicx-parser/tests/normative_contract.rs`) fails the build when this
+document and `ScopeStatus::ALL` disagree:
+
+| Value | Meaning |
+|---|---|
+| `no_drift_observed` | One known cwd, no observed branch drift. Not proof of a single workstream — absence of drift evidence is not evidence of homogeneity. |
+| `mixed_candidate` | Several cwds and/or branches inside the span, or a scope that is hidden from this view. A candidate, not a verdict. |
+| `unattributed` | Explicit scope evidence exists but does not resolve to a repository here, or could not be read at all (an over-cap or malformed tool-call record). Never a positive attribution and never proof of divergence; such a span inherits no project bucket. |
+| `unknown` | No cwd/branch evidence at all. |
+
+Two values changed after `v1` and both reached consumers before this document
+did: `homogeneous` was renamed `no_drift_observed`, and `unattributed` was
+added. A decoder pinned to the `v1` grammar rejects the new value rather than
+mis-reading it, which is why the model contract carries a version at all.
 
 `--lineage` builds a `LineageGraph` (nodes = tagged refs, edges =
 `declared_fork` / `parent_thread` / `shared_prefix`). A parent laid under its

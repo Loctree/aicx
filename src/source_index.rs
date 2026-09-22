@@ -39,7 +39,7 @@ const MAX_JSONL_RECORD_BYTES: usize = 2 * 1024 * 1024;
 /// short-circuited forever, leaving search previews full of
 /// `{"type":"thought","data":"..."}` spam. Including this constant forces a
 /// one-shot rebuild so index truth tracks filter truth.
-pub(crate) const SIGNAL_FILTER_VERSION: &str = "signal-v5-scope-repo-identity";
+pub(crate) const SIGNAL_FILTER_VERSION: &str = "signal-v6-scope-fails-closed";
 
 const PARSE_STATE_SCHEMA: &str = "aicx.source_parse_state.v1";
 const PARSE_STATE_RELPATH: &str = "indexed/_all/source_parse_state.v1.json";
@@ -205,6 +205,89 @@ struct SessionParseRecord {
     /// it so the intents index lane can exclude control-plane sessions.
     #[serde(default)]
     session_kind: Option<String>,
+    /// Identity of the FILESYSTEM the scope verdicts above were computed
+    /// against (see [`scope_environment_fingerprint`]).
+    ///
+    /// Those verdicts resolve repository identity on this host, so they can
+    /// go stale while the source bytes and the catalog row stay byte-identical
+    /// — a nested checkout created or removed, a `.gitmodules` edited. Old
+    /// ledgers deserialize to empty, which never matches and so never reuses.
+    #[serde(default)]
+    scope_environment: String,
+    /// Distinct cwds observed in this session's frames, which is what the
+    /// fingerprint above is recomputed from at reuse time.
+    #[serde(default)]
+    scope_cwds: Vec<String>,
+}
+
+/// Identity of the repository layout that a session's scope verdicts depend on.
+///
+/// Scope resolution reads the local filesystem: which `.git` ancestor a path
+/// has, how symlinks resolve, what `.gitmodules` declares. The reuse gate
+/// otherwise keys only on source bytes and catalog fields, so creating or
+/// removing a nested checkout — or editing `.gitmodules` — left a cached
+/// extract servable under verdicts the current filesystem no longer supports.
+///
+/// Deliberately bounded to what can be recomputed without re-parsing the
+/// source: the baseline's repo root, the submodule declarations at that root,
+/// and how each recorded frame cwd resolves today. A change the parser would
+/// see but this cannot is a re-parse away in any case, because it takes a
+/// source change to produce one.
+fn scope_environment_fingerprint(baseline: Option<&str>, scope_cwds: &[String]) -> String {
+    use aicx_parser::engine::{WorkdirIdentity, normalize_workdir};
+
+    /// How one path resolves today, as bytes, plus the repo root when it has
+    /// one.
+    fn resolution(value: &str) -> (Vec<u8>, Option<std::path::PathBuf>) {
+        match normalize_workdir(value, None) {
+            WorkdirIdentity::Resolved(root) => {
+                let mut bytes = b"resolved\0".to_vec();
+                bytes.extend_from_slice(root.to_string_lossy().as_bytes());
+                bytes.push(0);
+                (bytes, Some(root))
+            }
+            WorkdirIdentity::Unresolved(path) => {
+                let mut bytes = b"unresolved\0".to_vec();
+                bytes.extend_from_slice(path.as_bytes());
+                bytes.push(0);
+                (bytes, None)
+            }
+        }
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"aicx.scope_environment.v1\0");
+
+    match baseline.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(base) => {
+            let (bytes, root) = resolution(base);
+            hasher.update(&bytes);
+            if let Some(root) = root {
+                // Submodule declarations decide whether a vanished path is a
+                // repository of its own, so their content is part of the
+                // environment, not merely their presence.
+                match fs::read(root.join(".gitmodules")) {
+                    Ok(body) => {
+                        hasher.update(b"gitmodules\0");
+                        hasher.update(sha256_hex(&body).as_bytes());
+                    }
+                    Err(_) => hasher.update(b"no-gitmodules\0"),
+                }
+            }
+        }
+        None => hasher.update(b"no-baseline\0"),
+    }
+
+    let mut cwds: Vec<&str> = scope_cwds.iter().map(String::as_str).collect();
+    cwds.sort_unstable();
+    cwds.dedup();
+    for cwd in cwds {
+        hasher.update(b"cwd\0");
+        hasher.update(cwd.as_bytes());
+        hasher.update([0]);
+        hasher.update(&resolution(cwd).0);
+    }
+    hex::encode(hasher.finalize())
 }
 
 /// Build or preview the global lexical index from the durable catalog.
@@ -476,6 +559,7 @@ pub fn build_with_reporter(
         // catalog row's project.
         let session_mixed = scope.scope_foreign_to(entry.cwd.as_deref());
         let session_unattributed = frames.iter().any(|frame| frame.scope_unattributed);
+        let scope_cwds: Vec<String> = scope.cwds.iter().cloned().collect();
         // Frames carry the provenance resolved at the source, which is the
         // only lane that can see it for a catalog row cataloged before the
         // column existed.
@@ -539,6 +623,8 @@ pub fn build_with_reporter(
                 scope_conflict: session_mixed,
                 scope_unattributed: session_unattributed,
                 session_kind: resolved_kind.clone(),
+                scope_environment: scope_environment_fingerprint(entry.cwd.as_deref(), &scope_cwds),
+                scope_cwds,
             },
         );
     }
@@ -1673,6 +1759,13 @@ fn try_reuse_cached_extract(
     if record.cwd != entry.cwd {
         return None;
     }
+    // The verdicts also depend on the repository layout on this host, which
+    // can change without the source or the catalog row changing at all.
+    if record.scope_environment
+        != scope_environment_fingerprint(entry.cwd.as_deref(), &record.scope_cwds)
+    {
+        return None;
+    }
     // Zeroed legacy records (pre-fingerprint schema) never reuse.
     if record.source_len == 0 || record.source_mtime_ns == 0 {
         return None;
@@ -2128,6 +2221,8 @@ mod tests {
                 scope_conflict: false,
                 scope_unattributed: false,
                 session_kind: None,
+                scope_environment: scope_environment_fingerprint(entry.cwd.as_deref(), &[]),
+                scope_cwds: Vec::new(),
             },
         );
 
@@ -2150,6 +2245,28 @@ mod tests {
             try_reuse_cached_extract(&root, &rescoped, &prior, &key, &allow, "ignore-fingerprint")
                 .is_none(),
             "a moved catalog cwd must force a reparse, not reuse stale scope flags"
+        );
+
+        // The verdicts also depend on the repository layout on this host,
+        // which moves without the source or the catalog row moving at all.
+        // An old ledger states no layout, which is not the current one.
+        let mut stale_layout = prior.clone();
+        stale_layout
+            .sessions
+            .get_mut(&key)
+            .unwrap()
+            .scope_environment = String::new();
+        assert!(
+            try_reuse_cached_extract(
+                &root,
+                &entry,
+                &stale_layout,
+                &key,
+                &allow,
+                "ignore-fingerprint"
+            )
+            .is_none(),
+            "a cached extract whose layout identity no longer matches must reparse"
         );
 
         // Source path drift invalidates reuse.
@@ -2524,5 +2641,69 @@ mod tests {
             opaque_frames[0].scope_unattributed,
             "an over-cap record this reader could not classify is not proof of the baseline"
         );
+    }
+    /// Finding: the scope verdicts stored in the parse ledger are resolved
+    /// against the local filesystem, but the reuse gate keyed only on source
+    /// bytes and catalog fields. Creating or removing a nested checkout, or
+    /// editing `.gitmodules`, therefore left a cached extract servable under
+    /// verdicts the current layout no longer supports.
+    #[test]
+    fn the_repository_layout_is_part_of_a_cached_extracts_identity() {
+        let root = std::env::temp_dir().join(format!(
+            "aicx-scope-env-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let parent = root.join("vista");
+        let nested = parent.join("vendor").join("fleet-bus");
+        fs::create_dir_all(parent.join(".git")).unwrap();
+        fs::create_dir_all(&nested).unwrap();
+
+        let baseline = parent.to_string_lossy().into_owned();
+        let cwds = vec![nested.to_string_lossy().into_owned()];
+        let before = scope_environment_fingerprint(Some(&baseline), &cwds);
+
+        // A nested checkout appears: that path is now a repository of its own
+        // and the frames under it stop belonging to the parent.
+        fs::create_dir_all(nested.join(".git")).unwrap();
+        let with_nested = scope_environment_fingerprint(Some(&baseline), &cwds);
+        assert_ne!(
+            before, with_nested,
+            "a new nested checkout changes what the stored verdicts mean"
+        );
+
+        // And it disappears again.
+        fs::remove_dir_all(nested.join(".git")).unwrap();
+        assert_eq!(
+            before,
+            scope_environment_fingerprint(Some(&baseline), &cwds),
+            "the same layout is the same identity"
+        );
+
+        // `.gitmodules` decides whether a vanished path is its own
+        // repository, so its CONTENT is part of the environment.
+        fs::write(
+            parent.join(".gitmodules"),
+            "[submodule \"fleet-bus\"]\n\tpath = vendor/fleet-bus\n",
+        )
+        .unwrap();
+        let declared = scope_environment_fingerprint(Some(&baseline), &cwds);
+        assert_ne!(before, declared, "a new submodule declaration is a change");
+        fs::write(
+            parent.join(".gitmodules"),
+            "[submodule \"other\"]\n\tpath = vendor/other\n",
+        )
+        .unwrap();
+        assert_ne!(
+            declared,
+            scope_environment_fingerprint(Some(&baseline), &cwds),
+            "and so is editing one"
+        );
+
+        let _ = fs::remove_dir_all(&root);
     }
 }

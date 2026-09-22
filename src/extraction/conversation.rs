@@ -903,14 +903,19 @@ impl ScopeReport {
         if self.scope_mixed() {
             return true;
         }
-        baseline
-            .map(str::trim)
-            .filter(|base| !base.is_empty())
-            .is_some_and(|base| {
-                self.cwds
-                    .iter()
-                    .any(|cwd| !aicx_parser::engine::workdir_within_scope(cwd, base))
-            })
+        match baseline.map(str::trim).filter(|base| !base.is_empty()) {
+            Some(base) => self
+                .cwds
+                .iter()
+                .any(|cwd| !aicx_parser::engine::workdir_within_scope(cwd, base)),
+            // No cataloged checkout at all, but frames that name one. There
+            // is nothing to prove membership AGAINST, and "cannot prove" is
+            // not "belongs here": serving the session whole would stamp every
+            // frame with the catalog row's project on no evidence, while the
+            // per-frame census lane rejects exactly those cwds because it
+            // cannot prove them either. The two lanes have to agree.
+            None => !self.cwds.is_empty(),
+        }
     }
 }
 
@@ -1746,9 +1751,18 @@ mod harness_noise_tests {
         let inside = scope_report_for_entries(&[subdir]);
         assert!(!inside.scope_foreign_to(Some("/repos/vista")));
 
-        // Without a cataloged checkout there is nothing to be foreign to.
-        assert!(!report.scope_foreign_to(None));
-        assert!(!report.scope_foreign_to(Some("   ")));
+        // Without a cataloged checkout there is nothing to prove membership
+        // AGAINST — which is not the same as proving membership. A row with a
+        // project but no cwd would otherwise publish the whole session under
+        // that project while the per-frame census lane rejected the very same
+        // cwds, the two lanes disagreeing about one session.
+        assert!(report.scope_foreign_to(None));
+        assert!(report.scope_foreign_to(Some("   ")));
+
+        // Nothing observed, nothing claimed: a session with no cwd evidence
+        // at all is not made foreign by the absence of a baseline.
+        let silent = scope_report_for_entries(&[entry("user", "no cwd anywhere", 3)]);
+        assert!(!silent.scope_foreign_to(None));
     }
 
     #[test]

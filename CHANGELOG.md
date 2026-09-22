@@ -45,14 +45,18 @@ A session consistently re-scoped to a single foreign checkout is flagged as
 foreign instead of passing as homogeneous. The Codex provenance probe is now
 bounded in bytes as well as records.
 
-`SIGNAL_FILTER_VERSION` is `signal-v5-scope-repo-identity`: one `aicx index`
+`SIGNAL_FILTER_VERSION` is `signal-v6-scope-fails-closed`: one `aicx index`
 rebuild re-stamps chunk scope metadata. Frames re-scoped by explicit workdir
-evidence now carry the CANONICAL repo root as their cwd. Because that canonical
-spelling is what `.aicxignore` is compared against, checkout denials now match
-in every spelling both sides can produce: a rule written as `/var/...` still
-hides a frame stamped `/private/var/...`, and any checkout reached through a
-symlink stays hidden. The deny-list fingerprint is therefore `v2` and one
-rebuild re-filters content admitted under the narrower match.
+evidence now carry the CANONICAL repo root as their scope. Because that
+canonical spelling is what `.aicxignore` is compared against, checkout denials
+now match in every spelling both sides can produce: a rule written as
+`/var/...` still hides a frame stamped `/private/var/...`, and any checkout
+reached through a symlink stays hidden. The deny-list fingerprint is therefore
+`v3` — it covers the RESOLVED targets as well as the rule text, so retargeting
+a symlink invalidates caches built under the old target instead of quietly
+republishing a newly denied checkout. Resolving an incoming cwd is now lazy
+(a literal hit never asks the filesystem) and memoized per distinct cwd, so a
+large history pays one resolution per cwd rather than one per frame.
 
 One question, one predicate. "Is this session's scope mixed?" is answered by
 `ScopeReport::scope_mixed()` everywhere — the single-history refusal, the
@@ -76,10 +80,51 @@ verdicts they carry were computed against the previous one.
 Two adapter-level repairs in the same area: a Codex rollout with two
 consecutive `turn_context` records and no turn between them no longer produces
 an empty window whose range ends before it starts, which had made the whole
-rollout fail kernel validation; and an over-cap tool call in the full-parser
+rollout fail kernel validation; and an unreadable tool call in the full-parser
 lane now contributes the same "unreadable evidence" mark the bounded index
 reader already recorded, so its window fails closed instead of keeping the
-baseline cwd.
+baseline cwd. Unreadable covers both ways in — an over-cap record that is
+drained without parsing, and a malformed one that fails to parse — because the
+reason we could not read it makes no difference to the scope.
+
+#### Host resolution is out of the deterministic parser model
+
+Resolving repository identity reads the local filesystem: which checkouts
+exist, how symlinks resolve, what `.gitmodules` declares. Folding that answer
+into `Segment::cwd` put it into the canonical projection, so identical rollout
+bytes produced different canonical fingerprints on different machines. The
+recorded cwd is a fact and stays one; the resolved repo root now rides
+`Segment::scope_root`, which is deliberately excluded from
+`canonical_bytes`/`canonical_fingerprint`. Consumers that want the resolved
+bucket read it and fall back to the recorded `cwd`.
+
+The verdicts derived from that resolution are cached, so the cache now knows
+what they depended on. A cached extract is reused only when the repository
+layout still matches the one its verdicts were computed against — a nested
+checkout created or removed, or a `.gitmodules` edited, forces a reparse even
+though the source bytes and the catalog row are untouched.
+
+#### Absence is not an answer
+
+Three places read a missing value as a clean one. A catalog row with a project
+but no cwd gave the per-frame filter nothing to prove membership against, and
+published the whole session under that project while the census lane rejected
+the very same frames — the two lanes disagreeing about one session; a row with
+frame cwd evidence and no baseline is now routed through the census lane. An
+index chunk written before the scope keys existed carried none of them, and
+every reader took that for "not mixed, not unattributed, not a guardian"; such
+a chunk is now re-sourced rather than served, since the index schema version
+does not move for a metadata addition. And the fail-closed threshold for an
+unreadable record counted raw `"type":` substrings anywhere in the visible
+bytes, so an `arguments` payload carrying its own `type` field could raise the
+count past the threshold and talk itself out of being treated as opaque; the
+scan is now structural, counting only discriminators at record and payload
+depth.
+
+A submodule's descendants are the submodule's repository too: `.gitmodules`
+paths are matched on a path-component boundary, so a vanished
+`vendor/fleet-bus/src` is no longer absorbed into the parent checkout while
+`vendor/fleet-bus-old` correctly is not.
 
 #### Public API (source-breaking for struct-literal construction)
 
@@ -90,7 +135,16 @@ baseline cwd.
   must add the fields.
 - `aicx_parser::engine::ScopeStatus` gains the `Unattributed` variant —
   exhaustive matches over it need a new arm. Older readers deserializing a
-  model that contains it will reject the value.
+  model that contains it will reject the value, which is why
+  `SESSION_MODEL_SCHEMA` moves to `aicx.parser.session_model.v2`. The emitted
+  grammar is enumerated once in `ScopeStatus::ALL` and
+  `docs/OUTPUT_PROJECTION_CONTRACT.md` is held to it by a contract test: that
+  document had been declaring `homogeneous`, a value renamed before this
+  release, and never learned about `unattributed`.
+- `aicx_parser::engine::Segment` gains `scope_root: Option<String>` (serde
+  default, skipped when absent): this host's resolution of the span's explicit
+  tool-call workdirs. It is NOT part of the canonical projection — see above.
+  Code that builds `Segment` with a literal must add the field.
 - `aicx_parser::engine::Segment` gains `scope_conflict: bool` (serde default):
   the explicit "two proven repository identities" fact, which downstream
   filters read instead of inferring it from `ScopeStatus::MixedCandidate` —

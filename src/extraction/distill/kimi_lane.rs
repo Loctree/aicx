@@ -400,6 +400,7 @@ mod tests {
                 turn_range: TurnRange { start: 0, end: 0 },
                 scope_status: ScopeStatus::MixedCandidate,
                 scope_conflict: false,
+                scope_root: None,
             })
             .collect();
         model

@@ -338,6 +338,7 @@ mod tests {
             turn_range: aicx_parser::engine::TurnRange { start: 0, end: 0 },
             scope_status: ScopeStatus::Unknown,
             scope_conflict: false,
+            scope_root: None,
         };
         let lane = GenericLane::new(AgentKind::Kimi);
         let model = minimal_model(AgentKind::Kimi);

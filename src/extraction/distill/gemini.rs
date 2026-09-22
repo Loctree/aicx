@@ -428,6 +428,7 @@ mod tests {
                 },
                 scope_status: ScopeStatus::NoDriftObserved,
                 scope_conflict: false,
+                scope_root: None,
             },
             Segment {
                 segment_id: 1,
@@ -438,6 +439,7 @@ mod tests {
                 turn_range: TurnRange { start: 0, end: 0 }, // only user turn, no assistant reply -> partial/interrupted
                 scope_status: ScopeStatus::MixedCandidate,
                 scope_conflict: false,
+                scope_root: None,
             },
         ];
 

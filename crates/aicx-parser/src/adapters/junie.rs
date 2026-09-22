@@ -747,6 +747,7 @@ impl<'a> Assembly<'a> {
         if !model.turns.is_empty() {
             model.segments.push(Segment {
                 segment_id: 0,
+                scope_root: None,
                 scope_status: crate::engine::ScopeStatus::from_evidence(
                     match &self.cwd {
                         Known::Value(cwd) => Some(cwd.as_str()),

@@ -135,6 +135,11 @@ the path (`/var/…`, or a checkout reached through a symlink) still hides the
 frame recorded as `/private/var/…`. Write the path you use; matching resolves
 the rest.
 
+The deny list's identity covers where its rules RESOLVE, not only how they are
+written: retarget a symlink a rule points through and caches built under the
+old target are invalidated, so the newly denied checkout cannot be republished
+from content filtered under the previous one.
+
 ### Multi-machine / sync (operator truth)
 
 1. **Session JSONL sync** — catalog only discovers files under this host's agent
@@ -224,8 +229,11 @@ the default); two proven repo identities make the window a conflict, while
 unresolvable (historical or foreign-machine) workdirs that are not the
 baseline leave a durable unattributed mark — never a positive attribution,
 never proof of divergence, and frames carrying it never inherit any project
-bucket. Evidence that exists but could not be read — a tool call larger than
-the bounded reader's per-record cap — is unattributed for the same reason.
+bucket. Evidence that exists but could not be read is unattributed for the
+same reason, whether it was too large for the bounded reader's per-record cap
+or malformed: why we could not read it makes no difference to the scope. That
+decision is made structurally, so an oversized payload cannot spend its own
+unreadable bytes arguing it was never a tool call.
 Within a mixed
 session a frame must positively prove membership in the requested project —
 silence and conflicting evidence never inherit the session bucket — while
@@ -272,7 +280,22 @@ to the legacy path-name filter: a checkout at `…/vista/vendor/fleet-bus` spell
 to nothing at all.
 
 A submodule is recognised from the checkout root's `.gitmodules`, whatever
-subdirectory the session ran in.
+subdirectory the session ran in, and its descendants belong to it: a vanished
+`vendor/fleet-bus/src` is inside the declared `vendor/fleet-bus`. The boundary
+is a path component, so `vendor/fleet-bus-old` is an ordinary directory.
+
+A cataloged row with a project but no cwd gives membership nothing to prove
+itself against, which is not the same as proving it: such a session is routed
+through the census lane rather than published whole under the row's project.
+
+Where a frame's scope came from is recorded in two places for two reasons. The
+cwd the rollout wrote down is a fact and is never overwritten; this host's
+resolution of it into a repository root is kept separately, because resolution
+depends on which checkouts exist here and must not change the session's
+canonical fingerprint. Cached extracts are reused only while that repository
+layout still holds: create or remove a nested checkout, or edit `.gitmodules`,
+and the affected sessions are reparsed even though their source bytes and
+catalog rows are unchanged.
 
 **What this removes, and what it does not re-home.** Foreign frames are
 removed from the parent project's answer; they are *not* re-filed under the
@@ -282,8 +305,9 @@ project, so a session cataloged as `vista` never appears under
 separate change.
 
 The committed index stores whole-session chunks, so it cannot express that
-per-frame verdict: chunks flagged mixed or unattributed at index build are
-re-sourced through the census lane — a re-source that fails (source moved or
+per-frame verdict: chunks flagged mixed or unattributed at index build — and
+chunks from a generation built before those flags existed, which state nothing
+about their scope — are re-sourced through the census lane — a re-source that fails (source moved or
 deleted) is counted in `source_errors` and makes the answer incomplete, never
 silently dropped. A re-sourced session is re-checked against the requested
 project first, because the catalog can have been reattributed since the index
