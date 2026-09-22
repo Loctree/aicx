@@ -21,7 +21,15 @@ while read -r _lref lsha _rref rsha; do
   case "$lsha" in *[!0]*) : ;; *) continue ;; esac  # ref deletion: nothing to test
   HAVE_RANGE=1
   if printf '%s' "$rsha" | grep -qE '^0+$' || ! git cat-file -e "$rsha" 2>/dev/null; then
-    base=$(git merge-base "$lsha" origin/develop 2>/dev/null || true)
+    # Compare against the repository's actual default branch. Hardcoding
+    # origin/develop made every first push of a new branch fall back to a
+    # branch this repo abandoned on 2026-07-15: the merge-base landed hundreds
+    # of commits back, the range covered 215 .rs files, and a docs-only push
+    # ran the full cargo suite locally - the exact opposite of the light gate
+    # this block exists to select.
+    default_ref=$(git symbolic-ref --quiet refs/remotes/origin/HEAD 2>/dev/null || true)
+    [ -z "$default_ref" ] && default_ref=origin/main
+    base=$(git merge-base "$lsha" "$default_ref" 2>/dev/null || true)
     if [ -n "$base" ]; then
       files=$(git diff --name-only "$base" "$lsha")
     else
