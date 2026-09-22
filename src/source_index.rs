@@ -2218,8 +2218,8 @@ mod tests {
 {"timestamp":"2026-01-01T00:03:20Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"conflicted turn"}]}}
 "#;
         let body = template
-            .replace("@FLEET@", &fleet.display().to_string())
-            .replace("@OTHER@", &other.display().to_string());
+            .replace("@FLEET@", &json_path(&fleet))
+            .replace("@OTHER@", &json_path(&other));
         fs::write(&source_path, body).unwrap();
 
         let entry = CatalogEntry {
@@ -2258,6 +2258,15 @@ mod tests {
         assert!(frames[2].scope_conflict);
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Substitute a filesystem path into a JSONL fixture: a Windows path is
+    /// `C:\Users\…`, and pasting it raw into a JSON string literal produces
+    /// invalid escapes (`\U`), so the record silently fails to parse and the
+    /// window loses the only workdir evidence it had.
+    fn json_path(path: &Path) -> String {
+        let quoted = serde_json::Value::String(path.display().to_string()).to_string();
+        quoted[1..quoted.len() - 1].to_string()
     }
 
     fn bounded_scope_root(label: &str) -> std::path::PathBuf {

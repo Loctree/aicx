@@ -116,19 +116,20 @@ pub fn tool_call_workdir(payload: &Value) -> Option<String> {
 }
 
 /// `workdir` key inside an object literal, quote style agnostic:
-/// `workdir:"/p"`, `"workdir": "/p"`, `'workdir': '/p'`, and the
-/// backslash-escaped spelling that survives inside a raw JSONL record
-/// (`\"workdir\":\"/p\"`).
+/// `workdir:"/p"`, `"workdir": "/p"`, `'workdir': '/p'`.
 ///
 /// Codex writes `custom_tool_call.input` as model-authored JavaScript, so the
 /// quote style is whatever the model emitted. Accepting only JSON-style double
 /// quotes silently dropped real evidence and left the window on its baseline
 /// project — the leak this module exists to close.
+///
+/// The value runs to the closing quote and may contain backslashes: a Windows
+/// workdir is `C:\repo\crate`, and stopping the capture at the first backslash
+/// would reduce it to the drive letter.
 fn workdir_in_literal(input: &str) -> Option<String> {
     static WORKDIR_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let re = WORKDIR_RE.get_or_init(|| {
-        regex::Regex::new(r#"(?:\\?["'])?workdir(?:\\?["'])?\s*:\s*\\?["']([^"'\\]+)"#)
-            .expect("valid regex")
+        regex::Regex::new(r#"["']?workdir["']?\s*:\s*["']([^"']+)"#).expect("valid regex")
     });
     let value = re.captures(input)?.get(1)?.as_str().trim();
     (!value.is_empty()).then(|| value.to_string())
@@ -327,6 +328,22 @@ mod tests {
         )
         .expect("fixture payload");
         assert_eq!(tool_call_workdir(&mixed).as_deref(), Some("/foreign/other"));
+    }
+
+    /// A Windows workdir is `C:\repo\crate`. A capture that stops at the first
+    /// backslash reduces it to `C:` — no evidence, and the window silently
+    /// keeps a baseline it never verified.
+    #[test]
+    fn workdir_with_backslashes_survives_the_literal_scanner() {
+        let payload: Value = serde_json::json!({
+            "type": "custom_tool_call",
+            "name": "exec",
+            "input": r#"tools.exec_command({cmd:"cargo test",workdir:"C:\Users\runner\fleet-bus"})"#,
+        });
+        assert_eq!(
+            tool_call_workdir(&payload).as_deref(),
+            Some(r"C:\Users\runner\fleet-bus")
+        );
     }
 
     #[test]

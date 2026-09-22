@@ -38,6 +38,36 @@ fn unique_root(label: &str) -> PathBuf {
     ))
 }
 
+/// Substitute a filesystem path into a JSONL fixture.
+///
+/// A Windows path is `C:\Users\…`; pasted raw into a JSON string literal it
+/// produces invalid escapes (`\U`), the record fails to parse, and the fixture
+/// goes silently empty instead of failing loudly. `serde_json` writes the
+/// escapes; the surrounding quotes are stripped because the template supplies
+/// them.
+fn json_path(path: &Path) -> String {
+    let quoted = serde_json::Value::String(path.display().to_string()).to_string();
+    quoted[1..quoted.len() - 1].to_string()
+}
+
+/// Write a JSONL rollout fixture, proving every line parses first.
+///
+/// Silent invalidity is the failure mode that matters here: a raw Windows path
+/// pasted into a JSON string literal makes the record unparseable, the reader
+/// skips it, and the fixture asserts against an empty result instead of the
+/// shape it meant to describe. Fail at the fixture, loudly, on every platform.
+fn write_rollout(path: PathBuf, body: &str) {
+    for (index, line) in body.lines().enumerate() {
+        serde_json::from_str::<serde_json::Value>(line).unwrap_or_else(|error| {
+            panic!(
+                "fixture line {} is not valid JSON ({error}); a raw path in a JSON string?\n{line}",
+                index + 1
+            )
+        });
+    }
+    fs::write(path, body).expect("write rollout fixture");
+}
+
 fn make_repo(root: &Path, name: &str) -> PathBuf {
     let repo = root.join("workspaces").join(name);
     fs::create_dir_all(repo.join(".git")).expect("repo .git dir");
@@ -70,14 +100,14 @@ fn write_mixed_rollout(root: &Path, vista: &Path, fleet: &Path, other: &Path) ->
 "#;
     let body = template
         .replace("@SID@", session_id)
-        .replace("@VISTA@", &vista.display().to_string())
-        .replace("@FLEET@", &fleet.display().to_string())
-        .replace("@OTHER@", &other.display().to_string());
+        .replace("@VISTA@", &json_path(vista))
+        .replace("@FLEET@", &json_path(fleet))
+        .replace("@OTHER@", &json_path(other));
     let path = rollout_path(
         root,
         &format!("rollout-2026-01-01T00-00-00-{session_id}.jsonl"),
     );
-    fs::write(path, body).expect("write mixed rollout");
+    write_rollout(path, &body);
     session_id.to_string()
 }
 
@@ -89,12 +119,12 @@ fn write_homogeneous_rollout(root: &Path, vista: &Path) -> String {
 "#;
     let body = template
         .replace("@SID@", session_id)
-        .replace("@VISTA@", &vista.display().to_string());
+        .replace("@VISTA@", &json_path(vista));
     let path = rollout_path(
         root,
         &format!("rollout-2026-01-01T01-00-00-{session_id}.jsonl"),
     );
-    fs::write(path, body).expect("write homogeneous rollout");
+    write_rollout(path, &body);
     session_id.to_string()
 }
 
@@ -157,6 +187,36 @@ fn extract(root: &Path, frame_kind: aicx::timeline::FrameKind) -> IntentExtracti
     Aicx::with_aicx_home(&aicx_home)
         .extract_intents(&vista_config(frame_kind))
         .expect("extract intents through public API")
+}
+
+/// The failure this harness actually had on Windows: a raw `C:\Users\…`
+/// substituted into a JSON string literal is an invalid escape sequence, so
+/// the record never parses, the reader skips it, and every assertion in the
+/// file runs against an empty result — green logic, silent fixture.
+#[test]
+fn fixture_paths_are_json_escaped() {
+    let windows_like = Path::new(r"C:\Users\runner\workspaces\vista");
+    let escaped = json_path(windows_like);
+    assert_eq!(escaped, r"C:\\Users\\runner\\workspaces\\vista");
+
+    let line = format!(r#"{{"type":"turn_context","payload":{{"cwd":"{escaped}"}}}}"#);
+    let value: serde_json::Value =
+        serde_json::from_str(&line).expect("an escaped path keeps the record parseable");
+    assert_eq!(
+        value["payload"]["cwd"],
+        serde_json::json!(r"C:\Users\runner\workspaces\vista"),
+        "and it round-trips to the original path"
+    );
+
+    // The raw substitution this harness used to do does not parse at all.
+    let raw = format!(
+        r#"{{"type":"turn_context","payload":{{"cwd":"{}"}}}}"#,
+        windows_like.display()
+    );
+    assert!(
+        serde_json::from_str::<serde_json::Value>(&raw).is_err(),
+        "raw path substitution must be recognised as the bug it is"
+    );
 }
 
 #[test]
@@ -256,12 +316,12 @@ fn write_guardian_rollout(root: &Path, vista: &Path) -> String {
 "#;
     let body = template
         .replace("@SID@", session_id)
-        .replace("@VISTA@", &vista.display().to_string());
+        .replace("@VISTA@", &json_path(vista));
     let path = rollout_path(
         root,
         &format!("rollout-2026-01-01T02-00-00-{session_id}.jsonl"),
     );
-    fs::write(path, body).expect("write guardian rollout");
+    write_rollout(path, &body);
     session_id.to_string()
 }
 
@@ -273,12 +333,12 @@ fn write_plain_wrapper_rollout(root: &Path, vista: &Path) -> String {
 "#;
     let body = template
         .replace("@SID@", session_id)
-        .replace("@VISTA@", &vista.display().to_string());
+        .replace("@VISTA@", &json_path(vista));
     let path = rollout_path(
         root,
         &format!("rollout-2026-01-01T03-00-00-{session_id}.jsonl"),
     );
-    fs::write(path, body).expect("write plain wrapper rollout");
+    write_rollout(path, &body);
     session_id.to_string()
 }
 
@@ -465,12 +525,12 @@ fn write_unresolved_foreign_rollout(root: &Path, vista: &Path) -> String {
 "#;
     let body = template
         .replace("@SID@", session_id)
-        .replace("@VISTA@", &vista.display().to_string());
+        .replace("@VISTA@", &json_path(vista));
     let path = rollout_path(
         root,
         &format!("rollout-2026-01-01T04-00-00-{session_id}.jsonl"),
     );
-    fs::write(path, body).expect("write unresolved foreign rollout");
+    write_rollout(path, &body);
     session_id.to_string()
 }
 

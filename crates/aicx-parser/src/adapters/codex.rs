@@ -2044,6 +2044,14 @@ mod tests {
         assert!(base_ids.iter().all(|id| !id.contains('/')));
     }
 
+    /// Substitute a filesystem path into a JSONL fixture: a Windows path is
+    /// `C:\Users\…`, and pasting it raw into a JSON string literal produces
+    /// invalid escapes (`\U`), so the record silently fails to parse.
+    fn json_path(path: &Path) -> String {
+        let quoted = Value::String(path.display().to_string()).to_string();
+        quoted[1..quoted.len() - 1].to_string()
+    }
+
     fn temp_repo(label: &str) -> std::path::PathBuf {
         let root =
             std::env::temp_dir().join(format!("aicx-codex-scope-{label}-{}", std::process::id()));
@@ -2070,7 +2078,7 @@ mod tests {
 {"timestamp":"2026-01-01T00:04:00Z","type":"turn_context","payload":{"cwd":"/sessions/vista"}}
 {"timestamp":"2026-01-01T00:04:10Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"back to vista"}]}}
 "#;
-        let bytes = template.replace("@FLEET@", &fleet_str);
+        let bytes = template.replace("@FLEET@", &json_path(&fleet));
         let model = parse(bytes.as_bytes(), "s1");
         assert_eq!(model.segments.len(), 3, "{:?}", model.segments);
         let seg_cwds: Vec<Option<&str>> = model
@@ -2113,8 +2121,8 @@ mod tests {
 {"timestamp":"2026-01-01T00:02:00Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"worked in two repos"}]}}
 "#;
         let bytes = template
-            .replace("@A@", repo_a.to_string_lossy().as_ref())
-            .replace("@B@", repo_b.to_string_lossy().as_ref());
+            .replace("@A@", &json_path(&repo_a))
+            .replace("@B@", &json_path(&repo_b));
         let model = parse(bytes.as_bytes(), "s1");
         assert_eq!(model.segments.len(), 1, "{:?}", model.segments);
         assert_eq!(known_value(&model.segments[0].cwd), None);
