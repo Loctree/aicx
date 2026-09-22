@@ -106,7 +106,11 @@ struct HomeGuard<'a> {
 
 impl<'a> HomeGuard<'a> {
     fn set(root: &Path) -> Self {
-        let lock = HOME_LOCK.lock().expect("home lock");
+        // One failing test must not turn every later one into an unrelated
+        // `PoisonError` and hide which contract actually broke.
+        let lock = HOME_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let previous_home = std::env::var("HOME").ok();
         let previous_aicx = std::env::var("AICX_HOME").ok();
         unsafe {
@@ -556,6 +560,245 @@ fn unresolved_foreign_window_inherits_nothing_in_any_lane() {
             mixed_scope
         );
     }
+
+    drop(_guard);
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// Rewrite every catalog row in place through a JSON transform. Used to
+/// simulate catalog states the hot-window refresh will never revisit.
+fn rewrite_catalog_rows(aicx_home: &Path, mut transform: impl FnMut(&mut serde_json::Value)) {
+    let path = aicx::catalog::sessions_path_for(aicx_home);
+    let body = fs::read_to_string(&path).expect("read catalog");
+    let mut out = String::new();
+    for line in body.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let mut row: serde_json::Value = serde_json::from_str(line).expect("parse catalog row");
+        transform(&mut row);
+        out.push_str(&row.to_string());
+        out.push('\n');
+    }
+    fs::write(&path, out).expect("write catalog");
+}
+
+/// Provenance must not depend on a catalog column that no upgrade path fills.
+///
+/// `aicx index` reads the census rows; the census hot refresh
+/// (`scan_hot_window_skipping`) never revisits a source whose fingerprint is
+/// unchanged. A guardian session cataloged before the column existed therefore
+/// keeps `session_kind: null` through any number of index rebuilds — and its
+/// wrapper prompts and `Verdict:` replies re-enter the operator intent stream.
+/// The lanes that open the rollout must establish provenance themselves.
+#[test]
+fn cold_catalog_rows_still_exclude_guardian_sessions_in_both_lanes() {
+    let root = unique_root("coldguardian");
+    let _guard = HomeGuard::set(&root);
+    let vista = make_repo(&root, "vista");
+    let guardian_sid = write_guardian_rollout(&root, &vista);
+    let plain_sid = write_plain_wrapper_rollout(&root, &vista);
+
+    let aicx_home = root.join(".aicx");
+    aicx::catalog::rebuild(&aicx_home, &root).expect("rebuild catalog over fixture home");
+    // The pre-column state: rows exist, provenance does not.
+    rewrite_catalog_rows(&aicx_home, |row| {
+        if let Some(object) = row.as_object_mut() {
+            object.remove("session_kind");
+        }
+    });
+    let cold: Vec<_> = aicx::catalog::read_entries_at(&aicx_home)
+        .expect("read catalog")
+        .into_iter()
+        .filter(|entry| entry.session_kind.is_some())
+        .collect();
+    assert!(
+        cold.is_empty(),
+        "fixture must start with cold rows: {cold:?}"
+    );
+
+    // Census lane (hours: 0).
+    let census = extract(&root, aicx::timeline::FrameKind::UserMsg);
+    let census_agent = extract(&root, aicx::timeline::FrameKind::AgentReply);
+    for extraction in [&census, &census_agent] {
+        assert!(
+            !extraction
+                .records
+                .iter()
+                .any(|record| record.session_id == guardian_sid),
+            "guardian session leaked through the census lane from a cold catalog row: {:?}",
+            extraction
+                .records
+                .iter()
+                .filter(|record| record.session_id == guardian_sid)
+                .map(|record| &record.summary)
+                .collect::<Vec<_>>()
+        );
+    }
+    assert!(
+        census
+            .records
+            .iter()
+            .chain(census_agent.records.iter())
+            .any(|record| record.session_id == plain_sid),
+        "the plain control session must still produce operator intents"
+    );
+
+    // Index lane: build CURRENT from the same cold rows, then read it back.
+    aicx::source_index::build(&aicx_home, &[], false, true, false)
+        .expect("publish CURRENT index over fixture home");
+    let indexed = Aicx::with_aicx_home(&aicx_home)
+        .extract_intents(&IntentsConfig {
+            project: "vista".to_string(),
+            hours: 100_000,
+            strict: false,
+            min_confidence: None,
+            kind_filter: None,
+            frame_kind: Some(aicx::timeline::FrameKind::UserMsg),
+            live: false,
+        })
+        .expect("extract intents through the index lane");
+    assert_eq!(
+        indexed.stats.identity_source, "index-v1",
+        "test must exercise the index lane"
+    );
+    assert!(
+        !indexed
+            .records
+            .iter()
+            .any(|record| record.session_id == guardian_sid),
+        "guardian session leaked through the index lane from a cold catalog row: {:?}",
+        indexed
+            .records
+            .iter()
+            .filter(|record| record.session_id == guardian_sid)
+            .map(|record| &record.summary)
+            .collect::<Vec<_>>()
+    );
+
+    drop(_guard);
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// A flagged index chunk that has to be re-sourced can fail: the catalog may
+/// have been rebuilt, or the original transcript moved or deleted. Swallowing
+/// that read left `source_errors = 0`, so `completeness` claimed a complete
+/// answer while a whole session had silently vanished from it.
+#[test]
+fn index_lane_reports_sessions_it_could_not_re_source() {
+    let root = unique_root("resourcefail");
+    let _guard = HomeGuard::set(&root);
+    let vista = make_repo(&root, "vista");
+    let fleet = make_repo(&root, "fleet-bus");
+    let other = make_repo(&root, "other-repo");
+    let mixed_sid = write_mixed_rollout(&root, &vista, &fleet, &other);
+    write_homogeneous_rollout(&root, &vista);
+
+    let aicx_home = root.join(".aicx");
+    aicx::catalog::rebuild(&aicx_home, &root).expect("rebuild catalog over fixture home");
+    aicx::source_index::build(&aicx_home, &[], false, true, false)
+        .expect("publish CURRENT index over fixture home");
+
+    // The mixed session is index-flagged, so the index lane must re-source it
+    // — but its transcript is gone.
+    let source = rollout_path(
+        &root,
+        &format!("rollout-2026-01-01T00-00-00-{mixed_sid}.jsonl"),
+    );
+    fs::remove_file(&source).expect("remove the flagged session's source");
+
+    let extraction = Aicx::with_aicx_home(&aicx_home)
+        .extract_intents(&IntentsConfig {
+            project: "vista".to_string(),
+            hours: 100_000,
+            strict: false,
+            min_confidence: None,
+            kind_filter: None,
+            frame_kind: Some(aicx::timeline::FrameKind::UserMsg),
+            live: false,
+        })
+        .expect("extract intents through the index lane");
+
+    assert_eq!(
+        extraction.stats.identity_source, "index-v1",
+        "test must exercise the index lane"
+    );
+    assert!(
+        extraction.stats.source_errors > 0,
+        "a flagged session that could not be re-sourced must be counted, not skipped"
+    );
+    let completeness = extraction
+        .stats
+        .completeness(None, extraction.records.len());
+    assert!(
+        !completeness.complete,
+        "completeness must not claim a complete answer over a lost source"
+    );
+
+    drop(_guard);
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// The index matched a session on the project stored AT INDEX TIME; the
+/// rehydrated frames are stamped with the CURRENT catalog project. Without
+/// re-applying the caller's `-p` predicate, a session reattributed after the
+/// index was built carries another repo's frames into the answer.
+#[test]
+fn index_lane_re_source_reapplies_the_project_filter() {
+    let root = unique_root("resourceproject");
+    let _guard = HomeGuard::set(&root);
+    let vista = make_repo(&root, "vista");
+    let fleet = make_repo(&root, "fleet-bus");
+    let other = make_repo(&root, "other-repo");
+    let mixed_sid = write_mixed_rollout(&root, &vista, &fleet, &other);
+    write_homogeneous_rollout(&root, &vista);
+
+    let aicx_home = root.join(".aicx");
+    aicx::catalog::rebuild(&aicx_home, &root).expect("rebuild catalog over fixture home");
+    aicx::source_index::build(&aicx_home, &[], false, true, false)
+        .expect("publish CURRENT index over fixture home");
+
+    // Catalog rebuilt after the index: this session now belongs elsewhere.
+    rewrite_catalog_rows(&aicx_home, |row| {
+        if row.get("session_id").and_then(serde_json::Value::as_str) == Some(mixed_sid.as_str())
+            && let Some(object) = row.as_object_mut()
+        {
+            object.insert(
+                "project".to_string(),
+                serde_json::Value::String("vetcoders/fleet-bus".to_string()),
+            );
+        }
+    });
+
+    let extraction = Aicx::with_aicx_home(&aicx_home)
+        .extract_intents(&IntentsConfig {
+            project: "vista".to_string(),
+            hours: 100_000,
+            strict: false,
+            min_confidence: None,
+            kind_filter: None,
+            frame_kind: Some(aicx::timeline::FrameKind::UserMsg),
+            live: false,
+        })
+        .expect("extract intents through the index lane");
+
+    assert_eq!(
+        extraction.stats.identity_source, "index-v1",
+        "test must exercise the index lane"
+    );
+    assert!(
+        !extraction
+            .records
+            .iter()
+            .any(|record| record.session_id == mixed_sid),
+        "a session that no longer belongs to the requested project must not be re-sourced into it: {:?}",
+        extraction
+            .records
+            .iter()
+            .filter(|record| record.session_id == mixed_sid)
+            .map(|record| &record.summary)
+            .collect::<Vec<_>>()
+    );
 
     drop(_guard);
     let _ = fs::remove_dir_all(&root);

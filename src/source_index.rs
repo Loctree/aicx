@@ -18,7 +18,9 @@ use chrono::SecondsFormat;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use aicx_parser::engine::scope_evidence::{WindowScope, effective_window_scope, tool_call_workdir};
+use aicx_parser::engine::scope_evidence::{
+    WindowScope, WorkdirEvidence, effective_window_scope, tool_call_workdir,
+};
 
 use crate::catalog::CatalogEntry;
 use crate::progress::{Heartbeat, NoopReporter, Phase, Reporter};
@@ -37,7 +39,7 @@ const MAX_JSONL_RECORD_BYTES: usize = 2 * 1024 * 1024;
 /// short-circuited forever, leaving search previews full of
 /// `{"type":"thought","data":"..."}` spam. Including this constant forces a
 /// one-shot rebuild so index truth tracks filter truth.
-pub(crate) const SIGNAL_FILTER_VERSION: &str = "signal-v4-scope-chunk-metadata";
+pub(crate) const SIGNAL_FILTER_VERSION: &str = "signal-v5-scope-repo-identity";
 
 const PARSE_STATE_SCHEMA: &str = "aicx.source_parse_state.v1";
 const PARSE_STATE_RELPATH: &str = "indexed/_all/source_parse_state.v1.json";
@@ -462,8 +464,19 @@ pub fn build_with_reporter(
             .clone()
             .unwrap_or_else(|| "_unknown".to_string());
         let scope = crate::extraction::conversation::scope_report_for_entries(&frames);
-        let session_mixed = scope.status == aicx_parser::engine::ScopeStatus::MixedCandidate;
+        // Whole-session chunks cannot express per-frame scope, so this flag
+        // routes the session to the per-frame census lane. It must mean
+        // "more than one scope", not "MixedCandidate": a same-repo branch
+        // switch is mixed by status and perfectly servable as one bucket.
+        let session_mixed = scope.scope_mixed();
         let session_unattributed = frames.iter().any(|frame| frame.scope_unattributed);
+        // Frames carry the provenance resolved at the source, which is the
+        // only lane that can see it for a catalog row cataloged before the
+        // column existed.
+        let resolved_kind = frames
+            .iter()
+            .find_map(|frame| frame.session_kind.clone())
+            .or_else(|| entry.session_kind.clone());
         let mut metadata = serde_json::json!({
             "source_path": indexed_path.to_string_lossy(),
             "project": project,
@@ -478,7 +491,7 @@ pub fn build_with_reporter(
             "preview_lines": extract_preview_lines(&frames),
             "scope_conflict": session_mixed,
             "scope_unattributed": session_unattributed,
-            "session_kind": entry.session_kind,
+            "session_kind": resolved_kind.clone(),
         });
         if let Some(distill) = &distill {
             // card.v3 (W2-02): distill block + flat filter scalars. Reused
@@ -519,7 +532,7 @@ pub fn build_with_reporter(
                 cwd: entry.cwd.clone(),
                 scope_conflict: session_mixed,
                 scope_unattributed: session_unattributed,
-                session_kind: entry.session_kind.clone(),
+                session_kind: resolved_kind.clone(),
             },
         );
     }
@@ -995,6 +1008,11 @@ fn parse_catalog_source(
     let path = allow
         .resolve_file(path)
         .with_context(|| format!("resolve catalog source {}", path.display()))?;
+    // Provenance is established where the source is opened — the catalog
+    // column only caches it, and cold rows never get refreshed by a hot-window
+    // pass. Bounded header read, and only for rows that lack the column.
+    let session_kind =
+        crate::sessions::resolve_session_kind(&entry.agent, entry.session_kind.as_deref(), &path);
 
     if entry.agent == "vibecrafted" {
         let body = allow
@@ -1030,7 +1048,7 @@ fn parse_catalog_source(
                 cwd: entry.cwd.clone(),
                 scope_conflict: false,
                 scope_unattributed: false,
-                session_kind: entry.session_kind.clone(),
+                session_kind: session_kind.clone(),
                 timestamp_source: Some("source_mtime".to_string()),
                 source_path: Some(entry.source_path.clone()),
                 source_sha256: None,
@@ -1044,7 +1062,7 @@ fn parse_catalog_source(
         .len();
     if entry.agent == "codex" && source_bytes > MAX_FULL_PARSE_BYTES {
         return Ok(ParsedCatalogSource {
-            frames: parse_large_codex_signal(entry, &path, allow)?,
+            frames: parse_large_codex_signal(entry, &path, allow, session_kind.as_deref())?,
             distill: None,
         });
     }
@@ -1078,7 +1096,7 @@ fn parse_catalog_source(
     ));
     let mut frames = crate::output::timeline_entries_from_model(parsed.model());
     for frame in &mut frames {
-        frame.session_kind = entry.session_kind.clone();
+        frame.session_kind = session_kind.clone();
     }
     Ok(ParsedCatalogSource { frames, distill })
 }
@@ -1156,6 +1174,7 @@ fn parse_large_codex_signal(
     entry: &CatalogEntry,
     path: &Path,
     allow: &crate::source_path::SourceAllowlist,
+    session_kind: Option<&str>,
 ) -> Result<Vec<TimelineEntry>> {
     // `path` is already resolve_file'd by the caller; open through the allowlist.
     let file = allow
@@ -1169,11 +1188,24 @@ fn parse_large_codex_signal(
     // window can re-scope the whole window (never per-frame flip-flop).
     let mut baseline_cwd = entry.cwd.clone();
     let mut window_frames: Vec<TimelineEntry> = Vec::new();
-    let mut window_workdirs: Vec<String> = Vec::new();
+    let mut window_workdirs: Vec<WorkdirEvidence> = Vec::new();
     while let Some(record) = crate::sanitize::read_line_capped(&mut reader, MAX_JSONL_RECORD_BYTES)?
     {
         line_no += 1;
-        if record.exceeded || record.line.trim().is_empty() {
+        if record.exceeded {
+            // An over-cap record is drained, never parsed. When its visible
+            // head says it was a tool-call envelope, the window MIGHT have
+            // moved repos and this reader will never know: record unreadable
+            // evidence so the window fails closed to unattributed instead of
+            // silently keeping the baseline project.
+            if truncated_record_is_tool_call(&record.line)
+                && !window_workdirs.contains(&WorkdirEvidence::Opaque)
+            {
+                window_workdirs.push(WorkdirEvidence::Opaque);
+            }
+            continue;
+        }
+        if record.line.trim().is_empty() {
             continue;
         }
         let Ok(value) = serde_json::from_str::<serde_json::Value>(&record.line) else {
@@ -1197,25 +1229,32 @@ fn parse_large_codex_signal(
             }
             continue;
         }
-        if value.get("type").and_then(serde_json::Value::as_str) != Some("response_item") {
+        // Tool calls arrive in BOTH Codex envelopes: `response_item` and
+        // `event_msg`. The full adapter accepts both (`push_tool_turn` is
+        // reached from either), so a bounded reader that only looked at
+        // `response_item` lost every workdir of an `event_msg`-shaped rollout
+        // and left its foreign turns inheriting the baseline project.
+        let record_type = value.get("type").and_then(serde_json::Value::as_str);
+        if !matches!(record_type, Some("response_item") | Some("event_msg")) {
             continue;
         }
         let Some(payload) = value.get("payload") else {
             continue;
         };
         let payload_type = payload.get("type").and_then(serde_json::Value::as_str);
-        if matches!(
-            payload_type,
-            Some("function_call") | Some("custom_tool_call")
-        ) {
-            if let Some(workdir) = tool_call_workdir(payload)
-                && !window_workdirs.contains(&workdir)
-            {
-                window_workdirs.push(workdir);
+        if is_tool_call_payload_type(payload_type) {
+            if let Some(workdir) = tool_call_workdir(payload) {
+                let evidence = WorkdirEvidence::Explicit(workdir);
+                if !window_workdirs.contains(&evidence) {
+                    window_workdirs.push(evidence);
+                }
             }
             continue;
         }
-        if payload_type != Some("message") {
+        // Only `response_item.message` carries chat text in this reader; the
+        // `event_msg` envelope is footprint (the dual-envelope rule the Codex
+        // adapter applies) and would double every turn.
+        if record_type != Some("response_item") || payload_type != Some("message") {
             continue;
         }
         let Some(role) = payload.get("role").and_then(serde_json::Value::as_str) else {
@@ -1262,7 +1301,7 @@ fn parse_large_codex_signal(
             cwd: baseline_cwd.clone(),
             scope_conflict: false,
             scope_unattributed: false,
-            session_kind: entry.session_kind.clone(),
+            session_kind: session_kind.map(str::to_owned),
             timestamp_source: Some("record".to_string()),
             source_path: Some(entry.source_path.clone()),
             source_sha256: None,
@@ -1283,9 +1322,54 @@ fn parse_large_codex_signal(
 /// (including messages before the first tool call); proven-divergent evidence
 /// marks every frame conflicted, while unresolved foreign evidence leaves a
 /// durable do-not-inherit mark on every frame of the window.
+/// Codex tool-call payload types that can carry an explicit `workdir`.
+/// Mirrors the set the full adapter routes into `push_tool_turn`.
+fn is_tool_call_payload_type(payload_type: Option<&str>) -> bool {
+    matches!(
+        payload_type,
+        Some("function_call")
+            | Some("custom_tool_call")
+            | Some("tool_call")
+            | Some("mcp_tool_call")
+    )
+}
+
+/// Does the readable head of an over-cap record look like a tool-call
+/// envelope? The record is truncated (never valid JSON), so this reads the
+/// visible prefix only: the envelope and payload discriminators are written
+/// before the oversized `arguments`/`input` body, so they survive the cap.
+fn truncated_record_is_tool_call(prefix: &str) -> bool {
+    // Key order inside a record is not a contract, so this scans the whole
+    // visible prefix rather than a fixed head: the discriminator can sit
+    // after a megabyte of `arguments`. Over-cap records are rare and their
+    // bytes are already in hand.
+    let has_type = |value: &str| {
+        prefix.contains(&format!(r#""type":"{value}""#))
+            || prefix.contains(&format!(r#""type": "{value}""#))
+    };
+    // `function_call_output` / `mcp_tool_call_end` are RESULTS, not calls:
+    // they carry no workdir, so an oversized one is not lost evidence. The
+    // trailing quote in the needle keeps them out.
+    if [
+        "function_call",
+        "custom_tool_call",
+        "tool_call",
+        "mcp_tool_call",
+    ]
+    .iter()
+    .any(|kind| has_type(kind))
+    {
+        return true;
+    }
+    // A discriminator was readable and it was not a call: nothing was lost.
+    // None was readable at all: the record could have been anything, and a
+    // baseline the reader never verified is not a fact.
+    !prefix.contains(r#""type":"#) && !prefix.contains(r#""type": "#)
+}
+
 fn flush_scope_window(
     window_frames: &mut Vec<TimelineEntry>,
-    window_workdirs: &mut Vec<String>,
+    window_workdirs: &mut Vec<WorkdirEvidence>,
     baseline: Option<&str>,
     frames: &mut Vec<TimelineEntry>,
 ) {
@@ -1864,7 +1948,7 @@ mod tests {
         };
         let allow = crate::source_path::SourceAllowlist::from_roots([root.clone()]);
 
-        let frames = parse_large_codex_signal(&entry, &source_path, &allow).unwrap();
+        let frames = parse_large_codex_signal(&entry, &source_path, &allow, None).unwrap();
         assert_eq!(frames.len(), 2);
         assert_eq!(frames[0].cwd.as_deref(), Some("/repo/public"));
         assert_eq!(frames[1].cwd.as_deref(), Some("/repo/private"));
@@ -2155,7 +2239,8 @@ mod tests {
         };
         let allow = crate::source_path::SourceAllowlist::for_operator(&root, &root);
         let resolved = allow.resolve_file(&source_path).expect("resolve rollout");
-        let frames = parse_large_codex_signal(&entry, &resolved, &allow).expect("bounded parse");
+        let frames =
+            parse_large_codex_signal(&entry, &resolved, &allow, None).expect("bounded parse");
 
         assert_eq!(frames.len(), 3, "{frames:?}");
         assert_eq!(frames[0].message, "vista opening");
@@ -2173,5 +2258,195 @@ mod tests {
         assert!(frames[2].scope_conflict);
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    fn bounded_scope_root(label: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "aicx-bounded-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        root
+    }
+
+    fn bounded_entry(source_path: &Path) -> CatalogEntry {
+        CatalogEntry {
+            schema: crate::catalog::CATALOG_SCHEMA.to_string(),
+            session_id: "s1".to_string(),
+            agent: "codex".to_string(),
+            project: Some("vista".to_string()),
+            date: Some("2026-01-01".to_string()),
+            cwd: Some("/sessions/vista".to_string()),
+            source_path: source_path.display().to_string(),
+            source_len: None,
+            source_mtime_ns: None,
+            title: None,
+            machine: None,
+            logical_session_id: None,
+            session_kind: None,
+        }
+    }
+
+    fn jsonl(rows: &[serde_json::Value]) -> String {
+        rows.iter().fold(String::new(), |mut body, row| {
+            body.push_str(&row.to_string());
+            body.push('\n');
+            body
+        })
+    }
+
+    fn codex_meta(cwd: &str) -> serde_json::Value {
+        serde_json::json!({
+            "timestamp": "2026-01-01T00:00:00Z",
+            "type": "session_meta",
+            "payload": {"id": "s1", "cwd": cwd},
+        })
+    }
+
+    fn codex_turn_context(cwd: &str) -> serde_json::Value {
+        serde_json::json!({
+            "timestamp": "2026-01-01T00:01:00Z",
+            "type": "turn_context",
+            "payload": {"cwd": cwd},
+        })
+    }
+
+    fn codex_user_message(text: &str) -> serde_json::Value {
+        serde_json::json!({
+            "timestamp": "2026-01-01T00:01:10Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": text}],
+            },
+        })
+    }
+
+    /// Codex emits tool calls in BOTH envelopes. The full adapter routes
+    /// `event_msg` function/tool/mcp calls into the same handler as
+    /// `response_item`; a bounded reader that only accepted `response_item`
+    /// collected zero workdir evidence from an `event_msg`-shaped rollout and
+    /// left every foreign turn inheriting the baseline project.
+    #[test]
+    fn bounded_reader_reads_workdirs_from_event_msg_tool_calls() {
+        let root = bounded_scope_root("event-msg");
+        let fleet = root.join("fleet-bus");
+        fs::create_dir_all(fleet.join(".git")).unwrap();
+        let source_path = root.join(".codex").join("sessions").join("rollout.jsonl");
+        fs::create_dir_all(source_path.parent().unwrap()).unwrap();
+        // Real shape: `arguments` is a JSON STRING, not an object.
+        let arguments = serde_json::to_string(&serde_json::json!({
+            "cmd": "ls",
+            "workdir": fleet.display().to_string(),
+        }))
+        .unwrap();
+        let body = jsonl(&[
+            codex_meta("/sessions/vista"),
+            codex_turn_context("/sessions/vista"),
+            codex_user_message("biore fleet task"),
+            serde_json::json!({
+                "timestamp": "2026-01-01T00:01:20Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "function_call",
+                    "name": "shell",
+                    "call_id": "c1",
+                    "arguments": arguments,
+                },
+            }),
+        ]);
+        fs::write(&source_path, body).unwrap();
+
+        let entry = bounded_entry(&source_path);
+        let allow = crate::source_path::SourceAllowlist::for_operator(&root, &root);
+        let resolved = allow.resolve_file(&source_path).expect("resolve rollout");
+        let frames =
+            parse_large_codex_signal(&entry, &resolved, &allow, None).expect("bounded parse");
+
+        assert_eq!(frames.len(), 1, "{frames:?}");
+        assert_eq!(frames[0].message, "biore fleet task");
+        assert_eq!(
+            frames[0].cwd.as_deref(),
+            Some(fleet.to_string_lossy().as_ref()),
+            "an event_msg tool call re-scopes its window like a response_item one"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// An over-cap record is drained, never parsed. When it was a tool-call
+    /// envelope, the window's only foreign workdir can be inside it — keeping
+    /// the baseline there is a silent cross-repo leak, so unreadable evidence
+    /// fails closed to unattributed.
+    #[test]
+    fn oversized_tool_call_fails_closed_to_unattributed() {
+        // Real rollout key order: the envelope and payload discriminators are
+        // written BEFORE the oversized body, so they survive the cap.
+        let filler = "x".repeat(MAX_JSONL_RECORD_BYTES + 4096);
+        let oversized_window = |label: &str, oversized: String| {
+            let root = bounded_scope_root(label);
+            let source_path = root.join(".codex").join("sessions").join("rollout.jsonl");
+            fs::create_dir_all(source_path.parent().unwrap()).unwrap();
+            let mut body = jsonl(&[
+                codex_meta("/sessions/vista"),
+                codex_turn_context("/sessions/vista"),
+                codex_user_message("biore task"),
+            ]);
+            body.push_str(&oversized);
+            body.push('\n');
+            fs::write(&source_path, body).unwrap();
+            let entry = bounded_entry(&source_path);
+            let allow = crate::source_path::SourceAllowlist::for_operator(&root, &root);
+            let resolved = allow.resolve_file(&source_path).expect("resolve rollout");
+            let frames =
+                parse_large_codex_signal(&entry, &resolved, &allow, None).expect("bounded parse");
+            let _ = fs::remove_dir_all(&root);
+            frames
+        };
+
+        let call_frames = oversized_window(
+            "oversized-call",
+            format!(
+                r#"{{"timestamp":"2026-01-01T00:01:20Z","type":"response_item","payload":{{"type":"function_call","name":"shell","call_id":"c1","arguments":"{{\"cmd\":\"{filler}\"}}"}}}}"#
+            ),
+        );
+        assert_eq!(call_frames.len(), 1, "{call_frames:?}");
+        assert!(
+            call_frames[0].scope_unattributed,
+            "a tool call this reader could not read must not leave the window on its baseline"
+        );
+
+        // A merely oversized RESULT carries no workdir, so it is not lost
+        // evidence and must not poison an otherwise clean window.
+        let result_frames = oversized_window(
+            "oversized-result",
+            format!(
+                r#"{{"timestamp":"2026-01-01T00:01:20Z","type":"response_item","payload":{{"type":"function_call_output","call_id":"c1","output":"{filler}"}}}}"#
+            ),
+        );
+        assert_eq!(result_frames.len(), 1, "{result_frames:?}");
+        assert!(
+            !result_frames[0].scope_unattributed,
+            "an oversized tool RESULT carries no workdir and is not lost evidence"
+        );
+        assert_eq!(result_frames[0].cwd.as_deref(), Some("/sessions/vista"));
+
+        // Pathological writer: nothing identifiable survives the cap. The
+        // record could have been a tool call, so the window cannot claim the
+        // baseline it did not verify.
+        let opaque_frames = oversized_window(
+            "oversized-opaque",
+            format!(r#"{{"payload":{{"arguments":"{filler}"}}}}"#),
+        );
+        assert_eq!(opaque_frames.len(), 1, "{opaque_frames:?}");
+        assert!(
+            opaque_frames[0].scope_unattributed,
+            "an over-cap record this reader could not classify is not proof of the baseline"
+        );
     }
 }

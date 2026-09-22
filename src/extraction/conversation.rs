@@ -867,6 +867,19 @@ pub struct ScopeReport {
     pub conflicts: usize,
 }
 
+impl ScopeReport {
+    /// Does this session actually span more than one scope?
+    ///
+    /// `status` alone cannot answer that: `ScopeStatus::MixedCandidate` is
+    /// also how an ordinary branch switch inside ONE unchanged checkout is
+    /// recorded. Whole-session attribution stays valid there — only a proven
+    /// workdir conflict or more than one observed cwd makes a session
+    /// unservable as one bucket.
+    pub fn scope_mixed(&self) -> bool {
+        self.conflicts > 0 || self.cwds.len() > 1
+    }
+}
+
 /// Scope from the entries' own `cwd` / `branch` evidence. Unknown values do
 /// not count as a second workstream; topic-level mixing inside one cwd is
 /// invisible here and is not guessed at.

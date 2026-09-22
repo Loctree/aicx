@@ -14,7 +14,9 @@ use crate::engine::frames::{
     self, FrameClass, InjectKind, TransportFrame, TransportKind, TransportPayload, TransportRole,
 };
 use crate::engine::frames_rules;
-use crate::engine::scope_evidence::{WindowScope, effective_window_scope, tool_call_workdir};
+use crate::engine::scope_evidence::{
+    WindowScope, WorkdirEvidence, effective_window_scope, tool_call_workdir,
+};
 use crate::engine::{
     AgentKind, BoundaryFlags, ConsumedUnit, ContextEpochRef, CounterSemantics, CoverageReport,
     CoverageWarning, Known, ParseStatus, Provenance, ProviderConversationRef, RawUnitRef,
@@ -411,7 +413,7 @@ struct Assembly<'a> {
     segments: Vec<SegmentDraft>,
     /// Explicit tool-call `workdir` evidence of the open turn window; stronger
     /// than the `turn_context` baseline when it points at another repo.
-    window_workdirs: Vec<String>,
+    window_workdirs: Vec<WorkdirEvidence>,
     turns: Vec<Turn>,
     tools: Vec<ToolEvent>,
     tool_names: BTreeMap<String, String>,
@@ -1100,9 +1102,11 @@ impl<'a> Assembly<'a> {
         let payload = &event["payload"];
         if kind == ToolEventKind::Call
             && let Some(workdir) = tool_call_workdir(payload)
-            && !self.window_workdirs.contains(&workdir)
         {
-            self.window_workdirs.push(workdir);
+            let evidence = WorkdirEvidence::Explicit(workdir);
+            if !self.window_workdirs.contains(&evidence) {
+                self.window_workdirs.push(evidence);
+            }
         }
         let correlation_raw = string_at(payload, &["call_id"])
             .or_else(|| string_at(payload, &["id"]))
@@ -2109,8 +2113,8 @@ mod tests {
 {"timestamp":"2026-01-01T00:02:00Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"worked in two repos"}]}}
 "#;
         let bytes = template
-            .replace("@A@", &repo_a.to_string_lossy().into_owned())
-            .replace("@B@", &repo_b.to_string_lossy().into_owned());
+            .replace("@A@", repo_a.to_string_lossy().as_ref())
+            .replace("@B@", repo_b.to_string_lossy().as_ref());
         let model = parse(bytes.as_bytes(), "s1");
         assert_eq!(model.segments.len(), 1, "{:?}", model.segments);
         assert_eq!(known_value(&model.segments[0].cwd), None);

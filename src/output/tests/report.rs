@@ -898,3 +898,96 @@ fn test_find_last_sync_timestamp_skips_oversized_line_and_advances() {
     assert_eq!(found.unwrap(), expected);
     cleanup(&dir);
 }
+
+/// A Claude session that merely switches branch inside ONE checkout records
+/// `ScopeStatus::MixedCandidate` — that is what `branches_seen` means. Deriving
+/// the frame-level `scope_conflict` flag straight from that status made the
+/// project filter discard every frame of such a session BEFORE checking that
+/// its cwd positively belongs to the requested project: an ordinary branch
+/// switch silently erased the session's intents. `scope_conflict` is reserved
+/// for proven workdir divergence, which is the only case that clears the cwd.
+#[test]
+#[cfg(feature = "app")]
+fn claude_branch_drift_in_one_checkout_is_not_a_scope_conflict() {
+    use aicx_parser::engine::{SourceArtifact, SourceFraming, SourceHandle};
+
+    const SESSION: &str = "9d0f7c14-0000-4000-8000-0000000000aa";
+    const CWD: &str = "/Users/tester/Git/vista";
+    let body = [
+        serde_json::json!({
+            "type": "user",
+            "message": {"role": "user", "content": "zrob to na main"},
+            "sessionId": SESSION,
+            "cwd": CWD,
+            "gitBranch": "main",
+            "timestamp": "2026-09-01T10:00:00.000Z",
+        }),
+        serde_json::json!({
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "model": "claude-opus-5",
+                "content": [{"type": "text", "text": "Robie."}],
+            },
+            "sessionId": SESSION,
+            "cwd": CWD,
+            "gitBranch": "main",
+            "timestamp": "2026-09-01T10:00:10.000Z",
+        }),
+        // Same checkout, different branch — ordinary work, not a repo move.
+        serde_json::json!({
+            "type": "user",
+            "message": {"role": "user", "content": "teraz na feature branchu"},
+            "sessionId": SESSION,
+            "cwd": CWD,
+            "gitBranch": "cut/feature",
+            "timestamp": "2026-09-01T10:05:00.000Z",
+        }),
+    ]
+    .iter()
+    .fold(String::new(), |mut body, row| {
+        body.push_str(&row.to_string());
+        body.push('\n');
+        body
+    });
+
+    let artifact =
+        SourceArtifact::memory("session.jsonl", body.into_bytes(), SourceFraming::JsonLines)
+            .expect("memory artifact");
+    let handle = SourceHandle::new(
+        aicx_parser::engine::AgentKind::Claude,
+        SESSION,
+        Some(SESSION.to_owned()),
+        vec![artifact],
+    )
+    .expect("source handle");
+    let session = crate::parser_dispatch::parse_handle(&handle).expect("parse");
+    assert_eq!(
+        session.model().scope_status(),
+        aicx_parser::engine::ScopeStatus::MixedCandidate,
+        "branch drift is still recorded as a mixed candidate at the model level"
+    );
+
+    let entries = crate::output::timeline_entries_from_model(session.model());
+    assert!(!entries.is_empty(), "the session produced frames");
+    assert!(
+        entries.iter().all(|entry| !entry.scope_conflict),
+        "a same-checkout branch switch is not a workdir conflict"
+    );
+    assert!(
+        entries
+            .iter()
+            .all(|entry| entry.cwd.as_deref() == Some(CWD)),
+        "every frame keeps the one cwd it actually ran in"
+    );
+
+    // The scope report still reports the branch drift, but the session is not
+    // "mixed scope": one cwd, no conflicts, servable as one project bucket.
+    let scope = crate::extraction::conversation::scope_report_for_entries(&entries);
+    assert_eq!(scope.conflicts, 0);
+    assert_eq!(scope.cwds.len(), 1);
+    assert!(
+        !scope.scope_mixed(),
+        "one checkout plus branch drift is not more than one scope"
+    );
+}

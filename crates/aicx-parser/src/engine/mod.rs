@@ -45,7 +45,8 @@ pub use refusal::{
     RefusalEvidence, RefusalReason, SubstitutionError, SubstitutionKind,
 };
 pub use scope_evidence::{
-    WindowScope, WorkdirIdentity, effective_window_scope, normalize_workdir, tool_call_workdir,
+    WindowScope, WorkdirEvidence, WorkdirIdentity, effective_window_scope, normalize_workdir,
+    tool_call_workdir, workdir_within_scope,
 };
 pub use source::{AgentKind, SourceArtifact, SourceError, SourceFraming, SourceHandle};
 pub use validate::{

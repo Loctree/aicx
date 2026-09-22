@@ -105,6 +105,67 @@ fn per_frame_cwd_prevents_cross_repo_session_contamination() {
     );
 }
 
+/// A nested checkout or submodule lives lexically BELOW the session checkout
+/// and is a different repository. Accepting containment by path prefix kept
+/// its frames in the parent's bucket — the same cross-repo leak the turn-level
+/// scope work exists to close, just one layer further down the pipeline.
+#[cfg(feature = "app")]
+#[test]
+fn nested_checkout_frames_do_not_inherit_the_parent_project() {
+    let root = std::env::temp_dir().join(format!(
+        "aicx-intents-nested-checkout-{}-{}",
+        std::process::id(),
+        Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    ));
+    let _ = fs::remove_dir_all(&root);
+    let parent = root.join("vista");
+    let nested = parent.join("vendor/fleet-bus");
+    let parent_subdir = parent.join("crates/core");
+    fs::create_dir_all(parent.join(".git")).expect("parent git dir");
+    fs::create_dir_all(nested.join(".git")).expect("nested git dir");
+    fs::create_dir_all(&parent_subdir).expect("parent subdir");
+
+    let frame = |cwd: &Path, message: &str| crate::timeline::TimelineEntry {
+        timestamp: Utc::now(),
+        agent: "codex".to_string(),
+        session_id: "nested-session".to_string(),
+        role: "user".to_string(),
+        message: message.to_string(),
+        frame_class: None,
+        lineage_origin: None,
+        frame_kind: Some(FrameKind::UserMsg),
+        branch: None,
+        cwd: Some(cwd.to_string_lossy().into_owned()),
+        scope_conflict: false,
+        scope_unattributed: false,
+        session_kind: None,
+        timestamp_source: None,
+        source_path: None,
+        source_sha256: None,
+        source_line_span: None,
+    };
+    let mut frames = vec![
+        frame(&parent, "vista root turn"),
+        frame(&parent_subdir, "vista subdir turn"),
+        frame(&nested, "vendored fleet-bus turn"),
+    ];
+
+    retain_frames_for_project(
+        &mut frames,
+        "vetcoders/vista",
+        Some(parent.to_string_lossy().as_ref()),
+        false,
+    );
+
+    let kept: Vec<&str> = frames.iter().map(|frame| frame.message.as_str()).collect();
+    assert_eq!(
+        kept,
+        vec!["vista root turn", "vista subdir turn"],
+        "{kept:?}"
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
 #[cfg(feature = "app")]
 #[test]
 fn mixed_session_filter_is_fail_closed_for_unproven_frames() {

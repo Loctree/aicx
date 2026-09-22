@@ -663,8 +663,17 @@ pub(crate) fn codex_subagent_session_kind(payload: Option<&serde_json::Value>) -
 /// pipeline, so the slim loctree-consumer profile would flag it as dead.
 #[cfg(feature = "app")]
 pub(crate) fn is_guardian_session_kind(session_kind: Option<&str>) -> bool {
-    session_kind.is_some_and(|kind| kind.starts_with("subagent:guardian"))
+    // Exact value, never a prefix: `subagent:guardian-helper` (or any future
+    // `subagent:guardian*` nickname) is an ordinary subagent doing real work.
+    // Silently removing those from project intents would lose operator
+    // evidence, which is the opposite of what this predicate is for.
+    session_kind == Some(GUARDIAN_SESSION_KIND)
 }
+
+/// The one canonical guardian provenance value, as written by
+/// `codex_subagent_session_kind` for `source.subagent = {"other":"guardian"}`.
+#[cfg(feature = "app")]
+pub(crate) const GUARDIAN_SESSION_KIND: &str = "subagent:guardian";
 
 /// Light provenance probe for the catalog hot path: read only until the
 /// first `session_meta` record (bounded) instead of scanning the rollout.
@@ -685,6 +694,32 @@ pub(crate) fn codex_session_kind_from_source(path: &Path) -> Option<String> {
         }
     }
     None
+}
+
+/// Resolve a session's structural provenance at the point where its source is
+/// actually opened.
+///
+/// The catalog column is a cache, not the authority. The hot-window refresh
+/// (`scan_hot_window_skipping`) never revisits a source whose fingerprint is
+/// unchanged, so rows cataloged before the column existed keep `None`
+/// forever — and no number of `aicx index` runs backfills them, because the
+/// index reads the same column. Every lane that opens a Codex rollout can
+/// establish the truth itself with one bounded header read, which costs a
+/// fraction of the full parse that follows it. `aicx catalog rebuild` is what
+/// refreshes the stored column.
+#[cfg(feature = "app")]
+pub(crate) fn resolve_session_kind(
+    agent: &str,
+    cataloged: Option<&str>,
+    source_path: &Path,
+) -> Option<String> {
+    if let Some(kind) = cataloged.map(str::to_owned) {
+        return Some(kind);
+    }
+    if agent != "codex" {
+        return None;
+    }
+    codex_session_kind_from_source(source_path)
 }
 
 /// Discover Grok sessions under `~/.grok/sessions`.
@@ -2561,6 +2596,56 @@ mod tests {
             sessions[0].session_kind.as_deref(),
             Some("subagent:guardian")
         );
+    }
+
+    /// Guardian exclusion is an EXACT contract, not a namespace sweep. A
+    /// nickname that merely starts with the canonical value is an ordinary
+    /// subagent doing real work: removing it from project intents would drop
+    /// operator evidence on the floor.
+    #[test]
+    #[cfg(feature = "app")]
+    fn only_the_canonical_guardian_kind_is_control_plane() {
+        assert!(is_guardian_session_kind(Some("subagent:guardian")));
+        assert!(!is_guardian_session_kind(Some("subagent:guardian-helper")));
+        assert!(!is_guardian_session_kind(Some("subagent:guardianship")));
+        assert!(!is_guardian_session_kind(Some("subagent:Hooke")));
+        assert!(!is_guardian_session_kind(Some("subagent")));
+        assert!(!is_guardian_session_kind(None));
+    }
+
+    /// The catalog column is a cache. A row cataloged before the column
+    /// existed keeps `None` forever (the hot-window refresh never revisits an
+    /// unchanged source), so the lane that opens the rollout has to be able to
+    /// establish provenance itself.
+    #[test]
+    #[cfg(feature = "app")]
+    fn provenance_resolves_from_the_source_when_the_catalog_row_is_cold() {
+        let root = temp_root("cold_provenance");
+        let day = root.join("2026").join("08").join("27");
+        fs::create_dir_all(&day).unwrap();
+        write_session(
+            &day,
+            "rollout-2026-08-27T03-35-45-01a040db.jsonl",
+            &[
+                r#"{"timestamp":"2026-08-27T01:35:45.000Z","type":"session_meta","payload":{"id":"01a040db-60f0","cwd":"/Users/tester/Git/vista","source":{"subagent":{"other":"guardian"}}}}"#,
+                r#"{"timestamp":"2026-08-27T01:35:46.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"text":"Verdict: approve"}]}}"#,
+            ],
+        );
+        let path = day.join("rollout-2026-08-27T03-35-45-01a040db.jsonl");
+
+        // Cold row: no cached value, resolved from the source itself.
+        assert_eq!(
+            resolve_session_kind("codex", None, &path).as_deref(),
+            Some("subagent:guardian")
+        );
+        // A cached value is authoritative and costs no read.
+        assert_eq!(
+            resolve_session_kind("codex", Some("subagent:Hooke"), &path).as_deref(),
+            Some("subagent:Hooke")
+        );
+        // Only Codex carries this provenance shape.
+        assert_eq!(resolve_session_kind("claude", None, &path), None);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
