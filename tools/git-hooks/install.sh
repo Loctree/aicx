@@ -7,7 +7,7 @@ repo_root=$(git rev-parse --show-toplevel 2>/dev/null) || {
 }
 cd "$repo_root"
 
-for hook in pre-commit pre-push commit-msg embargo.sh selftest.sh install.sh; do
+for hook in pre-commit pre-push commit-msg prepare-commit-msg embargo.sh selftest.sh install.sh; do
   [ -f "tools/git-hooks/$hook" ] || {
     echo "git-hooks install: missing tools/git-hooks/$hook" >&2
     exit 1
@@ -15,7 +15,8 @@ for hook in pre-commit pre-push commit-msg embargo.sh selftest.sh install.sh; do
 done
 
 chmod +x tools/git-hooks/pre-commit tools/git-hooks/pre-push \
-  tools/git-hooks/commit-msg tools/git-hooks/embargo.sh \
+  tools/git-hooks/commit-msg tools/git-hooks/prepare-commit-msg \
+  tools/git-hooks/embargo.sh \
   tools/git-hooks/selftest.sh tools/git-hooks/install.sh
 git config core.hooksPath tools/git-hooks
 

@@ -1,0 +1,166 @@
+#!/usr/bin/env bash
+# Vibecrafted prepare-commit-msg hook.
+#
+# Fills the mechanical provenance trailers so an agent never has to reconstruct
+# them by hand. The commit-msg validator stays strict and independent; this hook
+# only supplies what it can actually measure.
+#
+# Contract:
+#   - A measured value overwrites whatever the message already declares.
+#     Provenance is a measurement, not an agent's claim about itself.
+#   - When a value cannot be measured, an existing declaration is left alone and
+#     nothing is invented. Provenance is never fabricated to satisfy a validator.
+#
+# Toggle for the optional session_pid trailer, highest precedence first:
+#   VC_SESSION_PID=0|1                     (one commit)
+#   git config vetcoders.sessionPid false  (repo, then global)
+#   default: enabled
+
+set -euo pipefail
+
+msg_file="${1:-}"
+source_kind="${2:-}"
+
+if [ -z "$msg_file" ] || [ ! -f "$msg_file" ]; then
+    printf 'prepare-commit-msg: expected path to commit message file\n' >&2
+    exit 2
+fi
+
+# Git generates these subjects itself; commit-msg lets them through unchanged.
+first_line="$(head -n1 "$msg_file" | tr -d '\r')"
+case "$first_line" in
+    "Merge "*|"Revert "*|"fixup!"*|"squash!"*|"amend!"*) exit 0 ;;
+esac
+
+types='feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert|release|merge'
+subject_pattern="^\\[([a-z][a-z0-9_-]*)/([a-z0-9][a-z0-9._-]*)\\] (${types})(\\(.+\\))?: .+$"
+
+# Only normalize messages that already declare the agent/runtime prefix. A
+# malformed subject is commit-msg's report to make, with its full diagnostics.
+if [[ "$first_line" =~ $subject_pattern ]]; then
+    agent="${BASH_REMATCH[1]}"
+    runtime_lane="${BASH_REMATCH[2]}"
+else
+    exit 0
+fi
+
+# Humans keep a human address. Mirrors the commit-msg human lane exactly; if the
+# two ever disagree, this hook writes a trailer the validator then rejects.
+human_agents='maciej|monika'
+authored_by=""
+authored_by_human=""
+if [[ "$agent" =~ ^(${human_agents})$ ]] || [ "$runtime_lane" = "manual" ]; then
+    authored_by_human=1
+    case "$agent" in
+        monika) authored_by="monika <hello@vetcoders.io>" ;;
+        maciej) authored_by="maciej <void@div0.space>" ;;
+        # Human runtime lane under an agent name: the address is not derivable,
+        # so leave whatever the author wrote for commit-msg to judge.
+        *) authored_by="" ;;
+    esac
+else
+    authored_by="${agent} <agents@vetcoders.io>"
+fi
+
+# session_id identifies a TRANSCRIPT, not a process. Two live processes resuming
+# one session share it legitimately; use session_pid to tell them apart.
+session_raw="${CODEX_SESSION_ID:-${CLAUDE_CODE_SESSION_ID:-${ATUIN_SESSION:-}}}"
+# The aicx fallback is agent-only on purpose: with no agent env it still reports
+# the machine's current agent session, which for a hand-written commit would
+# attribute a person's work to an agent's transcript. Humans fall back to the
+# shell session (ATUIN_SESSION) or to nothing.
+if [ -z "$session_raw" ] && [ -z "$authored_by_human" ] && command -v aicx >/dev/null 2>&1; then
+    # Git hooks do not inherit the harness stdin that carries session identity,
+    # so the env vars above are usually empty here. aicx knows the current
+    # session per runtime and is the only non-inventing source left.
+    session_raw="$(aicx sessions current 2>/dev/null || true)"
+fi
+
+session_id=""
+if printf '%s' "$session_raw" | grep -Eq '^[0-9a-fA-F]{32}$'; then
+    session_id="$(printf '%s' "$session_raw" \
+        | sed -E 's/^(.{8})(.{4})(.{4})(.{4})(.{12})$/\1-\2-\3-\4-\5/' | tr 'A-F' 'a-f')"
+elif printf '%s' "$session_raw" \
+    | grep -Eq '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'; then
+    session_id="$(printf '%s' "$session_raw" | tr 'A-F' 'a-f')"
+fi
+
+time_value="$(date +%Y-%m-%dT%H:%M:%S%z | sed -E 's/([+-][0-9]{2})([0-9]{2})$/\1:\2/')"
+
+runtime="${VIBECRAFTED_COMMIT_RUNTIME:-${VIBECRAFTED_RUNTIME:-}}"
+if [ -z "$runtime" ]; then
+    case "${TERM_PROGRAM:-}" in
+        iTerm.app|iTerm2) runtime="iterm2" ;;
+        Apple_Terminal) runtime="terminal" ;;
+        *) runtime="interactive" ;;
+    esac
+fi
+
+session_pid_enabled() {
+    case "${VC_SESSION_PID:-}" in
+        1|on|true|yes|enabled) return 0 ;;
+        0|off|false|no|disabled) return 1 ;;
+    esac
+    # git config resolves repo-local before global, so one setting covers both
+    # "this repo only" and "the whole fleet on this machine".
+    case "$(git config --get vetcoders.sessionPid 2>/dev/null || true)" in
+        0|off|false|no|disabled) return 1 ;;
+    esac
+    return 0
+}
+
+session_pid=""
+if session_pid_enabled; then
+    candidate="${CLAUDE_PID:-${CODEX_PID:-}}"
+    if printf '%s' "$candidate" | grep -Eq '^[0-9]{1,10}$'; then
+        session_pid="$candidate"
+    fi
+fi
+
+# A measured value replaces an existing trailer; an unmeasured one never does.
+set_trailer() {
+    local key="$1" value="$2"
+    [ -n "$value" ] || return 0
+    if grep -Eq "^${key}: " "$msg_file"; then
+        local tmp
+        tmp="$(mktemp "${TMPDIR:-/tmp}/vc-trailer.XXXXXX")"
+        # Comment lines keep Git's own scissors/status block intact.
+        awk -v key="$key" -v value="$value" '
+            $0 ~ "^" key ": " && substr($0, 1, 1) != "#" { print key ": " value; next }
+            { print }
+        ' "$msg_file" > "$tmp"
+        mv "$tmp" "$msg_file"
+    else
+        # Keep the trailers in one compact block: a single blank line before
+        # it, none inside. Appending '\n<trailer>' per call would scatter them
+        # across the message.
+        #
+        # Note: Git's own trailer parser is not the beneficiary here. A trailer
+        # token may not contain '_', so `session_id` invalidates the whole block
+        # for `git interpret-trailers` and `%(trailers)` no matter how it is
+        # laid out (verified). These trailers are read by the fleet's own
+        # regexes; compactness is for humans and for stable diffs.
+        local last
+        last="$(awk '!/^#/ && NF {line=$0} END {print line}' "$msg_file")"
+        if printf '%s' "$last" | grep -Eq '^[A-Za-z][A-Za-z0-9_-]*: '; then
+            printf '%s: %s\n' "$key" "$value" >> "$msg_file"
+        else
+            printf '\n%s: %s\n' "$key" "$value" >> "$msg_file"
+        fi
+    fi
+}
+
+set_trailer "Authored-By" "$authored_by"
+set_trailer "session_id" "$session_id"
+set_trailer "time" "$time_value"
+set_trailer "runtime" "$runtime"
+set_trailer "session_pid" "$session_pid"
+
+if [ -z "$session_id" ]; then
+    printf 'prepare-commit-msg: session identity not measurable; not inventing one.\n' >&2
+    printf '  Set CLAUDE_CODE_SESSION_ID/CODEX_SESSION_ID or supply session_id yourself.\n' >&2
+fi
+
+if [ "$source_kind" != "message" ]; then
+    printf 'prepare-commit-msg: filled provenance trailers for %s\n' "$agent" >&2
+fi
