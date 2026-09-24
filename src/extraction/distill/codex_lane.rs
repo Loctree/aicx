@@ -363,6 +363,7 @@ mod tests {
                 scope_status: ScopeStatus::Unknown,
                 scope_conflict: false,
                 scope_root: None,
+                scope_workdirs: Vec::new(),
             })
             .collect();
         model.turns = turns;

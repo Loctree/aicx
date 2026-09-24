@@ -146,6 +146,7 @@ mod tests {
             cwd: None,
             scope_conflict: false,
             scope_unattributed: false,
+            scope_workdirs: Vec::new(),
             session_kind: None,
             timestamp_source: None,
             source_path: None,

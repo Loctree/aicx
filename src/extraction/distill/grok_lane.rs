@@ -734,6 +734,7 @@ mod tests {
             scope_status: ScopeStatus::NoDriftObserved,
             scope_conflict: false,
             scope_root: None,
+            scope_workdirs: Vec::new(),
         }];
         model
     }
@@ -791,6 +792,7 @@ mod tests {
                 scope_status: ScopeStatus::NoDriftObserved,
                 scope_conflict: false,
                 scope_root: None,
+                scope_workdirs: Vec::new(),
             },
             Segment {
                 segment_id: 1,
@@ -802,6 +804,7 @@ mod tests {
                 scope_status: ScopeStatus::MixedCandidate,
                 scope_conflict: false,
                 scope_root: None,
+                scope_workdirs: Vec::new(),
             },
         ];
         model

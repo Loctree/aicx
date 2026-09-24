@@ -329,6 +329,24 @@ pub fn normalize_workdir(path: &str, baseline: Option<&str>) -> WorkdirIdentity 
     WorkdirIdentity::Unresolved(candidate.to_string_lossy().into_owned())
 }
 
+/// The workdir as the rollout RECORDED it, made comparable without asking the
+/// filesystem anything: a relative workdir is joined onto the window's
+/// baseline, `.`/`..` are collapsed, trailing separators dropped.
+///
+/// This is the host-independent form of the evidence. [`normalize_workdir`]
+/// answers "which checkout is this ON THIS HOST", which changes when a
+/// nested checkout appears; this answers "which path did the session name",
+/// which never does. Privacy filters and cache identities need the latter:
+/// both must see the raw evidence, not what survived one host's reduction.
+pub fn recorded_workdir(path: &str, baseline: Option<&str>) -> String {
+    match resolve_candidate(path, baseline) {
+        Some(candidate) => {
+            trim_path(&lexically_normalized(&candidate).to_string_lossy()).to_string()
+        }
+        None => trim_path(path).to_string(),
+    }
+}
+
 /// Collapse `.` and `..` without touching the filesystem.
 ///
 /// The lexical comparison below is the last resort for paths that do not exist

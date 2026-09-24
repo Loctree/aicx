@@ -25,6 +25,7 @@ fn entry(seconds_offset: i64, role: &str, message: &str) -> TimelineEntry {
         cwd: None,
         scope_conflict: false,
         scope_unattributed: false,
+        scope_workdirs: Vec::new(),
         session_kind: None,
         timestamp_source: None,
         source_path: None,

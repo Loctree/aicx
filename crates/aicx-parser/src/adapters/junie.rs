@@ -748,6 +748,7 @@ impl<'a> Assembly<'a> {
             model.segments.push(Segment {
                 segment_id: 0,
                 scope_root: None,
+                scope_workdirs: Vec::new(),
                 scope_status: crate::engine::ScopeStatus::from_evidence(
                     match &self.cwd {
                         Known::Value(cwd) => Some(cwd.as_str()),

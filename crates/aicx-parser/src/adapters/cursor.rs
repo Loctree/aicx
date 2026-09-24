@@ -541,6 +541,7 @@ impl Analysis {
             model.segments = vec![Segment {
                 segment_id: 0,
                 scope_root: None,
+                scope_workdirs: Vec::new(),
                 cwd: Known::unknown(),
                 branch: Known::unknown(),
                 started_at: model.provenance.started_at.clone(),

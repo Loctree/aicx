@@ -827,8 +827,12 @@ pub fn timeline_entries_from_model(model: &SessionModel) -> Vec<TimelineEntry> {
                 // The resolved repository identity when this host could
                 // prove one, otherwise the cwd the rollout recorded. The two
                 // are kept apart in the model so the canonical fingerprint
-                // stays independent of the machine doing the parsing.
+                // stays independent of the machine doing the parsing. A
+                // conflict span has NO scope: its recorded cwd stays in the
+                // model as a fact, but serving it here would file the span
+                // under a project the workdirs proved it was not only in.
                 cwd: segment
+                    .filter(|segment| !segment.scope_conflict)
                     .and_then(|segment| {
                         segment
                             .scope_root
@@ -846,8 +850,11 @@ pub fn timeline_entries_from_model(model: &SessionModel) -> Vec<TimelineEntry> {
                 scope_unattributed: segment.is_some_and(|segment| {
                     segment.scope_status == aicx_parser::engine::ScopeStatus::Unattributed
                 }),
+                scope_workdirs: segment
+                    .map(|segment| segment.scope_workdirs.clone())
+                    .unwrap_or_default(),
                 // Catalog provenance is stamped by the catalog read path
-                // (`parse_catalog_source_checked`), which owns the entry.
+                // (`parse_catalog_source`), which owns the entry.
                 session_kind: None,
                 timestamp_source,
                 // The typed model is deliberately path-free; source identity

@@ -46,6 +46,7 @@ pub(crate) fn build_timeline_entry(
         cwd: meta.cwd,
         scope_conflict: false,
         scope_unattributed: false,
+        scope_workdirs: Vec::new(),
         session_kind: None,
         timestamp_source: meta.timestamp_source,
         source_path: meta.source_path,

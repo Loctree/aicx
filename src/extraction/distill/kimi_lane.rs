@@ -401,6 +401,7 @@ mod tests {
                 scope_status: ScopeStatus::MixedCandidate,
                 scope_conflict: false,
                 scope_root: None,
+                scope_workdirs: Vec::new(),
             })
             .collect();
         model

@@ -19,7 +19,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use aicx_parser::engine::scope_evidence::{
-    WindowScope, WorkdirEvidence, effective_window_scope, tool_call_workdirs,
+    WindowScope, WorkdirEvidence, effective_window_scope, normalize_workdir, recorded_workdir,
+    tool_call_workdirs,
 };
 
 use crate::catalog::CatalogEntry;
@@ -1140,6 +1141,7 @@ fn parse_catalog_source(
                 cwd: entry.cwd.clone(),
                 scope_conflict: false,
                 scope_unattributed: false,
+                scope_workdirs: Vec::new(),
                 session_kind: session_kind.clone(),
                 timestamp_source: Some("source_mtime".to_string()),
                 source_path: Some(entry.source_path.clone()),
@@ -1268,8 +1270,16 @@ pub(crate) fn read_catalog_conversation_at(
 /// precisely how a session whose baseline is hidden comes back looking
 /// homogeneous, letting its remaining frames inherit the cataloged project.
 ///
+/// A frame is judged on every checkout its turn window touched, not only on
+/// its `cwd`: the window's recorded workdirs are tested too. A conflict window
+/// has no `cwd` to test at all, and a window absorbed into its baseline still
+/// ran inside the paths it names — judging `cwd` alone published exactly the
+/// denied checkout that made the window mixed.
+///
 /// The hidden repositories are counted, never named — scope honesty must not
-/// re-publish a path `.aicxignore` exists to hide.
+/// re-publish a path `.aicxignore` exists to hide. Each denied path counts as
+/// the checkout it resolves to here, so one repository reached through its
+/// root and a subdirectory is one hidden scope, not two.
 fn scope_report_excluding_ignored(
     frames: &mut Vec<TimelineEntry>,
     ignore: &crate::legacy_archive::RepoPathIgnoreMatcher,
@@ -1277,15 +1287,25 @@ fn scope_report_excluding_ignored(
     if ignore.is_empty() {
         return crate::extraction::conversation::scope_report_for_entries(frames);
     }
-    let hidden: std::collections::BTreeSet<String> = frames
-        .iter()
-        .filter(|frame| ignore.ignores_cwd(frame.cwd.as_deref()))
-        .filter_map(|frame| frame.cwd.as_deref())
-        .map(str::trim)
-        .filter(|cwd| !cwd.is_empty())
-        .map(str::to_owned)
-        .collect();
-    frames.retain(|frame| !ignore.ignores_cwd(frame.cwd.as_deref()));
+    let mut identities: BTreeMap<String, String> = BTreeMap::new();
+    let mut hidden = std::collections::BTreeSet::new();
+    frames.retain(|frame| {
+        let denied: Vec<&str> = frame
+            .cwd
+            .as_deref()
+            .into_iter()
+            .chain(frame.scope_workdirs.iter().map(String::as_str))
+            .map(str::trim)
+            .filter(|path| !path.is_empty() && ignore.ignores_cwd(Some(path)))
+            .collect();
+        for path in &denied {
+            let identity = identities
+                .entry((*path).to_owned())
+                .or_insert_with(|| normalize_workdir(path, None).scope_path());
+            hidden.insert(identity.clone());
+        }
+        denied.is_empty()
+    });
     let mut report = crate::extraction::conversation::scope_report_for_entries(frames);
     report.hidden_scopes = hidden.len();
     report
@@ -1436,6 +1456,7 @@ fn parse_large_codex_signal(
             cwd: baseline_cwd.clone(),
             scope_conflict: false,
             scope_unattributed: false,
+            scope_workdirs: Vec::new(),
             session_kind: session_kind.map(str::to_owned),
             timestamp_source: Some("record".to_string()),
             source_path: Some(entry.source_path.clone()),
@@ -1452,11 +1473,6 @@ fn parse_large_codex_signal(
     Ok(frames)
 }
 
-/// Stamp a buffered turn window with its effective scope and drain it into the
-/// session frame list: one consistent foreign repo re-scopes the whole window
-/// (including messages before the first tool call); proven-divergent evidence
-/// marks every frame conflicted, while unresolved foreign evidence leaves a
-/// durable do-not-inherit mark on every frame of the window.
 /// Codex tool-call payload types that can carry an explicit `workdir`.
 /// Mirrors the set the full adapter routes into `push_tool_turn`.
 fn is_tool_call_payload_type(payload_type: Option<&str>) -> bool {
@@ -1469,6 +1485,13 @@ fn is_tool_call_payload_type(payload_type: Option<&str>) -> bool {
     )
 }
 
+/// Stamp a buffered turn window with its effective scope and drain it into the
+/// session frame list: one consistent foreign repo re-scopes the whole window
+/// (including messages before the first tool call); proven-divergent evidence
+/// marks every frame conflicted, while unresolved foreign evidence leaves a
+/// durable do-not-inherit mark on every frame of the window. Every frame also
+/// carries the window's recorded workdirs, whatever the verdict, so the
+/// `.aicxignore` filter judges each checkout the window touched.
 fn flush_scope_window(
     window_frames: &mut Vec<TimelineEntry>,
     window_workdirs: &mut Vec<WorkdirEvidence>,
@@ -1476,6 +1499,19 @@ fn flush_scope_window(
     frames: &mut Vec<TimelineEntry>,
 ) {
     if !window_frames.is_empty() {
+        let recorded: Vec<String> = window_workdirs
+            .iter()
+            .filter_map(WorkdirEvidence::path)
+            .map(|workdir| recorded_workdir(workdir, baseline))
+            .fold(Vec::new(), |mut acc, workdir| {
+                if !acc.contains(&workdir) {
+                    acc.push(workdir);
+                }
+                acc
+            });
+        for frame in window_frames.iter_mut() {
+            frame.scope_workdirs.clone_from(&recorded);
+        }
         let (scope, path) = effective_window_scope(window_workdirs, baseline);
         match scope {
             WindowScope::Consistent => {
@@ -2128,6 +2164,7 @@ mod tests {
             cwd: Some(cwd.to_string()),
             scope_conflict: false,
             scope_unattributed: false,
+            scope_workdirs: Vec::new(),
             session_kind: None,
             timestamp_source: Some("record".to_string()),
             source_path: None,
@@ -2151,6 +2188,109 @@ mod tests {
             report.scope_mixed(),
             "a session is not homogeneous just because the other scope was hidden"
         );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A conflict window has no `cwd` to test, so the deny list must see the
+    /// workdirs that made it a conflict. Two real checkouts, one of them in
+    /// `.aicxignore`, both named by one turn window: the window's frames are
+    /// dropped on BOTH the full-parse and the bounded path, and the hidden
+    /// checkout is counted without being named.
+    #[test]
+    fn conflict_window_workdirs_reach_the_checkout_deny_list() {
+        let root = std::env::temp_dir().join(format!(
+            "aicx-source-index-ignore-conflict-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let repo_public = root.join("repo-public");
+        let repo_private = root.join("repo-private");
+        fs::create_dir_all(repo_public.join(".git")).unwrap();
+        fs::create_dir_all(repo_private.join(".git")).unwrap();
+        let aicx_home = root.join(".aicx");
+        fs::create_dir_all(&aicx_home).unwrap();
+        fs::write(
+            aicx_home.join(crate::legacy_archive::AICX_IGNORE_FILENAME),
+            format!("{}\n", repo_private.display()),
+        )
+        .unwrap();
+        let ignore = crate::legacy_archive::load_repo_path_ignore(&aicx_home, &root).unwrap();
+
+        let tool_call = |call_id: &str, workdir: &Path| {
+            serde_json::json!({
+                "timestamp": "2026-08-22T00:00:04Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "name": "exec_command",
+                    "call_id": call_id,
+                    "arguments": serde_json::json!({
+                        "cmd": "ls",
+                        "workdir": workdir.display().to_string(),
+                    })
+                    .to_string(),
+                },
+            })
+        };
+        let body = jsonl(&[
+            serde_json::json!({"timestamp": "2026-08-22T00:00:00Z", "type": "session_meta",
+                "payload": {"id": "conflict-deny", "cwd": "/sessions/vista"}}),
+            serde_json::json!({"timestamp": "2026-08-22T00:00:01Z", "type": "turn_context",
+                "payload": {"cwd": "/sessions/vista"}}),
+            serde_json::json!({"timestamp": "2026-08-22T00:00:02Z", "type": "response_item",
+                "payload": {"type": "message", "role": "user",
+                    "content": [{"type": "input_text", "text": "baseline question"}]}}),
+            serde_json::json!({"timestamp": "2026-08-22T00:00:03Z", "type": "turn_context",
+                "payload": {"cwd": "/sessions/vista"}}),
+            tool_call("c1", &repo_public),
+            tool_call("c2", &repo_private),
+            serde_json::json!({"timestamp": "2026-08-22T00:00:06Z", "type": "response_item",
+                "payload": {"type": "message", "role": "assistant",
+                    "content": [{"type": "output_text", "text": "private checkout secret"}]}}),
+        ]);
+        let source_path = root.join("rollout.jsonl");
+        fs::write(&source_path, body).unwrap();
+        let mut entry = bounded_entry(&source_path);
+        entry.session_id = "conflict-deny".to_string();
+        entry.cwd = Some("/sessions/vista".to_string());
+        let allow = crate::source_path::SourceAllowlist::from_roots([root.clone()]);
+
+        let full = parse_catalog_source(&entry, &source_path, &allow)
+            .unwrap()
+            .frames;
+        let bounded = parse_large_codex_signal(&entry, &source_path, &allow, None).unwrap();
+        for (label, mut frames) in [("full", full), ("bounded", bounded)] {
+            assert!(
+                frames
+                    .iter()
+                    .any(|frame| frame.message.contains("private checkout secret")),
+                "{label}: the fixture must actually produce the conflict frame"
+            );
+            let report = scope_report_excluding_ignored(&mut frames, &ignore);
+            assert!(
+                frames
+                    .iter()
+                    .all(|frame| !frame.message.contains("private checkout secret")),
+                "{label}: a frame whose window ran in a denied checkout survived"
+            );
+            assert!(
+                frames
+                    .iter()
+                    .any(|frame| frame.message.contains("baseline question")),
+                "{label}: frames outside the denied window must survive"
+            );
+            assert_eq!(report.hidden_scopes, 1, "{label}");
+            let rendered = format!("{report:?}");
+            assert!(
+                !rendered.contains("repo-private"),
+                "{label}: the hidden checkout must be counted, never named: {rendered}"
+            );
+        }
 
         let _ = fs::remove_dir_all(&root);
     }

@@ -379,6 +379,7 @@ impl AgentAdapter for GrokAdapter {
             model.segments.push(Segment {
                 segment_id: 0,
                 scope_root: None,
+                scope_workdirs: Vec::new(),
                 scope_status: crate::engine::ScopeStatus::from_evidence(
                     Some(cwd.as_str()),
                     branch.as_deref(),

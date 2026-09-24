@@ -102,6 +102,17 @@ pub struct Segment {
     /// want the resolved bucket read it explicitly and fall back to `cwd`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope_root: Option<String>,
+    /// Explicit tool-call workdirs this span's turn windows RECORDED, joined
+    /// onto the window's baseline and lexically normalized — no filesystem
+    /// reads. Empty when no window in the span named a workdir.
+    ///
+    /// This is the evidence the scope verdict was drawn from, kept so a
+    /// privacy filter can judge every checkout the span touched: a conflict
+    /// window has no single scope to test against `.aicxignore`, and a
+    /// window absorbed into its baseline still ran inside the paths it names.
+    /// Like `scope_root` it stays out of the canonical projection.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scope_workdirs: Vec<String>,
 }
 
 /// Structural scope verdict for a [`Segment`] or a whole conversation.

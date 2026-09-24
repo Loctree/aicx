@@ -67,6 +67,7 @@ pub fn model_with_text(text: &str) -> SessionModel {
         scope_conflict: false,
         cwd: Known::value("repo".to_owned()),
         scope_root: None,
+        scope_workdirs: Vec::new(),
         branch: Known::value("main".to_owned()),
         started_at: Known::value("2026-07-13T00:00:00Z".to_owned()),
         ended_at: Known::unknown(),

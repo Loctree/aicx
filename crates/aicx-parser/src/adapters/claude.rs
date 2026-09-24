@@ -1496,6 +1496,7 @@ fn finalize_segments(drafts: Vec<SegmentDraft>, turns: &[Turn]) -> Vec<Segment> 
         .map(|(index, draft)| Segment {
             segment_id: index as u32,
             scope_root: None,
+            scope_workdirs: Vec::new(),
             scope_status: draft.scope_status(),
             // Only the Codex adapter observes explicit tool-call workdirs.
             scope_conflict: false,

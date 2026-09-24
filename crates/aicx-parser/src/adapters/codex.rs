@@ -15,7 +15,7 @@ use crate::engine::frames::{
 };
 use crate::engine::frames_rules;
 use crate::engine::scope_evidence::{
-    WindowScope, WorkdirEvidence, effective_window_scope, tool_call_workdirs,
+    WindowScope, WorkdirEvidence, effective_window_scope, recorded_workdir, tool_call_workdirs,
 };
 use crate::engine::{
     AgentKind, BoundaryFlags, ConsumedUnit, ContextEpochRef, CounterSemantics, CoverageReport,
@@ -470,6 +470,9 @@ struct SegmentDraft {
     /// The window's explicit workdir evidence does not resolve and is not the
     /// baseline — durable "unknown, do not inherit" state.
     scope_unattributed: bool,
+    /// Recorded workdirs of every window folded into this draft. See
+    /// `Segment::scope_workdirs`.
+    scope_workdirs: Vec<String>,
 }
 
 impl<'a> Assembly<'a> {
@@ -642,6 +645,7 @@ impl<'a> Assembly<'a> {
                 start_turn: self.turns.len() as u64,
                 scope_conflict: false,
                 scope_unattributed: false,
+                scope_workdirs: Vec::new(),
             };
             // A draft that never received a turn is not a segment — this
             // `turn_context` supersedes it. Keeping both would emit two
@@ -674,6 +678,16 @@ impl<'a> Assembly<'a> {
             Known::Unknown(_) => None,
         };
         let (scope, path) = effective_window_scope(&self.window_workdirs, baseline);
+        for workdir in self
+            .window_workdirs
+            .iter()
+            .filter_map(WorkdirEvidence::path)
+        {
+            let recorded = recorded_workdir(workdir, baseline);
+            if !segment.scope_workdirs.contains(&recorded) {
+                segment.scope_workdirs.push(recorded);
+            }
+        }
         match scope {
             WindowScope::Consistent => {
                 if let Some(path) = path {
@@ -684,8 +698,12 @@ impl<'a> Assembly<'a> {
                     segment.scope_root = Some(path);
                 }
             }
+            // The recorded cwd survives a conflict for the same reason it
+            // survives a re-scope: it is a fact of the rollout, and whether
+            // two workdirs are two checkouts is a question about THIS disk.
+            // Consumers that bucket by scope read `scope_conflict` and refuse
+            // the span; they never read the cwd as its project.
             WindowScope::Conflict => {
-                segment.cwd = Known::unknown();
                 segment.scope_conflict = true;
             }
             // Unresolved foreign evidence is a durable "do not inherit" mark:
@@ -1328,6 +1346,7 @@ impl<'a> Assembly<'a> {
                 start_turn: 0,
                 scope_conflict: false,
                 scope_unattributed: false,
+                scope_workdirs: Vec::new(),
             });
         }
     }
@@ -1358,6 +1377,11 @@ impl<'a> Assembly<'a> {
             if mergeable {
                 if let Some(last) = merged.last_mut() {
                     last.ended_at = draft.ended_at.clone();
+                    for workdir in &draft.scope_workdirs {
+                        if !last.scope_workdirs.contains(workdir) {
+                            last.scope_workdirs.push(workdir.clone());
+                        }
+                    }
                 }
                 remap.push(merged.len().saturating_sub(1) as u32);
             } else {
@@ -1546,6 +1570,7 @@ impl<'a> Assembly<'a> {
                         },
                         scope_status,
                         scope_conflict: segment.scope_conflict,
+                        scope_workdirs: segment.scope_workdirs,
                     })
                 })
                 .collect();
@@ -2347,10 +2372,108 @@ mod tests {
             .replace("@B@", &json_path(&repo_b));
         let model = parse(bytes.as_bytes(), "s1");
         assert_eq!(model.segments.len(), 1, "{:?}", model.segments);
-        assert_eq!(known_value(&model.segments[0].cwd), None);
+        assert!(model.segments[0].scope_conflict);
         assert_eq!(model.segments[0].scope_status, ScopeStatus::MixedCandidate);
+        assert_eq!(model.segments[0].scope_root, None);
+        // The recorded baseline is a fact of the rollout; the conflict is a
+        // judgement about this disk and lives in `scope_conflict` only.
+        assert_eq!(known_value(&model.segments[0].cwd), Some("/sessions/vista"));
+        // Both workdirs survive as recorded evidence, so a privacy filter can
+        // still judge the checkouts that caused the conflict.
+        let recorded: Vec<String> = [&repo_a, &repo_b]
+            .iter()
+            .map(|repo| recorded_workdir(&repo.to_string_lossy(), None))
+            .collect();
+        assert_eq!(model.segments[0].scope_workdirs, recorded);
         let _ = std::fs::remove_dir_all(&repo_a);
         let _ = std::fs::remove_dir_all(&repo_b);
+    }
+
+    fn canonical_of(bytes: &[u8], id: &str) -> String {
+        let source = SourceHandle::new(
+            AgentKind::Codex,
+            id,
+            Some(id.to_owned()),
+            vec![
+                SourceArtifact::memory("rollout.jsonl", bytes.to_vec(), SourceFraming::JsonLines)
+                    .unwrap(),
+            ],
+        )
+        .unwrap();
+        let read = RawUnitReader::new(ReaderPolicy::default())
+            .read(&source)
+            .unwrap();
+        let adapter = CodexAdapter;
+        let classified = adapter.classify(&source, &read).unwrap();
+        let ValidatedParse::Session(parsed) =
+            validate_parse(adapter.assemble(&source, &read, classified).unwrap()).unwrap()
+        else {
+            panic!("session")
+        };
+        crate::engine::canonical_fingerprint(&parsed).expect("canonical fingerprint")
+    }
+
+    /// The canonical fingerprint is a function of the source bytes, not of
+    /// the disk they are parsed on. The same rollout is parsed before and
+    /// after the checkouts its workdirs name exist: the scope verdicts flip
+    /// (unattributed → conflict, baseline → nested checkout) and so does the
+    /// model's segmentation, but the canonical projection must not move.
+    #[test]
+    fn scope_verdicts_never_move_the_canonical_fingerprint() {
+        let base =
+            std::env::temp_dir().join(format!("aicx-codex-canonical-disk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let parent = base.join("parent");
+        let nested = parent.join("nested");
+        let repo_a = base.join("repo-a");
+        let repo_b = base.join("repo-b");
+        for dir in [&nested, &repo_a, &repo_b] {
+            std::fs::create_dir_all(dir).expect("scratch dir");
+        }
+        std::fs::create_dir_all(parent.join(".git")).expect("parent checkout");
+        let template = r#"{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"s1","cwd":"@PARENT@"}}
+{"timestamp":"2026-01-01T00:01:00Z","type":"turn_context","payload":{"cwd":"@PARENT@"}}
+{"timestamp":"2026-01-01T00:01:10Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"start in parent"}]}}
+{"timestamp":"2026-01-01T00:02:00Z","type":"turn_context","payload":{"cwd":"@PARENT@"}}
+{"timestamp":"2026-01-01T00:02:10Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"c1","input":"await tools.exec_command({cmd:\"ls\",\"workdir\":\"@NESTED@\"});"}}
+{"timestamp":"2026-01-01T00:02:20Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"inside nested"}]}}
+{"timestamp":"2026-01-01T00:03:00Z","type":"turn_context","payload":{"cwd":"@PARENT@"}}
+{"timestamp":"2026-01-01T00:03:10Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"c2","input":"await tools.exec_command({cmd:\"ls\",\"workdir\":\"@A@\"});"}}
+{"timestamp":"2026-01-01T00:03:20Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"c3","input":"await tools.exec_command({cmd:\"ls\",\"workdir\":\"@B@\"});"}}
+{"timestamp":"2026-01-01T00:03:30Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"two repos"}]}}
+{"timestamp":"2026-01-01T00:04:00Z","type":"turn_context","payload":{"cwd":"@PARENT@"}}
+{"timestamp":"2026-01-01T00:04:10Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"back in parent"}]}}
+"#;
+        let bytes = template
+            .replace("@PARENT@", &json_path(&parent))
+            .replace("@NESTED@", &json_path(&nested))
+            .replace("@A@", &json_path(&repo_a))
+            .replace("@B@", &json_path(&repo_b));
+
+        let before_model = parse(bytes.as_bytes(), "s1");
+        let before = canonical_of(bytes.as_bytes(), "s1");
+
+        for dir in [&nested, &repo_a, &repo_b] {
+            std::fs::create_dir_all(dir.join(".git")).expect("checkout marker");
+        }
+        let after_model = parse(bytes.as_bytes(), "s1");
+        let after = canonical_of(bytes.as_bytes(), "s1");
+
+        assert!(
+            after_model
+                .segments
+                .iter()
+                .any(|segment| segment.scope_conflict),
+            "the scenario must actually flip a verdict: {:?}",
+            after_model.segments
+        );
+        assert_ne!(
+            before_model.segments.len(),
+            after_model.segments.len(),
+            "the scenario must actually move the model's segmentation"
+        );
+        assert_eq!(before, after, "disk state moved the canonical fingerprint");
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// Turn windows never multiply segments on their own: repeated

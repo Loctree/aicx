@@ -240,6 +240,7 @@ mod tests {
                 scope_conflict: false,
                 cwd: Known::value(cwd.to_owned()),
                 scope_root: None,
+                scope_workdirs: Vec::new(),
                 branch: Known::unknown(),
                 started_at: Known::unknown(),
                 ended_at: Known::unknown(),
