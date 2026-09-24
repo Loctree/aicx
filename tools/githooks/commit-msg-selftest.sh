@@ -30,6 +30,7 @@ hook_env() {
         VIBECRAFTED_RUNTIME= \
         TERM_PROGRAM= \
         VC_SESSION_PID=0 \
+        VC_GIT_VERSION= \
         PATH="/usr/bin:/bin" \
         HOME="${HOME:-/tmp}" \
         TMPDIR="${TMPDIR:-/tmp}" \
@@ -447,6 +448,7 @@ $subject_agent
 Why this commit exists.
 
 # ------------------------ >8 ------------------------
+# Do not modify or remove the line above.
 diff --git a/README.md b/README.md
 session_id: $other_id
 EOF
@@ -566,6 +568,7 @@ $subject_agent
 Why this commit exists.
 
 ; ------------------------ >8 ------------------------
+; Do not modify or remove the line above.
 diff --git a/README.md b/README.md
 session_id: $other_id
 EOF
@@ -603,6 +606,7 @@ $subject_agent
 Why this commit exists.
 
 ; ------------------------ >8 ------------------------
+; Do not modify or remove the line above.
 diff --git a/README.md b/README.md
 session_id: $other_id
 EOF
@@ -657,6 +661,108 @@ if ! grep -Fq "vendor footers" "$err"; then
 fi
 rm -f "$tmp" "$err"
 printf 'ok validator: authored semicolon scissors is not a cut\n'
+
+# git commit -F keeps an authored hash scissors line. The vendor footer under
+# it must still be validated, because cleanup does not drop that suffix.
+tmp="$(mktemp)"
+err="$(mktemp)"
+cat >"$tmp" <<EOF
+$subject_agent
+
+Why this commit exists.
+
+# ------------------------ >8 ------------------------
+Co-Authored-By: Vendor <bot@openai.com>
+EOF
+if hook_env CODEX_SESSION_ID="$real_session" TERM_PROGRAM=iTerm.app \
+    "$hook" "$tmp" >/dev/null 2>"$err"; then
+    printf 'FAIL validator: commit -F scissors hid a vendor footer\n' >&2
+    rm -f "$tmp" "$err"
+    exit 1
+fi
+if ! grep -Fq "vendor footers" "$err"; then
+    printf 'FAIL validator: commit -F scissors (missing vendor footers)\n' >&2
+    cat "$err" >&2
+    rm -f "$tmp" "$err"
+    exit 1
+fi
+rm -f "$tmp" "$err"
+printf 'ok validator: commit -F keeps the suffix visible\n'
+
+# Git before 2.45 ignores core.commentString. A ;; value must not hide the
+# hash marker Git actually wrote.
+tmp="$(mktemp)"
+cat >"$tmp" <<EOF
+$subject_agent
+
+Why this commit exists.
+
+# ------------------------ >8 ------------------------
+# Do not modify or remove the line above.
+diff --git a/README.md b/README.md
+session_id: $other_id
+EOF
+if ! hook_env VC_GIT_VERSION='git version 2.43.0' \
+    GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.commentString GIT_CONFIG_VALUE_0=';;' \
+    CODEX_THREAD_ID="$thread_id" TERM_PROGRAM=iTerm.app \
+    "$hook" "$tmp" >/dev/null 2>&1; then
+    printf 'FAIL generator: old Git lost trailers under a hash scissors line\n' >&2
+    hook_env VC_GIT_VERSION='git version 2.43.0' \
+        GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.commentString GIT_CONFIG_VALUE_0=';;' \
+        CODEX_THREAD_ID="$thread_id" TERM_PROGRAM=iTerm.app "$hook" "$tmp" >&2 || true
+    cat "$tmp" >&2
+    rm -f "$tmp"
+    exit 1
+fi
+if ! awk -v id="$thread_id" '
+    /^#[[:space:]]*-{2,}[[:space:]]*>8/ { exit }
+    $0 == "session_id: " id { found=1 }
+    END { exit !found }
+' "$tmp"; then
+    printf 'FAIL generator: old Git did not place session_id above the hash cut\n' >&2
+    cat "$tmp" >&2
+    rm -f "$tmp"
+    exit 1
+fi
+rm -f "$tmp"
+printf 'ok generator: Git 2.43 ignores commentString\n'
+
+# Git 2.45+ honors commentString, so the cut prefix is that string.
+tmp="$(mktemp)"
+cat >"$tmp" <<EOF
+$subject_agent
+
+Why this commit exists.
+
+;; ------------------------ >8 ------------------------
+;; Do not modify or remove the line above.
+diff --git a/README.md b/README.md
+session_id: $other_id
+EOF
+if ! hook_env VC_GIT_VERSION='git version 2.51.0' \
+    GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.commentString GIT_CONFIG_VALUE_0=';;' \
+    CODEX_THREAD_ID="$thread_id" TERM_PROGRAM=iTerm.app \
+    "$hook" "$tmp" >/dev/null 2>&1; then
+    printf 'FAIL generator: commentString scissors message rejected\n' >&2
+    hook_env VC_GIT_VERSION='git version 2.51.0' \
+        GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.commentString GIT_CONFIG_VALUE_0=';;' \
+        CODEX_THREAD_ID="$thread_id" TERM_PROGRAM=iTerm.app "$hook" "$tmp" >&2 || true
+    cat "$tmp" >&2
+    rm -f "$tmp"
+    exit 1
+fi
+if ! awk -v id="$thread_id" '
+    /^;;[[:space:]]*-{2,}[[:space:]]*>8/ { exit }
+    $0 == "session_id: " id { found=1 }
+    END { exit !found }
+' "$tmp"; then
+    printf 'FAIL generator: session_id is not above the commentString cut\n' >&2
+    cat "$tmp" >&2
+    rm -f "$tmp"
+    exit 1
+fi
+rm -f "$tmp"
+printf 'ok generator: Git 2.45+ honors commentString\n'
 
 # auto mode, no scissors: a "#" line above the footer is body when Git has
 # to pick another character. It must not be skipped as a "#" comment.
@@ -766,6 +872,28 @@ if ! hook_env GEMINI_SESSION_ID="$gemini_id" TERM_PROGRAM=iTerm.app "$hook" "$tm
 fi
 rm -f "$tmp"
 printf 'ok validator: native Gemini session id accepted\n'
+
+subject_kimi='[kimi/interactive] fix: keep the scoped session id'
+kimi_id='11111111-1111-4111-8111-111111111111:worker'
+out="$(gen "$subject_kimi
+
+Why this commit exists." KIMI_SESSION_ID="$kimi_id" VC_SESSION_PID=0)"
+expect_line kimi-scoped-id "$out" "session_id: $kimi_id"
+tmp="$(mktemp)"
+printf '%s\n' "$out" >"$tmp"
+if ! hook_env KIMI_SESSION_ID="$kimi_id" TERM_PROGRAM=iTerm.app "$hook" "$tmp" >/dev/null 2>&1; then
+    printf 'FAIL validator: scoped Kimi session id rejected\n' >&2
+    hook_env KIMI_SESSION_ID="$kimi_id" TERM_PROGRAM=iTerm.app "$hook" "$tmp" >&2 || true
+    rm -f "$tmp"
+    exit 1
+fi
+rm -f "$tmp"
+printf 'ok validator: scoped Kimi session id accepted\n'
+
+out="$(gen "$subject_agent
+
+Why this commit exists." KIMI_SESSION_ID="$kimi_id" VC_SESSION_PID=0)"
+expect_absent codex-does-not-record-kimi "$out" "session_id:"
 
 out="$(gen "$subject_agent
 
