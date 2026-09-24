@@ -479,10 +479,11 @@ fn trim_path(path: &str) -> &str {
 /// established on this machine (neither path resolves to a checkout).
 ///
 /// Both sides are compared lexically normalized, so a scope written with a
-/// trailing `.` or `..` still contains what it names.
+/// trailing `.` or `..` still contains what it names, and in the form the
+/// recorded platform resolves them: see [`comparable_spelling`].
 fn lexically_within(candidate: &str, scope_root: &str) -> bool {
-    let candidate = lexically_normalized(candidate);
-    let scope = lexically_normalized(scope_root);
+    let candidate = comparable_spelling(&lexically_normalized(candidate));
+    let scope = comparable_spelling(&lexically_normalized(scope_root));
     let windows = windows_shaped(&scope);
     let candidate = trim_path(&candidate);
     let scope = trim_path(&scope);
@@ -490,6 +491,32 @@ fn lexically_within(candidate: &str, scope_root: &str) -> bool {
         || candidate
             .strip_prefix(scope)
             .is_some_and(|rest| rest.starts_with('/') || (windows && rest.starts_with('\\')))
+}
+
+/// One path in the spelling its own platform treats as identical.
+///
+/// Lexical normalization keeps each path's separator, so a Windows baseline
+/// `C:/Users/dev/repo` and a workdir `C:\Users\dev\repo\pkg` from the same
+/// rollout never shared a prefix, and `c:\users\…` never matched `C:\Users\…`:
+/// the window went unattributed and its intents were dropped. Windows accepts
+/// either separator and, by default, ignores letter case, so a Windows
+/// spelling is folded to `\` and ASCII lowercase before it is compared. ASCII
+/// folding is a subset of what Windows itself folds, so it never makes two
+/// paths equal that Windows would keep apart. A Unix spelling is left byte for
+/// byte: there `\` is a filename character and case is significant.
+fn comparable_spelling(path: &str) -> String {
+    if !windows_shaped(path) {
+        return path.to_owned();
+    }
+    path.chars()
+        .map(|c| {
+            if c == '/' {
+                '\\'
+            } else {
+                c.to_ascii_lowercase()
+            }
+        })
+        .collect()
 }
 
 /// Does `candidate` belong to the same checkout as `scope_root`?
@@ -1478,6 +1505,53 @@ mod tests {
         );
         // A drive-relative token is not absolute anywhere.
         assert!(!absolute_anywhere("C:repo"));
+    }
+
+    /// Finding: lexical containment kept each path's own separator and case,
+    /// so one Windows checkout spelled `C:/…` by the baseline and `C:\…` or
+    /// `c:\…` by a tool call was two strings with no common prefix. The window
+    /// went unattributed and its intents were dropped, although Windows
+    /// resolves every one of those spellings to the same directory.
+    #[test]
+    fn windows_spellings_of_one_checkout_are_one_scope() {
+        let forward = "C:/aicx-scope-nowhere/dev/repo";
+        let back = r"C:\aicx-scope-nowhere\dev\repo";
+        for (candidate, scope) in [
+            (r"C:\aicx-scope-nowhere\dev\repo\pkg", forward),
+            ("C:/aicx-scope-nowhere/dev/repo/pkg", back),
+            (r"c:\AICX-SCOPE-NOWHERE\Dev\Repo\pkg", back),
+            (r"C:\aicx-scope-nowhere/dev\repo", forward),
+        ] {
+            assert!(
+                workdir_within_scope(candidate, scope),
+                "`{candidate}` is inside `{scope}` on Windows"
+            );
+        }
+        let (scope, path) = effective_window_scope(
+            &explicit(&[r"C:\aicx-scope-nowhere\dev\repo\pkg", "src"]),
+            Some(forward),
+        );
+        assert_eq!(scope, WindowScope::Baseline);
+        assert_eq!(path, None);
+
+        // Folding never widens a scope past its own directory.
+        assert!(!workdir_within_scope(
+            r"C:\aicx-scope-nowhere\dev\repo-other",
+            forward
+        ));
+        assert!(!workdir_within_scope(
+            r"D:\aicx-scope-nowhere\dev\repo",
+            back
+        ));
+        // A Unix spelling keeps its case and its `\` as a filename character.
+        assert!(!workdir_within_scope(
+            "/aicx-scope-nowhere/Dev/repo",
+            "/aicx-scope-nowhere/dev/repo"
+        ));
+        assert!(!workdir_within_scope(
+            r"/aicx-scope-nowhere/dev\repo",
+            "/aicx-scope-nowhere/dev"
+        ));
     }
 
     /// Finding: the fail-closed threshold for an over-cap record counted raw
