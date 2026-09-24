@@ -100,8 +100,9 @@ pub enum WindowScope {
 /// conflicted, never confidently wrong.
 ///
 /// A `workdir` whose value is written but cannot be read as one path — a
-/// template literal that interpolates, a literal that never closes — is
-/// [`WorkdirEvidence::Opaque`]: the call names a directory we cannot see.
+/// variable or an expression, a template literal that interpolates, a literal
+/// that never closes — is [`WorkdirEvidence::Opaque`]: the call names a
+/// directory we cannot see.
 pub fn tool_call_workdirs(payload: &Value) -> Vec<WorkdirEvidence> {
     let mut found: Vec<WorkdirEvidence> = Vec::new();
     let mut push = |evidence: WorkdirEvidence| {
@@ -156,6 +157,21 @@ pub fn tool_call_workdirs(payload: &Value) -> Vec<WorkdirEvidence> {
 /// `\r` as an escape would corrupt it. A literal that never closes is
 /// opaque: whatever it names was cut off.
 ///
+/// A value that is not a literal at all — `workdir: targetDir`,
+/// `workdir: path.join(root, "pkg")`, the shorthand `{cmd, workdir}` — still
+/// names the directory the call ran in; only the runtime knew which. It is
+/// opaque, never "no evidence": skipping it left the window on its baseline
+/// while the call worked in another checkout. `null` and `undefined` ask for
+/// the default directory and are no evidence. Such a value counts only where
+/// the key is a property of an object (right after `{` or `,`): prose like
+/// `// workdir: the repo` names nothing, and reading it would unplace the
+/// window.
+///
+/// The key must be the whole property name, and a quoted one must be quoted
+/// on both sides: `networkdir:`, `fallback_workdir:` and `"fallback-workdir":`
+/// are other properties, and reading them would unplace a window whose call
+/// never left the baseline.
+///
 /// This is a scanner over key/value SHAPE, not a JavaScript parser, and it
 /// deliberately does not track which string a `workdir:` sits inside. Model
 /// JavaScript routinely carries apostrophes in comments and prose; a tokenizer
@@ -164,19 +180,45 @@ pub fn tool_call_workdirs(payload: &Value) -> Vec<WorkdirEvidence> {
 /// conflicted.
 fn workdirs_in_literal(input: &str) -> Vec<WorkdirEvidence> {
     static WORKDIR_KEY_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let re = WORKDIR_KEY_RE
-        .get_or_init(|| regex::Regex::new(r#"["']?workdir["']?\s*:\s*"#).expect("valid regex"));
+    static WORKDIR_SHORTHAND_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    // The leading class is the identifier boundary the regex crate has no
+    // look-behind for: it consumes the character before the key, which is
+    // never part of the value read after the match.
+    let re = WORKDIR_KEY_RE.get_or_init(|| {
+        regex::Regex::new(r#"(?:^|[^A-Za-z0-9_$])(?P<key>"workdir"|'workdir'|workdir)\s*:\s*"#)
+            .expect("valid regex")
+    });
+    let shorthand = WORKDIR_SHORTHAND_RE
+        .get_or_init(|| regex::Regex::new(r"[{,]\s*workdir\s*[,}]").expect("valid regex"));
     let mut found = Vec::new();
-    for key in re.find_iter(input) {
-        let value = &input[key.end()..];
-        let Some(delimiter) = value
-            .chars()
-            .next()
-            .filter(|c| matches!(c, '"' | '\'' | '`'))
-        else {
-            // Not a string literal (an identifier, an expression, or prose in
-            // a command): nothing to read, exactly as before.
+    if shorthand.is_match(input) {
+        found.push(WorkdirEvidence::Opaque);
+    }
+    for caps in re.captures_iter(input) {
+        let (Some(whole), Some(key)) = (caps.get(0), caps.name("key")) else {
             continue;
+        };
+        let value = &input[whole.end()..];
+        let Some(first) = value.chars().next() else {
+            continue;
+        };
+        let delimiter = match first {
+            '"' | '\'' | '`' => first,
+            c if c.is_ascii_alphabetic() || matches!(c, '_' | '$' | '(') => {
+                let before = input[..key.start()].trim_end();
+                let is_property = before.ends_with('{') || before.ends_with(',');
+                let word: String = value
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '$'))
+                    .collect();
+                if is_property && !matches!(word.as_str(), "null" | "undefined") {
+                    found.push(WorkdirEvidence::Opaque);
+                }
+                continue;
+            }
+            // A number, punctuation, or an escape of text quoted around this
+            // spot: not a value that can name a directory.
+            _ => continue,
         };
         match literal_body(&value[1..], delimiter) {
             Some(body) if delimiter == '`' && body.contains("${") => {
@@ -1687,6 +1729,77 @@ mod tests {
             r"/aicx-scope-nowhere/dev\repo",
             "/aicx-scope-nowhere/dev"
         ));
+    }
+
+    /// Finding: a `workdir` written as a variable or an expression was
+    /// skipped as "no evidence", so `tools.exec_command({cmd, workdir:
+    /// targetDir})` into another checkout left the window on its baseline.
+    /// Only the runtime knew that directory: the evidence is opaque.
+    #[test]
+    fn a_workdir_that_is_not_a_literal_is_opaque() {
+        for input in [
+            r#"tools.exec_command({cmd: "cargo test", workdir: targetDir})"#,
+            r#"tools.exec_command({cmd: "cargo test", workdir: cfg.repo})"#,
+            r#"tools.exec_command({cmd: "ls", workdir: path.join(root, "pkg")})"#,
+            r#"tools.exec_command({cmd: "ls", workdir: nullish})"#,
+            "tools.exec_command({ cmd, workdir })",
+            "tools.exec_command({workdir, cmd})",
+        ] {
+            assert_eq!(
+                tool_call_workdirs(&js_input(input)),
+                vec![WorkdirEvidence::Opaque],
+                "{input}"
+            );
+        }
+        // Asking for the default directory is not naming another one, and a
+        // `workdir:` that is not an object property is prose, not a value.
+        for input in [
+            r#"tools.exec_command({cmd: "ls", workdir: null})"#,
+            r#"tools.exec_command({cmd: "ls", workdir: undefined})"#,
+            "// workdir: the repo root\ntools.exec_command({cmd: \"ls\"})",
+            r#"tools.exec_command({cmd: "echo workdir: pkg"})"#,
+        ] {
+            assert!(tool_call_workdirs(&js_input(input)).is_empty(), "{input}");
+        }
+        // A readable literal beside an unreadable value keeps both.
+        assert_eq!(
+            tool_call_workdirs(&js_input(
+                r#"tools.exec_command({cmd: "a", workdir: "/repo/a"}); tools.exec_command({cmd: "b", workdir: other})"#
+            )),
+            vec![
+                WorkdirEvidence::Explicit("/repo/a".to_string()),
+                WorkdirEvidence::Opaque
+            ]
+        );
+    }
+
+    /// Finding: the key pattern had no identifier boundary, so another
+    /// property whose name merely ends in `workdir` was read as the call's.
+    #[test]
+    fn only_a_whole_workdir_key_is_read() {
+        for input in [
+            r#"tools.exec_command({cmd: "ls", networkdir: "/foreign/repo"})"#,
+            r#"tools.exec_command({cmd: "ls", fallback_workdir: "/foreign/repo"})"#,
+            r#"tools.exec_command({cmd: "ls", "fallback_workdir": "/foreign/repo"})"#,
+            r#"tools.exec_command({cmd: "ls", "fallback-workdir": "/foreign/repo"})"#,
+            r#"tools.exec_command({cmd: "ls", $workdir: "/foreign/repo"})"#,
+            r#"tools.exec_command({cmd: "ls", workdirs: ["/foreign/repo"]})"#,
+            r#"tools.exec_command({cmd: "ls", fallback_workdir: other})"#,
+        ] {
+            assert!(tool_call_workdirs(&js_input(input)).is_empty(), "{input}");
+        }
+        for input in [
+            r#"{workdir: "/repo/a"}"#,
+            r#"{"workdir": "/repo/a"}"#,
+            r#"{cmd: "ls",workdir:'/repo/a'}"#,
+            r#"workdir: "/repo/a""#,
+        ] {
+            assert_eq!(
+                first_workdir(&js_input(input)).as_deref(),
+                Some("/repo/a"),
+                "{input}"
+            );
+        }
     }
 
     /// Finding: the fail-closed threshold for an over-cap record counted raw
