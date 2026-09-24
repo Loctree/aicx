@@ -155,7 +155,9 @@ pub fn tool_call_workdirs(payload: &Value) -> Vec<WorkdirEvidence> {
 /// backslash or an escaped delimiter is unescaped in the value; every other
 /// backslash stays, because a Windows workdir is `C:\repo\crate` and reading
 /// `\r` as an escape would corrupt it. A literal that never closes is
-/// opaque: whatever it names was cut off.
+/// opaque: whatever it names was cut off. So is a literal that is only the
+/// first operand of an expression — `"/repos/vista" + "-private"` — because
+/// the value continues past its closing quote ([`value_ends_at`]).
 ///
 /// A value that is not a literal at all — `workdir: targetDir`,
 /// `workdir: path.join(root, "pkg")`, the shorthand `{cmd, workdir}` — still
@@ -221,10 +223,13 @@ fn workdirs_in_literal(input: &str) -> Vec<WorkdirEvidence> {
             _ => continue,
         };
         match literal_body(&value[1..], delimiter) {
-            Some(body) if delimiter == '`' && body.contains("${") => {
+            Some((body, _)) if delimiter == '`' && body.contains("${") => {
                 found.push(WorkdirEvidence::Opaque);
             }
-            Some(body) => {
+            Some((_, end)) if !value_ends_at(&value[1 + end..]) => {
+                found.push(WorkdirEvidence::Opaque);
+            }
+            Some((body, _)) => {
                 let body = body.trim();
                 if !body.is_empty() {
                     found.push(WorkdirEvidence::Explicit(body.to_string()));
@@ -237,22 +242,23 @@ fn workdirs_in_literal(input: &str) -> Vec<WorkdirEvidence> {
 }
 
 /// The body of a string literal that `delimiter` opened, up to the matching
-/// unescaped `delimiter`; `None` when it never closes. Only `\\` and an escaped
-/// delimiter are unescaped (see [`workdirs_in_literal`]).
-fn literal_body(rest: &str, delimiter: char) -> Option<String> {
+/// unescaped `delimiter`, and the byte offset in `rest` just past that
+/// delimiter; `None` when it never closes. Only `\\` and an escaped delimiter
+/// are unescaped (see [`workdirs_in_literal`]).
+fn literal_body(rest: &str, delimiter: char) -> Option<(String, usize)> {
     let mut body = String::new();
-    let mut chars = rest.chars();
-    while let Some(c) = chars.next() {
+    let mut chars = rest.char_indices();
+    while let Some((at, c)) = chars.next() {
         if c == delimiter {
-            return Some(body);
+            return Some((body, at + c.len_utf8()));
         }
         if c != '\\' {
             body.push(c);
             continue;
         }
         match chars.next() {
-            Some(escaped) if escaped == '\\' || escaped == delimiter => body.push(escaped),
-            Some(other) => {
+            Some((_, escaped)) if escaped == '\\' || escaped == delimiter => body.push(escaped),
+            Some((_, other)) => {
                 body.push('\\');
                 body.push(other);
             }
@@ -260,6 +266,25 @@ fn literal_body(rest: &str, delimiter: char) -> Option<String> {
         }
     }
     None
+}
+
+/// Does a property value end right after its closing quote?
+///
+/// `rest` is what follows the literal. Only the end of the property may come
+/// next — `,` or `}`, the close of an enclosing call or array, a statement
+/// end, a comment, or the end of the input. Anything else continues an
+/// expression: `workdir: "/repos/vista" + "-private"` names
+/// `/repos/vista-private`, and reading the first operand as the path would
+/// place the call in another checkout. A property written without the comma
+/// JavaScript requires before the next one is read as an expression too, and
+/// so is prose that quotes a path after `workdir:` and keeps talking; either
+/// costs the window its attribution, never its correctness.
+fn value_ends_at(rest: &str) -> bool {
+    let rest = rest.trim_start();
+    rest.is_empty()
+        || rest.starts_with([',', '}', ')', ']', ';'])
+        || rest.starts_with("//")
+        || rest.starts_with("/*")
 }
 
 /// Resolve one workdir string to an absolute spelling, lexically normalized.
@@ -1981,6 +2006,39 @@ mod tests {
             assert_eq!(
                 first_workdir(&js_input(input)).as_deref(),
                 Some("/repo/a"),
+                "{input}"
+            );
+        }
+    }
+
+    /// Finding: a literal was read as the whole value whatever followed it,
+    /// so `"/repos/vista" + "-private"` placed the call in `/repos/vista`.
+    #[test]
+    fn a_literal_is_the_value_only_when_the_value_ends_there() {
+        for input in [
+            r#"tools.exec_command({cmd: "ls", workdir: "/repos/vista" + "-private"})"#,
+            r#"tools.exec_command({cmd: "ls", workdir: '/repos/vista'.concat(suffix)})"#,
+            r#"tools.exec_command({cmd: "ls", workdir: `/repos/vista` + tail, yield_time_ms: 1})"#,
+            "tools.exec_command({\n  cmd: \"ls\",\n  workdir: \"/repos/vista\"\n    + \"-private\",\n})",
+            r#"tools.exec_command({cmd: "ls", workdir: "/repos/a" || "/repos/b"})"#,
+        ] {
+            assert_eq!(
+                tool_call_workdirs(&js_input(input)),
+                vec![WorkdirEvidence::Opaque],
+                "{input}"
+            );
+        }
+        for input in [
+            r#"tools.exec_command({cmd: "ls", workdir: "/repos/vista"})"#,
+            r#"tools.exec_command({workdir: "/repos/vista", cmd: "ls"})"#,
+            "tools.exec_command({\n  workdir: '/repos/vista'  // the checkout\n})",
+            "tools.exec_command({workdir: \"/repos/vista\" /* pinned */})",
+            r#"[{workdir: "/repos/vista"}]"#,
+            r#"{"workdir": "/repos/vista"}"#,
+        ] {
+            assert_eq!(
+                tool_call_workdirs(&js_input(input)),
+                vec![WorkdirEvidence::Explicit("/repos/vista".to_string())],
                 "{input}"
             );
         }
