@@ -103,9 +103,10 @@ an empty window whose range ends before it starts, which had made the whole
 rollout fail kernel validation; and an unreadable tool call in the full-parser
 lane now contributes the same "unreadable evidence" mark the bounded index
 reader already recorded, so its window fails closed instead of keeping the
-baseline cwd. Unreadable covers both ways in — an over-cap record that is
-drained without parsing, and a malformed one that fails to parse — because the
-reason we could not read it makes no difference to the scope.
+baseline cwd. Unreadable covers both ways in, in both readers — an over-cap
+record that is drained without parsing, and a malformed one that fails to
+parse — because the reason we could not read it makes no difference to the
+scope.
 
 #### Host resolution is out of the deterministic parser model
 

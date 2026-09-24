@@ -1348,6 +1348,19 @@ fn frame_matches_kind(frame: &TimelineEntry, requested: FrameKind) -> bool {
     }) == requested
 }
 
+/// Record that the current turn window holds a record this reader could not
+/// parse — drained over-cap or malformed — whose visible bytes may be a tool
+/// call, and so may hide the window's only foreign workdir. The window then
+/// fails closed to unattributed, exactly as the full Codex adapter's
+/// `note_opaque_window` decides for the same two cases.
+fn note_opaque_record(window_workdirs: &mut Vec<WorkdirEvidence>, line: &str) {
+    if aicx_parser::engine::truncated_record_is_tool_call(line)
+        && !window_workdirs.contains(&WorkdirEvidence::Opaque)
+    {
+        window_workdirs.push(WorkdirEvidence::Opaque);
+    }
+}
+
 /// Bounded signal-only reader for oversized Codex rollouts.
 ///
 /// Historical rollouts can exceed hundreds of MB because tool results and
@@ -1383,17 +1396,16 @@ fn parse_large_codex_signal(
             // moved repos and this reader will never know: record unreadable
             // evidence so the window fails closed to unattributed instead of
             // silently keeping the baseline project.
-            if aicx_parser::engine::truncated_record_is_tool_call(&record.line)
-                && !window_workdirs.contains(&WorkdirEvidence::Opaque)
-            {
-                window_workdirs.push(WorkdirEvidence::Opaque);
-            }
+            note_opaque_record(&mut window_workdirs, &record.line);
             continue;
         }
         if record.line.trim().is_empty() {
             continue;
         }
         let Ok(value) = serde_json::from_str::<serde_json::Value>(&record.line) else {
+            // A malformed record never becomes a value either, so its workdir
+            // is just as invisible: the full adapter treats both alike.
+            note_opaque_record(&mut window_workdirs, &record.line);
             continue;
         };
         if value.get("type").and_then(serde_json::Value::as_str) == Some("turn_context") {
@@ -3037,6 +3049,57 @@ mod tests {
             opaque_frames[0].scope_unattributed,
             "an over-cap record this reader could not classify is not proof of the baseline"
         );
+    }
+
+    /// A malformed record never parses either, so its workdir is as invisible
+    /// as an over-cap one's. The full adapter fails such a window closed; this
+    /// reader used to drop the record silently and keep the baseline.
+    #[test]
+    fn malformed_tool_call_fails_closed_to_unattributed() {
+        let malformed_window = |label: &str, malformed: &str| {
+            let root = bounded_scope_root(label);
+            let source_path = root.join(".codex").join("sessions").join("rollout.jsonl");
+            fs::create_dir_all(source_path.parent().unwrap()).unwrap();
+            let mut body = jsonl(&[
+                codex_meta("/sessions/vista"),
+                codex_turn_context("/sessions/vista"),
+                codex_user_message("biore task"),
+            ]);
+            body.push_str(malformed);
+            body.push('\n');
+            fs::write(&source_path, body).unwrap();
+            let entry = bounded_entry(&source_path);
+            let allow = crate::source_path::SourceAllowlist::for_operator(&root, &root);
+            let resolved = allow.resolve_file(&source_path).expect("resolve rollout");
+            let frames = parse_large_codex_signal(&entry, &resolved, &allow, None)
+                .expect("bounded parse")
+                .frames;
+            let _ = fs::remove_dir_all(&root);
+            frames
+        };
+
+        let call_frames = malformed_window(
+            "malformed-call",
+            r#"{"timestamp":"2026-01-01T00:01:20Z","type":"response_item","payload":{"type":"function_call","name":"shell","arguments":"{\"cmd\":\"ls\",\"workdir\":\"/sessions/fleet-bus\"}""#,
+        );
+        assert_eq!(call_frames.len(), 1, "{call_frames:?}");
+        assert!(
+            call_frames[0].scope_unattributed,
+            "a tool call this reader could not parse must not leave the window on its baseline"
+        );
+
+        // Both discriminators readable and neither is a call: a broken message
+        // hid no workdir and must not poison an otherwise clean window.
+        let message_frames = malformed_window(
+            "malformed-message",
+            r#"{"timestamp":"2026-01-01T00:01:20Z","type":"response_item","payload":{"type":"message","role":"assistant","content":["#,
+        );
+        assert_eq!(message_frames.len(), 1, "{message_frames:?}");
+        assert!(
+            !message_frames[0].scope_unattributed,
+            "a malformed message carries no workdir and is not lost evidence"
+        );
+        assert_eq!(message_frames[0].cwd.as_deref(), Some("/sessions/vista"));
     }
     /// Finding (P1-01/02): the scope verdicts stored in the parse ledger are
     /// resolved against the local filesystem, but the ledger fingerprinted
