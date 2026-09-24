@@ -276,6 +276,9 @@ fn literal_body(rest: &str, delimiter: char) -> Option<String> {
 /// of such a rollout unresolvable, and the window unattributed.
 fn resolve_candidate(path: &str, baseline: Option<&str>) -> Option<String> {
     let path = path.trim();
+    if let Some(on_drive) = on_baseline_drive(path, baseline) {
+        return Some(lexically_normalized(&on_drive));
+    }
     if absolute_anywhere(path) {
         return Some(lexically_normalized(path));
     }
@@ -288,6 +291,21 @@ fn resolve_candidate(path: &str, baseline: Option<&str>) -> Option<String> {
         "{}{separator}{path}",
         base.trim_end_matches(['/', '\\'])
     )))
+}
+
+/// A Windows path rooted without a drive (`\repo`) names that directory on the
+/// CURRENT drive, which for a tool call is the drive of the turn's cwd. Kept
+/// drive-less it matched neither `C:\repo` nor anything else, and the window
+/// went unattributed. UNC (`\\server\share`) names its own root, and a
+/// `/`-rooted path can be a Unix spelling, so both are left alone.
+fn on_baseline_drive(path: &str, baseline: Option<&str>) -> Option<String> {
+    if !path.starts_with('\\') || path.starts_with("\\\\") {
+        return None;
+    }
+    let base = baseline?.trim();
+    let bytes = base.as_bytes();
+    (bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
+        .then(|| format!("{}{path}", &base[..2]))
 }
 
 /// Is `path` absolute on ANY platform a rollout can come from? `/unix`,
@@ -1729,6 +1747,47 @@ mod tests {
             r"/aicx-scope-nowhere/dev\repo",
             "/aicx-scope-nowhere/dev"
         ));
+    }
+
+    /// Finding: a Windows path rooted without a drive (`\repo`) lives on the
+    /// CURRENT drive, the turn cwd's. Kept drive-less it matched nothing, so a
+    /// call that never left `C:\repo` unplaced its window.
+    #[test]
+    fn a_drive_less_rooted_windows_workdir_takes_the_baseline_drive() {
+        let baseline = r"C:\aicx-scope-nowhere\dev\repo";
+        assert_eq!(
+            resolve_candidate(r"\aicx-scope-nowhere\dev\repo\pkg", Some(baseline)).as_deref(),
+            Some(r"C:\aicx-scope-nowhere\dev\repo\pkg")
+        );
+        let (scope, _) = effective_window_scope(
+            &explicit(&[r"\aicx-scope-nowhere\dev\repo\pkg"]),
+            Some(baseline),
+        );
+        assert_eq!(scope, WindowScope::Baseline);
+        // Another directory on that drive stays another directory.
+        let (scope, _) = effective_window_scope(
+            &explicit(&[r"\aicx-scope-nowhere\dev\other"]),
+            Some(baseline),
+        );
+        assert_ne!(scope, WindowScope::Baseline);
+        // UNC names its own root, a `/`-rooted path may be a Unix spelling,
+        // and without a drive-shaped baseline there is no drive to borrow.
+        assert_eq!(
+            on_baseline_drive(r"\\server\share\repo", Some(baseline)),
+            None
+        );
+        assert_eq!(
+            on_baseline_drive("/aicx-scope-nowhere/dev/repo", Some(baseline)),
+            None
+        );
+        assert_eq!(
+            on_baseline_drive(
+                r"\aicx-scope-nowhere\repo",
+                Some("/aicx-scope-nowhere/repo")
+            ),
+            None
+        );
+        assert_eq!(on_baseline_drive(r"\aicx-scope-nowhere\repo", None), None);
     }
 
     /// Finding: a `workdir` written as a variable or an expression was
