@@ -257,7 +257,7 @@ subject_human='[maciej/manual] feat: describe the change'
 
 out="$(gen "$subject_agent
 
-Why this commit exists." CLAUDE_CODE_SESSION_ID="$real_session" VC_SESSION_PID=0)"
+Why this commit exists." CODEX_SESSION_ID="$real_session" VC_SESSION_PID=0)"
 expect_line fills-agent-mailbox "$out" "Authored-By: codex <agents@vetcoders.io>"
 expect_line fills-session-id "$out" "session_id: $real_session"
 expect_line fills-time-key "$out" "time: "
@@ -270,7 +270,7 @@ out="$(gen "$subject_agent
 Why this commit exists.
 
 session_id: 00000000-0000-4000-8000-deadbeef0000" \
-    CLAUDE_CODE_SESSION_ID="$real_session" VC_SESSION_PID=0)"
+    CODEX_SESSION_ID="$real_session" VC_SESSION_PID=0)"
 expect_line measured-overwrites-claim "$out" "session_id: $real_session"
 expect_absent measured-drops-stale-claim "$out" "deadbeef0000"
 
@@ -322,7 +322,7 @@ expect_absent session-pid-off "$out" "session_pid:"
 # and stable diffs.)
 tmp="$(mktemp)"
 printf '%s\n\nWhy this commit exists.\n' "$subject_agent" >"$tmp"
-hook_env CLAUDE_CODE_SESSION_ID="$real_session" CLAUDE_PID=35432 VC_SESSION_PID=1 \
+hook_env CODEX_SESSION_ID="$real_session" CLAUDE_PID=35432 VC_SESSION_PID=1 \
     TERM_PROGRAM=iTerm.app \
     "$prepare" "$tmp" message >/dev/null 2>&1 || true
 if awk '/^Authored-By: /{inblock=1} inblock && !NF {found=1} END{exit !found}' "$tmp"; then
@@ -341,10 +341,10 @@ expect_absent merge-subject-untouched "$out" "Authored-By:"
 # What the generator writes must satisfy the validator it feeds.
 tmp="$(mktemp)"
 printf '%s\n\nWhy this commit exists.\n' "$subject_agent" >"$tmp"
-hook_env CLAUDE_CODE_SESSION_ID="$real_session" CLAUDE_PID=35432 VC_SESSION_PID=1 \
+hook_env CODEX_SESSION_ID="$real_session" CLAUDE_PID=35432 VC_SESSION_PID=1 \
     TERM_PROGRAM=iTerm.app \
     "$prepare" "$tmp" message >/dev/null 2>&1 || true
-if ! hook_env CLAUDE_CODE_SESSION_ID="$real_session" CLAUDE_PID=35432 VC_SESSION_PID=1 \
+if ! hook_env CODEX_SESSION_ID="$real_session" CLAUDE_PID=35432 VC_SESSION_PID=1 \
     TERM_PROGRAM=iTerm.app \
     "$hook" "$tmp" >/dev/null 2>&1; then
     printf 'FAIL generator: output rejected by validator\n' >&2
@@ -447,7 +447,7 @@ Authored-By: codex <agents@vetcoders.io>
 session_id: $other_id
 time: 2020-01-01T00:00:00Z
 runtime: github-actions" \
-    CLAUDE_CODE_SESSION_ID="$real_session" TERM_PROGRAM=iTerm.app VC_SESSION_PID=0)"
+    CODEX_SESSION_ID="$real_session" TERM_PROGRAM=iTerm.app VC_SESSION_PID=0)"
 expect_line body-citation-survives "$out" "runtime: legacy-backend"
 expect_line measured-runtime-in-footer "$out" "runtime: iterm2"
 legacy_hits="$(printf '%s\n' "$out" | grep -c 'runtime: legacy-backend' || true)"
@@ -508,7 +508,7 @@ session_id: $other_id
 time: 2020-01-01T00:00:00Z
 runtime: github-actions
 Signed-off-by: Ada <ada@example.com>" \
-    CLAUDE_CODE_SESSION_ID="$real_session" TERM_PROGRAM=iTerm.app VC_SESSION_PID=0)"
+    CODEX_SESSION_ID="$real_session" TERM_PROGRAM=iTerm.app VC_SESSION_PID=0)"
 expect_line keeps-signed-off-by "$out" "Signed-off-by: Ada <ada@example.com>"
 expect_line signed-off-overwrites-session "$out" "session_id: $real_session"
 expect_absent signed-off-drops-stale-session "$out" "$other_id"
@@ -630,6 +630,36 @@ expect_absent aicx-other-agent-not-used "$out" "session_id:"
 rm -f "$other_bin/aicx"
 rmdir "$other_bin"
 printf 'ok generator: aicx fallback from another agent is not measured\n'
+
+subject_claude='[claude/interactive] chore: describe the change'
+claude_id="019eba52-81db-7d31-bb28-6343f05c4b79"
+out="$(gen "$subject_claude
+
+Why this commit exists." \
+    CODEX_THREAD_ID="$other_id" CLAUDE_CODE_SESSION_ID="$claude_id" VC_SESSION_PID=0)"
+expect_line claude-ignores-codex-env "$out" "session_id: $claude_id"
+expect_absent claude-does-not-record-codex "$out" "$other_id"
+
+out="$(gen "$subject_claude
+
+Why this commit exists." \
+    CODEX_THREAD_ID="$other_id" VC_SESSION_PID=0)"
+expect_absent claude-without-own-session "$out" "session_id:"
+printf 'ok generator: agent env must belong to the subject\n'
+
+reject body-session-is-not-a-trailer "$(
+    cat <<'EOF'
+[codex/interactive] chore: describe the change
+
+Why this commit exists.
+session_id: 00000000-0000-4000-8000-deadbeef0000
+is a citation, not the footer.
+
+Authored-By: codex <agents@vetcoders.io>
+time: 2026-06-04T14:08:27-06:00
+runtime: iterm2
+EOF
+)" "session_id"
 
 # --- parity between the two installable hook sets ---------------------------
 

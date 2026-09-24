@@ -82,26 +82,32 @@ if [ -n "$authored_by_human" ]; then
     fi
 else
     # shellcheck disable=SC2086
-    for key in \
-        AICX_SESSION_ID \
-        CODEX_THREAD_ID \
-        CODEX_SESSION_ID \
-        CLAUDE_SESSION_ID \
-        CLAUDE_CODE_SESSION_ID \
-        CURSOR_CONVERSATION_ID \
-        GEMINI_SESSION_ID \
-        JUNIE_SESSION_ID \
-        KIMI_SESSION_ID \
-        GROK_SESSION_ID \
-        GROK_THREAD_ID
-    do
+    # Same pairs as CURRENT_SESSION_ENV_KEYS. A Codex variable must not
+    # become the session id of a Claude commit just because it is set.
+    # AICX_SESSION_ID has no agent and is valid for every lane.
+    while read -r key key_agent; do
+        [ -n "$key" ] || continue
         value="${!key:-}"
-        if [ -n "$value" ]; then
-            session_raw="$value"
-            session_source="$key"
-            break
+        [ -n "$value" ] || continue
+        if [ -n "$key_agent" ] && [ "$key_agent" != "$agent" ]; then
+            continue
         fi
-    done
+        session_raw="$value"
+        session_source="$key"
+        break
+    done <<'EOF'
+AICX_SESSION_ID
+CODEX_THREAD_ID codex
+CODEX_SESSION_ID codex
+CLAUDE_SESSION_ID claude
+CLAUDE_CODE_SESSION_ID claude
+CURSOR_CONVERSATION_ID cursor
+GEMINI_SESSION_ID gemini
+JUNIE_SESSION_ID junie
+KIMI_SESSION_ID kimi
+GROK_SESSION_ID grok
+GROK_THREAD_ID grok
+EOF
     if [ -z "$session_raw" ] && command -v aicx >/dev/null 2>&1; then
         # Git hooks do not inherit the harness stdin that carries session
         # identity, so the env vars above are usually empty here. The disk

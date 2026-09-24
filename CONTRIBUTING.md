@@ -53,7 +53,8 @@ Two rules govern the split:
 The agent lane reads the same environment keys as `aicx sessions current`,
 in the same order: `AICX_SESSION_ID`, `CODEX_THREAD_ID`, `CODEX_SESSION_ID`,
 then the other agent session variables, then `aicx sessions current --json`.
-That fallback is used only when its `agent` matches the subject. A human
+An agent-specific variable is used only when it belongs to the subject, and
+the `aicx` fallback only when its `agent` matches too. A human
 lane (`maciej`, `monika`, or runtime `manual`) does not read those variables.
 Its only automatic fallback is `ATUIN_SESSION`, and that fallback is not used
 for agents.

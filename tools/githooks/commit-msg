@@ -107,24 +107,9 @@ if [ "$runtime_lane" = "manual" ]; then
     is_human=1
 fi
 
-if [ "$is_human" -eq 1 ]; then
-    author="${agent:-maciej}"
-    if ! printf '%s\n' "$kept" | grep -Eq "^Authored-By: ${author} <(${human_emails})>$"; then
-        failures+=("missing Authored-By: ${author} <void@div0.space> (human lane; not agents@vetcoders.io)")
-    fi
-elif [ -n "$agent" ] && ! printf '%s\n' "$kept" | grep -Eq "^Authored-By: ${agent} <agents@vetcoders\\.io>$"; then
-    failures+=("missing Authored-By: ${agent} <agents@vetcoders.io>")
-elif [ -z "$agent" ] && ! printf '%s\n' "$kept" | grep -Eq '^Authored-By: [a-z][a-z0-9_-]* <agents@vetcoders\.io>$'; then
-    failures+=("missing Authored-By: <agent> <agents@vetcoders.io>")
-fi
-
-if ! printf '%s\n' "$kept" | grep -Eq '^session_id: [0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'; then
-    failures+=("missing session_id: <uuid>")
-fi
-
-# Legacy keys are rejected in the footer even when a valid time: is also
-# present. A citation in the body is not a trailer: the generator leaves it
-# alone and still writes time:.
+# Required provenance is the footer, not a citation in the body. The
+# generator preserves a body line that looks like a trailer and does not
+# treat it as measured.
 footer="$(printf '%s\n' "$kept" | awk -v comment_prefix="$comment_prefix" '
     function is_comment(s) { return comment_prefix != "" && index(s, comment_prefix) == 1 }
     function is_trailer(s) { return s ~ /^[A-Za-z][A-Za-z0-9_-]*: / }
@@ -145,22 +130,37 @@ footer="$(printf '%s\n' "$kept" | awk -v comment_prefix="$comment_prefix" '
         for (i = bstart; i <= bend; i++) print lines[i]
     }
 ')"
+if [ "$is_human" -eq 1 ]; then
+    author="${agent:-maciej}"
+    if ! printf '%s\n' "$footer" | grep -Eq "^Authored-By: ${author} <(${human_emails})>$"; then
+        failures+=("missing Authored-By: ${author} <void@div0.space> (human lane; not agents@vetcoders.io)")
+    fi
+elif [ -n "$agent" ] && ! printf '%s\n' "$footer" | grep -Eq "^Authored-By: ${agent} <agents@vetcoders\\.io>$"; then
+    failures+=("missing Authored-By: ${agent} <agents@vetcoders.io>")
+elif [ -z "$agent" ] && ! printf '%s\n' "$footer" | grep -Eq '^Authored-By: [a-z][a-z0-9_-]* <agents@vetcoders\.io>$'; then
+    failures+=("missing Authored-By: <agent> <agents@vetcoders.io>")
+fi
+
+if ! printf '%s\n' "$footer" | grep -Eq '^session_id: [0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'; then
+    failures+=("missing session_id: <uuid>")
+fi
+
 if printf '%s\n' "$footer" | grep -Eq '^(timestamp|date): '; then
     failures+=("timestamp:/date: are legacy; the fleet standard is time: YYYY-MM-DDTHH:MM:SS+HH:MM")
 fi
-if ! printf '%s\n' "$kept" | grep -Eq '^time: [0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([+-][0-9]{2}:[0-9]{2}|Z)$'; then
+if ! printf '%s\n' "$footer" | grep -Eq '^time: [0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([+-][0-9]{2}:[0-9]{2}|Z)$'; then
     failures+=("missing time: YYYY-MM-DDTHH:MM:SS+HH:MM")
 fi
 
 # session_pid is optional by design: it separates two live processes sharing one
 # session_id, but requiring it would block manual commits and amends made
 # outside an agent process. Validate the shape only when it is present.
-if printf '%s\n' "$kept" | grep -Eq '^session_pid:' \
-    && ! printf '%s\n' "$kept" | grep -Eq '^session_pid: [0-9]{1,10}$'; then
+if printf '%s\n' "$footer" | grep -Eq '^session_pid:' \
+    && ! printf '%s\n' "$footer" | grep -Eq '^session_pid: [0-9]{1,10}$'; then
     failures+=("session_pid: must be a decimal process id when present")
 fi
 
-if ! printf '%s\n' "$kept" | grep -Eq '^runtime: .+'; then
+if ! printf '%s\n' "$footer" | grep -Eq '^runtime: .+'; then
     failures+=("missing runtime: <runtime name>")
 fi
 
