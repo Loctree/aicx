@@ -36,8 +36,10 @@ session_pid: 35432
 (`git commit -m` / `-F`). Plain `git commit` opens an editor first, so the
 same generator runs again from `commit-msg` after the message is saved.
 Trailers are inserted before Git's scissors line (`git commit -v`,
-`commit.cleanup=scissors`). The validator reads that same prefix, which is
-the text Git keeps.
+`commit.cleanup=scissors`). The marker uses `core.commentString` or
+`core.commentChar`, not a hard-coded `#`. The validator reads that same
+prefix, which is the text Git keeps. A `Signed-off-by` line in the footer
+stays where it is; only the measured provenance keys are overwritten.
 
 Two rules govern the split:
 

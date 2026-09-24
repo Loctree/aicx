@@ -55,11 +55,32 @@ else
     failures+=("subject must be: [<agent>/<runtime>] <type>(<scope>): <subject>")
 fi
 
+# Same comment prefix as prepare-commit-msg. A `;` scissors line is the cut
+# when core.commentChar is `;`; recognizing only `#` would validate trailers
+# Git is about to strip.
+comment_prefix="$(git config --get core.commentString 2>/dev/null || true)"
+if [ -z "$comment_prefix" ]; then
+    comment_prefix="$(git config --get core.commentChar 2>/dev/null || true)"
+fi
+case "$comment_prefix" in
+    ""|auto) comment_prefix='#' ;;
+esac
+
 # What Git will store: drop the scissors marker and the verbose diff under it.
 # Comment lines stay in the buffer; the checks below do not treat them as
 # trailers or as an explanatory body.
-kept="$(awk '
-    /^#[[:space:]]*-{2,}[[:space:]]*>8[[:space:]]*-{2,}[[:space:]]*$/ { exit }
+kept="$(awk -v comment_prefix="$comment_prefix" '
+    function re_escape(s,   i, c, o) {
+        o = ""
+        for (i = 1; i <= length(s); i++) {
+            c = substr(s, i, 1)
+            if (c ~ /[^A-Za-z0-9]/) o = o "\\" c
+            else o = o c
+        }
+        return o
+    }
+    BEGIN { cut = "^" re_escape(comment_prefix) "[[:space:]]*-{2,}[[:space:]]*>8[[:space:]]*-{2,}[[:space:]]*$" }
+    $0 ~ cut { exit }
     { sub(/\r$/, ""); print }
 ' "$msg_file")"
 
@@ -125,8 +146,10 @@ while IFS= read -r line || [ -n "$line" ]; do
     line="${line%$'\r'}"
     case "$line" in
         "$first_line"|"") continue ;;
-        \#*) continue ;;
     esac
+    if [ "${line#"$comment_prefix"}" != "$line" ]; then
+        continue
+    fi
     if printf '%s\n' "$line" | grep -Eq '^(Authored-By|session_id|session_pid|time|timestamp|date|runtime|Signed-off-by|Vibecrafted-Warn-Signature):'; then
         continue
     fi

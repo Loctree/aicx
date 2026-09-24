@@ -496,6 +496,66 @@ expect_absent human-atuin-not-aicx "$out" "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
 rm -f "$fake_bin/aicx"
 rmdir "$fake_bin"
 
+# Signed-off-by is part of the footer. The measured session replaces the
+# stale one; the foreign trailer stays, and it is not duplicated.
+out="$(gen "$subject_agent
+
+Why this commit exists.
+
+Authored-By: codex <agents@vetcoders.io>
+session_id: $other_id
+time: 2020-01-01T00:00:00Z
+runtime: github-actions
+Signed-off-by: Ada <ada@example.com>" \
+    CLAUDE_CODE_SESSION_ID="$real_session" TERM_PROGRAM=iTerm.app VC_SESSION_PID=0)"
+expect_line keeps-signed-off-by "$out" "Signed-off-by: Ada <ada@example.com>"
+expect_line signed-off-overwrites-session "$out" "session_id: $real_session"
+expect_absent signed-off-drops-stale-session "$out" "$other_id"
+session_lines="$(printf '%s\n' "$out" | grep -c '^session_id: ' || true)"
+signed_lines="$(printf '%s\n' "$out" | grep -c '^Signed-off-by: ' || true)"
+if [ "$session_lines" != "1" ] || [ "$signed_lines" != "1" ]; then
+    printf 'FAIL generator: footer duplicated (%s session_id, %s signed-off)\n' \
+        "$session_lines" "$signed_lines" >&2
+    printf '%s\n' "$out" >&2
+    exit 1
+fi
+printf 'ok generator: foreign trailer stays inside one footer\n'
+
+# core.commentChar=; makes Git emit a semicolon scissors line. Trailers must
+# sit above it, and a session id under the cut must not satisfy the validator.
+tmp="$(mktemp)"
+cat >"$tmp" <<EOF
+$subject_agent
+
+Why this commit exists.
+
+; ------------------------ >8 ------------------------
+diff --git a/README.md b/README.md
+session_id: $other_id
+EOF
+if ! hook_env \
+    GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.commentChar GIT_CONFIG_VALUE_0=';' \
+    CODEX_THREAD_ID="$thread_id" TERM_PROGRAM=iTerm.app \
+    "$hook" "$tmp" >/dev/null 2>&1; then
+    printf 'FAIL generator: semicolon scissors message rejected\n' >&2
+    hook_env GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.commentChar GIT_CONFIG_VALUE_0=';' \
+        CODEX_THREAD_ID="$thread_id" TERM_PROGRAM=iTerm.app "$hook" "$tmp" >&2 || true
+    rm -f "$tmp"
+    exit 1
+fi
+if ! awk -v id="$thread_id" '
+    /^;[[:space:]]*-{2,}[[:space:]]*>8/ { exit }
+    $0 == "session_id: " id { found=1 }
+    END { exit !found }
+' "$tmp"; then
+    printf 'FAIL generator: session_id is not above the semicolon scissors line\n' >&2
+    cat "$tmp" >&2
+    rm -f "$tmp"
+    exit 1
+fi
+rm -f "$tmp"
+printf 'ok generator: trailers sit above a semicolon scissors line\n'
+
 # --- parity between the two installable hook sets ---------------------------
 
 # tools/githooks (symlink install) and tools/git-hooks (core.hooksPath embargo

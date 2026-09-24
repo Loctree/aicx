@@ -156,10 +156,22 @@ if [ -z "$authored_by_human" ] && session_pid_enabled; then
     fi
 fi
 
-# Rewrite the footer in one pass. A key counts as a trailer only when it sits
-# in the blank-line-delimited block at the end of the pre-scissors text.
-# The same words inside the body stay words. Git's scissors line and
-# everything after it is copied unchanged, so cleanup cannot delete the footer.
+# Git's comment prefix. core.commentString wins when set; otherwise
+# core.commentChar. "auto" is resolved by Git per message, which this hook
+# cannot see, so it keeps the historical default.
+comment_prefix="$(git config --get core.commentString 2>/dev/null || true)"
+if [ -z "$comment_prefix" ]; then
+    comment_prefix="$(git config --get core.commentChar 2>/dev/null || true)"
+fi
+case "$comment_prefix" in
+    ""|auto) comment_prefix='#' ;;
+esac
+
+# Rewrite the footer in one pass. A trailer is any key line in the
+# blank-line-delimited block at the end of the pre-scissors text, including
+# foreign ones such as Signed-off-by. Managed keys are overwritten in place.
+# The same words inside the body stay words. The scissors line uses the
+# configured comment prefix, and everything after it is copied unchanged.
 apply_trailers() {
     local tmp
     tmp="$(mktemp "${TMPDIR:-/tmp}/vc-trailer.XXXXXX")"
@@ -172,11 +184,24 @@ apply_trailers() {
         -v time_value="$time_value" \
         -v runtime="$runtime" \
         -v session_pid="$session_pid" \
+        -v comment_prefix="$comment_prefix" \
         '
         function is_blank(s) { return s ~ /^[[:space:]]*$/ }
-        function is_comment(s) { return s ~ /^#/ }
+        function re_escape(s,   i, c, o) {
+            o = ""
+            for (i = 1; i <= length(s); i++) {
+                c = substr(s, i, 1)
+                if (c ~ /[^A-Za-z0-9]/) o = o "\\" c
+                else o = o c
+            }
+            return o
+        }
+        function is_comment(s) { return index(s, comment_prefix) == 1 }
         function is_scissors(s) {
-            return s ~ /^#[[:space:]]*-{2,}[[:space:]]*>8[[:space:]]*-{2,}[[:space:]]*$/
+            return s ~ ("^" re_escape(comment_prefix) "[[:space:]]*-{2,}[[:space:]]*>8[[:space:]]*-{2,}[[:space:]]*$")
+        }
+        function is_trailer(s) {
+            return s ~ /^[A-Za-z][A-Za-z0-9_-]*: /
         }
         function is_ours(s) {
             return s ~ /^(Authored-By|session_id|session_pid|time|runtime): /
@@ -216,7 +241,7 @@ apply_trailers() {
             while (end >= 1 && is_blank(lines[end])) end--
             bend = end
             bstart = end + 1
-            while (end >= 1 && is_ours(lines[end])) {
+            while (end >= 1 && is_trailer(lines[end])) {
                 bstart = end
                 end--
             }
@@ -230,15 +255,13 @@ apply_trailers() {
             spid = ""
             tm = ""
             rt = ""
-            ot = 0
             for (i = bstart; i <= bend; i++) {
-                if (is_blank(lines[i])) continue
+                if (is_blank(lines[i]) || !is_ours(lines[i])) continue
                 if (lines[i] ~ /^Authored-By: /) ab = field(lines[i])
                 else if (lines[i] ~ /^session_id: /) sid = field(lines[i])
                 else if (lines[i] ~ /^session_pid: /) spid = field(lines[i])
                 else if (lines[i] ~ /^time: /) tm = field(lines[i])
                 else if (lines[i] ~ /^runtime: /) rt = field(lines[i])
-                else { ot++; other[ot] = lines[i] }
             }
             if (authored_by != "") ab = authored_by
             if (session_id != "") sid = session_id
@@ -250,15 +273,35 @@ apply_trailers() {
             while (body_end >= 1 && is_blank(lines[body_end])) body_end--
             for (i = 1; i <= body_end; i++) print lines[i]
 
-            have = (ab != "" || sid != "" || tm != "" || rt != "" || spid != "" || ot > 0)
+            seen_ab = 0
+            seen_sid = 0
+            seen_spid = 0
+            seen_tm = 0
+            seen_rt = 0
+            have = (ab != "" || sid != "" || tm != "" || rt != "" || spid != "" || bstart <= bend)
             if (have) {
                 if (body_end >= 1) print ""
-                for (i = 1; i <= ot; i++) print other[i]
-                if (ab != "") print "Authored-By: " ab
-                if (sid != "") print "session_id: " sid
-                if (tm != "") print "time: " tm
-                if (rt != "") print "runtime: " rt
-                if (spid != "") print "session_pid: " spid
+                for (i = bstart; i <= bend; i++) {
+                    if (is_blank(lines[i])) continue
+                    if (lines[i] ~ /^Authored-By: /) {
+                        if (!seen_ab && ab != "") { print "Authored-By: " ab; seen_ab = 1 }
+                    } else if (lines[i] ~ /^session_id: /) {
+                        if (!seen_sid && sid != "") { print "session_id: " sid; seen_sid = 1 }
+                    } else if (lines[i] ~ /^session_pid: /) {
+                        if (!seen_spid && spid != "") { print "session_pid: " spid; seen_spid = 1 }
+                    } else if (lines[i] ~ /^time: /) {
+                        if (!seen_tm && tm != "") { print "time: " tm; seen_tm = 1 }
+                    } else if (lines[i] ~ /^runtime: /) {
+                        if (!seen_rt && rt != "") { print "runtime: " rt; seen_rt = 1 }
+                    } else {
+                        print lines[i]
+                    }
+                }
+                if (!seen_ab && ab != "") print "Authored-By: " ab
+                if (!seen_sid && sid != "") print "session_id: " sid
+                if (!seen_tm && tm != "") print "time: " tm
+                if (!seen_rt && rt != "") print "runtime: " rt
+                if (!seen_spid && spid != "") print "session_pid: " spid
             }
 
             if (cstart <= limit) {
