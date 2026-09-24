@@ -651,8 +651,11 @@ fn collect_intent_files_from_index(
                     }
                 };
             accounted.insert((entry.agent.clone(), entry.session_id.clone()));
-            let (file, scope) =
-                catalog_frames_to_intent_file(&entry, source_path, frames, scope, cutoff, false);
+            let Some((file, scope)) =
+                catalog_frames_to_intent_file(&entry, source_path, frames, scope, cutoff, false)
+            else {
+                continue;
+            };
             note_mixed_scope(mixed_scope, &entry.agent, &entry.session_id, &scope);
             if let Some(file) = file {
                 files.push(file);
@@ -790,8 +793,11 @@ fn collect_intent_files(
                     continue;
                 }
             };
-        let (file, scope) =
-            catalog_frames_to_intent_file(&entry, source_path, frames, scope, cutoff, live_row);
+        let Some((file, scope)) =
+            catalog_frames_to_intent_file(&entry, source_path, frames, scope, cutoff, live_row)
+        else {
+            continue;
+        };
         note_mixed_scope(mixed_scope, &entry.agent, &entry.session_id, &scope);
         let Some(file) = file else {
             continue;
@@ -834,23 +840,17 @@ fn catalog_frames_to_intent_file(
     scope: crate::extraction::conversation::ScopeReport,
     cutoff: DateTime<Utc>,
     live_row: bool,
-) -> (
+) -> Option<(
     Option<StoredChunkFile>,
     crate::extraction::conversation::ScopeReport,
-) {
-    let no_file = |scope: crate::extraction::conversation::ScopeReport| (None, scope);
-    // Guardian sessions are control-plane evidence and never enter the intent
-    // stream, regardless of which lane called us. The frames are the
-    // authority here: their provenance was resolved from the source, so this
-    // also catches catalog rows cataloged before the column existed — the
-    // early, column-only guard upstream is a fast path, not the contract.
-    let session_provenance = frames
-        .iter()
-        .find_map(|frame| frame.session_kind.as_deref());
-    if crate::sessions::is_guardian_session_kind(entry.session_kind.as_deref())
-        || crate::sessions::is_guardian_session_kind(session_provenance)
-    {
-        return no_file(scope);
+)> {
+    let no_file = |scope: crate::extraction::conversation::ScopeReport| Some((None, scope));
+    // Guardian sessions are control-plane evidence: they never enter the
+    // intent stream, and their scope never enters the mixed-scope telemetry
+    // either, regardless of which lane called us. `None` says "not operator
+    // work at all", which an empty file with a report cannot.
+    if is_guardian_session(entry, &source_path, &frames) {
+        return None;
     }
     let Some(project) = entry.project.clone() else {
         return no_file(scope);
@@ -865,16 +865,16 @@ fn catalog_frames_to_intent_file(
         scope.scope_foreign_to(entry.cwd.as_deref()),
     );
     let Some(timestamp) = frames.last().map(|frame| frame.timestamp) else {
-        return (None, scope);
+        return no_file(scope);
     };
     let canonical_date = entry
         .date
         .as_deref()
         .and_then(|date| NaiveDate::parse_from_str(date, "%Y-%m-%d").ok());
     if canonical_date.is_none() && timestamp < cutoff {
-        return (None, scope);
+        return no_file(scope);
     }
-    (
+    Some((
         Some(StoredChunkFile {
             agent: entry.agent.clone(),
             date: entry
@@ -905,6 +905,40 @@ fn catalog_frames_to_intent_file(
             body: None,
         }),
         scope,
+    ))
+}
+
+/// Is this session a guardian — control-plane evidence that stays out of the
+/// operator intent stream and out of its scope telemetry?
+///
+/// The frames are the authority: their provenance was resolved where the
+/// source was opened ([`crate::sessions::resolve_session_kind`]), so this also
+/// catches catalog rows cataloged before the column existed — the column-only
+/// guards in the lanes are fast paths, not the contract. The frame-kind and
+/// privacy filters can leave no frame to carry that provenance, and a guardian
+/// must not reach the telemetry through an empty view, so an empty view asks
+/// the source once more (one bounded header read).
+#[cfg(feature = "app")]
+fn is_guardian_session(
+    entry: &crate::catalog::CatalogEntry,
+    source_path: &Path,
+    frames: &[TimelineEntry],
+) -> bool {
+    if crate::sessions::is_guardian_session_kind(entry.session_kind.as_deref()) {
+        return true;
+    }
+    if frames.is_empty() {
+        let resolved = crate::sessions::resolve_session_kind(
+            &entry.agent,
+            entry.session_kind.as_deref(),
+            source_path,
+        );
+        return crate::sessions::is_guardian_session_kind(resolved.as_deref());
+    }
+    crate::sessions::is_guardian_session_kind(
+        frames
+            .iter()
+            .find_map(|frame| frame.session_kind.as_deref()),
     )
 }
 
@@ -953,7 +987,9 @@ fn collect_live_unadmitted_files(
             continue;
         }
         // Same control-plane exclusion as the census lane: guardian sessions
-        // never enter the operator project-intent stream.
+        // never enter the operator project-intent stream. The column is the
+        // fast path that skips the read; `is_guardian_session` after it is
+        // the contract.
         if crate::sessions::is_guardian_session_kind(entry.session_kind.as_deref()) {
             continue;
         }
@@ -971,6 +1007,9 @@ fn collect_live_unadmitted_files(
                     continue;
                 }
             };
+        if is_guardian_session(&entry, &source_path, &frames) {
+            continue;
+        }
         // `scope` is the WHOLE session's, taken before the frame-kind filter
         // and before the project filter narrows the frames to one bucket.
         note_mixed_scope(mixed_scope, &entry.agent, &entry.session_id, &scope);

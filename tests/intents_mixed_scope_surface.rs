@@ -740,6 +740,71 @@ fn cold_catalog_rows_still_exclude_guardian_sessions_in_both_lanes() {
     let _ = fs::remove_dir_all(&root);
 }
 
+/// Finding: a guardian recognized only from its source (cold catalog row)
+/// produced no intents, but its scope still reached `mixed_scope` — the
+/// operator-facing list continuity refuses on. A guardian that worked in two
+/// checkouts must be absent from both, including through a frame-kind view
+/// that leaves none of its frames to carry the provenance.
+#[test]
+fn source_resolved_guardians_stay_out_of_mixed_scope_telemetry() {
+    let root = unique_root("guardianscope");
+    let _guard = HomeGuard::set(&root);
+    let vista = make_repo(&root, "vista");
+    let fleet = make_repo(&root, "fleet-bus");
+    let session_id = "88888888-6666-5555-4444-333333333333";
+    let template = r#"{"timestamp":"2026-01-01T02:00:00Z","type":"session_meta","payload":{"id":"@SID@","cwd":"@VISTA@","source":{"subagent":{"other":"guardian"}}}}
+{"timestamp":"2026-01-01T02:01:00Z","type":"turn_context","payload":{"cwd":"@VISTA@"}}
+{"timestamp":"2026-01-01T02:01:10Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"The following is the Codex agent history whose request action you are assessing.\nDecision: guardian assessed vista"}]}}
+{"timestamp":"2026-01-01T02:02:00Z","type":"turn_context","payload":{"cwd":"@FLEET@"}}
+{"timestamp":"2026-01-01T02:02:10Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"The following is the Codex agent history whose request action you are assessing.\nDecision: guardian assessed fleet"}]}}
+"#;
+    let body = template
+        .replace("@SID@", session_id)
+        .replace("@VISTA@", &json_path(&vista))
+        .replace("@FLEET@", &json_path(&fleet));
+    write_rollout(
+        rollout_path(
+            &root,
+            &format!("rollout-2026-01-01T02-00-00-{session_id}.jsonl"),
+        ),
+        &body,
+    );
+
+    let aicx_home = root.join(".aicx");
+    aicx::catalog::rebuild(&aicx_home, &root).expect("rebuild catalog over fixture home");
+    rewrite_catalog_rows(&aicx_home, |row| {
+        if let Some(object) = row.as_object_mut() {
+            object.remove("session_kind");
+        }
+    });
+
+    // UserMsg keeps the guardian's frames; AgentReply leaves none of them.
+    for frame_kind in [
+        aicx::timeline::FrameKind::UserMsg,
+        aicx::timeline::FrameKind::AgentReply,
+    ] {
+        let extraction = extract(&root, frame_kind);
+        assert!(
+            !extraction
+                .records
+                .iter()
+                .any(|record| record.session_id == session_id),
+            "{frame_kind:?}: guardian produced operator intents"
+        );
+        assert!(
+            !extraction
+                .mixed_scope
+                .iter()
+                .any(|session| session.session_id == session_id),
+            "{frame_kind:?}: guardian reached the mixed-scope telemetry: {:?}",
+            extraction.mixed_scope
+        );
+    }
+
+    drop(_guard);
+    let _ = fs::remove_dir_all(&root);
+}
+
 /// A flagged index chunk that has to be re-sourced can fail: the catalog may
 /// have been rebuilt, or the original transcript moved or deleted. Swallowing
 /// that read left `source_errors = 0`, so `completeness` claimed a complete
