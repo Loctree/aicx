@@ -350,6 +350,22 @@ fn host_path(path: &str) -> Option<&Path> {
     path.is_absolute().then_some(path)
 }
 
+/// Is this Codex payload type an executable tool CALL, whose arguments can
+/// carry a `workdir`?
+///
+/// The full adapter routes calls into `push_tool_turn` from two envelopes:
+/// `response_item` (`function_call`, `custom_tool_call`, `web_search_call`)
+/// and `event_msg` (`function_call`, `tool_call`, `mcp_tool_call`). The
+/// bounded catalog reader and the over-cap check read their set from here,
+/// so no reader can quietly skip a call type another one scopes. Results
+/// (`function_call_output`, `mcp_tool_call_end`, …) are not calls.
+pub fn is_tool_call_payload_type(payload_type: &str) -> bool {
+    matches!(
+        payload_type,
+        "function_call" | "custom_tool_call" | "web_search_call" | "tool_call" | "mcp_tool_call"
+    )
+}
+
 /// Does the readable head of an over-cap record look like a tool-call
 /// envelope? The record is truncated (never valid JSON), so this reads the
 /// visible prefix only: the envelope and payload discriminators are written
@@ -363,12 +379,10 @@ pub fn truncated_record_is_tool_call(prefix: &str) -> bool {
     // `function_call_output` / `mcp_tool_call_end` are RESULTS, not calls:
     // they carry no workdir, so an oversized one is not lost evidence. Exact
     // equality against the parsed value keeps them out.
-    if discriminators.iter().any(|value| {
-        matches!(
-            value.as_str(),
-            "function_call" | "custom_tool_call" | "tool_call" | "mcp_tool_call"
-        )
-    }) {
+    if discriminators
+        .iter()
+        .any(|value| is_tool_call_payload_type(value))
+    {
         return true;
     }
     // Otherwise the question is whether the PAYLOAD discriminator was
@@ -1858,6 +1872,32 @@ mod tests {
                 Some("/repo/a"),
                 "{input}"
             );
+        }
+    }
+
+    /// Finding: the bounded catalog reader kept its own copy of the call
+    /// types and missed `web_search_call`, which the full adapter scopes.
+    /// Every reader now asks this one predicate.
+    #[test]
+    fn every_call_type_the_adapter_scopes_is_a_tool_call() {
+        // The `response_item` and `event_msg` call arms of the Codex adapter.
+        for call in [
+            "function_call",
+            "custom_tool_call",
+            "web_search_call",
+            "tool_call",
+            "mcp_tool_call",
+        ] {
+            assert!(is_tool_call_payload_type(call), "{call}");
+        }
+        for other in [
+            "function_call_output",
+            "custom_tool_call_output",
+            "mcp_tool_call_end",
+            "message",
+            "",
+        ] {
+            assert!(!is_tool_call_payload_type(other), "{other}");
         }
     }
 

@@ -19,8 +19,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use aicx_parser::engine::scope_evidence::{
-    WindowScope, WorkdirEvidence, effective_window_scope, normalize_workdir, recorded_workdir,
-    scope_layout_evidence, tool_call_workdirs,
+    WindowScope, WorkdirEvidence, effective_window_scope, is_tool_call_payload_type,
+    normalize_workdir, recorded_workdir, scope_layout_evidence, tool_call_workdirs,
 };
 
 use crate::catalog::CatalogEntry;
@@ -1416,15 +1416,18 @@ fn parse_large_codex_signal(
                 &mut frames,
                 &mut recorded_workdirs,
             );
-            if let Some(cwd) = value
+            // A `turn_context` REPLACES the baseline, exactly as in the full
+            // adapter: one without a cwd says this turn's directory is
+            // unknown. Keeping the previous cwd instead guessed that the turn
+            // stayed put, admitted it under the earlier checkout, and resolved
+            // its relative workdirs against a stale baseline.
+            baseline_cwd = value
                 .get("payload")
                 .and_then(|payload| payload.get("cwd"))
                 .and_then(serde_json::Value::as_str)
                 .map(str::trim)
                 .filter(|cwd| !cwd.is_empty())
-            {
-                baseline_cwd = Some(cwd.to_string());
-            }
+                .map(str::to_owned);
             continue;
         }
         // Tool calls arrive in BOTH Codex envelopes: `response_item` and
@@ -1440,7 +1443,7 @@ fn parse_large_codex_signal(
             continue;
         };
         let payload_type = payload.get("type").and_then(serde_json::Value::as_str);
-        if is_tool_call_payload_type(payload_type) {
+        if payload_type.is_some_and(is_tool_call_payload_type) {
             for workdir in tool_call_workdirs(payload) {
                 if !window_workdirs.contains(&workdir) {
                     window_workdirs.push(workdir);
@@ -1518,18 +1521,6 @@ fn parse_large_codex_signal(
         distill: None,
         recorded_workdirs: recorded_workdirs.into_iter().collect(),
     })
-}
-
-/// Codex tool-call payload types that can carry an explicit `workdir`.
-/// Mirrors the set the full adapter routes into `push_tool_turn`.
-fn is_tool_call_payload_type(payload_type: Option<&str>) -> bool {
-    matches!(
-        payload_type,
-        Some("function_call")
-            | Some("custom_tool_call")
-            | Some("tool_call")
-            | Some("mcp_tool_call")
-    )
 }
 
 /// Stamp a buffered turn window with its effective scope and drain it into the
@@ -2502,6 +2493,103 @@ mod tests {
             assert!(
                 !rendered.contains("repo-private"),
                 "{label}: the hidden checkout must be counted, never named: {rendered}"
+            );
+        }
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Two parity gaps between the readers, found in review: the bounded
+    /// reader kept the previous baseline when a `turn_context` carried no cwd
+    /// (the full adapter treats that turn's directory as unknown), and it did
+    /// not scope `web_search_call`, which the full adapter routes as a call.
+    /// Either way a turn inherited a checkout it never proved.
+    #[test]
+    fn both_readers_agree_on_a_cwd_less_turn_and_every_call_type() {
+        let root = std::env::temp_dir().join(format!(
+            "aicx-source-index-reader-parity-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let repo_home = root.join("repo-home");
+        let repo_away = root.join("repo-away");
+        for repo in [&repo_home, &repo_away] {
+            fs::create_dir_all(repo.join(".git")).unwrap();
+        }
+        let home = repo_home.display().to_string();
+        let message = |text: &str| {
+            serde_json::json!({"timestamp": "2026-08-22T00:00:02Z", "type": "response_item",
+                "payload": {"type": "message", "role": "user",
+                    "content": [{"type": "input_text", "text": text}]}})
+        };
+        let body = jsonl(&[
+            serde_json::json!({"timestamp": "2026-08-22T00:00:00Z", "type": "session_meta",
+                "payload": {"id": "reader-parity", "cwd": home}}),
+            serde_json::json!({"timestamp": "2026-08-22T00:00:01Z", "type": "turn_context",
+                "payload": {"cwd": home}}),
+            message("home turn"),
+            serde_json::json!({"timestamp": "2026-08-22T00:00:03Z", "type": "turn_context",
+                "payload": {"model": "gpt-test"}}),
+            message("turn with no recorded cwd"),
+            serde_json::json!({"timestamp": "2026-08-22T00:00:05Z", "type": "turn_context",
+                "payload": {"cwd": home}}),
+            serde_json::json!({
+                "timestamp": "2026-08-22T00:00:06Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "web_search_call",
+                    "call_id": "w1",
+                    "arguments": serde_json::json!({
+                        "workdir": repo_away.display().to_string(),
+                    })
+                    .to_string(),
+                },
+            }),
+            message("turn after a scoped call"),
+        ]);
+        let source_path = root.join("rollout.jsonl");
+        fs::write(&source_path, body).unwrap();
+        let mut entry = bounded_entry(&source_path);
+        entry.session_id = "reader-parity".to_string();
+        entry.cwd = Some(home.clone());
+        let allow = crate::source_path::SourceAllowlist::from_roots([root.clone()]);
+
+        let full = parse_catalog_source(&entry, &source_path, &allow)
+            .unwrap()
+            .frames;
+        let bounded = parse_large_codex_signal(&entry, &source_path, &allow, None)
+            .unwrap()
+            .frames;
+        for (label, frames) in [("full", full), ("bounded", bounded)] {
+            let find = |text: &str| {
+                frames
+                    .iter()
+                    .find(|frame| frame.message.contains(text))
+                    .cloned()
+                    .unwrap_or_else(|| panic!("{label}: no `{text}` frame in {frames:?}"))
+            };
+            assert!(
+                find("home turn")
+                    .cwd
+                    .as_deref()
+                    .is_some_and(|cwd| cwd.ends_with("repo-home")),
+                "{label}: the fixture must start in the home checkout"
+            );
+            let unplaced = find("turn with no recorded cwd");
+            assert_eq!(
+                unplaced.cwd, None,
+                "{label}: a turn_context without a cwd must not inherit the previous one"
+            );
+            let away = find("turn after a scoped call");
+            assert!(
+                away.cwd
+                    .as_deref()
+                    .is_some_and(|cwd| cwd.ends_with("repo-away")),
+                "{label}: a web_search_call workdir must scope its window: {away:?}"
             );
         }
 
