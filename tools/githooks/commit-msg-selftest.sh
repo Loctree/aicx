@@ -510,4 +510,19 @@ for name in commit-msg prepare-commit-msg; do
     printf 'ok parity: %s\n' "$name"
 done
 
+# pre-push is intentionally not byte-identical: the embargo copy also owns
+# the compile-embargo gate. Both copies must map a develop symref to
+# origin/main and must not merge-base against origin/develop directly.
+for copy in "$root/tools/githooks/pre-push" "$root/tools/git-hooks/pre-push"; do
+    if grep -q 'merge-base "$lsha" origin/develop' "$copy"; then
+        printf 'FAIL pre-push: %s still merge-bases against origin/develop\n' "$copy" >&2
+        exit 1
+    fi
+    if ! grep -q 'origin/develop) default_ref=origin/main' "$copy"; then
+        printf 'FAIL pre-push: %s does not retarget a develop symref to origin/main\n' "$copy" >&2
+        exit 1
+    fi
+done
+printf 'ok pre-push: default branch is not origin/develop\n'
+
 printf 'commit provenance selftest: all passed\n'
