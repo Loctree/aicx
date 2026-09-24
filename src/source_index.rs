@@ -2476,10 +2476,10 @@ mod tests {
             );
 
             let report = scope_report_excluding_ignored(&mut frames, &ignore);
-            for secret in ["rescoped secret", "conflict secret"] {
+            for denied_text in ["rescoped secret", "conflict secret"] {
                 assert!(
-                    find(&frames, secret).is_none(),
-                    "{label}: `{secret}` was run from the denied checkout and survived"
+                    find(&frames, denied_text).is_none(),
+                    "{label}: `{denied_text}` was run from the denied checkout and survived"
                 );
             }
             assert!(
