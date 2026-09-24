@@ -684,11 +684,19 @@ pub(crate) const GUARDIAN_SESSION_KIND: &str = "subagent:guardian";
 /// applied, turning a probe the catalog runs per session into hundreds of
 /// megabytes. An over-cap record cannot be a `session_meta` header worth
 /// parsing, so it is skipped rather than reassembled.
+///
+/// The bounds are the catalog's own header bounds, not a tighter copy: the
+/// catalog reads a session's identity from the same header, and a probe that
+/// gave up earlier would catalog a guardian whose identity it found as an
+/// ordinary session.
 #[cfg(feature = "app")]
 pub(crate) fn codex_session_kind_from_source(path: &Path) -> Option<String> {
+    use crate::session_catalog::{MAX_HEADER_BYTES, MAX_HEADER_LINES};
+    use std::io::Read;
+
     let file = fs::File::open(path).ok()?;
-    let mut reader = BufReader::new(file);
-    for _ in 0..64 {
+    let mut reader = BufReader::new(file.take(MAX_HEADER_BYTES as u64));
+    for _ in 0..MAX_HEADER_LINES {
         let line = aicx_parser::sanitize::read_line_capped(
             &mut reader,
             crate::session_catalog::MAX_HEADER_LINE_BYTES,
@@ -2692,6 +2700,35 @@ mod tests {
 
         // The over-cap record is skipped rather than reassembled, so the
         // answer comes from the header that follows it.
+        assert_eq!(
+            resolve_session_kind("codex", None, &path).as_deref(),
+            Some("subagent:guardian")
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Finding: the probe gave up after 64 records while the catalog reads a
+    /// session's identity from up to `MAX_HEADER_LINES` header records. A
+    /// guardian whose `session_meta` sat between the two limits was cataloged
+    /// with its identity and without its provenance, and so reached project
+    /// intents as an ordinary session.
+    #[test]
+    #[cfg(feature = "app")]
+    fn the_probe_reads_as_far_as_the_catalog_reads_the_header() {
+        let root = temp_root("probe_depth");
+        let day = root.join("2026").join("08").join("27");
+        fs::create_dir_all(&day).unwrap();
+        let preamble: Vec<String> = (0..99)
+            .map(|i| format!(r#"{{"type":"event_msg","payload":{{"type":"note","seq":{i}}}}}"#))
+            .collect();
+        let mut records: Vec<&str> = preamble.iter().map(String::as_str).collect();
+        records.push(
+            r#"{"timestamp":"2026-08-27T01:35:45.000Z","type":"session_meta","payload":{"id":"01a040dd-60f0","cwd":"/Users/tester/Git/vista","source":{"subagent":{"other":"guardian"}}}}"#,
+        );
+        assert!(records.len() > 64 && records.len() <= crate::session_catalog::MAX_HEADER_LINES);
+        write_session(&day, "rollout-2026-08-27T03-35-45-01a040dd.jsonl", &records);
+        let path = day.join("rollout-2026-08-27T03-35-45-01a040dd.jsonl");
+
         assert_eq!(
             resolve_session_kind("codex", None, &path).as_deref(),
             Some("subagent:guardian")
