@@ -174,12 +174,21 @@ impl ScopeStatus {
         }
     }
 
-    /// Combine two spans: any mixed → mixed; otherwise unknown dominates
-    /// no-drift evidence only when nothing is known at all.
+    /// Combine two spans: any unattributed → unattributed; otherwise any
+    /// mixed → mixed; unknown survives only when nothing is known at all.
+    ///
+    /// `Unattributed` outranks `MixedCandidate` because the two are different
+    /// facts and only one of them forbids attribution: mixed also covers an
+    /// ordinary branch switch inside one checkout, which whole-session
+    /// attribution survives, while unattributed means evidence this host
+    /// cannot place. Letting branch drift absorb it would hand a span with
+    /// unplaceable evidence the one status that no longer refuses a bucket.
+    /// Mixing is not lost by this: consumers that must refuse a braided
+    /// history decide on the proven conflicts and cwds, not on this enum.
     pub const fn join(self, other: Self) -> Self {
         match (self, other) {
-            (Self::MixedCandidate, _) | (_, Self::MixedCandidate) => Self::MixedCandidate,
             (Self::Unattributed, _) | (_, Self::Unattributed) => Self::Unattributed,
+            (Self::MixedCandidate, _) | (_, Self::MixedCandidate) => Self::MixedCandidate,
             (Self::NoDriftObserved, _) | (_, Self::NoDriftObserved) => Self::NoDriftObserved,
             (Self::Unknown, Self::Unknown) => Self::Unknown,
         }
@@ -685,6 +694,11 @@ impl SessionModel {
     /// Conversation-level scope: the join of every segment's verdict plus
     /// the cross-segment evidence (two homogeneous segments in different
     /// cwds are one mixed candidate).
+    ///
+    /// A segment's workdirs count as cwd evidence through its `scope_root`,
+    /// next to the recorded cwd: a turn window re-scoped to another checkout
+    /// keeps the session's recorded cwd, so reading `cwd` alone reported a
+    /// session that worked in two repositories as one with no drift.
     pub fn scope_status(&self) -> ScopeStatus {
         let per_segment = self
             .segments
@@ -692,13 +706,13 @@ impl SessionModel {
             .fold(ScopeStatus::Unknown, |acc, segment| {
                 acc.join(segment.scope_status)
             });
-        let cwds = self
-            .segments
-            .iter()
-            .filter_map(|segment| match &segment.cwd {
+        let cwds = self.segments.iter().flat_map(|segment| {
+            let recorded = match &segment.cwd {
                 Known::Value(cwd) => Some(cwd.as_str()),
                 Known::Unknown(_) => None,
-            });
+            };
+            recorded.into_iter().chain(segment.scope_root.as_deref())
+        });
         let branches = self
             .segments
             .iter()

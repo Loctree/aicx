@@ -2089,6 +2089,47 @@ mod tests {
         );
     }
 
+    /// Finding (P2-03): the session join let `MixedCandidate` outrank
+    /// `Unattributed`, so an ordinary branch switch in one checkout erased a
+    /// window whose evidence this host could not place — and handed the
+    /// session the one status that no longer refuses attribution.
+    #[test]
+    fn branch_drift_does_not_hide_an_unattributed_window() {
+        let oversized = format!(
+            r#"{{"timestamp":"2026-07-13T00:00:03Z","type":"response_item","payload":{{"type":"function_call","name":"shell","arguments":"{}"}}}}"#,
+            "x".repeat(2048)
+        );
+        let bytes = [
+            r#"{"timestamp":"2026-07-13T00:00:00Z","type":"session_meta","payload":{"id":"44444444-4444-4444-8444-444444444444","timestamp":"2026-07-13T00:00:00Z","cwd":"/repo/alpha","model":"gpt-test"}}"#,
+            r#"{"timestamp":"2026-07-13T00:00:01Z","type":"turn_context","payload":{"turn_id":"t1","cwd":"/repo/alpha","branch":"main","model":"gpt-test"}}"#,
+            r#"{"timestamp":"2026-07-13T00:00:02Z","type":"event_msg","payload":{"type":"user_message","message":"Run something big."}}"#,
+            &oversized,
+            r#"{"timestamp":"2026-07-13T00:00:05Z","type":"turn_context","payload":{"turn_id":"t2","cwd":"/repo/alpha","branch":"feature","model":"gpt-test"}}"#,
+            r#"{"timestamp":"2026-07-13T00:00:06Z","type":"event_msg","payload":{"type":"user_message","message":"Now on the feature branch."}}"#,
+        ]
+        .join("\n")
+            + "\n";
+
+        let model = parse_with_unit_cap(
+            bytes.as_bytes(),
+            "44444444-4444-4444-8444-444444444444",
+            512,
+        );
+        assert!(
+            model
+                .segments
+                .iter()
+                .any(|segment| segment.scope_status == ScopeStatus::Unattributed),
+            "fixture must carry an unattributed window: {:?}",
+            model.segments
+        );
+        assert_eq!(
+            model.scope_status(),
+            ScopeStatus::Unattributed,
+            "branch drift must not outrank unplaceable evidence"
+        );
+    }
+
     /// A malformed tool call never becomes a `Value` either, so its workdir
     /// is just as invisible as an over-cap one. Only the oversized case was
     /// routed through the opaque path, so a truncated envelope carrying the
@@ -2340,6 +2381,13 @@ mod tests {
             seg_scopes,
             vec![None, Some(fleet_str.as_str()), None],
             "the resolved repo identity rides the non-canonical field"
+        );
+        // Finding (P2-02): every recorded cwd is `vista`, so a session verdict
+        // read from `cwd` alone called this one checkout with no drift.
+        assert_eq!(
+            model.scope_status(),
+            ScopeStatus::MixedCandidate,
+            "a session that worked in two checkouts is not one with no drift"
         );
         let fleet_window_turns: Vec<&Turn> = model
             .turns

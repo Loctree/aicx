@@ -118,8 +118,10 @@ pub struct ConversationPayload {
     /// `session_id`, Codex tree `session_id` / `thread_id` /
     /// `forked_from_id` / `parent_thread_id`. The store id is a handle.
     pub conversation: aicx_parser::engine::ProviderConversationRef,
-    /// Structural scope of the whole session, from its segments' cwd,
-    /// branch and explicit tool-call workdirs. The emitted grammar is
+    /// Structural scope of the whole session, from its segments' recorded
+    /// cwd and branch, the checkout their explicit tool-call workdirs
+    /// resolved to (`scope_root`), and each segment's own verdict, where
+    /// `unattributed` outranks `mixed_candidate`. The emitted grammar is
     /// `ScopeStatus::ALL`; `docs/OUTPUT_PROJECTION_CONTRACT.md` declares it.
     pub scope_status: aicx_parser::engine::ScopeStatus,
     /// Compaction boundaries inside the session (epochs, never sources).
