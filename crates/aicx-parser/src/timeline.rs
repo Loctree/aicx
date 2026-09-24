@@ -161,11 +161,13 @@ pub struct TimelineEntry {
     #[serde(default, skip_serializing_if = "is_false")]
     pub scope_unattributed: bool,
     /// Explicit tool-call workdirs the entry's turn window recorded (see
-    /// `Segment::scope_workdirs`). Read by the `.aicxignore` filter before
-    /// anything is written, so a checkout the operator denied is judged even
-    /// when it never became the entry's `cwd` — a conflict window has no
-    /// `cwd` at all. Never serialized: the paths are filter input, not
-    /// output, and a stored entry has already been filtered.
+    /// `Segment::scope_workdirs`), plus the window's recorded cwd whenever
+    /// the scope verdict took it out of `cwd` (a re-scope serves the
+    /// resolved root, a conflict serves nothing). Read by the `.aicxignore`
+    /// filter before anything is written, so a checkout the operator denied
+    /// is judged even when it is not, or is no longer, the entry's `cwd`.
+    /// Never serialized: the paths are filter input, not output, and a
+    /// stored entry has already been filtered.
     #[serde(skip)]
     pub scope_workdirs: Vec<String>,
     /// Structural subagent provenance of the session (e.g. `subagent:guardian`)

@@ -1526,7 +1526,8 @@ fn is_tool_call_payload_type(payload_type: Option<&str>) -> bool {
 /// (including messages before the first tool call); proven-divergent evidence
 /// marks every frame conflicted, while unresolved foreign evidence leaves a
 /// durable do-not-inherit mark on every frame of the window. Every frame also
-/// carries the window's recorded workdirs, whatever the verdict, so the
+/// carries the window's recorded workdirs, whatever the verdict, and the
+/// recorded baseline whenever the verdict takes it out of `cwd`, so the
 /// `.aicxignore` filter judges each checkout the window touched.
 ///
 /// `session_workdirs` collects the baseline and recorded workdirs of every
@@ -1552,10 +1553,25 @@ fn flush_scope_window(
             });
         session_workdirs.extend(baseline.map(str::to_owned));
         session_workdirs.extend(recorded.iter().cloned());
-        for frame in window_frames.iter_mut() {
-            frame.scope_workdirs.clone_from(&recorded);
-        }
         let (scope, path) = effective_window_scope(window_workdirs, baseline);
+        // A re-scope moves `cwd` to the workdirs' root and a conflict clears
+        // it, yet the window still ran in its recorded baseline: the baseline
+        // joins the paths the deny list judges, standing in for the `cwd` it
+        // no longer is.
+        let judged = match baseline {
+            Some(baseline)
+                if matches!(scope, WindowScope::Consistent | WindowScope::Conflict)
+                    && !recorded.iter().any(|path| path == baseline) =>
+            {
+                std::iter::once(baseline.to_owned())
+                    .chain(recorded.iter().cloned())
+                    .collect()
+            }
+            _ => recorded,
+        };
+        for frame in window_frames.iter_mut() {
+            frame.scope_workdirs.clone_from(&judged);
+        }
         match scope {
             WindowScope::Consistent => {
                 if let Some(path) = path {
@@ -2329,6 +2345,146 @@ mod tests {
                     .iter()
                     .any(|frame| frame.message.contains("baseline question")),
                 "{label}: frames outside the denied window must survive"
+            );
+            assert_eq!(report.hidden_scopes, 1, "{label}");
+            let rendered = format!("{report:?}");
+            assert!(
+                !rendered.contains("repo-private"),
+                "{label}: the hidden checkout must be counted, never named: {rendered}"
+            );
+        }
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The mirror case: the DENIED checkout is the recorded baseline, and the
+    /// window's workdirs point elsewhere. A re-scope serves the workdirs' root
+    /// as `cwd` and a conflict serves none, so judging `cwd` alone published
+    /// work done from inside the denied checkout — which the recorded cwd,
+    /// served verbatim before scope verdicts existed, used to hide.
+    #[test]
+    fn a_denied_baseline_hides_its_rescoped_and_conflicted_windows() {
+        let root = std::env::temp_dir().join(format!(
+            "aicx-source-index-ignore-baseline-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let repo_public = root.join("repo-public");
+        let repo_other = root.join("repo-other");
+        let repo_private = root.join("repo-private");
+        for repo in [&repo_public, &repo_other, &repo_private] {
+            fs::create_dir_all(repo.join(".git")).unwrap();
+        }
+        let aicx_home = root.join(".aicx");
+        fs::create_dir_all(&aicx_home).unwrap();
+        fs::write(
+            aicx_home.join(crate::legacy_archive::AICX_IGNORE_FILENAME),
+            format!("{}\n", repo_private.display()),
+        )
+        .unwrap();
+        let ignore = crate::legacy_archive::load_repo_path_ignore(&aicx_home, &root).unwrap();
+
+        let public = repo_public.display().to_string();
+        let private = repo_private.display().to_string();
+        let turn_context = |cwd: &str| {
+            serde_json::json!({"timestamp": "2026-08-22T00:00:01Z", "type": "turn_context",
+                "payload": {"cwd": cwd}})
+        };
+        let message = |role: &str, text: &str| {
+            let kind = if role == "user" {
+                "input_text"
+            } else {
+                "output_text"
+            };
+            serde_json::json!({"timestamp": "2026-08-22T00:00:02Z", "type": "response_item",
+                "payload": {"type": "message", "role": role,
+                    "content": [{"type": kind, "text": text}]}})
+        };
+        let tool_call = |call_id: &str, workdir: &Path| {
+            serde_json::json!({
+                "timestamp": "2026-08-22T00:00:04Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "name": "exec_command",
+                    "call_id": call_id,
+                    "arguments": serde_json::json!({
+                        "cmd": "ls",
+                        "workdir": workdir.display().to_string(),
+                    })
+                    .to_string(),
+                },
+            })
+        };
+        let body = jsonl(&[
+            serde_json::json!({"timestamp": "2026-08-22T00:00:00Z", "type": "session_meta",
+                "payload": {"id": "baseline-deny", "cwd": public}}),
+            turn_context(&public),
+            message("user", "public work"),
+            // Run from the denied checkout, working on one other repo: the
+            // window is re-scoped to that repo.
+            turn_context(&private),
+            tool_call("c1", &repo_public),
+            message("assistant", "rescoped secret"),
+            // Run from the denied checkout, touching two other repos: the
+            // window is a conflict with no cwd at all.
+            turn_context(&private),
+            tool_call("c2", &repo_public),
+            tool_call("c3", &repo_other),
+            message("assistant", "conflict secret"),
+        ]);
+        let source_path = root.join("rollout.jsonl");
+        fs::write(&source_path, body).unwrap();
+        let mut entry = bounded_entry(&source_path);
+        entry.session_id = "baseline-deny".to_string();
+        entry.cwd = Some(public.clone());
+        let allow = crate::source_path::SourceAllowlist::from_roots([root.clone()]);
+
+        let full = parse_catalog_source(&entry, &source_path, &allow)
+            .unwrap()
+            .frames;
+        let bounded = parse_large_codex_signal(&entry, &source_path, &allow, None)
+            .unwrap()
+            .frames;
+        for (label, mut frames) in [("full", full), ("bounded", bounded)] {
+            let find = |frames: &[TimelineEntry], text: &str| {
+                frames
+                    .iter()
+                    .find(|frame| frame.message.contains(text))
+                    .cloned()
+            };
+            // The fixture must really move `cwd` off the denied baseline, or
+            // the test proves nothing.
+            let rescoped = find(&frames, "rescoped secret")
+                .unwrap_or_else(|| panic!("{label}: no re-scoped frame in {frames:?}"));
+            assert!(
+                rescoped
+                    .cwd
+                    .as_deref()
+                    .is_some_and(|cwd| cwd.ends_with("repo-public")),
+                "{label}: the window must be re-scoped to the public repo: {rescoped:?}"
+            );
+            let conflicted = find(&frames, "conflict secret")
+                .unwrap_or_else(|| panic!("{label}: no conflict frame in {frames:?}"));
+            assert!(
+                conflicted.scope_conflict && conflicted.cwd.is_none(),
+                "{label}: the window must be a conflict: {conflicted:?}"
+            );
+
+            let report = scope_report_excluding_ignored(&mut frames, &ignore);
+            for secret in ["rescoped secret", "conflict secret"] {
+                assert!(
+                    find(&frames, secret).is_none(),
+                    "{label}: `{secret}` was run from the denied checkout and survived"
+                );
+            }
+            assert!(
+                find(&frames, "public work").is_some(),
+                "{label}: frames recorded outside the denied checkout must survive"
             );
             assert_eq!(report.hidden_scopes, 1, "{label}");
             let rendered = format!("{report:?}");

@@ -850,8 +850,22 @@ pub fn timeline_entries_from_model(model: &SessionModel) -> Vec<TimelineEntry> {
                 scope_unattributed: segment.is_some_and(|segment| {
                     segment.scope_status == aicx_parser::engine::ScopeStatus::Unattributed
                 }),
+                // A re-scope serves the resolved root and a conflict serves
+                // nothing, yet the span still ran in its recorded cwd: that
+                // path joins the workdirs the deny list judges, standing in
+                // for the `cwd` it no longer is.
                 scope_workdirs: segment
-                    .map(|segment| segment.scope_workdirs.clone())
+                    .map(|segment| {
+                        let displaced = (segment.scope_conflict || segment.scope_root.is_some())
+                            .then(|| known_str(&segment.cwd))
+                            .flatten()
+                            .filter(|cwd| !segment.scope_workdirs.iter().any(|path| path == cwd));
+                        displaced
+                            .map(str::to_string)
+                            .into_iter()
+                            .chain(segment.scope_workdirs.iter().cloned())
+                            .collect()
+                    })
                     .unwrap_or_default(),
                 // Catalog provenance is stamped by the catalog read path
                 // (`parse_catalog_source`), which owns the entry.
