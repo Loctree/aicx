@@ -119,6 +119,29 @@ containment is the only evidence, a Windows spelling is compared the way
 Windows resolves it: `C:/repo` contains `C:\repo\pkg` and `c:\REPO\pkg`, so a
 rollout that mixes separators or case keeps its intents.
 
+A `workdir` that is not a literal at all is unreadable evidence as well. That
+covers a variable, an expression, and the shorthand `{cmd, workdir}`: each
+names a directory only the runtime knew. Such a call into another checkout no
+longer leaves its window on the baseline. `null` and `undefined` still ask for
+the default directory, and a `workdir:` in prose (not an object property)
+names nothing. Only the whole property name is read, so `networkdir` and
+`fallback_workdir` are other properties. A Windows `workdir` rooted without a
+drive (`\repo\pkg`) now sits on the drive of the turn's cwd and matches
+`C:\repo`, instead of matching nothing.
+
+The bounded reader for over-cap Codex rollouts now agrees with the full
+adapter in two places where they had drifted apart:
+
+- A `turn_context` without a cwd leaves that turn's directory unknown. The
+  bounded reader used to keep the previous turn's directory.
+- `web_search_call` is scoped as a call. One shared predicate now names the
+  call types for every reader.
+
+A session also counts as mixed only when its cwds name more than one
+repository. Previously, more than one spelling was enough, so a session that
+moved from `/repo` into `/repo/pkg` read as mixed and its cwd-less frames were
+dropped from project results.
+
 #### Host resolution is out of the deterministic parser model
 
 Resolving repository identity reads the local filesystem: which checkouts

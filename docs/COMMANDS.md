@@ -247,9 +247,15 @@ decision is made structurally, so an oversized payload cannot spend its own
 unreadable bytes arguing it was never a tool call, and a record type counts as
 read only when its value was: a payload `type` cut off mid-value proves
 nothing. A `workdir` that a tool call writes but does not state is unreadable
-too — a JavaScript template literal that interpolates, or a literal that never
-closes. A readable value runs to the quote that opened it, in any of the three
-quote styles, so `"/Users/O'Brien/repo"` is one path.
+too — a JavaScript template literal that interpolates, a literal that never
+closes, or a value that is not a literal at all (a variable, an expression,
+the shorthand `{cmd, workdir}`). `null` and `undefined` ask for the default
+directory and are no evidence, and only the whole property name `workdir` is
+read. A readable value runs to the quote that opened it, in any of the three
+quote styles, so `"/Users/O'Brien/repo"` is one path. Both Codex readers —
+the full adapter and the bounded reader for over-cap rollouts — scope the
+same call types, and both treat a `turn_context` without a cwd as a turn
+whose directory is unknown.
 Within a mixed
 session a frame must positively prove membership in the requested project —
 silence and conflicting evidence never inherit the session bucket — while
@@ -262,14 +268,18 @@ legacy path-segment fallback does not re-admit them either, however the path
 happens to be spelled. Lexical containment survives only where identity is
 unknowable — a workdir that does not exist on this machine — and there a
 Windows spelling is compared the way Windows resolves it (either separator,
-letter case ignored), a Unix spelling byte for byte. Identity is
+letter case ignored), a Unix spelling byte for byte; a Windows path rooted
+without a drive (`\repo`) sits on the drive of the turn's cwd. Identity is
 canonical (one checkout reached two ways is one repo) and existence-checked (a
 deleted subdirectory does not inherit its ancestor's `.git`); a relative
 `workdir` resolves against the turn's cwd, never against the directory `aicx`
 runs in. A window that ran tools in both the baseline and another checkout is
 a conflict, not a re-scope. Branch drift is not scope drift: a session that
 switches branch inside one unchanged checkout stays a normal, fully attributed
-session, and scope is judged on the whole session before the frame-kind filter
+session. Neither is a move within one checkout: a session is mixed only when
+its cwds name more than one repository, so `cd` from `/repo` into `/repo/pkg`
+keeps it homogeneous while a nested checkout still counts on its own. Scope is
+judged on the whole session before the frame-kind filter
 narrows it to one role — and before `.aicxignore` hides a checkout. A hidden
 repository is counted as a scope and never named, so a session whose own
 baseline is hidden cannot pass as homogeneous and hand its remaining frames to
