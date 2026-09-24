@@ -159,6 +159,12 @@ fn note_mixed_scope(
         session_id: session_id.to_string(),
         cwds: scope.cwds.clone(),
         branches: scope.branches.clone(),
+        // The whole verdict travels: a session mixed only by a hidden scope
+        // or a conflict has at most one visible cwd, and a consumer that
+        // rebuilt the report from cwds alone would call it homogeneous.
+        conflicts: scope.conflicts,
+        hidden_scopes: scope.hidden_scopes,
+        status: scope.status,
     });
 }
 

@@ -119,9 +119,10 @@ pub struct Segment {
 ///
 /// `MixedCandidate` is a candidate, not a verdict: the structure (several
 /// working directories or branches inside one span) says the history may
-/// braid more than one workstream. Consumers that distill *one* history
-/// (`continuity`) must not do so silently on a candidate; they refuse with
-/// `RefusalReason::MixedWorkstream` unless told to distill anyway.
+/// braid more than one workstream. It also covers a branch switch inside one
+/// checkout, so consumers that distill *one* history (`continuity`) refuse
+/// with `RefusalReason::MixedWorkstream` on proven evidence of a second
+/// scope (a conflict, a hidden scope, another cwd), not on this value alone.
 /// Topic-level mixing inside one cwd/branch is not detectable here. Absence of
 /// drift evidence is not evidence of homogeneity, so the non-mixed state only
 /// reports that no drift was observed.

@@ -61,10 +61,12 @@ pub struct IndexHealthLine {
 /// live parse (intents live window) → census fingerprints → index status.
 /// No embedder involvement anywhere on this path.
 ///
-/// Default = do not distill mixed-workstream candidates into one history
-/// (`ScopeStatus::MixedCandidate`, W2-R1). When every session in the window
-/// is such a candidate the pack refuses with `RefusalReason::MixedWorkstream`
-/// instead of returning an empty or braided narrative.
+/// Default = do not distill a mixed workstream into one history (W2-R1):
+/// a session that proves more than one scope — a workdir conflict, a scope
+/// hidden by `.aicxignore`, or more than one cwd — is withheld. When every
+/// session in the window is withheld the pack refuses with
+/// `RefusalReason::MixedWorkstream` instead of returning an empty or braided
+/// narrative.
 pub fn build(aicx_home: &Path, projects: &[String], hours: u64) -> Result<ContinuityPack> {
     build_with_scope(aicx_home, projects, hours, false)
 }
@@ -114,26 +116,7 @@ pub fn build_with_scope(
             !mixed_keys.contains(&(record.agent.as_str(), record.session_id.as_str()))
         });
         if records.is_empty() && before > 0 {
-            let first = &mixed_scope[0];
-            let report = crate::extraction::conversation::ScopeReport {
-                hidden_scopes: 0,
-                status: aicx_parser::engine::ScopeStatus::MixedCandidate,
-                cwds: first.cwds.clone(),
-                branches: first.branches.clone(),
-                entries: before,
-                conflicts: 0,
-            };
-            let refusal = crate::extraction::conversation::refuse_mixed_workstream(
-                first.agent_kind(),
-                &first.session_id,
-                &report,
-                false,
-            )
-            .expect("mixed candidate refuses by default");
-            return Err(anyhow::Error::new(refusal).context(format!(
-                "continuity: {} mixed-workstream session(s) in the window and nothing homogeneous to distill; pass distill_mixed to override",
-                mixed_scope.len()
-            )));
+            return Err(mixed_window_refusal(&mixed_scope, before));
         }
     }
 
@@ -151,6 +134,46 @@ pub fn build_with_scope(
         mixed_scope,
         distilled_mixed: distill_mixed,
     })
+}
+
+/// The error a window of only mixed-workstream sessions refuses with.
+///
+/// Built from the session's WHOLE scope verdict. Rebuilding the report from
+/// cwds alone zeroed the conflicts and hidden scopes that made a session
+/// mixed, so a session mixed only by a conflict or a `.aicxignore`-hidden
+/// checkout — at most one visible cwd — no longer looked mixed, and the
+/// `expect` on the refusal panicked the whole command.
+fn mixed_window_refusal(
+    mixed_scope: &[intents::MixedScopeSession],
+    withheld: usize,
+) -> anyhow::Error {
+    let context = format!(
+        "continuity: {} mixed-workstream session(s) in the window and nothing homogeneous to distill; pass distill_mixed to override",
+        mixed_scope.len()
+    );
+    let refusal = mixed_scope.first().and_then(|first| {
+        let report = crate::extraction::conversation::ScopeReport {
+            hidden_scopes: first.hidden_scopes,
+            status: first.status,
+            cwds: first.cwds.clone(),
+            branches: first.branches.clone(),
+            entries: withheld,
+            conflicts: first.conflicts,
+        };
+        crate::extraction::conversation::refuse_mixed_workstream(
+            first.agent_kind(),
+            &first.session_id,
+            &report,
+            false,
+        )
+    });
+    match refusal {
+        Some(refusal) => anyhow::Error::new(refusal).context(context),
+        // Every listed session passed `scope_mixed()` when it was noted, so
+        // this is the two predicates drifting apart. Still a refusal, never
+        // a panic and never an empty pack.
+        None => anyhow::anyhow!("{context} (the scope evidence no longer reads as mixed)"),
+    }
 }
 
 fn project_matches(entry_project: Option<&str>, projects: &[String]) -> bool {
@@ -495,6 +518,49 @@ fn unresolved_intents(records: &[IntentRecord]) -> Vec<&IntentRecord> {
 mod tests {
     use super::*;
     use std::fs;
+
+    use aicx_parser::engine::{RefusalReason, ScopeStatus};
+
+    /// Finding (P1-05): a session mixed only by a proven conflict or by a
+    /// scope `.aicxignore` hid has at most one visible cwd. The refusal was
+    /// rebuilt from cwds alone, so it no longer read as mixed, and the
+    /// `expect` on it panicked the whole command.
+    #[test]
+    fn a_window_mixed_only_by_conflict_or_hidden_scope_refuses_without_panicking() {
+        let session = |conflicts, hidden_scopes| intents::MixedScopeSession {
+            agent: "codex".to_string(),
+            session_id: "s1".to_string(),
+            cwds: vec!["/repo/alpha".to_string()],
+            branches: Vec::new(),
+            conflicts,
+            hidden_scopes,
+            status: ScopeStatus::NoDriftObserved,
+        };
+        for (label, mixed) in [
+            ("conflict-only", session(2, 0)),
+            ("hidden-only", session(0, 1)),
+        ] {
+            let error = mixed_window_refusal(std::slice::from_ref(&mixed), 3);
+            assert!(
+                matches!(
+                    error.downcast_ref::<RefusalReason>(),
+                    Some(RefusalReason::MixedWorkstream { .. })
+                ),
+                "{label}: {error:#}"
+            );
+        }
+
+        // Predicates that drift apart, or an empty list, still refuse —
+        // as a plain error, never a panic.
+        for mixed in [vec![session(0, 0)], Vec::new()] {
+            let error = mixed_window_refusal(&mixed, 3);
+            assert!(error.downcast_ref::<RefusalReason>().is_none());
+            assert!(
+                format!("{error:#}").contains("nothing homogeneous to distill"),
+                "{error:#}"
+            );
+        }
+    }
 
     #[test]
     fn continuity_pack_renders_all_sections_deterministically() {
