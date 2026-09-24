@@ -939,6 +939,15 @@ pub fn scope_report_for_entries(entries: &[TimelineEntry]) -> ScopeReport {
         .map(str::to_owned)
         .collect();
     let conflicts = entries.iter().filter(|entry| entry.scope_conflict).count();
+    // `scope_unattributed` is deliberately NOT folded into this status, unlike
+    // `ScopeStatus::join` on the parser model. There `Unattributed` outranks
+    // `MixedCandidate` because the model's consumer decides bucket
+    // inheritance per span. Here that decision is made per FRAME — the
+    // project filter drops every unattributed frame in both lanes before
+    // anything is served — and this status is the MIXING signal: records of
+    // a `MixedCandidate` session carry a `scope_status=mixed_candidate`
+    // evidence line. Letting one unplaceable window overwrite it would erase
+    // that line from a session that is braided as well.
     let status = if conflicts > 0 {
         ScopeStatus::MixedCandidate
     } else {
@@ -1672,6 +1681,32 @@ mod harness_noise_tests {
         let mut vista = entry("user", "regular vista turn", 2);
         vista.cwd = Some("/repos/vista".into());
         let report = scope_report_for_entries(&[conflicted, vista]);
+        assert_eq!(report.status, ScopeStatus::MixedCandidate);
+        assert_eq!(report.conflicts, 1);
+    }
+
+    /// Review question: why does the report not join `scope_unattributed` the
+    /// way the parser model does? Because this status is the mixing signal —
+    /// the `scope_status=mixed_candidate` evidence line keys on it — while an
+    /// unattributed frame is withheld on its own by the project filter. An
+    /// unplaceable window must not wipe the mixing signal of a braided session.
+    #[test]
+    fn an_unattributed_frame_does_not_mask_a_mixed_span() {
+        let mut unplaced = entry("user", "ran somewhere this host cannot place", 1);
+        unplaced.cwd = None;
+        unplaced.scope_unattributed = true;
+        let mut vista = entry("user", "regular vista turn", 2);
+        vista.cwd = Some("/repos/vista".into());
+        let mut fleet = entry("user", "turn in the other checkout", 3);
+        fleet.cwd = Some("/repos/fleet-bus".into());
+        let report = scope_report_for_entries(&[unplaced.clone(), vista, fleet]);
+        assert_eq!(report.status, ScopeStatus::MixedCandidate);
+        assert!(report.scope_mixed());
+
+        let mut conflicted = entry("user", "worked in two repos at once", 4);
+        conflicted.cwd = None;
+        conflicted.scope_conflict = true;
+        let report = scope_report_for_entries(&[unplaced, conflicted]);
         assert_eq!(report.status, ScopeStatus::MixedCandidate);
         assert_eq!(report.conflicts, 1);
     }
