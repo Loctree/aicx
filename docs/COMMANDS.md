@@ -133,7 +133,18 @@ A rule is matched in every spelling both sides can produce. Scope resolution
 stamps frames with the canonical repo root, so a rule written the way you see
 the path (`/var/…`, or a checkout reached through a symlink) still hides the
 frame recorded as `/private/var/…`. Write the path you use; matching resolves
-the rest.
+the rest. Spellings are reconciled through this host's filesystem when the
+index runs: the recorded spelling always matches literally, while a spelling
+reached through a symlink matches only while that link still resolves here.
+
+A frame is judged on every path its turn window ran in, not only on the scope
+it is served under: each tool-call `workdir` the window recorded, and the
+recorded cwd whenever the scope verdict replaced it (a re-scope serves the
+workdirs' repo root, a conflict serves no cwd). A session run from a denied
+checkout stays hidden when its window is attributed to another repository,
+and a conflict that touched a denied checkout is hidden as a whole. Windows
+merged into one span are judged on the union of their paths, which can hide
+a neighbouring frame too — the filter fails closed on purpose.
 
 The deny list's identity covers where its rules RESOLVE, not only how they are
 written: retarget a symlink a rule points through and caches built under the

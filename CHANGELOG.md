@@ -57,6 +57,19 @@ a symlink invalidates caches built under the old target instead of quietly
 republishing a newly denied checkout. Resolving an incoming cwd is now lazy
 (a literal hit never asks the filesystem) and memoized per distinct cwd, so a
 large history pays one resolution per cwd rather than one per frame.
+Spellings are reconciled through the indexing host's filesystem: the recorded
+spelling always matches literally, a symlinked one only while the link
+resolves there.
+
+A frame is judged against the deny list on every path its turn window ran in,
+not only on the scope it is served under: each tool-call workdir the window
+recorded, and the recorded cwd whenever the verdict took it out of the
+frame's `cwd` (a re-scope serves the workdirs' root, a conflict serves none).
+Judging the served scope alone published a conflict window that touched a
+denied checkout — it has no `cwd` to test — and the windows of a session run
+from a denied checkout that worked on another repository. Windows merged into
+one span are judged on the union of their paths, which can over-hide a
+neighbouring frame: fail closed on purpose.
 
 One question, one predicate. "Is this session's scope mixed?" is answered by
 `ScopeReport::scope_mixed()` everywhere — the single-history refusal, the
@@ -65,7 +78,14 @@ mixed-workstream telemetry and the project filter — instead of the generic
 mixed and stays silent when `.aicxignore` hid a whole scope. A scope hidden by
 the privacy filter is evidence of another checkout, so it blocks bucket
 inheritance for frames that carry no cwd of their own, even when nothing
-visible remains to compare it against.
+visible remains to compare it against. `continuity` rebuilds that report from
+each session's conflicts and hidden-scope count, so a window whose every
+session is mixed only by a proven conflict or by a hidden checkout is refused
+like any other mixed window. The session-level `ScopeStatus` (served over MCP)
+counts each span's resolved `scope_root` next to its recorded cwd, so a
+session that worked in a second repository is `mixed_candidate`, not
+`no_drift_observed`; and `unattributed` now outranks `mixed_candidate` in the
+join, so a branch switch cannot erase a window this host cannot place.
 
 Identity is anchored where it is defined and never replaces evidence someone
 else reads. `.gitmodules` is resolved from the checkout ROOT, so a submodule
@@ -96,7 +116,13 @@ bytes produced different canonical fingerprints on different machines. The
 recorded cwd is a fact and stays one; the resolved repo root now rides
 `Segment::scope_root`, which is deliberately excluded from
 `canonical_bytes`/`canonical_fingerprint`. Consumers that want the resolved
-bucket read it and fall back to the recorded `cwd`.
+bucket read it and fall back to the recorded `cwd`. A conflict no longer
+erases the recorded cwd either: the span keeps it and `scope_conflict` carries
+the verdict, while scope attribution (report timeline, brief) still gives a
+conflict span no project. Verdicts also cut segments along this disk, so the
+canonical projection folds adjacent segments that record the same cwd and
+branch; a scope-only cut never reaches the fingerprint, and every existing
+golden fixture keeps its bytes.
 
 The verdicts derived from that resolution are cached, so the cache now knows
 what they depended on. The parse ledger records, per session, every working
@@ -130,7 +156,20 @@ depth.
 A submodule's descendants are the submodule's repository too: `.gitmodules`
 paths are matched on a path-component boundary, so a vanished
 `vendor/fleet-bus/src` is no longer absorbed into the parent checkout while
-`vendor/fleet-bus-old` correctly is not.
+`vendor/fleet-bus-old` correctly is not. `.gitmodules` is read as git reads it,
+as git-config: case-insensitive section and key names, quoted values
+(`path = "vendor/fleet bus"`), `;`/`#` comments outside quotes, escapes and
+line continuation, and legacy `[submodule.name]` headers; only
+`submodule.*.path` declares a path. Only a lowercase, unquoted `path = x` line
+used to count, so a quoted declaration was invisible and its vanished tree was
+absorbed by the parent — the fail-open direction.
+
+A path is judged in its own spelling, not the host's. A Windows rollout
+(`C:\…`, `C:/…`, UNC) read on Unix, or the reverse, keeps an absolute
+baseline, so its relative workdirs still resolve against it instead of every
+window turning unattributed. The filesystem is probed only for a path that is
+absolute on this host; a foreign spelling is never resolved against the
+process cwd.
 
 #### Public API (source-breaking for struct-literal construction)
 
@@ -156,6 +195,22 @@ paths are matched on a path-component boundary, so a vanished
   filters read instead of inferring it from `ScopeStatus::MixedCandidate` —
   that status is also how ordinary branch drift is recorded. Code that builds
   `Segment` with a literal must add the field.
+- `aicx_parser::engine::Segment` gains `scope_workdirs: Vec<String>` (serde
+  default, skipped when empty): the span's tool-call workdirs as recorded,
+  joined onto the baseline and lexically normalized, with no filesystem
+  access. Like `scope_root` it stays out of the canonical projection.
+  `TimelineEntry` gains the same field as filter input only (never
+  serialized), plus the recorded cwd whenever the verdict took it out of
+  `cwd`. Code that builds either struct with a literal must add the field.
+- `aicx_parser::engine` exports `recorded_workdir` (the host-independent form
+  of a workdir) and `scope_layout_evidence` (what a scope verdict reads from
+  this host for one path: its resolution and its checkout's `.gitmodules`),
+  which the parse ledger fingerprints.
+- `ScopeStatus::join` ranks `Unattributed` above `MixedCandidate`.
+- `aicx::intents::MixedScopeSession` gains `conflicts`, `hidden_scopes` and
+  `status`. It is serialized, so payloads that carry it gain the three keys —
+  the hidden scopes as a count, never as paths. Code that builds it with a
+  literal must add the fields.
 - `aicx::extraction::conversation::ScopeReport` gains `hidden_scopes: usize`
   (distinct cwds removed by `.aicxignore` before the report was built) and the
   `scope_foreign_to(baseline)` method; `scope_mixed()` now counts hidden
