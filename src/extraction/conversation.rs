@@ -896,24 +896,18 @@ impl ScopeReport {
     /// How many repositories the observed cwds name.
     ///
     /// Two spellings inside one checkout — `/repo` and `/repo/pkg` after a
-    /// `cd` — are one repository, judged by the same membership predicate the
-    /// project filter applies to every frame; a nested checkout or submodule
-    /// is its own. Counting raw strings called every such session mixed, and
-    /// its cwd-less frames were then dropped from project results. Where
-    /// neither path resolves on this host the predicate falls back to lexical
-    /// containment, so two unrelated historical paths still count twice.
+    /// `cd` — are one repository; a nested checkout or submodule is its own.
+    /// Counting raw strings called every such session mixed, and its cwd-less
+    /// frames were then dropped from project results.
+    ///
+    /// This is an identity count, not a membership test, so it fails OPEN
+    /// the way the turn-window reduction does: a path that no longer exists —
+    /// a deleted `target/tmp-build`, a removed worktree — is not evidence of
+    /// a second repository while a checkout that plausibly contains it was
+    /// observed. Where nothing resolves on this host, lexical containment
+    /// decides, so two unrelated historical paths still count twice.
     fn observed_repositories(&self) -> usize {
-        let mut repositories: Vec<&str> = Vec::new();
-        for cwd in &self.cwds {
-            let known = repositories.iter().any(|seen| {
-                aicx_parser::engine::workdir_within_scope(cwd, seen)
-                    || aicx_parser::engine::workdir_within_scope(seen, cwd)
-            });
-            if !known {
-                repositories.push(cwd);
-            }
-        }
-        repositories.len()
+        aicx_parser::engine::repository_count(self.cwds.iter().map(String::as_str))
     }
 
     /// Does this session hold anything the cataloged checkout cannot claim?
@@ -1775,6 +1769,19 @@ mod harness_noise_tests {
         assert!(
             report.scope_mixed(),
             "a nested checkout is its own repository"
+        );
+
+        // Finding: a directory that no longer exists is not a second
+        // repository while the checkout containing it was observed — from its
+        // root or from a subdirectory, in either order.
+        let gone = repo.join("target").join("tmp-build").display().to_string();
+        assert!(
+            !scope_report_for_entries(&[at(&top, 1), at(&gone, 2)]).scope_mixed(),
+            "a deleted build dir inside the checkout is the same repository"
+        );
+        assert!(
+            !scope_report_for_entries(&[at(&gone, 1), at(&pkg, 2)]).scope_mixed(),
+            "absorbed through the checkout root, not only the recorded spelling"
         );
 
         // Nothing resolves on this host: spelling is the only evidence left.

@@ -723,6 +723,62 @@ fn plausibly_within_scope(candidate: &str, scope_root: &str) -> bool {
     }
 }
 
+/// How many repository identities a session's recorded workdirs name.
+///
+/// The session-level twin of the reduction in [`effective_window_scope`], with
+/// the same asymmetry and for the same reason: a count above one makes the
+/// whole session mixed, and a mixed session loses its cwd-less frames from
+/// project results. So a proven root counts once, however many of its
+/// directories the session stood in, and a nested checkout it contains counts
+/// again; a path that proves nothing — a deleted `target/` dir, a removed
+/// worktree, a historical path — counts only when neither a proven checkout
+/// nor another such path plausibly contains it ([`plausibly_within_scope`]).
+///
+/// The verdict does not depend on the order the paths were recorded in:
+/// proven roots are gathered first, and unproven paths are visited ancestors
+/// first, so `/repo/a` and `/repo/b` recorded before `/repo` are still one.
+pub fn repository_count<'a>(workdirs: impl IntoIterator<Item = &'a str>) -> usize {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    // Every spelling a proven checkout may be recorded under: the recorded
+    // path, its root as the ancestor walk found it, and its canonical root. An
+    // unproven path cannot be canonicalized, so it only ever matches the
+    // spelling it was written in.
+    let mut anchors: Vec<String> = Vec::new();
+    let mut unproven: Vec<String> = Vec::new();
+    for raw in workdirs {
+        let raw = trim_path(raw);
+        if raw.is_empty() {
+            continue;
+        }
+        match normalize_workdir(raw, None) {
+            WorkdirIdentity::Resolved(root) => {
+                anchors.push(raw.to_owned());
+                if let Some(walked) = host_path(raw).and_then(discover_git_root) {
+                    anchors.push(walked.to_string_lossy().into_owned());
+                }
+                anchors.push(root.to_string_lossy().into_owned());
+                if !roots.contains(&root) {
+                    roots.push(root);
+                }
+            }
+            WorkdirIdentity::Unresolved(path) => unproven.push(path),
+        }
+    }
+
+    unproven.sort_by_key(String::len);
+    let mut unproven_roots: Vec<String> = Vec::new();
+    for path in unproven {
+        let absorbed = anchors
+            .iter()
+            .chain(&unproven_roots)
+            .any(|anchor| plausibly_within_scope(&path, anchor));
+        if !absorbed {
+            unproven_roots.push(path);
+        }
+    }
+    roots.len() + unproven_roots.len()
+}
+
 /// The directory whose `.gitmodules` declares the submodules around `scope`.
 ///
 /// `.gitmodules` lives at the CHECKOUT root and spells its paths relative to
@@ -1465,6 +1521,61 @@ mod tests {
             "a declared submodule keeps its identity once the tree is gone"
         );
         assert_eq!(path, None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Counting a session's repositories is identity reduction, not
+    /// membership: it fails open on paths that prove nothing, keeps a proven
+    /// nested checkout and a declared submodule apart, and does not depend on
+    /// the order the paths were recorded in.
+    #[test]
+    fn a_session_counts_repositories_not_recorded_paths() {
+        let root = scratch("repository-count");
+        let parent = root.join("vista");
+        let nested = parent.join("tools").join("nested");
+        std::fs::create_dir_all(parent.join(".git")).expect("parent git dir");
+        std::fs::create_dir_all(parent.join("pkg")).expect("subdirectory");
+        std::fs::create_dir_all(nested.join(".git")).expect("nested git dir");
+        std::fs::write(
+            parent.join(".gitmodules"),
+            "[submodule \"fleet-bus\"]\n\tpath = vendor/fleet-bus\n\turl = https://example.invalid/fleet-bus.git\n",
+        )
+        .expect("write .gitmodules");
+        let path = |p: PathBuf| p.to_string_lossy().into_owned();
+        let top = path(parent.clone());
+        let pkg = path(parent.join("pkg"));
+        let gone_a = path(parent.join("target").join("tmp-build"));
+        let gone_b = path(parent.join("worktrees").join("removed"));
+        let submodule = path(parent.join("vendor").join("fleet-bus"));
+        let nested = path(nested);
+
+        assert_eq!(repository_count([top.as_str(), pkg.as_str()]), 1);
+        assert_eq!(repository_count([top.as_str(), gone_a.as_str()]), 1);
+        assert_eq!(
+            repository_count([gone_a.as_str(), gone_b.as_str(), top.as_str()]),
+            1,
+            "vanished paths recorded before their checkout are still inside it"
+        );
+        assert_eq!(
+            repository_count([pkg.as_str(), gone_a.as_str()]),
+            1,
+            "a subdirectory's checkout root absorbs a vanished sibling"
+        );
+        assert_eq!(repository_count([top.as_str(), nested.as_str()]), 2);
+        assert_eq!(
+            repository_count([top.as_str(), submodule.as_str()]),
+            2,
+            "a declared submodule keeps its identity once the tree is gone"
+        );
+        assert_eq!(
+            repository_count(["/aicx-scope-nowhere/repo/pkg", "/aicx-scope-nowhere/repo"]),
+            1
+        );
+        assert_eq!(
+            repository_count(["/aicx-scope-nowhere/repo/pkg", "/aicx-scope-nowhere/other"]),
+            2
+        );
+        assert_eq!(repository_count(["", "  "]), 0);
         let _ = std::fs::remove_dir_all(&root);
     }
 
