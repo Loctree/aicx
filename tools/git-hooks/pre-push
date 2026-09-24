@@ -62,22 +62,23 @@ else
     case "$lsha" in *[!0]*) : ;; *) DELETE_LINES=$((DELETE_LINES + 1)); continue ;; esac
     HAVE_RANGE=1
     if printf '%s' "$rsha" | grep -qE '^0+$' || ! git cat-file -e "$rsha" 2>/dev/null; then
-      # Same default-branch rule as tools/githooks/pre-push. origin/HEAD is
-      # local and is not refreshed by fetch; a stale develop pointer must not
-      # select the heavy gate. This copy is the one core.hooksPath installs.
+      # Same default-branch rule as tools/githooks/pre-push. A missing
+      # origin/main fails closed into the full gate instead of inspecting
+      # only the tip commit. This copy is the one core.hooksPath installs.
       default_ref=$(git symbolic-ref --quiet refs/remotes/origin/HEAD 2>/dev/null || true)
       case "$default_ref" in
         ""|refs/remotes/origin/develop|origin/develop) default_ref=origin/main ;;
       esac
       if ! git rev-parse --verify -q "${default_ref}^{commit}" >/dev/null 2>&1; then
-        default_ref=origin/main
+        RUST_TOUCHED=1
+        continue
       fi
       base=$(git merge-base "$lsha" "$default_ref" 2>/dev/null || true)
-      if [ -n "$base" ]; then
-        files=$(git diff --name-only "$base" "$lsha")
-      else
-        files=$(git show --name-only --format= "$lsha")
+      if [ -z "$base" ]; then
+        RUST_TOUCHED=1
+        continue
       fi
+      files=$(git diff --name-only "$base" "$lsha")
     else
       files=$(git diff --name-only "$rsha" "$lsha")
     fi

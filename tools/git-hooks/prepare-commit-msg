@@ -74,6 +74,7 @@ fi
 # shell id, so it is a human fallback only and never outranks `aicx`.
 session_raw=""
 session_source=""
+session_rejected=""
 if [ -n "$authored_by_human" ]; then
     if [ -n "${ATUIN_SESSION:-}" ]; then
         session_raw="$ATUIN_SESSION"
@@ -103,16 +104,26 @@ else
     done
     if [ -z "$session_raw" ] && command -v aicx >/dev/null 2>&1; then
         # Git hooks do not inherit the harness stdin that carries session
-        # identity, so the env vars above are usually empty here.
-        session_raw="$(aicx sessions current 2>/dev/null | head -n 1 | tr -d '[:space:]' || true)"
-        session_source="aicx sessions current"
+        # identity, so the env vars above are usually empty here. The disk
+        # fallback is the newest transcript in this checkout across agents,
+        # so a bare UUID can belong to a different lane than the subject.
+        # Use it only when the JSON names this subject.
+        session_json="$(aicx sessions current --json 2>/dev/null || true)"
+        session_candidate="$(printf '%s\n' "$session_json" | sed -n 's/.*"session_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
+        session_agent="$(printf '%s\n' "$session_json" | sed -n 's/.*"agent"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
+        if [ -n "$session_candidate" ] && [ "$session_agent" = "$agent" ]; then
+            session_raw="$session_candidate"
+            session_source="aicx sessions current"
+        elif [ -n "$session_candidate" ]; then
+            session_source="aicx sessions current ($session_agent)"
+            session_rejected=1
+        fi
     fi
 fi
 session_raw="$(printf '%s' "$session_raw" | tr -d '[:space:]')"
 
 session_id=""
-session_rejected=""
-if printf '%s' "$session_raw" | grep -Eq '^[0-9a-fA-F]{32}$'; then
+if [ -z "$session_rejected" ] && printf '%s' "$session_raw" | grep -Eq '^[0-9a-fA-F]{32}$'; then
     session_id="$(printf '%s' "$session_raw" \
         | sed -E 's/^(.{8})(.{4})(.{4})(.{4})(.{12})$/\1-\2-\3-\4-\5/' | tr 'A-F' 'a-f')"
 elif printf '%s' "$session_raw" \
@@ -197,8 +208,11 @@ apply_trailers() {
             return o
         }
         function is_comment(s) { return index(s, comment_prefix) == 1 }
+        # The marker shape, not a hard-coded prefix. core.commentChar=auto
+        # picks a character that does not begin any message line, so the
+        # configured value may be "auto" while the file contains "; --- >8 ---".
         function is_scissors(s) {
-            return s ~ ("^" re_escape(comment_prefix) "[[:space:]]*-{2,}[[:space:]]*>8[[:space:]]*-{2,}[[:space:]]*$")
+            return s ~ /^[^[:space:]]+[[:space:]]*-{2,}[[:space:]]*>8[[:space:]]*-{2,}[[:space:]]*$/
         }
         function is_trailer(s) {
             return s ~ /^[A-Za-z][A-Za-z0-9_-]*: /
@@ -218,6 +232,9 @@ apply_trailers() {
             if (!cut && is_scissors($0)) cut = n
         }
         END {
+            if (cut && match(lines[cut], /^[^[:space:]]+/)) {
+                comment_prefix = substr(lines[cut], 1, RLENGTH)
+            }
             limit = cut ? cut - 1 : n
             cstart = limit + 1
             seen = 0
@@ -319,8 +336,13 @@ apply_trailers() {
 }
 
 if [ -n "$session_rejected" ]; then
-    printf 'prepare-commit-msg: session identity from %s is not a UUID; not using it.\n' \
-        "$session_source" >&2
+    if [ -z "$session_raw" ]; then
+        printf 'prepare-commit-msg: session from %s is not the subject agent %s; not using it.\n' \
+            "$session_source" "$agent" >&2
+    else
+        printf 'prepare-commit-msg: session identity from %s is not a UUID; not using it.\n' \
+            "$session_source" >&2
+    fi
 elif [ -z "$session_id" ]; then
     printf 'prepare-commit-msg: session identity not measurable; not inventing one.\n' >&2
     if [ -n "$authored_by_human" ]; then

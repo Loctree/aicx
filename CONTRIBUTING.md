@@ -36,9 +36,9 @@ session_pid: 35432
 (`git commit -m` / `-F`). Plain `git commit` opens an editor first, so the
 same generator runs again from `commit-msg` after the message is saved.
 Trailers are inserted before Git's scissors line (`git commit -v`,
-`commit.cleanup=scissors`). The marker uses `core.commentString` or
-`core.commentChar`, not a hard-coded `#`. The validator reads that same
-prefix, which is the text Git keeps. A `Signed-off-by` line in the footer
+`commit.cleanup=scissors`). The marker is recognized by its `>8` shape, so
+`core.commentChar=auto` is not assumed to be `#`. The validator reads that
+same prefix, which is the text Git keeps. A `Signed-off-by` line in the footer
 stays where it is; only the measured provenance keys are overwritten.
 
 Two rules govern the split:
@@ -52,7 +52,8 @@ Two rules govern the split:
 
 The agent lane reads the same environment keys as `aicx sessions current`,
 in the same order: `AICX_SESSION_ID`, `CODEX_THREAD_ID`, `CODEX_SESSION_ID`,
-then the other agent session variables, then `aicx sessions current`. A human
+then the other agent session variables, then `aicx sessions current --json`.
+That fallback is used only when its `agent` matches the subject. A human
 lane (`maciej`, `monika`, or runtime `manual`) does not read those variables.
 Its only automatic fallback is `ATUIN_SESSION`, and that fallback is not used
 for agents.

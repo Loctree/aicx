@@ -69,20 +69,22 @@ esac
 # What Git will store: drop the scissors marker and the verbose diff under it.
 # Comment lines stay in the buffer; the checks below do not treat them as
 # trailers or as an explanatory body.
-kept="$(awk -v comment_prefix="$comment_prefix" '
-    function re_escape(s,   i, c, o) {
-        o = ""
-        for (i = 1; i <= length(s); i++) {
-            c = substr(s, i, 1)
-            if (c ~ /[^A-Za-z0-9]/) o = o "\\" c
-            else o = o c
-        }
-        return o
-    }
-    BEGIN { cut = "^" re_escape(comment_prefix) "[[:space:]]*-{2,}[[:space:]]*>8[[:space:]]*-{2,}[[:space:]]*$" }
-    $0 ~ cut { exit }
+# Any comment prefix. core.commentChar=auto does not tell us which character
+# Git wrote; the scissors line in the file does.
+kept="$(awk '
+    /^[^[:space:]]+[[:space:]]*-{2,}[[:space:]]*>8[[:space:]]*-{2,}[[:space:]]*$/ { exit }
     { sub(/\r$/, ""); print }
 ' "$msg_file")"
+scissors_prefix="$(awk '
+    /^[^[:space:]]+[[:space:]]*-{2,}[[:space:]]*>8[[:space:]]*-{2,}[[:space:]]*$/ {
+        match($0, /^[^[:space:]]+/)
+        print substr($0, 1, RLENGTH)
+        exit
+    }
+' "$msg_file")"
+if [ -n "$scissors_prefix" ]; then
+    comment_prefix="$scissors_prefix"
+fi
 
 if printf '%s\n' "$kept" | grep -Eiq '(^Co-Authored-By:|noreply@|@anthropic\.com|@openai\.com)'; then
     failures+=("vendor footers are forbidden; use Authored-By only")
@@ -120,9 +122,30 @@ if ! printf '%s\n' "$kept" | grep -Eq '^session_id: [0-9a-f]{8}-[0-9a-f]{4}-[0-9
     failures+=("missing session_id: <uuid>")
 fi
 
-# Legacy keys are rejected even when a valid time: is also present. The
-# generator adds time: without removing an old timestamp: from an amend.
-if printf '%s\n' "$kept" | grep -Eq '^(timestamp|date): '; then
+# Legacy keys are rejected in the footer even when a valid time: is also
+# present. A citation in the body is not a trailer: the generator leaves it
+# alone and still writes time:.
+footer="$(printf '%s\n' "$kept" | awk -v comment_prefix="$comment_prefix" '
+    function is_comment(s) { return comment_prefix != "" && index(s, comment_prefix) == 1 }
+    function is_trailer(s) { return s ~ /^[A-Za-z][A-Za-z0-9_-]*: / }
+    { n++; lines[n] = $0 }
+    END {
+        end = n
+        seen = 0
+        while (end >= 1) {
+            if (is_comment(lines[end])) { seen = 1; end--; continue }
+            if (seen && lines[end] ~ /^[[:space:]]*$/) { end--; continue }
+            break
+        }
+        while (end >= 1 && lines[end] ~ /^[[:space:]]*$/) end--
+        bend = end
+        bstart = end + 1
+        while (end >= 1 && is_trailer(lines[end])) { bstart = end; end-- }
+        if (bstart <= bend && end >= 1 && lines[end] !~ /^[[:space:]]*$/) exit
+        for (i = bstart; i <= bend; i++) print lines[i]
+    }
+')"
+if printf '%s\n' "$footer" | grep -Eq '^(timestamp|date): '; then
     failures+=("timestamp:/date: are legacy; the fleet standard is time: YYYY-MM-DDTHH:MM:SS+HH:MM")
 fi
 if ! printf '%s\n' "$kept" | grep -Eq '^time: [0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([+-][0-9]{2}:[0-9]{2}|Z)$'; then

@@ -474,7 +474,8 @@ expect_absent unmeasured-runtime-not-invented "$out" "runtime: interactive"
 fake_bin="$(mktemp -d)"
 cat >"$fake_bin/aicx" <<'EOF'
 #!/bin/sh
-echo aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee
+agent="${AICX_FAKE_AGENT:-codex}"
+printf '%s\n' "{\"session_id\":\"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee\",\"agent\":\"${agent}\",\"source\":\"disk\"}"
 EOF
 chmod +x "$fake_bin/aicx"
 atuin_id="11111111-2222-4333-8444-555555555555"
@@ -556,6 +557,80 @@ fi
 rm -f "$tmp"
 printf 'ok generator: trailers sit above a semicolon scissors line\n'
 
+# commentChar=auto: a hash-prefixed body line forces Git to pick another
+# marker. The hook must cut on that marker, not on a hard-coded '#'.
+tmp="$(mktemp)"
+cat >"$tmp" <<EOF
+$subject_agent
+
+Why this commit exists.
+# not a comment, so auto cannot pick hash
+
+; ------------------------ >8 ------------------------
+diff --git a/README.md b/README.md
+session_id: $other_id
+EOF
+if ! hook_env \
+    GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.commentChar GIT_CONFIG_VALUE_0=auto \
+    CODEX_THREAD_ID="$thread_id" TERM_PROGRAM=iTerm.app \
+    "$hook" "$tmp" >/dev/null 2>&1; then
+    printf 'FAIL generator: auto commentChar scissors message rejected\n' >&2
+    hook_env GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.commentChar GIT_CONFIG_VALUE_0=auto \
+        CODEX_THREAD_ID="$thread_id" TERM_PROGRAM=iTerm.app "$hook" "$tmp" >&2 || true
+    rm -f "$tmp"
+    exit 1
+fi
+if ! awk -v id="$thread_id" '
+    /^;[[:space:]]*-{2,}[[:space:]]*>8/ { exit }
+    $0 == "session_id: " id { found=1 }
+    END { exit !found }
+' "$tmp"; then
+    printf 'FAIL generator: session_id is not above the auto-mode scissors line\n' >&2
+    cat "$tmp" >&2
+    rm -f "$tmp"
+    exit 1
+fi
+rm -f "$tmp"
+printf 'ok generator: auto commentChar still cuts on the real scissors line\n'
+
+# A body citation of the old key is not a legacy trailer.
+out="$(gen "$subject_agent
+
+Why this commit exists.
+timestamp: 2026_0604_1408_MDT
+is how the old key looked.
+
+Authored-By: codex <agents@vetcoders.io>
+session_id: $real_session
+time: 2026-06-04T14:08:27-06:00
+runtime: iterm2" \
+    PATH=/usr/bin:/bin VC_SESSION_PID=0)"
+tmp="$(mktemp)"
+printf '%s\n' "$out" >"$tmp"
+if ! hook_env "$hook" "$tmp" >/dev/null 2>&1; then
+    printf 'FAIL validator: body citation of timestamp: was rejected\n' >&2
+    hook_env "$hook" "$tmp" >&2 || true
+    rm -f "$tmp"
+    exit 1
+fi
+rm -f "$tmp"
+printf 'ok validator: timestamp citation in the body is not a footer\n'
+
+other_bin="$(mktemp -d)"
+cat >"$other_bin/aicx" <<'EOF'
+#!/bin/sh
+printf '%s\n' '{"session_id":"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee","agent":"claude","source":"disk"}'
+EOF
+chmod +x "$other_bin/aicx"
+out="$(gen "$subject_agent
+
+Why this commit exists." \
+    PATH="$other_bin:/usr/bin:/bin" VC_SESSION_PID=0)"
+expect_absent aicx-other-agent-not-used "$out" "session_id:"
+rm -f "$other_bin/aicx"
+rmdir "$other_bin"
+printf 'ok generator: aicx fallback from another agent is not measured\n'
+
 # --- parity between the two installable hook sets ---------------------------
 
 # tools/githooks (symlink install) and tools/git-hooks (core.hooksPath embargo
@@ -580,6 +655,10 @@ for copy in "$root/tools/githooks/pre-push" "$root/tools/git-hooks/pre-push"; do
     fi
     if ! grep -q 'origin/develop) default_ref=origin/main' "$copy"; then
         printf 'FAIL pre-push: %s does not retarget a develop symref to origin/main\n' "$copy" >&2
+        exit 1
+    fi
+    if grep -q 'git show --name-only --format=' "$copy"; then
+        printf 'FAIL pre-push: %s still classifies a missing baseline from the tip commit\n' "$copy" >&2
         exit 1
     fi
 done
