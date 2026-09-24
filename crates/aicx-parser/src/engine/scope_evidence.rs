@@ -156,20 +156,74 @@ fn workdirs_in_literal(input: &str) -> Vec<String> {
         .collect()
 }
 
-/// Resolve one workdir string to a filesystem candidate.
+/// Resolve one workdir string to an absolute spelling, lexically normalized.
 ///
 /// A relative workdir (`.`, `packages/api`) belongs to the TURN's cwd, never to
 /// wherever `aicx` happens to be running: resolving it against the process cwd
 /// would let the caller's own checkout adopt a historical rollout's messages.
 /// Without a baseline there is nothing to resolve it against, so it stays
 /// unknown.
-fn resolve_candidate(path: &str, baseline: Option<&str>) -> Option<PathBuf> {
-    let candidate = Path::new(path);
-    if candidate.is_absolute() {
-        return Some(candidate.to_path_buf());
+///
+/// Absoluteness is a property of the RECORDED spelling, not of the host doing
+/// the parsing: a Windows rollout replayed on macOS still has `C:\repo` as an
+/// absolute baseline. Asking `Path::is_absolute` made every relative workdir
+/// of such a rollout unresolvable, and the window unattributed.
+fn resolve_candidate(path: &str, baseline: Option<&str>) -> Option<String> {
+    let path = path.trim();
+    if absolute_anywhere(path) {
+        return Some(lexically_normalized(path));
     }
-    let base = Path::new(baseline?.trim());
-    base.is_absolute().then(|| base.join(candidate))
+    let base = baseline?.trim();
+    if !absolute_anywhere(base) {
+        return None;
+    }
+    let separator = separator_of(base);
+    Some(lexically_normalized(&format!(
+        "{}{separator}{path}",
+        base.trim_end_matches(['/', '\\'])
+    )))
+}
+
+/// Is `path` absolute on ANY platform a rollout can come from? `/unix`,
+/// `C:\` or `C:/` drive roots, and `\`-rooted or UNC (`\\server\share`)
+/// Windows paths. A drive-relative `C:repo` is not.
+fn absolute_anywhere(path: &str) -> bool {
+    path.starts_with(['/', '\\']) || windows_drive_root(path)
+}
+
+fn windows_drive_root(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'/' | b'\\')
+}
+
+/// Is this a Windows spelling, where `\` is a separator rather than a legal
+/// filename character?
+fn windows_shaped(path: &str) -> bool {
+    path.starts_with('\\')
+        || (path.len() >= 2
+            && path.as_bytes()[0].is_ascii_alphabetic()
+            && path.as_bytes()[1] == b':')
+}
+
+/// The separator a path is spelled with, so a join or a rewrite keeps it.
+fn separator_of(path: &str) -> char {
+    if windows_shaped(path) && (path.contains('\\') || !path.contains('/')) {
+        '\\'
+    } else {
+        '/'
+    }
+}
+
+/// Only a path absolute on THIS host may be probed on its filesystem. Any
+/// other spelling — a Windows path on Unix, a Unix path on Windows — would be
+/// resolved against the process cwd, which is exactly the leak the relative
+/// case refuses.
+fn host_path(path: &str) -> Option<&Path> {
+    let path = Path::new(path);
+    path.is_absolute().then_some(path)
 }
 
 /// Does the readable head of an over-cap record look like a tool-call
@@ -314,9 +368,9 @@ pub fn normalize_workdir(path: &str, baseline: Option<&str>) -> WorkdirIdentity 
         // Nothing to resolve a bare relative token against; it stays as-is.
         return WorkdirIdentity::Unresolved(trim_path(path).to_string());
     };
-    let candidate = lexically_normalized(&candidate);
-    if candidate.exists()
-        && let Some(root) = discover_git_root(&candidate)
+    if let Some(on_host) = host_path(&candidate)
+        && on_host.exists()
+        && let Some(root) = discover_git_root(on_host)
     {
         // Canonical form, so one checkout reached through a symlink or a
         // `/var` vs `/private/var` spelling is one identity.
@@ -326,7 +380,7 @@ pub fn normalize_workdir(path: &str, baseline: Option<&str>) -> WorkdirIdentity 
     // from this machine still told us `.` or `packages/api` RELATIVE TO its
     // baseline. Discarding that join and keeping the bare token would compare
     // `.` against `/old/repo` and throw away turns that are plainly in scope.
-    WorkdirIdentity::Unresolved(candidate.to_string_lossy().into_owned())
+    WorkdirIdentity::Unresolved(candidate)
 }
 
 /// The workdir as the rollout RECORDED it, made comparable without asking the
@@ -340,35 +394,64 @@ pub fn normalize_workdir(path: &str, baseline: Option<&str>) -> WorkdirIdentity 
 /// both must see the raw evidence, not what survived one host's reduction.
 pub fn recorded_workdir(path: &str, baseline: Option<&str>) -> String {
     match resolve_candidate(path, baseline) {
-        Some(candidate) => {
-            trim_path(&lexically_normalized(&candidate).to_string_lossy()).to_string()
-        }
+        Some(candidate) => trim_path(&candidate).to_string(),
         None => trim_path(path).to_string(),
     }
 }
 
-/// Collapse `.` and `..` without touching the filesystem.
+/// Collapse `.` and `..` without touching the filesystem, in the path's own
+/// spelling.
 ///
 /// The lexical comparison below is the last resort for paths that do not exist
 /// here, so it must at least compare like with like: `/old/repo` joined with
-/// `.` is `/old/repo`, not `/old/repo/.`.
-fn lexically_normalized(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for component in path.components() {
-        match component {
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                if !out.pop() {
-                    out.push(component.as_os_str());
+/// `.` is `/old/repo`, not `/old/repo/.`. It works on the string rather than on
+/// `Path` components because components are the HOST's grammar: on Unix a
+/// Windows path is one opaque component, so `C:\repo\..\other` never
+/// collapsed. `\` separates only in a Windows spelling; in a Unix path it is a
+/// legal filename character and stays one.
+fn lexically_normalized(path: &str) -> String {
+    let path = path.trim();
+    let windows = windows_shaped(path);
+    let separator = separator_of(path);
+    let is_separator = |c: char| c == '/' || (windows && c == '\\');
+    let root_len = if windows_drive_root(path) {
+        3
+    } else if windows && (path.starts_with("\\\\") || path.starts_with("//")) {
+        2
+    } else if path.starts_with(is_separator) {
+        1
+    } else if windows {
+        // Drive-relative `C:repo`: the drive is the only root there is.
+        2
+    } else {
+        0
+    };
+    let (root, rest) = path.split_at(root_len);
+    let root: String = root
+        .chars()
+        .map(|c| if is_separator(c) { separator } else { c })
+        .collect();
+    let mut parts: Vec<&str> = Vec::new();
+    for part in rest.split(is_separator) {
+        match part {
+            "" | "." => {}
+            ".." => match parts.last() {
+                Some(last) if *last != ".." => {
+                    parts.pop();
                 }
-            }
-            other => out.push(other.as_os_str()),
+                // Above a root there is nothing to climb to; a relative path
+                // keeps the `..` it cannot resolve.
+                _ if root.is_empty() => parts.push(".."),
+                _ => {}
+            },
+            part => parts.push(part),
         }
     }
-    if out.as_os_str().is_empty() {
-        PathBuf::from(".")
+    let body = parts.join(separator.to_string().as_str());
+    if root.is_empty() && body.is_empty() {
+        ".".to_owned()
     } else {
-        out
+        format!("{root}{body}")
     }
 }
 
@@ -383,13 +466,19 @@ fn trim_path(path: &str) -> &str {
 
 /// Lexical containment — the fallback used ONLY where repo identity cannot be
 /// established on this machine (neither path resolves to a checkout).
+///
+/// Both sides are compared lexically normalized, so a scope written with a
+/// trailing `.` or `..` still contains what it names.
 fn lexically_within(candidate: &str, scope_root: &str) -> bool {
-    let candidate = trim_path(candidate);
-    let scope_root = trim_path(scope_root);
-    candidate == scope_root
+    let candidate = lexically_normalized(candidate);
+    let scope = lexically_normalized(scope_root);
+    let windows = windows_shaped(&scope);
+    let candidate = trim_path(&candidate);
+    let scope = trim_path(&scope);
+    candidate == scope
         || candidate
-            .strip_prefix(scope_root)
-            .is_some_and(|rest| rest.starts_with('/') || rest.starts_with('\\'))
+            .strip_prefix(scope)
+            .is_some_and(|rest| rest.starts_with('/') || (windows && rest.starts_with('\\')))
 }
 
 /// Does `candidate` belong to the same checkout as `scope_root`?
@@ -467,7 +556,11 @@ fn declared_submodule(scope_root: &str, path: &str) -> bool {
     // be canonicalized (it does not exist), so canonicalizing only the root
     // would leave the two incomparable on any host where the scope path runs
     // through a symlink.
-    let scope = Path::new(trim_path(scope_root));
+    let Some(scope) = host_path(trim_path(scope_root)) else {
+        // A scope spelled for another platform has no `.gitmodules` on this
+        // host; reading one relative to the process cwd would be a guess.
+        return false;
+    };
     // `.gitmodules` lives at the CHECKOUT root and spells its paths relative to
     // it, while the scope root is only a working directory — frequently a
     // subdirectory. Reading it where the session happened to stand would miss
@@ -484,11 +577,9 @@ fn declared_submodule(scope_root: &str, path: &str) -> bool {
         Err(_) => return false,
     };
     let relative = trim_path(&relative);
-    raw.lines()
-        .map(str::trim)
-        .filter_map(|line| line.strip_prefix("path"))
-        .filter_map(|rest| rest.trim().strip_prefix('='))
-        .map(|declared| trim_path(declared.trim()))
+    gitmodules_paths(&raw)
+        .iter()
+        .map(|declared| trim_path(declared))
         .filter(|declared| !declared.is_empty())
         // A submodule's DESCENDANTS are the submodule's repository too. A
         // vanished `vendor/fleet-bus/src` is still inside the declared
@@ -501,6 +592,128 @@ fn declared_submodule(scope_root: &str, path: &str) -> bool {
                     .strip_prefix(declared)
                     .is_some_and(|rest| rest.starts_with('/'))
         })
+}
+
+/// Every `submodule.<name>.path` value in a `.gitmodules` body, read with
+/// git-config syntax: section and key names are case-insensitive (`Path =`),
+/// values may be double-quoted (`"vendor/fleet bus"`), `;` and `#` start a
+/// comment outside quotes, `\` escapes a quote, a backslash or a newline
+/// (continuation), and surrounding whitespace is dropped while inner
+/// whitespace is kept.
+///
+/// A declaration this reader misses lets the parent absorb a vanished
+/// submodule — the fail-open direction — so malformed input is read
+/// leniently, never discarded: an unterminated quote runs to the end of the
+/// line and an unknown escape keeps its character.
+fn gitmodules_paths(raw: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    let mut in_submodule = false;
+    let mut chars = raw.chars().peekable();
+    loop {
+        while chars.next_if(|c| *c != '\n' && c.is_whitespace()).is_some() {}
+        match chars.peek().copied() {
+            None => break,
+            Some('\n') => {
+                chars.next();
+            }
+            Some('#' | ';') => skip_config_line(&mut chars),
+            Some('[') => {
+                chars.next();
+                let mut header = String::new();
+                while let Some(c) = chars.next_if(|c| *c != ']' && *c != '\n') {
+                    header.push(c);
+                }
+                if chars.next_if_eq(&']').is_none() {
+                    in_submodule = false;
+                    continue;
+                }
+                // `[submodule "name"]`, or the legacy `[submodule.name]`.
+                let section = header
+                    .trim_start()
+                    .split(|c: char| c.is_whitespace() || c == '"' || c == '.')
+                    .next()
+                    .unwrap_or_default();
+                in_submodule = section.eq_ignore_ascii_case("submodule");
+                // A key may follow the header on the same line.
+            }
+            Some(_) => {
+                let mut key = String::new();
+                while let Some(c) = chars.next_if(|c| c.is_ascii_alphanumeric() || *c == '-') {
+                    key.push(c);
+                }
+                while chars.next_if(|c| *c == ' ' || *c == '\t').is_some() {}
+                if key.is_empty() || chars.next_if_eq(&'=').is_none() {
+                    // A bare boolean key, or noise: nothing to read.
+                    skip_config_line(&mut chars);
+                    continue;
+                }
+                let value = config_value(&mut chars);
+                if in_submodule && key.eq_ignore_ascii_case("path") {
+                    paths.push(value);
+                }
+            }
+        }
+    }
+    paths
+}
+
+fn skip_config_line(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+    for c in chars.by_ref() {
+        if c == '\n' {
+            break;
+        }
+    }
+}
+
+/// One git-config value, consuming through the end of its (possibly
+/// continued) line. Mirrors git's `parse_value`: leading whitespace skipped,
+/// trailing unquoted whitespace trimmed, inner whitespace verbatim.
+fn config_value(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> String {
+    let mut value = String::new();
+    let mut quoted = false;
+    let mut comment = false;
+    // Length of `value` before a run of unquoted whitespace, so a run that
+    // turns out to be trailing can be cut off.
+    let mut trim_len: Option<usize> = None;
+    while let Some(c) = chars.next() {
+        if c == '\n' {
+            break;
+        }
+        if comment {
+            continue;
+        }
+        if c.is_whitespace() && !quoted {
+            if trim_len.is_none() {
+                trim_len = Some(value.len());
+            }
+            if !value.is_empty() {
+                value.push(c);
+            }
+            continue;
+        }
+        if !quoted && (c == ';' || c == '#') {
+            comment = true;
+            continue;
+        }
+        trim_len = None;
+        match c {
+            '\\' => match chars.next() {
+                Some('\n') => {}
+                Some('\r') if chars.next_if_eq(&'\n').is_some() => {}
+                Some('n') => value.push('\n'),
+                Some('t') => value.push('\t'),
+                Some('b') => value.push('\u{8}'),
+                Some(other) => value.push(other),
+                None => break,
+            },
+            '"' => quoted = !quoted,
+            other => value.push(other),
+        }
+    }
+    if let Some(len) = trim_len {
+        value.truncate(len);
+    }
+    value
 }
 
 /// Do these two paths resolve to two DIFFERENT checkouts on this machine?
@@ -1035,6 +1248,128 @@ mod tests {
             "`fleet-bus-old` is not inside the declared `fleet-bus`"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Finding (P1-06): `.gitmodules` is git-config, not `path = x` lines. A
+    /// reader that matched only a lowercase unquoted `path` let the parent
+    /// absorb every submodule declared as `Path =` or with a quoted value.
+    #[test]
+    fn gitmodules_are_read_with_git_config_syntax() {
+        let raw = concat!(
+            "# vendored checkouts\n",
+            "[Submodule \"fleet-bus\"]\n",
+            "\tPath = \"vendor/fleet-bus\" ; moved in 2025\n",
+            "\turl = https://example.invalid/fleet-bus.git\n",
+            "[submodule \"spaced\"]\n",
+            "\tpath=\"vendor/fleet bus\"\n",
+            "[submodule \"commented\"]\n",
+            "\tPATH = vendor/plain   # trailing comment\n",
+            "[submodule \"hash\"]\n",
+            "\tpath = \"vendor/with#hash\"\r\n",
+            "[submodule \"continued\"]\n",
+            "\tpath = vendor/cont\\\n",
+            "inued\n",
+            "[submodule \"escaped\"]\n",
+            "\tpath = \"vendor/q\\\"uote\"\n",
+            "[remote \"origin\"]\n",
+            "\tpath = not/a/submodule\n",
+            "[submodule.legacy] path = vendor/legacy\n",
+            "[submodule \"broken\"]\n",
+            "\tpath = \"vendor/unterminated\n",
+        );
+        assert_eq!(
+            gitmodules_paths(raw),
+            vec![
+                "vendor/fleet-bus",
+                "vendor/fleet bus",
+                "vendor/plain",
+                "vendor/with#hash",
+                "vendor/continued",
+                "vendor/q\"uote",
+                "vendor/legacy",
+                "vendor/unterminated",
+            ]
+        );
+    }
+
+    /// The same finding through the verdict: a submodule declared with a
+    /// capitalised key and a quoted, spaced value keeps its identity once its
+    /// tree is gone, and the component boundary still holds.
+    #[test]
+    fn a_quoted_submodule_declaration_is_not_absorbed_by_its_parent() {
+        let root = scratch("quoted-submodule");
+        let parent = root.join("vista");
+        std::fs::create_dir_all(parent.join(".git")).expect("parent git dir");
+        std::fs::write(
+            parent.join(".gitmodules"),
+            "[submodule \"fleet bus\"]\n\tPath = \"vendor/fleet bus\" ; moved\n",
+        )
+        .expect("write .gitmodules");
+        let base = parent.to_string_lossy().into_owned();
+
+        let gone = parent.join("vendor").join("fleet bus").join("src");
+        let (scope, path) =
+            effective_window_scope(&explicit(&[&gone.to_string_lossy()]), Some(&base));
+        assert_eq!(scope, WindowScope::Unattributed);
+        assert_eq!(path, None);
+
+        let sibling = parent.join("vendor").join("fleet bus-old");
+        let (scope, _) =
+            effective_window_scope(&explicit(&[&sibling.to_string_lossy()]), Some(&base));
+        assert_eq!(scope, WindowScope::Baseline);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Finding (P2-01): absoluteness was the HOST's question. A Windows
+    /// rollout replayed on Unix (or the reverse) had its baseline called
+    /// relative, so every relative workdir became unresolvable and the whole
+    /// window unattributed. The recorded spelling decides now, on every host.
+    #[test]
+    fn a_foreign_platform_baseline_still_anchors_relative_workdirs() {
+        let windows = r"C:\Users\dev\repo";
+        assert_eq!(recorded_workdir(".", Some(windows)), windows);
+        assert_eq!(
+            recorded_workdir(r"packages\api", Some(windows)),
+            r"C:\Users\dev\repo\packages\api"
+        );
+        assert_eq!(
+            recorded_workdir("packages/api", Some(windows)),
+            r"C:\Users\dev\repo\packages\api"
+        );
+        assert_eq!(
+            recorded_workdir(r"..\other", Some(windows)),
+            r"C:\Users\dev\other"
+        );
+        assert_eq!(
+            recorded_workdir(r"\\server\share\repo", Some(windows)),
+            r"\\server\share\repo"
+        );
+        let (scope, path) = effective_window_scope(
+            &explicit(&[".", r"packages\api", r"C:\Users\dev\repo\src"]),
+            Some(windows),
+        );
+        assert_eq!(scope, WindowScope::Baseline);
+        assert_eq!(path, None);
+        let (scope, _) = effective_window_scope(&explicit(&[r"..\other"]), Some(windows));
+        assert_eq!(
+            scope,
+            WindowScope::Unattributed,
+            "leaving the baseline is still foreign evidence"
+        );
+
+        // The Unix spelling reads the same on a Windows host.
+        let unix = "/sessions/replayed";
+        assert_eq!(recorded_workdir("./api/..", Some(unix)), unix);
+        let (scope, _) = effective_window_scope(&explicit(&[".", "api"]), Some(unix));
+        assert_eq!(scope, WindowScope::Baseline);
+
+        // In a Unix spelling `\` is a filename character, not a separator.
+        assert_eq!(
+            recorded_workdir(r"odd\name", Some(unix)),
+            r"/sessions/replayed/odd\name"
+        );
+        // A drive-relative token is not absolute anywhere.
+        assert!(!absolute_anywhere("C:repo"));
     }
 
     /// Finding: the fail-closed threshold for an over-cap record counted raw
