@@ -547,6 +547,58 @@ fn plausibly_within_scope(candidate: &str, scope_root: &str) -> bool {
     }
 }
 
+/// The directory whose `.gitmodules` declares the submodules around `scope`.
+///
+/// `.gitmodules` lives at the CHECKOUT root and spells its paths relative to
+/// it, while a scope is only a working directory — frequently a subdirectory.
+/// Reading it where the session happened to stand would miss every
+/// declaration and silently absorb the submodule into its parent.
+/// `discover_git_root` walks ancestors without canonicalizing, so the root it
+/// returns stays comparable with a candidate spelled the same way.
+fn submodule_declarations_root(scope: &Path) -> PathBuf {
+    discover_git_root(scope).unwrap_or_else(|| scope.to_path_buf())
+}
+
+/// Everything the scope verdicts in this module read from THIS host's
+/// filesystem about one recorded path, as bytes for a cache key.
+///
+/// A verdict is a pure function of the recorded evidence plus two reads: how
+/// the path resolves ([`normalize_workdir`]: does it exist, which `.git`
+/// ancestor is nearest) and which submodules its checkout declares
+/// ([`declared_submodule`] reads `.gitmodules` at that checkout root). A cache
+/// keyed on source bytes alone therefore serves stale verdicts after a nested
+/// checkout appears or a `.gitmodules` is edited, although no source byte
+/// moved. Hashing this for every path a session recorded makes the layout
+/// part of the cache identity. It lives beside the reads it mirrors, so a
+/// verdict that starts reading something new has one place to declare it.
+pub fn scope_layout_evidence(path: &str) -> Vec<u8> {
+    let mut evidence = Vec::new();
+    match normalize_workdir(path, None) {
+        WorkdirIdentity::Resolved(root) => {
+            evidence.extend_from_slice(b"resolved\0");
+            evidence.extend_from_slice(root.to_string_lossy().as_bytes());
+        }
+        WorkdirIdentity::Unresolved(candidate) => {
+            evidence.extend_from_slice(b"unresolved\0");
+            evidence.extend_from_slice(candidate.as_bytes());
+        }
+    }
+    evidence.push(0);
+    // Only a path spelled for this host has a `.gitmodules` to read, which is
+    // exactly the gate `declared_submodule` applies.
+    if let Some(scope) = host_path(trim_path(path)) {
+        match std::fs::read(submodule_declarations_root(scope).join(".gitmodules")) {
+            Ok(body) => {
+                evidence.extend_from_slice(b"gitmodules\0");
+                evidence.extend_from_slice(&(body.len() as u64).to_le_bytes());
+                evidence.extend_from_slice(&body);
+            }
+            Err(_) => evidence.extend_from_slice(b"no-gitmodules\0"),
+        }
+    }
+    evidence
+}
+
 /// Is `path` a submodule the checkout at `scope_root` declares?
 ///
 /// Bounded and offline: one `.gitmodules` read, no subprocess, no network. A
@@ -561,13 +613,7 @@ fn declared_submodule(scope_root: &str, path: &str) -> bool {
         // host; reading one relative to the process cwd would be a guess.
         return false;
     };
-    // `.gitmodules` lives at the CHECKOUT root and spells its paths relative to
-    // it, while the scope root is only a working directory — frequently a
-    // subdirectory. Reading it where the session happened to stand would miss
-    // every declaration and silently absorb the submodule into its parent.
-    // `discover_git_root` walks ancestors without canonicalizing, so the root
-    // it returns stays comparable with the candidate.
-    let root = discover_git_root(scope).unwrap_or_else(|| scope.to_path_buf());
+    let root = submodule_declarations_root(scope);
     let Ok(raw) = std::fs::read_to_string(root.join(".gitmodules")) else {
         return false;
     };
@@ -1317,6 +1363,57 @@ mod tests {
         let (scope, _) =
             effective_window_scope(&explicit(&[&sibling.to_string_lossy()]), Some(&base));
         assert_eq!(scope, WindowScope::Baseline);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Finding (P1-01/02): the index cache keyed verdicts on source bytes, so
+    /// a nested checkout appearing or a `.gitmodules` edit left stale verdicts
+    /// servable. The layout evidence of a recorded path must move whenever a
+    /// verdict about it can — including when the path is only a subdirectory
+    /// of the checkout that declares the submodule — and must hold still when
+    /// nothing the verdicts read has changed.
+    #[test]
+    fn layout_evidence_moves_exactly_when_a_verdict_can() {
+        let root = scratch("layout-evidence");
+        let parent = root.join("vista");
+        let app = parent.join("app");
+        let nested = app.join("tools").join("fleet-bus");
+        std::fs::create_dir_all(parent.join(".git")).expect("parent git dir");
+        std::fs::create_dir_all(nested.join("src")).expect("nested dir");
+        let base = app.to_string_lossy().into_owned();
+        let inside = nested.join("src").to_string_lossy().into_owned();
+        let vanished = app
+            .join("vendor")
+            .join("fleet")
+            .to_string_lossy()
+            .into_owned();
+        let verdict = |workdir: &str| effective_window_scope(&explicit(&[workdir]), Some(&base)).0;
+
+        let before = (scope_layout_evidence(&base), scope_layout_evidence(&inside));
+        assert_eq!(
+            (scope_layout_evidence(&base), scope_layout_evidence(&inside)),
+            before,
+            "nothing moved, so neither may the evidence"
+        );
+        assert_eq!(verdict(&inside), WindowScope::Baseline);
+        assert_eq!(verdict(&vanished), WindowScope::Baseline);
+
+        std::fs::create_dir_all(nested.join(".git")).expect("nested git dir");
+        assert_eq!(verdict(&inside), WindowScope::Consistent);
+        assert_ne!(scope_layout_evidence(&inside), before.1);
+        assert_eq!(
+            scope_layout_evidence(&base),
+            before.0,
+            "the baseline's own layout did not move"
+        );
+
+        std::fs::write(
+            parent.join(".gitmodules"),
+            "[submodule \"fleet\"]\n\tpath = app/vendor/fleet\n",
+        )
+        .expect("write .gitmodules");
+        assert_eq!(verdict(&vanished), WindowScope::Unattributed);
+        assert_ne!(scope_layout_evidence(&base), before.0);
         let _ = std::fs::remove_dir_all(&root);
     }
 

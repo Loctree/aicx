@@ -99,10 +99,16 @@ recorded cwd is a fact and stays one; the resolved repo root now rides
 bucket read it and fall back to the recorded `cwd`.
 
 The verdicts derived from that resolution are cached, so the cache now knows
-what they depended on. A cached extract is reused only when the repository
-layout still matches the one its verdicts were computed against — a nested
-checkout created or removed, or a `.gitmodules` edited, forces a reparse even
-though the source bytes and the catalog row are untouched.
+what they depended on. The parse ledger records, per session, every working
+directory the source wrote down — each turn's cwd and each tool-call
+workdir, taken before any scope reduction, so a workdir absorbed into its
+parent still counts — together with how each resolves on this host and the
+`.gitmodules` of the checkout it sits in. `aicx index` answers `unchanged`
+only while that recorded layout still holds, and reuses a cached extract only
+under the same condition: a nested checkout created or removed, or a
+`.gitmodules` edited, reparses the affected sessions even though their source
+bytes and catalog rows are untouched. A missing ledger proves no layout and
+never short-circuits.
 
 #### Absence is not an answer
 

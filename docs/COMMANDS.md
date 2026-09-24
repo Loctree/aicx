@@ -292,10 +292,12 @@ Where a frame's scope came from is recorded in two places for two reasons. The
 cwd the rollout wrote down is a fact and is never overwritten; this host's
 resolution of it into a repository root is kept separately, because resolution
 depends on which checkouts exist here and must not change the session's
-canonical fingerprint. Cached extracts are reused only while that repository
-layout still holds: create or remove a nested checkout, or edit `.gitmodules`,
-and the affected sessions are reparsed even though their source bytes and
-catalog rows are unchanged.
+canonical fingerprint. `aicx index` reports `unchanged`, and reuses cached
+extracts, only while that repository layout still holds for every working
+directory a session recorded — turn cwds and tool-call workdirs alike, including
+one its parent checkout absorbed: create or remove a nested checkout, or edit
+`.gitmodules`, and the affected sessions are reparsed even though their source
+bytes and catalog rows are unchanged.
 
 **What this removes, and what it does not re-home.** Foreign frames are
 removed from the parent project's answer; they are *not* re-filed under the

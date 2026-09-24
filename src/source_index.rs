@@ -6,7 +6,7 @@
 //! directly. It never reads or writes per-frame store cards or embedding
 //! NDJSON intermediates.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
@@ -20,7 +20,7 @@ use sha2::{Digest, Sha256};
 
 use aicx_parser::engine::scope_evidence::{
     WindowScope, WorkdirEvidence, effective_window_scope, normalize_workdir, recorded_workdir,
-    tool_call_workdirs,
+    scope_layout_evidence, tool_call_workdirs,
 };
 
 use crate::catalog::CatalogEntry;
@@ -207,7 +207,7 @@ struct SessionParseRecord {
     #[serde(default)]
     session_kind: Option<String>,
     /// Identity of the FILESYSTEM the scope verdicts above were computed
-    /// against (see [`scope_environment_fingerprint`]).
+    /// against (see [`ScopeLayoutProbe::fingerprint`]).
     ///
     /// Those verdicts resolve repository identity on this host, so they can
     /// go stale while the source bytes and the catalog row stay byte-identical
@@ -215,80 +215,80 @@ struct SessionParseRecord {
     /// ledgers deserialize to empty, which never matches and so never reuses.
     #[serde(default)]
     scope_environment: String,
-    /// Distinct cwds observed in this session's frames, which is what the
-    /// fingerprint above is recomputed from at reuse time.
+    /// Every working directory the source RECORDED — each span's cwd as
+    /// written and each turn window's tool workdirs — collected at the parse,
+    /// before the signal filter, `.aicxignore` and scope reduction. The
+    /// fingerprint above is recomputed from these. A reduced list (the scope
+    /// report's cwds) forgets precisely the paths that matter: a workdir its
+    /// baseline absorbed leaves no cwd behind, so a checkout later created
+    /// there never moved the fingerprint. Local ledger state beside the
+    /// `.aicxignore` that already names any hidden path; never published.
     #[serde(default)]
-    scope_cwds: Vec<String>,
+    scope_paths: Vec<String>,
 }
 
-/// Identity of the repository layout that a session's scope verdicts depend on.
+/// Memoized repository-layout identity for one index build.
 ///
-/// Scope resolution reads the local filesystem: which `.git` ancestor a path
-/// has, how symlinks resolve, what `.gitmodules` declares. The reuse gate
-/// otherwise keys only on source bytes and catalog fields, so creating or
-/// removing a nested checkout — or editing `.gitmodules` — left a cached
-/// extract servable under verdicts the current filesystem no longer supports.
-///
-/// Deliberately bounded to what can be recomputed without re-parsing the
-/// source: the baseline's repo root, the submodule declarations at that root,
-/// and how each recorded frame cwd resolves today. A change the parser would
-/// see but this cannot is a re-parse away in any case, because it takes a
-/// source change to produce one.
-fn scope_environment_fingerprint(baseline: Option<&str>, scope_cwds: &[String]) -> String {
-    use aicx_parser::engine::{WorkdirIdentity, normalize_workdir};
+/// Scope verdicts read this host's filesystem — which `.git` ancestor a path
+/// has, what `.gitmodules` declares — so a cache keyed on source bytes and
+/// catalog fields alone serves verdicts the layout no longer supports.
+/// [`scope_layout_evidence`] names what the verdicts read for one path; this
+/// hashes it for every path a session recorded. Thousands of sessions share
+/// a handful of working directories, and each lookup walks ancestors on disk,
+/// so one build probes each path once. A build is one snapshot: create a
+/// fresh probe per build, never keep one across builds.
+#[derive(Default)]
+struct ScopeLayoutProbe {
+    seen: HashMap<String, String>,
+}
 
-    /// How one path resolves today, as bytes, plus the repo root when it has
-    /// one.
-    fn resolution(value: &str) -> (Vec<u8>, Option<std::path::PathBuf>) {
-        match normalize_workdir(value, None) {
-            WorkdirIdentity::Resolved(root) => {
-                let mut bytes = b"resolved\0".to_vec();
-                bytes.extend_from_slice(root.to_string_lossy().as_bytes());
-                bytes.push(0);
-                (bytes, Some(root))
-            }
-            WorkdirIdentity::Unresolved(path) => {
-                let mut bytes = b"unresolved\0".to_vec();
-                bytes.extend_from_slice(path.as_bytes());
-                bytes.push(0);
-                (bytes, None)
-            }
+impl ScopeLayoutProbe {
+    fn layout(&mut self, path: &str) -> &str {
+        self.seen
+            .entry(path.to_owned())
+            .or_insert_with(|| hex::encode(Sha256::digest(scope_layout_evidence(path))))
+            .as_str()
+    }
+
+    /// Layout identity of one session: its catalog baseline plus every path
+    /// it recorded, each with what the verdicts read about it today.
+    fn fingerprint(&mut self, baseline: Option<&str>, scope_paths: &[String]) -> String {
+        let mut paths: Vec<&str> = baseline
+            .into_iter()
+            .chain(scope_paths.iter().map(String::as_str))
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+            .collect();
+        paths.sort_unstable();
+        paths.dedup();
+        let mut hasher = Sha256::new();
+        hasher.update(b"aicx.scope_environment.v2\0");
+        for path in paths {
+            hasher.update(b"path\0");
+            hasher.update(path.as_bytes());
+            hasher.update([0]);
+            hasher.update(self.layout(path).as_bytes());
+            hasher.update([0]);
         }
+        hex::encode(hasher.finalize())
     }
 
-    let mut hasher = Sha256::new();
-    hasher.update(b"aicx.scope_environment.v1\0");
-
-    match baseline.map(str::trim).filter(|value| !value.is_empty()) {
-        Some(base) => {
-            let (bytes, root) = resolution(base);
-            hasher.update(&bytes);
-            if let Some(root) = root {
-                // Submodule declarations decide whether a vanished path is a
-                // repository of its own, so their content is part of the
-                // environment, not merely their presence.
-                match fs::read(root.join(".gitmodules")) {
-                    Ok(body) => {
-                        hasher.update(b"gitmodules\0");
-                        hasher.update(sha256_hex(&body).as_bytes());
-                    }
-                    Err(_) => hasher.update(b"no-gitmodules\0"),
-                }
-            }
-        }
-        None => hasher.update(b"no-baseline\0"),
+    /// Do the scope verdicts CURRENT was published with still hold here?
+    ///
+    /// The generation fingerprint covers source bytes, the catalog and the
+    /// privacy rules, not the layout the verdicts read, so on its own it
+    /// served `unchanged` across a nested checkout appearing or a
+    /// `.gitmodules` edit and never reached the per-session reuse gate. The
+    /// ledger is written only beside a successful publish, so it describes
+    /// the layout CURRENT was built against. An empty ledger proves nothing,
+    /// and so is not current.
+    fn ledger_is_current(&mut self, ledger: &SourceParseState) -> bool {
+        !ledger.sessions.is_empty()
+            && ledger.sessions.values().all(|record| {
+                record.scope_environment
+                    == self.fingerprint(record.cwd.as_deref(), &record.scope_paths)
+            })
     }
-
-    let mut cwds: Vec<&str> = scope_cwds.iter().map(String::as_str).collect();
-    cwds.sort_unstable();
-    cwds.dedup();
-    for cwd in cwds {
-        hasher.update(b"cwd\0");
-        hasher.update(cwd.as_bytes());
-        hasher.update([0]);
-        hasher.update(&resolution(cwd).0);
-    }
-    hex::encode(hasher.finalize())
 }
 
 /// Build or preview the global lexical index from the durable catalog.
@@ -385,11 +385,23 @@ pub fn build_with_reporter(
     // `--semantic` refuses the lexical-only short-circuit when dense is absent
     // so operators can attach dense to an otherwise current corpus without
     // `--full-rescan`.
+    //
+    // Scope verdicts also read the repository layout on this host, which the
+    // digest cannot see; the ledger records it per session, so a layout
+    // change refuses the short-circuit and lets the reuse gate below re-parse
+    // exactly the sessions whose verdicts it could move.
+    let prior_state = if full_rescan {
+        SourceParseState::default()
+    } else {
+        load_parse_state(aicx_home, &repo_path_ignore_fingerprint)
+    };
+    let mut layout = ScopeLayoutProbe::default();
     let dense_missing = crate::vector_index::current_dense_not_built().unwrap_or(true);
     if !full_rescan
         && project_filters.is_empty()
         && crate::vector_index::source_lexical_generation_matches(&source_fingerprint)?
         && !(semantic && dense_missing)
+        && layout.ledger_is_current(&prior_state)
     {
         let (dense_kind, dense_docs) = current_dense_stats();
         return Ok(SourceIndexReport {
@@ -433,12 +445,6 @@ pub fn build_with_reporter(
         sessions: BTreeMap::new(),
     };
 
-    let prior_state = if full_rescan {
-        SourceParseState::default()
-    } else {
-        load_parse_state(aicx_home, &repo_path_ignore_fingerprint)
-    };
-
     let parse_phase = Phase::start(reporter.clone(), "index_parse", Some(selected.len() as u64));
     let parse_hb = Heartbeat::spawn_with_backoff(
         parse_phase.clone(),
@@ -459,6 +465,7 @@ pub fn build_with_reporter(
             &session_key,
             &source_allow,
             &repo_path_ignore_fingerprint,
+            &mut layout,
         ) {
             let record = prior_state
                 .sessions
@@ -505,6 +512,7 @@ pub fn build_with_reporter(
         let ParsedCatalogSource {
             mut frames,
             distill,
+            recorded_workdirs,
         } = parsed_source;
         sources_parsed += 1;
         let raw_count = frames.len();
@@ -560,7 +568,6 @@ pub fn build_with_reporter(
         // catalog row's project.
         let session_mixed = scope.scope_foreign_to(entry.cwd.as_deref());
         let session_unattributed = frames.iter().any(|frame| frame.scope_unattributed);
-        let scope_cwds: Vec<String> = scope.cwds.to_vec();
         // Frames carry the provenance resolved at the source, which is the
         // only lane that can see it for a catalog row cataloged before the
         // column existed.
@@ -624,8 +631,8 @@ pub fn build_with_reporter(
                 scope_conflict: session_mixed,
                 scope_unattributed: session_unattributed,
                 session_kind: resolved_kind.clone(),
-                scope_environment: scope_environment_fingerprint(entry.cwd.as_deref(), &scope_cwds),
-                scope_cwds,
+                scope_environment: layout.fingerprint(entry.cwd.as_deref(), &recorded_workdirs),
+                scope_paths: recorded_workdirs,
             },
         );
     }
@@ -976,6 +983,7 @@ fn read_session_document(aicx_home: &Path, entry: &CatalogEntry) -> Result<Sessi
         &session_key,
         &source_allow,
         &repo_path_ignore_fingerprint,
+        &mut ScopeLayoutProbe::default(),
     ) {
         return Ok(SessionDocument {
             body: chunk.text,
@@ -1090,6 +1098,24 @@ fn merge_context_spans(
 struct ParsedCatalogSource {
     frames: Vec<TimelineEntry>,
     distill: Option<crate::extraction::distill::materialize::IndexDistillate>,
+    /// Every working directory the source recorded, sorted and distinct:
+    /// what the index ledger fingerprints the repository layout from. Taken
+    /// at the source, because frames alone lose it — a re-scoped window's
+    /// frames carry the resolved checkout, not the cwd the turn recorded.
+    recorded_workdirs: Vec<String>,
+}
+
+/// Every working directory a parsed session RECORDED: each span's cwd as
+/// written and each turn window's tool workdirs, whatever the verdict.
+fn model_recorded_workdirs(model: &aicx_parser::engine::SessionModel) -> Vec<String> {
+    let mut paths = BTreeSet::new();
+    for segment in &model.segments {
+        if let aicx_parser::engine::Known::Value(cwd) = &segment.cwd {
+            paths.insert(cwd.clone());
+        }
+        paths.extend(segment.scope_workdirs.iter().cloned());
+    }
+    paths.into_iter().collect()
 }
 
 fn parse_catalog_source(
@@ -1119,6 +1145,7 @@ fn parse_catalog_source(
             return Ok(ParsedCatalogSource {
                 frames: Vec::new(),
                 distill: None,
+                recorded_workdirs: Vec::new(),
             });
         }
         let timestamp = fs::metadata(&path)
@@ -1128,6 +1155,7 @@ fn parse_catalog_source(
             .unwrap_or_else(chrono::Utc::now);
         return Ok(ParsedCatalogSource {
             distill: None,
+            recorded_workdirs: entry.cwd.iter().cloned().collect(),
             frames: vec![TimelineEntry {
                 timestamp,
                 agent: entry.agent.clone(),
@@ -1155,10 +1183,7 @@ fn parse_catalog_source(
         .with_context(|| format!("stat source {}", path.display()))?
         .len();
     if entry.agent == "codex" && source_bytes > MAX_FULL_PARSE_BYTES {
-        return Ok(ParsedCatalogSource {
-            frames: parse_large_codex_signal(entry, &path, allow, session_kind.as_deref())?,
-            distill: None,
-        });
+        return parse_large_codex_signal(entry, &path, allow, session_kind.as_deref());
     }
     if source_bytes > MAX_FULL_PARSE_BYTES {
         anyhow::bail!(
@@ -1192,7 +1217,11 @@ fn parse_catalog_source(
     for frame in &mut frames {
         frame.session_kind = session_kind.clone();
     }
-    Ok(ParsedCatalogSource { frames, distill })
+    Ok(ParsedCatalogSource {
+        frames,
+        distill,
+        recorded_workdirs: model_recorded_workdirs(parsed.model()),
+    })
 }
 
 /// Read one cataloged session through the same allowlisted, signal-only parser
@@ -1330,7 +1359,7 @@ fn parse_large_codex_signal(
     path: &Path,
     allow: &crate::source_path::SourceAllowlist,
     session_kind: Option<&str>,
-) -> Result<Vec<TimelineEntry>> {
+) -> Result<ParsedCatalogSource> {
     // `path` is already resolve_file'd by the caller; open through the allowlist.
     let file = allow
         .open_file(path)
@@ -1344,6 +1373,7 @@ fn parse_large_codex_signal(
     let mut baseline_cwd = entry.cwd.clone();
     let mut window_frames: Vec<TimelineEntry> = Vec::new();
     let mut window_workdirs: Vec<WorkdirEvidence> = Vec::new();
+    let mut recorded_workdirs = BTreeSet::new();
     while let Some(record) = crate::sanitize::read_line_capped(&mut reader, MAX_JSONL_RECORD_BYTES)?
     {
         line_no += 1;
@@ -1372,6 +1402,7 @@ fn parse_large_codex_signal(
                 &mut window_workdirs,
                 baseline_cwd.as_deref(),
                 &mut frames,
+                &mut recorded_workdirs,
             );
             if let Some(cwd) = value
                 .get("payload")
@@ -1469,8 +1500,13 @@ fn parse_large_codex_signal(
         &mut window_workdirs,
         baseline_cwd.as_deref(),
         &mut frames,
+        &mut recorded_workdirs,
     );
-    Ok(frames)
+    Ok(ParsedCatalogSource {
+        frames,
+        distill: None,
+        recorded_workdirs: recorded_workdirs.into_iter().collect(),
+    })
 }
 
 /// Codex tool-call payload types that can carry an explicit `workdir`.
@@ -1492,11 +1528,16 @@ fn is_tool_call_payload_type(payload_type: Option<&str>) -> bool {
 /// durable do-not-inherit mark on every frame of the window. Every frame also
 /// carries the window's recorded workdirs, whatever the verdict, so the
 /// `.aicxignore` filter judges each checkout the window touched.
+///
+/// `session_workdirs` collects the baseline and recorded workdirs of every
+/// window that produced frames: the paths whose layout its verdict read,
+/// which a re-scoped frame's resolved cwd no longer spells.
 fn flush_scope_window(
     window_frames: &mut Vec<TimelineEntry>,
     window_workdirs: &mut Vec<WorkdirEvidence>,
     baseline: Option<&str>,
     frames: &mut Vec<TimelineEntry>,
+    session_workdirs: &mut BTreeSet<String>,
 ) {
     if !window_frames.is_empty() {
         let recorded: Vec<String> = window_workdirs
@@ -1509,6 +1550,8 @@ fn flush_scope_window(
                 }
                 acc
             });
+        session_workdirs.extend(baseline.map(str::to_owned));
+        session_workdirs.extend(recorded.iter().cloned());
         for frame in window_frames.iter_mut() {
             frame.scope_workdirs.clone_from(&recorded);
         }
@@ -1777,6 +1820,7 @@ fn try_reuse_cached_extract(
     session_key: &str,
     source_allow: &crate::source_path::SourceAllowlist,
     repo_path_ignore_fingerprint: &str,
+    layout: &mut ScopeLayoutProbe,
 ) -> Option<aicx_retrieve::ChunkRef> {
     if prior.signal_filter_version != SIGNAL_FILTER_VERSION
         || prior.repo_path_ignore_fingerprint != repo_path_ignore_fingerprint
@@ -1797,9 +1841,7 @@ fn try_reuse_cached_extract(
     }
     // The verdicts also depend on the repository layout on this host, which
     // can change without the source or the catalog row changing at all.
-    if record.scope_environment
-        != scope_environment_fingerprint(entry.cwd.as_deref(), &record.scope_cwds)
-    {
+    if record.scope_environment != layout.fingerprint(entry.cwd.as_deref(), &record.scope_paths) {
         return None;
     }
     // Zeroed legacy records (pre-fingerprint schema) never reuse.
@@ -2101,7 +2143,9 @@ mod tests {
         };
         let allow = crate::source_path::SourceAllowlist::from_roots([root.clone()]);
 
-        let frames = parse_large_codex_signal(&entry, &source_path, &allow, None).unwrap();
+        let frames = parse_large_codex_signal(&entry, &source_path, &allow, None)
+            .unwrap()
+            .frames;
         assert_eq!(frames.len(), 2);
         assert_eq!(frames[0].cwd.as_deref(), Some("/repo/public"));
         assert_eq!(frames[1].cwd.as_deref(), Some("/repo/private"));
@@ -2263,7 +2307,9 @@ mod tests {
         let full = parse_catalog_source(&entry, &source_path, &allow)
             .unwrap()
             .frames;
-        let bounded = parse_large_codex_signal(&entry, &source_path, &allow, None).unwrap();
+        let bounded = parse_large_codex_signal(&entry, &source_path, &allow, None)
+            .unwrap()
+            .frames;
         for (label, mut frames) in [("full", full), ("bounded", bounded)] {
             assert!(
                 frames
@@ -2361,17 +2407,25 @@ mod tests {
                 scope_conflict: false,
                 scope_unattributed: false,
                 session_kind: None,
-                scope_environment: scope_environment_fingerprint(entry.cwd.as_deref(), &[]),
-                scope_cwds: Vec::new(),
+                scope_environment: ScopeLayoutProbe::default()
+                    .fingerprint(entry.cwd.as_deref(), &[]),
+                scope_paths: Vec::new(),
             },
         );
 
         let key = session_state_key("claude", "session");
         // Allowlist roots: treat test root as both HOME and aicx_home.
         let allow = crate::source_path::SourceAllowlist::for_operator(&root, &root);
-        let reused =
-            try_reuse_cached_extract(&root, &entry, &prior, &key, &allow, "ignore-fingerprint")
-                .expect("matching source fingerprint+hash must reuse");
+        let reused = try_reuse_cached_extract(
+            &root,
+            &entry,
+            &prior,
+            &key,
+            &allow,
+            "ignore-fingerprint",
+            &mut ScopeLayoutProbe::default(),
+        )
+        .expect("matching source fingerprint+hash must reuse");
         assert!(reused.text.contains("arrows vc-frame"));
         assert_eq!(reused.id, "claude:session");
 
@@ -2382,8 +2436,16 @@ mod tests {
         let mut rescoped = entry.clone();
         rescoped.cwd = Some("/repos/fleet-bus".to_string());
         assert!(
-            try_reuse_cached_extract(&root, &rescoped, &prior, &key, &allow, "ignore-fingerprint")
-                .is_none(),
+            try_reuse_cached_extract(
+                &root,
+                &rescoped,
+                &prior,
+                &key,
+                &allow,
+                "ignore-fingerprint",
+                &mut ScopeLayoutProbe::default()
+            )
+            .is_none(),
             "a moved catalog cwd must force a reparse, not reuse stale scope flags"
         );
 
@@ -2403,7 +2465,8 @@ mod tests {
                 &stale_layout,
                 &key,
                 &allow,
-                "ignore-fingerprint"
+                "ignore-fingerprint",
+                &mut ScopeLayoutProbe::default(),
             )
             .is_none(),
             "a cached extract whose layout identity no longer matches must reparse"
@@ -2413,8 +2476,16 @@ mod tests {
         let mut drifted = entry.clone();
         drifted.source_path = "/elsewhere/session.jsonl".to_string();
         assert!(
-            try_reuse_cached_extract(&root, &drifted, &prior, &key, &allow, "ignore-fingerprint")
-                .is_none()
+            try_reuse_cached_extract(
+                &root,
+                &drifted,
+                &prior,
+                &key,
+                &allow,
+                "ignore-fingerprint",
+                &mut ScopeLayoutProbe::default()
+            )
+            .is_none()
         );
 
         // Catalog-only size drift must NOT invalidate when live file is unchanged
@@ -2428,7 +2499,8 @@ mod tests {
                 &prior,
                 &key,
                 &allow,
-                "ignore-fingerprint"
+                "ignore-fingerprint",
+                &mut ScopeLayoutProbe::default(),
             )
             .is_some(),
             "stale catalog size alone must not force reparse when live matches"
@@ -2442,8 +2514,16 @@ mod tests {
         .unwrap();
         // Coarse FS mtime: touch content size always changes here.
         assert!(
-            try_reuse_cached_extract(&root, &entry, &prior, &key, &allow, "ignore-fingerprint")
-                .is_none(),
+            try_reuse_cached_extract(
+                &root,
+                &entry,
+                &prior,
+                &key,
+                &allow,
+                "ignore-fingerprint",
+                &mut ScopeLayoutProbe::default()
+            )
+            .is_none(),
             "live append must invalidate reuse"
         );
         // Restore live bytes so later checks use the original fingerprint.
@@ -2457,8 +2537,16 @@ mod tests {
         // Zeroed legacy records never reuse (forces reparse after upgrade).
         prior.sessions.get_mut(&key).unwrap().source_len = 0;
         assert!(
-            try_reuse_cached_extract(&root, &entry, &prior, &key, &allow, "ignore-fingerprint")
-                .is_none()
+            try_reuse_cached_extract(
+                &root,
+                &entry,
+                &prior,
+                &key,
+                &allow,
+                "ignore-fingerprint",
+                &mut ScopeLayoutProbe::default()
+            )
+            .is_none()
         );
         prior.sessions.get_mut(&key).unwrap().source_len = restored_len;
 
@@ -2469,7 +2557,8 @@ mod tests {
                 &prior,
                 &key,
                 &allow,
-                "changed-ignore-fingerprint"
+                "changed-ignore-fingerprint",
+                &mut ScopeLayoutProbe::default(),
             )
             .is_none(),
             "deny-list drift must invalidate cached extracts"
@@ -2478,8 +2567,16 @@ mod tests {
         // Corrupt extract bytes invalidate reuse.
         fs::write(&extract_path, "tampered").unwrap();
         assert!(
-            try_reuse_cached_extract(&root, &entry, &prior, &key, &allow, "ignore-fingerprint")
-                .is_none()
+            try_reuse_cached_extract(
+                &root,
+                &entry,
+                &prior,
+                &key,
+                &allow,
+                "ignore-fingerprint",
+                &mut ScopeLayoutProbe::default()
+            )
+            .is_none()
         );
 
         let _ = fs::remove_dir_all(&root);
@@ -2539,8 +2636,9 @@ mod tests {
         };
         let allow = crate::source_path::SourceAllowlist::for_operator(&root, &root);
         let resolved = allow.resolve_file(&source_path).expect("resolve rollout");
-        let frames =
-            parse_large_codex_signal(&entry, &resolved, &allow, None).expect("bounded parse");
+        let frames = parse_large_codex_signal(&entry, &resolved, &allow, None)
+            .expect("bounded parse")
+            .frames;
 
         assert_eq!(frames.len(), 3, "{frames:?}");
         assert_eq!(frames[0].message, "vista opening");
@@ -2683,8 +2781,9 @@ mod tests {
         let entry = bounded_entry(&source_path);
         let allow = crate::source_path::SourceAllowlist::for_operator(&root, &root);
         let resolved = allow.resolve_file(&source_path).expect("resolve rollout");
-        let frames =
-            parse_large_codex_signal(&entry, &resolved, &allow, None).expect("bounded parse");
+        let frames = parse_large_codex_signal(&entry, &resolved, &allow, None)
+            .expect("bounded parse")
+            .frames;
 
         assert_eq!(frames.len(), 1, "{frames:?}");
         assert_eq!(frames[0].message, "biore fleet task");
@@ -2721,8 +2820,9 @@ mod tests {
             let entry = bounded_entry(&source_path);
             let allow = crate::source_path::SourceAllowlist::for_operator(&root, &root);
             let resolved = allow.resolve_file(&source_path).expect("resolve rollout");
-            let frames =
-                parse_large_codex_signal(&entry, &resolved, &allow, None).expect("bounded parse");
+            let frames = parse_large_codex_signal(&entry, &resolved, &allow, None)
+                .expect("bounded parse")
+                .frames;
             let _ = fs::remove_dir_all(&root);
             frames
         };
@@ -2782,67 +2882,102 @@ mod tests {
             "an over-cap record this reader could not classify is not proof of the baseline"
         );
     }
-    /// Finding: the scope verdicts stored in the parse ledger are resolved
-    /// against the local filesystem, but the reuse gate keyed only on source
-    /// bytes and catalog fields. Creating or removing a nested checkout, or
-    /// editing `.gitmodules`, therefore left a cached extract servable under
-    /// verdicts the current layout no longer supports.
+    /// Finding (P1-01/02): the scope verdicts stored in the parse ledger are
+    /// resolved against the local filesystem, but the ledger fingerprinted
+    /// the scope report's cwds — AFTER reduction — and the generation
+    /// short-circuit never consulted it at all. A tool workdir its baseline
+    /// absorbed left no cwd behind, so a checkout later created there moved
+    /// nothing; a `.gitmodules` edit moved nothing once CURRENT matched.
     #[test]
     fn the_repository_layout_is_part_of_a_cached_extracts_identity() {
-        let root = std::env::temp_dir().join(format!(
-            "aicx-scope-env-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = fs::remove_dir_all(&root);
+        let root = bounded_scope_root("layout");
         let parent = root.join("vista");
         let nested = parent.join("vendor").join("fleet-bus");
         fs::create_dir_all(parent.join(".git")).unwrap();
         fs::create_dir_all(&nested).unwrap();
-
         let baseline = parent.to_string_lossy().into_owned();
-        let cwds = vec![nested.to_string_lossy().into_owned()];
-        let before = scope_environment_fingerprint(Some(&baseline), &cwds);
+        let source_path = root
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("rollout.jsonl");
+        fs::create_dir_all(source_path.parent().unwrap()).unwrap();
+        let template = r#"{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"s1","cwd":"@VISTA@"}}
+{"timestamp":"2026-01-01T00:01:00Z","type":"turn_context","payload":{"cwd":"@VISTA@"}}
+{"timestamp":"2026-01-01T00:01:05Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"vendored fix"}]}}
+{"timestamp":"2026-01-01T00:01:10Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"c1","input":"const r = await tools.exec_command({cmd:\"ls\",\"workdir\":\"@NESTED@\"});"}}
+"#;
+        let body = template
+            .replace("@VISTA@", &json_path(&parent))
+            .replace("@NESTED@", &json_path(&nested));
+        fs::write(&source_path, body).unwrap();
+        let mut entry = bounded_entry(&source_path);
+        entry.cwd = Some(baseline.clone());
+        let allow = crate::source_path::SourceAllowlist::for_operator(&root, &root);
+        let resolved = allow.resolve_file(&source_path).expect("resolve rollout");
+        let parsed =
+            parse_large_codex_signal(&entry, &resolved, &allow, None).expect("bounded parse");
 
-        // A nested checkout appears: that path is now a repository of its own
-        // and the frames under it stop belonging to the parent.
+        // The workdir sits inside the parent checkout, so the verdict absorbs
+        // it and no frame spells it — yet it is exactly the path whose layout
+        // decides that verdict.
+        assert_eq!(parsed.frames.len(), 1, "{:?}", parsed.frames);
+        assert_eq!(parsed.frames[0].cwd.as_deref(), Some(baseline.as_str()));
+        assert!(!parsed.frames[0].scope_conflict && !parsed.frames[0].scope_unattributed);
+        let nested_path = nested.to_string_lossy().into_owned();
+        assert!(
+            parsed.recorded_workdirs.contains(&nested_path),
+            "the absorbed workdir must survive into the ledger: {:?}",
+            parsed.recorded_workdirs
+        );
+
+        let current =
+            |ledger: &SourceParseState| ScopeLayoutProbe::default().ledger_is_current(ledger);
+        let mut ledger = SourceParseState::default();
+        assert!(!current(&ledger), "an empty ledger proves no layout");
+        ledger.sessions.insert(
+            session_state_key("codex", "s1"),
+            SessionParseRecord {
+                source_path: entry.source_path.clone(),
+                source_len: 1,
+                source_mtime_ns: 1,
+                extract_relpath: "extracts/codex/s1.md".to_string(),
+                extract_sha256: String::new(),
+                raw_frames: 1,
+                signal_frames: 1,
+                filtered_frames: 0,
+                project: entry.project.clone(),
+                date: entry.date.clone(),
+                cwd: entry.cwd.clone(),
+                scope_conflict: false,
+                scope_unattributed: false,
+                session_kind: None,
+                scope_environment: ScopeLayoutProbe::default()
+                    .fingerprint(entry.cwd.as_deref(), &parsed.recorded_workdirs),
+                scope_paths: parsed.recorded_workdirs.clone(),
+            },
+        );
+        assert!(current(&ledger), "an untouched layout is current");
+
+        // A nested checkout appears under the absorbed workdir: that path is
+        // now a repository of its own and the frame stops belonging to the
+        // parent, with no source byte moved.
         fs::create_dir_all(nested.join(".git")).unwrap();
-        let with_nested = scope_environment_fingerprint(Some(&baseline), &cwds);
-        assert_ne!(
-            before, with_nested,
-            "a new nested checkout changes what the stored verdicts mean"
+        assert!(
+            !current(&ledger),
+            "a new nested checkout must refuse the `unchanged` short-circuit"
         );
-
-        // And it disappears again.
         fs::remove_dir_all(nested.join(".git")).unwrap();
-        assert_eq!(
-            before,
-            scope_environment_fingerprint(Some(&baseline), &cwds),
-            "the same layout is the same identity"
-        );
+        assert!(current(&ledger), "the same layout is the same identity");
 
         // `.gitmodules` decides whether a vanished path is its own
-        // repository, so its CONTENT is part of the environment.
+        // repository, so its CONTENT is part of the layout.
         fs::write(
             parent.join(".gitmodules"),
             "[submodule \"fleet-bus\"]\n\tpath = vendor/fleet-bus\n",
         )
         .unwrap();
-        let declared = scope_environment_fingerprint(Some(&baseline), &cwds);
-        assert_ne!(before, declared, "a new submodule declaration is a change");
-        fs::write(
-            parent.join(".gitmodules"),
-            "[submodule \"other\"]\n\tpath = vendor/other\n",
-        )
-        .unwrap();
-        assert_ne!(
-            declared,
-            scope_environment_fingerprint(Some(&baseline), &cwds),
-            "and so is editing one"
-        );
+        assert!(!current(&ledger), "a submodule declaration is a change");
 
         let _ = fs::remove_dir_all(&root);
     }
