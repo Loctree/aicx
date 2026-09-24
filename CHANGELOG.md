@@ -22,7 +22,10 @@ Codex guardian/approval subagent sessions (`session_meta.source.subagent`) are
 classified as control-plane evidence: preserved in extract, index and
 conversations, never served as operator intents. The match is exact
 (`subagent:guardian`), and provenance is resolved from the rollout header when
-the catalog column is cold, so no catalog rebuild is a prerequisite.
+the catalog column is cold, so no catalog rebuild is a prerequisite. A
+guardian stays out of the mixed-scope telemetry too, so it cannot make
+`continuity` refuse, and the header probe reads as far as the catalog does
+(128 records, 256 KiB in total).
 
 Repository identity is canonical and existence-checked: a workdir that is not
 there resolves to nothing (an ancestor's `.git` says nothing about a directory
@@ -81,7 +84,9 @@ inheritance for frames that carry no cwd of their own, even when nothing
 visible remains to compare it against. `continuity` rebuilds that report from
 each session's conflicts and hidden-scope count, so a window whose every
 session is mixed only by a proven conflict or by a hidden checkout is refused
-like any other mixed window. The session-level `ScopeStatus` (served over MCP)
+like any other mixed window. It also refuses when the intents filters had
+already removed every frame of the mixed sessions: what decides is whether
+anything homogeneous is left, not whether the gate itself withheld something. The session-level `ScopeStatus` (served over MCP)
 counts each span's resolved `scope_root` next to its recorded cwd, so a
 session that worked in a second repository is `mixed_candidate`, not
 `no_drift_observed`; and `unattributed` now outranks `mixed_candidate` in the
@@ -124,8 +129,10 @@ covers a variable, an expression, and the shorthand `{cmd, workdir}`: each
 names a directory only the runtime knew. Such a call into another checkout no
 longer leaves its window on the baseline. `null` and `undefined` still ask for
 the default directory, and a `workdir:` in prose (not an object property)
-names nothing. Only the whole property name is read, so `networkdir` and
-`fallback_workdir` are other properties. A Windows `workdir` rooted without a
+names nothing. A literal is read only when it is the whole value:
+`"/repos/vista" + "-private"` is an expression, so the call is unreadable
+evidence rather than `/repos/vista`. Only the whole property name is read, so
+`networkdir` and `fallback_workdir` are other properties. A Windows `workdir` rooted without a
 drive (`\repo\pkg`) now sits on the drive of the turn's cwd and matches
 `C:\repo`, instead of matching nothing.
 
@@ -140,7 +147,12 @@ adapter in two places where they had drifted apart:
 A session also counts as mixed only when its cwds name more than one
 repository. Previously, more than one spelling was enough, so a session that
 moved from `/repo` into `/repo/pkg` read as mixed and its cwd-less frames were
-dropped from project results.
+dropped from project results. The count fails open the way the turn-window
+reduction does: a cwd that no longer exists (a deleted build directory, a
+removed worktree) is not a second repository while a checkout that plausibly
+contains it was observed, in whatever order the cwds were recorded. A
+submodule its parent still declares in `.gitmodules` keeps counting on its
+own.
 
 #### Host resolution is out of the deterministic parser model
 

@@ -230,8 +230,10 @@ selects the inter-agent lane by class (it rides the system lane, never
 `/fork` shares its origin's record prefix and `--lineage` says so instead
 of guessing. `aicx_session` (MCP) returns the tagged `conversation` ref, the
 session's `scope_status` and its compaction epoch count next to the
-messages. `aicx continuity` refuses to distill one history from a
-`mixed_candidate` session set (`mixed_workstream` refusal) unless asked to.
+messages. `aicx continuity` refuses to distill one history from a window
+whose only work is mixed-workstream sessions (`mixed_workstream` refusal)
+unless asked to — also when the project filters had already removed every
+frame of those sessions, so such a window never passes as an empty pack.
 
 Project-filtered queries (`-p`) are fail-closed inside mixed sessions. A turn
 window whose executable tool calls consistently name one foreign `workdir`
@@ -252,7 +254,9 @@ closes, or a value that is not a literal at all (a variable, an expression,
 the shorthand `{cmd, workdir}`). `null` and `undefined` ask for the default
 directory and are no evidence, and only the whole property name `workdir` is
 read. A readable value runs to the quote that opened it, in any of the three
-quote styles, so `"/Users/O'Brien/repo"` is one path. Both Codex readers —
+quote styles, so `"/Users/O'Brien/repo"` is one path, and it counts only as
+the whole value: `"/repos/vista" + "-private"` is an expression and
+unreadable. Both Codex readers —
 the full adapter and the bounded reader for over-cap rollouts — scope the
 same call types, and both treat a `turn_context` without a cwd as a turn
 whose directory is unknown.
@@ -278,7 +282,9 @@ a conflict, not a re-scope. Branch drift is not scope drift: a session that
 switches branch inside one unchanged checkout stays a normal, fully attributed
 session. Neither is a move within one checkout: a session is mixed only when
 its cwds name more than one repository, so `cd` from `/repo` into `/repo/pkg`
-keeps it homogeneous while a nested checkout still counts on its own. Scope is
+keeps it homogeneous while a nested checkout still counts on its own. A cwd
+that no longer exists counts as part of an observed checkout that plausibly
+contains it, unless `.gitmodules` there declares it a submodule. Scope is
 judged on the whole session before the frame-kind filter
 narrows it to one role — and before `.aicxignore` hides a checkout. A hidden
 repository is counted as a scope and never named, so a session whose own
@@ -358,7 +364,11 @@ column is a cache, not the authority — the census hot refresh never revisits
 an unchanged source, so rows cataloged before the column existed keep `null`.
 Both intent lanes therefore resolve provenance from the rollout header when
 the column is empty; no catalog rebuild is a prerequisite for the guardian
-contract, and `aicx catalog rebuild` is what refreshes the stored column.
+contract, and `aicx catalog rebuild` is what refreshes the stored column. The
+header probe reads as far as the catalog reads a header (128 records, 256 KiB
+in total). A guardian stays out of the `mixed_scope` list as well, even when
+the frame-kind or privacy filter leaves none of its frames, so it cannot make
+`aicx continuity` refuse.
 
 Batch report export remains available through `aicx claude`, `aicx codex`,
 `aicx all`, and `aicx conversations`. Those commands write requested reports,
