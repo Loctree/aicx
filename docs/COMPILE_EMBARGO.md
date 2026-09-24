@@ -15,8 +15,14 @@ closed marker use the ordinary hook policy.
 
 Run `tools/git-hooks/install.sh` once in the checkout. It idempotently sets
 `core.hooksPath` to `tools/git-hooks`; it does not copy files into `.git/hooks`.
+That `pre-push` then runs for every push, including when no embargo marker is
+open. On the first push of a branch its comparison base is `origin/HEAD`, and
+a missing, unresolved, or `develop` symref falls back to `origin/main`. It does
+not use `origin/develop`.
 Run `tools/git-hooks/selftest.sh` to exercise the commit, push, and installer
-contract in disposable repositories.
+contract in disposable repositories. The provenance selftest
+(`make hooks-test`) checks that this pre-push does not merge-base against
+`origin/develop`.
 
 ## Recovery ref
 
