@@ -472,6 +472,40 @@ fi
 rm -f "$tmp"
 printf 'ok generator: trailers sit above the scissors line\n'
 
+# Localized Git translates the explanation. The diff under the marker is
+# enough to know cleanup will drop the suffix.
+tmp="$(mktemp)"
+cat >"$tmp" <<EOF
+$subject_agent
+
+Why this commit exists.
+
+# ------------------------ >8 ------------------------
+# Nie usuwaj linii powyzej.
+diff --git a/README.md b/README.md
+session_id: $other_id
+EOF
+if ! hook_env CODEX_THREAD_ID="$thread_id" TERM_PROGRAM=iTerm.app \
+    "$hook" "$tmp" >/dev/null 2>&1; then
+    printf 'FAIL generator: localized scissors message rejected\n' >&2
+    hook_env CODEX_THREAD_ID="$thread_id" TERM_PROGRAM=iTerm.app "$hook" "$tmp" >&2 || true
+    cat "$tmp" >&2
+    rm -f "$tmp"
+    exit 1
+fi
+if ! awk -v id="$thread_id" '
+    /^#[[:space:]]*-{2,}[[:space:]]*>8/ { exit }
+    $0 == "session_id: " id { found=1 }
+    END { exit !found }
+' "$tmp"; then
+    printf 'FAIL generator: session_id is not above the localized scissors line\n' >&2
+    cat "$tmp" >&2
+    rm -f "$tmp"
+    exit 1
+fi
+rm -f "$tmp"
+printf 'ok generator: scissors marker does not need English prose\n'
+
 # A citation in the body is not a footer. The measured runtime is appended;
 # the cited line stays.
 out="$(gen "$subject_agent
@@ -972,6 +1006,26 @@ expect_line cursor-agent-alias-mailbox "$out" "Authored-By: cursor-agent <agents
 
 out="$(gen "$subject_agent
 
+Why this commit exists." CODEX_SESSION_ID="019c09d5-codex" VC_SESSION_PID=0)"
+expect_line codex-native-id "$out" "session_id: 019c09d5-codex"
+tmp="$(mktemp)"
+printf '%s\n' "$out" >"$tmp"
+if ! hook_env CODEX_SESSION_ID="019c09d5-codex" TERM_PROGRAM=iTerm.app "$hook" "$tmp" >/dev/null 2>&1; then
+    printf 'FAIL validator: native Codex session id rejected\n' >&2
+    hook_env CODEX_SESSION_ID="019c09d5-codex" TERM_PROGRAM=iTerm.app "$hook" "$tmp" >&2 || true
+    rm -f "$tmp"
+    exit 1
+fi
+rm -f "$tmp"
+printf 'ok validator: native Codex session id accepted\n'
+
+out="$(gen "$subject_agent
+
+Why this commit exists." AICX_SESSION_ID='   ' CODEX_THREAD_ID="$thread_id" VC_SESSION_PID=0)"
+expect_line whitespace-session-skipped "$out" "session_id: $thread_id"
+
+out="$(gen "$subject_agent
+
 Why this commit exists." GEMINI_SESSION_ID="$gemini_id" VC_SESSION_PID=0)"
 expect_absent codex-does-not-record-gemini "$out" "session_id:"
 
@@ -1019,14 +1073,14 @@ runtime: iterm2
 EOF
 )" "vendor footers"
 
-reject codex-rejects-junie-shaped-id "$(
+reject codex-rejects-kimi-shaped-id "$(
     cat <<'EOF'
 [codex/interactive] chore: describe the change
 
 Why this commit exists.
 
 Authored-By: codex <agents@vetcoders.io>
-session_id: 260408-214715-abcd
+session_id: 11111111-1111-4111-8111-111111111111:worker
 time: 2026-06-04T14:08:27-06:00
 runtime: iterm2
 EOF

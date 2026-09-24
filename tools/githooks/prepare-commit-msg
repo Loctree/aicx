@@ -99,6 +99,8 @@ else
     while read -r key key_agent; do
         [ -n "$key" ] || continue
         value="${!key:-}"
+        # A whitespace-only higher-priority variable must not hide the next id.
+        value="$(printf '%s' "$value" | tr -d '[:space:]')"
         [ -n "$value" ] || continue
         if [ -n "$key_agent" ] && [ "$key_agent" != "$session_agent" ]; then
             continue
@@ -149,12 +151,18 @@ gemini_session_re='^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$'
 # Kimi main lane is the bare session uuid. A subagent lane is
 # <uuid>:<agentId> (src/sessions.rs discover_kimi_sessions).
 kimi_session_re='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}:[A-Za-z0-9._+-]+$'
+# Codex discovery keeps session_meta.payload.id as written, including
+# non-UUID fixtures such as 019c09d5-codex.
+codex_session_re='^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$'
 if [ -z "$session_rejected" ] && printf '%s' "$session_raw" | grep -Eq '^[0-9a-fA-F]{32}$'; then
     session_id="$(printf '%s' "$session_raw" \
         | sed -E 's/^(.{8})(.{4})(.{4})(.{4})(.{12})$/\1-\2-\3-\4-\5/' | tr 'A-F' 'a-f')"
 elif [ -z "$session_rejected" ] && printf '%s' "$session_raw" \
     | grep -Eq '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'; then
     session_id="$(printf '%s' "$session_raw" | tr 'A-F' 'a-f')"
+elif [ -z "$session_rejected" ] && [ "$session_agent" = "codex" ] \
+    && printf '%s' "$session_raw" | grep -Eq "$codex_session_re"; then
+    session_id="$session_raw"
 elif [ -z "$session_rejected" ] && [ "$session_agent" = "junie" ] \
     && printf '%s' "$session_raw" | grep -Eq "$junie_session_re"; then
     session_id="$session_raw"
@@ -290,6 +298,18 @@ apply_trailers() {
         function rest_is_cut(rest) {
             return rest ~ /^ ------------------------ >8 ------------------------[[:space:]]*$/
         }
+        # A generated -v marker is followed by comment lines, then a diff.
+        # The English explanation is optional: localized Git translates it.
+        function generated_marker(i,    j) {
+            if (i >= n) return 0
+            if (index(lines[i + 1], "Do not modify or remove the line above.") > 0) return 1
+            j = i + 1
+            while (j <= n && (is_blank(lines[j]) || (comment_prefix != "" && index(lines[j], comment_prefix) == 1)))
+                j++
+            if (j <= n && (index(lines[j], "diff --git") == 1 || index(lines[j], "diff --cc") == 1))
+                return 1
+            return 0
+        }
         function token_len(s) {
             if (match(s, /^[^[:space:]]+/)) return RLENGTH
             return 0
@@ -386,8 +406,7 @@ apply_trailers() {
                 # commit.template placed above the status block.
                 if (!is_scissors(lines[i])) continue
                 if (!first_cut) first_cut = i
-                if (i < n && index(lines[i + 1], "Do not modify or remove the line above.") > 0)
-                    generated_cut = i
+                if (generated_marker(i)) generated_cut = i
             }
             if (generated_cut) cut = first_cut
             limit = cut ? cut - 1 : n
@@ -508,7 +527,10 @@ if [ -n "$session_rejected" ]; then
         printf 'prepare-commit-msg: session from %s is not the subject agent %s; not using it.\n' \
             "$session_source" "$agent" >&2
     else
-        if [ "$session_agent" = "junie" ]; then
+        if [ "$session_agent" = "codex" ]; then
+            printf 'prepare-commit-msg: session identity from %s is not a Codex session id or a UUID; not using it.\n' \
+                "$session_source" >&2
+        elif [ "$session_agent" = "junie" ]; then
             printf 'prepare-commit-msg: session identity from %s is not a Junie session id or a UUID; not using it.\n' \
                 "$session_source" >&2
         elif [ "$session_agent" = "gemini" ]; then

@@ -113,6 +113,16 @@ comment_prefix="$(awk \
     function rest_is_cut(rest) {
         return rest ~ /^ ------------------------ >8 ------------------------[[:space:]]*$/
     }
+    function generated_marker(i,    j) {
+        if (i >= n) return 0
+        if (index(lines[i + 1], "Do not modify or remove the line above.") > 0) return 1
+        j = i + 1
+        while (j <= n && (is_blank(lines[j]) || (comment_prefix != "" && index(lines[j], comment_prefix) == 1)))
+            j++
+        if (j <= n && (index(lines[j], "diff --git") == 1 || index(lines[j], "diff --cc") == 1))
+            return 1
+        return 0
+    }
     function token_len(s) {
         if (match(s, /^[^[:space:]]+/)) return RLENGTH
         return 0
@@ -190,8 +200,7 @@ comment_prefix="$(awk \
         for (i = 1; i <= n; i++) {
             if (!is_scissors(lines[i])) continue
             if (!first_cut) first_cut = i
-            if (i < n && index(lines[i + 1], "Do not modify or remove the line above.") > 0)
-                generated_cut = i
+            if (generated_marker(i)) generated_cut = i
         }
         if (generated_cut) cut = first_cut
         end = cut ? cut - 1 : n
@@ -264,6 +273,8 @@ fi
 session_ok=0
 if printf '%s\n' "$footer" | grep -Eq '^session_id: [0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'; then
     session_ok=1
+elif [ "$session_agent" = "codex" ] && printf '%s\n' "$footer" | grep -Eq '^session_id: [A-Za-z0-9][A-Za-z0-9._-]{0,127}$'; then
+    session_ok=1
 elif [ "$session_agent" = "junie" ] && printf '%s\n' "$footer" | grep -Eq '^session_id: [0-9]{6}(-[A-Za-z0-9]+)+$'; then
     session_ok=1
 elif [ "$session_agent" = "gemini" ] && printf '%s\n' "$footer" | grep -Eq '^session_id: [A-Za-z0-9][A-Za-z0-9._:-]{0,127}$'; then
@@ -272,7 +283,9 @@ elif [ "$session_agent" = "kimi" ] && printf '%s\n' "$footer" | grep -Eq '^sessi
     session_ok=1
 fi
 if [ "$session_ok" -ne 1 ]; then
-    if [ "$session_agent" = "junie" ]; then
+    if [ "$session_agent" = "codex" ]; then
+        failures+=("missing session_id: <uuid or Codex session id>")
+    elif [ "$session_agent" = "junie" ]; then
         failures+=("missing session_id: <uuid or YYMMDD-HHMMSS-suffix>")
     elif [ "$session_agent" = "gemini" ]; then
         failures+=("missing session_id: <uuid or Gemini session id>")

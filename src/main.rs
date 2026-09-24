@@ -4401,32 +4401,17 @@ fn current_session_from_disk() -> Result<Option<CurrentSessionPayload>> {
         &home.join(".junie").join("sessions"),
         Some(modified_after),
     ));
-    // Same root as the session-list path. The slug in `wd_<slug>_<hex>` is
-    // lossy, so cwd filtering stays on select_sessions below.
-    discovered.extend(sessions::discover_kimi_sessions(
-        &home.join(".kimi-code").join("sessions"),
-        Some(modified_after),
-    ));
     discovered.extend(sessions::discover_grok_sessions(
         &home.join(".grok").join("sessions"),
         Some(modified_after),
         Some(&here),
     ));
 
-    // Agents with a recorded cwd compete for "newest in this checkout".
-    // Kimi stores no cwd (the workspace slug is lossy and is not a path),
-    // so that filter drops every Kimi row. Use the newest Kimi transcript
-    // only when nothing in this checkout matched; the commit hook still
-    // requires the JSON agent to be the subject.
-    let mut selected =
-        sessions::select_sessions(discovered.clone(), Some(&here), None, Some(since_dt), 1);
-    if selected.is_empty() {
-        let kimi: Vec<_> = discovered
-            .into_iter()
-            .filter(|s| s.agent == "kimi")
-            .collect();
-        selected = sessions::select_sessions(kimi, None, Some("kimi"), Some(since_dt), 1);
-    }
+    // Only sessions that can be tied to this checkout. Kimi stores no cwd,
+    // and its workspace slug is not a path, so it is not a candidate here.
+    // A `[kimi/...]` commit supplies KIMI_SESSION_ID instead of borrowing
+    // another project's transcript.
+    let mut selected = sessions::select_sessions(discovered, Some(&here), None, Some(since_dt), 1);
     let Some(info) = selected.pop() else {
         return Ok(None);
     };

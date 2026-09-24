@@ -46,7 +46,8 @@ the hook follows the selector Git still runs. `core.commentString` is read
 only on Git 2.45 or newer; older Git ignores it and the hook uses
 `core.commentChar`. A line that begins with a candidate blocks it, including
 an authored `>8` line. Git drops the suffix when a generated `git commit -v`
-marker is present, and the cut is the first marker, including one from
+marker is present. That marker is recognized by the diff under it, not by
+English prose, and the cut is the first exact marker, including one from
 `commit.template` above the status block. `git commit -F` keeps the suffix,
 so a footer there is still validated. A prose word in front of `>8` is not a cut either. The validator reads the
 text above that cut, which is the text Git keeps. A `Signed-off-by` line in
@@ -69,9 +70,11 @@ in the same order: `AICX_SESSION_ID`, `CODEX_THREAD_ID`, `CODEX_SESSION_ID`,
 then the other agent session variables, then `aicx sessions current --json`.
 An agent-specific variable is used only when it belongs to the subject.
 `cursor-agent` is `cursor` and `gemini-antigravity` is `gemini` for that
-check; `Authored-By` keeps the spelling from the subject line. The `aicx`
-fallback is used only when its `agent` matches too, and that disk lookup
-includes Kimi transcripts under `~/.kimi-code/sessions`. A human
+check; `Authored-By` keeps the spelling from the subject line. Codex
+accepts the id discovery stores, including a non-UUID `payload.id` such as
+`019c09d5-codex`. The `aicx` fallback is used only when its `agent` matches
+too. Kimi transcripts are not inferred from disk: they have no recorded
+cwd, so a Kimi commit carries `KIMI_SESSION_ID`. A human
 lane (`maciej`, `monika`, or runtime `manual`) does not read those variables.
 Its only automatic fallback is `ATUIN_SESSION`, and that fallback is not used
 for agents. `session_id` is a UUID on every lane except Junie, Gemini, and a
