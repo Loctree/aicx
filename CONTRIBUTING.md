@@ -36,10 +36,16 @@ session_pid: 35432
 (`git commit -m` / `-F`). Plain `git commit` opens an editor first, so the
 same generator runs again from `commit-msg` after the message is saved.
 Trailers are inserted before Git's scissors line (`git commit -v`,
-`commit.cleanup=scissors`). The marker is recognized by its `>8` shape, so
-`core.commentChar=auto` is not assumed to be `#`. The validator reads that
-same prefix, which is the text Git keeps. A `Signed-off-by` line in the footer
-stays where it is; only the measured provenance keys are overwritten.
+`commit.cleanup=scissors`). The marker is the configured comment prefix
+(`core.commentString`, otherwise `core.commentChar`) followed by the `>8`
+shape. `core.commentChar=auto` matches only a one-character prefix from the
+set Git can choose (`#;@!$%^&|:`). A prose line that merely contains `>8` is
+not a cut, so a footer after it is still validated. The validator reads the
+text above that cut, which is the text Git keeps. A `Signed-off-by` line in
+the footer stays where it is; only the measured provenance keys are overwritten.
+Comment lines that Git will keep (`git commit -m` / `-F`, or
+`commit.cleanup=verbatim` / `whitespace`) stay above the provenance footer.
+`strip` removes them after the hook runs.
 
 Two rules govern the split:
 
@@ -57,7 +63,9 @@ An agent-specific variable is used only when it belongs to the subject, and
 the `aicx` fallback only when its `agent` matches too. A human
 lane (`maciej`, `monika`, or runtime `manual`) does not read those variables.
 Its only automatic fallback is `ATUIN_SESSION`, and that fallback is not used
-for agents.
+for agents. `session_id` is a UUID on every lane except Junie. Junie
+transcripts use the directory id AICX already returns, `YYMMDD-HHMMSS-suffix`
+(for example `260408-214715-abcd`), not a fabricated UUID.
 
 `runtime:` is written only from `VIBECRAFTED_COMMIT_RUNTIME`,
 `VIBECRAFTED_RUNTIME`, or a recognized `TERM_PROGRAM` (`iTerm.app` /
@@ -71,7 +79,10 @@ them, but nothing new is written that way.
 
 `session_pid:` is optional. `session_id` identifies a *transcript*, so two live
 processes resuming one session legitimately share it; the pid is what tells them
-apart. Toggle it at any time, highest precedence first:
+apart. It is the subject agent's process: `CLAUDE_PID` for `claude`,
+`CODEX_PID` for `codex`. Another agent's pid is not recorded. When the toggle
+is off, an existing `session_pid` trailer is removed rather than kept across
+an amend. Toggle it at any time, highest precedence first:
 
 ```bash
 VC_SESSION_PID=0 git commit          # this commit only

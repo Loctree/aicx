@@ -26,16 +26,23 @@ while read -r _lref lsha _rref rsha; do
     # branch this repo abandoned on 2026-07-15: the merge-base landed hundreds
     # of commits back and a docs-only push ran the full cargo suite.
     #
-    # origin/HEAD is a local symref. fetch does not move an existing one
-    # (remote.origin.followRemoteHEAD defaults to "create"), so a clone from
-    # when the default was develop keeps pointing there. Treat a missing ref,
-    # a develop pointer falls back to origin/main. If that ref does not
-    # resolve, fail closed: looking only at the tip hides Rust edits in
-    # earlier commits of the same first push.
-    default_ref=$(git symbolic-ref --quiet refs/remotes/origin/HEAD 2>/dev/null || true)
-    case "$default_ref" in
-      ""|refs/remotes/origin/develop|origin/develop) default_ref=origin/main ;;
-    esac
+    # The objects a first push uploads are the ones the destination does not
+    # already have. origin keeps its develop→main fallback: origin/HEAD is a
+    # local symref that fetch does not move once created. Any other remote
+    # uses that remote's HEAD. No usable baseline fails closed — a docs-only
+    # child of origin/main still uploads this repo's Rust history to an empty
+    # remote, and looking only at the tip hides earlier Rust commits.
+    if [ "$remote" = "origin" ]; then
+      default_ref=$(git symbolic-ref --quiet refs/remotes/origin/HEAD 2>/dev/null || true)
+      case "$default_ref" in
+        ""|refs/remotes/origin/develop|origin/develop) default_ref=origin/main ;;
+      esac
+    else
+      default_ref=$(git symbolic-ref --quiet "refs/remotes/${remote}/HEAD" 2>/dev/null || true)
+      case "$default_ref" in
+        ""|*"/develop") default_ref="refs/remotes/${remote}/main" ;;
+      esac
+    fi
     if ! git rev-parse --verify -q "${default_ref}^{commit}" >/dev/null 2>&1; then
       RUST_TOUCHED=1
       continue

@@ -56,35 +56,69 @@ else
 fi
 
 # Same comment prefix as prepare-commit-msg. A `;` scissors line is the cut
-# when core.commentChar is `;`; recognizing only `#` would validate trailers
-# Git is about to strip.
+# when core.commentChar is `;`. core.commentChar=auto matches only a single
+# character from the set Git can choose, never an arbitrary word: a prose
+# line such as "NOTE ---- >8 ----" must not hide the footer under it.
 comment_prefix="$(git config --get core.commentString 2>/dev/null || true)"
 if [ -z "$comment_prefix" ]; then
     comment_prefix="$(git config --get core.commentChar 2>/dev/null || true)"
 fi
+comment_mode=fixed
 case "$comment_prefix" in
-    ""|auto) comment_prefix='#' ;;
+    auto)
+        comment_mode=auto
+        comment_prefix='#'
+        ;;
+    "") comment_prefix='#' ;;
 esac
 
-# What Git will store: drop the scissors marker and the verbose diff under it.
-# Comment lines stay in the buffer; the checks below do not treat them as
+# What Git will store: drop a real scissors marker and the verbose diff under
+# it. Comment lines stay in the buffer; the checks below do not treat them as
 # trailers or as an explanatory body.
-# Any comment prefix. core.commentChar=auto does not tell us which character
-# Git wrote; the scissors line in the file does.
-kept="$(awk '
-    /^[^[:space:]]+[[:space:]]*-{2,}[[:space:]]*>8[[:space:]]*-{2,}[[:space:]]*$/ { exit }
-    { sub(/\r$/, ""); print }
-' "$msg_file")"
-scissors_prefix="$(awk '
-    /^[^[:space:]]+[[:space:]]*-{2,}[[:space:]]*>8[[:space:]]*-{2,}[[:space:]]*$/ {
-        match($0, /^[^[:space:]]+/)
-        print substr($0, 1, RLENGTH)
-        exit
+kept_tmp="$(mktemp "${TMPDIR:-/tmp}/vc-kept.XXXXXX")"
+trap 'rm -f "$kept_tmp"' EXIT
+comment_prefix="$(awk \
+    -v comment_prefix="$comment_prefix" \
+    -v comment_mode="$comment_mode" \
+    -v kept_path="$kept_tmp" \
+    '
+    function is_auto_char(c) { return index("#;@!$%^&|:", c) > 0 }
+    function rest_is_cut(rest) {
+        return rest ~ /^[[:space:]]+-{2,}[[:space:]]*>8[[:space:]]*-{2,}[[:space:]]*$/
+    }
+    function is_scissors(s,    c, rest) {
+        if (match(s, /^[^[:space:]]+/)) {
+            if (comment_mode == "auto" && RLENGTH != 1) return 0
+        } else {
+            return 0
+        }
+        if (comment_mode == "auto") {
+            c = substr(s, 1, 1)
+            if (!is_auto_char(c)) return 0
+            return rest_is_cut(substr(s, 2))
+        }
+        if (comment_prefix == "" || index(s, comment_prefix) != 1) return 0
+        rest = substr(s, length(comment_prefix) + 1)
+        return rest_is_cut(rest)
+    }
+    {
+        sub(/\r$/, "")
+        if (!seen_cut && is_scissors($0)) {
+            seen_cut = 1
+            if (comment_mode == "auto") comment_prefix = substr($0, 1, 1)
+            next
+        }
+        if (seen_cut) next
+        print > kept_path
+    }
+    END {
+        close(kept_path)
+        print comment_prefix
     }
 ' "$msg_file")"
-if [ -n "$scissors_prefix" ]; then
-    comment_prefix="$scissors_prefix"
-fi
+kept="$(cat "$kept_tmp")"
+rm -f "$kept_tmp"
+trap - EXIT
 
 if printf '%s\n' "$kept" | grep -Eiq '(^Co-Authored-By:|noreply@|@anthropic\.com|@openai\.com)'; then
     failures+=("vendor footers are forbidden; use Authored-By only")
@@ -141,8 +175,20 @@ elif [ -z "$agent" ] && ! printf '%s\n' "$footer" | grep -Eq '^Authored-By: [a-z
     failures+=("missing Authored-By: <agent> <agents@vetcoders.io>")
 fi
 
-if ! printf '%s\n' "$footer" | grep -Eq '^session_id: [0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'; then
-    failures+=("missing session_id: <uuid>")
+# UUID everywhere. Junie also keeps the id AICX discovery returns:
+# YYMMDD-HHMMSS-suffix, for example 260408-214715-abcd.
+session_ok=0
+if printf '%s\n' "$footer" | grep -Eq '^session_id: [0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'; then
+    session_ok=1
+elif [ "$agent" = "junie" ] && printf '%s\n' "$footer" | grep -Eq '^session_id: [0-9]{6}(-[A-Za-z0-9]+)+$'; then
+    session_ok=1
+fi
+if [ "$session_ok" -ne 1 ]; then
+    if [ "$agent" = "junie" ]; then
+        failures+=("missing session_id: <uuid or YYMMDD-HHMMSS-suffix>")
+    else
+        failures+=("missing session_id: <uuid>")
+    fi
 fi
 
 if printf '%s\n' "$footer" | grep -Eq '^(timestamp|date): '; then

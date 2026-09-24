@@ -62,13 +62,22 @@ else
     case "$lsha" in *[!0]*) : ;; *) DELETE_LINES=$((DELETE_LINES + 1)); continue ;; esac
     HAVE_RANGE=1
     if printf '%s' "$rsha" | grep -qE '^0+$' || ! git cat-file -e "$rsha" 2>/dev/null; then
-      # Same default-branch rule as tools/githooks/pre-push. A missing
-      # origin/main fails closed into the full gate instead of inspecting
-      # only the tip commit. This copy is the one core.hooksPath installs.
-      default_ref=$(git symbolic-ref --quiet refs/remotes/origin/HEAD 2>/dev/null || true)
-      case "$default_ref" in
-        ""|refs/remotes/origin/develop|origin/develop) default_ref=origin/main ;;
-      esac
+      # Same destination-remote rule as tools/githooks/pre-push. origin keeps
+      # the develop→main fallback. Any other remote uses its own HEAD, and a
+      # missing baseline fails closed into the full gate instead of inspecting
+      # only the tip or the delta from origin/main. This copy is the one
+      # core.hooksPath installs.
+      if [ "$remote" = "origin" ]; then
+        default_ref=$(git symbolic-ref --quiet refs/remotes/origin/HEAD 2>/dev/null || true)
+        case "$default_ref" in
+          ""|refs/remotes/origin/develop|origin/develop) default_ref=origin/main ;;
+        esac
+      else
+        default_ref=$(git symbolic-ref --quiet "refs/remotes/${remote}/HEAD" 2>/dev/null || true)
+        case "$default_ref" in
+          ""|*"/develop") default_ref="refs/remotes/${remote}/main" ;;
+        esac
+      fi
       if ! git rev-parse --verify -q "${default_ref}^{commit}" >/dev/null 2>&1; then
         RUST_TOUCHED=1
         continue

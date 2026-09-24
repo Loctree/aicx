@@ -12,7 +12,11 @@
 #   - When a value cannot be measured, an existing footer declaration is left
 #     alone and nothing is invented. Provenance is never fabricated.
 #   - The footer is inserted before Git's scissors line, so `git commit -v`
-#     and commit.cleanup=scissors cannot strip it after validation.
+#     and commit.cleanup=scissors cannot strip it after validation. The cut
+#     is the configured comment prefix, or one character from Git's auto set.
+#     A prose word in front of `>8` is not a cut.
+#   - Comment lines stay above that footer. `git commit -m`/`-F` and
+#     cleanup verbatim/whitespace keep them; strip deletes them afterwards.
 #
 # Toggle for the optional session_pid trailer, highest precedence first:
 #   VC_SESSION_PID=0|1                     (one commit)
@@ -129,12 +133,18 @@ fi
 session_raw="$(printf '%s' "$session_raw" | tr -d '[:space:]')"
 
 session_id=""
+# Junie ids are the session directory minus the "session-" prefix
+# (src/sessions.rs): 260408-214715-abcd, not a UUID. Other lanes stay UUID-only.
+junie_session_re='^[0-9]{6}(-[A-Za-z0-9]+)+$'
 if [ -z "$session_rejected" ] && printf '%s' "$session_raw" | grep -Eq '^[0-9a-fA-F]{32}$'; then
     session_id="$(printf '%s' "$session_raw" \
         | sed -E 's/^(.{8})(.{4})(.{4})(.{4})(.{12})$/\1-\2-\3-\4-\5/' | tr 'A-F' 'a-f')"
-elif printf '%s' "$session_raw" \
+elif [ -z "$session_rejected" ] && printf '%s' "$session_raw" \
     | grep -Eq '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'; then
     session_id="$(printf '%s' "$session_raw" | tr 'A-F' 'a-f')"
+elif [ -z "$session_rejected" ] && [ "$agent" = "junie" ] \
+    && printf '%s' "$session_raw" | grep -Eq "$junie_session_re"; then
+    session_id="$session_raw"
 elif [ -n "$session_raw" ]; then
     session_rejected=1
 fi
@@ -164,24 +174,39 @@ session_pid_enabled() {
     return 0
 }
 
-# Agent pids are not a measurement of a human commit.
+# Agent pids are not a measurement of a human commit, and CLAUDE_PID must not
+# satisfy a Codex subject just because both variables are exported. The
+# documented opt-out drops a pid already sitting in the footer; leaving the
+# parsed value in place made VC_SESSION_PID=0 a no-op on amend.
 session_pid=""
-if [ -z "$authored_by_human" ] && session_pid_enabled; then
-    candidate="${CLAUDE_PID:-${CODEX_PID:-}}"
-    if printf '%s' "$candidate" | grep -Eq '^[0-9]{1,10}$'; then
-        session_pid="$candidate"
+drop_pid=0
+if ! session_pid_enabled; then
+    drop_pid=1
+elif [ -z "$authored_by_human" ]; then
+    case "$agent" in
+        claude) pid_candidate="${CLAUDE_PID:-}" ;;
+        codex) pid_candidate="${CODEX_PID:-}" ;;
+        *) pid_candidate="" ;;
+    esac
+    if printf '%s' "$pid_candidate" | grep -Eq '^[0-9]{1,10}$'; then
+        session_pid="$pid_candidate"
     fi
 fi
 
 # Git's comment prefix. core.commentString wins when set; otherwise
-# core.commentChar. "auto" is resolved by Git per message, which this hook
-# cannot see, so it keeps the historical default.
+# core.commentChar. "auto" matches one character from the set Git can choose.
+# An empty value is Git's default "#", not auto.
 comment_prefix="$(git config --get core.commentString 2>/dev/null || true)"
 if [ -z "$comment_prefix" ]; then
     comment_prefix="$(git config --get core.commentChar 2>/dev/null || true)"
 fi
+comment_mode=fixed
 case "$comment_prefix" in
-    ""|auto) comment_prefix='#' ;;
+    auto)
+        comment_mode=auto
+        comment_prefix='#'
+        ;;
+    "") comment_prefix='#' ;;
 esac
 
 # Rewrite the footer in one pass. A trailer is any key line in the
@@ -201,7 +226,9 @@ apply_trailers() {
         -v time_value="$time_value" \
         -v runtime="$runtime" \
         -v session_pid="$session_pid" \
+        -v drop_pid="$drop_pid" \
         -v comment_prefix="$comment_prefix" \
+        -v comment_mode="$comment_mode" \
         '
         function is_blank(s) { return s ~ /^[[:space:]]*$/ }
         function re_escape(s,   i, c, o) {
@@ -213,12 +240,28 @@ apply_trailers() {
             }
             return o
         }
-        function is_comment(s) { return index(s, comment_prefix) == 1 }
-        # The marker shape, not a hard-coded prefix. core.commentChar=auto
-        # picks a character that does not begin any message line, so the
-        # configured value may be "auto" while the file contains "; --- >8 ---".
-        function is_scissors(s) {
-            return s ~ /^[^[:space:]]+[[:space:]]*-{2,}[[:space:]]*>8[[:space:]]*-{2,}[[:space:]]*$/
+        function is_comment(s) { return comment_prefix != "" && index(s, comment_prefix) == 1 }
+        # Auto candidates from adjust_comment_line_char in builtin/commit.c.
+        function is_auto_char(c) { return index("#;@!$%^&|:", c) > 0 }
+        function rest_is_cut(rest) {
+            return rest ~ /^[[:space:]]+-{2,}[[:space:]]*>8[[:space:]]*-{2,}[[:space:]]*$/
+        }
+        # Configured prefix, or in auto mode exactly one character Git can
+        # choose. A prose token such as NOTE is not a cut.
+        function is_scissors(s,    c, rest) {
+            if (match(s, /^[^[:space:]]+/)) {
+                if (comment_mode == "auto" && RLENGTH != 1) return 0
+            } else {
+                return 0
+            }
+            if (comment_mode == "auto") {
+                c = substr(s, 1, 1)
+                if (!is_auto_char(c)) return 0
+                return rest_is_cut(substr(s, 2))
+            }
+            if (comment_prefix == "" || index(s, comment_prefix) != 1) return 0
+            rest = substr(s, length(comment_prefix) + 1)
+            return rest_is_cut(rest)
         }
         function is_trailer(s) {
             return s ~ /^[A-Za-z][A-Za-z0-9_-]*: /
@@ -238,8 +281,8 @@ apply_trailers() {
             if (!cut && is_scissors($0)) cut = n
         }
         END {
-            if (cut && match(lines[cut], /^[^[:space:]]+/)) {
-                comment_prefix = substr(lines[cut], 1, RLENGTH)
+            if (cut && comment_mode == "auto") {
+                comment_prefix = substr(lines[cut], 1, 1)
             }
             limit = cut ? cut - 1 : n
             cstart = limit + 1
@@ -288,13 +331,31 @@ apply_trailers() {
             }
             if (authored_by != "") ab = authored_by
             if (session_id != "") sid = session_id
-            if (session_pid != "") spid = session_pid
+            if (drop_pid) spid = ""
+            else if (session_pid != "") spid = session_pid
             if (time_value != "") tm = time_value
             if (runtime != "") rt = runtime
 
             body_end = end
             while (body_end >= 1 && is_blank(lines[body_end])) body_end--
             for (i = 1; i <= body_end; i++) print lines[i]
+
+            # Comment lines stay above the footer. git commit -m/-F and
+            # cleanup verbatim/whitespace keep them; strip removes them after
+            # this hook. Parking them under runtime: made a kept comment the
+            # last block of the stored message.
+            printed_comments = 0
+            if (cstart <= limit) {
+                j = cstart
+                cend = limit
+                while (j <= cend && is_blank(lines[j])) j++
+                while (cend >= j && is_blank(lines[cend])) cend--
+                if (j <= cend) {
+                    if (body_end >= 1) print ""
+                    for (i = j; i <= cend; i++) print lines[i]
+                    printed_comments = 1
+                }
+            }
 
             seen_ab = 0
             seen_sid = 0
@@ -303,7 +364,7 @@ apply_trailers() {
             seen_rt = 0
             have = (ab != "" || sid != "" || tm != "" || rt != "" || spid != "" || bstart <= bend)
             if (have) {
-                if (body_end >= 1) print ""
+                if (body_end >= 1 || printed_comments) print ""
                 for (i = bstart; i <= bend; i++) {
                     if (is_blank(lines[i])) continue
                     if (lines[i] ~ /^Authored-By: /) {
@@ -327,11 +388,6 @@ apply_trailers() {
                 if (!seen_spid && spid != "") print "session_pid: " spid
             }
 
-            if (cstart <= limit) {
-                j = cstart
-                while (j <= limit && is_blank(lines[j])) j++
-                for (i = j; i <= limit; i++) print lines[i]
-            }
             if (cut) {
                 for (i = cut; i <= n; i++) print lines[i]
             }
@@ -346,8 +402,13 @@ if [ -n "$session_rejected" ]; then
         printf 'prepare-commit-msg: session from %s is not the subject agent %s; not using it.\n' \
             "$session_source" "$agent" >&2
     else
-        printf 'prepare-commit-msg: session identity from %s is not a UUID; not using it.\n' \
-            "$session_source" >&2
+        if [ "$agent" = "junie" ]; then
+            printf 'prepare-commit-msg: session identity from %s is not a Junie session id or a UUID; not using it.\n' \
+                "$session_source" >&2
+        else
+            printf 'prepare-commit-msg: session identity from %s is not a UUID; not using it.\n' \
+                "$session_source" >&2
+        fi
     fi
 elif [ -z "$session_id" ]; then
     printf 'prepare-commit-msg: session identity not measurable; not inventing one.\n' >&2

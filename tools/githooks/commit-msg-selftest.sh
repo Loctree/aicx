@@ -188,8 +188,11 @@ runtime: iterm2
 EOF
 )" "legacy"
 
-reject session-pid-not-numeric "$(
-    cat <<'EOF'
+# VC_SESSION_PID=0 drops the trailer before validation. With recording left on
+# and no measurable pid, a non-numeric declaration must still be rejected.
+tmp="$(mktemp)"
+err="$(mktemp)"
+cat >"$tmp" <<'EOF'
 [claude/interactive] fix: describe the change
 
 Why this commit exists.
@@ -200,7 +203,19 @@ time: 2026-06-04T14:08:27-06:00
 runtime: iterm2
 session_pid: not-a-pid
 EOF
-)" "decimal process id"
+if hook_env env VC_SESSION_PID=1 "$hook" "$tmp" >/dev/null 2>"$err"; then
+    printf 'FAIL reject: session-pid-not-numeric (hook accepted)\n' >&2
+    rm -f "$tmp" "$err"
+    exit 1
+fi
+if ! grep -Fq "decimal process id" "$err"; then
+    printf 'FAIL reject: session-pid-not-numeric (missing decimal process id)\n' >&2
+    cat "$err" >&2
+    rm -f "$tmp" "$err"
+    exit 1
+fi
+rm -f "$tmp" "$err"
+printf 'ok reject: session-pid-not-numeric\n'
 
 # A legacy trailer must not be mistaken for an explanatory body. Before the
 # fleet agreed on `time:`, an unrecognized key counted as body text and let a
@@ -306,23 +321,41 @@ Why this commit exists." \
     CLAUDE_CODE_SESSION_ID= CODEX_SESSION_ID= ATUIN_SESSION= VC_SESSION_PID=0)"
 expect_absent human-lane-never-borrows-agent-session "$out" "session_id:"
 
-# session_pid toggle, both directions.
+# session_pid belongs to the subject. A Codex commit must not record CLAUDE_PID
+# just because that variable is also exported.
 out="$(gen "$subject_agent
 
-Why this commit exists." CLAUDE_CODE_SESSION_ID="$real_session" CLAUDE_PID=35432 VC_SESSION_PID=1)"
-expect_line session-pid-on "$out" "session_pid: 35432"
+Why this commit exists." CODEX_SESSION_ID="$real_session" CODEX_PID=222 CLAUDE_PID=111 VC_SESSION_PID=1)"
+expect_line session-pid-matches-subject "$out" "session_pid: 222"
+expect_absent session-pid-ignores-other-agent "$out" "session_pid: 111"
 
 out="$(gen "$subject_agent
 
-Why this commit exists." CLAUDE_CODE_SESSION_ID="$real_session" CLAUDE_PID=35432 VC_SESSION_PID=0)"
-expect_absent session-pid-off "$out" "session_pid:"
+Why this commit exists." CODEX_SESSION_ID="$real_session" CLAUDE_PID=35432 VC_SESSION_PID=1)"
+expect_absent session-pid-omits-unmatched "$out" "session_pid:"
+
+# The opt-out removes a pid already in the message. An enabled toggle with no
+# matching pid leaves that declaration alone.
+out="$(gen "$subject_agent
+
+Why this commit exists.
+
+session_pid: 111" CODEX_SESSION_ID="$real_session" VC_SESSION_PID=0)"
+expect_absent session-pid-off-clears-existing "$out" "session_pid:"
+
+out="$(gen "$subject_agent
+
+Why this commit exists.
+
+session_pid: 111" CODEX_SESSION_ID="$real_session" CLAUDE_PID=222 VC_SESSION_PID=1)"
+expect_line session-pid-keeps-declaration-without-match "$out" "session_pid: 111"
 
 # Trailers must land as one compact block. (Git's own parser rejects the block
 # regardless, because `session_id` contains '_'; this is for readable messages
 # and stable diffs.)
 tmp="$(mktemp)"
 printf '%s\n\nWhy this commit exists.\n' "$subject_agent" >"$tmp"
-hook_env CODEX_SESSION_ID="$real_session" CLAUDE_PID=35432 VC_SESSION_PID=1 \
+hook_env CODEX_SESSION_ID="$real_session" CODEX_PID=35432 VC_SESSION_PID=1 \
     TERM_PROGRAM=iTerm.app \
     "$prepare" "$tmp" message >/dev/null 2>&1 || true
 if awk '/^Authored-By: /{inblock=1} inblock && !NF {found=1} END{exit !found}' "$tmp"; then
@@ -341,10 +374,10 @@ expect_absent merge-subject-untouched "$out" "Authored-By:"
 # What the generator writes must satisfy the validator it feeds.
 tmp="$(mktemp)"
 printf '%s\n\nWhy this commit exists.\n' "$subject_agent" >"$tmp"
-hook_env CODEX_SESSION_ID="$real_session" CLAUDE_PID=35432 VC_SESSION_PID=1 \
+hook_env CODEX_SESSION_ID="$real_session" CODEX_PID=35432 VC_SESSION_PID=1 \
     TERM_PROGRAM=iTerm.app \
     "$prepare" "$tmp" message >/dev/null 2>&1 || true
-if ! hook_env CODEX_SESSION_ID="$real_session" CLAUDE_PID=35432 VC_SESSION_PID=1 \
+if ! hook_env CODEX_SESSION_ID="$real_session" CODEX_PID=35432 VC_SESSION_PID=1 \
     TERM_PROGRAM=iTerm.app \
     "$hook" "$tmp" >/dev/null 2>&1; then
     printf 'FAIL generator: output rejected by validator\n' >&2
@@ -390,12 +423,14 @@ if ! hook_env CODEX_THREAD_ID="$thread_id" TERM_PROGRAM=iTerm.app \
     rm -f "$tmp"
     exit 1
 fi
+# git commit -m/-F keeps comment lines. They must stay above the footer,
+# not be moved under runtime: where they become the last stored block.
 if ! awk -v id="$thread_id" '
-    /^#/ { exit }
-    $0 == "session_id: " id { found=1 }
-    END { exit !found }
+    /^# Please enter/ { saw=1 }
+    $0 == "session_id: " id { if (saw) found=1; else below=1 }
+    END { exit !(found && !below) }
 ' "$tmp"; then
-    printf 'FAIL generator: interactive trailers landed after the comment template\n' >&2
+    printf 'FAIL generator: template comment landed below the footer\n' >&2
     cat "$tmp" >&2
     rm -f "$tmp"
     exit 1
@@ -647,6 +682,80 @@ Why this commit exists." \
 expect_absent claude-without-own-session "$out" "session_id:"
 printf 'ok generator: agent env must belong to the subject\n'
 
+subject_junie='[junie/interactive] fix: keep the native session id'
+junie_id="260408-214715-abcd"
+out="$(gen "$subject_junie
+
+Why this commit exists." JUNIE_SESSION_ID="$junie_id" VC_SESSION_PID=0)"
+expect_line junie-native-id "$out" "session_id: $junie_id"
+tmp="$(mktemp)"
+printf '%s\n' "$out" >"$tmp"
+if ! hook_env JUNIE_SESSION_ID="$junie_id" TERM_PROGRAM=iTerm.app "$hook" "$tmp" >/dev/null 2>&1; then
+    printf 'FAIL validator: native Junie session id rejected\n' >&2
+    hook_env JUNIE_SESSION_ID="$junie_id" TERM_PROGRAM=iTerm.app "$hook" "$tmp" >&2 || true
+    rm -f "$tmp"
+    exit 1
+fi
+rm -f "$tmp"
+printf 'ok validator: native Junie session id accepted\n'
+
+out="$(gen "$subject_agent
+
+Why this commit exists." JUNIE_SESSION_ID="$junie_id" VC_SESSION_PID=0)"
+expect_absent codex-does-not-record-junie "$out" "session_id:"
+
+out="$(gen "$subject_claude
+
+Why this commit exists." CLAUDE_CODE_SESSION_ID="$claude_id" CLAUDE_PID=111 CODEX_PID=222 VC_SESSION_PID=1)"
+expect_line claude-pid-matches-subject "$out" "session_pid: 111"
+expect_absent claude-pid-ignores-codex "$out" "session_pid: 222"
+
+# An authored comment kept by git commit -F stays above the footer.
+out="$(gen "$subject_agent
+
+Why this commit exists.
+
+# authored note" CODEX_SESSION_ID="$real_session" VC_SESSION_PID=0)"
+if ! printf '%s\n' "$out" | awk '
+    /^# authored note$/ { saw=1 }
+    /^session_id: / { if (saw) found=1; else below=1 }
+    END { exit !(found && !below) }
+'; then
+    printf 'FAIL generator: authored comment landed below the footer\n' >&2
+    printf '%s\n' "$out" >&2
+    exit 1
+fi
+printf 'ok generator: authored comment stays above the footer\n'
+
+reject prose-scissors-hides-nothing "$(
+    cat <<'EOF'
+[codex/interactive] chore: describe the change
+
+Why this commit exists.
+
+NOTE ------------------------ >8 ------------------------
+Co-Authored-By: Vendor <bot@openai.com>
+
+Authored-By: codex <agents@vetcoders.io>
+session_id: 019e93be-379d-7303-9ad4-ffae468db99f
+time: 2026-06-04T14:08:27-06:00
+runtime: iterm2
+EOF
+)" "vendor footers"
+
+reject codex-rejects-junie-shaped-id "$(
+    cat <<'EOF'
+[codex/interactive] chore: describe the change
+
+Why this commit exists.
+
+Authored-By: codex <agents@vetcoders.io>
+session_id: 260408-214715-abcd
+time: 2026-06-04T14:08:27-06:00
+runtime: iterm2
+EOF
+)" "session_id"
+
 reject body-session-is-not-a-trailer "$(
     cat <<'EOF'
 [codex/interactive] chore: describe the change
@@ -691,7 +800,22 @@ for copy in "$root/tools/githooks/pre-push" "$root/tools/git-hooks/pre-push"; do
         printf 'FAIL pre-push: %s still classifies a missing baseline from the tip commit\n' "$copy" >&2
         exit 1
     fi
+    if ! grep -q 'refs/remotes/${remote}/HEAD' "$copy"; then
+        printf 'FAIL pre-push: %s does not base a first push on the destination remote\n' "$copy" >&2
+        exit 1
+    fi
 done
 printf 'ok pre-push: default branch is not origin/develop\n'
+
+# A prose token in front of >8 must not be treated as Git's scissors marker.
+for name in commit-msg prepare-commit-msg; do
+    for dir in githooks git-hooks; do
+        if grep -F -q '[^[:space:]]+[[:space:]]*-{2,}' "$root/tools/$dir/$name"; then
+            printf 'FAIL scissors: %s/%s still accepts any word as the cut prefix\n' "$dir" "$name" >&2
+            exit 1
+        fi
+    done
+done
+printf 'ok scissors: cut prefix is not an arbitrary word\n'
 
 printf 'commit provenance selftest: all passed\n'
