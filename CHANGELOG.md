@@ -108,6 +108,17 @@ record that is drained without parsing, and a malformed one that fails to
 parse — because the reason we could not read it makes no difference to the
 scope.
 
+The evidence readers take their input at its word. A `workdir` literal runs to
+the quote that opened it, so `"/Users/O'Brien/repo"` is no longer cut to
+`/Users/O`; a JavaScript template literal is read like any other string, and
+one that interpolates — or any literal that never closes — is unreadable
+evidence rather than a fabricated path. A truncated record's `type` counts as
+read only when its value survived the cap, so an envelope plus a payload type
+cut mid-value no longer passes as two readable discriminators. Where lexical
+containment is the only evidence, a Windows spelling is compared the way
+Windows resolves it: `C:/repo` contains `C:\repo\pkg` and `c:\REPO\pkg`, so a
+rollout that mixes separators or case keeps its intents.
+
 #### Host resolution is out of the deterministic parser model
 
 Resolving repository identity reads the local filesystem: which checkouts

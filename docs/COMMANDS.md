@@ -244,7 +244,12 @@ bucket. Evidence that exists but could not be read is unattributed for the
 same reason, whether it was too large for the bounded reader's per-record cap
 or malformed: why we could not read it makes no difference to the scope. That
 decision is made structurally, so an oversized payload cannot spend its own
-unreadable bytes arguing it was never a tool call.
+unreadable bytes arguing it was never a tool call, and a record type counts as
+read only when its value was: a payload `type` cut off mid-value proves
+nothing. A `workdir` that a tool call writes but does not state is unreadable
+too — a JavaScript template literal that interpolates, or a literal that never
+closes. A readable value runs to the quote that opened it, in any of the three
+quote styles, so `"/Users/O'Brien/repo"` is one path.
 Within a mixed
 session a frame must positively prove membership in the requested project —
 silence and conflicting evidence never inherit the session bucket — while
@@ -255,7 +260,9 @@ nested checkout or submodule sits lexically under its parent checkout and is
 a different repo, so its frames do not join the parent's bucket — and the
 legacy path-segment fallback does not re-admit them either, however the path
 happens to be spelled. Lexical containment survives only where identity is
-unknowable — a workdir that does not exist on this machine. Identity is
+unknowable — a workdir that does not exist on this machine — and there a
+Windows spelling is compared the way Windows resolves it (either separator,
+letter case ignored), a Unix spelling byte for byte. Identity is
 canonical (one checkout reached two ways is one repo) and existence-checked (a
 deleted subdirectory does not inherit its ancestor's `.git`); a relative
 `workdir` resolves against the turn's cwd, never against the directory `aicx`
