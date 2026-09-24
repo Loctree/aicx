@@ -296,8 +296,11 @@ subdirectory the session ran in, and its descendants belong to it: a vanished
 is a path component, so `vendor/fleet-bus-old` is an ordinary directory.
 
 A cataloged row with a project but no cwd gives membership nothing to prove
-itself against, which is not the same as proving it: such a session is routed
-through the census lane rather than published whole under the row's project.
+itself against, which is not the same as proving it: when its frames name a
+cwd, the session is routed through the census lane rather than published whole
+under the row's project, and each such frame must prove membership on its own.
+A frame that records no cwd has no scope evidence either way: it keeps the
+row's project, as before, unless the session is mixed.
 
 Where a frame's scope came from is recorded in two places for two reasons. The
 cwd the rollout wrote down is a fact and is never overwritten; this host's
