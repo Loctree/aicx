@@ -136,6 +136,9 @@ session_id=""
 # Junie ids are the session directory minus the "session-" prefix
 # (src/sessions.rs): 260408-214715-abcd, not a UUID. Other lanes stay UUID-only.
 junie_session_re='^[0-9]{6}(-[A-Za-z0-9]+)+$'
+# Gemini keeps the sessionId string from the transcript JSON. The e2e fixture
+# is session-gemini-marble-l1-coverage; other saved ids are short tokens.
+gemini_session_re='^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$'
 if [ -z "$session_rejected" ] && printf '%s' "$session_raw" | grep -Eq '^[0-9a-fA-F]{32}$'; then
     session_id="$(printf '%s' "$session_raw" \
         | sed -E 's/^(.{8})(.{4})(.{4})(.{4})(.{12})$/\1-\2-\3-\4-\5/' | tr 'A-F' 'a-f')"
@@ -144,6 +147,9 @@ elif [ -z "$session_rejected" ] && printf '%s' "$session_raw" \
     session_id="$(printf '%s' "$session_raw" | tr 'A-F' 'a-f')"
 elif [ -z "$session_rejected" ] && [ "$agent" = "junie" ] \
     && printf '%s' "$session_raw" | grep -Eq "$junie_session_re"; then
+    session_id="$session_raw"
+elif [ -z "$session_rejected" ] && [ "$agent" = "gemini" ] \
+    && printf '%s' "$session_raw" | grep -Eq "$gemini_session_re"; then
     session_id="$session_raw"
 elif [ -n "$session_raw" ]; then
     session_rejected=1
@@ -241,22 +247,69 @@ apply_trailers() {
             return o
         }
         function is_comment(s) { return comment_prefix != "" && index(s, comment_prefix) == 1 }
-        # Auto candidates from adjust_comment_line_char in builtin/commit.c.
+        # Candidate order from adjust_comment_line_char in git 2.51.
         function is_auto_char(c) { return index("#;@!$%^&|:", c) > 0 }
         function rest_is_cut(rest) {
             return rest ~ /^[[:space:]]+-{2,}[[:space:]]*>8[[:space:]]*-{2,}[[:space:]]*$/
         }
-        # Configured prefix, or in auto mode exactly one character Git can
-        # choose. A prose token such as NOTE is not a cut.
-        function is_scissors(s,    c, rest) {
-            if (match(s, /^[^[:space:]]+/)) {
-                if (comment_mode == "auto" && RLENGTH != 1) return 0
-            } else {
-                return 0
+        function token_len(s) {
+            if (match(s, /^[^[:space:]]+/)) return RLENGTH
+            return 0
+        }
+        function candidate_scissors(s,    c) {
+            if (token_len(s) != 1) return 0
+            c = substr(s, 1, 1)
+            if (!is_auto_char(c)) return 0
+            return rest_is_cut(substr(s, 2))
+        }
+        function strike(ch,    i, c, out) {
+            out = ""
+            for (i = 1; i <= length(alive); i++) {
+                c = substr(alive, i, 1)
+                if (c != ch) out = out c
             }
+            alive = out
+        }
+        # Same rule as git 2.51. Status text and a verbose diff are added
+        # after the choice, so they are not part of the scan. A trailing run
+        # of blank lines and "#" lines is ignored_log_message_bytes. An
+        # authored "; >8" line still begins with ";" and blocks that candidate.
+        function choose_auto(    i, j, c, scan_end, saw_hash) {
+            for (i = 1; i <= n; i++) {
+                if (index(lines[i], "Please enter the commit message") > 0) {
+                    c = substr(lines[i], 1, 1)
+                    if (is_auto_char(c)) return c
+                }
+            }
+            scan_end = n
+            for (i = 1; i <= n; i++) {
+                if (!candidate_scissors(lines[i])) continue
+                j = i + 1
+                while (j <= n && is_blank(lines[j])) j++
+                if (j <= n && (index(lines[j], "diff --git") == 1 || index(lines[j], "diff --cc") == 1)) {
+                    scan_end = i - 1
+                    break
+                }
+            }
+            while (scan_end >= 1 && (is_blank(lines[scan_end]) || index(lines[scan_end], "#") == 1))
+                scan_end--
+            saw_hash = 0
+            for (i = 1; i <= scan_end; i++) {
+                if (index(lines[i], "#") > 0) saw_hash = 1
+            }
+            if (!saw_hash) return "#"
+            alive = "#;@!$%^&|:"
+            for (i = 1; i <= scan_end; i++) {
+                if (is_blank(lines[i])) continue
+                c = substr(lines[i], 1, 1)
+                if (is_auto_char(c)) strike(c)
+            }
+            if (alive == "") return "#"
+            return substr(alive, 1, 1)
+        }
+        function is_scissors(s,    rest) {
             if (comment_mode == "auto") {
-                c = substr(s, 1, 1)
-                if (!is_auto_char(c)) return 0
+                if (token_len(s) != 1 || substr(s, 1, 1) != comment_prefix) return 0
                 return rest_is_cut(substr(s, 2))
             }
             if (comment_prefix == "" || index(s, comment_prefix) != 1) return 0
@@ -278,11 +331,12 @@ apply_trailers() {
             sub(/\r$/, "")
             n++
             lines[n] = $0
-            if (!cut && is_scissors($0)) cut = n
         }
         END {
-            if (cut && comment_mode == "auto") {
-                comment_prefix = substr(lines[cut], 1, 1)
+            if (comment_mode == "auto") comment_prefix = choose_auto()
+            cut = 0
+            for (i = 1; i <= n; i++) {
+                if (is_scissors(lines[i])) { cut = i; break }
             }
             limit = cut ? cut - 1 : n
             cstart = limit + 1
@@ -404,6 +458,9 @@ if [ -n "$session_rejected" ]; then
     else
         if [ "$agent" = "junie" ]; then
             printf 'prepare-commit-msg: session identity from %s is not a Junie session id or a UUID; not using it.\n' \
+                "$session_source" >&2
+        elif [ "$agent" = "gemini" ]; then
+            printf 'prepare-commit-msg: session identity from %s is not a Gemini session id or a UUID; not using it.\n' \
                 "$session_source" >&2
         else
             printf 'prepare-commit-msg: session identity from %s is not a UUID; not using it.\n' \

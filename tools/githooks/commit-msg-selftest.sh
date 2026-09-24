@@ -592,14 +592,15 @@ fi
 rm -f "$tmp"
 printf 'ok generator: trailers sit above a semicolon scissors line\n'
 
-# commentChar=auto: a hash-prefixed body line forces Git to pick another
-# marker. The hook must cut on that marker, not on a hard-coded '#'.
+# commentChar=auto: a non-trailing hash line strikes "#", so Git's next
+# candidate is ";". The verbose diff is added after that choice. The "#"
+# line has to sit above other body text; a trailing "#" line does not strike.
 tmp="$(mktemp)"
 cat >"$tmp" <<EOF
 $subject_agent
 
-Why this commit exists.
 # not a comment, so auto cannot pick hash
+Why this commit exists.
 
 ; ------------------------ >8 ------------------------
 diff --git a/README.md b/README.md
@@ -627,6 +628,56 @@ if ! awk -v id="$thread_id" '
 fi
 rm -f "$tmp"
 printf 'ok generator: auto commentChar still cuts on the real scissors line\n'
+
+# An authored ";" scissors is not Git's marker: the line itself blocks ";",
+# so validation still sees a vendor footer underneath it.
+tmp="$(mktemp)"
+err="$(mktemp)"
+cat >"$tmp" <<EOF
+$subject_agent
+
+Why this commit exists.
+
+; ------------------------ >8 ------------------------
+Co-Authored-By: Vendor <bot@openai.com>
+EOF
+if hook_env \
+    GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.commentChar GIT_CONFIG_VALUE_0=auto \
+    CODEX_SESSION_ID="$real_session" TERM_PROGRAM=iTerm.app \
+    "$hook" "$tmp" >/dev/null 2>"$err"; then
+    printf 'FAIL validator: authored semicolon scissors hid a vendor footer\n' >&2
+    rm -f "$tmp" "$err"
+    exit 1
+fi
+if ! grep -Fq "vendor footers" "$err"; then
+    printf 'FAIL validator: authored semicolon scissors (missing vendor footers)\n' >&2
+    cat "$err" >&2
+    rm -f "$tmp" "$err"
+    exit 1
+fi
+rm -f "$tmp" "$err"
+printf 'ok validator: authored semicolon scissors is not a cut\n'
+
+# auto mode, no scissors: a "#" line above the footer is body when Git has
+# to pick another character. It must not be skipped as a "#" comment.
+tmp="$(mktemp)"
+cat >"$tmp" <<EOF
+$subject_agent
+
+# explanation
+EOF
+if ! hook_env \
+    GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.commentChar GIT_CONFIG_VALUE_0=auto \
+    CODEX_SESSION_ID="$real_session" TERM_PROGRAM=iTerm.app \
+    "$hook" "$tmp" >/dev/null 2>&1; then
+    printf 'FAIL validator: auto mode rejected a hash body line\n' >&2
+    hook_env GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.commentChar GIT_CONFIG_VALUE_0=auto \
+        CODEX_SESSION_ID="$real_session" TERM_PROGRAM=iTerm.app "$hook" "$tmp" >&2 || true
+    rm -f "$tmp"
+    exit 1
+fi
+rm -f "$tmp"
+printf 'ok validator: auto mode keeps a hash line as body\n'
 
 # A body citation of the old key is not a legacy trailer.
 out="$(gen "$subject_agent
@@ -698,6 +749,28 @@ if ! hook_env JUNIE_SESSION_ID="$junie_id" TERM_PROGRAM=iTerm.app "$hook" "$tmp"
 fi
 rm -f "$tmp"
 printf 'ok validator: native Junie session id accepted\n'
+
+subject_gemini='[gemini/interactive] fix: keep the native session id'
+gemini_id="session-gemini-marble-l1-coverage"
+out="$(gen "$subject_gemini
+
+Why this commit exists." GEMINI_SESSION_ID="$gemini_id" VC_SESSION_PID=0)"
+expect_line gemini-native-id "$out" "session_id: $gemini_id"
+tmp="$(mktemp)"
+printf '%s\n' "$out" >"$tmp"
+if ! hook_env GEMINI_SESSION_ID="$gemini_id" TERM_PROGRAM=iTerm.app "$hook" "$tmp" >/dev/null 2>&1; then
+    printf 'FAIL validator: native Gemini session id rejected\n' >&2
+    hook_env GEMINI_SESSION_ID="$gemini_id" TERM_PROGRAM=iTerm.app "$hook" "$tmp" >&2 || true
+    rm -f "$tmp"
+    exit 1
+fi
+rm -f "$tmp"
+printf 'ok validator: native Gemini session id accepted\n'
+
+out="$(gen "$subject_agent
+
+Why this commit exists." GEMINI_SESSION_ID="$gemini_id" VC_SESSION_PID=0)"
+expect_absent codex-does-not-record-gemini "$out" "session_id:"
 
 out="$(gen "$subject_agent
 

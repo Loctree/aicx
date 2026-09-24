@@ -38,9 +38,13 @@ same generator runs again from `commit-msg` after the message is saved.
 Trailers are inserted before Git's scissors line (`git commit -v`,
 `commit.cleanup=scissors`). The marker is the configured comment prefix
 (`core.commentString`, otherwise `core.commentChar`) followed by the `>8`
-shape. `core.commentChar=auto` matches only a one-character prefix from the
-set Git can choose (`#;@!$%^&|:`). A prose line that merely contains `>8` is
-not a cut, so a footer after it is still validated. The validator reads the
+shape. `core.commentChar=auto` uses the one character Git 2.51 would select
+(`#`, then `;@!$%^&|:`), not every character in that set. Current Git warns
+that `auto` is deprecated and scheduled for removal in Git 3.0; until then
+the hook follows the selector Git still runs. A line that begins
+with a candidate blocks it, including an authored `>8` line, so that line is
+not a cut. A prose word in front of `>8` is not a cut either. The footer
+after either line is still validated. The validator reads the
 text above that cut, which is the text Git keeps. A `Signed-off-by` line in
 the footer stays where it is; only the measured provenance keys are overwritten.
 Comment lines that Git will keep (`git commit -m` / `-F`, or
@@ -63,9 +67,11 @@ An agent-specific variable is used only when it belongs to the subject, and
 the `aicx` fallback only when its `agent` matches too. A human
 lane (`maciej`, `monika`, or runtime `manual`) does not read those variables.
 Its only automatic fallback is `ATUIN_SESSION`, and that fallback is not used
-for agents. `session_id` is a UUID on every lane except Junie. Junie
-transcripts use the directory id AICX already returns, `YYMMDD-HHMMSS-suffix`
-(for example `260408-214715-abcd`), not a fabricated UUID.
+for agents. `session_id` is a UUID on every lane except Junie and Gemini.
+Junie transcripts use the directory id AICX already returns,
+`YYMMDD-HHMMSS-suffix` (for example `260408-214715-abcd`). Gemini keeps the
+native `sessionId` string (for example `session-gemini-marble-l1-coverage`),
+not a fabricated UUID.
 
 `runtime:` is written only from `VIBECRAFTED_COMMIT_RUNTIME`,
 `VIBECRAFTED_RUNTIME`, or a recognized `TERM_PROGRAM` (`iTerm.app` /
