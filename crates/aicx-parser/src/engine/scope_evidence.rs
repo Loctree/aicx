@@ -253,7 +253,16 @@ pub fn truncated_record_is_tool_call(prefix: &str) -> bool {
     // payload type, hiding a tool call behind a megabyte of `arguments`.
     // Seeing one discriminator (the envelope's) or none is not evidence that
     // nothing was lost, so it fails closed.
-    discriminators.len() < 2
+    //
+    // Only a discriminator whose VALUE was read counts toward that proof. A
+    // `"type":"funct` cut by the cap is a key without an answer: counting it
+    // let an envelope plus a truncated payload type pass as two readable
+    // discriminators and keep the window attributed.
+    discriminators
+        .iter()
+        .filter(|value| !value.is_empty())
+        .count()
+        < 2
 }
 
 /// Values of every `"type"` key that can be a RECORD discriminator in the
@@ -336,8 +345,10 @@ fn record_type_discriminators(prefix: &str) -> Vec<String> {
         while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
             cursor += 1;
         }
-        // A discriminator truncated before its value is still a discriminator
-        // that was there: counting it keeps the fail-closed threshold honest.
+        // A discriminator truncated before or inside its value, or carrying a
+        // value that is not a string, is recorded as empty: the key was
+        // there, its answer was not read, and the threshold above must not
+        // count it as proof of anything.
         match bytes.get(cursor) {
             Some(b'"') => match read_string(cursor) {
                 Some((value, after)) => {
@@ -1507,6 +1518,27 @@ mod tests {
             !truncated_record_is_tool_call(readable),
             "two structural discriminators, neither a call"
         );
+    }
+
+    /// Finding: a payload `type` cut inside its value was recorded as an
+    /// empty discriminator and still counted, so an envelope plus a truncated
+    /// payload type read as two readable discriminators — neither a call — and
+    /// the record kept its window attributed. A key without its answer proves
+    /// nothing.
+    #[test]
+    fn a_truncated_payload_type_is_not_a_readable_discriminator() {
+        let envelope = r#"{"timestamp":"2026-09-22T00:00:00Z","type":"response_item","payload":{"#;
+        for cut in [r#""type":"funct"#, r#""type":"#, r#""type": "#] {
+            let prefix = format!("{envelope}{cut}");
+            assert!(
+                truncated_record_is_tool_call(&prefix),
+                "`{cut}` hides the payload type, so the record may be a call"
+            );
+        }
+        // A discriminator whose value is not a string is not a readable answer
+        // either.
+        let odd = format!(r#"{envelope}"type":null,"arguments":"#);
+        assert!(truncated_record_is_tool_call(&odd));
     }
 
     /// Finding: replaying a session whose checkout is gone from this machine.
