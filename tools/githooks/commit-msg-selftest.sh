@@ -726,6 +726,37 @@ fi
 rm -f "$tmp"
 printf 'ok generator: first scissors marker is the cut\n'
 
+# A short ">8" line is not Git's marker. A vendor footer under it stays
+# visible when a later exact marker is what Git will actually remove.
+tmp="$(mktemp)"
+err="$(mktemp)"
+cat >"$tmp" <<EOF
+$subject_agent
+
+Why this commit exists.
+
+# -- >8 --
+Co-Authored-By: Vendor <bot@openai.com>
+
+# ------------------------ >8 ------------------------
+# Do not modify or remove the line above.
+diff --git a/README.md b/README.md
+EOF
+if hook_env CODEX_SESSION_ID="$real_session" TERM_PROGRAM=iTerm.app \
+    "$hook" "$tmp" >/dev/null 2>"$err"; then
+    printf 'FAIL validator: short scissors shape hid a vendor footer\n' >&2
+    rm -f "$tmp" "$err"
+    exit 1
+fi
+if ! grep -Fq "vendor footers" "$err"; then
+    printf 'FAIL validator: short scissors shape (missing vendor footers)\n' >&2
+    cat "$err" >&2
+    rm -f "$tmp" "$err"
+    exit 1
+fi
+rm -f "$tmp" "$err"
+printf 'ok validator: only the exact 24-hyphen marker is a cut\n'
+
 # Git before 2.45 ignores core.commentString. A ;; value must not hide the
 # hash marker Git actually wrote.
 tmp="$(mktemp)"

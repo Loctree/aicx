@@ -111,7 +111,7 @@ comment_prefix="$(awk \
     function is_blank(s) { return s ~ /^[[:space:]]*$/ }
     function is_auto_char(c) { return index("#;@!$%^&|:", c) > 0 }
     function rest_is_cut(rest) {
-        return rest ~ /^[[:space:]]+-{2,}[[:space:]]*>8[[:space:]]*-{2,}[[:space:]]*$/
+        return rest ~ /^ ------------------------ >8 ------------------------[[:space:]]*$/
     }
     function token_len(s) {
         if (match(s, /^[^[:space:]]+/)) return RLENGTH

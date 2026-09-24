@@ -38,7 +38,8 @@ same generator runs again from `commit-msg` after the message is saved.
 Trailers are inserted before Git's scissors line (`git commit -v`,
 `commit.cleanup=scissors`). The marker is the configured comment prefix
 (`core.commentString`, otherwise `core.commentChar`) followed by the `>8`
-shape. `core.commentChar=auto` uses the one character Git 2.51 would select
+shape. The marker payload is Git's exact line: 24 hyphens, `>8`, 24 hyphens.
+A shorter `>8` line is not a cut. `core.commentChar=auto` uses the one character Git 2.51 would select
 (`#`, then `;@!$%^&|:`), not every character in that set. Current Git warns
 that `auto` is deprecated and scheduled for removal in Git 3.0; until then
 the hook follows the selector Git still runs. `core.commentString` is read

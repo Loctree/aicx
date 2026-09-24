@@ -285,8 +285,10 @@ apply_trailers() {
         function is_comment(s) { return comment_prefix != "" && index(s, comment_prefix) == 1 }
         # Candidate order from adjust_comment_line_char in git 2.51.
         function is_auto_char(c) { return index("#;@!$%^&|:", c) > 0 }
+        # Git cut_line is exactly 24 hyphens, a space, ">8", a space, 24 hyphens.
+        # A shorter authored ">8" line is not a marker Git will remove.
         function rest_is_cut(rest) {
-            return rest ~ /^[[:space:]]+-{2,}[[:space:]]*>8[[:space:]]*-{2,}[[:space:]]*$/
+            return rest ~ /^ ------------------------ >8 ------------------------[[:space:]]*$/
         }
         function token_len(s) {
             if (match(s, /^[^[:space:]]+/)) return RLENGTH
