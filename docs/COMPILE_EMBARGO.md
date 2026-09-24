@@ -19,7 +19,8 @@ That `pre-push` then runs for every push, including when no embargo marker is
 open. On the first push of a branch the comparison base is the destination
 remote. For `origin`, that is `origin/HEAD`, and a missing or `develop`
 symref falls back to `origin/main`. For any other remote it is that remote's
-HEAD. If the destination has no usable baseline, the hook runs the full gate
+HEAD, including when that default is `develop`. Only a missing HEAD falls
+back to `<remote>/main`. If the destination has no usable baseline, the hook runs the full gate
 instead of treating the push as the delta from `origin/main` or looking only
 at the tip commit. It does not use `origin/develop`.
 Run `tools/git-hooks/selftest.sh` to exercise the commit, push, and installer

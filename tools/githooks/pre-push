@@ -39,8 +39,10 @@ while read -r _lref lsha _rref rsha; do
       esac
     else
       default_ref=$(git symbolic-ref --quiet "refs/remotes/${remote}/HEAD" 2>/dev/null || true)
+      # Keep a real default, including develop. Only a missing HEAD falls
+      # back to main, and a missing main fails closed below.
       case "$default_ref" in
-        ""|*"/develop") default_ref="refs/remotes/${remote}/main" ;;
+        "") default_ref="refs/remotes/${remote}/main" ;;
       esac
     fi
     if ! git rev-parse --verify -q "${default_ref}^{commit}" >/dev/null 2>&1; then

@@ -142,12 +142,6 @@ comment_prefix="$(awk \
         alive = out
     }
     function choose_auto(    i, j, c, scan_end, saw_hash) {
-        for (i = 1; i <= n; i++) {
-            if (index(lines[i], "Please enter the commit message") > 0) {
-                c = substr(lines[i], 1, 1)
-                if (is_auto_char(c)) return c
-            }
-        }
         scan_end = n
         for (i = 1; i <= n; i++) {
             if (!candidate_scissors(lines[i])) continue

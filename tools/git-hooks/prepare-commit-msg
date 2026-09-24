@@ -333,12 +333,9 @@ apply_trailers() {
         # of blank lines and "#" lines is ignored_log_message_bytes. An
         # authored "; >8" line still begins with ";" and blocks that candidate.
         function choose_auto(    i, j, c, scan_end, saw_hash) {
-            for (i = 1; i <= n; i++) {
-                if (index(lines[i], "Please enter the commit message") > 0) {
-                    c = substr(lines[i], 1, 1)
-                    if (is_auto_char(c)) return c
-                }
-            }
+            # Do not trust a line that merely contains the template phrase.
+            # An authored "; Please enter ..." line occupies ";" and Git
+            # will not select it.
             scan_end = n
             for (i = 1; i <= n; i++) {
                 if (!candidate_scissors(lines[i])) continue
@@ -381,8 +378,14 @@ apply_trailers() {
         function is_trailer(s) {
             return s ~ /^[A-Za-z][A-Za-z0-9_-]*: /
         }
-        function is_ours(s) {
-            return s ~ /^(Authored-By|session_id|session_pid|time|runtime): /
+        function key_of(s,    p) {
+            p = index(s, ": ")
+            if (p == 0) return ""
+            return tolower(substr(s, 1, p - 1))
+        }
+        function is_ours(s,    k) {
+            k = key_of(s)
+            return k == "authored-by" || k == "session_id" || k == "session_pid" || k == "time" || k == "runtime"
         }
         function field(s, p) {
             p = index(s, ": ")
@@ -448,11 +451,12 @@ apply_trailers() {
             rt = ""
             for (i = bstart; i <= bend; i++) {
                 if (is_blank(lines[i]) || !is_ours(lines[i])) continue
-                if (lines[i] ~ /^Authored-By: /) ab = field(lines[i])
-                else if (lines[i] ~ /^session_id: /) sid = field(lines[i])
-                else if (lines[i] ~ /^session_pid: /) spid = field(lines[i])
-                else if (lines[i] ~ /^time: /) tm = field(lines[i])
-                else if (lines[i] ~ /^runtime: /) rt = field(lines[i])
+                k = key_of(lines[i])
+                if (k == "authored-by") ab = field(lines[i])
+                else if (k == "session_id") sid = field(lines[i])
+                else if (k == "session_pid") spid = field(lines[i])
+                else if (k == "time") tm = field(lines[i])
+                else if (k == "runtime") rt = field(lines[i])
             }
             if (authored_by != "") ab = authored_by
             if (session_id != "") sid = session_id
@@ -492,15 +496,16 @@ apply_trailers() {
                 if (body_end >= 1 || printed_comments) print ""
                 for (i = bstart; i <= bend; i++) {
                     if (is_blank(lines[i])) continue
-                    if (lines[i] ~ /^Authored-By: /) {
+                    k = key_of(lines[i])
+                    if (k == "authored-by") {
                         if (!seen_ab && ab != "") { print "Authored-By: " ab; seen_ab = 1 }
-                    } else if (lines[i] ~ /^session_id: /) {
+                    } else if (k == "session_id") {
                         if (!seen_sid && sid != "") { print "session_id: " sid; seen_sid = 1 }
-                    } else if (lines[i] ~ /^session_pid: /) {
+                    } else if (k == "session_pid") {
                         if (!seen_spid && spid != "") { print "session_pid: " spid; seen_spid = 1 }
-                    } else if (lines[i] ~ /^time: /) {
+                    } else if (k == "time") {
                         if (!seen_tm && tm != "") { print "time: " tm; seen_tm = 1 }
-                    } else if (lines[i] ~ /^runtime: /) {
+                    } else if (k == "runtime") {
                         if (!seen_rt && rt != "") { print "runtime: " rt; seen_rt = 1 }
                     } else {
                         print lines[i]

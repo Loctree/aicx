@@ -31,8 +31,11 @@ hook_env() {
         TERM_PROGRAM= \
         VC_SESSION_PID=0 \
         VC_GIT_VERSION= \
+        GIT_CONFIG_GLOBAL=/dev/null \
+        GIT_CONFIG_SYSTEM=/dev/null \
+        GIT_CONFIG_NOSYSTEM=1 \
         PATH="/usr/bin:/bin" \
-        HOME="${HOME:-/tmp}" \
+        HOME="${VC_HOOK_TEST_HOME:-/tmp}" \
         TMPDIR="${TMPDIR:-/tmp}" \
         "$@"
 }
@@ -505,6 +508,44 @@ if ! awk -v id="$thread_id" '
 fi
 rm -f "$tmp"
 printf 'ok generator: scissors marker does not need English prose\n'
+
+# An authored copy of Git's template phrase must not choose its prefix.
+# The line starts with ";", so Git leaves ";" occupied and keeps "#".
+tmp="$(mktemp)"
+cat >"$tmp" <<EOF
+$subject_agent
+
+; Please enter the commit message for your changes.
+Why this commit exists.
+
+# ------------------------ >8 ------------------------
+# Do not modify or remove the line above.
+diff --git a/README.md b/README.md
+session_id: $other_id
+EOF
+if ! hook_env \
+    GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.commentChar GIT_CONFIG_VALUE_0=auto \
+    CODEX_THREAD_ID="$thread_id" TERM_PROGRAM=iTerm.app \
+    "$hook" "$tmp" >/dev/null 2>&1; then
+    printf 'FAIL generator: forged template phrase rejected the commit\n' >&2
+    hook_env GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.commentChar GIT_CONFIG_VALUE_0=auto \
+        CODEX_THREAD_ID="$thread_id" TERM_PROGRAM=iTerm.app "$hook" "$tmp" >&2 || true
+    cat "$tmp" >&2
+    rm -f "$tmp"
+    exit 1
+fi
+if ! awk -v id="$thread_id" '
+    /^#[[:space:]]*-{2,}[[:space:]]*>8/ { exit }
+    $0 == "session_id: " id { found=1 }
+    END { exit !found }
+' "$tmp"; then
+    printf 'FAIL generator: forged template phrase hid the hash scissors line\n' >&2
+    cat "$tmp" >&2
+    rm -f "$tmp"
+    exit 1
+fi
+rm -f "$tmp"
+printf 'ok generator: authored template phrase does not choose the prefix\n'
 
 # A citation in the body is not a footer. The measured runtime is appended;
 # the cited line stays.
@@ -1026,6 +1067,15 @@ expect_line whitespace-session-skipped "$out" "session_id: $thread_id"
 
 out="$(gen "$subject_agent
 
+Why this commit exists.
+
+authored-by: vendor <vendor@example.test>" CODEX_SESSION_ID="$real_session" VC_SESSION_PID=0)"
+expect_line canonical-authored-by "$out" "Authored-By: codex <agents@vetcoders.io>"
+expect_absent lowercase-authored-by-kept "$out" "authored-by:"
+expect_absent lowercase-authored-by-vendor "$out" "vendor@example.test"
+
+out="$(gen "$subject_agent
+
 Why this commit exists." GEMINI_SESSION_ID="$gemini_id" VC_SESSION_PID=0)"
 expect_absent codex-does-not-record-gemini "$out" "session_id:"
 
@@ -1132,6 +1182,10 @@ for copy in "$root/tools/githooks/pre-push" "$root/tools/git-hooks/pre-push"; do
     fi
     if ! grep -q 'refs/remotes/${remote}/HEAD' "$copy"; then
         printf 'FAIL pre-push: %s does not base a first push on the destination remote\n' "$copy" >&2
+        exit 1
+    fi
+    if grep -F -q '*"/develop"' "$copy"; then
+        printf 'FAIL pre-push: %s rewrites a non-origin develop default to main\n' "$copy" >&2
         exit 1
     fi
 done
