@@ -882,7 +882,7 @@ impl ScopeReport {
     /// `status` alone cannot answer that: `ScopeStatus::MixedCandidate` is
     /// also how an ordinary branch switch inside ONE unchanged checkout is
     /// recorded. Whole-session attribution stays valid there — only a proven
-    /// workdir conflict or more than one observed cwd makes a session
+    /// workdir conflict or more than one observed repository makes a session
     /// unservable as one bucket.
     pub fn scope_mixed(&self) -> bool {
         // A hidden scope is evidence of another checkout, not absence of it.
@@ -890,7 +890,30 @@ impl ScopeReport {
         // what remains then looks homogeneous while we positively know it is
         // not — so one hidden scope is already mixed, with or without a second
         // visible one.
-        self.conflicts > 0 || self.hidden_scopes > 0 || self.cwds.len() > 1
+        self.conflicts > 0 || self.hidden_scopes > 0 || self.observed_repositories() > 1
+    }
+
+    /// How many repositories the observed cwds name.
+    ///
+    /// Two spellings inside one checkout — `/repo` and `/repo/pkg` after a
+    /// `cd` — are one repository, judged by the same membership predicate the
+    /// project filter applies to every frame; a nested checkout or submodule
+    /// is its own. Counting raw strings called every such session mixed, and
+    /// its cwd-less frames were then dropped from project results. Where
+    /// neither path resolves on this host the predicate falls back to lexical
+    /// containment, so two unrelated historical paths still count twice.
+    fn observed_repositories(&self) -> usize {
+        let mut repositories: Vec<&str> = Vec::new();
+        for cwd in &self.cwds {
+            let known = repositories.iter().any(|seen| {
+                aicx_parser::engine::workdir_within_scope(cwd, seen)
+                    || aicx_parser::engine::workdir_within_scope(seen, cwd)
+            });
+            if !known {
+                repositories.push(cwd);
+            }
+        }
+        repositories.len()
     }
 
     /// Does this session hold anything the cataloged checkout cannot claim?
@@ -1709,6 +1732,69 @@ mod harness_noise_tests {
         let report = scope_report_for_entries(&[unplaced, conflicted]);
         assert_eq!(report.status, ScopeStatus::MixedCandidate);
         assert_eq!(report.conflicts, 1);
+    }
+
+    /// Finding: the session scope counted distinct cwd STRINGS, so a session
+    /// that `cd`-ed from `/repo` into `/repo/pkg` read as mixed and its
+    /// cwd-less frames were dropped from project results. Repositories are
+    /// counted instead; a nested checkout still counts on its own.
+    #[test]
+    fn subdirectories_of_one_checkout_are_one_scope() {
+        let root = std::env::temp_dir().join(format!(
+            "aicx-scope-report-subdirs-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let repo = root.join("repo");
+        let nested = repo.join("vendor").join("fleet-bus");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(repo.join("pkg")).unwrap();
+        std::fs::create_dir_all(nested.join(".git")).unwrap();
+        let at = |cwd: &str, ts: i64| {
+            let mut frame = entry("user", "turn", ts);
+            frame.cwd = Some(cwd.to_owned());
+            frame
+        };
+        let top = repo.display().to_string();
+        let pkg = repo.join("pkg").display().to_string();
+
+        let report = scope_report_for_entries(&[at(&top, 1), at(&pkg, 2)]);
+        assert_eq!(
+            report.cwds.len(),
+            2,
+            "both spellings stay visible as evidence"
+        );
+        assert!(
+            !report.scope_mixed(),
+            "one checkout is one scope: {report:?}"
+        );
+        assert!(!report.scope_foreign_to(Some(&top)));
+
+        let report = scope_report_for_entries(&[at(&top, 1), at(&nested.display().to_string(), 2)]);
+        assert!(
+            report.scope_mixed(),
+            "a nested checkout is its own repository"
+        );
+
+        // Nothing resolves on this host: spelling is the only evidence left.
+        let historical = |cwd: &str| at(cwd, 3);
+        assert!(
+            !scope_report_for_entries(&[
+                historical("/aicx-scope-nowhere/repo"),
+                historical("/aicx-scope-nowhere/repo/pkg"),
+            ])
+            .scope_mixed()
+        );
+        assert!(
+            scope_report_for_entries(&[
+                historical("/aicx-scope-nowhere/repo/pkg"),
+                historical("/aicx-scope-nowhere/other"),
+            ])
+            .scope_mixed()
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Finding: `.aicxignore` removes frames BEFORE the report is built, so a
