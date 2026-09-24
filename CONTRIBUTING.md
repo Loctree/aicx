@@ -44,9 +44,10 @@ that `auto` is deprecated and scheduled for removal in Git 3.0; until then
 the hook follows the selector Git still runs. `core.commentString` is read
 only on Git 2.45 or newer; older Git ignores it and the hook uses
 `core.commentChar`. A line that begins with a candidate blocks it, including
-an authored `>8` line. That line is a cut only when Git's own explanation
-follows it (`git commit -v`). `git commit -F` keeps the suffix, so a footer
-there is still validated. A prose word in front of `>8` is not a cut either. The validator reads the
+an authored `>8` line. Git drops the suffix when a generated `git commit -v`
+marker is present, and the cut is the first marker, including one from
+`commit.template` above the status block. `git commit -F` keeps the suffix,
+so a footer there is still validated. A prose word in front of `>8` is not a cut either. The validator reads the
 text above that cut, which is the text Git keeps. A `Signed-off-by` line in
 the footer stays where it is; only the measured provenance keys are overwritten.
 Comment lines that Git will keep (`git commit -m` / `-F`, or
@@ -65,8 +66,11 @@ Two rules govern the split:
 The agent lane reads the same environment keys as `aicx sessions current`,
 in the same order: `AICX_SESSION_ID`, `CODEX_THREAD_ID`, `CODEX_SESSION_ID`,
 then the other agent session variables, then `aicx sessions current --json`.
-An agent-specific variable is used only when it belongs to the subject, and
-the `aicx` fallback only when its `agent` matches too. A human
+An agent-specific variable is used only when it belongs to the subject.
+`cursor-agent` is `cursor` and `gemini-antigravity` is `gemini` for that
+check; `Authored-By` keeps the spelling from the subject line. The `aicx`
+fallback is used only when its `agent` matches too, and that disk lookup
+includes Kimi transcripts under `~/.kimi-code/sessions`. A human
 lane (`maciej`, `monika`, or runtime `manual`) does not read those variables.
 Its only automatic fallback is `ATUIN_SESSION`, and that fallback is not used
 for agents. `session_id` is a UUID on every lane except Junie, Gemini, and a

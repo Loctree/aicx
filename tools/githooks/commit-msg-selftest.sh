@@ -689,6 +689,43 @@ fi
 rm -f "$tmp" "$err"
 printf 'ok validator: commit -F keeps the suffix visible\n'
 
+# A template marker before Git's generated -v marker is the cut. Trailers
+# placed before the later marker would be truncated with the status block.
+tmp="$(mktemp)"
+cat >"$tmp" <<EOF
+$subject_agent
+
+Why this commit exists.
+
+# ------------------------ >8 ------------------------
+template notes that cleanup drops
+
+# ------------------------ >8 ------------------------
+# Do not modify or remove the line above.
+diff --git a/README.md b/README.md
+session_id: $other_id
+EOF
+if ! hook_env CODEX_THREAD_ID="$thread_id" TERM_PROGRAM=iTerm.app \
+    "$hook" "$tmp" >/dev/null 2>&1; then
+    printf 'FAIL generator: template scissors message rejected\n' >&2
+    hook_env CODEX_THREAD_ID="$thread_id" TERM_PROGRAM=iTerm.app "$hook" "$tmp" >&2 || true
+    cat "$tmp" >&2
+    rm -f "$tmp"
+    exit 1
+fi
+if ! awk -v id="$thread_id" '
+    /^#[[:space:]]*-{2,}[[:space:]]*>8/ { exit }
+    $0 == "session_id: " id { found=1 }
+    END { exit !found }
+' "$tmp"; then
+    printf 'FAIL generator: session_id is not above the first scissors marker\n' >&2
+    cat "$tmp" >&2
+    rm -f "$tmp"
+    exit 1
+fi
+rm -f "$tmp"
+printf 'ok generator: first scissors marker is the cut\n'
+
 # Git before 2.45 ignores core.commentString. A ;; value must not hide the
 # hash marker Git actually wrote.
 tmp="$(mktemp)"
@@ -894,6 +931,13 @@ out="$(gen "$subject_agent
 
 Why this commit exists." KIMI_SESSION_ID="$kimi_id" VC_SESSION_PID=0)"
 expect_absent codex-does-not-record-kimi "$out" "session_id:"
+
+subject_cursor='[cursor-agent/interactive] fix: keep the cursor transcript'
+out="$(gen "$subject_cursor
+
+Why this commit exists." CURSOR_CONVERSATION_ID="$real_session" VC_SESSION_PID=0)"
+expect_line cursor-agent-alias-session "$out" "session_id: $real_session"
+expect_line cursor-agent-alias-mailbox "$out" "Authored-By: cursor-agent <agents@vetcoders.io>"
 
 out="$(gen "$subject_agent
 

@@ -4401,6 +4401,12 @@ fn current_session_from_disk() -> Result<Option<CurrentSessionPayload>> {
         &home.join(".junie").join("sessions"),
         Some(modified_after),
     ));
+    // Same root as the session-list path. The slug in `wd_<slug>_<hex>` is
+    // lossy, so cwd filtering stays on select_sessions below.
+    discovered.extend(sessions::discover_kimi_sessions(
+        &home.join(".kimi-code").join("sessions"),
+        Some(modified_after),
+    ));
     discovered.extend(sessions::discover_grok_sessions(
         &home.join(".grok").join("sessions"),
         Some(modified_after),
