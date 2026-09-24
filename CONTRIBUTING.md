@@ -32,19 +32,38 @@ runtime: iterm2
 session_pid: 35432
 ```
 
-`prepare-commit-msg` fills these in; `commit-msg` validates them independently.
+`prepare-commit-msg` fills these in when the subject is already in the file
+(`git commit -m` / `-F`). Plain `git commit` opens an editor first, so the
+same generator runs again from `commit-msg` after the message is saved.
+Trailers are inserted before Git's scissors line (`git commit -v`,
+`commit.cleanup=scissors`). The validator reads that same prefix, which is
+the text Git keeps.
+
 Two rules govern the split:
 
-- **A measured value wins.** The generator overwrites what a message claims
-  about its own session, because provenance is a measurement, not a
+- **A measured value wins.** The generator overwrites a footer trailer, not a
+  citation of the same key in the body. Provenance is a measurement, not a
   self-report.
 - **An unmeasurable value is never invented.** If the session cannot be
   resolved, the hook writes nothing and says so. A plausible-looking but
   fabricated id is worse than a missing one.
 
+The agent lane reads the same environment keys as `aicx sessions current`,
+in the same order: `AICX_SESSION_ID`, `CODEX_THREAD_ID`, `CODEX_SESSION_ID`,
+then the other agent session variables, then `aicx sessions current`. A human
+lane (`maciej`, `monika`, or runtime `manual`) does not read those variables.
+Its only automatic fallback is `ATUIN_SESSION`, and that fallback is not used
+for agents.
+
+`runtime:` is written only from `VIBECRAFTED_COMMIT_RUNTIME`,
+`VIBECRAFTED_RUNTIME`, or a recognized `TERM_PROGRAM` (`iTerm.app` /
+`iTerm2` → `iterm2`, `Apple_Terminal` → `terminal`). It is not defaulted to
+`interactive`.
+
 `time:` is the fleet-wide key and must be ISO-8601 with an explicit offset. The
-older `timestamp:` and `date:` keys are rejected on new commits — history keeps
-them, and readers still recognize them, but nothing new is written that way.
+older `timestamp:` and `date:` keys are rejected on new commits even when a
+valid `time:` is also present. History keeps them, and readers still recognize
+them, but nothing new is written that way.
 
 `session_pid:` is optional. `session_id` identifies a *transcript*, so two live
 processes resuming one session legitimately share it; the pid is what tells them

@@ -8,12 +8,40 @@ root="$(cd "$(dirname "$0")/../.." && pwd)"
 hook="$root/tools/githooks/commit-msg"
 prepare="$root/tools/githooks/prepare-commit-msg"
 
+# Measurement env must not leak from the shell running the test into the
+# hooks. An inherited CODEX_THREAD_ID or a live `aicx` would rewrite fixtures.
+hook_env() {
+    env \
+        AICX_SESSION_ID= \
+        CODEX_THREAD_ID= \
+        CODEX_SESSION_ID= \
+        CLAUDE_SESSION_ID= \
+        CLAUDE_CODE_SESSION_ID= \
+        CURSOR_CONVERSATION_ID= \
+        GEMINI_SESSION_ID= \
+        JUNIE_SESSION_ID= \
+        KIMI_SESSION_ID= \
+        GROK_SESSION_ID= \
+        GROK_THREAD_ID= \
+        ATUIN_SESSION= \
+        CLAUDE_PID= \
+        CODEX_PID= \
+        VIBECRAFTED_COMMIT_RUNTIME= \
+        VIBECRAFTED_RUNTIME= \
+        TERM_PROGRAM= \
+        VC_SESSION_PID=0 \
+        PATH="/usr/bin:/bin" \
+        HOME="${HOME:-/tmp}" \
+        TMPDIR="${TMPDIR:-/tmp}" \
+        "$@"
+}
+
 pass() {
     local name="$1" body="$2"
     local tmp
     tmp="$(mktemp)"
     printf '%s\n' "$body" >"$tmp"
-    if ! "$hook" "$tmp" >/dev/null 2>&1; then
+    if ! hook_env "$hook" "$tmp" >/dev/null 2>&1; then
         printf 'FAIL accept: %s\n' "$name" >&2
         "$hook" "$tmp" >&2 || true
         rm -f "$tmp"
@@ -29,7 +57,7 @@ reject() {
     tmp="$(mktemp)"
     err="$(mktemp)"
     printf '%s\n' "$body" >"$tmp"
-    if "$hook" "$tmp" >/dev/null 2>"$err"; then
+    if hook_env "$hook" "$tmp" >/dev/null 2>"$err"; then
         printf 'FAIL reject: %s (hook accepted)\n' "$name" >&2
         rm -f "$tmp" "$err"
         exit 1
@@ -102,31 +130,35 @@ EOF
 
 # --- validator: rejected shapes -------------------------------------------
 
-reject human-forced-agent-mailbox "$(
+# A derivable mailbox is a measurement, so the generator corrects it and the
+# validator then accepts the file. What stays a rejection is a human lane
+# whose address cannot be derived (agent name + runtime manual).
+reject human-lane-underivable-mailbox "$(
     cat <<'EOF'
-[maciej/manual] feat: Skip session re-scan during install
+[codex/manual] feat: describe the change
 
-Install no longer runs aicx all -H 10000.
+Why this commit exists.
 
-Authored-By: maciej <agents@vetcoders.io>
-session_id: 019e93be-379d-7303-8ad4-ffae468db99f
-time: 2026-08-18T21:16:04+02:00
-runtime: vibecrafted
+Authored-By: codex <agents@vetcoders.io>
+session_id: 019e93be-379d-7303-9ad4-ffae468db99f
+time: 2026-06-04T14:08:27-06:00
+runtime: iterm2
 EOF
 )" "human lane"
 
-reject agent-human-mailbox "$(
+reject legacy-beside-valid-time "$(
     cat <<'EOF'
 [codex/interactive] chore: describe the change
 
 Why this commit exists.
 
-Authored-By: codex <void@div0.space>
+Authored-By: codex <agents@vetcoders.io>
 session_id: 019e93be-379d-7303-9ad4-ffae468db99f
 time: 2026-06-04T14:08:27-06:00
+timestamp: 2026_0604_1408_MDT
 runtime: iterm2
 EOF
-)" "Authored-By: codex <agents@vetcoders.io>"
+)" "legacy"
 
 # The fleet agreed on one write-path time key. Legacy keys are named in the
 # error so the author is told how to migrate, not merely that they failed.
@@ -188,12 +220,13 @@ EOF
 # --- generator -------------------------------------------------------------
 
 gen() {
-    # gen <name> <message> [env assignments...] -> prints resulting message
+    # gen <message> [env assignments...] -> prints resulting message.
+    # Starts from a scrubbed environment; assignments in "$@" override.
     local msg="$1"; shift
     local tmp
     tmp="$(mktemp)"
     printf '%s\n' "$msg" >"$tmp"
-    env "$@" "$prepare" "$tmp" message >/dev/null 2>&1 || true
+    hook_env "$@" "$prepare" "$tmp" message >/dev/null 2>&1 || true
     cat "$tmp"
     rm -f "$tmp"
 }
@@ -260,8 +293,9 @@ expect_absent unmeasured-invents-nothing "$out" "session_id:"
 # The human lane keeps a human address; the generator must not force agents@.
 out="$(gen "$subject_human
 
-Why this commit exists." CLAUDE_CODE_SESSION_ID="$real_session" VC_SESSION_PID=0)"
+Why this commit exists." CLAUDE_CODE_SESSION_ID="$real_session" CODEX_THREAD_ID="$real_session" VC_SESSION_PID=0)"
 expect_line human-lane-keeps-human-mailbox "$out" "Authored-By: maciej <void@div0.space>"
+expect_absent human-lane-ignores-agent-session "$out" "session_id:"
 
 # A human commit must never inherit an agent's transcript. With no session in
 # the environment the aicx fallback would still report the machine's current
@@ -288,7 +322,8 @@ expect_absent session-pid-off "$out" "session_pid:"
 # and stable diffs.)
 tmp="$(mktemp)"
 printf '%s\n\nWhy this commit exists.\n' "$subject_agent" >"$tmp"
-env CLAUDE_CODE_SESSION_ID="$real_session" CLAUDE_PID=35432 VC_SESSION_PID=1 \
+hook_env CLAUDE_CODE_SESSION_ID="$real_session" CLAUDE_PID=35432 VC_SESSION_PID=1 \
+    TERM_PROGRAM=iTerm.app \
     "$prepare" "$tmp" message >/dev/null 2>&1 || true
 if awk '/^Authored-By: /{inblock=1} inblock && !NF {found=1} END{exit !found}' "$tmp"; then
     printf 'FAIL generator: blank line inside trailer block\n' >&2
@@ -306,9 +341,12 @@ expect_absent merge-subject-untouched "$out" "Authored-By:"
 # What the generator writes must satisfy the validator it feeds.
 tmp="$(mktemp)"
 printf '%s\n\nWhy this commit exists.\n' "$subject_agent" >"$tmp"
-env CLAUDE_CODE_SESSION_ID="$real_session" CLAUDE_PID=35432 VC_SESSION_PID=1 \
+hook_env CLAUDE_CODE_SESSION_ID="$real_session" CLAUDE_PID=35432 VC_SESSION_PID=1 \
+    TERM_PROGRAM=iTerm.app \
     "$prepare" "$tmp" message >/dev/null 2>&1 || true
-if ! "$hook" "$tmp" >/dev/null 2>&1; then
+if ! hook_env CLAUDE_CODE_SESSION_ID="$real_session" CLAUDE_PID=35432 VC_SESSION_PID=1 \
+    TERM_PROGRAM=iTerm.app \
+    "$hook" "$tmp" >/dev/null 2>&1; then
     printf 'FAIL generator: output rejected by validator\n' >&2
     "$hook" "$tmp" >&2 || true
     rm -f "$tmp"
@@ -316,6 +354,147 @@ if ! "$hook" "$tmp" >/dev/null 2>&1; then
 fi
 rm -f "$tmp"
 printf 'ok generator: output satisfies validator\n'
+
+thread_id="019eba52-81db-7d31-bb28-6343f05c4b79"
+other_id="00000000-0000-4000-8000-deadbeef0000"
+
+out="$(gen "$subject_agent
+
+Why this commit exists." CODEX_THREAD_ID="$thread_id" VC_SESSION_PID=0)"
+expect_line reads-codex-thread-id "$out" "session_id: $thread_id"
+
+out="$(gen "$subject_agent
+
+Why this commit exists." CODEX_THREAD_ID="$thread_id" CODEX_SESSION_ID="$other_id" VC_SESSION_PID=0)"
+expect_line thread-id-outranks-session-id "$out" "session_id: $thread_id"
+expect_absent thread-id-drops-session-id "$out" "$other_id"
+
+# Interactive commit: prepare-commit-msg sees an empty subject and must not
+# invent trailers. commit-msg runs the generator after the editor.
+tmp="$(mktemp)"
+printf '\n# Please enter the commit message for your changes. Lines starting\n# with '\''#'\'' will be ignored, and an empty message aborts the commit.\n' >"$tmp"
+hook_env CODEX_THREAD_ID="$thread_id" TERM_PROGRAM=iTerm.app \
+    "$prepare" "$tmp" commit >/dev/null 2>&1 || true
+if grep -q '^Authored-By:' "$tmp"; then
+    printf 'FAIL generator: pre-editor pass wrote trailers without a subject\n' >&2
+    cat "$tmp" >&2
+    rm -f "$tmp"
+    exit 1
+fi
+printf '%s\n\nWhy this commit exists.\n\n# Please enter the commit message for your changes.\n' \
+    "$subject_agent" >"$tmp"
+if ! hook_env CODEX_THREAD_ID="$thread_id" TERM_PROGRAM=iTerm.app \
+    "$hook" "$tmp" >/dev/null 2>&1; then
+    printf 'FAIL generator: interactive commit-msg did not accept a filled message\n' >&2
+    hook_env CODEX_THREAD_ID="$thread_id" TERM_PROGRAM=iTerm.app "$hook" "$tmp" >&2 || true
+    rm -f "$tmp"
+    exit 1
+fi
+if ! awk -v id="$thread_id" '
+    /^#/ { exit }
+    $0 == "session_id: " id { found=1 }
+    END { exit !found }
+' "$tmp"; then
+    printf 'FAIL generator: interactive trailers landed after the comment template\n' >&2
+    cat "$tmp" >&2
+    rm -f "$tmp"
+    exit 1
+fi
+rm -f "$tmp"
+printf 'ok generator: interactive commit fills trailers before the template\n'
+
+# git commit -v / cleanup=scissors. The validator must accept because the
+# footer is above the cut, and the stored prefix must actually contain it.
+tmp="$(mktemp)"
+cat >"$tmp" <<EOF
+$subject_agent
+
+Why this commit exists.
+
+# ------------------------ >8 ------------------------
+diff --git a/README.md b/README.md
+session_id: $other_id
+EOF
+if ! hook_env CODEX_THREAD_ID="$thread_id" TERM_PROGRAM=iTerm.app \
+    "$hook" "$tmp" >/dev/null 2>&1; then
+    printf 'FAIL generator: scissors message rejected\n' >&2
+    hook_env CODEX_THREAD_ID="$thread_id" TERM_PROGRAM=iTerm.app "$hook" "$tmp" >&2 || true
+    rm -f "$tmp"
+    exit 1
+fi
+if ! awk -v id="$thread_id" '
+    /^#[[:space:]]*-{2,}[[:space:]]*>8[[:space:]]*-{2,}/ { exit }
+    $0 == "session_id: " id { found=1 }
+    END { exit !found }
+' "$tmp"; then
+    printf 'FAIL generator: session_id is not above the scissors line\n' >&2
+    cat "$tmp" >&2
+    rm -f "$tmp"
+    exit 1
+fi
+rm -f "$tmp"
+printf 'ok generator: trailers sit above the scissors line\n'
+
+# A citation in the body is not a footer. The measured runtime is appended;
+# the cited line stays.
+out="$(gen "$subject_agent
+
+Why this commit exists.
+runtime: legacy-backend
+That line cites an old value.
+
+Authored-By: codex <agents@vetcoders.io>
+session_id: $other_id
+time: 2020-01-01T00:00:00Z
+runtime: github-actions" \
+    CLAUDE_CODE_SESSION_ID="$real_session" TERM_PROGRAM=iTerm.app VC_SESSION_PID=0)"
+expect_line body-citation-survives "$out" "runtime: legacy-backend"
+expect_line measured-runtime-in-footer "$out" "runtime: iterm2"
+legacy_hits="$(printf '%s\n' "$out" | grep -c 'runtime: legacy-backend' || true)"
+iterm_hits="$(printf '%s\n' "$out" | grep -c 'runtime: iterm2' || true)"
+if [ "$legacy_hits" != "1" ] || [ "$iterm_hits" != "1" ]; then
+    printf 'FAIL generator: body runtime citation was rewritten (%s legacy, %s iterm)\n' \
+        "$legacy_hits" "$iterm_hits" >&2
+    printf '%s\n' "$out" >&2
+    exit 1
+fi
+printf 'ok generator: body citation kept and footer measured\n'
+
+# No TERM_PROGRAM and no VIBECRAFTED_* runtime: do not invent "interactive",
+# and do not overwrite a footer the author already wrote.
+out="$(gen "$subject_agent
+
+Why this commit exists.
+
+runtime: github-actions" \
+    CLAUDE_CODE_SESSION_ID="$real_session" VC_SESSION_PID=0)"
+expect_line unmeasured-runtime-kept "$out" "runtime: github-actions"
+expect_absent unmeasured-runtime-not-invented "$out" "runtime: interactive"
+
+fake_bin="$(mktemp -d)"
+cat >"$fake_bin/aicx" <<'EOF'
+#!/bin/sh
+echo aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee
+EOF
+chmod +x "$fake_bin/aicx"
+atuin_id="11111111-2222-4333-8444-555555555555"
+out="$(gen "$subject_agent
+
+Why this commit exists." \
+    PATH="$fake_bin:/usr/bin:/bin" ATUIN_SESSION="$atuin_id" VC_SESSION_PID=0)"
+expect_line agent-prefers-aicx-over-atuin "$out" "session_id: aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+expect_absent agent-does-not-take-atuin "$out" "$atuin_id"
+
+out="$(gen "$subject_human
+
+Why this commit exists." \
+    PATH="$fake_bin:/usr/bin:/bin" ATUIN_SESSION="$atuin_id" \
+    CLAUDE_CODE_SESSION_ID="$real_session" VC_SESSION_PID=0)"
+expect_line human-atuin-fallback "$out" "session_id: $atuin_id"
+expect_absent human-atuin-not-agent "$out" "$real_session"
+expect_absent human-atuin-not-aicx "$out" "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+rm -f "$fake_bin/aicx"
+rmdir "$fake_bin"
 
 # --- parity between the two installable hook sets ---------------------------
 

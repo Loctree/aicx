@@ -1,7 +1,13 @@
 #!/usr/bin/env bash
 # Vibecrafted commit-msg hook.
 #
-# Enforces the agent/runtime commit standard:
+# Enforces the agent/runtime commit standard.
+#
+# After the editor (and on `git commit -m`, where prepare-commit-msg already
+# ran), this hook runs the sibling generator so an interactive commit still
+# receives trailers. Validation then reads only the text above Git's scissors
+# line — the part cleanup keeps. A trailer parked under the verbose diff
+# must not satisfy the check and then disappear from the object.
 #
 #   [codex/interactive] chore: Polish Makefile help output formatting
 #
@@ -41,11 +47,23 @@ failures=()
 agent=""
 if [[ "$first_line" =~ $subject_pattern ]]; then
     agent="${BASH_REMATCH[1]}"
+    prepare_hook="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)/prepare-commit-msg"
+    if [ -f "$prepare_hook" ]; then
+        "$prepare_hook" "$msg_file" commit
+    fi
 else
     failures+=("subject must be: [<agent>/<runtime>] <type>(<scope>): <subject>")
 fi
 
-if grep -Eiq '(^Co-Authored-By:|noreply@|@anthropic\.com|@openai\.com)' "$msg_file"; then
+# What Git will store: drop the scissors marker and the verbose diff under it.
+# Comment lines stay in the buffer; the checks below do not treat them as
+# trailers or as an explanatory body.
+kept="$(awk '
+    /^#[[:space:]]*-{2,}[[:space:]]*>8[[:space:]]*-{2,}[[:space:]]*$/ { exit }
+    { sub(/\r$/, ""); print }
+' "$msg_file")"
+
+if printf '%s\n' "$kept" | grep -Eiq '(^Co-Authored-By:|noreply@|@anthropic\.com|@openai\.com)'; then
     failures+=("vendor footers are forbidden; use Authored-By only")
 fi
 
@@ -68,35 +86,37 @@ fi
 
 if [ "$is_human" -eq 1 ]; then
     author="${agent:-maciej}"
-    if ! grep -Eq "^Authored-By: ${author} <(${human_emails})>$" "$msg_file"; then
+    if ! printf '%s\n' "$kept" | grep -Eq "^Authored-By: ${author} <(${human_emails})>$"; then
         failures+=("missing Authored-By: ${author} <void@div0.space> (human lane; not agents@vetcoders.io)")
     fi
-elif [ -n "$agent" ] && ! grep -Eq "^Authored-By: ${agent} <agents@vetcoders\\.io>$" "$msg_file"; then
+elif [ -n "$agent" ] && ! printf '%s\n' "$kept" | grep -Eq "^Authored-By: ${agent} <agents@vetcoders\\.io>$"; then
     failures+=("missing Authored-By: ${agent} <agents@vetcoders.io>")
-elif [ -z "$agent" ] && ! grep -Eq '^Authored-By: [a-z][a-z0-9_-]* <agents@vetcoders\.io>$' "$msg_file"; then
+elif [ -z "$agent" ] && ! printf '%s\n' "$kept" | grep -Eq '^Authored-By: [a-z][a-z0-9_-]* <agents@vetcoders\.io>$'; then
     failures+=("missing Authored-By: <agent> <agents@vetcoders.io>")
 fi
 
-if ! grep -Eq '^session_id: [0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' "$msg_file"; then
+if ! printf '%s\n' "$kept" | grep -Eq '^session_id: [0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'; then
     failures+=("missing session_id: <uuid>")
 fi
 
-if ! grep -Eq '^time: [0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([+-][0-9]{2}:[0-9]{2}|Z)$' "$msg_file"; then
-    if grep -Eq '^(timestamp|date): ' "$msg_file"; then
-        failures+=("timestamp:/date: are legacy; the fleet standard is time: YYYY-MM-DDTHH:MM:SS+HH:MM")
-    else
-        failures+=("missing time: YYYY-MM-DDTHH:MM:SS+HH:MM")
-    fi
+# Legacy keys are rejected even when a valid time: is also present. The
+# generator adds time: without removing an old timestamp: from an amend.
+if printf '%s\n' "$kept" | grep -Eq '^(timestamp|date): '; then
+    failures+=("timestamp:/date: are legacy; the fleet standard is time: YYYY-MM-DDTHH:MM:SS+HH:MM")
+fi
+if ! printf '%s\n' "$kept" | grep -Eq '^time: [0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([+-][0-9]{2}:[0-9]{2}|Z)$'; then
+    failures+=("missing time: YYYY-MM-DDTHH:MM:SS+HH:MM")
 fi
 
 # session_pid is optional by design: it separates two live processes sharing one
 # session_id, but requiring it would block manual commits and amends made
 # outside an agent process. Validate the shape only when it is present.
-if grep -Eq '^session_pid:' "$msg_file" && ! grep -Eq '^session_pid: [0-9]{1,10}$' "$msg_file"; then
+if printf '%s\n' "$kept" | grep -Eq '^session_pid:' \
+    && ! printf '%s\n' "$kept" | grep -Eq '^session_pid: [0-9]{1,10}$'; then
     failures+=("session_pid: must be a decimal process id when present")
 fi
 
-if ! grep -Eq '^runtime: .+' "$msg_file"; then
+if ! printf '%s\n' "$kept" | grep -Eq '^runtime: .+'; then
     failures+=("missing runtime: <runtime name>")
 fi
 
@@ -105,13 +125,14 @@ while IFS= read -r line || [ -n "$line" ]; do
     line="${line%$'\r'}"
     case "$line" in
         "$first_line"|"") continue ;;
+        \#*) continue ;;
     esac
     if printf '%s\n' "$line" | grep -Eq '^(Authored-By|session_id|session_pid|time|timestamp|date|runtime|Signed-off-by|Vibecrafted-Warn-Signature):'; then
         continue
     fi
     has_body=1
     break
-done < "$msg_file"
+done <<< "$kept"
 
 if [ "$has_body" -ne 1 ]; then
     failures+=("commit message needs an explanatory body before trailers")

@@ -2,14 +2,17 @@
 # Vibecrafted prepare-commit-msg hook.
 #
 # Fills the mechanical provenance trailers so an agent never has to reconstruct
-# them by hand. The commit-msg validator stays strict and independent; this hook
-# only supplies what it can actually measure.
+# them by hand. commit-msg runs this again after the editor: plain `git commit`
+# has an empty subject until then, so the pre-editor pass leaves that file
+# alone and the post-editor pass is the one that can measure the lane.
 #
 # Contract:
-#   - A measured value overwrites whatever the message already declares.
-#     Provenance is a measurement, not an agent's claim about itself.
-#   - When a value cannot be measured, an existing declaration is left alone and
-#     nothing is invented. Provenance is never fabricated to satisfy a validator.
+#   - A measured value overwrites a trailer in the footer block. It does not
+#     rewrite the same key when it appears in the body.
+#   - When a value cannot be measured, an existing footer declaration is left
+#     alone and nothing is invented. Provenance is never fabricated.
+#   - The footer is inserted before Git's scissors line, so `git commit -v`
+#     and commit.cleanup=scissors cannot strip it after validation.
 #
 # Toggle for the optional session_pid trailer, highest precedence first:
 #   VC_SESSION_PID=0|1                     (one commit)
@@ -27,7 +30,7 @@ if [ -z "$msg_file" ] || [ ! -f "$msg_file" ]; then
 fi
 
 # Git generates these subjects itself; commit-msg lets them through unchanged.
-first_line="$(head -n1 "$msg_file" | tr -d '\r')"
+first_line="$(head -n 1 "$msg_file" | tr -d '\r')"
 case "$first_line" in
     "Merge "*|"Revert "*|"fixup!"*|"squash!"*|"amend!"*) exit 0 ;;
 esac
@@ -35,14 +38,14 @@ esac
 types='feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert|release|merge'
 subject_pattern="^\\[([a-z][a-z0-9_-]*)/([a-z0-9][a-z0-9._-]*)\\] (${types})(\\(.+\\))?: .+$"
 
-# Only normalize messages that already declare the agent/runtime prefix. A
-# malformed subject is commit-msg's report to make, with its full diagnostics.
-if [[ "$first_line" =~ $subject_pattern ]]; then
-    agent="${BASH_REMATCH[1]}"
-    runtime_lane="${BASH_REMATCH[2]}"
-else
+# No subject yet: this is the pre-editor pass of an interactive commit.
+# commit-msg invokes this hook again once the author has written one.
+if [[ ! "$first_line" =~ $subject_pattern ]]; then
     exit 0
 fi
+
+agent="${BASH_REMATCH[1]}"
+runtime_lane="${BASH_REMATCH[2]}"
 
 # Humans keep a human address. Mirrors the commit-msg human lane exactly; if the
 # two ever disagree, this hook writes a trailer the validator then rejects.
@@ -64,35 +67,70 @@ fi
 
 # session_id identifies a TRANSCRIPT, not a process. Two live processes resuming
 # one session share it legitimately; use session_pid to tell them apart.
-session_raw="${CODEX_SESSION_ID:-${CLAUDE_CODE_SESSION_ID:-${ATUIN_SESSION:-}}}"
-# The aicx fallback is agent-only on purpose: with no agent env it still reports
-# the machine's current agent session, which for a hand-written commit would
-# attribute a person's work to an agent's transcript. Humans fall back to the
-# shell session (ATUIN_SESSION) or to nothing.
-if [ -z "$session_raw" ] && [ -z "$authored_by_human" ] && command -v aicx >/dev/null 2>&1; then
-    # Git hooks do not inherit the harness stdin that carries session identity,
-    # so the env vars above are usually empty here. aicx knows the current
-    # session per runtime and is the only non-inventing source left.
-    session_raw="$(aicx sessions current 2>/dev/null || true)"
+#
+# Agent order matches src/main.rs CURRENT_SESSION_ENV_KEYS. The human lane does
+# not read those variables: a shell that still exports an agent session must
+# not attribute the person's commit to that transcript. ATUIN_SESSION is a
+# shell id, so it is a human fallback only and never outranks `aicx`.
+session_raw=""
+session_source=""
+if [ -n "$authored_by_human" ]; then
+    if [ -n "${ATUIN_SESSION:-}" ]; then
+        session_raw="$ATUIN_SESSION"
+        session_source="ATUIN_SESSION"
+    fi
+else
+    # shellcheck disable=SC2086
+    for key in \
+        AICX_SESSION_ID \
+        CODEX_THREAD_ID \
+        CODEX_SESSION_ID \
+        CLAUDE_SESSION_ID \
+        CLAUDE_CODE_SESSION_ID \
+        CURSOR_CONVERSATION_ID \
+        GEMINI_SESSION_ID \
+        JUNIE_SESSION_ID \
+        KIMI_SESSION_ID \
+        GROK_SESSION_ID \
+        GROK_THREAD_ID
+    do
+        value="${!key:-}"
+        if [ -n "$value" ]; then
+            session_raw="$value"
+            session_source="$key"
+            break
+        fi
+    done
+    if [ -z "$session_raw" ] && command -v aicx >/dev/null 2>&1; then
+        # Git hooks do not inherit the harness stdin that carries session
+        # identity, so the env vars above are usually empty here.
+        session_raw="$(aicx sessions current 2>/dev/null | head -n 1 | tr -d '[:space:]' || true)"
+        session_source="aicx sessions current"
+    fi
 fi
+session_raw="$(printf '%s' "$session_raw" | tr -d '[:space:]')"
 
 session_id=""
+session_rejected=""
 if printf '%s' "$session_raw" | grep -Eq '^[0-9a-fA-F]{32}$'; then
     session_id="$(printf '%s' "$session_raw" \
         | sed -E 's/^(.{8})(.{4})(.{4})(.{4})(.{12})$/\1-\2-\3-\4-\5/' | tr 'A-F' 'a-f')"
 elif printf '%s' "$session_raw" \
     | grep -Eq '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'; then
     session_id="$(printf '%s' "$session_raw" | tr 'A-F' 'a-f')"
+elif [ -n "$session_raw" ]; then
+    session_rejected=1
 fi
 
 time_value="$(date +%Y-%m-%dT%H:%M:%S%z | sed -E 's/([+-][0-9]{2})([0-9]{2})$/\1:\2/')"
 
+# runtime is a measurement. An unrecognized terminal is not evidence, and
+# inventing "interactive" would overwrite a declaration the author supplied.
 runtime="${VIBECRAFTED_COMMIT_RUNTIME:-${VIBECRAFTED_RUNTIME:-}}"
 if [ -z "$runtime" ]; then
     case "${TERM_PROGRAM:-}" in
         iTerm.app|iTerm2) runtime="iterm2" ;;
         Apple_Terminal) runtime="terminal" ;;
-        *) runtime="interactive" ;;
     esac
 fi
 
@@ -109,57 +147,148 @@ session_pid_enabled() {
     return 0
 }
 
+# Agent pids are not a measurement of a human commit.
 session_pid=""
-if session_pid_enabled; then
+if [ -z "$authored_by_human" ] && session_pid_enabled; then
     candidate="${CLAUDE_PID:-${CODEX_PID:-}}"
     if printf '%s' "$candidate" | grep -Eq '^[0-9]{1,10}$'; then
         session_pid="$candidate"
     fi
 fi
 
-# A measured value replaces an existing trailer; an unmeasured one never does.
-set_trailer() {
-    local key="$1" value="$2"
-    [ -n "$value" ] || return 0
-    if grep -Eq "^${key}: " "$msg_file"; then
-        local tmp
-        tmp="$(mktemp "${TMPDIR:-/tmp}/vc-trailer.XXXXXX")"
-        # Comment lines keep Git's own scissors/status block intact.
-        awk -v key="$key" -v value="$value" '
-            $0 ~ "^" key ": " && substr($0, 1, 1) != "#" { print key ": " value; next }
-            { print }
-        ' "$msg_file" > "$tmp"
-        mv "$tmp" "$msg_file"
-    else
-        # Keep the trailers in one compact block: a single blank line before
-        # it, none inside. Appending '\n<trailer>' per call would scatter them
-        # across the message.
-        #
-        # Note: Git's own trailer parser is not the beneficiary here. A trailer
-        # token may not contain '_', so `session_id` invalidates the whole block
-        # for `git interpret-trailers` and `%(trailers)` no matter how it is
-        # laid out (verified). These trailers are read by the fleet's own
-        # regexes; compactness is for humans and for stable diffs.
-        local last
-        last="$(awk '!/^#/ && NF {line=$0} END {print line}' "$msg_file")"
-        if printf '%s' "$last" | grep -Eq '^[A-Za-z][A-Za-z0-9_-]*: '; then
-            printf '%s: %s\n' "$key" "$value" >> "$msg_file"
-        else
-            printf '\n%s: %s\n' "$key" "$value" >> "$msg_file"
-        fi
-    fi
+# Rewrite the footer in one pass. A key counts as a trailer only when it sits
+# in the blank-line-delimited block at the end of the pre-scissors text.
+# The same words inside the body stay words. Git's scissors line and
+# everything after it is copied unchanged, so cleanup cannot delete the footer.
+apply_trailers() {
+    local tmp
+    tmp="$(mktemp "${TMPDIR:-/tmp}/vc-trailer.XXXXXX")"
+    # EXIT covers a failing awk under set -e. Cleared after a successful mv
+    # so a later exit of this hook does not remove an unrelated file.
+    trap 'rm -f "$tmp"' EXIT
+    awk \
+        -v authored_by="$authored_by" \
+        -v session_id="$session_id" \
+        -v time_value="$time_value" \
+        -v runtime="$runtime" \
+        -v session_pid="$session_pid" \
+        '
+        function is_blank(s) { return s ~ /^[[:space:]]*$/ }
+        function is_comment(s) { return s ~ /^#/ }
+        function is_scissors(s) {
+            return s ~ /^#[[:space:]]*-{2,}[[:space:]]*>8[[:space:]]*-{2,}[[:space:]]*$/
+        }
+        function is_ours(s) {
+            return s ~ /^(Authored-By|session_id|session_pid|time|runtime): /
+        }
+        function field(s, p) {
+            p = index(s, ": ")
+            if (p == 0) return ""
+            return substr(s, p + 2)
+        }
+        {
+            sub(/\r$/, "")
+            n++
+            lines[n] = $0
+            if (!cut && is_scissors($0)) cut = n
+        }
+        END {
+            limit = cut ? cut - 1 : n
+            cstart = limit + 1
+            seen = 0
+            i = limit
+            while (i >= 1) {
+                if (is_comment(lines[i])) {
+                    seen = 1
+                    cstart = i
+                    i--
+                    continue
+                }
+                if (seen && is_blank(lines[i])) {
+                    cstart = i
+                    i--
+                    continue
+                }
+                break
+            }
+
+            end = cstart - 1
+            while (end >= 1 && is_blank(lines[end])) end--
+            bend = end
+            bstart = end + 1
+            while (end >= 1 && is_ours(lines[end])) {
+                bstart = end
+                end--
+            }
+            if (bstart <= bend && end >= 1 && !is_blank(lines[end])) {
+                bstart = bend + 1
+                end = bend
+            }
+
+            ab = ""
+            sid = ""
+            spid = ""
+            tm = ""
+            rt = ""
+            ot = 0
+            for (i = bstart; i <= bend; i++) {
+                if (is_blank(lines[i])) continue
+                if (lines[i] ~ /^Authored-By: /) ab = field(lines[i])
+                else if (lines[i] ~ /^session_id: /) sid = field(lines[i])
+                else if (lines[i] ~ /^session_pid: /) spid = field(lines[i])
+                else if (lines[i] ~ /^time: /) tm = field(lines[i])
+                else if (lines[i] ~ /^runtime: /) rt = field(lines[i])
+                else { ot++; other[ot] = lines[i] }
+            }
+            if (authored_by != "") ab = authored_by
+            if (session_id != "") sid = session_id
+            if (session_pid != "") spid = session_pid
+            if (time_value != "") tm = time_value
+            if (runtime != "") rt = runtime
+
+            body_end = end
+            while (body_end >= 1 && is_blank(lines[body_end])) body_end--
+            for (i = 1; i <= body_end; i++) print lines[i]
+
+            have = (ab != "" || sid != "" || tm != "" || rt != "" || spid != "" || ot > 0)
+            if (have) {
+                if (body_end >= 1) print ""
+                for (i = 1; i <= ot; i++) print other[i]
+                if (ab != "") print "Authored-By: " ab
+                if (sid != "") print "session_id: " sid
+                if (tm != "") print "time: " tm
+                if (rt != "") print "runtime: " rt
+                if (spid != "") print "session_pid: " spid
+            }
+
+            if (cstart <= limit) {
+                j = cstart
+                while (j <= limit && is_blank(lines[j])) j++
+                for (i = j; i <= limit; i++) print lines[i]
+            }
+            if (cut) {
+                for (i = cut; i <= n; i++) print lines[i]
+            }
+        }
+        ' "$msg_file" >"$tmp"
+    mv "$tmp" "$msg_file"
+    trap - EXIT
 }
 
-set_trailer "Authored-By" "$authored_by"
-set_trailer "session_id" "$session_id"
-set_trailer "time" "$time_value"
-set_trailer "runtime" "$runtime"
-set_trailer "session_pid" "$session_pid"
-
-if [ -z "$session_id" ]; then
+if [ -n "$session_rejected" ]; then
+    printf 'prepare-commit-msg: session identity from %s is not a UUID; not using it.\n' \
+        "$session_source" >&2
+elif [ -z "$session_id" ]; then
     printf 'prepare-commit-msg: session identity not measurable; not inventing one.\n' >&2
-    printf '  Set CLAUDE_CODE_SESSION_ID/CODEX_SESSION_ID or supply session_id yourself.\n' >&2
+    if [ -n "$authored_by_human" ]; then
+        printf '  Human lane reads ATUIN_SESSION only.\n' >&2
+    else
+        printf '  Agent lane reads AICX_SESSION_ID, CODEX_THREAD_ID, CODEX_SESSION_ID,\n' >&2
+        printf '  then the other agent env keys, then `aicx sessions current`.\n' >&2
+    fi
 fi
+
+apply_trailers
 
 if [ "$source_kind" != "message" ]; then
     printf 'prepare-commit-msg: filled provenance trailers for %s\n' "$agent" >&2

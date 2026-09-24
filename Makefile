@@ -204,6 +204,8 @@ test-retrieval-eval-rebaseline:
 
 check:
 	@echo "=== AICX Quality Gate ==="
+	@echo "[hooks] commit provenance selftest..."
+	@$(MAKE) hooks-test
 	@echo "[1/11] Checking manifest portability..."
 	@$(MAKE) manifest-check
 	@echo "[2/11] Checking formatting..."
@@ -474,7 +476,8 @@ help:
 	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'uninstall-service' '- Stop & remove the reader-only AICX Streamable HTTP service'
 	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'install-schedule' '- Install the separate index-maintenance schedule (HTTP service is reader-only)'
 	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'uninstall-schedule' '- Remove the separate index-maintenance schedule'
-	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'git-hooks' '- Install repo-local pre-commit + pre-push hooks'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'git-hooks' '- Install pre-commit, pre-push, and commit provenance hooks'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'hooks-test' '- Self-test commit provenance and pre-push default branch'
 	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'precheck' '- Quick default cargo check'
 	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'precheck-native' 'Quick native GGUF cargo check'
 	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'manifest-check' '- Fail if Cargo.toml uses local path dependencies'
