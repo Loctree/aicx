@@ -247,7 +247,7 @@ gen() {
     printf '%s\n' "$msg" >"$tmp"
     hook_env "$@" "$prepare" "$tmp" message >/dev/null 2>&1 || true
     cat "$tmp"
-    rm -f "$tmp"
+    rm -f "$tmp" "$tmp.vc-noneditor"
 }
 
 expect_line() {
@@ -546,6 +546,109 @@ if ! awk -v id="$thread_id" '
 fi
 rm -f "$tmp"
 printf 'ok generator: authored template phrase does not choose the prefix\n'
+
+# git commit -F keeps a patch excerpt under a scissors line. The diff is
+# not Git's verbose block, so a vendor footer there is still validated.
+tmp="$(mktemp)"
+err="$(mktemp)"
+cat >"$tmp" <<EOF
+$subject_agent
+
+Why this commit exists.
+
+# ------------------------ >8 ------------------------
+diff --git a/README.md b/README.md
+Co-Authored-By: Vendor <bot@openai.com>
+EOF
+hook_env CODEX_SESSION_ID="$real_session" TERM_PROGRAM=iTerm.app \
+    "$prepare" "$tmp" message >/dev/null 2>&1 || true
+if hook_env CODEX_SESSION_ID="$real_session" TERM_PROGRAM=iTerm.app \
+    "$hook" "$tmp" >/dev/null 2>"$err"; then
+    printf 'FAIL validator: commit -F patch excerpt hid a vendor footer\n' >&2
+    rm -f "$tmp" "$tmp.vc-noneditor" "$err"
+    exit 1
+fi
+if ! grep -Fq "vendor footers" "$err"; then
+    printf 'FAIL validator: commit -F patch excerpt (missing vendor footers)\n' >&2
+    cat "$err" >&2
+    rm -f "$tmp" "$tmp.vc-noneditor" "$err"
+    exit 1
+fi
+rm -f "$tmp" "$tmp.vc-noneditor" "$err"
+printf 'ok validator: commit -F patch excerpt stays visible\n'
+
+# cleanup=scissors without -v has no diff. A translated instruction still
+# marks the cut.
+tmp="$(mktemp)"
+cat >"$tmp" <<EOF
+$subject_agent
+
+Why this commit exists.
+
+# ------------------------ >8 ------------------------
+# status przetlumaczony
+EOF
+if ! hook_env \
+    GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=commit.cleanup GIT_CONFIG_VALUE_0=scissors \
+    CODEX_THREAD_ID="$thread_id" TERM_PROGRAM=iTerm.app \
+    "$hook" "$tmp" >/dev/null 2>&1; then
+    printf 'FAIL generator: translated scissors template rejected\n' >&2
+    hook_env GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=commit.cleanup GIT_CONFIG_VALUE_0=scissors \
+        CODEX_THREAD_ID="$thread_id" TERM_PROGRAM=iTerm.app "$hook" "$tmp" >&2 || true
+    cat "$tmp" >&2
+    rm -f "$tmp"
+    exit 1
+fi
+if ! awk -v id="$thread_id" '
+    /^#[[:space:]]*-{24}[[:space:]]*>8/ { exit }
+    $0 == "session_id: " id { found=1 }
+    END { exit !found }
+' "$tmp"; then
+    printf 'FAIL generator: session_id is not above the translated scissors template\n' >&2
+    cat "$tmp" >&2
+    rm -f "$tmp"
+    exit 1
+fi
+rm -f "$tmp"
+printf 'ok generator: scissors cleanup does not need a diff\n'
+
+# Auto chose ";" because a body line starts with "#". The generated
+# semicolon comments between the marker and the diff must not change that.
+tmp="$(mktemp)"
+cat >"$tmp" <<EOF
+$subject_agent
+
+# not a comment, so auto cannot pick hash
+Why this commit exists.
+
+; ------------------------ >8 ------------------------
+; status przetlumaczony
+diff --git a/README.md b/README.md
+session_id: $other_id
+EOF
+if ! hook_env \
+    GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.commentChar GIT_CONFIG_VALUE_0=auto \
+    CODEX_THREAD_ID="$thread_id" TERM_PROGRAM=iTerm.app \
+    "$hook" "$tmp" >/dev/null 2>&1; then
+    printf 'FAIL generator: localized auto template rejected\n' >&2
+    hook_env GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.commentChar GIT_CONFIG_VALUE_0=auto \
+        CODEX_THREAD_ID="$thread_id" TERM_PROGRAM=iTerm.app "$hook" "$tmp" >&2 || true
+    cat "$tmp" >&2
+    rm -f "$tmp"
+    exit 1
+fi
+if ! awk -v id="$thread_id" '
+    /^;[[:space:]]*-{24}[[:space:]]*>8/ { exit }
+    $0 == "session_id: " id { found=1 }
+    END { exit !found }
+' "$tmp"; then
+    printf 'FAIL generator: session_id is not above the semicolon cut\n' >&2
+    cat "$tmp" >&2
+    rm -f "$tmp"
+    exit 1
+fi
+rm -f "$tmp"
+printf 'ok generator: auto selection skips generated comments\n'
 
 # A citation in the body is not a footer. The measured runtime is appended;
 # the cited line stays.
@@ -982,6 +1085,27 @@ Why this commit exists." \
 expect_absent claude-without-own-session "$out" "session_id:"
 printf 'ok generator: agent env must belong to the subject\n'
 
+# aicx sessions current is env-first. A foreign Codex variable must be
+# cleared before that call or it hides the Claude transcript on disk.
+fake_bin="$(mktemp -d)"
+cat >"$fake_bin/aicx" <<'EOF'
+#!/bin/sh
+if [ -n "$CODEX_THREAD_ID" ]; then
+    printf '%s\n' '{"session_id":"019e93be-379d-7303-9ad4-ffae468db99f","agent":"codex"}'
+else
+    printf '%s\n' '{"session_id":"11111111-1111-4111-8111-111111111111","agent":"claude"}'
+fi
+EOF
+chmod +x "$fake_bin/aicx"
+out="$(gen "$subject_claude
+
+Why this commit exists." \
+    PATH="$fake_bin:/usr/bin:/bin" CODEX_THREAD_ID="$thread_id" VC_SESSION_PID=0)"
+expect_line claude-disk-not-foreign-env "$out" "session_id: 11111111-1111-4111-8111-111111111111"
+expect_absent claude-disk-ignored-codex "$out" "session_id: $thread_id"
+rm -f "$fake_bin/aicx"
+rmdir "$fake_bin"
+
 subject_junie='[junie/interactive] fix: keep the native session id'
 junie_id="260408-214715-abcd"
 out="$(gen "$subject_junie
@@ -1182,6 +1306,10 @@ for copy in "$root/tools/githooks/pre-push" "$root/tools/git-hooks/pre-push"; do
     fi
     if ! grep -q 'refs/remotes/${remote}/HEAD' "$copy"; then
         printf 'FAIL pre-push: %s does not base a first push on the destination remote\n' "$copy" >&2
+        exit 1
+    fi
+    if ! grep -q 'ls-remote --symref' "$copy"; then
+        printf 'FAIL pre-push: %s guesses main when the remote HEAD symref is missing\n' "$copy" >&2
         exit 1
     fi
     if grep -F -q '*"/develop"' "$copy"; then

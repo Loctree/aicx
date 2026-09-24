@@ -97,6 +97,23 @@ case "$comment_prefix" in
         ;;
     "") comment_prefix='#' ;;
 esac
+noneditor_flag="${msg_file}.vc-noneditor"
+non_editor=0
+if [ -f "$noneditor_flag" ]; then
+    non_editor=1
+fi
+cleanup_mode="$(git config --get commit.cleanup 2>/dev/null || true)"
+scissors_cleanup=0
+if [ "$cleanup_mode" = "scissors" ]; then
+    scissors_cleanup=1
+fi
+keep_comment_body=0
+case "$cleanup_mode" in
+    verbatim|whitespace) keep_comment_body=1 ;;
+    ""|default)
+        [ "$non_editor" = 1 ] && keep_comment_body=1
+        ;;
+esac
 
 # What Git will store: drop a real scissors marker and the verbose diff under
 # it. Comment lines stay in the buffer; the checks below do not treat them as
@@ -106,6 +123,8 @@ trap 'rm -f "$kept_tmp"' EXIT
 comment_prefix="$(awk \
     -v comment_prefix="$comment_prefix" \
     -v comment_mode="$comment_mode" \
+    -v non_editor="$non_editor" \
+    -v scissors_cleanup="$scissors_cleanup" \
     -v kept_path="$kept_tmp" \
     '
     function is_blank(s) { return s ~ /^[[:space:]]*$/ }
@@ -114,8 +133,10 @@ comment_prefix="$(awk \
         return rest ~ /^ ------------------------ >8 ------------------------[[:space:]]*$/
     }
     function generated_marker(i,    j) {
+        if (non_editor) return 0
         if (i >= n) return 0
         if (index(lines[i + 1], "Do not modify or remove the line above.") > 0) return 1
+        if (scissors_cleanup) return 1
         j = i + 1
         while (j <= n && (is_blank(lines[j]) || (comment_prefix != "" && index(lines[j], comment_prefix) == 1)))
             j++
@@ -145,12 +166,9 @@ comment_prefix="$(awk \
         scan_end = n
         for (i = 1; i <= n; i++) {
             if (!candidate_scissors(lines[i])) continue
-            if (i < n && index(lines[i + 1], "Do not modify or remove the line above.") > 0) {
-                scan_end = i - 1
-                break
-            }
             j = i + 1
-            while (j <= n && is_blank(lines[j])) j++
+            while (j <= n && (is_blank(lines[j]) || (token_len(lines[j]) == 1 && is_auto_char(substr(lines[j], 1, 1)))))
+                j++
             if (j <= n && (index(lines[j], "diff --git") == 1 || index(lines[j], "diff --cc") == 1)) {
                 scan_end = i - 1
                 break
@@ -315,7 +333,7 @@ while IFS= read -r line || [ -n "$line" ]; do
     case "$line" in
         "$first_line"|"") continue ;;
     esac
-    if [ "${line#"$comment_prefix"}" != "$line" ]; then
+    if [ "$keep_comment_body" -ne 1 ] && [ "${line#"$comment_prefix"}" != "$line" ]; then
         continue
     fi
     if printf '%s\n' "$line" | grep -Eq '^(Authored-By|session_id|session_pid|time|timestamp|date|runtime|Signed-off-by|Vibecrafted-Warn-Signature):'; then
@@ -328,6 +346,7 @@ done <<< "$kept"
 if [ "$has_body" -ne 1 ]; then
     failures+=("commit message needs an explanatory body before trailers")
 fi
+rm -f "$noneditor_flag"
 
 if [ "${#failures[@]}" -eq 0 ]; then
     exit 0
