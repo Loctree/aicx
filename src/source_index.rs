@@ -1442,9 +1442,8 @@ fn parse_large_codex_signal(
         let payload_type = payload.get("type").and_then(serde_json::Value::as_str);
         if is_tool_call_payload_type(payload_type) {
             for workdir in tool_call_workdirs(payload) {
-                let evidence = WorkdirEvidence::Explicit(workdir);
-                if !window_workdirs.contains(&evidence) {
-                    window_workdirs.push(evidence);
+                if !window_workdirs.contains(&workdir) {
+                    window_workdirs.push(workdir);
                 }
             }
             continue;

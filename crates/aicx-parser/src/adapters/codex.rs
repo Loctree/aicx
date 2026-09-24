@@ -1161,9 +1161,8 @@ impl<'a> Assembly<'a> {
         let payload = &event["payload"];
         if kind == ToolEventKind::Call {
             for workdir in tool_call_workdirs(payload) {
-                let evidence = WorkdirEvidence::Explicit(workdir);
-                if !self.window_workdirs.contains(&evidence) {
-                    self.window_workdirs.push(evidence);
+                if !self.window_workdirs.contains(&workdir) {
+                    self.window_workdirs.push(workdir);
                 }
             }
         }

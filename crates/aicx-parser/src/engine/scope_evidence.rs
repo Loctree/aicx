@@ -98,12 +98,15 @@ pub enum WindowScope {
 /// keeps a `workdir:`-shaped string inside a shell command from deciding the
 /// window on its own — an extra reading makes the window unattributed or
 /// conflicted, never confidently wrong.
-pub fn tool_call_workdirs(payload: &Value) -> Vec<String> {
-    let mut found: Vec<String> = Vec::new();
-    let mut push = |value: String| {
-        let trimmed = value.trim().to_string();
-        if !trimmed.is_empty() && !found.contains(&trimmed) {
-            found.push(trimmed);
+///
+/// A `workdir` whose value is written but cannot be read as one path — a
+/// template literal that interpolates, a literal that never closes — is
+/// [`WorkdirEvidence::Opaque`]: the call names a directory we cannot see.
+pub fn tool_call_workdirs(payload: &Value) -> Vec<WorkdirEvidence> {
+    let mut found: Vec<WorkdirEvidence> = Vec::new();
+    let mut push = |evidence: WorkdirEvidence| {
+        if !found.contains(&evidence) {
+            found.push(evidence);
         }
     };
     if let Some(arguments) = payload.get("arguments") {
@@ -113,47 +116,108 @@ pub fn tool_call_workdirs(payload: &Value) -> Vec<String> {
             _ => None,
         };
         match parsed.as_ref().and_then(|body| body.get("workdir")) {
-            Some(Value::String(workdir)) => push(workdir.clone()),
+            Some(Value::String(workdir)) => {
+                let workdir = workdir.trim();
+                if !workdir.is_empty() {
+                    push(WorkdirEvidence::Explicit(workdir.to_string()));
+                }
+            }
             // A JS literal can also arrive as the raw `arguments` string; scan
             // it rather than declaring no evidence because JSON parsing failed.
             _ => {
                 if let Value::String(raw) = arguments {
-                    for workdir in workdirs_in_literal(raw) {
-                        push(workdir);
-                    }
+                    workdirs_in_literal(raw).into_iter().for_each(&mut push);
                 }
             }
         }
     }
     if let Some(input) = payload.get("input").and_then(Value::as_str) {
-        for workdir in workdirs_in_literal(input) {
-            push(workdir);
-        }
+        workdirs_in_literal(input).into_iter().for_each(&mut push);
     }
     found
 }
 
 /// Every `workdir` key inside an object literal, quote style agnostic:
-/// `workdir:"/p"`, `"workdir": "/p"`, `'workdir': '/p'`.
+/// `workdir:"/p"`, `"workdir": "/p"`, `'workdir': '/p'`, `` workdir: `/p` ``.
 ///
 /// Codex writes `custom_tool_call.input` as model-authored JavaScript, so the
 /// quote style is whatever the model emitted. Accepting only JSON-style double
 /// quotes silently dropped real evidence and left the window on its baseline
-/// project — the leak this module exists to close.
+/// project — the leak this module exists to close. A template literal is a
+/// string literal too: a static one is read like any other, and one that
+/// interpolates (`${root}/pkg`) names a directory only runtime knew, so it is
+/// opaque rather than a fabricated path.
 ///
-/// A value runs to the closing quote and may contain backslashes: a Windows
-/// workdir is `C:\repo\crate`, and stopping the capture at the first backslash
-/// would reduce it to the drive letter.
-fn workdirs_in_literal(input: &str) -> Vec<String> {
-    static WORKDIR_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let re = WORKDIR_RE.get_or_init(|| {
-        regex::Regex::new(r#"["']?workdir["']?\s*:\s*["']([^"']+)"#).expect("valid regex")
-    });
-    re.captures_iter(input)
-        .filter_map(|capture| capture.get(1))
-        .map(|value| value.as_str().trim().to_string())
-        .filter(|value| !value.is_empty())
-        .collect()
+/// A value runs to the quote that OPENED it, never to the first quote of any
+/// kind: `"/Users/O'Brien/repo"` is one path, not `/Users/O`. A backslash
+/// escapes the character after it for that search, and only an escaped
+/// backslash or an escaped delimiter is unescaped in the value; every other
+/// backslash stays, because a Windows workdir is `C:\repo\crate` and reading
+/// `\r` as an escape would corrupt it. A literal that never closes is
+/// opaque: whatever it names was cut off.
+///
+/// This is a scanner over key/value SHAPE, not a JavaScript parser, and it
+/// deliberately does not track which string a `workdir:` sits inside. Model
+/// JavaScript routinely carries apostrophes in comments and prose; a tokenizer
+/// that misreads one would hide a real `workdir` key after it, which is a
+/// leak, while an extra reading only makes the window unattributed or
+/// conflicted.
+fn workdirs_in_literal(input: &str) -> Vec<WorkdirEvidence> {
+    static WORKDIR_KEY_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = WORKDIR_KEY_RE
+        .get_or_init(|| regex::Regex::new(r#"["']?workdir["']?\s*:\s*"#).expect("valid regex"));
+    let mut found = Vec::new();
+    for key in re.find_iter(input) {
+        let value = &input[key.end()..];
+        let Some(delimiter) = value
+            .chars()
+            .next()
+            .filter(|c| matches!(c, '"' | '\'' | '`'))
+        else {
+            // Not a string literal (an identifier, an expression, or prose in
+            // a command): nothing to read, exactly as before.
+            continue;
+        };
+        match literal_body(&value[1..], delimiter) {
+            Some(body) if delimiter == '`' && body.contains("${") => {
+                found.push(WorkdirEvidence::Opaque);
+            }
+            Some(body) => {
+                let body = body.trim();
+                if !body.is_empty() {
+                    found.push(WorkdirEvidence::Explicit(body.to_string()));
+                }
+            }
+            None => found.push(WorkdirEvidence::Opaque),
+        }
+    }
+    found
+}
+
+/// The body of a string literal that `delimiter` opened, up to the matching
+/// unescaped `delimiter`; `None` when it never closes. Only `\\` and an escaped
+/// delimiter are unescaped (see [`workdirs_in_literal`]).
+fn literal_body(rest: &str, delimiter: char) -> Option<String> {
+    let mut body = String::new();
+    let mut chars = rest.chars();
+    while let Some(c) = chars.next() {
+        if c == delimiter {
+            return Some(body);
+        }
+        if c != '\\' {
+            body.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some(escaped) if escaped == '\\' || escaped == delimiter => body.push(escaped),
+            Some(other) => {
+                body.push('\\');
+                body.push(other);
+            }
+            None => return None,
+        }
+    }
+    None
 }
 
 /// Resolve one workdir string to an absolute spelling, lexically normalized.
@@ -934,7 +998,14 @@ mod tests {
     }
 
     fn first_workdir(payload: &Value) -> Option<String> {
-        tool_call_workdirs(payload).into_iter().next()
+        tool_call_workdirs(payload)
+            .into_iter()
+            .next()
+            .and_then(|evidence| evidence.path().map(str::to_owned))
+    }
+
+    fn js_input(input: &str) -> Value {
+        serde_json::json!({"type": "custom_tool_call", "name": "exec", "input": input})
     }
 
     #[test]
@@ -1002,9 +1073,73 @@ mod tests {
         });
         assert_eq!(
             tool_call_workdirs(&payload),
-            vec!["/repo/vista".to_string(), "/repo/fleet-bus".to_string()],
+            explicit(&["/repo/vista", "/repo/fleet-bus"]),
             "a later hop must not hide behind the first call"
         );
+    }
+
+    /// Finding: the value capture stopped at the first quote of EITHER kind,
+    /// whatever opened it, so a legal apostrophe cut the path short and the
+    /// fabricated prefix decided the window.
+    #[test]
+    fn a_workdir_value_runs_to_the_quote_that_opened_it() {
+        assert_eq!(
+            tool_call_workdirs(&js_input(
+                r#"tools.exec_command({cmd:"ls",workdir:"/Users/O'Brien/repo"})"#
+            )),
+            explicit(&["/Users/O'Brien/repo"])
+        );
+        assert_eq!(
+            tool_call_workdirs(&js_input(
+                r#"tools.exec_command({workdir:'/tmp/say "hi"/x'})"#
+            )),
+            explicit(&[r#"/tmp/say "hi"/x"#])
+        );
+        // An escaped delimiter and an escaped backslash are part of the value;
+        // any other backslash is a Windows separator and stays.
+        assert_eq!(
+            tool_call_workdirs(&js_input(
+                r"tools.exec_command({workdir:'/Users/O\'Brien/repo'})"
+            )),
+            explicit(&["/Users/O'Brien/repo"])
+        );
+        assert_eq!(
+            tool_call_workdirs(&js_input(
+                r#"tools.exec_command({workdir:"C:\\Users\\dev\\repo"})"#
+            )),
+            explicit(&[r"C:\Users\dev\repo"])
+        );
+        // A literal that never closes was cut off: its path is unknowable.
+        assert_eq!(
+            tool_call_workdirs(&js_input(r#"tools.exec_command({workdir:"/foreign/re"#)),
+            vec![WorkdirEvidence::Opaque]
+        );
+    }
+
+    /// Finding: a template literal is a string literal in JavaScript, and the
+    /// scanner did not recognise one, so `` workdir: `/foreign/repo` `` left a
+    /// foreign call on its baseline project.
+    #[test]
+    fn a_template_literal_workdir_is_read_and_an_interpolated_one_is_opaque() {
+        assert_eq!(
+            tool_call_workdirs(&js_input(
+                "tools.exec_command({cmd:'ls', workdir: `/foreign/repo`})"
+            )),
+            explicit(&["/foreign/repo"])
+        );
+        // Interpolation names a directory only the runtime knew. It is
+        // evidence we cannot read, never the literal text `${root}/pkg`.
+        assert_eq!(
+            tool_call_workdirs(&js_input(
+                "tools.exec_command({cmd:'ls', workdir: `${root}/pkg`})"
+            )),
+            vec![WorkdirEvidence::Opaque]
+        );
+        let (scope, _) = effective_window_scope(
+            &tool_call_workdirs(&js_input("tools.exec_command({workdir: `${root}/pkg`})")),
+            Some("/present/vista"),
+        );
+        assert_eq!(scope, WindowScope::Unattributed);
     }
 
     #[test]
