@@ -553,4 +553,6 @@ fn test_inline_markdown_quote_break_attempt_does_not_inject_attribute() {
 fn test_render_server_shell_html_contains_csp_meta() {
     let html = render_server_shell_html("test");
     assert!(html.contains("<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; base-uri 'none'; frame-ancestors 'none'; form-action 'none';\">"));
+    assert!(html.contains("id=\"aicx-mark\""));
+    assert!(html.contains("aria-label=\"Loctree\""));
 }

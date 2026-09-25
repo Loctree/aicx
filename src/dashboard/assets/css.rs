@@ -40,6 +40,18 @@ body {
   padding: 10px 2px 16px;
 }
 
+.brand-lockup {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+}
+
+.brand-mark {
+  flex: none;
+  margin-top: 4px;
+  color: var(--text);
+}
+
 .app-header h1 {
   margin: 0;
   font-family: var(--font-display);

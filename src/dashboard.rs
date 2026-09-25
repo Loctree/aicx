@@ -272,6 +272,10 @@ pub fn build_dashboard_from_payload(
     })
 }
 
+/// Loctree node-tree mark from `loctree-com/public/assets/loctree-logo.svg`,
+/// inked with `currentColor` so the shell paints it bone on ink.
+pub(crate) const AICX_MARK_SVG: &str = r#"<svg id="aicx-mark" class="brand-mark" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 360 360" width="32" height="32" role="img" aria-label="Loctree" focusable="false"><g fill="currentColor"><circle cx="75" cy="50" r="16"/><circle cx="180" cy="50" r="16"/><circle cx="285" cy="50" r="16"/><circle cx="140" cy="120" r="16"/><circle cx="75" cy="190" r="16"/><circle cx="180" cy="190" r="16"/><circle cx="285" cy="190" r="16"/><circle cx="205" cy="310" r="16"/></g><line x1="210" y1="225" x2="210" y2="270" stroke="currentColor" stroke-width="10" stroke-linecap="round"/></svg>"#;
+
 /// Render a lightweight HTML shell for server mode.
 ///
 /// No data is embedded — the JavaScript fetches everything through API endpoints.
@@ -320,10 +324,13 @@ pub fn render_server_shell_html(title: &str) -> String {
 <body>
   <div class="app-shell">
     <header class="app-header">
-      <div>
+      <div class="brand-lockup">
+        {AICX_MARK_SVG}
+        <div>
         <h1>aicx</h1>
         <p class="meta">Search. <a href="/auth">Sign in</a></p>
         <p class="meta" id="ctx-gen-info">Loading…</p>
+        </div>
       </div>
       <div class="header-stats">
         <div class="stat"><strong id="ctx-stat-files">-</strong><span>files</span></div>
@@ -429,7 +436,8 @@ pub fn render_server_shell_html(title: &str) -> String {
             "{}\n{}",
             assets::DASHBOARD_INLINE_MARKDOWN_SCRIPT,
             assets::DASHBOARD_SERVER_SCRIPT
-        )
+        ),
+        AICX_MARK_SVG = AICX_MARK_SVG,
     )
 }
 
