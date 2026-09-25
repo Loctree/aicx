@@ -107,11 +107,20 @@ fn render_header(out: &mut String, model: &SessionModel, distillates: &[SegmentD
 
 /// More than one distinct known cwd across segments = several workstreams,
 /// even when each individual segment is internally drift-free.
+///
+/// A segment's resolved `scope_root` counts next to its recorded cwd, the same
+/// evidence [`SessionModel::scope_status`] reads. A session launched in one
+/// checkout whose workdirs resolved one span to another checkout is one
+/// segment with a drift-free status, and without this its brief would head
+/// that span with the other repository while claiming a single workstream.
 fn multi_workstream(model: &SessionModel) -> bool {
     let mut cwds = std::collections::BTreeSet::new();
     for segment in &model.segments {
         if let Known::Value(cwd) = &segment.cwd {
             cwds.insert(cwd.as_str());
+        }
+        if let Some(root) = segment.scope_root.as_deref() {
+            cwds.insert(root);
         }
     }
     cwds.len() > 1
@@ -361,5 +370,27 @@ mod tests {
             brief.contains("| 0 | /sessions/vista (scope conflict) | main |"),
             "{brief}"
         );
+    }
+
+    /// One segment, launched in one checkout, whose workdirs resolved it to
+    /// another: the session is `mixed_candidate`, and the brief must say so
+    /// rather than head the span with the other repository as its only work.
+    #[test]
+    fn a_rescoped_single_segment_is_a_multi_workstream_brief() {
+        let mut rescoped = segment(0, "/sessions/vista");
+        rescoped.scope_root = Some("/repo/fleet-bus".to_owned());
+        let model = minimal_model(vec![rescoped]);
+        assert_eq!(model.scope_status(), ScopeStatus::MixedCandidate);
+        let brief = render_brief(&model, &[distillate_for(0)]);
+        assert!(
+            brief.contains("**Multi-workstream session** — 1 segment(s), mixed_candidate"),
+            "{brief}"
+        );
+        assert!(brief.contains("| 0 | /repo/fleet-bus | main |"), "{brief}");
+
+        let mut same_place = segment(0, "/repo/fleet-bus");
+        same_place.scope_root = Some("/repo/fleet-bus".to_owned());
+        let brief = render_brief(&minimal_model(vec![same_place]), &[distillate_for(0)]);
+        assert!(!brief.contains("Multi-workstream"), "{brief}");
     }
 }
