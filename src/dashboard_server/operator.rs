@@ -646,14 +646,16 @@ body{margin:0;background:#0e0e0e;color:#f5f1e7;font-family:Inter,system-ui,sans-
 main{max-width:22rem;margin:4rem auto;padding:1.5rem;text-align:center}
 h1{font-family:"Instrument Serif","Iowan Old Style",Palatino,Georgia,serif;font-weight:400;font-size:2rem;margin:0 0 .5rem}
 p{margin:.4rem 0 1rem;line-height:1.4}
-#aicx-mark{display:block;width:28px;height:28px;margin:0 auto 1rem;color:#f5f1e7;background:transparent}
+.brand-pair{display:flex;align-items:center;justify-content:center;gap:.55rem;margin:0 0 1rem}
+.brand-word{font-family:"Instrument Serif","Iowan Old Style",Palatino,Georgia,serif;font-weight:400;font-size:1.35rem;line-height:1;letter-spacing:.04em;color:#f5f1e7}
+#aicx-mark{display:block;width:28px;height:28px;margin:0;color:#f5f1e7;background:transparent}
 .pills{display:flex;flex-direction:column;align-items:center;gap:.45rem}
-a{display:inline-flex;align-items:center;justify-content:center;gap:.55rem;width:14.5rem;margin:0;padding:.45rem .7rem;border:1px solid rgba(255,255,255,.16);border-radius:999px;color:#f5f1e7;text-decoration:none;font-size:.84rem}
-a svg{width:14px;height:14px;flex:none}
-a:hover{border-color:#3d7a72}
-.note{margin:.15rem 0 .35rem;color:rgba(245,241,231,.64);font-size:.75rem}
-button.pill{display:inline-flex;align-items:center;justify-content:center;gap:.55rem;width:14.5rem;margin:0;padding:.45rem .7rem;border:1px solid rgba(255,255,255,.16);border-radius:999px;background:transparent;color:#f5f1e7;font:inherit;font-size:.84rem;cursor:pointer}
-button.pill:hover{border-color:#3d7a72}
+.pills>a,.pills>button.pill{display:inline-flex;align-items:center;justify-content:flex-start;gap:.55rem;box-sizing:border-box;width:14.5rem;height:2.25rem;margin:0;padding:0 .75rem;border:1px solid rgba(255,255,255,.16);border-radius:999px;background:transparent;color:#f5f1e7;font-family:inherit;font-size:.84rem;font-weight:400;line-height:1;text-decoration:none;white-space:nowrap;cursor:pointer;appearance:none}
+.pills>a svg,.pills>button.pill svg{width:14px;height:14px;flex:0 0 14px}
+.pills>a:hover,.pills>button.pill:hover{border-color:#3d7a72}
+.note{width:14.5rem;margin:.15rem 0 .35rem;color:rgba(245,241,231,.64);font-size:.75rem}
+#passphrase-go{display:inline-flex;align-items:center;justify-content:center;box-sizing:border-box;width:100%;margin:0;padding:.45rem .7rem;border:1px solid rgba(255,255,255,.16);border-radius:999px;background:transparent;color:#f5f1e7;font:inherit;font-size:.84rem;cursor:pointer;appearance:none}
+#passphrase-go:hover{border-color:#3d7a72}
 #passphrase-modal{position:fixed;inset:0;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center}
 #passphrase-modal[hidden]{display:none}
 #passphrase-modal form{width:16rem;padding:1rem;background:#161616;border:1px solid rgba(255,255,255,.16);border-radius:12px;text-align:left}
@@ -663,7 +665,7 @@ button.pill:hover{border-color:#3d7a72}
 #passphrase-err[hidden]{display:none}
 </style></head>
 <body><main>
-<!--mark-->
+<div class="brand-pair"><!--mark--><span class="brand-word">AICX</span></div>
 <h1>Sign in</h1>
 <p>Search stays on this machine. Pick the credential that already knows you.</p>
 <div class="pills">
@@ -675,7 +677,7 @@ button.pill:hover{border-color:#3d7a72}
 </div>
 </main></body></html>"#;
 
-const PASSPHRASE_HTML: &str = r#"<button type="button" class="pill" id="passphrase-open">Enter passphrase</button>
+const PASSPHRASE_HTML: &str = r#"<button type="button" class="pill" id="passphrase-open"><svg class="auth-mark" viewBox="0 0 360 360" aria-hidden="true"><g fill="currentColor"><circle cx="75" cy="50" r="16"/><circle cx="180" cy="50" r="16"/><circle cx="285" cy="50" r="16"/><circle cx="140" cy="120" r="16"/><circle cx="75" cy="190" r="16"/><circle cx="180" cy="190" r="16"/><circle cx="285" cy="190" r="16"/><circle cx="205" cy="310" r="16"/></g><line x1="210" y1="225" x2="210" y2="270" stroke="currentColor" stroke-width="10" stroke-linecap="round"/></svg>Enter passphrase</button>
 <div id="passphrase-modal" hidden>
 <form id="passphrase-form">
 <label for="passphrase-token">Token</label>
@@ -796,6 +798,8 @@ mod tests {
             let html = text_of(page).await;
             assert!(html.contains("id=\"aicx-mark\""));
             assert!(html.contains("aria-label=\"Loctree\""));
+            assert!(html.contains("class=\"brand-word\">AICX</span>"));
+            assert_eq!(html.matches("id=\"aicx-mark\"").count(), 1);
             assert!(html.contains("/auth/tailscale"));
             assert!(html.contains("/auth/google"));
             assert!(html.contains("/auth/github"));
@@ -822,6 +826,8 @@ mod tests {
             assert!(local_html.contains("id=\"passphrase-token\""));
             assert!(local_html.contains("id=\"passphrase-go\""));
             assert!(local_html.contains("aicx_dashboard_token"));
+            assert_eq!(local_html.matches("auth-mark").count(), 4);
+            assert_eq!(local_html.matches("id=\"aicx-mark\"").count(), 1);
 
             let remote = app
                 .clone()
