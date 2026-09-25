@@ -108,8 +108,28 @@ pub(super) async fn post_index(
         .into_response()
 }
 
-pub(super) async fn get_auth_page() -> Html<String> {
-    Html(AUTH_HTML.replace("<!--mark-->", crate::dashboard::AICX_MARK_SVG))
+pub(super) async fn get_auth_page(headers: HeaderMap) -> Html<String> {
+    let page = AUTH_HTML.replace("<!--mark-->", crate::dashboard::AICX_MARK_SVG);
+    let passphrase = if passphrase_on_loopback(&headers) {
+        PASSPHRASE_HTML
+    } else {
+        ""
+    };
+    Html(page.replace("<!--passphrase-->", passphrase))
+}
+
+/// The passphrase control is a local paste of the existing bearer token.
+/// It is rendered only when the browser asked for this host by its loopback name.
+fn passphrase_on_loopback(headers: &HeaderMap) -> bool {
+    let Some(host) = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return false;
+    };
+    let host = host.trim();
+    let name = host.split_once(':').map(|(name, _)| name).unwrap_or(host);
+    name == "127.0.0.1"
 }
 
 pub(super) async fn auth_tailscale(headers: HeaderMap) -> Response {
@@ -632,6 +652,15 @@ a{display:inline-flex;align-items:center;justify-content:center;gap:.55rem;width
 a svg{width:14px;height:14px;flex:none}
 a:hover{border-color:#3d7a72}
 .note{margin:.15rem 0 .35rem;color:rgba(245,241,231,.64);font-size:.75rem}
+button.pill{display:inline-flex;align-items:center;justify-content:center;gap:.55rem;width:14.5rem;margin:0;padding:.45rem .7rem;border:1px solid rgba(255,255,255,.16);border-radius:999px;background:transparent;color:#f5f1e7;font:inherit;font-size:.84rem;cursor:pointer}
+button.pill:hover{border-color:#3d7a72}
+#passphrase-modal{position:fixed;inset:0;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center}
+#passphrase-modal[hidden]{display:none}
+#passphrase-modal form{width:16rem;padding:1rem;background:#161616;border:1px solid rgba(255,255,255,.16);border-radius:12px;text-align:left}
+#passphrase-modal label{display:block;margin:0 0 .4rem;font-size:.75rem;color:rgba(245,241,231,.64)}
+#passphrase-modal input{width:100%;box-sizing:border-box;margin:0 0 .6rem;padding:.45rem .6rem;border:1px solid rgba(255,255,255,.16);border-radius:8px;background:#0e0e0e;color:#f5f1e7;font:inherit}
+#passphrase-err{margin:0 0 .5rem;color:#e0a090;font-size:.75rem}
+#passphrase-err[hidden]{display:none}
 </style></head>
 <body><main>
 <!--mark-->
@@ -642,8 +671,63 @@ a:hover{border-color:#3d7a72}
 <p class="note">Tailscale Serve sends Tailscale-User-Login. No separate Tailscale app.</p>
 <a href="/auth/google"><svg class="auth-mark" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12.24 10.29V14.4h6.81c-.28 1.76-2.06 5.17-6.81 5.17-4.1 0-7.44-3.39-7.44-7.57S8.14 4.43 12.24 4.43c2.33 0 3.89.99 4.79 1.85l3.25-3.14C18.19 1.19 15.48 0 12.24 0 5.48 0 0 5.48 0 12.24S5.48 24.48 12.24 24.48c7.06 0 11.75-4.96 11.75-11.96 0-.8-.09-1.41-.19-2.23H12.24z"/></svg>Continue with Google</a>
 <a href="/auth/github"><svg class="auth-mark" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 .3C5.37.3 0 5.67 0 12.3c0 5.3 3.44 9.8 8.21 11.39.6.11.82-.26.82-.58 0-.28-.01-1.04-.02-2.04-3.34.72-4.04-1.61-4.04-1.61-.55-1.39-1.33-1.76-1.33-1.76-1.09-.74.08-.73.08-.73 1.2.08 1.84 1.24 1.84 1.24 1.07 1.83 2.81 1.3 3.5 1 .1-.78.42-1.3.76-1.6-2.67-.3-5.47-1.33-5.47-5.93 0-1.31.47-2.38 1.24-3.22-.13-.3-.54-1.52.1-3.18 0 0 1.01-.32 3.3 1.23a11.5 11.5 0 0 1 6 0c2.28-1.55 3.29-1.23 3.29-1.23.64 1.66.23 2.88.12 3.18.77.84 1.23 1.91 1.23 3.22 0 4.61-2.81 5.62-5.48 5.92.43.37.81 1.1.81 2.22 0 1.61-.01 2.9-.01 3.29 0 .32.22.69.83.57A12.3 12.3 0 0 0 24 12.3C24 5.67 18.63.3 12 .3z"/></svg>Continue with GitHub</a>
+<!--passphrase-->
 </div>
 </main></body></html>"#;
+
+const PASSPHRASE_HTML: &str = r#"<button type="button" class="pill" id="passphrase-open">Enter passphrase</button>
+<div id="passphrase-modal" hidden>
+<form id="passphrase-form">
+<label for="passphrase-token">Token</label>
+<input id="passphrase-token" type="password" autocomplete="off" spellcheck="false">
+<p id="passphrase-err" hidden></p>
+<button type="submit" class="pill" id="passphrase-go">Go</button>
+</form>
+</div>
+<script>
+(function () {
+  if (location.hostname !== "127.0.0.1") {
+    var stray = document.getElementById("passphrase-open");
+    if (stray) stray.remove();
+    return;
+  }
+  var open = document.getElementById("passphrase-open");
+  var modal = document.getElementById("passphrase-modal");
+  var form = document.getElementById("passphrase-form");
+  var input = document.getElementById("passphrase-token");
+  var err = document.getElementById("passphrase-err");
+  var go = document.getElementById("passphrase-go");
+  open.addEventListener("click", function () {
+    modal.hidden = false;
+    input.focus();
+  });
+  modal.addEventListener("click", function (event) {
+    if (event.target === modal) modal.hidden = true;
+  });
+  form.addEventListener("submit", function (event) {
+    event.preventDefault();
+    var token = (input.value || "").trim();
+    if (!token) return;
+    go.disabled = true;
+    err.hidden = true;
+    fetch("/api/status", { headers: { Authorization: "Bearer " + token } })
+      .then(function (response) {
+        if (!response.ok) {
+          err.textContent = "Token refused.";
+          err.hidden = false;
+          return;
+        }
+        localStorage.setItem("aicx_dashboard_token", token);
+        location.assign("/");
+      })
+      .catch(function () {
+        err.textContent = "Could not reach this machine.";
+        err.hidden = false;
+      })
+      .finally(function () { go.disabled = false; });
+  });
+})();
+</script>"#;
 
 #[cfg(test)]
 mod tests {
@@ -720,6 +804,38 @@ mod tests {
             assert!(html.contains("M24 12a3 3 0"));
             assert!(html.contains("background:transparent"));
             assert!(html.contains("text-align:center"));
+            assert!(!html.contains("passphrase-open"));
+
+            let local = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri("/auth")
+                        .header("host", "127.0.0.1:50110")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let local_html = text_of(local).await;
+            assert!(local_html.contains("id=\"passphrase-open\""));
+            assert!(local_html.contains("id=\"passphrase-token\""));
+            assert!(local_html.contains("id=\"passphrase-go\""));
+            assert!(local_html.contains("aicx_dashboard_token"));
+
+            let remote = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri("/auth")
+                        .header("host", "100.82.232.70:50110")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let remote_html = text_of(remote).await;
+            assert!(!remote_html.contains("passphrase-open"));
 
             let missing = app
                 .clone()
