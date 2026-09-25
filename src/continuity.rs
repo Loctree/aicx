@@ -486,7 +486,7 @@ pub fn render(pack: &ContinuityPack, for_inject: bool) -> String {
     out.push_str("## INDEX HEALTH\n\n");
     let health = &pack.index_health;
     out.push_str(&format!(
-        "- newest_session_updated: {}\n",
+        "- newest_source_file_mtime: {} (file touch, not conversation time)\n",
         health
             .newest_session_updated_at
             .as_deref()
@@ -761,8 +761,39 @@ mod tests {
             dropped_candidates: 0,
         };
         let rendered = render(&pack, false);
-        assert!(rendered.contains("newest_session_updated: 2026-08-13T01:48:00Z"));
+        assert!(rendered.contains(
+            "newest_source_file_mtime: 2026-08-13T01:48:00Z (file touch, not conversation time)"
+        ));
         assert!(rendered.contains("warning: chunk lag (pending=631"));
         assert!(rendered.contains("aicx catalog rebuild --with-chunks"));
+    }
+
+    #[test]
+    fn continuity_index_health_names_source_file_mtime() {
+        let pack = ContinuityPack {
+            project_label: "vetcoders/vibecrafted".into(),
+            hours: 24,
+            live_sessions: 1,
+            records: Vec::new(),
+            sources: Vec::new(),
+            index_health: IndexHealthLine {
+                newest_session_updated_at: Some("2026-09-21T03:30:00Z".into()),
+                committed_at: None,
+                pending: 0,
+                sessions_newer_than_chunks: 0,
+                readiness: "ready".into(),
+                mode: "live",
+            },
+            mixed_scope: Vec::new(),
+            distilled_mixed: false,
+            candidate_cap: 5_000,
+            dropped_candidates: 0,
+        };
+        let rendered = render(&pack, false);
+        assert!(rendered.contains(
+            "newest_source_file_mtime: 2026-09-21T03:30:00Z (file touch, not conversation time)"
+        ));
+        assert!(rendered.contains("newest_source_file_mtime"));
+        assert!(rendered.contains("file touch, not conversation time"));
     }
 }
