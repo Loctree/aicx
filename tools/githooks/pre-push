@@ -20,7 +20,14 @@ while read -r _lref lsha _rref rsha; do
   [ -z "$lsha" ] && continue
   case "$lsha" in *[!0]*) : ;; *) continue ;; esac  # ref deletion: nothing to test
   HAVE_RANGE=1
-  if printf '%s' "$rsha" | grep -qE '^0+$' || ! git cat-file -e "$rsha" 2>/dev/null; then
+  if ! printf '%s' "$rsha" | grep -qE '^0+$' && ! git cat-file -e "$rsha" 2>/dev/null; then
+    # Nonzero remote tip that is not in this object database. Diffing
+    # against the default branch would hide edits that exist only
+    # against that missing tip.
+    RUST_TOUCHED=1
+    continue
+  fi
+  if printf '%s' "$rsha" | grep -qE '^0+$'; then
     # Compare against the repository's actual default branch. Hardcoding
     # origin/develop made every first push of a new branch fall back to a
     # branch this repo abandoned on 2026-07-15: the merge-base landed hundreds

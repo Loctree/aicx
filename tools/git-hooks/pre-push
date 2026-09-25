@@ -61,7 +61,14 @@ else
     # nothing to compile or test. Count it and move on.
     case "$lsha" in *[!0]*) : ;; *) DELETE_LINES=$((DELETE_LINES + 1)); continue ;; esac
     HAVE_RANGE=1
-    if printf '%s' "$rsha" | grep -qE '^0+$' || ! git cat-file -e "$rsha" 2>/dev/null; then
+    if ! printf '%s' "$rsha" | grep -qE '^0+$' && ! git cat-file -e "$rsha" 2>/dev/null; then
+      # Nonzero remote tip that is not in this object database. Diffing
+      # against the default branch would hide edits that exist only
+      # against that missing tip.
+      RUST_TOUCHED=1
+      continue
+    fi
+    if printf '%s' "$rsha" | grep -qE '^0+$'; then
       # Same destination-remote rule as tools/githooks/pre-push. origin keeps
       # the develop→main fallback. Any other remote uses its own HEAD, and a
       # missing baseline fails closed into the full gate instead of inspecting

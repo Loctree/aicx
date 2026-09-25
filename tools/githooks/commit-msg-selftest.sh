@@ -31,6 +31,7 @@ hook_env() {
         TERM_PROGRAM= \
         VC_SESSION_PID=0 \
         VC_GIT_VERSION= \
+        VC_COMMIT_CLEANUP= \
         GIT_CONFIG_GLOBAL=/dev/null \
         GIT_CONFIG_SYSTEM=/dev/null \
         GIT_CONFIG_NOSYSTEM=1 \
@@ -351,6 +352,15 @@ out="$(gen "$subject_agent
 
 Why this commit exists.
 
+session_pid: 111" \
+    CODEX_SESSION_ID="$real_session" VC_SESSION_PID= \
+    GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=vetcoders.sessionPid GIT_CONFIG_VALUE_0=FALSE)"
+expect_absent session-pid-git-bool-false "$out" "session_pid:"
+
+out="$(gen "$subject_agent
+
+Why this commit exists.
+
 session_pid: 111" CODEX_SESSION_ID="$real_session" CLAUDE_PID=222 VC_SESSION_PID=1)"
 expect_line session-pid-keeps-declaration-without-match "$out" "session_pid: 111"
 
@@ -611,6 +621,39 @@ if ! awk -v id="$thread_id" '
 fi
 rm -f "$tmp"
 printf 'ok generator: scissors cleanup does not need a diff\n'
+
+# git commit --cleanup=scissors is not stored in config. The hook accepts
+# the same signal through the committing command, tested here as the
+# explicit override the selftest can set without spawning git.
+tmp="$(mktemp)"
+cat >"$tmp" <<EOF
+$subject_agent
+
+Why this commit exists.
+
+# ------------------------ >8 ------------------------
+# status przetlumaczony
+EOF
+if ! hook_env VC_COMMIT_CLEANUP=scissors \
+    CODEX_THREAD_ID="$thread_id" TERM_PROGRAM=iTerm.app \
+    "$hook" "$tmp" >/dev/null 2>&1; then
+    printf 'FAIL generator: per-command scissors cleanup rejected\n' >&2
+    cat "$tmp" >&2
+    rm -f "$tmp"
+    exit 1
+fi
+if ! awk -v id="$thread_id" '
+    /^#[[:space:]]*-{24}[[:space:]]*>8/ { exit }
+    $0 == "session_id: " id { found=1 }
+    END { exit !found }
+' "$tmp"; then
+    printf 'FAIL generator: per-command scissors cleanup left session_id below the cut\n' >&2
+    cat "$tmp" >&2
+    rm -f "$tmp"
+    exit 1
+fi
+rm -f "$tmp"
+printf 'ok generator: per-command scissors cleanup is a cut\n'
 
 # Auto chose ";" because a body line starts with "#". The generated
 # semicolon comments between the marker and the diff must not change that.
@@ -1169,6 +1212,21 @@ Why this commit exists." CURSOR_CONVERSATION_ID="$real_session" VC_SESSION_PID=0
 expect_line cursor-agent-alias-session "$out" "session_id: $real_session"
 expect_line cursor-agent-alias-mailbox "$out" "Authored-By: cursor-agent <agents@vetcoders.io>"
 
+out="$(gen "$subject_claude
+
+Why this commit exists." CLAUDE_SESSION_ID="abc12345-dead-beef" VC_SESSION_PID=0)"
+expect_line claude-native-id "$out" "session_id: abc12345-dead-beef"
+tmp="$(mktemp)"
+printf '%s\n' "$out" >"$tmp"
+if ! hook_env CLAUDE_SESSION_ID="abc12345-dead-beef" TERM_PROGRAM=iTerm.app "$hook" "$tmp" >/dev/null 2>&1; then
+    printf 'FAIL validator: native Claude session id rejected\n' >&2
+    hook_env CLAUDE_SESSION_ID="abc12345-dead-beef" TERM_PROGRAM=iTerm.app "$hook" "$tmp" >&2 || true
+    rm -f "$tmp"
+    exit 1
+fi
+rm -f "$tmp"
+printf 'ok validator: native Claude session id accepted\n'
+
 out="$(gen "$subject_agent
 
 Why this commit exists." CODEX_SESSION_ID="019c09d5-codex" VC_SESSION_PID=0)"
@@ -1310,6 +1368,10 @@ for copy in "$root/tools/githooks/pre-push" "$root/tools/git-hooks/pre-push"; do
     fi
     if ! grep -q 'ls-remote --symref' "$copy"; then
         printf 'FAIL pre-push: %s guesses main when the remote HEAD symref is missing\n' "$copy" >&2
+        exit 1
+    fi
+    if ! grep -q 'Nonzero remote tip' "$copy"; then
+        printf 'FAIL pre-push: %s diffs a missing remote tip against the default branch\n' "$copy" >&2
         exit 1
     fi
     if grep -F -q '*"/develop"' "$copy"; then

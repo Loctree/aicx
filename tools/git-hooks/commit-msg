@@ -104,8 +104,14 @@ if [ -f "$noneditor_flag" ]; then
 fi
 cleanup_mode="$(git config --get commit.cleanup 2>/dev/null || true)"
 scissors_cleanup=0
-if [ "$cleanup_mode" = "scissors" ]; then
+if [ "$cleanup_mode" = "scissors" ] || [ "${VC_COMMIT_CLEANUP:-}" = "scissors" ]; then
     scissors_cleanup=1
+fi
+if [ "$scissors_cleanup" -eq 0 ]; then
+    parent_args="$(ps -o args= -p "$PPID" 2>/dev/null || true)"
+    case "$parent_args" in
+        *"--cleanup=scissors"*|*"--cleanup scissors"*) scissors_cleanup=1 ;;
+    esac
 fi
 keep_comment_body=0
 case "$cleanup_mode" in
@@ -285,7 +291,8 @@ fi
 session_ok=0
 if printf '%s\n' "$footer" | grep -Eq '^session_id: [0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'; then
     session_ok=1
-elif [ "$session_agent" = "codex" ] && printf '%s\n' "$footer" | grep -Eq '^session_id: [A-Za-z0-9][A-Za-z0-9._-]{0,127}$'; then
+elif { [ "$session_agent" = "codex" ] || [ "$session_agent" = "claude" ]; } \
+    && printf '%s\n' "$footer" | grep -Eq '^session_id: [A-Za-z0-9][A-Za-z0-9._-]{0,127}$'; then
     session_ok=1
 elif [ "$session_agent" = "junie" ] && printf '%s\n' "$footer" | grep -Eq '^session_id: [0-9]{6}(-[A-Za-z0-9]+)+$'; then
     session_ok=1
@@ -295,8 +302,8 @@ elif [ "$session_agent" = "kimi" ] && printf '%s\n' "$footer" | grep -Eq '^sessi
     session_ok=1
 fi
 if [ "$session_ok" -ne 1 ]; then
-    if [ "$session_agent" = "codex" ]; then
-        failures+=("missing session_id: <uuid or Codex session id>")
+    if [ "$session_agent" = "codex" ] || [ "$session_agent" = "claude" ]; then
+        failures+=("missing session_id: <uuid or native session id>")
     elif [ "$session_agent" = "junie" ]; then
         failures+=("missing session_id: <uuid or YYMMDD-HHMMSS-suffix>")
     elif [ "$session_agent" = "gemini" ]; then

@@ -181,7 +181,7 @@ if [ -z "$session_rejected" ] && printf '%s' "$session_raw" | grep -Eq '^[0-9a-f
 elif [ -z "$session_rejected" ] && printf '%s' "$session_raw" \
     | grep -Eq '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'; then
     session_id="$(printf '%s' "$session_raw" | tr 'A-F' 'a-f')"
-elif [ -z "$session_rejected" ] && [ "$session_agent" = "codex" ] \
+elif [ -z "$session_rejected" ] && { [ "$session_agent" = "codex" ] || [ "$session_agent" = "claude" ]; } \
     && printf '%s' "$session_raw" | grep -Eq "$codex_session_re"; then
     session_id="$session_raw"
 elif [ -z "$session_rejected" ] && [ "$session_agent" = "junie" ] \
@@ -218,8 +218,9 @@ session_pid_enabled() {
     esac
     # git config resolves repo-local before global, so one setting covers both
     # "this repo only" and "the whole fleet on this machine".
-    case "$(git config --get vetcoders.sessionPid 2>/dev/null || true)" in
-        0|off|false|no|disabled) return 1 ;;
+    # Git accepts TRUE/FALSE/yes/no/on/off/0/1. --bool normalizes them.
+    case "$(git config --bool --get vetcoders.sessionPid 2>/dev/null || true)" in
+        false) return 1 ;;
     esac
     return 0
 }
@@ -293,8 +294,16 @@ if [ -f "$noneditor_flag" ]; then
 fi
 cleanup_mode="$(git config --get commit.cleanup 2>/dev/null || true)"
 scissors_cleanup=0
-if [ "$cleanup_mode" = "scissors" ]; then
+if [ "$cleanup_mode" = "scissors" ] || [ "${VC_COMMIT_CLEANUP:-}" = "scissors" ]; then
     scissors_cleanup=1
+fi
+# git commit --cleanup=scissors does not change stored config. The flag
+# is still on the committing process command line.
+if [ "$scissors_cleanup" -eq 0 ]; then
+    parent_args="$(ps -o args= -p "$PPID" 2>/dev/null || true)"
+    case "$parent_args" in
+        *"--cleanup=scissors"*|*"--cleanup scissors"*) scissors_cleanup=1 ;;
+    esac
 fi
 
 # Rewrite the footer in one pass. A trailer is any key line in the
@@ -574,8 +583,8 @@ if [ -n "$session_rejected" ]; then
         printf 'prepare-commit-msg: session from %s is not the subject agent %s; not using it.\n' \
             "$session_source" "$agent" >&2
     else
-        if [ "$session_agent" = "codex" ]; then
-            printf 'prepare-commit-msg: session identity from %s is not a Codex session id or a UUID; not using it.\n' \
+        if [ "$session_agent" = "codex" ] || [ "$session_agent" = "claude" ]; then
+            printf 'prepare-commit-msg: session identity from %s is not a session id for this agent; not using it.\n' \
                 "$session_source" >&2
         elif [ "$session_agent" = "junie" ]; then
             printf 'prepare-commit-msg: session identity from %s is not a Junie session id or a UUID; not using it.\n' \

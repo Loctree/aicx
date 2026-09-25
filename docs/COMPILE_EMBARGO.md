@@ -20,7 +20,8 @@ open. On the first push of a branch the comparison base is the destination
 remote. For `origin`, that is `origin/HEAD`, and a missing or `develop`
 symref falls back to `origin/main`. For any other remote it is that remote's
 HEAD, including when that default is `develop`. A missing local symref is
-read with `git ls-remote --symref`. If that still does not resolve, the hook runs the full gate
+read with `git ls-remote --symref`. If that still does not resolve, or the
+advertised remote tip is not in the local object database, the hook runs the full gate
 instead of treating the push as the delta from `origin/main` or looking only
 at the tip commit. It does not use `origin/develop`.
 Run `tools/git-hooks/selftest.sh` to exercise the commit, push, and installer

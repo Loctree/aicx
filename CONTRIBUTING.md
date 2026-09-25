@@ -72,7 +72,9 @@ An agent-specific variable is used only when it belongs to the subject.
 `cursor-agent` is `cursor` and `gemini-antigravity` is `gemini` for that
 check; `Authored-By` keeps the spelling from the subject line. Codex
 accepts the id discovery stores, including a non-UUID `payload.id` such as
-`019c09d5-codex`. The `aicx` fallback is used only when its `agent` matches
+`019c09d5-codex`. Claude accepts the transcript filename stem, including
+`abc12345-dead-beef`. `git commit --cleanup=scissors` is honored even when
+`commit.cleanup` is unset. The `aicx` fallback is used only when its `agent` matches
 too. Kimi transcripts are not inferred from disk: they have no recorded
 cwd, so a Kimi commit carries `KIMI_SESSION_ID`. A human
 lane (`maciej`, `monika`, or runtime `manual`) does not read those variables.
