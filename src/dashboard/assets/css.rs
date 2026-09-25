@@ -3,22 +3,27 @@
 pub(crate) const DASHBOARD_CSS: &str = r#"
 :root {
   color-scheme: dark;
-  --bg: #0a0f19;
-  --panel: #111827;
-  --panel-2: #0f172a;
-  --line: #1f2937;
-  --text: #e5e7eb;
-  --muted: #9ca3af;
-  --accent: #38bdf8;
-  --accent-2: #22d3ee;
+  --bg: #0e0e0e;
+  --panel: #161616;
+  --panel-2: #1e1e1e;
+  --line: rgba(255, 255, 255, 0.08);
+  --text: #f5f1e7;
+  --muted: rgba(245, 241, 231, 0.64);
+  --accent: #c99a3b;
+  --accent-2: #3d7a72;
+  --danger: #b86a5c;
+  --font-display: "Instrument Serif", "Iowan Old Style", Palatino, Georgia, serif;
+  --font-body: Inter, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, monospace;
 }
 
 * { box-sizing: border-box; }
 body {
   margin: 0;
-  font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
-  background: radial-gradient(1200px 700px at 20% -10%, #13233f 0%, var(--bg) 52%);
+  font-family: var(--font-body);
+  background: var(--bg);
   color: var(--text);
+  line-height: 1.5;
 }
 
 .app-shell {
@@ -37,7 +42,10 @@ body {
 
 .app-header h1 {
   margin: 0;
-  font-size: 1.45rem;
+  font-family: var(--font-display);
+  font-weight: 400;
+  font-size: 2rem;
+  letter-spacing: -0.02em;
 }
 
 .meta {
@@ -125,16 +133,17 @@ body {
   border-radius: 10px;
   background: var(--panel);
   color: var(--text);
-  padding: 11px 12px;
-  font-size: 0.98rem;
-  transition: border-color 0.15s;
+  padding: 14px 16px;
+  font-size: 1.05rem;
+  min-height: 48px;
+  transition: border-color 160ms ease;
 }
 
 .controls input[type="search"]:focus,
 .controls select:focus {
   outline: none;
   border-color: var(--accent);
-  box-shadow: 0 0 0 2px rgba(56, 189, 248, 0.15);
+  box-shadow: 0 0 0 2px rgba(61, 122, 114, 0.45);
 }
 
 .layout {
@@ -306,7 +315,7 @@ body {
 .detail-content {
   margin: 10px 14px 12px;
   border: 1px solid var(--line);
-  background: #0b1220;
+  background: #0e0e0e;
   border-radius: 10px;
   padding: 12px;
   overflow: auto;
@@ -319,7 +328,7 @@ body {
 
 mark.hl {
   background: #facc15;
-  color: #0a0f19;
+  color: #0e0e0e;
   border-radius: 2px;
   padding: 0 2px;
   font-style: normal;
@@ -327,7 +336,7 @@ mark.hl {
 
 mark.hl-fuzzy {
   background: #fb923c;
-  color: #0a0f19;
+  color: #0e0e0e;
   border-radius: 2px;
   padding: 0 2px;
   font-style: normal;
@@ -412,6 +421,14 @@ mark.hl-fuzzy {
   opacity: 0.6;
   cursor: wait;
 }
+
+.studio { display: grid; gap: 12px; margin: 0 0 16px; }
+.studio-card { border: 1px solid var(--line); background: var(--panel); border-radius: 14px; padding: 16px; }
+.studio-card summary, .studio-card button { min-height: 44px; cursor: pointer; }
+.studio-card button { background: var(--panel-2); color: var(--text); border: 1px solid var(--line); border-radius: 10px; padding: 8px 14px; }
+.studio-card button:hover { border-color: var(--accent-2); }
+#ctx-phrases { width: 100%; margin: 8px 0; background: var(--bg); color: var(--text); border: 1px solid var(--line); border-radius: 10px; font-family: var(--font-mono); font-size: 0.85rem; line-height: 1.45; }
+#ctx-index { background: var(--accent); color: #0e0e0e; border: 0; font-weight: 600; }
 
 @media (max-width: 1020px) {
   .filter-row {

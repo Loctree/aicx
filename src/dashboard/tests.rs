@@ -210,6 +210,11 @@ fn server_shell_includes_highlight_styles_and_wiring() {
     assert!(html.contains(".result-preview {"));
     assert!(html.contains("preview.className = 'result-preview';"));
     assert!(html.contains("preview.innerHTML = highlightTerms(truncated, state.query);"));
+    assert!(html.contains("id=\"ctx-onboarding\""));
+    assert!(html.contains("id=\"ctx-phrases\""));
+    assert!(html.contains("id=\"ctx-index\""));
+    assert!(html.contains("aicx_onboarding_dismissed"));
+    assert!(html.contains("theme-color\" content=\"#0e0e0e\""));
 }
 
 #[test]

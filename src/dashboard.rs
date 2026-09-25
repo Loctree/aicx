@@ -283,7 +283,7 @@ pub fn render_server_shell_html(title: &str) -> String {
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <meta name="theme-color" content="#0a0f19" />
+  <meta name="theme-color" content="#0e0e0e" />
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; base-uri 'none'; frame-ancestors 'none'; form-action 'none';">
   <link rel="manifest" href="/manifest.webmanifest" />
   <title>{}</title>
@@ -302,7 +302,7 @@ pub fn render_server_shell_html(title: &str) -> String {
 .md-rendered {{ font-size: 0.88rem; line-height: 1.55; }}
 .md-rendered h1,.md-rendered h2,.md-rendered h3,.md-rendered h4 {{ margin: 0.8em 0 0.3em; color: var(--accent); }}
 .md-rendered h1 {{ font-size: 1.2em; }} .md-rendered h2 {{ font-size: 1.1em; }} .md-rendered h3 {{ font-size: 1.0em; }}
-.md-rendered pre {{ background: #0b1220; border: 1px solid var(--line); border-radius: 8px; padding: 10px; overflow-x: auto; }}
+.md-rendered pre {{ background: #0e0e0e; border: 1px solid var(--line); border-radius: 8px; padding: 10px; overflow-x: auto; }}
 .md-rendered code {{ background: rgba(56,189,248,0.1); padding: 1px 4px; border-radius: 3px; font-size: 0.9em; }}
 .md-rendered pre code {{ background: none; padding: 0; }}
 .md-rendered blockquote {{ border-left: 3px solid var(--accent); margin: 0.5em 0; padding: 0.3em 1em; color: var(--muted); }}
@@ -322,7 +322,7 @@ pub fn render_server_shell_html(title: &str) -> String {
     <header class="app-header">
       <div>
         <h1>aicx</h1>
-        <p class="meta">Context Browser | PWA shell</p>
+        <p class="meta">Search. <a href="/auth">Sign in</a></p>
         <p class="meta" id="ctx-gen-info">Loading…</p>
       </div>
       <div class="header-stats">
@@ -334,7 +334,7 @@ pub fn render_server_shell_html(title: &str) -> String {
 
     <section class="controls">
       <div class="search-row">
-        <input id="ctx-search" type="search" placeholder="Fuzzy search… (Enter or pause to trigger)" autocomplete="off" />
+        <input id="ctx-search" type="search" placeholder="Search the corpus" autocomplete="off" />
         <label class="live-toggle" title="Live search (search while typing)">
           <input id="ctx-live" type="checkbox" /> <span>Live</span>
         </label>
@@ -362,6 +362,29 @@ pub fn render_server_shell_html(title: &str) -> String {
           <input type="range" id="ctx-score" min="0" max="100" value="0" />
           <span id="ctx-score-label">0</span>
         </div>
+      </div>
+    </section>
+
+    <section class="studio" id="ctx-studio">
+      <details class="studio-card" id="ctx-onboarding" open>
+        <summary>Start here</summary>
+        <ol>
+          <li>Sign in if this dashboard is not on your own loopback.</li>
+          <li>Build the index. Search only sees what has been indexed.</li>
+          <li>Add the words you actually type when a result is weak.</li>
+        </ol>
+        <button id="ctx-onboarding-dismiss" type="button">Hide this</button>
+      </details>
+      <details class="studio-card">
+        <summary>Phrases</summary>
+        <p class="meta">One list. Intent, task, decision, and the rest. Saved to this machine.</p>
+        <textarea id="ctx-phrases" rows="12" spellcheck="false"></textarea>
+        <button id="ctx-phrases-save" type="button">Save phrases</button>
+        <p id="ctx-phrases-status" class="meta"></p>
+      </details>
+      <div class="studio-card studio-index">
+        <button id="ctx-index" type="button">Build index</button>
+        <p id="ctx-index-status" class="meta"></p>
       </div>
     </section>
 
@@ -446,7 +469,7 @@ fn render_dashboard_html(payload: &DashboardPayload, title: &str) -> Result<Stri
 
     <section class="controls">
       <div class="search-row">
-        <input id="ctx-search" type="search" placeholder="Fuzzy search… (Enter or pause to trigger)" autocomplete="off" />
+        <input id="ctx-search" type="search" placeholder="Search the corpus" autocomplete="off" />
         <label class="live-toggle" title="Live search (search while typing)">
           <input id="ctx-live" type="checkbox" /> <span>Live</span>
         </label>
@@ -455,6 +478,29 @@ fn render_dashboard_html(payload: &DashboardPayload, title: &str) -> Result<Stri
         <select id="ctx-project"><option value="">All projects</option></select>
         <select id="ctx-agent"><option value="">All agents/sources</option></select>
         <select id="ctx-kind"><option value="">All kinds</option></select>
+      </div>
+    </section>
+
+    <section class="studio" id="ctx-studio">
+      <details class="studio-card" id="ctx-onboarding" open>
+        <summary>Start here</summary>
+        <ol>
+          <li>Sign in if this dashboard is not on your own loopback.</li>
+          <li>Build the index. Search only sees what has been indexed.</li>
+          <li>Add the words you actually type when a result is weak.</li>
+        </ol>
+        <button id="ctx-onboarding-dismiss" type="button">Hide this</button>
+      </details>
+      <details class="studio-card">
+        <summary>Phrases</summary>
+        <p class="meta">One list. Intent, task, decision, and the rest. Saved to this machine.</p>
+        <textarea id="ctx-phrases" rows="12" spellcheck="false"></textarea>
+        <button id="ctx-phrases-save" type="button">Save phrases</button>
+        <p id="ctx-phrases-status" class="meta"></p>
+      </details>
+      <div class="studio-card studio-index">
+        <button id="ctx-index" type="button">Build index</button>
+        <p id="ctx-index-status" class="meta"></p>
       </div>
     </section>
 
