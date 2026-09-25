@@ -148,38 +148,45 @@ pub(super) async fn auth_github_start(headers: HeaderMap) -> Response {
     )
 }
 
+struct OauthProvider {
+    name: &'static str,
+    token_url: &'static str,
+    identity_url: &'static str,
+    client_env: &'static str,
+    secret_env: &'static str,
+    identity_of: fn(&str) -> Option<String>,
+}
+
+const GOOGLE_PROVIDER: OauthProvider = OauthProvider {
+    name: "google",
+    token_url: "https://oauth2.googleapis.com/token",
+    identity_url: "https://openidconnect.googleapis.com/v1/userinfo",
+    client_env: "AICX_GOOGLE_CLIENT_ID",
+    secret_env: "AICX_GOOGLE_CLIENT_SECRET",
+    identity_of: google_identity,
+};
+
+const GITHUB_PROVIDER: OauthProvider = OauthProvider {
+    name: "github",
+    token_url: "https://github.com/login/oauth/access_token",
+    identity_url: "https://api.github.com/user",
+    client_env: "AICX_GITHUB_CLIENT_ID",
+    secret_env: "AICX_GITHUB_CLIENT_SECRET",
+    identity_of: github_identity,
+};
+
 pub(super) async fn auth_google_callback(
     headers: HeaderMap,
     Query(query): Query<OauthQuery>,
 ) -> Response {
-    finish_oauth(
-        "google",
-        "https://oauth2.googleapis.com/token",
-        "https://openidconnect.googleapis.com/v1/userinfo",
-        "AICX_GOOGLE_CLIENT_ID",
-        "AICX_GOOGLE_CLIENT_SECRET",
-        google_identity,
-        &headers,
-        &query,
-    )
-    .await
+    finish_oauth(&GOOGLE_PROVIDER, &headers, &query).await
 }
 
 pub(super) async fn auth_github_callback(
     headers: HeaderMap,
     Query(query): Query<OauthQuery>,
 ) -> Response {
-    finish_oauth(
-        "github",
-        "https://github.com/login/oauth/access_token",
-        "https://api.github.com/user",
-        "AICX_GITHUB_CLIENT_ID",
-        "AICX_GITHUB_CLIENT_SECRET",
-        github_identity,
-        &headers,
-        &query,
-    )
-    .await
+    finish_oauth(&GITHUB_PROVIDER, &headers, &query).await
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -279,12 +286,7 @@ fn oauth_start(
 }
 
 async fn finish_oauth(
-    provider: &str,
-    token_url: &str,
-    identity_url: &str,
-    client_env: &str,
-    secret_env: &str,
-    identity_of: fn(&str) -> Option<String>,
+    provider: &OauthProvider,
     headers: &HeaderMap,
     query: &OauthQuery,
 ) -> Response {
@@ -322,34 +324,38 @@ async fn finish_oauth(
     else {
         return html_status(StatusCode::BAD_REQUEST, "<p>Missing OAuth redirect.</p>");
     };
-    let Some(client_id) = std::env::var(client_env)
-        .ok()
-        .filter(|value| !value.is_empty())
-    else {
-        return html_status(
-            StatusCode::SERVICE_UNAVAILABLE,
-            &format!("<p>{provider} is not configured. Set {client_env}.</p>"),
-        );
-    };
-    let Some(secret) = std::env::var(secret_env)
+    let Some(client_id) = std::env::var(provider.client_env)
         .ok()
         .filter(|value| !value.is_empty())
     else {
         return html_status(
             StatusCode::SERVICE_UNAVAILABLE,
             &format!(
-                "<p>{provider} callback needs {secret_env} before a code can be exchanged.</p>"
+                "<p>{} is not configured. Set {}.</p>",
+                provider.name, provider.client_env
+            ),
+        );
+    };
+    let Some(secret) = std::env::var(provider.secret_env)
+        .ok()
+        .filter(|value| !value.is_empty())
+    else {
+        return html_status(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &format!(
+                "<p>{} callback needs {} before a code can be exchanged.</p>",
+                provider.name, provider.secret_env
             ),
         );
     };
     let identity = exchange_identity(
-        token_url,
-        identity_url,
+        provider.token_url,
+        provider.identity_url,
         &client_id,
         &secret,
         code,
         &redirect,
-        identity_of,
+        provider.identity_of,
     )
     .await;
     session_or_refuse(identity)
