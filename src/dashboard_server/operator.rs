@@ -650,7 +650,7 @@ p{margin:.4rem 0 1rem;line-height:1.4}
 .brand-word{font-family:"Instrument Serif","Iowan Old Style",Palatino,Georgia,serif;font-weight:400;font-size:1.35rem;line-height:1;letter-spacing:.04em;color:#f5f1e7}
 #aicx-mark{display:block;width:28px;height:28px;margin:0;color:#f5f1e7;background:transparent}
 .pills{display:flex;flex-direction:column;align-items:center;gap:.45rem}
-.pills>a,.pills>button.pill{display:inline-flex;align-items:center;justify-content:flex-start;gap:.55rem;box-sizing:border-box;width:14.5rem;height:2.25rem;margin:0;padding:0 .75rem;border:1px solid rgba(255,255,255,.16);border-radius:999px;background:transparent;color:#f5f1e7;font-family:inherit;font-size:.84rem;font-weight:400;line-height:1;text-decoration:none;white-space:nowrap;cursor:pointer;appearance:none}
+.pills>a,.pills>button.pill{display:inline-flex;align-items:center;justify-content:center;gap:.55rem;box-sizing:border-box;width:14.5rem;height:2.25rem;margin:0;padding:0 .75rem;border:1px solid rgba(255,255,255,.16);border-radius:999px;background:transparent;color:#f5f1e7;font-family:inherit;font-size:.84rem;font-weight:400;line-height:1;text-decoration:none;white-space:nowrap;cursor:pointer;appearance:none}
 .pills>a svg,.pills>button.pill svg{width:14px;height:14px;flex:0 0 14px}
 .pills>a:hover,.pills>button.pill:hover{border-color:#3d7a72}
 .note{width:14.5rem;margin:.15rem 0 .35rem;color:rgba(245,241,231,.64);font-size:.75rem}
