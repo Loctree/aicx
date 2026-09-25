@@ -1003,55 +1003,15 @@ const MAX_INTENT_LINES: usize = 6;
 const MAX_RESULT_LINES: usize = 6;
 const MAX_TAG_BLOCK_LINES: usize = 4;
 
-pub const INTENT_KEYWORDS: &[&str] = &[
-    // Polish
-    "mam pomysl",
-    "mam pomysł",
-    "mam taki pomysl",
-    "mam taki pomysł",
-    "pomysl",
-    "pomysł",
-    "proponuje",
-    "proponuję",
-    "zrobmy",
-    "zróbmy",
-    "ustalmy",
-    "ustalmy",
-    "chce",
-    "chcę",
-    "chcialbym",
-    "chciałbym",
-    "potrzebuje",
-    "potrzebuję",
-    "prosze",
-    "proszę",
-    "odpal",
-    "uruchom",
-    "usun",
-    "usuń",
-    "następny krok",
-    "nastepny krok",
-    "kolejny krok",
-    // English
-    "i want",
-    "i'd like",
-    "let's",
-    "next step",
-];
+pub use crate::intent_phrases::phrases;
 
-const RESULT_KEYWORDS: &[&str] = &[
-    "smoke test",
-    "passed",
-    "all checks passed",
-    "0 failed",
-    "completed",
-    "done",
-    "zrobione",
-    "dowiezione",
-    "gotowe",
-    "dziala",
-    "działa",
-];
+pub fn intent_keywords() -> &'static [&'static str] {
+    phrases().intent
+}
+
+pub fn result_keywords() -> &'static [&'static str] {
+    phrases().result_keywords
+}
 
 fn extract_signals(entries: &[&TimelineEntry]) -> ChunkSignals {
     let (todo_open, todo_done) = extract_checklist_items(entries);
@@ -1262,7 +1222,7 @@ pub(crate) fn is_intent_line(line: &str) -> bool {
     lower.starts_with("intent:")
         || lower.starts_with("[intent]")
         || severity_marker(line).is_some()
-        || INTENT_KEYWORDS.iter().any(|kw| lower.contains(kw))
+        || intent_keywords().iter().any(|kw| lower.contains(kw))
 }
 
 fn severity_marker(line: &str) -> Option<&'static str> {
@@ -1330,7 +1290,7 @@ fn extract_result_lines(entries: &[&TimelineEntry]) -> Vec<SignalItem> {
 
 pub fn is_result_line(line: &str) -> bool {
     let lower = line.to_lowercase();
-    RESULT_KEYWORDS.iter().any(|kw| lower.contains(kw))
+    result_keywords().iter().any(|kw| lower.contains(kw))
 }
 
 pub fn normalize_key(s: &str) -> String {

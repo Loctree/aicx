@@ -12,7 +12,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use crate::chunker::{
-    INTENT_KEYWORDS, is_decision_tag, is_local_command_artifact_line, is_outcome_tag,
+    intent_keywords, is_decision_tag, is_local_command_artifact_line, is_outcome_tag,
     is_result_line, normalize_key, parse_checklist_task, truncate_signal_line,
 };
 use crate::extraction::conversation::{projection_kind_for_role, projection_role_for_role};
@@ -1664,15 +1664,7 @@ fn is_outcome_line(line: &str) -> bool {
 /// follow-on content. Once a colon + detail appears ("Zrobione: build green"),
 /// the line stops being bare and counts again.
 fn is_bare_affirmation(line: &str) -> bool {
-    const BARE: &[&str] = &[
-        "zrobione",
-        "dowiezione",
-        "gotowe",
-        "dziala",
-        "działa",
-        "done",
-        "completed",
-    ];
+    let bare = crate::parser::intent_phrases::phrases().bare_affirmation;
     let trimmed = line.trim().trim_end_matches(['.', '!', ',']);
     if trimmed.is_empty() || trimmed.contains(':') {
         return false;
@@ -1680,7 +1672,7 @@ fn is_bare_affirmation(line: &str) -> bool {
     let stripped = trimmed
         .trim_start_matches(['-', '*', '+', '>', ' ', '\t'])
         .to_lowercase();
-    BARE.iter().any(|word| stripped == *word)
+    bare.iter().any(|word| stripped == *word)
 }
 
 /// Inline backtick code-span ranges within a single line, as byte offsets
@@ -1722,25 +1714,8 @@ fn is_word_char(c: char) -> bool {
 /// * post (~16 chars after): post-keyword negators that flip the keyword
 ///   itself (`let's not`, `chcę nie`, ...).
 fn is_negated_keyword(lower_line: &str, kw_pos: usize, kw_len: usize) -> bool {
-    const PRE_NEGATORS: &[&str] = &[
-        // Polish
-        "nie ",
-        "bez ",
-        // English
-        "don't ",
-        "do not ",
-        "won't ",
-        "will not ",
-        "shouldn't ",
-        "should not ",
-        "wouldn't ",
-        "would not ",
-        "isn't ",
-        "aren't ",
-        "doesn't ",
-        "didn't ",
-    ];
-    const POST_NEGATORS: &[&str] = &[" not ", " not,", " not.", " nie ", " nie,", " nie."];
+    let pre_negators = crate::parser::intent_phrases::phrases().negation_pre;
+    let post_negators = crate::parser::intent_phrases::phrases().negation_post;
 
     let pre_window_start = lower_line[..kw_pos]
         .char_indices()
@@ -1750,7 +1725,7 @@ fn is_negated_keyword(lower_line: &str, kw_pos: usize, kw_len: usize) -> bool {
         .map(|(i, _)| i)
         .unwrap_or(0);
     let pre = &lower_line[pre_window_start..kw_pos];
-    if PRE_NEGATORS.iter().any(|n| pre.ends_with(n)) {
+    if pre_negators.iter().any(|n| pre.ends_with(n)) {
         return true;
     }
 
@@ -1764,7 +1739,7 @@ fn is_negated_keyword(lower_line: &str, kw_pos: usize, kw_len: usize) -> bool {
             .unwrap_or(lower_line.len())
             .min(lower_line.len());
         let post = &lower_line[post_start..post_end];
-        if POST_NEGATORS.iter().any(|n| post.starts_with(n)) {
+        if post_negators.iter().any(|n| post.starts_with(n)) {
             return true;
         }
     }
@@ -1824,7 +1799,7 @@ fn looks_like_intent_line(line: &str) -> bool {
     if severity_marker(line).is_some() {
         return true;
     }
-    INTENT_KEYWORDS
+    intent_keywords()
         .iter()
         .any(|kw| matches_keyword_word_boundary(line, kw))
 }
@@ -1865,33 +1840,11 @@ fn is_source_metadata_line(line: &str) -> bool {
 
 fn looks_like_operator_decision_line(line: &str) -> bool {
     let lower = line.to_lowercase();
-    const POLICY_MARKERS: &[&str] = &[
-        // Scope rejections / accepted boundaries.
-        "nie fixujemy",
-        "nie robimy",
-        "nie ruszamy",
-        "out of scope",
-        "poza scope",
-        // Durable policy/default/constraint language.
-        "od teraz",
-        "from now on",
-        "canonical",
-        "kanonicz",
-        "default",
-        "domysln",
-        "domyśln",
-        "tylko przez",
-        "bez zgadywania",
-        "bez fallback",
-        "no fallback",
-        "musi mieć",
-        "musi miec",
-        // Product principles phrased as "X is an addon, not a rescue layer".
-        "ma byc dodatkiem",
-        "ma być dodatkiem",
-    ];
 
-    POLICY_MARKERS.iter().any(|marker| lower.contains(marker))
+    crate::parser::intent_phrases::phrases()
+        .decision_policy
+        .iter()
+        .any(|marker| lower.contains(marker))
 }
 
 /// `true` when a line is a code/log fragment rather than prose — a bare
@@ -2096,22 +2049,9 @@ fn commit_block_indices(lines: &[String]) -> HashSet<usize> {
 
 fn looks_like_operator_requirement_line(line: &str) -> bool {
     let lower = line.to_lowercase();
-    const REQUIREMENT_MARKERS: &[&str] = &[
-        "nie może być",
-        "nie moze byc",
-        "ma być",
-        "ma byc",
-        "musi ",
-        "musimy ",
-        "trzeba ",
-        "zrób to testowalne",
-        "zrob to testowalne",
-        "pełny ownership",
-        "pelny ownership",
-        "teraz wypuszuj",
-    ];
 
-    REQUIREMENT_MARKERS
+    crate::parser::intent_phrases::phrases()
+        .requirement
         .iter()
         .any(|marker| lower.contains(marker))
 }
@@ -2897,152 +2837,13 @@ fn push_unique(target: &mut Vec<String>, value: String) {
 
 const CLASSIFIER_ABSTAIN_THRESHOLD: f32 = 0.5;
 
-const QUESTION_MARKERS: &[&str] = &[
-    "how do",
-    "how does",
-    "how to",
-    "what is",
-    "what are",
-    "why does",
-    "why is",
-    "can we",
-    "should we",
-    "is it possible",
-    "does it",
-    "do we",
-    "jak ",
-    "dlaczego ",
-    "czy ",
-    "co to ",
-    "co jest",
-    "w jaki sposób",
-];
-
-const ASSUMPTION_MARKERS: &[&str] = &[
-    "i assume",
-    "assuming",
-    "i believe",
-    "we assume",
-    "hypothesis:",
-    "zakładam",
-    "zakladam",
-    "założenie:",
-    "zalozenie:",
-    "hipoteza:",
-    "przypuszczam",
-];
-
-const WHY_MARKERS: &[&str] = &[
-    "why:",
-    "because",
-    "the reason",
-    "this is needed",
-    "motivated by",
-    "driven by",
-    "root cause",
-    "underlying issue",
-    "bo ",
-    "ponieważ",
-    "dlatego że",
-    "przyczyna:",
-    "powód:",
-];
-
-const ARGUE_MARKERS: &[&str] = &[
-    "on the other hand",
-    "alternatively",
-    "disagree",
-    "counterpoint",
-    "trade-off",
-    "tradeoff",
-    "but if we",
-    "however,",
-    "z drugiej strony",
-    "alternatywnie",
-    "spór:",
-    "kontrargument",
-];
-
-const INSIGHT_MARKERS: &[&str] = &[
-    "insight:",
-    "realization:",
-    "key finding:",
-    "★ insight",
-    "the real issue is",
-    "fundamentally,",
-    "odkrycie:",
-    "wniosek:",
-    "kluczowe:",
-];
-
-const TASK_DIRECTIVE_MARKERS: &[&str] = &["task:", "todo:", "zadanie:"];
-
-const TASK_ACTION_HEADS: &[&str] = &[
-    // Polish operator requests.
-    "stworz",
-    "stwórz",
-    "utworz",
-    "utwórz",
-    "dodaj",
-    "napraw",
-    "popraw",
-    "zbuduj",
-    "przygotuj",
-    "zapisz",
-    "spisz",
-    "wypisz",
-    "zaimplementuj",
-    "podlacz",
-    "podłącz",
-    "skopiuj",
-    "przekopiuj",
-    "uruchom",
-    "odpal",
-    // English operator requests.
-    "create",
-    "add",
-    "fix",
-    "update",
-    "implement",
-    "write",
-    "run",
-    "copy",
-];
-
-const COMMITMENT_HEADS: &[&str] = &[
-    "zrobie",
-    "zrobię",
-    "zajme sie",
-    "zajmę się",
-    "i will ",
-    "i'll ",
-];
-
 /// Markers whose presence alone is enough to call a line a Result line. Each
 /// carries result-shape on its own (PASS/FAIL outcome, score readout, P-level
 /// count, command name that only appears in result-reporting contexts).
-const RESULT_STRICT_MARKERS: &[&str] = &[
-    "passed",
-    "failed",
-    "score=",
-    "score:",
-    "latency",
-    "p0=",
-    "p1=",
-    "p2=",
-    "/10",
-    "clippy",
-    "cargo test",
-    "✓",
-    "✗",
-    "0 warnings",
-    "0 errors",
-];
 
 /// Markers that look result-y but appear too often in meta-discussion (e.g.
 /// "we need to write tests for X", "this throws an error: should we…").
 /// These classify a line as Result only when [`line_has_result_shape`] matches.
-const RESULT_SOFT_MARKERS: &[&str] = &["tests ", "error:"];
 
 /// A line "has result shape" when it carries a concrete reporting signal:
 /// a digit (test count, error count, percentage), a PASS/FAIL token, or a
@@ -3052,19 +2853,21 @@ fn line_has_result_shape(lower_line: &str) -> bool {
     if lower_line.chars().any(|c| c.is_ascii_digit()) {
         return true;
     }
-    const SHAPE_TOKENS: &[&str] = &[
-        "pass", "fail", " ok", "ok.", "done", "skipped", "ignored", "timeout", "panicked",
-        "panic:", "✓", "✗",
-    ];
-    SHAPE_TOKENS.iter().any(|t| lower_line.contains(t))
+    crate::parser::intent_phrases::phrases()
+        .result_shape
+        .iter()
+        .any(|t| lower_line.contains(t))
 }
 
 fn looks_like_task_directive_line(line: &str) -> bool {
     let head = line.trim_start();
-    TASK_DIRECTIVE_MARKERS.iter().any(|marker| {
-        head.get(..marker.len())
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(marker))
-    })
+    crate::parser::intent_phrases::phrases()
+        .task_directive
+        .iter()
+        .any(|marker| {
+            head.get(..marker.len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(marker))
+        })
 }
 
 fn looks_like_bare_checkbox_task(line: &str) -> bool {
@@ -3083,31 +2886,21 @@ fn looks_like_actionable_task_line(line: &str) -> bool {
     }
 
     let lower = head.to_lowercase();
-    TASK_ACTION_HEADS.iter().any(|marker| {
-        lower == *marker
-            || lower
-                .strip_prefix(marker)
-                .is_some_and(|rest| rest.starts_with(' ') || rest.starts_with(':'))
-    })
+    crate::parser::intent_phrases::phrases()
+        .task_action_heads
+        .iter()
+        .any(|marker| {
+            lower == *marker
+                || lower
+                    .strip_prefix(marker)
+                    .is_some_and(|rest| rest.starts_with(' ') || rest.starts_with(':'))
+        })
 }
 
 fn looks_like_completion_outcome_line(line: &str) -> bool {
     let lower = line.to_lowercase();
-    const COMPLETION_MARKERS: &[&str] = &[
-        "zostal dodany",
-        "został dodany",
-        "zostala dodana",
-        "została dodana",
-        "zostaly dodane",
-        "zostały dodane",
-        "zostal utworzony",
-        "został utworzony",
-        "has been added",
-        "was added",
-        "has been created",
-        "was created",
-    ];
-    if !COMPLETION_MARKERS
+    if !crate::parser::intent_phrases::phrases()
+        .completion
         .iter()
         .any(|marker| lower.contains(marker))
     {
@@ -3149,7 +2942,8 @@ fn looks_like_commitment_line(line: &str) -> bool {
         return true;
     }
 
-    COMMITMENT_HEADS
+    crate::parser::intent_phrases::phrases()
+        .commitment_heads
         .iter()
         .any(|marker| head.starts_with(marker))
 }
@@ -3189,7 +2983,12 @@ pub fn classify_line_entry_type(line: &str, is_user: bool) -> Option<(EntryType,
         } else {
             0.7
         };
-        if QUESTION_MARKERS.iter().any(|m| lower.contains(m)) || trimmed.ends_with('?') {
+        if crate::parser::intent_phrases::phrases()
+            .question
+            .iter()
+            .any(|m| lower.contains(m))
+            || trimmed.ends_with('?')
+        {
             return Some((EntryType::Question, conf));
         }
     }
@@ -3211,7 +3010,11 @@ pub fn classify_line_entry_type(line: &str, is_user: bool) -> Option<(EntryType,
     {
         return Some((EntryType::Assumption, 0.9));
     }
-    if ASSUMPTION_MARKERS.iter().any(|m| lower.contains(m)) {
+    if crate::parser::intent_phrases::phrases()
+        .assumption
+        .iter()
+        .any(|m| lower.contains(m))
+    {
         return Some((EntryType::Assumption, 0.65));
     }
 
@@ -3223,7 +3026,11 @@ pub fn classify_line_entry_type(line: &str, is_user: bool) -> Option<(EntryType,
     {
         return Some((EntryType::Insight, 0.9));
     }
-    if INSIGHT_MARKERS.iter().any(|m| lower.contains(m)) {
+    if crate::parser::intent_phrases::phrases()
+        .insight
+        .iter()
+        .any(|m| lower.contains(m))
+    {
         return Some((EntryType::Insight, 0.65));
     }
 
@@ -3240,18 +3047,36 @@ pub fn classify_line_entry_type(line: &str, is_user: bool) -> Option<(EntryType,
     if trimmed.starts_with("result:") || trimmed.starts_with("wynik:") {
         return Some((EntryType::Result, 0.95));
     }
-    if is_result_line(line) || RESULT_STRICT_MARKERS.iter().any(|m| lower.contains(m)) {
+    if is_result_line(line)
+        || crate::parser::intent_phrases::phrases()
+            .result_strict
+            .iter()
+            .any(|m| lower.contains(m))
+    {
         return Some((EntryType::Result, 0.75));
     }
-    if RESULT_SOFT_MARKERS.iter().any(|m| lower.contains(m)) && line_has_result_shape(&lower) {
+    if crate::parser::intent_phrases::phrases()
+        .result_soft
+        .iter()
+        .any(|m| lower.contains(m))
+        && line_has_result_shape(&lower)
+    {
         return Some((EntryType::Result, 0.6));
     }
 
-    if ARGUE_MARKERS.iter().any(|m| lower.contains(m)) {
+    if crate::parser::intent_phrases::phrases()
+        .argue
+        .iter()
+        .any(|m| lower.contains(m))
+    {
         return Some((EntryType::Argue, 0.6));
     }
 
-    if WHY_MARKERS.iter().any(|m| lower.contains(m)) {
+    if crate::parser::intent_phrases::phrases()
+        .why
+        .iter()
+        .any(|m| lower.contains(m))
+    {
         return Some((EntryType::Why, 0.7));
     }
 
@@ -3259,7 +3084,7 @@ pub fn classify_line_entry_type(line: &str, is_user: bool) -> Option<(EntryType,
         return Some((EntryType::Intent, 0.8));
     }
     if is_user
-        && INTENT_KEYWORDS
+        && intent_keywords()
             .iter()
             .any(|kw| matches_keyword_word_boundary(line, kw))
     {
