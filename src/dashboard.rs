@@ -292,13 +292,10 @@ pub fn render_server_shell_html(title: &str) -> String {
   <link rel="manifest" href="/manifest.webmanifest" />
   <title>{}</title>
   <style>{}
-.regen-btn {{ background: var(--panel); border: 1px solid var(--line); color: var(--accent); border-radius: 8px; padding: 4px 10px; font-size: 1.1rem; cursor: pointer; min-width: 36px; }}
-.regen-btn:hover {{ background: var(--panel-2); }}
+.regen-btn {{ min-width: 2.25rem; }}
 .regen-btn:disabled {{ opacity: 0.5; cursor: wait; }}
-.time-row {{ display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }}
-.time-btn {{ background: var(--panel); border: 1px solid var(--line); color: var(--muted); border-radius: 8px; padding: 6px 12px; font-size: 0.82rem; cursor: pointer; transition: border-color 0.15s, color 0.15s; }}
-.time-btn:hover {{ border-color: var(--accent); color: var(--text); }}
-.time-btn.active {{ border-color: var(--accent); color: var(--accent); font-weight: 600; }}
+.time-row {{ flex-wrap: wrap; }}
+.time-btn:hover {{ color: var(--text); }}
 .sort-select {{ background: var(--panel); border: 1px solid var(--line); color: var(--text); border-radius: 8px; padding: 6px 10px; font-size: 0.82rem; }}
 .score-group {{ display: flex; align-items: center; gap: 6px; margin-left: auto; }}
 .score-group input[type="range"] {{ width: 100px; accent-color: var(--accent); }}
@@ -314,8 +311,6 @@ pub fn render_server_shell_html(title: &str) -> String {
 .md-rendered hr {{ border: none; border-top: 1px solid var(--line); margin: 1em 0; }}
 .md-rendered a {{ color: var(--accent-2); text-decoration: none; }}
 .md-rendered a:hover {{ text-decoration: underline; }}
-.detail-actions {{ display: flex; gap: 6px; }}
-.detail-actions button {{ border: 1px solid var(--line); border-radius: 8px; background: var(--panel); color: var(--text); padding: 6px 10px; cursor: pointer; font-size: 0.82rem; }}
 .detail-actions button:hover {{ border-color: var(--accent); }}
 .detail-content {{ margin: 0; border: 0; background: transparent; border-radius: 0; padding: 14px; overflow: auto; flex: 1; min-height: 280px; font-size: 0.86rem; line-height: 1.35; }}
 .filter-row {{ display: grid; grid-template-columns: repeat(3, 1fr) auto; gap: 10px; }}
@@ -325,9 +320,11 @@ pub fn render_server_shell_html(title: &str) -> String {
   <div class="app-shell">
     <header class="app-header">
       <div class="brand-lockup">
+        <div class="brand-pair">
         {AICX_MARK_SVG}
+        <span class="brand-word">AICX</span>
+        </div>
         <div>
-        <h1>aicx</h1>
         <p class="meta">Search. <a href="/auth">Sign in</a></p>
         <p class="meta" id="ctx-gen-info">Loading…</p>
         </div>
@@ -339,6 +336,15 @@ pub fn render_server_shell_html(title: &str) -> String {
       </div>
     </header>
 
+    <section class="layout" id="ctx-layout">
+      <aside class="list-pane">
+        <div id="ctx-summary" class="summary"></div>
+        <div id="ctx-list" class="result-list"></div>
+      </aside>
+
+      <div class="resize-handle" id="ctx-resize-handle" title="Drag to resize panels"></div>
+
+      <div class="main-column">
     <section class="controls">
       <div class="search-row">
         <input id="ctx-search" type="search" placeholder="Search the corpus" autocomplete="off" />
@@ -395,14 +401,6 @@ pub fn render_server_shell_html(title: &str) -> String {
       </div>
     </section>
 
-    <section class="layout" id="ctx-layout">
-      <aside class="list-pane">
-        <div id="ctx-summary" class="summary"></div>
-        <div id="ctx-list" class="result-list"></div>
-      </aside>
-
-      <div class="resize-handle" id="ctx-resize-handle" title="Drag to resize panels"></div>
-
       <article class="detail-pane">
         <div class="detail-head">
           <div>
@@ -422,6 +420,7 @@ pub fn render_server_shell_html(title: &str) -> String {
           <ul id="ctx-assumptions"></ul>
         </details>
       </article>
+      </div>
     </section>
   </div>
 
@@ -463,10 +462,16 @@ fn render_dashboard_html(payload: &DashboardPayload, title: &str) -> Result<Stri
 <body>
   <div class="app-shell">
     <header class="app-header">
-      <div>
-        <h1>AI Context Browser</h1>
+      <div class="brand-lockup">
+        <div class="brand-pair">
+        {AICX_MARK_SVG}
+        <span class="brand-word">AICX</span>
+        </div>
+        <div>
+        <p class="meta">AI Context Browser</p>
         <p class="meta">Search -> List -> Content | {}</p>
         <p class="meta">Generated {}</p>
+        </div>
       </div>
       <div class="header-stats">
         <div class="stat"><strong>{}</strong><span>files</span></div>
@@ -475,6 +480,15 @@ fn render_dashboard_html(payload: &DashboardPayload, title: &str) -> Result<Stri
       </div>
     </header>
 
+    <section class="layout" id="ctx-layout">
+      <aside class="list-pane">
+        <div id="ctx-summary" class="summary"></div>
+        <div id="ctx-list" class="result-list"></div>
+      </aside>
+
+      <div class="resize-handle" id="ctx-resize-handle" title="Drag to resize panels"></div>
+
+      <div class="main-column">
     <section class="controls">
       <div class="search-row">
         <input id="ctx-search" type="search" placeholder="Search the corpus" autocomplete="off" />
@@ -512,13 +526,7 @@ fn render_dashboard_html(payload: &DashboardPayload, title: &str) -> Result<Stri
       </div>
     </section>
 
-    <section class="layout" id="ctx-layout">
-      <aside class="list-pane">
-        <div id="ctx-summary" class="summary"></div>
-        <div id="ctx-list" class="result-list"></div>
-      </aside>
-
-      <div class="resize-handle" id="ctx-resize-handle" title="Drag to resize panels"></div>
+    </section>
 
       <article class="detail-pane">
         <div class="detail-head">
@@ -538,6 +546,7 @@ fn render_dashboard_html(payload: &DashboardPayload, title: &str) -> Result<Stri
           <ul id="ctx-assumptions"></ul>
         </details>
       </article>
+      </div>
     </section>
   </div>
 
@@ -554,7 +563,8 @@ fn render_dashboard_html(payload: &DashboardPayload, title: &str) -> Result<Stri
         payload.stats.total_projects,
         payload.stats.total_days,
         payload_json,
-        assets::DASHBOARD_SCRIPT
+        assets::DASHBOARD_SCRIPT,
+        AICX_MARK_SVG = AICX_MARK_SVG,
     ))
 }
 
