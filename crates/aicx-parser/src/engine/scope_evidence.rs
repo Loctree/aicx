@@ -272,19 +272,36 @@ fn literal_body(rest: &str, delimiter: char) -> Option<(String, usize)> {
 ///
 /// `rest` is what follows the literal. Only the end of the property may come
 /// next — `,` or `}`, the close of an enclosing call or array, a statement
-/// end, a comment, or the end of the input. Anything else continues an
-/// expression: `workdir: "/repos/vista" + "-private"` names
-/// `/repos/vista-private`, and reading the first operand as the path would
-/// place the call in another checkout. A property written without the comma
-/// JavaScript requires before the next one is read as an expression too, and
-/// so is prose that quotes a path after `workdir:` and keeps talking; either
-/// costs the window its attribution, never its correctness.
+/// end, or the end of the input. Anything else continues an expression:
+/// `workdir: "/repos/vista" + "-private"` names `/repos/vista-private`, and
+/// reading the first operand as the path would place the call in another
+/// checkout. A property written without the comma JavaScript requires before
+/// the next one is read as an expression too, and so is prose that quotes a
+/// path after `workdir:` and keeps talking; either costs the window its
+/// attribution, never its correctness.
+///
+/// A comment ends nothing by itself: JavaScript allows one between operands,
+/// so `"/repos/vista" /* note */ + "-private"` is still the expression. Each
+/// whole comment is skipped and what follows it decides. A block comment that
+/// never closes hid whatever came after it, so the value is opaque, as for a
+/// literal that never closes.
 fn value_ends_at(rest: &str) -> bool {
-    let rest = rest.trim_start();
-    rest.is_empty()
-        || rest.starts_with([',', '}', ')', ']', ';'])
-        || rest.starts_with("//")
-        || rest.starts_with("/*")
+    let mut rest = rest.trim_start();
+    loop {
+        if let Some(comment) = rest.strip_prefix("//") {
+            match comment.find('\n') {
+                Some(newline) => rest = comment[newline + 1..].trim_start(),
+                None => return true,
+            }
+        } else if let Some(comment) = rest.strip_prefix("/*") {
+            match comment.find("*/") {
+                Some(close) => rest = comment[close + 2..].trim_start(),
+                None => return false,
+            }
+        } else {
+            return rest.is_empty() || rest.starts_with([',', '}', ')', ']', ';']);
+        }
+    }
 }
 
 /// Resolve one workdir string to an absolute spelling, lexically normalized.
@@ -2021,6 +2038,10 @@ mod tests {
             r#"tools.exec_command({cmd: "ls", workdir: `/repos/vista` + tail, yield_time_ms: 1})"#,
             "tools.exec_command({\n  cmd: \"ls\",\n  workdir: \"/repos/vista\"\n    + \"-private\",\n})",
             r#"tools.exec_command({cmd: "ls", workdir: "/repos/a" || "/repos/b"})"#,
+            r#"tools.exec_command({cmd: "ls", workdir: "/repos/vista" /* suffix */ + "-private"})"#,
+            "tools.exec_command({\n  workdir: \"/repos/vista\" // suffix\n    + \"-private\",\n})",
+            "tools.exec_command({workdir: \"/repos/vista\" /* a */ /* b */ + tail})",
+            "tools.exec_command({workdir: \"/repos/vista\" /* never closes",
         ] {
             assert_eq!(
                 tool_call_workdirs(&js_input(input)),
@@ -2033,6 +2054,8 @@ mod tests {
             r#"tools.exec_command({workdir: "/repos/vista", cmd: "ls"})"#,
             "tools.exec_command({\n  workdir: '/repos/vista'  // the checkout\n})",
             "tools.exec_command({workdir: \"/repos/vista\" /* pinned */})",
+            "tools.exec_command({workdir: \"/repos/vista\" /* a */ // b\n, cmd: \"ls\"})",
+            "tools.exec_command({workdir: \"/repos/vista\" // last line",
             r#"[{workdir: "/repos/vista"}]"#,
             r#"{"workdir": "/repos/vista"}"#,
         ] {
