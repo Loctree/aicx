@@ -4407,6 +4407,10 @@ fn current_session_from_disk() -> Result<Option<CurrentSessionPayload>> {
         Some(&here),
     ));
 
+    // Only sessions that can be tied to this checkout. Kimi stores no cwd,
+    // and its workspace slug is not a path, so it is not a candidate here.
+    // A `[kimi/...]` commit supplies KIMI_SESSION_ID instead of borrowing
+    // another project's transcript.
     let mut selected = sessions::select_sessions(discovered, Some(&here), None, Some(since_dt), 1);
     let Some(info) = selected.pop() else {
         return Ok(None);

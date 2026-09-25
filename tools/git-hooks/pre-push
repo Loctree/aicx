@@ -61,13 +61,49 @@ else
     # nothing to compile or test. Count it and move on.
     case "$lsha" in *[!0]*) : ;; *) DELETE_LINES=$((DELETE_LINES + 1)); continue ;; esac
     HAVE_RANGE=1
-    if printf '%s' "$rsha" | grep -qE '^0+$' || ! git cat-file -e "$rsha" 2>/dev/null; then
-      base=$(git merge-base "$lsha" origin/develop 2>/dev/null || true)
-      if [ -n "$base" ]; then
-        files=$(git diff --name-only "$base" "$lsha")
+    if ! printf '%s' "$rsha" | grep -qE '^0+$' && ! git cat-file -e "$rsha" 2>/dev/null; then
+      # Nonzero remote tip that is not in this object database. Diffing
+      # against the default branch would hide edits that exist only
+      # against that missing tip.
+      RUST_TOUCHED=1
+      continue
+    fi
+    if printf '%s' "$rsha" | grep -qE '^0+$'; then
+      # Same destination-remote rule as tools/githooks/pre-push. origin keeps
+      # the develop→main fallback. Any other remote uses its own HEAD, and a
+      # missing baseline fails closed into the full gate instead of inspecting
+      # only the tip or the delta from origin/main. This copy is the one
+      # core.hooksPath installs.
+      if [ "$remote" = "origin" ]; then
+        default_ref=$(git symbolic-ref --quiet refs/remotes/origin/HEAD 2>/dev/null || true)
+        case "$default_ref" in
+          ""|refs/remotes/origin/develop|origin/develop) default_ref=origin/main ;;
+        esac
       else
-        files=$(git show --name-only --format= "$lsha")
+        default_ref=$(git symbolic-ref --quiet "refs/remotes/${remote}/HEAD" 2>/dev/null || true)
+        # Same missing-HEAD rule as tools/githooks/pre-push: ask the remote,
+        # and fail closed instead of guessing main.
+        if [ -z "$default_ref" ]; then
+          sym=$(git ls-remote --symref "$url" HEAD 2>/dev/null | awk '/^ref:/ { print $2; exit }')
+          case "$sym" in
+            refs/heads/*) default_ref="refs/remotes/${remote}/${sym#refs/heads/}" ;;
+          esac
+        fi
+        if [ -z "$default_ref" ]; then
+          RUST_TOUCHED=1
+          continue
+        fi
       fi
+      if ! git rev-parse --verify -q "${default_ref}^{commit}" >/dev/null 2>&1; then
+        RUST_TOUCHED=1
+        continue
+      fi
+      base=$(git merge-base "$lsha" "$default_ref" 2>/dev/null || true)
+      if [ -z "$base" ]; then
+        RUST_TOUCHED=1
+        continue
+      fi
+      files=$(git diff --name-only "$base" "$lsha")
     else
       files=$(git diff --name-only "$rsha" "$lsha")
     fi

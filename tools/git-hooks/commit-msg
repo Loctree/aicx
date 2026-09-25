@@ -1,7 +1,13 @@
 #!/usr/bin/env bash
 # Vibecrafted commit-msg hook.
 #
-# Enforces the agent/runtime commit standard:
+# Enforces the agent/runtime commit standard.
+#
+# After the editor (and on `git commit -m`, where prepare-commit-msg already
+# ran), this hook runs the sibling generator so an interactive commit still
+# receives trailers. Validation then reads only the text above Git's scissors
+# line — the part cleanup keeps. A trailer parked under the verbose diff
+# must not satisfy the check and then disappear from the object.
 #
 #   [codex/interactive] chore: Polish Makefile help output formatting
 #
@@ -9,8 +15,9 @@
 #
 #   Authored-By: codex <agents@vetcoders.io>
 #   session_id: 019e93be-379d-7303-9ad4-ffae468db99f
-#   timestamp: 2026_0604_1408_MDT
+#   time: 2026-06-04T14:08:27-06:00
 #   runtime: iterm2
+#   session_pid: 35432        (optional)
 #
 # Humans keep a human address. `[maciej/manual]` may use
 # `Authored-By: maciej <void@div0.space>`. Agents stay on
@@ -38,13 +45,193 @@ subject_pattern="^\\[([a-z][a-z0-9_-]*)/[a-z0-9][a-z0-9._-]*\\] (${types})(\\(.+
 
 failures=()
 agent=""
+session_agent=""
 if [[ "$first_line" =~ $subject_pattern ]]; then
     agent="${BASH_REMATCH[1]}"
+    session_agent="$agent"
+    case "$agent" in
+        cursor-agent) session_agent=cursor ;;
+        gemini-antigravity) session_agent=gemini ;;
+    esac
+    prepare_hook="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)/prepare-commit-msg"
+    if [ -f "$prepare_hook" ]; then
+        "$prepare_hook" "$msg_file" commit
+    fi
 else
     failures+=("subject must be: [<agent>/<runtime>] <type>(<scope>): <subject>")
 fi
 
-if grep -Eiq '(^Co-Authored-By:|noreply@|@anthropic\.com|@openai\.com)' "$msg_file"; then
+# Same comment prefix as prepare-commit-msg. core.commentString is ignored
+# before Git 2.45. A cut is only the marker Git writes for commit -v; an
+# authored >8 line that commit -F keeps is still validated.
+git_version_line() {
+    if [ -n "${VC_GIT_VERSION:-}" ]; then
+        printf '%s\n' "$VC_GIT_VERSION"
+    else
+        git --version 2>/dev/null || true
+    fi
+}
+git_supports_comment_string() {
+    local line major minor
+    line="$(git_version_line)"
+    major="$(printf '%s\n' "$line" | sed -n 's/^git version \([0-9][0-9]*\)\.\([0-9][0-9]*\).*/\1/p')"
+    minor="$(printf '%s\n' "$line" | sed -n 's/^git version \([0-9][0-9]*\)\.\([0-9][0-9]*\).*/\2/p')"
+    [ -n "$major" ] && [ -n "$minor" ] || return 1
+    if [ "$major" -gt 2 ]; then
+        return 0
+    fi
+    [ "$major" -eq 2 ] && [ "$minor" -ge 45 ]
+}
+comment_prefix="$(git config --get core.commentChar 2>/dev/null || true)"
+if git_supports_comment_string; then
+    comment_string="$(git config --get core.commentString 2>/dev/null || true)"
+    if [ -n "$comment_string" ]; then
+        comment_prefix="$comment_string"
+    fi
+fi
+comment_mode=fixed
+case "$comment_prefix" in
+    auto)
+        comment_mode=auto
+        comment_prefix='#'
+        ;;
+    "") comment_prefix='#' ;;
+esac
+noneditor_flag="${msg_file}.vc-noneditor"
+non_editor=0
+if [ -f "$noneditor_flag" ]; then
+    non_editor=1
+fi
+cleanup_mode="$(git config --get commit.cleanup 2>/dev/null || true)"
+scissors_cleanup=0
+if [ "$cleanup_mode" = "scissors" ] || [ "${VC_COMMIT_CLEANUP:-}" = "scissors" ]; then
+    scissors_cleanup=1
+fi
+if [ "$scissors_cleanup" -eq 0 ]; then
+    parent_args="$(ps -o args= -p "$PPID" 2>/dev/null || true)"
+    case "$parent_args" in
+        *"--cleanup=scissors"*|*"--cleanup scissors"*) scissors_cleanup=1 ;;
+    esac
+fi
+keep_comment_body=0
+case "$cleanup_mode" in
+    verbatim|whitespace) keep_comment_body=1 ;;
+    ""|default)
+        [ "$non_editor" = 1 ] && keep_comment_body=1
+        ;;
+esac
+
+# What Git will store: drop a real scissors marker and the verbose diff under
+# it. Comment lines stay in the buffer; the checks below do not treat them as
+# trailers or as an explanatory body.
+kept_tmp="$(mktemp "${TMPDIR:-/tmp}/vc-kept.XXXXXX")"
+trap 'rm -f "$kept_tmp"' EXIT
+comment_prefix="$(awk \
+    -v comment_prefix="$comment_prefix" \
+    -v comment_mode="$comment_mode" \
+    -v non_editor="$non_editor" \
+    -v scissors_cleanup="$scissors_cleanup" \
+    -v kept_path="$kept_tmp" \
+    '
+    function is_blank(s) { return s ~ /^[[:space:]]*$/ }
+    function is_auto_char(c) { return index("#;@!$%^&|:", c) > 0 }
+    function rest_is_cut(rest) {
+        return rest ~ /^ ------------------------ >8 ------------------------[[:space:]]*$/
+    }
+    function generated_marker(i,    j) {
+        if (non_editor) return 0
+        if (i >= n) return 0
+        if (index(lines[i + 1], "Do not modify or remove the line above.") > 0) return 1
+        if (scissors_cleanup) return 1
+        j = i + 1
+        while (j <= n && (is_blank(lines[j]) || (comment_prefix != "" && index(lines[j], comment_prefix) == 1)))
+            j++
+        if (j <= n && (index(lines[j], "diff --git") == 1 || index(lines[j], "diff --cc") == 1))
+            return 1
+        return 0
+    }
+    function token_len(s) {
+        if (match(s, /^[^[:space:]]+/)) return RLENGTH
+        return 0
+    }
+    function candidate_scissors(s,    c) {
+        if (token_len(s) != 1) return 0
+        c = substr(s, 1, 1)
+        if (!is_auto_char(c)) return 0
+        return rest_is_cut(substr(s, 2))
+    }
+    function strike(ch,    i, c, out) {
+        out = ""
+        for (i = 1; i <= length(alive); i++) {
+            c = substr(alive, i, 1)
+            if (c != ch) out = out c
+        }
+        alive = out
+    }
+    function choose_auto(    i, j, c, scan_end, saw_hash) {
+        scan_end = n
+        for (i = 1; i <= n; i++) {
+            if (!candidate_scissors(lines[i])) continue
+            j = i + 1
+            while (j <= n && (is_blank(lines[j]) || (token_len(lines[j]) == 1 && is_auto_char(substr(lines[j], 1, 1)))))
+                j++
+            if (j <= n && (index(lines[j], "diff --git") == 1 || index(lines[j], "diff --cc") == 1)) {
+                scan_end = i - 1
+                break
+            }
+        }
+        while (scan_end >= 1 && (is_blank(lines[scan_end]) || index(lines[scan_end], "#") == 1))
+            scan_end--
+        saw_hash = 0
+        for (i = 1; i <= scan_end; i++) {
+            if (index(lines[i], "#") > 0) saw_hash = 1
+        }
+        if (!saw_hash) return "#"
+        alive = "#;@!$%^&|:"
+        for (i = 1; i <= scan_end; i++) {
+            if (is_blank(lines[i])) continue
+            c = substr(lines[i], 1, 1)
+            if (is_auto_char(c)) strike(c)
+        }
+        if (alive == "") return "#"
+        return substr(alive, 1, 1)
+    }
+    function is_scissors(s,    rest) {
+        if (comment_mode == "auto") {
+            if (token_len(s) != 1 || substr(s, 1, 1) != comment_prefix) return 0
+            return rest_is_cut(substr(s, 2))
+        }
+        if (comment_prefix == "" || index(s, comment_prefix) != 1) return 0
+        rest = substr(s, length(comment_prefix) + 1)
+        return rest_is_cut(rest)
+    }
+    {
+        sub(/\r$/, "")
+        n++
+        lines[n] = $0
+    }
+    END {
+        if (comment_mode == "auto") comment_prefix = choose_auto()
+        cut = 0
+        first_cut = 0
+        generated_cut = 0
+        for (i = 1; i <= n; i++) {
+            if (!is_scissors(lines[i])) continue
+            if (!first_cut) first_cut = i
+            if (generated_marker(i)) generated_cut = i
+        }
+        if (generated_cut) cut = first_cut
+        end = cut ? cut - 1 : n
+        for (i = 1; i <= end; i++) print lines[i] > kept_path
+        close(kept_path)
+        print comment_prefix
+    }
+' "$msg_file")"
+kept="$(cat "$kept_tmp")"
+rm -f "$kept_tmp"
+trap - EXIT
+
+if printf '%s\n' "$kept" | grep -Eiq '(^Co-Authored-By:|noreply@|@anthropic\.com|@openai\.com)'; then
     failures+=("vendor footers are forbidden; use Authored-By only")
 fi
 
@@ -65,26 +252,85 @@ if [ "$runtime_lane" = "manual" ]; then
     is_human=1
 fi
 
+# Required provenance is the footer, not a citation in the body. The
+# generator preserves a body line that looks like a trailer and does not
+# treat it as measured.
+footer="$(printf '%s\n' "$kept" | awk -v comment_prefix="$comment_prefix" '
+    function is_comment(s) { return comment_prefix != "" && index(s, comment_prefix) == 1 }
+    function is_trailer(s) { return s ~ /^[A-Za-z][A-Za-z0-9_-]*: / }
+    { n++; lines[n] = $0 }
+    END {
+        end = n
+        seen = 0
+        while (end >= 1) {
+            if (is_comment(lines[end])) { seen = 1; end--; continue }
+            if (seen && lines[end] ~ /^[[:space:]]*$/) { end--; continue }
+            break
+        }
+        while (end >= 1 && lines[end] ~ /^[[:space:]]*$/) end--
+        bend = end
+        bstart = end + 1
+        while (end >= 1 && is_trailer(lines[end])) { bstart = end; end-- }
+        if (bstart <= bend && end >= 1 && lines[end] !~ /^[[:space:]]*$/) exit
+        for (i = bstart; i <= bend; i++) print lines[i]
+    }
+')"
 if [ "$is_human" -eq 1 ]; then
     author="${agent:-maciej}"
-    if ! grep -Eq "^Authored-By: ${author} <(${human_emails})>$" "$msg_file"; then
+    if ! printf '%s\n' "$footer" | grep -Eq "^Authored-By: ${author} <(${human_emails})>$"; then
         failures+=("missing Authored-By: ${author} <void@div0.space> (human lane; not agents@vetcoders.io)")
     fi
-elif [ -n "$agent" ] && ! grep -Eq "^Authored-By: ${agent} <agents@vetcoders\\.io>$" "$msg_file"; then
+elif [ -n "$agent" ] && ! printf '%s\n' "$footer" | grep -Eq "^Authored-By: ${agent} <agents@vetcoders\\.io>$"; then
     failures+=("missing Authored-By: ${agent} <agents@vetcoders.io>")
-elif [ -z "$agent" ] && ! grep -Eq '^Authored-By: [a-z][a-z0-9_-]* <agents@vetcoders\.io>$' "$msg_file"; then
+elif [ -z "$agent" ] && ! printf '%s\n' "$footer" | grep -Eq '^Authored-By: [a-z][a-z0-9_-]* <agents@vetcoders\.io>$'; then
     failures+=("missing Authored-By: <agent> <agents@vetcoders.io>")
 fi
 
-if ! grep -Eq '^session_id: [0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' "$msg_file"; then
-    failures+=("missing session_id: <uuid>")
+# UUID everywhere. Junie also keeps the id AICX discovery returns:
+# YYMMDD-HHMMSS-suffix, for example 260408-214715-abcd.
+session_ok=0
+if printf '%s\n' "$footer" | grep -Eq '^session_id: [0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'; then
+    session_ok=1
+elif { [ "$session_agent" = "codex" ] || [ "$session_agent" = "claude" ]; } \
+    && printf '%s\n' "$footer" | grep -Eq '^session_id: [A-Za-z0-9][A-Za-z0-9._-]{0,127}$'; then
+    session_ok=1
+elif [ "$session_agent" = "junie" ] && printf '%s\n' "$footer" | grep -Eq '^session_id: [0-9]{6}(-[A-Za-z0-9]+)+$'; then
+    session_ok=1
+elif [ "$session_agent" = "gemini" ] && printf '%s\n' "$footer" | grep -Eq '^session_id: [A-Za-z0-9][A-Za-z0-9._:-]{0,127}$'; then
+    session_ok=1
+elif [ "$session_agent" = "kimi" ] && printf '%s\n' "$footer" | grep -Eq '^session_id: [0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}:[A-Za-z0-9._+-]+$'; then
+    session_ok=1
+fi
+if [ "$session_ok" -ne 1 ]; then
+    if [ "$session_agent" = "codex" ] || [ "$session_agent" = "claude" ]; then
+        failures+=("missing session_id: <uuid or native session id>")
+    elif [ "$session_agent" = "junie" ]; then
+        failures+=("missing session_id: <uuid or YYMMDD-HHMMSS-suffix>")
+    elif [ "$session_agent" = "gemini" ]; then
+        failures+=("missing session_id: <uuid or Gemini session id>")
+    elif [ "$session_agent" = "kimi" ]; then
+        failures+=("missing session_id: <uuid or uuid:agentId>")
+    else
+        failures+=("missing session_id: <uuid>")
+    fi
 fi
 
-if ! grep -Eq '^timestamp: [0-9]{4}_[0-9]{4}_[0-9]{4}_[A-Za-z0-9_+-]+$' "$msg_file"; then
-    failures+=("missing timestamp: YYYY_MMDD_HHMM_TZ")
+if printf '%s\n' "$footer" | grep -Eq '^(timestamp|date): '; then
+    failures+=("timestamp:/date: are legacy; the fleet standard is time: YYYY-MM-DDTHH:MM:SS+HH:MM")
+fi
+if ! printf '%s\n' "$footer" | grep -Eq '^time: [0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([+-][0-9]{2}:[0-9]{2}|Z)$'; then
+    failures+=("missing time: YYYY-MM-DDTHH:MM:SS+HH:MM")
 fi
 
-if ! grep -Eq '^runtime: .+' "$msg_file"; then
+# session_pid is optional by design: it separates two live processes sharing one
+# session_id, but requiring it would block manual commits and amends made
+# outside an agent process. Validate the shape only when it is present.
+if printf '%s\n' "$footer" | grep -Eq '^session_pid:' \
+    && ! printf '%s\n' "$footer" | grep -Eq '^session_pid: [0-9]{1,10}$'; then
+    failures+=("session_pid: must be a decimal process id when present")
+fi
+
+if ! printf '%s\n' "$footer" | grep -Eq '^runtime: .+'; then
     failures+=("missing runtime: <runtime name>")
 fi
 
@@ -94,16 +340,20 @@ while IFS= read -r line || [ -n "$line" ]; do
     case "$line" in
         "$first_line"|"") continue ;;
     esac
-    if printf '%s\n' "$line" | grep -Eq '^(Authored-By|session_id|timestamp|runtime|Signed-off-by|Vibecrafted-Warn-Signature):'; then
+    if [ "$keep_comment_body" -ne 1 ] && [ "${line#"$comment_prefix"}" != "$line" ]; then
+        continue
+    fi
+    if printf '%s\n' "$line" | grep -Eq '^(Authored-By|session_id|session_pid|time|timestamp|date|runtime|Signed-off-by|Vibecrafted-Warn-Signature):'; then
         continue
     fi
     has_body=1
     break
-done < "$msg_file"
+done <<< "$kept"
 
 if [ "$has_body" -ne 1 ]; then
     failures+=("commit message needs an explanatory body before trailers")
 fi
+rm -f "$noneditor_flag"
 
 if [ "${#failures[@]}" -eq 0 ]; then
     exit 0
@@ -118,13 +368,13 @@ printf '  [codex/interactive] chore: describe the change\n\n' >&2
 printf '  Why this commit exists.\n\n' >&2
 printf '  Authored-By: codex <agents@vetcoders.io>\n' >&2
 printf '  session_id: 019e93be-379d-7303-9ad4-ffae468db99f\n' >&2
-printf '  timestamp: 2026_0604_1408_MDT\n' >&2
+printf '  time: 2026-06-04T14:08:27-06:00\n' >&2
 printf '  runtime: iterm2\n' >&2
 printf '\nHuman shape:\n' >&2
 printf '  [maciej/manual] feat: describe the change\n\n' >&2
 printf '  Why this commit exists.\n\n' >&2
 printf '  Authored-By: maciej <void@div0.space>\n' >&2
 printf '  session_id: <uuid>\n' >&2
-printf '  timestamp: YYYY_MMDD_HHMM_TZ\n' >&2
+printf '  time: YYYY-MM-DDTHH:MM:SS+HH:MM\n' >&2
 printf '  runtime: vibecrafted\n' >&2
 exit 1
