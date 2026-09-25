@@ -67,7 +67,13 @@ pub struct Phrases {
     pub requirement: &'static [&'static str],
     pub result_keywords: &'static [&'static str],
     pub bare_affirmation: &'static [&'static str],
+    /// Markers whose presence alone is enough to call a line a Result line. Each
+    /// carries result-shape on its own (PASS/FAIL outcome, score readout, P-level
+    /// count, command name that only appears in result-reporting contexts).
     pub result_strict: &'static [&'static str],
+    /// Markers that look result-y but appear too often in meta-discussion (e.g.
+    /// "we need to write tests for X", "this throws an error: should we…").
+    /// These classify a line as Result only when the line also has result shape.
     pub result_soft: &'static [&'static str],
     pub result_shape: &'static [&'static str],
     pub completion: &'static [&'static str],

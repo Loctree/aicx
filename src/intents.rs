@@ -2837,14 +2837,6 @@ fn push_unique(target: &mut Vec<String>, value: String) {
 
 const CLASSIFIER_ABSTAIN_THRESHOLD: f32 = 0.5;
 
-/// Markers whose presence alone is enough to call a line a Result line. Each
-/// carries result-shape on its own (PASS/FAIL outcome, score readout, P-level
-/// count, command name that only appears in result-reporting contexts).
-
-/// Markers that look result-y but appear too often in meta-discussion (e.g.
-/// "we need to write tests for X", "this throws an error: should we…").
-/// These classify a line as Result only when [`line_has_result_shape`] matches.
-
 /// A line "has result shape" when it carries a concrete reporting signal:
 /// a digit (test count, error count, percentage), a PASS/FAIL token, or a
 /// known status word. Without one, soft markers like "tests" or "error:" are
