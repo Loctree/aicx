@@ -618,7 +618,7 @@ const AUTH_HTML: &str = r#"<!doctype html>
 <style>
 body{margin:0;background:#0e0e0e;color:#f5f1e7;font-family:Inter,system-ui,sans-serif}
 main{max-width:28rem;margin:4rem auto;padding:1.5rem}
-h1{font-family:Georgia,serif;font-weight:400}
+h1{font-family:"Instrument Serif","Iowan Old Style",Palatino,Georgia,serif;font-weight:400}
 a{display:block;margin:.75rem 0;padding:.85rem 1rem;border:1px solid rgba(255,255,255,.16);border-radius:14px;color:#f5f1e7;text-decoration:none}
 a:hover{border-color:#3d7a72}
 </style></head>
