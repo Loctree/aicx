@@ -297,7 +297,16 @@ pub fn render(pack: &ContinuityPack, for_inject: bool) -> String {
     ));
 
     // ── NOW: open sessions + unresolved human intent ─────────────────────
+    // Preface states the selection rule. It does not union truncated ids
+    // into one thread; that is a different cut.
     out.push_str("## NOW\n\n");
+    out.push_str(
+        "open means a live_open intent record whose conversation date is inside the window\n",
+    );
+    out.push_str(
+        "no intent record under this stored session id is not proof the thread is absent\n",
+    );
+    out.push_str("a truncated session id is not a full thread identity\n\n");
     let live_records: Vec<&IntentRecord> = pack
         .records
         .iter()
@@ -315,7 +324,7 @@ pub fn render(pack: &ContinuityPack, for_inject: bool) -> String {
     for ((agent, session), timestamp) in open_sessions.iter().take(NOW_CAP) {
         out.push_str(&format!(
             "- open: {agent} · {session} · {}\n",
-            timestamp.unwrap_or("mtime-only")
+            timestamp.unwrap_or("no conversation timestamp")
         ));
     }
     let unresolved = unresolved_intents(&pack.records);
@@ -627,6 +636,116 @@ mod tests {
         let rendered = render(&pack, false);
         assert!(rendered.contains("open: claude · hot-open"));
         assert!(!rendered.contains("warning: chunk lag"));
+    }
+
+    #[test]
+    fn continuity_now_states_live_open_rule() {
+        let pack = ContinuityPack {
+            project_label: "vetcoders/vibecrafted".into(),
+            hours: 24,
+            live_sessions: 2,
+            records: vec![
+                crate::intents::IntentRecord {
+                    kind: IntentKind::Intent,
+                    summary: "keep live window independent of census".into(),
+                    context: None,
+                    evidence: Vec::new(),
+                    project: "vetcoders/vibecrafted".into(),
+                    agent: "claude".into(),
+                    date: "2026-08-13".into(),
+                    timestamp: Some("2026-08-13T02:00:00Z".into()),
+                    session_id: "hot-open".into(),
+                    count: None,
+                    first_chunk: None,
+                    last_chunk: None,
+                    source_chunk: "sess.jsonl".into(),
+                    source: None,
+                    honesty: crate::oracle::ClaimHonesty::live_open(),
+                },
+                crate::intents::IntentRecord {
+                    kind: IntentKind::Intent,
+                    summary: "open row whose conversation date was not stored".into(),
+                    context: None,
+                    evidence: Vec::new(),
+                    project: "vetcoders/vibecrafted".into(),
+                    agent: "claude".into(),
+                    date: "2026-08-13".into(),
+                    timestamp: None,
+                    session_id: "open-no-ts".into(),
+                    count: None,
+                    first_chunk: None,
+                    last_chunk: None,
+                    source_chunk: "sess-no-ts.jsonl".into(),
+                    source: None,
+                    honesty: crate::oracle::ClaimHonesty::live_open(),
+                },
+                crate::intents::IntentRecord {
+                    kind: IntentKind::Intent,
+                    summary: "canonical claim is not an open session".into(),
+                    context: None,
+                    evidence: Vec::new(),
+                    project: "vetcoders/vibecrafted".into(),
+                    agent: "codex".into(),
+                    date: "2026-08-01".into(),
+                    timestamp: Some("2026-08-01T00:00:00Z".into()),
+                    session_id: "canonical-closed".into(),
+                    count: None,
+                    first_chunk: None,
+                    last_chunk: None,
+                    source_chunk: "canonical.jsonl".into(),
+                    source: None,
+                    honesty: crate::oracle::ClaimHonesty::canonical(),
+                },
+            ],
+            sources: Vec::new(),
+            index_health: IndexHealthLine {
+                newest_session_updated_at: Some("2026-08-13T02:00:00Z".into()),
+                committed_at: None,
+                pending: 0,
+                sessions_newer_than_chunks: 0,
+                readiness: "ready".into(),
+                mode: "live",
+            },
+            mixed_scope: Vec::new(),
+            distilled_mixed: false,
+        };
+        let rendered = render(&pack, false);
+        for sentence in [
+            "open means a live_open intent record whose conversation date is inside the window",
+            "no intent record under this stored session id is not proof the thread is absent",
+            "a truncated session id is not a full thread identity",
+        ] {
+            assert!(
+                rendered.contains(sentence),
+                "missing {sentence} in:\n{rendered}"
+            );
+        }
+        let open_lines: Vec<&str> = rendered
+            .lines()
+            .filter(|line| line.starts_with("- open:"))
+            .collect();
+        assert!(
+            open_lines
+                .iter()
+                .any(|line| line.contains("claude · hot-open · 2026-08-13T02:00:00Z")),
+            "live_open row missing: {open_lines:?}"
+        );
+        assert!(
+            open_lines
+                .iter()
+                .any(|line| line.contains("claude · open-no-ts · no conversation timestamp")),
+            "missing conversation date must say so: {open_lines:?}"
+        );
+        assert!(
+            rendered.contains("canonical-closed"),
+            "canonical record was not rendered at all:\n{rendered}"
+        );
+        assert!(
+            open_lines
+                .iter()
+                .all(|line| !line.contains("canonical-closed")),
+            "canonical record leaked under - open:: {open_lines:?}"
+        );
     }
 
     #[test]
