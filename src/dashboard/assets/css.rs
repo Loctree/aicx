@@ -50,6 +50,7 @@ body {
   flex: none;
   margin-top: 4px;
   color: var(--text);
+  background: transparent;
 }
 
 .app-header h1 {

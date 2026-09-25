@@ -620,7 +620,7 @@ body{margin:0;background:#0e0e0e;color:#f5f1e7;font-family:Inter,system-ui,sans-
 main{max-width:22rem;margin:4rem auto;padding:1.5rem;text-align:center}
 h1{font-family:"Instrument Serif","Iowan Old Style",Palatino,Georgia,serif;font-weight:400;font-size:2rem;margin:0 0 .5rem}
 p{margin:.4rem 0 1rem;line-height:1.4}
-#aicx-mark{display:block;width:28px;height:28px;margin:0 auto 1rem;color:#f5f1e7}
+#aicx-mark{display:block;width:28px;height:28px;margin:0 auto 1rem;color:#f5f1e7;background:transparent}
 .pills{display:flex;flex-direction:column;align-items:center;gap:.45rem}
 a{display:inline-flex;align-items:center;justify-content:center;gap:.55rem;width:14.5rem;margin:0;padding:.45rem .7rem;border:1px solid rgba(255,255,255,.16);border-radius:999px;color:#f5f1e7;text-decoration:none;font-size:.84rem}
 a svg{width:14px;height:14px;flex:none}
@@ -632,7 +632,7 @@ a:hover{border-color:#3d7a72}
 <h1>Sign in</h1>
 <p>Search stays on this machine. Pick the credential that already knows you.</p>
 <div class="pills">
-<a href="/auth/tailscale"><svg class="auth-mark" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 1.8a10.2 10.2 0 1 0 0 20.4 10.2 10.2 0 0 0 0-20.4zm0 3.2a7 7 0 1 1 0 14 7 7 0 0 1 0-14zm0 2.6a4.4 4.4 0 1 0 .02 8.8A4.4 4.4 0 0 0 12 7.6z"/></svg>Continue with Tailscale</a>
+<a href="/auth/tailscale"><svg class="auth-mark" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M24 12a3 3 0 1 1-6 0 3 3 0 0 1 6 0zm-9 9a3 3 0 1 1-6 0 3 3 0 0 1 6 0zm0-9a3 3 0 1 1-6 0 3 3 0 0 1 6 0zm6-6a3 3 0 1 1 0-6 3 3 0 0 1 0 6zm0-.5a2.5 2.5 0 1 0 0-5 2.5 2.5 0 0 0 0 5zM3 24a3 3 0 1 1 0-6 3 3 0 0 1 0 6zm0-.5a2.5 2.5 0 1 0 0-5 2.5 2.5 0 0 0 0 5zm18 .5a3 3 0 1 1 0-6 3 3 0 0 1 0 6zm0-.5a2.5 2.5 0 1 0 0-5 2.5 2.5 0 0 0 0 5zM6 12a3 3 0 1 1-6 0 3 3 0 0 1 6 0zm9-9a3 3 0 1 1-6 0 3 3 0 0 1 6 0zm-3 2.5a2.5 2.5 0 1 0 0-5 2.5 2.5 0 0 0 0 5zM6 3a3 3 0 1 1-6 0 3 3 0 0 1 6 0zM3 5.5a2.5 2.5 0 1 0 0-5 2.5 2.5 0 0 0 0 5z"/></svg>Continue with Tailscale</a>
 <p class="note">Tailscale Serve sends Tailscale-User-Login. No separate Tailscale app.</p>
 <a href="/auth/google"><svg class="auth-mark" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12.24 10.29V14.4h6.81c-.28 1.76-2.06 5.17-6.81 5.17-4.1 0-7.44-3.39-7.44-7.57S8.14 4.43 12.24 4.43c2.33 0 3.89.99 4.79 1.85l3.25-3.14C18.19 1.19 15.48 0 12.24 0 5.48 0 0 5.48 0 12.24S5.48 24.48 12.24 24.48c7.06 0 11.75-4.96 11.75-11.96 0-.8-.09-1.41-.19-2.23H12.24z"/></svg>Continue with Google</a>
 <a href="/auth/github"><svg class="auth-mark" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 .3C5.37.3 0 5.67 0 12.3c0 5.3 3.44 9.8 8.21 11.39.6.11.82-.26.82-.58 0-.28-.01-1.04-.02-2.04-3.34.72-4.04-1.61-4.04-1.61-.55-1.39-1.33-1.76-1.33-1.76-1.09-.74.08-.73.08-.73 1.2.08 1.84 1.24 1.84 1.24 1.07 1.83 2.81 1.3 3.5 1 .1-.78.42-1.3.76-1.6-2.67-.3-5.47-1.33-5.47-5.93 0-1.31.47-2.38 1.24-3.22-.13-.3-.54-1.52.1-3.18 0 0 1.01-.32 3.3 1.23a11.5 11.5 0 0 1 6 0c2.28-1.55 3.29-1.23 3.29-1.23.64 1.66.23 2.88.12 3.18.77.84 1.23 1.91 1.23 3.22 0 4.61-2.81 5.62-5.48 5.92.43.37.81 1.1.81 2.22 0 1.61-.01 2.9-.01 3.29 0 .32.22.69.83.57A12.3 12.3 0 0 0 24 12.3C24 5.67 18.63.3 12 .3z"/></svg>Continue with GitHub</a>
@@ -711,6 +711,8 @@ mod tests {
             assert!(html.contains("/auth/github"));
             assert!(html.contains("Tailscale-User-Login"));
             assert_eq!(html.matches("auth-mark").count(), 3);
+            assert!(html.contains("M24 12a3 3 0"));
+            assert!(html.contains("background:transparent"));
             assert!(html.contains("text-align:center"));
 
             let missing = app
