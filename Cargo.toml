@@ -46,6 +46,7 @@ app = [
     "dep:indicatif",
     "dep:inquire",
     "dep:ratatui",
+    "dep:reqwest",
     "dep:rmcp",
     "dep:tokio",
     "dep:tower_governor",
@@ -87,6 +88,7 @@ indicatif = { version = "0.18", optional = true }
 inquire = { version = "0.7", optional = true }
 globset = "0.4"
 ratatui = { version = "0.30", optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots"], optional = true }
 crossterm = { version = "0.29", optional = true }
 axum = { version = "0.8", optional = true }
 futures = { version = "0.3", optional = true }

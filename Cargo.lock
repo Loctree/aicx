@@ -39,6 +39,7 @@ dependencies = [
  "libc",
  "ratatui",
  "regex",
+ "reqwest",
  "rmcp",
  "schemars",
  "serde",

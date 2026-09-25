@@ -1,0 +1,787 @@
+//! Operator surfaces on the dashboard: phrase file and index trigger.
+
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
+
+use axum::{
+    Json,
+    extract::{Query, State},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
+    response::{Html, IntoResponse, Response},
+};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+use super::{
+    DashboardServerState, REGENERATE_HEADER_NAME, REGENERATE_HEADER_VALUE, forbidden_response,
+};
+use crate::parser::intent_phrases;
+
+pub(super) fn phrases_path(state: &DashboardServerState) -> std::path::PathBuf {
+    state.config.aicx_home.join("intent_phrases.toml")
+}
+
+pub(super) async fn get_phrases(State(state): State<Arc<DashboardServerState>>) -> Response {
+    let path = phrases_path(&state);
+    let body = intent_phrases::read_operator_or_embedded(&path);
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        body,
+    )
+        .into_response()
+}
+
+pub(super) async fn put_phrases(
+    State(state): State<Arc<DashboardServerState>>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    if let Some(response) = reject_mutation(&state, &headers) {
+        return response;
+    }
+    if let Err(err) = intent_phrases::reload_from_str(&body) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(JsonError {
+                error: "invalid_phrases",
+                detail: err,
+            }),
+        )
+            .into_response();
+    }
+    let path = phrases_path(&state);
+    if let Some(parent) = path.parent()
+        && let Err(err) = std::fs::create_dir_all(parent)
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(JsonError {
+                error: "write_failed",
+                detail: err.to_string(),
+            }),
+        )
+            .into_response();
+    }
+    if let Err(err) = std::fs::write(&path, body) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(JsonError {
+                error: "write_failed",
+                detail: err.to_string(),
+            }),
+        )
+            .into_response();
+    }
+    (
+        StatusCode::OK,
+        Json(JsonOk {
+            ok: true,
+            path: path.display().to_string(),
+        }),
+    )
+        .into_response()
+}
+
+pub(super) async fn post_index(
+    State(state): State<Arc<DashboardServerState>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(response) = reject_mutation(&state, &headers) {
+        return response;
+    }
+    let home = state.config.aicx_home.clone();
+    tokio::spawn(async move {
+        let _ = tokio::task::spawn_blocking(move || {
+            let reporter = crate::progress::select_reporter(true);
+            crate::source_index::build_with_reporter(&home, &[], false, false, true, reporter)
+        })
+        .await;
+    });
+    (
+        StatusCode::ACCEPTED,
+        Json(JsonOk {
+            ok: true,
+            path: "index".to_string(),
+        }),
+    )
+        .into_response()
+}
+
+pub(super) async fn get_auth_page() -> Html<&'static str> {
+    Html(AUTH_HTML)
+}
+
+pub(super) async fn auth_tailscale(headers: HeaderMap) -> Response {
+    let login = headers
+        .get("tailscale-user-login")
+        .and_then(|value| value.to_str().ok());
+    let Some(identity) = login.and_then(tailscale_identity) else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Html(
+                "<p>Tailscale Serve did not present Tailscale-User-Login. Publish this dashboard with <code>tailscale serve</code>. There is no separate Tailscale OAuth app.</p>",
+            ),
+        )
+            .into_response();
+    };
+    session_redirect(&identity)
+}
+
+pub(super) async fn auth_google_start(headers: HeaderMap) -> Response {
+    oauth_start(
+        "google",
+        "https://accounts.google.com/o/oauth2/v2/auth",
+        "openid email",
+        "AICX_GOOGLE_CLIENT_ID",
+        &headers,
+    )
+}
+
+pub(super) async fn auth_github_start(headers: HeaderMap) -> Response {
+    oauth_start(
+        "github",
+        "https://github.com/login/oauth/authorize",
+        "read:user user:email",
+        "AICX_GITHUB_CLIENT_ID",
+        &headers,
+    )
+}
+
+pub(super) async fn auth_google_callback(
+    headers: HeaderMap,
+    Query(query): Query<OauthQuery>,
+) -> Response {
+    finish_oauth(
+        "google",
+        "https://oauth2.googleapis.com/token",
+        "https://openidconnect.googleapis.com/v1/userinfo",
+        "AICX_GOOGLE_CLIENT_ID",
+        "AICX_GOOGLE_CLIENT_SECRET",
+        google_identity,
+        &headers,
+        &query,
+    )
+    .await
+}
+
+pub(super) async fn auth_github_callback(
+    headers: HeaderMap,
+    Query(query): Query<OauthQuery>,
+) -> Response {
+    finish_oauth(
+        "github",
+        "https://github.com/login/oauth/access_token",
+        "https://api.github.com/user",
+        "AICX_GITHUB_CLIENT_ID",
+        "AICX_GITHUB_CLIENT_SECRET",
+        github_identity,
+        &headers,
+        &query,
+    )
+    .await
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub(crate) struct OauthQuery {
+    code: Option<String>,
+    state: Option<String>,
+    error: Option<String>,
+}
+
+pub(crate) fn oauth_authorize_url(
+    base: &str,
+    client_id: &str,
+    redirect: &str,
+    scope: &str,
+    state: &str,
+) -> String {
+    format!(
+        "{base}?client_id={}&redirect_uri={}&response_type=code&scope={}&state={}",
+        urlencoding_min(client_id),
+        urlencoding_min(redirect),
+        urlencoding_min(scope),
+        urlencoding_min(state)
+    )
+}
+
+pub(crate) fn tailscale_identity(login: &str) -> Option<String> {
+    let login = login.trim();
+    if login.is_empty() || login.len() > 200 {
+        return None;
+    }
+    if !login.bytes().all(|byte| {
+        byte.is_ascii_alphanumeric() || matches!(byte, b'@' | b'.' | b'_' | b'-' | b'+')
+    }) {
+        return None;
+    }
+    Some(format!("tailscale:{login}"))
+}
+
+pub(crate) fn google_identity(body: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let id = value
+        .get("email")
+        .and_then(|item| item.as_str())
+        .filter(|item| !item.is_empty())
+        .or_else(|| value.get("sub").and_then(|item| item.as_str()))?;
+    Some(format!("google:{id}"))
+}
+
+pub(crate) fn github_identity(body: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let login = value
+        .get("login")
+        .and_then(|item| item.as_str())
+        .filter(|item| !item.is_empty())?;
+    Some(format!("github:{login}"))
+}
+
+fn oauth_start(
+    provider: &str,
+    base: &str,
+    scope: &str,
+    client_env: &str,
+    headers: &HeaderMap,
+) -> Response {
+    let Some(client_id) = std::env::var(client_env)
+        .ok()
+        .filter(|value| !value.is_empty())
+    else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Html(format!(
+                "<p>{provider} is not configured. Set {client_env}.</p>"
+            )),
+        )
+            .into_response();
+    };
+    let origin = public_origin(headers);
+    let redirect = format!("{origin}/auth/{provider}/callback");
+    let state = random_hex(16);
+    let url = oauth_authorize_url(base, &client_id, &redirect, scope, &state);
+    let mut response_headers = HeaderMap::new();
+    if let Ok(location) = HeaderValue::from_str(&url) {
+        response_headers.insert(header::LOCATION, location);
+    }
+    append_cookie(
+        &mut response_headers,
+        &format!("aicx_oauth_state={state}; HttpOnly; SameSite=Lax; Path=/; Max-Age=600"),
+    );
+    append_cookie(
+        &mut response_headers,
+        &format!(
+            "aicx_oauth_redirect={}; HttpOnly; SameSite=Lax; Path=/; Max-Age=600",
+            hex::encode(redirect.as_bytes())
+        ),
+    );
+    (StatusCode::FOUND, response_headers).into_response()
+}
+
+async fn finish_oauth(
+    provider: &str,
+    token_url: &str,
+    identity_url: &str,
+    client_env: &str,
+    secret_env: &str,
+    identity_of: fn(&str) -> Option<String>,
+    headers: &HeaderMap,
+    query: &OauthQuery,
+) -> Response {
+    if query
+        .error
+        .as_deref()
+        .is_some_and(|value| !value.is_empty())
+    {
+        return html_status(
+            StatusCode::BAD_REQUEST,
+            "<p>The provider refused the sign-in.</p>",
+        );
+    }
+    let Some(code) = query.code.as_deref().filter(|value| !value.is_empty()) else {
+        return html_status(
+            StatusCode::BAD_REQUEST,
+            "<p>Missing authorization code.</p>",
+        );
+    };
+    let Some(state) = query.state.as_deref().filter(|value| !value.is_empty()) else {
+        return html_status(StatusCode::BAD_REQUEST, "<p>Missing OAuth state.</p>");
+    };
+    let Some(state_cookie) = cookie_value(headers, "aicx_oauth_state") else {
+        return html_status(
+            StatusCode::BAD_REQUEST,
+            "<p>Missing OAuth state cookie.</p>",
+        );
+    };
+    if !eq_secret(state, &state_cookie) {
+        return html_status(StatusCode::BAD_REQUEST, "<p>OAuth state did not match.</p>");
+    }
+    let Some(redirect) = cookie_value(headers, "aicx_oauth_redirect")
+        .and_then(|value| hex::decode(value).ok())
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+    else {
+        return html_status(StatusCode::BAD_REQUEST, "<p>Missing OAuth redirect.</p>");
+    };
+    let Some(client_id) = std::env::var(client_env)
+        .ok()
+        .filter(|value| !value.is_empty())
+    else {
+        return html_status(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &format!("<p>{provider} is not configured. Set {client_env}.</p>"),
+        );
+    };
+    let Some(secret) = std::env::var(secret_env)
+        .ok()
+        .filter(|value| !value.is_empty())
+    else {
+        return html_status(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &format!(
+                "<p>{provider} callback needs {secret_env} before a code can be exchanged.</p>"
+            ),
+        );
+    };
+    let identity = exchange_identity(
+        token_url,
+        identity_url,
+        &client_id,
+        &secret,
+        code,
+        &redirect,
+        identity_of,
+    )
+    .await;
+    session_or_refuse(identity)
+}
+
+fn session_or_refuse(identity: Result<String, String>) -> Response {
+    match identity {
+        Ok(identity) => session_redirect(&identity),
+        Err(_) => html_status(
+            StatusCode::BAD_GATEWAY,
+            "<p>The provider did not return an identity. No session was created.</p>",
+        ),
+    }
+}
+
+async fn exchange_identity(
+    token_url: &str,
+    identity_url: &str,
+    client_id: &str,
+    secret: &str,
+    code: &str,
+    redirect: &str,
+    identity_of: fn(&str) -> Option<String>,
+) -> Result<String, String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|_| "oauth client unavailable".to_string())?;
+    let body = format!(
+        "code={}&client_id={}&client_secret={}&redirect_uri={}&grant_type=authorization_code",
+        urlencoding_min(code),
+        urlencoding_min(client_id),
+        urlencoding_min(secret),
+        urlencoding_min(redirect)
+    );
+    let token_text = client
+        .post(token_url)
+        .header(header::ACCEPT, "application/json")
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(body)
+        .send()
+        .await
+        .map_err(|_| "token exchange failed".to_string())?
+        .error_for_status()
+        .map_err(|_| "token exchange refused".to_string())?
+        .text()
+        .await
+        .map_err(|_| "token response was empty".to_string())?;
+    let token: serde_json::Value =
+        serde_json::from_str(&token_text).map_err(|_| "token response was not json".to_string())?;
+    let access = token
+        .get("access_token")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "no access token".to_string())?;
+    let profile = client
+        .get(identity_url)
+        .header(header::AUTHORIZATION, format!("Bearer {access}"))
+        .header(header::USER_AGENT, "aicx")
+        .header(header::ACCEPT, "application/json")
+        .send()
+        .await
+        .map_err(|_| "identity request failed".to_string())?
+        .error_for_status()
+        .map_err(|_| "identity request refused".to_string())?
+        .text()
+        .await
+        .map_err(|_| "identity response was empty".to_string())?;
+    identity_of(&profile).ok_or_else(|| "provider returned no identity".to_string())
+}
+
+fn session_redirect(identity: &str) -> Response {
+    let mut headers = HeaderMap::new();
+    headers.insert(header::LOCATION, HeaderValue::from_static("/"));
+    append_cookie(
+        &mut headers,
+        &format!(
+            "aicx_session={}; HttpOnly; SameSite=Lax; Path=/",
+            sign_session(identity)
+        ),
+    );
+    (StatusCode::FOUND, headers).into_response()
+}
+
+fn sign_session(identity: &str) -> String {
+    let mac = hmac_sha256(session_key(), identity.as_bytes());
+    format!(
+        "v1.{}.{}",
+        hex::encode(identity.as_bytes()),
+        hex::encode(mac)
+    )
+}
+
+#[cfg(test)]
+fn open_session(token: &str) -> Option<String> {
+    let rest = token.strip_prefix("v1.")?;
+    let (ident_hex, mac_hex) = rest.split_once('.')?;
+    let ident = hex::decode(ident_hex).ok()?;
+    let mac = hex::decode(mac_hex).ok()?;
+    let expected = hmac_sha256(session_key(), &ident);
+    if mac.len() != expected.len() {
+        return None;
+    }
+    let mut diff = 0u8;
+    for (left, right) in mac.iter().zip(expected.iter()) {
+        diff |= left ^ right;
+    }
+    if diff != 0 {
+        return None;
+    }
+    String::from_utf8(ident).ok()
+}
+
+fn session_key() -> &'static [u8; 32] {
+    static KEY: OnceLock<[u8; 32]> = OnceLock::new();
+    KEY.get_or_init(|| {
+        let mut buf = [0u8; 32];
+        getrandom::fill(&mut buf).expect("session key");
+        buf
+    })
+}
+
+fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
+    const BLOCK: usize = 64;
+    let mut padded = [0u8; BLOCK];
+    if key.len() > BLOCK {
+        let digest = Sha256::digest(key);
+        padded[..32].copy_from_slice(&digest);
+    } else {
+        padded[..key.len()].copy_from_slice(key);
+    }
+    let mut ipad = [0x36u8; BLOCK];
+    let mut opad = [0x5cu8; BLOCK];
+    for index in 0..BLOCK {
+        ipad[index] ^= padded[index];
+        opad[index] ^= padded[index];
+    }
+    let mut inner = Sha256::new();
+    inner.update(ipad);
+    inner.update(message);
+    let inner = inner.finalize();
+    let mut outer = Sha256::new();
+    outer.update(opad);
+    outer.update(inner);
+    let digest = outer.finalize();
+    let mut mac = [0u8; 32];
+    mac.copy_from_slice(&digest);
+    mac
+}
+
+fn public_origin(headers: &HeaderMap) -> String {
+    let host = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("127.0.0.1");
+    let https = headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case("https"));
+    let scheme = if https { "https" } else { "http" };
+    format!("{scheme}://{host}")
+}
+
+fn random_hex(bytes: usize) -> String {
+    let mut buf = vec![0u8; bytes];
+    getrandom::fill(&mut buf).expect("oauth state");
+    hex::encode(buf)
+}
+
+fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
+    let prefix = format!("{name}=");
+    headers
+        .get(header::COOKIE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|cookie| {
+            cookie.split(';').find_map(|part| {
+                let part = part.trim();
+                part.strip_prefix(&prefix).map(str::to_string)
+            })
+        })
+}
+
+fn append_cookie(headers: &mut HeaderMap, cookie: &str) {
+    if let Ok(value) = HeaderValue::from_str(cookie) {
+        headers.append(header::SET_COOKIE, value);
+    }
+}
+
+fn html_status(status: StatusCode, body: &str) -> Response {
+    (status, Html(body.to_string())).into_response()
+}
+
+fn eq_secret(left: &str, right: &str) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (a, b) in left.bytes().zip(right.bytes()) {
+        diff |= a ^ b;
+    }
+    diff == 0
+}
+
+fn urlencoding_min(value: &str) -> String {
+    let mut out = String::new();
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char)
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+fn reject_mutation(state: &DashboardServerState, headers: &HeaderMap) -> Option<Response> {
+    let header_ok = headers
+        .get(REGENERATE_HEADER_NAME)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case(REGENERATE_HEADER_VALUE));
+    if !header_ok {
+        return Some(forbidden_response(
+            "missing_or_invalid_action_header",
+            format!("expected {REGENERATE_HEADER_NAME}: {REGENERATE_HEADER_VALUE}"),
+        ));
+    }
+    let origin = headers
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok());
+    let referer = headers
+        .get(header::REFERER)
+        .and_then(|value| value.to_str().ok());
+    let source = origin.or(referer);
+    if source.is_none() && !state.config.allow_no_origin {
+        return Some(forbidden_response(
+            "missing_origin_or_referer",
+            "mutating dashboard request had neither Origin nor Referer",
+        ));
+    }
+    if let Some(source) = source
+        && !state.config.cors_policy.allows_origin(source)
+    {
+        return Some(forbidden_response(
+            "origin_or_referer_rejected",
+            format!("source={source}"),
+        ));
+    }
+    None
+}
+
+#[derive(Serialize)]
+struct JsonError {
+    error: &'static str,
+    detail: String,
+}
+
+#[derive(Serialize)]
+struct JsonOk {
+    ok: bool,
+    path: String,
+}
+
+const AUTH_HTML: &str = r#"<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>aicx auth</title>
+<style>
+body{margin:0;background:#0e0e0e;color:#f5f1e7;font-family:Inter,system-ui,sans-serif}
+main{max-width:28rem;margin:4rem auto;padding:1.5rem}
+h1{font-family:Georgia,serif;font-weight:400}
+a{display:block;margin:.75rem 0;padding:.85rem 1rem;border:1px solid rgba(255,255,255,.16);border-radius:14px;color:#f5f1e7;text-decoration:none}
+a:hover{border-color:#3d7a72}
+</style></head>
+<body><main>
+<h1>Sign in</h1>
+<p>Search stays on this machine. Pick the credential that already knows you.</p>
+<a href="/auth/tailscale">Continue with Tailscale</a>
+<p>Tailscale Serve sends Tailscale-User-Login. No separate Tailscale app.</p>
+<a href="/auth/google">Continue with Google</a>
+<a href="/auth/github">Continue with GitHub</a>
+</main></body></html>"#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::Router;
+    use axum::body::Body;
+    use axum::routing::get;
+    use tower::ServiceExt;
+
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+    }
+
+    fn auth_router() -> Router {
+        Router::new()
+            .route("/auth", get(get_auth_page))
+            .route("/auth/tailscale", get(auth_tailscale))
+            .route("/auth/google", get(auth_google_start))
+            .route("/auth/github", get(auth_github_start))
+            .route("/auth/google/callback", get(auth_google_callback))
+            .route("/auth/github/callback", get(auth_github_callback))
+    }
+
+    async fn text_of(response: Response) -> String {
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("body");
+        String::from_utf8(bytes.to_vec()).expect("utf8")
+    }
+
+    fn session_cookie(response: &Response) -> Option<String> {
+        response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .find(|value| value.starts_with("aicx_session="))
+            .map(|value| {
+                value
+                    .trim_start_matches("aicx_session=")
+                    .split(';')
+                    .next()
+                    .unwrap_or("")
+                    .to_string()
+            })
+    }
+
+    #[test]
+    fn auth_routes_respond() {
+        runtime().block_on(async {
+            let app = auth_router();
+            let page = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri("/auth")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(page.status(), StatusCode::OK);
+            let html = text_of(page).await;
+            assert!(html.contains("/auth/tailscale"));
+            assert!(html.contains("/auth/google"));
+            assert!(html.contains("/auth/github"));
+            assert!(html.contains("Tailscale-User-Login"));
+
+            let missing = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri("/auth/tailscale")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
+            assert!(session_cookie(&missing).is_none());
+
+            let signed = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri("/auth/tailscale")
+                        .header("Tailscale-User-Login", "ada@example.com")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(signed.status(), StatusCode::FOUND);
+            let token = session_cookie(&signed).expect("signed session");
+            assert_eq!(
+                open_session(&token).as_deref(),
+                Some("tailscale:ada@example.com")
+            );
+
+            for path in ["/auth/google/callback", "/auth/github/callback"] {
+                let refused = app
+                    .clone()
+                    .oneshot(
+                        axum::http::Request::builder()
+                            .uri(path)
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+                assert!(session_cookie(&refused).is_none());
+            }
+        });
+    }
+
+    #[test]
+    fn failed_exchange_does_not_mint_a_session() {
+        let response = session_or_refuse(Err("no identity".to_string()));
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert!(session_cookie(&response).is_none());
+    }
+
+    #[test]
+    fn provider_identity_parsers_and_signed_cookie() {
+        assert_eq!(
+            google_identity(r#"{"email":"ada@example.com"}"#).as_deref(),
+            Some("google:ada@example.com")
+        );
+        assert_eq!(
+            github_identity(r#"{"login":"ada"}"#).as_deref(),
+            Some("github:ada")
+        );
+        assert!(google_identity("{}").is_none());
+        assert!(tailscale_identity("").is_none());
+        let token = sign_session("google:ada@example.com");
+        assert_eq!(
+            open_session(&token).as_deref(),
+            Some("google:ada@example.com")
+        );
+        assert!(open_session("v1.00.00").is_none());
+        let url = oauth_authorize_url(
+            "https://accounts.google.com/o/oauth2/v2/auth",
+            "client",
+            "https://host/auth/google/callback",
+            "openid email",
+            "state",
+        );
+        assert!(url.contains("client_id=client"));
+        assert!(url.contains("scope=openid%20email"));
+    }
+}
