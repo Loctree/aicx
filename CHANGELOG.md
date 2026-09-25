@@ -131,7 +131,9 @@ longer leaves its window on the baseline. `null` and `undefined` still ask for
 the default directory, and a `workdir:` in prose (not an object property)
 names nothing. A literal is read only when it is the whole value:
 `"/repos/vista" + "-private"` is an expression, so the call is unreadable
-evidence rather than `/repos/vista`. Only the whole property name is read, so
+evidence rather than `/repos/vista`. A comment between the operands changes
+nothing: `"/repos/vista" /* note */ + "-private"` is the same expression, and a
+block comment that never closes leaves the value unreadable. Only the whole property name is read, so
 `networkdir` and `fallback_workdir` are other properties. A Windows `workdir` rooted without a
 drive (`\repo\pkg`) now sits on the drive of the turn's cwd and matches
 `C:\repo`, instead of matching nothing.
@@ -169,7 +171,10 @@ the verdict, while scope attribution (report timeline, brief) still gives a
 conflict span no project. Verdicts also cut segments along this disk, so the
 canonical projection folds adjacent segments that record the same cwd and
 branch; a scope-only cut never reaches the fingerprint, and every existing
-golden fixture keeps its bytes.
+golden fixture keeps its bytes. `extract --brief` counts a span's
+`scope_root` next to the recorded cwds, as the session `ScopeStatus` does: a
+one-segment session launched in one checkout and re-scoped to another gets the
+multi-workstream header instead of reading as a single workstream.
 
 The verdicts derived from that resolution are cached, so the cache now knows
 what they depended on. The parse ledger records, per session, every working
