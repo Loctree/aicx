@@ -33,6 +33,7 @@ use crate::dashboard::{self, DashboardPayload, DashboardScope, DashboardStats};
 
 mod browse;
 mod cors;
+mod operator;
 mod search;
 use cors::dashboard_cors_middleware;
 pub use cors::{DashboardCorsPolicy, validate_dashboard_host_policy};
@@ -187,7 +188,13 @@ pub async fn run_dashboard_server(config: DashboardServerConfig) -> Result<()> {
         .route("/health", get(get_health))
         .route("/api/health", get(get_health))
         .route("/manifest.webmanifest", get(get_manifest))
-        .route("/service-worker.js", get(get_service_worker));
+        .route("/service-worker.js", get(get_service_worker))
+        .route("/auth", get(operator::get_auth_page))
+        .route("/auth/tailscale", get(operator::auth_tailscale))
+        .route("/auth/google", get(operator::auth_google_start))
+        .route("/auth/github", get(operator::auth_github_start))
+        .route("/auth/google/callback", get(operator::auth_google_callback))
+        .route("/auth/github/callback", get(operator::auth_github_callback));
 
     let api_router: Router<Arc<DashboardServerState>> = Router::new()
         .route("/api/status", get(get_status))
@@ -198,7 +205,12 @@ pub async fn run_dashboard_server(config: DashboardServerConfig) -> Result<()> {
         .route("/api/regenerate", post(regenerate_dashboard))
         .route("/api/search/semantic", get(search::get_semantic_search))
         .route("/api/search/cross", get(search::cross_search_gone))
-        .route("/api/search/steer", get(search::steer_search));
+        .route("/api/search/steer", get(search::steer_search))
+        .route(
+            "/api/phrases",
+            get(operator::get_phrases).put(operator::put_phrases),
+        )
+        .route("/api/index", post(operator::post_index));
 
     let api_router = auth::require_auth_layer(api_router, config.auth.clone());
 
@@ -444,8 +456,8 @@ async fn get_manifest() -> Response {
         "start_url": "/",
         "scope": "/",
         "display": "standalone",
-        "theme_color": "#0a0f19",
-        "background_color": "#0a0f19",
+        "theme_color": "#0e0e0e",
+        "background_color": "#0e0e0e",
         "icons": []
     });
     let body = serde_json::to_string_pretty(&manifest).unwrap_or_default();
@@ -472,7 +484,7 @@ self.addEventListener('fetch',e=>{const u=new URL(e.request.url);\
 if(u.pathname.startsWith('/api/')||u.pathname==='/service-worker.js')return;\
 e.respondWith(caches.match(e.request).then(r=>{if(r)return r;\
 return fetch(e.request).catch(()=>{if(e.request.mode==='navigate')\
-return new Response('<html><body style=\"background:#0a0f19;color:#e5e7eb;\
+return new Response('<html><body style=\"background:#0e0e0e;color:#f5f1e7;\
 font-family:system-ui;display:flex;align-items:center;justify-content:center;\
 height:100vh;margin:0\"><div style=\"text-align:center\"><h1>aicx archive not \
 reachable</h1><p>Start the server with <code>aicx dashboard --serve</code></p>\

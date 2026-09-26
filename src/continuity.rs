@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::Result;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 
 use crate::intents::{self, IntentKind, IntentRecord, IntentsConfig};
 
@@ -39,6 +39,11 @@ pub struct ContinuityPack {
     pub mixed_scope: Vec<crate::intents::MixedScopeSession>,
     /// Whether mixed candidates were distilled on explicit request.
     pub distilled_mixed: bool,
+    /// Copied from `extraction.stats.candidate_cap` in `build_with_scope`.
+    pub candidate_cap: usize,
+    /// Copied from `extraction.stats.dropped_candidates` in `build_with_scope`.
+    /// Zero means the cap was not reached.
+    pub dropped_candidates: usize,
 }
 
 pub struct SourceLine {
@@ -148,6 +153,8 @@ pub fn build_with_scope(
         index_health,
         mixed_scope,
         distilled_mixed: distill_mixed,
+        candidate_cap: extraction.stats.candidate_cap,
+        dropped_candidates: extraction.stats.dropped_candidates,
     })
 }
 
@@ -179,10 +186,17 @@ fn collect_sources(
         if !project_matches(entry.project.as_deref(), projects) {
             continue;
         }
+        let conversation_date = entry
+            .date
+            .as_deref()
+            .and_then(|date| NaiveDate::parse_from_str(date, "%Y-%m-%d").ok());
+        if conversation_date.is_some_and(|date| date < cutoff.date_naive()) {
+            continue;
+        }
         let mtime_ns = crate::catalog::live_source_fingerprint(Path::new(&entry.source_path))
             .map(|(_, mtime)| mtime)
             .or(entry.source_mtime_ns);
-        if mtime_ns.is_none_or(|mtime| mtime < cutoff_ns) {
+        if conversation_date.is_none() && mtime_ns.is_none_or(|mtime| mtime < cutoff_ns) {
             continue;
         }
         sources.push(SourceLine {
@@ -199,7 +213,16 @@ fn collect_sources(
             if !project_matches(entry.project.as_deref(), projects) {
                 continue;
             }
-            if entry.source_mtime_ns.is_none_or(|mtime| mtime < cutoff_ns) {
+            let conversation_date = entry
+                .date
+                .as_deref()
+                .and_then(|date| NaiveDate::parse_from_str(date, "%Y-%m-%d").ok());
+            if conversation_date.is_some_and(|date| date < cutoff.date_naive()) {
+                continue;
+            }
+            if conversation_date.is_none()
+                && entry.source_mtime_ns.is_none_or(|mtime| mtime < cutoff_ns)
+            {
                 continue;
             }
             sources.push(SourceLine {
@@ -264,6 +287,30 @@ fn collect_index_health(
     }
 }
 
+/// Facts the pack has, and the identities it does not. Printed before `## NOW`
+/// because inject truncation keeps the head.
+fn push_honesty_preface(out: &mut String, pack: &ContinuityPack) {
+    out.push_str("## HONESTY\n\n");
+    out.push_str("window: conversation date, else last frame if the catalog row is undated. File mtime does not admit a row.\n");
+    out.push_str("now: open means a live_open intent record whose conversation date is inside the window. No intent record under this stored session id is not proof the thread is absent.\n");
+    out.push_str("session: session id is printed as stored. A truncated session id is not a full thread identity.\n");
+    out.push_str("entity: project handle is printed as stored. Rename, alias, and split are not resolved on this card.\n");
+    out.push_str("labels: Decision, Intent, Outcome, and Task are classifier labels, not a confirmed operator decision (verification_state=not_verified_by_aicx). Turn role is not stored on the row.\n");
+    out.push_str("time: a later record does not retire an earlier one. An ever-immutable pin is not inferred here.\n");
+    if pack.dropped_candidates == 0 {
+        out.push_str(&format!(
+            "census: candidate cap {} not reached.\n",
+            pack.candidate_cap
+        ));
+    } else {
+        out.push_str(&format!(
+            "census: truncated. candidate cap {} reached; {} candidate(s) dropped. This is not a census.\n",
+            pack.candidate_cap, pack.dropped_candidates
+        ));
+    }
+    out.push('\n');
+}
+
 fn mtime_ns_to_rfc3339(mtime_ns: u64) -> Option<String> {
     DateTime::<Utc>::from_timestamp(
         (mtime_ns / 1_000_000_000) as i64,
@@ -280,8 +327,19 @@ pub fn render(pack: &ContinuityPack, for_inject: bool) -> String {
         pack.project_label, pack.hours
     ));
 
+    push_honesty_preface(&mut out, pack);
+
     // ── NOW: open sessions + unresolved human intent ─────────────────────
+    // Preface states the selection rule. It does not union truncated ids
+    // into one thread; that is a different cut.
     out.push_str("## NOW\n\n");
+    out.push_str(
+        "open means a live_open intent record whose conversation date is inside the window\n",
+    );
+    out.push_str(
+        "no intent record under this stored session id is not proof the thread is absent\n",
+    );
+    out.push_str("a truncated session id is not a full thread identity\n\n");
     let live_records: Vec<&IntentRecord> = pack
         .records
         .iter()
@@ -299,7 +357,7 @@ pub fn render(pack: &ContinuityPack, for_inject: bool) -> String {
     for ((agent, session), timestamp) in open_sessions.iter().take(NOW_CAP) {
         out.push_str(&format!(
             "- open: {agent} · {session} · {}\n",
-            timestamp.unwrap_or("mtime-only")
+            timestamp.unwrap_or("no conversation timestamp")
         ));
     }
     let unresolved = unresolved_intents(&pack.records);
@@ -437,7 +495,7 @@ pub fn render(pack: &ContinuityPack, for_inject: bool) -> String {
     out.push_str("## INDEX HEALTH\n\n");
     let health = &pack.index_health;
     out.push_str(&format!(
-        "- newest_session_updated: {}\n",
+        "- newest_source_file_mtime: {} (file touch, not conversation time)\n",
         health
             .newest_session_updated_at
             .as_deref()
@@ -493,11 +551,13 @@ fn unresolved_intents(records: &[IntentRecord]) -> Vec<&IntentRecord> {
 mod tests {
     use super::*;
     use std::fs;
+    use std::path::PathBuf;
 
-    #[test]
-    fn continuity_pack_renders_all_sections_deterministically() {
+    /// One transcript, one dated catalog row, primed live delta. Shared by the
+    /// section render and the real-path census test.
+    fn write_continuity_real_path_home(label: &str) -> (PathBuf, PathBuf) {
         let root = std::env::temp_dir().join(format!(
-            "aicx-continuity-{}-{}",
+            "aicx-continuity-{label}-{}-{}",
             std::process::id(),
             Utc::now().timestamp_nanos_opt().unwrap_or_default()
         ));
@@ -543,7 +603,35 @@ mod tests {
             cutoff_ns,
             crate::catalog::LiveDelta::default(),
         );
+        (root, source)
+    }
 
+    fn render_pack_with_census(candidate_cap: usize, dropped_candidates: usize) -> String {
+        let pack = ContinuityPack {
+            project_label: "Loctree/aicx".into(),
+            hours: 24,
+            live_sessions: 0,
+            records: Vec::new(),
+            sources: Vec::new(),
+            index_health: IndexHealthLine {
+                newest_session_updated_at: None,
+                committed_at: None,
+                pending: 0,
+                sessions_newer_than_chunks: 0,
+                readiness: "unknown".into(),
+                mode: "census",
+            },
+            mixed_scope: Vec::new(),
+            distilled_mixed: false,
+            candidate_cap,
+            dropped_candidates,
+        };
+        render(&pack, false)
+    }
+
+    #[test]
+    fn continuity_pack_renders_all_sections_deterministically() {
+        let (root, source) = write_continuity_real_path_home("sections");
         let projects = vec!["Loctree/aicx".to_string()];
         let pack = build(&root, &projects, 24).expect("build pack");
         let first = render(&pack, false);
@@ -551,6 +639,7 @@ mod tests {
 
         for heading in [
             "# CONTINUITY · Loctree/aicx · 24h",
+            "## HONESTY",
             "## NOW",
             "## PEERS",
             "## DECISIONS (closed)",
@@ -570,6 +659,50 @@ mod tests {
         );
         assert_eq!(first, second, "continuity pack must be deterministic");
 
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn continuity_honesty_preface_names_truncation_and_classifier() {
+        let open = render_pack_with_census(5_000, 0);
+        let truncated = render_pack_with_census(5_000, 3);
+        for rendered in [&open, &truncated] {
+            let honesty = rendered.find("## HONESTY").expect("honesty heading");
+            let now = rendered.find("## NOW").expect("now heading");
+            assert!(honesty < now, "preface must precede NOW:\n{rendered}");
+            for line in [
+                "window: conversation date, else last frame if the catalog row is undated. File mtime does not admit a row.",
+                "now: open means a live_open intent record whose conversation date is inside the window. No intent record under this stored session id is not proof the thread is absent.",
+                "session: session id is printed as stored. A truncated session id is not a full thread identity.",
+                "entity: project handle is printed as stored. Rename, alias, and split are not resolved on this card.",
+                "labels: Decision, Intent, Outcome, and Task are classifier labels, not a confirmed operator decision (verification_state=not_verified_by_aicx). Turn role is not stored on the row.",
+                "time: a later record does not retire an earlier one. An ever-immutable pin is not inferred here.",
+            ] {
+                assert!(rendered.contains(line), "missing preface line: {line}");
+            }
+        }
+        assert!(open.contains("census: candidate cap 5000 not reached."));
+        assert!(!open.contains("This is not a census"));
+        assert!(truncated.contains(
+            "census: truncated. candidate cap 5000 reached; 3 candidate(s) dropped. This is not a census."
+        ));
+        assert!(!truncated.contains("not reached"));
+    }
+
+    #[test]
+    fn continuity_build_prints_census_from_real_path() {
+        let (root, _source) = write_continuity_real_path_home("census");
+        let projects = vec!["Loctree/aicx".to_string()];
+        let pack = build(&root, &projects, 24).expect("build pack");
+        let rendered = render(&pack, false);
+        assert!(
+            rendered.contains("census:"),
+            "missing census line:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("not reached"),
+            "small home must stay under the candidate cap:\n{rendered}"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -607,10 +740,124 @@ mod tests {
             },
             mixed_scope: Vec::new(),
             distilled_mixed: false,
+            candidate_cap: 5_000,
+            dropped_candidates: 0,
         };
         let rendered = render(&pack, false);
         assert!(rendered.contains("open: claude · hot-open"));
         assert!(!rendered.contains("warning: chunk lag"));
+    }
+
+    #[test]
+    fn continuity_now_states_live_open_rule() {
+        let pack = ContinuityPack {
+            project_label: "vetcoders/vibecrafted".into(),
+            hours: 24,
+            live_sessions: 2,
+            records: vec![
+                crate::intents::IntentRecord {
+                    kind: IntentKind::Intent,
+                    summary: "keep live window independent of census".into(),
+                    context: None,
+                    evidence: Vec::new(),
+                    project: "vetcoders/vibecrafted".into(),
+                    agent: "claude".into(),
+                    date: "2026-08-13".into(),
+                    timestamp: Some("2026-08-13T02:00:00Z".into()),
+                    session_id: "hot-open".into(),
+                    count: None,
+                    first_chunk: None,
+                    last_chunk: None,
+                    source_chunk: "sess.jsonl".into(),
+                    source: None,
+                    honesty: crate::oracle::ClaimHonesty::live_open(),
+                },
+                crate::intents::IntentRecord {
+                    kind: IntentKind::Intent,
+                    summary: "open row whose conversation date was not stored".into(),
+                    context: None,
+                    evidence: Vec::new(),
+                    project: "vetcoders/vibecrafted".into(),
+                    agent: "claude".into(),
+                    date: "2026-08-13".into(),
+                    timestamp: None,
+                    session_id: "open-no-ts".into(),
+                    count: None,
+                    first_chunk: None,
+                    last_chunk: None,
+                    source_chunk: "sess-no-ts.jsonl".into(),
+                    source: None,
+                    honesty: crate::oracle::ClaimHonesty::live_open(),
+                },
+                crate::intents::IntentRecord {
+                    kind: IntentKind::Intent,
+                    summary: "canonical claim is not an open session".into(),
+                    context: None,
+                    evidence: Vec::new(),
+                    project: "vetcoders/vibecrafted".into(),
+                    agent: "codex".into(),
+                    date: "2026-08-01".into(),
+                    timestamp: Some("2026-08-01T00:00:00Z".into()),
+                    session_id: "canonical-closed".into(),
+                    count: None,
+                    first_chunk: None,
+                    last_chunk: None,
+                    source_chunk: "canonical.jsonl".into(),
+                    source: None,
+                    honesty: crate::oracle::ClaimHonesty::canonical(),
+                },
+            ],
+            sources: Vec::new(),
+            index_health: IndexHealthLine {
+                newest_session_updated_at: Some("2026-08-13T02:00:00Z".into()),
+                committed_at: None,
+                pending: 0,
+                sessions_newer_than_chunks: 0,
+                readiness: "ready".into(),
+                mode: "live",
+            },
+            mixed_scope: Vec::new(),
+            distilled_mixed: false,
+            candidate_cap: 5_000,
+            dropped_candidates: 0,
+        };
+        let rendered = render(&pack, false);
+        for sentence in [
+            "open means a live_open intent record whose conversation date is inside the window",
+            "no intent record under this stored session id is not proof the thread is absent",
+            "a truncated session id is not a full thread identity",
+        ] {
+            assert!(
+                rendered.contains(sentence),
+                "missing {sentence} in:\n{rendered}"
+            );
+        }
+        let open_lines: Vec<&str> = rendered
+            .lines()
+            .filter(|line| line.starts_with("- open:"))
+            .collect();
+        assert!(
+            open_lines
+                .iter()
+                .any(|line| line.contains("claude · hot-open · 2026-08-13T02:00:00Z")),
+            "live_open row missing: {open_lines:?}"
+        );
+        assert!(
+            open_lines
+                .iter()
+                .any(|line| line.contains("claude · open-no-ts · no conversation timestamp")),
+            "missing conversation date must say so: {open_lines:?}"
+        );
+        assert!(
+            rendered.contains("canonical-closed"),
+            "canonical record was not rendered at all:\n{rendered}"
+        );
+        assert!(
+            open_lines
+                .iter()
+                .all(|line| !line.contains("canonical-closed")),
+            "canonical record leaked under - open:: {open_lines:?}"
+        );
     }
 
     #[test]
@@ -631,10 +878,43 @@ mod tests {
             },
             mixed_scope: Vec::new(),
             distilled_mixed: false,
+            candidate_cap: 5_000,
+            dropped_candidates: 0,
         };
         let rendered = render(&pack, false);
-        assert!(rendered.contains("newest_session_updated: 2026-08-13T01:48:00Z"));
+        assert!(rendered.contains(
+            "newest_source_file_mtime: 2026-08-13T01:48:00Z (file touch, not conversation time)"
+        ));
         assert!(rendered.contains("warning: chunk lag (pending=631"));
         assert!(rendered.contains("aicx catalog rebuild --with-chunks"));
+    }
+
+    #[test]
+    fn continuity_index_health_names_source_file_mtime() {
+        let pack = ContinuityPack {
+            project_label: "vetcoders/vibecrafted".into(),
+            hours: 24,
+            live_sessions: 1,
+            records: Vec::new(),
+            sources: Vec::new(),
+            index_health: IndexHealthLine {
+                newest_session_updated_at: Some("2026-09-21T03:30:00Z".into()),
+                committed_at: None,
+                pending: 0,
+                sessions_newer_than_chunks: 0,
+                readiness: "ready".into(),
+                mode: "live",
+            },
+            mixed_scope: Vec::new(),
+            distilled_mixed: false,
+            candidate_cap: 5_000,
+            dropped_candidates: 0,
+        };
+        let rendered = render(&pack, false);
+        assert!(rendered.contains(
+            "newest_source_file_mtime: 2026-09-21T03:30:00Z (file touch, not conversation time)"
+        ));
+        assert!(rendered.contains("newest_source_file_mtime"));
+        assert!(rendered.contains("file touch, not conversation time"));
     }
 }

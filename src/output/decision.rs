@@ -1,22 +1,17 @@
-/// Keywords that signal an important decision or architectural note.
-const DECISION_KEYWORDS: &[&str] = &[
-    "decision:",
-    "plan:",
-    "architecture",
-    "BREAKING",
-    "TODO:",
-    "FIXME:",
-];
+fn decision_keywords() -> &'static [&'static str] {
+    crate::parser::intent_phrases::phrases().decision_output
+}
 
-/// Case-sensitive keywords (checked without lowercasing).
-const DECISION_KEYWORDS_CASE_SENSITIVE: &[&str] = &["WAŻNE", "KEY"];
+fn decision_keywords_case_sensitive() -> &'static [&'static str] {
+    crate::parser::intent_phrases::phrases().decision_output_case_sensitive
+}
 
 pub(crate) fn is_decision_message(message: &str) -> bool {
     let lower = message.to_lowercase();
-    DECISION_KEYWORDS
+    decision_keywords()
         .iter()
         .any(|kw| lower.contains(&kw.to_lowercase()))
-        || DECISION_KEYWORDS_CASE_SENSITIVE
+        || decision_keywords_case_sensitive()
             .iter()
             .any(|kw| message.contains(kw))
 }

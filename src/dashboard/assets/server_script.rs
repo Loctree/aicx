@@ -438,9 +438,44 @@ pub(crate) const DASHBOARD_SERVER_SCRIPT: &str = r#"
     } catch (_) {}
   };
 
+  const studio = () => {
+    const onboard = $('ctx-onboarding');
+    const dismiss = $('ctx-onboarding-dismiss');
+    try {
+      if (localStorage.getItem('aicx_onboarding_dismissed') === '1' && onboard) onboard.open = false;
+    } catch (_) {}
+    if (dismiss) dismiss.addEventListener('click', () => {
+      if (onboard) onboard.open = false;
+      try { localStorage.setItem('aicx_onboarding_dismissed', '1'); } catch (_) {}
+    });
+    const phrases = $('ctx-phrases');
+    const phraseStatus = $('ctx-phrases-status');
+    const phraseSave = $('ctx-phrases-save');
+    if (phrases) {
+      apiFetch('/api/phrases').then((r) => r.text()).then((text) => { phrases.value = text; }).catch(() => {});
+    }
+    if (phraseSave && phrases) phraseSave.addEventListener('click', () => {
+      apiFetch('/api/phrases', { method: 'PUT', body: phrases.value, headers: { 'content-type': 'text/plain', 'x-ai-contexters-action': 'regenerate' } })
+        .then((r) => r.json())
+        .then((body) => { if (phraseStatus) phraseStatus.textContent = body.ok ? 'Saved.' : (body.detail || 'Not saved.'); })
+        .catch(() => { if (phraseStatus) phraseStatus.textContent = 'Not saved.'; });
+    });
+    const indexBtn = $('ctx-index');
+    const indexStatus = $('ctx-index-status');
+    if (indexBtn) indexBtn.addEventListener('click', () => {
+      indexBtn.disabled = true;
+      if (indexStatus) indexStatus.textContent = 'Indexing…';
+      apiFetch('/api/index', { method: 'POST', headers: { 'x-ai-contexters-action': 'regenerate' } })
+        .then((r) => { if (indexStatus) indexStatus.textContent = r.status === 202 ? 'Index started.' : 'Index was refused.'; })
+        .catch(() => { if (indexStatus) indexStatus.textContent = 'Index was refused.'; })
+        .finally(() => { indexBtn.disabled = false; });
+    });
+  };
+
   const boot = () => {
     readUrlState();
     consumeQueryToken();
+    studio();
     const headers = {};
     const t = getToken();
     if (t) headers['Authorization'] = 'Bearer ' + t;

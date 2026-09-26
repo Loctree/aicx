@@ -210,6 +210,11 @@ fn server_shell_includes_highlight_styles_and_wiring() {
     assert!(html.contains(".result-preview {"));
     assert!(html.contains("preview.className = 'result-preview';"));
     assert!(html.contains("preview.innerHTML = highlightTerms(truncated, state.query);"));
+    assert!(html.contains("id=\"ctx-onboarding\""));
+    assert!(html.contains("id=\"ctx-phrases\""));
+    assert!(html.contains("id=\"ctx-index\""));
+    assert!(html.contains("aicx_onboarding_dismissed"));
+    assert!(html.contains("theme-color\" content=\"#0e0e0e\""));
 }
 
 #[test]
@@ -548,4 +553,6 @@ fn test_inline_markdown_quote_break_attempt_does_not_inject_attribute() {
 fn test_render_server_shell_html_contains_csp_meta() {
     let html = render_server_shell_html("test");
     assert!(html.contains("<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; base-uri 'none'; frame-ancestors 'none'; form-action 'none';\">"));
+    assert!(html.contains("id=\"aicx-mark\""));
+    assert!(html.contains("aria-label=\"Loctree\""));
 }

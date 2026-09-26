@@ -10,11 +10,11 @@ use std::path::PathBuf;
 fn catalog_rebuild_does_not_clear_hot_live_stamp() {
     assert!(
         session_is_hot_live(true, true),
-        "mtime-in-window sessions stay live after census fingerprints match"
+        "conversation-in-window sessions stay live after census fingerprints match"
     );
     assert!(
         !session_is_hot_live(true, false),
-        "cold mtime must not be stamped live"
+        "stale conversation must not be stamped live because a file was touched"
     );
     assert!(
         !session_is_hot_live(false, true),
@@ -212,7 +212,7 @@ fn markdown_separates_live_open_claims_from_closed_timeline() {
 
 #[test]
 #[cfg(feature = "app")]
-fn live_window_admits_fresh_mtime_rows_and_unadmitted_sessions() {
+fn live_window_rejects_stale_dated_touched_files_and_keeps_unadmitted() {
     let root = migration_test_root("live-window");
     let _ = fs::remove_dir_all(&root);
 
@@ -316,18 +316,19 @@ fn live_window_admits_fresh_mtime_rows_and_unadmitted_sessions() {
         closed.records
     );
 
-    // Live window: both rows admitted, both stamped with the open frame.
+    // Live window: touching an old dated transcript must not mint NOW.
+    // An undated unadmitted session with a fresh last frame still enters.
     let live = extract_intents_from_root_at_with_stats(&config(true), &root, Utc::now())
         .expect("extract with live window");
-    assert_eq!(live.stats.live_sessions, 2);
+    assert_eq!(live.stats.live_sessions, 1);
     let summaries: Vec<&str> = live
         .records
         .iter()
         .map(|record| record.summary.as_str())
         .collect();
     assert!(
-        summaries.iter().any(|s| s.contains("stale-dated row")),
-        "stale-dated fresh-mtime row missing: {summaries:?}"
+        summaries.iter().all(|s| !s.contains("stale-dated row")),
+        "stale-dated fresh-mtime row leaked into the live window: {summaries:?}"
     );
     assert!(
         summaries.iter().any(|s| s.contains("unadmitted session")),
