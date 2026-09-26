@@ -195,7 +195,9 @@ impl RepoPathIgnoreMatcher {
     #[cfg(any(feature = "app", test))]
     pub(crate) fn fingerprint(&self) -> String {
         let mut hasher = Sha256::new();
-        hasher.update(b"aicx.repo_path_ignore.v3\0");
+        // The version names the matching rules too: v4 compares Windows drive
+        // paths without regard to case, so content filtered under v3 re-runs.
+        hasher.update(b"aicx.repo_path_ignore.v4\0");
         for prefix in &self.prefixes {
             hasher.update(prefix.as_bytes());
             hasher.update([0]);
@@ -256,8 +258,31 @@ impl RepoPathIgnoreMatcher {
         self.prefixes
             .iter()
             .chain(self.canonical_prefixes.iter())
-            .any(|prefix| value == prefix || value.starts_with(&format!("{prefix}/")))
+            .any(|prefix| path_is_within(value, prefix))
     }
+}
+
+/// `value` is `prefix` or lives under it.
+///
+/// A Windows drive path compares without regard to case, as Windows resolves
+/// it: `c:/users/dev/private` is the checkout a `C:\Users\Dev\private` rule
+/// denies. Canonicalization cannot close that gap for a checkout that is gone
+/// or for a Windows rollout read on another OS, and a workdir the model typed
+/// into a tool call is spelled however the model spelled it. Folding more than
+/// Windows would (a Unicode lowercase, not its upcase table) can only deny
+/// more, which is the side a deny list fails on.
+fn path_is_within(value: &str, prefix: &str) -> bool {
+    if is_windows_drive_path(prefix) {
+        let (value, prefix) = (value.to_lowercase(), prefix.to_lowercase());
+        return value == prefix || value.starts_with(&format!("{prefix}/"));
+    }
+    value == prefix || value.starts_with(&format!("{prefix}/"))
+}
+
+/// `D:\work\private` or `D:/work/private` — a drive letter and its colon.
+fn is_windows_drive_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
 }
 
 /// Load `$AICX_HOME/.aicxignore` and interpret full-path / `~/…` lines as
@@ -333,8 +358,7 @@ fn is_repo_path_pattern(pattern: &str) -> bool {
         return true;
     }
     // Windows drive: `D:\work\private`
-    let bytes = pattern.as_bytes();
-    bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
+    pattern.len() >= 3 && is_windows_drive_path(pattern)
 }
 
 fn contains_glob_meta(pattern: &str) -> bool {
@@ -592,6 +616,41 @@ mod tests {
         write_ignore(&aicx_home, &format!("{}/\n", private.display()));
         let deduplicated = load_repo_path_ignore(&aicx_home, &user_home).unwrap();
         assert_eq!(first, deduplicated.fingerprint());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Finding: a Windows rule and a cwd that differ only in case were
+    /// compared byte for byte. Canonicalization cannot rescue a checkout that
+    /// is gone or a Windows rollout read on another OS, so frames from the
+    /// denied checkout stayed in extracts and in the published index.
+    #[test]
+    fn a_windows_rule_denies_its_checkout_in_any_case() {
+        let root = std::env::temp_dir().join(format!(
+            "aicx-ignore-windows-case-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let aicx_home = root.join(".aicx");
+        let user_home = root.join("user");
+        write_ignore(&aicx_home, "C:\\Users\\Dev\\private\n");
+        let ignore = load_repo_path_ignore(&aicx_home, &user_home).unwrap();
+        for cwd in [
+            r"C:\Users\Dev\private",
+            r"c:\users\dev\private",
+            "c:/USERS/dev/Private/crate",
+        ] {
+            assert!(ignore.ignores_cwd(Some(cwd)), "{cwd}");
+        }
+        // Still boundary-aware in any case, and a Unix rule keeps its case.
+        assert!(!ignore.ignores_cwd(Some(r"c:\users\dev\private-sibling")));
+        write_ignore(&aicx_home, "/repos/Private\n");
+        let unix = load_repo_path_ignore(&aicx_home, &user_home).unwrap();
+        assert!(unix.ignores_cwd(Some("/repos/Private/crate")));
+        assert!(!unix.ignores_cwd(Some("/repos/private")));
         let _ = fs::remove_dir_all(&root);
     }
 
