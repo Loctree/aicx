@@ -260,6 +260,12 @@ pub struct MixedScopeSession {
     pub session_id: String,
     pub cwds: Vec<String>,
     pub branches: Vec<String>,
+    /// Frames of the session in a proven workdir conflict.
+    pub conflicts: usize,
+    /// Scopes `.aicxignore` hid from this view: counted, never named.
+    pub hidden_scopes: usize,
+    /// The session's structural status as its scope report saw it.
+    pub status: aicx_parser::engine::ScopeStatus,
 }
 
 impl MixedScopeSession {

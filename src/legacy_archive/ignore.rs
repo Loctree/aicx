@@ -2,7 +2,9 @@ use anyhow::{Context, Result};
 use globset::{Glob, GlobMatcher};
 #[cfg(any(feature = "app", test))]
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use crate::sanitize;
 
@@ -162,6 +164,23 @@ where
 pub struct RepoPathIgnoreMatcher {
     user_home: PathBuf,
     prefixes: Vec<String>,
+    /// Canonical spelling of every prefix that resolves on this host.
+    ///
+    /// Scope normalization stamps frames with the CANONICAL repo root, so a
+    /// deny list written the way the operator types it (`/var/...`, or any
+    /// checkout reached through a symlink) would otherwise never match the
+    /// frame it is meant to hide.
+    canonical_prefixes: Vec<String>,
+    /// `fs::canonicalize` results for incoming cwds, for the lifetime of this
+    /// matcher.
+    ///
+    /// The reverse direction of `canonical_prefixes` cannot be precomputed —
+    /// a symlink's pre-images are not enumerable — so a frame spelled through
+    /// a symlink has to be resolved here. Frames repeat cwds heavily, so this
+    /// makes the cost one resolution per distinct cwd instead of one per
+    /// frame. A matcher is loaded per operation, which is also the window in
+    /// which a retargeted symlink could make a memoized answer stale.
+    canonical_cwds: Arc<Mutex<HashMap<String, Option<String>>>>,
 }
 
 impl RepoPathIgnoreMatcher {
@@ -176,8 +195,18 @@ impl RepoPathIgnoreMatcher {
     #[cfg(any(feature = "app", test))]
     pub(crate) fn fingerprint(&self) -> String {
         let mut hasher = Sha256::new();
-        hasher.update(b"aicx.repo_path_ignore.v1\0");
+        hasher.update(b"aicx.repo_path_ignore.v3\0");
         for prefix in &self.prefixes {
+            hasher.update(prefix.as_bytes());
+            hasher.update([0]);
+        }
+        // Matching depends on the RESOLVED targets too, so identity must.
+        // Retargeting a symlink changes which checkout a rule denies while
+        // the rule's literal spelling is untouched; hashing only the spelling
+        // let a cache built under the old target be reused under the new one,
+        // republishing content the rule now hides.
+        hasher.update(b"canonical\0");
+        for prefix in &self.canonical_prefixes {
             hasher.update(prefix.as_bytes());
             hasher.update([0]);
         }
@@ -185,6 +214,11 @@ impl RepoPathIgnoreMatcher {
     }
 
     /// True when `cwd` is the listed path or lives under it.
+    ///
+    /// Compared in every spelling both sides can produce. Privacy is the one
+    /// place that must fail CLOSED: an incoming cwd already rewritten to its
+    /// canonical repo root still has to hit a prefix the operator wrote in the
+    /// pre-symlink spelling, so a miss in one form is not an answer.
     pub fn ignores_cwd(&self, cwd: Option<&str>) -> bool {
         let Some(cwd) = cwd.map(str::trim).filter(|value| !value.is_empty()) else {
             return false;
@@ -192,10 +226,37 @@ impl RepoPathIgnoreMatcher {
         if self.prefixes.is_empty() {
             return false;
         }
-        let normalized = normalize_cwd_display(&expand_tilde(cwd, &self.user_home));
+        let expanded = expand_tilde(cwd, &self.user_home);
+        let literal = normalize_cwd_display(&expanded);
+        if self.matches_any_prefix(&literal) {
+            return true;
+        }
+        // Only a literal miss is worth a filesystem question, and only once
+        // per distinct cwd: see `canonical_cwds`.
+        match self.canonical_cwd(&expanded) {
+            Some(canonical) if canonical != literal => self.matches_any_prefix(&canonical),
+            _ => false,
+        }
+    }
+
+    fn canonical_cwd(&self, expanded: &str) -> Option<String> {
+        if let Ok(memo) = self.canonical_cwds.lock()
+            && let Some(hit) = memo.get(expanded)
+        {
+            return hit.clone();
+        }
+        let resolved = canonical_cwd_display(expanded);
+        if let Ok(mut memo) = self.canonical_cwds.lock() {
+            memo.insert(expanded.to_owned(), resolved.clone());
+        }
+        resolved
+    }
+
+    fn matches_any_prefix(&self, value: &str) -> bool {
         self.prefixes
             .iter()
-            .any(|prefix| normalized == *prefix || normalized.starts_with(&format!("{prefix}/")))
+            .chain(self.canonical_prefixes.iter())
+            .any(|prefix| value == prefix || value.starts_with(&format!("{prefix}/")))
     }
 }
 
@@ -207,6 +268,8 @@ pub fn load_repo_path_ignore(aicx_home: &Path, user_home: &Path) -> Result<RepoP
         return Ok(RepoPathIgnoreMatcher {
             user_home: user_home.to_path_buf(),
             prefixes: Vec::new(),
+            canonical_prefixes: Vec::new(),
+            canonical_cwds: Arc::default(),
         });
     }
 
@@ -236,11 +299,32 @@ pub fn load_repo_path_ignore(aicx_home: &Path, user_home: &Path) -> Result<RepoP
     }
     prefixes.sort();
     prefixes.dedup();
+    // Resolved once at load time: the deny list is small, and a rule written
+    // in the operator's spelling has to match a frame already stamped with
+    // the canonical repo root.
+    let mut canonical_prefixes: Vec<String> = prefixes
+        .iter()
+        .filter_map(|prefix| canonical_cwd_display(prefix))
+        .filter(|canonical| !prefixes.contains(canonical))
+        .collect();
+    canonical_prefixes.sort();
+    canonical_prefixes.dedup();
 
     Ok(RepoPathIgnoreMatcher {
         user_home: user_home.to_path_buf(),
         prefixes,
+        canonical_prefixes,
+        canonical_cwds: Arc::default(),
     })
+}
+
+/// Canonical spelling of an existing path, in the same display normalization
+/// the prefixes use. `None` when the path is gone from this host, which is not
+/// an error: the literal comparison still stands on its own.
+fn canonical_cwd_display(path: &str) -> Option<String> {
+    std::fs::canonicalize(path.trim())
+        .ok()
+        .map(|resolved| normalize_cwd_display(&resolved.to_string_lossy()))
 }
 
 fn is_repo_path_pattern(pattern: &str) -> bool {
@@ -284,6 +368,165 @@ mod tests {
     fn write_ignore(home: &Path, body: &str) {
         fs::create_dir_all(home).unwrap();
         fs::write(home.join(AICX_IGNORE_FILENAME), body).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn scratch(label: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "aicx-ignore-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        root
+    }
+
+    /// Finding: the fingerprint drives cache and index invalidation but
+    /// hashed only the literal rule spelling, while matching also depends on
+    /// where those rules RESOLVE. Retargeting a symlink changes which
+    /// checkout is denied without touching `.aicxignore`, so an unchanged
+    /// fingerprint let `aicx index` reuse content filtered under the old
+    /// target and republish what the rule now hides.
+    #[cfg(unix)]
+    #[test]
+    fn retargeting_a_denied_symlink_changes_the_deny_list_identity() {
+        let root = scratch("fingerprint-retarget");
+        let aicx_home = root.join(".aicx");
+        let user_home = root.join("user");
+        fs::create_dir_all(root.join("alpha")).unwrap();
+        fs::create_dir_all(root.join("beta")).unwrap();
+        let link = root.join("prywatne");
+        std::os::unix::fs::symlink(root.join("alpha"), &link).unwrap();
+
+        // The rule text never changes across this test.
+        write_ignore(&aicx_home, &format!("{}\n", link.display()));
+
+        let before = load_repo_path_ignore(&aicx_home, &user_home)
+            .unwrap()
+            .fingerprint();
+        assert!(
+            load_repo_path_ignore(&aicx_home, &user_home)
+                .unwrap()
+                .ignores_cwd(Some(
+                    &fs::canonicalize(root.join("alpha"))
+                        .unwrap()
+                        .to_string_lossy()
+                )),
+            "the rule denies alpha while the link points at it"
+        );
+
+        fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(root.join("beta"), &link).unwrap();
+
+        let after = load_repo_path_ignore(&aicx_home, &user_home).unwrap();
+        assert!(
+            after.ignores_cwd(Some(
+                &fs::canonicalize(root.join("beta"))
+                    .unwrap()
+                    .to_string_lossy()
+            )),
+            "and denies beta once the link points there"
+        );
+        assert_ne!(
+            before,
+            after.fingerprint(),
+            "a deny list that now hides a different checkout is a different deny list"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Finding: `ignores_cwd` canonicalized every incoming cwd, so a large
+    /// history paid one filesystem resolution per signal frame — while the
+    /// loader claimed the per-frame check was free of filesystem work.
+    ///
+    /// Resolution is now lazy (a literal hit never asks) and memoized per
+    /// distinct cwd. Observed here by removing the symlink between two calls:
+    /// only a memoized answer can survive its target disappearing.
+    #[cfg(unix)]
+    #[test]
+    fn an_incoming_cwd_is_resolved_at_most_once() {
+        let root = scratch("canonicalize-once");
+        let aicx_home = root.join(".aicx");
+        let user_home = root.join("user");
+        let real = root.join("real").join("prywatne");
+        fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(root.join("real"), root.join("link")).unwrap();
+
+        // Rule in canonical spelling, frame spelled through the symlink: the
+        // one direction that cannot be precomputed at load time.
+        let canonical_rule = fs::canonicalize(&real).unwrap();
+        write_ignore(&aicx_home, &format!("{}\n", canonical_rule.display()));
+        let ignore = load_repo_path_ignore(&aicx_home, &user_home).unwrap();
+
+        let through_link = root.join("link").join("prywatne");
+        let through_link = through_link.to_string_lossy().into_owned();
+        assert!(
+            ignore.ignores_cwd(Some(&through_link)),
+            "a symlinked spelling of a denied checkout must be denied"
+        );
+
+        fs::remove_file(root.join("link")).unwrap();
+        assert!(
+            ignore.ignores_cwd(Some(&through_link)),
+            "the second answer must come from the memo, not the filesystem"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Scope normalization stamps frames with the CANONICAL repo root. A deny
+    /// list naming the same checkout through a symlink must still hide it —
+    /// otherwise the private repository reaches extracts, index and intents.
+    #[cfg(unix)]
+    #[test]
+    fn a_denied_checkout_stays_denied_under_its_canonical_spelling() {
+        let root = std::env::temp_dir().join(format!(
+            "aicx-ignore-symlink-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let aicx_home = root.join(".aicx");
+        let user_home = root.join("user");
+        let real_checkout = root.join("real").join("prywatne");
+        fs::create_dir_all(&real_checkout).unwrap();
+        std::os::unix::fs::symlink(root.join("real"), root.join("link")).unwrap();
+
+        // The operator writes the path they see; the frame carries the path
+        // the repo-identity pass resolved it to.
+        write_ignore(
+            &aicx_home,
+            &format!("{}\n", root.join("link").join("prywatne").display()),
+        );
+        let ignore = load_repo_path_ignore(&aicx_home, &user_home).unwrap();
+        let stamped = fs::canonicalize(&real_checkout).unwrap();
+
+        assert!(
+            ignore.ignores_cwd(Some(&stamped.to_string_lossy())),
+            "canonical spelling of a denied checkout must still be denied"
+        );
+        assert!(
+            ignore.ignores_cwd(Some(&stamped.join("src").to_string_lossy())),
+            "and so must everything under it"
+        );
+        assert!(
+            !ignore.ignores_cwd(Some(
+                &fs::canonicalize(&root)
+                    .unwrap()
+                    .join("real")
+                    .to_string_lossy()
+            )),
+            "resolving spellings must not widen the rule to the parent"
+        );
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

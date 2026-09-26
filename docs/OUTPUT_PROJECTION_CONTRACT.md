@@ -15,7 +15,29 @@ away:
 | `SessionModel::snapshot` | `SourceSnapshotRef { path, content_hash, bytes, observed_at, cutoff }` | Names the bytes. Same hash = identical bytes, never "same event"; an appended turn changes it without a fork. `PackageIdentity` is this pair, not a conversation id. |
 | `Turn::frame_class` → `TimelineEntry::frame_class` | `Option<FrameClass>` | `ProjectionKind::from_frame_class` decides the kind; `--dialog` reveals `EchoSeal` by class, `--kind inter_agent` selects `InterAgent` by class, `LineageMeta` is not `Inject`. The role / `frame_kind` bridge in `conversation.rs` is the fallback for class-less entries only (store chunks, importers, lanes the throne does not own). |
 | `SessionModel::context_epochs` | `Vec<ContextEpochRef>` | A compaction is an epoch of the same conversation (summary provenance + replaced refs + trigger), never a second source in `--lineage`. |
-| `Segment::scope_status` / `SessionModel::scope_status()` | `homogeneous \| mixed_candidate \| unknown` | Structural only (distinct cwds / branch drift). A `mixed_candidate` makes `continuity` refuse a single distilled history (`RefusalReason::MixedWorkstream`) unless `distill_mixed` is passed; `intents` records from such sessions carry a `scope_status=mixed_candidate …` evidence line. Topic-level mixing inside one cwd is not detected and is not guessed. |
+| `Segment::scope_status` / `SessionModel::scope_status()` | `no_drift_observed \| mixed_candidate \| unattributed \| unknown` | Structural only (distinct cwds / branch drift / explicit tool-call workdirs). The session value joins every segment's verdict with the cross-segment evidence, and counts a segment's `scope_root` as cwd evidence next to its recorded `cwd`: a session launched in one checkout that worked in another is `mixed_candidate`, not `no_drift_observed`. In the join `unattributed` outranks `mixed_candidate`, so branch drift never hides unplaceable evidence. `continuity` refuses a single distilled history (`RefusalReason::MixedWorkstream`) only when the session proves more than one scope — a workdir conflict, a scope hidden by `.aicxignore`, or cwds that name more than one repository — unless `distill_mixed` is passed. That repository count fails open: a cwd that no longer exists is not a second repository while a checkout that plausibly contains it was observed. The window is refused whenever no record from a single-scope session is left, also when the intents filters had already removed every frame of the mixed sessions. A branch switch inside one checkout, or a `cd` into a subdirectory of it, is `mixed_candidate` and is still distilled. `intents` records from `mixed_candidate` sessions carry a `scope_status=mixed_candidate …` evidence line. Topic-level mixing inside one cwd is not detected and is not guessed. |
+| `Segment::scope_root` | `Option<String>` | The repo identity a span's explicit tool-call workdirs resolved to **on the reading host**. Deliberately NOT in the canonical projection: resolution reads the local filesystem, so folding it into `Segment::cwd` gave identical source bytes different canonical fingerprints per machine. Consumers that want the resolved bucket read this and fall back to the recorded `cwd`. |
+| `Segment::scope_conflict` | `bool` | The span's workdirs proved two repository identities **on the reading host**. The recorded `cwd` stays on the segment — it is what the rollout said, and the canonical fingerprint is built from it — while the report timeline serves a conflict span no `cwd` and the brief heads it "(scope conflict)", so it is never filed under either project. Out of the canonical projection for the same reason as `scope_root`; adjacent segments that differ only by such a host-derived cut fold back into one there. |
+| `Segment::scope_workdirs` | `Vec<String>` | The explicit tool-call workdirs the span's turn windows recorded, joined onto the recorded baseline and lexically normalized — no filesystem access, whatever the verdict. Filter input: `.aicxignore` judges a frame on every one of them and, whenever the verdict took the recorded cwd out of the served `cwd` (re-scope or conflict), on that cwd too. `TimelineEntry::scope_workdirs` carries the same list and is never serialized. Spans merged into one segment share the union, which can over-hide a neighbouring frame: fail closed on purpose. Not in the canonical projection. |
+
+### Scope grammar (`aicx.parser.session_model.v2`)
+
+`ScopeStatus` is a closed enum on the wire, so every value it can take is
+listed here and a contract test
+(`crates/aicx-parser/tests/normative_contract.rs`) fails the build when this
+document and `ScopeStatus::ALL` disagree:
+
+| Value | Meaning |
+|---|---|
+| `no_drift_observed` | One known cwd, no observed branch drift. Not proof of a single workstream — absence of drift evidence is not evidence of homogeneity. |
+| `mixed_candidate` | Several cwds and/or branches inside the span, or a scope that is hidden from this view. A candidate, not a verdict. |
+| `unattributed` | Explicit scope evidence exists but does not resolve to a repository here, or could not be read at all (an over-cap or malformed tool-call record). Never a positive attribution and never proof of divergence; such a span inherits no project bucket. |
+| `unknown` | No cwd/branch evidence at all. |
+
+Two values changed after `v1` and both reached consumers before this document
+did: `homogeneous` was renamed `no_drift_observed`, and `unattributed` was
+added. A decoder pinned to the `v1` grammar rejects the new value rather than
+mis-reading it, which is why the model contract carries a version at all.
 
 `--lineage` builds a `LineageGraph` (nodes = tagged refs, edges =
 `declared_fork` / `parent_thread` / `shared_prefix`). A parent laid under its

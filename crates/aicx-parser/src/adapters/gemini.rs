@@ -1258,6 +1258,8 @@ fn finalize_segments(drafts: Vec<SegmentDraft>, turns: &[Turn]) -> Vec<Segment> 
         .enumerate()
         .map(|(i, d)| Segment {
             segment_id: i as u32,
+            scope_root: None,
+            scope_workdirs: Vec::new(),
             scope_status: crate::engine::ScopeStatus::from_evidence(
                 match &d.cwd {
                     Known::Value(cwd) => Some(cwd.as_str()),
@@ -1268,6 +1270,8 @@ fn finalize_segments(drafts: Vec<SegmentDraft>, turns: &[Turn]) -> Vec<Segment> 
                     Known::Unknown(_) => None,
                 },
             ),
+            // Only the Codex adapter observes explicit tool-call workdirs.
+            scope_conflict: false,
             cwd: d.cwd,
             branch: d.branch,
             started_at: d.started_at,

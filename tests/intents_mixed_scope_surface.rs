@@ -1,0 +1,1079 @@
+// App-only integration surface: compiled to an empty target under the slim
+// `loctree-consumer` profile (`--no-default-features`).
+#![cfg(feature = "app")]
+
+//! Mixed-workstream fail-closed surface (cut A+B).
+//!
+//! Real-shaped Codex rollout: the session baseline (`session_meta` + every
+//! `turn_context`) stays in repo `vista`, but one whole turn window runs its
+//! executable tool calls with an explicit `workdir` into repo `fleet-bus`
+//! (shape of session 01a040db-60b7), and another turn window carries
+//! conflicting workdirs from two real repos. The fail-closed contract:
+//!
+//! 1. `-p vista` returns only positively Vista-scoped frames — the whole
+//!    fleet window (including the message BEFORE the first tool call) and the
+//!    conflicted window are absent;
+//! 2. the session is reported as a mixed-scope candidate;
+//! 3. a homogeneous control session keeps the legacy bucket inheritance.
+
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use aicx::api::Aicx;
+use aicx::intents::{IntentExtraction, IntentsConfig};
+
+// HOME is process-global; serialize the two env-dependent tests in this file.
+static HOME_LOCK: Mutex<()> = Mutex::new(());
+
+fn unique_root(label: &str) -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "aicx-mixed-scope-{label}-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock after unix epoch")
+            .as_nanos()
+    ))
+}
+
+/// Substitute a filesystem path into a JSONL fixture.
+///
+/// A Windows path is `C:\Users\…`; pasted raw into a JSON string literal it
+/// produces invalid escapes (`\U`), the record fails to parse, and the fixture
+/// goes silently empty instead of failing loudly. `serde_json` writes the
+/// escapes; the surrounding quotes are stripped because the template supplies
+/// them.
+fn json_path(path: &Path) -> String {
+    let quoted = serde_json::Value::String(path.display().to_string()).to_string();
+    quoted[1..quoted.len() - 1].to_string()
+}
+
+/// Write a JSONL rollout fixture, proving every line parses first.
+///
+/// Silent invalidity is the failure mode that matters here: a raw Windows path
+/// pasted into a JSON string literal makes the record unparseable, the reader
+/// skips it, and the fixture asserts against an empty result instead of the
+/// shape it meant to describe. Fail at the fixture, loudly, on every platform.
+fn write_rollout(path: PathBuf, body: &str) {
+    for (index, line) in body.lines().enumerate() {
+        serde_json::from_str::<serde_json::Value>(line).unwrap_or_else(|error| {
+            panic!(
+                "fixture line {} is not valid JSON ({error}); a raw path in a JSON string?\n{line}",
+                index + 1
+            )
+        });
+    }
+    fs::write(path, body).expect("write rollout fixture");
+}
+
+fn make_repo(root: &Path, name: &str) -> PathBuf {
+    let repo = root.join("workspaces").join(name);
+    fs::create_dir_all(repo.join(".git")).expect("repo .git dir");
+    repo
+}
+
+fn rollout_path(root: &Path, filename: &str) -> PathBuf {
+    let dir = root
+        .join(".codex")
+        .join("sessions")
+        .join("2026")
+        .join("01")
+        .join("01");
+    fs::create_dir_all(&dir).expect("codex sessions dir");
+    dir.join(filename)
+}
+
+fn write_mixed_rollout(root: &Path, vista: &Path, fleet: &Path, other: &Path) -> String {
+    let session_id = "11111111-2222-3333-4444-555555555555";
+    let template = r#"{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"@SID@","cwd":"@VISTA@"}}
+{"timestamp":"2026-01-01T00:01:00Z","type":"turn_context","payload":{"cwd":"@VISTA@"}}
+{"timestamp":"2026-01-01T00:01:10Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Pracujemy nad vista.\nDecision: preserve vista opening decision"}]}}
+{"timestamp":"2026-01-01T00:02:00Z","type":"turn_context","payload":{"cwd":"@VISTA@"}}
+{"timestamp":"2026-01-01T00:02:05Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Biore fleet task.\nDecision: preserve fleet bus decision"}]}}
+{"timestamp":"2026-01-01T00:02:10Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"c1","input":"const r = await tools.exec_command({cmd:\"npm test\",\"workdir\":\"@FLEET@\"});"}}
+{"timestamp":"2026-01-01T00:03:00Z","type":"turn_context","payload":{"cwd":"@VISTA@"}}
+{"timestamp":"2026-01-01T00:03:05Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"c2","input":"const a = await tools.exec_command({cmd:\"ls\",\"workdir\":\"@FLEET@\"});"}}
+{"timestamp":"2026-01-01T00:03:10Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"c3","input":"const b = await tools.exec_command({cmd:\"ls\",\"workdir\":\"@OTHER@\"});"}}
+{"timestamp":"2026-01-01T00:03:20Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Sprzeczne dowody.\nDecision: preserve conflicted turn decision"}]}}
+"#;
+    let body = template
+        .replace("@SID@", session_id)
+        .replace("@VISTA@", &json_path(vista))
+        .replace("@FLEET@", &json_path(fleet))
+        .replace("@OTHER@", &json_path(other));
+    let path = rollout_path(
+        root,
+        &format!("rollout-2026-01-01T00-00-00-{session_id}.jsonl"),
+    );
+    write_rollout(path, &body);
+    session_id.to_string()
+}
+
+fn write_homogeneous_rollout(root: &Path, vista: &Path) -> String {
+    let session_id = "99999999-8888-7777-6666-555555555555";
+    let template = r#"{"timestamp":"2026-01-01T01:00:00Z","type":"session_meta","payload":{"id":"@SID@","cwd":"@VISTA@"}}
+{"timestamp":"2026-01-01T01:01:00Z","type":"turn_context","payload":{"cwd":"@VISTA@"}}
+{"timestamp":"2026-01-01T01:01:10Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Czysta sesja vista.\nDecision: preserve homogeneous vista control decision"}]}}
+"#;
+    let body = template
+        .replace("@SID@", session_id)
+        .replace("@VISTA@", &json_path(vista));
+    let path = rollout_path(
+        root,
+        &format!("rollout-2026-01-01T01-00-00-{session_id}.jsonl"),
+    );
+    write_rollout(path, &body);
+    session_id.to_string()
+}
+
+struct HomeGuard<'a> {
+    _lock: MutexGuard<'a, ()>,
+    previous_home: Option<String>,
+    previous_aicx: Option<String>,
+}
+
+impl<'a> HomeGuard<'a> {
+    fn set(root: &Path) -> Self {
+        // One failing test must not turn every later one into an unrelated
+        // `PoisonError` and hide which contract actually broke.
+        let lock = HOME_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous_home = std::env::var("HOME").ok();
+        let previous_aicx = std::env::var("AICX_HOME").ok();
+        unsafe {
+            std::env::set_var("HOME", root);
+            std::env::remove_var("AICX_HOME");
+        }
+        Self {
+            _lock: lock,
+            previous_home,
+            previous_aicx,
+        }
+    }
+}
+
+impl Drop for HomeGuard<'_> {
+    fn drop(&mut self) {
+        unsafe {
+            match &self.previous_home {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+            match &self.previous_aicx {
+                Some(value) => std::env::set_var("AICX_HOME", value),
+                None => std::env::remove_var("AICX_HOME"),
+            }
+        }
+    }
+}
+
+fn vista_config(frame_kind: aicx::timeline::FrameKind) -> IntentsConfig {
+    IntentsConfig {
+        project: "vista".to_string(),
+        hours: 0,
+        strict: false,
+        min_confidence: None,
+        kind_filter: None,
+        frame_kind: Some(frame_kind),
+        live: false,
+    }
+}
+
+fn extract(root: &Path, frame_kind: aicx::timeline::FrameKind) -> IntentExtraction {
+    let aicx_home = root.join(".aicx");
+    Aicx::with_aicx_home(&aicx_home)
+        .extract_intents(&vista_config(frame_kind))
+        .expect("extract intents through public API")
+}
+
+/// The failure this harness actually had on Windows: a raw `C:\Users\…`
+/// substituted into a JSON string literal is an invalid escape sequence, so
+/// the record never parses, the reader skips it, and every assertion in the
+/// file runs against an empty result — green logic, silent fixture.
+#[test]
+fn fixture_paths_are_json_escaped() {
+    let windows_like = Path::new(r"C:\Users\runner\workspaces\vista");
+    let escaped = json_path(windows_like);
+    assert_eq!(escaped, r"C:\\Users\\runner\\workspaces\\vista");
+
+    let line = format!(r#"{{"type":"turn_context","payload":{{"cwd":"{escaped}"}}}}"#);
+    let value: serde_json::Value =
+        serde_json::from_str(&line).expect("an escaped path keeps the record parseable");
+    assert_eq!(
+        value["payload"]["cwd"],
+        serde_json::json!(r"C:\Users\runner\workspaces\vista"),
+        "and it round-trips to the original path"
+    );
+
+    // The raw substitution this harness used to do does not parse at all.
+    let raw = format!(
+        r#"{{"type":"turn_context","payload":{{"cwd":"{}"}}}}"#,
+        windows_like.display()
+    );
+    assert!(
+        serde_json::from_str::<serde_json::Value>(&raw).is_err(),
+        "raw path substitution must be recognised as the bug it is"
+    );
+}
+
+#[test]
+fn mixed_session_fleet_turns_never_leak_into_vista_intents() {
+    let root = unique_root("mixed");
+    let _guard = HomeGuard::set(&root);
+    let vista = make_repo(&root, "vista");
+    let fleet = make_repo(&root, "fleet-bus");
+    let other = make_repo(&root, "other-repo");
+    let mixed_sid = write_mixed_rollout(&root, &vista, &fleet, &other);
+    let control_sid = write_homogeneous_rollout(&root, &vista);
+
+    let aicx_home = root.join(".aicx");
+    aicx::catalog::rebuild(&aicx_home, &root).expect("rebuild catalog over fixture home");
+
+    // The product surface runs one extraction per frame kind (user / agent).
+    let user_extraction = extract(&root, aicx::timeline::FrameKind::UserMsg);
+    let agent_extraction = extract(&root, aicx::timeline::FrameKind::AgentReply);
+    let mixed_scope: Vec<_> = user_extraction
+        .mixed_scope
+        .iter()
+        .chain(agent_extraction.mixed_scope.iter())
+        .collect();
+    let records: Vec<_> = user_extraction
+        .records
+        .iter()
+        .chain(agent_extraction.records.iter())
+        .collect();
+
+    // The mixed session is reported as a mixed-scope candidate — even though
+    // the fail-closed filter removed its whole agent-reply file from vista.
+    assert!(
+        mixed_scope
+            .iter()
+            .any(|session| session.agent == "codex" && session.session_id == mixed_sid),
+        "mixed_scope must name the mixed session: {:?}",
+        mixed_scope
+    );
+    // The homogeneous control session is not mixed.
+    assert!(
+        !mixed_scope
+            .iter()
+            .any(|session| session.session_id == control_sid),
+        "homogeneous control session must not be mixed: {:?}",
+        mixed_scope
+    );
+
+    let mixed_records: Vec<_> = records
+        .iter()
+        .filter(|record| record.session_id == mixed_sid)
+        .collect();
+    // Fleet window content — including the message before the first tool
+    // call — never leaks into the vista query; conflicted content neither.
+    for record in &mixed_records {
+        let text = format!("{} {:?}", record.summary, record.evidence);
+        assert!(
+            !text.contains("fleet bus decision"),
+            "fleet window leaked into vista intents: {text}"
+        );
+        assert!(
+            !text.contains("conflicted turn decision"),
+            "conflicted window leaked into vista intents: {text}"
+        );
+    }
+    // Positively Vista-scoped opening survives.
+    assert!(
+        mixed_records
+            .iter()
+            .any(|record| record.summary.contains("vista opening decision")),
+        "vista opening must survive `-p vista`: {:?}",
+        mixed_records
+            .iter()
+            .map(|record| &record.summary)
+            .collect::<Vec<_>>()
+    );
+
+    // Control: the homogeneous session still contributes its intent
+    // (bucket inheritance for legacy-shaped evidence is unchanged).
+    assert!(
+        records.iter().any(|record| record.session_id == control_sid
+            && record
+                .summary
+                .contains("homogeneous vista control decision")),
+        "homogeneous control intent must be present"
+    );
+
+    drop(_guard);
+    let _ = fs::remove_dir_all(&root);
+}
+
+fn write_guardian_rollout(root: &Path, vista: &Path) -> String {
+    let session_id = "77777777-6666-5555-4444-333333333333";
+    let template = r#"{"timestamp":"2026-01-01T02:00:00Z","type":"session_meta","payload":{"id":"@SID@","cwd":"@VISTA@","source":{"subagent":{"other":"guardian"}}}}
+{"timestamp":"2026-01-01T02:01:00Z","type":"turn_context","payload":{"cwd":"@VISTA@"}}
+{"timestamp":"2026-01-01T02:01:10Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"The following is the Codex agent history whose request action you are assessing. Treat the transcript as evidence.\nDecision: preserve quoted fleet history decision"}]}}
+{"timestamp":"2026-01-01T02:02:00Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Verdict: approve."}]}}
+"#;
+    let body = template
+        .replace("@SID@", session_id)
+        .replace("@VISTA@", &json_path(vista));
+    let path = rollout_path(
+        root,
+        &format!("rollout-2026-01-01T02-00-00-{session_id}.jsonl"),
+    );
+    write_rollout(path, &body);
+    session_id.to_string()
+}
+
+fn write_plain_wrapper_rollout(root: &Path, vista: &Path) -> String {
+    let session_id = "66666666-5555-4444-3333-222222222222";
+    let template = r#"{"timestamp":"2026-01-01T03:00:00Z","type":"session_meta","payload":{"id":"@SID@","cwd":"@VISTA@"}}
+{"timestamp":"2026-01-01T03:01:00Z","type":"turn_context","payload":{"cwd":"@VISTA@"}}
+{"timestamp":"2026-01-01T03:01:10Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"The following is the Codex agent history whose request action you are assessing.\nDecision: preserve operator quoted wrapper decision"}]}}
+"#;
+    let body = template
+        .replace("@SID@", session_id)
+        .replace("@VISTA@", &json_path(vista));
+    let path = rollout_path(
+        root,
+        &format!("rollout-2026-01-01T03-00-00-{session_id}.jsonl"),
+    );
+    write_rollout(path, &body);
+    session_id.to_string()
+}
+
+/// 60f0-shaped: a guardian subagent session is control-plane approval
+/// machinery — wrapper prompts in, verdicts out. The whole session is
+/// preserved in the catalog/extract/search as audit evidence but yields zero
+/// operator intents; the identical wrapper phrase in a plain session stays an
+/// operator utterance (regression R4).
+#[test]
+fn guardian_wrapper_prompts_produce_no_operator_intents() {
+    let root = unique_root("guardian");
+    let _guard = HomeGuard::set(&root);
+    let vista = make_repo(&root, "vista");
+    let guardian_sid = write_guardian_rollout(&root, &vista);
+    let plain_sid = write_plain_wrapper_rollout(&root, &vista);
+
+    let aicx_home = root.join(".aicx");
+    aicx::catalog::rebuild(&aicx_home, &root).expect("rebuild catalog over fixture home");
+
+    let user_extraction = extract(&root, aicx::timeline::FrameKind::UserMsg);
+    let agent_extraction = extract(&root, aicx::timeline::FrameKind::AgentReply);
+    let records: Vec<_> = user_extraction
+        .records
+        .iter()
+        .chain(agent_extraction.records.iter())
+        .collect();
+
+    assert!(
+        !records
+            .iter()
+            .any(|record| record.session_id == guardian_sid),
+        "guardian session is control-plane evidence and must produce no operator intents at all: {:?}",
+        records
+            .iter()
+            .filter(|record| record.session_id == guardian_sid)
+            .map(|record| &record.summary)
+            .collect::<Vec<_>>()
+    );
+    // Regression R4 at the public surface: the same phrase in a plain
+    // session is an operator utterance and its intent survives.
+    assert!(
+        records.iter().any(|record| record.session_id == plain_sid
+            && record.summary.contains("operator quoted wrapper decision")),
+        "plain-session phrase must stay an operator intent: {:?}",
+        records
+            .iter()
+            .map(|record| &record.summary)
+            .collect::<Vec<_>>()
+    );
+
+    drop(_guard);
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// The production read path: a committed CURRENT index plus a finite,
+/// non-live window. Whole-session index chunks cannot express per-frame
+/// scope, so a session flagged mixed at index build must fall back to the
+/// census lane (fail-closed per frame), and guardian sessions must not
+/// surface at all. `identity_source == "index-v1"` proves this run really
+/// went through the index lane — the complaint class the first test (which
+/// forces the census path with `hours: 0`) cannot see.
+#[test]
+fn index_lane_falls_back_to_census_for_mixed_and_drops_guardian() {
+    let root = unique_root("indexlane");
+    let _guard = HomeGuard::set(&root);
+    let vista = make_repo(&root, "vista");
+    let fleet = make_repo(&root, "fleet-bus");
+    let other = make_repo(&root, "other-repo");
+    let mixed_sid = write_mixed_rollout(&root, &vista, &fleet, &other);
+    let control_sid = write_homogeneous_rollout(&root, &vista);
+    let guardian_sid = write_guardian_rollout(&root, &vista);
+
+    let aicx_home = root.join(".aicx");
+    aicx::catalog::rebuild(&aicx_home, &root).expect("rebuild catalog over fixture home");
+    aicx::source_index::build(&aicx_home, &[], false, true, false)
+        .expect("publish CURRENT index over fixture home");
+
+    let config = |frame_kind: aicx::timeline::FrameKind| IntentsConfig {
+        project: "vista".to_string(),
+        // Finite window covering the 2026-01 fixture dates; not 0 (would
+        // disable the index lane) and not ≤48h (would trigger live scan).
+        hours: 100_000,
+        strict: false,
+        min_confidence: None,
+        kind_filter: None,
+        frame_kind: Some(frame_kind),
+        live: false,
+    };
+    let user_extraction = Aicx::with_aicx_home(&aicx_home)
+        .extract_intents(&config(aicx::timeline::FrameKind::UserMsg))
+        .expect("extract user intents through public API");
+    let agent_extraction = Aicx::with_aicx_home(&aicx_home)
+        .extract_intents(&config(aicx::timeline::FrameKind::AgentReply))
+        .expect("extract agent intents through public API");
+
+    // The committed index served this run — the production lane under test.
+    assert_eq!(
+        user_extraction.stats.identity_source, "index-v1",
+        "test must exercise the index lane, not the census fallback"
+    );
+
+    let records: Vec<_> = user_extraction
+        .records
+        .iter()
+        .chain(agent_extraction.records.iter())
+        .collect();
+
+    // Guardian sessions are control-plane evidence: zero operator intents
+    // through the index lane as well.
+    assert!(
+        !records
+            .iter()
+            .any(|record| record.session_id == guardian_sid),
+        "guardian session leaked through the index lane: {:?}",
+        records
+            .iter()
+            .filter(|record| record.session_id == guardian_sid)
+            .map(|record| &record.summary)
+            .collect::<Vec<_>>()
+    );
+
+    // The mixed session is re-sourced through the census lane: fleet and
+    // conflicted windows stay out of `-p vista`, the vista opening survives.
+    let mixed_records: Vec<_> = records
+        .iter()
+        .filter(|record| record.session_id == mixed_sid)
+        .collect();
+    for record in &mixed_records {
+        let text = format!("{} {:?}", record.summary, record.evidence);
+        assert!(
+            !text.contains("fleet bus decision"),
+            "fleet window leaked through the index lane: {text}"
+        );
+        assert!(
+            !text.contains("conflicted turn decision"),
+            "conflicted window leaked through the index lane: {text}"
+        );
+    }
+    assert!(
+        mixed_records
+            .iter()
+            .any(|record| record.summary.contains("vista opening decision")),
+        "vista opening must survive the census fallback: {:?}",
+        mixed_records
+            .iter()
+            .map(|record| &record.summary)
+            .collect::<Vec<_>>()
+    );
+
+    // The census fallback reports the mixed session, the homogeneous
+    // control keeps bucket inheritance.
+    let mixed_scope: Vec<_> = user_extraction
+        .mixed_scope
+        .iter()
+        .chain(agent_extraction.mixed_scope.iter())
+        .collect();
+    assert!(
+        mixed_scope
+            .iter()
+            .any(|session| session.agent == "codex" && session.session_id == mixed_sid),
+        "mixed_scope must name the mixed session through the index lane: {:?}",
+        mixed_scope
+    );
+    assert!(
+        records.iter().any(|record| record.session_id == control_sid
+            && record
+                .summary
+                .contains("homogeneous vista control decision")),
+        "homogeneous control intent must be present through the index lane"
+    );
+
+    drop(_guard);
+    let _ = fs::remove_dir_all(&root);
+}
+
+fn write_unresolved_foreign_rollout(root: &Path, vista: &Path) -> String {
+    let session_id = "55555555-4444-3333-2222-111111111111";
+    let template = r#"{"timestamp":"2026-01-01T04:00:00Z","type":"session_meta","payload":{"id":"@SID@","cwd":"@VISTA@"}}
+{"timestamp":"2026-01-01T04:01:00Z","type":"turn_context","payload":{"cwd":"@VISTA@"}}
+{"timestamp":"2026-01-01T04:01:10Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Otwieramy viste.\nDecision: preserve vista baseline opening"}]}}
+{"timestamp":"2026-01-01T04:02:00Z","type":"turn_context","payload":{"cwd":"@VISTA@"}}
+{"timestamp":"2026-01-01T04:02:05Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Pisze z unresolved workdir.\nDecision: preserve unresolved foreign turn"}]}}
+{"timestamp":"2026-01-01T04:02:10Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"c9","input":"const r = await tools.exec_command({cmd:\"npm test\",\"workdir\":\"/definitely/missing/fleet-bus\"});"}}
+"#;
+    let body = template
+        .replace("@SID@", session_id)
+        .replace("@VISTA@", &json_path(vista));
+    let path = rollout_path(
+        root,
+        &format!("rollout-2026-01-01T04-00-00-{session_id}.jsonl"),
+    );
+    write_rollout(path, &body);
+    session_id.to_string()
+}
+
+/// Follow-up regression: `turn_context` baseline is vista, but one turn
+/// window's explicit workdir is an unresolvable foreign path
+/// (`/definitely/missing/fleet-bus`). That window is durably unattributed —
+/// it must NOT inherit the vista bucket, in either read lane, and the
+/// session must not be over-convicted as mixed either.
+#[test]
+fn unresolved_foreign_window_inherits_nothing_in_any_lane() {
+    let root = unique_root("unresolved");
+    let _guard = HomeGuard::set(&root);
+    let vista = make_repo(&root, "vista");
+    let unresolved_sid = write_unresolved_foreign_rollout(&root, &vista);
+
+    let aicx_home = root.join(".aicx");
+    aicx::catalog::rebuild(&aicx_home, &root).expect("rebuild catalog over fixture home");
+    aicx::source_index::build(&aicx_home, &[], false, true, false)
+        .expect("publish CURRENT index over fixture home");
+
+    let config = |hours: u64, frame_kind: aicx::timeline::FrameKind| IntentsConfig {
+        project: "vista".to_string(),
+        hours,
+        strict: false,
+        min_confidence: None,
+        kind_filter: None,
+        frame_kind: Some(frame_kind),
+        live: false,
+    };
+    let run = |hours: u64| {
+        let user = Aicx::with_aicx_home(&aicx_home)
+            .extract_intents(&config(hours, aicx::timeline::FrameKind::UserMsg))
+            .expect("extract user intents");
+        let agent = Aicx::with_aicx_home(&aicx_home)
+            .extract_intents(&config(hours, aicx::timeline::FrameKind::AgentReply))
+            .expect("extract agent intents");
+        (user, agent)
+    };
+
+    for (lane, hours) in [("census", 0), ("index", 100_000)] {
+        let (user_extraction, agent_extraction) = run(hours);
+        if lane == "index" {
+            assert_eq!(
+                user_extraction.stats.identity_source, "index-v1",
+                "index lane must serve the finite-window run"
+            );
+        }
+        let records: Vec<_> = user_extraction
+            .records
+            .iter()
+            .chain(agent_extraction.records.iter())
+            .collect();
+        let session_records: Vec<_> = records
+            .iter()
+            .filter(|record| record.session_id == unresolved_sid)
+            .collect();
+        assert!(
+            !session_records
+                .iter()
+                .any(|record| record.summary.contains("unresolved foreign turn")),
+            "{lane} lane: unattributed window must not inherit the vista bucket: {:?}",
+            session_records
+                .iter()
+                .map(|record| &record.summary)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            session_records
+                .iter()
+                .any(|record| record.summary.contains("vista baseline opening")),
+            "{lane} lane: the positively vista-scoped window must survive: {:?}",
+            session_records
+                .iter()
+                .map(|record| &record.summary)
+                .collect::<Vec<_>>()
+        );
+        let mixed_scope: Vec<_> = user_extraction
+            .mixed_scope
+            .iter()
+            .chain(agent_extraction.mixed_scope.iter())
+            .collect();
+        assert!(
+            !mixed_scope
+                .iter()
+                .any(|session| session.session_id == unresolved_sid),
+            "{lane} lane: unattributed evidence must not convict the session as mixed: {:?}",
+            mixed_scope
+        );
+    }
+
+    drop(_guard);
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// Rewrite every catalog row in place through a JSON transform. Used to
+/// simulate catalog states the hot-window refresh will never revisit.
+fn rewrite_catalog_rows(aicx_home: &Path, mut transform: impl FnMut(&mut serde_json::Value)) {
+    let path = aicx::catalog::sessions_path_for(aicx_home);
+    let body = fs::read_to_string(&path).expect("read catalog");
+    let mut out = String::new();
+    for line in body.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let mut row: serde_json::Value = serde_json::from_str(line).expect("parse catalog row");
+        transform(&mut row);
+        out.push_str(&row.to_string());
+        out.push('\n');
+    }
+    fs::write(&path, out).expect("write catalog");
+}
+
+/// Provenance must not depend on a catalog column that no upgrade path fills.
+///
+/// `aicx index` reads the census rows; the census hot refresh
+/// (`scan_hot_window_skipping`) never revisits a source whose fingerprint is
+/// unchanged. A guardian session cataloged before the column existed therefore
+/// keeps `session_kind: null` through any number of index rebuilds — and its
+/// wrapper prompts and `Verdict:` replies re-enter the operator intent stream.
+/// The lanes that open the rollout must establish provenance themselves.
+#[test]
+fn cold_catalog_rows_still_exclude_guardian_sessions_in_both_lanes() {
+    let root = unique_root("coldguardian");
+    let _guard = HomeGuard::set(&root);
+    let vista = make_repo(&root, "vista");
+    let guardian_sid = write_guardian_rollout(&root, &vista);
+    let plain_sid = write_plain_wrapper_rollout(&root, &vista);
+
+    let aicx_home = root.join(".aicx");
+    aicx::catalog::rebuild(&aicx_home, &root).expect("rebuild catalog over fixture home");
+    // The pre-column state: rows exist, provenance does not.
+    rewrite_catalog_rows(&aicx_home, |row| {
+        if let Some(object) = row.as_object_mut() {
+            object.remove("session_kind");
+        }
+    });
+    let cold: Vec<_> = aicx::catalog::read_entries_at(&aicx_home)
+        .expect("read catalog")
+        .into_iter()
+        .filter(|entry| entry.session_kind.is_some())
+        .collect();
+    assert!(
+        cold.is_empty(),
+        "fixture must start with cold rows: {cold:?}"
+    );
+
+    // Census lane (hours: 0).
+    let census = extract(&root, aicx::timeline::FrameKind::UserMsg);
+    let census_agent = extract(&root, aicx::timeline::FrameKind::AgentReply);
+    for extraction in [&census, &census_agent] {
+        assert!(
+            !extraction
+                .records
+                .iter()
+                .any(|record| record.session_id == guardian_sid),
+            "guardian session leaked through the census lane from a cold catalog row: {:?}",
+            extraction
+                .records
+                .iter()
+                .filter(|record| record.session_id == guardian_sid)
+                .map(|record| &record.summary)
+                .collect::<Vec<_>>()
+        );
+    }
+    assert!(
+        census
+            .records
+            .iter()
+            .chain(census_agent.records.iter())
+            .any(|record| record.session_id == plain_sid),
+        "the plain control session must still produce operator intents"
+    );
+
+    // Index lane: build CURRENT from the same cold rows, then read it back.
+    aicx::source_index::build(&aicx_home, &[], false, true, false)
+        .expect("publish CURRENT index over fixture home");
+    let indexed = Aicx::with_aicx_home(&aicx_home)
+        .extract_intents(&IntentsConfig {
+            project: "vista".to_string(),
+            hours: 100_000,
+            strict: false,
+            min_confidence: None,
+            kind_filter: None,
+            frame_kind: Some(aicx::timeline::FrameKind::UserMsg),
+            live: false,
+        })
+        .expect("extract intents through the index lane");
+    assert_eq!(
+        indexed.stats.identity_source, "index-v1",
+        "test must exercise the index lane"
+    );
+    assert!(
+        !indexed
+            .records
+            .iter()
+            .any(|record| record.session_id == guardian_sid),
+        "guardian session leaked through the index lane from a cold catalog row: {:?}",
+        indexed
+            .records
+            .iter()
+            .filter(|record| record.session_id == guardian_sid)
+            .map(|record| &record.summary)
+            .collect::<Vec<_>>()
+    );
+
+    drop(_guard);
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// Finding: a guardian recognized only from its source (cold catalog row)
+/// produced no intents, but its scope still reached `mixed_scope` — the
+/// operator-facing list continuity refuses on. A guardian that worked in two
+/// checkouts must be absent from both, including through a frame-kind view
+/// that leaves none of its frames to carry the provenance.
+#[test]
+fn source_resolved_guardians_stay_out_of_mixed_scope_telemetry() {
+    let root = unique_root("guardianscope");
+    let _guard = HomeGuard::set(&root);
+    let vista = make_repo(&root, "vista");
+    let fleet = make_repo(&root, "fleet-bus");
+    let session_id = "88888888-6666-5555-4444-333333333333";
+    let template = r#"{"timestamp":"2026-01-01T02:00:00Z","type":"session_meta","payload":{"id":"@SID@","cwd":"@VISTA@","source":{"subagent":{"other":"guardian"}}}}
+{"timestamp":"2026-01-01T02:01:00Z","type":"turn_context","payload":{"cwd":"@VISTA@"}}
+{"timestamp":"2026-01-01T02:01:10Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"The following is the Codex agent history whose request action you are assessing.\nDecision: guardian assessed vista"}]}}
+{"timestamp":"2026-01-01T02:02:00Z","type":"turn_context","payload":{"cwd":"@FLEET@"}}
+{"timestamp":"2026-01-01T02:02:10Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"The following is the Codex agent history whose request action you are assessing.\nDecision: guardian assessed fleet"}]}}
+"#;
+    let body = template
+        .replace("@SID@", session_id)
+        .replace("@VISTA@", &json_path(&vista))
+        .replace("@FLEET@", &json_path(&fleet));
+    write_rollout(
+        rollout_path(
+            &root,
+            &format!("rollout-2026-01-01T02-00-00-{session_id}.jsonl"),
+        ),
+        &body,
+    );
+
+    let aicx_home = root.join(".aicx");
+    aicx::catalog::rebuild(&aicx_home, &root).expect("rebuild catalog over fixture home");
+    rewrite_catalog_rows(&aicx_home, |row| {
+        if let Some(object) = row.as_object_mut() {
+            object.remove("session_kind");
+        }
+    });
+
+    // UserMsg keeps the guardian's frames; AgentReply leaves none of them.
+    for frame_kind in [
+        aicx::timeline::FrameKind::UserMsg,
+        aicx::timeline::FrameKind::AgentReply,
+    ] {
+        let extraction = extract(&root, frame_kind);
+        assert!(
+            !extraction
+                .records
+                .iter()
+                .any(|record| record.session_id == session_id),
+            "{frame_kind:?}: guardian produced operator intents"
+        );
+        assert!(
+            !extraction
+                .mixed_scope
+                .iter()
+                .any(|session| session.session_id == session_id),
+            "{frame_kind:?}: guardian reached the mixed-scope telemetry: {:?}",
+            extraction.mixed_scope
+        );
+    }
+
+    drop(_guard);
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// A flagged index chunk that has to be re-sourced can fail: the catalog may
+/// have been rebuilt, or the original transcript moved or deleted. Swallowing
+/// that read left `source_errors = 0`, so `completeness` claimed a complete
+/// answer while a whole session had silently vanished from it.
+#[test]
+fn index_lane_reports_sessions_it_could_not_re_source() {
+    let root = unique_root("resourcefail");
+    let _guard = HomeGuard::set(&root);
+    let vista = make_repo(&root, "vista");
+    let fleet = make_repo(&root, "fleet-bus");
+    let other = make_repo(&root, "other-repo");
+    let mixed_sid = write_mixed_rollout(&root, &vista, &fleet, &other);
+    write_homogeneous_rollout(&root, &vista);
+
+    let aicx_home = root.join(".aicx");
+    aicx::catalog::rebuild(&aicx_home, &root).expect("rebuild catalog over fixture home");
+    aicx::source_index::build(&aicx_home, &[], false, true, false)
+        .expect("publish CURRENT index over fixture home");
+
+    // The mixed session is index-flagged, so the index lane must re-source it
+    // — but its transcript is gone.
+    let source = rollout_path(
+        &root,
+        &format!("rollout-2026-01-01T00-00-00-{mixed_sid}.jsonl"),
+    );
+    fs::remove_file(&source).expect("remove the flagged session's source");
+
+    let extraction = Aicx::with_aicx_home(&aicx_home)
+        .extract_intents(&IntentsConfig {
+            project: "vista".to_string(),
+            hours: 100_000,
+            strict: false,
+            min_confidence: None,
+            kind_filter: None,
+            frame_kind: Some(aicx::timeline::FrameKind::UserMsg),
+            live: false,
+        })
+        .expect("extract intents through the index lane");
+
+    assert_eq!(
+        extraction.stats.identity_source, "index-v1",
+        "test must exercise the index lane"
+    );
+    assert!(
+        extraction.stats.source_errors > 0,
+        "a flagged session that could not be re-sourced must be counted, not skipped"
+    );
+    let completeness = extraction
+        .stats
+        .completeness(None, extraction.records.len());
+    assert!(
+        !completeness.complete,
+        "completeness must not claim a complete answer over a lost source"
+    );
+
+    drop(_guard);
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// The index matched a session on the project stored AT INDEX TIME; the
+/// rehydrated frames are stamped with the CURRENT catalog project. Without
+/// re-applying the caller's `-p` predicate, a session reattributed after the
+/// index was built carries another repo's frames into the answer.
+#[test]
+fn index_lane_re_source_reapplies_the_project_filter() {
+    let root = unique_root("resourceproject");
+    let _guard = HomeGuard::set(&root);
+    let vista = make_repo(&root, "vista");
+    let fleet = make_repo(&root, "fleet-bus");
+    let other = make_repo(&root, "other-repo");
+    let mixed_sid = write_mixed_rollout(&root, &vista, &fleet, &other);
+    write_homogeneous_rollout(&root, &vista);
+
+    let aicx_home = root.join(".aicx");
+    aicx::catalog::rebuild(&aicx_home, &root).expect("rebuild catalog over fixture home");
+    aicx::source_index::build(&aicx_home, &[], false, true, false)
+        .expect("publish CURRENT index over fixture home");
+
+    // Catalog rebuilt after the index: this session now belongs elsewhere.
+    rewrite_catalog_rows(&aicx_home, |row| {
+        if row.get("session_id").and_then(serde_json::Value::as_str) == Some(mixed_sid.as_str())
+            && let Some(object) = row.as_object_mut()
+        {
+            object.insert(
+                "project".to_string(),
+                serde_json::Value::String("vetcoders/fleet-bus".to_string()),
+            );
+        }
+    });
+
+    let extraction = Aicx::with_aicx_home(&aicx_home)
+        .extract_intents(&IntentsConfig {
+            project: "vista".to_string(),
+            hours: 100_000,
+            strict: false,
+            min_confidence: None,
+            kind_filter: None,
+            frame_kind: Some(aicx::timeline::FrameKind::UserMsg),
+            live: false,
+        })
+        .expect("extract intents through the index lane");
+
+    assert_eq!(
+        extraction.stats.identity_source, "index-v1",
+        "test must exercise the index lane"
+    );
+    assert!(
+        !extraction
+            .records
+            .iter()
+            .any(|record| record.session_id == mixed_sid),
+        "a session that no longer belongs to the requested project must not be re-sourced into it: {:?}",
+        extraction
+            .records
+            .iter()
+            .filter(|record| record.session_id == mixed_sid)
+            .map(|record| &record.summary)
+            .collect::<Vec<_>>()
+    );
+
+    drop(_guard);
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// Scope is a property of the session, not of one role. The frame-kind filter
+/// runs before the frames reach the intent builder, so a report computed from
+/// them sees at most half the evidence: a session whose assistant turns ran in
+/// a foreign checkout while its user turns carry the baseline looked
+/// homogeneous to the user pass — unreported as mixed, and cwd-less frames
+/// inheriting the catalog project on evidence that had been filtered away.
+#[test]
+fn whole_session_scope_is_judged_before_the_frame_kind_filter() {
+    let root = unique_root("scopebeforekind");
+    let _guard = HomeGuard::set(&root);
+    let vista = make_repo(&root, "vista");
+    let fleet = make_repo(&root, "fleet-bus");
+    let other = make_repo(&root, "other-repo");
+    let mixed_sid = write_mixed_rollout(&root, &vista, &fleet, &other);
+
+    let aicx_home = root.join(".aicx");
+    aicx::catalog::rebuild(&aicx_home, &root).expect("rebuild catalog over fixture home");
+
+    // The USER pass alone: every fleet-scoped frame in this fixture is an
+    // assistant turn, so a scope report taken after the kind filter cannot
+    // see the foreign evidence at all.
+    let user_only = extract(&root, aicx::timeline::FrameKind::UserMsg);
+    assert!(
+        user_only
+            .mixed_scope
+            .iter()
+            .any(|session| session.agent == "codex" && session.session_id == mixed_sid),
+        "the user pass must still report the session's whole-session scope: {:?}",
+        user_only.mixed_scope
+    );
+
+    drop(_guard);
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// `.aicxignore` removes frames one layer BELOW the scope report, so a session
+/// whose baseline checkout is hidden arrives looking homogeneous: one foreign
+/// cwd, no conflict. The report has to carry the fact that evidence was
+/// removed — as a count, never as the hidden path — or the surviving cwd-less
+/// frames inherit the cataloged project on evidence nobody can see.
+#[test]
+fn a_hidden_baseline_cannot_silence_mixed_scope() {
+    let root = unique_root("hiddenbaseline");
+    let _guard = HomeGuard::set(&root);
+    let vista = make_repo(&root, "vista");
+    let fleet = make_repo(&root, "fleet-bus");
+    let other = make_repo(&root, "other-repo");
+    let mixed_sid = write_mixed_rollout(&root, &vista, &fleet, &other);
+
+    let aicx_home = root.join(".aicx");
+    fs::create_dir_all(&aicx_home).expect("aicx home");
+    // The operator hides the session's own checkout.
+    fs::write(
+        aicx_home.join(".aicxignore"),
+        format!("{}\n", vista.display()),
+    )
+    .expect("write .aicxignore");
+    aicx::catalog::rebuild(&aicx_home, &root).expect("rebuild catalog over fixture home");
+
+    let user_extraction = extract(&root, aicx::timeline::FrameKind::UserMsg);
+    let agent_extraction = extract(&root, aicx::timeline::FrameKind::AgentReply);
+
+    // Whatever survives the privacy filter, none of it may be served as vista.
+    let leaked: Vec<&str> = user_extraction
+        .records
+        .iter()
+        .chain(agent_extraction.records.iter())
+        .map(|record| record.summary.as_str())
+        .collect();
+    assert!(
+        leaked.is_empty(),
+        "a session whose baseline is hidden must not hand its remaining frames to that project: {leaked:?}"
+    );
+    // ... and the session is still named as mixed rather than passing as clean.
+    let mixed: Vec<_> = user_extraction
+        .mixed_scope
+        .iter()
+        .chain(agent_extraction.mixed_scope.iter())
+        .collect();
+    assert!(
+        mixed
+            .iter()
+            .any(|session| session.agent == "codex" && session.session_id == mixed_sid),
+        "hidden evidence must still count as a scope: {mixed:?}"
+    );
+
+    drop(_guard);
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// A chunk flagged in the index whose catalog row is gone cannot be
+/// re-sourced at all — the loop never reaches a read, so a per-read error
+/// counter never fires. The session still left the answer, and completeness
+/// has to say so.
+#[test]
+fn index_lane_counts_flagged_chunks_with_no_catalog_row() {
+    let root = unique_root("resourceunmatched");
+    let _guard = HomeGuard::set(&root);
+    let vista = make_repo(&root, "vista");
+    let fleet = make_repo(&root, "fleet-bus");
+    let other = make_repo(&root, "other-repo");
+    let mixed_sid = write_mixed_rollout(&root, &vista, &fleet, &other);
+    write_homogeneous_rollout(&root, &vista);
+
+    let aicx_home = root.join(".aicx");
+    aicx::catalog::rebuild(&aicx_home, &root).expect("rebuild catalog over fixture home");
+    aicx::source_index::build(&aicx_home, &[], false, true, false)
+        .expect("publish CURRENT index over fixture home");
+
+    // The catalog loses the flagged session entirely (rebuilt elsewhere,
+    // pruned, or written by another host).
+    let catalog = aicx::catalog::sessions_path_for(&aicx_home);
+    let body = fs::read_to_string(&catalog).expect("read catalog");
+    let kept: String = body
+        .lines()
+        .filter(|line| !line.contains(&mixed_sid))
+        .map(|line| format!("{line}\n"))
+        .collect();
+    fs::write(&catalog, kept).expect("write catalog");
+
+    let extraction = Aicx::with_aicx_home(&aicx_home)
+        .extract_intents(&IntentsConfig {
+            project: "vista".to_string(),
+            hours: 100_000,
+            strict: false,
+            min_confidence: None,
+            kind_filter: None,
+            frame_kind: Some(aicx::timeline::FrameKind::UserMsg),
+            live: false,
+        })
+        .expect("extract intents through the index lane");
+
+    assert_eq!(
+        extraction.stats.identity_source, "index-v1",
+        "test must exercise the index lane"
+    );
+    assert!(
+        extraction.stats.source_errors > 0,
+        "a flagged chunk with no catalog row is a hole in the answer, not a silent drop"
+    );
+    let completeness = extraction
+        .stats
+        .completeness(None, extraction.records.len());
+    assert!(!completeness.complete);
+
+    drop(_guard);
+    let _ = fs::remove_dir_all(&root);
+}

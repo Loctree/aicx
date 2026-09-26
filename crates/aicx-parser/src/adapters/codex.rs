@@ -14,6 +14,9 @@ use crate::engine::frames::{
     self, FrameClass, InjectKind, TransportFrame, TransportKind, TransportPayload, TransportRole,
 };
 use crate::engine::frames_rules;
+use crate::engine::scope_evidence::{
+    WindowScope, WorkdirEvidence, effective_window_scope, recorded_workdir, tool_call_workdirs,
+};
 use crate::engine::{
     AgentKind, BoundaryFlags, ConsumedUnit, ContextEpochRef, CounterSemantics, CoverageReport,
     CoverageWarning, Known, ParseStatus, Provenance, ProviderConversationRef, RawUnitRef,
@@ -388,6 +391,19 @@ fn assemble_codex(
                 state.consume(&value, classified.evidence.clone())?;
             }
             ClassifiedDisposition::Skipped { reason, visible } => {
+                // A unit that never became a `Value` never reaches
+                // `push_tool_turn`, so its workdir is invisible to this lane.
+                // Two ways in: an over-cap unit is drained without parsing,
+                // and a malformed one fails to parse at all. Neither is
+                // evidence that nothing moved repos — the difference between
+                // them is only WHY we could not read it, which is no
+                // difference at all from the scope's point of view. Record the
+                // ignorance so the window fails closed. Without it the
+                // surrounding messages keep the baseline cwd and a foreign
+                // workdir leaks into the parent project.
+                if matches!(reason, SkippedReason::Oversized | SkippedReason::Malformed) {
+                    state.note_opaque_window(&raw.bytes);
+                }
                 state.observe_skip(classified, *reason, *visible, raw.boundary);
             }
         }
@@ -408,6 +424,9 @@ struct Assembly<'a> {
     current_branch: Known<String>,
     segment_started_at: Known<String>,
     segments: Vec<SegmentDraft>,
+    /// Explicit tool-call `workdir` evidence of the open turn window; stronger
+    /// than the `turn_context` baseline when it points at another repo.
+    window_workdirs: Vec<WorkdirEvidence>,
     turns: Vec<Turn>,
     tools: Vec<ToolEvent>,
     tool_names: BTreeMap<String, String>,
@@ -438,10 +457,22 @@ struct Assembly<'a> {
 #[derive(Clone)]
 struct SegmentDraft {
     cwd: Known<String>,
+    /// Host-resolved repository identity for this window; never folded into
+    /// `cwd`, which stays the recorded fact. See `Segment::scope_root`.
+    scope_root: Option<String>,
     branch: Known<String>,
     started_at: Known<String>,
     ended_at: Known<String>,
     start_turn: u64,
+    /// The window's explicit workdir evidence pointed at more than one repo
+    /// identity — mixed/unattributed, never guessed into a project bucket.
+    scope_conflict: bool,
+    /// The window's explicit workdir evidence does not resolve and is not the
+    /// baseline — durable "unknown, do not inherit" state.
+    scope_unattributed: bool,
+    /// Recorded workdirs of every window folded into this draft. See
+    /// `Segment::scope_workdirs`.
+    scope_workdirs: Vec<String>,
 }
 
 impl<'a> Assembly<'a> {
@@ -462,6 +493,7 @@ impl<'a> Assembly<'a> {
             current_branch: Known::unknown(),
             segment_started_at: Known::unknown(),
             segments: Vec::new(),
+            window_workdirs: Vec::new(),
             turns: Vec::new(),
             tools: Vec::new(),
             tool_names: BTreeMap::new(),
@@ -592,22 +624,96 @@ impl<'a> Assembly<'a> {
         if matches!(model, Known::Value(_)) {
             self.model = model;
         }
-        if cwd != self.current_cwd || branch != self.current_branch {
-            self.close_segment(timestamp.clone());
-            self.current_cwd = cwd;
-            self.current_branch = branch;
-            self.segment_started_at = timestamp;
-            if !self.turns.is_empty() {
-                self.segments.push(SegmentDraft {
-                    cwd: self.current_cwd.clone(),
-                    branch: self.current_branch.clone(),
-                    started_at: self.segment_started_at.clone(),
-                    ended_at: Known::unknown(),
-                    start_turn: self.turns.len() as u64,
-                });
+        // Every turn_context closes the current turn window for effective-scope
+        // purposes, even without cwd/branch drift: explicit tool-call workdirs
+        // are scoped to the window they ran in. Adjacent windows with identical
+        // effective scope merge back at `finish`, so the segment count only
+        // grows where the scope actually changed.
+        self.finalize_window();
+        self.close_segment(timestamp.clone());
+        self.window_workdirs.clear();
+        self.current_cwd = cwd;
+        self.current_branch = branch;
+        self.segment_started_at = timestamp;
+        if !self.turns.is_empty() {
+            let draft = SegmentDraft {
+                cwd: self.current_cwd.clone(),
+                scope_root: None,
+                branch: self.current_branch.clone(),
+                started_at: self.segment_started_at.clone(),
+                ended_at: Known::unknown(),
+                start_turn: self.turns.len() as u64,
+                scope_conflict: false,
+                scope_unattributed: false,
+                scope_workdirs: Vec::new(),
+            };
+            // A draft that never received a turn is not a segment — this
+            // `turn_context` supersedes it. Keeping both would emit two
+            // windows with the same `start_turn`, and `finish` derives each
+            // window's end from the NEXT window's start: the first would end
+            // one turn before it began and validation would reject the whole
+            // rollout over an empty window nobody can observe.
+            match self.segments.last_mut() {
+                Some(last) if last.start_turn == draft.start_turn => *last = draft,
+                _ => self.segments.push(draft),
             }
         }
         Ok(())
+    }
+
+    /// Stamp the closing turn window with its effective scope: a window whose
+    /// explicit workdirs all normalize to one repo identity belongs to that
+    /// repo (even when the `turn_context` baseline says otherwise); proven
+    /// divergence marks the window conflicted, while unresolved foreign
+    /// evidence leaves a durable do-not-inherit mark.
+    fn finalize_window(&mut self) {
+        if self.window_workdirs.is_empty() {
+            return;
+        }
+        let Some(segment) = self.segments.last_mut() else {
+            return;
+        };
+        let baseline = match &segment.cwd {
+            Known::Value(cwd) => Some(cwd.as_str()),
+            Known::Unknown(_) => None,
+        };
+        let (scope, path) = effective_window_scope(&self.window_workdirs, baseline);
+        for workdir in self
+            .window_workdirs
+            .iter()
+            .filter_map(WorkdirEvidence::path)
+        {
+            let recorded = recorded_workdir(workdir, baseline);
+            if !segment.scope_workdirs.contains(&recorded) {
+                segment.scope_workdirs.push(recorded);
+            }
+        }
+        match scope {
+            WindowScope::Consistent => {
+                if let Some(path) = path {
+                    // The RECORDED cwd stays untouched: it is what the rollout
+                    // said, and the canonical fingerprint is built from it. The
+                    // resolved identity is host-specific evidence and travels
+                    // beside it.
+                    segment.scope_root = Some(path);
+                }
+            }
+            // The recorded cwd survives a conflict for the same reason it
+            // survives a re-scope: it is a fact of the rollout, and whether
+            // two workdirs are two checkouts is a question about THIS disk.
+            // Consumers that bucket by scope read `scope_conflict` and refuse
+            // the span; they never read the cwd as its project.
+            WindowScope::Conflict => {
+                segment.scope_conflict = true;
+            }
+            // Unresolved foreign evidence is a durable "do not inherit" mark:
+            // the window keeps its baseline cwd for structure, but downstream
+            // filters must never count it as positive project evidence.
+            WindowScope::Unattributed => {
+                segment.scope_unattributed = true;
+            }
+            WindowScope::Baseline => {}
+        }
     }
 
     fn event_msg(
@@ -1035,6 +1141,16 @@ impl<'a> Assembly<'a> {
         Ok(())
     }
 
+    /// Record that this window contains evidence we could not read.
+    fn note_opaque_window(&mut self, bytes: &[u8]) {
+        let prefix = String::from_utf8_lossy(bytes);
+        if crate::engine::truncated_record_is_tool_call(&prefix)
+            && !self.window_workdirs.contains(&WorkdirEvidence::Opaque)
+        {
+            self.window_workdirs.push(WorkdirEvidence::Opaque);
+        }
+    }
+
     fn push_tool_turn(
         &mut self,
         event: &Value,
@@ -1043,6 +1159,13 @@ impl<'a> Assembly<'a> {
         kind: ToolEventKind,
     ) -> Result<(), AdapterError> {
         let payload = &event["payload"];
+        if kind == ToolEventKind::Call {
+            for workdir in tool_call_workdirs(payload) {
+                if !self.window_workdirs.contains(&workdir) {
+                    self.window_workdirs.push(workdir);
+                }
+            }
+        }
         let correlation_raw = string_at(payload, &["call_id"])
             .or_else(|| string_at(payload, &["id"]))
             .map(str::to_owned);
@@ -1215,10 +1338,14 @@ impl<'a> Assembly<'a> {
         if self.segments.is_empty() {
             self.segments.push(SegmentDraft {
                 cwd: self.current_cwd.clone(),
+                scope_root: None,
                 branch: self.current_branch.clone(),
                 started_at: self.segment_started_at.clone(),
                 ended_at: Known::unknown(),
                 start_turn: 0,
+                scope_conflict: false,
+                scope_unattributed: false,
+                scope_workdirs: Vec::new(),
             });
         }
     }
@@ -1227,6 +1354,41 @@ impl<'a> Assembly<'a> {
         if let Some(segment) = self.segments.last_mut() {
             segment.ended_at = ended_at;
         }
+    }
+
+    /// Merge adjacent finalized turn windows with identical effective scope so
+    /// per-`turn_context` windowing never multiplies the session's segment
+    /// count on its own. Returns the merged drafts plus the old→new index
+    /// remap used to retarget `Turn::segment_id`.
+    fn merge_scope_windows(drafts: &[SegmentDraft]) -> (Vec<SegmentDraft>, Vec<u32>) {
+        let mut merged: Vec<SegmentDraft> = Vec::new();
+        let mut remap = Vec::with_capacity(drafts.len());
+        for draft in drafts {
+            let mergeable = matches!(
+                merged.last(),
+                Some(last)
+                    if last.cwd == draft.cwd
+                        && last.scope_root == draft.scope_root
+                        && last.branch == draft.branch
+                        && last.scope_conflict == draft.scope_conflict
+                        && last.scope_unattributed == draft.scope_unattributed
+            );
+            if mergeable {
+                if let Some(last) = merged.last_mut() {
+                    last.ended_at = draft.ended_at.clone();
+                    for workdir in &draft.scope_workdirs {
+                        if !last.scope_workdirs.contains(workdir) {
+                            last.scope_workdirs.push(workdir.clone());
+                        }
+                    }
+                }
+                remap.push(merged.len().saturating_sub(1) as u32);
+            } else {
+                remap.push(merged.len() as u32);
+                merged.push(draft.clone());
+            }
+        }
+        (merged, remap)
     }
 
     fn observe_skip(
@@ -1281,6 +1443,7 @@ impl<'a> Assembly<'a> {
     }
 
     fn finish(mut self, classified: Vec<ClassifiedUnit>) -> Result<UnvalidatedParse, AdapterError> {
+        self.finalize_window();
         if let Some(last) = self.segments.last_mut() {
             last.ended_at = self.ended_at.clone();
         }
@@ -1362,28 +1525,41 @@ impl<'a> Assembly<'a> {
         model.usage_events = self.usage;
         model.skill_invocations = self.skills;
         if !model.turns.is_empty() {
-            model.segments = self
-                .segments
+            let (drafts, remap) = Self::merge_scope_windows(&self.segments);
+            for turn in &mut model.turns {
+                if let Some(mapped) = remap.get(turn.segment_id as usize) {
+                    turn.segment_id = *mapped;
+                }
+            }
+            model.segments = drafts
                 .into_iter()
                 .enumerate()
                 .filter_map(|(id, segment)| {
                     let end = model.turns.len() as u64 - 1;
-                    // cwd/branch are constant inside a Codex segment by
-                    // construction (`turn_context` drift opens a new one), so
-                    // the verdict is homogeneous-or-unknown.
-                    let scope_status = ScopeStatus::from_evidence(
-                        match &segment.cwd {
-                            Known::Value(cwd) => Some(cwd.as_str()),
-                            Known::Unknown(_) => None,
-                        },
-                        match &segment.branch {
-                            Known::Value(branch) => Some(branch.as_str()),
-                            Known::Unknown(_) => None,
-                        },
-                    );
+                    // A conflict window is mixed by construction. Otherwise
+                    // cwd/branch are constant inside a Codex segment (the
+                    // effective scope was resolved per turn window), so the
+                    // verdict is homogeneous-or-unknown.
+                    let scope_status = if segment.scope_conflict {
+                        ScopeStatus::MixedCandidate
+                    } else if segment.scope_unattributed {
+                        ScopeStatus::Unattributed
+                    } else {
+                        ScopeStatus::from_evidence(
+                            match &segment.cwd {
+                                Known::Value(cwd) => Some(cwd.as_str()),
+                                Known::Unknown(_) => None,
+                            },
+                            match &segment.branch {
+                                Known::Value(branch) => Some(branch.as_str()),
+                                Known::Unknown(_) => None,
+                            },
+                        )
+                    };
                     (segment.start_turn <= end).then_some(Segment {
                         segment_id: id as u32,
                         cwd: segment.cwd,
+                        scope_root: segment.scope_root,
                         branch: segment.branch,
                         started_at: segment.started_at,
                         ended_at: segment.ended_at,
@@ -1392,6 +1568,8 @@ impl<'a> Assembly<'a> {
                             end,
                         },
                         scope_status,
+                        scope_conflict: segment.scope_conflict,
+                        scope_workdirs: segment.scope_workdirs,
                     })
                 })
                 .collect();
@@ -1840,6 +2018,155 @@ mod tests {
         parsed.into_model()
     }
 
+    fn parse_with_unit_cap(bytes: &[u8], id: &str, max_unit_bytes: usize) -> SessionModel {
+        let source = SourceHandle::new(
+            AgentKind::Codex,
+            id,
+            Some(id.to_owned()),
+            vec![
+                SourceArtifact::memory("rollout.jsonl", bytes.to_vec(), SourceFraming::JsonLines)
+                    .unwrap(),
+            ],
+        )
+        .unwrap();
+        let policy = ReaderPolicy {
+            max_unit_bytes,
+            ..ReaderPolicy::default()
+        };
+        let read = RawUnitReader::new(policy).read(&source).unwrap();
+        let adapter = CodexAdapter;
+        let classified = adapter.classify(&source, &read).unwrap();
+        let ValidatedParse::Session(parsed) = validate_parse(
+            adapter
+                .assemble(&source, &read, classified)
+                .expect("Codex assembly"),
+        )
+        .expect("Codex kernel validation") else {
+            panic!("session")
+        };
+        parsed.into_model()
+    }
+
+    /// An over-cap tool call is drained, never parsed, so its workdir never
+    /// reaches the window. Leaving the window looking clean kept the baseline
+    /// cwd on the surrounding messages — a foreign workdir leaking into the
+    /// parent project. The bounded index reader already fails closed here;
+    /// the full-parser lane must not disagree with it.
+    #[test]
+    fn an_oversized_tool_call_makes_its_window_unattributed() {
+        let oversized = format!(
+            r#"{{"timestamp":"2026-07-13T00:00:03Z","type":"response_item","payload":{{"type":"function_call","name":"shell","arguments":"{}"}}}}"#,
+            "x".repeat(2048)
+        );
+        let bytes = [
+            r#"{"timestamp":"2026-07-13T00:00:00Z","type":"session_meta","payload":{"id":"33333333-3333-4333-8333-333333333333","timestamp":"2026-07-13T00:00:00Z","cwd":"/repo/alpha","model":"gpt-test"}}"#,
+            r#"{"timestamp":"2026-07-13T00:00:01Z","type":"turn_context","payload":{"turn_id":"t1","cwd":"/repo/alpha","model":"gpt-test"}}"#,
+            r#"{"timestamp":"2026-07-13T00:00:02Z","type":"event_msg","payload":{"type":"user_message","message":"Run something big."}}"#,
+            &oversized,
+            r#"{"timestamp":"2026-07-13T00:00:04Z","type":"event_msg","payload":{"type":"agent_message","message":"Done."}}"#,
+        ]
+        .join("\n")
+            + "\n";
+
+        let model = parse_with_unit_cap(
+            bytes.as_bytes(),
+            "33333333-3333-4333-8333-333333333333",
+            512,
+        );
+
+        assert!(
+            model
+                .segments
+                .iter()
+                .any(|segment| segment.scope_status == ScopeStatus::Unattributed),
+            "an unreadable tool call must leave its window unattributed, got {:?}",
+            model
+                .segments
+                .iter()
+                .map(|segment| segment.scope_status)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Finding (P2-03): the session join let `MixedCandidate` outrank
+    /// `Unattributed`, so an ordinary branch switch in one checkout erased a
+    /// window whose evidence this host could not place — and handed the
+    /// session the one status that no longer refuses attribution.
+    #[test]
+    fn branch_drift_does_not_hide_an_unattributed_window() {
+        let oversized = format!(
+            r#"{{"timestamp":"2026-07-13T00:00:03Z","type":"response_item","payload":{{"type":"function_call","name":"shell","arguments":"{}"}}}}"#,
+            "x".repeat(2048)
+        );
+        let bytes = [
+            r#"{"timestamp":"2026-07-13T00:00:00Z","type":"session_meta","payload":{"id":"44444444-4444-4444-8444-444444444444","timestamp":"2026-07-13T00:00:00Z","cwd":"/repo/alpha","model":"gpt-test"}}"#,
+            r#"{"timestamp":"2026-07-13T00:00:01Z","type":"turn_context","payload":{"turn_id":"t1","cwd":"/repo/alpha","branch":"main","model":"gpt-test"}}"#,
+            r#"{"timestamp":"2026-07-13T00:00:02Z","type":"event_msg","payload":{"type":"user_message","message":"Run something big."}}"#,
+            &oversized,
+            r#"{"timestamp":"2026-07-13T00:00:05Z","type":"turn_context","payload":{"turn_id":"t2","cwd":"/repo/alpha","branch":"feature","model":"gpt-test"}}"#,
+            r#"{"timestamp":"2026-07-13T00:00:06Z","type":"event_msg","payload":{"type":"user_message","message":"Now on the feature branch."}}"#,
+        ]
+        .join("\n")
+            + "\n";
+
+        let model = parse_with_unit_cap(
+            bytes.as_bytes(),
+            "44444444-4444-4444-8444-444444444444",
+            512,
+        );
+        assert!(
+            model
+                .segments
+                .iter()
+                .any(|segment| segment.scope_status == ScopeStatus::Unattributed),
+            "fixture must carry an unattributed window: {:?}",
+            model.segments
+        );
+        assert_eq!(
+            model.scope_status(),
+            ScopeStatus::Unattributed,
+            "branch drift must not outrank unplaceable evidence"
+        );
+    }
+
+    /// A malformed tool call never becomes a `Value` either, so its workdir
+    /// is just as invisible as an over-cap one. Only the oversized case was
+    /// routed through the opaque path, so a truncated envelope carrying the
+    /// window's only foreign workdir left the window looking clean and the
+    /// surrounding messages kept the baseline cwd.
+    #[test]
+    fn a_malformed_tool_call_makes_its_window_unattributed() {
+        // Under the cap, but unparseable: the envelope is cut mid-record.
+        let malformed = concat!(
+            r#"{"timestamp":"2026-07-13T00:00:03Z","type":"response_item","payload":"#,
+            r#"{"type":"function_call","name":"shell","arguments":"{\"workdir\":\"/repo/beta\""#
+        );
+        let bytes = [
+            r#"{"timestamp":"2026-07-13T00:00:00Z","type":"session_meta","payload":{"id":"44444444-4444-4444-8444-444444444444","timestamp":"2026-07-13T00:00:00Z","cwd":"/repo/alpha","model":"gpt-test"}}"#,
+            r#"{"timestamp":"2026-07-13T00:00:01Z","type":"turn_context","payload":{"turn_id":"t1","cwd":"/repo/alpha","model":"gpt-test"}}"#,
+            r#"{"timestamp":"2026-07-13T00:00:02Z","type":"event_msg","payload":{"type":"user_message","message":"Run something."}}"#,
+            malformed,
+            r#"{"timestamp":"2026-07-13T00:00:04Z","type":"event_msg","payload":{"type":"agent_message","message":"Done."}}"#,
+        ]
+        .join("\n")
+            + "\n";
+
+        let model = parse(bytes.as_bytes(), "44444444-4444-4444-8444-444444444444");
+
+        assert!(
+            model
+                .segments
+                .iter()
+                .any(|segment| segment.scope_status == ScopeStatus::Unattributed),
+            "an unreadable tool call must leave its window unattributed, got {:?}",
+            model
+                .segments
+                .iter()
+                .map(|segment| segment.scope_status)
+                .collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn minimal_oracle_and_explicit_source() {
         let bytes = include_bytes!("../../../../tests/fixtures/parser_engine/codex/minimal.jsonl");
@@ -1848,6 +2175,55 @@ mod tests {
         assert_eq!(model.turns[0].role, TurnRole::User);
         assert_eq!(model.coverage.raw_line_count, 4);
         assert_eq!(model.coverage.skipped_count, 0);
+    }
+
+    /// Two `turn_context` records with no turn between them used to leave a
+    /// zero-turn window. `finish` derives each window's end from the NEXT
+    /// window's start, so that window ended one turn before it began and
+    /// kernel validation rejected an otherwise parseable rollout outright.
+    #[test]
+    fn consecutive_turn_contexts_do_not_break_an_otherwise_parseable_rollout() {
+        let bytes = concat!(
+            r#"{"timestamp":"2026-07-13T00:00:00Z","type":"session_meta","payload":{"id":"22222222-2222-4222-8222-222222222222","timestamp":"2026-07-13T00:00:00Z","cwd":"/repo/alpha","model":"gpt-test"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-07-13T00:00:01Z","type":"turn_context","payload":{"turn_id":"t1","cwd":"/repo/alpha","model":"gpt-test"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-07-13T00:00:02Z","type":"event_msg","payload":{"type":"user_message","message":"Work in alpha."}}"#,
+            "\n",
+            r#"{"timestamp":"2026-07-13T00:00:03Z","type":"turn_context","payload":{"turn_id":"t2","cwd":"/repo/beta","model":"gpt-test"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-07-13T00:00:04Z","type":"turn_context","payload":{"turn_id":"t3","cwd":"/repo/gamma","model":"gpt-test"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-07-13T00:00:05Z","type":"event_msg","payload":{"type":"user_message","message":"Now work in gamma."}}"#,
+            "\n",
+        )
+        .as_bytes();
+
+        // `parse` panics on kernel validation failure — surviving it IS the
+        // assertion this finding is about.
+        let model = parse(bytes, "22222222-2222-4222-8222-222222222222");
+        assert_eq!(model.turns.len(), 2);
+        for segment in &model.segments {
+            assert!(
+                segment.turn_range.end >= segment.turn_range.start,
+                "a window must not end before it starts: {:?}",
+                segment.turn_range
+            );
+        }
+        // The superseded `beta` context never held a turn; the last context
+        // before the turn is the one that scopes it.
+        let scopes: Vec<Option<&str>> = model
+            .segments
+            .iter()
+            .map(|segment| match &segment.cwd {
+                Known::Value(cwd) => Some(cwd.as_str()),
+                Known::Unknown(_) => None,
+            })
+            .collect();
+        assert!(
+            !scopes.contains(&Some("/repo/beta")),
+            "a context with no turn must not become a segment: {scopes:?}"
+        );
     }
 
     #[test]
@@ -1933,6 +2309,237 @@ mod tests {
             1
         );
         assert!(base_ids.iter().all(|id| !id.contains('/')));
+    }
+
+    /// Substitute a filesystem path into a JSONL fixture: a Windows path is
+    /// `C:\Users\…`, and pasting it raw into a JSON string literal produces
+    /// invalid escapes (`\U`), so the record silently fails to parse.
+    fn json_path(path: &Path) -> String {
+        let quoted = Value::String(path.display().to_string()).to_string();
+        quoted[1..quoted.len() - 1].to_string()
+    }
+
+    fn temp_repo(label: &str) -> std::path::PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("aicx-codex-scope-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".git")).expect("temp repo git dir");
+        root
+    }
+
+    /// 60b7-shaped: the session baseline stays `vista` in every turn_context,
+    /// but one turn window runs its executable tool calls with an explicit
+    /// foreign workdir. The whole window — including the message BEFORE the
+    /// first tool call — takes the workdir's repo scope.
+    ///
+    /// The scope lands in `scope_root`, NOT in `cwd`: `cwd` is what the
+    /// rollout recorded and feeds the canonical fingerprint, while the repo
+    /// root is this host's resolution of the workdir and must stay out of it.
+    #[test]
+    fn tool_call_workdir_rescopes_the_whole_turn_window() {
+        let fleet = temp_repo("fleet");
+        // Identities are canonical, so the stamped scope is the canonical
+        // root (a temp dir is commonly reached through a symlink).
+        let fleet_str = std::fs::canonicalize(&fleet)
+            .unwrap_or_else(|_| fleet.clone())
+            .to_string_lossy()
+            .into_owned();
+        let template = r#"{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"s1","cwd":"/sessions/vista"}}
+{"timestamp":"2026-01-01T00:01:00Z","type":"turn_context","payload":{"cwd":"/sessions/vista"}}
+{"timestamp":"2026-01-01T00:01:10Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"vista opening question"}]}}
+{"timestamp":"2026-01-01T00:02:00Z","type":"turn_context","payload":{"cwd":"/sessions/vista"}}
+{"timestamp":"2026-01-01T00:02:05Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Biore fleet task"}]}}
+{"timestamp":"2026-01-01T00:02:10Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"c1","input":"const r = await tools.exec_command({cmd:\"npm test\",\"workdir\":\"@FLEET@\"});"}}
+{"timestamp":"2026-01-01T00:03:00Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"fleet summary"}]}}
+{"timestamp":"2026-01-01T00:04:00Z","type":"turn_context","payload":{"cwd":"/sessions/vista"}}
+{"timestamp":"2026-01-01T00:04:10Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"back to vista"}]}}
+"#;
+        let bytes = template.replace("@FLEET@", &json_path(&fleet));
+        let model = parse(bytes.as_bytes(), "s1");
+        assert_eq!(model.segments.len(), 3, "{:?}", model.segments);
+        let seg_cwds: Vec<Option<&str>> = model
+            .segments
+            .iter()
+            .map(|segment| known_value(&segment.cwd))
+            .collect();
+        assert_eq!(
+            seg_cwds,
+            vec![
+                Some("/sessions/vista"),
+                Some("/sessions/vista"),
+                Some("/sessions/vista")
+            ],
+            "the recorded baseline is a fact and is never overwritten"
+        );
+        let seg_scopes: Vec<Option<&str>> = model
+            .segments
+            .iter()
+            .map(|segment| segment.scope_root.as_deref())
+            .collect();
+        assert_eq!(
+            seg_scopes,
+            vec![None, Some(fleet_str.as_str()), None],
+            "the resolved repo identity rides the non-canonical field"
+        );
+        // Finding (P2-02): every recorded cwd is `vista`, so a session verdict
+        // read from `cwd` alone called this one checkout with no drift.
+        assert_eq!(
+            model.scope_status(),
+            ScopeStatus::MixedCandidate,
+            "a session that worked in two checkouts is not one with no drift"
+        );
+        let fleet_window_turns: Vec<&Turn> = model
+            .turns
+            .iter()
+            .filter(|turn| turn.segment_id == 1)
+            .collect();
+        assert!(
+            fleet_window_turns
+                .iter()
+                .any(|turn| turn.text.contains("Biore fleet task")),
+            "message before the first tool call shares the window scope"
+        );
+        let _ = std::fs::remove_dir_all(&fleet);
+    }
+
+    /// Two explicit workdirs resolving to two real repo roots inside one turn
+    /// window: mixed/unattributed, never guessed into either project.
+    #[test]
+    fn conflicting_workdirs_mark_the_window_mixed() {
+        let repo_a = temp_repo("conflict-a");
+        let repo_b = temp_repo("conflict-b");
+        let template = r#"{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"s1","cwd":"/sessions/vista"}}
+{"timestamp":"2026-01-01T00:01:00Z","type":"turn_context","payload":{"cwd":"/sessions/vista"}}
+{"timestamp":"2026-01-01T00:01:10Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"c1","input":"const a = await tools.exec_command({cmd:\"ls\",\"workdir\":\"@A@\"});"}}
+{"timestamp":"2026-01-01T00:01:20Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"c2","input":"const b = await tools.exec_command({cmd:\"ls\",\"workdir\":\"@B@\"});"}}
+{"timestamp":"2026-01-01T00:02:00Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"worked in two repos"}]}}
+"#;
+        let bytes = template
+            .replace("@A@", &json_path(&repo_a))
+            .replace("@B@", &json_path(&repo_b));
+        let model = parse(bytes.as_bytes(), "s1");
+        assert_eq!(model.segments.len(), 1, "{:?}", model.segments);
+        assert!(model.segments[0].scope_conflict);
+        assert_eq!(model.segments[0].scope_status, ScopeStatus::MixedCandidate);
+        assert_eq!(model.segments[0].scope_root, None);
+        // The recorded baseline is a fact of the rollout; the conflict is a
+        // judgement about this disk and lives in `scope_conflict` only.
+        assert_eq!(known_value(&model.segments[0].cwd), Some("/sessions/vista"));
+        // Both workdirs survive as recorded evidence, so a privacy filter can
+        // still judge the checkouts that caused the conflict.
+        let recorded: Vec<String> = [&repo_a, &repo_b]
+            .iter()
+            .map(|repo| recorded_workdir(&repo.to_string_lossy(), None))
+            .collect();
+        assert_eq!(model.segments[0].scope_workdirs, recorded);
+        let _ = std::fs::remove_dir_all(&repo_a);
+        let _ = std::fs::remove_dir_all(&repo_b);
+    }
+
+    fn canonical_of(bytes: &[u8], id: &str) -> String {
+        let source = SourceHandle::new(
+            AgentKind::Codex,
+            id,
+            Some(id.to_owned()),
+            vec![
+                SourceArtifact::memory("rollout.jsonl", bytes.to_vec(), SourceFraming::JsonLines)
+                    .unwrap(),
+            ],
+        )
+        .unwrap();
+        let read = RawUnitReader::new(ReaderPolicy::default())
+            .read(&source)
+            .unwrap();
+        let adapter = CodexAdapter;
+        let classified = adapter.classify(&source, &read).unwrap();
+        let ValidatedParse::Session(parsed) =
+            validate_parse(adapter.assemble(&source, &read, classified).unwrap()).unwrap()
+        else {
+            panic!("session")
+        };
+        crate::engine::canonical_fingerprint(&parsed).expect("canonical fingerprint")
+    }
+
+    /// The canonical fingerprint is a function of the source bytes, not of
+    /// the disk they are parsed on. The same rollout is parsed before and
+    /// after the checkouts its workdirs name exist: the scope verdicts flip
+    /// (unattributed → conflict, baseline → nested checkout) and so does the
+    /// model's segmentation, but the canonical projection must not move.
+    #[test]
+    fn scope_verdicts_never_move_the_canonical_fingerprint() {
+        let base =
+            std::env::temp_dir().join(format!("aicx-codex-canonical-disk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let parent = base.join("parent");
+        let nested = parent.join("nested");
+        let repo_a = base.join("repo-a");
+        let repo_b = base.join("repo-b");
+        for dir in [&nested, &repo_a, &repo_b] {
+            std::fs::create_dir_all(dir).expect("scratch dir");
+        }
+        std::fs::create_dir_all(parent.join(".git")).expect("parent checkout");
+        let template = r#"{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"s1","cwd":"@PARENT@"}}
+{"timestamp":"2026-01-01T00:01:00Z","type":"turn_context","payload":{"cwd":"@PARENT@"}}
+{"timestamp":"2026-01-01T00:01:10Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"start in parent"}]}}
+{"timestamp":"2026-01-01T00:02:00Z","type":"turn_context","payload":{"cwd":"@PARENT@"}}
+{"timestamp":"2026-01-01T00:02:10Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"c1","input":"await tools.exec_command({cmd:\"ls\",\"workdir\":\"@NESTED@\"});"}}
+{"timestamp":"2026-01-01T00:02:20Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"inside nested"}]}}
+{"timestamp":"2026-01-01T00:03:00Z","type":"turn_context","payload":{"cwd":"@PARENT@"}}
+{"timestamp":"2026-01-01T00:03:10Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"c2","input":"await tools.exec_command({cmd:\"ls\",\"workdir\":\"@A@\"});"}}
+{"timestamp":"2026-01-01T00:03:20Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"c3","input":"await tools.exec_command({cmd:\"ls\",\"workdir\":\"@B@\"});"}}
+{"timestamp":"2026-01-01T00:03:30Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"two repos"}]}}
+{"timestamp":"2026-01-01T00:04:00Z","type":"turn_context","payload":{"cwd":"@PARENT@"}}
+{"timestamp":"2026-01-01T00:04:10Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"back in parent"}]}}
+"#;
+        let bytes = template
+            .replace("@PARENT@", &json_path(&parent))
+            .replace("@NESTED@", &json_path(&nested))
+            .replace("@A@", &json_path(&repo_a))
+            .replace("@B@", &json_path(&repo_b));
+
+        let before_model = parse(bytes.as_bytes(), "s1");
+        let before = canonical_of(bytes.as_bytes(), "s1");
+
+        for dir in [&nested, &repo_a, &repo_b] {
+            std::fs::create_dir_all(dir.join(".git")).expect("checkout marker");
+        }
+        let after_model = parse(bytes.as_bytes(), "s1");
+        let after = canonical_of(bytes.as_bytes(), "s1");
+
+        assert!(
+            after_model
+                .segments
+                .iter()
+                .any(|segment| segment.scope_conflict),
+            "the scenario must actually flip a verdict: {:?}",
+            after_model.segments
+        );
+        assert_ne!(
+            before_model.segments.len(),
+            after_model.segments.len(),
+            "the scenario must actually move the model's segmentation"
+        );
+        assert_eq!(before, after, "disk state moved the canonical fingerprint");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Turn windows never multiply segments on their own: repeated
+    /// turn_context records with one homogeneous scope merge back into the
+    /// single segment the session had before windowing.
+    #[test]
+    fn homogeneous_windows_merge_back_into_one_segment() {
+        let bytes = br#"{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"s1","cwd":"/sessions/vista"}}
+{"timestamp":"2026-01-01T00:01:00Z","type":"turn_context","payload":{"cwd":"/sessions/vista"}}
+{"timestamp":"2026-01-01T00:01:10Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"first question"}]}}
+{"timestamp":"2026-01-01T00:02:00Z","type":"turn_context","payload":{"cwd":"/sessions/vista"}}
+{"timestamp":"2026-01-01T00:02:10Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"first answer"}]}}
+{"timestamp":"2026-01-01T00:03:00Z","type":"turn_context","payload":{"cwd":"/sessions/vista"}}
+{"timestamp":"2026-01-01T00:03:10Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"second question"}]}}
+"#;
+        let model = parse(bytes, "s1");
+        assert_eq!(model.segments.len(), 1, "{:?}", model.segments);
+        assert_eq!(known_value(&model.segments[0].cwd), Some("/sessions/vista"));
+        assert!(model.turns.iter().all(|turn| turn.segment_id == 0));
     }
 
     #[test]

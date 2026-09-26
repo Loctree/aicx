@@ -5,6 +5,282 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
+### Turn-level project scope, decided by repository identity
+
+`aicx intents -p <project>` used to attribute a whole session to the repo its
+`turn_context` declared, so a workstream that moved to another checkout leaked
+into the wrong project. Scope is now a per-turn-window verdict built from the
+explicit `workdir` of executable tool calls, reduced at **repo-root identity**
+— never by path prefix, so a nested checkout or submodule does not join its
+parent's bucket. Unreadable or unresolvable evidence is a durable
+"unattributed" state that inherits nothing, instead of silently keeping the
+baseline. Branch drift inside one checkout is not scope drift and keeps its
+intents. Foreign frames are removed from the parent project; they are not
+re-homed to the foreign one (see `docs/COMMANDS.md`).
+
+Codex guardian/approval subagent sessions (`session_meta.source.subagent`) are
+classified as control-plane evidence: preserved in extract, index and
+conversations, never served as operator intents. The match is exact
+(`subagent:guardian`), and provenance is resolved from the rollout header when
+the catalog column is cold, so no catalog rebuild is a prerequisite. A
+guardian stays out of the mixed-scope telemetry too, so it cannot make
+`continuity` refuse, and the header probe reads as far as the catalog does
+(128 records, 256 KiB in total).
+
+Repository identity is canonical and existence-checked: a workdir that is not
+there resolves to nothing (an ancestor's `.git` says nothing about a directory
+that was deleted), a relative workdir is resolved against the turn's cwd rather
+than wherever `aicx` runs, and one checkout reached through a symlink or a
+`/var` vs `/private/var` spelling is one identity. A window that ran tools in
+both the baseline and another checkout is a conflict, not a wholesale re-scope
+to the foreign root, and every `workdir` in an orchestrated tool call is read,
+not just the first.
+
+Membership and identity-counting are now separate judgements. A path that no
+longer exists cannot be served as a project (membership fails closed) and is
+not counted as a second repository either (identity fails open), because an
+unattributed window has its frames dropped outright — so a deleted `target/`
+or a cleaned-up worktree no longer deletes ordinary operator evidence. The
+exception is a submodule the parent still declares in `.gitmodules`, which
+keeps its own identity after its working tree is gone. Scope is judged before
+`.aicxignore` hides a checkout: hidden repositories are counted, never named.
+A session consistently re-scoped to a single foreign checkout is flagged as
+foreign instead of passing as homogeneous. The Codex provenance probe is now
+bounded in bytes as well as records.
+
+`SIGNAL_FILTER_VERSION` is `signal-v6-scope-fails-closed`: one `aicx index`
+rebuild re-stamps chunk scope metadata. Frames re-scoped by explicit workdir
+evidence now carry the CANONICAL repo root as their scope. Because that
+canonical spelling is what `.aicxignore` is compared against, checkout denials
+now match in every spelling both sides can produce: a rule written as
+`/var/...` still hides a frame stamped `/private/var/...`, and any checkout
+reached through a symlink stays hidden. The deny-list fingerprint is therefore
+`v3` — it covers the RESOLVED targets as well as the rule text, so retargeting
+a symlink invalidates caches built under the old target instead of quietly
+republishing a newly denied checkout. Resolving an incoming cwd is now lazy
+(a literal hit never asks the filesystem) and memoized per distinct cwd, so a
+large history pays one resolution per cwd rather than one per frame.
+Spellings are reconciled through the indexing host's filesystem: the recorded
+spelling always matches literally, a symlinked one only while the link
+resolves there.
+
+A frame is judged against the deny list on every path its turn window ran in,
+not only on the scope it is served under: each tool-call workdir the window
+recorded, and the recorded cwd whenever the verdict took it out of the
+frame's `cwd` (a re-scope serves the workdirs' root, a conflict serves none).
+Judging the served scope alone published a conflict window that touched a
+denied checkout — it has no `cwd` to test — and the windows of a session run
+from a denied checkout that worked on another repository. Windows merged into
+one span are judged on the union of their paths, which can over-hide a
+neighbouring frame: fail closed on purpose.
+
+One question, one predicate. "Is this session's scope mixed?" is answered by
+`ScopeReport::scope_mixed()` everywhere — the single-history refusal, the
+mixed-workstream telemetry and the project filter — instead of the generic
+`ScopeStatus`, which reports an ordinary branch switch inside one checkout as
+mixed and stays silent when `.aicxignore` hid a whole scope. A scope hidden by
+the privacy filter is evidence of another checkout, so it blocks bucket
+inheritance for frames that carry no cwd of their own, even when nothing
+visible remains to compare it against. `continuity` rebuilds that report from
+each session's conflicts and hidden-scope count, so a window whose every
+session is mixed only by a proven conflict or by a hidden checkout is refused
+like any other mixed window. It also refuses when the intents filters had
+already removed every frame of the mixed sessions: what decides is whether
+anything homogeneous is left, not whether the gate itself withheld something. The session-level `ScopeStatus` (served over MCP)
+counts each span's resolved `scope_root` next to its recorded cwd, so a
+session that worked in a second repository is `mixed_candidate`, not
+`no_drift_observed`; and `unattributed` now outranks `mixed_candidate` in the
+join, so a branch switch cannot erase a window this host cannot place.
+
+Identity is anchored where it is defined and never replaces evidence someone
+else reads. `.gitmodules` is resolved from the checkout ROOT, so a submodule
+declared by a repository is still recognised when the session stood in a
+subdirectory. A frame cwd that resolves to a real checkout here and cannot
+prove membership fails closed instead of falling through to the legacy
+path-spelling filter — which would re-admit `…/vista/vendor/fleet-bus` for
+`-p vista` precisely when the session's own baseline is historical. Cached
+extracts are no longer reused across a change of catalog cwd, since the scope
+verdicts they carry were computed against the previous one.
+
+Two adapter-level repairs in the same area: a Codex rollout with two
+consecutive `turn_context` records and no turn between them no longer produces
+an empty window whose range ends before it starts, which had made the whole
+rollout fail kernel validation; and an unreadable tool call in the full-parser
+lane now contributes the same "unreadable evidence" mark the bounded index
+reader already recorded, so its window fails closed instead of keeping the
+baseline cwd. Unreadable covers both ways in, in both readers — an over-cap
+record that is drained without parsing, and a malformed one that fails to
+parse — because the reason we could not read it makes no difference to the
+scope.
+
+The evidence readers take their input at its word. A `workdir` literal runs to
+the quote that opened it, so `"/Users/O'Brien/repo"` is no longer cut to
+`/Users/O`; a JavaScript template literal is read like any other string, and
+one that interpolates — or any literal that never closes — is unreadable
+evidence rather than a fabricated path. A truncated record's `type` counts as
+read only when its value survived the cap, so an envelope plus a payload type
+cut mid-value no longer passes as two readable discriminators. Where lexical
+containment is the only evidence, a Windows spelling is compared the way
+Windows resolves it: `C:/repo` contains `C:\repo\pkg` and `c:\REPO\pkg`, so a
+rollout that mixes separators or case keeps its intents.
+
+A `workdir` that is not a literal at all is unreadable evidence as well. That
+covers a variable, an expression, and the shorthand `{cmd, workdir}`: each
+names a directory only the runtime knew. Such a call into another checkout no
+longer leaves its window on the baseline. `null` and `undefined` still ask for
+the default directory, and a `workdir:` in prose (not an object property)
+names nothing. A literal is read only when it is the whole value:
+`"/repos/vista" + "-private"` is an expression, so the call is unreadable
+evidence rather than `/repos/vista`. A comment between the operands changes
+nothing: `"/repos/vista" /* note */ + "-private"` is the same expression, and a
+block comment that never closes leaves the value unreadable. Only the whole property name is read, so
+`networkdir` and `fallback_workdir` are other properties. A Windows `workdir` rooted without a
+drive (`\repo\pkg`) now sits on the drive of the turn's cwd and matches
+`C:\repo`, instead of matching nothing.
+
+The bounded reader for over-cap Codex rollouts now agrees with the full
+adapter in two places where they had drifted apart:
+
+- A `turn_context` without a cwd leaves that turn's directory unknown. The
+  bounded reader used to keep the previous turn's directory.
+- `web_search_call` is scoped as a call. One shared predicate now names the
+  call types for every reader.
+
+A session also counts as mixed only when its cwds name more than one
+repository. Previously, more than one spelling was enough, so a session that
+moved from `/repo` into `/repo/pkg` read as mixed and its cwd-less frames were
+dropped from project results. The count fails open the way the turn-window
+reduction does: a cwd that no longer exists (a deleted build directory, a
+removed worktree) is not a second repository while a checkout that plausibly
+contains it was observed, in whatever order the cwds were recorded. A
+submodule its parent still declares in `.gitmodules` keeps counting on its
+own.
+
+#### Host resolution is out of the deterministic parser model
+
+Resolving repository identity reads the local filesystem: which checkouts
+exist, how symlinks resolve, what `.gitmodules` declares. Folding that answer
+into `Segment::cwd` put it into the canonical projection, so identical rollout
+bytes produced different canonical fingerprints on different machines. The
+recorded cwd is a fact and stays one; the resolved repo root now rides
+`Segment::scope_root`, which is deliberately excluded from
+`canonical_bytes`/`canonical_fingerprint`. Consumers that want the resolved
+bucket read it and fall back to the recorded `cwd`. A conflict no longer
+erases the recorded cwd either: the span keeps it and `scope_conflict` carries
+the verdict, while scope attribution (report timeline, brief) still gives a
+conflict span no project. Verdicts also cut segments along this disk, so the
+canonical projection folds adjacent segments that record the same cwd and
+branch; a scope-only cut never reaches the fingerprint, and every existing
+golden fixture keeps its bytes. `extract --brief` counts a span's
+`scope_root` next to the recorded cwds, as the session `ScopeStatus` does: a
+one-segment session launched in one checkout and re-scoped to another gets the
+multi-workstream header instead of reading as a single workstream.
+
+The verdicts derived from that resolution are cached, so the cache now knows
+what they depended on. The parse ledger records, per session, every working
+directory the source wrote down — each turn's cwd and each tool-call
+workdir, taken before any scope reduction, so a workdir absorbed into its
+parent still counts — together with how each resolves on this host and the
+`.gitmodules` of the checkout it sits in. `aicx index` answers `unchanged`
+only while that recorded layout still holds, and reuses a cached extract only
+under the same condition: a nested checkout created or removed, or a
+`.gitmodules` edited, reparses the affected sessions even though their source
+bytes and catalog rows are untouched. A missing ledger proves no layout and
+never short-circuits.
+
+#### Absence is not an answer
+
+Three places read a missing value as a clean one. A catalog row with a project
+but no cwd gave the per-frame filter nothing to prove membership against, and
+published the whole session under that project while the census lane rejected
+the very same frames — the two lanes disagreeing about one session; a row with
+frame cwd evidence and no baseline is now routed through the census lane. An
+index chunk written before the scope keys existed carried none of them, and
+every reader took that for "not mixed, not unattributed, not a guardian"; such
+a chunk is now re-sourced rather than served, since the index schema version
+does not move for a metadata addition. And the fail-closed threshold for an
+unreadable record counted raw `"type":` substrings anywhere in the visible
+bytes, so an `arguments` payload carrying its own `type` field could raise the
+count past the threshold and talk itself out of being treated as opaque; the
+scan is now structural, counting only discriminators at record and payload
+depth.
+
+A submodule's descendants are the submodule's repository too: `.gitmodules`
+paths are matched on a path-component boundary, so a vanished
+`vendor/fleet-bus/src` is no longer absorbed into the parent checkout while
+`vendor/fleet-bus-old` correctly is not. `.gitmodules` is read as git reads it,
+as git-config: case-insensitive section and key names, quoted values
+(`path = "vendor/fleet bus"`), `;`/`#` comments outside quotes, escapes and
+line continuation, and legacy `[submodule.name]` headers; only
+`submodule.*.path` declares a path. Only a lowercase, unquoted `path = x` line
+used to count, so a quoted declaration was invisible and its vanished tree was
+absorbed by the parent — the fail-open direction.
+
+A path is judged in its own spelling, not the host's. A Windows rollout
+(`C:\…`, `C:/…`, UNC) read on Unix, or the reverse, keeps an absolute
+baseline, so its relative workdirs still resolve against it instead of every
+window turning unattributed. The filesystem is probed only for a path that is
+absolute on this host; a foreign spelling is never resolved against the
+process cwd.
+
+#### Public API (source-breaking for struct-literal construction)
+
+- `aicx_parser::timeline::TimelineEntry` gains `scope_conflict: bool`,
+  `scope_unattributed: bool` and `session_kind: Option<String>`. All three
+  serialize only when set and deserialize with defaults, so stored JSON stays
+  compatible in both directions; code that builds the struct with a literal
+  must add the fields.
+- `aicx_parser::engine::ScopeStatus` gains the `Unattributed` variant —
+  exhaustive matches over it need a new arm. Older readers deserializing a
+  model that contains it will reject the value, which is why
+  `SESSION_MODEL_SCHEMA` moves to `aicx.parser.session_model.v2`. The emitted
+  grammar is enumerated once in `ScopeStatus::ALL` and
+  `docs/OUTPUT_PROJECTION_CONTRACT.md` is held to it by a contract test: that
+  document had been declaring `homogeneous`, a value renamed before this
+  release, and never learned about `unattributed`.
+- `aicx_parser::engine::Segment` gains `scope_root: Option<String>` (serde
+  default, skipped when absent): this host's resolution of the span's explicit
+  tool-call workdirs. It is NOT part of the canonical projection — see above.
+  Code that builds `Segment` with a literal must add the field.
+- `aicx_parser::engine::Segment` gains `scope_conflict: bool` (serde default):
+  the explicit "two proven repository identities" fact, which downstream
+  filters read instead of inferring it from `ScopeStatus::MixedCandidate` —
+  that status is also how ordinary branch drift is recorded. Code that builds
+  `Segment` with a literal must add the field.
+- `aicx_parser::engine::Segment` gains `scope_workdirs: Vec<String>` (serde
+  default, skipped when empty): the span's tool-call workdirs as recorded,
+  joined onto the baseline and lexically normalized, with no filesystem
+  access. Like `scope_root` it stays out of the canonical projection.
+  `TimelineEntry` gains the same field as filter input only (never
+  serialized), plus the recorded cwd whenever the verdict took it out of
+  `cwd`. Code that builds either struct with a literal must add the field.
+- `aicx_parser::engine` exports `recorded_workdir` (the host-independent form
+  of a workdir) and `scope_layout_evidence` (what a scope verdict reads from
+  this host for one path: its resolution and its checkout's `.gitmodules`),
+  which the parse ledger fingerprints.
+- `ScopeStatus::join` ranks `Unattributed` above `MixedCandidate`.
+- `aicx::intents::MixedScopeSession` gains `conflicts`, `hidden_scopes` and
+  `status`. It is serialized, so payloads that carry it gain the three keys —
+  the hidden scopes as a count, never as paths. Code that builds it with a
+  literal must add the fields.
+- `aicx::extraction::conversation::ScopeReport` gains `hidden_scopes: usize`
+  (distinct cwds removed by `.aicxignore` before the report was built) and the
+  `scope_foreign_to(baseline)` method; `scope_mixed()` now counts hidden
+  scopes. Code that builds `ScopeReport` with a literal must add the field.
+- `aicx_parser::engine::truncated_record_is_tool_call` is now public: both the
+  bounded index reader and the full parser decide "did an unreadable record
+  hide a workdir?" from this one implementation.
+- `aicx_parser::engine` exports `WorkdirEvidence`, `workdir_within_scope` and
+  `distinct_repo_identity`; `effective_window_scope` takes
+  `&[WorkdirEvidence]` instead of `&[String]`; `normalize_workdir` takes the
+  turn baseline (relative workdirs resolve against it, never against the
+  process cwd); `tool_call_workdir` is replaced by `tool_call_workdirs`,
+  which returns every workdir in the payload.
+- `aicx::sessions::SessionInfo` gains `session_kind: Option<String>`
+  (serialize-only type; it stays part of the slim `loctree-consumer` read
+  core). The slim profile reads legacy chunk artifacts only, so the
+  catalog/index scope and guardian lanes do not apply to it.
+
 ## [0.14.0] - 2026-09-18
 
 ### Cursor is a first-class agent lane

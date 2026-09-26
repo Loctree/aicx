@@ -761,6 +761,10 @@ pub fn lineage_entries(
             frame_kind: Some(FrameKind::SystemNote),
             branch: None,
             cwd: None,
+            scope_conflict: false,
+            scope_unattributed: false,
+            scope_workdirs: Vec::new(),
+            session_kind: None,
             timestamp_source: Some("lineage_walk".to_string()),
             source_path: None,
             source_sha256: None,
@@ -858,6 +862,79 @@ pub struct ScopeReport {
     pub cwds: Vec<String>,
     pub branches: Vec<String>,
     pub entries: usize,
+    /// Entries whose turn-window workdir evidence conflicted (more than one
+    /// repo identity). Any conflict makes the span a mixed candidate on its
+    /// own — unknown scope never inherits a project bucket by silence.
+    pub conflicts: usize,
+    /// Distinct cwds that existed in the session but were removed before this
+    /// report was built, because `.aicxignore` hides those repositories.
+    ///
+    /// The COUNT is kept and the path deliberately is not: a hidden repository
+    /// must not be re-published through the scope surface, but a session whose
+    /// baseline was hidden must not look homogeneous either — that is how a
+    /// foreign cwd plus cwd-less frames would inherit the cataloged project.
+    pub hidden_scopes: usize,
+}
+
+impl ScopeReport {
+    /// Does this session actually span more than one scope?
+    ///
+    /// `status` alone cannot answer that: `ScopeStatus::MixedCandidate` is
+    /// also how an ordinary branch switch inside ONE unchanged checkout is
+    /// recorded. Whole-session attribution stays valid there — only a proven
+    /// workdir conflict or more than one observed repository makes a session
+    /// unservable as one bucket.
+    pub fn scope_mixed(&self) -> bool {
+        // A hidden scope is evidence of another checkout, not absence of it.
+        // `.aicxignore` can remove a session's ONLY cwd-bearing frames, and
+        // what remains then looks homogeneous while we positively know it is
+        // not — so one hidden scope is already mixed, with or without a second
+        // visible one.
+        self.conflicts > 0 || self.hidden_scopes > 0 || self.observed_repositories() > 1
+    }
+
+    /// How many repositories the observed cwds name.
+    ///
+    /// Two spellings inside one checkout — `/repo` and `/repo/pkg` after a
+    /// `cd` — are one repository; a nested checkout or submodule is its own.
+    /// Counting raw strings called every such session mixed, and its cwd-less
+    /// frames were then dropped from project results.
+    ///
+    /// This is an identity count, not a membership test, so it fails OPEN
+    /// the way the turn-window reduction does: a path that no longer exists —
+    /// a deleted `target/tmp-build`, a removed worktree — is not evidence of
+    /// a second repository while a checkout that plausibly contains it was
+    /// observed. Where nothing resolves on this host, lexical containment
+    /// decides, so two unrelated historical paths still count twice.
+    fn observed_repositories(&self) -> usize {
+        aicx_parser::engine::repository_count(self.cwds.iter().map(String::as_str))
+    }
+
+    /// Does this session hold anything the cataloged checkout cannot claim?
+    ///
+    /// [`Self::scope_mixed`] answers "more than one scope", which a session
+    /// re-scoped wholesale to ONE foreign checkout passes: one cwd, no
+    /// conflict, internally perfectly consistent — and every frame of it
+    /// belongs to another repository. Whole-session attribution is only safe
+    /// when the observed scope is also the cataloged one.
+    pub fn scope_foreign_to(&self, baseline: Option<&str>) -> bool {
+        if self.scope_mixed() {
+            return true;
+        }
+        match baseline.map(str::trim).filter(|base| !base.is_empty()) {
+            Some(base) => self
+                .cwds
+                .iter()
+                .any(|cwd| !aicx_parser::engine::workdir_within_scope(cwd, base)),
+            // No cataloged checkout at all, but frames that name one. There
+            // is nothing to prove membership AGAINST, and "cannot prove" is
+            // not "belongs here": serving the session whole would stamp every
+            // frame with the catalog row's project on no evidence, while the
+            // per-frame census lane rejects exactly those cwds because it
+            // cannot prove them either. The two lanes have to agree.
+            None => !self.cwds.is_empty(),
+        }
+    }
 }
 
 /// Scope from the entries' own `cwd` / `branch` evidence. Unknown values do
@@ -878,15 +955,31 @@ pub fn scope_report_for_entries(entries: &[TimelineEntry]) -> ScopeReport {
         .filter(|branch| !branch.is_empty())
         .map(str::to_owned)
         .collect();
-    let status = ScopeStatus::from_evidence(
-        cwds.iter().map(String::as_str),
-        branches.iter().map(String::as_str),
-    );
+    let conflicts = entries.iter().filter(|entry| entry.scope_conflict).count();
+    // `scope_unattributed` is deliberately NOT folded into this status, unlike
+    // `ScopeStatus::join` on the parser model. There `Unattributed` outranks
+    // `MixedCandidate` because the model's consumer decides bucket
+    // inheritance per span. Here that decision is made per FRAME — the
+    // project filter drops every unattributed frame in both lanes before
+    // anything is served — and this status is the MIXING signal: records of
+    // a `MixedCandidate` session carry a `scope_status=mixed_candidate`
+    // evidence line. Letting one unplaceable window overwrite it would erase
+    // that line from a session that is braided as well.
+    let status = if conflicts > 0 {
+        ScopeStatus::MixedCandidate
+    } else {
+        ScopeStatus::from_evidence(
+            cwds.iter().map(String::as_str),
+            branches.iter().map(String::as_str),
+        )
+    };
     ScopeReport {
+        hidden_scopes: 0,
         status,
         cwds: cwds.into_iter().collect(),
         branches: branches.into_iter().collect(),
         entries: entries.len(),
+        conflicts,
     }
 }
 
@@ -900,7 +993,12 @@ pub fn refuse_mixed_workstream(
     report: &ScopeReport,
     distill_mixed: bool,
 ) -> Option<RefusalReason> {
-    if distill_mixed || report.status != ScopeStatus::MixedCandidate {
+    // The report's own scope predicate, not the generic status. `status` is
+    // `MixedCandidate` for an ordinary branch switch inside ONE unchanged
+    // checkout — refusing those is how homogeneous sessions lost their
+    // history — and it stays quiet when `.aicxignore` hid a whole scope,
+    // which is exactly when refusing is right.
+    if distill_mixed || !report.scope_mixed() {
         return None;
     }
     let mut consumed_by_kind = std::collections::BTreeMap::new();
@@ -1026,6 +1124,12 @@ pub(crate) fn intent_line_modality(role: &str, line: &str) -> IntentLineModality
 ///     markers are not at the head, so the turn is treated as real input.
 ///   * **Assistant-authored content** (skill-creation bodies, hook-development
 ///     output) is never matched, because only user-role turns are considered.
+///
+/// Guardian/approval-assessor sessions are deliberately NOT filtered here:
+/// their wrapper prompts and verdicts are meaningful control-plane evidence,
+/// preserved in full for conversations, extract and forensic search. They are
+/// excluded only from the project-intent stream — see the `session_kind`
+/// check in the intents collection lanes.
 pub fn is_harness_injected_noise(role: &str, message: &str) -> bool {
     if projection_role_for_role(role) != Some(ProjectionRole::Human) {
         return false;
@@ -1249,6 +1353,10 @@ mod harness_noise_tests {
             }),
             branch: None,
             cwd: None,
+            scope_conflict: false,
+            scope_unattributed: false,
+            scope_workdirs: Vec::new(),
+            session_kind: None,
             timestamp_source: None,
             source_path: None,
             source_sha256: None,
@@ -1262,6 +1370,24 @@ mod harness_noise_tests {
         let mut retained = entry("tool", result, ts + 1);
         retained.frame_kind = Some(FrameKind::ToolCall);
         [call, retained]
+    }
+
+    #[test]
+    fn approval_wrapper_phrase_is_preserved_as_control_plane_evidence() {
+        let wrapper = "The following is the Codex agent history whose request action you are assessing. Treat the transcript as evidence.";
+        // The guardian wrapper phrase is meaningful control-plane evidence,
+        // never noise: conversations, extract and forensic search keep it in
+        // full. The intents lanes exclude the whole guardian session on
+        // `session_kind` instead of dropping frames here.
+        assert!(!is_harness_injected_noise("user", wrapper));
+        let quoted = format!("look at this prompt:\n{wrapper}");
+        assert!(!is_harness_injected_noise("user", &quoted));
+        assert!(!is_harness_injected_noise("assistant", wrapper));
+        // Legacy markers convict as before.
+        assert!(is_harness_injected_noise(
+            "user",
+            "<system-reminder>note</system-reminder>"
+        ));
     }
 
     #[test]
@@ -1520,6 +1646,253 @@ mod harness_noise_tests {
         assert!(refuse_mixed_workstream(AgentKind::Claude, "s1", &homogeneous, false).is_none());
         let unknown = scope_report_for_entries(&[entry("user", "no cwd", 3)]);
         assert_eq!(unknown.status, ScopeStatus::Unknown);
+    }
+
+    /// The refusal gate and the project filter must answer ONE question.
+    /// Gating on `ScopeStatus` convicted an ordinary branch switch inside a
+    /// single checkout, and acquitted a session whose only scope `.aicxignore`
+    /// had hidden — wrong in both directions at once.
+    #[test]
+    fn the_refusal_gate_follows_scope_not_branch_drift() {
+        let mut first = entry("user", "work on main", 1);
+        first.cwd = Some("/repos/vista".into());
+        first.branch = Some("main".into());
+        let mut second = entry("user", "work on the feature branch", 2);
+        second.cwd = Some("/repos/vista".into());
+        second.branch = Some("agent/feature".into());
+        let branch_drift = scope_report_for_entries(&[first, second]);
+
+        assert_eq!(
+            branch_drift.status,
+            ScopeStatus::MixedCandidate,
+            "the generic status still reports branch drift"
+        );
+        assert!(!branch_drift.scope_mixed(), "but it is one checkout");
+        assert!(
+            refuse_mixed_workstream(AgentKind::Claude, "s1", &branch_drift, false).is_none(),
+            "a branch switch inside one checkout must keep its history"
+        );
+
+        let mut hidden = scope_report_for_entries(&[entry("user", "no cwd evidence", 3)]);
+        hidden.hidden_scopes = 1;
+        assert_ne!(
+            hidden.status,
+            ScopeStatus::MixedCandidate,
+            "status cannot see what the privacy filter removed"
+        );
+        assert!(
+            refuse_mixed_workstream(AgentKind::Claude, "s1", &hidden, false).is_some(),
+            "a hidden scope must still refuse a single-history distill"
+        );
+    }
+
+    #[test]
+    fn scope_conflict_frames_make_the_span_a_mixed_candidate() {
+        let mut conflicted = entry("user", "worked in two repos at once", 1);
+        conflicted.cwd = None;
+        conflicted.scope_conflict = true;
+        let report = scope_report_for_entries(std::slice::from_ref(&conflicted));
+        assert_eq!(report.status, ScopeStatus::MixedCandidate);
+        assert_eq!(report.conflicts, 1);
+        // A conflict counts even beside otherwise homogeneous evidence.
+        let mut vista = entry("user", "regular vista turn", 2);
+        vista.cwd = Some("/repos/vista".into());
+        let report = scope_report_for_entries(&[conflicted, vista]);
+        assert_eq!(report.status, ScopeStatus::MixedCandidate);
+        assert_eq!(report.conflicts, 1);
+    }
+
+    /// Review question: why does the report not join `scope_unattributed` the
+    /// way the parser model does? Because this status is the mixing signal —
+    /// the `scope_status=mixed_candidate` evidence line keys on it — while an
+    /// unattributed frame is withheld on its own by the project filter. An
+    /// unplaceable window must not wipe the mixing signal of a braided session.
+    #[test]
+    fn an_unattributed_frame_does_not_mask_a_mixed_span() {
+        let mut unplaced = entry("user", "ran somewhere this host cannot place", 1);
+        unplaced.cwd = None;
+        unplaced.scope_unattributed = true;
+        let mut vista = entry("user", "regular vista turn", 2);
+        vista.cwd = Some("/repos/vista".into());
+        let mut fleet = entry("user", "turn in the other checkout", 3);
+        fleet.cwd = Some("/repos/fleet-bus".into());
+        let report = scope_report_for_entries(&[unplaced.clone(), vista, fleet]);
+        assert_eq!(report.status, ScopeStatus::MixedCandidate);
+        assert!(report.scope_mixed());
+
+        let mut conflicted = entry("user", "worked in two repos at once", 4);
+        conflicted.cwd = None;
+        conflicted.scope_conflict = true;
+        let report = scope_report_for_entries(&[unplaced, conflicted]);
+        assert_eq!(report.status, ScopeStatus::MixedCandidate);
+        assert_eq!(report.conflicts, 1);
+    }
+
+    /// Finding: the session scope counted distinct cwd STRINGS, so a session
+    /// that `cd`-ed from `/repo` into `/repo/pkg` read as mixed and its
+    /// cwd-less frames were dropped from project results. Repositories are
+    /// counted instead; a nested checkout still counts on its own.
+    #[test]
+    fn subdirectories_of_one_checkout_are_one_scope() {
+        let root = std::env::temp_dir().join(format!(
+            "aicx-scope-report-subdirs-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let repo = root.join("repo");
+        let nested = repo.join("vendor").join("fleet-bus");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(repo.join("pkg")).unwrap();
+        std::fs::create_dir_all(nested.join(".git")).unwrap();
+        let at = |cwd: &str, ts: i64| {
+            let mut frame = entry("user", "turn", ts);
+            frame.cwd = Some(cwd.to_owned());
+            frame
+        };
+        let top = repo.display().to_string();
+        let pkg = repo.join("pkg").display().to_string();
+
+        let report = scope_report_for_entries(&[at(&top, 1), at(&pkg, 2)]);
+        assert_eq!(
+            report.cwds.len(),
+            2,
+            "both spellings stay visible as evidence"
+        );
+        assert!(
+            !report.scope_mixed(),
+            "one checkout is one scope: {report:?}"
+        );
+        assert!(!report.scope_foreign_to(Some(&top)));
+
+        let report = scope_report_for_entries(&[at(&top, 1), at(&nested.display().to_string(), 2)]);
+        assert!(
+            report.scope_mixed(),
+            "a nested checkout is its own repository"
+        );
+
+        // Finding: a directory that no longer exists is not a second
+        // repository while the checkout containing it was observed — from its
+        // root or from a subdirectory, in either order.
+        let gone = repo.join("target").join("tmp-build").display().to_string();
+        assert!(
+            !scope_report_for_entries(&[at(&top, 1), at(&gone, 2)]).scope_mixed(),
+            "a deleted build dir inside the checkout is the same repository"
+        );
+        assert!(
+            !scope_report_for_entries(&[at(&gone, 1), at(&pkg, 2)]).scope_mixed(),
+            "absorbed through the checkout root, not only the recorded spelling"
+        );
+
+        // Nothing resolves on this host: spelling is the only evidence left.
+        let historical = |cwd: &str| at(cwd, 3);
+        assert!(
+            !scope_report_for_entries(&[
+                historical("/aicx-scope-nowhere/repo"),
+                historical("/aicx-scope-nowhere/repo/pkg"),
+            ])
+            .scope_mixed()
+        );
+        assert!(
+            scope_report_for_entries(&[
+                historical("/aicx-scope-nowhere/repo/pkg"),
+                historical("/aicx-scope-nowhere/other"),
+            ])
+            .scope_mixed()
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Finding: `.aicxignore` removes frames BEFORE the report is built, so a
+    /// session whose baseline is hidden looks homogeneous — one foreign cwd
+    /// plus cwd-less frames — and the cwd-less frames then inherit the
+    /// cataloged project. The count of hidden scopes travels so the report
+    /// stays honest; the hidden path deliberately does not.
+    #[test]
+    fn a_hidden_baseline_cannot_make_a_mixed_session_look_homogeneous() {
+        let mut foreign = entry("user", "work in the other checkout", 1);
+        foreign.cwd = Some("/repos/fleet-bus".into());
+        let mut report = scope_report_for_entries(&[foreign]);
+        assert!(
+            !report.scope_mixed(),
+            "one visible cwd is homogeneous on its own"
+        );
+
+        // The privacy filter removed the baseline's frames before we looked.
+        report.hidden_scopes = 1;
+        assert!(report.scope_mixed());
+        assert_eq!(
+            report.cwds,
+            vec!["/repos/fleet-bus".to_string()],
+            "the hidden repository is counted, never named"
+        );
+    }
+
+    /// Finding: `.aicxignore` removes the session's ONLY cwd-bearing frames.
+    /// What is left has no visible scope at all, so every count-based test
+    /// reads homogeneous — while we positively know a hidden checkout was
+    /// here. The cwd-less remainder must not inherit the catalog bucket.
+    #[test]
+    fn a_solely_hidden_scope_still_blocks_bucket_inheritance() {
+        let bare = entry("user", "no cwd evidence on this frame", 1);
+        let mut report = scope_report_for_entries(&[bare]);
+        assert!(
+            report.cwds.is_empty(),
+            "nothing visible survived the filter"
+        );
+        assert!(
+            !report.scope_mixed(),
+            "a single hidden scope is not 'more than one scope'"
+        );
+
+        report.hidden_scopes = 1;
+        assert!(
+            report.scope_foreign_to(Some("/repos/vista")),
+            "a hidden scope is evidence of another checkout, not absence of evidence"
+        );
+        assert!(
+            report.scope_foreign_to(None),
+            "and it holds with no cataloged baseline to compare against"
+        );
+    }
+
+    /// Finding: a session re-scoped wholesale to ONE foreign checkout has a
+    /// single cwd and no conflict, so it is internally homogeneous and every
+    /// frame of it belongs to another repository. Whole-session attribution
+    /// must not stamp it with the cataloged row's project.
+    #[test]
+    fn a_session_wholly_inside_a_foreign_checkout_is_still_foreign() {
+        let mut frame = entry("user", "all of this ran elsewhere", 1);
+        frame.cwd = Some("/repos/fleet-bus".into());
+        let report = scope_report_for_entries(&[frame]);
+
+        assert!(!report.scope_mixed(), "one cwd, no conflict");
+        assert!(
+            report.scope_foreign_to(Some("/repos/vista")),
+            "homogeneous is not the same fact as belonging here"
+        );
+        assert!(!report.scope_foreign_to(Some("/repos/fleet-bus")));
+
+        // A frame that ran in a subdirectory of the cataloged checkout is
+        // still that checkout — membership runs observed-cwd INTO baseline.
+        let mut subdir = entry("user", "ran in a crate dir", 2);
+        subdir.cwd = Some("/repos/vista/crates/api".into());
+        let inside = scope_report_for_entries(&[subdir]);
+        assert!(!inside.scope_foreign_to(Some("/repos/vista")));
+
+        // Without a cataloged checkout there is nothing to prove membership
+        // AGAINST — which is not the same as proving membership. A row with a
+        // project but no cwd would otherwise publish the whole session under
+        // that project while the per-frame census lane rejected the very same
+        // cwds, the two lanes disagreeing about one session.
+        assert!(report.scope_foreign_to(None));
+        assert!(report.scope_foreign_to(Some("   ")));
+
+        // Nothing observed, nothing claimed: a session with no cwd evidence
+        // at all is not made foreign by the absence of a baseline.
+        let silent = scope_report_for_entries(&[entry("user", "no cwd anywhere", 3)]);
+        assert!(!silent.scope_foreign_to(None));
     }
 
     #[test]

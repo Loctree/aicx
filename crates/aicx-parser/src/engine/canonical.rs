@@ -12,6 +12,7 @@ use super::model::{
 use super::source::AgentKind;
 use super::validate::ValidatedSession;
 use serde::Serialize;
+use std::collections::BTreeMap;
 
 pub const CANONICAL_SCHEMA: &str = "aicx.parser.canonical.v1";
 
@@ -42,6 +43,13 @@ struct CanonicalProvenance<'a> {
 
 /// C0A segment fields only. `Segment::scope_status` (W2-R1) is derived
 /// evidence and stays out of the frozen fingerprint.
+///
+/// `cwd` is here because it is the fact the rollout RECORDED.
+/// `Segment::scope_root` and `scope_conflict` are deliberately absent: they
+/// are this host's resolution of the recorded facts against the local
+/// filesystem, so including them would give the same source bytes different
+/// fingerprints on different machines — the opposite of what a canonical
+/// projection is for.
 #[derive(Serialize)]
 struct CanonicalSegment<'a> {
     segment_id: u32,
@@ -52,17 +60,39 @@ struct CanonicalSegment<'a> {
     turn_range: super::model::TurnRange,
 }
 
-impl<'a> CanonicalSegment<'a> {
-    fn of(segment: &'a Segment) -> Self {
-        Self {
-            segment_id: segment.segment_id,
-            cwd: &segment.cwd,
-            branch: &segment.branch,
-            started_at: &segment.started_at,
-            ended_at: &segment.ended_at,
-            turn_range: segment.turn_range,
+/// Segments as the RECORDED facts draw them, plus the model-segment →
+/// canonical-segment remap that retargets `Turn::segment_id`.
+///
+/// An adapter may split a span where only derived scope changed: Codex cuts
+/// a segment wherever a turn window's workdirs resolve to another checkout,
+/// and whether they do depends on which checkouts exist on this disk.
+/// Keeping those cuts would move `segment_id`, `turn_range` and every turn's
+/// `segment_id` with the host's filesystem — the same drift that keeps
+/// `scope_root` out. So adjacent segments that agree on the recorded `cwd`
+/// and `branch` fold back into one. An adapter that only ever splits on
+/// recorded drift never produces such a pair, and its projection is
+/// unchanged.
+fn canonical_segments(segments: &[Segment]) -> (Vec<CanonicalSegment<'_>>, BTreeMap<u32, u32>) {
+    let mut folded: Vec<CanonicalSegment<'_>> = Vec::with_capacity(segments.len());
+    let mut remap = BTreeMap::new();
+    for segment in segments {
+        match folded.last_mut() {
+            Some(last) if last.cwd == &segment.cwd && last.branch == &segment.branch => {
+                last.ended_at = &segment.ended_at;
+                last.turn_range.end = segment.turn_range.end;
+            }
+            _ => folded.push(CanonicalSegment {
+                segment_id: folded.len() as u32,
+                cwd: &segment.cwd,
+                branch: &segment.branch,
+                started_at: &segment.started_at,
+                ended_at: &segment.ended_at,
+                turn_range: segment.turn_range,
+            }),
         }
+        remap.insert(segment.segment_id, folded.len().saturating_sub(1) as u32);
     }
+    (folded, remap)
 }
 
 #[derive(Serialize)]
@@ -117,13 +147,18 @@ struct CanonicalSkipped<'a> {
 
 pub fn canonical_bytes(session: &ValidatedSession) -> Result<Vec<u8>, serde_json::Error> {
     let model = session.model();
+    let (segments, segment_remap) = canonical_segments(&model.segments);
     let canonical = CanonicalSession {
         schema: CANONICAL_SCHEMA,
         session_id: &model.session_id,
         provenance: canonical_provenance(&model.provenance),
-        segments: model.segments.iter().map(CanonicalSegment::of).collect(),
+        segments,
         skill_invocations: &model.skill_invocations,
-        turns: model.turns.iter().map(canonical_turn).collect(),
+        turns: model
+            .turns
+            .iter()
+            .map(|turn| canonical_turn(turn, &segment_remap))
+            .collect(),
         usage_events: model.usage_events.iter().map(canonical_usage).collect(),
         parser_coverage: canonical_coverage(&model.coverage),
     };
@@ -148,7 +183,7 @@ fn canonical_provenance(provenance: &Provenance) -> CanonicalProvenance<'_> {
     }
 }
 
-fn canonical_turn(turn: &Turn) -> CanonicalTurn<'_> {
+fn canonical_turn<'a>(turn: &'a Turn, segment_remap: &BTreeMap<u32, u32>) -> CanonicalTurn<'a> {
     CanonicalTurn {
         turn_idx: turn.turn_idx,
         role: turn.role,
@@ -157,7 +192,12 @@ fn canonical_turn(turn: &Turn) -> CanonicalTurn<'_> {
         text_hash: &turn.text_hash,
         text_chars: turn.text_chars,
         tool_name: &turn.tool_name,
-        segment_id: turn.segment_id,
+        // Validation guarantees every turn names a segment; the fallback only
+        // keeps this total.
+        segment_id: segment_remap
+            .get(&turn.segment_id)
+            .copied()
+            .unwrap_or(turn.segment_id),
         raw_line_nos: turn
             .raw_unit_refs
             .iter()

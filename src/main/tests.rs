@@ -860,6 +860,7 @@ fn session_info(project: &str, repo_path: &str) -> sessions::SessionInfo {
         source_path: PathBuf::from("/tmp/session.jsonl"),
         association: sessions::Association::Exact,
         temporal_confidence: sessions::TemporalConfidence::None,
+        session_kind: None,
     }
 }
 
@@ -913,6 +914,7 @@ fn intents_project_resolver_uses_catalog_without_legacy_cards() {
         title: None,
         machine: None,
         logical_session_id: None,
+        session_kind: None,
     };
     write_file(
         &catalog_path,
@@ -2944,6 +2946,10 @@ fn conversations_batch_writes_synthetic_sessions_without_store_path() {
             frame_kind: None,
             branch: Some("main".to_string()),
             cwd: Some("/tmp/project-one".to_string()),
+            scope_conflict: false,
+            scope_unattributed: false,
+            scope_workdirs: Vec::new(),
+            session_kind: None,
             timestamp_source: None,
             source_path: None,
             source_sha256: None,
@@ -2960,6 +2966,10 @@ fn conversations_batch_writes_synthetic_sessions_without_store_path() {
             frame_kind: None,
             branch: None,
             cwd: Some("/tmp/project-two".to_string()),
+            scope_conflict: false,
+            scope_unattributed: false,
+            scope_workdirs: Vec::new(),
+            session_kind: None,
             timestamp_source: None,
             source_path: None,
             source_sha256: None,
@@ -3186,6 +3196,10 @@ fn mk_entry(
         frame_kind: None,
         branch: None,
         cwd: cwd.map(str::to_string),
+        scope_conflict: false,
+        scope_unattributed: false,
+        scope_workdirs: Vec::new(),
+        session_kind: None,
         timestamp_source: None,
         source_path: None,
         source_sha256: None,

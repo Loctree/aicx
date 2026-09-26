@@ -41,7 +41,7 @@ indexing without the deny list.
 
 | Surface | Purpose |
 |---|---|
-| `~/.aicx/catalog/sessions.jsonl` | Session identity, project, agent, date, cwd, source path, title, machine, and source fingerprint |
+| `~/.aicx/catalog/sessions.jsonl` | Session identity, project, agent, date, cwd, source path, title, machine, source fingerprint, and subagent provenance (`session_kind`) |
 | `~/.aicx/extracts/` | Optional whole-session readable extract cache |
 | `~/.aicx/indexed/_all/hybrid/CURRENT` | Pointer to the published global search generation |
 | live agent source roots | Canonical session content |
@@ -129,6 +129,28 @@ session that wandered in for one turn still indexes its other project
 buckets. Re-run `aicx index` after editing the file (cached extracts are
 not reused while ignore rules are present).
 
+A rule is matched in every spelling both sides can produce. Scope resolution
+stamps frames with the canonical repo root, so a rule written the way you see
+the path (`/var/…`, or a checkout reached through a symlink) still hides the
+frame recorded as `/private/var/…`. Write the path you use; matching resolves
+the rest. Spellings are reconciled through this host's filesystem when the
+index runs: the recorded spelling always matches literally, while a spelling
+reached through a symlink matches only while that link still resolves here.
+
+A frame is judged on every path its turn window ran in, not only on the scope
+it is served under: each tool-call `workdir` the window recorded, and the
+recorded cwd whenever the scope verdict replaced it (a re-scope serves the
+workdirs' repo root, a conflict serves no cwd). A session run from a denied
+checkout stays hidden when its window is attributed to another repository,
+and a conflict that touched a denied checkout is hidden as a whole. Windows
+merged into one span are judged on the union of their paths, which can hide
+a neighbouring frame too — the filter fails closed on purpose.
+
+The deny list's identity covers where its rules RESOLVE, not only how they are
+written: retarget a symlink a rule points through and caches built under the
+old target are invalidated, so the newly denied checkout cannot be republished
+from content filtered under the previous one.
+
 ### Multi-machine / sync (operator truth)
 
 1. **Session JSONL sync** — catalog only discovers files under this host's agent
@@ -208,8 +230,145 @@ selects the inter-agent lane by class (it rides the system lane, never
 `/fork` shares its origin's record prefix and `--lineage` says so instead
 of guessing. `aicx_session` (MCP) returns the tagged `conversation` ref, the
 session's `scope_status` and its compaction epoch count next to the
-messages. `aicx continuity` refuses to distill one history from a
-`mixed_candidate` session set (`mixed_workstream` refusal) unless asked to.
+messages. `aicx continuity` refuses to distill one history from a window
+whose only work is mixed-workstream sessions (`mixed_workstream` refusal)
+unless asked to — also when the project filters had already removed every
+frame of those sessions, so such a window never passes as an empty pack.
+
+Project-filtered queries (`-p`) are fail-closed inside mixed sessions. A turn
+window whose executable tool calls consistently name one foreign `workdir`
+takes that repo as its effective scope (the `turn_context` baseline is only
+the default); two proven repo identities make the window a conflict, while
+unresolvable (historical or foreign-machine) workdirs that are not the
+baseline leave a durable unattributed mark — never a positive attribution,
+never proof of divergence, and frames carrying it never inherit any project
+bucket. Evidence that exists but could not be read is unattributed for the
+same reason, whether it was too large for the bounded reader's per-record cap
+or malformed: why we could not read it makes no difference to the scope. That
+decision is made structurally, so an oversized payload cannot spend its own
+unreadable bytes arguing it was never a tool call, and a record type counts as
+read only when its value was: a payload `type` cut off mid-value proves
+nothing. A `workdir` that a tool call writes but does not state is unreadable
+too — a JavaScript template literal that interpolates, a literal that never
+closes, or a value that is not a literal at all (a variable, an expression,
+the shorthand `{cmd, workdir}`). `null` and `undefined` ask for the default
+directory and are no evidence, and only the whole property name `workdir` is
+read. A readable value runs to the quote that opened it, in any of the three
+quote styles, so `"/Users/O'Brien/repo"` is one path, and it counts only as
+the whole value: `"/repos/vista" + "-private"` is an expression and
+unreadable. Both Codex readers —
+the full adapter and the bounded reader for over-cap rollouts — scope the
+same call types, and both treat a `turn_context` without a cwd as a turn
+whose directory is unknown.
+Within a mixed
+session a frame must positively prove membership in the requested project —
+silence and conflicting evidence never inherit the session bucket — while
+homogeneous sessions keep the legacy bucket inheritance.
+
+Membership is decided by **repository identity, never by path prefix**: a
+nested checkout or submodule sits lexically under its parent checkout and is
+a different repo, so its frames do not join the parent's bucket — and the
+legacy path-segment fallback does not re-admit them either, however the path
+happens to be spelled. Lexical containment survives only where identity is
+unknowable — a workdir that does not exist on this machine — and there a
+Windows spelling is compared the way Windows resolves it (either separator,
+letter case ignored), a Unix spelling byte for byte; a Windows path rooted
+without a drive (`\repo`) sits on the drive of the turn's cwd. Identity is
+canonical (one checkout reached two ways is one repo) and existence-checked (a
+deleted subdirectory does not inherit its ancestor's `.git`); a relative
+`workdir` resolves against the turn's cwd, never against the directory `aicx`
+runs in. A window that ran tools in both the baseline and another checkout is
+a conflict, not a re-scope. Branch drift is not scope drift: a session that
+switches branch inside one unchanged checkout stays a normal, fully attributed
+session. Neither is a move within one checkout: a session is mixed only when
+its cwds name more than one repository, so `cd` from `/repo` into `/repo/pkg`
+keeps it homogeneous while a nested checkout still counts on its own. A cwd
+that no longer exists counts as part of an observed checkout that plausibly
+contains it, unless `.gitmodules` there declares it a submodule. Scope is
+judged on the whole session before the frame-kind filter
+narrows it to one role — and before `.aicxignore` hides a checkout. A hidden
+repository is counted as a scope and never named, so a session whose own
+baseline is hidden cannot pass as homogeneous and hand its remaining frames to
+the cataloged project.
+
+**Membership fails closed; identity fails open.** These are different
+questions, and a path that no longer exists gets a different answer from each.
+May this frame be served as project P? Only if membership can be proven, so a
+live checkout never claims a path it cannot prove. Is this a *second*
+repository? Only if that can be proven too — an unattributed window has its
+frames dropped outright, so counting every deleted `target/`, cleaned-up
+worktree or removed temp directory as a foreign repo would silently delete
+ordinary operator evidence. The one missing path that keeps its own identity
+is a submodule the parent still declares in `.gitmodules`. A bare nested
+checkout that was deleted leaves no such trace, is indistinguishable from any
+other deleted directory, and is absorbed by its parent: a deliberate trade,
+made in favour of keeping evidence over chasing a leak that only exists for
+repositories that are already gone.
+
+A session whose frames are *consistently* re-scoped to one foreign checkout is
+internally homogeneous and still foreign: whole-session attribution applies
+only when the observed scope is also the cataloged one. A frame whose cwd resolves to a
+real checkout here and cannot prove membership is dropped rather than handed
+to the legacy path-name filter: a checkout at `…/vista/vendor/fleet-bus` spells
+`vista` without being it, and that fallback exists only for paths that resolve
+to nothing at all.
+
+A submodule is recognised from the checkout root's `.gitmodules`, whatever
+subdirectory the session ran in, and its descendants belong to it: a vanished
+`vendor/fleet-bus/src` is inside the declared `vendor/fleet-bus`. The boundary
+is a path component, so `vendor/fleet-bus-old` is an ordinary directory.
+
+A cataloged row with a project but no cwd gives membership nothing to prove
+itself against, which is not the same as proving it: when its frames name a
+cwd, the session is routed through the census lane rather than published whole
+under the row's project, and each such frame must prove membership on its own.
+A frame that records no cwd has no scope evidence either way: it keeps the
+row's project, as before, unless the session is mixed.
+
+Where a frame's scope came from is recorded in two places for two reasons. The
+cwd the rollout wrote down is a fact and is never overwritten; this host's
+resolution of it into a repository root is kept separately, because resolution
+depends on which checkouts exist here and must not change the session's
+canonical fingerprint. `aicx index` reports `unchanged`, and reuses cached
+extracts, only while that repository layout still holds for every working
+directory a session recorded — turn cwds and tool-call workdirs alike, including
+one its parent checkout absorbed: create or remove a nested checkout, or edit
+`.gitmodules`, and the affected sessions are reparsed even though their source
+bytes and catalog rows are unchanged.
+
+**What this removes, and what it does not re-home.** Foreign frames are
+removed from the parent project's answer; they are *not* re-filed under the
+foreign project. Both intent lanes iterate sessions by their cataloged
+project, so a session cataloged as `vista` never appears under
+`-p fleet-bus`, whatever its frames' effective scope. Per-frame re-homing is a
+separate change.
+
+The committed index stores whole-session chunks, so it cannot express that
+per-frame verdict: chunks flagged mixed or unattributed at index build — and
+chunks from a generation built before those flags existed, which state nothing
+about their scope — are re-sourced through the census lane — a re-source that fails (source moved or
+deleted) is counted in `source_errors` and makes the answer incomplete, never
+silently dropped. A re-sourced session is re-checked against the requested
+project first, because the catalog can have been reattributed since the index
+was built.
+
+Codex approval/guardian subagent sessions
+(`session_meta.source.subagent`, cataloged as `session_kind`) are control-plane
+machinery: their wrapper prompts and verdicts are preserved whole in the
+catalog, extracts and forensic search as audit evidence, but
+`session_kind = subagent:guardian` sessions never enter the operator
+project-intent stream. The match is **exact**: any other subagent nickname
+(`subagent:Hooke`, and even `subagent:guardian-helper`) is an ordinary
+subagent doing real work and keeps its intents. The cataloged `session_kind`
+column is a cache, not the authority — the census hot refresh never revisits
+an unchanged source, so rows cataloged before the column existed keep `null`.
+Both intent lanes therefore resolve provenance from the rollout header when
+the column is empty; no catalog rebuild is a prerequisite for the guardian
+contract, and `aicx catalog rebuild` is what refreshes the stored column. The
+header probe reads as far as the catalog reads a header (128 records, 256 KiB
+in total). A guardian stays out of the `mixed_scope` list as well, even when
+the frame-kind or privacy filter leaves none of its frames, so it cannot make
+`aicx continuity` refuse.
 
 Batch report export remains available through `aicx claude`, `aicx codex`,
 `aicx all`, and `aicx conversations`. Those commands write requested reports,

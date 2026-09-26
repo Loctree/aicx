@@ -36,6 +36,10 @@ fn per_frame_cwd_prevents_cross_repo_session_contamination() {
         frame_kind: Some(FrameKind::UserMsg),
         branch: None,
         cwd: cwd.map(str::to_string),
+        scope_conflict: false,
+        scope_unattributed: false,
+        scope_workdirs: Vec::new(),
+        session_kind: None,
         timestamp_source: None,
         source_path: None,
         source_sha256: None,
@@ -50,7 +54,7 @@ fn per_frame_cwd_prevents_cross_repo_session_contamination() {
         frame(None, "legacy frame without cwd"),
     ];
 
-    retain_frames_for_project(&mut frames, "Loctree/aicx", None);
+    retain_frames_for_project(&mut frames, "Loctree/aicx", None, false);
 
     assert_eq!(frames.len(), 2);
     assert!(frames.iter().any(|frame| frame.message == "aicx decision"));
@@ -86,7 +90,12 @@ fn per_frame_cwd_prevents_cross_repo_session_contamination() {
         ),
     ];
 
-    retain_frames_for_project(&mut frames, "vetcoders/vibecrafted", Some(suite_checkout));
+    retain_frames_for_project(
+        &mut frames,
+        "vetcoders/vibecrafted",
+        Some(suite_checkout),
+        false,
+    );
 
     assert_eq!(frames.len(), 2, "{frames:?}");
     assert!(frames.iter().any(|frame| frame.message == "suite decision"));
@@ -95,6 +104,207 @@ fn per_frame_cwd_prevents_cross_repo_session_contamination() {
             .iter()
             .any(|frame| frame.message == "suite subdir decision")
     );
+}
+
+/// A nested checkout or submodule lives lexically BELOW the session checkout
+/// and is a different repository. Accepting containment by path prefix kept
+/// its frames in the parent's bucket — the same cross-repo leak the turn-level
+/// scope work exists to close, just one layer further down the pipeline.
+#[cfg(feature = "app")]
+#[test]
+fn nested_checkout_frames_do_not_inherit_the_parent_project() {
+    let root = std::env::temp_dir().join(format!(
+        "aicx-intents-nested-checkout-{}-{}",
+        std::process::id(),
+        Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    ));
+    let _ = fs::remove_dir_all(&root);
+    let parent = root.join("vista");
+    let nested = parent.join("vendor/fleet-bus");
+    let parent_subdir = parent.join("crates/core");
+    fs::create_dir_all(parent.join(".git")).expect("parent git dir");
+    fs::create_dir_all(nested.join(".git")).expect("nested git dir");
+    fs::create_dir_all(&parent_subdir).expect("parent subdir");
+
+    let frame = |cwd: &Path, message: &str| crate::timeline::TimelineEntry {
+        timestamp: Utc::now(),
+        agent: "codex".to_string(),
+        session_id: "nested-session".to_string(),
+        role: "user".to_string(),
+        message: message.to_string(),
+        frame_class: None,
+        lineage_origin: None,
+        frame_kind: Some(FrameKind::UserMsg),
+        branch: None,
+        cwd: Some(cwd.to_string_lossy().into_owned()),
+        scope_conflict: false,
+        scope_unattributed: false,
+        scope_workdirs: Vec::new(),
+        session_kind: None,
+        timestamp_source: None,
+        source_path: None,
+        source_sha256: None,
+        source_line_span: None,
+    };
+    let mut frames = vec![
+        frame(&parent, "vista root turn"),
+        frame(&parent_subdir, "vista subdir turn"),
+        frame(&nested, "vendored fleet-bus turn"),
+    ];
+
+    retain_frames_for_project(
+        &mut frames,
+        "vetcoders/vista",
+        Some(parent.to_string_lossy().as_ref()),
+        false,
+    );
+
+    let kept: Vec<&str> = frames.iter().map(|frame| frame.message.as_str()).collect();
+    assert_eq!(
+        kept,
+        vec!["vista root turn", "vista subdir turn"],
+        "{kept:?}"
+    );
+
+    // Bare-name filter: the nested checkout's own path still SPELLS `vista`,
+    // so the legacy path-segment fallback would re-admit exactly what repo
+    // identity just rejected.
+    let mut frames = vec![
+        frame(&parent, "vista root turn"),
+        frame(&nested, "vendored fleet-bus turn"),
+    ];
+    retain_frames_for_project(
+        &mut frames,
+        "/vista",
+        Some(parent.to_string_lossy().as_ref()),
+        false,
+    );
+    let kept: Vec<&str> = frames.iter().map(|frame| frame.message.as_str()).collect();
+    assert_eq!(kept, vec!["vista root turn"], "{kept:?}");
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// The session's own baseline is historical and no longer exists on this
+/// machine, so no membership proof can succeed. A frame cwd that DOES resolve
+/// to a real checkout here must fail closed — dropping through to the
+/// path-spelling fallback re-admits a foreign repository merely because its
+/// path happens to contain the requested project name.
+#[cfg(feature = "app")]
+#[test]
+fn a_resolvable_frame_fails_closed_against_a_vanished_baseline() {
+    let root = std::env::temp_dir().join(format!(
+        "aicx-intents-vanished-baseline-{}-{}",
+        std::process::id(),
+        Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    ));
+    let _ = fs::remove_dir_all(&root);
+    // A real, resolvable checkout whose path spells the requested project.
+    let foreign = root.join("vista").join("vendor").join("fleet-bus");
+    fs::create_dir_all(foreign.join(".git")).expect("foreign git dir");
+
+    let frame = |cwd: &str, message: &str| crate::timeline::TimelineEntry {
+        timestamp: Utc::now(),
+        agent: "codex".to_string(),
+        session_id: "vanished-baseline".to_string(),
+        role: "user".to_string(),
+        message: message.to_string(),
+        frame_class: None,
+        lineage_origin: None,
+        frame_kind: Some(FrameKind::UserMsg),
+        branch: None,
+        cwd: Some(cwd.to_string()),
+        scope_conflict: false,
+        scope_unattributed: false,
+        scope_workdirs: Vec::new(),
+        session_kind: None,
+        timestamp_source: None,
+        source_path: None,
+        source_sha256: None,
+        source_line_span: None,
+    };
+
+    let mut frames = vec![frame(
+        foreign.to_string_lossy().as_ref(),
+        "foreign checkout turn",
+    )];
+    retain_frames_for_project(
+        &mut frames,
+        "/vista",
+        // The checkout this session was cataloged under is gone.
+        Some("/nonexistent-aicx-scope/vista"),
+        false,
+    );
+    let kept: Vec<&str> = frames.iter().map(|frame| frame.message.as_str()).collect();
+    assert!(
+        kept.is_empty(),
+        "a resolvable foreign checkout must not be re-admitted by path spelling: {kept:?}"
+    );
+
+    // An UNRESOLVABLE cwd is the one case with no identity to be had, so the
+    // legacy spelling fallback is still the only evidence available.
+    let mut frames = vec![frame(
+        "/nonexistent-aicx-scope/vista/crates/core",
+        "replayed turn",
+    )];
+    retain_frames_for_project(
+        &mut frames,
+        "/vista",
+        Some("/nonexistent-aicx-scope/vista"),
+        false,
+    );
+    assert_eq!(frames.len(), 1, "replayed sessions must still be servable");
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[cfg(feature = "app")]
+#[test]
+fn mixed_session_filter_is_fail_closed_for_unproven_frames() {
+    let frame = |cwd: Option<&str>, conflict: bool, message: &str| crate::timeline::TimelineEntry {
+        timestamp: Utc::now(),
+        agent: "codex".to_string(),
+        session_id: "mixed-session".to_string(),
+        role: "user".to_string(),
+        message: message.to_string(),
+        frame_class: None,
+        lineage_origin: None,
+        frame_kind: Some(FrameKind::UserMsg),
+        branch: None,
+        cwd: cwd.map(str::to_string),
+        scope_conflict: conflict,
+        scope_unattributed: false,
+        scope_workdirs: Vec::new(),
+        session_kind: None,
+        timestamp_source: None,
+        source_path: None,
+        source_sha256: None,
+        source_line_span: None,
+    };
+    let mut frames = vec![
+        frame(Some("/Users/silver/Git/vista"), false, "vista opening"),
+        frame(Some("/Users/silver/Git/fleet-bus"), false, "fleet-bus turn"),
+        frame(None, false, "no evidence frame"),
+        frame(None, true, "conflicting workdirs frame"),
+    ];
+
+    // Mixed session: only positively Vista-scoped frames survive `-p /vista`.
+    retain_frames_for_project(&mut frames, "/vista", Some("/Users/silver/Git/vista"), true);
+
+    assert_eq!(frames.len(), 1, "{frames:?}");
+    assert_eq!(frames[0].message, "vista opening");
+
+    // Homogeneous session: a no-evidence frame still inherits the bucket.
+    let mut frames = vec![
+        frame(Some("/Users/silver/Git/vista"), false, "vista opening"),
+        frame(None, false, "legacy frame without cwd"),
+    ];
+    retain_frames_for_project(
+        &mut frames,
+        "/vista",
+        Some("/Users/silver/Git/vista"),
+        false,
+    );
+    assert_eq!(frames.len(), 2, "{frames:?}");
 }
 
 fn chunk_path(root: &Path, project: &str, date: &str, name: &str) -> PathBuf {
@@ -241,6 +451,7 @@ fn live_window_admits_fresh_mtime_rows_and_unadmitted_sessions() {
         title: None,
         machine: Some("test".to_string()),
         logical_session_id: None,
+        session_kind: None,
     };
     fs::write(
         &catalog_path,
@@ -277,6 +488,7 @@ fn live_window_admits_fresh_mtime_rows_and_unadmitted_sessions() {
         title: None,
         machine: Some("test".to_string()),
         logical_session_id: None,
+        session_kind: None,
     };
     let production_user_home = crate::os_user_home().unwrap_or_else(|| root.clone());
     let cutoff_ns = (Utc::now() - chrono::Duration::hours(24))
@@ -372,6 +584,7 @@ fn catalog_source_replaces_retired_cards_for_intent_extraction() {
         title: Some("catalog hydration".to_string()),
         machine: Some("test".to_string()),
         logical_session_id: None,
+        session_kind: None,
     };
     fs::write(
         &catalog_path,
@@ -4709,8 +4922,10 @@ fn full_history_requests_never_take_the_index_path() {
             &home,
             "vetcoders/aicx",
             chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0).expect("epoch"),
+            crate::timeline::FrameKind::UserMsg,
             false,
             true,
+            &mut Vec::new(),
         )
         .is_none(),
         "full-history requests must fall through to the census"
@@ -4723,10 +4938,53 @@ fn full_history_requests_never_take_the_index_path() {
             &home,
             "vetcoders/aicx",
             chrono::Utc::now(),
+            crate::timeline::FrameKind::UserMsg,
             true,
             false,
+            &mut Vec::new(),
         )
         .is_none(),
         "hot-window requests must fall through to the census"
     );
+}
+
+/// Finding: a `CURRENT` generation built before the scope keys existed
+/// carries none of them, and every reader in the index lane took absence for
+/// a clean answer — not mixed, not unattributed, not a guardian. The Tantivy
+/// schema version does not move for a metadata addition, so nothing rejected
+/// such a generation; it kept serving foreign frames and guardian prompts
+/// until an operator happened to re-run `aicx index`.
+#[cfg(feature = "app")]
+#[test]
+fn a_chunk_that_cannot_state_its_scope_is_not_a_clean_chunk() {
+    let current = serde_json::json!({
+        "project": "vetcoders/aicx",
+        "scope_conflict": false,
+        "scope_unattributed": false,
+        "session_kind": serde_json::Value::Null,
+    });
+    assert!(
+        chunk_states_scope(&current),
+        "the builder writes every contract key, `null` included"
+    );
+
+    let pre_upgrade = serde_json::json!({ "project": "vetcoders/aicx" });
+    assert!(
+        !chunk_states_scope(&pre_upgrade),
+        "a chunk from before the contract states nothing about its scope"
+    );
+
+    // One missing key is enough: each carries a different refusal.
+    for key in SCOPE_METADATA_CONTRACT {
+        let mut partial = current.clone();
+        partial
+            .as_object_mut()
+            .expect("object")
+            .remove(key)
+            .expect("key present");
+        assert!(
+            !chunk_states_scope(&partial),
+            "a chunk missing `{key}` does not state its scope"
+        );
+    }
 }

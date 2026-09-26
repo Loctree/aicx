@@ -105,6 +105,7 @@ pub(crate) fn extract_intents_from_root_at_with_stats(
         let cutoff_hours = config.hours.min(i64::MAX as u64) as i64;
         now - Duration::hours(cutoff_hours)
     };
+    let mut mixed_scope = Vec::new();
     let (files, source_errors, corpus_identity_source, live_sessions) = collect_intent_files(
         aicx_home,
         &config.project,
@@ -112,7 +113,69 @@ pub(crate) fn extract_intents_from_root_at_with_stats(
         config.effective_frame_kind(),
         config.live,
         config.hours == 0,
+        &mut mixed_scope,
     )?;
+    extract_intents_from_files_with_stats(
+        config,
+        files,
+        source_errors,
+        corpus_identity_source,
+        live_sessions,
+        mixed_scope,
+    )
+}
+
+/// Record a mixed-workstream candidate once per (agent, session). Called both
+/// from surviving files and from the lanes' pre-filter scope reports, so the
+/// telemetry survives even when the fail-closed project filter removes every
+/// frame of the session from the requested bucket.
+fn note_mixed_scope(
+    mixed_scope: &mut Vec<MixedScopeSession>,
+    agent: &str,
+    session_id: &str,
+    scope: &crate::extraction::conversation::ScopeReport,
+) {
+    // Same predicate the distiller's refusal and the project filter use. A
+    // branch switch inside one checkout is one scope, and a scope hidden by
+    // `.aicxignore` is still a scope.
+    if !scope.scope_mixed() {
+        return;
+    }
+    if mixed_scope
+        .iter()
+        .any(|seen| seen.agent == agent && seen.session_id == session_id)
+    {
+        return;
+    }
+    crate::diagnostics::log_describe(&format!(
+        "intents_mixed_scope agent={} session_id={} cwds={} branches={}",
+        agent,
+        session_id,
+        scope.cwds.join(","),
+        scope.branches.join(",")
+    ));
+    mixed_scope.push(MixedScopeSession {
+        agent: agent.to_string(),
+        session_id: session_id.to_string(),
+        cwds: scope.cwds.clone(),
+        branches: scope.branches.clone(),
+        // The whole verdict travels: a session mixed only by a hidden scope
+        // or a conflict has at most one visible cwd, and a consumer that
+        // rebuilt the report from cwds alone would call it homogeneous.
+        conflicts: scope.conflicts,
+        hidden_scopes: scope.hidden_scopes,
+        status: scope.status,
+    });
+}
+
+fn extract_intents_from_files_with_stats(
+    config: &IntentsConfig,
+    files: Vec<StoredChunkFile>,
+    source_errors: usize,
+    corpus_identity_source: &str,
+    live_sessions: usize,
+    mut mixed_scope: Vec<MixedScopeSession>,
+) -> Result<IntentExtraction> {
     let scanned_count = files.len();
     let source_paths_verified = source_errors == 0 && verify_stored_chunk_paths(&files);
     let matched_project_buckets = files
@@ -139,27 +202,9 @@ pub(crate) fn extract_intents_from_root_at_with_stats(
         .filter(|file| file.identity_source == PATH_HEURISTIC_IDENTITY_SOURCE)
         .map(|file| file.path.to_string_lossy().into_owned())
         .collect();
-    let mut mixed_scope: Vec<MixedScopeSession> = Vec::new();
     for file in &files {
-        if let Some(scope) = file.scope.as_ref()
-            && scope.status == aicx_parser::engine::ScopeStatus::MixedCandidate
-            && !mixed_scope
-                .iter()
-                .any(|seen| seen.agent == file.agent && seen.session_id == file.session_id)
-        {
-            crate::diagnostics::log_describe(&format!(
-                "intents_mixed_scope agent={} session_id={} cwds={} branches={}",
-                file.agent,
-                file.session_id,
-                scope.cwds.join(","),
-                scope.branches.join(",")
-            ));
-            mixed_scope.push(MixedScopeSession {
-                agent: file.agent.clone(),
-                session_id: file.session_id.clone(),
-                cwds: scope.cwds.clone(),
-                branches: scope.branches.clone(),
-            });
+        if let Some(scope) = file.scope.as_ref() {
+            note_mixed_scope(&mut mixed_scope, &file.agent, &file.session_id, scope);
         }
     }
 
@@ -413,6 +458,30 @@ fn extend_with_cap<T>(
 /// Identity provenance for records served from the committed lexical index.
 pub const INDEX_IDENTITY_SOURCE: &str = "index-v1";
 
+/// Every metadata key the index lane's scope decisions read.
+#[cfg(feature = "app")]
+const SCOPE_METADATA_CONTRACT: [&str; 3] = ["scope_conflict", "scope_unattributed", "session_kind"];
+
+/// Does this chunk STATE its scope, or merely omit it?
+///
+/// A chunk written before these keys existed carries none of them, and every
+/// reader below takes absence for a clean answer: not mixed, not
+/// unattributed, not a guardian. The Tantivy schema version does not move for
+/// a metadata addition, so `open_current_adapter_at` admits such a generation
+/// and it keeps serving foreign frames and control-plane prompts until
+/// someone happens to re-run `aicx index`.
+///
+/// Presence is the contract, not truth: the builder writes all three keys on
+/// every chunk it publishes, `null` included. A chunk that cannot state its
+/// scope is re-sourced through the census lane, exactly like one that states
+/// a bad scope.
+#[cfg(feature = "app")]
+fn chunk_states_scope(metadata: &serde_json::Value) -> bool {
+    SCOPE_METADATA_CONTRACT
+        .iter()
+        .all(|key| metadata.get(key).is_some())
+}
+
 /// Serve chunk documents from the committed lexical index.
 ///
 /// The index already stores, per session, the canonical extract verbatim plus
@@ -436,9 +505,11 @@ fn collect_intent_files_from_index(
     aicx_home: &Path,
     project: &str,
     cutoff: DateTime<Utc>,
+    frame_kind: FrameKind,
     live: bool,
     full_history: bool,
-) -> Option<Vec<StoredChunkFile>> {
+    mixed_scope: &mut Vec<MixedScopeSession>,
+) -> Option<(Vec<StoredChunkFile>, usize)> {
     if live || full_history {
         return None;
     }
@@ -468,6 +539,7 @@ fn collect_intent_files_from_index(
         .ok()?;
 
     let mut files = Vec::with_capacity(chunks.len());
+    let mut mixed_ids: BTreeSet<(String, String)> = BTreeSet::new();
     for chunk in chunks {
         let metadata = &chunk.metadata;
         let field = |key: &str| {
@@ -477,6 +549,34 @@ fn collect_intent_files_from_index(
                 .unwrap_or_default()
                 .to_string()
         };
+        let states_scope = chunk_states_scope(metadata);
+        // Guardian sessions are control-plane evidence: kept whole in the
+        // index for forensic search, never served as operator intents.
+        if states_scope
+            && crate::sessions::is_guardian_session_kind(
+                metadata
+                    .get("session_kind")
+                    .and_then(|value| value.as_str()),
+            )
+        {
+            continue;
+        }
+        // Whole-session chunks cannot express per-frame scope. A session
+        // flagged mixed or unattributed at index build is re-sourced through
+        // the census lane (fail-closed per-frame filter) instead of being
+        // served raw.
+        let scope_flagged = metadata
+            .get("scope_conflict")
+            .and_then(|value| value.as_bool())
+            == Some(true)
+            || metadata
+                .get("scope_unattributed")
+                .and_then(|value| value.as_bool())
+                == Some(true);
+        if !states_scope || scope_flagged {
+            mixed_ids.insert((field("agent"), field("session_id")));
+            continue;
+        }
         let date = field("date");
         let Some(timestamp) = NaiveDate::parse_from_str(&date, "%Y-%m-%d")
             .ok()
@@ -501,12 +601,99 @@ fn collect_intent_files_from_index(
         });
     }
 
+    let mut source_errors = 0usize;
+    if !mixed_ids.is_empty() {
+        // Every flagged chunk has to end somewhere: re-sourced, deliberately
+        // excluded by the project filter, or counted as a hole. Anything
+        // else is a session that silently left the answer while
+        // `completeness` still called it complete.
+        let mut accounted: BTreeSet<(String, String)> = BTreeSet::new();
+        let entries = match crate::catalog::read_entries_at(aicx_home) {
+            Ok(entries) => entries,
+            Err(error) => {
+                crate::diagnostics::log_describe(&format!(
+                    "intents_index_catalog_unreadable flagged={} error={error:#}",
+                    mixed_ids.len()
+                ));
+                Vec::new()
+            }
+        };
+        for entry in entries {
+            if !mixed_ids.contains(&(entry.agent.clone(), entry.session_id.clone())) {
+                continue;
+            }
+            // The index matched this session on the project stored AT INDEX
+            // TIME. The catalog can have been reattributed since, and
+            // `catalog_frames_to_intent_file` stamps the CURRENT project — so
+            // without re-applying the caller's predicate a rehydrated session
+            // could carry another repo's frames into this result.
+            if !entry_matches_project(entry.project.as_deref(), project) {
+                // Deliberately out of this answer, not lost from it.
+                accounted.insert((entry.agent.clone(), entry.session_id.clone()));
+                continue;
+            }
+            let (source_path, frames, scope) =
+                match crate::source_index::read_catalog_signal_with_scope_at(
+                    aicx_home, &entry, frame_kind,
+                ) {
+                    Ok(result) => result,
+                    Err(error) => {
+                        // A flagged chunk that cannot be re-sourced is a hole
+                        // in the answer, not an empty session: the census lane
+                        // reports the same failure, and `completeness` must
+                        // not claim a complete result over a lost source.
+                        source_errors += 1;
+                        crate::diagnostics::log_describe(&format!(
+                            "intents_index_resource_skip agent={} session_id={} path={} error={error:#}",
+                            entry.agent, entry.session_id, entry.source_path
+                        ));
+                        continue;
+                    }
+                };
+            accounted.insert((entry.agent.clone(), entry.session_id.clone()));
+            let Some((file, scope)) =
+                catalog_frames_to_intent_file(&entry, source_path, frames, scope, cutoff, false)
+            else {
+                continue;
+            };
+            note_mixed_scope(mixed_scope, &entry.agent, &entry.session_id, &scope);
+            if let Some(file) = file {
+                files.push(file);
+            }
+        }
+        // Flagged in the index, absent from the catalog (or the catalog could
+        // not be read at all): the session is gone from this answer and the
+        // answer has to say so.
+        for (agent, session_id) in mixed_ids.iter().filter(|key| !accounted.contains(*key)) {
+            source_errors += 1;
+            crate::diagnostics::log_describe(&format!(
+                "intents_index_resource_unmatched agent={agent} session_id={session_id}"
+            ));
+        }
+    }
+
     files.sort_by(|left, right| {
         left.timestamp
             .cmp(&right.timestamp)
             .then_with(|| left.path.cmp(&right.path))
     });
-    Some(files)
+    Some((files, source_errors))
+}
+
+/// Apply the caller's `-p` predicate to one stored project address.
+///
+/// The one place the filter lives: the index re-source lane, the catalog
+/// census and the legacy chunk walk all decide membership the same way.
+/// An empty filter matches everything; a row without a project never does.
+fn entry_matches_project(entry_project: Option<&str>, project: &str) -> bool {
+    if project.trim().is_empty() {
+        return true;
+    }
+    let Some(entry_project) = entry_project else {
+        return false;
+    };
+    let (organization, repository) = entry_project.split_once('/').unwrap_or(("", entry_project));
+    legacy_archive::project_filter_matches(organization, repository, project)
 }
 
 #[cfg(feature = "app")]
@@ -517,12 +704,19 @@ fn collect_intent_files(
     frame_kind: FrameKind,
     live: bool,
     full_history: bool,
+    mixed_scope: &mut Vec<MixedScopeSession>,
 ) -> Result<(Vec<StoredChunkFile>, usize, &'static str, usize)> {
     // Prefer the committed index: same documents, no transcript re-parse.
-    if let Some(files) =
-        collect_intent_files_from_index(aicx_home, project, cutoff, live, full_history)
-    {
-        return Ok((files, 0, INDEX_IDENTITY_SOURCE, 0));
+    if let Some((files, source_errors)) = collect_intent_files_from_index(
+        aicx_home,
+        project,
+        cutoff,
+        frame_kind,
+        live,
+        full_history,
+        mixed_scope,
+    ) {
+        return Ok((files, source_errors, INDEX_IDENTITY_SOURCE, 0));
     }
 
     let entries = crate::catalog::read_entries_at(aicx_home)?;
@@ -548,12 +742,13 @@ fn collect_intent_files(
         let Some(identity_project) = entry.project.clone() else {
             continue;
         };
-        let (organization, repository) = identity_project
-            .split_once('/')
-            .unwrap_or(("", identity_project.as_str()));
-        if !project.trim().is_empty()
-            && !legacy_archive::project_filter_matches(organization, repository, project)
-        {
+        if !entry_matches_project(Some(identity_project.as_str()), project) {
+            continue;
+        }
+        // Guardian sessions are control-plane approval machinery: kept whole
+        // in the catalog, extract and forensic search, but never part of the
+        // operator project-intent stream.
+        if crate::sessions::is_guardian_session_kind(entry.session_kind.as_deref()) {
             continue;
         }
 
@@ -584,8 +779,10 @@ fn collect_intent_files(
         }
         let live_row = session_is_hot_live(live, hot);
 
-        let (source_path, mut frames) =
-            match crate::source_index::read_catalog_signal_at(aicx_home, &entry, frame_kind) {
+        let (source_path, frames, scope) =
+            match crate::source_index::read_catalog_signal_with_scope_at(
+                aicx_home, &entry, frame_kind,
+            ) {
                 Ok(result) => result,
                 Err(error) => {
                     source_errors += 1;
@@ -596,53 +793,20 @@ fn collect_intent_files(
                     continue;
                 }
             };
-        // Scope is judged on the whole session, before the project filter
-        // narrows the frames to one bucket (W2-R1).
-        let scope = crate::extraction::conversation::scope_report_for_entries(&frames);
-        retain_frames_for_project(&mut frames, &identity_project, entry.cwd.as_deref());
-        if frames.is_empty() {
+        let Some((file, scope)) =
+            catalog_frames_to_intent_file(&entry, source_path, frames, scope, cutoff, live_row)
+        else {
             continue;
-        }
-        let timestamp = frames
-            .last()
-            .map(|frame| frame.timestamp)
-            .expect("non-empty frames have a last timestamp");
-        if canonical_date.is_none() && timestamp < cutoff {
+        };
+        note_mixed_scope(mixed_scope, &entry.agent, &entry.session_id, &scope);
+        let Some(file) = file else {
             continue;
-        }
-        let date = entry
-            .date
-            .clone()
-            .unwrap_or_else(|| timestamp.format("%Y-%m-%d").to_string());
-        let transcript_entries = frames
-            .into_iter()
-            .map(|frame| TranscriptEntry {
-                role: frame.role,
-                lines: frame.message.lines().map(str::to_string).collect(),
-            })
-            .collect();
+        };
         seen_sessions.insert((entry.agent.clone(), entry.session_id.clone()));
         if live_row {
             live_sessions += 1;
         }
-        files.push(StoredChunkFile {
-            agent: entry.agent,
-            date,
-            path: source_path,
-            project: identity_project,
-            identity_source: CATALOG_IDENTITY_SOURCE.to_string(),
-            sequence: 0,
-            timestamp,
-            session_id: entry.session_id,
-            honesty: if live_row {
-                crate::oracle::ClaimHonesty::live_open()
-            } else {
-                crate::oracle::ClaimHonesty::canonical()
-            },
-            scope: Some(scope),
-            transcript_entries: Some(transcript_entries),
-            body: None,
-        });
+        files.push(file);
     }
 
     if live {
@@ -654,6 +818,7 @@ fn collect_intent_files(
             &seen_sessions,
             &mut files,
             &mut source_errors,
+            mixed_scope,
         )?;
     }
 
@@ -663,6 +828,118 @@ fn collect_intent_files(
             .then_with(|| left.path.cmp(&right.path))
     });
     Ok((files, source_errors, CATALOG_IDENTITY_SOURCE, live_sessions))
+}
+
+#[cfg(feature = "app")]
+fn catalog_frames_to_intent_file(
+    entry: &crate::catalog::CatalogEntry,
+    source_path: PathBuf,
+    mut frames: Vec<TimelineEntry>,
+    // Scope of the WHOLE session, computed before the frame-kind filter: a
+    // per-role view can see at most half the evidence.
+    scope: crate::extraction::conversation::ScopeReport,
+    cutoff: DateTime<Utc>,
+    live_row: bool,
+) -> Option<(
+    Option<StoredChunkFile>,
+    crate::extraction::conversation::ScopeReport,
+)> {
+    let no_file = |scope: crate::extraction::conversation::ScopeReport| Some((None, scope));
+    // Guardian sessions are control-plane evidence: they never enter the
+    // intent stream, and their scope never enters the mixed-scope telemetry
+    // either, regardless of which lane called us. `None` says "not operator
+    // work at all", which an empty file with a report cannot.
+    if is_guardian_session(entry, &source_path, &frames) {
+        return None;
+    }
+    let Some(project) = entry.project.clone() else {
+        return no_file(scope);
+    };
+    // Scope is judged on the whole session, before the project filter narrows
+    // the frames to one bucket — and the report travels even when the filter
+    // removes every frame (fail-closed must not silence mixed evidence).
+    retain_frames_for_project(
+        &mut frames,
+        &project,
+        entry.cwd.as_deref(),
+        scope.scope_foreign_to(entry.cwd.as_deref()),
+    );
+    let Some(timestamp) = frames.last().map(|frame| frame.timestamp) else {
+        return no_file(scope);
+    };
+    let canonical_date = entry
+        .date
+        .as_deref()
+        .and_then(|date| NaiveDate::parse_from_str(date, "%Y-%m-%d").ok());
+    if canonical_date.is_none() && timestamp < cutoff {
+        return no_file(scope);
+    }
+    Some((
+        Some(StoredChunkFile {
+            agent: entry.agent.clone(),
+            date: entry
+                .date
+                .clone()
+                .unwrap_or_else(|| timestamp.format("%Y-%m-%d").to_string()),
+            path: source_path,
+            project: project.clone(),
+            identity_source: CATALOG_IDENTITY_SOURCE.to_string(),
+            sequence: 0,
+            timestamp,
+            session_id: entry.session_id.clone(),
+            honesty: if live_row {
+                crate::oracle::ClaimHonesty::live_open()
+            } else {
+                crate::oracle::ClaimHonesty::canonical()
+            },
+            scope: Some(scope.clone()),
+            transcript_entries: Some(
+                frames
+                    .into_iter()
+                    .map(|frame| TranscriptEntry {
+                        role: frame.role,
+                        lines: frame.message.lines().map(str::to_string).collect(),
+                    })
+                    .collect(),
+            ),
+            body: None,
+        }),
+        scope,
+    ))
+}
+
+/// Is this session a guardian — control-plane evidence that stays out of the
+/// operator intent stream and out of its scope telemetry?
+///
+/// The frames are the authority: their provenance was resolved where the
+/// source was opened ([`crate::sessions::resolve_session_kind`]), so this also
+/// catches catalog rows cataloged before the column existed — the column-only
+/// guards in the lanes are fast paths, not the contract. The frame-kind and
+/// privacy filters can leave no frame to carry that provenance, and a guardian
+/// must not reach the telemetry through an empty view, so an empty view asks
+/// the source once more (one bounded header read).
+#[cfg(feature = "app")]
+fn is_guardian_session(
+    entry: &crate::catalog::CatalogEntry,
+    source_path: &Path,
+    frames: &[TimelineEntry],
+) -> bool {
+    if crate::sessions::is_guardian_session_kind(entry.session_kind.as_deref()) {
+        return true;
+    }
+    if frames.is_empty() {
+        let resolved = crate::sessions::resolve_session_kind(
+            &entry.agent,
+            entry.session_kind.as_deref(),
+            source_path,
+        );
+        return crate::sessions::is_guardian_session_kind(resolved.as_deref());
+    }
+    crate::sessions::is_guardian_session_kind(
+        frames
+            .iter()
+            .find_map(|frame| frame.session_kind.as_deref()),
+    )
 }
 
 /// Admit sessions the durable catalog census does not know yet (P0 live
@@ -679,6 +956,7 @@ fn collect_live_unadmitted_files(
     seen_sessions: &BTreeSet<(String, String)>,
     files: &mut Vec<StoredChunkFile>,
     source_errors: &mut usize,
+    mixed_scope: &mut Vec<MixedScopeSession>,
 ) -> Result<usize> {
     let user_home = crate::os_user_home().unwrap_or_else(|| aicx_home.to_path_buf());
     let cutoff_unix_ns = cutoff
@@ -705,16 +983,20 @@ fn collect_live_unadmitted_files(
             // proven to belong to the requested project. Never guess.
             continue;
         };
-        let (organization, repository) = identity_project
-            .split_once('/')
-            .unwrap_or(("", identity_project.as_str()));
-        if !project.trim().is_empty()
-            && !legacy_archive::project_filter_matches(organization, repository, project)
-        {
+        if !entry_matches_project(Some(identity_project.as_str()), project) {
             continue;
         }
-        let (source_path, mut frames) =
-            match crate::source_index::read_catalog_signal_at(aicx_home, &entry, frame_kind) {
+        // Same control-plane exclusion as the census lane: guardian sessions
+        // never enter the operator project-intent stream. The column is the
+        // fast path that skips the read; `is_guardian_session` after it is
+        // the contract.
+        if crate::sessions::is_guardian_session_kind(entry.session_kind.as_deref()) {
+            continue;
+        }
+        let (source_path, mut frames, scope) =
+            match crate::source_index::read_catalog_signal_with_scope_at(
+                aicx_home, &entry, frame_kind,
+            ) {
                 Ok(result) => result,
                 Err(error) => {
                     *source_errors += 1;
@@ -725,10 +1007,18 @@ fn collect_live_unadmitted_files(
                     continue;
                 }
             };
-        // Scope is judged on the whole session, before the project filter
-        // narrows the frames to one bucket (W2-R1).
-        let scope = crate::extraction::conversation::scope_report_for_entries(&frames);
-        retain_frames_for_project(&mut frames, &identity_project, entry.cwd.as_deref());
+        if is_guardian_session(&entry, &source_path, &frames) {
+            continue;
+        }
+        // `scope` is the WHOLE session's, taken before the frame-kind filter
+        // and before the project filter narrows the frames to one bucket.
+        note_mixed_scope(mixed_scope, &entry.agent, &entry.session_id, &scope);
+        retain_frames_for_project(
+            &mut frames,
+            &identity_project,
+            entry.cwd.as_deref(),
+            scope.scope_foreign_to(entry.cwd.as_deref()),
+        );
         if frames.is_empty() {
             continue;
         }
@@ -766,12 +1056,17 @@ fn collect_live_unadmitted_files(
     Ok(admitted)
 }
 
-/// Keep per-frame checkout truth ahead of a session's start-directory label.
+/// Keep per-frame checkout truth ahead of a session's start-directory label —
+/// fail-closed inside mixed sessions.
 ///
 /// Agents can `cd` into another repository without starting a new session.
 /// Frames that carry an explicit cwd must therefore prove they still belong
-/// to the requested canonical bucket. Older sources without per-frame cwd
-/// retain the catalog attribution instead of being silently discarded.
+/// to the requested canonical bucket. A frame whose turn-window workdir
+/// evidence conflicted (`scope_conflict`) never proves membership and is
+/// always dropped from a project-filtered query. A frame with NO cwd evidence
+/// inherits the catalog attribution only while the session scope is
+/// homogeneous; once the session is a mixed candidate, silence is not proof
+/// and the frame stays unattributed instead of leaking into the project.
 ///
 /// Membership has two proofs, either suffices:
 /// 1. the frame cwd is the session checkout (or a subdirectory of it) —
@@ -785,22 +1080,51 @@ fn retain_frames_for_project(
     frames: &mut Vec<TimelineEntry>,
     project: &str,
     session_cwd: Option<&str>,
+    session_mixed: bool,
 ) {
     let filters = [project.to_string()];
     let session_root = session_cwd
         .map(|cwd| cwd.trim_end_matches(['/', '\\']))
         .filter(|cwd| !cwd.is_empty());
     frames.retain(|frame| {
-        frame.cwd.as_deref().is_none_or(|cwd| {
-            let inside_session_checkout = session_root.is_some_and(|root| {
-                let cwd = cwd.trim_end_matches(['/', '\\']);
-                cwd == root
-                    || cwd
-                        .strip_prefix(root)
-                        .is_some_and(|rest| rest.starts_with('/') || rest.starts_with('\\'))
-            });
-            inside_session_checkout || crate::extraction::project_filter_matches_path(cwd, &filters)
-        })
+        // Durable "do not inherit" states: proven divergence and unresolved
+        // foreign evidence never join a project bucket.
+        if frame.scope_conflict || frame.scope_unattributed {
+            return false;
+        }
+        match frame.cwd.as_deref() {
+            Some(cwd) => {
+                // Repo identity, never a path prefix: a nested checkout or
+                // submodule lives lexically under the session checkout and is
+                // a different repository. Accepting containment by string
+                // shape is the cross-repo leak this filter exists to close.
+                if session_root
+                    .is_some_and(|root| aicx_parser::engine::workdir_within_scope(cwd, root))
+                {
+                    return true;
+                }
+                // The path-segment fallback below is a legacy heuristic over
+                // path SPELLING, and a nested checkout at
+                // `…/vista/vendor/fleet-bus` still spells `vista` — it
+                // re-admits exactly what repo identity just rejected. Reaching
+                // it is only honest when there was no identity to be had.
+                match aicx_parser::engine::normalize_workdir(cwd, session_root) {
+                    // Resolves to a real checkout here, and the membership test
+                    // above already measured it against the session root. A
+                    // failed proof is an answer, not a gap — including when the
+                    // session's own baseline is historical and no longer
+                    // resolves, which is precisely when spelling is least
+                    // trustworthy.
+                    aicx_parser::engine::WorkdirIdentity::Resolved(_) => false,
+                    // Nothing resolves on this host; spelling is the only
+                    // evidence the session left behind.
+                    aicx_parser::engine::WorkdirIdentity::Unresolved(_) => {
+                        crate::extraction::project_filter_matches_path(cwd, &filters)
+                    }
+                }
+            }
+            None => !session_mixed,
+        }
     });
 }
 
@@ -827,6 +1151,7 @@ fn collect_intent_files(
     frame_kind: FrameKind,
     _live: bool,
     _full_history: bool,
+    _mixed_scope: &mut Vec<MixedScopeSession>,
 ) -> Result<(Vec<StoredChunkFile>, usize, &'static str, usize)> {
     // `loctree-consumer` is the legacy read-core profile: it deliberately
     // excludes app-only source discovery and catalog parsing — including the
@@ -863,12 +1188,7 @@ fn collect_legacy_chunk_files(
         let (identity_project, identity_source) = persisted_project
             .map(|identity_project| (identity_project, PERSISTED_IDENTITY_SOURCE))
             .unwrap_or_else(|| (file.project.clone(), PATH_HEURISTIC_IDENTITY_SOURCE));
-        let (organization, repository) = identity_project
-            .split_once('/')
-            .unwrap_or(("", identity_project.as_str()));
-        if !project.trim().is_empty()
-            && !legacy_archive::project_filter_matches(organization, repository, project)
-        {
+        if !entry_matches_project(Some(identity_project.as_str()), project) {
             continue;
         }
         let sidecar = legacy_archive::load_sidecar(&file.path);

@@ -824,9 +824,52 @@ pub fn timeline_entries_from_model(model: &SessionModel) -> Vec<TimelineEntry> {
                 branch: segment
                     .and_then(|segment| known_str(&segment.branch))
                     .map(str::to_string),
+                // The resolved repository identity when this host could
+                // prove one, otherwise the cwd the rollout recorded. The two
+                // are kept apart in the model so the canonical fingerprint
+                // stays independent of the machine doing the parsing. A
+                // conflict span has NO scope: its recorded cwd stays in the
+                // model as a fact, but serving it here would file the span
+                // under a project the workdirs proved it was not only in.
                 cwd: segment
-                    .and_then(|segment| known_str(&segment.cwd))
+                    .filter(|segment| !segment.scope_conflict)
+                    .and_then(|segment| {
+                        segment
+                            .scope_root
+                            .as_deref()
+                            .or_else(|| known_str(&segment.cwd))
+                    })
                     .map(str::to_string),
+                // The explicit fact, carried by the model — never inferred
+                // from the generic mixed status. A Claude segment records
+                // `MixedCandidate` for an ordinary branch switch inside one
+                // unchanged checkout, and a Codex segment can be cwd-less for
+                // reasons that are not proven divergence; both used to be
+                // convicted here, dropping the whole session's intents.
+                scope_conflict: segment.is_some_and(|segment| segment.scope_conflict),
+                scope_unattributed: segment.is_some_and(|segment| {
+                    segment.scope_status == aicx_parser::engine::ScopeStatus::Unattributed
+                }),
+                // A re-scope serves the resolved root and a conflict serves
+                // nothing, yet the span still ran in its recorded cwd: that
+                // path joins the workdirs the deny list judges, standing in
+                // for the `cwd` it no longer is.
+                scope_workdirs: segment
+                    .map(|segment| {
+                        let displaced = (segment.scope_conflict || segment.scope_root.is_some())
+                            .then(|| known_str(&segment.cwd))
+                            .flatten()
+                            .filter(|cwd| !segment.scope_workdirs.iter().any(|path| path == cwd));
+                        displaced
+                            .map(str::to_string)
+                            .into_iter()
+                            .chain(segment.scope_workdirs.iter().cloned())
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                // Catalog provenance is stamped by the catalog read path
+                // (`parse_catalog_source`), which owns the entry.
+                session_kind: None,
                 timestamp_source,
                 // The typed model is deliberately path-free; source identity
                 // travels as the provenance content hash.

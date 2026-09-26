@@ -6,7 +6,7 @@
 //! directly. It never reads or writes per-frame store cards or embedding
 //! NDJSON intermediates.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
@@ -17,6 +17,11 @@ use anyhow::{Context, Result};
 use chrono::SecondsFormat;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+
+use aicx_parser::engine::scope_evidence::{
+    WindowScope, WorkdirEvidence, effective_window_scope, is_tool_call_payload_type,
+    normalize_workdir, recorded_workdir, scope_layout_evidence, tool_call_workdirs,
+};
 
 use crate::catalog::CatalogEntry;
 use crate::progress::{Heartbeat, NoopReporter, Phase, Reporter};
@@ -35,7 +40,7 @@ const MAX_JSONL_RECORD_BYTES: usize = 2 * 1024 * 1024;
 /// short-circuited forever, leaving search previews full of
 /// `{"type":"thought","data":"..."}` spam. Including this constant forces a
 /// one-shot rebuild so index truth tracks filter truth.
-const SIGNAL_FILTER_VERSION: &str = "signal-v3-workspace-metadata-strip";
+pub(crate) const SIGNAL_FILTER_VERSION: &str = "signal-v6-scope-fails-closed";
 
 const PARSE_STATE_SCHEMA: &str = "aicx.source_parse_state.v1";
 const PARSE_STATE_RELPATH: &str = "indexed/_all/source_parse_state.v1.json";
@@ -187,6 +192,103 @@ struct SessionParseRecord {
     project: Option<String>,
     date: Option<String>,
     cwd: Option<String>,
+    /// Whole-session mixed-workstream verdict at parse time; reused chunks
+    /// re-stamp it into metadata so the intents index lane can fall back to
+    /// the census for mixed sessions.
+    #[serde(default)]
+    scope_conflict: bool,
+    /// Any frame carried unresolved foreign workdir evidence; reused chunks
+    /// re-stamp it so the index lane falls back to the census lane, which
+    /// applies the do-not-inherit filter per frame.
+    #[serde(default)]
+    scope_unattributed: bool,
+    /// Subagent provenance (e.g. `subagent:guardian`); reused chunks re-stamp
+    /// it so the intents index lane can exclude control-plane sessions.
+    #[serde(default)]
+    session_kind: Option<String>,
+    /// Identity of the FILESYSTEM the scope verdicts above were computed
+    /// against (see [`ScopeLayoutProbe::fingerprint`]).
+    ///
+    /// Those verdicts resolve repository identity on this host, so they can
+    /// go stale while the source bytes and the catalog row stay byte-identical
+    /// — a nested checkout created or removed, a `.gitmodules` edited. Old
+    /// ledgers deserialize to empty, which never matches and so never reuses.
+    #[serde(default)]
+    scope_environment: String,
+    /// Every working directory the source RECORDED — each span's cwd as
+    /// written and each turn window's tool workdirs — collected at the parse,
+    /// before the signal filter, `.aicxignore` and scope reduction. The
+    /// fingerprint above is recomputed from these. A reduced list (the scope
+    /// report's cwds) forgets precisely the paths that matter: a workdir its
+    /// baseline absorbed leaves no cwd behind, so a checkout later created
+    /// there never moved the fingerprint. Local ledger state beside the
+    /// `.aicxignore` that already names any hidden path; never published.
+    #[serde(default)]
+    scope_paths: Vec<String>,
+}
+
+/// Memoized repository-layout identity for one index build.
+///
+/// Scope verdicts read this host's filesystem — which `.git` ancestor a path
+/// has, what `.gitmodules` declares — so a cache keyed on source bytes and
+/// catalog fields alone serves verdicts the layout no longer supports.
+/// [`scope_layout_evidence`] names what the verdicts read for one path; this
+/// hashes it for every path a session recorded. Thousands of sessions share
+/// a handful of working directories, and each lookup walks ancestors on disk,
+/// so one build probes each path once. A build is one snapshot: create a
+/// fresh probe per build, never keep one across builds.
+#[derive(Default)]
+struct ScopeLayoutProbe {
+    seen: HashMap<String, String>,
+}
+
+impl ScopeLayoutProbe {
+    fn layout(&mut self, path: &str) -> &str {
+        self.seen
+            .entry(path.to_owned())
+            .or_insert_with(|| hex::encode(Sha256::digest(scope_layout_evidence(path))))
+            .as_str()
+    }
+
+    /// Layout identity of one session: its catalog baseline plus every path
+    /// it recorded, each with what the verdicts read about it today.
+    fn fingerprint(&mut self, baseline: Option<&str>, scope_paths: &[String]) -> String {
+        let mut paths: Vec<&str> = baseline
+            .into_iter()
+            .chain(scope_paths.iter().map(String::as_str))
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+            .collect();
+        paths.sort_unstable();
+        paths.dedup();
+        let mut hasher = Sha256::new();
+        hasher.update(b"aicx.scope_environment.v2\0");
+        for path in paths {
+            hasher.update(b"path\0");
+            hasher.update(path.as_bytes());
+            hasher.update([0]);
+            hasher.update(self.layout(path).as_bytes());
+            hasher.update([0]);
+        }
+        hex::encode(hasher.finalize())
+    }
+
+    /// Do the scope verdicts CURRENT was published with still hold here?
+    ///
+    /// The generation fingerprint covers source bytes, the catalog and the
+    /// privacy rules, not the layout the verdicts read, so on its own it
+    /// served `unchanged` across a nested checkout appearing or a
+    /// `.gitmodules` edit and never reached the per-session reuse gate. The
+    /// ledger is written only beside a successful publish, so it describes
+    /// the layout CURRENT was built against. An empty ledger proves nothing,
+    /// and so is not current.
+    fn ledger_is_current(&mut self, ledger: &SourceParseState) -> bool {
+        !ledger.sessions.is_empty()
+            && ledger.sessions.values().all(|record| {
+                record.scope_environment
+                    == self.fingerprint(record.cwd.as_deref(), &record.scope_paths)
+            })
+    }
 }
 
 /// Build or preview the global lexical index from the durable catalog.
@@ -283,11 +385,23 @@ pub fn build_with_reporter(
     // `--semantic` refuses the lexical-only short-circuit when dense is absent
     // so operators can attach dense to an otherwise current corpus without
     // `--full-rescan`.
+    //
+    // Scope verdicts also read the repository layout on this host, which the
+    // digest cannot see; the ledger records it per session, so a layout
+    // change refuses the short-circuit and lets the reuse gate below re-parse
+    // exactly the sessions whose verdicts it could move.
+    let prior_state = if full_rescan {
+        SourceParseState::default()
+    } else {
+        load_parse_state(aicx_home, &repo_path_ignore_fingerprint)
+    };
+    let mut layout = ScopeLayoutProbe::default();
     let dense_missing = crate::vector_index::current_dense_not_built().unwrap_or(true);
     if !full_rescan
         && project_filters.is_empty()
         && crate::vector_index::source_lexical_generation_matches(&source_fingerprint)?
         && !(semantic && dense_missing)
+        && layout.ledger_is_current(&prior_state)
     {
         let (dense_kind, dense_docs) = current_dense_stats();
         return Ok(SourceIndexReport {
@@ -331,12 +445,6 @@ pub fn build_with_reporter(
         sessions: BTreeMap::new(),
     };
 
-    let prior_state = if full_rescan {
-        SourceParseState::default()
-    } else {
-        load_parse_state(aicx_home, &repo_path_ignore_fingerprint)
-    };
-
     let parse_phase = Phase::start(reporter.clone(), "index_parse", Some(selected.len() as u64));
     let parse_hb = Heartbeat::spawn_with_backoff(
         parse_phase.clone(),
@@ -357,6 +465,7 @@ pub fn build_with_reporter(
             &session_key,
             &source_allow,
             &repo_path_ignore_fingerprint,
+            &mut layout,
         ) {
             let record = prior_state
                 .sessions
@@ -403,6 +512,7 @@ pub fn build_with_reporter(
         let ParsedCatalogSource {
             mut frames,
             distill,
+            recorded_workdirs,
         } = parsed_source;
         sources_parsed += 1;
         let raw_count = frames.len();
@@ -414,7 +524,10 @@ pub fn build_with_reporter(
             frame.message = clean_message(&frame.message);
         }
         frames.retain(|frame| !frame.message.trim().is_empty());
-        drop_ignored_cwd_frames(&mut frames, &ignore);
+        // Same one step as the intent lane: whatever `.aicxignore` hides is
+        // counted into the report here, or this chunk's scope silently forgets
+        // the session's own baseline.
+        let scope = scope_report_excluding_ignored(&mut frames, &ignore);
         let signal_count = frames.len();
         signal_frames += signal_count;
         let filtered_count = before.saturating_sub(frames.len());
@@ -445,6 +558,23 @@ pub fn build_with_reporter(
             .project
             .clone()
             .unwrap_or_else(|| "_unknown".to_string());
+        // Whole-session chunks cannot express per-frame scope, so this flag
+        // routes the session to the per-frame census lane. It must mean
+        // "more than one scope", not "MixedCandidate": a same-repo branch
+        // switch is mixed by status and perfectly servable as one bucket.
+        // It must also catch the homogeneous case: every frame re-scoped to
+        // ONE foreign checkout is a consistent session that belongs to another
+        // repository, and serving it whole would stamp all of it with this
+        // catalog row's project.
+        let session_mixed = scope.scope_foreign_to(entry.cwd.as_deref());
+        let session_unattributed = frames.iter().any(|frame| frame.scope_unattributed);
+        // Frames carry the provenance resolved at the source, which is the
+        // only lane that can see it for a catalog row cataloged before the
+        // column existed.
+        let resolved_kind = frames
+            .iter()
+            .find_map(|frame| frame.session_kind.clone())
+            .or_else(|| entry.session_kind.clone());
         let mut metadata = serde_json::json!({
             "source_path": indexed_path.to_string_lossy(),
             "project": project,
@@ -457,6 +587,9 @@ pub fn build_with_reporter(
             "cwd": entry.cwd,
             "source_catalog_path": entry.source_path,
             "preview_lines": extract_preview_lines(&frames),
+            "scope_conflict": session_mixed,
+            "scope_unattributed": session_unattributed,
+            "session_kind": resolved_kind.clone(),
         });
         if let Some(distill) = &distill {
             // card.v3 (W2-02): distill block + flat filter scalars. Reused
@@ -495,6 +628,11 @@ pub fn build_with_reporter(
                 project: entry.project.clone(),
                 date: entry.date.clone().or(Some(date)),
                 cwd: entry.cwd.clone(),
+                scope_conflict: session_mixed,
+                scope_unattributed: session_unattributed,
+                session_kind: resolved_kind.clone(),
+                scope_environment: layout.fingerprint(entry.cwd.as_deref(), &recorded_workdirs),
+                scope_paths: recorded_workdirs,
             },
         );
     }
@@ -845,6 +983,7 @@ fn read_session_document(aicx_home: &Path, entry: &CatalogEntry) -> Result<Sessi
         &session_key,
         &source_allow,
         &repo_path_ignore_fingerprint,
+        &mut ScopeLayoutProbe::default(),
     ) {
         return Ok(SessionDocument {
             body: chunk.text,
@@ -868,7 +1007,7 @@ fn read_session_document(aicx_home: &Path, entry: &CatalogEntry) -> Result<Sessi
         frame.message = clean_message(&frame.message);
     }
     frames.retain(|frame| !frame.message.trim().is_empty());
-    drop_ignored_cwd_frames(&mut frames, &ignore);
+    let _ = scope_report_excluding_ignored(&mut frames, &ignore);
     let body = render_extract(entry, &frames);
     Ok(SessionDocument {
         body,
@@ -959,6 +1098,24 @@ fn merge_context_spans(
 struct ParsedCatalogSource {
     frames: Vec<TimelineEntry>,
     distill: Option<crate::extraction::distill::materialize::IndexDistillate>,
+    /// Every working directory the source recorded, sorted and distinct:
+    /// what the index ledger fingerprints the repository layout from. Taken
+    /// at the source, because frames alone lose it — a re-scoped window's
+    /// frames carry the resolved checkout, not the cwd the turn recorded.
+    recorded_workdirs: Vec<String>,
+}
+
+/// Every working directory a parsed session RECORDED: each span's cwd as
+/// written and each turn window's tool workdirs, whatever the verdict.
+fn model_recorded_workdirs(model: &aicx_parser::engine::SessionModel) -> Vec<String> {
+    let mut paths = BTreeSet::new();
+    for segment in &model.segments {
+        if let aicx_parser::engine::Known::Value(cwd) = &segment.cwd {
+            paths.insert(cwd.clone());
+        }
+        paths.extend(segment.scope_workdirs.iter().cloned());
+    }
+    paths.into_iter().collect()
 }
 
 fn parse_catalog_source(
@@ -970,6 +1127,11 @@ fn parse_catalog_source(
     let path = allow
         .resolve_file(path)
         .with_context(|| format!("resolve catalog source {}", path.display()))?;
+    // Provenance is established where the source is opened — the catalog
+    // column only caches it, and cold rows never get refreshed by a hot-window
+    // pass. Bounded header read, and only for rows that lack the column.
+    let session_kind =
+        crate::sessions::resolve_session_kind(&entry.agent, entry.session_kind.as_deref(), &path);
 
     if entry.agent == "vibecrafted" {
         let body = allow
@@ -983,6 +1145,7 @@ fn parse_catalog_source(
             return Ok(ParsedCatalogSource {
                 frames: Vec::new(),
                 distill: None,
+                recorded_workdirs: Vec::new(),
             });
         }
         let timestamp = fs::metadata(&path)
@@ -992,6 +1155,7 @@ fn parse_catalog_source(
             .unwrap_or_else(chrono::Utc::now);
         return Ok(ParsedCatalogSource {
             distill: None,
+            recorded_workdirs: entry.cwd.iter().cloned().collect(),
             frames: vec![TimelineEntry {
                 timestamp,
                 agent: entry.agent.clone(),
@@ -1003,6 +1167,10 @@ fn parse_catalog_source(
                 frame_kind: Some(FrameKind::AgentReply),
                 branch: None,
                 cwd: entry.cwd.clone(),
+                scope_conflict: false,
+                scope_unattributed: false,
+                scope_workdirs: Vec::new(),
+                session_kind: session_kind.clone(),
                 timestamp_source: Some("source_mtime".to_string()),
                 source_path: Some(entry.source_path.clone()),
                 source_sha256: None,
@@ -1015,10 +1183,7 @@ fn parse_catalog_source(
         .with_context(|| format!("stat source {}", path.display()))?
         .len();
     if entry.agent == "codex" && source_bytes > MAX_FULL_PARSE_BYTES {
-        return Ok(ParsedCatalogSource {
-            frames: parse_large_codex_signal(entry, &path, allow)?,
-            distill: None,
-        });
+        return parse_large_codex_signal(entry, &path, allow, session_kind.as_deref());
     }
     if source_bytes > MAX_FULL_PARSE_BYTES {
         anyhow::bail!(
@@ -1048,9 +1213,14 @@ fn parse_catalog_source(
     let distill = Some(crate::extraction::distill::materialize::index_metadata(
         &distillates,
     ));
+    let mut frames = crate::output::timeline_entries_from_model(parsed.model());
+    for frame in &mut frames {
+        frame.session_kind = session_kind.clone();
+    }
     Ok(ParsedCatalogSource {
-        frames: crate::output::timeline_entries_from_model(parsed.model()),
+        frames,
         distill,
+        recorded_workdirs: model_recorded_workdirs(parsed.model()),
     })
 }
 
@@ -1059,15 +1229,33 @@ fn parse_catalog_source(
 ///
 /// Intent retrieval uses this path directly instead of reconstructing evidence
 /// from retired per-frame cards. The returned path is canonical and proven to
-/// live below one of the operator-approved source roots before any source open.
-pub(crate) fn read_catalog_signal_at(
+/// live under the operator allowlist.
+/// The requested frames PLUS the scope report of the whole session.
+///
+/// Scope is a property of the session, not of one role: the kind filter drops
+/// the opposite role, so a report computed after it can see at most half the
+/// evidence. A session whose assistant turns ran in a foreign checkout while
+/// its user turns carry the baseline would then look homogeneous to both
+/// passes — unreported as mixed, and cwd-less frames inheriting the catalog
+/// project on the strength of evidence that was filtered away.
+///
+/// `.aicxignore` narrows the same evidence one layer deeper, so the count of
+/// scopes it hid travels with the report: an ignored BASELINE would otherwise
+/// leave a foreign cwd looking like the session's only scope.
+pub(crate) fn read_catalog_signal_with_scope_at(
     aicx_home: &Path,
     entry: &CatalogEntry,
     frame_kind: FrameKind,
-) -> Result<(PathBuf, Vec<TimelineEntry>)> {
-    let (source_path, mut frames) = read_catalog_conversation_at(aicx_home, entry)?;
+) -> Result<(
+    PathBuf,
+    Vec<TimelineEntry>,
+    crate::extraction::conversation::ScopeReport,
+)> {
+    // The report arrives already built, on the whole session and on the
+    // evidence the privacy filter removed; there is nothing here to re-attach.
+    let (source_path, mut frames, scope) = read_catalog_conversation_at(aicx_home, entry)?;
     frames.retain(|frame| frame_matches_kind(frame, frame_kind));
-    Ok((source_path, frames))
+    Ok((source_path, frames, scope))
 }
 
 /// Read one cataloged session as the clean user/assistant conversation used by
@@ -1076,7 +1264,11 @@ pub(crate) fn read_catalog_signal_at(
 pub(crate) fn read_catalog_conversation_at(
     aicx_home: &Path,
     entry: &CatalogEntry,
-) -> Result<(PathBuf, Vec<TimelineEntry>)> {
+) -> Result<(
+    PathBuf,
+    Vec<TimelineEntry>,
+    crate::extraction::conversation::ScopeReport,
+)> {
     let user_home = crate::os_user_home().unwrap_or_else(|| aicx_home.to_path_buf());
     let source_allow = crate::source_path::SourceAllowlist::for_operator(&user_home, aicx_home);
     let source_path = source_allow
@@ -1095,18 +1287,57 @@ pub(crate) fn read_catalog_conversation_at(
     }
     frames.retain(|frame| !frame.message.trim().is_empty());
     let ignore = crate::legacy_archive::load_repo_path_ignore(aicx_home, &user_home)?;
-    drop_ignored_cwd_frames(&mut frames, &ignore);
-    Ok((source_path, frames))
+    let scope = scope_report_excluding_ignored(&mut frames, &ignore);
+    Ok((source_path, frames, scope))
 }
 
-fn drop_ignored_cwd_frames(
+/// Drop frames whose cwd the operator hid, and report the session's scope.
+///
+/// The privacy filter and the scope report are deliberately ONE step. A report
+/// built after the filter has already lost the hidden evidence, and a caller
+/// that has to remember to re-attach it is a caller that can forget: that is
+/// precisely how a session whose baseline is hidden comes back looking
+/// homogeneous, letting its remaining frames inherit the cataloged project.
+///
+/// A frame is judged on every checkout its turn window touched, not only on
+/// its `cwd`: the window's recorded workdirs are tested too. A conflict window
+/// has no `cwd` to test at all, and a window absorbed into its baseline still
+/// ran inside the paths it names — judging `cwd` alone published exactly the
+/// denied checkout that made the window mixed.
+///
+/// The hidden repositories are counted, never named — scope honesty must not
+/// re-publish a path `.aicxignore` exists to hide. Each denied path counts as
+/// the checkout it resolves to here, so one repository reached through its
+/// root and a subdirectory is one hidden scope, not two.
+fn scope_report_excluding_ignored(
     frames: &mut Vec<TimelineEntry>,
     ignore: &crate::legacy_archive::RepoPathIgnoreMatcher,
-) {
+) -> crate::extraction::conversation::ScopeReport {
     if ignore.is_empty() {
-        return;
+        return crate::extraction::conversation::scope_report_for_entries(frames);
     }
-    frames.retain(|frame| !ignore.ignores_cwd(frame.cwd.as_deref()));
+    let mut identities: BTreeMap<String, String> = BTreeMap::new();
+    let mut hidden = std::collections::BTreeSet::new();
+    frames.retain(|frame| {
+        let denied: Vec<&str> = frame
+            .cwd
+            .as_deref()
+            .into_iter()
+            .chain(frame.scope_workdirs.iter().map(String::as_str))
+            .map(str::trim)
+            .filter(|path| !path.is_empty() && ignore.ignores_cwd(Some(path)))
+            .collect();
+        for path in &denied {
+            let identity = identities
+                .entry((*path).to_owned())
+                .or_insert_with(|| normalize_workdir(path, None).scope_path());
+            hidden.insert(identity.clone());
+        }
+        denied.is_empty()
+    });
+    let mut report = crate::extraction::conversation::scope_report_for_entries(frames);
+    report.hidden_scopes = hidden.len();
+    report
 }
 
 fn frame_matches_kind(frame: &TimelineEntry, requested: FrameKind) -> bool {
@@ -1115,6 +1346,19 @@ fn frame_matches_kind(frame: &TimelineEntry, requested: FrameKind) -> bool {
         "assistant" => FrameKind::AgentReply,
         _ => FrameKind::SystemNote,
     }) == requested
+}
+
+/// Record that the current turn window holds a record this reader could not
+/// parse — drained over-cap or malformed — whose visible bytes may be a tool
+/// call, and so may hide the window's only foreign workdir. The window then
+/// fails closed to unattributed, exactly as the full Codex adapter's
+/// `note_opaque_window` decides for the same two cases.
+fn note_opaque_record(window_workdirs: &mut Vec<WorkdirEvidence>, line: &str) {
+    if aicx_parser::engine::truncated_record_is_tool_call(line)
+        && !window_workdirs.contains(&WorkdirEvidence::Opaque)
+    {
+        window_workdirs.push(WorkdirEvidence::Opaque);
+    }
 }
 
 /// Bounded signal-only reader for oversized Codex rollouts.
@@ -1127,7 +1371,8 @@ fn parse_large_codex_signal(
     entry: &CatalogEntry,
     path: &Path,
     allow: &crate::source_path::SourceAllowlist,
-) -> Result<Vec<TimelineEntry>> {
+    session_kind: Option<&str>,
+) -> Result<ParsedCatalogSource> {
     // `path` is already resolve_file'd by the caller; open through the allowlist.
     let file = allow
         .open_file(path)
@@ -1135,35 +1380,81 @@ fn parse_large_codex_signal(
     let mut reader = BufReader::new(file);
     let mut frames = Vec::new();
     let mut line_no = 0u64;
-    let mut current_cwd = entry.cwd.clone();
+    // Turn-window effective scope: message frames buffer per window between
+    // `turn_context` records; explicit tool-call workdirs collected inside the
+    // window can re-scope the whole window (never per-frame flip-flop).
+    let mut baseline_cwd = entry.cwd.clone();
+    let mut window_frames: Vec<TimelineEntry> = Vec::new();
+    let mut window_workdirs: Vec<WorkdirEvidence> = Vec::new();
+    let mut recorded_workdirs = BTreeSet::new();
     while let Some(record) = crate::sanitize::read_line_capped(&mut reader, MAX_JSONL_RECORD_BYTES)?
     {
         line_no += 1;
-        if record.exceeded || record.line.trim().is_empty() {
+        if record.exceeded {
+            // An over-cap record is drained, never parsed. When its visible
+            // head says it was a tool-call envelope, the window MIGHT have
+            // moved repos and this reader will never know: record unreadable
+            // evidence so the window fails closed to unattributed instead of
+            // silently keeping the baseline project.
+            note_opaque_record(&mut window_workdirs, &record.line);
+            continue;
+        }
+        if record.line.trim().is_empty() {
             continue;
         }
         let Ok(value) = serde_json::from_str::<serde_json::Value>(&record.line) else {
+            // A malformed record never becomes a value either, so its workdir
+            // is just as invisible: the full adapter treats both alike.
+            note_opaque_record(&mut window_workdirs, &record.line);
             continue;
         };
         if value.get("type").and_then(serde_json::Value::as_str) == Some("turn_context") {
-            if let Some(cwd) = value
+            flush_scope_window(
+                &mut window_frames,
+                &mut window_workdirs,
+                baseline_cwd.as_deref(),
+                &mut frames,
+                &mut recorded_workdirs,
+            );
+            // A `turn_context` REPLACES the baseline, exactly as in the full
+            // adapter: one without a cwd says this turn's directory is
+            // unknown. Keeping the previous cwd instead guessed that the turn
+            // stayed put, admitted it under the earlier checkout, and resolved
+            // its relative workdirs against a stale baseline.
+            baseline_cwd = value
                 .get("payload")
                 .and_then(|payload| payload.get("cwd"))
                 .and_then(serde_json::Value::as_str)
                 .map(str::trim)
                 .filter(|cwd| !cwd.is_empty())
-            {
-                current_cwd = Some(cwd.to_string());
-            }
+                .map(str::to_owned);
             continue;
         }
-        if value.get("type").and_then(serde_json::Value::as_str) != Some("response_item") {
+        // Tool calls arrive in BOTH Codex envelopes: `response_item` and
+        // `event_msg`. The full adapter accepts both (`push_tool_turn` is
+        // reached from either), so a bounded reader that only looked at
+        // `response_item` lost every workdir of an `event_msg`-shaped rollout
+        // and left its foreign turns inheriting the baseline project.
+        let record_type = value.get("type").and_then(serde_json::Value::as_str);
+        if !matches!(record_type, Some("response_item") | Some("event_msg")) {
             continue;
         }
         let Some(payload) = value.get("payload") else {
             continue;
         };
-        if payload.get("type").and_then(serde_json::Value::as_str) != Some("message") {
+        let payload_type = payload.get("type").and_then(serde_json::Value::as_str);
+        if payload_type.is_some_and(is_tool_call_payload_type) {
+            for workdir in tool_call_workdirs(payload) {
+                if !window_workdirs.contains(&workdir) {
+                    window_workdirs.push(workdir);
+                }
+            }
+            continue;
+        }
+        // Only `response_item.message` carries chat text in this reader; the
+        // `event_msg` envelope is footprint (the dual-envelope rule the Codex
+        // adapter applies) and would double every turn.
+        if record_type != Some("response_item") || payload_type != Some("message") {
             continue;
         }
         let Some(role) = payload.get("role").and_then(serde_json::Value::as_str) else {
@@ -1197,7 +1488,7 @@ fn parse_large_codex_signal(
             .and_then(|raw| chrono::DateTime::parse_from_rfc3339(raw).ok())
             .map(|timestamp| timestamp.with_timezone(&chrono::Utc))
             .unwrap_or_else(chrono::Utc::now);
-        frames.push(TimelineEntry {
+        window_frames.push(TimelineEntry {
             timestamp,
             agent: entry.agent.clone(),
             session_id: entry.session_id.clone(),
@@ -1207,14 +1498,109 @@ fn parse_large_codex_signal(
             lineage_origin: None,
             frame_kind: Some(frame_kind),
             branch: None,
-            cwd: current_cwd.clone(),
+            cwd: baseline_cwd.clone(),
+            scope_conflict: false,
+            scope_unattributed: false,
+            scope_workdirs: Vec::new(),
+            session_kind: session_kind.map(str::to_owned),
             timestamp_source: Some("record".to_string()),
             source_path: Some(entry.source_path.clone()),
             source_sha256: None,
             source_line_span: Some((line_no, line_no)),
         });
     }
-    Ok(frames)
+    flush_scope_window(
+        &mut window_frames,
+        &mut window_workdirs,
+        baseline_cwd.as_deref(),
+        &mut frames,
+        &mut recorded_workdirs,
+    );
+    Ok(ParsedCatalogSource {
+        frames,
+        distill: None,
+        recorded_workdirs: recorded_workdirs.into_iter().collect(),
+    })
+}
+
+/// Stamp a buffered turn window with its effective scope and drain it into the
+/// session frame list: one consistent foreign repo re-scopes the whole window
+/// (including messages before the first tool call); proven-divergent evidence
+/// marks every frame conflicted, while unresolved foreign evidence leaves a
+/// durable do-not-inherit mark on every frame of the window. Every frame also
+/// carries the window's recorded workdirs, whatever the verdict, and the
+/// recorded baseline whenever the verdict takes it out of `cwd`, so the
+/// `.aicxignore` filter judges each checkout the window touched.
+///
+/// `session_workdirs` collects the baseline and recorded workdirs of every
+/// window that produced frames: the paths whose layout its verdict read,
+/// which a re-scoped frame's resolved cwd no longer spells.
+fn flush_scope_window(
+    window_frames: &mut Vec<TimelineEntry>,
+    window_workdirs: &mut Vec<WorkdirEvidence>,
+    baseline: Option<&str>,
+    frames: &mut Vec<TimelineEntry>,
+    session_workdirs: &mut BTreeSet<String>,
+) {
+    if !window_frames.is_empty() {
+        let recorded: Vec<String> = window_workdirs
+            .iter()
+            .filter_map(WorkdirEvidence::path)
+            .map(|workdir| recorded_workdir(workdir, baseline))
+            .fold(Vec::new(), |mut acc, workdir| {
+                if !acc.contains(&workdir) {
+                    acc.push(workdir);
+                }
+                acc
+            });
+        session_workdirs.extend(baseline.map(str::to_owned));
+        session_workdirs.extend(recorded.iter().cloned());
+        let (scope, path) = effective_window_scope(window_workdirs, baseline);
+        // A re-scope moves `cwd` to the workdirs' root and a conflict clears
+        // it, yet the window still ran in its recorded baseline: the baseline
+        // joins the paths the deny list judges, standing in for the `cwd` it
+        // no longer is.
+        let judged = match baseline {
+            Some(baseline)
+                if matches!(scope, WindowScope::Consistent | WindowScope::Conflict)
+                    && !recorded.iter().any(|path| path == baseline) =>
+            {
+                std::iter::once(baseline.to_owned())
+                    .chain(recorded.iter().cloned())
+                    .collect()
+            }
+            _ => recorded,
+        };
+        for frame in window_frames.iter_mut() {
+            frame.scope_workdirs.clone_from(&judged);
+        }
+        match scope {
+            WindowScope::Consistent => {
+                if let Some(path) = path {
+                    for frame in window_frames.iter_mut() {
+                        frame.cwd = Some(path.clone());
+                    }
+                }
+            }
+            WindowScope::Conflict => {
+                for frame in window_frames.iter_mut() {
+                    frame.cwd = None;
+                    frame.scope_conflict = true;
+                }
+            }
+            // Unresolved foreign evidence: durable do-not-inherit mark. The
+            // baseline cwd stays for structure, but the frame never counts as
+            // positive project evidence downstream.
+            WindowScope::Unattributed => {
+                for frame in window_frames.iter_mut() {
+                    frame.scope_unattributed = true;
+                }
+            }
+            WindowScope::Baseline => {}
+        }
+        frames.append(window_frames);
+    }
+    window_workdirs.clear();
 }
 
 fn is_signal_frame(frame: &TimelineEntry) -> bool {
@@ -1452,6 +1838,7 @@ fn try_reuse_cached_extract(
     session_key: &str,
     source_allow: &crate::source_path::SourceAllowlist,
     repo_path_ignore_fingerprint: &str,
+    layout: &mut ScopeLayoutProbe,
 ) -> Option<aicx_retrieve::ChunkRef> {
     if prior.signal_filter_version != SIGNAL_FILTER_VERSION
         || prior.repo_path_ignore_fingerprint != repo_path_ignore_fingerprint
@@ -1460,6 +1847,19 @@ fn try_reuse_cached_extract(
     }
     let record = prior.sessions.get(session_key)?;
     if record.source_path != entry.source_path {
+        return None;
+    }
+    // The stored scope verdicts were computed against the catalog cwd of the
+    // parse that produced them, and this path re-stamps them verbatim. An
+    // unchanged source under a MOVED catalog cwd is a different scope
+    // question, so reusing those flags would serve a now-foreign session
+    // unflagged and bypass per-frame filtering entirely.
+    if record.cwd != entry.cwd {
+        return None;
+    }
+    // The verdicts also depend on the repository layout on this host, which
+    // can change without the source or the catalog row changing at all.
+    if record.scope_environment != layout.fingerprint(entry.cwd.as_deref(), &record.scope_paths) {
         return None;
     }
     // Zeroed legacy records (pre-fingerprint schema) never reuse.
@@ -1518,6 +1918,9 @@ fn try_reuse_cached_extract(
         "source_catalog_path": entry.source_path,
         "preview_lines": preview_lines,
         "incremental_reuse": true,
+        "scope_conflict": record.scope_conflict,
+        "scope_unattributed": record.scope_unattributed,
+        "session_kind": record.session_kind.clone().or_else(|| entry.session_kind.clone()),
     });
     Some(aicx_retrieve::ChunkRef {
         id: format!("{}:{}", entry.agent, entry.session_id),
@@ -1754,10 +2157,13 @@ mod tests {
             title: None,
             machine: None,
             logical_session_id: None,
+            session_kind: None,
         };
         let allow = crate::source_path::SourceAllowlist::from_roots([root.clone()]);
 
-        let frames = parse_large_codex_signal(&entry, &source_path, &allow).unwrap();
+        let frames = parse_large_codex_signal(&entry, &source_path, &allow, None)
+            .unwrap()
+            .frames;
         assert_eq!(frames.len(), 2);
         assert_eq!(frames[0].cwd.as_deref(), Some("/repo/public"));
         assert_eq!(frames[1].cwd.as_deref(), Some("/repo/private"));
@@ -1818,6 +2224,10 @@ mod tests {
             frame_kind: Some(FrameKind::UserMsg),
             branch: None,
             cwd: Some(cwd.to_string()),
+            scope_conflict: false,
+            scope_unattributed: false,
+            scope_workdirs: Vec::new(),
+            session_kind: None,
             timestamp_source: Some("record".to_string()),
             source_path: None,
             source_sha256: None,
@@ -1829,10 +2239,359 @@ mod tests {
             frame("keep public again", "/repo/public"),
         ];
 
-        drop_ignored_cwd_frames(&mut frames, &ignore);
+        let report = scope_report_excluding_ignored(&mut frames, &ignore);
         assert_eq!(frames.len(), 2);
         assert_eq!(frames[0].message, "keep public");
         assert_eq!(frames[1].message, "keep public again");
+        // The hidden checkout is counted, and its path is not in the report.
+        assert_eq!(report.hidden_scopes, 1);
+        assert_eq!(report.cwds, vec!["/repo/public".to_string()]);
+        assert!(
+            report.scope_mixed(),
+            "a session is not homogeneous just because the other scope was hidden"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A conflict window has no `cwd` to test, so the deny list must see the
+    /// workdirs that made it a conflict. Two real checkouts, one of them in
+    /// `.aicxignore`, both named by one turn window: the window's frames are
+    /// dropped on BOTH the full-parse and the bounded path, and the hidden
+    /// checkout is counted without being named.
+    #[test]
+    fn conflict_window_workdirs_reach_the_checkout_deny_list() {
+        let root = std::env::temp_dir().join(format!(
+            "aicx-source-index-ignore-conflict-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let repo_public = root.join("repo-public");
+        let repo_private = root.join("repo-private");
+        fs::create_dir_all(repo_public.join(".git")).unwrap();
+        fs::create_dir_all(repo_private.join(".git")).unwrap();
+        let aicx_home = root.join(".aicx");
+        fs::create_dir_all(&aicx_home).unwrap();
+        fs::write(
+            aicx_home.join(crate::legacy_archive::AICX_IGNORE_FILENAME),
+            format!("{}\n", repo_private.display()),
+        )
+        .unwrap();
+        let ignore = crate::legacy_archive::load_repo_path_ignore(&aicx_home, &root).unwrap();
+
+        let tool_call = |call_id: &str, workdir: &Path| {
+            serde_json::json!({
+                "timestamp": "2026-08-22T00:00:04Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "name": "exec_command",
+                    "call_id": call_id,
+                    "arguments": serde_json::json!({
+                        "cmd": "ls",
+                        "workdir": workdir.display().to_string(),
+                    })
+                    .to_string(),
+                },
+            })
+        };
+        let body = jsonl(&[
+            serde_json::json!({"timestamp": "2026-08-22T00:00:00Z", "type": "session_meta",
+                "payload": {"id": "conflict-deny", "cwd": "/sessions/vista"}}),
+            serde_json::json!({"timestamp": "2026-08-22T00:00:01Z", "type": "turn_context",
+                "payload": {"cwd": "/sessions/vista"}}),
+            serde_json::json!({"timestamp": "2026-08-22T00:00:02Z", "type": "response_item",
+                "payload": {"type": "message", "role": "user",
+                    "content": [{"type": "input_text", "text": "baseline question"}]}}),
+            serde_json::json!({"timestamp": "2026-08-22T00:00:03Z", "type": "turn_context",
+                "payload": {"cwd": "/sessions/vista"}}),
+            tool_call("c1", &repo_public),
+            tool_call("c2", &repo_private),
+            serde_json::json!({"timestamp": "2026-08-22T00:00:06Z", "type": "response_item",
+                "payload": {"type": "message", "role": "assistant",
+                    "content": [{"type": "output_text", "text": "private checkout secret"}]}}),
+        ]);
+        let source_path = root.join("rollout.jsonl");
+        fs::write(&source_path, body).unwrap();
+        let mut entry = bounded_entry(&source_path);
+        entry.session_id = "conflict-deny".to_string();
+        entry.cwd = Some("/sessions/vista".to_string());
+        let allow = crate::source_path::SourceAllowlist::from_roots([root.clone()]);
+
+        let full = parse_catalog_source(&entry, &source_path, &allow)
+            .unwrap()
+            .frames;
+        let bounded = parse_large_codex_signal(&entry, &source_path, &allow, None)
+            .unwrap()
+            .frames;
+        for (label, mut frames) in [("full", full), ("bounded", bounded)] {
+            assert!(
+                frames
+                    .iter()
+                    .any(|frame| frame.message.contains("private checkout secret")),
+                "{label}: the fixture must actually produce the conflict frame"
+            );
+            let report = scope_report_excluding_ignored(&mut frames, &ignore);
+            assert!(
+                frames
+                    .iter()
+                    .all(|frame| !frame.message.contains("private checkout secret")),
+                "{label}: a frame whose window ran in a denied checkout survived"
+            );
+            assert!(
+                frames
+                    .iter()
+                    .any(|frame| frame.message.contains("baseline question")),
+                "{label}: frames outside the denied window must survive"
+            );
+            assert_eq!(report.hidden_scopes, 1, "{label}");
+            let rendered = format!("{report:?}");
+            assert!(
+                !rendered.contains("repo-private"),
+                "{label}: the hidden checkout must be counted, never named: {rendered}"
+            );
+        }
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The mirror case: the DENIED checkout is the recorded baseline, and the
+    /// window's workdirs point elsewhere. A re-scope serves the workdirs' root
+    /// as `cwd` and a conflict serves none, so judging `cwd` alone published
+    /// work done from inside the denied checkout — which the recorded cwd,
+    /// served verbatim before scope verdicts existed, used to hide.
+    #[test]
+    fn a_denied_baseline_hides_its_rescoped_and_conflicted_windows() {
+        let root = std::env::temp_dir().join(format!(
+            "aicx-source-index-ignore-baseline-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let repo_public = root.join("repo-public");
+        let repo_other = root.join("repo-other");
+        let repo_private = root.join("repo-private");
+        for repo in [&repo_public, &repo_other, &repo_private] {
+            fs::create_dir_all(repo.join(".git")).unwrap();
+        }
+        let aicx_home = root.join(".aicx");
+        fs::create_dir_all(&aicx_home).unwrap();
+        fs::write(
+            aicx_home.join(crate::legacy_archive::AICX_IGNORE_FILENAME),
+            format!("{}\n", repo_private.display()),
+        )
+        .unwrap();
+        let ignore = crate::legacy_archive::load_repo_path_ignore(&aicx_home, &root).unwrap();
+
+        let public = repo_public.display().to_string();
+        let private = repo_private.display().to_string();
+        let turn_context = |cwd: &str| {
+            serde_json::json!({"timestamp": "2026-08-22T00:00:01Z", "type": "turn_context",
+                "payload": {"cwd": cwd}})
+        };
+        let message = |role: &str, text: &str| {
+            let kind = if role == "user" {
+                "input_text"
+            } else {
+                "output_text"
+            };
+            serde_json::json!({"timestamp": "2026-08-22T00:00:02Z", "type": "response_item",
+                "payload": {"type": "message", "role": role,
+                    "content": [{"type": kind, "text": text}]}})
+        };
+        let tool_call = |call_id: &str, workdir: &Path| {
+            serde_json::json!({
+                "timestamp": "2026-08-22T00:00:04Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "name": "exec_command",
+                    "call_id": call_id,
+                    "arguments": serde_json::json!({
+                        "cmd": "ls",
+                        "workdir": workdir.display().to_string(),
+                    })
+                    .to_string(),
+                },
+            })
+        };
+        let body = jsonl(&[
+            serde_json::json!({"timestamp": "2026-08-22T00:00:00Z", "type": "session_meta",
+                "payload": {"id": "baseline-deny", "cwd": public}}),
+            turn_context(&public),
+            message("user", "public work"),
+            // Run from the denied checkout, working on one other repo: the
+            // window is re-scoped to that repo.
+            turn_context(&private),
+            tool_call("c1", &repo_public),
+            message("assistant", "rescoped secret"),
+            // Run from the denied checkout, touching two other repos: the
+            // window is a conflict with no cwd at all.
+            turn_context(&private),
+            tool_call("c2", &repo_public),
+            tool_call("c3", &repo_other),
+            message("assistant", "conflict secret"),
+        ]);
+        let source_path = root.join("rollout.jsonl");
+        fs::write(&source_path, body).unwrap();
+        let mut entry = bounded_entry(&source_path);
+        entry.session_id = "baseline-deny".to_string();
+        entry.cwd = Some(public.clone());
+        let allow = crate::source_path::SourceAllowlist::from_roots([root.clone()]);
+
+        let full = parse_catalog_source(&entry, &source_path, &allow)
+            .unwrap()
+            .frames;
+        let bounded = parse_large_codex_signal(&entry, &source_path, &allow, None)
+            .unwrap()
+            .frames;
+        for (label, mut frames) in [("full", full), ("bounded", bounded)] {
+            let find = |frames: &[TimelineEntry], text: &str| {
+                frames
+                    .iter()
+                    .find(|frame| frame.message.contains(text))
+                    .cloned()
+            };
+            // The fixture must really move `cwd` off the denied baseline, or
+            // the test proves nothing.
+            let rescoped = find(&frames, "rescoped secret")
+                .unwrap_or_else(|| panic!("{label}: no re-scoped frame in {frames:?}"));
+            assert!(
+                rescoped
+                    .cwd
+                    .as_deref()
+                    .is_some_and(|cwd| cwd.ends_with("repo-public")),
+                "{label}: the window must be re-scoped to the public repo: {rescoped:?}"
+            );
+            let conflicted = find(&frames, "conflict secret")
+                .unwrap_or_else(|| panic!("{label}: no conflict frame in {frames:?}"));
+            assert!(
+                conflicted.scope_conflict && conflicted.cwd.is_none(),
+                "{label}: the window must be a conflict: {conflicted:?}"
+            );
+
+            let report = scope_report_excluding_ignored(&mut frames, &ignore);
+            for denied_text in ["rescoped secret", "conflict secret"] {
+                assert!(
+                    find(&frames, denied_text).is_none(),
+                    "{label}: `{denied_text}` was run from the denied checkout and survived"
+                );
+            }
+            assert!(
+                find(&frames, "public work").is_some(),
+                "{label}: frames recorded outside the denied checkout must survive"
+            );
+            assert_eq!(report.hidden_scopes, 1, "{label}");
+            let rendered = format!("{report:?}");
+            assert!(
+                !rendered.contains("repo-private"),
+                "{label}: the hidden checkout must be counted, never named: {rendered}"
+            );
+        }
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Two parity gaps between the readers, found in review: the bounded
+    /// reader kept the previous baseline when a `turn_context` carried no cwd
+    /// (the full adapter treats that turn's directory as unknown), and it did
+    /// not scope `web_search_call`, which the full adapter routes as a call.
+    /// Either way a turn inherited a checkout it never proved.
+    #[test]
+    fn both_readers_agree_on_a_cwd_less_turn_and_every_call_type() {
+        let root = std::env::temp_dir().join(format!(
+            "aicx-source-index-reader-parity-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let repo_home = root.join("repo-home");
+        let repo_away = root.join("repo-away");
+        for repo in [&repo_home, &repo_away] {
+            fs::create_dir_all(repo.join(".git")).unwrap();
+        }
+        let home = repo_home.display().to_string();
+        let message = |text: &str| {
+            serde_json::json!({"timestamp": "2026-08-22T00:00:02Z", "type": "response_item",
+                "payload": {"type": "message", "role": "user",
+                    "content": [{"type": "input_text", "text": text}]}})
+        };
+        let body = jsonl(&[
+            serde_json::json!({"timestamp": "2026-08-22T00:00:00Z", "type": "session_meta",
+                "payload": {"id": "reader-parity", "cwd": home}}),
+            serde_json::json!({"timestamp": "2026-08-22T00:00:01Z", "type": "turn_context",
+                "payload": {"cwd": home}}),
+            message("home turn"),
+            serde_json::json!({"timestamp": "2026-08-22T00:00:03Z", "type": "turn_context",
+                "payload": {"model": "gpt-test"}}),
+            message("turn with no recorded cwd"),
+            serde_json::json!({"timestamp": "2026-08-22T00:00:05Z", "type": "turn_context",
+                "payload": {"cwd": home}}),
+            serde_json::json!({
+                "timestamp": "2026-08-22T00:00:06Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "web_search_call",
+                    "call_id": "w1",
+                    "arguments": serde_json::json!({
+                        "workdir": repo_away.display().to_string(),
+                    })
+                    .to_string(),
+                },
+            }),
+            message("turn after a scoped call"),
+        ]);
+        let source_path = root.join("rollout.jsonl");
+        fs::write(&source_path, body).unwrap();
+        let mut entry = bounded_entry(&source_path);
+        entry.session_id = "reader-parity".to_string();
+        entry.cwd = Some(home.clone());
+        let allow = crate::source_path::SourceAllowlist::from_roots([root.clone()]);
+
+        let full = parse_catalog_source(&entry, &source_path, &allow)
+            .unwrap()
+            .frames;
+        let bounded = parse_large_codex_signal(&entry, &source_path, &allow, None)
+            .unwrap()
+            .frames;
+        for (label, frames) in [("full", full), ("bounded", bounded)] {
+            let find = |text: &str| {
+                frames
+                    .iter()
+                    .find(|frame| frame.message.contains(text))
+                    .cloned()
+                    .unwrap_or_else(|| panic!("{label}: no `{text}` frame in {frames:?}"))
+            };
+            assert!(
+                find("home turn")
+                    .cwd
+                    .as_deref()
+                    .is_some_and(|cwd| cwd.ends_with("repo-home")),
+                "{label}: the fixture must start in the home checkout"
+            );
+            let unplaced = find("turn with no recorded cwd");
+            assert_eq!(
+                unplaced.cwd, None,
+                "{label}: a turn_context without a cwd must not inherit the previous one"
+            );
+            let away = find("turn after a scoped call");
+            assert!(
+                away.cwd
+                    .as_deref()
+                    .is_some_and(|cwd| cwd.ends_with("repo-away")),
+                "{label}: a web_search_call workdir must scope its window: {away:?}"
+            );
+        }
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -1878,6 +2637,7 @@ mod tests {
             title: Some("routing".to_string()),
             machine: None,
             logical_session_id: None,
+            session_kind: None,
         };
         let mut prior = SourceParseState {
             schema: PARSE_STATE_SCHEMA.to_string(),
@@ -1899,24 +2659,88 @@ mod tests {
                 project: entry.project.clone(),
                 date: entry.date.clone(),
                 cwd: entry.cwd.clone(),
+                scope_conflict: false,
+                scope_unattributed: false,
+                session_kind: None,
+                scope_environment: ScopeLayoutProbe::default()
+                    .fingerprint(entry.cwd.as_deref(), &[]),
+                scope_paths: Vec::new(),
             },
         );
 
         let key = session_state_key("claude", "session");
         // Allowlist roots: treat test root as both HOME and aicx_home.
         let allow = crate::source_path::SourceAllowlist::for_operator(&root, &root);
-        let reused =
-            try_reuse_cached_extract(&root, &entry, &prior, &key, &allow, "ignore-fingerprint")
-                .expect("matching source fingerprint+hash must reuse");
+        let reused = try_reuse_cached_extract(
+            &root,
+            &entry,
+            &prior,
+            &key,
+            &allow,
+            "ignore-fingerprint",
+            &mut ScopeLayoutProbe::default(),
+        )
+        .expect("matching source fingerprint+hash must reuse");
         assert!(reused.text.contains("arrows vc-frame"));
         assert_eq!(reused.id, "claude:session");
+
+        // The cached record carries scope verdicts computed against the
+        // catalog cwd of its parse. A row whose cwd MOVED is a different
+        // scope question: re-stamping the old flags would serve a now-foreign
+        // session unflagged, straight past per-frame filtering.
+        let mut rescoped = entry.clone();
+        rescoped.cwd = Some("/repos/fleet-bus".to_string());
+        assert!(
+            try_reuse_cached_extract(
+                &root,
+                &rescoped,
+                &prior,
+                &key,
+                &allow,
+                "ignore-fingerprint",
+                &mut ScopeLayoutProbe::default()
+            )
+            .is_none(),
+            "a moved catalog cwd must force a reparse, not reuse stale scope flags"
+        );
+
+        // The verdicts also depend on the repository layout on this host,
+        // which moves without the source or the catalog row moving at all.
+        // An old ledger states no layout, which is not the current one.
+        let mut stale_layout = prior.clone();
+        stale_layout
+            .sessions
+            .get_mut(&key)
+            .unwrap()
+            .scope_environment = String::new();
+        assert!(
+            try_reuse_cached_extract(
+                &root,
+                &entry,
+                &stale_layout,
+                &key,
+                &allow,
+                "ignore-fingerprint",
+                &mut ScopeLayoutProbe::default(),
+            )
+            .is_none(),
+            "a cached extract whose layout identity no longer matches must reparse"
+        );
 
         // Source path drift invalidates reuse.
         let mut drifted = entry.clone();
         drifted.source_path = "/elsewhere/session.jsonl".to_string();
         assert!(
-            try_reuse_cached_extract(&root, &drifted, &prior, &key, &allow, "ignore-fingerprint")
-                .is_none()
+            try_reuse_cached_extract(
+                &root,
+                &drifted,
+                &prior,
+                &key,
+                &allow,
+                "ignore-fingerprint",
+                &mut ScopeLayoutProbe::default()
+            )
+            .is_none()
         );
 
         // Catalog-only size drift must NOT invalidate when live file is unchanged
@@ -1930,7 +2754,8 @@ mod tests {
                 &prior,
                 &key,
                 &allow,
-                "ignore-fingerprint"
+                "ignore-fingerprint",
+                &mut ScopeLayoutProbe::default(),
             )
             .is_some(),
             "stale catalog size alone must not force reparse when live matches"
@@ -1944,8 +2769,16 @@ mod tests {
         .unwrap();
         // Coarse FS mtime: touch content size always changes here.
         assert!(
-            try_reuse_cached_extract(&root, &entry, &prior, &key, &allow, "ignore-fingerprint")
-                .is_none(),
+            try_reuse_cached_extract(
+                &root,
+                &entry,
+                &prior,
+                &key,
+                &allow,
+                "ignore-fingerprint",
+                &mut ScopeLayoutProbe::default()
+            )
+            .is_none(),
             "live append must invalidate reuse"
         );
         // Restore live bytes so later checks use the original fingerprint.
@@ -1959,8 +2792,16 @@ mod tests {
         // Zeroed legacy records never reuse (forces reparse after upgrade).
         prior.sessions.get_mut(&key).unwrap().source_len = 0;
         assert!(
-            try_reuse_cached_extract(&root, &entry, &prior, &key, &allow, "ignore-fingerprint")
-                .is_none()
+            try_reuse_cached_extract(
+                &root,
+                &entry,
+                &prior,
+                &key,
+                &allow,
+                "ignore-fingerprint",
+                &mut ScopeLayoutProbe::default()
+            )
+            .is_none()
         );
         prior.sessions.get_mut(&key).unwrap().source_len = restored_len;
 
@@ -1971,7 +2812,8 @@ mod tests {
                 &prior,
                 &key,
                 &allow,
-                "changed-ignore-fingerprint"
+                "changed-ignore-fingerprint",
+                &mut ScopeLayoutProbe::default(),
             )
             .is_none(),
             "deny-list drift must invalidate cached extracts"
@@ -1980,9 +2822,468 @@ mod tests {
         // Corrupt extract bytes invalidate reuse.
         fs::write(&extract_path, "tampered").unwrap();
         assert!(
-            try_reuse_cached_extract(&root, &entry, &prior, &key, &allow, "ignore-fingerprint")
-                .is_none()
+            try_reuse_cached_extract(
+                &root,
+                &entry,
+                &prior,
+                &key,
+                &allow,
+                "ignore-fingerprint",
+                &mut ScopeLayoutProbe::default()
+            )
+            .is_none()
         );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn bounded_reader_stamps_turn_window_effective_scope() {
+        let root = std::env::temp_dir().join(format!(
+            "aicx-bounded-scope-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let fleet = root.join("fleet-bus");
+        let other = root.join("other-repo");
+        fs::create_dir_all(fleet.join(".git")).unwrap();
+        fs::create_dir_all(other.join(".git")).unwrap();
+        let source_path = root
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("rollout.jsonl");
+        fs::create_dir_all(source_path.parent().unwrap()).unwrap();
+        let template = r#"{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"s1","cwd":"/sessions/vista"}}
+{"timestamp":"2026-01-01T00:01:00Z","type":"turn_context","payload":{"cwd":"/sessions/vista"}}
+{"timestamp":"2026-01-01T00:01:10Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"vista opening"}]}}
+{"timestamp":"2026-01-01T00:02:00Z","type":"turn_context","payload":{"cwd":"/sessions/vista"}}
+{"timestamp":"2026-01-01T00:02:05Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Biore fleet task"}]}}
+{"timestamp":"2026-01-01T00:02:10Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"c1","input":"const r = await tools.exec_command({cmd:\"npm test\",\"workdir\":\"@FLEET@\"});"}}
+{"timestamp":"2026-01-01T00:03:00Z","type":"turn_context","payload":{"cwd":"/sessions/vista"}}
+{"timestamp":"2026-01-01T00:03:05Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"c2","input":"const a = await tools.exec_command({cmd:\"ls\",\"workdir\":\"@FLEET@\"});"}}
+{"timestamp":"2026-01-01T00:03:10Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"c3","input":"const b = await tools.exec_command({cmd:\"ls\",\"workdir\":\"@OTHER@\"});"}}
+{"timestamp":"2026-01-01T00:03:20Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"conflicted turn"}]}}
+"#;
+        let body = template
+            .replace("@FLEET@", &json_path(&fleet))
+            .replace("@OTHER@", &json_path(&other));
+        fs::write(&source_path, body).unwrap();
+
+        let entry = CatalogEntry {
+            schema: crate::catalog::CATALOG_SCHEMA.to_string(),
+            session_id: "s1".to_string(),
+            agent: "codex".to_string(),
+            project: Some("vista".to_string()),
+            date: Some("2026-01-01".to_string()),
+            cwd: Some("/sessions/vista".to_string()),
+            source_path: source_path.display().to_string(),
+            source_len: None,
+            source_mtime_ns: None,
+            title: None,
+            machine: None,
+            logical_session_id: None,
+            session_kind: None,
+        };
+        let allow = crate::source_path::SourceAllowlist::for_operator(&root, &root);
+        let resolved = allow.resolve_file(&source_path).expect("resolve rollout");
+        let frames = parse_large_codex_signal(&entry, &resolved, &allow, None)
+            .expect("bounded parse")
+            .frames;
+
+        assert_eq!(frames.len(), 3, "{frames:?}");
+        assert_eq!(frames[0].message, "vista opening");
+        assert_eq!(frames[0].cwd.as_deref(), Some("/sessions/vista"));
+        assert!(!frames[0].scope_conflict);
+        assert_eq!(frames[1].message, "Biore fleet task");
+        assert_eq!(
+            frames[1].cwd.as_deref(),
+            Some(canonical(&fleet).as_str()),
+            "message before the first tool call shares the window scope"
+        );
+        assert!(!frames[1].scope_conflict);
+        assert_eq!(frames[2].message, "conflicted turn");
+        assert_eq!(frames[2].cwd, None);
+        assert!(frames[2].scope_conflict);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Substitute a filesystem path into a JSONL fixture: a Windows path is
+    /// `C:\Users\…`, and pasting it raw into a JSON string literal produces
+    /// invalid escapes (`\U`), so the record silently fails to parse and the
+    /// window loses the only workdir evidence it had.
+    fn json_path(path: &Path) -> String {
+        let quoted = serde_json::Value::String(path.display().to_string()).to_string();
+        quoted[1..quoted.len() - 1].to_string()
+    }
+
+    /// Identities are canonical, so a scratch repo under a symlinked temp
+    /// dir compares equal to the scope this reader stamps.
+    fn canonical(path: &Path) -> String {
+        fs::canonicalize(path)
+            .unwrap_or_else(|_| path.to_path_buf())
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    fn bounded_scope_root(label: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "aicx-bounded-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        root
+    }
+
+    fn bounded_entry(source_path: &Path) -> CatalogEntry {
+        CatalogEntry {
+            schema: crate::catalog::CATALOG_SCHEMA.to_string(),
+            session_id: "s1".to_string(),
+            agent: "codex".to_string(),
+            project: Some("vista".to_string()),
+            date: Some("2026-01-01".to_string()),
+            cwd: Some("/sessions/vista".to_string()),
+            source_path: source_path.display().to_string(),
+            source_len: None,
+            source_mtime_ns: None,
+            title: None,
+            machine: None,
+            logical_session_id: None,
+            session_kind: None,
+        }
+    }
+
+    fn jsonl(rows: &[serde_json::Value]) -> String {
+        rows.iter().fold(String::new(), |mut body, row| {
+            body.push_str(&row.to_string());
+            body.push('\n');
+            body
+        })
+    }
+
+    fn codex_meta(cwd: &str) -> serde_json::Value {
+        serde_json::json!({
+            "timestamp": "2026-01-01T00:00:00Z",
+            "type": "session_meta",
+            "payload": {"id": "s1", "cwd": cwd},
+        })
+    }
+
+    fn codex_turn_context(cwd: &str) -> serde_json::Value {
+        serde_json::json!({
+            "timestamp": "2026-01-01T00:01:00Z",
+            "type": "turn_context",
+            "payload": {"cwd": cwd},
+        })
+    }
+
+    fn codex_user_message(text: &str) -> serde_json::Value {
+        serde_json::json!({
+            "timestamp": "2026-01-01T00:01:10Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": text}],
+            },
+        })
+    }
+
+    /// Codex emits tool calls in BOTH envelopes. The full adapter routes
+    /// `event_msg` function/tool/mcp calls into the same handler as
+    /// `response_item`; a bounded reader that only accepted `response_item`
+    /// collected zero workdir evidence from an `event_msg`-shaped rollout and
+    /// left every foreign turn inheriting the baseline project.
+    #[test]
+    fn bounded_reader_reads_workdirs_from_event_msg_tool_calls() {
+        let root = bounded_scope_root("event-msg");
+        let fleet = root.join("fleet-bus");
+        fs::create_dir_all(fleet.join(".git")).unwrap();
+        let source_path = root.join(".codex").join("sessions").join("rollout.jsonl");
+        fs::create_dir_all(source_path.parent().unwrap()).unwrap();
+        // Real shape: `arguments` is a JSON STRING, not an object.
+        let arguments = serde_json::to_string(&serde_json::json!({
+            "cmd": "ls",
+            "workdir": fleet.display().to_string(),
+        }))
+        .unwrap();
+        let body = jsonl(&[
+            codex_meta("/sessions/vista"),
+            codex_turn_context("/sessions/vista"),
+            codex_user_message("biore fleet task"),
+            serde_json::json!({
+                "timestamp": "2026-01-01T00:01:20Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "function_call",
+                    "name": "shell",
+                    "call_id": "c1",
+                    "arguments": arguments,
+                },
+            }),
+        ]);
+        fs::write(&source_path, body).unwrap();
+
+        let entry = bounded_entry(&source_path);
+        let allow = crate::source_path::SourceAllowlist::for_operator(&root, &root);
+        let resolved = allow.resolve_file(&source_path).expect("resolve rollout");
+        let frames = parse_large_codex_signal(&entry, &resolved, &allow, None)
+            .expect("bounded parse")
+            .frames;
+
+        assert_eq!(frames.len(), 1, "{frames:?}");
+        assert_eq!(frames[0].message, "biore fleet task");
+        assert_eq!(
+            frames[0].cwd.as_deref(),
+            Some(canonical(&fleet).as_str()),
+            "an event_msg tool call re-scopes its window like a response_item one"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// An over-cap record is drained, never parsed. When it was a tool-call
+    /// envelope, the window's only foreign workdir can be inside it — keeping
+    /// the baseline there is a silent cross-repo leak, so unreadable evidence
+    /// fails closed to unattributed.
+    #[test]
+    fn oversized_tool_call_fails_closed_to_unattributed() {
+        // Real rollout key order: the envelope and payload discriminators are
+        // written BEFORE the oversized body, so they survive the cap.
+        let filler = "x".repeat(MAX_JSONL_RECORD_BYTES + 4096);
+        let oversized_window = |label: &str, oversized: String| {
+            let root = bounded_scope_root(label);
+            let source_path = root.join(".codex").join("sessions").join("rollout.jsonl");
+            fs::create_dir_all(source_path.parent().unwrap()).unwrap();
+            let mut body = jsonl(&[
+                codex_meta("/sessions/vista"),
+                codex_turn_context("/sessions/vista"),
+                codex_user_message("biore task"),
+            ]);
+            body.push_str(&oversized);
+            body.push('\n');
+            fs::write(&source_path, body).unwrap();
+            let entry = bounded_entry(&source_path);
+            let allow = crate::source_path::SourceAllowlist::for_operator(&root, &root);
+            let resolved = allow.resolve_file(&source_path).expect("resolve rollout");
+            let frames = parse_large_codex_signal(&entry, &resolved, &allow, None)
+                .expect("bounded parse")
+                .frames;
+            let _ = fs::remove_dir_all(&root);
+            frames
+        };
+
+        let call_frames = oversized_window(
+            "oversized-call",
+            format!(
+                r#"{{"timestamp":"2026-01-01T00:01:20Z","type":"response_item","payload":{{"type":"function_call","name":"shell","call_id":"c1","arguments":"{{\"cmd\":\"{filler}\"}}"}}}}"#
+            ),
+        );
+        assert_eq!(call_frames.len(), 1, "{call_frames:?}");
+        assert!(
+            call_frames[0].scope_unattributed,
+            "a tool call this reader could not read must not leave the window on its baseline"
+        );
+
+        // A merely oversized RESULT carries no workdir, so it is not lost
+        // evidence and must not poison an otherwise clean window.
+        let result_frames = oversized_window(
+            "oversized-result",
+            format!(
+                r#"{{"timestamp":"2026-01-01T00:01:20Z","type":"response_item","payload":{{"type":"function_call_output","call_id":"c1","output":"{filler}"}}}}"#
+            ),
+        );
+        assert_eq!(result_frames.len(), 1, "{result_frames:?}");
+        assert!(
+            !result_frames[0].scope_unattributed,
+            "an oversized tool RESULT carries no workdir and is not lost evidence"
+        );
+        assert_eq!(result_frames[0].cwd.as_deref(), Some("/sessions/vista"));
+
+        // A recognised envelope whose PAYLOAD discriminator sits after the
+        // oversized body: key order is not a contract, and seeing only the
+        // envelope's own `type` proves nothing about what was lost.
+        let late_discriminator = oversized_window(
+            "oversized-late-type",
+            format!(
+                r#"{{"timestamp":"2026-01-01T00:01:20Z","type":"response_item","payload":{{"arguments":"{filler}","type":"function_call"}}}}"#
+            ),
+        );
+        assert_eq!(late_discriminator.len(), 1, "{late_discriminator:?}");
+        assert!(
+            late_discriminator[0].scope_unattributed,
+            "an envelope truncated before its payload type must fail closed"
+        );
+
+        // Pathological writer: nothing identifiable survives the cap. The
+        // record could have been a tool call, so the window cannot claim the
+        // baseline it did not verify.
+        let opaque_frames = oversized_window(
+            "oversized-opaque",
+            format!(r#"{{"payload":{{"arguments":"{filler}"}}}}"#),
+        );
+        assert_eq!(opaque_frames.len(), 1, "{opaque_frames:?}");
+        assert!(
+            opaque_frames[0].scope_unattributed,
+            "an over-cap record this reader could not classify is not proof of the baseline"
+        );
+    }
+
+    /// A malformed record never parses either, so its workdir is as invisible
+    /// as an over-cap one's. The full adapter fails such a window closed; this
+    /// reader used to drop the record silently and keep the baseline.
+    #[test]
+    fn malformed_tool_call_fails_closed_to_unattributed() {
+        let malformed_window = |label: &str, malformed: &str| {
+            let root = bounded_scope_root(label);
+            let source_path = root.join(".codex").join("sessions").join("rollout.jsonl");
+            fs::create_dir_all(source_path.parent().unwrap()).unwrap();
+            let mut body = jsonl(&[
+                codex_meta("/sessions/vista"),
+                codex_turn_context("/sessions/vista"),
+                codex_user_message("biore task"),
+            ]);
+            body.push_str(malformed);
+            body.push('\n');
+            fs::write(&source_path, body).unwrap();
+            let entry = bounded_entry(&source_path);
+            let allow = crate::source_path::SourceAllowlist::for_operator(&root, &root);
+            let resolved = allow.resolve_file(&source_path).expect("resolve rollout");
+            let frames = parse_large_codex_signal(&entry, &resolved, &allow, None)
+                .expect("bounded parse")
+                .frames;
+            let _ = fs::remove_dir_all(&root);
+            frames
+        };
+
+        let call_frames = malformed_window(
+            "malformed-call",
+            r#"{"timestamp":"2026-01-01T00:01:20Z","type":"response_item","payload":{"type":"function_call","name":"shell","arguments":"{\"cmd\":\"ls\",\"workdir\":\"/sessions/fleet-bus\"}""#,
+        );
+        assert_eq!(call_frames.len(), 1, "{call_frames:?}");
+        assert!(
+            call_frames[0].scope_unattributed,
+            "a tool call this reader could not parse must not leave the window on its baseline"
+        );
+
+        // Both discriminators readable and neither is a call: a broken message
+        // hid no workdir and must not poison an otherwise clean window.
+        let message_frames = malformed_window(
+            "malformed-message",
+            r#"{"timestamp":"2026-01-01T00:01:20Z","type":"response_item","payload":{"type":"message","role":"assistant","content":["#,
+        );
+        assert_eq!(message_frames.len(), 1, "{message_frames:?}");
+        assert!(
+            !message_frames[0].scope_unattributed,
+            "a malformed message carries no workdir and is not lost evidence"
+        );
+        assert_eq!(message_frames[0].cwd.as_deref(), Some("/sessions/vista"));
+    }
+    /// Finding (P1-01/02): the scope verdicts stored in the parse ledger are
+    /// resolved against the local filesystem, but the ledger fingerprinted
+    /// the scope report's cwds — AFTER reduction — and the generation
+    /// short-circuit never consulted it at all. A tool workdir its baseline
+    /// absorbed left no cwd behind, so a checkout later created there moved
+    /// nothing; a `.gitmodules` edit moved nothing once CURRENT matched.
+    #[test]
+    fn the_repository_layout_is_part_of_a_cached_extracts_identity() {
+        let root = bounded_scope_root("layout");
+        let parent = root.join("vista");
+        let nested = parent.join("vendor").join("fleet-bus");
+        fs::create_dir_all(parent.join(".git")).unwrap();
+        fs::create_dir_all(&nested).unwrap();
+        let baseline = parent.to_string_lossy().into_owned();
+        let source_path = root
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("rollout.jsonl");
+        fs::create_dir_all(source_path.parent().unwrap()).unwrap();
+        let template = r#"{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"s1","cwd":"@VISTA@"}}
+{"timestamp":"2026-01-01T00:01:00Z","type":"turn_context","payload":{"cwd":"@VISTA@"}}
+{"timestamp":"2026-01-01T00:01:05Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"vendored fix"}]}}
+{"timestamp":"2026-01-01T00:01:10Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"c1","input":"const r = await tools.exec_command({cmd:\"ls\",\"workdir\":\"@NESTED@\"});"}}
+"#;
+        let body = template
+            .replace("@VISTA@", &json_path(&parent))
+            .replace("@NESTED@", &json_path(&nested));
+        fs::write(&source_path, body).unwrap();
+        let mut entry = bounded_entry(&source_path);
+        entry.cwd = Some(baseline.clone());
+        let allow = crate::source_path::SourceAllowlist::for_operator(&root, &root);
+        let resolved = allow.resolve_file(&source_path).expect("resolve rollout");
+        let parsed =
+            parse_large_codex_signal(&entry, &resolved, &allow, None).expect("bounded parse");
+
+        // The workdir sits inside the parent checkout, so the verdict absorbs
+        // it and no frame spells it — yet it is exactly the path whose layout
+        // decides that verdict.
+        assert_eq!(parsed.frames.len(), 1, "{:?}", parsed.frames);
+        assert_eq!(parsed.frames[0].cwd.as_deref(), Some(baseline.as_str()));
+        assert!(!parsed.frames[0].scope_conflict && !parsed.frames[0].scope_unattributed);
+        let nested_path = nested.to_string_lossy().into_owned();
+        assert!(
+            parsed.recorded_workdirs.contains(&nested_path),
+            "the absorbed workdir must survive into the ledger: {:?}",
+            parsed.recorded_workdirs
+        );
+
+        let current =
+            |ledger: &SourceParseState| ScopeLayoutProbe::default().ledger_is_current(ledger);
+        let mut ledger = SourceParseState::default();
+        assert!(!current(&ledger), "an empty ledger proves no layout");
+        ledger.sessions.insert(
+            session_state_key("codex", "s1"),
+            SessionParseRecord {
+                source_path: entry.source_path.clone(),
+                source_len: 1,
+                source_mtime_ns: 1,
+                extract_relpath: "extracts/codex/s1.md".to_string(),
+                extract_sha256: String::new(),
+                raw_frames: 1,
+                signal_frames: 1,
+                filtered_frames: 0,
+                project: entry.project.clone(),
+                date: entry.date.clone(),
+                cwd: entry.cwd.clone(),
+                scope_conflict: false,
+                scope_unattributed: false,
+                session_kind: None,
+                scope_environment: ScopeLayoutProbe::default()
+                    .fingerprint(entry.cwd.as_deref(), &parsed.recorded_workdirs),
+                scope_paths: parsed.recorded_workdirs.clone(),
+            },
+        );
+        assert!(current(&ledger), "an untouched layout is current");
+
+        // A nested checkout appears under the absorbed workdir: that path is
+        // now a repository of its own and the frame stops belonging to the
+        // parent, with no source byte moved.
+        fs::create_dir_all(nested.join(".git")).unwrap();
+        assert!(
+            !current(&ledger),
+            "a new nested checkout must refuse the `unchanged` short-circuit"
+        );
+        fs::remove_dir_all(nested.join(".git")).unwrap();
+        assert!(current(&ledger), "the same layout is the same identity");
+
+        // `.gitmodules` decides whether a vanished path is its own
+        // repository, so its CONTENT is part of the layout.
+        fs::write(
+            parent.join(".gitmodules"),
+            "[submodule \"fleet-bus\"]\n\tpath = vendor/fleet-bus\n",
+        )
+        .unwrap();
+        assert!(!current(&ledger), "a submodule declaration is a change");
 
         let _ = fs::remove_dir_all(&root);
     }

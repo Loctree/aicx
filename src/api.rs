@@ -1009,6 +1009,7 @@ mod tests {
                 title: None,
                 machine: None,
                 logical_session_id: None,
+                session_kind: None,
             })
             .expect("serialize row")
         };
@@ -1400,6 +1401,7 @@ mod tests {
                 title: None,
                 machine: None,
                 logical_session_id: None,
+                session_kind: None,
             })
             .expect("serialize row")
         };

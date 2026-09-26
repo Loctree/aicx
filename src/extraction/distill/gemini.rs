@@ -427,6 +427,9 @@ mod tests {
                     end: (model.turns.len() - 1) as u64,
                 },
                 scope_status: ScopeStatus::NoDriftObserved,
+                scope_conflict: false,
+                scope_root: None,
+                scope_workdirs: Vec::new(),
             },
             Segment {
                 segment_id: 1,
@@ -436,6 +439,9 @@ mod tests {
                 ended_at: Known::value("2026-04-15T03:20:00.000Z".to_owned()),
                 turn_range: TurnRange { start: 0, end: 0 }, // only user turn, no assistant reply -> partial/interrupted
                 scope_status: ScopeStatus::MixedCandidate,
+                scope_conflict: false,
+                scope_root: None,
+                scope_workdirs: Vec::new(),
             },
         ];
 
