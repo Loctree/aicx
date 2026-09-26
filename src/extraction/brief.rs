@@ -44,8 +44,9 @@ fn known_or<'a>(value: &'a Known<String>, fallback: &'a str) -> &'a str {
 
 /// Where a segment worked, as a reader should see it: the repository its
 /// workdirs resolved to when that is known, the recorded cwd otherwise, and an
-/// explicit marker when the workdirs proved several checkouts — the recorded
-/// cwd alone would present a mixed span as ordinary baseline work.
+/// explicit marker when the workdirs proved several checkouts or could not be
+/// placed at all — the recorded cwd alone would present such a span as
+/// ordinary baseline work, which an `unattributed` span must never inherit.
 fn segment_place(segment: &Segment) -> Option<String> {
     let place = segment
         .scope_root
@@ -55,13 +56,17 @@ fn segment_place(segment: &Segment) -> Option<String> {
             Known::Unknown(_) => None,
         })
         .map(str::to_owned);
-    if segment.scope_conflict {
-        return Some(match place {
-            Some(place) => format!("{place} (scope conflict)"),
-            None => "(scope conflict)".to_owned(),
-        });
-    }
-    place
+    let marker = if segment.scope_conflict {
+        "scope conflict"
+    } else if segment.scope_status == ScopeStatus::Unattributed {
+        "unattributed"
+    } else {
+        return place;
+    };
+    Some(match place {
+        Some(place) => format!("{place} ({marker})"),
+        None => format!("({marker})"),
+    })
 }
 
 fn render_header(out: &mut String, model: &SessionModel, distillates: &[SegmentDistillate]) {
@@ -352,6 +357,10 @@ mod tests {
     /// A conflict segment keeps its recorded cwd in the model, but the brief
     /// must not present it as ordinary baseline work; a re-scoped segment
     /// shows the repository its workdirs resolved to.
+    ///
+    /// Finding: an `unattributed` segment has neither a conflict nor a
+    /// `scope_root`, so it was headed with its recorded cwd as plain baseline
+    /// work — the one attribution the model says it must not inherit.
     #[test]
     fn scope_evidence_shapes_the_segment_heading() {
         let mut conflicted = segment(0, "/sessions/vista");
@@ -359,8 +368,13 @@ mod tests {
         conflicted.scope_status = ScopeStatus::MixedCandidate;
         let mut rescoped = segment(1, "/sessions/vista");
         rescoped.scope_root = Some("/repo/fleet-bus".to_owned());
-        let model = minimal_model(vec![conflicted, rescoped]);
-        let brief = render_brief(&model, &[distillate_for(0), distillate_for(1)]);
+        let mut unplaced = segment(2, "/sessions/vista");
+        unplaced.scope_status = ScopeStatus::Unattributed;
+        let model = minimal_model(vec![conflicted, rescoped, unplaced]);
+        let brief = render_brief(
+            &model,
+            &[distillate_for(0), distillate_for(1), distillate_for(2)],
+        );
         assert!(
             brief.contains("## Segment 0 · /sessions/vista (scope conflict)"),
             "{brief}"
@@ -368,6 +382,14 @@ mod tests {
         assert!(brief.contains("## Segment 1 · /repo/fleet-bus"), "{brief}");
         assert!(
             brief.contains("| 0 | /sessions/vista (scope conflict) | main |"),
+            "{brief}"
+        );
+        assert!(
+            brief.contains("## Segment 2 · /sessions/vista (unattributed)"),
+            "{brief}"
+        );
+        assert!(
+            brief.contains("| 2 | /sessions/vista (unattributed) | main |"),
             "{brief}"
         );
     }
