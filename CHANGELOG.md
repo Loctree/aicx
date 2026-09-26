@@ -55,9 +55,12 @@ canonical spelling is what `.aicxignore` is compared against, checkout denials
 now match in every spelling both sides can produce: a rule written as
 `/var/...` still hides a frame stamped `/private/var/...`, and any checkout
 reached through a symlink stays hidden. The deny-list fingerprint is therefore
-`v3` — it covers the RESOLVED targets as well as the rule text, so retargeting
+`v4` — it covers the RESOLVED targets as well as the rule text, so retargeting
 a symlink invalidates caches built under the old target instead of quietly
-republishing a newly denied checkout. Resolving an incoming cwd is now lazy
+republishing a newly denied checkout. A Windows drive rule
+(`C:\Users\Dev\private`) matches in any letter case, as Windows resolves it,
+also where no filesystem can reconcile the spelling: a checkout that is gone,
+or a Windows rollout read on another OS. Resolving an incoming cwd is now lazy
 (a literal hit never asks the filesystem) and memoized per distinct cwd, so a
 large history pays one resolution per cwd rather than one per frame.
 Spellings are reconciled through the indexing host's filesystem: the recorded
@@ -127,9 +130,12 @@ rollout that mixes separators or case keeps its intents.
 A `workdir` that is not a literal at all is unreadable evidence as well. That
 covers a variable, an expression, and the shorthand `{cmd, workdir}`: each
 names a directory only the runtime knew. Such a call into another checkout no
-longer leaves its window on the baseline. `null` and `undefined` still ask for
-the default directory, and a `workdir:` in prose (not an object property)
-names nothing. A literal is read only when it is the whole value:
+longer leaves its window on the baseline. So is an expression that opens with
+punctuation, `[root, repo].join('/')` or `!local ? foreign : base`. `null`,
+`undefined` and a number still name no directory, but only as the whole value:
+`undefined ?? otherDir` is an expression. A `workdir:` in prose (not an object
+property) names nothing, and a comment between the key and its value is
+skipped: `workdir: /* pinned */ "/repo/a"` reads `/repo/a`. A literal is read only when it is the whole value:
 `"/repos/vista" + "-private"` is an expression, so the call is unreadable
 evidence rather than `/repos/vista`. A comment between the operands changes
 nothing: `"/repos/vista" /* note */ + "-private"` is the same expression, and a
@@ -174,7 +180,9 @@ branch; a scope-only cut never reaches the fingerprint, and every existing
 golden fixture keeps its bytes. `extract --brief` counts a span's
 `scope_root` next to the recorded cwds, as the session `ScopeStatus` does: a
 one-segment session launched in one checkout and re-scoped to another gets the
-multi-workstream header instead of reading as a single workstream.
+multi-workstream header instead of reading as a single workstream. An
+`unattributed` span is headed "(unattributed)" after its recorded cwd, never as
+plain baseline work.
 
 The verdicts derived from that resolution are cached, so the cache now knows
 what they depended on. The parse ledger records, per session, every working

@@ -136,6 +136,9 @@ frame recorded as `/private/var/…`. Write the path you use; matching resolves
 the rest. Spellings are reconciled through this host's filesystem when the
 index runs: the recorded spelling always matches literally, while a spelling
 reached through a symlink matches only while that link still resolves here.
+A Windows drive rule (`D:\work\private`) matches in any letter case, as
+Windows resolves the path, also where the checkout is gone or the rollout is
+read on another OS; a Unix path keeps its case.
 
 A frame is judged on every path its turn window ran in, not only on the scope
 it is served under: each tool-call `workdir` the window recorded, and the
@@ -251,9 +254,11 @@ read only when its value was: a payload `type` cut off mid-value proves
 nothing. A `workdir` that a tool call writes but does not state is unreadable
 too — a JavaScript template literal that interpolates, a literal that never
 closes, or a value that is not a literal at all (a variable, an expression,
-the shorthand `{cmd, workdir}`). `null` and `undefined` ask for the default
-directory and are no evidence, and only the whole property name `workdir` is
-read. A readable value runs to the quote that opened it, in any of the three
+one that opens with punctuation such as `[root, repo].join('/')`, the
+shorthand `{cmd, workdir}`). `null`, `undefined` and a number are no evidence
+only as the whole value (`undefined ?? otherDir` is an expression), a comment
+between the key and its value is skipped, and only the whole property name
+`workdir` is read. A readable value runs to the quote that opened it, in any of the three
 quote styles, so `"/Users/O'Brien/repo"` is one path, and it counts only as
 the whole value: `"/repos/vista" + "-private"` is an expression and
 unreadable. Both Codex readers —
