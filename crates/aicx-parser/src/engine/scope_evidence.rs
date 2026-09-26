@@ -160,14 +160,16 @@ pub fn tool_call_workdirs(payload: &Value) -> Vec<WorkdirEvidence> {
 /// the value continues past its closing quote ([`value_ends_at`]).
 ///
 /// A value that is not a literal at all — `workdir: targetDir`,
-/// `workdir: path.join(root, "pkg")`, the shorthand `{cmd, workdir}` — still
+/// `workdir: path.join(root, "pkg")`, `workdir: [root, repo].join('/')`,
+/// `workdir: !local ? foreign : base`, the shorthand `{cmd, workdir}` — still
 /// names the directory the call ran in; only the runtime knew which. It is
 /// opaque, never "no evidence": skipping it left the window on its baseline
-/// while the call worked in another checkout. `null` and `undefined` ask for
-/// the default directory and are no evidence. Such a value counts only where
-/// the key is a property of an object (right after `{` or `,`): prose like
+/// while the call worked in another checkout. `null`, `undefined` and a
+/// number name no directory, but only as the whole value
+/// ([`names_no_directory`]). Such a value counts only where the key is a
+/// property of an object (right after `{` or `,`): prose like
 /// `// workdir: the repo` names nothing, and reading it would unplace the
-/// window.
+/// window. A comment between the key and its value is skipped.
 ///
 /// The key must be the whole property name, and a quoted one must be quoted
 /// on both sides: `networkdir:`, `fallback_workdir:` and `"fallback-workdir":`
@@ -200,27 +202,28 @@ fn workdirs_in_literal(input: &str) -> Vec<WorkdirEvidence> {
         let (Some(whole), Some(key)) = (caps.get(0), caps.name("key")) else {
             continue;
         };
-        let value = &input[whole.end()..];
-        let Some(first) = value.chars().next() else {
+        let before = input[..key.start()].trim_end();
+        let is_property = before.ends_with('{') || before.ends_with(',');
+        // A comment before the value hides nothing: the value follows it. A
+        // block comment that never closes hid the value.
+        let Some(value) = skip_comments(&input[whole.end()..]) else {
+            if is_property {
+                found.push(WorkdirEvidence::Opaque);
+            }
             continue;
         };
-        let delimiter = match first {
-            '"' | '\'' | '`' => first,
-            c if c.is_ascii_alphabetic() || matches!(c, '_' | '$' | '(') => {
-                let before = input[..key.start()].trim_end();
-                let is_property = before.ends_with('{') || before.ends_with(',');
-                let word: String = value
-                    .chars()
-                    .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '$'))
-                    .collect();
-                if is_property && !matches!(word.as_str(), "null" | "undefined") {
+        let delimiter = match value.chars().next() {
+            Some(quote @ ('"' | '\'' | '`')) => quote,
+            // Not a literal. As a property it is still the value the call ran
+            // with — an identifier, a call, or an expression that opens with
+            // punctuation, `[root, repo].join('/')` or `!local ? foreign :
+            // base` — and only the runtime knew which directory that was.
+            _ => {
+                if is_property && !names_no_directory(value) {
                     found.push(WorkdirEvidence::Opaque);
                 }
                 continue;
             }
-            // A number, punctuation, or an escape of text quoted around this
-            // spot: not a value that can name a directory.
-            _ => continue,
         };
         match literal_body(&value[1..], delimiter) {
             Some((body, _)) if delimiter == '`' && body.contains("${") => {
@@ -286,22 +289,48 @@ fn literal_body(rest: &str, delimiter: char) -> Option<(String, usize)> {
 /// never closes hid whatever came after it, so the value is opaque, as for a
 /// literal that never closes.
 fn value_ends_at(rest: &str) -> bool {
+    skip_comments(rest)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with([',', '}', ')', ']', ';']))
+}
+
+/// `rest` from its next token on, past whitespace and every whole comment.
+///
+/// A line comment runs to the end of its line, or of the input. `None` when a
+/// block comment never closes: whatever followed it is unreadable.
+fn skip_comments(rest: &str) -> Option<&str> {
     let mut rest = rest.trim_start();
     loop {
         if let Some(comment) = rest.strip_prefix("//") {
             match comment.find('\n') {
                 Some(newline) => rest = comment[newline + 1..].trim_start(),
-                None => return true,
+                None => return Some(""),
             }
         } else if let Some(comment) = rest.strip_prefix("/*") {
-            match comment.find("*/") {
-                Some(close) => rest = comment[close + 2..].trim_start(),
-                None => return false,
-            }
+            rest = comment[comment.find("*/")? + 2..].trim_start();
         } else {
-            return rest.is_empty() || rest.starts_with([',', '}', ')', ']', ';']);
+            return Some(rest);
         }
     }
+}
+
+/// A `workdir` value that is not a literal and still names no directory.
+///
+/// `null` and `undefined` ask for the default directory, a number is no path,
+/// and a key with nothing before its separator has no value. Each counts only
+/// when the value ends right after it: `undefined ?? otherDir` and
+/// `0 || otherDir` are expressions like any other.
+fn names_no_directory(value: &str) -> bool {
+    let unsigned = value.strip_prefix(['-', '+']).unwrap_or(value);
+    let end = unsigned
+        .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '$' | '.')))
+        .unwrap_or(unsigned.len());
+    let token = &unsigned[..end];
+    let number = token.starts_with(|c: char| c.is_ascii_digit())
+        || token
+            .strip_prefix('.')
+            .is_some_and(|fraction| fraction.starts_with(|c: char| c.is_ascii_digit()));
+    let no_directory = token.is_empty() || number || matches!(token, "null" | "undefined");
+    no_directory && value_ends_at(&unsigned[end..])
 }
 
 /// Resolve one workdir string to an absolute spelling, lexically normalized.
@@ -1961,6 +1990,11 @@ mod tests {
     /// skipped as "no evidence", so `tools.exec_command({cmd, workdir:
     /// targetDir})` into another checkout left the window on its baseline.
     /// Only the runtime knew that directory: the evidence is opaque.
+    ///
+    /// Finding: an expression that opens with punctuation —
+    /// `[root, repo].join('/')`, `!local ? foreign : base` — was skipped the
+    /// same way, and so were `undefined ?? otherDir` and `0 || otherDir`,
+    /// because only their first token was looked at.
     #[test]
     fn a_workdir_that_is_not_a_literal_is_opaque() {
         for input in [
@@ -1970,6 +2004,12 @@ mod tests {
             r#"tools.exec_command({cmd: "ls", workdir: nullish})"#,
             "tools.exec_command({ cmd, workdir })",
             "tools.exec_command({workdir, cmd})",
+            r#"tools.exec_command({cmd: "ls", workdir: [root, repo].join('/')})"#,
+            r#"tools.exec_command({cmd: "ls", workdir: !local ? foreign : base})"#,
+            r#"tools.exec_command({cmd: "ls", workdir: undefined ?? otherDir})"#,
+            r#"tools.exec_command({cmd: "ls", workdir: 0 || otherDir})"#,
+            r#"tools.exec_command({cmd: "ls", workdir: /* pinned */ otherDir})"#,
+            r#"tools.exec_command({cmd: "ls", workdir: /* never closes "/repo/a"})"#,
         ] {
             assert_eq!(
                 tool_call_workdirs(&js_input(input)),
@@ -1982,10 +2022,25 @@ mod tests {
         for input in [
             r#"tools.exec_command({cmd: "ls", workdir: null})"#,
             r#"tools.exec_command({cmd: "ls", workdir: undefined})"#,
+            r#"tools.exec_command({cmd: "ls", workdir: null /* default */})"#,
+            r#"tools.exec_command({cmd: "ls", workdir: 0})"#,
+            r#"tools.exec_command({cmd: "ls", workdir: -1, timeout: 5})"#,
             "// workdir: the repo root\ntools.exec_command({cmd: \"ls\"})",
             r#"tools.exec_command({cmd: "echo workdir: pkg"})"#,
+            r#"tools.exec_command({cmd: "echo workdir: [x]"})"#,
         ] {
             assert!(tool_call_workdirs(&js_input(input)).is_empty(), "{input}");
+        }
+        // A comment before a literal hides nothing: the literal is the value.
+        for input in [
+            r#"tools.exec_command({cmd: "ls", workdir: /* pinned */ "/repo/a"})"#,
+            "tools.exec_command({cmd: \"ls\", workdir: // pinned\n \"/repo/a\"})",
+        ] {
+            assert_eq!(
+                tool_call_workdirs(&js_input(input)),
+                vec![WorkdirEvidence::Explicit("/repo/a".to_string())],
+                "{input}"
+            );
         }
         // A readable literal beside an unreadable value keeps both.
         assert_eq!(
