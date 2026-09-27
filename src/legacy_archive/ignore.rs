@@ -346,8 +346,18 @@ pub fn load_repo_path_ignore(aicx_home: &Path, user_home: &Path) -> Result<RepoP
 /// Canonical spelling of an existing path, in the same display normalization
 /// the prefixes use. `None` when the path is gone from this host, which is not
 /// an error: the literal comparison still stands on its own.
+///
+/// Only a path absolute on THIS host is asked about. Any other spelling — a
+/// Windows `C:/Users/dev/private` read on Unix, a relative cwd — would be
+/// resolved against the process cwd, and a `C:` directory that happens to sit
+/// there would turn a foreign rule into a canonical prefix for an unrelated
+/// local path.
 fn canonical_cwd_display(path: &str) -> Option<String> {
-    std::fs::canonicalize(path.trim())
+    let path = Path::new(path.trim());
+    if !path.is_absolute() {
+        return None;
+    }
+    std::fs::canonicalize(path)
         .ok()
         .map(|resolved| normalize_cwd_display(&resolved.to_string_lossy()))
 }
@@ -652,6 +662,29 @@ mod tests {
         assert!(unix.ignores_cwd(Some("/repos/Private/crate")));
         assert!(!unix.ignores_cwd(Some("/repos/private")));
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Finding: every deny-list spelling was canonicalized on the host
+    /// filesystem, and one that is not absolute HERE — a Windows
+    /// `C:/Users/Dev/private` read on Unix — resolved against the process
+    /// cwd. A `C:` directory sitting there turned the foreign rule into a
+    /// canonical prefix for an unrelated local path.
+    #[test]
+    fn only_a_host_absolute_spelling_is_canonicalized() {
+        // `src` exists in the test's working directory, the crate root, so
+        // resolving the relative spelling against it named a real local dir.
+        assert!(Path::new("src").is_dir());
+        assert_eq!(canonical_cwd_display("src"), None);
+        if !cfg!(windows) {
+            assert_eq!(canonical_cwd_display("C:/Users/Dev/private"), None);
+        }
+        let here = std::env::temp_dir();
+        assert_eq!(
+            canonical_cwd_display(&here.to_string_lossy()),
+            Some(normalize_cwd_display(
+                &fs::canonicalize(&here).unwrap().to_string_lossy()
+            ))
+        );
     }
 
     #[test]
