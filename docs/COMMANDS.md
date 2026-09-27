@@ -136,7 +136,9 @@ frame recorded as `/private/var/…`. Write the path you use; matching resolves
 the rest. Spellings are reconciled through this host's filesystem when the
 index runs: the recorded spelling always matches literally, while a spelling
 reached through a symlink matches only while that link still resolves here.
-A Windows drive rule (`D:\work\private`) matches in any letter case, as
+Only a spelling absolute on this host is resolved: a Windows rule read on
+Unix, or a relative cwd, is compared as written, never against the directory
+`aicx` runs in. A Windows drive rule (`D:\work\private`) matches in any letter case, as
 Windows resolves the path, also where the checkout is gone or the rollout is
 read on another OS; a Unix path keeps its case.
 
@@ -256,15 +258,21 @@ too — a JavaScript template literal that interpolates, a literal that never
 closes, or a value that is not a literal at all (a variable, an expression,
 one that opens with punctuation such as `[root, repo].join('/')`, the
 shorthand `{cmd, workdir}`). `null`, `undefined` and a number are no evidence
-only as the whole value (`undefined ?? otherDir` is an expression), a comment
-between the key and its value is skipped, and only the whole property name
-`workdir` is read. A readable value runs to the quote that opened it, in any of the three
+only as the whole value (`undefined ?? otherDir` is an expression), and only
+the whole property name `workdir` is read, only as an object property (right
+after `{` or `,`): prose and a path a string merely quotes name nothing.
+Comments are skipped wherever JavaScript allows them, before the key as well
+as before the value, so `{cmd, /* note */ workdir: targetDir}` is read. A readable value runs to the quote that opened it, in any of the three
 quote styles, so `"/Users/O'Brien/repo"` is one path, and it counts only as
 the whole value: `"/repos/vista" + "-private"` is an expression and
 unreadable. Both Codex readers —
 the full adapter and the bounded reader for over-cap rollouts — scope the
 same call types, and both treat a `turn_context` without a cwd as a turn
-whose directory is unknown.
+whose directory is unknown: it is unattributed unless its tool calls place it,
+so its frames never inherit the session bucket. A source that records no
+per-turn cwd at all is not withholding one. Scope is judged on every frame a
+reader produced, tool calls included, before the signal projection: a turn
+window whose only record is a call still counts.
 Within a mixed
 session a frame must positively prove membership in the requested project —
 silence and conflicting evidence never inherit the session bucket — while
@@ -278,7 +286,9 @@ happens to be spelled. Lexical containment survives only where identity is
 unknowable — a workdir that does not exist on this machine — and there a
 Windows spelling is compared the way Windows resolves it (either separator,
 letter case ignored), a Unix spelling byte for byte; a Windows path rooted
-without a drive (`\repo`) sits on the drive of the turn's cwd. Identity is
+without a drive (`\repo`) sits on the drive of the turn's cwd, and a
+drive-relative one (`D:fleet`) joins the turn's cwd only on that same drive —
+on any other drive it is unreadable evidence. Identity is
 canonical (one checkout reached two ways is one repo) and existence-checked (a
 deleted subdirectory does not inherit its ancestor's `.git`); a relative
 `workdir` resolves against the turn's cwd, never against the directory `aicx`
@@ -316,7 +326,10 @@ only when the observed scope is also the cataloged one. A frame whose cwd resolv
 real checkout here and cannot prove membership is dropped rather than handed
 to the legacy path-name filter: a checkout at `…/vista/vendor/fleet-bus` spells
 `vista` without being it, and that fallback exists only for paths that resolve
-to nothing at all.
+to nothing at all — the frame's cwd and the session's checkout alike. A frame
+cwd gone from this host is dropped beside a live session checkout, or when the
+session records no checkout, because a removed `vendor/fleet-bus` spells
+`vista` just as well.
 
 A submodule is recognised from the checkout root's `.gitmodules`, whatever
 subdirectory the session ran in, and its descendants belong to it: a vanished
@@ -371,7 +384,7 @@ Both intent lanes therefore resolve provenance from the rollout header when
 the column is empty; no catalog rebuild is a prerequisite for the guardian
 contract, and `aicx catalog rebuild` is what refreshes the stored column. The
 header probe reads as far as the catalog reads a header (128 records, 256 KiB
-in total). A guardian stays out of the `mixed_scope` list as well, even when
+in total), and past a `session_meta` record that names no provenance. A guardian stays out of the `mixed_scope` list as well, even when
 the frame-kind or privacy filter leaves none of its frames, so it cannot make
 `aicx continuity` refuse.
 

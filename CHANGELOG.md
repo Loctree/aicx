@@ -25,7 +25,9 @@ conversations, never served as operator intents. The match is exact
 the catalog column is cold, so no catalog rebuild is a prerequisite. A
 guardian stays out of the mixed-scope telemetry too, so it cannot make
 `continuity` refuse, and the header probe reads as far as the catalog does
-(128 records, 256 KiB in total).
+(128 records, 256 KiB in total). A rollout can carry more than one
+`session_meta` record; the probe reads past one that names no provenance
+instead of stopping at it.
 
 Repository identity is canonical and existence-checked: a workdir that is not
 there resolves to nothing (an ancestor's `.git` says nothing about a directory
@@ -65,7 +67,9 @@ or a Windows rollout read on another OS. Resolving an incoming cwd is now lazy
 large history pays one resolution per cwd rather than one per frame.
 Spellings are reconciled through the indexing host's filesystem: the recorded
 spelling always matches literally, a symlinked one only while the link
-resolves there.
+resolves there. Only a spelling absolute on that host is resolved: a Windows
+rule read on Unix, or a relative cwd, is compared as written and never
+resolved against the directory `aicx` runs in.
 
 A frame is judged against the deny list on every path its turn window ran in,
 not only on the scope it is served under: each tool-call workdir the window
@@ -101,7 +105,11 @@ declared by a repository is still recognised when the session stood in a
 subdirectory. A frame cwd that resolves to a real checkout here and cannot
 prove membership fails closed instead of falling through to the legacy
 path-spelling filter — which would re-admit `…/vista/vendor/fleet-bus` for
-`-p vista` precisely when the session's own baseline is historical. Cached
+`-p vista` precisely when the session's own baseline is historical. The
+spelling filter is honest only where nothing resolves: a frame cwd gone from
+this host is matched by spelling only beside a session checkout that is gone
+too. Beside a live checkout, or with no session checkout at all, it is
+dropped, since a removed `vista/vendor/fleet-bus` still spells `vista`. Cached
 extracts are no longer reused across a change of catalog cwd, since the scope
 verdicts they carry were computed against the previous one.
 
@@ -133,24 +141,46 @@ names a directory only the runtime knew. Such a call into another checkout no
 longer leaves its window on the baseline. So is an expression that opens with
 punctuation, `[root, repo].join('/')` or `!local ? foreign : base`. `null`,
 `undefined` and a number still name no directory, but only as the whole value:
-`undefined ?? otherDir` is an expression. A `workdir:` in prose (not an object
-property) names nothing, and a comment between the key and its value is
-skipped: `workdir: /* pinned */ "/repo/a"` reads `/repo/a`. A literal is read only when it is the whole value:
+`undefined ?? otherDir` is an expression. A `workdir` counts only as an object
+property, right after `{` or `,`: prose (`// workdir: the repo`) names
+nothing, and neither does a path a string merely quotes
+(`const example = 'workdir:"/repo/foreign"'`), which used to re-scope the
+window of the real call beside it. Comments are skipped wherever JavaScript
+allows them: `{cmd, /* selected target */ workdir: targetDir}` is read, where
+the comment used to hide the key and keep a foreign call's window on the
+baseline, and `workdir: /* pinned */ "/repo/a"` reads `/repo/a`. A literal is
+read only when it is the whole value:
 `"/repos/vista" + "-private"` is an expression, so the call is unreadable
 evidence rather than `/repos/vista`. A comment between the operands changes
 nothing: `"/repos/vista" /* note */ + "-private"` is the same expression, and a
 block comment that never closes leaves the value unreadable. Only the whole property name is read, so
 `networkdir` and `fallback_workdir` are other properties. A Windows `workdir` rooted without a
 drive (`\repo\pkg`) now sits on the drive of the turn's cwd and matches
-`C:\repo`, instead of matching nothing.
+`C:\repo`, instead of matching nothing. A drive-relative one (`C:fleet`) is
+relative to the current directory of ITS drive, and a rollout records that
+only for the turn's own drive: `D:fleet` under `D:\vista` is
+`D:\vista\fleet`, while `C:fleet` there is unreadable evidence instead of the
+fabricated `D:\vista\C:fleet` the baseline used to absorb.
 
 The bounded reader for over-cap Codex rollouts now agrees with the full
 adapter in two places where they had drifted apart:
 
-- A `turn_context` without a cwd leaves that turn's directory unknown. The
-  bounded reader used to keep the previous turn's directory.
+- A `turn_context` without a cwd leaves that turn's directory unknown, and
+  the turn unattributed unless its tool calls place it. The bounded reader
+  used to keep the previous turn's directory, and both readers left such a
+  turn with no cwd and no mark, so its frames inherited the session's
+  project. A source that never records a per-turn cwd is not withholding one
+  and keeps inheriting.
 - `web_search_call` is scoped as a call. One shared predicate now names the
   call types for every reader.
+
+Scope is judged on every frame a reader produced, before the signal
+projection keeps only user and assistant frames. A turn window whose only
+record was a call into another checkout, or a call nobody can place, used to
+leave no trace in the session's scope: the index published the session whole
+under its catalog project and the catalog's conversation read agreed, while
+the per-frame lane would have refused it. The bounded reader keeps one empty
+tool-call frame for such a window, so its verdict reaches the report.
 
 A session also counts as mixed only when its cwds name more than one
 repository. Previously, more than one spelling was enough, so a session that
