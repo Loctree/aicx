@@ -1375,12 +1375,33 @@ fn frame_matches_kind(frame: &TimelineEntry, requested: FrameKind) -> bool {
 /// call, and so may hide the window's only foreign workdir. The window then
 /// fails closed to unattributed, exactly as the full Codex adapter's
 /// `note_opaque_window` decides for the same two cases.
-fn note_opaque_record(window_workdirs: &mut Vec<WorkdirEvidence>, line: &str) {
-    if aicx_parser::engine::truncated_record_is_tool_call(line)
-        && !window_workdirs.contains(&WorkdirEvidence::Opaque)
-    {
+///
+/// Returns whether the record may have been a call. A window whose only call
+/// is one this reader cannot read still ran a call, and still has to carry
+/// its verdict into the session's report: without a carrier frame the window
+/// flushes empty and the opaque evidence goes with it.
+fn note_opaque_record(window_workdirs: &mut Vec<WorkdirEvidence>, line: &str) -> bool {
+    if !aicx_parser::engine::truncated_record_is_tool_call(line) {
+        return false;
+    }
+    if !window_workdirs.contains(&WorkdirEvidence::Opaque) {
         window_workdirs.push(WorkdirEvidence::Opaque);
     }
+    true
+}
+
+/// The `timestamp` an unreadable record still shows in its visible head, or
+/// now — the fallback a readable record without one gets as well. Codex
+/// writes the envelope's timestamp first, so it survives the cap.
+fn visible_head_timestamp(line: &str) -> chrono::DateTime<chrono::Utc> {
+    static TIMESTAMP_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = TIMESTAMP_RE.get_or_init(|| {
+        regex::Regex::new(r#""timestamp"\s*:\s*"([^"]{1,64})""#).expect("valid regex")
+    });
+    re.captures(line)
+        .and_then(|caps| chrono::DateTime::parse_from_rfc3339(&caps[1]).ok())
+        .map(|timestamp| timestamp.with_timezone(&chrono::Utc))
+        .unwrap_or_else(chrono::Utc::now)
 }
 
 /// Bounded signal-only reader for oversized Codex rollouts.
@@ -1412,10 +1433,10 @@ fn parse_large_codex_signal(
     let mut baseline_withheld = false;
     let mut window_frames: Vec<TimelineEntry> = Vec::new();
     let mut window_workdirs: Vec<WorkdirEvidence> = Vec::new();
-    // The window's first readable tool call. A window that ran calls and said
-    // nothing still has to carry its verdict into the session's scope report,
-    // which the full adapter does through its tool-call frames: this reader
-    // keeps ONE call frame for such a window, never one per call.
+    // The window's first tool call, readable or not. A window that ran calls
+    // and said nothing still has to carry its verdict into the session's
+    // scope report, which the full adapter does through its tool-call frames:
+    // this reader keeps ONE call frame for such a window, never one per call.
     let mut window_call: Option<(chrono::DateTime<chrono::Utc>, u64)> = None;
     let mut recorded_workdirs = BTreeSet::new();
     let frame = |role: &str,
@@ -1472,7 +1493,9 @@ fn parse_large_codex_signal(
             // moved repos and this reader will never know: record unreadable
             // evidence so the window fails closed to unattributed instead of
             // silently keeping the baseline project.
-            note_opaque_record(&mut window_workdirs, &record.line);
+            if note_opaque_record(&mut window_workdirs, &record.line) {
+                window_call.get_or_insert_with(|| (visible_head_timestamp(&record.line), line_no));
+            }
             continue;
         }
         if record.line.trim().is_empty() {
@@ -1481,7 +1504,9 @@ fn parse_large_codex_signal(
         let Ok(value) = serde_json::from_str::<serde_json::Value>(&record.line) else {
             // A malformed record never becomes a value either, so its workdir
             // is just as invisible: the full adapter treats both alike.
-            note_opaque_record(&mut window_workdirs, &record.line);
+            if note_opaque_record(&mut window_workdirs, &record.line) {
+                window_call.get_or_insert_with(|| (visible_head_timestamp(&record.line), line_no));
+            }
             continue;
         };
         if value.get("type").and_then(serde_json::Value::as_str) == Some("turn_context") {
@@ -2801,6 +2826,75 @@ mod tests {
         }
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Finding: a window whose only call was a record the bounded reader could
+    /// not read — drained over the cap, or malformed — noted opaque evidence
+    /// but kept no carrier, so the window flushed empty and its verdict went
+    /// with it: the session read as placed although one of its turns ran a
+    /// call nobody can place.
+    #[test]
+    fn an_unreadable_call_alone_still_carries_its_window() {
+        let filler = "x".repeat(MAX_JSONL_RECORD_BYTES + 4096);
+        let over_cap = format!(
+            r#"{{"timestamp":"2026-08-22T00:00:04Z","type":"response_item","payload":{{"type":"function_call","name":"shell","call_id":"c1","arguments":"{{\"cmd\":\"{filler}\"}}"}}}}"#
+        );
+        let malformed = r#"{"timestamp":"2026-08-22T00:00:04Z","type":"response_item","payload":{"type":"function_call","name":"shell","arguments":"{\"cmd\":\"ls\",\"workdir\":\"/elsewhere\"}""#.to_string();
+        for (label, unreadable) in [("over-cap", over_cap), ("malformed", malformed)] {
+            let root = reader_fixture_root(&format!("unreadable-call-{label}"));
+            let repo_home = root.join("repo-home");
+            fs::create_dir_all(repo_home.join(".git")).unwrap();
+            let aicx_home = root.join(".aicx");
+            fs::create_dir_all(&aicx_home).unwrap();
+            let ignore = crate::legacy_archive::load_repo_path_ignore(&aicx_home, &root).unwrap();
+            let home = repo_home.display().to_string();
+            let mut body = jsonl(&[
+                serde_json::json!({"timestamp": "2026-08-22T00:00:00Z", "type": "session_meta",
+                    "payload": {"id": "unreadable-call", "cwd": home}}),
+                timed_turn_context("2026-08-22T00:00:01Z", Some(&home)),
+                timed_message("2026-08-22T00:00:02Z", "user", "home turn"),
+                timed_turn_context("2026-08-22T00:00:03Z", Some(&home)),
+            ]);
+            body.push_str(&unreadable);
+            body.push('\n');
+            body.push_str(&jsonl(&[
+                timed_turn_context("2026-08-22T00:00:05Z", Some(&home)),
+                timed_message("2026-08-22T00:00:06Z", "assistant", "home again"),
+            ]));
+            let source_path = root.join("rollout.jsonl");
+            fs::write(&source_path, body).unwrap();
+            let mut entry = bounded_entry(&source_path);
+            entry.session_id = "unreadable-call".to_string();
+            entry.cwd = Some(home.clone());
+            let allow = crate::source_path::SourceAllowlist::from_roots([root.clone()]);
+
+            let frames = parse_large_codex_signal(&entry, &source_path, &allow, None)
+                .unwrap()
+                .frames;
+            let carriers: Vec<&TimelineEntry> = frames
+                .iter()
+                .filter(|frame| frame.frame_kind == Some(FrameKind::ToolCall))
+                .collect();
+            assert_eq!(carriers.len(), 1, "{label}: {frames:?}");
+            assert_eq!(
+                carriers[0].timestamp.to_rfc3339(),
+                "2026-08-22T00:00:04+00:00",
+                "{label}: the carrier keeps the timestamp its record still shows"
+            );
+            let session = signal_session(frames, &ignore);
+            let messages: Vec<&str> = session
+                .frames
+                .iter()
+                .map(|frame| frame.message.as_str())
+                .collect();
+            assert_eq!(messages, ["home turn", "home again"], "{label}");
+            assert!(
+                session.unattributed,
+                "{label}: the window of an unreadable call must reach the session verdict"
+            );
+
+            let _ = fs::remove_dir_all(&root);
+        }
     }
 
     /// Finding: a `turn_context` without a cwd left its frames with no cwd
