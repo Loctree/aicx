@@ -166,10 +166,15 @@ pub fn tool_call_workdirs(payload: &Value) -> Vec<WorkdirEvidence> {
 /// opaque, never "no evidence": skipping it left the window on its baseline
 /// while the call worked in another checkout. `null`, `undefined` and a
 /// number name no directory, but only as the whole value
-/// ([`names_no_directory`]). Such a value counts only where the key is a
-/// property of an object (right after `{` or `,`): prose like
-/// `// workdir: the repo` names nothing, and reading it would unplace the
-/// window. A comment between the key and its value is skipped.
+/// ([`names_no_directory`]).
+///
+/// Any `workdir`, literal or not, counts only where the key is a property of
+/// an object ([`opens_property`]). Prose like `// workdir: the repo` names
+/// nothing, and reading it would unplace the window. A quoted path is no
+/// exception: `const example = 'workdir:"/repo/foreign"'` quotes a path no
+/// call ran in, and reading it as evidence would re-scope the window to that
+/// checkout. Comments are skipped wherever JavaScript allows them — before the
+/// key, around the separator, before the value.
 ///
 /// The key must be the whole property name, and a quoted one must be quoted
 /// on both sides: `networkdir:`, `fallback_workdir:` and `"fallback-workdir":`
@@ -177,49 +182,63 @@ pub fn tool_call_workdirs(payload: &Value) -> Vec<WorkdirEvidence> {
 /// never left the baseline.
 ///
 /// This is a scanner over key/value SHAPE, not a JavaScript parser, and it
-/// deliberately does not track which string a `workdir:` sits inside. Model
-/// JavaScript routinely carries apostrophes in comments and prose; a tokenizer
-/// that misreads one would hide a real `workdir` key after it, which is a
-/// leak, while an extra reading only makes the window unattributed or
-/// conflicted.
+/// does not track which string a `workdir` sits inside. Model JavaScript
+/// routinely carries apostrophes in comments and prose; a tokenizer that
+/// misreads one would hide a real `workdir` key after it, which is a leak. A
+/// string that itself spells an object property — `'{workdir: "/x"}'` — is
+/// therefore still read.
 fn workdirs_in_literal(input: &str) -> Vec<WorkdirEvidence> {
     static WORKDIR_KEY_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    static WORKDIR_SHORTHAND_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     // The leading class is the identifier boundary the regex crate has no
     // look-behind for: it consumes the character before the key, which is
     // never part of the value read after the match.
     let re = WORKDIR_KEY_RE.get_or_init(|| {
-        regex::Regex::new(r#"(?:^|[^A-Za-z0-9_$])(?P<key>"workdir"|'workdir'|workdir)\s*:\s*"#)
+        regex::Regex::new(r#"(?:^|[^A-Za-z0-9_$])(?P<key>"workdir"|'workdir'|workdir)"#)
             .expect("valid regex")
     });
-    let shorthand = WORKDIR_SHORTHAND_RE
-        .get_or_init(|| regex::Regex::new(r"[{,]\s*workdir\s*[,}]").expect("valid regex"));
     let mut found = Vec::new();
-    if shorthand.is_match(input) {
-        found.push(WorkdirEvidence::Opaque);
-    }
     for caps in re.captures_iter(input) {
-        let (Some(whole), Some(key)) = (caps.get(0), caps.name("key")) else {
+        let Some(key) = caps.name("key") else {
             continue;
         };
-        let before = input[..key.start()].trim_end();
-        let is_property = before.ends_with('{') || before.ends_with(',');
-        // A comment before the value hides nothing: the value follows it. A
-        // block comment that never closes hid the value.
-        let Some(value) = skip_comments(&input[whole.end()..]) else {
-            if is_property {
+        let quoted = key.as_str().starts_with(['"', '\'']);
+        let rest = &input[key.end()..];
+        // `workdirs`, `workdir_hint`: another identifier that only starts the
+        // same way.
+        if !quoted
+            && rest.starts_with(|c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '$'))
+        {
+            continue;
+        }
+        if !opens_property(&input[..key.start()]) {
+            continue;
+        }
+        // A block comment that never closes, on either side of the separator,
+        // hid the value.
+        let Some(rest) = skip_comments(rest) else {
+            found.push(WorkdirEvidence::Opaque);
+            continue;
+        };
+        let Some(rest) = rest.strip_prefix(':') else {
+            // The shorthand `{cmd, workdir}` passes the variable's value: a
+            // directory only the runtime knew.
+            if !quoted && rest.starts_with([',', '}']) {
                 found.push(WorkdirEvidence::Opaque);
             }
             continue;
         };
+        let Some(value) = skip_comments(rest) else {
+            found.push(WorkdirEvidence::Opaque);
+            continue;
+        };
         let delimiter = match value.chars().next() {
             Some(quote @ ('"' | '\'' | '`')) => quote,
-            // Not a literal. As a property it is still the value the call ran
-            // with — an identifier, a call, or an expression that opens with
+            // Not a literal. It is still the value the call ran with — an
+            // identifier, a call, or an expression that opens with
             // punctuation, `[root, repo].join('/')` or `!local ? foreign :
             // base` — and only the runtime knew which directory that was.
             _ => {
-                if is_property && !names_no_directory(value) {
+                if !names_no_directory(value) {
                     found.push(WorkdirEvidence::Opaque);
                 }
                 continue;
@@ -242,6 +261,51 @@ fn workdirs_in_literal(input: &str) -> Vec<WorkdirEvidence> {
         }
     }
     found
+}
+
+/// Does a key that follows `before` open an object property?
+///
+/// Only right after `{` or `,`, or at the very start of the input (an
+/// `arguments` string may be the object's body alone), with whole comments
+/// between them skipped: `{cmd, /* selected target */ workdir: targetDir}` is
+/// a property, and so is a key on the line after `{cmd, // note`. A comment on
+/// the key's OWN line
+/// that is still open where the key starts contains the key — `// workdir: the
+/// repo` is prose — so a line comment only ever ends a line above the key.
+///
+/// A line comment is found from the right, and each one stripped leaves the
+/// code before it to decide: `{url: "http://host", // note` ends in `,` once
+/// the comment goes, and the `//` inside the string is never reached.
+fn opens_property(before: &str) -> bool {
+    let mut rest = before;
+    // No line break between here and the key yet: a `//` on this line would
+    // have commented the key out.
+    let mut key_line = true;
+    loop {
+        let trimmed = rest.trim_end();
+        key_line &= !rest[trimmed.len()..].contains('\n');
+        rest = trimmed;
+        if rest.is_empty() || rest.ends_with(['{', ',']) {
+            return true;
+        }
+        if let Some(body) = rest.strip_suffix("*/") {
+            match body.rfind("/*") {
+                Some(open) => {
+                    rest = &body[..open];
+                    continue;
+                }
+                None => return false,
+            }
+        }
+        if key_line {
+            return false;
+        }
+        let line_start = rest.rfind('\n').map_or(0, |newline| newline + 1);
+        match rest[line_start..].rfind("//") {
+            Some(slash) => rest = &rest[..line_start + slash],
+            None => return false,
+        }
+    }
 }
 
 /// The body of a string literal that `delimiter` opened, up to the matching
@@ -2078,6 +2142,58 @@ mod tests {
             assert_eq!(
                 first_workdir(&js_input(input)).as_deref(),
                 Some("/repo/a"),
+                "{input}"
+            );
+        }
+    }
+
+    /// Finding: a quoted `workdir:` was read as evidence even where no object
+    /// property began, so a string that merely quotes a path —
+    /// `const example = 'workdir:"/repo/foreign"}'` — re-scoped the window of
+    /// the real call beside it to that checkout.
+    #[test]
+    fn a_workdir_outside_an_object_property_is_no_evidence() {
+        for input in [
+            r#"const example = 'workdir:"/repo/foreign"}'; await tools.exec_command({cmd:"pwd"});"#,
+            r#"console.log("workdir: '/repo/foreign'"); tools.exec_command({cmd: "ls"})"#,
+            r#"const hint = `workdir: "/repo/foreign"`; tools.exec_command({cmd: "ls"})"#,
+            r#"tools.exec_command({cmd: "echo workdir: '/repo/foreign'"})"#,
+            r#"tools.exec_command({cmd: "ls"}) /* workdir: "/repo/foreign" */"#,
+            "tools.exec_command({cmd: \"ls\", // workdir: \"/repo/foreign\"\n})",
+            r#"const example = "workdir"; tools.exec_command({cmd: "ls"})"#,
+        ] {
+            assert!(tool_call_workdirs(&js_input(input)).is_empty(), "{input}");
+        }
+    }
+
+    /// Finding: a comment between the previous property and the key hid the
+    /// key: `{cmd, /* selected target */ workdir: targetDir}` left the text
+    /// before the key ending in `*/`, the value was never read, and a call
+    /// into another checkout kept its window on the baseline.
+    #[test]
+    fn a_comment_before_the_key_hides_nothing() {
+        for input in [
+            "tools.exec_command({cmd, /* selected target */ workdir: targetDir})",
+            "tools.exec_command({cmd, /* a */ /* b */ workdir: targetDir})",
+            "tools.exec_command({cmd, // selected target\n  workdir: targetDir})",
+            "tools.exec_command({cmd, /* a */ // b\n  workdir: targetDir})",
+            "tools.exec_command({/* first */ workdir: targetDir, cmd})",
+            "tools.exec_command({url: \"http://host\", // note\n  workdir: targetDir})",
+        ] {
+            assert_eq!(
+                tool_call_workdirs(&js_input(input)),
+                vec![WorkdirEvidence::Opaque],
+                "{input}"
+            );
+        }
+        for input in [
+            r#"tools.exec_command({cmd: "ls", /* pinned */ workdir: "/repo/a"})"#,
+            "tools.exec_command({cmd: \"ls\", // pinned\n  workdir: '/repo/a'})",
+            "tools.exec_command({cmd: \"ls\",\n  // pinned\n  workdir: \"/repo/a\"})",
+        ] {
+            assert_eq!(
+                tool_call_workdirs(&js_input(input)),
+                explicit(&["/repo/a"]),
                 "{input}"
             );
         }
