@@ -421,11 +421,33 @@ fn resolve_candidate(path: &str, baseline: Option<&str>) -> Option<String> {
     if !absolute_anywhere(base) {
         return None;
     }
+    let path = relative_to_baseline_drive(path, base)?;
     let separator = separator_of(base);
     Some(lexically_normalized(&format!(
         "{}{separator}{path}",
         base.trim_end_matches(['/', '\\'])
     )))
+}
+
+/// The part of a relative `path` that joins onto `base`, if any does.
+///
+/// A drive-relative Windows path (`C:fleet`, bare `C:`) is relative to the
+/// current directory OF ITS DRIVE. The only drive whose current directory a
+/// rollout records is the baseline's, so `D:fleet` under `D:\vista` is
+/// `D:\vista\fleet`, while `C:fleet` under it names a directory nobody wrote
+/// down: joining it anyway fabricated `D:\vista\C:fleet`, which the lexical
+/// reduction then placed inside the baseline. A baseline without a drive
+/// letter (`\repo`, UNC) knows no drive's current directory at all. Under a
+/// Unix baseline there are no drives, and `C:fleet` is an ordinary name.
+fn relative_to_baseline_drive<'a>(path: &'a str, base: &str) -> Option<&'a str> {
+    let bytes = path.as_bytes();
+    let drive_relative = bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
+    if !drive_relative || !windows_shaped(base) {
+        return Some(path);
+    }
+    let base = base.as_bytes();
+    let same_drive = base.len() >= 2 && base[1] == b':' && base[0].eq_ignore_ascii_case(&bytes[0]);
+    same_drive.then(|| &path[2..])
 }
 
 /// A Windows path rooted without a drive (`\repo`) names that directory on the
@@ -2048,6 +2070,54 @@ mod tests {
             None
         );
         assert_eq!(on_baseline_drive(r"\aicx-scope-nowhere\repo", None), None);
+    }
+
+    /// Finding: a drive-relative Windows workdir (`C:fleet`) is relative to
+    /// the current directory OF ITS DRIVE. Joined onto a `D:` baseline it
+    /// became `D:\…\vista\C:fleet`, which the lexical reduction placed inside
+    /// the baseline, so a call in a foreign `C:` checkout kept its window on
+    /// the `D:` project.
+    #[test]
+    fn a_drive_relative_workdir_joins_only_its_own_drive() {
+        let baseline = r"D:\aicx-scope-nowhere\vista";
+        for foreign in ["C:fleet", "C:", r"c:..\fleet"] {
+            assert_eq!(
+                resolve_candidate(foreign, Some(baseline)),
+                None,
+                "{foreign}"
+            );
+            assert_eq!(
+                effective_window_scope(&explicit(&[foreign]), Some(baseline)),
+                (WindowScope::Unattributed, None),
+                "{foreign}"
+            );
+        }
+        // The baseline IS its own drive's current directory.
+        for (same_drive, resolved) in [
+            ("D:fleet", r"D:\aicx-scope-nowhere\vista\fleet"),
+            ("d:fleet", r"D:\aicx-scope-nowhere\vista\fleet"),
+            ("D:", r"D:\aicx-scope-nowhere\vista"),
+        ] {
+            assert_eq!(
+                resolve_candidate(same_drive, Some(baseline)).as_deref(),
+                Some(resolved),
+                "{same_drive}"
+            );
+            assert_eq!(
+                effective_window_scope(&explicit(&[same_drive]), Some(baseline)),
+                (WindowScope::Baseline, None),
+                "{same_drive}"
+            );
+        }
+        // A drive-less or UNC baseline records no drive's current directory.
+        for base in [r"\aicx-scope-nowhere\vista", r"\\server\share\vista"] {
+            assert_eq!(resolve_candidate("C:fleet", Some(base)), None, "{base}");
+        }
+        // Under a Unix baseline there are no drives: `C:fleet` is a name.
+        assert_eq!(
+            resolve_candidate("C:fleet", Some("/aicx-scope-nowhere/vista")).as_deref(),
+            Some("/aicx-scope-nowhere/vista/C:fleet")
+        );
     }
 
     /// Finding: a `workdir` written as a variable or an expression was
