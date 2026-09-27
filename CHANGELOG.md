@@ -141,7 +141,10 @@ names a directory only the runtime knew. Such a call into another checkout no
 longer leaves its window on the baseline. So is an expression that opens with
 punctuation, `[root, repo].join('/')` or `!local ? foreign : base`. `null`,
 `undefined` and a number still name no directory, but only as the whole value:
-`undefined ?? otherDir` is an expression. A `workdir` counts only as an object
+`undefined ?? otherDir` is an expression. A computed key names the same
+property: `{cmd, ["workdir"]: targetDir}` used to be skipped without even
+unreadable evidence, keeping a foreign call's window on the baseline, and is
+now read like `workdir: targetDir`. A `workdir` counts only as an object
 property, right after `{` or `,`: prose (`// workdir: the repo`) names
 nothing, and neither does a path a string merely quotes
 (`const example = 'workdir:"/repo/foreign"'`), which used to re-scope the
@@ -180,7 +183,9 @@ record was a call into another checkout, or a call nobody can place, used to
 leave no trace in the session's scope: the index published the session whole
 under its catalog project and the catalog's conversation read agreed, while
 the per-frame lane would have refused it. The bounded reader keeps one empty
-tool-call frame for such a window, so its verdict reaches the report.
+tool-call frame for such a window, so its verdict reaches the report, and it
+does so as well when the window's only call is a record it could not read,
+over the cap or malformed. The full adapter does not yet keep such a window.
 
 A session also counts as mixed only when its cwds name more than one
 repository. Previously, more than one spelling was enough, so a session that

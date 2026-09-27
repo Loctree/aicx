@@ -260,7 +260,10 @@ one that opens with punctuation such as `[root, repo].join('/')`, the
 shorthand `{cmd, workdir}`). `null`, `undefined` and a number are no evidence
 only as the whole value (`undefined ?? otherDir` is an expression), and only
 the whole property name `workdir` is read, only as an object property (right
-after `{` or `,`): prose and a path a string merely quotes name nothing.
+after `{` or `,`): prose and a path a string merely quotes name nothing. A
+computed key is the same property, so `{cmd, ["workdir"]: targetDir}` is read
+like `workdir: targetDir`; `[workdir]` is not, since it names whatever the
+variable holds.
 Comments are skipped wherever JavaScript allows them, before the key as well
 as before the value, so `{cmd, /* note */ workdir: targetDir}` is read. A readable value runs to the quote that opened it, in any of the three
 quote styles, so `"/Users/O'Brien/repo"` is one path, and it counts only as
@@ -272,7 +275,10 @@ whose directory is unknown: it is unattributed unless its tool calls place it,
 so its frames never inherit the session bucket. A source that records no
 per-turn cwd at all is not withholding one. Scope is judged on every frame a
 reader produced, tool calls included, before the signal projection: a turn
-window whose only record is a call still counts.
+window whose only record is a call still counts. In the bounded reader that
+holds for a call it could not read as well; the full adapter does not yet
+keep a window whose only record is an unreadable call, so that window's
+verdict is lost there.
 Within a mixed
 session a frame must positively prove membership in the requested project —
 silence and conflicting evidence never inherit the session bucket — while
