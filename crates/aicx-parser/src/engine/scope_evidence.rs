@@ -181,6 +181,13 @@ pub fn tool_call_workdirs(payload: &Value) -> Vec<WorkdirEvidence> {
 /// are other properties, and reading them would unplace a window whose call
 /// never left the baseline.
 ///
+/// A computed key is the same property written in brackets:
+/// `{cmd, ["workdir"]: targetDir}` passes `workdir` exactly as the plain key
+/// does, and skipping it left a call into another checkout on its baseline
+/// ([`computed_key`]). Only a quoted name computes this key — `[workdir]` is
+/// whatever the variable `workdir` holds — and a template-literal key
+/// exists only in brackets.
+///
 /// This is a scanner over key/value SHAPE, not a JavaScript parser, and it
 /// does not track which string a `workdir` sits inside. Model JavaScript
 /// routinely carries apostrophes in comments and prose; a tokenizer that
@@ -193,7 +200,7 @@ fn workdirs_in_literal(input: &str) -> Vec<WorkdirEvidence> {
     // look-behind for: it consumes the character before the key, which is
     // never part of the value read after the match.
     let re = WORKDIR_KEY_RE.get_or_init(|| {
-        regex::Regex::new(r#"(?:^|[^A-Za-z0-9_$])(?P<key>"workdir"|'workdir'|workdir)"#)
+        regex::Regex::new(r#"(?:^|[^A-Za-z0-9_$])(?P<key>"workdir"|'workdir'|`workdir`|workdir)"#)
             .expect("valid regex")
     });
     let mut found = Vec::new();
@@ -201,8 +208,9 @@ fn workdirs_in_literal(input: &str) -> Vec<WorkdirEvidence> {
         let Some(key) = caps.name("key") else {
             continue;
         };
-        let quoted = key.as_str().starts_with(['"', '\'']);
-        let rest = &input[key.end()..];
+        let quoted = key.as_str().starts_with(['"', '\'', '`']);
+        let mut before = &input[..key.start()];
+        let mut rest = &input[key.end()..];
         // `workdirs`, `workdir_hint`: another identifier that only starts the
         // same way.
         if !quoted
@@ -210,7 +218,14 @@ fn workdirs_in_literal(input: &str) -> Vec<WorkdirEvidence> {
         {
             continue;
         }
-        if !opens_property(&input[..key.start()]) {
+        if quoted {
+            match computed_key(before, rest) {
+                Some((open, close)) => (before, rest) = (open, close),
+                None if key.as_str().starts_with('`') => continue,
+                None => {}
+            }
+        }
+        if !opens_property(before) {
             continue;
         }
         // A block comment that never closes, on either side of the separator,
@@ -261,6 +276,17 @@ fn workdirs_in_literal(input: &str) -> Vec<WorkdirEvidence> {
         }
     }
     found
+}
+
+/// The text on either side of a quoted key that brackets compute —
+/// `["workdir"]` — with the brackets taken off, or `None` when the key is not
+/// computed. What precedes the `[` then decides, as for any key, whether a
+/// property opens there: `args["workdir"]` reads a member and
+/// `["workdir", other]` builds an array, and neither names a directory.
+fn computed_key<'a>(before: &'a str, after: &'a str) -> Option<(&'a str, &'a str)> {
+    let open = before.trim_end().strip_suffix('[')?;
+    let close = skip_comments(after)?.strip_prefix(']')?;
+    Some((open, close))
 }
 
 /// Does a key that follows `before` open an object property?
@@ -2231,6 +2257,49 @@ mod tests {
             r#"tools.exec_command({cmd: "ls"}) /* workdir: "/repo/foreign" */"#,
             "tools.exec_command({cmd: \"ls\", // workdir: \"/repo/foreign\"\n})",
             r#"const example = "workdir"; tools.exec_command({cmd: "ls"})"#,
+        ] {
+            assert!(tool_call_workdirs(&js_input(input)).is_empty(), "{input}");
+        }
+    }
+
+    /// Finding: a computed key, `{cmd, ["workdir"]: targetDir}`, left the text
+    /// before the key ending in `[`, so the occurrence was discarded without
+    /// even opaque evidence and a call into another checkout kept its window
+    /// on the baseline.
+    #[test]
+    fn a_computed_workdir_key_is_the_same_property() {
+        for input in [
+            r#"tools.exec_command({cmd, ["workdir"]: targetDir})"#,
+            "tools.exec_command({cmd, ['workdir']: targetDir})",
+            "tools.exec_command({cmd, [`workdir`]: targetDir})",
+            r#"tools.exec_command({cmd, [ "workdir" /* pinned */ ] : targetDir})"#,
+            r#"tools.exec_command({cmd, /* pinned */ ["workdir"]: targetDir})"#,
+        ] {
+            assert_eq!(
+                tool_call_workdirs(&js_input(input)),
+                vec![WorkdirEvidence::Opaque],
+                "{input}"
+            );
+        }
+        for input in [
+            r#"tools.exec_command({cmd: "ls", ["workdir"]: "/repo/a"})"#,
+            r#"tools.exec_command({["workdir"]: '/repo/a', cmd: "ls"})"#,
+            r#"tools.exec_command({cmd: "ls", [`workdir`]: `/repo/a`})"#,
+        ] {
+            assert_eq!(
+                tool_call_workdirs(&js_input(input)),
+                explicit(&["/repo/a"]),
+                "{input}"
+            );
+        }
+        // Brackets that compute no property of an object: a member read, an
+        // array, a variable's value as the key, and a template literal outside
+        // brackets, which is no key at all.
+        for input in [
+            r#"const dir = options["workdir"]; tools.exec_command({cmd: "ls"})"#,
+            r#"const keys = ["workdir", "cmd"]; tools.exec_command({cmd: "ls"})"#,
+            r#"tools.exec_command({cmd: "ls", [workdir]: "/repo/foreign"})"#,
+            "tools.exec_command({cmd: \"ls\", `workdir`: \"/repo/foreign\"})",
         ] {
             assert!(tool_call_workdirs(&js_input(input)).is_empty(), "{input}");
         }
