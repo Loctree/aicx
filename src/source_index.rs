@@ -510,27 +510,24 @@ pub fn build_with_reporter(
             }
         };
         let ParsedCatalogSource {
-            mut frames,
+            frames,
             distill,
             recorded_workdirs,
         } = parsed_source;
         sources_parsed += 1;
         let raw_count = frames.len();
         raw_frames += raw_count;
-        frames.sort_by_key(|frame| frame.timestamp);
-        let before = frames.len();
-        frames.retain(is_signal_frame);
-        for frame in &mut frames {
-            frame.message = clean_message(&frame.message);
-        }
-        frames.retain(|frame| !frame.message.trim().is_empty());
         // Same one step as the intent lane: whatever `.aicxignore` hides is
         // counted into the report here, or this chunk's scope silently forgets
         // the session's own baseline.
-        let scope = scope_report_excluding_ignored(&mut frames, &ignore);
+        let SignalSession {
+            frames,
+            scope,
+            unattributed: session_unattributed,
+        } = signal_session(frames, &ignore);
         let signal_count = frames.len();
         signal_frames += signal_count;
-        let filtered_count = before.saturating_sub(frames.len());
+        let filtered_count = raw_count.saturating_sub(frames.len());
         filtered_frames += filtered_count;
         if frames.is_empty() {
             continue;
@@ -567,7 +564,6 @@ pub fn build_with_reporter(
         // repository, and serving it whole would stamp all of it with this
         // catalog row's project.
         let session_mixed = scope.scope_foreign_to(entry.cwd.as_deref());
-        let session_unattributed = frames.iter().any(|frame| frame.scope_unattributed);
         // Frames carry the provenance resolved at the source, which is the
         // only lane that can see it for a catalog row cataloged before the
         // column existed.
@@ -1000,14 +996,8 @@ fn read_session_document(aicx_home: &Path, entry: &CatalogEntry) -> Result<Sessi
                 entry.agent, entry.session_id
             )
         })?;
-    let mut frames = parse_catalog_source(entry, &source_path, &source_allow)?.frames;
-    frames.sort_by_key(|frame| frame.timestamp);
-    frames.retain(is_signal_frame);
-    for frame in &mut frames {
-        frame.message = clean_message(&frame.message);
-    }
-    frames.retain(|frame| !frame.message.trim().is_empty());
-    let _ = scope_report_excluding_ignored(&mut frames, &ignore);
+    let frames = parse_catalog_source(entry, &source_path, &source_allow)?.frames;
+    let SignalSession { frames, .. } = signal_session(frames, &ignore);
     let body = render_extract(entry, &frames);
     Ok(SessionDocument {
         body,
@@ -1279,16 +1269,48 @@ pub(crate) fn read_catalog_conversation_at(
                 entry.agent, entry.session_id
             )
         })?;
-    let mut frames = parse_catalog_source(entry, &source_path, &source_allow)?.frames;
+    let frames = parse_catalog_source(entry, &source_path, &source_allow)?.frames;
+    let ignore = crate::legacy_archive::load_repo_path_ignore(aicx_home, &user_home)?;
+    let SignalSession { frames, scope, .. } = signal_session(frames, &ignore);
+    Ok((source_path, frames, scope))
+}
+
+/// A parsed session reduced to its signal frames, with the scope of every
+/// frame it parsed.
+struct SignalSession {
+    /// User and assistant frames, cleaned, with the denied ones removed.
+    frames: Vec<TimelineEntry>,
+    scope: crate::extraction::conversation::ScopeReport,
+    /// Some turn window of the session could not be placed.
+    unattributed: bool,
+}
+
+/// Sort a parsed session, judge its scope and privacy, then project it onto
+/// signal frames.
+///
+/// The order is the point. A turn window whose only foreign workdir sits on a
+/// tool call has no user or assistant frame to carry it, so a report built
+/// after the signal projection forgot that checkout: the session looked
+/// homogeneous, the index published it whole under its catalog project, and a
+/// cwd-less frame inherited that bucket in intents. The same holds for a
+/// window that could not be placed, and for a denied cwd seen only on a call.
+fn signal_session(
+    mut frames: Vec<TimelineEntry>,
+    ignore: &crate::legacy_archive::RepoPathIgnoreMatcher,
+) -> SignalSession {
     frames.sort_by_key(|frame| frame.timestamp);
+    let scope = scope_report_excluding_ignored(&mut frames, ignore);
+    let unattributed = frames.iter().any(|frame| frame.scope_unattributed);
     frames.retain(is_signal_frame);
     for frame in &mut frames {
         frame.message = clean_message(&frame.message);
     }
     frames.retain(|frame| !frame.message.trim().is_empty());
-    let ignore = crate::legacy_archive::load_repo_path_ignore(aicx_home, &user_home)?;
-    let scope = scope_report_excluding_ignored(&mut frames, &ignore);
-    Ok((source_path, frames, scope))
+    SignalSession {
+        frames,
+        scope,
+        unattributed,
+    }
 }
 
 /// Drop frames whose cwd the operator hid, and report the session's scope.
@@ -1366,7 +1388,9 @@ fn note_opaque_record(window_workdirs: &mut Vec<WorkdirEvidence>, line: &str) {
 /// Historical rollouts can exceed hundreds of MB because tool results and
 /// pasted artifacts share the JSONL. The full canonical projection pays for
 /// all of that noise. This path drains over-cap records without allocating
-/// them and deserializes only bounded message records.
+/// them and deserializes only bounded message records. The one other frame it
+/// keeps is a single, empty tool-call frame for a turn window that ran calls
+/// and holds no message: the carrier of that window's verdict.
 fn parse_large_codex_signal(
     entry: &CatalogEntry,
     path: &Path,
@@ -1386,7 +1410,57 @@ fn parse_large_codex_signal(
     let mut baseline_cwd = entry.cwd.clone();
     let mut window_frames: Vec<TimelineEntry> = Vec::new();
     let mut window_workdirs: Vec<WorkdirEvidence> = Vec::new();
+    // The window's first readable tool call. A window that ran calls and said
+    // nothing still has to carry its verdict into the session's scope report,
+    // which the full adapter does through its tool-call frames: this reader
+    // keeps ONE call frame for such a window, never one per call.
+    let mut window_call: Option<(chrono::DateTime<chrono::Utc>, u64)> = None;
     let mut recorded_workdirs = BTreeSet::new();
+    let frame = |role: &str,
+                 frame_kind: FrameKind,
+                 message: String,
+                 timestamp: chrono::DateTime<chrono::Utc>,
+                 line_no: u64,
+                 cwd: Option<String>| TimelineEntry {
+        timestamp,
+        agent: entry.agent.clone(),
+        session_id: entry.session_id.clone(),
+        role: role.to_string(),
+        message,
+        frame_class: None,
+        lineage_origin: None,
+        frame_kind: Some(frame_kind),
+        branch: None,
+        cwd,
+        scope_conflict: false,
+        scope_unattributed: false,
+        scope_workdirs: Vec::new(),
+        session_kind: session_kind.map(str::to_owned),
+        timestamp_source: Some("record".to_string()),
+        source_path: Some(entry.source_path.clone()),
+        source_sha256: None,
+        source_line_span: Some((line_no, line_no)),
+    };
+    let call_frame = |call: Option<(chrono::DateTime<chrono::Utc>, u64)>, cwd: Option<String>| {
+        call.map(|(timestamp, line)| {
+            frame(
+                "tool",
+                FrameKind::ToolCall,
+                String::new(),
+                timestamp,
+                line,
+                cwd,
+            )
+        })
+    };
+    let record_timestamp = |value: &serde_json::Value| {
+        value
+            .get("timestamp")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|raw| chrono::DateTime::parse_from_rfc3339(raw).ok())
+            .map(|timestamp| timestamp.with_timezone(&chrono::Utc))
+            .unwrap_or_else(chrono::Utc::now)
+    };
     while let Some(record) = crate::sanitize::read_line_capped(&mut reader, MAX_JSONL_RECORD_BYTES)?
     {
         line_no += 1;
@@ -1409,6 +1483,10 @@ fn parse_large_codex_signal(
             continue;
         };
         if value.get("type").and_then(serde_json::Value::as_str) == Some("turn_context") {
+            if window_frames.is_empty() {
+                window_frames.extend(call_frame(window_call, baseline_cwd.clone()));
+            }
+            window_call = None;
             flush_scope_window(
                 &mut window_frames,
                 &mut window_workdirs,
@@ -1449,6 +1527,7 @@ fn parse_large_codex_signal(
                     window_workdirs.push(workdir);
                 }
             }
+            window_call.get_or_insert_with(|| (record_timestamp(&value), line_no));
             continue;
         }
         // Only `response_item.message` carries chat text in this reader; the
@@ -1482,32 +1561,17 @@ fn parse_large_codex_signal(
         if message.trim().is_empty() {
             continue;
         }
-        let timestamp = value
-            .get("timestamp")
-            .and_then(serde_json::Value::as_str)
-            .and_then(|raw| chrono::DateTime::parse_from_rfc3339(raw).ok())
-            .map(|timestamp| timestamp.with_timezone(&chrono::Utc))
-            .unwrap_or_else(chrono::Utc::now);
-        window_frames.push(TimelineEntry {
-            timestamp,
-            agent: entry.agent.clone(),
-            session_id: entry.session_id.clone(),
-            role: role.to_string(),
+        window_frames.push(frame(
+            role,
+            frame_kind,
             message,
-            frame_class: None,
-            lineage_origin: None,
-            frame_kind: Some(frame_kind),
-            branch: None,
-            cwd: baseline_cwd.clone(),
-            scope_conflict: false,
-            scope_unattributed: false,
-            scope_workdirs: Vec::new(),
-            session_kind: session_kind.map(str::to_owned),
-            timestamp_source: Some("record".to_string()),
-            source_path: Some(entry.source_path.clone()),
-            source_sha256: None,
-            source_line_span: Some((line_no, line_no)),
-        });
+            record_timestamp(&value),
+            line_no,
+            baseline_cwd.clone(),
+        ));
+    }
+    if window_frames.is_empty() {
+        window_frames.extend(call_frame(window_call, baseline_cwd.clone()));
     }
     flush_scope_window(
         &mut window_frames,
@@ -2590,6 +2654,132 @@ mod tests {
                     .as_deref()
                     .is_some_and(|cwd| cwd.ends_with("repo-away")),
                 "{label}: a web_search_call workdir must scope its window: {away:?}"
+            );
+        }
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    fn reader_fixture_root(label: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "aicx-source-index-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        root
+    }
+
+    fn timed_message(at: &str, role: &str, text: &str) -> serde_json::Value {
+        let kind = if role == "user" {
+            "input_text"
+        } else {
+            "output_text"
+        };
+        serde_json::json!({"timestamp": at, "type": "response_item",
+            "payload": {"type": "message", "role": role,
+                "content": [{"type": kind, "text": text}]}})
+    }
+
+    fn timed_turn_context(at: &str, cwd: Option<&str>) -> serde_json::Value {
+        let payload = match cwd {
+            Some(cwd) => serde_json::json!({"cwd": cwd}),
+            None => serde_json::json!({"model": "gpt-test"}),
+        };
+        serde_json::json!({"timestamp": at, "type": "turn_context", "payload": payload})
+    }
+
+    /// Both readers' frames for one rollout, labelled.
+    fn both_readers(
+        entry: &CatalogEntry,
+        source_path: &Path,
+        root: &Path,
+    ) -> [(&'static str, Vec<TimelineEntry>); 2] {
+        let allow = crate::source_path::SourceAllowlist::from_roots([root.to_path_buf()]);
+        let full = parse_catalog_source(entry, source_path, &allow)
+            .unwrap()
+            .frames;
+        let bounded = parse_large_codex_signal(entry, source_path, &allow, None)
+            .unwrap()
+            .frames;
+        [("full", full), ("bounded", bounded)]
+    }
+
+    /// Finding: both lanes judged a session's scope only after dropping every
+    /// non-signal frame, so a turn window whose only record was a call into
+    /// another checkout left no trace in the report. The session looked
+    /// homogeneous, the index published it whole under its catalog project,
+    /// and a cwd-less frame inherited that bucket in intents. The bounded
+    /// reader kept no frame for such a window at all.
+    #[test]
+    fn a_window_of_calls_alone_still_reaches_the_session_scope() {
+        let root = reader_fixture_root("call-only-window");
+        let repo_home = root.join("repo-home");
+        let repo_away = root.join("repo-away");
+        for repo in [&repo_home, &repo_away] {
+            fs::create_dir_all(repo.join(".git")).unwrap();
+        }
+        let aicx_home = root.join(".aicx");
+        fs::create_dir_all(&aicx_home).unwrap();
+        let ignore = crate::legacy_archive::load_repo_path_ignore(&aicx_home, &root).unwrap();
+        let home = repo_home.display().to_string();
+        let body = jsonl(&[
+            serde_json::json!({"timestamp": "2026-08-22T00:00:00Z", "type": "session_meta",
+                "payload": {"id": "call-only", "cwd": home}}),
+            timed_turn_context("2026-08-22T00:00:01Z", Some(&home)),
+            timed_message("2026-08-22T00:00:02Z", "user", "home turn"),
+            // A window that only ran a call, in another checkout.
+            timed_turn_context("2026-08-22T00:00:03Z", Some(&home)),
+            serde_json::json!({"timestamp": "2026-08-22T00:00:04Z", "type": "response_item",
+                "payload": {"type": "function_call", "name": "exec_command", "call_id": "c1",
+                    "arguments": serde_json::json!({
+                        "cmd": "ls", "workdir": repo_away.display().to_string(),
+                    }).to_string()}}),
+            // A window that only ran a call nobody can place.
+            timed_turn_context("2026-08-22T00:00:05Z", Some(&home)),
+            serde_json::json!({"timestamp": "2026-08-22T00:00:06Z", "type": "response_item",
+                "payload": {"type": "custom_tool_call", "name": "exec", "call_id": "c2",
+                    "input": "tools.exec_command({cmd, workdir: targetDir})"}}),
+            timed_turn_context("2026-08-22T00:00:07Z", Some(&home)),
+            timed_message("2026-08-22T00:00:08Z", "assistant", "home again"),
+        ]);
+        let source_path = root.join("rollout.jsonl");
+        fs::write(&source_path, body).unwrap();
+        let mut entry = bounded_entry(&source_path);
+        entry.session_id = "call-only".to_string();
+        entry.cwd = Some(home.clone());
+
+        for (label, frames) in both_readers(&entry, &source_path, &root) {
+            let calls = frames
+                .iter()
+                .filter(|frame| frame.frame_kind == Some(FrameKind::ToolCall))
+                .count();
+            assert!(
+                calls >= 2,
+                "{label}: each call-only window keeps a call frame: {frames:?}"
+            );
+            let session = signal_session(frames, &ignore);
+            let messages: Vec<&str> = session
+                .frames
+                .iter()
+                .map(|frame| frame.message.as_str())
+                .collect();
+            assert_eq!(messages, ["home turn", "home again"], "{label}");
+            assert!(
+                session.scope.scope_foreign_to(Some(&home)),
+                "{label}: the call into repo-away must reach the report: {:?}",
+                session.scope
+            );
+            assert!(
+                session.unattributed,
+                "{label}: the unplaced window must reach the session verdict"
+            );
+            assert!(
+                session.frames.iter().all(|frame| !frame.scope_unattributed),
+                "{label}: the fixture must hold the evidence on calls alone"
             );
         }
 
