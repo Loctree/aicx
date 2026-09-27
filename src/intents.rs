@@ -1074,7 +1074,10 @@ fn collect_live_unadmitted_files(
 ///    and a checkout path need not spell `org/repo` in adjacent segments
 ///    (suite dirs, renamed clones);
 /// 2. the frame cwd spells the project as adjacent path segments — the
-///    strict anti-leak matcher for frames that left the session checkout.
+///    strict anti-leak matcher for frames that left the session checkout,
+///    honest only where neither the frame cwd nor the session checkout
+///    resolves on this host. A frame cwd with no session checkout to prove
+///    it against is dropped.
 #[cfg(feature = "app")]
 fn retain_frames_for_project(
     frames: &mut Vec<TimelineEntry>,
@@ -1116,10 +1119,20 @@ fn retain_frames_for_project(
                     // resolves, which is precisely when spelling is least
                     // trustworthy.
                     aicx_parser::engine::WorkdirIdentity::Resolved(_) => false,
-                    // Nothing resolves on this host; spelling is the only
-                    // evidence the session left behind.
+                    // Spelling is evidence only where the session root is as
+                    // unknowable as the frame. A root that resolves here has
+                    // just refused a path it cannot prove — a removed nested
+                    // checkout at `…/vista/vendor/fleet-bus` still spells
+                    // `vista` — and with no root at all there is nothing the
+                    // frame could belong to, which is how the whole-session
+                    // lane (`ScopeReport::scope_foreign_to`) reads it too.
                     aicx_parser::engine::WorkdirIdentity::Unresolved(_) => {
-                        crate::extraction::project_filter_matches_path(cwd, &filters)
+                        session_root.is_some_and(|root| {
+                            matches!(
+                                aicx_parser::engine::normalize_workdir(root, None),
+                                aicx_parser::engine::WorkdirIdentity::Unresolved(_)
+                            )
+                        }) && crate::extraction::project_filter_matches_path(cwd, &filters)
                     }
                 }
             }

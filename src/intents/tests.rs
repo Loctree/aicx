@@ -54,7 +54,14 @@ fn per_frame_cwd_prevents_cross_repo_session_contamination() {
         frame(None, "legacy frame without cwd"),
     ];
 
-    retain_frames_for_project(&mut frames, "Loctree/aicx", None, false);
+    // A session cataloged under a checkout that no longer exists: a frame
+    // that left it may still prove itself by spelling the project.
+    retain_frames_for_project(
+        &mut frames,
+        "Loctree/aicx",
+        Some("/Volumes/vc-workspace/Loctree/aicx-archived"),
+        false,
+    );
 
     assert_eq!(frames.len(), 2);
     assert!(frames.iter().any(|frame| frame.message == "aicx decision"));
@@ -253,6 +260,73 @@ fn a_resolvable_frame_fails_closed_against_a_vanished_baseline() {
         false,
     );
     assert_eq!(frames.len(), 1, "replayed sessions must still be servable");
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// Finding: the path-spelling fallback re-admitted a frame cwd that nothing
+/// resolves beside a session root that DID resolve, and beside no session
+/// root at all. Membership had just refused the first — a removed nested
+/// checkout sits lexically below its parent and is its own repository — and
+/// the whole-session lane refuses the second. Spelling is evidence only where
+/// the session root is as unknowable as the frame.
+#[cfg(feature = "app")]
+#[test]
+fn an_unresolved_frame_is_spelled_in_only_beside_an_unresolved_root() {
+    let root = std::env::temp_dir().join(format!(
+        "aicx-intents-spelling-fallback-{}-{}",
+        std::process::id(),
+        Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    ));
+    let _ = fs::remove_dir_all(&root);
+    let vista = root.join("vista");
+    fs::create_dir_all(vista.join(".git")).expect("vista git dir");
+    // The nested checkout was removed: its path resolves to nothing here.
+    let removed_nested = vista.join("vendor").join("fleet-bus");
+
+    let frame = |cwd: &str| crate::timeline::TimelineEntry {
+        timestamp: Utc::now(),
+        agent: "codex".to_string(),
+        session_id: "spelling-fallback".to_string(),
+        role: "user".to_string(),
+        message: cwd.to_string(),
+        frame_class: None,
+        lineage_origin: None,
+        frame_kind: Some(FrameKind::UserMsg),
+        branch: None,
+        cwd: Some(cwd.to_string()),
+        scope_conflict: false,
+        scope_unattributed: false,
+        scope_workdirs: Vec::new(),
+        session_kind: None,
+        timestamp_source: None,
+        source_path: None,
+        source_sha256: None,
+        source_line_span: None,
+    };
+
+    let mut frames = vec![frame(removed_nested.to_string_lossy().as_ref())];
+    retain_frames_for_project(
+        &mut frames,
+        "/vista",
+        Some(vista.to_string_lossy().as_ref()),
+        false,
+    );
+    assert!(frames.is_empty(), "resolved root: {frames:?}");
+
+    let mut frames = vec![frame("/nonexistent-aicx-scope/vista/vendor/fleet-bus")];
+    retain_frames_for_project(&mut frames, "/vista", None, false);
+    assert!(frames.is_empty(), "no session root: {frames:?}");
+
+    // Both sides historical: spelling is all the session left behind.
+    let mut frames = vec![frame("/nonexistent-aicx-scope/vista/crates/core")];
+    retain_frames_for_project(
+        &mut frames,
+        "/vista",
+        Some("/nonexistent-aicx-scope/aicx"),
+        false,
+    );
+    assert_eq!(frames.len(), 1, "unresolved root: {frames:?}");
 
     let _ = fs::remove_dir_all(&root);
 }
