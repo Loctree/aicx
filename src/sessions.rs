@@ -675,8 +675,9 @@ pub(crate) fn is_guardian_session_kind(session_kind: Option<&str>) -> bool {
 #[cfg(feature = "app")]
 pub(crate) const GUARDIAN_SESSION_KIND: &str = "subagent:guardian";
 
-/// Light provenance probe for the catalog hot path: read only until the
-/// first `session_meta` record (bounded) instead of scanning the rollout.
+/// Light provenance probe for the catalog hot path: read only until a
+/// `session_meta` record names a kind (bounded) instead of scanning the
+/// rollout.
 ///
 /// Bounded in BYTES as well as records. A rollout may open with a malformed or
 /// oversized record — the same shape `parse_large_codex_signal` exists for —
@@ -712,8 +713,13 @@ pub(crate) fn codex_session_kind_from_source(path: &Path) -> Option<String> {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
             continue;
         };
-        if value.get("type").and_then(|t| t.as_str()) == Some("session_meta") {
-            return codex_subagent_session_kind(value.get("payload"));
+        // The first `session_meta` need not carry the provenance: the catalog
+        // scanner keeps reading later ones until a kind appears, and a probe
+        // that stopped at the first would call that guardian ordinary.
+        if value.get("type").and_then(|t| t.as_str()) == Some("session_meta")
+            && let Some(kind) = codex_subagent_session_kind(value.get("payload"))
+        {
+            return Some(kind);
         }
     }
     None
@@ -2731,6 +2737,41 @@ mod tests {
 
         assert_eq!(
             resolve_session_kind("codex", None, &path).as_deref(),
+            Some("subagent:guardian")
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Finding: the probe returned at the FIRST `session_meta`, kind or not,
+    /// while the catalog scanner keeps reading later ones until one names a
+    /// kind. A rollout whose provenance sits in a second header was cataloged
+    /// ordinary on the cold path, and its guardian prompts reached intents.
+    #[test]
+    #[cfg(feature = "app")]
+    fn the_probe_reads_past_a_session_meta_without_provenance() {
+        let root = temp_root("probe_second_meta");
+        let day = root.join("2026").join("08").join("27");
+        fs::create_dir_all(&day).unwrap();
+        let name = "rollout-2026-08-27T03-35-46-01a040de.jsonl";
+        write_session(
+            &day,
+            name,
+            &[
+                r#"{"timestamp":"2026-08-27T01:35:46.000Z","type":"session_meta","payload":{"id":"01a040de-60f0","cwd":"/Users/tester/Git/vista"}}"#,
+                r#"{"timestamp":"2026-08-27T01:35:46.500Z","type":"session_meta","payload":{"id":"01a040de-60f0","source":{"subagent":{"other":"guardian"}}}}"#,
+            ],
+        );
+        let path = day.join(name);
+
+        assert_eq!(
+            resolve_session_kind("codex", None, &path).as_deref(),
+            Some("subagent:guardian")
+        );
+        // The full scanner agrees, which is the contract the probe mirrors.
+        assert_eq!(
+            discover_codex_sessions(&root, None)[0]
+                .session_kind
+                .as_deref(),
             Some("subagent:guardian")
         );
         let _ = fs::remove_dir_all(&root);
