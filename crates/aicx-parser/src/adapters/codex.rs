@@ -421,6 +421,10 @@ struct Assembly<'a> {
     started_at: Known<String>,
     ended_at: Known<String>,
     current_cwd: Known<String>,
+    /// The latest `turn_context` carried no cwd. That is not a legacy source
+    /// that never records one: the rollout names each turn's directory and
+    /// withheld it here, so the turn is unplaced, never the session's.
+    turn_cwd_withheld: bool,
     current_branch: Known<String>,
     segment_started_at: Known<String>,
     segments: Vec<SegmentDraft>,
@@ -490,6 +494,7 @@ impl<'a> Assembly<'a> {
             started_at: Known::unknown(),
             ended_at: Known::unknown(),
             current_cwd: Known::unknown(),
+            turn_cwd_withheld: false,
             current_branch: Known::unknown(),
             segment_started_at: Known::unknown(),
             segments: Vec::new(),
@@ -632,6 +637,10 @@ impl<'a> Assembly<'a> {
         self.finalize_window();
         self.close_segment(timestamp.clone());
         self.window_workdirs.clear();
+        // Without a cwd the turn's frames would carry none, and a frame with
+        // no cwd inherits the session's bucket downstream: the very turn this
+        // record refused to place. It starts unattributed instead.
+        self.turn_cwd_withheld = matches!(cwd, Known::Unknown(_));
         self.current_cwd = cwd;
         self.current_branch = branch;
         self.segment_started_at = timestamp;
@@ -644,7 +653,7 @@ impl<'a> Assembly<'a> {
                 ended_at: Known::unknown(),
                 start_turn: self.turns.len() as u64,
                 scope_conflict: false,
-                scope_unattributed: false,
+                scope_unattributed: self.turn_cwd_withheld,
                 scope_workdirs: Vec::new(),
             };
             // A draft that never received a turn is not a segment — this
@@ -696,6 +705,9 @@ impl<'a> Assembly<'a> {
                     // resolved identity is host-specific evidence and travels
                     // beside it.
                     segment.scope_root = Some(path);
+                    // The calls placed the window, so a withheld cwd no longer
+                    // leaves it unplaced.
+                    segment.scope_unattributed = false;
                 }
             }
             // The recorded cwd survives a conflict for the same reason it
@@ -1344,7 +1356,7 @@ impl<'a> Assembly<'a> {
                 ended_at: Known::unknown(),
                 start_turn: 0,
                 scope_conflict: false,
-                scope_unattributed: false,
+                scope_unattributed: self.turn_cwd_withheld,
                 scope_workdirs: Vec::new(),
             });
         }

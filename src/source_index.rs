@@ -1408,6 +1408,8 @@ fn parse_large_codex_signal(
     // `turn_context` records; explicit tool-call workdirs collected inside the
     // window can re-scope the whole window (never per-frame flip-flop).
     let mut baseline_cwd = entry.cwd.clone();
+    // The latest `turn_context` withheld its cwd: see `flush_scope_window`.
+    let mut baseline_withheld = false;
     let mut window_frames: Vec<TimelineEntry> = Vec::new();
     let mut window_workdirs: Vec<WorkdirEvidence> = Vec::new();
     // The window's first readable tool call. A window that ran calls and said
@@ -1491,6 +1493,7 @@ fn parse_large_codex_signal(
                 &mut window_frames,
                 &mut window_workdirs,
                 baseline_cwd.as_deref(),
+                baseline_withheld,
                 &mut frames,
                 &mut recorded_workdirs,
             );
@@ -1506,6 +1509,7 @@ fn parse_large_codex_signal(
                 .map(str::trim)
                 .filter(|cwd| !cwd.is_empty())
                 .map(str::to_owned);
+            baseline_withheld = baseline_cwd.is_none();
             continue;
         }
         // Tool calls arrive in BOTH Codex envelopes: `response_item` and
@@ -1577,6 +1581,7 @@ fn parse_large_codex_signal(
         &mut window_frames,
         &mut window_workdirs,
         baseline_cwd.as_deref(),
+        baseline_withheld,
         &mut frames,
         &mut recorded_workdirs,
     );
@@ -1596,6 +1601,12 @@ fn parse_large_codex_signal(
 /// recorded baseline whenever the verdict takes it out of `cwd`, so the
 /// `.aicxignore` filter judges each checkout the window touched.
 ///
+/// `withheld` says the window's `turn_context` carried no cwd. Its frames then
+/// have none either, and a frame without a cwd inherits the session's bucket
+/// downstream — the very turn the record refused to place. Unless the window's
+/// calls place it, it is unattributed, as in the full adapter. A source that
+/// never records a per-turn cwd is not withheld and keeps that inheritance.
+///
 /// `session_workdirs` collects the baseline and recorded workdirs of every
 /// window that produced frames: the paths whose layout its verdict read,
 /// which a re-scoped frame's resolved cwd no longer spells.
@@ -1603,6 +1614,7 @@ fn flush_scope_window(
     window_frames: &mut Vec<TimelineEntry>,
     window_workdirs: &mut Vec<WorkdirEvidence>,
     baseline: Option<&str>,
+    withheld: bool,
     frames: &mut Vec<TimelineEntry>,
     session_workdirs: &mut BTreeSet<String>,
 ) {
@@ -1656,6 +1668,11 @@ fn flush_scope_window(
             // baseline cwd stays for structure, but the frame never counts as
             // positive project evidence downstream.
             WindowScope::Unattributed => {
+                for frame in window_frames.iter_mut() {
+                    frame.scope_unattributed = true;
+                }
+            }
+            WindowScope::Baseline if withheld => {
                 for frame in window_frames.iter_mut() {
                     frame.scope_unattributed = true;
                 }
@@ -2781,6 +2798,89 @@ mod tests {
                 session.frames.iter().all(|frame| !frame.scope_unattributed),
                 "{label}: the fixture must hold the evidence on calls alone"
             );
+        }
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Finding: a `turn_context` without a cwd left its frames with no cwd
+    /// and no mark, and a frame with no cwd inherits the session's bucket:
+    /// both readers placed exactly the turn they had refused to place. The
+    /// turn is unattributed unless its calls place it, and a source that never
+    /// records a per-turn cwd keeps inheriting.
+    #[test]
+    fn a_turn_that_withholds_its_cwd_is_unattributed_in_both_readers() {
+        let root = reader_fixture_root("withheld-cwd");
+        let repo_home = root.join("repo-home");
+        let repo_away = root.join("repo-away");
+        for repo in [&repo_home, &repo_away] {
+            fs::create_dir_all(repo.join(".git")).unwrap();
+        }
+        let home = repo_home.display().to_string();
+        let body = jsonl(&[
+            serde_json::json!({"timestamp": "2026-08-22T00:00:00Z", "type": "session_meta",
+                "payload": {"id": "withheld", "cwd": home}}),
+            timed_turn_context("2026-08-22T00:00:01Z", Some(&home)),
+            timed_message("2026-08-22T00:00:02Z", "user", "home turn"),
+            timed_turn_context("2026-08-22T00:00:03Z", None),
+            timed_message("2026-08-22T00:00:04Z", "user", "withheld turn"),
+            timed_turn_context("2026-08-22T00:00:05Z", None),
+            timed_message("2026-08-22T00:00:06Z", "user", "withheld but placed"),
+            serde_json::json!({"timestamp": "2026-08-22T00:00:07Z", "type": "response_item",
+                "payload": {"type": "function_call", "name": "exec_command", "call_id": "c1",
+                    "arguments": serde_json::json!({
+                        "cmd": "ls", "workdir": repo_away.display().to_string(),
+                    }).to_string()}}),
+            timed_turn_context("2026-08-22T00:00:08Z", Some(&home)),
+            timed_message("2026-08-22T00:00:09Z", "assistant", "home again"),
+        ]);
+        let source_path = root.join("rollout.jsonl");
+        fs::write(&source_path, body).unwrap();
+        let mut entry = bounded_entry(&source_path);
+        entry.session_id = "withheld".to_string();
+        entry.cwd = Some(home.clone());
+
+        for (label, frames) in both_readers(&entry, &source_path, &root) {
+            let find = |text: &str| {
+                frames
+                    .iter()
+                    .find(|frame| frame.message.contains(text))
+                    .cloned()
+                    .unwrap_or_else(|| panic!("{label}: no `{text}` frame in {frames:?}"))
+            };
+            for placed in ["home turn", "home again"] {
+                assert!(!find(placed).scope_unattributed, "{label}: {placed}");
+            }
+            let withheld = find("withheld turn");
+            assert!(
+                withheld.cwd.is_none() && withheld.scope_unattributed,
+                "{label}: a withheld cwd must not leave the turn inheritable: {withheld:?}"
+            );
+            let placed = find("withheld but placed");
+            assert!(
+                !placed.scope_unattributed
+                    && placed
+                        .cwd
+                        .as_deref()
+                        .is_some_and(|cwd| cwd.ends_with("repo-away")),
+                "{label}: calls that place the window place it: {placed:?}"
+            );
+        }
+
+        // A source with no per-turn cwd at all is not withholding one.
+        let legacy = jsonl(&[
+            serde_json::json!({"timestamp": "2026-08-22T00:00:00Z", "type": "session_meta",
+                "payload": {"id": "withheld"}}),
+            timed_message("2026-08-22T00:00:01Z", "user", "legacy turn"),
+        ]);
+        fs::write(&source_path, legacy).unwrap();
+        entry.cwd = None;
+        for (label, frames) in both_readers(&entry, &source_path, &root) {
+            let legacy = frames
+                .iter()
+                .find(|frame| frame.message.contains("legacy turn"))
+                .unwrap_or_else(|| panic!("{label}: no legacy frame in {frames:?}"));
+            assert!(!legacy.scope_unattributed, "{label}: {legacy:?}");
         }
 
         let _ = fs::remove_dir_all(&root);
