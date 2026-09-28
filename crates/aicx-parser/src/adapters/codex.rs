@@ -2414,6 +2414,54 @@ mod tests {
         let _ = std::fs::remove_dir_all(&fleet);
     }
 
+    /// A readable tool call is a turn, so a window whose only record is one
+    /// still opens its own segment: the next `turn_context` does not replace
+    /// its draft, and `finish` keeps it even as the rollout's last window.
+    /// Its foreign workdir must reach the session verdict either way.
+    #[test]
+    fn a_window_whose_only_record_is_a_readable_call_keeps_its_scope() {
+        let fleet = temp_repo("fleet-call-only");
+        let fleet_str = std::fs::canonicalize(&fleet)
+            .unwrap_or_else(|_| fleet.clone())
+            .to_string_lossy()
+            .into_owned();
+        let template = r#"{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"s1","cwd":"/sessions/vista"}}
+{"timestamp":"2026-01-01T00:01:00Z","type":"turn_context","payload":{"cwd":"/sessions/vista"}}
+{"timestamp":"2026-01-01T00:01:10Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"vista opening question"}]}}
+{"timestamp":"2026-01-01T00:02:00Z","type":"turn_context","payload":{"cwd":"/sessions/vista"}}
+{"timestamp":"2026-01-01T00:02:10Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"c1","input":"await tools.exec_command({cmd:\"ls\",\"workdir\":\"@FLEET@\"});"}}
+{"timestamp":"2026-01-01T00:03:00Z","type":"turn_context","payload":{"cwd":"/sessions/vista"}}
+{"timestamp":"2026-01-01T00:03:10Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"back to vista"}]}}
+{"timestamp":"2026-01-01T00:04:00Z","type":"turn_context","payload":{"cwd":"/sessions/vista"}}
+{"timestamp":"2026-01-01T00:04:10Z","type":"response_item","payload":{"type":"function_call","name":"shell","call_id":"c2","arguments":"{\"command\":[\"ls\"],\"workdir\":\"@FLEET_ARG@\"}"}}
+"#;
+        // `arguments` is JSON inside a JSON string, so the path is escaped twice.
+        let once = json_path(&fleet);
+        let quoted = Value::String(once.clone()).to_string();
+        let bytes = template
+            .replace("@FLEET_ARG@", &quoted[1..quoted.len() - 1])
+            .replace("@FLEET@", &once);
+        let model = parse(bytes.as_bytes(), "s1");
+        let seg_scopes: Vec<Option<&str>> = model
+            .segments
+            .iter()
+            .map(|segment| segment.scope_root.as_deref())
+            .collect();
+        assert_eq!(
+            seg_scopes,
+            vec![
+                None,
+                Some(fleet_str.as_str()),
+                None,
+                Some(fleet_str.as_str())
+            ],
+            "a call-only window keeps its segment, mid-rollout and last: {:?}",
+            model.segments
+        );
+        assert_eq!(model.scope_status(), ScopeStatus::MixedCandidate);
+        let _ = std::fs::remove_dir_all(&fleet);
+    }
+
     /// Two explicit workdirs resolving to two real repo roots inside one turn
     /// window: mixed/unattributed, never guessed into either project.
     #[test]
