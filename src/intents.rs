@@ -42,6 +42,7 @@ use self::types::{
 pub use self::types::{
     IntentExtraction, IntentExtractionStats, IntentKind, IntentRecord, IntentsCompleteness,
     IntentsConfig, MigrationReport, MixedScopeSession, ProjectResolutionScope,
+    UnplacedScopeSession,
 };
 // Lane 2-5 schema anchor (MASTER Phase 2 §3). Stages land incrementally; these
 // types are the convergence point every lane stage must agree on.
@@ -105,7 +106,7 @@ pub(crate) fn extract_intents_from_root_at_with_stats(
         let cutoff_hours = config.hours.min(i64::MAX as u64) as i64;
         now - Duration::hours(cutoff_hours)
     };
-    let mut mixed_scope = Vec::new();
+    let mut notes = ScopeNotes::default();
     let (files, source_errors, corpus_identity_source, live_sessions) = collect_intent_files(
         aicx_home,
         &config.project,
@@ -113,7 +114,7 @@ pub(crate) fn extract_intents_from_root_at_with_stats(
         config.effective_frame_kind(),
         config.live,
         config.hours == 0,
-        &mut mixed_scope,
+        &mut notes,
     )?;
     extract_intents_from_files_with_stats(
         config,
@@ -121,8 +122,55 @@ pub(crate) fn extract_intents_from_root_at_with_stats(
         source_errors,
         corpus_identity_source,
         live_sessions,
-        mixed_scope,
+        notes,
     )
+}
+
+/// What the lanes' project filters could not serve, noted before each filter
+/// runs so that it survives a filter that removes every frame.
+#[derive(Debug, Default)]
+struct ScopeNotes {
+    /// Sessions that could not be served whole ([`note_mixed_scope`]).
+    mixed: Vec<MixedScopeSession>,
+    /// Sessions served without their unplaced frames ([`note_unplaced_frames`]).
+    unplaced: Vec<UnplacedScopeSession>,
+}
+
+/// Record, once per (agent, session), the frames the project filter is about
+/// to withhold because the turn window they sit in could not be placed.
+///
+/// Such a frame keeps the cataloged checkout as its `cwd`, so the session
+/// reads as one repository with no conflict and is not a mixed candidate: its
+/// placed frames are served, as they should be. The filter still drops every
+/// unplaced frame, and without this note that removal was silent — the answer
+/// looked complete, and a window that held only such work came back empty.
+/// A session the lane already noted as unservable is left out: `mixed_scope`
+/// withholds all of it.
+fn note_unplaced_frames(
+    unplaced: &mut Vec<UnplacedScopeSession>,
+    agent: &str,
+    session_id: &str,
+    frames: &[TimelineEntry],
+) {
+    let withheld = frames
+        .iter()
+        .filter(|frame| frame.scope_unattributed)
+        .count();
+    if withheld == 0
+        || unplaced
+            .iter()
+            .any(|seen| seen.agent == agent && seen.session_id == session_id)
+    {
+        return;
+    }
+    crate::diagnostics::log_describe(&format!(
+        "intents_unplaced_frames agent={agent} session_id={session_id} frames={withheld}"
+    ));
+    unplaced.push(UnplacedScopeSession {
+        agent: agent.to_string(),
+        session_id: session_id.to_string(),
+        frames: withheld,
+    });
 }
 
 /// Record a mixed-workstream candidate once per (agent, session). Called both
@@ -181,8 +229,12 @@ fn extract_intents_from_files_with_stats(
     source_errors: usize,
     corpus_identity_source: &str,
     live_sessions: usize,
-    mut mixed_scope: Vec<MixedScopeSession>,
+    notes: ScopeNotes,
 ) -> Result<IntentExtraction> {
+    let ScopeNotes {
+        mixed: mut mixed_scope,
+        unplaced: unplaced_scope,
+    } = notes;
     let scanned_count = files.len();
     let source_paths_verified = source_errors == 0 && verify_stored_chunk_paths(&files);
     let matched_project_buckets = files
@@ -326,12 +378,14 @@ fn extract_intents_from_files_with_stats(
         identity_source,
         path_heuristic_records,
         live_sessions,
+        unplaced_frames: unplaced_scope.iter().map(|session| session.frames).sum(),
     };
 
     Ok(IntentExtraction {
         records,
         stats,
         mixed_scope,
+        unplaced_scope,
     })
 }
 
@@ -356,6 +410,7 @@ pub(crate) fn extract_intents_from_root_at_for_projects_with_stats(
     let mut path_heuristic_records = 0usize;
     let mut live_sessions = 0usize;
     let mut mixed_scope: Vec<MixedScopeSession> = Vec::new();
+    let mut unplaced_scope: Vec<UnplacedScopeSession> = Vec::new();
 
     for project in projects {
         let mut scoped = config.clone();
@@ -367,6 +422,14 @@ pub(crate) fn extract_intents_from_root_at_for_projects_with_stats(
                 .any(|seen| seen.agent == session.agent && seen.session_id == session.session_id)
             {
                 mixed_scope.push(session);
+            }
+        }
+        for session in extraction.unplaced_scope {
+            if !unplaced_scope
+                .iter()
+                .any(|seen| seen.agent == session.agent && seen.session_id == session.session_id)
+            {
+                unplaced_scope.push(session);
             }
         }
         scanned_count += extraction.stats.scanned_count;
@@ -402,12 +465,14 @@ pub(crate) fn extract_intents_from_root_at_for_projects_with_stats(
         identity_source,
         path_heuristic_records,
         live_sessions,
+        unplaced_frames: unplaced_scope.iter().map(|session| session.frames).sum(),
     };
 
     Ok(IntentExtraction {
         records,
         stats,
         mixed_scope,
+        unplaced_scope,
     })
 }
 
@@ -524,7 +589,7 @@ fn collect_intent_files_from_index(
     frame_kind: FrameKind,
     live: bool,
     full_history: bool,
-    mixed_scope: &mut Vec<MixedScopeSession>,
+    notes: &mut ScopeNotes,
 ) -> Option<(Vec<StoredChunkFile>, usize)> {
     if live || full_history {
         return None;
@@ -674,7 +739,7 @@ fn collect_intent_files_from_index(
                 scope,
                 cutoff,
                 false,
-                mixed_scope,
+                notes,
             ) {
                 files.push(file);
             }
@@ -722,7 +787,7 @@ fn collect_intent_files(
     frame_kind: FrameKind,
     live: bool,
     full_history: bool,
-    mixed_scope: &mut Vec<MixedScopeSession>,
+    notes: &mut ScopeNotes,
 ) -> Result<(Vec<StoredChunkFile>, usize, &'static str, usize)> {
     // Prefer the committed index: same documents, no transcript re-parse.
     if let Some((files, source_errors)) = collect_intent_files_from_index(
@@ -732,7 +797,7 @@ fn collect_intent_files(
         frame_kind,
         live,
         full_history,
-        mixed_scope,
+        notes,
     ) {
         return Ok((files, source_errors, INDEX_IDENTITY_SOURCE, 0));
     }
@@ -818,7 +883,7 @@ fn collect_intent_files(
             scope,
             cutoff,
             live_row,
-            mixed_scope,
+            notes,
         ) else {
             continue;
         };
@@ -838,7 +903,7 @@ fn collect_intent_files(
             &seen_sessions,
             &mut files,
             &mut source_errors,
-            mixed_scope,
+            notes,
         )?;
     }
 
@@ -860,7 +925,7 @@ fn catalog_frames_to_intent_file(
     scope: crate::extraction::conversation::ScopeReport,
     cutoff: DateTime<Utc>,
     live_row: bool,
-    mixed_scope: &mut Vec<MixedScopeSession>,
+    notes: &mut ScopeNotes,
 ) -> Option<StoredChunkFile> {
     // Guardian sessions are control-plane evidence: they never enter the
     // intent stream, and their scope never enters the mixed-scope telemetry
@@ -871,7 +936,7 @@ fn catalog_frames_to_intent_file(
     let Some(project) = entry.project.clone() else {
         // No bucket to filter into: only the session's own spread is news.
         note_mixed_scope(
-            mixed_scope,
+            &mut notes.mixed,
             &entry.agent,
             &entry.session_id,
             &scope,
@@ -883,15 +948,24 @@ fn catalog_frames_to_intent_file(
     // the frames to one bucket, and the telemetry is noted before the filter
     // runs: fail-closed must not silence mixed evidence even when it removes
     // every frame. One verdict serves both, so the telemetry names exactly the
-    // sessions the filter could not serve whole.
+    // sessions the filter could not serve whole. A session it can serve loses
+    // only its unplaced frames, and those are noted too.
     let foreign = scope.scope_foreign_to(entry.cwd.as_deref());
     note_mixed_scope(
-        mixed_scope,
+        &mut notes.mixed,
         &entry.agent,
         &entry.session_id,
         &scope,
         foreign,
     );
+    if !foreign {
+        note_unplaced_frames(
+            &mut notes.unplaced,
+            &entry.agent,
+            &entry.session_id,
+            &frames,
+        );
+    }
     retain_frames_for_project(&mut frames, &project, entry.cwd.as_deref(), foreign);
     let timestamp = frames.last().map(|frame| frame.timestamp)?;
     let canonical_date = entry
@@ -980,7 +1054,7 @@ fn collect_live_unadmitted_files(
     seen_sessions: &BTreeSet<(String, String)>,
     files: &mut Vec<StoredChunkFile>,
     source_errors: &mut usize,
-    mixed_scope: &mut Vec<MixedScopeSession>,
+    notes: &mut ScopeNotes,
 ) -> Result<usize> {
     let user_home = crate::os_user_home().unwrap_or_else(|| aicx_home.to_path_buf());
     let cutoff_unix_ns = cutoff
@@ -1039,12 +1113,20 @@ fn collect_live_unadmitted_files(
         // filter's verdict is the telemetry's, as in the census lane.
         let foreign = scope.scope_foreign_to(entry.cwd.as_deref());
         note_mixed_scope(
-            mixed_scope,
+            &mut notes.mixed,
             &entry.agent,
             &entry.session_id,
             &scope,
             foreign,
         );
+        if !foreign {
+            note_unplaced_frames(
+                &mut notes.unplaced,
+                &entry.agent,
+                &entry.session_id,
+                &frames,
+            );
+        }
         retain_frames_for_project(
             &mut frames,
             &identity_project,
@@ -1196,7 +1278,7 @@ fn collect_intent_files(
     frame_kind: FrameKind,
     _live: bool,
     _full_history: bool,
-    _mixed_scope: &mut Vec<MixedScopeSession>,
+    _notes: &mut ScopeNotes,
 ) -> Result<(Vec<StoredChunkFile>, usize, &'static str, usize)> {
     // `loctree-consumer` is the legacy read-core profile: it deliberately
     // excludes app-only source discovery and catalog parsing — including the

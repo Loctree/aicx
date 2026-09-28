@@ -39,6 +39,10 @@ pub struct ContinuityPack {
     pub mixed_scope: Vec<crate::intents::MixedScopeSession>,
     /// Whether mixed candidates were distilled on explicit request.
     pub distilled_mixed: bool,
+    /// Sessions served without frames whose turn window could not be placed.
+    /// Those frames are never distilled, with or without `distill_mixed`,
+    /// and the pack lists what it left out.
+    pub unplaced_scope: Vec<crate::intents::UnplacedScopeSession>,
 }
 
 pub struct SourceLine {
@@ -70,6 +74,10 @@ pub struct IndexHealthLine {
 /// instead of returning an empty or braided narrative: with
 /// `RefusalReason::MixedWorkstream`, or with a plain error when the only such
 /// work sits in one foreign checkout, which that reason cannot express.
+///
+/// Frames whose turn window could not be placed are never distilled. The
+/// session they belong to is still served from its placed frames, and the pack
+/// lists what it left out. A window with nothing else to distill refuses.
 pub fn build(aicx_home: &Path, projects: &[String], hours: u64) -> Result<ContinuityPack> {
     build_with_scope(aicx_home, projects, hours, false)
 }
@@ -104,10 +112,12 @@ pub fn build_with_scope(
     let index_health = collect_index_health(aicx_home, projects, extraction.stats.live_sessions);
 
     let mixed_scope = extraction.mixed_scope;
+    let unplaced_scope = extraction.unplaced_scope;
     let mut records = extraction.records;
     if !distill_mixed {
         withhold_mixed_sessions(&mut records, &mixed_scope)?;
     }
+    refuse_unplaced_only_window(&records, &unplaced_scope)?;
 
     Ok(ContinuityPack {
         project_label: if projects.is_empty() {
@@ -122,7 +132,29 @@ pub fn build_with_scope(
         index_health,
         mixed_scope,
         distilled_mixed: distill_mixed,
+        unplaced_scope,
     })
+}
+
+/// A window whose only work sat in turn windows no checkout could claim
+/// refuses instead of rendering an empty NOW.
+///
+/// The intents filter withholds such frames before anything reaches this pack.
+/// With nothing else left, an empty pack would read as "no work in this
+/// window", when the truth is "work this pack cannot place". A pack that
+/// still holds records lists the sessions it served in part instead.
+fn refuse_unplaced_only_window(
+    records: &[IntentRecord],
+    unplaced_scope: &[intents::UnplacedScopeSession],
+) -> Result<()> {
+    if !records.is_empty() || unplaced_scope.is_empty() {
+        return Ok(());
+    }
+    let frames: usize = unplaced_scope.iter().map(|session| session.frames).sum();
+    anyhow::bail!(
+        "continuity: nothing placed to distill; {frames} frame(s) from {} session(s) were withheld because their turn window ran where no checkout could claim it",
+        unplaced_scope.len()
+    )
 }
 
 /// Scope gate (W2-R1): a mixed candidate is not distilled into one history by
@@ -375,6 +407,22 @@ pub fn render(pack: &ContinuityPack, for_inject: bool) -> String {
                 session.session_id,
                 session.cwds.join(","),
                 session.branches.join(",")
+            ));
+        }
+    }
+    if !pack.unplaced_scope.is_empty() {
+        out.push_str(&format!(
+            "- unplaced work: {} frame(s) from {} session(s) NOT in this pack (their turn window ran where no checkout could claim it)\n",
+            pack.unplaced_scope
+                .iter()
+                .map(|session| session.frames)
+                .sum::<usize>(),
+            pack.unplaced_scope.len()
+        ));
+        for session in pack.unplaced_scope.iter().take(NOW_CAP) {
+            out.push_str(&format!(
+                "  - {} · {} · frames={}\n",
+                session.agent, session.session_id, session.frames
             ));
         }
     }
@@ -765,6 +813,7 @@ mod tests {
             },
             mixed_scope: Vec::new(),
             distilled_mixed: false,
+            unplaced_scope: Vec::new(),
         };
         let rendered = render(&pack, false);
         assert!(rendered.contains("open: claude · hot-open"));
@@ -789,10 +838,69 @@ mod tests {
             },
             mixed_scope: Vec::new(),
             distilled_mixed: false,
+            unplaced_scope: Vec::new(),
         };
         let rendered = render(&pack, false);
         assert!(rendered.contains("newest_session_updated: 2026-08-13T01:48:00Z"));
         assert!(rendered.contains("warning: chunk lag (pending=631"));
         assert!(rendered.contains("aicx catalog rebuild --with-chunks"));
+    }
+
+    #[test]
+    fn continuity_now_lists_what_it_withheld_as_unplaced() {
+        let unplaced = |session_id: &str, frames: usize| crate::intents::UnplacedScopeSession {
+            agent: "codex".into(),
+            session_id: session_id.into(),
+            frames,
+        };
+        let pack = ContinuityPack {
+            project_label: "vetcoders/vibecrafted".into(),
+            hours: 24,
+            live_sessions: 0,
+            records: Vec::new(),
+            sources: Vec::new(),
+            index_health: IndexHealthLine {
+                newest_session_updated_at: None,
+                committed_at: None,
+                pending: 0,
+                sessions_newer_than_chunks: 0,
+                readiness: "ready".into(),
+                mode: "live",
+            },
+            mixed_scope: Vec::new(),
+            distilled_mixed: false,
+            unplaced_scope: vec![unplaced("s-one", 3), unplaced("s-two", 1)],
+        };
+        let rendered = render(&pack, false);
+        assert!(
+            rendered.contains("- unplaced work: 4 frame(s) from 2 session(s) NOT in this pack"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("  - codex · s-one · frames=3"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("  - codex · s-two · frames=1"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn a_window_of_only_unplaced_frames_refuses() {
+        let unplaced = [crate::intents::UnplacedScopeSession {
+            agent: "codex".into(),
+            session_id: "s-one".into(),
+            frames: 2,
+        }];
+        let error = refuse_unplaced_only_window(&[], &unplaced)
+            .expect_err("nothing placed to distill refuses");
+        assert!(
+            error
+                .to_string()
+                .contains("nothing placed to distill; 2 frame(s) from 1 session(s)"),
+            "{error}"
+        );
+        refuse_unplaced_only_window(&[], &[]).expect("an empty window with nothing withheld");
     }
 }

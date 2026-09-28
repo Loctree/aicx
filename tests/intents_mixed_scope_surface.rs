@@ -619,7 +619,143 @@ fn unresolved_foreign_window_inherits_nothing_in_any_lane() {
             "{lane} lane: unattributed evidence must not convict the session as mixed: {:?}",
             mixed_scope
         );
+        // ...yet the withheld window is reported, not silently gone. Only the
+        // agent reply sat in it: the user extraction withheld nothing.
+        let unplaced: Vec<usize> = agent_extraction
+            .unplaced_scope
+            .iter()
+            .filter(|session| session.session_id == unresolved_sid)
+            .map(|session| session.frames)
+            .collect();
+        assert_eq!(
+            unplaced,
+            [1],
+            "{lane} lane: the withheld reply must be reported: {:?}",
+            agent_extraction.unplaced_scope
+        );
+        assert!(
+            user_extraction.unplaced_scope.is_empty(),
+            "{lane} lane: no user frame was withheld: {:?}",
+            user_extraction.unplaced_scope
+        );
+        let completeness = agent_extraction
+            .stats
+            .completeness(None, agent_extraction.records.len());
+        assert!(
+            !completeness.complete && completeness.unplaced_frames == 1,
+            "{lane} lane: an answer missing a withheld frame is not complete: {completeness:?}"
+        );
+        assert!(
+            user_extraction
+                .stats
+                .completeness(None, user_extraction.records.len())
+                .complete,
+            "{lane} lane: the user answer withheld nothing"
+        );
     }
+
+    drop(_guard);
+    let _ = fs::remove_dir_all(&root);
+}
+
+fn write_unplaced_only_rollout(root: &Path, vista: &Path) -> String {
+    let session_id = "77777777-6666-5555-4444-333333333333";
+    let template = r#"{"timestamp":"2026-01-01T06:00:00Z","type":"session_meta","payload":{"id":"@SID@","cwd":"@VISTA@"}}
+{"timestamp":"2026-01-01T06:01:00Z","type":"turn_context","payload":{"cwd":"@VISTA@"}}
+{"timestamp":"2026-01-01T06:01:10Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Odpal testy.\nDecision: preserve unplaced-only opening"}]}}
+{"timestamp":"2026-01-01T06:01:20Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"u1","input":"const r = await tools.exec_command({cmd:\"npm test\",\"workdir\":\"/definitely/missing/fleet-bus\"});"}}
+"#;
+    let body = template
+        .replace("@SID@", session_id)
+        .replace("@VISTA@", &json_path(vista));
+    let path = rollout_path(
+        root,
+        &format!("rollout-2026-01-01T06-00-00-{session_id}.jsonl"),
+    );
+    write_rollout(path, &body);
+    session_id.to_string()
+}
+
+/// Finding: the project filter drops every frame whose turn window could not
+/// be placed, and nothing said so. A session cataloged in vista whose only
+/// window ran in an unresolvable checkout is not foreign to vista — it stays
+/// out of `mixed_scope` — so the answer read as complete and `continuity`
+/// rendered that window as a successful empty pack. The withheld frames are
+/// now named, the answer is not complete, and `continuity` refuses.
+#[test]
+fn a_window_of_only_unplaced_work_is_reported_and_refused() {
+    let root = unique_root("unplacedonly");
+    let _guard = HomeGuard::set(&root);
+    let vista = make_repo(&root, "vista");
+    let unplaced_sid = write_unplaced_only_rollout(&root, &vista);
+
+    let aicx_home = root.join(".aicx");
+    aicx::catalog::rebuild(&aicx_home, &root).expect("rebuild catalog over fixture home");
+    aicx::source_index::build(&aicx_home, &[], false, true, false)
+        .expect("publish CURRENT index over fixture home");
+
+    for (lane, hours) in [("census", 0), ("index", 100_000)] {
+        let extraction = Aicx::with_aicx_home(&aicx_home)
+            .extract_intents(&IntentsConfig {
+                project: "vista".to_string(),
+                hours,
+                strict: false,
+                min_confidence: None,
+                kind_filter: None,
+                frame_kind: Some(aicx::timeline::FrameKind::UserMsg),
+                live: false,
+            })
+            .expect("extract intents through public API");
+        if lane == "index" {
+            assert_eq!(
+                extraction.stats.identity_source, "index-v1",
+                "index lane must serve the finite-window run"
+            );
+        }
+        assert!(
+            extraction.records.is_empty(),
+            "{lane} lane: unplaced work must not reach vista: {:?}",
+            extraction.records
+        );
+        assert!(
+            extraction.mixed_scope.is_empty(),
+            "{lane} lane: an unplaced window does not convict the session: {:?}",
+            extraction.mixed_scope
+        );
+        let unplaced: Vec<usize> = extraction
+            .unplaced_scope
+            .iter()
+            .filter(|session| session.session_id == unplaced_sid)
+            .map(|session| session.frames)
+            .collect();
+        assert_eq!(
+            unplaced,
+            [1],
+            "{lane} lane: the withheld frame must be reported: {:?}",
+            extraction.unplaced_scope
+        );
+        let completeness = extraction.stats.completeness(None, 0);
+        assert!(
+            !completeness.complete && completeness.unplaced_frames == 1,
+            "{lane} lane: {completeness:?}"
+        );
+        assert!(
+            completeness
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("1 frame(s) withheld")),
+            "{lane} lane: {:?}",
+            completeness.warnings
+        );
+    }
+
+    let Err(error) = aicx::continuity::build(&aicx_home, &["vista".to_string()], 100_000) else {
+        panic!("a window of only unplaced work refuses");
+    };
+    assert!(
+        format!("{error:#}").contains("nothing placed to distill"),
+        "{error:#}"
+    );
 
     drop(_guard);
     let _ = fs::remove_dir_all(&root);

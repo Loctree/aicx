@@ -4999,7 +4999,7 @@ fn full_history_requests_never_take_the_index_path() {
             crate::timeline::FrameKind::UserMsg,
             false,
             true,
-            &mut Vec::new(),
+            &mut super::ScopeNotes::default(),
         )
         .is_none(),
         "full-history requests must fall through to the census"
@@ -5015,7 +5015,7 @@ fn full_history_requests_never_take_the_index_path() {
             crate::timeline::FrameKind::UserMsg,
             true,
             false,
-            &mut Vec::new(),
+            &mut super::ScopeNotes::default(),
         )
         .is_none(),
         "hot-window requests must fall through to the census"

@@ -2918,6 +2918,7 @@ mod tests {
             identity_source: crate::intents::PERSISTED_IDENTITY_SOURCE.to_string(),
             path_heuristic_records: 0,
             live_sessions: 0,
+            unplaced_frames: 0,
         };
         let completeness = stats.completeness(Some(1), 3).with_project_scope(
             "exact",

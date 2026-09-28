@@ -114,6 +114,9 @@ pub struct IntentExtractionStats {
     /// newer than the catalog census). 0 when live mode was off or nothing
     /// was fresher than the census.
     pub live_sessions: usize,
+    /// Frames the project filter withheld because the turn window they sit in
+    /// could not be placed ([`IntentExtraction::unplaced_scope`]).
+    pub unplaced_frames: usize,
 }
 
 /// Machine-readable honesty about whether an intents payload is exhaustive.
@@ -143,6 +146,11 @@ pub struct IntentsCompleteness {
     /// sources newer than the catalog census).
     #[serde(default)]
     pub live_sessions: usize,
+    /// Frames withheld because no checkout could claim the turn window they
+    /// sit in. They may belong to the requested project or to another one:
+    /// the answer cannot say, so it is not complete.
+    #[serde(default)]
+    pub unplaced_frames: usize,
     #[serde(default)]
     pub warnings: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -188,7 +196,10 @@ impl IntentExtractionStats {
         let limit_saturated = requested_limit
             .is_some_and(|limit| available_before_limit > 0 && available_before_limit >= limit);
         let candidate_cap_reached = self.dropped_candidates > 0 || self.dropped_task_events > 0;
-        let complete = self.source_errors == 0 && !candidate_cap_reached && !limit_saturated;
+        let complete = self.source_errors == 0
+            && self.unplaced_frames == 0
+            && !candidate_cap_reached
+            && !limit_saturated;
         let orphaned_buckets = self
             .matched_project_buckets
             .iter()
@@ -220,6 +231,12 @@ impl IntentExtractionStats {
                 self.live_sessions
             ));
         }
+        if self.unplaced_frames > 0 {
+            warnings.push(format!(
+                "{} frame(s) withheld: their turn window ran where no checkout could claim it",
+                self.unplaced_frames
+            ));
+        }
 
         IntentsCompleteness {
             complete,
@@ -232,6 +249,7 @@ impl IntentExtractionStats {
             orphaned_buckets,
             identity_source: self.identity_source.clone(),
             live_sessions: self.live_sessions,
+            unplaced_frames: self.unplaced_frames,
             warnings,
             requested_limit,
             available_before_limit,
@@ -251,6 +269,23 @@ pub struct IntentExtraction {
     /// `scope_status=mixed_candidate` evidence line); single-history
     /// distillers (`continuity`) use this list to refuse by default.
     pub mixed_scope: Vec<MixedScopeSession>,
+    /// Sessions the project filter served without some of their frames,
+    /// because the turn window those frames sit in could not be placed: its
+    /// workdir evidence named a directory that is unreadable, or that no
+    /// checkout on this host claims. Not a mixed candidate — one unplaceable
+    /// window does not withhold a session's placed history — but the answer is
+    /// not the whole session either, and it has to say so.
+    pub unplaced_scope: Vec<UnplacedScopeSession>,
+}
+
+/// A session with frames the project filter withheld as unplaced
+/// ([`IntentExtraction::unplaced_scope`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct UnplacedScopeSession {
+    pub agent: String,
+    pub session_id: String,
+    /// Frames of the requested kind that were withheld.
+    pub frames: usize,
 }
 
 /// One mixed-workstream candidate session, with the evidence that made it one:

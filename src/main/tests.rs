@@ -974,6 +974,7 @@ fn intents_project_resolver_exact_and_fuzzy_modes_are_separate() {
         identity_source: intents::PERSISTED_IDENTITY_SOURCE.to_string(),
         path_heuristic_records: 0,
         live_sessions: 0,
+        unplaced_frames: 0,
     };
     let complete = stats.completeness(None, 1);
     assert_eq!(
