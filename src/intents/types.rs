@@ -114,6 +114,9 @@ pub struct IntentExtractionStats {
     /// newer than the catalog census). 0 when live mode was off or nothing
     /// was fresher than the census.
     pub live_sessions: usize,
+    /// Sessions the lanes could not serve whole under the requested project
+    /// ([`IntentExtraction::mixed_scope`]).
+    pub mixed_scope_sessions: usize,
     /// Frames the project filter withheld because the turn window they sit in
     /// could not be placed ([`IntentExtraction::unplaced_scope`]).
     pub unplaced_frames: usize,
@@ -146,6 +149,12 @@ pub struct IntentsCompleteness {
     /// sources newer than the catalog census).
     #[serde(default)]
     pub live_sessions: usize,
+    /// Sessions cataloged under the requested project that were not served
+    /// whole: part or all of their work ran outside its checkout, in a proven
+    /// workdir conflict, or in a scope `.aicxignore` hides. Those frames are
+    /// withheld from every project's answer, so this one is not complete.
+    #[serde(default)]
+    pub mixed_scope_sessions: usize,
     /// Frames withheld because no checkout could claim the turn window they
     /// sit in. They may belong to the requested project or to another one:
     /// the answer cannot say, so it is not complete.
@@ -197,6 +206,7 @@ impl IntentExtractionStats {
             .is_some_and(|limit| available_before_limit > 0 && available_before_limit >= limit);
         let candidate_cap_reached = self.dropped_candidates > 0 || self.dropped_task_events > 0;
         let complete = self.source_errors == 0
+            && self.mixed_scope_sessions == 0
             && self.unplaced_frames == 0
             && !candidate_cap_reached
             && !limit_saturated;
@@ -231,12 +241,7 @@ impl IntentExtractionStats {
                 self.live_sessions
             ));
         }
-        if self.unplaced_frames > 0 {
-            warnings.push(format!(
-                "{} frame(s) withheld: their turn window ran where no checkout could claim it",
-                self.unplaced_frames
-            ));
-        }
+        warnings.extend(self.withheld_scope());
 
         IntentsCompleteness {
             complete,
@@ -249,6 +254,7 @@ impl IntentExtractionStats {
             orphaned_buckets,
             identity_source: self.identity_source.clone(),
             live_sessions: self.live_sessions,
+            mixed_scope_sessions: self.mixed_scope_sessions,
             unplaced_frames: self.unplaced_frames,
             warnings,
             requested_limit,
@@ -256,6 +262,43 @@ impl IntentExtractionStats {
             limit_saturated,
             scope: None,
         }
+    }
+
+    /// One line per kind of work the project filters withheld: sessions not
+    /// served whole, and frames whose turn window could not be placed.
+    fn withheld_scope(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        if self.mixed_scope_sessions > 0 {
+            lines.push(format!(
+                "{} session(s) not served whole: work that ran outside this project's checkout was withheld",
+                self.mixed_scope_sessions
+            ));
+        }
+        if self.unplaced_frames > 0 {
+            lines.push(format!(
+                "{} frame(s) withheld: their turn window ran where no checkout could claim it",
+                self.unplaced_frames
+            ));
+        }
+        lines
+    }
+
+    /// The withheld work as a Markdown note, for the surfaces that print no
+    /// `completeness`. An answer the filters emptied is otherwise blank, and
+    /// reads as a project with no intents at all. `None` when nothing was
+    /// withheld.
+    pub fn withheld_scope_note(&self) -> Option<String> {
+        let lines = self.withheld_scope();
+        if lines.is_empty() {
+            return None;
+        }
+        Some(
+            lines
+                .iter()
+                .map(|line| format!("> {line}\n"))
+                .collect::<String>()
+                + "\n",
+        )
     }
 }
 
@@ -265,9 +308,11 @@ pub struct IntentExtraction {
     pub stats: IntentExtractionStats,
     /// Sessions in the window whose structural scope is a mixed-workstream
     /// candidate (W2-R1): several cwds and/or branches in one conversation.
-    /// Their records are still returned (each carries a
-    /// `scope_status=mixed_candidate` evidence line); single-history
-    /// distillers (`continuity`) use this list to refuse by default.
+    /// Their frames inside the requested project are still returned, each
+    /// record carrying a `scope_status=mixed_candidate` evidence line. The
+    /// rest are withheld, so `completeness` counts these sessions and is not
+    /// complete. Single-history distillers (`continuity`) use this list to
+    /// refuse by default.
     pub mixed_scope: Vec<MixedScopeSession>,
     /// Sessions the project filter served without some of their frames,
     /// because the turn window those frames sit in could not be placed: its

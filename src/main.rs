@@ -5287,6 +5287,9 @@ fn run_intents(
             }
             let md = intents::format_intents_markdown(&records);
             print!("{}", md);
+            if let Some(note) = extraction.stats.withheld_scope_note() {
+                print!("{note}");
+            }
         }
     }
 

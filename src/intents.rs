@@ -379,6 +379,7 @@ fn extract_intents_from_files_with_stats(
         identity_source,
         path_heuristic_records,
         live_sessions,
+        mixed_scope_sessions: mixed_scope.len(),
         unplaced_frames: unplaced_scope.iter().map(|session| session.frames).sum(),
     };
 
@@ -466,6 +467,7 @@ pub(crate) fn extract_intents_from_root_at_for_projects_with_stats(
         identity_source,
         path_heuristic_records,
         live_sessions,
+        mixed_scope_sessions: mixed_scope.len(),
         unplaced_frames: unplaced_scope.iter().map(|session| session.frames).sum(),
     };
 

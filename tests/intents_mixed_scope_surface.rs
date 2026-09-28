@@ -1310,6 +1310,33 @@ fn a_session_rescoped_wholesale_to_one_foreign_checkout_is_reported() {
                 session.cwds
             );
         }
+        // Finding: the CLI and MCP payloads carry `completeness`, not
+        // `mixed_scope`, so this empty answer said `complete: true` and its
+        // Markdown said nothing at all. Every frame kind's answer now says
+        // what it withheld, in JSON and in Markdown.
+        for extraction in &extractions {
+            let completeness = extraction
+                .stats
+                .completeness(None, extraction.records.len());
+            assert!(
+                !completeness.complete && completeness.mixed_scope_sessions == 1,
+                "{lane} lane: an answer that withheld a session is not complete: {completeness:?}"
+            );
+            assert!(
+                completeness
+                    .warnings
+                    .iter()
+                    .any(|warning| warning.contains("1 session(s) not served whole")),
+                "{lane} lane: {completeness:?}"
+            );
+            let json = serde_json::to_value(&completeness).expect("serialize completeness");
+            assert_eq!(json["mixed_scope_sessions"], 1, "{lane} lane: {json}");
+            let note = extraction
+                .stats
+                .withheld_scope_note()
+                .expect("a Markdown answer names what it withheld");
+            assert!(note.contains("not served whole"), "{lane} lane: {note}");
+        }
     }
 
     // A window holding only that work refuses instead of rendering empty.
