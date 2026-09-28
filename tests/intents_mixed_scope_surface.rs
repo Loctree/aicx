@@ -1177,8 +1177,9 @@ fn a_session_rescoped_wholesale_to_one_foreign_checkout_is_reported() {
     }
 
     // A window holding only that work refuses instead of rendering empty.
-    let error = aicx::continuity::build(&aicx_home, &["vista".to_string()], 100_000)
-        .expect_err("a window of only foreign-checkout work refuses");
+    let Err(error) = aicx::continuity::build(&aicx_home, &["vista".to_string()], 100_000) else {
+        panic!("a window of only foreign-checkout work refuses");
+    };
     assert!(
         format!("{error:#}").contains("ran outside its cataloged checkout"),
         "{error:#}"
