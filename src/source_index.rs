@@ -3751,11 +3751,19 @@ mod tests {
             let entry = bounded_entry(&source_path);
             let allow = crate::source_path::SourceAllowlist::for_operator(&root, &root);
             let resolved = allow.resolve_file(&source_path).expect("resolve rollout");
-            let frames = parse_large_codex_signal(&entry, &resolved, &allow, None)
-                .expect("bounded parse")
-                .frames;
+            let (parsed, coverage) =
+                parse_large_codex_signal_checked(&entry, &resolved, &allow, None)
+                    .expect("bounded parse");
             let _ = fs::remove_dir_all(&root);
-            frames
+            // Failing a window closed is a verdict about attribution, not
+            // about the projection's stability: the drained record is counted
+            // and the feed stays cacheable.
+            assert_eq!(
+                coverage,
+                ConversationCoverage::BoundedProjection { skipped_records: 1 },
+                "{label}"
+            );
+            parsed.frames
         };
 
         let call_frames = oversized_window(
@@ -3802,7 +3810,9 @@ mod tests {
 
         // Pathological writer: nothing identifiable survives the cap. The
         // record could have been a tool call, so the window cannot claim the
-        // baseline it did not verify.
+        // baseline it did not verify. Not even its timestamp survives, so the
+        // carrier frame falls back to the wall clock — which still leaves the
+        // projection cacheable, because carrier frames are never served.
         let opaque_frames = oversized_window(
             "oversized-opaque",
             format!(r#"{{"payload":{{"arguments":"{filler}"}}}}"#),
