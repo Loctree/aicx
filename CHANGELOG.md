@@ -3,6 +3,13 @@
 All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+## [0.15.0] - 2026-09-28
+
+### Added
+
+- A bare first start opens the dashboard onboarding survey. Intent phrases are written to `intent_phrases.toml`. On macOS the same path installs the LaunchAgent through `tools/install-mcp-service.sh`.
+- `aicx serve --transport http` is one listener: humans open `/`, agents use `/mcp`. Non-loopback binds keep bearer auth. The passphrase form stays off non-loopback binds, including `0.0.0.0`.
+
 ## [Unreleased]
 
 ### Fixed

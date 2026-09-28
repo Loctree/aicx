@@ -19,7 +19,7 @@ agent source roots  →  catalog (identity)  →  extracts?  →  index CURRENT 
 | Sources | disk / rsync | file missing or path wrong on this host |
 | Catalog | `aicx catalog status` / `rebuild` | unadmitted sessions, fingerprint drift, missing_source |
 | Index | `aicx index status` / `index` | pending chunks, stale_index vs catalog snapshot |
-| Serve | `aicx serve --transport http` | Bearer auth + Host allowlist |
+| Serve | `aicx serve --transport http` | One listener: dashboard at `/`, MCP at `/mcp`. Bearer auth off loopback; loopback may be open |
 
 `catalog status` and `index status` are **orthogonal**. Catalog fresh with
 `index readiness=stale_index` means: identity is current, search lag remains.
