@@ -262,12 +262,12 @@ pub fn release_notes_body(changelog: &str, version: &str) -> String {
 }
 
 pub fn current_release_notes() -> String {
-    if let Some(path) = std::env::var_os("AICX_RELEASE_NOTES") {
-        if let Ok(text) = std::fs::read_to_string(path) {
-            let trimmed = text.trim();
-            if !trimmed.is_empty() {
-                return trimmed.to_string();
-            }
+    if let Some(path) = std::env::var_os("AICX_RELEASE_NOTES")
+        && let Ok(text) = std::fs::read_to_string(path)
+    {
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
         }
     }
     release_notes_body(CHANGELOG, package_version())
@@ -334,10 +334,10 @@ pub fn maybe_first_start() -> Result<FirstStart> {
         }
     };
     let gui = gui_available();
-    if !options.dry_run {
-        if let Err(err) = ensure_loopback_server() {
-            write_service_error(&home, Some(&err.to_string()));
-        }
+    if !options.dry_run
+        && let Err(err) = ensure_loopback_server()
+    {
+        write_service_error(&home, Some(&err.to_string()));
     }
     println!("{DASHBOARD_URL}");
     if gui && !options.dry_run {
