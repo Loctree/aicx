@@ -764,6 +764,8 @@ impl<'a> Assembly<'a> {
                     let end = model.turns.len() as u64 - 1;
                     (segment.start_turn <= end).then_some(Segment {
                         segment_id: id as u32,
+                        scope_root: None,
+                        scope_workdirs: Vec::new(),
                         cwd: Known::unknown(),
                         branch: Known::unknown(),
                         started_at: segment.started_at,
@@ -773,6 +775,8 @@ impl<'a> Assembly<'a> {
                             end,
                         },
                         scope_status: crate::engine::ScopeStatus::from_evidence(None, None),
+                        // Only the Codex adapter observes explicit tool-call workdirs.
+                        scope_conflict: false,
                     })
                 })
                 .collect();

@@ -18,6 +18,7 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const CODEX_SESSION_ID: &str = "019c578c-source-change-marble-l1-0001";
+const LAYOUT_SESSION_ID: &str = "019c578c-layout-identity-marble-l3-0001";
 const INITIAL_TOKEN: &str = "SOURCE_CHANGE_INITIAL_TOKEN_marble_a1b2c3";
 const APPENDED_TOKEN: &str = "AUDIT_CHANGED_SESSION_ONLY_7f4d9c31_marble_l1";
 const FOLDED_FIXTURE: &str =
@@ -121,6 +122,72 @@ fn seed_codex_session(home: &Path) -> PathBuf {
     .join("\n");
     write_file(&path, &format!("{body}\n"));
     path
+}
+
+/// One Codex turn whose tool call ran in a vendored directory of the parent
+/// checkout. `vendor/fleet-bus` exists but is not a repository, so the
+/// window's verdict absorbs the workdir into the parent and no frame spells it.
+fn seed_vendored_workdir_session(home: &Path, parent: &Path, vendored: &Path) {
+    let path = home
+        .join(".codex")
+        .join("sessions")
+        .join("2026")
+        .join("07")
+        .join("24")
+        .join(format!("rollout-{LAYOUT_SESSION_ID}.jsonl"));
+    let parent = parent.display().to_string();
+    let tool_input = format!(
+        "const r = await tools.exec_command({{cmd:\"ls\",\"workdir\":{}}});",
+        json!(vendored.display().to_string())
+    );
+    let body = [
+        json!({
+            "timestamp": "2026-07-24T10:00:00Z",
+            "type": "session_meta",
+            "payload": {
+                "id": LAYOUT_SESSION_ID,
+                "timestamp": "2026-07-24T10:00:00Z",
+                "cwd": parent,
+                "model": "gpt-test"
+            }
+        }),
+        json!({
+            "timestamp": "2026-07-24T10:00:01Z",
+            "type": "turn_context",
+            "payload": { "cwd": parent }
+        }),
+        json!({
+            "timestamp": "2026-07-24T10:00:02Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "Patch the vendored bus before the release." }]
+            }
+        }),
+        json!({
+            "timestamp": "2026-07-24T10:00:03Z",
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call",
+                "name": "exec",
+                "call_id": "c1",
+                "input": tool_input
+            }
+        }),
+        json!({
+            "timestamp": "2026-07-24T10:00:04Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{ "type": "output_text", "text": "Vendored bus patched and verified." }]
+            }
+        }),
+    ]
+    .map(|record| record.to_string())
+    .join("\n");
+    write_file(&path, &format!("{body}\n"));
 }
 
 fn append_codex_user_frame(path: &Path, token: &str) {
@@ -350,6 +417,76 @@ fn source_append_without_catalog_rebuild_still_indexes_token() {
         "live-only-ok after_parsed={} noop_unchanged=true token_hit=true",
         rep2["sources_parsed"]
     );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// Audit P1-01/02 (PR #86): scope verdicts read the repository layout on this
+/// host, which no source byte, catalog row or privacy rule records. The
+/// generation short-circuit answered `unchanged` without ever reaching the
+/// per-session layout gate, and that gate hashed only the cwds left after
+/// scope reduction. A nested checkout appearing under a recorded workdir, or a
+/// `.gitmodules` edit, must re-parse the session although the rollout never
+/// changed — and the re-parsed layout must then be current again.
+#[test]
+fn repository_layout_change_refuses_the_unchanged_short_circuit() {
+    let root = unique_root("layout");
+    let home = root.join("home");
+    let parent = root.join("work").join("vista");
+    let vendored = parent.join("vendor").join("fleet-bus");
+    fs::create_dir_all(parent.join(".git")).expect("parent checkout");
+    fs::create_dir_all(&vendored).expect("vendored dir");
+    seed_vendored_workdir_session(&home, &parent, &vendored);
+
+    let catalog = run_aicx(&home, &["catalog", "rebuild", "--json"]);
+    assert_success(&catalog, "catalog rebuild");
+    let first = run_aicx(
+        &home,
+        &["index", "--json", "--full-rescan", "--cache-extracts"],
+    );
+    assert_success(&first, "index initial publish");
+    assert_eq!(parse_json(&first)["sources_parsed"].as_u64(), Some(1));
+
+    let index = |label: &str| {
+        let output = run_aicx(&home, &["index", "--json", "--cache-extracts"]);
+        assert_success(&output, label);
+        parse_json(&output)
+    };
+    let noop = index("index no-op");
+    assert_eq!(noop["unchanged"].as_bool(), Some(true), "no-op: {noop}");
+
+    // A nested checkout appears under the absorbed workdir.
+    fs::create_dir_all(vendored.join(".git")).expect("nested checkout");
+    let nested = index("index after nested checkout");
+    assert_eq!(
+        nested["unchanged"].as_bool(),
+        Some(false),
+        "a new nested checkout must not report unchanged: {nested}"
+    );
+    assert_eq!(
+        nested["sources_parsed"].as_u64(),
+        Some(1),
+        "the session whose verdict it moved must re-parse: {nested}"
+    );
+    let settled = index("index no-op after nested checkout");
+    assert_eq!(
+        settled["unchanged"].as_bool(),
+        Some(true),
+        "the re-parsed layout is current again: {settled}"
+    );
+
+    // A submodule declaration edit, with the rollout still untouched.
+    write_file(
+        &parent.join(".gitmodules"),
+        "[submodule \"fleet-bus\"]\n\tpath = vendor/fleet-bus\n",
+    );
+    let declared = index("index after .gitmodules edit");
+    assert_eq!(
+        declared["unchanged"].as_bool(),
+        Some(false),
+        "a .gitmodules edit must not report unchanged: {declared}"
+    );
+    assert_eq!(declared["sources_parsed"].as_u64(), Some(1), "{declared}");
 
     let _ = fs::remove_dir_all(&root);
 }

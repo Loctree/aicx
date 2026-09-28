@@ -13,7 +13,7 @@
 //! evidence locator (`segment/turn`), because a claim without evidence is
 //! narration, not handoff.
 
-use aicx_parser::engine::{Known, ScopeStatus, SessionModel};
+use aicx_parser::engine::{Known, ScopeStatus, Segment, SessionModel};
 
 use super::distill::{GateOutcome, SegmentDistillate};
 
@@ -42,6 +42,33 @@ fn known_or<'a>(value: &'a Known<String>, fallback: &'a str) -> &'a str {
     }
 }
 
+/// Where a segment worked, as a reader should see it: the repository its
+/// workdirs resolved to when that is known, the recorded cwd otherwise, and an
+/// explicit marker when the workdirs proved several checkouts or could not be
+/// placed at all — the recorded cwd alone would present such a span as
+/// ordinary baseline work, which an `unattributed` span must never inherit.
+fn segment_place(segment: &Segment) -> Option<String> {
+    let place = segment
+        .scope_root
+        .as_deref()
+        .or(match &segment.cwd {
+            Known::Value(cwd) => Some(cwd.as_str()),
+            Known::Unknown(_) => None,
+        })
+        .map(str::to_owned);
+    let marker = if segment.scope_conflict {
+        "scope conflict"
+    } else if segment.scope_status == ScopeStatus::Unattributed {
+        "unattributed"
+    } else {
+        return place;
+    };
+    Some(match place {
+        Some(place) => format!("{place} ({marker})"),
+        None => format!("({marker})"),
+    })
+}
+
 fn render_header(out: &mut String, model: &SessionModel, distillates: &[SegmentDistillate]) {
     let agent = model.provenance.agent.as_str();
     out.push_str(&format!("# BRIEF {} · {agent}", model.session_id));
@@ -68,8 +95,13 @@ fn render_header(out: &mut String, model: &SessionModel, distillates: &[SegmentD
                 .iter()
                 .find(|segment| segment.segment_id == distillate.segment_id);
             let (cwd, branch) = segment
-                .map(|s| (known_or(&s.cwd, "?"), known_or(&s.branch, "?")))
-                .unwrap_or(("?", "?"));
+                .map(|s| {
+                    (
+                        segment_place(s).unwrap_or_else(|| "?".to_owned()),
+                        known_or(&s.branch, "?"),
+                    )
+                })
+                .unwrap_or_else(|| ("?".to_owned(), "?"));
             out.push_str(&format!(
                 "| {} | {} | {} | {:?} |\n",
                 distillate.segment_id, cwd, branch, distillate.outcome.agent_outcome
@@ -78,16 +110,30 @@ fn render_header(out: &mut String, model: &SessionModel, distillates: &[SegmentD
     }
 }
 
-/// More than one distinct known cwd across segments = several workstreams,
-/// even when each individual segment is internally drift-free.
+/// More than one repository across segments = several workstreams, even when
+/// each individual segment is internally drift-free.
+///
+/// A segment's resolved `scope_root` counts next to its recorded cwd, the same
+/// evidence [`SessionModel::scope_status`] reads. A session launched in one
+/// checkout whose workdirs resolved one span to another checkout is one
+/// segment with a drift-free status, and without this its brief would head
+/// that span with the other repository while claiming a single workstream.
+///
+/// Repositories are counted, not spellings ([`repository_count`], as the scope
+/// report counts them). A `scope_root` is a checkout's root, and the recorded
+/// cwd may be a directory inside that same checkout, so counting both strings
+/// labelled one repository as several workstreams.
+///
+/// [`repository_count`]: aicx_parser::engine::repository_count
 fn multi_workstream(model: &SessionModel) -> bool {
-    let mut cwds = std::collections::BTreeSet::new();
-    for segment in &model.segments {
-        if let Known::Value(cwd) = &segment.cwd {
-            cwds.insert(cwd.as_str());
-        }
-    }
-    cwds.len() > 1
+    let places = model.segments.iter().flat_map(|segment| {
+        let recorded = match &segment.cwd {
+            Known::Value(cwd) => Some(cwd.as_str()),
+            Known::Unknown(_) => None,
+        };
+        recorded.into_iter().chain(segment.scope_root.as_deref())
+    });
+    aicx_parser::engine::repository_count(places) > 1
 }
 
 fn render_segment(out: &mut String, model: &SessionModel, distillate: &SegmentDistillate) {
@@ -97,8 +143,8 @@ fn render_segment(out: &mut String, model: &SessionModel, distillate: &SegmentDi
         .find(|segment| segment.segment_id == distillate.segment_id);
     out.push_str(&format!("\n## Segment {}", distillate.segment_id));
     if let Some(segment) = segment {
-        if let Known::Value(cwd) = &segment.cwd {
-            out.push_str(&format!(" · {cwd}"));
+        if let Some(place) = segment_place(segment) {
+            out.push_str(&format!(" · {place}"));
         }
         if let Known::Value(branch) = &segment.branch {
             out.push_str(&format!(" @ {branch}"));
@@ -249,6 +295,9 @@ mod tests {
             ended_at: Known::unknown(),
             turn_range: TurnRange { start: 0, end: 0 },
             scope_status: ScopeStatus::NoDriftObserved,
+            scope_conflict: false,
+            scope_root: None,
+            scope_workdirs: Vec::new(),
         }
     }
 
@@ -308,5 +357,92 @@ mod tests {
         assert!(brief.contains("Multi-workstream session"));
         assert!(brief.contains("## Segment 0 · /repo-a"));
         assert!(brief.contains("## Segment 1 · /repo-b"));
+    }
+
+    /// A conflict segment keeps its recorded cwd in the model, but the brief
+    /// must not present it as ordinary baseline work; a re-scoped segment
+    /// shows the repository its workdirs resolved to.
+    ///
+    /// Finding: an `unattributed` segment has neither a conflict nor a
+    /// `scope_root`, so it was headed with its recorded cwd as plain baseline
+    /// work — the one attribution the model says it must not inherit.
+    #[test]
+    fn scope_evidence_shapes_the_segment_heading() {
+        let mut conflicted = segment(0, "/sessions/vista");
+        conflicted.scope_conflict = true;
+        conflicted.scope_status = ScopeStatus::MixedCandidate;
+        let mut rescoped = segment(1, "/sessions/vista");
+        rescoped.scope_root = Some("/repo/fleet-bus".to_owned());
+        let mut unplaced = segment(2, "/sessions/vista");
+        unplaced.scope_status = ScopeStatus::Unattributed;
+        let model = minimal_model(vec![conflicted, rescoped, unplaced]);
+        let brief = render_brief(
+            &model,
+            &[distillate_for(0), distillate_for(1), distillate_for(2)],
+        );
+        assert!(
+            brief.contains("## Segment 0 · /sessions/vista (scope conflict)"),
+            "{brief}"
+        );
+        assert!(brief.contains("## Segment 1 · /repo/fleet-bus"), "{brief}");
+        assert!(
+            brief.contains("| 0 | /sessions/vista (scope conflict) | main |"),
+            "{brief}"
+        );
+        assert!(
+            brief.contains("## Segment 2 · /sessions/vista (unattributed)"),
+            "{brief}"
+        );
+        assert!(
+            brief.contains("| 2 | /sessions/vista (unattributed) | main |"),
+            "{brief}"
+        );
+    }
+
+    /// One segment, launched in one checkout, whose workdirs resolved it to
+    /// another: the session is `mixed_candidate`, and the brief must say so
+    /// rather than head the span with the other repository as its only work.
+    #[test]
+    fn a_rescoped_single_segment_is_a_multi_workstream_brief() {
+        let mut rescoped = segment(0, "/sessions/vista");
+        rescoped.scope_root = Some("/repo/fleet-bus".to_owned());
+        let model = minimal_model(vec![rescoped]);
+        assert_eq!(model.scope_status(), ScopeStatus::MixedCandidate);
+        let brief = render_brief(&model, &[distillate_for(0)]);
+        assert!(
+            brief.contains("**Multi-workstream session** — 1 segment(s), mixed_candidate"),
+            "{brief}"
+        );
+        assert!(brief.contains("| 0 | /repo/fleet-bus | main |"), "{brief}");
+
+        let mut same_place = segment(0, "/repo/fleet-bus");
+        same_place.scope_root = Some("/repo/fleet-bus".to_owned());
+        let brief = render_brief(&minimal_model(vec![same_place]), &[distillate_for(0)]);
+        assert!(!brief.contains("Multi-workstream"), "{brief}");
+    }
+
+    /// Finding: the brief counted path spellings. A `scope_root` is a
+    /// checkout's root while the recorded cwd may sit inside that checkout, so
+    /// one repository was headed as several workstreams.
+    #[test]
+    fn a_checkout_root_and_a_directory_inside_it_are_one_workstream() {
+        let root =
+            std::env::temp_dir().join(format!("aicx-brief-one-repository-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".git")).expect("scratch checkout");
+        std::fs::create_dir_all(root.join("subdir")).expect("scratch subdir");
+        // Canonical spelling on both sides: a path gone from this disk cannot
+        // be canonicalized, so it is compared as written (`/var` is
+        // `/private/var` on macOS).
+        let canonical = std::fs::canonicalize(&root).expect("canonical checkout");
+        let checkout = canonical.to_string_lossy().into_owned();
+        // The recorded cwd exists, and one where it is gone from this disk.
+        for cwd in [canonical.join("subdir"), canonical.join("gone")] {
+            let mut inside = segment(0, &cwd.to_string_lossy());
+            inside.scope_root = Some(checkout.clone());
+            let brief = render_brief(&minimal_model(vec![inside]), &[distillate_for(0)]);
+            assert!(!brief.contains("Multi-workstream"), "{brief}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

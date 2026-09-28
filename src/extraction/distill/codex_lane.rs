@@ -361,6 +361,9 @@ mod tests {
                 ended_at: Known::unknown(),
                 turn_range: TurnRange { start: 0, end: 0 },
                 scope_status: ScopeStatus::Unknown,
+                scope_conflict: false,
+                scope_root: None,
+                scope_workdirs: Vec::new(),
             })
             .collect();
         model.turns = turns;

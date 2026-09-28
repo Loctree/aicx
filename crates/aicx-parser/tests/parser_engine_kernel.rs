@@ -148,6 +148,38 @@ fn canonical_serialization_is_stable_and_content_bounded() {
 }
 
 #[test]
+fn host_resolved_scope_root_cannot_move_the_canonical_fingerprint() {
+    // Repository identity is resolved against the LOCAL filesystem: symlink
+    // spelling, which checkouts exist, what `.gitmodules` says. Two machines
+    // reading the same rollout bytes legitimately resolve it differently.
+    // The canonical projection is the one thing that must not notice, or the
+    // same source would carry two fingerprints across the fleet.
+    let recorded = validated_fingerprint(None);
+    for resolved in [
+        "/Users/agent/checkout",
+        "/private/var/tmp/checkout",
+        "/var/tmp/checkout",
+    ] {
+        assert_eq!(
+            validated_fingerprint(Some(resolved.to_owned())),
+            recorded,
+            "scope_root {resolved} leaked into the canonical fingerprint"
+        );
+    }
+}
+
+fn validated_fingerprint(scope_root: Option<String>) -> String {
+    let mut model = model_with_text("scope-root determinism");
+    model.segments[0].scope_root = scope_root;
+    let session =
+        match validate_parse(UnvalidatedParse::from_model(model)).expect("valid synthetic model") {
+            ValidatedParse::Session(session) => *session,
+            ValidatedParse::Fatal(_) => panic!("synthetic model unexpectedly fatal"),
+        };
+    canonical_fingerprint(&session).expect("canonical fingerprint")
+}
+
+#[test]
 fn reader_enforces_validated_open_and_max_unit_size() {
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)

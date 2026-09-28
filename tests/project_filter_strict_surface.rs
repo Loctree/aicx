@@ -280,6 +280,7 @@ fn seed_codex_session_with_catalog_identity(
         title: Some(format!("historical identity marker {marker}")),
         machine: Some("strict-filter-fixture".to_string()),
         logical_session_id: None,
+        session_kind: None,
     };
     fs::write(
         aicx::catalog::sessions_path_for(&aicx_home),
