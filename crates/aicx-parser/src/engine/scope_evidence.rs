@@ -154,10 +154,14 @@ pub fn tool_call_workdirs(payload: &Value) -> Vec<WorkdirEvidence> {
 /// escapes the character after it for that search, and only an escaped
 /// backslash or an escaped delimiter is unescaped in the value; every other
 /// backslash stays, because a Windows workdir is `C:\repo\crate` and reading
-/// `\r` as an escape would corrupt it. A literal that never closes is
-/// opaque: whatever it names was cut off. So is a literal that is only the
-/// first operand of an expression — `"/repos/vista" + "-private"` — because
-/// the value continues past its closing quote ([`value_ends_at`]).
+/// `\r` as an escape would corrupt it. An escape that can spell a dot, a
+/// separator or a drive colon is the exception: JavaScript runs
+/// `"/repo/\x2e\x2e/foreign"` in `/foreign`, and read as written it sits
+/// beneath `/repo`, so such a literal is opaque ([`escape_masks_path`]). A
+/// literal that never closes is opaque too: whatever it names was cut off. So
+/// is a literal that is only the first operand of an expression —
+/// `"/repos/vista" + "-private"` — because the value continues past its
+/// closing quote ([`value_ends_at`]).
 ///
 /// A value that is not a literal at all — `workdir: targetDir`,
 /// `workdir: path.join(root, "pkg")`, `workdir: [root, repo].join('/')`,
@@ -260,14 +264,14 @@ fn workdirs_in_literal(input: &str) -> Vec<WorkdirEvidence> {
             }
         };
         match literal_body(&value[1..], delimiter) {
-            Some((body, _)) if delimiter == '`' && body.contains("${") => {
+            Some(literal) if delimiter == '`' && literal.body.contains("${") => {
                 found.push(WorkdirEvidence::Opaque);
             }
-            Some((_, end)) if !value_ends_at(&value[1 + end..]) => {
+            Some(literal) if literal.masked || !value_ends_at(&value[1 + literal.end..]) => {
                 found.push(WorkdirEvidence::Opaque);
             }
-            Some((body, _)) => {
-                let body = body.trim();
+            Some(literal) => {
+                let body = literal.body.trim();
                 if !body.is_empty() {
                     found.push(WorkdirEvidence::Explicit(body.to_string()));
                 }
@@ -334,16 +338,29 @@ fn opens_property(before: &str) -> bool {
     }
 }
 
+/// A string literal read up to its closing delimiter ([`literal_body`]).
+struct Literal {
+    body: String,
+    /// Byte offset in the scanned text just past the closing delimiter.
+    end: usize,
+    /// An escape in it can spell path structure its body does not show.
+    masked: bool,
+}
+
 /// The body of a string literal that `delimiter` opened, up to the matching
-/// unescaped `delimiter`, and the byte offset in `rest` just past that
-/// delimiter; `None` when it never closes. Only `\\` and an escaped delimiter
-/// are unescaped (see [`workdirs_in_literal`]).
-fn literal_body(rest: &str, delimiter: char) -> Option<(String, usize)> {
+/// unescaped `delimiter`; `None` when it never closes. Only `\\` and an
+/// escaped delimiter are unescaped (see [`workdirs_in_literal`]).
+fn literal_body(rest: &str, delimiter: char) -> Option<Literal> {
     let mut body = String::new();
+    let mut masked = false;
     let mut chars = rest.char_indices();
     while let Some((at, c)) = chars.next() {
         if c == delimiter {
-            return Some((body, at + c.len_utf8()));
+            return Some(Literal {
+                body,
+                end: at + c.len_utf8(),
+                masked,
+            });
         }
         if c != '\\' {
             body.push(c);
@@ -351,7 +368,8 @@ fn literal_body(rest: &str, delimiter: char) -> Option<(String, usize)> {
         }
         match chars.next() {
             Some((_, escaped)) if escaped == '\\' || escaped == delimiter => body.push(escaped),
-            Some((_, other)) => {
+            Some((at, other)) => {
+                masked |= escape_masks_path(other, &rest[at + other.len_utf8()..]);
                 body.push('\\');
                 body.push(other);
             }
@@ -359,6 +377,31 @@ fn literal_body(rest: &str, delimiter: char) -> Option<(String, usize)> {
         }
     }
     None
+}
+
+/// Can the escape `\` + `escaped`, with `after` following it, spell path
+/// structure that its written form does not show?
+///
+/// A backslash is kept as written so that a Windows workdir survives
+/// ([`workdirs_in_literal`]), and that reading is sound only while the escape
+/// cannot stand for a dot, a separator or a drive colon. A hex, Unicode or
+/// octal escape can spell any character — `\x2e`, `\u002f` and `\56` are a
+/// dot, a slash and a dot — while `\.`, `\/` and `\:` are those characters,
+/// and a backslash before a line break removes both, joining what surrounds
+/// it. A `\x` or `\u` that is no valid escape is a syntax error, so nothing
+/// ran with it, and `C:\xampp` or `C:\users` still read as written.
+fn escape_masks_path(escaped: char, after: &str) -> bool {
+    let hex = |len: usize| {
+        after
+            .get(..len)
+            .is_some_and(|digits| digits.chars().all(|c| c.is_ascii_hexdigit()))
+    };
+    match escaped {
+        'x' => hex(2),
+        'u' => after.starts_with('{') || hex(4),
+        '0'..='9' | '.' | '/' | ':' | '\n' | '\r' | '\u{2028}' | '\u{2029}' => true,
+        _ => false,
+    }
 }
 
 /// Does a property value end right after its closing quote?
@@ -2302,6 +2345,53 @@ mod tests {
             "tools.exec_command({cmd: \"ls\", `workdir`: \"/repo/foreign\"})",
         ] {
             assert!(tool_call_workdirs(&js_input(input)).is_empty(), "{input}");
+        }
+    }
+
+    /// Finding: the scanner keeps backslashes as written, so an escape that
+    /// JavaScript decodes into path structure was read as its spelling.
+    /// `"/repo/\x2e\x2e/foreign"` runs in `/foreign`, but read as written it
+    /// sat beneath `/repo` and kept the call on the baseline.
+    #[test]
+    fn an_escape_that_can_spell_path_structure_is_opaque() {
+        for input in [
+            r#"tools.exec_command({cmd: "ls", workdir: "/repo/\x2e\x2e/foreign"})"#,
+            r#"tools.exec_command({cmd: "ls", workdir: "/repo/\u002e\u002e/foreign"})"#,
+            r#"tools.exec_command({cmd: "ls", workdir: "/repo/\u{2e}\u{2e}/foreign"})"#,
+            r#"tools.exec_command({cmd: "ls", workdir: "/repo/\56\56/foreign"})"#,
+            r#"tools.exec_command({cmd: "ls", workdir: '/repo/\.\./foreign'})"#,
+            r#"tools.exec_command({cmd: "ls", workdir: "\x2fforeign"})"#,
+            r#"tools.exec_command({cmd: "ls", workdir: "repo\/..\/..\/foreign"})"#,
+            r#"tools.exec_command({cmd: "ls", workdir: "C\:/foreign"})"#,
+            "tools.exec_command({cmd: \"ls\", workdir: `/repo/.\\\n./foreign`})",
+        ] {
+            assert_eq!(
+                tool_call_workdirs(&js_input(input)),
+                vec![WorkdirEvidence::Opaque],
+                "{input}"
+            );
+        }
+        // A Windows workdir written without escaping keeps its backslashes,
+        // and so does a `\x` or `\u` that is no valid escape.
+        for (input, workdir) in [
+            (
+                r#"tools.exec_command({workdir: "C:\repo\crate"})"#,
+                r"C:\repo\crate",
+            ),
+            (
+                r#"tools.exec_command({workdir: "C:\users\dev\xampp"})"#,
+                r"C:\users\dev\xampp",
+            ),
+            (
+                r#"tools.exec_command({workdir: "C:\\repo\\crate"})"#,
+                r"C:\repo\crate",
+            ),
+        ] {
+            assert_eq!(
+                tool_call_workdirs(&js_input(input)),
+                explicit(&[workdir]),
+                "{input}"
+            );
         }
     }
 
