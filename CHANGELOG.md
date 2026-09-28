@@ -27,7 +27,11 @@ guardian stays out of the mixed-scope telemetry too, so it cannot make
 `continuity` refuse, and the header probe reads as far as the catalog does
 (128 records, 256 KiB in total). A rollout can carry more than one
 `session_meta` record; the probe reads past one that names no provenance
-instead of stopping at it.
+instead of stopping at it. The 256 KiB counts the records the probe reads, not
+an over-cap one it drains, so a record larger than the whole header no longer
+hides the `session_meta` after it. A cached extract is not reused when the
+catalog's `session_kind` differs from the one stored at parse, so a rebuild
+that names a session guardian takes effect over unchanged source bytes.
 
 Repository identity is canonical and existence-checked: a workdir that is not
 there resolves to nothing (an ancestor's `.git` says nothing about a directory
@@ -128,7 +132,11 @@ The evidence readers take their input at its word. A `workdir` literal runs to
 the quote that opened it, so `"/Users/O'Brien/repo"` is no longer cut to
 `/Users/O`; a JavaScript template literal is read like any other string, and
 one that interpolates — or any literal that never closes — is unreadable
-evidence rather than a fabricated path. A truncated record's `type` counts as
+evidence rather than a fabricated path. So is a literal with an escape that can
+spell a dot, a separator or a drive colon (`\x2e`, `\u002f`, `\56`, `\.`,
+`\/`, `\:`, or a backslash before a line break): `"/repo/\x2e\x2e/foreign"`
+runs in `/foreign`, and read as written it sat beneath `/repo`. Other
+backslashes stay as written, so `C:\repo\crate` is still read. A truncated record's `type` counts as
 read only when its value survived the cap, so an envelope plus a payload type
 cut mid-value no longer passes as two readable discriminators. Where lexical
 containment is the only evidence, a Windows spelling is compared the way

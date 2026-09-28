@@ -268,7 +268,10 @@ Comments are skipped wherever JavaScript allows them, before the key as well
 as before the value, so `{cmd, /* note */ workdir: targetDir}` is read. A readable value runs to the quote that opened it, in any of the three
 quote styles, so `"/Users/O'Brien/repo"` is one path, and it counts only as
 the whole value: `"/repos/vista" + "-private"` is an expression and
-unreadable. Both Codex readers —
+unreadable. Backslashes stay as written, so `C:\repo\crate` is read, except
+that an escape able to spell a dot, a separator or a drive colon (`\x2e`,
+`\u002f`, `\56`, `\.`, `\/`, `\:`, or a backslash before a line break) makes
+the literal unreadable: `"/repo/\x2e\x2e/foreign"` runs in `/foreign`. Both Codex readers —
 the full adapter and the bounded reader for over-cap rollouts — scope the
 same call types, and both treat a `turn_context` without a cwd as a turn
 whose directory is unknown: it is unattributed unless its tool calls place it,
@@ -390,7 +393,12 @@ Both intent lanes therefore resolve provenance from the rollout header when
 the column is empty; no catalog rebuild is a prerequisite for the guardian
 contract, and `aicx catalog rebuild` is what refreshes the stored column. The
 header probe reads as far as the catalog reads a header (128 records, 256 KiB
-in total), and past a `session_meta` record that names no provenance. A guardian stays out of the `mixed_scope` list as well, even when
+in total), and past a `session_meta` record that names no provenance. The
+256 KiB counts the records the probe reads; an over-cap record is drained
+without spending it, so a record larger than the whole header cannot hide the
+`session_meta` after it. `aicx index` reuses a cached extract only while the
+catalog's `session_kind`, when set, is the one stored at parse, so a rebuild
+that names a session guardian takes effect over unchanged source bytes. A guardian stays out of the `mixed_scope` list as well, even when
 the frame-kind or privacy filter leaves none of its frames, so it cannot make
 `aicx continuity` refuse.
 
