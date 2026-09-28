@@ -330,7 +330,17 @@ fn oversized_codex_projection_is_warm_without_rereading_its_records() {
         .open(fixture.source(0))
         .unwrap();
     // A terminated oversized record after valid signal exercises the same
-    // bounded-reader branch as historical tool/image-heavy rollouts.
+    // bounded-reader branch as historical tool/image-heavy rollouts. Its
+    // readable head names a tool RESULT: an over-cap record nothing
+    // identifies could have been a tool call and fails its turn window
+    // closed, which would leave this source no intents and keep it out of
+    // the warm/cold comparison below.
+    source.seek(SeekFrom::End(0)).unwrap();
+    source
+        .write_all(
+            br#"{"timestamp":"2026-07-25T10:00:03Z","type":"response_item","payload":{"type":"function_call_output","call_id":"c1","output":""#,
+        )
+        .unwrap();
     source.set_len(65 * 1024 * 1024).unwrap();
     source.seek(SeekFrom::End(0)).unwrap();
     source.write_all(b"\n").unwrap();
@@ -339,6 +349,21 @@ fn oversized_codex_projection_is_warm_without_rereading_its_records() {
     let (cold, cold_stats) = fixture.run(false);
     let cold_elapsed = started.elapsed();
     assert_eq!(parsed(&cold_stats), 2);
+    // The feed is payload-only, so count claims against the same sources
+    // left unpadded: the oversized record must cost source 0 none of its
+    // claims, or the warm/cold comparison below would not cover it.
+    let claims = |document: &Value| {
+        document["entries"].as_array().map_or(0, Vec::len)
+            + document["unresolved_attributions"]
+                .as_array()
+                .map_or(0, Vec::len)
+    };
+    let (unpadded, _) = Fixture::new("oversized-baseline").run(false);
+    assert_eq!(
+        claims(&cold),
+        claims(&unpadded),
+        "the oversized source must keep its claims: {cold}"
+    );
     let started = Instant::now();
     let (warm, warm_stats) = fixture.run(false);
     let warm_elapsed = started.elapsed();
