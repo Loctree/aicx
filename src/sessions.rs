@@ -686,12 +686,15 @@ pub(crate) const GUARDIAN_SESSION_KIND: &str = "subagent:guardian";
 /// megabytes. An over-cap record cannot be a `session_meta` header worth
 /// parsing, so it is drained rather than reassembled.
 ///
-/// Draining one must not end the probe. The byte budget counts the records
-/// the probe reads, not the ones it drains: charged to the budget, a leading
-/// record larger than the whole header used it up while being skipped, the
-/// probe never reached the `session_meta` after it, and a guardian was
-/// answered ordinary. The record count bounds the drain, and nothing drained
-/// is held.
+/// The drain stays inside the cap: the reader itself is `take(MAX_HEADER_BYTES)`,
+/// exactly as `session_catalog::probe_candidate` reads the header. An over-cap
+/// record within the header is drained and the probe reads on; one larger than
+/// the header ends it, for the catalog and the probe alike. Draining past the
+/// cap made this read unbounded — any record size, times the record count —
+/// on every Codex source the catalog touches, and an ordinary session never
+/// stops early. Provenance past the header is read by the full discovery scan
+/// of `aicx catalog rebuild`, which stores it in the column every lane reads
+/// before probing.
 ///
 /// The bounds are the catalog's own header bounds, never tighter: the catalog
 /// reads a session's identity from the same header, and a probe that gave up
@@ -700,10 +703,10 @@ pub(crate) const GUARDIAN_SESSION_KIND: &str = "subagent:guardian";
 #[cfg(feature = "app")]
 pub(crate) fn codex_session_kind_from_source(path: &Path) -> Option<String> {
     use crate::session_catalog::{MAX_HEADER_BYTES, MAX_HEADER_LINES};
+    use std::io::Read;
 
     let file = fs::File::open(path).ok()?;
-    let mut reader = BufReader::new(file);
-    let mut budget = MAX_HEADER_BYTES;
+    let mut reader = BufReader::new(file.take(MAX_HEADER_BYTES as u64));
     for _ in 0..MAX_HEADER_LINES {
         let line = aicx_parser::sanitize::read_line_capped(
             &mut reader,
@@ -713,9 +716,6 @@ pub(crate) fn codex_session_kind_from_source(path: &Path) -> Option<String> {
         if line.exceeded {
             continue;
         }
-        // A record that would cross the budget is where the header ends, as
-        // the catalog's own byte limit cuts it there.
-        budget = budget.checked_sub(line.line.len())?;
         let text = line.line.trim();
         if text.is_empty() {
             continue;
@@ -2723,13 +2723,14 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// Finding: the probe charged a drained record to its byte budget. A
-    /// leading record larger than the whole header budget used it up while
-    /// being skipped, the probe never reached the `session_meta` after it, and
-    /// a guardian was answered ordinary.
+    /// Finding: draining an over-cap record outside the byte cap made the
+    /// per-session probe unbounded — any record size, times the record count —
+    /// on the catalog hot path. The reader is capped like the catalog's own
+    /// header read, so a record larger than the header ends the probe for both,
+    /// and the full discovery scan a rebuild runs is what reads past it.
     #[test]
     #[cfg(feature = "app")]
-    fn a_record_larger_than_the_header_does_not_end_the_probe() {
+    fn a_record_larger_than_the_header_ends_the_probe_as_it_ends_the_header() {
         let root = temp_root("probe_past_budget");
         let day = root.join("2026").join("08").join("27");
         fs::create_dir_all(&day).unwrap();
@@ -2748,8 +2749,15 @@ mod tests {
         );
         let path = day.join(name);
 
+        // Past the header for the probe, which reads no further than the cap —
+        // the catalog's own header read stops there too
+        // (`bounded_header_reader_never_crosses_byte_cap`).
+        assert_eq!(resolve_session_kind("codex", None, &path), None);
+        // The full scan a rebuild runs reads the whole rollout and finds it.
         assert_eq!(
-            resolve_session_kind("codex", None, &path).as_deref(),
+            discover_codex_sessions(&root, None)[0]
+                .session_kind
+                .as_deref(),
             Some("subagent:guardian")
         );
         let _ = fs::remove_dir_all(&root);
