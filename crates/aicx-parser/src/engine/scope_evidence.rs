@@ -952,15 +952,21 @@ pub fn recorded_workdir(path: &str, baseline: Option<&str>) -> String {
 /// Windows path is one opaque component, so `C:\repo\..\other` never
 /// collapsed. `\` separates only in a Windows spelling; in a Unix path it is a
 /// legal filename character and stays one.
+///
+/// A UNC root is the whole `\\server\share`: Windows anchors `..` at the
+/// share, so `\\server\share\..\other` is `\\server\share\other`. Popping the
+/// share as an ordinary component fabricated `\\server\other`, another share,
+/// and a window whose baseline was that share read the call as its own.
 fn lexically_normalized(path: &str) -> String {
     let path = path.trim();
     let windows = windows_shaped(path);
     let separator = separator_of(path);
     let is_separator = |c: char| c == '/' || (windows && c == '\\');
+    let unc = windows && (path.starts_with("\\\\") || path.starts_with("//"));
     let root_len = if windows_drive_root(path) {
         3
-    } else if windows && (path.starts_with("\\\\") || path.starts_with("//")) {
-        2
+    } else if unc {
+        unc_root_len(path, is_separator)
     } else if path.starts_with(is_separator) {
         1
     } else if windows {
@@ -993,9 +999,31 @@ fn lexically_normalized(path: &str) -> String {
     let body = parts.join(separator.to_string().as_str());
     if root.is_empty() && body.is_empty() {
         ".".to_owned()
+    } else if unc && !body.is_empty() {
+        // The UNC root stops at the share name, before its separator.
+        format!("{root}{separator}{body}")
     } else {
         format!("{root}{body}")
     }
+}
+
+/// The byte length of a UNC root, `\\server\share`, up to the separator after
+/// the share name; a path with no share yet is its server alone.
+fn unc_root_len(path: &str, is_separator: impl Fn(char) -> bool) -> usize {
+    let mut names = 0;
+    let mut in_name = false;
+    for (at, c) in path.char_indices().skip(2) {
+        if !is_separator(c) {
+            in_name = true;
+        } else if in_name {
+            in_name = false;
+            names += 1;
+            if names == 2 {
+                return at;
+            }
+        }
+    }
+    path.len()
 }
 
 fn trim_path(path: &str) -> &str {
@@ -2219,6 +2247,35 @@ mod tests {
         );
         // A drive-relative token is not absolute anywhere.
         assert!(!absolute_anywhere("C:repo"));
+    }
+
+    /// Finding: a UNC path kept only its two leading separators as its root,
+    /// so `..` popped the share name. `\\server\share\..\other` became
+    /// `\\server\other`, another share, and a window whose baseline was that
+    /// share read the call as its own. Windows anchors `..` at the share.
+    #[test]
+    fn a_unc_share_is_one_root() {
+        for (path, normalized) in [
+            (r"\\server\share\..\other", r"\\server\share\other"),
+            (r"\\server\share\a\..\..\..\b", r"\\server\share\b"),
+            (r"\\server\share\..", r"\\server\share"),
+            (r"\\server/share\repo\.\pkg", r"\\server\share\repo\pkg"),
+            (r"\\server\share\", r"\\server\share"),
+            (r"\\server", r"\\server"),
+        ] {
+            assert_eq!(lexically_normalized(path), normalized, "{path}");
+        }
+        let share = r"\\server\share";
+        assert_eq!(
+            recorded_workdir(r"..\other", Some(share)),
+            r"\\server\share\other"
+        );
+        // Containment is pure string work, so no host probes a share here.
+        assert!(
+            !lexically_within(r"\\server\share\..\other", r"\\server\other"),
+            "the call stayed on `share`, not on the baseline share"
+        );
+        assert!(lexically_within(r"\\server\share\pkg\..\api", share));
     }
 
     /// Finding: lexical containment kept each path's own separator and case,
