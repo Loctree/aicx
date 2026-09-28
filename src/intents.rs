@@ -1249,10 +1249,12 @@ fn collect_live_unadmitted_files(
 ///    and a checkout path need not spell `org/repo` in adjacent segments
 ///    (suite dirs, renamed clones);
 /// 2. the frame cwd spells the project as adjacent path segments — the
-///    strict anti-leak matcher for frames that left the session checkout,
-///    honest only where neither the frame cwd nor the session checkout
-///    resolves on this host. A frame cwd with no session checkout to prove
-///    it against is dropped.
+///    strict anti-leak matcher for frames that left the session checkout.
+///    Spelling of an unresolved path is honest only when the session
+///    checkout is equally unresolved. A resolved checkout whose baseline is
+///    gone may still prove itself by its own repo-root name; an ancestor
+///    directory in that path is not the checkout. A frame with no session
+///    checkout at all is dropped.
 #[cfg(feature = "app")]
 fn retain_frames_for_project(
     frames: &mut Vec<TimelineEntry>,
@@ -1287,13 +1289,20 @@ fn retain_frames_for_project(
                 // re-admits exactly what repo identity just rejected. Reaching
                 // it is only honest when there was no identity to be had.
                 match aicx_parser::engine::normalize_workdir(cwd, session_root) {
-                    // Resolves to a real checkout here, and the membership test
-                    // above already measured it against the session root. A
-                    // failed proof is an answer, not a gap — including when the
-                    // session's own baseline is historical and no longer
-                    // resolves, which is precisely when spelling is least
-                    // trustworthy.
-                    aicx_parser::engine::WorkdirIdentity::Resolved(_) => false,
+                    // Membership against a live session checkout already failed.
+                    // A vanished baseline cannot prove identity, but the frame's
+                    // own checkout can: admit it only when THAT repo root spells
+                    // the project. An ancestor directory in the path does not —
+                    // `…/vista/vendor/fleet-bus` still spells `vista` and is a
+                    // different repository.
+                    aicx_parser::engine::WorkdirIdentity::Resolved(root) => {
+                        session_root.is_some_and(|baseline| {
+                            matches!(
+                                aicx_parser::engine::normalize_workdir(baseline, None),
+                                aicx_parser::engine::WorkdirIdentity::Unresolved(_)
+                            )
+                        }) && resolved_checkout_matches_project(&root, &filters)
+                    }
                     // Spelling is evidence only where the session root is as
                     // unknowable as the frame. A root that resolves here has
                     // just refused a path it cannot prove — a removed nested
@@ -1302,18 +1311,80 @@ fn retain_frames_for_project(
                     // frame could belong to, which is how the whole-session
                     // lane (`ScopeReport::scope_foreign_to`) reads it too.
                     aicx_parser::engine::WorkdirIdentity::Unresolved(_) => {
-                        session_root.is_some_and(|root| {
-                            matches!(
-                                aicx_parser::engine::normalize_workdir(root, None),
-                                aicx_parser::engine::WorkdirIdentity::Unresolved(_)
-                            )
-                        }) && crate::extraction::project_filter_matches_path(cwd, &filters)
+                        // A directory that is gone, whose parent is still this
+                        // checkout, is that checkout: `…/vibecrafted/labs` did
+                        // not become another repository by being deleted. A
+                        // path whose parent is gone too (`…/vista/vendor/fleet-bus`)
+                        // is unprovable and must not be spelled back in.
+                        missing_directory_inside_resolved_checkout(cwd, session_root)
+                            || (session_root.is_some_and(|root| {
+                                matches!(
+                                    aicx_parser::engine::normalize_workdir(root, None),
+                                    aicx_parser::engine::WorkdirIdentity::Unresolved(_)
+                                )
+                            }) && crate::extraction::project_filter_matches_path(cwd, &filters))
                     }
                 }
             }
             None => !session_mixed,
         }
     });
+}
+
+/// A missing path whose parent still belongs to the session checkout.
+///
+/// The parent has to exist and resolve to the same repo root. A removed
+/// nested tree (`vendor/fleet-bus` when `vendor` is gone) has no parent to
+/// stand on, so it stays unprovable instead of inheriting the catalog project.
+#[cfg(feature = "app")]
+fn missing_directory_inside_resolved_checkout(cwd: &str, session_root: Option<&str>) -> bool {
+    let Some(session_root) = session_root else {
+        return false;
+    };
+    let path = Path::new(cwd);
+    if path.exists() {
+        return false;
+    }
+    let Some(parent) = path.parent().filter(|parent| parent.exists()) else {
+        return false;
+    };
+    let Some(parent) = parent.to_str() else {
+        return false;
+    };
+    match (
+        aicx_parser::engine::normalize_workdir(parent, None),
+        aicx_parser::engine::normalize_workdir(session_root, None),
+    ) {
+        (
+            aicx_parser::engine::WorkdirIdentity::Resolved(parent_root),
+            aicx_parser::engine::WorkdirIdentity::Resolved(session),
+        ) => parent_root == session,
+        _ => false,
+    }
+}
+
+/// Does this resolved git root itself spell the requested project?
+///
+/// Only the checkout's own owner and repository segments count. A nested
+/// repository at `…/vista/vendor/fleet-bus` still has `vista` in its path,
+/// and matching that ancestor would put the foreign checkout back into the
+/// parent bucket.
+#[cfg(feature = "app")]
+fn resolved_checkout_matches_project(root: &Path, filters: &[String]) -> bool {
+    let mut segments = root
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(part) => Some(part.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let Some(repository) = segments.pop() else {
+        return false;
+    };
+    let organization = segments.pop().unwrap_or_default();
+    filters.iter().any(|filter| {
+        crate::legacy_archive::project_filter_matches(&organization, &repository, filter)
+    })
 }
 
 /// Catalog-admitted sessions stay live when conversation activity is inside

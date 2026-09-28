@@ -184,7 +184,7 @@ pub(super) fn load_catalog_feed(
             (saved.frames, saved.scope, saved.coverage)
         } else {
             stats.source_sessions_parsed += 1;
-            let read = crate::source_index::read_catalog_conversation_at(home, &row.entry);
+            let read = crate::source_index::read_catalog_conversation_checked_at(home, &row.entry);
             // Even a parser failure must not hide a source changing underneath
             // us. Re-stat after the read before using or persisting its frames.
             let allow = source_allowlist(home);
@@ -195,26 +195,32 @@ pub(super) fn load_catalog_feed(
                 );
             }
             match read {
-                Ok((read_path, frames, scope)) => {
+                Ok((read_path, frames, scope, coverage)) => {
                     if read_path != *path {
                         bail!("overlay source changed resolved path during read");
                     }
-                    // This reader returns session scope, not parser coverage.
-                    // A successful signal read is the conversation the slot
-                    // persists; scope is not a CompleteVisible / bounded /
-                    // uncacheable verdict.
-                    let coverage = ConversationCoverage::CompleteVisible;
-                    atomic_write_json(
-                        &source_cache,
-                        &ConversationCache {
-                            schema: CACHE_SCHEMA.to_owned(),
-                            key,
-                            checksum: digest(&(&frames, &scope, &coverage))?,
-                            frames: frames.clone(),
-                            scope: scope.clone(),
-                            coverage: coverage.clone(),
-                        },
-                    )?;
+                    // Scope is the session's checkout report. Coverage is the
+                    // parser's, and a partial or time-inferred read must not
+                    // become a trusted warm slot.
+                    if coverage.cacheable() {
+                        atomic_write_json(
+                            &source_cache,
+                            &ConversationCache {
+                                schema: CACHE_SCHEMA.to_owned(),
+                                key,
+                                checksum: digest(&(&frames, &scope, &coverage))?,
+                                frames: frames.clone(),
+                                scope: scope.clone(),
+                                coverage: coverage.clone(),
+                            },
+                        )?;
+                    } else {
+                        cacheable = false;
+                        report_skip(
+                            &row.entry,
+                            "partial parser coverage; current claims are not cached",
+                        );
+                    }
                     (frames, scope, coverage)
                 }
                 Err(error) => {
