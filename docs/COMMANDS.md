@@ -261,6 +261,9 @@ shorthand `{cmd, workdir}`). `null`, `undefined` and a number are no evidence
 only as the whole value (`undefined ?? otherDir` is an expression), and only
 the whole property name `workdir` is read, only as an object property (right
 after `{` or `,`): prose and a path a string merely quotes name nothing. A
+`workdir` property written inside a string, a template or a comment —
+`'{workdir: "/x"}'`, a shell command that echoes one, a commented-out call — is
+unreadable, never a path: the call beside it may name no directory at all. A
 computed key is the same property, so `{cmd, ["workdir"]: targetDir}` is read
 like `workdir: targetDir`; `[workdir]` is not, since it names whatever the
 variable holds.
@@ -294,7 +297,8 @@ legacy path-segment fallback does not re-admit them either, however the path
 happens to be spelled. Lexical containment survives only where identity is
 unknowable — a workdir that does not exist on this machine — and there a
 Windows spelling is compared the way Windows resolves it (either separator,
-letter case ignored), a Unix spelling byte for byte; a Windows path rooted
+letter case ignored), a Unix spelling byte for byte; a UNC root is the whole
+`\\server\share`, so `..` never climbs out of the share; a Windows path rooted
 without a drive (`\repo`) sits on the drive of the turn's cwd, and a
 drive-relative one (`D:fleet`) joins the turn's cwd only on that same drive —
 on any other drive it is unreadable evidence. Identity is
@@ -343,7 +347,10 @@ session records no checkout, because a removed `vendor/fleet-bus` spells
 A submodule is recognised from the checkout root's `.gitmodules`, whatever
 subdirectory the session ran in, and its descendants belong to it: a vanished
 `vendor/fleet-bus/src` is inside the declared `vendor/fleet-bus`. The boundary
-is a path component, so `vendor/fleet-bus-old` is an ordinary directory.
+is a path component, so `vendor/fleet-bus-old` is an ordinary directory. Under
+a Windows root a declaration is matched the way containment compares paths,
+ignoring letter case and separator, so a vanished `C:\Repo\vendor\fleet` is
+the declared `Vendor/Fleet`.
 
 A cataloged row with a project but no cwd gives membership nothing to prove
 itself against, which is not the same as proving it: when its frames name a

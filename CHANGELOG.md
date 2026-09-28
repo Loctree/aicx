@@ -136,12 +136,19 @@ evidence rather than a fabricated path. So is a literal with an escape that can
 spell a dot, a separator or a drive colon (`\x2e`, `\u002f`, `\56`, `\.`,
 `\/`, `\:`, or a backslash before a line break): `"/repo/\x2e\x2e/foreign"`
 runs in `/foreign`, and read as written it sat beneath `/repo`. Other
-backslashes stay as written, so `C:\repo\crate` is still read. A truncated record's `type` counts as
+backslashes stay as written, so `C:\repo\crate` is still read. A `workdir`
+property written inside a string, a template or a comment — `'{workdir:
+"/x"}'`, a shell command that echoes one, a commented-out call — is unreadable
+evidence rather than a path: beside a call that named no directory it used to
+move the whole window to `/x`. A truncated record's `type` counts as
 read only when its value survived the cap, so an envelope plus a payload type
 cut mid-value no longer passes as two readable discriminators. Where lexical
 containment is the only evidence, a Windows spelling is compared the way
 Windows resolves it: `C:/repo` contains `C:\repo\pkg` and `c:\REPO\pkg`, so a
-rollout that mixes separators or case keeps its intents.
+rollout that mixes separators or case keeps its intents. A `.gitmodules`
+declaration under a Windows root is matched the same way, so a vanished
+`C:\Repo\vendor\fleet` is the declared `Vendor/Fleet` rather than part of its
+parent.
 
 A `workdir` that is not a literal at all is unreadable evidence as well. That
 covers a variable, an expression, and the shorthand `{cmd, workdir}`: each
@@ -272,7 +279,9 @@ A path is judged in its own spelling, not the host's. A Windows rollout
 baseline, so its relative workdirs still resolve against it instead of every
 window turning unattributed. The filesystem is probed only for a path that is
 absolute on this host; a foreign spelling is never resolved against the
-process cwd.
+process cwd. A UNC root is the whole `\\server\share`: `..` stops at the
+share, so `\\server\share\..\other` is `\\server\share\other`, no longer the
+other share `\\server\other`.
 
 #### Public API (source-breaking for struct-literal construction)
 
