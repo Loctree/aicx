@@ -601,4 +601,53 @@ mark.hl-fuzzy {
     min-height: 220px;
   }
 }
+
+/* Server shell: the document does not scroll. Search stays in the top of
+   the main column; the list and the detail pane scroll on their own. */
+.server-dash .main-column {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  overflow: hidden;
+  padding: 0;
+}
+
+.server-dash .controls {
+  flex: 0 0 auto;
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  margin: 0;
+  padding: 12px 14px 10px;
+  background: var(--bg);
+  border-bottom: 1px solid var(--line);
+}
+
+.server-dash .main-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  padding: 0 14px 12px;
+}
+
+.server-dash .detail-pane {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: hidden;
+  margin-top: 12px;
+}
+
+.server-dash .detail-content {
+  min-height: 0;
+  overflow: auto;
+}
+
+.server-dash .studio {
+  flex: 0 1 auto;
+  max-height: 34%;
+  overflow: auto;
+  margin: 8px 0 0;
+}
 "#;

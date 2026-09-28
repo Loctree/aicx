@@ -281,6 +281,24 @@ pub(crate) const AICX_MARK_SVG: &str = r#"<svg id="aicx-mark" class="brand-mark"
 /// No data is embedded — the JavaScript fetches everything through API endpoints.
 /// PWA-ready: includes manifest link and service worker registration.
 pub fn render_server_shell_html(title: &str) -> String {
+    render_server_shell_html_for(title, false)
+}
+
+/// `local_open` is a loopback bind with authentication disabled.
+///
+/// That page states the local case. Sign in is offered only when the socket
+/// is not loopback or authentication is actually required.
+pub fn render_server_shell_html_for(title: &str, local_open: bool) -> String {
+    let access_line = if local_open {
+        r#"<p class="meta" id="ctx-access">This machine. No sign-in.</p>"#
+    } else {
+        r#"<p class="meta" id="ctx-access">Search. <a href="/auth">Sign in</a></p>"#
+    };
+    let onboarding_first = if local_open {
+        "This dashboard is on this machine. No sign-in."
+    } else {
+        "Sign in. This dashboard is not on your own loopback, or it asks for a token."
+    };
     format!(
         r##"<!doctype html>
 <html lang="en">
@@ -312,11 +330,11 @@ pub fn render_server_shell_html(title: &str) -> String {
 .md-rendered a {{ color: var(--accent-2); text-decoration: none; }}
 .md-rendered a:hover {{ text-decoration: underline; }}
 .detail-actions button:hover {{ border-color: var(--accent); }}
-.detail-content {{ margin: 0; border: 0; background: transparent; border-radius: 0; padding: 14px; overflow: auto; flex: 1; min-height: 280px; font-size: 0.86rem; line-height: 1.35; }}
+.detail-content {{ margin: 0; border: 0; background: transparent; border-radius: 0; padding: 14px; overflow: auto; flex: 1; min-height: 0; font-size: 0.86rem; line-height: 1.35; }}
 .filter-row {{ display: grid; grid-template-columns: repeat(3, 1fr) auto; gap: 10px; }}
   </style>
 </head>
-<body>
+<body class="server-dash">
   <div class="app-shell">
     <header class="app-header">
       <div class="brand-lockup">
@@ -325,12 +343,12 @@ pub fn render_server_shell_html(title: &str) -> String {
         <span class="brand-word">AICX</span>
         </div>
         <div>
-        <p class="meta">Search. <a href="/auth">Sign in</a></p>
+        {access_line}
         <p class="meta" id="ctx-gen-info">Loading…</p>
         </div>
       </div>
       <div class="header-stats">
-        <div class="stat"><strong id="ctx-stat-files">-</strong><span>files</span></div>
+        <div class="stat"><strong id="ctx-stat-files">-</strong><span id="ctx-stat-unit">files</span></div>
         <div class="stat"><strong id="ctx-stat-projects">-</strong><span>projects</span></div>
         <div class="stat"><strong id="ctx-stat-days">-</strong><span>days</span></div>
       </div>
@@ -378,29 +396,7 @@ pub fn render_server_shell_html(title: &str) -> String {
       </div>
     </section>
 
-    <section class="studio" id="ctx-studio">
-      <details class="studio-card" id="ctx-onboarding" open>
-        <summary>Start here</summary>
-        <ol>
-          <li>Sign in if this dashboard is not on your own loopback.</li>
-          <li>Build the index. Search only sees what has been indexed.</li>
-          <li>Add the words you actually type when a result is weak.</li>
-        </ol>
-        <button id="ctx-onboarding-dismiss" type="button">Hide this</button>
-      </details>
-      <details class="studio-card">
-        <summary>Phrases</summary>
-        <p class="meta">One list. Intent, task, decision, and the rest. Saved to this machine.</p>
-        <textarea id="ctx-phrases" rows="12" spellcheck="false"></textarea>
-        <button id="ctx-phrases-save" type="button">Save phrases</button>
-        <p id="ctx-phrases-status" class="meta"></p>
-      </details>
-      <div class="studio-card studio-index">
-        <button id="ctx-index" type="button">Build index</button>
-        <p id="ctx-index-status" class="meta"></p>
-      </div>
-    </section>
-
+      <div class="main-body">
       <article class="detail-pane">
         <div class="detail-head">
           <div>
@@ -420,6 +416,34 @@ pub fn render_server_shell_html(title: &str) -> String {
           <ul id="ctx-assumptions"></ul>
         </details>
       </article>
+    <section class="studio" id="ctx-studio">
+      <details class="studio-card" id="ctx-onboarding">
+        <summary>Start here</summary>
+        <p class="meta">Configuration survey. The phrases you actually type become intent keywords on this machine.</p>
+        <label class="meta" for="ctx-onboarding-phrases">Intent phrases, one per line</label>
+        <textarea id="ctx-onboarding-phrases" rows="4" spellcheck="false" placeholder="i want&#10;next step"></textarea>
+        <button id="ctx-onboarding-save" type="button">Save intent phrases</button>
+        <p id="ctx-onboarding-status" class="meta"></p>
+        <ol>
+          <li>{onboarding_first}</li>
+          <li>Save the phrases. They are written to intent_phrases.toml.</li>
+          <li>Build the index. Search only sees what has been indexed.</li>
+        </ol>
+        <button id="ctx-onboarding-dismiss" type="button">Hide this</button>
+      </details>
+      <details class="studio-card">
+        <summary>Phrases</summary>
+        <p class="meta">One list. Intent, task, decision, and the rest. Saved to this machine.</p>
+        <textarea id="ctx-phrases" rows="12" spellcheck="false"></textarea>
+        <button id="ctx-phrases-save" type="button">Save phrases</button>
+        <p id="ctx-phrases-status" class="meta"></p>
+      </details>
+      <div class="studio-card studio-index">
+        <button id="ctx-index" type="button">Build index</button>
+        <p id="ctx-index-status" class="meta"></p>
+      </div>
+    </section>
+      </div>
       </div>
     </section>
   </div>
@@ -436,6 +460,8 @@ pub fn render_server_shell_html(title: &str) -> String {
             assets::DASHBOARD_INLINE_MARKDOWN_SCRIPT,
             assets::DASHBOARD_SERVER_SCRIPT
         ),
+        access_line = access_line,
+        onboarding_first = onboarding_first,
         AICX_MARK_SVG = AICX_MARK_SVG,
     )
 }
@@ -506,10 +532,15 @@ fn render_dashboard_html(payload: &DashboardPayload, title: &str) -> Result<Stri
     <section class="studio" id="ctx-studio">
       <details class="studio-card" id="ctx-onboarding" open>
         <summary>Start here</summary>
+        <p class="meta">Configuration survey. The phrases you actually type become intent keywords on this machine.</p>
+        <label class="meta" for="ctx-onboarding-phrases">Intent phrases, one per line</label>
+        <textarea id="ctx-onboarding-phrases" rows="4" spellcheck="false" placeholder="i want&#10;next step"></textarea>
+        <button id="ctx-onboarding-save" type="button">Save intent phrases</button>
+        <p id="ctx-onboarding-status" class="meta"></p>
         <ol>
           <li>Sign in if this dashboard is not on your own loopback.</li>
+          <li>Save the phrases. They are written to intent_phrases.toml.</li>
           <li>Build the index. Search only sees what has been indexed.</li>
-          <li>Add the words you actually type when a result is weak.</li>
         </ol>
         <button id="ctx-onboarding-dismiss" type="button">Hide this</button>
       </details>

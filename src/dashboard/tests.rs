@@ -556,3 +556,33 @@ fn test_render_server_shell_html_contains_csp_meta() {
     assert!(html.contains("id=\"aicx-mark\""));
     assert!(html.contains("aria-label=\"Loctree\""));
 }
+
+#[test]
+fn local_open_shell_states_this_machine_and_does_not_offer_sign_in() {
+    let html = render_server_shell_html_for("AICX Dashboard", true);
+    assert!(html.contains("This machine. No sign-in."));
+    assert!(html.contains("This dashboard is on this machine. No sign-in."));
+    assert!(!html.contains("href=\"/auth\">Sign in"));
+    assert!(html.contains("class=\"server-dash\""));
+    assert!(html.contains("class=\"main-body\""));
+    assert!(html.contains("id=\"ctx-search\""));
+    assert!(html.contains("id=\"ctx-onboarding-save\""));
+    assert!(html.contains("id=\"ctx-phrases\""));
+}
+
+#[test]
+fn remote_or_auth_shell_still_offers_sign_in() {
+    let html = render_server_shell_html("AICX Dashboard");
+    assert!(html.contains("href=\"/auth\">Sign in"));
+    assert!(!html.contains("This machine. No sign-in."));
+}
+
+#[test]
+fn strip_dashboard_pollution_keeps_the_operator_ask() {
+    let raw = "<rules>\nThe rules section has a number of possible rules.\n<always_applied_workspace_rule name=\"Agents.md\">\nslice before edit\n</always_applied_workspace_rule>\n</rules>\n\nHelp me repro the bug.";
+    let cleaned = super::scan::strip_dashboard_pollution(raw);
+    assert!(!cleaned.contains("<rules>"));
+    assert!(!cleaned.contains("rules section"));
+    assert!(!cleaned.contains("slice before edit"));
+    assert!(cleaned.contains("Help me repro the bug"));
+}

@@ -22,7 +22,35 @@ pub(crate) const DASHBOARD_SERVER_SCRIPT: &str = r#"
   const state = {
     query: '', project: '', agent: '', kind: '', sort: 'newest', since: '',
     scoreMin: 0, limit: 350, selectedId: null, rows: [], selectedRecord: null,
-    browseRecords: [], mode: 'browse', expanded: false,
+    browseRecords: [], mode: 'browse', expanded: false, unit: 'session',
+  };
+
+  const withoutStamp = (line) => {
+    if (line.charAt(0) !== '[') return line;
+    const end = line.indexOf(']');
+    return end > 0 ? line.slice(end + 1).trim() : line;
+  };
+  const readableName = (record) => {
+    const preview = record.preview || record.excerpt || '';
+    const lines = preview.split('\n').map(function(line) { return line.trim(); }).filter(Boolean);
+    const spoken = function(prefix) {
+      return lines.find(function(line) { return withoutStamp(line).toLowerCase().indexOf(prefix) === 0; });
+    };
+    const chosen = spoken('user:') || spoken('assistant:');
+    if (chosen) {
+      let text = withoutStamp(chosen).replace(/^(user|assistant):\s*/i, '').replace(/<\/?user_query>/gi, ' ').replace(/\s+/g, ' ').trim();
+      if (text && text.indexOf('<') !== 0) return text.length > 140 ? text.slice(0, 140) + '\u2026' : text;
+    }
+    const raw = record.file_name || record.file || '';
+    const label = (record.label || '').trim();
+    if (label && !/\.jsonl?$/i.test(label)) return label;
+    if (record.kind === 'session' || /\.jsonl$/i.test(raw)) return (record.agent || 'session') + ' session';
+    return raw || '(unnamed)';
+  };
+  const listPreview = (record) => {
+    const text = (record.preview || record.excerpt || '').replace(/\[1970-01-01[^\]]*\]\s*/g, '').trim();
+    if (!text || text.indexOf('<rules>') === 0) return '';
+    return text.length > 240 ? text.slice(0, 240) + '\u2026' : text;
   };
 
   const renderMarkdown = AicxMarkdown.renderMarkdown;
@@ -186,7 +214,7 @@ pub(crate) const DASHBOARD_SERVER_SCRIPT: &str = r#"
       ui.detailContent.innerHTML = 'Use search or filters to pick a note.';
       return;
     }
-    const title = record.file_name || record.file || '(unnamed)';
+    const title = readableName(record);
     const scoreTxt = typeof score === 'number' && score > 0 ? 'score ' + score + '/100' : '';
     const meta = [record.project, record.agent, record.kind, record.date, scoreTxt].filter(Boolean).join(' \u2022 ');
     ui.detailTitle.innerHTML = highlightTerms(title, state.query);
@@ -207,8 +235,13 @@ pub(crate) const DASHBOARD_SERVER_SCRIPT: &str = r#"
       return;
     }
     ui.detailContent.textContent = 'Loading full content\u2026';
-    const endpoint = rec.id !== undefined ? '/api/chunk?id=' + rec.id : '/api/detail?id=' + rec.id;
-    apiFetch(endpoint)
+    if (rec.id === undefined || rec.id === null || rec.id === '') {
+      state.expanded = true;
+      if (ui.expand) ui.expand.textContent = 'Collapse';
+      ui.detailContent.innerHTML = '<div class="md-rendered">' + renderMarkdown(rec.excerpt || rec.preview || '') + '</div>';
+      return;
+    }
+    apiFetch('/api/detail?id=' + encodeURIComponent(rec.id))
       .then(function(r) { return r.json(); })
       .then(function(data) {
         if (!data.ok) { ui.detailContent.textContent = 'Failed: ' + (data.error || 'unknown'); return; }
@@ -248,10 +281,12 @@ pub(crate) const DASHBOARD_SERVER_SCRIPT: &str = r#"
       top.appendChild(mkBadge(record.date || ''));
       if (typeof score === 'number' && score > 0) top.appendChild(mkBadge(score + '/100'));
       const name = document.createElement('div'); name.className = 'result-name';
-      const fname = (record.file_name || record.file || '(unnamed)') + (record.size_human ? ' \u2022 ' + record.size_human : '');
+      const rawName = record.file_name || record.file || '';
+      const hideSize = record.kind === 'session' || /\.jsonl$/i.test(rawName);
+      const fname = readableName(record) + (!hideSize && record.size_human ? ' \u2022 ' + record.size_human : '');
       name.innerHTML = highlightTerms(fname, state.query);
       item.appendChild(top); item.appendChild(name);
-      const previewText = record.excerpt || record.preview || '';
+      const previewText = listPreview(record);
       if (previewText) {
         const preview = document.createElement('div'); preview.className = 'result-preview';
         const maxLen = 240; const truncated = previewText.length > maxLen ? previewText.slice(0, maxLen) + '\u2026' : previewText;
@@ -277,7 +312,8 @@ pub(crate) const DASHBOARD_SERVER_SCRIPT: &str = r#"
     else rows.sort(function(a, b) { return (b.record.sort_ts || 0) - (a.record.sort_ts || 0); });
     rows = runHooks('beforeRender', rows);
     state.rows = rows;
-    ui.summary.textContent = rows.length + ' file(s) | browse mode | total: ' + state.browseRecords.length;
+    const unit = state.unit === 'file' ? 'file' : 'session';
+    ui.summary.textContent = rows.length + ' ' + unit + (rows.length === 1 ? '' : 's');
     renderList(rows);
     runHooks('afterRender', rows);
   };
@@ -412,7 +448,10 @@ pub(crate) const DASHBOARD_SERVER_SCRIPT: &str = r#"
         fillSelect(ui.agent, data.agents || []);
         fillSelect(ui.kind, data.kinds || []);
         const s = data.stats || {};
+        state.unit = s.search_backend === 'catalog-live-source' ? 'session' : 'file';
         ui.statFiles.textContent = s.total_files || 0;
+        const unitLabel = document.getElementById('ctx-stat-unit');
+        if (unitLabel) unitLabel.textContent = state.unit === 'session' ? 'sessions' : 'files';
         ui.statProjects.textContent = s.total_projects || 0;
         ui.statDays.textContent = s.total_days || 0;
         ui.genInfo.textContent = 'Generated ' + (data.generated_at || '?');
@@ -447,6 +486,20 @@ pub(crate) const DASHBOARD_SERVER_SCRIPT: &str = r#"
     if (dismiss) dismiss.addEventListener('click', () => {
       if (onboard) onboard.open = false;
       try { localStorage.setItem('aicx_onboarding_dismissed', '1'); } catch (_) {}
+    });
+    const survey = $('ctx-onboarding-phrases');
+    const surveySave = $('ctx-onboarding-save');
+    const surveyStatus = $('ctx-onboarding-status');
+    if (surveySave && survey) surveySave.addEventListener('click', () => {
+      const phrases = survey.value.split(/\n/).map((line) => line.trim()).filter(Boolean);
+      apiFetch('/api/onboarding', {
+        method: 'POST',
+        body: JSON.stringify({ phrases: phrases }),
+        headers: { 'content-type': 'application/json', 'x-ai-contexters-action': 'regenerate' }
+      })
+        .then((r) => r.json())
+        .then((body) => { if (surveyStatus) surveyStatus.textContent = body.ok ? 'Saved intent phrases.' : (body.detail || 'Not saved.'); })
+        .catch(() => { if (surveyStatus) surveyStatus.textContent = 'Not saved.'; });
     });
     const phrases = $('ctx-phrases');
     const phraseStatus = $('ctx-phrases-status');
@@ -485,6 +538,13 @@ pub(crate) const DASHBOARD_SERVER_SCRIPT: &str = r#"
         if (r.status === 401) {
           showLogin();
           return;
+        }
+        const host = location.hostname;
+        if (host === '127.0.0.1' || host === 'localhost' || host === '::1') {
+          const access = document.getElementById('ctx-access');
+          if (access) access.textContent = 'This machine. No sign-in.';
+          const first = document.querySelector('#ctx-onboarding ol li');
+          if (first) first.textContent = 'This dashboard is on this machine. No sign-in.';
         }
         loadBrowseData();
       })

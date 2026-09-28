@@ -300,17 +300,13 @@ fn scan_catalog_sessions(
             .and_then(|ext| ext.to_str())
             .unwrap_or("log")
             .to_ascii_lowercase();
-        let (entry_count, preview, search_excerpt, detail_text, content_sort_ts) =
-            read_catalog_conversation_preview(aicx_home, &entry, preview_chars).unwrap_or_else(
-                || {
-                    read_preview_and_search_excerpt(
-                        &path,
-                        &extension,
-                        metadata.len(),
-                        preview_chars,
-                    )
-                },
-            );
+        // A catalog row is a session. If the conversation reader cannot produce
+        // a readable turn, leave the raw jsonl out of the default list.
+        let Some((entry_count, preview, search_excerpt, detail_text, content_sort_ts)) =
+            read_catalog_conversation_preview(aicx_home, &entry, preview_chars)
+        else {
+            continue;
+        };
         // Source modification time is the durable signal that a live session
         // changed. Some providers preserve stale or malformed frame timestamps,
         // so letting content time win can bury the hottest session.
@@ -388,7 +384,7 @@ fn scan_catalog_sessions(
         .join("hybrid")
         .is_dir();
     assumptions.push(format!(
-        "Rendered {} current session source(s) across {} exact project bucket(s).",
+        "Rendered {} readable session(s) across {} exact project bucket(s). Rules, tool payloads, and empty epoch stamps stay out of the default list.",
         stats.total_files, stats.total_projects
     ));
 
@@ -406,6 +402,82 @@ fn scan_catalog_sessions(
     })
 }
 
+/// Tags whose bodies are harness boilerplate, not something an operator reads.
+const DASHBOARD_POLLUTION_TAGS: &[&str] = &[
+    "rules",
+    "always_applied_workspace_rules",
+    "always_applied_workspace_rule",
+    "user_rules",
+    "agent_requestable_workspace_rules",
+    "agent_requestable_workspace_rule",
+    "user_info",
+    "git_status",
+    "agent_skills",
+    "agent_skill",
+    "system-reminder",
+    "open_and_recently_viewed_files",
+    "communication",
+    "mcp_instructions",
+    "user_query",
+];
+
+/// Readable default when `--preview-chars 0` would otherwise dump the whole turn.
+const READABLE_PREVIEW_CHARS: usize = 1_600;
+
+/// A stamp at or before the first Unix day is an empty epoch, not a session time.
+fn is_empty_epoch(timestamp: DateTime<Utc>) -> bool {
+    timestamp.timestamp() < 86_400
+}
+
+pub(super) fn strip_dashboard_pollution(message: &str) -> String {
+    let mut cleaned = message.to_string();
+    for tag in DASHBOARD_POLLUTION_TAGS {
+        cleaned = strip_tag_blocks(&cleaned, tag);
+    }
+    cleaned.trim().to_string()
+}
+
+fn strip_tag_blocks(input: &str, tag: &str) -> String {
+    let open_prefix = format!("<{tag}");
+    let close = format!("</{tag}>");
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    loop {
+        let Some(start) = rest.find(&open_prefix) else {
+            out.push_str(rest);
+            break;
+        };
+        let after = &rest[start + open_prefix.len()..];
+        let is_tag = after.starts_with('>')
+            || after.starts_with('/')
+            || after.starts_with(|ch: char| ch.is_whitespace());
+        if !is_tag {
+            out.push_str(&rest[..start + 1]);
+            rest = &rest[start + 1..];
+            continue;
+        }
+        out.push_str(&rest[..start]);
+        if let Some(end_rel) = rest[start..].find(&close) {
+            rest = &rest[start + end_rel + close.len()..];
+        } else {
+            break;
+        }
+    }
+    out
+}
+
+fn is_dashboard_noise_turn(message: &str) -> bool {
+    let head = message.trim_start();
+    if head.is_empty() {
+        return true;
+    }
+    if head.starts_with("Briefly inform the user about the task result") {
+        return true;
+    }
+    // Tool payloads that survived the signal filter still read as raw logs.
+    head.starts_with('{') && (head.contains("\"type\"") || head.contains("\"tool"))
+}
+
 fn read_catalog_conversation_preview(
     aicx_home: &Path,
     entry: &crate::catalog::CatalogEntry,
@@ -415,24 +487,59 @@ fn read_catalog_conversation_preview(
     if frames.is_empty() {
         return None;
     }
-    let mut conversation = String::new();
+
+    let mut turns: Vec<String> = Vec::new();
     for frame in &frames {
-        conversation.push_str(&format!(
-            "[{}] {}: {}\n\n",
-            frame.timestamp.format("%Y-%m-%d %H:%M:%S"),
-            frame.role,
-            frame.message.trim()
-        ));
-        if conversation.chars().count() >= MAX_DETAIL_CHARS {
+        let message = strip_dashboard_pollution(&frame.message);
+        if is_dashboard_noise_turn(&message) {
+            continue;
+        }
+        let role = if frame.role == "user" {
+            "user"
+        } else {
+            "assistant"
+        };
+        let stamp = if is_empty_epoch(frame.timestamp) {
+            String::new()
+        } else {
+            format!("[{}] ", frame.timestamp.format("%Y-%m-%d %H:%M:%S"))
+        };
+        turns.push(format!("{stamp}{role}: {message}"));
+        if turns.len() >= 80 {
             break;
         }
     }
-    let detail = trim_chars(&conversation, MAX_DETAIL_CHARS);
-    let collapsed = collapse_ws(&conversation);
-    let preview = trim_chars(&collapsed, preview_chars);
-    let search_excerpt = trim_chars(&collapsed, MAX_SEARCH_TEXT_CHARS);
-    let sort_ts = frames.last().map(|frame| frame.timestamp.timestamp());
-    Some((Some(frames.len()), preview, search_excerpt, detail, sort_ts))
+    if turns.is_empty() {
+        return None;
+    }
+
+    let mut conversation = String::new();
+    for line in &turns {
+        if conversation.chars().count() >= MAX_DETAIL_CHARS {
+            break;
+        }
+        conversation.push_str(line.trim());
+        conversation.push_str("\n\n");
+    }
+    let detail = trim_chars(conversation.trim(), MAX_DETAIL_CHARS);
+    if detail.trim().is_empty() {
+        return None;
+    }
+
+    let preview_cap = if preview_chars == 0 {
+        READABLE_PREVIEW_CHARS
+    } else {
+        preview_chars
+    };
+    let preview = trim_chars(conversation.trim(), preview_cap);
+    let search_excerpt = trim_chars(&collapse_ws(&conversation), MAX_SEARCH_TEXT_CHARS);
+    let sort_ts = frames
+        .iter()
+        .rev()
+        .find(|frame| !is_empty_epoch(frame.timestamp))
+        .or_else(|| frames.last())
+        .map(|frame| frame.timestamp.timestamp());
+    Some((Some(turns.len()), preview, search_excerpt, detail, sort_ts))
 }
 
 fn supported_note_extension(ext: &str) -> bool {
