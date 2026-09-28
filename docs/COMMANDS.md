@@ -283,7 +283,14 @@ not all written at the call is unreadable as well: a variable
 (`{cmd, ...opts}`), a key computed from code (`{cmd, [key]: dir}`), an
 accessor or a method (`{get workdir() {…}}`), or one that never closes. A
 spread nested deeper feeds another property, and a string argument or none
-names no directory.
+names no directory. A readable `workdir` names the directory only as a
+top-level property of the call's own argument: in code, of the object literal
+passed straight to `exec_command(`; in arguments that do not parse, of the
+argument object or of its body alone. Anywhere else it is unreadable, never a
+path — `const metadata = {workdir: "/repo/foreign"}`, an options object
+spread or passed by name, a nested `options.workdir` or
+`env: [{workdir: …}]`, an aliased call, another tool's argument — so the
+window is unattributed instead of re-scoped to a directory no call ran in.
 Comments are skipped wherever JavaScript allows them, before the key as well
 as before the value, so `{cmd, /* note */ workdir: targetDir}` is read. A readable value runs to the quote that opened it, in any of the three
 quote styles, so `"/Users/O'Brien/repo"` is one path, and it counts only as
@@ -365,7 +372,12 @@ internally homogeneous and still foreign: whole-session attribution applies
 only when the observed scope is also the cataloged one. The same verdict puts
 the session in the `mixed_scope` list, so work the filter removes wholesale is
 reported rather than silently gone; the list carries the session's own cwds,
-never the cataloged path. A frame whose cwd resolves to a
+never the cataloged path. Every session on that list is counted in the
+completeness `mixed_scope_sessions` field with a warning, and an answer
+missing any is not `complete`. The Markdown answer of `aicx intents` and MCP
+`aicx_intents` carries no completeness, so it ends with a note counting the
+sessions not served whole and the unplaced frames; an answer the filters
+emptied no longer reads as a project with nothing in it. A frame whose cwd resolves to a
 real checkout here and cannot prove membership is dropped rather than handed
 to the legacy path-name filter: a checkout at `…/vista/vendor/fleet-bus` spells
 `vista` without being it, and that fallback exists only for paths that resolve

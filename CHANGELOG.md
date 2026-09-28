@@ -213,6 +213,17 @@ one that never closes. Its directory was only known at runtime, and the
 window used to stay on the baseline. A spread nested deeper feeds another
 property, and a string argument or none names no directory.
 
+A readable `workdir` literal now names the directory only as a top-level
+property of the call's own argument: in code, of the object literal passed
+straight to `exec_command(`; in arguments that do not parse, of the argument
+object or of its body alone. The scan used to take any object property named
+`workdir` anywhere in the script, so `const metadata = {workdir:
+"/repo/foreign"}` beside a plain baseline call re-scoped the call's whole
+window to a checkout it never ran in. That literal — like an options object
+spread or passed by name, a nested `options.workdir` or `env: [{workdir: …}]`,
+an aliased call, or another tool's argument — is unreadable evidence now, and
+the window is unattributed.
+
 The bounded reader for over-cap Codex rollouts now agrees with the full
 adapter in two places where they had drifted apart:
 
@@ -246,6 +257,16 @@ Each lane now notes them before its filter runs. `IntentExtraction` gains
 `complete` and carries a warning. `continuity` lists the sessions in NOW and
 refuses a window with nothing else to distill.
 
+Sessions the project filter could not serve whole count against completeness
+as well. Such a session — work run outside the cataloged checkout, a proven
+workdir conflict, a scope `.aicxignore` hides — was named in `mixed_scope`,
+but the CLI and MCP payloads carry `completeness`, not that list: an answer
+the filter had emptied still read `complete: true`, and its Markdown was
+blank. The stats and `completeness` gain `mixed_scope_sessions`; an answer
+with any is not `complete` and carries a warning. The Markdown answer of
+`aicx intents` and MCP `aicx_intents` ends with a note counting the sessions
+not served whole and the unplaced frames.
+
 A session also counts as mixed only when its cwds name more than one
 repository. Previously, more than one spelling was enough, so a session that
 moved from `/repo` into `/repo/pkg` read as mixed and its cwd-less frames were
@@ -274,7 +295,10 @@ branch; a scope-only cut never reaches the fingerprint, and every existing
 golden fixture keeps its bytes. `extract --brief` counts a span's
 `scope_root` next to the recorded cwds, as the session `ScopeStatus` does: a
 one-segment session launched in one checkout and re-scoped to another gets the
-multi-workstream header instead of reading as a single workstream. An
+multi-workstream header instead of reading as a single workstream. It counts
+repositories, not spellings, as the scope report does: a `scope_root` is a
+checkout's root and the recorded cwd may sit inside it, so one repository
+used to be headed as several workstreams. An
 `unattributed` span is headed "(unattributed)" after its recorded cwd, never as
 plain baseline work.
 
@@ -376,6 +400,11 @@ a Unix root.
   `unplaced_frames: usize` (serde default on read), so completeness payloads
   gain the key, and `continuity::ContinuityPack` gains `unplaced_scope`. Code
   that builds these with a literal must add the field.
+- `IntentExtractionStats` and `IntentsCompleteness` gain
+  `mixed_scope_sessions: usize` (serde default on read), counted in
+  `complete`; code that builds them with a literal must add the field.
+  `IntentExtractionStats::withheld_scope_note()` returns the Markdown note for
+  the withheld work, `None` when nothing was withheld.
 - `aicx::extraction::conversation::ScopeReport` gains `hidden_scopes: usize`
   (distinct cwds removed by `.aicxignore` before the report was built) and the
   `scope_foreign_to(baseline)` method; `scope_mixed()` now counts hidden
