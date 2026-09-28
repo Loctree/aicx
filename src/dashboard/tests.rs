@@ -574,7 +574,8 @@ fn local_open_shell_states_this_machine_and_does_not_offer_sign_in() {
 fn remote_or_auth_shell_still_offers_sign_in() {
     let html = render_server_shell_html("AICX Dashboard");
     assert!(html.contains("href=\"/auth\">Sign in"));
-    assert!(!html.contains("This machine. No sign-in."));
+    assert!(html.contains("id=\"ctx-access\">Search. <a href=\"/auth\">Sign in</a>"));
+    assert!(!html.contains("id=\"ctx-access\">This machine. No sign-in."));
 }
 
 #[test]
