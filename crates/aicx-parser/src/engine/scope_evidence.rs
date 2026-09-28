@@ -107,8 +107,9 @@ pub enum WindowScope {
 /// written at the call ([`exec_arguments_unseen`]).
 ///
 /// Arguments that parse as a JSON object are read structurally: only their
-/// top-level `workdir` is the call's directory. The JavaScript scan is for
-/// arguments that do not parse.
+/// top-level `workdir` is the call's directory. Arguments that parse as any
+/// other JSON value name none. The JavaScript scan is for arguments that do
+/// not parse.
 pub fn tool_call_workdirs(payload: &Value) -> Vec<WorkdirEvidence> {
     let mut found: Vec<WorkdirEvidence> = Vec::new();
     let mut push = |evidence: WorkdirEvidence| {
@@ -122,12 +123,12 @@ pub fn tool_call_workdirs(payload: &Value) -> Vec<WorkdirEvidence> {
             Value::String(raw) => serde_json::from_str::<Value>(raw).ok(),
             _ => None,
         };
-        match parsed.as_ref().and_then(Value::as_object) {
+        match parsed.as_ref() {
             // Structured arguments: the call's directory is the top-level
             // `workdir` and nothing else. A nested `options.workdir`, or one
             // written inside the command string, is data the call carried, and
             // reading it re-scoped a baseline call to a checkout it never ran in.
-            Some(body) => match body.get("workdir") {
+            Some(Value::Object(body)) => match body.get("workdir") {
                 Some(Value::String(workdir)) => {
                     let workdir = workdir.trim();
                     if !workdir.is_empty() {
@@ -137,6 +138,11 @@ pub fn tool_call_workdirs(payload: &Value) -> Vec<WorkdirEvidence> {
                 None | Some(Value::Null | Value::Number(_)) => {}
                 Some(_) => push(WorkdirEvidence::Opaque),
             },
+            // Arguments that parse to anything but an object — an array, a
+            // string, a number — have no top-level `workdir`: the call named no
+            // directory. Scanned as JavaScript, `[{"workdir": "/foreign"}]`
+            // read as one and moved the window there.
+            Some(_) => {}
             // A JS literal can also arrive as the raw `arguments` string; scan
             // it rather than declaring no evidence because JSON parsing failed.
             None => {
@@ -1750,6 +1756,10 @@ mod tests {
         for raw in [
             r#"{"cmd":"pwd","options":{"workdir":"/repo/foreign"}}"#,
             r#"{"cmd":"pwd","workdir":null,"env":[{"workdir":"/repo/foreign"}]}"#,
+            // Parsed, but not an object: there is no top-level `workdir` at
+            // all, and the JavaScript scan must not find one inside it.
+            r#"[{"workdir":"/repo/foreign"}]"#,
+            r#""{\"workdir\":\"/repo/foreign\"}""#,
         ] {
             assert!(tool_call_workdirs(&arguments(raw)).is_empty(), "{raw}");
         }
