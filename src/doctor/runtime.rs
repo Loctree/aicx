@@ -95,7 +95,8 @@ mod tests {
     #[test]
     fn repair_preserves_existing_service_arguments() {
         assert!(REPAIR_MCP_SCRIPT.contains("Set :ProgramArguments:0"));
-        assert!(REPAIR_MCP_SCRIPT.contains("--no-auto-refresh"));
+        assert!(REPAIR_MCP_SCRIPT.contains("--experimental-auto-refresh"));
+        assert!(REPAIR_MCP_SCRIPT.contains("Delete :ProgramArguments:"));
         assert!(!REPAIR_MCP_SCRIPT.contains("--host\n"));
         assert!(!REPAIR_MCP_SCRIPT.contains("--port\n"));
     }

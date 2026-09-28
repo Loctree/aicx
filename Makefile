@@ -86,7 +86,11 @@ release-binaries:
 				echo "MACOS_DEVELOPER_ID_APPLICATION is required for CODESIGN=1" >&2; \
 				exit 1; \
 			else \
-				echo "  codesign skipped (set CODESIGN=1 and MACOS_DEVELOPER_ID_APPLICATION for release)"; \
+				for bin in $(RELEASE_BINARIES); do \
+					codesign --force --sign - "$(STAGING_DIR)/bin/$$bin"; \
+					codesign --verify --verbose=2 "$(STAGING_DIR)/bin/$$bin" >/dev/null; \
+					printf '  ad-hoc codesigned %s\n' "$$bin"; \
+				done; \
 			fi ;; \
 	esac
 	@$(PYTHON) -c 'import json, pathlib, sys; staging=pathlib.Path(sys.argv[1]); version=sys.argv[2]; commit=sys.argv[3]; data={"source":"loctree-aicx","commit":commit,"components":[{"name":"aicx","version":version,"source":"loctree-aicx"},{"name":"aicx-mcp","version":version,"source":"loctree-aicx"}]}; path=staging/"components"/"loctree-aicx.json"; path.write_text(json.dumps(data, indent=2)+"\n", encoding="utf-8"); print(f"  metadata -> {path}")' "$(STAGING_DIR)" "$(VERSION)" "$$(git rev-parse --short=12 HEAD)"

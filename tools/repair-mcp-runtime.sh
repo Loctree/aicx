@@ -52,9 +52,14 @@ trap 'restore_plist; rm -f "$BACKUP_PLIST"' EXIT
 # existing network and logging argument while changing only runtime ownership.
 /usr/libexec/PlistBuddy -c "Set :Label $LABEL" "$CANONICAL_PLIST"
 /usr/libexec/PlistBuddy -c "Set :ProgramArguments:0 $AICX_BIN" "$CANONICAL_PLIST"
-if ! plutil -extract ProgramArguments json -o - "$CANONICAL_PLIST" | grep -Fq '"--no-auto-refresh"'; then
+# Drop the deprecated reader flag. It conflicts with --experimental-auto-refresh.
+while plutil -extract ProgramArguments json -o - "$CANONICAL_PLIST" | grep -Fq '"--no-auto-refresh"'; do
+  IDX="$(plutil -extract ProgramArguments json -o - "$CANONICAL_PLIST" | python3 -c 'import json,sys; args=json.load(sys.stdin); print(next(i for i,a in enumerate(args) if a=="--no-auto-refresh"))')"
+  /usr/libexec/PlistBuddy -c "Delete :ProgramArguments:$IDX" "$CANONICAL_PLIST"
+done
+if ! plutil -extract ProgramArguments json -o - "$CANONICAL_PLIST" | grep -Fq '"--experimental-auto-refresh"'; then
   ARG_COUNT="$(plutil -extract ProgramArguments raw "$CANONICAL_PLIST")"
-  /usr/libexec/PlistBuddy -c "Add :ProgramArguments:$ARG_COUNT string --no-auto-refresh" "$CANONICAL_PLIST"
+  /usr/libexec/PlistBuddy -c "Add :ProgramArguments:$ARG_COUNT string --experimental-auto-refresh" "$CANONICAL_PLIST"
 fi
 plutil -lint "$CANONICAL_PLIST" >/dev/null
 
@@ -77,4 +82,4 @@ if [ -f "$LEGACY_PLIST" ]; then
 fi
 
 note "mcp runtime: $LABEL now uses $AICX_BIN"
-note "mcp refresh: disabled in the long-lived server (--no-auto-refresh)"
+note "mcp refresh: experimental auto-refresh at the product default cadence"

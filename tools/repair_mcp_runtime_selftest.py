@@ -65,8 +65,47 @@ def main() -> None:
         args = repaired["ProgramArguments"]
         assert args[0] == str(launcher)
         assert args[1:-1] == original_args[1:]
-        assert args[-1] == "--no-auto-refresh"
-        assert args.count("--no-auto-refresh") == 1
+        assert args[-1] == "--experimental-auto-refresh"
+        assert args.count("--no-auto-refresh") == 0
+
+        # The deprecated flag is not a completion token. A unit that already
+        # matches the loopback contract must repair successfully, and the
+        # repair must not write --no-auto-refresh back onto it.
+        loopback_args = [
+            "/stale/aicx-mcp", "--transport", "http",
+            "--host", "127.0.0.1", "--port", "8044",
+            "--allowed-host", "localhost", "--allowed-host", "127.0.0.1",
+            "--allowed-host", "::1", "--no-require-auth",
+            "--experimental-auto-refresh",
+        ]
+        plist_path.write_bytes(plistlib.dumps({
+            "Label": "com.loctree.aicx.mcp",
+            "ProgramArguments": loopback_args,
+            "KeepAlive": True,
+        }))
+        subprocess.run(["bash", str(SCRIPT)], env=env, check=True, capture_output=True, text=True)
+        again = plistlib.loads(plist_path.read_bytes())["ProgramArguments"]
+        assert again[0] == str(launcher)
+        assert "--no-auto-refresh" not in again
+        assert "--experimental-auto-refresh" in again
+        assert "--no-require-auth" in again
+        assert again[again.index("--host") + 1] == "127.0.0.1"
+
+        # An old reader flag is removed rather than required.
+        flagged = list(loopback_args)
+        flagged.insert(2, "--no-auto-refresh")
+        flagged.remove("--experimental-auto-refresh")
+        plist_path.write_bytes(plistlib.dumps({
+            "Label": "com.loctree.aicx.mcp",
+            "ProgramArguments": flagged,
+            "KeepAlive": True,
+        }))
+        subprocess.run(["bash", str(SCRIPT)], env=env, check=True, capture_output=True, text=True)
+        migrated = plistlib.loads(plist_path.read_bytes())["ProgramArguments"]
+        assert "--no-auto-refresh" not in migrated
+        assert migrated[-1] == "--experimental-auto-refresh"
+        assert migrated[migrated.index("--host") + 1] == "127.0.0.1"
+
         subprocess.run(
             ["bash", str(SCHEDULER_SCRIPT)],
             env=env,
