@@ -108,14 +108,90 @@ pub(super) async fn post_index(
         .into_response()
 }
 
-pub(super) async fn get_auth_page(headers: HeaderMap) -> Html<String> {
+pub(super) async fn get_auth_page(
+    State(state): State<Arc<DashboardServerState>>,
+    headers: HeaderMap,
+) -> Html<String> {
     let page = AUTH_HTML.replace("<!--mark-->", crate::dashboard::AICX_MARK_SVG);
-    let passphrase = if passphrase_on_loopback(&headers) {
+    // The passphrase form is a local paste of the bearer token. A non-loopback
+    // bind, including 0.0.0.0, must not render it even if the Host header says
+    // 127.0.0.1.
+    let passphrase = if state.config.host.is_loopback() && passphrase_on_loopback(&headers) {
         PASSPHRASE_HTML
     } else {
         ""
     };
     Html(page.replace("<!--passphrase-->", passphrase))
+}
+
+#[derive(Deserialize)]
+pub(super) struct OnboardingSurvey {
+    phrases: Vec<String>,
+}
+
+pub(super) async fn post_onboarding(
+    State(state): State<Arc<DashboardServerState>>,
+    headers: HeaderMap,
+    Json(survey): Json<OnboardingSurvey>,
+) -> Response {
+    if let Some(response) = reject_mutation(&state, &headers) {
+        return response;
+    }
+    let current = intent_phrases::read_operator_or_embedded(&phrases_path(&state));
+    let rendered = match crate::onboarding::merge_intent_keywords(&current, &survey.phrases) {
+        Ok(rendered) => rendered,
+        Err(err) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(JsonError {
+                    error: "invalid_phrases",
+                    detail: err,
+                }),
+            )
+                .into_response();
+        }
+    };
+    if let Err(err) = intent_phrases::reload_from_str(&rendered) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(JsonError {
+                error: "invalid_phrases",
+                detail: err,
+            }),
+        )
+            .into_response();
+    }
+    let path = phrases_path(&state);
+    if let Some(parent) = path.parent()
+        && let Err(err) = std::fs::create_dir_all(parent)
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(JsonError {
+                error: "write_failed",
+                detail: err.to_string(),
+            }),
+        )
+            .into_response();
+    }
+    if let Err(err) = std::fs::write(&path, rendered) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(JsonError {
+                error: "write_failed",
+                detail: err.to_string(),
+            }),
+        )
+            .into_response();
+    }
+    (
+        StatusCode::OK,
+        Json(JsonOk {
+            ok: true,
+            path: path.display().to_string(),
+        }),
+    )
+        .into_response()
 }
 
 /// The passphrase control is a local paste of the existing bearer token.
@@ -746,7 +822,7 @@ mod tests {
             .expect("runtime")
     }
 
-    fn auth_router() -> Router {
+    fn auth_router(host: std::net::IpAddr) -> Router {
         Router::new()
             .route("/auth", get(get_auth_page))
             .route("/auth/tailscale", get(auth_tailscale))
@@ -754,6 +830,7 @@ mod tests {
             .route("/auth/github", get(auth_github_start))
             .route("/auth/google/callback", get(auth_google_callback))
             .route("/auth/github/callback", get(auth_github_callback))
+            .with_state(super::super::test_server_state(host))
     }
 
     async fn text_of(response: Response) -> String {
@@ -783,7 +860,7 @@ mod tests {
     #[test]
     fn auth_routes_respond() {
         runtime().block_on(async {
-            let app = auth_router();
+            let app = auth_router("127.0.0.1".parse().unwrap());
             let page = app
                 .clone()
                 .oneshot(
@@ -842,6 +919,23 @@ mod tests {
                 .unwrap();
             let remote_html = text_of(remote).await;
             assert!(!remote_html.contains("passphrase-open"));
+
+            let public_bind = auth_router("0.0.0.0".parse().unwrap());
+            let spoofed = public_bind
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri("/auth")
+                        .header("host", "127.0.0.1:50110")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let spoofed_html = text_of(spoofed).await;
+            assert!(
+                !spoofed_html.contains("passphrase-open"),
+                "0.0.0.0 must not render the passphrase form"
+            );
 
             let missing = app
                 .clone()

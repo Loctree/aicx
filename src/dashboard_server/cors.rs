@@ -78,6 +78,17 @@ impl DashboardCorsPolicy {
     }
 }
 
+/// CORS for the hybrid listener. Loopback stays local. Any other bind uses the
+/// explicit Tailscale policy so `validate_dashboard_host_policy` can pass
+/// without opening `*` or turning bearer auth off.
+pub fn policy_for_hybrid_bind(host: IpAddr) -> (DashboardCorsPolicy, bool) {
+    if host.is_loopback() {
+        (DashboardCorsPolicy::Local, false)
+    } else {
+        (DashboardCorsPolicy::Tailscale, true)
+    }
+}
+
 pub fn validate_dashboard_host_policy(
     host: IpAddr,
     cors_policy: &DashboardCorsPolicy,

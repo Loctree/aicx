@@ -36,7 +36,7 @@ mod cors;
 mod operator;
 mod search;
 use cors::dashboard_cors_middleware;
-pub use cors::{DashboardCorsPolicy, validate_dashboard_host_policy};
+pub use cors::{DashboardCorsPolicy, policy_for_hybrid_bind, validate_dashboard_host_policy};
 
 const REGENERATE_HEADER_NAME: &str = "x-ai-contexters-action";
 const REGENERATE_HEADER_VALUE: &str = "regenerate";
@@ -166,61 +166,10 @@ impl Drop for RebuildFlagGuard<'_> {
 pub async fn run_dashboard_server(config: DashboardServerConfig) -> Result<()> {
     validate_dashboard_host_policy(config.host, &config.cors_policy, true, &config.auth)?;
 
-    let initial = rebuild_dashboard(&config).context("Initial dashboard build failed")?;
-    let shell_html = dashboard::render_server_shell_html(&config.title);
-
-    let state = Arc::new(DashboardServerState {
-        config: config.clone(),
-        shell_html,
-        snapshot: RwLock::new(DashboardSnapshot::from_build(initial)),
-        rebuilding: AtomicBool::new(false),
-    });
+    let app = dashboard_router(config.clone(), true, false).await?;
 
     let auth_source_label = config.auth.source.describe();
     let auth_enforced = config.auth.is_enforced();
-
-    // Public (no Bearer) routes: HTML shell + manifest + service worker + liveness.
-    // The browser fetches these as a raw GET to render the UI; the corpus-data
-    // surface (`/api/browse`, `/api/detail`, `/api/chunk`, `/api/context`,
-    // `/api/search/*`, `/api/regenerate`, `/api/status`) is gated below.
-    let public_router: Router<Arc<DashboardServerState>> = Router::new()
-        .route("/", get(get_dashboard_html))
-        .route("/health", get(get_health))
-        .route("/api/health", get(get_health))
-        .route("/manifest.webmanifest", get(get_manifest))
-        .route("/service-worker.js", get(get_service_worker))
-        .route("/auth", get(operator::get_auth_page))
-        .route("/auth/tailscale", get(operator::auth_tailscale))
-        .route("/auth/google", get(operator::auth_google_start))
-        .route("/auth/github", get(operator::auth_github_start))
-        .route("/auth/google/callback", get(operator::auth_google_callback))
-        .route("/auth/github/callback", get(operator::auth_github_callback));
-
-    let api_router: Router<Arc<DashboardServerState>> = Router::new()
-        .route("/api/status", get(get_status))
-        .route("/api/browse", get(browse::get_browse))
-        .route("/api/detail", get(browse::get_detail))
-        .route("/api/chunk", get(browse::get_chunk))
-        .route("/api/context", get(get_context))
-        .route("/api/regenerate", post(regenerate_dashboard))
-        .route("/api/search/semantic", get(search::get_semantic_search))
-        .route("/api/search/cross", get(search::cross_search_gone))
-        .route("/api/search/steer", get(search::steer_search))
-        .route(
-            "/api/phrases",
-            get(operator::get_phrases).put(operator::put_phrases),
-        )
-        .route("/api/index", post(operator::post_index));
-
-    let api_router = auth::require_auth_layer(api_router, config.auth.clone());
-
-    let app = public_router
-        .merge(api_router)
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            dashboard_cors_middleware,
-        ))
-        .with_state(state);
 
     let addr = SocketAddr::new(config.host, config.port);
     let listener = tokio::net::TcpListener::bind(addr)
@@ -274,6 +223,127 @@ pub async fn run_dashboard_server(config: DashboardServerConfig) -> Result<()> {
     )
     .await
     .context("Dashboard server runtime terminated unexpectedly")
+}
+
+/// Dashboard routes for a dedicated server or the hybrid HTTP listener.
+///
+/// `mount_health` is false on the hybrid listener because MCP already owns
+/// `/health`. `allow_empty_scan` keeps that listener up when the corpus scan
+/// cannot run; the shell and onboarding survey still bind.
+pub async fn dashboard_router(
+    config: DashboardServerConfig,
+    mount_health: bool,
+    allow_empty_scan: bool,
+) -> Result<Router> {
+    let initial = match rebuild_dashboard(&config) {
+        Ok(build) => build,
+        Err(err) if allow_empty_scan => {
+            tracing::warn!(
+                error = %err,
+                "dashboard scan failed; serving an empty shell with onboarding"
+            );
+            empty_build(&config)
+        }
+        Err(err) => return Err(err.context("Initial dashboard build failed")),
+    };
+    let local_open = config.host.is_loopback() && !config.auth.is_enforced();
+    let shell_html = dashboard::render_server_shell_html_for(&config.title, local_open);
+    let state = Arc::new(DashboardServerState {
+        config: config.clone(),
+        shell_html,
+        snapshot: RwLock::new(DashboardSnapshot::from_build(initial)),
+        rebuilding: AtomicBool::new(false),
+    });
+    Ok(assemble_router(state, mount_health))
+}
+
+fn assemble_router(state: Arc<DashboardServerState>, mount_health: bool) -> Router {
+    let mut public_router: Router<Arc<DashboardServerState>> = Router::new()
+        .route("/", get(get_dashboard_html))
+        .route("/manifest.webmanifest", get(get_manifest))
+        .route("/service-worker.js", get(get_service_worker))
+        .route("/auth", get(operator::get_auth_page))
+        .route("/auth/tailscale", get(operator::auth_tailscale))
+        .route("/auth/google", get(operator::auth_google_start))
+        .route("/auth/github", get(operator::auth_github_start))
+        .route("/auth/google/callback", get(operator::auth_google_callback))
+        .route("/auth/github/callback", get(operator::auth_github_callback));
+    if mount_health {
+        public_router = public_router
+            .route("/health", get(get_health))
+            .route("/api/health", get(get_health));
+    } else {
+        public_router = public_router.route("/api/health", get(get_health));
+    }
+
+    let api_router: Router<Arc<DashboardServerState>> = Router::new()
+        .route("/api/status", get(get_status))
+        .route("/api/browse", get(browse::get_browse))
+        .route("/api/detail", get(browse::get_detail))
+        .route("/api/chunk", get(browse::get_chunk))
+        .route("/api/context", get(get_context))
+        .route("/api/regenerate", post(regenerate_dashboard))
+        .route("/api/search/semantic", get(search::get_semantic_search))
+        .route("/api/search/cross", get(search::cross_search_gone))
+        .route("/api/search/steer", get(search::steer_search))
+        .route(
+            "/api/phrases",
+            get(operator::get_phrases).put(operator::put_phrases),
+        )
+        .route("/api/onboarding", post(operator::post_onboarding))
+        .route("/api/index", post(operator::post_index));
+
+    let api_router = auth::require_auth_layer(api_router, state.config.auth.clone());
+
+    public_router
+        .merge(api_router)
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            dashboard_cors_middleware,
+        ))
+        .with_state(state)
+}
+
+fn empty_build(config: &DashboardServerConfig) -> BuildOutput {
+    BuildOutput {
+        payload: DashboardPayload {
+            generated_at: Utc::now().to_rfc3339(),
+            aicx_home: config.aicx_home.display().to_string(),
+            stats: DashboardStats::default(),
+            assumptions: vec![
+                "Dashboard scan was unavailable; the shell still serves the onboarding survey."
+                    .to_string(),
+            ],
+            projects: Vec::new(),
+            agents: Vec::new(),
+            kinds: Vec::new(),
+            records: Vec::new(),
+        },
+        generated_at: Utc::now(),
+    }
+}
+
+#[cfg(test)]
+fn test_server_state(host: std::net::IpAddr) -> Arc<DashboardServerState> {
+    let config = DashboardServerConfig {
+        aicx_home: std::env::temp_dir(),
+        scope: DashboardScope::default(),
+        title: "test".to_string(),
+        preview_chars: 320,
+        artifact_path: std::env::temp_dir().join("aicx-dashboard.html"),
+        cors_policy: DashboardCorsPolicy::Local,
+        host,
+        port: 9,
+        auth: AuthConfig::disabled(),
+        allow_no_origin: true,
+    };
+    let initial = empty_build(&config);
+    Arc::new(DashboardServerState {
+        config,
+        shell_html: String::new(),
+        snapshot: RwLock::new(DashboardSnapshot::from_build(initial)),
+        rebuilding: AtomicBool::new(false),
+    })
 }
 
 async fn get_dashboard_html(State(state): State<Arc<DashboardServerState>>) -> impl IntoResponse {
@@ -473,7 +543,7 @@ async fn get_service_worker() -> Response {
     let sw_js = concat!(
         "const CACHE_NAME='aicx-shell-v",
         env!("AICX_BUILD_VERSION"),
-        "';\
+        "-net';\
 const SHELL_URLS=['/','/manifest.webmanifest'];\
 self.addEventListener('install',e=>{e.waitUntil(caches.open(CACHE_NAME)\
 .then(c=>c.addAll(SHELL_URLS)));self.skipWaiting();});\
@@ -482,13 +552,14 @@ self.addEventListener('activate',e=>{e.waitUntil(caches.keys()\
 self.clients.claim();});\
 self.addEventListener('fetch',e=>{const u=new URL(e.request.url);\
 if(u.pathname.startsWith('/api/')||u.pathname==='/service-worker.js')return;\
-e.respondWith(caches.match(e.request).then(r=>{if(r)return r;\
-return fetch(e.request).catch(()=>{if(e.request.mode==='navigate')\
+e.respondWith(fetch(e.request).then(resp=>{const copy=resp.clone();\
+caches.open(CACHE_NAME).then(c=>c.put(e.request,copy));return resp;}).catch(()=>caches.match(e.request).then(r=>{if(r)return r;\
+if(e.request.mode==='navigate')\
 return new Response('<html><body style=\"background:#0e0e0e;color:#f5f1e7;\
 font-family:system-ui;display:flex;align-items:center;justify-content:center;\
 height:100vh;margin:0\"><div style=\"text-align:center\"><h1>aicx archive not \
 reachable</h1><p>Start the server with <code>aicx dashboard --serve</code></p>\
-</div></body></html>',{headers:{'Content-Type':'text/html'}});});}));});"
+</div></body></html>',{headers:{'Content-Type':'text/html'}});})));});"
     );
     let mut headers = HeaderMap::new();
     headers.insert(
