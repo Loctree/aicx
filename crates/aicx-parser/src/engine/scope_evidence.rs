@@ -94,10 +94,11 @@ pub enum WindowScope {
 ///
 /// ALL occurrences are returned, not the first: one `input` can orchestrate
 /// several `tools.exec_command` calls, and reading only the first hides a
-/// later hop into another repository behind a baseline-looking opener. It also
-/// keeps a `workdir:`-shaped string inside a shell command from deciding the
-/// window on its own — an extra reading makes the window unattributed or
-/// conflicted, never confidently wrong.
+/// later hop into another repository behind a baseline-looking opener. A
+/// `workdir:` object written inside a string or a comment — a shell command
+/// that echoes one, an example, a commented-out call — is opaque, never a
+/// path: the call beside it may name no directory at all, and that text alone
+/// would then have decided the window.
 ///
 /// A `workdir` whose value is written but cannot be read as one path — a
 /// variable or an expression, a template literal that interpolates, a literal
@@ -192,12 +193,15 @@ pub fn tool_call_workdirs(payload: &Value) -> Vec<WorkdirEvidence> {
 /// whatever the variable `workdir` holds — and a template-literal key
 /// exists only in brackets.
 ///
-/// This is a scanner over key/value SHAPE, not a JavaScript parser, and it
-/// does not track which string a `workdir` sits inside. Model JavaScript
-/// routinely carries apostrophes in comments and prose; a tokenizer that
-/// misreads one would hide a real `workdir` key after it, which is a leak. A
-/// string that itself spells an object property — `'{workdir: "/x"}'` — is
-/// therefore still read.
+/// This is a scanner over key/value SHAPE, not a JavaScript parser: every key
+/// is found wherever it sits, and where it sits only decides what a readable
+/// path is worth. A key inside a string, a template or a comment
+/// ([`inert_spans`]) — `'{workdir: "/x"}'`, a shell command that echoes one,
+/// a commented-out call — is text no call ran with. Read as a path, it was the
+/// only evidence beside a call that named no directory and moved the whole
+/// window to `/x`. It is opaque instead: never hidden, because a lexer that
+/// misreads an apostrophe in prose must not hide a real key after it, and
+/// never a directory the window is placed in.
 fn workdirs_in_literal(input: &str) -> Vec<WorkdirEvidence> {
     static WORKDIR_KEY_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     // The leading class is the identifier boundary the regex crate has no
@@ -208,6 +212,8 @@ fn workdirs_in_literal(input: &str) -> Vec<WorkdirEvidence> {
             .expect("valid regex")
     });
     let mut found = Vec::new();
+    // Lexed on the first readable path only: most inputs never get there.
+    let mut inert: Option<Vec<std::ops::Range<usize>>> = None;
     for caps in re.captures_iter(input) {
         let Some(key) = caps.name("key") else {
             continue;
@@ -272,7 +278,13 @@ fn workdirs_in_literal(input: &str) -> Vec<WorkdirEvidence> {
             }
             Some(literal) => {
                 let body = literal.body.trim();
-                if !body.is_empty() {
+                if body.is_empty() {
+                    continue;
+                }
+                let inert = inert.get_or_insert_with(|| inert_spans(input));
+                if within(inert, key.start()) {
+                    found.push(WorkdirEvidence::Opaque);
+                } else {
                     found.push(WorkdirEvidence::Explicit(body.to_string()));
                 }
             }
@@ -280,6 +292,162 @@ fn workdirs_in_literal(input: &str) -> Vec<WorkdirEvidence> {
         }
     }
     found
+}
+
+/// Byte ranges of `input` that JavaScript reads as text rather than code:
+/// string and template literals from their opening quote, comments, and
+/// regular-expression literals. The `${…}` of a template is code again.
+///
+/// A lexer's first pass, not a parser, and it only decides what a `workdir`
+/// key is worth, never whether one is seen ([`workdirs_in_literal`]). A quote
+/// it pairs wrongly — an apostrophe in prose outside any comment, a regular
+/// expression it takes for a division — makes the code after it look like
+/// text, which can only turn a readable path opaque. A `'` or `"` string ends
+/// at the line break JavaScript forbids inside it, so a stray quote costs the
+/// rest of its line and no more.
+fn inert_spans(input: &str) -> Vec<std::ops::Range<usize>> {
+    let bytes = input.as_bytes();
+    let mut spans = Vec::new();
+    // The brace depth inside each `${` still open, innermost last.
+    let mut interpolations: Vec<usize> = Vec::new();
+    // A `/` opens a regular expression where no value has just ended: at the
+    // start, and after an operator or an opening bracket. After a name, a
+    // number or a closing bracket it divides.
+    let mut regex_may_open = true;
+    let mut at = 0;
+    while at < bytes.len() {
+        let start = at;
+        match bytes[at] {
+            quote @ (b'"' | b'\'') => {
+                at = quoted_end(bytes, at + 1, quote);
+                regex_may_open = false;
+            }
+            b'`' => {
+                at = template_end(bytes, at + 1, &mut interpolations);
+                regex_may_open = false;
+            }
+            b'}' if interpolations.last() == Some(&0) => {
+                interpolations.pop();
+                at = template_end(bytes, at + 1, &mut interpolations);
+                regex_may_open = false;
+            }
+            b'/' if bytes.get(at + 1) == Some(&b'/') => {
+                at = bytes[at..]
+                    .iter()
+                    .position(|&byte| byte == b'\n')
+                    .map_or(bytes.len(), |line| at + line);
+            }
+            b'/' if bytes.get(at + 1) == Some(&b'*') => {
+                at = bytes[at + 2..]
+                    .windows(2)
+                    .position(|pair| pair == b"*/")
+                    .map_or(bytes.len(), |close| at + 2 + close + 2);
+            }
+            b'/' if regex_may_open => {
+                at = regex_end(bytes, at + 1);
+                regex_may_open = false;
+            }
+            byte => {
+                if let Some(depth) = interpolations.last_mut() {
+                    match byte {
+                        b'{' => *depth += 1,
+                        b'}' => *depth -= 1,
+                        _ => {}
+                    }
+                }
+                if !byte.is_ascii_whitespace() {
+                    regex_may_open = matches!(
+                        byte,
+                        b'(' | b'['
+                            | b'{'
+                            | b'}'
+                            | b','
+                            | b';'
+                            | b':'
+                            | b'='
+                            | b'!'
+                            | b'&'
+                            | b'|'
+                            | b'?'
+                            | b'+'
+                            | b'-'
+                            | b'*'
+                            | b'%'
+                            | b'<'
+                            | b'>'
+                            | b'~'
+                            | b'^'
+                    );
+                }
+                at += 1;
+                continue;
+            }
+        }
+        spans.push(start..at);
+    }
+    spans
+}
+
+/// Just past the quote that closes a `'` or `"` string, or at the line break
+/// that ends it unclosed. An escaped line break continues the string.
+fn quoted_end(bytes: &[u8], mut at: usize, quote: u8) -> usize {
+    while at < bytes.len() {
+        match bytes[at] {
+            b'\\' if bytes[at + 1..].starts_with(b"\r\n") => at += 3,
+            b'\\' => at += 2,
+            b'\n' | b'\r' => return at,
+            byte if byte == quote => return at + 1,
+            _ => at += 1,
+        }
+    }
+    bytes.len()
+}
+
+/// Just past the backtick that closes a template, or past a `${` that opens
+/// code inside it, whose depth is then pushed onto `interpolations`.
+fn template_end(bytes: &[u8], mut at: usize, interpolations: &mut Vec<usize>) -> usize {
+    while at < bytes.len() {
+        match bytes[at] {
+            b'\\' => at += 2,
+            b'`' => return at + 1,
+            b'$' if bytes.get(at + 1) == Some(&b'{') => {
+                interpolations.push(0);
+                return at + 2;
+            }
+            _ => at += 1,
+        }
+    }
+    bytes.len()
+}
+
+/// Just past the `/` that closes a regular expression, or at the line break
+/// that shows it was none. A `/` inside a character class does not close it.
+fn regex_end(bytes: &[u8], mut at: usize) -> usize {
+    let mut in_class = false;
+    while at < bytes.len() {
+        match bytes[at] {
+            b'\\' => at += 2,
+            b'\n' | b'\r' => return at,
+            b'[' => {
+                in_class = true;
+                at += 1;
+            }
+            b']' => {
+                in_class = false;
+                at += 1;
+            }
+            b'/' if !in_class => return at + 1,
+            _ => at += 1,
+        }
+    }
+    bytes.len()
+}
+
+/// Does one of the sorted, disjoint `spans` hold `at` past its first byte? A
+/// string that OPENS at `at` is the key's own quote, not text around it.
+fn within(spans: &[std::ops::Range<usize>], at: usize) -> bool {
+    let before = spans.partition_point(|span| span.start < at);
+    before > 0 && at < spans[before - 1].end
 }
 
 /// The text on either side of a quoted key that brackets compute —
@@ -2302,6 +2470,56 @@ mod tests {
             r#"const example = "workdir"; tools.exec_command({cmd: "ls"})"#,
         ] {
             assert!(tool_call_workdirs(&js_input(input)).is_empty(), "{input}");
+        }
+    }
+
+    /// Finding: a `workdir` property written inside a string or a comment —
+    /// `'{workdir: "/repo/foreign"}'`, a commented-out call — was read as a
+    /// path. Beside a real call that names no directory it was the only
+    /// evidence, and it moved the whole window to that checkout.
+    #[test]
+    fn a_workdir_written_inside_text_is_never_a_path() {
+        for input in [
+            r#"const example = '{workdir: "/repo/foreign"}'; tools.exec_command({cmd: "pwd"})"#,
+            r#"tools.exec_command({cmd: "echo {workdir: '/repo/foreign'}"})"#,
+            r#"const doc = `{cmd: "ls", workdir: "/repo/foreign"}`; tools.exec_command({cmd: "pwd"})"#,
+            "// tools.exec_command({cmd: \"ls\", workdir: \"/repo/foreign\"})\ntools.exec_command({cmd: \"pwd\"})",
+            r#"/* {workdir: "/repo/foreign"} */ tools.exec_command({cmd: "pwd"})"#,
+            // A stray apostrophe in prose hides nothing: the key after it on
+            // the same line is still seen, only no longer as a path.
+            r#"It's here: tools.exec_command({cmd: "ls", workdir: "/repo/foreign"})"#,
+        ] {
+            assert_eq!(
+                tool_call_workdirs(&js_input(input)),
+                vec![WorkdirEvidence::Opaque],
+                "{input}"
+            );
+        }
+        // JSON arguments whose only `workdir` is inside the command string.
+        let payload = serde_json::json!({
+            "type": "function_call",
+            "name": "shell",
+            "arguments": r#"{"cmd":"echo {workdir: '/repo/foreign'}"}"#,
+        });
+        assert_eq!(tool_call_workdirs(&payload), vec![WorkdirEvidence::Opaque]);
+        // Code beside text is still code: a string, a comment, a template's
+        // interpolation, a regular expression and a division each end where
+        // JavaScript ends them, and the real call after them is read.
+        for input in [
+            r#"const note = "it's fine"; tools.exec_command({cmd: "ls", workdir: "/repo/a"})"#,
+            "// don't touch\ntools.exec_command({cmd: \"ls\", workdir: \"/repo/a\"})",
+            "It's here\ntools.exec_command({cmd: \"ls\", workdir: \"/repo/a\"})",
+            r#"const s = `${tools.exec_command({cmd: "ls", workdir: "/repo/a"})}`"#,
+            r#"const quote = /'/; tools.exec_command({cmd: "ls", workdir: "/repo/a"})"#,
+            r#"const half = total / 2; tools.exec_command({cmd: "ls", workdir: "/repo/a"})"#,
+            r#"tools.exec_command({cmd: "curl http://host/x", workdir: "/repo/a"})"#,
+            r#"tools.exec_command({"cmd": "ls", "workdir": "/repo/a"})"#,
+        ] {
+            assert_eq!(
+                tool_call_workdirs(&js_input(input)),
+                explicit(&["/repo/a"]),
+                "{input}"
+            );
         }
     }
 
