@@ -817,18 +817,18 @@ pub fn truncated_record_is_tool_call(prefix: &str) -> bool {
 ///
 /// * it tracks JSON string state, so `"type":` written inside an argument
 ///   body is text, not a key; and
-/// * it tracks nesting depth and keeps only the envelope (depth 1) and its
-///   payload (depth 2), which is where a Codex record's discriminators live.
+/// * it tracks which object each key sits in and keeps only the envelope's
+///   own keys and those of its `payload` object, which is where a Codex
+///   record's discriminators live. Depth alone is not that: a sibling such
+///   as `metadata: {"type":"note"}` is as shallow as the payload and is
+///   content all the same.
 ///
 /// Both matter for the same reason: the threshold below decides whether an
 /// unreadable record is allowed to keep its window attributed. A count that
-/// payload CONTENT can raise — an `arguments` object carrying its own
-/// `"type"` field — hands that decision to the very bytes we could not read.
+/// payload CONTENT or a sibling object can raise — an `arguments` object
+/// carrying its own `"type"` field, a `metadata` note before the payload —
+/// hands that decision to bytes that say nothing about the payload.
 fn record_type_discriminators(prefix: &str) -> Vec<String> {
-    /// Deepest nesting level at which a `"type"` key is still the record's
-    /// own discriminator: 1 is the envelope, 2 its `payload`.
-    const DISCRIMINATOR_DEPTH: usize = 2;
-
     let bytes = prefix.as_bytes();
     // Reads the string token starting at `bytes[at] == b'"'`, returning its
     // contents and the index just past the closing quote. An unterminated
@@ -850,17 +850,27 @@ fn record_type_discriminators(prefix: &str) -> Vec<String> {
     };
 
     let mut found = Vec::new();
-    let mut depth = 0usize;
+    // One entry per open container, outermost first: is it the envelope's
+    // `payload` object?
+    let mut containers: Vec<bool> = Vec::new();
+    // The envelope key whose value comes next, so the container it opens
+    // knows whether it is the payload.
+    let mut envelope_key: Option<String> = None;
     let mut idx = 0usize;
     while idx < bytes.len() {
         match bytes[idx] {
-            b'{' | b'[' => {
-                depth += 1;
+            open @ (b'{' | b'[') => {
+                containers.push(
+                    open == b'{'
+                        && containers.len() == 1
+                        && envelope_key.as_deref() == Some("payload"),
+                );
+                envelope_key = None;
                 idx += 1;
                 continue;
             }
             b'}' | b']' => {
-                depth = depth.saturating_sub(1);
+                containers.pop();
                 idx += 1;
                 continue;
             }
@@ -874,15 +884,24 @@ fn record_type_discriminators(prefix: &str) -> Vec<String> {
             break;
         };
         idx = after;
-        if token != "type" || depth > DISCRIMINATOR_DEPTH {
-            continue;
-        }
-        // A `"type"` token is only a discriminator when it is used as a KEY.
+        // Only a string used as a KEY names anything.
         let mut cursor = idx;
         while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
             cursor += 1;
         }
         if cursor >= bytes.len() || bytes[cursor] != b':' {
+            continue;
+        }
+        let discriminator = token == "type"
+            && match containers.len() {
+                1 => true,
+                2 => containers[1],
+                _ => false,
+            };
+        if containers.len() == 1 {
+            envelope_key = Some(token);
+        }
+        if !discriminator {
             continue;
         }
         cursor += 1;
@@ -2935,6 +2954,38 @@ mod tests {
         // either.
         let odd = format!(r#"{envelope}"type":null,"arguments":"#);
         assert!(truncated_record_is_tool_call(&odd));
+    }
+
+    /// Finding: the discriminator scan kept every `type` key within two levels,
+    /// so a sibling object as shallow as the payload — `metadata: {"type":…}`
+    /// before it — supplied the second discriminator. An envelope, that note
+    /// and a payload cut before its own late `type` read as two readable
+    /// non-call discriminators and kept the window attributed.
+    #[test]
+    fn a_sibling_type_before_the_payload_is_not_its_discriminator() {
+        let prefix = concat!(
+            r#"{"timestamp":"2026-09-22T00:00:00Z","type":"response_item","#,
+            r#""metadata":{"type":"note"},"payload":{"#,
+            r#""arguments":"{\"cmd\":\"deploy\",\"workdir\":\"/other/checkout"#
+        );
+        assert!(
+            truncated_record_is_tool_call(prefix),
+            "only the payload's own `type` can prove the record is not a call"
+        );
+
+        // A sibling array of objects is content too.
+        let listed = concat!(
+            r#"{"type":"response_item","tags":[{"type":"note"}],"payload":{"#,
+            r#""arguments":"{\"workdir\":\"/other/checkout"#
+        );
+        assert!(truncated_record_is_tool_call(listed));
+
+        // The payload's own `type`, after the same sibling, still reads.
+        let readable = concat!(
+            r#"{"type":"response_item","metadata":{"type":"note"},"payload":{"#,
+            r#""type":"message","content":[{"#
+        );
+        assert!(!truncated_record_is_tool_call(readable));
     }
 
     /// Finding: replaying a session whose checkout is gone from this machine.
