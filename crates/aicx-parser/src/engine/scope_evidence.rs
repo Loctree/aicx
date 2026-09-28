@@ -718,12 +718,24 @@ fn windows_drive_root(path: &str) -> bool {
 }
 
 /// Is this a Windows spelling, where `\` is a separator rather than a legal
-/// filename character?
+/// filename character? A drive, a `\`-rooted path, or a UNC root in either
+/// separator.
 fn windows_shaped(path: &str) -> bool {
     path.starts_with('\\')
+        || forward_slash_unc(path)
         || (path.len() >= 2
             && path.as_bytes()[0].is_ascii_alphabetic()
             && path.as_bytes()[1] == b':')
+}
+
+/// `//server/share`: Windows reads it as `\\server\share`. Read as a Unix
+/// path, `..` popped the share and `//server/share/../other` became
+/// `/server/other`, another share. Exactly two leading `/` and a name: POSIX
+/// leaves that prefix implementation-defined, which is room for this reading,
+/// while three or more collapse to `/` everywhere.
+fn forward_slash_unc(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    bytes.len() > 2 && bytes[0] == b'/' && bytes[1] == b'/' && !matches!(bytes[2], b'/' | b'\\')
 }
 
 /// The separator a path is spelled with, so a join or a rewrite keeps it.
@@ -953,10 +965,11 @@ pub fn recorded_workdir(path: &str, baseline: Option<&str>) -> String {
 /// collapsed. `\` separates only in a Windows spelling; in a Unix path it is a
 /// legal filename character and stays one.
 ///
-/// A UNC root is the whole `\\server\share`: Windows anchors `..` at the
-/// share, so `\\server\share\..\other` is `\\server\share\other`. Popping the
-/// share as an ordinary component fabricated `\\server\other`, another share,
-/// and a window whose baseline was that share read the call as its own.
+/// A UNC root is the whole `\\server\share` (or `//server/share`): Windows
+/// anchors `..` at the share, so `\\server\share\..\other` is
+/// `\\server\share\other`. Popping the share as an ordinary component
+/// fabricated `\\server\other`, another share, and a window whose baseline was
+/// that share read the call as its own.
 fn lexically_normalized(path: &str) -> String {
     let path = path.trim();
     let windows = windows_shaped(path);
@@ -2344,6 +2357,33 @@ mod tests {
             "the call stayed on `share`, not on the baseline share"
         );
         assert!(lexically_within(r"\\server\share\pkg\..\api", share));
+    }
+
+    /// Finding: `//server/share` is the same UNC root in the separator
+    /// Windows also accepts, but it read as a Unix path, so `..` popped the
+    /// share: `//server/share/../other` became `/server/other` and sat inside
+    /// a `//server/other` baseline. Three or more leading `/` stay a Unix root.
+    #[test]
+    fn a_forward_slash_unc_share_is_one_root() {
+        for (path, normalized) in [
+            ("//server/share/../other", "//server/share/other"),
+            ("//server/share/..", "//server/share"),
+            ("//server/share/repo/./pkg", "//server/share/repo/pkg"),
+            ("///server/share/../other", "/server/other"),
+        ] {
+            assert_eq!(lexically_normalized(path), normalized, "{path}");
+        }
+        assert_eq!(
+            recorded_workdir("../other", Some("//server/share")),
+            "//server/share/other"
+        );
+        // Containment is pure string work, so no host probes a share here.
+        assert!(
+            !lexically_within("//server/share/../other", "//server/other"),
+            "the call stayed on `share`, not on the baseline share"
+        );
+        // One share in both separators and any case, as Windows resolves it.
+        assert!(lexically_within(r"\\Server\Share\pkg", "//server/share"));
     }
 
     /// Finding: lexical containment kept each path's own separator and case,
