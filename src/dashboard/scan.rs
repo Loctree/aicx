@@ -18,6 +18,10 @@ const MAX_JSON_PARSE_BYTES: u64 = 8 * 1024 * 1024;
 const SEARCH_READ_BYTES: u64 = 256 * 1024;
 const MAX_SEARCH_TEXT_CHARS: usize = 12_000;
 const MAX_DETAIL_CHARS: usize = 32_000;
+/// Newest readable sessions kept on the dashboard list. The semantic search
+/// still covers the whole catalog; opening the port must not wait on every file.
+const DASHBOARD_LIST_CAP: usize = 400;
+const DASHBOARD_READ_BUDGET: usize = 800;
 type ConversationPreview = (Option<usize>, String, String, String, Option<i64>);
 
 pub(super) fn scan_legacy_archive(
@@ -270,7 +274,20 @@ fn scan_catalog_sessions(
     let mut kinds = BTreeSet::new();
     kinds.insert("session".to_string());
 
-    for entry in by_key.into_values() {
+    let mut candidates: Vec<_> = by_key.into_values().collect();
+    let catalog_sessions = candidates.len();
+    candidates.sort_by(|left, right| {
+        right
+            .source_mtime_ns
+            .unwrap_or(0)
+            .cmp(&left.source_mtime_ns.unwrap_or(0))
+            .then_with(|| right.date.cmp(&left.date))
+    });
+    let mut attempts = 0usize;
+    for entry in candidates {
+        if records.len() >= DASHBOARD_LIST_CAP || attempts >= DASHBOARD_READ_BUDGET {
+            break;
+        }
         let project = entry
             .project
             .clone()
@@ -302,6 +319,7 @@ fn scan_catalog_sessions(
             .to_ascii_lowercase();
         // A catalog row is a session. If the conversation reader cannot produce
         // a readable turn, leave the raw jsonl out of the default list.
+        attempts += 1;
         let Some((entry_count, preview, search_excerpt, detail_text, content_sort_ts)) =
             read_catalog_conversation_preview(aicx_home, &entry, preview_chars)
         else {
@@ -384,8 +402,8 @@ fn scan_catalog_sessions(
         .join("hybrid")
         .is_dir();
     assumptions.push(format!(
-        "Rendered {} readable session(s) across {} exact project bucket(s). Rules, tool payloads, and empty epoch stamps stay out of the default list.",
-        stats.total_files, stats.total_projects
+        "Showing the newest {} readable session(s) from {} catalog session(s) across {} project(s). Search covers the whole corpus. Rules, tool payloads, and empty epoch stamps stay out of the list.",
+        stats.total_files, catalog_sessions, stats.total_projects
     ));
 
     Ok(ScanResult {

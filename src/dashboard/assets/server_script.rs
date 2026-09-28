@@ -23,6 +23,7 @@ pub(crate) const DASHBOARD_SERVER_SCRIPT: &str = r#"
     query: '', project: '', agent: '', kind: '', sort: 'newest', since: '',
     scoreMin: 0, limit: 350, selectedId: null, rows: [], selectedRecord: null,
     browseRecords: [], mode: 'browse', expanded: false, unit: 'session',
+    assumptions: [], indexLoaded: false, corpusTotal: 0,
   };
 
   const withoutStamp = (line) => {
@@ -30,17 +31,25 @@ pub(crate) const DASHBOARD_SERVER_SCRIPT: &str = r#"
     const end = line.indexOf(']');
     return end > 0 ? line.slice(end + 1).trim() : line;
   };
+  const stripAnsi = (value) => String(value || '')
+    .replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, '')
+    .replace(/\u001b\][^\u0007]*(?:\u0007|\u001b\\)/g, '');
+  const readableLine = (line) => {
+    let text = stripAnsi(withoutStamp(line)).replace(/^(user|assistant):\s*/i, '').replace(/<\/?user_query>/gi, ' ').replace(/\s+/g, ' ').trim();
+    if (!text || text.indexOf('<') === 0) return '';
+    if (/[\u2500-\u257F]/.test(text)) return '';
+    return text.length > 140 ? text.slice(0, 140) + '\u2026' : text;
+  };
   const readableName = (record) => {
-    const preview = record.preview || record.excerpt || '';
+    const preview = stripAnsi(record.preview || record.excerpt || '');
     const lines = preview.split('\n').map(function(line) { return line.trim(); }).filter(Boolean);
     const spoken = function(prefix) {
-      return lines.find(function(line) { return withoutStamp(line).toLowerCase().indexOf(prefix) === 0; });
+      return lines.find(function(line) { return withoutStamp(line).toLowerCase().indexOf(prefix) === 0 && readableLine(line); });
     };
     const chosen = spoken('user:') || spoken('assistant:');
-    if (chosen) {
-      let text = withoutStamp(chosen).replace(/^(user|assistant):\s*/i, '').replace(/<\/?user_query>/gi, ' ').replace(/\s+/g, ' ').trim();
-      if (text && text.indexOf('<') !== 0) return text.length > 140 ? text.slice(0, 140) + '\u2026' : text;
-    }
+    if (chosen) return readableLine(chosen);
+    const first = lines.map(readableLine).find(Boolean);
+    if (first) return first;
     const raw = record.file_name || record.file || '';
     const label = (record.label || '').trim();
     if (label && !/\.jsonl?$/i.test(label)) return label;
@@ -48,7 +57,7 @@ pub(crate) const DASHBOARD_SERVER_SCRIPT: &str = r#"
     return raw || '(unnamed)';
   };
   const listPreview = (record) => {
-    const text = (record.preview || record.excerpt || '').replace(/\[1970-01-01[^\]]*\]\s*/g, '').trim();
+    const text = stripAnsi((record.preview || record.excerpt || '').replace(/\[1970-01-01[^\]]*\]\s*/g, '')).trim();
     if (!text || text.indexOf('<rules>') === 0) return '';
     return text.length > 240 ? text.slice(0, 240) + '\u2026' : text;
   };
@@ -211,7 +220,7 @@ pub(crate) const DASHBOARD_SERVER_SCRIPT: &str = r#"
     if (!record) {
       ui.detailTitle.textContent = 'No result selected';
       ui.detailMeta.textContent = '';
-      ui.detailContent.innerHTML = 'Use search or filters to pick a note.';
+      ui.detailContent.textContent = 'Open a session.';
       return;
     }
     const title = readableName(record);
@@ -219,7 +228,7 @@ pub(crate) const DASHBOARD_SERVER_SCRIPT: &str = r#"
     const meta = [record.project, record.agent, record.kind, record.date, scoreTxt].filter(Boolean).join(' \u2022 ');
     ui.detailTitle.innerHTML = highlightTerms(title, state.query);
     ui.detailMeta.innerHTML = highlightTerms(meta, state.query);
-    const previewText = record.preview || record.excerpt || '';
+    const previewText = stripAnsi(record.preview || record.excerpt || '');
     if (previewText) {
       ui.detailContent.innerHTML = '<div class="md-rendered">' + renderMarkdown(previewText) + '</div>';
     } else {
@@ -245,7 +254,7 @@ pub(crate) const DASHBOARD_SERVER_SCRIPT: &str = r#"
       .then(function(r) { return r.json(); })
       .then(function(data) {
         if (!data.ok) { ui.detailContent.textContent = 'Failed: ' + (data.error || 'unknown'); return; }
-        const content = data.content || data.detail_text || '';
+        const content = stripAnsi(data.content || data.detail_text || '');
         state.expanded = true;
         if (ui.expand) ui.expand.textContent = 'Collapse';
         ui.detailContent.innerHTML = '<div class="md-rendered">' + renderMarkdown(content) + '</div>';
@@ -257,11 +266,19 @@ pub(crate) const DASHBOARD_SERVER_SCRIPT: &str = r#"
   };
 
   /* --- result list ------------------------------------------------------- */
+  const corpusQuiet = () => !state.query && !state.project && !state.agent && !state.kind && !state.since && state.scoreMin === 0;
+  const emptyReason = () => {
+    if (!corpusQuiet()) return 'No sessions match this search.';
+    const note = (state.assumptions || []).find(Boolean);
+    if (note) return note;
+    if (!state.indexLoaded) return 'No index on this machine. Search only sees what has been scanned.';
+    return 'No sessions in this corpus.';
+  };
   const mkBadge = (txt) => { const n = document.createElement('span'); n.className = 'badge'; n.innerHTML = highlightTerms(String(txt || ''), state.query); return n; };
   const renderList = (rows) => {
     ui.list.innerHTML = '';
     if (!rows.length) {
-      const e = document.createElement('div'); e.className = 'empty'; e.textContent = 'No records match current query/filters.';
+      const e = document.createElement('div'); e.className = 'empty'; e.textContent = emptyReason();
       ui.list.appendChild(e); renderDetail(null, 0); return;
     }
     const visible = rows.slice(0, state.limit);
@@ -293,6 +310,12 @@ pub(crate) const DASHBOARD_SERVER_SCRIPT: &str = r#"
         preview.innerHTML = highlightTerms(truncated, state.query);
         item.appendChild(preview);
       }
+      const whereText = record.relative_path || record.path || '';
+      if (whereText) {
+        const where = document.createElement('div'); where.className = 'result-where';
+        where.textContent = whereText;
+        item.appendChild(where);
+      }
       item.addEventListener('click', function() {
         state.selectedId = rid; renderList(state.rows); renderDetail(record, score); runHooks('onSelect', record);
       });
@@ -313,7 +336,9 @@ pub(crate) const DASHBOARD_SERVER_SCRIPT: &str = r#"
     rows = runHooks('beforeRender', rows);
     state.rows = rows;
     const unit = state.unit === 'file' ? 'file' : 'session';
-    ui.summary.textContent = rows.length + ' ' + unit + (rows.length === 1 ? '' : 's');
+    ui.summary.textContent = (!rows.length && corpusQuiet())
+      ? emptyReason()
+      : rows.length + ' ' + unit + (rows.length === 1 ? '' : 's');
     renderList(rows);
     runHooks('afterRender', rows);
   };
@@ -448,12 +473,27 @@ pub(crate) const DASHBOARD_SERVER_SCRIPT: &str = r#"
         fillSelect(ui.agent, data.agents || []);
         fillSelect(ui.kind, data.kinds || []);
         const s = data.stats || {};
+        state.assumptions = data.assumptions || [];
+        state.indexLoaded = !!s.index_loaded;
+        state.corpusTotal = s.total_files || 0;
         state.unit = s.search_backend === 'catalog-live-source' ? 'session' : 'file';
-        ui.statFiles.textContent = s.total_files || 0;
+        const quietEmpty = state.corpusTotal === 0 && !s.index_loaded && !s.state_loaded;
+        ui.statFiles.textContent = quietEmpty ? '\u2014' : String(s.total_files || 0);
+        ui.statProjects.textContent = quietEmpty ? '\u2014' : String(s.total_projects || 0);
+        ui.statDays.textContent = quietEmpty ? '\u2014' : String(s.total_days || 0);
         const unitLabel = document.getElementById('ctx-stat-unit');
-        if (unitLabel) unitLabel.textContent = state.unit === 'session' ? 'sessions' : 'files';
-        ui.statProjects.textContent = s.total_projects || 0;
-        ui.statDays.textContent = s.total_days || 0;
+        if (unitLabel) unitLabel.textContent = (state.unit === 'session' || quietEmpty) ? 'sessions' : 'files';
+        const cardSessions = document.getElementById('ctx-card-sessions');
+        if (cardSessions) cardSessions.textContent = ui.statFiles.textContent;
+        const cardProjects = document.getElementById('ctx-card-projects');
+        if (cardProjects) cardProjects.textContent = ui.statProjects.textContent;
+        const indexState = document.getElementById('ctx-index-state');
+        if (indexState) indexState.textContent = s.index_loaded ? 'ready' : (quietEmpty ? 'not loaded' : 'partial');
+        const scope = document.getElementById('ctx-scope');
+        if (scope) {
+          const projects = data.projects || [];
+          scope.textContent = projects.length === 1 ? projects[0] : (projects.length ? (projects.length + ' projects') : 'This machine');
+        }
         ui.genInfo.textContent = 'Generated ' + (data.generated_at || '?');
         ui.assumptions.innerHTML = '';
         (data.assumptions || []).forEach(function(a) { const li = document.createElement('li'); li.textContent = a; ui.assumptions.appendChild(li); });
@@ -524,6 +564,22 @@ pub(crate) const DASHBOARD_SERVER_SCRIPT: &str = r#"
         .finally(() => { indexBtn.disabled = false; });
     });
   };
+
+  const navSessions = $('ctx-nav-sessions');
+  const navSetup = $('ctx-nav-setup');
+  const markNav = (active) => {
+    document.querySelectorAll('.rail-nav-item').forEach(function(btn) { btn.classList.toggle('active', btn === active); });
+  };
+  if (navSessions) navSessions.addEventListener('click', function() {
+    markNav(navSessions);
+    if (ui.list) ui.list.scrollTop = 0;
+    if (ui.search) ui.search.focus();
+  });
+  if (navSetup) navSetup.addEventListener('click', function() {
+    markNav(navSetup);
+    const onboard = $('ctx-onboarding');
+    if (onboard) onboard.open = true;
+  });
 
   const boot = () => {
     readUrlState();

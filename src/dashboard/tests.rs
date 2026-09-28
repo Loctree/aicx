@@ -565,7 +565,12 @@ fn local_open_shell_states_this_machine_and_does_not_offer_sign_in() {
     assert!(!html.contains("href=\"/auth\">Sign in"));
     assert!(html.contains("class=\"server-dash\""));
     assert!(html.contains("class=\"main-body\""));
+    assert!(html.contains("class=\"rail-search\""));
     assert!(html.contains("id=\"ctx-search\""));
+    assert_eq!(html.matches("id=\"ctx-search\"").count(), 1);
+    let search_at = html.find("id=\"ctx-search\"").expect("search");
+    let list_at = html.find("id=\"ctx-list\"").expect("list");
+    assert!(search_at < list_at);
     assert!(html.contains("id=\"ctx-onboarding-save\""));
     assert!(html.contains("id=\"ctx-phrases\""));
 }

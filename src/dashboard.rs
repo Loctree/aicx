@@ -336,116 +336,134 @@ pub fn render_server_shell_html_for(title: &str, local_open: bool) -> String {
 </head>
 <body class="server-dash">
   <div class="app-shell">
-    <header class="app-header">
-      <div class="brand-lockup">
-        <div class="brand-pair">
+    <aside class="rail">
+      <div class="rail-brand">
         {AICX_MARK_SVG}
         <span class="brand-word">AICX</span>
+      </div>
+      {access_line}
+      <form class="rail-search" role="search" action="#" onsubmit="return false">
+        <label class="sr" for="ctx-search">Search the corpus</label>
+        <input id="ctx-search" type="search" placeholder="Search the corpus" autocomplete="off" enterkeyhint="search" />
+        <div class="rail-search-tools">
+          <label class="live-toggle" title="Search while typing">
+            <input id="ctx-live" type="checkbox" /> <span>Live</span>
+          </label>
+          <button id="ctx-regenerate" type="button" class="regen-btn" title="Reload the corpus">&#8635;</button>
         </div>
+      </form>
+      <nav class="rail-nav" aria-label="Dashboard">
+        <button type="button" class="rail-nav-item active" id="ctx-nav-sessions">Sessions</button>
+        <button type="button" class="rail-nav-item" id="ctx-nav-setup">Setup</button>
+      </nav>
+      <div class="rail-scroll">
+        <div class="rail-filters">
+          <select id="ctx-project"><option value="">All projects</option></select>
+          <select id="ctx-agent"><option value="">All agents/sources</option></select>
+          <select id="ctx-kind"><option value="">All kinds</option></select>
+          <select id="ctx-sort" class="sort-select">
+            <option value="newest">Newest</option>
+            <option value="oldest">Oldest</option>
+            <option value="score">Score</option>
+          </select>
+          <div class="time-row">
+            <button class="time-btn" data-since="1h" type="button">1h</button>
+            <button class="time-btn" data-since="4h" type="button">4h</button>
+            <button class="time-btn" data-since="24h" type="button">24h</button>
+            <button class="time-btn" data-since="7d" type="button">7d</button>
+            <button class="time-btn" data-since="30d" type="button">30d</button>
+            <button class="time-btn active" data-since="" type="button">All</button>
+          </div>
+          <div class="score-group">
+            <span>Score</span>
+            <input type="range" id="ctx-score" min="0" max="100" value="0" />
+            <span id="ctx-score-label">0</span>
+          </div>
+        </div>
+        <section class="studio" id="ctx-studio">
+          <details class="studio-card" id="ctx-onboarding">
+            <summary>Start here</summary>
+            <p class="meta">Configuration survey. The phrases you actually type become intent keywords on this machine.</p>
+            <label class="meta" for="ctx-onboarding-phrases">Intent phrases, one per line</label>
+            <textarea id="ctx-onboarding-phrases" rows="4" spellcheck="false" placeholder="i want&#10;next step"></textarea>
+            <button id="ctx-onboarding-save" type="button">Save intent phrases</button>
+            <p id="ctx-onboarding-status" class="meta"></p>
+            <ol>
+              <li>{onboarding_first}</li>
+              <li>Save the phrases. They are written to intent_phrases.toml.</li>
+              <li>Build the index. Search only sees what has been indexed.</li>
+            </ol>
+            <button id="ctx-onboarding-dismiss" type="button">Hide this</button>
+          </details>
+          <details class="studio-card">
+            <summary>Phrases</summary>
+            <p class="meta">One list. Intent, task, decision, and the rest. Saved to this machine.</p>
+            <textarea id="ctx-phrases" rows="8" spellcheck="false"></textarea>
+            <button id="ctx-phrases-save" type="button">Save phrases</button>
+            <p id="ctx-phrases-status" class="meta"></p>
+          </details>
+          <div class="studio-card studio-index">
+            <button id="ctx-index" type="button">Build index</button>
+            <p id="ctx-index-status" class="meta"></p>
+          </div>
+        </section>
+      </div>
+    </aside>
+
+    <main class="stage">
+      <header class="stage-top">
         <div>
-        {access_line}
-        <p class="meta" id="ctx-gen-info">Loading…</p>
+          <p class="eyebrow">Corpus</p>
+          <p class="stage-title" id="ctx-scope">This machine</p>
+          <p class="meta" id="ctx-gen-info">Loading…</p>
         </div>
-      </div>
-      <div class="header-stats">
-        <div class="stat"><strong id="ctx-stat-files">-</strong><span id="ctx-stat-unit">files</span></div>
-        <div class="stat"><strong id="ctx-stat-projects">-</strong><span>projects</span></div>
-        <div class="stat"><strong id="ctx-stat-days">-</strong><span>days</span></div>
-      </div>
-    </header>
-
-    <section class="layout" id="ctx-layout">
-      <aside class="list-pane">
-        <div id="ctx-summary" class="summary"></div>
-        <div id="ctx-list" class="result-list"></div>
-      </aside>
-
-      <div class="resize-handle" id="ctx-resize-handle" title="Drag to resize panels"></div>
-
-      <div class="main-column">
-    <section class="controls">
-      <div class="search-row">
-        <input id="ctx-search" type="search" placeholder="Search the corpus" autocomplete="off" />
-        <label class="live-toggle" title="Live search (search while typing)">
-          <input id="ctx-live" type="checkbox" /> <span>Live</span>
-        </label>
-        <button id="ctx-regenerate" type="button" class="regen-btn" title="Regenerate dashboard data">&#8635;</button>
-      </div>
-      <div class="filter-row">
-        <select id="ctx-project"><option value="">All projects</option></select>
-        <select id="ctx-agent"><option value="">All agents/sources</option></select>
-        <select id="ctx-kind"><option value="">All kinds</option></select>
-        <select id="ctx-sort" class="sort-select">
-          <option value="newest">Newest</option>
-          <option value="oldest">Oldest</option>
-          <option value="score">Score</option>
-        </select>
-      </div>
-      <div class="time-row">
-        <button class="time-btn" data-since="1h">1h</button>
-        <button class="time-btn" data-since="4h">4h</button>
-        <button class="time-btn" data-since="24h">24h</button>
-        <button class="time-btn" data-since="7d">7d</button>
-        <button class="time-btn" data-since="30d">30d</button>
-        <button class="time-btn active" data-since="">All</button>
-        <div class="score-group">
-          <span>Score</span>
-          <input type="range" id="ctx-score" min="0" max="100" value="0" />
-          <span id="ctx-score-label">0</span>
+        <div class="header-stats">
+          <div class="stat"><strong id="ctx-stat-files">-</strong><span id="ctx-stat-unit">sessions</span></div>
+          <div class="stat"><strong id="ctx-stat-projects">-</strong><span>projects</span></div>
+          <div class="stat"><strong id="ctx-stat-days">-</strong><span>days</span></div>
         </div>
-      </div>
-    </section>
-
+      </header>
+      <section class="summary-row" aria-label="Corpus summary">
+        <article class="summary-card">
+          <strong id="ctx-card-sessions">-</strong>
+          <span>sessions</span>
+        </article>
+        <article class="summary-card">
+          <strong id="ctx-card-projects">-</strong>
+          <span>projects</span>
+        </article>
+        <article class="summary-card">
+          <strong id="ctx-index-state">-</strong>
+          <span>index</span>
+        </article>
+      </section>
       <div class="main-body">
-      <article class="detail-pane">
-        <div class="detail-head">
-          <div>
-            <h2 id="ctx-detail-title">Select a result</h2>
-            <p id="ctx-detail-meta" class="detail-meta"></p>
-          </div>
-          <div class="detail-actions">
-            <button id="ctx-expand" type="button" title="Expand full content">Expand</button>
-            <button id="ctx-copy-path" type="button">Copy Path</button>
-          </div>
-        </div>
-
-        <div id="ctx-detail-content" class="detail-content">Use search or filters to pick a note.</div>
-
-        <details class="assumptions">
-          <summary>Assumptions</summary>
-          <ul id="ctx-assumptions"></ul>
-        </details>
-      </article>
-    <section class="studio" id="ctx-studio">
-      <details class="studio-card" id="ctx-onboarding">
-        <summary>Start here</summary>
-        <p class="meta">Configuration survey. The phrases you actually type become intent keywords on this machine.</p>
-        <label class="meta" for="ctx-onboarding-phrases">Intent phrases, one per line</label>
-        <textarea id="ctx-onboarding-phrases" rows="4" spellcheck="false" placeholder="i want&#10;next step"></textarea>
-        <button id="ctx-onboarding-save" type="button">Save intent phrases</button>
-        <p id="ctx-onboarding-status" class="meta"></p>
-        <ol>
-          <li>{onboarding_first}</li>
-          <li>Save the phrases. They are written to intent_phrases.toml.</li>
-          <li>Build the index. Search only sees what has been indexed.</li>
-        </ol>
-        <button id="ctx-onboarding-dismiss" type="button">Hide this</button>
-      </details>
-      <details class="studio-card">
-        <summary>Phrases</summary>
-        <p class="meta">One list. Intent, task, decision, and the rest. Saved to this machine.</p>
-        <textarea id="ctx-phrases" rows="12" spellcheck="false"></textarea>
-        <button id="ctx-phrases-save" type="button">Save phrases</button>
-        <p id="ctx-phrases-status" class="meta"></p>
-      </details>
-      <div class="studio-card studio-index">
-        <button id="ctx-index" type="button">Build index</button>
-        <p id="ctx-index-status" class="meta"></p>
+        <section class="layout" id="ctx-layout">
+          <aside class="list-pane">
+            <div id="ctx-summary" class="summary"></div>
+            <div id="ctx-list" class="result-list"></div>
+          </aside>
+          <div class="resize-handle" id="ctx-resize-handle" title="Drag to resize panels"></div>
+          <article class="detail-pane">
+            <div class="detail-head">
+              <div>
+                <h2 id="ctx-detail-title">No result selected</h2>
+                <p id="ctx-detail-meta" class="detail-meta"></p>
+              </div>
+              <div class="detail-actions">
+                <button id="ctx-expand" type="button" title="Expand full content">Expand</button>
+                <button id="ctx-copy-path" type="button">Copy Path</button>
+              </div>
+            </div>
+            <div id="ctx-detail-content" class="detail-content">Open a session.</div>
+            <details class="assumptions">
+              <summary>Assumptions</summary>
+              <ul id="ctx-assumptions"></ul>
+            </details>
+          </article>
+        </section>
       </div>
-    </section>
-      </div>
-      </div>
-    </section>
+    </main>
   </div>
 
   <script>{}</script>
@@ -485,100 +503,92 @@ fn render_dashboard_html(payload: &DashboardPayload, title: &str) -> Result<Stri
   <title>{}</title>
   <style>{}</style>
 </head>
-<body>
+<body class="server-dash">
   <div class="app-shell">
-    <header class="app-header">
-      <div class="brand-lockup">
-        <div class="brand-pair">
+    <aside class="rail">
+      <div class="rail-brand">
         {AICX_MARK_SVG}
         <span class="brand-word">AICX</span>
-        </div>
-        <div>
-        <p class="meta">AI Context Browser</p>
-        <p class="meta">Search -> List -> Content | {}</p>
-        <p class="meta">Generated {}</p>
-        </div>
       </div>
-      <div class="header-stats">
-        <div class="stat"><strong>{}</strong><span>files</span></div>
-        <div class="stat"><strong>{}</strong><span>projects</span></div>
-        <div class="stat"><strong>{}</strong><span>days</span></div>
-      </div>
-    </header>
-
-    <section class="layout" id="ctx-layout">
-      <aside class="list-pane">
-        <div id="ctx-summary" class="summary"></div>
-        <div id="ctx-list" class="result-list"></div>
-      </aside>
-
-      <div class="resize-handle" id="ctx-resize-handle" title="Drag to resize panels"></div>
-
-      <div class="main-column">
-    <section class="controls">
-      <div class="search-row">
+      <p class="meta">AI Context Browser</p>
+      <form class="rail-search" role="search" onsubmit="return false">
+        <label class="sr" for="ctx-search">Search the corpus</label>
         <input id="ctx-search" type="search" placeholder="Search the corpus" autocomplete="off" />
-        <label class="live-toggle" title="Live search (search while typing)">
-          <input id="ctx-live" type="checkbox" /> <span>Live</span>
-        </label>
-      </div>
-      <div class="filter-row">
-        <select id="ctx-project"><option value="">All projects</option></select>
-        <select id="ctx-agent"><option value="">All agents/sources</option></select>
-        <select id="ctx-kind"><option value="">All kinds</option></select>
-      </div>
-    </section>
-
-    <section class="studio" id="ctx-studio">
-      <details class="studio-card" id="ctx-onboarding" open>
-        <summary>Start here</summary>
-        <p class="meta">Configuration survey. The phrases you actually type become intent keywords on this machine.</p>
-        <label class="meta" for="ctx-onboarding-phrases">Intent phrases, one per line</label>
-        <textarea id="ctx-onboarding-phrases" rows="4" spellcheck="false" placeholder="i want&#10;next step"></textarea>
-        <button id="ctx-onboarding-save" type="button">Save intent phrases</button>
-        <p id="ctx-onboarding-status" class="meta"></p>
-        <ol>
-          <li>Sign in if this dashboard is not on your own loopback.</li>
-          <li>Save the phrases. They are written to intent_phrases.toml.</li>
-          <li>Build the index. Search only sees what has been indexed.</li>
-        </ol>
-        <button id="ctx-onboarding-dismiss" type="button">Hide this</button>
-      </details>
-      <details class="studio-card">
-        <summary>Phrases</summary>
-        <p class="meta">One list. Intent, task, decision, and the rest. Saved to this machine.</p>
-        <textarea id="ctx-phrases" rows="12" spellcheck="false"></textarea>
-        <button id="ctx-phrases-save" type="button">Save phrases</button>
-        <p id="ctx-phrases-status" class="meta"></p>
-      </details>
-      <div class="studio-card studio-index">
-        <button id="ctx-index" type="button">Build index</button>
-        <p id="ctx-index-status" class="meta"></p>
-      </div>
-    </section>
-
-    </section>
-
-      <article class="detail-pane">
-        <div class="detail-head">
-          <div>
-            <h2 id="ctx-detail-title">Select a result</h2>
-            <p id="ctx-detail-meta" class="detail-meta"></p>
-          </div>
-          <button id="ctx-copy-path" type="button">Copy Path</button>
+      </form>
+      <div class="rail-scroll">
+        <div class="rail-filters">
+          <select id="ctx-project"><option value="">All projects</option></select>
+          <select id="ctx-agent"><option value="">All agents/sources</option></select>
+          <select id="ctx-kind"><option value="">All kinds</option></select>
         </div>
-
-        <p id="ctx-detail-path" class="detail-path"></p>
-        <p id="ctx-detail-preview" class="detail-preview"></p>
-        <pre id="ctx-detail-content" class="detail-content"></pre>
-
-        <details class="assumptions" open>
-          <summary>Assumptions</summary>
-          <ul id="ctx-assumptions"></ul>
-        </details>
-      </article>
+        <section class="studio" id="ctx-studio">
+          <details class="studio-card" id="ctx-onboarding">
+            <summary>Start here</summary>
+            <p class="meta">Configuration survey. The phrases you actually type become intent keywords on this machine.</p>
+            <label class="meta" for="ctx-onboarding-phrases">Intent phrases, one per line</label>
+            <textarea id="ctx-onboarding-phrases" rows="4" spellcheck="false" placeholder="i want&#10;next step"></textarea>
+            <button id="ctx-onboarding-save" type="button">Save intent phrases</button>
+            <p id="ctx-onboarding-status" class="meta"></p>
+            <ol>
+              <li>Sign in if this dashboard is not on your own loopback.</li>
+              <li>Save the phrases. They are written to intent_phrases.toml.</li>
+              <li>Build the index. Search only sees what has been indexed.</li>
+            </ol>
+            <button id="ctx-onboarding-dismiss" type="button">Hide this</button>
+          </details>
+          <details class="studio-card">
+            <summary>Phrases</summary>
+            <p class="meta">One list. Intent, task, decision, and the rest. Saved to this machine.</p>
+            <textarea id="ctx-phrases" rows="8" spellcheck="false"></textarea>
+            <button id="ctx-phrases-save" type="button">Save phrases</button>
+            <p id="ctx-phrases-status" class="meta"></p>
+          </details>
+          <div class="studio-card studio-index">
+            <button id="ctx-index" type="button">Build index</button>
+            <p id="ctx-index-status" class="meta"></p>
+          </div>
+        </section>
       </div>
-    </section>
+    </aside>
+    <main class="stage">
+      <header class="stage-top">
+        <div>
+          <p class="eyebrow">Corpus</p>
+          <p class="stage-title">Search -> List -> Content | {}</p>
+          <p class="meta">Generated {}</p>
+        </div>
+        <div class="header-stats">
+          <div class="stat"><strong>{}</strong><span>sessions</span></div>
+          <div class="stat"><strong>{}</strong><span>projects</span></div>
+          <div class="stat"><strong>{}</strong><span>days</span></div>
+        </div>
+      </header>
+      <div class="main-body">
+        <section class="layout" id="ctx-layout">
+          <aside class="list-pane">
+            <div id="ctx-summary" class="summary"></div>
+            <div id="ctx-list" class="result-list"></div>
+          </aside>
+          <div class="resize-handle" id="ctx-resize-handle" title="Drag to resize panels"></div>
+          <article class="detail-pane">
+            <div class="detail-head">
+              <div>
+                <h2 id="ctx-detail-title">No result selected</h2>
+                <p id="ctx-detail-meta" class="detail-meta"></p>
+              </div>
+              <button id="ctx-copy-path" type="button">Copy Path</button>
+            </div>
+            <p id="ctx-detail-path" class="detail-path"></p>
+            <p id="ctx-detail-preview" class="detail-preview"></p>
+            <pre id="ctx-detail-content" class="detail-content"></pre>
+            <details class="assumptions">
+              <summary>Assumptions</summary>
+              <ul id="ctx-assumptions"></ul>
+            </details>
+          </article>
+        </section>
+      </div>
+    </main>
   </div>
 
   <script id="ctx-data" type="application/json">{}</script>
