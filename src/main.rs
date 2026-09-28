@@ -7433,6 +7433,9 @@ fn run_extract_session(
         Ok(resolved) => resolved,
         Err(error) => emit_catalog_failure(agent, error),
     };
+    if let Some(notice) = &resolved.substitution_notice {
+        eprintln!("{notice}");
+    }
     // Locate-before-parse proof surface (instrumented CLI contract): the
     // catalog inspected bounded headers only, and exactly one source moves on
     // to the single parse pass below.

@@ -420,6 +420,11 @@ impl SessionCatalog {
         // A filename UUID is the physical source authority. Exact UUID lookup
         // can therefore open only the matching header and avoid touching an
         // arbitrarily large unrelated corpus.
+        //
+        // Cursor stores that same filename UUID once per project the
+        // conversation touched. Those copies are one session. Every other
+        // agent still treats two physical files with one filename UUID as
+        // ambiguity — a shared catalog must not collapse unrelated sessions.
         let uuid_matches: Vec<&CandidatePath> = candidates
             .iter()
             .filter(|candidate| {
@@ -430,6 +435,14 @@ impl SessionCatalog {
             })
             .collect();
         if uuid_matches.len() > 1 {
+            if self.agent == AgentKind::Cursor && is_uuid(&query) {
+                return self.resolve_cursor_same_id_project_copies(
+                    query,
+                    &uuid_matches,
+                    candidates.len(),
+                    stats,
+                );
+            }
             let mut summaries = uuid_matches
                 .into_iter()
                 .map(|candidate| CatalogCandidateSummary {
@@ -463,6 +476,47 @@ impl SessionCatalog {
 
         let sources = self.probe_candidates(&candidates, stats)?;
         resolve_from_sources(self.agent, query, sources)
+    }
+
+    /// Cursor writes `<project>/agent-transcripts/<uuid>/<uuid>.jsonl` for
+    /// every project a conversation touched. The filename UUID is one session
+    /// id, so an exact full-id query keeps the newest write
+    /// (`modified_unix_nanos`, then the lexicographically smaller path when
+    /// mtimes tie) and says so. Prefix collisions of different ids never
+    /// reach this function.
+    fn resolve_cursor_same_id_project_copies(
+        &self,
+        query: String,
+        matches: &[&CandidatePath],
+        candidates_scanned: usize,
+        stats: &mut CatalogIoStats,
+    ) -> Result<ResolvedSource, CatalogError> {
+        let copies = matches.len();
+        let mut ranked = matches.to_vec();
+        ranked.sort_by(|left, right| {
+            right
+                .fingerprint
+                .modified_unix_nanos
+                .cmp(&left.fingerprint.modified_unix_nanos)
+                .then_with(|| left.path.cmp(&right.path))
+        });
+        let chosen = ranked[0];
+        let source = self
+            .probe_candidate(chosen, stats)?
+            .ok_or_else(|| CatalogError::Missing {
+                query: query.clone(),
+                agent: self.agent,
+                candidates_scanned,
+            })?;
+        let kept = source.path.display().to_string();
+        Ok(ResolvedSource {
+            query: query.clone(),
+            matched_by: MatchKind::ExactSourceId,
+            source,
+            substitution_notice: Some(format!(
+                "substituted: {query} kept newest of {copies} cursor project copies → {kept}"
+            )),
+        })
     }
 
     fn scan_sources_with_progress(
