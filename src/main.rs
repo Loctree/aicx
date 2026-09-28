@@ -88,6 +88,7 @@ fn print_intent_schema_migration_report(report: &intents::MigrationReport) {
 ///   aicx index                 # census + incremental parse + publish (one command)
 ///   aicx search '<query>'
 /// Power-user surfaces (catalog, extracts, intents, migrations): aicx --help-full
+/// A bare first start opens the dashboard onboarding survey.
 #[derive(Debug, Parser)]
 #[command(name = "aicx")]
 #[command(author = "(c)2026 Vetcoders")]
@@ -1775,7 +1776,7 @@ enum Commands {
         filters: RetrievalFilters,
     },
 
-    /// Run aicx as an MCP server.
+    /// HTTP serves the dashboard at / and MCP at /mcp on one listener. stdio stays MCP-only.
     Serve {
         /// Transport: stdio (default) or http. Legacy alias: sse.
         #[arg(long, value_enum, default_value_t = McpTransport::Stdio)]
@@ -3692,9 +3693,14 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
         Some(Commands::Warmup { json }) => {
             run_warmup(json)?;
         }
-        None => {
-            Cli::command().print_help()?;
-        }
+        None => match aicx::onboarding::maybe_first_start()? {
+            aicx::onboarding::FirstStart::Opened(report) => {
+                print!("{}", report.render());
+            }
+            aicx::onboarding::FirstStart::AlreadyConfigured => {
+                Cli::command().print_help()?;
+            }
+        },
     }
 
     Ok(())
