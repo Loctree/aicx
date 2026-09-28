@@ -110,25 +110,30 @@ fn render_header(out: &mut String, model: &SessionModel, distillates: &[SegmentD
     }
 }
 
-/// More than one distinct known cwd across segments = several workstreams,
-/// even when each individual segment is internally drift-free.
+/// More than one repository across segments = several workstreams, even when
+/// each individual segment is internally drift-free.
 ///
 /// A segment's resolved `scope_root` counts next to its recorded cwd, the same
 /// evidence [`SessionModel::scope_status`] reads. A session launched in one
 /// checkout whose workdirs resolved one span to another checkout is one
 /// segment with a drift-free status, and without this its brief would head
 /// that span with the other repository while claiming a single workstream.
+///
+/// Repositories are counted, not spellings ([`repository_count`], as the scope
+/// report counts them). A `scope_root` is a checkout's root, and the recorded
+/// cwd may be a directory inside that same checkout, so counting both strings
+/// labelled one repository as several workstreams.
+///
+/// [`repository_count`]: aicx_parser::engine::repository_count
 fn multi_workstream(model: &SessionModel) -> bool {
-    let mut cwds = std::collections::BTreeSet::new();
-    for segment in &model.segments {
-        if let Known::Value(cwd) = &segment.cwd {
-            cwds.insert(cwd.as_str());
-        }
-        if let Some(root) = segment.scope_root.as_deref() {
-            cwds.insert(root);
-        }
-    }
-    cwds.len() > 1
+    let places = model.segments.iter().flat_map(|segment| {
+        let recorded = match &segment.cwd {
+            Known::Value(cwd) => Some(cwd.as_str()),
+            Known::Unknown(_) => None,
+        };
+        recorded.into_iter().chain(segment.scope_root.as_deref())
+    });
+    aicx_parser::engine::repository_count(places) > 1
 }
 
 fn render_segment(out: &mut String, model: &SessionModel, distillate: &SegmentDistillate) {
@@ -414,5 +419,30 @@ mod tests {
         same_place.scope_root = Some("/repo/fleet-bus".to_owned());
         let brief = render_brief(&minimal_model(vec![same_place]), &[distillate_for(0)]);
         assert!(!brief.contains("Multi-workstream"), "{brief}");
+    }
+
+    /// Finding: the brief counted path spellings. A `scope_root` is a
+    /// checkout's root while the recorded cwd may sit inside that checkout, so
+    /// one repository was headed as several workstreams.
+    #[test]
+    fn a_checkout_root_and_a_directory_inside_it_are_one_workstream() {
+        let root =
+            std::env::temp_dir().join(format!("aicx-brief-one-repository-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".git")).expect("scratch checkout");
+        std::fs::create_dir_all(root.join("subdir")).expect("scratch subdir");
+        // Canonical spelling on both sides: a path gone from this disk cannot
+        // be canonicalized, so it is compared as written (`/var` is
+        // `/private/var` on macOS).
+        let canonical = std::fs::canonicalize(&root).expect("canonical checkout");
+        let checkout = canonical.to_string_lossy().into_owned();
+        // The recorded cwd exists, and one where it is gone from this disk.
+        for cwd in [canonical.join("subdir"), canonical.join("gone")] {
+            let mut inside = segment(0, &cwd.to_string_lossy());
+            inside.scope_root = Some(checkout.clone());
+            let brief = render_brief(&minimal_model(vec![inside]), &[distillate_for(0)]);
+            assert!(!brief.contains("Multi-workstream"), "{brief}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
