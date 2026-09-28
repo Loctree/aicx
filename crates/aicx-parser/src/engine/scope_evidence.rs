@@ -780,13 +780,23 @@ fn relative_to_baseline_drive<'a>(path: &'a str, base: &str) -> Option<&'a str> 
     same_drive.then(|| &path[2..])
 }
 
-/// A Windows path rooted without a drive (`\repo`) names that directory on the
-/// CURRENT drive, which for a tool call is the drive of the turn's cwd. Kept
-/// drive-less it matched neither `C:\repo` nor anything else, and the window
-/// went unattributed. UNC (`\\server\share`) names its own root, and a
-/// `/`-rooted path can be a Unix spelling, so both are left alone.
+/// A Windows path rooted without a drive (`\repo`, or `/repo` in either
+/// separator) names that directory on the CURRENT drive, which for a tool call
+/// is the drive of the turn's cwd. Kept drive-less it matched neither
+/// `C:\repo` nor anything else, and the window went unattributed. Only a
+/// baseline with a drive letter lends one: that session ran on Windows, where
+/// `/repo` is not a Unix path (a session inside WSL records `/mnt/c/repo`).
+/// Under a Unix baseline `/repo` stays as written. UNC (`\\server\share`,
+/// `//server/share`) names its own root and is left alone.
 fn on_baseline_drive(path: &str, baseline: Option<&str>) -> Option<String> {
-    if !path.starts_with('\\') || path.starts_with("\\\\") {
+    let mut leading = path.bytes().take(2);
+    let rooted = leading
+        .next()
+        .is_some_and(|byte| matches!(byte, b'\\' | b'/'))
+        && !leading
+            .next()
+            .is_some_and(|byte| matches!(byte, b'\\' | b'/'));
+    if !rooted {
         return None;
     }
     let base = baseline?.trim();
@@ -2651,14 +2661,20 @@ mod tests {
             Some(baseline),
         );
         assert_ne!(scope, WindowScope::Baseline);
-        // UNC names its own root, a `/`-rooted path may be a Unix spelling,
-        // and without a drive-shaped baseline there is no drive to borrow.
+        // UNC names its own root in either separator, and without a
+        // drive-shaped baseline there is no drive to borrow.
+        for unc in [
+            r"\\server\share\repo",
+            "//server/share/repo",
+            r"/\server\share\repo",
+        ] {
+            assert_eq!(on_baseline_drive(unc, Some(baseline)), None, "{unc}");
+        }
         assert_eq!(
-            on_baseline_drive(r"\\server\share\repo", Some(baseline)),
-            None
-        );
-        assert_eq!(
-            on_baseline_drive("/aicx-scope-nowhere/dev/repo", Some(baseline)),
+            on_baseline_drive(
+                "/aicx-scope-nowhere/dev/repo",
+                Some("/aicx-scope-nowhere/dev")
+            ),
             None
         );
         assert_eq!(
@@ -2669,6 +2685,39 @@ mod tests {
             None
         );
         assert_eq!(on_baseline_drive(r"\aicx-scope-nowhere\repo", None), None);
+    }
+
+    /// Finding: Windows reads `/repo/pkg` as rooted on the current drive just
+    /// like `\repo\pkg`, but only the backslash form borrowed the baseline's
+    /// drive. Kept Unix-shaped, it matched no `C:\repo` baseline and a call
+    /// that never left the checkout unplaced its window.
+    #[test]
+    fn a_slash_rooted_workdir_takes_a_windows_baseline_drive() {
+        let baseline = r"C:\aicx-scope-nowhere\dev\repo";
+        assert_eq!(
+            resolve_candidate("/aicx-scope-nowhere/dev/repo/pkg", Some(baseline)).as_deref(),
+            Some("C:/aicx-scope-nowhere/dev/repo/pkg")
+        );
+        let (scope, _) = effective_window_scope(
+            &explicit(&["/aicx-scope-nowhere/dev/repo/pkg"]),
+            Some(baseline),
+        );
+        assert_eq!(scope, WindowScope::Baseline);
+        // `..` stays on that drive, and another directory stays another.
+        let (scope, _) = effective_window_scope(
+            &explicit(&["/aicx-scope-nowhere/dev/repo/../other"]),
+            Some(baseline),
+        );
+        assert_ne!(scope, WindowScope::Baseline);
+        // A Unix baseline lends no drive: `/repo` there is a Unix path.
+        assert_eq!(
+            resolve_candidate(
+                "/aicx-scope-nowhere/dev/repo/pkg",
+                Some("/aicx-scope-nowhere/dev/repo")
+            )
+            .as_deref(),
+            Some("/aicx-scope-nowhere/dev/repo/pkg")
+        );
     }
 
     /// Finding: a drive-relative Windows workdir (`C:fleet`) is relative to
