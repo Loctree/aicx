@@ -1883,6 +1883,13 @@ mod tests {
             )),
             [explicit(&["/repo/a"]), vec![WorkdirEvidence::Opaque]].concat()
         );
+        // So may whatever follows where the argument was cut off.
+        assert_eq!(
+            tool_call_workdirs(&js_input(
+                "tools.exec_command({workdir: \"/repo/a\" // last line"
+            )),
+            [explicit(&["/repo/a"]), vec![WorkdirEvidence::Opaque]].concat()
+        );
     }
 
     /// Finding: the value capture stopped at the first quote of EITHER kind,
@@ -3085,7 +3092,10 @@ mod tests {
             "tools.exec_command({\n  workdir: '/repos/vista'  // the checkout\n})",
             "tools.exec_command({workdir: \"/repos/vista\" /* pinned */})",
             "tools.exec_command({workdir: \"/repos/vista\" /* a */ // b\n, cmd: \"ls\"})",
-            "tools.exec_command({workdir: \"/repos/vista\" // last line",
+            // A line comment may run to the end of the input. An `exec_command`
+            // argument cut off there is also opaque, see
+            // `an_exec_argument_not_written_at_the_call_is_opaque`.
+            "{workdir: \"/repos/vista\" // last line",
             r#"[{workdir: "/repos/vista"}]"#,
             r#"{"workdir": "/repos/vista"}"#,
         ] {
