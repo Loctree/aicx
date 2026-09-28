@@ -104,6 +104,10 @@ pub enum WindowScope {
 /// variable or an expression, a template literal that interpolates, a literal
 /// that never closes — is [`WorkdirEvidence::Opaque`]: the call names a
 /// directory we cannot see.
+///
+/// Arguments that parse as a JSON object are read structurally: only their
+/// top-level `workdir` is the call's directory. The JavaScript scan is for
+/// arguments that do not parse.
 pub fn tool_call_workdirs(payload: &Value) -> Vec<WorkdirEvidence> {
     let mut found: Vec<WorkdirEvidence> = Vec::new();
     let mut push = |evidence: WorkdirEvidence| {
@@ -117,16 +121,24 @@ pub fn tool_call_workdirs(payload: &Value) -> Vec<WorkdirEvidence> {
             Value::String(raw) => serde_json::from_str::<Value>(raw).ok(),
             _ => None,
         };
-        match parsed.as_ref().and_then(|body| body.get("workdir")) {
-            Some(Value::String(workdir)) => {
-                let workdir = workdir.trim();
-                if !workdir.is_empty() {
-                    push(WorkdirEvidence::Explicit(workdir.to_string()));
+        match parsed.as_ref().and_then(Value::as_object) {
+            // Structured arguments: the call's directory is the top-level
+            // `workdir` and nothing else. A nested `options.workdir`, or one
+            // written inside the command string, is data the call carried, and
+            // reading it re-scoped a baseline call to a checkout it never ran in.
+            Some(body) => match body.get("workdir") {
+                Some(Value::String(workdir)) => {
+                    let workdir = workdir.trim();
+                    if !workdir.is_empty() {
+                        push(WorkdirEvidence::Explicit(workdir.to_string()));
+                    }
                 }
-            }
+                None | Some(Value::Null | Value::Number(_)) => {}
+                Some(_) => push(WorkdirEvidence::Opaque),
+            },
             // A JS literal can also arrive as the raw `arguments` string; scan
             // it rather than declaring no evidence because JSON parsing failed.
-            _ => {
+            None => {
                 if let Value::String(raw) = arguments {
                     workdirs_in_literal(raw).into_iter().for_each(&mut push);
                 }
@@ -1636,6 +1648,46 @@ mod tests {
         assert_eq!(first_workdir(&payload).as_deref(), Some("/repo/a"));
     }
 
+    /// Finding: arguments that parsed as a JSON object with no top-level
+    /// `workdir` were scanned again as JavaScript, so a nested
+    /// `options.workdir` — data the call carried — became the directory it ran
+    /// in and re-scoped a baseline call to that checkout. A parsed object is
+    /// read structurally; only arguments that do not parse are scanned.
+    #[test]
+    fn only_the_top_level_workdir_of_json_arguments_is_read() {
+        let arguments = |raw: &str| serde_json::json!({"type": "function_call", "name": "shell", "arguments": raw});
+        for raw in [
+            r#"{"cmd":"pwd","options":{"workdir":"/repo/foreign"}}"#,
+            r#"{"cmd":"pwd","workdir":null,"env":[{"workdir":"/repo/foreign"}]}"#,
+        ] {
+            assert!(tool_call_workdirs(&arguments(raw)).is_empty(), "{raw}");
+        }
+        // The same shape as an object value, not a string, is read the same.
+        let object = serde_json::json!({
+            "type": "function_call",
+            "name": "shell",
+            "arguments": {"cmd": "pwd", "options": {"workdir": "/repo/foreign"}},
+        });
+        assert!(tool_call_workdirs(&object).is_empty());
+        // The top-level key still decides, and a value that is no path and
+        // no "default" is a directory we cannot see.
+        assert_eq!(
+            tool_call_workdirs(&arguments(
+                r#"{"options":{"workdir":"/repo/foreign"},"workdir":"/repo/a"}"#
+            )),
+            explicit(&["/repo/a"])
+        );
+        assert_eq!(
+            tool_call_workdirs(&arguments(r#"{"cmd":"pwd","workdir":["/repo/a"]}"#)),
+            vec![WorkdirEvidence::Opaque]
+        );
+        // Arguments that do not parse are still scanned as JavaScript.
+        assert_eq!(
+            tool_call_workdirs(&arguments(r#"{cmd: "pwd", workdir: '/repo/b'}"#)),
+            explicit(&["/repo/b"])
+        );
+    }
+
     #[test]
     fn workdir_from_js_literal_input() {
         let payload: Value = serde_json::from_str(
@@ -2679,13 +2731,14 @@ mod tests {
                 "{input}"
             );
         }
-        // JSON arguments whose only `workdir` is inside the command string.
+        // JSON arguments whose only `workdir` is inside the command string are
+        // read structurally, and the string is data: no evidence at all.
         let payload = serde_json::json!({
             "type": "function_call",
             "name": "shell",
             "arguments": r#"{"cmd":"echo {workdir: '/repo/foreign'}"}"#,
         });
-        assert_eq!(tool_call_workdirs(&payload), vec![WorkdirEvidence::Opaque]);
+        assert!(tool_call_workdirs(&payload).is_empty());
         // Code beside text is still code: a string, a comment, a template's
         // interpolation, a regular expression and a division each end where
         // JavaScript ends them, and the real call after them is read.
