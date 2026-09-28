@@ -27,9 +27,13 @@ guardian stays out of the mixed-scope telemetry too, so it cannot make
 `continuity` refuse, and the header probe reads as far as the catalog does
 (128 records, 256 KiB in total). A rollout can carry more than one
 `session_meta` record; the probe reads past one that names no provenance
-instead of stopping at it. The 256 KiB counts the records the probe reads, not
-an over-cap one it drains, so a record larger than the whole header no longer
-hides the `session_meta` after it. A cached extract is not reused when the
+instead of stopping at it. The 256 KiB caps the reader itself, exactly as it
+caps the catalog's own header read: an over-cap record inside the header is
+drained and the probe reads on, one larger than the whole header ends the
+probe as it ends the header, and provenance past it is recorded by the full
+discovery scan of `aicx catalog rebuild`. The probe runs for every Codex
+source the catalog touches, so a drain past the cap would make it unbounded.
+A cached extract is not reused when the
 catalog's `session_kind` differs from the one stored at parse, so a rebuild
 that names a session guardian takes effect over unchanged source bytes.
 
@@ -85,11 +89,16 @@ from a denied checkout that worked on another repository. Windows merged into
 one span are judged on the union of their paths, which can over-hide a
 neighbouring frame: fail closed on purpose.
 
-One question, one predicate. "Is this session's scope mixed?" is answered by
-`ScopeReport::scope_mixed()` everywhere — the single-history refusal, the
-mixed-workstream telemetry and the project filter — instead of the generic
-`ScopeStatus`, which reports an ordinary branch switch inside one checkout as
-mixed and stays silent when `.aicxignore` hid a whole scope. A scope hidden by
+One question, one predicate. "Does this session span more than one scope?" is
+answered by `ScopeReport::scope_mixed()` everywhere — the single-history
+refusal among them — instead of the generic `ScopeStatus`, which reports an
+ordinary branch switch inside one checkout as mixed and stays silent when
+`.aicxignore` hid a whole scope. Where a catalog row names the session's
+checkout, the project filter and the mixed-workstream telemetry ask one
+further question, `scope_foreign_to` that checkout, as one verdict computed
+once per session: a session re-scoped wholesale to one foreign checkout loses
+its frames to the filter and is reported, instead of vanishing while
+`continuity` rendered the window as an empty pack. A scope hidden by
 the privacy filter is evidence of another checkout, so it blocks bucket
 inheritance for frames that carry no cwd of their own, even when nothing
 visible remains to compare it against. `continuity` rebuilds that report from
@@ -97,7 +106,9 @@ each session's conflicts and hidden-scope count, so a window whose every
 session is mixed only by a proven conflict or by a hidden checkout is refused
 like any other mixed window. It also refuses when the intents filters had
 already removed every frame of the mixed sessions: what decides is whether
-anything homogeneous is left, not whether the gate itself withheld something. The session-level `ScopeStatus` (served over MCP)
+anything homogeneous is left, not whether the gate itself withheld something.
+A window whose only such work sits in one foreign checkout refuses as a plain
+error, since the structured refusal describes more than one scope. The session-level `ScopeStatus` (served over MCP)
 counts each span's resolved `scope_root` next to its recorded cwd, so a
 session that worked in a second repository is `mixed_candidate`, not
 `no_drift_observed`; and `unattributed` now outranks `mixed_candidate` in the
@@ -260,8 +271,9 @@ does not move for a metadata addition. And the fail-closed threshold for an
 unreadable record counted raw `"type":` substrings anywhere in the visible
 bytes, so an `arguments` payload carrying its own `type` field could raise the
 count past the threshold and talk itself out of being treated as opaque; the
-scan is now structural, counting only discriminators at record and payload
-depth.
+scan is now structural, counting only the envelope's own discriminator and
+its `payload` object's — a sibling object before the payload, such as
+`metadata: {"type": …}`, is content however shallow it sits.
 
 A submodule's descendants are the submodule's repository too: `.gitmodules`
 paths are matched on a path-component boundary, so a vanished
@@ -281,7 +293,9 @@ window turning unattributed. The filesystem is probed only for a path that is
 absolute on this host; a foreign spelling is never resolved against the
 process cwd. A UNC root is the whole `\\server\share`: `..` stops at the
 share, so `\\server\share\..\other` is `\\server\share\other`, no longer the
-other share `\\server\other`.
+other share `\\server\other`. The same holds for `//server/share`, the
+forward-slash spelling Windows also accepts; three or more leading `/` remain
+a Unix root.
 
 #### Public API (source-breaking for struct-literal construction)
 

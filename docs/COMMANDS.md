@@ -238,7 +238,10 @@ session's `scope_status` and its compaction epoch count next to the
 messages. `aicx continuity` refuses to distill one history from a window
 whose only work is mixed-workstream sessions (`mixed_workstream` refusal)
 unless asked to — also when the project filters had already removed every
-frame of those sessions, so such a window never passes as an empty pack.
+frame of those sessions, so such a window never passes as an empty pack. A
+window whose only such work ran in one checkout other than its cataloged one
+refuses too, as a plain error, since `mixed_workstream` describes more than
+one scope.
 
 Project-filtered queries (`-p`) are fail-closed inside mixed sessions. A turn
 window whose executable tool calls consistently name one foreign `workdir`
@@ -298,7 +301,8 @@ happens to be spelled. Lexical containment survives only where identity is
 unknowable — a workdir that does not exist on this machine — and there a
 Windows spelling is compared the way Windows resolves it (either separator,
 letter case ignored), a Unix spelling byte for byte; a UNC root is the whole
-`\\server\share`, so `..` never climbs out of the share; a Windows path rooted
+`\\server\share` (or `//server/share`, while three or more leading `/` stay a
+Unix root), so `..` never climbs out of the share; a Windows path rooted
 without a drive (`\repo`) sits on the drive of the turn's cwd, and a
 drive-relative one (`D:fleet`) joins the turn's cwd only on that same drive —
 on any other drive it is unreadable evidence. Identity is
@@ -335,7 +339,10 @@ repositories that are already gone.
 
 A session whose frames are *consistently* re-scoped to one foreign checkout is
 internally homogeneous and still foreign: whole-session attribution applies
-only when the observed scope is also the cataloged one. A frame whose cwd resolves to a
+only when the observed scope is also the cataloged one. The same verdict puts
+the session in the `mixed_scope` list, so work the filter removes wholesale is
+reported rather than silently gone; the list carries the session's own cwds,
+never the cataloged path. A frame whose cwd resolves to a
 real checkout here and cannot prove membership is dropped rather than handed
 to the legacy path-name filter: a checkout at `…/vista/vendor/fleet-bus` spells
 `vista` without being it, and that fallback exists only for paths that resolve
@@ -401,9 +408,12 @@ the column is empty; no catalog rebuild is a prerequisite for the guardian
 contract, and `aicx catalog rebuild` is what refreshes the stored column. The
 header probe reads as far as the catalog reads a header (128 records, 256 KiB
 in total), and past a `session_meta` record that names no provenance. The
-256 KiB counts the records the probe reads; an over-cap record is drained
-without spending it, so a record larger than the whole header cannot hide the
-`session_meta` after it. `aicx index` reuses a cached extract only while the
+256 KiB caps the reader itself, as it caps the catalog's header read: an
+over-cap record inside the header is drained and the probe reads on, while one
+larger than the whole header ends the probe as it ends the header. Provenance
+past the header is recorded by the full discovery scan of
+`aicx catalog rebuild`, and every lane reads that column before it probes.
+`aicx index` reuses a cached extract only while the
 catalog's `session_kind`, when set, is the one stored at parse, so a rebuild
 that names a session guardian takes effect over unchanged source bytes. A guardian stays out of the `mixed_scope` list as well, even when
 the frame-kind or privacy filter leaves none of its frames, so it cannot make

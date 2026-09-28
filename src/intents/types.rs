@@ -253,7 +253,11 @@ pub struct IntentExtraction {
     pub mixed_scope: Vec<MixedScopeSession>,
 }
 
-/// One mixed-workstream candidate session, with the evidence that made it one.
+/// One mixed-workstream candidate session, with the evidence that made it one:
+/// a session its lane could not serve whole under one project, because it
+/// spans more than one scope or ran in a checkout other than its cataloged
+/// one. `cwds` are the session's own; the cataloged path is never among them
+/// unless the session itself worked there.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MixedScopeSession {
     pub agent: String,
