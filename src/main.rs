@@ -5244,6 +5244,11 @@ fn run_intents(
         } else {
             print_no_intents_message(projects, hours, None)?;
         }
+        // An answer the project filters emptied is not "no intents": the
+        // Markdown answer still says what they withheld.
+        if let Some(note) = extraction.stats.withheld_scope_note() {
+            print!("{note}");
+        }
         return Ok(());
     }
 

@@ -1214,6 +1214,62 @@ fn index_lane_counts_flagged_chunks_with_no_catalog_row() {
     let _ = fs::remove_dir_all(&root);
 }
 
+/// The Markdown text MCP `aicx_intents` answers for `project: vista`.
+fn mcp_intents_markdown(aicx_home: &Path) -> String {
+    use std::io::Write;
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_aicx-mcp"))
+        .env("AICX_HOME", aicx_home)
+        .env("AICX_ALLOW_TMP", "1")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn aicx-mcp");
+    let mut stdin = child.stdin.take().expect("aicx-mcp stdin");
+    let requests = [
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "clientInfo": {"name": "mixed-scope-surface", "version": "1"}
+            }
+        }),
+        serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}),
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "aicx_intents",
+                "arguments": {"project": "vista", "hours": 0, "emit": "markdown"}
+            }
+        }),
+    ];
+    for request in requests {
+        writeln!(stdin, "{request}").expect("write MCP request");
+    }
+    drop(stdin);
+    let output = child.wait_with_output().expect("wait for aicx-mcp");
+    assert!(
+        output.status.success(),
+        "aicx-mcp failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response = String::from_utf8(output.stdout)
+        .expect("MCP stdout utf-8")
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|response| response["id"] == 2)
+        .expect("MCP tool response");
+    response["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("MCP intents result missing text: {response}"))
+        .to_string()
+}
+
 fn write_foreign_only_rollout(root: &Path, vista: &Path, fleet: &Path) -> String {
     let session_id = "66666666-7777-8888-9999-000000000000";
     let template = r#"{"timestamp":"2026-01-01T05:00:00Z","type":"session_meta","payload":{"id":"@SID@","cwd":"@VISTA@"}}
@@ -1338,6 +1394,38 @@ fn a_session_rescoped_wholesale_to_one_foreign_checkout_is_reported() {
             assert!(note.contains("not served whole"), "{lane} lane: {note}");
         }
     }
+
+    // The surfaces a user reads. This answer is empty, and the CLI renders an
+    // empty Markdown answer through its own early exit, so the note has to
+    // survive there as well as in the JSON and in MCP.
+    let cli = |emit: &str| {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_aicx"))
+            .env("AICX_HOME", &aicx_home)
+            .env("AICX_ALLOW_TMP", "1")
+            .args(["intents", "-p", "vista", "--emit", emit, "-H", "0"])
+            .output()
+            .expect("run CLI intents");
+        assert!(
+            output.status.success(),
+            "CLI intents --emit {emit}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).expect("CLI stdout utf-8")
+    };
+    let markdown = cli("markdown");
+    assert!(
+        markdown.contains("1 session(s) not served whole"),
+        "CLI Markdown: {markdown:?}"
+    );
+    let json: serde_json::Value =
+        serde_json::from_str(&cli("json")).expect("parse CLI intents envelope");
+    assert_eq!(json["completeness"]["complete"], false, "{json}");
+    assert_eq!(json["completeness"]["mixed_scope_sessions"], 1, "{json}");
+    let mcp = mcp_intents_markdown(&aicx_home);
+    assert!(
+        mcp.contains("1 session(s) not served whole"),
+        "MCP Markdown: {mcp:?}"
+    );
 
     // A window holding only that work refuses instead of rendering empty.
     let Err(error) = aicx::continuity::build(&aicx_home, &["vista".to_string()], 100_000) else {
