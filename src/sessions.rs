@@ -684,19 +684,26 @@ pub(crate) const GUARDIAN_SESSION_KIND: &str = "subagent:guardian";
 /// and `BufRead::lines()` would allocate all of it before any record limit
 /// applied, turning a probe the catalog runs per session into hundreds of
 /// megabytes. An over-cap record cannot be a `session_meta` header worth
-/// parsing, so it is skipped rather than reassembled.
+/// parsing, so it is drained rather than reassembled.
 ///
-/// The bounds are the catalog's own header bounds, not a tighter copy: the
-/// catalog reads a session's identity from the same header, and a probe that
-/// gave up earlier would catalog a guardian whose identity it found as an
-/// ordinary session.
+/// Draining one must not end the probe. The byte budget counts the records
+/// the probe reads, not the ones it drains: charged to the budget, a leading
+/// record larger than the whole header used it up while being skipped, the
+/// probe never reached the `session_meta` after it, and a guardian was
+/// answered ordinary. The record count bounds the drain, and nothing drained
+/// is held.
+///
+/// The bounds are the catalog's own header bounds, never tighter: the catalog
+/// reads a session's identity from the same header, and a probe that gave up
+/// earlier would catalog a guardian whose identity it found as an ordinary
+/// session.
 #[cfg(feature = "app")]
 pub(crate) fn codex_session_kind_from_source(path: &Path) -> Option<String> {
     use crate::session_catalog::{MAX_HEADER_BYTES, MAX_HEADER_LINES};
-    use std::io::Read;
 
     let file = fs::File::open(path).ok()?;
-    let mut reader = BufReader::new(file.take(MAX_HEADER_BYTES as u64));
+    let mut reader = BufReader::new(file);
+    let mut budget = MAX_HEADER_BYTES;
     for _ in 0..MAX_HEADER_LINES {
         let line = aicx_parser::sanitize::read_line_capped(
             &mut reader,
@@ -706,6 +713,9 @@ pub(crate) fn codex_session_kind_from_source(path: &Path) -> Option<String> {
         if line.exceeded {
             continue;
         }
+        // A record that would cross the budget is where the header ends, as
+        // the catalog's own byte limit cuts it there.
+        budget = budget.checked_sub(line.line.len())?;
         let text = line.line.trim();
         if text.is_empty() {
             continue;
@@ -2706,6 +2716,38 @@ mod tests {
 
         // The over-cap record is skipped rather than reassembled, so the
         // answer comes from the header that follows it.
+        assert_eq!(
+            resolve_session_kind("codex", None, &path).as_deref(),
+            Some("subagent:guardian")
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Finding: the probe charged a drained record to its byte budget. A
+    /// leading record larger than the whole header budget used it up while
+    /// being skipped, the probe never reached the `session_meta` after it, and
+    /// a guardian was answered ordinary.
+    #[test]
+    #[cfg(feature = "app")]
+    fn a_record_larger_than_the_header_does_not_end_the_probe() {
+        let root = temp_root("probe_past_budget");
+        let day = root.join("2026").join("08").join("27");
+        fs::create_dir_all(&day).unwrap();
+        let bloat = format!(
+            r#"{{"timestamp":"2026-08-27T01:35:46.000Z","type":"response_item","payload":{{"type":"message","role":"user","content":[{{"text":"{}"}}]}}}}"#,
+            "x".repeat(crate::session_catalog::MAX_HEADER_BYTES + 4096)
+        );
+        let name = "rollout-2026-08-27T03-35-47-01a040df.jsonl";
+        write_session(
+            &day,
+            name,
+            &[
+                &bloat,
+                r#"{"timestamp":"2026-08-27T01:35:47.000Z","type":"session_meta","payload":{"id":"01a040df-60f0","cwd":"/Users/tester/Git/vista","source":{"subagent":{"other":"guardian"}}}}"#,
+            ],
+        );
+        let path = day.join(name);
+
         assert_eq!(
             resolve_session_kind("codex", None, &path).as_deref(),
             Some("subagent:guardian")
