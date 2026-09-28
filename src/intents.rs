@@ -146,6 +146,7 @@ struct ScopeNotes {
 /// looked complete, and a window that held only such work came back empty.
 /// A session the lane already noted as unservable is left out: `mixed_scope`
 /// withholds all of it.
+#[cfg(feature = "app")]
 fn note_unplaced_frames(
     unplaced: &mut Vec<UnplacedScopeSession>,
     agent: &str,
