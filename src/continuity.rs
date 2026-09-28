@@ -63,11 +63,13 @@ pub struct IndexHealthLine {
 ///
 /// Default = do not distill a mixed workstream into one history (W2-R1):
 /// a session that proves more than one scope — a workdir conflict, a scope
-/// hidden by `.aicxignore`, or more than one repository — is withheld. When
-/// the window holds a mixed session and no homogeneous record is left — even
-/// when upstream filters had already removed every frame of the mixed session
-/// — the pack refuses with `RefusalReason::MixedWorkstream` instead of
-/// returning an empty or braided narrative.
+/// hidden by `.aicxignore`, or more than one repository — or whose work ran
+/// in a checkout other than its cataloged one is withheld. When the window
+/// holds such a session and no homogeneous record is left — even when
+/// upstream filters had already removed every frame of it — the pack refuses
+/// instead of returning an empty or braided narrative: with
+/// `RefusalReason::MixedWorkstream`, or with a plain error when the only such
+/// work sits in one foreign checkout, which that reason cannot express.
 pub fn build(aicx_home: &Path, projects: &[String], hours: u64) -> Result<ContinuityPack> {
     build_with_scope(aicx_home, projects, hours, false)
 }
@@ -170,28 +172,31 @@ fn mixed_window_refusal(
         "continuity: {} mixed-workstream session(s) in the window and nothing homogeneous to distill; pass distill_mixed to override",
         mixed_scope.len()
     );
-    let refusal = mixed_scope.first().and_then(|first| {
+    let refusal = mixed_scope.iter().find_map(|session| {
         let report = crate::extraction::conversation::ScopeReport {
-            hidden_scopes: first.hidden_scopes,
-            status: first.status,
-            cwds: first.cwds.clone(),
-            branches: first.branches.clone(),
+            hidden_scopes: session.hidden_scopes,
+            status: session.status,
+            cwds: session.cwds.clone(),
+            branches: session.branches.clone(),
             entries: withheld,
-            conflicts: first.conflicts,
+            conflicts: session.conflicts,
         };
         crate::extraction::conversation::refuse_mixed_workstream(
-            first.agent_kind(),
-            &first.session_id,
+            session.agent_kind(),
+            &session.session_id,
             &report,
             false,
         )
     });
     match refusal {
         Some(refusal) => anyhow::Error::new(refusal).context(context),
-        // Every listed session passed `scope_mixed()` when it was noted, so
-        // this is the two predicates drifting apart. Still a refusal, never
-        // a panic and never an empty pack.
-        None => anyhow::anyhow!("{context} (the scope evidence no longer reads as mixed)"),
+        // A session is listed when its lane could not serve it whole: more
+        // than one scope, which refuses structurally above, or ONE scope
+        // foreign to its cataloged checkout, which that refusal cannot
+        // express. The telemetry keeps the cataloged path out of `cwds`, so
+        // a foreign-only session reads as one scope here. Still a refusal,
+        // never a panic and never an empty pack.
+        None => anyhow::anyhow!("{context} (the work ran outside its cataloged checkout)"),
     }
 }
 
@@ -569,8 +574,9 @@ mod tests {
             );
         }
 
-        // Predicates that drift apart, or an empty list, still refuse —
-        // as a plain error, never a panic.
+        // A session listed for running wholly in one foreign checkout has one
+        // visible scope, and an empty list has none: both still refuse — as a
+        // plain error, never a panic.
         for mixed in [vec![session(0, 0)], Vec::new()] {
             let error = mixed_window_refusal(&mixed, 3);
             assert!(error.downcast_ref::<RefusalReason>().is_none());
@@ -579,6 +585,17 @@ mod tests {
                 "{error:#}"
             );
         }
+
+        // Any session that supports the structured refusal gives it, not only
+        // the first one listed.
+        let error = mixed_window_refusal(&[session(0, 0), session(2, 0)], 3);
+        assert!(
+            matches!(
+                error.downcast_ref::<RefusalReason>(),
+                Some(RefusalReason::MixedWorkstream { .. })
+            ),
+            "{error:#}"
+        );
     }
 
     /// Finding: the gate refused only when it had withheld something itself.

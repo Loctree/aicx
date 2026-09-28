@@ -1077,3 +1077,113 @@ fn index_lane_counts_flagged_chunks_with_no_catalog_row() {
     drop(_guard);
     let _ = fs::remove_dir_all(&root);
 }
+
+fn write_foreign_only_rollout(root: &Path, vista: &Path, fleet: &Path) -> String {
+    let session_id = "66666666-7777-8888-9999-000000000000";
+    let template = r#"{"timestamp":"2026-01-01T05:00:00Z","type":"session_meta","payload":{"id":"@SID@","cwd":"@VISTA@"}}
+{"timestamp":"2026-01-01T05:01:00Z","type":"turn_context","payload":{"cwd":"@VISTA@"}}
+{"timestamp":"2026-01-01T05:01:10Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Robimy fleet.\nDecision: preserve foreign-only fleet opening"}]}}
+{"timestamp":"2026-01-01T05:01:20Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"f1","input":"const r = await tools.exec_command({cmd:\"npm test\",\"workdir\":\"@FLEET@\"});"}}
+{"timestamp":"2026-01-01T05:02:00Z","type":"turn_context","payload":{"cwd":"@VISTA@"}}
+{"timestamp":"2026-01-01T05:02:05Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Dalej fleet.\nDecision: preserve foreign-only fleet reply"}]}}
+{"timestamp":"2026-01-01T05:02:10Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"f2","input":"const r = await tools.exec_command({cmd:\"ls\",\"workdir\":\"@FLEET@\"});"}}
+"#;
+    let body = template
+        .replace("@SID@", session_id)
+        .replace("@VISTA@", &json_path(vista))
+        .replace("@FLEET@", &json_path(fleet));
+    let path = rollout_path(
+        root,
+        &format!("rollout-2026-01-01T05-00-00-{session_id}.jsonl"),
+    );
+    write_rollout(path, &body);
+    session_id.to_string()
+}
+
+/// Finding: the telemetry asked `scope_mixed()` while the project filter asked
+/// `scope_foreign_to` the cataloged checkout. A session cataloged in vista
+/// whose every window re-scoped to ONE foreign checkout has one repository
+/// and no conflict, so it was never reported — yet the filter removed every
+/// frame of it, and `continuity` answered the window with a successful empty
+/// pack. The telemetry now names exactly the sessions the filter could not
+/// serve whole, in every lane, and without publishing the cataloged path.
+#[test]
+fn a_session_rescoped_wholesale_to_one_foreign_checkout_is_reported() {
+    let root = unique_root("foreignonly");
+    let _guard = HomeGuard::set(&root);
+    let vista = make_repo(&root, "vista");
+    let fleet = make_repo(&root, "fleet-bus");
+    let foreign_sid = write_foreign_only_rollout(&root, &vista, &fleet);
+
+    let aicx_home = root.join(".aicx");
+    aicx::catalog::rebuild(&aicx_home, &root).expect("rebuild catalog over fixture home");
+    aicx::source_index::build(&aicx_home, &[], false, true, false)
+        .expect("publish CURRENT index over fixture home");
+
+    let config = |hours: u64, frame_kind: aicx::timeline::FrameKind| IntentsConfig {
+        project: "vista".to_string(),
+        hours,
+        strict: false,
+        min_confidence: None,
+        kind_filter: None,
+        frame_kind: Some(frame_kind),
+        live: false,
+    };
+    for (lane, hours) in [("census", 0), ("index", 100_000)] {
+        let extractions: Vec<IntentExtraction> = [
+            aicx::timeline::FrameKind::UserMsg,
+            aicx::timeline::FrameKind::AgentReply,
+        ]
+        .into_iter()
+        .map(|frame_kind| {
+            Aicx::with_aicx_home(&aicx_home)
+                .extract_intents(&config(hours, frame_kind))
+                .expect("extract intents through public API")
+        })
+        .collect();
+        if lane == "index" {
+            assert_eq!(
+                extractions[0].stats.identity_source, "index-v1",
+                "index lane must serve the finite-window run"
+            );
+        }
+        // The session's work is fleet's: none of it reaches `-p vista`.
+        assert!(
+            extractions
+                .iter()
+                .flat_map(|extraction| &extraction.records)
+                .all(|record| record.session_id != foreign_sid),
+            "{lane} lane: foreign-only work leaked into vista"
+        );
+        // ...and it is reported, not silently gone.
+        let reported: Vec<_> = extractions
+            .iter()
+            .flat_map(|extraction| &extraction.mixed_scope)
+            .filter(|session| session.session_id == foreign_sid)
+            .collect();
+        assert!(
+            !reported.is_empty(),
+            "{lane} lane: the session the filter emptied must be reported"
+        );
+        // Its own evidence only: the cataloged checkout is not published.
+        let vista_path = vista.display().to_string();
+        for session in &reported {
+            assert!(
+                session.cwds.iter().all(|cwd| cwd != &vista_path),
+                "{lane} lane: the cataloged path leaked into the telemetry: {:?}",
+                session.cwds
+            );
+        }
+    }
+
+    // A window holding only that work refuses instead of rendering empty.
+    let error = aicx::continuity::build(&aicx_home, &["vista".to_string()], 100_000)
+        .expect_err("a window of only foreign-checkout work refuses");
+    assert!(
+        format!("{error:#}").contains("ran outside its cataloged checkout"),
+        "{error:#}"
+    );
+
+    drop(_guard);
+    let _ = fs::remove_dir_all(&root);
+}

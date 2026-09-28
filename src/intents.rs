@@ -129,16 +129,23 @@ pub(crate) fn extract_intents_from_root_at_with_stats(
 /// from surviving files and from the lanes' pre-filter scope reports, so the
 /// telemetry survives even when the fail-closed project filter removes every
 /// frame of the session from the requested bucket.
+///
+/// `unservable` is the caller's verdict, and a lane with a catalog row passes
+/// the very one its project filter ran on: `scope_foreign_to` the cataloged
+/// checkout. `scope_mixed()` alone let a session re-scoped wholesale to ONE
+/// foreign checkout — one repository, no conflict — lose every frame to the
+/// filter and leave no trace, so `continuity` answered that window with a
+/// successful empty pack. Only a file with no catalog row to judge against
+/// falls back to `scope_mixed()`. Either way a branch switch inside one
+/// checkout is one scope, and a scope hidden by `.aicxignore` is still a scope.
 fn note_mixed_scope(
     mixed_scope: &mut Vec<MixedScopeSession>,
     agent: &str,
     session_id: &str,
     scope: &crate::extraction::conversation::ScopeReport,
+    unservable: bool,
 ) {
-    // Same predicate the distiller's refusal and the project filter use. A
-    // branch switch inside one checkout is one scope, and a scope hidden by
-    // `.aicxignore` is still a scope.
-    if !scope.scope_mixed() {
+    if !unservable {
         return;
     }
     if mixed_scope
@@ -203,8 +210,17 @@ fn extract_intents_from_files_with_stats(
         .map(|file| file.path.to_string_lossy().into_owned())
         .collect();
     for file in &files {
+        // The lanes that attach a scope have already noted the session on
+        // the verdict their project filter used; this pass is the floor for a
+        // file that arrives with a scope and no such verdict.
         if let Some(scope) = file.scope.as_ref() {
-            note_mixed_scope(&mut mixed_scope, &file.agent, &file.session_id, scope);
+            note_mixed_scope(
+                &mut mixed_scope,
+                &file.agent,
+                &file.session_id,
+                scope,
+                scope.scope_mixed(),
+            );
         }
     }
 
@@ -651,13 +667,15 @@ fn collect_intent_files_from_index(
                     }
                 };
             accounted.insert((entry.agent.clone(), entry.session_id.clone()));
-            let Some((file, scope)) =
-                catalog_frames_to_intent_file(&entry, source_path, frames, scope, cutoff, false)
-            else {
-                continue;
-            };
-            note_mixed_scope(mixed_scope, &entry.agent, &entry.session_id, &scope);
-            if let Some(file) = file {
+            if let Some(file) = catalog_frames_to_intent_file(
+                &entry,
+                source_path,
+                frames,
+                scope,
+                cutoff,
+                false,
+                mixed_scope,
+            ) {
                 files.push(file);
             }
         }
@@ -793,13 +811,15 @@ fn collect_intent_files(
                     continue;
                 }
             };
-        let Some((file, scope)) =
-            catalog_frames_to_intent_file(&entry, source_path, frames, scope, cutoff, live_row)
-        else {
-            continue;
-        };
-        note_mixed_scope(mixed_scope, &entry.agent, &entry.session_id, &scope);
-        let Some(file) = file else {
+        let Some(file) = catalog_frames_to_intent_file(
+            &entry,
+            source_path,
+            frames,
+            scope,
+            cutoff,
+            live_row,
+            mixed_scope,
+        ) else {
             continue;
         };
         seen_sessions.insert((entry.agent.clone(), entry.session_id.clone()));
@@ -840,72 +860,76 @@ fn catalog_frames_to_intent_file(
     scope: crate::extraction::conversation::ScopeReport,
     cutoff: DateTime<Utc>,
     live_row: bool,
-) -> Option<(
-    Option<StoredChunkFile>,
-    crate::extraction::conversation::ScopeReport,
-)> {
-    let no_file = |scope: crate::extraction::conversation::ScopeReport| Some((None, scope));
+    mixed_scope: &mut Vec<MixedScopeSession>,
+) -> Option<StoredChunkFile> {
     // Guardian sessions are control-plane evidence: they never enter the
     // intent stream, and their scope never enters the mixed-scope telemetry
-    // either, regardless of which lane called us. `None` says "not operator
-    // work at all", which an empty file with a report cannot.
+    // either, regardless of which lane called us.
     if is_guardian_session(entry, &source_path, &frames) {
         return None;
     }
     let Some(project) = entry.project.clone() else {
-        return no_file(scope);
+        // No bucket to filter into: only the session's own spread is news.
+        note_mixed_scope(
+            mixed_scope,
+            &entry.agent,
+            &entry.session_id,
+            &scope,
+            scope.scope_mixed(),
+        );
+        return None;
     };
     // Scope is judged on the whole session, before the project filter narrows
-    // the frames to one bucket — and the report travels even when the filter
-    // removes every frame (fail-closed must not silence mixed evidence).
-    retain_frames_for_project(
-        &mut frames,
-        &project,
-        entry.cwd.as_deref(),
-        scope.scope_foreign_to(entry.cwd.as_deref()),
+    // the frames to one bucket, and the telemetry is noted before the filter
+    // runs: fail-closed must not silence mixed evidence even when it removes
+    // every frame. One verdict serves both, so the telemetry names exactly the
+    // sessions the filter could not serve whole.
+    let foreign = scope.scope_foreign_to(entry.cwd.as_deref());
+    note_mixed_scope(
+        mixed_scope,
+        &entry.agent,
+        &entry.session_id,
+        &scope,
+        foreign,
     );
-    let Some(timestamp) = frames.last().map(|frame| frame.timestamp) else {
-        return no_file(scope);
-    };
+    retain_frames_for_project(&mut frames, &project, entry.cwd.as_deref(), foreign);
+    let timestamp = frames.last().map(|frame| frame.timestamp)?;
     let canonical_date = entry
         .date
         .as_deref()
         .and_then(|date| NaiveDate::parse_from_str(date, "%Y-%m-%d").ok());
     if canonical_date.is_none() && timestamp < cutoff {
-        return no_file(scope);
+        return None;
     }
-    Some((
-        Some(StoredChunkFile {
-            agent: entry.agent.clone(),
-            date: entry
-                .date
-                .clone()
-                .unwrap_or_else(|| timestamp.format("%Y-%m-%d").to_string()),
-            path: source_path,
-            project: project.clone(),
-            identity_source: CATALOG_IDENTITY_SOURCE.to_string(),
-            sequence: 0,
-            timestamp,
-            session_id: entry.session_id.clone(),
-            honesty: if live_row {
-                crate::oracle::ClaimHonesty::live_open()
-            } else {
-                crate::oracle::ClaimHonesty::canonical()
-            },
-            scope: Some(scope.clone()),
-            transcript_entries: Some(
-                frames
-                    .into_iter()
-                    .map(|frame| TranscriptEntry {
-                        role: frame.role,
-                        lines: frame.message.lines().map(str::to_string).collect(),
-                    })
-                    .collect(),
-            ),
-            body: None,
-        }),
-        scope,
-    ))
+    Some(StoredChunkFile {
+        agent: entry.agent.clone(),
+        date: entry
+            .date
+            .clone()
+            .unwrap_or_else(|| timestamp.format("%Y-%m-%d").to_string()),
+        path: source_path,
+        project: project.clone(),
+        identity_source: CATALOG_IDENTITY_SOURCE.to_string(),
+        sequence: 0,
+        timestamp,
+        session_id: entry.session_id.clone(),
+        honesty: if live_row {
+            crate::oracle::ClaimHonesty::live_open()
+        } else {
+            crate::oracle::ClaimHonesty::canonical()
+        },
+        scope: Some(scope),
+        transcript_entries: Some(
+            frames
+                .into_iter()
+                .map(|frame| TranscriptEntry {
+                    role: frame.role,
+                    lines: frame.message.lines().map(str::to_string).collect(),
+                })
+                .collect(),
+        ),
+        body: None,
+    })
 }
 
 /// Is this session a guardian — control-plane evidence that stays out of the
@@ -1011,13 +1035,21 @@ fn collect_live_unadmitted_files(
             continue;
         }
         // `scope` is the WHOLE session's, taken before the frame-kind filter
-        // and before the project filter narrows the frames to one bucket.
-        note_mixed_scope(mixed_scope, &entry.agent, &entry.session_id, &scope);
+        // and before the project filter narrows the frames to one bucket. The
+        // filter's verdict is the telemetry's, as in the census lane.
+        let foreign = scope.scope_foreign_to(entry.cwd.as_deref());
+        note_mixed_scope(
+            mixed_scope,
+            &entry.agent,
+            &entry.session_id,
+            &scope,
+            foreign,
+        );
         retain_frames_for_project(
             &mut frames,
             &identity_project,
             entry.cwd.as_deref(),
-            scope.scope_foreign_to(entry.cwd.as_deref()),
+            foreign,
         );
         if frames.is_empty() {
             continue;
