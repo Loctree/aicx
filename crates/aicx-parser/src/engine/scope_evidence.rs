@@ -203,14 +203,18 @@ pub fn tool_call_workdirs(payload: &Value) -> Vec<WorkdirEvidence> {
 /// The key must be the whole property name, and a quoted one must be quoted
 /// on both sides: `networkdir:`, `fallback_workdir:` and `"fallback-workdir":`
 /// are other properties, and reading them would unplace a window whose call
-/// never left the baseline.
+/// never left the baseline. A name is read as JavaScript evaluates it:
+/// `workdir` and `"workd\x69r"` are the `workdir` key
+/// ([`escaped_workdir_keys`]).
 ///
 /// A computed key is the same property written in brackets:
 /// `{cmd, ["workdir"]: targetDir}` passes `workdir` exactly as the plain key
 /// does, and skipping it left a call into another checkout on its baseline
 /// ([`computed_key`]). Only a quoted name computes this key — `[workdir]` is
 /// whatever the variable `workdir` holds — and a template-literal key
-/// exists only in brackets.
+/// exists only in brackets. A key computed from code is not read here: in an
+/// `exec_command` argument it makes the argument opaque
+/// ([`exec_arguments_unseen`]).
 ///
 /// This is a scanner over key/value SHAPE, not a JavaScript parser: every key
 /// is found wherever it sits, and where it sits only decides what a readable
@@ -230,27 +234,35 @@ fn workdirs_in_literal(input: &str) -> Vec<WorkdirEvidence> {
         regex::Regex::new(r#"(?:^|[^A-Za-z0-9_$])(?P<key>"workdir"|'workdir'|`workdir`|workdir)"#)
             .expect("valid regex")
     });
+    // Every key, as written, with the quote around it if it has one.
+    let mut keys: Vec<(std::ops::Range<usize>, Option<char>)> = re
+        .captures_iter(input)
+        .filter_map(|caps| caps.name("key"))
+        .map(|key| (key.range(), key.as_str().chars().next().filter(is_quote)))
+        .collect();
+    if input.contains('\\') {
+        keys.extend(escaped_workdir_keys(input));
+        keys.sort_by_key(|(key, _)| key.start);
+    }
     let mut found = Vec::new();
     // Lexed on the first readable path only: most inputs never get there.
     let mut inert: Option<Vec<std::ops::Range<usize>>> = None;
-    for caps in re.captures_iter(input) {
-        let Some(key) = caps.name("key") else {
-            continue;
-        };
-        let quoted = key.as_str().starts_with(['"', '\'', '`']);
-        let mut before = &input[..key.start()];
-        let mut rest = &input[key.end()..];
-        // `workdirs`, `workdir_hint`: another identifier that only starts the
-        // same way.
+    for (key, quote) in keys {
+        let quoted = quote.is_some();
+        let mut before = &input[..key.start];
+        let mut rest = &input[key.end..];
+        // `workdirs`, `workdir_hint`, `workdirs`: another identifier that
+        // only starts the same way.
         if !quoted
-            && rest.starts_with(|c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '$'))
+            && rest
+                .starts_with(|c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '$' | '\\'))
         {
             continue;
         }
         if quoted {
             match computed_key(before, rest) {
                 Some((open, close)) => (before, rest) = (open, close),
-                None if key.as_str().starts_with('`') => continue,
+                None if quote == Some('`') => continue,
                 None => {}
             }
         }
@@ -301,7 +313,7 @@ fn workdirs_in_literal(input: &str) -> Vec<WorkdirEvidence> {
                     continue;
                 }
                 let inert = inert.get_or_insert_with(|| inert_spans(input));
-                if within(inert, key.start()) {
+                if within(inert, key.start) {
                     found.push(WorkdirEvidence::Opaque);
                 } else {
                     found.push(WorkdirEvidence::Explicit(body.to_string()));
@@ -319,6 +331,123 @@ fn workdirs_in_literal(input: &str) -> Vec<WorkdirEvidence> {
     found
 }
 
+fn is_quote(c: &char) -> bool {
+    matches!(c, '"' | '\'' | '`')
+}
+
+/// Every key that spells `workdir` through escapes — `workd\u0069r`,
+/// `"workd\x69r"`, `'work\dir'` — with the quote around it if it has one.
+///
+/// JavaScript decodes the escapes in a property name before it looks the name
+/// up, so each of these IS the `workdir` key. Scanning for its plain spelling
+/// alone let the call's directory pass unseen, and the window stayed on its
+/// baseline while the call ran in another checkout. A name counts only as one
+/// whole run of name characters and escapes: bare, or with the same quote on
+/// both sides.
+fn escaped_workdir_keys(input: &str) -> Vec<(std::ops::Range<usize>, Option<char>)> {
+    static ESCAPED_NAME_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    // A run of name characters and escapes that holds at least one escape.
+    // The leading class is the boundary the regex crate has no look-behind
+    // for, as in `workdirs_in_literal`.
+    let re = ESCAPED_NAME_RE.get_or_init(|| {
+        let escape = r"\\(?:u\{[0-9A-Fa-f]*\}|\r\n|(?s:.))";
+        regex::Regex::new(&format!(
+            r"(?:^|[^A-Za-z0-9_$\\])(?P<name>(?:[A-Za-z0-9_$]|{escape})*{escape}(?:[A-Za-z0-9_$]|{escape})*)"
+        ))
+        .expect("valid regex")
+    });
+    let mut keys = Vec::new();
+    for name in re.captures_iter(input).filter_map(|caps| caps.name("name")) {
+        let quote = input[..name.start()]
+            .chars()
+            .next_back()
+            .filter(|quote| is_quote(quote) && input[name.end()..].starts_with(*quote));
+        if escaped_name(name.as_str(), quote).as_deref() != Some("workdir") {
+            continue;
+        }
+        let width = quote.map_or(0, char::len_utf8);
+        keys.push((name.start() - width..name.end() + width, quote));
+    }
+    keys
+}
+
+/// The name that a property key written as `written` evaluates to, or `None`
+/// when an escape in it is not valid there.
+///
+/// `quote` is the quote the name is written in. An identifier may only hold
+/// Unicode escapes (`\u0069`, `\u{69}`). A quoted name may hold any escape a
+/// string literal allows: hex, Unicode, legacy octal (`\151`), a line
+/// continuation that stands for nothing, or a backslash before any other
+/// character, which stands for that character (`\i` is `i`).
+fn escaped_name(written: &str, quote: Option<char>) -> Option<String> {
+    fn hex(digits: &str) -> Option<char> {
+        if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_hexdigit()) {
+            return None;
+        }
+        char::from_u32(u32::from_str_radix(digits, 16).ok()?)
+    }
+    let mut name = String::new();
+    let mut chars = written.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            name.push(c);
+            continue;
+        }
+        let escaped = chars.next()?;
+        let decoded = match escaped {
+            'u' if chars.peek() == Some(&'{') => {
+                chars.next();
+                let mut digits = String::new();
+                loop {
+                    match chars.next()? {
+                        '}' => break,
+                        digit => digits.push(digit),
+                    }
+                }
+                hex(&digits)?
+            }
+            'u' => {
+                let digits = chars.by_ref().take(4).collect::<String>();
+                hex(&digits).filter(|_| digits.len() == 4)?
+            }
+            _ if quote.is_none() => return None,
+            'x' => {
+                let digits = chars.by_ref().take(2).collect::<String>();
+                hex(&digits).filter(|_| digits.len() == 2)?
+            }
+            '0'..='7' => {
+                let mut value = escaped.to_digit(8)?;
+                // `\377` is the largest: three digits from 0-3, two from 4-7.
+                let more = if value <= 3 { 2 } else { 1 };
+                for _ in 0..more {
+                    match chars.peek().and_then(|c| c.to_digit(8)) {
+                        Some(digit) => {
+                            value = value * 8 + digit;
+                            chars.next();
+                        }
+                        None => break,
+                    }
+                }
+                char::from_u32(value)?
+            }
+            '\r' => {
+                chars.next_if_eq(&'\n');
+                continue;
+            }
+            '\n' | '\u{2028}' | '\u{2029}' => continue,
+            'b' => '\u{8}',
+            'f' => '\u{c}',
+            'n' => '\n',
+            'r' => '\r',
+            't' => '\t',
+            'v' => '\u{b}',
+            other => other,
+        };
+        name.push(decoded);
+    }
+    Some(name)
+}
+
 /// Does an `exec_command` call in `input` take an argument whose keys are not
 /// all written at the call?
 ///
@@ -329,10 +458,12 @@ fn workdirs_in_literal(input: &str) -> Vec<WorkdirEvidence> {
 /// `opts` or `args` parsed from a tool's output or kept from an earlier call,
 /// runs in a directory only the runtime knew. Such a call is opaque, never "no
 /// evidence", because treating it as no evidence left the window on its
-/// baseline while the call worked in another checkout. A spread nested deeper,
-/// such as `{env: {...process.env}}`, feeds another property. A string argument
-/// or no argument names no directory. An argument object that never closes
-/// was cut off and is opaque.
+/// baseline while the call worked in another checkout. The same holds for a
+/// property whose key only the runtime names — `{cmd, [key]: dir}`,
+/// `{get workdir() {…}}` ([`object_is_whole`]). A spread nested deeper, such
+/// as `{env: {...process.env}}`, feeds another property. A string argument or
+/// no argument names no directory. An argument object that never closes was
+/// cut off and is opaque.
 ///
 /// `exec_command` is the one tool that takes a `workdir`. Other tools take
 /// variables as a matter of course (`tools.apply_patch(patch)`), and reading
@@ -356,7 +487,7 @@ fn exec_arguments_unseen(input: &str, inert: &[std::ops::Range<usize>]) -> bool 
             continue;
         }
         if !argument.starts_with('{')
-            || !object_is_whole(input.as_bytes(), input.len() - argument.len(), inert)
+            || !object_is_whole(input, input.len() - argument.len(), inert)
         {
             return true;
         }
@@ -364,10 +495,16 @@ fn exec_arguments_unseen(input: &str, inert: &[std::ops::Range<usize>]) -> bool 
     false
 }
 
-/// Does the object literal opening at `open` close, with no spread of its
-/// own? Text and comments ([`inert_spans`]) are skipped, so a `...` or a brace
-/// inside a string is neither a spread nor the object's end.
-fn object_is_whole(bytes: &[u8], open: usize, inert: &[std::ops::Range<usize>]) -> bool {
+/// Does the object literal opening at `open` close, with every property of
+/// its own written where the key scan reads it ([`plain_property`])?
+///
+/// A spread (`...opts`), a key computed from code (`[name]`,
+/// `["work" + "dir"]`), an accessor (`get workdir() {…}`) or a method names a
+/// property only the runtime evaluates. Text and comments ([`inert_spans`])
+/// are skipped, so a `...` or a brace inside a string is neither a spread nor
+/// the object's end.
+fn object_is_whole(input: &str, open: usize, inert: &[std::ops::Range<usize>]) -> bool {
+    let bytes = input.as_bytes();
     let mut next = inert.partition_point(|span| span.start < open);
     let mut depth = 0usize;
     let mut at = open;
@@ -385,12 +522,76 @@ fn object_is_whole(bytes: &[u8], open: usize, inert: &[std::ops::Range<usize>]) 
                     return true;
                 }
             }
-            b'.' if depth == 1 && bytes[at..].starts_with(b"...") => return false,
             _ => {}
+        }
+        // A property of this object starts after its opening brace and after
+        // each comma between its properties.
+        if depth == 1 && matches!(bytes[at], b'{' | b',') && !plain_property(&input[at + 1..]) {
+            return false;
         }
         at += 1;
     }
     false
+}
+
+/// Does the object property that opens `rest` have a key the scan reads?
+///
+/// That is `key: value` or the shorthand `key`, where the key is a name, a
+/// quoted name, or one quoted name in brackets (`["workdir"]`). The end of the
+/// object, as after a trailing comma, opens no property. Anything else — a
+/// spread, a computed key built from code, an accessor or a method — is
+/// evaluated at runtime. So is a numeric key the scan does not read, such as
+/// `1.5`; it costs the call its attribution, never its correctness.
+fn plain_property(rest: &str) -> bool {
+    let Some(rest) = skip_comments(rest) else {
+        return false;
+    };
+    let after_key = match rest.chars().next() {
+        None | Some('}') => return true,
+        Some(quote @ ('"' | '\'')) => {
+            literal_body(&rest[1..], quote).map(|literal| &rest[1 + literal.end..])
+        }
+        Some('[') => skip_comments(&rest[1..]).and_then(|key| {
+            let quote = key.chars().next().filter(is_quote)?;
+            let literal = literal_body(&key[1..], quote)?;
+            if quote == '`' && literal.body.contains("${") {
+                return None;
+            }
+            skip_comments(&key[1 + literal.end..])?.strip_prefix(']')
+        }),
+        Some(c) if c.is_alphanumeric() || matches!(c, '_' | '$' | '\\') => {
+            // A name may also stand alone as the shorthand `{cmd, workdir}`.
+            let after = skip_comments(&rest[name_len(rest)..]);
+            return after.is_some_and(|after| after.starts_with([':', ',', '}']));
+        }
+        _ => None,
+    };
+    after_key
+        .and_then(skip_comments)
+        .is_some_and(|after| after.starts_with(':'))
+}
+
+/// Byte length of the name that opens `rest`, its `\u` escapes included:
+/// `workd\u{69}r` is one name, braces and all.
+fn name_len(rest: &str) -> usize {
+    let mut at = 0;
+    while let Some(c) = rest[at..].chars().next() {
+        if c == '\\' {
+            at += 1;
+            if rest[at..].starts_with("u{") {
+                match rest[at..].find('}') {
+                    Some(close) => at += close + 1,
+                    None => return rest.len(),
+                }
+            }
+            continue;
+        }
+        if !(c.is_alphanumeric() || matches!(c, '_' | '$')) {
+            break;
+        }
+        at += c.len_utf8();
+    }
+    at
 }
 
 /// Byte ranges of `input` that JavaScript reads as text rather than code:
@@ -1865,6 +2066,12 @@ mod tests {
             r#"tools.exec_command(Object.assign({cmd: "make"}, opts))"#,
             // The argument object was cut off.
             r#"tools.exec_command({cmd: "make""#,
+            // A key only the runtime names.
+            r#"tools.exec_command({cmd: "make", [key]: dir})"#,
+            r#"tools.exec_command({cmd: "make", ["work" + "dir"]: "/repo/a"})"#,
+            r#"tools.exec_command({cmd: "make", [`${key}`]: dir})"#,
+            r#"tools.exec_command({cmd: "make", get workdir() { return dir }})"#,
+            r#"tools.exec_command({cmd: "make", workdir() { return "/repo/a" }})"#,
         ] {
             assert_eq!(
                 tool_call_workdirs(&js_input(input)),
@@ -1877,6 +2084,8 @@ mod tests {
             r#"tools.exec_command({cmd: "ls", env: {...process.env, CI: "1"}})"#,
             r#"tools.exec_command({cmd: "ls", args: [...files]})"#,
             r#"tools.exec_command({cmd: "echo ...done", note: "}"})"#,
+            r#"tools.exec_command({cmd: "ls", "yield_time_ms": 1000, ['max_output']: 10,})"#,
+            r#"tools.exec_command({cmd, get: 1, 0: "x", /* note */ tty})"#,
             r#"tools.exec_command("ls")"#,
             "tools.exec_command()",
             // Other tools take variables as a matter of course.
@@ -1899,6 +2108,53 @@ mod tests {
                 "tools.exec_command({workdir: \"/repo/a\" // last line"
             )),
             [explicit(&["/repo/a"]), vec![WorkdirEvidence::Opaque]].concat()
+        );
+    }
+
+    /// Finding: the key scan matched `workdir` only as written, while
+    /// JavaScript decodes the escapes in a property name before it looks the
+    /// name up. Each call below runs in `/repo/foreign`, and with its argument
+    /// otherwise whole, the window stayed on its baseline.
+    #[test]
+    fn an_escaped_workdir_key_is_the_workdir_key() {
+        for input in [
+            r#"tools.exec_command({cmd: "ls", workdir: "/repo/foreign"})"#,
+            r#"tools.exec_command({cmd: "ls", workd\u{69}r: "/repo/foreign"})"#,
+            r#"tools.exec_command({cmd: "ls", "workdir": "/repo/foreign"})"#,
+            r#"tools.exec_command({cmd: "ls", 'workd\x69r': "/repo/foreign"})"#,
+            r#"tools.exec_command({cmd: "ls", "workd\151r": "/repo/foreign"})"#,
+            r#"tools.exec_command({cmd: "ls", "work\dir": "/repo/foreign"})"#,
+            r#"tools.exec_command({cmd: "ls", ["workdir"]: "/repo/foreign"})"#,
+            r#"tools.exec_command({cmd: "ls", [`workdir`]: "/repo/foreign"})"#,
+            // A line continuation in a quoted name stands for nothing.
+            "tools.exec_command({cmd: \"ls\", \"workd\\\nir\": \"/repo/foreign\"})",
+        ] {
+            assert_eq!(
+                tool_call_workdirs(&js_input(input)),
+                explicit(&["/repo/foreign"]),
+                "{input}"
+            );
+        }
+        // Raw arguments that fail to parse as JSON are scanned the same way.
+        let arguments = serde_json::json!({
+            "type": "function_call",
+            "name": "shell",
+            "arguments": r#"{"cmd":"ls","workdir":"/repo/foreign",}"#,
+        });
+        assert_eq!(tool_call_workdirs(&arguments), explicit(&["/repo/foreign"]));
+        // Escapes that spell another name are another property: `\r` is a
+        // carriage return, and `workdirs` is `workdirs`.
+        for input in [
+            r#"tools.exec_command({cmd: "ls", workdirs: "/repo/foreign"})"#,
+            r#"tools.exec_command({cmd: "ls", "workdi\r": "/repo/foreign"})"#,
+            r#"tools.exec_command({cmd: "ls", workdirs: "/repo/foreign"})"#,
+        ] {
+            assert!(tool_call_workdirs(&js_input(input)).is_empty(), "{input}");
+        }
+        // Written inside text, it is text, exactly as the plain spelling is.
+        assert_eq!(
+            tool_call_workdirs(&js_input(r#"console.log('{"workdir": "/repo/foreign"}')"#)),
+            vec![WorkdirEvidence::Opaque]
         );
     }
 
@@ -2982,17 +3238,25 @@ mod tests {
                 "{input}"
             );
         }
-        // Brackets that compute no property of an object: a member read, an
+        // Brackets that are not the `workdir` key as written: a member read, an
         // array, a variable's value as the key, and a template literal outside
         // brackets, which is no key at all.
         for input in [
             r#"const dir = options["workdir"]; tools.exec_command({cmd: "ls"})"#,
             r#"const keys = ["workdir", "cmd"]; tools.exec_command({cmd: "ls"})"#,
-            r#"tools.exec_command({cmd: "ls", [workdir]: "/repo/foreign"})"#,
-            "tools.exec_command({cmd: \"ls\", `workdir`: \"/repo/foreign\"})",
+            r#"const target = {cmd: "ls", [workdir]: "/repo/foreign"}"#,
+            "const target = {cmd: \"ls\", `workdir`: \"/repo/foreign\"}",
         ] {
             assert!(tool_call_workdirs(&js_input(input)).is_empty(), "{input}");
         }
+        // Passed to `exec_command`, though, a variable's value as the key may
+        // be `workdir` after all: only the runtime knew (`object_is_whole`).
+        assert_eq!(
+            tool_call_workdirs(&js_input(
+                r#"tools.exec_command({cmd: "ls", [workdir]: "/repo/foreign"})"#
+            )),
+            vec![WorkdirEvidence::Opaque]
+        );
     }
 
     /// Finding: the scanner keeps backslashes as written, so an escape that
