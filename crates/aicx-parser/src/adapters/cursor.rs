@@ -540,12 +540,16 @@ impl Analysis {
             let end = model.turns.len() as u64 - 1;
             model.segments = vec![Segment {
                 segment_id: 0,
+                scope_root: None,
+                scope_workdirs: Vec::new(),
                 cwd: Known::unknown(),
                 branch: Known::unknown(),
                 started_at: model.provenance.started_at.clone(),
                 ended_at: model.provenance.ended_at.clone(),
                 turn_range: TurnRange { start: 0, end },
                 scope_status: crate::engine::ScopeStatus::from_evidence(None, None),
+                // Only the Codex adapter observes explicit tool-call workdirs.
+                scope_conflict: false,
             }];
         }
         Ok(UnvalidatedParse::from_model(model))

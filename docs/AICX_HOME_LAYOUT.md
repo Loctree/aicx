@@ -44,7 +44,7 @@ on `cwd` into project buckets; only frames whose `cwd` sits under a listed
 prefix are dropped before index/extract-for-search. A stray `cd` into a
 private tree does not throw away the rest of the session.
 Path prefixes are literal; glob and negation syntax is rejected for checkout
-rules. A rule change invalidates the published index and matching extract
+rules. A Windows drive path (`D:\work\private`) matches in any letter case. A rule change invalidates the published index and matching extract
 cache automatically. If the file cannot be read, indexing and conversation
 retrieval stop instead of admitting unfiltered content.
 

@@ -236,7 +236,11 @@ mod tests {
             model.segments.push(crate::engine::Segment {
                 segment_id: 0,
                 scope_status: crate::engine::ScopeStatus::NoDriftObserved,
+                // Only the Codex adapter observes explicit tool-call workdirs.
+                scope_conflict: false,
                 cwd: Known::value(cwd.to_owned()),
+                scope_root: None,
+                scope_workdirs: Vec::new(),
                 branch: Known::unknown(),
                 started_at: Known::unknown(),
                 ended_at: Known::unknown(),

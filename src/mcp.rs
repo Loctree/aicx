@@ -1913,7 +1913,13 @@ impl AicxMcpServer {
         let records = display.records;
 
         let body = match params.emit.as_str() {
-            "markdown" | "md" => intents::format_intents_markdown(&records),
+            "markdown" | "md" => {
+                let mut body = intents::format_intents_markdown(&records);
+                if let Some(note) = extraction.stats.withheld_scope_note() {
+                    body.push_str(&note);
+                }
+                body
+            }
             _ => {
                 let oracle_status =
                     if extraction.stats.identity_source == intents::CATALOG_IDENTITY_SOURCE {
@@ -2955,6 +2961,8 @@ mod tests {
             identity_source: crate::intents::PERSISTED_IDENTITY_SOURCE.to_string(),
             path_heuristic_records: 0,
             live_sessions: 0,
+            mixed_scope_sessions: 0,
+            unplaced_frames: 0,
         };
         let completeness = stats.completeness(Some(1), 3).with_project_scope(
             "exact",

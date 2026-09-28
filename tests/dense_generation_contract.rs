@@ -1,4 +1,7 @@
 // Vibecrafted with AI Agents by Vetcoders (c)2024-2026 LibraxisAI
+// App-only integration surface: compiled to an empty target under the slim
+// `loctree-consumer` profile (`--no-default-features`).
+#![cfg(feature = "app")]
 //! W2-03 contract: one dense payload per hybrid generation.
 //!
 //! A hybrid generation materializes vectors exactly once, into the versioned

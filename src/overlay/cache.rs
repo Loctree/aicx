@@ -4,6 +4,7 @@
 
 use super::{OverlayBuildStats, OverlayFeedItem, atomic_write_json, deduplicated_catalog_feed};
 use crate::catalog::CatalogEntry;
+use crate::extraction::conversation::ScopeReport;
 use crate::source_index::ConversationCoverage;
 use crate::source_path::SourceAllowlist;
 use crate::timeline::TimelineEntry;
@@ -16,7 +17,7 @@ use std::path::{Component, Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 /// Bump for feed classification, census shaping, or frame serialization changes.
-const CACHE_SCHEMA: &str = "aicx.overlay.catalog-feed.v1";
+const CACHE_SCHEMA: &str = "aicx.overlay.catalog-feed.v2";
 const CACHE_OWNER_SCHEMA: &str = "aicx.overlay.catalog-cache-owner.v1";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -68,6 +69,10 @@ struct ConversationCache {
     key: String,
     checksum: String,
     frames: Vec<TimelineEntry>,
+    /// Scope of the WHOLE session, judged by the reader before the signal
+    /// projection. The cached frames cannot rebuild it: workdirs seen only on
+    /// tool calls and scopes `.aicxignore` hid are gone from them.
+    scope: ScopeReport,
     coverage: ConversationCoverage,
 }
 
@@ -169,14 +174,14 @@ pub(super) fn load_catalog_feed(
         } else {
             read_json::<ConversationCache>(root, &source_cache)?
         };
-        let (frames, coverage) = if let Some(saved) = saved
+        let (frames, scope, coverage) = if let Some(saved) = saved
             && saved.schema == CACHE_SCHEMA
             && saved.key == key
             && saved.coverage.cacheable()
-            && saved.checksum == digest(&(&saved.frames, &saved.coverage))?
+            && saved.checksum == digest(&(&saved.frames, &saved.scope, &saved.coverage))?
         {
             stats.source_sessions_reused += 1;
-            (saved.frames, saved.coverage)
+            (saved.frames, saved.scope, saved.coverage)
         } else {
             stats.source_sessions_parsed += 1;
             let read = crate::source_index::read_catalog_conversation_checked_at(home, &row.entry);
@@ -190,7 +195,7 @@ pub(super) fn load_catalog_feed(
                 );
             }
             match read {
-                Ok((read_path, frames, coverage)) => {
+                Ok((read_path, frames, scope, coverage)) => {
                     if read_path != *path {
                         bail!("overlay source changed resolved path during read");
                     }
@@ -200,8 +205,9 @@ pub(super) fn load_catalog_feed(
                             &ConversationCache {
                                 schema: CACHE_SCHEMA.to_owned(),
                                 key,
-                                checksum: digest(&(&frames, &coverage))?,
+                                checksum: digest(&(&frames, &scope, &coverage))?,
                                 frames: frames.clone(),
+                                scope: scope.clone(),
                                 coverage: coverage.clone(),
                             },
                         )?;
@@ -212,7 +218,7 @@ pub(super) fn load_catalog_feed(
                             "partial parser coverage; current claims are not cached",
                         );
                     }
-                    (frames, coverage)
+                    (frames, scope, coverage)
                 }
                 Err(error) => {
                     cacheable = false;
@@ -229,7 +235,7 @@ pub(super) fn load_catalog_feed(
             eprintln!("overlay: {note}");
             coverage_notes.push(note);
         }
-        conversations.push((row.entry.clone(), path.clone(), frames));
+        conversations.push((row.entry.clone(), path.clone(), frames, scope));
     }
     let records =
         crate::intents::extract_overlay_intents_from_conversations(repo_id, &conversations)?;
@@ -721,6 +727,7 @@ mod tests {
                     title: None,
                     machine: None,
                     logical_session_id: None,
+                    session_kind: None,
                 });
             }
             let fixture = Self {
@@ -1272,6 +1279,13 @@ mod tests {
         assert!(!stats.feed_cache_hit);
     }
 
+    /// Readable head of the sparse oversized record the bounded-reader tests
+    /// write. It names a tool RESULT, which carries no workdir. An over-cap
+    /// record nothing identifies could have been a tool call, and that fails
+    /// its turn window closed to unattributed: the window's intents are then
+    /// withheld, and there would be no feed left to cache.
+    const OVERSIZED_RESULT_HEAD: &[u8] = br#"{"timestamp":"2026-09-03T11:59:59Z","type":"response_item","payload":{"type":"function_call_output","call_id":"c1","output":""#;
+
     #[test]
     fn large_settled_projection_is_reused_but_unfinished_tail_is_not() {
         use std::io::{Seek, SeekFrom, Write};
@@ -1282,6 +1296,7 @@ mod tests {
         let mut source = fs::File::create(path).unwrap();
         // A sparse oversized record exercises the real >64MiB dispatch without
         // allocating a giant payload. The bounded reader reports it explicitly.
+        source.write_all(OVERSIZED_RESULT_HEAD).unwrap();
         source.set_len(65 * 1024 * 1024).unwrap();
         source.seek(SeekFrom::End(0)).unwrap();
         source.write_all(b"\n").unwrap();
@@ -1332,6 +1347,7 @@ mod tests {
         fixture.rows.truncate(1);
         fixture.rows[0].agent = "codex".to_owned();
         let mut source = fs::File::create(&fixture.rows[0].source_path).unwrap();
+        source.write_all(OVERSIZED_RESULT_HEAD).unwrap();
         source.set_len(65 * 1024 * 1024).unwrap();
         source.seek(SeekFrom::End(0)).unwrap();
         writeln!(source, "\n{}", serde_json::json!({

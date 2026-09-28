@@ -1199,6 +1199,7 @@ fn continuity_freshness_warns_when_hot_sources_have_pending_chunks() {
         title: None,
         machine: None,
         logical_session_id: None,
+        session_kind: None,
     };
     std::fs::write(
         crate::catalog::sessions_path_for(&tmp),

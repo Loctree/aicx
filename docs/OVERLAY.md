@@ -52,9 +52,11 @@ v1 readable.
 
 `catalog-feed-v1.json` and `catalog-source-v1-*.json` are private, disposable
 acceleration caches, not new source truth or a replacement for the lexical
-index. They use the versioned `aicx.overlay.catalog-feed.v1` envelope. A source
-slot is replaced when that source changes; appends do not create a new slot
-for every revision. The resolved `AICX_HOME` (or explicit API `index_root`)
+index. They use the versioned `aicx.overlay.catalog-feed.v2` envelope (v2 adds
+the whole-session scope report to each source slot, so a warm read attributes
+frames exactly as a cold one; v1 files are simply rebuilt). A source slot is
+replaced when that source changes; appends do not create a new slot for every
+revision. The resolved `AICX_HOME` (or explicit API `index_root`)
 owns these files; isolated calls never fall back to the operator's global home.
 `materialized-output-v1.json` binds an emitted document to its revision and
 checksum. Older output documents without that receipt are rematerialized once,
