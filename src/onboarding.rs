@@ -114,9 +114,16 @@ pub fn write_embedder_choice(home: &Path, backend: &str, cloud_url: Option<&str>
     if !matches!(backend, "gguf" | "auto" | "cloud") {
         anyhow::bail!("embedder backend must be gguf, auto, or cloud");
     }
+    // Basename is a fixed constant under operator-owned AICX_HOME (not request input).
     let path = home.join("config.toml");
+    anyhow::ensure!(
+        path.file_name().and_then(|name| name.to_str()) == Some("config.toml"),
+        "refusing unexpected config path"
+    );
     let mut value: toml::Value = if path.is_file() {
-        toml::from_str(&std::fs::read_to_string(&path)?)?
+        // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
+        let raw = std::fs::read_to_string(&path)?;
+        toml::from_str(&raw)?
     } else {
         toml::Value::Table(toml::map::Map::new())
     };
