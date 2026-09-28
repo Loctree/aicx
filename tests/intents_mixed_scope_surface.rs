@@ -1395,30 +1395,37 @@ fn a_session_rescoped_wholesale_to_one_foreign_checkout_is_reported() {
         }
     }
 
-    // The surfaces a user reads. This answer is empty, and the CLI renders an
-    // empty Markdown answer through its own early exit, so the note has to
-    // survive there as well as in the JSON and in MCP.
-    let cli = |emit: &str| {
+    // The surfaces a user reads. The CLI renders Markdown two ways: the
+    // unfiltered answer is the multi-lane Intent Report, and a filtered one
+    // that comes back empty leaves through its own early exit. The note has
+    // to survive both, as well as the JSON and MCP.
+    let cli = |args: &[&str]| {
         let output = std::process::Command::new(env!("CARGO_BIN_EXE_aicx"))
             .env("AICX_HOME", &aicx_home)
             .env("AICX_ALLOW_TMP", "1")
-            .args(["intents", "-p", "vista", "--emit", emit, "-H", "0"])
+            .args(["intents", "-p", "vista", "-H", "0"])
+            .args(args)
             .output()
             .expect("run CLI intents");
         assert!(
             output.status.success(),
-            "CLI intents --emit {emit}: {}",
+            "CLI intents {args:?}: {}",
             String::from_utf8_lossy(&output.stderr)
         );
         String::from_utf8(output.stdout).expect("CLI stdout utf-8")
     };
-    let markdown = cli("markdown");
+    let report = cli(&["--emit", "markdown"]);
     assert!(
-        markdown.contains("1 session(s) not served whole"),
-        "CLI Markdown: {markdown:?}"
+        report.starts_with("# Intent Report") && report.contains("1 session(s) not served whole"),
+        "CLI Intent Report: {report:?}"
+    );
+    let filtered = cli(&["--emit", "markdown", "--frame-kind", "user_msg"]);
+    assert!(
+        filtered.contains("1 session(s) not served whole"),
+        "CLI filtered Markdown: {filtered:?}"
     );
     let json: serde_json::Value =
-        serde_json::from_str(&cli("json")).expect("parse CLI intents envelope");
+        serde_json::from_str(&cli(&["--emit", "json"])).expect("parse CLI intents envelope");
     assert_eq!(json["completeness"]["complete"], false, "{json}");
     assert_eq!(json["completeness"]["mixed_scope_sessions"], 1, "{json}");
     let mcp = mcp_intents_markdown(&aicx_home);
