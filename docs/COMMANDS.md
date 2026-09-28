@@ -256,7 +256,12 @@ or malformed: why we could not read it makes no difference to the scope. That
 decision is made structurally, so an oversized payload cannot spend its own
 unreadable bytes arguing it was never a tool call, and a record type counts as
 read only when its value was: a payload `type` cut off mid-value proves
-nothing. A `workdir` that a tool call writes but does not state is unreadable
+nothing. Tool-call arguments that parse as a JSON object are read
+structurally: only their top-level `workdir` names the call's directory — a
+string is a path, `null` or a number is none, any other value is unreadable —
+so a nested `options.workdir`, or a `workdir` a command string spells out,
+names nothing. The rules below read code, and arguments that do not parse.
+A `workdir` that a tool call writes but does not state is unreadable
 too — a JavaScript template literal that interpolates, a literal that never
 closes, or a value that is not a literal at all (a variable, an expression,
 one that opens with punctuation such as `[root, repo].join('/')`, the
@@ -269,7 +274,11 @@ after `{` or `,`): prose and a path a string merely quotes name nothing. A
 unreadable, never a path: the call beside it may name no directory at all. A
 computed key is the same property, so `{cmd, ["workdir"]: targetDir}` is read
 like `workdir: targetDir`; `[workdir]` is not, since it names whatever the
-variable holds.
+variable holds. An `exec_command` whose argument is not all written at the
+call is unreadable as well: a variable (`tools.exec_command(args)`), an object
+with a top-level spread (`{cmd, ...opts}`), or one that never closes. A spread
+nested deeper feeds another property, and a string argument or none names no
+directory.
 Comments are skipped wherever JavaScript allows them, before the key as well
 as before the value, so `{cmd, /* note */ workdir: targetDir}` is read. A readable value runs to the quote that opened it, in any of the three
 quote styles, so `"/Users/O'Brien/repo"` is one path, and it counts only as
@@ -284,7 +293,8 @@ whose directory is unknown: it is unattributed unless its tool calls place it,
 so its frames never inherit the session bucket. A source that records no
 per-turn cwd at all is not withholding one. Scope is judged on every frame a
 reader produced, tool calls included, before the signal projection: a turn
-window whose only record is a call still counts. In the bounded reader that
+window whose only record is a readable call still counts in both readers,
+since the call is a turn of its own. In the bounded reader that
 holds for a call it could not read as well; the full adapter does not yet
 keep a window whose only record is an unreadable call, so that window's
 verdict is lost there.
@@ -302,8 +312,9 @@ unknowable — a workdir that does not exist on this machine — and there a
 Windows spelling is compared the way Windows resolves it (either separator,
 letter case ignored), a Unix spelling byte for byte; a UNC root is the whole
 `\\server\share` (or `//server/share`, while three or more leading `/` stay a
-Unix root), so `..` never climbs out of the share; a Windows path rooted
-without a drive (`\repo`) sits on the drive of the turn's cwd, and a
+Unix root), so `..` never climbs out of the share; a path rooted without a
+drive (`\repo`, or `/repo` when the turn's cwd has a drive) sits on the drive
+of the turn's cwd, and a
 drive-relative one (`D:fleet`) joins the turn's cwd only on that same drive —
 on any other drive it is unreadable evidence. Identity is
 canonical (one checkout reached two ways is one repo) and existence-checked (a

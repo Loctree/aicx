@@ -184,12 +184,27 @@ evidence rather than `/repos/vista`. A comment between the operands changes
 nothing: `"/repos/vista" /* note */ + "-private"` is the same expression, and a
 block comment that never closes leaves the value unreadable. Only the whole property name is read, so
 `networkdir` and `fallback_workdir` are other properties. A Windows `workdir` rooted without a
-drive (`\repo\pkg`) now sits on the drive of the turn's cwd and matches
-`C:\repo`, instead of matching nothing. A drive-relative one (`C:fleet`) is
+drive, by either separator (`\repo\pkg` or `/repo/pkg`), now sits on the drive
+of the turn's cwd and matches `C:\repo`, instead of matching nothing. Under a
+Unix cwd `/repo/pkg` stays a Unix path, and a UNC root in either separator is
+left alone. A drive-relative one (`C:fleet`) is
 relative to the current directory of ITS drive, and a rollout records that
 only for the turn's own drive: `D:fleet` under `D:\vista` is
 `D:\vista\fleet`, while `C:fleet` there is unreadable evidence instead of the
 fabricated `D:\vista\C:fleet` the baseline used to absorb.
+
+Tool-call arguments that parse as a JSON object are read structurally: only
+their top-level `workdir` is the call's directory. A string there is a path,
+`null` or a number names none, and any other value is unreadable evidence. A
+nested `options.workdir` used to become the call's directory and re-scope a
+baseline call to another checkout; it names nothing now, and neither does a
+`workdir` spelled inside a command string. The readings above are for code and
+for arguments that do not parse. In code, an `exec_command` whose argument is
+not all written at the call is unreadable evidence: a variable
+(`tools.exec_command(args)`), an object with a top-level spread
+(`{cmd, ...opts}`), or one that never closes. Its directory was only known at
+runtime, and the window used to stay on the baseline. A spread nested deeper
+feeds another property, and a string argument or none names no directory.
 
 The bounded reader for over-cap Codex rollouts now agrees with the full
 adapter in two places where they had drifted apart:
