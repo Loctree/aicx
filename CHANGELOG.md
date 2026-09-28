@@ -170,7 +170,10 @@ punctuation, `[root, repo].join('/')` or `!local ? foreign : base`. `null`,
 `undefined ?? otherDir` is an expression. A computed key names the same
 property: `{cmd, ["workdir"]: targetDir}` used to be skipped without even
 unreadable evidence, keeping a foreign call's window on the baseline, and is
-now read like `workdir: targetDir`. A `workdir` counts only as an object
+now read like `workdir: targetDir`. A key spelled with escapes is the key
+JavaScript evaluates: `workdir` and `"workd\x69r"` are `workdir`, where
+they used to be skipped and keep a foreign call's window on the baseline. A
+`workdir` counts only as an object
 property, right after `{` or `,`: prose (`// workdir: the repo`) names
 nothing, and neither does a path a string merely quotes
 (`const example = 'workdir:"/repo/foreign"'`), which used to re-scope the
@@ -198,13 +201,17 @@ their top-level `workdir` is the call's directory. A string there is a path,
 `null` or a number names none, and any other value is unreadable evidence. A
 nested `options.workdir` used to become the call's directory and re-scope a
 baseline call to another checkout; it names nothing now, and neither does a
-`workdir` spelled inside a command string. The readings above are for code and
-for arguments that do not parse. In code, an `exec_command` whose argument is
-not all written at the call is unreadable evidence: a variable
-(`tools.exec_command(args)`), an object with a top-level spread
-(`{cmd, ...opts}`), or one that never closes. Its directory was only known at
-runtime, and the window used to stay on the baseline. A spread nested deeper
-feeds another property, and a string argument or none names no directory.
+`workdir` spelled inside a command string. Arguments that parse as any other
+JSON value — an array, a string — name no directory either: they used to be
+scanned as code, so a quoted `{"workdir": …}` inside them re-scoped the
+window. The readings above are for code and for arguments that do not parse.
+In code, an `exec_command` whose argument is not all written at the call is
+unreadable evidence: a variable (`tools.exec_command(args)`), an object with a
+top-level spread (`{cmd, ...opts}`), a key computed from code
+(`{cmd, [key]: dir}`), an accessor or a method (`{get workdir() {…}}`), or
+one that never closes. Its directory was only known at runtime, and the
+window used to stay on the baseline. A spread nested deeper feeds another
+property, and a string argument or none names no directory.
 
 The bounded reader for over-cap Codex rollouts now agrees with the full
 adapter in two places where they had drifted apart:
@@ -227,6 +234,17 @@ the per-frame lane would have refused it. The bounded reader keeps one empty
 tool-call frame for such a window, so its verdict reaches the report, and it
 does so as well when the window's only call is a record it could not read,
 over the cap or malformed. The full adapter does not yet keep such a window.
+
+Frames the project filter withholds because their turn window could not be
+placed are reported, not dropped in silence. Such a window keeps the cataloged
+cwd, so its session is neither foreign nor mixed and is served from its placed
+frames — but the unplaced ones left no trace: `completeness` read as complete,
+and `continuity` rendered a window holding only that work as an empty pack.
+Each lane now notes them before its filter runs. `IntentExtraction` gains
+`unplaced_scope` (agent, session, frames of the requested kind), the stats and
+`completeness` gain `unplaced_frames`, and an answer missing any is not
+`complete` and carries a warning. `continuity` lists the sessions in NOW and
+refuses a window with nothing else to distill.
 
 A session also counts as mixed only when its cwds name more than one
 repository. Previously, more than one spelling was enough, so a session that
@@ -352,6 +370,12 @@ a Unix root.
   `status`. It is serialized, so payloads that carry it gain the three keys —
   the hidden scopes as a count, never as paths. Code that builds it with a
   literal must add the fields.
+- `aicx::intents::IntentExtraction` gains `unplaced_scope:
+  Vec<UnplacedScopeSession>` (new serialized type: `agent`, `session_id`,
+  `frames`). `IntentExtractionStats` and `IntentsCompleteness` gain
+  `unplaced_frames: usize` (serde default on read), so completeness payloads
+  gain the key, and `continuity::ContinuityPack` gains `unplaced_scope`. Code
+  that builds these with a literal must add the field.
 - `aicx::extraction::conversation::ScopeReport` gains `hidden_scopes: usize`
   (distinct cwds removed by `.aicxignore` before the report was built) and the
   `scope_foreign_to(baseline)` method; `scope_mixed()` now counts hidden

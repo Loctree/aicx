@@ -260,7 +260,9 @@ nothing. Tool-call arguments that parse as a JSON object are read
 structurally: only their top-level `workdir` names the call's directory — a
 string is a path, `null` or a number is none, any other value is unreadable —
 so a nested `options.workdir`, or a `workdir` a command string spells out,
-names nothing. The rules below read code, and arguments that do not parse.
+names nothing. Arguments that parse as any other JSON value (an array, a
+string) are data, not code, and name no directory. The rules below read code,
+and arguments that do not parse.
 A `workdir` that a tool call writes but does not state is unreadable
 too — a JavaScript template literal that interpolates, a literal that never
 closes, or a value that is not a literal at all (a variable, an expression,
@@ -274,11 +276,14 @@ after `{` or `,`): prose and a path a string merely quotes name nothing. A
 unreadable, never a path: the call beside it may name no directory at all. A
 computed key is the same property, so `{cmd, ["workdir"]: targetDir}` is read
 like `workdir: targetDir`; `[workdir]` is not, since it names whatever the
-variable holds. An `exec_command` whose argument is not all written at the
-call is unreadable as well: a variable (`tools.exec_command(args)`), an object
-with a top-level spread (`{cmd, ...opts}`), or one that never closes. A spread
-nested deeper feeds another property, and a string argument or none names no
-directory.
+variable holds. A key is read as JavaScript evaluates it, so `workdir`
+and `"workd\x69r"` are the `workdir` key. An `exec_command` whose argument is
+not all written at the call is unreadable as well: a variable
+(`tools.exec_command(args)`), an object with a top-level spread
+(`{cmd, ...opts}`), a key computed from code (`{cmd, [key]: dir}`), an
+accessor or a method (`{get workdir() {…}}`), or one that never closes. A
+spread nested deeper feeds another property, and a string argument or none
+names no directory.
 Comments are skipped wherever JavaScript allows them, before the key as well
 as before the value, so `{cmd, /* note */ workdir: targetDir}` is read. A readable value runs to the quote that opened it, in any of the three
 quote styles, so `"/Users/O'Brien/repo"` is one path, and it counts only as
@@ -298,6 +303,13 @@ since the call is a turn of its own. In the bounded reader that
 holds for a call it could not read as well; the full adapter does not yet
 keep a window whose only record is an unreadable call, so that window's
 verdict is lost there.
+Frames withheld that way are reported, not silently gone. An unplaced window
+keeps the cataloged cwd, so its session is neither foreign nor mixed and is
+served from its placed frames; the frames the filter withholds are named in
+`unplaced_scope` (agent, session, frame count), counted in the completeness
+`unplaced_frames` field with a warning, and an answer missing any is not
+`complete`. `aicx continuity` lists those sessions in NOW and refuses a window
+with nothing else to distill, instead of rendering it as an empty pack.
 Within a mixed
 session a frame must positively prove membership in the requested project —
 silence and conflicting evidence never inherit the session bucket — while
