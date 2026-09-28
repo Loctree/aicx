@@ -104,12 +104,14 @@ pub enum WindowScope {
 /// variable or an expression, a template literal that interpolates, a literal
 /// that never closes — is [`WorkdirEvidence::Opaque`]: the call names a
 /// directory we cannot see. So is an `exec_command` whose argument is not all
-/// written at the call ([`exec_arguments_unseen`]).
+/// written at the call ([`exec_arguments`]).
 ///
 /// Arguments that parse as a JSON object are read structurally: only their
 /// top-level `workdir` is the call's directory. Arguments that parse as any
 /// other JSON value name none. The JavaScript scan is for arguments that do
-/// not parse.
+/// not parse, and there too a path is read only from the argument object's
+/// own `workdir`. In a script, that is a property written directly in the
+/// object an `exec_command` call is passed ([`Site`]).
 pub fn tool_call_workdirs(payload: &Value) -> Vec<WorkdirEvidence> {
     let mut found: Vec<WorkdirEvidence> = Vec::new();
     let mut push = |evidence: WorkdirEvidence| {
@@ -147,15 +149,34 @@ pub fn tool_call_workdirs(payload: &Value) -> Vec<WorkdirEvidence> {
             // it rather than declaring no evidence because JSON parsing failed.
             None => {
                 if let Value::String(raw) = arguments {
-                    workdirs_in_literal(raw).into_iter().for_each(&mut push);
+                    workdirs_in_literal(raw, Site::Arguments)
+                        .into_iter()
+                        .for_each(&mut push);
                 }
             }
         }
     }
     if let Some(input) = payload.get("input").and_then(Value::as_str) {
-        workdirs_in_literal(input).into_iter().for_each(&mut push);
+        workdirs_in_literal(input, Site::Script)
+            .into_iter()
+            .for_each(&mut push);
     }
     found
+}
+
+/// Where the scanned text came from, which decides whose `workdir` it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Site {
+    /// Raw `arguments` that did not parse as JSON: the text is the call's
+    /// argument object, or that object's body alone.
+    Arguments,
+    /// A `custom_tool_call.input` script. A call's directory is a property of
+    /// the object literal passed straight to an `exec_command(` call. A
+    /// `workdir` anywhere else — `const metadata = {workdir: "/foreign"}` next
+    /// to `tools.exec_command({cmd: "pwd"})` — belongs to an object the scan
+    /// cannot tie to any call. Read as a path, it re-scoped a baseline call's
+    /// whole window to that checkout.
+    Script,
 }
 
 /// Every `workdir` key inside an object literal, quote style agnostic:
@@ -214,7 +235,7 @@ pub fn tool_call_workdirs(payload: &Value) -> Vec<WorkdirEvidence> {
 /// whatever the variable `workdir` holds — and a template-literal key
 /// exists only in brackets. A key computed from code is not read here: in an
 /// `exec_command` argument it makes the argument opaque
-/// ([`exec_arguments_unseen`]).
+/// ([`exec_arguments`]).
 ///
 /// This is a scanner over key/value SHAPE, not a JavaScript parser: every key
 /// is found wherever it sits, and where it sits only decides what a readable
@@ -225,7 +246,14 @@ pub fn tool_call_workdirs(payload: &Value) -> Vec<WorkdirEvidence> {
 /// window to `/x`. It is opaque instead: never hidden, because a lexer that
 /// misreads an apostrophe in prose must not hide a real key after it, and
 /// never a directory the window is placed in.
-fn workdirs_in_literal(input: &str) -> Vec<WorkdirEvidence> {
+///
+/// A readable path counts only as a property of the call's own argument
+/// object ([`Site`], [`call_property`]). A `workdir` written in any other
+/// object, or nested inside the argument, is a value the script may still hand
+/// to a call in a way the scan cannot follow, such as a tool reached through an
+/// alias. So it is opaque: never the directory the window is placed in, and
+/// never skipped as if the window named none.
+fn workdirs_in_literal(input: &str, site: Site) -> Vec<WorkdirEvidence> {
     static WORKDIR_KEY_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     // The leading class is the identifier boundary the regex crate has no
     // look-behind for: it consumes the character before the key, which is
@@ -247,6 +275,7 @@ fn workdirs_in_literal(input: &str) -> Vec<WorkdirEvidence> {
     let mut found = Vec::new();
     // Lexed on the first readable path only: most inputs never get there.
     let mut inert: Option<Vec<std::ops::Range<usize>>> = None;
+    let mut calls: Option<ExecArguments> = None;
     for (key, quote) in keys {
         let quoted = quote.is_some();
         let mut before = &input[..key.start];
@@ -313,10 +342,15 @@ fn workdirs_in_literal(input: &str) -> Vec<WorkdirEvidence> {
                     continue;
                 }
                 let inert = inert.get_or_insert_with(|| inert_spans(input));
-                if within(inert, key.start) {
-                    found.push(WorkdirEvidence::Opaque);
-                } else {
+                let calls = calls.get_or_insert_with(|| exec_arguments(input, inert));
+                // `before` ends where the property starts: at its key, or at
+                // the `[` of a computed one.
+                if !within(inert, key.start)
+                    && call_property(input, site, before.len(), &calls.objects, inert)
+                {
                     found.push(WorkdirEvidence::Explicit(body.to_string()));
+                } else {
+                    found.push(WorkdirEvidence::Opaque);
                 }
             }
             None => found.push(WorkdirEvidence::Opaque),
@@ -324,11 +358,79 @@ fn workdirs_in_literal(input: &str) -> Vec<WorkdirEvidence> {
     }
     if input.contains("exec_command") {
         let inert = inert.get_or_insert_with(|| inert_spans(input));
-        if exec_arguments_unseen(input, inert) {
+        if calls
+            .get_or_insert_with(|| exec_arguments(input, inert))
+            .unseen
+        {
             found.push(WorkdirEvidence::Opaque);
         }
     }
     found
+}
+
+/// Is the property starting at byte `at` one written directly in the call's
+/// own argument object, not in an object nested inside it or kept anywhere
+/// else?
+///
+/// In a script, that object is one passed straight to `exec_command(`
+/// (`objects`). Raw `arguments` text is the argument object itself, or its
+/// body alone when it opens with no brace.
+fn call_property(
+    input: &str,
+    site: Site,
+    at: usize,
+    objects: &[usize],
+    inert: &[std::ops::Range<usize>],
+) -> bool {
+    match site {
+        Site::Script => objects
+            .iter()
+            .filter(|&&open| open < at)
+            .any(|&open| depth_at(input, open, at, inert, 0) == Some(1)),
+        Site::Arguments => {
+            let start = skip_comments(input).map_or(input.len(), |rest| input.len() - rest.len());
+            if input[start..].starts_with('{') {
+                depth_at(input, start, at, inert, 0) == Some(1)
+            } else {
+                depth_at(input, start, at, inert, 1) == Some(1)
+            }
+        }
+    }
+}
+
+/// The bracket depth just before `at`, counting code from `from` at `depth`,
+/// or `None` once a bracket closes the level the count started inside. Text
+/// and comments ([`inert_spans`]) are skipped, so a brace inside a string
+/// neither opens nor closes anything.
+fn depth_at(
+    input: &str,
+    from: usize,
+    at: usize,
+    inert: &[std::ops::Range<usize>],
+    mut depth: usize,
+) -> Option<usize> {
+    let bytes = input.as_bytes();
+    let mut next = inert.partition_point(|span| span.start < from);
+    let mut cursor = from;
+    while cursor < at {
+        if let Some(span) = inert.get(next).filter(|span| span.start == cursor) {
+            cursor = span.end;
+            next += 1;
+            continue;
+        }
+        match bytes[cursor] {
+            b'{' | b'[' | b'(' => depth += 1,
+            b'}' | b']' | b')' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return None;
+                }
+            }
+            _ => {}
+        }
+        cursor += 1;
+    }
+    Some(depth)
 }
 
 fn is_quote(c: &char) -> bool {
@@ -448,12 +550,22 @@ fn escaped_name(written: &str, quote: Option<char>) -> Option<String> {
     Some(name)
 }
 
-/// Does an `exec_command` call in `input` take an argument whose keys are not
-/// all written at the call?
+/// The argument objects of the `exec_command` calls in a script.
+struct ExecArguments {
+    /// Byte offset of each object literal passed straight to a call, the only
+    /// places a readable `workdir` is the call's own ([`call_property`]).
+    objects: Vec<usize>,
+    /// A call takes an argument whose keys are not all written at the call.
+    unseen: bool,
+}
+
+/// Every `exec_command` call in `input`: the object literal each is passed,
+/// and whether any call takes an argument whose keys are not all written at
+/// the call.
 ///
-/// The key scan reads every `workdir` written anywhere in the input, so an
-/// options object built in the same script is seen whether it is spread into
-/// the call or passed by name. One built at runtime is not:
+/// An options object built in the same script, then spread into the call or
+/// passed by name, is no property of the call's own argument, so its `workdir`
+/// is opaque (see [`Site`]). One built at runtime is not seen at all:
 /// `tools.exec_command({cmd, ...opts})` or `tools.exec_command(args)`, with
 /// `opts` or `args` parsed from a tool's output or kept from an earlier call,
 /// runs in a directory only the runtime knew. Such a call is opaque, never "no
@@ -468,8 +580,15 @@ fn escaped_name(written: &str, quote: Option<char>) -> Option<String> {
 /// `exec_command` is the one tool that takes a `workdir`. Other tools take
 /// variables as a matter of course (`tools.apply_patch(patch)`), and reading
 /// those as unseen directories would unplace ordinary windows.
-fn exec_arguments_unseen(input: &str, inert: &[std::ops::Range<usize>]) -> bool {
+fn exec_arguments(input: &str, inert: &[std::ops::Range<usize>]) -> ExecArguments {
     static EXEC_CALL_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let mut calls = ExecArguments {
+        objects: Vec::new(),
+        unseen: false,
+    };
+    if !input.contains("exec_command") {
+        return calls;
+    }
     let re = EXEC_CALL_RE.get_or_init(|| {
         regex::Regex::new(r"(?:^|[^A-Za-z0-9_$])(?P<name>exec_command)\s*\(").expect("valid regex")
     });
@@ -481,18 +600,25 @@ fn exec_arguments_unseen(input: &str, inert: &[std::ops::Range<usize>]) -> bool 
             continue;
         }
         let Some(argument) = skip_comments(&input[call.end()..]) else {
-            return true;
+            // A block comment that never closes hid the argument, and every
+            // call after it.
+            calls.unseen = true;
+            break;
         };
         if argument.starts_with([')', '"', '\'', '`']) {
             continue;
         }
-        if !argument.starts_with('{')
-            || !object_is_whole(input, input.len() - argument.len(), inert)
-        {
-            return true;
+        let open = input.len() - argument.len();
+        if !argument.starts_with('{') {
+            calls.unseen = true;
+            continue;
+        }
+        calls.objects.push(open);
+        if !object_is_whole(input, open, inert) {
+            calls.unseen = true;
         }
     }
-    false
+    calls
 }
 
 /// Does the object literal opening at `open` close, with every property of
@@ -3124,16 +3250,94 @@ mod tests {
         ] {
             assert!(tool_call_workdirs(&js_input(input)).is_empty(), "{input}");
         }
-        for input in [
+        for raw in [
             r#"{workdir: "/repo/a"}"#,
             r#"{"workdir": "/repo/a"}"#,
             r#"{cmd: "ls",workdir:'/repo/a'}"#,
             r#"workdir: "/repo/a""#,
         ] {
             assert_eq!(
-                first_workdir(&js_input(input)).as_deref(),
+                first_workdir(&raw_arguments(raw)).as_deref(),
                 Some("/repo/a"),
+                "{raw}"
+            );
+        }
+    }
+
+    /// Raw `arguments` text that is the call's argument object, as a
+    /// `function_call` carries it.
+    fn raw_arguments(raw: &str) -> Value {
+        serde_json::json!({"type": "function_call", "name": "exec_command", "arguments": raw})
+    }
+
+    /// Finding: the key scan read a readable `workdir` wherever the script
+    /// wrote one, so `const metadata = {workdir: "/foreign"}` beside a call
+    /// that named no directory re-scoped that call's whole window to
+    /// `/foreign` and filed its messages under the wrong project. Only the
+    /// call's own argument names its directory. A `workdir` the scan cannot
+    /// tie to a call is opaque: the window is not placed there, and it is not
+    /// treated as naming no directory either.
+    #[test]
+    fn a_workdir_is_read_only_from_the_call_argument_itself() {
+        for input in [
+            r#"const metadata = {workdir: "/repo/foreign"}; await tools.exec_command({cmd: "pwd"})"#,
+            r#"tools.exec_command({cmd: "ls", options: {workdir: "/repo/foreign"}})"#,
+            r#"tools.exec_command({cmd: "ls", env: [{"workdir": "/repo/foreign"}]})"#,
+            r#"const opts = {workdir: "/repo/foreign"}; tools.exec_command({cmd: "ls", ...opts})"#,
+            // A call the scan does not recognise as `exec_command(`.
+            r#"const run = tools.exec_command; run({cmd: "ls", workdir: "/repo/foreign"})"#,
+            r#"tools.write_stdin({session_id: 1, workdir: "/repo/foreign"})"#,
+            r#"[{workdir: "/repo/foreign"}]"#,
+            r#"{workdir: "/repo/foreign"}"#,
+        ] {
+            assert_eq!(
+                tool_call_workdirs(&js_input(input)),
+                vec![WorkdirEvidence::Opaque],
                 "{input}"
+            );
+        }
+        let (scope, _) = effective_window_scope(
+            &tool_call_workdirs(&js_input(
+                r#"const metadata = {workdir: "/repo/foreign"}; await tools.exec_command({cmd: "pwd"})"#,
+            )),
+            Some("/present/vista"),
+        );
+        assert_eq!(scope, WindowScope::Unattributed);
+        // The call's own `workdir` is still read beside one it cannot claim,
+        // and in every call a script makes.
+        assert_eq!(
+            tool_call_workdirs(&js_input(
+                r#"const metadata = {workdir: "/repo/foreign"}; tools.exec_command({cmd: "ls", workdir: "/repo/a"})"#
+            )),
+            [vec![WorkdirEvidence::Opaque], explicit(&["/repo/a"])].concat()
+        );
+        assert_eq!(
+            tool_call_workdirs(&js_input(
+                r#"await Promise.all([tools.exec_command({cmd: "a", workdir: "/repo/a"}), tools.exec_command({cmd: "b", env: {X: "}"}, workdir: "/repo/b"})])"#
+            )),
+            explicit(&["/repo/a", "/repo/b"])
+        );
+        // Raw `arguments` are the argument object: its own `workdir` is read,
+        // a nested one is not the call's.
+        for raw in [
+            r#"{cmd: "ls", workdir: '/repo/a'}"#,
+            r#"/* call */ {cmd: "ls", workdir: '/repo/a'}"#,
+            r#"cmd: "ls", workdir: '/repo/a'"#,
+        ] {
+            assert_eq!(
+                tool_call_workdirs(&raw_arguments(raw)),
+                explicit(&["/repo/a"]),
+                "{raw}"
+            );
+        }
+        for raw in [
+            r#"{cmd: "ls", options: {workdir: '/repo/foreign'}}"#,
+            r#"[{workdir: '/repo/foreign'}]"#,
+        ] {
+            assert_eq!(
+                tool_call_workdirs(&raw_arguments(raw)),
+                vec![WorkdirEvidence::Opaque],
+                "{raw}"
             );
         }
     }
@@ -3366,17 +3570,24 @@ mod tests {
             "tools.exec_command({\n  workdir: '/repos/vista'  // the checkout\n})",
             "tools.exec_command({workdir: \"/repos/vista\" /* pinned */})",
             "tools.exec_command({workdir: \"/repos/vista\" /* a */ // b\n, cmd: \"ls\"})",
-            // A line comment may run to the end of the input. An `exec_command`
-            // argument cut off there is also opaque, see
-            // `an_exec_argument_not_written_at_the_call_is_opaque`.
-            "{workdir: \"/repos/vista\" // last line",
-            r#"[{workdir: "/repos/vista"}]"#,
-            r#"{"workdir": "/repos/vista"}"#,
         ] {
             assert_eq!(
                 tool_call_workdirs(&js_input(input)),
                 vec![WorkdirEvidence::Explicit("/repos/vista".to_string())],
                 "{input}"
+            );
+        }
+        // A line comment may run to the end of the input. An `exec_command`
+        // argument cut off there is also opaque, see
+        // `an_exec_argument_not_written_at_the_call_is_opaque`.
+        for raw in [
+            "{workdir: \"/repos/vista\" // last line",
+            r#"{"workdir": "/repos/vista"}"#,
+        ] {
+            assert_eq!(
+                tool_call_workdirs(&raw_arguments(raw)),
+                vec![WorkdirEvidence::Explicit("/repos/vista".to_string())],
+                "{raw}"
             );
         }
     }
