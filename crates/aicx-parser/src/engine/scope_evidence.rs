@@ -1271,15 +1271,50 @@ fn declared_submodule(scope_root: &str, path: &str) -> bool {
     let Ok(raw) = std::fs::read_to_string(root.join(".gitmodules")) else {
         return false;
     };
-    let root = root.as_path();
-    let relative = match Path::new(trim_path(path)).strip_prefix(root) {
-        Ok(relative) => relative.to_string_lossy().replace('\\', "/"),
-        Err(_) => return false,
+    declares_submodule(&raw, &root.to_string_lossy(), path)
+}
+
+/// Does the `.gitmodules` body `raw`, found at the checkout `root`, declare
+/// `path` or a directory that contains it?
+///
+/// The paths are compared in the spelling [`lexically_within`] compares them
+/// in ([`comparable_spelling`]), and a declaration under a Windows root is
+/// folded the same way. `C:\Repo\vendor\fleet` and `path = Vendor/Fleet` in
+/// `C:\repo` are one directory to Windows, and containment had already placed
+/// the path inside the checkout on that reading; matching the declaration
+/// byte for byte then missed it, and the parent absorbed a submodule it
+/// declares.
+fn declares_submodule(raw: &str, root: &str, path: &str) -> bool {
+    let root = comparable_spelling(&lexically_normalized(root));
+    let path = comparable_spelling(&lexically_normalized(path));
+    let windows = windows_shaped(&root);
+    let is_separator = |c: char| c == '/' || (windows && c == '\\');
+    let root = trim_path(&root);
+    let Some(rest) = trim_path(&path).strip_prefix(root) else {
+        return false;
     };
+    // The boundary is a path component: `/repo-old` is not inside `/repo`. A
+    // bare root (`/`) already ends in its separator.
+    let relative = if root.ends_with(is_separator) {
+        Some(rest)
+    } else {
+        rest.strip_prefix(is_separator)
+    };
+    let Some(relative) = relative else {
+        return false;
+    };
+    let fold = |spelling: &str| {
+        if windows {
+            spelling.replace('\\', "/").to_ascii_lowercase()
+        } else {
+            spelling.to_owned()
+        }
+    };
+    let relative = fold(relative);
     let relative = trim_path(&relative);
-    gitmodules_paths(&raw)
+    gitmodules_paths(raw)
         .iter()
-        .map(|declared| trim_path(declared))
+        .map(|declared| fold(trim_path(declared)))
         .filter(|declared| !declared.is_empty())
         // A submodule's DESCENDANTS are the submodule's repository too. A
         // vanished `vendor/fleet-bus/src` is still inside the declared
@@ -1289,7 +1324,7 @@ fn declared_submodule(scope_root: &str, path: &str) -> bool {
         .any(|declared| {
             relative == declared
                 || relative
-                    .strip_prefix(declared)
+                    .strip_prefix(declared.as_str())
                     .is_some_and(|rest| rest.starts_with('/'))
         })
 }
@@ -2195,6 +2230,39 @@ mod tests {
         assert_eq!(verdict(&vanished), WindowScope::Unattributed);
         assert_ne!(scope_layout_evidence(&base), before.0);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Finding: the declaration was matched byte for byte while containment
+    /// folds a Windows spelling. `C:\Repo\vendor\fleet` against
+    /// `path = Vendor/Fleet` in `C:\repo` is one directory to Windows and was
+    /// already inside the checkout, so the missed declaration let the parent
+    /// absorb its vanished submodule. The match is pure string work and is
+    /// checked here on every host.
+    #[test]
+    fn a_windows_submodule_declaration_matches_in_any_case() {
+        let raw = "[submodule \"fleet\"]\n\tpath = Vendor/Fleet\n";
+        for path in [
+            r"C:\Repo\vendor\fleet",
+            r"c:\REPO\VENDOR\FLEET\src",
+            r"C:\repo\Vendor\Fleet\",
+            "C:/repo/vendor/fleet",
+        ] {
+            assert!(declares_submodule(raw, r"C:\repo", path), "{path}");
+            assert!(declares_submodule(raw, "C:/Repo", path), "{path}");
+        }
+        for path in [
+            r"C:\repo\vendor\fleet-old",
+            r"C:\repository\vendor\fleet",
+            r"C:\repo",
+            r"D:\repo\vendor\fleet",
+        ] {
+            assert!(!declares_submodule(raw, r"C:\repo", path), "{path}");
+        }
+        // A Unix spelling keeps its case: there `Vendor/Fleet` and
+        // `vendor/fleet` are two directories.
+        assert!(declares_submodule(raw, "/repo", "/repo/Vendor/Fleet/src"));
+        assert!(!declares_submodule(raw, "/repo", "/repo/vendor/fleet"));
+        assert!(!declares_submodule(raw, "/repo", "/repo-old/Vendor/Fleet"));
     }
 
     /// Finding (P2-01): absoluteness was the HOST's question. A Windows
