@@ -67,6 +67,7 @@ pub struct InstallOptions {
     pub platform_is_macos: bool,
     pub script: Option<PathBuf>,
     pub bin: Option<PathBuf>,
+    pub port: u16,
 }
 
 impl InstallOptions {
@@ -76,6 +77,10 @@ impl InstallOptions {
             platform_is_macos: cfg!(target_os = "macos"),
             script: locate_service_installer(),
             bin: std::env::current_exe().ok(),
+            port: std::env::var("AICX_MCP_PORT")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(8044),
         }
     }
 }
@@ -158,7 +163,6 @@ pub fn service_definition_meets_contract(text: &str) -> bool {
         && has("--host")
         && has("127.0.0.1")
         && has("--port")
-        && has("8044")
         && has("--no-require-auth")
         && has("--experimental-auto-refresh")
         && !text.contains("--transport\n    <string>stdio")
@@ -312,6 +316,192 @@ fn write_state_line(home: &Path, rel: &str, line: &str) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortListener {
+    pub pid: u32,
+    pub command: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForeignListener {
+    pub pid: u32,
+    pub command: String,
+    pub occupied_port: u16,
+    pub alternate_port: u16,
+}
+
+impl ForeignListener {
+    pub fn instructions(&self) -> String {
+        format!(
+            "port {occupied} is used by {command} (pid {pid}). AICX left that process running.\n\nFree {occupied} yourself:\n  kill {pid}\n\nInstall the AICX service on {alt} instead. The dashboard and MCP share that port:\n  AICX_MCP_PORT={alt} aicx\n",
+            occupied = self.occupied_port,
+            command = self.command,
+            pid = self.pid,
+            alt = self.alternate_port,
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortPlan {
+    pub port: u16,
+    pub replaced_own_service: bool,
+    pub foreign: Option<ForeignListener>,
+}
+
+impl PortPlan {
+    fn keep(port: u16) -> Self {
+        Self {
+            port,
+            replaced_own_service: false,
+            foreign: None,
+        }
+    }
+}
+
+pub fn is_our_aicx_process(command: &str) -> bool {
+    let lower = command.to_ascii_lowercase();
+    if lower.contains("aicx-mcp") || lower.contains("com.loctree.aicx.mcp") {
+        return true;
+    }
+    command.split_whitespace().any(|word| {
+        let word = word.trim_matches(|ch: char| matches!(ch, '"' | '\'' | ','));
+        word == "aicx"
+            || word.ends_with("/aicx")
+            || word.ends_with("\\aicx")
+            || word.ends_with("/aicx-mcp")
+            || word.ends_with("\\aicx-mcp")
+    })
+}
+
+pub fn choose_service_port(listeners: &[PortListener], preferred: u16, busy: &[u16]) -> PortPlan {
+    if listeners.is_empty()
+        || listeners
+            .iter()
+            .all(|listener| is_our_aicx_process(&listener.command))
+    {
+        return PortPlan {
+            port: preferred,
+            replaced_own_service: !listeners.is_empty(),
+            foreign: None,
+        };
+    }
+    let foreign = listeners
+        .iter()
+        .find(|listener| !is_our_aicx_process(&listener.command))
+        .expect("foreign listener");
+    let alternate = (preferred.saturating_add(1)..)
+        .take(64)
+        .find(|port| *port != preferred && !busy.contains(port))
+        .unwrap_or(preferred.saturating_add(1));
+    PortPlan {
+        port: alternate,
+        replaced_own_service: false,
+        foreign: Some(ForeignListener {
+            pid: foreign.pid,
+            command: foreign.command.clone(),
+            occupied_port: preferred,
+            alternate_port: alternate,
+        }),
+    }
+}
+
+fn resolve_service_port(preferred: u16) -> PortPlan {
+    let listeners = listeners_on_port(preferred);
+    let mut busy = Vec::new();
+    if listeners
+        .iter()
+        .any(|listener| !is_our_aicx_process(&listener.command))
+    {
+        let mut candidate = preferred.saturating_add(1);
+        for _ in 0..64 {
+            if listeners_on_port(candidate).is_empty() {
+                break;
+            }
+            busy.push(candidate);
+            candidate = candidate.saturating_add(1);
+        }
+    }
+    choose_service_port(&listeners, preferred, &busy)
+}
+
+fn listens_on_port(name: &str, port: u16) -> bool {
+    let local = name.split("->").next().unwrap_or(name);
+    local.ends_with(&format!(":{port}"))
+}
+
+fn listeners_on_port(port: u16) -> Vec<PortListener> {
+    let output = Command::new("lsof")
+        .args(["-nP", "-iTCP", "-sTCP:LISTEN", "-Fpcn"])
+        .output();
+    let Ok(output) = output else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut listeners = Vec::new();
+    let mut pid = 0u32;
+    let mut command = String::new();
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix('p') {
+            pid = rest.parse().unwrap_or(0);
+            command.clear();
+        } else if let Some(rest) = line.strip_prefix('c') {
+            command = rest.to_string();
+        } else if let Some(rest) = line.strip_prefix('n')
+            && listens_on_port(rest, port)
+            && pid != 0
+        {
+            let full = process_command(pid).unwrap_or_else(|| command.clone());
+            listeners.push(PortListener { pid, command: full });
+        }
+    }
+    listeners
+}
+
+fn process_command(pid: u32) -> Option<String> {
+    let output = Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "command="])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if text.is_empty() { None } else { Some(text) }
+}
+
+enum PortOccupancy {
+    Free,
+    Ours,
+    Foreign(PortListener),
+}
+
+fn classify_port(port: u16) -> PortOccupancy {
+    let listeners = listeners_on_port(port);
+    if listeners.is_empty() {
+        PortOccupancy::Free
+    } else if listeners
+        .iter()
+        .all(|listener| is_our_aicx_process(&listener.command))
+    {
+        PortOccupancy::Ours
+    } else {
+        PortOccupancy::Foreign(
+            listeners
+                .into_iter()
+                .find(|listener| !is_our_aicx_process(&listener.command))
+                .expect("foreign listener"),
+        )
+    }
+}
+
+pub fn dashboard_url_for(port: u16) -> String {
+    format!("http://127.0.0.1:{port}/")
+}
+
 pub fn maybe_first_start() -> Result<FirstStart> {
     let home = crate::aicx_home::resolve()?;
     if !bare_start_opens_dashboard(&home) {
@@ -319,7 +509,16 @@ pub fn maybe_first_start() -> Result<FirstStart> {
     }
     let survey = needs_full_survey(&home);
     let home = crate::aicx_home::ensure()?;
-    let options = InstallOptions::from_env();
+    let mut options = InstallOptions::from_env();
+    let plan = if options.dry_run {
+        PortPlan::keep(options.port)
+    } else {
+        resolve_service_port(options.port)
+    };
+    options.port = plan.port;
+    if let Some(foreign) = &plan.foreign {
+        println!("{}", foreign.instructions());
+    }
     let service = if survey {
         let outcome = install_launch_agent(&options);
         match &outcome {
@@ -333,31 +532,33 @@ pub fn maybe_first_start() -> Result<FirstStart> {
             reason: "service already matches the loopback contract".to_string(),
         }
     };
+    let url = dashboard_url_for(plan.port);
     let gui = gui_available();
     if !options.dry_run
-        && let Err(err) = ensure_loopback_server()
+        && let Err(err) = ensure_loopback_server(plan.port)
     {
         write_service_error(&home, Some(&err.to_string()));
+        println!("{err}");
     }
-    println!("{DASHBOARD_URL}");
+    println!("{url}");
     if gui && !options.dry_run {
         // A missing browser is not a failure. The URL is already printed.
-        let _ = open_dashboard(DASHBOARD_URL);
+        let _ = open_dashboard(&url);
     }
     if !survey {
         offer_whats_new(&home)?;
     }
     mark_complete(&home)?;
     Ok(FirstStart::Opened(FirstStartReport {
-        dashboard_url: DASHBOARD_URL.to_string(),
+        dashboard_url: url,
         service: service.summary(),
     }))
 }
 
-/// Steady-state no-args behavior is not settled.
+/// After this version is configured, bare `aicx` is the short CLI help.
 ///
-/// First-run and a new version open the dashboard. Later bare `aicx` calls
-/// stay on the short front door until a founder note flips this to `true`.
+/// It does not open a browser and it does not launch `aicx wizard`.
+/// The browser opens only for first configuration and for What's new.
 pub fn steady_state_opens_browser() -> bool {
     false
 }
@@ -443,6 +644,7 @@ fn spawn_installer(
     command
         .args(args)
         .env("AICX_SKIP_MCP_CLIENTS", "1")
+        .env("AICX_MCP_PORT", options.port.to_string())
         .env_remove("AICX_MCP_HOST")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -505,11 +707,20 @@ fn gui_available() -> bool {
     }
 }
 
-fn ensure_loopback_server() -> Result<()> {
-    if loopback_dashboard_open() {
-        return Ok(());
+fn ensure_loopback_server(port: u16) -> Result<()> {
+    match classify_port(port) {
+        PortOccupancy::Free => {}
+        PortOccupancy::Ours => return Ok(()),
+        PortOccupancy::Foreign(listener) => {
+            let plan = choose_service_port(std::slice::from_ref(&listener), port, &[]);
+            let Some(foreign) = plan.foreign else {
+                anyhow::bail!("port {port} is already taken");
+            };
+            anyhow::bail!("{}", foreign.instructions());
+        }
     }
     let bin = std::env::current_exe().context("cannot resolve aicx binary")?;
+    let port_arg = port.to_string();
     let log_dir = crate::aicx_home::resolve()
         .unwrap_or_else(|_| PathBuf::from("."))
         .join("logs");
@@ -528,7 +739,7 @@ fn ensure_loopback_server() -> Result<()> {
             "--host",
             "127.0.0.1",
             "--port",
-            "8044",
+            port_arg.as_str(),
             "--no-require-auth",
             "--experimental-auto-refresh",
         ])
@@ -543,16 +754,6 @@ fn ensure_loopback_server() -> Result<()> {
         .spawn()
         .context("could not start the loopback dashboard on 127.0.0.1:8044")?;
     Ok(())
-}
-
-fn loopback_dashboard_open() -> bool {
-    std::net::TcpStream::connect_timeout(
-        &"127.0.0.1:8044"
-            .parse()
-            .expect("loopback dashboard address"),
-        std::time::Duration::from_millis(200),
-    )
-    .is_ok()
 }
 
 /// Append operator phrases to `[intent].keywords` in the existing phrase file.
@@ -676,6 +877,7 @@ mod tests {
             platform_is_macos: false,
             script: None,
             bin: None,
+            port: 8044,
         });
         assert_ne!(
             skipped,
@@ -688,6 +890,7 @@ mod tests {
             platform_is_macos: true,
             script: Some(PathBuf::from("/nope/install-mcp-service.sh")),
             bin: None,
+            port: 8044,
         });
         assert!(
             dry.summary().contains("dry-run"),
@@ -715,6 +918,7 @@ mod tests {
             platform_is_macos: true,
             script: Some(script),
             bin: Some(PathBuf::from("/tmp/aicx-under-test")),
+            port: 8044,
         });
         assert_eq!(outcome, ServiceInstall::Installed);
         let recorded = std::fs::read_to_string(&log).unwrap();
@@ -733,5 +937,54 @@ mod tests {
         assert!(rendered.contains("http://127.0.0.1:8044/"));
         assert!(rendered.contains("intent_phrases.toml"));
         assert!(!rendered.contains("Usage: aicx"));
+    }
+
+    #[test]
+    fn our_old_service_is_replaced_on_8044() {
+        let listeners = [PortListener {
+            pid: 9,
+            command: "/opt/homebrew/bin/aicx-mcp --host 100.82.232.70 --port 8044".into(),
+        }];
+        let plan = choose_service_port(&listeners, 8044, &[]);
+        assert!(plan.replaced_own_service);
+        assert_eq!(plan.port, 8044);
+        assert!(plan.foreign.is_none());
+    }
+
+    #[test]
+    fn foreign_listener_keeps_the_process_and_names_another_port() {
+        let listeners = [PortListener {
+            pid: 4242,
+            command: "nginx: master process".into(),
+        }];
+        let plan = choose_service_port(&listeners, 8044, &[8045]);
+        let foreign = plan.foreign.expect("foreign");
+        assert_eq!(plan.port, 8046);
+        assert!(!is_our_aicx_process(&foreign.command));
+        let text = foreign.instructions();
+        assert!(text.contains("nginx: master process"));
+        assert!(text.contains("pid 4242"));
+        assert!(text.contains("kill 4242"));
+        assert!(text.contains("AICX_MCP_PORT=8046 aicx"));
+        assert!(text.contains("left that process running"));
+    }
+
+    #[test]
+    fn configured_version_does_not_open_the_browser() {
+        assert!(!steady_state_opens_browser());
+        assert!(!survey_required(false, Some("gguf"), true));
+    }
+
+    #[test]
+    fn local_embedder_choice_does_not_require_an_api_key() {
+        let root = std::env::temp_dir().join(format!("aicx-embed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        write_embedder_choice(&root, "gguf", None).unwrap();
+        let text = std::fs::read_to_string(root.join("config.toml")).unwrap();
+        assert!(text.contains("backend = \"gguf\"") || text.contains("backend = 'gguf'"));
+        assert!(!text.contains("OPENAI_API_KEY"));
+        assert_eq!(embedder_backend(&root).as_deref(), Some("gguf"));
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
