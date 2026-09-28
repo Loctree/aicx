@@ -103,7 +103,8 @@ pub enum WindowScope {
 /// A `workdir` whose value is written but cannot be read as one path — a
 /// variable or an expression, a template literal that interpolates, a literal
 /// that never closes — is [`WorkdirEvidence::Opaque`]: the call names a
-/// directory we cannot see.
+/// directory we cannot see. So is an `exec_command` whose argument is not all
+/// written at the call ([`exec_arguments_unseen`]).
 ///
 /// Arguments that parse as a JSON object are read structurally: only their
 /// top-level `workdir` is the call's directory. The JavaScript scan is for
@@ -303,7 +304,87 @@ fn workdirs_in_literal(input: &str) -> Vec<WorkdirEvidence> {
             None => found.push(WorkdirEvidence::Opaque),
         }
     }
+    if input.contains("exec_command") {
+        let inert = inert.get_or_insert_with(|| inert_spans(input));
+        if exec_arguments_unseen(input, inert) {
+            found.push(WorkdirEvidence::Opaque);
+        }
+    }
     found
+}
+
+/// Does an `exec_command` call in `input` take an argument whose keys are not
+/// all written at the call?
+///
+/// The key scan reads every `workdir` written anywhere in the input, so an
+/// options object built in the same script is seen whether it is spread into
+/// the call or passed by name. One built at runtime is not:
+/// `tools.exec_command({cmd, ...opts})` or `tools.exec_command(args)`, with
+/// `opts` or `args` parsed from a tool's output or kept from an earlier call,
+/// runs in a directory only the runtime knew. Such a call is opaque, never "no
+/// evidence", because treating it as no evidence left the window on its
+/// baseline while the call worked in another checkout. A spread nested deeper,
+/// such as `{env: {...process.env}}`, feeds another property. A string argument
+/// or no argument names no directory. An argument object that never closes
+/// was cut off and is opaque.
+///
+/// `exec_command` is the one tool that takes a `workdir`. Other tools take
+/// variables as a matter of course (`tools.apply_patch(patch)`), and reading
+/// those as unseen directories would unplace ordinary windows.
+fn exec_arguments_unseen(input: &str, inert: &[std::ops::Range<usize>]) -> bool {
+    static EXEC_CALL_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = EXEC_CALL_RE.get_or_init(|| {
+        regex::Regex::new(r"(?:^|[^A-Za-z0-9_$])(?P<name>exec_command)\s*\(").expect("valid regex")
+    });
+    for caps in re.captures_iter(input) {
+        let (Some(name), Some(call)) = (caps.name("name"), caps.get(0)) else {
+            continue;
+        };
+        if within(inert, name.start()) {
+            continue;
+        }
+        let Some(argument) = skip_comments(&input[call.end()..]) else {
+            return true;
+        };
+        if argument.starts_with([')', '"', '\'', '`']) {
+            continue;
+        }
+        if !argument.starts_with('{')
+            || !object_is_whole(input.as_bytes(), input.len() - argument.len(), inert)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Does the object literal opening at `open` close, with no spread of its
+/// own? Text and comments ([`inert_spans`]) are skipped, so a `...` or a brace
+/// inside a string is neither a spread nor the object's end.
+fn object_is_whole(bytes: &[u8], open: usize, inert: &[std::ops::Range<usize>]) -> bool {
+    let mut next = inert.partition_point(|span| span.start < open);
+    let mut depth = 0usize;
+    let mut at = open;
+    while at < bytes.len() {
+        if let Some(span) = inert.get(next).filter(|span| span.start == at) {
+            at = span.end;
+            next += 1;
+            continue;
+        }
+        match bytes[at] {
+            b'{' | b'[' | b'(' => depth += 1,
+            b'}' | b']' | b')' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return true;
+                }
+            }
+            b'.' if depth == 1 && bytes[at..].starts_with(b"...") => return false,
+            _ => {}
+        }
+        at += 1;
+    }
+    false
 }
 
 /// Byte ranges of `input` that JavaScript reads as text rather than code:
@@ -1746,6 +1827,51 @@ mod tests {
             tool_call_workdirs(&payload),
             explicit(&["/repo/vista", "/repo/fleet-bus"]),
             "a later hop must not hide behind the first call"
+        );
+    }
+
+    /// Finding: `tools.exec_command({cmd, ...opts})` gave no evidence, so a
+    /// call whose runtime-built options carried another checkout's `workdir`
+    /// left the window on its baseline. An argument not all written at the
+    /// call names a directory only the runtime knew.
+    #[test]
+    fn an_exec_argument_not_written_at_the_call_is_opaque() {
+        for input in [
+            r#"await tools.exec_command({cmd: "make", ...opts})"#,
+            r#"tools.exec_command({...opts, cmd: "make"})"#,
+            "tools.exec_command(args)",
+            "for (const a of plan) await tools.exec_command(a);",
+            "tools.exec_command(...calls)",
+            r#"tools.exec_command(Object.assign({cmd: "make"}, opts))"#,
+            // The argument object was cut off.
+            r#"tools.exec_command({cmd: "make""#,
+        ] {
+            assert_eq!(
+                tool_call_workdirs(&js_input(input)),
+                vec![WorkdirEvidence::Opaque],
+                "{input}"
+            );
+        }
+        // Everything the call takes is written at it.
+        for input in [
+            r#"tools.exec_command({cmd: "ls", env: {...process.env, CI: "1"}})"#,
+            r#"tools.exec_command({cmd: "ls", args: [...files]})"#,
+            r#"tools.exec_command({cmd: "echo ...done", note: "}"})"#,
+            r#"tools.exec_command("ls")"#,
+            "tools.exec_command()",
+            // Other tools take variables as a matter of course.
+            "tools.apply_patch(patch); tools.write_stdin(input)",
+            r#"console.log("tools.exec_command(args)")"#,
+            "// tools.exec_command(args)\ntools.exec_command({cmd: \"ls\"})",
+        ] {
+            assert!(tool_call_workdirs(&js_input(input)).is_empty(), "{input}");
+        }
+        // A spread after a written `workdir` may override it.
+        assert_eq!(
+            tool_call_workdirs(&js_input(
+                r#"tools.exec_command({cmd: "ls", workdir: "/repo/a", ...opts})"#
+            )),
+            [explicit(&["/repo/a"]), vec![WorkdirEvidence::Opaque]].concat()
         );
     }
 
