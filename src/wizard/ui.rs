@@ -445,22 +445,14 @@ pub(crate) fn truncate_at_boundary(value: &str, max: usize) -> String {
         return "…".to_string();
     }
     let budget = max - 1;
-    let mut last_boundary = None::<usize>;
-    let mut taken = 0usize;
-    for (index, ch) in value.chars().enumerate() {
-        if taken >= budget {
-            break;
-        }
-        if (ch == ' ' || ch == '/' || ch == '|') && taken > 0 {
-            last_boundary = Some(index);
-        }
-        taken += 1;
-    }
-    let cut = last_boundary
-        .filter(|boundary| *boundary >= budget / 2)
-        .unwrap_or(budget);
-    let mut out: String = value.chars().take(cut).collect();
-    out = out.trim_end().to_string();
+    let prefix: String = value.chars().take(budget).collect();
+    let boundary = prefix.rfind([' ', '/', '|']).filter(|at| {
+        !prefix[..*at].trim().is_empty() && prefix[..*at].chars().count() >= budget / 2
+    });
+    let mut out = match boundary {
+        Some(at) => prefix[..at].trim_end().to_string(),
+        None => prefix,
+    };
     out.push('…');
     out
 }

@@ -495,17 +495,12 @@ fn truncate_words(value: &str, max: usize) -> String {
         return value.to_string();
     }
     let budget = max.saturating_sub(1);
-    let mut taken = 0usize;
     let mut end_byte = 0usize;
     let mut last_space = None::<usize>;
-    for (index, ch) in value.char_indices() {
-        if taken >= budget {
-            break;
-        }
-        if ch == ' ' && taken > 0 {
+    for (index, ch) in value.char_indices().take(budget) {
+        if ch == ' ' && end_byte > 0 {
             last_space = Some(index);
         }
-        taken += 1;
         end_byte = index + ch.len_utf8();
     }
     let end = last_space
