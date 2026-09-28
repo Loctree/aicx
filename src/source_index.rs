@@ -1963,6 +1963,16 @@ fn try_reuse_cached_extract(
     if record.cwd != entry.cwd {
         return None;
     }
+    // Provenance is resolved at parse with the catalog column first
+    // (`resolve_session_kind`), so the record holds what the column said then.
+    // A column that says otherwise now was refreshed since, over the same
+    // bytes: re-stamping the stored kind would serve a session the catalog now
+    // knows is a guardian as ordinary, and its wrapper prompts would reach
+    // intents. An empty column leaves the kind the source gave at parse, and
+    // unchanged bytes still give it.
+    if entry.session_kind.is_some() && entry.session_kind != record.session_kind {
+        return None;
+    }
     // The verdicts also depend on the repository layout on this host, which
     // can change without the source or the catalog row changing at all.
     if record.scope_environment != layout.fingerprint(entry.cwd.as_deref(), &record.scope_paths) {
@@ -3110,6 +3120,42 @@ mod tests {
             .is_none(),
             "a cached extract whose layout identity no longer matches must reparse"
         );
+
+        // A catalog rebuild that now names the session a guardian, over the
+        // same bytes, is newer than the kind the record stored at parse.
+        let guardian = crate::sessions::GUARDIAN_SESSION_KIND.to_string();
+        let mut ordinary_record = prior.clone();
+        ordinary_record.sessions.get_mut(&key).unwrap().session_kind =
+            Some("subagent:worker".to_string());
+        let mut guardian_row = entry.clone();
+        guardian_row.session_kind = Some(guardian.clone());
+        assert!(
+            try_reuse_cached_extract(
+                &root,
+                &guardian_row,
+                &ordinary_record,
+                &key,
+                &allow,
+                "ignore-fingerprint",
+                &mut ScopeLayoutProbe::default(),
+            )
+            .is_none(),
+            "a catalog kind that differs from the stored one must reparse, not re-stamp it"
+        );
+        // A row without the column keeps the kind the source gave at parse.
+        let mut guardian_record = prior.clone();
+        guardian_record.sessions.get_mut(&key).unwrap().session_kind = Some(guardian.clone());
+        let reused = try_reuse_cached_extract(
+            &root,
+            &entry,
+            &guardian_record,
+            &key,
+            &allow,
+            "ignore-fingerprint",
+            &mut ScopeLayoutProbe::default(),
+        )
+        .expect("an empty catalog column must not refuse the stored kind");
+        assert_eq!(reused.metadata["session_kind"], guardian.as_str());
 
         // Source path drift invalidates reuse.
         let mut drifted = entry.clone();
