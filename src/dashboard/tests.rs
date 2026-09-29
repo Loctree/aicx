@@ -660,12 +660,19 @@ fn unconfigured_home_shell_includes_survey_markup() {
     let _ = fs::remove_dir_all(&home);
     fs::create_dir_all(&home).unwrap();
     let unit = home.join("service-unit");
-    let script = home.join("install-mcp-service.sh");
-    fs::write(
-        &script,
-        "#!/bin/sh\nprintf '%s\\n' '--transport http --host 127.0.0.1 --port 8044 --no-require-auth --experimental-auto-refresh' > \"$AICX_SERVICE_UNIT\"\n",
-    )
-    .unwrap();
+    let script = if cfg!(windows) {
+        home.join("install-mcp-service.ps1")
+    } else {
+        home.join("install-mcp-service.sh")
+    };
+    let stub = if cfg!(windows) {
+        "$utf8 = New-Object System.Text.UTF8Encoding $false\n[System.IO.File]::WriteAllText($env:AICX_SERVICE_UNIT, \"--transport http --host 127.0.0.1 --port 8044 --no-require-auth --experimental-auto-refresh`n\", $utf8)\nexit 0\n"
+            .to_string()
+    } else {
+        "#!/bin/sh\nprintf '%s\\n' '--transport http --host 127.0.0.1 --port 8044 --no-require-auth --experimental-auto-refresh' > \"$AICX_SERVICE_UNIT\"\n"
+            .to_string()
+    };
+    fs::write(&script, stub).unwrap();
     let prev_unit = std::env::var_os("AICX_SERVICE_UNIT");
     unsafe {
         std::env::set_var("AICX_SERVICE_UNIT", &unit);
