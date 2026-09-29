@@ -163,6 +163,16 @@ pub(super) async fn post_onboarding(
             )
                 .into_response();
         }
+        Ok(Err(err)) if err.starts_with("install:") => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(JsonError {
+                    error: "install_failed",
+                    detail: err.trim_start_matches("install:").to_string(),
+                }),
+            )
+                .into_response();
+        }
         Ok(Err(err)) => {
             return (
                 StatusCode::BAD_REQUEST,

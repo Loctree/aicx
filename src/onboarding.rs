@@ -805,8 +805,9 @@ pub struct OnboardingApply {
     pub service: ServiceInstall,
 }
 
-/// Write survey phrases into the existing phrase file, then install the native
-/// service when the unit is missing or off-contract.
+/// Write survey phrases into the existing phrase file, set the local embedder
+/// when none is configured, then install the native service when the unit is
+/// missing or off-contract. A failed install leaves the survey required.
 pub fn apply_onboarding_survey(
     home: &Path,
     current: &str,
@@ -820,7 +821,13 @@ pub fn apply_onboarding_survey(
         std::fs::create_dir_all(parent).map_err(|err| format!("write:{err}"))?;
     }
     std::fs::write(&phrases_path, rendered).map_err(|err| format!("write:{err}"))?;
+    if embedder_backend(home).is_none() {
+        write_embedder_choice(home, "gguf", None).map_err(|err| format!("write:{err}"))?;
+    }
     let service = bring_service_onto_contract(home, options);
+    if let ServiceInstall::Failed { reason } = &service {
+        return Err(format!("install:{reason}"));
+    }
     Ok(OnboardingApply {
         phrases_path,
         service,
@@ -906,6 +913,10 @@ fn open_dashboard(url: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Serializes tests that mutate process-global `AICX_SERVICE_UNIT`.
+    static SERVICE_UNIT_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn bare_home_needs_onboarding_until_marker_or_config() {
@@ -943,6 +954,9 @@ mod tests {
 
     #[test]
     fn survey_writes_phrases_and_invokes_installer_when_service_is_missing() {
+        let _unit_guard = SERVICE_UNIT_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let dir = std::env::temp_dir().join(format!(
             "aicx-onboarding-apply-{}-{}",
             std::process::id(),
@@ -1006,6 +1020,163 @@ mod tests {
             Path::new(recorded.trim().trim_start_matches('\u{feff}')),
             bin.as_path()
         );
+        crate::parser::intent_phrases::reload_from_str(
+            crate::parser::intent_phrases::embedded_source(),
+        )
+        .expect("restore embedded phrases");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn one_save_finishes_survey_with_phrases_local_embedder_and_installer() {
+        let _unit_guard = SERVICE_UNIT_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "aicx-onboarding-finish-{}-{}",
+            std::process::id(),
+            "survey"
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("ran");
+        let bin = dir.join("aicx-under-test");
+        let unit = dir.join("service-unit");
+        let script = if cfg!(windows) {
+            dir.join("install-mcp-service.ps1")
+        } else {
+            dir.join("install-mcp-service.sh")
+        };
+        let body = if cfg!(windows) {
+            format!(
+                "$utf8 = New-Object System.Text.UTF8Encoding $false\n[System.IO.File]::WriteAllText('{}', $env:AICX_BIN, $utf8)\n[System.IO.File]::WriteAllText($env:AICX_SERVICE_UNIT, \"--transport http --host 127.0.0.1 --port 8044 --no-require-auth --experimental-auto-refresh`n\", $utf8)\nexit 0\n",
+                log.display().to_string().replace('\'', "''")
+            )
+        } else {
+            format!(
+                "#!/bin/sh\nprintf '%s' \"$AICX_BIN\" > '{}'\nprintf '%s\\n' '--transport http --host 127.0.0.1 --port 8044 --no-require-auth --experimental-auto-refresh' > \"$AICX_SERVICE_UNIT\"\n",
+                log.display().to_string().replace('\'', "'\\''")
+            )
+        };
+        std::fs::write(&script, body).unwrap();
+        assert!(
+            needs_full_survey(&dir),
+            "unconfigured home must still require the survey"
+        );
+        let prev_unit = std::env::var_os("AICX_SERVICE_UNIT");
+        unsafe {
+            std::env::set_var("AICX_SERVICE_UNIT", &unit);
+        }
+        let applied = apply_onboarding_survey(
+            &dir,
+            crate::parser::intent_phrases::embedded_source(),
+            &["finish the first-start survey".into()],
+            &InstallOptions {
+                dry_run: false,
+                platform_is_macos: cfg!(target_os = "macos"),
+                script: Some(script),
+                bin: Some(bin.clone()),
+                port: 8044,
+            },
+        )
+        .expect("one save must finish when the installer succeeds");
+        let survey_done = !needs_full_survey(&dir);
+        unsafe {
+            match prev_unit {
+                Some(value) => std::env::set_var("AICX_SERVICE_UNIT", value),
+                None => std::env::remove_var("AICX_SERVICE_UNIT"),
+            }
+        }
+        let written = std::fs::read_to_string(&applied.phrases_path).unwrap();
+        assert!(written.contains("finish the first-start survey"));
+        assert_eq!(embedder_backend(&dir).as_deref(), Some("gguf"));
+        let config = std::fs::read_to_string(dir.join("config.toml")).unwrap();
+        assert!(!config.contains("OPENAI_API_KEY"));
+        assert!(!config.contains("api_key"));
+        if cfg!(target_os = "macos") {
+            assert_eq!(applied.service, ServiceInstall::Installed);
+        } else {
+            assert_eq!(applied.service, ServiceInstall::NativeInstalled);
+        }
+        let recorded = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(
+            Path::new(recorded.trim().trim_start_matches('\u{feff}')),
+            bin.as_path()
+        );
+        assert!(
+            survey_done,
+            "after one successful save, needs_full_survey must be false"
+        );
+        crate::parser::intent_phrases::reload_from_str(
+            crate::parser::intent_phrases::embedded_source(),
+        )
+        .expect("restore embedded phrases");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn installer_failure_leaves_needs_full_survey_true() {
+        let _unit_guard = SERVICE_UNIT_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "aicx-onboarding-fail-{}-{}",
+            std::process::id(),
+            "survey"
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = if cfg!(windows) {
+            dir.join("install-mcp-service.ps1")
+        } else {
+            dir.join("install-mcp-service.sh")
+        };
+        let body = if cfg!(windows) {
+            "Write-Error 'installer boom'\nexit 1\n".to_string()
+        } else {
+            "#!/bin/sh\necho installer boom >&2\nexit 1\n".to_string()
+        };
+        std::fs::write(&script, body).unwrap();
+        let missing_unit = dir.join("missing-service-unit");
+        let prev_unit = std::env::var_os("AICX_SERVICE_UNIT");
+        unsafe {
+            std::env::set_var("AICX_SERVICE_UNIT", &missing_unit);
+        }
+        let err = apply_onboarding_survey(
+            &dir,
+            crate::parser::intent_phrases::embedded_source(),
+            &["keep the survey open on install failure".into()],
+            &InstallOptions {
+                dry_run: false,
+                platform_is_macos: cfg!(target_os = "macos"),
+                script: Some(script),
+                bin: Some(dir.join("aicx-under-test")),
+                port: 8044,
+            },
+        )
+        .expect_err("a failed installer must not finish onboarding");
+        let still_required = needs_full_survey(&dir);
+        let install_error = service_error(&dir);
+        unsafe {
+            match prev_unit {
+                Some(value) => std::env::set_var("AICX_SERVICE_UNIT", value),
+                None => std::env::remove_var("AICX_SERVICE_UNIT"),
+            }
+        }
+        assert!(
+            err.starts_with("install:"),
+            "failure must surface as install:…, got {err}"
+        );
+        assert!(
+            still_required,
+            "a failed install must leave needs_full_survey true"
+        );
+        assert!(
+            install_error.is_some(),
+            "failed install must leave the service error marker"
+        );
+        assert!(dir.join("intent_phrases.toml").is_file());
+        assert_eq!(embedder_backend(&dir).as_deref(), Some("gguf"));
         crate::parser::intent_phrases::reload_from_str(
             crate::parser::intent_phrases::embedded_source(),
         )
@@ -1147,6 +1318,9 @@ mod tests {
 
     #[test]
     fn marked_configured_home_stays_on_short_help() {
+        let _unit_guard = SERVICE_UNIT_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let root = std::env::temp_dir().join(format!("aicx-configured-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("state")).unwrap();
