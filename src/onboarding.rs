@@ -46,15 +46,25 @@ impl FirstStartReport {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServiceInstall {
+    /// macOS LaunchAgent. This variant is launchd, and only launchd.
     Installed,
-    Skipped { reason: String },
-    Failed { reason: String },
+    /// Linux systemd or Windows service. Not a LaunchAgent.
+    NativeInstalled,
+    Skipped {
+        reason: String,
+    },
+    Failed {
+        reason: String,
+    },
 }
 
 impl ServiceInstall {
     pub fn summary(&self) -> String {
         match self {
             Self::Installed => "launchd LaunchAgent installed (com.loctree.aicx.mcp)".to_string(),
+            Self::NativeInstalled => {
+                format!("native service installed on {}", std::env::consts::OS)
+            }
             Self::Skipped { reason } => format!("skipped: {reason}"),
             Self::Failed { reason } => format!("failed: {reason}"),
         }
@@ -530,7 +540,9 @@ pub fn maybe_first_start() -> Result<FirstStart> {
         let outcome = install_launch_agent(&options);
         match &outcome {
             ServiceInstall::Failed { reason } => write_service_error(&home, Some(reason)),
-            ServiceInstall::Installed => write_service_error(&home, None),
+            ServiceInstall::Installed | ServiceInstall::NativeInstalled => {
+                write_service_error(&home, None);
+            }
             ServiceInstall::Skipped { .. } => {}
         }
         outcome
@@ -630,12 +642,17 @@ fn run_embedded_installer(
     _use_script_path: bool,
 ) -> ServiceInstall {
     if let Some(script_path) = options.script.as_ref().filter(|path| path.is_file()) {
-        return spawn_installer(
-            program,
-            &[script_path.as_os_str().to_os_string()],
-            options,
-            None,
-        );
+        let script = script_path.as_os_str().to_os_string();
+        let args = if program == "powershell" {
+            vec![
+                std::ffi::OsString::from("-NoProfile"),
+                std::ffi::OsString::from("-File"),
+                script,
+            ]
+        } else {
+            vec![script]
+        };
+        return spawn_installer(program, &args, options, None);
     }
     let os_args: Vec<std::ffi::OsString> = args.iter().map(std::ffi::OsString::from).collect();
     spawn_installer(program, &os_args, options, Some(script))
@@ -684,7 +701,13 @@ fn spawn_installer(
         }
     };
     if output.status.success() {
-        return ServiceInstall::Installed;
+        // `Installed` is the LaunchAgent claim. A zero exit on Linux or
+        // Windows is the native service, not launchd.
+        return if std::env::consts::OS == "macos" {
+            ServiceInstall::Installed
+        } else {
+            ServiceInstall::NativeInstalled
+        };
     }
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -910,26 +933,47 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("aicx-install-stub-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let script = dir.join("install-mcp-service.sh");
         let log = dir.join("ran");
-        std::fs::write(
-            &script,
+        let bin = dir.join("aicx-under-test");
+        let script = if cfg!(windows) {
+            dir.join("install-mcp-service.ps1")
+        } else {
+            dir.join("install-mcp-service.sh")
+        };
+        let body = if cfg!(windows) {
+            format!(
+                "$utf8 = New-Object System.Text.UTF8Encoding $false\n[System.IO.File]::WriteAllText('{}', $env:AICX_BIN, $utf8)\nexit 0\n",
+                log.display().to_string().replace('\'', "''")
+            )
+        } else {
             format!(
                 "#!/bin/sh\nprintf '%s' \"$AICX_BIN\" > '{}'\n",
-                log.display()
-            ),
-        )
-        .unwrap();
+                log.display().to_string().replace('\'', "'\\''")
+            )
+        };
+        std::fs::write(&script, body).unwrap();
         let outcome = install_launch_agent(&InstallOptions {
             dry_run: false,
-            platform_is_macos: true,
+            platform_is_macos: cfg!(target_os = "macos"),
             script: Some(script),
-            bin: Some(PathBuf::from("/tmp/aicx-under-test")),
+            bin: Some(bin.clone()),
             port: 8044,
         });
-        assert_eq!(outcome, ServiceInstall::Installed);
+        if cfg!(target_os = "macos") {
+            assert_eq!(outcome, ServiceInstall::Installed);
+        } else {
+            assert_ne!(
+                outcome,
+                ServiceInstall::Installed,
+                "a non-macOS installer must not claim the LaunchAgent was installed"
+            );
+            assert_eq!(outcome, ServiceInstall::NativeInstalled);
+        }
         let recorded = std::fs::read_to_string(&log).unwrap();
-        assert_eq!(recorded, "/tmp/aicx-under-test");
+        assert_eq!(
+            Path::new(recorded.trim().trim_start_matches('\u{feff}')),
+            bin.as_path()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

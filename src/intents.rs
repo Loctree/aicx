@@ -1252,9 +1252,10 @@ fn collect_live_unadmitted_files(
 ///    strict anti-leak matcher for frames that left the session checkout.
 ///    Spelling of an unresolved path is honest only when the session
 ///    checkout is equally unresolved. A resolved checkout whose baseline is
-///    gone may still prove itself by its own repo-root name; an ancestor
-///    directory in that path is not the checkout. A frame with no session
-///    checkout at all is dropped.
+///    gone may stand in only when that checkout's own owner and repository
+///    are the requested project. A shared leaf name is a different
+///    repository, and an ancestor directory in the path is not the checkout.
+///    A frame with no session checkout at all is dropped.
 #[cfg(feature = "app")]
 fn retain_frames_for_project(
     frames: &mut Vec<TimelineEntry>,
@@ -1290,18 +1291,18 @@ fn retain_frames_for_project(
                 // it is only honest when there was no identity to be had.
                 match aicx_parser::engine::normalize_workdir(cwd, session_root) {
                     // Membership against a live session checkout already failed.
-                    // A vanished baseline cannot prove identity, but the frame's
-                    // own checkout can: admit it only when THAT repo root spells
-                    // the project. An ancestor directory in the path does not —
-                    // `…/vista/vendor/fleet-bus` still spells `vista` and is a
-                    // different repository.
+                    // A vanished baseline cannot prove identity. The frame's own
+                    // git root may stand in only when its owner and repository
+                    // are this project — not when another repo wears the same
+                    // leaf, and not when an ancestor directory spells the name.
+                    // `…/other/aicx` is not `Loctree/aicx`.
                     aicx_parser::engine::WorkdirIdentity::Resolved(root) => {
                         session_root.is_some_and(|baseline| {
                             matches!(
                                 aicx_parser::engine::normalize_workdir(baseline, None),
                                 aicx_parser::engine::WorkdirIdentity::Unresolved(_)
                             )
-                        }) && resolved_checkout_matches_project(&root, &filters)
+                        }) && resolved_owner_and_repo_are_the_project(&root, project)
                     }
                     // Spelling is evidence only where the session root is as
                     // unknowable as the frame. A root that resolves here has
@@ -1363,14 +1364,17 @@ fn missing_directory_inside_resolved_checkout(cwd: &str, session_root: Option<&s
     }
 }
 
-/// Does this resolved git root itself spell the requested project?
+/// The frame's git root is this project, not a neighbor with the same leaf.
 ///
-/// Only the checkout's own owner and repository segments count. A nested
-/// repository at `…/vista/vendor/fleet-bus` still has `vista` in its path,
-/// and matching that ancestor would put the foreign checkout back into the
-/// parent bucket.
+/// Only a strict `owner/repo` filter counts, and only against the checkout's
+/// own last two segments. `/aicx` and bare `aicx` match every repository
+/// named `aicx`. `…/vista/vendor/fleet-bus` still has `vista` above it and
+/// is a different repository.
 #[cfg(feature = "app")]
-fn resolved_checkout_matches_project(root: &Path, filters: &[String]) -> bool {
+fn resolved_owner_and_repo_are_the_project(root: &Path, project: &str) -> bool {
+    let Some((organization, repository)) = strict_owner_repo(project) else {
+        return false;
+    };
     let mut segments = root
         .components()
         .filter_map(|component| match component {
@@ -1378,13 +1382,31 @@ fn resolved_checkout_matches_project(root: &Path, filters: &[String]) -> bool {
             _ => None,
         })
         .collect::<Vec<_>>();
-    let Some(repository) = segments.pop() else {
+    let Some(root_repository) = segments.pop() else {
         return false;
     };
-    let organization = segments.pop().unwrap_or_default();
-    filters.iter().any(|filter| {
-        crate::legacy_archive::project_filter_matches(&organization, &repository, filter)
-    })
+    let Some(root_organization) = segments.pop() else {
+        return false;
+    };
+    root_organization.eq_ignore_ascii_case(organization)
+        && root_repository.eq_ignore_ascii_case(repository)
+}
+
+/// `owner/repo` only. A leading slash, a trailing slash, or a bare name is a
+/// leaf or wildcard, and two repositories can share that name.
+#[cfg(feature = "app")]
+fn strict_owner_repo(project: &str) -> Option<(&str, &str)> {
+    let project = project.trim();
+    if project.is_empty() || project.starts_with(['/', '\\']) || project.ends_with(['/', '\\']) {
+        return None;
+    }
+    let split_at = project.find(['/', '\\'])?;
+    let organization = &project[..split_at];
+    let repository = &project[split_at + 1..];
+    if organization.is_empty() || repository.is_empty() || repository.contains(['/', '\\']) {
+        return None;
+    }
+    Some((organization, repository))
 }
 
 /// Catalog-admitted sessions stay live when conversation activity is inside

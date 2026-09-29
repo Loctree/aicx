@@ -331,6 +331,206 @@ fn an_unresolved_frame_is_spelled_in_only_beside_an_unresolved_root() {
     let _ = fs::remove_dir_all(&root);
 }
 
+/// Kept exception: the catalog directory is gone, and the frame's own git
+/// root is this owner/repo. A renamed or deleted catalog path must not drop
+/// the checkout that still is the project.
+#[cfg(feature = "app")]
+#[test]
+fn dead_baseline_keeps_frame_whose_owner_and_repo_are_the_project() {
+    let root = std::env::temp_dir().join(format!(
+        "aicx-intents-dead-baseline-owner-repo-{}-{}",
+        std::process::id(),
+        Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    ));
+    let _ = fs::remove_dir_all(&root);
+    let checkout = root.join("Loctree").join("aicx");
+    fs::create_dir_all(checkout.join(".git")).expect("project git dir");
+    let baseline = root.join("Loctree").join("aicx-archived");
+
+    let frame = |cwd: &std::path::Path, message: &str| crate::timeline::TimelineEntry {
+        timestamp: Utc::now(),
+        agent: "codex".to_string(),
+        session_id: "dead-baseline".to_string(),
+        role: "user".to_string(),
+        message: message.to_string(),
+        frame_class: None,
+        lineage_origin: None,
+        frame_kind: Some(FrameKind::UserMsg),
+        branch: None,
+        cwd: Some(cwd.to_string_lossy().into_owned()),
+        scope_conflict: false,
+        scope_unattributed: false,
+        scope_workdirs: Vec::new(),
+        session_kind: None,
+        timestamp_source: None,
+        source_path: None,
+        source_sha256: None,
+        source_line_span: None,
+    };
+    let mut frames = vec![frame(&checkout, "this project")];
+    retain_frames_for_project(
+        &mut frames,
+        "Loctree/aicx",
+        Some(baseline.to_string_lossy().as_ref()),
+        false,
+    );
+    assert_eq!(frames.len(), 1, "{frames:?}");
+    assert_eq!(frames[0].message, "this project");
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// Closed hole: a vanished baseline plus a shared leaf name is not identity.
+/// `/aicx`, bare `aicx`, and `Loctree/aicx` must all refuse `other-org/aicx`.
+#[cfg(feature = "app")]
+#[test]
+fn foreign_repo_with_the_same_leaf_name_stays_out() {
+    let root = std::env::temp_dir().join(format!(
+        "aicx-intents-foreign-leaf-{}-{}",
+        std::process::id(),
+        Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    ));
+    let _ = fs::remove_dir_all(&root);
+    let foreign = root.join("other-org").join("aicx");
+    fs::create_dir_all(foreign.join(".git")).expect("foreign git dir");
+    let baseline = root.join("missing-catalog").join("aicx");
+
+    let frame = |cwd: &std::path::Path| crate::timeline::TimelineEntry {
+        timestamp: Utc::now(),
+        agent: "codex".to_string(),
+        session_id: "foreign-leaf".to_string(),
+        role: "user".to_string(),
+        message: "other aicx".to_string(),
+        frame_class: None,
+        lineage_origin: None,
+        frame_kind: Some(FrameKind::UserMsg),
+        branch: None,
+        cwd: Some(cwd.to_string_lossy().into_owned()),
+        scope_conflict: false,
+        scope_unattributed: false,
+        scope_workdirs: Vec::new(),
+        session_kind: None,
+        timestamp_source: None,
+        source_path: None,
+        source_sha256: None,
+        source_line_span: None,
+    };
+    for project in ["Loctree/aicx", "/aicx", "aicx"] {
+        let mut frames = vec![frame(&foreign)];
+        retain_frames_for_project(
+            &mut frames,
+            project,
+            Some(baseline.to_string_lossy().as_ref()),
+            false,
+        );
+        assert!(
+            frames.is_empty(),
+            "filter {project} must not admit a different repo with the same leaf: {frames:?}"
+        );
+    }
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// Kept exception: a deleted directory whose parent is still this checkout
+/// belongs to the checkout. Deleting `labs` does not make it another repo.
+#[cfg(feature = "app")]
+#[test]
+fn missing_directory_inside_the_session_checkout_stays() {
+    let root = std::env::temp_dir().join(format!(
+        "aicx-intents-missing-inside-{}-{}",
+        std::process::id(),
+        Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    ));
+    let _ = fs::remove_dir_all(&root);
+    let checkout = root.join("vibecrafted");
+    fs::create_dir_all(checkout.join(".git")).expect("checkout git dir");
+    let missing = checkout.join("labs");
+
+    let frame = |cwd: &std::path::Path| crate::timeline::TimelineEntry {
+        timestamp: Utc::now(),
+        agent: "codex".to_string(),
+        session_id: "missing-inside".to_string(),
+        role: "user".to_string(),
+        message: "deleted labs".to_string(),
+        frame_class: None,
+        lineage_origin: None,
+        frame_kind: Some(FrameKind::UserMsg),
+        branch: None,
+        cwd: Some(cwd.to_string_lossy().into_owned()),
+        scope_conflict: false,
+        scope_unattributed: false,
+        scope_workdirs: Vec::new(),
+        session_kind: None,
+        timestamp_source: None,
+        source_path: None,
+        source_sha256: None,
+        source_line_span: None,
+    };
+    let mut frames = vec![frame(&missing)];
+    retain_frames_for_project(
+        &mut frames,
+        "vetcoders/vibecrafted",
+        Some(checkout.to_string_lossy().as_ref()),
+        false,
+    );
+    assert_eq!(frames.len(), 1, "{frames:?}");
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// A missing directory in another checkout, or one with no parent left, is
+/// not this project.
+#[cfg(feature = "app")]
+#[test]
+fn missing_directory_outside_the_session_checkout_stays_out() {
+    let root = std::env::temp_dir().join(format!(
+        "aicx-intents-missing-outside-{}-{}",
+        std::process::id(),
+        Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    ));
+    let _ = fs::remove_dir_all(&root);
+    let checkout = root.join("vibecrafted");
+    let other = root.join("other-repo");
+    fs::create_dir_all(checkout.join(".git")).expect("checkout git dir");
+    fs::create_dir_all(other.join(".git")).expect("other git dir");
+    let missing_elsewhere = other.join("labs");
+    let missing_without_parent = root.join("gone").join("labs");
+
+    let frame = |cwd: &std::path::Path, message: &str| crate::timeline::TimelineEntry {
+        timestamp: Utc::now(),
+        agent: "codex".to_string(),
+        session_id: "missing-outside".to_string(),
+        role: "user".to_string(),
+        message: message.to_string(),
+        frame_class: None,
+        lineage_origin: None,
+        frame_kind: Some(FrameKind::UserMsg),
+        branch: None,
+        cwd: Some(cwd.to_string_lossy().into_owned()),
+        scope_conflict: false,
+        scope_unattributed: false,
+        scope_workdirs: Vec::new(),
+        session_kind: None,
+        timestamp_source: None,
+        source_path: None,
+        source_sha256: None,
+        source_line_span: None,
+    };
+    let mut frames = vec![
+        frame(&missing_elsewhere, "other checkout"),
+        frame(&missing_without_parent, "no parent"),
+    ];
+    retain_frames_for_project(
+        &mut frames,
+        "vetcoders/vibecrafted",
+        Some(checkout.to_string_lossy().as_ref()),
+        false,
+    );
+    assert!(
+        frames.is_empty(),
+        "a missing directory outside this checkout must stay out: {frames:?}"
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
 #[cfg(feature = "app")]
 #[test]
 fn mixed_session_filter_is_fail_closed_for_unproven_frames() {

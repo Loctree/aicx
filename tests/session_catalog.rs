@@ -487,13 +487,12 @@ fn cursor_exact_id_across_projects_keeps_newest_copy_and_distinct_prefix_stays_a
         .expect("project-copy choice must be named");
     assert!(
         notice.contains("newest of 2 cursor project copies"),
-        "notice must name how many project copies existed: {notice}"
+        "notice must name how many project copies existed"
     );
+    let kept = notice.split("→ ").nth(1).map(str::trim).map(Path::new);
     assert!(
-        notice.contains(&format!(
-            "zzz-live-project/agent-transcripts/{UUID_A}/{UUID_A}.jsonl"
-        )),
-        "notice must name the kept path: {notice}"
+        kept.is_some_and(|path| notice_names_kept_copy(path, "zzz-live-project", UUID_A)),
+        "notice must name the kept project copy"
     );
     assert_eq!(lookup.stats.files_opened, 1, "only the kept copy is opened");
 
@@ -508,6 +507,32 @@ fn cursor_exact_id_across_projects_keeps_newest_copy_and_distinct_prefix_stays_a
     ids.sort();
     ids.dedup();
     assert_eq!(ids, vec![UUID_A, UUID_B]);
+}
+
+fn notice_names_kept_copy(path: &Path, project: &str, session_id: &str) -> bool {
+    let mut parts = path
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(part) => Some(part.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let Some(file) = parts.pop() else {
+        return false;
+    };
+    let Some(directory) = parts.pop() else {
+        return false;
+    };
+    let Some(bucket) = parts.pop() else {
+        return false;
+    };
+    let Some(kept_project) = parts.pop() else {
+        return false;
+    };
+    file == format!("{session_id}.jsonl")
+        && directory == session_id
+        && bucket == "agent-transcripts"
+        && kept_project == project
 }
 
 fn set_mtime(path: &Path, unix_secs: u64) {
