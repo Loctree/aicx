@@ -562,14 +562,6 @@ pub(crate) const DASHBOARD_SERVER_SCRIPT: &str = r#"
 
   const studio = () => {
     const onboard = $('ctx-onboarding');
-    const dismiss = $('ctx-onboarding-dismiss');
-    try {
-      if (localStorage.getItem('aicx_onboarding_dismissed') === '1' && onboard) onboard.open = false;
-    } catch (_) {}
-    if (dismiss) dismiss.addEventListener('click', () => {
-      if (onboard) onboard.open = false;
-      try { localStorage.setItem('aicx_onboarding_dismissed', '1'); } catch (_) {}
-    });
     const survey = $('ctx-onboarding-phrases');
     const surveySave = $('ctx-onboarding-save');
     const surveyStatus = $('ctx-onboarding-status');
@@ -588,7 +580,8 @@ pub(crate) const DASHBOARD_SERVER_SCRIPT: &str = r#"
             return;
           }
           const service = body.service ? ' Background service: ' + body.service + '.' : '';
-          surveyStatus.textContent = 'Saved. Search will use these phrases.' + service;
+          surveyStatus.textContent = 'Saved on this machine.' + service;
+          if (onboard) onboard.open = false;
         })
         .catch(() => { if (surveyStatus) surveyStatus.textContent = 'Not saved.'; });
     });

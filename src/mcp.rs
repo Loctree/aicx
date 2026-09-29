@@ -3310,7 +3310,8 @@ mod tests {
                 .unwrap();
             let html = String::from_utf8(bytes.to_vec()).unwrap();
             assert!(html.contains("id=\"ctx-onboarding\""));
-            assert!(html.contains("Save and continue"));
+            assert!(html.contains(">Save</button>"));
+            assert!(html.contains("Type the phrases you actually use"));
             assert!(!html.contains("intent_phrases.toml"));
 
             let open_tailnet = super::hybrid_http_app(

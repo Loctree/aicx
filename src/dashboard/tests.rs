@@ -572,10 +572,18 @@ fn local_open_shell_states_this_machine_and_does_not_offer_sign_in() {
     let list_at = html.find("id=\"ctx-list\"").expect("list");
     assert!(search_at < list_at);
     assert!(html.contains("id=\"ctx-onboarding-save\""));
-    assert!(html.contains("Save and continue"));
+    assert!(html.contains(">Save</button>"));
+    assert!(!html.contains("id=\"ctx-onboarding-dismiss\""));
+    assert!(!html.contains("Hide this"));
+    assert!(html.contains("Type the phrases you actually use"));
+    assert!(html.contains("Save stores them on this machine"));
+    assert!(html.contains("background service is missing"));
     assert!(html.contains("Still reading the corpus"));
     assert!(!html.contains("intent_phrases.toml"));
     assert!(!html.contains("Save intent phrases"));
+    assert!(!html.contains("intent keywords"));
+    assert!(!html.contains("Build the index"));
+    assert!(!html.contains("NEXT STEP"));
     assert!(!html.contains("placeholder=\"i want"));
     assert!(html.contains("id=\"ctx-phrases\""));
 }
@@ -628,7 +636,7 @@ fn configured_home_shell_omits_survey_markup() {
         }
     }
     assert!(!html.contains("id=\"ctx-onboarding\""));
-    assert!(!html.contains("Save and continue"));
+    assert!(!html.contains(">Save</button>"));
     assert!(!html.contains("Start here"));
     assert!(html.contains("id=\"ctx-search\""));
     assert!(html.contains("class=\"rail-filters\""));
@@ -648,10 +656,16 @@ fn unconfigured_home_shell_includes_survey_markup() {
     ));
     let _ = fs::remove_dir_all(&home);
     fs::create_dir_all(&home).unwrap();
-    let missing_unit = home.join("missing-service-unit");
+    let unit = home.join("service-unit");
+    let script = home.join("install-mcp-service.sh");
+    fs::write(
+        &script,
+        "#!/bin/sh\nprintf '%s\\n' '--transport http --host 127.0.0.1 --port 8044 --no-require-auth --experimental-auto-refresh' > \"$AICX_SERVICE_UNIT\"\n",
+    )
+    .unwrap();
     let prev_unit = std::env::var_os("AICX_SERVICE_UNIT");
     unsafe {
-        std::env::set_var("AICX_SERVICE_UNIT", &missing_unit);
+        std::env::set_var("AICX_SERVICE_UNIT", &unit);
     }
     assert!(
         crate::onboarding::needs_full_survey(&home),
@@ -662,16 +676,52 @@ fn unconfigured_home_shell_includes_survey_markup() {
         true,
         crate::onboarding::needs_full_survey(&home),
     );
+    assert!(html.contains("id=\"ctx-onboarding\""));
+    assert!(html.contains("<summary>Start here</summary>"));
+    assert!(html.contains(">Save</button>"));
+    assert_eq!(html.matches("id=\"ctx-onboarding-save\"").count(), 1);
+    assert!(!html.contains("id=\"ctx-onboarding-dismiss\""));
+    assert!(html.contains("Type the phrases you actually use"));
+    assert!(html.contains("Save stores them on this machine"));
+    assert!(html.contains("background service is missing"));
+    assert!(!html.contains("intent_phrases.toml"));
+    assert!(html.contains("id=\"ctx-search\""));
+
+    crate::onboarding::apply_onboarding_survey(
+        &home,
+        crate::parser::intent_phrases::embedded_source(),
+        &["phrases I actually use".into()],
+        &crate::onboarding::InstallOptions {
+            dry_run: false,
+            platform_is_macos: cfg!(target_os = "macos"),
+            script: Some(script),
+            bin: Some(home.join("aicx-under-test")),
+            port: 8044,
+        },
+    )
+    .expect("stubbed installer must finish the survey");
+    assert!(
+        !crate::onboarding::needs_full_survey(&home),
+        "after save the survey must be finished"
+    );
+    let after = render_server_shell_html_for(
+        "AICX Dashboard",
+        true,
+        crate::onboarding::needs_full_survey(&home),
+    );
     unsafe {
         match prev_unit {
             Some(value) => std::env::set_var("AICX_SERVICE_UNIT", value),
             None => std::env::remove_var("AICX_SERVICE_UNIT"),
         }
     }
-    assert!(html.contains("id=\"ctx-onboarding\""));
-    assert!(html.contains("Save and continue"));
-    assert!(html.contains("Start here"));
-    assert!(html.contains("id=\"ctx-search\""));
+    assert!(!after.contains("id=\"ctx-onboarding\""));
+    assert!(!after.contains("<summary>Start here</summary>"));
+    assert!(after.contains("id=\"ctx-search\""));
+    crate::parser::intent_phrases::reload_from_str(
+        crate::parser::intent_phrases::embedded_source(),
+    )
+    .expect("restore embedded phrases");
     let _ = fs::remove_dir_all(&home);
 }
 

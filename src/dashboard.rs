@@ -307,12 +307,11 @@ pub fn render_server_shell_html_for(title: &str, local_open: bool, show_survey: 
         format!(
             r#"          <details class="studio-card" id="ctx-onboarding" open>
             <summary>Start here</summary>
-            <p class="meta">{onboarding_first} Type the phrases you say when you mean it, one per line. Save once. After that, search uses them and this machine keeps running in the background.</p>
+            <p class="meta">{onboarding_first} Type the phrases you actually use, one per line. Save stores them on this machine. If the background service is missing, Save installs it.</p>
             <label class="meta" for="ctx-onboarding-phrases">Phrases you type, one per line</label>
             <textarea id="ctx-onboarding-phrases" rows="4" spellcheck="false" placeholder="I want this&#10;do not ship that"></textarea>
-            <button id="ctx-onboarding-save" type="button">Save and continue</button>
+            <button id="ctx-onboarding-save" type="button">Save</button>
             <p id="ctx-onboarding-status" class="meta"></p>
-            <button id="ctx-onboarding-dismiss" type="button">Hide this</button>
           </details>
 "#
         )
@@ -530,12 +529,11 @@ fn render_dashboard_html(payload: &DashboardPayload, title: &str) -> Result<Stri
         <section class="studio" id="ctx-studio">
           <details class="studio-card" id="ctx-onboarding">
             <summary>Start here</summary>
-            <p class="meta">Type the phrases you say when you mean it, one per line. Save once. After that, search uses them and this machine keeps running in the background.</p>
+            <p class="meta">Type the phrases you actually use, one per line. Save stores them on this machine. If the background service is missing, Save installs it.</p>
             <label class="meta" for="ctx-onboarding-phrases">Phrases you type, one per line</label>
             <textarea id="ctx-onboarding-phrases" rows="4" spellcheck="false" placeholder="I want this&#10;do not ship that"></textarea>
-            <button id="ctx-onboarding-save" type="button">Save and continue</button>
+            <button id="ctx-onboarding-save" type="button">Save</button>
             <p id="ctx-onboarding-status" class="meta"></p>
-            <button id="ctx-onboarding-dismiss" type="button">Hide this</button>
           </details>
           <details class="studio-card">
             <summary>Phrases</summary>

@@ -37,7 +37,7 @@ pub struct FirstStartReport {
 impl FirstStartReport {
     pub fn render(&self) -> String {
         format!(
-            "aicx onboarding\nOpen the dashboard: {url}\nOne phrase list (intent_phrases.toml), the local embedder in config.toml, and the loopback service.\nService: {service}\nSearch still works if that install fails: aicx search '<query>'\n",
+            "aicx onboarding\nOpen the dashboard: {url}\nType the phrases you use. Save stores them on this machine and installs the background service when it is missing.\nService: {service}\nSearch still works if that install fails: aicx search '<query>'\n",
             url = self.dashboard_url,
             service = self.service,
         )
@@ -1387,7 +1387,11 @@ mod tests {
         let rendered = report.render();
         assert!(rendered.contains("onboarding"));
         assert!(rendered.contains("http://127.0.0.1:8044/"));
-        assert!(rendered.contains("intent_phrases.toml"));
+        assert!(rendered.contains("Type the phrases you use"));
+        assert!(rendered.contains("Save stores them on this machine"));
+        assert!(rendered.contains("background service"));
+        assert!(!rendered.contains("intent_phrases.toml"));
+        assert!(!rendered.contains("config.toml"));
         assert!(!rendered.contains("Usage: aicx"));
     }
 

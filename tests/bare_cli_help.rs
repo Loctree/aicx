@@ -62,6 +62,15 @@ fn unconfigured_home_prints_the_dashboard_url() {
         "first start must print the dashboard URL:\n{combined}"
     );
     assert!(
+        combined.contains("Type the phrases you use")
+            && combined.contains("Save stores them on this machine"),
+        "first start must name the save in plain language:\n{combined}"
+    );
+    assert!(
+        !combined.contains("intent_phrases.toml") && !combined.contains("config.toml"),
+        "first start must not name config files:\n{combined}"
+    );
+    assert!(
         !combined.contains("Usage: aicx"),
         "first start must not print short help instead of the dashboard:\n{combined}"
     );
