@@ -281,23 +281,43 @@ pub(crate) const AICX_MARK_SVG: &str = r#"<svg id="aicx-mark" class="brand-mark"
 /// No data is embedded — the JavaScript fetches everything through API endpoints.
 /// PWA-ready: includes manifest link and service worker registration.
 pub fn render_server_shell_html(title: &str) -> String {
-    render_server_shell_html_for(title, false)
+    render_server_shell_html_for(title, false, true)
 }
 
 /// `local_open` is a loopback bind with authentication disabled.
 ///
 /// That page states the local case. Sign in is offered only when the socket
 /// is not loopback or authentication is actually required.
-pub fn render_server_shell_html_for(title: &str, local_open: bool) -> String {
+///
+/// `show_survey` is true only while setup is unfinished (missing phrases,
+/// unset embedder, or service off-contract). A configured home gets the
+/// corpus rail without the Start-here wizard markup.
+pub fn render_server_shell_html_for(title: &str, local_open: bool, show_survey: bool) -> String {
     let access_line = if local_open {
         r#"<p class="meta" id="ctx-access">This machine. No sign-in.</p>"#
     } else {
         r#"<p class="meta" id="ctx-access">Search. <a href="/auth">Sign in</a></p>"#
     };
-    let onboarding_first = if local_open {
-        "This dashboard is on this machine. No sign-in."
+    let onboarding_card = if show_survey {
+        let onboarding_first = if local_open {
+            "This dashboard is on this machine. No sign-in."
+        } else {
+            "Sign in. This dashboard is not on your own loopback, or it asks for a token."
+        };
+        format!(
+            r#"          <details class="studio-card" id="ctx-onboarding" open>
+            <summary>Start here</summary>
+            <p class="meta">{onboarding_first} Type the phrases you say when you mean it, one per line. Save once. After that, search uses them and this machine keeps running in the background.</p>
+            <label class="meta" for="ctx-onboarding-phrases">Phrases you type, one per line</label>
+            <textarea id="ctx-onboarding-phrases" rows="4" spellcheck="false" placeholder="I want this&#10;do not ship that"></textarea>
+            <button id="ctx-onboarding-save" type="button">Save and continue</button>
+            <p id="ctx-onboarding-status" class="meta"></p>
+            <button id="ctx-onboarding-dismiss" type="button">Hide this</button>
+          </details>
+"#
+        )
     } else {
-        "Sign in. This dashboard is not on your own loopback, or it asks for a token."
+        String::new()
     };
     format!(
         r##"<!doctype html>
@@ -381,16 +401,7 @@ pub fn render_server_shell_html_for(title: &str, local_open: bool) -> String {
           </div>
         </div>
         <section class="studio" id="ctx-studio">
-          <details class="studio-card" id="ctx-onboarding">
-            <summary>Start here</summary>
-            <p class="meta">{onboarding_first} Type the phrases you say when you mean it, one per line. Save once. After that, search uses them and this machine keeps running in the background.</p>
-            <label class="meta" for="ctx-onboarding-phrases">Phrases you type, one per line</label>
-            <textarea id="ctx-onboarding-phrases" rows="4" spellcheck="false" placeholder="I want this&#10;do not ship that"></textarea>
-            <button id="ctx-onboarding-save" type="button">Save and continue</button>
-            <p id="ctx-onboarding-status" class="meta"></p>
-            <button id="ctx-onboarding-dismiss" type="button">Hide this</button>
-          </details>
-          <details class="studio-card">
+{onboarding_card}          <details class="studio-card">
             <summary>Phrases</summary>
             <p class="meta">One list. Intent, task, decision, and the rest. Saved to this machine.</p>
             <textarea id="ctx-phrases" rows="8" spellcheck="false"></textarea>
@@ -474,7 +485,7 @@ pub fn render_server_shell_html_for(title: &str, local_open: bool) -> String {
             assets::DASHBOARD_SERVER_SCRIPT
         ),
         access_line = access_line,
-        onboarding_first = onboarding_first,
+        onboarding_card = onboarding_card,
         AICX_MARK_SVG = AICX_MARK_SVG,
     )
 }

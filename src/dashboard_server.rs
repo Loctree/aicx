@@ -84,8 +84,6 @@ impl DashboardSnapshot {
 #[derive(Debug)]
 struct DashboardServerState {
     config: DashboardServerConfig,
-    /// Lightweight server-mode HTML shell (no embedded data).
-    shell_html: String,
     snapshot: RwLock<DashboardSnapshot>,
     rebuilding: AtomicBool,
 }
@@ -247,11 +245,8 @@ pub async fn dashboard_router(
         }
         Err(err) => return Err(err.context("Initial dashboard build failed")),
     };
-    let local_open = config.host.is_loopback() && !config.auth.is_enforced();
-    let shell_html = dashboard::render_server_shell_html_for(&config.title, local_open);
     let state = Arc::new(DashboardServerState {
         config: config.clone(),
-        shell_html,
         snapshot: RwLock::new(DashboardSnapshot::from_build(initial)),
         rebuilding: AtomicBool::new(false),
     });
@@ -341,13 +336,16 @@ fn test_server_state(host: std::net::IpAddr) -> Arc<DashboardServerState> {
     let initial = empty_build(&config);
     Arc::new(DashboardServerState {
         config,
-        shell_html: String::new(),
         snapshot: RwLock::new(DashboardSnapshot::from_build(initial)),
         rebuilding: AtomicBool::new(false),
     })
 }
 
 async fn get_dashboard_html(State(state): State<Arc<DashboardServerState>>) -> impl IntoResponse {
+    let local_open = state.config.host.is_loopback() && !state.config.auth.is_enforced();
+    let show_survey = crate::onboarding::needs_full_survey(&state.config.aicx_home);
+    let shell_html =
+        dashboard::render_server_shell_html_for(&state.config.title, local_open, show_survey);
     let mut headers = HeaderMap::new();
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     headers.insert(
@@ -360,7 +358,7 @@ async fn get_dashboard_html(State(state): State<Arc<DashboardServerState>>) -> i
         "permissions-policy",
         HeaderValue::from_static("interest-cohort=()"),
     );
-    (headers, Html(state.shell_html.clone()))
+    (headers, Html(shell_html))
 }
 
 async fn get_health() -> Json<serde_json::Value> {

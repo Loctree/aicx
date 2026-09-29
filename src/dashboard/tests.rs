@@ -559,7 +559,7 @@ fn test_render_server_shell_html_contains_csp_meta() {
 
 #[test]
 fn local_open_shell_states_this_machine_and_does_not_offer_sign_in() {
-    let html = render_server_shell_html_for("AICX Dashboard", true);
+    let html = render_server_shell_html_for("AICX Dashboard", true, true);
     assert!(html.contains("This machine. No sign-in."));
     assert!(html.contains("This dashboard is on this machine. No sign-in."));
     assert!(!html.contains("href=\"/auth\">Sign in"));
@@ -578,6 +578,95 @@ fn local_open_shell_states_this_machine_and_does_not_offer_sign_in() {
     assert!(!html.contains("Save intent phrases"));
     assert!(!html.contains("placeholder=\"i want"));
     assert!(html.contains("id=\"ctx-phrases\""));
+}
+
+#[test]
+fn configured_home_shell_omits_survey_markup() {
+    let home = std::env::temp_dir().join(format!(
+        "aicx-dash-configured-{}-{}",
+        std::process::id(),
+        "survey-gate"
+    ));
+    let _ = fs::remove_dir_all(&home);
+    fs::create_dir_all(&home).unwrap();
+    fs::write(
+        home.join("intent_phrases.toml"),
+        crate::parser::intent_phrases::embedded_source(),
+    )
+    .unwrap();
+    fs::write(
+        home.join("config.toml"),
+        "[embedder]\nbackend = \"gguf\"\nprofile = \"base\"\n",
+    )
+    .unwrap();
+    let unit = home.join("service-unit");
+    fs::write(
+        &unit,
+        "--transport http --host 127.0.0.1 --port 8044 --no-require-auth --experimental-auto-refresh\n",
+    )
+    .unwrap();
+    let prev_unit = std::env::var_os("AICX_SERVICE_UNIT");
+    unsafe {
+        std::env::set_var("AICX_SERVICE_UNIT", &unit);
+    }
+    assert!(
+        !crate::onboarding::needs_full_survey(&home),
+        "configured home must not require the survey"
+    );
+    let html = render_server_shell_html_for(
+        "AICX Dashboard",
+        true,
+        crate::onboarding::needs_full_survey(&home),
+    );
+    unsafe {
+        match prev_unit {
+            Some(value) => std::env::set_var("AICX_SERVICE_UNIT", value),
+            None => std::env::remove_var("AICX_SERVICE_UNIT"),
+        }
+    }
+    assert!(!html.contains("id=\"ctx-onboarding\""));
+    assert!(!html.contains("Save and continue"));
+    assert!(!html.contains("Start here"));
+    assert!(html.contains("id=\"ctx-search\""));
+    assert!(html.contains("class=\"rail-filters\""));
+    assert!(html.contains("id=\"ctx-phrases\""));
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn unconfigured_home_shell_includes_survey_markup() {
+    let home = std::env::temp_dir().join(format!(
+        "aicx-dash-bare-{}-{}",
+        std::process::id(),
+        "survey-gate"
+    ));
+    let _ = fs::remove_dir_all(&home);
+    fs::create_dir_all(&home).unwrap();
+    let missing_unit = home.join("missing-service-unit");
+    let prev_unit = std::env::var_os("AICX_SERVICE_UNIT");
+    unsafe {
+        std::env::set_var("AICX_SERVICE_UNIT", &missing_unit);
+    }
+    assert!(
+        crate::onboarding::needs_full_survey(&home),
+        "empty home must require the survey"
+    );
+    let html = render_server_shell_html_for(
+        "AICX Dashboard",
+        true,
+        crate::onboarding::needs_full_survey(&home),
+    );
+    unsafe {
+        match prev_unit {
+            Some(value) => std::env::set_var("AICX_SERVICE_UNIT", value),
+            None => std::env::remove_var("AICX_SERVICE_UNIT"),
+        }
+    }
+    assert!(html.contains("id=\"ctx-onboarding\""));
+    assert!(html.contains("Save and continue"));
+    assert!(html.contains("Start here"));
+    assert!(html.contains("id=\"ctx-search\""));
+    let _ = fs::remove_dir_all(&home);
 }
 
 #[test]
