@@ -213,7 +213,10 @@ fn server_shell_includes_highlight_styles_and_wiring() {
     assert!(html.contains("id=\"ctx-onboarding\""));
     assert!(html.contains("id=\"ctx-phrases\""));
     assert!(html.contains("id=\"ctx-index\""));
-    assert!(html.contains("aicx_onboarding_dismissed"));
+    assert!(html.contains("id=\"ctx-onboarding-save\""));
+    assert!(html.contains(">Save</button>"));
+    assert!(!html.contains("aicx_onboarding_dismissed"));
+    assert!(!html.contains("id=\"ctx-onboarding-dismiss\""));
     assert!(html.contains("theme-color\" content=\"#0e0e0e\""));
 }
 
