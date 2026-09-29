@@ -2253,13 +2253,21 @@ pub async fn run_http_config_with_lifecycle(
         }),
     );
 
-    let app = health_router.merge(auth::require_auth_layer(mcp_router, auth_config));
+    let aicx_home = crate::aicx_home::ensure()?;
+    let app = hybrid_http_app(
+        http_config.clone(),
+        auth_config.clone(),
+        health_router.merge(auth::require_auth_layer(mcp_router, auth_config)),
+        aicx_home,
+    )
+    .await?;
 
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to bind MCP server on {addr}: {e}"))?;
 
-    eprintln!("aicx MCP server running (streamable HTTP)");
+    eprintln!("aicx HTTP service running (dashboard + MCP)");
+    eprintln!("  Dashboard: http://{addr}/");
     eprintln!("  Endpoint: http://{addr}/mcp");
     eprintln!("  Health: http://{addr}/health");
     eprintln!("  Transport: Streamable HTTP (POST + GET /mcp)");
@@ -2289,6 +2297,35 @@ pub async fn run_http_config_with_lifecycle(
     )
     .await
     .map_err(|e| anyhow::anyhow!("MCP HTTP server error: {e}"))
+}
+
+async fn hybrid_http_app(
+    http_config: McpHttpConfig,
+    auth_config: AuthConfig,
+    mcp_app: axum::Router,
+    aicx_home: std::path::PathBuf,
+) -> anyhow::Result<axum::Router> {
+    let (cors, explicit) = crate::dashboard_server::policy_for_hybrid_bind(http_config.host);
+    crate::dashboard_server::validate_dashboard_host_policy(
+        http_config.host,
+        &cors,
+        explicit,
+        &auth_config,
+    )?;
+    let dashboard = crate::dashboard_server::DashboardServerConfig {
+        aicx_home: aicx_home.clone(),
+        scope: crate::dashboard::DashboardScope::default(),
+        title: "AICX".to_string(),
+        preview_chars: 320,
+        artifact_path: aicx_home.join("aicx-dashboard.html"),
+        cors_policy: cors,
+        host: http_config.host,
+        port: http_config.port,
+        auth: auth_config,
+        allow_no_origin: false,
+    };
+    let dashboard = crate::dashboard_server::dashboard_router(dashboard, false, true).await?;
+    Ok(dashboard.merge(mcp_app))
 }
 
 fn validate_http_auth_policy(
@@ -3238,5 +3275,94 @@ mod tests {
                 "mcp.example.internal".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn hybrid_listener_serves_dashboard_and_keeps_remote_auth() {
+        use tower::ServiceExt;
+
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        rt.block_on(async {
+            let home = std::env::temp_dir().join(format!("aicx-hybrid-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&home);
+            fs::create_dir_all(&home).expect("home");
+            let mcp = axum::Router::new().route("/mcp", axum::routing::get(|| async { "mcp" }));
+            let app = super::hybrid_http_app(
+                McpHttpConfig::localhost(8044),
+                AuthConfig::disabled(),
+                mcp,
+                home.clone(),
+            )
+            .await
+            .expect("loopback hybrid router");
+            let response = app
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri("/")
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), axum::http::StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            let html = String::from_utf8(bytes.to_vec()).unwrap();
+            assert!(html.contains("id=\"ctx-onboarding\""));
+            assert!(html.contains(">Save</button>"));
+            assert!(html.contains("Type the phrases you actually use"));
+            assert!(!html.contains("intent_phrases.toml"));
+
+            let open_tailnet = super::hybrid_http_app(
+                McpHttpConfig::new("100.82.232.70".parse().unwrap(), 8044),
+                AuthConfig::disabled(),
+                axum::Router::new(),
+                home.clone(),
+            )
+            .await;
+            assert!(
+                open_tailnet.is_err(),
+                "the Tailscale bind must not become an open dashboard"
+            );
+
+            let authed = super::hybrid_http_app(
+                McpHttpConfig::new("100.82.232.70".parse().unwrap(), 8044),
+                AuthConfig {
+                    token: Some("secret".to_string()),
+                    source: AuthSource::Cli,
+                },
+                axum::Router::new().route("/mcp", axum::routing::get(|| async { "mcp" })),
+                home.clone(),
+            )
+            .await
+            .expect("bearer-gated tailscale hybrid router");
+            let mut api_request = axum::http::Request::builder()
+                .uri("/api/status")
+                .body(axum::body::Body::empty())
+                .unwrap();
+            api_request
+                .extensions_mut()
+                .insert(axum::extract::connect_info::ConnectInfo(
+                    std::net::SocketAddr::from(([127, 0, 0, 1], 9)),
+                ));
+            let api = authed.clone().oneshot(api_request).await.unwrap();
+            assert_eq!(
+                api.status(),
+                axum::http::StatusCode::UNAUTHORIZED,
+                "non-loopback /api stays bearer-gated"
+            );
+            let shell = authed
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri("/")
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(shell.status(), axum::http::StatusCode::OK);
+            let _ = fs::remove_dir_all(&home);
+        });
     }
 }

@@ -210,6 +210,14 @@ fn server_shell_includes_highlight_styles_and_wiring() {
     assert!(html.contains(".result-preview {"));
     assert!(html.contains("preview.className = 'result-preview';"));
     assert!(html.contains("preview.innerHTML = highlightTerms(truncated, state.query);"));
+    assert!(html.contains("id=\"ctx-onboarding\""));
+    assert!(html.contains("id=\"ctx-phrases\""));
+    assert!(html.contains("id=\"ctx-index\""));
+    assert!(html.contains("id=\"ctx-onboarding-save\""));
+    assert!(html.contains(">Save</button>"));
+    assert!(!html.contains("aicx_onboarding_dismissed"));
+    assert!(!html.contains("id=\"ctx-onboarding-dismiss\""));
+    assert!(html.contains("theme-color\" content=\"#0e0e0e\""));
 }
 
 #[test]
@@ -548,4 +556,199 @@ fn test_inline_markdown_quote_break_attempt_does_not_inject_attribute() {
 fn test_render_server_shell_html_contains_csp_meta() {
     let html = render_server_shell_html("test");
     assert!(html.contains("<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; base-uri 'none'; frame-ancestors 'none'; form-action 'none';\">"));
+    assert!(html.contains("id=\"aicx-mark\""));
+    assert!(html.contains("aria-label=\"Loctree\""));
+}
+
+#[test]
+fn local_open_shell_states_this_machine_and_does_not_offer_sign_in() {
+    let html = render_server_shell_html_for("AICX Dashboard", true, true);
+    assert!(html.contains("This machine. No sign-in."));
+    assert!(html.contains("This dashboard is on this machine. No sign-in."));
+    assert!(!html.contains("href=\"/auth\">Sign in"));
+    assert!(html.contains("class=\"server-dash\""));
+    assert!(html.contains("class=\"main-body\""));
+    assert!(html.contains("class=\"rail-search\""));
+    assert!(html.contains("id=\"ctx-search\""));
+    assert_eq!(html.matches("id=\"ctx-search\"").count(), 1);
+    let search_at = html.find("id=\"ctx-search\"").expect("search");
+    let list_at = html.find("id=\"ctx-list\"").expect("list");
+    assert!(search_at < list_at);
+    assert!(html.contains("id=\"ctx-onboarding-save\""));
+    assert!(html.contains(">Save</button>"));
+    assert!(!html.contains("id=\"ctx-onboarding-dismiss\""));
+    assert!(!html.contains("Hide this"));
+    assert!(html.contains("Type the phrases you actually use"));
+    assert!(html.contains("Save stores them on this machine"));
+    assert!(html.contains("background service is missing"));
+    assert!(html.contains("Still reading the corpus"));
+    assert!(!html.contains("intent_phrases.toml"));
+    assert!(!html.contains("Save intent phrases"));
+    assert!(!html.contains("intent keywords"));
+    assert!(!html.contains("Build the index"));
+    assert!(!html.contains("NEXT STEP"));
+    assert!(!html.contains("placeholder=\"i want"));
+    assert!(html.contains("id=\"ctx-phrases\""));
+}
+
+#[test]
+fn configured_home_shell_omits_survey_markup() {
+    let _unit_guard = crate::onboarding::SERVICE_UNIT_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let home = std::env::temp_dir().join(format!(
+        "aicx-dash-configured-{}-{}",
+        std::process::id(),
+        "survey-gate"
+    ));
+    let _ = fs::remove_dir_all(&home);
+    fs::create_dir_all(&home).unwrap();
+    fs::write(
+        home.join("intent_phrases.toml"),
+        crate::parser::intent_phrases::embedded_source(),
+    )
+    .unwrap();
+    fs::write(
+        home.join("config.toml"),
+        "[embedder]\nbackend = \"gguf\"\nprofile = \"base\"\n",
+    )
+    .unwrap();
+    let unit = home.join("service-unit");
+    fs::write(
+        &unit,
+        "--transport http --host 127.0.0.1 --port 8044 --no-require-auth --experimental-auto-refresh\n",
+    )
+    .unwrap();
+    let prev_unit = std::env::var_os("AICX_SERVICE_UNIT");
+    unsafe {
+        std::env::set_var("AICX_SERVICE_UNIT", &unit);
+    }
+    assert!(
+        !crate::onboarding::needs_full_survey(&home),
+        "configured home must not require the survey"
+    );
+    let html = render_server_shell_html_for(
+        "AICX Dashboard",
+        true,
+        crate::onboarding::needs_full_survey(&home),
+    );
+    unsafe {
+        match prev_unit {
+            Some(value) => std::env::set_var("AICX_SERVICE_UNIT", value),
+            None => std::env::remove_var("AICX_SERVICE_UNIT"),
+        }
+    }
+    assert!(!html.contains("id=\"ctx-onboarding\""));
+    assert!(!html.contains(">Save</button>"));
+    assert!(!html.contains("Start here"));
+    assert!(html.contains("id=\"ctx-search\""));
+    assert!(html.contains("class=\"rail-filters\""));
+    assert!(html.contains("id=\"ctx-phrases\""));
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn unconfigured_home_shell_includes_survey_markup() {
+    let _unit_guard = crate::onboarding::SERVICE_UNIT_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let home = std::env::temp_dir().join(format!(
+        "aicx-dash-bare-{}-{}",
+        std::process::id(),
+        "survey-gate"
+    ));
+    let _ = fs::remove_dir_all(&home);
+    fs::create_dir_all(&home).unwrap();
+    let unit = home.join("service-unit");
+    let script = if cfg!(windows) {
+        home.join("install-mcp-service.ps1")
+    } else {
+        home.join("install-mcp-service.sh")
+    };
+    let stub = if cfg!(windows) {
+        "$utf8 = New-Object System.Text.UTF8Encoding $false\n[System.IO.File]::WriteAllText($env:AICX_SERVICE_UNIT, \"--transport http --host 127.0.0.1 --port 8044 --no-require-auth --experimental-auto-refresh`n\", $utf8)\nexit 0\n"
+            .to_string()
+    } else {
+        "#!/bin/sh\nprintf '%s\\n' '--transport http --host 127.0.0.1 --port 8044 --no-require-auth --experimental-auto-refresh' > \"$AICX_SERVICE_UNIT\"\n"
+            .to_string()
+    };
+    fs::write(&script, stub).unwrap();
+    let prev_unit = std::env::var_os("AICX_SERVICE_UNIT");
+    unsafe {
+        std::env::set_var("AICX_SERVICE_UNIT", &unit);
+    }
+    assert!(
+        crate::onboarding::needs_full_survey(&home),
+        "empty home must require the survey"
+    );
+    let html = render_server_shell_html_for(
+        "AICX Dashboard",
+        true,
+        crate::onboarding::needs_full_survey(&home),
+    );
+    assert!(html.contains("id=\"ctx-onboarding\""));
+    assert!(html.contains("<summary>Start here</summary>"));
+    assert!(html.contains(">Save</button>"));
+    assert_eq!(html.matches("id=\"ctx-onboarding-save\"").count(), 1);
+    assert!(!html.contains("id=\"ctx-onboarding-dismiss\""));
+    assert!(html.contains("Type the phrases you actually use"));
+    assert!(html.contains("Save stores them on this machine"));
+    assert!(html.contains("background service is missing"));
+    assert!(!html.contains("intent_phrases.toml"));
+    assert!(html.contains("id=\"ctx-search\""));
+
+    crate::onboarding::apply_onboarding_survey(
+        &home,
+        crate::parser::intent_phrases::embedded_source(),
+        &["phrases I actually use".into()],
+        &crate::onboarding::InstallOptions {
+            dry_run: false,
+            platform_is_macos: cfg!(target_os = "macos"),
+            script: Some(script),
+            bin: Some(home.join("aicx-under-test")),
+            port: 8044,
+        },
+    )
+    .expect("stubbed installer must finish the survey");
+    assert!(
+        !crate::onboarding::needs_full_survey(&home),
+        "after save the survey must be finished"
+    );
+    let after = render_server_shell_html_for(
+        "AICX Dashboard",
+        true,
+        crate::onboarding::needs_full_survey(&home),
+    );
+    unsafe {
+        match prev_unit {
+            Some(value) => std::env::set_var("AICX_SERVICE_UNIT", value),
+            None => std::env::remove_var("AICX_SERVICE_UNIT"),
+        }
+    }
+    assert!(!after.contains("id=\"ctx-onboarding\""));
+    assert!(!after.contains("<summary>Start here</summary>"));
+    assert!(after.contains("id=\"ctx-search\""));
+    crate::parser::intent_phrases::reload_from_str(
+        crate::parser::intent_phrases::embedded_source(),
+    )
+    .expect("restore embedded phrases");
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn remote_or_auth_shell_still_offers_sign_in() {
+    let html = render_server_shell_html("AICX Dashboard");
+    assert!(html.contains("href=\"/auth\">Sign in"));
+    assert!(html.contains("id=\"ctx-access\">Search. <a href=\"/auth\">Sign in</a>"));
+    assert!(!html.contains("id=\"ctx-access\">This machine. No sign-in."));
+}
+
+#[test]
+fn strip_dashboard_pollution_keeps_the_operator_ask() {
+    let raw = "<rules>\nThe rules section has a number of possible rules.\n<always_applied_workspace_rule name=\"Agents.md\">\nslice before edit\n</always_applied_workspace_rule>\n</rules>\n\nHelp me repro the bug.";
+    let cleaned = super::scan::strip_dashboard_pollution(raw);
+    assert!(!cleaned.contains("<rules>"));
+    assert!(!cleaned.contains("rules section"));
+    assert!(!cleaned.contains("slice before edit"));
+    assert!(cleaned.contains("Help me repro the bug"));
 }

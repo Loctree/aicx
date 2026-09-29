@@ -3,7 +3,24 @@
 All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+## [0.15.0] - 2026-09-28
+
+### Added
+
+- A bare first start opens the dashboard onboarding survey. Intent phrases are written to `intent_phrases.toml`. On macOS the same path installs the LaunchAgent through `tools/install-mcp-service.sh`.
+- `aicx serve --transport http` is one listener: humans open `/`, agents use `/mcp`. Non-loopback binds keep bearer auth. The passphrase form stays off non-loopback binds, including `0.0.0.0`.
+
 ## [Unreleased]
+
+### Fixed
+
+- Avoid re-parsing full project history before an unchanged `overlay` cache hit.
+  Reuse fingerprinted conversation frames across both intent lanes, preserve
+  full-history evidence, and serialize concurrent producers with advisory locks.
+  Add CLI parse/reuse counters and isolated warm/incremental/concurrency tests.
+  Protect persistent identity registries from malformed-cache replacement,
+  serialize custom-root ownership, refuse time-dependent Grok projections, and
+  redact source/session identifiers from cache diagnostics.
 
 ### Turn-level project scope, decided by repository identity
 

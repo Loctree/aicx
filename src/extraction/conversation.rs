@@ -856,7 +856,11 @@ pub fn merge_inherited(
 // ---------------------------------------------------------------------------
 
 /// Structural scope of a span of entries, with the evidence that produced it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Serializable so the overlay conversation cache can keep a session's report
+/// next to its signal frames: the report is judged before the signal
+/// projection and cannot be rebuilt from the frames it leaves.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ScopeReport {
     pub status: ScopeStatus,
     pub cwds: Vec<String>,

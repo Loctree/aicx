@@ -19,6 +19,14 @@ $AICX_HOME/
           manifest.json
       source_parse_state.v1.json
   context-corpus/                   # explicit Loctree/example ingestion
+  overlay-index-v1/<repo-id-hash>/   # derived intent overlay and private feed caches
+    side-index.json
+    ov1:<revision>.json
+    catalog-feed-v1.json
+    catalog-source-v1-<source-identity-hash>.json
+    materialized-output-v1.json
+    catalog-cache-owner-v1.json
+    producer-<repo-id-hash>.lock
   state/
   locks/
   config.toml
@@ -84,6 +92,21 @@ quarantined because another writer may still own them; remove those only in an
 offline cleanup after all AICX writers are stopped.
 Legacy `embeddings.ndjson` and `dense_brute_force.ndjson` are retired
 intermediates. Their deletion is still an explicit operator action.
+
+## Overlay cache
+
+`aicx overlay` keeps its existing versioned document and stable semantic-group
+side index under `overlay-index-v1/`. Private catalog-feed and conversation
+caches let unchanged calls skip transcript parsing and let incremental calls
+parse only changed sources. They remain derived data, never canonical session
+history. Current source identity and ignore policy govern reuse; `--rebuild`
+bypasses these caches. A producer advisory lock serializes writers for the same
+repo/cache root, including calls from different worktrees. See
+[OVERLAY.md](./OVERLAY.md) for freshness, failure, and instrumentation contracts.
+The private owner marker prevents an explicit shared index root from being
+silently adopted by another repository/home. Obsolete per-source conversation
+slots are collected only after successful complete publication; revisioned
+overlay documents keep their existing history/retention contract.
 
 ## Residual old artifacts
 

@@ -22,7 +22,44 @@ pub(crate) const DASHBOARD_SERVER_SCRIPT: &str = r#"
   const state = {
     query: '', project: '', agent: '', kind: '', sort: 'newest', since: '',
     scoreMin: 0, limit: 350, selectedId: null, rows: [], selectedRecord: null,
-    browseRecords: [], mode: 'browse', expanded: false,
+    browseRecords: [], mode: 'browse', expanded: false, unit: 'session',
+    assumptions: [], indexLoaded: false, corpusTotal: 0, browseRetries: 0,
+  };
+
+  const withoutStamp = (line) => {
+    if (line.charAt(0) !== '[') return line;
+    const end = line.indexOf(']');
+    return end > 0 ? line.slice(end + 1).trim() : line;
+  };
+  const stripAnsi = (value) => String(value || '')
+    .replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, '')
+    .replace(/\u001b\][^\u0007]*(?:\u0007|\u001b\\)/g, '');
+  const readableLine = (line) => {
+    let text = stripAnsi(withoutStamp(line)).replace(/^(user|assistant):\s*/i, '').replace(/<\/?user_query>/gi, ' ').replace(/\s+/g, ' ').trim();
+    if (!text || text.indexOf('<') === 0) return '';
+    if (/[\u2500-\u257F]/.test(text)) return '';
+    return text.length > 140 ? text.slice(0, 140) + '\u2026' : text;
+  };
+  const readableName = (record) => {
+    const preview = stripAnsi(record.preview || record.excerpt || '');
+    const lines = preview.split('\n').map(function(line) { return line.trim(); }).filter(Boolean);
+    const spoken = function(prefix) {
+      return lines.find(function(line) { return withoutStamp(line).toLowerCase().indexOf(prefix) === 0 && readableLine(line); });
+    };
+    const chosen = spoken('user:') || spoken('assistant:');
+    if (chosen) return readableLine(chosen);
+    const first = lines.map(readableLine).find(Boolean);
+    if (first) return first;
+    const raw = record.file_name || record.file || '';
+    const label = (record.label || '').trim();
+    if (label && !/\.jsonl?$/i.test(label)) return label;
+    if (record.kind === 'session' || /\.jsonl$/i.test(raw)) return (record.agent || 'session') + ' session';
+    return raw || '(unnamed)';
+  };
+  const listPreview = (record) => {
+    const text = stripAnsi((record.preview || record.excerpt || '').replace(/\[1970-01-01[^\]]*\]\s*/g, '')).trim();
+    if (!text || text.indexOf('<rules>') === 0) return '';
+    return text.length > 240 ? text.slice(0, 240) + '\u2026' : text;
   };
 
   const renderMarkdown = AicxMarkdown.renderMarkdown;
@@ -183,15 +220,15 @@ pub(crate) const DASHBOARD_SERVER_SCRIPT: &str = r#"
     if (!record) {
       ui.detailTitle.textContent = 'No result selected';
       ui.detailMeta.textContent = '';
-      ui.detailContent.innerHTML = 'Use search or filters to pick a note.';
+      ui.detailContent.textContent = 'Open a session.';
       return;
     }
-    const title = record.file_name || record.file || '(unnamed)';
+    const title = readableName(record);
     const scoreTxt = typeof score === 'number' && score > 0 ? 'score ' + score + '/100' : '';
     const meta = [record.project, record.agent, record.kind, record.date, scoreTxt].filter(Boolean).join(' \u2022 ');
     ui.detailTitle.innerHTML = highlightTerms(title, state.query);
     ui.detailMeta.innerHTML = highlightTerms(meta, state.query);
-    const previewText = record.preview || record.excerpt || '';
+    const previewText = stripAnsi(record.preview || record.excerpt || '');
     if (previewText) {
       ui.detailContent.innerHTML = '<div class="md-rendered">' + renderMarkdown(previewText) + '</div>';
     } else {
@@ -207,12 +244,17 @@ pub(crate) const DASHBOARD_SERVER_SCRIPT: &str = r#"
       return;
     }
     ui.detailContent.textContent = 'Loading full content\u2026';
-    const endpoint = rec.id !== undefined ? '/api/chunk?id=' + rec.id : '/api/detail?id=' + rec.id;
-    apiFetch(endpoint)
+    if (rec.id === undefined || rec.id === null || rec.id === '') {
+      state.expanded = true;
+      if (ui.expand) ui.expand.textContent = 'Collapse';
+      ui.detailContent.innerHTML = '<div class="md-rendered">' + renderMarkdown(rec.excerpt || rec.preview || '') + '</div>';
+      return;
+    }
+    apiFetch('/api/detail?id=' + encodeURIComponent(rec.id))
       .then(function(r) { return r.json(); })
       .then(function(data) {
         if (!data.ok) { ui.detailContent.textContent = 'Failed: ' + (data.error || 'unknown'); return; }
-        const content = data.content || data.detail_text || '';
+        const content = stripAnsi(data.content || data.detail_text || '');
         state.expanded = true;
         if (ui.expand) ui.expand.textContent = 'Collapse';
         ui.detailContent.innerHTML = '<div class="md-rendered">' + renderMarkdown(content) + '</div>';
@@ -224,11 +266,19 @@ pub(crate) const DASHBOARD_SERVER_SCRIPT: &str = r#"
   };
 
   /* --- result list ------------------------------------------------------- */
+  const corpusQuiet = () => !state.query && !state.project && !state.agent && !state.kind && !state.since && state.scoreMin === 0;
+  const emptyReason = () => {
+    if (!corpusQuiet()) return 'No sessions match this search.';
+    const note = (state.assumptions || []).find(Boolean);
+    if (note) return note;
+    if (!state.indexLoaded) return 'No index on this machine. Search only sees what has been scanned.';
+    return 'No sessions in this corpus.';
+  };
   const mkBadge = (txt) => { const n = document.createElement('span'); n.className = 'badge'; n.innerHTML = highlightTerms(String(txt || ''), state.query); return n; };
   const renderList = (rows) => {
     ui.list.innerHTML = '';
     if (!rows.length) {
-      const e = document.createElement('div'); e.className = 'empty'; e.textContent = 'No records match current query/filters.';
+      const e = document.createElement('div'); e.className = 'empty'; e.textContent = emptyReason();
       ui.list.appendChild(e); renderDetail(null, 0); return;
     }
     const visible = rows.slice(0, state.limit);
@@ -248,15 +298,23 @@ pub(crate) const DASHBOARD_SERVER_SCRIPT: &str = r#"
       top.appendChild(mkBadge(record.date || ''));
       if (typeof score === 'number' && score > 0) top.appendChild(mkBadge(score + '/100'));
       const name = document.createElement('div'); name.className = 'result-name';
-      const fname = (record.file_name || record.file || '(unnamed)') + (record.size_human ? ' \u2022 ' + record.size_human : '');
+      const rawName = record.file_name || record.file || '';
+      const hideSize = record.kind === 'session' || /\.jsonl$/i.test(rawName);
+      const fname = readableName(record) + (!hideSize && record.size_human ? ' \u2022 ' + record.size_human : '');
       name.innerHTML = highlightTerms(fname, state.query);
       item.appendChild(top); item.appendChild(name);
-      const previewText = record.excerpt || record.preview || '';
+      const previewText = listPreview(record);
       if (previewText) {
         const preview = document.createElement('div'); preview.className = 'result-preview';
         const maxLen = 240; const truncated = previewText.length > maxLen ? previewText.slice(0, maxLen) + '\u2026' : previewText;
         preview.innerHTML = highlightTerms(truncated, state.query);
         item.appendChild(preview);
+      }
+      const whereText = record.relative_path || record.path || '';
+      if (whereText) {
+        const where = document.createElement('div'); where.className = 'result-where';
+        where.textContent = whereText;
+        item.appendChild(where);
       }
       item.addEventListener('click', function() {
         state.selectedId = rid; renderList(state.rows); renderDetail(record, score); runHooks('onSelect', record);
@@ -277,7 +335,10 @@ pub(crate) const DASHBOARD_SERVER_SCRIPT: &str = r#"
     else rows.sort(function(a, b) { return (b.record.sort_ts || 0) - (a.record.sort_ts || 0); });
     rows = runHooks('beforeRender', rows);
     state.rows = rows;
-    ui.summary.textContent = rows.length + ' file(s) | browse mode | total: ' + state.browseRecords.length;
+    const unit = state.unit === 'file' ? 'file' : 'session';
+    ui.summary.textContent = (!rows.length && corpusQuiet())
+      ? emptyReason()
+      : rows.length + ' ' + unit + (rows.length === 1 ? '' : 's');
     renderList(rows);
     runHooks('afterRender', rows);
   };
@@ -394,6 +455,10 @@ pub(crate) const DASHBOARD_SERVER_SCRIPT: &str = r#"
   }
 
   /* --- load browse data -------------------------------------------------- */
+  const showCorpusBusy = () => {
+    ui.summary.textContent = 'Still reading the corpus. Retrying\u2026';
+    if (ui.genInfo) ui.genInfo.textContent = 'Still reading the corpus';
+  };
   const loadBrowseData = () => {
     ui.summary.textContent = 'Loading\u2026';
     const params = new URLSearchParams();
@@ -403,26 +468,83 @@ pub(crate) const DASHBOARD_SERVER_SCRIPT: &str = r#"
     if (state.sort) params.set('sort', state.sort);
     if (state.since) params.set('since', state.since);
     const qs = params.toString();
-    apiFetch('/api/browse' + (qs ? '?' + qs : ''))
-      .then(function(r) { return r.json(); })
+    const controller = new AbortController();
+    const timer = setTimeout(function() { controller.abort(); }, 8000);
+    apiFetch('/api/browse' + (qs ? '?' + qs : ''), { signal: controller.signal })
+      .then(function(r) {
+        clearTimeout(timer);
+        if (r.status === 503) {
+          return r.json().then(function(data) {
+            const err = new Error((data && data.error) || 'still_reading');
+            err.status = 503;
+            err.stillReading = data && data.error === 'still_reading';
+            throw err;
+          });
+        }
+        if (!r.ok) {
+          const err = new Error('HTTP ' + r.status);
+          err.status = r.status;
+          throw err;
+        }
+        return r.json();
+      })
       .then(function(data) {
-        if (!data.ok) { ui.summary.textContent = 'Failed: ' + (data.error || 'unknown'); return; }
+        if (!data.ok) {
+          if (data.error === 'still_reading') {
+            showCorpusBusy();
+            setTimeout(loadBrowseData, 2500);
+            return;
+          }
+          ui.summary.textContent = 'Failed: ' + (data.error || 'unknown');
+          return;
+        }
+        state.browseRetries = 0;
         state.browseRecords = data.records || [];
         fillSelect(ui.project, data.projects || []);
         fillSelect(ui.agent, data.agents || []);
         fillSelect(ui.kind, data.kinds || []);
         const s = data.stats || {};
-        ui.statFiles.textContent = s.total_files || 0;
-        ui.statProjects.textContent = s.total_projects || 0;
-        ui.statDays.textContent = s.total_days || 0;
+        state.assumptions = data.assumptions || [];
+        state.indexLoaded = !!s.index_loaded;
+        state.corpusTotal = s.total_files || 0;
+        state.unit = s.search_backend === 'catalog-live-source' ? 'session' : 'file';
+        const quietEmpty = state.corpusTotal === 0 && !s.index_loaded && !s.state_loaded;
+        ui.statFiles.textContent = quietEmpty ? '\u2014' : String(s.total_files || 0);
+        ui.statProjects.textContent = quietEmpty ? '\u2014' : String(s.total_projects || 0);
+        ui.statDays.textContent = quietEmpty ? '\u2014' : String(s.total_days || 0);
+        const unitLabel = document.getElementById('ctx-stat-unit');
+        if (unitLabel) unitLabel.textContent = (state.unit === 'session' || quietEmpty) ? 'sessions' : 'files';
+        const cardSessions = document.getElementById('ctx-card-sessions');
+        if (cardSessions) cardSessions.textContent = ui.statFiles.textContent;
+        const cardProjects = document.getElementById('ctx-card-projects');
+        if (cardProjects) cardProjects.textContent = ui.statProjects.textContent;
+        const indexState = document.getElementById('ctx-index-state');
+        if (indexState) indexState.textContent = s.index_loaded ? 'ready' : (quietEmpty ? 'not loaded' : 'partial');
+        const scope = document.getElementById('ctx-scope');
+        if (scope) {
+          const projects = data.projects || [];
+          scope.textContent = projects.length === 1 ? projects[0] : (projects.length ? (projects.length + ' projects') : 'This machine');
+        }
         ui.genInfo.textContent = 'Generated ' + (data.generated_at || '?');
         ui.assumptions.innerHTML = '';
         (data.assumptions || []).forEach(function(a) { const li = document.createElement('li'); li.textContent = a; ui.assumptions.appendChild(li); });
         applyBrowseFilters();
       })
       .catch(function(err) {
+        clearTimeout(timer);
         if (err && err.status === 401) return;
-        ui.summary.textContent = 'Load failed: ' + err.message;
+        const busy = (err && err.stillReading)
+          || (err && err.name === 'AbortError')
+          || (err && !err.status && /fetch|abort/i.test(String(err.message || '')));
+        if (busy) {
+          state.browseRetries = (state.browseRetries || 0) + 1;
+          showCorpusBusy();
+          if (state.browseRetries < 8) {
+            setTimeout(loadBrowseData, 2500);
+            return;
+          }
+        }
+        ui.summary.textContent = 'Load failed: ' + ((err && err.message) || 'unknown');
       });
   };
 
@@ -438,9 +560,75 @@ pub(crate) const DASHBOARD_SERVER_SCRIPT: &str = r#"
     } catch (_) {}
   };
 
+  const studio = () => {
+    const onboard = $('ctx-onboarding');
+    const survey = $('ctx-onboarding-phrases');
+    const surveySave = $('ctx-onboarding-save');
+    const surveyStatus = $('ctx-onboarding-status');
+    if (surveySave && survey) surveySave.addEventListener('click', () => {
+      const phrases = survey.value.split(/\n/).map((line) => line.trim()).filter(Boolean);
+      apiFetch('/api/onboarding', {
+        method: 'POST',
+        body: JSON.stringify({ phrases: phrases }),
+        headers: { 'content-type': 'application/json', 'x-ai-contexters-action': 'regenerate' }
+      })
+        .then((r) => r.json())
+        .then((body) => {
+          if (!surveyStatus) return;
+          if (!body.ok) {
+            surveyStatus.textContent = body.detail || 'Not saved.';
+            return;
+          }
+          const service = body.service ? ' Background service: ' + body.service + '.' : '';
+          surveyStatus.textContent = 'Saved on this machine.' + service;
+          if (onboard) onboard.open = false;
+        })
+        .catch(() => { if (surveyStatus) surveyStatus.textContent = 'Not saved.'; });
+    });
+    const phrases = $('ctx-phrases');
+    const phraseStatus = $('ctx-phrases-status');
+    const phraseSave = $('ctx-phrases-save');
+    if (phrases) {
+      apiFetch('/api/phrases').then((r) => r.text()).then((text) => { phrases.value = text; }).catch(() => {});
+    }
+    if (phraseSave && phrases) phraseSave.addEventListener('click', () => {
+      apiFetch('/api/phrases', { method: 'PUT', body: phrases.value, headers: { 'content-type': 'text/plain', 'x-ai-contexters-action': 'regenerate' } })
+        .then((r) => r.json())
+        .then((body) => { if (phraseStatus) phraseStatus.textContent = body.ok ? 'Saved.' : (body.detail || 'Not saved.'); })
+        .catch(() => { if (phraseStatus) phraseStatus.textContent = 'Not saved.'; });
+    });
+    const indexBtn = $('ctx-index');
+    const indexStatus = $('ctx-index-status');
+    if (indexBtn) indexBtn.addEventListener('click', () => {
+      indexBtn.disabled = true;
+      if (indexStatus) indexStatus.textContent = 'Indexing…';
+      apiFetch('/api/index', { method: 'POST', headers: { 'x-ai-contexters-action': 'regenerate' } })
+        .then((r) => { if (indexStatus) indexStatus.textContent = r.status === 202 ? 'Index started.' : 'Index was refused.'; })
+        .catch(() => { if (indexStatus) indexStatus.textContent = 'Index was refused.'; })
+        .finally(() => { indexBtn.disabled = false; });
+    });
+  };
+
+  const navSessions = $('ctx-nav-sessions');
+  const navSetup = $('ctx-nav-setup');
+  const markNav = (active) => {
+    document.querySelectorAll('.rail-nav-item').forEach(function(btn) { btn.classList.toggle('active', btn === active); });
+  };
+  if (navSessions) navSessions.addEventListener('click', function() {
+    markNav(navSessions);
+    if (ui.list) ui.list.scrollTop = 0;
+    if (ui.search) ui.search.focus();
+  });
+  if (navSetup) navSetup.addEventListener('click', function() {
+    markNav(navSetup);
+    const onboard = $('ctx-onboarding');
+    if (onboard) onboard.open = true;
+  });
+
   const boot = () => {
     readUrlState();
     consumeQueryToken();
+    studio();
     const headers = {};
     const t = getToken();
     if (t) headers['Authorization'] = 'Bearer ' + t;
@@ -449,8 +637,20 @@ pub(crate) const DASHBOARD_SERVER_SCRIPT: &str = r#"
       .then(function(r) {
         if (r.status === 401) {
           showLogin();
-          return;
+          return null;
         }
+        return r.json();
+      })
+      .then(function(data) {
+        if (!data) return;
+        const host = location.hostname;
+        if (host === '127.0.0.1' || host === 'localhost' || host === '::1') {
+          const access = document.getElementById('ctx-access');
+          if (access) access.textContent = 'This machine. No sign-in.';
+        }
+        const onboard = $('ctx-onboarding');
+        if (onboard && data.survey_required) onboard.open = true;
+        if (data.rebuilding) showCorpusBusy();
         loadBrowseData();
       })
       .catch(function() { loadBrowseData(); });

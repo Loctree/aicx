@@ -45,6 +45,22 @@ pub(crate) const SIGNAL_FILTER_VERSION: &str = "signal-v6-scope-fails-closed";
 const PARSE_STATE_SCHEMA: &str = "aicx.source_parse_state.v1";
 const PARSE_STATE_RELPATH: &str = "indexed/_all/source_parse_state.v1.json";
 
+/// Coverage of a cached conversation, not a promise about the original source.
+/// A settled bounded projection retains its limitation explicitly; transient
+/// partial reads and time-dependent timestamp inference are never cacheable.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) enum ConversationCoverage {
+    CompleteVisible,
+    BoundedProjection { skipped_records: usize },
+    Uncacheable,
+}
+
+impl ConversationCoverage {
+    pub(crate) fn cacheable(&self) -> bool {
+        !matches!(self, Self::Uncacheable)
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SourceIndexReport {
     pub catalog_path: String,
@@ -1113,6 +1129,14 @@ fn parse_catalog_source(
     path: &Path,
     allow: &crate::source_path::SourceAllowlist,
 ) -> Result<ParsedCatalogSource> {
+    Ok(parse_catalog_source_checked(entry, path, allow)?.0)
+}
+
+fn parse_catalog_source_checked(
+    entry: &CatalogEntry,
+    path: &Path,
+    allow: &crate::source_path::SourceAllowlist,
+) -> Result<(ParsedCatalogSource, ConversationCoverage)> {
     // Canonicalize + prove containment under approved source roots before any open.
     let path = allow
         .resolve_file(path)
@@ -1132,48 +1156,54 @@ fn parse_catalog_source(
         // `{"type":"thought","data":"The"}` spam over real operator answers.
         let message = vibecrafted_signal_body(&body);
         if message.trim().is_empty() {
-            return Ok(ParsedCatalogSource {
-                frames: Vec::new(),
-                distill: None,
-                recorded_workdirs: Vec::new(),
-            });
+            return Ok((
+                ParsedCatalogSource {
+                    frames: Vec::new(),
+                    distill: None,
+                    recorded_workdirs: Vec::new(),
+                },
+                ConversationCoverage::CompleteVisible,
+            ));
         }
-        let timestamp = fs::metadata(&path)
+        let modified = fs::metadata(&path)
             .ok()
-            .and_then(|metadata| metadata.modified().ok())
-            .map(chrono::DateTime::<chrono::Utc>::from)
-            .unwrap_or_else(chrono::Utc::now);
-        return Ok(ParsedCatalogSource {
-            distill: None,
-            recorded_workdirs: entry.cwd.iter().cloned().collect(),
-            frames: vec![TimelineEntry {
-                timestamp,
-                agent: entry.agent.clone(),
-                session_id: entry.session_id.clone(),
-                role: "assistant".to_string(),
-                message,
-                frame_class: None,
-                lineage_origin: None,
-                frame_kind: Some(FrameKind::AgentReply),
-                branch: None,
-                cwd: entry.cwd.clone(),
-                scope_conflict: false,
-                scope_unattributed: false,
-                scope_workdirs: Vec::new(),
-                session_kind: session_kind.clone(),
-                timestamp_source: Some("source_mtime".to_string()),
-                source_path: Some(entry.source_path.clone()),
-                source_sha256: None,
-                source_line_span: None,
-            }],
-        });
+            .and_then(|metadata| metadata.modified().ok());
+        let (timestamp, timestamp_source, coverage) =
+            vibecrafted_timestamp(modified, chrono::Utc::now());
+        return Ok((
+            ParsedCatalogSource {
+                distill: None,
+                recorded_workdirs: entry.cwd.iter().cloned().collect(),
+                frames: vec![TimelineEntry {
+                    timestamp,
+                    agent: entry.agent.clone(),
+                    session_id: entry.session_id.clone(),
+                    role: "assistant".to_string(),
+                    message,
+                    frame_class: None,
+                    lineage_origin: None,
+                    frame_kind: Some(FrameKind::AgentReply),
+                    branch: None,
+                    cwd: entry.cwd.clone(),
+                    scope_conflict: false,
+                    scope_unattributed: false,
+                    scope_workdirs: Vec::new(),
+                    session_kind: session_kind.clone(),
+                    timestamp_source: Some(timestamp_source.to_owned()),
+                    source_path: Some(entry.source_path.clone()),
+                    source_sha256: None,
+                    source_line_span: None,
+                }],
+            },
+            coverage,
+        ));
     }
 
     let source_bytes = fs::metadata(&path)
         .with_context(|| format!("stat source {}", path.display()))?
         .len();
     if entry.agent == "codex" && source_bytes > MAX_FULL_PARSE_BYTES {
-        return parse_large_codex_signal(entry, &path, allow, session_kind.as_deref());
+        return parse_large_codex_signal_checked(entry, &path, allow, session_kind.as_deref());
     }
     if source_bytes > MAX_FULL_PARSE_BYTES {
         anyhow::bail!(
@@ -1199,6 +1229,7 @@ fn parse_catalog_source(
         entry.logical_session_id.clone(),
         &path,
     )?;
+    let coverage = model_conversation_coverage(parsed.model());
     let distillates = crate::extraction::distill::materialize::session_distillates(parsed.model());
     let distill = Some(crate::extraction::distill::materialize::index_metadata(
         &distillates,
@@ -1207,11 +1238,58 @@ fn parse_catalog_source(
     for frame in &mut frames {
         frame.session_kind = session_kind.clone();
     }
-    Ok(ParsedCatalogSource {
-        frames,
-        distill,
-        recorded_workdirs: model_recorded_workdirs(parsed.model()),
-    })
+    Ok((
+        ParsedCatalogSource {
+            frames,
+            distill,
+            recorded_workdirs: model_recorded_workdirs(parsed.model()),
+        },
+        coverage,
+    ))
+}
+
+fn model_conversation_coverage(model: &aicx_parser::engine::SessionModel) -> ConversationCoverage {
+    let status = &model.coverage.status;
+    let complete = status.visible_completeness
+        == aicx_parser::engine::VisibleCompleteness::CompleteVisible
+        && !status.malformed_tail_present
+        && !status.visible_event_lost;
+    // Grok reserves Unknown start provenance for invalid non-empty created_at
+    // that selected its wall-clock fallback. Other adapters (notably stable
+    // Gemini Antigravity) may legitimately have no session-level start while
+    // carrying deterministic timestamps on every turn.
+    let time_dependent = model.provenance.agent == aicx_parser::engine::AgentKind::Grok
+        && matches!(
+            model.provenance.started_at,
+            aicx_parser::engine::Known::Unknown(_)
+        );
+    if complete && !time_dependent {
+        ConversationCoverage::CompleteVisible
+    } else {
+        ConversationCoverage::Uncacheable
+    }
+}
+
+fn vibecrafted_timestamp(
+    modified: Option<std::time::SystemTime>,
+    wall_clock: chrono::DateTime<chrono::Utc>,
+) -> (
+    chrono::DateTime<chrono::Utc>,
+    &'static str,
+    ConversationCoverage,
+) {
+    match modified {
+        Some(modified) => (
+            chrono::DateTime::<chrono::Utc>::from(modified),
+            "source_mtime",
+            ConversationCoverage::CompleteVisible,
+        ),
+        None => (
+            wall_clock,
+            "wall_clock_fallback",
+            ConversationCoverage::Uncacheable,
+        ),
+    }
 }
 
 /// Read one cataloged session through the same allowlisted, signal-only parser
@@ -1259,6 +1337,22 @@ pub(crate) fn read_catalog_conversation_at(
     Vec<TimelineEntry>,
     crate::extraction::conversation::ScopeReport,
 )> {
+    let (path, frames, scope, _) = read_catalog_conversation_checked_at(aicx_home, entry)?;
+    Ok((path, frames, scope))
+}
+
+/// Same reader as the public conversation path, with parser coverage retained
+/// for callers that persist derived claims. Partial visible reads remain usable
+/// for this request, but must not become a trusted warm cache.
+pub(crate) fn read_catalog_conversation_checked_at(
+    aicx_home: &Path,
+    entry: &CatalogEntry,
+) -> Result<(
+    PathBuf,
+    Vec<TimelineEntry>,
+    crate::extraction::conversation::ScopeReport,
+    ConversationCoverage,
+)> {
     let user_home = crate::os_user_home().unwrap_or_else(|| aicx_home.to_path_buf());
     let source_allow = crate::source_path::SourceAllowlist::for_operator(&user_home, aicx_home);
     let source_path = source_allow
@@ -1269,10 +1363,11 @@ pub(crate) fn read_catalog_conversation_at(
                 entry.agent, entry.session_id
             )
         })?;
-    let frames = parse_catalog_source(entry, &source_path, &source_allow)?.frames;
+    let (parsed_source, coverage) =
+        parse_catalog_source_checked(entry, &source_path, &source_allow)?;
     let ignore = crate::legacy_archive::load_repo_path_ignore(aicx_home, &user_home)?;
-    let SignalSession { frames, scope, .. } = signal_session(frames, &ignore);
-    Ok((source_path, frames, scope))
+    let SignalSession { frames, scope, .. } = signal_session(parsed_source.frames, &ignore);
+    Ok((source_path, frames, scope, coverage))
 }
 
 /// A parsed session reduced to its signal frames, with the scope of every
@@ -1412,19 +1507,41 @@ fn visible_head_timestamp(line: &str) -> chrono::DateTime<chrono::Utc> {
 /// them and deserializes only bounded message records. The one other frame it
 /// keeps is a single, empty tool-call frame for a turn window that ran calls
 /// and holds no message: the carrier of that window's verdict.
+#[cfg(test)]
 fn parse_large_codex_signal(
     entry: &CatalogEntry,
     path: &Path,
     allow: &crate::source_path::SourceAllowlist,
     session_kind: Option<&str>,
 ) -> Result<ParsedCatalogSource> {
+    Ok(parse_large_codex_signal_checked(entry, path, allow, session_kind)?.0)
+}
+
+fn parse_large_codex_signal_checked(
+    entry: &CatalogEntry,
+    path: &Path,
+    allow: &crate::source_path::SourceAllowlist,
+    session_kind: Option<&str>,
+) -> Result<(ParsedCatalogSource, ConversationCoverage)> {
     // `path` is already resolve_file'd by the caller; open through the allowlist.
-    let file = allow
+    let mut file = allow
         .open_file(path)
         .with_context(|| format!("open source {}", path.display()))?;
+    // read_line_capped drains oversized records without exposing whether the
+    // drained tail was terminated. Check EOF on this same descriptor first.
+    use std::io::{Read, Seek, SeekFrom};
+    let mut stable = true;
+    if file.metadata()?.len() > 0 {
+        file.seek(SeekFrom::End(-1))?;
+        let mut last = [0u8];
+        file.read_exact(&mut last)?;
+        stable = last[0] == b'\n';
+        file.seek(SeekFrom::Start(0))?;
+    }
     let mut reader = BufReader::new(file);
     let mut frames = Vec::new();
     let mut line_no = 0u64;
+    let mut skipped_records = 0usize;
     // Turn-window effective scope: message frames buffer per window between
     // `turn_context` records; explicit tool-call workdirs collected inside the
     // window can re-scope the whole window (never per-frame flip-flop).
@@ -1482,12 +1599,12 @@ fn parse_large_codex_signal(
             .and_then(serde_json::Value::as_str)
             .and_then(|raw| chrono::DateTime::parse_from_rfc3339(raw).ok())
             .map(|timestamp| timestamp.with_timezone(&chrono::Utc))
-            .unwrap_or_else(chrono::Utc::now)
     };
     while let Some(record) = crate::sanitize::read_line_capped(&mut reader, MAX_JSONL_RECORD_BYTES)?
     {
         line_no += 1;
         if record.exceeded {
+            skipped_records += 1;
             // An over-cap record is drained, never parsed. When its visible
             // head says it was a tool-call envelope, the window MIGHT have
             // moved repos and this reader will never know: record unreadable
@@ -1502,6 +1619,7 @@ fn parse_large_codex_signal(
             continue;
         }
         let Ok(value) = serde_json::from_str::<serde_json::Value>(&record.line) else {
+            stable = false;
             // A malformed record never becomes a value either, so its workdir
             // is just as invisible: the full adapter treats both alike.
             if note_opaque_record(&mut window_workdirs, &record.line) {
@@ -1556,7 +1674,16 @@ fn parse_large_codex_signal(
                     window_workdirs.push(workdir);
                 }
             }
-            window_call.get_or_insert_with(|| (record_timestamp(&value), line_no));
+            // A carrier's wall-clock fallback does not make the projection
+            // time-dependent: the signal projection drops tool-call frames
+            // before anything is served or cached, and the scope report their
+            // verdict feeds is built from sets and counts, not order.
+            window_call.get_or_insert_with(|| {
+                (
+                    record_timestamp(&value).unwrap_or_else(chrono::Utc::now),
+                    line_no,
+                )
+            });
             continue;
         }
         // Only `response_item.message` carries chat text in this reader; the
@@ -1590,11 +1717,15 @@ fn parse_large_codex_signal(
         if message.trim().is_empty() {
             continue;
         }
+        let timestamp = record_timestamp(&value).unwrap_or_else(|| {
+            stable = false;
+            chrono::Utc::now()
+        });
         window_frames.push(frame(
             role,
             frame_kind,
             message,
-            record_timestamp(&value),
+            timestamp,
             line_no,
             baseline_cwd.clone(),
         ));
@@ -1610,11 +1741,18 @@ fn parse_large_codex_signal(
         &mut frames,
         &mut recorded_workdirs,
     );
-    Ok(ParsedCatalogSource {
-        frames,
-        distill: None,
-        recorded_workdirs: recorded_workdirs.into_iter().collect(),
-    })
+    Ok((
+        ParsedCatalogSource {
+            frames,
+            distill: None,
+            recorded_workdirs: recorded_workdirs.into_iter().collect(),
+        },
+        if stable {
+            ConversationCoverage::BoundedProjection { skipped_records }
+        } else {
+            ConversationCoverage::Uncacheable
+        },
+    ))
 }
 
 /// Stamp a buffered turn window with its effective scope and drain it into the
@@ -2168,6 +2306,114 @@ fn write_if_changed(aicx_home: &Path, path: &Path, bytes: &[u8]) -> Result<bool>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vibecrafted_wall_clock_fallback_is_labeled_and_uncacheable() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-09-03T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let (fallback, source, coverage) = vibecrafted_timestamp(None, now);
+        assert_eq!(fallback, now);
+        assert_eq!(source, "wall_clock_fallback");
+        assert_eq!(coverage, ConversationCoverage::Uncacheable);
+
+        let modified = std::time::UNIX_EPOCH + std::time::Duration::from_secs(123);
+        let (timestamp, source, coverage) = vibecrafted_timestamp(Some(modified), now);
+        assert_eq!(timestamp.timestamp(), 123);
+        assert_eq!(source, "source_mtime");
+        assert_eq!(coverage, ConversationCoverage::CompleteVisible);
+    }
+
+    #[test]
+    fn gemini_antigravity_unknown_session_start_remains_cacheable() {
+        use aicx_parser::engine::{
+            ParserEngine, SourceArtifact, SourceFraming, SourceHandle, ValidatedParse,
+        };
+        let parse = || {
+            let artifact = SourceArtifact::memory(
+                "gemini_antigravity_conversation.json",
+                include_bytes!("../tests/fixtures/frame_kind/gemini_antigravity_conversation.json")
+                    .to_vec(),
+                SourceFraming::WholeDocument,
+            )
+            .unwrap();
+            let handle = SourceHandle::new(
+                aicx_parser::engine::AgentKind::Gemini,
+                "antigravity-cache",
+                Some("antigravity-cache".to_owned()),
+                vec![artifact],
+            )
+            .unwrap();
+            match ParserEngine::default().parse_registered(&handle).unwrap() {
+                ValidatedParse::Session(session) => session.into_model(),
+                ValidatedParse::Fatal(_) => panic!("Antigravity fixture must parse"),
+            }
+        };
+        let first = parse();
+        assert!(matches!(
+            first.provenance.started_at,
+            aicx_parser::engine::Known::Unknown(_)
+        ));
+        assert_eq!(
+            model_conversation_coverage(&first),
+            ConversationCoverage::CompleteVisible
+        );
+        let second = parse();
+        assert_eq!(
+            serde_json::to_value(crate::output::timeline_entries_from_model(&first)).unwrap(),
+            serde_json::to_value(crate::output::timeline_entries_from_model(&second)).unwrap()
+        );
+    }
+
+    #[test]
+    fn grok_wall_clock_timestamp_fallback_is_not_cacheable_until_repaired() {
+        use aicx_parser::engine::{
+            ParserEngine, SourceArtifact, SourceFraming, SourceHandle, ValidatedParse,
+        };
+        let parse = || {
+            let chat = SourceArtifact::memory(
+                "chat_history.jsonl",
+                b"{\"type\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"DECISION: keep Grok evidence\"}]}\n".to_vec(),
+                SourceFraming::JsonLines,
+            )
+            .unwrap();
+            let handle = SourceHandle::new(
+                aicx_parser::engine::AgentKind::Grok,
+                "grok-cache",
+                Some("grok-cache".to_owned()),
+                vec![chat],
+            )
+            .unwrap();
+            match ParserEngine::default().parse_registered(&handle).unwrap() {
+                ValidatedParse::Session(session) => session.into_model(),
+                ValidatedParse::Fatal(_) => panic!("Grok fixture must emit a current result"),
+            }
+        };
+
+        // Adapter provenance uses Unknown when invalid non-empty created_at
+        // selected a wall-clock base (covered at the adapter boundary). This
+        // canonical state must remain visible but never trusted as cache input.
+        let mut inferred = parse();
+        inferred.provenance.started_at = aicx_parser::engine::Known::unknown();
+        assert!(!crate::output::timeline_entries_from_model(&inferred).is_empty());
+        assert_eq!(
+            model_conversation_coverage(&inferred),
+            ConversationCoverage::Uncacheable
+        );
+
+        let repaired = parse();
+        assert_eq!(
+            model_conversation_coverage(&repaired),
+            ConversationCoverage::CompleteVisible
+        );
+        let repaired_again = parse();
+        assert_eq!(
+            serde_json::to_value(crate::output::timeline_entries_from_model(&repaired)).unwrap(),
+            serde_json::to_value(crate::output::timeline_entries_from_model(&repaired_again))
+                .unwrap(),
+            "repaired timestamp must yield a stable warm-cache input"
+        );
+    }
 
     #[test]
     fn persistent_project_slice_cannot_replace_the_global_generation() {
@@ -3505,11 +3751,19 @@ mod tests {
             let entry = bounded_entry(&source_path);
             let allow = crate::source_path::SourceAllowlist::for_operator(&root, &root);
             let resolved = allow.resolve_file(&source_path).expect("resolve rollout");
-            let frames = parse_large_codex_signal(&entry, &resolved, &allow, None)
-                .expect("bounded parse")
-                .frames;
+            let (parsed, coverage) =
+                parse_large_codex_signal_checked(&entry, &resolved, &allow, None)
+                    .expect("bounded parse");
             let _ = fs::remove_dir_all(&root);
-            frames
+            // Failing a window closed is a verdict about attribution, not
+            // about the projection's stability: the drained record is counted
+            // and the feed stays cacheable.
+            assert_eq!(
+                coverage,
+                ConversationCoverage::BoundedProjection { skipped_records: 1 },
+                "{label}"
+            );
+            parsed.frames
         };
 
         let call_frames = oversized_window(
@@ -3556,7 +3810,9 @@ mod tests {
 
         // Pathological writer: nothing identifiable survives the cap. The
         // record could have been a tool call, so the window cannot claim the
-        // baseline it did not verify.
+        // baseline it did not verify. Not even its timestamp survives, so the
+        // carrier frame falls back to the wall clock — which still leaves the
+        // projection cacheable, because carrier frames are never served.
         let opaque_frames = oversized_window(
             "oversized-opaque",
             format!(r#"{{"payload":{{"arguments":"{filler}"}}}}"#),

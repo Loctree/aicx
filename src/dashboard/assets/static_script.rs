@@ -270,7 +270,7 @@ pub(crate) const DASHBOARD_SCRIPT: &str = r#"
     if (!rows.length) {
       const empty = document.createElement('div');
       empty.className = 'empty';
-      empty.textContent = 'No records match current query/filters.';
+      empty.textContent = state.query ? 'No sessions match this search.' : 'No sessions in this corpus.';
       ui.list.appendChild(empty);
       renderDetail(null, 0);
       return;

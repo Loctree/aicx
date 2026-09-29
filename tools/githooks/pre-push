@@ -20,13 +20,56 @@ while read -r _lref lsha _rref rsha; do
   [ -z "$lsha" ] && continue
   case "$lsha" in *[!0]*) : ;; *) continue ;; esac  # ref deletion: nothing to test
   HAVE_RANGE=1
-  if printf '%s' "$rsha" | grep -qE '^0+$' || ! git cat-file -e "$rsha" 2>/dev/null; then
-    base=$(git merge-base "$lsha" origin/develop 2>/dev/null || true)
-    if [ -n "$base" ]; then
-      files=$(git diff --name-only "$base" "$lsha")
+  if ! printf '%s' "$rsha" | grep -qE '^0+$' && ! git cat-file -e "$rsha" 2>/dev/null; then
+    # Nonzero remote tip that is not in this object database. Diffing
+    # against the default branch would hide edits that exist only
+    # against that missing tip.
+    RUST_TOUCHED=1
+    continue
+  fi
+  if printf '%s' "$rsha" | grep -qE '^0+$'; then
+    # Compare against the repository's actual default branch. Hardcoding
+    # origin/develop made every first push of a new branch fall back to a
+    # branch this repo abandoned on 2026-07-15: the merge-base landed hundreds
+    # of commits back and a docs-only push ran the full cargo suite.
+    #
+    # The objects a first push uploads are the ones the destination does not
+    # already have. origin keeps its develop→main fallback: origin/HEAD is a
+    # local symref that fetch does not move once created. Any other remote
+    # uses that remote's HEAD. No usable baseline fails closed — a docs-only
+    # child of origin/main still uploads this repo's Rust history to an empty
+    # remote, and looking only at the tip hides earlier Rust commits.
+    if [ "$remote" = "origin" ]; then
+      default_ref=$(git symbolic-ref --quiet refs/remotes/origin/HEAD 2>/dev/null || true)
+      case "$default_ref" in
+        ""|refs/remotes/origin/develop|origin/develop) default_ref=origin/main ;;
+      esac
     else
-      files=$(git show --name-only --format= "$lsha")
+      default_ref=$(git symbolic-ref --quiet "refs/remotes/${remote}/HEAD" 2>/dev/null || true)
+      # fetch does not always create refs/remotes/<remote>/HEAD. Ask the
+      # remote which branch HEAD is, and fail closed if that cannot be
+      # resolved. Do not guess main.
+      if [ -z "$default_ref" ]; then
+        sym=$(git ls-remote --symref "$url" HEAD 2>/dev/null | awk '/^ref:/ { print $2; exit }')
+        case "$sym" in
+          refs/heads/*) default_ref="refs/remotes/${remote}/${sym#refs/heads/}" ;;
+        esac
+      fi
+      if [ -z "$default_ref" ]; then
+        RUST_TOUCHED=1
+        continue
+      fi
     fi
+    if ! git rev-parse --verify -q "${default_ref}^{commit}" >/dev/null 2>&1; then
+      RUST_TOUCHED=1
+      continue
+    fi
+    base=$(git merge-base "$lsha" "$default_ref" 2>/dev/null || true)
+    if [ -z "$base" ]; then
+      RUST_TOUCHED=1
+      continue
+    fi
+    files=$(git diff --name-only "$base" "$lsha")
   else
     files=$(git diff --name-only "$rsha" "$lsha")
   fi

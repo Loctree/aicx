@@ -5,7 +5,7 @@ mod uuid_shape;
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use session_catalog::{AgentKind, CatalogError, MAX_HEADER_BYTES, MatchKind, SessionCatalog};
 
@@ -443,6 +443,102 @@ fn cursor_transcript_identity_lives_on_filename_under_agent_transcripts() {
         catalog.resolve(UUID_B),
         Err(CatalogError::Missing { .. })
     ));
+}
+
+#[test]
+fn cursor_exact_id_across_projects_keeps_newest_copy_and_distinct_prefix_stays_ambiguous() {
+    let root = TestRoot::new("cursor-project-copies");
+    let transcript = r#"{"role":"user","message":{"content":[{"type":"text","text":"hej"}]}}
+{"role":"assistant","message":{"content":[{"type":"text","text":"ack"}]}}
+{"type":"turn_ended","status":"success"}
+"#;
+    // Newer copy sorts after the stale one, so a path-order pick fails this test.
+    let older = root.write(
+        format!("aaa-stale-project/agent-transcripts/{UUID_A}/{UUID_A}.jsonl"),
+        transcript,
+    );
+    let newer = root.write(
+        format!("zzz-live-project/agent-transcripts/{UUID_A}/{UUID_A}.jsonl"),
+        transcript,
+    );
+    set_mtime(&older, 1_700_000_000);
+    set_mtime(&newer, 1_800_000_000);
+    root.write(
+        format!("mmm-other-project/agent-transcripts/{UUID_B}/{UUID_B}.jsonl"),
+        transcript,
+    );
+
+    let catalog = SessionCatalog::new(AgentKind::Cursor, root.path()).unwrap();
+    let lookup = catalog.resolve_with_stats(UUID_A);
+    let resolved = lookup
+        .result
+        .expect("exact full id across cursor project copies must not be Ambiguous");
+    assert_eq!(resolved.matched_by, MatchKind::ExactSourceId);
+    assert_eq!(resolved.source.source_id, UUID_A);
+    assert!(
+        resolved.source.path.ends_with(format!(
+            "zzz-live-project/agent-transcripts/{UUID_A}/{UUID_A}.jsonl"
+        )),
+        "expected newest project copy, got {}",
+        resolved.source.path.display()
+    );
+    let notice = resolved
+        .substitution_notice
+        .expect("project-copy choice must be named");
+    assert!(
+        notice.contains("newest of 2 cursor project copies"),
+        "notice must name how many project copies existed"
+    );
+    let kept = notice.split("→ ").nth(1).map(str::trim).map(Path::new);
+    assert!(
+        kept.is_some_and(|path| notice_names_kept_copy(path, "zzz-live-project", UUID_A)),
+        "notice must name the kept project copy"
+    );
+    assert_eq!(lookup.stats.files_opened, 1, "only the kept copy is opened");
+
+    let ambiguous = catalog.resolve("019f0000").unwrap_err();
+    let CatalogError::Ambiguous { candidates, .. } = ambiguous else {
+        panic!("shared prefix of two different session ids must stay Ambiguous, got {ambiguous:?}");
+    };
+    let mut ids = candidates
+        .iter()
+        .map(|candidate| candidate.source_id.as_str())
+        .collect::<Vec<_>>();
+    ids.sort();
+    ids.dedup();
+    assert_eq!(ids, vec![UUID_A, UUID_B]);
+}
+
+fn notice_names_kept_copy(path: &Path, project: &str, session_id: &str) -> bool {
+    let mut parts = path
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(part) => Some(part.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let Some(file) = parts.pop() else {
+        return false;
+    };
+    let Some(directory) = parts.pop() else {
+        return false;
+    };
+    let Some(bucket) = parts.pop() else {
+        return false;
+    };
+    let Some(kept_project) = parts.pop() else {
+        return false;
+    };
+    file == format!("{session_id}.jsonl")
+        && directory == session_id
+        && bucket == "agent-transcripts"
+        && kept_project == project
+}
+
+fn set_mtime(path: &Path, unix_secs: u64) {
+    let file = fs::OpenOptions::new().write(true).open(path).unwrap();
+    file.set_modified(UNIX_EPOCH + Duration::from_secs(unix_secs))
+        .unwrap();
 }
 
 #[test]

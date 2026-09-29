@@ -272,29 +272,67 @@ pub fn build_dashboard_from_payload(
     })
 }
 
+/// Loctree node-tree mark from `loctree-com/public/assets/loctree-logo.svg`,
+/// inked with `currentColor` so the shell paints it bone on ink.
+pub(crate) const AICX_MARK_SVG: &str = r#"<svg id="aicx-mark" class="brand-mark" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 360 360" width="32" height="32" role="img" aria-label="Loctree" focusable="false"><g fill="currentColor"><circle cx="75" cy="50" r="16"/><circle cx="180" cy="50" r="16"/><circle cx="285" cy="50" r="16"/><circle cx="140" cy="120" r="16"/><circle cx="75" cy="190" r="16"/><circle cx="180" cy="190" r="16"/><circle cx="285" cy="190" r="16"/><circle cx="205" cy="310" r="16"/></g><line x1="210" y1="225" x2="210" y2="270" stroke="currentColor" stroke-width="10" stroke-linecap="round"/></svg>"#;
+
 /// Render a lightweight HTML shell for server mode.
 ///
 /// No data is embedded — the JavaScript fetches everything through API endpoints.
 /// PWA-ready: includes manifest link and service worker registration.
 pub fn render_server_shell_html(title: &str) -> String {
+    render_server_shell_html_for(title, false, true)
+}
+
+/// `local_open` is a loopback bind with authentication disabled.
+///
+/// That page states the local case. Sign in is offered only when the socket
+/// is not loopback or authentication is actually required.
+///
+/// `show_survey` is true only while setup is unfinished (missing phrases,
+/// unset embedder, or service off-contract). A configured home gets the
+/// corpus rail without the Start-here wizard markup.
+pub fn render_server_shell_html_for(title: &str, local_open: bool, show_survey: bool) -> String {
+    let access_line = if local_open {
+        r#"<p class="meta" id="ctx-access">This machine. No sign-in.</p>"#
+    } else {
+        r#"<p class="meta" id="ctx-access">Search. <a href="/auth">Sign in</a></p>"#
+    };
+    let onboarding_card = if show_survey {
+        let onboarding_first = if local_open {
+            "This dashboard is on this machine. No sign-in."
+        } else {
+            "Sign in. This dashboard is not on your own loopback, or it asks for a token."
+        };
+        format!(
+            r#"          <details class="studio-card" id="ctx-onboarding" open>
+            <summary>Start here</summary>
+            <p class="meta">{onboarding_first} Type the phrases you actually use, one per line. Save stores them on this machine. If the background service is missing, Save installs it.</p>
+            <label class="meta" for="ctx-onboarding-phrases">Phrases you type, one per line</label>
+            <textarea id="ctx-onboarding-phrases" rows="4" spellcheck="false" placeholder="I want this&#10;do not ship that"></textarea>
+            <button id="ctx-onboarding-save" type="button">Save</button>
+            <p id="ctx-onboarding-status" class="meta"></p>
+          </details>
+"#
+        )
+    } else {
+        String::new()
+    };
     format!(
         r##"<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <meta name="theme-color" content="#0a0f19" />
+  <meta name="theme-color" content="#0e0e0e" />
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; base-uri 'none'; frame-ancestors 'none'; form-action 'none';">
   <link rel="manifest" href="/manifest.webmanifest" />
   <title>{}</title>
   <style>{}
-.regen-btn {{ background: var(--panel); border: 1px solid var(--line); color: var(--accent); border-radius: 8px; padding: 4px 10px; font-size: 1.1rem; cursor: pointer; min-width: 36px; }}
-.regen-btn:hover {{ background: var(--panel-2); }}
+.regen-btn {{ min-width: 2.25rem; }}
 .regen-btn:disabled {{ opacity: 0.5; cursor: wait; }}
-.time-row {{ display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }}
-.time-btn {{ background: var(--panel); border: 1px solid var(--line); color: var(--muted); border-radius: 8px; padding: 6px 12px; font-size: 0.82rem; cursor: pointer; transition: border-color 0.15s, color 0.15s; }}
-.time-btn:hover {{ border-color: var(--accent); color: var(--text); }}
-.time-btn.active {{ border-color: var(--accent); color: var(--accent); font-weight: 600; }}
+.time-row {{ flex-wrap: wrap; }}
+.time-btn:hover {{ color: var(--text); }}
 .sort-select {{ background: var(--panel); border: 1px solid var(--line); color: var(--text); border-radius: 8px; padding: 6px 10px; font-size: 0.82rem; }}
 .score-group {{ display: flex; align-items: center; gap: 6px; margin-left: auto; }}
 .score-group input[type="range"] {{ width: 100px; accent-color: var(--accent); }}
@@ -302,7 +340,7 @@ pub fn render_server_shell_html(title: &str) -> String {
 .md-rendered {{ font-size: 0.88rem; line-height: 1.55; }}
 .md-rendered h1,.md-rendered h2,.md-rendered h3,.md-rendered h4 {{ margin: 0.8em 0 0.3em; color: var(--accent); }}
 .md-rendered h1 {{ font-size: 1.2em; }} .md-rendered h2 {{ font-size: 1.1em; }} .md-rendered h3 {{ font-size: 1.0em; }}
-.md-rendered pre {{ background: #0b1220; border: 1px solid var(--line); border-radius: 8px; padding: 10px; overflow-x: auto; }}
+.md-rendered pre {{ background: #0e0e0e; border: 1px solid var(--line); border-radius: 8px; padding: 10px; overflow-x: auto; }}
 .md-rendered code {{ background: rgba(56,189,248,0.1); padding: 1px 4px; border-radius: 3px; font-size: 0.9em; }}
 .md-rendered pre code {{ background: none; padding: 0; }}
 .md-rendered blockquote {{ border-left: 3px solid var(--accent); margin: 0.5em 0; padding: 0.3em 1em; color: var(--muted); }}
@@ -310,89 +348,127 @@ pub fn render_server_shell_html(title: &str) -> String {
 .md-rendered hr {{ border: none; border-top: 1px solid var(--line); margin: 1em 0; }}
 .md-rendered a {{ color: var(--accent-2); text-decoration: none; }}
 .md-rendered a:hover {{ text-decoration: underline; }}
-.detail-actions {{ display: flex; gap: 6px; }}
-.detail-actions button {{ border: 1px solid var(--line); border-radius: 8px; background: var(--panel); color: var(--text); padding: 6px 10px; cursor: pointer; font-size: 0.82rem; }}
 .detail-actions button:hover {{ border-color: var(--accent); }}
-.detail-content {{ margin: 0; border: 0; background: transparent; border-radius: 0; padding: 14px; overflow: auto; flex: 1; min-height: 280px; font-size: 0.86rem; line-height: 1.35; }}
+.detail-content {{ margin: 0; border: 0; background: transparent; border-radius: 0; padding: 14px; overflow: auto; flex: 1; min-height: 0; font-size: 0.86rem; line-height: 1.35; }}
 .filter-row {{ display: grid; grid-template-columns: repeat(3, 1fr) auto; gap: 10px; }}
   </style>
 </head>
-<body>
+<body class="server-dash">
   <div class="app-shell">
-    <header class="app-header">
-      <div>
-        <h1>aicx</h1>
-        <p class="meta">Context Browser | PWA shell</p>
-        <p class="meta" id="ctx-gen-info">Loading…</p>
+    <aside class="rail">
+      <div class="rail-brand">
+        {AICX_MARK_SVG}
+        <span class="brand-word">AICX</span>
       </div>
-      <div class="header-stats">
-        <div class="stat"><strong id="ctx-stat-files">-</strong><span>files</span></div>
-        <div class="stat"><strong id="ctx-stat-projects">-</strong><span>projects</span></div>
-        <div class="stat"><strong id="ctx-stat-days">-</strong><span>days</span></div>
-      </div>
-    </header>
-
-    <section class="controls">
-      <div class="search-row">
-        <input id="ctx-search" type="search" placeholder="Fuzzy search… (Enter or pause to trigger)" autocomplete="off" />
-        <label class="live-toggle" title="Live search (search while typing)">
-          <input id="ctx-live" type="checkbox" /> <span>Live</span>
-        </label>
-        <button id="ctx-regenerate" type="button" class="regen-btn" title="Regenerate dashboard data">&#8635;</button>
-      </div>
-      <div class="filter-row">
-        <select id="ctx-project"><option value="">All projects</option></select>
-        <select id="ctx-agent"><option value="">All agents/sources</option></select>
-        <select id="ctx-kind"><option value="">All kinds</option></select>
-        <select id="ctx-sort" class="sort-select">
-          <option value="newest">Newest</option>
-          <option value="oldest">Oldest</option>
-          <option value="score">Score</option>
-        </select>
-      </div>
-      <div class="time-row">
-        <button class="time-btn" data-since="1h">1h</button>
-        <button class="time-btn" data-since="4h">4h</button>
-        <button class="time-btn" data-since="24h">24h</button>
-        <button class="time-btn" data-since="7d">7d</button>
-        <button class="time-btn" data-since="30d">30d</button>
-        <button class="time-btn active" data-since="">All</button>
-        <div class="score-group">
-          <span>Score</span>
-          <input type="range" id="ctx-score" min="0" max="100" value="0" />
-          <span id="ctx-score-label">0</span>
+      {access_line}
+      <form class="rail-search" role="search" action="#" onsubmit="return false">
+        <label class="sr" for="ctx-search">Search the corpus</label>
+        <input id="ctx-search" type="search" placeholder="Search the corpus" autocomplete="off" enterkeyhint="search" />
+        <div class="rail-search-tools">
+          <label class="live-toggle" title="Search while typing">
+            <input id="ctx-live" type="checkbox" /> <span>Live</span>
+          </label>
+          <button id="ctx-regenerate" type="button" class="regen-btn" title="Reload the corpus">&#8635;</button>
         </div>
-      </div>
-    </section>
-
-    <section class="layout" id="ctx-layout">
-      <aside class="list-pane">
-        <div id="ctx-summary" class="summary"></div>
-        <div id="ctx-list" class="result-list"></div>
-      </aside>
-
-      <div class="resize-handle" id="ctx-resize-handle" title="Drag to resize panels"></div>
-
-      <article class="detail-pane">
-        <div class="detail-head">
-          <div>
-            <h2 id="ctx-detail-title">Select a result</h2>
-            <p id="ctx-detail-meta" class="detail-meta"></p>
+      </form>
+      <nav class="rail-nav" aria-label="Dashboard">
+        <button type="button" class="rail-nav-item active" id="ctx-nav-sessions">Sessions</button>
+        <button type="button" class="rail-nav-item" id="ctx-nav-setup">Setup</button>
+      </nav>
+      <div class="rail-scroll">
+        <div class="rail-filters">
+          <select id="ctx-project"><option value="">All projects</option></select>
+          <select id="ctx-agent"><option value="">All agents/sources</option></select>
+          <select id="ctx-kind"><option value="">All kinds</option></select>
+          <select id="ctx-sort" class="sort-select">
+            <option value="newest">Newest</option>
+            <option value="oldest">Oldest</option>
+            <option value="score">Score</option>
+          </select>
+          <div class="time-row">
+            <button class="time-btn" data-since="1h" type="button">1h</button>
+            <button class="time-btn" data-since="4h" type="button">4h</button>
+            <button class="time-btn" data-since="24h" type="button">24h</button>
+            <button class="time-btn" data-since="7d" type="button">7d</button>
+            <button class="time-btn" data-since="30d" type="button">30d</button>
+            <button class="time-btn active" data-since="" type="button">All</button>
           </div>
-          <div class="detail-actions">
-            <button id="ctx-expand" type="button" title="Expand full content">Expand</button>
-            <button id="ctx-copy-path" type="button">Copy Path</button>
+          <div class="score-group">
+            <span>Score</span>
+            <input type="range" id="ctx-score" min="0" max="100" value="0" />
+            <span id="ctx-score-label">0</span>
           </div>
         </div>
+        <section class="studio" id="ctx-studio">
+{onboarding_card}          <details class="studio-card">
+            <summary>Phrases</summary>
+            <p class="meta">One list. Intent, task, decision, and the rest. Saved to this machine.</p>
+            <textarea id="ctx-phrases" rows="8" spellcheck="false"></textarea>
+            <button id="ctx-phrases-save" type="button">Save phrases</button>
+            <p id="ctx-phrases-status" class="meta"></p>
+          </details>
+          <div class="studio-card studio-index">
+            <button id="ctx-index" type="button">Build index</button>
+            <p id="ctx-index-status" class="meta"></p>
+          </div>
+        </section>
+      </div>
+    </aside>
 
-        <div id="ctx-detail-content" class="detail-content">Use search or filters to pick a note.</div>
-
-        <details class="assumptions">
-          <summary>Assumptions</summary>
-          <ul id="ctx-assumptions"></ul>
-        </details>
-      </article>
-    </section>
+    <main class="stage">
+      <header class="stage-top">
+        <div>
+          <p class="eyebrow">Corpus</p>
+          <p class="stage-title" id="ctx-scope">This machine</p>
+          <p class="meta" id="ctx-gen-info">Loading…</p>
+        </div>
+        <div class="header-stats">
+          <div class="stat"><strong id="ctx-stat-files">-</strong><span id="ctx-stat-unit">sessions</span></div>
+          <div class="stat"><strong id="ctx-stat-projects">-</strong><span>projects</span></div>
+          <div class="stat"><strong id="ctx-stat-days">-</strong><span>days</span></div>
+        </div>
+      </header>
+      <section class="summary-row" aria-label="Corpus summary">
+        <article class="summary-card">
+          <strong id="ctx-card-sessions">-</strong>
+          <span>sessions</span>
+        </article>
+        <article class="summary-card">
+          <strong id="ctx-card-projects">-</strong>
+          <span>projects</span>
+        </article>
+        <article class="summary-card">
+          <strong id="ctx-index-state">-</strong>
+          <span>index</span>
+        </article>
+      </section>
+      <div class="main-body">
+        <section class="layout" id="ctx-layout">
+          <aside class="list-pane">
+            <div id="ctx-summary" class="summary"></div>
+            <div id="ctx-list" class="result-list"></div>
+          </aside>
+          <div class="resize-handle" id="ctx-resize-handle" title="Drag to resize panels"></div>
+          <article class="detail-pane">
+            <div class="detail-head">
+              <div>
+                <h2 id="ctx-detail-title">No result selected</h2>
+                <p id="ctx-detail-meta" class="detail-meta"></p>
+              </div>
+              <div class="detail-actions">
+                <button id="ctx-expand" type="button" title="Expand full content">Expand</button>
+                <button id="ctx-copy-path" type="button">Copy Path</button>
+              </div>
+            </div>
+            <div id="ctx-detail-content" class="detail-content">Open a session.</div>
+            <details class="assumptions">
+              <summary>Assumptions</summary>
+              <ul id="ctx-assumptions"></ul>
+            </details>
+          </article>
+        </section>
+      </div>
+    </main>
   </div>
 
   <script>{}</script>
@@ -406,7 +482,10 @@ pub fn render_server_shell_html(title: &str) -> String {
             "{}\n{}",
             assets::DASHBOARD_INLINE_MARKDOWN_SCRIPT,
             assets::DASHBOARD_SERVER_SCRIPT
-        )
+        ),
+        access_line = access_line,
+        onboarding_card = onboarding_card,
+        AICX_MARK_SVG = AICX_MARK_SVG,
     )
 }
 
@@ -429,62 +508,86 @@ fn render_dashboard_html(payload: &DashboardPayload, title: &str) -> Result<Stri
   <title>{}</title>
   <style>{}</style>
 </head>
-<body>
+<body class="server-dash">
   <div class="app-shell">
-    <header class="app-header">
-      <div>
-        <h1>AI Context Browser</h1>
-        <p class="meta">Search -> List -> Content | {}</p>
-        <p class="meta">Generated {}</p>
+    <aside class="rail">
+      <div class="rail-brand">
+        {AICX_MARK_SVG}
+        <span class="brand-word">AICX</span>
       </div>
-      <div class="header-stats">
-        <div class="stat"><strong>{}</strong><span>files</span></div>
-        <div class="stat"><strong>{}</strong><span>projects</span></div>
-        <div class="stat"><strong>{}</strong><span>days</span></div>
-      </div>
-    </header>
-
-    <section class="controls">
-      <div class="search-row">
-        <input id="ctx-search" type="search" placeholder="Fuzzy search… (Enter or pause to trigger)" autocomplete="off" />
-        <label class="live-toggle" title="Live search (search while typing)">
-          <input id="ctx-live" type="checkbox" /> <span>Live</span>
-        </label>
-      </div>
-      <div class="filter-row">
-        <select id="ctx-project"><option value="">All projects</option></select>
-        <select id="ctx-agent"><option value="">All agents/sources</option></select>
-        <select id="ctx-kind"><option value="">All kinds</option></select>
-      </div>
-    </section>
-
-    <section class="layout" id="ctx-layout">
-      <aside class="list-pane">
-        <div id="ctx-summary" class="summary"></div>
-        <div id="ctx-list" class="result-list"></div>
-      </aside>
-
-      <div class="resize-handle" id="ctx-resize-handle" title="Drag to resize panels"></div>
-
-      <article class="detail-pane">
-        <div class="detail-head">
-          <div>
-            <h2 id="ctx-detail-title">Select a result</h2>
-            <p id="ctx-detail-meta" class="detail-meta"></p>
-          </div>
-          <button id="ctx-copy-path" type="button">Copy Path</button>
+      <p class="meta">AI Context Browser</p>
+      <form class="rail-search" role="search" onsubmit="return false">
+        <label class="sr" for="ctx-search">Search the corpus</label>
+        <input id="ctx-search" type="search" placeholder="Search the corpus" autocomplete="off" />
+      </form>
+      <div class="rail-scroll">
+        <div class="rail-filters">
+          <select id="ctx-project"><option value="">All projects</option></select>
+          <select id="ctx-agent"><option value="">All agents/sources</option></select>
+          <select id="ctx-kind"><option value="">All kinds</option></select>
         </div>
-
-        <p id="ctx-detail-path" class="detail-path"></p>
-        <p id="ctx-detail-preview" class="detail-preview"></p>
-        <pre id="ctx-detail-content" class="detail-content"></pre>
-
-        <details class="assumptions" open>
-          <summary>Assumptions</summary>
-          <ul id="ctx-assumptions"></ul>
-        </details>
-      </article>
-    </section>
+        <section class="studio" id="ctx-studio">
+          <details class="studio-card" id="ctx-onboarding">
+            <summary>Start here</summary>
+            <p class="meta">Type the phrases you actually use, one per line. Save stores them on this machine. If the background service is missing, Save installs it.</p>
+            <label class="meta" for="ctx-onboarding-phrases">Phrases you type, one per line</label>
+            <textarea id="ctx-onboarding-phrases" rows="4" spellcheck="false" placeholder="I want this&#10;do not ship that"></textarea>
+            <button id="ctx-onboarding-save" type="button">Save</button>
+            <p id="ctx-onboarding-status" class="meta"></p>
+          </details>
+          <details class="studio-card">
+            <summary>Phrases</summary>
+            <p class="meta">One list. Intent, task, decision, and the rest. Saved to this machine.</p>
+            <textarea id="ctx-phrases" rows="8" spellcheck="false"></textarea>
+            <button id="ctx-phrases-save" type="button">Save phrases</button>
+            <p id="ctx-phrases-status" class="meta"></p>
+          </details>
+          <div class="studio-card studio-index">
+            <button id="ctx-index" type="button">Build index</button>
+            <p id="ctx-index-status" class="meta"></p>
+          </div>
+        </section>
+      </div>
+    </aside>
+    <main class="stage">
+      <header class="stage-top">
+        <div>
+          <p class="eyebrow">Corpus</p>
+          <p class="stage-title">Search -> List -> Content | {}</p>
+          <p class="meta">Generated {}</p>
+        </div>
+        <div class="header-stats">
+          <div class="stat"><strong>{}</strong><span>sessions</span></div>
+          <div class="stat"><strong>{}</strong><span>projects</span></div>
+          <div class="stat"><strong>{}</strong><span>days</span></div>
+        </div>
+      </header>
+      <div class="main-body">
+        <section class="layout" id="ctx-layout">
+          <aside class="list-pane">
+            <div id="ctx-summary" class="summary"></div>
+            <div id="ctx-list" class="result-list"></div>
+          </aside>
+          <div class="resize-handle" id="ctx-resize-handle" title="Drag to resize panels"></div>
+          <article class="detail-pane">
+            <div class="detail-head">
+              <div>
+                <h2 id="ctx-detail-title">No result selected</h2>
+                <p id="ctx-detail-meta" class="detail-meta"></p>
+              </div>
+              <button id="ctx-copy-path" type="button">Copy Path</button>
+            </div>
+            <p id="ctx-detail-path" class="detail-path"></p>
+            <p id="ctx-detail-preview" class="detail-preview"></p>
+            <pre id="ctx-detail-content" class="detail-content"></pre>
+            <details class="assumptions">
+              <summary>Assumptions</summary>
+              <ul id="ctx-assumptions"></ul>
+            </details>
+          </article>
+        </section>
+      </div>
+    </main>
   </div>
 
   <script id="ctx-data" type="application/json">{}</script>
@@ -500,7 +603,8 @@ fn render_dashboard_html(payload: &DashboardPayload, title: &str) -> Result<Stri
         payload.stats.total_projects,
         payload.stats.total_days,
         payload_json,
-        assets::DASHBOARD_SCRIPT
+        assets::DASHBOARD_SCRIPT,
+        AICX_MARK_SVG = AICX_MARK_SVG,
     ))
 }
 

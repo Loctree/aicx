@@ -88,6 +88,7 @@ fn print_intent_schema_migration_report(report: &intents::MigrationReport) {
 ///   aicx index                 # census + incremental parse + publish (one command)
 ///   aicx search '<query>'
 /// Power-user surfaces (catalog, extracts, intents, migrations): aicx --help-full
+/// A bare first start opens the dashboard onboarding survey.
 #[derive(Debug, Parser)]
 #[command(name = "aicx")]
 #[command(author = "(c)2026 Vetcoders")]
@@ -1775,7 +1776,7 @@ enum Commands {
         filters: RetrievalFilters,
     },
 
-    /// Run aicx as an MCP server.
+    /// HTTP serves the dashboard at / and MCP at /mcp on one listener. stdio stays MCP-only.
     Serve {
         /// Transport: stdio (default) or http. Legacy alias: sse.
         #[arg(long, value_enum, default_value_t = McpTransport::Stdio)]
@@ -2637,14 +2638,17 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
             serde_json::to_writer_pretty(io::stdout().lock(), &overlay)?;
             println!();
             eprintln!(
-                "overlay: cards={} new={} retained={} attributions={} unresolved={} files_opened={} raw_session_files_opened={}",
+                "overlay: cards={} new={} retained={} attributions={} unresolved={} files_opened={} raw_session_files_opened={} source_sessions_parsed={} source_sessions_reused={} feed_cache_hit={}",
                 stats.canonical_cards_seen,
                 stats.new_intents,
                 stats.retained_intents,
                 stats.emitted_attributions,
                 stats.unresolved_attributions,
                 stats.files_opened,
-                stats.raw_session_files_opened
+                stats.raw_session_files_opened,
+                stats.source_sessions_parsed,
+                stats.source_sessions_reused,
+                stats.feed_cache_hit,
             );
         }
         Some(Commands::Claude {
@@ -3689,9 +3693,14 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
         Some(Commands::Warmup { json }) => {
             run_warmup(json)?;
         }
-        None => {
-            Cli::command().print_help()?;
-        }
+        None => match aicx::onboarding::maybe_first_start()? {
+            aicx::onboarding::FirstStart::Opened(report) => {
+                print!("{}", report.render());
+            }
+            aicx::onboarding::FirstStart::AlreadyConfigured => {
+                Cli::command().print_help()?;
+            }
+        },
     }
 
     Ok(())
@@ -4407,6 +4416,10 @@ fn current_session_from_disk() -> Result<Option<CurrentSessionPayload>> {
         Some(&here),
     ));
 
+    // Only sessions that can be tied to this checkout. Kimi stores no cwd,
+    // and its workspace slug is not a path, so it is not a candidate here.
+    // A `[kimi/...]` commit supplies KIMI_SESSION_ID instead of borrowing
+    // another project's transcript.
     let mut selected = sessions::select_sessions(discovered, Some(&here), None, Some(since_dt), 1);
     let Some(info) = selected.pop() else {
         return Ok(None);
@@ -7443,6 +7456,9 @@ fn run_extract_session(
         Ok(resolved) => resolved,
         Err(error) => emit_catalog_failure(agent, error),
     };
+    if let Some(notice) = &resolved.substitution_notice {
+        eprintln!("{notice}");
+    }
     // Locate-before-parse proof surface (instrumented CLI contract): the
     // catalog inspected bounded headers only, and exactly one source moves on
     // to the single parse pass below.

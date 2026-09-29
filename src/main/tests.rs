@@ -2147,6 +2147,11 @@ fn serve_help_prefers_http_name_and_stays_compact() {
     let rendered = serve.render_long_help().to_string();
 
     assert!(rendered.contains("Transport: stdio (default) or http."));
+    assert!(
+        rendered.contains("dashboard at /"),
+        "serve help names the hybrid dashboard route"
+    );
+    assert!(rendered.contains("MCP at /mcp"));
     assert!(rendered.contains("--host <HOST>"));
     assert!(rendered.contains("Bind address for streamable HTTP transport"));
     assert!(rendered.contains("--allowed-host <HOST>"));
@@ -2285,6 +2290,10 @@ fn top_level_help_lists_daily_drivers_only() {
     }
     assert!(!rendered.contains("dashboard-serve"));
     assert!(!rendered.contains("reports-extractor"));
+    assert!(
+        rendered.contains("dashboard onboarding"),
+        "short help points at onboarding without listing the hidden command"
+    );
 }
 
 #[test]

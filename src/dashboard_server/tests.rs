@@ -55,7 +55,6 @@ fn mk_state_with_origin_escape(
             auth: AuthConfig::disabled(),
             allow_no_origin,
         },
-        shell_html: "<html>shell</html>".to_string(),
         snapshot: RwLock::new(DashboardSnapshot {
             payload: DashboardPayload {
                 generated_at: String::new(),

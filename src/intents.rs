@@ -12,7 +12,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use crate::chunker::{
-    INTENT_KEYWORDS, is_decision_tag, is_local_command_artifact_line, is_outcome_tag,
+    intent_keywords, is_decision_tag, is_local_command_artifact_line, is_outcome_tag,
     is_result_line, normalize_key, parse_checklist_task, truncate_signal_line,
 };
 use crate::extraction::conversation::{projection_kind_for_role, projection_role_for_role};
@@ -819,11 +819,6 @@ fn collect_intent_files(
     let mut source_errors = 0usize;
     let mut live_sessions = 0usize;
     let mut seen_sessions: BTreeSet<(String, String)> = BTreeSet::new();
-    // Census paths are only ever touched through the operator allowlist —
-    // the same containment contract as read_catalog_signal_at.
-    let allow_user_home = crate::os_user_home().unwrap_or_else(|| aicx_home.to_path_buf());
-    let source_allow =
-        crate::source_path::SourceAllowlist::for_operator(&allow_user_home, aicx_home);
     for entry in entries {
         let Some(identity_project) = entry.project.clone() else {
             continue;
@@ -842,28 +837,12 @@ fn collect_intent_files(
             .date
             .as_deref()
             .and_then(|date| NaiveDate::parse_from_str(date, "%Y-%m-%d").ok());
-        // Live window is mtime-in-window, not "newer than census fingerprint".
-        // A catalog rebuild stamps every row current, which used to collapse
-        // the hot set to zero and leave NOW/PEERS empty. Prefer a live stat;
-        // fall back to the census fingerprint so a just-rebuilt hot row
-        // still counts. Paths the operator allowlist refuses are NEVER
-        // stat'ed raw (a poisoned census row could point anywhere — the
-        // same containment contract as read_catalog_signal_at); they fall
-        // through to the census fingerprint instead.
-        let hot = if live {
-            source_allow
-                .resolve_file(entry.source_path.as_str())
-                .ok()
-                .and_then(|path| crate::catalog::live_source_fingerprint(&path))
-                .or_else(|| entry.source_mtime_ns.map(|mtime_ns| (0, mtime_ns)))
-                .is_some_and(|(_, mtime_ns)| mtime_ns_within_window(mtime_ns, cutoff))
-        } else {
-            false
-        };
-        if canonical_date.is_some_and(|date| date < cutoff.date_naive()) && (!live || !hot) {
+        // Window membership is conversation time (catalog session date, then
+        // last frame). Source mtime is a reparse fingerprint, not age: a
+        // touched 2026-09-18 transcript must not enter a 24h NOW on 09-21.
+        if canonical_date.is_some_and(|date| date < cutoff.date_naive()) {
             continue;
         }
-        let live_row = session_is_hot_live(live, hot);
 
         let (source_path, frames, scope) =
             match crate::source_index::read_catalog_signal_with_scope_at(
@@ -879,6 +858,8 @@ fn collect_intent_files(
                     continue;
                 }
             };
+        let in_window = conversation_activity_in_window(cutoff, canonical_date, frames.last());
+        let live_row = session_is_hot_live(live, in_window);
         let Some(file) = catalog_frames_to_intent_file(
             &entry,
             source_path,
@@ -1043,10 +1024,86 @@ fn is_guardian_session(
     )
 }
 
+/// Overlay's full-history census uses the same per-lane global caps, task
+/// reconciliation and dedup as `intents`. Only the source-read boundary differs:
+/// a cleaned conversation can be reused for both lanes, including from cache.
+///
+/// Each conversation carries the scope report of its WHOLE session, built by
+/// the reader before the signal projection and the frame-kind filter, exactly
+/// as the census lane receives it. A report rebuilt here from the cleaned
+/// frames would miss the workdirs seen only on tool calls and the scopes
+/// `.aicxignore` hid.
+#[cfg(feature = "app")]
+pub(crate) fn extract_overlay_intents_from_conversations(
+    project: &str,
+    conversations: &[(
+        crate::catalog::CatalogEntry,
+        PathBuf,
+        Vec<TimelineEntry>,
+        crate::extraction::conversation::ScopeReport,
+    )],
+) -> Result<Vec<IntentRecord>> {
+    let cutoff = DateTime::<Utc>::from_timestamp(0, 0).expect("valid Unix epoch");
+    let mut records = Vec::new();
+    for kind in [FrameKind::UserMsg, FrameKind::AgentReply] {
+        let config = IntentsConfig {
+            project: project.to_owned(),
+            hours: 0,
+            strict: false,
+            min_confidence: None,
+            kind_filter: None,
+            frame_kind: Some(kind),
+            live: false,
+        };
+        let mut notes = ScopeNotes::default();
+        let mut files = conversations
+            .iter()
+            .filter_map(|(entry, path, frames, scope)| {
+                let frames = frames
+                    .iter()
+                    .filter(|frame| {
+                        frame.frame_kind.unwrap_or(match frame.role.as_str() {
+                            "user" => FrameKind::UserMsg,
+                            "assistant" => FrameKind::AgentReply,
+                            _ => FrameKind::SystemNote,
+                        }) == kind
+                    })
+                    .cloned()
+                    .collect();
+                catalog_frames_to_intent_file(
+                    entry,
+                    path.clone(),
+                    frames,
+                    scope.clone(),
+                    cutoff,
+                    false,
+                    &mut notes,
+                )
+            })
+            .collect::<Vec<_>>();
+        files.sort_by(|left, right| {
+            left.timestamp
+                .cmp(&right.timestamp)
+                .then_with(|| left.path.cmp(&right.path))
+        });
+        let extraction = extract_intents_from_files_with_stats(
+            &config,
+            files,
+            0,
+            CATALOG_IDENTITY_SOURCE,
+            0,
+            notes,
+        )?;
+        records.extend(extraction.records);
+    }
+    Ok(records)
+}
+
 /// Admit sessions the durable catalog census does not know yet (P0 live
-/// window): scan live source roots, keep entries inside the mtime window and
-/// project filter, parse them through the same catalog-source reader, and
-/// stamp records with the `open_session` honesty frame.
+/// window): scan live source roots, keep entries whose conversation date
+/// (or last frame, when undated) is inside the window, parse them through
+/// the same catalog-source reader, and stamp records with the `open_session`
+/// honesty frame. Source mtime is not a membership clock.
 #[cfg(feature = "app")]
 #[allow(clippy::too_many_arguments)]
 fn collect_live_unadmitted_files(
@@ -1070,13 +1127,11 @@ fn collect_live_unadmitted_files(
         if seen_sessions.contains(&(entry.agent.clone(), entry.session_id.clone())) {
             continue;
         }
-        // Live scan only serves the hot window: skip anything whose source
-        // mtime is older than the cutoff (or unreadable — the census will
-        // pick it up at next rebuild).
-        if !entry
-            .source_mtime_ns
-            .is_some_and(|mtime_ns| mtime_ns_within_window(mtime_ns, cutoff))
-        {
+        let canonical_date = entry
+            .date
+            .as_deref()
+            .and_then(|date| NaiveDate::parse_from_str(date, "%Y-%m-%d").ok());
+        if canonical_date.is_some_and(|date| date < cutoff.date_naive()) {
             continue;
         }
         let Some(identity_project) = entry.project.clone() else {
@@ -1139,6 +1194,9 @@ fn collect_live_unadmitted_files(
         if frames.is_empty() {
             continue;
         }
+        if !conversation_activity_in_window(cutoff, canonical_date, frames.last()) {
+            continue;
+        }
         let timestamp = frames
             .last()
             .map(|frame| frame.timestamp)
@@ -1191,10 +1249,13 @@ fn collect_live_unadmitted_files(
 ///    and a checkout path need not spell `org/repo` in adjacent segments
 ///    (suite dirs, renamed clones);
 /// 2. the frame cwd spells the project as adjacent path segments — the
-///    strict anti-leak matcher for frames that left the session checkout,
-///    honest only where neither the frame cwd nor the session checkout
-///    resolves on this host. A frame cwd with no session checkout to prove
-///    it against is dropped.
+///    strict anti-leak matcher for frames that left the session checkout.
+///    Spelling of an unresolved path is honest only when the session
+///    checkout is equally unresolved. A resolved checkout whose baseline is
+///    gone may stand in only when that checkout's own owner and repository
+///    are the requested project. A shared leaf name is a different
+///    repository, and an ancestor directory in the path is not the checkout.
+///    A frame with no session checkout at all is dropped.
 #[cfg(feature = "app")]
 fn retain_frames_for_project(
     frames: &mut Vec<TimelineEntry>,
@@ -1229,13 +1290,20 @@ fn retain_frames_for_project(
                 // re-admits exactly what repo identity just rejected. Reaching
                 // it is only honest when there was no identity to be had.
                 match aicx_parser::engine::normalize_workdir(cwd, session_root) {
-                    // Resolves to a real checkout here, and the membership test
-                    // above already measured it against the session root. A
-                    // failed proof is an answer, not a gap — including when the
-                    // session's own baseline is historical and no longer
-                    // resolves, which is precisely when spelling is least
-                    // trustworthy.
-                    aicx_parser::engine::WorkdirIdentity::Resolved(_) => false,
+                    // Membership against a live session checkout already failed.
+                    // A vanished baseline cannot prove identity. The frame's own
+                    // git root may stand in only when its owner and repository
+                    // are this project — not when another repo wears the same
+                    // leaf, and not when an ancestor directory spells the name.
+                    // `…/other/aicx` is not `Loctree/aicx`.
+                    aicx_parser::engine::WorkdirIdentity::Resolved(root) => {
+                        session_root.is_some_and(|baseline| {
+                            matches!(
+                                aicx_parser::engine::normalize_workdir(baseline, None),
+                                aicx_parser::engine::WorkdirIdentity::Unresolved(_)
+                            )
+                        }) && resolved_owner_and_repo_are_the_project(&root, project)
+                    }
                     // Spelling is evidence only where the session root is as
                     // unknowable as the frame. A root that resolves here has
                     // just refused a path it cannot prove — a removed nested
@@ -1244,12 +1312,18 @@ fn retain_frames_for_project(
                     // frame could belong to, which is how the whole-session
                     // lane (`ScopeReport::scope_foreign_to`) reads it too.
                     aicx_parser::engine::WorkdirIdentity::Unresolved(_) => {
-                        session_root.is_some_and(|root| {
-                            matches!(
-                                aicx_parser::engine::normalize_workdir(root, None),
-                                aicx_parser::engine::WorkdirIdentity::Unresolved(_)
-                            )
-                        }) && crate::extraction::project_filter_matches_path(cwd, &filters)
+                        // A directory that is gone, whose parent is still this
+                        // checkout, is that checkout: `…/vibecrafted/labs` did
+                        // not become another repository by being deleted. A
+                        // path whose parent is gone too (`…/vista/vendor/fleet-bus`)
+                        // is unprovable and must not be spelled back in.
+                        missing_directory_inside_resolved_checkout(cwd, session_root)
+                            || (session_root.is_some_and(|root| {
+                                matches!(
+                                    aicx_parser::engine::normalize_workdir(root, None),
+                                    aicx_parser::engine::WorkdirIdentity::Unresolved(_)
+                                )
+                            }) && crate::extraction::project_filter_matches_path(cwd, &filters))
                     }
                 }
             }
@@ -1258,19 +1332,102 @@ fn retain_frames_for_project(
     });
 }
 
-/// Catalog-admitted sessions stay live when they are still inside the
-/// requested mtime window. Rebuild fingerprint equality must not demote them.
+/// A missing path whose parent still belongs to the session checkout.
+///
+/// The parent has to exist and resolve to the same repo root. A removed
+/// nested tree (`vendor/fleet-bus` when `vendor` is gone) has no parent to
+/// stand on, so it stays unprovable instead of inheriting the catalog project.
 #[cfg(feature = "app")]
-pub(crate) fn session_is_hot_live(live: bool, mtime_in_window: bool) -> bool {
-    live && mtime_in_window
+fn missing_directory_inside_resolved_checkout(cwd: &str, session_root: Option<&str>) -> bool {
+    let Some(session_root) = session_root else {
+        return false;
+    };
+    let path = Path::new(cwd);
+    if path.exists() {
+        return false;
+    }
+    let Some(parent) = path.parent().filter(|parent| parent.exists()) else {
+        return false;
+    };
+    let Some(parent) = parent.to_str() else {
+        return false;
+    };
+    match (
+        aicx_parser::engine::normalize_workdir(parent, None),
+        aicx_parser::engine::normalize_workdir(session_root, None),
+    ) {
+        (
+            aicx_parser::engine::WorkdirIdentity::Resolved(parent_root),
+            aicx_parser::engine::WorkdirIdentity::Resolved(session),
+        ) => parent_root == session,
+        _ => false,
+    }
 }
 
-/// True when a unix-nanosecond mtime falls at or after the window cutoff.
+/// The frame's git root is this project, not a neighbor with the same leaf.
+///
+/// Only a strict `owner/repo` filter counts, and only against the checkout's
+/// own last two segments. `/aicx` and bare `aicx` match every repository
+/// named `aicx`. `…/vista/vendor/fleet-bus` still has `vista` above it and
+/// is a different repository.
 #[cfg(feature = "app")]
-fn mtime_ns_within_window(mtime_ns: u64, cutoff: DateTime<Utc>) -> bool {
-    let secs = (mtime_ns / 1_000_000_000) as i64;
-    let nanos = (mtime_ns % 1_000_000_000) as u32;
-    DateTime::<Utc>::from_timestamp(secs, nanos).is_some_and(|mtime| mtime >= cutoff)
+fn resolved_owner_and_repo_are_the_project(root: &Path, project: &str) -> bool {
+    let Some((organization, repository)) = strict_owner_repo(project) else {
+        return false;
+    };
+    let mut segments = root
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(part) => Some(part.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let Some(root_repository) = segments.pop() else {
+        return false;
+    };
+    let Some(root_organization) = segments.pop() else {
+        return false;
+    };
+    root_organization.eq_ignore_ascii_case(organization)
+        && root_repository.eq_ignore_ascii_case(repository)
+}
+
+/// `owner/repo` only. A leading slash, a trailing slash, or a bare name is a
+/// leaf or wildcard, and two repositories can share that name.
+#[cfg(feature = "app")]
+fn strict_owner_repo(project: &str) -> Option<(&str, &str)> {
+    let project = project.trim();
+    if project.is_empty() || project.starts_with(['/', '\\']) || project.ends_with(['/', '\\']) {
+        return None;
+    }
+    let split_at = project.find(['/', '\\'])?;
+    let organization = &project[..split_at];
+    let repository = &project[split_at + 1..];
+    if organization.is_empty() || repository.is_empty() || repository.contains(['/', '\\']) {
+        return None;
+    }
+    Some((organization, repository))
+}
+
+/// Catalog-admitted sessions stay live when conversation activity is inside
+/// the requested window. Source mtime must not promote a stale session.
+#[cfg(feature = "app")]
+pub(crate) fn session_is_hot_live(live: bool, conversation_in_window: bool) -> bool {
+    live && conversation_in_window
+}
+
+/// Window clock: catalog session date first, last frame only when the row
+/// has no date. File mtime is never an input.
+#[cfg(feature = "app")]
+fn conversation_activity_in_window(
+    cutoff: DateTime<Utc>,
+    canonical_date: Option<NaiveDate>,
+    last_frame: Option<&TimelineEntry>,
+) -> bool {
+    if let Some(date) = canonical_date {
+        return date >= cutoff.date_naive();
+    }
+    last_frame.is_some_and(|frame| frame.timestamp >= cutoff)
 }
 
 #[cfg(not(feature = "app"))]
@@ -2046,15 +2203,7 @@ fn is_outcome_line(line: &str) -> bool {
 /// follow-on content. Once a colon + detail appears ("Zrobione: build green"),
 /// the line stops being bare and counts again.
 fn is_bare_affirmation(line: &str) -> bool {
-    const BARE: &[&str] = &[
-        "zrobione",
-        "dowiezione",
-        "gotowe",
-        "dziala",
-        "działa",
-        "done",
-        "completed",
-    ];
+    let bare = crate::parser::intent_phrases::phrases().bare_affirmation;
     let trimmed = line.trim().trim_end_matches(['.', '!', ',']);
     if trimmed.is_empty() || trimmed.contains(':') {
         return false;
@@ -2062,7 +2211,7 @@ fn is_bare_affirmation(line: &str) -> bool {
     let stripped = trimmed
         .trim_start_matches(['-', '*', '+', '>', ' ', '\t'])
         .to_lowercase();
-    BARE.iter().any(|word| stripped == *word)
+    bare.iter().any(|word| stripped == *word)
 }
 
 /// Inline backtick code-span ranges within a single line, as byte offsets
@@ -2104,25 +2253,8 @@ fn is_word_char(c: char) -> bool {
 /// * post (~16 chars after): post-keyword negators that flip the keyword
 ///   itself (`let's not`, `chcę nie`, ...).
 fn is_negated_keyword(lower_line: &str, kw_pos: usize, kw_len: usize) -> bool {
-    const PRE_NEGATORS: &[&str] = &[
-        // Polish
-        "nie ",
-        "bez ",
-        // English
-        "don't ",
-        "do not ",
-        "won't ",
-        "will not ",
-        "shouldn't ",
-        "should not ",
-        "wouldn't ",
-        "would not ",
-        "isn't ",
-        "aren't ",
-        "doesn't ",
-        "didn't ",
-    ];
-    const POST_NEGATORS: &[&str] = &[" not ", " not,", " not.", " nie ", " nie,", " nie."];
+    let pre_negators = crate::parser::intent_phrases::phrases().negation_pre;
+    let post_negators = crate::parser::intent_phrases::phrases().negation_post;
 
     let pre_window_start = lower_line[..kw_pos]
         .char_indices()
@@ -2132,7 +2264,7 @@ fn is_negated_keyword(lower_line: &str, kw_pos: usize, kw_len: usize) -> bool {
         .map(|(i, _)| i)
         .unwrap_or(0);
     let pre = &lower_line[pre_window_start..kw_pos];
-    if PRE_NEGATORS.iter().any(|n| pre.ends_with(n)) {
+    if pre_negators.iter().any(|n| pre.ends_with(n)) {
         return true;
     }
 
@@ -2146,7 +2278,7 @@ fn is_negated_keyword(lower_line: &str, kw_pos: usize, kw_len: usize) -> bool {
             .unwrap_or(lower_line.len())
             .min(lower_line.len());
         let post = &lower_line[post_start..post_end];
-        if POST_NEGATORS.iter().any(|n| post.starts_with(n)) {
+        if post_negators.iter().any(|n| post.starts_with(n)) {
             return true;
         }
     }
@@ -2206,7 +2338,7 @@ fn looks_like_intent_line(line: &str) -> bool {
     if severity_marker(line).is_some() {
         return true;
     }
-    INTENT_KEYWORDS
+    intent_keywords()
         .iter()
         .any(|kw| matches_keyword_word_boundary(line, kw))
 }
@@ -2247,33 +2379,11 @@ fn is_source_metadata_line(line: &str) -> bool {
 
 fn looks_like_operator_decision_line(line: &str) -> bool {
     let lower = line.to_lowercase();
-    const POLICY_MARKERS: &[&str] = &[
-        // Scope rejections / accepted boundaries.
-        "nie fixujemy",
-        "nie robimy",
-        "nie ruszamy",
-        "out of scope",
-        "poza scope",
-        // Durable policy/default/constraint language.
-        "od teraz",
-        "from now on",
-        "canonical",
-        "kanonicz",
-        "default",
-        "domysln",
-        "domyśln",
-        "tylko przez",
-        "bez zgadywania",
-        "bez fallback",
-        "no fallback",
-        "musi mieć",
-        "musi miec",
-        // Product principles phrased as "X is an addon, not a rescue layer".
-        "ma byc dodatkiem",
-        "ma być dodatkiem",
-    ];
 
-    POLICY_MARKERS.iter().any(|marker| lower.contains(marker))
+    crate::parser::intent_phrases::phrases()
+        .decision_policy
+        .iter()
+        .any(|marker| lower.contains(marker))
 }
 
 /// `true` when a line is a code/log fragment rather than prose — a bare
@@ -2478,22 +2588,9 @@ fn commit_block_indices(lines: &[String]) -> HashSet<usize> {
 
 fn looks_like_operator_requirement_line(line: &str) -> bool {
     let lower = line.to_lowercase();
-    const REQUIREMENT_MARKERS: &[&str] = &[
-        "nie może być",
-        "nie moze byc",
-        "ma być",
-        "ma byc",
-        "musi ",
-        "musimy ",
-        "trzeba ",
-        "zrób to testowalne",
-        "zrob to testowalne",
-        "pełny ownership",
-        "pelny ownership",
-        "teraz wypuszuj",
-    ];
 
-    REQUIREMENT_MARKERS
+    crate::parser::intent_phrases::phrases()
+        .requirement
         .iter()
         .any(|marker| lower.contains(marker))
 }
@@ -3279,153 +3376,6 @@ fn push_unique(target: &mut Vec<String>, value: String) {
 
 const CLASSIFIER_ABSTAIN_THRESHOLD: f32 = 0.5;
 
-const QUESTION_MARKERS: &[&str] = &[
-    "how do",
-    "how does",
-    "how to",
-    "what is",
-    "what are",
-    "why does",
-    "why is",
-    "can we",
-    "should we",
-    "is it possible",
-    "does it",
-    "do we",
-    "jak ",
-    "dlaczego ",
-    "czy ",
-    "co to ",
-    "co jest",
-    "w jaki sposób",
-];
-
-const ASSUMPTION_MARKERS: &[&str] = &[
-    "i assume",
-    "assuming",
-    "i believe",
-    "we assume",
-    "hypothesis:",
-    "zakładam",
-    "zakladam",
-    "założenie:",
-    "zalozenie:",
-    "hipoteza:",
-    "przypuszczam",
-];
-
-const WHY_MARKERS: &[&str] = &[
-    "why:",
-    "because",
-    "the reason",
-    "this is needed",
-    "motivated by",
-    "driven by",
-    "root cause",
-    "underlying issue",
-    "bo ",
-    "ponieważ",
-    "dlatego że",
-    "przyczyna:",
-    "powód:",
-];
-
-const ARGUE_MARKERS: &[&str] = &[
-    "on the other hand",
-    "alternatively",
-    "disagree",
-    "counterpoint",
-    "trade-off",
-    "tradeoff",
-    "but if we",
-    "however,",
-    "z drugiej strony",
-    "alternatywnie",
-    "spór:",
-    "kontrargument",
-];
-
-const INSIGHT_MARKERS: &[&str] = &[
-    "insight:",
-    "realization:",
-    "key finding:",
-    "★ insight",
-    "the real issue is",
-    "fundamentally,",
-    "odkrycie:",
-    "wniosek:",
-    "kluczowe:",
-];
-
-const TASK_DIRECTIVE_MARKERS: &[&str] = &["task:", "todo:", "zadanie:"];
-
-const TASK_ACTION_HEADS: &[&str] = &[
-    // Polish operator requests.
-    "stworz",
-    "stwórz",
-    "utworz",
-    "utwórz",
-    "dodaj",
-    "napraw",
-    "popraw",
-    "zbuduj",
-    "przygotuj",
-    "zapisz",
-    "spisz",
-    "wypisz",
-    "zaimplementuj",
-    "podlacz",
-    "podłącz",
-    "skopiuj",
-    "przekopiuj",
-    "uruchom",
-    "odpal",
-    // English operator requests.
-    "create",
-    "add",
-    "fix",
-    "update",
-    "implement",
-    "write",
-    "run",
-    "copy",
-];
-
-const COMMITMENT_HEADS: &[&str] = &[
-    "zrobie",
-    "zrobię",
-    "zajme sie",
-    "zajmę się",
-    "i will ",
-    "i'll ",
-];
-
-/// Markers whose presence alone is enough to call a line a Result line. Each
-/// carries result-shape on its own (PASS/FAIL outcome, score readout, P-level
-/// count, command name that only appears in result-reporting contexts).
-const RESULT_STRICT_MARKERS: &[&str] = &[
-    "passed",
-    "failed",
-    "score=",
-    "score:",
-    "latency",
-    "p0=",
-    "p1=",
-    "p2=",
-    "/10",
-    "clippy",
-    "cargo test",
-    "✓",
-    "✗",
-    "0 warnings",
-    "0 errors",
-];
-
-/// Markers that look result-y but appear too often in meta-discussion (e.g.
-/// "we need to write tests for X", "this throws an error: should we…").
-/// These classify a line as Result only when [`line_has_result_shape`] matches.
-const RESULT_SOFT_MARKERS: &[&str] = &["tests ", "error:"];
-
 /// A line "has result shape" when it carries a concrete reporting signal:
 /// a digit (test count, error count, percentage), a PASS/FAIL token, or a
 /// known status word. Without one, soft markers like "tests" or "error:" are
@@ -3434,19 +3384,21 @@ fn line_has_result_shape(lower_line: &str) -> bool {
     if lower_line.chars().any(|c| c.is_ascii_digit()) {
         return true;
     }
-    const SHAPE_TOKENS: &[&str] = &[
-        "pass", "fail", " ok", "ok.", "done", "skipped", "ignored", "timeout", "panicked",
-        "panic:", "✓", "✗",
-    ];
-    SHAPE_TOKENS.iter().any(|t| lower_line.contains(t))
+    crate::parser::intent_phrases::phrases()
+        .result_shape
+        .iter()
+        .any(|t| lower_line.contains(t))
 }
 
 fn looks_like_task_directive_line(line: &str) -> bool {
     let head = line.trim_start();
-    TASK_DIRECTIVE_MARKERS.iter().any(|marker| {
-        head.get(..marker.len())
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(marker))
-    })
+    crate::parser::intent_phrases::phrases()
+        .task_directive
+        .iter()
+        .any(|marker| {
+            head.get(..marker.len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(marker))
+        })
 }
 
 fn looks_like_bare_checkbox_task(line: &str) -> bool {
@@ -3465,31 +3417,21 @@ fn looks_like_actionable_task_line(line: &str) -> bool {
     }
 
     let lower = head.to_lowercase();
-    TASK_ACTION_HEADS.iter().any(|marker| {
-        lower == *marker
-            || lower
-                .strip_prefix(marker)
-                .is_some_and(|rest| rest.starts_with(' ') || rest.starts_with(':'))
-    })
+    crate::parser::intent_phrases::phrases()
+        .task_action_heads
+        .iter()
+        .any(|marker| {
+            lower == *marker
+                || lower
+                    .strip_prefix(marker)
+                    .is_some_and(|rest| rest.starts_with(' ') || rest.starts_with(':'))
+        })
 }
 
 fn looks_like_completion_outcome_line(line: &str) -> bool {
     let lower = line.to_lowercase();
-    const COMPLETION_MARKERS: &[&str] = &[
-        "zostal dodany",
-        "został dodany",
-        "zostala dodana",
-        "została dodana",
-        "zostaly dodane",
-        "zostały dodane",
-        "zostal utworzony",
-        "został utworzony",
-        "has been added",
-        "was added",
-        "has been created",
-        "was created",
-    ];
-    if !COMPLETION_MARKERS
+    if !crate::parser::intent_phrases::phrases()
+        .completion
         .iter()
         .any(|marker| lower.contains(marker))
     {
@@ -3531,7 +3473,8 @@ fn looks_like_commitment_line(line: &str) -> bool {
         return true;
     }
 
-    COMMITMENT_HEADS
+    crate::parser::intent_phrases::phrases()
+        .commitment_heads
         .iter()
         .any(|marker| head.starts_with(marker))
 }
@@ -3571,7 +3514,12 @@ pub fn classify_line_entry_type(line: &str, is_user: bool) -> Option<(EntryType,
         } else {
             0.7
         };
-        if QUESTION_MARKERS.iter().any(|m| lower.contains(m)) || trimmed.ends_with('?') {
+        if crate::parser::intent_phrases::phrases()
+            .question
+            .iter()
+            .any(|m| lower.contains(m))
+            || trimmed.ends_with('?')
+        {
             return Some((EntryType::Question, conf));
         }
     }
@@ -3593,7 +3541,11 @@ pub fn classify_line_entry_type(line: &str, is_user: bool) -> Option<(EntryType,
     {
         return Some((EntryType::Assumption, 0.9));
     }
-    if ASSUMPTION_MARKERS.iter().any(|m| lower.contains(m)) {
+    if crate::parser::intent_phrases::phrases()
+        .assumption
+        .iter()
+        .any(|m| lower.contains(m))
+    {
         return Some((EntryType::Assumption, 0.65));
     }
 
@@ -3605,7 +3557,11 @@ pub fn classify_line_entry_type(line: &str, is_user: bool) -> Option<(EntryType,
     {
         return Some((EntryType::Insight, 0.9));
     }
-    if INSIGHT_MARKERS.iter().any(|m| lower.contains(m)) {
+    if crate::parser::intent_phrases::phrases()
+        .insight
+        .iter()
+        .any(|m| lower.contains(m))
+    {
         return Some((EntryType::Insight, 0.65));
     }
 
@@ -3622,18 +3578,36 @@ pub fn classify_line_entry_type(line: &str, is_user: bool) -> Option<(EntryType,
     if trimmed.starts_with("result:") || trimmed.starts_with("wynik:") {
         return Some((EntryType::Result, 0.95));
     }
-    if is_result_line(line) || RESULT_STRICT_MARKERS.iter().any(|m| lower.contains(m)) {
+    if is_result_line(line)
+        || crate::parser::intent_phrases::phrases()
+            .result_strict
+            .iter()
+            .any(|m| lower.contains(m))
+    {
         return Some((EntryType::Result, 0.75));
     }
-    if RESULT_SOFT_MARKERS.iter().any(|m| lower.contains(m)) && line_has_result_shape(&lower) {
+    if crate::parser::intent_phrases::phrases()
+        .result_soft
+        .iter()
+        .any(|m| lower.contains(m))
+        && line_has_result_shape(&lower)
+    {
         return Some((EntryType::Result, 0.6));
     }
 
-    if ARGUE_MARKERS.iter().any(|m| lower.contains(m)) {
+    if crate::parser::intent_phrases::phrases()
+        .argue
+        .iter()
+        .any(|m| lower.contains(m))
+    {
         return Some((EntryType::Argue, 0.6));
     }
 
-    if WHY_MARKERS.iter().any(|m| lower.contains(m)) {
+    if crate::parser::intent_phrases::phrases()
+        .why
+        .iter()
+        .any(|m| lower.contains(m))
+    {
         return Some((EntryType::Why, 0.7));
     }
 
@@ -3641,7 +3615,7 @@ pub fn classify_line_entry_type(line: &str, is_user: bool) -> Option<(EntryType,
         return Some((EntryType::Intent, 0.8));
     }
     if is_user
-        && INTENT_KEYWORDS
+        && intent_keywords()
             .iter()
             .any(|kw| matches_keyword_word_boundary(line, kw))
     {

@@ -17,7 +17,22 @@ static TEMPFILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Atomically write `content` to `path`. Creates parent directories as needed.
 pub fn atomic_write(path: &Path, content: &[u8]) -> io::Result<()> {
-    let tmp = stage_tempfile(path, content)?;
+    atomic_write_with_privacy(path, content, false)
+}
+
+/// Owner-only Unix creation, selected BEFORE any payload bytes are written.
+/// Windows retains inherited ACLs; existing generic callers keep their mode.
+#[cfg(feature = "app")]
+pub(crate) fn atomic_write_private(path: &Path, content: &[u8]) -> io::Result<()> {
+    atomic_write_with_privacy(path, content, true)
+}
+
+fn atomic_write_with_privacy(path: &Path, content: &[u8], owner_only: bool) -> io::Result<()> {
+    let tmp = if owner_only {
+        stage_tempfile_with_privacy(path, content, true)?
+    } else {
+        stage_tempfile(path, content)?
+    };
     if let Err(err) = commit_tempfile(&tmp, path) {
         discard_tempfile(&tmp);
         return Err(err);
@@ -30,6 +45,14 @@ pub fn atomic_write(path: &Path, content: &[u8]) -> io::Result<()> {
 /// path. The caller MUST follow up with either `commit_tempfile` or
 /// `discard_tempfile`; the staged file is otherwise leaked.
 pub fn stage_tempfile(target: &Path, content: &[u8]) -> io::Result<PathBuf> {
+    stage_tempfile_with_privacy(target, content, false)
+}
+
+fn stage_tempfile_with_privacy(
+    target: &Path,
+    content: &[u8],
+    owner_only: bool,
+) -> io::Result<PathBuf> {
     let parent = target.parent().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -67,10 +90,16 @@ pub fn stage_tempfile(target: &Path, content: &[u8]) -> io::Result<PathBuf> {
     let tmp = parent.join(tmp_name);
 
     let res = (|| -> io::Result<()> {
-        let mut file = fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&tmp)?;
+        let mut options = fs::OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        if owner_only {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        #[cfg(not(unix))]
+        let _ = owner_only;
+        let mut file = options.open(&tmp)?;
         file.write_all(content)?;
         file.flush()?;
         file.sync_all()
@@ -156,6 +185,38 @@ mod tests {
         atomic_write(&path, b"replaced").unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"replaced");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(all(unix, feature = "app"))]
+    #[test]
+    fn private_atomic_write_stages_and_replaces_with_owner_only_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = unique_test_dir("private");
+        let path = dir.join("conversation.json");
+        let directory_mode = fs::metadata(&dir).unwrap().permissions().mode();
+        fs::write(&path, b"old").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        let staged = stage_tempfile_with_privacy(&path, b"private", true).unwrap();
+        assert_eq!(
+            fs::metadata(&staged).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        commit_tempfile(&staged, &path).unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        atomic_write_private(&path, b"replacement").unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(&dir).unwrap().permissions().mode(),
+            directory_mode
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"replacement");
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

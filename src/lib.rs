@@ -76,6 +76,8 @@ pub mod mcp;
 #[cfg(feature = "app")]
 pub mod mcp_session;
 #[cfg(feature = "app")]
+pub mod onboarding;
+#[cfg(feature = "app")]
 pub mod oracle;
 #[cfg(not(feature = "app"))]
 #[allow(dead_code)]
