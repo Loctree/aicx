@@ -7,8 +7,13 @@
 
 use anyhow::{Context, Result};
 use std::io::Write;
+use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
+/// Bound for waiting until 127.0.0.1 accepts before opening the browser.
+const LOOPBACK_READY_BUDGET: Duration = Duration::from_secs(5);
 
 /// Carried inside the binary. npm install does not run this; a bare `aicx` does.
 const EMBEDDED_MCP_SERVICE_INSTALLER: &str = include_str!("../tools/install-mcp-service.sh");
@@ -592,14 +597,21 @@ pub fn maybe_first_start() -> Result<FirstStart> {
     };
     let url = dashboard_url_for(plan.port);
     let gui = gui_available();
-    if !options.dry_run
-        && let Err(err) = ensure_loopback_server(plan.port)
-    {
-        write_service_error(&home, Some(&err.to_string()));
-        println!("{err}");
-    }
+    let loopback_ready = if options.dry_run {
+        false
+    } else {
+        match ensure_loopback_server(plan.port) {
+            Ok(()) => true,
+            Err(err) => {
+                write_service_error(&home, Some(&err.to_string()));
+                // Reason first, then the URL below — never open a dead page.
+                println!("{err}");
+                false
+            }
+        }
+    };
     println!("{url}");
-    if gui && !options.dry_run {
+    if should_open_dashboard(gui, options.dry_run, loopback_ready) {
         // A missing browser is not a failure. The URL is already printed.
         let _ = open_dashboard(&url);
     }
@@ -778,8 +790,37 @@ fn gui_available() -> bool {
 
 fn ensure_loopback_server(port: u16) -> Result<()> {
     match classify_port(port) {
-        PortOccupancy::Free => {}
-        PortOccupancy::Ours => return Ok(()),
+        PortOccupancy::Free => {
+            let bin = std::env::current_exe().context("cannot resolve aicx binary")?;
+            let log_dir = crate::aicx_home::resolve()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join("logs");
+            std::fs::create_dir_all(&log_dir).ok();
+            let log = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(log_dir.join("aicx-serve-http.log"))
+                .ok();
+            let mut serve_args = vec!["serve".to_string()];
+            serve_args.extend(loopback_http_argv(port));
+            let mut command = Command::new(bin);
+            command
+                .args(&serve_args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null());
+            if let Some(log) = log {
+                command.stderr(log);
+            } else {
+                command.stderr(Stdio::null());
+            }
+            command
+                .spawn()
+                .context("could not start the loopback dashboard on 127.0.0.1:8044")?;
+        }
+        PortOccupancy::Ours => {
+            // Launchd (or a prior spawn) already owns the port claim — still wait
+            // until TCP accept works before the browser is allowed to open.
+        }
         PortOccupancy::Foreign(listener) => {
             let plan = choose_service_port(std::slice::from_ref(&listener), port, &[]);
             let Some(foreign) = plan.foreign else {
@@ -788,32 +829,32 @@ fn ensure_loopback_server(port: u16) -> Result<()> {
             anyhow::bail!("{}", foreign.instructions());
         }
     }
-    let bin = std::env::current_exe().context("cannot resolve aicx binary")?;
-    let log_dir = crate::aicx_home::resolve()
-        .unwrap_or_else(|_| PathBuf::from("."))
-        .join("logs");
-    std::fs::create_dir_all(&log_dir).ok();
-    let log = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log_dir.join("aicx-serve-http.log"))
-        .ok();
-    let mut serve_args = vec!["serve".to_string()];
-    serve_args.extend(loopback_http_argv(port));
-    let mut command = Command::new(bin);
-    command
-        .args(&serve_args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null());
-    if let Some(log) = log {
-        command.stderr(log);
-    } else {
-        command.stderr(Stdio::null());
-    }
-    command
-        .spawn()
-        .context("could not start the loopback dashboard on 127.0.0.1:8044")?;
+    wait_until_loopback_accepts(port, LOOPBACK_READY_BUDGET)
+        .with_context(|| format!("timed out waiting for 127.0.0.1:{port} to accept connections"))?;
     Ok(())
+}
+
+/// Poll until something on 127.0.0.1:`port` accepts a TCP connect, or `budget` elapses.
+fn wait_until_loopback_accepts(port: u16, budget: Duration) -> Result<()> {
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let deadline = Instant::now() + budget;
+    let mut last_err = None;
+    while Instant::now() < deadline {
+        match TcpStream::connect_timeout(&addr, Duration::from_millis(100)) {
+            Ok(_) => return Ok(()),
+            Err(err) => last_err = Some(err),
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    match last_err {
+        Some(err) => Err(err).context(format!("127.0.0.1:{port} did not accept within {budget:?}")),
+        None => anyhow::bail!("127.0.0.1:{port} did not accept within {budget:?}"),
+    }
+}
+
+/// Open the OS browser only when GUI is available, not dry-run, and loopback is ready.
+fn should_open_dashboard(gui: bool, dry_run: bool, loopback_ready: bool) -> bool {
+    gui && !dry_run && loopback_ready
 }
 
 /// Install the existing native service unit when this machine is off-contract.
@@ -1494,5 +1535,47 @@ mod tests {
         assert!(!text.contains("OPENAI_API_KEY"));
         assert_eq!(embedder_backend(&root).as_deref(), Some("gguf"));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn open_is_skipped_until_loopback_accepts_and_after_timeout() {
+        // Ephemeral port — never touch the operator's real 8044.
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe");
+        let port = probe.local_addr().expect("addr").port();
+        drop(probe);
+
+        let timed_out = wait_until_loopback_accepts(port, Duration::from_millis(250));
+        assert!(
+            timed_out.is_err(),
+            "nothing listening must time out: {timed_out:?}"
+        );
+        assert!(
+            !should_open_dashboard(true, false, timed_out.is_ok()),
+            "timeout must not open the browser"
+        );
+
+        let listener = std::net::TcpListener::bind(("127.0.0.1", port)).expect("bind fake");
+        let acceptor = std::thread::spawn(move || {
+            let _ = listener.accept();
+        });
+        let ready = wait_until_loopback_accepts(port, Duration::from_secs(2));
+        assert!(
+            ready.is_ok(),
+            "fake listener must satisfy the ready wait: {ready:?}"
+        );
+        assert!(
+            should_open_dashboard(true, false, ready.is_ok()),
+            "open is allowed only after accept"
+        );
+        assert!(
+            !should_open_dashboard(true, true, true),
+            "dry-run must still skip open"
+        );
+        assert!(
+            !should_open_dashboard(false, false, true),
+            "no-GUI must still skip open"
+        );
+        // Never call open_dashboard / launchctl — the gate is the contract under test.
+        let _ = acceptor.join();
     }
 }
