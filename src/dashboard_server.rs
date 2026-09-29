@@ -111,6 +111,7 @@ struct DashboardStatusResponse {
     stats: DashboardStats,
     assumptions: Vec<String>,
     last_error: Option<String>,
+    survey_required: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -373,22 +374,42 @@ async fn get_health() -> Json<serde_json::Value> {
 async fn get_status(
     State(state): State<Arc<DashboardServerState>>,
 ) -> Json<DashboardStatusResponse> {
-    let snapshot = state.snapshot.read().await;
-    Json(DashboardStatusResponse {
-        ok: true,
-        mode: "server-shell",
-        rebuilding: state.rebuilding.load(Ordering::SeqCst),
-        generated_at: snapshot.generated_at.to_rfc3339(),
-        build_count: snapshot.build_count,
-        aicx_home: state.config.aicx_home.display().to_string(),
-        artifact_path: state.config.artifact_path.display().to_string(),
-        artifact_written: false,
-        title: state.config.title.clone(),
-        preview_chars: state.config.preview_chars,
-        stats: snapshot.stats.clone(),
-        assumptions: snapshot.assumptions.clone(),
-        last_error: snapshot.last_error.clone(),
-    })
+    let survey_required = crate::onboarding::needs_full_survey(&state.config.aicx_home);
+    let rebuilding = state.rebuilding.load(Ordering::SeqCst);
+    match state.snapshot.try_read() {
+        Ok(snapshot) => Json(DashboardStatusResponse {
+            ok: true,
+            mode: "server-shell",
+            rebuilding,
+            generated_at: snapshot.generated_at.to_rfc3339(),
+            build_count: snapshot.build_count,
+            aicx_home: state.config.aicx_home.display().to_string(),
+            artifact_path: state.config.artifact_path.display().to_string(),
+            artifact_written: false,
+            title: state.config.title.clone(),
+            preview_chars: state.config.preview_chars,
+            stats: snapshot.stats.clone(),
+            assumptions: snapshot.assumptions.clone(),
+            last_error: snapshot.last_error.clone(),
+            survey_required,
+        }),
+        Err(_) => Json(DashboardStatusResponse {
+            ok: true,
+            mode: "server-shell",
+            rebuilding: true,
+            generated_at: String::new(),
+            build_count: 0,
+            aicx_home: state.config.aicx_home.display().to_string(),
+            artifact_path: state.config.artifact_path.display().to_string(),
+            artifact_written: false,
+            title: state.config.title.clone(),
+            preview_chars: state.config.preview_chars,
+            stats: DashboardStats::default(),
+            assumptions: Vec::new(),
+            last_error: None,
+            survey_required,
+        }),
+    }
 }
 
 async fn regenerate_dashboard(

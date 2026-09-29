@@ -383,16 +383,11 @@ pub fn render_server_shell_html_for(title: &str, local_open: bool) -> String {
         <section class="studio" id="ctx-studio">
           <details class="studio-card" id="ctx-onboarding">
             <summary>Start here</summary>
-            <p class="meta">Configuration survey. The phrases you actually type become intent keywords on this machine.</p>
-            <label class="meta" for="ctx-onboarding-phrases">Intent phrases, one per line</label>
-            <textarea id="ctx-onboarding-phrases" rows="4" spellcheck="false" placeholder="i want&#10;next step"></textarea>
-            <button id="ctx-onboarding-save" type="button">Save intent phrases</button>
+            <p class="meta">{onboarding_first} Type the phrases you say when you mean it, one per line. Save once. After that, search uses them and this machine keeps running in the background.</p>
+            <label class="meta" for="ctx-onboarding-phrases">Phrases you type, one per line</label>
+            <textarea id="ctx-onboarding-phrases" rows="4" spellcheck="false" placeholder="I want this&#10;do not ship that"></textarea>
+            <button id="ctx-onboarding-save" type="button">Save and continue</button>
             <p id="ctx-onboarding-status" class="meta"></p>
-            <ol>
-              <li>{onboarding_first}</li>
-              <li>Save the phrases. They are written to intent_phrases.toml.</li>
-              <li>Build the index. Search only sees what has been indexed.</li>
-            </ol>
             <button id="ctx-onboarding-dismiss" type="button">Hide this</button>
           </details>
           <details class="studio-card">
@@ -524,16 +519,11 @@ fn render_dashboard_html(payload: &DashboardPayload, title: &str) -> Result<Stri
         <section class="studio" id="ctx-studio">
           <details class="studio-card" id="ctx-onboarding">
             <summary>Start here</summary>
-            <p class="meta">Configuration survey. The phrases you actually type become intent keywords on this machine.</p>
-            <label class="meta" for="ctx-onboarding-phrases">Intent phrases, one per line</label>
-            <textarea id="ctx-onboarding-phrases" rows="4" spellcheck="false" placeholder="i want&#10;next step"></textarea>
-            <button id="ctx-onboarding-save" type="button">Save intent phrases</button>
+            <p class="meta">Type the phrases you say when you mean it, one per line. Save once. After that, search uses them and this machine keeps running in the background.</p>
+            <label class="meta" for="ctx-onboarding-phrases">Phrases you type, one per line</label>
+            <textarea id="ctx-onboarding-phrases" rows="4" spellcheck="false" placeholder="I want this&#10;do not ship that"></textarea>
+            <button id="ctx-onboarding-save" type="button">Save and continue</button>
             <p id="ctx-onboarding-status" class="meta"></p>
-            <ol>
-              <li>Sign in if this dashboard is not on your own loopback.</li>
-              <li>Save the phrases. They are written to intent_phrases.toml.</li>
-              <li>Build the index. Search only sees what has been indexed.</li>
-            </ol>
             <button id="ctx-onboarding-dismiss" type="button">Hide this</button>
           </details>
           <details class="studio-card">

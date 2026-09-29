@@ -142,7 +142,19 @@ pub(super) async fn get_browse(
         }
     };
 
-    let snapshot = state.snapshot.read().await;
+    let snapshot = match state.snapshot.try_read() {
+        Ok(snapshot) => snapshot,
+        Err(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorResponse {
+                    ok: false,
+                    error: "still_reading".to_string(),
+                }),
+            )
+                .into_response();
+        }
+    };
     let since_ts = params.since.as_deref().and_then(parse_relative_time);
 
     let mut records: Vec<BrowseRecord> = snapshot

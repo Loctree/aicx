@@ -537,15 +537,7 @@ pub fn maybe_first_start() -> Result<FirstStart> {
         println!("{}", foreign.instructions());
     }
     let service = if survey {
-        let outcome = install_launch_agent(&options);
-        match &outcome {
-            ServiceInstall::Failed { reason } => write_service_error(&home, Some(reason)),
-            ServiceInstall::Installed | ServiceInstall::NativeInstalled => {
-                write_service_error(&home, None);
-            }
-            ServiceInstall::Skipped { .. } => {}
-        }
-        outcome
+        bring_service_onto_contract(&home, &options)
     } else {
         ServiceInstall::Skipped {
             reason: "service already matches the loopback contract".to_string(),
@@ -786,6 +778,55 @@ fn ensure_loopback_server(port: u16) -> Result<()> {
     Ok(())
 }
 
+/// Install the existing native service unit when this machine is off-contract.
+///
+/// Uses `tools/install-mcp-service*.sh` (embedded or `InstallOptions.script`).
+/// Does not invent a second installer.
+pub fn bring_service_onto_contract(home: &Path, options: &InstallOptions) -> ServiceInstall {
+    if service_meets_contract(home) {
+        return ServiceInstall::Skipped {
+            reason: "service already matches the loopback contract".to_string(),
+        };
+    }
+    let outcome = install_launch_agent(options);
+    match &outcome {
+        ServiceInstall::Failed { reason } => write_service_error(home, Some(reason)),
+        ServiceInstall::Installed | ServiceInstall::NativeInstalled => {
+            write_service_error(home, None);
+        }
+        ServiceInstall::Skipped { .. } => {}
+    }
+    outcome
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OnboardingApply {
+    pub phrases_path: PathBuf,
+    pub service: ServiceInstall,
+}
+
+/// Write survey phrases into the existing phrase file, then install the native
+/// service when the unit is missing or off-contract.
+pub fn apply_onboarding_survey(
+    home: &Path,
+    current: &str,
+    extra: &[String],
+    options: &InstallOptions,
+) -> Result<OnboardingApply, String> {
+    let rendered = merge_intent_keywords(current, extra)?;
+    crate::parser::intent_phrases::reload_from_str(&rendered)?;
+    let phrases_path = home.join("intent_phrases.toml");
+    if let Some(parent) = phrases_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|err| format!("write:{err}"))?;
+    }
+    std::fs::write(&phrases_path, rendered).map_err(|err| format!("write:{err}"))?;
+    let service = bring_service_onto_contract(home, options);
+    Ok(OnboardingApply {
+        phrases_path,
+        service,
+    })
+}
+
 /// Append operator phrases to `[intent].keywords` in the existing phrase file.
 ///
 /// This is the onboarding survey store. It does not create a second database.
@@ -898,6 +939,78 @@ mod tests {
             crate::parser::intent_phrases::embedded_source(),
         )
         .expect("restore embedded phrases");
+    }
+
+    #[test]
+    fn survey_writes_phrases_and_invokes_installer_when_service_is_missing() {
+        let dir = std::env::temp_dir().join(format!(
+            "aicx-onboarding-apply-{}-{}",
+            std::process::id(),
+            "survey"
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("ran");
+        let bin = dir.join("aicx-under-test");
+        let script = if cfg!(windows) {
+            dir.join("install-mcp-service.ps1")
+        } else {
+            dir.join("install-mcp-service.sh")
+        };
+        let body = if cfg!(windows) {
+            format!(
+                "$utf8 = New-Object System.Text.UTF8Encoding $false\n[System.IO.File]::WriteAllText('{}', $env:AICX_BIN, $utf8)\nexit 0\n",
+                log.display().to_string().replace('\'', "''")
+            )
+        } else {
+            format!(
+                "#!/bin/sh\nprintf '%s' \"$AICX_BIN\" > '{}'\n",
+                log.display().to_string().replace('\'', "'\\''")
+            )
+        };
+        std::fs::write(&script, body).unwrap();
+        let missing_unit = dir.join("missing-service-unit");
+        let prev_unit = std::env::var_os("AICX_SERVICE_UNIT");
+        unsafe {
+            std::env::set_var("AICX_SERVICE_UNIT", &missing_unit);
+        }
+        let applied = apply_onboarding_survey(
+            &dir,
+            crate::parser::intent_phrases::embedded_source(),
+            &["ship the loopback dashboard".into()],
+            &InstallOptions {
+                dry_run: false,
+                platform_is_macos: cfg!(target_os = "macos"),
+                script: Some(script),
+                bin: Some(bin.clone()),
+                port: 8044,
+            },
+        )
+        .expect("apply");
+        unsafe {
+            match prev_unit {
+                Some(value) => std::env::set_var("AICX_SERVICE_UNIT", value),
+                None => std::env::remove_var("AICX_SERVICE_UNIT"),
+            }
+        }
+        let written = std::fs::read_to_string(&applied.phrases_path).unwrap();
+        assert!(written.contains("ship the loopback dashboard"));
+        assert!(applied.phrases_path.ends_with("intent_phrases.toml"));
+        if cfg!(target_os = "macos") {
+            assert_eq!(applied.service, ServiceInstall::Installed);
+        } else {
+            assert_eq!(applied.service, ServiceInstall::NativeInstalled);
+        }
+        let recorded = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(
+            Path::new(recorded.trim().trim_start_matches('\u{feff}')),
+            bin.as_path()
+        );
+        crate::parser::intent_phrases::reload_from_str(
+            crate::parser::intent_phrases::embedded_source(),
+        )
+        .expect("restore embedded phrases");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

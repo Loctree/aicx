@@ -23,7 +23,7 @@ pub(crate) const DASHBOARD_SERVER_SCRIPT: &str = r#"
     query: '', project: '', agent: '', kind: '', sort: 'newest', since: '',
     scoreMin: 0, limit: 350, selectedId: null, rows: [], selectedRecord: null,
     browseRecords: [], mode: 'browse', expanded: false, unit: 'session',
-    assumptions: [], indexLoaded: false, corpusTotal: 0,
+    assumptions: [], indexLoaded: false, corpusTotal: 0, browseRetries: 0,
   };
 
   const withoutStamp = (line) => {
@@ -455,6 +455,10 @@ pub(crate) const DASHBOARD_SERVER_SCRIPT: &str = r#"
   }
 
   /* --- load browse data -------------------------------------------------- */
+  const showCorpusBusy = () => {
+    ui.summary.textContent = 'Still reading the corpus. Retrying\u2026';
+    if (ui.genInfo) ui.genInfo.textContent = 'Still reading the corpus';
+  };
   const loadBrowseData = () => {
     ui.summary.textContent = 'Loading\u2026';
     const params = new URLSearchParams();
@@ -464,10 +468,37 @@ pub(crate) const DASHBOARD_SERVER_SCRIPT: &str = r#"
     if (state.sort) params.set('sort', state.sort);
     if (state.since) params.set('since', state.since);
     const qs = params.toString();
-    apiFetch('/api/browse' + (qs ? '?' + qs : ''))
-      .then(function(r) { return r.json(); })
+    const controller = new AbortController();
+    const timer = setTimeout(function() { controller.abort(); }, 8000);
+    apiFetch('/api/browse' + (qs ? '?' + qs : ''), { signal: controller.signal })
+      .then(function(r) {
+        clearTimeout(timer);
+        if (r.status === 503) {
+          return r.json().then(function(data) {
+            const err = new Error((data && data.error) || 'still_reading');
+            err.status = 503;
+            err.stillReading = data && data.error === 'still_reading';
+            throw err;
+          });
+        }
+        if (!r.ok) {
+          const err = new Error('HTTP ' + r.status);
+          err.status = r.status;
+          throw err;
+        }
+        return r.json();
+      })
       .then(function(data) {
-        if (!data.ok) { ui.summary.textContent = 'Failed: ' + (data.error || 'unknown'); return; }
+        if (!data.ok) {
+          if (data.error === 'still_reading') {
+            showCorpusBusy();
+            setTimeout(loadBrowseData, 2500);
+            return;
+          }
+          ui.summary.textContent = 'Failed: ' + (data.error || 'unknown');
+          return;
+        }
+        state.browseRetries = 0;
         state.browseRecords = data.records || [];
         fillSelect(ui.project, data.projects || []);
         fillSelect(ui.agent, data.agents || []);
@@ -500,8 +531,20 @@ pub(crate) const DASHBOARD_SERVER_SCRIPT: &str = r#"
         applyBrowseFilters();
       })
       .catch(function(err) {
+        clearTimeout(timer);
         if (err && err.status === 401) return;
-        ui.summary.textContent = 'Load failed: ' + err.message;
+        const busy = (err && err.stillReading)
+          || (err && err.name === 'AbortError')
+          || (err && !err.status && /fetch|abort/i.test(String(err.message || '')));
+        if (busy) {
+          state.browseRetries = (state.browseRetries || 0) + 1;
+          showCorpusBusy();
+          if (state.browseRetries < 8) {
+            setTimeout(loadBrowseData, 2500);
+            return;
+          }
+        }
+        ui.summary.textContent = 'Load failed: ' + ((err && err.message) || 'unknown');
       });
   };
 
@@ -538,7 +581,15 @@ pub(crate) const DASHBOARD_SERVER_SCRIPT: &str = r#"
         headers: { 'content-type': 'application/json', 'x-ai-contexters-action': 'regenerate' }
       })
         .then((r) => r.json())
-        .then((body) => { if (surveyStatus) surveyStatus.textContent = body.ok ? 'Saved intent phrases.' : (body.detail || 'Not saved.'); })
+        .then((body) => {
+          if (!surveyStatus) return;
+          if (!body.ok) {
+            surveyStatus.textContent = body.detail || 'Not saved.';
+            return;
+          }
+          const service = body.service ? ' Background service: ' + body.service + '.' : '';
+          surveyStatus.textContent = 'Saved. Search will use these phrases.' + service;
+        })
         .catch(() => { if (surveyStatus) surveyStatus.textContent = 'Not saved.'; });
     });
     const phrases = $('ctx-phrases');
@@ -593,15 +644,20 @@ pub(crate) const DASHBOARD_SERVER_SCRIPT: &str = r#"
       .then(function(r) {
         if (r.status === 401) {
           showLogin();
-          return;
+          return null;
         }
+        return r.json();
+      })
+      .then(function(data) {
+        if (!data) return;
         const host = location.hostname;
         if (host === '127.0.0.1' || host === 'localhost' || host === '::1') {
           const access = document.getElementById('ctx-access');
           if (access) access.textContent = 'This machine. No sign-in.';
-          const first = document.querySelector('#ctx-onboarding ol li');
-          if (first) first.textContent = 'This dashboard is on this machine. No sign-in.';
         }
+        const onboard = $('ctx-onboarding');
+        if (onboard && data.survey_required) onboard.open = true;
+        if (data.rebuilding) showCorpusBusy();
         loadBrowseData();
       })
       .catch(function() { loadBrowseData(); });

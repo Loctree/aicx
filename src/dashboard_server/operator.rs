@@ -78,6 +78,7 @@ pub(super) async fn put_phrases(
         Json(JsonOk {
             ok: true,
             path: path.display().to_string(),
+            service: None,
         }),
     )
         .into_response()
@@ -103,6 +104,7 @@ pub(super) async fn post_index(
         Json(JsonOk {
             ok: true,
             path: "index".to_string(),
+            service: None,
         }),
     )
         .into_response()
@@ -137,10 +139,31 @@ pub(super) async fn post_onboarding(
     if let Some(response) = reject_mutation(&state, &headers) {
         return response;
     }
+    let home = state.config.aicx_home.clone();
     let current = intent_phrases::read_operator_or_embedded(&phrases_path(&state));
-    let rendered = match crate::onboarding::merge_intent_keywords(&current, &survey.phrases) {
-        Ok(rendered) => rendered,
-        Err(err) => {
+    let phrases = survey.phrases;
+    let applied = match tokio::task::spawn_blocking(move || {
+        crate::onboarding::apply_onboarding_survey(
+            &home,
+            &current,
+            &phrases,
+            &crate::onboarding::InstallOptions::from_env(),
+        )
+    })
+    .await
+    {
+        Ok(Ok(applied)) => applied,
+        Ok(Err(err)) if err.starts_with("write:") => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(JsonError {
+                    error: "write_failed",
+                    detail: err.trim_start_matches("write:").to_string(),
+                }),
+            )
+                .into_response();
+        }
+        Ok(Err(err)) => {
             return (
                 StatusCode::BAD_REQUEST,
                 Json(JsonError {
@@ -150,45 +173,23 @@ pub(super) async fn post_onboarding(
             )
                 .into_response();
         }
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(JsonError {
+                    error: "write_failed",
+                    detail: err.to_string(),
+                }),
+            )
+                .into_response();
+        }
     };
-    if let Err(err) = intent_phrases::reload_from_str(&rendered) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(JsonError {
-                error: "invalid_phrases",
-                detail: err,
-            }),
-        )
-            .into_response();
-    }
-    let path = phrases_path(&state);
-    if let Some(parent) = path.parent()
-        && let Err(err) = std::fs::create_dir_all(parent)
-    {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(JsonError {
-                error: "write_failed",
-                detail: err.to_string(),
-            }),
-        )
-            .into_response();
-    }
-    if let Err(err) = std::fs::write(&path, rendered) {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(JsonError {
-                error: "write_failed",
-                detail: err.to_string(),
-            }),
-        )
-            .into_response();
-    }
     (
         StatusCode::OK,
         Json(JsonOk {
             ok: true,
-            path: path.display().to_string(),
+            path: applied.phrases_path.display().to_string(),
+            service: Some(applied.service.summary()),
         }),
     )
         .into_response()
@@ -713,6 +714,8 @@ struct JsonError {
 struct JsonOk {
     ok: bool,
     path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    service: Option<String>,
 }
 
 const AUTH_HTML: &str = r#"<!doctype html>

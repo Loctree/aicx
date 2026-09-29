@@ -572,6 +572,11 @@ fn local_open_shell_states_this_machine_and_does_not_offer_sign_in() {
     let list_at = html.find("id=\"ctx-list\"").expect("list");
     assert!(search_at < list_at);
     assert!(html.contains("id=\"ctx-onboarding-save\""));
+    assert!(html.contains("Save and continue"));
+    assert!(html.contains("Still reading the corpus"));
+    assert!(!html.contains("intent_phrases.toml"));
+    assert!(!html.contains("Save intent phrases"));
+    assert!(!html.contains("placeholder=\"i want"));
     assert!(html.contains("id=\"ctx-phrases\""));
 }
 
