@@ -582,6 +582,9 @@ fn local_open_shell_states_this_machine_and_does_not_offer_sign_in() {
 
 #[test]
 fn configured_home_shell_omits_survey_markup() {
+    let _unit_guard = crate::onboarding::SERVICE_UNIT_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
     let home = std::env::temp_dir().join(format!(
         "aicx-dash-configured-{}-{}",
         std::process::id(),
@@ -635,6 +638,9 @@ fn configured_home_shell_omits_survey_markup() {
 
 #[test]
 fn unconfigured_home_shell_includes_survey_markup() {
+    let _unit_guard = crate::onboarding::SERVICE_UNIT_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
     let home = std::env::temp_dir().join(format!(
         "aicx-dash-bare-{}-{}",
         std::process::id(),

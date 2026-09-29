@@ -95,6 +95,53 @@ impl InstallOptions {
     }
 }
 
+/// ProgramArguments the loopback HTTP service must run (LaunchAgent / `aicx serve`).
+///
+/// Host is always `127.0.0.1` (never `0.0.0.0`). Auth is off on loopback.
+/// Auto-refresh is the experimental opt-in — never `--no-auto-refresh`.
+pub fn loopback_http_argv(port: u16) -> Vec<String> {
+    vec![
+        "--transport".into(),
+        "http".into(),
+        "--host".into(),
+        "127.0.0.1".into(),
+        "--port".into(),
+        port.to_string(),
+        "--no-require-auth".into(),
+        "--experimental-auto-refresh".into(),
+    ]
+}
+
+/// How production invokes `tools/install-mcp-service.sh` without spawning it.
+///
+/// When `InstallOptions.script` points at a real file, argv is that path under
+/// `bash`. Otherwise stdin carries the embedded copy (`bash -s`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstallerInvocation {
+    pub program: &'static str,
+    pub args: Vec<std::ffi::OsString>,
+    pub stdin_embedded: bool,
+    pub port: u16,
+}
+
+/// Resolve the macOS service installer command the survey save would run.
+pub fn resolve_macos_installer_invocation(options: &InstallOptions) -> InstallerInvocation {
+    if let Some(script_path) = options.script.as_ref().filter(|path| path.is_file()) {
+        return InstallerInvocation {
+            program: "bash",
+            args: vec![script_path.as_os_str().to_os_string()],
+            stdin_embedded: false,
+            port: options.port,
+        };
+    }
+    InstallerInvocation {
+        program: "bash",
+        args: vec![std::ffi::OsString::from("-s")],
+        stdin_embedded: true,
+        port: options.port,
+    }
+}
+
 pub fn package_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
@@ -742,7 +789,6 @@ fn ensure_loopback_server(port: u16) -> Result<()> {
         }
     }
     let bin = std::env::current_exe().context("cannot resolve aicx binary")?;
-    let port_arg = port.to_string();
     let log_dir = crate::aicx_home::resolve()
         .unwrap_or_else(|_| PathBuf::from("."))
         .join("logs");
@@ -752,19 +798,11 @@ fn ensure_loopback_server(port: u16) -> Result<()> {
         .append(true)
         .open(log_dir.join("aicx-serve-http.log"))
         .ok();
+    let mut serve_args = vec!["serve".to_string()];
+    serve_args.extend(loopback_http_argv(port));
     let mut command = Command::new(bin);
     command
-        .args([
-            "serve",
-            "--transport",
-            "http",
-            "--host",
-            "127.0.0.1",
-            "--port",
-            port_arg.as_str(),
-            "--no-require-auth",
-            "--experimental-auto-refresh",
-        ])
+        .args(&serve_args)
         .stdin(Stdio::null())
         .stdout(Stdio::null());
     if let Some(log) = log {
@@ -910,13 +948,13 @@ fn open_dashboard(url: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Serializes tests that mutate process-global `AICX_SERVICE_UNIT`.
+#[cfg(test)]
+pub(crate) static SERVICE_UNIT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    /// Serializes tests that mutate process-global `AICX_SERVICE_UNIT`.
-    static SERVICE_UNIT_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn bare_home_needs_onboarding_until_marker_or_config() {
@@ -1259,6 +1297,85 @@ mod tests {
             bin.as_path()
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn production_installer_resolves_loopback_argv_without_launchctl() {
+        let script = locate_service_installer()
+            .expect("repo checkout must resolve tools/install-mcp-service.sh without a test stub");
+        assert!(
+            script.file_name().and_then(|name| name.to_str()) == Some("install-mcp-service.sh"),
+            "production installer must be install-mcp-service.sh, got {}",
+            script.display()
+        );
+        assert!(
+            script
+                .to_string_lossy()
+                .contains("tools/install-mcp-service"),
+            "installer path must stay under tools/, got {}",
+            script.display()
+        );
+
+        let options = InstallOptions {
+            dry_run: true,
+            platform_is_macos: true,
+            script: Some(script.clone()),
+            bin: None,
+            port: 8044,
+        };
+        let invocation = resolve_macos_installer_invocation(&options);
+        assert_eq!(invocation.program, "bash");
+        assert_eq!(
+            invocation.args,
+            vec![script.as_os_str().to_os_string()],
+            "production must exec the real installer path, not a stub"
+        );
+        assert!(!invocation.stdin_embedded);
+        assert_eq!(invocation.port, 8044);
+
+        let argv = loopback_http_argv(8044);
+        assert_eq!(
+            argv,
+            vec![
+                "--transport".to_string(),
+                "http".to_string(),
+                "--host".to_string(),
+                "127.0.0.1".to_string(),
+                "--port".to_string(),
+                "8044".to_string(),
+                "--no-require-auth".to_string(),
+                "--experimental-auto-refresh".to_string(),
+            ]
+        );
+        assert!(!argv.iter().any(|arg| arg == "0.0.0.0"));
+        assert!(!argv.iter().any(|arg| arg == "--no-auto-refresh"));
+
+        let body = std::fs::read_to_string(&script).expect("read installer");
+        assert_eq!(body, EMBEDDED_MCP_SERVICE_INSTALLER);
+        assert!(body.contains("HOST=\"${AICX_MCP_HOST:-127.0.0.1}\""));
+        assert!(body.contains("PORT=\"${AICX_MCP_PORT:-8044}\""));
+        assert!(body.contains("--experimental-auto-refresh"));
+        assert!(body.contains("--no-require-auth"));
+        assert!(!body.contains("0.0.0.0"));
+        // Comment may mention the flag as forbidden; the ProgramArguments array must not.
+        let program_args = body
+            .split("<key>ProgramArguments</key>")
+            .nth(1)
+            .and_then(|rest| rest.split("</array>").next())
+            .expect("ProgramArguments array");
+        assert!(
+            !program_args.contains("--no-auto-refresh"),
+            "LaunchAgent argv must not disable auto-refresh"
+        );
+        assert!(program_args.contains("--experimental-auto-refresh"));
+        assert!(program_args.contains("$HOST_XML"));
+        assert!(program_args.contains("$PORT_XML"));
+
+        let skipped = install_launch_agent(&options);
+        assert!(
+            skipped.summary().contains("dry-run"),
+            "this lock must not call launchctl"
+        );
     }
 
     #[test]
