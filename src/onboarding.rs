@@ -1134,6 +1134,55 @@ mod tests {
     }
 
     #[test]
+    fn empty_home_opens_the_dashboard_path() {
+        let root = std::env::temp_dir().join(format!("aicx-first-start-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        assert!(
+            bare_start_opens_dashboard(&root),
+            "no first-run marker must still open/print the dashboard"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn marked_configured_home_stays_on_short_help() {
+        let root = std::env::temp_dir().join(format!("aicx-configured-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("state")).unwrap();
+        std::fs::write(root.join("intent_phrases.toml"), "phrases = [\"find\"]\n").unwrap();
+        write_embedder_choice(&root, "gguf", None).unwrap();
+        std::fs::write(
+            root.join("state/whats-new-offered"),
+            format!("{}\n", package_version()),
+        )
+        .unwrap();
+        mark_complete(&root).unwrap();
+        let unit = root.join("aicx-mcp.plist");
+        std::fs::write(
+            &unit,
+            "--transport http --host 127.0.0.1 --port 18044 --no-require-auth --experimental-auto-refresh\n",
+        )
+        .unwrap();
+        let previous_unit = std::env::var_os("AICX_SERVICE_UNIT");
+        unsafe {
+            std::env::set_var("AICX_SERVICE_UNIT", &unit);
+        }
+        let opens = bare_start_opens_dashboard(&root);
+        unsafe {
+            match previous_unit {
+                Some(value) => std::env::set_var("AICX_SERVICE_UNIT", value),
+                None => std::env::remove_var("AICX_SERVICE_UNIT"),
+            }
+        }
+        assert!(
+            !opens,
+            "after this version is configured, bare aicx must not reopen the dashboard"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn configured_version_does_not_open_the_browser() {
         assert!(!steady_state_opens_browser());
         assert!(!survey_required(false, Some("gguf"), true));
