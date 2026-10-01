@@ -355,6 +355,7 @@ fn watermark_coverage_follows_the_recording_key_agents() {
         "grok",
         "kimi",
         "cursor",
+        "copilot",
         "codescribe",
     ];
     let project = Vec::new();
@@ -384,6 +385,13 @@ fn watermark_coverage_follows_the_recording_key_agents() {
     assert!(covered.contains("kimi"));
     assert!(!covered.contains("cursor"));
 
+    // The previous all composition covers Cursor but never the new Copilot history.
+    let mut state = StateManager::default();
+    state.update_watermark(&format!("{CURSOR_ALL_WATERMARK_KEY}:all"), Utc::now());
+    let covered = watermark_covered_agents(&state, &key, &aliases);
+    assert!(covered.contains("cursor"));
+    assert!(!covered.contains("copilot"));
+
     // Once the canonical key itself holds a watermark (a run of the current
     // composition recorded it), every requested agent is covered.
     let mut state = StateManager::default();
@@ -391,6 +399,7 @@ fn watermark_coverage_follows_the_recording_key_agents() {
     let covered = watermark_covered_agents(&state, &key, &aliases);
     assert!(covered.contains("kimi"));
     assert!(covered.contains("cursor"));
+    assert!(covered.contains("copilot"));
     assert_eq!(covered.len(), agents.len());
 }
 
@@ -406,6 +415,7 @@ fn watermark_coverage_unions_alias_generations() {
         "grok",
         "kimi",
         "cursor",
+        "copilot",
         "codescribe",
     ];
     let project = Vec::new();
@@ -911,6 +921,7 @@ fn intents_project_resolver_uses_catalog_without_legacy_cards() {
         source_path: root.join("source.jsonl").display().to_string(),
         source_len: None,
         source_mtime_ns: None,
+        source_bundle_fingerprint: None,
         title: None,
         machine: None,
         logical_session_id: None,
@@ -2781,6 +2792,9 @@ fn extract_every_agent_subcommand_parses() {
         ("grok", ExtractAgent::Grok),
         ("junie", ExtractAgent::Junie),
         ("kimi", ExtractAgent::Kimi),
+        ("copilot", ExtractAgent::Copilot),
+        ("copilot-cli", ExtractAgent::Copilot),
+        ("github-copilot", ExtractAgent::Copilot),
     ] {
         let cli = Cli::try_parse_from(["aicx", "extract", name, "--session", "abc12345"])
             .unwrap_or_else(|error| panic!("agent subcommand `{name}` must parse: {error}"));
@@ -2891,18 +2905,32 @@ fn conversations_accepts_claude_agent_and_out_dir() {
 }
 
 #[test]
-fn conversations_rejects_non_claude_agent_for_v1() {
-    let err = Cli::try_parse_from([
-        "aicx",
-        "conversations",
-        "--agent",
+fn conversations_accepts_registered_providers_and_aliases() {
+    for agent in [
+        "claude",
         "codex",
-        "--out-dir",
-        "/tmp/aicx-conversations",
-    ])
-    .expect_err("conversations v1 should reject non-claude agents");
-
-    assert!(err.to_string().contains("possible values"));
+        "gemini",
+        "grok",
+        "junie",
+        "kimi",
+        "cursor",
+        "copilot",
+        "copilot-cli",
+    ] {
+        let cli = Cli::try_parse_from([
+            "aicx",
+            "conversations",
+            "--agent",
+            agent,
+            "--out-dir",
+            "/tmp/aicx-conversations",
+        ])
+        .unwrap();
+        let Some(Commands::Conversations { agent: parsed, .. }) = cli.command else {
+            panic!("conversations command expected")
+        };
+        assert!(aicx::session_catalog::AgentKind::parse(&parsed).is_some());
+    }
 }
 
 #[test]

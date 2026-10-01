@@ -12,6 +12,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- GitHub Copilot CLI sessions (`copilot`, aliases `copilot-cli`,
+  `github-copilot`, and `github-copilot-cli`) across discovery/catalog, readable extracts, bulk exports,
+  conversation JSON, intents, handoff briefs, source indexing/search, and MCP.
+  Read `~/.copilot/session-state/<id>/events.jsonl` with optional `workspace.yaml`
+  metadata; preserve message/tool provenance and expose unsupported visible
+  events as incomplete coverage. Source-bundle fingerprints include metadata
+  changes, and append-safe incremental processing retains stable session IDs.
+
 ### Fixed
 
 - Avoid re-parsing full project history before an unchanged `overlay` cache hit.

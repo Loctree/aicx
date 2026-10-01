@@ -54,6 +54,10 @@ pub struct CatalogEntry {
     /// instead of treating path-stable catalog rows as frozen.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_mtime_ns: Option<u64>,
+    /// Independent evidence for optional source artifacts. Legacy rows lack
+    /// this receipt and are refreshed when a bundled source is next admitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_bundle_fingerprint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -69,15 +73,15 @@ pub struct CatalogEntry {
 
 /// Size + mtime-ns for a path. Returns `None` when the file is unreadable.
 pub fn live_source_fingerprint(path: &Path) -> Option<(u64, u64)> {
-    let metadata = fs::metadata(path).ok()?;
-    let mtime_ns = metadata
-        .modified()
-        .ok()?
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()?
-        .as_nanos();
+    let fingerprint = live_source_bundle_fingerprint(path)?;
     // u64 covers unix nanos until year ~2554; truncation is intentional.
-    Some((metadata.len(), mtime_ns as u64))
+    Some((fingerprint.len, fingerprint.modified_unix_nanos as u64))
+}
+
+/// Live source evidence with distinct artifact identity, including Copilot's
+/// optional workspace sidecar. Size and mtime remain physical measurements.
+pub fn live_source_bundle_fingerprint(path: &Path) -> Option<session_catalog::SourceFingerprint> {
+    session_catalog::source_bundle_fingerprint(path).ok()
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -283,7 +287,7 @@ pub fn project_identities_from_catalog_at(aicx_home: &Path) -> Result<Vec<String
 
 /// Rebuild the durable catalog from live agent source roots.
 ///
-/// Walks claude / codex / gemini / grok / junie roots via
+/// Walks registered agent roots via
 /// [`SessionCatalog`], enriches with [`crate::sessions`] discovery for
 /// cwd/project/title when available, and writes one jsonl line per
 /// session. Never creates per-frame card files under `store/`.
@@ -300,7 +304,7 @@ pub fn rebuild_with_progress(
     let mut progress = RebuildProgress::preparing();
     on_progress(&progress);
 
-    let by_id = scan_live_entries_with_progress(home, user_home, started, &mut on_progress);
+    let by_id = scan_live_entries_with_progress(home, user_home, started, &mut on_progress)?;
 
     progress.stage = RebuildStage::Serializing;
     progress.sessions = by_id.len();
@@ -372,7 +376,7 @@ pub fn status(home: &Path, user_home: &Path) -> Result<CatalogStatusReport> {
         None
     };
     let catalog_entries = read_entries_at(home)?;
-    let live = scan_live_entries(home, user_home);
+    let live = scan_live_entries(home, user_home)?;
 
     let mut counts = StalenessCounts::default();
     let mut by_agent: BTreeMap<String, StalenessCounts> = BTreeMap::new();
@@ -399,7 +403,10 @@ pub fn status(home: &Path, user_home: &Path) -> Result<CatalogStatusReport> {
 
         match (live_fp, entry.source_len, entry.source_mtime_ns) {
             (Some((live_len, live_mtime)), Some(cat_len), Some(cat_mtime))
-                if live_len == cat_len && live_mtime == cat_mtime =>
+                if live_len == cat_len
+                    && live_mtime == cat_mtime
+                    && live_entry.and_then(|live| live.source_bundle_fingerprint.as_ref())
+                        == entry.source_bundle_fingerprint.as_ref() =>
             {
                 counts.current += 1;
                 agent_counts.current += 1;
@@ -549,7 +556,30 @@ const LIVE_DELTA_CUTOFF_TOLERANCE_NS: u128 = 60 * 1_000_000_000;
 static LIVE_DELTA_CACHE: std::sync::Mutex<Option<(Instant, PathBuf, PathBuf, u128, LiveDelta)>> =
     std::sync::Mutex::new(None);
 
+// A synthetic test delta must survive cache invalidation by other tests and
+// must never fall through to the developer's real session roots.
+#[cfg(test)]
+thread_local! {
+    #[allow(clippy::type_complexity)]
+    static TEST_LIVE_DELTA_CACHE: std::cell::RefCell<Option<(PathBuf, u128, LiveDelta)>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
 pub fn live_delta(home: &Path, user_home: &Path, cutoff_unix_ns: u128) -> Result<LiveDelta> {
+    #[cfg(test)]
+    if let Some(delta) = TEST_LIVE_DELTA_CACHE.with(|fixture| {
+        fixture
+            .borrow()
+            .as_ref()
+            .and_then(|(fixture_home, cutoff, delta)| {
+                (fixture_home == home
+                    && cutoff.abs_diff(cutoff_unix_ns) <= LIVE_DELTA_CUTOFF_TOLERANCE_NS)
+                    .then(|| delta.clone())
+            })
+    }) {
+        return Ok(delta);
+    }
     if let Ok(guard) = LIVE_DELTA_CACHE.lock()
         && let Some((stamp, cached_home, cached_user_home, cached_cutoff, delta)) = guard.as_ref()
         && stamp.elapsed() < LIVE_DELTA_CACHE_TTL
@@ -572,24 +602,18 @@ pub fn live_delta(home: &Path, user_home: &Path, cutoff_unix_ns: u128) -> Result
     Ok(delta)
 }
 
-/// Seed the live-delta cache so unit tests exercise the intents live window
-/// without walking the developer's real agent roots.
+/// Supply a thread-local delta so tests exercise the intents live window
+/// without walking real agent roots or racing the process-global cache.
 #[cfg(test)]
 pub(crate) fn prime_live_delta_cache_for_tests(
     home: &Path,
-    user_home: &Path,
+    _user_home: &Path,
     cutoff_unix_ns: u128,
     delta: LiveDelta,
 ) {
-    if let Ok(mut guard) = LIVE_DELTA_CACHE.lock() {
-        *guard = Some((
-            Instant::now(),
-            home.to_path_buf(),
-            user_home.to_path_buf(),
-            cutoff_unix_ns,
-            delta,
-        ));
-    }
+    TEST_LIVE_DELTA_CACHE.with(|fixture| {
+        *fixture.borrow_mut() = Some((home.to_path_buf(), cutoff_unix_ns, delta));
+    });
 }
 
 fn live_delta_uncached(home: &Path, user_home: &Path, cutoff_unix_ns: u128) -> Result<LiveDelta> {
@@ -605,20 +629,26 @@ fn live_delta_uncached(home: &Path, user_home: &Path, cutoff_unix_ns: u128) -> R
     // disk. The cost of that trust: path-derived fields (cwd, project guess)
     // of an untouched source are not re-derived when the derivation itself
     // improves; `aicx catalog rebuild` is the pass that does.
-    let known_fingerprints: BTreeMap<&str, (u64, u128)> = catalog_by_key
+    let known_fingerprints: BTreeMap<&str, (u64, u128, Option<&str>)> = catalog_by_key
         .values()
         .filter_map(|entry| {
             Some((
                 entry.source_path.as_str(),
-                (entry.source_len?, entry.source_mtime_ns? as u128),
+                (
+                    entry.source_len?,
+                    entry.source_mtime_ns? as u128,
+                    entry.source_bundle_fingerprint.as_deref(),
+                ),
             ))
         })
         .collect();
     let is_known = |path: &Path, fingerprint: &crate::session_catalog::SourceFingerprint| {
         known_fingerprints
             .get(path.to_string_lossy().as_ref())
-            .is_some_and(|(len, modified)| {
-                *len == fingerprint.len && *modified == fingerprint.modified_unix_nanos
+            .is_some_and(|(len, modified, bundle)| {
+                *len == fingerprint.len
+                    && *modified == fingerprint.modified_unix_nanos
+                    && *bundle == fingerprint.bundle_fingerprint.as_deref()
             })
     };
 
@@ -633,17 +663,27 @@ fn live_delta_uncached(home: &Path, user_home: &Path, cutoff_unix_ns: u128) -> R
         AgentKind::Grok,
         AgentKind::Junie,
         AgentKind::Kimi,
+        AgentKind::Copilot,
     ];
     for agent in agents {
         let root = agent_source_root(agent, user_home);
-        if !root.exists() {
+        if !(if agent == AgentKind::Copilot {
+            root.try_exists()
+                .with_context(|| format!("inspect copilot root {}", root.display()))?
+        } else {
+            root.exists()
+        }) {
             continue;
         }
-        let Ok(catalog) = SessionCatalog::new(agent, &root) else {
-            continue;
+        let catalog = match SessionCatalog::new(agent, &root) {
+            Ok(catalog) => catalog,
+            Err(error) if agent == AgentKind::Copilot => return Err(error.into()),
+            Err(_) => continue,
         };
-        let Ok(scan) = catalog.scan_hot_window_skipping(cutoff_unix_ns, &is_known) else {
-            continue;
+        let scan = match catalog.scan_hot_window_skipping(cutoff_unix_ns, &is_known) {
+            Ok(scan) => scan,
+            Err(error) if agent == AgentKind::Copilot => return Err(error.into()),
+            Err(_) => continue,
         };
         live_sessions += scan.total_candidates;
         if let Some(newest) = scan.newest_modified_unix_nanos {
@@ -687,6 +727,7 @@ fn live_delta_uncached(home: &Path, user_home: &Path, cutoff_unix_ns: u128) -> R
                 cataloged.source_path != entry.source_path
                     || cataloged.source_len != entry.source_len
                     || cataloged.source_mtime_ns != entry.source_mtime_ns
+                    || cataloged.source_bundle_fingerprint != entry.source_bundle_fingerprint
                     || cataloged.project != entry.project
                     || cataloged.cwd != entry.cwd
             })
@@ -796,7 +837,10 @@ pub fn refresh_hot(
     })
 }
 
-fn scan_live_entries(home: &Path, user_home: &Path) -> BTreeMap<(String, String), CatalogEntry> {
+fn scan_live_entries(
+    home: &Path,
+    user_home: &Path,
+) -> Result<BTreeMap<(String, String), CatalogEntry>> {
     scan_live_entries_with_progress(home, user_home, Instant::now(), &mut |_| {})
 }
 
@@ -805,7 +849,7 @@ fn scan_live_entries_with_progress(
     user_home: &Path,
     started: Instant,
     on_progress: &mut impl FnMut(&RebuildProgress),
-) -> BTreeMap<(String, String), CatalogEntry> {
+) -> Result<BTreeMap<(String, String), CatalogEntry>> {
     let mut by_id: BTreeMap<(String, String), CatalogEntry> = BTreeMap::new();
     let mut progress = RebuildProgress::preparing();
     on_progress(&progress);
@@ -818,6 +862,7 @@ fn scan_live_entries_with_progress(
         AgentKind::Grok,
         AgentKind::Junie,
         AgentKind::Kimi,
+        AgentKind::Copilot,
     ];
     for (agent_offset, agent) in agents.into_iter().enumerate() {
         progress.stage = RebuildStage::ScanningSources;
@@ -828,11 +873,17 @@ fn scan_live_entries_with_progress(
         on_progress(&progress);
 
         let root = agent_source_root(agent, user_home);
-        if !root.exists() {
+        if !(if agent == AgentKind::Copilot {
+            root.try_exists()
+                .with_context(|| format!("inspect copilot root {}", root.display()))?
+        } else {
+            root.exists()
+        }) {
             continue;
         }
         let catalog = match SessionCatalog::new(agent, &root) {
             Ok(c) => c,
+            Err(error) if agent == AgentKind::Copilot => return Err(error.into()),
             Err(_) => continue,
         };
         let scan = catalog.scan_with_stats_and_progress(|io| {
@@ -843,6 +894,7 @@ fn scan_live_entries_with_progress(
         });
         let sources = match scan.result {
             Ok(s) => s,
+            Err(error) if agent == AgentKind::Copilot => return Err(error.into()),
             Err(_) => continue,
         };
         for source in sources {
@@ -874,7 +926,7 @@ fn scan_live_entries_with_progress(
     reattribute_catalog_entries(&mut by_id, &mut memo);
     memo.persist();
 
-    by_id
+    Ok(by_id)
 }
 
 fn push_sample(
@@ -940,7 +992,7 @@ fn recommendations_for(readiness: CatalogReadiness, counts: &StalenessCounts) ->
         }
         CatalogReadiness::Empty => {
             out.push(
-                "No agent session sources found under ~/.claude|codex|gemini|grok|junie or vibecrafted runtime_runs."
+                "No agent session sources found under ~/.claude|codex|gemini|grok|junie|kimi-code|cursor, ~/.copilot/session-state or vibecrafted runtime_runs."
                     .into(),
             );
             out.push(
@@ -999,7 +1051,7 @@ fn recommendations_for(readiness: CatalogReadiness, counts: &StalenessCounts) ->
 fn multi_host_notes(by_machine: &BTreeMap<String, usize>, counts: &StalenessCounts) -> Vec<String> {
     let mut notes = vec![
         "Catalog discovers only local agent source roots on the host running rebuild/status.".into(),
-        "Alternative store drop dirs are not scanned; put JSONL under ~/.claude/projects, ~/.codex/sessions, ~/.cursor/projects, ~/.gemini/tmp, ~/.grok/sessions, ~/.junie/sessions, ~/.kimi-code/sessions, or ~/.vibecrafted/control_plane/runtime_runs.".into(),
+        "Alternative store drop dirs are not scanned; put JSONL under ~/.claude/projects, ~/.codex/sessions, ~/.cursor/projects, ~/.gemini/tmp, ~/.grok/sessions, ~/.junie/sessions, ~/.kimi-code/sessions, ~/.copilot/session-state, or ~/.vibecrafted/control_plane/runtime_runs.".into(),
         "AICX_HOME / [storage].home relocates the whole home (catalog+index+extracts), not a second session intake path.".into(),
         "Dense indexes are model+dimension locked. Laptop 0.6b vectors must not merge into the owner's 8b CURRENT — lexical Tantivy can be rebuilt on the owner host from shared sources.".into(),
         "Remote agents: `aicx serve --transport http` with Bearer token (not OAuth). Prefer one index owner and point remotes at its streamable HTTP + embedder URL.".into(),
@@ -1052,6 +1104,7 @@ pub fn resolve_session(home: &Path, session_id: &str) -> Result<Option<CatalogEn
                 fingerprint: SourceFingerprint {
                     len: entry.source_len.unwrap_or_default(),
                     modified_unix_nanos: entry.source_mtime_ns.unwrap_or_default() as u128,
+                    bundle_fingerprint: entry.source_bundle_fingerprint.clone(),
                 },
                 header_truncated: false,
             })
@@ -1102,6 +1155,7 @@ fn agent_source_root(agent: AgentKind, user_home: &Path) -> PathBuf {
         AgentKind::Grok => user_home.join(".grok").join("sessions"),
         AgentKind::Junie => user_home.join(".junie").join("sessions"),
         AgentKind::Kimi => user_home.join(".kimi-code").join("sessions"),
+        AgentKind::Copilot => session_catalog::copilot_session_root(user_home),
     }
 }
 
@@ -1127,29 +1181,46 @@ fn is_primary_catalog_source(agent: AgentKind, path: &Path) -> bool {
                 && stem == parent
                 && stem.is_some_and(is_uuid)
         }
+        AgentKind::Copilot => session_catalog::is_copilot_source_file(path),
         _ => true,
     }
 }
 
 fn entry_from_source(agent: AgentKind, source: &CatalogSource) -> CatalogEntry {
+    // Only selected sources are enriched. Reading a changed Copilot stream
+    // through EOF is necessary because session.resume may occur well beyond
+    // the catalog's bounded identity header and move the working repository.
+    let copilot = (agent == AgentKind::Copilot)
+        .then(|| crate::sessions::scan_copilot_session_file(&source.path, &source.source_id))
+        .flatten();
     let session_id = if agent == AgentKind::Grok {
         grok_session_id_from_path(&source.path).unwrap_or_else(|| source.source_id.clone())
     } else {
         source.source_id.clone()
     };
-    let cwd = infer_cwd_from_path(agent, &source.path);
-    let project = cwd
-        .as_deref()
-        .and_then(project_from_cwd)
+    let cwd = copilot
+        .as_ref()
+        .and_then(|metadata| metadata.repo_path.clone())
+        .or_else(|| infer_cwd_from_path(agent, &source.path));
+    let project = copilot
+        .as_ref()
+        .and_then(|metadata| metadata.project.clone())
+        .or_else(|| cwd.as_deref().and_then(project_from_cwd))
         .or_else(|| infer_project_from_path(agent, &source.path))
         .map(|slug| canonicalize_project_slug(&slug));
-    let date = source
-        .fingerprint
-        .modified_unix_nanos
-        .checked_div(1_000_000_000)
-        .and_then(|secs| {
-            chrono::DateTime::from_timestamp(secs as i64, 0)
-                .map(|dt| dt.format("%Y-%m-%d").to_string())
+    let date = copilot
+        .as_ref()
+        .and_then(|metadata| metadata.updated_at.or(metadata.started_at))
+        .map(|timestamp| timestamp.format("%Y-%m-%d").to_string())
+        .or_else(|| {
+            source
+                .fingerprint
+                .modified_unix_nanos
+                .checked_div(1_000_000_000)
+                .and_then(|secs| {
+                    chrono::DateTime::from_timestamp(secs as i64, 0)
+                        .map(|dt| dt.format("%Y-%m-%d").to_string())
+                })
         });
     CatalogEntry {
         schema: CATALOG_SCHEMA.to_string(),
@@ -1161,7 +1232,8 @@ fn entry_from_source(agent: AgentKind, source: &CatalogSource) -> CatalogEntry {
         source_path: source.path.display().to_string(),
         source_len: Some(source.fingerprint.len),
         source_mtime_ns: Some(source.fingerprint.modified_unix_nanos as u64),
-        title: None,
+        source_bundle_fingerprint: source.fingerprint.bundle_fingerprint.clone(),
+        title: copilot.and_then(|metadata| metadata.title),
         machine: hostname(),
         logical_session_id: if agent == AgentKind::Grok {
             Some(session_id)
@@ -1221,9 +1293,11 @@ fn merge_session_info(
         .updated_at
         .or(info.started_at)
         .map(|dt| dt.format("%Y-%m-%d").to_string());
-    let (source_len, source_mtime_ns) = live_source_fingerprint(&info.source_path)
-        .map(|(len, mtime)| (Some(len), Some(mtime)))
-        .unwrap_or((None, None));
+    let fingerprint = live_source_bundle_fingerprint(&info.source_path);
+    let source_len = fingerprint.as_ref().map(|fingerprint| fingerprint.len);
+    let source_mtime_ns = fingerprint
+        .as_ref()
+        .map(|fingerprint| fingerprint.modified_unix_nanos as u64);
     let entry = by_id.entry(key).or_insert_with(|| CatalogEntry {
         schema: CATALOG_SCHEMA.to_string(),
         session_id: info.session_id.clone(),
@@ -1234,6 +1308,8 @@ fn merge_session_info(
         source_path: info.source_path.display().to_string(),
         source_len,
         source_mtime_ns,
+        source_bundle_fingerprint: fingerprint
+            .and_then(|fingerprint| fingerprint.bundle_fingerprint),
         title: info.title.clone(),
         machine: hostname(),
         logical_session_id: None,
@@ -1263,9 +1339,10 @@ fn merge_session_info(
     }
     // Refresh fingerprint whenever discovery sees the live file — rebuild must
     // admit source appends even when session id/path are unchanged.
-    if let Some((len, mtime)) = live_source_fingerprint(&info.source_path) {
-        entry.source_len = Some(len);
-        entry.source_mtime_ns = Some(mtime);
+    if let Some(fingerprint) = live_source_bundle_fingerprint(&info.source_path) {
+        entry.source_len = Some(fingerprint.len);
+        entry.source_mtime_ns = Some(fingerprint.modified_unix_nanos as u64);
+        entry.source_bundle_fingerprint = fingerprint.bundle_fingerprint;
     }
 }
 
@@ -1315,6 +1392,7 @@ fn enrich_runtime_runs(by_id: &mut BTreeMap<(String, String), CatalogEntry>, use
             source_path: transcript.display().to_string(),
             source_len,
             source_mtime_ns,
+            source_bundle_fingerprint: None,
             title: Some("runtime_run transcript".to_string()),
             machine: hostname(),
             logical_session_id: None,
@@ -1691,6 +1769,216 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    #[test]
+    fn copilot_broken_provider_root_fails_catalog_operations_and_preserves_prior_catalog() {
+        let dir = test_root("copilot-provider-error");
+        let home = dir.join(".aicx");
+        let user = dir.join("user");
+        let root = user.join(".copilot").join("session-state");
+        fs::create_dir_all(root.parent().unwrap()).unwrap();
+        fs::write(&root, "not a directory").unwrap();
+        fs::create_dir_all(catalog_dir_for(&home)).unwrap();
+        let before = "existing durable catalog\n";
+        fs::write(sessions_path_for(&home), before).unwrap();
+        assert!(rebuild(&home, &user).is_err());
+        assert_eq!(
+            fs::read_to_string(sessions_path_for(&home)).unwrap(),
+            before
+        );
+        assert!(live_delta_uncached(&home, &user, 0).is_err());
+        fs::remove_file(&root).unwrap();
+        fs::remove_file(sessions_path_for(&home)).unwrap();
+        assert!(rebuild(&home, &user).unwrap().total_sessions == 0);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn copilot_named_sdk_session_is_admitted_into_durable_catalog() {
+        let dir = test_root("copilot-named-session");
+        let home = dir.join(".aicx");
+        let user = dir.join("user");
+        let id = "user-123-task-456";
+        let directory = user.join(".copilot").join("session-state").join(id);
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("events.jsonl"), format!("{{\"type\":\"session.start\",\"timestamp\":\"2026-06-01T12:00:00Z\",\"data\":{{\"sessionId\":\"{id}\",\"context\":{{\"cwd\":\"/owner/repo\",\"repository\":\"owner/repo\"}}}}}}\n")).unwrap();
+        rebuild(&home, &user).unwrap();
+        let rows = read_entries_at(&home).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].session_id, id);
+        assert_eq!(
+            resolve_session(&home, "user-123")
+                .unwrap()
+                .unwrap()
+                .session_id,
+            id
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn copilot_catalog_hot_refresh_observes_sidecar_metadata_only_change() {
+        let dir = test_root("copilot-sidecar-refresh");
+        let home = dir.join(".aicx");
+        let user = dir.join("user");
+        let id = "12345678-1234-1234-1234-123456789abc";
+        let session = user.join(".copilot").join("session-state").join(id);
+        fs::create_dir_all(&session).unwrap();
+        let events = session.join("events.jsonl");
+        fs::write(&events, format!("{{\"type\":\"session.start\",\"timestamp\":\"2026-06-01T12:00:00Z\",\"data\":{{\"sessionId\":\"{id}\"}}}}\n")).unwrap();
+        let sidecar = session.join("workspace.yaml");
+        fs::write(
+            &sidecar,
+            "cwd: /repo/first\nrepository: owner/first\nname: first title\n",
+        )
+        .unwrap();
+        let report = rebuild(&home, &user).unwrap();
+        assert_eq!(report.agents.get("copilot"), Some(&1));
+        let entry = read_entries_at(&home).unwrap().pop().unwrap();
+        assert_eq!(entry.session_id, id);
+        assert_eq!(entry.project.as_deref(), Some("owner/first"));
+        assert_eq!(entry.title.as_deref(), Some("first title"));
+        assert!(
+            live_delta_uncached(&home, &user, 0)
+                .unwrap()
+                .changed
+                .is_empty()
+        );
+        fs::write(
+            &sidecar,
+            "cwd: /repo/other\nrepository: owner/other\nname: other title\n",
+        )
+        .unwrap();
+        filetime::set_file_mtime(
+            &sidecar,
+            filetime::FileTime::from_unix_time(
+                (entry.source_mtime_ns.unwrap() / 1_000_000_000) as i64 + 2,
+                0,
+            ),
+        )
+        .unwrap();
+        let delta = live_delta_uncached(&home, &user, 0).unwrap();
+        assert_eq!(delta.changed.len(), 1);
+        assert_eq!(delta.changed[0].project.as_deref(), Some("owner/other"));
+        assert_eq!(delta.changed[0].title.as_deref(), Some("other title"));
+        refresh_hot(&home, &user, 0).unwrap();
+        let entry = read_entries_at(&home).unwrap().pop().unwrap();
+        assert_eq!(entry.cwd.as_deref(), Some("/repo/other"));
+        assert_eq!(entry.project.as_deref(), Some("owner/other"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn copilot_catalog_status_and_hot_admission_notice_sidecar_edits_below_event_mtime() {
+        let dir = test_root("copilot-independent-artifacts");
+        let home = dir.join(".aicx");
+        let user = dir.join("user");
+        let session = user.join(".copilot/session-state/user-123-task-456");
+        fs::create_dir_all(&session).unwrap();
+        let events = session.join("events.jsonl");
+        fs::write(&events, "{\"type\":\"session.start\",\"timestamp\":\"2026-06-01T12:00:00Z\",\"data\":{\"sessionId\":\"user-123-task-456\"}}\n").unwrap();
+        filetime::set_file_mtime(
+            &events,
+            filetime::FileTime::from_unix_time(2_000_000_000, 0),
+        )
+        .unwrap();
+        let sidecar = session.join("workspace.yaml");
+        fs::write(&sidecar, "cwd: /repo/first\nname: first title\n").unwrap();
+        filetime::set_file_mtime(
+            &sidecar,
+            filetime::FileTime::from_unix_time(1_700_000_000, 0),
+        )
+        .unwrap();
+        rebuild(&home, &user).unwrap();
+        let before = read_entries_at(&home).unwrap().pop().unwrap();
+        assert!(before.source_bundle_fingerprint.is_some());
+        fs::write(&sidecar, "cwd: /repo/other\nname: other title\n").unwrap();
+        filetime::set_file_mtime(
+            &sidecar,
+            filetime::FileTime::from_unix_time(1_700_000_001, 0),
+        )
+        .unwrap();
+        let live = live_source_bundle_fingerprint(&events).unwrap();
+        assert_eq!(before.source_len, Some(live.len));
+        assert_eq!(
+            before.source_mtime_ns,
+            Some(live.modified_unix_nanos as u64)
+        );
+        assert_ne!(before.source_bundle_fingerprint, live.bundle_fingerprint);
+        assert_eq!(status(&home, &user).unwrap().counts.stale, 1);
+        let delta = live_delta_uncached(&home, &user, 0).unwrap();
+        assert_eq!(delta.changed.len(), 1);
+        assert_eq!(delta.changed[0].title.as_deref(), Some("other title"));
+        refresh_hot(&home, &user, 0).unwrap();
+        let after = read_entries_at(&home).unwrap().pop().unwrap();
+        assert_eq!(after.cwd.as_deref(), Some("/repo/other"));
+        assert_eq!(after.source_bundle_fingerprint, live.bundle_fingerprint);
+        assert!(
+            live_delta_uncached(&home, &user, 0)
+                .unwrap()
+                .changed
+                .is_empty()
+        );
+        assert_eq!(status(&home, &user).unwrap().counts.current, 1);
+        // Old catalog JSON has no bundle receipt and must be admitted once.
+        let mut legacy = serde_json::to_value(after).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("source_bundle_fingerprint");
+        fs::write(sessions_path_for(&home), format!("{legacy}\n")).unwrap();
+        assert_eq!(
+            live_delta_uncached(&home, &user, 0).unwrap().changed.len(),
+            1
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn copilot_hot_catalog_uses_resume_metadata_beyond_identity_header() {
+        let dir = test_root("copilot-resume-refresh");
+        let home = dir.join(".aicx");
+        let user = dir.join("user");
+        let id = "12345678-1234-1234-1234-123456789abc";
+        let session = user.join(".copilot").join("session-state").join(id);
+        fs::create_dir_all(&session).unwrap();
+        let mut file = File::create(session.join("events.jsonl")).unwrap();
+        writeln!(file, r#"{{"type":"session.start","timestamp":"2026-06-01T12:00:00Z","data":{{"sessionId":"{id}","context":{{"cwd":"/repo/old","repository":"owner/old"}}}}}}"#).unwrap();
+        for _ in 0..session_catalog::MAX_HEADER_LINES {
+            writeln!(file, r#"{{"type":"hook.end","data":{{}}}}"#).unwrap();
+        }
+        writeln!(file, r#"{{"type":"session.resume","timestamp":"2026-06-02T12:00:00Z","data":{{"context":{{"cwd":"/repo/current","repository":"owner/current"}}}}}}"#).unwrap();
+        let delta = live_delta_uncached(&home, &user, 0).unwrap();
+        assert_eq!(delta.changed.len(), 1);
+        assert_eq!(delta.changed[0].session_id, id);
+        assert_eq!(delta.changed[0].cwd.as_deref(), Some("/repo/current"));
+        assert_eq!(delta.changed[0].project.as_deref(), Some("owner/current"));
+        assert_eq!(delta.changed[0].date.as_deref(), Some("2026-06-02"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn copilot_hot_catalog_uses_direct_context_change_beyond_identity_header() {
+        let dir = test_root("copilot-context-change-refresh");
+        let home = dir.join(".aicx");
+        let user = dir.join("user");
+        let id = "user-123-task-456";
+        let session = user.join(".copilot").join("session-state").join(id);
+        fs::create_dir_all(&session).unwrap();
+        let mut file = File::create(session.join("events.jsonl")).unwrap();
+        writeln!(file, r#"{{"type":"session.start","timestamp":"2026-06-01T12:00:00Z","data":{{"sessionId":"{id}","context":{{"cwd":"/repo/old","repository":"owner/old"}}}}}}"#).unwrap();
+        for _ in 0..session_catalog::MAX_HEADER_LINES {
+            writeln!(file, r#"{{"type":"hook.end","data":{{}}}}"#).unwrap();
+        }
+        writeln!(file, r#"{{"type":"session.context_changed","timestamp":"2026-06-02T12:00:00Z","data":{{"cwd":"/repo/current","repository":"owner/current"}}}}"#).unwrap();
+        let delta = live_delta_uncached(&home, &user, 0).unwrap();
+        assert_eq!(delta.changed.len(), 1);
+        assert_eq!(delta.changed[0].session_id, id);
+        assert_eq!(delta.changed[0].cwd.as_deref(), Some("/repo/current"));
+        assert_eq!(delta.changed[0].project.as_deref(), Some("owner/current"));
+        assert_eq!(delta.changed[0].date.as_deref(), Some("2026-06-02"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     fn test_root(label: &str) -> PathBuf {
         static N: AtomicU64 = AtomicU64::new(0);
         let nanos = SystemTime::now()
@@ -1817,6 +2105,7 @@ mod tests {
             source_path: "/tmp/x".into(),
             source_len: None,
             source_mtime_ns: None,
+            source_bundle_fingerprint: None,
             title: None,
             machine: None,
             logical_session_id: None,
@@ -1855,6 +2144,7 @@ mod tests {
                 source_path: format!("/tmp/{session_id}.jsonl"),
                 source_len: None,
                 source_mtime_ns: None,
+                source_bundle_fingerprint: None,
                 title: None,
                 machine: None,
                 logical_session_id: None,
@@ -2017,6 +2307,7 @@ mod tests {
             source_path: dir.join("does-not-exist.jsonl").display().to_string(),
             source_len: Some(10),
             source_mtime_ns: Some(1),
+            source_bundle_fingerprint: None,
             title: None,
             machine: Some("laptop".into()),
             logical_session_id: None,
@@ -2058,6 +2349,7 @@ mod tests {
             source_path: outside.display().to_string(),
             source_len: Some(source_len),
             source_mtime_ns: Some(source_mtime_ns),
+            source_bundle_fingerprint: None,
             title: None,
             machine: Some("laptop".into()),
             logical_session_id: None,
@@ -2139,6 +2431,7 @@ mod tests {
             source_path: source.display().to_string(),
             source_len: None,
             source_mtime_ns: None,
+            source_bundle_fingerprint: None,
             title: None,
             machine: None,
             logical_session_id: None,

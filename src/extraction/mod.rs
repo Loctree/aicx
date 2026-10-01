@@ -145,8 +145,20 @@ pub fn extract_agent_sessions(
         crate::session_catalog::AgentKind::Junie => home.join(".junie").join("sessions"),
         crate::session_catalog::AgentKind::Kimi => home.join(".kimi-code").join("sessions"),
         crate::session_catalog::AgentKind::Cursor => home.join(".cursor").join("projects"),
+        crate::session_catalog::AgentKind::Copilot => {
+            crate::session_catalog::copilot_session_root(&home)
+        }
     };
-    if !root.is_dir() {
+    let root_metadata = match fs::metadata(&root) {
+        Ok(metadata) => Some(metadata),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("cannot inspect {agent} session root {}", root.display())
+            });
+        }
+    };
+    if root_metadata.is_none() {
         // No session root means this agent has never written a session on
         // this host: zero sources, not a failed adapter claim. Typed refusals
         // are reserved for sources that exist and were understood.
@@ -157,6 +169,11 @@ pub fn extract_agent_sessions(
         ));
         return Ok(SessionExtractionBatch::default());
     }
+    anyhow::ensure!(
+        root_metadata.is_some_and(|metadata| metadata.is_dir()),
+        "{agent} session root is not a directory: {}",
+        root.display()
+    );
     let scan = crate::session_catalog::SessionCatalog::new(agent, &root)?.scan_with_stats();
     let parser_agent_kind = parser_agent(agent);
     let mut batch = SessionExtractionBatch::default();
@@ -426,6 +443,7 @@ const fn parser_agent(agent: crate::session_catalog::AgentKind) -> aicx_parser::
         crate::session_catalog::AgentKind::Grok => aicx_parser::engine::AgentKind::Grok,
         crate::session_catalog::AgentKind::Junie => aicx_parser::engine::AgentKind::Junie,
         crate::session_catalog::AgentKind::Kimi => aicx_parser::engine::AgentKind::Kimi,
+        crate::session_catalog::AgentKind::Copilot => aicx_parser::engine::AgentKind::Copilot,
     }
 }
 

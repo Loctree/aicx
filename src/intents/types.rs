@@ -365,6 +365,9 @@ impl MixedScopeSession {
             "grok" => AgentKind::Grok,
             "junie" => AgentKind::Junie,
             "kimi" => AgentKind::Kimi,
+            "copilot" | "copilot-cli" | "github-copilot" | "github-copilot-cli" => {
+                AgentKind::Copilot
+            }
             _ => AgentKind::Claude,
         }
     }

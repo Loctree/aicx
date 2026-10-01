@@ -21,6 +21,7 @@ hook_env() {
         GEMINI_SESSION_ID= \
         JUNIE_SESSION_ID= \
         KIMI_SESSION_ID= \
+        COPILOT_SESSION_ID= \
         GROK_SESSION_ID= \
         GROK_THREAD_ID= \
         ATUIN_SESSION= \
@@ -1393,3 +1394,20 @@ done
 printf 'ok scissors: cut prefix is not an arbitrary word\n'
 
 printf 'commit provenance selftest: all passed\n'
+
+# Copilot native identity is canonical even when the subject uses an alias.
+copilot_id="11111111-2222-4333-8444-555555555555"
+out="$(gen '[copilot-cli/interactive] feat: import native Copilot sessions
+
+Keep native provenance.' COPILOT_SESSION_ID="$copilot_id" VC_SESSION_PID=0)"
+expect_line copilot-alias-session "$out" "session_id: $copilot_id"
+expect_line copilot-alias-author "$out" "Authored-By: copilot-cli <agents@vetcoders.io>"
+out="$(gen '[codex/interactive] fix: preserve the owning session
+
+Keep native provenance.' COPILOT_SESSION_ID="$copilot_id" VC_SESSION_PID=0)"
+expect_absent codex-does-not-record-copilot "$out" "session_id:"
+
+out="$(gen '[copilot/interactive] feat: import a named SDK session
+
+Preserve the native identifier.' COPILOT_SESSION_ID="user-123-task-456" VC_SESSION_PID=0)"
+expect_line copilot-named-native-session "$out" "session_id: user-123-task-456"

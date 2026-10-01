@@ -2,7 +2,8 @@
 
 **Operator front door for agent session logs.**
 
-`aicx` catalogs live Claude, Codex, Grok, Gemini, Junie, Vibecrafted, and
+`aicx` catalogs live Claude, Codex, Cursor, Grok, Gemini, Junie, Kimi, GitHub
+Copilot CLI, Vibecrafted, and
 operator-owned sources; renders readable whole-session extracts; and publishes
 a lexical-first search index. Sources remain content truth. The compact catalog
 owns session identity and topical project attribution.
@@ -59,12 +60,26 @@ First-class roots include:
 - `~/.grok/sessions/*/chat_history.jsonl`
 - `~/.gemini/tmp/*/chats/session-*.json`
 - `~/.kimi-code/sessions/**/wire.jsonl`
+- `~/.copilot/session-state/<session-id>/events.jsonl` (optional `workspace.yaml`)
 - Junie sources
 - Vibecrafted `control_plane/runtime_runs/*/transcript.log`
 - explicit operator markdown and Codescribe imports
 
 Source opens go through a canonical allowlist resolver. Traversal, non-files,
 and symlink escapes are rejected.
+
+GitHub Copilot CLI uses the canonical provider name `copilot`:
+
+```bash
+aicx extract copilot --session <session-id> --conversation
+aicx extract all --provider copilot
+aicx index
+aicx search 'past decision' --agent copilot
+aicx intents --agent copilot --emit json
+```
+
+See [Copilot sessions](docs/COPILOT_SESSIONS.md) for event coverage, source
+identity, direct-file extraction, and MCP usage.
 
 ## Intents and verification
 
@@ -138,6 +153,7 @@ accepted.
 - [AICX home layout](docs/AICX_HOME_LAYOUT.md)
 - [Context corpus](docs/CONTEXT_CORPUS.md)
 - [Source protection](docs/SOURCE_PROTECTION.md)
+- [GitHub Copilot CLI sessions](docs/COPILOT_SESSIONS.md)
 - [Releases](docs/RELEASES.md)
 
 Built so that months later the operator can still find the session, open the

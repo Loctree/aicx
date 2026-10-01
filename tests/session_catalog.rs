@@ -718,7 +718,7 @@ fn gemini_catalog_admits_only_conversations_under_chats() {
 
 #[test]
 fn agent_kind_exposes_session_roots_and_parser_kinds() {
-    assert_eq!(AgentKind::ALL.len(), 7);
+    assert_eq!(AgentKind::ALL.len(), 8);
     assert_eq!(AgentKind::parse("claude"), Some(AgentKind::Claude));
     assert_eq!(AgentKind::parse("cursor"), Some(AgentKind::Cursor));
     assert_eq!(AgentKind::parse("cursor-agent"), Some(AgentKind::Cursor));

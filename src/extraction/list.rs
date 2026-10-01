@@ -13,6 +13,10 @@ fn is_gemini_session_file(path: &Path) -> bool {
         .is_some_and(|ext| matches!(ext, "json" | "jsonl"))
 }
 
+fn is_copilot_session_file(path: &Path) -> bool {
+    crate::session_catalog::is_copilot_source_file(path)
+}
+
 fn source_root_for_protection(path: &Path) -> PathBuf {
     if path.is_file() {
         path.parent()
@@ -343,6 +347,46 @@ pub fn list_available_sources() -> Result<Vec<SourceInfo>> {
         }
     }
 
+    // Copilot CLI: usage telemetry at ~/.copilot/events.jsonl is excluded.
+    let copilot_sessions = crate::session_catalog::copilot_session_root(&home);
+    if copilot_sessions.try_exists()? {
+        anyhow::ensure!(
+            copilot_sessions.is_dir(),
+            "copilot session root is not a directory: {}",
+            copilot_sessions.display()
+        );
+        // Admission is deliberately direct: nested checkpoints, rewind data
+        // and tool-created events files are not additional conversations.
+        let mut count = 0usize;
+        let mut size = 0u64;
+        for entry in fs::read_dir(&copilot_sessions)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let events = entry.path().join("events.jsonl");
+            if !is_copilot_session_file(&events) {
+                continue;
+            }
+            match fs::symlink_metadata(&events) {
+                Ok(metadata) if metadata.is_file() => {
+                    count += 1;
+                    size += metadata.len();
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("cannot inspect copilot source {}", events.display())
+                    });
+                }
+            }
+        }
+        if count > 0 {
+            sources.push(source_info(&home, "copilot", copilot_sessions, count, size));
+        }
+    }
+
     // Codescribe transcripts: ~/.codescribe/transcriptions/YYYY-MM-DD/*.{txt,md,json}
     let codescribe_transcripts = discover_codescribe_transcripts(&home);
     if !codescribe_transcripts.is_empty() {
@@ -378,4 +422,33 @@ pub fn list_available_sources() -> Result<Vec<SourceInfo>> {
     }
 
     Ok(sources)
+}
+
+#[cfg(test)]
+mod copilot_tests {
+    use super::*;
+
+    #[test]
+    fn copilot_source_listing_shape_excludes_metrics_and_nested_artifacts() {
+        let root = Path::new("/home/user/.copilot/session-state");
+        let id = "12345678-1234-1234-1234-123456789abc";
+        assert!(is_copilot_session_file(&root.join(id).join("events.jsonl")));
+        assert!(!is_copilot_session_file(Path::new(
+            "/home/user/.copilot/events.jsonl"
+        )));
+        assert!(!is_copilot_session_file(
+            &root
+                .join(id)
+                .join("checkpoints")
+                .join(id)
+                .join("events.jsonl")
+        ));
+        assert!(!is_copilot_session_file(&root.join(id).join("tool.jsonl")));
+        assert!(!is_copilot_session_file(
+            &root.join(".metadata").join("events.jsonl")
+        ));
+        assert!(is_copilot_session_file(
+            &root.join("user-123-task-456").join("events.jsonl")
+        ));
+    }
 }

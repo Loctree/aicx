@@ -2054,7 +2054,7 @@ fn hybrid_filters(filters: SemanticRetrievalFilters<'_>) -> aicx_retrieve::Filte
     if let Some(agent) = filters.agent {
         set.values.insert(
             "agent".to_string(),
-            serde_json::Value::String(agent.to_string()),
+            serde_json::Value::String(canonical_agent_slug(agent)),
         );
     }
     if let Some(date) = filters.date {
@@ -2455,10 +2455,11 @@ fn semantic_candidate_metadata_matches(
     metadata: &serde_json::Value,
     filters: &SemanticSearchFilters,
 ) -> bool {
-    if let Some(agent) = filters.agent.as_deref()
-        && metadata.get("agent").and_then(serde_json::Value::as_str) != Some(agent)
-    {
-        return false;
+    if let Some(agent) = filters.agent.as_deref() {
+        let canonical = canonical_agent_slug(agent);
+        if metadata.get("agent").and_then(serde_json::Value::as_str) != Some(canonical.as_str()) {
+            return false;
+        }
     }
 
     let date_filter_active =
@@ -4922,6 +4923,41 @@ mod tests {
             exact.values.get("date"),
             Some(&serde_json::json!("20260721"))
         );
+    }
+
+    #[test]
+    fn copilot_alias_filters_keep_native_provider_identity() {
+        for agent in [
+            "copilot",
+            "copilot-cli",
+            "github-copilot",
+            "github-copilot-cli",
+        ] {
+            let filters = SemanticSearchFilters {
+                agent: Some(agent.into()),
+                ..Default::default()
+            };
+            assert!(semantic_candidate_metadata_matches(
+                &serde_json::json!({"agent": "copilot", "model": "claude-sonnet"}),
+                &filters,
+            ));
+            assert!(!semantic_candidate_metadata_matches(
+                &serde_json::json!({"agent": "claude", "model": "claude-sonnet"}),
+                &filters,
+            ));
+            let pushdown = hybrid_filters(SemanticRetrievalFilters {
+                kind: None,
+                frame_kind: None,
+                project: None,
+                agent: Some(agent),
+                date: None,
+                candidate_filters: Some(&filters),
+            });
+            assert_eq!(
+                pushdown.values.get("agent"),
+                Some(&serde_json::json!("copilot"))
+            );
+        }
     }
 
     /// Bug #31 regression: top-N raw semantic hits sit outside the

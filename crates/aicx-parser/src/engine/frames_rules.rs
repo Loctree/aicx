@@ -114,6 +114,26 @@ const GENERIC_INJECT_TAGS: &[InjectTagRule] = &[InjectTagRule {
     kind: InjectRuleKind::TransportControl,
 }];
 
+// # copilot — developer instructions and skill bodies remain injected context.
+const COPILOT_INJECT_TAGS: &[InjectTagRule] = &[
+    InjectTagRule {
+        tag: "system",
+        kind: InjectRuleKind::TransportControl,
+    },
+    InjectTagRule {
+        tag: "developer",
+        kind: InjectRuleKind::AgentInstructions,
+    },
+    InjectTagRule {
+        tag: "skill.invoked",
+        kind: InjectRuleKind::AgentInstructions,
+    },
+    InjectTagRule {
+        tag: "session.compaction_complete",
+        kind: InjectRuleKind::CompactionReplay,
+    },
+];
+
 // # cursor — harness notifications and skill attachments ride the wire as
 // injected wrappers, never operator speech; both reminder spellings resolve
 // through WRAPPER peeling in the adapter, so only the cursor-specific tags
@@ -167,6 +187,13 @@ const GROK_INJECT_TAGS: &[InjectTagRule] = &[
 // # grok
 
 pub const AGENT_FRAME_RULES: &[AgentFrameRules] = &[
+    AgentFrameRules {
+        agent: AgentKind::Copilot,
+        echo_promotion: false,
+        klops_guard: &[],
+        queue_seal: false,
+        inject_tags: COPILOT_INJECT_TAGS,
+    },
     AgentFrameRules {
         agent: AgentKind::Codex,
         echo_promotion: true,

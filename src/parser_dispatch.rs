@@ -36,11 +36,27 @@ pub fn source_handle_for_file(
     };
     let artifact = SourceArtifact::validated_file(artifact_name, path, framing)
         .map_err(|error| anyhow!("invalid source artifact: {error}"))?;
+    let mut artifacts = vec![artifact];
+    if agent == AgentKind::Copilot {
+        let sidecar = path.with_file_name("workspace.yaml");
+        // Only a regular sibling belongs to this finite source selection.
+        // A symlink must not turn metadata discovery into an arbitrary read.
+        if std::fs::symlink_metadata(&sidecar).is_ok_and(|meta| meta.is_file()) {
+            artifacts.push(
+                SourceArtifact::validated_file(
+                    "workspace.yaml",
+                    &sidecar,
+                    SourceFraming::WholeDocument,
+                )
+                .map_err(|error| anyhow!("invalid Copilot workspace artifact: {error}"))?,
+            );
+        }
+    }
     SourceHandle::new(
         agent,
         safe_source_id(source_id),
         logical_session_id,
-        vec![artifact],
+        artifacts,
     )
     .map_err(|error| anyhow!("invalid source handle: {error}"))
 }

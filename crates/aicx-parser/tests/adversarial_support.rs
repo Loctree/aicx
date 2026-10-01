@@ -17,8 +17,15 @@ pub struct AgentCase {
     pub mutation_needle: &'static str,
 }
 
-pub fn cases() -> [AgentCase; 6] {
+pub fn cases() -> [AgentCase; 7] {
     [
+        AgentCase {
+            agent: AgentKind::Copilot,
+            artifact: "events.jsonl",
+            source_id: "adversarial-copilot",
+            base: include_bytes!("../../../tests/fixtures/parser_engine/copilot/events.jsonl"),
+            mutation_needle: "Build the Copilot oracle.",
+        },
         AgentCase {
             agent: AgentKind::Codex,
             artifact: "rollout.jsonl",
@@ -210,6 +217,11 @@ pub fn opaque_event(case: AgentCase) -> Vec<u8> {
         }
         AgentKind::Cursor => {
             format!(r#"{{"type":"future_opaque_event","ciphertext":"{SECRET_SENTINEL}"}}"#)
+        }
+        AgentKind::Copilot => {
+            format!(
+                r#"{{"type":"assistant.message","data":{{"content":"","messageId":"opaque-fixture","reasoningOpaque":"{SECRET_SENTINEL}"}}}}"#
+            )
         }
     };
     bytes.extend_from_slice(line.as_bytes());
