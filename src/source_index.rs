@@ -417,11 +417,33 @@ pub fn build_with_reporter(
     };
     let mut layout = ScopeLayoutProbe::default();
     let dense_missing = crate::vector_index::current_dense_not_built().unwrap_or(true);
+    #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+    let mut prepared_engine = None;
     if !full_rescan
         && project_filters.is_empty()
         && crate::vector_index::source_lexical_generation_matches(&source_fingerprint)?
         && !(semantic && dense_missing)
         && layout.ledger_is_current(&prior_state)
+        && {
+            // Same corpus is insufficient after the configured model/endpoint
+            // changes. Keep this initialized engine for the rebuild if needed.
+            #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+            {
+                if semantic {
+                    let engine = crate::embedder::EmbeddingEngine::new()?;
+                    let matches =
+                        crate::vector_index::hybrid_manifest_matches_embedder(None, engine.info());
+                    prepared_engine = Some(engine);
+                    matches
+                } else {
+                    true
+                }
+            }
+            #[cfg(not(any(feature = "native-embedder", feature = "cloud-embedder")))]
+            {
+                !semantic
+            }
+        }
     {
         let (dense_kind, dense_docs) = current_dense_stats();
         return Ok(SourceIndexReport {
@@ -665,59 +687,85 @@ pub fn build_with_reporter(
         );
     }
 
+    let semantic_payload = if semantic && !dry_run {
+        Some(embed_chunks_for_semantic(
+            &chunks,
+            reporter.clone(),
+            #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+            prepared_engine,
+        )?)
+    } else {
+        None
+    };
     let publish_phase = Phase::start(reporter.clone(), "index_publish", None);
     let publish_hb = Heartbeat::spawn_with_backoff(
         publish_phase.clone(),
         Duration::from_secs(2),
         Duration::from_secs(15),
     );
-    let (manifest_path, dense_docs, dense_kind) = if dry_run {
-        (
-            None,
-            0usize,
-            if semantic {
-                "would_build_semantic".to_string()
-            } else {
-                "optional_not_built".to_string()
-            },
-        )
-    } else if semantic {
-        let (dense_chunks, fingerprint) = embed_chunks_for_semantic(&chunks)?;
-        let manifest = crate::vector_index::publish_source_hybrid_generation(
-            &chunks,
-            &dense_chunks,
-            &source_fingerprint,
-            &fingerprint,
-        )?;
-        if project_filters.is_empty() {
-            write_parse_state(aicx_home, &next_state)?;
-        }
-        let path = crate::vector_index::hybrid_manifest_path(None)?
-            .display()
-            .to_string();
-        (
-            Some(path).filter(|_| manifest.lexical_doc_count == chunks.len()),
-            manifest.dense_count,
-            manifest.dense_kind,
-        )
-    } else {
-        let manifest =
-            crate::vector_index::publish_source_lexical_generation(&chunks, &source_fingerprint)?;
-        // Persist parse state only after a successful publish so a killed build
-        // cannot claim sessions are current when CURRENT never flipped.
-        if project_filters.is_empty() {
-            write_parse_state(aicx_home, &next_state)?;
-        }
-        let path = crate::vector_index::hybrid_manifest_path(None)?
-            .display()
-            .to_string();
-        (
-            Some(path).filter(|_| manifest.lexical_doc_count == chunks.len()),
-            0,
-            "optional_not_built".to_string(),
-        )
-    };
+    let publication: Result<_> = (|| {
+        Ok(if dry_run {
+            (
+                None,
+                0usize,
+                if semantic {
+                    "would_build_semantic".to_string()
+                } else {
+                    "optional_not_built".to_string()
+                },
+            )
+        } else if semantic {
+            let (dense_chunks, fingerprint) = semantic_payload
+                .as_ref()
+                .expect("semantic payload prepared");
+            let manifest = crate::vector_index::publish_source_hybrid_generation(
+                &chunks,
+                dense_chunks,
+                &source_fingerprint,
+                fingerprint,
+            )?;
+            if project_filters.is_empty() {
+                write_parse_state(aicx_home, &next_state)?;
+            }
+            let path = crate::vector_index::hybrid_manifest_path(None)?
+                .display()
+                .to_string();
+            (
+                Some(path).filter(|_| manifest.lexical_doc_count == chunks.len()),
+                manifest.dense_count,
+                manifest.dense_kind,
+            )
+        } else {
+            let manifest = crate::vector_index::publish_source_lexical_generation(
+                &chunks,
+                &source_fingerprint,
+            )?;
+            // Persist parse state only after a successful publish so a killed build
+            // cannot claim sessions are current when CURRENT never flipped.
+            if project_filters.is_empty() {
+                write_parse_state(aicx_home, &next_state)?;
+            }
+            let path = crate::vector_index::hybrid_manifest_path(None)?
+                .display()
+                .to_string();
+            (
+                Some(path).filter(|_| manifest.lexical_doc_count == chunks.len()),
+                manifest.dense_count,
+                manifest.dense_kind,
+            )
+        })
+    })();
     publish_hb.stop();
+    let (manifest_path, dense_docs, dense_kind) = match publication {
+        Ok(published) => published,
+        Err(error) => {
+            publish_phase.finish_err(
+                &error,
+                Some("retry aicx index after checking the generation artifacts"),
+            );
+            return Err(error);
+        }
+    };
     publish_phase.finish_ok(format!(
         "lexical_docs={} dense_docs={dense_docs}{}",
         chunks.len(),
@@ -763,77 +811,141 @@ fn current_dense_stats() -> (String, usize) {
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
 fn embed_chunks_for_semantic(
     chunks: &[aicx_retrieve::ChunkRef],
+    reporter: Arc<dyn Reporter>,
+    prepared_engine: Option<crate::embedder::EmbeddingEngine>,
 ) -> Result<(
     Vec<aicx_retrieve::DenseChunkRef>,
     aicx_retrieve::EmbedderFingerprint,
 )> {
-    let mut engine = crate::embedder::EmbeddingEngine::new().with_context(|| {
-        "initialize embedder for `aicx index --semantic` (configure ~/.aicx/config.toml \
-         [embedder.cloud] or native GGUF, then `aicx warmup`)"
-            .to_string()
-    })?;
-    let info = engine.info().clone();
-    let fingerprint = crate::vector_index::hybrid_embedder_fingerprint(&info);
-    let batch_size = engine.embed_batch_size().max(1);
-    let mut dense_chunks = Vec::with_capacity(chunks.len());
-    let total = chunks.len();
-    for (batch_idx, batch) in chunks.chunks(batch_size).enumerate() {
-        let texts: Vec<String> = batch
-            .iter()
-            .map(|chunk| {
-                // Bound embed payload: first ~8k chars keeps signal, avoids multi-MB HTTP.
-                let text = chunk.text.as_str();
-                if text.len() > 8_192 {
-                    text.chars().take(8_192).collect()
-                } else {
-                    text.to_string()
-                }
-            })
-            .collect();
-        let vectors = engine.embed_batch(&texts).with_context(|| {
-            format!(
-                "embed batch {}/{} ({} texts) for index --semantic",
-                batch_idx + 1,
-                total.div_ceil(batch_size),
-                texts.len()
-            )
-        })?;
-        if vectors.len() != batch.len() {
-            anyhow::bail!(
-                "embedder returned {} vectors for {} texts in batch {}",
-                vectors.len(),
-                batch.len(),
-                batch_idx + 1
-            );
+    use aicx_progress_contracts::{EventSink, IndexEvent};
+    let phase = Phase::start(reporter, "index_embed", Some(chunks.len() as u64));
+    let progress = aicx_monitor::IndexProgressMonitor::default();
+    progress.on_event(&IndexEvent::RunStarted {
+        total_items: chunks.len(),
+        namespace: "index_embed".into(),
+        source_label: "source extracts".into(),
+        parallelism: 1,
+        started_at: chrono::Utc::now(),
+    });
+    let result: Result<_> = (|| {
+        let mut engine = match prepared_engine {
+            Some(engine) => Ok(engine),
+            None => crate::embedder::EmbeddingEngine::new(),
         }
-        for (chunk, embedding) in batch.iter().zip(vectors) {
-            if embedding.len() != fingerprint.dim {
+        .with_context(|| {
+            "initialize embedder for `aicx index --semantic` (configure ~/.aicx/config.toml \
+         [embedder.cloud] or native GGUF, then `aicx warmup`)"
+                .to_string()
+        })?;
+        let info = engine.info().clone();
+        let fingerprint = crate::vector_index::hybrid_embedder_fingerprint(&info);
+        let batch_size = engine.embed_batch_size().max(1);
+        let mut dense_chunks = Vec::with_capacity(chunks.len());
+        let total = chunks.len();
+        for (batch_idx, batch) in chunks.chunks(batch_size).enumerate() {
+            for (offset, chunk) in batch.iter().enumerate() {
+                progress.on_event(&IndexEvent::ItemStarted {
+                    item_index: batch_idx * batch_size + offset,
+                    label: chunk.id.clone(),
+                    size_bytes: None,
+                });
+            }
+            let batch_started = Instant::now();
+            let texts: Vec<String> = batch
+                .iter()
+                .map(|chunk| {
+                    // Bound embed payload: first ~8k chars keeps signal, avoids multi-MB HTTP.
+                    let text = chunk.text.as_str();
+                    if text.len() > 8_192 {
+                        text.chars().take(8_192).collect()
+                    } else {
+                        text.to_string()
+                    }
+                })
+                .collect();
+            let vectors = engine.embed_batch(&texts).with_context(|| {
+                format!(
+                    "embed batch {}/{} ({} texts) for index --semantic",
+                    batch_idx + 1,
+                    total.div_ceil(batch_size),
+                    texts.len()
+                )
+            })?;
+            if vectors.len() != batch.len() {
                 anyhow::bail!(
-                    "embedder returned dim {} for chunk {}; config expects {}",
-                    embedding.len(),
-                    chunk.id,
-                    fingerprint.dim
+                    "embedder returned {} vectors for {} texts in batch {}",
+                    vectors.len(),
+                    batch.len(),
+                    batch_idx + 1
                 );
             }
-            dense_chunks.push(aicx_retrieve::DenseChunkRef {
-                chunk: chunk.clone(),
-                embedding,
-            });
-        }
-        if batch_idx == 0 || (batch_idx + 1) % 10 == 0 || (batch_idx + 1) * batch_size >= total {
+            for (offset, (chunk, embedding)) in batch.iter().zip(vectors).enumerate() {
+                if embedding.len() != fingerprint.dim {
+                    anyhow::bail!(
+                        "embedder returned dim {} for chunk {}; config expects {}",
+                        embedding.len(),
+                        chunk.id,
+                        fingerprint.dim
+                    );
+                }
+                dense_chunks.push(aicx_retrieve::DenseChunkRef {
+                    chunk: chunk.clone(),
+                    embedding,
+                });
+                progress.on_event(&IndexEvent::ItemIndexed {
+                    item_index: batch_idx * batch_size + offset,
+                    label: chunk.id.clone(),
+                    chunks_indexed: 1,
+                    duration_ms: batch_started.elapsed().as_millis() as u64,
+                    embedder_ms: None,
+                    tokens_estimated: None,
+                    content_hash: None,
+                });
+            }
+            phase.tick(dense_chunks.len() as u64);
+            let snapshot = progress.snapshot();
+            let eta = snapshot
+                .eta_secs
+                .map(|s| format!("{:.0}s", s))
+                .unwrap_or_else(|| "unknown".into());
             eprintln!(
-                "aicx index --semantic · embedded {}/{} session document(s)",
-                dense_chunks.len(),
-                total
+                "aicx index --semantic · embedded {}/{} document(s) · {:.2} docs/s · ETA {}",
+                snapshot.processed, snapshot.total, snapshot.items_per_sec, eta
+            );
+        }
+        Ok((dense_chunks, fingerprint))
+    })();
+    match &result {
+        Ok(_) => {
+            let snapshot = progress.snapshot();
+            progress.on_event(&IndexEvent::RunCompleted {
+                processed: snapshot.processed,
+                indexed: snapshot.indexed,
+                skipped: snapshot.skipped,
+                failed: snapshot.failed,
+                total_chunks: snapshot.total_chunks,
+                elapsed: phase.started_at.elapsed(),
+                stopped_early: false,
+            });
+            phase.finish_ok(format!("embedded={}", snapshot.indexed));
+        }
+        Err(error) => {
+            progress.on_event(&IndexEvent::RunFailed {
+                error: format!("{error:#}"),
+                processed_before_failure: progress.snapshot().processed,
+            });
+            phase.finish_err(
+                error,
+                Some("check embedder configuration and retry aicx index --semantic"),
             );
         }
     }
-    Ok((dense_chunks, fingerprint))
+    result
 }
-
 #[cfg(not(any(feature = "native-embedder", feature = "cloud-embedder")))]
 fn embed_chunks_for_semantic(
     _chunks: &[aicx_retrieve::ChunkRef],
+    _reporter: Arc<dyn Reporter>,
 ) -> Result<(
     Vec<aicx_retrieve::DenseChunkRef>,
     aicx_retrieve::EmbedderFingerprint,

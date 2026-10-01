@@ -722,19 +722,12 @@ fn generation_has_dense(dir: &Path) -> bool {
     let Ok(manifest) = aicx_retrieve::Manifest::read_from_path(&dir.join("manifest.json")) else {
         return false;
     };
-    manifest.dense_kind != "optional_not_built"
-        && manifest.dense_count > 0
-        && dir
-            .join(aicx_retrieve::MMAP_DENSE_PAYLOAD_FILE_NAME)
-            .is_file()
+    manifest.open_dense_payload(dir).is_ok()
 }
 
-/// Copy the previous CURRENT dense mmap into a lexical-only generation and
-/// stamp the matching dense/embedder fields onto `manifest`.
-///
-/// Auto-refresh publishes lexical-only snapshots in ~50s. Without this copy,
-/// CURRENT becomes `optional_not_built` / `dense_count` 0 and retention can
-/// delete the last generation that still had vectors.
+/// Carry a validated dense mmap into a lexical generation of the same corpus.
+/// Retention separately protects the last usable dense generation when the
+/// corpus changes and CURRENT must truthfully become lexical-only.
 fn carry_forward_dense_artifacts(
     previous_dir: &Path,
     dest_dir: &Path,
@@ -747,6 +740,15 @@ fn carry_forward_dense_artifacts(
     else {
         return;
     };
+    // Retention protects the old dense generation independently. Only carry
+    // it into CURRENT when its corpus binding matches the new lexical build.
+    if previous.source_hash_blake3 != manifest.source_hash_blake3
+        || previous.source_chunk_count != manifest.source_chunk_count
+        || previous.lexical_doc_count != manifest.lexical_doc_count
+        || previous.open_dense_payload(previous_dir).is_err()
+    {
+        return;
+    }
     let src = previous_dir.join(aicx_retrieve::MMAP_DENSE_PAYLOAD_FILE_NAME);
     let dst = dest_dir.join(aicx_retrieve::MMAP_DENSE_PAYLOAD_FILE_NAME);
     if std::fs::copy(&src, &dst).is_err() {
@@ -888,8 +890,8 @@ pub fn current_lexical_doc_count() -> Result<Option<usize>> {
 
 /// Publish one lexical-only CURRENT generation directly from source extracts.
 ///
-/// Dense vectors are intentionally absent: `aicx search` stays lexical-first
-/// and `--deep` fails honestly until `aicx index --semantic` materializes dense.
+/// Matching validated dense vectors are carried forward. Otherwise `--deep`
+/// fails honestly until `aicx index --semantic` materializes the new corpus.
 /// No embeddings NDJSON or brute-force twin is emitted.
 pub fn publish_source_lexical_generation(
     chunks: &[aicx_retrieve::ChunkRef],
@@ -1009,7 +1011,7 @@ pub fn publish_source_hybrid_generation(
     Ok(manifest)
 }
 
-/// True when CURRENT is lexical-only (`optional_not_built`) or missing dense mmap.
+/// True when CURRENT has no dense payload valid for its manifest.
 pub fn current_dense_not_built() -> Result<bool> {
     let path = hybrid_manifest_path(None)?;
     if !path.is_file() {
@@ -1025,9 +1027,7 @@ pub fn current_dense_not_built() -> Result<bool> {
     let Some(generation_dir) = path.parent() else {
         return Ok(true);
     };
-    Ok(!generation_dir
-        .join(aicx_retrieve::MMAP_DENSE_PAYLOAD_FILE_NAME)
-        .is_file())
+    Ok(manifest.open_dense_payload(generation_dir).is_err())
 }
 
 pub fn hybrid_manifest_path(project: Option<&str>) -> Result<PathBuf> {
@@ -2243,7 +2243,7 @@ fn has_existing_hybrid_artifacts(project: Option<&str>) -> bool {
 /// `false` — which forces [`should_skip_hybrid_rebuild`] to rebuild rather
 /// than skip, so search never serves a stale-model hybrid.
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
-fn hybrid_manifest_matches_embedder(
+pub(crate) fn hybrid_manifest_matches_embedder(
     project: Option<&str>,
     info: &crate::embedder::EmbeddingModelInfo,
 ) -> bool {
@@ -2255,7 +2255,11 @@ fn hybrid_manifest_matches_embedder(
     }
     match aicx_retrieve::Manifest::read_from_path(&manifest_path) {
         Ok(manifest) => {
-            manifest.embedder_dim == info.dimension && manifest.embedder_model == info.model_id
+            let expected = hybrid_embedder_fingerprint(info);
+            manifest.embedder_dim == expected.dim
+                && manifest.embedder_model == expected.model
+                && manifest.embedder_url_hash == expected.url_hash
+                && manifest.embedder_distance == expected.distance
         }
         Err(_) => false,
     }
@@ -3447,7 +3451,7 @@ mod source_hybrid_publish_tests {
     }
 
     #[test]
-    fn lexical_publish_keeps_previous_dense_and_retention_cannot_drop_it() {
+    fn lexical_publish_only_carries_matching_dense_and_retains_old_generation() {
         let root = std::env::temp_dir().join(format!(
             "aicx-lexical-keep-dense-{}-{}",
             std::process::id(),
@@ -3475,7 +3479,7 @@ mod source_hybrid_publish_tests {
         .unwrap();
 
         let lexical =
-            publish_source_lexical_generation(std::slice::from_ref(&chunk), "fp-keep-dense-1")
+            publish_source_lexical_generation(std::slice::from_ref(&chunk), "fp-keep-dense-0")
                 .expect("lexical publish after dense");
         assert!(
             lexical.dense_count > 0,
@@ -3485,6 +3489,9 @@ mod source_hybrid_publish_tests {
         );
         assert_ne!(lexical.dense_kind, "optional_not_built");
         let current = hybrid_index_dir(None).unwrap();
+        lexical
+            .open_dense_payload(&current)
+            .expect("same-corpus carry must remain queryable");
         assert!(
             current
                 .join(aicx_retrieve::MMAP_DENSE_PAYLOAD_FILE_NAME)
@@ -3499,9 +3506,10 @@ mod source_hybrid_publish_tests {
             )
             .unwrap();
             assert!(
-                published.dense_count > 0,
-                "later lexical publish {i} dropped dense_count to 0"
+                published.dense_count == 0,
+                "changed corpus {i} must not claim old dense is current"
             );
+            assert!(current_dense_not_built().unwrap());
         }
 
         let hybrid_root = hybrid_root_dir(None).unwrap();
@@ -3515,12 +3523,51 @@ mod source_hybrid_publish_tests {
         )
         .unwrap();
         assert!(
-            current_manifest.dense_count > 0,
-            "CURRENT after lexical publishes must still report dense"
+            current_manifest.dense_count == 0,
+            "CURRENT after source drift must report dense as absent"
         );
 
         drop(_home);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn corrupt_dense_payload_is_not_current_or_carried_forward() {
+        let root = std::env::temp_dir().join(format!(
+            "aicx-corrupt-dense-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let _home = super::iter3_tests::ScopedAicxHome::set(&root);
+        let chunk = sample_chunk("claude:corrupt", "valid lexical source");
+        let dense = DenseChunkRef {
+            chunk: chunk.clone(),
+            embedding: vec![1.0, 0.0],
+        };
+        let fp = EmbedderFingerprint::new("test", "http://test/embed", 2, "cosine");
+        publish_source_hybrid_generation(std::slice::from_ref(&chunk), &[dense], "corpus", &fp)
+            .unwrap();
+        let current = hybrid_index_dir(None).unwrap();
+        let mut manifest =
+            aicx_retrieve::Manifest::read_from_path(&current.join("manifest.json")).unwrap();
+        manifest.source_hash_blake3 = "ab".repeat(32);
+        manifest
+            .write_to_path(&current.join("manifest.json"))
+            .unwrap();
+        assert!(
+            current_dense_not_built().unwrap(),
+            "file presence cannot mask a header/hash mismatch"
+        );
+        let next =
+            publish_source_lexical_generation(std::slice::from_ref(&chunk), "corpus").unwrap();
+        assert_eq!(next.dense_count, 0);
+        assert!(current_dense_not_built().unwrap());
+        drop(_home);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     fn write_stub_generation(hybrid_root: &std::path::Path, name: &str, dense: bool) {
@@ -3562,11 +3609,19 @@ mod source_hybrid_publish_tests {
         };
         manifest.write_to_path(&dir.join("manifest.json")).unwrap();
         if dense {
-            std::fs::write(
+            use aicx_retrieve::{DenseChunkRef, DenseIndex, Distance, MmapDenseAdapter};
+            let mut index = MmapDenseAdapter::create(
                 dir.join(aicx_retrieve::MMAP_DENSE_PAYLOAD_FILE_NAME),
-                b"dense-payload",
-            )
-            .unwrap();
+                4,
+                Distance::Cosine,
+                [0xab; 32],
+            );
+            index
+                .build(&[DenseChunkRef {
+                    chunk: sample_chunk(name, "retention fixture"),
+                    embedding: vec![1.0, 0.0, 0.0, 0.0],
+                }])
+                .unwrap();
         }
     }
 
@@ -3607,6 +3662,25 @@ mod source_hybrid_publish_tests {
         );
         assert!(gens.join("g-2026-01-03T00-00-00Z-lex2").is_dir());
         assert!(gens.join("g-2026-01-04T00-00-00Z-lex3").is_dir());
+
+        let corrupt = "g-2026-01-05T00-00-00Z-corrupt";
+        write_stub_generation(&hybrid_root, corrupt, true);
+        std::fs::write(
+            gens.join(corrupt)
+                .join(aicx_retrieve::MMAP_DENSE_PAYLOAD_FILE_NAME),
+            b"truncated",
+        )
+        .unwrap();
+        prune_unreferenced_hybrid_generations(
+            &hybrid_root,
+            corrupt,
+            Some("g-2026-01-04T00-00-00Z-lex3"),
+        )
+        .unwrap();
+        assert!(
+            gens.join("g-2026-01-01T00-00-00Z-dense1").is_dir(),
+            "a corrupt current payload must not displace the last usable dense generation"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }

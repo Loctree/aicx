@@ -122,6 +122,39 @@ pub struct Manifest {
 }
 
 impl Manifest {
+    /// Open the actual dense payload bound to this manifest, rather than
+    /// interpreting a nonzero count or a file name as a valid generation.
+    pub fn open_dense_payload(&self, generation_dir: &Path) -> Result<crate::MmapDenseAdapter> {
+        use crate::{DenseIndex, Distance, MMAP_DENSE_KIND, MmapDenseAdapter};
+        self.validate_against(self)?;
+        if self.dense_kind != MMAP_DENSE_KIND || self.dense_count == 0 || self.embedder_dim == 0 {
+            anyhow::bail!(
+                "generation {} has no supported dense payload",
+                self.generation_id
+            );
+        }
+        let distance = match self.embedder_distance.as_str() {
+            "cosine" => Distance::Cosine,
+            "dot" => Distance::Dot,
+            "euclidean" => Distance::Euclidean,
+            other => anyhow::bail!("unsupported dense distance: {other}"),
+        };
+        let dense = MmapDenseAdapter::open(
+            generation_dir.join(MMAP_DENSE_PAYLOAD_FILE_NAME),
+            self.embedder_dim,
+            distance,
+            Some(decode_source_hash_blake3(&self.source_hash_blake3)?),
+        )?;
+        if dense.count() != self.dense_count {
+            return Err(crate::RetrieveError::DenseCountMismatch {
+                expected: self.dense_count,
+                actual: dense.count(),
+            }
+            .into());
+        }
+        Ok(dense)
+    }
+
     pub fn write_to_path(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
@@ -234,6 +267,27 @@ impl Manifest {
             return Err(ManifestError::SchemaVersionUnsupported(
                 other.schema_version.clone(),
             ));
+        }
+
+        if self.generation_id != other.generation_id {
+            return Err(ManifestError::GenerationMismatch {
+                lexical_gen: self.generation_id.clone(),
+                dense_gen: other.generation_id.clone(),
+            });
+        }
+
+        if self.source_chunk_count != other.source_chunk_count {
+            return Err(ManifestError::SourceChunkCountMismatch {
+                expected: self.source_chunk_count,
+                actual: other.source_chunk_count,
+            });
+        }
+
+        if self.embedder_url_hash != other.embedder_url_hash {
+            return Err(ManifestError::EmbedderModelDrift {
+                manifest_model: self.embedder_url_hash.clone(),
+                query_model: other.embedder_url_hash.clone(),
+            });
         }
 
         if self.embedder_dim != other.embedder_dim {

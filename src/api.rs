@@ -748,12 +748,18 @@ fn hybrid_current_index_status(base: &Path, project: Option<&str>) -> Result<Opt
         "hybrid"
     };
 
-    let (lexical_status, dense_status, dense_kind, dense_count, dense_recommendation) =
+    let (lexical_status, mut dense_status, dense_kind, dense_count, mut dense_recommendation) =
         plane_fields_from_manifest(
             &manifest.dense_kind,
             manifest.dense_count,
             manifest.lexical_doc_count,
         );
+    if dense_status == "ready" && manifest.open_dense_payload(&generation_dir).is_err() {
+        dense_status = "invalid".into();
+        dense_recommendation = Some(
+            "dense payload does not match CURRENT; rebuild with `aicx index --semantic`".into(),
+        );
+    }
     Ok(Some(IndexStatus {
         // For the extract-era store, "chunks" == signal session documents.
         canonical_chunks: manifest.lexical_doc_count,

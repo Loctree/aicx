@@ -19,6 +19,9 @@ use sysinfo::{Pid, ProcessesToUpdate, System};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
+mod progress;
+pub use progress::IndexProgressMonitor;
+
 /// Apple-Silicon GPU IOKit classes we probe via `ioreg` on macOS.
 pub const GPU_CLASSES: &[&str] = &["AGXAcceleratorG15X", "IOAccelerator"];
 

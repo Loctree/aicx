@@ -14,6 +14,7 @@ keywords = ["ai", "monitor", "telemetry", "cpu", "gpu"]
 categories = ["development-tools", "command-line-utilities"]
 
 [dependencies]
+aicx-progress-contracts = { path = "../aicx-progress-contracts", version = "0.15.0" }
 sysinfo = "0.32"
 tokio = { version = "1", features = ["sync", "rt", "macros", "time"] }
 

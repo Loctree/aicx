@@ -75,6 +75,7 @@ dependencies = [
 name = "aicx-monitor"
 version = "0.15.0"
 dependencies = [
+ "aicx-progress-contracts",
  "sysinfo",
  "tokio",
 ]
