@@ -19,6 +19,18 @@ const TOOL_TOKEN: &str = "copilottoolexclusive893fed";
 const EVENT_TIME: &str = "2026-09-29T12:00:00Z";
 static FIXTURE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// Git hooks export repository-local variables. Fixtures must never inherit
+/// those coordinates, even for the git processes spawned by the CLI itself.
+fn isolated_test_command(binary: impl AsRef<std::ffi::OsStr>) -> Command {
+    let mut command = Command::new(binary);
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("GIT_") {
+            command.env_remove(key);
+        }
+    }
+    command
+}
+
 struct CopilotFixture {
     home: PathBuf,
     copilot_home: PathBuf,
@@ -41,7 +53,9 @@ impl CopilotFixture {
         let cwd = home.join("work").join("copilot-pipeline");
         fs::create_dir_all(&cwd).unwrap();
         assert!(
-            Command::new("git")
+            isolated_test_command("git")
+                .env("HOME", &home)
+                .env("USERPROFILE", &home)
                 .args(["init", "--quiet"])
                 .arg(&cwd)
                 .status()
@@ -49,7 +63,9 @@ impl CopilotFixture {
                 .success()
         );
         assert!(
-            Command::new("git")
+            isolated_test_command("git")
+                .env("HOME", &home)
+                .env("USERPROFILE", &home)
                 .arg("-C")
                 .arg(&cwd)
                 .args([
@@ -144,7 +160,7 @@ impl CopilotFixture {
     }
 
     fn command(&self, binary: &str) -> Command {
-        let mut command = Command::new(binary);
+        let mut command = isolated_test_command(binary);
         command
             .env("HOME", &self.home)
             .env("USERPROFILE", &self.home)
