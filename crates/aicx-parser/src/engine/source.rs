@@ -17,6 +17,7 @@ pub enum AgentKind {
     Junie,
     Kimi,
     Cursor,
+    Copilot,
 }
 
 impl AgentKind {
@@ -32,6 +33,9 @@ impl AgentKind {
             "junie" => Some(Self::Junie),
             "grok" => Some(Self::Grok),
             "kimi" => Some(Self::Kimi),
+            "copilot" | "copilot-cli" | "github-copilot" | "github-copilot-cli" => {
+                Some(Self::Copilot)
+            }
             _ => None,
         }
     }
@@ -45,6 +49,7 @@ impl AgentKind {
             Self::Junie => "junie",
             Self::Kimi => "kimi",
             Self::Cursor => "cursor",
+            Self::Copilot => "copilot",
         }
     }
 }

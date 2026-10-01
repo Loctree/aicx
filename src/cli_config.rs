@@ -67,6 +67,11 @@ const DEFAULT_CONFIG_TOML: &str = r#"# aicx — Vibecrafted with AI Agents (c)20
 # Per-field AICX_EMBEDDER_* env vars override values loaded from the file.
 #
 # Edit and re-save. No restart needed; aicx reloads on every invocation.
+# Local agent sources are discovered in the OS user's home, independently of
+# storage.home. GitHub Copilot CLI writes ~/.copilot/session-state/<id>/events.jsonl
+# with an optional workspace.yaml sidecar. Use `aicx sources` to inspect roots;
+# `aicx extract copilot` accepts copilot-cli, github-copilot, github-copilot-cli.
+# COPILOT_HOME overrides ~/.copilot; sessions live at $COPILOT_HOME/session-state.
 
 [storage]
 # Optional persistent AICX root override. `AICX_HOME` env still wins for

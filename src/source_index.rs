@@ -200,6 +200,10 @@ struct SessionParseRecord {
     /// Live source mtime when this extract was produced (unix nanoseconds).
     #[serde(default)]
     source_mtime_ns: u64,
+    /// Distinct bundled-artifact evidence. Old Copilot ledgers have no
+    /// receipt and must reparse once instead of trusting size+latest mtime.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_bundle_fingerprint: Option<String>,
     extract_relpath: String,
     extract_sha256: String,
     raw_frames: usize,
@@ -624,14 +628,15 @@ pub fn build_with_reporter(
         // Always stamp LIVE stats into the parse ledger so reuse survives
         // catalog lag (append without catalog rebuild still reuses later
         // once CURRENT has the new extract).
-        let (source_len, source_mtime_ns) = crate::catalog::live_source_fingerprint(&source_path)
+        let fingerprint = crate::catalog::live_source_bundle_fingerprint(&source_path)
             .unwrap_or_else(|| resolve_entry_fingerprint(entry, &source_path));
         next_state.sessions.insert(
             session_key,
             SessionParseRecord {
                 source_path: entry.source_path.clone(),
-                source_len,
-                source_mtime_ns,
+                source_len: fingerprint.len,
+                source_mtime_ns: fingerprint.modified_unix_nanos as u64,
+                source_bundle_fingerprint: fingerprint.bundle_fingerprint,
                 extract_relpath: rel.to_string_lossy().replace('\\', "/"),
                 extract_sha256: sha256_hex(extract.as_bytes()),
                 raw_frames: raw_count,
@@ -980,6 +985,82 @@ pub fn search_session_passages(
     })
 }
 
+/// Read a source-index search reference through the existing checked session
+/// reader. Only catalog-admitted source/cache coordinates are candidates;
+/// arbitrary files under extracts are not admitted by their pathname alone.
+pub(crate) fn read_catalog_chunk_reference_at(
+    aicx_home: &Path,
+    reference: &crate::legacy_archive::ChunkRefSpec,
+    max_chars: Option<usize>,
+) -> Result<Option<crate::legacy_archive::ReadContextChunk>> {
+    use crate::legacy_archive::{Kind, StoredContextFile};
+    let entries = crate::catalog::read_entries_at(aicx_home)?;
+    let user_home = crate::os_user_home().unwrap_or_else(|| aicx_home.to_path_buf());
+    let source_allow = crate::source_path::SourceAllowlist::for_operator(&user_home, aicx_home);
+    let mut candidates = Vec::new();
+    for entry in &entries {
+        let mut paths = vec![extract_path_for(aicx_home, &entry.agent, &entry.session_id)];
+        if let Ok(source_path) = source_allow.resolve_file(entry.source_path.as_str()) {
+            paths.push(source_path);
+        }
+        for path in paths {
+            let file = StoredContextFile {
+                path,
+                project: entry.project.clone().unwrap_or_else(|| "_unknown".into()),
+                repo: None,
+                date_compact: entry.date.as_deref().unwrap_or_default().replace('-', ""),
+                date_iso: entry.date.clone().unwrap_or_default(),
+                kind: Kind::Conversations,
+                agent: entry.agent.clone(),
+                session_id: entry.session_id.clone(),
+                chunk: 1,
+            };
+            if crate::legacy_archive::context_file_matches_spec(aicx_home, &file, reference) {
+                candidates.push(file);
+            }
+        }
+    }
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+    let first = &candidates[0];
+    anyhow::ensure!(
+        candidates
+            .iter()
+            .all(|candidate| candidate.agent == first.agent
+                && candidate.session_id == first.session_id),
+        "ambiguous catalog chunk reference; use a full source or extract path"
+    );
+    let file = crate::legacy_archive::resolve_context_chunk_file(aicx_home, candidates, reference)?;
+    let entry = entries
+        .iter()
+        .find(|entry| entry.agent == file.agent && entry.session_id == file.session_id)
+        .ok_or_else(|| anyhow::anyhow!("resolved catalog session disappeared"))?;
+    // Cache hash, live source fingerprint, repository scope and ignore rules
+    // are checked by this shared path; stale cache files cannot override source.
+    let document = read_session_document(aicx_home, entry)?;
+    let bytes = document.body.len() as u64;
+    let (content, truncated) = crate::legacy_archive::truncate_chars(document.body, max_chars);
+    Ok(Some(crate::legacy_archive::ReadContextChunk {
+        relative_path: file
+            .path
+            .strip_prefix(aicx_home)
+            .unwrap_or(&file.path)
+            .to_string_lossy()
+            .replace('\\', "/"),
+        path: file.path,
+        project: file.project,
+        date: file.date_iso,
+        kind: file.kind.dir_name().into(),
+        agent: file.agent,
+        session_id: file.session_id,
+        chunk: file.chunk,
+        bytes,
+        content,
+        truncated,
+    }))
+}
+
 fn read_session_document(aicx_home: &Path, entry: &CatalogEntry) -> Result<SessionDocument> {
     let user_home = crate::os_user_home().unwrap_or_else(|| aicx_home.to_path_buf());
     let ignore = crate::legacy_archive::load_repo_path_ignore(aicx_home, &user_home)?;
@@ -1221,6 +1302,7 @@ fn parse_catalog_source_checked(
         "grok" => aicx_parser::engine::AgentKind::Grok,
         "junie" => aicx_parser::engine::AgentKind::Junie,
         "kimi" => aicx_parser::engine::AgentKind::Kimi,
+        "copilot" => aicx_parser::engine::AgentKind::Copilot,
         other => anyhow::bail!("unsupported catalog agent `{other}`"),
     };
     let parsed = crate::parser_dispatch::parse_file(
@@ -2120,18 +2202,25 @@ fn try_reuse_cached_extract(
     if record.source_len == 0 || record.source_mtime_ns == 0 {
         return None;
     }
+    if entry.agent == "copilot" && record.source_bundle_fingerprint.is_none() {
+        return None;
+    }
     // LIVE source fingerprint is the reuse gate. Catalog-embedded size/mtime
     // lag until rebuild; requiring them to match the ledger forced full
     // reparse after a source-change index that already stamped live stats.
     if let Ok(live_path) = source_allow.resolve_file(entry.source_path.as_str()) {
-        let (live_len, live_mtime) = crate::catalog::live_source_fingerprint(&live_path)?;
-        if live_len != record.source_len || live_mtime != record.source_mtime_ns {
+        let live = crate::catalog::live_source_bundle_fingerprint(&live_path)?;
+        if live.len != record.source_len
+            || live.modified_unix_nanos as u64 != record.source_mtime_ns
+            || live.bundle_fingerprint != record.source_bundle_fingerprint
+        {
             return None;
         }
     } else {
         // Unreadable path: fall back to catalog-admitted fields only.
         if entry.source_len != Some(record.source_len)
             || entry.source_mtime_ns != Some(record.source_mtime_ns)
+            || entry.source_bundle_fingerprint != record.source_bundle_fingerprint
         {
             return None;
         }
@@ -2217,9 +2306,14 @@ fn source_fingerprint(
         hasher.update([0]);
         hasher.update(entry.source_path.as_bytes());
         hasher.update([0]);
-        let (len, mtime) = live_or_catalog_fingerprint(entry, source_allow);
-        hasher.update(len.to_le_bytes());
-        hasher.update(mtime.to_le_bytes());
+        let fingerprint = live_or_catalog_fingerprint(entry, source_allow);
+        hasher.update(fingerprint.len.to_le_bytes());
+        hasher.update((fingerprint.modified_unix_nanos as u64).to_le_bytes());
+        if let Some(bundle) = fingerprint.bundle_fingerprint {
+            hasher.update(b"source_bundle\0");
+            hasher.update(bundle.as_bytes());
+            hasher.update([0]);
+        }
     }
     Ok(hex::encode(hasher.finalize()))
 }
@@ -2229,23 +2323,37 @@ fn source_fingerprint(
 fn live_or_catalog_fingerprint(
     entry: &CatalogEntry,
     source_allow: &crate::source_path::SourceAllowlist,
-) -> (u64, u64) {
+) -> crate::session_catalog::SourceFingerprint {
     if let Ok(path) = source_allow.resolve_file(entry.source_path.as_str())
-        && let Some(live) = crate::catalog::live_source_fingerprint(&path)
+        && let Some(live) = crate::catalog::live_source_bundle_fingerprint(&path)
     {
         return live;
     }
-    (
-        entry.source_len.unwrap_or(0),
-        entry.source_mtime_ns.unwrap_or(0),
-    )
+    crate::session_catalog::SourceFingerprint {
+        len: entry.source_len.unwrap_or(0),
+        modified_unix_nanos: entry.source_mtime_ns.unwrap_or(0) as u128,
+        bundle_fingerprint: entry.source_bundle_fingerprint.clone(),
+    }
 }
 
-fn resolve_entry_fingerprint(entry: &CatalogEntry, source_path: &Path) -> (u64, u64) {
+fn resolve_entry_fingerprint(
+    entry: &CatalogEntry,
+    source_path: &Path,
+) -> crate::session_catalog::SourceFingerprint {
     if let (Some(len), Some(mtime)) = (entry.source_len, entry.source_mtime_ns) {
-        return (len, mtime);
+        return crate::session_catalog::SourceFingerprint {
+            len,
+            modified_unix_nanos: mtime as u128,
+            bundle_fingerprint: entry.source_bundle_fingerprint.clone(),
+        };
     }
-    crate::catalog::live_source_fingerprint(source_path).unwrap_or((0, 0))
+    crate::catalog::live_source_bundle_fingerprint(source_path).unwrap_or(
+        crate::session_catalog::SourceFingerprint {
+            len: 0,
+            modified_unix_nanos: 0,
+            bundle_fingerprint: None,
+        },
+    )
 }
 
 fn extract_path_for(aicx_home: &Path, agent: &str, session_id: &str) -> PathBuf {
@@ -2516,6 +2624,7 @@ mod tests {
             source_path: source_path.display().to_string(),
             source_len: None,
             source_mtime_ns: None,
+            source_bundle_fingerprint: None,
             title: None,
             machine: None,
             logical_session_id: None,
@@ -3237,6 +3346,157 @@ mod tests {
     }
 
     #[test]
+    fn copilot_cache_reuse_and_generation_notice_sidecar_edits_below_event_mtime() {
+        let root = reader_fixture_root("copilot-bundle-cache");
+        let source_path = root.join(".copilot/session-state/user-123-task-456/events.jsonl");
+        let sidecar = source_path.parent().unwrap().join("workspace.yaml");
+        fs::create_dir_all(source_path.parent().unwrap()).unwrap();
+        fs::write(&source_path, "{\"type\":\"session.start\",\"data\":{}}\n").unwrap();
+        fs::write(&sidecar, "name: first title\n").unwrap();
+        filetime::set_file_mtime(
+            &source_path,
+            filetime::FileTime::from_unix_time(2_000_000_000, 0),
+        )
+        .unwrap();
+        filetime::set_file_mtime(
+            &sidecar,
+            filetime::FileTime::from_unix_time(1_700_000_000, 0),
+        )
+        .unwrap();
+        let before = crate::catalog::live_source_bundle_fingerprint(&source_path).unwrap();
+        let entry = CatalogEntry {
+            schema: crate::catalog::CATALOG_SCHEMA.to_owned(),
+            session_id: "user-123-task-456".to_owned(),
+            agent: "copilot".to_owned(),
+            project: None,
+            date: None,
+            cwd: None,
+            source_path: source_path.display().to_string(),
+            source_len: Some(before.len),
+            source_mtime_ns: Some(before.modified_unix_nanos as u64),
+            source_bundle_fingerprint: before.bundle_fingerprint.clone(),
+            title: None,
+            machine: None,
+            logical_session_id: None,
+            session_kind: None,
+        };
+        let catalog_path = crate::catalog::sessions_path_for(&root);
+        fs::create_dir_all(catalog_path.parent().unwrap()).unwrap();
+        fs::write(
+            &catalog_path,
+            format!("{}\n", serde_json::to_string(&entry).unwrap()),
+        )
+        .unwrap();
+        let extract_relpath = "extracts/copilot/user-123-task-456_conversation.md";
+        let body = "# Copilot session\n\nuser: retain source evidence\n";
+        let extract_path = root.join(extract_relpath);
+        fs::create_dir_all(extract_path.parent().unwrap()).unwrap();
+        fs::write(&extract_path, body).unwrap();
+        let key = session_state_key("copilot", &entry.session_id);
+        let mut prior = SourceParseState {
+            schema: PARSE_STATE_SCHEMA.to_owned(),
+            signal_filter_version: SIGNAL_FILTER_VERSION.to_owned(),
+            repo_path_ignore_fingerprint: "ignore-fingerprint".to_owned(),
+            sessions: BTreeMap::from([(
+                key.clone(),
+                SessionParseRecord {
+                    source_path: entry.source_path.clone(),
+                    source_len: before.len,
+                    source_mtime_ns: before.modified_unix_nanos as u64,
+                    source_bundle_fingerprint: before.bundle_fingerprint.clone(),
+                    extract_relpath: extract_relpath.to_owned(),
+                    extract_sha256: sha256_hex(body.as_bytes()),
+                    raw_frames: 1,
+                    signal_frames: 1,
+                    filtered_frames: 0,
+                    project: None,
+                    date: None,
+                    cwd: None,
+                    scope_conflict: false,
+                    scope_unattributed: false,
+                    session_kind: None,
+                    scope_environment: ScopeLayoutProbe::default().fingerprint(None, &[]),
+                    scope_paths: Vec::new(),
+                },
+            )]),
+        };
+        let allow = crate::source_path::SourceAllowlist::from_roots([root.clone()]);
+        let reuse = |prior: &SourceParseState| {
+            try_reuse_cached_extract(
+                &root,
+                &entry,
+                prior,
+                &key,
+                &allow,
+                "ignore-fingerprint",
+                &mut ScopeLayoutProbe::default(),
+            )
+        };
+        assert!(reuse(&prior).is_some());
+        let generation_before = source_fingerprint(
+            &root,
+            &catalog_path,
+            std::slice::from_ref(&entry),
+            &allow,
+            "ignore-fingerprint",
+        )
+        .unwrap();
+
+        fs::write(&sidecar, "name: other title\n").unwrap();
+        filetime::set_file_mtime(
+            &sidecar,
+            filetime::FileTime::from_unix_time(1_700_000_001, 0),
+        )
+        .unwrap();
+        let after = crate::catalog::live_source_bundle_fingerprint(&source_path).unwrap();
+        assert_eq!(before.len, after.len);
+        assert_eq!(before.modified_unix_nanos, after.modified_unix_nanos);
+        assert_ne!(before.bundle_fingerprint, after.bundle_fingerprint);
+        assert!(
+            reuse(&prior).is_none(),
+            "sidecar edits must invalidate cached passages"
+        );
+        assert_ne!(
+            generation_before,
+            source_fingerprint(
+                &root,
+                &catalog_path,
+                std::slice::from_ref(&entry),
+                &allow,
+                "ignore-fingerprint"
+            )
+            .unwrap()
+        );
+
+        prior
+            .sessions
+            .get_mut(&key)
+            .unwrap()
+            .source_bundle_fingerprint = after.bundle_fingerprint;
+        assert!(
+            reuse(&prior).is_some(),
+            "a freshly parsed bundle can reuse despite a lagging catalog"
+        );
+        prior
+            .sessions
+            .get_mut(&key)
+            .unwrap()
+            .source_bundle_fingerprint = None;
+        assert!(
+            reuse(&prior).is_none(),
+            "legacy Copilot records must reparse once"
+        );
+        let mut legacy = serde_json::to_value(&prior).unwrap();
+        legacy["sessions"][&key]
+            .as_object_mut()
+            .unwrap()
+            .remove("source_bundle_fingerprint");
+        let restored: SourceParseState = serde_json::from_value(legacy).unwrap();
+        assert_eq!(restored.sessions[&key].source_bundle_fingerprint, None);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn parse_state_reuse_requires_matching_source_path_and_extract_hash() {
         let root = std::env::temp_dir().join(format!(
             "aicx-source-index-reuse-{}-{}",
@@ -3274,6 +3534,7 @@ mod tests {
             source_path: source_path.display().to_string(),
             source_len: Some(source_len),
             source_mtime_ns: Some(source_mtime_ns),
+            source_bundle_fingerprint: None,
             title: Some("routing".to_string()),
             machine: None,
             logical_session_id: None,
@@ -3291,6 +3552,7 @@ mod tests {
                 source_path: entry.source_path.clone(),
                 source_len,
                 source_mtime_ns,
+                source_bundle_fingerprint: None,
                 extract_relpath: extract_rel.to_string(),
                 extract_sha256: sha256_hex(body.as_bytes()),
                 raw_frames: 4,
@@ -3560,6 +3822,7 @@ mod tests {
             source_path: source_path.display().to_string(),
             source_len: None,
             source_mtime_ns: None,
+            source_bundle_fingerprint: None,
             title: None,
             machine: None,
             logical_session_id: None,
@@ -3631,6 +3894,7 @@ mod tests {
             source_path: source_path.display().to_string(),
             source_len: None,
             source_mtime_ns: None,
+            source_bundle_fingerprint: None,
             title: None,
             machine: None,
             logical_session_id: None,
@@ -3933,6 +4197,7 @@ mod tests {
                 source_path: entry.source_path.clone(),
                 source_len: 1,
                 source_mtime_ns: 1,
+                source_bundle_fingerprint: None,
                 extract_relpath: "extracts/codex/s1.md".to_string(),
                 extract_sha256: String::new(),
                 raw_frames: 1,

@@ -52,6 +52,7 @@ if [[ "$first_line" =~ $subject_pattern ]]; then
     case "$agent" in
         cursor-agent) session_agent=cursor ;;
         gemini-antigravity) session_agent=gemini ;;
+        copilot-cli|github-copilot|github-copilot-cli) session_agent=copilot ;;
     esac
     prepare_hook="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)/prepare-commit-msg"
     if [ -f "$prepare_hook" ]; then
@@ -291,7 +292,7 @@ fi
 session_ok=0
 if printf '%s\n' "$footer" | grep -Eq '^session_id: [0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'; then
     session_ok=1
-elif { [ "$session_agent" = "codex" ] || [ "$session_agent" = "claude" ]; } \
+elif { [ "$session_agent" = "codex" ] || [ "$session_agent" = "claude" ] || [ "$session_agent" = "copilot" ]; } \
     && printf '%s\n' "$footer" | grep -Eq '^session_id: [A-Za-z0-9][A-Za-z0-9._-]{0,127}$'; then
     session_ok=1
 elif [ "$session_agent" = "junie" ] && printf '%s\n' "$footer" | grep -Eq '^session_id: [0-9]{6}(-[A-Za-z0-9]+)+$'; then
@@ -302,7 +303,7 @@ elif [ "$session_agent" = "kimi" ] && printf '%s\n' "$footer" | grep -Eq '^sessi
     session_ok=1
 fi
 if [ "$session_ok" -ne 1 ]; then
-    if [ "$session_agent" = "codex" ] || [ "$session_agent" = "claude" ]; then
+    if [ "$session_agent" = "codex" ] || [ "$session_agent" = "claude" ] || [ "$session_agent" = "copilot" ]; then
         failures+=("missing session_id: <uuid or native session id>")
     elif [ "$session_agent" = "junie" ]; then
         failures+=("missing session_id: <uuid or YYMMDD-HHMMSS-suffix>")

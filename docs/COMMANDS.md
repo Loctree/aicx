@@ -112,7 +112,8 @@ Orthogonal surfaces:
 - **catalog status** = will rebuild admit/change identity rows?
 - **index status** = is CURRENT lagging the catalog/corpus?
 
-`catalog rebuild` walks the registered Claude, Codex, Grok, Gemini, Junie, and
+`catalog rebuild` walks the registered Claude, Codex, Cursor, Grok, Gemini,
+Junie, Kimi, Copilot CLI, and
 Vibecrafted runtime roots. It writes the compact catalog and prints counts,
 including `pending_chunks`. It does not materialize session content unless
 `--with-chunks` is passed, which drains the lag through `aicx index`.
@@ -160,7 +161,8 @@ from content filtered under the previous one.
 
 1. **Session JSONL sync** — catalog only discovers files under this host's agent
    roots (`~/.claude/projects`, `~/.codex/sessions`, `~/.cursor/projects`, `~/.gemini/tmp`,
-   `~/.grok/sessions`, `~/.junie/sessions`, `~/.kimi-code/sessions`, `~/.vibecrafted/control_plane/runtime_runs`).
+   `~/.grok/sessions`, `~/.junie/sessions`, `~/.kimi-code/sessions`,
+   `~/.copilot/session-state`, `~/.vibecrafted/control_plane/runtime_runs`).
    Drop synced JSONL into those trees, then `catalog status` → `catalog rebuild`.
 2. **No alternate daily store intake** — there is no second "drop folder" for
    sessions. `AICX_HOME` / `[storage].home` relocates the **whole** home
@@ -185,10 +187,26 @@ aicx extract codex --session <session-id> --conversation
 aicx extract cursor --session <session-id> --conversation
 aicx extract grok --session <session-id> --conversation
 aicx extract gemini --session <session-id> --conversation
+aicx extract copilot --session <session-id> --conversation
 ```
 
 Use `--output <path>` for an explicit file. Session mode resolves through the
 catalog and opens only an allowlisted, canonical source path.
+
+Copilot CLI also supports bulk extraction, conversation JSON exports, briefs,
+intents, index/search, and the same MCP tools as other providers. The provider
+name is `copilot`; `copilot-cli`, `github-copilot`, and `github-copilot-cli`
+are accepted aliases.
+See [COPILOT_SESSIONS.md](COPILOT_SESSIONS.md) for source layout and coverage.
+
+```bash
+aicx extract all --provider copilot --conversation
+aicx conversations --agent copilot --hours 0 --out-dir ./conversations
+aicx extract copilot --session <session-id> --brief
+aicx extract copilot --session <session-id> --agent-commands --result full
+aicx intents --agent copilot --hours 0 --emit json
+aicx search 'past decision' --agent copilot --hours 0 --json
+```
 
 ### Projection flags (W2-T13)
 

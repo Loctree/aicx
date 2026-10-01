@@ -104,7 +104,6 @@ pub mod search_eval;
 /// Deterministic locate-before-parse session catalog (C1L line). Registered
 /// here for the CLI extraction dispatch; final shared runtime wiring stays
 /// with the C5X cut.
-#[cfg(feature = "app")]
 pub mod session_catalog;
 pub mod sessions;
 #[cfg(feature = "app")]

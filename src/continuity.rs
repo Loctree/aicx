@@ -788,6 +788,7 @@ mod tests {
             source_path: source.display().to_string(),
             source_len: None,
             source_mtime_ns: None,
+            source_bundle_fingerprint: None,
             title: None,
             machine: Some("test".to_string()),
             logical_session_id: None,

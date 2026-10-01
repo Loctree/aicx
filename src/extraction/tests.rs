@@ -48,6 +48,7 @@ fn duplicate_session_sources_are_ordered_freshest_first() {
             fingerprint: crate::session_catalog::SourceFingerprint {
                 len: 1,
                 modified_unix_nanos,
+                bundle_fingerprint: None,
             },
             header_truncated: false,
         }
