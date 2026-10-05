@@ -162,13 +162,15 @@ fn frozen_cli_mcp_inject_census_time_role_and_error_contract() {
         Some("2026-10-02T12:00:00Z"),
         "Decision: merely mentioning aicx must not assign this foreign request.",
     ));
-    // This baseline does not have a Copilot adapter; that is a disclosed hole, not 0 discovered Copilot.
+    // Copilot is a supported adapter. This body is Claude-shaped on purpose:
+    // discovery must keep the provider in the census, and an empty parse is
+    // `no_frames`, not a silent drop.
     entries.push(fixture.source(
         25,
         "copilot",
         "Loctree/aicx",
         Some("2026-10-02T12:00:00Z"),
-        "Decision: unsupported provider must be counted.",
+        "Decision: an unreadable copilot body must stay in the census.",
     ));
     entries.push(fixture.source(
         26,
@@ -212,7 +214,7 @@ fn frozen_cli_mcp_inject_census_time_role_and_error_contract() {
     assert_eq!(pack.selection.len(), 28);
     assert!(
         pack.source_errors >= 2,
-        "unsupported provider and malformed visible tail are separate holes"
+        "empty copilot parse and malformed visible tail are separate holes"
     );
     assert_eq!(
         pack.selection
@@ -224,7 +226,7 @@ fn frozen_cli_mcp_inject_census_time_role_and_error_contract() {
     assert!(
         pack.selection
             .iter()
-            .any(|s| s.agent == "copilot" && s.status == "source_error")
+            .any(|s| s.agent == "copilot" && s.status == "no_frames")
     );
     assert!(
         pack.selection
