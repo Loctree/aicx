@@ -1426,6 +1426,188 @@ fn scan_junie_session_file(path: &Path, session_id: &str) -> Option<SessionInfo>
     })
 }
 
+/// Discover GitHub Copilot CLI's event bundles. The session catalog owns
+/// admission and identity; workspace.yaml is optional metadata, never a
+/// second session source. Source I/O failures are reported instead of being
+/// silently presented as a host with no sessions.
+pub fn discover_copilot_sessions(
+    sessions_root: &Path,
+    modified_after: Option<SystemTime>,
+    cwd_filter: Option<&str>,
+) -> Vec<SessionInfo> {
+    use crate::session_catalog::{AgentKind, SessionCatalog};
+    match sessions_root.try_exists() {
+        Ok(false) => return Vec::new(),
+        Ok(true) => {}
+        Err(error) => {
+            eprintln!(
+                "aicx: sessions: cannot inspect copilot root {}: {error}",
+                sessions_root.display()
+            );
+            return Vec::new();
+        }
+    }
+    let sources = match SessionCatalog::new(AgentKind::Copilot, sessions_root)
+        .and_then(|catalog| catalog.scan_with_stats().result)
+    {
+        Ok(sources) => sources,
+        Err(error) => {
+            eprintln!("aicx: sessions: copilot source discovery failed: {error}");
+            return Vec::new();
+        }
+    };
+    let cutoff = modified_after
+        .and_then(|time| time.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos());
+    let mut out = Vec::new();
+    for source in sources {
+        if cutoff.is_some_and(|cutoff| source.fingerprint.modified_unix_nanos < cutoff) {
+            continue;
+        }
+        match scan_copilot_session_file(&source.path, &source.source_id) {
+            Some(info)
+                if cwd_filter.is_none_or(|want| {
+                    info.repo_path
+                        .as_deref()
+                        .is_some_and(|cwd| cwd_nests(want, cwd))
+                }) =>
+            {
+                out.push(info)
+            }
+            Some(_) => {}
+            None => eprintln!(
+                "aicx: sessions: unreadable copilot source {}",
+                source.path.display()
+            ),
+        }
+    }
+    out
+}
+
+pub(crate) fn scan_copilot_session_file(path: &Path, session_id: &str) -> Option<SessionInfo> {
+    let file = crate::sanitize::open_file_validated(path).ok()?;
+    let mut metadata = crate::session_catalog::copilot_metadata(path);
+    let parse_timestamp = |raw: &str| {
+        DateTime::parse_from_rfc3339(raw)
+            .ok()
+            .map(|time| time.with_timezone(&Utc))
+    };
+    let mut started_at = metadata.created_at.as_deref().and_then(parse_timestamp);
+    let mut updated_at = metadata
+        .updated_at
+        .as_deref()
+        .and_then(parse_timestamp)
+        .or(started_at);
+    let mut reader = BufReader::new(file);
+    let mut user_message_count = 0usize;
+    let mut agent_message_count = 0usize;
+    let mut title = metadata.title;
+    let mut saw_parsable_line = false;
+    while let Some(line) =
+        crate::sanitize::read_line_capped(&mut reader, crate::extraction::MAX_LINE_BYTES).ok()?
+    {
+        if line.exceeded {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line.line.trim()) else {
+            continue;
+        };
+        saw_parsable_line = true;
+        let context = match value.get("type").and_then(|value| value.as_str()) {
+            Some("session.resume") => value.get("data").and_then(|data| data.get("context")),
+            Some("session.context_changed") => value.get("data"),
+            _ => None,
+        };
+        if let Some(context) = context {
+            if let Some(cwd) = context["cwd"]
+                .as_str()
+                .or_else(|| context["gitRoot"].as_str())
+                .filter(|cwd| !cwd.trim().is_empty())
+            {
+                metadata.cwd = Some(cwd.to_owned());
+            }
+            if let Some(repository) = context["repository"]
+                .as_str()
+                .filter(|repository| !repository.trim().is_empty())
+            {
+                metadata.repository = Some(repository.to_owned());
+            }
+        }
+        if let Some(timestamp) = value
+            .get("timestamp")
+            .and_then(|value| value.as_str())
+            .and_then(parse_timestamp)
+        {
+            started_at = Some(started_at.map_or(timestamp, |current| current.min(timestamp)));
+            updated_at = Some(updated_at.map_or(timestamp, |current| current.max(timestamp)));
+        }
+        let content = value
+            .get("data")
+            .and_then(|data| data.get("content"))
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|content| !content.is_empty());
+        match value.get("type").and_then(|value| value.as_str()) {
+            Some("user.message")
+                // parentAgentTaskId is native telemetry that can also occur
+                // on main human messages. Match the parser's explicit author
+                // markers instead of using a task association as authorship.
+                if value["agentId"].as_str().is_none_or(str::is_empty)
+                    && value["data"]["source"]
+                    .as_str()
+                    .is_none_or(str::is_empty)
+                    && value["data"]["isAutopilotContinuation"].as_bool() != Some(true) =>
+            {
+                if let Some(content) = content {
+                    user_message_count += 1;
+                    if title.is_none() {
+                        title = Some(short_title(content));
+                    }
+                }
+            }
+            Some("assistant.message")
+                if content.is_some()
+                    && value["agentId"].as_str().is_none_or(str::is_empty)
+                    && value["data"]["parentToolCallId"].as_str().is_none() =>
+            {
+                agent_message_count += 1
+            }
+            _ => {}
+        }
+    }
+    let project = metadata
+        .repository
+        .or_else(|| metadata.cwd.as_deref().and_then(project_label_from_cwd));
+    let association = if metadata.cwd.is_some() {
+        Association::Exact
+    } else {
+        Association::Unknown
+    };
+    let temporal_confidence = if started_at.is_some() {
+        TemporalConfidence::Full
+    } else if saw_parsable_line {
+        TemporalConfidence::Partial
+    } else {
+        TemporalConfidence::None
+    };
+    Some(SessionInfo {
+        session_id: session_id.to_owned(),
+        agent: "copilot".to_owned(),
+        project,
+        repo_path: metadata.cwd,
+        started_at,
+        updated_at,
+        message_count: user_message_count + agent_message_count,
+        user_message_count,
+        agent_message_count,
+        title,
+        source_path: path.to_path_buf(),
+        association,
+        temporal_confidence,
+        session_kind: None,
+    })
+}
+
 const KIMI_WIRE_FILENAME: &str = "wire.jsonl";
 
 /// Discover Kimi Code CLI sessions under a sessions root
@@ -2070,6 +2252,11 @@ pub fn discover_sessions_at(
     agent: Option<&str>,
 ) -> Vec<SessionInfo> {
     let mut discovered = Vec::new();
+    let agent = agent.map(|agent| {
+        crate::session_catalog::AgentKind::parse(agent)
+            .map(|kind| kind.as_str())
+            .unwrap_or(agent)
+    });
     if agent.is_none_or(|a| a == "claude") {
         discovered.extend(discover_claude_sessions(
             &home.join(".claude").join("projects"),
@@ -2112,6 +2299,13 @@ pub fn discover_sessions_at(
     if agent.is_none_or(|a| a == "cursor") {
         discovered.extend(discover_cursor_sessions(
             &home.join(".cursor").join("projects"),
+            modified_after,
+            cwd_filter,
+        ));
+    }
+    if agent.is_none_or(|a| a == "copilot") {
+        discovered.extend(discover_copilot_sessions(
+            &crate::session_catalog::copilot_session_root(home),
             modified_after,
             cwd_filter,
         ));
@@ -2370,6 +2564,24 @@ pub fn find_session_by_id(home: &Path, id: &str) -> Option<SessionInfo> {
         }
     }
 
+    let copilot_root = crate::session_catalog::copilot_session_root(home);
+    if copilot_root.exists() {
+        match crate::session_catalog::SessionCatalog::new(
+            crate::session_catalog::AgentKind::Copilot,
+            &copilot_root,
+        )
+        .and_then(|catalog| catalog.resolve(id))
+        {
+            Ok(resolved) => {
+                return scan_copilot_session_file(
+                    &resolved.source.path,
+                    &resolved.source.source_id,
+                );
+            }
+            Err(crate::session_catalog::CatalogError::Missing { .. }) => {}
+            Err(error) => eprintln!("aicx: session: copilot lookup failed: {error}"),
+        }
+    }
     None
 }
 
@@ -2448,6 +2660,137 @@ pub fn select_sessions(
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn copilot_task_telemetry_preserves_human_count_and_runtime_authorship_is_excluded() {
+        let home = temp_root("copilot_authorship");
+        let session = home.join("session-state").join("user-123-task-456");
+        fs::create_dir_all(&session).unwrap();
+        write_session(
+            &session,
+            "events.jsonl",
+            &[
+                r#"{"type":"user.message","data":{"content":"A human request","parentAgentTaskId":"native-task"}}"#,
+                r#"{"type":"user.message","data":{"content":"Another human request"}}"#,
+                r#"{"type":"user.message","agentId":"worker-agent","data":{"content":"Worker message","parentAgentTaskId":"native-task"}}"#,
+                r#"{"type":"user.message","data":{"content":"Agent message","source":"agent-worker"}}"#,
+                r#"{"type":"user.message","data":{"content":"Skill context","source":"skill-review"}}"#,
+                r#"{"type":"user.message","data":{"content":"Harness continuation","isAutopilotContinuation":true}}"#,
+                r#"{"type":"assistant.message","agentId":"worker-agent","data":{"content":"Worker response"}}"#,
+                r#"{"type":"assistant.message","data":{"content":"Nested worker reply","parentToolCallId":"worker-call"}}"#,
+                r#"{"type":"assistant.message","data":{"content":"Main response"}}"#,
+            ],
+        );
+        let info =
+            scan_copilot_session_file(&session.join("events.jsonl"), "user-123-task-456").unwrap();
+        assert_eq!(info.user_message_count, 2);
+        assert_eq!(info.agent_message_count, 1);
+        assert_eq!(info.message_count, 3);
+        assert_eq!(info.title.as_deref(), Some("A human request"));
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn discovers_copilot_metadata_counts_and_exact_directory_identity() {
+        let home = temp_root("copilot_metadata");
+        let id = "12345678-1234-1234-1234-123456789abc";
+        let root = home.join(".copilot").join("session-state");
+        let session = root.join(id);
+        fs::create_dir_all(&session).unwrap();
+        write_session(
+            &session,
+            "events.jsonl",
+            &[
+                r#"{"type":"session.start","timestamp":"2026-06-01T12:00:00Z","data":{"sessionId":"logical-id","startTime":"2026-06-01T12:00:00Z","context":{"cwd":"/repos/owner/repo","repository":"owner/repo"}}}"#,
+                r#"{"type":"user.message","timestamp":"2026-06-01T12:00:01Z","data":{"content":"Build the requested feature"}}"#,
+                r#"{"type":"user.message","agentId":"worker-agent","timestamp":"2026-06-01T12:00:02Z","data":{"content":"internal worker prompt","parentAgentTaskId":"worker-task"}}"#,
+                r#"{"type":"assistant.message","timestamp":"2026-06-01T12:00:03Z","data":{"content":"Implemented the feature"}}"#,
+                r#"{"type":"assistant.message","timestamp":"2026-06-01T12:00:04Z","data":{"content":"","toolRequests":[{"name":"read_file"}]}}"#,
+                r#"{"type":"session.shutdown","timestamp":"2026-06-01T12:00:05Z","data":{}}"#,
+            ],
+        );
+        let info = discover_copilot_sessions(&root, None, None).pop().unwrap();
+        assert_eq!(info.agent, "copilot");
+        assert_eq!(info.session_id, id);
+        assert_eq!(info.repo_path.as_deref(), Some("/repos/owner/repo"));
+        assert_eq!(info.project.as_deref(), Some("owner/repo"));
+        assert_eq!(info.user_message_count, 1);
+        assert_eq!(info.agent_message_count, 1);
+        assert_eq!(info.message_count, 2);
+        assert_eq!(info.title.as_deref(), Some("Build the requested feature"));
+        assert_eq!(
+            info.updated_at.unwrap().to_rfc3339(),
+            "2026-06-01T12:00:05+00:00"
+        );
+        assert_eq!(info.association, Association::Exact);
+        assert_eq!(info.temporal_confidence, TemporalConfidence::Full);
+        assert_eq!(
+            find_session_by_id(&home, "12345678").unwrap().session_id,
+            id
+        );
+        assert_eq!(
+            discover_sessions_at(&home, None, None, Some("github-copilot-cli")).len(),
+            1
+        );
+        assert!(discover_copilot_sessions(&root, None, Some("/repos/other")).is_empty());
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn copilot_resume_beyond_header_updates_current_repo_and_malformed_sidecar_is_optional() {
+        let home = temp_root("copilot_resume");
+        let id = "12345678-1234-1234-1234-123456789abc";
+        let root = home.join(".copilot").join("session-state");
+        let session = root.join(id);
+        fs::create_dir_all(&session).unwrap();
+        let mut file = fs::File::create(session.join("events.jsonl")).unwrap();
+        writeln!(file, r#"{{"type":"session.start","timestamp":"2026-06-01T12:00:00Z","data":{{"sessionId":"{id}","context":{{"cwd":"/repo/old","repository":"owner/old"}}}}}}"#).unwrap();
+        for _ in 0..crate::session_catalog::MAX_HEADER_LINES {
+            writeln!(file, r#"{{"type":"hook.end","data":{{}}}}"#).unwrap();
+        }
+        writeln!(file, r#"{{"type":"session.resume","timestamp":"2026-06-02T12:00:00Z","data":{{"context":{{"cwd":"/repo/new","repository":"owner/new"}}}}}}"#).unwrap();
+        fs::write(session.join("workspace.yaml"), "cwd: [invalid\n").unwrap();
+        let info = discover_copilot_sessions(&root, None, Some("/repo/new"))
+            .pop()
+            .unwrap();
+        assert_eq!(info.session_id, id);
+        assert_eq!(info.repo_path.as_deref(), Some("/repo/new"));
+        assert_eq!(info.project.as_deref(), Some("owner/new"));
+        assert_eq!(
+            info.started_at.unwrap().to_rfc3339(),
+            "2026-06-01T12:00:00+00:00"
+        );
+        assert_eq!(
+            info.updated_at.unwrap().to_rfc3339(),
+            "2026-06-02T12:00:00+00:00"
+        );
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn copilot_workspace_fallback_keeps_absolute_time_without_session_header() {
+        let home = temp_root("copilot_sidecar");
+        let id = "12345678-1234-1234-1234-123456789abc";
+        let root = home.join(".copilot").join("session-state");
+        let session = root.join(id);
+        fs::create_dir_all(&session).unwrap();
+        fs::write(
+            session.join("events.jsonl"),
+            "{\"type\":\"hook.end\",\"data\":{}}\n",
+        )
+        .unwrap();
+        fs::write(session.join("workspace.yaml"), "id: wrong-sidecar-id\ncwd: /repo/fallback\nrepository: owner/fallback\nname: saved title\ncreated_at: '2026-06-01T12:00:00Z'\nupdated_at: '2026-06-02T12:00:00Z'\n").unwrap();
+        let info = discover_copilot_sessions(&root, None, None).pop().unwrap();
+        assert_eq!(info.session_id, id);
+        assert_eq!(info.repo_path.as_deref(), Some("/repo/fallback"));
+        assert_eq!(info.title.as_deref(), Some("saved title"));
+        assert_eq!(info.temporal_confidence, TemporalConfidence::Full);
+        assert_eq!(
+            info.updated_at.unwrap().to_rfc3339(),
+            "2026-06-02T12:00:00+00:00"
+        );
+        fs::remove_dir_all(home).unwrap();
+    }
 
     #[test]
     fn cursor_inferred_cwd_filter_survives_dots_and_underscores() {

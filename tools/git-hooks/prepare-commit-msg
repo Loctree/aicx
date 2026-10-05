@@ -56,6 +56,7 @@ session_agent="$agent"
 case "$agent" in
     cursor-agent) session_agent=cursor ;;
     gemini-antigravity) session_agent=gemini ;;
+        copilot-cli|github-copilot|github-copilot-cli) session_agent=copilot ;;
 esac
 
 # Humans keep a human address. Mirrors the commit-msg human lane exactly; if the
@@ -118,6 +119,7 @@ CURSOR_CONVERSATION_ID cursor
 GEMINI_SESSION_ID gemini
 JUNIE_SESSION_ID junie
 KIMI_SESSION_ID kimi
+COPILOT_SESSION_ID copilot
 GROK_SESSION_ID grok
 GROK_THREAD_ID grok
 EOF
@@ -145,6 +147,7 @@ CURSOR_CONVERSATION_ID cursor
 GEMINI_SESSION_ID gemini
 JUNIE_SESSION_ID junie
 KIMI_SESSION_ID kimi
+COPILOT_SESSION_ID copilot
 GROK_SESSION_ID grok
 GROK_THREAD_ID grok
 EOF
@@ -181,7 +184,7 @@ if [ -z "$session_rejected" ] && printf '%s' "$session_raw" | grep -Eq '^[0-9a-f
 elif [ -z "$session_rejected" ] && printf '%s' "$session_raw" \
     | grep -Eq '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'; then
     session_id="$(printf '%s' "$session_raw" | tr 'A-F' 'a-f')"
-elif [ -z "$session_rejected" ] && { [ "$session_agent" = "codex" ] || [ "$session_agent" = "claude" ]; } \
+elif [ -z "$session_rejected" ] && { [ "$session_agent" = "codex" ] || [ "$session_agent" = "claude" ] || [ "$session_agent" = "copilot" ]; } \
     && printf '%s' "$session_raw" | grep -Eq "$codex_session_re"; then
     session_id="$session_raw"
 elif [ -z "$session_rejected" ] && [ "$session_agent" = "junie" ] \
@@ -583,7 +586,7 @@ if [ -n "$session_rejected" ]; then
         printf 'prepare-commit-msg: session from %s is not the subject agent %s; not using it.\n' \
             "$session_source" "$agent" >&2
     else
-        if [ "$session_agent" = "codex" ] || [ "$session_agent" = "claude" ]; then
+        if [ "$session_agent" = "codex" ] || [ "$session_agent" = "claude" ] || [ "$session_agent" = "copilot" ]; then
             printf 'prepare-commit-msg: session identity from %s is not a session id for this agent; not using it.\n' \
                 "$session_source" >&2
         elif [ "$session_agent" = "junie" ]; then

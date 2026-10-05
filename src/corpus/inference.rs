@@ -15,6 +15,7 @@ pub(super) fn infer_agent(path: &Path, content: &str) -> String {
     )
     .to_ascii_lowercase();
     for agent in [
+        "copilot",
         "claude",
         "codex",
         "gemini",

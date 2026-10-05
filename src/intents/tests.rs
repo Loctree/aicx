@@ -723,6 +723,7 @@ fn live_window_rejects_stale_dated_touched_files_and_keeps_unadmitted() {
         source_path: stale_dated.display().to_string(),
         source_len: None,
         source_mtime_ns: None,
+        source_bundle_fingerprint: None,
         title: None,
         machine: Some("test".to_string()),
         logical_session_id: None,
@@ -760,19 +761,19 @@ fn live_window_rejects_stale_dated_touched_files_and_keeps_unadmitted() {
         source_path: unadmitted.display().to_string(),
         source_len: Some(64),
         source_mtime_ns: Some(now_ns),
+        source_bundle_fingerprint: None,
         title: None,
         machine: Some("test".to_string()),
         logical_session_id: None,
         session_kind: None,
     };
-    let production_user_home = crate::os_user_home().unwrap_or_else(|| root.clone());
     let cutoff_ns = (Utc::now() - chrono::Duration::hours(24))
         .timestamp_nanos_opt()
         .map(|nanos| nanos.max(0) as u128)
         .unwrap_or(0);
     crate::catalog::prime_live_delta_cache_for_tests(
         &root,
-        &production_user_home,
+        &root,
         cutoff_ns,
         crate::catalog::LiveDelta {
             unadmitted: vec![row_b],
@@ -819,7 +820,7 @@ fn live_window_rejects_stale_dated_touched_files_and_keeps_unadmitted() {
     );
     assert!(
         summaries.iter().any(|s| s.contains("unadmitted session")),
-        "unadmitted live session missing: {summaries:?}"
+        "unadmitted synthetic live session missing"
     );
     assert!(
         live.records
@@ -857,6 +858,7 @@ fn catalog_source_replaces_retired_cards_for_intent_extraction() {
         source_path: source.display().to_string(),
         source_len: None,
         source_mtime_ns: None,
+        source_bundle_fingerprint: None,
         title: Some("catalog hydration".to_string()),
         machine: Some("test".to_string()),
         logical_session_id: None,

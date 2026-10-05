@@ -1284,7 +1284,15 @@ fn speaker_role(frame_kind: Option<&str>, speaker_hint: Option<&str>, line: &str
         Some(hint)
             if matches!(
                 hint.as_str(),
-                "assistant" | "agent" | "claude" | "codex" | "gemini" | "junie" | "kimi" | "cursor"
+                "assistant"
+                    | "agent"
+                    | "claude"
+                    | "codex"
+                    | "gemini"
+                    | "junie"
+                    | "kimi"
+                    | "cursor"
+                    | "copilot"
             ) =>
         {
             SpeakerRole::Assistant

@@ -727,6 +727,7 @@ mod tests {
                     source_path: source.to_string_lossy().into_owned(),
                     source_len: None,
                     source_mtime_ns: None,
+                    source_bundle_fingerprint: None,
                     title: None,
                     machine: None,
                     logical_session_id: None,

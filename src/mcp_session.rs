@@ -400,11 +400,11 @@ fn parse_optional_agent(agent: Option<&str>) -> Result<Option<AgentKind>, Sessio
             SessionSurfaceError::invalid(
                 "invalid_agent",
                 format!(
-                    "unknown agent `{value}`; expected claude, codex, gemini, junie, grok, kimi, or cursor"
+                    "unknown agent `{value}`; expected claude, codex, gemini, junie, grok, kimi, cursor, or copilot"
                 ),
                 json!({
                     "agent": value,
-                    "expected": ["claude", "codex", "gemini", "junie", "grok", "kimi", "cursor"],
+                    "expected": ["claude", "codex", "gemini", "junie", "grok", "kimi", "cursor", "copilot"],
                 }),
             )
         }),
@@ -672,7 +672,22 @@ fn resolve_session_across_agents(
     let mut last_missing: Option<(AgentKind, CatalogError)> = None;
     for agent in agents {
         let root = agent.session_root(user_home);
-        if !root.is_dir() {
+        if agent == AgentKind::Copilot {
+            match root.try_exists() {
+                Ok(false) => continue,
+                Ok(true) => {}
+                Err(error) => {
+                    return Err(catalog_error(
+                        agent,
+                        CatalogError::Io {
+                            path: root,
+                            message: error.to_string(),
+                        },
+                        0,
+                    ));
+                }
+            }
+        } else if !root.is_dir() {
             continue;
         }
         let catalog = session_catalog::SessionCatalog::new(agent, &root)
@@ -826,6 +841,7 @@ fn guess_user_home(source: &Path, agent: AgentKind) -> PathBuf {
         AgentKind::Grok => ".grok",
         AgentKind::Junie => ".junie",
         AgentKind::Kimi => ".kimi-code",
+        AgentKind::Copilot => ".copilot",
     };
     let mut current = source;
     while let Some(parent) = current.parent() {

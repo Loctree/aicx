@@ -532,14 +532,16 @@ fn humanize_stem(stem: &str) -> String {
 }
 
 fn agent_from_title(title: &str) -> Option<String> {
-    ["codex", "claude", "gemini"]
-        .iter()
-        .find(|candidate| contains_case_insensitive(title, candidate))
-        .map(|candidate| (*candidate).to_string())
+    [
+        "copilot", "codex", "claude", "gemini", "cursor", "grok", "junie", "kimi",
+    ]
+    .iter()
+    .find(|candidate| contains_case_insensitive(title, candidate))
+    .map(|candidate| (*candidate).to_string())
 }
 
 fn is_known_agent(segment: &str) -> bool {
-    matches!(segment, "codex" | "claude" | "gemini")
+    crate::session_catalog::AgentKind::parse(segment).is_some()
 }
 
 fn read_tail_string(scan_root: &Path, path: &Path, max_bytes: u64) -> Result<String> {
@@ -687,4 +689,22 @@ fn parse_timestamp(raw: &str) -> Option<i64> {
     DateTime::parse_from_rfc3339(raw)
         .ok()
         .map(|dt| dt.with_timezone(&Utc).timestamp())
+}
+
+#[cfg(test)]
+mod agent_tests {
+    use super::*;
+
+    #[test]
+    fn copilot_report_runtime_takes_precedence_over_model_name() {
+        assert_eq!(
+            derive_agent("Copilot using Claude", &[], None, None),
+            "copilot"
+        );
+        assert_eq!(
+            derive_agent("Implementation", &["copilot".into()], None, None),
+            "copilot"
+        );
+        assert!(is_known_agent("github-copilot-cli"));
+    }
 }
