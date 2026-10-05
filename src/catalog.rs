@@ -1213,7 +1213,7 @@ pub(crate) fn recover_catalog_scope_at(
     let user_home =
         crate::os_user_home().context("resolve user home for catalog scope recovery")?;
     let source = crate::source_path::SourceAllowlist::for_operator(&user_home, aicx_home)
-        .resolve_file(Path::new(&entry.source_path))?;
+        .resolve_file(entry.source_path.as_str())?;
     let metadata = crate::sessions::codex_session_metadata_from_source(&source)
         .context("read Codex metadata for catalog scope recovery")?;
     let Some(id) = metadata.session_id.as_deref() else {

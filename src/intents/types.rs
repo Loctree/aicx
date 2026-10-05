@@ -51,6 +51,8 @@ pub struct SourceSelection {
     pub agent: String,
     pub session_id: String,
     pub path: String,
+    /// Project in the selected catalog view; old null rows can be recovered
+    /// from root metadata in memory, without changing the durable catalog.
     pub catalog_project: Option<String>,
     pub admitted: bool,
     pub status: String,

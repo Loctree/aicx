@@ -310,8 +310,7 @@ fn extract_intents_from_files_with_stats(
         unplaced: unplaced_scope,
         selection,
         now,
-        #[cfg(feature = "app")]
-            coverage: _,
+        ..
     } = notes;
     let mut selection = selection;
     for file in &files {

@@ -57,7 +57,7 @@ pub struct ContinuityPack {
 pub struct SourceLine {
     pub agent: String,
     pub path: String,
-    /// Qualifying conversation activity, never source-file mtime.
+    /// Latest retained claim activity, never source-file mtime.
     pub latest_activity: Option<String>,
     pub live: bool,
 }
@@ -786,7 +786,7 @@ pub fn render(pack: &ContinuityPack, for_inject: bool) -> String {
     }
     for source in pack.sources.iter().take(SOURCE_CAP) {
         out.push_str(&format!(
-            "- {} · latest_qualifying_activity={} · {}{}\n",
+            "- {} · latest_retained_claim_activity={} · {}{}\n",
             source.agent,
             source.latest_activity.as_deref().unwrap_or("unknown"),
             source.path,
