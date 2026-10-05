@@ -35,8 +35,39 @@ impl IntentKind {
     }
 }
 
+/// Source provenance; a classifier label never certifies a human decision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct IntentProvenance {
+    pub role: String,
+    pub locator: String,
+    pub scope: Option<String>,
+    pub timestamp_basis: String,
+    pub attribution: String,
+}
+
+/// Receipt from the actual source-selection pass, before render budgets.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct SourceSelection {
+    pub agent: String,
+    pub session_id: String,
+    pub path: String,
+    pub catalog_project: Option<String>,
+    pub admitted: bool,
+    pub status: String,
+    pub parsed_frames: usize,
+    pub scoped_frames: usize,
+    pub qualified_frames: usize,
+    pub unknown_time_frames: usize,
+    pub outside_window_frames: usize,
+    pub scope_withheld_frames: usize,
+    pub parser_coverage: Option<String>,
+    pub latest_activity: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct IntentRecord {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<IntentProvenance>,
     pub kind: IntentKind,
     pub summary: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -304,6 +335,7 @@ impl IntentExtractionStats {
 
 #[derive(Debug, Clone)]
 pub struct IntentExtraction {
+    pub selection: Vec<SourceSelection>,
     pub records: Vec<IntentRecord>,
     pub stats: IntentExtractionStats,
     /// Sessions in the window whose structural scope is a mixed-workstream
@@ -397,6 +429,9 @@ pub(super) struct StoredChunkFile {
 
 #[derive(Debug, Clone)]
 pub(super) struct TranscriptEntry {
+    pub(super) timestamp: Option<DateTime<Utc>>,
+    pub(super) locator: Option<String>,
+    pub(super) cwd: Option<String>,
     pub(super) role: String,
     pub(super) lines: Vec<String>,
 }

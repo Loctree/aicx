@@ -1053,6 +1053,9 @@ enum ContinuityAction {
         /// Window in hours.
         #[arg(short = 'H', long, default_value = "24")]
         hours: u64,
+        /// Inclusive UTC window end (RFC3339); defaults to the current time.
+        #[arg(long)]
+        until: Option<chrono::DateTime<chrono::Utc>>,
         /// Bound the output to a prompt-inject budget (~6k tokens).
         #[arg(long)]
         for_inject: bool,
@@ -1068,6 +1071,9 @@ enum ContinuityAction {
         /// Window in hours.
         #[arg(short = 'H', long, default_value = "24")]
         hours: u64,
+        /// Inclusive UTC window end (RFC3339); defaults to the current time.
+        #[arg(long)]
+        until: Option<chrono::DateTime<chrono::Utc>>,
         /// Output path.
         #[arg(short, long, default_value = "CONTINUITY.md")]
         output: PathBuf,
@@ -3174,19 +3180,21 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
             )?;
         }
         Some(Commands::Continuity { action }) => {
-            let (projects, hours, for_inject, output, no_refresh) = match action {
+            let (projects, hours, until, for_inject, output, no_refresh) = match action {
                 ContinuityAction::Show {
                     project,
                     hours,
+                    until,
                     for_inject,
                     no_refresh,
-                } => (project, hours, for_inject, None, no_refresh),
+                } => (project, hours, until, for_inject, None, no_refresh),
                 ContinuityAction::Write {
                     project,
                     hours,
+                    until,
                     output,
                     no_refresh,
-                } => (project, hours, false, Some(output), no_refresh),
+                } => (project, hours, until, false, Some(output), no_refresh),
             };
             let projects = if projects.is_empty() {
                 vec![current_checkout_project()?]
@@ -3198,7 +3206,13 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
             }
             let resolution = resolve_intents_project_filters(&projects, project_match)?;
             let aicx_home = aicx::aicx_home::ensure()?;
-            let pack = aicx::continuity::build(&aicx_home, &resolution.selected, hours)?;
+            let pack = aicx::continuity::build_with_scope_at(
+                &aicx_home,
+                &resolution.selected,
+                hours,
+                false,
+                until.unwrap_or_else(chrono::Utc::now),
+            )?;
             let rendered = aicx::continuity::render(&pack, for_inject);
             match output {
                 Some(path) => {

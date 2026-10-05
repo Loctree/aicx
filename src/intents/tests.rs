@@ -651,6 +651,7 @@ fn extract_demo_extraction(label: &str, body: &str) -> IntentExtraction {
 #[test]
 fn markdown_separates_live_open_claims_from_closed_timeline() {
     let record = |summary: &str, honesty: crate::oracle::ClaimHonesty| IntentRecord {
+        provenance: None,
         kind: IntentKind::Outcome,
         summary: summary.to_string(),
         context: None,
@@ -702,11 +703,11 @@ fn live_window_rejects_stale_dated_touched_files_and_keeps_unadmitted() {
 
     // Row A: catalog row whose census DATE is far outside the window, but
     // whose live source file is freshly written (mtime = now).
-    let stale_dated = root.join("runtime_runs/live-a/transcript.log");
+    let stale_dated = root.join("runtime_runs/live-a/transcript.jsonl");
     fs::create_dir_all(stale_dated.parent().expect("parent")).expect("create parent");
     fs::write(
         &stale_dated,
-        "We completed the live-window admission for the stale-dated row.\n",
+        format!("{}\n", serde_json::json!({"type":"assistant","timestamp":"2026-01-01T00:00:00Z","sessionId":"live-a","cwd":"/fixtures/Loctree/aicx","message":{"role":"assistant","content":"We completed the live-window admission for the stale-dated row."}})),
     )
     .expect("write stale-dated source");
     let catalog_path = crate::catalog::sessions_path_for(&root);
@@ -715,10 +716,10 @@ fn live_window_rejects_stale_dated_touched_files_and_keeps_unadmitted() {
     let row_a = crate::catalog::CatalogEntry {
         schema: crate::catalog::CATALOG_SCHEMA.to_string(),
         session_id: "live-a".to_string(),
-        agent: "vibecrafted".to_string(),
+        agent: "claude".to_string(),
         project: Some("Loctree/aicx".to_string()),
         date: Some("2026-01-01".to_string()),
-        cwd: None,
+        cwd: Some("/fixtures/Loctree/aicx".into()),
         source_path: stale_dated.display().to_string(),
         source_len: None,
         source_mtime_ns: None,
@@ -738,11 +739,11 @@ fn live_window_rejects_stale_dated_touched_files_and_keeps_unadmitted() {
 
     // Row B: session the census does not know at all (unadmitted). The
     // live-delta cache is primed so the test never walks real agent roots.
-    let unadmitted = root.join("runtime_runs/live-b/transcript.log");
+    let unadmitted = root.join("runtime_runs/live-b/transcript.jsonl");
     fs::create_dir_all(unadmitted.parent().expect("parent")).expect("create parent");
     fs::write(
         &unadmitted,
-        "We completed the live-window admission for the unadmitted session.\n",
+        format!("{}\n", serde_json::json!({"type":"assistant","timestamp":Utc::now().to_rfc3339(),"sessionId":"live-b","cwd":"/fixtures/Loctree/aicx","message":{"role":"assistant","content":"We completed the live-window admission for the unadmitted session."}})),
     )
     .expect("write unadmitted source");
     let now_ns = std::time::SystemTime::now()
@@ -752,10 +753,10 @@ fn live_window_rejects_stale_dated_touched_files_and_keeps_unadmitted() {
     let row_b = crate::catalog::CatalogEntry {
         schema: crate::catalog::CATALOG_SCHEMA.to_string(),
         session_id: "live-b".to_string(),
-        agent: "vibecrafted".to_string(),
+        agent: "claude".to_string(),
         project: Some("Loctree/aicx".to_string()),
         date: None,
-        cwd: None,
+        cwd: Some("/fixtures/Loctree/aicx".into()),
         source_path: unadmitted.display().to_string(),
         source_len: Some(64),
         source_mtime_ns: Some(now_ns),
@@ -1154,6 +1155,7 @@ Intent:
 #[test]
 fn collapse_session_merges_exact_daily_duplicates_within_session() {
     let make_record = |source_chunk: &str| IntentRecord {
+        provenance: None,
         kind: IntentKind::Intent,
         summary: "przerobimy Screenscribe na portal".to_string(),
         context: None,
@@ -1194,6 +1196,7 @@ fn collapse_session_merges_exact_daily_duplicates_within_session() {
 #[test]
 fn collapse_session_keeps_same_session_id_in_distinct_projects() {
     let make_record = |project: &str, source_chunk: &str| IntentRecord {
+        provenance: None,
         kind: IntentKind::Intent,
         summary: "preserve project-scoped session identity".to_string(),
         context: None,
@@ -1239,6 +1242,7 @@ fn collapse_session_keeps_same_session_id_in_distinct_projects() {
 fn collapse_session_prefers_substantive_intent_over_newer_task_noise() {
     let make_record =
         |kind: IntentKind, summary: &str, timestamp: &str, source: &str| IntentRecord {
+            provenance: None,
             kind,
             summary: summary.to_string(),
             context: None,
@@ -1308,6 +1312,7 @@ fn collapse_session_prefers_substantive_intent_over_newer_task_noise() {
 #[test]
 fn newest_limit_uses_total_identity_order_for_timestamp_ties() {
     let make_record = |project: &str, session_id: &str, source_chunk: &str| IntentRecord {
+        provenance: None,
         kind: IntentKind::Intent,
         summary: format!("intent {project} {session_id} {source_chunk}"),
         context: None,
@@ -1376,6 +1381,7 @@ fn newest_limit_uses_total_identity_order_for_timestamp_ties() {
 #[test]
 fn collapse_session_tolerates_existing_none_count() {
     let make_record = |summary: &str, count| IntentRecord {
+        provenance: None,
         kind: IntentKind::Intent,
         summary: summary.to_string(),
         context: None,
@@ -2347,6 +2353,7 @@ fn explicit_agent_frame_kind_override_still_admits_agent_chunk() {
 #[test]
 fn formats_markdown_with_required_sections() {
     let records = vec![IntentRecord {
+        provenance: None,
         kind: IntentKind::Decision,
         summary: "Keep the parser flat".to_string(),
         context: Some("It removes overlap bugs.".to_string()),
@@ -2374,6 +2381,7 @@ fn formats_markdown_with_required_sections() {
 #[test]
 fn formats_json_with_same_fields() {
     let records = vec![IntentRecord {
+        provenance: None,
         kind: IntentKind::Outcome,
         summary: "p0=0 after validation".to_string(),
         context: None,
@@ -2400,6 +2408,7 @@ fn formats_json_with_same_fields() {
 #[test]
 fn formats_oracle_json_as_canonical_corpus_not_semantic_fallback() {
     let records = vec![IntentRecord {
+        provenance: None,
         kind: IntentKind::Decision,
         summary: "Canonical corpus stays source of truth".to_string(),
         context: None,
@@ -2452,6 +2461,7 @@ fn strip_case_prefix_is_utf8_safe() {
 
 fn honesty_probe_record(honesty: crate::oracle::ClaimHonesty) -> IntentRecord {
     IntentRecord {
+        provenance: None,
         kind: IntentKind::Intent,
         summary: "thread honesty frame through display surfaces".to_string(),
         context: None,
@@ -2663,6 +2673,7 @@ fn unresolved_filter_narrows_when_session_resolved() {
     // defers the kind filter so Outcomes survive the resolution check.)
     let records = vec![
         IntentRecord {
+            provenance: None,
             kind: IntentKind::Intent,
             summary: "ship native intents audit".to_string(),
             context: None,
@@ -2680,6 +2691,7 @@ fn unresolved_filter_narrows_when_session_resolved() {
             honesty: Default::default(),
         },
         IntentRecord {
+            provenance: None,
             kind: IntentKind::Outcome,
             summary: "native intents audit shipped".to_string(),
             context: None,
@@ -2697,6 +2709,7 @@ fn unresolved_filter_narrows_when_session_resolved() {
             honesty: Default::default(),
         },
         IntentRecord {
+            provenance: None,
             kind: IntentKind::Intent,
             summary: "lock regression anchor".to_string(),
             context: None,
@@ -2749,6 +2762,7 @@ fn none_limit_does_not_clip_roadmap() {
     // (The CLI default override lives in `run_intents`: default sentinel -> None.)
     let records: Vec<IntentRecord> = (0..12)
         .map(|i| IntentRecord {
+            provenance: None,
             kind: IntentKind::Intent,
             summary: format!("planned roadmap item {i}"),
             context: None,
@@ -3887,6 +3901,7 @@ mod quality {
     #[test]
     fn reconcile_session_id_uses_filename_when_record_disagrees() {
         let mut records = vec![IntentRecord {
+            provenance: None,
             kind: IntentKind::Intent,
             summary: "claim from session A but filename is from session B".to_string(),
             context: None,
@@ -3917,6 +3932,7 @@ mod quality {
     #[test]
     fn reconcile_keeps_session_id_when_already_consistent() {
         let mut records = vec![IntentRecord {
+            provenance: None,
             kind: IntentKind::Decision,
             summary: "session_id matches filename".to_string(),
             context: None,
@@ -3946,6 +3962,7 @@ mod quality {
         let source_chunk = "/tmp/2026_0504_codex_019df273-2c1_067.md".to_string();
         let mut records = vec![
             IntentRecord {
+                provenance: None,
                 kind: IntentKind::Decision,
                 summary: "nie mamy ani jednego użytkownika. Jesteśmy teraz w San Francisco i potrzebujemy strategii. Zrób sobie aicx search...[truncated]".to_string(),
                 evidence: Vec::new(),
@@ -3963,6 +3980,7 @@ mod quality {
                 honesty: Default::default(),
             },
             IntentRecord {
+                provenance: None,
                 kind: IntentKind::Decision,
                 summary: "nie mamy ani jednego użytkownika. Jesteśmy teraz w San Francisco i potrzebujemy strategii. Zrób sobie aicx search 'repozytoria libraxis loctree vetcoders' i pomóż.".to_string(),
                 evidence: Vec::new(),
@@ -3998,6 +4016,7 @@ mod quality {
         source_chunk: &str,
     ) -> IntentRecord {
         IntentRecord {
+            provenance: None,
             kind,
             summary: summary.to_string(),
             evidence: Vec::new(),
@@ -4121,6 +4140,7 @@ mod area_e_regressions {
 
     fn make_record(kind: IntentKind, summary: &str) -> IntentRecord {
         IntentRecord {
+            provenance: None,
             kind,
             summary: summary.to_string(),
             context: None,
@@ -4316,6 +4336,7 @@ mod flexible_dates {
 
     fn make_record(summary: &str, date: &str, timestamp: Option<&str>) -> IntentRecord {
         IntentRecord {
+            provenance: None,
             kind: IntentKind::Intent,
             summary: summary.to_string(),
             context: None,
@@ -4870,6 +4891,7 @@ Results:
     fn test_unresolved_mode_intent_vs_session() {
         let records = vec![
             IntentRecord {
+                provenance: None,
                 kind: IntentKind::Intent,
                 summary: "implement search".to_string(),
                 context: None,
@@ -4887,6 +4909,7 @@ Results:
                 honesty: Default::default(),
             },
             IntentRecord {
+                provenance: None,
                 kind: IntentKind::Intent,
                 summary: "fix login".to_string(),
                 context: None,
@@ -4904,6 +4927,7 @@ Results:
                 honesty: Default::default(),
             },
             IntentRecord {
+                provenance: None,
                 kind: IntentKind::Outcome,
                 summary: "search was implemented successfully".to_string(),
                 context: None,
@@ -4960,6 +4984,7 @@ Results:
     fn test_kind_plus_unresolved_combination() {
         let records = vec![
             IntentRecord {
+                provenance: None,
                 kind: IntentKind::Intent,
                 summary: "implement search".to_string(),
                 context: None,
@@ -4977,6 +5002,7 @@ Results:
                 honesty: Default::default(),
             },
             IntentRecord {
+                provenance: None,
                 kind: IntentKind::Intent,
                 summary: "fix login".to_string(),
                 context: None,
@@ -4994,6 +5020,7 @@ Results:
                 honesty: Default::default(),
             },
             IntentRecord {
+                provenance: None,
                 kind: IntentKind::Outcome,
                 summary: "search was implemented successfully".to_string(),
                 context: None,
@@ -5052,6 +5079,7 @@ Results:
         // 1. Voice transcript intent without context/evidence (confidence 2)
         let c1 = IntentCandidate {
             record: IntentRecord {
+                provenance: None,
                 kind: IntentKind::Intent,
                 summary: "low confidence intent".to_string(),
                 context: None,
@@ -5075,6 +5103,7 @@ Results:
         // 2. High confidence intent (confidence 4)
         let c2 = IntentCandidate {
             record: IntentRecord {
+                provenance: None,
                 kind: IntentKind::Intent,
                 summary: "high confidence intent".to_string(),
                 context: Some("explicit instruction".to_string()),

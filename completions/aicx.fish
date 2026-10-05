@@ -646,6 +646,7 @@ complete -c aicx -n "__fish_aicx_using_subcommand continuity; and not __fish_see
 complete -c aicx -n "__fish_aicx_using_subcommand continuity; and not __fish_seen_subcommand_from show write help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
 complete -c aicx -n "__fish_aicx_using_subcommand continuity; and __fish_seen_subcommand_from show" -s p -l project -d 'Catalog project filters (union). Fail-closed identity: bare or unknown names error with candidates instead of returning silence' -r
 complete -c aicx -n "__fish_aicx_using_subcommand continuity; and __fish_seen_subcommand_from show" -s H -l hours -d 'Window in hours' -r
+complete -c aicx -n "__fish_aicx_using_subcommand continuity; and __fish_seen_subcommand_from show" -l until -d 'Inclusive UTC window end (RFC3339); defaults to the current time' -r
 complete -c aicx -n "__fish_aicx_using_subcommand continuity; and __fish_seen_subcommand_from show" -l for-inject -d 'Bound the output to a prompt-inject budget (~6k tokens)'
 complete -c aicx -n "__fish_aicx_using_subcommand continuity; and __fish_seen_subcommand_from show" -l no-refresh -d 'Skip the bounded catalog hot refresh performed before rendering'
 complete -c aicx -n "__fish_aicx_using_subcommand continuity; and __fish_seen_subcommand_from show" -s v -l verbose -d 'Verbose diagnostics: echo per-file extractor warnings to stderr'
@@ -653,6 +654,7 @@ complete -c aicx -n "__fish_aicx_using_subcommand continuity; and __fish_seen_su
 complete -c aicx -n "__fish_aicx_using_subcommand continuity; and __fish_seen_subcommand_from show" -s h -l help -d 'Print help (see more with \'--help\')'
 complete -c aicx -n "__fish_aicx_using_subcommand continuity; and __fish_seen_subcommand_from write" -s p -l project -d 'Catalog project filters (union)' -r
 complete -c aicx -n "__fish_aicx_using_subcommand continuity; and __fish_seen_subcommand_from write" -s H -l hours -d 'Window in hours' -r
+complete -c aicx -n "__fish_aicx_using_subcommand continuity; and __fish_seen_subcommand_from write" -l until -d 'Inclusive UTC window end (RFC3339); defaults to the current time' -r
 complete -c aicx -n "__fish_aicx_using_subcommand continuity; and __fish_seen_subcommand_from write" -s o -l output -d 'Output path' -r -F
 complete -c aicx -n "__fish_aicx_using_subcommand continuity; and __fish_seen_subcommand_from write" -l no-refresh -d 'Skip the bounded catalog hot refresh performed before rendering'
 complete -c aicx -n "__fish_aicx_using_subcommand continuity; and __fish_seen_subcommand_from write" -s v -l verbose -d 'Verbose diagnostics: echo per-file extractor warnings to stderr'

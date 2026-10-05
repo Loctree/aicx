@@ -33,6 +33,7 @@ fn default_intents_markdown_uses_pack_report() {
         IntentPackSection {
             title: "Decisions",
             records: vec![intents::IntentRecord {
+                provenance: None,
                 kind: intents::IntentKind::Decision,
                 summary: "ship public seed only after privacy scrub".to_string(),
                 context: None,

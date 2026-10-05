@@ -179,6 +179,7 @@ pub struct ShowSessionRequest<'a> {
 }
 
 pub struct ContinuityRequest<'a> {
+    pub until: Option<chrono::DateTime<chrono::Utc>>,
     pub aicx_home: &'a Path,
     pub project: Option<&'a str>,
     pub projects: &'a [String],
@@ -301,12 +302,17 @@ pub fn continuity_pack(
     }
     let selected =
         resolve_session_project_filters(&filters, &[], req.aicx_home, req.project_match)?;
-    let pack = crate::continuity::build(req.aicx_home, &selected, req.hours).map_err(|error| {
-        SessionSurfaceError::Internal {
-            message: format!("continuity pack: {error}"),
-        }
+    let pack = crate::continuity::build_with_scope_at(
+        req.aicx_home,
+        &selected,
+        req.hours,
+        false,
+        req.until.unwrap_or_else(chrono::Utc::now),
+    )
+    .map_err(|error| SessionSurfaceError::Internal {
+        message: format!("continuity pack: {error}"),
     })?;
-    let mut markdown = crate::continuity::render(&pack, req.for_inject);
+    let mut markdown = crate::continuity::render(&pack, false);
     if let Some(idx) = markdown.find('\n') {
         markdown.insert(idx + 1, '\n');
         markdown.insert_str(idx + 2, CONTINUITY_BANNER);
@@ -314,7 +320,36 @@ pub fn continuity_pack(
         markdown.push('\n');
         markdown.push_str(CONTINUITY_BANNER);
     }
+    if req.for_inject {
+        markdown = crate::continuity::bounded_inject(markdown);
+    }
     let mut warnings = Vec::new();
+    if pack.source_errors > 0 {
+        warnings.push(format!("coverage: {} source errors", pack.source_errors));
+    }
+    if pack.dropped_candidates > 0 || pack.dropped_task_events > 0 {
+        warnings.push(format!(
+            "coverage: candidate budget dropped {} candidates and {} task events",
+            pack.dropped_candidates, pack.dropped_task_events
+        ));
+    }
+    if !pack.mixed_scope.is_empty() || !pack.unplaced_scope.is_empty() {
+        warnings.push("coverage: mixed or unplaced scope was withheld; index readiness does not prove complete coverage".into());
+    }
+    if pack
+        .selection
+        .iter()
+        .any(|source| source.unknown_time_frames > 0)
+    {
+        warnings.push(
+            if pack.hours == 0 {
+                "coverage: undated history is retained only as unknown-time candidates"
+            } else {
+                "coverage: unknown conversation timestamps withheld"
+            }
+            .into(),
+        );
+    }
     if pack.live_sessions == 0 {
         warnings.push(format!(
             "continuity window {}h for {} produced 0 live sessions; empty NOW/PEERS is not proof of a quiet window",
@@ -1212,6 +1247,7 @@ mod tests {
         let aicx_home = home.join(".aicx");
         fs::create_dir_all(&aicx_home).expect("aicx home");
         let pack = continuity_pack(ContinuityRequest {
+            until: None,
             aicx_home: &aicx_home,
             project: Some("Loctree/aicx"),
             projects: &[],
@@ -1236,6 +1272,7 @@ mod tests {
         assert!(!lower.contains("claude --resume"));
 
         let missing_project = continuity_pack(ContinuityRequest {
+            until: None,
             aicx_home: &aicx_home,
             project: None,
             projects: &[],

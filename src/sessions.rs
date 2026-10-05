@@ -702,17 +702,37 @@ pub(crate) const GUARDIAN_SESSION_KIND: &str = "subagent:guardian";
 /// session.
 #[cfg(feature = "app")]
 pub(crate) fn codex_session_kind_from_source(path: &Path) -> Option<String> {
+    codex_session_metadata_from_source(path)?.session_kind
+}
+
+/// Recorded root metadata only. Later logical identities cannot donate their
+/// cwd to the first session; subagent provenance retains its existing probe.
+#[cfg(feature = "app")]
+#[derive(Default)]
+pub(crate) struct CodexSessionMetadata {
+    pub session_id: Option<String>,
+    pub cwd: Option<String>,
+    pub date: Option<String>,
+    pub session_kind: Option<String>,
+}
+
+#[cfg(feature = "app")]
+pub(crate) fn codex_session_metadata_from_source(path: &Path) -> Option<CodexSessionMetadata> {
     use crate::session_catalog::{MAX_HEADER_BYTES, MAX_HEADER_LINES};
     use std::io::Read;
 
     let file = fs::File::open(path).ok()?;
     let mut reader = BufReader::new(file.take(MAX_HEADER_BYTES as u64));
+    let mut metadata = CodexSessionMetadata::default();
     for _ in 0..MAX_HEADER_LINES {
-        let line = aicx_parser::sanitize::read_line_capped(
+        let Some(line) = aicx_parser::sanitize::read_line_capped(
             &mut reader,
             crate::session_catalog::MAX_HEADER_LINE_BYTES,
         )
-        .ok()??;
+        .ok()?
+        else {
+            break;
+        };
         if line.exceeded {
             continue;
         }
@@ -726,13 +746,44 @@ pub(crate) fn codex_session_kind_from_source(path: &Path) -> Option<String> {
         // The first `session_meta` need not carry the provenance: the catalog
         // scanner keeps reading later ones until a kind appears, and a probe
         // that stopped at the first would call that guardian ordinary.
-        if value.get("type").and_then(|t| t.as_str()) == Some("session_meta")
-            && let Some(kind) = codex_subagent_session_kind(value.get("payload"))
+        if value.get("type").and_then(|t| t.as_str()) != Some("session_meta") {
+            continue;
+        }
+        let payload = value.get("payload");
+        if metadata.session_kind.is_none() {
+            metadata.session_kind = codex_subagent_session_kind(payload);
+        }
+        let id = payload
+            .and_then(|payload| payload.get("id"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|id| !id.is_empty());
+        if metadata.session_id.is_none() {
+            metadata.session_id = id.map(str::to_owned);
+        }
+        if let Some(id) = id
+            && metadata
+                .session_id
+                .as_deref()
+                .is_some_and(|root| root.eq_ignore_ascii_case(id))
         {
-            return Some(kind);
+            if metadata.cwd.is_none() {
+                metadata.cwd = payload
+                    .and_then(|payload| payload.get("cwd"))
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|cwd| Path::new(cwd).is_absolute())
+                    .map(str::to_owned);
+            }
+            if metadata.date.is_none() {
+                metadata.date = value
+                    .get("timestamp")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|timestamp| DateTime::parse_from_rfc3339(timestamp).ok())
+                    .map(|timestamp| timestamp.with_timezone(&Utc).format("%Y-%m-%d").to_string());
+            }
         }
     }
-    None
+    Some(metadata)
 }
 
 /// Resolve a session's structural provenance at the point where its source is

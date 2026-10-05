@@ -1262,6 +1262,7 @@ _arguments "${_arguments_options[@]}" : \
 '*--project=[Catalog project filters (union). Fail-closed identity\: bare or unknown names error with candidates instead of returning silence]:PROJECT:_default' \
 '-H+[Window in hours]:HOURS:_default' \
 '--hours=[Window in hours]:HOURS:_default' \
+'--until=[Inclusive UTC window end (RFC3339); defaults to the current time]:UNTIL:_default' \
 '--for-inject[Bound the output to a prompt-inject budget (~6k tokens)]' \
 '--no-refresh[Skip the bounded catalog hot refresh performed before rendering]' \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
@@ -1277,6 +1278,7 @@ _arguments "${_arguments_options[@]}" : \
 '*--project=[Catalog project filters (union)]:PROJECT:_default' \
 '-H+[Window in hours]:HOURS:_default' \
 '--hours=[Window in hours]:HOURS:_default' \
+'--until=[Inclusive UTC window end (RFC3339); defaults to the current time]:UNTIL:_default' \
 '-o+[Output path]:OUTPUT:_files' \
 '--output=[Output path]:OUTPUT:_files' \
 '--no-refresh[Skip the bounded catalog hot refresh performed before rendering]' \

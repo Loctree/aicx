@@ -1310,6 +1310,7 @@ fn vibecrafted_timestamp(
 /// `.aicxignore` narrows the same evidence one layer deeper, so the count of
 /// scopes it hid travels with the report: an ignored BASELINE would otherwise
 /// leave a foreign cwd looking like the session's only scope.
+#[cfg(test)]
 pub(crate) fn read_catalog_signal_with_scope_at(
     aicx_home: &Path,
     entry: &CatalogEntry,
@@ -1457,7 +1458,7 @@ fn scope_report_excluding_ignored(
     report
 }
 
-fn frame_matches_kind(frame: &TimelineEntry, requested: FrameKind) -> bool {
+pub(crate) fn frame_matches_kind(frame: &TimelineEntry, requested: FrameKind) -> bool {
     frame.frame_kind.unwrap_or(match frame.role.as_str() {
         "user" => FrameKind::UserMsg,
         "assistant" => FrameKind::AgentReply,
@@ -1717,18 +1718,23 @@ fn parse_large_codex_signal_checked(
         if message.trim().is_empty() {
             continue;
         }
-        let timestamp = record_timestamp(&value).unwrap_or_else(|| {
+        let recorded_time = record_timestamp(&value);
+        let timestamp = recorded_time.unwrap_or_else(|| {
             stable = false;
-            chrono::Utc::now()
+            chrono::DateTime::UNIX_EPOCH
         });
-        window_frames.push(frame(
+        let mut message_frame = frame(
             role,
             frame_kind,
             message,
             timestamp,
             line_no,
             baseline_cwd.clone(),
-        ));
+        );
+        if recorded_time.is_none() {
+            message_frame.timestamp_source = Some("unknown".to_string());
+        }
+        window_frames.push(message_frame);
     }
     if window_frames.is_empty() {
         window_frames.extend(call_frame(window_call, baseline_cwd.clone()));
@@ -3972,5 +3978,33 @@ mod tests {
         assert!(!current(&ledger), "a submodule declaration is a change");
 
         let _ = fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod continuity_clock_contract {
+    use super::*;
+    #[test]
+    fn continuity_contract_large_codex_missing_record_time_is_unknown() {
+        let root = std::env::temp_dir().join(format!(
+            "aicx-large-codex-clock-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("session.jsonl");
+        fs::write(&path, format!("{}\n", serde_json::json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Decision: retain undated audio policy."}]}}))).unwrap();
+        let entry: CatalogEntry = serde_json::from_value(serde_json::json!({"schema":crate::catalog::CATALOG_SCHEMA,"session_id":"11111111-2222-3333-4444-555555555555","agent":"codex","project":"Loctree/aicx","cwd":"/fixtures/Loctree/aicx","source_path":path})).unwrap();
+        let allow = crate::source_path::SourceAllowlist::from_roots([root.clone()]);
+        let (parsed, coverage) =
+            parse_large_codex_signal_checked(&entry, &path, &allow, None).unwrap();
+        assert_eq!(parsed.frames.len(), 1);
+        assert_eq!(coverage, ConversationCoverage::Uncacheable);
+        assert_eq!(
+            parsed.frames[0].timestamp_source.as_deref(),
+            Some("unknown")
+        );
+        assert_eq!(parsed.frames[0].timestamp, chrono::DateTime::UNIX_EPOCH);
+        fs::remove_dir_all(root).unwrap();
     }
 }

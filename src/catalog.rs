@@ -1137,20 +1137,48 @@ fn entry_from_source(agent: AgentKind, source: &CatalogSource) -> CatalogEntry {
     } else {
         source.source_id.clone()
     };
-    let cwd = infer_cwd_from_path(agent, &source.path);
+    let codex_metadata = (agent == AgentKind::Codex)
+        .then(|| crate::sessions::codex_session_metadata_from_source(&source.path))
+        .flatten();
+    let cwd = codex_metadata
+        .as_ref()
+        .filter(|metadata| {
+            metadata.session_id.as_deref().is_some_and(|id| {
+                id.eq_ignore_ascii_case(
+                    source
+                        .logical_session_id
+                        .as_deref()
+                        .unwrap_or(&source.source_id),
+                )
+            })
+        })
+        .and_then(|metadata| metadata.cwd.clone())
+        .or_else(|| infer_cwd_from_path(agent, &source.path));
     let project = cwd
         .as_deref()
-        .and_then(project_from_cwd)
+        .and_then(|cwd| {
+            if agent == AgentKind::Codex {
+                project_from_git_remote(cwd).or_else(|| project_from_cwd(cwd))
+            } else {
+                project_from_cwd(cwd)
+            }
+        })
         .or_else(|| infer_project_from_path(agent, &source.path))
         .map(|slug| canonicalize_project_slug(&slug));
-    let date = source
-        .fingerprint
-        .modified_unix_nanos
-        .checked_div(1_000_000_000)
-        .and_then(|secs| {
-            chrono::DateTime::from_timestamp(secs as i64, 0)
-                .map(|dt| dt.format("%Y-%m-%d").to_string())
-        });
+    let date = if agent == AgentKind::Codex {
+        codex_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.date.clone())
+    } else {
+        source
+            .fingerprint
+            .modified_unix_nanos
+            .checked_div(1_000_000_000)
+            .and_then(|secs| {
+                chrono::DateTime::from_timestamp(secs as i64, 0)
+                    .map(|dt| dt.format("%Y-%m-%d").to_string())
+            })
+    };
     CatalogEntry {
         schema: CATALOG_SCHEMA.to_string(),
         session_id: session_id.clone(),
@@ -1168,12 +1196,68 @@ fn entry_from_source(agent: AgentKind, source: &CatalogSource) -> CatalogEntry {
         } else {
             source.logical_session_id.clone()
         },
-        session_kind: if agent == AgentKind::Codex {
-            crate::sessions::codex_session_kind_from_source(&source.path)
-        } else {
-            None
-        },
+        session_kind: codex_metadata.and_then(|metadata| metadata.session_kind),
     }
+}
+
+/// Recover old null scope columns from bounded, allowlisted Codex root
+/// metadata. This is an in-memory view: identity, clocks and catalog stay put.
+pub(crate) fn recover_catalog_scope_at(
+    aicx_home: &Path,
+    entry: &CatalogEntry,
+) -> Result<CatalogEntry> {
+    let mut recovered = entry.clone();
+    if entry.agent != "codex" || (entry.cwd.is_some() && entry.project.is_some()) {
+        return Ok(recovered);
+    }
+    let user_home =
+        crate::os_user_home().context("resolve user home for catalog scope recovery")?;
+    let source = crate::source_path::SourceAllowlist::for_operator(&user_home, aicx_home)
+        .resolve_file(Path::new(&entry.source_path))?;
+    let metadata = crate::sessions::codex_session_metadata_from_source(&source)
+        .context("read Codex metadata for catalog scope recovery")?;
+    let Some(id) = metadata.session_id.as_deref() else {
+        return Ok(recovered);
+    };
+    // A filename UUID is physical authority; its logical root may differ.
+    // Cached logical identity, when present, must still match in full.
+    let physical_matches = source
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .and_then(|stem| {
+            if is_uuid(stem) {
+                return Some(stem);
+            }
+            let start = stem.len().checked_sub(36)?;
+            let candidate = stem.get(start..)?;
+            (is_uuid(candidate)
+                && start.checked_sub(1).is_some_and(|boundary| {
+                    matches!(stem.as_bytes()[boundary], b'-' | b'_' | b'.')
+                }))
+            .then_some(candidate)
+        })
+        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(&entry.session_id));
+    let identity_matches = entry.logical_session_id.as_deref().map_or_else(
+        || physical_matches || id.eq_ignore_ascii_case(&entry.session_id),
+        |logical| logical.eq_ignore_ascii_case(id),
+    );
+    if !identity_matches {
+        return Ok(recovered);
+    }
+    if recovered.cwd.is_none() {
+        recovered.cwd = metadata.cwd;
+    }
+    if recovered.project.is_none() {
+        recovered.project = recovered.cwd.as_deref().and_then(|cwd| {
+            project_from_git_remote(cwd)
+                .or_else(|| project_from_cwd(cwd))
+                .map(|project| canonicalize_project_slug(&project))
+        });
+    }
+    if recovered.session_kind.is_none() {
+        recovered.session_kind = metadata.session_kind;
+    }
+    Ok(recovered)
 }
 
 fn enrich_from_sessions_discovery(
@@ -2168,5 +2252,27 @@ mod tests {
             "vetcoders/codescribe"
         );
         assert_eq!(canonicalize_project_slug("/vibecrafted/"), "vibecrafted");
+    }
+    #[test]
+    fn continuity_contract_hot_codex_keeps_recorded_header_scope() {
+        let dir = test_root("continuity-hot-header");
+        let user = dir.join("user");
+        let home = dir.join(".aicx");
+        let root = user.join(".codex/sessions/2026/10/02");
+        fs::create_dir_all(&root).unwrap();
+        let id = "11111111-2222-3333-4444-555555555555";
+        let path = root.join(format!("rollout-2026-10-02T12-00-00-{id}.jsonl"));
+        fs::write(&path, format!("{}\n", serde_json::json!({"type":"session_meta","timestamp":"2026-10-02T12:00:00Z","payload":{"id":id,"cwd":"/fixtures/vetcoders/codescribe"}}))).unwrap();
+        let delta = live_delta_uncached(&home, &user, 0).unwrap();
+        assert_eq!(delta.unadmitted.len(), 1);
+        assert_eq!(
+            delta.unadmitted[0].cwd.as_deref(),
+            Some("/fixtures/vetcoders/codescribe")
+        );
+        assert_eq!(
+            delta.unadmitted[0].project.as_deref(),
+            Some("vetcoders/codescribe")
+        );
+        fs::remove_dir_all(dir).unwrap();
     }
 }

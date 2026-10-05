@@ -603,3 +603,44 @@ default contract.
 Commands that support `--json` emit structured stdout. Diagnostics and
 progress go to stderr. Consult the command-specific help for exit codes and
 the exact JSON envelope.
+
+### Continuity clocks, coverage, and provenance
+
+`aicx continuity show -p /codescribe -H 96` selects utterances in an inclusive
+UTC window `[now - 96h, now]`. The session may have started before that window.
+Unknown utterance time is withheld and counted; touching a source file does not
+supply conversation time. Reproduce a historical window with
+`--until 2026-10-03T04:47:00Z --no-refresh`. `continuity write` accepts the same
+`--until`; MCP `aicx_continuity` accepts the optional RFC3339 `until` parameter.
+`-H 0` selects recorded history through the window end and retains undated
+claims as explicitly unknown-time candidates.
+
+The head of the pack distinguishes considered, catalog-admitted, live,
+qualified, and represented sources, with provider counts before and after
+rendering. SOURCES lists sources of retained records; its 20-row limit is a
+render limit, and omissions are disclosed. Candidate/task budgets, unreadable
+or partially parsed sources, unknown timestamps, mixed/unplaced scope, and
+section limits remain visible in `--for-inject`. Index readiness describes
+index health and does not certify project-memory coverage.
+
+Raw claims retain provider, full stored session id, source path, frame/line
+locator, role, UTC timestamp, scope and verification status. A human role and a
+classifier label still mean a candidate, not an authenticated Founder decision.
+Quoted/fenced agent material is not promoted to fresh human directives. Human
+request/constraint candidates precede peer claims; an unrelated Outcome never
+closes every request in the session. Without explicit resolution evidence,
+requests remain unresolved candidates. Existing matching checklist events
+continue to resolve only the corresponding task.
+
+Codex root scope can be recovered from bounded, identity-checked source
+metadata when an old catalog row lacks cwd/project. This read-only recovery
+does not rewrite the catalog or transfer a mixed thread to another project.
+Foreign, hidden and unplaced work remains withheld. Provider support follows
+the running build; unsupported sources are coverage errors.
+
+For a metadata-only developer trace (no conversation payloads):
+
+```bash
+cargo run --example continuity_trace -- "$HOME/.aicx" /codescribe \
+  2026-10-03T04:47:00Z FULL_SESSION_ID
+```

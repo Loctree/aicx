@@ -944,6 +944,8 @@ pub struct SessionParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ContinuityParams {
+    /// Inclusive RFC3339 window end; defaults to current UTC time.
+    pub until: Option<String>,
     /// Exact project filter. Required — MCP cannot infer the operator checkout.
     pub project: Option<String>,
     /// Optional additional exact project filters.
@@ -2070,6 +2072,17 @@ impl AicxMcpServer {
             .map_err(|e| McpError::internal_error(format!("AICX home error: {e}"), None))?;
         let projects = params.projects.unwrap_or_default();
         let payload = mcp_session::continuity_pack(mcp_session::ContinuityRequest {
+            until: params
+                .until
+                .as_deref()
+                .map(|time| {
+                    chrono::DateTime::parse_from_rfc3339(time)
+                        .map(|t| t.with_timezone(&chrono::Utc))
+                })
+                .transpose()
+                .map_err(|_| {
+                    McpError::invalid_params("until must be an RFC3339 timestamp", None)
+                })?,
             aicx_home: &aicx_home,
             project: params.project.as_deref(),
             projects: &projects,
@@ -2922,6 +2935,7 @@ mod tests {
         // the MCP tool returns so every consumer sees the honesty frame —
         // historical claims at session close, not verified by aicx.
         let records = vec![crate::intents::IntentRecord {
+            provenance: None,
             kind: crate::intents::IntentKind::Intent,
             summary: "expose honesty frame over MCP".to_string(),
             context: None,

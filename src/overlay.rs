@@ -1989,6 +1989,7 @@ mod tests {
     #[test]
     fn frozen_intent_evidence_ref_is_stable_and_non_empty() {
         let record = IntentRecord {
+            provenance: None,
             kind: IntentKind::Decision,
             summary: "Must pin overlay feed to catalog sources".to_owned(),
             context: None,
@@ -2019,6 +2020,7 @@ mod tests {
     #[test]
     fn intent_record_without_evidence_is_fail_closed() {
         let record = IntentRecord {
+            provenance: None,
             kind: IntentKind::Intent,
             summary: "claim without durable source".to_owned(),
             context: None,
