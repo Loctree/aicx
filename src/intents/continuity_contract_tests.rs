@@ -31,6 +31,7 @@ fn fixture(date: &str, turns: &[(&str, &str, &str)]) -> PathBuf {
         source_path: path.to_string_lossy().into(),
         source_len: None,
         source_mtime_ns: None,
+        source_bundle_fingerprint: None,
         title: None,
         machine: None,
         logical_session_id: None,
