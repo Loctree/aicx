@@ -768,11 +768,11 @@ mod tests {
         ));
         let _ = fs::remove_dir_all(&root);
 
-        let source = root.join("runtime_runs/continuity-a/transcript.log");
+        let source = root.join("continuity-a/session.jsonl");
         fs::create_dir_all(source.parent().expect("parent")).expect("create parent");
         fs::write(
             &source,
-            "We decided to route continuity through the live window engine.\n",
+            format!("{}\n", serde_json::json!({"type":"user","timestamp":Utc::now().to_rfc3339(),"sessionId":"continuity-a","cwd":"/fixtures/Loctree/aicx","message":{"role":"user","content":"Decision: route continuity through the live window engine."}})),
         )
         .expect("write source");
         let catalog_path = crate::catalog::sessions_path_for(&root);
@@ -781,10 +781,10 @@ mod tests {
         let entry = crate::catalog::CatalogEntry {
             schema: crate::catalog::CATALOG_SCHEMA.to_string(),
             session_id: "continuity-a".to_string(),
-            agent: "vibecrafted".to_string(),
+            agent: "claude".to_string(),
             project: Some("Loctree/aicx".to_string()),
             date: Some(Utc::now().format("%Y-%m-%d").to_string()),
-            cwd: None,
+            cwd: Some("/fixtures/Loctree/aicx".into()),
             source_path: source.display().to_string(),
             source_len: None,
             source_mtime_ns: None,
@@ -1187,5 +1187,34 @@ mod tests {
             "{error}"
         );
         refuse_unplaced_only_window(&[], &[]).expect("an empty window with nothing withheld");
+    }
+    #[test]
+    fn continuity_contract_unrelated_outcome_does_not_close_intents() {
+        let (root, _) = write_continuity_real_path_home("outcome-contract");
+        let mut pack = build(&root, &["Loctree/aicx".into()], 24).unwrap();
+        let mut record = pack.records[0].clone();
+        record.kind = IntentKind::Intent;
+        record.summary = "preserve all audio unless explicitly opted out".into();
+        let mut other = record.clone();
+        other.summary = "add separate delivery and revision buses".into();
+        let mut outcome = record.clone();
+        outcome.kind = IntentKind::Outcome;
+        outcome.summary = "cargo check completed".into();
+        pack.records = vec![record, other, outcome];
+        assert_eq!(unresolved_intents(&pack.records).len(), 2);
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn continuity_contract_unicode_injection_never_panics() {
+        let (root, _) = write_continuity_real_path_home("unicode-contract");
+        let mut pack = build(&root, &["Loctree/aicx".into()], 24).unwrap();
+        // Exercise every byte alignment, rather than relying on one accidental boundary.
+        for padding in 0..4 {
+            pack.records[0].summary = format!("{}{}", "x".repeat(padding), "🦀".repeat(30_000));
+            let result = std::panic::catch_unwind(|| render(&pack, true));
+            assert!(result.is_ok(), "UTF-8 boundary at padding {padding}");
+            assert!(result.unwrap().contains("truncated"));
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 }

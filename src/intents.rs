@@ -4218,3 +4218,7 @@ fn normalize_migration_project_label(project: &str) -> String {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(test, feature = "app"))]
+#[path = "intents/continuity_contract_tests.rs"]
+mod continuity_contract_tests;
