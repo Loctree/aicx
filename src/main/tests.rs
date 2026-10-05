@@ -2282,6 +2282,7 @@ fn top_level_help_lists_daily_drivers_only() {
     // The one rebuild command and the reader are the front door.
     assert!(rendered.contains("\n  index "));
     assert!(rendered.contains("\n  search "));
+    assert!(rendered.contains("\n  utterances "));
     assert!(rendered.contains("aicx index                 # census + incremental parse + publish"));
     assert!(!rendered.contains("aicx catalog rebuild"));
 
@@ -2318,6 +2319,7 @@ fn help_full_reveals_power_user_commands_but_never_legacy_spellings() {
         "dashboard",
         "reports",
         "intents",
+        "utterances",
         "migrate",
         "index",
         "search",

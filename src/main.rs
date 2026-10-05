@@ -56,6 +56,7 @@ use aicx::reports_extractor::{self, ReportsExtractorConfig};
 use aicx::sessions;
 use aicx::state::StateManager;
 use aicx::timeline;
+use aicx::utterances;
 
 fn print_intent_schema_migration_report(report: &intents::MigrationReport) {
     eprintln!("=== Intent Schema Migration (dry run) ===");
@@ -1704,6 +1705,32 @@ enum Commands {
     #[command(name = "dashboard-serve", hide = true)]
     DashboardServeLegacy(#[command(flatten)] DashboardServeLegacyArgs),
 
+    /// List human utterances in a project window, or refuse.
+    ///
+    /// Exit 0 only when every matching session was read whole, the list
+    /// contains at least one human utterance, and the newest admitted
+    /// utterance reaches the window's end date. Catalog date does not skip a
+    /// session. Code-shaped lines and agent replies are printed under
+    /// "machine text". This command does not classify decisions.
+    Utterances {
+        /// Catalog project filters. Omit to scan all projects.
+        /// Repeated `-p` flags or a comma list (`-p a,b`) form a union.
+        #[arg(short, long, value_delimiter = ',')]
+        project: Vec<String>,
+
+        /// Hours to look back when `--since` is omitted (default: 720 = 30 days, 0 = all time).
+        #[arg(short = 'H', long, default_value = "720")]
+        hours: u64,
+
+        /// Inclusive window start, YYYY-MM-DD UTC. Overrides `--hours`.
+        #[arg(long)]
+        since: Option<String>,
+
+        /// Inclusive window end, YYYY-MM-DD UTC. Omit to end at now.
+        #[arg(long)]
+        until: Option<String>,
+    },
+
     /// Extract structured intents from the durable catalog and allowlisted session sources.
     #[command(hide = true)]
     Intents {
@@ -3160,6 +3187,14 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
                 title: args.title,
                 preview_chars: args.preview_chars,
             })?;
+        }
+        Some(Commands::Utterances {
+            project,
+            hours,
+            since,
+            until,
+        }) => {
+            run_utterances(&project, hours, since, until, project_match)?;
         }
         Some(Commands::Intents {
             project,
@@ -5162,6 +5197,36 @@ fn print_live_window_header(live_sessions: usize) {
         "catalog_index (live scan: 0 newer than census)"
     };
     println!("mode: {mode}\n");
+}
+
+fn run_utterances(
+    projects: &[String],
+    hours: u64,
+    since: Option<String>,
+    until: Option<String>,
+    project_match: legacy_archive::ProjectMatchMode,
+) -> Result<()> {
+    let since = parse_cli_date(since.as_deref(), "--since")?;
+    let until = parse_cli_date(until.as_deref(), "--until")?;
+    let now = Utc::now();
+    let window = utterances::window_from_bounds(now, hours, since, until);
+    if window.start > window.end {
+        anyhow::bail!("utterances window starts after it ends");
+    }
+    let resolution = resolve_intents_project_filters(projects, project_match)?;
+    let filters: &[String] = if resolution.selected.is_empty() {
+        projects
+    } else {
+        &resolution.selected
+    };
+    let aicx_home = aicx::aicx_home::ensure()?;
+    let settlement = utterances::settle_catalog(&aicx_home, filters, window)?;
+    print!("{}", settlement.render());
+    io::stdout().flush()?;
+    if !settlement.complete() {
+        std::process::exit(utterances::REFUSAL_EXIT_CODE);
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]

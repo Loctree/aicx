@@ -121,6 +121,8 @@ pub mod state;
 pub mod steer_index;
 #[cfg(feature = "app")]
 mod steer_index_contract;
+#[cfg(feature = "app")]
+pub mod utterances;
 mod uuid_shape;
 #[cfg(feature = "app")]
 pub mod validation;

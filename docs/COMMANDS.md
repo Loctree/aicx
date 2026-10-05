@@ -32,6 +32,23 @@ aicx search --deep 'routing strzałek taby'
 file per session under `~/.aicx/extracts/`. Without that flag, source logs and
 the published index remain the content owners.
 
+## Human utterances
+
+`aicx intents` classifies stored text and can exit 0 after it has dropped
+records. `aicx utterances` is the listing that may be read as what a human said.
+
+```bash
+aicx utterances -p vetcoders/vista --since 2026-09-01 --until 2026-09-29
+```
+
+The first line is the real span of admitted turns and the end of the window
+you asked for. Exit 0 means every session that matches the project was read
+whole, at least one human utterance is in the list, and the newest admitted
+turn reaches the window's end date. Catalog date does not skip a session.
+A cut session, an unreadable session, an empty human list, or a span that
+stops short of that date exits 2. Code-shaped lines and agent replies are
+printed under `machine text`.
+
 Checkout prefixes in `~/.aicx/.aicxignore` are part of index and cache
 identity. Editing the file makes the next `aicx index` rebuild automatically;
 an unreadable file or unsupported checkout glob/negation aborts rather than
