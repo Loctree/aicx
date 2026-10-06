@@ -148,9 +148,17 @@ fn read_intent_source(
 enum LegacyScopeCacheResult {
     Miss,
     Hit {
-        file: Option<StoredChunkFile>,
+        file: Option<Box<StoredChunkFile>>,
         live_row: bool,
     },
+}
+
+#[cfg(feature = "app")]
+#[derive(Clone, Copy)]
+struct LegacyScopeQuery {
+    cutoff: DateTime<Utc>,
+    frame_kind: FrameKind,
+    live: bool,
 }
 
 /// A legacy index row cannot prove its own scope, but an existing reader-cache
@@ -161,9 +169,7 @@ enum LegacyScopeCacheResult {
 fn peek_legacy_scope_file(
     aicx_home: &Path,
     entry: &crate::catalog::CatalogEntry,
-    cutoff: DateTime<Utc>,
-    frame_kind: FrameKind,
-    live: bool,
+    query: LegacyScopeQuery,
     source_filter: &IntentSourceFilter,
     source_errors: &mut usize,
     notes: &mut ScopeNotes,
@@ -187,21 +193,22 @@ fn peek_legacy_scope_file(
             entry.agent, entry.session_id
         ));
     }
-    frames.retain(|frame| crate::source_index::frame_matches_kind(frame, frame_kind));
+    frames.retain(|frame| crate::source_index::frame_matches_kind(frame, query.frame_kind));
     let in_window = frames.iter().any(|frame| {
         frame_has_conversation_time(frame)
-            && frame.timestamp >= cutoff
+            && frame.timestamp >= query.cutoff
             && frame.timestamp <= notes.now.unwrap_or_else(Utc::now)
     });
-    let live_row = session_is_hot_live(live, in_window);
+    let live_row = session_is_hot_live(query.live, in_window);
     let file = catalog_frames_to_intent_file(
         entry,
         (source_path, frames, scope),
-        cutoff,
+        query.cutoff,
         live_row,
         source_filter,
         notes,
-    );
+    )
+    .map(Box::new);
     Ok(LegacyScopeCacheResult::Hit { file, live_row })
 }
 
@@ -1173,6 +1180,11 @@ fn collect_intent_files_from_index(
     let project = &config.project;
     let frame_kind = config.effective_frame_kind();
     let live = config.live;
+    let legacy_scope_query = LegacyScopeQuery {
+        cutoff,
+        frame_kind,
+        live,
+    };
     let adapter = crate::steer_index::open_current_adapter_at(aicx_home).ok()?;
     let current_metadata = adapter
         .scan_metadata(adapter.doc_count, |metadata| {
@@ -1281,9 +1293,7 @@ fn collect_intent_files_from_index(
             match peek_legacy_scope_file(
                 aicx_home,
                 &entry,
-                cutoff,
-                frame_kind,
-                live,
+                legacy_scope_query,
                 source_filter,
                 &mut source_errors,
                 notes,
@@ -1293,7 +1303,7 @@ fn collect_intent_files_from_index(
                         if live_row {
                             live_sessions += 1;
                         }
-                        files.push(file);
+                        files.push(*file);
                     }
                     continue;
                 }
@@ -1348,9 +1358,7 @@ fn collect_intent_files_from_index(
             match peek_legacy_scope_file(
                 aicx_home,
                 &entry,
-                cutoff,
-                frame_kind,
-                live,
+                legacy_scope_query,
                 source_filter,
                 &mut source_errors,
                 notes,
@@ -1360,7 +1368,7 @@ fn collect_intent_files_from_index(
                         if live_row {
                             live_sessions += 1;
                         }
-                        files.push(file);
+                        files.push(*file);
                     }
                     continue;
                 }

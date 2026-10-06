@@ -95,7 +95,7 @@ struct CacheOwner {
     canonical_home_digest: String,
 }
 
-type ConversationRead = (
+pub(super) type ConversationRead = (
     PathBuf,
     Vec<TimelineEntry>,
     ScopeReport,

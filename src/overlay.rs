@@ -37,12 +37,7 @@ mod cache;
 pub(crate) fn read_cached_catalog_conversation_at(
     home: &Path,
     entry: &crate::catalog::CatalogEntry,
-) -> Result<(
-    PathBuf,
-    Vec<crate::timeline::TimelineEntry>,
-    crate::extraction::conversation::ScopeReport,
-    crate::source_index::ConversationCoverage,
-)> {
+) -> Result<cache::ConversationRead> {
     let (conversation, reused) = cache::load_source_conversation(home, entry)?;
     tracing::debug!(target: "aicx::reader_cache", reused, "read validated conversation");
     Ok(conversation)
@@ -52,14 +47,7 @@ pub(crate) fn read_cached_catalog_conversation_at(
 pub(crate) fn peek_cached_catalog_conversation_at(
     home: &Path,
     entry: &crate::catalog::CatalogEntry,
-) -> Result<
-    Option<(
-        PathBuf,
-        Vec<crate::timeline::TimelineEntry>,
-        crate::extraction::conversation::ScopeReport,
-        crate::source_index::ConversationCoverage,
-    )>,
-> {
+) -> Result<Option<cache::ConversationRead>> {
     cache::peek_source_conversation(home, entry)
 }
 
