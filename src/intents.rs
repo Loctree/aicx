@@ -857,7 +857,7 @@ fn collect_intent_files_from_index(
     let frame_kind = config.effective_frame_kind();
     let live = config.live;
     let adapter = crate::steer_index::open_current_adapter_at(aicx_home).ok()?;
-    let current_ids = adapter
+    let current_metadata = adapter
         .scan_metadata(adapter.doc_count, |metadata| {
             if source_filter.agent.is_some()
                 && !metadata
@@ -876,21 +876,59 @@ fn collect_intent_files_from_index(
                     .and_then(|value| value.as_str())
                     .is_some()
         })
-        .ok()?
-        .into_iter()
-        .filter_map(|metadata| {
-            Some((
-                metadata.get("agent")?.as_str()?.to_string(),
-                metadata.get("session_id")?.as_str()?.to_string(),
-            ))
-        })
-        .collect::<BTreeSet<_>>();
+        .ok()?;
+    let mut current_ids = BTreeSet::new();
+    let mut current_flagged_for_project = BTreeSet::new();
+    for metadata in current_metadata {
+        let Some(agent) = metadata.get("agent").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        let Some(session_id) = metadata.get("session_id").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        let key = (agent.to_string(), session_id.to_string());
+        current_ids.insert(key.clone());
+        let project_matches = metadata
+            .get("project")
+            .and_then(|value| value.as_str())
+            .is_some_and(|stored| entry_matches_project(Some(stored), project));
+        let guardian = crate::sessions::is_guardian_session_kind(
+            metadata
+                .get("session_kind")
+                .and_then(|value| value.as_str()),
+        );
+        let scope_flagged = !chunk_states_scope(&metadata)
+            || metadata
+                .get("scope_conflict")
+                .and_then(|value| value.as_bool())
+                == Some(true)
+            || metadata
+                .get("scope_unattributed")
+                .and_then(|value| value.as_bool())
+                == Some(true);
+        if project_matches && !guardian && scope_flagged {
+            current_flagged_for_project.insert(key);
+        }
+    }
 
     let entries = crate::catalog::read_entries_at(aicx_home).ok()?;
     if entries.is_empty() {
         return None;
     }
-    let mut source_errors = 0usize;
+    let catalog_ids = entries
+        .iter()
+        .map(|entry| (entry.agent.clone(), entry.session_id.clone()))
+        .collect::<BTreeSet<_>>();
+    let unmatched_flagged = current_flagged_for_project
+        .difference(&catalog_ids)
+        .cloned()
+        .collect::<Vec<_>>();
+    for (agent, session_id) in &unmatched_flagged {
+        crate::diagnostics::log_describe(&format!(
+            "intents_index_resource_unmatched agent={agent} session_id={session_id}"
+        ));
+    }
+    let mut source_errors = unmatched_flagged.len();
     let mut selected = Vec::new();
     for original_entry in entries {
         if !source_agent_matches(&original_entry.agent, source_filter) {
