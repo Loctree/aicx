@@ -616,7 +616,7 @@ fn configured_home_shell_omits_survey_markup() {
     let unit = home.join("service-unit");
     fs::write(
         &unit,
-        "--transport http --host 127.0.0.1 --port 8044 --no-require-auth --experimental-auto-refresh\n",
+        "--transport http --host 127.0.0.1 --port 8044 --no-require-auth --no-auto-refresh\n",
     )
     .unwrap();
     let prev_unit = std::env::var_os("AICX_SERVICE_UNIT");
@@ -666,10 +666,10 @@ fn unconfigured_home_shell_includes_survey_markup() {
         home.join("install-mcp-service.sh")
     };
     let stub = if cfg!(windows) {
-        "$utf8 = New-Object System.Text.UTF8Encoding $false\n[System.IO.File]::WriteAllText($env:AICX_SERVICE_UNIT, \"--transport http --host 127.0.0.1 --port 8044 --no-require-auth --experimental-auto-refresh`n\", $utf8)\nexit 0\n"
+        "$utf8 = New-Object System.Text.UTF8Encoding $false\n[System.IO.File]::WriteAllText($env:AICX_SERVICE_UNIT, \"--transport http --host 127.0.0.1 --port 8044 --no-require-auth --no-auto-refresh`n\", $utf8)\nexit 0\n"
             .to_string()
     } else {
-        "#!/bin/sh\nprintf '%s\\n' '--transport http --host 127.0.0.1 --port 8044 --no-require-auth --experimental-auto-refresh' > \"$AICX_SERVICE_UNIT\"\n"
+        "#!/bin/sh\nprintf '%s\\n' '--transport http --host 127.0.0.1 --port 8044 --no-require-auth --no-auto-refresh' > \"$AICX_SERVICE_UNIT\"\n"
             .to_string()
     };
     fs::write(&script, stub).unwrap();

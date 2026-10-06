@@ -100,7 +100,7 @@ fn configured_home_prints_short_help_without_hidden_commands() {
     let unit = home.join("aicx-mcp.plist");
     std::fs::write(
         &unit,
-        "--transport http --host 127.0.0.1 --port 18099 --no-require-auth --experimental-auto-refresh\n",
+        "--transport http --host 127.0.0.1 --port 18099 --no-require-auth --no-auto-refresh\n",
     )
     .unwrap();
 

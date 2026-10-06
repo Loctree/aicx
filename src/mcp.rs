@@ -1893,9 +1893,17 @@ impl AicxMcpServer {
             live: IntentsConfig::auto_live(params.hours),
         };
 
-        let extraction =
-            intents::extract_intents_with_stats_for_projects(&config, &effective_projects)
-                .map_err(|e| McpError::internal_error(format!("Extract intents: {e}"), None))?;
+        let source_filter = intents::IntentSourceFilter {
+            agent: params.agent.clone(),
+            date_lo: params.since.clone(),
+            date_hi: params.until.clone(),
+        };
+        let extraction = intents::extract_intents_with_stats_for_projects_filtered(
+            &config,
+            &effective_projects,
+            &source_filter,
+        )
+        .map_err(|e| McpError::internal_error(format!("Extract intents: {e}"), None))?;
         let records = extraction.records;
 
         let limit_capped = params.limit.min(500);

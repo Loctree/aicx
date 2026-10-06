@@ -13,6 +13,11 @@ WRAPPER = ROOT / "distribution/npm/aicx/package.json"
 PLATFORM_ROOT = ROOT / "distribution/npm/aicx/platform-packages"
 PLATFORMS = ("darwin-arm64", "linux-x64-gnu", "win32-x64-gnu")
 FORBIDDEN = ("preinstall", "install", "postinstall", "prepare")
+SERVICE_INSTALLERS = (
+    ROOT / "tools/install-mcp-service.sh",
+    ROOT / "tools/install-mcp-service-linux.sh",
+    ROOT / "tools/install-mcp-service.ps1",
+)
 
 
 def assert_script_free(path: Path) -> None:
@@ -41,21 +46,31 @@ def main() -> None:
     if "process.exit(error.status)" in wrapper_source:
         raise SystemExit("npm wrapper still treats a null child status as an exit code")
 
+    for installer in SERVICE_INSTALLERS:
+        source = installer.read_text(encoding="utf-8")
+        if "--experimental-auto-refresh" in source:
+            raise SystemExit(f"{installer} still enables the embedded MCP writer")
+        if "--no-auto-refresh" not in source:
+            raise SystemExit(f"{installer} lost the explicit reader-only compatibility flag")
+
     hint = subprocess.run(
         [
             "node",
             "-e",
             r"""
 const { plistMatchesLoopbackContract, childFailureExit } = require("./distribution/npm/aicx/index.js");
-const loopback = "<string>--host</string>\n<string>127.0.0.1</string>\n<string>--no-require-auth</string>\n<string>--experimental-auto-refresh</string>\n";
-if (!plistMatchesLoopbackContract(loopback)) process.exit(2);
-if (plistMatchesLoopbackContract(loopback.replace("--experimental-auto-refresh", "--no-auto-refresh"))) process.exit(3);
-if (plistMatchesLoopbackContract(loopback.replace("<string>127.0.0.1</string>", "<string>0.0.0.0</string>"))) process.exit(4);
-if (plistMatchesLoopbackContract(loopback.replace("--no-require-auth", "--allowed-host"))) process.exit(5);
+const loopbackReader = "<string>--host</string>\n<string>127.0.0.1</string>\n<string>--no-require-auth</string>\n<string>--no-auto-refresh</string>\n";
+const implicitReader = loopbackReader.replace("<string>--no-auto-refresh</string>\n", "");
+const embeddedWriter = implicitReader + "<string>--experimental-auto-refresh</string>\n";
+if (!plistMatchesLoopbackContract(loopbackReader)) process.exit(2);
+if (!plistMatchesLoopbackContract(implicitReader)) process.exit(3);
+if (plistMatchesLoopbackContract(embeddedWriter)) process.exit(4);
+if (plistMatchesLoopbackContract(loopbackReader.replace("<string>127.0.0.1</string>", "<string>0.0.0.0</string>"))) process.exit(5);
+if (plistMatchesLoopbackContract(loopbackReader.replace("--no-require-auth", "--allowed-host"))) process.exit(6);
 const killed = childFailureExit({ status: null, signal: "SIGKILL" });
-if (!killed || killed.code === 0 || !killed.line.includes("code signature invalid")) process.exit(6);
+if (!killed || killed.code === 0 || !killed.line.includes("code signature invalid")) process.exit(7);
 const exited = childFailureExit({ status: 2, signal: null });
-if (!exited || exited.code !== 2 || exited.line) process.exit(7);
+if (!exited || exited.code !== 2 || exited.line) process.exit(8);
 """,
         ],
         cwd=ROOT,

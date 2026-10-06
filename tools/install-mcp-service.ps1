@@ -1,5 +1,5 @@
 # Windows service for the AICX loopback listener.
-# Same contract as launchd: 127.0.0.1, no bearer, experimental auto-refresh (300s).
+# Same reader-only contract as launchd: 127.0.0.1, no bearer.
 $ErrorActionPreference = "Stop"
 $port = if ($env:AICX_MCP_PORT) { $env:AICX_MCP_PORT } else { "8044" }
 $bin = $env:AICX_BIN
@@ -12,7 +12,7 @@ if (-not $bin) {
   Write-Error "mcp service: aicx not found"
   exit 1
 }
-$args = "serve --transport http --host 127.0.0.1 --port $port --no-require-auth --experimental-auto-refresh"
+$args = "serve --transport http --host 127.0.0.1 --port $port --no-require-auth --no-auto-refresh"
 $recordDir = Join-Path $env:LOCALAPPDATA "aicx"
 New-Item -ItemType Directory -Force -Path $recordDir | Out-Null
 $record = Join-Path $recordDir "aicx-mcp-service.xml"

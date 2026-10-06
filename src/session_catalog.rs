@@ -188,24 +188,60 @@ impl fmt::Display for AgentKind {
 pub struct SourceFingerprint {
     pub len: u64,
     pub modified_unix_nanos: u128,
+    /// Cheap physical identity on Unix (dev/inode/ctime/mode/owner); on
+    /// platforms without that proof this includes a streaming content digest.
+    pub physical_identity: Vec<u64>,
     /// Separate artifact evidence for multi-file sources. Size and freshness
     /// retain their physical meanings; neither encodes this digest.
     pub bundle_fingerprint: Option<String>,
 }
 
 impl SourceFingerprint {
-    fn from_metadata(metadata: &fs::Metadata) -> Self {
+    fn from_path(path: &Path, metadata: &fs::Metadata) -> std::io::Result<Self> {
+        let _ = path;
         let modified_unix_nanos = metadata
             .modified()
             .unwrap_or(SystemTime::UNIX_EPOCH)
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        Self {
+        #[cfg(unix)]
+        let physical_identity = {
+            use std::os::unix::fs::MetadataExt;
+            vec![
+                metadata.dev(),
+                metadata.ino(),
+                metadata.ctime() as u64,
+                metadata.ctime_nsec() as u64,
+                metadata.mode() as u64,
+                metadata.uid() as u64,
+                metadata.gid() as u64,
+            ]
+        };
+        #[cfg(not(unix))]
+        let physical_identity = {
+            let mut file = sanitize::open_file_validated(path).map_err(std::io::Error::other)?;
+            let mut hasher = Sha256::new();
+            let mut buffer = [0u8; 64 * 1024];
+            loop {
+                let count = file.read(&mut buffer)?;
+                if count == 0 {
+                    break;
+                }
+                hasher.update(&buffer[..count]);
+            }
+            hasher
+                .finalize()
+                .chunks_exact(8)
+                .map(|bytes| u64::from_le_bytes(bytes.try_into().expect("eight-byte digest chunk")))
+                .collect()
+        };
+        Ok(Self {
             len: metadata.len(),
             modified_unix_nanos,
+            physical_identity,
             bundle_fingerprint: None,
-        }
+        })
     }
 }
 
@@ -252,7 +288,7 @@ fn is_copilot_source_id(value: &str) -> bool {
 /// workspace sidecar participates because an unchanged event stream can gain
 /// a repository association or title when that sidecar changes.
 pub(crate) fn source_bundle_fingerprint(path: &Path) -> std::io::Result<SourceFingerprint> {
-    let mut fingerprint = SourceFingerprint::from_metadata(&fs::metadata(path)?);
+    let mut fingerprint = SourceFingerprint::from_path(path, &fs::metadata(path)?)?;
     if is_copilot_source_file(path) {
         let mut bundle = Sha256::new();
         bundle.update(b"copilot-source-bundle.v1\0events.jsonl\0");
@@ -263,7 +299,7 @@ pub(crate) fn source_bundle_fingerprint(path: &Path) -> std::io::Result<SourceFi
             && let Ok(metadata) = fs::symlink_metadata(&sidecar)
             && metadata.is_file()
         {
-            let companion = SourceFingerprint::from_metadata(&metadata);
+            let companion = SourceFingerprint::from_path(&sidecar, &metadata)?;
             bundle.update(b"present\0");
             bundle.update(companion.len.to_le_bytes());
             bundle.update(companion.modified_unix_nanos.to_le_bytes());
@@ -1547,6 +1583,43 @@ mod copilot_tests {
             after.bundle_fingerprint, preserved_mtime.bundle_fingerprint,
             "bounded workspace content hash also observes a preserved-mtime edit"
         );
+        fs::remove_dir_all(root.parent().unwrap().parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn physical_identity_detects_same_size_restored_mtime_and_atomic_replace() {
+        let root = root();
+        let events = event(&root);
+        fs::write(&events, b"aaaa\n").unwrap();
+        let before = source_bundle_fingerprint(&events).unwrap();
+        let pinned_mtime =
+            filetime::FileTime::from_last_modification_time(&fs::metadata(&events).unwrap());
+
+        fs::write(&events, b"bbbb\n").unwrap();
+        filetime::set_file_mtime(&events, pinned_mtime).unwrap();
+        let rewritten = source_bundle_fingerprint(&events).unwrap();
+        assert_eq!(before.len, rewritten.len);
+        assert_eq!(before.modified_unix_nanos, rewritten.modified_unix_nanos);
+        assert_ne!(
+            before.physical_identity, rewritten.physical_identity,
+            "same-size restored-mtime rewrite must move physical identity"
+        );
+
+        #[cfg(unix)]
+        {
+            let replacement = events.with_extension("replacement");
+            fs::write(&replacement, b"bbbb\n").unwrap();
+            filetime::set_file_mtime(&replacement, pinned_mtime).unwrap();
+            fs::rename(&replacement, &events).unwrap();
+            let replaced = source_bundle_fingerprint(&events).unwrap();
+            assert_eq!(rewritten.len, replaced.len);
+            assert_eq!(rewritten.modified_unix_nanos, replaced.modified_unix_nanos);
+            assert_ne!(
+                rewritten.physical_identity, replaced.physical_identity,
+                "atomic replacement must move inode/ctime identity"
+            );
+        }
+
         fs::remove_dir_all(root.parent().unwrap().parent().unwrap()).unwrap();
     }
 

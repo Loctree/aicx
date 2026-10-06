@@ -1104,6 +1104,7 @@ pub fn resolve_session(home: &Path, session_id: &str) -> Result<Option<CatalogEn
                 fingerprint: SourceFingerprint {
                     len: entry.source_len.unwrap_or_default(),
                     modified_unix_nanos: entry.source_mtime_ns.unwrap_or_default() as u128,
+                    physical_identity: Vec::new(),
                     bundle_fingerprint: entry.source_bundle_fingerprint.clone(),
                 },
                 header_truncated: false,

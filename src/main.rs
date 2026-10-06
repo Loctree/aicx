@@ -5287,16 +5287,18 @@ fn run_intents(
         live,
     };
 
-    let extraction =
-        intents::extract_intents_with_stats_for_projects(&config, &effective_projects)?;
-    let records = extraction.records;
-
-    let (date_lo, date_hi) = if let Some(ref d) = filters.since {
-        let bounds = parse_date_filter(d)?;
-        (bounds.0, bounds.1)
-    } else {
-        (None, filters.until.clone())
+    let (date_lo, date_hi) = intent_date_bounds(&filters)?;
+    let source_filter = intents::IntentSourceFilter {
+        agent: filters.agent.clone(),
+        date_lo: date_lo.clone(),
+        date_hi: date_hi.clone(),
     };
+    let extraction = intents::extract_intents_with_stats_for_projects_filtered(
+        &config,
+        &effective_projects,
+        &source_filter,
+    )?;
+    let records = extraction.records;
 
     let display_filters = intents::IntentDisplayFilters {
         unresolved,
@@ -5599,8 +5601,17 @@ fn extract_intents_pack_lane(
         frame_kind,
         live,
     };
-    let extraction = intents::extract_intents_with_stats_for_projects(&config, projects)?;
     let (date_lo, date_hi) = intent_date_bounds(filters)?;
+    let source_filter = intents::IntentSourceFilter {
+        agent: filters.agent.clone(),
+        date_lo: date_lo.clone(),
+        date_hi: date_hi.clone(),
+    };
+    let extraction = intents::extract_intents_with_stats_for_projects_filtered(
+        &config,
+        projects,
+        &source_filter,
+    )?;
     let mut records = intents::apply_display_filters(
         extraction.records,
         &intents::IntentDisplayFilters {
@@ -5624,12 +5635,17 @@ fn extract_intents_pack_lane(
 }
 
 fn intent_date_bounds(filters: &RetrievalFilters) -> Result<(Option<String>, Option<String>)> {
-    if let Some(ref d) = filters.since {
-        let bounds = parse_date_filter(d)?;
-        Ok((bounds.0, bounds.1))
+    let (lo, hi) = if let Some(ref date) = filters.since {
+        if date.contains("..") {
+            parse_date_filter(date)?
+        } else {
+            // --since is a lower bound; --date keeps the single-day selector.
+            (Some(date.clone()), None)
+        }
     } else {
-        Ok((None, filters.until.clone()))
-    }
+        (None, None)
+    };
+    Ok((lo, hi.or_else(|| filters.until.clone())))
 }
 
 fn format_intents_pack_markdown(
@@ -5838,6 +5854,12 @@ fn run_tail(
         live: intents::IntentsConfig::auto_live(hours),
     };
 
+    let (date_lo, date_hi) = intent_date_bounds(&filters)?;
+    let source_filter = intents::IntentSourceFilter {
+        agent: filters.agent.clone(),
+        date_lo: date_lo.clone(),
+        date_hi: date_hi.clone(),
+    };
     let mut last_seen = std::collections::HashSet::new();
     eprintln!(
         "Watching for new intents in {}...",
@@ -5845,23 +5867,18 @@ fn run_tail(
     );
 
     loop {
-        if let Ok(extraction) =
-            intents::extract_intents_with_stats_for_projects(&config, &effective_projects)
-        {
+        if let Ok(extraction) = intents::extract_intents_with_stats_for_projects_filtered(
+            &config,
+            &effective_projects,
+            &source_filter,
+        ) {
             let mut records = extraction.records;
             // Apply filtering identical to run_intents
             if let Some(agent_filter) = &filters.agent {
                 let want = aicx::search_engine::canonical_agent_slug(agent_filter);
                 records.retain(|r| r.agent == want);
             }
-            let (lo, hi) = if let Some(ref d) = filters.since {
-                (
-                    parse_date_filter(d).ok().and_then(|b| b.0),
-                    parse_date_filter(d).ok().and_then(|b| b.1),
-                )
-            } else {
-                (None, filters.until.clone())
-            };
+            let (lo, hi) = (&date_lo, &date_hi);
             if lo.is_some() || hi.is_some() {
                 records.retain(|r| {
                     lo.as_ref().is_none_or(|lo| r.date.as_str() >= lo.as_str())

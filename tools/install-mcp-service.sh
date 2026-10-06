@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
-# install-mcp-service.sh — one loopback HTTP process for AICX (macOS launchd).
+# install-mcp-service.sh — one reader-only HTTP process for AICX (macOS launchd).
 #
 # Installs a per-user LaunchAgent that runs the npm-installed aicx-mcp (or
 # `aicx serve` when that sibling is absent):
-#   --transport http --host 127.0.0.1 --no-require-auth --experimental-auto-refresh
+#   --transport http --host 127.0.0.1 --no-require-auth --no-auto-refresh
 # `/` is the dashboard and `/mcp` is MCP on port 8044. Loopback auth is off.
 # A non-loopback AICX_MCP_HOST does not receive --no-require-auth; the binary
-# refuses that bind without a bearer. Auto-refresh is the experimental opt-in
-# at the product default cadence (300s). Do not pass --no-auto-refresh.
-# KeepAlive=true. The separate maintenance schedule stays available.
+# refuses that bind without a bearer. The long-lived service never owns index
+# maintenance; the separate short-lived maintenance schedule stays available.
+# KeepAlive=true.
 #
 # Usage:
 #   bash tools/install-mcp-service.sh              # install / refresh service
@@ -118,9 +118,9 @@ RUN_BIN_XML="$(printf '%s' "$RUN_BIN" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -
 HOST_XML="$(printf '%s' "$HOST" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g' -e "s/'/\&apos;/g")"
 PORT_XML="$(printf '%s' "$PORT" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g' -e "s/'/\&apos;/g")"
 PATH_XML="$(printf '%s' "$AICX_DIR:/usr/bin:/bin:$HOME/.local/bin:$HOME/.cargo/bin:/opt/homebrew/bin" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g' -e "s/'/\&apos;/g")"
-# Tool-name audit + rmcp session lifecycle + the experimental refresh writer.
+# Tool-name audit + rmcp session lifecycle. Index maintenance has a separate owner.
 # Not `info` globally — that floods hyper/h2. Not `--verbose` — extractor only.
-RUST_LOG_VALUE="${AICX_MCP_RUST_LOG:-mcp.audit=info,mcp.lifecycle=info,mcp.refresh=info,rmcp=info}"
+RUST_LOG_VALUE="${AICX_MCP_RUST_LOG:-mcp.audit=info,mcp.lifecycle=info,rmcp=info}"
 RUST_LOG_XML="$(printf '%s' "$RUST_LOG_VALUE" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g' -e "s/'/\&apos;/g")"
 
 mkdir -p "$HOME/Library/LaunchAgents" "$LOG_DIR"
@@ -155,7 +155,7 @@ cat > "$PLIST" <<PLIST_EOF
     <string>$HOST_XML</string>
     <string>--port</string>
     <string>$PORT_XML</string>$ALLOWED_ARGS_XML$NO_AUTH_XML
-    <string>--experimental-auto-refresh</string>
+    <string>--no-auto-refresh</string>
   </array>
   <key>EnvironmentVariables</key>
   <dict>
@@ -242,7 +242,7 @@ fi
 
 if service_loaded; then
   note "mcp service: dashboard http://$HOST:$PORT/ and MCP http://$HOST:$PORT/mcp via $LABEL"
-  note "mcp service: loopback auth off; experimental auto-refresh at the 300s default"
+  note "mcp service: reader-only; index maintenance stays with the separate scheduler"
   note "mcp service logs: $LOG_DIR/aicx-serve-http.log"
 else
   note "mcp service: FAILED — plist is at $PLIST but launchd did not keep the job"
@@ -252,4 +252,4 @@ else
 fi
 
 note "HTTP service: one process, dashboard on / and MCP on /mcp."
-note "Embedded refresh is the experimental opt-in at the product default cadence."
+note "Embedded refresh is disabled; this long-lived service is reader-only."

@@ -213,16 +213,15 @@ function plistHost(plist) {
 }
 
 // A migrated LaunchAgent is the loopback reader: host is loopback, auth is
-// not required, experimental refresh is on, and the deprecated reader flag
-// is absent. Anything else still needs `aicx doctor --repair-runtime`.
+// not required, and the embedded writer is not enabled. The deprecated reader
+// flag is optional because current binaries are reader-only by default.
 function plistMatchesLoopbackContract(plist) {
   const host = plistHost(plist);
   const loopback = host === "127.0.0.1" || host === "localhost" || host === "::1";
   return (
     loopback &&
     plist.includes("--no-require-auth") &&
-    plist.includes("--experimental-auto-refresh") &&
-    !plist.includes("--no-auto-refresh")
+    !plist.includes("--experimental-auto-refresh")
   );
 }
 

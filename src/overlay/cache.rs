@@ -17,7 +17,7 @@ use std::path::{Component, Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 /// Bump for feed classification, census shaping, or frame serialization changes.
-const CACHE_SCHEMA: &str = "aicx.overlay.catalog-feed.v2";
+const CACHE_SCHEMA: &str = "aicx.overlay.catalog-feed.v4";
 const CACHE_OWNER_SCHEMA: &str = "aicx.overlay.catalog-cache-owner.v1";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -28,6 +28,9 @@ struct SourceFingerprint {
     // Inode + ctime detect atomic replacement and same-size, restored-mtime
     // edits. Metadata-only warm checks must not mistake these for unchanged.
     platform_identity: Vec<u64>,
+    /// A native session can depend on an unchanged event stream and a changed
+    /// workspace sidecar. Both overlay and ordinary readers share this key.
+    bundle_fingerprint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -61,6 +64,7 @@ struct FeedCache {
     checksum: String,
     items: Vec<OverlayFeedItem>,
     coverage_notes: Vec<String>,
+    scope_receipts: Vec<(String, crate::source_index::ConversationScopeReceipt)>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -74,6 +78,7 @@ struct ConversationCache {
     /// tool calls and scopes `.aicxignore` hid are gone from them.
     scope: ScopeReport,
     coverage: ConversationCoverage,
+    scope_receipt: crate::source_index::ConversationScopeReceipt,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -88,6 +93,141 @@ struct CacheOwner {
     schema: String,
     repo_id: String,
     canonical_home_digest: String,
+}
+
+type ConversationRead = (
+    PathBuf,
+    Vec<TimelineEntry>,
+    ScopeReport,
+    ConversationCoverage,
+);
+
+/// Reuse the validated whole-conversation cache for source readers as well as
+/// overlay. This does not publish or mutate the lexical CURRENT generation.
+pub(super) fn load_source_conversation(
+    home: &Path,
+    entry: &CatalogEntry,
+) -> Result<(ConversationRead, bool)> {
+    let allow = source_allowlist(home);
+    let state = source_state(&allow, &entry.source_path);
+    let SourceState::Ready { path, .. } = &state else {
+        bail!("intent source is missing, unreadable, or outside the source allowlist");
+    };
+    let canonical_home = home
+        .canonicalize()
+        .context("canonicalize reader cache home")?;
+    let root = canonical_home.join("reader-conversations-v1");
+    if let Ok(metadata) = fs::symlink_metadata(&root)
+        && (metadata.file_type().is_symlink() || !metadata.is_dir())
+    {
+        bail!("reader conversation cache must be a regular directory");
+    }
+    fs::create_dir_all(&root)?;
+    if root.canonicalize()?.parent() != Some(canonical_home.as_path()) {
+        bail!("reader conversation cache escapes its AICX home");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
+    }
+    let root_identity = fs::symlink_metadata(&root)?;
+    validate_reader_root(&root, &canonical_home, &root_identity)?;
+    claim_cache_owner(&root, home, "aicx/reader")?;
+    validate_reader_root(&root, &canonical_home, &root_identity)?;
+    let row = SourceRow {
+        entry: entry.clone(),
+        state: state.clone(),
+    };
+    let policy = source_policy(home, "aicx/reader")?;
+    let key = digest(&(&policy, &row))?;
+    let slot = root.join(source_slot_name(&row)?);
+    let unchanged = || -> Result<()> {
+        validate_reader_root(&root, &canonical_home, &root_identity)?;
+        if source_state(&allow, &entry.source_path) != state
+            || source_policy(home, "aicx/reader")? != policy
+        {
+            bail!(
+                "intent source or ignore policy changed during its read; retry after the writer settles"
+            );
+        }
+        Ok(())
+    };
+    unchanged()?;
+    if let Some(saved) = read_json::<ConversationCache>(&root, &slot)?
+        && saved.schema == CACHE_SCHEMA
+        && saved.key == key
+        && saved.coverage.cacheable()
+        && saved.checksum
+            == digest(&(
+                &saved.frames,
+                &saved.scope,
+                &saved.coverage,
+                &saved.scope_receipt,
+            ))?
+        && crate::source_index::conversation_scope_receipt_is_current(entry, &saved.scope_receipt)
+    {
+        unchanged()?;
+        if !crate::source_index::conversation_scope_receipt_is_current(entry, &saved.scope_receipt)
+        {
+            bail!("intent source repository layout changed during its cache read");
+        }
+        return Ok((
+            (path.clone(), saved.frames, saved.scope, saved.coverage),
+            true,
+        ));
+    }
+    let (read_path, frames, scope, coverage, scope_receipt) =
+        crate::source_index::read_catalog_conversation_checked_with_scope_receipt_at(home, entry)?;
+    unchanged()?;
+    if read_path != *path {
+        bail!("intent source changed resolved path during its read");
+    }
+    if !crate::source_index::conversation_scope_receipt_is_current(entry, &scope_receipt) {
+        bail!("intent source repository layout changed during its read");
+    }
+    if coverage.cacheable() {
+        unchanged()?;
+        atomic_write_json(
+            &slot,
+            &ConversationCache {
+                schema: CACHE_SCHEMA.to_owned(),
+                key,
+                checksum: digest(&(&frames, &scope, &coverage, &scope_receipt))?,
+                frames: frames.clone(),
+                scope: scope.clone(),
+                coverage: coverage.clone(),
+                scope_receipt: scope_receipt.clone(),
+            },
+        )?;
+        unchanged()?;
+        if !crate::source_index::conversation_scope_receipt_is_current(entry, &scope_receipt) {
+            bail!("intent source repository layout changed while publishing its cache");
+        }
+    }
+    Ok(((read_path, frames, scope, coverage), false))
+}
+
+fn validate_reader_root(root: &Path, home: &Path, pinned: &fs::Metadata) -> Result<()> {
+    let current = fs::symlink_metadata(root)?;
+    if current.file_type().is_symlink()
+        || !current.is_dir()
+        || root.canonicalize()?.parent() != Some(home)
+    {
+        bail!("reader cache directory changed its home boundary");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if current.dev() != pinned.dev() || current.ino() != pinned.ino() {
+            bail!("reader cache directory identity changed during its read");
+        }
+    }
+    #[cfg(not(unix))]
+    if current.created().ok() != pinned.created().ok() {
+        bail!("reader cache directory identity changed during its read");
+    }
+    Ok(())
 }
 
 pub(super) fn output_has_receipt(root: &Path, output: &super::OverlayDocument) -> Result<bool> {
@@ -138,9 +278,13 @@ pub(super) fn load_catalog_feed(
         && let Some(saved) = read_json::<FeedCache>(root, &feed_path)?
         && saved.schema == CACHE_SCHEMA
         && saved.key == before.key
-        && saved.checksum == digest(&(&saved.items, &saved.coverage_notes))?
+        && saved.checksum == digest(&(&saved.items, &saved.coverage_notes, &saved.scope_receipts))?
+        && feed_scope_receipts_are_current(&before, &saved.scope_receipts)?
     {
         ensure_unchanged(&before, &snapshot(home, repo_id)?)?;
+        if !feed_scope_receipts_are_current(&before, &saved.scope_receipts)? {
+            bail!("overlay repository layout changed during its feed cache read");
+        }
         prune_obsolete_source_slots(root, &before)?;
         stats.feed_cache_hit = true;
         stats.source_sessions_reused = before
@@ -156,6 +300,8 @@ pub(super) fn load_catalog_feed(
 
     let mut conversations = Vec::new();
     let mut coverage_notes = Vec::new();
+    let mut scope_receipts = Vec::new();
+    let mut source_scope_validator = crate::source_index::ConversationScopeValidator::default();
     for row in &before.rows {
         let SourceState::Ready { path, .. } = &row.state else {
             continue;
@@ -174,17 +320,31 @@ pub(super) fn load_catalog_feed(
         } else {
             read_json::<ConversationCache>(root, &source_cache)?
         };
-        let (frames, scope, coverage) = if let Some(saved) = saved
+        let (frames, scope, coverage, scope_receipt) = if let Some(saved) = saved
             && saved.schema == CACHE_SCHEMA
             && saved.key == key
             && saved.coverage.cacheable()
-            && saved.checksum == digest(&(&saved.frames, &saved.scope, &saved.coverage))?
+            && saved.checksum
+                == digest(&(
+                    &saved.frames,
+                    &saved.scope,
+                    &saved.coverage,
+                    &saved.scope_receipt,
+                ))?
+            && source_scope_validator.is_current(&row.entry, &saved.scope_receipt)
         {
             stats.source_sessions_reused += 1;
-            (saved.frames, saved.scope, saved.coverage)
+            (
+                saved.frames,
+                saved.scope,
+                saved.coverage,
+                saved.scope_receipt,
+            )
         } else {
             stats.source_sessions_parsed += 1;
-            let read = crate::source_index::read_catalog_conversation_checked_at(home, &row.entry);
+            let read = crate::source_index::read_catalog_conversation_checked_with_scope_receipt_at(
+                home, &row.entry,
+            );
             // Even a parser failure must not hide a source changing underneath
             // us. Re-stat after the read before using or persisting its frames.
             let allow = source_allowlist(home);
@@ -195,9 +355,15 @@ pub(super) fn load_catalog_feed(
                 );
             }
             match read {
-                Ok((read_path, frames, scope, coverage)) => {
+                Ok((read_path, frames, scope, coverage, scope_receipt)) => {
                     if read_path != *path {
                         bail!("overlay source changed resolved path during read");
+                    }
+                    if !crate::source_index::conversation_scope_receipt_is_current(
+                        &row.entry,
+                        &scope_receipt,
+                    ) {
+                        bail!("overlay repository layout changed during its source read");
                     }
                     // Scope is the session's checkout report. Coverage is the
                     // parser's, and a partial or time-inferred read must not
@@ -208,10 +374,11 @@ pub(super) fn load_catalog_feed(
                             &ConversationCache {
                                 schema: CACHE_SCHEMA.to_owned(),
                                 key,
-                                checksum: digest(&(&frames, &scope, &coverage))?,
+                                checksum: digest(&(&frames, &scope, &coverage, &scope_receipt))?,
                                 frames: frames.clone(),
                                 scope: scope.clone(),
                                 coverage: coverage.clone(),
+                                scope_receipt: scope_receipt.clone(),
                             },
                         )?;
                     } else {
@@ -221,7 +388,7 @@ pub(super) fn load_catalog_feed(
                             "partial parser coverage; current claims are not cached",
                         );
                     }
-                    (frames, scope, coverage)
+                    (frames, scope, coverage, scope_receipt)
                 }
                 Err(error) => {
                     cacheable = false;
@@ -238,21 +405,31 @@ pub(super) fn load_catalog_feed(
             eprintln!("overlay: {note}");
             coverage_notes.push(note);
         }
+        scope_receipts.push((source_slot_name(row)?, scope_receipt));
         conversations.push((row.entry.clone(), path.clone(), frames, scope));
     }
     let records =
         crate::intents::extract_overlay_intents_from_conversations(repo_id, &conversations)?;
     let items = deduplicated_catalog_feed(records, repo_id);
     ensure_unchanged(&before, &snapshot(home, repo_id)?)?;
+    let mut final_scope_validator = crate::source_index::ConversationScopeValidator::default();
+    if conversations
+        .iter()
+        .zip(&scope_receipts)
+        .any(|((entry, ..), (_, receipt))| !final_scope_validator.is_current(entry, receipt))
+    {
+        bail!("overlay repository layout changed during its feed construction");
+    }
     if cacheable {
         atomic_write_json(
             &feed_path,
             &FeedCache {
                 schema: CACHE_SCHEMA.to_owned(),
                 key: before.key.clone(),
-                checksum: digest(&(&items, &coverage_notes))?,
+                checksum: digest(&(&items, &coverage_notes, &scope_receipts))?,
                 items: items.clone(),
                 coverage_notes,
+                scope_receipts,
             },
         )?;
         // Only an atomically published, complete/cacheable feed authorizes
@@ -262,25 +439,31 @@ pub(super) fn load_catalog_feed(
     Ok((items, stats))
 }
 
-fn snapshot(home: &Path, repo_id: &str) -> Result<Snapshot> {
-    let user_home = crate::os_user_home().unwrap_or_else(|| home.to_path_buf());
-    let allow = SourceAllowlist::for_operator(&user_home, home);
-    let ignore = crate::legacy_archive::load_repo_path_ignore(home, &user_home)?;
-    let roots = allow
-        .roots()
+fn feed_scope_receipts_are_current(
+    snapshot: &Snapshot,
+    receipts: &[(String, crate::source_index::ConversationScopeReceipt)],
+) -> Result<bool> {
+    let mut scope_validator = crate::source_index::ConversationScopeValidator::default();
+    let mut ready_rows = snapshot
+        .rows
         .iter()
-        .map(|root| (root, root.canonicalize().ok()))
-        .collect::<Vec<_>>();
-    let policy = digest(&(
-        CACHE_SCHEMA,
-        env!("CARGO_PKG_VERSION"),
-        option_env!("AICX_GIT_COMMIT"),
-        crate::source_index::SIGNAL_FILTER_VERSION,
-        home,
-        repo_id,
-        roots,
-        ignore.fingerprint(),
-    ))?;
+        .filter(|row| matches!(row.state, SourceState::Ready { .. }));
+    for (source_slot, receipt) in receipts {
+        let Some(row) = ready_rows.next() else {
+            return Ok(false);
+        };
+        if *source_slot != source_slot_name(row)?
+            || !scope_validator.is_current(&row.entry, receipt)
+        {
+            return Ok(false);
+        }
+    }
+    Ok(ready_rows.next().is_none())
+}
+
+fn snapshot(home: &Path, repo_id: &str) -> Result<Snapshot> {
+    let policy = source_policy(home, repo_id)?;
+    let allow = source_allowlist(home);
     let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).expect("valid Unix epoch");
     let mut rows = Vec::new();
     for entry in crate::catalog::read_entries_at(home)? {
@@ -307,6 +490,27 @@ fn snapshot(home: &Path, repo_id: &str) -> Result<Snapshot> {
     Ok(Snapshot { policy, key, rows })
 }
 
+fn source_policy(home: &Path, repo_id: &str) -> Result<String> {
+    let user_home = crate::os_user_home().unwrap_or_else(|| home.to_path_buf());
+    let allow = SourceAllowlist::for_operator(&user_home, home);
+    let ignore = crate::legacy_archive::load_repo_path_ignore(home, &user_home)?;
+    let roots = allow
+        .roots()
+        .iter()
+        .map(|root| (root, root.canonicalize().ok()))
+        .collect::<Vec<_>>();
+    digest(&(
+        CACHE_SCHEMA,
+        env!("CARGO_PKG_VERSION"),
+        option_env!("AICX_GIT_COMMIT"),
+        crate::source_index::SIGNAL_FILTER_VERSION,
+        home,
+        repo_id,
+        roots,
+        ignore.fingerprint(),
+    ))
+}
+
 fn source_allowlist(home: &Path) -> SourceAllowlist {
     SourceAllowlist::for_operator(
         &crate::os_user_home().unwrap_or_else(|| home.to_path_buf()),
@@ -331,6 +535,7 @@ fn ready_source(allow: &SourceAllowlist, source: &Path) -> Result<(PathBuf, Sour
     let file = allow.open_file(source)?;
     let metadata = file.metadata()?;
     let fingerprint = fingerprint(&metadata)?;
+    let bundle = crate::session_catalog::source_bundle_fingerprint(&path)?.bundle_fingerprint;
     // Non-Unix metadata APIs do not expose the same cheap inode/ctime
     // guarantee. Be conservative: hash bytes with bounded memory rather than
     // trusting a same-size edit whose mtime was restored. Still no reparse.
@@ -350,7 +555,11 @@ fn ready_source(allow: &SourceAllowlist, source: &Path) -> Result<(PathBuf, Sour
         hasher.finalize()
     };
     let live_path = allow.resolve_file(source)?;
-    if path != live_path || fingerprint != self::fingerprint(&fs::metadata(&live_path)?)? {
+    if path != live_path
+        || fingerprint != self::fingerprint(&fs::metadata(&live_path)?)?
+        || bundle
+            != crate::session_catalog::source_bundle_fingerprint(&live_path)?.bundle_fingerprint
+    {
         bail!("overlay source changed while checking its identity");
     }
     #[cfg(not(unix))]
@@ -363,6 +572,8 @@ fn ready_source(allow: &SourceAllowlist, source: &Path) -> Result<(PathBuf, Sour
         }
         fingerprint
     };
+    let mut fingerprint = fingerprint;
+    fingerprint.bundle_fingerprint = bundle;
     Ok((path, fingerprint))
 }
 
@@ -403,6 +614,7 @@ fn fingerprint(metadata: &fs::Metadata) -> Result<SourceFingerprint> {
             .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
             .map(|time| time.as_nanos()),
         platform_identity,
+        bundle_fingerprint: None,
     })
 }
 
@@ -776,6 +988,216 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.temp_root);
         }
+    }
+
+    fn absorbed_nested_workdir_fixture() -> (Fixture, PathBuf) {
+        let mut fixture = Fixture::new();
+        let parent = fixture.home.join("workspace/aicx");
+        let nested = parent.join("vendor/fleet-bus");
+        fs::create_dir_all(parent.join(".git")).unwrap();
+        fs::create_dir_all(&nested).unwrap();
+        let row = &mut fixture.rows[0];
+        row.agent = "codex".to_owned();
+        row.cwd = Some(parent.to_string_lossy().into_owned());
+        let command = format!(
+            "const r = await tools.exec_command({{cmd:\"ls\",workdir:{}}});",
+            serde_json::to_string(&nested.to_string_lossy()).unwrap()
+        );
+        let records = [
+            serde_json::json!({
+                "timestamp": "2026-09-03T10:00:00Z", "type": "session_meta",
+                "payload": {"id": row.session_id, "cwd": row.cwd}
+            }),
+            serde_json::json!({
+                "timestamp": "2026-09-03T10:00:01Z", "type": "turn_context",
+                "payload": {"cwd": row.cwd}
+            }),
+            serde_json::json!({
+                "timestamp": "2026-09-03T10:00:02Z", "type": "response_item",
+                "payload": {"type": "message", "role": "user", "content": [{
+                    "type": "input_text",
+                    "text": "DECISION: preserve the parent scope in src/layout-proof.rs. WHY: unchanged source bytes must not freeze checkout identity."
+                }]}
+            }),
+            serde_json::json!({
+                "timestamp": "2026-09-03T10:00:03Z", "type": "response_item",
+                "payload": {"type": "custom_tool_call", "name": "exec",
+                    "call_id": "layout-call", "input": command}
+            }),
+        ];
+        fs::write(
+            &row.source_path,
+            records
+                .iter()
+                .map(|value| serde_json::to_string(value).unwrap())
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n",
+        )
+        .unwrap();
+        fixture.write_catalog();
+        (fixture, nested)
+    }
+
+    #[test]
+    fn reader_cache_invalidates_an_absorbed_workdir_layout_change() {
+        let (fixture, nested) = absorbed_nested_workdir_fixture();
+        let entry = &fixture.rows[0];
+        let (cold, reused) = load_source_conversation(&fixture.home, entry).unwrap();
+        assert!(!reused);
+        assert!(!cold.2.scope_mixed());
+        let root = fixture.home.join("reader-conversations-v1");
+        let slot = root.join(
+            source_slot_name(&SourceRow {
+                entry: entry.clone(),
+                state: SourceState::Missing,
+            })
+            .unwrap(),
+        );
+        let saved: ConversationCache = read_json(&root, &slot).unwrap().unwrap();
+        let nested_path = nested.to_string_lossy().into_owned();
+        assert!(saved.scope_receipt.recorded_workdirs.contains(&nested_path));
+        assert!(
+            !saved.scope.cwds.contains(&nested_path),
+            "the fixture must require parser-owned raw paths, not reduced scope"
+        );
+        assert!(load_source_conversation(&fixture.home, entry).unwrap().1);
+
+        fs::create_dir(nested.join(".git")).unwrap();
+        let (changed, reused) = load_source_conversation(&fixture.home, entry).unwrap();
+        assert!(!reused, "unchanged bytes cannot authorize stale scope");
+        assert!(
+            changed.2.scope_foreign_to(entry.cwd.as_deref()),
+            "the new nested checkout must no longer inherit the parent scope"
+        );
+        assert_ne!(digest(&cold).unwrap(), digest(&changed).unwrap());
+        assert!(load_source_conversation(&fixture.home, entry).unwrap().1);
+
+        fs::remove_dir(nested.join(".git")).unwrap();
+        let (restored, reused) = load_source_conversation(&fixture.home, entry).unwrap();
+        assert!(!reused);
+        assert_eq!(digest(&cold).unwrap(), digest(&restored).unwrap());
+    }
+
+    #[test]
+    fn feed_cache_rechecks_raw_workdir_layout_before_a_hit() {
+        let (fixture, nested) = absorbed_nested_workdir_fixture();
+        let (cold, stats) = fixture.load(false);
+        assert_eq!(stats.source_sessions_parsed, 2);
+        assert!(
+            cold.iter()
+                .any(|item| item.theses.iter().any(|text| text.contains("parent scope")))
+        );
+        assert!(fixture.load(false).1.feed_cache_hit);
+
+        fs::create_dir(nested.join(".git")).unwrap();
+        let (changed, stats) = fixture.load(false);
+        assert!(!stats.feed_cache_hit);
+        assert_eq!(stats.source_sessions_parsed, 1);
+        assert_eq!(stats.source_sessions_reused, 1);
+        assert!(
+            !changed
+                .iter()
+                .any(|item| item.theses.iter().any(|text| text.contains("parent scope")))
+        );
+        assert_ne!(digest(&cold).unwrap(), digest(&changed).unwrap());
+        assert!(fixture.load(false).1.feed_cache_hit);
+    }
+
+    #[test]
+    fn shared_source_fingerprint_tracks_copilot_workspace_changes() {
+        let fixture = Fixture::new();
+        let session = fixture
+            .home
+            .join(".copilot/session-state/00000000-0000-0000-0000-000000000042");
+        fs::create_dir_all(&session).unwrap();
+        let source = session.join("events.jsonl");
+        let workspace = session.join("workspace.yaml");
+        fs::write(&source, "{}\n").unwrap();
+        fs::write(&workspace, "cwd: /repo/first\n").unwrap();
+        let allow = source_allowlist(&fixture.home);
+        let before = ready_source(&allow, &source).unwrap();
+        assert!(before.1.bundle_fingerprint.is_some());
+        fs::write(&workspace, "cwd: /repo/second\n").unwrap();
+        let after = ready_source(&allow, &source).unwrap();
+        assert_eq!(before.0, after.0);
+        assert_eq!(before.1.len, after.1.len);
+        assert_eq!(before.1.modified_ns, after.1.modified_ns);
+        assert_ne!(before.1.bundle_fingerprint, after.1.bundle_fingerprint);
+    }
+
+    #[test]
+    fn reader_source_cache_reuses_whole_scope_and_invalidates_appends() {
+        let fixture = Fixture::new();
+        let entry = &fixture.rows[0];
+        let (cold, reused) = load_source_conversation(&fixture.home, entry).unwrap();
+        assert!(!reused);
+        let (warm, reused) = load_source_conversation(&fixture.home, entry).unwrap();
+        assert!(reused);
+        assert_eq!(digest(&cold).unwrap(), digest(&warm).unwrap());
+        fs::write(
+            &entry.source_path,
+            "DECISION: preserve a newly appended source in src/new.rs\nWHY: current evidence must invalidate the warm cache.\n",
+        )
+        .unwrap();
+        let (changed, reused) = load_source_conversation(&fixture.home, entry).unwrap();
+        assert!(!reused);
+        assert_ne!(digest(&cold).unwrap(), digest(&changed).unwrap());
+    }
+
+    #[test]
+    fn reader_source_cache_does_not_serve_a_missing_source() {
+        let fixture = Fixture::new();
+        let entry = &fixture.rows[0];
+        load_source_conversation(&fixture.home, entry).unwrap();
+        fs::remove_file(&entry.source_path).unwrap();
+        assert!(load_source_conversation(&fixture.home, entry).is_err());
+    }
+
+    #[test]
+    fn reader_source_cache_reparses_corrupt_derived_bytes() {
+        let fixture = Fixture::new();
+        let entry = &fixture.rows[0];
+        let (cold, _) = load_source_conversation(&fixture.home, entry).unwrap();
+        let root = fixture.home.join("reader-conversations-v1");
+        let slot = root.join(
+            source_slot_name(&SourceRow {
+                entry: entry.clone(),
+                state: SourceState::Missing,
+            })
+            .unwrap(),
+        );
+        fs::write(slot, b"{invalid derived cache").unwrap();
+        let (recovered, reused) = load_source_conversation(&fixture.home, entry).unwrap();
+        assert!(!reused);
+        assert_eq!(digest(&cold).unwrap(), digest(&recovered).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reader_source_cache_detects_root_retarget_after_initial_validation() {
+        let fixture = Fixture::new();
+        let root = fixture.home.join("reader-conversations-v1");
+        fs::create_dir(&root).unwrap();
+        let home = fixture.home.canonicalize().unwrap();
+        let identity = fs::symlink_metadata(&root).unwrap();
+        validate_reader_root(&root, &home, &identity).unwrap();
+        let previous = fixture.home.join("reader-conversations-previous");
+        fs::rename(&root, &previous).unwrap();
+        std::os::unix::fs::symlink(&fixture.root, &root).unwrap();
+        assert!(validate_reader_root(&root, &home, &identity).is_err());
+        fs::remove_file(&root).unwrap();
+        fs::create_dir(&root).unwrap();
+        assert!(validate_reader_root(&root, &home, &identity).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reader_source_cache_rejects_a_symlinked_root() {
+        let fixture = Fixture::new();
+        std::os::unix::fs::symlink(&fixture.root, fixture.home.join("reader-conversations-v1"))
+            .unwrap();
+        assert!(load_source_conversation(&fixture.home, &fixture.rows[0]).is_err());
     }
 
     #[test]

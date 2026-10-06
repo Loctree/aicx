@@ -19,6 +19,10 @@ $AICX_HOME/
           manifest.json
       source_parse_state.v1.json
   context-corpus/                   # explicit Loctree/example ingestion
+  reader-conversations-v1/          # disposable, validated source-reader cache
+    catalog-source-v1-<source-identity-hash>.json
+    catalog-cache-owner-v1.json
+    catalog-cache-owner.lock
   overlay-index-v1/<repo-id-hash>/   # derived intent overlay and private feed caches
     side-index.json
     ov1:<revision>.json
@@ -53,6 +57,41 @@ retrieval stop instead of admitting unfiltered content.
 ~/Repozytoria/moje_prywatne
 /Volumes/secret/client-side
 ```
+
+## Validated conversation reuse
+
+Catalog-backed intent queries reuse whole cleaned conversations under
+`reader-conversations-v1/`. This uses the overlay conversation-cache validation
+rules, not another published index. The lexical `CURRENT` generation is unchanged
+by these reads.
+
+The existing `indexed/_all/source_parse_state.v1.json` ledger also carries
+physical source identity, parser/extract coverage, and whole-session scope
+receipts for newly parsed sources. Earlier rows retain explicit unknown
+coverage until a deliberate full rescan or a source change requires parsing;
+normal maintenance never invents those receipts from current file metadata.
+
+Reuse requires a readable allowlisted source, matching source identity and
+fingerprint, matching multi-file bundle metadata, unchanged ignore policy,
+repository layout and producer schema, a verified payload checksum, and
+cacheable parser coverage. Stable bounded projections retain their skipped
+record count on cold and warm reads; they never become complete coverage.
+Layout checks use the parser's original recorded workdirs;
+reduced visible frames cannot reconstruct tool-only or absorbed paths.
+Whole-session scope is retained before query-specific frame and date filtering.
+Source and cache-directory identities are checked again during the operation;
+missing, unreadable, replaced, or transiently partial sources do not authorize
+stale cached claims. Corrupt disposable payloads are re-parsed from their source.
+
+On Unix the cache directory is `0700` and atomically written payloads are `0600`.
+The owner marker binds the directory to its canonical AICX home; owner claims
+serialize through an advisory lock. Source slots are replaceable and atomically
+published, so concurrent readers never consume half-written JSON.
+
+This directory is machine-local derived state. It can be discarded when no
+reader is using it; source logs, catalog identity, and published generations
+remain authoritative. An empty cache requires a first source parse; warm reuse
+does not promise that live-root discovery or changed-source parsing is free.
 
 ## Catalog
 

@@ -24,6 +24,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Keep runtime repair, default service installers, npm migration checks, and
+  onboarding reader-only. Preserve operator network/logging settings, repair
+  missing `serve`, verify launchd ownership of the healthy listener, and restore
+  prior scheduler state after failed registration.
+- Bound intent source work by agent before parsing and by utterance timestamps
+  before classification/caps. Reuse the validated whole-conversation cache
+  without publishing CURRENT, retain recent utterances in old indexed sessions,
+  and interpret intent `--since` as a lower date bound.
+- Reuse unchanged intent extracts through the existing source-parse ledger,
+  re-source changed sessions, preserve parser/extract coverage, and order caps
+  by qualifying utterance time. Revalidate parser-recorded checkout layout for
+  both conversation and whole-feed cache hits.
+- Reject complete extract reuse after physical source replacement or a
+  same-size edit with restored mtime. Preserve valid legacy extracts as
+  explicitly unknown during normal maintenance, keeping full historical
+  rescans deliberate.
+
 - Avoid re-parsing full project history before an unchanged `overlay` cache hit.
   Reuse fingerprinted conversation frames across both intent lanes, preserve
   full-history evidence, and serialize concurrent producers with advisory locks.

@@ -32,6 +32,22 @@ use std::time::Instant;
 
 mod cache;
 
+/// Whole-session source reuse with the overlay cache's freshness and coverage
+/// checks. The cache is derived reader state, never a published search index.
+pub(crate) fn read_cached_catalog_conversation_at(
+    home: &Path,
+    entry: &crate::catalog::CatalogEntry,
+) -> Result<(
+    PathBuf,
+    Vec<crate::timeline::TimelineEntry>,
+    crate::extraction::conversation::ScopeReport,
+    crate::source_index::ConversationCoverage,
+)> {
+    let (conversation, reused) = cache::load_source_conversation(home, entry)?;
+    tracing::debug!(target: "aicx::reader_cache", reused, "read validated conversation");
+    Ok(conversation)
+}
+
 pub const OVERLAY_SCHEMA: &str = "loctree.overlay.intent.v1";
 pub const OVERLAY_INDEX_SCHEMA: &str = "aicx.overlay.side_index.v1";
 pub const ATTRIBUTION_VERSION: &str = "path-symbol-resolver.v2";

@@ -3,6 +3,43 @@ use filetime::{FileTime, set_file_mtime};
 use std::fs;
 
 #[test]
+fn intents_since_is_a_lower_bound_and_until_is_preserved() {
+    let filters = RetrievalFilters {
+        limit: None,
+        sort: None,
+        score: None,
+        agent: None,
+        since: Some("2026-10-01".into()),
+        until: None,
+        frame_kind: None,
+    };
+    assert_eq!(
+        intent_date_bounds(&filters).unwrap(),
+        (Some("2026-10-01".into()), None)
+    );
+    let bounded = RetrievalFilters {
+        until: Some("2026-10-06".into()),
+        ..filters.clone()
+    };
+    assert_eq!(
+        intent_date_bounds(&bounded).unwrap(),
+        (Some("2026-10-01".into()), Some("2026-10-06".into()))
+    );
+    let range = RetrievalFilters {
+        since: Some("2026-10-01..2026-10-03".into()),
+        ..filters
+    };
+    assert_eq!(
+        intent_date_bounds(&range).unwrap(),
+        (Some("2026-10-01".into()), Some("2026-10-03".into()))
+    );
+    assert_eq!(
+        parse_date_filter("2026-10-01").unwrap(),
+        (Some("2026-10-01".into()), Some("2026-10-01".into()))
+    );
+}
+
+#[test]
 fn intents_pack_report_carries_header_level_honesty_notice() {
     // B2: the default `aicx intents` text surface is the pack report; its
     // header metadata must carry the honesty frame so a weeks-old INTENT

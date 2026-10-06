@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # systemd --user unit for the AICX loopback listener.
-# Same contract as the macOS LaunchAgent: 127.0.0.1, no bearer, auto-refresh 300s.
+# Same reader-only contract as the macOS LaunchAgent: 127.0.0.1, no bearer.
 set -euo pipefail
 
 if [ "$(uname -s)" != "Linux" ]; then
@@ -30,7 +30,7 @@ cat > "$UNIT" <<UNIT
 Description=AICX dashboard and MCP
 
 [Service]
-ExecStart=$AICX_BIN serve --transport http --host 127.0.0.1 --port $PORT --no-require-auth --experimental-auto-refresh
+ExecStart=$AICX_BIN serve --transport http --host 127.0.0.1 --port $PORT --no-require-auth --no-auto-refresh
 Restart=on-failure
 
 [Install]

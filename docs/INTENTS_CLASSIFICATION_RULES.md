@@ -55,23 +55,41 @@ are two sources, tried in order.
 its resolved identity, so intent extraction reads those documents back instead
 of re-parsing the original transcripts:
 
-1. Opens the published `CURRENT` generation under the active AICX home.
-2. Filters by project on the stored slug, through the same
+1. Opens the published `CURRENT` generation under the active AICX home and
+   joins its session identities with current catalog membership and the existing
+   source-parse ledger.
+2. Filters by project on the catalog slug, through the same
    `project_filter_matches` resolver the rest of the CLI uses.
-3. Filters by the stored canonical date against the requested window.
-4. Reads back the stored body — the extract — plus `agent`, `date`,
-   `session_id` and `cwd` from the document metadata.
-5. Narrows frames to `frame_kind`; default is `user_msg`.
+3. Filters trusted agent metadata before loading unrelated bodies. A stored
+   session date is not used to discard potentially recent utterances.
+4. Reuses an extract only after proving live source identity/fingerprint,
+   ignore policy, checkout layout, and extract checksum. Changed, missing, or
+   unsafe sources are re-sourced through the checked conversation reader.
+   Old ledgers without coverage receipts remain explicitly `legacy_unknown`
+   and cannot produce `complete: true`.
+   Modern reuse also checks physical file identity (inode/change time on Unix,
+   a conservative content fingerprint where those are unavailable), so a
+   same-size edit with restored mtime cannot silently reuse a complete result.
+5. Narrows frames to `frame_kind` and the requested utterance-time window before
+   classification and caps; default frame kind is `user_msg`.
 
-Records gathered this way carry `identity_source: index-v1`.
+Records gathered from validated extracts carry `identity_source: index-v1`.
+Stable bounded projections preserve skipped-record and extract-omission
+coverage. Candidates are ordered by their latest qualifying utterance before
+the global cap, including recent utterances in old sessions.
 
 ### 2. The catalog census (fallback)
 
 Used when the index cannot answer: no published `CURRENT` on this machine, or
-a hot-window request (`--live`, or a window of 48h or less) where freshly
-written sessions are not committed yet. This path walks the census and parses
-the original transcripts, applying the same project, window and `frame_kind`
-narrowing. Records carry `identity_source: catalog-v1`.
+an individual source has changed, is unadmitted, or lacks a usable reuse proof.
+Live requests (`--live`, or a window of 48h or less) still reuse validated
+unchanged extracts and admit newly written sessions afterward.
+This path walks the census, excludes
+nonmatching agents before scope recovery and source reads, and reuses validated
+whole-conversation source slots under `reader-conversations-v1/`.
+Changed, uncached, or non-cacheable sources are parsed through the original
+reader. Whole-session scope is retained before applying project, utterance-time
+and `frame_kind` narrowing. Records carry `identity_source: catalog-v1`.
 
 The fallback exists so a machine that never ran `aicx index` still gets a
 timeline rather than a confident empty one.
@@ -82,7 +100,9 @@ Default consequence, on both paths: ordinary `aicx intents -p X` reads
 
 Source anchors:
 
-- Chunk collection: `src/intents.rs::collect_chunk_files`
+- Source collection: `src/intents.rs::collect_intent_files`
+- Source predicates: `src/intents/types.rs::IntentSourceFilter`
+- Validated reader reuse: `src/overlay.rs::read_cached_catalog_conversation_at`
 - Default frame kind: `src/intents/types.rs::IntentsConfig::default_frame_kind`
 
 ## Chunk Parsing

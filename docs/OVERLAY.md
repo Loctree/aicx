@@ -52,9 +52,10 @@ v1 readable.
 
 `catalog-feed-v1.json` and `catalog-source-v1-*.json` are private, disposable
 acceleration caches, not new source truth or a replacement for the lexical
-index. They use the versioned `aicx.overlay.catalog-feed.v2` envelope (v2 adds
-the whole-session scope report to each source slot, so a warm read attributes
-frames exactly as a cold one; v1 files are simply rebuilt). A source slot is
+index. They use the versioned `aicx.overlay.catalog-feed.v4` envelope (v2 added
+whole-session scope; v3 validates live multi-file source bundles such as
+Copilot's workspace sidecar; v4 also fingerprints the filesystem layout of
+every parser-recorded workdir). Older envelopes are rebuilt. A source slot is
 replaced when that source changes; appends do not create a new slot for every
 revision. The resolved `AICX_HOME` (or explicit API `index_root`)
 owns these files; isolated calls never fall back to the operator's global home.
@@ -76,6 +77,18 @@ private source slots may adopt the marker; an unowned root already containing
 source-shaped slots is never adopted implicitly. A fixed root-wide advisory
 lock serializes the first ownership claim before any repo-scoped producer lock,
 so two repositories cannot concurrently adopt the same explicit index root.
+
+Ordinary catalog-backed intent reads share these conversation validation
+primitives through `read_cached_catalog_conversation_at`. Their source slots
+live in the machine-local `reader-conversations-v1/` directory described in
+[AICX_HOME_LAYOUT.md](AICX_HOME_LAYOUT.md), with a separate reader owner marker.
+This is derived source reuse and never publishes lexical `CURRENT`.
+
+Both conversation reuse and a whole-feed hit revalidate repository layout
+using the parser's original workdirs, including paths absorbed into a parent
+checkout or removed by privacy projection. Creating a nested checkout or
+changing submodule layout invalidates affected source slots even when source
+bytes and catalog identity are unchanged.
 
 ## Identity and publication rules
 

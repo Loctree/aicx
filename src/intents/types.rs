@@ -110,6 +110,20 @@ pub struct IntentsConfig {
     pub live: bool,
 }
 
+/// Query predicates that are safe to apply while selecting intent sources.
+///
+/// This stays separate from [`IntentsConfig`] so existing library callers do
+/// not have to populate new mandatory fields. Agent matching is pushed ahead
+/// of source recovery/reads when catalog or index metadata states the agent.
+/// Date bounds are applied to individual utterance timestamps after parsing;
+/// session dates and filesystem mtimes are never substituted for that clock.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IntentSourceFilter {
+    pub agent: Option<String>,
+    pub date_lo: Option<String>,
+    pub date_hi: Option<String>,
+}
+
 /// Widest retrieval window that turns the live source scan on by default.
 /// Beyond this the census/index is authoritative and a live walk would only
 /// add cost without hot-window value.
@@ -264,7 +278,7 @@ impl IntentExtractionStats {
         }
         if self.source_errors > 0 {
             warnings.push(format!(
-                "{} catalog source(s) were unreadable or unsupported",
+                "{} source(s) were unreadable, unsupported, or partially covered",
                 self.source_errors
             ));
         }

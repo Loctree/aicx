@@ -54,6 +54,64 @@ identity. Editing the file makes the next `aicx index` rebuild automatically;
 an unreadable file or unsupported checkout glob/negation aborts rather than
 indexing without the deny list.
 
+## Background runtime ownership
+
+Default HTTP MCP services are reader-only on macOS, Linux, and Windows.
+Installers and onboarding do not opt the listener into
+`--experimental-auto-refresh`. That flag remains an explicit experimental
+operator choice, independent of installing or repairing a reader.
+
+On macOS, `aicx doctor --repair-runtime` preserves the configured bind, port,
+auth, allowed hosts, and log paths, repairs a missing `serve` subcommand, and
+removes embedded writer ownership. Readiness requires HTTP 200 from `/health`
+and a listener owned by the registered launchd job or its descendant.
+Failure restores the prior MCP configuration. The separate index scheduler is
+also installed transactionally; a scheduler failure reports the partial outcome
+explicitly while retaining the healthy reader and attempting to restore the
+previous schedule. Registration alone is not service health.
+
+The macOS maintenance scheduler runs `catalog refresh` and `index` in a separate
+short-lived process every 2h24m. Other platforms can invoke the same explicit
+maintenance commands; reader installation does not imply periodic indexing.
+
+## Intent query cost and freshness
+
+`intents --live` and automatically live windows of 48h or less keep fresh source
+semantics. Trusted agent metadata is filtered before unrelated sources are
+opened. Dates narrow individual utterance timestamps before classification and
+candidate caps; a session's creation date cannot exclude its recent utterances.
+
+When `CURRENT` is available, queries join catalog membership with the existing
+source-parse ledger. Unchanged extracts are reused only after checking live
+source fingerprints, ignore policy, checkout layout, source identity, and
+extract checksums. Changed, unadmitted, or unproven sources are read freshly;
+live queries retain that admission step instead of reparsing all history.
+
+Fresh source reads reuse validated whole conversations in
+`$AICX_HOME/reader-conversations-v1/`, sharing the overlay cache's validation
+rules. Stable bounded projections retain their skipped-record warning on every
+reuse. Transient partial reads are never trusted warm results. Old parse
+ledgers without coverage receipts may accelerate unchanged reads, but explicitly
+report `legacy_unknown` and incomplete coverage. No read upgrades that absence
+to complete evidence or publishes `CURRENT`.
+
+Normal maintenance keeps valid older extracts with their unknown receipts,
+parses changed or new sources, and preserves settled bounded coverage. Merely
+upgrading the reader does not trigger a full historical parse. An explicit
+`aicx index --full-rescan` upgrades old receipts from the original sources;
+run that expensive operation on the intended maintenance host.
+
+Cold or changed sources still require parsing, and live provider-root discovery
+still has a cost. `--no-live` is an explicit choice to exclude unadmitted live
+sources; it is not a repair for stale or incomplete evidence.
+Full-history requests (`-H 0`) retain the original catalog-conversation lane,
+including whole-session scope, to keep durable overlay evidence stable.
+
+For intent queries, `--since 2026-10-01` means from October 1 onward.
+`--until` supplies the inclusive upper date. Explicit ranges such as
+`--since 2026-10-01..2026-10-03` retain their bounds. The separate `--date`
+selector on retrieval commands retains its single-day semantics.
+
 ## Runtime artifacts
 
 | Surface | Purpose |

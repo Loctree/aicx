@@ -103,7 +103,8 @@ impl InstallOptions {
 /// ProgramArguments the loopback HTTP service must run (LaunchAgent / `aicx serve`).
 ///
 /// Host is always `127.0.0.1` (never `0.0.0.0`). Auth is off on loopback.
-/// Auto-refresh is the experimental opt-in — never `--no-auto-refresh`.
+/// Index maintenance remains separate; the compatibility flag makes the
+/// reader-only ownership explicit even against older binaries.
 pub fn loopback_http_argv(port: u16) -> Vec<String> {
     vec![
         "--transport".into(),
@@ -113,7 +114,7 @@ pub fn loopback_http_argv(port: u16) -> Vec<String> {
         "--port".into(),
         port.to_string(),
         "--no-require-auth".into(),
-        "--experimental-auto-refresh".into(),
+        "--no-auto-refresh".into(),
     ]
 }
 
@@ -233,7 +234,7 @@ pub fn service_definition_meets_contract(text: &str) -> bool {
         && has("127.0.0.1")
         && has("--port")
         && has("--no-require-auth")
-        && has("--experimental-auto-refresh")
+        && !has("--experimental-auto-refresh")
         && !text.contains("--transport\n    <string>stdio")
         && !text.contains("--transport stdio")
         && !text.contains("\"stdio\"")
@@ -1128,12 +1129,12 @@ mod tests {
         };
         let body = if cfg!(windows) {
             format!(
-                "$utf8 = New-Object System.Text.UTF8Encoding $false\n[System.IO.File]::WriteAllText('{}', $env:AICX_BIN, $utf8)\n[System.IO.File]::WriteAllText($env:AICX_SERVICE_UNIT, \"--transport http --host 127.0.0.1 --port 8044 --no-require-auth --experimental-auto-refresh`n\", $utf8)\nexit 0\n",
+                "$utf8 = New-Object System.Text.UTF8Encoding $false\n[System.IO.File]::WriteAllText('{}', $env:AICX_BIN, $utf8)\n[System.IO.File]::WriteAllText($env:AICX_SERVICE_UNIT, \"--transport http --host 127.0.0.1 --port 8044 --no-require-auth --no-auto-refresh`n\", $utf8)\nexit 0\n",
                 log.display().to_string().replace('\'', "''")
             )
         } else {
             format!(
-                "#!/bin/sh\nprintf '%s' \"$AICX_BIN\" > '{}'\nprintf '%s\\n' '--transport http --host 127.0.0.1 --port 8044 --no-require-auth --experimental-auto-refresh' > \"$AICX_SERVICE_UNIT\"\n",
+                "#!/bin/sh\nprintf '%s' \"$AICX_BIN\" > '{}'\nprintf '%s\\n' '--transport http --host 127.0.0.1 --port 8044 --no-require-auth --no-auto-refresh' > \"$AICX_SERVICE_UNIT\"\n",
                 log.display().to_string().replace('\'', "'\\''")
             )
         };
@@ -1292,6 +1293,21 @@ mod tests {
     }
 
     #[test]
+    fn loopback_service_contract_accepts_readers_and_rejects_embedded_writer() {
+        let reader = "--transport http --host 127.0.0.1 --port 8044 --no-require-auth";
+        assert!(service_definition_meets_contract(reader));
+        assert!(service_definition_meets_contract(&format!(
+            "{reader} --no-auto-refresh"
+        )));
+        assert!(!service_definition_meets_contract(&format!(
+            "{reader} --experimental-auto-refresh"
+        )));
+        assert!(!service_definition_meets_contract(
+            "--transport http --host 0.0.0.0 --port 8044 --no-require-auth"
+        ));
+    }
+
+    #[test]
     fn installer_invocation_uses_the_service_script() {
         let dir = std::env::temp_dir().join(format!("aicx-install-stub-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1385,30 +1401,29 @@ mod tests {
                 "--port".to_string(),
                 "8044".to_string(),
                 "--no-require-auth".to_string(),
-                "--experimental-auto-refresh".to_string(),
+                "--no-auto-refresh".to_string(),
             ]
         );
         assert!(!argv.iter().any(|arg| arg == "0.0.0.0"));
-        assert!(!argv.iter().any(|arg| arg == "--no-auto-refresh"));
+        assert!(!argv.iter().any(|arg| arg == "--experimental-auto-refresh"));
 
         let body = std::fs::read_to_string(&script).expect("read installer");
         assert_eq!(body, EMBEDDED_MCP_SERVICE_INSTALLER);
         assert!(body.contains("HOST=\"${AICX_MCP_HOST:-127.0.0.1}\""));
         assert!(body.contains("PORT=\"${AICX_MCP_PORT:-8044}\""));
-        assert!(body.contains("--experimental-auto-refresh"));
+        assert!(body.contains("--no-auto-refresh"));
         assert!(body.contains("--no-require-auth"));
         assert!(!body.contains("0.0.0.0"));
-        // Comment may mention the flag as forbidden; the ProgramArguments array must not.
         let program_args = body
             .split("<key>ProgramArguments</key>")
             .nth(1)
             .and_then(|rest| rest.split("</array>").next())
             .expect("ProgramArguments array");
         assert!(
-            !program_args.contains("--no-auto-refresh"),
-            "LaunchAgent argv must not disable auto-refresh"
+            !program_args.contains("--experimental-auto-refresh"),
+            "LaunchAgent argv must not enable the embedded writer"
         );
-        assert!(program_args.contains("--experimental-auto-refresh"));
+        assert!(program_args.contains("--no-auto-refresh"));
         assert!(program_args.contains("$HOST_XML"));
         assert!(program_args.contains("$PORT_XML"));
 
@@ -1497,7 +1512,7 @@ mod tests {
         let unit = root.join("aicx-mcp.plist");
         std::fs::write(
             &unit,
-            "--transport http --host 127.0.0.1 --port 18044 --no-require-auth --experimental-auto-refresh\n",
+            "--transport http --host 127.0.0.1 --port 18044 --no-require-auth --no-auto-refresh\n",
         )
         .unwrap();
         let previous_unit = std::env::var_os("AICX_SERVICE_UNIT");

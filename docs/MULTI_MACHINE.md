@@ -72,12 +72,17 @@ Exclude from any file-sync of `~/.aicx` (MEGA `.megaignore` syntax):
 -dN:indexed
 -dN:catalog
 -dN:extracts
+-dN:reader-conversations-v1
 -dN:tmp
 -fN:auth-token
 ```
 
 Keep `store/` and `context-corpus/` synced (durable data). Classify
 `state.json` before deciding.
+
+Validated reader-conversation caches are also machine-local. They bind to
+allowlisted source identities and the canonical AICX home, and must not be
+transported as an authority for another host's sources.
 
 Defense in depth since 2026-08-10: manifests carry `writer_version` /
 `build_id`, and both publish and search reject a provable lexical schema
