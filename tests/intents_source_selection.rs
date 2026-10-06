@@ -130,6 +130,7 @@ fn indexed_old_session_keeps_fresh_utterance_and_drops_old_utterance() {
         agent: Some("codex".to_string()),
         date_lo: Some(fresh_date),
         date_hi: Some(today),
+        full_source_scan: false,
     };
     let extraction = extract_intents_with_stats_for_projects_filtered(
         &config,
@@ -404,6 +405,51 @@ fn maintenance_republishes_legacy_unknown_then_reparses_modern_physical_drift() 
     aicx::source_index::build(&aicx_home, &[], false, true, false)
         .expect("publish initial modern CURRENT");
 
+    let query = IntentsConfig {
+        project: "aicx".to_string(),
+        hours: 100_000,
+        strict: false,
+        min_confidence: None,
+        kind_filter: None,
+        frame_kind: Some(aicx::timeline::FrameKind::UserMsg),
+        live: false,
+    };
+    let fast_filter = IntentSourceFilter {
+        agent: Some("codex".to_string()),
+        full_source_scan: false,
+        ..Default::default()
+    };
+    let initial_ledger = fs::read(&state_path).expect("read initial ledger bytes");
+    let mut missing_ledger: serde_json::Value =
+        serde_json::from_slice(&initial_ledger).expect("parse initial ledger for missing-row test");
+    missing_ledger["sessions"]
+        .as_object_mut()
+        .expect("ledger sessions object")
+        .clear();
+    fs::write(
+        &state_path,
+        serde_json::to_vec_pretty(&missing_ledger).expect("serialize missing-row ledger"),
+    )
+    .expect("write ledger without CURRENT row");
+    let missing = extract_intents_with_stats_for_projects_filtered(
+        &query,
+        &["aicx".to_string()],
+        &fast_filter,
+    )
+    .expect("bounded query with CURRENT row missing from ledger");
+    assert!(
+        missing.records.is_empty(),
+        "a cold CURRENT row without ledger proof must not trigger a raw history parse"
+    );
+    assert_eq!(missing.stats.legacy_scope_unproven, 1);
+    assert!(
+        missing
+            .selection
+            .iter()
+            .any(|row| { row.session_id == session_id && row.status == "legacy_scope_unproven" })
+    );
+    fs::write(&state_path, initial_ledger).expect("restore initial ledger");
+
     let mut transitional: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&state_path).expect("read initial ledger"))
             .expect("parse initial ledger");
@@ -437,6 +483,108 @@ fn maintenance_republishes_legacy_unknown_then_reparses_modern_physical_drift() 
     );
     assert!(current_chunk().metadata["conversation_coverage"].is_null());
 
+    let mut unproven: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&state_path).expect("read unknown ledger"))
+            .expect("parse unknown ledger");
+    unproven["sessions"]
+        .as_object_mut()
+        .and_then(|sessions| sessions.values_mut().next())
+        .expect("single unknown ledger record")["scope_unattributed"] =
+        serde_json::Value::Bool(true);
+    fs::write(
+        &state_path,
+        serde_json::to_vec_pretty(&unproven).expect("serialize unproven ledger"),
+    )
+    .expect("write unproven legacy scope");
+    let legacy_mtime = filetime::FileTime::from_last_modification_time(
+        &fs::metadata(&source).expect("legacy source metadata"),
+    );
+    let legacy_len = fs::metadata(&source).unwrap().len();
+    write_source('B');
+    assert_eq!(fs::metadata(&source).unwrap().len(), legacy_len);
+    filetime::set_file_mtime(&source, legacy_mtime).expect("restore legacy source mtime");
+
+    let fast = extract_intents_with_stats_for_projects_filtered(
+        &query,
+        &["aicx".to_string()],
+        &fast_filter,
+    )
+    .expect("fast query with explicit legacy scope hole");
+    assert!(
+        fast.records.is_empty(),
+        "legacy extract must not bypass scope"
+    );
+    assert!(fast.stats.source_errors > 0);
+    assert_eq!(fast.stats.legacy_scope_unproven, 1);
+    assert!(
+        fast.selection
+            .iter()
+            .any(|row| { row.session_id == session_id && row.status == "legacy_scope_unproven" })
+    );
+    assert!(
+        fast.stats
+            .completeness(None, fast.records.len())
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("legacy_scope_unproven"))
+    );
+
+    // With CURRENT temporarily unavailable, the ordinary catalog lane performs
+    // one checked source read and publishes the strong reader-cache proof. Put
+    // CURRENT back before the next query so the legacy index branch must use
+    // the non-filling cache peek rather than silently parsing the source.
+    let current_pointer = aicx_home.join("indexed/_all/hybrid/CURRENT");
+    let parked_pointer = aicx_home.join("indexed/_all/hybrid/CURRENT.test-parked");
+    fs::rename(&current_pointer, &parked_pointer).expect("park CURRENT pointer");
+    let checked_read = extract_intents_with_stats_for_projects_filtered(
+        &query,
+        &["aicx".to_string()],
+        &fast_filter,
+    );
+    fs::rename(&parked_pointer, &current_pointer).expect("restore CURRENT pointer");
+    let checked_read = checked_read.expect("checked catalog read warms reader cache");
+    assert!(checked_read.records.iter().any(|record| {
+        record.session_id == session_id && record.summary.contains("maintenance body B")
+    }));
+
+    let warm = extract_intents_with_stats_for_projects_filtered(
+        &query,
+        &["aicx".to_string()],
+        &fast_filter,
+    )
+    .expect("legacy index query with strong cached scope proof");
+    assert!(warm.records.iter().any(|record| {
+        record.session_id == session_id && record.summary.contains("maintenance body B")
+    }));
+    assert_eq!(warm.stats.source_errors, 0, "{:#?}", warm.selection);
+    assert_eq!(warm.stats.legacy_scope_unproven, 0);
+    assert!(warm.selection.iter().any(|row| {
+        row.session_id == session_id
+            && row.status == "qualified"
+            && row.parser_coverage.as_deref() == Some("complete_visible")
+    }));
+    assert!(
+        !warm
+            .selection
+            .iter()
+            .any(|row| row.status == "legacy_scope_unproven")
+    );
+
+    let exhaustive = extract_intents_with_stats_for_projects_filtered(
+        &query,
+        &["aicx".to_string()],
+        &IntentSourceFilter {
+            agent: Some("codex".to_string()),
+            full_source_scan: true,
+            ..Default::default()
+        },
+    )
+    .expect("explicit full source scan");
+    assert!(exhaustive.records.iter().any(|record| {
+        record.session_id == session_id && record.summary.contains("maintenance body B")
+    }));
+    assert_eq!(exhaustive.stats.source_errors, 0);
+
     let upgraded = aicx::source_index::build(&aicx_home, &[], false, true, false)
         .expect("explicit full-rescan upgrade");
     assert_eq!(upgraded.sources_parsed, 1);
@@ -453,7 +601,7 @@ fn maintenance_republishes_legacy_unknown_then_reparses_modern_physical_drift() 
         &fs::metadata(&source).expect("source metadata"),
     );
     let old_len = fs::metadata(&source).unwrap().len();
-    write_source('B');
+    write_source('C');
     assert_eq!(fs::metadata(&source).unwrap().len(), old_len);
     filetime::set_file_mtime(&source, pinned_mtime).expect("restore source mtime");
     let reparsed = aicx::source_index::build(&aicx_home, &[], false, false, false)
@@ -461,8 +609,8 @@ fn maintenance_republishes_legacy_unknown_then_reparses_modern_physical_drift() 
     assert_eq!(reparsed.sources_parsed, 1);
     assert_eq!(reparsed.sources_reused, 0);
     let current = current_chunk();
-    assert!(current.text.contains("maintenance body B"));
-    assert!(!current.text.contains("maintenance body A"));
+    assert!(current.text.contains("maintenance body C"));
+    assert!(!current.text.contains("maintenance body B"));
 
     drop(_guard);
     let _ = fs::remove_dir_all(root);

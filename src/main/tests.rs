@@ -1023,6 +1023,7 @@ fn intents_project_resolver_exact_and_fuzzy_modes_are_separate() {
         identity_source: intents::PERSISTED_IDENTITY_SOURCE.to_string(),
         path_heuristic_records: 0,
         live_sessions: 0,
+        legacy_scope_unproven: 0,
         mixed_scope_sessions: 0,
         unplaced_frames: 0,
     };
@@ -1995,6 +1996,19 @@ fn intents_accepts_frame_kind_filter() {
             assert_eq!(filters.frame_kind, Some(FrameKindArg::ToolCall));
         }
         _ => panic!("expected intents command"),
+    }
+}
+
+#[test]
+fn intents_accepts_explicit_full_rescan() {
+    let cli = Cli::try_parse_from(["aicx", "intents", "--full-rescan"])
+        .expect("intents command with full-rescan should parse");
+
+    match cli.command {
+        Some(Commands::Intents {
+            full_rescan: true, ..
+        }) => {}
+        _ => panic!("expected intents full-rescan command"),
     }
 }
 

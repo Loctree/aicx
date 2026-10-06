@@ -113,6 +113,7 @@ fn read_intent_source(
     aicx_home: &Path,
     entry: &crate::catalog::CatalogEntry,
     frame_kind: FrameKind,
+    source_filter: &IntentSourceFilter,
     source_errors: &mut usize,
     notes: &mut ScopeNotes,
 ) -> Result<(
@@ -120,8 +121,11 @@ fn read_intent_source(
     Vec<TimelineEntry>,
     crate::extraction::conversation::ScopeReport,
 )> {
-    let (path, mut frames, scope, coverage) =
-        crate::overlay::read_cached_catalog_conversation_at(aicx_home, entry)?;
+    let (path, mut frames, scope, coverage) = if source_filter.full_source_scan {
+        crate::source_index::read_catalog_conversation_checked_at(aicx_home, entry)?
+    } else {
+        crate::overlay::read_cached_catalog_conversation_at(aicx_home, entry)?
+    };
     notes.coverage.insert(
         (entry.agent.clone(), entry.session_id.clone()),
         coverage.receipt_label(),
@@ -138,6 +142,67 @@ fn read_intent_source(
     }
     frames.retain(|frame| crate::source_index::frame_matches_kind(frame, frame_kind));
     Ok((path, frames, scope))
+}
+
+#[cfg(feature = "app")]
+enum LegacyScopeCacheResult {
+    Miss,
+    Hit {
+        file: Option<StoredChunkFile>,
+        live_row: bool,
+    },
+}
+
+/// A legacy index row cannot prove its own scope, but an existing reader-cache
+/// entry can: that cache binds current source bytes, parser policy and the
+/// whole-session scope receipt. Inspect it without parsing on a miss, then run
+/// the same role, project and time qualification as an ordinary source read.
+#[cfg(feature = "app")]
+fn peek_legacy_scope_file(
+    aicx_home: &Path,
+    entry: &crate::catalog::CatalogEntry,
+    cutoff: DateTime<Utc>,
+    frame_kind: FrameKind,
+    live: bool,
+    source_filter: &IntentSourceFilter,
+    source_errors: &mut usize,
+    notes: &mut ScopeNotes,
+) -> Result<LegacyScopeCacheResult> {
+    let Some((source_path, mut frames, scope, coverage)) =
+        crate::overlay::peek_cached_catalog_conversation_at(aicx_home, entry)?
+    else {
+        return Ok(LegacyScopeCacheResult::Miss);
+    };
+    notes.coverage.insert(
+        (entry.agent.clone(), entry.session_id.clone()),
+        coverage.receipt_label(),
+    );
+    if !matches!(
+        coverage,
+        crate::source_index::ConversationCoverage::CompleteVisible
+    ) {
+        *source_errors += 1;
+        crate::diagnostics::log_describe(&format!(
+            "intents_partial_legacy_cache agent={} session_id={} coverage={coverage:?}",
+            entry.agent, entry.session_id
+        ));
+    }
+    frames.retain(|frame| crate::source_index::frame_matches_kind(frame, frame_kind));
+    let in_window = frames.iter().any(|frame| {
+        frame_has_conversation_time(frame)
+            && frame.timestamp >= cutoff
+            && frame.timestamp <= notes.now.unwrap_or_else(Utc::now)
+    });
+    let live_row = session_is_hot_live(live, in_window);
+    let file = catalog_frames_to_intent_file(
+        entry,
+        (source_path, frames, scope),
+        cutoff,
+        live_row,
+        source_filter,
+        notes,
+    );
+    Ok(LegacyScopeCacheResult::Hit { file, live_row })
 }
 
 pub fn extract_intents(config: &IntentsConfig) -> Result<Vec<IntentRecord>> {
@@ -347,7 +412,7 @@ fn extract_intents_from_files_with_stats(
         ..
     } = notes;
     let mut selection = selection;
-    materialize_transcripts_for_admission(&mut files, config, source_filter, now);
+    materialize_transcripts_for_admission(&mut files, config, source_filter, now)?;
     order_files_for_admission(&mut files);
     for file in &files {
         let path = file.path.to_string_lossy().into_owned();
@@ -425,6 +490,10 @@ fn extract_intents_from_files_with_stats(
             file.transcript_entries.as_ref()
         {
             (Vec::new(), transcript_entries.clone())
+        } else if let Some(transcript_entries) =
+            validated_extract_transcript_entries(&file, config.effective_frame_kind())?
+        {
+            (Vec::new(), transcript_entries)
         } else if let Some(body) = file.body.as_ref() {
             // Served from the committed index: the document is already in
             // memory and needs no disk read or transcript re-parse.
@@ -549,6 +618,10 @@ fn extract_intents_from_files_with_stats(
     reconcile_session_id_with_path(&mut records);
 
     sort_intent_records(&mut records);
+    let legacy_scope_unproven = selection
+        .iter()
+        .filter(|source| source.status == "legacy_scope_unproven")
+        .count();
 
     let stats = IntentExtractionStats {
         scanned_count,
@@ -562,6 +635,7 @@ fn extract_intents_from_files_with_stats(
         identity_source,
         path_heuristic_records,
         live_sessions,
+        legacy_scope_unproven,
         mixed_scope_sessions: mixed_scope.len(),
         unplaced_frames: unplaced_scope.iter().map(|session| session.frames).sum(),
     };
@@ -573,6 +647,29 @@ fn extract_intents_from_files_with_stats(
         mixed_scope,
         unplaced_scope,
     })
+}
+
+#[cfg(feature = "app")]
+fn validated_extract_transcript_entries(
+    file: &StoredChunkFile,
+    wanted: FrameKind,
+) -> Result<Option<Vec<TranscriptEntry>>> {
+    let Some(validated) = file.validated_extract.as_ref() else {
+        return Ok(None);
+    };
+    let body = validated.read_verified_body()?;
+    let mut transcript_entries = parse_extract_document(&body);
+    transcript_entries
+        .retain(|entry| FrameKind::parse(&entry.role).is_some_and(|kind| kind == wanted));
+    Ok(Some(transcript_entries))
+}
+
+#[cfg(not(feature = "app"))]
+fn validated_extract_transcript_entries(
+    _file: &StoredChunkFile,
+    _wanted: FrameKind,
+) -> Result<Option<Vec<TranscriptEntry>>> {
+    Ok(None)
 }
 
 pub(crate) fn extract_intents_from_root_at_for_projects_with_stats(
@@ -617,6 +714,7 @@ pub(crate) fn extract_intents_from_root_at_for_projects_with_stats_filtered(
     let mut identity_source = PERSISTED_IDENTITY_SOURCE.to_string();
     let mut path_heuristic_records = 0usize;
     let mut live_sessions = 0usize;
+    let mut legacy_scope_unproven = 0usize;
     let mut mixed_scope: Vec<MixedScopeSession> = Vec::new();
     let mut unplaced_scope: Vec<UnplacedScopeSession> = Vec::new();
 
@@ -666,6 +764,7 @@ pub(crate) fn extract_intents_from_root_at_for_projects_with_stats_filtered(
         matched_project_buckets.extend(extraction.stats.matched_project_buckets);
         path_heuristic_records += extraction.stats.path_heuristic_records;
         live_sessions += extraction.stats.live_sessions;
+        legacy_scope_unproven += extraction.stats.legacy_scope_unproven;
         if extraction.stats.identity_source == PATH_HEURISTIC_IDENTITY_SOURCE {
             identity_source = PATH_HEURISTIC_IDENTITY_SOURCE.to_string();
         } else if extraction.stats.identity_source == CATALOG_IDENTITY_SOURCE
@@ -695,6 +794,7 @@ pub(crate) fn extract_intents_from_root_at_for_projects_with_stats_filtered(
         identity_source,
         path_heuristic_records,
         live_sessions,
+        legacy_scope_unproven,
         mixed_scope_sessions: mixed_scope.len(),
         unplaced_frames: unplaced_scope.iter().map(|session| session.frames).sum(),
     };
@@ -754,10 +854,12 @@ fn transcript_human_messages(entries: &[TranscriptEntry]) -> usize {
 }
 
 fn file_human_messages(file: &StoredChunkFile) -> usize {
-    file.transcript_entries
-        .as_deref()
-        .map(transcript_human_messages)
-        .unwrap_or(0)
+    file.admission_human_messages.unwrap_or_else(|| {
+        file.transcript_entries
+            .as_deref()
+            .map(transcript_human_messages)
+            .unwrap_or(0)
+    })
 }
 
 /// Parse index bodies once, narrow them the way the candidate loop does, and
@@ -768,16 +870,35 @@ fn materialize_transcripts_for_admission(
     config: &IntentsConfig,
     source_filter: &IntentSourceFilter,
     now: Option<DateTime<Utc>>,
-) {
+) -> Result<()> {
     let wanted = config.effective_frame_kind();
+    let cutoff = now.map(|now| window_cutoff(now, config.hours));
     for file in files.iter_mut() {
+        #[cfg(feature = "app")]
         if file.transcript_entries.is_none()
-            && let Some(body) = file.body.take()
+            && file.admission_human_messages.is_none()
+            && let Some(validated) = file.validated_extract.as_ref()
         {
-            let mut entries = parse_extract_document(&body);
-            entries
-                .retain(|entry| FrameKind::parse(&entry.role).is_some_and(|kind| kind == wanted));
-            file.transcript_entries = Some(entries);
+            let body = validated.read_verified_body()?;
+            let admission = scan_extract_admission(&body, wanted, cutoff, now, source_filter);
+            file.admission_human_messages = Some(admission.human_messages);
+            if let Some(latest) = admission.latest {
+                file.timestamp = latest;
+                file.date = latest.format("%Y-%m-%d").to_string();
+            }
+            continue;
+        }
+        if file.transcript_entries.is_none()
+            && file.admission_human_messages.is_none()
+            && let Some(body) = file.body.as_ref()
+        {
+            let admission = scan_extract_admission(body, wanted, cutoff, now, source_filter);
+            file.admission_human_messages = Some(admission.human_messages);
+            if let Some(latest) = admission.latest {
+                file.timestamp = latest;
+                file.date = latest.format("%Y-%m-%d").to_string();
+            }
+            continue;
         }
         if let Some(now) = now
             && let Some(entries) = file.transcript_entries.as_mut()
@@ -812,7 +933,63 @@ fn materialize_transcripts_for_admission(
             file.timestamp = latest;
             file.date = latest.format("%Y-%m-%d").to_string();
         }
+        file.admission_human_messages = Some(file_human_messages(file));
     }
+    Ok(())
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ExtractAdmission {
+    parsed_frames: usize,
+    qualified_frames: usize,
+    human_messages: usize,
+    latest: Option<DateTime<Utc>>,
+}
+
+fn scan_extract_admission(
+    content: &str,
+    wanted: FrameKind,
+    cutoff: Option<DateTime<Utc>>,
+    now: Option<DateTime<Utc>>,
+    source_filter: &IntentSourceFilter,
+) -> ExtractAdmission {
+    const ROLE_SEPARATOR: &str = " · ";
+    let mut admission = ExtractAdmission::default();
+    for line in content.lines() {
+        let Some(heading) = line.trim().strip_prefix("## ") else {
+            continue;
+        };
+        let Some((timestamp, role)) = heading.rsplit_once(ROLE_SEPARATOR) else {
+            continue;
+        };
+        let Some(kind) = FrameKind::parse(role.trim()) else {
+            continue;
+        };
+        if kind != wanted {
+            continue;
+        }
+        admission.parsed_frames += 1;
+        let Ok(timestamp) = DateTime::parse_from_rfc3339(timestamp.trim()) else {
+            continue;
+        };
+        let timestamp = timestamp.with_timezone(&Utc);
+        if let (Some(cutoff), Some(now)) = (cutoff, now)
+            && (timestamp < cutoff || timestamp > now)
+        {
+            continue;
+        }
+        if !source_date_matches_filter(&timestamp.format("%Y-%m-%d").to_string(), source_filter) {
+            continue;
+        }
+        admission.qualified_frames += 1;
+        admission.human_messages += usize::from(is_user_role(role.trim()));
+        admission.latest = Some(
+            admission
+                .latest
+                .map_or(timestamp, |seen| seen.max(timestamp)),
+        );
+    }
+    admission
 }
 
 /// Heavier human speech is admitted before a newer thin file. Equal weight
@@ -990,7 +1167,7 @@ fn collect_intent_files_from_index(
     source_filter: &IntentSourceFilter,
     notes: &mut ScopeNotes,
 ) -> Option<(Vec<StoredChunkFile>, usize, usize)> {
-    if config.hours == 0 {
+    if config.hours == 0 || source_filter.full_source_scan {
         return None;
     }
     let project = &config.project;
@@ -1081,8 +1258,11 @@ fn collect_intent_files_from_index(
         .filter(|entry| current_ids.contains(&(entry.agent.clone(), entry.session_id.clone())))
         .cloned()
         .collect::<Vec<_>>();
-    let mut validated =
+    let validated_batch =
         crate::source_index::validated_cached_extracts_at(aicx_home, &candidates).ok()?;
+    let mut validated = validated_batch.extracts;
+    let legacy_layout_unproven = validated_batch.legacy_scope_unproven;
+    let ledger_unproven = validated_batch.ledger_unproven;
     let mut files = Vec::with_capacity(selected.len());
     let mut live_sessions = 0usize;
     let mut seen_sessions = BTreeSet::new();
@@ -1090,10 +1270,59 @@ fn collect_intent_files_from_index(
     for entry in selected {
         let key = (entry.agent.clone(), entry.session_id.clone());
         seen_sessions.insert(key.clone());
-        let reusable = validated.remove(&key).filter(|validated| {
-            chunk_states_scope(&validated.chunk.metadata)
+        let cold_deferral_reason = if legacy_layout_unproven.contains(&key) {
+            Some("layout")
+        } else if ledger_unproven.contains(&key) {
+            Some("ledger")
+        } else {
+            None
+        };
+        if let Some(reason) = cold_deferral_reason {
+            match peek_legacy_scope_file(
+                aicx_home,
+                &entry,
+                cutoff,
+                frame_kind,
+                live,
+                source_filter,
+                &mut source_errors,
+                notes,
+            ) {
+                Ok(LegacyScopeCacheResult::Hit { file, live_row }) => {
+                    if let Some(file) = file {
+                        if live_row {
+                            live_sessions += 1;
+                        }
+                        files.push(file);
+                    }
+                    continue;
+                }
+                Ok(LegacyScopeCacheResult::Miss) => {}
+                Err(error) => crate::diagnostics::log_describe(&format!(
+                    "intents_legacy_cache_peek_skip agent={} session_id={} reason={} error={error:#}",
+                    entry.agent, entry.session_id, reason
+                )),
+            }
+            source_errors += 1;
+            notes.coverage.insert(key, "legacy_unknown".to_string());
+            let mut receipt = source_receipt(&entry, true, "legacy_scope_unproven");
+            receipt.parser_coverage = Some("legacy_unknown".to_string());
+            notes.selection.push(receipt);
+            crate::diagnostics::log_describe(&format!(
+                "intents_legacy_scope_unproven agent={} session_id={} reason={}",
+                entry.agent, entry.session_id, reason
+            ));
+            continue;
+        }
+        let validated_candidate = validated.remove(&key);
+        let reuse_safe = validated_candidate.as_ref().is_some_and(|validated| {
+            chunk_states_scope(&validated.metadata)
                 && !validated
-                    .chunk
+                    .metadata
+                    .get("scope_conflict")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(true)
+                && !validated
                     .metadata
                     .get("scope_unattributed")
                     .and_then(|value| value.as_bool())
@@ -1104,12 +1333,58 @@ fn collect_intent_files_from_index(
                     .is_none_or(|scope| !scope.scope_foreign_to(entry.cwd.as_deref()))
                 && !crate::sessions::is_guardian_session_kind(
                     validated
-                        .chunk
                         .metadata
                         .get("session_kind")
                         .and_then(|value| value.as_str()),
                 )
         });
+        if let Some(validated) = validated_candidate.as_ref()
+            && !reuse_safe
+            && matches!(
+                &validated.coverage,
+                crate::source_index::ConversationCoverage::LegacyUnknown
+            )
+        {
+            match peek_legacy_scope_file(
+                aicx_home,
+                &entry,
+                cutoff,
+                frame_kind,
+                live,
+                source_filter,
+                &mut source_errors,
+                notes,
+            ) {
+                Ok(LegacyScopeCacheResult::Hit { file, live_row }) => {
+                    if let Some(file) = file {
+                        if live_row {
+                            live_sessions += 1;
+                        }
+                        files.push(file);
+                    }
+                    continue;
+                }
+                Ok(LegacyScopeCacheResult::Miss) => {}
+                Err(error) => crate::diagnostics::log_describe(&format!(
+                    "intents_legacy_cache_peek_skip agent={} session_id={} error={error:#}",
+                    entry.agent, entry.session_id
+                )),
+            }
+            source_errors += 1;
+            notes
+                .coverage
+                .insert(key.clone(), validated.coverage.receipt_label());
+            let mut receipt = source_receipt(&entry, true, "legacy_scope_unproven");
+            receipt.path = validated.extract_path.to_string_lossy().into_owned();
+            receipt.parser_coverage = Some(validated.coverage.receipt_label());
+            notes.selection.push(receipt);
+            crate::diagnostics::log_describe(&format!(
+                "intents_legacy_scope_unproven agent={} session_id={}",
+                entry.agent, entry.session_id
+            ));
+            continue;
+        }
+        let reusable = validated_candidate.filter(|_| reuse_safe);
 
         if let Some(validated) = reusable {
             if !matches!(
@@ -1125,7 +1400,7 @@ fn collect_intent_files_from_index(
             notes
                 .coverage
                 .insert(key, validated.coverage.receipt_label());
-            if let Some(file) = indexed_extract_to_intent_file(
+            match indexed_extract_to_intent_file(
                 &entry,
                 validated,
                 cutoff,
@@ -1134,18 +1409,29 @@ fn collect_intent_files_from_index(
                 source_filter,
                 notes,
             ) {
-                if live {
-                    live_sessions += 1;
+                Ok(Some(file)) => {
+                    if live {
+                        live_sessions += 1;
+                    }
+                    files.push(file);
+                    continue;
                 }
-                files.push(file);
+                Ok(None) => continue,
+                Err(error) => {
+                    source_errors += 1;
+                    crate::diagnostics::log_describe(&format!(
+                        "intents_index_extract_recheck agent={} session_id={} error={error:#}",
+                        entry.agent, entry.session_id
+                    ));
+                }
             }
-            continue;
         }
 
         let (source_path, frames, scope) = match read_intent_source(
             aicx_home,
             &entry,
             frame_kind,
+            source_filter,
             &mut source_errors,
             notes,
         ) {
@@ -1215,49 +1501,30 @@ fn indexed_extract_to_intent_file(
     live: bool,
     source_filter: &IntentSourceFilter,
     notes: &mut ScopeNotes,
-) -> Option<StoredChunkFile> {
+) -> Result<Option<StoredChunkFile>> {
     let mut receipt = source_receipt(entry, true, "no_frames");
-    receipt.path = validated.chunk.source_path.clone();
+    receipt.path = validated.extract_path.to_string_lossy().into_owned();
     receipt.parser_coverage = Some(validated.coverage.receipt_label());
     let Some(project) = entry.project.clone() else {
         receipt.status = "project_excluded".into();
         notes.selection.push(receipt);
-        return None;
+        return Ok(None);
     };
-
-    let mut entries = parse_extract_document(&validated.chunk.text);
-    entries.retain(|item| FrameKind::parse(&item.role).is_some_and(|kind| kind == frame_kind));
-    receipt.parsed_frames = entries.len();
-    receipt.scoped_frames = entries.len();
-    receipt.unknown_time_frames = entries
-        .iter()
-        .filter(|item| item.timestamp.is_none())
-        .count();
     let now = notes.now.unwrap_or_else(Utc::now);
-    entries.retain(|item| {
-        item.timestamp.is_some_and(|timestamp| {
-            timestamp >= cutoff
-                && timestamp <= now
-                && source_date_matches_filter(
-                    &timestamp.format("%Y-%m-%d").to_string(),
-                    source_filter,
-                )
-        })
-    });
-    receipt.qualified_frames = entries.len();
-    receipt.outside_window_frames = receipt
+    let body = validated.read_verified_body()?;
+    let admission =
+        scan_extract_admission(&body, frame_kind, Some(cutoff), Some(now), source_filter);
+    receipt.parsed_frames = admission.parsed_frames;
+    receipt.scoped_frames = admission.parsed_frames;
+    receipt.qualified_frames = admission.qualified_frames;
+    receipt.outside_window_frames = admission
         .parsed_frames
-        .saturating_sub(receipt.qualified_frames + receipt.unknown_time_frames);
-    receipt.latest_activity = entries
-        .iter()
-        .filter_map(|item| item.timestamp)
-        .max()
-        .map(|timestamp| timestamp.to_rfc3339());
-    receipt.status = if entries.is_empty() {
+        .saturating_sub(admission.qualified_frames);
+    receipt.latest_activity = admission.latest.map(|timestamp| timestamp.to_rfc3339());
+    receipt.human_messages = admission.human_messages;
+    receipt.status = if admission.qualified_frames == 0 {
         if receipt.parsed_frames == 0 {
             "no_frames"
-        } else if receipt.unknown_time_frames == receipt.parsed_frames {
-            "unknown_time"
         } else {
             "outside_window"
         }
@@ -1266,12 +1533,14 @@ fn indexed_extract_to_intent_file(
     }
     .into();
     notes.selection.push(receipt);
-    let timestamp = entries.iter().filter_map(|item| item.timestamp).max()?;
+    let Some(timestamp) = admission.latest else {
+        return Ok(None);
+    };
 
-    Some(StoredChunkFile {
+    Ok(Some(StoredChunkFile {
         agent: entry.agent.clone(),
         date: timestamp.format("%Y-%m-%d").to_string(),
-        path: PathBuf::from(validated.chunk.source_path),
+        path: validated.extract_path.clone(),
         project,
         identity_source: INDEX_IDENTITY_SOURCE.to_string(),
         sequence: 0,
@@ -1282,10 +1551,12 @@ fn indexed_extract_to_intent_file(
         } else {
             crate::oracle::ClaimHonesty::canonical()
         },
-        scope: validated.scope,
-        transcript_entries: Some(entries),
+        scope: validated.scope.clone(),
+        transcript_entries: None,
+        admission_human_messages: Some(admission.human_messages),
+        validated_extract: Some(validated),
         body: None,
-    })
+    }))
 }
 
 /// Apply the caller's `-p` predicate to one stored project address.
@@ -1369,21 +1640,27 @@ fn collect_intent_files(
                 .push(source_receipt(&entry, true, "control_plane"));
             continue;
         }
-        let (source_path, frames, scope) =
-            match read_intent_source(aicx_home, &entry, frame_kind, &mut source_errors, notes) {
-                Ok(result) => result,
-                Err(error) => {
-                    source_errors += 1;
-                    notes
-                        .selection
-                        .push(source_receipt(&entry, true, "source_error"));
-                    crate::diagnostics::log_describe(&format!(
-                        "intents_source_skip agent={} session_id={} path={} error={error:#}",
-                        entry.agent, entry.session_id, entry.source_path
-                    ));
-                    continue;
-                }
-            };
+        let (source_path, frames, scope) = match read_intent_source(
+            aicx_home,
+            &entry,
+            frame_kind,
+            source_filter,
+            &mut source_errors,
+            notes,
+        ) {
+            Ok(result) => result,
+            Err(error) => {
+                source_errors += 1;
+                notes
+                    .selection
+                    .push(source_receipt(&entry, true, "source_error"));
+                crate::diagnostics::log_describe(&format!(
+                    "intents_source_skip agent={} session_id={} path={} error={error:#}",
+                    entry.agent, entry.session_id, entry.source_path
+                ));
+                continue;
+            }
+        };
         let in_window = frames.iter().any(|frame| {
             frame_has_conversation_time(frame)
                 && frame.timestamp >= cutoff
@@ -1595,6 +1872,8 @@ fn catalog_frames_to_intent_file(
                 })
                 .collect(),
         ),
+        admission_human_messages: None,
+        validated_extract: None,
         body: None,
     })
 }
@@ -1749,21 +2028,27 @@ fn collect_live_unadmitted_files(
                 .push(source_receipt(&entry, false, "project_excluded"));
             continue;
         }
-        let (source_path, frames, scope) =
-            match read_intent_source(aicx_home, &entry, frame_kind, source_errors, notes) {
-                Ok(result) => result,
-                Err(error) => {
-                    *source_errors += 1;
-                    notes
-                        .selection
-                        .push(source_receipt(&entry, false, "source_error"));
-                    crate::diagnostics::log_describe(&format!(
-                        "intents_live_source_skip agent={} session_id={} error={error:#}",
-                        entry.agent, entry.session_id
-                    ));
-                    continue;
-                }
-            };
+        let (source_path, frames, scope) = match read_intent_source(
+            aicx_home,
+            &entry,
+            frame_kind,
+            source_filter,
+            source_errors,
+            notes,
+        ) {
+            Ok(result) => result,
+            Err(error) => {
+                *source_errors += 1;
+                notes
+                    .selection
+                    .push(source_receipt(&entry, false, "source_error"));
+                crate::diagnostics::log_describe(&format!(
+                    "intents_live_source_skip agent={} session_id={} error={error:#}",
+                    entry.agent, entry.session_id
+                ));
+                continue;
+            }
+        };
         let selection_before = notes.selection.len();
         if let Some(mut file) = catalog_frames_to_intent_file(
             &entry,
@@ -2088,6 +2373,9 @@ fn collect_legacy_chunk_files(
             honesty,
             scope: None,
             transcript_entries: None,
+            admission_human_messages: None,
+            #[cfg(feature = "app")]
+            validated_extract: None,
             body: None,
         });
     }

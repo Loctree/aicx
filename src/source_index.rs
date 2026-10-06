@@ -306,11 +306,67 @@ fn maintenance_record_settled(record: &SessionParseRecord) -> bool {
         .is_some_and(ConversationCoverage::cacheable)
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct ValidatedSourceExtract {
-    pub chunk: aicx_retrieve::ChunkRef,
+    aicx_home: PathBuf,
+    pub extract_path: PathBuf,
+    pub metadata: serde_json::Value,
     pub coverage: ConversationCoverage,
     pub scope: Option<crate::extraction::conversation::ScopeReport>,
+    extract_sha256: String,
+    source_path: PathBuf,
+    source_fingerprint: crate::session_catalog::SourceFingerprint,
+    repo_path_ignore_fingerprint: String,
+    scope_entry: CatalogEntry,
+    scope_receipt: ConversationScopeReceipt,
+}
+
+pub(crate) struct ValidatedSourceExtracts {
+    pub extracts: HashMap<(String, String), ValidatedSourceExtract>,
+    pub legacy_scope_unproven: BTreeSet<(String, String)>,
+    pub ledger_unproven: BTreeSet<(String, String)>,
+}
+
+impl ValidatedSourceExtract {
+    fn verify_policy_and_scope(&self, phase: &str) -> Result<()> {
+        let user_home = crate::os_user_home().unwrap_or_else(|| self.aicx_home.clone());
+        let ignore = crate::legacy_archive::load_repo_path_ignore(&self.aicx_home, &user_home)?;
+        if ignore.fingerprint() != self.repo_path_ignore_fingerprint {
+            anyhow::bail!("validated intent privacy policy changed {phase} extract read");
+        }
+        if !conversation_scope_receipt_is_current(&self.scope_entry, &self.scope_receipt) {
+            anyhow::bail!("validated intent repository layout changed {phase} extract read");
+        }
+        Ok(())
+    }
+
+    pub(crate) fn read_verified_body(&self) -> Result<String> {
+        let user_home = crate::os_user_home().unwrap_or_else(|| self.aicx_home.clone());
+        let allow = crate::source_path::SourceAllowlist::for_operator(&user_home, &self.aicx_home);
+        let resolved = allow.resolve_file(&self.source_path)?;
+        if resolved != self.source_path || allow.open_file(&resolved).is_err() {
+            anyhow::bail!("validated intent source changed readability or resolved path");
+        }
+        let Some(before) = crate::catalog::live_source_bundle_fingerprint(&resolved) else {
+            anyhow::bail!("validated intent source fingerprint is unavailable");
+        };
+        if before != self.source_fingerprint {
+            anyhow::bail!("validated intent source changed before extract read");
+        }
+        self.verify_policy_and_scope("before")?;
+        let body = crate::source_path::read_under_aicx_home(&self.aicx_home, &self.extract_path)?;
+        if body.trim().is_empty() || sha256_hex(body.as_bytes()) != self.extract_sha256 {
+            anyhow::bail!("validated intent extract checksum mismatch");
+        }
+        let Some(after) = crate::catalog::live_source_bundle_fingerprint(&resolved) else {
+            anyhow::bail!("validated intent source fingerprint disappeared after extract read");
+        };
+        if after != before {
+            anyhow::bail!("validated intent source changed during extract read");
+        }
+        self.verify_policy_and_scope("after")?;
+        Ok(body)
+    }
 }
 
 /// Scope-layout evidence captured before signal projection. The reduced
@@ -1347,7 +1403,7 @@ fn read_session_document(aicx_home: &Path, entry: &CatalogEntry) -> Result<Sessi
 pub(crate) fn validated_cached_extracts_at(
     aicx_home: &Path,
     entries: &[CatalogEntry],
-) -> Result<HashMap<(String, String), ValidatedSourceExtract>> {
+) -> Result<ValidatedSourceExtracts> {
     let user_home = crate::os_user_home().unwrap_or_else(|| aicx_home.to_path_buf());
     let ignore = crate::legacy_archive::load_repo_path_ignore(aicx_home, &user_home)?;
     let repo_path_ignore_fingerprint = ignore.fingerprint();
@@ -1355,10 +1411,13 @@ pub(crate) fn validated_cached_extracts_at(
     let prior_state = load_parse_state(aicx_home, &repo_path_ignore_fingerprint);
     let mut layout = ScopeLayoutProbe::default();
     let mut validated = HashMap::new();
+    let mut legacy_scope_unproven = BTreeSet::new();
+    let mut ledger_unproven = BTreeSet::new();
 
     for entry in entries {
         let session_key = session_state_key(&entry.agent, &entry.session_id);
         let Some(record) = prior_state.sessions.get(&session_key) else {
+            ledger_unproven.insert((entry.agent.clone(), entry.session_id.clone()));
             continue;
         };
         // Intent reads may never fall back to catalog-stamped fingerprints:
@@ -1378,6 +1437,16 @@ pub(crate) fn validated_cached_extracts_at(
                 && live.physical_identity != record.source_physical_identity)
             || live.bundle_fingerprint != record.source_bundle_fingerprint
         {
+            continue;
+        }
+        let legacy = record.source_physical_identity.is_empty();
+        let scope_layout_current = record.scope_environment
+            == layout.fingerprint(entry.cwd.as_deref(), &record.scope_paths);
+        if legacy
+            && record.source_path == entry.source_path
+            && (record.cwd != entry.cwd || !scope_layout_current)
+        {
+            legacy_scope_unproven.insert((entry.agent.clone(), entry.session_id.clone()));
             continue;
         }
         let Some(chunk) = try_reuse_cached_extract(
@@ -1409,13 +1478,32 @@ pub(crate) fn validated_cached_extracts_at(
         validated.insert(
             (entry.agent.clone(), entry.session_id.clone()),
             ValidatedSourceExtract {
-                chunk,
+                aicx_home: aicx_home.to_path_buf(),
+                extract_path: PathBuf::from(chunk.source_path),
+                metadata: serde_json::json!({
+                    "scope_conflict": chunk.metadata.get("scope_conflict").cloned(),
+                    "scope_unattributed": chunk.metadata.get("scope_unattributed").cloned(),
+                    "session_kind": chunk.metadata.get("session_kind").cloned(),
+                }),
                 coverage,
                 scope: record.scope.clone(),
+                extract_sha256: record.extract_sha256.clone(),
+                source_path: live_path,
+                source_fingerprint: live,
+                repo_path_ignore_fingerprint: repo_path_ignore_fingerprint.clone(),
+                scope_entry: entry.clone(),
+                scope_receipt: ConversationScopeReceipt {
+                    recorded_workdirs: record.scope_paths.clone(),
+                    scope_environment: record.scope_environment.clone(),
+                },
             },
         );
     }
-    Ok(validated)
+    Ok(ValidatedSourceExtracts {
+        extracts: validated,
+        legacy_scope_unproven,
+        ledger_unproven,
+    })
 }
 
 fn matching_line_numbers(body: &str, query: &str, literal: bool) -> Result<Vec<usize>> {
@@ -4208,8 +4296,12 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         let source = root.join("sources/session.jsonl");
         let extract = root.join("extracts/codex/session_conversation.md");
+        let workspace = root.join("workspaces/aicx");
+        let nested = workspace.join("vendor/fleet-bus");
         fs::create_dir_all(source.parent().unwrap()).unwrap();
         fs::create_dir_all(extract.parent().unwrap()).unwrap();
+        fs::create_dir_all(workspace.join(".git")).unwrap();
+        fs::create_dir_all(&nested).unwrap();
         fs::write(&source, "source bytes\n").unwrap();
         let body = "# AICX session extract\n\n## 2026-10-06T00:00:00.000Z · user\n\nDecision: retain legacy evidence\n";
         fs::write(&extract, body).unwrap();
@@ -4220,7 +4312,7 @@ mod tests {
             agent: "codex".to_string(),
             project: Some("vetcoders/aicx".to_string()),
             date: Some("2026-10-06".to_string()),
-            cwd: None,
+            cwd: Some(workspace.to_string_lossy().into_owned()),
             source_path: source.display().to_string(),
             source_len: Some(fingerprint.len),
             source_mtime_ns: Some(fingerprint.modified_unix_nanos as u64),
@@ -4253,12 +4345,15 @@ mod tests {
                     filtered_frames: 0,
                     project: entry.project.clone(),
                     date: entry.date.clone(),
-                    cwd: None,
+                    cwd: entry.cwd.clone(),
                     scope_conflict: false,
                     scope_unattributed: false,
                     session_kind: None,
-                    scope_environment: ScopeLayoutProbe::default().fingerprint(None, &[]),
-                    scope_paths: Vec::new(),
+                    scope_environment: ScopeLayoutProbe::default().fingerprint(
+                        entry.cwd.as_deref(),
+                        &[nested.to_string_lossy().into_owned()],
+                    ),
+                    scope_paths: vec![nested.to_string_lossy().into_owned()],
                     coverage: None,
                     scope: None,
                 },
@@ -4268,10 +4363,52 @@ mod tests {
 
         let validated = validated_cached_extracts_at(&root, std::slice::from_ref(&entry)).unwrap();
         let legacy = validated
+            .extracts
             .get(&(entry.agent.clone(), entry.session_id.clone()))
             .expect("legacy ledger still proves exact bytes and policy");
         assert_eq!(legacy.coverage, ConversationCoverage::LegacyUnknown);
         assert!(legacy.scope.is_none());
+        assert!(legacy.metadata.get("preview_lines").is_none());
+        assert!(legacy.extract_path.ends_with("session_conversation.md"));
+        assert_eq!(legacy.read_verified_body().unwrap(), body);
+
+        fs::write(
+            root.join(crate::legacy_archive::AICX_IGNORE_FILENAME),
+            format!("{}\n", workspace.display()),
+        )
+        .unwrap();
+        assert!(
+            legacy
+                .read_verified_body()
+                .unwrap_err()
+                .to_string()
+                .contains("privacy policy changed before extract read"),
+            "a lazy handle must not outlive the privacy policy it was validated under"
+        );
+        fs::write(root.join(crate::legacy_archive::AICX_IGNORE_FILENAME), "").unwrap();
+        assert_eq!(legacy.read_verified_body().unwrap(), body);
+
+        fs::create_dir_all(nested.join(".git")).unwrap();
+        assert!(
+            legacy
+                .read_verified_body()
+                .unwrap_err()
+                .to_string()
+                .contains("repository layout changed before extract read"),
+            "a lazy handle must not outlive the scope layout it was validated under"
+        );
+        fs::remove_dir(nested.join(".git")).unwrap();
+        assert_eq!(legacy.read_verified_body().unwrap(), body);
+
+        let mut moved = entry.clone();
+        moved.cwd = Some("/different/catalog/scope".to_string());
+        let deferred = validated_cached_extracts_at(&root, std::slice::from_ref(&moved)).unwrap();
+        assert!(deferred.extracts.is_empty());
+        assert!(
+            deferred
+                .legacy_scope_unproven
+                .contains(&(moved.agent.clone(), moved.session_id.clone()))
+        );
         assert!(
             maintenance_record_reusable(state.sessions.values().next().unwrap()),
             "normal maintenance must reuse unchanged legacy extracts without a historical reparse"
@@ -4304,6 +4441,7 @@ mod tests {
         assert_eq!(
             validated_cached_extracts_at(&root, std::slice::from_ref(&entry))
                 .unwrap()
+                .extracts
                 .values()
                 .next()
                 .unwrap()
@@ -4323,6 +4461,7 @@ mod tests {
         assert!(
             validated_cached_extracts_at(&root, std::slice::from_ref(&entry))
                 .unwrap()
+                .extracts
                 .is_empty(),
             "modern ledger must reject same-size restored-mtime source drift"
         );

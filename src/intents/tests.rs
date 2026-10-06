@@ -1095,6 +1095,7 @@ fn source_date_filter_keeps_new_utterance_in_old_session_and_cache_tracks_append
         agent: Some("claude".to_string()),
         date_lo: Some("2026-10-02".to_string()),
         date_hi: Some("2026-10-02".to_string()),
+        full_source_scan: false,
     };
     let now = DateTime::parse_from_rfc3339("2026-10-03T00:00:00Z")
         .expect("now")
@@ -1184,6 +1185,7 @@ fn filtered_query_falls_back_when_catalog_and_index_are_missing() {
             agent: Some("codex".to_string()),
             date_lo: Some("2026-10-02".to_string()),
             date_hi: Some("2026-10-02".to_string()),
+            full_source_scan: false,
         },
         &root,
         DateTime::parse_from_rfc3339("2026-10-03T00:00:00Z")
@@ -1230,30 +1232,25 @@ fn indexed_candidate_cap_prioritizes_max_qualified_utterance_time() {
     let now = DateTime::parse_from_rfc3339("2026-10-06T12:00:00Z")
         .expect("now")
         .with_timezone(&Utc);
-    let cutoff = window_cutoff(now, 720);
     let source_filter = IntentSourceFilter::default();
-    let mut notes = ScopeNotes {
-        now: Some(now),
-        ..Default::default()
-    };
     let mut files = Vec::with_capacity(MAX_CANDIDATES + 1);
-    let make_entry = |session_id: String| crate::catalog::CatalogEntry {
-        schema: crate::catalog::CATALOG_SCHEMA.to_string(),
-        session_id,
+    let make_file = |session_id: String, text: String| StoredChunkFile {
         agent: "codex".to_string(),
-        project: Some("vetcoders/aicx".to_string()),
+        date: "2025-01-01".to_string(),
+        path: PathBuf::from(format!("/fixtures/{session_id}.md")),
+        project: "vetcoders/aicx".to_string(),
+        identity_source: INDEX_IDENTITY_SOURCE.to_string(),
+        sequence: 0,
         // Deliberately stale session metadata: cap order must come from the
         // qualified utterance, never this creation/canonical date.
-        date: Some("2025-01-01".to_string()),
-        cwd: Some("/fixtures/vetcoders/aicx".to_string()),
-        source_path: "/fixtures/indexed-extract.md".to_string(),
-        source_len: Some(1),
-        source_mtime_ns: Some(1),
-        source_bundle_fingerprint: None,
-        title: None,
-        machine: Some("test".to_string()),
-        logical_session_id: None,
-        session_kind: None,
+        timestamp: DateTime::UNIX_EPOCH,
+        session_id,
+        honesty: crate::oracle::ClaimHonesty::canonical(),
+        scope: None,
+        transcript_entries: None,
+        admission_human_messages: None,
+        validated_extract: None,
+        body: Some(text),
     };
 
     for index in 0..MAX_CANDIDATES {
@@ -1263,81 +1260,49 @@ fn indexed_candidate_cap_prioritizes_max_qualified_utterance_time() {
             "# AICX session extract\n\n## {} · user\n\nDecision: indexed filler {index:05}\n",
             at.to_rfc3339()
         );
-        let entry = make_entry(session_id.clone());
-        let file = indexed_extract_to_intent_file(
-            &entry,
-            crate::source_index::ValidatedSourceExtract {
-                chunk: aicx_retrieve::ChunkRef {
-                    id: format!("codex:{session_id}"),
-                    source_path: format!("/fixtures/{session_id}.md"),
-                    text,
-                    metadata: serde_json::json!({}),
-                },
-                coverage: crate::source_index::ConversationCoverage::CompleteVisible,
-                scope: None,
-            },
-            cutoff,
-            FrameKind::UserMsg,
-            false,
-            &source_filter,
-            &mut notes,
-        )
-        .expect("qualified filler extract");
-        files.push(file);
+        files.push(make_file(session_id, text));
     }
 
     let target_session = "old-session-newest-utterance";
-    let target_entry = make_entry(target_session.to_string());
-    let target = indexed_extract_to_intent_file(
-        &target_entry,
-        crate::source_index::ValidatedSourceExtract {
-            chunk: aicx_retrieve::ChunkRef {
-                id: format!("codex:{target_session}"),
-                source_path: "/fixtures/target.md".to_string(),
-                text: format!(
-                    "# AICX session extract\n\n## {} · user\n\nDecision: retain newest qualified utterance beyond cap\n",
-                    (now - chrono::Duration::minutes(1)).to_rfc3339()
-                ),
-                metadata: serde_json::json!({}),
-            },
-            coverage: crate::source_index::ConversationCoverage::CompleteVisible,
-            scope: None,
-        },
-        cutoff,
-        FrameKind::UserMsg,
-        false,
-        &source_filter,
-        &mut notes,
-    )
-    .expect("qualified target extract");
+    files.push(make_file(
+        target_session.to_string(),
+        format!(
+            "# AICX session extract\n\n## {} · user\n\nDecision: retain newest qualified utterance beyond cap\n",
+            (now - chrono::Duration::minutes(1)).to_rfc3339()
+        ),
+    ));
+    let config = IntentsConfig {
+        project: "vetcoders/aicx".to_string(),
+        hours: 720,
+        strict: false,
+        min_confidence: None,
+        kind_filter: Some(IntentKind::Decision),
+        frame_kind: Some(FrameKind::UserMsg),
+        live: false,
+    };
+    materialize_transcripts_for_admission(&mut files, &config, &source_filter, Some(now))
+        .expect("materialize indexed admission metadata");
+    order_files_for_admission(&mut files);
+    let target = files
+        .iter()
+        .find(|file| file.session_id == target_session)
+        .expect("target file");
     assert_eq!(
         target.timestamp,
         now - chrono::Duration::minutes(1),
         "indexed priority must derive from the newest qualified utterance"
     );
-    files.push(target);
-    files.sort_by(|left, right| {
-        left.timestamp
-            .cmp(&right.timestamp)
-            .then_with(|| left.path.cmp(&right.path))
-    });
-
     let extraction = extract_intents_from_files_with_stats(
-        &IntentsConfig {
-            project: "vetcoders/aicx".to_string(),
-            hours: 720,
-            strict: false,
-            min_confidence: None,
-            kind_filter: Some(IntentKind::Decision),
-            frame_kind: Some(FrameKind::UserMsg),
-            live: false,
-        },
+        &config,
         files,
         0,
         INDEX_IDENTITY_SOURCE,
         0,
         &source_filter,
-        notes,
+        ScopeNotes {
+            now: Some(now),
+            ..Default::default()
+        },
     )
     .expect("extract over-cap indexed candidates");
     assert!(extraction.stats.dropped_candidates > 0);
@@ -3023,6 +2988,9 @@ fn build_candidate_threads_sidecar_honesty_into_record() {
         honesty: crate::oracle::ClaimHonesty::canonical(),
         scope: None,
         transcript_entries: None,
+        admission_human_messages: None,
+        #[cfg(feature = "app")]
+        validated_extract: None,
         body: None,
     };
 
@@ -4936,6 +4904,9 @@ mod flexible_dates {
             honesty: Default::default(),
             scope: None,
             transcript_entries: None,
+            admission_human_messages: None,
+            #[cfg(feature = "app")]
+            validated_extract: None,
             body: None,
         };
 
@@ -4994,6 +4965,9 @@ mod flexible_dates {
             honesty: Default::default(),
             scope: None,
             transcript_entries: None,
+            admission_human_messages: None,
+            #[cfg(feature = "app")]
+            validated_extract: None,
             body: None,
         };
 
@@ -5227,6 +5201,9 @@ Update Cargo.lock dependencies\n";
             honesty: Default::default(),
             scope: None,
             transcript_entries: None,
+            admission_human_messages: None,
+            #[cfg(feature = "app")]
+            validated_extract: None,
             body: None,
         };
 
@@ -5518,6 +5495,9 @@ Results:
             honesty: Default::default(),
             scope: None,
             transcript_entries: None,
+            admission_human_messages: None,
+            #[cfg(feature = "app")]
+            validated_extract: None,
             body: None,
         };
 
@@ -5855,6 +5835,9 @@ fn heavier_older_session_survives_the_candidate_cap() {
         honesty: crate::oracle::ClaimHonesty::canonical(),
         scope: None,
         transcript_entries: Some(entries),
+        admission_human_messages: None,
+        #[cfg(feature = "app")]
+        validated_extract: None,
         body: None,
     };
     let config = IntentsConfig {
@@ -5946,6 +5929,9 @@ fn admission_weight_counts_only_user_turns_inside_explicit_date_window() {
         honesty: crate::oracle::ClaimHonesty::canonical(),
         scope: None,
         transcript_entries: None,
+        admission_human_messages: None,
+        #[cfg(feature = "app")]
+        validated_extract: None,
         body: Some(body),
     };
     let mut files = vec![
@@ -5965,9 +5951,17 @@ fn admission_weight_counts_only_user_turns_inside_explicit_date_window() {
         agent: Some("codex".into()),
         date_lo: Some("2026-10-01".into()),
         date_hi: Some("2026-10-06".into()),
+        full_source_scan: false,
     };
 
-    materialize_transcripts_for_admission(&mut files, &config, &source_filter, Some(now));
+    materialize_transcripts_for_admission(&mut files, &config, &source_filter, Some(now))
+        .expect("materialize admission headings");
+    assert!(
+        files
+            .iter()
+            .all(|file| file.transcript_entries.is_none() && file.body.is_some()),
+        "heading admission must not eagerly retain parsed message bodies"
+    );
     order_files_for_admission(&mut files);
 
     assert_eq!(files[0].session_id, "qualifying-heavy");

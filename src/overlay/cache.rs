@@ -108,6 +108,23 @@ pub(super) fn load_source_conversation(
     home: &Path,
     entry: &CatalogEntry,
 ) -> Result<(ConversationRead, bool)> {
+    load_source_conversation_inner(home, entry, true)?
+        .context("source conversation parse returned no result")
+}
+
+/// Read an existing validated conversation without filling a cold cache.
+pub(super) fn peek_source_conversation(
+    home: &Path,
+    entry: &CatalogEntry,
+) -> Result<Option<ConversationRead>> {
+    Ok(load_source_conversation_inner(home, entry, false)?.map(|(read, _)| read))
+}
+
+fn load_source_conversation_inner(
+    home: &Path,
+    entry: &CatalogEntry,
+    allow_source_parse: bool,
+) -> Result<Option<(ConversationRead, bool)>> {
     let allow = source_allowlist(home);
     let state = source_state(&allow, &entry.source_path);
     let SourceState::Ready { path, .. } = &state else {
@@ -117,22 +134,44 @@ pub(super) fn load_source_conversation(
         .canonicalize()
         .context("canonicalize reader cache home")?;
     let root = canonical_home.join("reader-conversations-v1");
-    if let Ok(metadata) = fs::symlink_metadata(&root)
-        && (metadata.file_type().is_symlink() || !metadata.is_dir())
-    {
-        bail!("reader conversation cache must be a regular directory");
+    match fs::symlink_metadata(&root) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            bail!("reader conversation cache must be a regular directory");
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && !allow_source_parse => {
+            return Ok(None);
+        }
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+            return Err(error).context("inspect reader conversation cache");
+        }
+        _ => {}
     }
-    fs::create_dir_all(&root)?;
+    if allow_source_parse {
+        fs::create_dir_all(&root)?;
+    }
     if root.canonicalize()?.parent() != Some(canonical_home.as_path()) {
         bail!("reader conversation cache escapes its AICX home");
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
+        if fs::metadata(&root)?.permissions().mode() & 0o777 != 0o700 {
+            if !allow_source_parse {
+                bail!("reader conversation cache is not private");
+            }
+            fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
+        }
     }
     let root_identity = fs::symlink_metadata(&root)?;
     validate_reader_root(&root, &canonical_home, &root_identity)?;
+    if !allow_source_parse
+        && !existing_cache_owner_matches(&root, &expected_cache_owner(home, "aicx/reader")?)?
+    {
+        if directory_has_source_slot_name(&root)? {
+            bail!("reader source cache slots have no valid owner marker");
+        }
+        return Ok(None);
+    }
     claim_cache_owner(&root, home, "aicx/reader")?;
     validate_reader_root(&root, &canonical_home, &root_identity)?;
     let row = SourceRow {
@@ -172,10 +211,14 @@ pub(super) fn load_source_conversation(
         {
             bail!("intent source repository layout changed during its cache read");
         }
-        return Ok((
+        return Ok(Some((
             (path.clone(), saved.frames, saved.scope, saved.coverage),
             true,
-        ));
+        )));
+    }
+    if !allow_source_parse {
+        unchanged()?;
+        return Ok(None);
     }
     let (read_path, frames, scope, coverage, scope_receipt) =
         crate::source_index::read_catalog_conversation_checked_with_scope_receipt_at(home, entry)?;
@@ -205,7 +248,7 @@ pub(super) fn load_source_conversation(
             bail!("intent source repository layout changed while publishing its cache");
         }
     }
-    Ok(((read_path, frames, scope, coverage), false))
+    Ok(Some(((read_path, frames, scope, coverage), false)))
 }
 
 fn validate_reader_root(root: &Path, home: &Path, pinned: &fs::Metadata) -> Result<()> {
@@ -667,6 +710,16 @@ pub(super) fn claim_cache_owner(root: &Path, home: &Path, repo_id: &str) -> Resu
     validate_cache_path(root, &lock_path)?;
     let holder_path = lock_path.with_file_name("catalog-cache-owner.lock.holder");
     validate_cache_path(root, &holder_path)?;
+    let expected = expected_cache_owner(home, repo_id)?;
+    // An established owner is immutable for this namespace. Check it while
+    // holding a shared lock; readers must not rewrite exclusive holder
+    // diagnostics and fsync the lock for every source-cache lookup.
+    let reader_lock =
+        crate::locks::acquire_shared(&lock_path).context("wait for overlay cache owner check")?;
+    if existing_cache_owner_matches(root, &expected)? {
+        return Ok(());
+    }
+    drop(reader_lock);
     let owner_lock = crate::locks::acquire_exclusive(&lock_path)
         .context("wait for overlay cache owner claim")?;
     let result = ensure_cache_owner(root, home, repo_id);
@@ -674,26 +727,37 @@ pub(super) fn claim_cache_owner(root: &Path, home: &Path, repo_id: &str) -> Resu
     result
 }
 
-fn ensure_cache_owner(root: &Path, home: &Path, repo_id: &str) -> Result<()> {
+fn expected_cache_owner(home: &Path, repo_id: &str) -> Result<CacheOwner> {
     let canonical_home = home
         .canonicalize()
         .with_context(|| format!("canonicalize AICX home {}", home.display()))?;
-    let expected = CacheOwner {
+    Ok(CacheOwner {
         schema: CACHE_OWNER_SCHEMA.to_owned(),
         repo_id: repo_id.to_owned(),
         canonical_home_digest: digest(&(
             CACHE_OWNER_SCHEMA,
             canonical_home.to_string_lossy().as_ref(),
         ))?,
-    };
+    })
+}
+
+fn existing_cache_owner_matches(root: &Path, expected: &CacheOwner) -> Result<bool> {
     let marker = root.join("catalog-cache-owner-v1.json");
     if let Some(actual) = read_json_strict::<CacheOwner>(root, &marker, "cache-owner")? {
-        if actual != expected {
+        if &actual != expected {
             bail!(
                 "overlay catalog cache owner mismatch under {}; refusing source-cache reads, writes, or cleanup",
                 root.display()
             );
         }
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn ensure_cache_owner(root: &Path, home: &Path, repo_id: &str) -> Result<()> {
+    let expected = expected_cache_owner(home, repo_id)?;
+    if existing_cache_owner_matches(root, &expected)? {
         return Ok(());
     }
     if directory_has_source_slot_name(root)? {
@@ -702,7 +766,7 @@ fn ensure_cache_owner(root: &Path, home: &Path, repo_id: &str) -> Result<()> {
             root.display()
         );
     }
-    atomic_write_json(&marker, &expected)
+    atomic_write_json(&root.join("catalog-cache-owner-v1.json"), &expected)
 }
 
 fn directory_has_source_slot_name(root: &Path) -> Result<bool> {
@@ -1080,6 +1144,59 @@ mod tests {
     }
 
     #[test]
+    fn cache_only_source_read_never_fills_a_missing_or_changed_slot() {
+        let (fixture, _) = absorbed_nested_workdir_fixture();
+        let entry = &fixture.rows[0];
+        let root = fixture.home.join("reader-conversations-v1");
+        assert!(
+            peek_source_conversation(&fixture.home, entry)
+                .unwrap()
+                .is_none()
+        );
+        assert!(!root.exists(), "a cold peek must not create a cache owner");
+        let (cold, _) = load_source_conversation(&fixture.home, entry).unwrap();
+        let slot = root.join(
+            source_slot_name(&SourceRow {
+                entry: entry.clone(),
+                state: SourceState::Missing,
+            })
+            .unwrap(),
+        );
+        let bytes = fs::read(&slot).unwrap();
+        let modified = fs::metadata(&slot).unwrap().modified().unwrap();
+        let hit = peek_source_conversation(&fixture.home, entry)
+            .unwrap()
+            .expect("whole-session proof is already available");
+        assert_eq!(digest(&hit).unwrap(), digest(&cold).unwrap());
+
+        use std::io::Write;
+        let mut source = fs::OpenOptions::new()
+            .append(true)
+            .open(&entry.source_path)
+            .unwrap();
+        writeln!(
+            source,
+            "{}",
+            serde_json::json!({
+                "timestamp": "2026-09-03T10:00:04Z",
+                "type": "response_item",
+                "payload": {"type": "message", "role": "user", "content": [{
+                    "type": "input_text", "text": "DECISION: observe the new source turn."
+                }]}
+            })
+        )
+        .unwrap();
+        assert!(
+            peek_source_conversation(&fixture.home, entry)
+                .unwrap()
+                .is_none(),
+            "a changed source has no current cached proof"
+        );
+        assert_eq!(fs::read(&slot).unwrap(), bytes);
+        assert_eq!(fs::metadata(&slot).unwrap().modified().unwrap(), modified);
+    }
+
+    #[test]
     fn feed_cache_rechecks_raw_workdir_layout_before_a_hit() {
         let (fixture, nested) = absorbed_nested_workdir_fixture();
         let (cold, stats) = fixture.load(false);
@@ -1282,6 +1399,34 @@ mod tests {
         let error = claim_cache_owner(&fixture.root, &fixture.home, "Loctree/aicx").unwrap_err();
         assert!(error.to_string().contains("owner mismatch"));
         assert!(fixture.source_slot(&fixture.rows[0]).is_file());
+    }
+
+    #[test]
+    fn established_cache_owner_checks_do_not_mutate_lock_or_holder() {
+        let fixture = Fixture::new();
+        claim_cache_owner(&fixture.root, &fixture.home, "Loctree/aicx").unwrap();
+        let lock = fixture.root.join("catalog-cache-owner.lock");
+        let holder = fixture.root.join("catalog-cache-owner.lock.holder");
+        let marker = fixture.root.join("catalog-cache-owner-v1.json");
+        let lock_bytes = fs::read(&lock).unwrap();
+        let lock_modified = fs::metadata(&lock).unwrap().modified().unwrap();
+        let marker_bytes = fs::read(&marker).unwrap();
+        // Existing exclusive-owner diagnostics are independent of an ordinary
+        // reader. The old per-source exclusive claim overwrote this sidecar.
+        fs::write(&holder, b"preserve exclusive holder diagnostics").unwrap();
+        for _ in 0..3 {
+            claim_cache_owner(&fixture.root, &fixture.home, "Loctree/aicx").unwrap();
+        }
+        assert_eq!(fs::read(&lock).unwrap(), lock_bytes);
+        assert_eq!(
+            fs::metadata(&lock).unwrap().modified().unwrap(),
+            lock_modified
+        );
+        assert_eq!(fs::read(&marker).unwrap(), marker_bytes);
+        assert_eq!(
+            fs::read(&holder).unwrap(),
+            b"preserve exclusive holder diagnostics"
+        );
     }
 
     #[test]

@@ -70,6 +70,9 @@ of re-parsing the original transcripts:
    Modern reuse also checks physical file identity (inode/change time on Unix,
    a conservative content fingerprint where those are unavailable), so a
    same-size edit with restored mtime cannot silently reuse a complete result.
+   Validation retains lightweight handles rather than every extract body;
+   heading-only admission scans compute weight and time, then each selected
+   body is reopened, rechecked and parsed individually in admission order.
 5. Narrows frames to `frame_kind` and the requested utterance-time window before
    classification and caps; default frame kind is `user_msg`.
 
@@ -92,6 +95,21 @@ whole-conversation source slots under `reader-conversations-v1/`.
 Changed, uncached, or non-cacheable sources are parsed through the original
 reader. Whole-session scope is retained before applying project, utterance-time
 and `frame_kind` narrowing. Records carry `identity_source: catalog-v1`.
+
+The default foreground query does not open a legacy source merely because its
+old extract lacks enough per-frame scope evidence. If a reader-cache entry
+already proves the current source bytes, parser policy and whole-session scope,
+the query reuses those frames and applies the normal role, project and time
+filters. A cold cache emits a `legacy_scope_unproven` source receipt, increments
+`source_errors`, and keeps the answer incomplete. `aicx intents --full-rescan`
+(MCP `full_rescan: true`) is the explicit expensive escape hatch: it bypasses
+CURRENT and reader-cache reuse and parses every selected source under the
+existing parser safety bounds.
+
+The same cache-only rule applies to a session already present in `CURRENT` when
+its parse-ledger row is missing. A session absent from `CURRENT` is new, while a
+row whose recorded source fingerprint changed is changed; those two states
+still use the checked source reader instead of being mislabeled as legacy.
 
 The fallback exists so a machine that never ran `aicx index` still gets a
 timeline rather than a confident empty one.

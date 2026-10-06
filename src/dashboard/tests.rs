@@ -232,6 +232,12 @@ fn server_shell_includes_browser_bearer_auth_wiring() {
     assert!(html.contains("aicx-auth-overlay"));
     assert!(html.contains("const consumeQueryToken = () => {"));
     assert!(html.contains("const boot = () => {"));
+    assert!(html.contains("scanStatus: 'unknown'"));
+    assert!(html.contains("data.scan_status === 'not_scanned'"));
+    assert!(html.contains("ui.genInfo.textContent = 'Not scanned yet'"));
+    assert!(html.contains("const deferredScan = state.scanStatus === 'not_scanned'"));
+    assert!(html.contains("const controller = deferredScan ? null : new AbortController()"));
+    assert!(!html.contains("new Date(data.generated_at"));
     // All corpus calls must go through apiFetch, not bare fetch.
     assert!(html.contains("apiFetch('/api/browse'"));
     assert!(html.contains("apiFetch('/api/search/semantic?'"));

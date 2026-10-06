@@ -1788,6 +1788,11 @@ enum Commands {
         /// Disable the automatic live scan for hot (≤ 48h) windows.
         #[arg(long)]
         no_live: bool,
+
+        /// Parse every selected catalog source instead of deferring legacy
+        /// scope holes. Expensive; parser safety bounds still apply.
+        #[arg(long)]
+        full_rescan: bool,
     },
 
     /// Multi-agent continuity pack: NOW / PEERS / DECISIONS / TASKS /
@@ -3209,6 +3214,7 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
             kind,
             live,
             no_live,
+            full_rescan,
         }) => {
             let live_mode = live || (intents::IntentsConfig::auto_live(hours) && !no_live);
             run_intents(
@@ -3226,6 +3232,7 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
                     collapse_session,
                 },
                 live_mode,
+                full_rescan,
             )?;
         }
         Some(Commands::Continuity { action }) => {
@@ -5237,6 +5244,7 @@ fn run_intents(
     project_match: legacy_archive::ProjectMatchMode,
     display: IntentsDisplayOptions<'_>,
     live: bool,
+    full_source_scan: bool,
 ) -> Result<()> {
     let IntentsDisplayOptions {
         emit,
@@ -5273,6 +5281,7 @@ fn run_intents(
             strict,
             min_confidence,
             live,
+            full_source_scan,
         )?;
         return Ok(());
     }
@@ -5292,6 +5301,7 @@ fn run_intents(
         agent: filters.agent.clone(),
         date_lo: date_lo.clone(),
         date_hi: date_hi.clone(),
+        full_source_scan,
     };
     let extraction = intents::extract_intents_with_stats_for_projects_filtered(
         &config,
@@ -5449,6 +5459,7 @@ fn run_intents_pack(
     strict: bool,
     min_confidence: Option<u8>,
     live: bool,
+    full_source_scan: bool,
 ) -> Result<()> {
     let lane_sort = filters.sort.unwrap_or(SortOrder::Newest);
     let lane_limit = filters.limit.or(Some(DEFAULT_INTENTS_PACK_LIMIT));
@@ -5465,6 +5476,7 @@ fn run_intents_pack(
         lane_sort,
         lane_limit,
         live,
+        full_source_scan,
     )?;
     let (tasks, stats_b) = extract_intents_pack_lane(
         projects,
@@ -5479,6 +5491,7 @@ fn run_intents_pack(
         lane_sort,
         lane_limit,
         live,
+        full_source_scan,
     )?;
     let (user_msg, stats_c) = extract_intents_pack_lane(
         projects,
@@ -5493,6 +5506,7 @@ fn run_intents_pack(
         lane_sort,
         lane_limit,
         live,
+        full_source_scan,
     )?;
     let (agent_reply, stats_d) = extract_intents_pack_lane(
         projects,
@@ -5507,6 +5521,7 @@ fn run_intents_pack(
         lane_sort,
         lane_limit,
         live,
+        full_source_scan,
     )?;
     let (unresolved, stats_e) = extract_intents_pack_lane(
         projects,
@@ -5521,6 +5536,7 @@ fn run_intents_pack(
         lane_sort,
         lane_limit,
         live,
+        full_source_scan,
     )?;
     // Lanes overlap on the same sessions — the widest lane is the honest count.
     let lanes = [stats_a, stats_b, stats_c, stats_d, stats_e];
@@ -5591,6 +5607,7 @@ fn extract_intents_pack_lane(
     sort: SortOrder,
     limit: Option<usize>,
     live: bool,
+    full_source_scan: bool,
 ) -> Result<(Vec<intents::IntentRecord>, intents::IntentExtractionStats)> {
     let config = intents::IntentsConfig {
         project: projects.first().cloned().unwrap_or_default(),
@@ -5606,6 +5623,7 @@ fn extract_intents_pack_lane(
         agent: filters.agent.clone(),
         date_lo: date_lo.clone(),
         date_hi: date_hi.clone(),
+        full_source_scan,
     };
     let extraction = intents::extract_intents_with_stats_for_projects_filtered(
         &config,
@@ -5831,6 +5849,7 @@ fn run_tail(
                 collapse_session: false,
             },
             intents::IntentsConfig::auto_live(hours),
+            false,
         );
     }
 
@@ -5859,6 +5878,7 @@ fn run_tail(
         agent: filters.agent.clone(),
         date_lo: date_lo.clone(),
         date_hi: date_hi.clone(),
+        full_source_scan: false,
     };
     let mut last_seen = std::collections::HashSet::new();
     eprintln!(

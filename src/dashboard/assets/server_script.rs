@@ -24,6 +24,18 @@ pub(crate) const DASHBOARD_SERVER_SCRIPT: &str = r#"
     scoreMin: 0, limit: 350, selectedId: null, rows: [], selectedRecord: null,
     browseRecords: [], mode: 'browse', expanded: false, unit: 'session',
     assumptions: [], indexLoaded: false, corpusTotal: 0, browseRetries: 0,
+    scanStatus: 'unknown',
+  };
+
+  const applyStatus = (data) => {
+    if (!data || !data.scan_status) return;
+    state.scanStatus = data.scan_status;
+    if (data.scan_status === 'not_scanned') {
+      ui.statFiles.textContent = '\u2014';
+      ui.statProjects.textContent = '\u2014';
+      ui.statDays.textContent = '\u2014';
+      if (ui.genInfo) ui.genInfo.textContent = 'Not scanned yet';
+    }
   };
 
   const withoutStamp = (line) => {
@@ -108,8 +120,13 @@ pub(crate) const DASHBOARD_SERVER_SCRIPT: &str = r#"
               err.textContent = 'Invalid token (HTTP ' + r.status + ').';
               err.style.display = 'block';
             }
-            return;
+            return null;
           }
+          return r.json();
+        })
+        .then(function(data) {
+          if (!data) return;
+          applyStatus(data);
           saveToken(tok);
           hideLogin();
           loadBrowseData();
@@ -460,7 +477,9 @@ pub(crate) const DASHBOARD_SERVER_SCRIPT: &str = r#"
     if (ui.genInfo) ui.genInfo.textContent = 'Still reading the corpus';
   };
   const loadBrowseData = () => {
-    ui.summary.textContent = 'Loading\u2026';
+    const deferredScan = state.scanStatus === 'not_scanned';
+    if (deferredScan) showCorpusBusy();
+    else ui.summary.textContent = 'Loading\u2026';
     const params = new URLSearchParams();
     if (state.project) params.set('project', state.project);
     if (state.agent) params.set('agent', state.agent);
@@ -468,11 +487,12 @@ pub(crate) const DASHBOARD_SERVER_SCRIPT: &str = r#"
     if (state.sort) params.set('sort', state.sort);
     if (state.since) params.set('since', state.since);
     const qs = params.toString();
-    const controller = new AbortController();
-    const timer = setTimeout(function() { controller.abort(); }, 8000);
-    apiFetch('/api/browse' + (qs ? '?' + qs : ''), { signal: controller.signal })
+    const controller = deferredScan ? null : new AbortController();
+    const timer = controller ? setTimeout(function() { controller.abort(); }, 8000) : null;
+    const requestOptions = controller ? { signal: controller.signal } : {};
+    apiFetch('/api/browse' + (qs ? '?' + qs : ''), requestOptions)
       .then(function(r) {
-        clearTimeout(timer);
+        if (timer) clearTimeout(timer);
         if (r.status === 503) {
           return r.json().then(function(data) {
             const err = new Error((data && data.error) || 'still_reading');
@@ -499,6 +519,7 @@ pub(crate) const DASHBOARD_SERVER_SCRIPT: &str = r#"
           return;
         }
         state.browseRetries = 0;
+        state.scanStatus = 'ready';
         state.browseRecords = data.records || [];
         fillSelect(ui.project, data.projects || []);
         fillSelect(ui.agent, data.agents || []);
@@ -643,6 +664,7 @@ pub(crate) const DASHBOARD_SERVER_SCRIPT: &str = r#"
       })
       .then(function(data) {
         if (!data) return;
+        applyStatus(data);
         const host = location.hostname;
         if (host === '127.0.0.1' || host === 'localhost' || host === '::1') {
           const access = document.getElementById('ctx-access');

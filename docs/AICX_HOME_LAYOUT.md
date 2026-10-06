@@ -85,8 +85,13 @@ stale cached claims. Corrupt disposable payloads are re-parsed from their source
 
 On Unix the cache directory is `0700` and atomically written payloads are `0600`.
 The owner marker binds the directory to its canonical AICX home; owner claims
-serialize through an advisory lock. Source slots are replaceable and atomically
-published, so concurrent readers never consume half-written JSON.
+serialize through an exclusive advisory lock. Once established, ordinary
+lookups validate the exact marker under a shared lock without rewriting
+exclusive-holder diagnostics or syncing the lock file for each source.
+Source slots are replaceable and atomically published, so concurrent readers
+never consume half-written JSON.
+An existing validated slot can also satisfy a legacy scope hole. A cache-only
+lookup never fills a missing or invalid slot by implicitly parsing its source.
 
 This directory is machine-local derived state. It can be discarded when no
 reader is using it; source logs, catalog identity, and published generations

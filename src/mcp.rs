@@ -865,6 +865,10 @@ pub struct IntentsParams {
     pub since: Option<String>,
     /// Optional upper date bound (YYYY-MM-DD)
     pub until: Option<String>,
+    /// Parse every selected catalog source instead of deferring legacy scope
+    /// holes. Expensive; parser safety bounds still apply.
+    #[serde(default)]
+    pub full_rescan: bool,
     /// Sort order: newest (default), oldest
     pub sort: Option<String>,
     /// Max records to return (default: 20, capped at 500)
@@ -1897,6 +1901,7 @@ impl AicxMcpServer {
             agent: params.agent.clone(),
             date_lo: params.since.clone(),
             date_hi: params.until.clone(),
+            full_source_scan: params.full_rescan,
         };
         let extraction = intents::extract_intents_with_stats_for_projects_filtered(
             &config,
@@ -2345,7 +2350,7 @@ async fn hybrid_http_app(
         auth: auth_config,
         allow_no_origin: false,
     };
-    let dashboard = crate::dashboard_server::dashboard_router(dashboard, false, true).await?;
+    let dashboard = crate::dashboard_server::dashboard_router_deferred(dashboard, false).await?;
     Ok(dashboard.merge(mcp_app))
 }
 
@@ -2983,6 +2988,7 @@ mod tests {
             identity_source: crate::intents::PERSISTED_IDENTITY_SOURCE.to_string(),
             path_heuristic_records: 0,
             live_sessions: 0,
+            legacy_scope_unproven: 0,
             mixed_scope_sessions: 0,
             unplaced_frames: 0,
         };
@@ -3318,6 +3324,7 @@ mod tests {
             .await
             .expect("loopback hybrid router");
             let response = app
+                .clone()
                 .oneshot(
                     axum::http::Request::builder()
                         .uri("/")
@@ -3335,6 +3342,25 @@ mod tests {
             assert!(html.contains(">Save</button>"));
             assert!(html.contains("Type the phrases you actually use"));
             assert!(!html.contains("intent_phrases.toml"));
+
+            let mut status_request = axum::http::Request::builder()
+                .uri("/api/status")
+                .body(axum::body::Body::empty())
+                .unwrap();
+            status_request
+                .extensions_mut()
+                .insert(axum::extract::connect_info::ConnectInfo(
+                    std::net::SocketAddr::from(([127, 0, 0, 1], 9)),
+                ));
+            let status = app.oneshot(status_request).await.unwrap();
+            assert_eq!(status.status(), axum::http::StatusCode::OK);
+            let bytes = axum::body::to_bytes(status.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            let status: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(status["scan_status"], "not_scanned");
+            assert_eq!(status["build_count"], 0);
+            assert!(status["stats"].is_null());
 
             let open_tailnet = super::hybrid_http_app(
                 McpHttpConfig::new("100.82.232.70".parse().unwrap(), 8044),

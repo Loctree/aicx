@@ -242,21 +242,7 @@ fn chunk_label(file: &CorpusItem) -> String {
 fn load_corpus_items() -> anyhow::Result<Vec<CorpusItem>> {
     let home = crate::aicx_home::resolve()?;
     if crate::catalog::sessions_path_for(&home).is_file() {
-        return Ok(crate::catalog::read_entries_at(&home)?
-            .into_iter()
-            .filter_map(|entry| {
-                let project = entry.project?;
-                Some(CorpusItem {
-                    stored_project: project.clone(),
-                    project,
-                    agent: entry.agent,
-                    date: entry.date.unwrap_or_default(),
-                    title: entry.title.unwrap_or_default(),
-                    cwd: entry.cwd.unwrap_or_default(),
-                    path: PathBuf::from(entry.source_path),
-                })
-            })
-            .collect());
+        return load_catalog_corpus_items_at(&home);
     }
     Ok(legacy_archive::scan_context_files()?
         .into_iter()
@@ -268,6 +254,24 @@ fn load_corpus_items() -> anyhow::Result<Vec<CorpusItem>> {
             title: String::new(),
             cwd: String::new(),
             path: file.path,
+        })
+        .collect())
+}
+
+fn load_catalog_corpus_items_at(home: &std::path::Path) -> anyhow::Result<Vec<CorpusItem>> {
+    Ok(crate::catalog::read_entries_at(home)?
+        .into_iter()
+        .filter_map(|entry| {
+            let project = entry.project?;
+            Some(CorpusItem {
+                stored_project: project.clone(),
+                project,
+                agent: entry.agent,
+                date: entry.date.unwrap_or_default(),
+                title: entry.title.unwrap_or_default(),
+                cwd: entry.cwd.unwrap_or_default(),
+                path: PathBuf::from(entry.source_path),
+            })
         })
         .collect())
 }
@@ -907,19 +911,42 @@ mod tests {
     }
 
     #[test]
-    fn live_catalog_orgs_are_human_names() {
-        let Ok(home) = crate::aicx_home::resolve() else {
-            return;
-        };
-        if !crate::catalog::sessions_path_for(&home).is_file() {
-            return;
+    fn catalog_fixture_orgs_are_human_names_and_preserve_every_session() {
+        let home = unique_test_dir("catalog-orgs");
+        let catalog = crate::catalog::sessions_path_for(&home);
+        fs::create_dir_all(catalog.parent().unwrap()).unwrap();
+        let rows = [
+            ("vetcoders/vibecrafted", "/tmp/vetcoders/vibecrafted"),
+            (
+                "000212/vibecrafted",
+                "/tmp/worktrees/vetcoders/vibecrafted/2026/task",
+            ),
+            ("vetcoders/vista", "/tmp/vetcoders/vista"),
+            (
+                "2026_0910/vista",
+                "/tmp/artifacts/vetcoders/vista/2026_0910/task",
+            ),
+        ];
+        let mut file = File::create(&catalog).unwrap();
+        for (index, (project, cwd)) in rows.iter().enumerate() {
+            writeln!(
+                file,
+                "{}",
+                serde_json::json!({
+                    "schema": crate::catalog::CATALOG_SCHEMA,
+                    "session_id": format!("fixture-{index}"),
+                    "agent": "cursor",
+                    "project": project,
+                    "date": "2026-09-10",
+                    "cwd": cwd,
+                    "source_path": home.join(format!("missing-{index}.jsonl")),
+                })
+            )
+            .unwrap();
         }
-        let screen = CorpusScreen::load();
-        assert!(
-            screen.all_files.len() >= 16_000,
-            "session count {}",
-            screen.all_files.len()
-        );
+        drop(file);
+        let screen = CorpusScreen::from_items(load_catalog_corpus_items_at(&home).unwrap());
+        assert_eq!(screen.all_files.len(), rows.len());
         assert_eq!(screen.entries.len(), screen.all_files.len());
         let orgs = screen.orgs();
         let bare = orgs
@@ -940,5 +967,6 @@ mod tests {
                 .iter()
                 .any(|entry| entry.label.contains("2026-"))
         );
+        fs::remove_dir_all(home).unwrap();
     }
 }

@@ -126,6 +126,9 @@ pub struct IntentSourceFilter {
     pub agent: Option<String>,
     pub date_lo: Option<String>,
     pub date_hi: Option<String>,
+    /// Explicit expensive mode: bypass CURRENT and reader conversation reuse,
+    /// parsing every selected catalog source under the existing parser bounds.
+    pub full_source_scan: bool,
 }
 
 /// Widest retrieval window that turns the live source scan on by default.
@@ -165,6 +168,9 @@ pub struct IntentExtractionStats {
     /// newer than the catalog census). 0 when live mode was off or nothing
     /// was fresher than the census.
     pub live_sessions: usize,
+    /// Validated legacy extracts withheld because their per-frame scope cannot
+    /// be proven without an explicit full source scan.
+    pub legacy_scope_unproven: usize,
     /// Sessions the lanes could not serve whole under the requested project
     /// ([`IntentExtraction::mixed_scope`]).
     pub mixed_scope_sessions: usize,
@@ -200,6 +206,8 @@ pub struct IntentsCompleteness {
     /// sources newer than the catalog census).
     #[serde(default)]
     pub live_sessions: usize,
+    #[serde(default)]
+    pub legacy_scope_unproven: usize,
     /// Sessions cataloged under the requested project that were not served
     /// whole: part or all of their work ran outside its checkout, in a proven
     /// workdir conflict, or in a scope `.aicxignore` hides. Those frames are
@@ -292,6 +300,12 @@ impl IntentExtractionStats {
                 self.live_sessions
             ));
         }
+        if self.legacy_scope_unproven > 0 {
+            warnings.push(format!(
+                "{} legacy source(s) withheld as legacy_scope_unproven; rerun intents --full-rescan for deliberate source parsing",
+                self.legacy_scope_unproven
+            ));
+        }
         warnings.extend(self.withheld_scope());
 
         IntentsCompleteness {
@@ -305,6 +319,7 @@ impl IntentExtractionStats {
             orphaned_buckets,
             identity_source: self.identity_source.clone(),
             live_sessions: self.live_sessions,
+            legacy_scope_unproven: self.legacy_scope_unproven,
             mixed_scope_sessions: self.mixed_scope_sessions,
             unplaced_frames: self.unplaced_frames,
             warnings,
@@ -441,6 +456,12 @@ pub(super) struct StoredChunkFile {
     /// documents that carry no cwd/branch evidence.
     pub(super) scope: Option<crate::extraction::conversation::ScopeReport>,
     pub(super) transcript_entries: Option<Vec<TranscriptEntry>>,
+    /// Query-qualified human-turn count computed without retaining every body.
+    pub(super) admission_human_messages: Option<usize>,
+    /// Strictly validated parse-ledger handle. Its body is re-opened and
+    /// checksum/source-fingerprint checked only when this file is classified.
+    #[cfg(feature = "app")]
+    pub(super) validated_extract: Option<crate::source_index::ValidatedSourceExtract>,
     /// Chunk document already held in memory, read from the committed lexical
     /// index instead of the original transcript.
     ///

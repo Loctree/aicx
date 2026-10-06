@@ -40,6 +40,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   same-size edit with restored mtime. Preserve valid legacy extracts as
   explicitly unknown during normal maintenance, keeping full historical
   rescans deliberate.
+- Keep bounded intent queries fast by reporting legacy per-frame scope gaps as
+  incomplete instead of opening historical multi-gigabyte sources. Reuse an
+  existing reader-cache entry only when it strongly proves current source bytes
+  and whole-session scope, including for `CURRENT` IDs missing their parse-ledger
+  row; keep new IDs and fingerprint-drifted rows on the checked fresh-reader
+  path. Preserve an explicit `intents --full-rescan` / MCP `full_rescan` path for
+  deliberate all-selected-source parsing under the existing parser safety
+  bounds.
 
 - Avoid re-parsing full project history before an unchanged `overlay` cache hit.
   Reuse fingerprinted conversation frames across both intent lanes, preserve

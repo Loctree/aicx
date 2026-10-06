@@ -66,6 +66,7 @@ struct DashboardSnapshot {
     assumptions: Vec<String>,
     build_count: u64,
     last_error: Option<String>,
+    scan_status: DashboardScanStatus,
 }
 
 impl DashboardSnapshot {
@@ -77,6 +78,46 @@ impl DashboardSnapshot {
             generated_at: build.generated_at,
             build_count: 1,
             last_error: None,
+            scan_status: DashboardScanStatus::Ready,
+        }
+    }
+
+    fn deferred(config: &DashboardServerConfig) -> Self {
+        let assumption =
+            "Dashboard data has not been scanned; request /api/browse or POST /api/regenerate to load it."
+                .to_string();
+        Self {
+            payload: DashboardPayload {
+                generated_at: String::new(),
+                aicx_home: config.aicx_home.display().to_string(),
+                stats: DashboardStats::default(),
+                assumptions: vec![assumption.clone()],
+                projects: Vec::new(),
+                agents: Vec::new(),
+                kinds: Vec::new(),
+                records: Vec::new(),
+            },
+            generated_at: Utc::now(),
+            stats: DashboardStats::default(),
+            assumptions: vec![assumption],
+            build_count: 0,
+            last_error: None,
+            scan_status: DashboardScanStatus::NotScanned,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DashboardScanStatus {
+    NotScanned,
+    Ready,
+}
+
+impl DashboardScanStatus {
+    fn label(self) -> &'static str {
+        match self {
+            Self::NotScanned => "not_scanned",
+            Self::Ready => "ready",
         }
     }
 }
@@ -99,14 +140,15 @@ struct DashboardStatusResponse {
     ok: bool,
     mode: &'static str,
     rebuilding: bool,
-    generated_at: String,
+    scan_status: &'static str,
+    generated_at: Option<String>,
     build_count: u64,
     aicx_home: String,
     artifact_path: String,
     artifact_written: bool,
     title: String,
     preview_chars: usize,
-    stats: DashboardStats,
+    stats: Option<DashboardStats>,
     assumptions: Vec<String>,
     last_error: Option<String>,
     survey_required: bool,
@@ -245,9 +287,28 @@ pub async fn dashboard_router(
         }
         Err(err) => return Err(err.context("Initial dashboard build failed")),
     };
+    Ok(assemble_router(
+        Arc::new(DashboardServerState {
+            config: config.clone(),
+            snapshot: RwLock::new(DashboardSnapshot::from_build(initial)),
+            rebuilding: AtomicBool::new(false),
+        }),
+        mount_health,
+    ))
+}
+
+/// Build the hybrid MCP/dashboard router without touching the corpus.
+///
+/// MCP health and tools must bind independently from the optional dashboard
+/// dataset. The first explicit browse or regenerate request performs the scan.
+pub async fn dashboard_router_deferred(
+    config: DashboardServerConfig,
+    mount_health: bool,
+) -> Result<Router> {
+    let initial = DashboardSnapshot::deferred(&config);
     let state = Arc::new(DashboardServerState {
         config: config.clone(),
-        snapshot: RwLock::new(DashboardSnapshot::from_build(initial)),
+        snapshot: RwLock::new(initial),
         rebuilding: AtomicBool::new(false),
     });
     Ok(assemble_router(state, mount_health))
@@ -274,7 +335,7 @@ fn assemble_router(state: Arc<DashboardServerState>, mount_health: bool) -> Rout
 
     let api_router: Router<Arc<DashboardServerState>> = Router::new()
         .route("/api/status", get(get_status))
-        .route("/api/browse", get(browse::get_browse))
+        .route("/api/browse", get(get_browse_on_demand))
         .route("/api/detail", get(browse::get_detail))
         .route("/api/chunk", get(browse::get_chunk))
         .route("/api/context", get(get_context))
@@ -379,14 +440,17 @@ async fn get_status(
             ok: true,
             mode: "server-shell",
             rebuilding,
-            generated_at: snapshot.generated_at.to_rfc3339(),
+            scan_status: snapshot.scan_status.label(),
+            generated_at: (snapshot.scan_status == DashboardScanStatus::Ready)
+                .then(|| snapshot.generated_at.to_rfc3339()),
             build_count: snapshot.build_count,
             aicx_home: state.config.aicx_home.display().to_string(),
             artifact_path: state.config.artifact_path.display().to_string(),
             artifact_written: false,
             title: state.config.title.clone(),
             preview_chars: state.config.preview_chars,
-            stats: snapshot.stats.clone(),
+            stats: (snapshot.scan_status == DashboardScanStatus::Ready)
+                .then(|| snapshot.stats.clone()),
             assumptions: snapshot.assumptions.clone(),
             last_error: snapshot.last_error.clone(),
             survey_required,
@@ -395,19 +459,94 @@ async fn get_status(
             ok: true,
             mode: "server-shell",
             rebuilding: true,
-            generated_at: String::new(),
+            scan_status: "unavailable",
+            generated_at: None,
             build_count: 0,
             aicx_home: state.config.aicx_home.display().to_string(),
             artifact_path: state.config.artifact_path.display().to_string(),
             artifact_written: false,
             title: state.config.title.clone(),
             preview_chars: state.config.preview_chars,
-            stats: DashboardStats::default(),
+            stats: None,
             assumptions: Vec::new(),
             last_error: None,
             survey_required,
         }),
     }
+}
+
+async fn rebuild_snapshot(
+    state: &Arc<DashboardServerState>,
+) -> std::result::Result<DashboardRegenerateResponse, String> {
+    let config = state.config.clone();
+    let rebuilt = tokio::task::spawn_blocking(move || rebuild_dashboard(&config)).await;
+    let build = match rebuilt {
+        Ok(Ok(build)) => build,
+        Ok(Err(err)) => {
+            let message = format!("{err:#}");
+            state.snapshot.write().await.last_error = Some(message.clone());
+            return Err(message);
+        }
+        Err(err) => {
+            let message = format!("Regeneration task join failure: {err}");
+            state.snapshot.write().await.last_error = Some(message.clone());
+            return Err(message);
+        }
+    };
+
+    let mut snapshot = state.snapshot.write().await;
+    snapshot.stats = build.payload.stats.clone();
+    snapshot.assumptions = build.payload.assumptions.clone();
+    snapshot.payload = build.payload;
+    snapshot.generated_at = build.generated_at;
+    snapshot.build_count = snapshot.build_count.saturating_add(1);
+    snapshot.last_error = None;
+    snapshot.scan_status = DashboardScanStatus::Ready;
+
+    Ok(DashboardRegenerateResponse {
+        ok: true,
+        mode: "server-shell",
+        regenerated_at: snapshot.generated_at.to_rfc3339(),
+        build_count: snapshot.build_count,
+        artifact_path: state.config.artifact_path.display().to_string(),
+        artifact_written: false,
+        stats: snapshot.stats.clone(),
+    })
+}
+
+async fn get_browse_on_demand(
+    State(state): State<Arc<DashboardServerState>>,
+    params: std::result::Result<
+        axum::extract::Query<browse::BrowseParams>,
+        axum::extract::rejection::QueryRejection,
+    >,
+) -> Response {
+    if params.is_err() {
+        return browse::get_browse(State(state), params).await;
+    }
+    let scan_deferred = state.snapshot.read().await.scan_status == DashboardScanStatus::NotScanned;
+    if scan_deferred {
+        if state.rebuilding.swap(true, Ordering::SeqCst) {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorResponse {
+                    ok: false,
+                    error: "still_reading".to_string(),
+                }),
+            )
+                .into_response();
+        }
+        let _flag_guard = RebuildFlagGuard::new(&state.rebuilding);
+        if let Err(error) = rebuild_snapshot(&state).await {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse { ok: false, error }),
+            )
+                .into_response();
+        }
+    }
+
+    browse::get_browse(State(state), params).await
 }
 
 async fn regenerate_dashboard(
@@ -463,59 +602,13 @@ async fn regenerate_dashboard(
     }
     let _flag_guard = RebuildFlagGuard::new(&state.rebuilding);
 
-    let config = state.config.clone();
-    let rebuilt = tokio::task::spawn_blocking(move || rebuild_dashboard(&config)).await;
-
-    match rebuilt {
-        Ok(Ok(build)) => {
-            let mut snapshot = state.snapshot.write().await;
-            snapshot.stats = build.payload.stats.clone();
-            snapshot.assumptions = build.payload.assumptions.clone();
-            snapshot.payload = build.payload;
-            snapshot.generated_at = build.generated_at;
-            snapshot.build_count = snapshot.build_count.saturating_add(1);
-            snapshot.last_error = None;
-
-            let response = DashboardRegenerateResponse {
-                ok: true,
-                mode: "server-shell",
-                regenerated_at: snapshot.generated_at.to_rfc3339(),
-                build_count: snapshot.build_count,
-                artifact_path: state.config.artifact_path.display().to_string(),
-                artifact_written: false,
-                stats: snapshot.stats.clone(),
-            };
-
-            (StatusCode::OK, Json(response)).into_response()
-        }
-        Ok(Err(err)) => {
-            let err_msg = format!("{err:#}");
-            let mut snapshot = state.snapshot.write().await;
-            snapshot.last_error = Some(err_msg.clone());
-
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    ok: false,
-                    error: err_msg,
-                }),
-            )
-                .into_response()
-        }
-        Err(err) => {
-            let err_msg = format!("Regeneration task join failure: {err}");
-            let mut snapshot = state.snapshot.write().await;
-            snapshot.last_error = Some(err_msg.clone());
-
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    ok: false,
-                    error: err_msg,
-                }),
-            )
-                .into_response()
-        }
+    match rebuild_snapshot(&state).await {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse { ok: false, error }),
+        )
+            .into_response(),
     }
 }
 
@@ -531,9 +624,12 @@ async fn get_context(State(state): State<Arc<DashboardServerState>>) -> Json<ser
         "aicx_home": state.config.aicx_home.display().to_string(),
         "host": state.config.host.to_string(),
         "port": state.config.port,
-        "generated_at": snapshot.generated_at.to_rfc3339(),
+        "scan_status": snapshot.scan_status.label(),
+        "generated_at": (snapshot.scan_status == DashboardScanStatus::Ready)
+            .then(|| snapshot.generated_at.to_rfc3339()),
         "build_count": snapshot.build_count,
-        "stats": snapshot.stats,
+        "stats": (snapshot.scan_status == DashboardScanStatus::Ready)
+            .then(|| snapshot.stats.clone()),
     }))
 }
 

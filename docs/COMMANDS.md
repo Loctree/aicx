@@ -70,6 +70,12 @@ also installed transactionally; a scheduler failure reports the partial outcome
 explicitly while retaining the healthy reader and attempting to restore the
 previous schedule. Registration alone is not service health.
 
+Hybrid HTTP startup binds MCP and health without scanning provider roots or
+building the dashboard corpus. The dashboard initially reports
+`scan_status: "not_scanned"`, `build_count: 0`, and null `generated_at`/`stats`.
+An authorized browse or regenerate request loads that optional dataset.
+MCP readiness is independent of dashboard data readiness.
+
 The macOS maintenance scheduler runs `catalog refresh` and `index` in a separate
 short-lived process every 2h24m. Other platforms can invoke the same explicit
 maintenance commands; reader installation does not imply periodic indexing.
@@ -84,8 +90,11 @@ candidate caps; a session's creation date cannot exclude its recent utterances.
 When `CURRENT` is available, queries join catalog membership with the existing
 source-parse ledger. Unchanged extracts are reused only after checking live
 source fingerprints, ignore policy, checkout layout, source identity, and
-extract checksums. Changed, unadmitted, or unproven sources are read freshly;
-live queries retain that admission step instead of reparsing all history.
+extract checksums. Changed and unadmitted sources are read freshly; unchanged
+legacy sources without reconstructable scope are reported as explicit holes.
+Live queries retain source admission instead of reparsing all history.
+Indexed admission scans qualifying headings before loading individual bodies,
+so classification does not keep the full extract corpus in memory.
 
 Fresh source reads reuse validated whole conversations in
 `$AICX_HOME/reader-conversations-v1/`, sharing the overlay cache's validation
@@ -104,6 +113,19 @@ run that expensive operation on the intended maintenance host.
 Cold or changed sources still require parsing, and live provider-root discovery
 still has a cost. `--no-live` is an explicit choice to exclude unadmitted live
 sources; it is not a repair for stale or incomplete evidence.
+By default, a legacy extract whose per-frame scope cannot be proven reuses an
+existing reader-conversation entry only when that entry still proves the source
+bytes and whole-session scope. Without that warm proof it is reported as
+`legacy_scope_unproven` and keeps `complete: false` instead of triggering an
+unbounded foreground history parse. Run `aicx intents --full-rescan` to parse
+every selected catalog source deliberately. MCP callers use `full_rescan: true`.
+This cache-only rule also covers IDs already present in `CURRENT` whose ledger
+row is absent; new IDs outside `CURRENT` and rows with proven source drift still
+use the checked source reader.
+This bypasses CURRENT and reader-conversation reuse, but retains source
+allowlists, parser size/record safety bounds, coverage receipts, agent/project
+filters, and utterance-time windows; it does not promise that unsupported or
+oversized provider records become lossless.
 Full-history requests (`-H 0`) retain the original catalog-conversation lane,
 including whole-session scope, to keep durable overlay evidence stable.
 
