@@ -5709,6 +5709,66 @@ fn full_history_requests_never_take_the_index_path() {
     );
 }
 
+#[test]
+#[cfg(feature = "app")]
+fn current_metadata_holes_respect_global_project_and_agent_boundaries() {
+    let no_filter = IntentSourceFilter::default();
+    let missing_project = serde_json::json!({
+        "agent": "codex",
+        "session_id": "legacy-session"
+        // Missing scope keys deliberately make this a flagged legacy chunk.
+    });
+    let global = current_metadata_fact(&missing_project, "", &no_filter)
+        .expect("global query considers metadata with unknown project");
+    assert_eq!(
+        global.key,
+        Some(("codex".to_string(), "legacy-session".to_string()))
+    );
+    assert!(global.flagged_for_project);
+    assert!(
+        !current_metadata_fact(&missing_project, "vetcoders/aicx", &no_filter)
+            .expect("identified metadata remains available for catalog reattribution")
+            .flagged_for_project,
+        "project-specific query must not claim metadata with unknown project"
+    );
+
+    let missing_identity = serde_json::json!({
+        "project": "vetcoders/aicx"
+    });
+    let unfiltered = current_metadata_fact(&missing_identity, "", &no_filter)
+        .expect("unfiltered global query must account for unidentified flagged metadata");
+    assert!(unfiltered.key.is_none());
+    assert!(unfiltered.flagged_for_project);
+    assert!(
+        current_metadata_fact(
+            &missing_identity,
+            "",
+            &IntentSourceFilter {
+                agent: Some("codex".to_string()),
+                ..Default::default()
+            }
+        )
+        .is_none(),
+        "agent-filtered query must exclude metadata whose agent is unknown"
+    );
+
+    let missing_session = serde_json::json!({
+        "agent": "codex",
+        "project": "vetcoders/aicx"
+    });
+    let filtered = current_metadata_fact(
+        &missing_session,
+        "vetcoders/aicx",
+        &IntentSourceFilter {
+            agent: Some("codex".to_string()),
+            ..Default::default()
+        },
+    )
+    .expect("known matching agent still exposes a missing-session metadata hole");
+    assert!(filtered.key.is_none());
+    assert!(filtered.flagged_for_project);
+}
+
 /// Finding: a `CURRENT` generation built before the scope keys existed
 /// carries none of them, and every reader in the index lane took absence for
 /// a clean answer — not mixed, not unattributed, not a guardian. The Tantivy
@@ -5748,4 +5808,171 @@ fn a_chunk_that_cannot_state_its_scope_is_not_a_clean_chunk() {
             "a chunk missing `{key}` does not state its scope"
         );
     }
+}
+
+#[cfg(feature = "app")]
+#[test]
+fn heavier_older_session_survives_the_candidate_cap() {
+    use super::{
+        CATALOG_IDENTITY_SOURCE, MAX_CANDIDATES, ScopeNotes, StoredChunkFile, TranscriptEntry,
+        extract_intents_from_files_with_stats,
+    };
+    use chrono::TimeZone;
+
+    let older = Utc.with_ymd_and_hms(2026, 10, 3, 22, 18, 0).unwrap();
+    let newer = Utc.with_ymd_and_hms(2026, 10, 5, 19, 10, 0).unwrap();
+    let now = Utc.with_ymd_and_hms(2026, 10, 6, 12, 0, 0).unwrap();
+    let heavy_lines: Vec<TranscriptEntry> = (0..344)
+        .map(|index| TranscriptEntry {
+            timestamp: Some(older),
+            locator: Some(format!("heavy:{index}")),
+            cwd: None,
+            role: "user".into(),
+            lines: vec![format!("from now on keep heavy turn {index}")],
+        })
+        .collect();
+    let lines_per_turn = MAX_CANDIDATES.div_ceil(6);
+    let thin_lines: Vec<TranscriptEntry> = (0..6)
+        .map(|turn| TranscriptEntry {
+            timestamp: Some(newer),
+            locator: Some(format!("thin:{turn}")),
+            cwd: None,
+            role: "user".into(),
+            lines: (0..lines_per_turn)
+                .map(|line| format!("from now on thin filler {turn}-{line}"))
+                .collect(),
+        })
+        .collect();
+    let file = |session: &str, timestamp, entries: Vec<TranscriptEntry>| StoredChunkFile {
+        agent: "codex".into(),
+        date: "2026-10-03".into(),
+        path: PathBuf::from(format!("{session}.jsonl")),
+        project: "codescribe".into(),
+        identity_source: CATALOG_IDENTITY_SOURCE.into(),
+        sequence: 0,
+        timestamp,
+        session_id: session.into(),
+        honesty: crate::oracle::ClaimHonesty::canonical(),
+        scope: None,
+        transcript_entries: Some(entries),
+        body: None,
+    };
+    let config = IntentsConfig {
+        project: "codescribe".into(),
+        hours: 0,
+        strict: false,
+        min_confidence: None,
+        kind_filter: None,
+        frame_kind: None,
+        live: true,
+    };
+    let notes = ScopeNotes {
+        now: Some(now),
+        ..Default::default()
+    };
+    let extraction = extract_intents_from_files_with_stats(
+        &config,
+        vec![
+            file("thin-session", newer, thin_lines),
+            file("heavy-session", older, heavy_lines),
+        ],
+        0,
+        CATALOG_IDENTITY_SOURCE,
+        0,
+        &IntentSourceFilter::default(),
+        notes,
+    )
+    .expect("extract");
+    let heavy = extraction
+        .selection
+        .iter()
+        .find(|row| row.session_id == "heavy-session")
+        .expect("heavy selection");
+    let thin = extraction
+        .selection
+        .iter()
+        .find(|row| row.session_id == "thin-session")
+        .expect("thin selection");
+    assert_eq!(heavy.human_messages, 344);
+    assert_eq!(thin.human_messages, 6);
+    assert!(extraction.stats.dropped_candidates > 0);
+    assert!(
+        extraction
+            .records
+            .iter()
+            .any(|record| record.session_id == "heavy-session"),
+        "heavy session was dropped under the cap; dropped={}",
+        extraction.stats.dropped_candidates
+    );
+}
+
+#[cfg(feature = "app")]
+#[test]
+fn admission_weight_counts_only_user_turns_inside_explicit_date_window() {
+    use chrono::TimeZone;
+
+    let old = Utc.with_ymd_and_hms(2026, 9, 1, 12, 0, 0).unwrap();
+    let heavy_qualifying = Utc.with_ymd_and_hms(2026, 10, 2, 12, 0, 0).unwrap();
+    let thin_first = Utc.with_ymd_and_hms(2026, 10, 1, 12, 0, 0).unwrap();
+    let thin_latest = Utc.with_ymd_and_hms(2026, 10, 3, 12, 0, 0).unwrap();
+    let now = Utc.with_ymd_and_hms(2026, 10, 6, 12, 0, 0).unwrap();
+    let mut heavy_body = String::from("# AICX session extract\n\n");
+    for index in 0..128 {
+        heavy_body.push_str(&format!(
+            "## {} · user\n\nDecision: historical human turn {index}\n\n",
+            old.to_rfc3339()
+        ));
+    }
+    heavy_body.push_str(&format!(
+        "## {} · user\n\nDecision: one qualifying human turn\n\n",
+        heavy_qualifying.to_rfc3339()
+    ));
+    let thin_body = format!(
+        "# AICX session extract\n\n## {} · user\n\nDecision: qualifying one\n\n## {} · user\n\nDecision: qualifying two\n",
+        thin_first.to_rfc3339(),
+        thin_latest.to_rfc3339()
+    );
+    let file = |session: &str, body: String| StoredChunkFile {
+        agent: "codex".into(),
+        date: "2025-01-01".into(),
+        path: PathBuf::from(format!("{session}.md")),
+        project: "vetcoders/aicx".into(),
+        identity_source: INDEX_IDENTITY_SOURCE.into(),
+        sequence: 0,
+        // Deliberately unusable metadata clock; materialization must replace it
+        // with the newest qualifying utterance.
+        timestamp: DateTime::UNIX_EPOCH,
+        session_id: session.into(),
+        honesty: crate::oracle::ClaimHonesty::canonical(),
+        scope: None,
+        transcript_entries: None,
+        body: Some(body),
+    };
+    let mut files = vec![
+        file("historically-heavy", heavy_body),
+        file("qualifying-heavy", thin_body),
+    ];
+    let config = IntentsConfig {
+        project: "vetcoders/aicx".into(),
+        hours: 0,
+        strict: false,
+        min_confidence: None,
+        kind_filter: None,
+        frame_kind: Some(FrameKind::UserMsg),
+        live: false,
+    };
+    let source_filter = IntentSourceFilter {
+        agent: Some("codex".into()),
+        date_lo: Some("2026-10-01".into()),
+        date_hi: Some("2026-10-06".into()),
+    };
+
+    materialize_transcripts_for_admission(&mut files, &config, &source_filter, Some(now));
+    order_files_for_admission(&mut files);
+
+    assert_eq!(files[0].session_id, "qualifying-heavy");
+    assert_eq!(file_human_messages(&files[0]), 2);
+    assert_eq!(files[0].timestamp, thin_latest);
+    assert_eq!(file_human_messages(&files[1]), 1);
+    assert_eq!(files[1].timestamp, heavy_qualifying);
 }

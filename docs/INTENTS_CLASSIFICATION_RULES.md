@@ -75,8 +75,10 @@ of re-parsing the original transcripts:
 
 Records gathered from validated extracts carry `identity_source: index-v1`.
 Stable bounded projections preserve skipped-record and extract-omission
-coverage. Candidates are ordered by their latest qualifying utterance before
-the global cap, including recent utterances in old sessions.
+coverage. Before the global cap, files are ordered by the number of qualifying
+human turns and then by their latest qualifying utterance, including recent
+utterances in old sessions. Utterances outside `--since`/`--until` never add
+weight or recency to that admission order.
 
 ### 2. The catalog census (fallback)
 

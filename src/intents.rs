@@ -332,7 +332,7 @@ fn note_mixed_scope(
 
 fn extract_intents_from_files_with_stats(
     config: &IntentsConfig,
-    files: Vec<StoredChunkFile>,
+    mut files: Vec<StoredChunkFile>,
     source_errors: usize,
     corpus_identity_source: &str,
     live_sessions: usize,
@@ -347,21 +347,28 @@ fn extract_intents_from_files_with_stats(
         ..
     } = notes;
     let mut selection = selection;
+    materialize_transcripts_for_admission(&mut files, config, source_filter, now);
+    order_files_for_admission(&mut files);
     for file in &files {
-        if !selection.iter().any(|s| {
-            s.agent == file.agent
-                && s.session_id == file.session_id
-                && s.path == file.path.to_string_lossy()
+        let path = file.path.to_string_lossy().into_owned();
+        let weight = file_human_messages(file);
+        if let Some(row) = selection.iter_mut().find(|row| {
+            row.agent == file.agent && row.session_id == file.session_id && row.path == path
         }) {
+            if file.transcript_entries.is_some() {
+                row.human_messages = weight;
+            }
+        } else {
             selection.push(SourceSelection {
                 agent: file.agent.clone(),
                 session_id: file.session_id.clone(),
-                path: file.path.to_string_lossy().into_owned(),
+                path,
                 catalog_project: Some(file.project.clone()),
                 admitted: file.identity_source != LIVE_SCAN_IDENTITY_SOURCE,
                 status: "qualified".into(),
                 qualified_frames: file.transcript_entries.as_ref().map_or(0, Vec::len),
                 latest_activity: Some(file.timestamp.to_rfc3339()),
+                human_messages: weight,
                 ..Default::default()
             });
         }
@@ -413,7 +420,7 @@ fn extract_intents_from_files_with_stats(
     let mut dropped_candidates = 0usize;
     let mut dropped_task_events = 0usize;
 
-    for file in files.into_iter().rev() {
+    for file in files {
         let (signal_lines, transcript_entries) = if let Some(transcript_entries) =
             file.transcript_entries.as_ref()
         {
@@ -483,6 +490,12 @@ fn extract_intents_from_files_with_stats(
             .into();
         }
         let source_chunk = file.path.to_string_lossy().to_string();
+        let weight = transcript_human_messages(&transcript_entries);
+        if let Some(row) = selection.iter_mut().find(|row| {
+            row.agent == file.agent && row.session_id == file.session_id && row.path == source_chunk
+        }) {
+            row.human_messages = weight;
+        }
 
         // oś 3: stamp records with the chunk's canonical bucket (file.project),
         // not the query filter (config.project) — empty/aliased filters must not
@@ -733,6 +746,87 @@ fn verify_stored_chunk_paths(files: &[StoredChunkFile]) -> bool {
 
 /// E.6: append `additions` into `target` until `target` reaches MAX_CANDIDATES.
 /// Emits a single stderr diagnostic the first time a cap is hit per run.
+fn transcript_human_messages(entries: &[TranscriptEntry]) -> usize {
+    entries
+        .iter()
+        .filter(|entry| is_user_role(&entry.role))
+        .count()
+}
+
+fn file_human_messages(file: &StoredChunkFile) -> usize {
+    file.transcript_entries
+        .as_deref()
+        .map(transcript_human_messages)
+        .unwrap_or(0)
+}
+
+/// Parse index bodies once, narrow them the way the candidate loop does, and
+/// drop turns outside the window. Weight has to be known before the cap
+/// decides which file is allowed to fill it.
+fn materialize_transcripts_for_admission(
+    files: &mut [StoredChunkFile],
+    config: &IntentsConfig,
+    source_filter: &IntentSourceFilter,
+    now: Option<DateTime<Utc>>,
+) {
+    let wanted = config.effective_frame_kind();
+    for file in files.iter_mut() {
+        if file.transcript_entries.is_none()
+            && let Some(body) = file.body.take()
+        {
+            let mut entries = parse_extract_document(&body);
+            entries
+                .retain(|entry| FrameKind::parse(&entry.role).is_some_and(|kind| kind == wanted));
+            file.transcript_entries = Some(entries);
+        }
+        if let Some(now) = now
+            && let Some(entries) = file.transcript_entries.as_mut()
+        {
+            let cutoff = window_cutoff(now, config.hours);
+            entries.retain(|entry| {
+                entry
+                    .timestamp
+                    .is_none_or(|time| time >= cutoff && time <= now)
+            });
+        }
+        if (source_filter.date_lo.is_some() || source_filter.date_hi.is_some())
+            && let Some(entries) = file.transcript_entries.as_mut()
+        {
+            entries.retain(|entry| {
+                entry.timestamp.is_some_and(|timestamp| {
+                    source_date_matches_filter(
+                        &timestamp.format("%Y-%m-%d").to_string(),
+                        source_filter,
+                    )
+                })
+            });
+        }
+        if let Some(latest) = file
+            .transcript_entries
+            .as_deref()
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry.timestamp)
+            .max()
+        {
+            file.timestamp = latest;
+            file.date = latest.format("%Y-%m-%d").to_string();
+        }
+    }
+}
+
+/// Heavier human speech is admitted before a newer thin file. Equal weight
+/// keeps the previous newest-first order, including its path tie-break.
+fn order_files_for_admission(files: &mut [StoredChunkFile]) {
+    files.sort_by(|left, right| {
+        file_human_messages(right)
+            .cmp(&file_human_messages(left))
+            .then_with(|| right.timestamp.cmp(&left.timestamp))
+            .then_with(|| right.sequence.cmp(&left.sequence))
+            .then_with(|| right.path.cmp(&left.path))
+    });
+}
+
 fn extend_with_cap<T>(
     target: &mut Vec<T>,
     additions: Vec<T>,
@@ -791,6 +885,52 @@ fn source_agent_matches(agent: &str, filter: &IntentSourceFilter) -> bool {
         .map(|kind| kind.as_str())
         .unwrap_or(want);
     agent == want
+}
+
+#[cfg(feature = "app")]
+#[derive(Debug, PartialEq, Eq)]
+struct CurrentMetadataFact {
+    key: Option<(String, String)>,
+    flagged_for_project: bool,
+}
+
+#[cfg(feature = "app")]
+fn current_metadata_fact(
+    metadata: &serde_json::Value,
+    project: &str,
+    source_filter: &IntentSourceFilter,
+) -> Option<CurrentMetadataFact> {
+    let agent = metadata.get("agent").and_then(|value| value.as_str());
+    if source_filter.agent.is_some()
+        && !agent.is_some_and(|agent| source_agent_matches(agent, source_filter))
+    {
+        return None;
+    }
+    let key = agent
+        .zip(metadata.get("session_id").and_then(|value| value.as_str()))
+        .map(|(agent, session_id)| (agent.to_string(), session_id.to_string()));
+    let project_matches = entry_matches_project(
+        metadata.get("project").and_then(|value| value.as_str()),
+        project,
+    );
+    let guardian = crate::sessions::is_guardian_session_kind(
+        metadata
+            .get("session_kind")
+            .and_then(|value| value.as_str()),
+    );
+    let scope_flagged = !chunk_states_scope(metadata)
+        || metadata
+            .get("scope_conflict")
+            .and_then(|value| value.as_bool())
+            == Some(true)
+        || metadata
+            .get("scope_unattributed")
+            .and_then(|value| value.as_bool())
+            == Some(true);
+    Some(CurrentMetadataFact {
+        key,
+        flagged_for_project: project_matches && !guardian && scope_flagged,
+    })
 }
 
 /// Match the date grammar used by the display filter, but on the utterance's
@@ -859,55 +999,25 @@ fn collect_intent_files_from_index(
     let adapter = crate::steer_index::open_current_adapter_at(aicx_home).ok()?;
     let current_metadata = adapter
         .scan_metadata(adapter.doc_count, |metadata| {
-            if source_filter.agent.is_some()
-                && !metadata
-                    .get("agent")
-                    .and_then(|value| value.as_str())
-                    .is_some_and(|agent| source_agent_matches(agent, source_filter))
-            {
-                return false;
-            }
-            metadata
-                .get("agent")
-                .and_then(|value| value.as_str())
-                .is_some()
-                && metadata
-                    .get("session_id")
-                    .and_then(|value| value.as_str())
-                    .is_some()
+            current_metadata_fact(metadata, project, source_filter).is_some()
         })
         .ok()?;
     let mut current_ids = BTreeSet::new();
     let mut current_flagged_for_project = BTreeSet::new();
+    let mut unidentified_flagged = 0usize;
     for metadata in current_metadata {
-        let Some(agent) = metadata.get("agent").and_then(|value| value.as_str()) else {
-            continue;
-        };
-        let Some(session_id) = metadata.get("session_id").and_then(|value| value.as_str()) else {
-            continue;
-        };
-        let key = (agent.to_string(), session_id.to_string());
-        current_ids.insert(key.clone());
-        let project_matches = metadata
-            .get("project")
-            .and_then(|value| value.as_str())
-            .is_some_and(|stored| entry_matches_project(Some(stored), project));
-        let guardian = crate::sessions::is_guardian_session_kind(
-            metadata
-                .get("session_kind")
-                .and_then(|value| value.as_str()),
-        );
-        let scope_flagged = !chunk_states_scope(&metadata)
-            || metadata
-                .get("scope_conflict")
-                .and_then(|value| value.as_bool())
-                == Some(true)
-            || metadata
-                .get("scope_unattributed")
-                .and_then(|value| value.as_bool())
-                == Some(true);
-        if project_matches && !guardian && scope_flagged {
-            current_flagged_for_project.insert(key);
+        let fact = current_metadata_fact(&metadata, project, source_filter)
+            .expect("scan predicate admitted this metadata");
+        if let Some(key) = fact.key {
+            current_ids.insert(key.clone());
+            if fact.flagged_for_project {
+                current_flagged_for_project.insert(key);
+            }
+        } else if fact.flagged_for_project {
+            unidentified_flagged += 1;
+            crate::diagnostics::log_describe(
+                "intents_index_metadata_unidentified scope_flagged=true",
+            );
         }
     }
 
@@ -928,7 +1038,7 @@ fn collect_intent_files_from_index(
             "intents_index_resource_unmatched agent={agent} session_id={session_id}"
         ));
     }
-    let mut source_errors = unmatched_flagged.len();
+    let mut source_errors = unmatched_flagged.len() + unidentified_flagged;
     let mut selected = Vec::new();
     for original_entry in entries {
         if !source_agent_matches(&original_entry.agent, source_filter) {
@@ -1413,6 +1523,7 @@ fn catalog_frames_to_intent_file(
         .iter()
         .filter(|f| frame_has_conversation_time(f))
         .count();
+    receipt.human_messages = frames.iter().filter(|f| is_user_role(&f.role)).count();
     receipt.scope_withheld_frames = receipt.parsed_frames.saturating_sub(receipt.scoped_frames);
     receipt.outside_window_frames = receipt
         .scoped_frames
