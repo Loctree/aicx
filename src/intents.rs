@@ -670,14 +670,13 @@ fn materialize_transcripts_for_admission(
 ) {
     let wanted = config.effective_frame_kind();
     for file in files.iter_mut() {
-        if file.transcript_entries.is_none() {
-            if let Some(body) = file.body.take() {
-                let mut entries = parse_extract_document(&body);
-                entries.retain(|entry| {
-                    FrameKind::parse(&entry.role).is_some_and(|kind| kind == wanted)
-                });
-                file.transcript_entries = Some(entries);
-            }
+        if file.transcript_entries.is_none()
+            && let Some(body) = file.body.take()
+        {
+            let mut entries = parse_extract_document(&body);
+            entries
+                .retain(|entry| FrameKind::parse(&entry.role).is_some_and(|kind| kind == wanted));
+            file.transcript_entries = Some(entries);
         }
         if let Some(now) = now
             && let Some(entries) = file.transcript_entries.as_mut()
