@@ -64,6 +64,10 @@ pub struct SourceSelection {
     pub scope_withheld_frames: usize,
     pub parser_coverage: Option<String>,
     pub latest_activity: Option<String>,
+    /// User-role turns this extraction kept for the file after the window
+    /// filter. Admission and continuity rank by this count, then by time.
+    /// It is the count already on the frames, not a second sessions-list scan.
+    pub human_messages: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

@@ -299,7 +299,7 @@ fn note_mixed_scope(
 
 fn extract_intents_from_files_with_stats(
     config: &IntentsConfig,
-    files: Vec<StoredChunkFile>,
+    mut files: Vec<StoredChunkFile>,
     source_errors: usize,
     corpus_identity_source: &str,
     live_sessions: usize,
@@ -313,21 +313,28 @@ fn extract_intents_from_files_with_stats(
         ..
     } = notes;
     let mut selection = selection;
+    materialize_transcripts_for_admission(&mut files, config, now);
+    order_files_for_admission(&mut files);
     for file in &files {
-        if !selection.iter().any(|s| {
-            s.agent == file.agent
-                && s.session_id == file.session_id
-                && s.path == file.path.to_string_lossy()
+        let path = file.path.to_string_lossy().into_owned();
+        let weight = file_human_messages(file);
+        if let Some(row) = selection.iter_mut().find(|row| {
+            row.agent == file.agent && row.session_id == file.session_id && row.path == path
         }) {
+            if file.transcript_entries.is_some() {
+                row.human_messages = weight;
+            }
+        } else {
             selection.push(SourceSelection {
                 agent: file.agent.clone(),
                 session_id: file.session_id.clone(),
-                path: file.path.to_string_lossy().into_owned(),
+                path,
                 catalog_project: Some(file.project.clone()),
                 admitted: file.identity_source != LIVE_SCAN_IDENTITY_SOURCE,
                 status: "qualified".into(),
                 qualified_frames: file.transcript_entries.as_ref().map_or(0, Vec::len),
                 latest_activity: Some(file.timestamp.to_rfc3339()),
+                human_messages: weight,
                 ..Default::default()
             });
         }
@@ -379,7 +386,7 @@ fn extract_intents_from_files_with_stats(
     let mut dropped_candidates = 0usize;
     let mut dropped_task_events = 0usize;
 
-    for file in files.into_iter().rev() {
+    for file in files {
         let (signal_lines, transcript_entries) = if let Some(transcript_entries) =
             file.transcript_entries.as_ref()
         {
@@ -413,6 +420,12 @@ fn extract_intents_from_files_with_stats(
             });
         }
         let source_chunk = file.path.to_string_lossy().to_string();
+        let weight = transcript_human_messages(&transcript_entries);
+        if let Some(row) = selection.iter_mut().find(|row| {
+            row.agent == file.agent && row.session_id == file.session_id && row.path == source_chunk
+        }) {
+            row.human_messages = weight;
+        }
 
         // oś 3: stamp records with the chunk's canonical bucket (file.project),
         // not the query filter (config.project) — empty/aliased filters must not
@@ -633,6 +646,64 @@ fn verify_stored_chunk_paths(files: &[StoredChunkFile]) -> bool {
 
 /// E.6: append `additions` into `target` until `target` reaches MAX_CANDIDATES.
 /// Emits a single stderr diagnostic the first time a cap is hit per run.
+fn transcript_human_messages(entries: &[TranscriptEntry]) -> usize {
+    entries
+        .iter()
+        .filter(|entry| is_user_role(&entry.role))
+        .count()
+}
+
+fn file_human_messages(file: &StoredChunkFile) -> usize {
+    file.transcript_entries
+        .as_deref()
+        .map(transcript_human_messages)
+        .unwrap_or(0)
+}
+
+/// Parse index bodies once, narrow them the way the candidate loop does, and
+/// drop turns outside the window. Weight has to be known before the cap
+/// decides which file is allowed to fill it.
+fn materialize_transcripts_for_admission(
+    files: &mut [StoredChunkFile],
+    config: &IntentsConfig,
+    now: Option<DateTime<Utc>>,
+) {
+    let wanted = config.effective_frame_kind();
+    for file in files.iter_mut() {
+        if file.transcript_entries.is_none() {
+            if let Some(body) = file.body.take() {
+                let mut entries = parse_extract_document(&body);
+                entries.retain(|entry| {
+                    FrameKind::parse(&entry.role).is_some_and(|kind| kind == wanted)
+                });
+                file.transcript_entries = Some(entries);
+            }
+        }
+        if let Some(now) = now
+            && let Some(entries) = file.transcript_entries.as_mut()
+        {
+            let cutoff = window_cutoff(now, config.hours);
+            entries.retain(|entry| {
+                entry
+                    .timestamp
+                    .is_none_or(|time| time >= cutoff && time <= now)
+            });
+        }
+    }
+}
+
+/// Heavier human speech is admitted before a newer thin file. Equal weight
+/// keeps the previous newest-first order, including its path tie-break.
+fn order_files_for_admission(files: &mut [StoredChunkFile]) {
+    files.sort_by(|left, right| {
+        file_human_messages(right)
+            .cmp(&file_human_messages(left))
+            .then_with(|| right.timestamp.cmp(&left.timestamp))
+            .then_with(|| right.sequence.cmp(&left.sequence))
+            .then_with(|| right.path.cmp(&left.path))
+    });
+}
+
 fn extend_with_cap<T>(
     target: &mut Vec<T>,
     additions: Vec<T>,
@@ -1103,6 +1174,7 @@ fn catalog_frames_to_intent_file(
         .iter()
         .filter(|f| frame_has_conversation_time(f))
         .count();
+    receipt.human_messages = frames.iter().filter(|f| is_user_role(&f.role)).count();
     receipt.scope_withheld_frames = receipt.parsed_frames.saturating_sub(receipt.scoped_frames);
     receipt.outside_window_frames = receipt
         .scoped_frames

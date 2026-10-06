@@ -60,6 +60,8 @@ pub struct SourceLine {
     /// Latest retained claim activity, never source-file mtime.
     pub latest_activity: Option<String>,
     pub live: bool,
+    /// User-role turns the extraction kept for this source.
+    pub human_messages: usize,
 }
 
 pub struct IndexHealthLine {
@@ -139,7 +141,7 @@ pub fn build_with_scope_at(
             record.timestamp = Some(timestamp.to_rfc3339());
         }
     }
-    let sources = collect_sources(&extraction.selection, &records);
+    let sources = collect_sources(&extraction.selection, &records, &mixed_scope);
 
     Ok(ContinuityPack {
         selection: extraction.selection,
@@ -262,9 +264,25 @@ fn mixed_window_refusal(
 
 /// Sources are receipts for retained claims, not a second catalog/mtime scan.
 /// Qualification without a classifier record remains visible in coverage.
+fn session_human_weights(selection: &[intents::SourceSelection]) -> BTreeMap<(&str, &str), usize> {
+    let mut weights: BTreeMap<(&str, &str), usize> = BTreeMap::new();
+    for source in selection {
+        let weight = weights
+            .entry((source.agent.as_str(), source.session_id.as_str()))
+            .or_insert(0);
+        *weight = (*weight).saturating_add(source.human_messages);
+    }
+    weights
+}
+
+fn weight_of(weights: &BTreeMap<(&str, &str), usize>, agent: &str, session_id: &str) -> usize {
+    weights.get(&(agent, session_id)).copied().unwrap_or(0)
+}
+
 fn collect_sources(
     selection: &[intents::SourceSelection],
     records: &[IntentRecord],
+    mixed: &[intents::MixedScopeSession],
 ) -> Vec<SourceLine> {
     let mut sources: BTreeMap<(&str, &str), SourceLine> = BTreeMap::new();
     for selected in selection.iter().filter(|source| {
@@ -273,6 +291,11 @@ fn collect_sources(
             "qualified" | "unbounded_unknown_time"
         )
     }) {
+        if mixed.iter().any(|session| {
+            session.agent == selected.agent && session.session_id == selected.session_id
+        }) {
+            continue;
+        }
         let retained: Vec<&IntentRecord> = records
             .iter()
             .filter(|record| {
@@ -281,7 +304,7 @@ fn collect_sources(
                     && record.source_chunk == selected.path
             })
             .collect();
-        if retained.is_empty() {
+        if retained.is_empty() && selected.human_messages == 0 {
             continue;
         }
         let latest = newest_record_time(&retained).map(|time| time.to_rfc3339());
@@ -292,15 +315,18 @@ fn collect_sources(
                 path: selected.path.clone(),
                 latest_activity: None,
                 live: !selected.admitted,
+                human_messages: 0,
             });
+        source.human_messages = source.human_messages.max(selected.human_messages);
         if latest > source.latest_activity {
             source.latest_activity = latest;
         }
     }
     let mut sources: Vec<SourceLine> = sources.into_values().collect();
     sources.sort_by(|a, b| {
-        b.latest_activity
-            .cmp(&a.latest_activity)
+        b.human_messages
+            .cmp(&a.human_messages)
+            .then_with(|| b.latest_activity.cmp(&a.latest_activity))
             .then_with(|| a.path.cmp(&b.path))
     });
     sources
@@ -372,6 +398,7 @@ fn push_honesty_preface(out: &mut String, pack: &ContinuityPack) {
     out.push_str("labels: Decision, Intent, Outcome, and Task are classifier candidates, not verified Founder decisions or completed work (verification_state=not_verified_by_aicx). A user role alone does not authenticate quoted instructions.\n");
     out.push_str("now: open means a retained live_open record; missing records do not prove thread absence. Session ids and project handles are stored identities; truncated ids, aliases, renames and splits are not resolved here.\n");
     out.push_str("time: a later record or unrelated Outcome does not retire an earlier request; no explicit resolution links are available. Human requests and constraint candidates precede peer claims.\n");
+    out.push_str("rank: human-turn weight, then recency. A newer session with fewer user turns does not outrank a heavier one. human=N is the user-role turn count this extraction kept.\n");
 
     let qualified = pack
         .selection
@@ -486,10 +513,12 @@ fn push_honesty_preface(out: &mut String, pack: &ContinuityPack) {
     let mut peer_sessions_shown = 0;
     let mut peer_claims_shown = 0;
     let mut peer_sessions_total = 0;
-    for sessions in per_agent.values_mut() {
+    let weights = session_human_weights(&pack.selection);
+    for (agent, sessions) in per_agent.iter_mut() {
         sessions.sort_by(|(id_a, a), (id_b, b)| {
-            newest_record_time(b)
-                .cmp(&newest_record_time(a))
+            weight_of(&weights, agent, id_b)
+                .cmp(&weight_of(&weights, agent, id_a))
+                .then_with(|| newest_record_time(b).cmp(&newest_record_time(a)))
                 .then_with(|| id_a.cmp(id_b))
         });
         peer_sessions_total += sessions.len();
@@ -608,6 +637,7 @@ pub fn render(pack: &ContinuityPack, for_inject: bool) -> String {
     push_honesty_preface(&mut out, pack);
 
     out.push_str("## NOW\n\n");
+    let weights = session_human_weights(&pack.selection);
     let mut requests = unresolved_intents(&pack.records);
     requests.extend(
         pack.records
@@ -615,8 +645,13 @@ pub fn render(pack: &ContinuityPack, for_inject: bool) -> String {
             .filter(|record| human_record(record) && record.kind == IntentKind::Decision),
     );
     requests.sort_by(|a, b| {
-        human_record(b)
-            .cmp(&human_record(a))
+        weight_of(&weights, b.agent.as_str(), b.session_id.as_str())
+            .cmp(&weight_of(
+                &weights,
+                a.agent.as_str(),
+                a.session_id.as_str(),
+            ))
+            .then_with(|| human_record(b).cmp(&human_record(a)))
             .then_with(|| record_time(b).cmp(&record_time(a)))
             .then_with(|| a.agent.cmp(&b.agent))
             .then_with(|| a.session_id.cmp(&b.session_id))
@@ -645,17 +680,23 @@ pub fn render(pack: &ContinuityPack, for_inject: bool) -> String {
         }
     }
     let mut open_sessions: Vec<_> = open_sessions.into_iter().collect();
-    open_sessions.sort_by(|(id_a, a), (id_b, b)| b.cmp(a).then_with(|| id_a.cmp(id_b)));
+    open_sessions.sort_by(|(id_a, a), (id_b, b)| {
+        weight_of(&weights, id_b.0, id_b.1)
+            .cmp(&weight_of(&weights, id_a.0, id_a.1))
+            .then_with(|| b.cmp(a))
+            .then_with(|| id_a.cmp(id_b))
+    });
     if open_sessions.is_empty() {
         out.push_str("- no retained open-session records inside the window; thread absence is not established\n");
     }
     for ((agent, session), timestamp) in open_sessions.into_iter().take(NOW_CAP) {
         out.push_str(&format!(
-            "- open: {agent} · {session} · {}\n",
+            "- open: {agent} · {session} · {} · human={}\n",
             timestamp
                 .map(|time| time.to_rfc3339())
                 .as_deref()
-                .unwrap_or("unknown")
+                .unwrap_or("unknown"),
+            weight_of(&weights, agent, session)
         ));
     }
     if !pack.mixed_scope.is_empty() {
@@ -707,8 +748,9 @@ pub fn render(pack: &ContinuityPack, for_inject: bool) -> String {
         out.push_str(&format!("### {agent}\n"));
         let mut ordered: Vec<_> = sessions.into_iter().collect();
         ordered.sort_by(|(id_a, a), (id_b, b)| {
-            newest_record_time(b)
-                .cmp(&newest_record_time(a))
+            weight_of(&weights, agent, id_b)
+                .cmp(&weight_of(&weights, agent, id_a))
+                .then_with(|| newest_record_time(b).cmp(&newest_record_time(a)))
                 .then_with(|| id_a.cmp(id_b))
         });
         for (session, mut records) in ordered.into_iter().take(PEER_SESSION_CAP) {
@@ -720,7 +762,10 @@ pub fn render(pack: &ContinuityPack, for_inject: bool) -> String {
             let timestamp = newest_record_time(&records)
                 .map(|time| time.to_rfc3339())
                 .unwrap_or_else(|| "unknown".to_string());
-            out.push_str(&format!("- {session}{marker} · {timestamp}\n"));
+            out.push_str(&format!(
+                "- {session}{marker} · human={} · {timestamp}\n",
+                weight_of(&weights, agent, session)
+            ));
             records.sort_by(|a, b| {
                 human_record(b)
                     .cmp(&human_record(a))
@@ -745,8 +790,13 @@ pub fn render(pack: &ContinuityPack, for_inject: bool) -> String {
         .filter(|record| record.kind == IntentKind::Decision)
         .collect();
     decisions.sort_by(|a, b| {
-        human_record(b)
-            .cmp(&human_record(a))
+        weight_of(&weights, b.agent.as_str(), b.session_id.as_str())
+            .cmp(&weight_of(
+                &weights,
+                a.agent.as_str(),
+                a.session_id.as_str(),
+            ))
+            .then_with(|| human_record(b).cmp(&human_record(a)))
             .then_with(|| record_time(b).cmp(&record_time(a)))
             .then_with(|| a.source_chunk.cmp(&b.source_chunk))
     });
@@ -765,8 +815,13 @@ pub fn render(pack: &ContinuityPack, for_inject: bool) -> String {
         .filter(|record| record.kind == IntentKind::Task)
         .collect();
     tasks.sort_by(|a, b| {
-        human_record(b)
-            .cmp(&human_record(a))
+        weight_of(&weights, b.agent.as_str(), b.session_id.as_str())
+            .cmp(&weight_of(
+                &weights,
+                a.agent.as_str(),
+                a.session_id.as_str(),
+            ))
+            .then_with(|| human_record(b).cmp(&human_record(a)))
             .then_with(|| record_time(b).cmp(&record_time(a)))
             .then_with(|| a.source_chunk.cmp(&b.source_chunk))
     });
@@ -786,8 +841,9 @@ pub fn render(pack: &ContinuityPack, for_inject: bool) -> String {
     }
     for source in pack.sources.iter().take(SOURCE_CAP) {
         out.push_str(&format!(
-            "- {} · latest_retained_claim_activity={} · {}{}\n",
+            "- {} · human={} · latest_retained_claim_activity={} · {}{}\n",
             source.agent,
+            source.human_messages,
             source.latest_activity.as_deref().unwrap_or("unknown"),
             source.path,
             if source.live { " [unadmitted]" } else { "" }
@@ -1439,5 +1495,136 @@ mod tests {
             assert!(result.unwrap().contains("truncated"));
         }
         fs::remove_dir_all(root).unwrap();
+    }
+
+    fn weighted_decision(session: &str, path: &str, when: &str, summary: &str) -> IntentRecord {
+        IntentRecord {
+            provenance: Some(crate::intents::IntentProvenance {
+                role: "user".into(),
+                locator: "line:1".into(),
+                scope: None,
+                timestamp_basis: "conversation".into(),
+                attribution: "transcript".into(),
+            }),
+            kind: IntentKind::Decision,
+            summary: summary.into(),
+            context: None,
+            evidence: Vec::new(),
+            project: "codescribe".into(),
+            agent: "codex".into(),
+            date: "2026-10-03".into(),
+            timestamp: Some(when.into()),
+            session_id: session.into(),
+            count: None,
+            first_chunk: None,
+            last_chunk: None,
+            source_chunk: path.into(),
+            source: None,
+            honesty: crate::oracle::ClaimHonesty::canonical(),
+        }
+    }
+
+    fn qualified_source(
+        session: &str,
+        path: &str,
+        human_messages: usize,
+    ) -> intents::SourceSelection {
+        intents::SourceSelection {
+            agent: "codex".into(),
+            session_id: session.into(),
+            path: path.into(),
+            status: "qualified".into(),
+            admitted: true,
+            human_messages,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn heavier_older_session_outranks_newer_thin_ones() {
+        let heavy_id = "01a0f7e1-d2c3-72b2-aacf-d029ac5370cc";
+        let mut records = vec![weighted_decision(
+            heavy_id,
+            "heavy.jsonl",
+            "2026-10-03T22:18:00Z",
+            "keep the heavy session",
+        )];
+        let mut selection = vec![qualified_source(heavy_id, "heavy.jsonl", 344)];
+        for index in 0..8 {
+            let session = format!("thin-{index}");
+            let path = format!("thin-{index}.jsonl");
+            records.push(weighted_decision(
+                &session,
+                &path,
+                &format!("2026-10-05T19:10:{index:02}Z"),
+                &format!("thin decision {index}"),
+            ));
+            selection.push(qualified_source(&session, &path, 6));
+        }
+        selection.push(qualified_source("silent-heavy", "silent.jsonl", 344));
+        let mixed = vec![crate::intents::MixedScopeSession {
+            agent: "codex".into(),
+            session_id: "mixed-heavy".into(),
+            cwds: vec!["/a".into(), "/b".into()],
+            branches: Vec::new(),
+            conflicts: 1,
+            hidden_scopes: 0,
+            status: aicx_parser::engine::ScopeStatus::MixedCandidate,
+        }];
+        selection.push(qualified_source("mixed-heavy", "mixed.jsonl", 344));
+        let sources = collect_sources(&selection, &records, &mixed);
+        assert_eq!(sources[0].path, "heavy.jsonl");
+        assert_eq!(sources[0].human_messages, 344);
+        assert!(sources.iter().any(|source| source.path == "silent.jsonl"));
+        assert!(sources.iter().all(|source| source.path != "mixed.jsonl"));
+        let pack = ContinuityPack {
+            selection,
+            source_errors: 0,
+            dropped_task_events: 0,
+            window_end: "2026-10-06T12:00:00Z".into(),
+            project_label: "codescribe".into(),
+            hours: 120,
+            live_sessions: 10,
+            records,
+            sources,
+            index_health: IndexHealthLine {
+                newest_session_updated_at: None,
+                committed_at: None,
+                pending: 0,
+                sessions_newer_than_chunks: 0,
+                readiness: "ready".into(),
+                mode: "live",
+            },
+            mixed_scope: mixed,
+            distilled_mixed: false,
+            candidate_cap: 5_000,
+            dropped_candidates: 0,
+            unplaced_scope: Vec::new(),
+        };
+        let rendered = render(&pack, false);
+        let peers = rendered
+            .split("## PEERS")
+            .nth(1)
+            .and_then(|section| section.split("## DECISIONS").next())
+            .unwrap_or("");
+        assert!(peers.contains(heavy_id), "{peers}");
+        assert!(peers.contains("human=344"), "{peers}");
+        assert!(!peers.contains("thin-0"), "{peers}");
+        let decisions = rendered
+            .split("## DECISIONS")
+            .nth(1)
+            .and_then(|section| section.split("## TASKS").next())
+            .unwrap_or("");
+        let heavy_at = decisions
+            .find("keep the heavy session")
+            .expect("heavy decision");
+        let thin_at = decisions
+            .find("thin decision 7")
+            .expect("newest thin decision");
+        assert!(heavy_at < thin_at, "{decisions}");
+        let source_block = rendered.split("## SOURCES").nth(1).unwrap_or("");
+        let heavy_source = source_block.find("human=344").expect("weighted source");
+        let thin_source = source_block.find("human=6").expect("thin source");
+        assert!(heavy_source < thin_source, "{source_block}");
     }
 }

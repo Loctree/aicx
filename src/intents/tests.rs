@@ -5294,3 +5294,98 @@ fn a_chunk_that_cannot_state_its_scope_is_not_a_clean_chunk() {
         );
     }
 }
+
+#[cfg(feature = "app")]
+#[test]
+fn heavier_older_session_survives_the_candidate_cap() {
+    use super::{
+        CATALOG_IDENTITY_SOURCE, MAX_CANDIDATES, ScopeNotes, StoredChunkFile, TranscriptEntry,
+        extract_intents_from_files_with_stats,
+    };
+    use chrono::TimeZone;
+
+    let older = Utc.with_ymd_and_hms(2026, 10, 3, 22, 18, 0).unwrap();
+    let newer = Utc.with_ymd_and_hms(2026, 10, 5, 19, 10, 0).unwrap();
+    let now = Utc.with_ymd_and_hms(2026, 10, 6, 12, 0, 0).unwrap();
+    let heavy_lines: Vec<TranscriptEntry> = (0..344)
+        .map(|index| TranscriptEntry {
+            timestamp: Some(older),
+            locator: Some(format!("heavy:{index}")),
+            cwd: None,
+            role: "user".into(),
+            lines: vec![format!("from now on keep heavy turn {index}")],
+        })
+        .collect();
+    let lines_per_turn = MAX_CANDIDATES.div_ceil(6);
+    let thin_lines: Vec<TranscriptEntry> = (0..6)
+        .map(|turn| TranscriptEntry {
+            timestamp: Some(newer),
+            locator: Some(format!("thin:{turn}")),
+            cwd: None,
+            role: "user".into(),
+            lines: (0..lines_per_turn)
+                .map(|line| format!("from now on thin filler {turn}-{line}"))
+                .collect(),
+        })
+        .collect();
+    let file = |session: &str, timestamp, entries: Vec<TranscriptEntry>| StoredChunkFile {
+        agent: "codex".into(),
+        date: "2026-10-03".into(),
+        path: PathBuf::from(format!("{session}.jsonl")),
+        project: "codescribe".into(),
+        identity_source: CATALOG_IDENTITY_SOURCE.into(),
+        sequence: 0,
+        timestamp,
+        session_id: session.into(),
+        honesty: crate::oracle::ClaimHonesty::canonical(),
+        scope: None,
+        transcript_entries: Some(entries),
+        body: None,
+    };
+    let config = IntentsConfig {
+        project: "codescribe".into(),
+        hours: 0,
+        strict: false,
+        min_confidence: None,
+        kind_filter: None,
+        frame_kind: None,
+        live: true,
+    };
+    let notes = ScopeNotes {
+        now: Some(now),
+        ..Default::default()
+    };
+    let extraction = extract_intents_from_files_with_stats(
+        &config,
+        vec![
+            file("thin-session", newer, thin_lines),
+            file("heavy-session", older, heavy_lines),
+        ],
+        0,
+        CATALOG_IDENTITY_SOURCE,
+        0,
+        notes,
+    )
+    .expect("extract");
+    let heavy = extraction
+        .selection
+        .iter()
+        .find(|row| row.session_id == "heavy-session")
+        .expect("heavy selection");
+    let thin = extraction
+        .selection
+        .iter()
+        .find(|row| row.session_id == "thin-session")
+        .expect("thin selection");
+    assert_eq!(heavy.human_messages, 344);
+    assert_eq!(thin.human_messages, 6);
+    assert!(extraction.stats.dropped_candidates > 0);
+    assert!(
+        extraction
+            .records
+            .iter()
+            .any(|record| record.session_id == "heavy-session"),
+        "heavy session was dropped under the cap; dropped={}",
+        extraction.stats.dropped_candidates
+    );
+}
