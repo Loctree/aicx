@@ -11,6 +11,52 @@ LEGACY_PLIST="$HOME/Library/LaunchAgents/$LEGACY_LABEL.plist"
 note() { printf '  %s\n' "$*"; }
 gui_domain() { printf 'gui/%s' "$(id -u)"; }
 
+# launchd removes a booted-out job asynchronously; an immediate bootstrap of
+# the same label races that removal and fails with "Bootstrap failed: 5:
+# Input/output error". Wait for the label to disappear, and retry bootstrap.
+BOOTSTRAP_ATTEMPTS="${AICX_RUNTIME_BOOTSTRAP_ATTEMPTS:-5}"
+
+wait_until_unloaded() {
+  local label="$1"
+  local tries=20
+  while launchctl print "$(gui_domain)/$label" >/dev/null 2>&1; do
+    tries=$((tries - 1))
+    if [ "$tries" -le 0 ]; then
+      return 1
+    fi
+    sleep 0.25
+  done
+  return 0
+}
+
+bootout_and_wait() {
+  local label="$1"
+  launchctl bootout "$(gui_domain)/$label" 2>/dev/null || true
+  wait_until_unloaded "$label" || true
+}
+
+bootstrap_with_retry() {
+  local plist="$1"
+  local label="$2"
+  local attempt=1
+  local err=""
+  while :; do
+    err="$(launchctl bootstrap "$(gui_domain)" "$plist" 2>&1)" || true
+    if launchctl print "$(gui_domain)/$label" >/dev/null 2>&1; then
+      return 0
+    fi
+    if [ "$attempt" -ge "$BOOTSTRAP_ATTEMPTS" ]; then
+      break
+    fi
+    attempt=$((attempt + 1))
+    sleep 0.5
+  done
+  if [ -n "$err" ]; then
+    printf '%s\n' "$err" >&2
+  fi
+  return 1
+}
+
 if [ "$(uname -s)" != "Darwin" ]; then
   note "runtime repair: skipped (launchd-only; this host is $(uname -s))"
   exit 0
@@ -68,8 +114,8 @@ rollback_on_exit() {
   if [ "$status" -ne 0 ]; then
     restore_plist
     if [ "$SERVICE_STOPPED" = "1" ]; then
-      launchctl bootout "$(gui_domain)/$LABEL" 2>/dev/null || true
-      launchctl bootout "$(gui_domain)/$LEGACY_LABEL" 2>/dev/null || true
+      bootout_and_wait "$LABEL"
+      bootout_and_wait "$LEGACY_LABEL"
       if [ -n "$LEGACY_ARCHIVE" ] && [ -f "$LEGACY_ARCHIVE" ]; then
         if [ -f "$LEGACY_PLIST" ]; then
           rm -f "$LEGACY_ARCHIVE"
@@ -79,15 +125,15 @@ rollback_on_exit() {
       fi
       reload_failed=0
       if [ "$CANONICAL_WAS_LOADED" = "1" ]; then
-        if ! launchctl bootstrap "$(gui_domain)" "$CANONICAL_PLIST" 2>/dev/null || \
-           ! launchctl print "$(gui_domain)/$LABEL" >/dev/null 2>&1; then
+        if ! bootstrap_with_retry "$CANONICAL_PLIST" "$LABEL"; then
           reload_failed=1
+          echo "Recover manually: launchctl bootstrap $(gui_domain) $CANONICAL_PLIST" >&2
         fi
       fi
       if [ "$LEGACY_WAS_LOADED" = "1" ]; then
-        if ! launchctl bootstrap "$(gui_domain)" "$LEGACY_PLIST" 2>/dev/null || \
-           ! launchctl print "$(gui_domain)/$LEGACY_LABEL" >/dev/null 2>&1; then
+        if ! bootstrap_with_retry "$LEGACY_PLIST" "$LEGACY_LABEL"; then
           reload_failed=1
+          echo "Recover manually: launchctl bootstrap $(gui_domain) $LEGACY_PLIST" >&2
         fi
       fi
       if [ "$CANONICAL_WAS_LOADED" = "0" ] && [ "$LEGACY_WAS_LOADED" = "0" ]; then
@@ -175,6 +221,12 @@ case "$HEALTH_ATTEMPTS" in
     exit 1
     ;;
 esac
+case "$BOOTSTRAP_ATTEMPTS" in
+  ''|*[!0-9]*|0)
+    echo "Error: AICX_RUNTIME_BOOTSTRAP_ATTEMPTS must be a positive integer" >&2
+    exit 1
+    ;;
+esac
 
 launchd_job_pid() {
   launchctl print "$(gui_domain)/$LABEL" 2>/dev/null | awk '
@@ -232,10 +284,9 @@ socket_owned_by_launchd_job() {
 }
 
 SERVICE_STOPPED=1
-launchctl bootout "$(gui_domain)/$LEGACY_LABEL" 2>/dev/null || true
-launchctl bootout "$(gui_domain)/$LABEL" 2>/dev/null || true
-if ! launchctl bootstrap "$(gui_domain)" "$CANONICAL_PLIST" || \
-   ! launchctl print "$(gui_domain)/$LABEL" >/dev/null; then
+bootout_and_wait "$LEGACY_LABEL"
+bootout_and_wait "$LABEL"
+if ! bootstrap_with_retry "$CANONICAL_PLIST" "$LABEL"; then
   echo "Error: repaired MCP service did not load; rolling back" >&2
   exit 1
 fi

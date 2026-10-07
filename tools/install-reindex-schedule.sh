@@ -36,6 +36,58 @@ fi
 
 gui_domain() { printf 'gui/%s' "$(id -u)"; }
 
+# launchd removes a booted-out job asynchronously; an immediate bootstrap of
+# the same label races that removal and fails with "Bootstrap failed: 5:
+# Input/output error". Wait for the label to disappear, and retry bootstrap.
+BOOTSTRAP_ATTEMPTS="${AICX_RUNTIME_BOOTSTRAP_ATTEMPTS:-5}"
+case "$BOOTSTRAP_ATTEMPTS" in
+  ''|*[!0-9]*|0)
+    echo "Error: AICX_RUNTIME_BOOTSTRAP_ATTEMPTS must be a positive integer" >&2
+    exit 1
+    ;;
+esac
+
+wait_until_unloaded() {
+  local label="$1"
+  local tries=20
+  while launchctl print "$(gui_domain)/$label" >/dev/null 2>&1; do
+    tries=$((tries - 1))
+    if [ "$tries" -le 0 ]; then
+      return 1
+    fi
+    sleep 0.25
+  done
+  return 0
+}
+
+bootout_and_wait() {
+  local label="$1"
+  launchctl bootout "$(gui_domain)/$label" 2>/dev/null || true
+  wait_until_unloaded "$label" || true
+}
+
+bootstrap_with_retry() {
+  local plist="$1"
+  local label="$2"
+  local attempt=1
+  local err=""
+  while :; do
+    err="$(launchctl bootstrap "$(gui_domain)" "$plist" 2>&1)" || true
+    if launchctl print "$(gui_domain)/$label" >/dev/null 2>&1; then
+      return 0
+    fi
+    if [ "$attempt" -ge "$BOOTSTRAP_ATTEMPTS" ]; then
+      break
+    fi
+    attempt=$((attempt + 1))
+    sleep 0.5
+  done
+  if [ -n "$err" ]; then
+    printf '%s\n' "$err" >&2
+  fi
+  return 1
+}
+
 if [ "${1:-}" = "--uninstall" ]; then
   launchctl bootout "$(gui_domain)/$LABEL" 2>/dev/null || true
   rm -f "$PLIST"
@@ -101,8 +153,8 @@ rollback_on_exit() {
   trap - EXIT
   if [ "$status" -ne 0 ] && [ "$TRANSACTION_ACTIVE" = "1" ]; then
     if [ "$SERVICES_TOUCHED" = "1" ]; then
-      launchctl bootout "$(gui_domain)/$LABEL" 2>/dev/null || true
-      launchctl bootout "$(gui_domain)/$LEGACY_LABEL" 2>/dev/null || true
+      bootout_and_wait "$LABEL"
+      bootout_and_wait "$LEGACY_LABEL"
     fi
     restore_file "$CANONICAL_EXISTED" "$CANONICAL_BACKUP" "$PLIST"
     restore_file "$LEGACY_EXISTED" "$LEGACY_BACKUP" "$LEGACY_PLIST"
@@ -111,15 +163,15 @@ rollback_on_exit() {
     fi
     reload_failed=0
     if [ "$SERVICES_TOUCHED" = "1" ] && [ "$CANONICAL_WAS_LOADED" = "1" ]; then
-      if ! launchctl bootstrap "$(gui_domain)" "$PLIST" 2>/dev/null || \
-         ! launchctl print "$(gui_domain)/$LABEL" >/dev/null 2>&1; then
+      if ! bootstrap_with_retry "$PLIST" "$LABEL"; then
         reload_failed=1
+        echo "Recover manually: launchctl bootstrap $(gui_domain) $PLIST" >&2
       fi
     fi
     if [ "$SERVICES_TOUCHED" = "1" ] && [ "$LEGACY_WAS_LOADED" = "1" ]; then
-      if ! launchctl bootstrap "$(gui_domain)" "$LEGACY_PLIST" 2>/dev/null || \
-         ! launchctl print "$(gui_domain)/$LEGACY_LABEL" >/dev/null 2>&1; then
+      if ! bootstrap_with_retry "$LEGACY_PLIST" "$LEGACY_LABEL"; then
         reload_failed=1
+        echo "Recover manually: launchctl bootstrap $(gui_domain) $LEGACY_PLIST" >&2
       fi
     fi
     if [ "$reload_failed" = "0" ]; then
@@ -186,10 +238,9 @@ if launchctl print "$(gui_domain)/$LEGACY_LABEL" >/dev/null 2>&1; then
   LEGACY_WAS_LOADED=1
 fi
 SERVICES_TOUCHED=1
-launchctl bootout "$(gui_domain)/$LEGACY_LABEL" 2>/dev/null || true
-launchctl bootout "$(gui_domain)/$LABEL" 2>/dev/null || true
-if ! launchctl bootstrap "$(gui_domain)" "$PLIST" || \
-   ! launchctl print "$(gui_domain)/$LABEL" >/dev/null 2>&1; then
+bootout_and_wait "$LEGACY_LABEL"
+bootout_and_wait "$LABEL"
+if ! bootstrap_with_retry "$PLIST" "$LABEL"; then
   echo "Error: LaunchAgent $LABEL failed to register; rolling back" >&2
   exit 1
 fi

@@ -87,9 +87,14 @@ def fixture(tmp: Path) -> tuple[Path, Path, dict[str, str], Path, Path]:
         "  fail=0\n"
         "  [ \"${AICX_SELFTEST_FAIL_BOOTSTRAP_ONCE:-0}\" = 1 ] && fail=1\n"
         "  [ \"${AICX_SELFTEST_FAIL_BOOTSTRAP_LABEL:-}\" = \"$label\" ] && fail=1\n"
-        "  if [ \"$fail\" = 1 ] && [ ! -e \"$AICX_SELFTEST_BOOTSTRAP_MARKER\" ]; then\n"
-        "    : > \"$AICX_SELFTEST_BOOTSTRAP_MARKER\"\n"
-        "    exit 1\n"
+        "  if [ \"$fail\" = 1 ]; then\n"
+        "    count=0\n"
+        "    [ -f \"$AICX_SELFTEST_BOOTSTRAP_MARKER\" ] && count=\"$(cat \"$AICX_SELFTEST_BOOTSTRAP_MARKER\")\"\n"
+        "    if [ \"$count\" -lt \"${AICX_SELFTEST_FAIL_BOOTSTRAP_COUNT:-1}\" ]; then\n"
+        "      echo $((count + 1)) > \"$AICX_SELFTEST_BOOTSTRAP_MARKER\"\n"
+        "      echo 'Bootstrap failed: 5: Input/output error' >&2\n"
+        "      exit 1\n"
+        "    fi\n"
         "  fi\n"
         "  : > \"$AICX_SELFTEST_LAUNCHCTL_STATE/$label\"\n"
         "  exit 0\n"
@@ -339,7 +344,26 @@ def test_legacy_missing_serve_uses_native_subcommand(tmp: Path) -> None:
     assert not launchctl_state(env, "io.vetcoders.aicx.mcp").exists()
 
 
-def test_bootstrap_failure_restores_previous_plist(tmp: Path) -> None:
+def test_transient_bootstrap_failure_recovers(tmp: Path) -> None:
+    # launchd's asynchronous bootout makes the first bootstrap of a just-removed
+    # label fail with EIO; the retry must absorb exactly that race.
+    agents, launcher, env, launchctl_log, _ = fixture(tmp)
+    plist_path = agents / "com.loctree.aicx.mcp.plist"
+    write_plist(
+        plist_path,
+        "com.loctree.aicx.mcp",
+        ["/stale/aicx", "serve", "--transport", "http", "--port", "8044"],
+    )
+    launchctl_state(env, "com.loctree.aicx.mcp").touch()
+
+    result = run_repair(env | {"AICX_SELFTEST_FAIL_BOOTSTRAP_ONCE": "1"})
+    assert "is ready at http://127.0.0.1:8044/health" in result.stdout
+    args = plistlib.loads(plist_path.read_bytes())["ProgramArguments"]
+    assert args[0] == str(launcher)
+    assert launchctl_log.read_text(encoding="utf-8").count("bootstrap ") == 2
+
+
+def test_exhausted_bootstrap_retries_restore_loaded_state(tmp: Path) -> None:
     agents, _, env, launchctl_log, curl_log = fixture(tmp)
     plist_path = agents / "com.loctree.aicx.mcp.plist"
     write_plist(
@@ -350,12 +374,54 @@ def test_bootstrap_failure_restores_previous_plist(tmp: Path) -> None:
     original = plist_path.read_bytes()
     launchctl_state(env, "com.loctree.aicx.mcp").touch()
 
-    result = run_repair(env | {"AICX_SELFTEST_FAIL_BOOTSTRAP_ONCE": "1"}, check=False)
+    result = run_repair(
+        env
+        | {
+            "AICX_SELFTEST_FAIL_BOOTSTRAP_ONCE": "1",
+            "AICX_SELFTEST_FAIL_BOOTSTRAP_COUNT": "2",
+            "AICX_RUNTIME_BOOTSTRAP_ATTEMPTS": "2",
+        },
+        check=False,
+    )
     assert result.returncode != 0
     assert plist_path.read_bytes() == original
     assert "did not load; rolling back" in result.stderr
     assert "previous MCP plist and loaded state restored" in result.stdout
-    assert launchctl_log.read_text(encoding="utf-8").count("bootstrap ") == 2
+    assert launchctl_log.read_text(encoding="utf-8").count("bootstrap ") == 3
+    assert not curl_log.exists()
+
+
+def test_persistent_bootstrap_failure_names_manual_recovery(tmp: Path) -> None:
+    agents, _, env, launchctl_log, curl_log = fixture(tmp)
+    plist_path = agents / "com.loctree.aicx.mcp.plist"
+    write_plist(
+        plist_path,
+        "com.loctree.aicx.mcp",
+        ["/stale/aicx", "serve", "--transport", "http", "--port", "8044"],
+    )
+    original = plist_path.read_bytes()
+    launchctl_state(env, "com.loctree.aicx.mcp").touch()
+
+    result = run_repair(
+        env
+        | {
+            "AICX_SELFTEST_FAIL_BOOTSTRAP_ONCE": "1",
+            "AICX_SELFTEST_FAIL_BOOTSTRAP_COUNT": "99",
+            "AICX_RUNTIME_BOOTSTRAP_ATTEMPTS": "2",
+        },
+        check=False,
+    )
+    assert result.returncode != 0
+    assert plist_path.read_bytes() == original
+    assert "did not load; rolling back" in result.stderr
+    assert "Bootstrap failed: 5: Input/output error" in result.stderr
+    assert "could not be reloaded" in result.stderr
+    assert (
+        f"Recover manually: launchctl bootstrap gui/{os.getuid()} {plist_path}"
+        in result.stderr
+    )
+    assert "loaded state restored" not in result.stdout
+    assert launchctl_log.read_text(encoding="utf-8").count("bootstrap ") == 4
     assert not curl_log.exists()
 
 
@@ -494,7 +560,11 @@ def test_scheduler_failure_restores_canonical_file_and_loaded_state(tmp: Path) -
 
     result = subprocess.run(
         ["bash", str(SCHEDULER_SCRIPT)],
-        env=env | {"AICX_SELFTEST_FAIL_BOOTSTRAP_LABEL": "com.loctree.aicx.reindex"},
+        env=env
+        | {
+            "AICX_SELFTEST_FAIL_BOOTSTRAP_LABEL": "com.loctree.aicx.reindex",
+            "AICX_RUNTIME_BOOTSTRAP_ATTEMPTS": "1",
+        },
         check=False,
         capture_output=True,
         text=True,
@@ -521,6 +591,7 @@ def test_scheduler_failure_restores_legacy_file_and_loaded_state(tmp: Path) -> N
         | {
             "AICX_SELFTEST_FAIL_BOOTSTRAP_LABEL": "com.loctree.aicx.reindex",
             "AICX_SELFTEST_EXPECT_FILE_AT_BOOTSTRAP": str(legacy),
+            "AICX_RUNTIME_BOOTSTRAP_ATTEMPTS": "1",
         },
         check=False,
         capture_output=True,
@@ -551,7 +622,11 @@ def test_scheduler_failure_preserves_both_unloaded_jobs(tmp: Path) -> None:
 
     result = subprocess.run(
         ["bash", str(SCHEDULER_SCRIPT)],
-        env=env | {"AICX_SELFTEST_FAIL_BOOTSTRAP_LABEL": "com.loctree.aicx.reindex"},
+        env=env
+        | {
+            "AICX_SELFTEST_FAIL_BOOTSTRAP_LABEL": "com.loctree.aicx.reindex",
+            "AICX_RUNTIME_BOOTSTRAP_ATTEMPTS": "1",
+        },
         check=False,
         capture_output=True,
         text=True,
@@ -603,7 +678,13 @@ def main() -> None:
         test_clean_reader_and_scheduler(base / "clean")
         test_experimental_writer_becomes_reader(base / "writer")
         test_legacy_missing_serve_uses_native_subcommand(base / "legacy")
-        test_bootstrap_failure_restores_previous_plist(base / "bootstrap-failure")
+        test_transient_bootstrap_failure_recovers(base / "bootstrap-transient")
+        test_exhausted_bootstrap_retries_restore_loaded_state(
+            base / "bootstrap-exhausted"
+        )
+        test_persistent_bootstrap_failure_names_manual_recovery(
+            base / "bootstrap-persistent"
+        )
         test_health_failure_restores_previous_plist(base / "health-failure")
         test_foreign_http_listener_cannot_mask_bind_failure(base / "foreign-listener")
         test_health_failure_restores_both_labels_and_registrations(
