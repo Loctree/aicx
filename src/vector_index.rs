@@ -1664,6 +1664,14 @@ pub fn write_index_with_options(
                 total_items,
             );
         }
+        // Checkpoint durability: the `.tmp` resume file is only worth what
+        // reached disk. Without this, rows sit in the BufWriter until the
+        // final flush and a killed multi-hour build resumes from whatever
+        // happened to spill out of the buffer. One flush per embed batch
+        // makes "resume from the last completed batch" a contract.
+        writer
+            .flush()
+            .with_context(|| format!("checkpoint tmp index: {}", tmp_path.display()))?;
     }
 
     // Emit completion only after the final atomic commit lands on disk so the
