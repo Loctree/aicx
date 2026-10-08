@@ -1382,6 +1382,8 @@ pub fn normalize_workdir(path: &str, baseline: Option<&str>) -> WorkdirIdentity 
         && on_host.exists()
         && let Some(root) = discover_git_root(on_host)
     {
+        // A linked worktree is the same repository as its principal checkout.
+        let root = principal_repo_root(root);
         // Canonical form, so one checkout reached through a symlink or a
         // `/var` vs `/private/var` spelling is one identity.
         return WorkdirIdentity::Resolved(std::fs::canonicalize(&root).unwrap_or(root));
@@ -1391,6 +1393,71 @@ pub fn normalize_workdir(path: &str, baseline: Option<&str>) -> WorkdirIdentity 
     // baseline. Discarding that join and keeping the bare token would compare
     // `.` against `/old/repo` and throw away turns that are plainly in scope.
     WorkdirIdentity::Unresolved(candidate)
+}
+
+/// The repository a checkout root belongs to, with linked `git worktree`
+/// checkouts folded into their principal checkout.
+///
+/// A linked worktree's root carries a `.git` FILE whose `gitdir:` points at
+/// `<principal>/.git/worktrees/<name>`. Reading that root as a repository of
+/// its own made every fleet-worktree session foreign to the project it was
+/// dispatched for: `-p <project>` withheld its frames, intents answered "no
+/// records" and continuity refused the window on a repo that was being
+/// developed intensively — the freshest SERVED sessions predated the
+/// worktree era. One repository, however many worktrees it is checked out
+/// through.
+///
+/// A submodule's `.git` file points at `<parent>/.git/modules/<name>` and is
+/// deliberately NOT folded: a submodule is its own repository (the scope
+/// contract already keeps its identity after its working tree is gone). A
+/// marker that cannot be read, or a pointer of another shape, keeps the
+/// checkout root as its own identity — fail toward the status quo, never
+/// toward a fabricated principal.
+fn principal_repo_root(root: PathBuf) -> PathBuf {
+    let marker = root.join(".git");
+    if !marker.is_file() {
+        return root;
+    }
+    let Ok(contents) = std::fs::read_to_string(&marker) else {
+        return root;
+    };
+    let Some(gitdir) = contents
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("gitdir:"))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return root;
+    };
+    let gitdir_path = if Path::new(gitdir).is_absolute() {
+        PathBuf::from(gitdir)
+    } else {
+        root.join(gitdir)
+    };
+    // <principal>/.git/worktrees/<name> — anything else (modules/<name>,
+    // a bare repo, an unexpected layout) is not a linked worktree.
+    let mut ancestors = gitdir_path.components().rev();
+    let has_name = ancestors.next().is_some();
+    let under_worktrees = ancestors
+        .next()
+        .is_some_and(|c| c.as_os_str() == "worktrees");
+    let under_dot_git = ancestors.next().is_some_and(|c| c.as_os_str() == ".git");
+    if !(has_name && under_worktrees && under_dot_git) {
+        return root;
+    }
+    let Some(principal) = gitdir_path
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+    else {
+        return root;
+    };
+    if principal.join(".git").exists() {
+        principal
+    } else {
+        root
+    }
 }
 
 /// The workdir as the rollout RECORDED it, made comparable without asking the
@@ -2061,6 +2128,97 @@ mod tests {
 
     fn js_input(input: &str) -> Value {
         serde_json::json!({"type": "custom_tool_call", "name": "exec", "input": input})
+    }
+
+    /// Finding: a linked `git worktree` root carries a `.git` FILE pointing
+    /// at `<principal>/.git/worktrees/<name>`, and the ancestor walk read it
+    /// as a repository of its own. Every fleet session dispatched into
+    /// `~/.vibecrafted/worktrees/<org>/<repo>/...` was therefore foreign to
+    /// `-p <repo>`: intents served no human records and continuity refused
+    /// the window while the repo was being developed intensively.
+    #[test]
+    fn linked_worktree_resolves_to_its_principal_checkout() {
+        let root = scratch("worktree-principal");
+        let principal = root.join("principal");
+        let worktree = root.join("wt/2026_1005/codex-work");
+        std::fs::create_dir_all(principal.join(".git/worktrees/codex-work"))
+            .expect("principal layout");
+        std::fs::create_dir_all(&worktree).expect("worktree layout");
+        std::fs::write(
+            worktree.join(".git"),
+            format!(
+                "gitdir: {}\n",
+                principal.join(".git/worktrees/codex-work").display()
+            ),
+        )
+        .expect("worktree marker");
+
+        let resolved = normalize_workdir(&worktree.to_string_lossy(), None);
+        assert_eq!(
+            resolved,
+            WorkdirIdentity::Resolved(PathBuf::from(canonical(&principal))),
+            "a linked worktree is the principal repository, not its own"
+        );
+        assert!(!distinct_repo_identity(
+            &worktree.to_string_lossy(),
+            &principal.to_string_lossy()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A submodule's `.git` file points at `<parent>/.git/modules/<name>` and
+    /// keeps its own identity: the scope contract treats a submodule as a
+    /// repository of its own even after its working tree is gone.
+    #[test]
+    fn submodule_marker_keeps_its_own_identity() {
+        let root = scratch("submodule-identity");
+        let parent = root.join("parent");
+        let submodule = parent.join("vendor/fleet-bus");
+        std::fs::create_dir_all(parent.join(".git/modules/fleet-bus")).expect("parent layout");
+        std::fs::create_dir_all(&submodule).expect("submodule layout");
+        std::fs::write(
+            submodule.join(".git"),
+            "gitdir: ../../.git/modules/fleet-bus\n",
+        )
+        .expect("submodule marker");
+
+        let resolved = normalize_workdir(&submodule.to_string_lossy(), None);
+        assert_eq!(
+            resolved,
+            WorkdirIdentity::Resolved(PathBuf::from(canonical(&submodule))),
+            "a submodule checkout stays a repository of its own"
+        );
+        assert!(distinct_repo_identity(
+            &submodule.to_string_lossy(),
+            &parent.to_string_lossy()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A `.git` file that cannot be read as a worktree pointer — garbage, an
+    /// empty `gitdir:`, a pointer whose principal has no `.git` — keeps the
+    /// checkout root as its own identity instead of fabricating a principal.
+    #[test]
+    fn malformed_worktree_marker_keeps_the_checkout_root() {
+        let root = scratch("worktree-malformed");
+        for (label, contents) in [
+            ("garbage", "not a pointer at all\n"),
+            ("empty", "gitdir:   \n"),
+            (
+                "dangling",
+                "gitdir: /nonexistent/principal/.git/worktrees/x\n",
+            ),
+        ] {
+            let checkout = root.join(label);
+            std::fs::create_dir_all(&checkout).expect("checkout layout");
+            std::fs::write(checkout.join(".git"), contents).expect("marker");
+            assert_eq!(
+                normalize_workdir(&checkout.to_string_lossy(), None),
+                WorkdirIdentity::Resolved(PathBuf::from(canonical(&checkout))),
+                "{label}: identity must stay on the checkout root"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
