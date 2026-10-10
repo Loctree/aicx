@@ -14,6 +14,8 @@
 //! - `~/.kimi-code/sessions`
 //! - `~/.copilot/session-state`
 //! - `~/.vibecrafted/control_plane/runtime_runs`
+//! - `~/.codescribe/agent-bridge/buses` (Codescribe Transcript Bus ledgers)
+//! - `~/.codescribe/transcriptions` (Codescribe dictated takes)
 //! - the active AICX home (`$AICX_HOME` / `~/.aicx`)
 //!
 //! Unit tests register their tempfile roots explicitly via [`SourceAllowlist::from_roots`]
@@ -36,6 +38,9 @@ pub const DEFAULT_SOURCE_ROOT_RELATIVE: &[&str] = &[
     ".kimi-code/sessions",
     ".copilot/session-state",
     ".vibecrafted/control_plane/runtime_runs",
+    // `importers::codescribe_bus::BUS_ROOT_RELATIVE`; a test pins the two.
+    ".codescribe/agent-bridge/buses",
+    ".codescribe/transcriptions",
 ];
 
 /// Allowlist of approved roots for readable session/catalog artifacts.

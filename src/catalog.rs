@@ -701,6 +701,14 @@ fn live_delta_uncached(home: &Path, user_home: &Path, cutoff_unix_ns: u128) -> R
     // Runtime-run transcripts are a bounded tree — the vibecrafted lane of
     // the live window stays in.
     enrich_runtime_runs(&mut fresh, user_home);
+    // Bus ledgers are read whole, so only those written inside the window.
+    enrich_codescribe_bus(
+        &mut fresh,
+        Some(&catalog_by_key),
+        user_home,
+        Some(cutoff_unix_ns),
+    );
+    enrich_codescribe_transcripts(&mut fresh, user_home, Some(cutoff_unix_ns));
 
     // Reattribution — not the path guess — is what finally decides a
     // session's identity, so the delta has to compare post-reattribution
@@ -922,6 +930,8 @@ fn scan_live_entries_with_progress(
     progress.elapsed_ms = started.elapsed().as_millis() as u64;
     on_progress(&progress);
     enrich_runtime_runs(&mut by_id, user_home);
+    enrich_codescribe_bus(&mut by_id, None, user_home, None);
+    enrich_codescribe_transcripts(&mut by_id, user_home, None);
     let mut memo = RemoteMemo::load(home);
     reattribute_catalog_entries(&mut by_id, &mut memo);
     memo.persist();
@@ -1491,6 +1501,105 @@ fn enrich_runtime_runs(by_id: &mut BTreeMap<(String, String), CatalogEntry>, use
             entry.source_len = Some(len);
             entry.source_mtime_ns = Some(mtime);
         }
+    }
+}
+
+/// Codescribe bus ledgers: one session per ledger and receiving agent session
+/// that heard the operator speak or type. Project and cwd are the receiving
+/// session's own — the bus says to whom, the agent's census says where — so
+/// `-p` narrowing and reattribution treat the voice like the session it was
+/// spoken into. `census` resolves receivers outside a hot-window delta.
+fn enrich_codescribe_bus(
+    by_id: &mut BTreeMap<(String, String), CatalogEntry>,
+    census: Option<&BTreeMap<(String, String), CatalogEntry>>,
+    user_home: &Path,
+    modified_since_ns: Option<u128>,
+) {
+    let seeds = crate::importers::codescribe_bus::bus_session_seeds(user_home, modified_since_ns);
+    if seeds.is_empty() {
+        return;
+    }
+    let machine = hostname();
+    let entries: Vec<CatalogEntry> = seeds
+        .into_iter()
+        .map(|seed| {
+            let key = (
+                seed.recipient_agent.to_string(),
+                seed.recipient.session.clone(),
+            );
+            let receiver = by_id
+                .get(&key)
+                .or_else(|| census.and_then(|census| census.get(&key)));
+            let (project, cwd) =
+                receiver.map_or((None, None), |row| (row.project.clone(), row.cwd.clone()));
+            let (source_len, source_mtime_ns) = live_source_fingerprint(&seed.source_path)
+                .map_or((None, None), |(len, mtime)| (Some(len), Some(mtime)));
+            let listener = seed
+                .recipient
+                .name
+                .as_deref()
+                .unwrap_or(seed.recipient_agent);
+            CatalogEntry {
+                schema: CATALOG_SCHEMA.to_string(),
+                session_id: seed.session_id,
+                agent: crate::importers::codescribe::CODESCRIBE_AGENT.to_string(),
+                project,
+                date: Some(seed.last_at.format("%Y-%m-%d").to_string()),
+                cwd,
+                source_path: seed.source_path.display().to_string(),
+                source_len,
+                source_mtime_ns,
+                source_bundle_fingerprint: None,
+                title: Some(format!("codescribe bus → {listener}")),
+                machine: machine.clone(),
+                logical_session_id: None,
+                session_kind: None,
+            }
+        })
+        .collect();
+    for entry in entries {
+        by_id.insert((entry.agent.clone(), entry.session_id.clone()), entry);
+    }
+}
+
+/// Codescribe dictated takes: one session per take (`catalog_takes`). A take
+/// names no repository — no frontmatter project in the corpus, no cwd — so it
+/// lands in the explicit dictation bucket: served by unfiltered `intents`,
+/// `-p /codescribe-dictation` and search, never guessed into a project.
+fn enrich_codescribe_transcripts(
+    by_id: &mut BTreeMap<(String, String), CatalogEntry>,
+    user_home: &Path,
+    modified_since_ns: Option<u128>,
+) {
+    let takes = crate::importers::codescribe::catalog_takes(user_home);
+    if takes.is_empty() {
+        return;
+    }
+    let machine = hostname();
+    for take in takes {
+        let Some((source_len, source_mtime_ns)) = live_source_fingerprint(&take.path) else {
+            continue;
+        };
+        if modified_since_ns.is_some_and(|cutoff| u128::from(source_mtime_ns) < cutoff) {
+            continue;
+        }
+        let entry = CatalogEntry {
+            schema: CATALOG_SCHEMA.to_string(),
+            session_id: crate::importers::codescribe::codescribe_session_id(&take.path, take.date),
+            agent: crate::importers::codescribe::CODESCRIBE_AGENT.to_string(),
+            project: Some(crate::importers::codescribe::CODESCRIBE_DICTATION_PROJECT.to_string()),
+            date: Some(take.date.format("%Y-%m-%d").to_string()),
+            cwd: None,
+            source_path: take.path.display().to_string(),
+            source_len: Some(source_len),
+            source_mtime_ns: Some(source_mtime_ns),
+            source_bundle_fingerprint: None,
+            title: Some("codescribe dictation".to_string()),
+            machine: machine.clone(),
+            logical_session_id: None,
+            session_kind: None,
+        };
+        by_id.insert((entry.agent.clone(), entry.session_id.clone()), entry);
     }
 }
 

@@ -3281,6 +3281,10 @@ fn is_source_metadata_line(line: &str) -> bool {
         "source:",
         "kind:",
         "source_file:",
+        // Codescribe transcript header written by `importers::codescribe`.
+        "speaker_hint:",
+        "audio_offset_ms:",
+        "duration_ms:",
         "severity:",
         "project:",
         "author:",

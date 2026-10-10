@@ -3,13 +3,18 @@ use crate::extraction::*;
 use anyhow::Result;
 use chrono::{Duration, NaiveDate, NaiveTime, TimeZone};
 use serde::Deserialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::BufReader;
 
 use crate::importers::operator_markdown::split_operator_frontmatter;
 use crate::timeline::FrameKind;
 
 pub(crate) const CODESCRIBE_AGENT: &str = "codescribe";
+/// Catalog bucket of dictated takes. A take names no repository, and intents
+/// serves only bucketed sessions, so dictation gets one explicit non-repo
+/// bucket (`local/<name>`, like other remote-less buckets) instead of a
+/// project guessed from its words.
+pub const CODESCRIBE_DICTATION_PROJECT: &str = "local/codescribe-dictation";
 const CODESCRIBE_TRANSCRIPT_KIND: &str = "transcript";
 const CODESCRIBE_NO_SPEECH_MARKERS: &[&str] = &[
     "no reliable speech detected",
@@ -410,14 +415,7 @@ fn parse_codescribe_transcript_with_lexicon(
         _ => parse_plain_codescribe_text(&content),
     };
 
-    let session_id = format!(
-        "{}-{}-codescribe-{}",
-        codescribe_path_fingerprint(path),
-        path.file_stem()
-            .map(|stem| stem.to_string_lossy())
-            .unwrap_or_else(|| "unknown".into()),
-        date.format("%Y-%m-%d")
-    );
+    let session_id = codescribe_session_id(path, date);
     let source_file = path.display();
 
     let mut entries = Vec::new();
@@ -432,8 +430,10 @@ fn parse_codescribe_transcript_with_lexicon(
             .duration_ms
             .map(|value| value.to_string())
             .unwrap_or_else(|| "unknown".to_string());
+        // The `<codescribe>` envelope gives dictation the same
+        // `voice_transcript` provenance in intents as bus speech.
         let message = format!(
-            "kind: {CODESCRIBE_TRANSCRIPT_KIND}\nspeaker_hint: {speaker_hint}\nsource_file: {source_file}\naudio_offset_ms: {}\nduration_ms: {duration}\n\n{}",
+            "kind: {CODESCRIBE_TRANSCRIPT_KIND}\nspeaker_hint: {speaker_hint}\nsource_file: {source_file}\naudio_offset_ms: {}\nduration_ms: {duration}\n\n<codescribe>{}</codescribe>",
             segment.start_ms, segment.text
         );
 
@@ -455,6 +455,56 @@ fn parse_codescribe_transcript_with_lexicon(
     }
 
     Ok(entries)
+}
+
+/// Session identity of one transcript file, shared by the importer and the
+/// catalog so both name the same session.
+pub(crate) fn codescribe_session_id(path: &Path, date: NaiveDate) -> String {
+    format!(
+        "{}-{}-codescribe-{}",
+        codescribe_path_fingerprint(path),
+        path.file_stem()
+            .map(|stem| stem.to_string_lossy())
+            .unwrap_or_else(|| "unknown".into()),
+        date.format("%Y-%m-%d")
+    )
+}
+
+/// One transcript per recorded take, for the session catalog.
+///
+/// Codescribe archives a take as `<HHMMSS_slug>_raw.txt` beside its audio;
+/// formatter passes add `_ai` / `_formatted` rewrites of the same speech, and
+/// `_failed` marks a take with no transcript. The raw text is the operator's
+/// words, so a take is cataloged once: `_raw` first, then other recognizer
+/// outputs (`_cloud`, numbered). Formatter rewrites and failed takes are never
+/// cataloged — a take with only a rewrite is left out rather than attributed
+/// to the operator verbatim. Files without a variant suffix (chat `.md`,
+/// whisper `.json`) are their own take.
+pub fn catalog_takes(home: &Path) -> Vec<CodescribeTranscript> {
+    let mut takes: BTreeMap<(NaiveDate, String), (u8, CodescribeTranscript)> = BTreeMap::new();
+    for transcript in discover_codescribe_transcripts(home) {
+        let Some(stem) = transcript.path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        let (take, rank) = match stem.rsplit_once('_') {
+            Some((take, "raw")) => (take, 0),
+            Some((take, "cloud")) => (take, 1),
+            Some((take, variant)) if variant.bytes().all(|byte| byte.is_ascii_digit()) => (take, 2),
+            Some((_, "ai" | "formatted" | "failed")) => continue,
+            _ => (stem, 0),
+        };
+        let key = (transcript.date, take.to_owned());
+        match takes.get(&key) {
+            Some((kept, _)) if *kept <= rank => {}
+            _ => {
+                takes.insert(key, (rank, transcript));
+            }
+        }
+    }
+    takes
+        .into_values()
+        .map(|(_, transcript)| transcript)
+        .collect()
 }
 
 fn codescribe_path_fingerprint(path: &Path) -> String {

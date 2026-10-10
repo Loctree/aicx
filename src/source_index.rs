@@ -40,7 +40,7 @@ const MAX_JSONL_RECORD_BYTES: usize = 2 * 1024 * 1024;
 /// short-circuited forever, leaving search previews full of
 /// `{"type":"thought","data":"..."}` spam. Including this constant forces a
 /// one-shot rebuild so index truth tracks filter truth.
-pub(crate) const SIGNAL_FILTER_VERSION: &str = "signal-v6-scope-fails-closed";
+pub(crate) const SIGNAL_FILTER_VERSION: &str = "signal-v7-compaction-summary-not-human";
 
 const PARSE_STATE_SCHEMA: &str = "aicx.source_parse_state.v1";
 const PARSE_STATE_RELPATH: &str = "indexed/_all/source_parse_state.v1.json";
@@ -1682,6 +1682,13 @@ fn parse_catalog_source_checked(
         ));
     }
 
+    if entry.agent == crate::importers::codescribe::CODESCRIBE_AGENT {
+        if entry.session_id.starts_with("bus-") {
+            return parse_codescribe_bus_source(entry, &path, allow, session_kind);
+        }
+        return parse_codescribe_transcript_source(entry, &path, session_kind);
+    }
+
     let source_bytes = fs::metadata(&path)
         .with_context(|| format!("stat source {}", path.display()))?
         .len();
@@ -2373,6 +2380,77 @@ fn is_signal_frame(frame: &TimelineEntry) -> bool {
     signal_kind
         && !crate::extraction::is_harness_injected_noise(&frame.role, &frame.message)
         && !looks_like_binary_payload(&frame.message)
+}
+
+/// One Codescribe bus catalog session: the ledger replayed and narrowed to
+/// the receiving agent session the row names. The operator's words become
+/// `user` frames, the receiver's own bus replies `assistant` frames. A row the
+/// ledger no longer delivers to yields no frames rather than someone else's.
+fn parse_codescribe_bus_source(
+    entry: &CatalogEntry,
+    path: &Path,
+    allow: &crate::source_path::SourceAllowlist,
+    session_kind: Option<String>,
+) -> Result<(ParsedCatalogSource, ConversationCoverage)> {
+    let body = allow
+        .read_to_string(path)
+        .with_context(|| format!("read codescribe bus ledger {}", path.display()))?;
+    let replay = crate::importers::codescribe_bus::replay_bus_ledger(&body);
+    let mut frames = crate::importers::codescribe_bus::bus_session_frames(
+        path,
+        &replay,
+        &entry.session_id,
+        entry.cwd.as_deref(),
+    )
+    .unwrap_or_default();
+    for frame in &mut frames {
+        frame.session_kind = session_kind.clone();
+    }
+    let coverage = match replay.skipped_records() {
+        0 => ConversationCoverage::CompleteVisible,
+        skipped_records => ConversationCoverage::BoundedProjection { skipped_records },
+    };
+    Ok((
+        ParsedCatalogSource {
+            frames,
+            distill: None,
+            recorded_workdirs: entry.cwd.iter().cloned().collect(),
+        },
+        coverage,
+    ))
+}
+
+/// One dictated Codescribe take, parsed by the existing transcript importer
+/// with no project filter and no time cutoff: the catalog row already chose
+/// the take, and windows are applied downstream per utterance.
+fn parse_codescribe_transcript_source(
+    entry: &CatalogEntry,
+    path: &Path,
+    session_kind: Option<String>,
+) -> Result<(ParsedCatalogSource, ConversationCoverage)> {
+    let date = entry
+        .date
+        .as_deref()
+        .and_then(|date| chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").ok())
+        .with_context(|| format!("codescribe take {} has no catalog date", path.display()))?;
+    let config = crate::timeline::ExtractionConfig {
+        project_filter: Vec::new(),
+        cutoff: chrono::DateTime::<chrono::Utc>::UNIX_EPOCH,
+        include_assistant: true,
+        watermark: None,
+    };
+    let mut frames = crate::importers::parse_codescribe_transcript(path, date, &config)?;
+    for frame in &mut frames {
+        frame.session_kind = session_kind.clone();
+    }
+    Ok((
+        ParsedCatalogSource {
+            frames,
+            distill: None,
+            recorded_workdirs: Vec::new(),
+        },
+        ConversationCoverage::CompleteVisible,
+    ))
 }
 
 /// Collapse a vibecrafted `runtime_runs/*/transcript.log` into indexable text.
