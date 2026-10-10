@@ -21,8 +21,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   metadata; preserve message/tool provenance and expose unsupported visible
   events as incomplete coverage. Source-bundle fingerprints include metadata
   changes, and append-safe incremental processing retains stable session IDs.
+- Codescribe Transcript Bus as a session source (agent `codescribe`). Each bus
+  ledger under `~/.codescribe/agent-bridge/buses` is replayed with the bridge's
+  own seal rule (latest `rendered_text` snapshot of a closed take; open takes
+  are counted, not delivered) and cataloged once per receiving agent session,
+  inheriting that session's project and cwd. Spoken takes carry the
+  `<codescribe>` voice envelope (`[voice]` in intents), typed deliveries stay
+  verbatim, and the receiver's own bus replies stay on the assistant lane.
+  Agent-to-agent peer messages are not part of this source.
 
 ### Fixed
+
+- Claude compaction summaries (`isCompactSummary` rows) are epoch context, not
+  operator speech: they no longer surface in `aicx intents` as fresh decisions
+  and intents stamped with the compaction time. `SIGNAL_FILTER_VERSION` moves to
+  `signal-v7`, so the next `aicx index` re-parses every source once.
 
 - Keep runtime repair, default service installers, npm migration checks, and
   onboarding reader-only. Preserve operator network/logging settings, repair

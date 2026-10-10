@@ -118,6 +118,27 @@ Default consequence, on both paths: ordinary `aicx intents -p X` reads
 `user_msg` frames, not agent replies. Agent replies require an explicit
 `--frame-kind`.
 
+### What counts as a `user_msg` frame
+
+- Claude compaction summaries (`isCompactSummary` rows) are not: the compacting
+  model wrote them, so they land on the system lane as `CompactionReplay`
+  context and never become operator intents or decisions.
+- Codescribe bus speech is: the catalog seeds one `codescribe` session per bus
+  ledger and receiving agent session (project and cwd of the receiver). A
+  spoken take is one `user_msg` frame wrapped in `<codescribe>…</codescribe>`,
+  so it carries `voice_transcript` provenance. A typed delivery stays verbatim.
+  The bus records no boundary between what the operator wrote and what they
+  pasted, so an unmarked paste (a PR page, a review) is classified like any
+  typed text; only `>` quotes and fences the operator typed mark a reference.
+  The receiver's own bus replies are `agent_reply` frames.
+
+Source anchors:
+
+- `crates/aicx-parser/src/adapters/claude.rs::emit_compaction_summary`
+- `src/importers/codescribe_bus.rs::replay_bus_ledger`
+- `src/catalog.rs::enrich_codescribe_bus`
+- `src/source_index.rs::parse_codescribe_bus_source`
+
 Source anchors:
 
 - Source collection: `src/intents.rs::collect_intent_files`
