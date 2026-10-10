@@ -29,6 +29,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `<codescribe>` voice envelope (`[voice]` in intents), typed deliveries stay
   verbatim, and the receiver's own bus replies stay on the assistant lane.
   Agent-to-agent peer messages are not part of this source.
+- Codescribe dictated takes (`~/.codescribe/transcriptions`) in the session
+  catalog through the existing transcript importer, one text per recording:
+  the unnumbered `_raw` export first, numbered `_raw_<n>` collision exports and
+  `_cloud` after it; `_failed`, `_ai` and `_formatted` files, numbered or not,
+  never. A numbered file with audio of its own is a distinct recording. Takes
+  name no repository, so they live in the explicit `local/codescribe-dictation`
+  bucket (served by unfiltered `intents` and `-p /codescribe-dictation`).
 
 ### Fixed
 

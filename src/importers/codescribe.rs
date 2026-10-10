@@ -472,32 +472,45 @@ pub(crate) fn codescribe_session_id(path: &Path, date: NaiveDate) -> String {
 
 /// One transcript per recorded take, for the session catalog.
 ///
-/// Codescribe archives a take as `<HHMMSS_slug>_raw.txt` beside its audio;
-/// formatter passes add `_ai` / `_formatted` rewrites of the same speech, and
-/// `_failed` marks a take with no transcript. The raw text is the operator's
-/// words, so a take is cataloged once: `_raw` first, then other recognizer
-/// outputs (`_cloud`, numbered). Formatter rewrites and failed takes are never
-/// cataloged — a take with only a rewrite is left out rather than attributed
-/// to the operator verbatim. Files without a variant suffix (chat `.md`,
-/// whisper `.json`) are their own take.
+/// Codescribe's filename contract: a take is archived as
+/// `<HHMMSS_slug>_<variant>[_<n>].txt`, where `_raw` is the recognizer text
+/// beside the take's `<stem>_raw.m4a`, `_cloud` another recognizer's output,
+/// `_ai` / `_formatted` formatter rewrites, and `_failed` a take with no
+/// transcript. A numeric `_<n>` after the variant is a colliding second text
+/// file: it plays the base stem's audio (`archivedAudioCandidates` in the app),
+/// so it is another export of the same take. Only a numbered file with audio
+/// of its own is a distinct recording.
+///
+/// A take is cataloged once: its unnumbered `_raw` first, then numbered raw
+/// exports, then `_cloud`. Formatter rewrites and failed takes — numbered or
+/// not — are never cataloged; a take with only a rewrite is left out rather
+/// than attributed to the speaker verbatim. Files without a variant (chat
+/// `.md`, whisper `.json`) are their own take.
 pub fn catalog_takes(home: &Path) -> Vec<CodescribeTranscript> {
-    let mut takes: BTreeMap<(NaiveDate, String), (u8, CodescribeTranscript)> = BTreeMap::new();
+    let mut takes: BTreeMap<(NaiveDate, String), ((u8, u64), CodescribeTranscript)> =
+        BTreeMap::new();
     for transcript in discover_codescribe_transcripts(home) {
         let Some(stem) = transcript.path.file_stem().and_then(|stem| stem.to_str()) else {
             continue;
         };
-        let (take, rank) = match stem.rsplit_once('_') {
-            Some((take, "raw")) => (take, 0),
-            Some((take, "cloud")) => (take, 1),
-            Some((take, variant)) if variant.bytes().all(|byte| byte.is_ascii_digit()) => (take, 2),
-            Some((_, "ai" | "formatted" | "failed")) => continue,
-            _ => (stem, 0),
+        let (take, variant, collision) = split_take_variant(stem);
+        let rank = match variant {
+            Some("raw") | None => 0,
+            Some("cloud") => 1,
+            _ => continue,
         };
+        // A numbered export with its own recording is a take of its own.
+        let take = if collision.is_some() && has_own_audio(&transcript.path) {
+            stem
+        } else {
+            take
+        };
+        let priority = (rank, collision.unwrap_or(0));
         let key = (transcript.date, take.to_owned());
         match takes.get(&key) {
-            Some((kept, _)) if *kept <= rank => {}
+            Some((kept, _)) if *kept <= priority => {}
             _ => {
-                takes.insert(key, (rank, transcript));
+                takes.insert(key, (priority, transcript));
             }
         }
     }
@@ -505,6 +518,31 @@ pub fn catalog_takes(home: &Path) -> Vec<CodescribeTranscript> {
         .into_values()
         .map(|(_, transcript)| transcript)
         .collect()
+}
+
+/// `<take>_<variant>[_<n>]` → (take, variant, collision number). A stem with
+/// no known variant is its own take; a trailing number is only a collision
+/// suffix when it follows a variant, so slugs ending in digits stay intact.
+fn split_take_variant(stem: &str) -> (&str, Option<&str>, Option<u64>) {
+    const VARIANTS: [&str; 5] = ["raw", "cloud", "ai", "formatted", "failed"];
+    let (base, collision) = match stem.rsplit_once('_') {
+        Some((base, digits))
+            if !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()) =>
+        {
+            (base, digits.parse::<u64>().ok())
+        }
+        _ => (stem, None),
+    };
+    match base.rsplit_once('_') {
+        Some((take, variant)) if VARIANTS.contains(&variant) => (take, Some(variant), collision),
+        _ => (stem, None, None),
+    }
+}
+
+fn has_own_audio(transcript: &Path) -> bool {
+    ["m4a", "wav", "flac"]
+        .iter()
+        .any(|ext| transcript.with_extension(ext).is_file())
 }
 
 fn codescribe_path_fingerprint(path: &Path) -> String {

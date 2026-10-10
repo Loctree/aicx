@@ -131,6 +131,10 @@ Default consequence, on both paths: ordinary `aicx intents -p X` reads
   pasted, so an unmarked paste (a PR page, a review) is classified like any
   typed text; only `>` quotes and fences the operator typed mark a reference.
   The receiver's own bus replies are `agent_reply` frames.
+- Codescribe dictation is: one session per recorded take in the
+  `local/codescribe-dictation` bucket, its text in the same `<codescribe>`
+  envelope. Formatter rewrites (`_ai`, `_formatted`) and failed takes are
+  never cataloged, numbered or not (`importers::codescribe::catalog_takes`).
 
 Source anchors:
 
