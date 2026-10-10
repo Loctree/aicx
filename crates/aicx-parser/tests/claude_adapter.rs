@@ -1041,6 +1041,59 @@ fn claude_queue_enqueue_of_a_task_notification_is_not_operator_input() {
     );
 }
 
+fn compaction_summary_row(content: serde_json::Value, timestamp: &str) -> String {
+    format!(
+        "{}\n",
+        serde_json::json!({
+            "type": "user",
+            "isCompactSummary": true,
+            "compactMetadata": {"trigger": "auto"},
+            "message": {"role": "user", "content": content},
+            "sessionId": QUEUE_SESSION,
+            "timestamp": timestamp,
+        })
+    )
+}
+
+const COMPACTION_SUMMARY: &str = "This session is being continued from a previous conversation \
+     that ran out of context.\n\nSummary:\n1. Primary Request and Intent:\n   \
+     - \"fix the synthetic lab properly\" — operator decision: from now on no fallback";
+
+#[test]
+fn claude_compaction_summary_is_epoch_context_not_operator_speech() {
+    for content in [
+        serde_json::json!(COMPACTION_SUMMARY),
+        serde_json::json!([{"type": "text", "text": COMPACTION_SUMMARY}]),
+    ] {
+        let body = [
+            user_row("fix the synthetic lab", "2026-01-02T01:00:00.000Z"),
+            compaction_summary_row(content, "2026-01-02T09:25:42.067Z"),
+            user_row("go on, cut it", "2026-01-02T09:26:00.000Z"),
+        ]
+        .concat();
+        let model = session_model(QUEUE_SESSION, &body);
+
+        // The compacting model's retelling quotes the operator, but only the
+        // two rows the operator actually sent are human speech.
+        assert_eq!(
+            user_turn_texts(&model),
+            vec!["fix the synthetic lab", "go on, cut it"]
+        );
+        let summary: Vec<_> = model
+            .turns
+            .iter()
+            .filter(|turn| turn.text.starts_with("This session is being continued"))
+            .collect();
+        assert_eq!(summary.len(), 1, "accounted once, not dropped");
+        assert_eq!(summary[0].kind, TurnKind::SystemNote);
+        assert_eq!(summary[0].role, TurnRole::System);
+
+        // The boundary itself is still recorded as a context epoch.
+        assert_eq!(model.context_epochs.len(), 1);
+        assert_eq!(model.context_epochs[0].first_turn_after, Some(1));
+    }
+}
+
 #[test]
 fn claude_queue_bookkeeping_operations_emit_no_turn() {
     for operation in ["remove", "dequeue", "popAll"] {

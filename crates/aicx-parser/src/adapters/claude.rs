@@ -59,7 +59,10 @@ use crate::skill_collapse::detect_skill_marker;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
-pub const CLAUDE_ADAPTER_VERSION: &str = "claude-adapter-v2";
+pub const CLAUDE_ADAPTER_VERSION: &str = "claude-adapter-v3";
+
+/// Inject tag for the `isCompactSummary` row (see `emit_compaction_summary`).
+const COMPACTION_SUMMARY_TAG: &str = "compact_summary";
 
 /// Anthropic usage provider token for typed `UsageEvent`s.
 const USAGE_PROVIDER: &str = "anthropic";
@@ -460,7 +463,8 @@ fn walk_conversational_row(
     // Compaction boundary (`isCompactSummary` + `compactMetadata`): the row
     // that follows is the summary that replaced earlier context. Recorded
     // as a context epoch of THIS conversation — never a second source.
-    if object.get("isCompactSummary").and_then(Value::as_bool) == Some(true) {
+    let compaction_summary = object.get("isCompactSummary").and_then(Value::as_bool) == Some(true);
+    if compaction_summary {
         let trigger = object
             .get("compactMetadata")
             .and_then(Value::as_object)
@@ -476,6 +480,49 @@ fn walk_conversational_row(
     }
 
     let role = string_field(message, "role").unwrap_or(top_type);
+    // The summary rides the user lane, but the model that compacted the
+    // context wrote it: it retells what the operator asked in the agent's
+    // words. As human speech it surfaced in `aicx intents` as fresh
+    // decisions and intents stamped with the compaction time.
+    if compaction_summary && top_type == "user" {
+        match message.get("content") {
+            Some(Value::String(text)) => {
+                emit_compaction_summary(text, timestamp, vec![physical_ref], analysis);
+                return Ok(());
+            }
+            Some(Value::Array(blocks)) => {
+                for (index, block) in blocks.iter().enumerate() {
+                    let text_block = block
+                        .as_object()
+                        .filter(|object| string_field(object, "type") == Some("text"))
+                        .and_then(|object| string_field(object, "text"));
+                    if let Some(text) = text_block {
+                        emit_compaction_summary(
+                            text,
+                            timestamp,
+                            vec![physical_ref.clone()],
+                            analysis,
+                        );
+                    } else {
+                        walk_content_block(
+                            raw,
+                            &physical_ref,
+                            top_type,
+                            role,
+                            index,
+                            block,
+                            timestamp,
+                            ctx,
+                            analysis,
+                            logical,
+                        )?;
+                    }
+                }
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
     match message.get("content") {
         None => Ok(()),
         Some(Value::String(text)) => {
@@ -879,6 +926,38 @@ fn emit_text_turn(
     ) {
         emit_frame(&frame, refs, analysis);
     }
+}
+
+/// Hand a compaction summary to the throne as injected context.
+///
+/// The tag is assigned from the row's `isCompactSummary` structure, never
+/// read off the text, so the summary cannot leak onto the human lane however
+/// it is phrased. `# claude` maps the tag to `CompactionReplay`.
+fn emit_compaction_summary(
+    text: &str,
+    timestamp: &Known<String>,
+    refs: Vec<RawUnitRef>,
+    analysis: &mut Analysis,
+) {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    let evidence = refs
+        .first()
+        .expect("a compaction summary always carries its physical evidence")
+        .clone();
+    let frame = TransportFrame {
+        agent: AgentKind::Claude,
+        transport_kind: TransportKind::InjectedContext,
+        timestamp: timestamp.clone(),
+        payload: TransportPayload::Inject {
+            tag: COMPACTION_SUMMARY_TAG.to_owned(),
+            content: trimmed.to_owned(),
+        },
+        evidence,
+    };
+    emit_frame(&frame, refs, analysis);
 }
 
 /// Hand the operator text carried by a `queue-operation` enqueue to the

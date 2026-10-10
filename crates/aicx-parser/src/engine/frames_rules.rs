@@ -73,6 +73,13 @@ const CLAUDE_INJECT_TAGS: &[InjectTagRule] = &[
         tag: "compact_boundary",
         kind: InjectRuleKind::CompactionReplay,
     },
+    // The `isCompactSummary` user row: the compacting model's retelling of
+    // the earlier context. Assigned by row structure in the adapter, so it is
+    // epoch context like kimi's summary — never operator speech.
+    InjectTagRule {
+        tag: "compact_summary",
+        kind: InjectRuleKind::CompactionReplay,
+    },
     // Background-task completion pushed by the harness, observed both as a
     // `queue-operation` enqueue body and as a user-row text block. Machine
     // chatter: a system note, never operator speech.
