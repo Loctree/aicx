@@ -12,7 +12,10 @@
 //! - `~/.gemini/tmp`
 //! - `~/.junie/sessions`
 //! - `~/.kimi-code/sessions`
+//! - `~/.copilot/session-state`
 //! - `~/.vibecrafted/control_plane/runtime_runs`
+//! - `~/.codescribe/agent-bridge/buses` (Codescribe Transcript Bus ledgers)
+//! - `~/.codescribe/transcriptions` (Codescribe dictated takes)
 //! - the active AICX home (`$AICX_HOME` / `~/.aicx`)
 //!
 //! Unit tests register their tempfile roots explicitly via [`SourceAllowlist::from_roots`]
@@ -33,7 +36,11 @@ pub const DEFAULT_SOURCE_ROOT_RELATIVE: &[&str] = &[
     ".gemini/tmp",
     ".junie/sessions",
     ".kimi-code/sessions",
+    ".copilot/session-state",
     ".vibecrafted/control_plane/runtime_runs",
+    // `importers::codescribe_bus::BUS_ROOT_RELATIVE`; a test pins the two.
+    ".codescribe/agent-bridge/buses",
+    ".codescribe/transcriptions",
 ];
 
 /// Allowlist of approved roots for readable session/catalog artifacts.
@@ -50,6 +57,7 @@ impl SourceAllowlist {
         for rel in DEFAULT_SOURCE_ROOT_RELATIVE {
             roots.push(user_home.join(rel));
         }
+        roots.push(crate::session_catalog::copilot_session_root(user_home));
         roots.push(aicx_home.to_path_buf());
         Self::from_roots(roots)
     }
@@ -279,6 +287,22 @@ mod tests {
         let resolved = allow.resolve_file(&wire).unwrap();
         assert_eq!(fs::read_to_string(&resolved).unwrap(), "{}\n");
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn copilot_sources_are_allowed_but_global_telemetry_is_outside_the_root() {
+        let root = test_dir("copilot");
+        let aicx = root.join(".aicx");
+        let session = root.join(".copilot/session-state/11111111-2222-4333-8444-555555555555");
+        fs::create_dir_all(&session).unwrap();
+        let events = session.join("events.jsonl");
+        fs::write(&events, b"{}\n").unwrap();
+        let telemetry = root.join(".copilot/events.jsonl");
+        fs::write(&telemetry, b"{}\n").unwrap();
+        let allow = SourceAllowlist::for_operator(&root, &aicx);
+        assert!(allow.resolve_file(events).is_ok());
+        assert!(allow.resolve_file(telemetry).is_err());
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

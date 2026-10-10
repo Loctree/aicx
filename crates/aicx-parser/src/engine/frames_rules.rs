@@ -73,6 +73,13 @@ const CLAUDE_INJECT_TAGS: &[InjectTagRule] = &[
         tag: "compact_boundary",
         kind: InjectRuleKind::CompactionReplay,
     },
+    // The `isCompactSummary` user row: the compacting model's retelling of
+    // the earlier context. Assigned by row structure in the adapter, so it is
+    // epoch context like kimi's summary — never operator speech.
+    InjectTagRule {
+        tag: "compact_summary",
+        kind: InjectRuleKind::CompactionReplay,
+    },
     // Background-task completion pushed by the harness, observed both as a
     // `queue-operation` enqueue body and as a user-row text block. Machine
     // chatter: a system note, never operator speech.
@@ -113,6 +120,26 @@ const GENERIC_INJECT_TAGS: &[InjectTagRule] = &[InjectTagRule {
     tag: "system",
     kind: InjectRuleKind::TransportControl,
 }];
+
+// # copilot — developer instructions and skill bodies remain injected context.
+const COPILOT_INJECT_TAGS: &[InjectTagRule] = &[
+    InjectTagRule {
+        tag: "system",
+        kind: InjectRuleKind::TransportControl,
+    },
+    InjectTagRule {
+        tag: "developer",
+        kind: InjectRuleKind::AgentInstructions,
+    },
+    InjectTagRule {
+        tag: "skill.invoked",
+        kind: InjectRuleKind::AgentInstructions,
+    },
+    InjectTagRule {
+        tag: "session.compaction_complete",
+        kind: InjectRuleKind::CompactionReplay,
+    },
+];
 
 // # cursor — harness notifications and skill attachments ride the wire as
 // injected wrappers, never operator speech; both reminder spellings resolve
@@ -167,6 +194,13 @@ const GROK_INJECT_TAGS: &[InjectTagRule] = &[
 // # grok
 
 pub const AGENT_FRAME_RULES: &[AgentFrameRules] = &[
+    AgentFrameRules {
+        agent: AgentKind::Copilot,
+        echo_promotion: false,
+        klops_guard: &[],
+        queue_seal: false,
+        inject_tags: COPILOT_INJECT_TAGS,
+    },
     AgentFrameRules {
         agent: AgentKind::Codex,
         echo_promotion: true,

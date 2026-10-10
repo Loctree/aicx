@@ -1,0 +1,12 @@
+id: copilot-workspace-fallback
+cwd: /fixture/stale-cwd
+git_root: /fixture/stale-cwd
+repository: example/stale
+branch: stale-branch
+client_name: copilot-cli
+name: Synthetic Copilot conversation
+user_named: true
+summary_count: 1
+fork_count: 0
+created_at: '2026-09-29T10:00:00Z'
+updated_at: '2026-09-30T10:02:00Z'

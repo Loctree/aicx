@@ -40,10 +40,56 @@ const MAX_JSONL_RECORD_BYTES: usize = 2 * 1024 * 1024;
 /// short-circuited forever, leaving search previews full of
 /// `{"type":"thought","data":"..."}` spam. Including this constant forces a
 /// one-shot rebuild so index truth tracks filter truth.
-pub(crate) const SIGNAL_FILTER_VERSION: &str = "signal-v6-scope-fails-closed";
+pub(crate) const SIGNAL_FILTER_VERSION: &str = "signal-v7-compaction-summary-not-human";
 
 const PARSE_STATE_SCHEMA: &str = "aicx.source_parse_state.v1";
 const PARSE_STATE_RELPATH: &str = "indexed/_all/source_parse_state.v1.json";
+
+/// Coverage of a cached conversation, not a promise about the original source.
+/// A settled bounded projection retains its limitation explicitly; transient
+/// partial reads and time-dependent timestamp inference are never cacheable.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) enum ConversationCoverage {
+    CompleteVisible,
+    BoundedProjection {
+        skipped_records: usize,
+    },
+    /// A pre-coverage parse ledger still proves source bytes, policy, layout and
+    /// extract checksum, but cannot prove the parser saw the whole conversation.
+    LegacyUnknown,
+    Uncacheable,
+}
+
+impl ConversationCoverage {
+    pub(crate) fn cacheable(&self) -> bool {
+        matches!(self, Self::CompleteVisible | Self::BoundedProjection { .. })
+    }
+
+    fn with_omitted_frames(self, omitted_frames: usize) -> Self {
+        if omitted_frames == 0 || matches!(&self, Self::Uncacheable | Self::LegacyUnknown) {
+            return self;
+        }
+        let skipped_records = match self {
+            Self::CompleteVisible => omitted_frames,
+            Self::BoundedProjection { skipped_records } => {
+                skipped_records.saturating_add(omitted_frames)
+            }
+            Self::LegacyUnknown | Self::Uncacheable => unreachable!("returned above"),
+        };
+        Self::BoundedProjection { skipped_records }
+    }
+
+    pub(crate) fn receipt_label(&self) -> String {
+        match self {
+            Self::CompleteVisible => "complete_visible".to_string(),
+            Self::BoundedProjection { skipped_records } => {
+                format!("bounded_projection:skipped_records={skipped_records}")
+            }
+            Self::LegacyUnknown => "legacy_unknown".to_string(),
+            Self::Uncacheable => "uncacheable".to_string(),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SourceIndexReport {
@@ -184,6 +230,14 @@ struct SessionParseRecord {
     /// Live source mtime when this extract was produced (unix nanoseconds).
     #[serde(default)]
     source_mtime_ns: u64,
+    /// Physical identity beyond len+mtime. Empty on legacy ledgers; those rows
+    /// may be served only with explicit unknown coverage until rebuilt.
+    #[serde(default)]
+    source_physical_identity: Vec<u64>,
+    /// Distinct bundled-artifact evidence. Old Copilot ledgers have no
+    /// receipt and must reparse once instead of trusting size+latest mtime.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_bundle_fingerprint: Option<String>,
     extract_relpath: String,
     extract_sha256: String,
     raw_frames: usize,
@@ -225,6 +279,126 @@ struct SessionParseRecord {
     /// `.aicxignore` that already names any hidden path; never published.
     #[serde(default)]
     scope_paths: Vec<String>,
+    /// Parser/extract coverage behind the published body. Old ledgers carry no
+    /// receipt and therefore cannot authorize a complete indexed answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    coverage: Option<ConversationCoverage>,
+    /// Whole-session scope report, built before signal projection. Index bodies
+    /// cannot reconstruct branches, hidden scopes, or removed tool-call paths.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    scope: Option<crate::extraction::conversation::ScopeReport>,
+}
+
+fn maintenance_record_reusable(record: &SessionParseRecord) -> bool {
+    record
+        .coverage
+        .as_ref()
+        .is_none_or(ConversationCoverage::cacheable)
+}
+
+fn maintenance_record_settled(record: &SessionParseRecord) -> bool {
+    if record.source_physical_identity.is_empty() {
+        return record.coverage.is_none();
+    }
+    record
+        .coverage
+        .as_ref()
+        .is_some_and(ConversationCoverage::cacheable)
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ValidatedSourceExtract {
+    aicx_home: PathBuf,
+    pub extract_path: PathBuf,
+    pub metadata: serde_json::Value,
+    pub coverage: ConversationCoverage,
+    pub scope: Option<crate::extraction::conversation::ScopeReport>,
+    extract_sha256: String,
+    source_path: PathBuf,
+    source_fingerprint: crate::session_catalog::SourceFingerprint,
+    repo_path_ignore_fingerprint: String,
+    scope_entry: CatalogEntry,
+    scope_receipt: ConversationScopeReceipt,
+}
+
+pub(crate) struct ValidatedSourceExtracts {
+    pub extracts: HashMap<(String, String), ValidatedSourceExtract>,
+    pub legacy_scope_unproven: BTreeSet<(String, String)>,
+    pub ledger_unproven: BTreeSet<(String, String)>,
+}
+
+impl ValidatedSourceExtract {
+    fn verify_policy_and_scope(&self, phase: &str) -> Result<()> {
+        let user_home = crate::os_user_home().unwrap_or_else(|| self.aicx_home.clone());
+        let ignore = crate::legacy_archive::load_repo_path_ignore(&self.aicx_home, &user_home)?;
+        if ignore.fingerprint() != self.repo_path_ignore_fingerprint {
+            anyhow::bail!("validated intent privacy policy changed {phase} extract read");
+        }
+        if !conversation_scope_receipt_is_current(&self.scope_entry, &self.scope_receipt) {
+            anyhow::bail!("validated intent repository layout changed {phase} extract read");
+        }
+        Ok(())
+    }
+
+    pub(crate) fn read_verified_body(&self) -> Result<String> {
+        let user_home = crate::os_user_home().unwrap_or_else(|| self.aicx_home.clone());
+        let allow = crate::source_path::SourceAllowlist::for_operator(&user_home, &self.aicx_home);
+        let resolved = allow.resolve_file(&self.source_path)?;
+        if resolved != self.source_path || allow.open_file(&resolved).is_err() {
+            anyhow::bail!("validated intent source changed readability or resolved path");
+        }
+        let Some(before) = crate::catalog::live_source_bundle_fingerprint(&resolved) else {
+            anyhow::bail!("validated intent source fingerprint is unavailable");
+        };
+        if before != self.source_fingerprint {
+            anyhow::bail!("validated intent source changed before extract read");
+        }
+        self.verify_policy_and_scope("before")?;
+        let body = crate::source_path::read_under_aicx_home(&self.aicx_home, &self.extract_path)?;
+        if body.trim().is_empty() || sha256_hex(body.as_bytes()) != self.extract_sha256 {
+            anyhow::bail!("validated intent extract checksum mismatch");
+        }
+        let Some(after) = crate::catalog::live_source_bundle_fingerprint(&resolved) else {
+            anyhow::bail!("validated intent source fingerprint disappeared after extract read");
+        };
+        if after != before {
+            anyhow::bail!("validated intent source changed during extract read");
+        }
+        self.verify_policy_and_scope("after")?;
+        Ok(body)
+    }
+}
+
+/// Scope-layout evidence captured before signal projection. The reduced
+/// `ScopeReport` cannot reconstruct tool-only or absorbed workdirs.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ConversationScopeReceipt {
+    pub recorded_workdirs: Vec<String>,
+    pub scope_environment: String,
+}
+
+#[derive(Default)]
+pub(crate) struct ConversationScopeValidator {
+    layout: ScopeLayoutProbe,
+}
+
+impl ConversationScopeValidator {
+    pub(crate) fn is_current(
+        &mut self,
+        entry: &CatalogEntry,
+        receipt: &ConversationScopeReceipt,
+    ) -> bool {
+        self.layout
+            .fingerprint(entry.cwd.as_deref(), &receipt.recorded_workdirs)
+            == receipt.scope_environment
+    }
+}
+
+pub(crate) fn conversation_scope_receipt_is_current(
+    entry: &CatalogEntry,
+    receipt: &ConversationScopeReceipt,
+) -> bool {
+    ConversationScopeValidator::default().is_current(entry, receipt)
 }
 
 /// Memoized repository-layout identity for one index build.
@@ -397,11 +571,37 @@ pub fn build_with_reporter(
     };
     let mut layout = ScopeLayoutProbe::default();
     let dense_missing = crate::vector_index::current_dense_not_built().unwrap_or(true);
+    #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+    let mut prepared_engine = None;
     if !full_rescan
         && project_filters.is_empty()
         && crate::vector_index::source_lexical_generation_matches(&source_fingerprint)?
         && !(semantic && dense_missing)
         && layout.ledger_is_current(&prior_state)
+        && prior_state
+            .sessions
+            .values()
+            .all(maintenance_record_settled)
+        && {
+            // Same corpus is insufficient after the configured model/endpoint
+            // changes. Keep this initialized engine for the rebuild if needed.
+            #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+            {
+                if semantic {
+                    let engine = crate::embedder::EmbeddingEngine::new()?;
+                    let matches =
+                        crate::vector_index::hybrid_manifest_matches_embedder(None, engine.info());
+                    prepared_engine = Some(engine);
+                    matches
+                } else {
+                    true
+                }
+            }
+            #[cfg(not(any(feature = "native-embedder", feature = "cloud-embedder")))]
+            {
+                !semantic
+            }
+        }
     {
         let (dense_kind, dense_docs) = current_dense_stats();
         return Ok(SourceIndexReport {
@@ -458,24 +658,40 @@ pub fn build_with_reporter(
         // True incremental: reuse a prior extract only when the source
         // fingerprint (path + size + mtime) still matches and extract bytes
         // have not been tampered with.
-        if let Some(chunk) = try_reuse_cached_extract(
-            aicx_home,
-            entry,
-            &prior_state,
-            &session_key,
-            &source_allow,
-            &repo_path_ignore_fingerprint,
-            &mut layout,
-        ) {
-            let record = prior_state
+        let ledger_has_current_contract = prior_state
+            .sessions
+            .get(&session_key)
+            .is_some_and(maintenance_record_reusable);
+        if ledger_has_current_contract
+            && let Some(mut chunk) = try_reuse_cached_extract(
+                aicx_home,
+                entry,
+                &prior_state,
+                &session_key,
+                &source_allow,
+                &repo_path_ignore_fingerprint,
+                &mut layout,
+            )
+        {
+            let mut record = prior_state
                 .sessions
                 .get(&session_key)
-                .expect("reuse requires prior record");
+                .expect("reuse requires prior record")
+                .clone();
+            if record.source_physical_identity.is_empty() {
+                // Pre-physical-identity extracts remain useful, but normal
+                // maintenance may never upgrade yesterday's body with today's
+                // proof. Keep the receipt explicitly unknown until full-rescan.
+                record.coverage = None;
+                if let Some(metadata) = chunk.metadata.as_object_mut() {
+                    metadata.insert("conversation_coverage".to_string(), serde_json::Value::Null);
+                }
+            }
             raw_frames += record.raw_frames;
             signal_frames += record.signal_frames;
             filtered_frames += record.filtered_frames;
             sources_reused += 1;
-            next_state.sessions.insert(session_key, record.clone());
+            next_state.sessions.insert(session_key, record);
             chunks.push(chunk);
             continue;
         }
@@ -495,20 +711,21 @@ pub fn build_with_reporter(
                 continue;
             }
         };
-        let parsed_source = match parse_catalog_source(entry, &source_path, &source_allow) {
-            Ok(parsed) => parsed,
-            Err(error) => {
-                crate::diagnostics::log_describe(&format!(
-                    "source_index_skip agent={} session_id={} path={} error={error:#}",
-                    entry.agent,
-                    entry.session_id,
-                    source_path.display()
-                ));
-                sources_skipped += 1;
-                *skipped_by_agent.entry(entry.agent.clone()).or_default() += 1;
-                continue;
-            }
-        };
+        let (parsed_source, coverage) =
+            match parse_catalog_source_checked(entry, &source_path, &source_allow) {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    crate::diagnostics::log_describe(&format!(
+                        "source_index_skip agent={} session_id={} path={} error={error:#}",
+                        entry.agent,
+                        entry.session_id,
+                        source_path.display()
+                    ));
+                    sources_skipped += 1;
+                    *skipped_by_agent.entry(entry.agent.clone()).or_default() += 1;
+                    continue;
+                }
+            };
         let ParsedCatalogSource {
             frames,
             distill,
@@ -533,7 +750,9 @@ pub fn build_with_reporter(
             continue;
         }
 
-        let extract = render_extract(entry, &frames);
+        let rendered = render_extract(entry, &frames);
+        let coverage = coverage.with_omitted_frames(rendered.omitted_frames);
+        let extract = rendered.body;
         if extract.trim().is_empty() {
             continue;
         }
@@ -586,6 +805,7 @@ pub fn build_with_reporter(
             "scope_conflict": session_mixed,
             "scope_unattributed": session_unattributed,
             "session_kind": resolved_kind.clone(),
+            "conversation_coverage": coverage.clone(),
         });
         if let Some(distill) = &distill {
             // card.v3 (W2-02): distill block + flat filter scalars. Reused
@@ -608,14 +828,16 @@ pub fn build_with_reporter(
         // Always stamp LIVE stats into the parse ledger so reuse survives
         // catalog lag (append without catalog rebuild still reuses later
         // once CURRENT has the new extract).
-        let (source_len, source_mtime_ns) = crate::catalog::live_source_fingerprint(&source_path)
+        let fingerprint = crate::catalog::live_source_bundle_fingerprint(&source_path)
             .unwrap_or_else(|| resolve_entry_fingerprint(entry, &source_path));
         next_state.sessions.insert(
             session_key,
             SessionParseRecord {
                 source_path: entry.source_path.clone(),
-                source_len,
-                source_mtime_ns,
+                source_len: fingerprint.len,
+                source_mtime_ns: fingerprint.modified_unix_nanos as u64,
+                source_physical_identity: fingerprint.physical_identity,
+                source_bundle_fingerprint: fingerprint.bundle_fingerprint,
                 extract_relpath: rel.to_string_lossy().replace('\\', "/"),
                 extract_sha256: sha256_hex(extract.as_bytes()),
                 raw_frames: raw_count,
@@ -629,6 +851,8 @@ pub fn build_with_reporter(
                 session_kind: resolved_kind.clone(),
                 scope_environment: layout.fingerprint(entry.cwd.as_deref(), &recorded_workdirs),
                 scope_paths: recorded_workdirs,
+                coverage: Some(coverage),
+                scope: Some(scope),
             },
         );
     }
@@ -644,59 +868,85 @@ pub fn build_with_reporter(
         );
     }
 
+    let semantic_payload = if semantic && !dry_run {
+        Some(embed_chunks_for_semantic(
+            &chunks,
+            reporter.clone(),
+            #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+            prepared_engine,
+        )?)
+    } else {
+        None
+    };
     let publish_phase = Phase::start(reporter.clone(), "index_publish", None);
     let publish_hb = Heartbeat::spawn_with_backoff(
         publish_phase.clone(),
         Duration::from_secs(2),
         Duration::from_secs(15),
     );
-    let (manifest_path, dense_docs, dense_kind) = if dry_run {
-        (
-            None,
-            0usize,
-            if semantic {
-                "would_build_semantic".to_string()
-            } else {
-                "optional_not_built".to_string()
-            },
-        )
-    } else if semantic {
-        let (dense_chunks, fingerprint) = embed_chunks_for_semantic(&chunks)?;
-        let manifest = crate::vector_index::publish_source_hybrid_generation(
-            &chunks,
-            &dense_chunks,
-            &source_fingerprint,
-            &fingerprint,
-        )?;
-        if project_filters.is_empty() {
-            write_parse_state(aicx_home, &next_state)?;
-        }
-        let path = crate::vector_index::hybrid_manifest_path(None)?
-            .display()
-            .to_string();
-        (
-            Some(path).filter(|_| manifest.lexical_doc_count == chunks.len()),
-            manifest.dense_count,
-            manifest.dense_kind,
-        )
-    } else {
-        let manifest =
-            crate::vector_index::publish_source_lexical_generation(&chunks, &source_fingerprint)?;
-        // Persist parse state only after a successful publish so a killed build
-        // cannot claim sessions are current when CURRENT never flipped.
-        if project_filters.is_empty() {
-            write_parse_state(aicx_home, &next_state)?;
-        }
-        let path = crate::vector_index::hybrid_manifest_path(None)?
-            .display()
-            .to_string();
-        (
-            Some(path).filter(|_| manifest.lexical_doc_count == chunks.len()),
-            0,
-            "optional_not_built".to_string(),
-        )
-    };
+    let publication: Result<_> = (|| {
+        Ok(if dry_run {
+            (
+                None,
+                0usize,
+                if semantic {
+                    "would_build_semantic".to_string()
+                } else {
+                    "optional_not_built".to_string()
+                },
+            )
+        } else if semantic {
+            let (dense_chunks, fingerprint) = semantic_payload
+                .as_ref()
+                .expect("semantic payload prepared");
+            let manifest = crate::vector_index::publish_source_hybrid_generation(
+                &chunks,
+                dense_chunks,
+                &source_fingerprint,
+                fingerprint,
+            )?;
+            if project_filters.is_empty() {
+                write_parse_state(aicx_home, &next_state)?;
+            }
+            let path = crate::vector_index::hybrid_manifest_path(None)?
+                .display()
+                .to_string();
+            (
+                Some(path).filter(|_| manifest.lexical_doc_count == chunks.len()),
+                manifest.dense_count,
+                manifest.dense_kind,
+            )
+        } else {
+            let manifest = crate::vector_index::publish_source_lexical_generation(
+                &chunks,
+                &source_fingerprint,
+            )?;
+            // Persist parse state only after a successful publish so a killed build
+            // cannot claim sessions are current when CURRENT never flipped.
+            if project_filters.is_empty() {
+                write_parse_state(aicx_home, &next_state)?;
+            }
+            let path = crate::vector_index::hybrid_manifest_path(None)?
+                .display()
+                .to_string();
+            (
+                Some(path).filter(|_| manifest.lexical_doc_count == chunks.len()),
+                manifest.dense_count,
+                manifest.dense_kind,
+            )
+        })
+    })();
     publish_hb.stop();
+    let (manifest_path, dense_docs, dense_kind) = match publication {
+        Ok(published) => published,
+        Err(error) => {
+            publish_phase.finish_err(
+                &error,
+                Some("retry aicx index after checking the generation artifacts"),
+            );
+            return Err(error);
+        }
+    };
     publish_phase.finish_ok(format!(
         "lexical_docs={} dense_docs={dense_docs}{}",
         chunks.len(),
@@ -742,77 +992,141 @@ fn current_dense_stats() -> (String, usize) {
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
 fn embed_chunks_for_semantic(
     chunks: &[aicx_retrieve::ChunkRef],
+    reporter: Arc<dyn Reporter>,
+    prepared_engine: Option<crate::embedder::EmbeddingEngine>,
 ) -> Result<(
     Vec<aicx_retrieve::DenseChunkRef>,
     aicx_retrieve::EmbedderFingerprint,
 )> {
-    let mut engine = crate::embedder::EmbeddingEngine::new().with_context(|| {
-        "initialize embedder for `aicx index --semantic` (configure ~/.aicx/config.toml \
-         [embedder.cloud] or native GGUF, then `aicx warmup`)"
-            .to_string()
-    })?;
-    let info = engine.info().clone();
-    let fingerprint = crate::vector_index::hybrid_embedder_fingerprint(&info);
-    let batch_size = engine.embed_batch_size().max(1);
-    let mut dense_chunks = Vec::with_capacity(chunks.len());
-    let total = chunks.len();
-    for (batch_idx, batch) in chunks.chunks(batch_size).enumerate() {
-        let texts: Vec<String> = batch
-            .iter()
-            .map(|chunk| {
-                // Bound embed payload: first ~8k chars keeps signal, avoids multi-MB HTTP.
-                let text = chunk.text.as_str();
-                if text.len() > 8_192 {
-                    text.chars().take(8_192).collect()
-                } else {
-                    text.to_string()
-                }
-            })
-            .collect();
-        let vectors = engine.embed_batch(&texts).with_context(|| {
-            format!(
-                "embed batch {}/{} ({} texts) for index --semantic",
-                batch_idx + 1,
-                total.div_ceil(batch_size),
-                texts.len()
-            )
-        })?;
-        if vectors.len() != batch.len() {
-            anyhow::bail!(
-                "embedder returned {} vectors for {} texts in batch {}",
-                vectors.len(),
-                batch.len(),
-                batch_idx + 1
-            );
+    use aicx_progress_contracts::{EventSink, IndexEvent};
+    let phase = Phase::start(reporter, "index_embed", Some(chunks.len() as u64));
+    let progress = aicx_monitor::IndexProgressMonitor::default();
+    progress.on_event(&IndexEvent::RunStarted {
+        total_items: chunks.len(),
+        namespace: "index_embed".into(),
+        source_label: "source extracts".into(),
+        parallelism: 1,
+        started_at: chrono::Utc::now(),
+    });
+    let result: Result<_> = (|| {
+        let mut engine = match prepared_engine {
+            Some(engine) => Ok(engine),
+            None => crate::embedder::EmbeddingEngine::new(),
         }
-        for (chunk, embedding) in batch.iter().zip(vectors) {
-            if embedding.len() != fingerprint.dim {
+        .with_context(|| {
+            "initialize embedder for `aicx index --semantic` (configure ~/.aicx/config.toml \
+         [embedder.cloud] or native GGUF, then `aicx warmup`)"
+                .to_string()
+        })?;
+        let info = engine.info().clone();
+        let fingerprint = crate::vector_index::hybrid_embedder_fingerprint(&info);
+        let batch_size = engine.embed_batch_size().max(1);
+        let mut dense_chunks = Vec::with_capacity(chunks.len());
+        let total = chunks.len();
+        for (batch_idx, batch) in chunks.chunks(batch_size).enumerate() {
+            for (offset, chunk) in batch.iter().enumerate() {
+                progress.on_event(&IndexEvent::ItemStarted {
+                    item_index: batch_idx * batch_size + offset,
+                    label: chunk.id.clone(),
+                    size_bytes: None,
+                });
+            }
+            let batch_started = Instant::now();
+            let texts: Vec<String> = batch
+                .iter()
+                .map(|chunk| {
+                    // Bound embed payload: first ~8k chars keeps signal, avoids multi-MB HTTP.
+                    let text = chunk.text.as_str();
+                    if text.len() > 8_192 {
+                        text.chars().take(8_192).collect()
+                    } else {
+                        text.to_string()
+                    }
+                })
+                .collect();
+            let vectors = engine.embed_batch(&texts).with_context(|| {
+                format!(
+                    "embed batch {}/{} ({} texts) for index --semantic",
+                    batch_idx + 1,
+                    total.div_ceil(batch_size),
+                    texts.len()
+                )
+            })?;
+            if vectors.len() != batch.len() {
                 anyhow::bail!(
-                    "embedder returned dim {} for chunk {}; config expects {}",
-                    embedding.len(),
-                    chunk.id,
-                    fingerprint.dim
+                    "embedder returned {} vectors for {} texts in batch {}",
+                    vectors.len(),
+                    batch.len(),
+                    batch_idx + 1
                 );
             }
-            dense_chunks.push(aicx_retrieve::DenseChunkRef {
-                chunk: chunk.clone(),
-                embedding,
-            });
-        }
-        if batch_idx == 0 || (batch_idx + 1) % 10 == 0 || (batch_idx + 1) * batch_size >= total {
+            for (offset, (chunk, embedding)) in batch.iter().zip(vectors).enumerate() {
+                if embedding.len() != fingerprint.dim {
+                    anyhow::bail!(
+                        "embedder returned dim {} for chunk {}; config expects {}",
+                        embedding.len(),
+                        chunk.id,
+                        fingerprint.dim
+                    );
+                }
+                dense_chunks.push(aicx_retrieve::DenseChunkRef {
+                    chunk: chunk.clone(),
+                    embedding,
+                });
+                progress.on_event(&IndexEvent::ItemIndexed {
+                    item_index: batch_idx * batch_size + offset,
+                    label: chunk.id.clone(),
+                    chunks_indexed: 1,
+                    duration_ms: batch_started.elapsed().as_millis() as u64,
+                    embedder_ms: None,
+                    tokens_estimated: None,
+                    content_hash: None,
+                });
+            }
+            phase.tick(dense_chunks.len() as u64);
+            let snapshot = progress.snapshot();
+            let eta = snapshot
+                .eta_secs
+                .map(|s| format!("{:.0}s", s))
+                .unwrap_or_else(|| "unknown".into());
             eprintln!(
-                "aicx index --semantic · embedded {}/{} session document(s)",
-                dense_chunks.len(),
-                total
+                "aicx index --semantic · embedded {}/{} document(s) · {:.2} docs/s · ETA {}",
+                snapshot.processed, snapshot.total, snapshot.items_per_sec, eta
+            );
+        }
+        Ok((dense_chunks, fingerprint))
+    })();
+    match &result {
+        Ok(_) => {
+            let snapshot = progress.snapshot();
+            progress.on_event(&IndexEvent::RunCompleted {
+                processed: snapshot.processed,
+                indexed: snapshot.indexed,
+                skipped: snapshot.skipped,
+                failed: snapshot.failed,
+                total_chunks: snapshot.total_chunks,
+                elapsed: phase.started_at.elapsed(),
+                stopped_early: false,
+            });
+            phase.finish_ok(format!("embedded={}", snapshot.indexed));
+        }
+        Err(error) => {
+            progress.on_event(&IndexEvent::RunFailed {
+                error: format!("{error:#}"),
+                processed_before_failure: progress.snapshot().processed,
+            });
+            phase.finish_err(
+                error,
+                Some("check embedder configuration and retry aicx index --semantic"),
             );
         }
     }
-    Ok((dense_chunks, fingerprint))
+    result
 }
-
 #[cfg(not(any(feature = "native-embedder", feature = "cloud-embedder")))]
 fn embed_chunks_for_semantic(
     _chunks: &[aicx_retrieve::ChunkRef],
+    _reporter: Arc<dyn Reporter>,
 ) -> Result<(
     Vec<aicx_retrieve::DenseChunkRef>,
     aicx_retrieve::EmbedderFingerprint,
@@ -964,6 +1278,82 @@ pub fn search_session_passages(
     })
 }
 
+/// Read a source-index search reference through the existing checked session
+/// reader. Only catalog-admitted source/cache coordinates are candidates;
+/// arbitrary files under extracts are not admitted by their pathname alone.
+pub(crate) fn read_catalog_chunk_reference_at(
+    aicx_home: &Path,
+    reference: &crate::legacy_archive::ChunkRefSpec,
+    max_chars: Option<usize>,
+) -> Result<Option<crate::legacy_archive::ReadContextChunk>> {
+    use crate::legacy_archive::{Kind, StoredContextFile};
+    let entries = crate::catalog::read_entries_at(aicx_home)?;
+    let user_home = crate::os_user_home().unwrap_or_else(|| aicx_home.to_path_buf());
+    let source_allow = crate::source_path::SourceAllowlist::for_operator(&user_home, aicx_home);
+    let mut candidates = Vec::new();
+    for entry in &entries {
+        let mut paths = vec![extract_path_for(aicx_home, &entry.agent, &entry.session_id)];
+        if let Ok(source_path) = source_allow.resolve_file(entry.source_path.as_str()) {
+            paths.push(source_path);
+        }
+        for path in paths {
+            let file = StoredContextFile {
+                path,
+                project: entry.project.clone().unwrap_or_else(|| "_unknown".into()),
+                repo: None,
+                date_compact: entry.date.as_deref().unwrap_or_default().replace('-', ""),
+                date_iso: entry.date.clone().unwrap_or_default(),
+                kind: Kind::Conversations,
+                agent: entry.agent.clone(),
+                session_id: entry.session_id.clone(),
+                chunk: 1,
+            };
+            if crate::legacy_archive::context_file_matches_spec(aicx_home, &file, reference) {
+                candidates.push(file);
+            }
+        }
+    }
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+    let first = &candidates[0];
+    anyhow::ensure!(
+        candidates
+            .iter()
+            .all(|candidate| candidate.agent == first.agent
+                && candidate.session_id == first.session_id),
+        "ambiguous catalog chunk reference; use a full source or extract path"
+    );
+    let file = crate::legacy_archive::resolve_context_chunk_file(aicx_home, candidates, reference)?;
+    let entry = entries
+        .iter()
+        .find(|entry| entry.agent == file.agent && entry.session_id == file.session_id)
+        .ok_or_else(|| anyhow::anyhow!("resolved catalog session disappeared"))?;
+    // Cache hash, live source fingerprint, repository scope and ignore rules
+    // are checked by this shared path; stale cache files cannot override source.
+    let document = read_session_document(aicx_home, entry)?;
+    let bytes = document.body.len() as u64;
+    let (content, truncated) = crate::legacy_archive::truncate_chars(document.body, max_chars);
+    Ok(Some(crate::legacy_archive::ReadContextChunk {
+        relative_path: file
+            .path
+            .strip_prefix(aicx_home)
+            .unwrap_or(&file.path)
+            .to_string_lossy()
+            .replace('\\', "/"),
+        path: file.path,
+        project: file.project,
+        date: file.date_iso,
+        kind: file.kind.dir_name().into(),
+        agent: file.agent,
+        session_id: file.session_id,
+        chunk: file.chunk,
+        bytes,
+        content,
+        truncated,
+    }))
+}
+
 fn read_session_document(aicx_home: &Path, entry: &CatalogEntry) -> Result<SessionDocument> {
     let user_home = crate::os_user_home().unwrap_or_else(|| aicx_home.to_path_buf());
     let ignore = crate::legacy_archive::load_repo_path_ignore(aicx_home, &user_home)?;
@@ -998,12 +1388,121 @@ fn read_session_document(aicx_home: &Path, entry: &CatalogEntry) -> Result<Sessi
         })?;
     let frames = parse_catalog_source(entry, &source_path, &source_allow)?.frames;
     let SignalSession { frames, .. } = signal_session(frames, &ignore);
-    let body = render_extract(entry, &frames);
+    let body = render_extract(entry, &frames).body;
     Ok(SessionDocument {
         body,
         source_path: entry.source_path.clone(),
         document_path: source_path,
         cache_hit: false,
+    })
+}
+
+/// Validate published per-session extracts against the same ledger and live
+/// evidence used by incremental index builds. Missing/legacy/unverifiable rows
+/// are omitted so callers can re-source them through the canonical reader.
+pub(crate) fn validated_cached_extracts_at(
+    aicx_home: &Path,
+    entries: &[CatalogEntry],
+) -> Result<ValidatedSourceExtracts> {
+    let user_home = crate::os_user_home().unwrap_or_else(|| aicx_home.to_path_buf());
+    let ignore = crate::legacy_archive::load_repo_path_ignore(aicx_home, &user_home)?;
+    let repo_path_ignore_fingerprint = ignore.fingerprint();
+    let source_allow = crate::source_path::SourceAllowlist::for_operator(&user_home, aicx_home);
+    let prior_state = load_parse_state(aicx_home, &repo_path_ignore_fingerprint);
+    let mut layout = ScopeLayoutProbe::default();
+    let mut validated = HashMap::new();
+    let mut legacy_scope_unproven = BTreeSet::new();
+    let mut ledger_unproven = BTreeSet::new();
+
+    for entry in entries {
+        let session_key = session_state_key(&entry.agent, &entry.session_id);
+        let Some(record) = prior_state.sessions.get(&session_key) else {
+            ledger_unproven.insert((entry.agent.clone(), entry.session_id.clone()));
+            continue;
+        };
+        // Intent reads may never fall back to catalog-stamped fingerprints:
+        // deletion, unreadability, or allowlist drift must invalidate the body.
+        let Ok(live_path) = source_allow.resolve_file(entry.source_path.as_str()) else {
+            continue;
+        };
+        if source_allow.open_file(&live_path).is_err() {
+            continue;
+        }
+        let Some(live) = crate::catalog::live_source_bundle_fingerprint(&live_path) else {
+            continue;
+        };
+        if live.len != record.source_len
+            || live.modified_unix_nanos as u64 != record.source_mtime_ns
+            || (!record.source_physical_identity.is_empty()
+                && live.physical_identity != record.source_physical_identity)
+            || live.bundle_fingerprint != record.source_bundle_fingerprint
+        {
+            continue;
+        }
+        let legacy = record.source_physical_identity.is_empty();
+        let scope_layout_current = record.scope_environment
+            == layout.fingerprint(entry.cwd.as_deref(), &record.scope_paths);
+        if legacy
+            && record.source_path == entry.source_path
+            && (record.cwd != entry.cwd || !scope_layout_current)
+        {
+            legacy_scope_unproven.insert((entry.agent.clone(), entry.session_id.clone()));
+            continue;
+        }
+        let Some(chunk) = try_reuse_cached_extract(
+            aicx_home,
+            entry,
+            &prior_state,
+            &session_key,
+            &source_allow,
+            &repo_path_ignore_fingerprint,
+            &mut layout,
+        ) else {
+            continue;
+        };
+        let Some(after) = crate::catalog::live_source_bundle_fingerprint(&live_path) else {
+            continue;
+        };
+        if after != live {
+            continue;
+        }
+        let coverage = record
+            .source_physical_identity
+            .is_empty()
+            .then_some(ConversationCoverage::LegacyUnknown)
+            .or_else(|| record.coverage.clone())
+            .unwrap_or(ConversationCoverage::LegacyUnknown);
+        if matches!(&coverage, ConversationCoverage::Uncacheable) {
+            continue;
+        }
+        validated.insert(
+            (entry.agent.clone(), entry.session_id.clone()),
+            ValidatedSourceExtract {
+                aicx_home: aicx_home.to_path_buf(),
+                extract_path: PathBuf::from(chunk.source_path),
+                metadata: serde_json::json!({
+                    "scope_conflict": chunk.metadata.get("scope_conflict").cloned(),
+                    "scope_unattributed": chunk.metadata.get("scope_unattributed").cloned(),
+                    "session_kind": chunk.metadata.get("session_kind").cloned(),
+                }),
+                coverage,
+                scope: record.scope.clone(),
+                extract_sha256: record.extract_sha256.clone(),
+                source_path: live_path,
+                source_fingerprint: live,
+                repo_path_ignore_fingerprint: repo_path_ignore_fingerprint.clone(),
+                scope_entry: entry.clone(),
+                scope_receipt: ConversationScopeReceipt {
+                    recorded_workdirs: record.scope_paths.clone(),
+                    scope_environment: record.scope_environment.clone(),
+                },
+            },
+        );
+    }
+    Ok(ValidatedSourceExtracts {
+        extracts: validated,
+        legacy_scope_unproven,
+        ledger_unproven,
     })
 }
 
@@ -1113,6 +1612,14 @@ fn parse_catalog_source(
     path: &Path,
     allow: &crate::source_path::SourceAllowlist,
 ) -> Result<ParsedCatalogSource> {
+    Ok(parse_catalog_source_checked(entry, path, allow)?.0)
+}
+
+fn parse_catalog_source_checked(
+    entry: &CatalogEntry,
+    path: &Path,
+    allow: &crate::source_path::SourceAllowlist,
+) -> Result<(ParsedCatalogSource, ConversationCoverage)> {
     // Canonicalize + prove containment under approved source roots before any open.
     let path = allow
         .resolve_file(path)
@@ -1132,48 +1639,61 @@ fn parse_catalog_source(
         // `{"type":"thought","data":"The"}` spam over real operator answers.
         let message = vibecrafted_signal_body(&body);
         if message.trim().is_empty() {
-            return Ok(ParsedCatalogSource {
-                frames: Vec::new(),
-                distill: None,
-                recorded_workdirs: Vec::new(),
-            });
+            return Ok((
+                ParsedCatalogSource {
+                    frames: Vec::new(),
+                    distill: None,
+                    recorded_workdirs: Vec::new(),
+                },
+                ConversationCoverage::CompleteVisible,
+            ));
         }
-        let timestamp = fs::metadata(&path)
+        let modified = fs::metadata(&path)
             .ok()
-            .and_then(|metadata| metadata.modified().ok())
-            .map(chrono::DateTime::<chrono::Utc>::from)
-            .unwrap_or_else(chrono::Utc::now);
-        return Ok(ParsedCatalogSource {
-            distill: None,
-            recorded_workdirs: entry.cwd.iter().cloned().collect(),
-            frames: vec![TimelineEntry {
-                timestamp,
-                agent: entry.agent.clone(),
-                session_id: entry.session_id.clone(),
-                role: "assistant".to_string(),
-                message,
-                frame_class: None,
-                lineage_origin: None,
-                frame_kind: Some(FrameKind::AgentReply),
-                branch: None,
-                cwd: entry.cwd.clone(),
-                scope_conflict: false,
-                scope_unattributed: false,
-                scope_workdirs: Vec::new(),
-                session_kind: session_kind.clone(),
-                timestamp_source: Some("source_mtime".to_string()),
-                source_path: Some(entry.source_path.clone()),
-                source_sha256: None,
-                source_line_span: None,
-            }],
-        });
+            .and_then(|metadata| metadata.modified().ok());
+        let (timestamp, timestamp_source, coverage) =
+            vibecrafted_timestamp(modified, chrono::Utc::now());
+        return Ok((
+            ParsedCatalogSource {
+                distill: None,
+                recorded_workdirs: entry.cwd.iter().cloned().collect(),
+                frames: vec![TimelineEntry {
+                    timestamp,
+                    agent: entry.agent.clone(),
+                    session_id: entry.session_id.clone(),
+                    role: "assistant".to_string(),
+                    message,
+                    frame_class: None,
+                    lineage_origin: None,
+                    frame_kind: Some(FrameKind::AgentReply),
+                    branch: None,
+                    cwd: entry.cwd.clone(),
+                    scope_conflict: false,
+                    scope_unattributed: false,
+                    scope_workdirs: Vec::new(),
+                    session_kind: session_kind.clone(),
+                    timestamp_source: Some(timestamp_source.to_owned()),
+                    source_path: Some(entry.source_path.clone()),
+                    source_sha256: None,
+                    source_line_span: None,
+                }],
+            },
+            coverage,
+        ));
+    }
+
+    if entry.agent == crate::importers::codescribe::CODESCRIBE_AGENT {
+        if entry.session_id.starts_with("bus-") {
+            return parse_codescribe_bus_source(entry, &path, allow, session_kind);
+        }
+        return parse_codescribe_transcript_source(entry, &path, session_kind);
     }
 
     let source_bytes = fs::metadata(&path)
         .with_context(|| format!("stat source {}", path.display()))?
         .len();
     if entry.agent == "codex" && source_bytes > MAX_FULL_PARSE_BYTES {
-        return parse_large_codex_signal(entry, &path, allow, session_kind.as_deref());
+        return parse_large_codex_signal_checked(entry, &path, allow, session_kind.as_deref());
     }
     if source_bytes > MAX_FULL_PARSE_BYTES {
         anyhow::bail!(
@@ -1191,6 +1711,7 @@ fn parse_catalog_source(
         "grok" => aicx_parser::engine::AgentKind::Grok,
         "junie" => aicx_parser::engine::AgentKind::Junie,
         "kimi" => aicx_parser::engine::AgentKind::Kimi,
+        "copilot" => aicx_parser::engine::AgentKind::Copilot,
         other => anyhow::bail!("unsupported catalog agent `{other}`"),
     };
     let parsed = crate::parser_dispatch::parse_file(
@@ -1199,6 +1720,7 @@ fn parse_catalog_source(
         entry.logical_session_id.clone(),
         &path,
     )?;
+    let coverage = model_conversation_coverage(parsed.model());
     let distillates = crate::extraction::distill::materialize::session_distillates(parsed.model());
     let distill = Some(crate::extraction::distill::materialize::index_metadata(
         &distillates,
@@ -1207,11 +1729,58 @@ fn parse_catalog_source(
     for frame in &mut frames {
         frame.session_kind = session_kind.clone();
     }
-    Ok(ParsedCatalogSource {
-        frames,
-        distill,
-        recorded_workdirs: model_recorded_workdirs(parsed.model()),
-    })
+    Ok((
+        ParsedCatalogSource {
+            frames,
+            distill,
+            recorded_workdirs: model_recorded_workdirs(parsed.model()),
+        },
+        coverage,
+    ))
+}
+
+fn model_conversation_coverage(model: &aicx_parser::engine::SessionModel) -> ConversationCoverage {
+    let status = &model.coverage.status;
+    let complete = status.visible_completeness
+        == aicx_parser::engine::VisibleCompleteness::CompleteVisible
+        && !status.malformed_tail_present
+        && !status.visible_event_lost;
+    // Grok reserves Unknown start provenance for invalid non-empty created_at
+    // that selected its wall-clock fallback. Other adapters (notably stable
+    // Gemini Antigravity) may legitimately have no session-level start while
+    // carrying deterministic timestamps on every turn.
+    let time_dependent = model.provenance.agent == aicx_parser::engine::AgentKind::Grok
+        && matches!(
+            model.provenance.started_at,
+            aicx_parser::engine::Known::Unknown(_)
+        );
+    if complete && !time_dependent {
+        ConversationCoverage::CompleteVisible
+    } else {
+        ConversationCoverage::Uncacheable
+    }
+}
+
+fn vibecrafted_timestamp(
+    modified: Option<std::time::SystemTime>,
+    wall_clock: chrono::DateTime<chrono::Utc>,
+) -> (
+    chrono::DateTime<chrono::Utc>,
+    &'static str,
+    ConversationCoverage,
+) {
+    match modified {
+        Some(modified) => (
+            chrono::DateTime::<chrono::Utc>::from(modified),
+            "source_mtime",
+            ConversationCoverage::CompleteVisible,
+        ),
+        None => (
+            wall_clock,
+            "wall_clock_fallback",
+            ConversationCoverage::Uncacheable,
+        ),
+    }
 }
 
 /// Read one cataloged session through the same allowlisted, signal-only parser
@@ -1232,6 +1801,7 @@ fn parse_catalog_source(
 /// `.aicxignore` narrows the same evidence one layer deeper, so the count of
 /// scopes it hid travels with the report: an ignored BASELINE would otherwise
 /// leave a foreign cwd looking like the session's only scope.
+#[cfg(test)]
 pub(crate) fn read_catalog_signal_with_scope_at(
     aicx_home: &Path,
     entry: &CatalogEntry,
@@ -1259,6 +1829,37 @@ pub(crate) fn read_catalog_conversation_at(
     Vec<TimelineEntry>,
     crate::extraction::conversation::ScopeReport,
 )> {
+    let (path, frames, scope, _) = read_catalog_conversation_checked_at(aicx_home, entry)?;
+    Ok((path, frames, scope))
+}
+
+/// Same reader as the public conversation path, with parser coverage retained
+/// for callers that persist derived claims. Partial visible reads remain usable
+/// for this request, but must not become a trusted warm cache.
+pub(crate) fn read_catalog_conversation_checked_at(
+    aicx_home: &Path,
+    entry: &CatalogEntry,
+) -> Result<(
+    PathBuf,
+    Vec<TimelineEntry>,
+    crate::extraction::conversation::ScopeReport,
+    ConversationCoverage,
+)> {
+    let (path, frames, scope, coverage, _) =
+        read_catalog_conversation_checked_with_scope_receipt_at(aicx_home, entry)?;
+    Ok((path, frames, scope, coverage))
+}
+
+pub(crate) fn read_catalog_conversation_checked_with_scope_receipt_at(
+    aicx_home: &Path,
+    entry: &CatalogEntry,
+) -> Result<(
+    PathBuf,
+    Vec<TimelineEntry>,
+    crate::extraction::conversation::ScopeReport,
+    ConversationCoverage,
+    ConversationScopeReceipt,
+)> {
     let user_home = crate::os_user_home().unwrap_or_else(|| aicx_home.to_path_buf());
     let source_allow = crate::source_path::SourceAllowlist::for_operator(&user_home, aicx_home);
     let source_path = source_allow
@@ -1269,10 +1870,23 @@ pub(crate) fn read_catalog_conversation_at(
                 entry.agent, entry.session_id
             )
         })?;
-    let frames = parse_catalog_source(entry, &source_path, &source_allow)?.frames;
+    let (parsed_source, coverage) =
+        parse_catalog_source_checked(entry, &source_path, &source_allow)?;
+    let recorded_workdirs = parsed_source.recorded_workdirs.clone();
     let ignore = crate::legacy_archive::load_repo_path_ignore(aicx_home, &user_home)?;
-    let SignalSession { frames, scope, .. } = signal_session(frames, &ignore);
-    Ok((source_path, frames, scope))
+    let SignalSession { frames, scope, .. } = signal_session(parsed_source.frames, &ignore);
+    let scope_environment =
+        ScopeLayoutProbe::default().fingerprint(entry.cwd.as_deref(), &recorded_workdirs);
+    Ok((
+        source_path,
+        frames,
+        scope,
+        coverage,
+        ConversationScopeReceipt {
+            recorded_workdirs,
+            scope_environment,
+        },
+    ))
 }
 
 /// A parsed session reduced to its signal frames, with the scope of every
@@ -1362,7 +1976,7 @@ fn scope_report_excluding_ignored(
     report
 }
 
-fn frame_matches_kind(frame: &TimelineEntry, requested: FrameKind) -> bool {
+pub(crate) fn frame_matches_kind(frame: &TimelineEntry, requested: FrameKind) -> bool {
     frame.frame_kind.unwrap_or(match frame.role.as_str() {
         "user" => FrameKind::UserMsg,
         "assistant" => FrameKind::AgentReply,
@@ -1412,19 +2026,41 @@ fn visible_head_timestamp(line: &str) -> chrono::DateTime<chrono::Utc> {
 /// them and deserializes only bounded message records. The one other frame it
 /// keeps is a single, empty tool-call frame for a turn window that ran calls
 /// and holds no message: the carrier of that window's verdict.
+#[cfg(test)]
 fn parse_large_codex_signal(
     entry: &CatalogEntry,
     path: &Path,
     allow: &crate::source_path::SourceAllowlist,
     session_kind: Option<&str>,
 ) -> Result<ParsedCatalogSource> {
+    Ok(parse_large_codex_signal_checked(entry, path, allow, session_kind)?.0)
+}
+
+fn parse_large_codex_signal_checked(
+    entry: &CatalogEntry,
+    path: &Path,
+    allow: &crate::source_path::SourceAllowlist,
+    session_kind: Option<&str>,
+) -> Result<(ParsedCatalogSource, ConversationCoverage)> {
     // `path` is already resolve_file'd by the caller; open through the allowlist.
-    let file = allow
+    let mut file = allow
         .open_file(path)
         .with_context(|| format!("open source {}", path.display()))?;
+    // read_line_capped drains oversized records without exposing whether the
+    // drained tail was terminated. Check EOF on this same descriptor first.
+    use std::io::{Read, Seek, SeekFrom};
+    let mut stable = true;
+    if file.metadata()?.len() > 0 {
+        file.seek(SeekFrom::End(-1))?;
+        let mut last = [0u8];
+        file.read_exact(&mut last)?;
+        stable = last[0] == b'\n';
+        file.seek(SeekFrom::Start(0))?;
+    }
     let mut reader = BufReader::new(file);
     let mut frames = Vec::new();
     let mut line_no = 0u64;
+    let mut skipped_records = 0usize;
     // Turn-window effective scope: message frames buffer per window between
     // `turn_context` records; explicit tool-call workdirs collected inside the
     // window can re-scope the whole window (never per-frame flip-flop).
@@ -1482,12 +2118,12 @@ fn parse_large_codex_signal(
             .and_then(serde_json::Value::as_str)
             .and_then(|raw| chrono::DateTime::parse_from_rfc3339(raw).ok())
             .map(|timestamp| timestamp.with_timezone(&chrono::Utc))
-            .unwrap_or_else(chrono::Utc::now)
     };
     while let Some(record) = crate::sanitize::read_line_capped(&mut reader, MAX_JSONL_RECORD_BYTES)?
     {
         line_no += 1;
         if record.exceeded {
+            skipped_records += 1;
             // An over-cap record is drained, never parsed. When its visible
             // head says it was a tool-call envelope, the window MIGHT have
             // moved repos and this reader will never know: record unreadable
@@ -1502,6 +2138,7 @@ fn parse_large_codex_signal(
             continue;
         }
         let Ok(value) = serde_json::from_str::<serde_json::Value>(&record.line) else {
+            stable = false;
             // A malformed record never becomes a value either, so its workdir
             // is just as invisible: the full adapter treats both alike.
             if note_opaque_record(&mut window_workdirs, &record.line) {
@@ -1556,7 +2193,16 @@ fn parse_large_codex_signal(
                     window_workdirs.push(workdir);
                 }
             }
-            window_call.get_or_insert_with(|| (record_timestamp(&value), line_no));
+            // A carrier's wall-clock fallback does not make the projection
+            // time-dependent: the signal projection drops tool-call frames
+            // before anything is served or cached, and the scope report their
+            // verdict feeds is built from sets and counts, not order.
+            window_call.get_or_insert_with(|| {
+                (
+                    record_timestamp(&value).unwrap_or_else(chrono::Utc::now),
+                    line_no,
+                )
+            });
             continue;
         }
         // Only `response_item.message` carries chat text in this reader; the
@@ -1590,14 +2236,23 @@ fn parse_large_codex_signal(
         if message.trim().is_empty() {
             continue;
         }
-        window_frames.push(frame(
+        let recorded_time = record_timestamp(&value);
+        let timestamp = recorded_time.unwrap_or_else(|| {
+            stable = false;
+            chrono::DateTime::UNIX_EPOCH
+        });
+        let mut message_frame = frame(
             role,
             frame_kind,
             message,
-            record_timestamp(&value),
+            timestamp,
             line_no,
             baseline_cwd.clone(),
-        ));
+        );
+        if recorded_time.is_none() {
+            message_frame.timestamp_source = Some("unknown".to_string());
+        }
+        window_frames.push(message_frame);
     }
     if window_frames.is_empty() {
         window_frames.extend(call_frame(window_call, baseline_cwd.clone()));
@@ -1610,11 +2265,18 @@ fn parse_large_codex_signal(
         &mut frames,
         &mut recorded_workdirs,
     );
-    Ok(ParsedCatalogSource {
-        frames,
-        distill: None,
-        recorded_workdirs: recorded_workdirs.into_iter().collect(),
-    })
+    Ok((
+        ParsedCatalogSource {
+            frames,
+            distill: None,
+            recorded_workdirs: recorded_workdirs.into_iter().collect(),
+        },
+        if stable {
+            ConversationCoverage::BoundedProjection { skipped_records }
+        } else {
+            ConversationCoverage::Uncacheable
+        },
+    ))
 }
 
 /// Stamp a buffered turn window with its effective scope and drain it into the
@@ -1718,6 +2380,77 @@ fn is_signal_frame(frame: &TimelineEntry) -> bool {
     signal_kind
         && !crate::extraction::is_harness_injected_noise(&frame.role, &frame.message)
         && !looks_like_binary_payload(&frame.message)
+}
+
+/// One Codescribe bus catalog session: the ledger replayed and narrowed to
+/// the receiving agent session the row names. The operator's words become
+/// `user` frames, the receiver's own bus replies `assistant` frames. A row the
+/// ledger no longer delivers to yields no frames rather than someone else's.
+fn parse_codescribe_bus_source(
+    entry: &CatalogEntry,
+    path: &Path,
+    allow: &crate::source_path::SourceAllowlist,
+    session_kind: Option<String>,
+) -> Result<(ParsedCatalogSource, ConversationCoverage)> {
+    let body = allow
+        .read_to_string(path)
+        .with_context(|| format!("read codescribe bus ledger {}", path.display()))?;
+    let replay = crate::importers::codescribe_bus::replay_bus_ledger(&body);
+    let mut frames = crate::importers::codescribe_bus::bus_session_frames(
+        path,
+        &replay,
+        &entry.session_id,
+        entry.cwd.as_deref(),
+    )
+    .unwrap_or_default();
+    for frame in &mut frames {
+        frame.session_kind = session_kind.clone();
+    }
+    let coverage = match replay.skipped_records() {
+        0 => ConversationCoverage::CompleteVisible,
+        skipped_records => ConversationCoverage::BoundedProjection { skipped_records },
+    };
+    Ok((
+        ParsedCatalogSource {
+            frames,
+            distill: None,
+            recorded_workdirs: entry.cwd.iter().cloned().collect(),
+        },
+        coverage,
+    ))
+}
+
+/// One dictated Codescribe take, parsed by the existing transcript importer
+/// with no project filter and no time cutoff: the catalog row already chose
+/// the take, and windows are applied downstream per utterance.
+fn parse_codescribe_transcript_source(
+    entry: &CatalogEntry,
+    path: &Path,
+    session_kind: Option<String>,
+) -> Result<(ParsedCatalogSource, ConversationCoverage)> {
+    let date = entry
+        .date
+        .as_deref()
+        .and_then(|date| chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").ok())
+        .with_context(|| format!("codescribe take {} has no catalog date", path.display()))?;
+    let config = crate::timeline::ExtractionConfig {
+        project_filter: Vec::new(),
+        cutoff: chrono::DateTime::<chrono::Utc>::UNIX_EPOCH,
+        include_assistant: true,
+        watermark: None,
+    };
+    let mut frames = crate::importers::parse_codescribe_transcript(path, date, &config)?;
+    for frame in &mut frames {
+        frame.session_kind = session_kind.clone();
+    }
+    Ok((
+        ParsedCatalogSource {
+            frames,
+            distill: None,
+            recorded_workdirs: Vec::new(),
+        },
+        ConversationCoverage::CompleteVisible,
+    ))
 }
 
 /// Collapse a vibecrafted `runtime_runs/*/transcript.log` into indexable text.
@@ -1827,7 +2560,12 @@ fn strip_known_harness_blocks(message: &str) -> String {
     cleaned
 }
 
-fn render_extract(entry: &CatalogEntry, frames: &[TimelineEntry]) -> String {
+struct RenderedExtract {
+    body: String,
+    omitted_frames: usize,
+}
+
+fn render_extract(entry: &CatalogEntry, frames: &[TimelineEntry]) -> RenderedExtract {
     let mut out = format!(
         "# AICX session extract\n\n- session: `{}`\n- agent: `{}`\n- project: `{}`\n- source: `{}`\n\n",
         entry.session_id,
@@ -1835,6 +2573,7 @@ fn render_extract(entry: &CatalogEntry, frames: &[TimelineEntry]) -> String {
         entry.project.as_deref().unwrap_or("_unknown"),
         entry.source_path
     );
+    let mut rendered_frames = 0usize;
     for frame in frames {
         let role = if frame.role == "user" {
             "user"
@@ -1855,8 +2594,12 @@ fn render_extract(entry: &CatalogEntry, frames: &[TimelineEntry]) -> String {
         out.push_str(&header);
         out.push_str(frame.message.trim());
         out.push_str("\n\n");
+        rendered_frames += 1;
     }
-    out
+    RenderedExtract {
+        body: out,
+        omitted_frames: frames.len().saturating_sub(rendered_frames),
+    }
 }
 
 fn extract_preview_lines(frames: &[TimelineEntry]) -> Vec<String> {
@@ -1982,18 +2725,27 @@ fn try_reuse_cached_extract(
     if record.source_len == 0 || record.source_mtime_ns == 0 {
         return None;
     }
+    if entry.agent == "copilot" && record.source_bundle_fingerprint.is_none() {
+        return None;
+    }
     // LIVE source fingerprint is the reuse gate. Catalog-embedded size/mtime
     // lag until rebuild; requiring them to match the ledger forced full
     // reparse after a source-change index that already stamped live stats.
     if let Ok(live_path) = source_allow.resolve_file(entry.source_path.as_str()) {
-        let (live_len, live_mtime) = crate::catalog::live_source_fingerprint(&live_path)?;
-        if live_len != record.source_len || live_mtime != record.source_mtime_ns {
+        let live = crate::catalog::live_source_bundle_fingerprint(&live_path)?;
+        if live.len != record.source_len
+            || live.modified_unix_nanos as u64 != record.source_mtime_ns
+            || (!record.source_physical_identity.is_empty()
+                && live.physical_identity != record.source_physical_identity)
+            || live.bundle_fingerprint != record.source_bundle_fingerprint
+        {
             return None;
         }
     } else {
         // Unreadable path: fall back to catalog-admitted fields only.
         if entry.source_len != Some(record.source_len)
             || entry.source_mtime_ns != Some(record.source_mtime_ns)
+            || entry.source_bundle_fingerprint != record.source_bundle_fingerprint
         {
             return None;
         }
@@ -2037,6 +2789,7 @@ fn try_reuse_cached_extract(
         "scope_conflict": record.scope_conflict,
         "scope_unattributed": record.scope_unattributed,
         "session_kind": record.session_kind.clone().or_else(|| entry.session_kind.clone()),
+        "conversation_coverage": record.coverage.clone(),
     });
     Some(aicx_retrieve::ChunkRef {
         id: format!("{}:{}", entry.agent, entry.session_id),
@@ -2079,9 +2832,17 @@ fn source_fingerprint(
         hasher.update([0]);
         hasher.update(entry.source_path.as_bytes());
         hasher.update([0]);
-        let (len, mtime) = live_or_catalog_fingerprint(entry, source_allow);
-        hasher.update(len.to_le_bytes());
-        hasher.update(mtime.to_le_bytes());
+        let fingerprint = live_or_catalog_fingerprint(entry, source_allow);
+        hasher.update(fingerprint.len.to_le_bytes());
+        hasher.update((fingerprint.modified_unix_nanos as u64).to_le_bytes());
+        for value in fingerprint.physical_identity {
+            hasher.update(value.to_le_bytes());
+        }
+        if let Some(bundle) = fingerprint.bundle_fingerprint {
+            hasher.update(b"source_bundle\0");
+            hasher.update(bundle.as_bytes());
+            hasher.update([0]);
+        }
     }
     Ok(hex::encode(hasher.finalize()))
 }
@@ -2091,23 +2852,40 @@ fn source_fingerprint(
 fn live_or_catalog_fingerprint(
     entry: &CatalogEntry,
     source_allow: &crate::source_path::SourceAllowlist,
-) -> (u64, u64) {
+) -> crate::session_catalog::SourceFingerprint {
     if let Ok(path) = source_allow.resolve_file(entry.source_path.as_str())
-        && let Some(live) = crate::catalog::live_source_fingerprint(&path)
+        && let Some(live) = crate::catalog::live_source_bundle_fingerprint(&path)
     {
         return live;
     }
-    (
-        entry.source_len.unwrap_or(0),
-        entry.source_mtime_ns.unwrap_or(0),
-    )
+    crate::session_catalog::SourceFingerprint {
+        len: entry.source_len.unwrap_or(0),
+        modified_unix_nanos: entry.source_mtime_ns.unwrap_or(0) as u128,
+        physical_identity: Vec::new(),
+        bundle_fingerprint: entry.source_bundle_fingerprint.clone(),
+    }
 }
 
-fn resolve_entry_fingerprint(entry: &CatalogEntry, source_path: &Path) -> (u64, u64) {
+fn resolve_entry_fingerprint(
+    entry: &CatalogEntry,
+    source_path: &Path,
+) -> crate::session_catalog::SourceFingerprint {
     if let (Some(len), Some(mtime)) = (entry.source_len, entry.source_mtime_ns) {
-        return (len, mtime);
+        return crate::session_catalog::SourceFingerprint {
+            len,
+            modified_unix_nanos: mtime as u128,
+            physical_identity: Vec::new(),
+            bundle_fingerprint: entry.source_bundle_fingerprint.clone(),
+        };
     }
-    crate::catalog::live_source_fingerprint(source_path).unwrap_or((0, 0))
+    crate::catalog::live_source_bundle_fingerprint(source_path).unwrap_or(
+        crate::session_catalog::SourceFingerprint {
+            len: 0,
+            modified_unix_nanos: 0,
+            physical_identity: Vec::new(),
+            bundle_fingerprint: None,
+        },
+    )
 }
 
 fn extract_path_for(aicx_home: &Path, agent: &str, session_id: &str) -> PathBuf {
@@ -2168,6 +2946,114 @@ fn write_if_changed(aicx_home: &Path, path: &Path, bytes: &[u8]) -> Result<bool>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vibecrafted_wall_clock_fallback_is_labeled_and_uncacheable() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-09-03T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let (fallback, source, coverage) = vibecrafted_timestamp(None, now);
+        assert_eq!(fallback, now);
+        assert_eq!(source, "wall_clock_fallback");
+        assert_eq!(coverage, ConversationCoverage::Uncacheable);
+
+        let modified = std::time::UNIX_EPOCH + std::time::Duration::from_secs(123);
+        let (timestamp, source, coverage) = vibecrafted_timestamp(Some(modified), now);
+        assert_eq!(timestamp.timestamp(), 123);
+        assert_eq!(source, "source_mtime");
+        assert_eq!(coverage, ConversationCoverage::CompleteVisible);
+    }
+
+    #[test]
+    fn gemini_antigravity_unknown_session_start_remains_cacheable() {
+        use aicx_parser::engine::{
+            ParserEngine, SourceArtifact, SourceFraming, SourceHandle, ValidatedParse,
+        };
+        let parse = || {
+            let artifact = SourceArtifact::memory(
+                "gemini_antigravity_conversation.json",
+                include_bytes!("../tests/fixtures/frame_kind/gemini_antigravity_conversation.json")
+                    .to_vec(),
+                SourceFraming::WholeDocument,
+            )
+            .unwrap();
+            let handle = SourceHandle::new(
+                aicx_parser::engine::AgentKind::Gemini,
+                "antigravity-cache",
+                Some("antigravity-cache".to_owned()),
+                vec![artifact],
+            )
+            .unwrap();
+            match ParserEngine::default().parse_registered(&handle).unwrap() {
+                ValidatedParse::Session(session) => session.into_model(),
+                ValidatedParse::Fatal(_) => panic!("Antigravity fixture must parse"),
+            }
+        };
+        let first = parse();
+        assert!(matches!(
+            first.provenance.started_at,
+            aicx_parser::engine::Known::Unknown(_)
+        ));
+        assert_eq!(
+            model_conversation_coverage(&first),
+            ConversationCoverage::CompleteVisible
+        );
+        let second = parse();
+        assert_eq!(
+            serde_json::to_value(crate::output::timeline_entries_from_model(&first)).unwrap(),
+            serde_json::to_value(crate::output::timeline_entries_from_model(&second)).unwrap()
+        );
+    }
+
+    #[test]
+    fn grok_wall_clock_timestamp_fallback_is_not_cacheable_until_repaired() {
+        use aicx_parser::engine::{
+            ParserEngine, SourceArtifact, SourceFraming, SourceHandle, ValidatedParse,
+        };
+        let parse = || {
+            let chat = SourceArtifact::memory(
+                "chat_history.jsonl",
+                b"{\"type\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"DECISION: keep Grok evidence\"}]}\n".to_vec(),
+                SourceFraming::JsonLines,
+            )
+            .unwrap();
+            let handle = SourceHandle::new(
+                aicx_parser::engine::AgentKind::Grok,
+                "grok-cache",
+                Some("grok-cache".to_owned()),
+                vec![chat],
+            )
+            .unwrap();
+            match ParserEngine::default().parse_registered(&handle).unwrap() {
+                ValidatedParse::Session(session) => session.into_model(),
+                ValidatedParse::Fatal(_) => panic!("Grok fixture must emit a current result"),
+            }
+        };
+
+        // Adapter provenance uses Unknown when invalid non-empty created_at
+        // selected a wall-clock base (covered at the adapter boundary). This
+        // canonical state must remain visible but never trusted as cache input.
+        let mut inferred = parse();
+        inferred.provenance.started_at = aicx_parser::engine::Known::unknown();
+        assert!(!crate::output::timeline_entries_from_model(&inferred).is_empty());
+        assert_eq!(
+            model_conversation_coverage(&inferred),
+            ConversationCoverage::Uncacheable
+        );
+
+        let repaired = parse();
+        assert_eq!(
+            model_conversation_coverage(&repaired),
+            ConversationCoverage::CompleteVisible
+        );
+        let repaired_again = parse();
+        assert_eq!(
+            serde_json::to_value(crate::output::timeline_entries_from_model(&repaired)).unwrap(),
+            serde_json::to_value(crate::output::timeline_entries_from_model(&repaired_again))
+                .unwrap(),
+            "repaired timestamp must yield a stable warm-cache input"
+        );
+    }
 
     #[test]
     fn persistent_project_slice_cannot_replace_the_global_generation() {
@@ -2270,6 +3156,7 @@ mod tests {
             source_path: source_path.display().to_string(),
             source_len: None,
             source_mtime_ns: None,
+            source_bundle_fingerprint: None,
             title: None,
             machine: None,
             logical_session_id: None,
@@ -2991,6 +3878,208 @@ mod tests {
     }
 
     #[test]
+    fn copilot_cache_reuse_and_generation_notice_sidecar_edits_below_event_mtime() {
+        let root = reader_fixture_root("copilot-bundle-cache");
+        let source_path = root.join(".copilot/session-state/user-123-task-456/events.jsonl");
+        let sidecar = source_path.parent().unwrap().join("workspace.yaml");
+        fs::create_dir_all(source_path.parent().unwrap()).unwrap();
+        fs::write(&source_path, "{\"type\":\"session.start\",\"data\":{}}\n").unwrap();
+        fs::write(&sidecar, "name: first title\n").unwrap();
+        filetime::set_file_mtime(
+            &source_path,
+            filetime::FileTime::from_unix_time(2_000_000_000, 0),
+        )
+        .unwrap();
+        filetime::set_file_mtime(
+            &sidecar,
+            filetime::FileTime::from_unix_time(1_700_000_000, 0),
+        )
+        .unwrap();
+        let before = crate::catalog::live_source_bundle_fingerprint(&source_path).unwrap();
+        let entry = CatalogEntry {
+            schema: crate::catalog::CATALOG_SCHEMA.to_owned(),
+            session_id: "user-123-task-456".to_owned(),
+            agent: "copilot".to_owned(),
+            project: None,
+            date: None,
+            cwd: None,
+            source_path: source_path.display().to_string(),
+            source_len: Some(before.len),
+            source_mtime_ns: Some(before.modified_unix_nanos as u64),
+            source_bundle_fingerprint: before.bundle_fingerprint.clone(),
+            title: None,
+            machine: None,
+            logical_session_id: None,
+            session_kind: None,
+        };
+        let catalog_path = crate::catalog::sessions_path_for(&root);
+        fs::create_dir_all(catalog_path.parent().unwrap()).unwrap();
+        fs::write(
+            &catalog_path,
+            format!("{}\n", serde_json::to_string(&entry).unwrap()),
+        )
+        .unwrap();
+        let extract_relpath = "extracts/copilot/user-123-task-456_conversation.md";
+        let body = "# Copilot session\n\nuser: retain source evidence\n";
+        let extract_path = root.join(extract_relpath);
+        fs::create_dir_all(extract_path.parent().unwrap()).unwrap();
+        fs::write(&extract_path, body).unwrap();
+        let key = session_state_key("copilot", &entry.session_id);
+        let mut prior = SourceParseState {
+            schema: PARSE_STATE_SCHEMA.to_owned(),
+            signal_filter_version: SIGNAL_FILTER_VERSION.to_owned(),
+            repo_path_ignore_fingerprint: "ignore-fingerprint".to_owned(),
+            sessions: BTreeMap::from([(
+                key.clone(),
+                SessionParseRecord {
+                    source_path: entry.source_path.clone(),
+                    source_len: before.len,
+                    source_mtime_ns: before.modified_unix_nanos as u64,
+                    source_physical_identity: before.physical_identity.clone(),
+                    source_bundle_fingerprint: before.bundle_fingerprint.clone(),
+                    extract_relpath: extract_relpath.to_owned(),
+                    extract_sha256: sha256_hex(body.as_bytes()),
+                    raw_frames: 1,
+                    signal_frames: 1,
+                    filtered_frames: 0,
+                    project: None,
+                    date: None,
+                    cwd: None,
+                    scope_conflict: false,
+                    scope_unattributed: false,
+                    session_kind: None,
+                    scope_environment: ScopeLayoutProbe::default().fingerprint(None, &[]),
+                    scope_paths: Vec::new(),
+                    coverage: None,
+                    scope: None,
+                },
+            )]),
+        };
+        let allow = crate::source_path::SourceAllowlist::from_roots([root.clone()]);
+        let reuse = |prior: &SourceParseState| {
+            try_reuse_cached_extract(
+                &root,
+                &entry,
+                prior,
+                &key,
+                &allow,
+                "ignore-fingerprint",
+                &mut ScopeLayoutProbe::default(),
+            )
+        };
+        assert!(reuse(&prior).is_some());
+        let generation_before = source_fingerprint(
+            &root,
+            &catalog_path,
+            std::slice::from_ref(&entry),
+            &allow,
+            "ignore-fingerprint",
+        )
+        .unwrap();
+
+        fs::write(&sidecar, "name: other title\n").unwrap();
+        filetime::set_file_mtime(
+            &sidecar,
+            filetime::FileTime::from_unix_time(1_700_000_001, 0),
+        )
+        .unwrap();
+        let after = crate::catalog::live_source_bundle_fingerprint(&source_path).unwrap();
+        assert_eq!(before.len, after.len);
+        assert_eq!(before.modified_unix_nanos, after.modified_unix_nanos);
+        assert_ne!(before.bundle_fingerprint, after.bundle_fingerprint);
+        assert!(
+            reuse(&prior).is_none(),
+            "sidecar edits must invalidate cached passages"
+        );
+        assert_ne!(
+            generation_before,
+            source_fingerprint(
+                &root,
+                &catalog_path,
+                std::slice::from_ref(&entry),
+                &allow,
+                "ignore-fingerprint"
+            )
+            .unwrap()
+        );
+
+        prior
+            .sessions
+            .get_mut(&key)
+            .unwrap()
+            .source_bundle_fingerprint = after.bundle_fingerprint;
+        assert!(
+            reuse(&prior).is_some(),
+            "a freshly parsed bundle can reuse despite a lagging catalog"
+        );
+        prior
+            .sessions
+            .get_mut(&key)
+            .unwrap()
+            .source_bundle_fingerprint = None;
+        assert!(
+            reuse(&prior).is_none(),
+            "legacy Copilot records must reparse once"
+        );
+        let mut legacy = serde_json::to_value(&prior).unwrap();
+        legacy["sessions"][&key]
+            .as_object_mut()
+            .unwrap()
+            .remove("source_bundle_fingerprint");
+        let restored: SourceParseState = serde_json::from_value(legacy).unwrap();
+        assert_eq!(restored.sessions[&key].source_bundle_fingerprint, None);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn extract_size_omissions_downgrade_complete_coverage() {
+        let entry = CatalogEntry {
+            schema: crate::catalog::CATALOG_SCHEMA.to_string(),
+            session_id: "render-cap".to_string(),
+            agent: "codex".to_string(),
+            project: Some("vetcoders/aicx".to_string()),
+            date: Some("2026-10-06".to_string()),
+            cwd: Some("/repo/aicx".to_string()),
+            source_path: "/sources/render-cap.jsonl".to_string(),
+            source_len: None,
+            source_mtime_ns: None,
+            source_bundle_fingerprint: None,
+            title: None,
+            machine: None,
+            logical_session_id: None,
+            session_kind: None,
+        };
+        let frame = |ordinal: i64| TimelineEntry {
+            timestamp: chrono::Utc::now() + chrono::Duration::seconds(ordinal),
+            agent: "codex".to_string(),
+            session_id: entry.session_id.clone(),
+            role: "user".to_string(),
+            message: "x".repeat(MAX_EXTRACT_CHARS / 2),
+            frame_class: None,
+            lineage_origin: None,
+            frame_kind: Some(FrameKind::UserMsg),
+            branch: None,
+            cwd: entry.cwd.clone(),
+            scope_conflict: false,
+            scope_unattributed: false,
+            scope_workdirs: Vec::new(),
+            session_kind: None,
+            timestamp_source: Some("record".to_string()),
+            source_path: Some(entry.source_path.clone()),
+            source_sha256: None,
+            source_line_span: None,
+        };
+        let rendered = render_extract(&entry, &[frame(0), frame(1), frame(2)]);
+        assert!(rendered.omitted_frames > 0);
+        assert!(rendered.body.contains("extract truncated by source index"));
+        assert!(matches!(
+            ConversationCoverage::CompleteVisible.with_omitted_frames(rendered.omitted_frames),
+            ConversationCoverage::BoundedProjection { skipped_records }
+                if skipped_records == rendered.omitted_frames
+        ));
+    }
+
+    #[test]
     fn parse_state_reuse_requires_matching_source_path_and_extract_hash() {
         let root = std::env::temp_dir().join(format!(
             "aicx-source-index-reuse-{}-{}",
@@ -3028,6 +4117,7 @@ mod tests {
             source_path: source_path.display().to_string(),
             source_len: Some(source_len),
             source_mtime_ns: Some(source_mtime_ns),
+            source_bundle_fingerprint: None,
             title: Some("routing".to_string()),
             machine: None,
             logical_session_id: None,
@@ -3045,6 +4135,8 @@ mod tests {
                 source_path: entry.source_path.clone(),
                 source_len,
                 source_mtime_ns,
+                source_physical_identity: Vec::new(),
+                source_bundle_fingerprint: None,
                 extract_relpath: extract_rel.to_string(),
                 extract_sha256: sha256_hex(body.as_bytes()),
                 raw_frames: 4,
@@ -3059,6 +4151,8 @@ mod tests {
                 scope_environment: ScopeLayoutProbe::default()
                     .fingerprint(entry.cwd.as_deref(), &[]),
                 scope_paths: Vec::new(),
+                coverage: None,
+                scope: None,
             },
         );
 
@@ -3268,6 +4362,206 @@ mod tests {
     }
 
     #[test]
+    fn legacy_parse_ledger_is_reusable_only_as_explicit_unknown_coverage() {
+        let root = std::env::temp_dir().join(format!(
+            "aicx-source-index-legacy-coverage-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let source = root.join("sources/session.jsonl");
+        let extract = root.join("extracts/codex/session_conversation.md");
+        let workspace = root.join("workspaces/aicx");
+        let nested = workspace.join("vendor/fleet-bus");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::create_dir_all(extract.parent().unwrap()).unwrap();
+        fs::create_dir_all(workspace.join(".git")).unwrap();
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(&source, "source bytes\n").unwrap();
+        let body = "# AICX session extract\n\n## 2026-10-06T00:00:00.000Z · user\n\nDecision: retain legacy evidence\n";
+        fs::write(&extract, body).unwrap();
+        let fingerprint = crate::catalog::live_source_bundle_fingerprint(&source).unwrap();
+        let entry = CatalogEntry {
+            schema: crate::catalog::CATALOG_SCHEMA.to_string(),
+            session_id: "session".to_string(),
+            agent: "codex".to_string(),
+            project: Some("vetcoders/aicx".to_string()),
+            date: Some("2026-10-06".to_string()),
+            cwd: Some(workspace.to_string_lossy().into_owned()),
+            source_path: source.display().to_string(),
+            source_len: Some(fingerprint.len),
+            source_mtime_ns: Some(fingerprint.modified_unix_nanos as u64),
+            source_bundle_fingerprint: fingerprint.bundle_fingerprint.clone(),
+            title: None,
+            machine: None,
+            logical_session_id: None,
+            session_kind: None,
+        };
+        let user_home = crate::os_user_home().unwrap_or_else(|| root.clone());
+        let ignore = crate::legacy_archive::load_repo_path_ignore(&root, &user_home).unwrap();
+        let ignore_fingerprint = ignore.fingerprint();
+        let key = session_state_key(&entry.agent, &entry.session_id);
+        let state = SourceParseState {
+            schema: PARSE_STATE_SCHEMA.to_string(),
+            signal_filter_version: SIGNAL_FILTER_VERSION.to_string(),
+            repo_path_ignore_fingerprint: ignore_fingerprint,
+            sessions: BTreeMap::from([(
+                key,
+                SessionParseRecord {
+                    source_path: entry.source_path.clone(),
+                    source_len: fingerprint.len,
+                    source_mtime_ns: fingerprint.modified_unix_nanos as u64,
+                    source_physical_identity: Vec::new(),
+                    source_bundle_fingerprint: fingerprint.bundle_fingerprint,
+                    extract_relpath: "extracts/codex/session_conversation.md".to_string(),
+                    extract_sha256: sha256_hex(body.as_bytes()),
+                    raw_frames: 1,
+                    signal_frames: 1,
+                    filtered_frames: 0,
+                    project: entry.project.clone(),
+                    date: entry.date.clone(),
+                    cwd: entry.cwd.clone(),
+                    scope_conflict: false,
+                    scope_unattributed: false,
+                    session_kind: None,
+                    scope_environment: ScopeLayoutProbe::default().fingerprint(
+                        entry.cwd.as_deref(),
+                        &[nested.to_string_lossy().into_owned()],
+                    ),
+                    scope_paths: vec![nested.to_string_lossy().into_owned()],
+                    coverage: None,
+                    scope: None,
+                },
+            )]),
+        };
+        write_parse_state(&root, &state).unwrap();
+
+        let validated = validated_cached_extracts_at(&root, std::slice::from_ref(&entry)).unwrap();
+        let legacy = validated
+            .extracts
+            .get(&(entry.agent.clone(), entry.session_id.clone()))
+            .expect("legacy ledger still proves exact bytes and policy");
+        assert_eq!(legacy.coverage, ConversationCoverage::LegacyUnknown);
+        assert!(legacy.scope.is_none());
+        assert!(legacy.metadata.get("preview_lines").is_none());
+        assert!(legacy.extract_path.ends_with("session_conversation.md"));
+        assert_eq!(legacy.read_verified_body().unwrap(), body);
+
+        fs::write(
+            root.join(crate::legacy_archive::AICX_IGNORE_FILENAME),
+            format!("{}\n", workspace.display()),
+        )
+        .unwrap();
+        assert!(
+            legacy
+                .read_verified_body()
+                .unwrap_err()
+                .to_string()
+                .contains("privacy policy changed before extract read"),
+            "a lazy handle must not outlive the privacy policy it was validated under"
+        );
+        fs::write(root.join(crate::legacy_archive::AICX_IGNORE_FILENAME), "").unwrap();
+        assert_eq!(legacy.read_verified_body().unwrap(), body);
+
+        fs::create_dir_all(nested.join(".git")).unwrap();
+        assert!(
+            legacy
+                .read_verified_body()
+                .unwrap_err()
+                .to_string()
+                .contains("repository layout changed before extract read"),
+            "a lazy handle must not outlive the scope layout it was validated under"
+        );
+        fs::remove_dir(nested.join(".git")).unwrap();
+        assert_eq!(legacy.read_verified_body().unwrap(), body);
+
+        let mut moved = entry.clone();
+        moved.cwd = Some("/different/catalog/scope".to_string());
+        let deferred = validated_cached_extracts_at(&root, std::slice::from_ref(&moved)).unwrap();
+        assert!(deferred.extracts.is_empty());
+        assert!(
+            deferred
+                .legacy_scope_unproven
+                .contains(&(moved.agent.clone(), moved.session_id.clone()))
+        );
+        assert!(
+            maintenance_record_reusable(state.sessions.values().next().unwrap()),
+            "normal maintenance must reuse unchanged legacy extracts without a historical reparse"
+        );
+        assert!(maintenance_record_settled(
+            state.sessions.values().next().unwrap()
+        ));
+        let mut transitional = state.clone();
+        transitional.sessions.values_mut().next().unwrap().coverage =
+            Some(ConversationCoverage::CompleteVisible);
+        assert!(maintenance_record_reusable(
+            transitional.sessions.values().next().unwrap()
+        ));
+        assert!(
+            !maintenance_record_settled(transitional.sessions.values().next().unwrap()),
+            "a pre-identity complete receipt needs one cheap republish as explicit unknown"
+        );
+
+        let pinned_mtime =
+            filetime::FileTime::from_last_modification_time(&fs::metadata(&source).unwrap());
+        let mut modern = state.clone();
+        let modern_record = modern.sessions.values_mut().next().unwrap();
+        modern_record.source_physical_identity = fingerprint.physical_identity.clone();
+        modern_record.coverage = Some(ConversationCoverage::CompleteVisible);
+        assert!(maintenance_record_reusable(modern_record));
+        modern_record.coverage = Some(ConversationCoverage::Uncacheable);
+        assert!(!maintenance_record_reusable(modern_record));
+        modern_record.coverage = Some(ConversationCoverage::CompleteVisible);
+        write_parse_state(&root, &modern).unwrap();
+        assert_eq!(
+            validated_cached_extracts_at(&root, std::slice::from_ref(&entry))
+                .unwrap()
+                .extracts
+                .values()
+                .next()
+                .unwrap()
+                .coverage,
+            ConversationCoverage::CompleteVisible
+        );
+
+        fs::write(&source, "source BYTEs\n").unwrap();
+        filetime::set_file_mtime(&source, pinned_mtime).unwrap();
+        let rewritten = crate::catalog::live_source_bundle_fingerprint(&source).unwrap();
+        assert_eq!(fingerprint.len, rewritten.len);
+        assert_eq!(
+            fingerprint.modified_unix_nanos,
+            rewritten.modified_unix_nanos
+        );
+        assert_ne!(fingerprint.physical_identity, rewritten.physical_identity);
+        assert!(
+            validated_cached_extracts_at(&root, std::slice::from_ref(&entry))
+                .unwrap()
+                .extracts
+                .is_empty(),
+            "modern ledger must reject same-size restored-mtime source drift"
+        );
+        let current = load_parse_state(&root, &ignore.fingerprint());
+        let allow = crate::source_path::SourceAllowlist::for_operator(&user_home, &root);
+        assert!(
+            try_reuse_cached_extract(
+                &root,
+                &entry,
+                &current,
+                &session_state_key(&entry.agent, &entry.session_id),
+                &allow,
+                &ignore.fingerprint(),
+                &mut ScopeLayoutProbe::default(),
+            )
+            .is_none(),
+            "normal maintenance must parse a modern source whose physical identity moved"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn bounded_reader_stamps_turn_window_effective_scope() {
         let root = std::env::temp_dir().join(format!(
             "aicx-bounded-scope-{}-{}",
@@ -3314,6 +4608,7 @@ mod tests {
             source_path: source_path.display().to_string(),
             source_len: None,
             source_mtime_ns: None,
+            source_bundle_fingerprint: None,
             title: None,
             machine: None,
             logical_session_id: None,
@@ -3385,6 +4680,7 @@ mod tests {
             source_path: source_path.display().to_string(),
             source_len: None,
             source_mtime_ns: None,
+            source_bundle_fingerprint: None,
             title: None,
             machine: None,
             logical_session_id: None,
@@ -3505,11 +4801,19 @@ mod tests {
             let entry = bounded_entry(&source_path);
             let allow = crate::source_path::SourceAllowlist::for_operator(&root, &root);
             let resolved = allow.resolve_file(&source_path).expect("resolve rollout");
-            let frames = parse_large_codex_signal(&entry, &resolved, &allow, None)
-                .expect("bounded parse")
-                .frames;
+            let (parsed, coverage) =
+                parse_large_codex_signal_checked(&entry, &resolved, &allow, None)
+                    .expect("bounded parse");
             let _ = fs::remove_dir_all(&root);
-            frames
+            // Failing a window closed is a verdict about attribution, not
+            // about the projection's stability: the drained record is counted
+            // and the feed stays cacheable.
+            assert_eq!(
+                coverage,
+                ConversationCoverage::BoundedProjection { skipped_records: 1 },
+                "{label}"
+            );
+            parsed.frames
         };
 
         let call_frames = oversized_window(
@@ -3556,7 +4860,9 @@ mod tests {
 
         // Pathological writer: nothing identifiable survives the cap. The
         // record could have been a tool call, so the window cannot claim the
-        // baseline it did not verify.
+        // baseline it did not verify. Not even its timestamp survives, so the
+        // carrier frame falls back to the wall clock — which still leaves the
+        // projection cacheable, because carrier frames are never served.
         let opaque_frames = oversized_window(
             "oversized-opaque",
             format!(r#"{{"payload":{{"arguments":"{filler}"}}}}"#),
@@ -3677,6 +4983,8 @@ mod tests {
                 source_path: entry.source_path.clone(),
                 source_len: 1,
                 source_mtime_ns: 1,
+                source_physical_identity: Vec::new(),
+                source_bundle_fingerprint: None,
                 extract_relpath: "extracts/codex/s1.md".to_string(),
                 extract_sha256: String::new(),
                 raw_frames: 1,
@@ -3691,6 +4999,8 @@ mod tests {
                 scope_environment: ScopeLayoutProbe::default()
                     .fingerprint(entry.cwd.as_deref(), &parsed.recorded_workdirs),
                 scope_paths: parsed.recorded_workdirs.clone(),
+                coverage: None,
+                scope: None,
             },
         );
         assert!(current(&ledger), "an untouched layout is current");
@@ -3716,5 +5026,33 @@ mod tests {
         assert!(!current(&ledger), "a submodule declaration is a change");
 
         let _ = fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod continuity_clock_contract {
+    use super::*;
+    #[test]
+    fn continuity_contract_large_codex_missing_record_time_is_unknown() {
+        let root = std::env::temp_dir().join(format!(
+            "aicx-large-codex-clock-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("session.jsonl");
+        fs::write(&path, format!("{}\n", serde_json::json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Decision: retain undated audio policy."}]}}))).unwrap();
+        let entry: CatalogEntry = serde_json::from_value(serde_json::json!({"schema":crate::catalog::CATALOG_SCHEMA,"session_id":"11111111-2222-3333-4444-555555555555","agent":"codex","project":"Loctree/aicx","cwd":"/fixtures/Loctree/aicx","source_path":path})).unwrap();
+        let allow = crate::source_path::SourceAllowlist::from_roots([root.clone()]);
+        let (parsed, coverage) =
+            parse_large_codex_signal_checked(&entry, &path, &allow, None).unwrap();
+        assert_eq!(parsed.frames.len(), 1);
+        assert_eq!(coverage, ConversationCoverage::Uncacheable);
+        assert_eq!(
+            parsed.frames[0].timestamp_source.as_deref(),
+            Some("unknown")
+        );
+        assert_eq!(parsed.frames[0].timestamp, chrono::DateTime::UNIX_EPOCH);
+        fs::remove_dir_all(root).unwrap();
     }
 }

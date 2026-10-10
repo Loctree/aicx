@@ -35,8 +35,45 @@ impl IntentKind {
     }
 }
 
+/// Source provenance; a classifier label never certifies a human decision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct IntentProvenance {
+    pub role: String,
+    pub locator: String,
+    pub scope: Option<String>,
+    pub timestamp_basis: String,
+    pub attribution: String,
+}
+
+/// Receipt from the actual source-selection pass, before render budgets.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct SourceSelection {
+    pub agent: String,
+    pub session_id: String,
+    pub path: String,
+    /// Project in the selected catalog view; old null rows can be recovered
+    /// from root metadata in memory, without changing the durable catalog.
+    pub catalog_project: Option<String>,
+    pub admitted: bool,
+    pub status: String,
+    pub parsed_frames: usize,
+    pub scoped_frames: usize,
+    pub qualified_frames: usize,
+    pub unknown_time_frames: usize,
+    pub outside_window_frames: usize,
+    pub scope_withheld_frames: usize,
+    pub parser_coverage: Option<String>,
+    pub latest_activity: Option<String>,
+    /// User-role turns this extraction kept for the file after the window
+    /// filter. Admission and continuity rank by this count, then by time.
+    /// It is the count already on the frames, not a second sessions-list scan.
+    pub human_messages: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct IntentRecord {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<IntentProvenance>,
     pub kind: IntentKind,
     pub summary: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -77,6 +114,23 @@ pub struct IntentsConfig {
     pub live: bool,
 }
 
+/// Query predicates that are safe to apply while selecting intent sources.
+///
+/// This stays separate from [`IntentsConfig`] so existing library callers do
+/// not have to populate new mandatory fields. Agent matching is pushed ahead
+/// of source recovery/reads when catalog or index metadata states the agent.
+/// Date bounds are applied to individual utterance timestamps after parsing;
+/// session dates and filesystem mtimes are never substituted for that clock.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IntentSourceFilter {
+    pub agent: Option<String>,
+    pub date_lo: Option<String>,
+    pub date_hi: Option<String>,
+    /// Explicit expensive mode: bypass CURRENT and reader conversation reuse,
+    /// parsing every selected catalog source under the existing parser bounds.
+    pub full_source_scan: bool,
+}
+
 /// Widest retrieval window that turns the live source scan on by default.
 /// Beyond this the census/index is authoritative and a live walk would only
 /// add cost without hot-window value.
@@ -114,6 +168,9 @@ pub struct IntentExtractionStats {
     /// newer than the catalog census). 0 when live mode was off or nothing
     /// was fresher than the census.
     pub live_sessions: usize,
+    /// Validated legacy extracts withheld because their per-frame scope cannot
+    /// be proven without an explicit full source scan.
+    pub legacy_scope_unproven: usize,
     /// Sessions the lanes could not serve whole under the requested project
     /// ([`IntentExtraction::mixed_scope`]).
     pub mixed_scope_sessions: usize,
@@ -149,6 +206,8 @@ pub struct IntentsCompleteness {
     /// sources newer than the catalog census).
     #[serde(default)]
     pub live_sessions: usize,
+    #[serde(default)]
+    pub legacy_scope_unproven: usize,
     /// Sessions cataloged under the requested project that were not served
     /// whole: part or all of their work ran outside its checkout, in a proven
     /// workdir conflict, or in a scope `.aicxignore` hides. Those frames are
@@ -231,7 +290,7 @@ impl IntentExtractionStats {
         }
         if self.source_errors > 0 {
             warnings.push(format!(
-                "{} catalog source(s) were unreadable or unsupported",
+                "{} source(s) were unreadable, unsupported, or partially covered",
                 self.source_errors
             ));
         }
@@ -239,6 +298,12 @@ impl IntentExtractionStats {
             warnings.push(format!(
                 "{} session(s) admitted from the live window (open/unadmitted, unverified)",
                 self.live_sessions
+            ));
+        }
+        if self.legacy_scope_unproven > 0 {
+            warnings.push(format!(
+                "{} legacy source(s) withheld as legacy_scope_unproven; rerun intents --full-rescan for deliberate source parsing",
+                self.legacy_scope_unproven
             ));
         }
         warnings.extend(self.withheld_scope());
@@ -254,6 +319,7 @@ impl IntentExtractionStats {
             orphaned_buckets,
             identity_source: self.identity_source.clone(),
             live_sessions: self.live_sessions,
+            legacy_scope_unproven: self.legacy_scope_unproven,
             mixed_scope_sessions: self.mixed_scope_sessions,
             unplaced_frames: self.unplaced_frames,
             warnings,
@@ -304,6 +370,7 @@ impl IntentExtractionStats {
 
 #[derive(Debug, Clone)]
 pub struct IntentExtraction {
+    pub selection: Vec<SourceSelection>,
     pub records: Vec<IntentRecord>,
     pub stats: IntentExtractionStats,
     /// Sessions in the window whose structural scope is a mixed-workstream
@@ -365,6 +432,9 @@ impl MixedScopeSession {
             "grok" => AgentKind::Grok,
             "junie" => AgentKind::Junie,
             "kimi" => AgentKind::Kimi,
+            "copilot" | "copilot-cli" | "github-copilot" | "github-copilot-cli" => {
+                AgentKind::Copilot
+            }
             _ => AgentKind::Claude,
         }
     }
@@ -386,6 +456,12 @@ pub(super) struct StoredChunkFile {
     /// documents that carry no cwd/branch evidence.
     pub(super) scope: Option<crate::extraction::conversation::ScopeReport>,
     pub(super) transcript_entries: Option<Vec<TranscriptEntry>>,
+    /// Query-qualified human-turn count computed without retaining every body.
+    pub(super) admission_human_messages: Option<usize>,
+    /// Strictly validated parse-ledger handle. Its body is re-opened and
+    /// checksum/source-fingerprint checked only when this file is classified.
+    #[cfg(feature = "app")]
+    pub(super) validated_extract: Option<crate::source_index::ValidatedSourceExtract>,
     /// Chunk document already held in memory, read from the committed lexical
     /// index instead of the original transcript.
     ///
@@ -397,6 +473,9 @@ pub(super) struct StoredChunkFile {
 
 #[derive(Debug, Clone)]
 pub(super) struct TranscriptEntry {
+    pub(super) timestamp: Option<DateTime<Utc>>,
+    pub(super) locator: Option<String>,
+    pub(super) cwd: Option<String>,
     pub(super) role: String,
     pub(super) lines: Vec<String>,
 }

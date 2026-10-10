@@ -1190,6 +1190,7 @@ pub const CLI_SUBCOMMAND_NAMES: &[&str] = &[
     // it points at the catalog engine, not the removed card mill.
     "store",
     "tail",
+    "utterances",
     "warmup",
     "wizard",
 ];
@@ -1659,6 +1660,7 @@ extra_self_echo_patterns = [
             "aicx refs -H 24",
             "aicx reports --workflow marbles",
             "aicx intents -H 720",
+            "aicx utterances -p vetcoders/vista --since 2026-09-01",
             "aicx conversations --out-dir /tmp",
             "aicx health",
             "aicx list",

@@ -182,10 +182,10 @@ fn render_corpus(frame: &mut Frame, area: Rect, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Percentage(18),
-            Constraint::Percentage(24),
-            Constraint::Percentage(30),
-            Constraint::Percentage(28),
+            Constraint::Length(24),
+            Constraint::Length(32),
+            Constraint::Min(28),
+            Constraint::Min(24),
         ])
         .split(area);
 
@@ -195,7 +195,7 @@ fn render_corpus(frame: &mut Frame, area: Rect, app: &App) {
         "Orgs",
         app.corpus.orgs(),
         app.corpus.column == CorpusColumn::Orgs,
-        0,
+        app.corpus.org_selected,
     );
     render_simple_list(
         frame,
@@ -203,7 +203,7 @@ fn render_corpus(frame: &mut Frame, area: Rect, app: &App) {
         "Repos",
         app.corpus.repos(),
         app.corpus.column == CorpusColumn::Repos,
-        0,
+        app.corpus.repo_selected,
     );
 
     let chunk_items = app
@@ -221,11 +221,10 @@ fn render_corpus(frame: &mut Frame, area: Rect, app: &App) {
         app.corpus.selected,
     );
 
-    let preview = app.corpus.selected_preview();
     frame.render_widget(
-        Paragraph::new(preview)
+        Paragraph::new(app.corpus.preview.as_str())
             .block(block("Preview"))
-            .wrap(Wrap { trim: false }),
+            .wrap(Wrap { trim: true }),
         chunks[3],
     );
 }
@@ -398,20 +397,64 @@ fn render_simple_list(
     focused: bool,
     selected: usize,
 ) {
+    let width = inner_width(area);
+    let height = area.height.saturating_sub(2) as usize;
+    let start = window_start(values.len(), selected, height);
     let items = values
         .into_iter()
-        .take(200)
+        .skip(start)
+        .take(height.max(1))
         .enumerate()
         .map(|(idx, value)| {
-            let style = if focused && idx == selected {
+            let style = if focused && start + idx == selected {
                 Style::default().fg(Color::Cyan).bold()
             } else {
                 Style::default()
             };
-            ListItem::new(Line::from(Span::styled(truncate(&value, 80), style)))
+            ListItem::new(Line::from(Span::styled(
+                truncate_at_boundary(&value, width),
+                style,
+            )))
         })
         .collect::<Vec<_>>();
     frame.render_widget(List::new(items).block(block(title)), area);
+}
+
+fn inner_width(area: Rect) -> usize {
+    area.width.saturating_sub(2) as usize
+}
+
+fn window_start(len: usize, selected: usize, height: usize) -> usize {
+    if height == 0 || len <= height {
+        return 0;
+    }
+    let selected = selected.min(len - 1);
+    selected.saturating_sub(height / 2).min(len - height)
+}
+
+/// Cut on a space or slash when the text is wider than the column.
+/// A single token wider than the column is the only case that ends mid-token.
+pub(crate) fn truncate_at_boundary(value: &str, max: usize) -> String {
+    if value.chars().count() <= max {
+        return value.to_string();
+    }
+    if max == 0 {
+        return String::new();
+    }
+    if max == 1 {
+        return "…".to_string();
+    }
+    let budget = max - 1;
+    let prefix: String = value.chars().take(budget).collect();
+    let boundary = prefix.rfind([' ', '/', '|']).filter(|at| {
+        !prefix[..*at].trim().is_empty() && prefix[..*at].chars().count() >= budget / 2
+    });
+    let mut out = match boundary {
+        Some(at) => prefix[..at].trim_end().to_string(),
+        None => prefix,
+    };
+    out.push('…');
+    out
 }
 
 fn render_help(frame: &mut Frame, area: Rect) {

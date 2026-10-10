@@ -32,10 +32,107 @@ aicx search --deep 'routing strzałek taby'
 file per session under `~/.aicx/extracts/`. Without that flag, source logs and
 the published index remain the content owners.
 
+## Human utterances
+
+`aicx intents` classifies stored text and can exit 0 after it has dropped
+records. `aicx utterances` is the listing that may be read as what a human said.
+
+```bash
+aicx utterances -p vetcoders/vista --since 2026-09-01 --until 2026-09-29
+```
+
+The first line is the real span of admitted turns and the end of the window
+you asked for. Exit 0 means every session that matches the project was read
+whole, at least one human utterance is in the list, and the newest admitted
+turn reaches the window's end date. Catalog date does not skip a session.
+A cut session, an unreadable session, an empty human list, or a span that
+stops short of that date exits 2. Code-shaped lines and agent replies are
+printed under `machine text`.
+
 Checkout prefixes in `~/.aicx/.aicxignore` are part of index and cache
 identity. Editing the file makes the next `aicx index` rebuild automatically;
 an unreadable file or unsupported checkout glob/negation aborts rather than
 indexing without the deny list.
+
+## Background runtime ownership
+
+Default HTTP MCP services are reader-only on macOS, Linux, and Windows.
+Installers and onboarding do not opt the listener into
+`--experimental-auto-refresh`. That flag remains an explicit experimental
+operator choice, independent of installing or repairing a reader.
+
+On macOS, `aicx doctor --repair-runtime` preserves the configured bind, port,
+auth, allowed hosts, and log paths, repairs a missing `serve` subcommand, and
+removes embedded writer ownership. Readiness requires HTTP 200 from `/health`
+and a listener owned by the registered launchd job or its descendant.
+Failure restores the prior MCP configuration. The separate index scheduler is
+also installed transactionally; a scheduler failure reports the partial outcome
+explicitly while retaining the healthy reader and attempting to restore the
+previous schedule. Registration alone is not service health.
+
+Hybrid HTTP startup binds MCP and health without scanning provider roots or
+building the dashboard corpus. The dashboard initially reports
+`scan_status: "not_scanned"`, `build_count: 0`, and null `generated_at`/`stats`.
+An authorized browse or regenerate request loads that optional dataset.
+MCP readiness is independent of dashboard data readiness.
+
+The macOS maintenance scheduler runs `catalog refresh` and `index` in a separate
+short-lived process every 2h24m. Other platforms can invoke the same explicit
+maintenance commands; reader installation does not imply periodic indexing.
+
+## Intent query cost and freshness
+
+`intents --live` and automatically live windows of 48h or less keep fresh source
+semantics. Trusted agent metadata is filtered before unrelated sources are
+opened. Dates narrow individual utterance timestamps before classification and
+candidate caps; a session's creation date cannot exclude its recent utterances.
+
+When `CURRENT` is available, queries join catalog membership with the existing
+source-parse ledger. Unchanged extracts are reused only after checking live
+source fingerprints, ignore policy, checkout layout, source identity, and
+extract checksums. Changed and unadmitted sources are read freshly; unchanged
+legacy sources without reconstructable scope are reported as explicit holes.
+Live queries retain source admission instead of reparsing all history.
+Indexed admission scans qualifying headings before loading individual bodies,
+so classification does not keep the full extract corpus in memory.
+
+Fresh source reads reuse validated whole conversations in
+`$AICX_HOME/reader-conversations-v1/`, sharing the overlay cache's validation
+rules. Stable bounded projections retain their skipped-record warning on every
+reuse. Transient partial reads are never trusted warm results. Old parse
+ledgers without coverage receipts may accelerate unchanged reads, but explicitly
+report `legacy_unknown` and incomplete coverage. No read upgrades that absence
+to complete evidence or publishes `CURRENT`.
+
+Normal maintenance keeps valid older extracts with their unknown receipts,
+parses changed or new sources, and preserves settled bounded coverage. Merely
+upgrading the reader does not trigger a full historical parse. An explicit
+`aicx index --full-rescan` upgrades old receipts from the original sources;
+run that expensive operation on the intended maintenance host.
+
+Cold or changed sources still require parsing, and live provider-root discovery
+still has a cost. `--no-live` is an explicit choice to exclude unadmitted live
+sources; it is not a repair for stale or incomplete evidence.
+By default, a legacy extract whose per-frame scope cannot be proven reuses an
+existing reader-conversation entry only when that entry still proves the source
+bytes and whole-session scope. Without that warm proof it is reported as
+`legacy_scope_unproven` and keeps `complete: false` instead of triggering an
+unbounded foreground history parse. Run `aicx intents --full-rescan` to parse
+every selected catalog source deliberately. MCP callers use `full_rescan: true`.
+This cache-only rule also covers IDs already present in `CURRENT` whose ledger
+row is absent; new IDs outside `CURRENT` and rows with proven source drift still
+use the checked source reader.
+This bypasses CURRENT and reader-conversation reuse, but retains source
+allowlists, parser size/record safety bounds, coverage receipts, agent/project
+filters, and utterance-time windows; it does not promise that unsupported or
+oversized provider records become lossless.
+Full-history requests (`-H 0`) retain the original catalog-conversation lane,
+including whole-session scope, to keep durable overlay evidence stable.
+
+For intent queries, `--since 2026-10-01` means from October 1 onward.
+`--until` supplies the inclusive upper date. Explicit ranges such as
+`--since 2026-10-01..2026-10-03` retain their bounds. The separate `--date`
+selector on retrieval commands retains its single-day semantics.
 
 ## Runtime artifacts
 
@@ -112,7 +209,8 @@ Orthogonal surfaces:
 - **catalog status** = will rebuild admit/change identity rows?
 - **index status** = is CURRENT lagging the catalog/corpus?
 
-`catalog rebuild` walks the registered Claude, Codex, Grok, Gemini, Junie, and
+`catalog rebuild` walks the registered Claude, Codex, Cursor, Grok, Gemini,
+Junie, Kimi, Copilot CLI, and
 Vibecrafted runtime roots. It writes the compact catalog and prints counts,
 including `pending_chunks`. It does not materialize session content unless
 `--with-chunks` is passed, which drains the lag through `aicx index`.
@@ -160,7 +258,8 @@ from content filtered under the previous one.
 
 1. **Session JSONL sync** — catalog only discovers files under this host's agent
    roots (`~/.claude/projects`, `~/.codex/sessions`, `~/.cursor/projects`, `~/.gemini/tmp`,
-   `~/.grok/sessions`, `~/.junie/sessions`, `~/.kimi-code/sessions`, `~/.vibecrafted/control_plane/runtime_runs`).
+   `~/.grok/sessions`, `~/.junie/sessions`, `~/.kimi-code/sessions`,
+   `~/.copilot/session-state`, `~/.vibecrafted/control_plane/runtime_runs`).
    Drop synced JSONL into those trees, then `catalog status` → `catalog rebuild`.
 2. **No alternate daily store intake** — there is no second "drop folder" for
    sessions. `AICX_HOME` / `[storage].home` relocates the **whole** home
@@ -185,10 +284,26 @@ aicx extract codex --session <session-id> --conversation
 aicx extract cursor --session <session-id> --conversation
 aicx extract grok --session <session-id> --conversation
 aicx extract gemini --session <session-id> --conversation
+aicx extract copilot --session <session-id> --conversation
 ```
 
 Use `--output <path>` for an explicit file. Session mode resolves through the
 catalog and opens only an allowlisted, canonical source path.
+
+Copilot CLI also supports bulk extraction, conversation JSON exports, briefs,
+intents, index/search, and the same MCP tools as other providers. The provider
+name is `copilot`; `copilot-cli`, `github-copilot`, and `github-copilot-cli`
+are accepted aliases.
+See [COPILOT_SESSIONS.md](COPILOT_SESSIONS.md) for source layout and coverage.
+
+```bash
+aicx extract all --provider copilot --conversation
+aicx conversations --agent copilot --hours 0 --out-dir ./conversations
+aicx extract copilot --session <session-id> --brief
+aicx extract copilot --session <session-id> --agent-commands --result full
+aicx intents --agent copilot --hours 0 --emit json
+aicx search 'past decision' --agent copilot --hours 0 --json
+```
 
 ### Projection flags (W2-T13)
 
@@ -539,6 +654,22 @@ Missing CURRENT rows are counted per extractor (for example,
 Project filters are exact by default. Ambiguous bare repository names fail
 closed; `--project-fuzzy` is an explicit opt-in.
 
+## Intent overlay
+
+```bash
+aicx overlay --repo /path/to/repository --format json
+# Explicitly bypass derived feed/conversation and output caches:
+aicx overlay --repo /path/to/repository --format json --rebuild
+```
+
+The published `loctree.overlay.intent.v1` JSON and full-history evidence are
+unchanged. Warm calls validate live source fingerprints before using cached
+catalog intents. Changed sessions are parsed once for both message lanes;
+concurrent producers serialize through an advisory lock. Stderr reports
+`source_sessions_parsed`, `source_sessions_reused`, and `feed_cache_hit` without
+polluting stdout JSON. This command does not rebuild or publish the search
+index. See [OVERLAY.md](./OVERLAY.md) for the complete cache contract.
+
 ## Status and diagnostics
 
 ```bash
@@ -587,3 +718,44 @@ default contract.
 Commands that support `--json` emit structured stdout. Diagnostics and
 progress go to stderr. Consult the command-specific help for exit codes and
 the exact JSON envelope.
+
+### Continuity clocks, coverage, and provenance
+
+`aicx continuity show -p /codescribe -H 96` selects utterances in an inclusive
+UTC window `[now - 96h, now]`. The session may have started before that window.
+Unknown utterance time is withheld and counted; touching a source file does not
+supply conversation time. Reproduce a historical window with
+`--until 2026-10-03T04:47:00Z --no-refresh`. `continuity write` accepts the same
+`--until`; MCP `aicx_continuity` accepts the optional RFC3339 `until` parameter.
+`-H 0` selects recorded history through the window end and retains undated
+claims as explicitly unknown-time candidates.
+
+The head of the pack distinguishes considered, catalog-admitted, live,
+qualified, and represented sources, with provider counts before and after
+rendering. SOURCES lists sources of retained records; its 20-row limit is a
+render limit, and omissions are disclosed. Candidate/task budgets, unreadable
+or partially parsed sources, unknown timestamps, mixed/unplaced scope, and
+section limits remain visible in `--for-inject`. Index readiness describes
+index health and does not certify project-memory coverage.
+
+Raw claims retain provider, full stored session id, source path, frame/line
+locator, role, UTC timestamp, scope and verification status. A human role and a
+classifier label still mean a candidate, not an authenticated Founder decision.
+Quoted/fenced agent material is not promoted to fresh human directives. Human
+request/constraint candidates precede peer claims; an unrelated Outcome never
+closes every request in the session. Without explicit resolution evidence,
+requests remain unresolved candidates. Existing matching checklist events
+continue to resolve only the corresponding task.
+
+Codex root scope can be recovered from bounded, identity-checked source
+metadata when an old catalog row lacks cwd/project. This read-only recovery
+does not rewrite the catalog or transfer a mixed thread to another project.
+Foreign, hidden and unplaced work remains withheld. Provider support follows
+the running build; unsupported sources are coverage errors.
+
+For a metadata-only developer trace (no conversation payloads):
+
+```bash
+cargo run --example continuity_trace -- "$HOME/.aicx" /codescribe \
+  2026-10-03T04:47:00Z FULL_SESSION_ID
+```

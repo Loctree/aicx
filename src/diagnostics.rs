@@ -61,7 +61,7 @@ impl DiagnosticKind {
 }
 
 const EXTRACTOR_ORDER: &[&str] = &[
-    "claude", "codex", "gemini", "junie", "grok", "kimi", "cursor",
+    "claude", "codex", "gemini", "junie", "grok", "kimi", "cursor", "copilot",
 ];
 
 #[derive(Default)]
@@ -609,6 +609,7 @@ fn canonical_extractor_key(extractor: &str) -> &'static str {
         "grok" => "grok",
         "kimi" => "kimi",
         "cursor" => "cursor",
+        "copilot" | "copilot-cli" | "github-copilot" | "github-copilot-cli" => "copilot",
         _ => {
             // Unknown extractor → explicit "unknown" bucket, never silent
             // attribution to claude. Drop the debug_assert because legit

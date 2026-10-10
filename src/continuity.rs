@@ -2,7 +2,7 @@
 //!
 //! `aicx continuity show|write` renders one deterministic markdown pack per
 //! project bucket + time window: open work (NOW), what each peer agent did
-//! (PEERS), closed decisions, tasks, the evidence trail (SOURCES), and an
+//! (PEERS), decision candidates, tasks, the evidence trail (SOURCES), and an
 //! honest INDEX HEALTH line. It replaces "read the compact of yourself" as
 //! the way a fresh session recovers context: live parse first, census
 //! second, semantics never required for a hot window.
@@ -27,6 +27,10 @@ const TASK_CAP: usize = 15;
 const SOURCE_CAP: usize = 20;
 
 pub struct ContinuityPack {
+    pub selection: Vec<intents::SourceSelection>,
+    pub source_errors: usize,
+    pub dropped_task_events: usize,
+    pub window_end: String,
     pub project_label: String,
     pub hours: u64,
     pub live_sessions: usize,
@@ -39,6 +43,11 @@ pub struct ContinuityPack {
     pub mixed_scope: Vec<crate::intents::MixedScopeSession>,
     /// Whether mixed candidates were distilled on explicit request.
     pub distilled_mixed: bool,
+    /// Copied from `extraction.stats.candidate_cap` in `build_with_scope`.
+    pub candidate_cap: usize,
+    /// Copied from `extraction.stats.dropped_candidates` in `build_with_scope`.
+    /// Zero means the cap was not reached.
+    pub dropped_candidates: usize,
     /// Sessions served without frames whose turn window could not be placed.
     /// Those frames are never distilled, with or without `distill_mixed`,
     /// and the pack lists what it left out.
@@ -48,8 +57,11 @@ pub struct ContinuityPack {
 pub struct SourceLine {
     pub agent: String,
     pub path: String,
-    pub mtime: Option<String>,
+    /// Latest retained claim activity, never source-file mtime.
+    pub latest_activity: Option<String>,
     pub live: bool,
+    /// User-role turns the extraction kept for this source.
+    pub human_messages: usize,
 }
 
 pub struct IndexHealthLine {
@@ -91,6 +103,17 @@ pub fn build_with_scope(
     hours: u64,
     distill_mixed: bool,
 ) -> Result<ContinuityPack> {
+    build_with_scope_at(aicx_home, projects, hours, distill_mixed, Utc::now())
+}
+
+/// Frozen-clock variant: extraction and rendering share one window endpoint.
+pub fn build_with_scope_at(
+    aicx_home: &Path,
+    projects: &[String],
+    hours: u64,
+    distill_mixed: bool,
+    now: DateTime<Utc>,
+) -> Result<ContinuityPack> {
     let config = IntentsConfig {
         project: projects.first().cloned().unwrap_or_default(),
         hours,
@@ -101,14 +124,9 @@ pub fn build_with_scope(
         live: true,
     };
     let extraction = intents::extract_intents_from_root_at_for_projects_with_stats(
-        &config,
-        projects,
-        aicx_home,
-        Utc::now(),
+        &config, projects, aicx_home, now,
     )?;
 
-    let cutoff = Utc::now() - chrono::Duration::hours(hours.min(i64::MAX as u64) as i64);
-    let sources = collect_sources(aicx_home, projects, cutoff);
     let index_health = collect_index_health(aicx_home, projects, extraction.stats.live_sessions);
 
     let mixed_scope = extraction.mixed_scope;
@@ -118,8 +136,18 @@ pub fn build_with_scope(
         withhold_mixed_sessions(&mut records, &mixed_scope)?;
     }
     refuse_unplaced_only_window(&records, &unplaced_scope)?;
+    for record in &mut records {
+        if let Some(timestamp) = record_time(record) {
+            record.timestamp = Some(timestamp.to_rfc3339());
+        }
+    }
+    let sources = collect_sources(&extraction.selection, &records, &mixed_scope);
 
     Ok(ContinuityPack {
+        selection: extraction.selection,
+        source_errors: extraction.stats.source_errors,
+        dropped_task_events: extraction.stats.dropped_task_events,
+        window_end: now.to_rfc3339(),
         project_label: if projects.is_empty() {
             "(all projects)".to_string()
         } else {
@@ -132,6 +160,8 @@ pub fn build_with_scope(
         index_health,
         mixed_scope,
         distilled_mixed: distill_mixed,
+        candidate_cap: extraction.stats.candidate_cap,
+        dropped_candidates: extraction.stats.dropped_candidates,
         unplaced_scope,
     })
 }
@@ -232,69 +262,73 @@ fn mixed_window_refusal(
     }
 }
 
-fn project_matches(entry_project: Option<&str>, projects: &[String]) -> bool {
-    if projects.is_empty() {
-        return true;
+/// Sources are receipts for retained claims, not a second catalog/mtime scan.
+/// Qualification without a classifier record remains visible in coverage.
+fn session_human_weights(selection: &[intents::SourceSelection]) -> BTreeMap<(&str, &str), usize> {
+    let mut weights: BTreeMap<(&str, &str), usize> = BTreeMap::new();
+    for source in selection {
+        let weight = weights
+            .entry((source.agent.as_str(), source.session_id.as_str()))
+            .or_insert(0);
+        *weight = (*weight).saturating_add(source.human_messages);
     }
-    let Some(identity) = entry_project else {
-        return false;
-    };
-    let (organization, repository) = identity.split_once('/').unwrap_or(("", identity));
-    projects.iter().any(|filter| {
-        crate::legacy_archive::project_filter_matches(organization, repository, filter)
-    })
+    weights
+}
+
+fn weight_of(weights: &BTreeMap<(&str, &str), usize>, agent: &str, session_id: &str) -> usize {
+    weights.get(&(agent, session_id)).copied().unwrap_or(0)
 }
 
 fn collect_sources(
-    aicx_home: &Path,
-    projects: &[String],
-    cutoff: DateTime<Utc>,
+    selection: &[intents::SourceSelection],
+    records: &[IntentRecord],
+    mixed: &[intents::MixedScopeSession],
 ) -> Vec<SourceLine> {
-    let mut sources = Vec::new();
-    let cutoff_ns = cutoff
-        .timestamp_nanos_opt()
-        .map(|nanos| nanos as u64)
-        .unwrap_or(0);
-
-    for entry in crate::catalog::read_entries_at(aicx_home).unwrap_or_default() {
-        if !project_matches(entry.project.as_deref(), projects) {
+    let mut sources: BTreeMap<(&str, &str), SourceLine> = BTreeMap::new();
+    for selected in selection.iter().filter(|source| {
+        matches!(
+            source.status.as_str(),
+            "qualified" | "unbounded_unknown_time"
+        )
+    }) {
+        if mixed.iter().any(|session| {
+            session.agent == selected.agent && session.session_id == selected.session_id
+        }) {
             continue;
         }
-        let mtime_ns = crate::catalog::live_source_fingerprint(Path::new(&entry.source_path))
-            .map(|(_, mtime)| mtime)
-            .or(entry.source_mtime_ns);
-        if mtime_ns.is_none_or(|mtime| mtime < cutoff_ns) {
+        let retained: Vec<&IntentRecord> = records
+            .iter()
+            .filter(|record| {
+                record.agent == selected.agent
+                    && record.session_id == selected.session_id
+                    && record.source_chunk == selected.path
+            })
+            .collect();
+        if retained.is_empty() && selected.human_messages == 0 {
             continue;
         }
-        sources.push(SourceLine {
-            agent: entry.agent,
-            path: entry.source_path,
-            mtime: mtime_ns.and_then(mtime_ns_to_rfc3339),
-            live: false,
-        });
-    }
-
-    let user_home = crate::os_user_home().unwrap_or_else(|| aicx_home.to_path_buf());
-    if let Ok(delta) = crate::catalog::live_delta(aicx_home, &user_home, cutoff_ns as u128) {
-        for entry in delta.unadmitted {
-            if !project_matches(entry.project.as_deref(), projects) {
-                continue;
-            }
-            if entry.source_mtime_ns.is_none_or(|mtime| mtime < cutoff_ns) {
-                continue;
-            }
-            sources.push(SourceLine {
-                agent: entry.agent,
-                path: entry.source_path,
-                mtime: entry.source_mtime_ns.and_then(mtime_ns_to_rfc3339),
-                live: true,
+        let latest = newest_record_time(&retained).map(|time| time.to_rfc3339());
+        let source = sources
+            .entry((selected.agent.as_str(), selected.path.as_str()))
+            .or_insert_with(|| SourceLine {
+                agent: selected.agent.clone(),
+                path: selected.path.clone(),
+                latest_activity: None,
+                live: !selected.admitted,
+                human_messages: 0,
             });
+        source.human_messages = source.human_messages.max(selected.human_messages);
+        if latest > source.latest_activity {
+            source.latest_activity = latest;
         }
     }
-
-    // Deterministic: newest first, path as tiebreaker.
-    sources.sort_by(|a, b| b.mtime.cmp(&a.mtime).then_with(|| a.path.cmp(&b.path)));
-    sources.truncate(SOURCE_CAP);
+    let mut sources: Vec<SourceLine> = sources.into_values().collect();
+    sources.sort_by(|a, b| {
+        b.human_messages
+            .cmp(&a.human_messages)
+            .then_with(|| b.latest_activity.cmp(&a.latest_activity))
+            .then_with(|| a.path.cmp(&b.path))
+    });
     sources
 }
 
@@ -345,49 +379,324 @@ fn collect_index_health(
     }
 }
 
-fn mtime_ns_to_rfc3339(mtime_ns: u64) -> Option<String> {
-    DateTime::<Utc>::from_timestamp(
-        (mtime_ns / 1_000_000_000) as i64,
-        (mtime_ns % 1_000_000_000) as u32,
-    )
-    .map(|dt| dt.to_rfc3339())
+/// Coverage and render limits belong at the head so inject cannot silently
+/// turn a bounded narrative into a claim of exhaustive project history.
+fn push_honesty_preface(out: &mut String, pack: &ContinuityPack) {
+    out.push_str("## HONESTY\n\n");
+    let end = DateTime::parse_from_rfc3339(&pack.window_end)
+        .ok()
+        .map(|time| time.with_timezone(&Utc));
+    let cutoff = end.map(|time| intents::window_cutoff(time, pack.hours));
+    out.push_str(&format!(
+        "window: [{}, {}] UTC, by qualifying frame timestamp; file mtime and catalog date do not admit a claim.\n",
+        cutoff.map(|time| time.to_rfc3339()).as_deref().unwrap_or("unknown"),
+        end.map(|time| time.to_rfc3339()).as_deref().unwrap_or("unknown")
+    ));
+    if pack.hours == 0 {
+        out.push_str("unbounded history: undated claims can be retained as unknown-time candidates; no timestamp is inferred.\n");
+    }
+    out.push_str("labels: Decision, Intent, Outcome, and Task are classifier candidates, not verified Founder decisions or completed work (verification_state=not_verified_by_aicx). A user role alone does not authenticate quoted instructions.\n");
+    out.push_str("now: open means a retained live_open record; missing records do not prove thread absence. Session ids and project handles are stored identities; truncated ids, aliases, renames and splits are not resolved here.\n");
+    out.push_str("time: a later record or unrelated Outcome does not retire an earlier request; no explicit resolution links are available. Human requests and constraint candidates precede peer claims.\n");
+    out.push_str("rank: human-turn weight, then recency. A newer session with fewer user turns does not outrank a heavier one. human=N is the user-role turn count this extraction kept.\n");
+
+    let qualified = pack
+        .selection
+        .iter()
+        .filter(|source| source.status == "qualified")
+        .count();
+    let unknown_time: usize = pack
+        .selection
+        .iter()
+        .map(|source| source.unknown_time_frames)
+        .sum();
+    let frames: usize = pack
+        .selection
+        .iter()
+        .map(|source| source.qualified_frames)
+        .sum();
+    let mut reasons: BTreeMap<&str, usize> = BTreeMap::new();
+    for source in &pack.selection {
+        *reasons.entry(&source.status).or_default() += 1;
+    }
+    let reason_line = reasons
+        .iter()
+        .map(|(reason, count)| format!("{reason}={count}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    out.push_str(&format!(
+        "coverage: considered_sources={} · qualified_sources={qualified} · qualified_frames={frames} · represented_sources={} · sources_shown={} · qualified_without_retained_claim={} · source_rows_omitted={} · source_errors={} · unknown_time_frames={unknown_time}.\n",
+        pack.selection.len(), pack.sources.len(), pack.sources.len().min(SOURCE_CAP),
+        qualified.saturating_sub(pack.sources.len()), pack.sources.len().saturating_sub(SOURCE_CAP), pack.source_errors
+    ));
+    out.push_str(&format!(
+        "source admission: discovered={} · catalog_admitted={} · live_unadmitted={}\n",
+        pack.selection.len(),
+        pack.selection.iter().filter(|s| s.admitted).count(),
+        pack.selection.iter().filter(|s| !s.admitted).count()
+    ));
+    out.push_str(&format!("selection_status: {reason_line}\n"));
+    out.push_str(&format!(
+        "frame omissions: outside_window={} · scope_withheld={} · unknown_time={}\n",
+        pack.selection
+            .iter()
+            .map(|s| s.outside_window_frames)
+            .sum::<usize>(),
+        pack.selection
+            .iter()
+            .map(|s| s.scope_withheld_frames)
+            .sum::<usize>(),
+        unknown_time
+    ));
+    out.push_str(&format!(
+        "scope omissions: mixed_sessions={} · unplaced_frames={} · mixed_distilled={} (explicit request).\n",
+        pack.mixed_scope.len(), pack.unplaced_scope.iter().map(|session| session.frames).sum::<usize>(), pack.distilled_mixed
+    ));
+    let providers: std::collections::BTreeSet<&str> = pack
+        .selection
+        .iter()
+        .map(|source| source.agent.as_str())
+        .chain(pack.records.iter().map(|record| record.agent.as_str()))
+        .collect();
+    for agent in providers {
+        out.push_str(&format!(
+            "provider {agent}: considered_sources={} · qualified_sources={} · represented_sources={} · sources_shown={} · retained_records={}\n",
+            pack.selection.iter().filter(|source| source.agent == agent).count(),
+            pack.selection.iter().filter(|source| source.agent == agent && source.status == "qualified").count(),
+            pack.sources.iter().filter(|source| source.agent == agent).count(),
+            pack.sources.iter().take(SOURCE_CAP).filter(|source| source.agent == agent).count(),
+            pack.records.iter().filter(|record| record.agent == agent).count()
+        ));
+    }
+    out.push_str("source cleaning: existing signal readers can remove harness/base64/overlong lines and cap each message at 262144 Unicode characters; parser coverage is not word-for-word payload coverage.\n");
+    out.push_str("coverage is limited to discovered sources; provider completeness is not inferred. Index readiness is separate and cannot certify continuity coverage.\n");
+    out.push_str(&format!(
+        "extraction caps: candidate_cap={} · dropped_candidates={} · dropped_task_events={} · source_errors={}{}\n",
+        pack.candidate_cap, pack.dropped_candidates, pack.dropped_task_events, pack.source_errors,
+        if pack.dropped_candidates > 0 || pack.dropped_task_events > 0 || pack.source_errors > 0 {
+            " · incomplete extraction"
+        } else { " · these extraction caps not reached" }
+    ));
+    let requests = unresolved_intents(&pack.records).len();
+    let human_decisions = pack
+        .records
+        .iter()
+        .filter(|record| human_record(record) && record.kind == IntentKind::Decision)
+        .count();
+    let open_sessions: std::collections::BTreeSet<(&str, &str)> = pack
+        .records
+        .iter()
+        .filter(|record| record.honesty.is_live_open())
+        .map(|record| (record.agent.as_str(), record.session_id.as_str()))
+        .collect();
+    let decisions = pack
+        .records
+        .iter()
+        .filter(|record| record.kind == IntentKind::Decision)
+        .count();
+    let tasks = pack
+        .records
+        .iter()
+        .filter(|record| record.kind == IntentKind::Task)
+        .count();
+    let mut peer_sessions: BTreeMap<(&str, &str), Vec<&IntentRecord>> = BTreeMap::new();
+    for record in &pack.records {
+        peer_sessions
+            .entry((record.agent.as_str(), record.session_id.as_str()))
+            .or_default()
+            .push(record);
+    }
+    let mut per_agent: BTreeMap<&str, Vec<(&str, Vec<&IntentRecord>)>> = BTreeMap::new();
+    for ((agent, session), records) in peer_sessions {
+        per_agent.entry(agent).or_default().push((session, records));
+    }
+    let mut peer_sessions_shown = 0;
+    let mut peer_claims_shown = 0;
+    let mut peer_sessions_total = 0;
+    let weights = session_human_weights(&pack.selection);
+    for (agent, sessions) in per_agent.iter_mut() {
+        sessions.sort_by(|(id_a, a), (id_b, b)| {
+            weight_of(&weights, agent, id_b)
+                .cmp(&weight_of(&weights, agent, id_a))
+                .then_with(|| newest_record_time(b).cmp(&newest_record_time(a)))
+                .then_with(|| id_a.cmp(id_b))
+        });
+        peer_sessions_total += sessions.len();
+        peer_sessions_shown += sessions.len().min(PEER_SESSION_CAP);
+        peer_claims_shown += sessions
+            .iter()
+            .take(PEER_SESSION_CAP)
+            .map(|(_, records)| records.len().min(PEER_CLAIM_CAP))
+            .sum::<usize>();
+    }
+    out.push_str(&format!(
+        "render caps before inject: NOW open_sessions={}/{} (cap={NOW_CAP}); requests_and_human_constraints={}/{} (cap={NOW_CAP}); PEERS sessions={peer_sessions_shown}/{peer_sessions_total} (cap={PEER_SESSION_CAP}/provider), claims={peer_claims_shown}/{} (cap={PEER_CLAIM_CAP}/session); DECISIONS={}/{} (cap={DECISION_CAP}); TASKS={}/{} (cap={TASK_CAP}); SOURCES={}/{} (cap={SOURCE_CAP}); mixed_details={}/{}; unplaced_details={}/{}. Counts are shown/available; excess is omitted.\n\n",
+        open_sessions.len().min(NOW_CAP), open_sessions.len(),
+        (requests + human_decisions).min(NOW_CAP), requests + human_decisions,
+        pack.records.len(), decisions.min(DECISION_CAP), decisions, tasks.min(TASK_CAP), tasks,
+        pack.sources.len().min(SOURCE_CAP), pack.sources.len(),
+        pack.mixed_scope.len().min(NOW_CAP), pack.mixed_scope.len(),
+        pack.unplaced_scope.len().min(NOW_CAP), pack.unplaced_scope.len()
+    ));
 }
 
-/// Render the pack. `for_inject` bounds the output to the prompt budget.
+fn record_time(record: &IntentRecord) -> Option<DateTime<Utc>> {
+    record
+        .timestamp
+        .as_deref()
+        .and_then(|timestamp| DateTime::parse_from_rfc3339(timestamp).ok())
+        .map(|time| time.with_timezone(&Utc))
+}
+
+fn newest_record_time(records: &[&IntentRecord]) -> Option<DateTime<Utc>> {
+    records
+        .iter()
+        .filter_map(|record| record_time(record))
+        .max()
+}
+
+fn human_record(record: &IntentRecord) -> bool {
+    record.provenance.as_ref().is_some_and(|provenance| {
+        matches!(
+            provenance.role.to_ascii_lowercase().as_str(),
+            "user" | "human" | "founder" | "user_msg"
+        )
+    })
+}
+
+/// One atomic line includes the complete claim and its provenance. Embedded
+/// newlines are escaped so an inject budget can never detach those two.
+fn claim_line(record: &IntentRecord, label: &str, indent: &str) -> String {
+    let (role, locator, scope, basis, attribution) = record
+        .provenance
+        .as_ref()
+        .map(|provenance| {
+            (
+                provenance.role.as_str(),
+                provenance.locator.as_str(),
+                provenance.scope.as_deref().unwrap_or("unknown"),
+                provenance.timestamp_basis.as_str(),
+                provenance.attribution.as_str(),
+            )
+        })
+        .unwrap_or((
+            "unknown",
+            record.source_chunk.as_str(),
+            "unknown",
+            "unknown",
+            "unattributed",
+        ));
+    let timestamp = record_time(record)
+        .map(|time| time.to_rfc3339())
+        .unwrap_or_else(|| "unknown".to_string());
+    let line = format!(
+        "{indent}- {label} [{} · {}] · role={role} · locator={locator} · scope={scope} · timestamp={timestamp} · timestamp_basis={basis} · attribution={attribution} · status={} · claim_scope={} · source={}: {}",
+        record.agent,
+        record.session_id,
+        record
+            .honesty
+            .verification_state
+            .as_deref()
+            .unwrap_or("not_verified_by_aicx"),
+        record.honesty.claim_scope.as_deref().unwrap_or("unknown"),
+        record.source_chunk,
+        record.summary
+    );
+    format!("{}\n", line.replace('\r', "\\r").replace('\n', "\\n"))
+}
+
+/// Retain complete lines within a Unicode-character budget, including the
+/// omission marker. Long claims are omitted whole, allowing later requests
+/// to survive rather than stopping at one over-sized claim.
+pub(crate) fn bounded_inject(out: String) -> String {
+    if out.chars().count() <= INJECT_CHAR_BUDGET {
+        return out;
+    }
+    const MARKER: &str = "\n[continuity pack truncated at inject budget; content omitted; claim lines retained whole]\n";
+    let limit = INJECT_CHAR_BUDGET - MARKER.chars().count();
+    let mut bounded = String::new();
+    let mut used = 0;
+    for line in out.split_inclusive('\n') {
+        let count = line.chars().count();
+        if used + count <= limit {
+            bounded.push_str(line);
+            used += count;
+        }
+    }
+    bounded.push_str(MARKER);
+    bounded
+}
+
+/// Render the pack. `for_inject` bounds complete claim lines in Unicode chars.
 pub fn render(pack: &ContinuityPack, for_inject: bool) -> String {
     let mut out = String::new();
     out.push_str(&format!(
         "# CONTINUITY · {} · {}h\n\n",
         pack.project_label, pack.hours
     ));
+    push_honesty_preface(&mut out, pack);
 
-    // ── NOW: open sessions + unresolved human intent ─────────────────────
     out.push_str("## NOW\n\n");
-    let live_records: Vec<&IntentRecord> = pack
+    let weights = session_human_weights(&pack.selection);
+    let mut requests = unresolved_intents(&pack.records);
+    requests.extend(
+        pack.records
+            .iter()
+            .filter(|record| human_record(record) && record.kind == IntentKind::Decision),
+    );
+    requests.sort_by(|a, b| {
+        weight_of(&weights, b.agent.as_str(), b.session_id.as_str())
+            .cmp(&weight_of(
+                &weights,
+                a.agent.as_str(),
+                a.session_id.as_str(),
+            ))
+            .then_with(|| human_record(b).cmp(&human_record(a)))
+            .then_with(|| record_time(b).cmp(&record_time(a)))
+            .then_with(|| a.agent.cmp(&b.agent))
+            .then_with(|| a.session_id.cmp(&b.session_id))
+            .then_with(|| a.source_chunk.cmp(&b.source_chunk))
+    });
+    for record in requests.into_iter().take(NOW_CAP) {
+        let label = if record.kind == IntentKind::Intent {
+            "unresolved intent candidate"
+        } else {
+            "human constraint/decision candidate"
+        };
+        out.push_str(&claim_line(record, label, ""));
+    }
+    let mut open_sessions: BTreeMap<(&str, &str), Option<DateTime<Utc>>> = BTreeMap::new();
+    for record in pack
         .records
         .iter()
         .filter(|record| record.honesty.is_live_open())
-        .collect();
-    let mut open_sessions: BTreeMap<(&str, &str), Option<&str>> = BTreeMap::new();
-    for record in &live_records {
-        open_sessions
+    {
+        let newest = open_sessions
             .entry((record.agent.as_str(), record.session_id.as_str()))
-            .or_insert(record.timestamp.as_deref());
+            .or_default();
+        let timestamp = record_time(record);
+        if timestamp > *newest {
+            *newest = timestamp;
+        }
     }
+    let mut open_sessions: Vec<_> = open_sessions.into_iter().collect();
+    open_sessions.sort_by(|(id_a, a), (id_b, b)| {
+        weight_of(&weights, id_b.0, id_b.1)
+            .cmp(&weight_of(&weights, id_a.0, id_a.1))
+            .then_with(|| b.cmp(a))
+            .then_with(|| id_a.cmp(id_b))
+    });
     if open_sessions.is_empty() {
-        out.push_str("- no open sessions inside the window\n");
+        out.push_str("- no retained open-session records inside the window; thread absence is not established\n");
     }
-    for ((agent, session), timestamp) in open_sessions.iter().take(NOW_CAP) {
+    for ((agent, session), timestamp) in open_sessions.into_iter().take(NOW_CAP) {
         out.push_str(&format!(
-            "- open: {agent} · {session} · {}\n",
-            timestamp.unwrap_or("mtime-only")
-        ));
-    }
-    let unresolved = unresolved_intents(&pack.records);
-    for record in unresolved.iter().take(NOW_CAP) {
-        out.push_str(&format!(
-            "- unresolved intent ({}): {}\n",
-            record.agent, record.summary
+            "- open: {agent} · {session} · {} · human={}\n",
+            timestamp
+                .map(|time| time.to_rfc3339())
+                .as_deref()
+                .unwrap_or("unknown"),
+            weight_of(&weights, agent, session)
         ));
     }
     if !pack.mixed_scope.is_empty() {
@@ -411,14 +720,8 @@ pub fn render(pack: &ContinuityPack, for_inject: bool) -> String {
         }
     }
     if !pack.unplaced_scope.is_empty() {
-        out.push_str(&format!(
-            "- unplaced work: {} frame(s) from {} session(s) NOT in this pack (their turn window ran where no checkout could claim it)\n",
-            pack.unplaced_scope
-                .iter()
-                .map(|session| session.frames)
-                .sum::<usize>(),
-            pack.unplaced_scope.len()
-        ));
+        out.push_str(&format!("- unplaced work: {} frame(s) from {} session(s) NOT in this pack (their turn window ran where no checkout could claim it)\n",
+            pack.unplaced_scope.iter().map(|session| session.frames).sum::<usize>(), pack.unplaced_scope.len()));
         for session in pack.unplaced_scope.iter().take(NOW_CAP) {
             out.push_str(&format!(
                 "  - {} · {} · frames={}\n",
@@ -428,113 +731,130 @@ pub fn render(pack: &ContinuityPack, for_inject: bool) -> String {
     }
     out.push('\n');
 
-    // ── PEERS: per-agent fairness blocks, newest sessions first ──────────
     out.push_str("## PEERS\n\n");
-    let mut by_agent: BTreeMap<&str, Vec<&IntentRecord>> = BTreeMap::new();
+    let mut by_agent: BTreeMap<&str, BTreeMap<&str, Vec<&IntentRecord>>> = BTreeMap::new();
     for record in &pack.records {
         by_agent
             .entry(record.agent.as_str())
             .or_default()
+            .entry(record.session_id.as_str())
+            .or_default()
             .push(record);
     }
     if by_agent.is_empty() {
-        out.push_str("- no sessions inside the window\n");
+        out.push_str("- no retained records inside the window\n");
     }
-    for (agent, records) in &by_agent {
+    for (agent, sessions) in by_agent {
         out.push_str(&format!("### {agent}\n"));
-        let mut sessions: BTreeMap<&str, Vec<&IntentRecord>> = BTreeMap::new();
-        for record in records {
-            sessions
-                .entry(record.session_id.as_str())
-                .or_default()
-                .push(record);
-        }
-        let mut ordered: Vec<(&str, Vec<&IntentRecord>)> = sessions.into_iter().collect();
-        fn newest<'a>(records: &'a [&IntentRecord]) -> Option<&'a str> {
-            records
-                .iter()
-                .map(|record| record.timestamp.as_deref())
-                .max()
-                .flatten()
-        }
-        ordered
-            .sort_by(|(id_a, a), (id_b, b)| newest(b).cmp(&newest(a)).then_with(|| id_a.cmp(id_b)));
-        for (session, session_records) in ordered.into_iter().take(PEER_SESSION_CAP) {
-            let live_marker = if session_records.iter().any(|r| r.honesty.is_live_open()) {
+        let mut ordered: Vec<_> = sessions.into_iter().collect();
+        ordered.sort_by(|(id_a, a), (id_b, b)| {
+            weight_of(&weights, agent, id_b)
+                .cmp(&weight_of(&weights, agent, id_a))
+                .then_with(|| newest_record_time(b).cmp(&newest_record_time(a)))
+                .then_with(|| id_a.cmp(id_b))
+        });
+        for (session, mut records) in ordered.into_iter().take(PEER_SESSION_CAP) {
+            let marker = if records.iter().any(|record| record.honesty.is_live_open()) {
                 " [open]"
             } else {
                 ""
             };
-            let mtime = session_records
-                .iter()
-                .filter_map(|r| r.timestamp.as_deref())
-                .max()
-                .unwrap_or("-");
-            out.push_str(&format!("- {session}{live_marker} · {mtime}\n"));
-            for record in session_records.iter().take(PEER_CLAIM_CAP) {
-                out.push_str(&format!(
-                    "  - {}: {}\n",
-                    record.kind.heading().to_lowercase(),
-                    record.summary
+            let timestamp = newest_record_time(&records)
+                .map(|time| time.to_rfc3339())
+                .unwrap_or_else(|| "unknown".to_string());
+            out.push_str(&format!(
+                "- {session}{marker} · human={} · {timestamp}\n",
+                weight_of(&weights, agent, session)
+            ));
+            records.sort_by(|a, b| {
+                human_record(b)
+                    .cmp(&human_record(a))
+                    .then_with(|| record_time(b).cmp(&record_time(a)))
+                    .then_with(|| a.source_chunk.cmp(&b.source_chunk))
+            });
+            for record in records.into_iter().take(PEER_CLAIM_CAP) {
+                out.push_str(&claim_line(
+                    record,
+                    &format!("{} candidate", record.kind.heading().to_lowercase()),
+                    "  ",
                 ));
             }
         }
     }
     out.push('\n');
 
-    // ── DECISIONS (closed) ───────────────────────────────────────────────
-    out.push_str("## DECISIONS (closed)\n\n");
-    let decisions: Vec<&IntentRecord> = pack
+    out.push_str("## DECISIONS (candidates; unverified)\n\n");
+    let mut decisions: Vec<_> = pack
         .records
         .iter()
-        .filter(|r| r.kind == IntentKind::Decision && !r.honesty.is_live_open())
-        .take(DECISION_CAP)
+        .filter(|record| record.kind == IntentKind::Decision)
         .collect();
+    decisions.sort_by(|a, b| {
+        weight_of(&weights, b.agent.as_str(), b.session_id.as_str())
+            .cmp(&weight_of(
+                &weights,
+                a.agent.as_str(),
+                a.session_id.as_str(),
+            ))
+            .then_with(|| human_record(b).cmp(&human_record(a)))
+            .then_with(|| record_time(b).cmp(&record_time(a)))
+            .then_with(|| a.source_chunk.cmp(&b.source_chunk))
+    });
     if decisions.is_empty() {
-        out.push_str("- none captured in the window\n");
+        out.push_str("- none classified in the window\n");
     }
-    for record in decisions {
-        out.push_str(&format!("- [{}] {}\n", record.agent, record.summary));
+    for record in decisions.into_iter().take(DECISION_CAP) {
+        out.push_str(&claim_line(record, "decision candidate", ""));
     }
     out.push('\n');
 
-    // ── TASKS ────────────────────────────────────────────────────────────
     out.push_str("## TASKS\n\n");
-    let tasks: Vec<&IntentRecord> = pack
+    let mut tasks: Vec<_> = pack
         .records
         .iter()
-        .filter(|r| r.kind == IntentKind::Task)
-        .take(TASK_CAP)
+        .filter(|record| record.kind == IntentKind::Task)
         .collect();
+    tasks.sort_by(|a, b| {
+        weight_of(&weights, b.agent.as_str(), b.session_id.as_str())
+            .cmp(&weight_of(
+                &weights,
+                a.agent.as_str(),
+                a.session_id.as_str(),
+            ))
+            .then_with(|| human_record(b).cmp(&human_record(a)))
+            .then_with(|| record_time(b).cmp(&record_time(a)))
+            .then_with(|| a.source_chunk.cmp(&b.source_chunk))
+    });
     if tasks.is_empty() {
-        out.push_str("- none captured in the window\n");
+        out.push_str("- none classified in the window\n");
     }
-    for record in tasks {
-        out.push_str(&format!("- [{}] {}\n", record.agent, record.summary));
+    for record in tasks.into_iter().take(TASK_CAP) {
+        out.push_str(&claim_line(record, "task candidate", ""));
     }
     out.push('\n');
 
-    // ── SOURCES: evidence, not magic ─────────────────────────────────────
     out.push_str("## SOURCES\n\n");
     if pack.sources.is_empty() {
-        out.push_str("- no session sources inside the window\n");
+        out.push_str(
+            "- no source paths represented by retained records; see qualification coverage above\n",
+        );
     }
-    for source in &pack.sources {
+    for source in pack.sources.iter().take(SOURCE_CAP) {
         out.push_str(&format!(
-            "- {} · {} · {}{}\n",
+            "- {} · human={} · latest_retained_claim_activity={} · {}{}\n",
             source.agent,
-            source.mtime.as_deref().unwrap_or("mtime-unknown"),
+            source.human_messages,
+            source.latest_activity.as_deref().unwrap_or("unknown"),
             source.path,
             if source.live { " [unadmitted]" } else { "" }
         ));
     }
     out.push('\n');
 
-    // ── INDEX HEALTH: honesty line ───────────────────────────────────────
     out.push_str("## INDEX HEALTH\n\n");
     let health = &pack.index_health;
     out.push_str(&format!(
-        "- newest_session_updated: {}\n",
+        "- newest_source_file_mtime: {} (file touch, not conversation time)\n",
         health
             .newest_session_updated_at
             .as_deref()
@@ -548,48 +868,34 @@ pub fn render(pack: &ContinuityPack, for_inject: bool) -> String {
         "- sessions_newer_than_chunks: {} · pending: {}\n",
         health.sessions_newer_than_chunks, health.pending
     ));
-    out.push_str(&format!(
-        "- readiness: {} · mode: {} · live_sessions: {}\n",
-        health.readiness, health.mode, pack.live_sessions
-    ));
+    out.push_str(&format!("- readiness: {} · mode: {} · live_sessions: {} · index readiness is not continuity coverage\n", health.readiness, health.mode, pack.live_sessions));
     if health.pending > 0 || health.sessions_newer_than_chunks > 0 {
-        out.push_str(&format!(
-            "- warning: chunk lag (pending={}, sessions_newer_than_chunks={}); run `aicx catalog rebuild --with-chunks` or `aicx index` — empty NOW/PEERS is not proof of a quiet window\n",
-            health.pending, health.sessions_newer_than_chunks
-        ));
+        out.push_str(&format!("- warning: chunk lag (pending={}, sessions_newer_than_chunks={}); run `aicx catalog rebuild --with-chunks` or `aicx index` — empty NOW/PEERS is not proof of a quiet window\n", health.pending, health.sessions_newer_than_chunks));
     }
-
-    if for_inject && out.len() > INJECT_CHAR_BUDGET {
-        // Keep the head (NOW/PEERS carry the sharpest context) and stamp the
-        // truncation so the consumer knows the pack is bounded, not complete.
-        out.truncate(INJECT_CHAR_BUDGET);
-        out.push_str("\n\n[continuity pack truncated at inject budget]\n");
-    }
-    out
+    if for_inject { bounded_inject(out) } else { out }
 }
 
-/// Session-level unresolved human intent: Intent records from sessions with
-/// no Outcome, newest first.
+/// Without explicit request-to-outcome links every Intent remains a candidate
+/// unresolved request. A same-session Outcome does not prove its resolution.
 fn unresolved_intents(records: &[IntentRecord]) -> Vec<&IntentRecord> {
-    let resolved: std::collections::HashSet<&str> = records
+    let mut unresolved: Vec<_> = records
         .iter()
-        .filter(|record| record.kind == IntentKind::Outcome)
-        .map(|record| record.session_id.as_str())
+        .filter(|record| record.kind == IntentKind::Intent)
         .collect();
-    let mut unresolved: Vec<&IntentRecord> = records
-        .iter()
-        .filter(|record| {
-            record.kind == IntentKind::Intent && !resolved.contains(record.session_id.as_str())
-        })
-        .collect();
-    unresolved.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    unresolved.sort_by(|a, b| {
+        record_time(b)
+            .cmp(&record_time(a))
+            .then_with(|| a.agent.cmp(&b.agent))
+            .then_with(|| a.session_id.cmp(&b.session_id))
+            .then_with(|| a.source_chunk.cmp(&b.source_chunk))
+    });
     unresolved
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
+    use std::path::PathBuf;
 
     use aicx_parser::engine::{RefusalReason, ScopeStatus};
 
@@ -675,6 +981,7 @@ mod tests {
         // A homogeneous record is kept and the mixed session's is withheld;
         // a window with no mixed session is not the gate's business.
         let record = |session_id: &str| IntentRecord {
+            provenance: None,
             kind: IntentKind::Decision,
             summary: format!("decided in {session_id}"),
             context: None,
@@ -699,20 +1006,21 @@ mod tests {
         withhold_mixed_sessions(&mut records, &[]).expect("no mixed session, nothing to refuse");
     }
 
-    #[test]
-    fn continuity_pack_renders_all_sections_deterministically() {
+    /// One transcript, one dated catalog row, primed live delta. Shared by the
+    /// section render and the real-path census test.
+    fn write_continuity_real_path_home(label: &str) -> (PathBuf, PathBuf) {
         let root = std::env::temp_dir().join(format!(
-            "aicx-continuity-{}-{}",
+            "aicx-continuity-{label}-{}-{}",
             std::process::id(),
             Utc::now().timestamp_nanos_opt().unwrap_or_default()
         ));
         let _ = fs::remove_dir_all(&root);
 
-        let source = root.join("runtime_runs/continuity-a/transcript.log");
+        let source = root.join("continuity-a/session.jsonl");
         fs::create_dir_all(source.parent().expect("parent")).expect("create parent");
         fs::write(
             &source,
-            "We decided to route continuity through the live window engine.\n",
+            format!("{}\n", serde_json::json!({"type":"user","timestamp":Utc::now().to_rfc3339(),"sessionId":"continuity-a","cwd":"/fixtures/Loctree/aicx","message":{"role":"user","content":"Decision: route continuity through the live window engine."}})),
         )
         .expect("write source");
         let catalog_path = crate::catalog::sessions_path_for(&root);
@@ -721,13 +1029,14 @@ mod tests {
         let entry = crate::catalog::CatalogEntry {
             schema: crate::catalog::CATALOG_SCHEMA.to_string(),
             session_id: "continuity-a".to_string(),
-            agent: "vibecrafted".to_string(),
+            agent: "claude".to_string(),
             project: Some("Loctree/aicx".to_string()),
             date: Some(Utc::now().format("%Y-%m-%d").to_string()),
-            cwd: None,
+            cwd: Some("/fixtures/Loctree/aicx".into()),
             source_path: source.display().to_string(),
             source_len: None,
             source_mtime_ns: None,
+            source_bundle_fingerprint: None,
             title: None,
             machine: Some("test".to_string()),
             logical_session_id: None,
@@ -749,17 +1058,55 @@ mod tests {
             cutoff_ns,
             crate::catalog::LiveDelta::default(),
         );
+        (root, source)
+    }
 
+    fn render_pack_with_census(candidate_cap: usize, dropped_candidates: usize) -> String {
+        let pack = ContinuityPack {
+            selection: Vec::new(),
+            source_errors: 0,
+            dropped_task_events: 0,
+            window_end: String::new(),
+            project_label: "Loctree/aicx".into(),
+            hours: 24,
+            live_sessions: 0,
+            records: Vec::new(),
+            sources: Vec::new(),
+            index_health: IndexHealthLine {
+                newest_session_updated_at: None,
+                committed_at: None,
+                pending: 0,
+                sessions_newer_than_chunks: 0,
+                readiness: "unknown".into(),
+                mode: "census",
+            },
+            mixed_scope: Vec::new(),
+            distilled_mixed: false,
+            candidate_cap,
+            dropped_candidates,
+            unplaced_scope: Vec::new(),
+        };
+        render(&pack, false)
+    }
+
+    #[test]
+    fn continuity_pack_renders_all_sections_deterministically() {
+        let (root, source) = write_continuity_real_path_home("sections");
         let projects = vec!["Loctree/aicx".to_string()];
-        let pack = build(&root, &projects, 24).expect("build pack");
+        let now = Utc::now();
+        let pack = build_with_scope_at(&root, &projects, 24, false, now).expect("build pack");
         let first = render(&pack, false);
-        let second = render(&build(&root, &projects, 24).expect("rebuild pack"), false);
+        let second = render(
+            &build_with_scope_at(&root, &projects, 24, false, now).expect("rebuild pack"),
+            false,
+        );
 
         for heading in [
             "# CONTINUITY · Loctree/aicx · 24h",
+            "## HONESTY",
             "## NOW",
             "## PEERS",
-            "## DECISIONS (closed)",
+            "## DECISIONS (candidates; unverified)",
             "## TASKS",
             "## SOURCES",
             "## INDEX HEALTH",
@@ -780,12 +1127,59 @@ mod tests {
     }
 
     #[test]
+    fn continuity_honesty_preface_names_truncation_and_classifier() {
+        let open = render_pack_with_census(5_000, 0);
+        let truncated = render_pack_with_census(5_000, 3);
+        for rendered in [&open, &truncated] {
+            let honesty = rendered.find("## HONESTY").expect("honesty heading");
+            let now = rendered.find("## NOW").expect("now heading");
+            assert!(honesty < now, "preface must precede NOW:\n{rendered}");
+            for line in [
+                "by qualifying frame timestamp; file mtime and catalog date do not admit a claim",
+                "classifier candidates, not verified Founder decisions or completed work",
+                "A user role alone does not authenticate quoted instructions",
+                "Session ids and project handles are stored identities",
+                "unrelated Outcome does not retire an earlier request",
+                "Index readiness is separate and cannot certify continuity coverage",
+            ] {
+                assert!(rendered.contains(line), "missing preface line: {line}");
+            }
+        }
+        assert!(open.contains("candidate_cap=5000 · dropped_candidates=0"));
+        assert!(!open.contains("incomplete extraction"));
+        assert!(truncated.contains("candidate_cap=5000 · dropped_candidates=3"));
+        assert!(!truncated.contains("not reached"));
+    }
+
+    #[test]
+    fn continuity_build_prints_census_from_real_path() {
+        let (root, _source) = write_continuity_real_path_home("census");
+        let projects = vec!["Loctree/aicx".to_string()];
+        let pack = build(&root, &projects, 24).expect("build pack");
+        let rendered = render(&pack, false);
+        assert!(
+            rendered.contains("coverage:"),
+            "missing census line:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("not reached"),
+            "small home must stay under the candidate cap:\n{rendered}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn continuity_now_lists_live_open_sessions() {
         let pack = ContinuityPack {
+            selection: Vec::new(),
+            source_errors: 0,
+            dropped_task_events: 0,
+            window_end: String::new(),
             project_label: "vetcoders/vibecrafted".into(),
             hours: 24,
             live_sessions: 1,
             records: vec![crate::intents::IntentRecord {
+                provenance: None,
                 kind: IntentKind::Intent,
                 summary: "keep live window independent of census".into(),
                 context: None,
@@ -813,6 +1207,8 @@ mod tests {
             },
             mixed_scope: Vec::new(),
             distilled_mixed: false,
+            candidate_cap: 5_000,
+            dropped_candidates: 0,
             unplaced_scope: Vec::new(),
         };
         let rendered = render(&pack, false);
@@ -821,8 +1217,132 @@ mod tests {
     }
 
     #[test]
+    fn continuity_now_states_live_open_rule() {
+        let pack = ContinuityPack {
+            selection: Vec::new(),
+            source_errors: 0,
+            dropped_task_events: 0,
+            window_end: String::new(),
+            project_label: "vetcoders/vibecrafted".into(),
+            hours: 24,
+            live_sessions: 2,
+            records: vec![
+                crate::intents::IntentRecord {
+                    provenance: None,
+                    kind: IntentKind::Intent,
+                    summary: "keep live window independent of census".into(),
+                    context: None,
+                    evidence: Vec::new(),
+                    project: "vetcoders/vibecrafted".into(),
+                    agent: "claude".into(),
+                    date: "2026-08-13".into(),
+                    timestamp: Some("2026-08-13T02:00:00Z".into()),
+                    session_id: "hot-open".into(),
+                    count: None,
+                    first_chunk: None,
+                    last_chunk: None,
+                    source_chunk: "sess.jsonl".into(),
+                    source: None,
+                    honesty: crate::oracle::ClaimHonesty::live_open(),
+                },
+                crate::intents::IntentRecord {
+                    provenance: None,
+                    kind: IntentKind::Intent,
+                    summary: "open row whose conversation date was not stored".into(),
+                    context: None,
+                    evidence: Vec::new(),
+                    project: "vetcoders/vibecrafted".into(),
+                    agent: "claude".into(),
+                    date: "2026-08-13".into(),
+                    timestamp: None,
+                    session_id: "open-no-ts".into(),
+                    count: None,
+                    first_chunk: None,
+                    last_chunk: None,
+                    source_chunk: "sess-no-ts.jsonl".into(),
+                    source: None,
+                    honesty: crate::oracle::ClaimHonesty::live_open(),
+                },
+                crate::intents::IntentRecord {
+                    provenance: None,
+                    kind: IntentKind::Intent,
+                    summary: "canonical claim is not an open session".into(),
+                    context: None,
+                    evidence: Vec::new(),
+                    project: "vetcoders/vibecrafted".into(),
+                    agent: "codex".into(),
+                    date: "2026-08-01".into(),
+                    timestamp: Some("2026-08-01T00:00:00Z".into()),
+                    session_id: "canonical-closed".into(),
+                    count: None,
+                    first_chunk: None,
+                    last_chunk: None,
+                    source_chunk: "canonical.jsonl".into(),
+                    source: None,
+                    honesty: crate::oracle::ClaimHonesty::canonical(),
+                },
+            ],
+            sources: Vec::new(),
+            index_health: IndexHealthLine {
+                newest_session_updated_at: Some("2026-08-13T02:00:00Z".into()),
+                committed_at: None,
+                pending: 0,
+                sessions_newer_than_chunks: 0,
+                readiness: "ready".into(),
+                mode: "live",
+            },
+            mixed_scope: Vec::new(),
+            distilled_mixed: false,
+            candidate_cap: 5_000,
+            dropped_candidates: 0,
+            unplaced_scope: Vec::new(),
+        };
+        let rendered = render(&pack, false);
+        for sentence in [
+            "open means a retained live_open record",
+            "missing records do not prove thread absence",
+            "truncated ids, aliases, renames and splits are not resolved here",
+        ] {
+            assert!(
+                rendered.contains(sentence),
+                "missing {sentence} in:\n{rendered}"
+            );
+        }
+        let open_lines: Vec<&str> = rendered
+            .lines()
+            .filter(|line| line.starts_with("- open:"))
+            .collect();
+        assert!(
+            open_lines
+                .iter()
+                .any(|line| line.contains("claude · hot-open · 2026-08-13T02:00:00+00:00")),
+            "live_open row missing: {open_lines:?}"
+        );
+        assert!(
+            open_lines
+                .iter()
+                .any(|line| line.contains("claude · open-no-ts · unknown")),
+            "missing conversation date must say so: {open_lines:?}"
+        );
+        assert!(
+            rendered.contains("canonical-closed"),
+            "canonical record was not rendered at all:\n{rendered}"
+        );
+        assert!(
+            open_lines
+                .iter()
+                .all(|line| !line.contains("canonical-closed")),
+            "canonical record leaked under - open:: {open_lines:?}"
+        );
+    }
+
+    #[test]
     fn continuity_index_health_warns_on_pending_chunks() {
         let pack = ContinuityPack {
+            selection: Vec::new(),
+            source_errors: 0,
+            dropped_task_events: 0,
+            window_end: String::new(),
             project_label: "vetcoders/vibecrafted".into(),
             hours: 24,
             live_sessions: 1,
@@ -838,12 +1358,50 @@ mod tests {
             },
             mixed_scope: Vec::new(),
             distilled_mixed: false,
+            candidate_cap: 5_000,
+            dropped_candidates: 0,
             unplaced_scope: Vec::new(),
         };
         let rendered = render(&pack, false);
-        assert!(rendered.contains("newest_session_updated: 2026-08-13T01:48:00Z"));
+        assert!(rendered.contains(
+            "newest_source_file_mtime: 2026-08-13T01:48:00Z (file touch, not conversation time)"
+        ));
         assert!(rendered.contains("warning: chunk lag (pending=631"));
         assert!(rendered.contains("aicx catalog rebuild --with-chunks"));
+    }
+
+    #[test]
+    fn continuity_index_health_names_source_file_mtime() {
+        let pack = ContinuityPack {
+            selection: Vec::new(),
+            source_errors: 0,
+            dropped_task_events: 0,
+            window_end: String::new(),
+            project_label: "vetcoders/vibecrafted".into(),
+            hours: 24,
+            live_sessions: 1,
+            records: Vec::new(),
+            sources: Vec::new(),
+            index_health: IndexHealthLine {
+                newest_session_updated_at: Some("2026-09-21T03:30:00Z".into()),
+                committed_at: None,
+                pending: 0,
+                sessions_newer_than_chunks: 0,
+                readiness: "ready".into(),
+                mode: "live",
+            },
+            mixed_scope: Vec::new(),
+            distilled_mixed: false,
+            candidate_cap: 5_000,
+            dropped_candidates: 0,
+            unplaced_scope: Vec::new(),
+        };
+        let rendered = render(&pack, false);
+        assert!(rendered.contains(
+            "newest_source_file_mtime: 2026-09-21T03:30:00Z (file touch, not conversation time)"
+        ));
+        assert!(rendered.contains("newest_source_file_mtime"));
+        assert!(rendered.contains("file touch, not conversation time"));
     }
 
     #[test]
@@ -854,6 +1412,10 @@ mod tests {
             frames,
         };
         let pack = ContinuityPack {
+            selection: Vec::new(),
+            source_errors: 0,
+            dropped_task_events: 0,
+            window_end: String::new(),
             project_label: "vetcoders/vibecrafted".into(),
             hours: 24,
             live_sessions: 0,
@@ -869,6 +1431,8 @@ mod tests {
             },
             mixed_scope: Vec::new(),
             distilled_mixed: false,
+            candidate_cap: 5_000,
+            dropped_candidates: 0,
             unplaced_scope: vec![unplaced("s-one", 3), unplaced("s-two", 1)],
         };
         let rendered = render(&pack, false);
@@ -902,5 +1466,165 @@ mod tests {
             "{error}"
         );
         refuse_unplaced_only_window(&[], &[]).expect("an empty window with nothing withheld");
+    }
+    #[test]
+    fn continuity_contract_unrelated_outcome_does_not_close_intents() {
+        let (root, _) = write_continuity_real_path_home("outcome-contract");
+        let mut pack = build(&root, &["Loctree/aicx".into()], 24).unwrap();
+        let mut record = pack.records[0].clone();
+        record.kind = IntentKind::Intent;
+        record.summary = "preserve all audio unless explicitly opted out".into();
+        let mut other = record.clone();
+        other.summary = "add separate delivery and revision buses".into();
+        let mut outcome = record.clone();
+        outcome.kind = IntentKind::Outcome;
+        outcome.summary = "cargo check completed".into();
+        pack.records = vec![record, other, outcome];
+        assert_eq!(unresolved_intents(&pack.records).len(), 2);
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn continuity_contract_unicode_injection_never_panics() {
+        let (root, _) = write_continuity_real_path_home("unicode-contract");
+        let mut pack = build(&root, &["Loctree/aicx".into()], 24).unwrap();
+        // Exercise every byte alignment, rather than relying on one accidental boundary.
+        for padding in 0..4 {
+            pack.records[0].summary = format!("{}{}", "x".repeat(padding), "🦀".repeat(30_000));
+            let result = std::panic::catch_unwind(|| render(&pack, true));
+            assert!(result.is_ok(), "UTF-8 boundary at padding {padding}");
+            assert!(result.unwrap().contains("truncated"));
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn weighted_decision(session: &str, path: &str, when: &str, summary: &str) -> IntentRecord {
+        IntentRecord {
+            provenance: Some(crate::intents::IntentProvenance {
+                role: "user".into(),
+                locator: "line:1".into(),
+                scope: None,
+                timestamp_basis: "conversation".into(),
+                attribution: "transcript".into(),
+            }),
+            kind: IntentKind::Decision,
+            summary: summary.into(),
+            context: None,
+            evidence: Vec::new(),
+            project: "codescribe".into(),
+            agent: "codex".into(),
+            date: "2026-10-03".into(),
+            timestamp: Some(when.into()),
+            session_id: session.into(),
+            count: None,
+            first_chunk: None,
+            last_chunk: None,
+            source_chunk: path.into(),
+            source: None,
+            honesty: crate::oracle::ClaimHonesty::canonical(),
+        }
+    }
+
+    fn qualified_source(
+        session: &str,
+        path: &str,
+        human_messages: usize,
+    ) -> intents::SourceSelection {
+        intents::SourceSelection {
+            agent: "codex".into(),
+            session_id: session.into(),
+            path: path.into(),
+            status: "qualified".into(),
+            admitted: true,
+            human_messages,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn heavier_older_session_outranks_newer_thin_ones() {
+        let heavy_id = "01a0f7e1-d2c3-72b2-aacf-d029ac5370cc";
+        let mut records = vec![weighted_decision(
+            heavy_id,
+            "heavy.jsonl",
+            "2026-10-03T22:18:00Z",
+            "keep the heavy session",
+        )];
+        let mut selection = vec![qualified_source(heavy_id, "heavy.jsonl", 344)];
+        for index in 0..8 {
+            let session = format!("thin-{index}");
+            let path = format!("thin-{index}.jsonl");
+            records.push(weighted_decision(
+                &session,
+                &path,
+                &format!("2026-10-05T19:10:{index:02}Z"),
+                &format!("thin decision {index}"),
+            ));
+            selection.push(qualified_source(&session, &path, 6));
+        }
+        selection.push(qualified_source("silent-heavy", "silent.jsonl", 344));
+        let mixed = vec![crate::intents::MixedScopeSession {
+            agent: "codex".into(),
+            session_id: "mixed-heavy".into(),
+            cwds: vec!["/a".into(), "/b".into()],
+            branches: Vec::new(),
+            conflicts: 1,
+            hidden_scopes: 0,
+            status: aicx_parser::engine::ScopeStatus::MixedCandidate,
+        }];
+        selection.push(qualified_source("mixed-heavy", "mixed.jsonl", 344));
+        let sources = collect_sources(&selection, &records, &mixed);
+        assert_eq!(sources[0].path, "heavy.jsonl");
+        assert_eq!(sources[0].human_messages, 344);
+        assert!(sources.iter().any(|source| source.path == "silent.jsonl"));
+        assert!(sources.iter().all(|source| source.path != "mixed.jsonl"));
+        let pack = ContinuityPack {
+            selection,
+            source_errors: 0,
+            dropped_task_events: 0,
+            window_end: "2026-10-06T12:00:00Z".into(),
+            project_label: "codescribe".into(),
+            hours: 120,
+            live_sessions: 10,
+            records,
+            sources,
+            index_health: IndexHealthLine {
+                newest_session_updated_at: None,
+                committed_at: None,
+                pending: 0,
+                sessions_newer_than_chunks: 0,
+                readiness: "ready".into(),
+                mode: "live",
+            },
+            mixed_scope: mixed,
+            distilled_mixed: false,
+            candidate_cap: 5_000,
+            dropped_candidates: 0,
+            unplaced_scope: Vec::new(),
+        };
+        let rendered = render(&pack, false);
+        let peers = rendered
+            .split("## PEERS")
+            .nth(1)
+            .and_then(|section| section.split("## DECISIONS").next())
+            .unwrap_or("");
+        assert!(peers.contains(heavy_id), "{peers}");
+        assert!(peers.contains("human=344"), "{peers}");
+        assert!(!peers.contains("thin-0"), "{peers}");
+        let decisions = rendered
+            .split("## DECISIONS")
+            .nth(1)
+            .and_then(|section| section.split("## TASKS").next())
+            .unwrap_or("");
+        let heavy_at = decisions
+            .find("keep the heavy session")
+            .expect("heavy decision");
+        let thin_at = decisions
+            .find("thin decision 7")
+            .expect("newest thin decision");
+        assert!(heavy_at < thin_at, "{decisions}");
+        let source_block = rendered.split("## SOURCES").nth(1).unwrap_or("");
+        let heavy_source = source_block.find("human=344").expect("weighted source");
+        let thin_source = source_block.find("human=6").expect("thin source");
+        assert!(heavy_source < thin_source, "{source_block}");
     }
 }

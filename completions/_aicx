@@ -197,6 +197,7 @@ _arguments "${_arguments_options[@]}" : \
 '--agent-commands[Only tool / shell invocations the agent made]' \
 '--conversation[Conversation-first mode\: emit denoised user/assistant transcript only]' \
 '--dialog[Dialogue view\: human speech (direct + delayed echo-bus / queued, with their seals) plus assistant-final answers]' \
+'(--conversation --dialog --user-only --agent-only --user-commands --agent-commands)--brief[Distilled handoff brief (inverted pyramid, one section per segment)\: outcome first, then decision candidates, gates, open questions and handoff signals, each with an evidence locator into the substrate. Rendered from the agent'\''s distiller lane (\`GenericLane\` fail-open); mixed sessions get a multi-workstream header, never averaged outcomes]' \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
@@ -225,6 +226,36 @@ _arguments "${_arguments_options[@]}" : \
 '--agent-commands[Only tool / shell invocations the agent made]' \
 '--conversation[Conversation-first mode\: emit denoised user/assistant transcript only]' \
 '--dialog[Dialogue view\: human speech (direct + delayed echo-bus / queued, with their seals) plus assistant-final answers]' \
+'(--conversation --dialog --user-only --agent-only --user-commands --agent-commands)--brief[Distilled handoff brief (inverted pyramid, one section per segment)\: outcome first, then decision candidates, gates, open questions and handoff signals, each with an evidence locator into the substrate. Rendered from the agent'\''s distiller lane (\`GenericLane\` fail-open); mixed sessions get a multi-workstream header, never averaged outcomes]' \
+'-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(cursor)
+_arguments "${_arguments_options[@]}" : \
+'(--file)--session=[Session id\: source id, logical id, alias, UUID suffix (≥8 chars), or unique prefix. Resolved through the session catalog before any parse]:SESSION:_default' \
+'--file=[Direct source file. Builds a source handle from this path only — no catalog scan, no global AICX state. Requires \`-o/--output\`]:FILE:_files' \
+'-o+[Output file path. Required with \`--file\`; defaults to \`~/.aicx/extracts/<agent>/<session_id>\[_conversation\]\[_user\].md\` in session mode]:OUTPUT:_files' \
+'--output=[Output file path. Required with \`--file\`; defaults to \`~/.aicx/extracts/<agent>/<session_id>\[_conversation\]\[_user\].md\` in session mode]:OUTPUT:_files' \
+'*-p+[Project/repo filter, repeatable or comma-separated (OR across projects, AND with every other axis). Entries are kept when their recorded cwd belongs to one of them; an entry with no known cwd is filtered out rather than guessed. A single value also names the output'\''s project identity, as before]:PROJECT:_default' \
+'*--project=[Project/repo filter, repeatable or comma-separated (OR across projects, AND with every other axis). Entries are kept when their recorded cwd belongs to one of them; an entry with no known cwd is filtered out rather than guessed. A single value also names the output'\''s project identity, as before]:PROJECT:_default' \
+'--max-message-chars=[Maximum message characters in markdown (0 = no truncation)]:MAX_MESSAGE_CHARS:_default' \
+'-H+[Hours to look back inside the session view (0 = unbounded). A window on the projection, not a re-parse; absence is never a silent default]:HOURS:_default' \
+'--hours=[Hours to look back inside the session view (0 = unbounded). A window on the projection, not a re-parse; absence is never a silent default]:HOURS:_default' \
+'*--kind=[Throne kind filter (repeatable / comma list)\: human | echo_seal | shell_action | inject | assistant_final | lineage_meta | inter_agent. \`inter_agent\` opens the inter-agent lane; it is never rendered as assistant and stays outside --conversation / --dialog by default]:KIND:_default' \
+'--lineage=[Walk parent sessions through \`session_meta.forked_from_id\` (session catalog lookup, never filename guessing). Bare \`--lineage\` = unbounded; \`--lineage=N\` = at most N parents. Needs --session (catalog)]::DEPTH:_default' \
+'--result=[Retained shell result body\: none (\`\$ cmd \[N lines, sha256\:…\]\`, default) | head=N | full. The body stays in the substrate either way]:none|head=N|full:_default' \
+'--no-redact-secrets[Redact secrets (tokens/keys) from outputs before writing/syncing]' \
+'(--agent-only)--user-only[Only include user messages (exclude assistant + reasoning)]' \
+'--agent-only[Only include assistant answers (\`assistant_final\`). Reasoning, inter-agent traffic and lineage metadata are excluded\: they are not the assistant speaking to the operator]' \
+'--user-commands[Only shell commands the human submitted (e.g. Codex \`<user_shell_command>\`). A command quoted in prose is not an execution]' \
+'--agent-commands[Only tool / shell invocations the agent made]' \
+'--conversation[Conversation-first mode\: emit denoised user/assistant transcript only]' \
+'--dialog[Dialogue view\: human speech (direct + delayed echo-bus / queued, with their seals) plus assistant-final answers]' \
+'(--conversation --dialog --user-only --agent-only --user-commands --agent-commands)--brief[Distilled handoff brief (inverted pyramid, one section per segment)\: outcome first, then decision candidates, gates, open questions and handoff signals, each with an evidence locator into the substrate. Rendered from the agent'\''s distiller lane (\`GenericLane\` fail-open); mixed sessions get a multi-workstream header, never averaged outcomes]' \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
@@ -253,6 +284,7 @@ _arguments "${_arguments_options[@]}" : \
 '--agent-commands[Only tool / shell invocations the agent made]' \
 '--conversation[Conversation-first mode\: emit denoised user/assistant transcript only]' \
 '--dialog[Dialogue view\: human speech (direct + delayed echo-bus / queued, with their seals) plus assistant-final answers]' \
+'(--conversation --dialog --user-only --agent-only --user-commands --agent-commands)--brief[Distilled handoff brief (inverted pyramid, one section per segment)\: outcome first, then decision candidates, gates, open questions and handoff signals, each with an evidence locator into the substrate. Rendered from the agent'\''s distiller lane (\`GenericLane\` fail-open); mixed sessions get a multi-workstream header, never averaged outcomes]' \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
@@ -281,6 +313,7 @@ _arguments "${_arguments_options[@]}" : \
 '--agent-commands[Only tool / shell invocations the agent made]' \
 '--conversation[Conversation-first mode\: emit denoised user/assistant transcript only]' \
 '--dialog[Dialogue view\: human speech (direct + delayed echo-bus / queued, with their seals) plus assistant-final answers]' \
+'(--conversation --dialog --user-only --agent-only --user-commands --agent-commands)--brief[Distilled handoff brief (inverted pyramid, one section per segment)\: outcome first, then decision candidates, gates, open questions and handoff signals, each with an evidence locator into the substrate. Rendered from the agent'\''s distiller lane (\`GenericLane\` fail-open); mixed sessions get a multi-workstream header, never averaged outcomes]' \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
@@ -309,6 +342,7 @@ _arguments "${_arguments_options[@]}" : \
 '--agent-commands[Only tool / shell invocations the agent made]' \
 '--conversation[Conversation-first mode\: emit denoised user/assistant transcript only]' \
 '--dialog[Dialogue view\: human speech (direct + delayed echo-bus / queued, with their seals) plus assistant-final answers]' \
+'(--conversation --dialog --user-only --agent-only --user-commands --agent-commands)--brief[Distilled handoff brief (inverted pyramid, one section per segment)\: outcome first, then decision candidates, gates, open questions and handoff signals, each with an evidence locator into the substrate. Rendered from the agent'\''s distiller lane (\`GenericLane\` fail-open); mixed sessions get a multi-workstream header, never averaged outcomes]' \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
@@ -337,6 +371,36 @@ _arguments "${_arguments_options[@]}" : \
 '--agent-commands[Only tool / shell invocations the agent made]' \
 '--conversation[Conversation-first mode\: emit denoised user/assistant transcript only]' \
 '--dialog[Dialogue view\: human speech (direct + delayed echo-bus / queued, with their seals) plus assistant-final answers]' \
+'(--conversation --dialog --user-only --agent-only --user-commands --agent-commands)--brief[Distilled handoff brief (inverted pyramid, one section per segment)\: outcome first, then decision candidates, gates, open questions and handoff signals, each with an evidence locator into the substrate. Rendered from the agent'\''s distiller lane (\`GenericLane\` fail-open); mixed sessions get a multi-workstream header, never averaged outcomes]' \
+'-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(copilot)
+_arguments "${_arguments_options[@]}" : \
+'(--file)--session=[Session id\: source id, logical id, alias, UUID suffix (≥8 chars), or unique prefix. Resolved through the session catalog before any parse]:SESSION:_default' \
+'--file=[Direct source file. Builds a source handle from this path only — no catalog scan, no global AICX state. Requires \`-o/--output\`]:FILE:_files' \
+'-o+[Output file path. Required with \`--file\`; defaults to \`~/.aicx/extracts/<agent>/<session_id>\[_conversation\]\[_user\].md\` in session mode]:OUTPUT:_files' \
+'--output=[Output file path. Required with \`--file\`; defaults to \`~/.aicx/extracts/<agent>/<session_id>\[_conversation\]\[_user\].md\` in session mode]:OUTPUT:_files' \
+'*-p+[Project/repo filter, repeatable or comma-separated (OR across projects, AND with every other axis). Entries are kept when their recorded cwd belongs to one of them; an entry with no known cwd is filtered out rather than guessed. A single value also names the output'\''s project identity, as before]:PROJECT:_default' \
+'*--project=[Project/repo filter, repeatable or comma-separated (OR across projects, AND with every other axis). Entries are kept when their recorded cwd belongs to one of them; an entry with no known cwd is filtered out rather than guessed. A single value also names the output'\''s project identity, as before]:PROJECT:_default' \
+'--max-message-chars=[Maximum message characters in markdown (0 = no truncation)]:MAX_MESSAGE_CHARS:_default' \
+'-H+[Hours to look back inside the session view (0 = unbounded). A window on the projection, not a re-parse; absence is never a silent default]:HOURS:_default' \
+'--hours=[Hours to look back inside the session view (0 = unbounded). A window on the projection, not a re-parse; absence is never a silent default]:HOURS:_default' \
+'*--kind=[Throne kind filter (repeatable / comma list)\: human | echo_seal | shell_action | inject | assistant_final | lineage_meta | inter_agent. \`inter_agent\` opens the inter-agent lane; it is never rendered as assistant and stays outside --conversation / --dialog by default]:KIND:_default' \
+'--lineage=[Walk parent sessions through \`session_meta.forked_from_id\` (session catalog lookup, never filename guessing). Bare \`--lineage\` = unbounded; \`--lineage=N\` = at most N parents. Needs --session (catalog)]::DEPTH:_default' \
+'--result=[Retained shell result body\: none (\`\$ cmd \[N lines, sha256\:…\]\`, default) | head=N | full. The body stays in the substrate either way]:none|head=N|full:_default' \
+'--no-redact-secrets[Redact secrets (tokens/keys) from outputs before writing/syncing]' \
+'(--agent-only)--user-only[Only include user messages (exclude assistant + reasoning)]' \
+'--agent-only[Only include assistant answers (\`assistant_final\`). Reasoning, inter-agent traffic and lineage metadata are excluded\: they are not the assistant speaking to the operator]' \
+'--user-commands[Only shell commands the human submitted (e.g. Codex \`<user_shell_command>\`). A command quoted in prose is not an execution]' \
+'--agent-commands[Only tool / shell invocations the agent made]' \
+'--conversation[Conversation-first mode\: emit denoised user/assistant transcript only]' \
+'--dialog[Dialogue view\: human speech (direct + delayed echo-bus / queued, with their seals) plus assistant-final answers]' \
+'(--conversation --dialog --user-only --agent-only --user-commands --agent-commands)--brief[Distilled handoff brief (inverted pyramid, one section per segment)\: outcome first, then decision candidates, gates, open questions and handoff signals, each with an evidence locator into the substrate. Rendered from the agent'\''s distiller lane (\`GenericLane\` fail-open); mixed sessions get a multi-workstream header, never averaged outcomes]' \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
@@ -393,6 +457,10 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
+(cursor)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
 (gemini)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
@@ -406,6 +474,10 @@ _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
 (kimi)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(copilot)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
@@ -427,7 +499,7 @@ esac
 ;;
 (conversations)
 _arguments "${_arguments_options[@]}" : \
-'--agent=[Source agent for batch conversation export (v1\: claude only)]:AGENT:(claude)' \
+'--agent=[Source agent for batch conversation export]:AGENT:_default' \
 '*-p+[Source cwd/project filter(s)\: narrows session discovery before export]:PROJECT:_default' \
 '*--project=[Source cwd/project filter(s)\: narrows session discovery before export]:PROJECT:_default' \
 '-H+[Hours to look back when scanning source sessions (default\: 1 year)]:HOURS:_default' \
@@ -767,7 +839,7 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 '*-p+[Exact project filter, same shapes as search/intents/MCP\: \`owner/repo\`, \`/repo\` (cross-org repo), \`owner/\` (org wildcard), or a unique bare \`name\`. Empty is a numbered miss, not silence]:PROJECT:_default' \
 '*--project=[Exact project filter, same shapes as search/intents/MCP\: \`owner/repo\`, \`/repo\` (cross-org repo), \`owner/\` (org wildcard), or a unique bare \`name\`. Empty is a numbered miss, not silence]:PROJECT:_default' \
-'--agent=[Filter by agent (claude | codex | gemini | junie | grok | kimi)]:AGENT:(claude codex gemini junie grok kimi)' \
+'--agent=[Filter by agent (claude | codex | gemini | junie | grok | kimi | cursor | copilot)]:AGENT:(claude codex gemini junie grok kimi cursor cursor-agent copilot copilot-cli github-copilot github-copilot-cli)' \
 '--since=[Only sessions updated on/after this date (YYYY-MM-DD). Defaults to the last 30 days; pass --all to scan the full history]:SINCE:_default' \
 '--limit=[Max sessions to show (0 = all)]:LIMIT:_default' \
 '--format=[Output format\: table | json]:FORMAT:_default' \
@@ -797,7 +869,7 @@ _arguments "${_arguments_options[@]}" : \
 ;;
 (report)
 _arguments "${_arguments_options[@]}" : \
-'--agent=[Agent\: claude | codex | gemini | junie | grok. Inferred from the session id when omitted]:AGENT:_default' \
+'--agent=[Agent\: claude | codex | gemini | junie | grok | kimi | cursor | copilot. Inferred from the session id when omitted]:AGENT:_default' \
 '--hours=[Hours to look back when locating the session (default 720)]:HOURS:_default' \
 '--repo=[Repo root evidence is checked against (default\: current directory)]:REPO:_files' \
 '--max=[Max clarify questions (hard-capped at 5)]:MAX:_default' \
@@ -870,7 +942,7 @@ _arguments "${_arguments_options[@]}" : \
             (extract)
 _arguments "${_arguments_options[@]}" : \
 '--session=[Session id (or unique prefix)]:SESSION:_default' \
-'--agent=[Agent\: claude | codex | gemini | junie | grok. Inferred from the session id when omitted]:AGENT:_default' \
+'--agent=[Agent\: claude | codex | gemini | junie | grok | kimi | cursor | copilot. Inferred from the session id when omitted]:AGENT:_default' \
 '--hours=[Hours to look back when locating the session (default 720)]:HOURS:_default' \
 '--format=[Output format\: json | summary]:FORMAT:_default' \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
@@ -928,7 +1000,7 @@ _arguments "${_arguments_options[@]}" : \
             (collect)
 _arguments "${_arguments_options[@]}" : \
 '--session=[Session id (or unique prefix)]:SESSION:_default' \
-'--agent=[Agent\: claude | codex | gemini | junie | grok. Inferred from the session id when omitted]:AGENT:_default' \
+'--agent=[Agent\: claude | codex | gemini | junie | grok | kimi | cursor | copilot. Inferred from the session id when omitted]:AGENT:_default' \
 '--hours=[Hours to look back when locating the session (default 720)]:HOURS:_default' \
 '--repo=[Repo root evidence is checked against (default\: current directory)]:REPO:_files' \
 '--format=[Output format\: json | summary]:FORMAT:_default' \
@@ -970,7 +1042,7 @@ esac
 (clarify)
 _arguments "${_arguments_options[@]}" : \
 '--session=[Session id (or unique prefix)]:SESSION:_default' \
-'--agent=[Agent\: claude | codex | gemini | junie | grok. Inferred from the session id when omitted]:AGENT:_default' \
+'--agent=[Agent\: claude | codex | gemini | junie | grok | kimi | cursor | copilot. Inferred from the session id when omitted]:AGENT:_default' \
 '--hours=[Hours to look back when locating the session (default 720)]:HOURS:_default' \
 '--repo=[Repo root evidence is checked against (default\: current directory)]:REPO:_files' \
 '--max=[Max questions (hard-capped at 5)]:MAX:_default' \
@@ -1219,7 +1291,7 @@ _arguments "${_arguments_options[@]}" : \
 '--limit=[Maximum number of results to return. Default is command-specific\: search/steer 10, tail 20, intents unlimited (full roadmap)]:LIMIT:_default' \
 '--sort=[Sort order applied after filtering. Default\: command-specific]:SORT:(newest oldest score)' \
 '--score=[Minimum score threshold (0-100; semantic match confidence)]:SCORE:_default' \
-'--agent=[Agent name filter\: claude | codex | gemini | junie | codescribe]:AGENT:_default' \
+'--agent=[Agent name filter\: claude | codex | gemini | junie | grok | kimi | cursor | copilot | codescribe]:AGENT:_default' \
 '--since=[Lower date bound\: YYYY-MM-DD or relative (e.g., 2026-04-23..)]:SINCE:_default' \
 '--until=[Upper date bound\: YYYY-MM-DD]:UNTIL:_default' \
 '--frame-kind=[Frame channel filter\: user_msg | agent_reply | internal_thought | tool_call]:FRAME_KIND:(user_msg agent_reply internal_thought tool_call)' \
@@ -1262,6 +1334,7 @@ _arguments "${_arguments_options[@]}" : \
 '*--project=[Catalog project filters (union). Fail-closed identity\: bare or unknown names error with candidates instead of returning silence]:PROJECT:_default' \
 '-H+[Window in hours]:HOURS:_default' \
 '--hours=[Window in hours]:HOURS:_default' \
+'--until=[Inclusive UTC window end (RFC3339); defaults to the current time]:UNTIL:_default' \
 '--for-inject[Bound the output to a prompt-inject budget (~6k tokens)]' \
 '--no-refresh[Skip the bounded catalog hot refresh performed before rendering]' \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
@@ -1277,6 +1350,7 @@ _arguments "${_arguments_options[@]}" : \
 '*--project=[Catalog project filters (union)]:PROJECT:_default' \
 '-H+[Window in hours]:HOURS:_default' \
 '--hours=[Window in hours]:HOURS:_default' \
+'--until=[Inclusive UTC window end (RFC3339); defaults to the current time]:UNTIL:_default' \
 '-o+[Output path]:OUTPUT:_files' \
 '--output=[Output path]:OUTPUT:_files' \
 '--no-refresh[Skip the bounded catalog hot refresh performed before rendering]' \
@@ -1330,7 +1404,7 @@ _arguments "${_arguments_options[@]}" : \
 '--limit=[Maximum number of results to return. Default is command-specific\: search/steer 10, tail 20, intents unlimited (full roadmap)]:LIMIT:_default' \
 '--sort=[Sort order applied after filtering. Default\: command-specific]:SORT:(newest oldest score)' \
 '--score=[Minimum score threshold (0-100; semantic match confidence)]:SCORE:_default' \
-'--agent=[Agent name filter\: claude | codex | gemini | junie | codescribe]:AGENT:_default' \
+'--agent=[Agent name filter\: claude | codex | gemini | junie | grok | kimi | cursor | copilot | codescribe]:AGENT:_default' \
 '--since=[Lower date bound\: YYYY-MM-DD or relative (e.g., 2026-04-23..)]:SINCE:_default' \
 '--until=[Upper date bound\: YYYY-MM-DD]:UNTIL:_default' \
 '--frame-kind=[Frame channel filter\: user_msg | agent_reply | internal_thought | tool_call]:FRAME_KIND:(user_msg agent_reply internal_thought tool_call)' \
@@ -1398,11 +1472,11 @@ _arguments "${_arguments_options[@]}" : \
 '--limit=[Maximum number of results to return. Default is command-specific\: search/steer 10, tail 20, intents unlimited (full roadmap)]:LIMIT:_default' \
 '--sort=[Sort order applied after filtering. Default\: command-specific]:SORT:(newest oldest score)' \
 '--score=[Minimum score threshold (0-100; semantic match confidence)]:SCORE:_default' \
-'--agent=[Agent name filter\: claude | codex | gemini | junie | codescribe]:AGENT:_default' \
+'--agent=[Agent name filter\: claude | codex | gemini | junie | grok | kimi | cursor | copilot | codescribe]:AGENT:_default' \
 '--since=[Lower date bound\: YYYY-MM-DD or relative (e.g., 2026-04-23..)]:SINCE:_default' \
 '--until=[Upper date bound\: YYYY-MM-DD]:UNTIL:_default' \
 '--frame-kind=[Frame channel filter\: user_msg | agent_reply | internal_thought | tool_call]:FRAME_KIND:(user_msg agent_reply internal_thought tool_call)' \
-'--kind=[Filter by indexed document kind\: conversations, plans, reports, other]:KIND:(conversations conversation plans plan reports report other)' \
+'--kind=[Filter by indexed document kind\: conversations, plans, reports, other — or a distilled card.v3 axis\: \`decision\` (documents whose session distilled at least one decision candidate)]:KIND:(conversations conversation plans plan reports report other decision decisions)' \
 '--session=[Search passages inside one catalog session instead of ranking sessions]:SESSION:_default' \
 '--context=[Context lines before and after each passage match (default\: 2)]:N:_default' \
 '--result=[Shell result body on tool_call hits\: none (stub \`\$ cmd \[N lines, sha256\:…\]\`, default) | head=N | full]:none|head=N|full:_default' \
@@ -1697,7 +1771,7 @@ _arguments "${_arguments_options[@]}" : \
 '--limit=[Maximum number of results to return. Default is command-specific\: search/steer 10, tail 20, intents unlimited (full roadmap)]:LIMIT:_default' \
 '--sort=[Sort order applied after filtering. Default\: command-specific]:SORT:(newest oldest score)' \
 '--score=[Minimum score threshold (0-100; semantic match confidence)]:SCORE:_default' \
-'--agent=[Agent name filter\: claude | codex | gemini | junie | codescribe]:AGENT:_default' \
+'--agent=[Agent name filter\: claude | codex | gemini | junie | grok | kimi | cursor | copilot | codescribe]:AGENT:_default' \
 '--since=[Lower date bound\: YYYY-MM-DD or relative (e.g., 2026-04-23..)]:SINCE:_default' \
 '--until=[Upper date bound\: YYYY-MM-DD]:UNTIL:_default' \
 '--frame-kind=[Frame channel filter\: user_msg | agent_reply | internal_thought | tool_call]:FRAME_KIND:(user_msg agent_reply internal_thought tool_call)' \
@@ -1836,6 +1910,10 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
+(cursor)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
 (gemini)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
@@ -1849,6 +1927,10 @@ _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
 (kimi)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(copilot)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
@@ -2243,7 +2325,7 @@ _aicx_commands() {
 'intents:Extract structured intents from the durable catalog and allowlisted session sources' \
 'continuity:Multi-agent continuity pack\: NOW / PEERS / DECISIONS / TASKS / SOURCES / INDEX HEALTH for a project window. Live parse first, census second — never blocked on the embedder' \
 'tail:Print recent intents/chunks (snapshot mode); add --follow to stream new arrivals' \
-'serve:Run aicx as an MCP server' \
+'serve:HTTP serves the dashboard at / and MCP at /mcp on one listener. stdio stays MCP-only' \
 'init:Retired compatibility shim; prints migration guidance' \
 'search:Search the CURRENT source/extract index. Lexical-first by default; optional dense rerank with --deep. When no index exists, the only fallback is a bounded recency-ranked filesystem search' \
 'eval:Run local evaluation helpers for retrieval/search quality' \
@@ -2593,10 +2675,12 @@ _aicx__subcmd__extract_commands() {
     local commands; commands=(
 'codex:OpenAI Codex CLI rollouts (~/.codex/sessions)' \
 'claude:Claude Code sessions (~/.claude/projects)' \
+'cursor:Cursor agent transcripts (~/.cursor/projects/*/agent-transcripts)' \
 'gemini:Gemini CLI chats (~/.gemini/tmp/<hash>/chats)' \
 'grok:Grok CLI sessions (~/.grok)' \
 'junie:JetBrains Junie event logs (~/.junie/sessions)' \
 'kimi:Kimi Code CLI wire files (~/.kimi-code/sessions)' \
+'copilot:GitHub Copilot CLI sessions (~/.copilot/session-state)' \
 'all:Every compatible source on this machine, in one incremental pass' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
@@ -2617,6 +2701,16 @@ _aicx__subcmd__extract__subcmd__codex_commands() {
     local commands; commands=()
     _describe -t commands 'aicx extract codex commands' commands "$@"
 }
+(( $+functions[_aicx__subcmd__extract__subcmd__copilot_commands] )) ||
+_aicx__subcmd__extract__subcmd__copilot_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx extract copilot commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__extract__subcmd__cursor_commands] )) ||
+_aicx__subcmd__extract__subcmd__cursor_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx extract cursor commands' commands "$@"
+}
 (( $+functions[_aicx__subcmd__extract__subcmd__gemini_commands] )) ||
 _aicx__subcmd__extract__subcmd__gemini_commands() {
     local commands; commands=()
@@ -2632,10 +2726,12 @@ _aicx__subcmd__extract__subcmd__help_commands() {
     local commands; commands=(
 'codex:OpenAI Codex CLI rollouts (~/.codex/sessions)' \
 'claude:Claude Code sessions (~/.claude/projects)' \
+'cursor:Cursor agent transcripts (~/.cursor/projects/*/agent-transcripts)' \
 'gemini:Gemini CLI chats (~/.gemini/tmp/<hash>/chats)' \
 'grok:Grok CLI sessions (~/.grok)' \
 'junie:JetBrains Junie event logs (~/.junie/sessions)' \
 'kimi:Kimi Code CLI wire files (~/.kimi-code/sessions)' \
+'copilot:GitHub Copilot CLI sessions (~/.copilot/session-state)' \
 'all:Every compatible source on this machine, in one incremental pass' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
@@ -2655,6 +2751,16 @@ _aicx__subcmd__extract__subcmd__help__subcmd__claude_commands() {
 _aicx__subcmd__extract__subcmd__help__subcmd__codex_commands() {
     local commands; commands=()
     _describe -t commands 'aicx extract help codex commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__extract__subcmd__help__subcmd__copilot_commands] )) ||
+_aicx__subcmd__extract__subcmd__help__subcmd__copilot_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx extract help copilot commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__extract__subcmd__help__subcmd__cursor_commands] )) ||
+_aicx__subcmd__extract__subcmd__help__subcmd__cursor_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx extract help cursor commands' commands "$@"
 }
 (( $+functions[_aicx__subcmd__extract__subcmd__help__subcmd__gemini_commands] )) ||
 _aicx__subcmd__extract__subcmd__help__subcmd__gemini_commands() {
@@ -2725,7 +2831,7 @@ _aicx__subcmd__help_commands() {
 'intents:Extract structured intents from the durable catalog and allowlisted session sources' \
 'continuity:Multi-agent continuity pack\: NOW / PEERS / DECISIONS / TASKS / SOURCES / INDEX HEALTH for a project window. Live parse first, census second — never blocked on the embedder' \
 'tail:Print recent intents/chunks (snapshot mode); add --follow to stream new arrivals' \
-'serve:Run aicx as an MCP server' \
+'serve:HTTP serves the dashboard at / and MCP at /mcp on one listener. stdio stays MCP-only' \
 'init:Retired compatibility shim; prints migration guidance' \
 'search:Search the CURRENT source/extract index. Lexical-first by default; optional dense rerank with --deep. When no index exists, the only fallback is a bounded recency-ranked filesystem search' \
 'eval:Run local evaluation helpers for retrieval/search quality' \
@@ -2912,10 +3018,12 @@ _aicx__subcmd__help__subcmd__extract_commands() {
     local commands; commands=(
 'codex:OpenAI Codex CLI rollouts (~/.codex/sessions)' \
 'claude:Claude Code sessions (~/.claude/projects)' \
+'cursor:Cursor agent transcripts (~/.cursor/projects/*/agent-transcripts)' \
 'gemini:Gemini CLI chats (~/.gemini/tmp/<hash>/chats)' \
 'grok:Grok CLI sessions (~/.grok)' \
 'junie:JetBrains Junie event logs (~/.junie/sessions)' \
 'kimi:Kimi Code CLI wire files (~/.kimi-code/sessions)' \
+'copilot:GitHub Copilot CLI sessions (~/.copilot/session-state)' \
 'all:Every compatible source on this machine, in one incremental pass' \
     )
     _describe -t commands 'aicx help extract commands' commands "$@"
@@ -2934,6 +3042,16 @@ _aicx__subcmd__help__subcmd__extract__subcmd__claude_commands() {
 _aicx__subcmd__help__subcmd__extract__subcmd__codex_commands() {
     local commands; commands=()
     _describe -t commands 'aicx help extract codex commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__help__subcmd__extract__subcmd__copilot_commands] )) ||
+_aicx__subcmd__help__subcmd__extract__subcmd__copilot_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx help extract copilot commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__help__subcmd__extract__subcmd__cursor_commands] )) ||
+_aicx__subcmd__help__subcmd__extract__subcmd__cursor_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx help extract cursor commands' commands "$@"
 }
 (( $+functions[_aicx__subcmd__help__subcmd__extract__subcmd__gemini_commands] )) ||
 _aicx__subcmd__help__subcmd__extract__subcmd__gemini_commands() {

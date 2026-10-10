@@ -435,6 +435,18 @@ pub fn read_context_chunk_at(
     let spec = ChunkRefSpec::parse(reference)?;
 
     let files = scan_context_files_at(&base)?;
+    // Legacy archive references remain readable independently of the source
+    // catalog. A broken catalog must not retire a valid existing chunk.
+    #[cfg(feature = "app")]
+    if !files
+        .iter()
+        .any(|file| context_file_matches_spec(&base, file, &spec))
+        && let Some(chunk) =
+            crate::source_index::read_catalog_chunk_reference_at(&base, &spec, max_chars)?
+    {
+        return Ok(chunk);
+    }
+
     let file = resolve_context_chunk_file(&base, files, &spec)?;
 
     let relative_path = file
@@ -465,7 +477,7 @@ pub fn read_context_chunk_at(
     })
 }
 
-fn resolve_context_chunk_file(
+pub(crate) fn resolve_context_chunk_file(
     base: &Path,
     files: Vec<StoredContextFile>,
     spec: &ChunkRefSpec,
@@ -483,6 +495,23 @@ fn resolve_context_chunk_file(
             .into_iter()
             .find(|file| stored_file_matches_reference(base, file, reference))
             .ok_or_else(|| anyhow!("chunk not found: {reference}")),
+    }
+}
+
+#[cfg(feature = "app")]
+pub(crate) fn context_file_matches_spec(
+    base: &Path,
+    file: &StoredContextFile,
+    spec: &ChunkRefSpec,
+) -> bool {
+    match spec {
+        ChunkRefSpec::Id(id) => chunk_path_ref_id(file).starts_with(id),
+        ChunkRefSpec::Path(path) => {
+            stored_file_matches_reference(base, file, &path.to_string_lossy())
+        }
+        ChunkRefSpec::LegacyCompact(reference) => {
+            stored_file_matches_reference(base, file, reference)
+        }
     }
 }
 
@@ -564,7 +593,7 @@ fn stored_file_matches_reference(base: &Path, file: &StoredContextFile, referenc
     compact_ref == reference
 }
 
-fn truncate_chars(content: String, max_chars: Option<usize>) -> (String, bool) {
+pub(crate) fn truncate_chars(content: String, max_chars: Option<usize>) -> (String, bool) {
     let Some(max_chars) = max_chars else {
         return (content, false);
     };

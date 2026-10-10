@@ -13,7 +13,7 @@ dependencies = [
 
 [[package]]
 name = "aicx"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "aicx-embeddings",
  "aicx-monitor",
@@ -39,6 +39,7 @@ dependencies = [
  "libc",
  "ratatui",
  "regex",
+ "reqwest",
  "rmcp",
  "schemars",
  "serde",
@@ -58,7 +59,7 @@ dependencies = [
 
 [[package]]
 name = "aicx-embeddings"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "anyhow",
  "dirs",
@@ -72,15 +73,16 @@ dependencies = [
 
 [[package]]
 name = "aicx-monitor"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
+ "aicx-progress-contracts",
  "sysinfo",
  "tokio",
 ]
 
 [[package]]
 name = "aicx-parser"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -89,6 +91,7 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "serde_yaml",
  "sha2",
  "siphasher",
  "toml",
@@ -97,7 +100,7 @@ dependencies = [
 
 [[package]]
 name = "aicx-progress-contracts"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "chrono",
  "serde",
@@ -106,7 +109,7 @@ dependencies = [
 
 [[package]]
 name = "aicx-retrieve"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "aicx-parser",
  "anyhow",
@@ -2901,9 +2904,9 @@ dependencies = [
 
 [[package]]
 name = "rmcp"
-version = "2.0.0"
+version = "2.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d52d21e5b342699bc4de690e6104fc4e43255e4e8420ff0f2cbb963aac09da6f"
+checksum = "f00a32c3b81b7b254076a65abd5ab2551209146713ba38f73818657e865e9433"
 dependencies = [
  "async-trait",
  "base64",

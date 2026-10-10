@@ -38,6 +38,31 @@ fn matching_manifests_validate() {
 }
 
 #[test]
+fn different_generation_is_refused_even_with_identical_counts_and_model() {
+    let left = manifest();
+    let mut right = left.clone();
+    right.generation_id = "g-other".into();
+    assert!(matches!(
+        left.validate_against(&right),
+        Err(RetrieveError::GenerationMismatch { .. })
+    ));
+}
+
+#[test]
+fn endpoint_and_source_population_drift_are_refused() {
+    let left = manifest();
+    let mut right = left.clone();
+    right.embedder_url_hash = "different-endpoint".into();
+    assert!(left.validate_against(&right).is_err());
+    right = left.clone();
+    right.source_chunk_count += 1;
+    assert!(matches!(
+        left.validate_against(&right),
+        Err(RetrieveError::SourceChunkCountMismatch { .. })
+    ));
+}
+
+#[test]
 fn dim_mismatch_is_typed() {
     let left = manifest();
     let mut right = manifest();

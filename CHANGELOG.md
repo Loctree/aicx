@@ -3,7 +3,79 @@
 All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+## [0.15.0] - 2026-09-28
+
+### Added
+
+- A bare first start opens the dashboard onboarding survey. Intent phrases are written to `intent_phrases.toml`. On macOS the same path installs the LaunchAgent through `tools/install-mcp-service.sh`.
+- `aicx serve --transport http` is one listener: humans open `/`, agents use `/mcp`. Non-loopback binds keep bearer auth. The passphrase form stays off non-loopback binds, including `0.0.0.0`.
+
 ## [Unreleased]
+
+### Added
+
+- GitHub Copilot CLI sessions (`copilot`, aliases `copilot-cli`,
+  `github-copilot`, and `github-copilot-cli`) across discovery/catalog, readable extracts, bulk exports,
+  conversation JSON, intents, handoff briefs, source indexing/search, and MCP.
+  Read `~/.copilot/session-state/<id>/events.jsonl` with optional `workspace.yaml`
+  metadata; preserve message/tool provenance and expose unsupported visible
+  events as incomplete coverage. Source-bundle fingerprints include metadata
+  changes, and append-safe incremental processing retains stable session IDs.
+- Codescribe Transcript Bus as a session source (agent `codescribe`). Each bus
+  ledger under `~/.codescribe/agent-bridge/buses` is replayed with the bridge's
+  own seal rule (latest `rendered_text` snapshot of a closed take; open takes
+  are counted, not delivered) and cataloged once per receiving agent session,
+  inheriting that session's project and cwd. Spoken takes carry the
+  `<codescribe>` voice envelope (`[voice]` in intents), typed deliveries stay
+  verbatim, and the receiver's own bus replies stay on the assistant lane.
+  Agent-to-agent peer messages are not part of this source.
+- Codescribe dictated takes (`~/.codescribe/transcriptions`) in the session
+  catalog through the existing transcript importer, one text per recording:
+  the unnumbered `_raw` export first, numbered `_raw_<n>` collision exports and
+  `_cloud` after it; `_failed`, `_ai` and `_formatted` files, numbered or not,
+  never. A numbered file with audio of its own is a distinct recording. Takes
+  name no repository, so they live in the explicit `local/codescribe-dictation`
+  bucket (served by unfiltered `intents` and `-p /codescribe-dictation`).
+
+### Fixed
+
+- Claude compaction summaries (`isCompactSummary` rows) are epoch context, not
+  operator speech: they no longer surface in `aicx intents` as fresh decisions
+  and intents stamped with the compaction time. `SIGNAL_FILTER_VERSION` moves to
+  `signal-v7`, so the next `aicx index` re-parses every source once.
+
+- Keep runtime repair, default service installers, npm migration checks, and
+  onboarding reader-only. Preserve operator network/logging settings, repair
+  missing `serve`, verify launchd ownership of the healthy listener, and restore
+  prior scheduler state after failed registration.
+- Bound intent source work by agent before parsing and by utterance timestamps
+  before classification/caps. Reuse the validated whole-conversation cache
+  without publishing CURRENT, retain recent utterances in old indexed sessions,
+  and interpret intent `--since` as a lower date bound.
+- Reuse unchanged intent extracts through the existing source-parse ledger,
+  re-source changed sessions, preserve parser/extract coverage, and order caps
+  by qualifying utterance time. Revalidate parser-recorded checkout layout for
+  both conversation and whole-feed cache hits.
+- Reject complete extract reuse after physical source replacement or a
+  same-size edit with restored mtime. Preserve valid legacy extracts as
+  explicitly unknown during normal maintenance, keeping full historical
+  rescans deliberate.
+- Keep bounded intent queries fast by reporting legacy per-frame scope gaps as
+  incomplete instead of opening historical multi-gigabyte sources. Reuse an
+  existing reader-cache entry only when it strongly proves current source bytes
+  and whole-session scope, including for `CURRENT` IDs missing their parse-ledger
+  row; keep new IDs and fingerprint-drifted rows on the checked fresh-reader
+  path. Preserve an explicit `intents --full-rescan` / MCP `full_rescan` path for
+  deliberate all-selected-source parsing under the existing parser safety
+  bounds.
+
+- Avoid re-parsing full project history before an unchanged `overlay` cache hit.
+  Reuse fingerprinted conversation frames across both intent lanes, preserve
+  full-history evidence, and serialize concurrent producers with advisory locks.
+  Add CLI parse/reuse counters and isolated warm/incremental/concurrency tests.
+  Protect persistent identity registries from malformed-cache replacement,
+  serialize custom-root ownership, refuse time-dependent Grok projections, and
+  redact source/session identifiers from cache diagnostics.
 
 ### Turn-level project scope, decided by repository identity
 

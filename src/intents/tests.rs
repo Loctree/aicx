@@ -10,11 +10,11 @@ use std::path::PathBuf;
 fn catalog_rebuild_does_not_clear_hot_live_stamp() {
     assert!(
         session_is_hot_live(true, true),
-        "mtime-in-window sessions stay live after census fingerprints match"
+        "conversation-in-window sessions stay live after census fingerprints match"
     );
     assert!(
         !session_is_hot_live(true, false),
-        "cold mtime must not be stamped live"
+        "stale conversation must not be stamped live because a file was touched"
     );
     assert!(
         !session_is_hot_live(false, true),
@@ -331,6 +331,206 @@ fn an_unresolved_frame_is_spelled_in_only_beside_an_unresolved_root() {
     let _ = fs::remove_dir_all(&root);
 }
 
+/// Kept exception: the catalog directory is gone, and the frame's own git
+/// root is this owner/repo. A renamed or deleted catalog path must not drop
+/// the checkout that still is the project.
+#[cfg(feature = "app")]
+#[test]
+fn dead_baseline_keeps_frame_whose_owner_and_repo_are_the_project() {
+    let root = std::env::temp_dir().join(format!(
+        "aicx-intents-dead-baseline-owner-repo-{}-{}",
+        std::process::id(),
+        Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    ));
+    let _ = fs::remove_dir_all(&root);
+    let checkout = root.join("Loctree").join("aicx");
+    fs::create_dir_all(checkout.join(".git")).expect("project git dir");
+    let baseline = root.join("Loctree").join("aicx-archived");
+
+    let frame = |cwd: &std::path::Path, message: &str| crate::timeline::TimelineEntry {
+        timestamp: Utc::now(),
+        agent: "codex".to_string(),
+        session_id: "dead-baseline".to_string(),
+        role: "user".to_string(),
+        message: message.to_string(),
+        frame_class: None,
+        lineage_origin: None,
+        frame_kind: Some(FrameKind::UserMsg),
+        branch: None,
+        cwd: Some(cwd.to_string_lossy().into_owned()),
+        scope_conflict: false,
+        scope_unattributed: false,
+        scope_workdirs: Vec::new(),
+        session_kind: None,
+        timestamp_source: None,
+        source_path: None,
+        source_sha256: None,
+        source_line_span: None,
+    };
+    let mut frames = vec![frame(&checkout, "this project")];
+    retain_frames_for_project(
+        &mut frames,
+        "Loctree/aicx",
+        Some(baseline.to_string_lossy().as_ref()),
+        false,
+    );
+    assert_eq!(frames.len(), 1, "{frames:?}");
+    assert_eq!(frames[0].message, "this project");
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// Closed hole: a vanished baseline plus a shared leaf name is not identity.
+/// `/aicx`, bare `aicx`, and `Loctree/aicx` must all refuse `other-org/aicx`.
+#[cfg(feature = "app")]
+#[test]
+fn foreign_repo_with_the_same_leaf_name_stays_out() {
+    let root = std::env::temp_dir().join(format!(
+        "aicx-intents-foreign-leaf-{}-{}",
+        std::process::id(),
+        Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    ));
+    let _ = fs::remove_dir_all(&root);
+    let foreign = root.join("other-org").join("aicx");
+    fs::create_dir_all(foreign.join(".git")).expect("foreign git dir");
+    let baseline = root.join("missing-catalog").join("aicx");
+
+    let frame = |cwd: &std::path::Path| crate::timeline::TimelineEntry {
+        timestamp: Utc::now(),
+        agent: "codex".to_string(),
+        session_id: "foreign-leaf".to_string(),
+        role: "user".to_string(),
+        message: "other aicx".to_string(),
+        frame_class: None,
+        lineage_origin: None,
+        frame_kind: Some(FrameKind::UserMsg),
+        branch: None,
+        cwd: Some(cwd.to_string_lossy().into_owned()),
+        scope_conflict: false,
+        scope_unattributed: false,
+        scope_workdirs: Vec::new(),
+        session_kind: None,
+        timestamp_source: None,
+        source_path: None,
+        source_sha256: None,
+        source_line_span: None,
+    };
+    for project in ["Loctree/aicx", "/aicx", "aicx"] {
+        let mut frames = vec![frame(&foreign)];
+        retain_frames_for_project(
+            &mut frames,
+            project,
+            Some(baseline.to_string_lossy().as_ref()),
+            false,
+        );
+        assert!(
+            frames.is_empty(),
+            "filter {project} must not admit a different repo with the same leaf: {frames:?}"
+        );
+    }
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// Kept exception: a deleted directory whose parent is still this checkout
+/// belongs to the checkout. Deleting `labs` does not make it another repo.
+#[cfg(feature = "app")]
+#[test]
+fn missing_directory_inside_the_session_checkout_stays() {
+    let root = std::env::temp_dir().join(format!(
+        "aicx-intents-missing-inside-{}-{}",
+        std::process::id(),
+        Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    ));
+    let _ = fs::remove_dir_all(&root);
+    let checkout = root.join("vibecrafted");
+    fs::create_dir_all(checkout.join(".git")).expect("checkout git dir");
+    let missing = checkout.join("labs");
+
+    let frame = |cwd: &std::path::Path| crate::timeline::TimelineEntry {
+        timestamp: Utc::now(),
+        agent: "codex".to_string(),
+        session_id: "missing-inside".to_string(),
+        role: "user".to_string(),
+        message: "deleted labs".to_string(),
+        frame_class: None,
+        lineage_origin: None,
+        frame_kind: Some(FrameKind::UserMsg),
+        branch: None,
+        cwd: Some(cwd.to_string_lossy().into_owned()),
+        scope_conflict: false,
+        scope_unattributed: false,
+        scope_workdirs: Vec::new(),
+        session_kind: None,
+        timestamp_source: None,
+        source_path: None,
+        source_sha256: None,
+        source_line_span: None,
+    };
+    let mut frames = vec![frame(&missing)];
+    retain_frames_for_project(
+        &mut frames,
+        "vetcoders/vibecrafted",
+        Some(checkout.to_string_lossy().as_ref()),
+        false,
+    );
+    assert_eq!(frames.len(), 1, "{frames:?}");
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// A missing directory in another checkout, or one with no parent left, is
+/// not this project.
+#[cfg(feature = "app")]
+#[test]
+fn missing_directory_outside_the_session_checkout_stays_out() {
+    let root = std::env::temp_dir().join(format!(
+        "aicx-intents-missing-outside-{}-{}",
+        std::process::id(),
+        Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    ));
+    let _ = fs::remove_dir_all(&root);
+    let checkout = root.join("vibecrafted");
+    let other = root.join("other-repo");
+    fs::create_dir_all(checkout.join(".git")).expect("checkout git dir");
+    fs::create_dir_all(other.join(".git")).expect("other git dir");
+    let missing_elsewhere = other.join("labs");
+    let missing_without_parent = root.join("gone").join("labs");
+
+    let frame = |cwd: &std::path::Path, message: &str| crate::timeline::TimelineEntry {
+        timestamp: Utc::now(),
+        agent: "codex".to_string(),
+        session_id: "missing-outside".to_string(),
+        role: "user".to_string(),
+        message: message.to_string(),
+        frame_class: None,
+        lineage_origin: None,
+        frame_kind: Some(FrameKind::UserMsg),
+        branch: None,
+        cwd: Some(cwd.to_string_lossy().into_owned()),
+        scope_conflict: false,
+        scope_unattributed: false,
+        scope_workdirs: Vec::new(),
+        session_kind: None,
+        timestamp_source: None,
+        source_path: None,
+        source_sha256: None,
+        source_line_span: None,
+    };
+    let mut frames = vec![
+        frame(&missing_elsewhere, "other checkout"),
+        frame(&missing_without_parent, "no parent"),
+    ];
+    retain_frames_for_project(
+        &mut frames,
+        "vetcoders/vibecrafted",
+        Some(checkout.to_string_lossy().as_ref()),
+        false,
+    );
+    assert!(
+        frames.is_empty(),
+        "a missing directory outside this checkout must stay out: {frames:?}"
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
 #[cfg(feature = "app")]
 #[test]
 fn mixed_session_filter_is_fail_closed_for_unproven_frames() {
@@ -451,6 +651,7 @@ fn extract_demo_extraction(label: &str, body: &str) -> IntentExtraction {
 #[test]
 fn markdown_separates_live_open_claims_from_closed_timeline() {
     let record = |summary: &str, honesty: crate::oracle::ClaimHonesty| IntentRecord {
+        provenance: None,
         kind: IntentKind::Outcome,
         summary: summary.to_string(),
         context: None,
@@ -496,17 +697,17 @@ fn markdown_separates_live_open_claims_from_closed_timeline() {
 
 #[test]
 #[cfg(feature = "app")]
-fn live_window_admits_fresh_mtime_rows_and_unadmitted_sessions() {
+fn live_window_rejects_stale_dated_touched_files_and_keeps_unadmitted() {
     let root = migration_test_root("live-window");
     let _ = fs::remove_dir_all(&root);
 
     // Row A: catalog row whose census DATE is far outside the window, but
     // whose live source file is freshly written (mtime = now).
-    let stale_dated = root.join("runtime_runs/live-a/transcript.log");
+    let stale_dated = root.join("runtime_runs/live-a/transcript.jsonl");
     fs::create_dir_all(stale_dated.parent().expect("parent")).expect("create parent");
     fs::write(
         &stale_dated,
-        "We completed the live-window admission for the stale-dated row.\n",
+        format!("{}\n", serde_json::json!({"type":"assistant","timestamp":"2026-01-01T00:00:00Z","sessionId":"live-a","cwd":"/fixtures/Loctree/aicx","message":{"role":"assistant","content":"We completed the live-window admission for the stale-dated row."}})),
     )
     .expect("write stale-dated source");
     let catalog_path = crate::catalog::sessions_path_for(&root);
@@ -515,13 +716,14 @@ fn live_window_admits_fresh_mtime_rows_and_unadmitted_sessions() {
     let row_a = crate::catalog::CatalogEntry {
         schema: crate::catalog::CATALOG_SCHEMA.to_string(),
         session_id: "live-a".to_string(),
-        agent: "vibecrafted".to_string(),
+        agent: "claude".to_string(),
         project: Some("Loctree/aicx".to_string()),
         date: Some("2026-01-01".to_string()),
-        cwd: None,
+        cwd: Some("/fixtures/Loctree/aicx".into()),
         source_path: stale_dated.display().to_string(),
         source_len: None,
         source_mtime_ns: None,
+        source_bundle_fingerprint: None,
         title: None,
         machine: Some("test".to_string()),
         logical_session_id: None,
@@ -538,11 +740,11 @@ fn live_window_admits_fresh_mtime_rows_and_unadmitted_sessions() {
 
     // Row B: session the census does not know at all (unadmitted). The
     // live-delta cache is primed so the test never walks real agent roots.
-    let unadmitted = root.join("runtime_runs/live-b/transcript.log");
+    let unadmitted = root.join("runtime_runs/live-b/transcript.jsonl");
     fs::create_dir_all(unadmitted.parent().expect("parent")).expect("create parent");
     fs::write(
         &unadmitted,
-        "We completed the live-window admission for the unadmitted session.\n",
+        format!("{}\n", serde_json::json!({"type":"assistant","timestamp":Utc::now().to_rfc3339(),"sessionId":"live-b","cwd":"/fixtures/Loctree/aicx","message":{"role":"assistant","content":"We completed the live-window admission for the unadmitted session."}})),
     )
     .expect("write unadmitted source");
     let now_ns = std::time::SystemTime::now()
@@ -552,31 +754,50 @@ fn live_window_admits_fresh_mtime_rows_and_unadmitted_sessions() {
     let row_b = crate::catalog::CatalogEntry {
         schema: crate::catalog::CATALOG_SCHEMA.to_string(),
         session_id: "live-b".to_string(),
-        agent: "vibecrafted".to_string(),
+        agent: "claude".to_string(),
         project: Some("Loctree/aicx".to_string()),
         date: None,
-        cwd: None,
+        cwd: Some("/fixtures/Loctree/aicx".into()),
         source_path: unadmitted.display().to_string(),
         source_len: Some(64),
         source_mtime_ns: Some(now_ns),
+        source_bundle_fingerprint: None,
         title: None,
         machine: Some("test".to_string()),
         logical_session_id: None,
         session_kind: None,
     };
-    let production_user_home = crate::os_user_home().unwrap_or_else(|| root.clone());
+    let row_c = crate::catalog::CatalogEntry {
+        schema: crate::catalog::CATALOG_SCHEMA.to_string(),
+        session_id: "live-wrong-agent".to_string(),
+        agent: "codex".to_string(),
+        project: Some("Loctree/aicx".to_string()),
+        date: None,
+        cwd: Some("/fixtures/Loctree/aicx".into()),
+        source_path: root
+            .join("missing/live-wrong-agent.jsonl")
+            .display()
+            .to_string(),
+        source_len: Some(u64::MAX),
+        source_mtime_ns: Some(now_ns),
+        source_bundle_fingerprint: None,
+        title: None,
+        machine: Some("test".to_string()),
+        logical_session_id: None,
+        session_kind: None,
+    };
     let cutoff_ns = (Utc::now() - chrono::Duration::hours(24))
         .timestamp_nanos_opt()
         .map(|nanos| nanos.max(0) as u128)
         .unwrap_or(0);
     crate::catalog::prime_live_delta_cache_for_tests(
         &root,
-        &production_user_home,
+        &root,
         cutoff_ns,
         crate::catalog::LiveDelta {
-            unadmitted: vec![row_b],
+            unadmitted: vec![row_b, row_c],
             changed: Vec::new(),
-            live_sessions: 2,
+            live_sessions: 3,
             newest_live_mtime_ns: Some(now_ns),
             wall_ms: 0,
         },
@@ -602,22 +823,35 @@ fn live_window_admits_fresh_mtime_rows_and_unadmitted_sessions() {
         closed.records
     );
 
-    // Live window: both rows admitted, both stamped with the open frame.
-    let live = extract_intents_from_root_at_with_stats(&config(true), &root, Utc::now())
-        .expect("extract with live window");
-    assert_eq!(live.stats.live_sessions, 2);
+    // Live window: touching an old dated transcript must not mint NOW.
+    // An undated unadmitted session with a fresh last frame still enters.
+    let live = extract_intents_from_root_at_with_stats_filtered(
+        &config(true),
+        &IntentSourceFilter {
+            agent: Some("claude".to_string()),
+            ..Default::default()
+        },
+        &root,
+        Utc::now(),
+    )
+    .expect("extract with live window");
+    assert_eq!(live.stats.live_sessions, 1);
+    assert_eq!(live.stats.source_errors, 0, "{:#?}", live.selection);
+    assert!(live.selection.iter().any(|receipt| {
+        receipt.session_id == "live-wrong-agent" && receipt.status == "agent_excluded"
+    }));
     let summaries: Vec<&str> = live
         .records
         .iter()
         .map(|record| record.summary.as_str())
         .collect();
     assert!(
-        summaries.iter().any(|s| s.contains("stale-dated row")),
-        "stale-dated fresh-mtime row missing: {summaries:?}"
+        summaries.iter().all(|s| !s.contains("stale-dated row")),
+        "stale-dated fresh-mtime row leaked into the live window: {summaries:?}"
     );
     assert!(
         summaries.iter().any(|s| s.contains("unadmitted session")),
-        "unadmitted live session missing: {summaries:?}"
+        "unadmitted synthetic live session missing"
     );
     assert!(
         live.records
@@ -655,6 +889,7 @@ fn catalog_source_replaces_retired_cards_for_intent_extraction() {
         source_path: source.display().to_string(),
         source_len: None,
         source_mtime_ns: None,
+        source_bundle_fingerprint: None,
         title: Some("catalog hydration".to_string()),
         machine: Some("test".to_string()),
         logical_session_id: None,
@@ -701,6 +936,383 @@ fn catalog_source_replaces_retired_cards_for_intent_extraction() {
         "intent extraction must not regrow the retired card store"
     );
     let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+#[cfg(feature = "app")]
+fn source_agent_filter_skips_wrong_agent_before_opening_source() {
+    let root = migration_test_root("source-agent-pushdown");
+    let _ = fs::remove_dir_all(&root);
+    let source = root.join("runtime_runs/requested/transcript.log");
+    fs::create_dir_all(source.parent().expect("source parent")).expect("create source parent");
+    fs::write(
+        &source,
+        "We completed the requested-agent source selection and verified the result.\n",
+    )
+    .expect("write requested source");
+
+    let catalog_path = crate::catalog::sessions_path_for(&root);
+    fs::create_dir_all(catalog_path.parent().expect("catalog parent"))
+        .expect("create catalog parent");
+    let requested = crate::catalog::CatalogEntry {
+        schema: crate::catalog::CATALOG_SCHEMA.to_string(),
+        session_id: "requested-agent-session".to_string(),
+        agent: "vibecrafted".to_string(),
+        project: Some("Loctree/aicx".to_string()),
+        date: Some("2026-10-02".to_string()),
+        cwd: Some("/fixtures/Loctree/aicx".to_string()),
+        source_path: source.display().to_string(),
+        source_len: None,
+        source_mtime_ns: None,
+        source_bundle_fingerprint: None,
+        title: None,
+        machine: Some("test".to_string()),
+        logical_session_id: None,
+        session_kind: None,
+    };
+    let excluded = crate::catalog::CatalogEntry {
+        schema: crate::catalog::CATALOG_SCHEMA.to_string(),
+        session_id: "wrong-agent-invalid-source".to_string(),
+        agent: "claude".to_string(),
+        project: Some("Loctree/aicx".to_string()),
+        date: Some("2026-10-02".to_string()),
+        cwd: Some("/fixtures/Loctree/aicx".to_string()),
+        source_path: root.join("missing/oversized.jsonl").display().to_string(),
+        source_len: Some(u64::MAX),
+        source_mtime_ns: None,
+        source_bundle_fingerprint: None,
+        title: None,
+        machine: Some("test".to_string()),
+        logical_session_id: None,
+        session_kind: None,
+    };
+    fs::write(
+        &catalog_path,
+        format!(
+            "{}\n{}\n",
+            serde_json::to_string(&requested).expect("serialize requested row"),
+            serde_json::to_string(&excluded).expect("serialize excluded row")
+        ),
+    )
+    .expect("write catalog");
+
+    let config = IntentsConfig {
+        project: "Loctree/aicx".to_string(),
+        hours: 0,
+        strict: false,
+        min_confidence: None,
+        kind_filter: Some(IntentKind::Outcome),
+        frame_kind: Some(FrameKind::AgentReply),
+        live: false,
+    };
+    let extraction = extract_intents_from_root_at_with_stats_filtered(
+        &config,
+        &IntentSourceFilter {
+            agent: Some("vibecrafted".to_string()),
+            ..Default::default()
+        },
+        &root,
+        Utc::now(),
+    )
+    .expect("extract requested agent only");
+
+    assert_eq!(
+        extraction.stats.source_errors, 0,
+        "{:#?}",
+        extraction.selection
+    );
+    assert!(
+        extraction
+            .records
+            .iter()
+            .any(|record| record.session_id == "requested-agent-session")
+    );
+    assert!(extraction.selection.iter().any(|receipt| {
+        receipt.session_id == "wrong-agent-invalid-source" && receipt.status == "agent_excluded"
+    }));
+    assert!(!extraction.selection.iter().any(|receipt| {
+        receipt.session_id == "wrong-agent-invalid-source" && receipt.status == "source_error"
+    }));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+#[cfg(feature = "app")]
+fn source_date_filter_keeps_new_utterance_in_old_session_and_cache_tracks_appends() {
+    let root = migration_test_root("source-date-pushdown");
+    let _ = fs::remove_dir_all(&root);
+    let source = root.join("runtime_runs/old-session/transcript.jsonl");
+    fs::create_dir_all(source.parent().expect("source parent")).expect("create source parent");
+    fs::write(
+        &source,
+        format!(
+            "{}\n{}\n",
+            serde_json::json!({"type":"assistant","timestamp":"2026-09-01T08:00:00Z","sessionId":"old-session","cwd":"/fixtures/Loctree/aicx","message":{"role":"assistant","content":"We completed the obsolete source-selection outcome."}}),
+            serde_json::json!({"type":"assistant","timestamp":"2026-10-02T09:30:00Z","sessionId":"old-session","cwd":"/fixtures/Loctree/aicx","message":{"role":"assistant","content":"We completed the fresh utterance-time source-selection outcome."}})
+        ),
+    )
+    .expect("write old session with fresh utterance");
+
+    let catalog_path = crate::catalog::sessions_path_for(&root);
+    fs::create_dir_all(catalog_path.parent().expect("catalog parent"))
+        .expect("create catalog parent");
+    let entry = crate::catalog::CatalogEntry {
+        schema: crate::catalog::CATALOG_SCHEMA.to_string(),
+        session_id: "old-session".to_string(),
+        agent: "claude".to_string(),
+        project: Some("Loctree/aicx".to_string()),
+        date: Some("2026-09-01".to_string()),
+        cwd: Some("/fixtures/Loctree/aicx".to_string()),
+        source_path: source.display().to_string(),
+        source_len: None,
+        source_mtime_ns: None,
+        source_bundle_fingerprint: None,
+        title: None,
+        machine: Some("test".to_string()),
+        logical_session_id: None,
+        session_kind: None,
+    };
+    fs::write(
+        &catalog_path,
+        format!(
+            "{}\n",
+            serde_json::to_string(&entry).expect("serialize catalog row")
+        ),
+    )
+    .expect("write catalog");
+
+    let config = IntentsConfig {
+        project: "Loctree/aicx".to_string(),
+        hours: 0,
+        strict: false,
+        min_confidence: None,
+        kind_filter: Some(IntentKind::Outcome),
+        frame_kind: Some(FrameKind::AgentReply),
+        live: false,
+    };
+    let source_filter = IntentSourceFilter {
+        agent: Some("claude".to_string()),
+        date_lo: Some("2026-10-02".to_string()),
+        date_hi: Some("2026-10-02".to_string()),
+        full_source_scan: false,
+    };
+    let now = DateTime::parse_from_rfc3339("2026-10-03T00:00:00Z")
+        .expect("now")
+        .with_timezone(&Utc);
+    let extraction =
+        extract_intents_from_root_at_with_stats_filtered(&config, &source_filter, &root, now)
+            .expect("extract utterance-time window");
+
+    let summaries = extraction
+        .records
+        .iter()
+        .map(|record| record.summary.as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        summaries
+            .iter()
+            .any(|summary| summary.contains("fresh utterance-time")),
+        "fresh utterance from old session missing: {summaries:?}"
+    );
+    assert!(
+        summaries
+            .iter()
+            .all(|summary| !summary.contains("obsolete source-selection")),
+        "out-of-window utterance survived: {summaries:?}"
+    );
+    let receipt = extraction
+        .selection
+        .iter()
+        .find(|receipt| receipt.session_id == "old-session")
+        .expect("selection receipt");
+    assert_eq!(receipt.parsed_frames, 2);
+    assert_eq!(receipt.qualified_frames, 1);
+    assert_eq!(receipt.outside_window_frames, 1);
+
+    let warm =
+        extract_intents_from_root_at_with_stats_filtered(&config, &source_filter, &root, now)
+            .expect("extract warm cached source");
+    assert_eq!(
+        warm.records, extraction.records,
+        "warm cached extraction changed query semantics"
+    );
+
+    let mut changed = fs::read_to_string(&source).expect("read source before append");
+    changed.push_str(&format!(
+        "{}\n",
+        serde_json::json!({"type":"assistant","timestamp":"2026-10-02T10:00:00Z","sessionId":"old-session","cwd":"/fixtures/Loctree/aicx","message":{"role":"assistant","content":"We completed the appended source-change visibility outcome."}})
+    ));
+    fs::write(&source, changed).expect("append changed source");
+    let refreshed =
+        extract_intents_from_root_at_with_stats_filtered(&config, &source_filter, &root, now)
+            .expect("extract after source append");
+    assert!(
+        refreshed
+            .records
+            .iter()
+            .any(|record| record.summary.contains("appended source-change visibility")),
+        "changed source was hidden by the warm cache: {:?}",
+        refreshed.records
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn filtered_query_falls_back_when_catalog_and_index_are_missing() {
+    let root = migration_test_root("source-filter-legacy-fallback");
+    let _ = fs::remove_dir_all(&root);
+    write_chunk(
+        &root,
+        "demo",
+        "2026-10-02",
+        "120000_codex-001.md",
+        "[signals]\nIntent:\n- [intent] Preserve the honest legacy fallback.\n[/signals]\n",
+    );
+    let config = IntentsConfig {
+        project: "demo".to_string(),
+        hours: 0,
+        strict: false,
+        min_confidence: None,
+        kind_filter: Some(IntentKind::Intent),
+        frame_kind: Some(FrameKind::UserMsg),
+        live: false,
+    };
+    let extraction = extract_intents_from_root_at_with_stats_filtered(
+        &config,
+        &IntentSourceFilter {
+            agent: Some("codex".to_string()),
+            date_lo: Some("2026-10-02".to_string()),
+            date_hi: Some("2026-10-02".to_string()),
+            full_source_scan: false,
+        },
+        &root,
+        DateTime::parse_from_rfc3339("2026-10-03T00:00:00Z")
+            .expect("now")
+            .with_timezone(&Utc),
+    )
+    .expect("extract legacy fallback");
+
+    // With no catalog or persisted bucket marker, the legacy path can only
+    // recover project/agent identity from the chunk layout. Keep that warning
+    // honest: the canonical path date is safe to narrow early, while the agent
+    // label remains filename-derived and is left to the display-stage filter.
+    assert_eq!(
+        extraction.stats.identity_source,
+        PATH_HEURISTIC_IDENTITY_SOURCE
+    );
+    assert!(
+        !extraction.records.is_empty(),
+        "legacy grammar fixture produced no intent record; selection={:#?}",
+        extraction.selection,
+    );
+    assert!(
+        extraction.stats.path_heuristic_records > 0,
+        "legacy fallback must report records whose identity is path-derived; records={:#?} selection={:#?}",
+        extraction.records,
+        extraction.selection,
+    );
+    assert_eq!(extraction.stats.source_errors, 0);
+    assert!(
+        extraction
+            .records
+            .iter()
+            .any(|record| record.summary.contains("honest legacy fallback")),
+        "legacy fallback returned a fake empty result: {:?}",
+        extraction.records
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+#[cfg(feature = "app")]
+fn indexed_candidate_cap_prioritizes_max_qualified_utterance_time() {
+    let now = DateTime::parse_from_rfc3339("2026-10-06T12:00:00Z")
+        .expect("now")
+        .with_timezone(&Utc);
+    let source_filter = IntentSourceFilter::default();
+    let mut files = Vec::with_capacity(MAX_CANDIDATES + 1);
+    let make_file = |session_id: String, text: String| StoredChunkFile {
+        agent: "codex".to_string(),
+        date: "2025-01-01".to_string(),
+        path: PathBuf::from(format!("/fixtures/{session_id}.md")),
+        project: "vetcoders/aicx".to_string(),
+        identity_source: INDEX_IDENTITY_SOURCE.to_string(),
+        sequence: 0,
+        // Deliberately stale session metadata: cap order must come from the
+        // qualified utterance, never this creation/canonical date.
+        timestamp: DateTime::UNIX_EPOCH,
+        session_id,
+        honesty: crate::oracle::ClaimHonesty::canonical(),
+        scope: None,
+        transcript_entries: None,
+        admission_human_messages: None,
+        validated_extract: None,
+        body: Some(text),
+    };
+
+    for index in 0..MAX_CANDIDATES {
+        let session_id = format!("filler-{index:05}");
+        let at = now - chrono::Duration::minutes(10) - chrono::Duration::seconds(index as i64);
+        let text = format!(
+            "# AICX session extract\n\n## {} · user\n\nDecision: indexed filler {index:05}\n",
+            at.to_rfc3339()
+        );
+        files.push(make_file(session_id, text));
+    }
+
+    let target_session = "old-session-newest-utterance";
+    files.push(make_file(
+        target_session.to_string(),
+        format!(
+            "# AICX session extract\n\n## {} · user\n\nDecision: retain newest qualified utterance beyond cap\n",
+            (now - chrono::Duration::minutes(1)).to_rfc3339()
+        ),
+    ));
+    let config = IntentsConfig {
+        project: "vetcoders/aicx".to_string(),
+        hours: 720,
+        strict: false,
+        min_confidence: None,
+        kind_filter: Some(IntentKind::Decision),
+        frame_kind: Some(FrameKind::UserMsg),
+        live: false,
+    };
+    materialize_transcripts_for_admission(&mut files, &config, &source_filter, Some(now))
+        .expect("materialize indexed admission metadata");
+    order_files_for_admission(&mut files);
+    let target = files
+        .iter()
+        .find(|file| file.session_id == target_session)
+        .expect("target file");
+    assert_eq!(
+        target.timestamp,
+        now - chrono::Duration::minutes(1),
+        "indexed priority must derive from the newest qualified utterance"
+    );
+    let extraction = extract_intents_from_files_with_stats(
+        &config,
+        files,
+        0,
+        INDEX_IDENTITY_SOURCE,
+        0,
+        &source_filter,
+        ScopeNotes {
+            now: Some(now),
+            ..Default::default()
+        },
+    )
+    .expect("extract over-cap indexed candidates");
+    assert!(extraction.stats.dropped_candidates > 0);
+    assert!(
+        extraction.records.iter().any(|record| {
+            record.session_id == target_session
+                && record.summary.contains("newest qualified utterance")
+        }),
+        "newest utterance from an old session lost priority at the cap"
+    );
 }
 
 fn extract_demo_records(label: &str, body: &str) -> Vec<IntentRecord> {
@@ -953,6 +1565,7 @@ Intent:
 #[test]
 fn collapse_session_merges_exact_daily_duplicates_within_session() {
     let make_record = |source_chunk: &str| IntentRecord {
+        provenance: None,
         kind: IntentKind::Intent,
         summary: "przerobimy Screenscribe na portal".to_string(),
         context: None,
@@ -993,6 +1606,7 @@ fn collapse_session_merges_exact_daily_duplicates_within_session() {
 #[test]
 fn collapse_session_keeps_same_session_id_in_distinct_projects() {
     let make_record = |project: &str, source_chunk: &str| IntentRecord {
+        provenance: None,
         kind: IntentKind::Intent,
         summary: "preserve project-scoped session identity".to_string(),
         context: None,
@@ -1038,6 +1652,7 @@ fn collapse_session_keeps_same_session_id_in_distinct_projects() {
 fn collapse_session_prefers_substantive_intent_over_newer_task_noise() {
     let make_record =
         |kind: IntentKind, summary: &str, timestamp: &str, source: &str| IntentRecord {
+            provenance: None,
             kind,
             summary: summary.to_string(),
             context: None,
@@ -1107,6 +1722,7 @@ fn collapse_session_prefers_substantive_intent_over_newer_task_noise() {
 #[test]
 fn newest_limit_uses_total_identity_order_for_timestamp_ties() {
     let make_record = |project: &str, session_id: &str, source_chunk: &str| IntentRecord {
+        provenance: None,
         kind: IntentKind::Intent,
         summary: format!("intent {project} {session_id} {source_chunk}"),
         context: None,
@@ -1175,6 +1791,7 @@ fn newest_limit_uses_total_identity_order_for_timestamp_ties() {
 #[test]
 fn collapse_session_tolerates_existing_none_count() {
     let make_record = |summary: &str, count| IntentRecord {
+        provenance: None,
         kind: IntentKind::Intent,
         summary: summary.to_string(),
         context: None,
@@ -2146,6 +2763,7 @@ fn explicit_agent_frame_kind_override_still_admits_agent_chunk() {
 #[test]
 fn formats_markdown_with_required_sections() {
     let records = vec![IntentRecord {
+        provenance: None,
         kind: IntentKind::Decision,
         summary: "Keep the parser flat".to_string(),
         context: Some("It removes overlap bugs.".to_string()),
@@ -2173,6 +2791,7 @@ fn formats_markdown_with_required_sections() {
 #[test]
 fn formats_json_with_same_fields() {
     let records = vec![IntentRecord {
+        provenance: None,
         kind: IntentKind::Outcome,
         summary: "p0=0 after validation".to_string(),
         context: None,
@@ -2199,6 +2818,7 @@ fn formats_json_with_same_fields() {
 #[test]
 fn formats_oracle_json_as_canonical_corpus_not_semantic_fallback() {
     let records = vec![IntentRecord {
+        provenance: None,
         kind: IntentKind::Decision,
         summary: "Canonical corpus stays source of truth".to_string(),
         context: None,
@@ -2251,6 +2871,7 @@ fn strip_case_prefix_is_utf8_safe() {
 
 fn honesty_probe_record(honesty: crate::oracle::ClaimHonesty) -> IntentRecord {
     IntentRecord {
+        provenance: None,
         kind: IntentKind::Intent,
         summary: "thread honesty frame through display surfaces".to_string(),
         context: None,
@@ -2367,6 +2988,9 @@ fn build_candidate_threads_sidecar_honesty_into_record() {
         honesty: crate::oracle::ClaimHonesty::canonical(),
         scope: None,
         transcript_entries: None,
+        admission_human_messages: None,
+        #[cfg(feature = "app")]
+        validated_extract: None,
         body: None,
     };
 
@@ -2462,6 +3086,7 @@ fn unresolved_filter_narrows_when_session_resolved() {
     // defers the kind filter so Outcomes survive the resolution check.)
     let records = vec![
         IntentRecord {
+            provenance: None,
             kind: IntentKind::Intent,
             summary: "ship native intents audit".to_string(),
             context: None,
@@ -2479,6 +3104,7 @@ fn unresolved_filter_narrows_when_session_resolved() {
             honesty: Default::default(),
         },
         IntentRecord {
+            provenance: None,
             kind: IntentKind::Outcome,
             summary: "native intents audit shipped".to_string(),
             context: None,
@@ -2496,6 +3122,7 @@ fn unresolved_filter_narrows_when_session_resolved() {
             honesty: Default::default(),
         },
         IntentRecord {
+            provenance: None,
             kind: IntentKind::Intent,
             summary: "lock regression anchor".to_string(),
             context: None,
@@ -2548,6 +3175,7 @@ fn none_limit_does_not_clip_roadmap() {
     // (The CLI default override lives in `run_intents`: default sentinel -> None.)
     let records: Vec<IntentRecord> = (0..12)
         .map(|i| IntentRecord {
+            provenance: None,
             kind: IntentKind::Intent,
             summary: format!("planned roadmap item {i}"),
             context: None,
@@ -3686,6 +4314,7 @@ mod quality {
     #[test]
     fn reconcile_session_id_uses_filename_when_record_disagrees() {
         let mut records = vec![IntentRecord {
+            provenance: None,
             kind: IntentKind::Intent,
             summary: "claim from session A but filename is from session B".to_string(),
             context: None,
@@ -3716,6 +4345,7 @@ mod quality {
     #[test]
     fn reconcile_keeps_session_id_when_already_consistent() {
         let mut records = vec![IntentRecord {
+            provenance: None,
             kind: IntentKind::Decision,
             summary: "session_id matches filename".to_string(),
             context: None,
@@ -3745,6 +4375,7 @@ mod quality {
         let source_chunk = "/tmp/2026_0504_codex_019df273-2c1_067.md".to_string();
         let mut records = vec![
             IntentRecord {
+                provenance: None,
                 kind: IntentKind::Decision,
                 summary: "nie mamy ani jednego użytkownika. Jesteśmy teraz w San Francisco i potrzebujemy strategii. Zrób sobie aicx search...[truncated]".to_string(),
                 evidence: Vec::new(),
@@ -3762,6 +4393,7 @@ mod quality {
                 honesty: Default::default(),
             },
             IntentRecord {
+                provenance: None,
                 kind: IntentKind::Decision,
                 summary: "nie mamy ani jednego użytkownika. Jesteśmy teraz w San Francisco i potrzebujemy strategii. Zrób sobie aicx search 'repozytoria libraxis loctree vetcoders' i pomóż.".to_string(),
                 evidence: Vec::new(),
@@ -3797,6 +4429,7 @@ mod quality {
         source_chunk: &str,
     ) -> IntentRecord {
         IntentRecord {
+            provenance: None,
             kind,
             summary: summary.to_string(),
             evidence: Vec::new(),
@@ -3920,6 +4553,7 @@ mod area_e_regressions {
 
     fn make_record(kind: IntentKind, summary: &str) -> IntentRecord {
         IntentRecord {
+            provenance: None,
             kind,
             summary: summary.to_string(),
             context: None,
@@ -4115,6 +4749,7 @@ mod flexible_dates {
 
     fn make_record(summary: &str, date: &str, timestamp: Option<&str>) -> IntentRecord {
         IntentRecord {
+            provenance: None,
             kind: IntentKind::Intent,
             summary: summary.to_string(),
             context: None,
@@ -4269,6 +4904,9 @@ mod flexible_dates {
             honesty: Default::default(),
             scope: None,
             transcript_entries: None,
+            admission_human_messages: None,
+            #[cfg(feature = "app")]
+            validated_extract: None,
             body: None,
         };
 
@@ -4327,6 +4965,9 @@ mod flexible_dates {
             honesty: Default::default(),
             scope: None,
             transcript_entries: None,
+            admission_human_messages: None,
+            #[cfg(feature = "app")]
+            validated_extract: None,
             body: None,
         };
 
@@ -4560,6 +5201,9 @@ Update Cargo.lock dependencies\n";
             honesty: Default::default(),
             scope: None,
             transcript_entries: None,
+            admission_human_messages: None,
+            #[cfg(feature = "app")]
+            validated_extract: None,
             body: None,
         };
 
@@ -4669,6 +5313,7 @@ Results:
     fn test_unresolved_mode_intent_vs_session() {
         let records = vec![
             IntentRecord {
+                provenance: None,
                 kind: IntentKind::Intent,
                 summary: "implement search".to_string(),
                 context: None,
@@ -4686,6 +5331,7 @@ Results:
                 honesty: Default::default(),
             },
             IntentRecord {
+                provenance: None,
                 kind: IntentKind::Intent,
                 summary: "fix login".to_string(),
                 context: None,
@@ -4703,6 +5349,7 @@ Results:
                 honesty: Default::default(),
             },
             IntentRecord {
+                provenance: None,
                 kind: IntentKind::Outcome,
                 summary: "search was implemented successfully".to_string(),
                 context: None,
@@ -4759,6 +5406,7 @@ Results:
     fn test_kind_plus_unresolved_combination() {
         let records = vec![
             IntentRecord {
+                provenance: None,
                 kind: IntentKind::Intent,
                 summary: "implement search".to_string(),
                 context: None,
@@ -4776,6 +5424,7 @@ Results:
                 honesty: Default::default(),
             },
             IntentRecord {
+                provenance: None,
                 kind: IntentKind::Intent,
                 summary: "fix login".to_string(),
                 context: None,
@@ -4793,6 +5442,7 @@ Results:
                 honesty: Default::default(),
             },
             IntentRecord {
+                provenance: None,
                 kind: IntentKind::Outcome,
                 summary: "search was implemented successfully".to_string(),
                 context: None,
@@ -4845,12 +5495,16 @@ Results:
             honesty: Default::default(),
             scope: None,
             transcript_entries: None,
+            admission_human_messages: None,
+            #[cfg(feature = "app")]
+            validated_extract: None,
             body: None,
         };
 
         // 1. Voice transcript intent without context/evidence (confidence 2)
         let c1 = IntentCandidate {
             record: IntentRecord {
+                provenance: None,
                 kind: IntentKind::Intent,
                 summary: "low confidence intent".to_string(),
                 context: None,
@@ -4874,6 +5528,7 @@ Results:
         // 2. High confidence intent (confidence 4)
         let c2 = IntentCandidate {
             record: IntentRecord {
+                provenance: None,
                 kind: IntentKind::Intent,
                 summary: "high confidence intent".to_string(),
                 context: Some("explicit instruction".to_string()),
@@ -4994,32 +5649,104 @@ fn full_history_requests_never_take_the_index_path() {
     assert!(
         super::collect_intent_files_from_index(
             &home,
-            "vetcoders/aicx",
+            &IntentsConfig {
+                project: "vetcoders/aicx".to_string(),
+                hours: 0,
+                strict: false,
+                min_confidence: None,
+                kind_filter: None,
+                frame_kind: Some(FrameKind::UserMsg),
+                live: false,
+            },
             chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0).expect("epoch"),
-            crate::timeline::FrameKind::UserMsg,
-            false,
-            true,
+            &super::IntentSourceFilter::default(),
             &mut super::ScopeNotes::default(),
         )
         .is_none(),
         "full-history requests must fall through to the census"
     );
 
-    // The live hot window is likewise census-only: fresh sessions are not
-    // committed to the index yet.
+    // A live window may join CURRENT with changed/unadmitted sources, but no
+    // published CURRENT still falls through honestly.
     assert!(
         super::collect_intent_files_from_index(
             &home,
-            "vetcoders/aicx",
+            &IntentsConfig {
+                project: "vetcoders/aicx".to_string(),
+                hours: 24,
+                strict: false,
+                min_confidence: None,
+                kind_filter: None,
+                frame_kind: Some(FrameKind::UserMsg),
+                live: true,
+            },
             chrono::Utc::now(),
-            crate::timeline::FrameKind::UserMsg,
-            true,
-            false,
+            &super::IntentSourceFilter::default(),
             &mut super::ScopeNotes::default(),
         )
         .is_none(),
         "hot-window requests must fall through to the census"
     );
+}
+
+#[test]
+#[cfg(feature = "app")]
+fn current_metadata_holes_respect_global_project_and_agent_boundaries() {
+    let no_filter = IntentSourceFilter::default();
+    let missing_project = serde_json::json!({
+        "agent": "codex",
+        "session_id": "legacy-session"
+        // Missing scope keys deliberately make this a flagged legacy chunk.
+    });
+    let global = current_metadata_fact(&missing_project, "", &no_filter)
+        .expect("global query considers metadata with unknown project");
+    assert_eq!(
+        global.key,
+        Some(("codex".to_string(), "legacy-session".to_string()))
+    );
+    assert!(global.flagged_for_project);
+    assert!(
+        !current_metadata_fact(&missing_project, "vetcoders/aicx", &no_filter)
+            .expect("identified metadata remains available for catalog reattribution")
+            .flagged_for_project,
+        "project-specific query must not claim metadata with unknown project"
+    );
+
+    let missing_identity = serde_json::json!({
+        "project": "vetcoders/aicx"
+    });
+    let unfiltered = current_metadata_fact(&missing_identity, "", &no_filter)
+        .expect("unfiltered global query must account for unidentified flagged metadata");
+    assert!(unfiltered.key.is_none());
+    assert!(unfiltered.flagged_for_project);
+    assert!(
+        current_metadata_fact(
+            &missing_identity,
+            "",
+            &IntentSourceFilter {
+                agent: Some("codex".to_string()),
+                ..Default::default()
+            }
+        )
+        .is_none(),
+        "agent-filtered query must exclude metadata whose agent is unknown"
+    );
+
+    let missing_session = serde_json::json!({
+        "agent": "codex",
+        "project": "vetcoders/aicx"
+    });
+    let filtered = current_metadata_fact(
+        &missing_session,
+        "vetcoders/aicx",
+        &IntentSourceFilter {
+            agent: Some("codex".to_string()),
+            ..Default::default()
+        },
+    )
+    .expect("known matching agent still exposes a missing-session metadata hole");
+    assert!(filtered.key.is_none());
+    assert!(filtered.flagged_for_project);
 }
 
 /// Finding: a `CURRENT` generation built before the scope keys existed
@@ -5061,4 +5788,185 @@ fn a_chunk_that_cannot_state_its_scope_is_not_a_clean_chunk() {
             "a chunk missing `{key}` does not state its scope"
         );
     }
+}
+
+#[cfg(feature = "app")]
+#[test]
+fn heavier_older_session_survives_the_candidate_cap() {
+    use super::{
+        CATALOG_IDENTITY_SOURCE, MAX_CANDIDATES, ScopeNotes, StoredChunkFile, TranscriptEntry,
+        extract_intents_from_files_with_stats,
+    };
+    use chrono::TimeZone;
+
+    let older = Utc.with_ymd_and_hms(2026, 10, 3, 22, 18, 0).unwrap();
+    let newer = Utc.with_ymd_and_hms(2026, 10, 5, 19, 10, 0).unwrap();
+    let now = Utc.with_ymd_and_hms(2026, 10, 6, 12, 0, 0).unwrap();
+    let heavy_lines: Vec<TranscriptEntry> = (0..344)
+        .map(|index| TranscriptEntry {
+            timestamp: Some(older),
+            locator: Some(format!("heavy:{index}")),
+            cwd: None,
+            role: "user".into(),
+            lines: vec![format!("from now on keep heavy turn {index}")],
+        })
+        .collect();
+    let lines_per_turn = MAX_CANDIDATES.div_ceil(6);
+    let thin_lines: Vec<TranscriptEntry> = (0..6)
+        .map(|turn| TranscriptEntry {
+            timestamp: Some(newer),
+            locator: Some(format!("thin:{turn}")),
+            cwd: None,
+            role: "user".into(),
+            lines: (0..lines_per_turn)
+                .map(|line| format!("from now on thin filler {turn}-{line}"))
+                .collect(),
+        })
+        .collect();
+    let file = |session: &str, timestamp, entries: Vec<TranscriptEntry>| StoredChunkFile {
+        agent: "codex".into(),
+        date: "2026-10-03".into(),
+        path: PathBuf::from(format!("{session}.jsonl")),
+        project: "codescribe".into(),
+        identity_source: CATALOG_IDENTITY_SOURCE.into(),
+        sequence: 0,
+        timestamp,
+        session_id: session.into(),
+        honesty: crate::oracle::ClaimHonesty::canonical(),
+        scope: None,
+        transcript_entries: Some(entries),
+        admission_human_messages: None,
+        #[cfg(feature = "app")]
+        validated_extract: None,
+        body: None,
+    };
+    let config = IntentsConfig {
+        project: "codescribe".into(),
+        hours: 0,
+        strict: false,
+        min_confidence: None,
+        kind_filter: None,
+        frame_kind: None,
+        live: true,
+    };
+    let notes = ScopeNotes {
+        now: Some(now),
+        ..Default::default()
+    };
+    let extraction = extract_intents_from_files_with_stats(
+        &config,
+        vec![
+            file("thin-session", newer, thin_lines),
+            file("heavy-session", older, heavy_lines),
+        ],
+        0,
+        CATALOG_IDENTITY_SOURCE,
+        0,
+        &IntentSourceFilter::default(),
+        notes,
+    )
+    .expect("extract");
+    let heavy = extraction
+        .selection
+        .iter()
+        .find(|row| row.session_id == "heavy-session")
+        .expect("heavy selection");
+    let thin = extraction
+        .selection
+        .iter()
+        .find(|row| row.session_id == "thin-session")
+        .expect("thin selection");
+    assert_eq!(heavy.human_messages, 344);
+    assert_eq!(thin.human_messages, 6);
+    assert!(extraction.stats.dropped_candidates > 0);
+    assert!(
+        extraction
+            .records
+            .iter()
+            .any(|record| record.session_id == "heavy-session"),
+        "heavy session was dropped under the cap; dropped={}",
+        extraction.stats.dropped_candidates
+    );
+}
+
+#[cfg(feature = "app")]
+#[test]
+fn admission_weight_counts_only_user_turns_inside_explicit_date_window() {
+    use chrono::TimeZone;
+
+    let old = Utc.with_ymd_and_hms(2026, 9, 1, 12, 0, 0).unwrap();
+    let heavy_qualifying = Utc.with_ymd_and_hms(2026, 10, 2, 12, 0, 0).unwrap();
+    let thin_first = Utc.with_ymd_and_hms(2026, 10, 1, 12, 0, 0).unwrap();
+    let thin_latest = Utc.with_ymd_and_hms(2026, 10, 3, 12, 0, 0).unwrap();
+    let now = Utc.with_ymd_and_hms(2026, 10, 6, 12, 0, 0).unwrap();
+    let mut heavy_body = String::from("# AICX session extract\n\n");
+    for index in 0..128 {
+        heavy_body.push_str(&format!(
+            "## {} · user\n\nDecision: historical human turn {index}\n\n",
+            old.to_rfc3339()
+        ));
+    }
+    heavy_body.push_str(&format!(
+        "## {} · user\n\nDecision: one qualifying human turn\n\n",
+        heavy_qualifying.to_rfc3339()
+    ));
+    let thin_body = format!(
+        "# AICX session extract\n\n## {} · user\n\nDecision: qualifying one\n\n## {} · user\n\nDecision: qualifying two\n",
+        thin_first.to_rfc3339(),
+        thin_latest.to_rfc3339()
+    );
+    let file = |session: &str, body: String| StoredChunkFile {
+        agent: "codex".into(),
+        date: "2025-01-01".into(),
+        path: PathBuf::from(format!("{session}.md")),
+        project: "vetcoders/aicx".into(),
+        identity_source: INDEX_IDENTITY_SOURCE.into(),
+        sequence: 0,
+        // Deliberately unusable metadata clock; materialization must replace it
+        // with the newest qualifying utterance.
+        timestamp: DateTime::UNIX_EPOCH,
+        session_id: session.into(),
+        honesty: crate::oracle::ClaimHonesty::canonical(),
+        scope: None,
+        transcript_entries: None,
+        admission_human_messages: None,
+        #[cfg(feature = "app")]
+        validated_extract: None,
+        body: Some(body),
+    };
+    let mut files = vec![
+        file("historically-heavy", heavy_body),
+        file("qualifying-heavy", thin_body),
+    ];
+    let config = IntentsConfig {
+        project: "vetcoders/aicx".into(),
+        hours: 0,
+        strict: false,
+        min_confidence: None,
+        kind_filter: None,
+        frame_kind: Some(FrameKind::UserMsg),
+        live: false,
+    };
+    let source_filter = IntentSourceFilter {
+        agent: Some("codex".into()),
+        date_lo: Some("2026-10-01".into()),
+        date_hi: Some("2026-10-06".into()),
+        full_source_scan: false,
+    };
+
+    materialize_transcripts_for_admission(&mut files, &config, &source_filter, Some(now))
+        .expect("materialize admission headings");
+    assert!(
+        files
+            .iter()
+            .all(|file| file.transcript_entries.is_none() && file.body.is_some()),
+        "heading admission must not eagerly retain parsed message bodies"
+    );
+    order_files_for_admission(&mut files);
+
+    assert_eq!(files[0].session_id, "qualifying-heavy");
+    assert_eq!(file_human_messages(&files[0]), 2);
+    assert_eq!(files[0].timestamp, thin_latest);
+    assert_eq!(file_human_messages(&files[1]), 1);
+    assert_eq!(files[1].timestamp, heavy_qualifying);
 }

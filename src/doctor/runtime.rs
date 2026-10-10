@@ -71,6 +71,10 @@ pub fn repair_runtime() -> Result<RuntimeRepairReport> {
         INSTALL_REINDEX_SCRIPT,
         &launcher,
         Some(("AICX_REINDEX_INTERVAL", REINDEX_INTERVAL_SECONDS)),
+    )
+    .context(
+        "MCP is a healthy reader-only service; index scheduler repair failed and attempted \
+         to restore its previous state. Inspect the scheduler error before retrying",
     )?;
     Ok(RuntimeRepairReport {
         status: "repaired",
@@ -92,12 +96,37 @@ pub fn format_runtime_repair_text(report: &RuntimeRepairReport) -> String {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "macos")]
     #[test]
-    fn repair_preserves_existing_service_arguments() {
-        assert!(REPAIR_MCP_SCRIPT.contains("Set :ProgramArguments:0"));
-        assert!(REPAIR_MCP_SCRIPT.contains("--no-auto-refresh"));
-        assert!(!REPAIR_MCP_SCRIPT.contains("--host\n"));
-        assert!(!REPAIR_MCP_SCRIPT.contains("--port\n"));
+    fn embedded_runtime_repair_passes_mocked_regressions() {
+        use std::fs;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock must follow the Unix epoch")
+            .as_nanos();
+        let script_path = std::env::temp_dir().join(format!(
+            "aicx-embedded-runtime-repair-{}-{nonce}.sh",
+            std::process::id()
+        ));
+        fs::write(&script_path, REPAIR_MCP_SCRIPT)
+            .expect("materialize the embedded runtime repair for its mocked regression suite");
+        let output = Command::new("python3")
+            .arg(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tools/repair_mcp_runtime_selftest.py"
+            ))
+            .arg(&script_path)
+            .output()
+            .expect("run the embedded runtime repair regression suite");
+        let _ = fs::remove_file(&script_path);
+        assert!(
+            output.status.success(),
+            "embedded runtime repair regression suite failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]

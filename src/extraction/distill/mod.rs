@@ -233,7 +233,7 @@ impl AgentLaneDistiller for GenericLane {
 
 /// All parser-supported agents, in registry iteration order. W1 lanes cover
 /// this list; anything absent from the registry falls back to [`GenericLane`].
-const ALL_AGENTS: [AgentKind; 7] = [
+const ALL_AGENTS: [AgentKind; 8] = [
     AgentKind::Claude,
     AgentKind::Codex,
     AgentKind::Gemini,
@@ -241,6 +241,7 @@ const ALL_AGENTS: [AgentKind; 7] = [
     AgentKind::Junie,
     AgentKind::Kimi,
     AgentKind::Cursor,
+    AgentKind::Copilot,
 ];
 
 /// Registry mapping [`AgentKind`] to its distiller lane.
@@ -290,6 +291,7 @@ impl LaneRegistry {
         registry.register(Box::new(grok_lane::GrokLane));
         registry.register(Box::new(junie::JunieLane::new()));
         registry.register(Box::new(kimi_lane::KimiLane));
+        registry.register(Box::new(copilot_lane::CopilotLane));
         registry
     }
 }
@@ -311,6 +313,7 @@ pub mod gemini;
 pub mod grok_lane;
 pub mod junie;
 
+pub mod copilot_lane;
 pub mod kimi_lane;
 
 #[cfg(test)]

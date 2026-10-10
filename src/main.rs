@@ -56,6 +56,7 @@ use aicx::reports_extractor::{self, ReportsExtractorConfig};
 use aicx::sessions;
 use aicx::state::StateManager;
 use aicx::timeline;
+use aicx::utterances;
 
 fn print_intent_schema_migration_report(report: &intents::MigrationReport) {
     eprintln!("=== Intent Schema Migration (dry run) ===");
@@ -88,6 +89,7 @@ fn print_intent_schema_migration_report(report: &intents::MigrationReport) {
 ///   aicx index                 # census + incremental parse + publish (one command)
 ///   aicx search '<query>'
 /// Power-user surfaces (catalog, extracts, intents, migrations): aicx --help-full
+/// A bare first start opens the dashboard onboarding survey.
 #[derive(Debug, Parser)]
 #[command(name = "aicx")]
 #[command(author = "(c)2026 Vetcoders")]
@@ -173,6 +175,7 @@ enum ExtractAgent {
     Grok,
     Junie,
     Kimi,
+    Copilot,
 }
 
 impl ExtractAgent {
@@ -185,6 +188,7 @@ impl ExtractAgent {
             Self::Grok => "grok",
             Self::Junie => "junie",
             Self::Kimi => "kimi",
+            Self::Copilot => "copilot",
         }
     }
 
@@ -197,6 +201,7 @@ impl ExtractAgent {
             Self::Grok => aicx::session_catalog::AgentKind::Grok,
             Self::Junie => aicx::session_catalog::AgentKind::Junie,
             Self::Kimi => aicx::session_catalog::AgentKind::Kimi,
+            Self::Copilot => aicx::session_catalog::AgentKind::Copilot,
         }
     }
 
@@ -209,6 +214,7 @@ impl ExtractAgent {
             Self::Grok => aicx::parser::engine::AgentKind::Grok,
             Self::Junie => aicx::parser::engine::AgentKind::Junie,
             Self::Kimi => aicx::parser::engine::AgentKind::Kimi,
+            Self::Copilot => aicx::parser::engine::AgentKind::Copilot,
         }
     }
 
@@ -225,6 +231,7 @@ impl ExtractAgent {
             Self::Grok => home.join(".grok").join("sessions"),
             Self::Junie => home.join(".junie").join("sessions"),
             Self::Kimi => home.join(".kimi-code").join("sessions"),
+            Self::Copilot => aicx::session_catalog::copilot_session_root(home),
         }
     }
 
@@ -237,6 +244,9 @@ impl ExtractAgent {
             "grok" => Some(Self::Grok),
             "junie" => Some(Self::Junie),
             "kimi" => Some(Self::Kimi),
+            "copilot" | "copilot-cli" | "github-copilot" | "github-copilot-cli" => {
+                Some(Self::Copilot)
+            }
             _ => None,
         }
     }
@@ -258,6 +268,9 @@ enum ExtractTarget {
     Junie(ExtractAgentArgs),
     /// Kimi Code CLI wire files (~/.kimi-code/sessions)
     Kimi(ExtractAgentArgs),
+    /// GitHub Copilot CLI sessions (~/.copilot/session-state)
+    #[command(aliases = ["copilot-cli", "github-copilot", "github-copilot-cli"])]
+    Copilot(ExtractAgentArgs),
     /// Every compatible source on this machine, in one incremental pass.
     All(ExtractAllArgs),
 }
@@ -272,6 +285,7 @@ impl ExtractTarget {
             Self::Grok(args) => (ExtractAgent::Grok, args),
             Self::Junie(args) => (ExtractAgent::Junie, args),
             Self::Kimi(args) => (ExtractAgent::Kimi, args),
+            Self::Copilot(args) => (ExtractAgent::Copilot, args),
             Self::All(_) => unreachable!("`extract all` is dispatched before split()"),
         }
     }
@@ -546,8 +560,8 @@ enum SessionsCommand {
         #[arg(short, long, value_delimiter = ',')]
         project: Vec<String>,
 
-        /// Filter by agent (claude | codex | gemini | junie | grok | kimi | cursor).
-        #[arg(long, value_parser = ["claude", "codex", "gemini", "junie", "grok", "kimi", "cursor", "cursor-agent"])]
+        /// Filter by agent (claude | codex | gemini | junie | grok | kimi | cursor | copilot).
+        #[arg(long, value_parser = ["claude", "codex", "gemini", "junie", "grok", "kimi", "cursor", "cursor-agent", "copilot", "copilot-cli", "github-copilot", "github-copilot-cli"])]
         agent: Option<String>,
 
         /// Only sessions updated on/after this date (YYYY-MM-DD). Defaults to the
@@ -594,7 +608,7 @@ enum SessionsCommand {
         /// Session id (or a unique prefix).
         session_id: String,
 
-        /// Agent: claude | codex | gemini | junie | grok. Inferred from the session
+        /// Agent: claude | codex | gemini | junie | grok | kimi | cursor | copilot. Inferred from the session
         /// id when omitted.
         #[arg(long)]
         agent: Option<String>,
@@ -625,7 +639,7 @@ enum ClaimsCommand {
         #[arg(long)]
         session: String,
 
-        /// Agent: claude | codex | gemini | junie | grok. Inferred from the session id
+        /// Agent: claude | codex | gemini | junie | grok | kimi | cursor | copilot. Inferred from the session id
         /// when omitted.
         #[arg(long)]
         agent: Option<String>,
@@ -649,7 +663,7 @@ enum ResultsCommand {
         #[arg(long)]
         session: String,
 
-        /// Agent: claude | codex | gemini | junie | grok. Inferred from the session id
+        /// Agent: claude | codex | gemini | junie | grok | kimi | cursor | copilot. Inferred from the session id
         /// when omitted.
         #[arg(long)]
         agent: Option<String>,
@@ -713,7 +727,7 @@ struct RetrievalFilters {
     #[arg(long)]
     score: Option<u8>,
 
-    /// Agent name filter: claude | codex | gemini | junie | codescribe.
+    /// Agent name filter: claude | codex | gemini | junie | grok | kimi | cursor | copilot | codescribe.
     #[arg(long)]
     agent: Option<String>,
 
@@ -1052,6 +1066,9 @@ enum ContinuityAction {
         /// Window in hours.
         #[arg(short = 'H', long, default_value = "24")]
         hours: u64,
+        /// Inclusive UTC window end (RFC3339); defaults to the current time.
+        #[arg(long)]
+        until: Option<chrono::DateTime<chrono::Utc>>,
         /// Bound the output to a prompt-inject budget (~6k tokens).
         #[arg(long)]
         for_inject: bool,
@@ -1067,6 +1084,9 @@ enum ContinuityAction {
         /// Window in hours.
         #[arg(short = 'H', long, default_value = "24")]
         hours: u64,
+        /// Inclusive UTC window end (RFC3339); defaults to the current time.
+        #[arg(long)]
+        until: Option<chrono::DateTime<chrono::Utc>>,
         /// Output path.
         #[arg(short, long, default_value = "CONTINUITY.md")]
         output: PathBuf,
@@ -1361,8 +1381,8 @@ enum Commands {
     ///
     /// Canonical grammar (the target is a required subcommand):
     ///   aicx extract all [-p PROJECT]... [-H HOURS] [--provider NAME]... [--rebuild]
-    ///   aicx extract {codex|claude|gemini|grok|junie} --session <id> [--conversation] [-o FILE]
-    ///   aicx extract {codex|claude|gemini|grok|junie} --file <path> --conversation -o <path>
+    ///   aicx extract {codex|claude|cursor|gemini|grok|junie|kimi|copilot} --session <id> [--conversation] [-o FILE]
+    ///   aicx extract {codex|claude|cursor|gemini|grok|junie|kimi|copilot} --file <path> --conversation -o <path>
     ///
     /// `all` walks every registered agent, projects each session through the
     /// same filters, and writes a run manifest under
@@ -1433,8 +1453,8 @@ enum Commands {
         #[command(flatten)]
         redaction: RedactionArgs,
 
-        /// Source agent for batch conversation export (v1: claude only).
-        #[arg(long, value_parser = ["claude"], default_value = "claude")]
+        /// Source agent for batch conversation export.
+        #[arg(long, default_value = "claude")]
         agent: String,
 
         /// Source cwd/project filter(s): narrows session discovery before export.
@@ -1469,7 +1489,7 @@ enum Commands {
 
     /// Rebuild the durable extract-era session catalog (no per-frame cards).
     ///
-    /// Walks live agent source roots (claude/codex/gemini/grok/junie +
+    /// Walks live agent source roots (claude/codex/cursor/gemini/grok/junie/kimi/copilot +
     /// vibecrafted runtime_runs) and writes `~/.aicx/catalog/sessions.jsonl`.
     /// Does not materialize card files under `~/.aicx/store/`.
     ///
@@ -1525,7 +1545,8 @@ enum Commands {
     // ── Layer 1: Query & inspect ──────────────────────────────────────
     /// List raw agent session sources on disk (pre-extraction inputs).
     ///
-    /// Shows Claude Code, Codex, Gemini, Junie, and Grok log paths with session
+    /// Shows Claude Code, Codex, Gemini, Junie, and Grok log paths, plus Cursor,
+    /// Kimi and GitHub Copilot CLI, with session
     /// counts and sizes. This is what extractors will read from — use
     /// `catalog resolve` / `extract` to inspect identity and readable transcripts.
     #[command(hide = true, display_order = 10)]
@@ -1566,7 +1587,7 @@ enum Commands {
         #[arg(long)]
         session: String,
 
-        /// Agent: claude | codex | gemini | junie | grok. Inferred from the session id
+        /// Agent: claude | codex | gemini | junie | grok | kimi | cursor | copilot. Inferred from the session id
         /// when omitted.
         #[arg(long)]
         agent: Option<String>,
@@ -1684,6 +1705,32 @@ enum Commands {
     #[command(name = "dashboard-serve", hide = true)]
     DashboardServeLegacy(#[command(flatten)] DashboardServeLegacyArgs),
 
+    /// List human utterances in a project window, or refuse.
+    ///
+    /// Exit 0 only when every matching session was read whole, the list
+    /// contains at least one human utterance, and the newest admitted
+    /// utterance reaches the window's end date. Catalog date does not skip a
+    /// session. Code-shaped lines and agent replies are printed under
+    /// "machine text". This command does not classify decisions.
+    Utterances {
+        /// Catalog project filters. Omit to scan all projects.
+        /// Repeated `-p` flags or a comma list (`-p a,b`) form a union.
+        #[arg(short, long, value_delimiter = ',')]
+        project: Vec<String>,
+
+        /// Hours to look back when `--since` is omitted (default: 720 = 30 days, 0 = all time).
+        #[arg(short = 'H', long, default_value = "720")]
+        hours: u64,
+
+        /// Inclusive window start, YYYY-MM-DD UTC. Overrides `--hours`.
+        #[arg(long)]
+        since: Option<String>,
+
+        /// Inclusive window end, YYYY-MM-DD UTC. Omit to end at now.
+        #[arg(long)]
+        until: Option<String>,
+    },
+
     /// Extract structured intents from the durable catalog and allowlisted session sources.
     #[command(hide = true)]
     Intents {
@@ -1741,6 +1788,11 @@ enum Commands {
         /// Disable the automatic live scan for hot (≤ 48h) windows.
         #[arg(long)]
         no_live: bool,
+
+        /// Parse every selected catalog source instead of deferring legacy
+        /// scope holes. Expensive; parser safety bounds still apply.
+        #[arg(long)]
+        full_rescan: bool,
     },
 
     /// Multi-agent continuity pack: NOW / PEERS / DECISIONS / TASKS /
@@ -1775,7 +1827,7 @@ enum Commands {
         filters: RetrievalFilters,
     },
 
-    /// Run aicx as an MCP server.
+    /// HTTP serves the dashboard at / and MCP at /mcp on one listener. stdio stays MCP-only.
     Serve {
         /// Transport: stdio (default) or http. Legacy alias: sse.
         #[arg(long, value_enum, default_value_t = McpTransport::Stdio)]
@@ -2637,14 +2689,17 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
             serde_json::to_writer_pretty(io::stdout().lock(), &overlay)?;
             println!();
             eprintln!(
-                "overlay: cards={} new={} retained={} attributions={} unresolved={} files_opened={} raw_session_files_opened={}",
+                "overlay: cards={} new={} retained={} attributions={} unresolved={} files_opened={} raw_session_files_opened={} source_sessions_parsed={} source_sessions_reused={} feed_cache_hit={}",
                 stats.canonical_cards_seen,
                 stats.new_intents,
                 stats.retained_intents,
                 stats.emitted_attributions,
                 stats.unresolved_attributions,
                 stats.files_opened,
-                stats.raw_session_files_opened
+                stats.raw_session_files_opened,
+                stats.source_sessions_parsed,
+                stats.source_sessions_reused,
+                stats.feed_cache_hit,
             );
         }
         Some(Commands::Claude {
@@ -2754,6 +2809,7 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
                     "grok",
                     "kimi",
                     "cursor",
+                    "copilot",
                     "codescribe",
                 ],
                 project,
@@ -2875,7 +2931,7 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
                     json,
                     aicx::cli::failure::StructuredFailure::new(
                         "missing_agent_subcommand",
-                        "extract requires a target: all | codex | claude | cursor | gemini | grok | junie | kimi",
+                        "extract requires a target: all | codex | claude | cursor | gemini | grok | junie | kimi | copilot",
                         "rerun as `aicx extract all`, `aicx extract codex --session <id> --conversation`, or `aicx extract codex --file <path> --conversation -o <path>`",
                     )
                     .with_fallback("aicx extract all"),
@@ -3137,6 +3193,14 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
                 preview_chars: args.preview_chars,
             })?;
         }
+        Some(Commands::Utterances {
+            project,
+            hours,
+            since,
+            until,
+        }) => {
+            run_utterances(&project, hours, since, until, project_match)?;
+        }
         Some(Commands::Intents {
             project,
             hours,
@@ -3150,6 +3214,7 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
             kind,
             live,
             no_live,
+            full_rescan,
         }) => {
             let live_mode = live || (intents::IntentsConfig::auto_live(hours) && !no_live);
             run_intents(
@@ -3167,22 +3232,25 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
                     collapse_session,
                 },
                 live_mode,
+                full_rescan,
             )?;
         }
         Some(Commands::Continuity { action }) => {
-            let (projects, hours, for_inject, output, no_refresh) = match action {
+            let (projects, hours, until, for_inject, output, no_refresh) = match action {
                 ContinuityAction::Show {
                     project,
                     hours,
+                    until,
                     for_inject,
                     no_refresh,
-                } => (project, hours, for_inject, None, no_refresh),
+                } => (project, hours, until, for_inject, None, no_refresh),
                 ContinuityAction::Write {
                     project,
                     hours,
+                    until,
                     output,
                     no_refresh,
-                } => (project, hours, false, Some(output), no_refresh),
+                } => (project, hours, until, false, Some(output), no_refresh),
             };
             let projects = if projects.is_empty() {
                 vec![current_checkout_project()?]
@@ -3194,7 +3262,13 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
             }
             let resolution = resolve_intents_project_filters(&projects, project_match)?;
             let aicx_home = aicx::aicx_home::ensure()?;
-            let pack = aicx::continuity::build(&aicx_home, &resolution.selected, hours)?;
+            let pack = aicx::continuity::build_with_scope_at(
+                &aicx_home,
+                &resolution.selected,
+                hours,
+                false,
+                until.unwrap_or_else(chrono::Utc::now),
+            )?;
             let rendered = aicx::continuity::render(&pack, for_inject);
             match output {
                 Some(path) => {
@@ -3689,9 +3763,14 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
         Some(Commands::Warmup { json }) => {
             run_warmup(json)?;
         }
-        None => {
-            Cli::command().print_help()?;
-        }
+        None => match aicx::onboarding::maybe_first_start()? {
+            aicx::onboarding::FirstStart::Opened(report) => {
+                print!("{}", report.render());
+            }
+            aicx::onboarding::FirstStart::AlreadyConfigured => {
+                Cli::command().print_help()?;
+            }
+        },
     }
 
     Ok(())
@@ -3788,8 +3867,9 @@ fn load_session_claims(
             .map(|s| s.agent.clone())
             .context("could not infer agent from session id; pass --agent")?,
     };
-    let extract_agent = ExtractAgent::from_str(&agent_str)
-        .with_context(|| format!("unknown agent '{agent_str}' (claude|codex|gemini|junie|grok)"))?;
+    let extract_agent = ExtractAgent::from_str(&agent_str).with_context(|| {
+        format!("unknown agent '{agent_str}' (claude|codex|cursor|gemini|junie|grok|kimi|copilot)")
+    })?;
 
     let root = extract_agent.session_root(&home);
     let catalog = aicx::session_catalog::SessionCatalog::new(extract_agent.catalog_kind(), &root)
@@ -4298,6 +4378,7 @@ const CURRENT_SESSION_ENV_KEYS: &[(&str, Option<&str>)] = &[
     ("GEMINI_SESSION_ID", Some("gemini")),
     ("JUNIE_SESSION_ID", Some("junie")),
     ("KIMI_SESSION_ID", Some("kimi")),
+    ("COPILOT_SESSION_ID", Some("copilot")),
     ("GROK_SESSION_ID", Some("grok")),
     ("GROK_THREAD_ID", Some("grok")),
 ];
@@ -4407,6 +4488,16 @@ fn current_session_from_disk() -> Result<Option<CurrentSessionPayload>> {
         Some(&here),
     ));
 
+    discovered.extend(sessions::discover_copilot_sessions(
+        &aicx::session_catalog::copilot_session_root(&home),
+        Some(modified_after),
+        Some(&here),
+    ));
+
+    // Only sessions that can be tied to this checkout. Kimi stores no cwd,
+    // and its workspace slug is not a path, so it is not a candidate here.
+    // A `[kimi/...]` commit supplies KIMI_SESSION_ID instead of borrowing
+    // another project's transcript.
     let mut selected = sessions::select_sessions(discovered, Some(&here), None, Some(since_dt), 1);
     let Some(info) = selected.pop() else {
         return Ok(None);
@@ -4435,6 +4526,9 @@ fn run_sessions_list(
     format: &str,
     project: Option<(Vec<String>, legacy_archive::ProjectMatchMode)>,
 ) -> Result<()> {
+    let agent = agent.map(|name| {
+        ExtractAgent::from_str(&name).map_or(name.clone(), |agent| agent.label().to_owned())
+    });
     // Recency window: default to the last 30 days so the scan stays fast on
     // large histories; --since sets it explicitly, --all scans everything.
     let since_dt: Option<DateTime<Utc>> = if all {
@@ -4515,6 +4609,14 @@ fn run_sessions_list(
         discovered.extend(sessions::discover_kimi_sessions(
             &home.join(".kimi-code").join("sessions"),
             modified_after,
+        ));
+    }
+
+    if want_agent.is_none_or(|a| ExtractAgent::from_str(a) == Some(ExtractAgent::Copilot)) {
+        discovered.extend(sessions::discover_copilot_sessions(
+            &aicx::session_catalog::copilot_session_root(&home),
+            modified_after,
+            here.as_deref(),
         ));
     }
 
@@ -5104,6 +5206,36 @@ fn print_live_window_header(live_sessions: usize) {
     println!("mode: {mode}\n");
 }
 
+fn run_utterances(
+    projects: &[String],
+    hours: u64,
+    since: Option<String>,
+    until: Option<String>,
+    project_match: legacy_archive::ProjectMatchMode,
+) -> Result<()> {
+    let since = parse_cli_date(since.as_deref(), "--since")?;
+    let until = parse_cli_date(until.as_deref(), "--until")?;
+    let now = Utc::now();
+    let window = utterances::window_from_bounds(now, hours, since, until);
+    if window.start > window.end {
+        anyhow::bail!("utterances window starts after it ends");
+    }
+    let resolution = resolve_intents_project_filters(projects, project_match)?;
+    let filters: &[String] = if resolution.selected.is_empty() {
+        projects
+    } else {
+        &resolution.selected
+    };
+    let aicx_home = aicx::aicx_home::ensure()?;
+    let settlement = utterances::settle_catalog(&aicx_home, filters, window)?;
+    print!("{}", settlement.render());
+    io::stdout().flush()?;
+    if !settlement.complete() {
+        std::process::exit(utterances::REFUSAL_EXIT_CODE);
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_intents(
     projects: &[String],
@@ -5112,6 +5244,7 @@ fn run_intents(
     project_match: legacy_archive::ProjectMatchMode,
     display: IntentsDisplayOptions<'_>,
     live: bool,
+    full_source_scan: bool,
 ) -> Result<()> {
     let IntentsDisplayOptions {
         emit,
@@ -5148,6 +5281,7 @@ fn run_intents(
             strict,
             min_confidence,
             live,
+            full_source_scan,
         )?;
         return Ok(());
     }
@@ -5162,16 +5296,19 @@ fn run_intents(
         live,
     };
 
-    let extraction =
-        intents::extract_intents_with_stats_for_projects(&config, &effective_projects)?;
-    let records = extraction.records;
-
-    let (date_lo, date_hi) = if let Some(ref d) = filters.since {
-        let bounds = parse_date_filter(d)?;
-        (bounds.0, bounds.1)
-    } else {
-        (None, filters.until.clone())
+    let (date_lo, date_hi) = intent_date_bounds(&filters)?;
+    let source_filter = intents::IntentSourceFilter {
+        agent: filters.agent.clone(),
+        date_lo: date_lo.clone(),
+        date_hi: date_hi.clone(),
+        full_source_scan,
     };
+    let extraction = intents::extract_intents_with_stats_for_projects_filtered(
+        &config,
+        &effective_projects,
+        &source_filter,
+    )?;
+    let records = extraction.records;
 
     let display_filters = intents::IntentDisplayFilters {
         unresolved,
@@ -5322,6 +5459,7 @@ fn run_intents_pack(
     strict: bool,
     min_confidence: Option<u8>,
     live: bool,
+    full_source_scan: bool,
 ) -> Result<()> {
     let lane_sort = filters.sort.unwrap_or(SortOrder::Newest);
     let lane_limit = filters.limit.or(Some(DEFAULT_INTENTS_PACK_LIMIT));
@@ -5338,6 +5476,7 @@ fn run_intents_pack(
         lane_sort,
         lane_limit,
         live,
+        full_source_scan,
     )?;
     let (tasks, stats_b) = extract_intents_pack_lane(
         projects,
@@ -5352,6 +5491,7 @@ fn run_intents_pack(
         lane_sort,
         lane_limit,
         live,
+        full_source_scan,
     )?;
     let (user_msg, stats_c) = extract_intents_pack_lane(
         projects,
@@ -5366,6 +5506,7 @@ fn run_intents_pack(
         lane_sort,
         lane_limit,
         live,
+        full_source_scan,
     )?;
     let (agent_reply, stats_d) = extract_intents_pack_lane(
         projects,
@@ -5380,6 +5521,7 @@ fn run_intents_pack(
         lane_sort,
         lane_limit,
         live,
+        full_source_scan,
     )?;
     let (unresolved, stats_e) = extract_intents_pack_lane(
         projects,
@@ -5394,6 +5536,7 @@ fn run_intents_pack(
         lane_sort,
         lane_limit,
         live,
+        full_source_scan,
     )?;
     // Lanes overlap on the same sessions — the widest lane is the honest count.
     let lanes = [stats_a, stats_b, stats_c, stats_d, stats_e];
@@ -5464,6 +5607,7 @@ fn extract_intents_pack_lane(
     sort: SortOrder,
     limit: Option<usize>,
     live: bool,
+    full_source_scan: bool,
 ) -> Result<(Vec<intents::IntentRecord>, intents::IntentExtractionStats)> {
     let config = intents::IntentsConfig {
         project: projects.first().cloned().unwrap_or_default(),
@@ -5474,8 +5618,18 @@ fn extract_intents_pack_lane(
         frame_kind,
         live,
     };
-    let extraction = intents::extract_intents_with_stats_for_projects(&config, projects)?;
     let (date_lo, date_hi) = intent_date_bounds(filters)?;
+    let source_filter = intents::IntentSourceFilter {
+        agent: filters.agent.clone(),
+        date_lo: date_lo.clone(),
+        date_hi: date_hi.clone(),
+        full_source_scan,
+    };
+    let extraction = intents::extract_intents_with_stats_for_projects_filtered(
+        &config,
+        projects,
+        &source_filter,
+    )?;
     let mut records = intents::apply_display_filters(
         extraction.records,
         &intents::IntentDisplayFilters {
@@ -5499,12 +5653,17 @@ fn extract_intents_pack_lane(
 }
 
 fn intent_date_bounds(filters: &RetrievalFilters) -> Result<(Option<String>, Option<String>)> {
-    if let Some(ref d) = filters.since {
-        let bounds = parse_date_filter(d)?;
-        Ok((bounds.0, bounds.1))
+    let (lo, hi) = if let Some(ref date) = filters.since {
+        if date.contains("..") {
+            parse_date_filter(date)?
+        } else {
+            // --since is a lower bound; --date keeps the single-day selector.
+            (Some(date.clone()), None)
+        }
     } else {
-        Ok((None, filters.until.clone()))
-    }
+        (None, None)
+    };
+    Ok((lo, hi.or_else(|| filters.until.clone())))
 }
 
 fn format_intents_pack_markdown(
@@ -5690,6 +5849,7 @@ fn run_tail(
                 collapse_session: false,
             },
             intents::IntentsConfig::auto_live(hours),
+            false,
         );
     }
 
@@ -5713,6 +5873,13 @@ fn run_tail(
         live: intents::IntentsConfig::auto_live(hours),
     };
 
+    let (date_lo, date_hi) = intent_date_bounds(&filters)?;
+    let source_filter = intents::IntentSourceFilter {
+        agent: filters.agent.clone(),
+        date_lo: date_lo.clone(),
+        date_hi: date_hi.clone(),
+        full_source_scan: false,
+    };
     let mut last_seen = std::collections::HashSet::new();
     eprintln!(
         "Watching for new intents in {}...",
@@ -5720,23 +5887,18 @@ fn run_tail(
     );
 
     loop {
-        if let Ok(extraction) =
-            intents::extract_intents_with_stats_for_projects(&config, &effective_projects)
-        {
+        if let Ok(extraction) = intents::extract_intents_with_stats_for_projects_filtered(
+            &config,
+            &effective_projects,
+            &source_filter,
+        ) {
             let mut records = extraction.records;
             // Apply filtering identical to run_intents
             if let Some(agent_filter) = &filters.agent {
                 let want = aicx::search_engine::canonical_agent_slug(agent_filter);
                 records.retain(|r| r.agent == want);
             }
-            let (lo, hi) = if let Some(ref d) = filters.since {
-                (
-                    parse_date_filter(d).ok().and_then(|b| b.0),
-                    parse_date_filter(d).ok().and_then(|b| b.1),
-                )
-            } else {
-                (None, filters.until.clone())
-            };
+            let (lo, hi) = (&date_lo, &date_hi);
             if lo.is_some() || hi.is_some() {
                 records.retain(|r| {
                     lo.as_ref().is_none_or(|lo| r.date.as_str() >= lo.as_str())
@@ -5988,10 +6150,10 @@ fn conversation_batch_output_path(out_dir: &Path, agent_label: &str, session_id:
     ))
 }
 
-fn run_conversations_batch(options: ConversationsBatchOptions) -> Result<()> {
-    if options.agent != "claude" {
-        anyhow::bail!("conversations v1 supports --agent claude only");
-    }
+fn run_conversations_batch(mut options: ConversationsBatchOptions) -> Result<()> {
+    let agent = aicx::session_catalog::AgentKind::parse(&options.agent)
+        .ok_or_else(|| anyhow::anyhow!("unsupported conversations agent `{}`", options.agent))?;
+    options.agent = agent.as_str().to_owned();
 
     let cutoff = lookback_cutoff(options.hours);
     let config = ExtractionConfig {
@@ -6001,8 +6163,8 @@ fn run_conversations_batch(options: ConversationsBatchOptions) -> Result<()> {
         watermark: None,
     };
 
-    let batch = sources::extract_agent_sessions(aicx::session_catalog::AgentKind::Claude, &config)?;
-    emit_session_batch_summary("claude", &batch);
+    let batch = sources::extract_agent_sessions(agent, &config)?;
+    emit_session_batch_summary(agent.as_str(), &batch);
     // Unified all-skipped contract (O4): every batch surface exits 3 when
     // every selected session was skipped by diagnostics, with the same
     // condition as `run_extraction` (`skipped == selected`;
@@ -6115,9 +6277,7 @@ fn conversations_discovery_by_kind(entries: &[timeline::TimelineEntry]) -> BTree
 
 /// Agent histogram across the extracted timeline entries.
 ///
-/// In conversations v1 the agent is always `"claude"` (the only
-/// supported source), but the field is emitted for forward-compat with
-/// future multi-agent exports.
+/// The histogram follows each entry's canonical provider.
 fn conversations_discovery_by_agent(
     entries: &[timeline::TimelineEntry],
 ) -> BTreeMap<String, usize> {
@@ -6680,6 +6840,7 @@ const fn bulk_agent_to_parser_agent(
         aicx::session_catalog::AgentKind::Junie => aicx::parser::engine::AgentKind::Junie,
         aicx::session_catalog::AgentKind::Kimi => aicx::parser::engine::AgentKind::Kimi,
         aicx::session_catalog::AgentKind::Cursor => aicx::parser::engine::AgentKind::Cursor,
+        aicx::session_catalog::AgentKind::Copilot => aicx::parser::engine::AgentKind::Copilot,
     }
 }
 
@@ -6692,6 +6853,7 @@ const fn bulk_agent_to_extract_agent(agent: aicx::session_catalog::AgentKind) ->
         aicx::session_catalog::AgentKind::Junie => ExtractAgent::Junie,
         aicx::session_catalog::AgentKind::Kimi => ExtractAgent::Kimi,
         aicx::session_catalog::AgentKind::Cursor => ExtractAgent::Cursor,
+        aicx::session_catalog::AgentKind::Copilot => ExtractAgent::Copilot,
     }
 }
 
@@ -6713,7 +6875,7 @@ fn resolve_bulk_agents(
             return Err(aicx::cli::failure::StructuredFailure::new(
                 "unknown_provider",
                 format!("`{token}` is not a supported provider"),
-                "pass one of: claude, codex, gemini, grok, junie, kimi",
+                "pass one of: claude, codex, cursor, gemini, grok, junie, kimi, copilot",
             ));
         };
         let agent = agent.catalog_kind();
@@ -6785,10 +6947,14 @@ fn extract_one_source_for_bulk(
 
     let provider = agent.to_string();
     let parser_version = parser_version_for(agent).to_owned();
-    let source_fingerprint = bulk::source_fingerprint(
+    let mut source_fingerprint = bulk::source_fingerprint(
         source.fingerprint.len,
         source.fingerprint.modified_unix_nanos,
     );
+    if let Some(bundle) = &source.fingerprint.bundle_fingerprint {
+        source_fingerprint.push('b');
+        source_fingerprint.push_str(bundle);
+    }
     let row = |outcome: SourceOutcome| ManifestEntry {
         provider: provider.clone(),
         source_id: source.source_id.clone(),
@@ -7443,6 +7609,9 @@ fn run_extract_session(
         Ok(resolved) => resolved,
         Err(error) => emit_catalog_failure(agent, error),
     };
+    if let Some(notice) = &resolved.substitution_notice {
+        eprintln!("{notice}");
+    }
     // Locate-before-parse proof surface (instrumented CLI contract): the
     // catalog inspected bounded headers only, and exactly one source moves on
     // to the single parse pass below.
@@ -7891,6 +8060,7 @@ const ALL_WATERMARK_AGENTS: &[&str] = &[
     "grok",
     "kimi",
     "cursor",
+    "copilot",
     "codescribe",
 ];
 
@@ -7899,6 +8069,8 @@ const ALL_WATERMARK_AGENTS: &[&str] = &[
 /// watermark through [`extraction_source_key_aliases`] instead of rescanning
 /// every incumbent provider from scratch.
 const KIMI_ALL_WATERMARK_KEY: &str = "claude+codescribe+codex+gemini+grok+junie+kimi";
+/// Incumbent composition before Copilot joined. Its watermark never covers Copilot.
+const CURSOR_ALL_WATERMARK_KEY: &str = "claude+codescribe+codex+cursor+gemini+grok+junie+kimi";
 
 fn normalized_source_key_parts<'a>(parts: impl IntoIterator<Item = &'a str>) -> Vec<String> {
     let mut normalized = parts
@@ -7945,6 +8117,7 @@ fn extraction_source_key_aliases(agents: &[&str], project: &[String]) -> Vec<Str
         // watermark covers only the agents named in the recording key —
         // `watermark_covered_agents` exempts the newcomer, or its whole
         // pre-upgrade history would be skipped as if already ingested.
+        aliases.push(format!("{CURSOR_ALL_WATERMARK_KEY}:{project_key}"));
         aliases.push(format!("{KIMI_ALL_WATERMARK_KEY}:{project_key}"));
         aliases.push(format!("{LEGACY_ALL_WATERMARK_KEY}:{project_key}"));
         aliases.push(format!(
@@ -8370,10 +8543,19 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
         // run silently skips the agent's whole pre-upgrade history (kimi
         // lanes on the first kimi-aware `all` run).
         let uncovered_config;
-        let agent_config = if watermark.is_some() && !watermark_covered.contains(agent) {
-            eprintln!(
-                "  [{agent}] no extraction watermark covers this agent yet; scanning the full window"
-            );
+        let agent_config = if watermark.is_some()
+            && (!watermark_covered.contains(agent) || agent == "copilot")
+        {
+            if agent == "copilot" {
+                // Native events can append with the same timestamp. The
+                // existing content dedup below owns incremental admission;
+                // a global wall-clock watermark cannot prove source position.
+                eprintln!("  [copilot] scanning the full window for append-safe content dedup");
+            } else {
+                eprintln!(
+                    "  [{agent}] no extraction watermark covers this agent yet; scanning the full window"
+                );
+            }
             uncovered_config = ExtractionConfig {
                 watermark: None,
                 ..config.clone()
@@ -8401,6 +8583,10 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
             ),
             "kimi" => sources::extract_agent_sessions(
                 aicx::session_catalog::AgentKind::Kimi,
+                agent_config,
+            ),
+            "copilot" => sources::extract_agent_sessions(
+                aicx::session_catalog::AgentKind::Copilot,
                 agent_config,
             ),
             "cursor" => sources::extract_agent_sessions(

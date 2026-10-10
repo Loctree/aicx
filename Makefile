@@ -12,7 +12,7 @@ ifeq (,$(shell command -v cargo 2>/dev/null))
 endif
 
 .PHONY: all build build-native completions release-binaries install install-npm npm-install install-bin install-config install-cargo git-hooks install-schedule uninstall-schedule install-service uninstall-service
-.PHONY: precheck precheck-native loctree-consumer-check test test-native check fmt fmt-check clippy clippy-native semgrep ci clean help manifest-check
+.PHONY: hooks-test precheck precheck-native loctree-consumer-check test test-native check fmt fmt-check clippy clippy-native semgrep ci clean help manifest-check
 .PHONY: embeddings-check embeddings-test embeddings-clippy embeddings-hydrate embeddings-info
 .PHONY: version version-show version-check version-check-selftest version-bump version-patch bump-patch changelog-close release-notes release-plan release-prepare release-check release-tag release-push package-check release-bundle release-bundle-only-binaries test-e2e
 .PHONY: publish-crates publish-crates-dry
@@ -86,7 +86,11 @@ release-binaries:
 				echo "MACOS_DEVELOPER_ID_APPLICATION is required for CODESIGN=1" >&2; \
 				exit 1; \
 			else \
-				echo "  codesign skipped (set CODESIGN=1 and MACOS_DEVELOPER_ID_APPLICATION for release)"; \
+				for bin in $(RELEASE_BINARIES); do \
+					codesign --force --sign - "$(STAGING_DIR)/bin/$$bin"; \
+					codesign --verify --verbose=2 "$(STAGING_DIR)/bin/$$bin" >/dev/null; \
+					printf '  ad-hoc codesigned %s\n' "$$bin"; \
+				done; \
 			fi ;; \
 	esac
 	@$(PYTHON) -c 'import json, pathlib, sys; staging=pathlib.Path(sys.argv[1]); version=sys.argv[2]; commit=sys.argv[3]; data={"source":"loctree-aicx","commit":commit,"components":[{"name":"aicx","version":version,"source":"loctree-aicx"},{"name":"aicx-mcp","version":version,"source":"loctree-aicx"}]}; path=staging/"components"/"loctree-aicx.json"; path.write_text(json.dumps(data, indent=2)+"\n", encoding="utf-8"); print(f"  metadata -> {path}")' "$(STAGING_DIR)" "$(VERSION)" "$$(git rev-parse --short=12 HEAD)"
@@ -143,7 +147,10 @@ install-cargo:
 git-hooks:
 	@echo "Installing git hooks..."
 	@bash ./tools/install-githooks.sh
-	@echo "✓ pre-commit + pre-push hooks installed"
+	@echo "✓ pre-commit + pre-push + commit provenance hooks installed"
+
+hooks-test:
+	@bash ./tools/githooks/commit-msg-selftest.sh
 
 precheck:
 	cargo check --locked -p aicx --all-targets
@@ -201,6 +208,8 @@ test-retrieval-eval-rebaseline:
 
 check:
 	@echo "=== AICX Quality Gate ==="
+	@echo "[hooks] commit provenance selftest..."
+	@$(MAKE) hooks-test
 	@echo "[1/11] Checking manifest portability..."
 	@$(MAKE) manifest-check
 	@echo "[2/11] Checking formatting..."
@@ -471,7 +480,8 @@ help:
 	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'uninstall-service' '- Stop & remove the reader-only AICX Streamable HTTP service'
 	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'install-schedule' '- Install the separate index-maintenance schedule (HTTP service is reader-only)'
 	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'uninstall-schedule' '- Remove the separate index-maintenance schedule'
-	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'git-hooks' '- Install repo-local pre-commit + pre-push hooks'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'git-hooks' '- Install pre-commit, pre-push, and commit provenance hooks'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'hooks-test' '- Self-test commit provenance and the pre-push baseline'
 	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'precheck' '- Quick default cargo check'
 	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'precheck-native' 'Quick native GGUF cargo check'
 	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'manifest-check' '- Fail if Cargo.toml uses local path dependencies'

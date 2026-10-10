@@ -718,12 +718,59 @@ fn publish_hybrid_generation(hybrid_root: &Path, generation_dir: &Path) -> Resul
     Ok(())
 }
 
+fn generation_has_dense(dir: &Path) -> bool {
+    let Ok(manifest) = aicx_retrieve::Manifest::read_from_path(&dir.join("manifest.json")) else {
+        return false;
+    };
+    manifest.open_dense_payload(dir).is_ok()
+}
+
+/// Carry a validated dense mmap into a lexical generation of the same corpus.
+/// Retention separately protects the last usable dense generation when the
+/// corpus changes and CURRENT must truthfully become lexical-only.
+fn carry_forward_dense_artifacts(
+    previous_dir: &Path,
+    dest_dir: &Path,
+    manifest: &mut aicx_retrieve::Manifest,
+) {
+    if previous_dir == dest_dir || !generation_has_dense(previous_dir) {
+        return;
+    }
+    let Ok(previous) = aicx_retrieve::Manifest::read_from_path(&previous_dir.join("manifest.json"))
+    else {
+        return;
+    };
+    // Retention protects the old dense generation independently. Only carry
+    // it into CURRENT when its corpus binding matches the new lexical build.
+    if previous.source_hash_blake3 != manifest.source_hash_blake3
+        || previous.source_chunk_count != manifest.source_chunk_count
+        || previous.lexical_doc_count != manifest.lexical_doc_count
+        || previous.open_dense_payload(previous_dir).is_err()
+    {
+        return;
+    }
+    let src = previous_dir.join(aicx_retrieve::MMAP_DENSE_PAYLOAD_FILE_NAME);
+    let dst = dest_dir.join(aicx_retrieve::MMAP_DENSE_PAYLOAD_FILE_NAME);
+    if std::fs::copy(&src, &dst).is_err() {
+        return;
+    }
+    manifest.dense_count = previous.dense_count;
+    manifest.dense_kind = previous.dense_kind;
+    manifest.embedder_model = previous.embedder_model;
+    manifest.embedder_url_hash = previous.embedder_url_hash;
+    manifest.embedder_dim = previous.embedder_dim;
+    manifest.embedder_distance = previous.embedder_distance;
+}
+
 /// Delete superseded *complete* generation directories after a CURRENT flip.
 ///
 /// Keep the live pointer and the previous pointer ([`HYBRID_GENERATION_RETAIN`]
 /// = those two). Directories without `manifest.json` are interrupted builds
 /// and stay quarantined — they must not steal the rollback slot by name sort.
-fn prune_unreferenced_hybrid_generations(
+///
+/// If that retain set has no dense mmap, also keep the newest complete
+/// generation that still has dense, even when that exceeds the usual cap.
+pub(crate) fn prune_unreferenced_hybrid_generations(
     hybrid_root: &Path,
     keep_name: &str,
     previous_name: Option<&str>,
@@ -736,13 +783,7 @@ fn prune_unreferenced_hybrid_generations(
             return Err(err).context(format!("read generations dir: {}", gens.display()));
         }
     };
-    let mut retain: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    retain.insert(keep_name.to_string());
-    if let Some(previous_name) = previous_name
-        && retain.len() < HYBRID_GENERATION_RETAIN
-    {
-        retain.insert(previous_name.to_string());
-    }
+    let mut complete: Vec<(String, PathBuf)> = Vec::new();
     for entry in read_dir {
         let entry = entry.with_context(|| format!("read generations entry: {}", gens.display()))?;
         if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
@@ -752,11 +793,35 @@ fn prune_unreferenced_hybrid_generations(
         let Some(name) = name.to_str() else {
             continue;
         };
-        if !is_valid_generation_dir_name(name) || retain.contains(name) {
+        if !is_valid_generation_dir_name(name) {
             continue;
         }
         let path = gens.join(name);
         if !path.join("manifest.json").is_file() {
+            continue;
+        }
+        complete.push((name.to_string(), path));
+    }
+    let mut retain: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    retain.insert(keep_name.to_string());
+    if let Some(previous_name) = previous_name
+        && retain.len() < HYBRID_GENERATION_RETAIN
+    {
+        retain.insert(previous_name.to_string());
+    }
+    let retained_has_dense = retain
+        .iter()
+        .any(|name| generation_has_dense(&gens.join(name)));
+    if !retained_has_dense
+        && let Some((name, _)) = complete
+            .iter()
+            .filter(|(_, path)| generation_has_dense(path))
+            .max_by(|a, b| a.0.cmp(&b.0))
+    {
+        retain.insert(name.clone());
+    }
+    for (name, path) in complete {
+        if retain.contains(&name) {
             continue;
         }
         let validated = crate::sanitize::validate_dir_path(&path)
@@ -769,8 +834,8 @@ fn prune_unreferenced_hybrid_generations(
 
 /// Whether CURRENT already represents the same catalog/source fingerprint.
 ///
-/// Only lexical-only source generations qualify. Legacy store/NDJSON
-/// generations are never mistaken for a source-driven no-op.
+/// A matching source hash plus a readable current lexical schema is enough.
+/// Carried dense from a previous generation does not force a republish.
 pub fn source_lexical_generation_matches(source_fingerprint: &str) -> Result<bool> {
     use aicx_retrieve::LexicalIndex;
 
@@ -782,9 +847,7 @@ pub fn source_lexical_generation_matches(source_fingerprint: &str) -> Result<boo
         Ok(manifest) => manifest,
         Err(_) => return Ok(false),
     };
-    if manifest.dense_kind != "optional_not_built"
-        || manifest.source_hash_blake3 != aicx_retrieve::source_hash_blake3(source_fingerprint)
-    {
+    if manifest.source_hash_blake3 != aicx_retrieve::source_hash_blake3(source_fingerprint) {
         return Ok(false);
     }
 
@@ -827,8 +890,8 @@ pub fn current_lexical_doc_count() -> Result<Option<usize>> {
 
 /// Publish one lexical-only CURRENT generation directly from source extracts.
 ///
-/// Dense vectors are intentionally absent: `aicx search` stays lexical-first
-/// and `--deep` fails honestly until `aicx index --semantic` materializes dense.
+/// Matching validated dense vectors are carried forward. Otherwise `--deep`
+/// fails honestly until `aicx index --semantic` materializes the new corpus.
 /// No embeddings NDJSON or brute-force twin is emitted.
 pub fn publish_source_lexical_generation(
     chunks: &[aicx_retrieve::ChunkRef],
@@ -840,6 +903,7 @@ pub fn publish_source_lexical_generation(
         anyhow::bail!("cannot publish an empty source lexical generation");
     }
     let hybrid_root = hybrid_root_dir(None)?;
+    let previous_dir = resolve_hybrid_generation_dir(&hybrid_root);
     let generation_dir = hybrid_root
         .join(HYBRID_GENERATIONS_DIR_NAME)
         .join(generation_dir_name(&Manifest::fresh_generation_id()));
@@ -850,7 +914,7 @@ pub fn publish_source_lexical_generation(
     let mut lexical = TantivyAdapter::new(generation_dir.clone())?;
     let commit = lexical.build(chunks)?;
     let completed = Manifest::now_utc();
-    let manifest = Manifest {
+    let mut manifest = Manifest {
         schema_version: "2.0".to_string(),
         generation_id: Manifest::fresh_generation_id(),
         writer_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -874,6 +938,7 @@ pub fn publish_source_lexical_generation(
         fusion_algorithm: "rrf".to_string(),
         fusion_k: aicx_retrieve::RRF_K_DEFAULT,
     };
+    carry_forward_dense_artifacts(&previous_dir, &generation_dir, &mut manifest);
     manifest.write_to_path(&generation_dir.join("manifest.json"))?;
     publish_hybrid_generation(&hybrid_root, &generation_dir)?;
     Ok(manifest)
@@ -946,7 +1011,7 @@ pub fn publish_source_hybrid_generation(
     Ok(manifest)
 }
 
-/// True when CURRENT is lexical-only (`optional_not_built`) or missing dense mmap.
+/// True when CURRENT has no dense payload valid for its manifest.
 pub fn current_dense_not_built() -> Result<bool> {
     let path = hybrid_manifest_path(None)?;
     if !path.is_file() {
@@ -962,9 +1027,7 @@ pub fn current_dense_not_built() -> Result<bool> {
     let Some(generation_dir) = path.parent() else {
         return Ok(true);
     };
-    Ok(!generation_dir
-        .join(aicx_retrieve::MMAP_DENSE_PAYLOAD_FILE_NAME)
-        .is_file())
+    Ok(manifest.open_dense_payload(generation_dir).is_err())
 }
 
 pub fn hybrid_manifest_path(project: Option<&str>) -> Result<PathBuf> {
@@ -1601,6 +1664,14 @@ pub fn write_index_with_options(
                 total_items,
             );
         }
+        // Checkpoint durability: the `.tmp` resume file is only worth what
+        // reached disk. Without this, rows sit in the BufWriter until the
+        // final flush and a killed multi-hour build resumes from whatever
+        // happened to spill out of the buffer. One flush per embed batch
+        // makes "resume from the last completed batch" a contract.
+        writer
+            .flush()
+            .with_context(|| format!("checkpoint tmp index: {}", tmp_path.display()))?;
     }
 
     // Emit completion only after the final atomic commit lands on disk so the
@@ -2180,7 +2251,7 @@ fn has_existing_hybrid_artifacts(project: Option<&str>) -> bool {
 /// `false` — which forces [`should_skip_hybrid_rebuild`] to rebuild rather
 /// than skip, so search never serves a stale-model hybrid.
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
-fn hybrid_manifest_matches_embedder(
+pub(crate) fn hybrid_manifest_matches_embedder(
     project: Option<&str>,
     info: &crate::embedder::EmbeddingModelInfo,
 ) -> bool {
@@ -2192,7 +2263,11 @@ fn hybrid_manifest_matches_embedder(
     }
     match aicx_retrieve::Manifest::read_from_path(&manifest_path) {
         Ok(manifest) => {
-            manifest.embedder_dim == info.dimension && manifest.embedder_model == info.model_id
+            let expected = hybrid_embedder_fingerprint(info);
+            manifest.embedder_dim == expected.dim
+                && manifest.embedder_model == expected.model
+                && manifest.embedder_url_hash == expected.url_hash
+                && manifest.embedder_distance == expected.distance
         }
         Err(_) => false,
     }
@@ -3353,6 +3428,268 @@ mod source_hybrid_publish_tests {
         assert!(!current_dense_not_built().unwrap());
 
         drop(_home);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn sample_chunk(id: &str, text: &str) -> ChunkRef {
+        ChunkRef {
+            id: id.into(),
+            source_path: format!("/tmp/{id}.jsonl"),
+            text: text.into(),
+            metadata: serde_json::json!({"agent": "claude", "project": "Loctree/aicx"}),
+        }
+    }
+
+    fn remaining_dense_generations(hybrid_root: &std::path::Path) -> Vec<String> {
+        let gens = hybrid_root.join("generations");
+        let mut names = Vec::new();
+        let Ok(read_dir) = std::fs::read_dir(&gens) else {
+            return names;
+        };
+        for entry in read_dir.flatten() {
+            if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let path = entry.path();
+            if super::generation_has_dense(&path) {
+                names.push(entry.file_name().to_string_lossy().into_owned());
+            }
+        }
+        names
+    }
+
+    #[test]
+    fn lexical_publish_only_carries_matching_dense_and_retains_old_generation() {
+        let root = std::env::temp_dir().join(format!(
+            "aicx-lexical-keep-dense-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("indexed").join("_all").join("hybrid")).unwrap();
+        let _home = super::iter3_tests::ScopedAicxHome::set(&root);
+
+        let chunk = sample_chunk("claude:sess-keep-dense", "hello hybrid then lexical");
+        let dense = DenseChunkRef {
+            chunk: chunk.clone(),
+            embedding: vec![0.1, 0.2, 0.3, 0.4],
+        };
+        let fp = EmbedderFingerprint::new("test-model", "http://test/embed", 4, "cosine");
+        publish_source_hybrid_generation(
+            std::slice::from_ref(&chunk),
+            &[dense],
+            "fp-keep-dense-0",
+            &fp,
+        )
+        .unwrap();
+
+        let lexical =
+            publish_source_lexical_generation(std::slice::from_ref(&chunk), "fp-keep-dense-0")
+                .expect("lexical publish after dense");
+        assert!(
+            lexical.dense_count > 0,
+            "lexical publish must not drop dense_count to 0 when the previous CURRENT had dense; got dense_count={} dense_kind={}",
+            lexical.dense_count,
+            lexical.dense_kind
+        );
+        assert_ne!(lexical.dense_kind, "optional_not_built");
+        let current = hybrid_index_dir(None).unwrap();
+        lexical
+            .open_dense_payload(&current)
+            .expect("same-corpus carry must remain queryable");
+        assert!(
+            current
+                .join(aicx_retrieve::MMAP_DENSE_PAYLOAD_FILE_NAME)
+                .is_file(),
+            "carried dense mmap must live in the published generation"
+        );
+
+        for i in 2..=5 {
+            let published = publish_source_lexical_generation(
+                std::slice::from_ref(&chunk),
+                &format!("fp-keep-dense-{i}"),
+            )
+            .unwrap();
+            assert!(
+                published.dense_count == 0,
+                "changed corpus {i} must not claim old dense is current"
+            );
+            assert!(current_dense_not_built().unwrap());
+        }
+
+        let hybrid_root = hybrid_root_dir(None).unwrap();
+        let dense_left = remaining_dense_generations(&hybrid_root);
+        assert!(
+            !dense_left.is_empty(),
+            "retention must not delete the last generation that still has dense"
+        );
+        let current_manifest = aicx_retrieve::Manifest::read_from_path(
+            &hybrid_index_dir(None).unwrap().join("manifest.json"),
+        )
+        .unwrap();
+        assert!(
+            current_manifest.dense_count == 0,
+            "CURRENT after source drift must report dense as absent"
+        );
+
+        drop(_home);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn corrupt_dense_payload_is_not_current_or_carried_forward() {
+        let root = std::env::temp_dir().join(format!(
+            "aicx-corrupt-dense-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let _home = super::iter3_tests::ScopedAicxHome::set(&root);
+        let chunk = sample_chunk("claude:corrupt", "valid lexical source");
+        let dense = DenseChunkRef {
+            chunk: chunk.clone(),
+            embedding: vec![1.0, 0.0],
+        };
+        let fp = EmbedderFingerprint::new("test", "http://test/embed", 2, "cosine");
+        publish_source_hybrid_generation(std::slice::from_ref(&chunk), &[dense], "corpus", &fp)
+            .unwrap();
+        let current = hybrid_index_dir(None).unwrap();
+        let mut manifest =
+            aicx_retrieve::Manifest::read_from_path(&current.join("manifest.json")).unwrap();
+        manifest.source_hash_blake3 = "ab".repeat(32);
+        manifest
+            .write_to_path(&current.join("manifest.json"))
+            .unwrap();
+        assert!(
+            current_dense_not_built().unwrap(),
+            "file presence cannot mask a header/hash mismatch"
+        );
+        let next =
+            publish_source_lexical_generation(std::slice::from_ref(&chunk), "corpus").unwrap();
+        assert_eq!(next.dense_count, 0);
+        assert!(current_dense_not_built().unwrap());
+        drop(_home);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn write_stub_generation(hybrid_root: &std::path::Path, name: &str, dense: bool) {
+        use aicx_retrieve::Manifest;
+        let dir = hybrid_root.join("generations").join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let manifest = Manifest {
+            schema_version: "2.0".to_string(),
+            generation_id: name.to_string(),
+            writer_version: env!("CARGO_PKG_VERSION").to_string(),
+            build_id: "test".to_string(),
+            source_chunk_count: 1,
+            source_hash_blake3: "ab".repeat(32),
+            embedder_model: if dense {
+                "test-model".to_string()
+            } else {
+                "optional".to_string()
+            },
+            embedder_url_hash: if dense {
+                "hash".to_string()
+            } else {
+                "not_built".to_string()
+            },
+            embedder_dim: if dense { 4 } else { 0 },
+            embedder_distance: "cosine".to_string(),
+            dense_count: usize::from(dense),
+            dense_kind: if dense {
+                MMAP_DENSE_KIND.to_string()
+            } else {
+                "optional_not_built".to_string()
+            },
+            lexical_commit_id: aicx_retrieve::TANTIVY_SCHEMA_VERSION.to_string(),
+            lexical_doc_count: 1,
+            build_started_at: Manifest::now_utc(),
+            build_completed_at: Manifest::now_utc(),
+            build_wall_seconds: 1,
+            fusion_algorithm: "rrf".to_string(),
+            fusion_k: aicx_retrieve::RRF_K_DEFAULT,
+        };
+        manifest.write_to_path(&dir.join("manifest.json")).unwrap();
+        if dense {
+            use aicx_retrieve::{DenseChunkRef, DenseIndex, Distance, MmapDenseAdapter};
+            let mut index = MmapDenseAdapter::create(
+                dir.join(aicx_retrieve::MMAP_DENSE_PAYLOAD_FILE_NAME),
+                4,
+                Distance::Cosine,
+                [0xab; 32],
+            );
+            index
+                .build(&[DenseChunkRef {
+                    chunk: sample_chunk(name, "retention fixture"),
+                    embedding: vec![1.0, 0.0, 0.0, 0.0],
+                }])
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn retention_keeps_last_dense_generation_beyond_the_usual_cap() {
+        let root = std::env::temp_dir().join(format!(
+            "aicx-retain-last-dense-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let hybrid_root = root.join("hybrid");
+        std::fs::create_dir_all(hybrid_root.join("generations")).unwrap();
+
+        write_stub_generation(&hybrid_root, "g-2026-01-01T00-00-00Z-dense1", true);
+        write_stub_generation(&hybrid_root, "g-2026-01-02T00-00-00Z-lex1", false);
+        write_stub_generation(&hybrid_root, "g-2026-01-03T00-00-00Z-lex2", false);
+        write_stub_generation(&hybrid_root, "g-2026-01-04T00-00-00Z-lex3", false);
+
+        prune_unreferenced_hybrid_generations(
+            &hybrid_root,
+            "g-2026-01-04T00-00-00Z-lex3",
+            Some("g-2026-01-03T00-00-00Z-lex2"),
+        )
+        .unwrap();
+
+        let gens = hybrid_root.join("generations");
+        assert!(
+            gens.join("g-2026-01-01T00-00-00Z-dense1").is_dir(),
+            "the last dense generation must survive retention even when CURRENT is lexical-only"
+        );
+        assert!(
+            !gens.join("g-2026-01-02T00-00-00Z-lex1").exists(),
+            "ordinary lexical generations beyond the cap may still be deleted"
+        );
+        assert!(gens.join("g-2026-01-03T00-00-00Z-lex2").is_dir());
+        assert!(gens.join("g-2026-01-04T00-00-00Z-lex3").is_dir());
+
+        let corrupt = "g-2026-01-05T00-00-00Z-corrupt";
+        write_stub_generation(&hybrid_root, corrupt, true);
+        std::fs::write(
+            gens.join(corrupt)
+                .join(aicx_retrieve::MMAP_DENSE_PAYLOAD_FILE_NAME),
+            b"truncated",
+        )
+        .unwrap();
+        prune_unreferenced_hybrid_generations(
+            &hybrid_root,
+            corrupt,
+            Some("g-2026-01-04T00-00-00Z-lex3"),
+        )
+        .unwrap();
+        assert!(
+            gens.join("g-2026-01-01T00-00-00Z-dense1").is_dir(),
+            "a corrupt current payload must not displace the last usable dense generation"
+        );
+
         let _ = std::fs::remove_dir_all(&root);
     }
 }

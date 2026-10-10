@@ -277,6 +277,7 @@ fn seed_codex_session_with_catalog_identity(
         source_path: history.display().to_string(),
         source_len: Some(source_len).filter(|&n| n > 0),
         source_mtime_ns: Some(source_mtime_ns).filter(|&n| n > 0),
+        source_bundle_fingerprint: None,
         title: Some(format!("historical identity marker {marker}")),
         machine: Some("strict-filter-fixture".to_string()),
         logical_session_id: None,

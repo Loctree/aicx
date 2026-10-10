@@ -785,7 +785,7 @@ pub struct SteerParams {
     pub run_id: Option<String>,
     /// Filter by prompt_id (exact match against sidecar metadata)
     pub prompt_id: Option<String>,
-    /// Filter by agent name: claude, codex, cursor, gemini, junie, kimi, grok (case-insensitive)
+    /// Filter by agent name: claude, codex, cursor, gemini, junie, kimi, grok, copilot (case-insensitive)
     pub agent: Option<String>,
     /// Filter by kind: conversations, plans, reports, other
     pub kind: Option<String>,
@@ -859,12 +859,16 @@ pub struct IntentsParams {
     /// Collapse multiple intents from the same session into one entry with count
     #[serde(default)]
     pub collapse_session: bool,
-    /// Optional agent filter (claude, codex, cursor, gemini, junie, kimi, grok)
+    /// Optional agent filter (claude, codex, cursor, gemini, junie, kimi, grok, copilot)
     pub agent: Option<String>,
     /// Optional lower date bound (YYYY-MM-DD or single-day shorthand like 2026-04-23..)
     pub since: Option<String>,
     /// Optional upper date bound (YYYY-MM-DD)
     pub until: Option<String>,
+    /// Parse every selected catalog source instead of deferring legacy scope
+    /// holes. Expensive; parser safety bounds still apply.
+    #[serde(default)]
+    pub full_rescan: bool,
     /// Sort order: newest (default), oldest
     pub sort: Option<String>,
     /// Max records to return (default: 20, capped at 500)
@@ -912,7 +916,7 @@ pub struct SessionsParams {
     pub projects: Option<Vec<String>>,
     /// Project identity matching: `exact` (default) or explicit `fuzzy`.
     pub project_match: Option<String>,
-    /// Filter by agent: claude, codex, cursor, gemini, junie, kimi, grok.
+    /// Filter by agent: claude, codex, cursor, gemini, junie, kimi, grok, copilot.
     pub agent: Option<String>,
     /// Hours to look back (default 720 = 30 days, 0 = all time).
     #[serde(default = "mcp_session::default_list_hours")]
@@ -944,6 +948,8 @@ pub struct SessionParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ContinuityParams {
+    /// Inclusive RFC3339 window end; defaults to current UTC time.
+    pub until: Option<String>,
     /// Exact project filter. Required — MCP cannot infer the operator checkout.
     pub project: Option<String>,
     /// Optional additional exact project filters.
@@ -1891,9 +1897,18 @@ impl AicxMcpServer {
             live: IntentsConfig::auto_live(params.hours),
         };
 
-        let extraction =
-            intents::extract_intents_with_stats_for_projects(&config, &effective_projects)
-                .map_err(|e| McpError::internal_error(format!("Extract intents: {e}"), None))?;
+        let source_filter = intents::IntentSourceFilter {
+            agent: params.agent.clone(),
+            date_lo: params.since.clone(),
+            date_hi: params.until.clone(),
+            full_source_scan: params.full_rescan,
+        };
+        let extraction = intents::extract_intents_with_stats_for_projects_filtered(
+            &config,
+            &effective_projects,
+            &source_filter,
+        )
+        .map_err(|e| McpError::internal_error(format!("Extract intents: {e}"), None))?;
         let records = extraction.records;
 
         let limit_capped = params.limit.min(500);
@@ -2070,6 +2085,17 @@ impl AicxMcpServer {
             .map_err(|e| McpError::internal_error(format!("AICX home error: {e}"), None))?;
         let projects = params.projects.unwrap_or_default();
         let payload = mcp_session::continuity_pack(mcp_session::ContinuityRequest {
+            until: params
+                .until
+                .as_deref()
+                .map(|time| {
+                    chrono::DateTime::parse_from_rfc3339(time)
+                        .map(|t| t.with_timezone(&chrono::Utc))
+                })
+                .transpose()
+                .map_err(|_| {
+                    McpError::invalid_params("until must be an RFC3339 timestamp", None)
+                })?,
             aicx_home: &aicx_home,
             project: params.project.as_deref(),
             projects: &projects,
@@ -2253,13 +2279,21 @@ pub async fn run_http_config_with_lifecycle(
         }),
     );
 
-    let app = health_router.merge(auth::require_auth_layer(mcp_router, auth_config));
+    let aicx_home = crate::aicx_home::ensure()?;
+    let app = hybrid_http_app(
+        http_config.clone(),
+        auth_config.clone(),
+        health_router.merge(auth::require_auth_layer(mcp_router, auth_config)),
+        aicx_home,
+    )
+    .await?;
 
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to bind MCP server on {addr}: {e}"))?;
 
-    eprintln!("aicx MCP server running (streamable HTTP)");
+    eprintln!("aicx HTTP service running (dashboard + MCP)");
+    eprintln!("  Dashboard: http://{addr}/");
     eprintln!("  Endpoint: http://{addr}/mcp");
     eprintln!("  Health: http://{addr}/health");
     eprintln!("  Transport: Streamable HTTP (POST + GET /mcp)");
@@ -2289,6 +2323,35 @@ pub async fn run_http_config_with_lifecycle(
     )
     .await
     .map_err(|e| anyhow::anyhow!("MCP HTTP server error: {e}"))
+}
+
+async fn hybrid_http_app(
+    http_config: McpHttpConfig,
+    auth_config: AuthConfig,
+    mcp_app: axum::Router,
+    aicx_home: std::path::PathBuf,
+) -> anyhow::Result<axum::Router> {
+    let (cors, explicit) = crate::dashboard_server::policy_for_hybrid_bind(http_config.host);
+    crate::dashboard_server::validate_dashboard_host_policy(
+        http_config.host,
+        &cors,
+        explicit,
+        &auth_config,
+    )?;
+    let dashboard = crate::dashboard_server::DashboardServerConfig {
+        aicx_home: aicx_home.clone(),
+        scope: crate::dashboard::DashboardScope::default(),
+        title: "AICX".to_string(),
+        preview_chars: 320,
+        artifact_path: aicx_home.join("aicx-dashboard.html"),
+        cors_policy: cors,
+        host: http_config.host,
+        port: http_config.port,
+        auth: auth_config,
+        allow_no_origin: false,
+    };
+    let dashboard = crate::dashboard_server::dashboard_router_deferred(dashboard, false).await?;
+    Ok(dashboard.merge(mcp_app))
 }
 
 fn validate_http_auth_policy(
@@ -2885,6 +2948,7 @@ mod tests {
         // the MCP tool returns so every consumer sees the honesty frame —
         // historical claims at session close, not verified by aicx.
         let records = vec![crate::intents::IntentRecord {
+            provenance: None,
             kind: crate::intents::IntentKind::Intent,
             summary: "expose honesty frame over MCP".to_string(),
             context: None,
@@ -2924,6 +2988,7 @@ mod tests {
             identity_source: crate::intents::PERSISTED_IDENTITY_SOURCE.to_string(),
             path_heuristic_records: 0,
             live_sessions: 0,
+            legacy_scope_unproven: 0,
             mixed_scope_sessions: 0,
             unplaced_frames: 0,
         };
@@ -3238,5 +3303,114 @@ mod tests {
                 "mcp.example.internal".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn hybrid_listener_serves_dashboard_and_keeps_remote_auth() {
+        use tower::ServiceExt;
+
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        rt.block_on(async {
+            let home = std::env::temp_dir().join(format!("aicx-hybrid-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&home);
+            fs::create_dir_all(&home).expect("home");
+            let mcp = axum::Router::new().route("/mcp", axum::routing::get(|| async { "mcp" }));
+            let app = super::hybrid_http_app(
+                McpHttpConfig::localhost(8044),
+                AuthConfig::disabled(),
+                mcp,
+                home.clone(),
+            )
+            .await
+            .expect("loopback hybrid router");
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri("/")
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), axum::http::StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            let html = String::from_utf8(bytes.to_vec()).unwrap();
+            assert!(html.contains("id=\"ctx-onboarding\""));
+            assert!(html.contains(">Save</button>"));
+            assert!(html.contains("Type the phrases you actually use"));
+            assert!(!html.contains("intent_phrases.toml"));
+
+            let mut status_request = axum::http::Request::builder()
+                .uri("/api/status")
+                .body(axum::body::Body::empty())
+                .unwrap();
+            status_request
+                .extensions_mut()
+                .insert(axum::extract::connect_info::ConnectInfo(
+                    std::net::SocketAddr::from(([127, 0, 0, 1], 9)),
+                ));
+            let status = app.oneshot(status_request).await.unwrap();
+            assert_eq!(status.status(), axum::http::StatusCode::OK);
+            let bytes = axum::body::to_bytes(status.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            let status: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(status["scan_status"], "not_scanned");
+            assert_eq!(status["build_count"], 0);
+            assert!(status["stats"].is_null());
+
+            let open_tailnet = super::hybrid_http_app(
+                McpHttpConfig::new("100.82.232.70".parse().unwrap(), 8044),
+                AuthConfig::disabled(),
+                axum::Router::new(),
+                home.clone(),
+            )
+            .await;
+            assert!(
+                open_tailnet.is_err(),
+                "the Tailscale bind must not become an open dashboard"
+            );
+
+            let authed = super::hybrid_http_app(
+                McpHttpConfig::new("100.82.232.70".parse().unwrap(), 8044),
+                AuthConfig {
+                    token: Some("secret".to_string()),
+                    source: AuthSource::Cli,
+                },
+                axum::Router::new().route("/mcp", axum::routing::get(|| async { "mcp" })),
+                home.clone(),
+            )
+            .await
+            .expect("bearer-gated tailscale hybrid router");
+            let mut api_request = axum::http::Request::builder()
+                .uri("/api/status")
+                .body(axum::body::Body::empty())
+                .unwrap();
+            api_request
+                .extensions_mut()
+                .insert(axum::extract::connect_info::ConnectInfo(
+                    std::net::SocketAddr::from(([127, 0, 0, 1], 9)),
+                ));
+            let api = authed.clone().oneshot(api_request).await.unwrap();
+            assert_eq!(
+                api.status(),
+                axum::http::StatusCode::UNAUTHORIZED,
+                "non-loopback /api stays bearer-gated"
+            );
+            let shell = authed
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri("/")
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(shell.status(), axum::http::StatusCode::OK);
+            let _ = fs::remove_dir_all(&home);
+        });
     }
 }

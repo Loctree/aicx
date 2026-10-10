@@ -34,6 +34,25 @@ say()  { printf '==> %s\n' "$*"; }
 warn() { printf 'warn: %s\n' "$*" >&2; }
 die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
 
+# Rust's linker signature (flags=0x20002, adhoc+linker-signed) is what
+# macOS 27 taskgated rejects. codesign --verify can still say "valid on
+# disk" while exec dies with SIGKILL, and that rejection sticks to the
+# vnode. Replace only that signature. A Developer ID signature is left
+# as it was. npm packages stay script-free; this runs at install time
+# in this dev installer, not as a package lifecycle script.
+resign_linker_signed_macho() {
+  local bin="$1"
+  [ "$(uname -s)" = "Darwin" ] || return 0
+  local details
+  details="$(codesign -dvvv "$bin" 2>&1 || true)"
+  case "$details" in
+    *linker-signed*) ;;
+    *) return 0 ;;
+  esac
+  codesign --force --sign - "$bin"
+  codesign --verify --verbose=2 "$bin" >/dev/null
+}
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 WRAPPER_DIR="${WRAPPER_DIR:-$SCRIPT_DIR/loct}"
@@ -149,7 +168,9 @@ for bin in $platform_bins; do
   base="${bin%.exe}"
   src="$NATIVE_BIN_DIR/${base}${exe_suffix}"
   [ -f "$src" ] || die "missing native binary: $src"
-  install -m 0755 "$src" "$work/platform/bin/${base}${exe_suffix}"
+  dest="$work/platform/bin/${base}${exe_suffix}"
+  install -m 0755 "$src" "$dest"
+  resign_linker_signed_macho "$dest"
 done
 
 if [ "${SKIP_BIN_CHECK:-0}" != "1" ]; then

@@ -55,23 +55,61 @@ are two sources, tried in order.
 its resolved identity, so intent extraction reads those documents back instead
 of re-parsing the original transcripts:
 
-1. Opens the published `CURRENT` generation under the active AICX home.
-2. Filters by project on the stored slug, through the same
+1. Opens the published `CURRENT` generation under the active AICX home and
+   joins its session identities with current catalog membership and the existing
+   source-parse ledger.
+2. Filters by project on the catalog slug, through the same
    `project_filter_matches` resolver the rest of the CLI uses.
-3. Filters by the stored canonical date against the requested window.
-4. Reads back the stored body — the extract — plus `agent`, `date`,
-   `session_id` and `cwd` from the document metadata.
-5. Narrows frames to `frame_kind`; default is `user_msg`.
+3. Filters trusted agent metadata before loading unrelated bodies. A stored
+   session date is not used to discard potentially recent utterances.
+4. Reuses an extract only after proving live source identity/fingerprint,
+   ignore policy, checkout layout, and extract checksum. Changed, missing, or
+   unsafe sources are re-sourced through the checked conversation reader.
+   Old ledgers without coverage receipts remain explicitly `legacy_unknown`
+   and cannot produce `complete: true`.
+   Modern reuse also checks physical file identity (inode/change time on Unix,
+   a conservative content fingerprint where those are unavailable), so a
+   same-size edit with restored mtime cannot silently reuse a complete result.
+   Validation retains lightweight handles rather than every extract body;
+   heading-only admission scans compute weight and time, then each selected
+   body is reopened, rechecked and parsed individually in admission order.
+5. Narrows frames to `frame_kind` and the requested utterance-time window before
+   classification and caps; default frame kind is `user_msg`.
 
-Records gathered this way carry `identity_source: index-v1`.
+Records gathered from validated extracts carry `identity_source: index-v1`.
+Stable bounded projections preserve skipped-record and extract-omission
+coverage. Before the global cap, files are ordered by the number of qualifying
+human turns and then by their latest qualifying utterance, including recent
+utterances in old sessions. Utterances outside `--since`/`--until` never add
+weight or recency to that admission order.
 
 ### 2. The catalog census (fallback)
 
 Used when the index cannot answer: no published `CURRENT` on this machine, or
-a hot-window request (`--live`, or a window of 48h or less) where freshly
-written sessions are not committed yet. This path walks the census and parses
-the original transcripts, applying the same project, window and `frame_kind`
-narrowing. Records carry `identity_source: catalog-v1`.
+an individual source has changed, is unadmitted, or lacks a usable reuse proof.
+Live requests (`--live`, or a window of 48h or less) still reuse validated
+unchanged extracts and admit newly written sessions afterward.
+This path walks the census, excludes
+nonmatching agents before scope recovery and source reads, and reuses validated
+whole-conversation source slots under `reader-conversations-v1/`.
+Changed, uncached, or non-cacheable sources are parsed through the original
+reader. Whole-session scope is retained before applying project, utterance-time
+and `frame_kind` narrowing. Records carry `identity_source: catalog-v1`.
+
+The default foreground query does not open a legacy source merely because its
+old extract lacks enough per-frame scope evidence. If a reader-cache entry
+already proves the current source bytes, parser policy and whole-session scope,
+the query reuses those frames and applies the normal role, project and time
+filters. A cold cache emits a `legacy_scope_unproven` source receipt, increments
+`source_errors`, and keeps the answer incomplete. `aicx intents --full-rescan`
+(MCP `full_rescan: true`) is the explicit expensive escape hatch: it bypasses
+CURRENT and reader-cache reuse and parses every selected source under the
+existing parser safety bounds.
+
+The same cache-only rule applies to a session already present in `CURRENT` when
+its parse-ledger row is missing. A session absent from `CURRENT` is new, while a
+row whose recorded source fingerprint changed is changed; those two states
+still use the checked source reader instead of being mislabeled as legacy.
 
 The fallback exists so a machine that never ran `aicx index` still gets a
 timeline rather than a confident empty one.
@@ -80,9 +118,36 @@ Default consequence, on both paths: ordinary `aicx intents -p X` reads
 `user_msg` frames, not agent replies. Agent replies require an explicit
 `--frame-kind`.
 
+### What counts as a `user_msg` frame
+
+- Claude compaction summaries (`isCompactSummary` rows) are not: the compacting
+  model wrote them, so they land on the system lane as `CompactionReplay`
+  context and never become operator intents or decisions.
+- Codescribe bus speech is: the catalog seeds one `codescribe` session per bus
+  ledger and receiving agent session (project and cwd of the receiver). A
+  spoken take is one `user_msg` frame wrapped in `<codescribe>…</codescribe>`,
+  so it carries `voice_transcript` provenance. A typed delivery stays verbatim.
+  The bus records no boundary between what the operator wrote and what they
+  pasted, so an unmarked paste (a PR page, a review) is classified like any
+  typed text; only `>` quotes and fences the operator typed mark a reference.
+  The receiver's own bus replies are `agent_reply` frames.
+- Codescribe dictation is: one session per recorded take in the
+  `local/codescribe-dictation` bucket, its text in the same `<codescribe>`
+  envelope. Formatter rewrites (`_ai`, `_formatted`) and failed takes are
+  never cataloged, numbered or not (`importers::codescribe::catalog_takes`).
+
 Source anchors:
 
-- Chunk collection: `src/intents.rs::collect_chunk_files`
+- `crates/aicx-parser/src/adapters/claude.rs::emit_compaction_summary`
+- `src/importers/codescribe_bus.rs::replay_bus_ledger`
+- `src/catalog.rs::enrich_codescribe_bus`
+- `src/source_index.rs::parse_codescribe_bus_source`
+
+Source anchors:
+
+- Source collection: `src/intents.rs::collect_intent_files`
+- Source predicates: `src/intents/types.rs::IntentSourceFilter`
+- Validated reader reuse: `src/overlay.rs::read_cached_catalog_conversation_at`
 - Default frame kind: `src/intents/types.rs::IntentsConfig::default_frame_kind`
 
 ## Chunk Parsing

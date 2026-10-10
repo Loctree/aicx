@@ -7,6 +7,7 @@ pub mod card_header;
 pub mod chunker;
 pub mod engine;
 pub mod frontmatter;
+pub mod intent_phrases;
 pub mod noise;
 pub mod projections;
 pub mod sanitize;

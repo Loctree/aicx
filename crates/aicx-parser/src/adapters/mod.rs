@@ -2,6 +2,7 @@
 
 pub mod claude;
 pub mod codex;
+pub mod copilot;
 pub mod cursor;
 pub mod gemini;
 pub mod grok;
@@ -10,6 +11,7 @@ pub mod kimi;
 
 pub use claude::ClaudeAdapter;
 pub use codex::CodexAdapter;
+pub use copilot::CopilotAdapter;
 pub use cursor::CursorAdapter;
 pub use gemini::GeminiAdapter;
 pub use grok::GrokAdapter;
@@ -88,6 +90,7 @@ static GROK: GrokAdapter = GrokAdapter;
 static JUNIE: JunieAdapter = JunieAdapter;
 static KIMI: KimiAdapter = KimiAdapter;
 static CURSOR: CursorAdapter = CursorAdapter;
+static COPILOT: CopilotAdapter = CopilotAdapter;
 
 /// Return the one registered parser for an exhaustive [`AgentKind`].
 pub const fn registered_adapter(agent: AgentKind) -> &'static dyn AgentAdapter {
@@ -99,6 +102,7 @@ pub const fn registered_adapter(agent: AgentKind) -> &'static dyn AgentAdapter {
         AgentKind::Junie => &JUNIE,
         AgentKind::Kimi => &KIMI,
         AgentKind::Cursor => &CURSOR,
+        AgentKind::Copilot => &COPILOT,
     }
 }
 
@@ -116,6 +120,7 @@ mod registry_tests {
             AgentKind::Junie,
             AgentKind::Kimi,
             AgentKind::Cursor,
+            AgentKind::Copilot,
         ] {
             let adapter = registered_adapter(agent);
             assert_eq!(adapter.agent(), agent);
