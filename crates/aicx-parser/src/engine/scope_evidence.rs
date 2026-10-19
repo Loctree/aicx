@@ -112,6 +112,12 @@ pub enum WindowScope {
 /// not parse, and there too a path is read only from the argument object's
 /// own `workdir`. In a script, that is a property written directly in the
 /// object an `exec_command` call is passed ([`Site`]).
+///
+/// A patch is not a script ([`is_patch`]). `apply_patch` input is patch
+/// grammar, and the code it adds, removes or quotes as context is file
+/// content no call ran with. Scanned as JavaScript, a context line such as
+/// ` workdir: dir,` of a patched source file read as a property and made the
+/// window opaque. A patch names files, never the directory its call ran in.
 pub fn tool_call_workdirs(payload: &Value) -> Vec<WorkdirEvidence> {
     let mut found: Vec<WorkdirEvidence> = Vec::new();
     let mut push = |evidence: WorkdirEvidence| {
@@ -119,6 +125,8 @@ pub fn tool_call_workdirs(payload: &Value) -> Vec<WorkdirEvidence> {
             found.push(evidence);
         }
     };
+    let patch_call = payload.get("name").and_then(Value::as_str) == Some("apply_patch");
+    let script = |text: &str| !patch_call && !is_patch(text);
     if let Some(arguments) = payload.get("arguments") {
         let parsed = match arguments {
             Value::Object(_) => Some(arguments.clone()),
@@ -148,7 +156,9 @@ pub fn tool_call_workdirs(payload: &Value) -> Vec<WorkdirEvidence> {
             // A JS literal can also arrive as the raw `arguments` string; scan
             // it rather than declaring no evidence because JSON parsing failed.
             None => {
-                if let Value::String(raw) = arguments {
+                if let Value::String(raw) = arguments
+                    && script(raw)
+                {
                     workdirs_in_literal(raw, Site::Arguments)
                         .into_iter()
                         .for_each(&mut push);
@@ -156,12 +166,20 @@ pub fn tool_call_workdirs(payload: &Value) -> Vec<WorkdirEvidence> {
             }
         }
     }
-    if let Some(input) = payload.get("input").and_then(Value::as_str) {
+    if let Some(input) = payload.get("input").and_then(Value::as_str)
+        && script(input)
+    {
         workdirs_in_literal(input, Site::Script)
             .into_iter()
             .for_each(&mut push);
     }
     found
+}
+
+/// Is `text` an `apply_patch` patch? Patch grammar opens with its envelope,
+/// `*** Begin Patch`, which no JavaScript can open with.
+fn is_patch(text: &str) -> bool {
+    text.trim_start().starts_with("*** Begin Patch")
 }
 
 /// Where the scanned text came from, which decides whose `workdir` it is.
@@ -273,12 +291,11 @@ fn workdirs_in_literal(input: &str, site: Site) -> Vec<WorkdirEvidence> {
         keys.sort_by_key(|(key, _)| key.start);
     }
     let mut found = Vec::new();
-    // Lexed on the first readable path only: most inputs never get there.
+    // Lexed once, at the first key: most inputs hold none.
     let mut inert: Option<Vec<std::ops::Range<usize>>> = None;
     let mut calls: Option<ExecArguments> = None;
     for (key, quote) in keys {
         let quoted = quote.is_some();
-        let mut before = &input[..key.start];
         let mut rest = &input[key.end..];
         // `workdirs`, `workdir_hint`, `workdirs`: another identifier that
         // only starts the same way.
@@ -288,14 +305,21 @@ fn workdirs_in_literal(input: &str, site: Site) -> Vec<WorkdirEvidence> {
         {
             continue;
         }
+        let inert = inert.get_or_insert_with(|| inert_spans(input));
+        // Text no call ran with ([`inert_spans`]); its comments are read
+        // apart from code's ([`code_before`]).
+        let in_text = within(inert, key.start);
+        // Where the property starts: at its key, or at the `[` of a computed
+        // one.
+        let mut start = key.start;
         if quoted {
-            match computed_key(before, rest) {
-                Some((open, close)) => (before, rest) = (open, close),
+            match computed_key(input, key.clone(), in_text, inert) {
+                Some((open, close)) => (start, rest) = (open, close),
                 None if quote == Some('`') => continue,
                 None => {}
             }
         }
-        if !opens_property(before) {
+        if !opens_property(input, start, in_text, inert) {
             continue;
         }
         // A block comment that never closes, on either side of the separator,
@@ -341,13 +365,8 @@ fn workdirs_in_literal(input: &str, site: Site) -> Vec<WorkdirEvidence> {
                 if body.is_empty() {
                     continue;
                 }
-                let inert = inert.get_or_insert_with(|| inert_spans(input));
                 let calls = calls.get_or_insert_with(|| exec_arguments(input, inert));
-                // `before` ends where the property starts: at its key, or at
-                // the `[` of a computed one.
-                if !within(inert, key.start)
-                    && call_property(input, site, before.len(), &calls.objects, inert)
-                {
+                if !in_text && call_property(input, site, start, &calls.objects, inert) {
                     found.push(WorkdirEvidence::Explicit(body.to_string()));
                 } else {
                     found.push(WorkdirEvidence::Opaque);
@@ -580,8 +599,22 @@ struct ExecArguments {
 /// `exec_command` is the one tool that takes a `workdir`. Other tools take
 /// variables as a matter of course (`tools.apply_patch(patch)`), and reading
 /// those as unseen directories would unplace ordinary windows.
+///
+/// A call is read in one shape only: `exec_command(`, called directly, with
+/// nothing but whitespace and comments ([`inert_spans`]) before its
+/// parenthesis. Matching the parenthesis as text missed
+/// `exec_command /* note */ (args)` outright, so its dynamic argument was
+/// never unseen. Every other live use of the name runs the tool with
+/// arguments this scan does not read — optional chaining
+/// (`exec_command?.(args)`), `.call`, `.apply` or `.bind`, the tool handed on
+/// as a value (`plan.map(tools.exec_command)`) or renamed
+/// (`{exec_command: run}`) — and is unseen too. Review after review found one
+/// more such spelling beside the last fix; a closed list of readable shapes
+/// is the only list that stays closed. A bare name that only binds itself,
+/// `const {exec_command} = tools`, is no call: its calls are read where they
+/// are written.
 fn exec_arguments(input: &str, inert: &[std::ops::Range<usize>]) -> ExecArguments {
-    static EXEC_CALL_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static EXEC_NAME_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let mut calls = ExecArguments {
         objects: Vec::new(),
         unseen: false,
@@ -589,26 +622,41 @@ fn exec_arguments(input: &str, inert: &[std::ops::Range<usize>]) -> ExecArgument
     if !input.contains("exec_command") {
         return calls;
     }
-    let re = EXEC_CALL_RE.get_or_init(|| {
-        regex::Regex::new(r"(?:^|[^A-Za-z0-9_$])(?P<name>exec_command)\s*\(").expect("valid regex")
+    // The leading class is the identifier boundary the regex crate has no
+    // look-behind for, as in `workdirs_in_literal`.
+    let re = EXEC_NAME_RE.get_or_init(|| {
+        regex::Regex::new(r"(?:^|[^A-Za-z0-9_$])(?P<name>exec_command)").expect("valid regex")
     });
-    for caps in re.captures_iter(input) {
-        let (Some(name), Some(call)) = (caps.name("name"), caps.get(0)) else {
-            continue;
-        };
-        if within(inert, name.start()) {
+    for name in re.captures_iter(input).filter_map(|caps| caps.name("name")) {
+        // `exec_commands`, `exec_command_v2`: another name.
+        if input[name.end()..]
+            .starts_with(|c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '$' | '\\'))
+            || within(inert, name.start())
+        {
             continue;
         }
-        let Some(argument) = skip_comments(&input[call.end()..]) else {
-            // A block comment that never closes hid the argument, and every
-            // call after it.
+        let Some(after_name) = next_code(input, name.end(), inert) else {
+            // A block comment that never closes hid the call, and every call
+            // after it.
             calls.unseen = true;
             break;
         };
+        if !input[after_name..].starts_with('(') {
+            let member = code_before(input, name.start(), false, inert).ends_with('.');
+            let rest = &input[after_name..];
+            if member || rest.starts_with("?.") || rest.starts_with(['.', ':', ')', ']']) {
+                calls.unseen = true;
+            }
+            continue;
+        }
+        let Some(open) = next_code(input, after_name + 1, inert) else {
+            calls.unseen = true;
+            break;
+        };
+        let argument = &input[open..];
         if argument.starts_with([')', '"', '\'', '`']) {
             continue;
         }
-        let open = input.len() - argument.len();
         if !argument.starts_with('{') {
             calls.unseen = true;
             continue;
@@ -876,31 +924,88 @@ fn within(spans: &[std::ops::Range<usize>], at: usize) -> bool {
     before > 0 && at < spans[before - 1].end
 }
 
-/// The text on either side of a quoted key that brackets compute —
-/// `["workdir"]` — with the brackets taken off, or `None` when the key is not
-/// computed. What precedes the `[` then decides, as for any key, whether a
-/// property opens there: `args["workdir"]` reads a member and
+/// Where the computed property around the quoted key at `key` starts — the
+/// `[` of `["workdir"]` — and the text after its `]`, or `None` when the key
+/// is not computed. What precedes the `[` then decides, as for any key,
+/// whether a property opens there: `args["workdir"]` reads a member and
 /// `["workdir", other]` builds an array, and neither names a directory.
-fn computed_key<'a>(before: &'a str, after: &'a str) -> Option<(&'a str, &'a str)> {
-    let open = before.trim_end().strip_suffix('[')?;
-    let close = skip_comments(after)?.strip_prefix(']')?;
+///
+/// Comments may sit on either side of the key inside the brackets, as beside
+/// any token. Taking only whitespace off before the key read
+/// `[/* c */ "workdir"]: dir` as a bare quoted key after `*/`, which opened
+/// no property, while [`plain_property`] skipped the same comment and found
+/// the argument whole: no evidence at all.
+fn computed_key<'a>(
+    input: &'a str,
+    key: std::ops::Range<usize>,
+    in_text: bool,
+    inert: &[std::ops::Range<usize>],
+) -> Option<(usize, &'a str)> {
+    let open = code_before(input, key.start, in_text, inert)
+        .strip_suffix('[')?
+        .len();
+    let close = skip_comments(&input[key.end..])?.strip_prefix(']')?;
     Some((open, close))
 }
 
-/// Does a key that follows `before` open an object property?
+/// Does the property starting at byte `at` open an object property?
 ///
 /// Only right after `{` or `,`, or at the very start of the input (an
-/// `arguments` string may be the object's body alone), with whole comments
-/// between them skipped: `{cmd, /* selected target */ workdir: targetDir}` is
-/// a property, and so is a key on the line after `{cmd, // note`. A comment on
-/// the key's OWN line
-/// that is still open where the key starts contains the key — `// workdir: the
-/// repo` is prose — so a line comment only ever ends a line above the key.
+/// `arguments` string may be the object's body alone), with whitespace and
+/// whole comments between them skipped ([`code_before`]):
+/// `{cmd, /* selected target */ workdir: targetDir}` is a property, and so is
+/// a key on the line after `{cmd, // note`. A line comment on the key's OWN
+/// line contains the key — `// workdir: the repo` is prose.
+fn opens_property(input: &str, at: usize, in_text: bool, inert: &[std::ops::Range<usize>]) -> bool {
+    let before = code_before(input, at, in_text, inert);
+    before.is_empty() || before.ends_with(['{', ','])
+}
+
+/// `input` before byte `at`, less the whitespace and whole comments that end
+/// there: the code a key or a call name follows.
 ///
-/// A line comment is found from the right, and each one stripped leaves the
-/// code before it to decide: `{url: "http://host", // note` ends in `,` once
-/// the comment goes, and the `//` inside the string is never reached.
-fn opens_property(before: &str) -> bool {
+/// The comments are the ones [`inert_spans`] lexed, paired as JavaScript
+/// pairs them — a block comment ends at its first `*/` and never nests, and a
+/// `/*` or `//` inside a string opens nothing — which is also how
+/// [`object_is_whole`] reads the same argument. Pairing a `*/` with the LAST
+/// `/*` before it read `{cmd, /* note /* marker */ workdir: dir}` as a key
+/// after the word `note`: no property, while the object scan found the
+/// argument whole, and the call kept its baseline on no evidence.
+///
+/// `in_text` marks a position the lexer placed inside a string or a comment,
+/// which [`text_before`] reads instead.
+fn code_before<'a>(
+    input: &'a str,
+    at: usize,
+    in_text: bool,
+    inert: &[std::ops::Range<usize>],
+) -> &'a str {
+    if in_text {
+        return text_before(&input[..at]);
+    }
+    let mut end = at;
+    loop {
+        end = input[..end].trim_end().len();
+        // The last span opened before `end`, if the code there ends inside it.
+        let comment = inert[..inert.partition_point(|span| span.start < end)]
+            .last()
+            .filter(|span| end <= span.end && is_comment(&input[(*span).clone()]));
+        match comment {
+            Some(span) => end = span.start,
+            None => return &input[..end],
+        }
+    }
+}
+
+/// [`code_before`] for a key the lexer placed inside text.
+///
+/// There is no code to lex there, and the lexer may have misread the text —
+/// an apostrophe in prose opens a "string" that swallows a real key — so
+/// `before` is read as if it were code: block comments paired from the left,
+/// and a `//` taken for a comment only on a line above the key. A key on the
+/// line of a `//` is inside that comment. Whatever this reading finds is worth
+/// at most an opaque key, never a path ([`workdirs_in_literal`]).
+fn text_before(before: &str) -> &str {
     let mut rest = before;
     // No line break between here and the key yet: a `//` on this line would
     // have commented the key out.
@@ -909,27 +1014,69 @@ fn opens_property(before: &str) -> bool {
         let trimmed = rest.trim_end();
         key_line &= !rest[trimmed.len()..].contains('\n');
         rest = trimmed;
-        if rest.is_empty() || rest.ends_with(['{', ',']) {
-            return true;
-        }
-        if let Some(body) = rest.strip_suffix("*/") {
-            match body.rfind("/*") {
+        if rest.ends_with("*/") {
+            match block_comment_closing_at_end(rest) {
                 Some(open) => {
-                    rest = &body[..open];
+                    rest = &rest[..open];
                     continue;
                 }
-                None => return false,
+                None => return rest,
             }
         }
-        if key_line {
-            return false;
+        if key_line || rest.ends_with(['{', ',', '[']) {
+            return rest;
         }
+        // A line comment is found from the right, and each one stripped
+        // leaves the code before it to decide: `{url: "http://host", // note`
+        // ends in `,` once the comment goes, and the `//` inside the string
+        // is never reached.
         let line_start = rest.rfind('\n').map_or(0, |newline| newline + 1);
         match rest[line_start..].rfind("//") {
             Some(slash) => rest = &rest[..line_start + slash],
-            None => return false,
+            None => return rest,
         }
     }
+}
+
+/// Where the block comment that closes at the very end of `text` opens.
+/// Comments are paired from the left: each runs from its `/*` to the first
+/// `*/` after it.
+fn block_comment_closing_at_end(text: &str) -> Option<usize> {
+    let mut from = 0;
+    while let Some(open) = text[from..].find("/*").map(|at| from + at) {
+        let close = open + 2 + text[open + 2..].find("*/")? + 2;
+        if close == text.len() {
+            return Some(open);
+        }
+        from = close;
+    }
+    None
+}
+
+/// Where the code after byte `at` resumes: whitespace and whole comments
+/// ([`inert_spans`]) skipped. `None` when a block comment there never closes:
+/// whatever followed it is unreadable.
+fn next_code(input: &str, mut at: usize, inert: &[std::ops::Range<usize>]) -> Option<usize> {
+    loop {
+        at = input.len() - input[at..].trim_start().len();
+        let next = inert.partition_point(|span| span.start < at);
+        let Some(span) = inert.get(next).filter(|span| span.start == at) else {
+            return Some(at);
+        };
+        let text = &input[span.clone()];
+        if text.starts_with("/*") && (text.len() < 4 || !text.ends_with("*/")) {
+            return None;
+        }
+        if !is_comment(text) {
+            return Some(at);
+        }
+        at = span.end;
+    }
+}
+
+/// Is this inert span ([`inert_spans`]) a comment rather than text?
+fn is_comment(span: &str) -> bool {
+    span.starts_with("//") || span.starts_with("/*")
 }
 
 /// A string literal read up to its closing delimiter ([`literal_body`]).
@@ -1187,7 +1334,17 @@ fn separator_of(path: &str) -> char {
 /// other spelling — a Windows path on Unix, a Unix path on Windows — would be
 /// resolved against the process cwd, which is exactly the leak the relative
 /// case refuses.
+///
+/// Asking `Path::is_absolute` alone is not enough: Unix calls the
+/// forward-slash UNC root `//server/share/repo` absolute too, so a replayed
+/// Windows workdir resolved to whatever local checkout sat at
+/// `/server/share/repo` and stamped its identity on the window. A spelling
+/// this module reads as Windows ([`windows_shaped`]) is foreign on any other
+/// host, and is never probed there.
 fn host_path(path: &str) -> Option<&Path> {
+    if cfg!(not(windows)) && windows_shaped(path) {
+        return None;
+    }
     let path = Path::new(path);
     path.is_absolute().then_some(path)
 }
@@ -3150,6 +3307,30 @@ mod tests {
         assert!(lexically_within(r"\\Server\Share\pkg", "//server/share"));
     }
 
+    /// Finding: `host_path` asked only `Path::is_absolute`, and Unix calls
+    /// the forward-slash UNC root `//server/share/repo` absolute too. A
+    /// replayed Windows workdir was probed on this host and resolved to
+    /// whatever local checkout sat at `/server/share/repo`.
+    #[cfg(not(windows))]
+    #[test]
+    fn a_foreign_unc_spelling_is_never_probed_on_this_host() {
+        for foreign in ["//server/share/repo", r"\\server\share\repo", r"C:\repo"] {
+            assert!(host_path(foreign).is_none(), "{foreign}");
+        }
+        assert_eq!(host_path("/repo"), Some(Path::new("/repo")));
+        // A real local checkout, spelled with one more leading `/`: Unix
+        // opens it, and Windows would read a share named after its first
+        // directory.
+        let root = scratch("unc-probe");
+        let repo = root.join("server/share/repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let spelled = format!("/{}", repo.display());
+        assert!(forward_slash_unc(&spelled) && Path::new(&spelled).is_dir());
+        assert!(!normalize_workdir(&spelled, None).is_resolved());
+        assert!(normalize_workdir(&repo.to_string_lossy(), None).is_resolved());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// Finding: lexical containment kept each path's own separator and case,
     /// so one Windows checkout spelled `C:/…` by the baseline and `C:\…` or
     /// `c:\…` by a tool call was two strings with no common prefix. The window
@@ -3699,6 +3880,161 @@ mod tests {
                 "{input}"
             );
         }
+    }
+
+    /// Finding: the property scan paired a `*/` with the LAST `/*` before it,
+    /// while JavaScript ends a block comment at its first `*/` and never
+    /// nests one. In `{cmd, /* note /* marker */ workdir: dir}` the live key
+    /// read as a word after `note`, no property, while the object scan found
+    /// the argument whole: the call named a directory and the window kept its
+    /// baseline on no evidence at all.
+    #[test]
+    fn a_block_comment_ends_at_its_first_close() {
+        for input in [
+            "tools.exec_command({cmd, /* note /* marker */ workdir: dir})",
+            "tools.exec_command({cmd, /* a /* b /* c */ workdir: dir})",
+            "tools.exec_command({cmd, /* note /* marker */ // more\n  workdir: dir})",
+            // Inside text the lexer may have misread, comments pair the same.
+            "It's here: tools.exec_command({cmd, /* a /* b */ workdir: dir})",
+        ] {
+            assert_eq!(
+                tool_call_workdirs(&js_input(input)),
+                vec![WorkdirEvidence::Opaque],
+                "{input}"
+            );
+        }
+        for input in [
+            r#"tools.exec_command({cmd: "ls", /* note /* marker */ workdir: "/foreign/repo"})"#,
+            // A `/*` inside a string opens no comment.
+            r#"tools.exec_command({cmd: "ls /*", /* pinned */ workdir: "/foreign/repo"})"#,
+        ] {
+            assert_eq!(
+                tool_call_workdirs(&js_input(input)),
+                explicit(&["/foreign/repo"]),
+                "{input}"
+            );
+        }
+    }
+
+    /// Finding: a computed key was recognised only with whitespace between
+    /// its `[` and the quoted name. `[/* c */ "workdir"]: dir` read as a bare
+    /// quoted key after `*/`, which opened no property, while the object scan
+    /// skipped the same comment and found the argument whole: no evidence.
+    #[test]
+    fn a_comment_inside_computed_brackets_hides_nothing() {
+        for input in [
+            r#"tools.exec_command({cmd, [/* c */ "workdir"]: dir})"#,
+            "tools.exec_command({cmd, [ // c\n  'workdir']: dir})",
+            r#"tools.exec_command({cmd, [/* a */ /* b */ "workdir" /* c */]: dir})"#,
+        ] {
+            assert_eq!(
+                tool_call_workdirs(&js_input(input)),
+                vec![WorkdirEvidence::Opaque],
+                "{input}"
+            );
+        }
+        assert_eq!(
+            tool_call_workdirs(&js_input(
+                r#"tools.exec_command({cmd: "ls", [/* c */ "workdir"]: "/foreign/repo"})"#
+            )),
+            explicit(&["/foreign/repo"])
+        );
+        // Brackets after a member still read a member, comment or not.
+        assert!(
+            tool_call_workdirs(&js_input(
+                r#"const dir = options[/* c */ "workdir"]; tools.exec_command({cmd: "ls"})"#
+            ))
+            .is_empty()
+        );
+    }
+
+    /// Finding: a call was recognised only as `exec_command` and its
+    /// parenthesis with whitespace between. `exec_command /* c */ (args)` and
+    /// `exec_command?.(args)` were no calls at all, so their dynamic argument
+    /// was never unseen and a foreign `workdir` in it left the window on its
+    /// baseline. One shape is read, `exec_command(` called directly; every
+    /// other live use runs the tool with arguments the scan cannot see.
+    #[test]
+    fn only_a_direct_exec_command_call_is_read() {
+        for input in [
+            "tools.exec_command /* c */ (args)",
+            "tools.exec_command\n  // run it\n  (args)",
+            "tools.exec_command?.(args)",
+            "tools.exec_command ?. (args)",
+            r#"tools.exec_command?.({cmd: "ls", workdir: "/repo/a"})"#,
+            "tools.exec_command.call(tools, args)",
+            "tools.exec_command.apply(tools, [args])",
+            "const run = tools.exec_command.bind(tools); run(args)",
+            "await Promise.all(plan.map(tools.exec_command))",
+            "const {exec_command: run} = tools; run(args)",
+            // A comment that never closes hid the call.
+            "tools.exec_command /* never closes",
+        ] {
+            assert_eq!(
+                tool_call_workdirs(&js_input(input)),
+                vec![WorkdirEvidence::Opaque],
+                "{input}"
+            );
+        }
+        // A direct call is read with comments anywhere JavaScript allows them,
+        // and a name destructured whole is still the tool.
+        for input in [
+            r#"tools.exec_command /* pinned */ ({cmd: "ls", workdir: "/repo/a"})"#,
+            "tools.exec_command(\n  // the call\n  {cmd: \"ls\", workdir: \"/repo/a\"})",
+            r#"const {exec_command} = tools; exec_command({cmd: "ls", workdir: "/repo/a"})"#,
+        ] {
+            assert_eq!(
+                tool_call_workdirs(&js_input(input)),
+                explicit(&["/repo/a"]),
+                "{input}"
+            );
+        }
+        // Another name, and the name inside text, are no calls.
+        for input in [
+            "tools.exec_commands(args)",
+            r#"const note = "tools.exec_command?.(args)"; tools.write_stdin(input)"#,
+        ] {
+            assert!(tool_call_workdirs(&js_input(input)).is_empty(), "{input}");
+        }
+    }
+
+    /// Finding: `apply_patch` input was scanned as a script. A patched
+    /// source file's context lines — ` workdir: dir,` inside a call it quotes
+    /// — read as a property and made the window opaque, although a patch
+    /// names files, never the directory its call ran in.
+    #[test]
+    fn a_patch_is_not_a_script() {
+        let patch = "*** Begin Patch\n\
+                     *** Update File: scripts/run.js\n\
+                     @@ async function main() {\n   \
+                     await tools.exec_command({\n     \
+                     cmd: \"make\",\n     \
+                     workdir: dir,\n   \
+                     });\n\
+                     -  const old = 1;\n\
+                     +  const fresh = 2;\n\
+                     *** End Patch\n";
+        // Scanned as a script, the quoted call is one into an unseen directory.
+        assert_eq!(
+            workdirs_in_literal(patch, Site::Script),
+            vec![WorkdirEvidence::Opaque]
+        );
+        for payload in [
+            serde_json::json!({"type": "custom_tool_call", "name": "apply_patch", "input": patch}),
+            serde_json::json!({"type": "function_call", "name": "apply_patch", "arguments": patch}),
+            // The envelope is patch grammar whatever the call is named.
+            js_input(patch),
+            js_input(&format!("\n  {patch}")),
+        ] {
+            assert!(tool_call_workdirs(&payload).is_empty(), "{payload}");
+        }
+        // A script is still a script beside the patch tool.
+        assert_eq!(
+            tool_call_workdirs(&js_input(
+                r#"tools.apply_patch(patch); tools.exec_command({cmd: "ls", workdir: "/repo/a"})"#
+            )),
+            explicit(&["/repo/a"])
+        );
     }
 
     /// Finding: a literal was read as the whole value whatever followed it,

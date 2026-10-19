@@ -287,16 +287,33 @@ struct SessionParseRecord {
     /// cannot reconstruct branches, hidden scopes, or removed tool-call paths.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     scope: Option<crate::extraction::conversation::ScopeReport>,
+    /// `.aicxignore` withheld every frame the session recorded: there is no
+    /// extract and no chunk, and this record is the session's only trace in
+    /// the index lane. Without it the session vanished from CURRENT and from
+    /// this ledger alike while the census still reported it, so search
+    /// coverage counted it as never indexed and every build parsed it again.
+    #[serde(default)]
+    withheld: bool,
+    /// Date (`%Y-%m-%d`) of the session's latest signal frame, counted before
+    /// `.aicxignore` withheld any ([`SignalSession::recency`]). A flagged
+    /// chunk is published under it, on parse and on reuse alike
+    /// ([`chunk_date`]). Ledgers written before it carry none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    recency: Option<String>,
 }
 
 fn maintenance_record_reusable(record: &SessionParseRecord) -> bool {
-    record
-        .coverage
-        .as_ref()
-        .is_none_or(ConversationCoverage::cacheable)
+    record_dates_its_chunk(record)
+        && record
+            .coverage
+            .as_ref()
+            .is_none_or(ConversationCoverage::cacheable)
 }
 
 fn maintenance_record_settled(record: &SessionParseRecord) -> bool {
+    if !record_dates_its_chunk(record) {
+        return false;
+    }
     if record.source_physical_identity.is_empty() {
         return record.coverage.is_none();
     }
@@ -662,28 +679,37 @@ pub fn build_with_reporter(
             .sessions
             .get(&session_key)
             .is_some_and(maintenance_record_reusable);
-        if ledger_has_current_contract
-            && let Some(mut chunk) = try_reuse_cached_extract(
-                aicx_home,
-                entry,
-                &prior_state,
-                &session_key,
-                &source_allow,
-                &repo_path_ignore_fingerprint,
-                &mut layout,
-            )
-        {
-            let mut record = prior_state
-                .sessions
-                .get(&session_key)
-                .expect("reuse requires prior record")
-                .clone();
+        // A withheld session reuses its marker and publishes nothing.
+        let reused = ledger_has_current_contract
+            .then(|| {
+                reusable_record(
+                    entry,
+                    &prior_state,
+                    &session_key,
+                    &source_allow,
+                    &repo_path_ignore_fingerprint,
+                    &mut layout,
+                )
+            })
+            .flatten()
+            .and_then(|record| {
+                if record.withheld {
+                    Some((record, None))
+                } else {
+                    cached_chunk(aicx_home, entry, record).map(|chunk| (record, Some(chunk)))
+                }
+            });
+        if let Some((record, mut chunk)) = reused {
+            let mut record = record.clone();
             if record.source_physical_identity.is_empty() {
                 // Pre-physical-identity extracts remain useful, but normal
                 // maintenance may never upgrade yesterday's body with today's
                 // proof. Keep the receipt explicitly unknown until full-rescan.
                 record.coverage = None;
-                if let Some(metadata) = chunk.metadata.as_object_mut() {
+                if let Some(metadata) = chunk
+                    .as_mut()
+                    .and_then(|chunk| chunk.metadata.as_object_mut())
+                {
                     metadata.insert("conversation_coverage".to_string(), serde_json::Value::Null);
                 }
             }
@@ -692,7 +718,7 @@ pub fn build_with_reporter(
             filtered_frames += record.filtered_frames;
             sources_reused += 1;
             next_state.sessions.insert(session_key, record);
-            chunks.push(chunk);
+            chunks.extend(chunk);
             continue;
         }
 
@@ -726,135 +752,25 @@ pub fn build_with_reporter(
                     continue;
                 }
             };
-        let ParsedCatalogSource {
-            frames,
-            distill,
-            recorded_workdirs,
-        } = parsed_source;
         sources_parsed += 1;
-        let raw_count = frames.len();
-        raw_frames += raw_count;
-        // Same one step as the intent lane: whatever `.aicxignore` hides is
-        // counted into the report here, or this chunk's scope silently forgets
-        // the session's own baseline.
-        let SignalSession {
-            frames,
-            scope,
-            unattributed: session_unattributed,
-        } = signal_session(frames, &ignore);
-        let signal_count = frames.len();
-        signal_frames += signal_count;
-        let filtered_count = raw_count.saturating_sub(frames.len());
-        filtered_frames += filtered_count;
-        if frames.is_empty() {
-            continue;
+        let indexed = index_parsed_session(
+            aicx_home,
+            entry,
+            &source_path,
+            (parsed_source, coverage),
+            &ignore,
+            dry_run,
+            &mut layout,
+        )?;
+        raw_frames += indexed.raw_frames;
+        signal_frames += indexed.signal_frames;
+        filtered_frames += indexed.filtered_frames;
+        extracts_written += usize::from(indexed.extract_written);
+        distill_docs += usize::from(indexed.distilled);
+        chunks.extend(indexed.chunk);
+        if let Some(record) = indexed.record {
+            next_state.sessions.insert(session_key, record);
         }
-
-        let rendered = render_extract(entry, &frames);
-        let coverage = coverage.with_omitted_frames(rendered.omitted_frames);
-        let extract = rendered.body;
-        if extract.trim().is_empty() {
-            continue;
-        }
-        let extract_path = extract_path_for(aicx_home, &entry.agent, &entry.session_id);
-        if !dry_run && write_if_changed(aicx_home, &extract_path, extract.as_bytes())? {
-            extracts_written += 1;
-        }
-        let indexed_path = if !dry_run {
-            extract_path.clone()
-        } else {
-            source_path.to_path_buf()
-        };
-        let date = frames
-            .last()
-            .map(|frame| frame.timestamp.format("%Y-%m-%d").to_string())
-            .or_else(|| entry.date.clone())
-            .unwrap_or_default();
-        let project = entry
-            .project
-            .clone()
-            .unwrap_or_else(|| "_unknown".to_string());
-        // Whole-session chunks cannot express per-frame scope, so this flag
-        // routes the session to the per-frame census lane. It must mean
-        // "more than one scope", not "MixedCandidate": a same-repo branch
-        // switch is mixed by status and perfectly servable as one bucket.
-        // It must also catch the homogeneous case: every frame re-scoped to
-        // ONE foreign checkout is a consistent session that belongs to another
-        // repository, and serving it whole would stamp all of it with this
-        // catalog row's project.
-        let session_mixed = scope.scope_foreign_to(entry.cwd.as_deref());
-        // Frames carry the provenance resolved at the source, which is the
-        // only lane that can see it for a catalog row cataloged before the
-        // column existed.
-        let resolved_kind = frames
-            .iter()
-            .find_map(|frame| frame.session_kind.clone())
-            .or_else(|| entry.session_kind.clone());
-        let mut metadata = serde_json::json!({
-            "source_path": indexed_path.to_string_lossy(),
-            "project": project,
-            "agent": entry.agent,
-            "date": date,
-            "kind": "conversations",
-            "session_id": entry.session_id,
-            "logical_session_id": entry.logical_session_id,
-            "frame_kind": "conversation",
-            "cwd": entry.cwd,
-            "source_catalog_path": entry.source_path,
-            "preview_lines": extract_preview_lines(&frames),
-            "scope_conflict": session_mixed,
-            "scope_unattributed": session_unattributed,
-            "session_kind": resolved_kind.clone(),
-            "conversation_coverage": coverage.clone(),
-        });
-        if let Some(distill) = &distill {
-            // card.v3 (W2-02): distill block + flat filter scalars. Reused
-            // cached extracts skip this branch, so their documents stay v2
-            // until re-parsed — incremental coverage, reported not faked.
-            distill.merge_into(&mut metadata);
-            distill_docs += 1;
-        }
-        chunks.push(aicx_retrieve::ChunkRef {
-            id: format!("{}:{}", entry.agent, entry.session_id),
-            source_path: indexed_path.display().to_string(),
-            text: extract.clone(),
-            metadata,
-        });
-
-        let rel = extract_path
-            .strip_prefix(aicx_home)
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(|_| extract_path.clone());
-        // Always stamp LIVE stats into the parse ledger so reuse survives
-        // catalog lag (append without catalog rebuild still reuses later
-        // once CURRENT has the new extract).
-        let fingerprint = crate::catalog::live_source_bundle_fingerprint(&source_path)
-            .unwrap_or_else(|| resolve_entry_fingerprint(entry, &source_path));
-        next_state.sessions.insert(
-            session_key,
-            SessionParseRecord {
-                source_path: entry.source_path.clone(),
-                source_len: fingerprint.len,
-                source_mtime_ns: fingerprint.modified_unix_nanos as u64,
-                source_physical_identity: fingerprint.physical_identity,
-                source_bundle_fingerprint: fingerprint.bundle_fingerprint,
-                extract_relpath: rel.to_string_lossy().replace('\\', "/"),
-                extract_sha256: sha256_hex(extract.as_bytes()),
-                raw_frames: raw_count,
-                signal_frames: signal_count,
-                filtered_frames: filtered_count,
-                project: entry.project.clone(),
-                date: entry.date.clone().or(Some(date)),
-                cwd: entry.cwd.clone(),
-                scope_conflict: session_mixed,
-                scope_unattributed: session_unattributed,
-                session_kind: resolved_kind.clone(),
-                scope_environment: layout.fingerprint(entry.cwd.as_deref(), &recorded_workdirs),
-                scope_paths: recorded_workdirs,
-                coverage: Some(coverage),
-                scope: Some(scope),
-            },
-        );
     }
     parse_hb.stop();
     parse_phase.finish_ok(format!(
@@ -973,6 +889,214 @@ pub fn build_with_reporter(
         manifest_path,
         skipped_by_agent,
     })
+}
+
+/// What indexing one freshly parsed session produced.
+struct IndexedSession {
+    /// The session's searchable document, when any of it survives.
+    chunk: Option<aicx_retrieve::ChunkRef>,
+    /// Its parse-ledger row: beside a chunk, or alone for a session
+    /// `.aicxignore` withheld whole ([`SessionParseRecord::withheld`]).
+    record: Option<SessionParseRecord>,
+    raw_frames: usize,
+    signal_frames: usize,
+    filtered_frames: usize,
+    /// The extract on disk changed.
+    extract_written: bool,
+    /// The chunk carries the card.v3 distill block.
+    distilled: bool,
+}
+
+/// Reduce one freshly parsed catalog session to its signal frames, write its
+/// extract, and build the chunk and the ledger row that publish it.
+///
+/// A session `.aicxignore` emptied keeps a ledger row and gets no chunk.
+/// Dropping both took the hidden scopes it had just counted with them: the
+/// index lane kept no trace of a session the census reports, search coverage
+/// called it never indexed, and every build parsed it again. A session with
+/// no signal frames and nothing hidden leaves no trace, as before.
+fn index_parsed_session(
+    aicx_home: &Path,
+    entry: &CatalogEntry,
+    source_path: &Path,
+    (parsed, mut coverage): (ParsedCatalogSource, ConversationCoverage),
+    ignore: &crate::legacy_archive::RepoPathIgnoreMatcher,
+    dry_run: bool,
+    layout: &mut ScopeLayoutProbe,
+) -> Result<IndexedSession> {
+    let ParsedCatalogSource {
+        frames,
+        distill,
+        recorded_workdirs,
+    } = parsed;
+    let raw_frames = frames.len();
+    // Same one step as the intent lane: whatever `.aicxignore` hides is
+    // counted into the report here, or this chunk's scope silently forgets
+    // the session's own baseline.
+    let SignalSession {
+        frames,
+        scope,
+        unattributed: session_unattributed,
+        recency,
+    } = signal_session(frames, ignore);
+    let mut indexed = IndexedSession {
+        chunk: None,
+        record: None,
+        raw_frames,
+        signal_frames: frames.len(),
+        filtered_frames: raw_frames.saturating_sub(frames.len()),
+        extract_written: false,
+        distilled: false,
+    };
+    // No signal and nothing hidden: no document, nothing to account for.
+    if frames.is_empty() && scope.hidden_scopes == 0 {
+        return Ok(indexed);
+    }
+    // Whole-session chunks cannot express per-frame scope, so this flag
+    // routes the session to the per-frame census lane. It must mean
+    // "more than one scope", not "MixedCandidate": a same-repo branch
+    // switch is mixed by status and perfectly servable as one bucket.
+    // It must also catch the homogeneous case: every frame re-scoped to
+    // ONE foreign checkout is a consistent session that belongs to another
+    // repository, and serving it whole would stamp all of it with this
+    // catalog row's project.
+    let session_mixed = scope.scope_foreign_to(entry.cwd.as_deref());
+    // Frames carry the provenance resolved at the source, which is the
+    // only lane that can see it for a catalog row cataloged before the
+    // column existed.
+    let resolved_kind = frames
+        .iter()
+        .find_map(|frame| frame.session_kind.clone())
+        .or_else(|| entry.session_kind.clone());
+    let recency = recency.map(|at| at.format("%Y-%m-%d").to_string());
+    // The extract a chunk was published from, and the date it carries.
+    let published = if frames.is_empty() {
+        None
+    } else {
+        let rendered = render_extract(entry, &frames);
+        coverage = coverage.with_omitted_frames(rendered.omitted_frames);
+        let extract = rendered.body;
+        if extract.trim().is_empty() {
+            return Ok(indexed);
+        }
+        let extract_path = extract_path_for(aicx_home, &entry.agent, &entry.session_id);
+        indexed.extract_written =
+            !dry_run && write_if_changed(aicx_home, &extract_path, extract.as_bytes())?;
+        let indexed_path = if !dry_run {
+            extract_path.clone()
+        } else {
+            source_path.to_path_buf()
+        };
+        let shown = frames
+            .last()
+            .map(|frame| frame.timestamp.format("%Y-%m-%d").to_string());
+        let date = chunk_date(
+            session_mixed || session_unattributed,
+            recency.as_deref(),
+            shown.as_deref(),
+            entry.date.as_deref(),
+        );
+        let project = entry
+            .project
+            .clone()
+            .unwrap_or_else(|| "_unknown".to_string());
+        let mut metadata = serde_json::json!({
+            "source_path": indexed_path.to_string_lossy(),
+            "project": project,
+            "agent": entry.agent,
+            "date": date,
+            "kind": "conversations",
+            "session_id": entry.session_id,
+            "logical_session_id": entry.logical_session_id,
+            "frame_kind": "conversation",
+            "cwd": entry.cwd,
+            "source_catalog_path": entry.source_path,
+            "preview_lines": extract_preview_lines(&frames),
+            "scope_conflict": session_mixed,
+            "scope_unattributed": session_unattributed,
+            "session_kind": resolved_kind.clone(),
+            "conversation_coverage": coverage.clone(),
+        });
+        if let Some(distill) = &distill {
+            // card.v3 (W2-02): distill block + flat filter scalars. Reused
+            // cached extracts skip this branch, so their documents stay v2
+            // until re-parsed — incremental coverage, reported not faked.
+            distill.merge_into(&mut metadata);
+            indexed.distilled = true;
+        }
+        indexed.chunk = Some(aicx_retrieve::ChunkRef {
+            id: format!("{}:{}", entry.agent, entry.session_id),
+            source_path: indexed_path.display().to_string(),
+            text: extract.clone(),
+            metadata,
+        });
+        let rel = extract_path
+            .strip_prefix(aicx_home)
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|_| extract_path.clone());
+        Some((
+            rel.to_string_lossy().replace('\\', "/"),
+            sha256_hex(extract.as_bytes()),
+            date,
+        ))
+    };
+    // Always stamp LIVE stats into the parse ledger so reuse survives
+    // catalog lag (append without catalog rebuild still reuses later
+    // once CURRENT has the new extract).
+    let fingerprint = crate::catalog::live_source_bundle_fingerprint(source_path)
+        .unwrap_or_else(|| resolve_entry_fingerprint(entry, source_path));
+    let withheld = published.is_none();
+    let (extract_relpath, extract_sha256, date) = published.unwrap_or_default();
+    indexed.record = Some(SessionParseRecord {
+        source_path: entry.source_path.clone(),
+        source_len: fingerprint.len,
+        source_mtime_ns: fingerprint.modified_unix_nanos as u64,
+        source_physical_identity: fingerprint.physical_identity,
+        source_bundle_fingerprint: fingerprint.bundle_fingerprint,
+        extract_relpath,
+        extract_sha256,
+        raw_frames: indexed.raw_frames,
+        signal_frames: indexed.signal_frames,
+        filtered_frames: indexed.filtered_frames,
+        project: entry.project.clone(),
+        date: entry.date.clone().or((!withheld).then_some(date)),
+        cwd: entry.cwd.clone(),
+        scope_conflict: session_mixed,
+        scope_unattributed: session_unattributed,
+        session_kind: resolved_kind,
+        scope_environment: layout.fingerprint(entry.cwd.as_deref(), &recorded_workdirs),
+        scope_paths: recorded_workdirs,
+        coverage: Some(coverage),
+        scope: Some(scope),
+        withheld,
+        recency,
+    });
+    Ok(indexed)
+}
+
+/// The date a chunk is published under: `dated`, else `fallback`, unless the
+/// chunk is flagged.
+///
+/// Readers cut chunks by date before they read anything else about them. A
+/// flagged chunk — mixed scope, an unplaceable window, a scope `.aicxignore`
+/// hid — is routed by its flags, and dated by its last surviving frame it
+/// fell outside a window exactly when the frames `.aicxignore` hid were the
+/// recent ones: the flag went unread with them. A flagged chunk is dated by
+/// the session's own `recency`, hidden frames included, on parse and on
+/// reuse alike.
+fn chunk_date(
+    flagged: bool,
+    recency: Option<&str>,
+    dated: Option<&str>,
+    fallback: Option<&str>,
+) -> String {
+    flagged
+        .then_some(recency)
+        .flatten()
+        .or(dated)
+        .or(fallback)
+        .unwrap_or_default()
+        .to_string()
 }
 
 fn current_dense_stats() -> (String, usize) {
@@ -1173,10 +1297,21 @@ pub fn current_search_coverage(aicx_home: &Path) -> SearchCoverage {
     };
     let mut skipped = BTreeMap::new();
     let mut scanned_sessions = 0usize;
+    let withheld = withheld_sessions(
+        aicx_home,
+        entries
+            .iter()
+            .filter(|entry| !indexed.contains(&session_state_key(&entry.agent, &entry.session_id))),
+    );
 
     for entry in &entries {
-        if indexed.contains(&session_state_key(&entry.agent, &entry.session_id)) {
+        let key = session_state_key(&entry.agent, &entry.session_id);
+        if indexed.contains(&key) {
             scanned_sessions += 1;
+        } else if withheld.contains(&key) {
+            *skipped
+                .entry("aicxignore_withheld".to_string())
+                .or_default() += 1;
         } else {
             *skipped
                 .entry(format!(
@@ -1196,6 +1331,50 @@ pub fn current_search_coverage(aicx_home: &Path) -> SearchCoverage {
         total_sessions,
         skipped,
     }
+}
+
+/// The sessions among `entries` that `.aicxignore` withheld whole, as the
+/// parse ledger records them for their current source bytes
+/// ([`SessionParseRecord::withheld`]).
+///
+/// Such a session has no document in CURRENT by design. Counted as unindexed,
+/// it told the operator to re-run an index that withholds it again, forever.
+/// A marker whose source changed since proves nothing about the new bytes,
+/// and that session stays unindexed until a build reads them.
+fn withheld_sessions<'a>(
+    aicx_home: &Path,
+    entries: impl IntoIterator<Item = &'a CatalogEntry>,
+) -> HashSet<String> {
+    let mut entries = entries.into_iter().peekable();
+    if entries.peek().is_none() {
+        return HashSet::new();
+    }
+    let user_home = crate::os_user_home().unwrap_or_else(|| aicx_home.to_path_buf());
+    let Ok(ignore) = crate::legacy_archive::load_repo_path_ignore(aicx_home, &user_home) else {
+        return HashSet::new();
+    };
+    if ignore.is_empty() {
+        return HashSet::new();
+    }
+    let ignore_fingerprint = ignore.fingerprint();
+    let ledger = load_parse_state(aicx_home, &ignore_fingerprint);
+    let source_allow = crate::source_path::SourceAllowlist::for_operator(&user_home, aicx_home);
+    let mut layout = ScopeLayoutProbe::default();
+    entries
+        .filter_map(|entry| {
+            let key = session_state_key(&entry.agent, &entry.session_id);
+            reusable_record(
+                entry,
+                &ledger,
+                &key,
+                &source_allow,
+                &ignore_fingerprint,
+                &mut layout,
+            )
+            .is_some_and(|record| record.withheld)
+            .then_some(key)
+        })
+        .collect()
 }
 
 fn current_indexed_session_keys() -> Result<HashSet<String>> {
@@ -1897,6 +2076,10 @@ struct SignalSession {
     scope: crate::extraction::conversation::ScopeReport,
     /// Some turn window of the session could not be placed.
     unattributed: bool,
+    /// The latest signal frame the session recorded, before `.aicxignore`
+    /// withheld any: the session's own recency, which dates a flagged chunk
+    /// ([`chunk_date`]).
+    recency: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Sort a parsed session, judge its scope and privacy, then project it onto
@@ -1913,6 +2096,11 @@ fn signal_session(
     ignore: &crate::legacy_archive::RepoPathIgnoreMatcher,
 ) -> SignalSession {
     frames.sort_by_key(|frame| frame.timestamp);
+    let recency = frames
+        .iter()
+        .rev()
+        .find(|frame| is_signal_frame(frame))
+        .map(|frame| frame.timestamp);
     let scope = scope_report_excluding_ignored(&mut frames, ignore);
     let unattributed = frames.iter().any(|frame| frame.scope_unattributed);
     frames.retain(is_signal_frame);
@@ -1924,6 +2112,7 @@ fn signal_session(
         frames,
         scope,
         unattributed,
+        recency,
     }
 }
 
@@ -2680,6 +2869,9 @@ fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
+/// The cached chunk a prior parse published for this session, when its
+/// ledger row still proves it ([`reusable_record`]). A withheld session
+/// published none.
 fn try_reuse_cached_extract(
     aicx_home: &Path,
     entry: &CatalogEntry,
@@ -2689,6 +2881,29 @@ fn try_reuse_cached_extract(
     repo_path_ignore_fingerprint: &str,
     layout: &mut ScopeLayoutProbe,
 ) -> Option<aicx_retrieve::ChunkRef> {
+    reusable_record(
+        entry,
+        prior,
+        session_key,
+        source_allow,
+        repo_path_ignore_fingerprint,
+        layout,
+    )
+    .filter(|record| !record.withheld)
+    .and_then(|record| cached_chunk(aicx_home, entry, record))
+}
+
+/// The ledger row of a prior parse, when everything its verdicts read is
+/// unchanged: filter and privacy rules, catalog row, repository layout and
+/// the live source bytes.
+fn reusable_record<'a>(
+    entry: &CatalogEntry,
+    prior: &'a SourceParseState,
+    session_key: &str,
+    source_allow: &crate::source_path::SourceAllowlist,
+    repo_path_ignore_fingerprint: &str,
+    layout: &mut ScopeLayoutProbe,
+) -> Option<&'a SessionParseRecord> {
     if prior.signal_filter_version != SIGNAL_FILTER_VERSION
         || prior.repo_path_ignore_fingerprint != repo_path_ignore_fingerprint
     {
@@ -2728,6 +2943,9 @@ fn try_reuse_cached_extract(
     if entry.agent == "copilot" && record.source_bundle_fingerprint.is_none() {
         return None;
     }
+    if !record_dates_its_chunk(record) {
+        return None;
+    }
     // LIVE source fingerprint is the reuse gate. Catalog-embedded size/mtime
     // lag until rebuild; requiring them to match the ledger forced full
     // reparse after a source-change index that already stamped live stats.
@@ -2750,6 +2968,25 @@ fn try_reuse_cached_extract(
             return None;
         }
     }
+    Some(record)
+}
+
+/// Can this ledger row date its chunk as a fresh parse would ([`chunk_date`])?
+/// A flagged row written before `recency` existed cannot: re-stamped with the
+/// session's catalog date, its flag would again fall outside the windows the
+/// hidden frames were in. It is parsed once more instead.
+fn record_dates_its_chunk(record: &SessionParseRecord) -> bool {
+    record.withheld
+        || !(record.scope_conflict || record.scope_unattributed)
+        || record.recency.is_some()
+}
+
+/// The chunk a ledger row published, read back from its checked extract.
+fn cached_chunk(
+    aicx_home: &Path,
+    entry: &CatalogEntry,
+    record: &SessionParseRecord,
+) -> Option<aicx_retrieve::ChunkRef> {
     let extract_path = aicx_home.join(&record.extract_relpath);
     let body = crate::source_path::read_under_aicx_home(aicx_home, &extract_path).ok()?;
     if sha256_hex(body.as_bytes()) != record.extract_sha256 {
@@ -2763,11 +3000,12 @@ fn try_reuse_cached_extract(
         .clone()
         .or_else(|| record.project.clone())
         .unwrap_or_else(|| "_unknown".to_string());
-    let date = entry
-        .date
-        .clone()
-        .or_else(|| record.date.clone())
-        .unwrap_or_default();
+    let date = chunk_date(
+        record.scope_conflict || record.scope_unattributed,
+        record.recency.as_deref(),
+        entry.date.as_deref(),
+        record.date.as_deref(),
+    );
     let preview_lines: Vec<String> = body
         .lines()
         .filter(|line| !line.trim().is_empty() && !line.starts_with('#'))
@@ -3952,6 +4190,8 @@ mod tests {
                     scope_paths: Vec::new(),
                     coverage: None,
                     scope: None,
+                    withheld: false,
+                    recency: None,
                 },
             )]),
         };
@@ -4153,6 +4393,8 @@ mod tests {
                 scope_paths: Vec::new(),
                 coverage: None,
                 scope: None,
+                withheld: false,
+                recency: None,
             },
         );
 
@@ -4434,6 +4676,8 @@ mod tests {
                     scope_paths: vec![nested.to_string_lossy().into_owned()],
                     coverage: None,
                     scope: None,
+                    withheld: false,
+                    recency: None,
                 },
             )]),
         };
@@ -5001,6 +5245,8 @@ mod tests {
                 scope_paths: parsed.recorded_workdirs.clone(),
                 coverage: None,
                 scope: None,
+                withheld: false,
+                recency: None,
             },
         );
         assert!(current(&ledger), "an untouched layout is current");
@@ -5054,5 +5300,290 @@ mod continuity_clock_contract {
         );
         assert_eq!(parsed.frames[0].timestamp, chrono::DateTime::UNIX_EPOCH);
         fs::remove_dir_all(root).unwrap();
+    }
+}
+
+/// Index-lane accounting for sessions `.aicxignore` filters (issue #88, C).
+#[cfg(test)]
+mod aicxignore_index_lane {
+    use super::*;
+
+    struct Fixture {
+        root: PathBuf,
+        ignore: crate::legacy_archive::RepoPathIgnoreMatcher,
+        allow: crate::source_path::SourceAllowlist,
+        entry: CatalogEntry,
+    }
+
+    impl Fixture {
+        /// An AICX home hiding `/repo/private`, and one cataloged claude
+        /// session whose source lives under it, started on `2026-06-30` in
+        /// `/repo/public`.
+        fn new(label: &str) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "aicx-ignore-lane-{label}-{}-{}",
+                std::process::id(),
+                chrono::Utc::now().timestamp_nanos_opt().unwrap()
+            ));
+            let _ = fs::remove_dir_all(&root);
+            fs::create_dir_all(root.join("sources")).unwrap();
+            fs::write(
+                root.join(crate::legacy_archive::AICX_IGNORE_FILENAME),
+                "/repo/private\n",
+            )
+            .unwrap();
+            let source = root.join("sources/session.jsonl");
+            fs::write(&source, "{\"type\":\"user\",\"text\":\"recorded\"}\n").unwrap();
+            // The production readers expand `~` against the operator's home.
+            let user_home = crate::os_user_home().unwrap_or_else(|| root.clone());
+            let ignore = crate::legacy_archive::load_repo_path_ignore(&root, &user_home).unwrap();
+            let allow = crate::source_path::SourceAllowlist::for_operator(&user_home, &root);
+            let entry = CatalogEntry {
+                schema: crate::catalog::CATALOG_SCHEMA.to_string(),
+                session_id: "session".to_string(),
+                agent: "claude".to_string(),
+                project: Some("vetcoders/public".to_string()),
+                date: Some("2026-06-30".to_string()),
+                cwd: Some("/repo/public".to_string()),
+                source_path: source.display().to_string(),
+                source_len: None,
+                source_mtime_ns: None,
+                source_bundle_fingerprint: None,
+                title: None,
+                machine: None,
+                logical_session_id: None,
+                session_kind: None,
+            };
+            Self {
+                root,
+                ignore,
+                allow,
+                entry,
+            }
+        }
+
+        fn frame(&self, at: &str, cwd: &str, message: &str) -> TimelineEntry {
+            TimelineEntry {
+                timestamp: chrono::DateTime::parse_from_rfc3339(at)
+                    .unwrap()
+                    .with_timezone(&chrono::Utc),
+                agent: "claude".to_string(),
+                session_id: "session".to_string(),
+                role: "user".to_string(),
+                message: message.to_string(),
+                frame_class: None,
+                lineage_origin: None,
+                frame_kind: Some(FrameKind::UserMsg),
+                branch: None,
+                cwd: Some(cwd.to_string()),
+                scope_conflict: false,
+                scope_unattributed: false,
+                scope_workdirs: Vec::new(),
+                session_kind: None,
+                timestamp_source: Some("record".to_string()),
+                source_path: None,
+                source_sha256: None,
+                source_line_span: None,
+            }
+        }
+
+        fn index(&self, frames: Vec<TimelineEntry>) -> IndexedSession {
+            let mut recorded_workdirs: Vec<String> = frames
+                .iter()
+                .filter_map(|frame| frame.cwd.clone())
+                .collect();
+            recorded_workdirs.sort();
+            recorded_workdirs.dedup();
+            let parsed = ParsedCatalogSource {
+                frames,
+                distill: None,
+                recorded_workdirs,
+            };
+            index_parsed_session(
+                &self.root,
+                &self.entry,
+                Path::new(&self.entry.source_path),
+                (parsed, ConversationCoverage::CompleteVisible),
+                &self.ignore,
+                true,
+                &mut ScopeLayoutProbe::default(),
+            )
+            .unwrap()
+        }
+
+        /// A ledger holding `record`, written where the index writes it.
+        fn ledger(&self, record: SessionParseRecord) -> SourceParseState {
+            let state = SourceParseState {
+                schema: PARSE_STATE_SCHEMA.to_string(),
+                signal_filter_version: SIGNAL_FILTER_VERSION.to_string(),
+                repo_path_ignore_fingerprint: self.ignore.fingerprint(),
+                sessions: BTreeMap::from([(self.key(), record)]),
+            };
+            let path = parse_state_path(&self.root);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, serde_json::to_vec(&state).unwrap()).unwrap();
+            state
+        }
+
+        fn key(&self) -> String {
+            session_state_key(&self.entry.agent, &self.entry.session_id)
+        }
+
+        fn reuse(&self, state: &SourceParseState) -> Option<aicx_retrieve::ChunkRef> {
+            try_reuse_cached_extract(
+                &self.root,
+                &self.entry,
+                state,
+                &self.key(),
+                &self.allow,
+                &self.ignore.fingerprint(),
+                &mut ScopeLayoutProbe::default(),
+            )
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    /// Finding: a session `.aicxignore` emptied left the indexer through the
+    /// `frames.is_empty()` branch with the hidden scopes it had just counted:
+    /// no chunk and no ledger row. The census reported the session while the
+    /// index lane kept no trace of it, search coverage counted it as never
+    /// indexed, and every build parsed it again.
+    #[test]
+    fn a_session_aicxignore_emptied_keeps_its_place_in_the_ledger() {
+        let fixture = Fixture::new("emptied");
+        let indexed = fixture.index(vec![
+            fixture.frame("2026-07-01T10:00:00Z", "/repo/private", "first hidden"),
+            fixture.frame("2026-07-02T10:00:00Z", "/repo/private", "second hidden"),
+        ]);
+        assert!(indexed.chunk.is_none(), "nothing hidden is published");
+        assert_eq!(
+            (
+                indexed.raw_frames,
+                indexed.signal_frames,
+                indexed.filtered_frames
+            ),
+            (2, 0, 2)
+        );
+        let record = indexed
+            .record
+            .expect("the withheld session is accounted for");
+        assert!(record.withheld);
+        assert!(record.extract_relpath.is_empty() && record.extract_sha256.is_empty());
+        assert!(record.scope_conflict, "a hidden scope is a mixed scope");
+        let scope = record.scope.as_ref().expect("the scope travels");
+        assert_eq!(scope.hidden_scopes, 1);
+        assert!(
+            scope.cwds.is_empty(),
+            "a hidden path is counted, never named"
+        );
+        // The marker settles like any other row, so it neither forces a
+        // rebuild forever nor stands in for a chunk.
+        assert!(maintenance_record_settled(&record) && maintenance_record_reusable(&record));
+
+        let state = fixture.ledger(record);
+        assert!(
+            fixture.reuse(&state).is_none(),
+            "a withheld session publishes nothing"
+        );
+        let reused = reusable_record(
+            &fixture.entry,
+            &state,
+            &fixture.key(),
+            &fixture.allow,
+            &fixture.ignore.fingerprint(),
+            &mut ScopeLayoutProbe::default(),
+        )
+        .expect("an unchanged source reuses its marker instead of parsing again");
+        assert!(reused.withheld);
+        // Coverage names it withheld, not unindexed.
+        assert_eq!(
+            withheld_sessions(&fixture.root, [&fixture.entry]),
+            HashSet::from([fixture.key()])
+        );
+        // New bytes are not withheld until a build reads them.
+        fs::write(
+            &fixture.entry.source_path,
+            "{\"type\":\"user\",\"text\":\"recorded\"}\n{\"type\":\"user\",\"text\":\"more\"}\n",
+        )
+        .unwrap();
+        assert!(withheld_sessions(&fixture.root, [&fixture.entry]).is_empty());
+    }
+
+    /// A session with no signal at all, and nothing hidden, stays untraced.
+    #[test]
+    fn a_session_without_signal_or_hidden_scope_leaves_no_trace() {
+        let fixture = Fixture::new("silent");
+        let mut tool = fixture.frame("2026-07-01T10:00:00Z", "/repo/public", "ls");
+        tool.role = "tool".to_string();
+        tool.frame_kind = Some(FrameKind::ToolCall);
+        let indexed = fixture.index(vec![tool]);
+        assert!(indexed.chunk.is_none() && indexed.record.is_none());
+    }
+
+    /// Finding: a partially filtered session was dated by its last
+    /// SURVIVING frame. When `.aicxignore` hid the recent frames, a reader
+    /// that cuts chunks by date dropped the chunk before it read the
+    /// `scope_conflict` flag the hidden frames had raised. A flagged chunk is
+    /// dated by the session's own recency, on parse and on reuse alike.
+    #[test]
+    fn a_flagged_chunk_is_dated_by_the_frames_aicxignore_hid() {
+        let fixture = Fixture::new("recency");
+        let frames = || {
+            vec![
+                fixture.frame("2026-07-01T10:00:00Z", "/repo/public", "visible plan"),
+                fixture.frame("2026-07-09T10:00:00Z", "/repo/private", "hidden follow-up"),
+            ]
+        };
+        let indexed = fixture.index(frames());
+        let chunk = indexed.chunk.expect("the visible frame is published");
+        assert!(!chunk.text.contains("hidden follow-up"));
+        assert_eq!(chunk.metadata["scope_conflict"], true);
+        assert_eq!(chunk.metadata["date"], "2026-07-09");
+        let record = indexed.record.expect("published sessions keep a row");
+        assert_eq!(record.recency.as_deref(), Some("2026-07-09"));
+        assert!(!record.withheld);
+
+        // Reuse re-stamps the same date, not the catalog's session start.
+        let extract = fixture.root.join(&record.extract_relpath);
+        fs::create_dir_all(extract.parent().unwrap()).unwrap();
+        fs::write(&extract, &chunk.text).unwrap();
+        let state = fixture.ledger(record.clone());
+        let reused = fixture.reuse(&state).expect("an unchanged source reuses");
+        assert_eq!(reused.metadata["date"], "2026-07-09");
+        assert_eq!(reused.metadata["scope_conflict"], true);
+
+        // A flagged row written before `recency` existed cannot date its
+        // chunk, so it is parsed once more instead of re-dated by the
+        // session's start, and it does not let the build short-circuit.
+        let mut legacy = record;
+        legacy.recency = None;
+        assert!(!maintenance_record_settled(&legacy) && !maintenance_record_reusable(&legacy));
+        assert!(fixture.reuse(&fixture.ledger(legacy)).is_none());
+    }
+
+    /// An unflagged chunk is still dated by what it shows.
+    #[test]
+    fn an_unflagged_chunk_keeps_the_date_of_its_last_frame() {
+        let fixture = Fixture::new("unflagged");
+        let indexed = fixture.index(vec![
+            fixture.frame("2026-07-01T10:00:00Z", "/repo/public", "first"),
+            fixture.frame("2026-07-03T10:00:00Z", "/repo/public/api", "second"),
+        ]);
+        let chunk = indexed.chunk.expect("published");
+        assert_eq!(chunk.metadata["scope_conflict"], false);
+        assert_eq!(chunk.metadata["date"], "2026-07-03");
+        assert_eq!(
+            chunk_date(false, Some("2026-07-09"), Some("2026-07-03"), None),
+            "2026-07-03"
+        );
+        assert_eq!(
+            chunk_date(true, None, Some("2026-07-03"), Some("2026-06-30")),
+            "2026-07-03"
+        );
     }
 }
