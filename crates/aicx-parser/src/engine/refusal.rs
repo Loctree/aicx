@@ -385,13 +385,19 @@ impl fmt::Display for RefusalReason {
                 session_id,
                 cwds,
                 branches,
-                ..
+                evidence,
             } => write!(
                 formatter,
-                "refused: {} session {session_id} is a mixed-workstream candidate ({} cwd(s), {} branch(es)); one distilled history would braid them — pass distill_mixed to override",
+                "refused: {} session {session_id} is a mixed-workstream candidate ({} cwd(s), {} branch(es)); one distilled history would braid them — {}",
                 agent.as_str(),
                 cwds.len(),
                 branches.len(),
+                // An override cannot distill units that never reached the gate.
+                if evidence.raw_unit_count == 0 {
+                    "none of it reached this gate, so --distill-mixed (MCP: distill_mixed) would add nothing"
+                } else {
+                    "pass --distill-mixed (MCP: distill_mixed) to override"
+                },
             ),
             Self::LedgerNotTotal {
                 agent,

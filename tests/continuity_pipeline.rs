@@ -8,15 +8,24 @@ use chrono::{DateTime, Utc};
 use std::{
     fs,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Output},
+    sync::{Mutex, MutexGuard},
 };
+
+// HOME is process-global; each fixture holds this lock for its whole life.
+static HOME_LOCK: Mutex<()> = Mutex::new(());
 
 struct Fixture {
     root: PathBuf,
     previous_home: Option<std::ffi::OsString>,
+    _home_lock: MutexGuard<'static, ()>,
 }
 impl Fixture {
     fn new() -> Self {
+        // One failing test must not poison the lock and hide which contract broke.
+        let home_lock = HOME_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = std::env::temp_dir().join(format!(
             "aicx-continuity-pipeline-{}-{}",
             std::process::id(),
@@ -24,13 +33,14 @@ impl Fixture {
         ));
         fs::create_dir_all(root.join(".aicx/synthetic")).unwrap();
         let previous_home = std::env::var_os("HOME");
-        // This integration target has one test; no other test thread accesses HOME.
+        // Serialized by HOME_LOCK: no other test thread touches HOME meanwhile.
         unsafe {
             std::env::set_var("HOME", &root);
         }
         Self {
             root,
             previous_home,
+            _home_lock: home_lock,
         }
     }
     fn home(&self) -> PathBuf {
@@ -90,28 +100,86 @@ impl Fixture {
         )
         .unwrap();
     }
-    fn cli(&self, inject: bool) -> String {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_aicx"));
-        command
-            .args([
-                "continuity",
-                "show",
-                "-p",
-                "Loctree/aicx",
-                "-H",
-                "96",
-                "--until",
-                "2026-10-03T04:47:00Z",
-                "--no-refresh",
-            ])
+    /// One Codex rollout launched in repository `alpha` whose later turns
+    /// ran tool calls in `beta` and, conflicting, in `beta` and `gamma`: a
+    /// single session proving more than one scope.
+    fn mixed_source(&self) -> CatalogEntry {
+        let repo = |name: &str| {
+            let repo = self.root.join("workspaces").join(name);
+            fs::create_dir_all(repo.join(".git")).unwrap();
+            serde_json::Value::String(repo.to_string_lossy().into())
+        };
+        let (alpha, beta, gamma) = (repo("alpha"), repo("beta"), repo("gamma"));
+        let id = "55555555-4444-3333-2222-111111111111";
+        let exec = |call: &str, workdir: &serde_json::Value| {
+            format!(
+                "const {call} = await tools.exec_command({{cmd:\"ls\",\"workdir\":{workdir}}});"
+            )
+        };
+        let lines = [
+            serde_json::json!({"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":id,"cwd":alpha}}),
+            serde_json::json!({"timestamp":"2026-01-01T00:01:00Z","type":"turn_context","payload":{"cwd":alpha}}),
+            serde_json::json!({"timestamp":"2026-01-01T00:01:10Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Decision: keep the alpha opening decision"}]}}),
+            serde_json::json!({"timestamp":"2026-01-01T00:02:00Z","type":"turn_context","payload":{"cwd":alpha}}),
+            serde_json::json!({"timestamp":"2026-01-01T00:02:05Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Decision: keep the beta bus decision"}]}}),
+            serde_json::json!({"timestamp":"2026-01-01T00:02:10Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"c1","input":exec("r", &beta)}}),
+            serde_json::json!({"timestamp":"2026-01-01T00:03:00Z","type":"turn_context","payload":{"cwd":alpha}}),
+            serde_json::json!({"timestamp":"2026-01-01T00:03:05Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"c2","input":exec("a", &beta)}}),
+            serde_json::json!({"timestamp":"2026-01-01T00:03:10Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"c3","input":exec("b", &gamma)}}),
+        ];
+        let path = self.home().join(format!("synthetic/rollout-{id}.jsonl"));
+        fs::write(
+            &path,
+            lines
+                .iter()
+                .map(|line| format!("{line}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+        CatalogEntry {
+            schema: CATALOG_SCHEMA.into(),
+            session_id: id.into(),
+            agent: "codex".into(),
+            project: Some("workspaces/alpha".into()),
+            date: Some("2026-01-01".into()),
+            cwd: alpha.as_str().map(Into::into),
+            source_path: path.to_string_lossy().into(),
+            source_len: None,
+            source_mtime_ns: None,
+            source_bundle_fingerprint: None,
+            title: None,
+            machine: None,
+            logical_session_id: None,
+            session_kind: None,
+        }
+    }
+    /// Run the real binary against this fixture's isolated homes.
+    fn run(&self, args: &[&str]) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_aicx"))
+            .args(args)
             .env("HOME", &self.root)
             .env("USERPROFILE", &self.root)
             .env("AICX_HOME", self.home())
-            .env("AICX_ALLOW_TMP", "1");
+            .env("AICX_ALLOW_TMP", "1")
+            .output()
+            .unwrap()
+    }
+    fn cli(&self, inject: bool) -> String {
+        let mut args = vec![
+            "continuity",
+            "show",
+            "-p",
+            "Loctree/aicx",
+            "-H",
+            "96",
+            "--until",
+            "2026-10-03T04:47:00Z",
+            "--no-refresh",
+        ];
         if inject {
-            command.arg("--for-inject");
+            args.push("--for-inject");
         }
-        let output = command.output().unwrap();
+        let output = self.run(&args);
         assert!(
             output.status.success(),
             "{}",
@@ -266,6 +334,7 @@ fn frozen_cli_mcp_inject_census_time_role_and_error_contract() {
         hours: 96,
         until: Some(now),
         for_inject: false,
+        distill_mixed: false,
     })
     .unwrap();
     assert_eq!(normalized_mcp(&mcp.markdown), normalized_mcp(&cli));
@@ -279,6 +348,7 @@ fn frozen_cli_mcp_inject_census_time_role_and_error_contract() {
         hours: 96,
         until: Some(now),
         for_inject: true,
+        distill_mixed: false,
     })
     .unwrap();
     assert!(mcp_inject.markdown.chars().count() <= 24_000);
@@ -289,4 +359,87 @@ fn frozen_cli_mcp_inject_census_time_role_and_error_contract() {
             .markdown
             .contains("preserve synthetic audio constraint")
     );
+}
+
+/// Founder CLI failure (2026-10-20, Issue #88 round 8): a window of only
+/// mixed-workstream work refused with "pass distill_mixed to override", and
+/// `--distill_mixed` was rejected as an unexpected argument — the override
+/// the refusal named existed on no surface.
+#[test]
+fn cli_distill_mixed_overrides_a_mixed_only_window_under_both_spellings() {
+    let fixture = Fixture::new();
+    fixture.catalog(&[fixture.mixed_source()]);
+    let base = [
+        "continuity",
+        "show",
+        "-p",
+        "workspaces/alpha",
+        "-H",
+        "24",
+        "--until",
+        "2026-01-01T12:00:00Z",
+        "--no-refresh",
+    ];
+    let with = |flag: &'static str| [&base[..], &[flag]].concat();
+
+    let refused = fixture.run(&base);
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        !refused.status.success(),
+        "a mixed-only window refuses by default"
+    );
+    assert!(stderr.contains("1 mixed-workstream session(s)"), "{stderr}");
+    assert!(
+        stderr.contains("pass --distill-mixed (MCP: distill_mixed) to distill their 1 record(s)"),
+        "{stderr}"
+    );
+
+    let mut shown = Vec::new();
+    for flag in ["--distill-mixed", "--distill_mixed"] {
+        let output = fixture.run(&with(flag));
+        assert!(
+            output.status.success(),
+            "{flag}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        for line in [
+            "keep the alpha opening decision",
+            "mixed-workstream candidates: 1 session(s) distilled on request; 1 with retained records",
+            "mixed_distilled=true (explicit request)",
+        ] {
+            assert!(stdout.contains(line), "{flag}: missing {line}:\n{stdout}");
+        }
+        assert!(!stdout.contains("beta bus decision"), "{flag}:\n{stdout}");
+        shown.push(stdout);
+    }
+    assert_eq!(shown[0], shown[1], "both spellings are one flag");
+
+    // `write` takes the same switch and writes the same pack.
+    let out = fixture.root.join("CONTINUITY.md");
+    let out_arg = out.to_string_lossy().into_owned();
+    let mut write = with("--distill_mixed");
+    write[1] = "write";
+    write.extend(["-o", out_arg.as_str()]);
+    let written = fixture.run(&write);
+    assert!(
+        written.status.success(),
+        "{}",
+        String::from_utf8_lossy(&written.stderr)
+    );
+    assert_eq!(fs::read_to_string(&out).unwrap(), shown[0]);
+
+    // MCP forwards the same switch to the same pack.
+    let mcp = aicx::mcp_session::continuity_pack(aicx::mcp_session::ContinuityRequest {
+        aicx_home: &fixture.home(),
+        project: Some("workspaces/alpha"),
+        projects: &[],
+        project_match: ProjectMatchMode::Exact,
+        hours: 24,
+        until: Some("2026-01-01T12:00:00Z".parse().unwrap()),
+        for_inject: false,
+        distill_mixed: true,
+    })
+    .unwrap();
+    assert_eq!(normalized_mcp(&mcp.markdown), normalized_mcp(&shown[0]));
 }

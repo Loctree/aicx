@@ -136,12 +136,16 @@ pub fn build_with_scope_at(
         withhold_mixed_sessions(&mut records, &mixed_scope)?;
     }
     refuse_unplaced_only_window(&records, &unplaced_scope)?;
+    refuse_unread_only_window(&records, extraction.stats.source_errors)?;
     for record in &mut records {
         if let Some(timestamp) = record_time(record) {
             record.timestamp = Some(timestamp.to_rfc3339());
         }
     }
-    let sources = collect_sources(&extraction.selection, &records, &mixed_scope);
+    // Distilled mixed records are cited like any other: their sources are
+    // receipts, not omissions.
+    let withheld: &[intents::MixedScopeSession] = if distill_mixed { &[] } else { &mixed_scope };
+    let sources = collect_sources(&extraction.selection, &records, withheld);
 
     Ok(ContinuityPack {
         selection: extraction.selection,
@@ -184,6 +188,23 @@ fn refuse_unplaced_only_window(
     anyhow::bail!(
         "continuity: nothing placed to distill; {frames} frame(s) from {} session(s) were withheld because their turn window ran where no checkout could claim it",
         unplaced_scope.len()
+    )
+}
+
+/// A window with nothing distilled refuses when the extraction could not read
+/// all of it.
+///
+/// `source_errors` counts sources the reader could not cover whole: an
+/// unreadable or unsupported body, a malformed tail, a partial parse. With
+/// records left, the honesty preface names those holes next to the work that
+/// survived. With none left, the empty NOW would read as "a quiet window"
+/// when the truth is "a window this pack could not read".
+fn refuse_unread_only_window(records: &[IntentRecord], source_errors: usize) -> Result<()> {
+    if !records.is_empty() || source_errors == 0 {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "continuity: nothing to distill; {source_errors} source(s) in the window were unreadable, unsupported, or only partially covered, so an empty pack would not prove a quiet window"
     )
 }
 
@@ -230,8 +251,16 @@ fn mixed_window_refusal(
     mixed_scope: &[intents::MixedScopeSession],
     withheld: usize,
 ) -> anyhow::Error {
+    // The override restores what this gate withheld, nothing more. When no
+    // record of these sessions reached it, naming the override as the remedy
+    // would send the operator to an empty pack or a second refusal.
+    let remedy = if withheld == 0 {
+        "no record of theirs reached this gate (upstream filters or the classifier left none), so --distill-mixed (MCP: distill_mixed) would add nothing".to_string()
+    } else {
+        format!("pass --distill-mixed (MCP: distill_mixed) to distill their {withheld} record(s)")
+    };
     let context = format!(
-        "continuity: {} mixed-workstream session(s) in the window and nothing homogeneous to distill; pass distill_mixed to override",
+        "continuity: {} mixed-workstream session(s) in the window and nothing homogeneous to distill; {remedy}",
         mixed_scope.len()
     );
     let refusal = mixed_scope.iter().find_map(|session| {
@@ -700,13 +729,24 @@ pub fn render(pack: &ContinuityPack, for_inject: bool) -> String {
         ));
     }
     if !pack.mixed_scope.is_empty() {
+        // Distilling on request admits a session; it does not restore records
+        // that never reached the gate. Say how many actually contributed.
+        let contributed = pack
+            .mixed_scope
+            .iter()
+            .filter(|session| {
+                pack.records.iter().any(|record| {
+                    record.agent == session.agent && record.session_id == session.session_id
+                })
+            })
+            .count();
         out.push_str(&format!(
             "- mixed-workstream candidates: {} session(s) {} (scope_status=mixed_candidate)\n",
             pack.mixed_scope.len(),
             if pack.distilled_mixed {
-                "distilled on request"
+                format!("distilled on request; {contributed} with retained records")
             } else {
-                "NOT distilled into this pack"
+                "NOT distilled into this pack".to_string()
             }
         ));
         for session in pack.mixed_scope.iter().take(NOW_CAP) {
@@ -926,6 +966,13 @@ mod tests {
                 ),
                 "{label}: {error:#}"
             );
+            // The remedy names the real switch and what it would restore.
+            assert!(
+                format!("{error:#}").contains(
+                    "pass --distill-mixed (MCP: distill_mixed) to distill their 3 record(s)"
+                ),
+                "{label}: {error:#}"
+            );
         }
 
         // A session listed for running wholly in one foreign checkout has one
@@ -977,6 +1024,12 @@ mod tests {
             ),
             "{error:#}"
         );
+        // Finding (Issue #88, round 8): this refusal named `distill_mixed` as
+        // the override, yet the gate had withheld nothing, so the override
+        // could only lead to an empty pack or a second refusal.
+        let message = format!("{error:#}");
+        assert!(message.contains("would add nothing"), "{message}");
+        assert!(!message.contains("to override"), "{message}");
 
         // A homogeneous record is kept and the mixed session's is withheld;
         // a window with no mixed session is not the gate's business.
@@ -1404,6 +1457,58 @@ mod tests {
         assert!(rendered.contains("file touch, not conversation time"));
     }
 
+    /// Distilling on request admits a mixed session; it cannot restore records
+    /// that never reached the gate. The pack says how many of the admitted
+    /// sessions actually contributed.
+    #[test]
+    fn continuity_now_counts_distilled_mixed_sessions_that_contributed() {
+        let mixed = |session_id: &str| crate::intents::MixedScopeSession {
+            agent: "codex".into(),
+            session_id: session_id.into(),
+            cwds: vec!["/repo/alpha".into(), "/repo/beta".into()],
+            branches: Vec::new(),
+            conflicts: 1,
+            hidden_scopes: 0,
+            status: ScopeStatus::MixedCandidate,
+        };
+        let pack = ContinuityPack {
+            selection: Vec::new(),
+            source_errors: 0,
+            dropped_task_events: 0,
+            window_end: String::new(),
+            project_label: "Loctree/aicx".into(),
+            hours: 24,
+            live_sessions: 0,
+            records: vec![weighted_decision(
+                "mixed-a",
+                "a.jsonl",
+                "2026-10-03T22:18:00Z",
+                "kept from a",
+            )],
+            sources: Vec::new(),
+            index_health: IndexHealthLine {
+                newest_session_updated_at: None,
+                committed_at: None,
+                pending: 0,
+                sessions_newer_than_chunks: 0,
+                readiness: "ready".into(),
+                mode: "live",
+            },
+            mixed_scope: vec![mixed("mixed-a"), mixed("mixed-b")],
+            distilled_mixed: true,
+            candidate_cap: 5_000,
+            dropped_candidates: 0,
+            unplaced_scope: Vec::new(),
+        };
+        let rendered = render(&pack, false);
+        assert!(
+            rendered.contains(
+                "- mixed-workstream candidates: 2 session(s) distilled on request; 1 with retained records"
+            ),
+            "{rendered}"
+        );
+    }
+
     #[test]
     fn continuity_now_lists_what_it_withheld_as_unplaced() {
         let unplaced = |session_id: &str, frames: usize| crate::intents::UnplacedScopeSession {
@@ -1466,6 +1571,37 @@ mod tests {
             "{error}"
         );
         refuse_unplaced_only_window(&[], &[]).expect("an empty window with nothing withheld");
+    }
+
+    /// Finding (Issue #88, round 10): `source_errors` was counted and shown in
+    /// HONESTY, but a window with nothing distilled still returned a pack
+    /// whose NOW read as a quiet window — over sources it never read.
+    #[test]
+    fn a_window_with_nothing_read_refuses_instead_of_reading_as_quiet() {
+        let (root, source) = write_continuity_real_path_home("unread");
+        fs::remove_file(&source).expect("drop the cataloged source");
+        let projects = vec!["Loctree/aicx".to_string()];
+        for distill_mixed in [false, true] {
+            let error = match build_with_scope_at(&root, &projects, 24, distill_mixed, Utc::now()) {
+                Ok(pack) => panic!(
+                    "distill_mixed={distill_mixed}: an unread window must refuse, got:\n{}",
+                    render(&pack, false)
+                ),
+                Err(error) => format!("{error:#}"),
+            };
+            assert!(
+                error.contains("nothing to distill; 1 source(s) in the window were unreadable"),
+                "distill_mixed={distill_mixed}: {error}"
+            );
+        }
+        let _ = fs::remove_dir_all(&root);
+
+        // A window with records left keeps them; the preface names the holes.
+        let record = weighted_decision("s1", "s1.jsonl", "2026-10-03T22:18:00Z", "kept");
+        refuse_unread_only_window(std::slice::from_ref(&record), 3)
+            .expect("records left alongside source errors");
+        // Nothing read wrong and nothing found: a quiet window, not a refusal.
+        refuse_unread_only_window(&[], 0).expect("a quiet window with every source read");
     }
     #[test]
     fn continuity_contract_unrelated_outcome_does_not_close_intents() {

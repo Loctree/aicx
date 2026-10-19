@@ -962,6 +962,10 @@ pub struct ContinuityParams {
     /// Bound the markdown to the prompt-inject budget.
     #[serde(default)]
     pub for_inject: bool,
+    /// Distill mixed-workstream sessions instead of withholding them (and
+    /// refusing a window of only such work), same as `--distill-mixed`.
+    #[serde(default)]
+    pub distill_mixed: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -2102,6 +2106,7 @@ impl AicxMcpServer {
             project_match,
             hours: params.hours,
             for_inject: params.for_inject,
+            distill_mixed: params.distill_mixed,
         })
         .map_err(mcp_session::SessionSurfaceError::into_mcp)?;
         let json = serde_json::to_string(&payload).map_err(|e| {

@@ -186,6 +186,8 @@ pub struct ContinuityRequest<'a> {
     pub project_match: ProjectMatchMode,
     pub hours: u64,
     pub for_inject: bool,
+    /// Operator override: distill mixed-workstream sessions into the pack.
+    pub distill_mixed: bool,
 }
 
 pub fn default_list_hours() -> u64 {
@@ -306,7 +308,7 @@ pub fn continuity_pack(
         req.aicx_home,
         &selected,
         req.hours,
-        false,
+        req.distill_mixed,
         req.until.unwrap_or_else(chrono::Utc::now),
     )
     .map_err(|error| SessionSurfaceError::Internal {
@@ -333,8 +335,14 @@ pub fn continuity_pack(
             pack.dropped_candidates, pack.dropped_task_events
         ));
     }
-    if !pack.mixed_scope.is_empty() || !pack.unplaced_scope.is_empty() {
+    if (!pack.mixed_scope.is_empty() && !pack.distilled_mixed) || !pack.unplaced_scope.is_empty() {
         warnings.push("coverage: mixed or unplaced scope was withheld; index readiness does not prove complete coverage".into());
+    }
+    if pack.distilled_mixed && !pack.mixed_scope.is_empty() {
+        warnings.push(format!(
+            "scope: {} mixed-workstream session(s) distilled on explicit request; their history may braid workstreams",
+            pack.mixed_scope.len()
+        ));
     }
     if pack
         .selection
@@ -1270,6 +1278,7 @@ mod tests {
             project_match: ProjectMatchMode::Exact,
             hours: 24,
             for_inject: false,
+            distill_mixed: false,
         })
         .expect("continuity");
         assert!(pack.ok);
@@ -1295,6 +1304,7 @@ mod tests {
             project_match: ProjectMatchMode::Exact,
             hours: 24,
             for_inject: false,
+            distill_mixed: false,
         });
         let err = missing_project.expect_err("project required");
         match err {
@@ -1303,6 +1313,154 @@ mod tests {
             }
             other => panic!("expected project_required, got {other:?}"),
         }
+        let _ = fs::remove_dir_all(home);
+    }
+
+    /// One Codex rollout launched in repository `alpha` whose second turn ran
+    /// its tool calls in repository `beta`, and whose third carried
+    /// conflicting workdirs from `beta` and `gamma`: a single session proving
+    /// more than one scope, and the only work in its window.
+    fn write_mixed_only_continuity_home(label: &str) -> (PathBuf, PathBuf) {
+        let home = temp_home(label);
+        let repo = |name: &str| {
+            let repo = home.join("workspaces").join(name);
+            fs::create_dir_all(repo.join(".git")).expect("repo .git");
+            serde_json::Value::String(repo.display().to_string())
+        };
+        let (alpha, beta, gamma) = (repo("alpha"), repo("beta"), repo("gamma"));
+        let session_id = "11111111-2222-3333-4444-555555555555";
+        let lines = [
+            json!({"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":session_id,"cwd":alpha}}),
+            json!({"timestamp":"2026-01-01T00:01:00Z","type":"turn_context","payload":{"cwd":alpha}}),
+            json!({"timestamp":"2026-01-01T00:01:10Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Decision: keep the alpha opening decision"}]}}),
+            json!({"timestamp":"2026-01-01T00:02:00Z","type":"turn_context","payload":{"cwd":alpha}}),
+            json!({"timestamp":"2026-01-01T00:02:05Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Decision: keep the beta bus decision"}]}}),
+            json!({"timestamp":"2026-01-01T00:02:10Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"c1","input":format!("const r = await tools.exec_command({{cmd:\"npm test\",\"workdir\":{beta}}});")}}),
+            json!({"timestamp":"2026-01-01T00:03:00Z","type":"turn_context","payload":{"cwd":alpha}}),
+            json!({"timestamp":"2026-01-01T00:03:05Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"c2","input":format!("const a = await tools.exec_command({{cmd:\"ls\",\"workdir\":{beta}}});")}}),
+            json!({"timestamp":"2026-01-01T00:03:10Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"c3","input":format!("const b = await tools.exec_command({{cmd:\"ls\",\"workdir\":{gamma}}});")}}),
+        ];
+        // The reader serves sources under the AICX home, never a stray
+        // temp path, so the rollout lives there and the catalog names it.
+        let aicx_home = home.join(".aicx");
+        let source = aicx_home.join(format!("synthetic/rollout-{session_id}.jsonl"));
+        fs::create_dir_all(source.parent().expect("source parent")).expect("source dir");
+        let body: String = lines.iter().map(|line| format!("{line}\n")).collect();
+        fs::write(&source, body).expect("write rollout");
+        let entry = crate::catalog::CatalogEntry {
+            schema: crate::catalog::CATALOG_SCHEMA.to_string(),
+            session_id: session_id.to_string(),
+            agent: "codex".to_string(),
+            project: Some("workspaces/alpha".to_string()),
+            date: Some("2026-01-01".to_string()),
+            cwd: alpha.as_str().map(Into::into),
+            source_path: source.display().to_string(),
+            source_len: None,
+            source_mtime_ns: None,
+            source_bundle_fingerprint: None,
+            title: None,
+            machine: None,
+            logical_session_id: None,
+            session_kind: None,
+        };
+        let catalog_path = crate::catalog::sessions_path_for(&aicx_home);
+        fs::create_dir_all(catalog_path.parent().expect("catalog parent")).expect("catalog dir");
+        fs::write(
+            &catalog_path,
+            format!("{}\n", serde_json::to_string(&entry).expect("catalog row")),
+        )
+        .expect("write catalog");
+        (home, aicx_home)
+    }
+
+    /// Finding (Issue #88, round 8): the refusal told the operator to pass
+    /// `distill_mixed`, and no surface forwarded it — MCP hardcoded `false`.
+    #[test]
+    fn continuity_pack_distills_a_mixed_only_window_on_request() {
+        let (home, aicx_home) = write_mixed_only_continuity_home("continuity-mixed");
+        let until: DateTime<Utc> = "2026-01-01T12:00:00Z".parse().expect("until");
+        let hours = 24;
+        let cutoff_ns = crate::intents::window_cutoff(until, hours)
+            .timestamp_nanos_opt()
+            .map(|nanos| nanos.max(0) as u128)
+            .unwrap_or(0);
+        crate::catalog::prime_live_delta_cache_for_tests(
+            &aicx_home,
+            &home,
+            cutoff_ns,
+            crate::catalog::LiveDelta::default(),
+        );
+        let request = |distill_mixed| ContinuityRequest {
+            until: Some(until),
+            aicx_home: &aicx_home,
+            project: Some("workspaces/alpha"),
+            projects: &[],
+            project_match: ProjectMatchMode::Exact,
+            hours,
+            for_inject: false,
+            distill_mixed,
+        };
+
+        // Default: the only work in the window is mixed, so the pack refuses
+        // and names the switch that overrides it.
+        match continuity_pack(request(false)) {
+            Err(SessionSurfaceError::Internal { message }) => {
+                assert!(
+                    message.contains("1 mixed-workstream session(s)"),
+                    "{message}"
+                );
+                assert!(
+                    message.contains(
+                        "pass --distill-mixed (MCP: distill_mixed) to distill their 1 record(s)"
+                    ),
+                    "{message}"
+                );
+            }
+            other => panic!("a mixed-only window must refuse by default, got {other:?}"),
+        }
+
+        // Override: the session is distilled, the pack says so, and its
+        // records are cited like any other source.
+        let pack = continuity_pack(request(true)).expect("distill_mixed overrides the refusal");
+        assert!(pack.ok);
+        for line in [
+            "keep the alpha opening decision",
+            "mixed-workstream candidates: 1 session(s) distilled on request; 1 with retained records",
+            "mixed_distilled=true (explicit request)",
+            "rollout-11111111-2222-3333-4444-555555555555.jsonl",
+        ] {
+            assert!(
+                pack.markdown.contains(line),
+                "missing {line}:\n{}",
+                pack.markdown
+            );
+        }
+        let sources = pack.markdown.split("## SOURCES").nth(1).unwrap_or_default();
+        assert!(
+            sources.contains("rollout-11111111-2222-3333-4444-555555555555.jsonl"),
+            "a distilled session keeps its source receipt:\n{sources}"
+        );
+        // The override admits the session, not frames its scope gate withheld.
+        assert!(
+            !pack.markdown.contains("beta bus decision"),
+            "{}",
+            pack.markdown
+        );
+        assert!(
+            pack.warnings
+                .iter()
+                .any(|warning| warning.contains("distilled on explicit request")),
+            "{:?}",
+            pack.warnings
+        );
+        assert!(
+            !pack
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("was withheld")),
+            "nothing was withheld: {:?}",
+            pack.warnings
+        );
         let _ = fs::remove_dir_all(home);
     }
 }

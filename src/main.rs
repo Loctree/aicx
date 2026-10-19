@@ -1075,6 +1075,11 @@ enum ContinuityAction {
         /// Skip the bounded catalog hot refresh performed before rendering.
         #[arg(long)]
         no_refresh: bool,
+        /// Distill mixed-workstream sessions into the pack instead of
+        /// withholding them (and refusing a window of only such work). The
+        /// pack states that it did.
+        #[arg(long, visible_alias = "distill_mixed")]
+        distill_mixed: bool,
     },
     /// Write the continuity pack to a file.
     Write {
@@ -1093,6 +1098,11 @@ enum ContinuityAction {
         /// Skip the bounded catalog hot refresh performed before rendering.
         #[arg(long)]
         no_refresh: bool,
+        /// Distill mixed-workstream sessions into the pack instead of
+        /// withholding them (and refusing a window of only such work). The
+        /// pack states that it did.
+        #[arg(long, visible_alias = "distill_mixed")]
+        distill_mixed: bool,
     },
 }
 
@@ -3236,22 +3246,41 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
             )?;
         }
         Some(Commands::Continuity { action }) => {
-            let (projects, hours, until, for_inject, output, no_refresh) = match action {
-                ContinuityAction::Show {
-                    project,
-                    hours,
-                    until,
-                    for_inject,
-                    no_refresh,
-                } => (project, hours, until, for_inject, None, no_refresh),
-                ContinuityAction::Write {
-                    project,
-                    hours,
-                    until,
-                    output,
-                    no_refresh,
-                } => (project, hours, until, false, Some(output), no_refresh),
-            };
+            let (projects, hours, until, for_inject, output, no_refresh, distill_mixed) =
+                match action {
+                    ContinuityAction::Show {
+                        project,
+                        hours,
+                        until,
+                        for_inject,
+                        no_refresh,
+                        distill_mixed,
+                    } => (
+                        project,
+                        hours,
+                        until,
+                        for_inject,
+                        None,
+                        no_refresh,
+                        distill_mixed,
+                    ),
+                    ContinuityAction::Write {
+                        project,
+                        hours,
+                        until,
+                        output,
+                        no_refresh,
+                        distill_mixed,
+                    } => (
+                        project,
+                        hours,
+                        until,
+                        false,
+                        Some(output),
+                        no_refresh,
+                        distill_mixed,
+                    ),
+                };
             let projects = if projects.is_empty() {
                 vec![current_checkout_project()?]
             } else {
@@ -3266,7 +3295,7 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
                 &aicx_home,
                 &resolution.selected,
                 hours,
-                false,
+                distill_mixed,
                 until.unwrap_or_else(chrono::Utc::now),
             )?;
             let rendered = aicx::continuity::render(&pack, for_inject);
