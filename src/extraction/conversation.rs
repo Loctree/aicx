@@ -115,10 +115,13 @@ pub fn human_channel_for_entry(entry: &TimelineEntry) -> Option<aicx_parser::eng
 
 /// Who ran this shell action, when the entry carries the class that proves it.
 ///
-/// `None` means unprovable, not "agent": entries from lanes the throne does
-/// not own yet (legacy archives, importers, Claude's tool lane) never carried
-/// an executor. A narrowed executor axis withholds those rather than guessing
-/// — see [`spec_admits_entry`].
+/// Adapters prove it from the transport: Codex `<user_shell_command>` is the
+/// human's, a Claude `tool_use` with an `input.command` and a Codex
+/// `exec` / `exec_command` / `shell` call are the agent's. `None` means
+/// unprovable, not "agent": entries that never went through an adapter
+/// (legacy archives, importers, store chunks) and tool calls that run no
+/// command carry no executor. A narrowed executor axis withholds those rather
+/// than guessing — see [`spec_admits_entry`].
 pub fn shell_executor_for_entry(entry: &TimelineEntry) -> Option<ShellExecutor> {
     entry
         .frame_class
@@ -133,8 +136,9 @@ pub fn shell_executor_for_entry(entry: &TimelineEntry) -> Option<ShellExecutor> 
 /// `TurnKind::ToolCall` and `TurnKind::ToolResult` onto one `FrameKind`, and
 /// both halves speak with role `tool`. Adapters attach
 /// [`FrameClass::ShellAction`] to the command and leave the result twin
-/// class-less (codex `push_envelope`, junie `push_shell_action`), so class
-/// absence is the precise signal.
+/// class-less (codex `push_envelope`, junie `push_shell_action`; claude and
+/// codex agent tool calls join the result into the class by call id), so
+/// class absence is the precise signal.
 ///
 /// Before this discriminator existed the predicate matched *both* halves and
 /// `fold_shell_results` dropped the command with them: every shell action
@@ -2121,5 +2125,204 @@ mod harness_noise_tests {
         let projection = to_conversation_with_stats(&entries, &[]);
         assert_eq!(projection.messages.len(), 1);
         assert_eq!(projection.messages[0].message, "What does store.rs do?");
+    }
+}
+
+/// `--agent-commands` / `--user-commands` / `--kind shell_action` over real
+/// Claude and Codex records, through the path `extract` runs: parse ->
+/// `timeline_entries_from_model` -> `fold_shell_results` ->
+/// `apply_projection_at` (aicx-problems 2026-10-13: the agent lane admitted
+/// nothing for any provider, and Codex agent runs never reached
+/// `shell_action` at all).
+#[cfg(test)]
+mod agent_command_lane_tests {
+    use super::*;
+    use aicx_parser::engine::{SourceArtifact, SourceFraming, SourceHandle};
+
+    fn entries_for(agent: AgentKind, session: &str, body: &str) -> Vec<TimelineEntry> {
+        let artifact = SourceArtifact::memory(
+            "session.jsonl",
+            body.as_bytes().to_vec(),
+            SourceFraming::JsonLines,
+        )
+        .expect("memory artifact");
+        let handle = SourceHandle::new(agent, session, Some(session.to_owned()), vec![artifact])
+            .expect("source handle");
+        let parsed = crate::parser_dispatch::parse_handle(&handle).expect("parse");
+        crate::output::timeline_entries_from_model(parsed.model())
+    }
+
+    /// One extract invocation: the flags resolved the way the CLI resolves
+    /// them, `--result full` so the joined output is visible.
+    fn extract(entries: &[TimelineEntry], flags: AxisFlags) -> Vec<String> {
+        let mut spec = ProjectionSpec {
+            result: ResultBody::Full,
+            ..ProjectionSpec::default()
+        };
+        apply_axis_flags(&mut spec, &flags).expect("flags resolve");
+        let mut folded = fold_shell_results(entries.to_vec(), &spec);
+        apply_projection_at(&mut folded, &spec, Utc::now());
+        folded.into_iter().map(|entry| entry.message).collect()
+    }
+
+    fn agent_commands() -> AxisFlags {
+        AxisFlags {
+            agent_commands: true,
+            ..AxisFlags::default()
+        }
+    }
+
+    fn user_commands() -> AxisFlags {
+        AxisFlags {
+            user_commands: true,
+            ..AxisFlags::default()
+        }
+    }
+
+    fn kinds(kinds: &[&str]) -> AxisFlags {
+        AxisFlags {
+            kinds: kinds.iter().map(|kind| (*kind).to_owned()).collect(),
+            ..AxisFlags::default()
+        }
+    }
+
+    const CLAUDE_SESSION: &str = "55555555-5555-4555-8555-555555555555";
+
+    fn claude_rows() -> String {
+        let row = |kind: &str, ts: &str, message: serde_json::Value| {
+            serde_json::json!({
+                "type": kind,
+                "sessionId": CLAUDE_SESSION,
+                "cwd": "/repo/alpha",
+                "gitBranch": "main",
+                "timestamp": ts,
+                "message": message,
+            })
+        };
+        [
+            row(
+                "user",
+                "2026-10-13T17:00:00Z",
+                serde_json::json!({"role": "user", "content": "uruchom testy"}),
+            ),
+            // Parallel calls; the results come back in another order.
+            row(
+                "assistant",
+                "2026-10-13T17:00:01Z",
+                serde_json::json!({"role": "assistant", "model": "claude-opus-5", "content": [
+                    {"type": "tool_use", "id": "toolu_test", "name": "Bash",
+                     "input": {"command": "cargo test --workspace"}},
+                    {"type": "tool_use", "id": "toolu_echo", "name": "Bash",
+                     "input": {"command": "echo done"}},
+                ]}),
+            ),
+            row(
+                "user",
+                "2026-10-13T17:00:09Z",
+                serde_json::json!({"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_echo", "content": "done"},
+                    {"type": "tool_result", "tool_use_id": "toolu_test",
+                     "content": "test result: ok. 3 passed"},
+                ]}),
+            ),
+            row(
+                "assistant",
+                "2026-10-13T17:00:10Z",
+                serde_json::json!({"role": "assistant", "model": "claude-opus-5",
+                    "content": [{"type": "text", "text": "Testy przechodza."}]}),
+            ),
+        ]
+        .iter()
+        .map(|row| format!("{row}\n"))
+        .collect()
+    }
+
+    #[test]
+    fn claude_bash_calls_fill_the_agent_command_lane_with_their_own_results() {
+        let entries = entries_for(AgentKind::Claude, CLAUDE_SESSION, &claude_rows());
+        let agent_lane = vec![
+            "$ cargo test --workspace\ntest result: ok. 3 passed".to_owned(),
+            "$ echo done\ndone".to_owned(),
+        ];
+
+        // Before: `no entries were extractable`. Each command renders with the
+        // result its own `tool_use` id answered, not the adjacent row.
+        assert_eq!(extract(&entries, agent_commands()), agent_lane);
+        // `--kind shell_action` (both executors) shows the same runs.
+        assert_eq!(extract(&entries, kinds(&["shell_action"])), agent_lane);
+        // A Claude session holds no command the operator ran.
+        assert!(extract(&entries, user_commands()).is_empty());
+        // Both executors asked for at once is one question, not a conflict.
+        assert_eq!(
+            extract(
+                &entries,
+                AxisFlags {
+                    user_commands: true,
+                    agent_commands: true,
+                    ..AxisFlags::default()
+                }
+            ),
+            agent_lane
+        );
+        // The razor default keeps speech and the folded runs in order; no
+        // result twin and no agent `echo` reaches the operator lane.
+        assert_eq!(
+            extract(&entries, AxisFlags::default()),
+            [
+                vec!["uruchom testy".to_owned()],
+                agent_lane.clone(),
+                vec!["Testy przechodza.".to_owned()]
+            ]
+            .concat()
+        );
+        assert_eq!(
+            extract(&entries, kinds(&["human", "echo_seal"])),
+            vec!["uruchom testy".to_owned()]
+        );
+    }
+
+    fn codex_rows() -> String {
+        [
+            r#"{"timestamp":"2026-10-13T17:00:00Z","type":"session_meta","payload":{"id":"codex-agent-lane","cwd":"/repo"}}"#,
+            r#"{"timestamp":"2026-10-13T17:00:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"odpal testy"}]}}"#,
+            r#"{"timestamp":"2026-10-13T17:00:02Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"c1","arguments":"{\"cmd\":\"cargo test\"}"}}"#,
+            r#"{"timestamp":"2026-10-13T17:00:03Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"c2","arguments":"{\"cmd\":\"echo done\"}"}}"#,
+            r#"{"timestamp":"2026-10-13T17:00:04Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"c3","input":"await tools.exec_command({cmd:\"git status\"});"}}"#,
+            r#"{"timestamp":"2026-10-13T17:00:05Z","type":"response_item","payload":{"type":"function_call","name":"update_plan","call_id":"c4","arguments":"{\"plan\":[]}"}}"#,
+            r#"{"timestamp":"2026-10-13T17:00:06Z","type":"response_item","payload":{"type":"function_call_output","call_id":"c2","output":"done"}}"#,
+            r#"{"timestamp":"2026-10-13T17:00:07Z","type":"response_item","payload":{"type":"function_call_output","call_id":"c1","output":"test result: ok"}}"#,
+            r#"{"timestamp":"2026-10-13T17:00:08Z","type":"response_item","payload":{"type":"function_call_output","call_id":"c4","output":"Plan updated"}}"#,
+            r#"{"timestamp":"2026-10-13T17:00:09Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"c3","output":"On branch main"}}"#,
+            r#"{"timestamp":"2026-10-13T17:00:10Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<user_shell_command>\n<command>\npsa loctree\n</command>\n<result>\nExit code: 0\n</result>\n</user_shell_command>"}]}}"#,
+        ]
+        .iter()
+        .map(|row| format!("{row}\n"))
+        .collect()
+    }
+
+    #[test]
+    fn codex_exec_and_shell_calls_split_from_the_operators_commands() {
+        let entries = entries_for(AgentKind::Codex, "codex-agent-lane", &codex_rows());
+        let agent_lane = vec![
+            "$ cargo test\ntest result: ok".to_owned(),
+            "$ echo done\ndone".to_owned(),
+            "$ await tools.exec_command({cmd:\"git status\"});\nOn branch main".to_owned(),
+        ];
+
+        // Before: zero of the agent's runs; `update_plan` runs no command.
+        assert_eq!(extract(&entries, agent_commands()), agent_lane);
+        // The operator's envelope is the only human command.
+        let human = extract(&entries, user_commands());
+        assert_eq!(human.len(), 1);
+        assert!(human[0].starts_with("$ psa loctree\n<user_shell_command>"));
+        // `--kind shell_action` carries both executors, in record order.
+        let all = extract(&entries, kinds(&["shell_action"]));
+        assert_eq!(all, [agent_lane, human].concat());
+        // The agent's `echo` stays its own run; the operator lane holds only
+        // what the operator typed.
+        assert_eq!(
+            extract(&entries, kinds(&["human", "echo_seal"])),
+            vec!["odpal testy".to_owned()]
+        );
     }
 }

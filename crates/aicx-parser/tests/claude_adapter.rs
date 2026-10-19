@@ -1335,3 +1335,131 @@ fn claude_direct_user_text_is_human_direct_through_the_throne() {
     assert_eq!(classified.seal.seal_ts, turn.timestamp);
     assert_eq!(classified.turn_kind, Some(TurnKind::UserMsg));
 }
+
+/// A command-bearing `tool_use` is the agent's shell action — the lane
+/// `--agent-commands` reads (aicx-problems 2026-10-13: it admitted nothing,
+/// because no Claude turn carried an executor). The throne classifies it from
+/// the transport; the `tool_result` that answers it is a later row, often not
+/// adjacent, and is joined into the class by `tool_use` id.
+#[test]
+fn claude_command_tool_use_is_the_agents_shell_action_with_its_result_joined() {
+    use aicx_parser::engine::{FrameClass, ShellExecutor};
+
+    let session = "44444444-4444-4444-8444-444444444444";
+    let row = |kind: &str, ts: &str, message: serde_json::Value| {
+        serde_json::json!({
+            "type": kind,
+            "sessionId": session,
+            "cwd": "/repo/alpha",
+            "gitBranch": "main",
+            "timestamp": ts,
+            "message": message,
+        })
+    };
+    let tool_use = |id: &str, name: &str, input: serde_json::Value| serde_json::json!({"type": "tool_use", "id": id, "name": name, "input": input});
+    let tool_result = |id: &str, text: &str| serde_json::json!({"type": "tool_result", "tool_use_id": id, "content": text});
+    let body = [
+        row(
+            "user",
+            "2026-10-13T17:00:00Z",
+            serde_json::json!({"role": "user", "content": "uruchom testy"}),
+        ),
+        // Parallel calls: two commands, one file read, one command that is
+        // never answered (interrupted turn).
+        row(
+            "assistant",
+            "2026-10-13T17:00:01Z",
+            serde_json::json!({"role": "assistant", "model": "claude-opus-5", "content": [
+                tool_use("toolu_test", "Bash", serde_json::json!({"command": "cargo test --workspace"})),
+                tool_use("toolu_read", "Read", serde_json::json!({"file_path": "/repo/alpha/Cargo.toml"})),
+                tool_use("toolu_echo", "Bash", serde_json::json!({"command": "echo done"})),
+                tool_use("toolu_wait", "Bash", serde_json::json!({"command": "sleep 600"})),
+            ]}),
+        ),
+        // Results come back in another order than the calls went out.
+        row(
+            "user",
+            "2026-10-13T17:00:09Z",
+            serde_json::json!({"role": "user", "content": [
+                tool_result("toolu_read", "[package]"),
+                tool_result("toolu_echo", "done"),
+                tool_result("toolu_test", "test result: ok. 3 passed"),
+            ]}),
+        ),
+    ]
+    .iter()
+    .map(|row| format!("{row}\n"))
+    .collect::<String>();
+    let model = session_model(session, &body);
+
+    let call = |command: &str| {
+        model
+            .turns
+            .iter()
+            .find(|turn| turn.kind == TurnKind::ToolCall && turn.text == command)
+            .unwrap_or_else(|| panic!("call turn `{command}`"))
+    };
+    let result_hash = |text: &str| {
+        model
+            .turns
+            .iter()
+            .find(|turn| turn.kind == TurnKind::ToolResult && turn.text == text)
+            .map(|turn| turn.text_hash.clone())
+            .unwrap_or_else(|| panic!("result turn `{text}`"))
+    };
+
+    for (command, output) in [
+        ("cargo test --workspace", "test result: ok. 3 passed"),
+        // `# claude` has no echo bus: an agent's echo is its own run, never
+        // operator speech.
+        ("echo done", "done"),
+    ] {
+        let turn = call(command);
+        // The call keeps its lane and its recorded body; only the class is new.
+        assert_eq!(turn.role, TurnRole::Assistant);
+        match &turn.frame_class {
+            Some(FrameClass::ShellAction {
+                cmd,
+                result,
+                executor,
+            }) => {
+                assert_eq!(cmd, command);
+                assert_eq!(*executor, ShellExecutor::Agent);
+                assert_eq!(result.text, output, "result joined by tool_use id");
+                assert_eq!(
+                    result.hash,
+                    result_hash(output),
+                    "the class retains the result twin byte for byte"
+                );
+            }
+            other => panic!("`{command}` must be the agent's shell action, got {other:?}"),
+        }
+    }
+
+    match &call("sleep 600").frame_class {
+        Some(FrameClass::ShellAction { result, .. }) => {
+            assert!(result.text.is_empty(), "no result row, nothing retained");
+        }
+        other => panic!("an unanswered command is still a shell action, got {other:?}"),
+    }
+
+    // A tool without a command is not a shell action, and no result row
+    // carries a class: it is the twin the projection folds away.
+    assert_eq!(call("").frame_class, None, "Read carries no command");
+    assert!(
+        model
+            .turns
+            .iter()
+            .filter(|turn| turn.kind == TurnKind::ToolResult)
+            .all(|turn| turn.frame_class.is_none())
+    );
+    assert_eq!(
+        model
+            .turns
+            .iter()
+            .filter(|turn| turn.kind == TurnKind::UserMsg)
+            .count(),
+        1,
+        "no command became operator speech"
+    );
+}
