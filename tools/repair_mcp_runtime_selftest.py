@@ -64,8 +64,20 @@ def fixture(tmp: Path) -> tuple[Path, Path, dict[str, str], Path, Path]:
         "if [ \"${1:-}\" = managername ]; then echo Aqua; exit 0; fi\n"
         "if [ \"${1:-}\" = print ]; then\n"
         "  label=${2##*/}\n"
-        "  [ -e \"$AICX_SELFTEST_LAUNCHCTL_STATE/$label\" ] || exit 1\n"
-        "  printf 'state = running\\npid = %s\\n' \"${AICX_SELFTEST_JOB_PID:-4242}\"\n"
+        "  if [ ! -e \"$AICX_SELFTEST_LAUNCHCTL_STATE/$label\" ]; then\n"
+        "    printf 'Could not find service \"%s\" in domain for user gui: %s\\n' \"$label\" \"$(id -u)\" >&2\n"
+        "    exit 113\n"
+        "  fi\n"
+        "  printf '\\tstate = running\\n\\tpid = %s\\n\\tlast exit code = %s\\n' \\\n"
+        "    \"${AICX_SELFTEST_JOB_PID:-4242}\" \"${AICX_SELFTEST_LAST_EXIT:-(never exited)}\"\n"
+        "  exit 0\n"
+        "fi\n"
+        "if [ \"${1:-}\" = print-disabled ]; then\n"
+        "  printf 'disabled services = {\\n'\n"
+        "  if [ -n \"${AICX_SELFTEST_DISABLED_LABEL:-}\" ]; then\n"
+        "    printf '\\t\"%s\" => disabled\\n' \"$AICX_SELFTEST_DISABLED_LABEL\"\n"
+        "  fi\n"
+        "  printf '}\\n'\n"
         "  exit 0\n"
         "fi\n"
         "if [ \"${1:-}\" = bootout ]; then\n"
@@ -96,6 +108,7 @@ def fixture(tmp: Path) -> tuple[Path, Path, dict[str, str], Path, Path]:
         "      exit 1\n"
         "    fi\n"
         "  fi\n"
+        "  [ \"${AICX_SELFTEST_BOOTSTRAP_DROPS_JOB:-0}\" = 1 ] && exit 0\n"
         "  : > \"$AICX_SELFTEST_LAUNCHCTL_STATE/$label\"\n"
         "  exit 0\n"
         "fi\n"
@@ -179,6 +192,15 @@ def assert_common_plist_preserved(before: dict, after: dict) -> None:
 
 def launchctl_state(env: dict[str, str], label: str) -> Path:
     return Path(env["AICX_SELFTEST_LAUNCHCTL_STATE"]) / label
+
+
+def mcp_down_error(plist_path: Path) -> str:
+    domain = f"gui/{os.getuid()}"
+    return (
+        f"Error: previous MCP plist restored at {plist_path}, but launchd could not "
+        f"reload the service — MCP is DOWN until you run: launchctl bootstrap "
+        f"{domain} {plist_path}"
+    )
 
 
 def test_clean_reader_and_scheduler(tmp: Path) -> None:
@@ -386,7 +408,18 @@ def test_exhausted_bootstrap_retries_restore_loaded_state(tmp: Path) -> None:
     assert result.returncode != 0
     assert plist_path.read_bytes() == original
     assert "did not load; rolling back" in result.stderr
+    domain = f"gui/{os.getuid()}"
+    # The failed repair bootstrap carries launchd context, not a bare EIO.
+    assert f"launchd diagnostics for {domain}/com.loctree.aicx.mcp:" in result.stderr
+    assert "launchctl print: service is not loaded" in result.stderr
+    assert "job not listed after 2 attempt(s)" in result.stderr
+    # Rollback claims loaded state only after launchd lists the job again.
     assert "previous MCP plist and loaded state restored" in result.stdout
+    assert "verified via launchctl print" in result.stdout
+    assert launchctl_state(env, "com.loctree.aicx.mcp").exists()
+    log_lines = launchctl_log.read_text(encoding="utf-8").splitlines()
+    assert log_lines[-1] == f"print {domain}/com.loctree.aicx.mcp"
+    assert "Error: previous MCP plist restored" not in result.stderr
     assert launchctl_log.read_text(encoding="utf-8").count("bootstrap ") == 3
     assert not curl_log.exists()
 
@@ -415,14 +448,110 @@ def test_persistent_bootstrap_failure_names_manual_recovery(tmp: Path) -> None:
     assert plist_path.read_bytes() == original
     assert "did not load; rolling back" in result.stderr
     assert "Bootstrap failed: 5: Input/output error" in result.stderr
-    assert "could not be reloaded" in result.stderr
     assert (
-        f"Recover manually: launchctl bootstrap gui/{os.getuid()} {plist_path}"
+        f"launchd diagnostics for gui/{os.getuid()}/com.loctree.aicx.mcp:"
         in result.stderr
     )
+    # Restored file + dead service is an outage: a hard error whose last word
+    # is the exact one-line recovery, never a soft warning.
+    assert result.stderr.rstrip().splitlines()[-1] == mcp_down_error(plist_path)
+    assert "Warning:" not in result.stderr
     assert "loaded state restored" not in result.stdout
+    assert not launchctl_state(env, "com.loctree.aicx.mcp").exists()
     assert launchctl_log.read_text(encoding="utf-8").count("bootstrap ") == 4
     assert not curl_log.exists()
+
+
+def test_disabled_label_is_named_in_bootstrap_diagnostics(tmp: Path) -> None:
+    agents, _, env, _, _ = fixture(tmp)
+    plist_path = agents / "com.loctree.aicx.mcp.plist"
+    write_plist(
+        plist_path,
+        "com.loctree.aicx.mcp",
+        ["/stale/aicx", "serve", "--transport", "http", "--port", "8044"],
+    )
+    launchctl_state(env, "com.loctree.aicx.mcp").touch()
+
+    result = run_repair(
+        env
+        | {
+            "AICX_SELFTEST_FAIL_BOOTSTRAP_ONCE": "1",
+            "AICX_SELFTEST_FAIL_BOOTSTRAP_COUNT": "99",
+            "AICX_RUNTIME_BOOTSTRAP_ATTEMPTS": "1",
+            "AICX_SELFTEST_DISABLED_LABEL": "com.loctree.aicx.mcp",
+        },
+        check=False,
+    )
+    assert result.returncode != 0
+    assert (
+        'launchctl print-disabled: "com.loctree.aicx.mcp" => disabled' in result.stderr
+    )
+    assert result.stderr.rstrip().splitlines()[-1] == mcp_down_error(plist_path)
+
+
+def test_silent_bootstrap_drop_is_reported_as_down(tmp: Path) -> None:
+    # launchctl may exit 0 without the job ever being listed. Loaded state is
+    # launchd's listing, so both the repair and the rollback must see the
+    # outage and name the recovery even though launchctl printed no error.
+    agents, _, env, launchctl_log, curl_log = fixture(tmp)
+    plist_path = agents / "com.loctree.aicx.mcp.plist"
+    write_plist(
+        plist_path,
+        "com.loctree.aicx.mcp",
+        ["/stale/aicx", "serve", "--transport", "http", "--port", "8044"],
+    )
+    original = plist_path.read_bytes()
+    launchctl_state(env, "com.loctree.aicx.mcp").touch()
+
+    result = run_repair(
+        env
+        | {
+            "AICX_SELFTEST_BOOTSTRAP_DROPS_JOB": "1",
+            "AICX_RUNTIME_BOOTSTRAP_ATTEMPTS": "2",
+        },
+        check=False,
+    )
+    assert result.returncode != 0
+    assert plist_path.read_bytes() == original
+    assert "Bootstrap failed" not in result.stderr
+    assert "did not load; rolling back" in result.stderr
+    assert result.stderr.count("launchctl print: service is not loaded") == 2
+    assert result.stderr.rstrip().splitlines()[-1] == mcp_down_error(plist_path)
+    assert "loaded state restored" not in result.stdout
+    assert not launchctl_state(env, "com.loctree.aicx.mcp").exists()
+    assert launchctl_log.read_text(encoding="utf-8").count("bootstrap ") == 4
+    assert not curl_log.exists()
+
+
+def test_rollback_reload_failure_names_each_down_label(tmp: Path) -> None:
+    agents, _, env, _, _ = fixture(tmp)
+    canonical = agents / "com.loctree.aicx.mcp.plist"
+    legacy = agents / "io.vetcoders.aicx.mcp.plist"
+    write_plist(
+        canonical,
+        "com.loctree.aicx.mcp",
+        ["/old/canonical", "serve", "--transport", "http", "--port", "8044"],
+    )
+    write_plist(
+        legacy,
+        "io.vetcoders.aicx.mcp",
+        ["/old/legacy", "--transport", "http", "--port", "8044"],
+    )
+    launchctl_state(env, "com.loctree.aicx.mcp").touch()
+    launchctl_state(env, "io.vetcoders.aicx.mcp").touch()
+
+    result = run_repair(
+        env
+        | {
+            "AICX_SELFTEST_BOOTSTRAP_DROPS_JOB": "1",
+            "AICX_RUNTIME_BOOTSTRAP_ATTEMPTS": "1",
+        },
+        check=False,
+    )
+    assert result.returncode != 0
+    stderr_lines = result.stderr.rstrip().splitlines()
+    assert stderr_lines[-2:] == [mcp_down_error(canonical), mcp_down_error(legacy)]
+    assert "loaded state restored" not in result.stdout
 
 
 def test_health_failure_restores_previous_plist(tmp: Path) -> None:
@@ -436,9 +565,20 @@ def test_health_failure_restores_previous_plist(tmp: Path) -> None:
     original = plist_path.read_bytes()
     assert not launchctl_state(env, "com.loctree.aicx.mcp").exists()
 
-    result = run_repair(env | {"AICX_SELFTEST_FAIL_HEALTH": "1"}, check=False)
+    result = run_repair(
+        env
+        | {
+            "AICX_SELFTEST_FAIL_HEALTH": "1",
+            "AICX_SELFTEST_LAST_EXIT": "78: EX_CONFIG",
+        },
+        check=False,
+    )
     assert result.returncode != 0
     assert plist_path.read_bytes() == original
+    # The repaired job is still listed when health fails, so its launchd
+    # state and exit code reach the operator before rollback boots it out.
+    assert "  state = running" in result.stderr
+    assert "  last exit code = 78: EX_CONFIG" in result.stderr
     assert "did not own the listening socket and return HTTP 200" in result.stderr
     assert "previous MCP plist restored; previous services remained unloaded" in result.stdout
     assert "loaded state restored" not in result.stdout
@@ -685,6 +825,9 @@ def main() -> None:
         test_persistent_bootstrap_failure_names_manual_recovery(
             base / "bootstrap-persistent"
         )
+        test_disabled_label_is_named_in_bootstrap_diagnostics(base / "bootstrap-disabled")
+        test_silent_bootstrap_drop_is_reported_as_down(base / "bootstrap-silent-drop")
+        test_rollback_reload_failure_names_each_down_label(base / "two-label-down")
         test_health_failure_restores_previous_plist(base / "health-failure")
         test_foreign_http_listener_cannot_mask_bind_failure(base / "foreign-listener")
         test_health_failure_restores_both_labels_and_registrations(

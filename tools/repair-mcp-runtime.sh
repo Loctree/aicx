@@ -16,10 +16,38 @@ gui_domain() { printf 'gui/%s' "$(id -u)"; }
 # Input/output error". Wait for the label to disappear, and retry bootstrap.
 BOOTSTRAP_ATTEMPTS="${AICX_RUNTIME_BOOTSTRAP_ATTEMPTS:-5}"
 
+# launchd's own listing is the only truth for "loaded"; bootstrap's exit
+# status is not (it reports EIO for races and for already-loaded labels).
+service_loaded() {
+  launchctl print "$(gui_domain)/$1" >/dev/null 2>&1
+}
+
+# "Bootstrap failed: 5: Input/output error" carries no cause. Attach what
+# launchd knows: the job's state and last exit code while it is listed, and
+# whether the label is disabled in the GUI domain.
+launchd_diagnostics() {
+  local label="$1"
+  local target
+  local state
+  local disabled
+  target="$(gui_domain)/$label"
+  state="$(launchctl print "$target" 2>&1 | grep -E 'state =|last exit code =' | sed 's/^[[:space:]]*//' || true)"
+  disabled="$(launchctl print-disabled "$(gui_domain)" 2>/dev/null | grep -F "\"$label\"" | sed 's/^[[:space:]]*//' || true)"
+  printf 'launchd diagnostics for %s:\n' "$target" >&2
+  if [ -n "$state" ]; then
+    printf '%s\n' "$state" | sed 's/^/  /' >&2
+  else
+    printf '  launchctl print: service is not loaded\n' >&2
+  fi
+  if [ -n "$disabled" ]; then
+    printf '  launchctl print-disabled: %s\n' "$disabled" >&2
+  fi
+}
+
 wait_until_unloaded() {
   local label="$1"
   local tries=20
-  while launchctl print "$(gui_domain)/$label" >/dev/null 2>&1; do
+  while service_loaded "$label"; do
     tries=$((tries - 1))
     if [ "$tries" -le 0 ]; then
       return 1
@@ -42,7 +70,7 @@ bootstrap_with_retry() {
   local err=""
   while :; do
     err="$(launchctl bootstrap "$(gui_domain)" "$plist" 2>&1)" || true
-    if launchctl print "$(gui_domain)/$label" >/dev/null 2>&1; then
+    if service_loaded "$label"; then
       return 0
     fi
     if [ "$attempt" -ge "$BOOTSTRAP_ATTEMPTS" ]; then
@@ -54,6 +82,9 @@ bootstrap_with_retry() {
   if [ -n "$err" ]; then
     printf '%s\n' "$err" >&2
   fi
+  printf 'launchctl bootstrap %s %s: job not listed after %s attempt(s)\n' \
+    "$(gui_domain)" "$plist" "$attempt" >&2
+  launchd_diagnostics "$label"
   return 1
 }
 
@@ -84,10 +115,10 @@ if [ ! -f "$SOURCE_PLIST" ]; then
 fi
 CANONICAL_WAS_LOADED=0
 LEGACY_WAS_LOADED=0
-if launchctl print "$(gui_domain)/$LABEL" >/dev/null 2>&1; then
+if service_loaded "$LABEL"; then
   CANONICAL_WAS_LOADED=1
 fi
-if launchctl print "$(gui_domain)/$LEGACY_LABEL" >/dev/null 2>&1; then
+if service_loaded "$LEGACY_LABEL"; then
   LEGACY_WAS_LOADED=1
 fi
 
@@ -123,25 +154,28 @@ rollback_on_exit() {
           mv -f "$LEGACY_ARCHIVE" "$LEGACY_PLIST"
         fi
       fi
-      reload_failed=0
       if [ "$CANONICAL_WAS_LOADED" = "1" ]; then
-        if ! bootstrap_with_retry "$CANONICAL_PLIST" "$LABEL"; then
-          reload_failed=1
-          echo "Recover manually: launchctl bootstrap $(gui_domain) $CANONICAL_PLIST" >&2
-        fi
+        bootstrap_with_retry "$CANONICAL_PLIST" "$LABEL" || true
       fi
       if [ "$LEGACY_WAS_LOADED" = "1" ]; then
-        if ! bootstrap_with_retry "$LEGACY_PLIST" "$LEGACY_LABEL"; then
-          reload_failed=1
-          echo "Recover manually: launchctl bootstrap $(gui_domain) $LEGACY_PLIST" >&2
-        fi
+        bootstrap_with_retry "$LEGACY_PLIST" "$LEGACY_LABEL" || true
+      fi
+      # Loaded state counts as restored only when launchd lists every job
+      # that was loaded before repair began, checked after all reloads ran.
+      # A restored file with a dead service is an outage, not a warning.
+      reload_failed=0
+      if [ "$CANONICAL_WAS_LOADED" = "1" ] && ! service_loaded "$LABEL"; then
+        reload_failed=1
+        echo "Error: previous MCP plist restored at $CANONICAL_PLIST, but launchd could not reload the service — MCP is DOWN until you run: launchctl bootstrap $(gui_domain) $CANONICAL_PLIST" >&2
+      fi
+      if [ "$LEGACY_WAS_LOADED" = "1" ] && ! service_loaded "$LEGACY_LABEL"; then
+        reload_failed=1
+        echo "Error: previous MCP plist restored at $LEGACY_PLIST, but launchd could not reload the service — MCP is DOWN until you run: launchctl bootstrap $(gui_domain) $LEGACY_PLIST" >&2
       fi
       if [ "$CANONICAL_WAS_LOADED" = "0" ] && [ "$LEGACY_WAS_LOADED" = "0" ]; then
         note "rollback: previous MCP plist restored; previous services remained unloaded"
       elif [ "$reload_failed" = "0" ]; then
-        note "rollback: previous MCP plist and loaded state restored"
-      else
-        echo "Warning: previous MCP plist restored, but a prior loaded service could not be reloaded" >&2
+        note "rollback: previous MCP plist and loaded state restored (verified via launchctl print)"
       fi
     fi
   fi
@@ -307,6 +341,8 @@ while [ "$attempt" -le "$HEALTH_ATTEMPTS" ]; do
   attempt=$((attempt + 1))
 done
 if [ "$ready" != "1" ]; then
+  # The repaired job is still listed here, so launchd can say how it died.
+  launchd_diagnostics "$LABEL"
   echo "Error: repaired MCP service did not own the listening socket and return HTTP 200 at $HEALTH_URL; rolling back" >&2
   exit 1
 fi

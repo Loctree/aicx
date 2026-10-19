@@ -170,7 +170,7 @@ async fn run_deep_impl(
     phase.tick(4);
     let mut semantic_health = {
         let opts = opts.clone();
-        check!(phase, hb, move || check_semantic_health(&opts))
+        check!(phase, hb, move || check_semantic_health(&opts, true))
     };
     phase.tick(5);
     let mut embedder_warmth = {
@@ -519,7 +519,7 @@ async fn run_deep_impl(
         phase.tick(7);
         semantic_health = {
             let opts = opts.clone();
-            check!(phase, hb, move || check_semantic_health(&opts))
+            check!(phase, hb, move || check_semantic_health(&opts, true))
         };
         phase.tick(8);
         index_freshness = {
@@ -890,7 +890,7 @@ pub(crate) async fn run_fast_impl(
     let sidecars = check_sidecars_fast(&walk, budget);
     let corpus_buckets = check_corpus_buckets(base);
     let noise_health = unmeasured_in_fast("noise_health", "sidecar noise aggregation");
-    let semantic_health = check_semantic_health(opts);
+    let semantic_health = check_semantic_health(opts, false);
     let index_freshness = unmeasured_in_fast("index_freshness", "recursive store mtime scan");
     let index_consistency =
         unmeasured_in_fast("index_consistency", "index.json vs store reconciliation");
@@ -1219,9 +1219,23 @@ pub(crate) fn check_context_corpus(base: &Path) -> CheckResult {
     }
 }
 
+/// Semantic capability check. Fast health stays bounded: it proves the
+/// configured backend from config and model-file presence alone. Loading the
+/// native GGUF engine (model mmap + Metal warm-up) is paid only under
+/// `--smoke` or `--deep`; the cloud HTTP probe only under `--smoke`.
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
-pub(crate) fn check_semantic_health(opts: &DoctorOptions) -> CheckResult {
+pub(crate) fn check_semantic_health(opts: &DoctorOptions, deep: bool) -> CheckResult {
     let cfg = crate::embedder::EmbeddingConfig::from_env();
+    semantic_health_with(&cfg, opts, deep, native_embedder_ping)
+}
+
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+fn semantic_health_with(
+    cfg: &crate::embedder::EmbeddingConfig,
+    opts: &DoctorOptions,
+    deep: bool,
+    engine_ping: impl FnOnce() -> std::result::Result<String, String>,
+) -> CheckResult {
     match cfg.backend {
         crate::embedder::BackendPreference::Cloud => {
             let Some(cloud) = cfg.cloud.as_ref() else {
@@ -1259,7 +1273,7 @@ pub(crate) fn check_semantic_health(opts: &DoctorOptions) -> CheckResult {
                     recommendation: None,
                 };
             }
-            match crate::embedder::cloud::probe(&cloud.url, &cloud.model) {
+            match cloud_embedder_probe(&cloud.url, &cloud.model) {
                 Ok(detail) => CheckResult {
                     name: "semantic_health".to_string(),
                     severity: Severity::Green,
@@ -1293,7 +1307,18 @@ pub(crate) fn check_semantic_health(opts: &DoctorOptions) -> CheckResult {
                     crate::embedder::find_cached_model_file(&resolved.repo, &resolved.filename)
                 });
             if let Some(path) = found {
-                match native_embedder_ping() {
+                if !opts.smoke && !deep {
+                    return CheckResult {
+                        name: "semantic_health".to_string(),
+                        severity: Severity::Green,
+                        detail: format!(
+                            "native model available at {} (pass --smoke for engine probe)",
+                            path.display()
+                        ),
+                        recommendation: None,
+                    };
+                }
+                match engine_ping() {
                     Ok(detail) => CheckResult {
                         name: "semantic_health".to_string(),
                         severity: Severity::Green,
@@ -1323,7 +1348,8 @@ pub(crate) fn check_semantic_health(opts: &DoctorOptions) -> CheckResult {
                     recommendation: Some(
                         "Hydrate the model cache or switch [embedder].backend = \"cloud\". Semantic features will be skipped until available."
                             .to_string(),
-                    ),                }
+                    ),
+                }
             }
         }
         crate::embedder::BackendPreference::Candle => CheckResult {
@@ -1342,13 +1368,25 @@ pub(crate) fn native_embedder_ping() -> std::result::Result<String, String> {
         .map_err(|err| err.to_string())
 }
 
+#[cfg(feature = "cloud-embedder")]
+fn cloud_embedder_probe(url: &str, model: &str) -> std::result::Result<String, String> {
+    crate::embedder::cloud::probe(url, model)
+}
+
+/// A native-only build still parses a `backend = "cloud"` config; it must
+/// report the missing capability instead of failing to compile.
+#[cfg(all(feature = "native-embedder", not(feature = "cloud-embedder")))]
+fn cloud_embedder_probe(_url: &str, _model: &str) -> std::result::Result<String, String> {
+    Err("binary built without the cloud-embedder feature".to_string())
+}
+
 #[cfg(not(feature = "native-embedder"))]
 pub(crate) fn native_embedder_ping() -> std::result::Result<String, String> {
     Ok("native engine info probe skipped; native-embedder feature is disabled".to_string())
 }
 
 #[cfg(not(any(feature = "native-embedder", feature = "cloud-embedder")))]
-pub(crate) fn check_semantic_health(_opts: &DoctorOptions) -> CheckResult {
+pub(crate) fn check_semantic_health(_opts: &DoctorOptions, _deep: bool) -> CheckResult {
     CheckResult {
         name: "semantic_health".to_string(),
         severity: Severity::Critical,
@@ -1720,7 +1758,7 @@ pub(crate) fn check_embedder_warmth(opts: &DoctorOptions) -> CheckResult {
             && let Some(cloud) = cfg.cloud.as_ref()
         {
             let start = std::time::Instant::now();
-            match crate::embedder::cloud::probe(&cloud.url, &cloud.model) {
+            match cloud_embedder_probe(&cloud.url, &cloud.model) {
                 Ok(_) => {
                     let elapsed = start.elapsed();
                     let severity = if elapsed < Duration::from_millis(500) {
@@ -2525,5 +2563,85 @@ mod fast_health_budget_tests {
         let report = rt.block_on(run_fast_impl(&base, &opts(), &mut budget));
         assert_eq!(report.sidecars.severity, Severity::Warning);
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A GGUF config pinned to a real file on disk, built by hand so the
+    /// check never consults the host's env, `config.toml`, or HF cache.
+    #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+    fn present_gguf_model(
+        tag: &str,
+        backend: crate::embedder::BackendPreference,
+    ) -> (PathBuf, crate::embedder::EmbeddingConfig) {
+        let base = fixture(tag, 0, 0);
+        std::fs::create_dir_all(&base).unwrap();
+        let model = base.join("model.Q4_K_M.gguf");
+        std::fs::write(&model, b"not-a-real-gguf").unwrap();
+        let cfg = crate::embedder::EmbeddingConfig {
+            backend,
+            model_path: Some(model),
+            ..Default::default()
+        };
+        (base, cfg)
+    }
+
+    #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+    #[test]
+    fn fast_semantic_health_trusts_model_presence_without_loading_the_engine() {
+        // Issue #88: fast health loaded the GGUF model (and warmed Metal)
+        // whenever the file existed, blowing its latency bound.
+        for backend in [
+            crate::embedder::BackendPreference::Gguf,
+            crate::embedder::BackendPreference::Auto,
+        ] {
+            let (base, cfg) = present_gguf_model("semantic-fast", backend);
+            let pings = std::cell::Cell::new(0usize);
+            let result = semantic_health_with(&cfg, &opts(), false, || {
+                pings.set(pings.get() + 1);
+                Ok("engine loaded".to_string())
+            });
+
+            assert_eq!(
+                pings.get(),
+                0,
+                "fast health must not load the native engine"
+            );
+            assert_eq!(result.severity, Severity::Green, "{result:?}");
+            assert_eq!(
+                result.detail,
+                format!(
+                    "native model available at {} (pass --smoke for engine probe)",
+                    cfg.model_path.as_ref().unwrap().display()
+                )
+            );
+            let _ = std::fs::remove_dir_all(&base);
+        }
+    }
+
+    #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+    #[test]
+    fn smoke_and_deep_semantic_health_still_probe_the_engine() {
+        let smoke = DoctorOptions {
+            smoke: true,
+            ..opts()
+        };
+        for (label, run_opts, deep) in [("smoke", smoke, false), ("deep", opts(), true)] {
+            let (base, cfg) = present_gguf_model(label, crate::embedder::BackendPreference::Gguf);
+            let pings = std::cell::Cell::new(0usize);
+            let result = semantic_health_with(&cfg, &run_opts, deep, || {
+                pings.set(pings.get() + 1);
+                Err("model load failed".to_string())
+            });
+
+            assert_eq!(pings.get(), 1, "{label} must probe the engine exactly once");
+            assert_eq!(result.severity, Severity::Warning, "{label}: {result:?}");
+            assert!(
+                result
+                    .detail
+                    .contains("embedder info probe failed: model load failed"),
+                "{label} must surface the engine failure: {}",
+                result.detail
+            );
+            let _ = std::fs::remove_dir_all(&base);
+        }
     }
 }
