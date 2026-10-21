@@ -210,7 +210,7 @@ Orthogonal surfaces:
 - **index status** = is CURRENT lagging the catalog/corpus?
 
 `catalog rebuild` walks the registered Claude, Codex, Cursor, Grok, Gemini,
-Junie, Kimi, Copilot CLI, and
+Junie, Kimi, Copilot CLI, oh-my-pi / pi, and
 Vibecrafted runtime roots. It writes the compact catalog and prints counts,
 including `pending_chunks`. It does not materialize session content unless
 `--with-chunks` is passed, which drains the lag through `aicx index`.
@@ -259,7 +259,8 @@ from content filtered under the previous one.
 1. **Session JSONL sync** — catalog only discovers files under this host's agent
    roots (`~/.claude/projects`, `~/.codex/sessions`, `~/.cursor/projects`, `~/.gemini/tmp`,
    `~/.grok/sessions`, `~/.junie/sessions`, `~/.kimi-code/sessions`,
-   `~/.copilot/session-state`, `~/.vibecrafted/control_plane/runtime_runs`).
+   `~/.copilot/session-state`, `~/.omp/agent/sessions`, `~/.pi/agent/sessions`,
+   `~/.vibecrafted/control_plane/runtime_runs`).
    Drop synced JSONL into those trees, then `catalog status` → `catalog rebuild`.
 2. **No alternate daily store intake** — there is no second "drop folder" for
    sessions. `AICX_HOME` / `[storage].home` relocates the **whole** home
@@ -285,6 +286,7 @@ aicx extract cursor --session <session-id> --conversation
 aicx extract grok --session <session-id> --conversation
 aicx extract gemini --session <session-id> --conversation
 aicx extract copilot --session <session-id> --conversation
+aicx extract omp --session <session-id> --conversation
 ```
 
 Use `--output <path>` for an explicit file. Session mode resolves through the
@@ -303,6 +305,20 @@ aicx extract copilot --session <session-id> --brief
 aicx extract copilot --session <session-id> --agent-commands --result full
 aicx intents --agent copilot --hours 0 --emit json
 aicx search 'past decision' --agent copilot --hours 0 --json
+```
+
+oh-my-pi and upstream pi use the same surfaces. The provider name is `omp`;
+`pi` and `oh-my-pi` are accepted aliases. Both `~/.omp/agent/sessions` and
+`~/.pi/agent/sessions` are one agent. Nested tool-log directories are not
+sessions. See [OMP_SESSIONS.md](OMP_SESSIONS.md).
+
+```bash
+aicx extract omp --session <session-id> --conversation
+aicx extract pi --session <session-id> --conversation --user-only
+aicx extract all --provider omp --conversation
+aicx conversations --agent omp --hours 0 --out-dir ./conversations
+aicx intents --agent omp --hours 0 --emit json
+aicx search 'past decision' --agent pi --hours 0 --json
 ```
 
 ### Projection flags (W2-T13)

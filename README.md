@@ -3,7 +3,7 @@
 **Operator front door for agent session logs.**
 
 `aicx` catalogs live Claude, Codex, Cursor, Grok, Gemini, Junie, Kimi, GitHub
-Copilot CLI, Vibecrafted, and
+Copilot CLI, oh-my-pi / pi, Vibecrafted, and
 operator-owned sources; renders readable whole-session extracts; and publishes
 a lexical-first search index. Sources remain content truth. The compact catalog
 owns session identity and topical project attribution.
@@ -61,6 +61,7 @@ First-class roots include:
 - `~/.gemini/tmp/*/chats/session-*.json`
 - `~/.kimi-code/sessions/**/wire.jsonl`
 - `~/.copilot/session-state/<session-id>/events.jsonl` (optional `workspace.yaml`)
+- `~/.omp/agent/sessions/<encoded-cwd>/<timestamp>_<uuid>.jsonl` and the same layout under `~/.pi/agent/sessions`
 - Junie sources
 - Vibecrafted `control_plane/runtime_runs/*/transcript.log`
 - explicit operator markdown and Codescribe imports
@@ -80,6 +81,20 @@ aicx intents --agent copilot --emit json
 
 See [Copilot sessions](docs/COPILOT_SESSIONS.md) for event coverage, source
 identity, direct-file extraction, and MCP usage.
+
+oh-my-pi and upstream pi use the canonical provider name `omp` (`pi` and
+`oh-my-pi` are aliases):
+
+```bash
+aicx extract omp --session <session-id> --conversation
+aicx extract all --provider omp
+aicx search 'past decision' --agent omp
+aicx search 'past decision' --agent pi
+aicx intents --agent omp --emit json
+```
+
+See [oh-my-pi sessions](docs/OMP_SESSIONS.md) for the active branch, human
+speech versus harness injection, and both session stores.
 
 ## Intents and verification
 
@@ -154,6 +169,7 @@ accepted.
 - [Context corpus](docs/CONTEXT_CORPUS.md)
 - [Source protection](docs/SOURCE_PROTECTION.md)
 - [GitHub Copilot CLI sessions](docs/COPILOT_SESSIONS.md)
+- [oh-my-pi and pi sessions](docs/OMP_SESSIONS.md)
 - [Releases](docs/RELEASES.md)
 
 Built so that months later the operator can still find the session, open the

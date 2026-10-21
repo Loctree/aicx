@@ -14,6 +14,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- oh-my-pi and upstream pi sessions (`omp`, aliases `pi` and `oh-my-pi`)
+  across discovery/catalog, readable extracts, bulk exports, conversation
+  JSON, intents, handoff briefs, source indexing/search, and MCP. Read
+  `~/.omp/agent/sessions/<encoded-cwd>/<timestamp>_<uuidv7>.jsonl` and the
+  same layout under `~/.pi/agent/sessions`. Nested tool-log directories are
+  not sessions. The active `parentId` branch is the transcript; harness
+  injections, including Vibecrafted worker contracts and `custom_message`
+  cards, stay out of human intent. Unknown record types stay visible.
 - GitHub Copilot CLI sessions (`copilot`, aliases `copilot-cli`,
   `github-copilot`, and `github-copilot-cli`) across discovery/catalog, readable extracts, bulk exports,
   conversation JSON, intents, handoff briefs, source indexing/search, and MCP.
