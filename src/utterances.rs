@@ -378,6 +378,10 @@ fn split_frame(frame: &SpokenFrame) -> (Option<String>, Option<String>) {
 }
 
 fn partition_human_text(text: &str) -> (String, String) {
+    // A launcher turn under the user role is the operator agent's brief.
+    if crate::intents::is_dispatch_brief(text) {
+        return (String::new(), text.to_string());
+    }
     let mut prose = Vec::new();
     let mut machine = Vec::new();
     let mut in_fence = false;
@@ -571,6 +575,48 @@ mod tests {
             let heading = line.trim().to_ascii_lowercase();
             heading != "decisions" && heading != "decisions:" && !heading.starts_with("decisions ")
         }));
+    }
+
+    #[test]
+    fn dispatch_envelope_brief_prints_under_machine_text() {
+        let brief = "You are running under Vibecrafted core runtime.\n\nContract:\n- Skill: vc-workflow\n\nOperator prompt:\nShip the attribution cut before noon.";
+        let speech = "Keep my own words under the human heading.";
+        let settlement = settle(
+            &[SessionRead::Whole {
+                project: "vetcoders/vista".to_string(),
+                frames: vec![
+                    frame(
+                        "2026-09-29T15:00:00Z",
+                        "user",
+                        Some(FrameKind::UserMsg),
+                        brief,
+                    ),
+                    frame("2026-09-29T16:00:00Z", "user", None, speech),
+                ],
+            }],
+            september_window(),
+            &["vetcoders/vista".to_string()],
+        );
+        let report = settlement.render();
+
+        assert!(
+            !human_body(&report).contains("Vibecrafted core runtime"),
+            "{report}"
+        );
+        assert!(
+            !human_body(&report).contains("Ship the attribution cut"),
+            "{report}"
+        );
+        assert!(
+            machine_body(&report).contains("You are running under Vibecrafted core runtime."),
+            "{report}"
+        );
+        assert!(
+            machine_body(&report).contains("Ship the attribution cut before noon."),
+            "{report}"
+        );
+        assert!(human_body(&report).contains(speech), "{report}");
+        assert_eq!(settlement.human.len(), 1);
     }
 
     #[test]

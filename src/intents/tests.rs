@@ -5970,3 +5970,214 @@ fn admission_weight_counts_only_user_turns_inside_explicit_date_window() {
     assert_eq!(file_human_messages(&files[1]), 1);
     assert_eq!(files[1].timestamp, heavy_qualifying);
 }
+
+/// One Claude session written through the production catalog, so the
+/// launcher envelope reaches intents the way a headless worker's does.
+#[cfg(feature = "app")]
+fn dispatch_envelope_session(turns: &[(&str, &str, &str)]) -> PathBuf {
+    let root = migration_test_root("dispatch-envelope");
+    fs::create_dir_all(&root).unwrap();
+    let session_id = "dispatch-envelope-session";
+    let cwd = "/fixtures/Loctree/aicx";
+    let path = root.join("session.jsonl");
+    let mut body = String::new();
+    for (time, role, text) in turns {
+        body.push_str(
+            &serde_json::json!({
+                "type": role,
+                "timestamp": time,
+                "sessionId": session_id,
+                "cwd": cwd,
+                "message": {"role": role, "content": text}
+            })
+            .to_string(),
+        );
+        body.push('\n');
+    }
+    fs::write(&path, body).unwrap();
+    let entry = crate::catalog::CatalogEntry {
+        schema: crate::catalog::CATALOG_SCHEMA.into(),
+        session_id: session_id.into(),
+        agent: "claude".into(),
+        project: Some("Loctree/aicx".into()),
+        date: Some("2026-10-02".into()),
+        cwd: Some(cwd.into()),
+        source_path: path.to_string_lossy().into(),
+        source_len: None,
+        source_mtime_ns: None,
+        source_bundle_fingerprint: None,
+        title: None,
+        machine: None,
+        logical_session_id: None,
+        session_kind: None,
+    };
+    let catalog = crate::catalog::sessions_path_for(&root);
+    fs::create_dir_all(catalog.parent().unwrap()).unwrap();
+    fs::write(
+        catalog,
+        format!("{}\n", serde_json::to_string(&entry).unwrap()),
+    )
+    .unwrap();
+    root
+}
+
+#[cfg(feature = "app")]
+fn dispatch_envelope_extract(root: &Path) -> IntentExtraction {
+    let config = IntentsConfig {
+        project: "Loctree/aicx".into(),
+        hours: 96,
+        strict: false,
+        min_confidence: None,
+        kind_filter: None,
+        frame_kind: None,
+        live: false,
+    };
+    extract_intents_from_root_at_with_stats(&config, root, "2026-10-03T04:47:00Z".parse().unwrap())
+        .expect("extract intents")
+}
+
+/// A launcher brief, shaped like the envelope every headless worker opens with.
+#[cfg(feature = "app")]
+const DISPATCH_ENVELOPE_BRIEF: &str = "You are running under Vibecrafted core runtime.
+
+Contract:
+- Work in repository root: /fixtures/Loctree/aicx
+- Skill: vc-workflow
+
+Operator prompt:
+---
+prompt_id: W1-01
+---
+Decision: the operator agent ranks every brief as founder speech.
+From now on render every brief under the human heading.
+- [ ] give the dispatch envelope its own attribution
+test result: ok. 3 passed";
+
+#[cfg(feature = "app")]
+const DISPATCH_ENVELOPE_HUMAN: &str = "Decision: keep my own words visible as human speech.";
+
+#[cfg(feature = "app")]
+fn dispatch_envelope_turns() -> [(&'static str, &'static str, &'static str); 3] {
+    [
+        ("2026-10-02T12:00:00Z", "user", DISPATCH_ENVELOPE_BRIEF),
+        (
+            "2026-10-02T12:01:00Z",
+            "assistant",
+            "Working on the attribution cut.",
+        ),
+        ("2026-10-02T12:05:00Z", "user", DISPATCH_ENVELOPE_HUMAN),
+    ]
+}
+
+#[cfg(feature = "app")]
+#[test]
+fn dispatch_envelope_brief_is_attributed_dispatch_brief_not_human() {
+    let root = dispatch_envelope_session(&dispatch_envelope_turns());
+    let extraction = dispatch_envelope_extract(&root);
+    let _ = fs::remove_dir_all(&root);
+    assert_eq!(extraction.stats.source_errors, 0);
+
+    let attribution = |record: &IntentRecord| {
+        record
+            .provenance
+            .as_ref()
+            .map(|provenance| provenance.attribution.clone())
+            .unwrap_or_default()
+    };
+    let from_brief: Vec<&IntentRecord> = extraction
+        .records
+        .iter()
+        .filter(|record| !record.summary.contains("keep my own words"))
+        .collect();
+    assert!(
+        !from_brief.is_empty(),
+        "the brief must stay as evidence, not vanish like a charter block: {:?}",
+        extraction.records
+    );
+    for record in &from_brief {
+        assert_eq!(
+            attribution(record),
+            "dispatch_brief",
+            "brief line kept a human attribution: {record:?}"
+        );
+        assert_eq!(
+            record.provenance.as_ref().unwrap().role,
+            "user",
+            "the transcript role stays what the source says: {record:?}"
+        );
+        assert_eq!(
+            record.kind,
+            IntentKind::Task,
+            "a brief prescribes work; it never decides for the human or reports an outcome: {record:?}"
+        );
+    }
+    assert!(
+        from_brief.iter().any(|record| record
+            .summary
+            .contains("dispatch envelope its own attribution")),
+        "the dispatched checklist must survive as evidence: {from_brief:?}"
+    );
+
+    let selection = extraction
+        .selection
+        .iter()
+        .find(|row| row.session_id == "dispatch-envelope-session")
+        .expect("session selected");
+    assert_eq!(
+        selection.human_messages, 1,
+        "the envelope turn is not human speech: {selection:?}"
+    );
+}
+
+#[cfg(feature = "app")]
+#[test]
+fn dispatch_envelope_plain_human_message_keeps_human_candidate() {
+    let root = dispatch_envelope_session(&dispatch_envelope_turns());
+    let extraction = dispatch_envelope_extract(&root);
+    let _ = fs::remove_dir_all(&root);
+
+    let human = extraction
+        .records
+        .iter()
+        .find(|record| record.summary.contains("keep my own words"))
+        .unwrap_or_else(|| panic!("plain human decision lost: {:?}", extraction.records));
+    assert_eq!(human.kind, IntentKind::Decision);
+    let provenance = human.provenance.as_ref().expect("provenance");
+    assert_eq!(provenance.role, "user");
+    assert_eq!(provenance.attribution, "human_candidate");
+}
+
+#[test]
+fn dispatch_envelope_head_is_judged_on_the_first_non_blank_line() {
+    let envelope = "You are running under Vibecrafted core runtime.";
+    assert!(is_dispatch_brief(&format!(
+        "\n\n  {envelope}\n\nContract:\n- Skill: vc-workflow"
+    )));
+    assert!(is_dispatch_brief(&format!(
+        "{}\nOperator prompt:",
+        envelope.to_ascii_lowercase()
+    )));
+    assert!(
+        !is_dispatch_brief(&format!("Read what the worker saw:\n{envelope}")),
+        "a human quoting the envelope later in a message is still speaking"
+    );
+    assert!(!is_dispatch_brief(&format!("> {envelope}")));
+    assert!(!is_dispatch_brief("Ship the attribution cut."));
+    assert!(
+        is_dispatch_brief(
+            "Read and follow the private task file: /cp/runtime_runs/init-261021-041518-72231/prompt.md"
+        ),
+        "the launcher's private-prompt pointer is the same machine turn"
+    );
+    assert!(!is_dispatch_brief(
+        "Read and follow the plan we wrote yesterday."
+    ));
+
+    let charter = format!("# AGENTS.md instructions for /repo\n{envelope}");
+    assert!(
+        !is_dispatch_brief(&charter),
+        "a charter head stays a charter block, dropped whole"
+    );
+    assert!(is_reingested_charter_block(&charter));
+    assert!(!is_reingested_charter_block(envelope));
+}

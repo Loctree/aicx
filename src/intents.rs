@@ -856,7 +856,14 @@ fn verify_stored_chunk_paths(files: &[StoredChunkFile]) -> bool {
 fn transcript_human_messages(entries: &[TranscriptEntry]) -> usize {
     entries
         .iter()
-        .filter(|entry| is_user_role(&entry.role))
+        .filter(|entry| {
+            is_user_role(&entry.role)
+                && !entry
+                    .lines
+                    .iter()
+                    .find(|line| !line.trim().is_empty())
+                    .is_some_and(|head| is_dispatch_brief(head))
+        })
         .count()
 }
 
@@ -1808,7 +1815,10 @@ fn catalog_frames_to_intent_file(
         .iter()
         .filter(|f| frame_has_conversation_time(f))
         .count();
-    receipt.human_messages = frames.iter().filter(|f| is_user_role(&f.role)).count();
+    receipt.human_messages = frames
+        .iter()
+        .filter(|f| is_user_role(&f.role) && !is_dispatch_brief(&f.message))
+        .count();
     receipt.scope_withheld_frames = receipt.parsed_frames.saturating_sub(receipt.scoped_frames);
     receipt.outside_window_frames = receipt
         .scoped_frames
@@ -2860,6 +2870,7 @@ fn extract_transcript_candidates(
         );
         let file = &frame_file;
         let is_user = is_intent_signal_role(&signal_spec, &entry.role);
+        let mut dispatch_brief = false;
         if is_user {
             let message = entry.lines.join("\n");
             if (is_harness_injected_noise(&entry.role, &message)
@@ -2868,6 +2879,7 @@ fn extract_transcript_candidates(
             {
                 continue;
             }
+            dispatch_brief = is_dispatch_brief(&message);
         }
         let mut codescribe_parser = CodescribeParser::new();
         // Document-role awareness: a pasted run of commit/changelog lines is
@@ -2920,12 +2932,17 @@ fn extract_transcript_candidates(
                     source_provenance,
                 ) {
                     event.candidate.record.provenance =
-                        Some(transcript_provenance(entry, index, is_user));
+                        Some(transcript_provenance(entry, index, is_user, dispatch_brief));
                     if entry.timestamp.is_none() && file.date == "unknown" {
                         event.candidate.record.timestamp = None;
                     }
                     task_events.push(event);
                 }
+                continue;
+            }
+            // A brief prescribes work: its checklist survives as evidence,
+            // but it neither decides for the human nor reports an outcome.
+            if dispatch_brief {
                 continue;
             }
 
@@ -2946,7 +2963,8 @@ fn extract_transcript_candidates(
                 false,
                 source_provenance,
             ) {
-                candidate.record.provenance = Some(transcript_provenance(entry, index, is_user));
+                candidate.record.provenance =
+                    Some(transcript_provenance(entry, index, is_user, dispatch_brief));
                 if entry.timestamp.is_none() && file.date == "unknown" {
                     candidate.record.timestamp = None;
                 }
@@ -2958,7 +2976,12 @@ fn extract_transcript_candidates(
     (candidates, task_events)
 }
 
-fn transcript_provenance(entry: &TranscriptEntry, line: usize, is_user: bool) -> IntentProvenance {
+fn transcript_provenance(
+    entry: &TranscriptEntry,
+    line: usize,
+    is_user: bool,
+    dispatch_brief: bool,
+) -> IntentProvenance {
     IntentProvenance {
         role: entry.role.clone(),
         locator: format!(
@@ -2979,7 +3002,9 @@ fn transcript_provenance(entry: &TranscriptEntry, line: usize, is_user: bool) ->
             "unknown"
         }
         .into(),
-        attribution: if is_user {
+        attribution: if dispatch_brief {
+            "dispatch_brief"
+        } else if is_user {
             "human_candidate"
         } else {
             "agent_claim"
@@ -2988,11 +3013,49 @@ fn transcript_provenance(entry: &TranscriptEntry, line: usize, is_user: bool) ->
     }
 }
 
-fn is_reingested_charter_block(message: &str) -> bool {
+/// Machine text that arrives under a user role, judged by its head.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReingestedBlock {
+    /// Charter or doctrine pasted back in: dropped before any candidate.
+    Charter,
+    /// A Vibecrafted launcher envelope carrying the operator agent's brief:
+    /// kept as evidence under `dispatch_brief`, never human speech.
+    DispatchBrief,
+}
+
+fn reingested_block(message: &str) -> Option<ReingestedBlock> {
     let head = message.trim_start();
-    charter_head_markers()
-        .iter()
-        .any(|marker| starts_with_marker(head, marker))
+    let opens_with = |markers: &[&str]| {
+        markers
+            .iter()
+            .any(|marker| starts_with_marker(head, marker))
+    };
+    if opens_with(charter_head_markers()) {
+        Some(ReingestedBlock::Charter)
+    } else if opens_with(dispatch_head_markers()) {
+        Some(ReingestedBlock::DispatchBrief)
+    } else {
+        None
+    }
+}
+
+/// Lines the Vibecrafted launcher writes as a worker's first user turn: the
+/// inline envelope (the corpus screen titles headless sessions by it) and
+/// the pointer to a private prompt file.
+fn dispatch_head_markers() -> &'static [&'static str] {
+    &[
+        "You are running under Vibecrafted core runtime.",
+        "Read and follow the private task file: ",
+    ]
+}
+
+fn is_reingested_charter_block(message: &str) -> bool {
+    reingested_block(message) == Some(ReingestedBlock::Charter)
+}
+
+/// Does this user-role message open with a Vibecrafted launcher turn?
+pub(crate) fn is_dispatch_brief(message: &str) -> bool {
+    reingested_block(message) == Some(ReingestedBlock::DispatchBrief)
 }
 
 fn role_suppresses_outcome_promotion(role: &str) -> bool {
