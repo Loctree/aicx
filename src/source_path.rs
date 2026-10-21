@@ -105,7 +105,10 @@ impl SourceAllowlist {
                 canonical.display()
             ));
         }
-        Ok(canonical)
+        // Windows canonicalizes to `\\?\C:\…`. The returned path is printed
+        // as evidence and compared with recorded `C:\…` paths, so it carries
+        // the plain spelling; opening re-canonicalizes it.
+        Ok(aicx_parser::sanitize::strip_verbatim_prefix(&canonical))
     }
 
     /// Open a readable file only after [`Self::resolve_file`].

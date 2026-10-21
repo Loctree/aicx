@@ -1288,7 +1288,7 @@ fn on_baseline_drive(path: &str, baseline: Option<&str>) -> Option<String> {
 /// Is `path` absolute on ANY platform a rollout can come from? `/unix`,
 /// `C:\` or `C:/` drive roots, and `\`-rooted or UNC (`\\server\share`)
 /// Windows paths. A drive-relative `C:repo` is not.
-fn absolute_anywhere(path: &str) -> bool {
+pub fn absolute_anywhere(path: &str) -> bool {
     path.starts_with(['/', '\\']) || windows_drive_root(path)
 }
 

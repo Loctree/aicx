@@ -89,7 +89,13 @@ fn at(base: DateTime<Utc>, seconds: i64) -> String {
 /// summary the harness writes after the context ran out.
 fn write_claude_session(root: &Path, repo: &Path, base: DateTime<Utc>) {
     let cwd = repo.display().to_string();
-    let dir = root.join(".claude/projects").join(cwd.replace('/', "-"));
+    // Claude Code names the project directory after the cwd with every
+    // separator and drive colon spelled `-`: `C:\Users\x` -> `C--Users-x`.
+    // Replacing only `/` left a Windows cwd absolute, and `join` then wrote
+    // the session outside `.claude/projects`.
+    let dir = root
+        .join(".claude/projects")
+        .join(cwd.replace(['/', '\\', ':'], "-"));
     fs::create_dir_all(&dir).expect("create claude project dir");
     let body = jsonl(&[
         json!({"type": "user", "sessionId": SESSION, "cwd": cwd, "timestamp": at(base, 0),

@@ -239,7 +239,7 @@ pub fn path_is_temp_allowlisted(path: &Path) -> bool {
 /// Windows; starts_with between a verbatim path and either a non-verbatim base
 /// (the canonicalize-fallback case) or another verbatim path is unreliable — so
 /// normalise BOTH sides to non-verbatim before comparing. No-op on Unix.
-fn strip_verbatim_prefix(path: &Path) -> PathBuf {
+pub fn strip_verbatim_prefix(path: &Path) -> PathBuf {
     let text = path.to_string_lossy();
     if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
         return PathBuf::from(format!(r"\\{rest}"));
@@ -789,6 +789,31 @@ mod tests {
         // …while a verbatim `...` folder or embedded `..` is still innocent.
         assert!(!contains_traversal(r"\\?\C:\tmp\store\..."));
         assert!(!contains_traversal(r"C:\srv\a..b\c"));
+    }
+
+    #[test]
+    fn strip_verbatim_prefix_gives_the_spelling_a_user_recorded() {
+        for (verbatim, plain) in [
+            (
+                r"\\?\C:\Users\runner\session.jsonl",
+                r"C:\Users\runner\session.jsonl",
+            ),
+            (
+                r"\\?\UNC\server\share\session.jsonl",
+                r"\\server\share\session.jsonl",
+            ),
+            (
+                r"C:\Users\runner\session.jsonl",
+                r"C:\Users\runner\session.jsonl",
+            ),
+            ("/Users/runner/session.jsonl", "/Users/runner/session.jsonl"),
+        ] {
+            assert_eq!(
+                strip_verbatim_prefix(Path::new(verbatim)),
+                PathBuf::from(plain),
+                "{verbatim}"
+            );
+        }
     }
 
     #[test]

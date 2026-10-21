@@ -768,10 +768,13 @@ pub(crate) fn codex_session_metadata_from_source(path: &Path) -> Option<CodexSes
                 .is_some_and(|root| root.eq_ignore_ascii_case(id))
         {
             if metadata.cwd.is_none() {
+                // A recorded cwd is absolute by its spelling, not by this host:
+                // `/repo` from a Mac stays a cwd when read on Windows, and
+                // `C:\repo` from Windows stays one when read on a Mac.
                 metadata.cwd = payload
                     .and_then(|payload| payload.get("cwd"))
                     .and_then(serde_json::Value::as_str)
-                    .filter(|cwd| Path::new(cwd).is_absolute())
+                    .filter(|cwd| aicx_parser::engine::absolute_anywhere(cwd))
                     .map(str::to_owned);
             }
             if metadata.date.is_none() {
@@ -2829,6 +2832,33 @@ mod tests {
         let _ = fs::remove_dir_all(&base);
         fs::create_dir_all(&base).unwrap();
         base
+    }
+
+    /// Windows CI read `/fixtures/...` as relative and dropped the cwd; a Mac
+    /// reading a synced Windows rollout dropped `C:\...` the same way.
+    #[cfg(feature = "app")]
+    #[test]
+    fn codex_session_meta_keeps_a_cwd_absolute_on_any_platform() {
+        let root = temp_root("codex_cwd_spelling");
+        let id = "11111111-2222-3333-4444-555555555555";
+        for (cwd, kept) in [
+            ("/fixtures/vetcoders/codescribe", true),
+            (r"C:\Users\runner\codescribe", true),
+            (r"\\server\share\codescribe", true),
+            ("relative/codescribe", false),
+            ("C:codescribe", false),
+        ] {
+            let path = root.join("rollout.jsonl");
+            let line = serde_json::json!({
+                "type": "session_meta",
+                "timestamp": "2026-10-02T12:00:00Z",
+                "payload": {"id": id, "cwd": cwd},
+            });
+            fs::write(&path, format!("{line}\n")).unwrap();
+            let metadata = codex_session_metadata_from_source(&path).expect("metadata");
+            assert_eq!(metadata.cwd.as_deref(), kept.then_some(cwd), "cwd {cwd:?}");
+        }
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
