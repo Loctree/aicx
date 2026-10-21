@@ -326,7 +326,10 @@ fn two_branches_ahead_render_with_subject_trailers_and_worktree() {
     let markdown = fixture.pack();
     let section = open_work(&markdown);
 
-    let principal = fs::canonicalize(&fixture.repo).unwrap();
+    // The pack prints paths without Windows' `\\?\` verbatim prefix, which
+    // `canonicalize` adds there (windows-latest CI on 24fe661).
+    let principal =
+        aicx_parser::sanitize::strip_verbatim_prefix(&fs::canonicalize(&fixture.repo).unwrap());
     assert!(
         section.contains(&format!("checkout {}", principal.display())),
         "the linked-worktree session must fold into its principal checkout:\n{section}"
@@ -334,7 +337,9 @@ fn two_branches_ahead_render_with_subject_trailers_and_worktree() {
     assert!(section.contains("HEAD=integrate"), "{section}");
 
     let alpha = row(section, "cut/alpha").unwrap_or_else(|| panic!("{section}"));
-    let worktree = fs::canonicalize(&fixture.alpha_worktree).unwrap();
+    let worktree = aicx_parser::sanitize::strip_verbatim_prefix(
+        &fs::canonicalize(&fixture.alpha_worktree).unwrap(),
+    );
     for expected in [
         "open=2",
         "subject=feat(alpha): finish the slice",
