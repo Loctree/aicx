@@ -17,8 +17,15 @@ pub struct AgentCase {
     pub mutation_needle: &'static str,
 }
 
-pub fn cases() -> [AgentCase; 7] {
+pub fn cases() -> [AgentCase; 8] {
     [
+        AgentCase {
+            agent: AgentKind::Omp,
+            artifact: "session.jsonl",
+            source_id: "adversarial-omp",
+            base: include_bytes!("../../../tests/fixtures/parser_engine/omp/session.jsonl"),
+            mutation_needle: "Preserve the omp request about lexical search.",
+        },
         AgentCase {
             agent: AgentKind::Copilot,
             artifact: "events.jsonl",
@@ -221,6 +228,11 @@ pub fn opaque_event(case: AgentCase) -> Vec<u8> {
         AgentKind::Copilot => {
             format!(
                 r#"{{"type":"assistant.message","data":{{"content":"","messageId":"opaque-fixture","reasoningOpaque":"{SECRET_SENTINEL}"}}}}"#
+            )
+        }
+        AgentKind::Omp => {
+            format!(
+                r#"{{"type":"credential_pin","id":"pin-opaque","parentId":null,"timestamp":"2026-10-21T12:00:25.000Z","provider":"fixture","hash":"{SECRET_SENTINEL}"}}"#
             )
         }
     };
