@@ -77,6 +77,10 @@ pub mod mcp;
 pub mod mcp_session;
 #[cfg(feature = "app")]
 pub mod onboarding;
+/// OPEN WORK for the continuity pack: local branches whose commits the
+/// checkout's HEAD lacks by patch identity (read-only local git, bounded).
+#[cfg(feature = "app")]
+pub mod open_work;
 #[cfg(feature = "app")]
 pub mod oracle;
 #[cfg(not(feature = "app"))]

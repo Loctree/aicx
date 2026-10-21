@@ -54,6 +54,10 @@ pub struct ContinuityPack {
     /// Those frames are never distilled, with or without `distill_mixed`,
     /// and the pack lists what it left out.
     pub unplaced_scope: Vec<crate::intents::UnplacedScopeSession>,
+    /// Local branches of the filtered repository carrying commits HEAD lacks
+    /// by patch identity. `None` when not collected (hand-built packs); the
+    /// section and its HONESTY line render only when collected.
+    pub open_work: Option<crate::open_work::OpenWork>,
 }
 
 pub struct SourceLine {
@@ -169,6 +173,7 @@ pub fn build_with_scope_at(
         candidate_cap: extraction.stats.candidate_cap,
         dropped_candidates: extraction.stats.dropped_candidates,
         unplaced_scope,
+        open_work: Some(crate::open_work::collect(aicx_home, projects)),
     })
 }
 
@@ -508,6 +513,9 @@ fn push_honesty_preface(out: &mut String, pack: &ContinuityPack) {
             " · incomplete extraction"
         } else { " · these extraction caps not reached" }
     ));
+    if let Some(open_work) = &pack.open_work {
+        out.push_str(&crate::open_work::honesty_line(open_work));
+    }
     let requests = unresolved_intents(&pack.records).len();
     let human_decisions = pack
         .records
@@ -1134,6 +1142,9 @@ fn render_with_addressed(pack: &ContinuityPack, for_inject: bool, addressed: &st
     }
     out.push('\n');
 
+    if let Some(open_work) = &pack.open_work {
+        out.push_str(&crate::open_work::render_section(open_work));
+    }
     out.push_str(addressed);
     out.push_str("## SOURCES\n\n");
     if pack.sources.is_empty() {
@@ -1400,6 +1411,7 @@ mod tests {
             candidate_cap,
             dropped_candidates,
             unplaced_scope: Vec::new(),
+            open_work: None,
         };
         render(&pack, false)
     }
@@ -1539,6 +1551,7 @@ mod tests {
             candidate_cap: 5_000,
             dropped_candidates: 0,
             unplaced_scope: Vec::new(),
+            open_work: None,
         };
         let rendered = render(&pack, false);
         assert!(rendered.contains("open: claude · hot-open"));
@@ -1625,6 +1638,7 @@ mod tests {
             candidate_cap: 5_000,
             dropped_candidates: 0,
             unplaced_scope: Vec::new(),
+            open_work: None,
         };
         let rendered = render(&pack, false);
         for sentence in [
@@ -1690,6 +1704,7 @@ mod tests {
             candidate_cap: 5_000,
             dropped_candidates: 0,
             unplaced_scope: Vec::new(),
+            open_work: None,
         };
         let rendered = render(&pack, false);
         assert!(rendered.contains(
@@ -1724,6 +1739,7 @@ mod tests {
             candidate_cap: 5_000,
             dropped_candidates: 0,
             unplaced_scope: Vec::new(),
+            open_work: None,
         };
         let rendered = render(&pack, false);
         assert!(rendered.contains(
@@ -1775,6 +1791,7 @@ mod tests {
             candidate_cap: 5_000,
             dropped_candidates: 0,
             unplaced_scope: Vec::new(),
+            open_work: None,
         };
         let rendered = render(&pack, false);
         assert!(
@@ -1815,6 +1832,7 @@ mod tests {
             candidate_cap: 5_000,
             dropped_candidates: 0,
             unplaced_scope: vec![unplaced("s-one", 3), unplaced("s-two", 1)],
+            open_work: None,
         };
         let rendered = render(&pack, false);
         assert!(
@@ -2012,6 +2030,7 @@ mod tests {
             candidate_cap: 5_000,
             dropped_candidates: 0,
             unplaced_scope: Vec::new(),
+            open_work: None,
         };
         let rendered = render(&pack, false);
         let peers = rendered
@@ -2117,6 +2136,7 @@ mod tests {
             candidate_cap: 5_000,
             dropped_candidates: 0,
             unplaced_scope: Vec::new(),
+            open_work: None,
         }
     }
 
