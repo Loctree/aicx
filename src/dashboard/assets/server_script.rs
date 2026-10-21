@@ -309,7 +309,7 @@ pub(crate) const DASHBOARD_SERVER_SCRIPT: &str = r#"
       ui.detailContent.innerHTML = '<div class="md-rendered">' + renderMarkdown(rec.excerpt || rec.preview || '') + '</div>';
       return;
     }
-    apiFetch('/api/detail?id=' + encodeURIComponent(rec.id))
+    apiFetch('/api/detail?full=1&id=' + encodeURIComponent(rec.id))
       .then(function(r) { return r.json(); })
       .then(function(data) {
         if (!data.ok) { ui.detailContent.textContent = 'Failed: ' + (data.error || 'unknown'); return; }

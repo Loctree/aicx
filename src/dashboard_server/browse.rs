@@ -221,6 +221,8 @@ pub(super) async fn get_browse(
 #[derive(Debug, Deserialize)]
 pub(super) struct DetailParams {
     id: usize,
+    /// Expand: reread the whole session instead of the bounded scan detail.
+    full: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -253,12 +255,30 @@ pub(super) async fn get_detail(
     // Record IDs are 1-based (assigned during the legacy archive scan), so look up by
     // matching the id field rather than using it as a raw array index.
     if let Some(record) = snapshot.payload.records.iter().find(|r| r.id == params.id) {
+        let bounded = record.detail_text.clone();
+        // The scan detail stops at 80 turns / 32k chars even when the preview
+        // did not, so Expand always rereads a catalog session in full.
+        let full_source = super::intents::truthy(&params.full).then(|| record.clone());
+        drop(snapshot);
+        let detail_text = match full_source {
+            Some(record) => {
+                let aicx_home = state.config.aicx_home.clone();
+                tokio::task::spawn_blocking(move || {
+                    crate::dashboard::read_record_full_text(&aicx_home, &record)
+                })
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or(bounded)
+            }
+            None => bounded,
+        };
         (
             StatusCode::OK,
             Json(DetailResponse {
                 ok: true,
                 id: params.id,
-                detail_text: record.detail_text.clone(),
+                detail_text,
             }),
         )
             .into_response()

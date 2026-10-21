@@ -208,6 +208,16 @@ pub struct DashboardRecord {
     pub header: String,
     pub body_chars_total: usize,
     pub body_truncated: bool,
+    /// Server-side handle for Expand: rereads the whole session on demand.
+    #[serde(skip)]
+    pub catalog_entry: Option<crate::catalog::CatalogEntry>,
+}
+
+/// The whole readable session behind a record, reread on demand for Expand.
+/// `None` when the record is not a catalog session or its source is gone.
+pub(crate) fn read_record_full_text(aicx_home: &Path, record: &DashboardRecord) -> Option<String> {
+    let entry = record.catalog_entry.as_ref()?;
+    scan::read_catalog_conversation_full(aicx_home, entry)
 }
 
 #[derive(Debug, Clone)]

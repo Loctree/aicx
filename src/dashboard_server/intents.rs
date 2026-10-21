@@ -78,7 +78,7 @@ struct IntentsResponse {
     items: Vec<IntentApiItem>,
 }
 
-fn truthy(value: &Option<String>) -> bool {
+pub(super) fn truthy(value: &Option<String>) -> bool {
     matches!(
         value.as_deref().map(str::trim),
         Some("1" | "true" | "yes" | "TRUE" | "True" | "YES")

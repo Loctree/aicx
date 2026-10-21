@@ -216,6 +216,7 @@ pub(super) fn scan_legacy_archive(
             header,
             body_chars_total: note.body_chars_total,
             body_truncated: note.body_truncated,
+            catalog_entry: None,
         };
 
         stats.total_files += 1;
@@ -414,7 +415,7 @@ fn scan_catalog_sessions(
         records.push(DashboardRecord {
             id: 0,
             project,
-            agent: entry.agent,
+            agent: entry.agent.clone(),
             date,
             time,
             kind: "session".to_string(),
@@ -434,6 +435,7 @@ fn scan_catalog_sessions(
             header,
             body_chars_total: note.body_chars_total,
             body_truncated: note.body_truncated,
+            catalog_entry: Some(entry.clone()),
         });
     }
 
@@ -554,6 +556,42 @@ fn is_dashboard_noise_turn(message: &str) -> bool {
     head.starts_with('{') && (head.contains("\"type\"") || head.contains("\"tool"))
 }
 
+/// One readable `[stamp] role: message` line, or `None` for dashboard noise.
+fn readable_turn(frame: &crate::extraction::TimelineEntry) -> Option<String> {
+    let message = strip_dashboard_pollution(&frame.message);
+    if is_dashboard_noise_turn(&message) {
+        return None;
+    }
+    let role = if frame.role == "user" {
+        "user"
+    } else {
+        "assistant"
+    };
+    let stamp = if is_empty_epoch(frame.timestamp) {
+        String::new()
+    } else {
+        format!("[{}] ", frame.timestamp.format("%Y-%m-%d %H:%M:%S"))
+    };
+    Some(format!("{stamp}{role}: {message}"))
+}
+
+/// The whole readable conversation of one catalog session, for Expand.
+///
+/// The scan keeps only a bounded detail per record so the list stays cheap;
+/// this reads the source again on demand without the turn or character caps.
+pub(crate) fn read_catalog_conversation_full(
+    aicx_home: &Path,
+    entry: &crate::catalog::CatalogEntry,
+) -> Option<String> {
+    let (_, frames, _scope) =
+        crate::source_index::read_catalog_conversation_at(aicx_home, entry).ok()?;
+    let turns: Vec<String> = frames.iter().filter_map(readable_turn).collect();
+    if turns.is_empty() {
+        return None;
+    }
+    Some(turns.join("\n\n"))
+}
+
 fn read_catalog_conversation_preview(
     aicx_home: &Path,
     entry: &crate::catalog::CatalogEntry,
@@ -567,21 +605,10 @@ fn read_catalog_conversation_preview(
 
     let mut turns: Vec<String> = Vec::new();
     for frame in &frames {
-        let message = strip_dashboard_pollution(&frame.message);
-        if is_dashboard_noise_turn(&message) {
+        let Some(turn) = readable_turn(frame) else {
             continue;
-        }
-        let role = if frame.role == "user" {
-            "user"
-        } else {
-            "assistant"
         };
-        let stamp = if is_empty_epoch(frame.timestamp) {
-            String::new()
-        } else {
-            format!("[{}] ", frame.timestamp.format("%Y-%m-%d %H:%M:%S"))
-        };
-        turns.push(format!("{stamp}{role}: {message}"));
+        turns.push(turn);
         if turns.len() >= 80 {
             break;
         }
