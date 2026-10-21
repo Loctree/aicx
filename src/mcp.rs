@@ -623,7 +623,7 @@ pub struct SearchParams {
     pub until: Option<String>,
     /// Optional sort order: newest, oldest, score
     pub sort: Option<String>,
-    /// Optional frame/channel filter: user_msg, agent_reply, internal_thought, tool_call
+    /// Frame filters are currently refused: the search index stores conversation-level documents.
     pub frame_kind: Option<FrameKind>,
     /// Optional canonical corpus kind filter: conversations, plans, reports, other
     pub kind: Option<String>,
@@ -1283,6 +1283,12 @@ impl AicxMcpServer {
         validate_string_len(params.until.as_deref(), 4096, "until")?;
         validate_string_len(params.project_match.as_deref(), 32, "project_match")?;
         validate_string_len(params.sort.as_deref(), 4096, "sort")?;
+        if let Err(err) = crate::search_engine::validate_search_frame_kind(params.frame_kind) {
+            let payload = serde_json::to_value(&err).map_err(|e| {
+                McpError::internal_error(format!("Serialize frame filter refusal: {e}"), None)
+            })?;
+            return Err(McpError::invalid_params(err.to_string(), Some(payload)));
+        }
         if let Some(projects) = &params.projects {
             for (i, p) in projects.iter().enumerate() {
                 validate_string_len(Some(p), 4096, &format!("projects[{}]", i))?;
@@ -2603,6 +2609,38 @@ mod tests {
             slim: true,
             verbose: false,
             strict_semantic: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn honest_count_mcp_refuses_frame_filter_before_index_or_embedder_checks() {
+        use crate::parser::FrameKind;
+        use rmcp::handler::server::wrapper::Parameters;
+
+        let server = AicxMcpServer::new();
+        server.mark_embedder_unavailable(Instant::now(), MCP_EMBEDDER_NEGATIVE_TTL);
+        for kind in [
+            FrameKind::UserMsg,
+            FrameKind::AgentReply,
+            FrameKind::InternalThought,
+            FrameKind::ToolCall,
+            FrameKind::SystemNote,
+        ] {
+            let mut params = minimal_search_params();
+            params.frame_kind = Some(kind);
+            let err = server
+                .search(Parameters(params))
+                .await
+                .expect_err("unsupported filter");
+            let data = err.data.expect("typed refusal payload");
+            assert_eq!(data["kind"], "unsupported_frame_kind");
+            assert_eq!(data["indexed_granularity"], "conversation");
+            assert_eq!(data["requested_frame_kind"], kind.as_str());
+            let reason = data["reason"].as_str().unwrap();
+            assert!(reason.contains("conversation"), "{reason}");
+            assert!(reason.contains(kind.as_str()), "{reason}");
+            assert!(!data["recommendation"].as_str().unwrap().is_empty());
+            assert!(data.get("completeness").is_none());
         }
     }
 

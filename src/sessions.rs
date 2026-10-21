@@ -371,6 +371,65 @@ pub fn discover_claude_sessions(
     out
 }
 
+/// Count a delivered user row once when the same parser used by continuity
+/// retains human speech. Keep transport metadata out before parsing; the
+/// adapter owns tool/result, injection and compaction classification.
+fn claude_human_turn_text(
+    value: &serde_json::Value,
+    line: &str,
+    session_id: &str,
+) -> Option<String> {
+    use aicx_parser::engine::{
+        AgentKind, ParserEngine, SourceArtifact, SourceFraming, SourceHandle, TurnRole,
+        ValidatedParse,
+    };
+
+    if value.get("isMeta").and_then(serde_json::Value::as_bool) == Some(true) {
+        return None;
+    }
+    // Avoid feeding tool-result bodies through the engine a second time.
+    // This is a transport-shape prefilter; it does not decide speech.
+    let content = value.get("message")?.get("content")?;
+    let has_text = content.as_str().is_some_and(|text| !text.trim().is_empty())
+        || content.as_array().is_some_and(|blocks| {
+            blocks.iter().any(|block| {
+                block.get("type").and_then(serde_json::Value::as_str) == Some("text")
+                    && block
+                        .get("text")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|text| !text.trim().is_empty())
+            })
+        });
+    if !has_text {
+        return None;
+    }
+    let artifact = SourceArtifact::memory(
+        "message.jsonl",
+        // Individual rows need not repeat sessionId. Supply the file's
+        // already-resolved identity as metadata, without changing the row.
+        format!(
+            "{{\"type\":\"summary\",\"sessionId\":{}}}\n{line}\n",
+            serde_json::to_string(session_id).ok()?,
+        )
+        .into_bytes(),
+        SourceFraming::JsonLines,
+    )
+    .ok()?;
+    let source =
+        SourceHandle::new(AgentKind::Claude, "session-count", None, vec![artifact]).ok()?;
+    let ValidatedParse::Session(session) =
+        ParserEngine::default().parse_registered(&source).ok()?
+    else {
+        return None;
+    };
+    session
+        .model()
+        .turns
+        .iter()
+        .find(|turn| turn.role == TurnRole::User)
+        .map(|turn| turn.text.clone())
+}
+
 /// Parse a single Claude session `.jsonl` into a [`SessionInfo`].
 fn scan_claude_session_file(path: &Path, decoded_cwd: Option<&str>) -> Option<SessionInfo> {
     let file = fs::File::open(path).ok()?;
@@ -425,15 +484,11 @@ fn scan_claude_session_file(path: &Path, decoded_cwd: Option<&str>) -> Option<Se
         match role {
             Some("user") => {
                 message_count += 1;
-                user_message_count += 1;
-                if title.is_none()
-                    && let Some(text) = value
-                        .get("message")
-                        .and_then(|m| m.get("content"))
-                        .and_then(|c| c.as_str())
-                    && !text.trim().is_empty()
-                {
-                    title = Some(short_title(text));
+                if let Some(text) = claude_human_turn_text(&value, line, &session_id) {
+                    user_message_count += 1;
+                    if title.is_none() {
+                        title = Some(short_title(&text));
+                    }
                 }
             }
             Some("assistant") => {
@@ -2663,6 +2718,49 @@ pub fn select_sessions(
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn honest_count_claude_counts_human_rows_not_tool_results_or_meta() {
+        let root = temp_root("honest_count_claude");
+        let lines = [
+            r#"{"type":"user","isMeta":true,"message":{"role":"user","content":"Injected context"}}"#,
+            r#"{"type":"user","message":{"role":"user","content":"First human turn"}}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"pwd"}}]}}"#,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":[{"type":"text","text":"Tool output is not speech"}]}]}}"#,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"Second human"},{"type":"text","text":"turn continues"},{"type":"tool_result","content":"More tool output"}]}}"#,
+            r#"{"type":"user","isCompactSummary":true,"message":{"role":"user","content":"Compacted context"}}"#,
+            r#"{"type":"user","message":{"role":"user","content":"<system-reminder>Injected reminder</system-reminder>"}}"#,
+            r#"{"type":"user","message":{"role":"user","content":" "}}"#,
+        ];
+        write_session(&root, "session.jsonl", &lines);
+        let info = scan_claude_session_file(&root.join("session.jsonl"), None).unwrap();
+        assert_eq!(info.user_message_count, 2);
+        assert_eq!(info.agent_message_count, 1);
+        assert_eq!(
+            info.message_count,
+            lines.len(),
+            "total still measures transport rows"
+        );
+        assert_eq!(info.title.as_deref(), Some("First human turn"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn honest_count_claude_tool_and_meta_only_session_has_no_human_turns() {
+        let root = temp_root("honest_count_claude_empty");
+        write_session(
+            &root,
+            "session.jsonl",
+            &[
+                r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","content":"result"}]}}"#,
+                r#"{"type":"user","isMeta":true,"message":{"role":"user","content":"meta"}}"#,
+            ],
+        );
+        let info = scan_claude_session_file(&root.join("session.jsonl"), None).unwrap();
+        assert_eq!(info.user_message_count, 0);
+        assert_eq!(info.title, None);
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn copilot_task_telemetry_preserves_human_count_and_runtime_authorship_is_excluded() {

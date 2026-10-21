@@ -230,6 +230,13 @@ pub struct HybridRetrievalStatus {
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SemanticError {
+    /// The current index stores conversations, not independently searchable frames.
+    UnsupportedFrameKind {
+        requested_frame_kind: String,
+        indexed_granularity: String,
+        reason: String,
+        recommendation: String,
+    },
     /// Binary was compiled without any embedder feature flag.
     EmbedderFeatureMissing {
         reason: String,
@@ -306,7 +313,8 @@ impl SemanticError {
     /// One-line reason for terse logs / oracle_status.
     pub fn reason(&self) -> &str {
         match self {
-            Self::EmbedderFeatureMissing { reason, .. }
+            Self::UnsupportedFrameKind { reason, .. }
+            | Self::EmbedderFeatureMissing { reason, .. }
             | Self::EmbedderUnavailable { reason, .. }
             | Self::IndexNotBuilt { reason, .. }
             | Self::IndexBusy { reason, .. }
@@ -322,7 +330,8 @@ impl SemanticError {
     /// Actionable recommendation the operator can paste into their shell.
     pub fn recommendation(&self) -> &str {
         match self {
-            Self::EmbedderFeatureMissing { recommendation, .. }
+            Self::UnsupportedFrameKind { recommendation, .. }
+            | Self::EmbedderFeatureMissing { recommendation, .. }
             | Self::EmbedderUnavailable { recommendation, .. }
             | Self::IndexNotBuilt { recommendation, .. }
             | Self::IndexBusy { recommendation, .. }
@@ -338,6 +347,7 @@ impl SemanticError {
     /// Stable kind label for `oracle_status: backend=fail_fast kind=...`.
     pub fn kind(&self) -> &'static str {
         match self {
+            Self::UnsupportedFrameKind { .. } => "unsupported_frame_kind",
             Self::EmbedderFeatureMissing { .. } => "embedder_feature_missing",
             Self::EmbedderUnavailable { .. } => "embedder_unavailable",
             Self::IndexNotBuilt { .. } => "index_not_built",
@@ -374,6 +384,25 @@ impl std::fmt::Display for SemanticError {
 }
 
 impl std::error::Error for SemanticError {}
+
+/// Refuse a frame filter before querying conversation-level documents. Shared
+/// with MCP so a cached backend failure cannot obscure the unsupported request.
+pub(crate) fn validate_search_frame_kind(
+    frame_kind: Option<FrameKind>,
+) -> std::result::Result<(), SemanticError> {
+    if let Some(kind) = frame_kind {
+        return Err(SemanticError::UnsupportedFrameKind {
+            requested_frame_kind: kind.as_str().to_string(),
+            indexed_granularity: "conversation".to_string(),
+            reason: format!(
+                "frame_kind={} cannot be honored: the search index contains conversation-level documents, not individual frames",
+                kind.as_str(),
+            ),
+            recommendation: "omit frame_kind to search conversations; use `aicx extract <agent> --session <id> --conversation` to inspect a selected session's frames".to_string(),
+        });
+    }
+    Ok(())
+}
 
 fn index_query_error(path: &std::path::Path, err: anyhow::Error) -> SemanticError {
     let reason = format!("index query failed: {err}");
@@ -436,6 +465,7 @@ fn try_semantic_search_with_boundary(
     kind_filter: Option<&str>,
     candidate_filters: Option<&SemanticSearchFilters>,
 ) -> std::result::Result<(SemanticOutcome, CandidateBoundary), SemanticError> {
+    validate_search_frame_kind(frame_kind_filter)?;
     #[cfg(not(any(feature = "native-embedder", feature = "cloud-embedder")))]
     {
         let _ = (
@@ -3886,6 +3916,25 @@ mod tests {
             agent: None,
             date: None,
             candidate_filters: None,
+        }
+    }
+
+    #[test]
+    fn honest_count_search_refuses_frame_filters_in_shared_retrieval() {
+        for kind in [
+            FrameKind::UserMsg,
+            FrameKind::AgentReply,
+            FrameKind::InternalThought,
+            FrameKind::ToolCall,
+            FrameKind::SystemNote,
+        ] {
+            let err =
+                try_semantic_search(Path::new("unused"), "query", 10, &[None], Some(kind), None)
+                    .expect_err("conversation documents cannot honor frame filters");
+            assert_eq!(err.kind(), "unsupported_frame_kind");
+            assert!(err.reason().contains("conversation"));
+            assert!(err.reason().contains(kind.as_str()));
+            assert!(!err.allows_filesystem_fallback());
         }
     }
 
