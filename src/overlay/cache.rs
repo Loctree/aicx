@@ -1120,7 +1120,13 @@ mod tests {
         );
         let saved: ConversationCache = read_json(&root, &slot).unwrap().unwrap();
         let nested_path = nested.to_string_lossy().into_owned();
-        assert!(saved.scope_receipt.recorded_workdirs.contains(&nested_path));
+        // Windows CI is the only place this has failed; print what was
+        // recorded so the next red run names the spelling, not just "false".
+        assert!(
+            saved.scope_receipt.recorded_workdirs.contains(&nested_path),
+            "nested {nested_path:?} not in recorded {:?}",
+            saved.scope_receipt.recorded_workdirs
+        );
         assert!(
             !saved.scope.cwds.contains(&nested_path),
             "the fixture must require parser-owned raw paths, not reduced scope"
