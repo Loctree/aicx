@@ -3,6 +3,9 @@
 //! ADDRESSED TO are still over budget. The omission marker names those
 //! sections with the number of rows it dropped. A pack that fits is left
 //! byte-identical.
+//!
+//! Addressed speech is the last unprotected content to go: OPEN WORK gives
+//! its rows back first, and ADDRESSED TO loses its oldest takes first.
 use aicx::catalog::{CATALOG_SCHEMA, CatalogEntry};
 use chrono::Utc;
 use serde_json::json;
@@ -316,6 +319,15 @@ fn now_floor_hits(pack: &str, count: usize) -> usize {
         .count()
 }
 
+/// Indices of the addressed takes still printed, oldest first. The trailing
+/// space keeps `PRESSURE-1` from matching `PRESSURE-10`.
+fn kept_takes(pack: &str, count: usize) -> Vec<usize> {
+    let addressed = section(pack, "ADDRESSED TO ANDRZEJ");
+    (0..count)
+        .filter(|index| addressed.contains(&format!("PRESSURE-{index} ")))
+        .collect()
+}
+
 #[test]
 fn inject_keeps_the_now_floor_and_counts_dropped_rows() {
     let fixture = Fixture::new();
@@ -399,6 +411,82 @@ fn inject_keeps_every_now_line_when_the_section_is_shorter_than_the_floor() {
         "a short NOW section must survive whole:\n{}",
         section(&inject, "NOW")
     );
+}
+
+#[test]
+fn inject_trims_open_work_before_addressed_speech() {
+    let fixture = Fixture::new();
+    fixture.decisions(2);
+    fixture.branches(18);
+    fixture.addressed(3);
+
+    let full = fixture.pack(false);
+    assert!(
+        section(&full, "OPEN WORK").chars().count() > 24_000,
+        "OPEN WORK must exceed the inject budget on its own"
+    );
+    assert_eq!(kept_takes(&full, 3), vec![0, 1, 2]);
+
+    let inject = fixture.pack(true);
+    assert!(inject.chars().count() <= 24_000);
+    let marker = marker_line(&inject);
+    assert!(
+        dropped_rows(section(&full, "OPEN WORK"), section(&inject, "OPEN WORK")) > 0,
+        "OPEN WORK was not trimmed:\n{marker}"
+    );
+    // Every take fits once OPEN WORK gives its rows back. Cutting a take
+    // while an OPEN WORK row is still printed is the bug this cut closes.
+    assert_eq!(
+        kept_takes(&inject, 3),
+        vec![0, 1, 2],
+        "addressed speech was cut before OPEN WORK:\n{marker}\n{}",
+        section(&inject, "ADDRESSED TO ANDRZEJ")
+    );
+    assert!(!marker.contains("ADDRESSED TO"), "{marker}");
+    assert_eq!(now_floor_hits(&inject, 2), 2, "{}", section(&inject, "NOW"));
+}
+
+#[test]
+fn inject_drops_the_oldest_addressed_speech_first() {
+    let fixture = Fixture::new();
+    fixture.decisions(1);
+    fixture.branches(0);
+    fixture.addressed(12);
+
+    let full = fixture.pack(false);
+    assert!(
+        section(&full, "ADDRESSED TO ANDRZEJ").chars().count() > 24_000,
+        "ADDRESSED TO must exceed the inject budget on its own"
+    );
+    let inject = fixture.pack(true);
+    assert!(inject.chars().count() <= 24_000);
+    let kept = kept_takes(&inject, 12);
+    let addressed = section(&inject, "ADDRESSED TO ANDRZEJ");
+    assert!(
+        !kept.is_empty() && kept.len() < 12,
+        "kept {kept:?}:\n{addressed}"
+    );
+    // Takes render newest first; the budget takes them from the tail, so
+    // what survives is the newest run of takes.
+    assert_eq!(
+        kept,
+        ((12 - kept.len())..12).collect::<Vec<_>>(),
+        "{addressed}"
+    );
+    assert_eq!(now_floor_hits(&inject, 1), 1, "{}", section(&inject, "NOW"));
+    // The rest of HONESTY goes before addressed speech; the pack title and
+    // the window/labels lines do not.
+    let marker = marker_line(&inject);
+    assert!(marker.contains("HONESTY"), "{marker}");
+    assert_eq!(
+        inject.lines().next(),
+        full.lines().next(),
+        "pack title was cut:\n{inject}"
+    );
+    let honesty = section(&inject, "HONESTY");
+    for head in ["window: [", "labels: "] {
+        assert!(honesty.contains(head), "HONESTY lost {head}:\n{honesty}");
+    }
 }
 
 #[test]

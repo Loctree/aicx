@@ -25,6 +25,11 @@ const INJECT_CHAR_BUDGET: usize = 24_000;
 /// and the other claim sections are still what the budget can cut.
 const NOW_INJECT_FLOOR: usize = 5;
 
+/// HONESTY lines that say which window this is and that every label is an
+/// unverified candidate. With the pack title they outlive addressed speech;
+/// the rest of HONESTY is cut before it.
+const HONESTY_INJECT_HEAD: [&str; 3] = ["window:", "unbounded history:", "labels:"];
+
 const NOW_CAP: usize = 10;
 const PEER_SESSION_CAP: usize = 8;
 const PEER_CLAIM_CAP: usize = 3;
@@ -661,10 +666,12 @@ fn printed_path(path: &str) -> String {
 ///
 /// The newest [`NOW_INJECT_FLOOR`] NOW body lines stay whole until claim
 /// lines outside that floor, OPEN WORK rows, and ADDRESSED TO rows have been
-/// dropped. Fewer NOW lines than the floor are kept whole. The first NOW body
-/// line then stays with SOURCES and INDEX HEALTH. The omission marker names
-/// every section that lost a line, and OPEN WORK / ADDRESSED TO also say how
-/// many rows were dropped.
+/// dropped. Addressed speech is the last unprotected content to go: OPEN WORK
+/// and every other unprotected line leave before an ADDRESSED TO row, and
+/// that section loses its oldest takes first. Fewer NOW lines than the floor
+/// are kept whole. The first NOW body line then stays with SOURCES and INDEX
+/// HEALTH. The omission marker names every section that lost a line, and
+/// OPEN WORK / ADDRESSED TO also say how many rows were dropped.
 pub(crate) fn bounded_inject(out: String) -> String {
     if out.chars().count() <= INJECT_CHAR_BUDGET {
         return out;
@@ -712,8 +719,12 @@ fn inject_omission_marker(shortened: &[String]) -> String {
     }
 }
 
+fn addressed_section(section: &str) -> bool {
+    section.starts_with("ADDRESSED TO")
+}
+
 fn counts_dropped_rows(section: &str) -> bool {
-    section == "OPEN WORK" || section.starts_with("ADDRESSED TO")
+    section == "OPEN WORK" || addressed_section(section)
 }
 
 fn split_inject_lines(out: &str) -> Vec<InjectLine> {
@@ -740,11 +751,16 @@ fn split_inject_lines(out: &str) -> Vec<InjectLine> {
         // The single newest NOW line stays with SOURCES and INDEX HEALTH
         // once the floor itself has to give lines back.
         let protect_newest_now = now_floor && now_floor_used == 1;
+        let honesty_head = (section.is_empty() && body.starts_with("# "))
+            || (section == "HONESTY"
+                && HONESTY_INJECT_HEAD
+                    .iter()
+                    .any(|prefix| body.starts_with(prefix)));
         lines.push(InjectLine {
             section: section.clone(),
             line: line.to_string(),
             claim,
-            protected: protected || protect_newest_now,
+            protected: protected || protect_newest_now || honesty_head,
             heading,
             now_floor,
         });
@@ -802,10 +818,11 @@ fn last_inject_line(
         .map(|(index, _)| index)
 }
 
-/// Claim lines outside the NOW floor go first. OPEN WORK and ADDRESSED TO
-/// rows follow, from the tail, before the floor gives a line back. One body
-/// line of each protected section (newest NOW, SOURCES, INDEX HEALTH) stays
-/// until nothing else can go.
+/// Claim lines outside the NOW floor go first, then OPEN WORK rows from the
+/// tail, then the remaining unprotected lines. ADDRESSED TO rows go next,
+/// from the tail (the oldest take first), before the floor gives a line back.
+/// One body line of each protected section (pack title, HONESTY head, newest
+/// NOW, SOURCES, INDEX HEALTH) stays until nothing else can go.
 fn next_inject_drop(lines: &[InjectLine], keep: &[bool]) -> Option<usize> {
     if let Some(index) = last_inject_line(lines, keep, |piece| {
         piece.claim && !piece.protected && !piece.now_floor && !piece.heading
@@ -813,13 +830,17 @@ fn next_inject_drop(lines: &[InjectLine], keep: &[bool]) -> Option<usize> {
         return Some(index);
     }
     if let Some(index) = last_inject_line(lines, keep, |piece| {
-        (piece.section == "OPEN WORK" || piece.section.starts_with("ADDRESSED TO"))
-            && !piece.heading
+        piece.section == "OPEN WORK" && !piece.heading
     }) {
         return Some(index);
     }
     if let Some(index) = last_inject_line(lines, keep, |piece| {
-        !piece.protected && !piece.now_floor && !piece.heading
+        !piece.protected && !piece.now_floor && !piece.heading && !addressed_section(&piece.section)
+    }) {
+        return Some(index);
+    }
+    if let Some(index) = last_inject_line(lines, keep, |piece| {
+        addressed_section(&piece.section) && !piece.heading
     }) {
         return Some(index);
     }
