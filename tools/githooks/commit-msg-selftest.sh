@@ -1445,3 +1445,14 @@ out="$(gen '[copilot/interactive] feat: import a named SDK session
 
 Preserve the native identifier.' COPILOT_SESSION_ID="user-123-task-456" VC_SESSION_PID=0)"
 expect_line copilot-named-native-session "$out" "session_id: user-123-task-456"
+
+omp_id="01999999-bbbb-7666-8666-111111111111"
+out="$(gen '[pi/interactive] feat: import a native omp session
+
+Keep the omp transcript.' OMP_SESSION_ID="$omp_id" VC_SESSION_PID=0)"
+expect_line omp-alias-session "$out" "session_id: $omp_id"
+expect_line omp-alias-author "$out" "Authored-By: pi <agents@vetcoders.io>"
+out="$(gen '[codex/interactive] fix: do not steal an omp session
+
+Keep the owning lane.' PI_SESSION_ID="$omp_id" VC_SESSION_PID=0)"
+expect_absent codex-does-not-record-omp "$out" "session_id:"
