@@ -582,6 +582,130 @@ fn test_cors_all_returns_wildcard_not_reflected_origin() {
     );
 }
 
+fn intent_record(
+    project: &str,
+    agent: &str,
+    date: &str,
+    summary: &str,
+) -> crate::intents::IntentRecord {
+    crate::intents::IntentRecord {
+        provenance: None,
+        kind: crate::intents::IntentKind::Intent,
+        summary: summary.to_string(),
+        context: None,
+        evidence: vec![],
+        project: project.to_string(),
+        agent: agent.to_string(),
+        date: date.to_string(),
+        timestamp: None,
+        session_id: "sess-intent-1".to_string(),
+        count: None,
+        first_chunk: None,
+        last_chunk: None,
+        source_chunk: format!("{project}-{agent}-{date}"),
+        source: None,
+        honesty: Default::default(),
+    }
+}
+
+#[test]
+fn intents_api_filters_project_agent_hours_and_limit_and_cuts_the_body() {
+    let now = DateTime::parse_from_rfc3339("2026-10-21T12:00:00Z")
+        .expect("now")
+        .with_timezone(&Utc);
+    let long = "ł".repeat(3001);
+    let records = vec![
+        intent_record("Loctree/aicx", "claude", "2026-10-21", &long),
+        intent_record("Other/repo", "claude", "2026-10-21", "other project"),
+        intent_record("Loctree/aicx", "codex", "2026-10-21", "other agent"),
+        intent_record("Loctree/aicx", "claude", "2020-01-01", "old intent"),
+        intent_record(
+            "Loctree/aicx",
+            "claude",
+            "2026-10-20",
+            "older matching intent",
+        ),
+    ];
+
+    let filtered = intents::select_intent_api_items(
+        records.clone(),
+        &intents::IntentApiSelect {
+            project: Some("Loctree/aicx".to_string()),
+            agent: Some("claude".to_string()),
+            hours: 48,
+            limit: Some(1),
+            full: false,
+            session_id: None,
+            source_chunk: None,
+            now,
+        },
+    );
+    assert_eq!(filtered.len(), 1);
+    let item = &filtered[0];
+    assert_eq!(item.project, "Loctree/aicx");
+    assert_eq!(item.agent, "claude");
+    assert_eq!(item.date, "2026-10-21");
+    assert_eq!(item.kind, "INTENT");
+    assert_eq!(item.surface, "intent");
+    assert!(item.header.contains('·'));
+    assert!(item.header.contains("Loctree/aicx"));
+    assert!(item.header.contains("sess-int"));
+    assert_eq!(item.body_chars_total, 3001);
+    assert!(item.body_truncated);
+    assert!(item.body.contains(" …[+1 znaków]"));
+    assert!(item.body.chars().count() > 3000);
+
+    let all_time = intents::select_intent_api_items(
+        records,
+        &intents::IntentApiSelect {
+            project: Some("Loctree/aicx".to_string()),
+            agent: Some("claude".to_string()),
+            hours: 0,
+            limit: Some(10),
+            full: true,
+            session_id: None,
+            source_chunk: None,
+            now,
+        },
+    );
+    assert!(all_time.iter().any(|item| item.date == "2020-01-01"));
+    assert!(all_time.iter().all(|item| item.agent == "claude"));
+    assert!(all_time.iter().all(|item| item.project == "Loctree/aicx"));
+    let full = all_time
+        .iter()
+        .find(|item| item.date == "2026-10-21")
+        .expect("long record");
+    assert!(!full.body_truncated);
+    assert_eq!(full.body.chars().count(), 3001);
+}
+
+#[tokio::test]
+async fn intents_http_envelope_reports_the_shared_preview_constant() {
+    let root = mk_tmp_dir("dashboard_server_intents_envelope");
+    let state = mk_state(root.clone(), root.join("dashboard.html"));
+    let app = assemble_router(state, false);
+    let response = app
+        .oneshot(http_request(
+            Method::GET,
+            "/api/intents?project=Loctree/aicx&agent=claude&hours=48&limit=5",
+            None,
+            None,
+            false,
+        ))
+        .await
+        .expect("intents response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_body_to_string(response).await;
+    let payload: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(payload["ok"], true);
+    assert_eq!(
+        payload["body_preview_chars"],
+        crate::result_format::RESULT_BODY_PREVIEW_CHARS
+    );
+    assert!(payload["items"].is_array());
+    let _ = fs::remove_dir_all(root);
+}
+
 #[test]
 fn test_service_worker_cache_name_includes_version() {
     // Just statically verified in code. But we can't test get_service_worker directly

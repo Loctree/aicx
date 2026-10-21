@@ -280,7 +280,7 @@ fn static_dashboard_includes_highlight_styles_and_wiring() {
     assert!(html.contains("name.innerHTML = highlightTerms(nameText, highlightQuery());"));
     assert!(html.contains(".result-preview {"));
     assert!(html.contains("preview.className = 'result-preview';"));
-    assert!(html.contains("preview.innerHTML = highlightTerms(record.preview, highlightQuery());"));
+    assert!(html.contains("preview.innerHTML = highlightTerms(listText, highlightQuery());"));
     assert!(html.contains("state.queryRaw = ui.search.value || '';"));
 }
 

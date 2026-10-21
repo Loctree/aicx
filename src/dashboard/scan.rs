@@ -22,7 +22,45 @@ const MAX_DETAIL_CHARS: usize = 32_000;
 /// still covers the whole catalog; opening the port must not wait on every file.
 const DASHBOARD_LIST_CAP: usize = 400;
 const DASHBOARD_READ_BUDGET: usize = 800;
-type ConversationPreview = (Option<usize>, String, String, String, Option<i64>);
+
+struct NotePreview {
+    entry_count: Option<usize>,
+    preview: String,
+    body_chars_total: usize,
+    body_truncated: bool,
+    search_excerpt: String,
+    detail_text: String,
+    sort_ts: Option<i64>,
+}
+
+fn cut_osnowa(text: &str, max_chars: usize) -> (String, usize, bool) {
+    let cut = crate::result_format::cut_result_body(text, max_chars);
+    (cut.body, cut.body_chars_total, cut.body_truncated)
+}
+
+fn note_preview(
+    entry_count: Option<usize>,
+    source: &str,
+    max_chars: usize,
+    search_excerpt: String,
+    detail_text: String,
+    sort_ts: Option<i64>,
+) -> NotePreview {
+    let (preview, body_chars_total, body_truncated) = cut_osnowa(source, max_chars);
+    NotePreview {
+        entry_count,
+        preview,
+        body_chars_total,
+        body_truncated,
+        search_excerpt,
+        detail_text,
+        sort_ts,
+    }
+}
+
+fn record_header(project: &str, agent: &str, kind: &str, date: &str, session_id: &str) -> String {
+    crate::result_format::result_header(project, agent, kind, date, None, session_id)
+}
 
 pub(super) fn scan_legacy_archive(
     aicx_home: &Path,
@@ -106,8 +144,11 @@ pub(super) fn scan_legacy_archive(
             .and_then(|name| name.to_str())
             .unwrap_or("unknown-file")
             .to_string();
-        let (entry_count, preview, search_excerpt, detail_text, content_sort_ts) =
+        let note =
             read_preview_and_search_excerpt(&file_path, &extension, metadata.len(), preview_chars);
+        let entry_count = note.entry_count;
+        let search_excerpt = note.search_excerpt;
+        let content_sort_ts = note.sort_ts;
 
         let modified = metadata.modified().ok();
         let modified_utc = format_modified_utc(modified);
@@ -144,6 +185,13 @@ pub(super) fn scan_legacy_archive(
         projects.insert(stored_file.project.clone());
         agents.insert(stored_file.agent.clone());
         kinds.insert(stored_file.kind.dir_name().to_string());
+        let header = record_header(
+            &stored_file.project,
+            &stored_file.agent,
+            stored_file.kind.dir_name(),
+            &stored_file.date_iso,
+            "",
+        );
 
         let record = DashboardRecord {
             id: records.len() + 1,
@@ -161,9 +209,13 @@ pub(super) fn scan_legacy_archive(
             modified_utc,
             sort_ts,
             entry_count,
-            preview,
+            preview: note.preview.clone(),
             search_blob,
-            detail_text,
+            detail_text: note.detail_text,
+            session_id: String::new(),
+            header,
+            body_chars_total: note.body_chars_total,
+            body_truncated: note.body_truncated,
         };
 
         stats.total_files += 1;
@@ -320,11 +372,12 @@ fn scan_catalog_sessions(
         // A catalog row is a session. If the conversation reader cannot produce
         // a readable turn, leave the raw jsonl out of the default list.
         attempts += 1;
-        let Some((entry_count, preview, search_excerpt, detail_text, content_sort_ts)) =
-            read_catalog_conversation_preview(aicx_home, &entry, preview_chars)
-        else {
+        let Some(note) = read_catalog_conversation_preview(aicx_home, &entry, preview_chars) else {
             continue;
         };
+        let entry_count = note.entry_count;
+        let search_excerpt = note.search_excerpt;
+        let content_sort_ts = note.sort_ts;
         // Source modification time is the durable signal that a live session
         // changed. Some providers preserve stale or malformed frame timestamps,
         // so letting content time win can bury the hottest session.
@@ -357,6 +410,7 @@ fn scan_catalog_sessions(
         stats.fuzzy_index_chars += search_blob.len();
         stats.total_bytes += metadata.len();
         stats.total_entries_estimate += entry_count.unwrap_or(0);
+        let header = record_header(&project, &entry.agent, "session", &date, &entry.session_id);
         records.push(DashboardRecord {
             id: 0,
             project,
@@ -373,9 +427,13 @@ fn scan_catalog_sessions(
             modified_utc: format_modified_utc(modified),
             sort_ts,
             entry_count,
-            preview,
+            preview: note.preview,
             search_blob,
-            detail_text,
+            detail_text: note.detail_text,
+            session_id: entry.session_id.clone(),
+            header,
+            body_chars_total: note.body_chars_total,
+            body_truncated: note.body_truncated,
         });
     }
 
@@ -500,7 +558,7 @@ fn read_catalog_conversation_preview(
     aicx_home: &Path,
     entry: &crate::catalog::CatalogEntry,
     preview_chars: usize,
-) -> Option<ConversationPreview> {
+) -> Option<NotePreview> {
     let (_, frames, _scope) =
         crate::source_index::read_catalog_conversation_at(aicx_home, entry).ok()?;
     if frames.is_empty() {
@@ -550,7 +608,6 @@ fn read_catalog_conversation_preview(
     } else {
         preview_chars
     };
-    let preview = trim_chars(conversation.trim(), preview_cap);
     let search_excerpt = trim_chars(&collapse_ws(&conversation), MAX_SEARCH_TEXT_CHARS);
     let sort_ts = frames
         .iter()
@@ -558,7 +615,14 @@ fn read_catalog_conversation_preview(
         .find(|frame| !is_empty_epoch(frame.timestamp))
         .or_else(|| frames.last())
         .map(|frame| frame.timestamp.timestamp());
-    Some((Some(turns.len()), preview, search_excerpt, detail, sort_ts))
+    Some(note_preview(
+        Some(turns.len()),
+        conversation.trim(),
+        preview_cap,
+        search_excerpt,
+        detail,
+        sort_ts,
+    ))
 }
 
 fn supported_note_extension(ext: &str) -> bool {
@@ -580,45 +644,45 @@ fn read_preview_and_search_excerpt(
     extension: &str,
     size: u64,
     preview_chars: usize,
-) -> (Option<usize>, String, String, String, Option<i64>) {
+) -> NotePreview {
     if extension == "json" {
         return read_json_preview_and_search(path, size, preview_chars);
     }
 
     let raw = read_text_limited(path, SEARCH_READ_BYTES);
     if raw.is_empty() {
-        return (None, "".to_string(), "".to_string(), "".to_string(), None);
+        return note_preview(None, "", preview_chars, String::new(), String::new(), None);
     }
 
     let detail = trim_chars(&sanitize_detail_text(&raw), MAX_DETAIL_CHARS);
     let collapsed = collapse_ws(&raw);
-    let preview = trim_chars(&collapsed, preview_chars);
     let search_excerpt = trim_chars(&collapsed, MAX_SEARCH_TEXT_CHARS);
     let sort_ts = extract_latest_timestamp_from_text(&raw);
 
-    (None, preview, search_excerpt, detail, sort_ts)
+    note_preview(
+        None,
+        &collapsed,
+        preview_chars,
+        search_excerpt,
+        detail,
+        sort_ts,
+    )
 }
 
-fn read_json_preview_and_search(
-    path: &Path,
-    size: u64,
-    max_preview_chars: usize,
-) -> (Option<usize>, String, String, String, Option<i64>) {
+fn read_json_preview_and_search(path: &Path, size: u64, max_preview_chars: usize) -> NotePreview {
     if size > MAX_JSON_PARSE_BYTES {
         let raw = read_text_limited(path, SEARCH_READ_BYTES);
         let collapsed = collapse_ws(&raw);
-        let preview = trim_chars(
-            &format!(
-                "JSON file too large to parse structurally; using raw excerpt ({}). {}",
-                human_size(size),
-                trim_chars(&collapsed, max_preview_chars)
-            ),
-            max_preview_chars,
+        let source = format!(
+            "JSON file too large to parse structurally; using raw excerpt ({}). {}",
+            human_size(size),
+            trim_chars(&collapsed, max_preview_chars)
         );
         let detail = trim_chars(&sanitize_detail_text(&raw), MAX_DETAIL_CHARS);
-        return (
+        return note_preview(
             None,
-            preview,
+            &source,
+            max_preview_chars,
             trim_chars(&collapsed, MAX_SEARCH_TEXT_CHARS),
             detail,
             None,
@@ -628,11 +692,12 @@ fn read_json_preview_and_search(
     let bytes = match fs::read(path) {
         Ok(v) => v,
         Err(_) => {
-            return (
+            return note_preview(
                 None,
-                "Failed to read JSON preview.".to_string(),
-                "".to_string(),
-                "".to_string(),
+                "Failed to read JSON preview.",
+                max_preview_chars,
+                String::new(),
+                String::new(),
                 None,
             );
         }
@@ -643,9 +708,10 @@ fn read_json_preview_and_search(
         Err(_) => {
             let raw = String::from_utf8_lossy(&bytes).to_string();
             let collapsed = collapse_ws(&raw);
-            return (
+            return note_preview(
                 None,
-                trim_chars(&collapsed, max_preview_chars),
+                &collapsed,
+                max_preview_chars,
                 trim_chars(&collapsed, MAX_SEARCH_TEXT_CHARS),
                 trim_chars(&sanitize_detail_text(&raw), MAX_DETAIL_CHARS),
                 None,
@@ -666,13 +732,10 @@ fn read_json_preview_and_search(
     );
 
     let collapsed = collapse_ws(&strings.join(" | "));
-    let preview = if collapsed.is_empty() {
-        trim_chars(
-            "JSON payload parsed but no string fields were found.",
-            max_preview_chars,
-        )
+    let source = if collapsed.is_empty() {
+        "JSON payload parsed but no string fields were found.".to_string()
     } else {
-        trim_chars(&collapsed, max_preview_chars)
+        collapsed.clone()
     };
     let search_excerpt = trim_chars(&collapsed, MAX_SEARCH_TEXT_CHARS);
 
@@ -680,7 +743,14 @@ fn read_json_preview_and_search(
     let detail = trim_chars(&sanitize_detail_text(&pretty), MAX_DETAIL_CHARS);
     let sort_ts = extract_latest_timestamp_from_json(&value);
 
-    (entry_count, preview, search_excerpt, detail, sort_ts)
+    note_preview(
+        entry_count,
+        &source,
+        max_preview_chars,
+        search_excerpt,
+        detail,
+        sort_ts,
+    )
 }
 
 pub(super) fn collect_json_strings(

@@ -813,8 +813,8 @@ struct DashboardArgs {
     #[arg(long, default_value = DEFAULT_DASHBOARD_TITLE)]
     title: String,
 
-    /// Max preview characters per record (0 = no truncation)
-    #[arg(long, default_value = "320")]
+    /// Max osnowa characters per record (0 = no truncation). Default is the shared result preview.
+    #[arg(long, default_value_t = aicx::result_format::RESULT_BODY_PREVIEW_CHARS)]
     preview_chars: usize,
 }
 
@@ -972,8 +972,8 @@ struct DashboardServeLegacyArgs {
     #[arg(long, default_value = DEFAULT_DASHBOARD_TITLE)]
     title: String,
 
-    /// Max preview characters per record (0 = no truncation)
-    #[arg(long, default_value = "320")]
+    /// Max osnowa characters per record (0 = no truncation). Default is the shared result preview.
+    #[arg(long, default_value_t = aicx::result_format::RESULT_BODY_PREVIEW_CHARS)]
     preview_chars: usize,
 }
 
@@ -1815,6 +1815,10 @@ enum Commands {
         /// scope holes. Expensive; parser safety bounds still apply.
         #[arg(long)]
         full_rescan: bool,
+
+        /// Print the whole osnowa. Default keeps the shared 3000-character preview.
+        #[arg(long)]
+        full: bool,
     },
 
     /// Multi-agent continuity pack: NOW / PEERS / DECISIONS / TASKS /
@@ -3237,6 +3241,7 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
             live,
             no_live,
             full_rescan,
+            full,
         }) => {
             let live_mode = live || (intents::IntentsConfig::auto_live(hours) && !no_live);
             run_intents(
@@ -3252,6 +3257,7 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
                     unresolved,
                     unresolved_mode: unresolved_mode.into(),
                     collapse_session,
+                    full,
                 },
                 live_mode,
                 full_rescan,
@@ -4982,6 +4988,7 @@ struct IntentsDisplayOptions<'a> {
     unresolved: bool,
     unresolved_mode: aicx::intents::UnresolvedMode,
     collapse_session: bool,
+    full: bool,
 }
 
 #[derive(Debug)]
@@ -5299,6 +5306,7 @@ fn run_intents(
         unresolved,
         unresolved_mode,
         collapse_session,
+        full,
     } = display;
     let kind_filter = kind.map(|k| match k {
         "decision" => intents::IntentKind::Decision,
@@ -5327,6 +5335,7 @@ fn run_intents(
             min_confidence,
             live,
             full_source_scan,
+            full,
         )?;
         return Ok(());
     }
@@ -5461,10 +5470,11 @@ fn run_intents(
                     project_resolution.selected.clone(),
                     project_resolution.candidates.clone(),
                 );
-            let json = intents::format_intents_oracle_json_with_completeness(
+            let json = intents::format_intents_oracle_json_with_completeness_and_body(
                 &records,
                 oracle_status,
                 completeness,
+                full,
             )?;
             println!("{}", json);
         }
@@ -5472,7 +5482,7 @@ fn run_intents(
             if live {
                 print_live_window_header(extraction.stats.live_sessions);
             }
-            let md = intents::format_intents_markdown(&records);
+            let md = intents::format_intents_markdown_with(&records, full);
             print!("{}", md);
             if let Some(note) = extraction.stats.withheld_scope_note() {
                 print!("{note}");
@@ -5497,6 +5507,7 @@ fn should_render_intents_pack(
         && filters.frame_kind.is_none()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_intents_pack(
     projects: &[String],
     hours: u64,
@@ -5505,6 +5516,7 @@ fn run_intents_pack(
     min_confidence: Option<u8>,
     live: bool,
     full_source_scan: bool,
+    full: bool,
 ) -> Result<()> {
     let lane_sort = filters.sort.unwrap_or(SortOrder::Newest);
     let lane_limit = filters.limit.or(Some(DEFAULT_INTENTS_PACK_LIMIT));
@@ -5623,7 +5635,7 @@ fn run_intents_pack(
     };
     print!(
         "{}",
-        format_intents_pack_markdown(&project_label, hours, lane_limit, &sections)
+        format_intents_pack_markdown(&project_label, hours, lane_limit, &sections, full)
     );
     // What the project filters withheld, counted on the widest lane as well:
     // every lane notes the same sessions, and a lane without a frame kind sees
@@ -5716,6 +5728,7 @@ fn format_intents_pack_markdown(
     hours: u64,
     per_section_limit: Option<usize>,
     sections: &[IntentPackSection],
+    full: bool,
 ) -> String {
     let mut out = String::new();
     out.push_str("# Intent Report\n\n");
@@ -5739,7 +5752,7 @@ fn format_intents_pack_markdown(
             continue;
         }
         for record in &section.records {
-            format_pack_record(&mut out, record);
+            format_pack_record(&mut out, record, full);
         }
     }
 
@@ -5749,9 +5762,18 @@ fn format_intents_pack_markdown(
         out.push_str("_No mission keyword hits._\n");
     } else {
         for hit in hits {
+            let shown = if full {
+                hit.summary.clone()
+            } else {
+                aicx::result_format::cut_result_body(
+                    &hit.summary,
+                    aicx::result_format::RESULT_BODY_PREVIEW_CHARS,
+                )
+                .body
+            };
             out.push_str(&format!(
                 "- `{}` in {} | {} | {}: {}\n",
-                hit.keyword, hit.section, hit.date, hit.agent, hit.summary
+                hit.keyword, hit.section, hit.date, hit.agent, shown
             ));
             for source_chunk in unique_source_chunks(&hit.source_chunk) {
                 out.push_str(&format!("  source_chunk: {source_chunk}\n"));
@@ -5762,20 +5784,10 @@ fn format_intents_pack_markdown(
     out
 }
 
-fn format_pack_record(out: &mut String, record: &intents::IntentRecord) {
-    let count = record
-        .count
-        .filter(|count| *count > 1)
-        .map(|count| format!(" ({count}x)"))
-        .unwrap_or_default();
-    out.push_str(&format!(
-        "### {}{} | {} | {}\n",
-        record.kind.heading(),
-        count,
-        record.agent,
-        record.date
-    ));
-    out.push_str(&format!("{}: {}\n", record.kind.heading(), record.summary));
+fn format_pack_record(out: &mut String, record: &intents::IntentRecord, full: bool) {
+    let shown = intents::intent_display_body(record, full);
+    out.push_str(&format!("### {}\n", intents::intent_display_header(record)));
+    out.push_str(&format!("{}: {}\n", record.kind.heading(), shown.body));
     out.push_str(&format!(
         "WHY: {}\n",
         record.context.as_deref().unwrap_or("not captured")
@@ -5892,6 +5904,7 @@ fn run_tail(
                 unresolved: false,
                 unresolved_mode: aicx::intents::UnresolvedMode::Session,
                 collapse_session: false,
+                full: false,
             },
             intents::IntentsConfig::auto_live(hours),
             false,
@@ -5974,8 +5987,9 @@ fn run_tail(
             if !new_records.is_empty() {
                 for rec in new_records {
                     let mut out = String::new();
-                    out.push_str(&format!("### {} | {}\n", rec.kind.heading(), rec.agent));
-                    out.push_str(&format!("{}: {}\n", rec.kind.heading(), rec.summary));
+                    let shown = intents::intent_display_body(&rec, false);
+                    out.push_str(&format!("### {}\n", intents::intent_display_header(&rec)));
+                    out.push_str(&format!("{}: {}\n", rec.kind.heading(), shown.body));
                     out.push_str(&format!(
                         "WHY: {}\n",
                         rec.context.as_deref().unwrap_or("not captured")
@@ -11318,7 +11332,7 @@ fn spawn_dashboard_server_background(args: DashboardServerBackgroundArgs<'_>) ->
     if args.title != DEFAULT_DASHBOARD_TITLE {
         command.arg("--title").arg(args.title);
     }
-    if args.preview_chars != 320 {
+    if args.preview_chars != aicx::result_format::RESULT_BODY_PREVIEW_CHARS {
         command
             .arg("--preview-chars")
             .arg(args.preview_chars.to_string());

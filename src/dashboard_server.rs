@@ -34,6 +34,7 @@ use crate::dashboard::{self, DashboardPayload, DashboardScope, DashboardStats};
 mod browse;
 mod continuity;
 mod cors;
+mod intents;
 mod operator;
 mod search;
 use cors::dashboard_cors_middleware;
@@ -337,6 +338,7 @@ fn assemble_router(state: Arc<DashboardServerState>, mount_health: bool) -> Rout
     let api_router: Router<Arc<DashboardServerState>> = Router::new()
         .route("/api/status", get(get_status))
         .route("/api/browse", get(get_browse_on_demand))
+        .route("/api/intents", get(intents::get_intents))
         .route("/api/detail", get(browse::get_detail))
         .route("/api/chunk", get(browse::get_chunk))
         .route("/api/context", get(get_context))

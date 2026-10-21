@@ -869,6 +869,9 @@ pub struct IntentsParams {
     /// holes. Expensive; parser safety bounds still apply.
     #[serde(default)]
     pub full_rescan: bool,
+    /// Return the whole osnowa. Default false keeps the shared 3000-character preview.
+    #[serde(default)]
+    pub full: bool,
     /// Sort order: newest (default), oldest
     pub sort: Option<String>,
     /// Max records to return (default: 20, capped at 500)
@@ -1943,7 +1946,7 @@ impl AicxMcpServer {
 
         let body = match params.emit.as_str() {
             "markdown" | "md" => {
-                let mut body = intents::format_intents_markdown(&records);
+                let mut body = intents::format_intents_markdown_with(&records, params.full);
                 if let Some(note) = extraction.stats.withheld_scope_note() {
                     body.push_str(&note);
                 }
@@ -1974,10 +1977,11 @@ impl AicxMcpServer {
                         project_resolution.selected.clone(),
                         project_resolution.candidates.clone(),
                     );
-                intents::format_intents_oracle_json_with_completeness(
+                intents::format_intents_oracle_json_with_completeness_and_body(
                     &records,
                     oracle_status,
                     completeness,
+                    params.full,
                 )
                 .map_err(|e| {
                     McpError::internal_error(format!("Serialize intents JSON: {e}"), None)
@@ -2361,7 +2365,7 @@ async fn hybrid_http_app(
         aicx_home: aicx_home.clone(),
         scope: crate::dashboard::DashboardScope::default(),
         title: "AICX".to_string(),
-        preview_chars: 320,
+        preview_chars: crate::result_format::RESULT_BODY_PREVIEW_CHARS,
         artifact_path: aicx_home.join("aicx-dashboard.html"),
         cors_policy: cors,
         host: http_config.host,

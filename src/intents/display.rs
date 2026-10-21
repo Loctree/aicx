@@ -490,7 +490,72 @@ fn canonicalize_source_chunks(target: &mut String) {
     *target = chunks.join(", ");
 }
 
+pub fn intent_display_header(record: &IntentRecord) -> String {
+    let mut kind = record.kind.heading().to_string();
+    if record.source.as_deref() == Some("voice_transcript") {
+        kind.push_str(" [voice]");
+    }
+    if let Some(count) = record.count.filter(|count| *count > 1) {
+        kind.push_str(&format!(" ({count}x)"));
+    }
+    crate::result_format::result_header(
+        &record.project,
+        &record.agent,
+        &kind,
+        &record.date,
+        None,
+        &record.session_id,
+    )
+}
+
+pub fn intent_display_body(record: &IntentRecord, full: bool) -> crate::result_format::ResultBody {
+    if full {
+        return crate::result_format::cut_result_body(&record.summary, 0);
+    }
+    let body = super::truncate_summary_for_display(&record.summary);
+    let body_chars_total = record.summary.chars().count();
+    crate::result_format::ResultBody {
+        body_truncated: body != record.summary,
+        body_chars_total,
+        body,
+    }
+}
+
+#[derive(serde::Serialize)]
+struct PresentedIntent {
+    #[serde(flatten)]
+    record: IntentRecord,
+    header: String,
+    body: String,
+    body_chars_total: usize,
+    body_truncated: bool,
+}
+
+fn present_intent(record: &IntentRecord, full: bool) -> PresentedIntent {
+    let shown = intent_display_body(record, full);
+    let mut owned = record.clone();
+    owned.summary = shown.body.clone();
+    PresentedIntent {
+        header: intent_display_header(record),
+        body: shown.body,
+        body_chars_total: shown.body_chars_total,
+        body_truncated: shown.body_truncated,
+        record: owned,
+    }
+}
+
+fn present_intents(records: &[IntentRecord], full: bool) -> Vec<PresentedIntent> {
+    records
+        .iter()
+        .map(|record| present_intent(record, full))
+        .collect()
+}
+
 pub fn format_intents_markdown(records: &[IntentRecord]) -> String {
+    format_intents_markdown_with(records, false)
+}
+
+pub fn format_intents_markdown_with(records: &[IntentRecord], full: bool) -> String {
     if records.is_empty() {
         return String::new();
     }
@@ -516,15 +581,15 @@ pub fn format_intents_markdown(records: &[IntentRecord]) -> String {
             "_{}_\n\n",
             ClaimHonesty::live_open().display_line()
         ));
-        format_intents_records_into(&mut out, &live);
+        format_intents_records_into(&mut out, &live, full);
         out.push_str("## Closed Session Intent\n\n");
     }
-    format_intents_records_into(&mut out, &closed);
+    format_intents_records_into(&mut out, &closed, full);
 
     out
 }
 
-fn format_intents_records_into(out: &mut String, records: &[&IntentRecord]) {
+fn format_intents_records_into(out: &mut String, records: &[&IntentRecord], full: bool) {
     let mut last_date: Option<&str> = None;
 
     for record in records {
@@ -536,18 +601,9 @@ fn format_intents_records_into(out: &mut String, records: &[&IntentRecord]) {
             last_date = Some(record.date.as_str());
         }
 
-        let voice_marker = if record.source.as_deref() == Some("voice_transcript") {
-            " [voice]"
-        } else {
-            ""
-        };
-        out.push_str(&format!(
-            "### {}{} | {}\n",
-            record.kind.heading(),
-            voice_marker,
-            record.agent
-        ));
-        out.push_str(&format!("{}: {}\n", record.kind.heading(), record.summary));
+        let shown = intent_display_body(record, full);
+        out.push_str(&format!("### {}\n", intent_display_header(record)));
+        out.push_str(&format!("{}: {}\n", record.kind.heading(), shown.body));
         out.push_str(&format!(
             "WHY: {}\n",
             record.context.as_deref().unwrap_or("not captured")
@@ -562,18 +618,31 @@ fn format_intents_records_into(out: &mut String, records: &[&IntentRecord]) {
 }
 
 pub fn format_intents_json(records: &[IntentRecord]) -> Result<String> {
-    serde_json::to_string_pretty(records).context("Failed to serialize intents to JSON")
+    format_intents_json_with(records, false)
+}
+
+pub fn format_intents_json_with(records: &[IntentRecord], full: bool) -> Result<String> {
+    serde_json::to_string_pretty(&present_intents(records, full))
+        .context("Failed to serialize intents to JSON")
 }
 
 pub fn format_intents_oracle_json(
     records: &[IntentRecord],
     oracle_status: OracleStatus,
 ) -> Result<String> {
+    format_intents_oracle_json_with(records, oracle_status, false)
+}
+
+pub fn format_intents_oracle_json_with(
+    records: &[IntentRecord],
+    oracle_status: OracleStatus,
+    full: bool,
+) -> Result<String> {
     serde_json::to_string_pretty(&OracleEnvelope {
         oracle_status,
         claim_honesty: ClaimHonesty::canonical(),
         results: records.len(),
-        items: records,
+        items: present_intents(records, full),
     })
     .context("Failed to serialize intents oracle JSON")
 }
@@ -583,13 +652,27 @@ pub fn format_intents_oracle_json_with_completeness(
     oracle_status: OracleStatus,
     completeness: IntentsCompleteness,
 ) -> Result<String> {
+    format_intents_oracle_json_with_completeness_and_body(
+        records,
+        oracle_status,
+        completeness,
+        false,
+    )
+}
+
+pub fn format_intents_oracle_json_with_completeness_and_body(
+    records: &[IntentRecord],
+    oracle_status: OracleStatus,
+    completeness: IntentsCompleteness,
+    full: bool,
+) -> Result<String> {
     #[derive(serde::Serialize)]
-    struct IntentsOracleEnvelope<'a> {
+    struct IntentsOracleEnvelope {
         oracle_status: OracleStatus,
         claim_honesty: ClaimHonesty,
         completeness: IntentsCompleteness,
         results: usize,
-        items: &'a [IntentRecord],
+        items: Vec<PresentedIntent>,
     }
 
     serde_json::to_string_pretty(&IntentsOracleEnvelope {
@@ -597,7 +680,7 @@ pub fn format_intents_oracle_json_with_completeness(
         claim_honesty: ClaimHonesty::canonical(),
         completeness,
         results: records.len(),
-        items: records,
+        items: present_intents(records, full),
     })
     .context("Failed to serialize intents oracle JSON")
 }

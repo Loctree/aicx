@@ -22,7 +22,7 @@ pub(crate) const DASHBOARD_SERVER_SCRIPT: &str = r#"
   const state = {
     query: '', project: '', agent: '', kind: '', sort: 'newest', since: '',
     scoreMin: 0, limit: 350, selectedId: null, rows: [], selectedRecord: null,
-    browseRecords: [], mode: 'browse', expanded: false, unit: 'session',
+    browseRecords: [], mode: 'browse', view: 'sessions', intentHours: 720, expanded: false, unit: 'session',
     assumptions: [], indexLoaded: false, corpusTotal: 0, browseRetries: 0,
     scanStatus: 'unknown',
   };
@@ -68,10 +68,22 @@ pub(crate) const DASHBOARD_SERVER_SCRIPT: &str = r#"
     if (record.kind === 'session' || /\.jsonl$/i.test(raw)) return (record.agent || 'session') + ' session';
     return raw || '(unnamed)';
   };
+  const resultFormat = window.AICX_RESULT_FORMAT || {};
+  const listSnippetChars = Number(resultFormat.listSnippetChars) || 0;
   const listPreview = (record) => {
     const text = stripAnsi((record.preview || record.excerpt || '').replace(/\[1970-01-01[^\]]*\]\s*/g, '')).trim();
     if (!text || text.indexOf('<rules>') === 0) return '';
-    return text.length > 240 ? text.slice(0, 240) + '\u2026' : text;
+    if (listSnippetChars > 0 && text.length > listSnippetChars) return text.slice(0, listSnippetChars) + '\u2026';
+    return text;
+  };
+  const resultHeader = (record, score) => {
+    const scored = typeof score === 'number' && score > 0;
+    if (record.header && !scored) return record.header;
+    const parts = [record.project, record.agent, record.kind, record.date].filter(Boolean);
+    if (scored) parts.push(String(score));
+    const session = record.session_id ? String(record.session_id).slice(0, 8) : '';
+    if (session) parts.push(session);
+    return parts.join(' \u00b7 ');
   };
 
   const renderMarkdown = AicxMarkdown.renderMarkdown;
@@ -241,8 +253,7 @@ pub(crate) const DASHBOARD_SERVER_SCRIPT: &str = r#"
       return;
     }
     const title = readableName(record);
-    const scoreTxt = typeof score === 'number' && score > 0 ? 'score ' + score + '/100' : '';
-    const meta = [record.project, record.agent, record.kind, record.date, scoreTxt].filter(Boolean).join(' \u2022 ');
+    const meta = resultHeader(record, score);
     ui.detailTitle.innerHTML = highlightTerms(title, state.query);
     ui.detailMeta.innerHTML = highlightTerms(meta, state.query);
     const previewText = stripAnsi(record.preview || record.excerpt || '');
@@ -261,6 +272,37 @@ pub(crate) const DASHBOARD_SERVER_SCRIPT: &str = r#"
       return;
     }
     ui.detailContent.textContent = 'Loading full content\u2026';
+    if (rec.surface === 'intent') {
+      const params = new URLSearchParams();
+      params.set('full', '1');
+      params.set('hours', String(state.intentHours));
+      params.set('limit', '20');
+      if (state.project) params.set('project', state.project);
+      if (rec.session_id) params.set('session_id', rec.session_id);
+      if (rec.source_chunk) params.set('source_chunk', rec.source_chunk);
+      apiFetch('/api/intents?' + params.toString())
+        .then(function(r) { return r.json(); })
+        .then(function(data) {
+          const match = (data.items || []).find(function(item) {
+            return item.session_id === rec.session_id && item.source_chunk === rec.source_chunk;
+          }) || (data.items || [])[0];
+          const content = stripAnsi((match && match.body) || rec.body || '');
+          state.expanded = true;
+          if (ui.expand) ui.expand.textContent = 'Collapse';
+          ui.detailContent.innerHTML = '<div class="md-rendered">' + renderMarkdown(content) + '</div>';
+        })
+        .catch(function(err) {
+          if (err && err.status === 401) return;
+          ui.detailContent.textContent = 'Load failed: ' + err.message;
+        });
+      return;
+    }
+    if ((rec.id === undefined || rec.id === null || rec.id === '') && rec.detail_text) {
+      state.expanded = true;
+      if (ui.expand) ui.expand.textContent = 'Collapse';
+      ui.detailContent.innerHTML = '<div class="md-rendered">' + renderMarkdown(stripAnsi(rec.detail_text)) + '</div>';
+      return;
+    }
     if (rec.id === undefined || rec.id === null || rec.id === '') {
       state.expanded = true;
       if (ui.expand) ui.expand.textContent = 'Collapse';
@@ -299,7 +341,11 @@ pub(crate) const DASHBOARD_SERVER_SCRIPT: &str = r#"
       ui.list.appendChild(e); renderDetail(null, 0); return;
     }
     const visible = rows.slice(0, state.limit);
-    const idKey = (r) => r.id !== undefined ? r.id : r.path;
+    const idKey = (r) => {
+      if (r.surface === 'intent') return String(r.session_id || '') + '|' + String(r.source_chunk || '');
+      if (r.id !== undefined && r.id !== null && r.id !== '') return r.id;
+      return r.path || r.session_id || '';
+    };
     if (!state.selectedId || !visible.some(function(r) { return idKey(r.record) === state.selectedId; })) {
       state.selectedId = idKey(visible[0].record);
     }
@@ -316,14 +362,14 @@ pub(crate) const DASHBOARD_SERVER_SCRIPT: &str = r#"
       if (typeof score === 'number' && score > 0) top.appendChild(mkBadge(score + '/100'));
       const name = document.createElement('div'); name.className = 'result-name';
       const rawName = record.file_name || record.file || '';
-      const hideSize = record.kind === 'session' || /\.jsonl$/i.test(rawName);
-      const fname = readableName(record) + (!hideSize && record.size_human ? ' \u2022 ' + record.size_human : '');
+      const hideSize = record.kind === 'session' || record.surface === 'intent' || /\.jsonl$/i.test(rawName);
+      const fname = resultHeader(record, score) || (readableName(record) + (!hideSize && record.size_human ? ' \u2022 ' + record.size_human : ''));
       name.innerHTML = highlightTerms(fname, state.query);
       item.appendChild(top); item.appendChild(name);
       const previewText = listPreview(record);
       if (previewText) {
         const preview = document.createElement('div'); preview.className = 'result-preview';
-        const maxLen = 240; const truncated = previewText.length > maxLen ? previewText.slice(0, maxLen) + '\u2026' : previewText;
+        const truncated = previewText;
         preview.innerHTML = highlightTerms(truncated, state.query);
         item.appendChild(preview);
       }
@@ -353,9 +399,10 @@ pub(crate) const DASHBOARD_SERVER_SCRIPT: &str = r#"
     rows = runHooks('beforeRender', rows);
     state.rows = rows;
     const unit = state.unit === 'file' ? 'file' : 'session';
+    const shown = Math.min(rows.length, state.limit);
     ui.summary.textContent = (!rows.length && corpusQuiet())
       ? emptyReason()
-      : rows.length + ' ' + unit + (rows.length === 1 ? '' : 's');
+      : shown + ' / ' + rows.length + ' ' + unit + (rows.length === 1 ? '' : 's');
     renderList(rows);
     runHooks('afterRender', rows);
   };
@@ -385,7 +432,7 @@ pub(crate) const DASHBOARD_SERVER_SCRIPT: &str = r#"
         else if (state.sort === 'oldest') rows.sort(function(a, b) { return (a.record.sort_ts || a.record.date || '') < (b.record.sort_ts || b.record.date || '') ? -1 : 1; });
         rows = runHooks('beforeRender', rows);
         state.rows = rows;
-        ui.summary.textContent = rows.length + ' result(s) | fuzzy search | scanned: ' + (data.total_scanned || '?');
+        ui.summary.textContent = Math.min(rows.length, state.limit) + ' / ' + rows.length + ' results | scanned ' + (data.total_scanned || '?');
         renderList(rows);
         runHooks('afterRender', rows);
       })
@@ -404,6 +451,7 @@ pub(crate) const DASHBOARD_SERVER_SCRIPT: &str = r#"
     state.sort = ui.sort.value;
     state.scoreMin = parseInt(ui.score.value, 10) || 0;
     pushUrlState();
+    if (state.view === 'intents') { loadIntents(); return; }
     if (state.query) { runSearch(); } else { loadBrowseData(); }
   };
 
@@ -435,10 +483,23 @@ pub(crate) const DASHBOARD_SERVER_SCRIPT: &str = r#"
       btn.classList.toggle('active', btn.dataset.since === since);
     });
   };
+  const intentHoursFor = (since) => {
+    if (since === '1h') return 1;
+    if (since === '4h') return 4;
+    if (since === '24h') return 24;
+    if (since === '7d') return 168;
+    if (since === '30d') return 720;
+    return 0;
+  };
   document.querySelectorAll('.time-btn').forEach(function(btn) {
     btn.addEventListener('click', function() {
-      state.since = btn.dataset.since;
-      setTimeBtnActive(state.since);
+      if (state.view === 'intents') {
+        state.intentHours = intentHoursFor(btn.dataset.since);
+        setTimeBtnActive(btn.dataset.since);
+      } else {
+        state.since = btn.dataset.since;
+        setTimeBtnActive(state.since);
+      }
       refresh();
     });
   });
@@ -723,16 +784,53 @@ pub(crate) const DASHBOARD_SERVER_SCRIPT: &str = r#"
     catch (_) { $('ctx-continuity-status').textContent = 'Select the command above to copy it.'; }
   });
 
+  const loadIntents = () => {
+    state.view = 'intents';
+    state.mode = 'intents';
+    ui.summary.textContent = 'Loading intents\u2026';
+    const params = new URLSearchParams();
+    if (state.project) params.set('project', state.project);
+    if (state.agent) params.set('agent', state.agent);
+    params.set('hours', String(state.intentHours));
+    params.set('limit', '20');
+    apiFetch('/api/intents?' + params.toString())
+      .then(function(r) { return r.json(); })
+      .then(function(data) {
+        if (!data.ok) { ui.summary.textContent = 'Failed: ' + (data.error || 'unknown'); return; }
+        const records = data.items || [];
+        state.browseRecords = records;
+        const rows = records.map(function(record) { return { record: record, score: 0 }; });
+        state.rows = rows;
+        ui.summary.textContent = Math.min(records.length, state.limit) + ' / ' + records.length + ' intents';
+        if (ui.statFiles) ui.statFiles.textContent = String(records.length);
+        renderList(rows);
+      })
+      .catch(function(err) {
+        if (err && err.status === 401) return;
+        ui.summary.textContent = 'Intents failed: ' + err.message;
+      });
+  };
+
   const navSessions = $('ctx-nav-sessions');
+  const navIntents = $('ctx-nav-intents');
   const navSetup = $('ctx-nav-setup');
   const markNav = (active) => {
     document.querySelectorAll('.rail-nav-item').forEach(function(btn) { btn.classList.toggle('active', btn === active); });
   };
   if (navSessions) navSessions.addEventListener('click', function() {
     markNav(navSessions);
+    state.view = 'sessions';
     showContinuity(false);
+    setTimeBtnActive(state.since);
     if (ui.list) ui.list.scrollTop = 0;
     if (ui.search) ui.search.focus();
+    loadBrowseData();
+  });
+  if (navIntents) navIntents.addEventListener('click', function() {
+    markNav(navIntents);
+    showContinuity(false);
+    setTimeBtnActive(state.intentHours === 0 ? '' : (state.intentHours === 720 ? '30d' : ''));
+    loadIntents();
   });
   if (navSetup) navSetup.addEventListener('click', function() {
     markNav(navSetup);

@@ -32,8 +32,11 @@ mod types;
 pub use self::display::{
     IntentDisplayFilters, IntentDisplayResult, IntentSortOrder, UnresolvedMode,
     apply_display_filters, apply_display_filters_with_completeness, format_intents_json,
-    format_intents_markdown, format_intents_oracle_json,
+    format_intents_json_with, format_intents_markdown, format_intents_markdown_with,
+    format_intents_oracle_json, format_intents_oracle_json_with,
     format_intents_oracle_json_with_completeness,
+    format_intents_oracle_json_with_completeness_and_body, intent_display_body,
+    intent_display_header,
 };
 use self::types::{
     CandidateAccumulator, IntentCandidate, SignalSection, StoredChunkFile, TaskAccumulator,
@@ -3743,7 +3746,7 @@ fn build_candidate(
         record: IntentRecord {
             provenance: None,
             kind,
-            summary: truncate_summary_for_display(&summary),
+            summary,
             context,
             evidence,
             project: project.to_string(),
@@ -3998,57 +4001,14 @@ fn is_section_heading_noise(text: &str) -> bool {
     })
 }
 
-/// Sentence-aware truncation for human-readable summaries. The chunker's
-/// generic `truncate_signal_line` cuts mid-word at 240 bytes and appends
-/// "...[truncated]"; for an intent summary that destroys readability and
-/// often discards the verb that carries the decision. We allow up to 480
-/// bytes and prefer the last sentence terminator (or comma/space) within
-/// the trailing window so the output ends on a natural break.
-fn truncate_summary_for_display(text: &str) -> String {
-    const MAX_BYTES: usize = 480;
-    const TAIL_LOOKBACK: usize = 80;
-
-    if text.len() <= MAX_BYTES {
-        return text.to_string();
-    }
-
-    let mut cutoff = MAX_BYTES;
-    while cutoff > 0 && !text.is_char_boundary(cutoff) {
-        cutoff -= 1;
-    }
-
-    let look_start = cutoff.saturating_sub(TAIL_LOOKBACK);
-    let look_start = (0..=look_start)
-        .rev()
-        .find(|i| text.is_char_boundary(*i))
-        .unwrap_or(0);
-    let tail = &text[look_start..cutoff];
-
-    if let Some(rel) = tail.rfind(['.', '!', '?']) {
-        let abs_start = look_start + rel;
-        if let Some(ch) = text[abs_start..].chars().next() {
-            let abs_end = abs_start + ch.len_utf8();
-            return text[..abs_end].trim_end().to_string();
-        }
-    }
-
-    if let Some(rel) = tail.rfind([',', ';', ':']) {
-        let abs = look_start + rel;
-        let mut out = text[..abs].trim_end().to_string();
-        out.push_str(" …");
-        return out;
-    }
-
-    if let Some(rel) = tail.rfind(char::is_whitespace) {
-        let abs = look_start + rel;
-        let mut out = text[..abs].trim_end().to_string();
-        out.push_str(" …");
-        return out;
-    }
-
-    let mut out = text[..cutoff].to_string();
-    out.push_str(" …");
-    out
+/// Sentence-aware osnowa for human-readable summaries.
+///
+/// Display-only. Stored summaries stay whole so `--full` and Expand can
+/// return the original text. The cut is [`crate::result_format::RESULT_BODY_PREVIEW_CHARS`]
+/// Unicode scalars, not the old 480-byte cap.
+pub(crate) fn truncate_summary_for_display(text: &str) -> String {
+    crate::result_format::cut_result_body(text, crate::result_format::RESULT_BODY_PREVIEW_CHARS)
+        .body
 }
 
 /// Walks the dedup output and replaces `session_id` with the value parsed from

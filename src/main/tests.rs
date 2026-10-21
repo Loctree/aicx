@@ -46,7 +46,7 @@ fn intents_pack_report_carries_header_level_honesty_notice() {
     // never reads like current runtime truth.
     let sections: Vec<IntentPackSection> = Vec::new();
 
-    let out = format_intents_pack_markdown("(all projects)", 720, Some(10), &sections);
+    let out = format_intents_pack_markdown("(all projects)", 720, Some(10), &sections, false);
 
     assert!(
         out.contains("- claims: historical @ session close · not verified by aicx\n"),
@@ -106,7 +106,7 @@ fn default_intents_markdown_uses_pack_report() {
         },
     ];
 
-    let markdown = format_intents_pack_markdown("Loctree/aicx", 168, Some(20), &sections);
+    let markdown = format_intents_pack_markdown("Loctree/aicx", 168, Some(20), &sections, false);
 
     assert!(markdown.starts_with("# Intent Report"));
     assert!(markdown.contains("- per_section_limit: 20"));
@@ -780,6 +780,30 @@ fn sessions_current_command_parses_json_flag() {
             command: SessionsCommand::Current { json },
         }) => assert!(json),
         _ => panic!("expected sessions current command"),
+    }
+}
+
+#[test]
+fn dashboard_preview_chars_defaults_to_result_body_constant() {
+    let cli = Cli::try_parse_from(["aicx", "dashboard", "--serve"]).expect("dashboard");
+    match cli.command {
+        Some(Commands::Dashboard(args)) => {
+            assert_eq!(
+                args.preview_chars,
+                aicx::result_format::RESULT_BODY_PREVIEW_CHARS
+            );
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+    let cli = Cli::try_parse_from(["aicx", "dashboard-serve"]).expect("legacy");
+    match cli.command {
+        Some(Commands::DashboardServeLegacy(args)) => {
+            assert_eq!(
+                args.preview_chars,
+                aicx::result_format::RESULT_BODY_PREVIEW_CHARS
+            );
+        }
+        other => panic!("unexpected {other:?}"),
     }
 }
 

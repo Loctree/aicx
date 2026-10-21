@@ -101,6 +101,7 @@ pub mod rank;
 pub mod redact;
 #[cfg(feature = "app")]
 pub mod reports_extractor;
+pub mod result_format;
 #[cfg(feature = "app")]
 pub mod search_engine;
 #[cfg(feature = "app")]

@@ -37,6 +37,11 @@ struct BrowseRecord {
     sort_ts: i64,
     entry_count: Option<usize>,
     preview: String,
+    session_id: String,
+    header: String,
+    body: String,
+    body_chars_total: usize,
+    body_truncated: bool,
 }
 
 impl From<&DashboardRecord> for BrowseRecord {
@@ -57,6 +62,11 @@ impl From<&DashboardRecord> for BrowseRecord {
             sort_ts: r.sort_ts,
             entry_count: r.entry_count,
             preview: r.preview.clone(),
+            session_id: r.session_id.clone(),
+            header: r.header.clone(),
+            body: r.preview.clone(),
+            body_chars_total: r.body_chars_total,
+            body_truncated: r.body_truncated,
         }
     }
 }

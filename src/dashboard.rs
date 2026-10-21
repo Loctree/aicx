@@ -204,6 +204,10 @@ pub struct DashboardRecord {
     pub preview: String,
     pub search_blob: String,
     pub detail_text: String,
+    pub session_id: String,
+    pub header: String,
+    pub body_chars_total: usize,
+    pub body_truncated: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -373,6 +377,7 @@ pub fn render_server_shell_html_for(title: &str, local_open: bool, show_survey: 
       </form>
       <nav class="rail-nav" aria-label="Dashboard">
         <button type="button" class="rail-nav-item active" id="ctx-nav-sessions">Sessions</button>
+        <button type="button" class="rail-nav-item" id="ctx-nav-intents">Intents</button>
         <button type="button" class="rail-nav-item" id="ctx-nav-setup">Setup</button>
       </nav>
       <div class="rail-scroll">
@@ -479,7 +484,8 @@ pub fn render_server_shell_html_for(title: &str, local_open: bool, show_survey: 
         html_escape(title),
         assets::DASHBOARD_CSS,
         format_args!(
-            "{}\n{}",
+            "{}\n{}\n{}",
+            result_format_bootstrap(),
             assets::DASHBOARD_INLINE_MARKDOWN_SCRIPT,
             assets::DASHBOARD_SERVER_SCRIPT
         ),
@@ -575,7 +581,10 @@ fn render_dashboard_html(payload: &DashboardPayload, title: &str) -> Result<Stri
                 <h2 id="ctx-detail-title">No result selected</h2>
                 <p id="ctx-detail-meta" class="detail-meta"></p>
               </div>
-              <button id="ctx-copy-path" type="button">Copy Path</button>
+              <div class="detail-actions">
+                <button id="ctx-expand" type="button" title="Expand full content">Expand</button>
+                <button id="ctx-copy-path" type="button">Copy Path</button>
+              </div>
             </div>
             <p id="ctx-detail-path" class="detail-path"></p>
             <p id="ctx-detail-preview" class="detail-preview"></p>
@@ -592,6 +601,7 @@ fn render_dashboard_html(payload: &DashboardPayload, title: &str) -> Result<Stri
 
   <script id="ctx-data" type="application/json">{}</script>
   <script>{}</script>
+  <script>{}</script>
 </body>
 </html>
 "#,
@@ -603,9 +613,18 @@ fn render_dashboard_html(payload: &DashboardPayload, title: &str) -> Result<Stri
         payload.stats.total_projects,
         payload.stats.total_days,
         payload_json,
+        result_format_bootstrap(),
         assets::DASHBOARD_SCRIPT,
         AICX_MARK_SVG = AICX_MARK_SVG,
     ))
+}
+
+fn result_format_bootstrap() -> String {
+    format!(
+        "window.AICX_RESULT_FORMAT={{bodyPreviewChars:{},listSnippetChars:{}}};",
+        crate::result_format::RESULT_BODY_PREVIEW_CHARS,
+        crate::result_format::RESULT_LIST_SNIPPET_CHARS
+    )
 }
 
 fn html_escape(input: &str) -> String {

@@ -2902,7 +2902,9 @@ fn markdown_timeline_opens_with_header_level_honesty_notice() {
     let notice_pos = markdown
         .find("_claims: historical @ session close · not verified by aicx_")
         .expect("honesty notice present");
-    let first_record_pos = markdown.find("### INTENT").expect("record present");
+    let first_record_pos = markdown
+        .find("### Loctree/aicx · claude · INTENT · 2026-07-02 · sess-b2")
+        .expect("record present");
     assert!(title_pos < notice_pos && notice_pos < first_record_pos);
 }
 
@@ -2945,9 +2947,13 @@ fn oracle_json_envelope_adds_claim_honesty_without_touching_existing_keys() {
         record_keys,
         [
             "agent",
+            "body",
+            "body_chars_total",
+            "body_truncated",
             "count",
             "date",
             "evidence",
+            "header",
             "kind",
             "project",
             "session_id",
@@ -2955,7 +2961,7 @@ fn oracle_json_envelope_adds_claim_honesty_without_touching_existing_keys() {
             "summary",
             "timestamp",
         ],
-        "v1 record JSON keys drifted — the honesty threading must stay additive"
+        "v1 record JSON keys drifted — honesty and result-format fields stay additive"
     );
 }
 
@@ -4069,42 +4075,37 @@ mod quality {
 
     #[test]
     fn long_summary_ends_at_sentence_terminator_when_available() {
-        let mut text = String::new();
-        text.push_str("Pierwsza część decyzji o canonical corpus i jego znaczeniu dla całego stacku Vetcoders w kontekście długoterminowej strategii AICX. ");
-        // Force length > 480 bytes; ensure a full sentence-terminator
-        // exists in the lookback window (last 80 bytes before cutoff).
-        text.push_str(
-            &"Druga część rozważań która dopisuje treść aż przekroczymy próg 480 bajtów. "
-                .repeat(5),
+        let prefix = "x".repeat(crate::result_format::RESULT_BODY_PREVIEW_CHARS - 40);
+        let text = format!(
+            "{prefix}Pierwsza część decyzji. And this extra sentence should stay outside the osnowa."
         );
-        assert!(text.len() > 480);
+        assert!(text.chars().count() > crate::result_format::RESULT_BODY_PREVIEW_CHARS);
 
         let out = truncate_summary_for_display(&text);
-        assert!(out.len() <= 480 + 4);
-        // Output must end on a strong terminator or an ellipsis,
-        // never mid-word with "...[truncated]".
-        assert!(
-            out.ends_with('.') || out.ends_with('!') || out.ends_with('?') || out.ends_with('…')
-        );
+        let marker = out.rfind(" …[+").expect("truncation marker");
+        let stem = &out[..marker];
+        assert!(stem.ends_with('.'));
+        assert!(stem.contains("Pierwsza część decyzji."));
+        assert!(!stem.contains("extra sentence"));
+        assert!(stem.chars().count() <= crate::result_format::RESULT_BODY_PREVIEW_CHARS);
+        assert!(out.contains("znaków"));
         assert!(!out.contains("...[truncated]"));
     }
 
     #[test]
     fn long_summary_without_terminator_falls_back_to_word_boundary() {
-        // Long text with no sentence terminators at all.
-        let text = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau upsilon phi chi psi omega ".repeat(5);
-        assert!(text.len() > 480);
+        let word = "alpha ";
+        let text = word.repeat(800);
+        assert!(text.chars().count() > crate::result_format::RESULT_BODY_PREVIEW_CHARS);
 
         let out = truncate_summary_for_display(&text);
-        assert!(out.ends_with('…'));
+        let marker = out.rfind(" …[+").expect("truncation marker");
+        let stem = out[..marker].trim_end();
+        assert!(out.ends_with("znaków]"));
         assert!(!out.contains("...[truncated]"));
-        // Ensure the cut landed on a word boundary (no partial word
-        // immediately before the ellipsis).
-        let stem = out.trim_end_matches(['…', ' ']);
-        assert!(
-            stem.chars().last().is_none_or(|c| !c.is_alphabetic())
-                || stem.ends_with(|c: char| c.is_alphabetic())
-        );
+        assert!(stem.ends_with("alpha"));
+        let next = text[stem.len()..].chars().next();
+        assert!(next.is_none_or(|ch| ch.is_whitespace()));
     }
 
     // ── content-scoped dedup ───────────────────────────────────────
