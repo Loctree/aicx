@@ -39,6 +39,15 @@ case "$first_line" in
     "Merge "*|"Revert "*|"fixup!"*|"squash!"*|"amend!"*) exit 0 ;;
 esac
 
+# A cherry-pick or rebase replays a commit another session already authored.
+# Its footer is that session's measurement; this process only moved the patch.
+# Git keeps CHERRY_PICK_HEAD for every replayed pick (rebase included), so the
+# message is left exactly as recorded. Missing trailers are commit-msg's call.
+git_dir="$(git rev-parse --git-dir 2>/dev/null || true)"
+if [ -n "$git_dir" ] && [ -f "$git_dir/CHERRY_PICK_HEAD" ]; then
+    exit 0
+fi
+
 types='feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert|release|merge'
 subject_pattern="^\\[([a-z][a-z0-9_-]*)/([a-z0-9][a-z0-9._-]*)\\] (${types})(\\(.+\\))?: .+$"
 

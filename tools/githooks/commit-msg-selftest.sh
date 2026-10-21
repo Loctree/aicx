@@ -417,6 +417,40 @@ Why this commit exists." CODEX_THREAD_ID="$thread_id" CODEX_SESSION_ID="$other_i
 expect_line thread-id-outranks-session-id "$out" "session_id: $thread_id"
 expect_absent thread-id-drops-session-id "$out" "$other_id"
 
+# A cherry-pick (and every rebase pick) replays a commit another session wrote.
+# The replaying session is measurable but did not author it: its id must not
+# replace the recorded footer. Git marks the replay with CHERRY_PICK_HEAD.
+replay_repo="$(mktemp -d)"
+git -C "$replay_repo" init -q
+replayed="$subject_agent
+
+Why this commit exists.
+
+Authored-By: codex <agents@vetcoders.io>
+session_id: $other_id
+time: 2026-10-20T01:15:39+02:00
+runtime: headless"
+replay_gen() {
+    local tmp
+    tmp="$(mktemp)"
+    printf '%s\n' "$replayed" >"$tmp"
+    (cd "$replay_repo" && hook_env CODEX_THREAD_ID="$thread_id" VC_SESSION_PID=0 \
+        "$prepare" "$tmp" message >/dev/null 2>&1) || true
+    cat "$tmp"
+    rm -f "$tmp" "$tmp.vc-noneditor"
+}
+git -C "$replay_repo" rev-parse HEAD >/dev/null 2>&1 || \
+    git -C "$replay_repo" -c user.email=t@t -c user.name=t commit -q --allow-empty -m seed
+git -C "$replay_repo" rev-parse HEAD >"$replay_repo/.git/CHERRY_PICK_HEAD"
+out="$(replay_gen)"
+expect_line replay-keeps-recorded-session "$out" "session_id: $other_id"
+expect_line replay-keeps-recorded-time "$out" "time: 2026-10-20T01:15:39+02:00"
+expect_absent replay-does-not-measure-replayer "$out" "$thread_id"
+rm -f "$replay_repo/.git/CHERRY_PICK_HEAD"
+out="$(replay_gen)"
+expect_line plain-commit-still-measures "$out" "session_id: $thread_id"
+rm -rf "$replay_repo"
+
 # Interactive commit: prepare-commit-msg sees an empty subject and must not
 # invent trailers. commit-msg runs the generator after the editor.
 tmp="$(mktemp)"
