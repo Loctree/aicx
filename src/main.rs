@@ -1080,6 +1080,10 @@ enum ContinuityAction {
         /// pack states that it did.
         #[arg(long, visible_alias = "distill_mixed")]
         distill_mixed: bool,
+        /// Include cross-project Codescribe bus speech addressed to this name
+        /// (case/diacritic-insensitive). Dictation has no addressee and is excluded.
+        #[arg(long = "as", value_name = "NAME")]
+        addressee: Option<String>,
     },
     /// Write the continuity pack to a file.
     Write {
@@ -1103,6 +1107,10 @@ enum ContinuityAction {
         /// pack states that it did.
         #[arg(long, visible_alias = "distill_mixed")]
         distill_mixed: bool,
+        /// Include cross-project Codescribe bus speech addressed to this name
+        /// (case/diacritic-insensitive). Dictation has no addressee and is excluded.
+        #[arg(long = "as", value_name = "NAME")]
+        addressee: Option<String>,
     },
 }
 
@@ -3246,7 +3254,7 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
             )?;
         }
         Some(Commands::Continuity { action }) => {
-            let (projects, hours, until, for_inject, output, no_refresh, distill_mixed) =
+            let (projects, hours, until, for_inject, output, no_refresh, distill_mixed, addressee) =
                 match action {
                     ContinuityAction::Show {
                         project,
@@ -3255,6 +3263,7 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
                         for_inject,
                         no_refresh,
                         distill_mixed,
+                        addressee,
                     } => (
                         project,
                         hours,
@@ -3263,6 +3272,7 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
                         None,
                         no_refresh,
                         distill_mixed,
+                        addressee,
                     ),
                     ContinuityAction::Write {
                         project,
@@ -3271,6 +3281,7 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
                         output,
                         no_refresh,
                         distill_mixed,
+                        addressee,
                     } => (
                         project,
                         hours,
@@ -3279,6 +3290,7 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
                         Some(output),
                         no_refresh,
                         distill_mixed,
+                        addressee,
                     ),
                 };
             let projects = if projects.is_empty() {
@@ -3298,7 +3310,7 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
                 distill_mixed,
                 until.unwrap_or_else(chrono::Utc::now),
             )?;
-            let rendered = aicx::continuity::render(&pack, for_inject);
+            let rendered = aicx::continuity::render_as(&pack, for_inject, addressee.as_deref())?;
             match output {
                 Some(path) => {
                     std::fs::write(&path, &rendered)

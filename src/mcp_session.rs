@@ -292,6 +292,15 @@ pub fn show_session(
 pub fn continuity_pack(
     req: ContinuityRequest<'_>,
 ) -> Result<ContinuityPayload, SessionSurfaceError> {
+    continuity_pack_as(req, None)
+}
+
+/// The addressed variant preserves the unaddressed request API used by
+/// in-process consumers while adding the CLI's cross-project bus view.
+pub fn continuity_pack_as(
+    req: ContinuityRequest<'_>,
+    addressee: Option<&str>,
+) -> Result<ContinuityPayload, SessionSurfaceError> {
     let filters = collect_project_filters(req.project, req.projects);
     if filters.is_empty() {
         return Err(SessionSurfaceError::invalid(
@@ -314,7 +323,11 @@ pub fn continuity_pack(
     .map_err(|error| SessionSurfaceError::Internal {
         message: format!("continuity pack: {error}"),
     })?;
-    let mut markdown = crate::continuity::render(&pack, false);
+    let mut markdown = crate::continuity::render_as(&pack, false, addressee).map_err(|error| {
+        SessionSurfaceError::Internal {
+            message: format!("addressed speech: {error}"),
+        }
+    })?;
     if let Some(idx) = markdown.find('\n') {
         markdown.insert(idx + 1, '\n');
         markdown.insert_str(idx + 2, CONTINUITY_BANNER);

@@ -966,6 +966,10 @@ pub struct ContinuityParams {
     /// refusing a window of only such work), same as `--distill-mixed`.
     #[serde(default)]
     pub distill_mixed: bool,
+    /// Include cross-project Codescribe bus speech addressed to this name
+    /// (case/diacritic-insensitive). Dictation has no addressee and is excluded.
+    #[serde(rename = "as")]
+    pub addressee: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2075,7 +2079,7 @@ impl AicxMcpServer {
 
     #[tool(
         name = "aicx_continuity",
-        description = "Render the multi-agent continuity pack (NOW / PEERS / DECISIONS / TASKS / SOURCES / INDEX HEALTH) from a live parse, same as `aicx continuity show`. Project filter is required and exact. The pack is context transport only: it never selects native resume and never tells the agent to recover or continue a previous provider session."
+        description = "Render the multi-agent continuity pack (NOW / PEERS / DECISIONS / TASKS / SOURCES / INDEX HEALTH) from a live parse, same as `aicx continuity show`. Project filter is required and exact. Optional `as` adds ADDRESSED TO <NAME>: cross-project Codescribe bus speech matching structured recipients/audience (case/diacritic-insensitive); dictation has no addressee and is excluded. The pack is context transport only: it never selects native resume and never tells the agent to recover or continue a previous provider session."
     )]
     async fn continuity(
         &self,
@@ -2085,6 +2089,7 @@ impl AicxMcpServer {
         tracing::info!(target: "mcp.audit", tool_name = "aicx_continuity", "mcp tool invoked");
         validate_string_len(params.project.as_deref(), 4096, "project")?;
         validate_string_len(params.project_match.as_deref(), 32, "project_match")?;
+        validate_string_len(params.addressee.as_deref(), 256, "as")?;
         if let Some(projects) = &params.projects {
             for (i, project) in projects.iter().enumerate() {
                 validate_string_len(Some(project), 4096, &format!("projects[{i}]"))?;
@@ -2094,26 +2099,29 @@ impl AicxMcpServer {
         let aicx_home = crate::aicx_home::ensure()
             .map_err(|e| McpError::internal_error(format!("AICX home error: {e}"), None))?;
         let projects = params.projects.unwrap_or_default();
-        let payload = mcp_session::continuity_pack(mcp_session::ContinuityRequest {
-            until: params
-                .until
-                .as_deref()
-                .map(|time| {
-                    chrono::DateTime::parse_from_rfc3339(time)
-                        .map(|t| t.with_timezone(&chrono::Utc))
-                })
-                .transpose()
-                .map_err(|_| {
-                    McpError::invalid_params("until must be an RFC3339 timestamp", None)
-                })?,
-            aicx_home: &aicx_home,
-            project: params.project.as_deref(),
-            projects: &projects,
-            project_match,
-            hours: params.hours,
-            for_inject: params.for_inject,
-            distill_mixed: params.distill_mixed,
-        })
+        let payload = mcp_session::continuity_pack_as(
+            mcp_session::ContinuityRequest {
+                until: params
+                    .until
+                    .as_deref()
+                    .map(|time| {
+                        chrono::DateTime::parse_from_rfc3339(time)
+                            .map(|t| t.with_timezone(&chrono::Utc))
+                    })
+                    .transpose()
+                    .map_err(|_| {
+                        McpError::invalid_params("until must be an RFC3339 timestamp", None)
+                    })?,
+                aicx_home: &aicx_home,
+                project: params.project.as_deref(),
+                projects: &projects,
+                project_match,
+                hours: params.hours,
+                for_inject: params.for_inject,
+                distill_mixed: params.distill_mixed,
+            },
+            params.addressee.as_deref(),
+        )
         .map_err(mcp_session::SessionSurfaceError::into_mcp)?;
         let json = serde_json::to_string(&payload).map_err(|e| {
             McpError::internal_error(format!("Serialize continuity JSON: {e}"), None)

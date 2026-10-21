@@ -6,7 +6,9 @@
 //! honest INDEX HEALTH line. It replaces "read the compact of yourself" as
 //! the way a fresh session recovers context: live parse first, census
 //! second, semantics never required for a hot window.
-
+//! `--as <name>` adds cross-project Codescribe bus speech addressed through
+//! structured recipient/audience metadata. Dictation has no addressee and is
+//! excluded. Names use AICX's Unicode/diacritic-folded, case-insensitive match.
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -815,8 +817,108 @@ fn reserve_inject_tail(out: String) -> String {
     }
 }
 
+/// Render optional addressed speech without changing the project-scoped pack.
+/// The bus is read live, including projects outside the narrative's filter.
+/// Unreadable ledgers fail the request; replay omissions remain explicit.
+pub fn render_as(
+    pack: &ContinuityPack,
+    for_inject: bool,
+    addressee: Option<&str>,
+) -> Result<String> {
+    let Some(name) = addressee else {
+        return Ok(render(pack, for_inject));
+    };
+    let name = name.trim();
+    anyhow::ensure!(!name.is_empty(), "addressed name must not be empty");
+    let normalized = crate::sanitize::normalize_query(name);
+    anyhow::ensure!(!normalized.is_empty(), "addressed name must contain a name");
+    let user_home = crate::os_user_home()
+        .ok_or_else(|| anyhow::anyhow!("cannot resolve operator home for addressed speech"))?;
+    let now = DateTime::parse_from_rfc3339(&pack.window_end)?.with_timezone(&Utc);
+    let cutoff = intents::window_cutoff(now, pack.hours);
+    let mut messages = Vec::new();
+    let mut skipped = 0;
+    let mut open = 0;
+    let ledgers = crate::importers::codescribe_bus::discover_bus_ledgers(&user_home);
+    for ledger in &ledgers {
+        let replay = crate::importers::codescribe_bus::read_bus_ledger(ledger)?;
+        skipped += replay.skipped_records();
+        open += replay.open_takes;
+        for message in replay.messages {
+            if message.kind.is_human()
+                && message.at >= cutoff
+                && message.at <= now
+                && (message.recipients.iter().any(|party| {
+                    party
+                        .name
+                        .as_deref()
+                        .is_some_and(|name| crate::sanitize::normalize_query(name) == normalized)
+                }) || message.audience.as_deref().is_some_and(|audience| {
+                    crate::sanitize::normalize_query(audience) == normalized
+                }))
+            {
+                messages.push((ledger, message));
+            }
+        }
+    }
+    messages.sort_by(|(path_a, a), (path_b, b)| {
+        b.at.cmp(&a.at)
+            .then_with(|| path_a.cmp(path_b))
+            .then_with(|| a.text.cmp(&b.text))
+            .then_with(|| a.recipients.cmp(&b.recipients))
+    });
+    let mut section = format!(
+        "## ADDRESSED TO {}\n\n",
+        name.to_uppercase().replace(['\r', '\n'], " ")
+    );
+    section.push_str("- cross-project bus speech; structured recipients/audience only; dictation has no addressee and is excluded\n");
+    if skipped > 0 || open > 0 {
+        section.push_str(&format!(
+            "- bus coverage: {skipped} skipped records; {open} open takes withheld (all ledgers, not window-scoped)\n"
+        ));
+    }
+    if messages.is_empty() {
+        section.push_str("- no addressed bus messages inside the window; absence is not proof of no assignment\n");
+    }
+    for (ledger, message) in messages.iter().take(SOURCE_CAP) {
+        use crate::importers::codescribe_bus::BusMessageKind;
+        let kind = match message.kind {
+            BusMessageKind::Spoken { certified: true } => "voice",
+            BusMessageKind::Spoken { certified: false } => "voice, coverage refused",
+            BusMessageKind::Typed => "typed",
+            BusMessageKind::AgentReply => unreachable!("human messages only"),
+        };
+        let recipients = message
+            .recipients
+            .iter()
+            .map(|party| format!("{}/{}", party.provider, party.session))
+            .collect::<Vec<_>>()
+            .join(", ");
+        section.push_str(&format!(
+            "- [{}] {} · {} · recipients={} · source={}\n",
+            kind,
+            message.text.replace('\r', "\\r").replace('\n', "\\n"),
+            message.at.to_rfc3339(),
+            recipients,
+            printed_path(&ledger.to_string_lossy()),
+        ));
+    }
+    if messages.len() > SOURCE_CAP {
+        section.push_str(&format!(
+            "- {} addressed messages omitted at section cap\n",
+            messages.len() - SOURCE_CAP
+        ));
+    }
+    section.push('\n');
+    Ok(render_with_addressed(pack, for_inject, &section))
+}
+
 /// Render the pack. `for_inject` bounds complete claim lines in Unicode chars.
 pub fn render(pack: &ContinuityPack, for_inject: bool) -> String {
+    render_with_addressed(pack, for_inject, "")
+}
+
+fn render_with_addressed(pack: &ContinuityPack, for_inject: bool, addressed: &str) -> String {
     let mut out = String::new();
     out.push_str(&format!(
         "# CONTINUITY · {} · {}h\n\n",
@@ -1032,6 +1134,7 @@ pub fn render(pack: &ContinuityPack, for_inject: bool) -> String {
     }
     out.push('\n');
 
+    out.push_str(addressed);
     out.push_str("## SOURCES\n\n");
     if pack.sources.is_empty() {
         out.push_str(

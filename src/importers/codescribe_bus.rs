@@ -117,6 +117,8 @@ pub struct BusMessage {
     pub text: String,
     /// Sessions the message was addressed to.
     pub recipients: Vec<BusParty>,
+    /// Explicit bus audience, independent of recipient session metadata.
+    pub audience: Option<String>,
     /// Author of an agent reply.
     pub sender: Option<BusParty>,
 }
@@ -148,6 +150,7 @@ struct TakeSnapshot {
     text: String,
     started_at: Option<DateTime<Utc>>,
     recipients: Vec<BusParty>,
+    audience: Option<String>,
     terminal: bool,
 }
 
@@ -166,6 +169,7 @@ impl Replayer {
         at: Option<DateTime<Utc>>,
         text: &str,
         recipients: Vec<BusParty>,
+        audience: Option<String>,
         sender: Option<BusParty>,
     ) {
         let text = text.trim();
@@ -181,6 +185,7 @@ impl Replayer {
             at,
             text: text.to_owned(),
             recipients,
+            audience,
             sender,
         });
     }
@@ -197,6 +202,7 @@ impl Replayer {
                 take.started_at,
                 &take.text,
                 take.recipients,
+                take.audience,
                 None,
             );
         }
@@ -223,12 +229,14 @@ impl Replayer {
                 .unwrap_or(0);
             let emitted = timestamp_field(row, "emitted_at");
             let recipients = parties(row.get("recipients"));
+            let audience = str_field(row, "audience").map(str::to_owned);
             let terminal = action == Some(TERMINAL_SEAL);
             let take = self.takes.entry(session).or_insert_with(|| TakeSnapshot {
                 revision: i64::MIN,
                 text: String::new(),
                 started_at: None,
                 recipients: Vec::new(),
+                audience: None,
                 terminal: false,
             });
             take.started_at = match (take.started_at, emitted) {
@@ -239,6 +247,9 @@ impl Replayer {
                 take.revision = revision;
                 take.text = text.to_owned();
                 take.terminal = terminal;
+                if audience.is_some() {
+                    take.audience = audience;
+                }
                 if !recipients.is_empty() {
                     take.recipients = recipients;
                 }
@@ -250,6 +261,7 @@ impl Replayer {
                 timestamp_field(row, "emitted_at"),
                 text,
                 parties(row.get("recipients")),
+                str_field(row, "audience").map(str::to_owned),
                 None,
             );
         }
@@ -313,6 +325,7 @@ pub fn replay_bus_ledger(body: &str) -> BusReplay {
                     timestamp_field(&row, "emitted_at"),
                     str_field(&row, "text").unwrap_or_default(),
                     recipients,
+                    str_field(&row, "audience").map(str::to_owned),
                     None,
                 );
             }
@@ -327,6 +340,7 @@ pub fn replay_bus_ledger(body: &str) -> BusReplay {
                     timestamp_field(&row, "emitted_at"),
                     str_field(&row, "text").unwrap_or_default(),
                     parties(row.get("recipients")),
+                    str_field(&row, "audience").map(str::to_owned),
                     sender,
                 );
             }
@@ -783,6 +797,7 @@ mod tests {
                 "Please do these tasks:\n1. Fix terminal colors.\n2. Preserve my existing session."
                     .to_owned(),
             recipients: Vec::new(),
+            audience: None,
             sender: None,
         };
         assert_eq!(frame_text(&typed), typed.text);
