@@ -115,6 +115,9 @@ pub struct BusMessage {
     pub kind: BusMessageKind,
     pub at: DateTime<Utc>,
     pub text: String,
+    /// Stable bus take identity, independent of the ledger storing its copy.
+    /// Typed messages and legacy rows without a take id use time/text fallback.
+    pub take_id: Option<String>,
     /// Sessions the message was addressed to.
     pub recipients: Vec<BusParty>,
     /// Explicit bus audience, independent of recipient session metadata.
@@ -146,6 +149,7 @@ impl BusReplay {
 }
 
 struct TakeSnapshot {
+    take_id: Option<String>,
     revision: i64,
     text: String,
     started_at: Option<DateTime<Utc>>,
@@ -163,6 +167,7 @@ struct Replayer {
 }
 
 impl Replayer {
+    #[allow(clippy::too_many_arguments)]
     fn push(
         &mut self,
         kind: BusMessageKind,
@@ -171,6 +176,7 @@ impl Replayer {
         recipients: Vec<BusParty>,
         audience: Option<String>,
         sender: Option<BusParty>,
+        take_id: Option<&str>,
     ) {
         let text = text.trim();
         if text.is_empty() {
@@ -184,6 +190,9 @@ impl Replayer {
             kind,
             at,
             text: text.to_owned(),
+            take_id: take_id
+                .filter(|id| !id.trim().is_empty())
+                .map(str::to_owned),
             recipients,
             audience,
             sender,
@@ -204,6 +213,7 @@ impl Replayer {
                 take.recipients,
                 take.audience,
                 None,
+                take.take_id.as_deref().or(Some(session)),
             );
         }
     }
@@ -218,6 +228,10 @@ impl Replayer {
         let Some(text) = str_field(row, "rendered_text") else {
             return;
         };
+        let take_id = str_field(row, "take_id")
+            .filter(|id| !id.trim().is_empty())
+            .or_else(|| (!session.is_empty()).then_some(session.as_str()))
+            .map(str::to_owned);
         let addressed = str_field(row, "audience").is_some_and(|audience| !audience.is_empty());
         if channel_of_session(&session).is_some() && addressed {
             if self.settled.contains(&session) {
@@ -232,6 +246,7 @@ impl Replayer {
             let audience = str_field(row, "audience").map(str::to_owned);
             let terminal = action == Some(TERMINAL_SEAL);
             let take = self.takes.entry(session).or_insert_with(|| TakeSnapshot {
+                take_id: str_field(row, "take_id").map(str::to_owned),
                 revision: i64::MIN,
                 text: String::new(),
                 started_at: None,
@@ -244,6 +259,9 @@ impl Replayer {
                 (known, seen) => known.or(seen),
             };
             if revision >= take.revision {
+                if let Some(id) = str_field(row, "take_id").filter(|id| !id.trim().is_empty()) {
+                    take.take_id = Some(id.to_owned());
+                }
                 take.revision = revision;
                 take.text = text.to_owned();
                 take.terminal = terminal;
@@ -254,8 +272,13 @@ impl Replayer {
                     take.recipients = recipients;
                 }
             }
-        } else if action == Some(TERMINAL_SEAL) && self.settled.insert(session) {
+        } else if action == Some(TERMINAL_SEAL)
+            && take_id
+                .as_ref()
+                .is_none_or(|id| self.settled.insert(id.clone()))
+        {
             // A named (non-channel) utterance: its terminal row is the delivery.
+            // Idless legacy takes must not all settle under the empty-string id.
             self.push(
                 BusMessageKind::Spoken { certified: true },
                 timestamp_field(row, "emitted_at"),
@@ -263,6 +286,7 @@ impl Replayer {
                 parties(row.get("recipients")),
                 str_field(row, "audience").map(str::to_owned),
                 None,
+                take_id.as_deref(),
             );
         }
     }
@@ -327,6 +351,7 @@ pub fn replay_bus_ledger(body: &str) -> BusReplay {
                     recipients,
                     str_field(&row, "audience").map(str::to_owned),
                     None,
+                    None,
                 );
             }
             AGENT_REPLY_SCHEMA => {
@@ -342,6 +367,7 @@ pub fn replay_bus_ledger(body: &str) -> BusReplay {
                     parties(row.get("recipients")),
                     str_field(&row, "audience").map(str::to_owned),
                     sender,
+                    None,
                 );
             }
             _ => {}
@@ -792,6 +818,7 @@ mod tests {
     fn typed_text_stays_verbatim_and_only_speech_gets_the_voice_envelope() {
         let typed = BusMessage {
             kind: BusMessageKind::Typed,
+            take_id: None,
             at: Utc::now(),
             text:
                 "Please do these tasks:\n1. Fix terminal colors.\n2. Preserve my existing session."

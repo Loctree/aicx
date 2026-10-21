@@ -1243,6 +1243,24 @@ fn collect_intent_files_from_index(
                 .push(source_receipt(&original_entry, true, "agent_excluded"));
             continue;
         }
+        // Exclude definitely cold sources before scope recovery, cache validation,
+        // or parsing. Mtime only excludes; frame timestamps still admit claims.
+        if config.hours != 0
+            && crate::utterances::source_predates_window(
+                original_entry.source_path.as_ref(),
+                &crate::utterances::Window {
+                    start: cutoff,
+                    end: notes.now.unwrap_or_else(Utc::now),
+                },
+            )
+        {
+            notes.selection.push(source_receipt(
+                &original_entry,
+                true,
+                "skipped_before_window",
+            ));
+            continue;
+        }
         let entry = match crate::catalog::recover_catalog_scope_at(aicx_home, &original_entry) {
             Ok(entries) => entries,
             Err(error) => {
@@ -1627,6 +1645,24 @@ fn collect_intent_files(
             notes
                 .selection
                 .push(source_receipt(&original_entry, true, "agent_excluded"));
+            continue;
+        }
+        // Exclude definitely cold sources before scope recovery, cache validation,
+        // or parsing. Mtime only excludes; frame timestamps still admit claims.
+        if config.hours != 0
+            && crate::utterances::source_predates_window(
+                original_entry.source_path.as_ref(),
+                &crate::utterances::Window {
+                    start: cutoff,
+                    end: notes.now.unwrap_or_else(Utc::now),
+                },
+            )
+        {
+            notes.selection.push(source_receipt(
+                &original_entry,
+                true,
+                "skipped_before_window",
+            ));
             continue;
         }
         let entry = match crate::catalog::recover_catalog_scope_at(aicx_home, &original_entry) {
@@ -2044,6 +2080,20 @@ fn collect_live_unadmitted_files(
             notes
                 .selection
                 .push(source_receipt(&entry, false, "project_excluded"));
+            continue;
+        }
+        if cutoff != DateTime::UNIX_EPOCH
+            && crate::utterances::source_predates_window(
+                entry.source_path.as_ref(),
+                &crate::utterances::Window {
+                    start: cutoff,
+                    end: notes.now.unwrap_or_else(Utc::now),
+                },
+            )
+        {
+            notes
+                .selection
+                .push(source_receipt(&entry, false, "skipped_before_window"));
             continue;
         }
         let (source_path, frames, scope) = match read_intent_source(

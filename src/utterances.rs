@@ -378,7 +378,7 @@ fn source_file_mtime(path: &Path) -> Option<DateTime<Utc>> {
 /// True when the source file's mtime is strictly older than the window start
 /// minus [`SOURCE_MTIME_MARGIN_HOURS`]. Missing or unreadable mtime is false:
 /// a source we cannot date can still hold an in-window frame.
-fn source_predates_window(path: &Path, window: &Window) -> bool {
+pub(crate) fn source_predates_window(path: &Path, window: &Window) -> bool {
     let Some(mtime) = source_file_mtime(path) else {
         return false;
     };

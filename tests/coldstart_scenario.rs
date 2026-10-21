@@ -302,6 +302,14 @@ impl Fixture {
             &["cherry-pick", &picked_sha],
             "2026-10-19T23:10:00+00:00",
         );
+        // A branch-heavy checkout still reports only the four unintegrated cuts.
+        for index in 0..20 {
+            self.git(
+                &repo,
+                &["branch", &format!("archive/already-landed-{index:02}")],
+                opened,
+            );
+        }
     }
 
     fn claude_source(&self, cwd: &Path, session: &str) -> PathBuf {
@@ -556,13 +564,14 @@ impl Fixture {
             .root
             .join(".codescribe/agent-bridge/buses/events/2026_1020/channel-4.jsonl");
         fs::create_dir_all(ledger.parent().unwrap()).unwrap();
-        fs::write(
-            ledger,
-            rows.iter()
-                .map(|row| format!("{row}\n"))
-                .collect::<String>(),
-        )
-        .unwrap();
+        let body = rows
+            .iter()
+            .map(|row| format!("{row}\n"))
+            .collect::<String>();
+        fs::write(&ledger, &body).unwrap();
+        // One delivered take, copied through live and archived ledger lanes.
+        fs::write(ledger.with_file_name("events.jsonl"), &body).unwrap();
+        fs::write(ledger.with_file_name("events.compressed.jsonl"), &body).unwrap();
     }
 
     /// The real binary against this fixture's isolated homes.
@@ -709,6 +718,7 @@ fn coldstart_one_call_shows_open_work_the_addressed_take_and_sources() {
     // nothing addressed to anyone else or outside the window.
     let addressed = section(&inject, "ADDRESSED TO ");
     assert!(addressed.starts_with("ANDRZEJ\n"), "{addressed}");
+    assert_eq!(addressed.matches(FOUNDER_TAKE).count(), 1, "{addressed}");
     let take = addressed
         .lines()
         .find(|line| line.contains(FOUNDER_TAKE))

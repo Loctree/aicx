@@ -655,7 +655,8 @@ fn printed_path(path: &str) -> String {
 
 /// Keep `--for-inject` inside [`INJECT_CHAR_BUDGET`].
 ///
-/// SOURCES and INDEX HEALTH are reserved whole when they fit. Claim sections
+/// The first NOW body line is reserved alongside SOURCES and INDEX HEALTH.
+/// Tail sections are reserved whole when they fit. Claim sections
 /// (NOW, PEERS, DECISIONS, TASKS) lose complete lines from the tail first.
 /// The omission marker names every section that lost a line.
 pub(crate) fn bounded_inject(out: String) -> String {
@@ -707,6 +708,7 @@ fn split_inject_lines(out: &str) -> Vec<InjectLine> {
     let mut section = String::new();
     let mut claim = false;
     let mut protected = false;
+    let mut now_reserved = false;
     for line in out.split_inclusive('\n') {
         let body = line.trim_end_matches(['\n', '\r']);
         let heading = body.starts_with("## ");
@@ -715,11 +717,13 @@ fn split_inject_lines(out: &str) -> Vec<InjectLine> {
             claim = matches!(section.as_str(), "NOW" | "PEERS" | "DECISIONS" | "TASKS");
             protected = matches!(section.as_str(), "SOURCES" | "INDEX HEALTH");
         }
+        let reserve_now = section == "NOW" && !heading && !body.trim().is_empty() && !now_reserved;
+        now_reserved |= reserve_now;
         lines.push(InjectLine {
             section: section.clone(),
             line: line.to_string(),
             claim,
-            protected,
+            protected: protected || reserve_now,
             heading,
         });
     }
@@ -761,10 +765,12 @@ fn last_inject_line(
         .map(|(index, _)| index)
 }
 
-/// Drop claim lines before any other prose, and keep one body line of each
+/// Drop unreserved claim lines before other prose, and keep one body line of each
 /// protected section until nothing else can go.
 fn next_inject_drop(lines: &[InjectLine], keep: &[bool]) -> Option<usize> {
-    if let Some(index) = last_inject_line(lines, keep, |piece| piece.claim && !piece.heading) {
+    if let Some(index) = last_inject_line(lines, keep, |piece| {
+        piece.claim && !piece.protected && !piece.heading
+    }) {
         return Some(index);
     }
     if let Some(index) = last_inject_line(lines, keep, |piece| !piece.protected && !piece.heading) {
@@ -825,6 +831,17 @@ fn reserve_inject_tail(out: String) -> String {
     }
 }
 
+/// Take identity wins over timestamp/text; idless legacy copies use both.
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+enum AddressedTakeKey {
+    Take(String),
+    Legacy {
+        spoken: bool,
+        at: DateTime<Utc>,
+        text: String,
+    },
+}
+
 /// Render optional addressed speech without changing the project-scoped pack.
 /// The bus is read live, including projects outside the narrative's filter.
 /// Unreadable ledgers fail the request; replay omissions remain explicit.
@@ -844,7 +861,13 @@ pub fn render_as(
         .ok_or_else(|| anyhow::anyhow!("cannot resolve operator home for addressed speech"))?;
     let now = DateTime::parse_from_rfc3339(&pack.window_end)?.with_timezone(&Utc);
     let cutoff = intents::window_cutoff(now, pack.hours);
-    let mut messages = Vec::new();
+    let mut messages: BTreeMap<
+        AddressedTakeKey,
+        (
+            Vec<std::path::PathBuf>,
+            crate::importers::codescribe_bus::BusMessage,
+        ),
+    > = BTreeMap::new();
     let mut skipped = 0;
     let mut open = 0;
     let ledgers = crate::importers::codescribe_bus::discover_bus_ledgers(&user_home);
@@ -865,10 +888,42 @@ pub fn render_as(
                     crate::sanitize::normalize_query(audience) == normalized
                 }))
             {
-                messages.push((ledger, message));
+                use crate::importers::codescribe_bus::BusMessageKind;
+                let key = message.take_id.as_ref().map_or_else(
+                    || AddressedTakeKey::Legacy {
+                        spoken: matches!(message.kind, BusMessageKind::Spoken { .. }),
+                        at: message.at,
+                        text: message
+                            .text
+                            .split_whitespace()
+                            .collect::<Vec<_>>()
+                            .join(" "),
+                    },
+                    |id| AddressedTakeKey::Take(id.clone()),
+                );
+                match messages.entry(key) {
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert((vec![ledger.clone()], message));
+                    }
+                    std::collections::btree_map::Entry::Occupied(mut entry) => {
+                        let (paths, kept) = entry.get_mut();
+                        if !paths.contains(ledger) {
+                            paths.push(ledger.clone());
+                        }
+                        kept.at = kept.at.min(message.at);
+                        kept.recipients.extend(message.recipients);
+                        kept.recipients.sort();
+                        kept.recipients.dedup();
+                        // A certified copy does not erase a refused delivery copy.
+                        if matches!(message.kind, BusMessageKind::Spoken { certified: false }) {
+                            kept.kind = message.kind;
+                        }
+                    }
+                }
             }
         }
     }
+    let mut messages: Vec<_> = messages.into_values().collect();
     messages.sort_by(|(path_a, a), (path_b, b)| {
         b.at.cmp(&a.at)
             .then_with(|| path_a.cmp(path_b))
@@ -888,7 +943,7 @@ pub fn render_as(
     if messages.is_empty() {
         section.push_str("- no addressed bus messages inside the window; absence is not proof of no assignment\n");
     }
-    for (ledger, message) in messages.iter().take(SOURCE_CAP) {
+    for (ledgers, message) in messages.iter().take(SOURCE_CAP) {
         use crate::importers::codescribe_bus::BusMessageKind;
         let kind = match message.kind {
             BusMessageKind::Spoken { certified: true } => "voice",
@@ -908,7 +963,11 @@ pub fn render_as(
             message.text.replace('\r', "\\r").replace('\n', "\\n"),
             message.at.to_rfc3339(),
             recipients,
-            printed_path(&ledger.to_string_lossy()),
+            ledgers
+                .iter()
+                .map(|ledger| printed_path(&ledger.to_string_lossy()))
+                .collect::<Vec<_>>()
+                .join(", "),
         ));
     }
     if messages.len() > SOURCE_CAP {
