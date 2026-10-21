@@ -21,6 +21,10 @@ use crate::intents::{self, IntentKind, IntentRecord, IntentsConfig};
 /// pack is prompt preamble — it must never crowd out the actual task.
 const INJECT_CHAR_BUDGET: usize = 24_000;
 
+/// Newest NOW body lines kept whole while OPEN WORK rows, ADDRESSED TO rows,
+/// and the other claim sections are still what the budget can cut.
+const NOW_INJECT_FLOOR: usize = 5;
+
 const NOW_CAP: usize = 10;
 const PEER_SESSION_CAP: usize = 8;
 const PEER_CLAIM_CAP: usize = 3;
@@ -655,10 +659,12 @@ fn printed_path(path: &str) -> String {
 
 /// Keep `--for-inject` inside [`INJECT_CHAR_BUDGET`].
 ///
-/// The first NOW body line is reserved alongside SOURCES and INDEX HEALTH.
-/// Tail sections are reserved whole when they fit. Claim sections
-/// (NOW, PEERS, DECISIONS, TASKS) lose complete lines from the tail first.
-/// The omission marker names every section that lost a line.
+/// The newest [`NOW_INJECT_FLOOR`] NOW body lines stay whole until claim
+/// lines outside that floor, OPEN WORK rows, and ADDRESSED TO rows have been
+/// dropped. Fewer NOW lines than the floor are kept whole. The first NOW body
+/// line then stays with SOURCES and INDEX HEALTH. The omission marker names
+/// every section that lost a line, and OPEN WORK / ADDRESSED TO also say how
+/// many rows were dropped.
 pub(crate) fn bounded_inject(out: String) -> String {
     if out.chars().count() <= INJECT_CHAR_BUDGET {
         return out;
@@ -672,6 +678,9 @@ struct InjectLine {
     claim: bool,
     protected: bool,
     heading: bool,
+    /// One of the newest NOW body lines. Dropped only after OPEN WORK rows,
+    /// ADDRESSED TO rows, and the other claim lines are gone.
+    now_floor: bool,
 }
 
 fn inject_section_key(heading: &str) -> String {
@@ -703,12 +712,16 @@ fn inject_omission_marker(shortened: &[String]) -> String {
     }
 }
 
+fn counts_dropped_rows(section: &str) -> bool {
+    section == "OPEN WORK" || section.starts_with("ADDRESSED TO")
+}
+
 fn split_inject_lines(out: &str) -> Vec<InjectLine> {
     let mut lines = Vec::new();
     let mut section = String::new();
     let mut claim = false;
     let mut protected = false;
-    let mut now_reserved = false;
+    let mut now_floor_used = 0usize;
     for line in out.split_inclusive('\n') {
         let body = line.trim_end_matches(['\n', '\r']);
         let heading = body.starts_with("## ");
@@ -717,14 +730,23 @@ fn split_inject_lines(out: &str) -> Vec<InjectLine> {
             claim = matches!(section.as_str(), "NOW" | "PEERS" | "DECISIONS" | "TASKS");
             protected = matches!(section.as_str(), "SOURCES" | "INDEX HEALTH");
         }
-        let reserve_now = section == "NOW" && !heading && !body.trim().is_empty() && !now_reserved;
-        now_reserved |= reserve_now;
+        let now_floor = section == "NOW"
+            && !heading
+            && !body.trim().is_empty()
+            && now_floor_used < NOW_INJECT_FLOOR;
+        if now_floor {
+            now_floor_used += 1;
+        }
+        // The single newest NOW line stays with SOURCES and INDEX HEALTH
+        // once the floor itself has to give lines back.
+        let protect_newest_now = now_floor && now_floor_used == 1;
         lines.push(InjectLine {
             section: section.clone(),
             line: line.to_string(),
             claim,
-            protected: protected || reserve_now,
+            protected: protected || protect_newest_now,
             heading,
+            now_floor,
         });
     }
     lines
@@ -732,6 +754,7 @@ fn split_inject_lines(out: &str) -> Vec<InjectLine> {
 
 fn shortened_inject_sections(lines: &[InjectLine], keep: &[bool]) -> Vec<String> {
     let mut names = Vec::new();
+    let mut row_drops: BTreeMap<String, usize> = BTreeMap::new();
     for (piece, on) in lines.iter().zip(keep.iter()) {
         if *on || piece.section.is_empty() || piece.line.trim().is_empty() {
             continue;
@@ -739,8 +762,22 @@ fn shortened_inject_sections(lines: &[InjectLine], keep: &[bool]) -> Vec<String>
         if !names.contains(&piece.section) {
             names.push(piece.section.clone());
         }
+        if !piece.heading && counts_dropped_rows(&piece.section) {
+            *row_drops.entry(piece.section.clone()).or_default() += 1;
+        }
     }
     names
+        .into_iter()
+        .map(
+            |name| match row_drops.get(&name).copied().filter(|count| *count > 0) {
+                Some(count) => format!(
+                    "{name} ({count} {})",
+                    if count == 1 { "row" } else { "rows" }
+                ),
+                None => name,
+            },
+        )
+        .collect()
 }
 
 fn kept_inject_chars(lines: &[InjectLine], keep: &[bool]) -> usize {
@@ -765,15 +802,29 @@ fn last_inject_line(
         .map(|(index, _)| index)
 }
 
-/// Drop unreserved claim lines before other prose, and keep one body line of each
-/// protected section until nothing else can go.
+/// Claim lines outside the NOW floor go first. OPEN WORK and ADDRESSED TO
+/// rows follow, from the tail, before the floor gives a line back. One body
+/// line of each protected section (newest NOW, SOURCES, INDEX HEALTH) stays
+/// until nothing else can go.
 fn next_inject_drop(lines: &[InjectLine], keep: &[bool]) -> Option<usize> {
     if let Some(index) = last_inject_line(lines, keep, |piece| {
-        piece.claim && !piece.protected && !piece.heading
+        piece.claim && !piece.protected && !piece.now_floor && !piece.heading
     }) {
         return Some(index);
     }
-    if let Some(index) = last_inject_line(lines, keep, |piece| !piece.protected && !piece.heading) {
+    if let Some(index) = last_inject_line(lines, keep, |piece| {
+        (piece.section == "OPEN WORK" || piece.section.starts_with("ADDRESSED TO"))
+            && !piece.heading
+    }) {
+        return Some(index);
+    }
+    if let Some(index) = last_inject_line(lines, keep, |piece| {
+        !piece.protected && !piece.now_floor && !piece.heading
+    }) {
+        return Some(index);
+    }
+    if let Some(index) = last_inject_line(lines, keep, |piece| piece.now_floor && !piece.protected)
+    {
         return Some(index);
     }
     if let Some(index) = last_extra_protected_line(lines, keep) {
