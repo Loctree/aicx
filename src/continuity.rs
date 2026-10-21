@@ -628,10 +628,19 @@ fn claim_line(record: &IntentRecord, label: &str, indent: &str) -> String {
             .as_deref()
             .unwrap_or("not_verified_by_aicx"),
         record.honesty.claim_scope.as_deref().unwrap_or("unknown"),
-        record.source_chunk,
+        printed_path(&record.source_chunk),
         record.summary
     );
     format!("{}\n", line.replace('\r', "\\r").replace('\n', "\\n"))
+}
+
+/// Evidence paths are printed the way an operator types them. Windows
+/// canonical paths carry a `\\?\` prefix; identity comparisons keep it, the
+/// rendered pack does not.
+fn printed_path(path: &str) -> String {
+    aicx_parser::sanitize::strip_verbatim_prefix(Path::new(path))
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// Retain complete lines within a Unicode-character budget, including the
@@ -885,7 +894,7 @@ pub fn render(pack: &ContinuityPack, for_inject: bool) -> String {
             source.agent,
             source.human_messages,
             source.latest_activity.as_deref().unwrap_or("unknown"),
-            source.path,
+            printed_path(&source.path),
             if source.live { " [unadmitted]" } else { "" }
         ));
     }
@@ -1170,9 +1179,23 @@ mod tests {
             first.contains("continuity-a"),
             "peer session id missing:\n{first}"
         );
+        // The pack prints the resolved source. `temp_dir()` may be a short
+        // (`RUNNER~1`) or symlinked (`/var` -> `/private/var`) spelling of it,
+        // so the expectation is the canonical path as the pack prints it.
+        let printed_source = printed_path(
+            &source
+                .canonicalize()
+                .expect("canonical source")
+                .display()
+                .to_string(),
+        );
         assert!(
-            first.contains(&source.display().to_string()),
-            "source evidence path missing:\n{first}"
+            first.contains(&printed_source),
+            "source evidence path {printed_source:?} missing:\n{first}"
+        );
+        assert!(
+            !first.contains(r"\\?\"),
+            "a Windows verbatim prefix leaked into the pack:\n{first}"
         );
         assert_eq!(first, second, "continuity pack must be deterministic");
 

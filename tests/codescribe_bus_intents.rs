@@ -289,7 +289,9 @@ fn codescribe_speech_reaches_intents_through_hot_refresh_census_and_index() {
         bus_row.session_id,
         format!("bus-{LEDGER_STEM}-claude-{SESSION}")
     );
-    assert_eq!(bus_row.source_path, ledger.display().to_string());
+    // Path equality, not string equality: the fixture joins `a/b` segments, the
+    // census joins components, and Windows spells those with different separators.
+    assert_eq!(Path::new(&bus_row.source_path), ledger.as_path());
     assert_eq!(
         bus_row.cwd, receiver.cwd,
         "bus speech inherits the receiver's cwd"
@@ -303,7 +305,7 @@ fn codescribe_speech_reaches_intents_through_hot_refresh_census_and_index() {
         .filter(|entry| entry.agent == "codescribe" && !entry.session_id.starts_with("bus-"))
         .collect();
     assert_eq!(takes.len(), 1, "one catalog row per dictated take");
-    assert_eq!(takes[0].source_path, raw_take.display().to_string());
+    assert_eq!(Path::new(&takes[0].source_path), raw_take.as_path());
     assert_eq!(
         takes[0].project.as_deref(),
         Some(aicx::importers::codescribe::CODESCRIBE_DICTATION_PROJECT),

@@ -1056,8 +1056,10 @@ mod tests {
 
     fn absorbed_nested_workdir_fixture() -> (Fixture, PathBuf) {
         let mut fixture = Fixture::new();
-        let parent = fixture.home.join("workspace/aicx");
-        let nested = parent.join("vendor/fleet-bus");
+        // One component per join: `a/b` keeps a `/` inside a Windows path, and
+        // the recorded workdir is normalised to one separator.
+        let parent = fixture.home.join("workspace").join("aicx");
+        let nested = parent.join("vendor").join("fleet-bus");
         fs::create_dir_all(parent.join(".git")).unwrap();
         fs::create_dir_all(&nested).unwrap();
         let row = &mut fixture.rows[0];
