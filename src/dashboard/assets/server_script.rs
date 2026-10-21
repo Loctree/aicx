@@ -630,6 +630,99 @@ pub(crate) const DASHBOARD_SERVER_SCRIPT: &str = r#"
     });
   };
 
+  /* --- continuity: the same frozen window in the browser and CLI --------- */
+  const continuityPanel = document.createElement('section');
+  continuityPanel.id = 'ctx-continuity';
+  continuityPanel.className = 'continuity-panel';
+  continuityPanel.hidden = true;
+  continuityPanel.setAttribute('aria-label', 'Continuity');
+  continuityPanel.innerHTML = `
+    <h2>Continuity</h2>
+    <p class="meta">Build a cold start from this machine's session history. Read the sections, then use the same pack in your terminal.</p>
+    <form id="ctx-continuity-form" class="continuity-form">
+      <label>Project<input name="project" id="ctx-continuity-project" placeholder="owner/repo" required list="ctx-continuity-projects" /></label>
+      <datalist id="ctx-continuity-projects"></datalist>
+      <label>Name (optional)<input name="as" placeholder="Andrzej" /></label>
+      <label>Hours<input name="hours" type="number" min="0" step="1" value="72" required /></label>
+      <label class="continuity-fit"><input name="inject" type="checkbox" checked />Fit to prompt</label>
+      <button type="submit">Build pack</button>
+    </form>
+    <p id="ctx-continuity-status" class="meta" role="status" aria-live="polite">Choose a project to begin. Hours: 0 includes all history.</p>
+    <div id="ctx-continuity-result" hidden>
+      <p class="meta">Reproduce this window in the terminal (same AICX home and source history):</p>
+      <pre class="continuity-command"><code id="ctx-continuity-command"></code></pre>
+      <button id="ctx-continuity-copy" type="button">Copy command</button>
+      <nav id="ctx-continuity-meter" class="continuity-meter" aria-label="Pack sections"></nav>
+      <div id="ctx-continuity-sections"></div>
+    </div>`;
+  const mainBody = document.querySelector('.main-body');
+  if (mainBody) mainBody.appendChild(continuityPanel);
+  const navContinuity = document.createElement('button');
+  navContinuity.type = 'button';
+  navContinuity.id = 'ctx-nav-continuity';
+  navContinuity.className = 'rail-nav-item';
+  navContinuity.textContent = 'Continuity';
+  const railNav = document.querySelector('.rail-nav');
+  if (railNav) railNav.appendChild(navContinuity);
+  const showContinuity = (visible) => {
+    continuityPanel.hidden = !visible;
+    const layout = $('ctx-layout');
+    if (layout) layout.hidden = visible;
+    if (visible) {
+      const project = $('ctx-continuity-project');
+      if (!project.value) project.value = state.project || '';
+      const options = $('ctx-continuity-projects');
+      options.replaceChildren();
+      Array.from(ui.project.options).filter((o) => o.value).forEach((o) => {
+        const option = document.createElement('option'); option.value = o.value; options.appendChild(option);
+      });
+      project.focus();
+    }
+  };
+  navContinuity.addEventListener('click', () => { markNav(navContinuity); showContinuity(true); });
+  $('ctx-continuity-form').addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const params = new URLSearchParams(new FormData(form));
+    params.set('inject', form.elements.inject.checked ? 'true' : 'false');
+    if (!params.get('as').trim()) params.delete('as');
+    const button = form.querySelector('button[type="submit"]');
+    const status = $('ctx-continuity-status');
+    const result = $('ctx-continuity-result');
+    button.disabled = true; result.hidden = true;
+    status.textContent = 'Building continuity from live sources…';
+    try {
+      const response = await apiFetch('/api/continuity?' + params.toString());
+      const data = await response.json();
+      if (!response.ok || !data.ok) throw new Error(data.error || 'HTTP ' + response.status);
+      $('ctx-continuity-command').textContent = data.cli_command;
+      const meter = $('ctx-continuity-meter');
+      const sections = $('ctx-continuity-sections');
+      meter.replaceChildren(); sections.replaceChildren();
+      data.sections.forEach((section, index) => {
+        const id = 'ctx-continuity-section-' + index;
+        const link = document.createElement('a');
+        link.href = '#' + id;
+        link.textContent = section.title + ' · ' + section.lines + ' lines';
+        meter.appendChild(link);
+        const article = document.createElement('article');
+        article.id = id; article.className = 'continuity-section';
+        const heading = document.createElement('h3');
+        heading.textContent = section.title + ' · ' + section.lines + ' lines';
+        const content = document.createElement('div'); content.className = 'md-rendered';
+        content.innerHTML = renderMarkdown(section.markdown);
+        article.append(heading, content); sections.appendChild(article);
+      });
+      status.textContent = data.total_lines + ' lines · window ends ' + data.until + (data.inject ? ' · fit to prompt' : ' · full pack');
+      result.hidden = false;
+    } catch (error) { status.textContent = error.message; }
+    finally { button.disabled = false; }
+  });
+  $('ctx-continuity-copy').addEventListener('click', async () => {
+    try { await navigator.clipboard.writeText($('ctx-continuity-command').textContent); }
+    catch (_) { $('ctx-continuity-status').textContent = 'Select the command above to copy it.'; }
+  });
+
   const navSessions = $('ctx-nav-sessions');
   const navSetup = $('ctx-nav-setup');
   const markNav = (active) => {
@@ -637,11 +730,13 @@ pub(crate) const DASHBOARD_SERVER_SCRIPT: &str = r#"
   };
   if (navSessions) navSessions.addEventListener('click', function() {
     markNav(navSessions);
+    showContinuity(false);
     if (ui.list) ui.list.scrollTop = 0;
     if (ui.search) ui.search.focus();
   });
   if (navSetup) navSetup.addEventListener('click', function() {
     markNav(navSetup);
+    showContinuity(false);
     const onboard = $('ctx-onboarding');
     if (onboard) onboard.open = true;
   });

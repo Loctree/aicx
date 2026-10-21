@@ -32,6 +32,7 @@ use crate::auth::{self, AuthConfig};
 use crate::dashboard::{self, DashboardPayload, DashboardScope, DashboardStats};
 
 mod browse;
+mod continuity;
 mod cors;
 mod operator;
 mod search;
@@ -339,6 +340,7 @@ fn assemble_router(state: Arc<DashboardServerState>, mount_health: bool) -> Rout
         .route("/api/detail", get(browse::get_detail))
         .route("/api/chunk", get(browse::get_chunk))
         .route("/api/context", get(get_context))
+        .route("/api/continuity", get(continuity::get_continuity))
         .route("/api/regenerate", post(regenerate_dashboard))
         .route("/api/search/semantic", get(search::get_semantic_search))
         .route("/api/search/cross", get(search::cross_search_gone))

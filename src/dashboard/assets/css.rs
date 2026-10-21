@@ -1,6 +1,23 @@
 //! Shared dashboard CSS.
 
 pub(crate) const DASHBOARD_CSS: &str = r#"
+/* Continuity uses the dashboard's existing type, controls and colors. */
+.continuity-panel[hidden], #ctx-layout[hidden] { display: none; }
+.continuity-panel { padding: 24px; overflow-y: auto; width: 100%; min-width: 0; }
+.continuity-form { display: flex; flex-wrap: wrap; align-items: end; gap: 12px; margin: 20px 0; }
+.continuity-form label { display: flex; flex-direction: column; gap: 6px; font-size: 13px; }
+.continuity-form input { padding: 8px; min-width: 0; color: var(--text); background: var(--panel); border: 1px solid var(--line); border-radius: 6px; font: inherit; }
+.continuity-panel button { padding: 8px 14px; color: var(--text); background: var(--panel); border: 1px solid var(--line); border-radius: 999px; font: inherit; cursor: pointer; }
+.continuity-panel button:hover, .continuity-meter a:hover { border-color: var(--accent); }
+.continuity-panel button:disabled { opacity: .6; cursor: wait; }
+.continuity-form input[type=number] { width: 85px; }
+.continuity-form .continuity-fit { flex-direction: row; align-items: center; padding: 8px 0; }
+.continuity-command { white-space: pre-wrap; overflow-wrap: anywhere; padding: 14px; border: 1px solid var(--line); border-radius: 8px; font-family: var(--font-mono); }
+.continuity-meter { display: flex; flex-wrap: wrap; gap: 8px; margin: 20px 0; }
+.continuity-meter a { color: inherit; border: 1px solid var(--line); border-radius: 16px; padding: 5px 10px; font-size: 12px; text-decoration: none; }
+.continuity-section { border-top: 1px solid var(--line); padding: 16px 0; overflow-wrap: anywhere; }
+.continuity-section h3 { font-size: 13px; opacity: .7; }
+#ctx-continuity-status { white-space: pre-wrap; }
 :root {
   color-scheme: dark;
   --bg: #0e0e0e;
