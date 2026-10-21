@@ -435,6 +435,7 @@ impl MixedScopeSession {
             "copilot" | "copilot-cli" | "github-copilot" | "github-copilot-cli" => {
                 AgentKind::Copilot
             }
+            "omp" | "pi" | "oh-my-pi" => AgentKind::Omp,
             _ => AgentKind::Claude,
         }
     }

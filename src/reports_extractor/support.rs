@@ -533,7 +533,8 @@ fn humanize_stem(stem: &str) -> String {
 
 fn agent_from_title(title: &str) -> Option<String> {
     [
-        "copilot", "codex", "claude", "gemini", "cursor", "grok", "junie", "kimi",
+        "copilot", "omp", "oh-my-pi", "codex", "claude", "gemini", "cursor", "grok", "junie",
+        "kimi",
     ]
     .iter()
     .find(|candidate| contains_case_insensitive(title, candidate))

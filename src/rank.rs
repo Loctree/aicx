@@ -1293,6 +1293,9 @@ fn speaker_role(frame_kind: Option<&str>, speaker_hint: Option<&str>, line: &str
                     | "kimi"
                     | "cursor"
                     | "copilot"
+                    | "omp"
+                    | "pi"
+                    | "oh-my-pi"
             ) =>
         {
             SpeakerRole::Assistant

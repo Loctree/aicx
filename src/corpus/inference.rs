@@ -14,7 +14,14 @@ pub(super) fn infer_agent(path: &Path, content: &str) -> String {
         content.lines().take(20).collect::<String>()
     )
     .to_ascii_lowercase();
+    if haystack.contains("/.omp/")
+        || haystack.contains("/.pi/agent/")
+        || haystack.contains("oh-my-pi")
+    {
+        return "omp".to_string();
+    }
     for agent in [
+        "omp",
         "copilot",
         "claude",
         "codex",

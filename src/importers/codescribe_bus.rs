@@ -67,6 +67,7 @@ impl BusParty {
             "kimi" => Some("kimi"),
             "cursor" | "cursor-agent" => Some("cursor"),
             "copilot" | "copilot-cli" => Some("copilot"),
+            "omp" | "pi" | "oh-my-pi" => Some("omp"),
             _ => None,
         }
     }
