@@ -985,6 +985,15 @@ pub fn render(pack: &ContinuityPack, for_inject: bool) -> String {
     render_with_addressed(pack, for_inject, "")
 }
 
+/// Same lower bound as the HONESTY window line. An unreadable end does not
+/// fold: there is no window to measure a branch against.
+fn open_work_window_start(pack: &ContinuityPack) -> Option<DateTime<Utc>> {
+    let end = DateTime::parse_from_rfc3339(&pack.window_end)
+        .ok()
+        .map(|time| time.with_timezone(&Utc))?;
+    Some(intents::window_cutoff(end, pack.hours))
+}
+
 fn render_with_addressed(pack: &ContinuityPack, for_inject: bool, addressed: &str) -> String {
     let mut out = String::new();
     out.push_str(&format!(
@@ -1202,7 +1211,18 @@ fn render_with_addressed(pack: &ContinuityPack, for_inject: bool, addressed: &st
     out.push('\n');
 
     if let Some(open_work) = &pack.open_work {
-        out.push_str(&crate::open_work::render_section(open_work));
+        // The pack stays as collected. Inject mode only decides which rows
+        // the section spells out; the window start is the cutoff HONESTY
+        // already prints.
+        let inject_not_before = if for_inject {
+            open_work_window_start(pack)
+        } else {
+            None
+        };
+        out.push_str(&crate::open_work::render_section(
+            open_work,
+            inject_not_before,
+        ));
     }
     out.push_str(addressed);
     out.push_str("## SOURCES\n\n");

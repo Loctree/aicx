@@ -17,6 +17,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use aicx_parser::engine::{WorkdirIdentity, normalize_workdir};
+use chrono::{DateTime, Utc};
 
 /// Local branches examined per pack, newest committer date first.
 pub const BRANCH_CAP: usize = 50;
@@ -544,7 +545,15 @@ pub fn honesty_line(open: &OpenWork) -> String {
 }
 
 /// The OPEN WORK section. Empty for an unfiltered pack.
-pub fn render_section(open: &OpenWork) -> String {
+///
+/// `inject_not_before` is set only for `--for-inject`. `None` lists every
+/// open branch, byte for byte with the unbudgeted section. `Some` is the
+/// pack window start: a branch whose newest open commit is strictly older
+/// than that instant folds into one summary line, unless a worktree holds
+/// it. A commit at or after the start stays listed, including one later
+/// than the window end. That commit is not stale, and the inject character
+/// budget still truncates the section.
+pub fn render_section(open: &OpenWork, inject_not_before: Option<DateTime<Utc>>) -> String {
     if open.projects.is_empty() {
         return String::new();
     }
@@ -587,36 +596,16 @@ pub fn render_section(open: &OpenWork) -> String {
             checkout.branches_total,
             checkout.commits_examined
         ));
+        let mut folded: Vec<&OpenBranch> = Vec::new();
         for row in &checkout.rows {
-            let worktree = match &row.worktree {
-                Some(held) => format!(
-                    "{}{}",
-                    printed(&held.path),
-                    if held.prunable {
-                        " (prunable: directory gone)"
-                    } else {
-                        ""
-                    }
-                ),
-                None if checkout.worktrees_unknown => "unknown".to_string(),
-                None => "none".to_string(),
-            };
-            out.push_str(&format!(
-                "- {} · open={} · already_in_head={} · newest={}{} · author_date={} · Authored-By={} · session_id={} · worktree={} · subject={}\n",
-                one_line(&row.branch),
-                row.open_commits,
-                row.integrated_commits,
-                short(&row.newest.sha),
-                row.newest_reapplied_in_head
-                    .as_deref()
-                    .map(|sha| format!(" · newest_reapplied_in_head={}", short(sha)))
-                    .unwrap_or_default(),
-                one_line(&row.newest.author_date),
-                listed(&row.newest.authored_by),
-                listed(&row.newest.session_ids),
-                one_line(&worktree),
-                one_line(&row.newest.subject)
-            ));
+            if branch_listed_for_inject(checkout, row, inject_not_before) {
+                out.push_str(&branch_row(checkout, row));
+            } else {
+                folded.push(row);
+            }
+        }
+        if !folded.is_empty() {
+            out.push_str(&fold_summary(&folded));
         }
         for (branch, ahead) in &checkout.over_budget {
             out.push_str(&format!(
@@ -654,6 +643,81 @@ pub fn render_section(open: &OpenWork) -> String {
     }
     out.push('\n');
     out
+}
+
+fn branch_row(checkout: &CheckoutOpenWork, row: &OpenBranch) -> String {
+    let worktree = match &row.worktree {
+        Some(held) => format!(
+            "{}{}",
+            printed(&held.path),
+            if held.prunable {
+                " (prunable: directory gone)"
+            } else {
+                ""
+            }
+        ),
+        None if checkout.worktrees_unknown => "unknown".to_string(),
+        None => "none".to_string(),
+    };
+    format!(
+        "- {} · open={} · already_in_head={} · newest={}{} · author_date={} · Authored-By={} · session_id={} · worktree={} · subject={}\n",
+        one_line(&row.branch),
+        row.open_commits,
+        row.integrated_commits,
+        short(&row.newest.sha),
+        row.newest_reapplied_in_head
+            .as_deref()
+            .map(|sha| format!(" · newest_reapplied_in_head={}", short(sha)))
+            .unwrap_or_default(),
+        one_line(&row.newest.author_date),
+        listed(&row.newest.authored_by),
+        listed(&row.newest.session_ids),
+        one_line(&worktree),
+        one_line(&row.newest.subject)
+    )
+}
+
+/// `None` lists every row. A worktree hold, or an unknown worktree list,
+/// stays listed: the section must not claim a branch is unheld when git
+/// could not say so. An unreadable author date is not proven stale.
+fn branch_listed_for_inject(
+    checkout: &CheckoutOpenWork,
+    row: &OpenBranch,
+    inject_not_before: Option<DateTime<Utc>>,
+) -> bool {
+    let Some(not_before) = inject_not_before else {
+        return true;
+    };
+    if checkout.worktrees_unknown || row.worktree.is_some() {
+        return true;
+    }
+    match DateTime::parse_from_rfc3339(row.newest.author_date.trim()) {
+        Ok(author) => author.with_timezone(&Utc) >= not_before,
+        Err(_) => true,
+    }
+}
+
+/// One line for the branches older than the pack window: how many, the
+/// newest author date among them, and how many carry a reapplied-in-HEAD hint.
+fn fold_summary(rows: &[&OpenBranch]) -> String {
+    let Some(newest) = rows.iter().max_by(|left, right| {
+        left.newest
+            .author_time
+            .cmp(&right.newest.author_time)
+            .then_with(|| left.newest.author_date.cmp(&right.newest.author_date))
+            .then_with(|| left.branch.cmp(&right.branch))
+    }) else {
+        return String::new();
+    };
+    let reapplied = rows
+        .iter()
+        .filter(|row| row.newest_reapplied_in_head.is_some())
+        .count();
+    format!(
+        "- {} branch(es) outside the pack window · newest_author_date={} · newest_reapplied_in_head={reapplied}\n",
+        rows.len(),
+        one_line(&newest.newest.author_date),
+    )
 }
 
 #[cfg(test)]
