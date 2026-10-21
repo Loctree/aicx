@@ -643,26 +643,176 @@ fn printed_path(path: &str) -> String {
         .into_owned()
 }
 
-/// Retain complete lines within a Unicode-character budget, including the
-/// omission marker. Long claims are omitted whole, allowing later requests
-/// to survive rather than stopping at one over-sized claim.
+/// Keep `--for-inject` inside [`INJECT_CHAR_BUDGET`].
+///
+/// SOURCES and INDEX HEALTH are reserved whole when they fit. Claim sections
+/// (NOW, PEERS, DECISIONS, TASKS) lose complete lines from the tail first.
+/// The omission marker names every section that lost a line.
 pub(crate) fn bounded_inject(out: String) -> String {
     if out.chars().count() <= INJECT_CHAR_BUDGET {
         return out;
     }
-    const MARKER: &str = "\n[continuity pack truncated at inject budget; content omitted; claim lines retained whole]\n";
-    let limit = INJECT_CHAR_BUDGET - MARKER.chars().count();
-    let mut bounded = String::new();
-    let mut used = 0;
-    for line in out.split_inclusive('\n') {
-        let count = line.chars().count();
-        if used + count <= limit {
-            bounded.push_str(line);
-            used += count;
+    reserve_inject_tail(out)
+}
+
+struct InjectLine {
+    section: String,
+    line: String,
+    claim: bool,
+    protected: bool,
+    heading: bool,
+}
+
+fn inject_section_key(heading: &str) -> String {
+    for name in [
+        "INDEX HEALTH",
+        "DECISIONS",
+        "SOURCES",
+        "HONESTY",
+        "PEERS",
+        "TASKS",
+        "NOW",
+    ] {
+        if heading.starts_with(name) {
+            return name.to_string();
         }
     }
-    bounded.push_str(MARKER);
-    bounded
+    heading.to_string()
+}
+
+fn inject_omission_marker(shortened: &[String]) -> String {
+    if shortened.is_empty() {
+        "\n[continuity pack truncated at inject budget; content omitted; claim lines retained whole]\n"
+            .to_string()
+    } else {
+        format!(
+            "\n[continuity pack truncated at inject budget; shortened: {}; claim lines retained whole]\n",
+            shortened.join(", ")
+        )
+    }
+}
+
+fn split_inject_lines(out: &str) -> Vec<InjectLine> {
+    let mut lines = Vec::new();
+    let mut section = String::new();
+    let mut claim = false;
+    let mut protected = false;
+    for line in out.split_inclusive('\n') {
+        let body = line.trim_end_matches(['\n', '\r']);
+        let heading = body.starts_with("## ");
+        if heading {
+            section = inject_section_key(body.trim_start_matches("## "));
+            claim = matches!(section.as_str(), "NOW" | "PEERS" | "DECISIONS" | "TASKS");
+            protected = matches!(section.as_str(), "SOURCES" | "INDEX HEALTH");
+        }
+        lines.push(InjectLine {
+            section: section.clone(),
+            line: line.to_string(),
+            claim,
+            protected,
+            heading,
+        });
+    }
+    lines
+}
+
+fn shortened_inject_sections(lines: &[InjectLine], keep: &[bool]) -> Vec<String> {
+    let mut names = Vec::new();
+    for (piece, on) in lines.iter().zip(keep.iter()) {
+        if *on || piece.section.is_empty() || piece.line.trim().is_empty() {
+            continue;
+        }
+        if !names.contains(&piece.section) {
+            names.push(piece.section.clone());
+        }
+    }
+    names
+}
+
+fn kept_inject_chars(lines: &[InjectLine], keep: &[bool]) -> usize {
+    lines
+        .iter()
+        .zip(keep.iter())
+        .filter(|(_, on)| **on)
+        .map(|(piece, _)| piece.line.chars().count())
+        .sum()
+}
+
+fn last_inject_line(
+    lines: &[InjectLine],
+    keep: &[bool],
+    pred: impl Fn(&InjectLine) -> bool,
+) -> Option<usize> {
+    lines
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(index, piece)| keep[*index] && pred(piece))
+        .map(|(index, _)| index)
+}
+
+/// Drop claim lines before any other prose, and keep one body line of each
+/// protected section until nothing else can go.
+fn next_inject_drop(lines: &[InjectLine], keep: &[bool]) -> Option<usize> {
+    if let Some(index) = last_inject_line(lines, keep, |piece| piece.claim && !piece.heading) {
+        return Some(index);
+    }
+    if let Some(index) = last_inject_line(lines, keep, |piece| !piece.protected && !piece.heading) {
+        return Some(index);
+    }
+    if let Some(index) = last_extra_protected_line(lines, keep) {
+        return Some(index);
+    }
+    last_inject_line(lines, keep, |_| true)
+}
+
+fn last_extra_protected_line(lines: &[InjectLine], keep: &[bool]) -> Option<usize> {
+    let mut body_count: BTreeMap<&str, usize> = BTreeMap::new();
+    for (index, piece) in lines.iter().enumerate() {
+        if keep[index] && piece.protected && !piece.heading && !piece.line.trim().is_empty() {
+            *body_count.entry(piece.section.as_str()).or_default() += 1;
+        }
+    }
+    lines
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(index, piece)| {
+            if !keep[*index] || !piece.protected || piece.heading {
+                return false;
+            }
+            piece.line.trim().is_empty()
+                || body_count.get(piece.section.as_str()).copied().unwrap_or(0) > 1
+        })
+        .map(|(index, _)| index)
+}
+
+fn reserve_inject_tail(out: String) -> String {
+    let lines = split_inject_lines(&out);
+    let mut keep = vec![true; lines.len()];
+    loop {
+        let shortened = shortened_inject_sections(&lines, &keep);
+        let marker = inject_omission_marker(&shortened);
+        if kept_inject_chars(&lines, &keep) + marker.chars().count() <= INJECT_CHAR_BUDGET {
+            let mut bounded = String::new();
+            for (piece, on) in lines.iter().zip(keep.iter()) {
+                if *on {
+                    bounded.push_str(&piece.line);
+                }
+            }
+            bounded.push_str(&marker);
+            return bounded;
+        }
+        match next_inject_drop(&lines, &keep) {
+            Some(index) => keep[index] = false,
+            None => {
+                return inject_omission_marker(&[])
+                    .chars()
+                    .take(INJECT_CHAR_BUDGET)
+                    .collect();
+            }
+        }
+    }
 }
 
 /// Render the pack. `for_inject` bounds complete claim lines in Unicode chars.
@@ -1785,5 +1935,170 @@ mod tests {
         let heavy_source = source_block.find("human=344").expect("weighted source");
         let thin_source = source_block.find("human=6").expect("thin source");
         assert!(heavy_source < thin_source, "{source_block}");
+    }
+
+    fn overflow_inject_pack() -> ContinuityPack {
+        // Medium claim lines fill the budget from the front. The tail lines are
+        // longer than one claim, so a leftover sliver cannot admit them.
+        let fat = |tag: &str, index: usize| {
+            format!("CLAIMSTART-{tag}-{index}-{}-CLAIMEND", "x".repeat(1_800))
+        };
+        let record = |kind: IntentKind, session: String, summary: String| IntentRecord {
+            provenance: Some(crate::intents::IntentProvenance {
+                role: "user".into(),
+                locator: "line:1".into(),
+                scope: None,
+                timestamp_basis: "conversation".into(),
+                attribution: "transcript".into(),
+            }),
+            kind,
+            summary,
+            context: None,
+            evidence: Vec::new(),
+            project: "Loctree/aicx".into(),
+            agent: "codex".into(),
+            date: "2026-10-21".into(),
+            timestamp: Some("2026-10-21T00:00:00Z".into()),
+            session_id: session,
+            count: None,
+            first_chunk: None,
+            last_chunk: None,
+            source_chunk: "claims.jsonl".into(),
+            source: None,
+            honesty: crate::oracle::ClaimHonesty::canonical(),
+        };
+        let mut records = Vec::new();
+        for index in 0..8 {
+            records.push(record(
+                IntentKind::Intent,
+                format!("now-{index}"),
+                fat("now", index),
+            ));
+            records.push(record(
+                IntentKind::Decision,
+                format!("decision-{index}"),
+                fat("decision", index),
+            ));
+            records.push(record(
+                IntentKind::Task,
+                format!("task-{index}"),
+                fat("task", index),
+            ));
+        }
+        ContinuityPack {
+            selection: Vec::new(),
+            source_errors: 0,
+            dropped_task_events: 0,
+            window_end: "2026-10-21T00:00:00Z".into(),
+            project_label: "Loctree/aicx".into(),
+            hours: 72,
+            live_sessions: 0,
+            records,
+            sources: vec![SourceLine {
+                agent: "codex".into(),
+                path: format!("sources-kept.jsonl{}", "s".repeat(3_000)),
+                latest_activity: Some("2026-10-21T00:00:00Z".into()),
+                live: false,
+                human_messages: 3,
+            }],
+            index_health: IndexHealthLine {
+                newest_session_updated_at: Some("2026-10-21T00:00:00Z".into()),
+                committed_at: Some("2026-10-21T00:00:00Z".into()),
+                pending: 0,
+                sessions_newer_than_chunks: 0,
+                readiness: format!("inject-health-kept{}", "h".repeat(3_000)),
+                mode: "live",
+            },
+            mixed_scope: Vec::new(),
+            distilled_mixed: false,
+            candidate_cap: 5_000,
+            dropped_candidates: 0,
+            unplaced_scope: Vec::new(),
+        }
+    }
+
+    fn inject_section_body<'a>(rendered: &'a str, heading: &str) -> &'a str {
+        let rest = rendered
+            .split(heading)
+            .nth(1)
+            .unwrap_or_else(|| panic!("missing {heading} in:\n{rendered}"));
+        let rest = rest.strip_prefix('\n').unwrap_or(rest);
+        let end = rest
+            .find("\n## ")
+            .or_else(|| rest.find("\n[continuity pack truncated"));
+        match end {
+            Some(index) => &rest[..index],
+            None => rest,
+        }
+    }
+
+    #[test]
+    fn inject_budget_keeps_sources_and_index_health_when_claims_overflow() {
+        let pack = overflow_inject_pack();
+        let full = render(&pack, false);
+        assert!(
+            full.chars().count() > INJECT_CHAR_BUDGET,
+            "fixture must exceed the inject budget so truncation is real"
+        );
+        let rendered = render(&pack, true);
+        let sources = inject_section_body(&rendered, "## SOURCES");
+        let health = inject_section_body(&rendered, "## INDEX HEALTH");
+        assert!(
+            sources.contains("sources-kept.jsonl"),
+            "SOURCES body empty:\n{sources}\n--- pack tail ---\n{}",
+            rendered.chars().rev().take(800).collect::<String>()
+        );
+        assert!(
+            health.contains("inject-health-kept"),
+            "INDEX HEALTH body empty:\n{health}"
+        );
+        assert!(
+            health.contains("readiness:"),
+            "INDEX HEALTH lost its readiness line:\n{health}"
+        );
+    }
+
+    #[test]
+    fn inject_budget_keeps_marker_names_shortened_sections() {
+        let rendered = render(&overflow_inject_pack(), true);
+        let marker = rendered
+            .lines()
+            .find(|line| line.contains("truncated at inject budget"))
+            .unwrap_or_else(|| panic!("missing omission marker:\n{rendered}"));
+        assert!(
+            marker.contains("shortened:"),
+            "marker must name the shortened sections: {marker}"
+        );
+        for section in ["NOW", "PEERS", "DECISIONS"] {
+            assert!(
+                marker.contains(section),
+                "marker omitted {section}: {marker}"
+            );
+        }
+    }
+
+    #[test]
+    fn inject_budget_keeps_output_within_char_budget() {
+        let rendered = render(&overflow_inject_pack(), true);
+        let chars = rendered.chars().count();
+        assert!(
+            chars <= INJECT_CHAR_BUDGET,
+            "inject pack is {chars} chars, budget is {INJECT_CHAR_BUDGET}"
+        );
+        for line in rendered.lines() {
+            if line.contains("CLAIMSTART") {
+                assert!(
+                    line.contains("CLAIMEND"),
+                    "claim line was cut inside the budget: {line}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn inject_budget_keeps_fitting_pack_unchanged() {
+        let pack = render_pack_with_census(5_000, 0);
+        assert!(pack.chars().count() <= INJECT_CHAR_BUDGET);
+        assert_eq!(bounded_inject(pack.clone()), pack);
     }
 }
