@@ -18,6 +18,7 @@ pub enum AgentKind {
     Kimi,
     Cursor,
     Copilot,
+    Omp,
 }
 
 impl AgentKind {
@@ -36,6 +37,7 @@ impl AgentKind {
             "copilot" | "copilot-cli" | "github-copilot" | "github-copilot-cli" => {
                 Some(Self::Copilot)
             }
+            "omp" | "pi" | "oh-my-pi" => Some(Self::Omp),
             _ => None,
         }
     }
@@ -50,6 +52,7 @@ impl AgentKind {
             Self::Kimi => "kimi",
             Self::Cursor => "cursor",
             Self::Copilot => "copilot",
+            Self::Omp => "omp",
         }
     }
 }

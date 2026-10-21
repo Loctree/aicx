@@ -426,6 +426,14 @@ pub enum ProviderConversationRef {
         parent_session_id: Option<String>,
         unobserved: Vec<String>,
     },
+    /// oh-my-pi / omp session header. `session_id` is the uuid from the
+    /// `session` record (the filename uuid when the header is absent).
+    /// `parent_session_id` is `parentSession` when the header carried it.
+    Omp {
+        session_id: String,
+        parent_session_id: Option<String>,
+        unobserved: Vec<String>,
+    },
 }
 
 impl ProviderConversationRef {
@@ -481,6 +489,11 @@ impl ProviderConversationRef {
                 parent_session_id: None,
                 unobserved: vec!["parent_session_id".to_owned()],
             },
+            AgentKind::Omp => Self::Omp {
+                session_id: store_id,
+                parent_session_id: None,
+                unobserved: vec!["parent_session_id".to_owned()],
+            },
         }
     }
 
@@ -494,6 +507,7 @@ impl ProviderConversationRef {
             Self::Kimi { .. } => AgentKind::Kimi,
             Self::Cursor { .. } => AgentKind::Cursor,
             Self::Copilot { .. } => AgentKind::Copilot,
+            Self::Omp { .. } => AgentKind::Omp,
         }
     }
 
@@ -507,7 +521,8 @@ impl ProviderConversationRef {
             | Self::Junie { session_id, .. }
             | Self::Kimi { session_id, .. }
             | Self::Cursor { session_id, .. }
-            | Self::Copilot { session_id, .. } => session_id,
+            | Self::Copilot { session_id, .. }
+            | Self::Omp { session_id, .. } => session_id,
             Self::Codex {
                 tree_session_id,
                 thread_id,
@@ -526,6 +541,12 @@ impl ProviderConversationRef {
                 ..
             } => {
                 vec![("detached_from_spawning_parent_session_id", id.as_str())]
+            }
+            Self::Omp {
+                parent_session_id: Some(id),
+                ..
+            } => {
+                vec![("parentSession", id.as_str())]
             }
             Self::Codex {
                 forked_from_id,
@@ -554,7 +575,8 @@ impl ProviderConversationRef {
             | Self::Junie { unobserved, .. }
             | Self::Kimi { unobserved, .. }
             | Self::Cursor { unobserved, .. }
-            | Self::Copilot { unobserved, .. } => unobserved,
+            | Self::Copilot { unobserved, .. }
+            | Self::Omp { unobserved, .. } => unobserved,
         }
     }
 }

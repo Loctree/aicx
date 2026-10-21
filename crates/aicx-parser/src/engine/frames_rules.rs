@@ -160,6 +160,59 @@ const CURSOR_INJECT_TAGS: &[InjectTagRule] = &[
     },
 ];
 
+// # omp / pi — tags the adapter assigns. Unknown customType values stay
+// InjectKind::Other and still cannot become human speech.
+const OMP_INJECT_TAGS: &[InjectTagRule] = &[
+    InjectTagRule {
+        tag: "system",
+        kind: InjectRuleKind::TransportControl,
+    },
+    InjectTagRule {
+        tag: "dispatch_brief",
+        kind: InjectRuleKind::TransportControl,
+    },
+    InjectTagRule {
+        tag: "synthetic_user",
+        kind: InjectRuleKind::TransportControl,
+    },
+    InjectTagRule {
+        tag: "agent_authored",
+        kind: InjectRuleKind::TransportControl,
+    },
+    InjectTagRule {
+        tag: "steering",
+        kind: InjectRuleKind::TransportControl,
+    },
+    InjectTagRule {
+        tag: "user_unattributed",
+        kind: InjectRuleKind::TransportControl,
+    },
+    InjectTagRule {
+        tag: "ttsr_injection",
+        kind: InjectRuleKind::TransportControl,
+    },
+    InjectTagRule {
+        tag: "developer",
+        kind: InjectRuleKind::AgentInstructions,
+    },
+    InjectTagRule {
+        tag: "session_init",
+        kind: InjectRuleKind::AgentInstructions,
+    },
+    InjectTagRule {
+        tag: "skill-prompt",
+        kind: InjectRuleKind::AgentInstructions,
+    },
+    InjectTagRule {
+        tag: "compaction",
+        kind: InjectRuleKind::CompactionReplay,
+    },
+    InjectTagRule {
+        tag: "branch_summary",
+        kind: InjectRuleKind::CompactionReplay,
+    },
+];
+
 // # kimi — the compaction summary is epoch context, never re-emitted speech.
 const KIMI_INJECT_TAGS: &[InjectTagRule] = &[
     InjectTagRule {
@@ -256,6 +309,15 @@ pub const AGENT_FRAME_RULES: &[AgentFrameRules] = &[
         klops_guard: &[],
         queue_seal: false,
         inject_tags: CURSOR_INJECT_TAGS,
+    },
+    // # omp / pi — harness injections are tagged in the adapter. Human speech
+    // is only an attributed user message; these tags never promote to it.
+    AgentFrameRules {
+        agent: AgentKind::Omp,
+        echo_promotion: false,
+        klops_guard: &[],
+        queue_seal: false,
+        inject_tags: OMP_INJECT_TAGS,
     },
 ];
 
