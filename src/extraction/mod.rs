@@ -137,53 +137,64 @@ pub fn extract_agent_sessions(
     config: &ExtractionConfig,
 ) -> Result<SessionExtractionBatch> {
     let home = crate::os_user_home().context("No home dir")?;
-    let root = match agent {
-        crate::session_catalog::AgentKind::Claude => home.join(".claude").join("projects"),
-        crate::session_catalog::AgentKind::Codex => home.join(".codex").join("sessions"),
-        crate::session_catalog::AgentKind::Gemini => home.join(".gemini").join("tmp"),
-        crate::session_catalog::AgentKind::Grok => home.join(".grok"),
-        crate::session_catalog::AgentKind::Junie => home.join(".junie").join("sessions"),
-        crate::session_catalog::AgentKind::Kimi => home.join(".kimi-code").join("sessions"),
-        crate::session_catalog::AgentKind::Cursor => home.join(".cursor").join("projects"),
+    let roots = match agent {
+        crate::session_catalog::AgentKind::Claude => vec![home.join(".claude").join("projects")],
+        crate::session_catalog::AgentKind::Codex => vec![home.join(".codex").join("sessions")],
+        crate::session_catalog::AgentKind::Gemini => vec![home.join(".gemini").join("tmp")],
+        crate::session_catalog::AgentKind::Grok => vec![home.join(".grok")],
+        crate::session_catalog::AgentKind::Junie => vec![home.join(".junie").join("sessions")],
+        crate::session_catalog::AgentKind::Kimi => {
+            vec![home.join(".kimi-code").join("sessions")]
+        }
+        crate::session_catalog::AgentKind::Cursor => vec![home.join(".cursor").join("projects")],
         crate::session_catalog::AgentKind::Copilot => {
-            crate::session_catalog::copilot_session_root(&home)
+            vec![crate::session_catalog::copilot_session_root(&home)]
         }
+        crate::session_catalog::AgentKind::Omp => crate::session_catalog::omp_session_roots(&home),
     };
-    let root_metadata = match fs::metadata(&root) {
-        Ok(metadata) => Some(metadata),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => {
-            return Err(error).with_context(|| {
-                format!("cannot inspect {agent} session root {}", root.display())
-            });
-        }
-    };
-    if root_metadata.is_none() {
-        // No session root means this agent has never written a session on
-        // this host: zero sources, not a failed adapter claim. Typed refusals
-        // are reserved for sources that exist and were understood.
-        crate::diagnostics::log_describe(&format!(
-            "session_root_missing agent={} root={}",
-            agent,
-            root.display()
-        ));
-        return Ok(SessionExtractionBatch::default());
-    }
-    anyhow::ensure!(
-        root_metadata.is_some_and(|metadata| metadata.is_dir()),
-        "{agent} session root is not a directory: {}",
-        root.display()
-    );
-    let scan = crate::session_catalog::SessionCatalog::new(agent, &root)?.scan_with_stats();
     let parser_agent_kind = parser_agent(agent);
     let mut batch = SessionExtractionBatch::default();
     let mut first_refusal = None;
     let mut projection_basis = None;
-    let mut sources: Vec<_> = scan
-        .result?
-        .into_iter()
-        .filter(|source| source_is_selected(source.fingerprint.modified_unix_nanos, config))
-        .collect();
+    let mut sources = Vec::new();
+    let mut saw_dir = false;
+    for root in &roots {
+        let root_metadata = match fs::metadata(root) {
+            Ok(metadata) => Some(metadata),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("cannot inspect {agent} session root {}", root.display())
+                });
+            }
+        };
+        let Some(metadata) = root_metadata else {
+            // A missing pi store next to an omp store is an unused root, not
+            // a failed adapter claim. Typed refusals stay for sources that
+            // exist and were understood.
+            crate::diagnostics::log_describe(&format!(
+                "session_root_missing agent={} root={}",
+                agent,
+                root.display()
+            ));
+            continue;
+        };
+        anyhow::ensure!(
+            metadata.is_dir(),
+            "{agent} session root is not a directory: {}",
+            root.display()
+        );
+        saw_dir = true;
+        let scan = crate::session_catalog::SessionCatalog::new(agent, root)?.scan_with_stats();
+        sources.extend(
+            scan.result?.into_iter().filter(|source| {
+                source_is_selected(source.fingerprint.modified_unix_nanos, config)
+            }),
+        );
+    }
+    if !saw_dir {
+        return Ok(SessionExtractionBatch::default());
+    }
     order_sources_freshest_first(&mut sources);
     for source in sources {
         let parsed = crate::parser_dispatch::parse_file(
@@ -444,6 +455,7 @@ const fn parser_agent(agent: crate::session_catalog::AgentKind) -> aicx_parser::
         crate::session_catalog::AgentKind::Junie => aicx_parser::engine::AgentKind::Junie,
         crate::session_catalog::AgentKind::Kimi => aicx_parser::engine::AgentKind::Kimi,
         crate::session_catalog::AgentKind::Copilot => aicx_parser::engine::AgentKind::Copilot,
+        crate::session_catalog::AgentKind::Omp => aicx_parser::engine::AgentKind::Omp,
     }
 }
 

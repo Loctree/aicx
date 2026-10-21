@@ -387,6 +387,53 @@ pub fn list_available_sources() -> Result<Vec<SourceInfo>> {
         }
     }
 
+    // oh-my-pi and upstream pi share one agent. Nested tool-log directories
+    // are not sessions; catalog admission is the only filter.
+    for root in crate::session_catalog::omp_session_roots(&home) {
+        let present = match root.try_exists() {
+            Ok(value) => value,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("cannot inspect omp session root {}", root.display())
+                });
+            }
+        };
+        if !present {
+            continue;
+        }
+        anyhow::ensure!(
+            root.is_dir(),
+            "omp session root is not a directory: {}",
+            root.display()
+        );
+        let catalog = crate::session_catalog::SessionCatalog::new(
+            crate::session_catalog::AgentKind::Omp,
+            &root,
+        )
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+        let scanned = catalog
+            .scan_with_stats()
+            .result
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        if scanned.is_empty() {
+            continue;
+        }
+        let mut size = 0u64;
+        for source in &scanned {
+            match fs::symlink_metadata(&source.path) {
+                Ok(metadata) if metadata.is_file() => size += metadata.len(),
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("cannot inspect omp source {}", source.path.display())
+                    });
+                }
+            }
+        }
+        sources.push(source_info(&home, "omp", root, scanned.len(), size));
+    }
+
     // Codescribe transcripts: ~/.codescribe/transcriptions/YYYY-MM-DD/*.{txt,md,json}
     let codescribe_transcripts = discover_codescribe_transcripts(&home);
     if !codescribe_transcripts.is_empty() {
@@ -450,5 +497,28 @@ mod copilot_tests {
         assert!(is_copilot_session_file(
             &root.join("user-123-task-456").join("events.jsonl")
         ));
+    }
+}
+
+#[cfg(test)]
+mod omp_tests {
+    use super::*;
+
+    #[test]
+    fn omp_and_pi_session_files_are_listed_and_nested_tool_logs_are_not() {
+        let id = "01999999-aaaa-7666-8666-111111111111";
+        let stem = format!("2026-10-21T12-00-00-000Z_{id}");
+        let omp =
+            Path::new("/home/user/.omp/agent/sessions/--fixture--").join(format!("{stem}.jsonl"));
+        assert!(crate::session_catalog::is_omp_source_file(&omp));
+        let nested = Path::new("/home/user/.omp/agent/sessions/--fixture--")
+            .join(&stem)
+            .join("1.bash.log");
+        assert!(!crate::session_catalog::is_omp_source_file(&nested));
+        let pi =
+            Path::new("/home/user/.pi/agent/sessions/--fixture--").join(format!("{stem}.jsonl"));
+        assert!(crate::session_catalog::is_omp_source_file(&pi));
+        let loose = Path::new("/home/user/.omp/agent/sessions").join(format!("{stem}.jsonl"));
+        assert!(!crate::session_catalog::is_omp_source_file(&loose));
     }
 }
