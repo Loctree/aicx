@@ -408,6 +408,35 @@ _arguments "${_arguments_options[@]}" : \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
 ;;
+(omp)
+_arguments "${_arguments_options[@]}" : \
+'(--file)--session=[Session id\: source id, logical id, alias, UUID suffix (≥8 chars), or unique prefix. Resolved through the session catalog before any parse]:SESSION:_default' \
+'--file=[Direct source file. Builds a source handle from this path only — no catalog scan, no global AICX state. Requires \`-o/--output\`]:FILE:_files' \
+'-o+[Output file path. Required with \`--file\`; defaults to \`~/.aicx/extracts/<agent>/<session_id>\[_conversation\]\[_user\].md\` in session mode]:OUTPUT:_files' \
+'--output=[Output file path. Required with \`--file\`; defaults to \`~/.aicx/extracts/<agent>/<session_id>\[_conversation\]\[_user\].md\` in session mode]:OUTPUT:_files' \
+'*-p+[Project/repo filter, repeatable or comma-separated (OR across projects, AND with every other axis). Entries are kept when their recorded cwd belongs to one of them; an entry with no known cwd is filtered out rather than guessed. A single value also names the output'\''s project identity, as before]:PROJECT:_default' \
+'*--project=[Project/repo filter, repeatable or comma-separated (OR across projects, AND with every other axis). Entries are kept when their recorded cwd belongs to one of them; an entry with no known cwd is filtered out rather than guessed. A single value also names the output'\''s project identity, as before]:PROJECT:_default' \
+'--max-message-chars=[Maximum message characters in markdown (0 = no truncation)]:MAX_MESSAGE_CHARS:_default' \
+'-H+[Hours to look back inside the session view (0 = unbounded). A window on the projection, not a re-parse; absence is never a silent default]:HOURS:_default' \
+'--hours=[Hours to look back inside the session view (0 = unbounded). A window on the projection, not a re-parse; absence is never a silent default]:HOURS:_default' \
+'*--kind=[Throne kind filter (repeatable / comma list)\: human | echo_seal | shell_action | inject | assistant_final | lineage_meta | inter_agent. \`inter_agent\` opens the inter-agent lane; it is never rendered as assistant and stays outside --conversation / --dialog by default]:KIND:_default' \
+'--lineage=[Walk parent sessions through \`session_meta.forked_from_id\` (session catalog lookup, never filename guessing). Bare \`--lineage\` = unbounded; \`--lineage=N\` = at most N parents. Needs --session (catalog)]::DEPTH:_default' \
+'--result=[Retained shell result body\: none (\`\$ cmd \[N lines, sha256\:…\]\`, default) | head=N | full. The body stays in the substrate either way]:none|head=N|full:_default' \
+'--no-redact-secrets[Redact secrets (tokens/keys) from outputs before writing/syncing]' \
+'(--agent-only)--user-only[Only include user messages (exclude assistant + reasoning)]' \
+'--agent-only[Only include assistant answers (\`assistant_final\`). Reasoning, inter-agent traffic and lineage metadata are excluded\: they are not the assistant speaking to the operator]' \
+'--user-commands[Only shell commands the human submitted (e.g. Codex \`<user_shell_command>\`). A command quoted in prose is not an execution]' \
+'--agent-commands[Only tool / shell invocations the agent made]' \
+'--conversation[Conversation-first mode\: emit denoised user/assistant transcript only]' \
+'--dialog[Dialogue view\: human speech (direct + delayed echo-bus / queued, with their seals) plus assistant-final answers]' \
+'(--conversation --dialog --user-only --agent-only --user-commands --agent-commands)--brief[Distilled handoff brief (inverted pyramid, one section per segment)\: outcome first, then decision candidates, gates, open questions and handoff signals, each with an evidence locator into the substrate. Rendered from the agent'\''s distiller lane (\`GenericLane\` fail-open); mixed sessions get a multi-workstream header, never averaged outcomes]' \
+'-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
 (all)
 _arguments "${_arguments_options[@]}" : \
 '*--provider=[Restrict the pass to these providers (repeatable / comma list). Default\: every provider the parser registry claims]:PROVIDER:_default' \
@@ -478,6 +507,10 @@ _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
 (copilot)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(omp)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
@@ -839,7 +872,7 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 '*-p+[Exact project filter, same shapes as search/intents/MCP\: \`owner/repo\`, \`/repo\` (cross-org repo), \`owner/\` (org wildcard), or a unique bare \`name\`. Empty is a numbered miss, not silence]:PROJECT:_default' \
 '*--project=[Exact project filter, same shapes as search/intents/MCP\: \`owner/repo\`, \`/repo\` (cross-org repo), \`owner/\` (org wildcard), or a unique bare \`name\`. Empty is a numbered miss, not silence]:PROJECT:_default' \
-'--agent=[Filter by agent (claude | codex | gemini | junie | grok | kimi | cursor | copilot)]:AGENT:(claude codex gemini junie grok kimi cursor cursor-agent copilot copilot-cli github-copilot github-copilot-cli)' \
+'--agent=[Filter by agent (claude | codex | gemini | junie | grok | kimi | cursor | copilot | omp)]:AGENT:(claude codex gemini junie grok kimi cursor cursor-agent copilot copilot-cli github-copilot github-copilot-cli omp pi oh-my-pi)' \
 '--since=[Only sessions updated on/after this date (YYYY-MM-DD). Defaults to the last 30 days; pass --all to scan the full history]:SINCE:_default' \
 '--limit=[Max sessions to show (0 = all)]:LIMIT:_default' \
 '--format=[Output format\: table | json]:FORMAT:_default' \
@@ -869,7 +902,7 @@ _arguments "${_arguments_options[@]}" : \
 ;;
 (report)
 _arguments "${_arguments_options[@]}" : \
-'--agent=[Agent\: claude | codex | gemini | junie | grok | kimi | cursor | copilot. Inferred from the session id when omitted]:AGENT:_default' \
+'--agent=[Agent\: claude | codex | gemini | junie | grok | kimi | cursor | copilot | omp. Inferred from the session id when omitted]:AGENT:_default' \
 '--hours=[Hours to look back when locating the session (default 720)]:HOURS:_default' \
 '--repo=[Repo root evidence is checked against (default\: current directory)]:REPO:_files' \
 '--max=[Max clarify questions (hard-capped at 5)]:MAX:_default' \
@@ -942,7 +975,7 @@ _arguments "${_arguments_options[@]}" : \
             (extract)
 _arguments "${_arguments_options[@]}" : \
 '--session=[Session id (or unique prefix)]:SESSION:_default' \
-'--agent=[Agent\: claude | codex | gemini | junie | grok | kimi | cursor | copilot. Inferred from the session id when omitted]:AGENT:_default' \
+'--agent=[Agent\: claude | codex | gemini | junie | grok | kimi | cursor | copilot | omp. Inferred from the session id when omitted]:AGENT:_default' \
 '--hours=[Hours to look back when locating the session (default 720)]:HOURS:_default' \
 '--format=[Output format\: json | summary]:FORMAT:_default' \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
@@ -1000,7 +1033,7 @@ _arguments "${_arguments_options[@]}" : \
             (collect)
 _arguments "${_arguments_options[@]}" : \
 '--session=[Session id (or unique prefix)]:SESSION:_default' \
-'--agent=[Agent\: claude | codex | gemini | junie | grok | kimi | cursor | copilot. Inferred from the session id when omitted]:AGENT:_default' \
+'--agent=[Agent\: claude | codex | gemini | junie | grok | kimi | cursor | copilot | omp. Inferred from the session id when omitted]:AGENT:_default' \
 '--hours=[Hours to look back when locating the session (default 720)]:HOURS:_default' \
 '--repo=[Repo root evidence is checked against (default\: current directory)]:REPO:_files' \
 '--format=[Output format\: json | summary]:FORMAT:_default' \
@@ -1042,7 +1075,7 @@ esac
 (clarify)
 _arguments "${_arguments_options[@]}" : \
 '--session=[Session id (or unique prefix)]:SESSION:_default' \
-'--agent=[Agent\: claude | codex | gemini | junie | grok | kimi | cursor | copilot. Inferred from the session id when omitted]:AGENT:_default' \
+'--agent=[Agent\: claude | codex | gemini | junie | grok | kimi | cursor | copilot | omp. Inferred from the session id when omitted]:AGENT:_default' \
 '--hours=[Hours to look back when locating the session (default 720)]:HOURS:_default' \
 '--repo=[Repo root evidence is checked against (default\: current directory)]:REPO:_files' \
 '--max=[Max questions (hard-capped at 5)]:MAX:_default' \
@@ -1282,6 +1315,21 @@ _arguments "${_arguments_options[@]}" : \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
 ;;
+(utterances)
+_arguments "${_arguments_options[@]}" : \
+'*-p+[Catalog project filters. Omit to scan all projects. Repeated \`-p\` flags or a comma list (\`-p a,b\`) form a union]:PROJECT:_default' \
+'*--project=[Catalog project filters. Omit to scan all projects. Repeated \`-p\` flags or a comma list (\`-p a,b\`) form a union]:PROJECT:_default' \
+'-H+[Hours to look back when \`--since\` is omitted (default\: 720 = 30 days, 0 = all time)]:HOURS:_default' \
+'--hours=[Hours to look back when \`--since\` is omitted (default\: 720 = 30 days, 0 = all time)]:HOURS:_default' \
+'--since=[Inclusive window start, YYYY-MM-DD UTC. Overrides \`--hours\`]:SINCE:_default' \
+'--until=[Inclusive window end, YYYY-MM-DD UTC. Omit to end at now]:UNTIL:_default' \
+'-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
 (intents)
 _arguments "${_arguments_options[@]}" : \
 '*-p+[Catalog project filters. Omit to scan all projects. Repeated \`-p\` flags or comma list (\`-p a,b\`) form a union]:PROJECT:_default' \
@@ -1291,7 +1339,7 @@ _arguments "${_arguments_options[@]}" : \
 '--limit=[Maximum number of results to return. Default is command-specific\: search/steer 10, tail 20, intents unlimited (full roadmap)]:LIMIT:_default' \
 '--sort=[Sort order applied after filtering. Default\: command-specific]:SORT:(newest oldest score)' \
 '--score=[Minimum score threshold (0-100; semantic match confidence)]:SCORE:_default' \
-'--agent=[Agent name filter\: claude | codex | gemini | junie | grok | kimi | cursor | copilot | codescribe]:AGENT:_default' \
+'--agent=[Agent name filter\: claude | codex | gemini | junie | grok | kimi | cursor | copilot | omp | codescribe]:AGENT:_default' \
 '--since=[Lower date bound\: YYYY-MM-DD or relative (e.g., 2026-04-23..)]:SINCE:_default' \
 '--until=[Upper date bound\: YYYY-MM-DD]:UNTIL:_default' \
 '--frame-kind=[Frame channel filter\: user_msg | agent_reply | internal_thought | tool_call]:FRAME_KIND:(user_msg agent_reply internal_thought tool_call)' \
@@ -1304,6 +1352,7 @@ _arguments "${_arguments_options[@]}" : \
 '--strict[Only show high-confidence intents]' \
 '(--no-live)--live[Force the live source-root scan regardless of the window size. (Windows of ≤ 48h scan live sources automatically.)]' \
 '--no-live[Disable the automatic live scan for hot (≤ 48h) windows]' \
+'--full-rescan[Parse every selected catalog source instead of deferring legacy scope holes. Expensive; parser safety bounds still apply]' \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
@@ -1335,8 +1384,11 @@ _arguments "${_arguments_options[@]}" : \
 '-H+[Window in hours]:HOURS:_default' \
 '--hours=[Window in hours]:HOURS:_default' \
 '--until=[Inclusive UTC window end (RFC3339); defaults to the current time]:UNTIL:_default' \
+'--as=[Include cross-project Codescribe bus speech addressed to this name (case/diacritic-insensitive). Dictation has no addressee and is excluded]:NAME:_default' \
 '--for-inject[Bound the output to a prompt-inject budget (~6k tokens)]' \
 '--no-refresh[Skip the bounded catalog hot refresh performed before rendering]' \
+'--distill-mixed[Distill mixed-workstream sessions into the pack instead of withholding them (and refusing a window of only such work). The pack states that it did]' \
+'--distill_mixed[Distill mixed-workstream sessions into the pack instead of withholding them (and refusing a window of only such work). The pack states that it did]' \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
@@ -1353,7 +1405,10 @@ _arguments "${_arguments_options[@]}" : \
 '--until=[Inclusive UTC window end (RFC3339); defaults to the current time]:UNTIL:_default' \
 '-o+[Output path]:OUTPUT:_files' \
 '--output=[Output path]:OUTPUT:_files' \
+'--as=[Include cross-project Codescribe bus speech addressed to this name (case/diacritic-insensitive). Dictation has no addressee and is excluded]:NAME:_default' \
 '--no-refresh[Skip the bounded catalog hot refresh performed before rendering]' \
+'--distill-mixed[Distill mixed-workstream sessions into the pack instead of withholding them (and refusing a window of only such work). The pack states that it did]' \
+'--distill_mixed[Distill mixed-workstream sessions into the pack instead of withholding them (and refusing a window of only such work). The pack states that it did]' \
 '-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
 '--project-fuzzy[Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed]' \
@@ -1404,7 +1459,7 @@ _arguments "${_arguments_options[@]}" : \
 '--limit=[Maximum number of results to return. Default is command-specific\: search/steer 10, tail 20, intents unlimited (full roadmap)]:LIMIT:_default' \
 '--sort=[Sort order applied after filtering. Default\: command-specific]:SORT:(newest oldest score)' \
 '--score=[Minimum score threshold (0-100; semantic match confidence)]:SCORE:_default' \
-'--agent=[Agent name filter\: claude | codex | gemini | junie | grok | kimi | cursor | copilot | codescribe]:AGENT:_default' \
+'--agent=[Agent name filter\: claude | codex | gemini | junie | grok | kimi | cursor | copilot | omp | codescribe]:AGENT:_default' \
 '--since=[Lower date bound\: YYYY-MM-DD or relative (e.g., 2026-04-23..)]:SINCE:_default' \
 '--until=[Upper date bound\: YYYY-MM-DD]:UNTIL:_default' \
 '--frame-kind=[Frame channel filter\: user_msg | agent_reply | internal_thought | tool_call]:FRAME_KIND:(user_msg agent_reply internal_thought tool_call)' \
@@ -1472,7 +1527,7 @@ _arguments "${_arguments_options[@]}" : \
 '--limit=[Maximum number of results to return. Default is command-specific\: search/steer 10, tail 20, intents unlimited (full roadmap)]:LIMIT:_default' \
 '--sort=[Sort order applied after filtering. Default\: command-specific]:SORT:(newest oldest score)' \
 '--score=[Minimum score threshold (0-100; semantic match confidence)]:SCORE:_default' \
-'--agent=[Agent name filter\: claude | codex | gemini | junie | grok | kimi | cursor | copilot | codescribe]:AGENT:_default' \
+'--agent=[Agent name filter\: claude | codex | gemini | junie | grok | kimi | cursor | copilot | omp | codescribe]:AGENT:_default' \
 '--since=[Lower date bound\: YYYY-MM-DD or relative (e.g., 2026-04-23..)]:SINCE:_default' \
 '--until=[Upper date bound\: YYYY-MM-DD]:UNTIL:_default' \
 '--frame-kind=[Frame channel filter\: user_msg | agent_reply | internal_thought | tool_call]:FRAME_KIND:(user_msg agent_reply internal_thought tool_call)' \
@@ -1771,7 +1826,7 @@ _arguments "${_arguments_options[@]}" : \
 '--limit=[Maximum number of results to return. Default is command-specific\: search/steer 10, tail 20, intents unlimited (full roadmap)]:LIMIT:_default' \
 '--sort=[Sort order applied after filtering. Default\: command-specific]:SORT:(newest oldest score)' \
 '--score=[Minimum score threshold (0-100; semantic match confidence)]:SCORE:_default' \
-'--agent=[Agent name filter\: claude | codex | gemini | junie | grok | kimi | cursor | copilot | codescribe]:AGENT:_default' \
+'--agent=[Agent name filter\: claude | codex | gemini | junie | grok | kimi | cursor | copilot | omp | codescribe]:AGENT:_default' \
 '--since=[Lower date bound\: YYYY-MM-DD or relative (e.g., 2026-04-23..)]:SINCE:_default' \
 '--until=[Upper date bound\: YYYY-MM-DD]:UNTIL:_default' \
 '--frame-kind=[Frame channel filter\: user_msg | agent_reply | internal_thought | tool_call]:FRAME_KIND:(user_msg agent_reply internal_thought tool_call)' \
@@ -1931,6 +1986,10 @@ _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
 (copilot)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(omp)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
@@ -2138,6 +2197,10 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
+(utterances)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
 (intents)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
@@ -2322,6 +2385,7 @@ _aicx_commands() {
 'corpus:Audit or repair derived corpus markdown' \
 'reports-extractor:Deprecated compatibility shim for \`aicx reports\`' \
 'dashboard-serve:Deprecated compatibility shim for \`aicx dashboard --serve\`' \
+'utterances:List human utterances in a project window, or refuse' \
 'intents:Extract structured intents from the durable catalog and allowlisted session sources' \
 'continuity:Multi-agent continuity pack\: NOW / PEERS / DECISIONS / TASKS / SOURCES / INDEX HEALTH for a project window. Live parse first, census second — never blocked on the embedder' \
 'tail:Print recent intents/chunks (snapshot mode); add --follow to stream new arrivals' \
@@ -2681,6 +2745,7 @@ _aicx__subcmd__extract_commands() {
 'junie:JetBrains Junie event logs (~/.junie/sessions)' \
 'kimi:Kimi Code CLI wire files (~/.kimi-code/sessions)' \
 'copilot:GitHub Copilot CLI sessions (~/.copilot/session-state)' \
+'omp:oh-my-pi / pi sessions (~/.omp/agent/sessions and ~/.pi/agent/sessions)' \
 'all:Every compatible source on this machine, in one incremental pass' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
@@ -2732,6 +2797,7 @@ _aicx__subcmd__extract__subcmd__help_commands() {
 'junie:JetBrains Junie event logs (~/.junie/sessions)' \
 'kimi:Kimi Code CLI wire files (~/.kimi-code/sessions)' \
 'copilot:GitHub Copilot CLI sessions (~/.copilot/session-state)' \
+'omp:oh-my-pi / pi sessions (~/.omp/agent/sessions and ~/.pi/agent/sessions)' \
 'all:Every compatible source on this machine, in one incremental pass' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
@@ -2787,6 +2853,11 @@ _aicx__subcmd__extract__subcmd__help__subcmd__kimi_commands() {
     local commands; commands=()
     _describe -t commands 'aicx extract help kimi commands' commands "$@"
 }
+(( $+functions[_aicx__subcmd__extract__subcmd__help__subcmd__omp_commands] )) ||
+_aicx__subcmd__extract__subcmd__help__subcmd__omp_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx extract help omp commands' commands "$@"
+}
 (( $+functions[_aicx__subcmd__extract__subcmd__junie_commands] )) ||
 _aicx__subcmd__extract__subcmd__junie_commands() {
     local commands; commands=()
@@ -2796,6 +2867,11 @@ _aicx__subcmd__extract__subcmd__junie_commands() {
 _aicx__subcmd__extract__subcmd__kimi_commands() {
     local commands; commands=()
     _describe -t commands 'aicx extract kimi commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__extract__subcmd__omp_commands] )) ||
+_aicx__subcmd__extract__subcmd__omp_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx extract omp commands' commands "$@"
 }
 (( $+functions[_aicx__subcmd__health_commands] )) ||
 _aicx__subcmd__health_commands() {
@@ -2828,6 +2904,7 @@ _aicx__subcmd__help_commands() {
 'corpus:Audit or repair derived corpus markdown' \
 'reports-extractor:Deprecated compatibility shim for \`aicx reports\`' \
 'dashboard-serve:Deprecated compatibility shim for \`aicx dashboard --serve\`' \
+'utterances:List human utterances in a project window, or refuse' \
 'intents:Extract structured intents from the durable catalog and allowlisted session sources' \
 'continuity:Multi-agent continuity pack\: NOW / PEERS / DECISIONS / TASKS / SOURCES / INDEX HEALTH for a project window. Live parse first, census second — never blocked on the embedder' \
 'tail:Print recent intents/chunks (snapshot mode); add --follow to stream new arrivals' \
@@ -3024,6 +3101,7 @@ _aicx__subcmd__help__subcmd__extract_commands() {
 'junie:JetBrains Junie event logs (~/.junie/sessions)' \
 'kimi:Kimi Code CLI wire files (~/.kimi-code/sessions)' \
 'copilot:GitHub Copilot CLI sessions (~/.copilot/session-state)' \
+'omp:oh-my-pi / pi sessions (~/.omp/agent/sessions and ~/.pi/agent/sessions)' \
 'all:Every compatible source on this machine, in one incremental pass' \
     )
     _describe -t commands 'aicx help extract commands' commands "$@"
@@ -3072,6 +3150,11 @@ _aicx__subcmd__help__subcmd__extract__subcmd__junie_commands() {
 _aicx__subcmd__help__subcmd__extract__subcmd__kimi_commands() {
     local commands; commands=()
     _describe -t commands 'aicx help extract kimi commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__help__subcmd__extract__subcmd__omp_commands] )) ||
+_aicx__subcmd__help__subcmd__extract__subcmd__omp_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx help extract omp commands' commands "$@"
 }
 (( $+functions[_aicx__subcmd__help__subcmd__health_commands] )) ||
 _aicx__subcmd__help__subcmd__health_commands() {
@@ -3234,6 +3317,11 @@ _aicx__subcmd__help__subcmd__steer_commands() {
 _aicx__subcmd__help__subcmd__tail_commands() {
     local commands; commands=()
     _describe -t commands 'aicx help tail commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__help__subcmd__utterances_commands] )) ||
+_aicx__subcmd__help__subcmd__utterances_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx help utterances commands' commands "$@"
 }
 (( $+functions[_aicx__subcmd__help__subcmd__warmup_commands] )) ||
 _aicx__subcmd__help__subcmd__warmup_commands() {
@@ -3496,6 +3584,11 @@ _aicx__subcmd__steer_commands() {
 _aicx__subcmd__tail_commands() {
     local commands; commands=()
     _describe -t commands 'aicx tail commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__utterances_commands] )) ||
+_aicx__subcmd__utterances_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx utterances commands' commands "$@"
 }
 (( $+functions[_aicx__subcmd__warmup_commands] )) ||
 _aicx__subcmd__warmup_commands() {
