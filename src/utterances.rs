@@ -23,6 +23,13 @@ pub const REFUSAL_EXIT_CODE: i32 = 2;
 /// One session is read whole or not at all. Larger sources are omitted.
 pub const SESSION_BYTE_BUDGET: u64 = 32 * 1024 * 1024;
 
+/// Clock skew kept before the window start, in hours.
+///
+/// Synced hosts can disagree by this much. A source file last written inside
+/// the margin can still hold an in-window frame. A file older than the window
+/// start minus this margin cannot: its mtime bounds the newest byte written.
+pub const SOURCE_MTIME_MARGIN_HOURS: i64 = 24;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Window {
     pub start: DateTime<Utc>,
@@ -84,6 +91,9 @@ pub struct Settlement {
     pub machine: Vec<Utterance>,
     pub holes: Vec<SessionHole>,
     pub control_plane_excluded: usize,
+    /// Sources not read because their file mtime is older than the window
+    /// start minus [`SOURCE_MTIME_MARGIN_HOURS`].
+    pub skipped_before_window: usize,
 }
 
 impl Settlement {
@@ -145,6 +155,12 @@ impl Settlement {
             out.push_str(&format!(
                 "control plane excluded: {}\n",
                 self.control_plane_excluded
+            ));
+        }
+        if self.skipped_before_window > 0 {
+            out.push_str(&format!(
+                "skipped_before_window: {}\n",
+                self.skipped_before_window
             ));
         }
         for reason in self.refusal_reasons() {
@@ -249,15 +265,17 @@ pub fn settle(reads: &[SessionRead], window: Window, projects: &[String]) -> Set
         machine,
         holes,
         control_plane_excluded: 0,
+        skipped_before_window: 0,
     }
 }
 
 /// Read the durable catalog for `filters` inside `window`.
 ///
 /// An empty filter list reads every catalog project. Catalog date does not
-/// admit or exclude a row: for most agents that column is a file mtime, so a
-/// session dated after the window can still hold an in-window turn. Every
-/// matching session is read whole, omitted whole, or recorded as a hole.
+/// admit or exclude a row. The live source file mtime does: a file last
+/// written before the window start minus [`SOURCE_MTIME_MARGIN_HOURS`] is
+/// counted in [`Settlement::skipped_before_window`] and is not read. Every
+/// other matching session is read whole, omitted whole, or recorded as a hole.
 /// Frames from a partial parse are discarded. Turn timestamps decide what
 /// enters the list.
 pub fn settle_catalog(aicx_home: &Path, filters: &[String], window: Window) -> Result<Settlement> {
@@ -265,6 +283,7 @@ pub fn settle_catalog(aicx_home: &Path, filters: &[String], window: Window) -> R
         .with_context(|| format!("read catalog under {}", aicx_home.display()))?;
     let mut reads = Vec::new();
     let mut control_plane_excluded = 0usize;
+    let mut skipped_before_window = 0usize;
     for original in entries {
         if !row_matches(original.project.as_deref(), filters) {
             continue;
@@ -284,6 +303,10 @@ pub fn settle_catalog(aicx_home: &Path, filters: &[String], window: Window) -> R
         }
         if crate::sessions::is_guardian_session_kind(entry.session_kind.as_deref()) {
             control_plane_excluded += 1;
+            continue;
+        }
+        if source_predates_window(Path::new(&entry.source_path), &window) {
+            skipped_before_window += 1;
             continue;
         }
         if source_exceeds_budget(&entry) {
@@ -323,6 +346,7 @@ pub fn settle_catalog(aicx_home: &Path, filters: &[String], window: Window) -> R
     }
     let mut settlement = settle(&reads, window, filters);
     settlement.control_plane_excluded = control_plane_excluded;
+    settlement.skipped_before_window = skipped_before_window;
     Ok(settlement)
 }
 
@@ -342,6 +366,27 @@ fn source_exceeds_budget(entry: &crate::catalog::CatalogEntry) -> bool {
             .map(|meta| meta.len())
     });
     matches!(len, Some(len) if len > SESSION_BYTE_BUDGET)
+}
+
+fn source_file_mtime(path: &Path) -> Option<DateTime<Utc>> {
+    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+    let elapsed = modified.duration_since(std::time::UNIX_EPOCH).ok()?;
+    let secs = i64::try_from(elapsed.as_secs()).ok()?;
+    DateTime::from_timestamp(secs, elapsed.subsec_nanos())
+}
+
+/// True when the source file's mtime is strictly older than the window start
+/// minus [`SOURCE_MTIME_MARGIN_HOURS`]. Missing or unreadable mtime is false:
+/// a source we cannot date can still hold an in-window frame.
+fn source_predates_window(path: &Path, window: &Window) -> bool {
+    let Some(mtime) = source_file_mtime(path) else {
+        return false;
+    };
+    let cutoff = window
+        .start
+        .checked_sub_signed(chrono::Duration::hours(SOURCE_MTIME_MARGIN_HOURS))
+        .unwrap_or(DateTime::UNIX_EPOCH);
+    mtime < cutoff
 }
 
 fn row_matches(project: Option<&str>, filters: &[String]) -> bool {
@@ -890,5 +935,124 @@ mod tests {
         assert!(report.contains("sess-huge"));
         assert!(report.contains("omitted whole"));
         assert!(!report.contains("this file was never written"));
+    }
+
+    fn write_user_jsonl(path: &std::path::Path, session_id: &str, when: &str, text: &str) {
+        std::fs::write(
+            path,
+            format!(
+                "{{\"type\":\"user\",\"timestamp\":\"{when}\",\"sessionId\":\"{session_id}\",\"message\":{{\"role\":\"user\",\"content\":{}}}}}\n",
+                serde_json::to_string(text).unwrap()
+            ),
+        )
+        .unwrap();
+    }
+
+    fn set_mtime(path: &std::path::Path, when: DateTime<Utc>) {
+        let mtime =
+            filetime::FileTime::from_unix_time(when.timestamp(), when.timestamp_subsec_nanos());
+        filetime::set_file_mtime(path, mtime).unwrap();
+    }
+
+    #[test]
+    fn utterances_skip_stale_source_older_than_margin_is_counted_not_refused() {
+        let home = TempHome::new("stale-before-window");
+        let stale = home.0.join("stale.jsonl");
+        let fresh = home.0.join("fresh.jsonl");
+        let stale_speech = "This July line must not enter the September window.";
+        let fresh_speech = "Ship the census fix.";
+        write_user_jsonl(&stale, "sess-stale", "2026-09-15T12:00:00Z", stale_speech);
+        write_user_jsonl(&fresh, "sess-fresh", "2026-09-29T16:00:00Z", fresh_speech);
+        // Older than the window start minus 24 h. The catalog date is after
+        // the window on purpose: that column stays non-authoritative.
+        set_mtime(&stale, ts("2026-07-01T00:00:00Z"));
+        write_catalog(
+            &home.0,
+            &[
+                catalog_entry(
+                    "sess-stale",
+                    "vetcoders/vista",
+                    "2026-10-06",
+                    &stale,
+                    Some(std::fs::metadata(&stale).unwrap().len()),
+                    None,
+                ),
+                catalog_entry(
+                    "sess-fresh",
+                    "vetcoders/vista",
+                    "2026-09-29",
+                    &fresh,
+                    Some(std::fs::metadata(&fresh).unwrap().len()),
+                    None,
+                ),
+            ],
+        );
+
+        let settlement = settle_catalog(
+            &home.0,
+            &["vetcoders/vista".to_string()],
+            september_window(),
+        )
+        .expect("stale sources are a settlement, not an I/O error");
+        let report = settlement.render();
+
+        assert_eq!(settlement.skipped_before_window, 1, "{report}");
+        assert!(report.contains("skipped_before_window: 1"), "{report}");
+        assert!(!report.contains("sess-stale"), "{report}");
+        assert!(!report.contains(stale_speech), "{report}");
+        assert!(!report.contains("refused:"), "{report}");
+        assert!(human_body(&report).contains(fresh_speech), "{report}");
+        assert!(settlement.complete(), "{report}");
+    }
+
+    #[test]
+    fn utterances_skip_stale_source_inside_margin_is_still_read_and_can_refuse() {
+        let home = TempHome::new("inside-margin");
+        let margin = home.0.join("margin.jsonl");
+        let fresh = home.0.join("fresh.jsonl");
+        let fresh_speech = "Ship the census fix.";
+        std::fs::write(&margin, "margin source is inside the clock-skew window\n").unwrap();
+        write_user_jsonl(&fresh, "sess-fresh", "2026-09-29T16:00:00Z", fresh_speech);
+        // 12 h before the window start: inside the 24 h margin, so the file
+        // can still hold an in-window frame and must still be able to refuse.
+        set_mtime(&margin, ts("2026-08-31T12:00:00Z"));
+        write_catalog(
+            &home.0,
+            &[
+                catalog_entry(
+                    "sess-margin",
+                    "vetcoders/vista",
+                    "2026-04-15",
+                    &margin,
+                    Some(SESSION_BYTE_BUDGET + 1),
+                    None,
+                ),
+                catalog_entry(
+                    "sess-fresh",
+                    "vetcoders/vista",
+                    "2026-09-29",
+                    &fresh,
+                    Some(std::fs::metadata(&fresh).unwrap().len()),
+                    None,
+                ),
+            ],
+        );
+
+        let settlement = settle_catalog(
+            &home.0,
+            &["vetcoders/vista".to_string()],
+            september_window(),
+        )
+        .expect("an in-margin source is still a settlement");
+        let report = settlement.render();
+
+        assert_eq!(SOURCE_MTIME_MARGIN_HOURS, 24);
+        assert_eq!(settlement.skipped_before_window, 0, "{report}");
+        assert!(!report.contains("skipped_before_window:"), "{report}");
+        assert!(report.contains("sess-margin"), "{report}");
+        assert!(report.contains("omitted whole"), "{report}");
+        assert!(report.contains("refused:"), "{report}");
+        assert!(human_body(&report).contains(fresh_speech), "{report}");
+        assert!(!settlement.complete(), "{report}");
     }
 }

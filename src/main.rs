@@ -1728,8 +1728,12 @@ enum Commands {
     /// Exit 0 only when every matching session was read whole, the list
     /// contains at least one human utterance, and the newest admitted
     /// utterance reaches the window's end date. Catalog date does not skip a
-    /// session. Code-shaped lines and agent replies are printed under
-    /// "machine text". This command does not classify decisions.
+    /// session. A source file whose mtime is older than the window start
+    /// minus 24 h cannot hold an in-window frame: it is not read and is
+    /// counted as skipped_before_window. Sources inside that 24 h margin are
+    /// still read and can still refuse. Code-shaped lines and agent replies
+    /// are printed under "machine text". This command does not classify
+    /// decisions.
     Utterances {
         /// Catalog project filters. Omit to scan all projects.
         /// Repeated `-p` flags or a comma list (`-p a,b`) form a union.
