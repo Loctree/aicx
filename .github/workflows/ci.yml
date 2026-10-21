@@ -36,7 +36,10 @@ jobs:
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         if: runner.os == 'Linux'
         with:
-          python-version: '3.x'
+          # '3.x' resolved to 3.15, which semgrep 1.182 has no wheel for
+          # (cp310-cp314); the step then exited 2 with no output. Same pin as
+          # release.yml.
+          python-version: '3.12'
 
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable 2026-07
         with:
