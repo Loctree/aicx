@@ -18,10 +18,16 @@ const OTHER: &str = "bbbbbbbb-1111-4222-8333-444444444444";
 struct Fixture(PathBuf);
 impl Fixture {
     fn new() -> Self {
+        // The tests run in parallel and the macOS clock ticks in microseconds,
+        // so pid + time alone gave two fixtures one root: one test's catalog
+        // replaced the other's ("no project matches loctree/aicx").
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
         let root = std::env::temp_dir().join(format!(
-            "aicx-continuity-addressed-{}-{}",
+            "aicx-continuity-addressed-{}-{}-{}",
             std::process::id(),
-            Utc::now().timestamp_nanos_opt().unwrap()
+            Utc::now().timestamp_nanos_opt().unwrap(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
         ));
         let fixture = Self(root);
         fs::create_dir_all(fixture.0.join(".aicx/catalog")).unwrap();
