@@ -2134,7 +2134,7 @@ mod harness_noise_tests {
 /// `apply_projection_at` (aicx-problems 2026-10-13: the agent lane admitted
 /// nothing for any provider, and Codex agent runs never reached
 /// `shell_action` at all).
-#[cfg(test)]
+#[cfg(all(test, feature = "app"))]
 mod agent_command_lane_tests {
     use super::*;
     use aicx_parser::engine::{SourceArtifact, SourceFraming, SourceHandle};
