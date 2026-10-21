@@ -1891,6 +1891,7 @@ fn parse_catalog_source_checked(
         "junie" => aicx_parser::engine::AgentKind::Junie,
         "kimi" => aicx_parser::engine::AgentKind::Kimi,
         "copilot" => aicx_parser::engine::AgentKind::Copilot,
+        "omp" | "pi" | "oh-my-pi" => aicx_parser::engine::AgentKind::Omp,
         other => anyhow::bail!("unsupported catalog agent `{other}`"),
     };
     let parsed = crate::parser_dispatch::parse_file(

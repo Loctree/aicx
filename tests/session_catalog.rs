@@ -718,7 +718,7 @@ fn gemini_catalog_admits_only_conversations_under_chats() {
 
 #[test]
 fn agent_kind_exposes_session_roots_and_parser_kinds() {
-    assert_eq!(AgentKind::ALL.len(), 8);
+    assert_eq!(AgentKind::ALL.len(), 9);
     assert_eq!(AgentKind::parse("claude"), Some(AgentKind::Claude));
     assert_eq!(AgentKind::parse("cursor"), Some(AgentKind::Cursor));
     assert_eq!(AgentKind::parse("cursor-agent"), Some(AgentKind::Cursor));
@@ -756,4 +756,27 @@ fn agent_kind_exposes_session_roots_and_parser_kinds() {
         AgentKind::Cursor.parser_kind(),
         aicx::parser::engine::AgentKind::Cursor
     );
+    assert_eq!(AgentKind::parse("omp"), Some(AgentKind::Omp));
+    assert_eq!(AgentKind::parse("pi"), Some(AgentKind::Omp));
+    assert_eq!(AgentKind::parse("oh-my-pi"), Some(AgentKind::Omp));
+    assert_eq!(
+        AgentKind::Omp.parser_kind(),
+        aicx::parser::engine::AgentKind::Omp
+    );
+    assert_eq!(
+        AgentKind::Omp.session_root(home),
+        home.join(".omp").join("agent").join("sessions")
+    );
+    assert_eq!(
+        AgentKind::Omp.session_roots(home),
+        session_catalog::omp_session_roots(home)
+    );
+    assert_eq!(
+        session_catalog::omp_session_roots(home),
+        vec![
+            home.join(".omp").join("agent").join("sessions"),
+            session_catalog::pi_session_root(home),
+        ]
+    );
+    assert_eq!(AgentKind::Copilot.session_roots(home).len(), 1);
 }

@@ -37,10 +37,11 @@ pub enum AgentKind {
     Kimi,
     Cursor,
     Copilot,
+    Omp,
 }
 
 impl AgentKind {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::Claude,
         Self::Codex,
         Self::Gemini,
@@ -49,6 +50,7 @@ impl AgentKind {
         Self::Kimi,
         Self::Cursor,
         Self::Copilot,
+        Self::Omp,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -61,6 +63,7 @@ impl AgentKind {
             Self::Kimi => "kimi",
             Self::Cursor => "cursor",
             Self::Copilot => "copilot",
+            Self::Omp => "omp",
         }
     }
 
@@ -76,6 +79,7 @@ impl AgentKind {
             "copilot" | "copilot-cli" | "github-copilot" | "github-copilot-cli" => {
                 Some(Self::Copilot)
             }
+            "omp" | "pi" | "oh-my-pi" => Some(Self::Omp),
             _ => None,
         }
     }
@@ -91,6 +95,16 @@ impl AgentKind {
             Self::Kimi => home.join(".kimi-code").join("sessions"),
             Self::Cursor => home.join(".cursor").join("projects"),
             Self::Copilot => copilot_session_root(home),
+            Self::Omp => omp_session_root(home),
+        }
+    }
+
+    /// Every on-disk root this agent may write. Omp and upstream pi share one
+    /// catalog identity and two stores.
+    pub fn session_roots(self, home: &Path) -> Vec<PathBuf> {
+        match self {
+            Self::Omp => omp_session_roots(home),
+            other => vec![other.session_root(home)],
         }
     }
 
@@ -104,6 +118,7 @@ impl AgentKind {
             Self::Kimi => aicx_parser::engine::AgentKind::Kimi,
             Self::Cursor => aicx_parser::engine::AgentKind::Cursor,
             Self::Copilot => aicx_parser::engine::AgentKind::Copilot,
+            Self::Omp => aicx_parser::engine::AgentKind::Omp,
         }
     }
 
@@ -116,7 +131,8 @@ impl AgentKind {
             | Self::Grok
             | Self::Kimi
             | Self::Cursor
-            | Self::Copilot => extension == Some("jsonl"),
+            | Self::Copilot
+            | Self::Omp => extension == Some("jsonl"),
         }
     }
 
@@ -173,6 +189,10 @@ impl AgentKind {
                 .any(|dir| dir.file_name().and_then(|name| name.to_str()) == Some("chats")),
             Self::Kimi => path.file_name().and_then(|name| name.to_str()) == Some("wire.jsonl"),
             Self::Copilot => is_copilot_source_file(path),
+            // `<encoded-cwd>/<ISO-ts>_<uuid>.jsonl` directly under the sessions
+            // root. Nested tool logs live one directory deeper and are not
+            // sessions, the same way Cursor `agent-tools/` is not a transcript.
+            Self::Omp => is_omp_source_file(path),
             Self::Claude | Self::Codex | Self::Junie => true,
         }
     }
@@ -282,6 +302,39 @@ fn is_copilot_source_id(value: &str) -> bool {
     !value.starts_with('.')
         && !value.contains(':')
         && validate_identity(value).is_some_and(|id| id == value)
+}
+
+/// oh-my-pi sessions. Upstream pi uses the same layout under `~/.pi`.
+pub fn omp_session_root(home: &Path) -> PathBuf {
+    home.join(".omp").join("agent").join("sessions")
+}
+
+pub fn pi_session_root(home: &Path) -> PathBuf {
+    home.join(".pi").join("agent").join("sessions")
+}
+
+pub fn omp_session_roots(home: &Path) -> Vec<PathBuf> {
+    vec![omp_session_root(home), pi_session_root(home)]
+}
+
+/// A real omp/pi session is a JSONL whose stem ends in a UUID and whose
+/// ancestors are `<store>/.{omp,pi}/agent/sessions/<encoded-cwd>/<file>`.
+/// Tool-log JSONL nested inside `<ISO-ts>_<uuid>/` fails the `sessions`
+/// ancestor check.
+pub(crate) fn is_omp_source_file(path: &Path) -> bool {
+    let stem = path.file_stem().and_then(|stem| stem.to_str());
+    path.extension().and_then(|ext| ext.to_str()) == Some("jsonl")
+        && stem.is_some_and(|stem| uuid_from_filename(stem).is_some())
+        && ancestor_name(path, 2) == Some("sessions")
+        && ancestor_name(path, 3) == Some("agent")
+        && matches!(ancestor_name(path, 4), Some(".omp" | ".pi"))
+}
+
+fn ancestor_name(path: &Path, nth: usize) -> Option<&str> {
+    path.ancestors()
+        .nth(nth)
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
 }
 
 /// Metadata fingerprint of the finite source bundle. Copilot's optional
@@ -810,7 +863,7 @@ impl SessionCatalog {
         for path in paths {
             let fingerprint = match source_bundle_fingerprint(&path) {
                 Ok(fingerprint) => fingerprint,
-                Err(error) if self.agent == AgentKind::Copilot => {
+                Err(error) if matches!(self.agent, AgentKind::Copilot | AgentKind::Omp) => {
                     return Err(CatalogError::Io {
                         path,
                         message: error.to_string(),
@@ -971,7 +1024,9 @@ impl SessionCatalog {
         for candidate in candidates {
             match self.probe_candidate(candidate, stats) {
                 Ok(Some(source)) => sources.push(source),
-                Err(error @ CatalogError::Io { .. }) if self.agent == AgentKind::Copilot => {
+                Err(error @ CatalogError::Io { .. })
+                    if matches!(self.agent, AgentKind::Copilot | AgentKind::Omp) =>
+                {
                     return Err(error);
                 }
                 Ok(None) | Err(CatalogError::Io { .. }) => stats.rejected_paths += 1,
@@ -1214,6 +1269,21 @@ fn observe_record(
             && let Some(id) = object
                 .get("data")
                 .and_then(|data| data.get("sessionId"))
+                .and_then(Value::as_str)
+                .and_then(validate_identity)
+        {
+            root_ids.push(id);
+        }
+        return;
+    }
+
+    if agent == AgentKind::Omp {
+        // Message ids are tree nodes inside one file. Only the session header
+        // asserts the logical root. A generic `id` read would adopt the first
+        // message id and split one transcript into a child.
+        if object.get("type").and_then(Value::as_str) == Some("session")
+            && let Some(id) = object
+                .get("id")
                 .and_then(Value::as_str)
                 .and_then(validate_identity)
         {

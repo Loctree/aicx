@@ -1666,6 +1666,245 @@ pub(crate) fn scan_copilot_session_file(path: &Path, session_id: &str) -> Option
     })
 }
 
+/// Discover oh-my-pi and upstream pi session files under one sessions root.
+/// Nested tool-log directories are not sessions; the catalog admits only
+/// direct `<encoded-cwd>/<timestamp>_<uuid>.jsonl` files.
+pub fn discover_omp_sessions(
+    sessions_root: &Path,
+    modified_after: Option<SystemTime>,
+    cwd_filter: Option<&str>,
+) -> Vec<SessionInfo> {
+    use crate::session_catalog::{AgentKind, SessionCatalog};
+    match sessions_root.try_exists() {
+        Ok(false) => return Vec::new(),
+        Ok(true) => {}
+        Err(error) => {
+            eprintln!(
+                "aicx: sessions: cannot inspect omp root {}: {error}",
+                sessions_root.display()
+            );
+            return Vec::new();
+        }
+    }
+    let sources = match SessionCatalog::new(AgentKind::Omp, sessions_root)
+        .and_then(|catalog| catalog.scan_with_stats().result)
+    {
+        Ok(sources) => sources,
+        Err(error) => {
+            eprintln!("aicx: sessions: omp source discovery failed: {error}");
+            return Vec::new();
+        }
+    };
+    let cutoff = modified_after
+        .and_then(|time| time.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos());
+    let mut out = Vec::new();
+    for source in sources {
+        if cutoff.is_some_and(|cutoff| source.fingerprint.modified_unix_nanos < cutoff) {
+            continue;
+        }
+        match scan_omp_session_file(&source.path, &source.source_id) {
+            Some(info)
+                if cwd_filter.is_none_or(|want| {
+                    info.repo_path
+                        .as_deref()
+                        .is_some_and(|cwd| cwd_nests(want, cwd))
+                }) =>
+            {
+                out.push(info)
+            }
+            Some(_) => {}
+            None => eprintln!(
+                "aicx: sessions: unreadable omp source {}",
+                source.path.display()
+            ),
+        }
+    }
+    out
+}
+
+const OMP_DISPATCH_HEADS: &[&str] = &[
+    "You are running under Vibecrafted core runtime.",
+    "Read and follow the private task file: ",
+];
+
+/// Bounded session list metadata. Human rows follow the parser rule: a user
+/// message is speech only when omp would treat it as typed by a person.
+pub(crate) fn scan_omp_session_file(path: &Path, session_id: &str) -> Option<SessionInfo> {
+    let file = crate::sanitize::open_file_validated(path).ok()?;
+    let mut reader = BufReader::new(file);
+    let parse_timestamp = |raw: &str| {
+        DateTime::parse_from_rfc3339(raw)
+            .ok()
+            .map(|time| time.with_timezone(&Utc))
+    };
+    let mut cwd = None;
+    let mut title = None;
+    let mut started_at = None;
+    let mut updated_at = None;
+    let mut user_message_count = 0usize;
+    let mut agent_message_count = 0usize;
+    let mut saw_parsable_line = false;
+    while let Some(line) =
+        crate::sanitize::read_line_capped(&mut reader, crate::extraction::MAX_LINE_BYTES).ok()?
+    {
+        if line.exceeded {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line.line.trim()) else {
+            continue;
+        };
+        saw_parsable_line = true;
+        if let Some(timestamp) = value
+            .get("timestamp")
+            .and_then(|value| value.as_str())
+            .and_then(parse_timestamp)
+        {
+            started_at =
+                Some(started_at.map_or(timestamp, |current: DateTime<Utc>| current.min(timestamp)));
+            updated_at =
+                Some(updated_at.map_or(timestamp, |current: DateTime<Utc>| current.max(timestamp)));
+        }
+        match value.get("type").and_then(|value| value.as_str()) {
+            Some("title") => {
+                if title.is_none()
+                    && let Some(text) = value
+                        .get("title")
+                        .and_then(|value| value.as_str())
+                        .map(str::trim)
+                        .filter(|text| !text.is_empty())
+                {
+                    title = Some(short_title(text));
+                }
+            }
+            Some("session") => {
+                if let Some(path) = value
+                    .get("cwd")
+                    .and_then(|value| value.as_str())
+                    .map(str::trim)
+                    .filter(|path| !path.is_empty())
+                {
+                    cwd = Some(path.to_owned());
+                }
+                if let Some(timestamp) = value
+                    .get("timestamp")
+                    .and_then(|value| value.as_str())
+                    .and_then(parse_timestamp)
+                {
+                    started_at = Some(
+                        started_at
+                            .map_or(timestamp, |current: DateTime<Utc>| current.min(timestamp)),
+                    );
+                }
+            }
+            Some("message") => {
+                let Some(message) = value.get("message") else {
+                    continue;
+                };
+                let content =
+                    omp_message_text(message.get("content").unwrap_or(&serde_json::Value::Null));
+                let trimmed = content.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                match message.get("role").and_then(|value| value.as_str()) {
+                    Some("user") if omp_user_is_human(message, trimmed) => {
+                        user_message_count += 1;
+                        if title.is_none() {
+                            title = Some(short_title(trimmed));
+                        }
+                    }
+                    Some("assistant") if omp_assistant_has_text(message) => {
+                        agent_message_count += 1;
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+    let project = cwd.as_deref().and_then(project_label_from_cwd);
+    let association = if cwd.is_some() {
+        Association::Exact
+    } else {
+        Association::Unknown
+    };
+    let temporal_confidence = if started_at.is_some() {
+        TemporalConfidence::Full
+    } else if saw_parsable_line {
+        TemporalConfidence::Partial
+    } else {
+        TemporalConfidence::None
+    };
+    Some(SessionInfo {
+        session_id: session_id.to_owned(),
+        agent: "omp".to_owned(),
+        project,
+        repo_path: cwd,
+        started_at,
+        updated_at,
+        message_count: user_message_count + agent_message_count,
+        user_message_count,
+        agent_message_count,
+        title,
+        source_path: path.to_path_buf(),
+        association,
+        temporal_confidence,
+        session_kind: None,
+    })
+}
+
+fn omp_message_text(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::Array(items) => items
+            .iter()
+            .filter_map(|item| {
+                item.get("text")
+                    .and_then(|text| text.as_str())
+                    .map(str::to_owned)
+                    .or_else(|| item.as_str().map(str::to_owned))
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
+fn omp_user_is_human(message: &serde_json::Value, content: &str) -> bool {
+    let attribution = message.get("attribution").and_then(|value| value.as_str());
+    let synthetic = message
+        .get("synthetic")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    let steering = message
+        .get("steering")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+        || message
+            .get("liveSteered")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+    let dispatch = OMP_DISPATCH_HEADS
+        .iter()
+        .any(|marker| content.trim_start().starts_with(marker));
+    matches!(attribution, None | Some("user")) && !synthetic && !steering && !dispatch
+}
+
+fn omp_assistant_has_text(message: &serde_json::Value) -> bool {
+    match message.get("content") {
+        Some(serde_json::Value::String(text)) => !text.trim().is_empty(),
+        Some(serde_json::Value::Array(items)) => items.iter().any(|item| {
+            item.get("type").and_then(|value| value.as_str()) == Some("text")
+                && item
+                    .get("text")
+                    .and_then(|value| value.as_str())
+                    .is_some_and(|text| !text.trim().is_empty())
+        }),
+        _ => false,
+    }
+}
+
 const KIMI_WIRE_FILENAME: &str = "wire.jsonl";
 
 /// Discover Kimi Code CLI sessions under a sessions root
@@ -2368,6 +2607,14 @@ pub fn discover_sessions_at(
             cwd_filter,
         ));
     }
+    if agent.is_none_or(|raw| {
+        crate::session_catalog::AgentKind::parse(raw)
+            == Some(crate::session_catalog::AgentKind::Omp)
+    }) {
+        for root in crate::session_catalog::omp_session_roots(home) {
+            discovered.extend(discover_omp_sessions(&root, modified_after, cwd_filter));
+        }
+    }
     discovered
 }
 
@@ -2638,6 +2885,32 @@ pub fn find_session_by_id(home: &Path, id: &str) -> Option<SessionInfo> {
             }
             Err(crate::session_catalog::CatalogError::Missing { .. }) => {}
             Err(error) => eprintln!("aicx: session: copilot lookup failed: {error}"),
+        }
+    }
+
+    for omp_root in crate::session_catalog::omp_session_roots(home) {
+        match omp_root.try_exists() {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(error) => {
+                eprintln!(
+                    "aicx: session: cannot inspect omp root {}: {error}",
+                    omp_root.display()
+                );
+                continue;
+            }
+        }
+        match crate::session_catalog::SessionCatalog::new(
+            crate::session_catalog::AgentKind::Omp,
+            &omp_root,
+        )
+        .and_then(|catalog| catalog.resolve(id))
+        {
+            Ok(resolved) => {
+                return scan_omp_session_file(&resolved.source.path, &resolved.source.source_id);
+            }
+            Err(crate::session_catalog::CatalogError::Missing { .. }) => {}
+            Err(error) => eprintln!("aicx: session: omp lookup failed: {error}"),
         }
     }
     None

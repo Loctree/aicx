@@ -664,38 +664,37 @@ fn live_delta_uncached(home: &Path, user_home: &Path, cutoff_unix_ns: u128) -> R
         AgentKind::Junie,
         AgentKind::Kimi,
         AgentKind::Copilot,
+        AgentKind::Omp,
     ];
     for agent in agents {
-        let root = agent_source_root(agent, user_home);
-        if !(if agent == AgentKind::Copilot {
-            root.try_exists()
-                .with_context(|| format!("inspect copilot root {}", root.display()))?
-        } else {
-            root.exists()
-        }) {
-            continue;
-        }
-        let catalog = match SessionCatalog::new(agent, &root) {
-            Ok(catalog) => catalog,
-            Err(error) if agent == AgentKind::Copilot => return Err(error.into()),
-            Err(_) => continue,
-        };
-        let scan = match catalog.scan_hot_window_skipping(cutoff_unix_ns, &is_known) {
-            Ok(scan) => scan,
-            Err(error) if agent == AgentKind::Copilot => return Err(error.into()),
-            Err(_) => continue,
-        };
-        live_sessions += scan.total_candidates;
-        if let Some(newest) = scan.newest_modified_unix_nanos {
-            let newest = newest.min(u64::MAX as u128) as u64;
-            newest_live_mtime_ns = Some(newest_live_mtime_ns.map_or(newest, |max| max.max(newest)));
-        }
-        for source in scan.fresh_sources {
-            if !is_primary_catalog_source(agent, &source.path) {
-                continue;
+        for root in present_agent_roots(agent, user_home)? {
+            let catalog = match SessionCatalog::new(agent, &root) {
+                Ok(catalog) => catalog,
+                Err(error) if matches!(agent, AgentKind::Copilot | AgentKind::Omp) => {
+                    return Err(error.into());
+                }
+                Err(_) => continue,
+            };
+            let scan = match catalog.scan_hot_window_skipping(cutoff_unix_ns, &is_known) {
+                Ok(scan) => scan,
+                Err(error) if matches!(agent, AgentKind::Copilot | AgentKind::Omp) => {
+                    return Err(error.into());
+                }
+                Err(_) => continue,
+            };
+            live_sessions += scan.total_candidates;
+            if let Some(newest) = scan.newest_modified_unix_nanos {
+                let newest = newest.min(u64::MAX as u128) as u64;
+                newest_live_mtime_ns =
+                    Some(newest_live_mtime_ns.map_or(newest, |max| max.max(newest)));
             }
-            let entry = entry_from_source(agent, &source);
-            fresh.insert((entry.agent.clone(), entry.session_id.clone()), entry);
+            for source in scan.fresh_sources {
+                if !is_primary_catalog_source(agent, &source.path) {
+                    continue;
+                }
+                let entry = entry_from_source(agent, &source);
+                fresh.insert((entry.agent.clone(), entry.session_id.clone()), entry);
+            }
         }
     }
     // Runtime-run transcripts are a bounded tree — the vibecrafted lane of
@@ -871,6 +870,7 @@ fn scan_live_entries_with_progress(
         AgentKind::Junie,
         AgentKind::Kimi,
         AgentKind::Copilot,
+        AgentKind::Omp,
     ];
     for (agent_offset, agent) in agents.into_iter().enumerate() {
         progress.stage = RebuildStage::ScanningSources;
@@ -880,42 +880,39 @@ fn scan_live_entries_with_progress(
         progress.elapsed_ms = started.elapsed().as_millis() as u64;
         on_progress(&progress);
 
-        let root = agent_source_root(agent, user_home);
-        if !(if agent == AgentKind::Copilot {
-            root.try_exists()
-                .with_context(|| format!("inspect copilot root {}", root.display()))?
-        } else {
-            root.exists()
-        }) {
-            continue;
-        }
-        let catalog = match SessionCatalog::new(agent, &root) {
-            Ok(c) => c,
-            Err(error) if agent == AgentKind::Copilot => return Err(error.into()),
-            Err(_) => continue,
-        };
-        let scan = catalog.scan_with_stats_and_progress(|io| {
-            progress.io = io.clone();
+        for root in present_agent_roots(agent, user_home)? {
+            let catalog = match SessionCatalog::new(agent, &root) {
+                Ok(c) => c,
+                Err(error) if matches!(agent, AgentKind::Copilot | AgentKind::Omp) => {
+                    return Err(error.into());
+                }
+                Err(_) => continue,
+            };
+            let scan = catalog.scan_with_stats_and_progress(|io| {
+                progress.io = io.clone();
+                progress.sessions = by_id.len();
+                progress.elapsed_ms = started.elapsed().as_millis() as u64;
+                on_progress(&progress);
+            });
+            let sources = match scan.result {
+                Ok(s) => s,
+                Err(error) if matches!(agent, AgentKind::Copilot | AgentKind::Omp) => {
+                    return Err(error.into());
+                }
+                Err(_) => continue,
+            };
+            for source in sources {
+                if !is_primary_catalog_source(agent, &source.path) {
+                    continue;
+                }
+                let entry = entry_from_source(agent, &source);
+                by_id.insert((entry.agent.clone(), entry.session_id.clone()), entry);
+            }
+            progress.io = scan.stats;
             progress.sessions = by_id.len();
             progress.elapsed_ms = started.elapsed().as_millis() as u64;
             on_progress(&progress);
-        });
-        let sources = match scan.result {
-            Ok(s) => s,
-            Err(error) if agent == AgentKind::Copilot => return Err(error.into()),
-            Err(_) => continue,
-        };
-        for source in sources {
-            if !is_primary_catalog_source(agent, &source.path) {
-                continue;
-            }
-            let entry = entry_from_source(agent, &source);
-            by_id.insert((entry.agent.clone(), entry.session_id.clone()), entry);
         }
-        progress.io = scan.stats;
-        progress.sessions = by_id.len();
-        progress.elapsed_ms = started.elapsed().as_millis() as u64;
-        on_progress(&progress);
     }
 
     progress.stage = RebuildStage::EnrichingSessions;
@@ -1167,7 +1164,33 @@ fn agent_source_root(agent: AgentKind, user_home: &Path) -> PathBuf {
         AgentKind::Junie => user_home.join(".junie").join("sessions"),
         AgentKind::Kimi => user_home.join(".kimi-code").join("sessions"),
         AgentKind::Copilot => session_catalog::copilot_session_root(user_home),
+        AgentKind::Omp => session_catalog::omp_session_root(user_home),
     }
+}
+
+fn agent_source_roots(agent: AgentKind, user_home: &Path) -> Vec<PathBuf> {
+    if agent == AgentKind::Omp {
+        session_catalog::omp_session_roots(user_home)
+    } else {
+        vec![agent_source_root(agent, user_home)]
+    }
+}
+
+/// Missing stores are skipped. Copilot and omp permission errors stay visible.
+fn present_agent_roots(agent: AgentKind, user_home: &Path) -> Result<Vec<PathBuf>> {
+    let mut present = Vec::new();
+    for root in agent_source_roots(agent, user_home) {
+        let exists = if matches!(agent, AgentKind::Copilot | AgentKind::Omp) {
+            root.try_exists()
+                .with_context(|| format!("inspect {agent} root {}", root.display()))?
+        } else {
+            root.exists()
+        };
+        if exists {
+            present.push(root);
+        }
+    }
+    Ok(present)
 }
 
 fn is_primary_catalog_source(agent: AgentKind, path: &Path) -> bool {
@@ -1193,6 +1216,7 @@ fn is_primary_catalog_source(agent: AgentKind, path: &Path) -> bool {
                 && stem.is_some_and(is_uuid)
         }
         AgentKind::Copilot => session_catalog::is_copilot_source_file(path),
+        AgentKind::Omp => session_catalog::is_omp_source_file(path),
         _ => true,
     }
 }
@@ -1201,9 +1225,13 @@ fn entry_from_source(agent: AgentKind, source: &CatalogSource) -> CatalogEntry {
     // Only selected sources are enriched. Reading a changed Copilot stream
     // through EOF is necessary because session.resume may occur well beyond
     // the catalog's bounded identity header and move the working repository.
-    let copilot = (agent == AgentKind::Copilot)
-        .then(|| crate::sessions::scan_copilot_session_file(&source.path, &source.source_id))
-        .flatten();
+    let copilot = match agent {
+        AgentKind::Copilot => {
+            crate::sessions::scan_copilot_session_file(&source.path, &source.source_id)
+        }
+        AgentKind::Omp => crate::sessions::scan_omp_session_file(&source.path, &source.source_id),
+        _ => None,
+    };
     let session_id = if agent == AgentKind::Grok {
         grok_session_id_from_path(&source.path).unwrap_or_else(|| source.source_id.clone())
     } else {

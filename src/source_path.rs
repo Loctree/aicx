@@ -13,6 +13,8 @@
 //! - `~/.junie/sessions`
 //! - `~/.kimi-code/sessions`
 //! - `~/.copilot/session-state`
+//! - `~/.omp/agent/sessions`
+//! - `~/.pi/agent/sessions`
 //! - `~/.vibecrafted/control_plane/runtime_runs`
 //! - `~/.codescribe/agent-bridge/buses` (Codescribe Transcript Bus ledgers)
 //! - `~/.codescribe/transcriptions` (Codescribe dictated takes)
@@ -37,6 +39,8 @@ pub const DEFAULT_SOURCE_ROOT_RELATIVE: &[&str] = &[
     ".junie/sessions",
     ".kimi-code/sessions",
     ".copilot/session-state",
+    ".omp/agent/sessions",
+    ".pi/agent/sessions",
     ".vibecrafted/control_plane/runtime_runs",
     // `importers::codescribe_bus::BUS_ROOT_RELATIVE`; a test pins the two.
     ".codescribe/agent-bridge/buses",
@@ -302,6 +306,35 @@ mod tests {
         let allow = SourceAllowlist::for_operator(&root, &aicx);
         assert!(allow.resolve_file(events).is_ok());
         assert!(allow.resolve_file(telemetry).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn omp_and_pi_session_stores_are_allowed_and_sibling_trees_are_not() {
+        let root = test_dir("omp");
+        let aicx = root.join(".aicx");
+        let omp = root.join(".omp/agent/sessions/encoded/2026-10-21T12-00-00-000Z_01999999-aaaa-7666-8666-111111111111.jsonl");
+        fs::create_dir_all(omp.parent().unwrap()).unwrap();
+        fs::write(&omp, b"{}\n").unwrap();
+        // Tool logs live beside the session file, still inside the store.
+        // Catalog admission, not this allowlist, refuses them as sessions.
+        let nested = omp
+            .parent()
+            .unwrap()
+            .join("2026-10-21T12-00-00-000Z_01999999-aaaa-7666-8666-111111111111/1.bash.log");
+        fs::create_dir_all(nested.parent().unwrap()).unwrap();
+        fs::write(&nested, b"log\n").unwrap();
+        let outside = root.join(".omp/agent/logs/not-a-session.jsonl");
+        fs::create_dir_all(outside.parent().unwrap()).unwrap();
+        fs::write(&outside, b"{}\n").unwrap();
+        let pi = root.join(".pi/agent/sessions/encoded/2026-10-21T12-00-00-000Z_01999999-aaaa-7666-8666-222222222222.jsonl");
+        fs::create_dir_all(pi.parent().unwrap()).unwrap();
+        fs::write(&pi, b"{}\n").unwrap();
+        let allow = SourceAllowlist::for_operator(&root, &aicx);
+        assert!(allow.resolve_file(&omp).is_ok());
+        assert!(allow.resolve_file(&pi).is_ok());
+        assert!(allow.resolve_file(&nested).is_ok());
+        assert!(allow.resolve_file(&outside).is_err());
         let _ = fs::remove_dir_all(root);
     }
 
