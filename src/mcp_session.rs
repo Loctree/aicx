@@ -421,11 +421,11 @@ fn parse_optional_agent(agent: Option<&str>) -> Result<Option<AgentKind>, Sessio
             SessionSurfaceError::invalid(
                 "invalid_agent",
                 format!(
-                    "unknown agent `{value}`; expected claude, codex, gemini, junie, grok, kimi, cursor, or copilot"
+                    "unknown agent `{value}`; expected claude, codex, gemini, junie, grok, kimi, cursor, copilot, or omp"
                 ),
                 json!({
                     "agent": value,
-                    "expected": ["claude", "codex", "gemini", "junie", "grok", "kimi", "cursor", "copilot"],
+                    "expected": ["claude", "codex", "gemini", "junie", "grok", "kimi", "cursor", "copilot", "omp", "pi", "oh-my-pi"],
                 }),
             )
         }),
@@ -692,55 +692,63 @@ fn resolve_session_across_agents(
     let mut scanned = 0usize;
     let mut last_missing: Option<(AgentKind, CatalogError)> = None;
     for agent in agents {
-        let root = agent.session_root(user_home);
-        if agent == AgentKind::Copilot {
-            match root.try_exists() {
-                Ok(false) => continue,
-                Ok(true) => {}
+        let mut agent_hit = None;
+        for root in agent.session_roots(user_home) {
+            if matches!(agent, AgentKind::Copilot | AgentKind::Omp) {
+                match root.try_exists() {
+                    Ok(false) => continue,
+                    Ok(true) => {}
+                    Err(error) => {
+                        return Err(catalog_error(
+                            agent,
+                            CatalogError::Io {
+                                path: root,
+                                message: error.to_string(),
+                            },
+                            scanned,
+                        ));
+                    }
+                }
+            } else if !root.is_dir() {
+                continue;
+            }
+            let catalog = session_catalog::SessionCatalog::new(agent, &root)
+                .map_err(|error| catalog_error(agent, error, scanned))?;
+            let lookup = catalog.resolve_with_stats(query);
+            scanned += lookup.stats.metadata_candidates;
+            match lookup.result {
+                Ok(resolved) => {
+                    agent_hit = Some((agent, resolved, lookup.stats));
+                    break;
+                }
+                Err(CatalogError::Missing { .. }) => {
+                    last_missing = Some((
+                        agent,
+                        CatalogError::Missing {
+                            query: query.to_string(),
+                            agent,
+                            candidates_scanned: lookup.stats.metadata_candidates,
+                        },
+                    ));
+                }
+                Err(CatalogError::Ambiguous { query, candidates }) => {
+                    return Err(catalog_error(
+                        agent,
+                        CatalogError::Ambiguous { query, candidates },
+                        lookup.stats.metadata_candidates,
+                    ));
+                }
                 Err(error) => {
                     return Err(catalog_error(
                         agent,
-                        CatalogError::Io {
-                            path: root,
-                            message: error.to_string(),
-                        },
-                        0,
+                        error,
+                        lookup.stats.metadata_candidates,
                     ));
                 }
             }
-        } else if !root.is_dir() {
-            continue;
         }
-        let catalog = session_catalog::SessionCatalog::new(agent, &root)
-            .map_err(|error| catalog_error(agent, error, 0))?;
-        let lookup = catalog.resolve_with_stats(query);
-        scanned += lookup.stats.metadata_candidates;
-        match lookup.result {
-            Ok(resolved) => hits.push((agent, resolved, lookup.stats)),
-            Err(CatalogError::Missing { .. }) => {
-                last_missing = Some((
-                    agent,
-                    CatalogError::Missing {
-                        query: query.to_string(),
-                        agent,
-                        candidates_scanned: lookup.stats.metadata_candidates,
-                    },
-                ));
-            }
-            Err(CatalogError::Ambiguous { query, candidates }) => {
-                return Err(catalog_error(
-                    agent,
-                    CatalogError::Ambiguous { query, candidates },
-                    lookup.stats.metadata_candidates,
-                ));
-            }
-            Err(error) => {
-                return Err(catalog_error(
-                    agent,
-                    error,
-                    lookup.stats.metadata_candidates,
-                ));
-            }
+        if let Some(hit) = agent_hit {
+            hits.push(hit);
         }
     }
     match hits.len() {
@@ -854,19 +862,24 @@ fn session_info_for_resolved(agent: AgentKind, resolved: &ResolvedSource) -> Ses
 }
 
 fn guess_user_home(source: &Path, agent: AgentKind) -> PathBuf {
-    let marker = match agent {
-        AgentKind::Claude => ".claude",
-        AgentKind::Codex => ".codex",
-        AgentKind::Cursor => ".cursor",
-        AgentKind::Gemini => ".gemini",
-        AgentKind::Grok => ".grok",
-        AgentKind::Junie => ".junie",
-        AgentKind::Kimi => ".kimi-code",
-        AgentKind::Copilot => ".copilot",
+    let markers: &[&str] = match agent {
+        AgentKind::Claude => &[".claude"],
+        AgentKind::Codex => &[".codex"],
+        AgentKind::Cursor => &[".cursor"],
+        AgentKind::Gemini => &[".gemini"],
+        AgentKind::Grok => &[".grok"],
+        AgentKind::Junie => &[".junie"],
+        AgentKind::Kimi => &[".kimi-code"],
+        AgentKind::Copilot => &[".copilot"],
+        AgentKind::Omp => &[".omp", ".pi"],
     };
     let mut current = source;
     while let Some(parent) = current.parent() {
-        if current.file_name().and_then(|name| name.to_str()) == Some(marker) {
+        if current
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| markers.contains(&name))
+        {
             return parent.to_path_buf();
         }
         current = parent;

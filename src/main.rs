@@ -176,6 +176,7 @@ enum ExtractAgent {
     Junie,
     Kimi,
     Copilot,
+    Omp,
 }
 
 impl ExtractAgent {
@@ -189,6 +190,7 @@ impl ExtractAgent {
             Self::Junie => "junie",
             Self::Kimi => "kimi",
             Self::Copilot => "copilot",
+            Self::Omp => "omp",
         }
     }
 
@@ -202,6 +204,7 @@ impl ExtractAgent {
             Self::Junie => aicx::session_catalog::AgentKind::Junie,
             Self::Kimi => aicx::session_catalog::AgentKind::Kimi,
             Self::Copilot => aicx::session_catalog::AgentKind::Copilot,
+            Self::Omp => aicx::session_catalog::AgentKind::Omp,
         }
     }
 
@@ -215,6 +218,7 @@ impl ExtractAgent {
             Self::Junie => aicx::parser::engine::AgentKind::Junie,
             Self::Kimi => aicx::parser::engine::AgentKind::Kimi,
             Self::Copilot => aicx::parser::engine::AgentKind::Copilot,
+            Self::Omp => aicx::parser::engine::AgentKind::Omp,
         }
     }
 
@@ -232,6 +236,15 @@ impl ExtractAgent {
             Self::Junie => home.join(".junie").join("sessions"),
             Self::Kimi => home.join(".kimi-code").join("sessions"),
             Self::Copilot => aicx::session_catalog::copilot_session_root(home),
+            Self::Omp => aicx::session_catalog::omp_session_root(home),
+        }
+    }
+
+    /// Every on-disk store this agent may occupy. omp also reads upstream pi.
+    fn session_roots(self, home: &Path) -> Vec<PathBuf> {
+        match self {
+            Self::Omp => aicx::session_catalog::omp_session_roots(home),
+            other => vec![other.session_root(home)],
         }
     }
 
@@ -247,6 +260,7 @@ impl ExtractAgent {
             "copilot" | "copilot-cli" | "github-copilot" | "github-copilot-cli" => {
                 Some(Self::Copilot)
             }
+            "omp" | "pi" | "oh-my-pi" => Some(Self::Omp),
             _ => None,
         }
     }
@@ -271,6 +285,9 @@ enum ExtractTarget {
     /// GitHub Copilot CLI sessions (~/.copilot/session-state)
     #[command(aliases = ["copilot-cli", "github-copilot", "github-copilot-cli"])]
     Copilot(ExtractAgentArgs),
+    /// oh-my-pi / pi sessions (~/.omp/agent/sessions and ~/.pi/agent/sessions)
+    #[command(aliases = ["pi", "oh-my-pi"])]
+    Omp(ExtractAgentArgs),
     /// Every compatible source on this machine, in one incremental pass.
     All(ExtractAllArgs),
 }
@@ -286,6 +303,7 @@ impl ExtractTarget {
             Self::Junie(args) => (ExtractAgent::Junie, args),
             Self::Kimi(args) => (ExtractAgent::Kimi, args),
             Self::Copilot(args) => (ExtractAgent::Copilot, args),
+            Self::Omp(args) => (ExtractAgent::Omp, args),
             Self::All(_) => unreachable!("`extract all` is dispatched before split()"),
         }
     }
@@ -560,8 +578,8 @@ enum SessionsCommand {
         #[arg(short, long, value_delimiter = ',')]
         project: Vec<String>,
 
-        /// Filter by agent (claude | codex | gemini | junie | grok | kimi | cursor | copilot).
-        #[arg(long, value_parser = ["claude", "codex", "gemini", "junie", "grok", "kimi", "cursor", "cursor-agent", "copilot", "copilot-cli", "github-copilot", "github-copilot-cli"])]
+        /// Filter by agent (claude | codex | gemini | junie | grok | kimi | cursor | copilot | omp).
+        #[arg(long, value_parser = ["claude", "codex", "gemini", "junie", "grok", "kimi", "cursor", "cursor-agent", "copilot", "copilot-cli", "github-copilot", "github-copilot-cli", "omp", "pi", "oh-my-pi"])]
         agent: Option<String>,
 
         /// Only sessions updated on/after this date (YYYY-MM-DD). Defaults to the
@@ -608,7 +626,7 @@ enum SessionsCommand {
         /// Session id (or a unique prefix).
         session_id: String,
 
-        /// Agent: claude | codex | gemini | junie | grok | kimi | cursor | copilot. Inferred from the session
+        /// Agent: claude | codex | gemini | junie | grok | kimi | cursor | copilot | omp. Inferred from the session
         /// id when omitted.
         #[arg(long)]
         agent: Option<String>,
@@ -639,7 +657,7 @@ enum ClaimsCommand {
         #[arg(long)]
         session: String,
 
-        /// Agent: claude | codex | gemini | junie | grok | kimi | cursor | copilot. Inferred from the session id
+        /// Agent: claude | codex | gemini | junie | grok | kimi | cursor | copilot | omp. Inferred from the session id
         /// when omitted.
         #[arg(long)]
         agent: Option<String>,
@@ -663,7 +681,7 @@ enum ResultsCommand {
         #[arg(long)]
         session: String,
 
-        /// Agent: claude | codex | gemini | junie | grok | kimi | cursor | copilot. Inferred from the session id
+        /// Agent: claude | codex | gemini | junie | grok | kimi | cursor | copilot | omp. Inferred from the session id
         /// when omitted.
         #[arg(long)]
         agent: Option<String>,
@@ -727,7 +745,7 @@ struct RetrievalFilters {
     #[arg(long)]
     score: Option<u8>,
 
-    /// Agent name filter: claude | codex | gemini | junie | grok | kimi | cursor | copilot | codescribe.
+    /// Agent name filter: claude | codex | gemini | junie | grok | kimi | cursor | copilot | omp | codescribe.
     #[arg(long)]
     agent: Option<String>,
 
@@ -1399,8 +1417,8 @@ enum Commands {
     ///
     /// Canonical grammar (the target is a required subcommand):
     ///   aicx extract all [-p PROJECT]... [-H HOURS] [--provider NAME]... [--rebuild]
-    ///   aicx extract {codex|claude|cursor|gemini|grok|junie|kimi|copilot} --session <id> [--conversation] [-o FILE]
-    ///   aicx extract {codex|claude|cursor|gemini|grok|junie|kimi|copilot} --file <path> --conversation -o <path>
+    ///   aicx extract {codex|claude|cursor|gemini|grok|junie|kimi|copilot|omp} --session <id> [--conversation] [-o FILE]
+    ///   aicx extract {codex|claude|cursor|gemini|grok|junie|kimi|copilot|omp} --file <path> --conversation -o <path>
     ///
     /// `all` walks every registered agent, projects each session through the
     /// same filters, and writes a run manifest under
@@ -1507,7 +1525,7 @@ enum Commands {
 
     /// Rebuild the durable extract-era session catalog (no per-frame cards).
     ///
-    /// Walks live agent source roots (claude/codex/cursor/gemini/grok/junie/kimi/copilot +
+    /// Walks live agent source roots (claude/codex/cursor/gemini/grok/junie/kimi/copilot/omp +
     /// vibecrafted runtime_runs) and writes `~/.aicx/catalog/sessions.jsonl`.
     /// Does not materialize card files under `~/.aicx/store/`.
     ///
@@ -1564,7 +1582,7 @@ enum Commands {
     /// List raw agent session sources on disk (pre-extraction inputs).
     ///
     /// Shows Claude Code, Codex, Gemini, Junie, and Grok log paths, plus Cursor,
-    /// Kimi and GitHub Copilot CLI, with session
+    /// Kimi, GitHub Copilot CLI, and oh-my-pi / pi, with session
     /// counts and sizes. This is what extractors will read from — use
     /// `catalog resolve` / `extract` to inspect identity and readable transcripts.
     #[command(hide = true, display_order = 10)]
@@ -1605,7 +1623,7 @@ enum Commands {
         #[arg(long)]
         session: String,
 
-        /// Agent: claude | codex | gemini | junie | grok | kimi | cursor | copilot. Inferred from the session id
+        /// Agent: claude | codex | gemini | junie | grok | kimi | cursor | copilot | omp. Inferred from the session id
         /// when omitted.
         #[arg(long)]
         agent: Option<String>,
@@ -2836,6 +2854,7 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
                     "kimi",
                     "cursor",
                     "copilot",
+                    "omp",
                     "codescribe",
                 ],
                 project,
@@ -2957,7 +2976,7 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
                     json,
                     aicx::cli::failure::StructuredFailure::new(
                         "missing_agent_subcommand",
-                        "extract requires a target: all | codex | claude | cursor | gemini | grok | junie | kimi | copilot",
+                        "extract requires a target: all | codex | claude | cursor | gemini | grok | junie | kimi | copilot | omp",
                         "rerun as `aicx extract all`, `aicx extract codex --session <id> --conversation`, or `aicx extract codex --file <path> --conversation -o <path>`",
                     )
                     .with_fallback("aicx extract all"),
@@ -3919,14 +3938,12 @@ fn load_session_claims(
             .context("could not infer agent from session id; pass --agent")?,
     };
     let extract_agent = ExtractAgent::from_str(&agent_str).with_context(|| {
-        format!("unknown agent '{agent_str}' (claude|codex|cursor|gemini|junie|grok|kimi|copilot)")
+        format!(
+            "unknown agent '{agent_str}' (claude|codex|cursor|gemini|junie|grok|kimi|copilot|omp)"
+        )
     })?;
 
-    let root = extract_agent.session_root(&home);
-    let catalog = aicx::session_catalog::SessionCatalog::new(extract_agent.catalog_kind(), &root)
-        .map_err(|error| anyhow::anyhow!("{error}"))?;
-    let resolved = catalog
-        .resolve(session)
+    let (_catalog, resolved, _stats) = resolve_extract_session(extract_agent, &home, session)
         .map_err(|error| anyhow::anyhow!("{error}"))?;
     let canonical_id = resolved.source.source_id.clone();
 
@@ -4430,6 +4447,8 @@ const CURRENT_SESSION_ENV_KEYS: &[(&str, Option<&str>)] = &[
     ("JUNIE_SESSION_ID", Some("junie")),
     ("KIMI_SESSION_ID", Some("kimi")),
     ("COPILOT_SESSION_ID", Some("copilot")),
+    ("OMP_SESSION_ID", Some("omp")),
+    ("PI_SESSION_ID", Some("omp")),
     ("GROK_SESSION_ID", Some("grok")),
     ("GROK_THREAD_ID", Some("grok")),
 ];
@@ -4544,6 +4563,13 @@ fn current_session_from_disk() -> Result<Option<CurrentSessionPayload>> {
         Some(modified_after),
         Some(&here),
     ));
+    for root in aicx::session_catalog::omp_session_roots(&home) {
+        discovered.extend(sessions::discover_omp_sessions(
+            &root,
+            Some(modified_after),
+            Some(&here),
+        ));
+    }
 
     // Only sessions that can be tied to this checkout. Kimi stores no cwd,
     // and its workspace slug is not a path, so it is not a candidate here.
@@ -4669,6 +4695,15 @@ fn run_sessions_list(
             modified_after,
             here.as_deref(),
         ));
+    }
+    if want_agent.is_none_or(|a| ExtractAgent::from_str(a) == Some(ExtractAgent::Omp)) {
+        for root in aicx::session_catalog::omp_session_roots(&home) {
+            discovered.extend(sessions::discover_omp_sessions(
+                &root,
+                modified_after,
+                here.as_deref(),
+            ));
+        }
     }
 
     let scanned = discovered.len();
@@ -6682,22 +6717,73 @@ fn run_extract_all(args: ExtractAllArgs) -> Result<()> {
     for agent in &agents {
         let extract_agent = bulk_agent_to_extract_agent(*agent);
         let home = aicx::os_user_home().context("No home dir")?;
-        let root = extract_agent.session_root(&home);
-        if !root.is_dir() {
-            // A provider that never ran on this host contributes zero sources.
-            // That is not "unsupported" and not a failure — it is silence, and
-            // the manifest shows it as an absent provider rather than a lie.
-            eprintln!(
-                "extract all: {agent}: no session root at {} (provider never used here)",
-                root.display()
-            );
-            continue;
-        }
-        let sources = match aicx::session_catalog::SessionCatalog::new(*agent, &root) {
-            Ok(catalog) => match catalog.scan_with_stats().result {
-                Ok(sources) => sources,
+        let mut saw_dir = false;
+        let mut saw_error = false;
+        for root in extract_agent.session_roots(&home) {
+            let present = if matches!(extract_agent, ExtractAgent::Copilot | ExtractAgent::Omp) {
+                match root.try_exists() {
+                    Ok(value) => value,
+                    Err(error) => {
+                        saw_error = true;
+                        rows.push(bulk::ManifestEntry {
+                            provider: agent.to_string(),
+                            source_id: format!("<{agent}-catalog>"),
+                            logical_session_id: None,
+                            source_path: root.display().to_string(),
+                            source_fingerprint: String::new(),
+                            parser_version: parser_version_for(*agent).to_owned(),
+                            outcome: bulk::SourceOutcome::Failed {
+                                reason: error.to_string(),
+                                recover: format!("aicx catalog rebuild --agent {agent}"),
+                            },
+                        });
+                        continue;
+                    }
+                }
+            } else {
+                root.is_dir()
+            };
+            if !present {
+                continue;
+            }
+            if !root.is_dir() {
+                saw_error = true;
+                rows.push(bulk::ManifestEntry {
+                    provider: agent.to_string(),
+                    source_id: format!("<{agent}-catalog>"),
+                    logical_session_id: None,
+                    source_path: root.display().to_string(),
+                    source_fingerprint: String::new(),
+                    parser_version: parser_version_for(*agent).to_owned(),
+                    outcome: bulk::SourceOutcome::Failed {
+                        reason: format!("session root is not a directory: {}", root.display()),
+                        recover: format!("aicx catalog rebuild --agent {agent}"),
+                    },
+                });
+                continue;
+            }
+            saw_dir = true;
+            let sources = match aicx::session_catalog::SessionCatalog::new(*agent, &root) {
+                Ok(catalog) => match catalog.scan_with_stats().result {
+                    Ok(sources) => sources,
+                    Err(error) => {
+                        eprintln!("extract all: {agent}: catalog scan failed: {error}");
+                        rows.push(bulk::ManifestEntry {
+                            provider: agent.to_string(),
+                            source_id: format!("<{agent}-catalog>"),
+                            logical_session_id: None,
+                            source_path: root.display().to_string(),
+                            source_fingerprint: String::new(),
+                            parser_version: parser_version_for(*agent).to_owned(),
+                            outcome: bulk::SourceOutcome::Failed {
+                                reason: error.to_string(),
+                                recover: format!("aicx catalog rebuild --agent {agent}"),
+                            },
+                        });
+                        continue;
+                    }
+                },
                 Err(error) => {
-                    eprintln!("extract all: {agent}: catalog scan failed: {error}");
                     rows.push(bulk::ManifestEntry {
                         provider: agent.to_string(),
                         source_id: format!("<{agent}-catalog>"),
@@ -6712,43 +6798,42 @@ fn run_extract_all(args: ExtractAllArgs) -> Result<()> {
                     });
                     continue;
                 }
-            },
-            Err(error) => {
-                rows.push(bulk::ManifestEntry {
-                    provider: agent.to_string(),
-                    source_id: format!("<{agent}-catalog>"),
-                    logical_session_id: None,
-                    source_path: root.display().to_string(),
-                    source_fingerprint: String::new(),
-                    parser_version: parser_version_for(*agent).to_owned(),
-                    outcome: bulk::SourceOutcome::Failed {
-                        reason: error.to_string(),
-                        recover: format!("aicx catalog rebuild --agent {agent}"),
-                    },
-                });
-                continue;
-            }
-        };
+            };
 
-        eprintln!(
-            "extract all: {agent}: {} source(s) discovered under {}",
-            sources.len(),
-            root.display()
-        );
-
-        for source in sources {
-            let row = extract_one_source_for_bulk(
-                extract_agent,
-                *agent,
-                &source,
-                &options,
-                &extracts_root,
-                &projection_fingerprint,
-                &mut state,
-                args.rebuild,
-                args.dry_run,
+            eprintln!(
+                "extract all: {agent}: {} source(s) discovered under {}",
+                sources.len(),
+                root.display()
             );
-            rows.push(row);
+
+            for source in sources {
+                let row = extract_one_source_for_bulk(
+                    extract_agent,
+                    *agent,
+                    &source,
+                    &options,
+                    &extracts_root,
+                    &projection_fingerprint,
+                    &mut state,
+                    args.rebuild,
+                    args.dry_run,
+                );
+                rows.push(row);
+            }
+        }
+        if !saw_dir && !saw_error {
+            // A provider that never ran on this host contributes zero sources.
+            // That is not "unsupported" and not a failure — it is silence, and
+            // the manifest shows it as an absent provider rather than a lie.
+            let listed = extract_agent
+                .session_roots(&home)
+                .iter()
+                .map(|root| root.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            eprintln!(
+                "extract all: {agent}: no session root at {listed} (provider never used here)"
+            );
         }
     }
 
@@ -6900,6 +6985,7 @@ const fn bulk_agent_to_parser_agent(
         aicx::session_catalog::AgentKind::Kimi => aicx::parser::engine::AgentKind::Kimi,
         aicx::session_catalog::AgentKind::Cursor => aicx::parser::engine::AgentKind::Cursor,
         aicx::session_catalog::AgentKind::Copilot => aicx::parser::engine::AgentKind::Copilot,
+        aicx::session_catalog::AgentKind::Omp => aicx::parser::engine::AgentKind::Omp,
     }
 }
 
@@ -6913,6 +6999,7 @@ const fn bulk_agent_to_extract_agent(agent: aicx::session_catalog::AgentKind) ->
         aicx::session_catalog::AgentKind::Kimi => ExtractAgent::Kimi,
         aicx::session_catalog::AgentKind::Cursor => ExtractAgent::Cursor,
         aicx::session_catalog::AgentKind::Copilot => ExtractAgent::Copilot,
+        aicx::session_catalog::AgentKind::Omp => ExtractAgent::Omp,
     }
 }
 
@@ -6934,7 +7021,7 @@ fn resolve_bulk_agents(
             return Err(aicx::cli::failure::StructuredFailure::new(
                 "unknown_provider",
                 format!("`{token}` is not a supported provider"),
-                "pass one of: claude, codex, cursor, gemini, grok, junie, kimi, copilot",
+                "pass one of: claude, codex, cursor, gemini, grok, junie, kimi, copilot, omp",
             ));
         };
         let agent = agent.catalog_kind();
@@ -7632,15 +7719,68 @@ fn walk_lineage(
     (graph, hops)
 }
 
+/// Resolve one session across every store the agent occupies.
+///
+/// omp keeps `~/.omp` ahead of upstream `~/.pi`. A missing root is skipped.
+/// `Missing` tries the next root. `Ambiguous` and I/O fail immediately.
+/// Permission errors on Copilot and omp are not treated as an empty store.
+fn resolve_extract_session(
+    agent: ExtractAgent,
+    home: &Path,
+    query: &str,
+) -> Result<
+    (
+        aicx::session_catalog::SessionCatalog,
+        aicx::session_catalog::ResolvedSource,
+        aicx::session_catalog::CatalogIoStats,
+    ),
+    aicx::session_catalog::CatalogError,
+> {
+    use aicx::session_catalog::{CatalogError, SessionCatalog};
+    let mut scanned = 0usize;
+    for root in agent.session_roots(home) {
+        let present = if matches!(agent, ExtractAgent::Copilot | ExtractAgent::Omp) {
+            match root.try_exists() {
+                Ok(value) => value,
+                Err(error) => {
+                    return Err(CatalogError::Io {
+                        path: root,
+                        message: error.to_string(),
+                    });
+                }
+            }
+        } else {
+            root.is_dir()
+        };
+        if !present {
+            continue;
+        }
+        let catalog = SessionCatalog::new(agent.catalog_kind(), &root)?;
+        let lookup = catalog.resolve_with_stats(query);
+        scanned += lookup.stats.metadata_candidates;
+        match lookup.result {
+            Ok(resolved) => return Ok((catalog, resolved, lookup.stats)),
+            Err(CatalogError::Missing { .. }) => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(CatalogError::Missing {
+        query: query.to_string(),
+        agent: agent.catalog_kind(),
+        candidates_scanned: scanned,
+    })
+}
+
 /// Run `aicx extract <agent> --session <id>`: resolve the session catalog
 /// first (bounded identity headers, zero body reads), then parse exactly the
 /// one resolved source and project it. The default output path encodes both
 /// the `--conversation` and `--user-only` axes so the four modes never
 /// collide:
-///   * `~/.aicx/extracts/<agent>/<session_id>.md`
-///   * `~/.aicx/extracts/<agent>/<session_id>_user.md` (`--user-only`)
-///   * `~/.aicx/extracts/<agent>/<session_id>_conversation.md` (`--conversation`)
-///   * `~/.aicx/extracts/<agent>/<session_id>_conversation_user.md` (both)
+///
+/// * `~/.aicx/extracts/<agent>/<session_id>.md`
+/// * `~/.aicx/extracts/<agent>/<session_id>_user.md` (`--user-only`)
+/// * `~/.aicx/extracts/<agent>/<session_id>_conversation.md` (`--conversation`)
+/// * `~/.aicx/extracts/<agent>/<session_id>_conversation_user.md` (both)
 fn run_extract_session(
     agent: ExtractAgent,
     session_reference: &str,
@@ -7649,25 +7789,9 @@ fn run_extract_session(
     options: ExtractFileOptions,
 ) -> Result<()> {
     let home = aicx::os_user_home().context("No home dir")?;
-    let root = agent.session_root(&home);
-    if !root.is_dir() {
-        emit_catalog_failure(
-            agent,
-            aicx::session_catalog::CatalogError::Missing {
-                query: session_reference.to_string(),
-                agent: agent.catalog_kind(),
-                candidates_scanned: 0,
-            },
-        );
-    }
-
-    let catalog = aicx::session_catalog::SessionCatalog::new(agent.catalog_kind(), &root)
-        .unwrap_or_else(|error| emit_catalog_failure(agent, error));
-    let lookup = catalog.resolve_with_stats(session_reference);
-    let resolved = match lookup.result {
-        Ok(resolved) => resolved,
-        Err(error) => emit_catalog_failure(agent, error),
-    };
+    let (catalog, resolved, lookup_stats) =
+        resolve_extract_session(agent, &home, session_reference)
+            .unwrap_or_else(|error| emit_catalog_failure(agent, error));
     if let Some(notice) = &resolved.substitution_notice {
         eprintln!("{notice}");
     }
@@ -7683,7 +7807,7 @@ fn run_extract_session(
     );
     eprintln!(
         "extract: catalog_candidates={} catalog_files_opened={} catalog_body_reads={} sources_parsed=1",
-        lookup.stats.metadata_candidates, lookup.stats.files_opened, lookup.stats.body_reads
+        lookup_stats.metadata_candidates, lookup_stats.files_opened, lookup_stats.body_reads
     );
 
     // Contract discipline: the resolved source must produce a valid direct
@@ -8120,6 +8244,7 @@ const ALL_WATERMARK_AGENTS: &[&str] = &[
     "kimi",
     "cursor",
     "copilot",
+    "omp",
     "codescribe",
 ];
 
@@ -8130,6 +8255,9 @@ const ALL_WATERMARK_AGENTS: &[&str] = &[
 const KIMI_ALL_WATERMARK_KEY: &str = "claude+codescribe+codex+gemini+grok+junie+kimi";
 /// Incumbent composition before Copilot joined. Its watermark never covers Copilot.
 const CURSOR_ALL_WATERMARK_KEY: &str = "claude+codescribe+codex+cursor+gemini+grok+junie+kimi";
+/// Incumbent composition before omp joined. Its watermark never covers omp.
+const COPILOT_ALL_WATERMARK_KEY: &str =
+    "claude+codescribe+codex+copilot+cursor+gemini+grok+junie+kimi";
 
 fn normalized_source_key_parts<'a>(parts: impl IntoIterator<Item = &'a str>) -> Vec<String> {
     let mut normalized = parts
@@ -8176,6 +8304,7 @@ fn extraction_source_key_aliases(agents: &[&str], project: &[String]) -> Vec<Str
         // watermark covers only the agents named in the recording key —
         // `watermark_covered_agents` exempts the newcomer, or its whole
         // pre-upgrade history would be skipped as if already ingested.
+        aliases.push(format!("{COPILOT_ALL_WATERMARK_KEY}:{project_key}"));
         aliases.push(format!("{CURSOR_ALL_WATERMARK_KEY}:{project_key}"));
         aliases.push(format!("{KIMI_ALL_WATERMARK_KEY}:{project_key}"));
         aliases.push(format!("{LEGACY_ALL_WATERMARK_KEY}:{project_key}"));
@@ -8602,14 +8731,15 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
         // run silently skips the agent's whole pre-upgrade history (kimi
         // lanes on the first kimi-aware `all` run).
         let uncovered_config;
+        let full_window_scan = matches!(agent, "copilot" | "omp");
         let agent_config = if watermark.is_some()
-            && (!watermark_covered.contains(agent) || agent == "copilot")
+            && (!watermark_covered.contains(agent) || full_window_scan)
         {
-            if agent == "copilot" {
+            if full_window_scan {
                 // Native events can append with the same timestamp. The
                 // existing content dedup below owns incremental admission;
                 // a global wall-clock watermark cannot prove source position.
-                eprintln!("  [copilot] scanning the full window for append-safe content dedup");
+                eprintln!("  [{agent}] scanning the full window for append-safe content dedup");
             } else {
                 eprintln!(
                     "  [{agent}] no extraction watermark covers this agent yet; scanning the full window"
@@ -8648,6 +8778,9 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
                 aicx::session_catalog::AgentKind::Copilot,
                 agent_config,
             ),
+            "omp" => {
+                sources::extract_agent_sessions(aicx::session_catalog::AgentKind::Omp, agent_config)
+            }
             "cursor" => sources::extract_agent_sessions(
                 aicx::session_catalog::AgentKind::Cursor,
                 agent_config,
