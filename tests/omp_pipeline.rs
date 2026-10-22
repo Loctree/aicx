@@ -363,19 +363,11 @@ fn omp_public_pipeline_discovers_both_roots_and_ignores_tool_logs() {
     let resolved = fixture.json(&["catalog", "resolve", OMP_ID, "--json"]);
     assert_eq!(resolved["agent"], "omp");
     assert_eq!(resolved["session_id"], OMP_ID);
-    assert!(
-        resolved["source_path"]
-            .as_str()
-            .unwrap()
-            .contains("/.omp/agent/sessions/")
-    );
+    // Windows prints `\` separators; compare the store shape, not the platform.
+    let source_path = |value: &Value| value["source_path"].as_str().unwrap().replace('\\', "/");
+    assert!(source_path(&resolved).contains("/.omp/agent/sessions/"));
     let pi = fixture.json(&["catalog", "resolve", PI_ID, "--json"]);
-    assert!(
-        pi["source_path"]
-            .as_str()
-            .unwrap()
-            .contains("/.pi/agent/sessions/")
-    );
+    assert!(source_path(&pi).contains("/.pi/agent/sessions/"));
 
     for agent in ["omp", "pi", "oh-my-pi"] {
         let sessions = fixture.json(&["sessions", "list", "--all", "--agent", agent, "--json"]);

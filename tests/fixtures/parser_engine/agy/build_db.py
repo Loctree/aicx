@@ -76,7 +76,7 @@ def header(cascade_id: str, trajectory_id: str, cwd: str) -> bytes:
             msg(2, vi(1, STAMP), vi(2, 0)),
             text(3, trajectory_id),
             text(6, cascade_id),
-            text(7, f"file://{cwd}"),
+            text(7, Path(cwd).as_uri()),
             text(18, "agy-fixture"),
         ]
     )

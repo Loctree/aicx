@@ -1037,14 +1037,24 @@ fn cwd_from_field(text: &str) -> Option<String> {
             .map(str::to_owned);
     }
     let trimmed = text.trim();
-    (!trimmed.is_empty() && trimmed.starts_with('/')).then(|| trimmed.to_owned())
+    crate::engine::absolute_anywhere(trimmed).then(|| trimmed.to_owned())
 }
 
 fn workspace_cwd(raw: &str) -> Option<String> {
     let rest = raw.trim().strip_prefix("file://")?;
     let rest = rest.strip_prefix("localhost").unwrap_or(rest);
     let decoded = percent_decode(rest);
+    // A Windows workspace is `file:///c%3A/Users/...`; the cwd is `c:/Users/...`,
+    // not the rooted `/c:/...` the URI path spells.
+    if let Some(drive) = decoded.strip_prefix('/').filter(|path| drive_path(path)) {
+        return Some(drive.to_owned());
+    }
     decoded.starts_with('/').then_some(decoded)
+}
+
+fn drive_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'/'
 }
 
 fn percent_decode(raw: &str) -> String {
@@ -1382,5 +1392,36 @@ fn b64_value(byte: u8) -> Option<u8> {
         b'+' => Some(62),
         b'/' => Some(63),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod workspace_cwd_tests {
+    use super::workspace_cwd;
+
+    #[test]
+    fn posix_workspace_uris_keep_the_rooted_path() {
+        assert_eq!(
+            workspace_cwd("file:///Users/x/work/agy%20pipeline").as_deref(),
+            Some("/Users/x/work/agy pipeline")
+        );
+    }
+
+    #[test]
+    fn windows_workspace_uris_name_the_drive_path() {
+        assert_eq!(
+            workspace_cwd("file:///c%3A/Users/x/work/agy-pipeline").as_deref(),
+            Some("c:/Users/x/work/agy-pipeline")
+        );
+        assert_eq!(
+            workspace_cwd("file:///C:/Users/x/work/agy-pipeline").as_deref(),
+            Some("C:/Users/x/work/agy-pipeline")
+        );
+    }
+
+    #[test]
+    fn non_file_workspaces_carry_no_cwd() {
+        assert_eq!(workspace_cwd("vscode-remote://ssh/x"), None);
+        assert_eq!(workspace_cwd("file://relative/path"), None);
     }
 }

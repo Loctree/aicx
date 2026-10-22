@@ -80,7 +80,12 @@ impl AgyFixture {
             .arg("--home")
             .arg(&home)
             .arg("--cwd")
-            .arg(cwd.display().to_string())
+            // A verbatim `\\?\C:\…` cwd is not what agy records; hand the fixture the plain path.
+            .arg(
+                aicx_parser::sanitize::strip_verbatim_prefix(&cwd)
+                    .display()
+                    .to_string(),
+            )
             .status()
             .unwrap();
         assert!(status.success(), "fixture sqlite emit failed");
