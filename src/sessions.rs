@@ -1949,11 +1949,18 @@ fn scan_agy_session_file_app(path: &Path, session_id: &str) -> Option<SessionInf
     let updated_at = listing.updated_at.as_deref().and_then(parse_rfc3339);
     // agy's own project name is a workspace label ("default-cli-project" or a
     // UUID), not a repository; the cwd names the repo like every other agent.
+    // Without a cwd the session has no known project rather than a fake one.
     let project = listing
         .cwd
         .as_deref()
         .and_then(project_label_from_cwd)
-        .or_else(|| listing.project.clone().filter(|name| !name.is_empty()));
+        .or_else(|| {
+            listing.project.clone().filter(|name| {
+                !name.is_empty()
+                    && name != "default-cli-project"
+                    && !crate::uuid_shape::is_uuid(name)
+            })
+        });
     let association = if listing.cwd.is_some() {
         Association::Exact
     } else {
