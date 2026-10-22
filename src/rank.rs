@@ -1296,6 +1296,9 @@ fn speaker_role(frame_kind: Option<&str>, speaker_hint: Option<&str>, line: &str
                     | "omp"
                     | "pi"
                     | "oh-my-pi"
+                    | "agy"
+                    | "antigravity"
+                    | "antigravity-cli"
             ) =>
         {
             SpeakerRole::Assistant

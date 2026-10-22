@@ -67,6 +67,7 @@ case "$agent" in
     gemini-antigravity) session_agent=gemini ;;
         copilot-cli|github-copilot|github-copilot-cli) session_agent=copilot ;;
     pi|oh-my-pi) session_agent=omp ;;
+    antigravity|antigravity-cli) session_agent=agy ;;
 esac
 
 # Humans keep a human address. Mirrors the commit-msg human lane exactly; if the

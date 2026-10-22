@@ -1892,6 +1892,7 @@ fn parse_catalog_source_checked(
         "kimi" => aicx_parser::engine::AgentKind::Kimi,
         "copilot" => aicx_parser::engine::AgentKind::Copilot,
         "omp" | "pi" | "oh-my-pi" => aicx_parser::engine::AgentKind::Omp,
+        "agy" | "antigravity" | "antigravity-cli" => aicx_parser::engine::AgentKind::Agy,
         other => anyhow::bail!("unsupported catalog agent `{other}`"),
     };
     let parsed = crate::parser_dispatch::parse_file(

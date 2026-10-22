@@ -177,6 +177,7 @@ enum ExtractAgent {
     Kimi,
     Copilot,
     Omp,
+    Agy,
 }
 
 impl ExtractAgent {
@@ -191,6 +192,7 @@ impl ExtractAgent {
             Self::Kimi => "kimi",
             Self::Copilot => "copilot",
             Self::Omp => "omp",
+            Self::Agy => "agy",
         }
     }
 
@@ -205,6 +207,7 @@ impl ExtractAgent {
             Self::Kimi => aicx::session_catalog::AgentKind::Kimi,
             Self::Copilot => aicx::session_catalog::AgentKind::Copilot,
             Self::Omp => aicx::session_catalog::AgentKind::Omp,
+            Self::Agy => aicx::session_catalog::AgentKind::Agy,
         }
     }
 
@@ -219,6 +222,7 @@ impl ExtractAgent {
             Self::Kimi => aicx::parser::engine::AgentKind::Kimi,
             Self::Copilot => aicx::parser::engine::AgentKind::Copilot,
             Self::Omp => aicx::parser::engine::AgentKind::Omp,
+            Self::Agy => aicx::parser::engine::AgentKind::Agy,
         }
     }
 
@@ -237,13 +241,16 @@ impl ExtractAgent {
             Self::Kimi => home.join(".kimi-code").join("sessions"),
             Self::Copilot => aicx::session_catalog::copilot_session_root(home),
             Self::Omp => aicx::session_catalog::omp_session_root(home),
+            Self::Agy => aicx::session_catalog::agy_session_root(home),
         }
     }
 
     /// Every on-disk store this agent may occupy. omp also reads upstream pi.
+    /// agy reads the CLI store and the IDE store.
     fn session_roots(self, home: &Path) -> Vec<PathBuf> {
         match self {
             Self::Omp => aicx::session_catalog::omp_session_roots(home),
+            Self::Agy => aicx::session_catalog::agy_session_roots(home),
             other => vec![other.session_root(home)],
         }
     }
@@ -261,6 +268,7 @@ impl ExtractAgent {
                 Some(Self::Copilot)
             }
             "omp" | "pi" | "oh-my-pi" => Some(Self::Omp),
+            "agy" | "antigravity" | "antigravity-cli" => Some(Self::Agy),
             _ => None,
         }
     }
@@ -288,6 +296,10 @@ enum ExtractTarget {
     /// oh-my-pi / pi sessions (~/.omp/agent/sessions and ~/.pi/agent/sessions)
     #[command(aliases = ["pi", "oh-my-pi"])]
     Omp(ExtractAgentArgs),
+    /// Antigravity CLI conversations (~/.gemini/antigravity-cli/conversations)
+    /// and the IDE store (~/.gemini/antigravity/conversations).
+    #[command(aliases = ["antigravity", "antigravity-cli"])]
+    Agy(ExtractAgentArgs),
     /// Every compatible source on this machine, in one incremental pass.
     All(ExtractAllArgs),
 }
@@ -304,6 +316,7 @@ impl ExtractTarget {
             Self::Kimi(args) => (ExtractAgent::Kimi, args),
             Self::Copilot(args) => (ExtractAgent::Copilot, args),
             Self::Omp(args) => (ExtractAgent::Omp, args),
+            Self::Agy(args) => (ExtractAgent::Agy, args),
             Self::All(_) => unreachable!("`extract all` is dispatched before split()"),
         }
     }
@@ -578,8 +591,8 @@ enum SessionsCommand {
         #[arg(short, long, value_delimiter = ',')]
         project: Vec<String>,
 
-        /// Filter by agent (claude | codex | gemini | junie | grok | kimi | cursor | copilot | omp).
-        #[arg(long, value_parser = ["claude", "codex", "gemini", "junie", "grok", "kimi", "cursor", "cursor-agent", "copilot", "copilot-cli", "github-copilot", "github-copilot-cli", "omp", "pi", "oh-my-pi"])]
+        /// Filter by agent (claude | codex | gemini | junie | grok | kimi | cursor | copilot | omp | agy | agy).
+        #[arg(long, value_parser = ["claude", "codex", "gemini", "junie", "grok", "kimi", "cursor", "cursor-agent", "copilot", "copilot-cli", "github-copilot", "github-copilot-cli", "omp", "pi", "oh-my-pi", "agy", "antigravity", "antigravity-cli"])]
         agent: Option<String>,
 
         /// Only sessions updated on/after this date (YYYY-MM-DD). Defaults to the
@@ -626,7 +639,7 @@ enum SessionsCommand {
         /// Session id (or a unique prefix).
         session_id: String,
 
-        /// Agent: claude | codex | gemini | junie | grok | kimi | cursor | copilot | omp. Inferred from the session
+        /// Agent: claude | codex | gemini | junie | grok | kimi | cursor | copilot | omp | agy. Inferred from the session
         /// id when omitted.
         #[arg(long)]
         agent: Option<String>,
@@ -657,7 +670,7 @@ enum ClaimsCommand {
         #[arg(long)]
         session: String,
 
-        /// Agent: claude | codex | gemini | junie | grok | kimi | cursor | copilot | omp. Inferred from the session id
+        /// Agent: claude | codex | gemini | junie | grok | kimi | cursor | copilot | omp | agy. Inferred from the session id
         /// when omitted.
         #[arg(long)]
         agent: Option<String>,
@@ -681,7 +694,7 @@ enum ResultsCommand {
         #[arg(long)]
         session: String,
 
-        /// Agent: claude | codex | gemini | junie | grok | kimi | cursor | copilot | omp. Inferred from the session id
+        /// Agent: claude | codex | gemini | junie | grok | kimi | cursor | copilot | omp | agy. Inferred from the session id
         /// when omitted.
         #[arg(long)]
         agent: Option<String>,
@@ -745,7 +758,7 @@ struct RetrievalFilters {
     #[arg(long)]
     score: Option<u8>,
 
-    /// Agent name filter: claude | codex | gemini | junie | grok | kimi | cursor | copilot | omp | codescribe.
+    /// Agent name filter: claude | codex | gemini | junie | grok | kimi | cursor | copilot | omp | agy | codescribe.
     #[arg(long)]
     agent: Option<String>,
 
@@ -1417,8 +1430,8 @@ enum Commands {
     ///
     /// Canonical grammar (the target is a required subcommand):
     ///   aicx extract all [-p PROJECT]... [-H HOURS] [--provider NAME]... [--rebuild]
-    ///   aicx extract {codex|claude|cursor|gemini|grok|junie|kimi|copilot|omp} --session <id> [--conversation] [-o FILE]
-    ///   aicx extract {codex|claude|cursor|gemini|grok|junie|kimi|copilot|omp} --file <path> --conversation -o <path>
+    ///   aicx extract {codex|claude|cursor|gemini|grok|junie|kimi|copilot|omp|agy} --session <id> [--conversation] [-o FILE]
+    ///   aicx extract {codex|claude|cursor|gemini|grok|junie|kimi|copilot|omp|agy} --file <path> --conversation -o <path>
     ///
     /// `all` walks every registered agent, projects each session through the
     /// same filters, and writes a run manifest under
@@ -1582,7 +1595,7 @@ enum Commands {
     /// List raw agent session sources on disk (pre-extraction inputs).
     ///
     /// Shows Claude Code, Codex, Gemini, Junie, and Grok log paths, plus Cursor,
-    /// Kimi, GitHub Copilot CLI, and oh-my-pi / pi, with session
+    /// Kimi, GitHub Copilot CLI, oh-my-pi / pi, and Antigravity CLI, with session
     /// counts and sizes. This is what extractors will read from — use
     /// `catalog resolve` / `extract` to inspect identity and readable transcripts.
     #[command(hide = true, display_order = 10)]
@@ -1623,7 +1636,7 @@ enum Commands {
         #[arg(long)]
         session: String,
 
-        /// Agent: claude | codex | gemini | junie | grok | kimi | cursor | copilot | omp. Inferred from the session id
+        /// Agent: claude | codex | gemini | junie | grok | kimi | cursor | copilot | omp | agy. Inferred from the session id
         /// when omitted.
         #[arg(long)]
         agent: Option<String>,
@@ -2855,6 +2868,7 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
                     "cursor",
                     "copilot",
                     "omp",
+                    "agy",
                     "codescribe",
                 ],
                 project,
@@ -4570,6 +4584,13 @@ fn current_session_from_disk() -> Result<Option<CurrentSessionPayload>> {
             Some(&here),
         ));
     }
+    for root in aicx::session_catalog::agy_session_roots(&home) {
+        discovered.extend(sessions::discover_agy_sessions(
+            &root,
+            Some(modified_after),
+            Some(&here),
+        ));
+    }
 
     // Only sessions that can be tied to this checkout. Kimi stores no cwd,
     // and its workspace slug is not a path, so it is not a candidate here.
@@ -4699,6 +4720,15 @@ fn run_sessions_list(
     if want_agent.is_none_or(|a| ExtractAgent::from_str(a) == Some(ExtractAgent::Omp)) {
         for root in aicx::session_catalog::omp_session_roots(&home) {
             discovered.extend(sessions::discover_omp_sessions(
+                &root,
+                modified_after,
+                here.as_deref(),
+            ));
+        }
+    }
+    if want_agent.is_none_or(|a| ExtractAgent::from_str(a) == Some(ExtractAgent::Agy)) {
+        for root in aicx::session_catalog::agy_session_roots(&home) {
+            discovered.extend(sessions::discover_agy_sessions(
                 &root,
                 modified_after,
                 here.as_deref(),
@@ -6986,6 +7016,7 @@ const fn bulk_agent_to_parser_agent(
         aicx::session_catalog::AgentKind::Cursor => aicx::parser::engine::AgentKind::Cursor,
         aicx::session_catalog::AgentKind::Copilot => aicx::parser::engine::AgentKind::Copilot,
         aicx::session_catalog::AgentKind::Omp => aicx::parser::engine::AgentKind::Omp,
+        aicx::session_catalog::AgentKind::Agy => aicx::parser::engine::AgentKind::Agy,
     }
 }
 
@@ -7000,6 +7031,7 @@ const fn bulk_agent_to_extract_agent(agent: aicx::session_catalog::AgentKind) ->
         aicx::session_catalog::AgentKind::Cursor => ExtractAgent::Cursor,
         aicx::session_catalog::AgentKind::Copilot => ExtractAgent::Copilot,
         aicx::session_catalog::AgentKind::Omp => ExtractAgent::Omp,
+        aicx::session_catalog::AgentKind::Agy => ExtractAgent::Agy,
     }
 }
 
@@ -8245,6 +8277,7 @@ const ALL_WATERMARK_AGENTS: &[&str] = &[
     "cursor",
     "copilot",
     "omp",
+    "agy",
     "codescribe",
 ];
 
@@ -8258,6 +8291,9 @@ const CURSOR_ALL_WATERMARK_KEY: &str = "claude+codescribe+codex+cursor+gemini+gr
 /// Incumbent composition before omp joined. Its watermark never covers omp.
 const COPILOT_ALL_WATERMARK_KEY: &str =
     "claude+codescribe+codex+copilot+cursor+gemini+grok+junie+kimi";
+/// Incumbent composition before agy joined. Its watermark never covers agy.
+const OMP_ALL_WATERMARK_KEY: &str =
+    "claude+codescribe+codex+copilot+cursor+gemini+grok+junie+kimi+omp";
 
 fn normalized_source_key_parts<'a>(parts: impl IntoIterator<Item = &'a str>) -> Vec<String> {
     let mut normalized = parts
@@ -8304,6 +8340,7 @@ fn extraction_source_key_aliases(agents: &[&str], project: &[String]) -> Vec<Str
         // watermark covers only the agents named in the recording key —
         // `watermark_covered_agents` exempts the newcomer, or its whole
         // pre-upgrade history would be skipped as if already ingested.
+        aliases.push(format!("{OMP_ALL_WATERMARK_KEY}:{project_key}"));
         aliases.push(format!("{COPILOT_ALL_WATERMARK_KEY}:{project_key}"));
         aliases.push(format!("{CURSOR_ALL_WATERMARK_KEY}:{project_key}"));
         aliases.push(format!("{KIMI_ALL_WATERMARK_KEY}:{project_key}"));
@@ -8780,6 +8817,9 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
             ),
             "omp" => {
                 sources::extract_agent_sessions(aicx::session_catalog::AgentKind::Omp, agent_config)
+            }
+            "agy" => {
+                sources::extract_agent_sessions(aicx::session_catalog::AgentKind::Agy, agent_config)
             }
             "cursor" => sources::extract_agent_sessions(
                 aicx::session_catalog::AgentKind::Cursor,

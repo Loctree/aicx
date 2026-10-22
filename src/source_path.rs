@@ -10,6 +10,8 @@
 //! - `~/.cursor/projects`
 //! - `~/.grok/sessions`
 //! - `~/.gemini/tmp`
+//! - `~/.gemini/antigravity-cli/conversations` (Antigravity CLI / agy)
+//! - `~/.gemini/antigravity/conversations` (Antigravity IDE / agy)
 //! - `~/.junie/sessions`
 //! - `~/.kimi-code/sessions`
 //! - `~/.copilot/session-state`
@@ -36,6 +38,8 @@ pub const DEFAULT_SOURCE_ROOT_RELATIVE: &[&str] = &[
     ".cursor/projects",
     ".grok/sessions",
     ".gemini/tmp",
+    ".gemini/antigravity-cli/conversations",
+    ".gemini/antigravity/conversations",
     ".junie/sessions",
     ".kimi-code/sessions",
     ".copilot/session-state",
@@ -335,6 +339,38 @@ mod tests {
         assert!(allow.resolve_file(&pi).is_ok());
         assert!(allow.resolve_file(&nested).is_ok());
         assert!(allow.resolve_file(&outside).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn agy_conversation_stores_are_allowed_and_gemini_siblings_are_not() {
+        // Same containment miss as kimi: `aicx index` skips every cataloged
+        // agy database when the conversation roots are absent from this list.
+        // `.gemini/tmp` stays the Gemini export root and must not be widened
+        // to the whole `.gemini` tree.
+        let root = test_dir("agy");
+        let aicx = root.join(".aicx");
+        let cli = root
+            .join(".gemini/antigravity-cli/conversations/11111111-1111-4111-8111-111111111111.db");
+        let ide =
+            root.join(".gemini/antigravity/conversations/22222222-2222-4222-8222-222222222222.db");
+        for db in [&cli, &ide] {
+            fs::create_dir_all(db.parent().unwrap()).unwrap();
+            fs::write(db, b"sqlite").unwrap();
+        }
+        let sibling = root.join(".gemini/antigravity-cli/brain/note.pb");
+        fs::create_dir_all(sibling.parent().unwrap()).unwrap();
+        fs::write(&sibling, b"legacy").unwrap();
+        let legacy_pb = root.join(".gemini/antigravity/conversations/old.pb");
+        fs::write(&legacy_pb, b"pb").unwrap();
+        let allow = SourceAllowlist::for_operator(&root, &aicx);
+        assert!(allow.resolve_file(&cli).is_ok());
+        assert!(allow.resolve_file(&ide).is_ok());
+        // A `.pb` sitting in the conversation directory is still a file under
+        // the approved root. Catalog admission, not this allowlist, keeps it
+        // off the agy lane. A sibling tree outside `conversations` is refused.
+        assert!(allow.resolve_file(&legacy_pb).is_ok());
+        assert!(allow.resolve_file(&sibling).is_err());
         let _ = fs::remove_dir_all(root);
     }
 

@@ -38,10 +38,11 @@ pub enum AgentKind {
     Cursor,
     Copilot,
     Omp,
+    Agy,
 }
 
 impl AgentKind {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::Claude,
         Self::Codex,
         Self::Gemini,
@@ -51,6 +52,7 @@ impl AgentKind {
         Self::Cursor,
         Self::Copilot,
         Self::Omp,
+        Self::Agy,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -64,6 +66,7 @@ impl AgentKind {
             Self::Cursor => "cursor",
             Self::Copilot => "copilot",
             Self::Omp => "omp",
+            Self::Agy => "agy",
         }
     }
 
@@ -72,6 +75,7 @@ impl AgentKind {
             "claude" => Some(Self::Claude),
             "codex" => Some(Self::Codex),
             "gemini" | "gemini-antigravity" => Some(Self::Gemini),
+            "agy" | "antigravity" | "antigravity-cli" => Some(Self::Agy),
             "junie" => Some(Self::Junie),
             "grok" => Some(Self::Grok),
             "kimi" => Some(Self::Kimi),
@@ -96,14 +100,16 @@ impl AgentKind {
             Self::Cursor => home.join(".cursor").join("projects"),
             Self::Copilot => copilot_session_root(home),
             Self::Omp => omp_session_root(home),
+            Self::Agy => agy_session_root(home),
         }
     }
 
     /// Every on-disk root this agent may write. Omp and upstream pi share one
-    /// catalog identity and two stores.
+    /// catalog identity and two stores. Agy reads the CLI store and the IDE store.
     pub fn session_roots(self, home: &Path) -> Vec<PathBuf> {
         match self {
             Self::Omp => omp_session_roots(home),
+            Self::Agy => agy_session_roots(home),
             other => vec![other.session_root(home)],
         }
     }
@@ -119,12 +125,14 @@ impl AgentKind {
             Self::Cursor => aicx_parser::engine::AgentKind::Cursor,
             Self::Copilot => aicx_parser::engine::AgentKind::Copilot,
             Self::Omp => aicx_parser::engine::AgentKind::Omp,
+            Self::Agy => aicx_parser::engine::AgentKind::Agy,
         }
     }
 
     fn accepts_extension(self, extension: Option<&str>) -> bool {
         match self {
             Self::Gemini => matches!(extension, Some("json" | "jsonl")),
+            Self::Agy => extension == Some("db"),
             Self::Claude
             | Self::Codex
             | Self::Junie
@@ -193,6 +201,7 @@ impl AgentKind {
             // root. Nested tool logs live one directory deeper and are not
             // sessions, the same way Cursor `agent-tools/` is not a transcript.
             Self::Omp => is_omp_source_file(path),
+            Self::Agy => is_agy_source_file(path),
             Self::Claude | Self::Codex | Self::Junie => true,
         }
     }
@@ -317,6 +326,37 @@ pub fn omp_session_roots(home: &Path) -> Vec<PathBuf> {
     vec![omp_session_root(home), pi_session_root(home)]
 }
 
+/// Antigravity CLI conversations. The IDE store is the second root.
+pub fn agy_session_root(home: &Path) -> PathBuf {
+    home.join(".gemini")
+        .join("antigravity-cli")
+        .join("conversations")
+}
+
+pub fn agy_ide_session_root(home: &Path) -> PathBuf {
+    home.join(".gemini")
+        .join("antigravity")
+        .join("conversations")
+}
+
+pub fn agy_session_roots(home: &Path) -> Vec<PathBuf> {
+    vec![agy_session_root(home), agy_ide_session_root(home)]
+}
+
+/// A native agy conversation is `<cascade-uuid>.db` directly under
+/// `antigravity-cli/conversations` or `antigravity/conversations`.
+/// `.pb` exports, WAL sidecars, and non-UUID names are not sessions.
+pub(crate) fn is_agy_source_file(path: &Path) -> bool {
+    let stem = path.file_stem().and_then(|stem| stem.to_str());
+    path.extension().and_then(|ext| ext.to_str()) == Some("db")
+        && stem.is_some_and(|stem| is_uuid(stem) && uuid_from_filename(stem).is_some())
+        && ancestor_name(path, 1) == Some("conversations")
+        && matches!(
+            ancestor_name(path, 2),
+            Some("antigravity-cli" | "antigravity")
+        )
+}
+
 /// A real omp/pi session is a JSONL whose stem ends in a UUID and whose
 /// ancestors are `<store>/.{omp,pi}/agent/sessions/<encoded-cwd>/<file>`.
 /// Tool-log JSONL nested inside `<ISO-ts>_<uuid>/` fails the `sessions`
@@ -374,6 +414,32 @@ pub(crate) fn source_bundle_fingerprint(path: &Path) -> std::io::Result<SourceFi
             fingerprint.modified_unix_nanos = fingerprint
                 .modified_unix_nanos
                 .max(companion.modified_unix_nanos);
+        } else {
+            bundle.update(b"absent\0");
+        }
+        fingerprint.bundle_fingerprint = Some(hex::encode(bundle.finalize()));
+    } else if is_agy_source_file(path) {
+        // WAL appends move `.db-wal` while `.db` mtime stays put. Stat only:
+        // opening the database would refresh `.db-shm` and is not a catalog probe.
+        let mut bundle = Sha256::new();
+        bundle.update(b"agy-source-bundle.v1\0db\0");
+        bundle.update(fingerprint.len.to_le_bytes());
+        bundle.update(fingerprint.modified_unix_nanos.to_le_bytes());
+        bundle.update(b"db-wal\0");
+        let wal = path.with_extension("db-wal");
+        if let Ok(metadata) = fs::symlink_metadata(&wal)
+            && metadata.is_file()
+        {
+            let modified = metadata
+                .modified()
+                .unwrap_or(SystemTime::UNIX_EPOCH)
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            bundle.update(b"present\0");
+            bundle.update(metadata.len().to_le_bytes());
+            bundle.update(modified.to_le_bytes());
+            fingerprint.modified_unix_nanos = fingerprint.modified_unix_nanos.max(modified);
         } else {
             bundle.update(b"absent\0");
         }
@@ -863,7 +929,12 @@ impl SessionCatalog {
         for path in paths {
             let fingerprint = match source_bundle_fingerprint(&path) {
                 Ok(fingerprint) => fingerprint,
-                Err(error) if matches!(self.agent, AgentKind::Copilot | AgentKind::Omp) => {
+                Err(error)
+                    if matches!(
+                        self.agent,
+                        AgentKind::Copilot | AgentKind::Omp | AgentKind::Agy
+                    ) =>
+                {
                     return Err(CatalogError::Io {
                         path,
                         message: error.to_string(),
@@ -1025,7 +1096,10 @@ impl SessionCatalog {
             match self.probe_candidate(candidate, stats) {
                 Ok(Some(source)) => sources.push(source),
                 Err(error @ CatalogError::Io { .. })
-                    if matches!(self.agent, AgentKind::Copilot | AgentKind::Omp) =>
+                    if matches!(
+                        self.agent,
+                        AgentKind::Copilot | AgentKind::Omp | AgentKind::Agy
+                    ) =>
                 {
                     return Err(error);
                 }
@@ -1047,6 +1121,27 @@ impl SessionCatalog {
         candidate: &CandidatePath,
         stats: &mut CatalogIoStats,
     ) -> Result<Option<CatalogSource>, CatalogError> {
+        // SQLite conversation files are not JSONL. Reading them as text
+        // fails on the first non-UTF-8 byte. The filename UUID is the
+        // catalog identity; the body is opened later, read-only, by the
+        // agy materializer.
+        if self.agent == AgentKind::Agy {
+            let Some(source_id) = candidate.filename_uuid.clone() else {
+                return Ok(None);
+            };
+            return Ok(Some(CatalogSource {
+                agent: self.agent,
+                source_id,
+                logical_session_id: None,
+                aliases: Vec::new(),
+                filename_aliases: candidate.filename_aliases.clone(),
+                scoped_children: Vec::new(),
+                path: candidate.path.clone(),
+                identity_inferred: true,
+                fingerprint: candidate.fingerprint.clone(),
+                header_truncated: false,
+            }));
+        }
         let file =
             sanitize::open_file_validated(&candidate.path).map_err(|error| CatalogError::Io {
                 path: candidate.path.clone(),

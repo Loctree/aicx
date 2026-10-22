@@ -434,6 +434,13 @@ pub enum ProviderConversationRef {
         parent_session_id: Option<String>,
         unobserved: Vec<String>,
     },
+    /// Native Antigravity CLI conversation. `session_id` is the cascade id.
+    /// `trajectory_id` is field 3 of the metadata blob when that field is present.
+    Agy {
+        session_id: String,
+        trajectory_id: Option<String>,
+        unobserved: Vec<String>,
+    },
 }
 
 impl ProviderConversationRef {
@@ -494,6 +501,11 @@ impl ProviderConversationRef {
                 parent_session_id: None,
                 unobserved: vec!["parent_session_id".to_owned()],
             },
+            AgentKind::Agy => Self::Agy {
+                session_id: store_id,
+                trajectory_id: None,
+                unobserved: vec!["trajectory_id".to_owned()],
+            },
         }
     }
 
@@ -508,6 +520,7 @@ impl ProviderConversationRef {
             Self::Cursor { .. } => AgentKind::Cursor,
             Self::Copilot { .. } => AgentKind::Copilot,
             Self::Omp { .. } => AgentKind::Omp,
+            Self::Agy { .. } => AgentKind::Agy,
         }
     }
 
@@ -522,7 +535,8 @@ impl ProviderConversationRef {
             | Self::Kimi { session_id, .. }
             | Self::Cursor { session_id, .. }
             | Self::Copilot { session_id, .. }
-            | Self::Omp { session_id, .. } => session_id,
+            | Self::Omp { session_id, .. }
+            | Self::Agy { session_id, .. } => session_id,
             Self::Codex {
                 tree_session_id,
                 thread_id,
@@ -576,7 +590,8 @@ impl ProviderConversationRef {
             | Self::Kimi { unobserved, .. }
             | Self::Cursor { unobserved, .. }
             | Self::Copilot { unobserved, .. }
-            | Self::Omp { unobserved, .. } => unobserved,
+            | Self::Omp { unobserved, .. }
+            | Self::Agy { unobserved, .. } => unobserved,
         }
     }
 }

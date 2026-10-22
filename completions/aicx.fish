@@ -143,19 +143,20 @@ complete -c aicx -n "__fish_aicx_using_subcommand all" -l conversation -d 'Conve
 complete -c aicx -n "__fish_aicx_using_subcommand all" -s v -l verbose -d 'Verbose diagnostics: echo per-file extractor warnings to stderr'
 complete -c aicx -n "__fish_aicx_using_subcommand all" -l project-fuzzy -d 'Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed'
 complete -c aicx -n "__fish_aicx_using_subcommand all" -s h -l help -d 'Print help (see more with \'--help\')'
-complete -c aicx -n "__fish_aicx_using_subcommand extract; and not __fish_seen_subcommand_from codex claude cursor gemini grok junie kimi copilot omp all help" -s v -l verbose -d 'Verbose diagnostics: echo per-file extractor warnings to stderr'
-complete -c aicx -n "__fish_aicx_using_subcommand extract; and not __fish_seen_subcommand_from codex claude cursor gemini grok junie kimi copilot omp all help" -s h -l help -d 'Print help (see more with \'--help\')'
-complete -c aicx -n "__fish_aicx_using_subcommand extract; and not __fish_seen_subcommand_from codex claude cursor gemini grok junie kimi copilot omp all help" -a "codex" -d 'OpenAI Codex CLI rollouts (~/.codex/sessions)'
-complete -c aicx -n "__fish_aicx_using_subcommand extract; and not __fish_seen_subcommand_from codex claude cursor gemini grok junie kimi copilot omp all help" -a "claude" -d 'Claude Code sessions (~/.claude/projects)'
-complete -c aicx -n "__fish_aicx_using_subcommand extract; and not __fish_seen_subcommand_from codex claude cursor gemini grok junie kimi copilot omp all help" -a "cursor" -d 'Cursor agent transcripts (~/.cursor/projects/*/agent-transcripts)'
-complete -c aicx -n "__fish_aicx_using_subcommand extract; and not __fish_seen_subcommand_from codex claude cursor gemini grok junie kimi copilot omp all help" -a "gemini" -d 'Gemini CLI chats (~/.gemini/tmp/<hash>/chats)'
-complete -c aicx -n "__fish_aicx_using_subcommand extract; and not __fish_seen_subcommand_from codex claude cursor gemini grok junie kimi copilot omp all help" -a "grok" -d 'Grok CLI sessions (~/.grok)'
-complete -c aicx -n "__fish_aicx_using_subcommand extract; and not __fish_seen_subcommand_from codex claude cursor gemini grok junie kimi copilot omp all help" -a "junie" -d 'JetBrains Junie event logs (~/.junie/sessions)'
-complete -c aicx -n "__fish_aicx_using_subcommand extract; and not __fish_seen_subcommand_from codex claude cursor gemini grok junie kimi copilot omp all help" -a "kimi" -d 'Kimi Code CLI wire files (~/.kimi-code/sessions)'
-complete -c aicx -n "__fish_aicx_using_subcommand extract; and not __fish_seen_subcommand_from codex claude cursor gemini grok junie kimi copilot omp all help" -a "copilot" -d 'GitHub Copilot CLI sessions (~/.copilot/session-state)'
-complete -c aicx -n "__fish_aicx_using_subcommand extract; and not __fish_seen_subcommand_from codex claude cursor gemini grok junie kimi copilot omp all help" -a "omp" -d 'oh-my-pi / pi sessions (~/.omp/agent/sessions and ~/.pi/agent/sessions)'
-complete -c aicx -n "__fish_aicx_using_subcommand extract; and not __fish_seen_subcommand_from codex claude cursor gemini grok junie kimi copilot omp all help" -a "all" -d 'Every compatible source on this machine, in one incremental pass'
-complete -c aicx -n "__fish_aicx_using_subcommand extract; and not __fish_seen_subcommand_from codex claude cursor gemini grok junie kimi copilot omp all help" -a "help" -d 'Print this message or the help of the given subcommand(s)'
+complete -c aicx -n "__fish_aicx_using_subcommand extract; and not __fish_seen_subcommand_from codex claude cursor gemini grok junie kimi copilot omp agy all help" -s v -l verbose -d 'Verbose diagnostics: echo per-file extractor warnings to stderr'
+complete -c aicx -n "__fish_aicx_using_subcommand extract; and not __fish_seen_subcommand_from codex claude cursor gemini grok junie kimi copilot omp agy all help" -s h -l help -d 'Print help (see more with \'--help\')'
+complete -c aicx -n "__fish_aicx_using_subcommand extract; and not __fish_seen_subcommand_from codex claude cursor gemini grok junie kimi copilot omp agy all help" -a "codex" -d 'OpenAI Codex CLI rollouts (~/.codex/sessions)'
+complete -c aicx -n "__fish_aicx_using_subcommand extract; and not __fish_seen_subcommand_from codex claude cursor gemini grok junie kimi copilot omp agy all help" -a "claude" -d 'Claude Code sessions (~/.claude/projects)'
+complete -c aicx -n "__fish_aicx_using_subcommand extract; and not __fish_seen_subcommand_from codex claude cursor gemini grok junie kimi copilot omp agy all help" -a "cursor" -d 'Cursor agent transcripts (~/.cursor/projects/*/agent-transcripts)'
+complete -c aicx -n "__fish_aicx_using_subcommand extract; and not __fish_seen_subcommand_from codex claude cursor gemini grok junie kimi copilot omp agy all help" -a "gemini" -d 'Gemini CLI chats (~/.gemini/tmp/<hash>/chats)'
+complete -c aicx -n "__fish_aicx_using_subcommand extract; and not __fish_seen_subcommand_from codex claude cursor gemini grok junie kimi copilot omp agy all help" -a "grok" -d 'Grok CLI sessions (~/.grok)'
+complete -c aicx -n "__fish_aicx_using_subcommand extract; and not __fish_seen_subcommand_from codex claude cursor gemini grok junie kimi copilot omp agy all help" -a "junie" -d 'JetBrains Junie event logs (~/.junie/sessions)'
+complete -c aicx -n "__fish_aicx_using_subcommand extract; and not __fish_seen_subcommand_from codex claude cursor gemini grok junie kimi copilot omp agy all help" -a "kimi" -d 'Kimi Code CLI wire files (~/.kimi-code/sessions)'
+complete -c aicx -n "__fish_aicx_using_subcommand extract; and not __fish_seen_subcommand_from codex claude cursor gemini grok junie kimi copilot omp agy all help" -a "copilot" -d 'GitHub Copilot CLI sessions (~/.copilot/session-state)'
+complete -c aicx -n "__fish_aicx_using_subcommand extract; and not __fish_seen_subcommand_from codex claude cursor gemini grok junie kimi copilot omp agy all help" -a "omp" -d 'oh-my-pi / pi sessions (~/.omp/agent/sessions and ~/.pi/agent/sessions)'
+complete -c aicx -n "__fish_aicx_using_subcommand extract; and not __fish_seen_subcommand_from codex claude cursor gemini grok junie kimi copilot omp agy all help" -a "agy" -d 'Antigravity CLI conversations (~/.gemini/antigravity-cli/conversations) and the IDE store (~/.gemini/antigravity/conversations)'
+complete -c aicx -n "__fish_aicx_using_subcommand extract; and not __fish_seen_subcommand_from codex claude cursor gemini grok junie kimi copilot omp agy all help" -a "all" -d 'Every compatible source on this machine, in one incremental pass'
+complete -c aicx -n "__fish_aicx_using_subcommand extract; and not __fish_seen_subcommand_from codex claude cursor gemini grok junie kimi copilot omp agy all help" -a "help" -d 'Print this message or the help of the given subcommand(s)'
 complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subcommand_from codex" -l session -d 'Session id: source id, logical id, alias, UUID suffix (≥8 chars), or unique prefix. Resolved through the session catalog before any parse' -r
 complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subcommand_from codex" -l file -d 'Direct source file. Builds a source handle from this path only — no catalog scan, no global AICX state. Requires `-o/--output`' -r -F
 complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subcommand_from codex" -s o -l output -d 'Output file path. Required with `--file`; defaults to `~/.aicx/extracts/<agent>/<session_id>[_conversation][_user].md` in session mode' -r -F
@@ -336,6 +337,26 @@ complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subco
 complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subcommand_from omp" -s v -l verbose -d 'Verbose diagnostics: echo per-file extractor warnings to stderr'
 complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subcommand_from omp" -l project-fuzzy -d 'Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed'
 complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subcommand_from omp" -s h -l help -d 'Print help (see more with \'--help\')'
+complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subcommand_from agy" -l session -d 'Session id: source id, logical id, alias, UUID suffix (≥8 chars), or unique prefix. Resolved through the session catalog before any parse' -r
+complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subcommand_from agy" -l file -d 'Direct source file. Builds a source handle from this path only — no catalog scan, no global AICX state. Requires `-o/--output`' -r -F
+complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subcommand_from agy" -s o -l output -d 'Output file path. Required with `--file`; defaults to `~/.aicx/extracts/<agent>/<session_id>[_conversation][_user].md` in session mode' -r -F
+complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subcommand_from agy" -s p -l project -d 'Project/repo filter, repeatable or comma-separated (OR across projects, AND with every other axis). Entries are kept when their recorded cwd belongs to one of them; an entry with no known cwd is filtered out rather than guessed. A single value also names the output\'s project identity, as before' -r
+complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subcommand_from agy" -l max-message-chars -d 'Maximum message characters in markdown (0 = no truncation)' -r
+complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subcommand_from agy" -s H -l hours -d 'Hours to look back inside the session view (0 = unbounded). A window on the projection, not a re-parse; absence is never a silent default' -r
+complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subcommand_from agy" -l kind -d 'Throne kind filter (repeatable / comma list): human | echo_seal | shell_action | inject | assistant_final | lineage_meta | inter_agent. `inter_agent` opens the inter-agent lane; it is never rendered as assistant and stays outside --conversation / --dialog by default' -r
+complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subcommand_from agy" -l lineage -d 'Walk parent sessions through `session_meta.forked_from_id` (session catalog lookup, never filename guessing). Bare `--lineage` = unbounded; `--lineage=N` = at most N parents. Needs --session (catalog)' -r
+complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subcommand_from agy" -l result -d 'Retained shell result body: none (`$ cmd [N lines, sha256:…]`, default) | head=N | full. The body stays in the substrate either way' -r
+complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subcommand_from agy" -l no-redact-secrets -d 'Redact secrets (tokens/keys) from outputs before writing/syncing'
+complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subcommand_from agy" -l user-only -d 'Only include user messages (exclude assistant + reasoning)'
+complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subcommand_from agy" -l agent-only -d 'Only include assistant answers (`assistant_final`). Reasoning, inter-agent traffic and lineage metadata are excluded: they are not the assistant speaking to the operator'
+complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subcommand_from agy" -l user-commands -d 'Only shell commands the human submitted (e.g. Codex `<user_shell_command>`). A command quoted in prose is not an execution'
+complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subcommand_from agy" -l agent-commands -d 'Only tool / shell invocations the agent made'
+complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subcommand_from agy" -l conversation -d 'Conversation-first mode: emit denoised user/assistant transcript only'
+complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subcommand_from agy" -l dialog -d 'Dialogue view: human speech (direct + delayed echo-bus / queued, with their seals) plus assistant-final answers'
+complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subcommand_from agy" -l brief -d 'Distilled handoff brief (inverted pyramid, one section per segment): outcome first, then decision candidates, gates, open questions and handoff signals, each with an evidence locator into the substrate. Rendered from the agent\'s distiller lane (`GenericLane` fail-open); mixed sessions get a multi-workstream header, never averaged outcomes'
+complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subcommand_from agy" -s v -l verbose -d 'Verbose diagnostics: echo per-file extractor warnings to stderr'
+complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subcommand_from agy" -l project-fuzzy -d 'Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed'
+complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subcommand_from agy" -s h -l help -d 'Print help (see more with \'--help\')'
 complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subcommand_from all" -l provider -d 'Restrict the pass to these providers (repeatable / comma list). Default: every provider the parser registry claims' -r
 complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subcommand_from all" -s p -l project -d 'Project/repo filter, repeatable (OR across projects, AND with the other axes). A session whose cwd is unknown is filtered out, not guessed into the result' -r
 complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subcommand_from all" -s H -l hours -d 'Hours to look back over *event* timestamps (0 = unbounded). One cutoff is captured when the command starts and every session shares it' -r
@@ -364,6 +385,7 @@ complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subco
 complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subcommand_from help" -f -a "kimi" -d 'Kimi Code CLI wire files (~/.kimi-code/sessions)'
 complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subcommand_from help" -f -a "copilot" -d 'GitHub Copilot CLI sessions (~/.copilot/session-state)'
 complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subcommand_from help" -f -a "omp" -d 'oh-my-pi / pi sessions (~/.omp/agent/sessions and ~/.pi/agent/sessions)'
+complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subcommand_from help" -f -a "agy" -d 'Antigravity CLI conversations (~/.gemini/antigravity-cli/conversations) and the IDE store (~/.gemini/antigravity/conversations)'
 complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subcommand_from help" -f -a "all" -d 'Every compatible source on this machine, in one incremental pass'
 complete -c aicx -n "__fish_aicx_using_subcommand extract; and __fish_seen_subcommand_from help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
 complete -c aicx -n "__fish_aicx_using_subcommand conversations" -l agent -d 'Source agent for batch conversation export' -r
@@ -483,7 +505,7 @@ complete -c aicx -n "__fish_aicx_using_subcommand sessions; and __fish_seen_subc
 complete -c aicx -n "__fish_aicx_using_subcommand sessions; and __fish_seen_subcommand_from current" -l project-fuzzy -d 'Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed'
 complete -c aicx -n "__fish_aicx_using_subcommand sessions; and __fish_seen_subcommand_from current" -s h -l help -d 'Print help (see more with \'--help\')'
 complete -c aicx -n "__fish_aicx_using_subcommand sessions; and __fish_seen_subcommand_from list" -s p -l project -d 'Exact project filter, same shapes as search/intents/MCP: `owner/repo`, `/repo` (cross-org repo), `owner/` (org wildcard), or a unique bare `name`. Empty is a numbered miss, not silence' -r
-complete -c aicx -n "__fish_aicx_using_subcommand sessions; and __fish_seen_subcommand_from list" -l agent -d 'Filter by agent (claude | codex | gemini | junie | grok | kimi | cursor | copilot | omp)' -r -f -a "claude\t''
+complete -c aicx -n "__fish_aicx_using_subcommand sessions; and __fish_seen_subcommand_from list" -l agent -d 'Filter by agent (claude | codex | gemini | junie | grok | kimi | cursor | copilot | omp | agy | agy)' -r -f -a "claude\t''
 codex\t''
 gemini\t''
 junie\t''
@@ -497,7 +519,10 @@ github-copilot\t''
 github-copilot-cli\t''
 omp\t''
 pi\t''
-oh-my-pi\t''"
+oh-my-pi\t''
+agy\t''
+antigravity\t''
+antigravity-cli\t''"
 complete -c aicx -n "__fish_aicx_using_subcommand sessions; and __fish_seen_subcommand_from list" -l since -d 'Only sessions updated on/after this date (YYYY-MM-DD). Defaults to the last 30 days; pass --all to scan the full history' -r
 complete -c aicx -n "__fish_aicx_using_subcommand sessions; and __fish_seen_subcommand_from list" -l limit -d 'Max sessions to show (0 = all)' -r
 complete -c aicx -n "__fish_aicx_using_subcommand sessions; and __fish_seen_subcommand_from list" -l format -d 'Output format: table | json' -r
@@ -512,7 +537,7 @@ complete -c aicx -n "__fish_aicx_using_subcommand sessions; and __fish_seen_subc
 complete -c aicx -n "__fish_aicx_using_subcommand sessions; and __fish_seen_subcommand_from show" -s v -l verbose -d 'Verbose diagnostics: echo per-file extractor warnings to stderr'
 complete -c aicx -n "__fish_aicx_using_subcommand sessions; and __fish_seen_subcommand_from show" -l project-fuzzy -d 'Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed'
 complete -c aicx -n "__fish_aicx_using_subcommand sessions; and __fish_seen_subcommand_from show" -s h -l help -d 'Print help (see more with \'--help\')'
-complete -c aicx -n "__fish_aicx_using_subcommand sessions; and __fish_seen_subcommand_from report" -l agent -d 'Agent: claude | codex | gemini | junie | grok | kimi | cursor | copilot | omp. Inferred from the session id when omitted' -r
+complete -c aicx -n "__fish_aicx_using_subcommand sessions; and __fish_seen_subcommand_from report" -l agent -d 'Agent: claude | codex | gemini | junie | grok | kimi | cursor | copilot | omp | agy. Inferred from the session id when omitted' -r
 complete -c aicx -n "__fish_aicx_using_subcommand sessions; and __fish_seen_subcommand_from report" -l hours -d 'Hours to look back when locating the session (default 720)' -r
 complete -c aicx -n "__fish_aicx_using_subcommand sessions; and __fish_seen_subcommand_from report" -l repo -d 'Repo root evidence is checked against (default: current directory)' -r -F
 complete -c aicx -n "__fish_aicx_using_subcommand sessions; and __fish_seen_subcommand_from report" -l max -d 'Max clarify questions (hard-capped at 5)' -r
@@ -531,7 +556,7 @@ complete -c aicx -n "__fish_aicx_using_subcommand claims; and not __fish_seen_su
 complete -c aicx -n "__fish_aicx_using_subcommand claims; and not __fish_seen_subcommand_from extract help" -f -a "extract" -d 'Extract Unverified claims (Lane 2) from a session\'s conversation'
 complete -c aicx -n "__fish_aicx_using_subcommand claims; and not __fish_seen_subcommand_from extract help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
 complete -c aicx -n "__fish_aicx_using_subcommand claims; and __fish_seen_subcommand_from extract" -l session -d 'Session id (or unique prefix)' -r
-complete -c aicx -n "__fish_aicx_using_subcommand claims; and __fish_seen_subcommand_from extract" -l agent -d 'Agent: claude | codex | gemini | junie | grok | kimi | cursor | copilot | omp. Inferred from the session id when omitted' -r
+complete -c aicx -n "__fish_aicx_using_subcommand claims; and __fish_seen_subcommand_from extract" -l agent -d 'Agent: claude | codex | gemini | junie | grok | kimi | cursor | copilot | omp | agy. Inferred from the session id when omitted' -r
 complete -c aicx -n "__fish_aicx_using_subcommand claims; and __fish_seen_subcommand_from extract" -l hours -d 'Hours to look back when locating the session (default 720)' -r
 complete -c aicx -n "__fish_aicx_using_subcommand claims; and __fish_seen_subcommand_from extract" -l format -d 'Output format: json | summary' -r
 complete -c aicx -n "__fish_aicx_using_subcommand claims; and __fish_seen_subcommand_from extract" -s v -l verbose -d 'Verbose diagnostics: echo per-file extractor warnings to stderr'
@@ -545,7 +570,7 @@ complete -c aicx -n "__fish_aicx_using_subcommand results; and not __fish_seen_s
 complete -c aicx -n "__fish_aicx_using_subcommand results; and not __fish_seen_subcommand_from collect help" -f -a "collect" -d 'Collect repo evidence (artifact existence) for a session\'s claims and fold it into verification statuses (Lane 3)'
 complete -c aicx -n "__fish_aicx_using_subcommand results; and not __fish_seen_subcommand_from collect help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
 complete -c aicx -n "__fish_aicx_using_subcommand results; and __fish_seen_subcommand_from collect" -l session -d 'Session id (or unique prefix)' -r
-complete -c aicx -n "__fish_aicx_using_subcommand results; and __fish_seen_subcommand_from collect" -l agent -d 'Agent: claude | codex | gemini | junie | grok | kimi | cursor | copilot | omp. Inferred from the session id when omitted' -r
+complete -c aicx -n "__fish_aicx_using_subcommand results; and __fish_seen_subcommand_from collect" -l agent -d 'Agent: claude | codex | gemini | junie | grok | kimi | cursor | copilot | omp | agy. Inferred from the session id when omitted' -r
 complete -c aicx -n "__fish_aicx_using_subcommand results; and __fish_seen_subcommand_from collect" -l hours -d 'Hours to look back when locating the session (default 720)' -r
 complete -c aicx -n "__fish_aicx_using_subcommand results; and __fish_seen_subcommand_from collect" -l repo -d 'Repo root evidence is checked against (default: current directory)' -r -F
 complete -c aicx -n "__fish_aicx_using_subcommand results; and __fish_seen_subcommand_from collect" -l format -d 'Output format: json | summary' -r
@@ -555,7 +580,7 @@ complete -c aicx -n "__fish_aicx_using_subcommand results; and __fish_seen_subco
 complete -c aicx -n "__fish_aicx_using_subcommand results; and __fish_seen_subcommand_from help" -f -a "collect" -d 'Collect repo evidence (artifact existence) for a session\'s claims and fold it into verification statuses (Lane 3)'
 complete -c aicx -n "__fish_aicx_using_subcommand results; and __fish_seen_subcommand_from help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
 complete -c aicx -n "__fish_aicx_using_subcommand clarify" -l session -d 'Session id (or unique prefix)' -r
-complete -c aicx -n "__fish_aicx_using_subcommand clarify" -l agent -d 'Agent: claude | codex | gemini | junie | grok | kimi | cursor | copilot | omp. Inferred from the session id when omitted' -r
+complete -c aicx -n "__fish_aicx_using_subcommand clarify" -l agent -d 'Agent: claude | codex | gemini | junie | grok | kimi | cursor | copilot | omp | agy. Inferred from the session id when omitted' -r
 complete -c aicx -n "__fish_aicx_using_subcommand clarify" -l hours -d 'Hours to look back when locating the session (default 720)' -r
 complete -c aicx -n "__fish_aicx_using_subcommand clarify" -l repo -d 'Repo root evidence is checked against (default: current directory)' -r -F
 complete -c aicx -n "__fish_aicx_using_subcommand clarify" -l max -d 'Max questions (hard-capped at 5)' -r
@@ -597,7 +622,7 @@ complete -c aicx -n "__fish_aicx_using_subcommand dashboard" -l auth-token -d 'O
 complete -c aicx -n "__fish_aicx_using_subcommand dashboard" -l require-auth -d 'Require Bearer auth on dashboard `/api/*` (default: true). Pass `--no-require-auth` to opt out' -r -f -a "true\t''
 false\t''"
 complete -c aicx -n "__fish_aicx_using_subcommand dashboard" -l title -d 'Document title' -r
-complete -c aicx -n "__fish_aicx_using_subcommand dashboard" -l preview-chars -d 'Max preview characters per record (0 = no truncation)' -r
+complete -c aicx -n "__fish_aicx_using_subcommand dashboard" -l preview-chars -d 'Max osnowa characters per record (0 = no truncation). Default is the shared result preview' -r
 complete -c aicx -n "__fish_aicx_using_subcommand dashboard" -l serve -d 'Run the live local HTTP dashboard instead of generating a static HTML file'
 complete -c aicx -n "__fish_aicx_using_subcommand dashboard" -l generate-html -d 'Generate a standalone HTML file (default mode when no mode flag is passed)'
 complete -c aicx -n "__fish_aicx_using_subcommand dashboard" -l no-open -d 'Suppress automatic browser open on startup (server mode only)'
@@ -673,7 +698,7 @@ complete -c aicx -n "__fish_aicx_using_subcommand dashboard-serve" -l host -d 'B
 complete -c aicx -n "__fish_aicx_using_subcommand dashboard-serve" -l port -d 'Bind TCP port' -r
 complete -c aicx -n "__fish_aicx_using_subcommand dashboard-serve" -l artifact -d 'Legacy compatibility path retained for status surfaces; not written in server mode' -r -F
 complete -c aicx -n "__fish_aicx_using_subcommand dashboard-serve" -l title -d 'Document title' -r
-complete -c aicx -n "__fish_aicx_using_subcommand dashboard-serve" -l preview-chars -d 'Max preview characters per record (0 = no truncation)' -r
+complete -c aicx -n "__fish_aicx_using_subcommand dashboard-serve" -l preview-chars -d 'Max osnowa characters per record (0 = no truncation). Default is the shared result preview' -r
 complete -c aicx -n "__fish_aicx_using_subcommand dashboard-serve" -l no-open -d 'Suppress automatic browser open on startup'
 complete -c aicx -n "__fish_aicx_using_subcommand dashboard-serve" -s v -l verbose -d 'Verbose diagnostics: echo per-file extractor warnings to stderr'
 complete -c aicx -n "__fish_aicx_using_subcommand dashboard-serve" -l project-fuzzy -d 'Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed'
@@ -692,7 +717,7 @@ complete -c aicx -n "__fish_aicx_using_subcommand intents" -l sort -d 'Sort orde
 oldest\t''
 score\t''"
 complete -c aicx -n "__fish_aicx_using_subcommand intents" -l score -d 'Minimum score threshold (0-100; semantic match confidence)' -r
-complete -c aicx -n "__fish_aicx_using_subcommand intents" -l agent -d 'Agent name filter: claude | codex | gemini | junie | grok | kimi | cursor | copilot | omp | codescribe' -r
+complete -c aicx -n "__fish_aicx_using_subcommand intents" -l agent -d 'Agent name filter: claude | codex | gemini | junie | grok | kimi | cursor | copilot | omp | agy | codescribe' -r
 complete -c aicx -n "__fish_aicx_using_subcommand intents" -l since -d 'Lower date bound: YYYY-MM-DD or relative (e.g., 2026-04-23..)' -r
 complete -c aicx -n "__fish_aicx_using_subcommand intents" -l until -d 'Upper date bound: YYYY-MM-DD' -r
 complete -c aicx -n "__fish_aicx_using_subcommand intents" -l frame-kind -d 'Frame channel filter: user_msg | agent_reply | internal_thought | tool_call' -r -f -a "user_msg\t''
@@ -714,6 +739,7 @@ complete -c aicx -n "__fish_aicx_using_subcommand intents" -l strict -d 'Only sh
 complete -c aicx -n "__fish_aicx_using_subcommand intents" -l live -d 'Force the live source-root scan regardless of the window size. (Windows of ≤ 48h scan live sources automatically.)'
 complete -c aicx -n "__fish_aicx_using_subcommand intents" -l no-live -d 'Disable the automatic live scan for hot (≤ 48h) windows'
 complete -c aicx -n "__fish_aicx_using_subcommand intents" -l full-rescan -d 'Parse every selected catalog source instead of deferring legacy scope holes. Expensive; parser safety bounds still apply'
+complete -c aicx -n "__fish_aicx_using_subcommand intents" -l full -d 'Print the whole osnowa. Default keeps the shared 3000-character preview'
 complete -c aicx -n "__fish_aicx_using_subcommand intents" -s v -l verbose -d 'Verbose diagnostics: echo per-file extractor warnings to stderr'
 complete -c aicx -n "__fish_aicx_using_subcommand intents" -l project-fuzzy -d 'Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed'
 complete -c aicx -n "__fish_aicx_using_subcommand intents" -s h -l help -d 'Print help (see more with \'--help\')'
@@ -754,7 +780,7 @@ complete -c aicx -n "__fish_aicx_using_subcommand tail" -l sort -d 'Sort order a
 oldest\t''
 score\t''"
 complete -c aicx -n "__fish_aicx_using_subcommand tail" -l score -d 'Minimum score threshold (0-100; semantic match confidence)' -r
-complete -c aicx -n "__fish_aicx_using_subcommand tail" -l agent -d 'Agent name filter: claude | codex | gemini | junie | grok | kimi | cursor | copilot | omp | codescribe' -r
+complete -c aicx -n "__fish_aicx_using_subcommand tail" -l agent -d 'Agent name filter: claude | codex | gemini | junie | grok | kimi | cursor | copilot | omp | agy | codescribe' -r
 complete -c aicx -n "__fish_aicx_using_subcommand tail" -l since -d 'Lower date bound: YYYY-MM-DD or relative (e.g., 2026-04-23..)' -r
 complete -c aicx -n "__fish_aicx_using_subcommand tail" -l until -d 'Upper date bound: YYYY-MM-DD' -r
 complete -c aicx -n "__fish_aicx_using_subcommand tail" -l frame-kind -d 'Frame channel filter: user_msg | agent_reply | internal_thought | tool_call' -r -f -a "user_msg\t''
@@ -805,7 +831,7 @@ complete -c aicx -n "__fish_aicx_using_subcommand search" -l sort -d 'Sort order
 oldest\t''
 score\t''"
 complete -c aicx -n "__fish_aicx_using_subcommand search" -l score -d 'Minimum score threshold (0-100; semantic match confidence)' -r
-complete -c aicx -n "__fish_aicx_using_subcommand search" -l agent -d 'Agent name filter: claude | codex | gemini | junie | grok | kimi | cursor | copilot | omp | codescribe' -r
+complete -c aicx -n "__fish_aicx_using_subcommand search" -l agent -d 'Agent name filter: claude | codex | gemini | junie | grok | kimi | cursor | copilot | omp | agy | codescribe' -r
 complete -c aicx -n "__fish_aicx_using_subcommand search" -l since -d 'Lower date bound: YYYY-MM-DD or relative (e.g., 2026-04-23..)' -r
 complete -c aicx -n "__fish_aicx_using_subcommand search" -l until -d 'Upper date bound: YYYY-MM-DD' -r
 complete -c aicx -n "__fish_aicx_using_subcommand search" -l frame-kind -d 'Frame channel filter: user_msg | agent_reply | internal_thought | tool_call' -r -f -a "user_msg\t''
@@ -926,7 +952,7 @@ complete -c aicx -n "__fish_aicx_using_subcommand steer" -l sort -d 'Sort order 
 oldest\t''
 score\t''"
 complete -c aicx -n "__fish_aicx_using_subcommand steer" -l score -d 'Minimum score threshold (0-100; semantic match confidence)' -r
-complete -c aicx -n "__fish_aicx_using_subcommand steer" -l agent -d 'Agent name filter: claude | codex | gemini | junie | grok | kimi | cursor | copilot | omp | codescribe' -r
+complete -c aicx -n "__fish_aicx_using_subcommand steer" -l agent -d 'Agent name filter: claude | codex | gemini | junie | grok | kimi | cursor | copilot | omp | agy | codescribe' -r
 complete -c aicx -n "__fish_aicx_using_subcommand steer" -l since -d 'Lower date bound: YYYY-MM-DD or relative (e.g., 2026-04-23..)' -r
 complete -c aicx -n "__fish_aicx_using_subcommand steer" -l until -d 'Upper date bound: YYYY-MM-DD' -r
 complete -c aicx -n "__fish_aicx_using_subcommand steer" -l frame-kind -d 'Frame channel filter: user_msg | agent_reply | internal_thought | tool_call' -r -f -a "user_msg\t''
@@ -1028,6 +1054,7 @@ complete -c aicx -n "__fish_aicx_using_subcommand help; and __fish_seen_subcomma
 complete -c aicx -n "__fish_aicx_using_subcommand help; and __fish_seen_subcommand_from extract" -f -a "kimi" -d 'Kimi Code CLI wire files (~/.kimi-code/sessions)'
 complete -c aicx -n "__fish_aicx_using_subcommand help; and __fish_seen_subcommand_from extract" -f -a "copilot" -d 'GitHub Copilot CLI sessions (~/.copilot/session-state)'
 complete -c aicx -n "__fish_aicx_using_subcommand help; and __fish_seen_subcommand_from extract" -f -a "omp" -d 'oh-my-pi / pi sessions (~/.omp/agent/sessions and ~/.pi/agent/sessions)'
+complete -c aicx -n "__fish_aicx_using_subcommand help; and __fish_seen_subcommand_from extract" -f -a "agy" -d 'Antigravity CLI conversations (~/.gemini/antigravity-cli/conversations) and the IDE store (~/.gemini/antigravity/conversations)'
 complete -c aicx -n "__fish_aicx_using_subcommand help; and __fish_seen_subcommand_from extract" -f -a "all" -d 'Every compatible source on this machine, in one incremental pass'
 complete -c aicx -n "__fish_aicx_using_subcommand help; and __fish_seen_subcommand_from catalog" -f -a "rebuild" -d 'Walk all source roots and rewrite `~/.aicx/catalog/sessions.jsonl`'
 complete -c aicx -n "__fish_aicx_using_subcommand help; and __fish_seen_subcommand_from catalog" -f -a "refresh" -d 'Admit new or changed sessions from a bounded hot window'

@@ -718,7 +718,7 @@ fn gemini_catalog_admits_only_conversations_under_chats() {
 
 #[test]
 fn agent_kind_exposes_session_roots_and_parser_kinds() {
-    assert_eq!(AgentKind::ALL.len(), 9);
+    assert_eq!(AgentKind::ALL.len(), 10);
     assert_eq!(AgentKind::parse("claude"), Some(AgentKind::Claude));
     assert_eq!(AgentKind::parse("cursor"), Some(AgentKind::Cursor));
     assert_eq!(AgentKind::parse("cursor-agent"), Some(AgentKind::Cursor));
@@ -779,4 +779,25 @@ fn agent_kind_exposes_session_roots_and_parser_kinds() {
         ]
     );
     assert_eq!(AgentKind::Copilot.session_roots(home).len(), 1);
+    assert_eq!(AgentKind::parse("agy"), Some(AgentKind::Agy));
+    assert_eq!(AgentKind::parse("antigravity"), Some(AgentKind::Agy));
+    assert_eq!(AgentKind::parse("antigravity-cli"), Some(AgentKind::Agy));
+    assert_eq!(
+        AgentKind::parse("gemini-antigravity"),
+        Some(AgentKind::Gemini)
+    );
+    assert_eq!(
+        AgentKind::Agy.parser_kind(),
+        aicx::parser::engine::AgentKind::Agy
+    );
+    assert_eq!(
+        AgentKind::Agy.session_root(home),
+        home.join(".gemini")
+            .join("antigravity-cli")
+            .join("conversations")
+    );
+    assert_eq!(
+        AgentKind::Agy.session_roots(home),
+        session_catalog::agy_session_roots(home)
+    );
 }

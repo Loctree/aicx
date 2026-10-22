@@ -611,6 +611,7 @@ fn canonical_extractor_key(extractor: &str) -> &'static str {
         "cursor" => "cursor",
         "copilot" | "copilot-cli" | "github-copilot" | "github-copilot-cli" => "copilot",
         "omp" | "pi" | "oh-my-pi" => "omp",
+        "agy" | "antigravity" | "antigravity-cli" => "agy",
         _ => {
             // Unknown extractor → explicit "unknown" bucket, never silent
             // attribution to claude. Drop the debug_assert because legit

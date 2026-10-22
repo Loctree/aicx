@@ -21,6 +21,23 @@ pub fn source_handle_for_file(
     logical_session_id: Option<String>,
     path: &Path,
 ) -> Result<SourceHandle> {
+    if agent == AgentKind::Agy {
+        let bytes = crate::agy_store::materialize_agy_db(path)
+            .map_err(|error| anyhow!("agy trajectory could not be read: {error}"))?;
+        let artifact = SourceArtifact::memory(
+            format!("{}.jsonl", safe_source_id(source_id)),
+            bytes,
+            SourceFraming::JsonLines,
+        )
+        .map_err(|error| anyhow!("invalid agy trajectory artifact: {error}"))?;
+        return SourceHandle::new(
+            agent,
+            safe_source_id(source_id),
+            logical_session_id,
+            vec![artifact],
+        )
+        .map_err(|error| anyhow!("invalid source handle: {error}"));
+    }
     let artifact_name = path
         .file_name()
         .and_then(|name| name.to_str())

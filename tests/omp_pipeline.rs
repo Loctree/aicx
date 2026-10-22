@@ -555,7 +555,7 @@ fn legacy_all_watermark_does_not_skip_the_new_omp_provider() {
     let migrated: Value =
         serde_json::from_slice(&fs::read(aicx_home.join("state.json")).unwrap()).unwrap();
     assert_eq!(
-        migrated["last_processed"]["claude+codescribe+codex+copilot+cursor+gemini+grok+junie+kimi+omp:all"],
+        migrated["last_processed"]["agy+claude+codescribe+codex+copilot+cursor+gemini+grok+junie+kimi+omp:all"],
         "2026-09-30T00:00:00Z",
         "incumbent watermark does not move backwards: {migrated}"
     );

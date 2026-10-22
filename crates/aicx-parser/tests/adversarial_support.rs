@@ -17,7 +17,7 @@ pub struct AgentCase {
     pub mutation_needle: &'static str,
 }
 
-pub fn cases() -> [AgentCase; 8] {
+pub fn cases() -> [AgentCase; 9] {
     [
         AgentCase {
             agent: AgentKind::Omp,
@@ -78,6 +78,13 @@ pub fn cases() -> [AgentCase; 8] {
             source_id: "adversarial-kimi",
             base: include_bytes!("../../../tests/fixtures/parser_engine/kimi/minimal.jsonl"),
             mutation_needle: "Zbuduj parser kimi.",
+        },
+        AgentCase {
+            agent: AgentKind::Agy,
+            artifact: "cli.jsonl",
+            source_id: "11111111-1111-4111-8111-111111111111",
+            base: include_bytes!("../../../tests/fixtures/parser_engine/agy/cli.jsonl"),
+            mutation_needle: "Preserve the agy request about lexical search.",
         },
     ]
 }
@@ -234,6 +241,11 @@ pub fn opaque_event(case: AgentCase) -> Vec<u8> {
             format!(
                 r#"{{"type":"credential_pin","id":"pin-opaque","parentId":null,"timestamp":"2026-10-21T12:00:25.000Z","provider":"fixture","hash":"{SECRET_SENTINEL}"}}"#
             )
+        }
+        AgentKind::Agy => {
+            // Sentinel bytes live inside base64 of a non-UTF-8 protobuf field.
+            // The JSON line itself does not carry the plaintext.
+            r#"{"idx":900,"payload_b64":"CIQBKmMKCAjA0O7VBhAAYgtzdGVwLW9wYXF1ZSJKCgtvcGFxdWUtY2FsbBIJdmlld19maWxlGgJ7fTosEioKKEFJQ1hfU0VDUkVUX1NFTlRJTkVMX0M1QV9ET19OT1RfUFJPSkVDVP8=","record":"step","status":3,"step_format":0,"step_type":132,"v":1}"#.to_owned()
         }
     };
     bytes.extend_from_slice(line.as_bytes());

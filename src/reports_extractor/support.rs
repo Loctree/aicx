@@ -533,7 +533,18 @@ fn humanize_stem(stem: &str) -> String {
 
 fn agent_from_title(title: &str) -> Option<String> {
     [
-        "copilot", "omp", "oh-my-pi", "codex", "claude", "gemini", "cursor", "grok", "junie",
+        "antigravity-cli",
+        "antigravity",
+        "agy",
+        "copilot",
+        "omp",
+        "oh-my-pi",
+        "codex",
+        "claude",
+        "gemini",
+        "cursor",
+        "grok",
+        "junie",
         "kimi",
     ]
     .iter()

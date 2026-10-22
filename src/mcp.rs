@@ -785,7 +785,7 @@ pub struct SteerParams {
     pub run_id: Option<String>,
     /// Filter by prompt_id (exact match against sidecar metadata)
     pub prompt_id: Option<String>,
-    /// Filter by agent name: claude, codex, cursor, gemini, junie, kimi, grok, copilot (case-insensitive)
+    /// Filter by agent name: claude, codex, cursor, gemini, junie, kimi, grok, copilot, omp, agy (case-insensitive)
     pub agent: Option<String>,
     /// Filter by kind: conversations, plans, reports, other
     pub kind: Option<String>,
@@ -919,7 +919,7 @@ pub struct SessionsParams {
     pub projects: Option<Vec<String>>,
     /// Project identity matching: `exact` (default) or explicit `fuzzy`.
     pub project_match: Option<String>,
-    /// Filter by agent: claude, codex, cursor, gemini, junie, kimi, grok, copilot.
+    /// Filter by agent: claude, codex, cursor, gemini, junie, kimi, grok, copilot, omp, agy.
     pub agent: Option<String>,
     /// Hours to look back (default 720 = 30 days, 0 = all time).
     #[serde(default = "mcp_session::default_list_hours")]

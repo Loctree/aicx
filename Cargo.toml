@@ -47,6 +47,7 @@ app = [
     "dep:inquire",
     "dep:ratatui",
     "dep:reqwest",
+    "dep:rusqlite",
     "dep:rmcp",
     "dep:tokio",
     "dep:tower_governor",
@@ -89,6 +90,7 @@ inquire = { version = "0.7", optional = true }
 globset = "0.4"
 ratatui = { version = "0.30", optional = true }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots"], optional = true }
+rusqlite = { version = "0.32", features = ["bundled"], optional = true }
 crossterm = { version = "0.29", optional = true }
 axum = { version = "0.8", optional = true }
 futures = { version = "0.3", optional = true }

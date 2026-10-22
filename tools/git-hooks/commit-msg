@@ -54,6 +54,7 @@ if [[ "$first_line" =~ $subject_pattern ]]; then
         gemini-antigravity) session_agent=gemini ;;
         copilot-cli|github-copilot|github-copilot-cli) session_agent=copilot ;;
         pi|oh-my-pi) session_agent=omp ;;
+        antigravity|antigravity-cli) session_agent=agy ;;
     esac
     prepare_hook="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)/prepare-commit-msg"
     if [ -f "$prepare_hook" ]; then

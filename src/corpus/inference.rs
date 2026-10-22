@@ -8,9 +8,24 @@ use std::time::SystemTime;
 use crate::sanitize;
 
 pub(super) fn infer_agent(path: &Path, content: &str) -> String {
+    let path_text = path
+        .display()
+        .to_string()
+        .replace('\\', "/")
+        .to_ascii_lowercase();
+    let path_is_db = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("db"));
+    // Path only. A `.pb` under the same tree stays on the Gemini legacy path,
+    // and file contents must not steal a store that merely mentions agy.
+    if path_text.contains("antigravity-cli/conversations")
+        || (path_text.contains("/antigravity/conversations/") && path_is_db)
+    {
+        return "agy".to_string();
+    }
     let haystack = format!(
-        "{} {}",
-        path.display(),
+        "{path_text} {}",
         content.lines().take(20).collect::<String>()
     )
     .to_ascii_lowercase();

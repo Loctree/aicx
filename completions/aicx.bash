@@ -265,6 +265,9 @@ _aicx() {
             aicx__subcmd__eval__subcmd__help,search-quality)
                 cmd="aicx__subcmd__eval__subcmd__help__subcmd__search__subcmd__quality"
                 ;;
+            aicx__subcmd__extract,agy)
+                cmd="aicx__subcmd__extract__subcmd__agy"
+                ;;
             aicx__subcmd__extract,all)
                 cmd="aicx__subcmd__extract__subcmd__all"
                 ;;
@@ -297,6 +300,9 @@ _aicx() {
                 ;;
             aicx__subcmd__extract,omp)
                 cmd="aicx__subcmd__extract__subcmd__omp"
+                ;;
+            aicx__subcmd__extract__subcmd__help,agy)
+                cmd="aicx__subcmd__extract__subcmd__help__subcmd__agy"
                 ;;
             aicx__subcmd__extract__subcmd__help,all)
                 cmd="aicx__subcmd__extract__subcmd__help__subcmd__all"
@@ -495,6 +501,9 @@ _aicx() {
                 ;;
             aicx__subcmd__help__subcmd__eval,search-quality)
                 cmd="aicx__subcmd__help__subcmd__eval__subcmd__search__subcmd__quality"
+                ;;
+            aicx__subcmd__help__subcmd__extract,agy)
+                cmd="aicx__subcmd__help__subcmd__extract__subcmd__agy"
                 ;;
             aicx__subcmd__help__subcmd__extract,all)
                 cmd="aicx__subcmd__help__subcmd__extract__subcmd__all"
@@ -1817,12 +1826,74 @@ _aicx() {
             return 0
             ;;
         aicx__subcmd__extract)
-            opts="-v -h --verbose --project-fuzzy --help codex claude cursor gemini grok junie kimi copilot omp all help"
+            opts="-v -h --verbose --project-fuzzy --help codex claude cursor gemini grok junie kimi copilot omp agy all help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi
             case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        aicx__subcmd__extract__subcmd__agy)
+            opts="-o -p -H -v -h --no-redact-secrets --session --file --output --project --user-only --agent-only --user-commands --agent-commands --max-message-chars --conversation --hours --kind --dialog --brief --lineage --result --verbose --project-fuzzy --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --session)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --file)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --output)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                -o)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --project)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                -p)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --max-message-chars)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --hours)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                -H)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --kind)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --lineage)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --result)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
                 *)
                     COMPREPLY=()
                     ;;
@@ -2257,8 +2328,22 @@ _aicx() {
             return 0
             ;;
         aicx__subcmd__extract__subcmd__help)
-            opts="codex claude cursor gemini grok junie kimi copilot omp all help"
+            opts="codex claude cursor gemini grok junie kimi copilot omp agy all help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        aicx__subcmd__extract__subcmd__help__subcmd__agy)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi
@@ -3045,8 +3130,22 @@ _aicx() {
             return 0
             ;;
         aicx__subcmd__help__subcmd__extract)
-            opts="codex claude cursor gemini grok junie kimi copilot omp all"
+            opts="codex claude cursor gemini grok junie kimi copilot omp agy all"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        aicx__subcmd__help__subcmd__extract__subcmd__agy)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi
@@ -3891,7 +3990,7 @@ _aicx() {
             return 0
             ;;
         aicx__subcmd__intents)
-            opts="-p -H -v -h --project --hours --limit --sort --score --agent --since --until --frame-kind --unresolved --unresolved-mode --collapse-session --emit --strict --min-confidence --kind --live --no-live --full-rescan --verbose --project-fuzzy --help"
+            opts="-p -H -v -h --project --hours --limit --sort --score --agent --since --until --frame-kind --unresolved --unresolved-mode --collapse-session --emit --strict --min-confidence --kind --live --no-live --full-rescan --full --verbose --project-fuzzy --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -4566,7 +4665,7 @@ _aicx() {
                     return 0
                     ;;
                 --agent)
-                    COMPREPLY=($(compgen -W "claude codex gemini junie grok kimi cursor cursor-agent copilot copilot-cli github-copilot github-copilot-cli omp pi oh-my-pi" -- "${cur}"))
+                    COMPREPLY=($(compgen -W "claude codex gemini junie grok kimi cursor cursor-agent copilot copilot-cli github-copilot github-copilot-cli omp pi oh-my-pi agy antigravity antigravity-cli" -- "${cur}"))
                     return 0
                     ;;
                 --since)

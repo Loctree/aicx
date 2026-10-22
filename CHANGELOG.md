@@ -14,6 +14,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Native Antigravity CLI conversations (`agy`, aliases `antigravity` and
+  `antigravity-cli`) across discovery/catalog, readable extracts, bulk
+  exports, conversation JSON, intents, handoff briefs, source indexing/search,
+  and MCP. Read `~/.gemini/antigravity-cli/conversations/<cascade-uuid>.db`
+  and the same SQLite schema under `~/.gemini/antigravity/conversations`.
+  The application opens each database read-only and feeds the parser a
+  deterministic JSONL stream. Legacy `.pb` exports and `gemini-antigravity`
+  stay on the Gemini adapter. Unknown step types stay visible as coverage
+  warnings. See `docs/AGY_SESSIONS.md`.
 - oh-my-pi and upstream pi sessions (`omp`, aliases `pi` and `oh-my-pi`)
   across discovery/catalog, readable extracts, bulk exports, conversation
   JSON, intents, handoff briefs, source indexing/search, and MCP. Read

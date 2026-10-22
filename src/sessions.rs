@@ -1854,6 +1854,139 @@ pub(crate) fn scan_omp_session_file(path: &Path, session_id: &str) -> Option<Ses
     })
 }
 
+/// Discover native Antigravity CLI and IDE conversation databases.
+/// Each `<cascade-uuid>.db` under the conversations directory is one session.
+/// Legacy `.pb` exports stay on the Gemini path.
+pub fn discover_agy_sessions(
+    sessions_root: &Path,
+    modified_after: Option<SystemTime>,
+    cwd_filter: Option<&str>,
+) -> Vec<SessionInfo> {
+    use crate::session_catalog::{AgentKind, SessionCatalog};
+    match sessions_root.try_exists() {
+        Ok(false) => return Vec::new(),
+        Ok(true) => {}
+        Err(error) => {
+            eprintln!(
+                "aicx: sessions: cannot inspect agy root {}: {error}",
+                sessions_root.display()
+            );
+            return Vec::new();
+        }
+    }
+    let sources = match SessionCatalog::new(AgentKind::Agy, sessions_root)
+        .and_then(|catalog| catalog.scan_with_stats().result)
+    {
+        Ok(sources) => sources,
+        Err(error) => {
+            eprintln!("aicx: sessions: agy source discovery failed: {error}");
+            return Vec::new();
+        }
+    };
+    let cutoff = modified_after
+        .and_then(|time| time.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos());
+    let mut out = Vec::new();
+    for source in sources {
+        if cutoff.is_some_and(|cutoff| source.fingerprint.modified_unix_nanos < cutoff) {
+            continue;
+        }
+        match scan_agy_session_file(&source.path, &source.source_id) {
+            Some(info)
+                if cwd_filter.is_none_or(|want| {
+                    info.repo_path
+                        .as_deref()
+                        .is_some_and(|cwd| cwd_nests(want, cwd))
+                }) =>
+            {
+                out.push(info)
+            }
+            Some(_) => {}
+            None => eprintln!(
+                "aicx: sessions: unreadable agy source {}",
+                source.path.display()
+            ),
+        }
+    }
+    out
+}
+
+pub(crate) fn scan_agy_session_file(path: &Path, session_id: &str) -> Option<SessionInfo> {
+    #[cfg(feature = "app")]
+    {
+        scan_agy_session_file_app(path, session_id)
+    }
+    #[cfg(not(feature = "app"))]
+    {
+        Some(agy_session_stub(path, session_id))
+    }
+}
+
+#[cfg(not(feature = "app"))]
+fn agy_session_stub(path: &Path, session_id: &str) -> SessionInfo {
+    SessionInfo {
+        session_id: session_id.to_owned(),
+        agent: "agy".to_owned(),
+        project: None,
+        repo_path: None,
+        started_at: None,
+        updated_at: None,
+        message_count: 0,
+        user_message_count: 0,
+        agent_message_count: 0,
+        title: None,
+        source_path: path.to_path_buf(),
+        association: Association::Unknown,
+        temporal_confidence: TemporalConfidence::None,
+        session_kind: None,
+    }
+}
+
+#[cfg(feature = "app")]
+fn scan_agy_session_file_app(path: &Path, session_id: &str) -> Option<SessionInfo> {
+    let listing = crate::agy_store::read_listing(path).ok()?;
+    let started_at = listing.started_at.as_deref().and_then(parse_rfc3339);
+    let updated_at = listing.updated_at.as_deref().and_then(parse_rfc3339);
+    let project = listing
+        .project
+        .clone()
+        .filter(|name| !name.is_empty())
+        .or_else(|| listing.cwd.as_deref().and_then(project_label_from_cwd));
+    let association = if listing.cwd.is_some() {
+        Association::Exact
+    } else {
+        Association::Unknown
+    };
+    let temporal_confidence = if started_at.is_some() || updated_at.is_some() {
+        TemporalConfidence::Full
+    } else {
+        TemporalConfidence::None
+    };
+    Some(SessionInfo {
+        session_id: session_id.to_owned(),
+        agent: "agy".to_owned(),
+        project,
+        repo_path: listing.cwd,
+        started_at,
+        updated_at,
+        message_count: listing.user_messages + listing.agent_messages,
+        user_message_count: listing.user_messages,
+        agent_message_count: listing.agent_messages,
+        title: listing.title.as_deref().map(short_title),
+        source_path: path.to_path_buf(),
+        association,
+        temporal_confidence,
+        session_kind: None,
+    })
+}
+
+#[cfg(feature = "app")]
+fn parse_rfc3339(raw: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(raw)
+        .ok()
+        .map(|time| time.with_timezone(&Utc))
+}
+
 fn omp_message_text(value: &serde_json::Value) -> String {
     match value {
         serde_json::Value::String(text) => text.clone(),
@@ -2615,6 +2748,14 @@ pub fn discover_sessions_at(
             discovered.extend(discover_omp_sessions(&root, modified_after, cwd_filter));
         }
     }
+    if agent.is_none_or(|raw| {
+        crate::session_catalog::AgentKind::parse(raw)
+            == Some(crate::session_catalog::AgentKind::Agy)
+    }) {
+        for root in crate::session_catalog::agy_session_roots(home) {
+            discovered.extend(discover_agy_sessions(&root, modified_after, cwd_filter));
+        }
+    }
     discovered
 }
 
@@ -2911,6 +3052,32 @@ pub fn find_session_by_id(home: &Path, id: &str) -> Option<SessionInfo> {
             }
             Err(crate::session_catalog::CatalogError::Missing { .. }) => {}
             Err(error) => eprintln!("aicx: session: omp lookup failed: {error}"),
+        }
+    }
+
+    for agy_root in crate::session_catalog::agy_session_roots(home) {
+        match agy_root.try_exists() {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(error) => {
+                eprintln!(
+                    "aicx: session: cannot inspect agy root {}: {error}",
+                    agy_root.display()
+                );
+                continue;
+            }
+        }
+        match crate::session_catalog::SessionCatalog::new(
+            crate::session_catalog::AgentKind::Agy,
+            &agy_root,
+        )
+        .and_then(|catalog| catalog.resolve(id))
+        {
+            Ok(resolved) => {
+                return scan_agy_session_file(&resolved.source.path, &resolved.source.source_id);
+            }
+            Err(crate::session_catalog::CatalogError::Missing { .. }) => {}
+            Err(error) => eprintln!("aicx: session: agy lookup failed: {error}"),
         }
     }
     None

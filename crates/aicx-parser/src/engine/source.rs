@@ -19,6 +19,7 @@ pub enum AgentKind {
     Cursor,
     Copilot,
     Omp,
+    Agy,
 }
 
 impl AgentKind {
@@ -31,6 +32,7 @@ impl AgentKind {
             "codex" => Some(Self::Codex),
             "cursor" | "cursor-agent" => Some(Self::Cursor),
             "gemini" | "gemini-antigravity" => Some(Self::Gemini),
+            "agy" | "antigravity" | "antigravity-cli" => Some(Self::Agy),
             "junie" => Some(Self::Junie),
             "grok" => Some(Self::Grok),
             "kimi" => Some(Self::Kimi),
@@ -53,6 +55,7 @@ impl AgentKind {
             Self::Cursor => "cursor",
             Self::Copilot => "copilot",
             Self::Omp => "omp",
+            Self::Agy => "agy",
         }
     }
 }

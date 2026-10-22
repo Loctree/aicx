@@ -665,19 +665,24 @@ fn live_delta_uncached(home: &Path, user_home: &Path, cutoff_unix_ns: u128) -> R
         AgentKind::Kimi,
         AgentKind::Copilot,
         AgentKind::Omp,
+        AgentKind::Agy,
     ];
     for agent in agents {
         for root in present_agent_roots(agent, user_home)? {
             let catalog = match SessionCatalog::new(agent, &root) {
                 Ok(catalog) => catalog,
-                Err(error) if matches!(agent, AgentKind::Copilot | AgentKind::Omp) => {
+                Err(error)
+                    if matches!(agent, AgentKind::Copilot | AgentKind::Omp | AgentKind::Agy) =>
+                {
                     return Err(error.into());
                 }
                 Err(_) => continue,
             };
             let scan = match catalog.scan_hot_window_skipping(cutoff_unix_ns, &is_known) {
                 Ok(scan) => scan,
-                Err(error) if matches!(agent, AgentKind::Copilot | AgentKind::Omp) => {
+                Err(error)
+                    if matches!(agent, AgentKind::Copilot | AgentKind::Omp | AgentKind::Agy) =>
+                {
                     return Err(error.into());
                 }
                 Err(_) => continue,
@@ -871,6 +876,7 @@ fn scan_live_entries_with_progress(
         AgentKind::Kimi,
         AgentKind::Copilot,
         AgentKind::Omp,
+        AgentKind::Agy,
     ];
     for (agent_offset, agent) in agents.into_iter().enumerate() {
         progress.stage = RebuildStage::ScanningSources;
@@ -883,7 +889,9 @@ fn scan_live_entries_with_progress(
         for root in present_agent_roots(agent, user_home)? {
             let catalog = match SessionCatalog::new(agent, &root) {
                 Ok(c) => c,
-                Err(error) if matches!(agent, AgentKind::Copilot | AgentKind::Omp) => {
+                Err(error)
+                    if matches!(agent, AgentKind::Copilot | AgentKind::Omp | AgentKind::Agy) =>
+                {
                     return Err(error.into());
                 }
                 Err(_) => continue,
@@ -896,7 +904,9 @@ fn scan_live_entries_with_progress(
             });
             let sources = match scan.result {
                 Ok(s) => s,
-                Err(error) if matches!(agent, AgentKind::Copilot | AgentKind::Omp) => {
+                Err(error)
+                    if matches!(agent, AgentKind::Copilot | AgentKind::Omp | AgentKind::Agy) =>
+                {
                     return Err(error.into());
                 }
                 Err(_) => continue,
@@ -1165,14 +1175,15 @@ fn agent_source_root(agent: AgentKind, user_home: &Path) -> PathBuf {
         AgentKind::Kimi => user_home.join(".kimi-code").join("sessions"),
         AgentKind::Copilot => session_catalog::copilot_session_root(user_home),
         AgentKind::Omp => session_catalog::omp_session_root(user_home),
+        AgentKind::Agy => session_catalog::agy_session_root(user_home),
     }
 }
 
 fn agent_source_roots(agent: AgentKind, user_home: &Path) -> Vec<PathBuf> {
-    if agent == AgentKind::Omp {
-        session_catalog::omp_session_roots(user_home)
-    } else {
-        vec![agent_source_root(agent, user_home)]
+    match agent {
+        AgentKind::Omp => session_catalog::omp_session_roots(user_home),
+        AgentKind::Agy => session_catalog::agy_session_roots(user_home),
+        _ => vec![agent_source_root(agent, user_home)],
     }
 }
 
@@ -1180,7 +1191,7 @@ fn agent_source_roots(agent: AgentKind, user_home: &Path) -> Vec<PathBuf> {
 fn present_agent_roots(agent: AgentKind, user_home: &Path) -> Result<Vec<PathBuf>> {
     let mut present = Vec::new();
     for root in agent_source_roots(agent, user_home) {
-        let exists = if matches!(agent, AgentKind::Copilot | AgentKind::Omp) {
+        let exists = if matches!(agent, AgentKind::Copilot | AgentKind::Omp | AgentKind::Agy) {
             root.try_exists()
                 .with_context(|| format!("inspect {agent} root {}", root.display()))?
         } else {
@@ -1217,6 +1228,7 @@ fn is_primary_catalog_source(agent: AgentKind, path: &Path) -> bool {
         }
         AgentKind::Copilot => session_catalog::is_copilot_source_file(path),
         AgentKind::Omp => session_catalog::is_omp_source_file(path),
+        AgentKind::Agy => session_catalog::is_agy_source_file(path),
         _ => true,
     }
 }
@@ -1230,6 +1242,7 @@ fn entry_from_source(agent: AgentKind, source: &CatalogSource) -> CatalogEntry {
             crate::sessions::scan_copilot_session_file(&source.path, &source.source_id)
         }
         AgentKind::Omp => crate::sessions::scan_omp_session_file(&source.path, &source.source_id),
+        AgentKind::Agy => crate::sessions::scan_agy_session_file(&source.path, &source.source_id),
         _ => None,
     };
     let session_id = if agent == AgentKind::Grok {

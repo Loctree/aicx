@@ -68,6 +68,7 @@ impl BusParty {
             "cursor" | "cursor-agent" => Some("cursor"),
             "copilot" | "copilot-cli" => Some("copilot"),
             "omp" | "pi" | "oh-my-pi" => Some("omp"),
+            "agy" | "antigravity" | "antigravity-cli" => Some("agy"),
             _ => None,
         }
     }

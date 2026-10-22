@@ -210,7 +210,7 @@ Orthogonal surfaces:
 - **index status** = is CURRENT lagging the catalog/corpus?
 
 `catalog rebuild` walks the registered Claude, Codex, Cursor, Grok, Gemini,
-Junie, Kimi, Copilot CLI, oh-my-pi / pi, and
+Junie, Kimi, Copilot CLI, oh-my-pi / pi, Antigravity CLI, and
 Vibecrafted runtime roots. It writes the compact catalog and prints counts,
 including `pending_chunks`. It does not materialize session content unless
 `--with-chunks` is passed, which drains the lag through `aicx index`.
@@ -319,6 +319,23 @@ aicx extract all --provider omp --conversation
 aicx conversations --agent omp --hours 0 --out-dir ./conversations
 aicx intents --agent omp --hours 0 --emit json
 aicx search 'past decision' --agent pi --hours 0 --json
+```
+
+Antigravity CLI uses the same surfaces. The provider name is `agy`;
+`antigravity` and `antigravity-cli` are accepted aliases. Both
+`~/.gemini/antigravity-cli/conversations` and
+`~/.gemini/antigravity/conversations` are one agent. A session is a
+`<cascade-uuid>.db`. Legacy `.pb` exports stay on Gemini
+(`gemini-antigravity`). See [AGY_SESSIONS.md](AGY_SESSIONS.md).
+
+```bash
+aicx sessions list --agent agy
+aicx extract agy --session <cascade-id> --conversation
+aicx extract antigravity-cli --session <cascade-id> --conversation --user-only
+aicx extract all --provider agy --conversation
+aicx conversations --agent agy --hours 0 --out-dir ./conversations
+aicx intents --agent agy --hours 0 --emit json
+aicx search 'past decision' --agent antigravity --hours 0 --json
 ```
 
 ### Projection flags (W2-T13)

@@ -434,6 +434,51 @@ pub fn list_available_sources() -> Result<Vec<SourceInfo>> {
         sources.push(source_info(&home, "omp", root, scanned.len(), size));
     }
 
+    for root in crate::session_catalog::agy_session_roots(&home) {
+        let present = match root.try_exists() {
+            Ok(value) => value,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("cannot inspect agy session root {}", root.display())
+                });
+            }
+        };
+        if !present {
+            continue;
+        }
+        anyhow::ensure!(
+            root.is_dir(),
+            "agy session root is not a directory: {}",
+            root.display()
+        );
+        let catalog = crate::session_catalog::SessionCatalog::new(
+            crate::session_catalog::AgentKind::Agy,
+            &root,
+        )
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+        let scanned = catalog
+            .scan_with_stats()
+            .result
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        if scanned.is_empty() {
+            continue;
+        }
+        let mut size = 0u64;
+        for source in &scanned {
+            match fs::symlink_metadata(&source.path) {
+                Ok(metadata) if metadata.is_file() => size += metadata.len(),
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("cannot inspect agy source {}", source.path.display())
+                    });
+                }
+            }
+        }
+        sources.push(source_info(&home, "agy", root, scanned.len(), size));
+    }
+
     // Codescribe transcripts: ~/.codescribe/transcriptions/YYYY-MM-DD/*.{txt,md,json}
     let codescribe_transcripts = discover_codescribe_transcripts(&home);
     if !codescribe_transcripts.is_empty() {

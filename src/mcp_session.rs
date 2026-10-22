@@ -421,11 +421,11 @@ fn parse_optional_agent(agent: Option<&str>) -> Result<Option<AgentKind>, Sessio
             SessionSurfaceError::invalid(
                 "invalid_agent",
                 format!(
-                    "unknown agent `{value}`; expected claude, codex, gemini, junie, grok, kimi, cursor, copilot, or omp"
+                    "unknown agent `{value}`; expected claude, codex, gemini, junie, grok, kimi, cursor, copilot, omp, or agy"
                 ),
                 json!({
                     "agent": value,
-                    "expected": ["claude", "codex", "gemini", "junie", "grok", "kimi", "cursor", "copilot", "omp", "pi", "oh-my-pi"],
+                    "expected": ["claude", "codex", "gemini", "junie", "grok", "kimi", "cursor", "copilot", "omp", "pi", "oh-my-pi", "agy", "antigravity", "antigravity-cli"],
                 }),
             )
         }),
@@ -694,7 +694,7 @@ fn resolve_session_across_agents(
     for agent in agents {
         let mut agent_hit = None;
         for root in agent.session_roots(user_home) {
-            if matches!(agent, AgentKind::Copilot | AgentKind::Omp) {
+            if matches!(agent, AgentKind::Copilot | AgentKind::Omp | AgentKind::Agy) {
                 match root.try_exists() {
                     Ok(false) => continue,
                     Ok(true) => {}
@@ -872,6 +872,7 @@ fn guess_user_home(source: &Path, agent: AgentKind) -> PathBuf {
         AgentKind::Kimi => &[".kimi-code"],
         AgentKind::Copilot => &[".copilot"],
         AgentKind::Omp => &[".omp", ".pi"],
+        AgentKind::Agy => &[".gemini"],
     };
     let mut current = source;
     while let Some(parent) = current.parent() {

@@ -160,6 +160,34 @@ const CURSOR_INJECT_TAGS: &[InjectTagRule] = &[
     },
 ];
 
+// # agy — tags the adapter assigns. Dispatch briefs stay injected context.
+const AGY_INJECT_TAGS: &[InjectTagRule] = &[
+    InjectTagRule {
+        tag: "system",
+        kind: InjectRuleKind::TransportControl,
+    },
+    InjectTagRule {
+        tag: "dispatch_brief",
+        kind: InjectRuleKind::TransportControl,
+    },
+    InjectTagRule {
+        tag: "synthetic_user",
+        kind: InjectRuleKind::TransportControl,
+    },
+    InjectTagRule {
+        tag: "agent_authored",
+        kind: InjectRuleKind::TransportControl,
+    },
+    InjectTagRule {
+        tag: "steering",
+        kind: InjectRuleKind::TransportControl,
+    },
+    InjectTagRule {
+        tag: "user_unattributed",
+        kind: InjectRuleKind::TransportControl,
+    },
+];
+
 // # omp / pi — tags the adapter assigns. Unknown customType values stay
 // InjectKind::Other and still cannot become human speech.
 const OMP_INJECT_TAGS: &[InjectTagRule] = &[
@@ -318,6 +346,13 @@ pub const AGENT_FRAME_RULES: &[AgentFrameRules] = &[
         klops_guard: &[],
         queue_seal: false,
         inject_tags: OMP_INJECT_TAGS,
+    },
+    AgentFrameRules {
+        agent: AgentKind::Agy,
+        echo_promotion: false,
+        klops_guard: &[],
+        queue_seal: false,
+        inject_tags: AGY_INJECT_TAGS,
     },
 ];
 

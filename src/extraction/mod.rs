@@ -151,6 +151,7 @@ pub fn extract_agent_sessions(
             vec![crate::session_catalog::copilot_session_root(&home)]
         }
         crate::session_catalog::AgentKind::Omp => crate::session_catalog::omp_session_roots(&home),
+        crate::session_catalog::AgentKind::Agy => crate::session_catalog::agy_session_roots(&home),
     };
     let parser_agent_kind = parser_agent(agent);
     let mut batch = SessionExtractionBatch::default();
@@ -456,6 +457,7 @@ const fn parser_agent(agent: crate::session_catalog::AgentKind) -> aicx_parser::
         crate::session_catalog::AgentKind::Kimi => aicx_parser::engine::AgentKind::Kimi,
         crate::session_catalog::AgentKind::Copilot => aicx_parser::engine::AgentKind::Copilot,
         crate::session_catalog::AgentKind::Omp => aicx_parser::engine::AgentKind::Omp,
+        crate::session_catalog::AgentKind::Agy => aicx_parser::engine::AgentKind::Agy,
     }
 }
 

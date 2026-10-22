@@ -395,6 +395,7 @@ fn watermark_coverage_follows_the_recording_key_agents() {
         "cursor",
         "copilot",
         "omp",
+        "agy",
         "codescribe",
     ];
     let project = Vec::new();
@@ -438,6 +439,13 @@ fn watermark_coverage_follows_the_recording_key_agents() {
     assert!(covered.contains("copilot"));
     assert!(!covered.contains("omp"));
 
+    // The omp-aware composition covers omp but never agy history.
+    let mut state = StateManager::default();
+    state.update_watermark(&format!("{OMP_ALL_WATERMARK_KEY}:all"), Utc::now());
+    let covered = watermark_covered_agents(&state, &key, &aliases);
+    assert!(covered.contains("omp"));
+    assert!(!covered.contains("agy"));
+
     // Once the canonical key itself holds a watermark (a run of the current
     // composition recorded it), every requested agent is covered.
     let mut state = StateManager::default();
@@ -447,6 +455,7 @@ fn watermark_coverage_follows_the_recording_key_agents() {
     assert!(covered.contains("cursor"));
     assert!(covered.contains("copilot"));
     assert!(covered.contains("omp"));
+    assert!(covered.contains("agy"));
     assert_eq!(covered.len(), agents.len());
 }
 
@@ -464,6 +473,7 @@ fn watermark_coverage_unions_alias_generations() {
         "cursor",
         "copilot",
         "omp",
+        "agy",
         "codescribe",
     ];
     let project = Vec::new();
@@ -2886,6 +2896,9 @@ fn extract_every_agent_subcommand_parses() {
         ("omp", ExtractAgent::Omp),
         ("pi", ExtractAgent::Omp),
         ("oh-my-pi", ExtractAgent::Omp),
+        ("agy", ExtractAgent::Agy),
+        ("antigravity", ExtractAgent::Agy),
+        ("antigravity-cli", ExtractAgent::Agy),
     ] {
         let cli = Cli::try_parse_from(["aicx", "extract", name, "--session", "abc12345"])
             .unwrap_or_else(|error| panic!("agent subcommand `{name}` must parse: {error}"));
@@ -2923,7 +2936,9 @@ fn extract_help_hides_removed_flag_grammar() {
         .find_subcommand_mut("extract")
         .expect("extract subcommand should exist");
     let rendered = extract.render_long_help().to_string();
-    for agent in ["codex", "claude", "gemini", "grok", "junie", "kimi", "omp"] {
+    for agent in [
+        "codex", "claude", "gemini", "grok", "junie", "kimi", "omp", "agy",
+    ] {
         assert!(
             rendered.contains(agent),
             "extract --help must list the `{agent}` subcommand"
@@ -3010,6 +3025,9 @@ fn conversations_accepts_registered_providers_and_aliases() {
         "omp",
         "pi",
         "oh-my-pi",
+        "agy",
+        "antigravity",
+        "antigravity-cli",
     ] {
         let cli = Cli::try_parse_from([
             "aicx",
