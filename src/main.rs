@@ -591,7 +591,7 @@ enum SessionsCommand {
         #[arg(short, long, value_delimiter = ',')]
         project: Vec<String>,
 
-        /// Filter by agent (claude | codex | gemini | junie | grok | kimi | cursor | copilot | omp | agy | agy).
+        /// Filter by agent (claude | codex | gemini | junie | grok | kimi | cursor | copilot | omp | agy).
         #[arg(long, value_parser = ["claude", "codex", "gemini", "junie", "grok", "kimi", "cursor", "cursor-agent", "copilot", "copilot-cli", "github-copilot", "github-copilot-cli", "omp", "pi", "oh-my-pi", "agy", "antigravity", "antigravity-cli"])]
         agent: Option<String>,
 

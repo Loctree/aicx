@@ -505,7 +505,7 @@ complete -c aicx -n "__fish_aicx_using_subcommand sessions; and __fish_seen_subc
 complete -c aicx -n "__fish_aicx_using_subcommand sessions; and __fish_seen_subcommand_from current" -l project-fuzzy -d 'Opt in to project-family matching. By default project filters are exact and an ambiguous bare repository name fails closed'
 complete -c aicx -n "__fish_aicx_using_subcommand sessions; and __fish_seen_subcommand_from current" -s h -l help -d 'Print help (see more with \'--help\')'
 complete -c aicx -n "__fish_aicx_using_subcommand sessions; and __fish_seen_subcommand_from list" -s p -l project -d 'Exact project filter, same shapes as search/intents/MCP: `owner/repo`, `/repo` (cross-org repo), `owner/` (org wildcard), or a unique bare `name`. Empty is a numbered miss, not silence' -r
-complete -c aicx -n "__fish_aicx_using_subcommand sessions; and __fish_seen_subcommand_from list" -l agent -d 'Filter by agent (claude | codex | gemini | junie | grok | kimi | cursor | copilot | omp | agy | agy)' -r -f -a "claude\t''
+complete -c aicx -n "__fish_aicx_using_subcommand sessions; and __fish_seen_subcommand_from list" -l agent -d 'Filter by agent (claude | codex | gemini | junie | grok | kimi | cursor | copilot | omp | agy)' -r -f -a "claude\t''
 codex\t''
 gemini\t''
 junie\t''

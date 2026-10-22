@@ -905,7 +905,7 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 '*-p+[Exact project filter, same shapes as search/intents/MCP\: \`owner/repo\`, \`/repo\` (cross-org repo), \`owner/\` (org wildcard), or a unique bare \`name\`. Empty is a numbered miss, not silence]:PROJECT:_default' \
 '*--project=[Exact project filter, same shapes as search/intents/MCP\: \`owner/repo\`, \`/repo\` (cross-org repo), \`owner/\` (org wildcard), or a unique bare \`name\`. Empty is a numbered miss, not silence]:PROJECT:_default' \
-'--agent=[Filter by agent (claude | codex | gemini | junie | grok | kimi | cursor | copilot | omp | agy | agy)]:AGENT:(claude codex gemini junie grok kimi cursor cursor-agent copilot copilot-cli github-copilot github-copilot-cli omp pi oh-my-pi agy antigravity antigravity-cli)' \
+'--agent=[Filter by agent (claude | codex | gemini | junie | grok | kimi | cursor | copilot | omp | agy)]:AGENT:(claude codex gemini junie grok kimi cursor cursor-agent copilot copilot-cli github-copilot github-copilot-cli omp pi oh-my-pi agy antigravity antigravity-cli)' \
 '--since=[Only sessions updated on/after this date (YYYY-MM-DD). Defaults to the last 30 days; pass --all to scan the full history]:SINCE:_default' \
 '--limit=[Max sessions to show (0 = all)]:LIMIT:_default' \
 '--format=[Output format\: table | json]:FORMAT:_default' \
