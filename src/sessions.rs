@@ -1947,11 +1947,13 @@ fn scan_agy_session_file_app(path: &Path, session_id: &str) -> Option<SessionInf
     let listing = crate::agy_store::read_listing(path).ok()?;
     let started_at = listing.started_at.as_deref().and_then(parse_rfc3339);
     let updated_at = listing.updated_at.as_deref().and_then(parse_rfc3339);
+    // agy's own project name is a workspace label ("default-cli-project" or a
+    // UUID), not a repository; the cwd names the repo like every other agent.
     let project = listing
-        .project
-        .clone()
-        .filter(|name| !name.is_empty())
-        .or_else(|| listing.cwd.as_deref().and_then(project_label_from_cwd));
+        .cwd
+        .as_deref()
+        .and_then(project_label_from_cwd)
+        .or_else(|| listing.project.clone().filter(|name| !name.is_empty()));
     let association = if listing.cwd.is_some() {
         Association::Exact
     } else {

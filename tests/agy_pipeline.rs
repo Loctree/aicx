@@ -184,6 +184,19 @@ fn agy_public_pipeline_discovers_both_stores() {
         assert!(rows.iter().all(|row| row["agent"] == "agy"));
         assert!(rows.iter().any(|row| row["session_id"] == CLI_ID));
         assert!(rows.iter().any(|row| row["session_id"] == IDE_ID));
+        // agy's own project label (field 18, "agy-fixture" here, live usually
+        // "default-cli-project") is not a repository; the cwd names the repo.
+        let with_cwd: Vec<_> = rows
+            .iter()
+            .filter(|row| row["repo_path"].is_string())
+            .collect();
+        assert!(
+            !with_cwd.is_empty(),
+            "{agent}: no row carried a cwd: {sessions}"
+        );
+        for row in with_cwd {
+            assert_eq!(row["project"], "agy-pipeline", "{agent}: {row}");
+        }
     }
 
     let conversation = extract(&fixture, "conversation.md", "agy", &["--conversation"]);
