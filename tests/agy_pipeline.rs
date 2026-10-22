@@ -163,19 +163,11 @@ fn agy_public_pipeline_discovers_both_stores() {
     let resolved = fixture.json(&["catalog", "resolve", CLI_ID, "--json"]);
     assert_eq!(resolved["agent"], "agy");
     assert_eq!(resolved["session_id"], CLI_ID);
-    assert!(
-        resolved["source_path"]
-            .as_str()
-            .unwrap()
-            .contains("/.gemini/antigravity-cli/conversations/")
-    );
+    // Windows prints `\` separators; compare the store shape, not the platform.
+    let source_path = |value: &Value| value["source_path"].as_str().unwrap().replace('\\', "/");
+    assert!(source_path(&resolved).contains("/.gemini/antigravity-cli/conversations/"));
     let ide = fixture.json(&["catalog", "resolve", IDE_ID, "--json"]);
-    assert!(
-        ide["source_path"]
-            .as_str()
-            .unwrap()
-            .contains("/.gemini/antigravity/conversations/")
-    );
+    assert!(source_path(&ide).contains("/.gemini/antigravity/conversations/"));
 
     for agent in ["agy", "antigravity", "antigravity-cli"] {
         let sessions = fixture.json(&["sessions", "list", "--all", "--agent", agent, "--json"]);

@@ -168,8 +168,23 @@ fn open_ro(path: &Path) -> anyhow::Result<Connection> {
 
 fn sqlite_ro_uri(path: &Path) -> String {
     let absolute = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    let text = absolute.to_string_lossy().replace('\\', "/");
+    // canonicalize() is verbatim on Windows (`\\?\C:\…`); SQLite reads that `?`
+    // as a URI authority and refuses the open.
+    let absolute = aicx_parser::sanitize::strip_verbatim_prefix(&absolute);
+    sqlite_ro_uri_from(&absolute.to_string_lossy())
+}
+
+fn sqlite_ro_uri_from(path: &str) -> String {
+    let text = path.replace('\\', "/");
     let mut encoded = String::from("file:");
+    // A drive path (`C:/…`) or a UNC share (`//server/…`) needs an empty
+    // authority in front of it, as SQLite documents for Windows URIs.
+    if text.as_bytes().get(1) == Some(&b':') || text.starts_with("//") {
+        encoded.push_str("//");
+        if !text.starts_with('/') {
+            encoded.push('/');
+        }
+    }
     for byte in text.bytes() {
         match byte {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b'.' | b'_' | b'-' | b':' => {
@@ -180,4 +195,41 @@ fn sqlite_ro_uri(path: &Path) -> String {
     }
     encoded.push_str("?mode=ro");
     encoded
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use aicx_parser::sanitize::strip_verbatim_prefix;
+
+    use super::sqlite_ro_uri_from;
+
+    fn uri_for(path: &str) -> String {
+        sqlite_ro_uri_from(&strip_verbatim_prefix(Path::new(path)).to_string_lossy())
+    }
+
+    #[test]
+    fn posix_paths_keep_the_plain_file_uri() {
+        assert_eq!(
+            uri_for("/Users/x/.gemini/antigravity-cli/conversations/a b.db"),
+            "file:/Users/x/.gemini/antigravity-cli/conversations/a%20b.db?mode=ro"
+        );
+    }
+
+    #[test]
+    fn windows_verbatim_drive_paths_open_without_a_question_mark_authority() {
+        assert_eq!(
+            uri_for(r"\\?\C:\Users\runner\.gemini\antigravity\conversations\1.db"),
+            "file:///C:/Users/runner/.gemini/antigravity/conversations/1.db?mode=ro"
+        );
+    }
+
+    #[test]
+    fn windows_verbatim_unc_paths_keep_an_empty_authority() {
+        assert_eq!(
+            uri_for(r"\\?\UNC\server\share\conversations\1.db"),
+            "file:////server/share/conversations/1.db?mode=ro"
+        );
+    }
 }
