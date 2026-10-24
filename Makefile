@@ -12,7 +12,7 @@ ifeq (,$(shell command -v cargo 2>/dev/null))
 endif
 
 .PHONY: all build build-native completions release-binaries install install-npm npm-install install-bin install-config install-cargo git-hooks install-schedule uninstall-schedule install-service uninstall-service
-.PHONY: hooks-test precheck precheck-native loctree-consumer-check test test-native check fmt fmt-check clippy clippy-native semgrep ci clean help manifest-check
+.PHONY: hooks-test precheck precheck-native loctree-consumer-check test test-mcp-services test-native check fmt fmt-check clippy clippy-native semgrep ci clean help manifest-check
 .PHONY: embeddings-check embeddings-test embeddings-clippy embeddings-hydrate embeddings-info
 .PHONY: version version-show version-check version-check-selftest version-bump version-patch bump-patch changelog-close release-notes release-plan release-prepare release-check release-tag release-push package-check release-bundle release-bundle-only-binaries test-e2e
 .PHONY: publish-crates publish-crates-dry
@@ -181,9 +181,14 @@ manifest-check:
 
 test:
 	@$(MAKE) loctree-consumer-check
+	@$(MAKE) test-mcp-services
 	python3 tools/configure_mcp_clients.py --self-test
 	cargo test --locked -p aicx --all-targets
 	cargo test --locked -p aicx-embeddings
+
+test-mcp-services:
+	PYTHONDONTWRITEBYTECODE=1 $(PYTHON) tools/mcp_service_installers_selftest.py
+	PYTHONDONTWRITEBYTECODE=1 $(PYTHON) tools/repair_mcp_runtime_selftest.py
 
 test-native:
 	cargo test --locked -p aicx-embeddings --features gguf

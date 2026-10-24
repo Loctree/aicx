@@ -54,7 +54,7 @@ impl Fixture {
                 "sessionId": id,
                 "cwd": cwd,
                 "timestamp": format!("2026-10-02T12:{minute:02}:{second:02}Z"),
-                "message": {"role": "user", "content": format!("marker-turn-{n:03}: keep every turn reachable.")}
+                "message": {"role": "user", "content": format!("<user_query>marker-turn-{n:03}: keep every turn reachable.</user_query>")}
             });
             let reply = json!({
                 "type": "assistant",
@@ -178,6 +178,7 @@ async fn expand_rereads_the_whole_session_past_the_scan_caps() {
         bounded.contains("marker-turn-000"),
         "scan detail starts the conversation: {bounded:.200}"
     );
+    assert!(!bounded.contains("<user_query>"));
     assert!(
         !bounded.contains("marker-turn-119"),
         "fixture must exceed the scan's turn cap, or this test proves nothing"
@@ -191,5 +192,6 @@ async fn expand_rereads_the_whole_session_past_the_scan_caps() {
         assert!(full.contains(&marker), "Expand lost {marker}");
     }
     assert!(full.contains("reply-119 acknowledged."));
+    assert!(!full.contains("<user_query>"));
     assert!(full.len() > bounded.len());
 }

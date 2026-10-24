@@ -210,6 +210,54 @@ fn normalized_mcp(markdown: &str) -> String {
         .collect::<Vec<_>>()
         .join("\n")
 }
+
+#[test]
+fn cli_startup_uses_persisted_phrases_and_invalid_override_uses_embedded_defaults() {
+    let fixture = Fixture::new();
+    let custom = "Operatorvow: preserve the violet orchard constraint.";
+    let builtin = "Decision: preserve the embedded classification contract.";
+    fixture.catalog(&[
+        fixture.source(
+            0,
+            "claude",
+            "Loctree/aicx",
+            Some("2026-10-02T12:00:00Z"),
+            custom,
+        ),
+        fixture.source(
+            1,
+            "claude",
+            "Loctree/aicx",
+            Some("2026-10-02T12:00:00Z"),
+            builtin,
+        ),
+    ]);
+    let path = fixture.home().join("intent_phrases.toml");
+    fs::write(
+        &path,
+        aicx::parser::intent_phrases::embedded_source().replacen(
+            "policy = [",
+            "policy = [\"operatorvow:\",",
+            1,
+        ),
+    )
+    .unwrap();
+    let persisted = fixture.cli(false);
+    assert!(persisted.contains(custom), "{persisted}");
+    assert!(
+        persisted.contains("preserve the embedded classification contract."),
+        "{persisted}"
+    );
+
+    fs::write(&path, "invalid = [").unwrap();
+    let fallback = fixture.cli(false);
+    assert!(!fallback.contains(custom), "{fallback}");
+    assert!(
+        fallback.contains("preserve the embedded classification contract."),
+        "{fallback}"
+    );
+}
+
 #[test]
 fn frozen_cli_mcp_inject_census_time_role_and_error_contract() {
     let fixture = Fixture::new();

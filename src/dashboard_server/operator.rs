@@ -1,6 +1,6 @@
 //! Operator surfaces on the dashboard: phrase file and index trigger.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, atomic::Ordering};
 use std::time::Duration;
 
 use axum::{
@@ -10,7 +10,6 @@ use axum::{
     response::{Html, IntoResponse, Response},
 };
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 use super::{
     DashboardServerState, REGENERATE_HEADER_NAME, REGENERATE_HEADER_VALUE, forbidden_response,
@@ -92,13 +91,25 @@ pub(super) async fn post_index(
         return response;
     }
     let home = state.config.aicx_home.clone();
-    tokio::spawn(async move {
-        let _ = tokio::task::spawn_blocking(move || {
-            let reporter = crate::progress::select_reporter(true);
+    if spawn_index_operation(state, move || {
+        let reporter = crate::progress::select_reporter(true);
+        if let Err(error) =
             crate::source_index::build_with_reporter(&home, &[], false, false, true, reporter)
-        })
-        .await;
-    });
+        {
+            tracing::error!(%error, "dashboard index build failed");
+        }
+    })
+    .is_none()
+    {
+        return (
+            StatusCode::CONFLICT,
+            Json(JsonError {
+                error: "operation_in_progress",
+                detail: "A dashboard scan or index build is already in progress.".to_string(),
+            }),
+        )
+            .into_response();
+    }
     (
         StatusCode::ACCEPTED,
         Json(JsonOk {
@@ -110,11 +121,37 @@ pub(super) async fn post_index(
         .into_response()
 }
 
+struct IndexOperationGuard(Arc<DashboardServerState>);
+
+impl Drop for IndexOperationGuard {
+    fn drop(&mut self) {
+        self.0.rebuilding.store(false, Ordering::SeqCst);
+    }
+}
+
+fn spawn_index_operation(
+    state: Arc<DashboardServerState>,
+    build: impl FnOnce() + Send + 'static,
+) -> Option<tokio::task::JoinHandle<()>> {
+    state
+        .rebuilding
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .ok()?;
+    let guard = IndexOperationGuard(state);
+    Some(tokio::task::spawn_blocking(move || {
+        // Keep ownership in the blocking task, even if the request is cancelled.
+        let _guard = guard;
+        build();
+    }))
+}
+
 pub(super) async fn get_auth_page(
     State(state): State<Arc<DashboardServerState>>,
     headers: HeaderMap,
 ) -> Html<String> {
-    let page = AUTH_HTML.replace("<!--mark-->", crate::dashboard::AICX_MARK_SVG);
+    let page = AUTH_HTML
+        .replace("<!--mark-->", crate::dashboard::AICX_MARK_SVG)
+        .replace("Continue with ", "Not yet supported: ");
     // The passphrase form is a local paste of the bearer token. A non-loopback
     // bind, including 0.0.0.0, must not render it even if the Host header says
     // 127.0.0.1.
@@ -232,7 +269,7 @@ pub(super) async fn auth_tailscale(headers: HeaderMap) -> Response {
         )
             .into_response();
     };
-    session_redirect(&identity)
+    session_unavailable(&identity)
 }
 
 pub(super) async fn auth_google_start(headers: HeaderMap) -> Response {
@@ -470,7 +507,7 @@ async fn finish_oauth(
 
 fn session_or_refuse(identity: Result<String, String>) -> Response {
     match identity {
-        Ok(identity) => session_redirect(&identity),
+        Ok(identity) => session_unavailable(&identity),
         Err(_) => html_status(
             StatusCode::BAD_GATEWAY,
             "<p>The provider did not return an identity. No session was created.</p>",
@@ -534,83 +571,14 @@ async fn exchange_identity(
     identity_of(&profile).ok_or_else(|| "provider returned no identity".to_string())
 }
 
-fn session_redirect(identity: &str) -> Response {
-    let mut headers = HeaderMap::new();
-    headers.insert(header::LOCATION, HeaderValue::from_static("/"));
-    append_cookie(
-        &mut headers,
-        &format!(
-            "aicx_session={}; HttpOnly; SameSite=Lax; Path=/",
-            sign_session(identity)
-        ),
-    );
-    (StatusCode::FOUND, headers).into_response()
-}
-
-fn sign_session(identity: &str) -> String {
-    let mac = hmac_sha256(session_key(), identity.as_bytes());
-    format!(
-        "v1.{}.{}",
-        hex::encode(identity.as_bytes()),
-        hex::encode(mac)
+fn session_unavailable(_identity: &str) -> Response {
+    // Provider identity alone does not authorize access to this machine's corpus.
+    // Keep bearer authentication and its mutation/CSRF contract unchanged until
+    // account authorization and trusted-proxy policy exist.
+    html_status(
+        StatusCode::NOT_IMPLEMENTED,
+        "<p>Provider sign-in is not supported yet. No dashboard session was created. Use the existing dashboard bearer token.</p>",
     )
-}
-
-#[cfg(test)]
-fn open_session(token: &str) -> Option<String> {
-    let rest = token.strip_prefix("v1.")?;
-    let (ident_hex, mac_hex) = rest.split_once('.')?;
-    let ident = hex::decode(ident_hex).ok()?;
-    let mac = hex::decode(mac_hex).ok()?;
-    let expected = hmac_sha256(session_key(), &ident);
-    if mac.len() != expected.len() {
-        return None;
-    }
-    let mut diff = 0u8;
-    for (left, right) in mac.iter().zip(expected.iter()) {
-        diff |= left ^ right;
-    }
-    if diff != 0 {
-        return None;
-    }
-    String::from_utf8(ident).ok()
-}
-
-fn session_key() -> &'static [u8; 32] {
-    static KEY: OnceLock<[u8; 32]> = OnceLock::new();
-    KEY.get_or_init(|| {
-        let mut buf = [0u8; 32];
-        getrandom::fill(&mut buf).expect("session key");
-        buf
-    })
-}
-
-fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
-    const BLOCK: usize = 64;
-    let mut padded = [0u8; BLOCK];
-    if key.len() > BLOCK {
-        let digest = Sha256::digest(key);
-        padded[..32].copy_from_slice(&digest);
-    } else {
-        padded[..key.len()].copy_from_slice(key);
-    }
-    let mut ipad = [0x36u8; BLOCK];
-    let mut opad = [0x5cu8; BLOCK];
-    for index in 0..BLOCK {
-        ipad[index] ^= padded[index];
-        opad[index] ^= padded[index];
-    }
-    let mut inner = Sha256::new();
-    inner.update(ipad);
-    inner.update(message);
-    let inner = inner.finalize();
-    let mut outer = Sha256::new();
-    outer.update(opad);
-    outer.update(inner);
-    let digest = outer.finalize();
-    let mut mac = [0u8; 32];
-    mac.copy_from_slice(&digest);
-    mac
 }
 
 fn public_origin(headers: &HeaderMap) -> String {
@@ -756,7 +724,7 @@ p{margin:.4rem 0 1rem;line-height:1.4}
 <body><main>
 <div class="brand-pair"><!--mark--><span class="brand-word">AICX</span></div>
 <h1>Sign in</h1>
-<p>Search stays on this machine. Pick the credential that already knows you.</p>
+<p>Search stays on this machine. Dashboard access requires the existing bearer token; provider sign-in is not supported yet.</p>
 <div class="pills">
 <a href="/auth/tailscale"><svg class="auth-mark" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M24 12a3 3 0 1 1-6 0 3 3 0 0 1 6 0zm-9 9a3 3 0 1 1-6 0 3 3 0 0 1 6 0zm0-9a3 3 0 1 1-6 0 3 3 0 0 1 6 0zm6-6a3 3 0 1 1 0-6 3 3 0 0 1 0 6zm0-.5a2.5 2.5 0 1 0 0-5 2.5 2.5 0 0 0 0 5zM3 24a3 3 0 1 1 0-6 3 3 0 0 1 0 6zm0-.5a2.5 2.5 0 1 0 0-5 2.5 2.5 0 0 0 0 5zm18 .5a3 3 0 1 1 0-6 3 3 0 0 1 0 6zm0-.5a2.5 2.5 0 1 0 0-5 2.5 2.5 0 0 0 0 5zM6 12a3 3 0 1 1-6 0 3 3 0 0 1 6 0zm9-9a3 3 0 1 1-6 0 3 3 0 0 1 6 0zm-3 2.5a2.5 2.5 0 1 0 0-5 2.5 2.5 0 0 0 0 5zM6 3a3 3 0 1 1-6 0 3 3 0 0 1 6 0zM3 5.5a2.5 2.5 0 1 0 0-5 2.5 2.5 0 0 0 0 5z"/></svg>Continue with Tailscale</a>
 <p class="note">Tailscale Serve sends Tailscale-User-Login. No separate Tailscale app.</p>
@@ -853,6 +821,53 @@ mod tests {
         String::from_utf8(bytes.to_vec()).expect("utf8")
     }
 
+    #[test]
+    fn index_operation_excludes_concurrent_work_and_releases_on_success_and_panic() {
+        runtime().block_on(async {
+            let state = super::super::test_server_state("127.0.0.1".parse().unwrap());
+            let (release, wait) = std::sync::mpsc::channel();
+            let operation = spawn_index_operation(state.clone(), move || {
+                wait.recv().unwrap();
+            })
+            .expect("first operation");
+            let second = spawn_index_operation(state.clone(), || {});
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                REGENERATE_HEADER_NAME,
+                HeaderValue::from_static(REGENERATE_HEADER_VALUE),
+            );
+            let rejected = post_index(State(state.clone()), headers.clone()).await;
+            let regenerate =
+                super::super::regenerate_dashboard(State(state.clone()), headers).await;
+            release.send(()).unwrap();
+            operation.await.unwrap();
+            assert!(second.is_none());
+            assert_eq!(rejected.status(), StatusCode::CONFLICT);
+            assert_eq!(regenerate.status(), StatusCode::CONFLICT);
+            assert!(!state.rebuilding.load(Ordering::SeqCst));
+
+            let failed = spawn_index_operation(state.clone(), || panic!("simulated build failure"))
+                .expect("guard released after completion");
+            assert!(failed.await.unwrap_err().is_panic());
+            assert!(!state.rebuilding.load(Ordering::SeqCst));
+            spawn_index_operation(state.clone(), || {})
+                .expect("guard released after failure")
+                .await
+                .unwrap();
+            assert!(!state.rebuilding.load(Ordering::SeqCst));
+        });
+    }
+
+    #[test]
+    fn index_operation_does_not_bypass_mutation_gate() {
+        runtime().block_on(async {
+            let state = super::super::test_server_state("127.0.0.1".parse().unwrap());
+            let response = post_index(State(state.clone()), HeaderMap::new()).await;
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            assert!(!state.rebuilding.load(Ordering::SeqCst));
+        });
+    }
+
     fn session_cookie(response: &Response) -> Option<String> {
         response
             .headers()
@@ -894,6 +909,11 @@ mod tests {
             assert!(html.contains("/auth/google"));
             assert!(html.contains("/auth/github"));
             assert!(html.contains("Tailscale-User-Login"));
+            assert!(html.contains("provider sign-in is not supported yet"));
+            assert!(html.contains("Not yet supported: Tailscale"));
+            assert!(html.contains("Not yet supported: Google"));
+            assert!(html.contains("Not yet supported: GitHub"));
+            assert!(!html.contains("Continue with "));
             assert_eq!(html.matches("auth-mark").count(), 3);
             assert!(html.contains("M24 12a3 3 0"));
             assert!(html.contains("background:transparent"));
@@ -974,12 +994,9 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            assert_eq!(signed.status(), StatusCode::FOUND);
-            let token = session_cookie(&signed).expect("signed session");
-            assert_eq!(
-                open_session(&token).as_deref(),
-                Some("tailscale:ada@example.com")
-            );
+            assert_eq!(signed.status(), StatusCode::NOT_IMPLEMENTED);
+            assert!(session_cookie(&signed).is_none());
+            assert!(text_of(signed).await.contains("No dashboard session"));
 
             for path in ["/auth/google/callback", "/auth/github/callback"] {
                 let refused = app
@@ -1006,7 +1023,15 @@ mod tests {
     }
 
     #[test]
-    fn provider_identity_parsers_and_signed_cookie() {
+    fn successful_exchange_does_not_mint_unsupported_session() {
+        let response = session_or_refuse(Ok("github:operator".to_string()));
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        assert!(session_cookie(&response).is_none());
+        assert!(!response.headers().contains_key(header::LOCATION));
+    }
+
+    #[test]
+    fn provider_identity_parsers() {
         assert_eq!(
             google_identity(r#"{"email":"ada@example.com"}"#).as_deref(),
             Some("google:ada@example.com")
@@ -1017,12 +1042,6 @@ mod tests {
         );
         assert!(google_identity("{}").is_none());
         assert!(tailscale_identity("").is_none());
-        let token = sign_session("google:ada@example.com");
-        assert_eq!(
-            open_session(&token).as_deref(),
-            Some("google:ada@example.com")
-        );
-        assert!(open_session("v1.00.00").is_none());
         let url = oauth_authorize_url(
             "https://accounts.google.com/o/oauth2/v2/auth",
             "client",

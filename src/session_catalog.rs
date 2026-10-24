@@ -825,10 +825,10 @@ impl SessionCatalog {
 
     /// Cursor writes `<project>/agent-transcripts/<uuid>/<uuid>.jsonl` for
     /// every project a conversation touched. The filename UUID is one session
-    /// id, so an exact full-id query keeps the newest write
-    /// (`modified_unix_nanos`, then the lexicographically smaller path when
-    /// mtimes tie) and says so. Prefix collisions of different ids never
-    /// reach this function.
+    /// id, so an exact full-id query prefers more messages in the bounded
+    /// identity probe, then byte length, freshness, and the smaller path.
+    /// This inspects each matching header, never unrelated conversation bodies.
+    /// Prefix collisions of different ids never reach this function.
     fn resolve_cursor_same_id_project_copies(
         &self,
         query: String,
@@ -837,17 +837,33 @@ impl SessionCatalog {
         stats: &mut CatalogIoStats,
     ) -> Result<ResolvedSource, CatalogError> {
         let copies = matches.len();
-        let mut ranked = matches.to_vec();
+        let mut ranked = Vec::with_capacity(copies);
+        for candidate in matches {
+            let mut message_count = 0;
+            if let Some(source) =
+                self.probe_candidate_with_message_count(candidate, stats, &mut message_count)?
+            {
+                ranked.push((message_count, source));
+            }
+        }
         ranked.sort_by(|left, right| {
             right
-                .fingerprint
-                .modified_unix_nanos
-                .cmp(&left.fingerprint.modified_unix_nanos)
-                .then_with(|| left.path.cmp(&right.path))
+                .0
+                .cmp(&left.0)
+                .then_with(|| right.1.fingerprint.len.cmp(&left.1.fingerprint.len))
+                .then_with(|| {
+                    right
+                        .1
+                        .fingerprint
+                        .modified_unix_nanos
+                        .cmp(&left.1.fingerprint.modified_unix_nanos)
+                })
+                .then_with(|| left.1.path.cmp(&right.1.path))
         });
-        let chosen = ranked[0];
-        let source = self
-            .probe_candidate(chosen, stats)?
+        let source = ranked
+            .into_iter()
+            .next()
+            .map(|(_, source)| source)
             .ok_or_else(|| CatalogError::Missing {
                 query: query.clone(),
                 agent: self.agent,
@@ -859,7 +875,7 @@ impl SessionCatalog {
             matched_by: MatchKind::ExactSourceId,
             source,
             substitution_notice: Some(format!(
-                "substituted: {query} kept newest of {copies} cursor project copies → {kept}"
+                "substituted: {query} kept most complete of {copies} cursor project copies (bounded message count, then bytes and newest) → {kept}"
             )),
         })
     }
@@ -1121,6 +1137,15 @@ impl SessionCatalog {
         candidate: &CandidatePath,
         stats: &mut CatalogIoStats,
     ) -> Result<Option<CatalogSource>, CatalogError> {
+        self.probe_candidate_with_message_count(candidate, stats, &mut 0)
+    }
+
+    fn probe_candidate_with_message_count(
+        &self,
+        candidate: &CandidatePath,
+        stats: &mut CatalogIoStats,
+        message_count: &mut usize,
+    ) -> Result<Option<CatalogSource>, CatalogError> {
         // SQLite conversation files are not JSONL. Reading them as text
         // fails on the first non-UTF-8 byte. The filename UUID is the
         // catalog identity; the body is opened later, read-only, by the
@@ -1172,6 +1197,15 @@ impl SessionCatalog {
                 json_prefix.push_str(&line.line);
             }
             if let Ok(value) = serde_json::from_str::<Value>(line.line.trim()) {
+                if self.agent == AgentKind::Cursor
+                    && matches!(
+                        value.get("role").and_then(Value::as_str),
+                        Some("user" | "assistant")
+                    )
+                    && value.get("message").is_some_and(Value::is_object)
+                {
+                    *message_count += 1;
+                }
                 observe_record(self.agent, &value, &mut root_ids, &mut children);
             }
         }

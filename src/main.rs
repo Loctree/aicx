@@ -2715,6 +2715,14 @@ fn main() -> Result<()> {
     let diagnostics_state_dir = aicx::aicx_home::ensure().ok().map(|d| d.join("state"));
     let _ = aicx::diagnostics::init(cli.verbose, diagnostics_state_dir);
 
+    if let Ok(home) = aicx::aicx_home::resolve()
+        && let Err(error) = aicx::parser::intent_phrases::load_operator_or_embedded(
+            &home.join("intent_phrases.toml"),
+        )
+    {
+        eprintln!("aicx: invalid operator intent phrases; using embedded defaults: {error}");
+    }
+
     let result = run_command(cli.command, cli.project_fuzzy);
     aicx::diagnostics::emit_summary();
     result
@@ -2990,7 +2998,7 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
                     json,
                     aicx::cli::failure::StructuredFailure::new(
                         "missing_agent_subcommand",
-                        "extract requires a target: all | codex | claude | cursor | gemini | grok | junie | kimi | copilot | omp",
+                        "extract requires a target: all | codex | claude | cursor | gemini | grok | junie | kimi | copilot | omp | agy",
                         "rerun as `aicx extract all`, `aicx extract codex --session <id> --conversation`, or `aicx extract codex --file <path> --conversation -o <path>`",
                     )
                     .with_fallback("aicx extract all"),

@@ -298,7 +298,12 @@ fn read_service_definition() -> Option<String> {
         "windows" => user_home()?.join("AppData/Local/aicx/aicx-mcp-service.xml"),
         _ => return None,
     };
-    std::fs::read_to_string(path).ok()
+    let text = std::fs::read_to_string(path).ok()?;
+    // Legacy SCM records described a console app that cannot run as a service.
+    if cfg!(target_os = "windows") && !text.contains("<Task") {
+        return None;
+    }
+    Some(text)
 }
 
 fn user_home() -> Option<PathBuf> {
@@ -949,14 +954,20 @@ pub fn locate_service_installer() -> Option<PathBuf> {
             return Some(path);
         }
     }
+    let filename = match std::env::consts::OS {
+        "macos" => "install-mcp-service.sh",
+        "linux" => "install-mcp-service-linux.sh",
+        "windows" => "install-mcp-service.ps1",
+        _ => return None,
+    };
     let mut candidates = Vec::new();
     if let Ok(exe) = std::env::current_exe()
         && let Some(dir) = exe.parent()
     {
-        candidates.push(dir.join("../../tools/install-mcp-service.sh"));
-        candidates.push(dir.join("../tools/install-mcp-service.sh"));
+        candidates.push(dir.join("../../tools").join(filename));
+        candidates.push(dir.join("../tools").join(filename));
     }
-    candidates.push(PathBuf::from("tools/install-mcp-service.sh"));
+    candidates.push(PathBuf::from("tools").join(filename));
     candidates.into_iter().find(|path| path.is_file())
 }
 
@@ -1357,13 +1368,53 @@ mod tests {
     }
 
     #[test]
+    fn windows_installer_without_override_keeps_configured_storage_home() {
+        let root = std::env::current_dir()
+            .unwrap()
+            .join(format!(".aicx-service-home-test-{}", std::process::id()));
+        let configured = root.join("configured-corpus");
+        std::fs::create_dir_all(root.join(".aicx")).unwrap();
+        std::fs::write(
+            root.join(".aicx/config.toml"),
+            format!(
+                "[storage]\nhome = {}\n",
+                toml::Value::String(configured.to_string_lossy().into_owned())
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            crate::aicx_home::resolve_from(None, &root).unwrap(),
+            configured
+        );
+        assert_eq!(
+            crate::aicx_home::resolve_from(Some(std::ffi::OsString::new()), &root).unwrap(),
+            configured
+        );
+        assert!(
+            EMBEDDED_WINDOWS_SERVICE_INSTALLER
+                .contains("Remove-Item Env:AICX_HOME -ErrorAction SilentlyContinue")
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn production_installer_resolves_loopback_argv_without_launchctl() {
         let script = locate_service_installer()
-            .expect("repo checkout must resolve tools/install-mcp-service.sh without a test stub");
-        assert!(
-            script.file_name().and_then(|name| name.to_str()) == Some("install-mcp-service.sh"),
-            "production installer must be install-mcp-service.sh, got {}",
-            script.display()
+            .expect("repo checkout must resolve the native service installer without a test stub");
+        let (filename, embedded) = match std::env::consts::OS {
+            "linux" => (
+                "install-mcp-service-linux.sh",
+                EMBEDDED_LINUX_SERVICE_INSTALLER,
+            ),
+            "windows" => (
+                "install-mcp-service.ps1",
+                EMBEDDED_WINDOWS_SERVICE_INSTALLER,
+            ),
+            _ => ("install-mcp-service.sh", EMBEDDED_MCP_SERVICE_INSTALLER),
+        };
+        assert_eq!(
+            script.file_name().and_then(|name| name.to_str()),
+            Some(filename)
         );
         assert!(
             script
@@ -1408,13 +1459,15 @@ mod tests {
         assert!(!argv.iter().any(|arg| arg == "--experimental-auto-refresh"));
 
         let body = std::fs::read_to_string(&script).expect("read installer");
-        assert_eq!(body, EMBEDDED_MCP_SERVICE_INSTALLER);
-        assert!(body.contains("HOST=\"${AICX_MCP_HOST:-127.0.0.1}\""));
-        assert!(body.contains("PORT=\"${AICX_MCP_PORT:-8044}\""));
+        assert_eq!(body, embedded);
+        if cfg!(target_os = "macos") {
+            assert!(body.contains("HOST=\"${AICX_MCP_HOST:-127.0.0.1}\""));
+            assert!(body.contains("PORT=\"${AICX_MCP_PORT:-8044}\""));
+        }
         assert!(body.contains("--no-auto-refresh"));
         assert!(body.contains("--no-require-auth"));
         assert!(!body.contains("0.0.0.0"));
-        let program_args = body
+        let program_args = EMBEDDED_MCP_SERVICE_INSTALLER
             .split("<key>ProgramArguments</key>")
             .nth(1)
             .and_then(|rest| rest.split("</array>").next())
@@ -1426,6 +1479,7 @@ mod tests {
         assert!(program_args.contains("--no-auto-refresh"));
         assert!(program_args.contains("$HOST_XML"));
         assert!(program_args.contains("$PORT_XML"));
+        assert!(program_args.contains("<string>serve</string>"));
 
         let skipped = install_launch_agent(&options);
         assert!(

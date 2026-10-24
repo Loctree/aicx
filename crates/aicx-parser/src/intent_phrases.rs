@@ -117,6 +117,22 @@ pub fn reload_from_str(text: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Load persisted operator phrases before classification. Invalid or unreadable
+/// overrides restore embedded defaults and return a diagnostic for the caller.
+pub fn load_operator_or_embedded(path: &Path) -> Result<(), String> {
+    let result = match std::fs::read_to_string(path) {
+        Ok(text) => reload_from_str(&text),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            reload_from_str(embedded_source())
+        }
+        Err(err) => Err(err.to_string()),
+    };
+    if result.is_err() {
+        reload_from_str(embedded_source()).expect("embedded intent_phrases.toml parses");
+    }
+    result
+}
+
 pub fn read_operator_or_embedded(path: &Path) -> String {
     std::fs::read_to_string(path).unwrap_or_else(|_| embedded_source().to_string())
 }
@@ -156,4 +172,55 @@ fn leak(items: &[String]) -> &'static [&'static str] {
         .map(|item| Box::leak(item.clone().into_boxed_str()) as &'static str)
         .collect();
     Box::leak(leaked.into_boxed_slice())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn operator_phrases_are_validated_before_becoming_live() {
+        let edited =
+            embedded_source().replacen("keywords = [", "keywords = [\"operator-only-intent\",", 1);
+        assert!(
+            parse_phrases(&edited)
+                .unwrap()
+                .intent
+                .contains(&"operator-only-intent")
+        );
+        assert!(parse_phrases("intent = [\"broken shape\"]").is_err());
+        let missing = embedded_source().replace("[intent]", "[missing_intent]");
+        assert!(parse_phrases(&missing).is_err());
+    }
+
+    #[test]
+    fn startup_loads_persisted_phrases_and_falls_back_on_invalid_or_missing_file() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target")
+            .join(format!(
+                "intent-phrases-test-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("intent_phrases.toml");
+        let edited =
+            embedded_source().replacen("keywords = [", "keywords = [\"operator-only-intent\",", 1);
+        std::fs::write(&path, edited).unwrap();
+        load_operator_or_embedded(&path).unwrap();
+        assert!(phrases().intent.contains(&"operator-only-intent"));
+        std::fs::write(&path, "invalid = [").unwrap();
+        assert!(load_operator_or_embedded(&path).is_err());
+        assert!(!phrases().intent.contains(&"operator-only-intent"));
+        std::fs::remove_file(&path).unwrap();
+        load_operator_or_embedded(&path).unwrap();
+        assert_eq!(
+            phrases().intent,
+            parse_phrases(embedded_source()).unwrap().intent
+        );
+        std::fs::remove_dir(&root).unwrap();
+    }
 }

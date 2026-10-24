@@ -9,7 +9,39 @@ use std::path::Path;
 use std::time::Duration;
 
 use aicx_parser::adapters::agy::{self, AgyHeaderPreview};
-use rusqlite::{Connection, OpenFlags, OptionalExtension};
+use rusqlite::{Connection, OpenFlags};
+
+const MAX_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
+const MAX_TOTAL_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
+const MAX_STEP_ROWS: usize = 100_000;
+
+#[derive(Default)]
+struct ReadBudget {
+    bytes: usize,
+    rows: usize,
+}
+
+impl ReadBudget {
+    fn consume(&mut self, bytes: usize, is_step: bool) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            bytes <= MAX_PAYLOAD_BYTES,
+            "AGY payload exceeds the {MAX_PAYLOAD_BYTES}-byte limit"
+        );
+        anyhow::ensure!(
+            bytes <= MAX_TOTAL_PAYLOAD_BYTES - self.bytes,
+            "AGY conversation exceeds the {MAX_TOTAL_PAYLOAD_BYTES}-byte payload limit"
+        );
+        if is_step {
+            anyhow::ensure!(
+                self.rows < MAX_STEP_ROWS,
+                "AGY conversation exceeds the {MAX_STEP_ROWS}-step limit"
+            );
+            self.rows += 1;
+        }
+        self.bytes += bytes;
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgyListing {
@@ -32,15 +64,16 @@ struct StepRow {
 
 pub fn materialize_agy_db(path: &Path) -> anyhow::Result<Vec<u8>> {
     let conn = open_ro(path)?;
-    let metadata = metadata_blob(&conn)?;
-    let mut steps = load_steps(&conn)?;
-    steps.sort_by_key(|step| step.idx);
+    let mut budget = ReadBudget::default();
+    let metadata = metadata_blob(&conn, &mut budget)?;
+    let steps = load_steps(&conn, &mut budget)?;
     Ok(render_stream(metadata.as_deref(), &steps))
 }
 
 pub fn read_listing(path: &Path) -> anyhow::Result<AgyListing> {
     let conn = open_ro(path)?;
-    let metadata = metadata_blob(&conn)?;
+    let mut budget = ReadBudget::default();
+    let metadata = metadata_blob(&conn, &mut budget)?;
     let header = metadata
         .as_deref()
         .map(agy::preview_header)
@@ -51,16 +84,11 @@ pub fn read_listing(path: &Path) -> anyhow::Result<AgyListing> {
             project_name: None,
             started_at: None,
         });
+    validate_step_totals(&conn, &budget, true)?;
     let mut statement = conn.prepare(
         "SELECT step_type, step_format, step_payload FROM steps WHERE step_type IN (14, 15) ORDER BY idx ASC",
     )?;
-    let rows = statement.query_map([], |row| {
-        Ok((
-            row.get::<_, i64>(0)?,
-            row.get::<_, Option<i64>>(1)?,
-            row.get::<_, Option<Vec<u8>>>(2)?,
-        ))
-    })?;
+    let mut rows = statement.query([])?;
     let mut listing = AgyListing {
         cwd: header.cwd,
         project: header.project_name,
@@ -70,12 +98,15 @@ pub fn read_listing(path: &Path) -> anyhow::Result<AgyListing> {
         user_messages: 0,
         agent_messages: 0,
     };
-    for row in rows {
-        let (step_type, step_format, payload) = row?;
+    while let Some(row) = rows.next()? {
+        let step_type = row.get::<_, i64>(0)?;
+        let step_format = row.get::<_, Option<i64>>(1)?;
+        let payload = row.get_ref(2)?.as_blob_or_null()?.unwrap_or(&[]);
+        budget.consume(payload.len(), true)?;
         if step_format.is_some_and(|format| format != 0) {
             continue;
         }
-        let preview = agy::preview_step(step_type, payload.as_deref().unwrap_or(&[]));
+        let preview = agy::preview_step(step_type, payload);
         if let Some(text) = preview.human_text {
             listing.user_messages += 1;
             if listing.title.is_none() {
@@ -95,34 +126,74 @@ pub fn read_listing(path: &Path) -> anyhow::Result<AgyListing> {
     Ok(listing)
 }
 
-fn metadata_blob(conn: &Connection) -> anyhow::Result<Option<Vec<u8>>> {
-    Ok(conn
-        .query_row(
-            "SELECT data FROM trajectory_metadata_blob WHERE id = 'main' LIMIT 1",
-            [],
-            |row| row.get(0),
-        )
-        .optional()?)
+fn metadata_blob(conn: &Connection, budget: &mut ReadBudget) -> anyhow::Result<Option<Vec<u8>>> {
+    let mut statement = conn.prepare(&format!(
+        "SELECT CASE WHEN length(data) <= {MAX_PAYLOAD_BYTES} THEN data ELSE NULL END,
+                COALESCE(length(data), 0)
+         FROM trajectory_metadata_blob WHERE id = 'main' LIMIT 1"
+    ))?;
+    let mut rows = statement.query([])?;
+    let Some(row) = rows.next()? else {
+        return Ok(None);
+    };
+    budget.consume(row.get(1)?, false)?;
+    let payload = row.get_ref(0)?.as_blob_or_null()?;
+    Ok(payload.map(<[u8]>::to_vec))
 }
 
-fn load_steps(conn: &Connection) -> anyhow::Result<Vec<StepRow>> {
+fn load_steps(conn: &Connection, budget: &mut ReadBudget) -> anyhow::Result<Vec<StepRow>> {
+    validate_step_totals(conn, budget, false)?;
     let mut statement = conn.prepare(
         "SELECT idx, step_type, status, step_format, step_payload FROM steps ORDER BY idx ASC",
     )?;
-    let rows = statement.query_map([], |row| {
-        Ok(StepRow {
+    let mut rows = statement.query([])?;
+    let mut steps = Vec::new();
+    while let Some(row) = rows.next()? {
+        let payload = row.get_ref(4)?.as_blob_or_null()?;
+        budget.consume(payload.map_or(0, <[u8]>::len), true)?;
+        steps.push(StepRow {
             idx: row.get(0)?,
             step_type: row.get(1)?,
             status: row.get(2)?,
             step_format: row.get(3)?,
-            payload: row.get(4)?,
-        })
-    })?;
-    let mut steps = Vec::new();
-    for row in rows {
-        steps.push(row?);
+            payload: payload.map(<[u8]>::to_vec),
+        });
     }
     Ok(steps)
+}
+
+fn validate_step_totals(
+    conn: &Connection,
+    budget: &ReadBudget,
+    speech_only: bool,
+) -> anyhow::Result<()> {
+    // Inspect blob lengths before SQLite can materialize or sort the payloads.
+    let filter = if speech_only {
+        " WHERE step_type IN (14, 15)"
+    } else {
+        ""
+    };
+    let (rows, bytes, largest): (usize, usize, usize) = conn.query_row(
+        &format!(
+            "SELECT COUNT(*), COALESCE(SUM(length(step_payload)), 0),
+                    COALESCE(MAX(length(step_payload)), 0) FROM steps{filter}"
+        ),
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    anyhow::ensure!(
+        largest <= MAX_PAYLOAD_BYTES,
+        "AGY payload exceeds the {MAX_PAYLOAD_BYTES}-byte limit"
+    );
+    anyhow::ensure!(
+        bytes <= MAX_TOTAL_PAYLOAD_BYTES - budget.bytes,
+        "AGY conversation exceeds the {MAX_TOTAL_PAYLOAD_BYTES}-byte payload limit"
+    );
+    anyhow::ensure!(
+        rows <= MAX_STEP_ROWS - budget.rows,
+        "AGY conversation exceeds the {MAX_STEP_ROWS}-step limit"
+    );
+    Ok(())
 }
 
 fn render_stream(metadata: Option<&[u8]>, steps: &[StepRow]) -> Vec<u8> {
@@ -162,7 +233,7 @@ fn open_ro(path: &Path) -> anyhow::Result<Connection> {
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
     )?;
     conn.busy_timeout(Duration::from_millis(1500))?;
-    conn.execute_batch("PRAGMA query_only = ON;")?;
+    conn.execute_batch("PRAGMA query_only = ON; BEGIN DEFERRED;")?;
     Ok(conn)
 }
 
@@ -203,7 +274,116 @@ mod tests {
 
     use aicx_parser::sanitize::strip_verbatim_prefix;
 
-    use super::sqlite_ro_uri_from;
+    use super::*;
+
+    fn steps_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE steps (
+                idx INTEGER, step_type INTEGER, status INTEGER,
+                step_format INTEGER, step_payload BLOB
+             );
+             INSERT INTO steps VALUES (2, 14, NULL, 0, X'01020304');
+             INSERT INTO steps VALUES (0, 14, NULL, 0, X'01020304');
+             INSERT INTO steps VALUES (1, 15, NULL, 0, X'01020304');",
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn step_loading_preserves_order_at_the_exact_budget() {
+        let conn = steps_db();
+        let mut budget = ReadBudget {
+            bytes: MAX_TOTAL_PAYLOAD_BYTES - 12,
+            rows: MAX_STEP_ROWS - 3,
+        };
+        let steps = load_steps(&conn, &mut budget).unwrap();
+        assert_eq!(
+            steps.iter().map(|step| step.idx).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert_eq!(budget.bytes, MAX_TOTAL_PAYLOAD_BYTES);
+        assert_eq!(budget.rows, MAX_STEP_ROWS);
+        assert!(
+            String::from_utf8(render_stream(None, &steps))
+                .unwrap()
+                .contains("\"payload_b64\":\"AQIDBA==\"")
+        );
+    }
+
+    #[test]
+    fn step_loading_rejects_cumulative_payloads() {
+        let mut budget = ReadBudget {
+            bytes: MAX_TOTAL_PAYLOAD_BYTES - 8,
+            rows: 0,
+        };
+        let error = load_steps(&steps_db(), &mut budget).err().unwrap();
+        assert!(error.to_string().contains("payload limit"));
+        assert_eq!(budget.rows, 0);
+    }
+
+    #[test]
+    fn step_loading_rejects_excess_rows_even_with_small_payloads() {
+        let mut budget = ReadBudget {
+            bytes: 0,
+            rows: MAX_STEP_ROWS - 2,
+        };
+        let error = load_steps(&steps_db(), &mut budget).err().unwrap();
+        assert!(error.to_string().contains("step limit"));
+        assert_eq!(budget.bytes, 0);
+    }
+
+    #[test]
+    fn metadata_counts_towards_the_shared_payload_budget() {
+        let conn = steps_db();
+        conn.execute_batch(
+            "CREATE TABLE trajectory_metadata_blob (id TEXT, data BLOB);
+             INSERT INTO trajectory_metadata_blob VALUES ('main', X'01020304');",
+        )
+        .unwrap();
+        let mut budget = ReadBudget {
+            bytes: MAX_TOTAL_PAYLOAD_BYTES - 12,
+            rows: 0,
+        };
+        assert_eq!(
+            metadata_blob(&conn, &mut budget).unwrap(),
+            Some(vec![1, 2, 3, 4])
+        );
+        assert!(load_steps(&conn, &mut budget).is_err());
+        assert_eq!(budget.rows, 0);
+    }
+
+    #[test]
+    fn oversized_sqlite_payload_is_rejected_before_copying() {
+        let conn = steps_db();
+        conn.execute(
+            "UPDATE steps SET step_payload = zeroblob(?1) WHERE idx = 0",
+            [MAX_PAYLOAD_BYTES + 1],
+        )
+        .unwrap();
+        let mut budget = ReadBudget::default();
+        let error = load_steps(&conn, &mut budget).err().unwrap();
+        assert!(error.to_string().contains("AGY payload exceeds"));
+        assert_eq!(budget.bytes, 0);
+        assert_eq!(budget.rows, 0);
+    }
+
+    #[test]
+    fn oversized_metadata_is_rejected_before_copying() {
+        let conn = steps_db();
+        conn.execute_batch("CREATE TABLE trajectory_metadata_blob (id TEXT, data BLOB);")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO trajectory_metadata_blob VALUES ('main', zeroblob(?1))",
+            [MAX_PAYLOAD_BYTES + 1],
+        )
+        .unwrap();
+        let mut budget = ReadBudget::default();
+        let error = metadata_blob(&conn, &mut budget).unwrap_err();
+        assert!(error.to_string().contains("AGY payload exceeds"));
+        assert_eq!(budget.bytes, 0);
+    }
 
     fn uri_for(path: &str) -> String {
         sqlite_ro_uri_from(&strip_verbatim_prefix(Path::new(path)).to_string_lossy())

@@ -99,18 +99,34 @@ if [ "$MANAGER" != "Aqua" ]; then
   exit 1
 fi
 
-AICX_BIN="${AICX_BIN:-$(command -v aicx || true)}"
-if [ -z "$AICX_BIN" ] || [ ! -x "$AICX_BIN" ]; then
-  echo "Error: runtime repair could not resolve an executable aicx launcher" >&2
-  exit 1
-fi
-
 SOURCE_PLIST="$CANONICAL_PLIST"
 if [ ! -f "$SOURCE_PLIST" ]; then
   SOURCE_PLIST="$LEGACY_PLIST"
 fi
 if [ ! -f "$SOURCE_PLIST" ]; then
   echo "Error: no AICX MCP LaunchAgent found; install the service before repairing it" >&2
+  exit 1
+fi
+# Preserve a working operator-selected launcher unless explicitly overridden.
+# Standalone aicx-mcp registrations migrate to the hybrid sibling, never
+# receive the unsupported `serve` subcommand themselves.
+if [ -z "${AICX_BIN:-}" ]; then
+  AICX_BIN="$(plutil -extract ProgramArguments json -o - "$SOURCE_PLIST" | python3 -c '
+import json, sys
+args = json.load(sys.stdin)
+print(args[0] if isinstance(args, list) and args and isinstance(args[0], str) else "")
+')"
+  if [ "$(basename "$AICX_BIN")" = "aicx-mcp" ]; then
+    AICX_BIN="$(dirname "$AICX_BIN")/aicx"
+  fi
+  if [ ! -x "$AICX_BIN" ]; then
+    AICX_BIN="$(command -v aicx || true)"
+  fi
+elif [ "$(basename "$AICX_BIN")" = "aicx-mcp" ]; then
+  AICX_BIN="$(dirname "$AICX_BIN")/aicx"
+fi
+if [ -z "$AICX_BIN" ] || [ ! -x "$AICX_BIN" ]; then
+  echo "Error: runtime repair could not resolve an executable hybrid aicx launcher" >&2
   exit 1
 fi
 CANONICAL_WAS_LOADED=0

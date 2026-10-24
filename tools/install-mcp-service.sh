@@ -2,8 +2,7 @@
 set -euo pipefail
 # install-mcp-service.sh — one reader-only HTTP process for AICX (macOS launchd).
 #
-# Installs a per-user LaunchAgent that runs the npm-installed aicx-mcp (or
-# `aicx serve` when that sibling is absent):
+# Installs a per-user LaunchAgent that runs the hybrid `aicx serve`:
 #   --transport http --host 127.0.0.1 --no-require-auth --no-auto-refresh
 # `/` is the dashboard and `/mcp` is MCP on port 8044. Loopback auth is off.
 # A non-loopback AICX_MCP_HOST does not receive --no-require-auth; the binary
@@ -82,17 +81,15 @@ fi
 
 AICX_DIR="$(dirname "$AICX_BIN")"
 
-# Prefer the npm sibling aicx-mcp. `aicx serve` is the same HTTP mode when
-# the platform package did not ship the sibling.
-SERVE_MODE=0
-if [ -x "$AICX_DIR/aicx-mcp" ]; then
-  RUN_BIN="$AICX_DIR/aicx-mcp"
-elif [ "$(basename "$AICX_BIN")" = "aicx-mcp" ]; then
-  RUN_BIN="$AICX_BIN"
-else
-  RUN_BIN="$AICX_BIN"
-  SERVE_MODE=1
+# The standalone MCP sibling does not serve the dashboard.
+if [ "$(basename "$AICX_BIN")" = "aicx-mcp" ]; then
+  AICX_BIN="$AICX_DIR/aicx"
+  if [ ! -x "$AICX_BIN" ]; then
+    note "mcp service: hybrid aicx executable not found beside aicx-mcp"
+    exit 1
+  fi
 fi
+RUN_BIN="$AICX_BIN"
 
 # Local-only is the product default. Tailnet exposure is an explicit operator
 # decision via AICX_MCP_HOST, and that bind does not get --no-require-auth.
@@ -118,6 +115,7 @@ RUN_BIN_XML="$(printf '%s' "$RUN_BIN" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -
 HOST_XML="$(printf '%s' "$HOST" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g' -e "s/'/\&apos;/g")"
 PORT_XML="$(printf '%s' "$PORT" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g' -e "s/'/\&apos;/g")"
 PATH_XML="$(printf '%s' "$AICX_DIR:/usr/bin:/bin:$HOME/.local/bin:$HOME/.cargo/bin:/opt/homebrew/bin" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g' -e "s/'/\&apos;/g")"
+LOG_DIR_XML="$(printf '%s' "$LOG_DIR" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g' -e "s/'/\&apos;/g")"
 # Tool-name audit + rmcp session lifecycle. Index maintenance has a separate owner.
 # Not `info` globally — that floods hyper/h2. Not `--verbose` — extractor only.
 RUST_LOG_VALUE="${AICX_MCP_RUST_LOG:-mcp.audit=info,mcp.lifecycle=info,rmcp=info}"
@@ -133,12 +131,6 @@ case "$HOST" in
     <string>--no-require-auth</string>"
     ;;
 esac
-SERVE_XML=""
-if [ "$SERVE_MODE" = "1" ]; then
-  SERVE_XML="
-    <string>serve</string>"
-fi
-
 cat > "$PLIST" <<PLIST_EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -148,7 +140,8 @@ cat > "$PLIST" <<PLIST_EOF
   <string>$LABEL</string>
   <key>ProgramArguments</key>
   <array>
-    <string>$RUN_BIN_XML</string>$SERVE_XML
+    <string>$RUN_BIN_XML</string>
+    <string>serve</string>
     <string>--transport</string>
     <string>http</string>
     <string>--host</string>
@@ -169,9 +162,9 @@ cat > "$PLIST" <<PLIST_EOF
   <key>KeepAlive</key>
   <true/>
   <key>StandardOutPath</key>
-  <string>$LOG_DIR/aicx-serve-http.log</string>
+  <string>$LOG_DIR_XML/aicx-serve-http.log</string>
   <key>StandardErrorPath</key>
-  <string>$LOG_DIR/aicx-serve-http.log</string>
+  <string>$LOG_DIR_XML/aicx-serve-http.log</string>
 </dict>
 </plist>
 PLIST_EOF
@@ -181,8 +174,14 @@ plutil -lint "$PLIST" >/dev/null
 # Keep expensive corpus publication outside the long-lived server. The helper
 # also writes its plist when launchctl cannot bootstrap from the current shell.
 REINDEX_INSTALLER="$(cd "$(dirname "$0")" && pwd)/install-reindex-schedule.sh"
+MANAGER="$(launchctl managername 2>/dev/null || true)"
 if [ -f "$REINDEX_INSTALLER" ]; then
-  AICX_BIN="$AICX_BIN" bash "$REINDEX_INSTALLER"
+  if ! AICX_BIN="$AICX_BIN" bash "$REINDEX_INSTALLER"; then
+    if [ "$MANAGER" = "Aqua" ]; then
+      exit 1
+    fi
+    note "index refresh: activation deferred until an Aqua login"
+  fi
 else
   note "index refresh: run 'aicx doctor --repair-runtime' once to install the 8640s scheduler"
 fi
@@ -220,14 +219,13 @@ try_bootstrap() {
   return 1
 }
 
-MANAGER="$(launchctl managername 2>/dev/null || true)"
 if [ "$MANAGER" != "Aqua" ]; then
   note "mcp service: plist written to $PLIST"
   note "mcp service: NOT loaded — this shell is not an Aqua login (launchctl managername=${MANAGER:-unknown})"
   note "mcp service: retry from Terminal.app / a GUI session:"
   note "  launchctl bootstrap gui/$(id -u) $PLIST"
   note "mcp service: do not run this as root."
-  exit 1
+  exit 0
 fi
 
 # Migrate machines still running the legacy io.vetcoders.aicx.mcp agent so

@@ -168,6 +168,16 @@ fn main() -> ExitCode {
 
     let args = Args::parse();
 
+    if let Ok(home) = aicx::aicx_home::resolve()
+        && let Err(error) = aicx::parser::intent_phrases::load_operator_or_embedded(
+            &home.join("intent_phrases.toml"),
+        )
+    {
+        safe_stderr_log(&format!(
+            "[aicx-mcp] invalid operator intent phrases; using embedded defaults: {error}"
+        ));
+    }
+
     if let Err(message) =
         validate_auto_refresh_transport(args.transport, args.experimental_auto_refresh)
     {

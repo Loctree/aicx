@@ -486,7 +486,7 @@ fn cursor_exact_id_across_projects_keeps_newest_copy_and_distinct_prefix_stays_a
         .substitution_notice
         .expect("project-copy choice must be named");
     assert!(
-        notice.contains("newest of 2 cursor project copies"),
+        notice.contains("most complete of 2 cursor project copies"),
         "notice must name how many project copies existed"
     );
     let kept = notice.split("→ ").nth(1).map(str::trim).map(Path::new);
@@ -494,7 +494,10 @@ fn cursor_exact_id_across_projects_keeps_newest_copy_and_distinct_prefix_stays_a
         kept.is_some_and(|path| notice_names_kept_copy(path, "zzz-live-project", UUID_A)),
         "notice must name the kept project copy"
     );
-    assert_eq!(lookup.stats.files_opened, 1, "only the kept copy is opened");
+    assert_eq!(
+        lookup.stats.files_opened, 2,
+        "both copy headers are compared"
+    );
 
     let ambiguous = catalog.resolve("019f0000").unwrap_err();
     let CatalogError::Ambiguous { candidates, .. } = ambiguous else {
@@ -507,6 +510,81 @@ fn cursor_exact_id_across_projects_keeps_newest_copy_and_distinct_prefix_stays_a
     ids.sort();
     ids.dedup();
     assert_eq!(ids, vec![UUID_A, UUID_B]);
+}
+
+#[test]
+fn cursor_exact_id_prefers_complete_older_transcript_over_newer_partial_copy() {
+    let root = TestRoot::new("cursor-completeness");
+    let turn =
+        "{\"role\":\"user\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"ask\"}]}}\n";
+    let completed = format!(
+        "{}{{\"role\":\"assistant\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"complete-copy-final-answer\"}}]}}}}\n",
+        turn.repeat(12)
+    );
+    let complete = root.write(
+        format!(".cursor/projects/older-project/agent-transcripts/{UUID_A}/{UUID_A}.jsonl"),
+        &completed,
+    );
+    let partial = root.write(
+        format!(".cursor/projects/newer-project/agent-transcripts/{UUID_A}/{UUID_A}.jsonl"),
+        &format!(
+            "{{\"role\":\"user\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"{}\"}}]}}}}\n",
+            "one-long-message ".repeat(2000)
+        ),
+    );
+    assert!(fs::metadata(&partial).unwrap().len() > fs::metadata(&complete).unwrap().len());
+    set_mtime(&complete, 1_700_000_000);
+    set_mtime(&partial, 1_800_000_000);
+
+    let catalog =
+        SessionCatalog::new(AgentKind::Cursor, root.path().join(".cursor/projects")).unwrap();
+    let lookup = catalog.resolve_with_stats(UUID_A);
+    let resolved = lookup.result.unwrap();
+    assert_eq!(resolved.source.path, complete);
+    assert!(
+        resolved
+            .substitution_notice
+            .unwrap()
+            .contains("most complete")
+    );
+    assert_eq!(lookup.stats.files_opened, 2);
+    assert_eq!(lookup.stats.body_reads, 0);
+
+    #[cfg(feature = "app")]
+    {
+        let output_path = root.path().join("conversation.md");
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_aicx"))
+            .env("HOME", root.path())
+            .env("USERPROFILE", root.path())
+            .env("AICX_HOME", root.path().join(".aicx"))
+            .env("AICX_ALLOW_TMP", "1")
+            .env("AICX_NO_MUTATION_WARN", "1")
+            .args([
+                "extract",
+                "cursor",
+                "--session",
+                UUID_A,
+                "--conversation",
+                "-o",
+            ])
+            .arg(&output_path)
+            .output()
+            .expect("run real extract CLI");
+        assert!(
+            output.status.success(),
+            "extract failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            fs::read_to_string(output_path)
+                .unwrap()
+                .contains("complete-copy-final-answer")
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("most complete of 2 cursor project copies")
+        );
+    }
 }
 
 fn notice_names_kept_copy(path: &Path, project: &str, session_id: &str) -> bool {

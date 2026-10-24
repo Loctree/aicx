@@ -496,7 +496,6 @@ const DASHBOARD_POLLUTION_TAGS: &[&str] = &[
     "open_and_recently_viewed_files",
     "communication",
     "mcp_instructions",
-    "user_query",
 ];
 
 /// Readable default when `--preview-chars 0` would otherwise dump the whole turn.
@@ -512,7 +511,11 @@ pub(super) fn strip_dashboard_pollution(message: &str) -> String {
     for tag in DASHBOARD_POLLUTION_TAGS {
         cleaned = strip_tag_blocks(&cleaned, tag);
     }
-    cleaned.trim().to_string()
+    cleaned
+        .replace("<user_query>", "")
+        .replace("</user_query>", "")
+        .trim()
+        .to_string()
 }
 
 fn strip_tag_blocks(input: &str, tag: &str) -> String {
@@ -538,6 +541,7 @@ fn strip_tag_blocks(input: &str, tag: &str) -> String {
         if let Some(end_rel) = rest[start..].find(&close) {
             rest = &rest[start + end_rel + close.len()..];
         } else {
+            out.push_str(&rest[start..]);
             break;
         }
     }
@@ -966,5 +970,28 @@ fn human_size(bytes: u64) -> String {
         format!("{:.1} KB", b / KB)
     } else {
         format!("{} B", bytes)
+    }
+}
+
+#[cfg(test)]
+mod pollution_tests {
+    use super::strip_dashboard_pollution;
+
+    #[test]
+    fn preserves_wrapped_operator_ask() {
+        assert_eq!(
+            strip_dashboard_pollution(
+                "<rules>boilerplate</rules>\n<user_query>Fix the failing test.</user_query>"
+            ),
+            "Fix the failing test."
+        );
+    }
+
+    #[test]
+    fn unmatched_pollution_tag_preserves_remainder() {
+        assert_eq!(
+            strip_dashboard_pollution("Keep this. <rules>Unclosed, but keep the actual ask."),
+            "Keep this. <rules>Unclosed, but keep the actual ask."
+        );
     }
 }

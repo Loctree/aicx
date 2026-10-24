@@ -40,6 +40,26 @@ def fixture(tmp: Path) -> tuple[Path, Path, dict[str, str], Path, Path]:
     agents.mkdir(parents=True)
     fake_bin.mkdir()
 
+    if os.uname().sysname != "Darwin":
+        # Exercise the real shell control flow on Linux too; only OS APIs are mocked.
+        uname = fake_bin / "uname"
+        uname.write_text("#!/bin/sh\necho Darwin\n")
+        uname.chmod(0o755)
+        plutil = fake_bin / "plutil"
+        plutil.write_text(
+            f"#!{sys.executable}\n"
+            "import json, plistlib, sys\n"
+            "from pathlib import Path\n"
+            "args = sys.argv[1:]\n"
+            "path = Path(args[-1])\n"
+            "data = plistlib.loads(path.read_bytes())\n"
+            "if args[0] == '-extract': print(json.dumps(data[args[1]]))\n"
+            "elif args[0] == '-replace':\n"
+            " data[args[1]] = json.loads(args[3]) if args[2] == '-json' else args[3]\n"
+            " path.write_bytes(plistlib.dumps(data, sort_keys=False))\n"
+        )
+        plutil.chmod(0o755)
+
     launcher = fake_bin / "aicx"
     calls = tmp / "aicx-calls.log"
     launcher.write_text(
@@ -61,7 +81,7 @@ def fixture(tmp: Path) -> tuple[Path, Path, dict[str, str], Path, Path]:
     launchctl.write_text(
         "#!/bin/sh\n"
         "printf '%s\\n' \"$*\" >> \"$AICX_SELFTEST_LAUNCHCTL_LOG\"\n"
-        "if [ \"${1:-}\" = managername ]; then echo Aqua; exit 0; fi\n"
+        "if [ \"${1:-}\" = managername ]; then echo \"${AICX_SELFTEST_MANAGER:-Aqua}\"; exit 0; fi\n"
         "if [ \"${1:-}\" = print ]; then\n"
         "  label=${2##*/}\n"
         "  if [ ! -e \"$AICX_SELFTEST_LAUNCHCTL_STATE/$label\" ]; then\n"
@@ -171,8 +191,25 @@ def fixture(tmp: Path) -> tuple[Path, Path, dict[str, str], Path, Path]:
 
 
 def run_repair(env: dict[str, str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
+    command = ["bash", str(SCRIPT)]
+    if os.uname().sysname != "Darwin":
+        # Mock the absolute macOS API and scratch allocation; all test artifacts
+        # stay under the repository fixture, never the host's temporary directory.
+        source = SCRIPT.read_text().replace(
+            '/usr/libexec/PlistBuddy -c "Set :Label $LABEL" "$CANONICAL_PLIST"',
+            'plutil -replace Label -string "$LABEL" "$CANONICAL_PLIST"',
+        ).replace(
+            'BACKUP_PLIST="$(mktemp "${TMPDIR:-/tmp}/aicx-mcp-plist.XXXXXX")"',
+            'BACKUP_PLIST="$CANONICAL_PLIST.repair-backup.$$"\n'
+            '(umask 077; set -o noclobber; : > "$BACKUP_PLIST")',
+        ).replace(
+            'LEGACY_ARCHIVE="$(mktemp "${LEGACY_PLIST}.migrated.$(date -u +%Y%m%dT%H%M%SZ).XXXXXX")"',
+            'LEGACY_ARCHIVE="${LEGACY_PLIST}.migrated.fixture.$$"\n'
+            '  (umask 077; set -o noclobber; : > "$LEGACY_ARCHIVE")',
+        )
+        command = ["bash", "-c", source]
     return subprocess.run(
-        ["bash", str(SCRIPT)],
+        command,
         env=env,
         check=check,
         capture_output=True,
@@ -245,6 +282,9 @@ def test_clean_reader_and_scheduler(tmp: Path) -> None:
     # but it must not change its plist contract or duplicate the reader flag.
     run_repair(env)
     assert plistlib.loads(plist_path.read_bytes()) == repaired
+
+    if os.uname().sysname != "Darwin":
+        return  # The scheduler's macOS-specific contract is tested on Darwin.
 
     subprocess.run(
         ["bash", str(SCHEDULER_SCRIPT)],
@@ -319,6 +359,34 @@ def test_experimental_writer_becomes_reader(tmp: Path) -> None:
         "17",
         "--no-auto-refresh",
     ]
+
+
+def test_existing_hybrid_launcher_is_preserved(tmp: Path) -> None:
+    agents, launcher, env, _, _ = fixture(tmp)
+    custom = launcher.parent / "custom-aicx"
+    custom.write_bytes(launcher.read_bytes())
+    custom.chmod(0o755)
+    plist_path = agents / "com.loctree.aicx.mcp.plist"
+    write_plist(plist_path, "com.loctree.aicx.mcp", [str(custom), "serve", "--port", "8044"])
+    env.pop("AICX_BIN")
+    run_repair(env)
+    assert plistlib.loads(plist_path.read_bytes())["ProgramArguments"][:2] == [str(custom), "serve"]
+
+
+def test_explicit_standalone_launcher_migrates_to_hybrid(tmp: Path) -> None:
+    agents, launcher, env, _, _ = fixture(tmp)
+    standalone = launcher.parent / "aicx-mcp"
+    standalone.write_bytes(launcher.read_bytes())
+    standalone.chmod(0o755)
+    plist_path = agents / "com.loctree.aicx.mcp.plist"
+    write_plist(plist_path, "com.loctree.aicx.mcp", [str(standalone), "--port", "8044"])
+    run_repair(env | {"AICX_BIN": str(standalone)})
+    assert plistlib.loads(plist_path.read_bytes())["ProgramArguments"][:2] == [str(launcher), "serve"]
+    original = plist_path.read_bytes()
+    launcher.unlink()
+    result = run_repair(env | {"AICX_BIN": str(standalone)}, check=False)
+    assert result.returncode != 0
+    assert plist_path.read_bytes() == original
 
 
 def test_legacy_missing_serve_uses_native_subcommand(tmp: Path) -> None:
@@ -809,15 +877,17 @@ def test_scheduler_success_retires_legacy_after_canonical_load(tmp: Path) -> Non
 def main() -> None:
     if len(sys.argv) > 2:
         raise SystemExit(f"usage: {Path(sys.argv[0]).name} [repair-script]")
-    if os.uname().sysname != "Darwin":
-        print("repair MCP runtime self-test skipped (Darwin only)")
+    if os.name == "nt":
+        print("repair MCP runtime shell mocks skipped on Windows; covered by Linux/macOS CI")
         return
     assert SCRIPT.is_file(), f"repair script not found: {SCRIPT}"
-    with tempfile.TemporaryDirectory(prefix="aicx-runtime-repair-") as raw_tmp:
+    with tempfile.TemporaryDirectory(prefix=".aicx-runtime-repair-", dir=ROOT) as raw_tmp:
         base = Path(raw_tmp)
         test_clean_reader_and_scheduler(base / "clean")
         test_experimental_writer_becomes_reader(base / "writer")
         test_legacy_missing_serve_uses_native_subcommand(base / "legacy")
+        test_existing_hybrid_launcher_is_preserved(base / "preserve-hybrid")
+        test_explicit_standalone_launcher_migrates_to_hybrid(base / "standalone-to-hybrid")
         test_transient_bootstrap_failure_recovers(base / "bootstrap-transient")
         test_exhausted_bootstrap_retries_restore_loaded_state(
             base / "bootstrap-exhausted"
@@ -835,6 +905,9 @@ def main() -> None:
         )
         test_descendant_listener_is_owned_by_launchd_job(base / "descendant-listener")
         test_ipv6_wildcard_uses_port_only_socket_ownership(base / "ipv6-wildcard")
+        if os.uname().sysname != "Darwin":
+            print("repair MCP runtime migration and rollback: passed (mocked macOS APIs)")
+            return
         test_scheduler_failure_restores_canonical_file_and_loaded_state(
             base / "scheduler-canonical-failure"
         )

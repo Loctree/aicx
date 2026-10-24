@@ -28,6 +28,11 @@ materializes one JSONL stream — a header row from `trajectory_metadata_blob`
 and one row per `steps` record, sorted by `idx` — and the source digest is the
 digest of that stream.
 
+Materialization fails closed above 100,000 steps, 16 MiB for a single payload,
+or 64 MiB of cumulative payload bytes (including metadata). These limits are
+checked before copying SQLite blobs into the stream. Catalog previews apply
+the same byte limits to metadata and the speech rows they inspect.
+
 ## What becomes speech
 
 `step_payload` is protobuf without a published schema. AICX walks the wire
