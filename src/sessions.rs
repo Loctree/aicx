@@ -126,6 +126,11 @@ pub struct SessionInfo {
     pub source_path: PathBuf,
     pub association: Association,
     pub temporal_confidence: TemporalConfidence,
+    /// Structural subagent provenance (e.g. `subagent:guardian` from Codex
+    /// `session_meta.source.subagent`): the session's user prompts may be
+    /// harness-generated wrappers rather than operator utterances.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_kind: Option<String>,
 }
 
 /// Decode a Claude project directory name back into a cwd path.
@@ -468,6 +473,7 @@ fn scan_claude_session_file(path: &Path, decoded_cwd: Option<&str>) -> Option<Se
         source_path: path.to_path_buf(),
         association,
         temporal_confidence,
+        session_kind: None,
     })
 }
 
@@ -534,6 +540,7 @@ fn scan_codex_session_file(path: &Path) -> Option<SessionInfo> {
     let mut user_message_count = 0usize;
     let mut agent_message_count = 0usize;
     let mut title: Option<String> = None;
+    let mut session_kind: Option<String> = None;
     // Set only after a line actually parses (see scan_claude_session_file): a
     // garbage-only file reports TemporalConfidence::None, not Partial.
     let mut saw_parsable_line = false;
@@ -572,6 +579,9 @@ fn scan_codex_session_file(path: &Path) -> Option<SessionInfo> {
                     .and_then(|p| p.get("cwd"))
                     .and_then(|c| c.as_str())
                     .map(String::from);
+            }
+            if session_kind.is_none() {
+                session_kind = codex_subagent_session_kind(payload);
             }
             continue;
         }
@@ -624,7 +634,131 @@ fn scan_codex_session_file(path: &Path) -> Option<SessionInfo> {
         source_path: path.to_path_buf(),
         association,
         temporal_confidence,
+        session_kind,
     })
+}
+
+/// Subagent provenance from Codex `session_meta.payload.source.subagent`
+/// (e.g. `{"other": "guardian"}`): the structural marker that the session's
+/// user prompts may be harness-generated wrappers, not operator utterances.
+pub(crate) fn codex_subagent_session_kind(payload: Option<&serde_json::Value>) -> Option<String> {
+    let subagent = payload?.get("source")?.get("subagent")?;
+    match subagent {
+        serde_json::Value::String(name) => Some(format!("subagent:{name}")),
+        serde_json::Value::Object(map) => map
+            .get("other")
+            .and_then(serde_json::Value::as_str)
+            .map(|name| format!("subagent:{name}"))
+            .or_else(|| Some("subagent".to_string())),
+        _ => Some("subagent".to_string()),
+    }
+}
+
+/// Guardian/approval-assessor provenance: the session is control-plane
+/// machinery (wrapper prompts in, verdicts out) — meaningful audit evidence,
+/// but never operator project-intent. Generic subagents do real work and are
+/// NOT covered by this predicate.
+///
+/// Gated to `app`: every call site lives in the app-only intents/catalog
+/// pipeline, so the slim loctree-consumer profile would flag it as dead.
+#[cfg(feature = "app")]
+pub(crate) fn is_guardian_session_kind(session_kind: Option<&str>) -> bool {
+    // Exact value, never a prefix: `subagent:guardian-helper` (or any future
+    // `subagent:guardian*` nickname) is an ordinary subagent doing real work.
+    // Silently removing those from project intents would lose operator
+    // evidence, which is the opposite of what this predicate is for.
+    session_kind == Some(GUARDIAN_SESSION_KIND)
+}
+
+/// The one canonical guardian provenance value, as written by
+/// `codex_subagent_session_kind` for `source.subagent = {"other":"guardian"}`.
+#[cfg(feature = "app")]
+pub(crate) const GUARDIAN_SESSION_KIND: &str = "subagent:guardian";
+
+/// Light provenance probe for the catalog hot path: read only until a
+/// `session_meta` record names a kind (bounded) instead of scanning the
+/// rollout.
+///
+/// Bounded in BYTES as well as records. A rollout may open with a malformed or
+/// oversized record — the same shape `parse_large_codex_signal` exists for —
+/// and `BufRead::lines()` would allocate all of it before any record limit
+/// applied, turning a probe the catalog runs per session into hundreds of
+/// megabytes. An over-cap record cannot be a `session_meta` header worth
+/// parsing, so it is drained rather than reassembled.
+///
+/// The drain stays inside the cap: the reader itself is `take(MAX_HEADER_BYTES)`,
+/// exactly as `session_catalog::probe_candidate` reads the header. An over-cap
+/// record within the header is drained and the probe reads on; one larger than
+/// the header ends it, for the catalog and the probe alike. Draining past the
+/// cap made this read unbounded — any record size, times the record count —
+/// on every Codex source the catalog touches, and an ordinary session never
+/// stops early. Provenance past the header is read by the full discovery scan
+/// of `aicx catalog rebuild`, which stores it in the column every lane reads
+/// before probing.
+///
+/// The bounds are the catalog's own header bounds, never tighter: the catalog
+/// reads a session's identity from the same header, and a probe that gave up
+/// earlier would catalog a guardian whose identity it found as an ordinary
+/// session.
+#[cfg(feature = "app")]
+pub(crate) fn codex_session_kind_from_source(path: &Path) -> Option<String> {
+    use crate::session_catalog::{MAX_HEADER_BYTES, MAX_HEADER_LINES};
+    use std::io::Read;
+
+    let file = fs::File::open(path).ok()?;
+    let mut reader = BufReader::new(file.take(MAX_HEADER_BYTES as u64));
+    for _ in 0..MAX_HEADER_LINES {
+        let line = aicx_parser::sanitize::read_line_capped(
+            &mut reader,
+            crate::session_catalog::MAX_HEADER_LINE_BYTES,
+        )
+        .ok()??;
+        if line.exceeded {
+            continue;
+        }
+        let text = line.line.trim();
+        if text.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
+            continue;
+        };
+        // The first `session_meta` need not carry the provenance: the catalog
+        // scanner keeps reading later ones until a kind appears, and a probe
+        // that stopped at the first would call that guardian ordinary.
+        if value.get("type").and_then(|t| t.as_str()) == Some("session_meta")
+            && let Some(kind) = codex_subagent_session_kind(value.get("payload"))
+        {
+            return Some(kind);
+        }
+    }
+    None
+}
+
+/// Resolve a session's structural provenance at the point where its source is
+/// actually opened.
+///
+/// The catalog column is a cache, not the authority. The hot-window refresh
+/// (`scan_hot_window_skipping`) never revisits a source whose fingerprint is
+/// unchanged, so rows cataloged before the column existed keep `None`
+/// forever — and no number of `aicx index` runs backfills them, because the
+/// index reads the same column. Every lane that opens a Codex rollout can
+/// establish the truth itself with one bounded header read, which costs a
+/// fraction of the full parse that follows it. `aicx catalog rebuild` is what
+/// refreshes the stored column.
+#[cfg(feature = "app")]
+pub(crate) fn resolve_session_kind(
+    agent: &str,
+    cataloged: Option<&str>,
+    source_path: &Path,
+) -> Option<String> {
+    if let Some(kind) = cataloged.map(str::to_owned) {
+        return Some(kind);
+    }
+    if agent != "codex" {
+        return None;
+    }
+    codex_session_kind_from_source(source_path)
 }
 
 /// Discover Grok sessions under `~/.grok/sessions`.
@@ -778,6 +912,7 @@ fn scan_grok_session_file(path: &Path) -> Option<SessionInfo> {
         source_path: path.to_path_buf(),
         association,
         temporal_confidence,
+        session_kind: None,
     })
 }
 
@@ -986,6 +1121,7 @@ fn scan_gemini_session_file(path: &Path, dir_name: &str) -> Option<SessionInfo> 
         source_path: path.to_path_buf(),
         association,
         temporal_confidence,
+        session_kind: None,
     })
 }
 
@@ -1235,6 +1371,7 @@ fn scan_junie_session_file(path: &Path, session_id: &str) -> Option<SessionInfo>
         source_path: path.to_path_buf(),
         association,
         temporal_confidence,
+        session_kind: None,
     })
 }
 
@@ -1434,6 +1571,7 @@ fn scan_kimi_session_file(
         source_path: path.to_path_buf(),
         association: Association::Unknown,
         temporal_confidence,
+        session_kind: None,
     })
 }
 
@@ -1673,6 +1811,7 @@ fn scan_cursor_session_file(path: &Path, decoded_cwd: Option<&str>) -> Option<Se
         source_path: path.to_path_buf(),
         association,
         temporal_confidence,
+        session_kind: None,
     })
 }
 
@@ -2476,6 +2615,239 @@ mod tests {
     }
 
     #[test]
+    fn codex_subagent_provenance_becomes_session_kind() {
+        let root = temp_root("codex_subagent");
+        let day = root.join("2026").join("08").join("27");
+        fs::create_dir_all(&day).unwrap();
+        write_session(
+            &day,
+            "rollout-2026-08-27T03-35-14-01a040db.jsonl",
+            &[
+                r#"{"timestamp":"2026-08-27T01:35:45.863Z","type":"session_meta","payload":{"id":"01a040db-child","cwd":"/Users/tester/Git/vista","source":{"subagent":{"other":"guardian"}}}}"#,
+                r#"{"timestamp":"2026-08-27T01:35:46.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"text":"The following is the Codex agent history whose request action you are assessing."}]}}"#,
+            ],
+        );
+        let sessions = discover_codex_sessions(&root, None);
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(
+            sessions[0].session_kind.as_deref(),
+            Some("subagent:guardian")
+        );
+    }
+
+    /// Guardian exclusion is an EXACT contract, not a namespace sweep. A
+    /// nickname that merely starts with the canonical value is an ordinary
+    /// subagent doing real work: removing it from project intents would drop
+    /// operator evidence on the floor.
+    #[test]
+    #[cfg(feature = "app")]
+    fn only_the_canonical_guardian_kind_is_control_plane() {
+        assert!(is_guardian_session_kind(Some("subagent:guardian")));
+        assert!(!is_guardian_session_kind(Some("subagent:guardian-helper")));
+        assert!(!is_guardian_session_kind(Some("subagent:guardianship")));
+        assert!(!is_guardian_session_kind(Some("subagent:Hooke")));
+        assert!(!is_guardian_session_kind(Some("subagent")));
+        assert!(!is_guardian_session_kind(None));
+    }
+
+    /// The catalog column is a cache. A row cataloged before the column
+    /// existed keeps `None` forever (the hot-window refresh never revisits an
+    /// unchanged source), so the lane that opens the rollout has to be able to
+    /// establish provenance itself.
+    #[test]
+    #[cfg(feature = "app")]
+    fn provenance_resolves_from_the_source_when_the_catalog_row_is_cold() {
+        let root = temp_root("cold_provenance");
+        let day = root.join("2026").join("08").join("27");
+        fs::create_dir_all(&day).unwrap();
+        write_session(
+            &day,
+            "rollout-2026-08-27T03-35-45-01a040db.jsonl",
+            &[
+                r#"{"timestamp":"2026-08-27T01:35:45.000Z","type":"session_meta","payload":{"id":"01a040db-60f0","cwd":"/Users/tester/Git/vista","source":{"subagent":{"other":"guardian"}}}}"#,
+                r#"{"timestamp":"2026-08-27T01:35:46.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"text":"Verdict: approve"}]}}"#,
+            ],
+        );
+        let path = day.join("rollout-2026-08-27T03-35-45-01a040db.jsonl");
+
+        // Cold row: no cached value, resolved from the source itself.
+        assert_eq!(
+            resolve_session_kind("codex", None, &path).as_deref(),
+            Some("subagent:guardian")
+        );
+        // A cached value is authoritative and costs no read.
+        assert_eq!(
+            resolve_session_kind("codex", Some("subagent:Hooke"), &path).as_deref(),
+            Some("subagent:Hooke")
+        );
+        // Only Codex carries this provenance shape.
+        assert_eq!(resolve_session_kind("claude", None, &path), None);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Finding: the probe is documented as bounded, but `BufRead::lines()`
+    /// bounds only the record COUNT. A rollout that opens with an oversized or
+    /// malformed record made the catalog allocate all of it per session.
+    #[test]
+    #[cfg(feature = "app")]
+    fn an_oversized_leading_record_does_not_defeat_the_bounded_probe() {
+        let root = temp_root("capped_probe");
+        let day = root.join("2026").join("08").join("27");
+        fs::create_dir_all(&day).unwrap();
+        // An over-cap record that WOULD answer the probe if it were parsed,
+        // followed by the real header. Reading it whole is not just expensive,
+        // it is the wrong answer: a record too large to be a session header is
+        // not the session header.
+        let bloat = format!(
+            r#"{{"timestamp":"2026-08-27T01:35:44.000Z","type":"session_meta","payload":{{"id":"padded","source":{{"subagent":{{"other":"from-the-oversized-record"}}}},"junk":"{}"}}}}"#,
+            "x".repeat(crate::session_catalog::MAX_HEADER_LINE_BYTES * 2)
+        );
+        write_session(
+            &day,
+            "rollout-2026-08-27T03-35-44-01a040dc.jsonl",
+            &[
+                &bloat,
+                r#"{"timestamp":"2026-08-27T01:35:45.000Z","type":"session_meta","payload":{"id":"01a040dc-60f0","cwd":"/Users/tester/Git/vista","source":{"subagent":{"other":"guardian"}}}}"#,
+            ],
+        );
+        let path = day.join("rollout-2026-08-27T03-35-44-01a040dc.jsonl");
+
+        // The over-cap record is skipped rather than reassembled, so the
+        // answer comes from the header that follows it.
+        assert_eq!(
+            resolve_session_kind("codex", None, &path).as_deref(),
+            Some("subagent:guardian")
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Finding: draining an over-cap record outside the byte cap made the
+    /// per-session probe unbounded — any record size, times the record count —
+    /// on the catalog hot path. The reader is capped like the catalog's own
+    /// header read, so a record larger than the header ends the probe for both,
+    /// and the full discovery scan a rebuild runs is what reads past it.
+    #[test]
+    #[cfg(feature = "app")]
+    fn a_record_larger_than_the_header_ends_the_probe_as_it_ends_the_header() {
+        let root = temp_root("probe_past_budget");
+        let day = root.join("2026").join("08").join("27");
+        fs::create_dir_all(&day).unwrap();
+        let bloat = format!(
+            r#"{{"timestamp":"2026-08-27T01:35:46.000Z","type":"response_item","payload":{{"type":"message","role":"user","content":[{{"text":"{}"}}]}}}}"#,
+            "x".repeat(crate::session_catalog::MAX_HEADER_BYTES + 4096)
+        );
+        let name = "rollout-2026-08-27T03-35-47-01a040df.jsonl";
+        write_session(
+            &day,
+            name,
+            &[
+                &bloat,
+                r#"{"timestamp":"2026-08-27T01:35:47.000Z","type":"session_meta","payload":{"id":"01a040df-60f0","cwd":"/Users/tester/Git/vista","source":{"subagent":{"other":"guardian"}}}}"#,
+            ],
+        );
+        let path = day.join(name);
+
+        // Past the header for the probe, which reads no further than the cap —
+        // the catalog's own header read stops there too
+        // (`bounded_header_reader_never_crosses_byte_cap`).
+        assert_eq!(resolve_session_kind("codex", None, &path), None);
+        // The full scan a rebuild runs reads the whole rollout and finds it.
+        assert_eq!(
+            discover_codex_sessions(&root, None)[0]
+                .session_kind
+                .as_deref(),
+            Some("subagent:guardian")
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Finding: the probe gave up after 64 records while the catalog reads a
+    /// session's identity from up to `MAX_HEADER_LINES` header records. A
+    /// guardian whose `session_meta` sat between the two limits was cataloged
+    /// with its identity and without its provenance, and so reached project
+    /// intents as an ordinary session.
+    #[test]
+    #[cfg(feature = "app")]
+    fn the_probe_reads_as_far_as_the_catalog_reads_the_header() {
+        let root = temp_root("probe_depth");
+        let day = root.join("2026").join("08").join("27");
+        fs::create_dir_all(&day).unwrap();
+        let preamble: Vec<String> = (0..99)
+            .map(|i| format!(r#"{{"type":"event_msg","payload":{{"type":"note","seq":{i}}}}}"#))
+            .collect();
+        let mut records: Vec<&str> = preamble.iter().map(String::as_str).collect();
+        records.push(
+            r#"{"timestamp":"2026-08-27T01:35:45.000Z","type":"session_meta","payload":{"id":"01a040dd-60f0","cwd":"/Users/tester/Git/vista","source":{"subagent":{"other":"guardian"}}}}"#,
+        );
+        assert!(records.len() > 64 && records.len() <= crate::session_catalog::MAX_HEADER_LINES);
+        write_session(&day, "rollout-2026-08-27T03-35-45-01a040dd.jsonl", &records);
+        let path = day.join("rollout-2026-08-27T03-35-45-01a040dd.jsonl");
+
+        assert_eq!(
+            resolve_session_kind("codex", None, &path).as_deref(),
+            Some("subagent:guardian")
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Finding: the probe returned at the FIRST `session_meta`, kind or not,
+    /// while the catalog scanner keeps reading later ones until one names a
+    /// kind. A rollout whose provenance sits in a second header was cataloged
+    /// ordinary on the cold path, and its guardian prompts reached intents.
+    #[test]
+    #[cfg(feature = "app")]
+    fn the_probe_reads_past_a_session_meta_without_provenance() {
+        let root = temp_root("probe_second_meta");
+        let day = root.join("2026").join("08").join("27");
+        fs::create_dir_all(&day).unwrap();
+        let name = "rollout-2026-08-27T03-35-46-01a040de.jsonl";
+        write_session(
+            &day,
+            name,
+            &[
+                r#"{"timestamp":"2026-08-27T01:35:46.000Z","type":"session_meta","payload":{"id":"01a040de-60f0","cwd":"/Users/tester/Git/vista"}}"#,
+                r#"{"timestamp":"2026-08-27T01:35:46.500Z","type":"session_meta","payload":{"id":"01a040de-60f0","source":{"subagent":{"other":"guardian"}}}}"#,
+            ],
+        );
+        let path = day.join(name);
+
+        assert_eq!(
+            resolve_session_kind("codex", None, &path).as_deref(),
+            Some("subagent:guardian")
+        );
+        // The full scanner agrees, which is the contract the probe mirrors.
+        assert_eq!(
+            discover_codex_sessions(&root, None)[0]
+                .session_kind
+                .as_deref(),
+            Some("subagent:guardian")
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn codex_plain_session_has_no_session_kind() {
+        let root = temp_root("codex_plain_kind");
+        let day = root.join("2026").join("08").join("27");
+        fs::create_dir_all(&day).unwrap();
+        write_session(
+            &day,
+            "rollout-2026-08-27T04-00-00-02b151ec.jsonl",
+            &[
+                r#"{"timestamp":"2026-08-27T02:00:00.000Z","type":"session_meta","payload":{"id":"02b151ec-plain","cwd":"/Users/tester/Git/vista"}}"#,
+                r#"{"timestamp":"2026-08-27T02:00:01.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"text":"hej"}]}}"#,
+            ],
+        );
+        let sessions = discover_codex_sessions(&root, None);
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session_kind, None);
+    }
+
+    #[test]
     fn discovers_codex_session_from_meta_and_message_stream() {
         let root = temp_root("codex");
         let day = root.join("2026").join("01").join("29");
@@ -2531,6 +2903,7 @@ mod tests {
             source_path: PathBuf::from(format!("/x/{id}.jsonl")),
             association: Association::Exact,
             temporal_confidence: TemporalConfidence::Full,
+            session_kind: None,
         }
     }
 
@@ -3321,6 +3694,7 @@ mod tests {
             source_path: PathBuf::from("/dev/null"),
             association: Association::Inferred,
             temporal_confidence: TemporalConfidence::None,
+            session_kind: None,
         };
         let sessions = vec![mk("cursor"), mk("claude"), mk("gemini")];
         let cursor = select_sessions(sessions.clone(), None, Some("cursor-agent"), None, 0);

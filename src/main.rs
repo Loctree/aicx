@@ -5244,6 +5244,11 @@ fn run_intents(
         } else {
             print_no_intents_message(projects, hours, None)?;
         }
+        // An answer the project filters emptied is not "no intents": the
+        // Markdown answer still says what they withheld.
+        if let Some(note) = extraction.stats.withheld_scope_note() {
+            print!("{note}");
+        }
         return Ok(());
     }
 
@@ -5287,6 +5292,9 @@ fn run_intents(
             }
             let md = intents::format_intents_markdown(&records);
             print!("{}", md);
+            if let Some(note) = extraction.stats.withheld_scope_note() {
+                print!("{note}");
+            }
         }
     }
 
@@ -5317,7 +5325,7 @@ fn run_intents_pack(
 ) -> Result<()> {
     let lane_sort = filters.sort.unwrap_or(SortOrder::Newest);
     let lane_limit = filters.limit.or(Some(DEFAULT_INTENTS_PACK_LIMIT));
-    let (decisions, live_a) = extract_intents_pack_lane(
+    let (decisions, stats_a) = extract_intents_pack_lane(
         projects,
         hours,
         filters,
@@ -5331,7 +5339,7 @@ fn run_intents_pack(
         lane_limit,
         live,
     )?;
-    let (tasks, live_b) = extract_intents_pack_lane(
+    let (tasks, stats_b) = extract_intents_pack_lane(
         projects,
         hours,
         filters,
@@ -5345,7 +5353,7 @@ fn run_intents_pack(
         lane_limit,
         live,
     )?;
-    let (user_msg, live_c) = extract_intents_pack_lane(
+    let (user_msg, stats_c) = extract_intents_pack_lane(
         projects,
         hours,
         filters,
@@ -5359,7 +5367,7 @@ fn run_intents_pack(
         lane_limit,
         live,
     )?;
-    let (agent_reply, live_d) = extract_intents_pack_lane(
+    let (agent_reply, stats_d) = extract_intents_pack_lane(
         projects,
         hours,
         filters,
@@ -5373,7 +5381,7 @@ fn run_intents_pack(
         lane_limit,
         live,
     )?;
-    let (unresolved, live_e) = extract_intents_pack_lane(
+    let (unresolved, stats_e) = extract_intents_pack_lane(
         projects,
         hours,
         filters,
@@ -5388,7 +5396,12 @@ fn run_intents_pack(
         live,
     )?;
     // Lanes overlap on the same sessions — the widest lane is the honest count.
-    let live_sessions = live_a.max(live_b).max(live_c).max(live_d).max(live_e);
+    let lanes = [stats_a, stats_b, stats_c, stats_d, stats_e];
+    let live_sessions = lanes
+        .iter()
+        .map(|stats| stats.live_sessions)
+        .max()
+        .unwrap_or(0);
     if live {
         print_live_window_header(live_sessions);
     }
@@ -5424,6 +5437,16 @@ fn run_intents_pack(
         "{}",
         format_intents_pack_markdown(&project_label, hours, lane_limit, &sections)
     );
+    // What the project filters withheld, counted on the widest lane as well:
+    // every lane notes the same sessions, and a lane without a frame kind sees
+    // every unplaced frame.
+    if let Some(note) = lanes
+        .iter()
+        .max_by_key(|stats| (stats.mixed_scope_sessions, stats.unplaced_frames))
+        .and_then(|stats| stats.withheld_scope_note())
+    {
+        print!("\n{note}");
+    }
     Ok(())
 }
 
@@ -5441,7 +5464,7 @@ fn extract_intents_pack_lane(
     sort: SortOrder,
     limit: Option<usize>,
     live: bool,
-) -> Result<(Vec<intents::IntentRecord>, usize)> {
+) -> Result<(Vec<intents::IntentRecord>, intents::IntentExtractionStats)> {
     let config = intents::IntentsConfig {
         project: projects.first().cloned().unwrap_or_default(),
         hours,
@@ -5472,7 +5495,7 @@ fn extract_intents_pack_lane(
     if unresolved && let Some(kind) = kind_filter {
         records.retain(|record| record.kind == kind);
     }
-    Ok((records, extraction.stats.live_sessions))
+    Ok((records, extraction.stats))
 }
 
 fn intent_date_bounds(filters: &RetrievalFilters) -> Result<(Option<String>, Option<String>)> {

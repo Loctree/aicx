@@ -9,6 +9,7 @@ pub mod identity;
 pub mod model;
 pub mod reader;
 pub mod refusal;
+pub mod scope_evidence;
 pub mod source;
 pub mod validate;
 
@@ -42,6 +43,11 @@ pub use reader::{
 pub use refusal::{
     AdapterDetection, DetectionProbe, MIN_HUMAN_UTTERANCES, MIN_VISIBLE_TURNS, REFUSAL_SCHEMA,
     RefusalEvidence, RefusalReason, SubstitutionError, SubstitutionKind,
+};
+pub use scope_evidence::{
+    WindowScope, WorkdirEvidence, WorkdirIdentity, distinct_repo_identity, effective_window_scope,
+    is_tool_call_payload_type, normalize_workdir, recorded_workdir, repository_count,
+    scope_layout_evidence, tool_call_workdirs, truncated_record_is_tool_call, workdir_within_scope,
 };
 pub use source::{AgentKind, SourceArtifact, SourceError, SourceFraming, SourceHandle};
 pub use validate::{

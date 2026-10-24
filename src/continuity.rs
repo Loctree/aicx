@@ -39,6 +39,10 @@ pub struct ContinuityPack {
     pub mixed_scope: Vec<crate::intents::MixedScopeSession>,
     /// Whether mixed candidates were distilled on explicit request.
     pub distilled_mixed: bool,
+    /// Sessions served without frames whose turn window could not be placed.
+    /// Those frames are never distilled, with or without `distill_mixed`,
+    /// and the pack lists what it left out.
+    pub unplaced_scope: Vec<crate::intents::UnplacedScopeSession>,
 }
 
 pub struct SourceLine {
@@ -61,10 +65,19 @@ pub struct IndexHealthLine {
 /// live parse (intents live window) → census fingerprints → index status.
 /// No embedder involvement anywhere on this path.
 ///
-/// Default = do not distill mixed-workstream candidates into one history
-/// (`ScopeStatus::MixedCandidate`, W2-R1). When every session in the window
-/// is such a candidate the pack refuses with `RefusalReason::MixedWorkstream`
-/// instead of returning an empty or braided narrative.
+/// Default = do not distill a mixed workstream into one history (W2-R1):
+/// a session that proves more than one scope — a workdir conflict, a scope
+/// hidden by `.aicxignore`, or more than one repository — or whose work ran
+/// in a checkout other than its cataloged one is withheld. When the window
+/// holds such a session and no homogeneous record is left — even when
+/// upstream filters had already removed every frame of it — the pack refuses
+/// instead of returning an empty or braided narrative: with
+/// `RefusalReason::MixedWorkstream`, or with a plain error when the only such
+/// work sits in one foreign checkout, which that reason cannot express.
+///
+/// Frames whose turn window could not be placed are never distilled. The
+/// session they belong to is still served from its placed frames, and the pack
+/// lists what it left out. A window with nothing else to distill refuses.
 pub fn build(aicx_home: &Path, projects: &[String], hours: u64) -> Result<ContinuityPack> {
     build_with_scope(aicx_home, projects, hours, false)
 }
@@ -98,42 +111,13 @@ pub fn build_with_scope(
     let sources = collect_sources(aicx_home, projects, cutoff);
     let index_health = collect_index_health(aicx_home, projects, extraction.stats.live_sessions);
 
-    // Scope gate (W2-R1): a mixed candidate is not distilled into one
-    // history by default. Records from those sessions are withheld from
-    // the narrative and the sessions are listed; when nothing else is left
-    // the pack refuses loudly rather than rendering an empty NOW.
     let mixed_scope = extraction.mixed_scope;
+    let unplaced_scope = extraction.unplaced_scope;
     let mut records = extraction.records;
-    if !distill_mixed && !mixed_scope.is_empty() {
-        let mixed_keys: std::collections::BTreeSet<(&str, &str)> = mixed_scope
-            .iter()
-            .map(|session| (session.agent.as_str(), session.session_id.as_str()))
-            .collect();
-        let before = records.len();
-        records.retain(|record| {
-            !mixed_keys.contains(&(record.agent.as_str(), record.session_id.as_str()))
-        });
-        if records.is_empty() && before > 0 {
-            let first = &mixed_scope[0];
-            let report = crate::extraction::conversation::ScopeReport {
-                status: aicx_parser::engine::ScopeStatus::MixedCandidate,
-                cwds: first.cwds.clone(),
-                branches: first.branches.clone(),
-                entries: before,
-            };
-            let refusal = crate::extraction::conversation::refuse_mixed_workstream(
-                first.agent_kind(),
-                &first.session_id,
-                &report,
-                false,
-            )
-            .expect("mixed candidate refuses by default");
-            return Err(anyhow::Error::new(refusal).context(format!(
-                "continuity: {} mixed-workstream session(s) in the window and nothing homogeneous to distill; pass distill_mixed to override",
-                mixed_scope.len()
-            )));
-        }
+    if !distill_mixed {
+        withhold_mixed_sessions(&mut records, &mixed_scope)?;
     }
+    refuse_unplaced_only_window(&records, &unplaced_scope)?;
 
     Ok(ContinuityPack {
         project_label: if projects.is_empty() {
@@ -148,7 +132,104 @@ pub fn build_with_scope(
         index_health,
         mixed_scope,
         distilled_mixed: distill_mixed,
+        unplaced_scope,
     })
+}
+
+/// A window whose only work sat in turn windows no checkout could claim
+/// refuses instead of rendering an empty NOW.
+///
+/// The intents filter withholds such frames before anything reaches this pack.
+/// With nothing else left, an empty pack would read as "no work in this
+/// window", when the truth is "work this pack cannot place". A pack that
+/// still holds records lists the sessions it served in part instead.
+fn refuse_unplaced_only_window(
+    records: &[IntentRecord],
+    unplaced_scope: &[intents::UnplacedScopeSession],
+) -> Result<()> {
+    if !records.is_empty() || unplaced_scope.is_empty() {
+        return Ok(());
+    }
+    let frames: usize = unplaced_scope.iter().map(|session| session.frames).sum();
+    anyhow::bail!(
+        "continuity: nothing placed to distill; {frames} frame(s) from {} session(s) were withheld because their turn window ran where no checkout could claim it",
+        unplaced_scope.len()
+    )
+}
+
+/// Scope gate (W2-R1): a mixed candidate is not distilled into one history by
+/// default. Records from those sessions are withheld from the narrative (the
+/// sessions stay listed), and when nothing homogeneous is left the pack
+/// refuses loudly rather than rendering an empty NOW.
+///
+/// "Nothing left" is judged on what REMAINS, not on how much this gate
+/// withheld. The intents filters fail closed upstream, so a mixed session can
+/// arrive here with none of its frames — `.aicxignore` hid its baseline, or
+/// no frame could be attributed to the project — and still be the only work
+/// in the window. Refusing only when this gate had withheld something let
+/// exactly that window through as a successful, empty pack.
+fn withhold_mixed_sessions(
+    records: &mut Vec<IntentRecord>,
+    mixed_scope: &[intents::MixedScopeSession],
+) -> Result<()> {
+    if mixed_scope.is_empty() {
+        return Ok(());
+    }
+    let mixed_keys: std::collections::BTreeSet<(&str, &str)> = mixed_scope
+        .iter()
+        .map(|session| (session.agent.as_str(), session.session_id.as_str()))
+        .collect();
+    let before = records.len();
+    records.retain(|record| {
+        !mixed_keys.contains(&(record.agent.as_str(), record.session_id.as_str()))
+    });
+    if records.is_empty() {
+        return Err(mixed_window_refusal(mixed_scope, before));
+    }
+    Ok(())
+}
+
+/// The error a window of only mixed-workstream sessions refuses with.
+///
+/// Built from the session's WHOLE scope verdict. Rebuilding the report from
+/// cwds alone zeroed the conflicts and hidden scopes that made a session
+/// mixed, so a session mixed only by a conflict or a `.aicxignore`-hidden
+/// checkout — at most one visible cwd — no longer looked mixed, and the
+/// `expect` on the refusal panicked the whole command.
+fn mixed_window_refusal(
+    mixed_scope: &[intents::MixedScopeSession],
+    withheld: usize,
+) -> anyhow::Error {
+    let context = format!(
+        "continuity: {} mixed-workstream session(s) in the window and nothing homogeneous to distill; pass distill_mixed to override",
+        mixed_scope.len()
+    );
+    let refusal = mixed_scope.iter().find_map(|session| {
+        let report = crate::extraction::conversation::ScopeReport {
+            hidden_scopes: session.hidden_scopes,
+            status: session.status,
+            cwds: session.cwds.clone(),
+            branches: session.branches.clone(),
+            entries: withheld,
+            conflicts: session.conflicts,
+        };
+        crate::extraction::conversation::refuse_mixed_workstream(
+            session.agent_kind(),
+            &session.session_id,
+            &report,
+            false,
+        )
+    });
+    match refusal {
+        Some(refusal) => anyhow::Error::new(refusal).context(context),
+        // A session is listed when its lane could not serve it whole: more
+        // than one scope, which refuses structurally above, or ONE scope
+        // foreign to its cataloged checkout, which that refusal cannot
+        // express. The telemetry keeps the cataloged path out of `cwds`, so
+        // a foreign-only session reads as one scope here. Still a refusal,
+        // never a panic and never an empty pack.
+        None => anyhow::anyhow!("{context} (the work ran outside its cataloged checkout)"),
+    }
 }
 
 fn project_matches(entry_project: Option<&str>, projects: &[String]) -> bool {
@@ -329,6 +410,22 @@ pub fn render(pack: &ContinuityPack, for_inject: bool) -> String {
             ));
         }
     }
+    if !pack.unplaced_scope.is_empty() {
+        out.push_str(&format!(
+            "- unplaced work: {} frame(s) from {} session(s) NOT in this pack (their turn window ran where no checkout could claim it)\n",
+            pack.unplaced_scope
+                .iter()
+                .map(|session| session.frames)
+                .sum::<usize>(),
+            pack.unplaced_scope.len()
+        ));
+        for session in pack.unplaced_scope.iter().take(NOW_CAP) {
+            out.push_str(&format!(
+                "  - {} · {} · frames={}\n",
+                session.agent, session.session_id, session.frames
+            ));
+        }
+    }
     out.push('\n');
 
     // ── PEERS: per-agent fairness blocks, newest sessions first ──────────
@@ -494,6 +591,114 @@ mod tests {
     use super::*;
     use std::fs;
 
+    use aicx_parser::engine::{RefusalReason, ScopeStatus};
+
+    /// Finding (P1-05): a session mixed only by a proven conflict or by a
+    /// scope `.aicxignore` hid has at most one visible cwd. The refusal was
+    /// rebuilt from cwds alone, so it no longer read as mixed, and the
+    /// `expect` on it panicked the whole command.
+    #[test]
+    fn a_window_mixed_only_by_conflict_or_hidden_scope_refuses_without_panicking() {
+        let session = |conflicts, hidden_scopes| intents::MixedScopeSession {
+            agent: "codex".to_string(),
+            session_id: "s1".to_string(),
+            cwds: vec!["/repo/alpha".to_string()],
+            branches: Vec::new(),
+            conflicts,
+            hidden_scopes,
+            status: ScopeStatus::NoDriftObserved,
+        };
+        for (label, mixed) in [
+            ("conflict-only", session(2, 0)),
+            ("hidden-only", session(0, 1)),
+        ] {
+            let error = mixed_window_refusal(std::slice::from_ref(&mixed), 3);
+            assert!(
+                matches!(
+                    error.downcast_ref::<RefusalReason>(),
+                    Some(RefusalReason::MixedWorkstream { .. })
+                ),
+                "{label}: {error:#}"
+            );
+        }
+
+        // A session listed for running wholly in one foreign checkout has one
+        // visible scope, and an empty list has none: both still refuse — as a
+        // plain error, never a panic.
+        for mixed in [vec![session(0, 0)], Vec::new()] {
+            let error = mixed_window_refusal(&mixed, 3);
+            assert!(error.downcast_ref::<RefusalReason>().is_none());
+            assert!(
+                format!("{error:#}").contains("nothing homogeneous to distill"),
+                "{error:#}"
+            );
+        }
+
+        // Any session that supports the structured refusal gives it, not only
+        // the first one listed.
+        let error = mixed_window_refusal(&[session(0, 0), session(2, 0)], 3);
+        assert!(
+            matches!(
+                error.downcast_ref::<RefusalReason>(),
+                Some(RefusalReason::MixedWorkstream { .. })
+            ),
+            "{error:#}"
+        );
+    }
+
+    /// Finding: the gate refused only when it had withheld something itself.
+    /// A mixed session whose frames the fail-closed intents filters had
+    /// already removed arrived with zero records, and the window returned a
+    /// successful, empty pack.
+    #[test]
+    fn a_window_of_only_mixed_work_refuses_even_when_nothing_was_withheld() {
+        let mixed = intents::MixedScopeSession {
+            agent: "codex".to_string(),
+            session_id: "s1".to_string(),
+            cwds: vec!["/repo/alpha".to_string()],
+            branches: Vec::new(),
+            conflicts: 0,
+            hidden_scopes: 1,
+            status: ScopeStatus::NoDriftObserved,
+        };
+        let mut records: Vec<IntentRecord> = Vec::new();
+        let error = withhold_mixed_sessions(&mut records, std::slice::from_ref(&mixed))
+            .expect_err("a window holding only a mixed session refuses");
+        assert!(
+            matches!(
+                error.downcast_ref::<RefusalReason>(),
+                Some(RefusalReason::MixedWorkstream { .. })
+            ),
+            "{error:#}"
+        );
+
+        // A homogeneous record is kept and the mixed session's is withheld;
+        // a window with no mixed session is not the gate's business.
+        let record = |session_id: &str| IntentRecord {
+            kind: IntentKind::Decision,
+            summary: format!("decided in {session_id}"),
+            context: None,
+            evidence: Vec::new(),
+            project: "Loctree/aicx".to_string(),
+            agent: "codex".to_string(),
+            date: "2026-09-24".to_string(),
+            timestamp: None,
+            session_id: session_id.to_string(),
+            count: None,
+            first_chunk: None,
+            last_chunk: None,
+            source_chunk: String::new(),
+            source: None,
+            honesty: Default::default(),
+        };
+        let mut records = vec![record("s1"), record("s2")];
+        withhold_mixed_sessions(&mut records, std::slice::from_ref(&mixed))
+            .expect("a homogeneous record is left");
+        assert_eq!(records, vec![record("s2")]);
+        let mut records: Vec<IntentRecord> = Vec::new();
+        withhold_mixed_sessions(&mut records, &[]).expect("no mixed session, nothing to refuse");
+    }
+
     #[test]
     fn continuity_pack_renders_all_sections_deterministically() {
         let root = std::env::temp_dir().join(format!(
@@ -526,6 +731,7 @@ mod tests {
             title: None,
             machine: Some("test".to_string()),
             logical_session_id: None,
+            session_kind: None,
         };
         fs::write(
             &catalog_path,
@@ -607,6 +813,7 @@ mod tests {
             },
             mixed_scope: Vec::new(),
             distilled_mixed: false,
+            unplaced_scope: Vec::new(),
         };
         let rendered = render(&pack, false);
         assert!(rendered.contains("open: claude · hot-open"));
@@ -631,10 +838,69 @@ mod tests {
             },
             mixed_scope: Vec::new(),
             distilled_mixed: false,
+            unplaced_scope: Vec::new(),
         };
         let rendered = render(&pack, false);
         assert!(rendered.contains("newest_session_updated: 2026-08-13T01:48:00Z"));
         assert!(rendered.contains("warning: chunk lag (pending=631"));
         assert!(rendered.contains("aicx catalog rebuild --with-chunks"));
+    }
+
+    #[test]
+    fn continuity_now_lists_what_it_withheld_as_unplaced() {
+        let unplaced = |session_id: &str, frames: usize| crate::intents::UnplacedScopeSession {
+            agent: "codex".into(),
+            session_id: session_id.into(),
+            frames,
+        };
+        let pack = ContinuityPack {
+            project_label: "vetcoders/vibecrafted".into(),
+            hours: 24,
+            live_sessions: 0,
+            records: Vec::new(),
+            sources: Vec::new(),
+            index_health: IndexHealthLine {
+                newest_session_updated_at: None,
+                committed_at: None,
+                pending: 0,
+                sessions_newer_than_chunks: 0,
+                readiness: "ready".into(),
+                mode: "live",
+            },
+            mixed_scope: Vec::new(),
+            distilled_mixed: false,
+            unplaced_scope: vec![unplaced("s-one", 3), unplaced("s-two", 1)],
+        };
+        let rendered = render(&pack, false);
+        assert!(
+            rendered.contains("- unplaced work: 4 frame(s) from 2 session(s) NOT in this pack"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("  - codex · s-one · frames=3"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("  - codex · s-two · frames=1"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn a_window_of_only_unplaced_frames_refuses() {
+        let unplaced = [crate::intents::UnplacedScopeSession {
+            agent: "codex".into(),
+            session_id: "s-one".into(),
+            frames: 2,
+        }];
+        let error = refuse_unplaced_only_window(&[], &unplaced)
+            .expect_err("nothing placed to distill refuses");
+        assert!(
+            error
+                .to_string()
+                .contains("nothing placed to distill; 2 frame(s) from 1 session(s)"),
+            "{error}"
+        );
+        refuse_unplaced_only_window(&[], &[]).expect("an empty window with nothing withheld");
     }
 }

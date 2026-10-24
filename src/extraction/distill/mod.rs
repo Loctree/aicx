@@ -337,6 +337,9 @@ mod tests {
             ended_at: aicx_parser::engine::Known::unknown(),
             turn_range: aicx_parser::engine::TurnRange { start: 0, end: 0 },
             scope_status: ScopeStatus::Unknown,
+            scope_conflict: false,
+            scope_root: None,
+            scope_workdirs: Vec::new(),
         };
         let lane = GenericLane::new(AgentKind::Kimi);
         let model = minimal_model(AgentKind::Kimi);

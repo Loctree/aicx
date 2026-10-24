@@ -60,6 +60,11 @@ pub struct CatalogEntry {
     pub machine: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub logical_session_id: Option<String>,
+    /// Structural subagent provenance (e.g. `subagent:guardian`); travels from
+    /// session discovery so harness-wrapper prompts are never mistaken for
+    /// operator utterances downstream.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_kind: Option<String>,
 }
 
 /// Size + mtime-ns for a path. Returns `None` when the file is unreadable.
@@ -1163,6 +1168,11 @@ fn entry_from_source(agent: AgentKind, source: &CatalogSource) -> CatalogEntry {
         } else {
             source.logical_session_id.clone()
         },
+        session_kind: if agent == AgentKind::Codex {
+            crate::sessions::codex_session_kind_from_source(&source.path)
+        } else {
+            None
+        },
     }
 }
 
@@ -1227,6 +1237,7 @@ fn merge_session_info(
         title: info.title.clone(),
         machine: hostname(),
         logical_session_id: None,
+        session_kind: info.session_kind.clone(),
     });
     if let Some(repo_path) = info.repo_path.as_deref() {
         entry.cwd = Some(repo_path.to_string());
@@ -1240,6 +1251,9 @@ fn merge_session_info(
     }
     if entry.title.is_none() {
         entry.title = info.title.clone();
+    }
+    if entry.session_kind.is_none() {
+        entry.session_kind = info.session_kind.clone();
     }
     if entry.date.is_none() {
         entry.date = date;
@@ -1304,6 +1318,7 @@ fn enrich_runtime_runs(by_id: &mut BTreeMap<(String, String), CatalogEntry>, use
             title: Some("runtime_run transcript".to_string()),
             machine: hostname(),
             logical_session_id: None,
+            session_kind: None,
         });
         if let Some((len, mtime)) = live_source_fingerprint(&transcript) {
             entry.source_len = Some(len);
@@ -1805,6 +1820,7 @@ mod tests {
             title: None,
             machine: None,
             logical_session_id: None,
+            session_kind: None,
         };
         let mut case_variant = entry.clone();
         case_variant.session_id = "s2".into();
@@ -1842,6 +1858,7 @@ mod tests {
                 title: None,
                 machine: None,
                 logical_session_id: None,
+                session_kind: None,
             })
             .map(|entry| serde_json::to_string(&entry).unwrap())
             .collect::<Vec<_>>()
@@ -2003,6 +2020,7 @@ mod tests {
             title: None,
             machine: Some("laptop".into()),
             logical_session_id: None,
+            session_kind: None,
         };
         fs::write(
             sessions_path_for(&home),
@@ -2043,6 +2061,7 @@ mod tests {
             title: None,
             machine: Some("laptop".into()),
             logical_session_id: None,
+            session_kind: None,
         };
         fs::write(
             sessions_path_for(&home),
@@ -2123,6 +2142,7 @@ mod tests {
             title: None,
             machine: None,
             logical_session_id: None,
+            session_kind: None,
         };
         fs::write(
             sessions_path_for(&home),

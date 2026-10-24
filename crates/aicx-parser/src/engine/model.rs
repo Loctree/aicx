@@ -16,7 +16,15 @@ use super::frames::FrameClass;
 use super::source::AgentKind;
 use serde::{Deserialize, Serialize};
 
-pub const SESSION_MODEL_SCHEMA: &str = "aicx.parser.session_model.v1";
+/// Version of the `SessionModel` contract.
+///
+/// `v2` (W2-R1 follow-up) widens [`ScopeStatus`] with `unattributed` and adds
+/// [`Segment::scope_root`]. Both are additive, but a decoder written against
+/// the `v1` grammar treats `ScopeStatus` as closed and rejects the new value
+/// outright, so the widening is announced rather than slipped in. The emitted
+/// grammar itself is [`ScopeStatus::ALL`], which
+/// `docs/OUTPUT_PROJECTION_CONTRACT.md` is held to by a contract test.
+pub const SESSION_MODEL_SCHEMA: &str = "aicx.parser.session_model.v2";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -74,15 +82,47 @@ pub struct Segment {
     /// drift inside the segment); they never guess from content.
     #[serde(default)]
     pub scope_status: ScopeStatus,
+    /// Explicit tool-call workdirs inside this span proved two repository
+    /// identities. This is NOT the same fact as `scope_status`: a segment is
+    /// a `MixedCandidate` for ordinary branch drift inside one unchanged
+    /// checkout, which is fully attributable. Only a proven workdir conflict
+    /// leaves the span with no repository to belong to, so downstream filters
+    /// read this flag instead of inferring it from the generic status.
+    #[serde(default)]
+    pub scope_conflict: bool,
+    /// Repository identity this span's explicit tool-call workdirs resolved
+    /// to ON THIS HOST, when they agreed on one.
+    ///
+    /// Deliberately separate from [`Self::cwd`], which stays the fact the
+    /// rollout RECORDED. Resolving an identity reads the local filesystem —
+    /// which checkouts exist, how symlinks resolve, what `.gitmodules`
+    /// declares — so folding it into `cwd` made the canonical fingerprint of
+    /// identical source bytes differ from machine to machine. This field is
+    /// excluded from the canonical projection for that reason; consumers that
+    /// want the resolved bucket read it explicitly and fall back to `cwd`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope_root: Option<String>,
+    /// Explicit tool-call workdirs this span's turn windows RECORDED, joined
+    /// onto the window's baseline and lexically normalized — no filesystem
+    /// reads. Empty when no window in the span named a workdir.
+    ///
+    /// This is the evidence the scope verdict was drawn from, kept so a
+    /// privacy filter can judge every checkout the span touched: a conflict
+    /// window has no single scope to test against `.aicxignore`, and a
+    /// window absorbed into its baseline still ran inside the paths it names.
+    /// Like `scope_root` it stays out of the canonical projection.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scope_workdirs: Vec<String>,
 }
 
 /// Structural scope verdict for a [`Segment`] or a whole conversation.
 ///
 /// `MixedCandidate` is a candidate, not a verdict: the structure (several
 /// working directories or branches inside one span) says the history may
-/// braid more than one workstream. Consumers that distill *one* history
-/// (`continuity`) must not do so silently on a candidate; they refuse with
-/// `RefusalReason::MixedWorkstream` unless told to distill anyway.
+/// braid more than one workstream. It also covers a branch switch inside one
+/// checkout, so consumers that distill *one* history (`continuity`) refuse
+/// with `RefusalReason::MixedWorkstream` on proven evidence of a second
+/// scope (a conflict, a hidden scope, another cwd), not on this value alone.
 /// Topic-level mixing inside one cwd/branch is not detectable here. Absence of
 /// drift evidence is not evidence of homogeneity, so the non-mixed state only
 /// reports that no drift was observed.
@@ -94,24 +134,61 @@ pub enum ScopeStatus {
     NoDriftObserved,
     /// Several cwds and/or branches inside the span.
     MixedCandidate,
+    /// Explicit scope evidence exists but does not resolve (historical or
+    /// foreign-machine workdir that is not the baseline): the span must not
+    /// inherit any project bucket downstream.
+    Unattributed,
     /// No cwd/branch evidence at all: scope cannot be judged.
     #[default]
     Unknown,
 }
 
 impl ScopeStatus {
+    /// Every variant, in the order the contract documents them.
+    ///
+    /// The one place the emitted grammar is enumerated, so that the
+    /// contract document can be held to the code rather than maintained
+    /// beside it: a value listed here and missing from
+    /// `docs/OUTPUT_PROJECTION_CONTRACT.md` fails the contract test in
+    /// `crates/aicx-parser/tests/normative_contract.rs`. The `homogeneous`
+    /// → `no_drift_observed` rename reached consumers with that document
+    /// still naming the old value, and `unattributed` repeated it; this is
+    /// what stops a third round.
+    ///
+    /// Adding a variant means adding it here too — the exhaustive matches
+    /// below name every variant, but nothing forces this array to grow, so
+    /// it is a convention the test enforces one step later, not a compiler
+    /// guarantee.
+    pub const ALL: [Self; 4] = [
+        Self::NoDriftObserved,
+        Self::MixedCandidate,
+        Self::Unattributed,
+        Self::Unknown,
+    ];
+
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::NoDriftObserved => "no_drift_observed",
             Self::MixedCandidate => "mixed_candidate",
+            Self::Unattributed => "unattributed",
             Self::Unknown => "unknown",
         }
     }
 
-    /// Combine two spans: any mixed → mixed; otherwise unknown dominates
-    /// no-drift evidence only when nothing is known at all.
+    /// Combine two spans: any unattributed → unattributed; otherwise any
+    /// mixed → mixed; unknown survives only when nothing is known at all.
+    ///
+    /// `Unattributed` outranks `MixedCandidate` because the two are different
+    /// facts and only one of them forbids attribution: mixed also covers an
+    /// ordinary branch switch inside one checkout, which whole-session
+    /// attribution survives, while unattributed means evidence this host
+    /// cannot place. Letting branch drift absorb it would hand a span with
+    /// unplaceable evidence the one status that no longer refuses a bucket.
+    /// Mixing is not lost by this: consumers that must refuse a braided
+    /// history decide on the proven conflicts and cwds, not on this enum.
     pub const fn join(self, other: Self) -> Self {
         match (self, other) {
+            (Self::Unattributed, _) | (_, Self::Unattributed) => Self::Unattributed,
             (Self::MixedCandidate, _) | (_, Self::MixedCandidate) => Self::MixedCandidate,
             (Self::NoDriftObserved, _) | (_, Self::NoDriftObserved) => Self::NoDriftObserved,
             (Self::Unknown, Self::Unknown) => Self::Unknown,
@@ -618,6 +695,11 @@ impl SessionModel {
     /// Conversation-level scope: the join of every segment's verdict plus
     /// the cross-segment evidence (two homogeneous segments in different
     /// cwds are one mixed candidate).
+    ///
+    /// A segment's workdirs count as cwd evidence through its `scope_root`,
+    /// next to the recorded cwd: a turn window re-scoped to another checkout
+    /// keeps the session's recorded cwd, so reading `cwd` alone reported a
+    /// session that worked in two repositories as one with no drift.
     pub fn scope_status(&self) -> ScopeStatus {
         let per_segment = self
             .segments
@@ -625,13 +707,13 @@ impl SessionModel {
             .fold(ScopeStatus::Unknown, |acc, segment| {
                 acc.join(segment.scope_status)
             });
-        let cwds = self
-            .segments
-            .iter()
-            .filter_map(|segment| match &segment.cwd {
+        let cwds = self.segments.iter().flat_map(|segment| {
+            let recorded = match &segment.cwd {
                 Known::Value(cwd) => Some(cwd.as_str()),
                 Known::Unknown(_) => None,
-            });
+            };
+            recorded.into_iter().chain(segment.scope_root.as_deref())
+        });
         let branches = self
             .segments
             .iter()

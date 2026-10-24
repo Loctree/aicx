@@ -138,6 +138,7 @@ fn seed_session(aicx_home: &Path) -> PathBuf {
         title: Some("vc-trust replay".to_string()),
         machine: Some("scratch".to_string()),
         logical_session_id: None,
+        session_kind: None,
     };
     write_file(
         &aicx::catalog::sessions_path_for(aicx_home),

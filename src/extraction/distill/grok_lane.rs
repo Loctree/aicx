@@ -732,6 +732,9 @@ mod tests {
             ended_at: Known::value("2026-08-27T19:06:15Z".to_owned()),
             turn_range: TurnRange { start: 0, end: 6 },
             scope_status: ScopeStatus::NoDriftObserved,
+            scope_conflict: false,
+            scope_root: None,
+            scope_workdirs: Vec::new(),
         }];
         model
     }
@@ -787,6 +790,9 @@ mod tests {
                 ended_at: Known::value(TS.to_owned()),
                 turn_range: TurnRange { start: 0, end: 1 },
                 scope_status: ScopeStatus::NoDriftObserved,
+                scope_conflict: false,
+                scope_root: None,
+                scope_workdirs: Vec::new(),
             },
             Segment {
                 segment_id: 1,
@@ -796,6 +802,9 @@ mod tests {
                 ended_at: Known::value(TS.to_owned()),
                 turn_range: TurnRange { start: 2, end: 3 },
                 scope_status: ScopeStatus::MixedCandidate,
+                scope_conflict: false,
+                scope_root: None,
+                scope_workdirs: Vec::new(),
             },
         ];
         model

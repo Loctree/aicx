@@ -123,6 +123,10 @@ pub enum CollapseStubKind {
     DedupRef,
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 /// Unified timeline entry from any AI agent source.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TimelineEntry {
@@ -146,6 +150,30 @@ pub struct TimelineEntry {
     pub branch: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    /// The turn window's explicit workdir evidence pointed at more than one
+    /// repo identity — mixed/unattributed scope, never assigned to a project
+    /// bucket by inheritance.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub scope_conflict: bool,
+    /// Explicit workdir evidence exists but does not resolve and is not the
+    /// session baseline — durable "unknown scope" state: the frame must never
+    /// inherit a project bucket.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub scope_unattributed: bool,
+    /// Explicit tool-call workdirs the entry's turn window recorded (see
+    /// `Segment::scope_workdirs`), plus the window's recorded cwd whenever
+    /// the scope verdict took it out of `cwd` (a re-scope serves the
+    /// resolved root, a conflict serves nothing). Read by the `.aicxignore`
+    /// filter before anything is written, so a checkout the operator denied
+    /// is judged even when it is not, or is no longer, the entry's `cwd`.
+    /// Never serialized: the paths are filter input, not output, and a
+    /// stored entry has already been filtered.
+    #[serde(skip)]
+    pub scope_workdirs: Vec<String>,
+    /// Structural subagent provenance of the session (e.g. `subagent:guardian`)
+    /// when known from the catalog; harness-wrapper classification keys on it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_kind: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timestamp_source: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

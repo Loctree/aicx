@@ -747,6 +747,8 @@ impl<'a> Assembly<'a> {
         if !model.turns.is_empty() {
             model.segments.push(Segment {
                 segment_id: 0,
+                scope_root: None,
+                scope_workdirs: Vec::new(),
                 scope_status: crate::engine::ScopeStatus::from_evidence(
                     match &self.cwd {
                         Known::Value(cwd) => Some(cwd.as_str()),
@@ -757,6 +759,8 @@ impl<'a> Assembly<'a> {
                         Known::Unknown(_) => None,
                     },
                 ),
+                // Only the Codex adapter observes explicit tool-call workdirs.
+                scope_conflict: false,
                 cwd: self.cwd,
                 branch: self.branch,
                 started_at: self.segment_started_at,
