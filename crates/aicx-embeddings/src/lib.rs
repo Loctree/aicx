@@ -430,17 +430,53 @@ impl EmbeddingEngine {
     }
 
     pub fn embed(&mut self, text: &str) -> Result<Vec<f32>> {
-        self.inner.embed(text)
+        self.embed_batch(&[text])?
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("no embedding generated"))
     }
 
     pub fn embed_batch<T: AsRef<str>>(&mut self, texts: &[T]) -> Result<Vec<Vec<f32>>> {
         let owned: Vec<String> = texts.iter().map(|text| text.as_ref().to_string()).collect();
-        self.inner.embed_batch(&owned)
+        let vectors = self.inner.embed_batch(&owned)?;
+        validate_embedding_batch(&vectors, owned.len(), self.dimension())?;
+        Ok(vectors)
     }
 
     pub fn similarity(a: &[f32], b: &[f32]) -> f32 {
         similarity(a, b)
     }
+}
+
+/// Validate provider output before it can become an index generation or query.
+/// Counting rows alone accepts malformed, non-finite and zero-norm vectors.
+pub fn validate_embedding_batch(
+    vectors: &[Vec<f32>],
+    expected_rows: usize,
+    dimension: usize,
+) -> Result<()> {
+    if dimension == 0 || vectors.len() != expected_rows {
+        return Err(anyhow!(
+            "invalid embedding batch: expected {expected_rows} rows of nonzero dimension {dimension}, got {} rows",
+            vectors.len()
+        ));
+    }
+    for (row, vector) in vectors.iter().enumerate() {
+        if vector.len() != dimension {
+            return Err(anyhow!(
+                "embedding row {row}: expected dimension {dimension}, got {}",
+                vector.len()
+            ));
+        }
+        if vector.iter().any(|value| !value.is_finite())
+            || !vector.iter().any(|value| *value != 0.0)
+        {
+            return Err(anyhow!(
+                "embedding row {row} must be finite and have nonzero norm"
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub fn similarity(a: &[f32], b: &[f32]) -> f32 {
@@ -547,6 +583,21 @@ impl NativeEmbedderConfigSection {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn malformed_provider_output_never_reaches_generation_or_query() {
+        assert!(validate_embedding_batch(&[vec![1.0, 0.0]], 1, 2).is_ok());
+        for (vectors, rows, dim) in [
+            (vec![], 1, 2),
+            (vec![vec![1.0]], 1, 2),
+            (vec![vec![]], 1, 0),
+            (vec![vec![f32::NAN, 1.0]], 1, 2),
+            (vec![vec![f32::INFINITY, 1.0]], 1, 2),
+            (vec![vec![0.0, 0.0]], 1, 2),
+        ] {
+            assert!(validate_embedding_batch(&vectors, rows, dim).is_err());
+        }
+    }
 
     #[test]
     fn similarity_identical_vectors() {

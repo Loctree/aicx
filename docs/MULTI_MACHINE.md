@@ -19,7 +19,7 @@ agent source roots  →  catalog (identity)  →  extracts?  →  index CURRENT 
 | Sources | disk / rsync | file missing or path wrong on this host |
 | Catalog | `aicx catalog status` / `rebuild` | unadmitted sessions, fingerprint drift, missing_source |
 | Index | `aicx index status` / `index` | pending chunks, stale_index vs catalog snapshot |
-| Serve | `aicx serve --transport http` | Bearer auth + Host allowlist |
+| Serve | `aicx serve --transport http` | One listener: dashboard at `/`, MCP at `/mcp`. Bearer auth off loopback; loopback may be open |
 
 `catalog status` and `index status` are **orthogonal**. Catalog fresh with
 `index readiness=stale_index` means: identity is current, search lag remains.
@@ -72,12 +72,17 @@ Exclude from any file-sync of `~/.aicx` (MEGA `.megaignore` syntax):
 -dN:indexed
 -dN:catalog
 -dN:extracts
+-dN:reader-conversations-v1
 -dN:tmp
 -fN:auth-token
 ```
 
 Keep `store/` and `context-corpus/` synced (durable data). Classify
 `state.json` before deciding.
+
+Validated reader-conversation caches are also machine-local. They bind to
+allowlisted source identities and the canonical AICX home, and must not be
+transported as an authority for another host's sources.
 
 Defense in depth since 2026-08-10: manifests carry `writer_version` /
 `build_id`, and both publish and search reject a provable lexical schema

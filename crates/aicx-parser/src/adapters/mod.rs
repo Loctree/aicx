@@ -1,20 +1,26 @@
 //! Frozen adapter boundary and exhaustive built-in adapter registry.
 
+pub mod agy;
 pub mod claude;
 pub mod codex;
+pub mod copilot;
 pub mod cursor;
 pub mod gemini;
 pub mod grok;
 pub mod junie;
 pub mod kimi;
+pub mod omp;
 
+pub use agy::AgyAdapter;
 pub use claude::ClaudeAdapter;
 pub use codex::CodexAdapter;
+pub use copilot::CopilotAdapter;
 pub use cursor::CursorAdapter;
 pub use gemini::GeminiAdapter;
 pub use grok::GrokAdapter;
 pub use junie::JunieAdapter;
 pub use kimi::KimiAdapter;
+pub use omp::OmpAdapter;
 
 use crate::engine::{
     AgentKind, RawUnitRef, SkippedReason, SourceHandle, SourceRead, UnvalidatedParse,
@@ -88,6 +94,9 @@ static GROK: GrokAdapter = GrokAdapter;
 static JUNIE: JunieAdapter = JunieAdapter;
 static KIMI: KimiAdapter = KimiAdapter;
 static CURSOR: CursorAdapter = CursorAdapter;
+static COPILOT: CopilotAdapter = CopilotAdapter;
+static OMP: OmpAdapter = OmpAdapter;
+static AGY: AgyAdapter = AgyAdapter;
 
 /// Return the one registered parser for an exhaustive [`AgentKind`].
 pub const fn registered_adapter(agent: AgentKind) -> &'static dyn AgentAdapter {
@@ -99,6 +108,9 @@ pub const fn registered_adapter(agent: AgentKind) -> &'static dyn AgentAdapter {
         AgentKind::Junie => &JUNIE,
         AgentKind::Kimi => &KIMI,
         AgentKind::Cursor => &CURSOR,
+        AgentKind::Copilot => &COPILOT,
+        AgentKind::Omp => &OMP,
+        AgentKind::Agy => &AGY,
     }
 }
 
@@ -116,6 +128,9 @@ mod registry_tests {
             AgentKind::Junie,
             AgentKind::Kimi,
             AgentKind::Cursor,
+            AgentKind::Copilot,
+            AgentKind::Omp,
+            AgentKind::Agy,
         ] {
             let adapter = registered_adapter(agent);
             assert_eq!(adapter.agent(), agent);

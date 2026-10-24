@@ -1,0 +1,9 @@
+# build.rs links every binary with an 8 MiB main-thread stack on Windows MSVC,
+# because the clap tree overflows the 1 MiB default. Test threads do not get
+# that stack: they start with RUST_MIN_STACK (2 MiB). On windows-latest the
+# debug `Cli::try_parse_from` in src/main/tests.rs overflowed it
+# (clarify_max_enforces_documented_one_to_five_range, STATUS_STACK_OVERFLOW,
+# CI run 39559179910). Tests run with the stack the binary ships with.
+# An explicit RUST_MIN_STACK in the environment still wins.
+[env]
+RUST_MIN_STACK = "8388608"

@@ -532,14 +532,66 @@ fn humanize_stem(stem: &str) -> String {
 }
 
 fn agent_from_title(title: &str) -> Option<String> {
-    ["codex", "claude", "gemini"]
-        .iter()
-        .find(|candidate| contains_case_insensitive(title, candidate))
-        .map(|candidate| (*candidate).to_string())
+    if contains_case_insensitive(title, "gemini-antigravity") {
+        return Some("gemini".to_string());
+    }
+    [
+        "antigravity-cli",
+        "antigravity",
+        "agy",
+        "copilot",
+        "omp",
+        "oh-my-pi",
+        "codex",
+        "claude",
+        "gemini",
+        "cursor",
+        "grok",
+        "junie",
+        "kimi",
+    ]
+    .iter()
+    .find(|candidate| {
+        if matches!(**candidate, "omp" | "agy") {
+            title
+                .split(|ch: char| !ch.is_alphanumeric())
+                .any(|word| word.eq_ignore_ascii_case(candidate))
+        } else {
+            contains_case_insensitive(title, candidate)
+        }
+    })
+    .map(|candidate| (*candidate).to_string())
+}
+
+#[cfg(test)]
+mod agent_title_tests {
+    use super::agent_from_title;
+
+    #[test]
+    fn short_agent_names_match_tokens_not_component_substrings() {
+        assert_eq!(agent_from_title("Component compilation report"), None);
+        assert_eq!(
+            agent_from_title("OMP: component report").as_deref(),
+            Some("omp")
+        );
+        assert_eq!(agent_from_title("report (agy)").as_deref(), Some("agy"));
+    }
+
+    #[test]
+    fn legacy_gemini_antigravity_title_keeps_gemini_identity() {
+        assert_eq!(
+            agent_from_title("Gemini-Antigravity session report").as_deref(),
+            Some("gemini")
+        );
+        assert_eq!(
+            agent_from_title("antigravity-cli report").as_deref(),
+            Some("antigravity-cli")
+        );
+    }
 }
 
 fn is_known_agent(segment: &str) -> bool {
-    matches!(segment, "codex" | "claude" | "gemini")
+    crate::session_catalog::AgentKind::parse(segment).is_some()
 }
 
 fn read_tail_string(scan_root: &Path, path: &Path, max_bytes: u64) -> Result<String> {
@@ -687,4 +739,22 @@ fn parse_timestamp(raw: &str) -> Option<i64> {
     DateTime::parse_from_rfc3339(raw)
         .ok()
         .map(|dt| dt.with_timezone(&Utc).timestamp())
+}
+
+#[cfg(test)]
+mod agent_tests {
+    use super::*;
+
+    #[test]
+    fn copilot_report_runtime_takes_precedence_over_model_name() {
+        assert_eq!(
+            derive_agent("Copilot using Claude", &[], None, None),
+            "copilot"
+        );
+        assert_eq!(
+            derive_agent("Implementation", &["copilot".into()], None, None),
+            "copilot"
+        );
+        assert!(is_known_agent("github-copilot-cli"));
+    }
 }

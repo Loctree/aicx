@@ -15,7 +15,7 @@ In multi-agent environments (fleet of 10–50 agents: Codex, Claude, Gemini, Ant
 | **Number of processes** | 1 process per agent (50 agents = 50 processes in `ps aux`) | **1 central daemon per host** |
 | **RAM usage** | Memory duplication for each process (50 × 50MB+) | **Shared RAM (~30–60MB per process)** |
 | **Cache management** | Disk contention over `.cache` files | **Single in-memory `Arc<Snapshot>` in RAM** |
-| **Query speed** | Binary startup + cold read per call | **< 1–5 ms (instant RAM graph lookup)** |
+| **Query cost** | Binary startup plus retrieval work per call | No per-call process startup; cost depends on the tool, corpus, and validation |
 | **Remote access** | Only locally on the working machine | **Network / Tailscale access (`host-a`, `host-b`)** |
 | **Scalability** | Overwhelms CPU and file descriptor limits | **Tokio + Axum easily handles thousands of concurrent requests** |
 
@@ -38,7 +38,13 @@ client-specific environment/header mechanism.
 
 ### 2.1. Live Refresh Behavior
 * **Is `aicx serve` live?** **Yes.** `aicx serve` does not freeze a stale in-memory copy of the index. Every tool invocation (`aicx_search`, `aicx_steer`, `aicx_intents`) reads the live Tantivy and vector store state from disk (`~/.aicx/`).
-* **Ingestion cadence:** the long-lived HTTP server is a **reader**, not an index writer. It owns no periodic refresh loop by default; freshness belongs to a separate maintenance owner (`tools/install-reindex-schedule.sh`, i.e. `aicx catalog rebuild && aicx index`). The legacy embedded writer still exists behind an explicit, experimental opt-in (`--experimental-auto-refresh`, cadence tuned with `--refresh-interval-seconds`); `--refresh-interval-seconds` on its own never grants writer ownership. `--no-auto-refresh` is kept only as a deprecated compatibility flag — the default is already off. The installer still passes it deliberately and defensively, so the LaunchAgent stays reader-only even if it ever runs against an older binary whose default was writer-on; new callers should not use it.
+* **Ingestion cadence:** the long-lived HTTP server is a **reader**, not an index writer. It owns no periodic refresh loop by default; freshness belongs to a separate maintenance owner (`tools/install-reindex-schedule.sh`, i.e. `aicx catalog refresh && aicx index`). The legacy embedded writer still exists behind an explicit, experimental opt-in (`--experimental-auto-refresh`, cadence tuned with `--refresh-interval-seconds`); `--refresh-interval-seconds` on its own never grants writer ownership. `--no-auto-refresh` is kept only as a deprecated compatibility flag — the default is already off. The installer still passes it deliberately and defensively, so the LaunchAgent stays reader-only even if it ever runs against an older binary whose default was writer-on; new callers should not use it.
+
+The hybrid listener binds without scanning provider roots or building dashboard
+data. `/api/status` and `/api/context` initially report `scan_status: "not_scanned"`,
+`build_count: 0`, and null `generated_at`/`stats`. An authorized browse or
+regenerate request loads the optional dashboard snapshot. This is independent
+of `/health`, MCP initialization, and index readiness.
 
 ### 2.2. Installation & Makefile Targets
 * **Standard install (with wizard):**

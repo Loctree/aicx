@@ -2,7 +2,8 @@
 
 **Operator front door for agent session logs.**
 
-`aicx` catalogs live Claude, Codex, Grok, Gemini, Junie, Vibecrafted, and
+`aicx` catalogs live Claude, Codex, Cursor, Grok, Gemini, Junie, Kimi, GitHub
+Copilot CLI, oh-my-pi / pi, Antigravity CLI, Vibecrafted, and
 operator-owned sources; renders readable whole-session extracts; and publishes
 a lexical-first search index. Sources remain content truth. The compact catalog
 owns session identity and topical project attribution.
@@ -59,12 +60,58 @@ First-class roots include:
 - `~/.grok/sessions/*/chat_history.jsonl`
 - `~/.gemini/tmp/*/chats/session-*.json`
 - `~/.kimi-code/sessions/**/wire.jsonl`
+- `~/.copilot/session-state/<session-id>/events.jsonl` (optional `workspace.yaml`)
+- `~/.omp/agent/sessions/<encoded-cwd>/<timestamp>_<uuid>.jsonl` and the same layout under `~/.pi/agent/sessions`
+- `~/.gemini/antigravity-cli/conversations/<cascade-uuid>.db` and the same schema under `~/.gemini/antigravity/conversations`
 - Junie sources
 - Vibecrafted `control_plane/runtime_runs/*/transcript.log`
 - explicit operator markdown and Codescribe imports
 
 Source opens go through a canonical allowlist resolver. Traversal, non-files,
 and symlink escapes are rejected.
+
+GitHub Copilot CLI uses the canonical provider name `copilot`:
+
+```bash
+aicx extract copilot --session <session-id> --conversation
+aicx extract all --provider copilot
+aicx index
+aicx search 'past decision' --agent copilot
+aicx intents --agent copilot --emit json
+```
+
+See [Copilot sessions](docs/COPILOT_SESSIONS.md) for event coverage, source
+identity, direct-file extraction, and MCP usage.
+
+oh-my-pi and upstream pi use the canonical provider name `omp` (`pi` and
+`oh-my-pi` are aliases):
+
+```bash
+aicx extract omp --session <session-id> --conversation
+aicx extract all --provider omp
+aicx search 'past decision' --agent omp
+aicx search 'past decision' --agent pi
+aicx intents --agent omp --emit json
+```
+
+See [oh-my-pi sessions](docs/OMP_SESSIONS.md) for the active branch, human
+speech versus harness injection, and both session stores.
+
+Antigravity CLI uses the canonical provider name `agy` (`antigravity` and
+`antigravity-cli` are aliases). Legacy `.pb` exports and `gemini-antigravity`
+stay on Gemini:
+
+```bash
+aicx sessions list --agent agy
+aicx extract agy --session <cascade-id> --conversation
+aicx extract all --provider agy
+aicx search 'past decision' --agent agy
+aicx search 'past decision' --agent antigravity
+aicx intents --agent agy --emit json
+```
+
+See [Antigravity CLI sessions](docs/AGY_SESSIONS.md) for the SQLite trajectory
+schema, human speech versus worker contracts, and both conversation stores.
 
 ## Intents and verification
 
@@ -138,6 +185,9 @@ accepted.
 - [AICX home layout](docs/AICX_HOME_LAYOUT.md)
 - [Context corpus](docs/CONTEXT_CORPUS.md)
 - [Source protection](docs/SOURCE_PROTECTION.md)
+- [GitHub Copilot CLI sessions](docs/COPILOT_SESSIONS.md)
+- [oh-my-pi and pi sessions](docs/OMP_SESSIONS.md)
+- [Antigravity CLI sessions](docs/AGY_SESSIONS.md)
 - [Releases](docs/RELEASES.md)
 
 Built so that months later the operator can still find the session, open the

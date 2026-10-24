@@ -5,7 +5,7 @@ mod uuid_shape;
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use session_catalog::{AgentKind, CatalogError, MAX_HEADER_BYTES, MatchKind, SessionCatalog};
 
@@ -446,6 +446,180 @@ fn cursor_transcript_identity_lives_on_filename_under_agent_transcripts() {
 }
 
 #[test]
+fn cursor_exact_id_across_projects_keeps_newest_copy_and_distinct_prefix_stays_ambiguous() {
+    let root = TestRoot::new("cursor-project-copies");
+    let transcript = r#"{"role":"user","message":{"content":[{"type":"text","text":"hej"}]}}
+{"role":"assistant","message":{"content":[{"type":"text","text":"ack"}]}}
+{"type":"turn_ended","status":"success"}
+"#;
+    // Newer copy sorts after the stale one, so a path-order pick fails this test.
+    let older = root.write(
+        format!("aaa-stale-project/agent-transcripts/{UUID_A}/{UUID_A}.jsonl"),
+        transcript,
+    );
+    let newer = root.write(
+        format!("zzz-live-project/agent-transcripts/{UUID_A}/{UUID_A}.jsonl"),
+        transcript,
+    );
+    set_mtime(&older, 1_700_000_000);
+    set_mtime(&newer, 1_800_000_000);
+    root.write(
+        format!("mmm-other-project/agent-transcripts/{UUID_B}/{UUID_B}.jsonl"),
+        transcript,
+    );
+
+    let catalog = SessionCatalog::new(AgentKind::Cursor, root.path()).unwrap();
+    let lookup = catalog.resolve_with_stats(UUID_A);
+    let resolved = lookup
+        .result
+        .expect("exact full id across cursor project copies must not be Ambiguous");
+    assert_eq!(resolved.matched_by, MatchKind::ExactSourceId);
+    assert_eq!(resolved.source.source_id, UUID_A);
+    assert!(
+        resolved.source.path.ends_with(format!(
+            "zzz-live-project/agent-transcripts/{UUID_A}/{UUID_A}.jsonl"
+        )),
+        "expected newest project copy, got {}",
+        resolved.source.path.display()
+    );
+    let notice = resolved
+        .substitution_notice
+        .expect("project-copy choice must be named");
+    assert!(
+        notice.contains("most complete of 2 cursor project copies"),
+        "notice must name how many project copies existed"
+    );
+    let kept = notice.split("→ ").nth(1).map(str::trim).map(Path::new);
+    assert!(
+        kept.is_some_and(|path| notice_names_kept_copy(path, "zzz-live-project", UUID_A)),
+        "notice must name the kept project copy"
+    );
+    assert_eq!(
+        lookup.stats.files_opened, 2,
+        "both copy headers are compared"
+    );
+
+    let ambiguous = catalog.resolve("019f0000").unwrap_err();
+    let CatalogError::Ambiguous { candidates, .. } = ambiguous else {
+        panic!("shared prefix of two different session ids must stay Ambiguous, got {ambiguous:?}");
+    };
+    let mut ids = candidates
+        .iter()
+        .map(|candidate| candidate.source_id.as_str())
+        .collect::<Vec<_>>();
+    ids.sort();
+    ids.dedup();
+    assert_eq!(ids, vec![UUID_A, UUID_B]);
+}
+
+#[test]
+fn cursor_exact_id_prefers_complete_older_transcript_over_newer_partial_copy() {
+    let root = TestRoot::new("cursor-completeness");
+    let turn =
+        "{\"role\":\"user\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"ask\"}]}}\n";
+    let completed = format!(
+        "{}{{\"role\":\"assistant\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"complete-copy-final-answer\"}}]}}}}\n",
+        turn.repeat(12)
+    );
+    let complete = root.write(
+        format!(".cursor/projects/older-project/agent-transcripts/{UUID_A}/{UUID_A}.jsonl"),
+        &completed,
+    );
+    let partial = root.write(
+        format!(".cursor/projects/newer-project/agent-transcripts/{UUID_A}/{UUID_A}.jsonl"),
+        &format!(
+            "{{\"role\":\"user\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"{}\"}}]}}}}\n",
+            "one-long-message ".repeat(2000)
+        ),
+    );
+    assert!(fs::metadata(&partial).unwrap().len() > fs::metadata(&complete).unwrap().len());
+    set_mtime(&complete, 1_700_000_000);
+    set_mtime(&partial, 1_800_000_000);
+
+    let catalog =
+        SessionCatalog::new(AgentKind::Cursor, root.path().join(".cursor/projects")).unwrap();
+    let lookup = catalog.resolve_with_stats(UUID_A);
+    let resolved = lookup.result.unwrap();
+    assert_eq!(resolved.source.path, complete);
+    assert!(
+        resolved
+            .substitution_notice
+            .unwrap()
+            .contains("most complete")
+    );
+    assert_eq!(lookup.stats.files_opened, 2);
+    assert_eq!(lookup.stats.body_reads, 0);
+
+    #[cfg(feature = "app")]
+    {
+        let output_path = root.path().join("conversation.md");
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_aicx"))
+            .env("HOME", root.path())
+            .env("USERPROFILE", root.path())
+            .env("AICX_HOME", root.path().join(".aicx"))
+            .env("AICX_ALLOW_TMP", "1")
+            .env("AICX_NO_MUTATION_WARN", "1")
+            .args([
+                "extract",
+                "cursor",
+                "--session",
+                UUID_A,
+                "--conversation",
+                "-o",
+            ])
+            .arg(&output_path)
+            .output()
+            .expect("run real extract CLI");
+        assert!(
+            output.status.success(),
+            "extract failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            fs::read_to_string(output_path)
+                .unwrap()
+                .contains("complete-copy-final-answer")
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("most complete of 2 cursor project copies")
+        );
+    }
+}
+
+fn notice_names_kept_copy(path: &Path, project: &str, session_id: &str) -> bool {
+    let mut parts = path
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(part) => Some(part.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let Some(file) = parts.pop() else {
+        return false;
+    };
+    let Some(directory) = parts.pop() else {
+        return false;
+    };
+    let Some(bucket) = parts.pop() else {
+        return false;
+    };
+    let Some(kept_project) = parts.pop() else {
+        return false;
+    };
+    file == format!("{session_id}.jsonl")
+        && directory == session_id
+        && bucket == "agent-transcripts"
+        && kept_project == project
+}
+
+fn set_mtime(path: &Path, unix_secs: u64) {
+    let file = fs::OpenOptions::new().write(true).open(path).unwrap();
+    file.set_modified(UNIX_EPOCH + Duration::from_secs(unix_secs))
+        .unwrap();
+}
+
+#[test]
 fn kimi_wire_identity_lives_on_session_dir_scoped_by_lane() {
     let root = TestRoot::new("kimi-wire-shape");
     let session_rel = format!("wd_proj_deadbeef/session_{UUID_A}");
@@ -622,7 +796,7 @@ fn gemini_catalog_admits_only_conversations_under_chats() {
 
 #[test]
 fn agent_kind_exposes_session_roots_and_parser_kinds() {
-    assert_eq!(AgentKind::ALL.len(), 7);
+    assert_eq!(AgentKind::ALL.len(), 10);
     assert_eq!(AgentKind::parse("claude"), Some(AgentKind::Claude));
     assert_eq!(AgentKind::parse("cursor"), Some(AgentKind::Cursor));
     assert_eq!(AgentKind::parse("cursor-agent"), Some(AgentKind::Cursor));
@@ -659,5 +833,49 @@ fn agent_kind_exposes_session_roots_and_parser_kinds() {
     assert_eq!(
         AgentKind::Cursor.parser_kind(),
         aicx::parser::engine::AgentKind::Cursor
+    );
+    assert_eq!(AgentKind::parse("omp"), Some(AgentKind::Omp));
+    assert_eq!(AgentKind::parse("pi"), Some(AgentKind::Omp));
+    assert_eq!(AgentKind::parse("oh-my-pi"), Some(AgentKind::Omp));
+    assert_eq!(
+        AgentKind::Omp.parser_kind(),
+        aicx::parser::engine::AgentKind::Omp
+    );
+    assert_eq!(
+        AgentKind::Omp.session_root(home),
+        home.join(".omp").join("agent").join("sessions")
+    );
+    assert_eq!(
+        AgentKind::Omp.session_roots(home),
+        session_catalog::omp_session_roots(home)
+    );
+    assert_eq!(
+        session_catalog::omp_session_roots(home),
+        vec![
+            home.join(".omp").join("agent").join("sessions"),
+            session_catalog::pi_session_root(home),
+        ]
+    );
+    assert_eq!(AgentKind::Copilot.session_roots(home).len(), 1);
+    assert_eq!(AgentKind::parse("agy"), Some(AgentKind::Agy));
+    assert_eq!(AgentKind::parse("antigravity"), Some(AgentKind::Agy));
+    assert_eq!(AgentKind::parse("antigravity-cli"), Some(AgentKind::Agy));
+    assert_eq!(
+        AgentKind::parse("gemini-antigravity"),
+        Some(AgentKind::Gemini)
+    );
+    assert_eq!(
+        AgentKind::Agy.parser_kind(),
+        aicx::parser::engine::AgentKind::Agy
+    );
+    assert_eq!(
+        AgentKind::Agy.session_root(home),
+        home.join(".gemini")
+            .join("antigravity-cli")
+            .join("conversations")
+    );
+    assert_eq!(
+        AgentKind::Agy.session_roots(home),
+        session_catalog::agy_session_roots(home)
     );
 }

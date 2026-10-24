@@ -10,9 +10,16 @@
 //! - `~/.cursor/projects`
 //! - `~/.grok/sessions`
 //! - `~/.gemini/tmp`
+//! - `~/.gemini/antigravity-cli/conversations` (Antigravity CLI / agy)
+//! - `~/.gemini/antigravity/conversations` (Antigravity IDE / agy)
 //! - `~/.junie/sessions`
 //! - `~/.kimi-code/sessions`
+//! - `~/.copilot/session-state`
+//! - `~/.omp/agent/sessions`
+//! - `~/.pi/agent/sessions`
 //! - `~/.vibecrafted/control_plane/runtime_runs`
+//! - `~/.codescribe/agent-bridge/buses` (Codescribe Transcript Bus ledgers)
+//! - `~/.codescribe/transcriptions` (Codescribe dictated takes)
 //! - the active AICX home (`$AICX_HOME` / `~/.aicx`)
 //!
 //! Unit tests register their tempfile roots explicitly via [`SourceAllowlist::from_roots`]
@@ -31,9 +38,17 @@ pub const DEFAULT_SOURCE_ROOT_RELATIVE: &[&str] = &[
     ".cursor/projects",
     ".grok/sessions",
     ".gemini/tmp",
+    ".gemini/antigravity-cli/conversations",
+    ".gemini/antigravity/conversations",
     ".junie/sessions",
     ".kimi-code/sessions",
+    ".copilot/session-state",
+    ".omp/agent/sessions",
+    ".pi/agent/sessions",
     ".vibecrafted/control_plane/runtime_runs",
+    // `importers::codescribe_bus::BUS_ROOT_RELATIVE`; a test pins the two.
+    ".codescribe/agent-bridge/buses",
+    ".codescribe/transcriptions",
 ];
 
 /// Allowlist of approved roots for readable session/catalog artifacts.
@@ -50,6 +65,7 @@ impl SourceAllowlist {
         for rel in DEFAULT_SOURCE_ROOT_RELATIVE {
             roots.push(user_home.join(rel));
         }
+        roots.push(crate::session_catalog::copilot_session_root(user_home));
         roots.push(aicx_home.to_path_buf());
         Self::from_roots(roots)
     }
@@ -279,6 +295,83 @@ mod tests {
         let resolved = allow.resolve_file(&wire).unwrap();
         assert_eq!(fs::read_to_string(&resolved).unwrap(), "{}\n");
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn copilot_sources_are_allowed_but_global_telemetry_is_outside_the_root() {
+        let root = test_dir("copilot");
+        let aicx = root.join(".aicx");
+        let session = root.join(".copilot/session-state/11111111-2222-4333-8444-555555555555");
+        fs::create_dir_all(&session).unwrap();
+        let events = session.join("events.jsonl");
+        fs::write(&events, b"{}\n").unwrap();
+        let telemetry = root.join(".copilot/events.jsonl");
+        fs::write(&telemetry, b"{}\n").unwrap();
+        let allow = SourceAllowlist::for_operator(&root, &aicx);
+        assert!(allow.resolve_file(events).is_ok());
+        assert!(allow.resolve_file(telemetry).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn omp_and_pi_session_stores_are_allowed_and_sibling_trees_are_not() {
+        let root = test_dir("omp");
+        let aicx = root.join(".aicx");
+        let omp = root.join(".omp/agent/sessions/encoded/2026-10-21T12-00-00-000Z_01999999-aaaa-7666-8666-111111111111.jsonl");
+        fs::create_dir_all(omp.parent().unwrap()).unwrap();
+        fs::write(&omp, b"{}\n").unwrap();
+        // Tool logs live beside the session file, still inside the store.
+        // Catalog admission, not this allowlist, refuses them as sessions.
+        let nested = omp
+            .parent()
+            .unwrap()
+            .join("2026-10-21T12-00-00-000Z_01999999-aaaa-7666-8666-111111111111/1.bash.log");
+        fs::create_dir_all(nested.parent().unwrap()).unwrap();
+        fs::write(&nested, b"log\n").unwrap();
+        let outside = root.join(".omp/agent/logs/not-a-session.jsonl");
+        fs::create_dir_all(outside.parent().unwrap()).unwrap();
+        fs::write(&outside, b"{}\n").unwrap();
+        let pi = root.join(".pi/agent/sessions/encoded/2026-10-21T12-00-00-000Z_01999999-aaaa-7666-8666-222222222222.jsonl");
+        fs::create_dir_all(pi.parent().unwrap()).unwrap();
+        fs::write(&pi, b"{}\n").unwrap();
+        let allow = SourceAllowlist::for_operator(&root, &aicx);
+        assert!(allow.resolve_file(&omp).is_ok());
+        assert!(allow.resolve_file(&pi).is_ok());
+        assert!(allow.resolve_file(&nested).is_ok());
+        assert!(allow.resolve_file(&outside).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn agy_conversation_stores_are_allowed_and_gemini_siblings_are_not() {
+        // Same containment miss as kimi: `aicx index` skips every cataloged
+        // agy database when the conversation roots are absent from this list.
+        // `.gemini/tmp` stays the Gemini export root and must not be widened
+        // to the whole `.gemini` tree.
+        let root = test_dir("agy");
+        let aicx = root.join(".aicx");
+        let cli = root
+            .join(".gemini/antigravity-cli/conversations/11111111-1111-4111-8111-111111111111.db");
+        let ide =
+            root.join(".gemini/antigravity/conversations/22222222-2222-4222-8222-222222222222.db");
+        for db in [&cli, &ide] {
+            fs::create_dir_all(db.parent().unwrap()).unwrap();
+            fs::write(db, b"sqlite").unwrap();
+        }
+        let sibling = root.join(".gemini/antigravity-cli/brain/note.pb");
+        fs::create_dir_all(sibling.parent().unwrap()).unwrap();
+        fs::write(&sibling, b"legacy").unwrap();
+        let legacy_pb = root.join(".gemini/antigravity/conversations/old.pb");
+        fs::write(&legacy_pb, b"pb").unwrap();
+        let allow = SourceAllowlist::for_operator(&root, &aicx);
+        assert!(allow.resolve_file(&cli).is_ok());
+        assert!(allow.resolve_file(&ide).is_ok());
+        // A `.pb` sitting in the conversation directory is still a file under
+        // the approved root. Catalog admission, not this allowlist, keeps it
+        // off the agy lane. A sibling tree outside `conversations` is refused.
+        assert!(allow.resolve_file(&legacy_pb).is_ok());
+        assert!(allow.resolve_file(&sibling).is_err());
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

@@ -1196,6 +1196,7 @@ fn continuity_freshness_warns_when_hot_sources_have_pending_chunks() {
         source_path: source.display().to_string(),
         source_len: Some(32),
         source_mtime_ns: Some(now_ns),
+        source_bundle_fingerprint: None,
         title: None,
         machine: None,
         logical_session_id: None,

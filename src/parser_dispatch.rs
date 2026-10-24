@@ -21,6 +21,23 @@ pub fn source_handle_for_file(
     logical_session_id: Option<String>,
     path: &Path,
 ) -> Result<SourceHandle> {
+    if agent == AgentKind::Agy {
+        let bytes = crate::agy_store::materialize_agy_db(path)
+            .map_err(|error| anyhow!("agy trajectory could not be read: {error}"))?;
+        let artifact = SourceArtifact::memory(
+            format!("{}.jsonl", safe_source_id(source_id)),
+            bytes,
+            SourceFraming::JsonLines,
+        )
+        .map_err(|error| anyhow!("invalid agy trajectory artifact: {error}"))?;
+        return SourceHandle::new(
+            agent,
+            safe_source_id(source_id),
+            logical_session_id,
+            vec![artifact],
+        )
+        .map_err(|error| anyhow!("invalid source handle: {error}"));
+    }
     let artifact_name = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -36,11 +53,27 @@ pub fn source_handle_for_file(
     };
     let artifact = SourceArtifact::validated_file(artifact_name, path, framing)
         .map_err(|error| anyhow!("invalid source artifact: {error}"))?;
+    let mut artifacts = vec![artifact];
+    if agent == AgentKind::Copilot {
+        let sidecar = path.with_file_name("workspace.yaml");
+        // Only a regular sibling belongs to this finite source selection.
+        // A symlink must not turn metadata discovery into an arbitrary read.
+        if std::fs::symlink_metadata(&sidecar).is_ok_and(|meta| meta.is_file()) {
+            artifacts.push(
+                SourceArtifact::validated_file(
+                    "workspace.yaml",
+                    &sidecar,
+                    SourceFraming::WholeDocument,
+                )
+                .map_err(|error| anyhow!("invalid Copilot workspace artifact: {error}"))?,
+            );
+        }
+    }
     SourceHandle::new(
         agent,
         safe_source_id(source_id),
         logical_session_id,
-        vec![artifact],
+        artifacts,
     )
     .map_err(|error| anyhow!("invalid source handle: {error}"))
 }

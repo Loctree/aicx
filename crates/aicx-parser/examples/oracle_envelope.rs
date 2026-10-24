@@ -48,6 +48,9 @@ fn main() -> ExitCode {
         "junie" => AgentKind::Junie,
         "kimi" => AgentKind::Kimi,
         "cursor" => AgentKind::Cursor,
+        "copilot" => AgentKind::Copilot,
+        "omp" | "pi" | "oh-my-pi" => AgentKind::Omp,
+        "agy" | "antigravity" | "antigravity-cli" => AgentKind::Agy,
         other => {
             eprintln!("unsupported agent: {other}");
             return ExitCode::from(2);

@@ -365,3 +365,23 @@ impl Default for App {
         Self::new()
     }
 }
+
+#[cfg(test)]
+impl App {
+    pub fn for_corpus_test(corpus: crate::wizard::screens::corpus::CorpusScreen) -> Self {
+        Self {
+            active: Screen::Corpus,
+            corpus,
+            doctor: DoctorScreen::default(),
+            intents: IntentsScreen::load(None, 168, None),
+            rebuild: RebuildScreen::default(),
+            search: SearchScreen::default(),
+            should_quit: false,
+            show_help: false,
+            search_mode: false,
+            search_input: String::new(),
+            confirmation: None,
+            status: "ready".to_string(),
+        }
+    }
+}

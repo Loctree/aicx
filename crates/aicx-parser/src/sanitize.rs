@@ -239,7 +239,7 @@ pub fn path_is_temp_allowlisted(path: &Path) -> bool {
 /// Windows; starts_with between a verbatim path and either a non-verbatim base
 /// (the canonicalize-fallback case) or another verbatim path is unreliable — so
 /// normalise BOTH sides to non-verbatim before comparing. No-op on Unix.
-fn strip_verbatim_prefix(path: &Path) -> PathBuf {
+pub fn strip_verbatim_prefix(path: &Path) -> PathBuf {
     let text = path.to_string_lossy();
     if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
         return PathBuf::from(format!(r"\\{rest}"));
@@ -792,6 +792,31 @@ mod tests {
     }
 
     #[test]
+    fn strip_verbatim_prefix_gives_the_spelling_a_user_recorded() {
+        for (verbatim, plain) in [
+            (
+                r"\\?\C:\Users\runner\session.jsonl",
+                r"C:\Users\runner\session.jsonl",
+            ),
+            (
+                r"\\?\UNC\server\share\session.jsonl",
+                r"\\server\share\session.jsonl",
+            ),
+            (
+                r"C:\Users\runner\session.jsonl",
+                r"C:\Users\runner\session.jsonl",
+            ),
+            ("/Users/runner/session.jsonl", "/Users/runner/session.jsonl"),
+        ] {
+            assert_eq!(
+                strip_verbatim_prefix(Path::new(verbatim)),
+                PathBuf::from(plain),
+                "{verbatim}"
+            );
+        }
+    }
+
+    #[test]
     fn test_contains_traversal_carriage_return() {
         assert!(contains_traversal("path\rwith\rcr"));
     }
@@ -1190,6 +1215,7 @@ pub const CLI_SUBCOMMAND_NAMES: &[&str] = &[
     // it points at the catalog engine, not the removed card mill.
     "store",
     "tail",
+    "utterances",
     "warmup",
     "wizard",
 ];
@@ -1659,6 +1685,7 @@ extra_self_echo_patterns = [
             "aicx refs -H 24",
             "aicx reports --workflow marbles",
             "aicx intents -H 720",
+            "aicx utterances -p vetcoders/vista --since 2026-09-01",
             "aicx conversations --out-dir /tmp",
             "aicx health",
             "aicx list",

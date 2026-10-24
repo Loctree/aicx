@@ -17,6 +17,9 @@ pub enum AgentKind {
     Junie,
     Kimi,
     Cursor,
+    Copilot,
+    Omp,
+    Agy,
 }
 
 impl AgentKind {
@@ -29,9 +32,14 @@ impl AgentKind {
             "codex" => Some(Self::Codex),
             "cursor" | "cursor-agent" => Some(Self::Cursor),
             "gemini" | "gemini-antigravity" => Some(Self::Gemini),
+            "agy" | "antigravity" | "antigravity-cli" => Some(Self::Agy),
             "junie" => Some(Self::Junie),
             "grok" => Some(Self::Grok),
             "kimi" => Some(Self::Kimi),
+            "copilot" | "copilot-cli" | "github-copilot" | "github-copilot-cli" => {
+                Some(Self::Copilot)
+            }
+            "omp" | "pi" | "oh-my-pi" => Some(Self::Omp),
             _ => None,
         }
     }
@@ -45,6 +53,9 @@ impl AgentKind {
             Self::Junie => "junie",
             Self::Kimi => "kimi",
             Self::Cursor => "cursor",
+            Self::Copilot => "copilot",
+            Self::Omp => "omp",
+            Self::Agy => "agy",
         }
     }
 }

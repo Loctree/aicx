@@ -39,8 +39,11 @@
 //! and seal are what `push_turn` records. Transport idioms (which tags are
 //! injections) live as data in `engine::frames_rules` under `# claude`.
 //! Tool-use / tool-result / thinking blocks are not speech and stay on the
-//! direct tool lane: the taxonomy names no split call/result pair
-//! (`ShellAction` maps to a single `ToolCall` lane) — reported as BOUNDARY.
+//! direct tool lane. One exception carries a class: a `tool_use` with a
+//! verbatim `input.command` is the agent's shell action, classified by the
+//! throne as `ShellAction { executor: Agent }`; its `tool_result` (a separate
+//! row) is joined into that class by `tool_use` id and stays on the lane as
+//! the class-less result twin.
 
 use super::{AdapterError, AgentAdapter, ClassifiedDisposition, ClassifiedUnit, RawUnitLevel};
 use crate::engine::frames::{
@@ -59,7 +62,10 @@ use crate::skill_collapse::detect_skill_marker;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
-pub const CLAUDE_ADAPTER_VERSION: &str = "claude-adapter-v2";
+pub const CLAUDE_ADAPTER_VERSION: &str = "claude-adapter-v4";
+
+/// Inject tag for the `isCompactSummary` row (see `emit_compaction_summary`).
+const COMPACTION_SUMMARY_TAG: &str = "compact_summary";
 
 /// Anthropic usage provider token for typed `UsageEvent`s.
 const USAGE_PROVIDER: &str = "anthropic";
@@ -192,6 +198,9 @@ struct Ctx<'a> {
     session_id: &'a str,
     next_logical_ordinal: u64,
     tool_names: BTreeMap<String, String>,
+    /// `tool_use` id -> turn of a command-bearing call still waiting for its
+    /// `tool_result`. The two halves are separate rows; see `pair_shell_result`.
+    shell_calls: BTreeMap<String, u64>,
 }
 
 fn analyze(source: &SourceHandle, read: &SourceRead) -> Result<Analysis, AdapterError> {
@@ -216,6 +225,7 @@ fn analyze(source: &SourceHandle, read: &SourceRead) -> Result<Analysis, Adapter
         session_id,
         next_logical_ordinal: read.units.len() as u64 + 1,
         tool_names: BTreeMap::new(),
+        shell_calls: BTreeMap::new(),
     };
     let mut analysis = Analysis {
         classified: Vec::new(),
@@ -460,7 +470,8 @@ fn walk_conversational_row(
     // Compaction boundary (`isCompactSummary` + `compactMetadata`): the row
     // that follows is the summary that replaced earlier context. Recorded
     // as a context epoch of THIS conversation — never a second source.
-    if object.get("isCompactSummary").and_then(Value::as_bool) == Some(true) {
+    let compaction_summary = object.get("isCompactSummary").and_then(Value::as_bool) == Some(true);
+    if compaction_summary {
         let trigger = object
             .get("compactMetadata")
             .and_then(Value::as_object)
@@ -476,6 +487,49 @@ fn walk_conversational_row(
     }
 
     let role = string_field(message, "role").unwrap_or(top_type);
+    // The summary rides the user lane, but the model that compacted the
+    // context wrote it: it retells what the operator asked in the agent's
+    // words. As human speech it surfaced in `aicx intents` as fresh
+    // decisions and intents stamped with the compaction time.
+    if compaction_summary && top_type == "user" {
+        match message.get("content") {
+            Some(Value::String(text)) => {
+                emit_compaction_summary(text, timestamp, vec![physical_ref], analysis);
+                return Ok(());
+            }
+            Some(Value::Array(blocks)) => {
+                for (index, block) in blocks.iter().enumerate() {
+                    let text_block = block
+                        .as_object()
+                        .filter(|object| string_field(object, "type") == Some("text"))
+                        .and_then(|object| string_field(object, "text"));
+                    if let Some(text) = text_block {
+                        emit_compaction_summary(
+                            text,
+                            timestamp,
+                            vec![physical_ref.clone()],
+                            analysis,
+                        );
+                    } else {
+                        walk_content_block(
+                            raw,
+                            &physical_ref,
+                            top_type,
+                            role,
+                            index,
+                            block,
+                            timestamp,
+                            ctx,
+                            analysis,
+                            logical,
+                        )?;
+                    }
+                }
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
     match message.get("content") {
         None => Ok(()),
         Some(Value::String(text)) => {
@@ -653,12 +707,22 @@ fn walk_content_block(
             // instead of an empty `$ `. Other tools keep an empty body —
             // a synthesized summary would be heuristic, and heuristics
             // never enter the kernel (C0A §1.1).
+            //
+            // The same command makes the turn the agent's shell action: a
+            // `tool_use` block is the agent's own invocation, so the throne
+            // classifies it from `AgentToolCall` and `--agent-commands` can
+            // prove the executor. Its result is joined by `tool_use` id when
+            // the `tool_result` row arrives (`pair_shell_result`).
             let input = object.get("input").unwrap_or(&Value::Null);
             let command = input
                 .get("command")
                 .and_then(Value::as_str)
                 .map(str::trim)
                 .unwrap_or_default();
+            let shell_class = (!command.is_empty())
+                .then(|| agent_shell_class(command, String::new(), timestamp, &evidence))
+                .flatten();
+            let awaits_result = shell_class.is_some();
             let turn_idx = push_turn(
                 TurnRole::Assistant,
                 TurnKind::ToolCall,
@@ -666,9 +730,12 @@ fn walk_content_block(
                 timestamp,
                 known_nonempty(name),
                 vec![physical_ref.clone(), evidence.clone()],
-                None,
+                shell_class,
                 analysis,
             );
+            if awaits_result && !call_id.is_empty() {
+                ctx.shell_calls.insert(call_id.to_owned(), turn_idx);
+            }
             let payload = canonical_json(input);
             analysis.tool_events.push(ToolEvent {
                 kind: ToolEventKind::Call,
@@ -694,6 +761,9 @@ fn walk_content_block(
             let correlation = string_field(object, "tool_use_id").unwrap_or_default();
             let tool_name = ctx.tool_names.get(correlation).cloned();
             let text = tool_result_text(object.get("content"));
+            if let Some(call_idx) = ctx.shell_calls.remove(correlation) {
+                pair_shell_result(analysis, call_idx, &text, timestamp, &evidence);
+            }
             let turn_idx = push_turn(
                 TurnRole::Tool,
                 TurnKind::ToolResult,
@@ -881,6 +951,38 @@ fn emit_text_turn(
     }
 }
 
+/// Hand a compaction summary to the throne as injected context.
+///
+/// The tag is assigned from the row's `isCompactSummary` structure, never
+/// read off the text, so the summary cannot leak onto the human lane however
+/// it is phrased. `# claude` maps the tag to `CompactionReplay`.
+fn emit_compaction_summary(
+    text: &str,
+    timestamp: &Known<String>,
+    refs: Vec<RawUnitRef>,
+    analysis: &mut Analysis,
+) {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    let evidence = refs
+        .first()
+        .expect("a compaction summary always carries its physical evidence")
+        .clone();
+    let frame = TransportFrame {
+        agent: AgentKind::Claude,
+        transport_kind: TransportKind::InjectedContext,
+        timestamp: timestamp.clone(),
+        payload: TransportPayload::Inject {
+            tag: COMPACTION_SUMMARY_TAG.to_owned(),
+            content: trimmed.to_owned(),
+        },
+        evidence,
+    };
+    emit_frame(&frame, refs, analysis);
+}
+
 /// Hand the operator text carried by a `queue-operation` enqueue to the
 /// throne as a `queue_operation` frame.
 ///
@@ -932,6 +1034,58 @@ fn emit_queued_user_turn(
         analysis.queue_turns.push(turn_idx);
     }
     Ok(())
+}
+
+/// The agent's shell action for a command-bearing `tool_use` (`Bash`,
+/// `Monitor`, …), decided by the throne. The transport proves the executor:
+/// a `tool_use` block is the agent's own invocation (`AgentToolCall`), never
+/// a command the operator typed. `None` when the throne answers with any
+/// other class; the turn then stays class-less, exactly as before.
+fn agent_shell_class(
+    command: &str,
+    result: String,
+    timestamp: &Known<String>,
+    evidence: &RawUnitRef,
+) -> Option<FrameClass> {
+    let classified = frames::classify(&TransportFrame {
+        agent: AgentKind::Claude,
+        transport_kind: TransportKind::AgentToolCall,
+        timestamp: timestamp.clone(),
+        payload: TransportPayload::Shell {
+            command: command.to_owned(),
+            result,
+        },
+        evidence: evidence.clone(),
+    });
+    matches!(classified.class, FrameClass::ShellAction { .. }).then_some(classified.class)
+}
+
+/// Join a `tool_result` to the shell `tool_use` it answers.
+///
+/// The two halves are separate JSONL rows, often not adjacent (parallel
+/// calls answer in a batch), so the class minted at the call carries an empty
+/// result until its `tool_use` id comes back. The class then holds both
+/// halves and the result row stays a class-less `ToolResult` twin — the shape
+/// `fold_shell_results` renders from, as for Junie and the Codex envelope.
+/// Only the class changes: turn text and hash, and so the canonical
+/// fingerprint, stay what the call row recorded.
+fn pair_shell_result(
+    analysis: &mut Analysis,
+    call_idx: u64,
+    result: &str,
+    timestamp: &Known<String>,
+    evidence: &RawUnitRef,
+) {
+    let Some(call) = analysis.turns.get_mut(call_idx as usize) else {
+        return;
+    };
+    let cmd = match &call.frame_class {
+        Some(FrameClass::ShellAction { cmd, .. }) => cmd.clone(),
+        _ => return,
+    };
+    if let Some(class) = agent_shell_class(&cmd, result.to_owned(), timestamp, evidence) {
+        call.frame_class = Some(class);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

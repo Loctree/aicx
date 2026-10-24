@@ -22,7 +22,68 @@ pub(crate) const DASHBOARD_SERVER_SCRIPT: &str = r#"
   const state = {
     query: '', project: '', agent: '', kind: '', sort: 'newest', since: '',
     scoreMin: 0, limit: 350, selectedId: null, rows: [], selectedRecord: null,
-    browseRecords: [], mode: 'browse', expanded: false,
+    browseRecords: [], mode: 'browse', view: 'sessions', intentHours: 720, expanded: false, unit: 'session',
+    assumptions: [], indexLoaded: false, corpusTotal: 0, browseRetries: 0,
+    scanStatus: 'unknown',
+  };
+
+  const applyStatus = (data) => {
+    if (!data || !data.scan_status) return;
+    state.scanStatus = data.scan_status;
+    if (data.scan_status === 'not_scanned') {
+      ui.statFiles.textContent = '\u2014';
+      ui.statProjects.textContent = '\u2014';
+      ui.statDays.textContent = '\u2014';
+      if (ui.genInfo) ui.genInfo.textContent = 'Not scanned yet';
+    }
+  };
+
+  const withoutStamp = (line) => {
+    if (line.charAt(0) !== '[') return line;
+    const end = line.indexOf(']');
+    return end > 0 ? line.slice(end + 1).trim() : line;
+  };
+  const stripAnsi = (value) => String(value || '')
+    .replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, '')
+    .replace(/\u001b\][^\u0007]*(?:\u0007|\u001b\\)/g, '');
+  const readableLine = (line) => {
+    let text = stripAnsi(withoutStamp(line)).replace(/^(user|assistant):\s*/i, '').replace(/<\/?user_query>/gi, ' ').replace(/\s+/g, ' ').trim();
+    if (!text || text.indexOf('<') === 0) return '';
+    if (/[\u2500-\u257F]/.test(text)) return '';
+    return text.length > 140 ? text.slice(0, 140) + '\u2026' : text;
+  };
+  const readableName = (record) => {
+    const preview = stripAnsi(record.preview || record.excerpt || '');
+    const lines = preview.split('\n').map(function(line) { return line.trim(); }).filter(Boolean);
+    const spoken = function(prefix) {
+      return lines.find(function(line) { return withoutStamp(line).toLowerCase().indexOf(prefix) === 0 && readableLine(line); });
+    };
+    const chosen = spoken('user:') || spoken('assistant:');
+    if (chosen) return readableLine(chosen);
+    const first = lines.map(readableLine).find(Boolean);
+    if (first) return first;
+    const raw = record.file_name || record.file || '';
+    const label = (record.label || '').trim();
+    if (label && !/\.jsonl?$/i.test(label)) return label;
+    if (record.kind === 'session' || /\.jsonl$/i.test(raw)) return (record.agent || 'session') + ' session';
+    return raw || '(unnamed)';
+  };
+  const resultFormat = window.AICX_RESULT_FORMAT || {};
+  const listSnippetChars = Number(resultFormat.listSnippetChars) || 0;
+  const listPreview = (record) => {
+    const text = stripAnsi((record.preview || record.excerpt || '').replace(/\[1970-01-01[^\]]*\]\s*/g, '')).trim();
+    if (!text || text.indexOf('<rules>') === 0) return '';
+    if (listSnippetChars > 0 && text.length > listSnippetChars) return text.slice(0, listSnippetChars) + '\u2026';
+    return text;
+  };
+  const resultHeader = (record, score) => {
+    const scored = typeof score === 'number' && score > 0;
+    if (record.header && !scored) return record.header;
+    const parts = [record.project, record.agent, record.kind, record.date].filter(Boolean);
+    if (scored) parts.push(String(score));
+    const session = record.session_id ? String(record.session_id).slice(0, 8) : '';
+    if (session) parts.push(session);
+    return parts.join(' \u00b7 ');
   };
 
   const renderMarkdown = AicxMarkdown.renderMarkdown;
@@ -71,8 +132,13 @@ pub(crate) const DASHBOARD_SERVER_SCRIPT: &str = r#"
               err.textContent = 'Invalid token (HTTP ' + r.status + ').';
               err.style.display = 'block';
             }
-            return;
+            return null;
           }
+          return r.json();
+        })
+        .then(function(data) {
+          if (!data) return;
+          applyStatus(data);
           saveToken(tok);
           hideLogin();
           loadBrowseData();
@@ -183,15 +249,14 @@ pub(crate) const DASHBOARD_SERVER_SCRIPT: &str = r#"
     if (!record) {
       ui.detailTitle.textContent = 'No result selected';
       ui.detailMeta.textContent = '';
-      ui.detailContent.innerHTML = 'Use search or filters to pick a note.';
+      ui.detailContent.textContent = 'Open a session.';
       return;
     }
-    const title = record.file_name || record.file || '(unnamed)';
-    const scoreTxt = typeof score === 'number' && score > 0 ? 'score ' + score + '/100' : '';
-    const meta = [record.project, record.agent, record.kind, record.date, scoreTxt].filter(Boolean).join(' \u2022 ');
+    const title = readableName(record);
+    const meta = resultHeader(record, score);
     ui.detailTitle.innerHTML = highlightTerms(title, state.query);
     ui.detailMeta.innerHTML = highlightTerms(meta, state.query);
-    const previewText = record.preview || record.excerpt || '';
+    const previewText = stripAnsi(record.preview || record.excerpt || '');
     if (previewText) {
       ui.detailContent.innerHTML = '<div class="md-rendered">' + renderMarkdown(previewText) + '</div>';
     } else {
@@ -207,12 +272,48 @@ pub(crate) const DASHBOARD_SERVER_SCRIPT: &str = r#"
       return;
     }
     ui.detailContent.textContent = 'Loading full content\u2026';
-    const endpoint = rec.id !== undefined ? '/api/chunk?id=' + rec.id : '/api/detail?id=' + rec.id;
-    apiFetch(endpoint)
+    if (rec.surface === 'intent') {
+      const params = new URLSearchParams();
+      params.set('full', '1');
+      params.set('hours', String(state.intentHours));
+      params.set('limit', '20');
+      if (state.project) params.set('project', state.project);
+      if (rec.session_id) params.set('session_id', rec.session_id);
+      if (rec.source_chunk) params.set('source_chunk', rec.source_chunk);
+      apiFetch('/api/intents?' + params.toString())
+        .then(function(r) { return r.json(); })
+        .then(function(data) {
+          const match = (data.items || []).find(function(item) {
+            return item.session_id === rec.session_id && item.source_chunk === rec.source_chunk;
+          }) || (data.items || [])[0];
+          const content = stripAnsi((match && match.body) || rec.body || '');
+          state.expanded = true;
+          if (ui.expand) ui.expand.textContent = 'Collapse';
+          ui.detailContent.innerHTML = '<div class="md-rendered">' + renderMarkdown(content) + '</div>';
+        })
+        .catch(function(err) {
+          if (err && err.status === 401) return;
+          ui.detailContent.textContent = 'Load failed: ' + err.message;
+        });
+      return;
+    }
+    if ((rec.id === undefined || rec.id === null || rec.id === '') && rec.detail_text) {
+      state.expanded = true;
+      if (ui.expand) ui.expand.textContent = 'Collapse';
+      ui.detailContent.innerHTML = '<div class="md-rendered">' + renderMarkdown(stripAnsi(rec.detail_text)) + '</div>';
+      return;
+    }
+    if (rec.id === undefined || rec.id === null || rec.id === '') {
+      state.expanded = true;
+      if (ui.expand) ui.expand.textContent = 'Collapse';
+      ui.detailContent.innerHTML = '<div class="md-rendered">' + renderMarkdown(rec.excerpt || rec.preview || '') + '</div>';
+      return;
+    }
+    apiFetch('/api/detail?full=1&id=' + encodeURIComponent(rec.id))
       .then(function(r) { return r.json(); })
       .then(function(data) {
         if (!data.ok) { ui.detailContent.textContent = 'Failed: ' + (data.error || 'unknown'); return; }
-        const content = data.content || data.detail_text || '';
+        const content = stripAnsi(data.content || data.detail_text || '');
         state.expanded = true;
         if (ui.expand) ui.expand.textContent = 'Collapse';
         ui.detailContent.innerHTML = '<div class="md-rendered">' + renderMarkdown(content) + '</div>';
@@ -224,15 +325,27 @@ pub(crate) const DASHBOARD_SERVER_SCRIPT: &str = r#"
   };
 
   /* --- result list ------------------------------------------------------- */
+  const corpusQuiet = () => !state.query && !state.project && !state.agent && !state.kind && !state.since && state.scoreMin === 0;
+  const emptyReason = () => {
+    if (!corpusQuiet()) return 'No sessions match this search.';
+    const note = (state.assumptions || []).find(Boolean);
+    if (note) return note;
+    if (!state.indexLoaded) return 'No index on this machine. Search only sees what has been scanned.';
+    return 'No sessions in this corpus.';
+  };
   const mkBadge = (txt) => { const n = document.createElement('span'); n.className = 'badge'; n.innerHTML = highlightTerms(String(txt || ''), state.query); return n; };
   const renderList = (rows) => {
     ui.list.innerHTML = '';
     if (!rows.length) {
-      const e = document.createElement('div'); e.className = 'empty'; e.textContent = 'No records match current query/filters.';
+      const e = document.createElement('div'); e.className = 'empty'; e.textContent = emptyReason();
       ui.list.appendChild(e); renderDetail(null, 0); return;
     }
     const visible = rows.slice(0, state.limit);
-    const idKey = (r) => r.id !== undefined ? r.id : r.path;
+    const idKey = (r) => {
+      if (r.surface === 'intent') return String(r.session_id || '') + '|' + String(r.source_chunk || '');
+      if (r.id !== undefined && r.id !== null && r.id !== '') return r.id;
+      return r.path || r.session_id || '';
+    };
     if (!state.selectedId || !visible.some(function(r) { return idKey(r.record) === state.selectedId; })) {
       state.selectedId = idKey(visible[0].record);
     }
@@ -248,15 +361,23 @@ pub(crate) const DASHBOARD_SERVER_SCRIPT: &str = r#"
       top.appendChild(mkBadge(record.date || ''));
       if (typeof score === 'number' && score > 0) top.appendChild(mkBadge(score + '/100'));
       const name = document.createElement('div'); name.className = 'result-name';
-      const fname = (record.file_name || record.file || '(unnamed)') + (record.size_human ? ' \u2022 ' + record.size_human : '');
+      const rawName = record.file_name || record.file || '';
+      const hideSize = record.kind === 'session' || record.surface === 'intent' || /\.jsonl$/i.test(rawName);
+      const fname = resultHeader(record, score) || (readableName(record) + (!hideSize && record.size_human ? ' \u2022 ' + record.size_human : ''));
       name.innerHTML = highlightTerms(fname, state.query);
       item.appendChild(top); item.appendChild(name);
-      const previewText = record.excerpt || record.preview || '';
+      const previewText = listPreview(record);
       if (previewText) {
         const preview = document.createElement('div'); preview.className = 'result-preview';
-        const maxLen = 240; const truncated = previewText.length > maxLen ? previewText.slice(0, maxLen) + '\u2026' : previewText;
+        const truncated = previewText;
         preview.innerHTML = highlightTerms(truncated, state.query);
         item.appendChild(preview);
+      }
+      const whereText = record.relative_path || record.path || '';
+      if (whereText) {
+        const where = document.createElement('div'); where.className = 'result-where';
+        where.textContent = whereText;
+        item.appendChild(where);
       }
       item.addEventListener('click', function() {
         state.selectedId = rid; renderList(state.rows); renderDetail(record, score); runHooks('onSelect', record);
@@ -277,7 +398,11 @@ pub(crate) const DASHBOARD_SERVER_SCRIPT: &str = r#"
     else rows.sort(function(a, b) { return (b.record.sort_ts || 0) - (a.record.sort_ts || 0); });
     rows = runHooks('beforeRender', rows);
     state.rows = rows;
-    ui.summary.textContent = rows.length + ' file(s) | browse mode | total: ' + state.browseRecords.length;
+    const unit = state.unit === 'file' ? 'file' : 'session';
+    const shown = Math.min(rows.length, state.limit);
+    ui.summary.textContent = (!rows.length && corpusQuiet())
+      ? emptyReason()
+      : shown + ' / ' + rows.length + ' ' + unit + (rows.length === 1 ? '' : 's');
     renderList(rows);
     runHooks('afterRender', rows);
   };
@@ -307,7 +432,7 @@ pub(crate) const DASHBOARD_SERVER_SCRIPT: &str = r#"
         else if (state.sort === 'oldest') rows.sort(function(a, b) { return (a.record.sort_ts || a.record.date || '') < (b.record.sort_ts || b.record.date || '') ? -1 : 1; });
         rows = runHooks('beforeRender', rows);
         state.rows = rows;
-        ui.summary.textContent = rows.length + ' result(s) | fuzzy search | scanned: ' + (data.total_scanned || '?');
+        ui.summary.textContent = Math.min(rows.length, state.limit) + ' / ' + rows.length + ' results | scanned ' + (data.total_scanned || '?');
         renderList(rows);
         runHooks('afterRender', rows);
       })
@@ -326,6 +451,7 @@ pub(crate) const DASHBOARD_SERVER_SCRIPT: &str = r#"
     state.sort = ui.sort.value;
     state.scoreMin = parseInt(ui.score.value, 10) || 0;
     pushUrlState();
+    if (state.view === 'intents') { loadIntents(); return; }
     if (state.query) { runSearch(); } else { loadBrowseData(); }
   };
 
@@ -357,10 +483,23 @@ pub(crate) const DASHBOARD_SERVER_SCRIPT: &str = r#"
       btn.classList.toggle('active', btn.dataset.since === since);
     });
   };
+  const intentHoursFor = (since) => {
+    if (since === '1h') return 1;
+    if (since === '4h') return 4;
+    if (since === '24h') return 24;
+    if (since === '7d') return 168;
+    if (since === '30d') return 720;
+    return 0;
+  };
   document.querySelectorAll('.time-btn').forEach(function(btn) {
     btn.addEventListener('click', function() {
-      state.since = btn.dataset.since;
-      setTimeBtnActive(state.since);
+      if (state.view === 'intents') {
+        state.intentHours = intentHoursFor(btn.dataset.since);
+        setTimeBtnActive(btn.dataset.since);
+      } else {
+        state.since = btn.dataset.since;
+        setTimeBtnActive(state.since);
+      }
       refresh();
     });
   });
@@ -394,8 +533,14 @@ pub(crate) const DASHBOARD_SERVER_SCRIPT: &str = r#"
   }
 
   /* --- load browse data -------------------------------------------------- */
+  const showCorpusBusy = () => {
+    ui.summary.textContent = 'Still reading the corpus. Retrying\u2026';
+    if (ui.genInfo) ui.genInfo.textContent = 'Still reading the corpus';
+  };
   const loadBrowseData = () => {
-    ui.summary.textContent = 'Loading\u2026';
+    const deferredScan = state.scanStatus === 'not_scanned';
+    if (deferredScan) showCorpusBusy();
+    else ui.summary.textContent = 'Loading\u2026';
     const params = new URLSearchParams();
     if (state.project) params.set('project', state.project);
     if (state.agent) params.set('agent', state.agent);
@@ -403,26 +548,85 @@ pub(crate) const DASHBOARD_SERVER_SCRIPT: &str = r#"
     if (state.sort) params.set('sort', state.sort);
     if (state.since) params.set('since', state.since);
     const qs = params.toString();
-    apiFetch('/api/browse' + (qs ? '?' + qs : ''))
-      .then(function(r) { return r.json(); })
+    const controller = deferredScan ? null : new AbortController();
+    const timer = controller ? setTimeout(function() { controller.abort(); }, 8000) : null;
+    const requestOptions = controller ? { signal: controller.signal } : {};
+    apiFetch('/api/browse' + (qs ? '?' + qs : ''), requestOptions)
+      .then(function(r) {
+        if (timer) clearTimeout(timer);
+        if (r.status === 503) {
+          return r.json().then(function(data) {
+            const err = new Error((data && data.error) || 'still_reading');
+            err.status = 503;
+            err.stillReading = data && data.error === 'still_reading';
+            throw err;
+          });
+        }
+        if (!r.ok) {
+          const err = new Error('HTTP ' + r.status);
+          err.status = r.status;
+          throw err;
+        }
+        return r.json();
+      })
       .then(function(data) {
-        if (!data.ok) { ui.summary.textContent = 'Failed: ' + (data.error || 'unknown'); return; }
+        if (!data.ok) {
+          if (data.error === 'still_reading') {
+            showCorpusBusy();
+            setTimeout(loadBrowseData, 2500);
+            return;
+          }
+          ui.summary.textContent = 'Failed: ' + (data.error || 'unknown');
+          return;
+        }
+        state.browseRetries = 0;
+        state.scanStatus = 'ready';
         state.browseRecords = data.records || [];
         fillSelect(ui.project, data.projects || []);
         fillSelect(ui.agent, data.agents || []);
         fillSelect(ui.kind, data.kinds || []);
         const s = data.stats || {};
-        ui.statFiles.textContent = s.total_files || 0;
-        ui.statProjects.textContent = s.total_projects || 0;
-        ui.statDays.textContent = s.total_days || 0;
+        state.assumptions = data.assumptions || [];
+        state.indexLoaded = !!s.index_loaded;
+        state.corpusTotal = s.total_files || 0;
+        state.unit = s.search_backend === 'catalog-live-source' ? 'session' : 'file';
+        const quietEmpty = state.corpusTotal === 0 && !s.index_loaded && !s.state_loaded;
+        ui.statFiles.textContent = quietEmpty ? '\u2014' : String(s.total_files || 0);
+        ui.statProjects.textContent = quietEmpty ? '\u2014' : String(s.total_projects || 0);
+        ui.statDays.textContent = quietEmpty ? '\u2014' : String(s.total_days || 0);
+        const unitLabel = document.getElementById('ctx-stat-unit');
+        if (unitLabel) unitLabel.textContent = (state.unit === 'session' || quietEmpty) ? 'sessions' : 'files';
+        const cardSessions = document.getElementById('ctx-card-sessions');
+        if (cardSessions) cardSessions.textContent = ui.statFiles.textContent;
+        const cardProjects = document.getElementById('ctx-card-projects');
+        if (cardProjects) cardProjects.textContent = ui.statProjects.textContent;
+        const indexState = document.getElementById('ctx-index-state');
+        if (indexState) indexState.textContent = s.index_loaded ? 'ready' : (quietEmpty ? 'not loaded' : 'partial');
+        const scope = document.getElementById('ctx-scope');
+        if (scope) {
+          const projects = data.projects || [];
+          scope.textContent = projects.length === 1 ? projects[0] : (projects.length ? (projects.length + ' projects') : 'This machine');
+        }
         ui.genInfo.textContent = 'Generated ' + (data.generated_at || '?');
         ui.assumptions.innerHTML = '';
         (data.assumptions || []).forEach(function(a) { const li = document.createElement('li'); li.textContent = a; ui.assumptions.appendChild(li); });
         applyBrowseFilters();
       })
       .catch(function(err) {
+        clearTimeout(timer);
         if (err && err.status === 401) return;
-        ui.summary.textContent = 'Load failed: ' + err.message;
+        const busy = (err && err.stillReading)
+          || (err && err.name === 'AbortError')
+          || (err && !err.status && /fetch|abort/i.test(String(err.message || '')));
+        if (busy) {
+          state.browseRetries = (state.browseRetries || 0) + 1;
+          showCorpusBusy();
+          if (state.browseRetries < 8) {
+            setTimeout(loadBrowseData, 2500);
+            return;
+          }
+        }
+        ui.summary.textContent = 'Load failed: ' + ((err && err.message) || 'unknown');
       });
   };
 
@@ -438,9 +642,207 @@ pub(crate) const DASHBOARD_SERVER_SCRIPT: &str = r#"
     } catch (_) {}
   };
 
+  const studio = () => {
+    const onboard = $('ctx-onboarding');
+    const survey = $('ctx-onboarding-phrases');
+    const surveySave = $('ctx-onboarding-save');
+    const surveyStatus = $('ctx-onboarding-status');
+    if (surveySave && survey) surveySave.addEventListener('click', () => {
+      const phrases = survey.value.split(/\n/).map((line) => line.trim()).filter(Boolean);
+      apiFetch('/api/onboarding', {
+        method: 'POST',
+        body: JSON.stringify({ phrases: phrases }),
+        headers: { 'content-type': 'application/json', 'x-ai-contexters-action': 'regenerate' }
+      })
+        .then((r) => r.json())
+        .then((body) => {
+          if (!surveyStatus) return;
+          if (!body.ok) {
+            surveyStatus.textContent = body.detail || 'Not saved.';
+            return;
+          }
+          const service = body.service ? ' Background service: ' + body.service + '.' : '';
+          surveyStatus.textContent = 'Saved on this machine.' + service;
+          if (onboard) onboard.open = false;
+        })
+        .catch(() => { if (surveyStatus) surveyStatus.textContent = 'Not saved.'; });
+    });
+    const phrases = $('ctx-phrases');
+    const phraseStatus = $('ctx-phrases-status');
+    const phraseSave = $('ctx-phrases-save');
+    if (phrases) {
+      apiFetch('/api/phrases').then((r) => r.text()).then((text) => { phrases.value = text; }).catch(() => {});
+    }
+    if (phraseSave && phrases) phraseSave.addEventListener('click', () => {
+      apiFetch('/api/phrases', { method: 'PUT', body: phrases.value, headers: { 'content-type': 'text/plain', 'x-ai-contexters-action': 'regenerate' } })
+        .then((r) => r.json())
+        .then((body) => { if (phraseStatus) phraseStatus.textContent = body.ok ? 'Saved.' : (body.detail || 'Not saved.'); })
+        .catch(() => { if (phraseStatus) phraseStatus.textContent = 'Not saved.'; });
+    });
+    const indexBtn = $('ctx-index');
+    const indexStatus = $('ctx-index-status');
+    if (indexBtn) indexBtn.addEventListener('click', () => {
+      indexBtn.disabled = true;
+      if (indexStatus) indexStatus.textContent = 'Indexing…';
+      apiFetch('/api/index', { method: 'POST', headers: { 'x-ai-contexters-action': 'regenerate' } })
+        .then((r) => { if (indexStatus) indexStatus.textContent = r.status === 202 ? 'Index started.' : 'Index was refused.'; })
+        .catch(() => { if (indexStatus) indexStatus.textContent = 'Index was refused.'; })
+        .finally(() => { indexBtn.disabled = false; });
+    });
+  };
+
+  /* --- continuity: the same frozen window in the browser and CLI --------- */
+  const continuityPanel = document.createElement('section');
+  continuityPanel.id = 'ctx-continuity';
+  continuityPanel.className = 'continuity-panel';
+  continuityPanel.hidden = true;
+  continuityPanel.setAttribute('aria-label', 'Continuity');
+  continuityPanel.innerHTML = `
+    <h2>Continuity</h2>
+    <p class="meta">Build a cold start from this machine's session history. Read the sections, then use the same pack in your terminal.</p>
+    <form id="ctx-continuity-form" class="continuity-form">
+      <label>Project<input name="project" id="ctx-continuity-project" placeholder="owner/repo" required list="ctx-continuity-projects" /></label>
+      <datalist id="ctx-continuity-projects"></datalist>
+      <label>Name (optional)<input name="as" placeholder="Andrzej" /></label>
+      <label>Hours<input name="hours" type="number" min="0" step="1" value="72" required /></label>
+      <label class="continuity-fit"><input name="inject" type="checkbox" checked />Fit to prompt</label>
+      <button type="submit">Build pack</button>
+    </form>
+    <p id="ctx-continuity-status" class="meta" role="status" aria-live="polite">Choose a project to begin. Hours: 0 includes all history.</p>
+    <div id="ctx-continuity-result" hidden>
+      <p class="meta">Reproduce this window in the terminal (same AICX home and source history):</p>
+      <pre class="continuity-command"><code id="ctx-continuity-command"></code></pre>
+      <button id="ctx-continuity-copy" type="button">Copy command</button>
+      <nav id="ctx-continuity-meter" class="continuity-meter" aria-label="Pack sections"></nav>
+      <div id="ctx-continuity-sections"></div>
+    </div>`;
+  const mainBody = document.querySelector('.main-body');
+  if (mainBody) mainBody.appendChild(continuityPanel);
+  const navContinuity = document.createElement('button');
+  navContinuity.type = 'button';
+  navContinuity.id = 'ctx-nav-continuity';
+  navContinuity.className = 'rail-nav-item';
+  navContinuity.textContent = 'Continuity';
+  const railNav = document.querySelector('.rail-nav');
+  if (railNav) railNav.appendChild(navContinuity);
+  const showContinuity = (visible) => {
+    continuityPanel.hidden = !visible;
+    const layout = $('ctx-layout');
+    if (layout) layout.hidden = visible;
+    if (visible) {
+      const project = $('ctx-continuity-project');
+      if (!project.value) project.value = state.project || '';
+      const options = $('ctx-continuity-projects');
+      options.replaceChildren();
+      Array.from(ui.project.options).filter((o) => o.value).forEach((o) => {
+        const option = document.createElement('option'); option.value = o.value; options.appendChild(option);
+      });
+      project.focus();
+    }
+  };
+  navContinuity.addEventListener('click', () => { markNav(navContinuity); showContinuity(true); });
+  $('ctx-continuity-form').addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const params = new URLSearchParams(new FormData(form));
+    params.set('inject', form.elements.inject.checked ? 'true' : 'false');
+    if (!params.get('as').trim()) params.delete('as');
+    const button = form.querySelector('button[type="submit"]');
+    const status = $('ctx-continuity-status');
+    const result = $('ctx-continuity-result');
+    button.disabled = true; result.hidden = true;
+    status.textContent = 'Building continuity from live sources…';
+    try {
+      const response = await apiFetch('/api/continuity?' + params.toString());
+      const data = await response.json();
+      if (!response.ok || !data.ok) throw new Error(data.error || 'HTTP ' + response.status);
+      $('ctx-continuity-command').textContent = data.cli_command;
+      const meter = $('ctx-continuity-meter');
+      const sections = $('ctx-continuity-sections');
+      meter.replaceChildren(); sections.replaceChildren();
+      data.sections.forEach((section, index) => {
+        const id = 'ctx-continuity-section-' + index;
+        const link = document.createElement('a');
+        link.href = '#' + id;
+        link.textContent = section.title + ' · ' + section.lines + ' lines';
+        meter.appendChild(link);
+        const article = document.createElement('article');
+        article.id = id; article.className = 'continuity-section';
+        const heading = document.createElement('h3');
+        heading.textContent = section.title + ' · ' + section.lines + ' lines';
+        const content = document.createElement('div'); content.className = 'md-rendered';
+        content.innerHTML = renderMarkdown(section.markdown);
+        article.append(heading, content); sections.appendChild(article);
+      });
+      status.textContent = data.total_lines + ' lines · window ends ' + data.until + (data.inject ? ' · fit to prompt' : ' · full pack');
+      result.hidden = false;
+    } catch (error) { status.textContent = error.message; }
+    finally { button.disabled = false; }
+  });
+  $('ctx-continuity-copy').addEventListener('click', async () => {
+    try { await navigator.clipboard.writeText($('ctx-continuity-command').textContent); }
+    catch (_) { $('ctx-continuity-status').textContent = 'Select the command above to copy it.'; }
+  });
+
+  const loadIntents = () => {
+    state.view = 'intents';
+    state.mode = 'intents';
+    ui.summary.textContent = 'Loading intents\u2026';
+    const params = new URLSearchParams();
+    if (state.project) params.set('project', state.project);
+    if (state.agent) params.set('agent', state.agent);
+    params.set('hours', String(state.intentHours));
+    params.set('limit', '20');
+    apiFetch('/api/intents?' + params.toString())
+      .then(function(r) { return r.json(); })
+      .then(function(data) {
+        if (!data.ok) { ui.summary.textContent = 'Failed: ' + (data.error || 'unknown'); return; }
+        const records = data.items || [];
+        state.browseRecords = records;
+        const rows = records.map(function(record) { return { record: record, score: 0 }; });
+        state.rows = rows;
+        ui.summary.textContent = Math.min(records.length, state.limit) + ' / ' + records.length + ' intents';
+        if (ui.statFiles) ui.statFiles.textContent = String(records.length);
+        renderList(rows);
+      })
+      .catch(function(err) {
+        if (err && err.status === 401) return;
+        ui.summary.textContent = 'Intents failed: ' + err.message;
+      });
+  };
+
+  const navSessions = $('ctx-nav-sessions');
+  const navIntents = $('ctx-nav-intents');
+  const navSetup = $('ctx-nav-setup');
+  const markNav = (active) => {
+    document.querySelectorAll('.rail-nav-item').forEach(function(btn) { btn.classList.toggle('active', btn === active); });
+  };
+  if (navSessions) navSessions.addEventListener('click', function() {
+    markNav(navSessions);
+    state.view = 'sessions';
+    showContinuity(false);
+    setTimeBtnActive(state.since);
+    if (ui.list) ui.list.scrollTop = 0;
+    if (ui.search) ui.search.focus();
+    loadBrowseData();
+  });
+  if (navIntents) navIntents.addEventListener('click', function() {
+    markNav(navIntents);
+    showContinuity(false);
+    setTimeBtnActive(state.intentHours === 0 ? '' : (state.intentHours === 720 ? '30d' : ''));
+    loadIntents();
+  });
+  if (navSetup) navSetup.addEventListener('click', function() {
+    markNav(navSetup);
+    showContinuity(false);
+    const onboard = $('ctx-onboarding');
+    if (onboard) onboard.open = true;
+  });
+
   const boot = () => {
     readUrlState();
     consumeQueryToken();
+    studio();
     const headers = {};
     const t = getToken();
     if (t) headers['Authorization'] = 'Bearer ' + t;
@@ -449,8 +851,21 @@ pub(crate) const DASHBOARD_SERVER_SCRIPT: &str = r#"
       .then(function(r) {
         if (r.status === 401) {
           showLogin();
-          return;
+          return null;
         }
+        return r.json();
+      })
+      .then(function(data) {
+        if (!data) return;
+        applyStatus(data);
+        const host = location.hostname;
+        if (host === '127.0.0.1' || host === 'localhost' || host === '::1') {
+          const access = document.getElementById('ctx-access');
+          if (access) access.textContent = 'This machine. No sign-in.';
+        }
+        const onboard = $('ctx-onboarding');
+        if (onboard && data.survey_required) onboard.open = true;
+        if (data.rebuilding) showCorpusBusy();
         loadBrowseData();
       })
       .catch(function() { loadBrowseData(); });

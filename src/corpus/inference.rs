@@ -8,13 +8,40 @@ use std::time::SystemTime;
 use crate::sanitize;
 
 pub(super) fn infer_agent(path: &Path, content: &str) -> String {
+    let path_text = path
+        .display()
+        .to_string()
+        .replace('\\', "/")
+        .to_ascii_lowercase();
+    let path_is_db = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("db"));
+    // Path only. A `.pb` under the same tree stays on the Gemini legacy path,
+    // and file contents must not steal a store that merely mentions agy.
+    if path_is_db
+        && (path_text.contains("/antigravity-cli/conversations/")
+            || path_text.starts_with("antigravity-cli/conversations/")
+            || path_text.contains("/antigravity/conversations/"))
+    {
+        return "agy".to_string();
+    }
     let haystack = format!(
-        "{} {}",
-        path.display(),
+        "{path_text} {}",
         content.lines().take(20).collect::<String>()
     )
     .to_ascii_lowercase();
+    if haystack.contains("/.omp/")
+        || haystack.contains("/.pi/agent/")
+        || haystack.contains("oh-my-pi")
+        || haystack
+            .split(|ch: char| !ch.is_alphanumeric())
+            .any(|token| token == "omp")
+    {
+        return "omp".to_string();
+    }
     for agent in [
+        "copilot",
         "claude",
         "codex",
         "gemini",
@@ -103,4 +130,32 @@ pub(super) fn derived_markdown_hash(content: &str) -> String {
         hash = hash.wrapping_mul(0x100000001b3);
     }
     format!("fnv1a64:{hash:016x}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn antigravity_conversations_require_sqlite_extension() {
+        for root in [
+            "/home/user/.gemini/antigravity-cli/conversations",
+            "/home/user/.gemini/antigravity/conversations",
+        ] {
+            assert_eq!(infer_agent(&Path::new(root).join("session.db"), ""), "agy");
+            assert_eq!(
+                infer_agent(&Path::new(root).join("session.pb"), ""),
+                "gemini"
+            );
+        }
+    }
+
+    #[test]
+    fn omp_content_matches_a_token_not_component() {
+        assert_eq!(
+            infer_agent(Path::new("report.md"), "Component summary"),
+            "unknown"
+        );
+        assert_eq!(infer_agent(Path::new("report.md"), "agent: omp"), "omp");
+    }
 }

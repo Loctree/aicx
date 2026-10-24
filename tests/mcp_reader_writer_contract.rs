@@ -50,6 +50,31 @@ fn http_service_installer_does_not_take_over_index_maintenance() {
 }
 
 #[test]
+fn default_service_installers_start_reader_only() {
+    for (name, installer) in [
+        ("launchd", include_str!("../tools/install-mcp-service.sh")),
+        (
+            "systemd",
+            include_str!("../tools/install-mcp-service-linux.sh"),
+        ),
+        ("windows", include_str!("../tools/install-mcp-service.ps1")),
+    ] {
+        assert!(
+            installer.contains("--no-auto-refresh"),
+            "{name} installer must keep the long-lived MCP reader-only"
+        );
+        assert!(
+            !installer.contains("--experimental-auto-refresh"),
+            "{name} installer must not enable the embedded writer"
+        );
+        assert!(
+            installer.contains("--no-require-auth"),
+            "{name} loopback installer must preserve the existing auth policy"
+        );
+    }
+}
+
+#[test]
 fn separate_maintenance_process_boundary_remains_available() {
     let maintenance = include_str!("../tools/install-reindex-schedule.sh");
 

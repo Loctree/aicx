@@ -11,7 +11,8 @@ use super::{
     AdapterError, AgentAdapter, ClassifiedDisposition, ClassifiedUnit, RawUnitLevel, sealed,
 };
 use crate::engine::frames::{
-    self, FrameClass, InjectKind, TransportFrame, TransportKind, TransportPayload, TransportRole,
+    self, FrameClass, InjectKind, Retained, ShellExecutor, TransportFrame, TransportKind,
+    TransportPayload, TransportRole,
 };
 use crate::engine::frames_rules;
 use crate::engine::scope_evidence::{
@@ -28,7 +29,7 @@ use crate::engine::{
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
-pub const CODEX_ADAPTER_VERSION: &str = "codex-rollout-v3";
+pub const CODEX_ADAPTER_VERSION: &str = "codex-rollout-v4";
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CodexAdapter;
@@ -434,6 +435,9 @@ struct Assembly<'a> {
     turns: Vec<Turn>,
     tools: Vec<ToolEvent>,
     tool_names: BTreeMap<String, String>,
+    /// `call_id` -> turn of an agent shell call still waiting for its output.
+    /// Call and output are separate records; see `pair_shell_result`.
+    shell_calls: BTreeMap<String, usize>,
     usage: Vec<UsageEvent>,
     skills: Vec<SkillInvocation>,
     warnings: Vec<CoverageWarning>,
@@ -502,6 +506,7 @@ impl<'a> Assembly<'a> {
             turns: Vec::new(),
             tools: Vec::new(),
             tool_names: BTreeMap::new(),
+            shell_calls: BTreeMap::new(),
             usage: Vec::new(),
             skills: Vec::new(),
             warnings: Vec::new(),
@@ -1212,6 +1217,24 @@ impl<'a> Assembly<'a> {
         } else {
             TurnKind::ToolResult
         };
+        // An agent shell call carries its class; the body stays the recorded
+        // arguments, so text hash and canonical fingerprint do not move. The
+        // output record is joined into that class by `call_id`.
+        let shell_class = match kind {
+            ToolEventKind::Call => agent_shell_command(&name, payload)
+                .map(|command| agent_shell_action(command, String::new())),
+            ToolEventKind::Result => {
+                if let Some(call_idx) = correlation_raw
+                    .as_ref()
+                    .and_then(|call_id| self.shell_calls.remove(call_id))
+                {
+                    self.pair_shell_result(call_idx, &body);
+                }
+                None
+            }
+        };
+        let awaits_result = shell_class.is_some();
+        let turns_before = self.turns.len();
         self.push_turn(
             TurnRole::Tool,
             turn_kind,
@@ -1219,8 +1242,14 @@ impl<'a> Assembly<'a> {
             timestamp,
             Known::value(name.clone()),
             evidence.clone(),
-            None,
+            shell_class,
         )?;
+        if awaits_result
+            && self.turns.len() > turns_before
+            && let Some(call_id) = &correlation_raw
+        {
+            self.shell_calls.insert(call_id.clone(), turns_before);
+        }
         let turn_idx = self.turns.len() as u64 - 1;
         self.tools.push(ToolEvent {
             kind,
@@ -1232,6 +1261,23 @@ impl<'a> Assembly<'a> {
             raw_unit_refs: vec![evidence],
         });
         Ok(())
+    }
+
+    /// Join an output record to the agent shell call it answers.
+    ///
+    /// The class minted at the call holds an empty result until its `call_id`
+    /// comes back; outputs of parallel calls need not be adjacent. Then the
+    /// class holds both halves and the output turn stays the class-less
+    /// `ToolResult` twin `fold_shell_results` skips. Only the class changes.
+    fn pair_shell_result(&mut self, call_idx: usize, output: &str) {
+        let Some(call) = self.turns.get_mut(call_idx) else {
+            return;
+        };
+        let cmd = match &call.frame_class {
+            Some(FrameClass::ShellAction { cmd, .. }) => cmd.clone(),
+            _ => return,
+        };
+        call.frame_class = Some(agent_shell_action(cmd, output.to_owned()));
     }
 
     /// Classify a `role=user` message body before it reaches the turn stream.
@@ -1794,6 +1840,95 @@ fn user_shell_command(body: &str) -> Option<&str> {
     let command = body.split_once("<command>")?.1;
     let command = command.split_once("</command>")?.0.trim();
     (!command.is_empty()).then_some(command)
+}
+
+/// The command an agent tool call runs, when the call is a shell execution.
+///
+/// Read verbatim from the record, never re-guessed from the body text:
+/// - `exec` (code-mode `custom_tool_call`): the script in `input` — what
+///   actually ran; the `tools.exec_command` calls inside it stay in it.
+/// - `exec_command`: the `cmd` argument.
+/// - `shell` / `shell_command` / `container.exec`: the `command` argument,
+///   a string or an argv array.
+///
+/// `None` for every other tool (`apply_patch`, `write_stdin`, MCP calls, …)
+/// and for a shell call whose record names no command.
+fn agent_shell_command(name: &str, payload: &Value) -> Option<String> {
+    let command = match name {
+        "exec" => payload
+            .get("input")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        "exec_command" => string_at(&call_arguments(payload)?, &["cmd"]).map(str::to_owned),
+        "shell" | "shell_command" | "container.exec" => {
+            match call_arguments(payload)?.get("command")? {
+                Value::String(command) => Some(command.clone()),
+                Value::Array(argv) => argv_command_line(argv),
+                _ => None,
+            }
+        }
+        _ => None,
+    }?;
+    let command = command.trim();
+    (!command.is_empty()).then(|| command.to_owned())
+}
+
+/// `arguments` as an object: Codex writes them as a JSON string, older
+/// rollouts as an inline object.
+fn call_arguments(payload: &Value) -> Option<Value> {
+    match payload.get("arguments")? {
+        Value::String(raw) => serde_json::from_str(raw).ok(),
+        object @ Value::Object(_) => Some(object.clone()),
+        _ => None,
+    }
+}
+
+/// A recorded argv as one command line, every word kept and quoted where the
+/// shell would split it (`["bash", "-lc", "cargo test"]` ->
+/// `bash -lc 'cargo test'`). No word is dropped: which part is "the command"
+/// is the reader's call, not the parser's.
+fn argv_command_line(argv: &[Value]) -> Option<String> {
+    let words = argv
+        .iter()
+        .map(|word| word.as_str().map(shell_word))
+        .collect::<Option<Vec<_>>>()?;
+    Some(words.join(" "))
+}
+
+fn shell_word(word: &str) -> String {
+    let plain = !word.is_empty()
+        && word.chars().all(|ch| {
+            ch.is_ascii_alphanumeric()
+                || matches!(
+                    ch,
+                    '-' | '_' | '.' | '/' | ':' | '=' | '@' | '%' | '+' | ','
+                )
+        });
+    if plain {
+        word.to_owned()
+    } else {
+        format!("'{}'", word.replace('\'', r"'\''"))
+    }
+}
+
+/// The agent's shell action, built here instead of by `frames::classify`.
+///
+/// Reuse would be wrong: `# codex` turns echo promotion on for the operator's
+/// `<user_shell_command>` echo bus, and the classifier applies that rule per
+/// agent, not per transport. An agent's own `echo …` would come back as
+/// `EchoSeal` — operator speech minted from an agent run. A function or
+/// custom tool call is the agent's tool lane, so the executor is `Agent` by
+/// transport, never by reading the command.
+fn agent_shell_action(cmd: String, result: String) -> FrameClass {
+    FrameClass::ShellAction {
+        cmd,
+        result: Retained {
+            chars: result.chars().count() as u64,
+            hash: sha256_hex(result.as_bytes()),
+            text: result,
+        },
+        executor: ShellExecutor::Agent,
+    }
 }
 
 fn shell_action_marker(command: &str) -> String {

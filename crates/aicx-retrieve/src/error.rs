@@ -16,6 +16,9 @@ pub enum RetrieveError {
     #[error("dense count mismatch: expected {expected}, got {actual}")]
     DenseCountMismatch { expected: usize, actual: usize },
 
+    #[error("source chunk count mismatch: expected {expected}, got {actual}")]
+    SourceChunkCountMismatch { expected: usize, actual: usize },
+
     #[error("lexical document count mismatch: expected {expected}, got {actual}")]
     LexicalDocCountMismatch { expected: usize, actual: usize },
 

@@ -3,13 +3,50 @@ use filetime::{FileTime, set_file_mtime};
 use std::fs;
 
 #[test]
+fn intents_since_is_a_lower_bound_and_until_is_preserved() {
+    let filters = RetrievalFilters {
+        limit: None,
+        sort: None,
+        score: None,
+        agent: None,
+        since: Some("2026-10-01".into()),
+        until: None,
+        frame_kind: None,
+    };
+    assert_eq!(
+        intent_date_bounds(&filters).unwrap(),
+        (Some("2026-10-01".into()), None)
+    );
+    let bounded = RetrievalFilters {
+        until: Some("2026-10-06".into()),
+        ..filters.clone()
+    };
+    assert_eq!(
+        intent_date_bounds(&bounded).unwrap(),
+        (Some("2026-10-01".into()), Some("2026-10-06".into()))
+    );
+    let range = RetrievalFilters {
+        since: Some("2026-10-01..2026-10-03".into()),
+        ..filters
+    };
+    assert_eq!(
+        intent_date_bounds(&range).unwrap(),
+        (Some("2026-10-01".into()), Some("2026-10-03".into()))
+    );
+    assert_eq!(
+        parse_date_filter("2026-10-01").unwrap(),
+        (Some("2026-10-01".into()), Some("2026-10-01".into()))
+    );
+}
+
+#[test]
 fn intents_pack_report_carries_header_level_honesty_notice() {
     // B2: the default `aicx intents` text surface is the pack report; its
     // header metadata must carry the honesty frame so a weeks-old INTENT
     // never reads like current runtime truth.
     let sections: Vec<IntentPackSection> = Vec::new();
 
-    let out = format_intents_pack_markdown("(all projects)", 720, Some(10), &sections);
+    let out = format_intents_pack_markdown("(all projects)", 720, Some(10), &sections, false);
 
     assert!(
         out.contains("- claims: historical @ session close · not verified by aicx\n"),
@@ -33,6 +70,7 @@ fn default_intents_markdown_uses_pack_report() {
         IntentPackSection {
             title: "Decisions",
             records: vec![intents::IntentRecord {
+                provenance: None,
                 kind: intents::IntentKind::Decision,
                 summary: "ship public seed only after privacy scrub".to_string(),
                 context: None,
@@ -68,7 +106,7 @@ fn default_intents_markdown_uses_pack_report() {
         },
     ];
 
-    let markdown = format_intents_pack_markdown("Loctree/aicx", 168, Some(20), &sections);
+    let markdown = format_intents_pack_markdown("Loctree/aicx", 168, Some(20), &sections, false);
 
     assert!(markdown.starts_with("# Intent Report"));
     assert!(markdown.contains("- per_section_limit: 20"));
@@ -355,6 +393,9 @@ fn watermark_coverage_follows_the_recording_key_agents() {
         "grok",
         "kimi",
         "cursor",
+        "copilot",
+        "omp",
+        "agy",
         "codescribe",
     ];
     let project = Vec::new();
@@ -384,6 +425,27 @@ fn watermark_coverage_follows_the_recording_key_agents() {
     assert!(covered.contains("kimi"));
     assert!(!covered.contains("cursor"));
 
+    // The previous all composition covers Cursor but never the new Copilot history.
+    let mut state = StateManager::default();
+    state.update_watermark(&format!("{CURSOR_ALL_WATERMARK_KEY}:all"), Utc::now());
+    let covered = watermark_covered_agents(&state, &key, &aliases);
+    assert!(covered.contains("cursor"));
+    assert!(!covered.contains("copilot"));
+
+    // The copilot-aware composition covers Copilot but never omp history.
+    let mut state = StateManager::default();
+    state.update_watermark(&format!("{COPILOT_ALL_WATERMARK_KEY}:all"), Utc::now());
+    let covered = watermark_covered_agents(&state, &key, &aliases);
+    assert!(covered.contains("copilot"));
+    assert!(!covered.contains("omp"));
+
+    // The omp-aware composition covers omp but never agy history.
+    let mut state = StateManager::default();
+    state.update_watermark(&format!("{OMP_ALL_WATERMARK_KEY}:all"), Utc::now());
+    let covered = watermark_covered_agents(&state, &key, &aliases);
+    assert!(covered.contains("omp"));
+    assert!(!covered.contains("agy"));
+
     // Once the canonical key itself holds a watermark (a run of the current
     // composition recorded it), every requested agent is covered.
     let mut state = StateManager::default();
@@ -391,6 +453,9 @@ fn watermark_coverage_follows_the_recording_key_agents() {
     let covered = watermark_covered_agents(&state, &key, &aliases);
     assert!(covered.contains("kimi"));
     assert!(covered.contains("cursor"));
+    assert!(covered.contains("copilot"));
+    assert!(covered.contains("omp"));
+    assert!(covered.contains("agy"));
     assert_eq!(covered.len(), agents.len());
 }
 
@@ -406,6 +471,9 @@ fn watermark_coverage_unions_alias_generations() {
         "grok",
         "kimi",
         "cursor",
+        "copilot",
+        "omp",
+        "agy",
         "codescribe",
     ];
     let project = Vec::new();
@@ -736,6 +804,30 @@ fn sessions_current_command_parses_json_flag() {
 }
 
 #[test]
+fn dashboard_preview_chars_defaults_to_result_body_constant() {
+    let cli = Cli::try_parse_from(["aicx", "dashboard", "--serve"]).expect("dashboard");
+    match cli.command {
+        Some(Commands::Dashboard(args)) => {
+            assert_eq!(
+                args.preview_chars,
+                aicx::result_format::RESULT_BODY_PREVIEW_CHARS
+            );
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+    let cli = Cli::try_parse_from(["aicx", "dashboard-serve"]).expect("legacy");
+    match cli.command {
+        Some(Commands::DashboardServeLegacy(args)) => {
+            assert_eq!(
+                args.preview_chars,
+                aicx::result_format::RESULT_BODY_PREVIEW_CHARS
+            );
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+#[test]
 fn retrieval_limit_is_a_true_option_so_explicit_ten_is_honored() {
     // P2-11: `--limit 10` used to collide with the default sentinel and
     // silently meant "no limit" for intents. Now omission is None and an
@@ -911,6 +1003,7 @@ fn intents_project_resolver_uses_catalog_without_legacy_cards() {
         source_path: root.join("source.jsonl").display().to_string(),
         source_len: None,
         source_mtime_ns: None,
+        source_bundle_fingerprint: None,
         title: None,
         machine: None,
         logical_session_id: None,
@@ -974,6 +1067,7 @@ fn intents_project_resolver_exact_and_fuzzy_modes_are_separate() {
         identity_source: intents::PERSISTED_IDENTITY_SOURCE.to_string(),
         path_heuristic_records: 0,
         live_sessions: 0,
+        legacy_scope_unproven: 0,
         mixed_scope_sessions: 0,
         unplaced_frames: 0,
     };
@@ -1950,6 +2044,19 @@ fn intents_accepts_frame_kind_filter() {
 }
 
 #[test]
+fn intents_accepts_explicit_full_rescan() {
+    let cli = Cli::try_parse_from(["aicx", "intents", "--full-rescan"])
+        .expect("intents command with full-rescan should parse");
+
+    match cli.command {
+        Some(Commands::Intents {
+            full_rescan: true, ..
+        }) => {}
+        _ => panic!("expected intents full-rescan command"),
+    }
+}
+
+#[test]
 fn rank_subcommand_is_rejected() {
     let err = Cli::try_parse_from(["aicx", "rank", "-p", "foo"])
         .expect_err("rank subcommand should be rejected");
@@ -2147,6 +2254,11 @@ fn serve_help_prefers_http_name_and_stays_compact() {
     let rendered = serve.render_long_help().to_string();
 
     assert!(rendered.contains("Transport: stdio (default) or http."));
+    assert!(
+        rendered.contains("dashboard at /"),
+        "serve help names the hybrid dashboard route"
+    );
+    assert!(rendered.contains("MCP at /mcp"));
     assert!(rendered.contains("--host <HOST>"));
     assert!(rendered.contains("Bind address for streamable HTTP transport"));
     assert!(rendered.contains("--allowed-host <HOST>"));
@@ -2265,6 +2377,7 @@ fn top_level_help_lists_daily_drivers_only() {
     // The one rebuild command and the reader are the front door.
     assert!(rendered.contains("\n  index "));
     assert!(rendered.contains("\n  search "));
+    assert!(rendered.contains("\n  utterances "));
     assert!(rendered.contains("aicx index                 # census + incremental parse + publish"));
     assert!(!rendered.contains("aicx catalog rebuild"));
 
@@ -2285,6 +2398,10 @@ fn top_level_help_lists_daily_drivers_only() {
     }
     assert!(!rendered.contains("dashboard-serve"));
     assert!(!rendered.contains("reports-extractor"));
+    assert!(
+        rendered.contains("dashboard onboarding"),
+        "short help points at onboarding without listing the hidden command"
+    );
 }
 
 #[test]
@@ -2297,6 +2414,7 @@ fn help_full_reveals_power_user_commands_but_never_legacy_spellings() {
         "dashboard",
         "reports",
         "intents",
+        "utterances",
         "migrate",
         "index",
         "search",
@@ -2772,6 +2890,15 @@ fn extract_every_agent_subcommand_parses() {
         ("grok", ExtractAgent::Grok),
         ("junie", ExtractAgent::Junie),
         ("kimi", ExtractAgent::Kimi),
+        ("copilot", ExtractAgent::Copilot),
+        ("copilot-cli", ExtractAgent::Copilot),
+        ("github-copilot", ExtractAgent::Copilot),
+        ("omp", ExtractAgent::Omp),
+        ("pi", ExtractAgent::Omp),
+        ("oh-my-pi", ExtractAgent::Omp),
+        ("agy", ExtractAgent::Agy),
+        ("antigravity", ExtractAgent::Agy),
+        ("antigravity-cli", ExtractAgent::Agy),
     ] {
         let cli = Cli::try_parse_from(["aicx", "extract", name, "--session", "abc12345"])
             .unwrap_or_else(|error| panic!("agent subcommand `{name}` must parse: {error}"));
@@ -2809,7 +2936,9 @@ fn extract_help_hides_removed_flag_grammar() {
         .find_subcommand_mut("extract")
         .expect("extract subcommand should exist");
     let rendered = extract.render_long_help().to_string();
-    for agent in ["codex", "claude", "gemini", "grok", "junie", "kimi"] {
+    for agent in [
+        "codex", "claude", "gemini", "grok", "junie", "kimi", "omp", "agy",
+    ] {
         assert!(
             rendered.contains(agent),
             "extract --help must list the `{agent}` subcommand"
@@ -2882,18 +3011,38 @@ fn conversations_accepts_claude_agent_and_out_dir() {
 }
 
 #[test]
-fn conversations_rejects_non_claude_agent_for_v1() {
-    let err = Cli::try_parse_from([
-        "aicx",
-        "conversations",
-        "--agent",
+fn conversations_accepts_registered_providers_and_aliases() {
+    for agent in [
+        "claude",
         "codex",
-        "--out-dir",
-        "/tmp/aicx-conversations",
-    ])
-    .expect_err("conversations v1 should reject non-claude agents");
-
-    assert!(err.to_string().contains("possible values"));
+        "gemini",
+        "grok",
+        "junie",
+        "kimi",
+        "cursor",
+        "copilot",
+        "copilot-cli",
+        "omp",
+        "pi",
+        "oh-my-pi",
+        "agy",
+        "antigravity",
+        "antigravity-cli",
+    ] {
+        let cli = Cli::try_parse_from([
+            "aicx",
+            "conversations",
+            "--agent",
+            agent,
+            "--out-dir",
+            "/tmp/aicx-conversations",
+        ])
+        .unwrap();
+        let Some(Commands::Conversations { agent: parsed, .. }) = cli.command else {
+            panic!("conversations command expected")
+        };
+        assert!(aicx::session_catalog::AgentKind::parse(&parsed).is_some());
+    }
 }
 
 #[test]

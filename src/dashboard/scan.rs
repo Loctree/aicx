@@ -18,7 +18,49 @@ const MAX_JSON_PARSE_BYTES: u64 = 8 * 1024 * 1024;
 const SEARCH_READ_BYTES: u64 = 256 * 1024;
 const MAX_SEARCH_TEXT_CHARS: usize = 12_000;
 const MAX_DETAIL_CHARS: usize = 32_000;
-type ConversationPreview = (Option<usize>, String, String, String, Option<i64>);
+/// Newest readable sessions kept on the dashboard list. The semantic search
+/// still covers the whole catalog; opening the port must not wait on every file.
+const DASHBOARD_LIST_CAP: usize = 400;
+const DASHBOARD_READ_BUDGET: usize = 800;
+
+struct NotePreview {
+    entry_count: Option<usize>,
+    preview: String,
+    body_chars_total: usize,
+    body_truncated: bool,
+    search_excerpt: String,
+    detail_text: String,
+    sort_ts: Option<i64>,
+}
+
+fn cut_osnowa(text: &str, max_chars: usize) -> (String, usize, bool) {
+    let cut = crate::result_format::cut_result_body(text, max_chars);
+    (cut.body, cut.body_chars_total, cut.body_truncated)
+}
+
+fn note_preview(
+    entry_count: Option<usize>,
+    source: &str,
+    max_chars: usize,
+    search_excerpt: String,
+    detail_text: String,
+    sort_ts: Option<i64>,
+) -> NotePreview {
+    let (preview, body_chars_total, body_truncated) = cut_osnowa(source, max_chars);
+    NotePreview {
+        entry_count,
+        preview,
+        body_chars_total,
+        body_truncated,
+        search_excerpt,
+        detail_text,
+        sort_ts,
+    }
+}
+
+fn record_header(project: &str, agent: &str, kind: &str, date: &str, session_id: &str) -> String {
+    crate::result_format::result_header(project, agent, kind, date, None, session_id)
+}
 
 pub(super) fn scan_legacy_archive(
     aicx_home: &Path,
@@ -102,8 +144,11 @@ pub(super) fn scan_legacy_archive(
             .and_then(|name| name.to_str())
             .unwrap_or("unknown-file")
             .to_string();
-        let (entry_count, preview, search_excerpt, detail_text, content_sort_ts) =
+        let note =
             read_preview_and_search_excerpt(&file_path, &extension, metadata.len(), preview_chars);
+        let entry_count = note.entry_count;
+        let search_excerpt = note.search_excerpt;
+        let content_sort_ts = note.sort_ts;
 
         let modified = metadata.modified().ok();
         let modified_utc = format_modified_utc(modified);
@@ -140,6 +185,13 @@ pub(super) fn scan_legacy_archive(
         projects.insert(stored_file.project.clone());
         agents.insert(stored_file.agent.clone());
         kinds.insert(stored_file.kind.dir_name().to_string());
+        let header = record_header(
+            &stored_file.project,
+            &stored_file.agent,
+            stored_file.kind.dir_name(),
+            &stored_file.date_iso,
+            "",
+        );
 
         let record = DashboardRecord {
             id: records.len() + 1,
@@ -157,9 +209,14 @@ pub(super) fn scan_legacy_archive(
             modified_utc,
             sort_ts,
             entry_count,
-            preview,
+            preview: note.preview.clone(),
             search_blob,
-            detail_text,
+            detail_text: note.detail_text,
+            session_id: String::new(),
+            header,
+            body_chars_total: note.body_chars_total,
+            body_truncated: note.body_truncated,
+            catalog_entry: None,
         };
 
         stats.total_files += 1;
@@ -270,7 +327,20 @@ fn scan_catalog_sessions(
     let mut kinds = BTreeSet::new();
     kinds.insert("session".to_string());
 
-    for entry in by_key.into_values() {
+    let mut candidates: Vec<_> = by_key.into_values().collect();
+    let catalog_sessions = candidates.len();
+    candidates.sort_by(|left, right| {
+        right
+            .source_mtime_ns
+            .unwrap_or(0)
+            .cmp(&left.source_mtime_ns.unwrap_or(0))
+            .then_with(|| right.date.cmp(&left.date))
+    });
+    let mut attempts = 0usize;
+    for entry in candidates {
+        if records.len() >= DASHBOARD_LIST_CAP || attempts >= DASHBOARD_READ_BUDGET {
+            break;
+        }
         let project = entry
             .project
             .clone()
@@ -300,17 +370,15 @@ fn scan_catalog_sessions(
             .and_then(|ext| ext.to_str())
             .unwrap_or("log")
             .to_ascii_lowercase();
-        let (entry_count, preview, search_excerpt, detail_text, content_sort_ts) =
-            read_catalog_conversation_preview(aicx_home, &entry, preview_chars).unwrap_or_else(
-                || {
-                    read_preview_and_search_excerpt(
-                        &path,
-                        &extension,
-                        metadata.len(),
-                        preview_chars,
-                    )
-                },
-            );
+        // A catalog row is a session. If the conversation reader cannot produce
+        // a readable turn, leave the raw jsonl out of the default list.
+        attempts += 1;
+        let Some(note) = read_catalog_conversation_preview(aicx_home, &entry, preview_chars) else {
+            continue;
+        };
+        let entry_count = note.entry_count;
+        let search_excerpt = note.search_excerpt;
+        let content_sort_ts = note.sort_ts;
         // Source modification time is the durable signal that a live session
         // changed. Some providers preserve stale or malformed frame timestamps,
         // so letting content time win can bury the hottest session.
@@ -343,10 +411,11 @@ fn scan_catalog_sessions(
         stats.fuzzy_index_chars += search_blob.len();
         stats.total_bytes += metadata.len();
         stats.total_entries_estimate += entry_count.unwrap_or(0);
+        let header = record_header(&project, &entry.agent, "session", &date, &entry.session_id);
         records.push(DashboardRecord {
             id: 0,
             project,
-            agent: entry.agent,
+            agent: entry.agent.clone(),
             date,
             time,
             kind: "session".to_string(),
@@ -359,9 +428,14 @@ fn scan_catalog_sessions(
             modified_utc: format_modified_utc(modified),
             sort_ts,
             entry_count,
-            preview,
+            preview: note.preview,
             search_blob,
-            detail_text,
+            detail_text: note.detail_text,
+            session_id: entry.session_id.clone(),
+            header,
+            body_chars_total: note.body_chars_total,
+            body_truncated: note.body_truncated,
+            catalog_entry: Some(entry.clone()),
         });
     }
 
@@ -388,8 +462,8 @@ fn scan_catalog_sessions(
         .join("hybrid")
         .is_dir();
     assumptions.push(format!(
-        "Rendered {} current session source(s) across {} exact project bucket(s).",
-        stats.total_files, stats.total_projects
+        "Showing the newest {} readable session(s) from {} catalog session(s) across {} project(s). Search covers the whole corpus. Rules, tool payloads, and empty epoch stamps stay out of the list.",
+        stats.total_files, catalog_sessions, stats.total_projects
     ));
 
     Ok(ScanResult {
@@ -406,34 +480,180 @@ fn scan_catalog_sessions(
     })
 }
 
+/// Tags whose bodies are harness boilerplate, not something an operator reads.
+const DASHBOARD_POLLUTION_TAGS: &[&str] = &[
+    "rules",
+    "always_applied_workspace_rules",
+    "always_applied_workspace_rule",
+    "user_rules",
+    "agent_requestable_workspace_rules",
+    "agent_requestable_workspace_rule",
+    "user_info",
+    "git_status",
+    "agent_skills",
+    "agent_skill",
+    "system-reminder",
+    "open_and_recently_viewed_files",
+    "communication",
+    "mcp_instructions",
+];
+
+/// Readable default when `--preview-chars 0` would otherwise dump the whole turn.
+const READABLE_PREVIEW_CHARS: usize = 1_600;
+
+/// A stamp at or before the first Unix day is an empty epoch, not a session time.
+fn is_empty_epoch(timestamp: DateTime<Utc>) -> bool {
+    timestamp.timestamp() < 86_400
+}
+
+pub(super) fn strip_dashboard_pollution(message: &str) -> String {
+    let mut cleaned = message.to_string();
+    for tag in DASHBOARD_POLLUTION_TAGS {
+        cleaned = strip_tag_blocks(&cleaned, tag);
+    }
+    cleaned
+        .replace("<user_query>", "")
+        .replace("</user_query>", "")
+        .trim()
+        .to_string()
+}
+
+fn strip_tag_blocks(input: &str, tag: &str) -> String {
+    let open_prefix = format!("<{tag}");
+    let close = format!("</{tag}>");
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    loop {
+        let Some(start) = rest.find(&open_prefix) else {
+            out.push_str(rest);
+            break;
+        };
+        let after = &rest[start + open_prefix.len()..];
+        let is_tag = after.starts_with('>')
+            || after.starts_with('/')
+            || after.starts_with(|ch: char| ch.is_whitespace());
+        if !is_tag {
+            out.push_str(&rest[..start + 1]);
+            rest = &rest[start + 1..];
+            continue;
+        }
+        out.push_str(&rest[..start]);
+        if let Some(end_rel) = rest[start..].find(&close) {
+            rest = &rest[start + end_rel + close.len()..];
+        } else {
+            out.push_str(&rest[start..]);
+            break;
+        }
+    }
+    out
+}
+
+fn is_dashboard_noise_turn(message: &str) -> bool {
+    let head = message.trim_start();
+    if head.is_empty() {
+        return true;
+    }
+    if head.starts_with("Briefly inform the user about the task result") {
+        return true;
+    }
+    // Tool payloads that survived the signal filter still read as raw logs.
+    head.starts_with('{') && (head.contains("\"type\"") || head.contains("\"tool"))
+}
+
+/// One readable `[stamp] role: message` line, or `None` for dashboard noise.
+fn readable_turn(frame: &crate::extraction::TimelineEntry) -> Option<String> {
+    let message = strip_dashboard_pollution(&frame.message);
+    if is_dashboard_noise_turn(&message) {
+        return None;
+    }
+    let role = if frame.role == "user" {
+        "user"
+    } else {
+        "assistant"
+    };
+    let stamp = if is_empty_epoch(frame.timestamp) {
+        String::new()
+    } else {
+        format!("[{}] ", frame.timestamp.format("%Y-%m-%d %H:%M:%S"))
+    };
+    Some(format!("{stamp}{role}: {message}"))
+}
+
+/// The whole readable conversation of one catalog session, for Expand.
+///
+/// The scan keeps only a bounded detail per record so the list stays cheap;
+/// this reads the source again on demand without the turn or character caps.
+pub(crate) fn read_catalog_conversation_full(
+    aicx_home: &Path,
+    entry: &crate::catalog::CatalogEntry,
+) -> Option<String> {
+    let (_, frames, _scope) =
+        crate::source_index::read_catalog_conversation_at(aicx_home, entry).ok()?;
+    let turns: Vec<String> = frames.iter().filter_map(readable_turn).collect();
+    if turns.is_empty() {
+        return None;
+    }
+    Some(turns.join("\n\n"))
+}
+
 fn read_catalog_conversation_preview(
     aicx_home: &Path,
     entry: &crate::catalog::CatalogEntry,
     preview_chars: usize,
-) -> Option<ConversationPreview> {
+) -> Option<NotePreview> {
     let (_, frames, _scope) =
         crate::source_index::read_catalog_conversation_at(aicx_home, entry).ok()?;
     if frames.is_empty() {
         return None;
     }
-    let mut conversation = String::new();
+
+    let mut turns: Vec<String> = Vec::new();
     for frame in &frames {
-        conversation.push_str(&format!(
-            "[{}] {}: {}\n\n",
-            frame.timestamp.format("%Y-%m-%d %H:%M:%S"),
-            frame.role,
-            frame.message.trim()
-        ));
-        if conversation.chars().count() >= MAX_DETAIL_CHARS {
+        let Some(turn) = readable_turn(frame) else {
+            continue;
+        };
+        turns.push(turn);
+        if turns.len() >= 80 {
             break;
         }
     }
-    let detail = trim_chars(&conversation, MAX_DETAIL_CHARS);
-    let collapsed = collapse_ws(&conversation);
-    let preview = trim_chars(&collapsed, preview_chars);
-    let search_excerpt = trim_chars(&collapsed, MAX_SEARCH_TEXT_CHARS);
-    let sort_ts = frames.last().map(|frame| frame.timestamp.timestamp());
-    Some((Some(frames.len()), preview, search_excerpt, detail, sort_ts))
+    if turns.is_empty() {
+        return None;
+    }
+
+    let mut conversation = String::new();
+    for line in &turns {
+        if conversation.chars().count() >= MAX_DETAIL_CHARS {
+            break;
+        }
+        conversation.push_str(line.trim());
+        conversation.push_str("\n\n");
+    }
+    let detail = trim_chars(conversation.trim(), MAX_DETAIL_CHARS);
+    if detail.trim().is_empty() {
+        return None;
+    }
+
+    let preview_cap = if preview_chars == 0 {
+        READABLE_PREVIEW_CHARS
+    } else {
+        preview_chars
+    };
+    let search_excerpt = trim_chars(&collapse_ws(&conversation), MAX_SEARCH_TEXT_CHARS);
+    let sort_ts = frames
+        .iter()
+        .rev()
+        .find(|frame| !is_empty_epoch(frame.timestamp))
+        .or_else(|| frames.last())
+        .map(|frame| frame.timestamp.timestamp());
+    Some(note_preview(
+        Some(turns.len()),
+        conversation.trim(),
+        preview_cap,
+        search_excerpt,
+        detail,
+        sort_ts,
+    ))
 }
 
 fn supported_note_extension(ext: &str) -> bool {
@@ -455,45 +675,45 @@ fn read_preview_and_search_excerpt(
     extension: &str,
     size: u64,
     preview_chars: usize,
-) -> (Option<usize>, String, String, String, Option<i64>) {
+) -> NotePreview {
     if extension == "json" {
         return read_json_preview_and_search(path, size, preview_chars);
     }
 
     let raw = read_text_limited(path, SEARCH_READ_BYTES);
     if raw.is_empty() {
-        return (None, "".to_string(), "".to_string(), "".to_string(), None);
+        return note_preview(None, "", preview_chars, String::new(), String::new(), None);
     }
 
     let detail = trim_chars(&sanitize_detail_text(&raw), MAX_DETAIL_CHARS);
     let collapsed = collapse_ws(&raw);
-    let preview = trim_chars(&collapsed, preview_chars);
     let search_excerpt = trim_chars(&collapsed, MAX_SEARCH_TEXT_CHARS);
     let sort_ts = extract_latest_timestamp_from_text(&raw);
 
-    (None, preview, search_excerpt, detail, sort_ts)
+    note_preview(
+        None,
+        &collapsed,
+        preview_chars,
+        search_excerpt,
+        detail,
+        sort_ts,
+    )
 }
 
-fn read_json_preview_and_search(
-    path: &Path,
-    size: u64,
-    max_preview_chars: usize,
-) -> (Option<usize>, String, String, String, Option<i64>) {
+fn read_json_preview_and_search(path: &Path, size: u64, max_preview_chars: usize) -> NotePreview {
     if size > MAX_JSON_PARSE_BYTES {
         let raw = read_text_limited(path, SEARCH_READ_BYTES);
         let collapsed = collapse_ws(&raw);
-        let preview = trim_chars(
-            &format!(
-                "JSON file too large to parse structurally; using raw excerpt ({}). {}",
-                human_size(size),
-                trim_chars(&collapsed, max_preview_chars)
-            ),
-            max_preview_chars,
+        let source = format!(
+            "JSON file too large to parse structurally; using raw excerpt ({}). {}",
+            human_size(size),
+            trim_chars(&collapsed, max_preview_chars)
         );
         let detail = trim_chars(&sanitize_detail_text(&raw), MAX_DETAIL_CHARS);
-        return (
+        return note_preview(
             None,
-            preview,
+            &source,
+            max_preview_chars,
             trim_chars(&collapsed, MAX_SEARCH_TEXT_CHARS),
             detail,
             None,
@@ -503,11 +723,12 @@ fn read_json_preview_and_search(
     let bytes = match fs::read(path) {
         Ok(v) => v,
         Err(_) => {
-            return (
+            return note_preview(
                 None,
-                "Failed to read JSON preview.".to_string(),
-                "".to_string(),
-                "".to_string(),
+                "Failed to read JSON preview.",
+                max_preview_chars,
+                String::new(),
+                String::new(),
                 None,
             );
         }
@@ -518,9 +739,10 @@ fn read_json_preview_and_search(
         Err(_) => {
             let raw = String::from_utf8_lossy(&bytes).to_string();
             let collapsed = collapse_ws(&raw);
-            return (
+            return note_preview(
                 None,
-                trim_chars(&collapsed, max_preview_chars),
+                &collapsed,
+                max_preview_chars,
                 trim_chars(&collapsed, MAX_SEARCH_TEXT_CHARS),
                 trim_chars(&sanitize_detail_text(&raw), MAX_DETAIL_CHARS),
                 None,
@@ -541,13 +763,10 @@ fn read_json_preview_and_search(
     );
 
     let collapsed = collapse_ws(&strings.join(" | "));
-    let preview = if collapsed.is_empty() {
-        trim_chars(
-            "JSON payload parsed but no string fields were found.",
-            max_preview_chars,
-        )
+    let source = if collapsed.is_empty() {
+        "JSON payload parsed but no string fields were found.".to_string()
     } else {
-        trim_chars(&collapsed, max_preview_chars)
+        collapsed.clone()
     };
     let search_excerpt = trim_chars(&collapsed, MAX_SEARCH_TEXT_CHARS);
 
@@ -555,7 +774,14 @@ fn read_json_preview_and_search(
     let detail = trim_chars(&sanitize_detail_text(&pretty), MAX_DETAIL_CHARS);
     let sort_ts = extract_latest_timestamp_from_json(&value);
 
-    (entry_count, preview, search_excerpt, detail, sort_ts)
+    note_preview(
+        entry_count,
+        &source,
+        max_preview_chars,
+        search_excerpt,
+        detail,
+        sort_ts,
+    )
 }
 
 pub(super) fn collect_json_strings(
@@ -744,5 +970,28 @@ fn human_size(bytes: u64) -> String {
         format!("{:.1} KB", b / KB)
     } else {
         format!("{} B", bytes)
+    }
+}
+
+#[cfg(test)]
+mod pollution_tests {
+    use super::strip_dashboard_pollution;
+
+    #[test]
+    fn preserves_wrapped_operator_ask() {
+        assert_eq!(
+            strip_dashboard_pollution(
+                "<rules>boilerplate</rules>\n<user_query>Fix the failing test.</user_query>"
+            ),
+            "Fix the failing test."
+        );
+    }
+
+    #[test]
+    fn unmatched_pollution_tag_preserves_remainder() {
+        assert_eq!(
+            strip_dashboard_pollution("Keep this. <rules>Unclosed, but keep the actual ask."),
+            "Keep this. <rules>Unclosed, but keep the actual ask."
+        );
     }
 }

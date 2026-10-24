@@ -20,6 +20,8 @@ pub const BUILD_VERSION: &str = env!("AICX_BUILD_VERSION");
 pub const GIT_COMMIT: &str = env!("AICX_GIT_COMMIT");
 pub const GIT_DIRTY: bool = env!("AICX_GIT_DIRTY").as_bytes()[0] == b'1';
 
+#[cfg(feature = "app")]
+pub mod agy_store;
 pub mod aicx_home;
 pub mod api;
 #[cfg(feature = "app")]
@@ -76,6 +78,12 @@ pub mod mcp;
 #[cfg(feature = "app")]
 pub mod mcp_session;
 #[cfg(feature = "app")]
+pub mod onboarding;
+/// OPEN WORK for the continuity pack: local branches whose commits the
+/// checkout's HEAD lacks by patch identity (read-only local git, bounded).
+#[cfg(feature = "app")]
+pub mod open_work;
+#[cfg(feature = "app")]
 pub mod oracle;
 #[cfg(not(feature = "app"))]
 #[allow(dead_code)]
@@ -95,6 +103,7 @@ pub mod rank;
 pub mod redact;
 #[cfg(feature = "app")]
 pub mod reports_extractor;
+pub mod result_format;
 #[cfg(feature = "app")]
 pub mod search_engine;
 #[cfg(feature = "app")]
@@ -102,7 +111,6 @@ pub mod search_eval;
 /// Deterministic locate-before-parse session catalog (C1L line). Registered
 /// here for the CLI extraction dispatch; final shared runtime wiring stays
 /// with the C5X cut.
-#[cfg(feature = "app")]
 pub mod session_catalog;
 pub mod sessions;
 #[cfg(feature = "app")]
@@ -120,6 +128,8 @@ pub mod state;
 pub mod steer_index;
 #[cfg(feature = "app")]
 mod steer_index_contract;
+#[cfg(feature = "app")]
+pub mod utterances;
 mod uuid_shape;
 #[cfg(feature = "app")]
 pub mod validation;

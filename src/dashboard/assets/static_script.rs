@@ -39,6 +39,8 @@ pub(crate) const DASHBOARD_SCRIPT: &str = r#"
     onSelect: [],
   };
 
+  ui.expand = document.getElementById('ctx-expand');
+
   const state = {
     query: '',
     queryRaw: '',
@@ -49,6 +51,23 @@ pub(crate) const DASHBOARD_SCRIPT: &str = r#"
     selectedId: null,
     rows: [],
     selectedRecord: null,
+    expanded: false,
+  };
+
+  const resultFormat = window.AICX_RESULT_FORMAT || {};
+  const listSnippetChars = Number(resultFormat.listSnippetChars) || 0;
+  const listSnippet = (text) => {
+    const value = text || '';
+    if (listSnippetChars > 0 && value.length > listSnippetChars) return value.slice(0, listSnippetChars) + '\u2026';
+    return value;
+  };
+  const resultHeader = (record, score) => {
+    if (record.header && !(score > 0)) return record.header;
+    const parts = [record.project, record.agent, record.kind, record.date].filter(Boolean);
+    if (score > 0) parts.push(String(score));
+    const session = record.session_id ? String(record.session_id).slice(0, 8) : '';
+    if (session) parts.push(session);
+    return parts.join(' \u00b7 ');
   };
 
   const normalizeText = (text) => {
@@ -246,15 +265,17 @@ pub(crate) const DASHBOARD_SCRIPT: &str = r#"
       return;
     }
 
+    state.expanded = false;
+    if (ui.expand) ui.expand.textContent = 'Expand';
     const detailTitle = record.file_name || '(unnamed file)';
-    const detailMeta = `${record.project || 'unknown'} | ${record.agent || 'unknown'} | ${record.kind || 'unknown'} | score ${Math.round(Number(score || 0) * 100)}/100`;
+    const detailMeta = resultHeader(record, Math.round(Number(score || 0) * 100));
     const detailPath = record.absolute_path || record.relative_path || '';
     ui.detailTitle.innerHTML = highlightTerms(detailTitle, highlightQuery());
     ui.detailMeta.innerHTML = highlightTerms(detailMeta, highlightQuery());
     ui.detailPath.innerHTML = highlightTerms(detailPath, highlightQuery());
     ui.detailPreview.innerHTML = highlightTerms(record.preview || '', highlightQuery());
     ui.detailContent.innerHTML =
-      highlightTerms(record.detail_text || record.preview || '(no content)', highlightQuery());
+      highlightTerms(record.preview || record.detail_text || '(no content)', highlightQuery());
   };
 
   const mkBadge = (txt) => {
@@ -270,7 +291,7 @@ pub(crate) const DASHBOARD_SCRIPT: &str = r#"
     if (!rows.length) {
       const empty = document.createElement('div');
       empty.className = 'empty';
-      empty.textContent = 'No records match current query/filters.';
+      empty.textContent = state.query ? 'No sessions match this search.' : 'No sessions in this corpus.';
       ui.list.appendChild(empty);
       renderDetail(null, 0);
       return;
@@ -306,7 +327,8 @@ pub(crate) const DASHBOARD_SCRIPT: &str = r#"
       if (state.query && record.preview) {
         const preview = document.createElement('div');
         preview.className = 'result-preview';
-        preview.innerHTML = highlightTerms(record.preview, highlightQuery());
+        const listText = listSnippet(record.preview);
+        preview.innerHTML = highlightTerms(listText, highlightQuery());
         item.appendChild(preview);
       }
 
@@ -394,6 +416,19 @@ pub(crate) const DASHBOARD_SCRIPT: &str = r#"
 
   liveCheckbox.addEventListener('change', () => {
     if (liveCheckbox.checked) scheduleRefresh();
+  });
+
+  if (ui.expand) ui.expand.addEventListener('click', () => {
+    const record = state.selectedRecord;
+    if (!record) return;
+    if (state.expanded) {
+      const selected = state.rows.find((row) => row.record.id === state.selectedId);
+      renderDetail(record, selected ? selected.score : 0);
+      return;
+    }
+    state.expanded = true;
+    ui.expand.textContent = 'Collapse';
+    ui.detailContent.innerHTML = highlightTerms(record.detail_text || record.preview || '(no content)', highlightQuery());
   });
 
   ui.copyPath.addEventListener('click', async () => {

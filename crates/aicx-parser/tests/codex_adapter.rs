@@ -918,3 +918,118 @@ fn codex_compaction_replay_is_hash_deduplicated_and_not_speech() {
             .compaction_boundary_present
     );
 }
+
+/// Agent exec / shell tool calls are the agent's shell actions (aicx-problems
+/// 2026-10-13: `--kind shell_action` returned only the operator's
+/// `<user_shell_command>` envelopes, none of the agent's runs). The output
+/// record is joined into the call's class by `call_id`, in any order.
+#[test]
+fn codex_agent_shell_calls_are_agent_shell_actions_with_output_joined() {
+    use aicx_parser::engine::{FrameClass, ShellExecutor};
+
+    let body = br#"{"timestamp":"2026-10-13T17:00:00Z","type":"session_meta","payload":{"id":"agent-shell","cwd":"/repo"}}
+{"timestamp":"2026-10-13T17:00:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"odpal testy"}]}}
+{"timestamp":"2026-10-13T17:00:02Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"c1","arguments":"{\"cmd\":\"cargo test\",\"yield_time_ms\":1000}"}}
+{"timestamp":"2026-10-13T17:00:03Z","type":"response_item","payload":{"type":"function_call","name":"shell","call_id":"c2","arguments":"{\"command\":[\"bash\",\"-lc\",\"ls -la\"]}"}}
+{"timestamp":"2026-10-13T17:00:04Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"c3","input":"const r = await tools.exec_command({cmd:\"git status\"});\ntext(r.output);"}}
+{"timestamp":"2026-10-13T17:00:05Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"c4","arguments":"{\"cmd\":\"echo done\"}"}}
+{"timestamp":"2026-10-13T17:00:06Z","type":"response_item","payload":{"type":"function_call","name":"update_plan","call_id":"c5","arguments":"{\"plan\":[]}"}}
+{"timestamp":"2026-10-13T17:00:07Z","type":"response_item","payload":{"type":"function_call_output","call_id":"c2","output":"total 0"}}
+{"timestamp":"2026-10-13T17:00:08Z","type":"response_item","payload":{"type":"function_call_output","call_id":"c1","output":"test result: ok"}}
+{"timestamp":"2026-10-13T17:00:09Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"c3","output":"On branch main"}}
+{"timestamp":"2026-10-13T17:00:10Z","type":"response_item","payload":{"type":"function_call_output","call_id":"c4","output":"done"}}
+{"timestamp":"2026-10-13T17:00:11Z","type":"response_item","payload":{"type":"function_call_output","call_id":"c5","output":"Plan updated"}}
+{"timestamp":"2026-10-13T17:00:12Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<user_shell_command>\n<command>\npsa loctree\n</command>\n<result>\nExit code: 0\n</result>\n</user_shell_command>"}]}}
+"#;
+    let model = model("agent-shell", body);
+
+    let call = |name: &str, nth: usize| {
+        model
+            .turns
+            .iter()
+            .filter(|turn| {
+                turn.kind == TurnKind::ToolCall && turn.tool_name == Known::value(name.to_owned())
+            })
+            .nth(nth)
+            .unwrap_or_else(|| panic!("call turn {name}#{nth}"))
+    };
+    let result_hash = |text: &str| {
+        model
+            .turns
+            .iter()
+            .find(|turn| turn.kind == TurnKind::ToolResult && turn.text == text)
+            .map(|turn| turn.text_hash.clone())
+            .unwrap_or_else(|| panic!("result turn `{text}`"))
+    };
+
+    for (name, nth, command, output) in [
+        ("exec_command", 0, "cargo test", "test result: ok"),
+        // argv keeps every word; quoting keeps the word boundaries.
+        ("shell", 0, "bash -lc 'ls -la'", "total 0"),
+        // Code mode: the script is what ran.
+        (
+            "exec",
+            0,
+            "const r = await tools.exec_command({cmd:\"git status\"});\ntext(r.output);",
+            "On branch main",
+        ),
+        // `# codex` promotes the operator's echo to the echo bus; the agent's
+        // own echo stays the agent's run.
+        ("exec_command", 1, "echo done", "done"),
+    ] {
+        let turn = call(name, nth);
+        assert_eq!(turn.role, TurnRole::Tool);
+        match &turn.frame_class {
+            Some(FrameClass::ShellAction {
+                cmd,
+                result,
+                executor,
+            }) => {
+                assert_eq!(cmd, command);
+                assert_eq!(*executor, ShellExecutor::Agent);
+                assert_eq!(result.text, output, "output joined by call_id");
+                assert_eq!(result.hash, result_hash(output));
+            }
+            other => panic!("{name}#{nth} must be the agent's shell action, got {other:?}"),
+        }
+    }
+
+    // The body stays what the record carried, so text hash and canonical
+    // fingerprint are untouched by the class.
+    assert_eq!(
+        call("exec_command", 0).text,
+        r#"{"cmd":"cargo test","yield_time_ms":1000}"#
+    );
+    assert_eq!(
+        call("update_plan", 0).frame_class,
+        None,
+        "a non-shell tool is not a shell action"
+    );
+    match &call("user_shell_command", 0).frame_class {
+        Some(FrameClass::ShellAction { cmd, executor, .. }) => {
+            assert_eq!(cmd, "psa loctree");
+            assert_eq!(
+                *executor,
+                ShellExecutor::Human,
+                "the operator's run stays human"
+            );
+        }
+        other => panic!("user envelope must stay a human shell action, got {other:?}"),
+    }
+    assert!(
+        model
+            .turns
+            .iter()
+            .filter(|turn| turn.kind == TurnKind::ToolResult)
+            .all(|turn| turn.frame_class.is_none())
+    );
+    assert_eq!(
+        model
+            .turns
+            .iter()
+            .filter(|turn| turn.kind == TurnKind::UserMsg)
+            .count(),
+        1,
+        "no agent run became operator speech"
+    );
+}

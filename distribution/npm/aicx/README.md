@@ -27,6 +27,11 @@ release, migrate it once without changing its host/port configuration:
 aicx doctor --repair-runtime
 ```
 
+Repair keeps the HTTP MCP listener reader-only and preserves its configured
+bind and auth. The wrapper accepts reader-only services with or without the
+deprecated `--no-auto-refresh` flag; an embedded experimental writer requires
+migration. Catalog/index maintenance is a separate process.
+
 The wrapper resolves both binaries from the matching platform package. That
 package already contains the verified release binaries; npm installation does
 not run lifecycle scripts, download release assets, or unpack archives.
