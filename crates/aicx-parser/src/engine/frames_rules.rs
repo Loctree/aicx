@@ -73,6 +73,13 @@ const CLAUDE_INJECT_TAGS: &[InjectTagRule] = &[
         tag: "compact_boundary",
         kind: InjectRuleKind::CompactionReplay,
     },
+    // The `isCompactSummary` user row: the compacting model's retelling of
+    // the earlier context. Assigned by row structure in the adapter, so it is
+    // epoch context like kimi's summary — never operator speech.
+    InjectTagRule {
+        tag: "compact_summary",
+        kind: InjectRuleKind::CompactionReplay,
+    },
     // Background-task completion pushed by the harness, observed both as a
     // `queue-operation` enqueue body and as a user-row text block. Machine
     // chatter: a system note, never operator speech.
@@ -114,6 +121,26 @@ const GENERIC_INJECT_TAGS: &[InjectTagRule] = &[InjectTagRule {
     kind: InjectRuleKind::TransportControl,
 }];
 
+// # copilot — developer instructions and skill bodies remain injected context.
+const COPILOT_INJECT_TAGS: &[InjectTagRule] = &[
+    InjectTagRule {
+        tag: "system",
+        kind: InjectRuleKind::TransportControl,
+    },
+    InjectTagRule {
+        tag: "developer",
+        kind: InjectRuleKind::AgentInstructions,
+    },
+    InjectTagRule {
+        tag: "skill.invoked",
+        kind: InjectRuleKind::AgentInstructions,
+    },
+    InjectTagRule {
+        tag: "session.compaction_complete",
+        kind: InjectRuleKind::CompactionReplay,
+    },
+];
+
 // # cursor — harness notifications and skill attachments ride the wire as
 // injected wrappers, never operator speech; both reminder spellings resolve
 // through WRAPPER peeling in the adapter, so only the cursor-specific tags
@@ -130,6 +157,87 @@ const CURSOR_INJECT_TAGS: &[InjectTagRule] = &[
     InjectTagRule {
         tag: "manually_attached_skills",
         kind: InjectRuleKind::AgentInstructions,
+    },
+];
+
+// # agy — tags the adapter assigns. Dispatch briefs stay injected context.
+const AGY_INJECT_TAGS: &[InjectTagRule] = &[
+    InjectTagRule {
+        tag: "system",
+        kind: InjectRuleKind::TransportControl,
+    },
+    InjectTagRule {
+        tag: "dispatch_brief",
+        kind: InjectRuleKind::TransportControl,
+    },
+    InjectTagRule {
+        tag: "synthetic_user",
+        kind: InjectRuleKind::TransportControl,
+    },
+    InjectTagRule {
+        tag: "agent_authored",
+        kind: InjectRuleKind::TransportControl,
+    },
+    InjectTagRule {
+        tag: "steering",
+        kind: InjectRuleKind::TransportControl,
+    },
+    InjectTagRule {
+        tag: "user_unattributed",
+        kind: InjectRuleKind::TransportControl,
+    },
+];
+
+// # omp / pi — tags the adapter assigns. Unknown customType values stay
+// InjectKind::Other and still cannot become human speech.
+const OMP_INJECT_TAGS: &[InjectTagRule] = &[
+    InjectTagRule {
+        tag: "system",
+        kind: InjectRuleKind::TransportControl,
+    },
+    InjectTagRule {
+        tag: "dispatch_brief",
+        kind: InjectRuleKind::TransportControl,
+    },
+    InjectTagRule {
+        tag: "synthetic_user",
+        kind: InjectRuleKind::TransportControl,
+    },
+    InjectTagRule {
+        tag: "agent_authored",
+        kind: InjectRuleKind::TransportControl,
+    },
+    InjectTagRule {
+        tag: "steering",
+        kind: InjectRuleKind::TransportControl,
+    },
+    InjectTagRule {
+        tag: "user_unattributed",
+        kind: InjectRuleKind::TransportControl,
+    },
+    InjectTagRule {
+        tag: "ttsr_injection",
+        kind: InjectRuleKind::TransportControl,
+    },
+    InjectTagRule {
+        tag: "developer",
+        kind: InjectRuleKind::AgentInstructions,
+    },
+    InjectTagRule {
+        tag: "session_init",
+        kind: InjectRuleKind::AgentInstructions,
+    },
+    InjectTagRule {
+        tag: "skill-prompt",
+        kind: InjectRuleKind::AgentInstructions,
+    },
+    InjectTagRule {
+        tag: "compaction",
+        kind: InjectRuleKind::CompactionReplay,
+    },
+    InjectTagRule {
+        tag: "branch_summary",
+        kind: InjectRuleKind::CompactionReplay,
     },
 ];
 
@@ -167,6 +275,13 @@ const GROK_INJECT_TAGS: &[InjectTagRule] = &[
 // # grok
 
 pub const AGENT_FRAME_RULES: &[AgentFrameRules] = &[
+    AgentFrameRules {
+        agent: AgentKind::Copilot,
+        echo_promotion: false,
+        klops_guard: &[],
+        queue_seal: false,
+        inject_tags: COPILOT_INJECT_TAGS,
+    },
     AgentFrameRules {
         agent: AgentKind::Codex,
         echo_promotion: true,
@@ -222,6 +337,22 @@ pub const AGENT_FRAME_RULES: &[AgentFrameRules] = &[
         klops_guard: &[],
         queue_seal: false,
         inject_tags: CURSOR_INJECT_TAGS,
+    },
+    // # omp / pi — harness injections are tagged in the adapter. Human speech
+    // is only an attributed user message; these tags never promote to it.
+    AgentFrameRules {
+        agent: AgentKind::Omp,
+        echo_promotion: false,
+        klops_guard: &[],
+        queue_seal: false,
+        inject_tags: OMP_INJECT_TAGS,
+    },
+    AgentFrameRules {
+        agent: AgentKind::Agy,
+        echo_promotion: false,
+        klops_guard: &[],
+        queue_seal: false,
+        inject_tags: AGY_INJECT_TAGS,
     },
 ];
 

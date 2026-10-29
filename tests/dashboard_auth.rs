@@ -70,6 +70,28 @@ async fn test_dashboard_api_browse_without_token_401() {
 }
 
 #[tokio::test]
+async fn test_provider_cookie_and_untrusted_identity_header_do_not_authorize_corpus() {
+    let app = build_protected_api_router("right-token");
+    let mut req = request("/api/browse", None);
+    req.headers_mut().insert(
+        "cookie",
+        "aicx_session=v1.unsupported.provider-session"
+            .parse()
+            .unwrap(),
+    );
+    req.headers_mut().insert(
+        "tailscale-user-login",
+        "operator@example.invalid".parse().unwrap(),
+    );
+    let response = app.oneshot(req).await.expect("oneshot");
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        body_to_string(response).await,
+        r#"{"error":"unauthorized"}"#
+    );
+}
+
+#[tokio::test]
 async fn test_dashboard_api_browse_with_wrong_token_returns_401_same_shape() {
     let app = build_protected_api_router("right-token");
     let response = app

@@ -1,0 +1,96 @@
+# Founder-corpus phrases that classify a line. One file on purpose.
+# Add a survey answer here. Do not grow a second list in Rust.
+
+[intent]
+keywords = [
+  "mam pomysl", "mam pomysł", "mam taki pomysl", "mam taki pomysł",
+  "pomysl", "pomysł", "proponuje", "proponuję", "zrobmy", "zróbmy",
+  "ustalmy", "chce", "chcę", "chcialbym", "chciałbym",
+  "potrzebuje", "potrzebuję", "prosze", "proszę", "odpal", "uruchom",
+  "usun", "usuń", "następny krok", "nastepny krok", "kolejny krok",
+  "i want", "i'd like", "let's", "next step",
+]
+
+[task]
+directive = ["task:", "todo:", "zadanie:"]
+action_heads = [
+  "stworz", "stwórz", "utworz", "utwórz", "dodaj", "napraw", "popraw",
+  "zbuduj", "przygotuj", "zapisz", "spisz", "wypisz", "zaimplementuj",
+  "podlacz", "podłącz", "skopiuj", "przekopiuj", "uruchom", "odpal",
+  "create", "add", "fix", "update", "implement", "write", "run", "copy",
+]
+commitment_heads = ["zrobie", "zrobię", "zajme sie", "zajmę się", "i will ", "i'll "]
+
+[decision]
+policy = [
+  "nie fixujemy", "nie robimy", "nie ruszamy", "out of scope", "poza scope",
+  "od teraz", "from now on", "canonical", "kanonicz", "default",
+  "domysln", "domyśln", "tylko przez", "bez zgadywania", "bez fallback",
+  "no fallback", "musi mieć", "musi miec", "ma byc dodatkiem", "ma być dodatkiem",
+]
+output = ["decision:", "plan:", "architecture", "BREAKING", "TODO:", "FIXME:"]
+output_case_sensitive = ["WAŻNE", "KEY"]
+
+[requirement]
+markers = [
+  "nie może być", "nie moze byc", "ma być", "ma byc", "musi ", "musimy ",
+  "trzeba ", "zrób to testowalne", "zrob to testowalne", "pełny ownership",
+  "pelny ownership", "teraz wypuszuj",
+]
+
+[outcome]
+result_keywords = [
+  "smoke test", "passed", "all checks passed", "0 failed", "completed",
+  "done", "zrobione", "dowiezione", "gotowe", "dziala", "działa",
+]
+bare_affirmation = ["zrobione", "dowiezione", "gotowe", "dziala", "działa", "done", "completed"]
+result_strict = [
+  "passed", "failed", "score=", "score:", "latency", "p0=", "p1=", "p2=",
+  "/10", "clippy", "cargo test", "✓", "✗", "0 warnings", "0 errors",
+]
+result_soft = ["tests ", "error:"]
+result_shape = ["pass", "fail", " ok", "ok.", "done", "skipped", "ignored", "timeout", "panicked", "panic:", "✓", "✗"]
+completion = [
+  "zostal dodany", "został dodany", "zostala dodana", "została dodana",
+  "zostaly dodane", "zostały dodane", "zostal utworzony", "został utworzony",
+  "has been added", "was added", "has been created", "was created",
+]
+
+[question]
+markers = [
+  "how do", "how does", "how to", "what is", "what are", "why does", "why is",
+  "can we", "should we", "is it possible", "does it", "do we",
+  "jak ", "dlaczego ", "czy ", "co to ", "co jest", "w jaki sposób",
+]
+
+[assumption]
+markers = [
+  "i assume", "assuming", "i believe", "we assume", "hypothesis:",
+  "zakładam", "zakladam", "założenie:", "zalozenie:", "hipoteza:", "przypuszczam",
+]
+
+[why]
+markers = [
+  "why:", "because", "the reason", "this is needed", "motivated by", "driven by",
+  "root cause", "underlying issue", "bo ", "ponieważ", "dlatego że", "przyczyna:", "powód:",
+]
+
+[argue]
+markers = [
+  "on the other hand", "alternatively", "disagree", "counterpoint", "trade-off",
+  "tradeoff", "but if we", "however,", "z drugiej strony", "alternatywnie",
+  "spór:", "kontrargument",
+]
+
+[insight]
+markers = [
+  "insight:", "realization:", "key finding:", "★ insight", "the real issue is",
+  "fundamentally,", "odkrycie:", "wniosek:", "kluczowe:",
+]
+
+[negation]
+pre = [
+  "nie ", "bez ", "don't ", "do not ", "won't ", "will not ", "shouldn't ",
+  "should not ", "wouldn't ", "would not ", "isn't ", "aren't ", "doesn't ", "didn't ",
+]
+post = [" not ", " not,", " not.", " nie ", " nie,", " nie."]

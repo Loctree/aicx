@@ -576,6 +576,10 @@ fn query_context_lines(body: &str, query: &str) -> Vec<String> {
                 continue;
             }
             let phrase_score = i32::from(normalized.contains(&normalized_query));
+            let exact_terms = terms
+                .iter()
+                .filter(|term| normalized.contains(String::as_str(term)))
+                .count();
             let quote_score = i32::from(
                 benchmark_context
                     && candidate
@@ -591,7 +595,9 @@ fn query_context_lines(body: &str, query: &str) -> Vec<String> {
             // multi-term query. Require two matched terms before a sentence
             // receives a decision/invariant class; otherwise retain it only
             // as ordinary substantive context.
-            let class = if term_score >= signal_term_floor {
+            // Prefix recall may find an earlier decision about a different
+            // identifier. It must not outrank the actual appended query text.
+            let class = if term_score >= signal_term_floor && exact_terms > 0 {
                 class
             } else {
                 class.min(LexicalEvidenceClass::Substantive)
@@ -1651,6 +1657,18 @@ mod swap_tests {
         assert!(
             snippets.iter().any(|line| line.contains("W2-B-4c")),
             "snippet must come from the matched body region: {snippets:?}"
+        );
+    }
+
+    #[test]
+    fn snippet_prefers_appended_exact_identifier_to_earlier_prefix_decision() {
+        let body = "Decision: use lexical search for copilotpipelineinitial91dbea.\nDecision: retain copilotpipelineappended47fdae in the same session.";
+        let lines = query_context_lines(body, "copilotpipelineappended47fdae");
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("copilotpipelineappended47fdae")),
+            "{lines:?}"
         );
     }
 

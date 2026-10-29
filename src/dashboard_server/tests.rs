@@ -1,7 +1,14 @@
 use super::search::{MAX_SCORE_FILTER, merge_project_scopes, validate_score_filter};
 use super::*;
 use crate::test_support::capture_logs;
+use axum::{
+    body::Body,
+    extract::ConnectInfo,
+    http::{Method, Request, header::AUTHORIZATION},
+};
 use http_body_util::BodyExt;
+use std::net::SocketAddr;
+use tower::ServiceExt;
 
 fn mk_tmp_dir(name: &str) -> PathBuf {
     let dir = std::env::current_dir()
@@ -21,6 +28,48 @@ fn seed_store(root: &Path) {
         "# demo\n\n### 2026-02-24 12:00:00 UTC | user\n> hello",
     )
     .expect("seed file");
+}
+
+fn seed_browse_store(root: &Path) {
+    let p = root
+        .join("store")
+        .join("local")
+        .join("demo")
+        .join("2026_0224")
+        .join("conversations")
+        .join("codex");
+    fs::create_dir_all(&p).expect("create browse fixture dirs");
+    fs::write(
+        p.join("2026_0224_codex_deferred001_001.md"),
+        "# demo\n\n### 2026-02-24 12:00:00 UTC | user\n> deferred hello",
+    )
+    .expect("seed browse fixture");
+}
+
+fn http_request(
+    method: Method,
+    uri: &str,
+    bearer: Option<&str>,
+    origin: Option<&str>,
+    action: bool,
+) -> Request<Body> {
+    let mut builder = Request::builder().method(method).uri(uri);
+    if let Some(token) = bearer {
+        builder = builder.header(AUTHORIZATION, format!("Bearer {token}"));
+    }
+    if let Some(origin) = origin {
+        builder = builder.header(header::ORIGIN, origin);
+    }
+    if action {
+        builder = builder.header(REGENERATE_HEADER_NAME, REGENERATE_HEADER_VALUE);
+    }
+    let mut request = builder.body(Body::empty()).expect("request");
+    request.extensions_mut().insert(ConnectInfo(
+        "127.0.0.1:49152"
+            .parse::<SocketAddr>()
+            .expect("peer address"),
+    ));
+    request
 }
 
 async fn response_body_to_string(response: Response) -> String {
@@ -55,7 +104,6 @@ fn mk_state_with_origin_escape(
             auth: AuthConfig::disabled(),
             allow_no_origin,
         },
-        shell_html: "<html>shell</html>".to_string(),
         snapshot: RwLock::new(DashboardSnapshot {
             payload: DashboardPayload {
                 generated_at: String::new(),
@@ -72,6 +120,7 @@ fn mk_state_with_origin_escape(
             assumptions: Vec::new(),
             build_count: 1,
             last_error: None,
+            scan_status: DashboardScanStatus::Ready,
         }),
         rebuilding: AtomicBool::new(false),
     })
@@ -173,6 +222,123 @@ fn write_dashboard_artifact_writes_atomically() {
     );
 
     let _ = fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn deferred_hybrid_router_scans_only_on_explicit_data_request() {
+    let root = mk_tmp_dir("dashboard_server_deferred_hybrid");
+    seed_browse_store(&root);
+    let token = "deferred-test-token";
+    let config = DashboardServerConfig {
+        aicx_home: root.clone(),
+        scope: DashboardScope::default(),
+        title: "deferred test".to_string(),
+        preview_chars: 120,
+        artifact_path: root.join("dashboard.html"),
+        cors_policy: DashboardCorsPolicy::Local,
+        host: "127.0.0.1".parse().expect("host"),
+        port: 8033,
+        auth: AuthConfig {
+            token: Some(token.to_string()),
+            source: crate::auth::AuthSource::Cli,
+        },
+        allow_no_origin: false,
+    };
+    let app = dashboard_router_deferred(config, false)
+        .await
+        .expect("deferred router");
+
+    let unauthorized = app
+        .clone()
+        .oneshot(http_request(Method::GET, "/api/browse", None, None, false))
+        .await
+        .expect("unauthorized browse response");
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+    let initial_status = app
+        .clone()
+        .oneshot(http_request(
+            Method::GET,
+            "/api/status",
+            Some(token),
+            None,
+            false,
+        ))
+        .await
+        .expect("initial status response");
+    assert_eq!(initial_status.status(), StatusCode::OK);
+    let initial: serde_json::Value =
+        serde_json::from_str(&response_body_to_string(initial_status).await)
+            .expect("initial status json");
+    assert_eq!(initial["scan_status"], "not_scanned");
+    assert_eq!(initial["build_count"], 0);
+    assert!(initial["generated_at"].is_null());
+    assert!(initial["stats"].is_null());
+
+    let browse = app
+        .clone()
+        .oneshot(http_request(
+            Method::GET,
+            "/api/browse?sort=newest",
+            Some(token),
+            None,
+            false,
+        ))
+        .await
+        .expect("browse response");
+    assert_eq!(browse.status(), StatusCode::OK);
+    let browse_json: serde_json::Value =
+        serde_json::from_str(&response_body_to_string(browse).await).expect("browse json");
+    assert_eq!(browse_json["records"].as_array().map(Vec::len), Some(1));
+    assert!(browse_json.to_string().contains("deferred hello"));
+
+    let ready_status = app
+        .clone()
+        .oneshot(http_request(
+            Method::GET,
+            "/api/status",
+            Some(token),
+            None,
+            false,
+        ))
+        .await
+        .expect("ready status response");
+    let ready: serde_json::Value =
+        serde_json::from_str(&response_body_to_string(ready_status).await).expect("ready json");
+    assert_eq!(ready["scan_status"], "ready");
+    assert_eq!(ready["build_count"], 1);
+    assert_eq!(ready["stats"]["total_files"], 1);
+
+    let missing_origin = app
+        .clone()
+        .oneshot(http_request(
+            Method::POST,
+            "/api/regenerate",
+            Some(token),
+            None,
+            true,
+        ))
+        .await
+        .expect("missing-origin regenerate response");
+    assert_eq!(missing_origin.status(), StatusCode::FORBIDDEN);
+
+    let regenerated = app
+        .oneshot(http_request(
+            Method::POST,
+            "/api/regenerate",
+            Some(token),
+            Some("http://127.0.0.1:8033"),
+            true,
+        ))
+        .await
+        .expect("regenerate response");
+    assert_eq!(regenerated.status(), StatusCode::OK);
+    let regenerated_json: serde_json::Value =
+        serde_json::from_str(&response_body_to_string(regenerated).await).expect("regenerate json");
+    assert_eq!(regenerated_json["build_count"], 2);
+    assert_eq!(regenerated_json["stats"]["total_files"], 1);
+
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -414,6 +580,130 @@ fn test_cors_all_returns_wildcard_not_reflected_origin() {
         policy.response_allow_origin("https://attacker.example.com"),
         Some(HeaderValue::from_static("*"))
     );
+}
+
+fn intent_record(
+    project: &str,
+    agent: &str,
+    date: &str,
+    summary: &str,
+) -> crate::intents::IntentRecord {
+    crate::intents::IntentRecord {
+        provenance: None,
+        kind: crate::intents::IntentKind::Intent,
+        summary: summary.to_string(),
+        context: None,
+        evidence: vec![],
+        project: project.to_string(),
+        agent: agent.to_string(),
+        date: date.to_string(),
+        timestamp: None,
+        session_id: "sess-intent-1".to_string(),
+        count: None,
+        first_chunk: None,
+        last_chunk: None,
+        source_chunk: format!("{project}-{agent}-{date}"),
+        source: None,
+        honesty: Default::default(),
+    }
+}
+
+#[test]
+fn intents_api_filters_project_agent_hours_and_limit_and_cuts_the_body() {
+    let now = DateTime::parse_from_rfc3339("2026-10-21T12:00:00Z")
+        .expect("now")
+        .with_timezone(&Utc);
+    let long = "ł".repeat(3001);
+    let records = vec![
+        intent_record("Loctree/aicx", "claude", "2026-10-21", &long),
+        intent_record("Other/repo", "claude", "2026-10-21", "other project"),
+        intent_record("Loctree/aicx", "codex", "2026-10-21", "other agent"),
+        intent_record("Loctree/aicx", "claude", "2020-01-01", "old intent"),
+        intent_record(
+            "Loctree/aicx",
+            "claude",
+            "2026-10-20",
+            "older matching intent",
+        ),
+    ];
+
+    let filtered = intents::select_intent_api_items(
+        records.clone(),
+        &intents::IntentApiSelect {
+            project: Some("Loctree/aicx".to_string()),
+            agent: Some("claude".to_string()),
+            hours: 48,
+            limit: Some(1),
+            full: false,
+            session_id: None,
+            source_chunk: None,
+            now,
+        },
+    );
+    assert_eq!(filtered.len(), 1);
+    let item = &filtered[0];
+    assert_eq!(item.project, "Loctree/aicx");
+    assert_eq!(item.agent, "claude");
+    assert_eq!(item.date, "2026-10-21");
+    assert_eq!(item.kind, "INTENT");
+    assert_eq!(item.surface, "intent");
+    assert!(item.header.contains('·'));
+    assert!(item.header.contains("Loctree/aicx"));
+    assert!(item.header.contains("sess-int"));
+    assert_eq!(item.body_chars_total, 3001);
+    assert!(item.body_truncated);
+    assert!(item.body.contains(" …[+1 znaków]"));
+    assert!(item.body.chars().count() > 3000);
+
+    let all_time = intents::select_intent_api_items(
+        records,
+        &intents::IntentApiSelect {
+            project: Some("Loctree/aicx".to_string()),
+            agent: Some("claude".to_string()),
+            hours: 0,
+            limit: Some(10),
+            full: true,
+            session_id: None,
+            source_chunk: None,
+            now,
+        },
+    );
+    assert!(all_time.iter().any(|item| item.date == "2020-01-01"));
+    assert!(all_time.iter().all(|item| item.agent == "claude"));
+    assert!(all_time.iter().all(|item| item.project == "Loctree/aicx"));
+    let full = all_time
+        .iter()
+        .find(|item| item.date == "2026-10-21")
+        .expect("long record");
+    assert!(!full.body_truncated);
+    assert_eq!(full.body.chars().count(), 3001);
+}
+
+#[tokio::test]
+async fn intents_http_envelope_reports_the_shared_preview_constant() {
+    let root = mk_tmp_dir("dashboard_server_intents_envelope");
+    let state = mk_state(root.clone(), root.join("dashboard.html"));
+    let app = assemble_router(state, false);
+    let response = app
+        .oneshot(http_request(
+            Method::GET,
+            "/api/intents?project=Loctree/aicx&agent=claude&hours=48&limit=5",
+            None,
+            None,
+            false,
+        ))
+        .await
+        .expect("intents response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_body_to_string(response).await;
+    let payload: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(payload["ok"], true);
+    assert_eq!(
+        payload["body_preview_chars"],
+        crate::result_format::RESULT_BODY_PREVIEW_CHARS
+    );
+    assert!(payload["items"].is_array());
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]

@@ -2,6 +2,7 @@
 """Static guardrails for the script-free npm publication workflow."""
 
 import json
+import subprocess
 from pathlib import Path
 
 
@@ -12,6 +13,11 @@ WRAPPER = ROOT / "distribution/npm/aicx/package.json"
 PLATFORM_ROOT = ROOT / "distribution/npm/aicx/platform-packages"
 PLATFORMS = ("darwin-arm64", "linux-x64-gnu", "win32-x64-gnu")
 FORBIDDEN = ("preinstall", "install", "postinstall", "prepare")
+SERVICE_INSTALLERS = (
+    ROOT / "tools/install-mcp-service.sh",
+    ROOT / "tools/install-mcp-service-linux.sh",
+    ROOT / "tools/install-mcp-service.ps1",
+)
 
 
 def assert_script_free(path: Path) -> None:
@@ -33,6 +39,56 @@ def main() -> None:
         raise SystemExit("npm wrapper lost the script-free runtime migration hint")
     if "aicx doctor --repair-runtime" not in wrapper_readme:
         raise SystemExit("npm README lost the runtime migration command")
+    if "plistMatchesLoopbackContract" not in wrapper_source:
+        raise SystemExit("npm wrapper lost the loopback-contract migration check")
+    if "childFailureExit" not in wrapper_source:
+        raise SystemExit("npm wrapper lost the signal-death exit")
+    if "process.exit(error.status)" in wrapper_source:
+        raise SystemExit("npm wrapper still treats a null child status as an exit code")
+
+    for installer in SERVICE_INSTALLERS:
+        source = installer.read_text(encoding="utf-8")
+        if "--experimental-auto-refresh" in source:
+            raise SystemExit(f"{installer} still enables the embedded MCP writer")
+        if "--no-auto-refresh" not in source:
+            raise SystemExit(f"{installer} lost the explicit reader-only compatibility flag")
+
+    hint = subprocess.run(
+        [
+            "node",
+            "-e",
+            r"""
+const { plistMatchesLoopbackContract, childFailureExit } = require("./distribution/npm/aicx/index.js");
+const loopbackReader = "<string>--host</string>\n<string>127.0.0.1</string>\n<string>--no-require-auth</string>\n<string>--no-auto-refresh</string>\n";
+const implicitReader = loopbackReader.replace("<string>--no-auto-refresh</string>\n", "");
+const embeddedWriter = implicitReader + "<string>--experimental-auto-refresh</string>\n";
+if (!plistMatchesLoopbackContract(loopbackReader)) process.exit(2);
+if (!plistMatchesLoopbackContract(implicitReader)) process.exit(3);
+if (plistMatchesLoopbackContract(embeddedWriter)) process.exit(4);
+if (plistMatchesLoopbackContract(loopbackReader.replace("<string>127.0.0.1</string>", "<string>0.0.0.0</string>"))) process.exit(5);
+if (plistMatchesLoopbackContract(loopbackReader.replace("--no-require-auth", "--allowed-host"))) process.exit(6);
+const killed = childFailureExit({ status: null, signal: "SIGKILL" });
+if (!killed || killed.code === 0 || !killed.line.includes("code signature invalid")) process.exit(7);
+const exited = childFailureExit({ status: 2, signal: null });
+if (!exited || exited.code !== 2 || exited.line) process.exit(8);
+""",
+        ],
+        cwd=ROOT,
+        check=False,
+        text=True,
+    )
+    if hint.returncode != 0:
+        raise SystemExit(f"npm wrapper migration/signal contract failed ({hint.returncode})")
+
+    install_local = (ROOT / "distribution/npm/install-local.sh").read_text(encoding="utf-8")
+    if "resign_linker_signed_macho" not in install_local or "codesign --force --sign -" not in install_local:
+        raise SystemExit("install-local lost the linker-signed Mach-O re-sign")
+    stage = (ROOT / "distribution/npm/stage-platform-package.mjs").read_text(encoding="utf-8")
+    if "resignLinkerSignedDarwinBinary" not in stage or 'codesign", ["--force", "--sign", "-"' not in stage:
+        raise SystemExit("stage-platform-package lost the linker-signed Mach-O re-sign")
+    makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
+    if "codesign --force --sign -" not in makefile:
+        raise SystemExit("release-binaries lost the ad-hoc codesign fallback")
 
     workflow = WORKFLOW.read_text(encoding="utf-8")
     required = (

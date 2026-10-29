@@ -16,6 +16,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use aicx_parser::sanitize;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 /// Maximum physical bytes read from one candidate while cataloging identity.
 pub const MAX_HEADER_BYTES: usize = 256 * 1024;
@@ -35,10 +36,13 @@ pub enum AgentKind {
     Grok,
     Kimi,
     Cursor,
+    Copilot,
+    Omp,
+    Agy,
 }
 
 impl AgentKind {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 10] = [
         Self::Claude,
         Self::Codex,
         Self::Gemini,
@@ -46,6 +50,9 @@ impl AgentKind {
         Self::Grok,
         Self::Kimi,
         Self::Cursor,
+        Self::Copilot,
+        Self::Omp,
+        Self::Agy,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -57,6 +64,9 @@ impl AgentKind {
             Self::Grok => "grok",
             Self::Kimi => "kimi",
             Self::Cursor => "cursor",
+            Self::Copilot => "copilot",
+            Self::Omp => "omp",
+            Self::Agy => "agy",
         }
     }
 
@@ -65,10 +75,15 @@ impl AgentKind {
             "claude" => Some(Self::Claude),
             "codex" => Some(Self::Codex),
             "gemini" | "gemini-antigravity" => Some(Self::Gemini),
+            "agy" | "antigravity" | "antigravity-cli" => Some(Self::Agy),
             "junie" => Some(Self::Junie),
             "grok" => Some(Self::Grok),
             "kimi" => Some(Self::Kimi),
             "cursor" | "cursor-agent" => Some(Self::Cursor),
+            "copilot" | "copilot-cli" | "github-copilot" | "github-copilot-cli" => {
+                Some(Self::Copilot)
+            }
+            "omp" | "pi" | "oh-my-pi" => Some(Self::Omp),
             _ => None,
         }
     }
@@ -83,6 +98,19 @@ impl AgentKind {
             Self::Junie => home.join(".junie").join("sessions"),
             Self::Kimi => home.join(".kimi-code").join("sessions"),
             Self::Cursor => home.join(".cursor").join("projects"),
+            Self::Copilot => copilot_session_root(home),
+            Self::Omp => omp_session_root(home),
+            Self::Agy => agy_session_root(home),
+        }
+    }
+
+    /// Every on-disk root this agent may write. Omp and upstream pi share one
+    /// catalog identity and two stores. Agy reads the CLI store and the IDE store.
+    pub fn session_roots(self, home: &Path) -> Vec<PathBuf> {
+        match self {
+            Self::Omp => omp_session_roots(home),
+            Self::Agy => agy_session_roots(home),
+            other => vec![other.session_root(home)],
         }
     }
 
@@ -95,15 +123,24 @@ impl AgentKind {
             Self::Junie => aicx_parser::engine::AgentKind::Junie,
             Self::Kimi => aicx_parser::engine::AgentKind::Kimi,
             Self::Cursor => aicx_parser::engine::AgentKind::Cursor,
+            Self::Copilot => aicx_parser::engine::AgentKind::Copilot,
+            Self::Omp => aicx_parser::engine::AgentKind::Omp,
+            Self::Agy => aicx_parser::engine::AgentKind::Agy,
         }
     }
 
     fn accepts_extension(self, extension: Option<&str>) -> bool {
         match self {
             Self::Gemini => matches!(extension, Some("json" | "jsonl")),
-            Self::Claude | Self::Codex | Self::Junie | Self::Grok | Self::Kimi | Self::Cursor => {
-                extension == Some("jsonl")
-            }
+            Self::Agy => extension == Some("db"),
+            Self::Claude
+            | Self::Codex
+            | Self::Junie
+            | Self::Grok
+            | Self::Kimi
+            | Self::Cursor
+            | Self::Copilot
+            | Self::Omp => extension == Some("jsonl"),
         }
     }
 
@@ -159,6 +196,12 @@ impl AgentKind {
                 .take(2)
                 .any(|dir| dir.file_name().and_then(|name| name.to_str()) == Some("chats")),
             Self::Kimi => path.file_name().and_then(|name| name.to_str()) == Some("wire.jsonl"),
+            Self::Copilot => is_copilot_source_file(path),
+            // `<encoded-cwd>/<ISO-ts>_<uuid>.jsonl` directly under the sessions
+            // root. Nested tool logs live one directory deeper and are not
+            // sessions, the same way Cursor `agent-tools/` is not a transcript.
+            Self::Omp => is_omp_source_file(path),
+            Self::Agy => is_agy_source_file(path),
             Self::Claude | Self::Codex | Self::Junie => true,
         }
     }
@@ -174,21 +217,319 @@ impl fmt::Display for AgentKind {
 pub struct SourceFingerprint {
     pub len: u64,
     pub modified_unix_nanos: u128,
+    /// Cheap physical identity on Unix (dev/inode/ctime/mode/owner); on
+    /// platforms without that proof this includes a streaming content digest.
+    pub physical_identity: Vec<u64>,
+    /// Separate artifact evidence for multi-file sources. Size and freshness
+    /// retain their physical meanings; neither encodes this digest.
+    pub bundle_fingerprint: Option<String>,
 }
 
 impl SourceFingerprint {
-    fn from_metadata(metadata: &fs::Metadata) -> Self {
+    fn from_path(path: &Path, metadata: &fs::Metadata) -> std::io::Result<Self> {
+        let _ = path;
         let modified_unix_nanos = metadata
             .modified()
             .unwrap_or(SystemTime::UNIX_EPOCH)
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        Self {
+        #[cfg(unix)]
+        let physical_identity = {
+            use std::os::unix::fs::MetadataExt;
+            vec![
+                metadata.dev(),
+                metadata.ino(),
+                metadata.ctime() as u64,
+                metadata.ctime_nsec() as u64,
+                metadata.mode() as u64,
+                metadata.uid() as u64,
+                metadata.gid() as u64,
+            ]
+        };
+        #[cfg(not(unix))]
+        let physical_identity = {
+            let mut file = sanitize::open_file_validated(path).map_err(std::io::Error::other)?;
+            let mut hasher = Sha256::new();
+            let mut buffer = [0u8; 64 * 1024];
+            loop {
+                let count = file.read(&mut buffer)?;
+                if count == 0 {
+                    break;
+                }
+                hasher.update(&buffer[..count]);
+            }
+            hasher
+                .finalize()
+                .chunks_exact(8)
+                .map(|bytes| u64::from_le_bytes(bytes.try_into().expect("eight-byte digest chunk")))
+                .collect()
+        };
+        Ok(Self {
             len: metadata.len(),
             modified_unix_nanos,
+            physical_identity,
+            bundle_fingerprint: None,
+        })
+    }
+}
+
+/// GitHub Copilot CLI and SDK honor COPILOT_HOME for their configuration and
+/// persisted sessions. Storage.home/AICX_HOME do not move provider sources.
+pub fn copilot_session_root(home: &Path) -> PathBuf {
+    let configured = std::env::var_os("COPILOT_HOME");
+    copilot_session_root_from(home, configured.as_deref())
+}
+
+fn copilot_session_root_from(home: &Path, configured: Option<&std::ffi::OsStr>) -> PathBuf {
+    configured
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".copilot"))
+        .join("session-state")
+}
+
+/// Copilot stores one conversation at `session-state/<id>/events.jsonl`.
+/// Global usage events and JSONL inside checkpoints/tool artifacts are not
+/// conversation sources, even when they reuse the same filename.
+pub(crate) fn is_copilot_source_file(path: &Path) -> bool {
+    path.file_name().and_then(|name| name.to_str()) == Some("events.jsonl")
+        && path
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|name| name.to_str())
+            .is_some_and(is_copilot_source_id)
+        && path
+            .ancestors()
+            .nth(2)
+            .and_then(Path::file_name)
+            .and_then(|name| name.to_str())
+            == Some("session-state")
+}
+
+fn is_copilot_source_id(value: &str) -> bool {
+    !value.starts_with('.')
+        && !value.contains(':')
+        && validate_identity(value).is_some_and(|id| id == value)
+}
+
+/// oh-my-pi sessions. Upstream pi uses the same layout under `~/.pi`.
+pub fn omp_session_root(home: &Path) -> PathBuf {
+    home.join(".omp").join("agent").join("sessions")
+}
+
+pub fn pi_session_root(home: &Path) -> PathBuf {
+    home.join(".pi").join("agent").join("sessions")
+}
+
+pub fn omp_session_roots(home: &Path) -> Vec<PathBuf> {
+    vec![omp_session_root(home), pi_session_root(home)]
+}
+
+/// Antigravity CLI conversations. The IDE store is the second root.
+pub fn agy_session_root(home: &Path) -> PathBuf {
+    home.join(".gemini")
+        .join("antigravity-cli")
+        .join("conversations")
+}
+
+pub fn agy_ide_session_root(home: &Path) -> PathBuf {
+    home.join(".gemini")
+        .join("antigravity")
+        .join("conversations")
+}
+
+pub fn agy_session_roots(home: &Path) -> Vec<PathBuf> {
+    vec![agy_session_root(home), agy_ide_session_root(home)]
+}
+
+/// A native agy conversation is `<cascade-uuid>.db` directly under
+/// `antigravity-cli/conversations` or `antigravity/conversations`.
+/// `.pb` exports, WAL sidecars, and non-UUID names are not sessions.
+pub(crate) fn is_agy_source_file(path: &Path) -> bool {
+    let stem = path.file_stem().and_then(|stem| stem.to_str());
+    path.extension().and_then(|ext| ext.to_str()) == Some("db")
+        && stem.is_some_and(|stem| is_uuid(stem) && uuid_from_filename(stem).is_some())
+        && ancestor_name(path, 1) == Some("conversations")
+        && matches!(
+            ancestor_name(path, 2),
+            Some("antigravity-cli" | "antigravity")
+        )
+}
+
+/// A real omp/pi session is a JSONL whose stem ends in a UUID and whose
+/// ancestors are `<store>/.{omp,pi}/agent/sessions/<encoded-cwd>/<file>`.
+/// Tool-log JSONL nested inside `<ISO-ts>_<uuid>/` fails the `sessions`
+/// ancestor check.
+pub(crate) fn is_omp_source_file(path: &Path) -> bool {
+    let stem = path.file_stem().and_then(|stem| stem.to_str());
+    path.extension().and_then(|ext| ext.to_str()) == Some("jsonl")
+        && stem.is_some_and(|stem| uuid_from_filename(stem).is_some())
+        && ancestor_name(path, 2) == Some("sessions")
+        && ancestor_name(path, 3) == Some("agent")
+        && matches!(ancestor_name(path, 4), Some(".omp" | ".pi"))
+}
+
+fn ancestor_name(path: &Path, nth: usize) -> Option<&str> {
+    path.ancestors()
+        .nth(nth)
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+}
+
+/// Metadata fingerprint of the finite source bundle. Copilot's optional
+/// workspace sidecar participates because an unchanged event stream can gain
+/// a repository association or title when that sidecar changes.
+pub(crate) fn source_bundle_fingerprint(path: &Path) -> std::io::Result<SourceFingerprint> {
+    let mut fingerprint = SourceFingerprint::from_path(path, &fs::metadata(path)?)?;
+    if is_copilot_source_file(path) {
+        let mut bundle = Sha256::new();
+        bundle.update(b"copilot-source-bundle.v1\0events.jsonl\0");
+        bundle.update(fingerprint.len.to_le_bytes());
+        bundle.update(fingerprint.modified_unix_nanos.to_le_bytes());
+        bundle.update(b"workspace.yaml\0");
+        if let Some(sidecar) = path.parent().map(|parent| parent.join("workspace.yaml"))
+            && let Ok(metadata) = fs::symlink_metadata(&sidecar)
+            && metadata.is_file()
+        {
+            let companion = SourceFingerprint::from_path(&sidecar, &metadata)?;
+            bundle.update(b"present\0");
+            bundle.update(companion.len.to_le_bytes());
+            bundle.update(companion.modified_unix_nanos.to_le_bytes());
+            // Native workspace metadata is small. Hash its bytes inside the
+            // same bounded metadata budget, catching preserved-mtime edits
+            // too; oversized sidecars still retain independent size+mtime.
+            if companion.len <= MAX_HEADER_BYTES as u64 {
+                let file =
+                    sanitize::open_file_validated(&sidecar).map_err(std::io::Error::other)?;
+                let mut bytes = Vec::new();
+                file.take(MAX_HEADER_BYTES as u64 + 1)
+                    .read_to_end(&mut bytes)?;
+                bundle.update(b"content\0");
+                bundle.update(Sha256::digest(&bytes));
+            } else {
+                bundle.update(b"oversized-metadata\0");
+            }
+            fingerprint.len = fingerprint.len.saturating_add(companion.len);
+            fingerprint.modified_unix_nanos = fingerprint
+                .modified_unix_nanos
+                .max(companion.modified_unix_nanos);
+        } else {
+            bundle.update(b"absent\0");
+        }
+        fingerprint.bundle_fingerprint = Some(hex::encode(bundle.finalize()));
+    } else if is_agy_source_file(path) {
+        // WAL appends move `.db-wal` while `.db` mtime stays put. Stat only:
+        // opening the database would refresh `.db-shm` and is not a catalog probe.
+        let mut bundle = Sha256::new();
+        bundle.update(b"agy-source-bundle.v1\0db\0");
+        bundle.update(fingerprint.len.to_le_bytes());
+        bundle.update(fingerprint.modified_unix_nanos.to_le_bytes());
+        bundle.update(b"db-wal\0");
+        let wal = path.with_extension("db-wal");
+        if let Ok(metadata) = fs::symlink_metadata(&wal)
+            && metadata.is_file()
+        {
+            let modified = metadata
+                .modified()
+                .unwrap_or(SystemTime::UNIX_EPOCH)
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            bundle.update(b"present\0");
+            bundle.update(metadata.len().to_le_bytes());
+            bundle.update(modified.to_le_bytes());
+            fingerprint.modified_unix_nanos = fingerprint.modified_unix_nanos.max(modified);
+        } else {
+            bundle.update(b"absent\0");
+        }
+        fingerprint.bundle_fingerprint = Some(hex::encode(bundle.finalize()));
+    }
+    Ok(fingerprint)
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct CopilotMetadata {
+    pub cwd: Option<String>,
+    pub repository: Option<String>,
+    pub title: Option<String>,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
+}
+
+/// Bounded metadata probe, with the event header taking precedence over the
+/// optional YAML sidecar. A malformed sidecar never hides valid events.
+pub(crate) fn copilot_metadata(path: &Path) -> CopilotMetadata {
+    let mut metadata = CopilotMetadata::default();
+    if let Ok(file) = sanitize::open_file_validated(path) {
+        let mut reader = BufReader::new(file.take(MAX_HEADER_BYTES as u64));
+        for _ in 0..MAX_HEADER_LINES {
+            let Ok(Some(line)) = sanitize::read_line_capped(&mut reader, MAX_HEADER_LINE_BYTES)
+            else {
+                break;
+            };
+            if line.exceeded {
+                continue;
+            }
+            let Ok(value) = serde_json::from_str::<Value>(line.line.trim()) else {
+                continue;
+            };
+            let event_type = value.get("type").and_then(Value::as_str);
+            if !matches!(event_type, Some("session.start" | "session.resume")) {
+                continue;
+            }
+            let data = &value["data"];
+            if let Some(cwd) = nonempty_string(&data["context"]["cwd"])
+                .or_else(|| nonempty_string(&data["context"]["gitRoot"]))
+            {
+                metadata.cwd = Some(cwd);
+            }
+            if let Some(repository) = nonempty_string(&data["context"]["repository"]) {
+                metadata.repository = Some(repository);
+            }
+            if event_type == Some("session.start") && metadata.created_at.is_none() {
+                metadata.created_at = nonempty_string(&data["startTime"])
+                    .or_else(|| nonempty_string(&value["timestamp"]));
+            }
+            if event_type == Some("session.resume") {
+                metadata.updated_at = nonempty_string(&value["timestamp"]);
+            }
         }
     }
+    if let Some(sidecar) = path.parent().map(|parent| parent.join("workspace.yaml"))
+        && fs::symlink_metadata(&sidecar).is_ok_and(|metadata| metadata.is_file())
+        && let Ok(file) = sanitize::open_file_validated(&sidecar)
+    {
+        let mut bytes = Vec::new();
+        if file
+            .take(MAX_HEADER_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)
+            .is_ok()
+            && bytes.len() <= MAX_HEADER_BYTES
+            && let Ok(value) = serde_yaml::from_slice::<Value>(&bytes)
+        {
+            metadata.cwd = metadata.cwd.or_else(|| {
+                nonempty_string(&value["cwd"]).or_else(|| nonempty_string(&value["git_root"]))
+            });
+            metadata.repository = metadata
+                .repository
+                .or_else(|| nonempty_string(&value["repository"]));
+            metadata.title = nonempty_string(&value["name"]);
+            metadata.created_at = metadata
+                .created_at
+                .or_else(|| nonempty_string(&value["created_at"]));
+            metadata.updated_at = nonempty_string(&value["updated_at"]).or(metadata.updated_at);
+        }
+    }
+    metadata
+}
+
+fn nonempty_string(value: &Value) -> Option<String> {
+    value
+        .as_str()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_owned)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -371,7 +712,11 @@ impl SessionCatalog {
         Ok(Self {
             agent,
             root,
-            max_depth: MAX_SCAN_DEPTH,
+            max_depth: if agent == AgentKind::Copilot {
+                1
+            } else {
+                MAX_SCAN_DEPTH
+            },
         })
     }
 
@@ -420,6 +765,11 @@ impl SessionCatalog {
         // A filename UUID is the physical source authority. Exact UUID lookup
         // can therefore open only the matching header and avoid touching an
         // arbitrarily large unrelated corpus.
+        //
+        // Cursor stores that same filename UUID once per project the
+        // conversation touched. Those copies are one session. Every other
+        // agent still treats two physical files with one filename UUID as
+        // ambiguity — a shared catalog must not collapse unrelated sessions.
         let uuid_matches: Vec<&CandidatePath> = candidates
             .iter()
             .filter(|candidate| {
@@ -430,6 +780,14 @@ impl SessionCatalog {
             })
             .collect();
         if uuid_matches.len() > 1 {
+            if self.agent == AgentKind::Cursor && is_uuid(&query) {
+                return self.resolve_cursor_same_id_project_copies(
+                    query,
+                    &uuid_matches,
+                    candidates.len(),
+                    stats,
+                );
+            }
             let mut summaries = uuid_matches
                 .into_iter()
                 .map(|candidate| CatalogCandidateSummary {
@@ -463,6 +821,63 @@ impl SessionCatalog {
 
         let sources = self.probe_candidates(&candidates, stats)?;
         resolve_from_sources(self.agent, query, sources)
+    }
+
+    /// Cursor writes `<project>/agent-transcripts/<uuid>/<uuid>.jsonl` for
+    /// every project a conversation touched. The filename UUID is one session
+    /// id, so an exact full-id query prefers more messages in the bounded
+    /// identity probe, then byte length, freshness, and the smaller path.
+    /// This inspects each matching header, never unrelated conversation bodies.
+    /// Prefix collisions of different ids never reach this function.
+    fn resolve_cursor_same_id_project_copies(
+        &self,
+        query: String,
+        matches: &[&CandidatePath],
+        candidates_scanned: usize,
+        stats: &mut CatalogIoStats,
+    ) -> Result<ResolvedSource, CatalogError> {
+        let copies = matches.len();
+        let mut ranked = Vec::with_capacity(copies);
+        for candidate in matches {
+            let mut message_count = 0;
+            if let Some(source) =
+                self.probe_candidate_with_message_count(candidate, stats, &mut message_count)?
+            {
+                ranked.push((message_count, source));
+            }
+        }
+        ranked.sort_by(|left, right| {
+            right
+                .0
+                .cmp(&left.0)
+                .then_with(|| right.1.fingerprint.len.cmp(&left.1.fingerprint.len))
+                .then_with(|| {
+                    right
+                        .1
+                        .fingerprint
+                        .modified_unix_nanos
+                        .cmp(&left.1.fingerprint.modified_unix_nanos)
+                })
+                .then_with(|| left.1.path.cmp(&right.1.path))
+        });
+        let source = ranked
+            .into_iter()
+            .next()
+            .map(|(_, source)| source)
+            .ok_or_else(|| CatalogError::Missing {
+                query: query.clone(),
+                agent: self.agent,
+                candidates_scanned,
+            })?;
+        let kept = source.path.display().to_string();
+        Ok(ResolvedSource {
+            query: query.clone(),
+            matched_by: MatchKind::ExactSourceId,
+            source,
+            substitution_notice: Some(format!(
+                "substituted: {query} kept most complete of {copies} cursor project copies (bounded message count, then bytes and newest) → {kept}"
+            )),
+        })
     }
 
     fn scan_sources_with_progress(
@@ -528,11 +943,31 @@ impl SessionCatalog {
 
         let mut candidates = Vec::with_capacity(paths.len());
         for path in paths {
-            let Ok(metadata) = fs::metadata(&path) else {
-                stats.rejected_paths += 1;
-                continue;
+            let fingerprint = match source_bundle_fingerprint(&path) {
+                Ok(fingerprint) => fingerprint,
+                Err(error)
+                    if matches!(
+                        self.agent,
+                        AgentKind::Copilot | AgentKind::Omp | AgentKind::Agy
+                    ) =>
+                {
+                    return Err(CatalogError::Io {
+                        path,
+                        message: error.to_string(),
+                    });
+                }
+                Err(_) => {
+                    stats.rejected_paths += 1;
+                    continue;
+                }
             };
-            let mut filename_aliases = filename_aliases(&path);
+            let mut filename_aliases = if self.agent == AgentKind::Copilot {
+                // Every Copilot source is called events.jsonl; exposing that
+                // stem as an alias would make unrelated sessions ambiguous.
+                Vec::new()
+            } else {
+                filename_aliases(&path)
+            };
             let filename_uuid = path
                 .file_stem()
                 .and_then(|stem| stem.to_str())
@@ -551,6 +986,17 @@ impl SessionCatalog {
                     } else {
                         None
                     }
+                })
+                .or_else(|| {
+                    (self.agent == AgentKind::Copilot)
+                        .then(|| {
+                            path.parent()
+                                .and_then(Path::file_name)
+                                .and_then(|name| name.to_str())
+                                .filter(|name| is_copilot_source_id(name))
+                                .map(str::to_owned)
+                        })
+                        .flatten()
                 })
                 .or_else(|| {
                     // Kimi layout: `…/wd_<slug>_<hex>/session_<uuid>/agents/<agentId>/wire.jsonl`.
@@ -597,7 +1043,7 @@ impl SessionCatalog {
                 path,
                 filename_aliases,
                 filename_uuid,
-                fingerprint: SourceFingerprint::from_metadata(&metadata),
+                fingerprint,
             });
             on_progress(stats);
         }
@@ -665,6 +1111,14 @@ impl SessionCatalog {
         for candidate in candidates {
             match self.probe_candidate(candidate, stats) {
                 Ok(Some(source)) => sources.push(source),
+                Err(error @ CatalogError::Io { .. })
+                    if matches!(
+                        self.agent,
+                        AgentKind::Copilot | AgentKind::Omp | AgentKind::Agy
+                    ) =>
+                {
+                    return Err(error);
+                }
                 Ok(None) | Err(CatalogError::Io { .. }) => stats.rejected_paths += 1,
                 Err(error) => return Err(error),
             }
@@ -683,6 +1137,36 @@ impl SessionCatalog {
         candidate: &CandidatePath,
         stats: &mut CatalogIoStats,
     ) -> Result<Option<CatalogSource>, CatalogError> {
+        self.probe_candidate_with_message_count(candidate, stats, &mut 0)
+    }
+
+    fn probe_candidate_with_message_count(
+        &self,
+        candidate: &CandidatePath,
+        stats: &mut CatalogIoStats,
+        message_count: &mut usize,
+    ) -> Result<Option<CatalogSource>, CatalogError> {
+        // SQLite conversation files are not JSONL. Reading them as text
+        // fails on the first non-UTF-8 byte. The filename UUID is the
+        // catalog identity; the body is opened later, read-only, by the
+        // agy materializer.
+        if self.agent == AgentKind::Agy {
+            let Some(source_id) = candidate.filename_uuid.clone() else {
+                return Ok(None);
+            };
+            return Ok(Some(CatalogSource {
+                agent: self.agent,
+                source_id,
+                logical_session_id: None,
+                aliases: Vec::new(),
+                filename_aliases: candidate.filename_aliases.clone(),
+                scoped_children: Vec::new(),
+                path: candidate.path.clone(),
+                identity_inferred: true,
+                fingerprint: candidate.fingerprint.clone(),
+                header_truncated: false,
+            }));
+        }
         let file =
             sanitize::open_file_validated(&candidate.path).map_err(|error| CatalogError::Io {
                 path: candidate.path.clone(),
@@ -713,6 +1197,15 @@ impl SessionCatalog {
                 json_prefix.push_str(&line.line);
             }
             if let Ok(value) = serde_json::from_str::<Value>(line.line.trim()) {
+                if self.agent == AgentKind::Cursor
+                    && matches!(
+                        value.get("role").and_then(Value::as_str),
+                        Some("user" | "assistant")
+                    )
+                    && value.get("message").is_some_and(Value::is_object)
+                {
+                    *message_count += 1;
+                }
                 observe_record(self.agent, &value, &mut root_ids, &mut children);
             }
         }
@@ -898,6 +1391,36 @@ fn observe_record(
         return;
     };
 
+    if agent == AgentKind::Copilot {
+        // Event ids and parentId form an event chain, not session identity.
+        // Only session.start may assert the logical root id.
+        if object.get("type").and_then(Value::as_str) == Some("session.start")
+            && let Some(id) = object
+                .get("data")
+                .and_then(|data| data.get("sessionId"))
+                .and_then(Value::as_str)
+                .and_then(validate_identity)
+        {
+            root_ids.push(id);
+        }
+        return;
+    }
+
+    if agent == AgentKind::Omp {
+        // Message ids are tree nodes inside one file. Only the session header
+        // asserts the logical root. A generic `id` read would adopt the first
+        // message id and split one transcript into a child.
+        if object.get("type").and_then(Value::as_str) == Some("session")
+            && let Some(id) = object
+                .get("id")
+                .and_then(Value::as_str)
+                .and_then(validate_identity)
+        {
+            root_ids.push(id);
+        }
+        return;
+    }
+
     if matches!(agent, AgentKind::Codex | AgentKind::Grok)
         && object.get("type").and_then(Value::as_str) == Some("session_meta")
     {
@@ -1075,4 +1598,297 @@ fn dedupe_ordered(values: &mut Vec<String>) {
 fn dedupe_children_ordered(values: &mut Vec<ScopedChildIdentity>) {
     let mut seen = BTreeSet::new();
     values.retain(|value| seen.insert(value.id.to_ascii_lowercase()));
+}
+
+#[cfg(test)]
+mod copilot_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    const ID: &str = "12345678-1234-1234-1234-123456789abc";
+
+    fn root() -> PathBuf {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir()
+            .join(format!(
+                "aicx-copilot-catalog-{}-{}",
+                std::process::id(),
+                N.fetch_add(1, Ordering::Relaxed)
+            ))
+            .join(".copilot")
+            .join("session-state");
+        fs::create_dir_all(root.join(ID)).unwrap();
+        root
+    }
+
+    fn event(root: &Path) -> PathBuf {
+        let path = root.join(ID).join("events.jsonl");
+        fs::write(&path, format!("{{\"type\":\"session.start\",\"id\":\"event-id\",\"data\":{{\"sessionId\":\"{ID}\",\"context\":{{\"cwd\":\"/repo/current\"}}}}}}\n")).unwrap();
+        path
+    }
+
+    #[test]
+    fn copilot_catalog_admits_only_direct_conversation_events() {
+        let root = root();
+        let events = event(&root);
+        let nested = root.join(ID).join("checkpoints").join(ID);
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(nested.join("events.jsonl"), "{}\n").unwrap();
+        fs::write(root.join(ID).join("tool.jsonl"), "{}\n").unwrap();
+        let global = root.parent().unwrap().join("events.jsonl");
+        fs::write(&global, "{}\n").unwrap();
+        assert!(!is_copilot_source_file(&global));
+        let scan = SessionCatalog::new(AgentKind::Copilot, &root)
+            .unwrap()
+            .scan_with_stats();
+        let sources = scan.result.unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].path, events.canonicalize().unwrap());
+        assert_eq!(sources[0].source_id, ID);
+        assert_eq!(sources[0].logical_session_id.as_deref(), Some(ID));
+        assert!(
+            !sources[0]
+                .filename_aliases
+                .iter()
+                .any(|alias| alias == "events" || alias == "events.jsonl")
+        );
+        assert_eq!(scan.stats.body_reads, 0);
+        assert_eq!(scan.stats.files_opened, 1);
+        fs::remove_dir_all(root.parent().unwrap().parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn copilot_directory_identity_resolves_exact_and_prefix_despite_logical_drift() {
+        let root = root();
+        let events = event(&root);
+        fs::write(&events, "{\"type\":\"session.start\",\"id\":\"event-id\",\"data\":{\"sessionId\":\"logical-alias\"}}\n").unwrap();
+        let catalog = SessionCatalog::new(AgentKind::Copilot, &root).unwrap();
+        let exact = catalog.resolve(ID).unwrap();
+        assert_eq!(exact.matched_by, MatchKind::ExactSourceId);
+        assert_eq!(exact.source.source_id, ID);
+        assert_eq!(
+            catalog.resolve("12345678").unwrap().matched_by,
+            MatchKind::UniquePrefix
+        );
+        assert_eq!(
+            catalog.resolve("logical-alias").unwrap().matched_by,
+            MatchKind::ExactLogicalId
+        );
+        assert!(matches!(
+            catalog.resolve("events"),
+            Err(CatalogError::Missing { .. })
+        ));
+        fs::remove_dir_all(root.parent().unwrap().parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn copilot_optional_sidecar_falls_back_and_malformed_yaml_preserves_events() {
+        let root = root();
+        let events = event(&root);
+        let sidecar = events.parent().unwrap().join("workspace.yaml");
+        fs::write(&sidecar, "cwd: /repo/stale\nname: session title\nrepository: owner/repo\ncreated_at: '2026-06-01T12:00:00Z'\n").unwrap();
+        let metadata = copilot_metadata(&events);
+        assert_eq!(metadata.cwd.as_deref(), Some("/repo/current"));
+        assert_eq!(metadata.repository.as_deref(), Some("owner/repo"));
+        assert_eq!(metadata.title.as_deref(), Some("session title"));
+        fs::write(&sidecar, "cwd: [unterminated\n").unwrap();
+        let metadata = copilot_metadata(&events);
+        assert_eq!(metadata.cwd.as_deref(), Some("/repo/current"));
+        assert!(metadata.title.is_none());
+        assert_eq!(
+            SessionCatalog::new(AgentKind::Copilot, &root)
+                .unwrap()
+                .scan_with_stats()
+                .result
+                .unwrap()
+                .len(),
+            1
+        );
+        fs::remove_dir_all(root.parent().unwrap().parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn copilot_bundle_fingerprint_observes_sidecar_edit_and_removal() {
+        let root = root();
+        let events = event(&root);
+        let only_events = source_bundle_fingerprint(&events).unwrap();
+        let sidecar = events.parent().unwrap().join("workspace.yaml");
+        fs::write(&sidecar, "name: first\n").unwrap();
+        let before = source_bundle_fingerprint(&events).unwrap();
+        assert_ne!(before, only_events);
+        fs::write(&sidecar, "name: other\n").unwrap();
+        filetime::set_file_mtime(
+            &sidecar,
+            filetime::FileTime::from_unix_time(
+                (before.modified_unix_nanos / 1_000_000_000) as i64 + 2,
+                0,
+            ),
+        )
+        .unwrap();
+        let after = source_bundle_fingerprint(&events).unwrap();
+        assert_eq!(before.len, after.len);
+        assert_ne!(before, after);
+        fs::remove_file(&sidecar).unwrap();
+        assert_eq!(source_bundle_fingerprint(&events).unwrap(), only_events);
+        fs::remove_dir_all(root.parent().unwrap().parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn copilot_bundle_retains_sidecar_evidence_under_future_event_mtime() {
+        let root = root();
+        let events = event(&root);
+        filetime::set_file_mtime(
+            &events,
+            filetime::FileTime::from_unix_time(2_000_000_000, 0),
+        )
+        .unwrap();
+        let sidecar = events.parent().unwrap().join("workspace.yaml");
+        fs::write(&sidecar, "name: first\n").unwrap();
+        filetime::set_file_mtime(
+            &sidecar,
+            filetime::FileTime::from_unix_time(1_700_000_000, 0),
+        )
+        .unwrap();
+        let before = source_bundle_fingerprint(&events).unwrap();
+        fs::write(&sidecar, "name: other\n").unwrap();
+        filetime::set_file_mtime(
+            &sidecar,
+            filetime::FileTime::from_unix_time(1_700_000_001, 0),
+        )
+        .unwrap();
+        let after = source_bundle_fingerprint(&events).unwrap();
+        assert_eq!(
+            before.len, after.len,
+            "size is the physical total, not an encoded hash"
+        );
+        assert_eq!(
+            before.modified_unix_nanos, after.modified_unix_nanos,
+            "recency remains the newest artifact timestamp"
+        );
+        assert_ne!(before.bundle_fingerprint, after.bundle_fingerprint);
+        fs::write(&sidecar, "name: third\n").unwrap();
+        filetime::set_file_mtime(
+            &sidecar,
+            filetime::FileTime::from_unix_time(1_700_000_001, 0),
+        )
+        .unwrap();
+        let preserved_mtime = source_bundle_fingerprint(&events).unwrap();
+        assert_eq!(after.len, preserved_mtime.len);
+        assert_eq!(
+            after.modified_unix_nanos,
+            preserved_mtime.modified_unix_nanos
+        );
+        assert_ne!(
+            after.bundle_fingerprint, preserved_mtime.bundle_fingerprint,
+            "bounded workspace content hash also observes a preserved-mtime edit"
+        );
+        fs::remove_dir_all(root.parent().unwrap().parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn physical_identity_detects_same_size_restored_mtime_and_atomic_replace() {
+        let root = root();
+        let events = event(&root);
+        fs::write(&events, b"aaaa\n").unwrap();
+        let before = source_bundle_fingerprint(&events).unwrap();
+        let pinned_mtime =
+            filetime::FileTime::from_last_modification_time(&fs::metadata(&events).unwrap());
+
+        fs::write(&events, b"bbbb\n").unwrap();
+        filetime::set_file_mtime(&events, pinned_mtime).unwrap();
+        let rewritten = source_bundle_fingerprint(&events).unwrap();
+        assert_eq!(before.len, rewritten.len);
+        assert_eq!(before.modified_unix_nanos, rewritten.modified_unix_nanos);
+        assert_ne!(
+            before.physical_identity, rewritten.physical_identity,
+            "same-size restored-mtime rewrite must move physical identity"
+        );
+
+        #[cfg(unix)]
+        {
+            let replacement = events.with_extension("replacement");
+            fs::write(&replacement, b"bbbb\n").unwrap();
+            filetime::set_file_mtime(&replacement, pinned_mtime).unwrap();
+            fs::rename(&replacement, &events).unwrap();
+            let replaced = source_bundle_fingerprint(&events).unwrap();
+            assert_eq!(rewritten.len, replaced.len);
+            assert_eq!(rewritten.modified_unix_nanos, replaced.modified_unix_nanos);
+            assert_ne!(
+                rewritten.physical_identity, replaced.physical_identity,
+                "atomic replacement must move inode/ctime identity"
+            );
+        }
+
+        fs::remove_dir_all(root.parent().unwrap().parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn copilot_missing_selected_source_is_io_error_while_empty_root_is_empty() {
+        let root = root();
+        let events = event(&root);
+        let catalog = SessionCatalog::new(AgentKind::Copilot, &root).unwrap();
+        let mut stats = CatalogIoStats::default();
+        let candidates = catalog.collect_candidate_paths(&mut stats).unwrap();
+        fs::remove_file(events).unwrap();
+        assert!(matches!(
+            catalog.probe_candidates(&candidates, &mut stats),
+            Err(CatalogError::Io { .. })
+        ));
+        assert!(catalog.scan_with_stats().result.unwrap().is_empty());
+        fs::remove_dir_all(root.parent().unwrap().parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn copilot_provider_roots_and_aliases_are_canonical() {
+        for alias in [
+            "copilot",
+            "copilot-cli",
+            "github-copilot",
+            "github-copilot-cli",
+        ] {
+            assert_eq!(AgentKind::parse(alias), Some(AgentKind::Copilot));
+        }
+        assert_eq!(
+            copilot_session_root_from(Path::new("/home/user"), None),
+            PathBuf::from("/home/user/.copilot/session-state")
+        );
+        assert_eq!(
+            copilot_session_root_from(Path::new("/home/user"), Some(std::ffi::OsStr::new(""))),
+            PathBuf::from("/home/user/.copilot/session-state")
+        );
+        assert_eq!(
+            copilot_session_root_from(
+                Path::new("/home/user"),
+                Some(std::ffi::OsStr::new("/custom/copilot-home"))
+            ),
+            PathBuf::from("/custom/copilot-home/session-state")
+        );
+        assert!(AgentKind::ALL.contains(&AgentKind::Copilot));
+    }
+
+    #[test]
+    fn copilot_sdk_named_session_id_is_physical_identity_for_exact_and_prefix_lookup() {
+        let root = root();
+        let named = "user-123-task-456";
+        let directory = root.join(named);
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(
+            directory.join("events.jsonl"),
+            format!("{{\"type\":\"session.start\",\"data\":{{\"sessionId\":\"{named}\"}}}}\n"),
+        )
+        .unwrap();
+        let catalog = SessionCatalog::new(AgentKind::Copilot, &root).unwrap();
+        let exact = catalog.resolve(named).unwrap();
+        assert_eq!(exact.source.source_id, named);
+        assert_eq!(exact.matched_by, MatchKind::ExactSourceId);
+        assert_eq!(catalog.resolve("user-123").unwrap().source.source_id, named);
+        assert!(is_copilot_source_file(&directory.join("events.jsonl")));
+        assert!(!is_copilot_source_file(
+            &root.join("unsafe:id").join("events.jsonl")
+        ));
+        assert!(!is_copilot_source_file(
+            &root.join(".hidden").join("events.jsonl")
+        ));
+        fs::remove_dir_all(root.parent().unwrap().parent().unwrap()).unwrap();
+    }
 }

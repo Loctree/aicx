@@ -135,6 +135,7 @@ fn seed_session(aicx_home: &Path) -> PathBuf {
         source_path: source.display().to_string(),
         source_len: Some(source_len),
         source_mtime_ns: Some(source_mtime_ns),
+        source_bundle_fingerprint: None,
         title: Some("vc-trust replay".to_string()),
         machine: Some("scratch".to_string()),
         logical_session_id: None,

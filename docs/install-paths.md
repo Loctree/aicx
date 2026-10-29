@@ -53,6 +53,29 @@ npm @loctree/aicx
   -> node_modules/@loctree/aicx-<platform>/aicx-mcp
 ```
 
+## Background dashboard and MCP
+
+The native installers run the hybrid `aicx serve`, not standalone `aicx-mcp`,
+so one reader-only process serves both `/` and `/mcp` on loopback port 8044.
+Linux uses a systemd user unit; macOS uses a LaunchAgent. From a non-Aqua
+macOS shell, installation writes the plist successfully and defers activation
+until GUI login.
+
+Windows uses an interactive-logon scheduled task named `AICX-MCP-<user SID>`,
+running as the current user without elevation, only while that user is logged
+in. It resolves npm shims to the prebuilt native `aicx.exe`. Failed task
+activation restores the previous owned task; foreign task registrations and
+legacy Windows services are never stopped or deleted. A legacy service
+occupying port 8044 must be inspected and retired explicitly by its operator
+before retrying. The installed task XML is recorded at
+`%LOCALAPPDATA%\aicx\aicx-mcp-service.xml` for onboarding.
+The task uses an encoded, no-profile PowerShell action to persist an explicitly
+set `AICX_HOME`, without modifying user or system environment settings. If the
+installer has no override, the action removes any ambient `AICX_HOME` so the
+native resolver honors the installing user's `[storage].home` configuration.
+Readiness requires the listener to descend
+from that registration's unique wrapper, not merely match its binary name.
+
 ## Channels
 
 | Channel | Trigger | Target | Shadow behavior |

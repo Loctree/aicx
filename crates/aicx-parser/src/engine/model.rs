@@ -419,6 +419,28 @@ pub enum ProviderConversationRef {
         worker_id: Option<String>,
         unobserved: Vec<String>,
     },
+    /// Copilot CLI's `session.start.data.sessionId` names the saved conversation.
+    /// A detached continuation can explicitly name its spawning parent session.
+    Copilot {
+        session_id: String,
+        parent_session_id: Option<String>,
+        unobserved: Vec<String>,
+    },
+    /// oh-my-pi / omp session header. `session_id` is the uuid from the
+    /// `session` record (the filename uuid when the header is absent).
+    /// `parent_session_id` is `parentSession` when the header carried it.
+    Omp {
+        session_id: String,
+        parent_session_id: Option<String>,
+        unobserved: Vec<String>,
+    },
+    /// Native Antigravity CLI conversation. `session_id` is the cascade id.
+    /// `trajectory_id` is field 3 of the metadata blob when that field is present.
+    Agy {
+        session_id: String,
+        trajectory_id: Option<String>,
+        unobserved: Vec<String>,
+    },
 }
 
 impl ProviderConversationRef {
@@ -469,6 +491,21 @@ impl ProviderConversationRef {
                 worker_id: None,
                 unobserved: vec!["worker_id".to_owned()],
             },
+            AgentKind::Copilot => Self::Copilot {
+                session_id: store_id,
+                parent_session_id: None,
+                unobserved: vec!["parent_session_id".to_owned()],
+            },
+            AgentKind::Omp => Self::Omp {
+                session_id: store_id,
+                parent_session_id: None,
+                unobserved: vec!["parent_session_id".to_owned()],
+            },
+            AgentKind::Agy => Self::Agy {
+                session_id: store_id,
+                trajectory_id: None,
+                unobserved: vec!["trajectory_id".to_owned()],
+            },
         }
     }
 
@@ -481,6 +518,9 @@ impl ProviderConversationRef {
             Self::Junie { .. } => AgentKind::Junie,
             Self::Kimi { .. } => AgentKind::Kimi,
             Self::Cursor { .. } => AgentKind::Cursor,
+            Self::Copilot { .. } => AgentKind::Copilot,
+            Self::Omp { .. } => AgentKind::Omp,
+            Self::Agy { .. } => AgentKind::Agy,
         }
     }
 
@@ -493,7 +533,10 @@ impl ProviderConversationRef {
             | Self::Grok { session_id, .. }
             | Self::Junie { session_id, .. }
             | Self::Kimi { session_id, .. }
-            | Self::Cursor { session_id, .. } => session_id,
+            | Self::Cursor { session_id, .. }
+            | Self::Copilot { session_id, .. }
+            | Self::Omp { session_id, .. }
+            | Self::Agy { session_id, .. } => session_id,
             Self::Codex {
                 tree_session_id,
                 thread_id,
@@ -507,6 +550,18 @@ impl ProviderConversationRef {
     /// (sub-agent parent). Claude has none at session level.
     pub fn declared_parents(&self) -> Vec<(&'static str, &str)> {
         match self {
+            Self::Copilot {
+                parent_session_id: Some(id),
+                ..
+            } => {
+                vec![("detached_from_spawning_parent_session_id", id.as_str())]
+            }
+            Self::Omp {
+                parent_session_id: Some(id),
+                ..
+            } => {
+                vec![("parentSession", id.as_str())]
+            }
             Self::Codex {
                 forked_from_id,
                 parent_thread_id,
@@ -533,7 +588,10 @@ impl ProviderConversationRef {
             | Self::Grok { unobserved, .. }
             | Self::Junie { unobserved, .. }
             | Self::Kimi { unobserved, .. }
-            | Self::Cursor { unobserved, .. } => unobserved,
+            | Self::Cursor { unobserved, .. }
+            | Self::Copilot { unobserved, .. }
+            | Self::Omp { unobserved, .. }
+            | Self::Agy { unobserved, .. } => unobserved,
         }
     }
 }

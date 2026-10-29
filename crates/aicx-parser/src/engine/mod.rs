@@ -45,9 +45,10 @@ pub use refusal::{
     RefusalEvidence, RefusalReason, SubstitutionError, SubstitutionKind,
 };
 pub use scope_evidence::{
-    WindowScope, WorkdirEvidence, WorkdirIdentity, distinct_repo_identity, effective_window_scope,
-    is_tool_call_payload_type, normalize_workdir, recorded_workdir, repository_count,
-    scope_layout_evidence, tool_call_workdirs, truncated_record_is_tool_call, workdir_within_scope,
+    WindowScope, WorkdirEvidence, WorkdirIdentity, absolute_anywhere, distinct_repo_identity,
+    effective_window_scope, is_tool_call_payload_type, normalize_workdir, recorded_workdir,
+    repository_count, scope_layout_evidence, tool_call_workdirs, truncated_record_is_tool_call,
+    workdir_within_scope,
 };
 pub use source::{AgentKind, SourceArtifact, SourceError, SourceFraming, SourceHandle};
 pub use validate::{

@@ -3,13 +3,18 @@ use crate::extraction::*;
 use anyhow::Result;
 use chrono::{Duration, NaiveDate, NaiveTime, TimeZone};
 use serde::Deserialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::BufReader;
 
 use crate::importers::operator_markdown::split_operator_frontmatter;
 use crate::timeline::FrameKind;
 
 pub(crate) const CODESCRIBE_AGENT: &str = "codescribe";
+/// Catalog bucket of dictated takes. A take names no repository, and intents
+/// serves only bucketed sessions, so dictation gets one explicit non-repo
+/// bucket (`local/<name>`, like other remote-less buckets) instead of a
+/// project guessed from its words.
+pub const CODESCRIBE_DICTATION_PROJECT: &str = "local/codescribe-dictation";
 const CODESCRIBE_TRANSCRIPT_KIND: &str = "transcript";
 const CODESCRIBE_NO_SPEECH_MARKERS: &[&str] = &[
     "no reliable speech detected",
@@ -410,14 +415,7 @@ fn parse_codescribe_transcript_with_lexicon(
         _ => parse_plain_codescribe_text(&content),
     };
 
-    let session_id = format!(
-        "{}-{}-codescribe-{}",
-        codescribe_path_fingerprint(path),
-        path.file_stem()
-            .map(|stem| stem.to_string_lossy())
-            .unwrap_or_else(|| "unknown".into()),
-        date.format("%Y-%m-%d")
-    );
+    let session_id = codescribe_session_id(path, date);
     let source_file = path.display();
 
     let mut entries = Vec::new();
@@ -432,8 +430,10 @@ fn parse_codescribe_transcript_with_lexicon(
             .duration_ms
             .map(|value| value.to_string())
             .unwrap_or_else(|| "unknown".to_string());
+        // The `<codescribe>` envelope gives dictation the same
+        // `voice_transcript` provenance in intents as bus speech.
         let message = format!(
-            "kind: {CODESCRIBE_TRANSCRIPT_KIND}\nspeaker_hint: {speaker_hint}\nsource_file: {source_file}\naudio_offset_ms: {}\nduration_ms: {duration}\n\n{}",
+            "kind: {CODESCRIBE_TRANSCRIPT_KIND}\nspeaker_hint: {speaker_hint}\nsource_file: {source_file}\naudio_offset_ms: {}\nduration_ms: {duration}\n\n<codescribe>{}</codescribe>",
             segment.start_ms, segment.text
         );
 
@@ -455,6 +455,94 @@ fn parse_codescribe_transcript_with_lexicon(
     }
 
     Ok(entries)
+}
+
+/// Session identity of one transcript file, shared by the importer and the
+/// catalog so both name the same session.
+pub(crate) fn codescribe_session_id(path: &Path, date: NaiveDate) -> String {
+    format!(
+        "{}-{}-codescribe-{}",
+        codescribe_path_fingerprint(path),
+        path.file_stem()
+            .map(|stem| stem.to_string_lossy())
+            .unwrap_or_else(|| "unknown".into()),
+        date.format("%Y-%m-%d")
+    )
+}
+
+/// One transcript per recorded take, for the session catalog.
+///
+/// Codescribe's filename contract: a take is archived as
+/// `<HHMMSS_slug>_<variant>[_<n>].txt`, where `_raw` is the recognizer text
+/// beside the take's `<stem>_raw.m4a`, `_cloud` another recognizer's output,
+/// `_ai` / `_formatted` formatter rewrites, and `_failed` a take with no
+/// transcript. A numeric `_<n>` after the variant is a colliding second text
+/// file: it plays the base stem's audio (`archivedAudioCandidates` in the app),
+/// so it is another export of the same take. Only a numbered file with audio
+/// of its own is a distinct recording.
+///
+/// A take is cataloged once: its unnumbered `_raw` first, then numbered raw
+/// exports, then `_cloud`. Formatter rewrites and failed takes — numbered or
+/// not — are never cataloged; a take with only a rewrite is left out rather
+/// than attributed to the speaker verbatim. Files without a variant (chat
+/// `.md`, whisper `.json`) are their own take.
+pub fn catalog_takes(home: &Path) -> Vec<CodescribeTranscript> {
+    let mut takes: BTreeMap<(NaiveDate, String), ((u8, u64), CodescribeTranscript)> =
+        BTreeMap::new();
+    for transcript in discover_codescribe_transcripts(home) {
+        let Some(stem) = transcript.path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        let (take, variant, collision) = split_take_variant(stem);
+        let rank = match variant {
+            Some("raw") | None => 0,
+            Some("cloud") => 1,
+            _ => continue,
+        };
+        // A numbered export with its own recording is a take of its own.
+        let take = if collision.is_some() && has_own_audio(&transcript.path) {
+            stem
+        } else {
+            take
+        };
+        let priority = (rank, collision.unwrap_or(0));
+        let key = (transcript.date, take.to_owned());
+        match takes.get(&key) {
+            Some((kept, _)) if *kept <= priority => {}
+            _ => {
+                takes.insert(key, (priority, transcript));
+            }
+        }
+    }
+    takes
+        .into_values()
+        .map(|(_, transcript)| transcript)
+        .collect()
+}
+
+/// `<take>_<variant>[_<n>]` → (take, variant, collision number). A stem with
+/// no known variant is its own take; a trailing number is only a collision
+/// suffix when it follows a variant, so slugs ending in digits stay intact.
+fn split_take_variant(stem: &str) -> (&str, Option<&str>, Option<u64>) {
+    const VARIANTS: [&str; 5] = ["raw", "cloud", "ai", "formatted", "failed"];
+    let (base, collision) = match stem.rsplit_once('_') {
+        Some((base, digits))
+            if !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()) =>
+        {
+            (base, digits.parse::<u64>().ok())
+        }
+        _ => (stem, None),
+    };
+    match base.rsplit_once('_') {
+        Some((take, variant)) if VARIANTS.contains(&variant) => (take, Some(variant), collision),
+        _ => (stem, None, None),
+    }
+}
+
+fn has_own_audio(transcript: &Path) -> bool {
+    ["m4a", "wav", "flac"]
+        .iter()
+        .any(|ext| transcript.with_extension(ext).is_file())
 }
 
 fn codescribe_path_fingerprint(path: &Path) -> String {

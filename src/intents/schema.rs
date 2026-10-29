@@ -2361,6 +2361,7 @@ mod tests {
         use super::super::{IntentKind, IntentRecord};
 
         let intent = IntentRecord {
+            provenance: None,
             kind: IntentKind::Intent,
             summary: "add zero-width character support".to_string(),
             context: None,
@@ -2393,6 +2394,7 @@ mod tests {
         use super::super::{IntentKind, IntentRecord};
 
         let intent = IntentRecord {
+            provenance: None,
             kind: IntentKind::Intent,
             summary: "fix database migration".to_string(),
             context: None,

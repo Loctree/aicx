@@ -977,6 +977,41 @@ fn read_context_chunk_accepts_relative_path_file_name_and_compact_ref() {
 }
 
 #[test]
+#[cfg(feature = "app")]
+fn read_legacy_chunk_ignores_unrelated_malformed_catalog() {
+    let root = retrieval_test_root("legacy-read-broken-catalog");
+    let _ = fs::remove_dir_all(&root);
+    let chunk = root.join(
+        "store/vetcoders/aicx/2026_0321/conversations/codex/2026_0321_codex_legacy-session_001.md",
+    );
+    write_chunk_file(&chunk, "Decision: retain the readable archived evidence");
+    let catalog = crate::catalog::sessions_path_for(&root);
+    fs::create_dir_all(catalog.parent().unwrap()).unwrap();
+    fs::write(&catalog, "{broken catalog row\n").unwrap();
+
+    let absolute = chunk.to_string_lossy();
+    let chunk_id = format!(
+        "chunk:{}",
+        chunk_path_ref_id(&scan_context_files_at(&root).unwrap()[0])
+    );
+    for reference in [
+        absolute.as_ref(),
+        "2026_0321_codex_legacy-session_001.md",
+        "vetcoders/aicx|2026-03-21|conversations|codex|legacy-session|001",
+        &chunk_id,
+    ] {
+        let read = read_context_chunk_at(&root, reference, None).unwrap();
+        assert!(read.content.contains("readable archived evidence"));
+    }
+    // Source/extract references still require a valid admission catalog.
+    assert!(
+        read_context_chunk_at(&root, "extracts/copilot/not-admitted_conversation.md", None)
+            .is_err()
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn chunk_ref_spec_parse_accepts_paths_and_chunk_ids() {
     assert_eq!(
         ChunkRefSpec::parse("/tmp/aicx/chunk.md").unwrap(),

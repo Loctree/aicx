@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
-# install-mcp-service.sh — background reader-only HTTP MCP server for AICX (macOS launchd).
+# install-mcp-service.sh — one reader-only HTTP process for AICX (macOS launchd).
 #
-# Installs a per-user LaunchAgent that runs
-#   aicx serve --transport http --no-auto-refresh
-# with KeepAlive=true, so the Streamable HTTP MCP reader stays available 24/7
-# across machine restarts without taking ownership of catalog/index maintenance.
-# Index maintenance is a separate process boundary; see install-reindex-schedule.sh
-# for the baseline scheduler.
+# Installs a per-user LaunchAgent that runs the hybrid `aicx serve`:
+#   --transport http --host 127.0.0.1 --no-require-auth --no-auto-refresh
+# `/` is the dashboard and `/mcp` is MCP on port 8044. Loopback auth is off.
+# A non-loopback AICX_MCP_HOST does not receive --no-require-auth; the binary
+# refuses that bind without a bearer. The long-lived service never owns index
+# maintenance; the separate short-lived maintenance schedule stays available.
+# KeepAlive=true.
 #
 # Usage:
 #   bash tools/install-mcp-service.sh              # install / refresh service
@@ -80,8 +81,18 @@ fi
 
 AICX_DIR="$(dirname "$AICX_BIN")"
 
-# Local-only is the safe and portable default. Tailnet exposure is an explicit
-# operator decision: AICX_MCP_HOST="$(tailscale ip -4)" make install-service.
+# The standalone MCP sibling does not serve the dashboard.
+if [ "$(basename "$AICX_BIN")" = "aicx-mcp" ]; then
+  AICX_BIN="$AICX_DIR/aicx"
+  if [ ! -x "$AICX_BIN" ]; then
+    note "mcp service: hybrid aicx executable not found beside aicx-mcp"
+    exit 1
+  fi
+fi
+RUN_BIN="$AICX_BIN"
+
+# Local-only is the product default. Tailnet exposure is an explicit operator
+# decision via AICX_MCP_HOST, and that bind does not get --no-require-auth.
 HOST="${AICX_MCP_HOST:-127.0.0.1}"
 
 # Build allowed-host arguments as plist entries, not a shell command string.
@@ -100,22 +111,26 @@ for h in "${HOSTS[@]}"; do
   fi
 done
 
-AICX_BIN_XML="$(printf '%s' "$AICX_BIN" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g' -e "s/'/\&apos;/g")"
+RUN_BIN_XML="$(printf '%s' "$RUN_BIN" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g' -e "s/'/\&apos;/g")"
 HOST_XML="$(printf '%s' "$HOST" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g' -e "s/'/\&apos;/g")"
 PORT_XML="$(printf '%s' "$PORT" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g' -e "s/'/\&apos;/g")"
 PATH_XML="$(printf '%s' "$AICX_DIR:/usr/bin:/bin:$HOME/.local/bin:$HOME/.cargo/bin:/opt/homebrew/bin" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g' -e "s/'/\&apos;/g")"
-# Default: tool-name audit + rmcp session lifecycle. The reader does not own
-# periodic refresh, so mcp.refresh logging is intentionally absent here.
+LOG_DIR_XML="$(printf '%s' "$LOG_DIR" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g' -e "s/'/\&apos;/g")"
+# Tool-name audit + rmcp session lifecycle. Index maintenance has a separate owner.
 # Not `info` globally — that floods hyper/h2. Not `--verbose` — extractor only.
 RUST_LOG_VALUE="${AICX_MCP_RUST_LOG:-mcp.audit=info,mcp.lifecycle=info,rmcp=info}"
 RUST_LOG_XML="$(printf '%s' "$RUST_LOG_VALUE" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g' -e "s/'/\&apos;/g")"
 
 mkdir -p "$HOME/Library/LaunchAgents" "$LOG_DIR"
 
-# `--no-auto-refresh` is deliberately kept even though the binary's default is
-# already reader-only: it keeps the LaunchAgent safe if it ever runs against an
-# older aicx whose default embedded the periodic writer. Do not remove it as
-# "redundant"; the flag is a compatibility no-op on current builds.
+# Loopback is the only bind that may run without a bearer. 127.0.0.0/8 and ::1.
+NO_AUTH_XML=""
+case "$HOST" in
+  127.*|::1|0:0:0:0:0:0:0:1)
+    NO_AUTH_XML="
+    <string>--no-require-auth</string>"
+    ;;
+esac
 cat > "$PLIST" <<PLIST_EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -125,15 +140,14 @@ cat > "$PLIST" <<PLIST_EOF
   <string>$LABEL</string>
   <key>ProgramArguments</key>
   <array>
-    <string>$AICX_BIN_XML</string>
+    <string>$RUN_BIN_XML</string>
     <string>serve</string>
     <string>--transport</string>
     <string>http</string>
-    <string>--no-auto-refresh</string>
     <string>--host</string>
     <string>$HOST_XML</string>
     <string>--port</string>
-    <string>$PORT_XML</string>$ALLOWED_ARGS_XML
+    <string>$PORT_XML</string>$ALLOWED_ARGS_XML$NO_AUTH_XML
     <string>--no-auto-refresh</string>
   </array>
   <key>EnvironmentVariables</key>
@@ -148,9 +162,9 @@ cat > "$PLIST" <<PLIST_EOF
   <key>KeepAlive</key>
   <true/>
   <key>StandardOutPath</key>
-  <string>$LOG_DIR/aicx-serve-http.log</string>
+  <string>$LOG_DIR_XML/aicx-serve-http.log</string>
   <key>StandardErrorPath</key>
-  <string>$LOG_DIR/aicx-serve-http.log</string>
+  <string>$LOG_DIR_XML/aicx-serve-http.log</string>
 </dict>
 </plist>
 PLIST_EOF
@@ -160,8 +174,14 @@ plutil -lint "$PLIST" >/dev/null
 # Keep expensive corpus publication outside the long-lived server. The helper
 # also writes its plist when launchctl cannot bootstrap from the current shell.
 REINDEX_INSTALLER="$(cd "$(dirname "$0")" && pwd)/install-reindex-schedule.sh"
+MANAGER="$(launchctl managername 2>/dev/null || true)"
 if [ -f "$REINDEX_INSTALLER" ]; then
-  AICX_BIN="$AICX_BIN" bash "$REINDEX_INSTALLER"
+  if ! AICX_BIN="$AICX_BIN" bash "$REINDEX_INSTALLER"; then
+    if [ "$MANAGER" = "Aqua" ]; then
+      exit 1
+    fi
+    note "index refresh: activation deferred until an Aqua login"
+  fi
 else
   note "index refresh: run 'aicx doctor --repair-runtime' once to install the 8640s scheduler"
 fi
@@ -199,14 +219,12 @@ try_bootstrap() {
   return 1
 }
 
-MANAGER="$(launchctl managername 2>/dev/null || true)"
 if [ "$MANAGER" != "Aqua" ]; then
   note "mcp service: plist written to $PLIST"
-  note "mcp service: not loaded — this shell is not an Aqua login (launchctl managername=${MANAGER:-unknown})"
-  note "mcp service: load from Terminal.app / a GUI session:"
+  note "mcp service: NOT loaded — this shell is not an Aqua login (launchctl managername=${MANAGER:-unknown})"
+  note "mcp service: retry from Terminal.app / a GUI session:"
   note "  launchctl bootstrap gui/$(id -u) $PLIST"
-  note "mcp service: otherwise it loads at the next GUI login. Do not run this as root."
-  note "index maintenance: separate; this reader never owns refresh"
+  note "mcp service: do not run this as root."
   exit 0
 fi
 
@@ -221,16 +239,15 @@ if ! try_bootstrap; then
 fi
 
 if service_loaded; then
-  note "mcp service: running reader-only on http://$HOST:$PORT/mcp via $LABEL"
-  note "index maintenance: separate process owner; MCP auto-refresh disabled"
+  note "mcp service: dashboard http://$HOST:$PORT/ and MCP http://$HOST:$PORT/mcp via $LABEL"
+  note "mcp service: reader-only; index maintenance stays with the separate scheduler"
   note "mcp service logs: $LOG_DIR/aicx-serve-http.log"
 else
-  note "mcp service: plist written to $PLIST (bootstrap failed in this Aqua session)"
+  note "mcp service: FAILED — plist is at $PLIST but launchd did not keep the job"
   note "mcp service: retry: launchctl bootstrap gui/$(id -u) $PLIST"
   note "mcp service: do not run as root — this is a per-user LaunchAgent"
-  note "index maintenance: separate; this reader never owns refresh"
+  exit 1
 fi
 
-note "Note: the HTTP MCP service is a reader and does not refresh the index."
-note "For periodic freshness install the separate maintenance schedule:"
-note "  make install-schedule   # aicx catalog rebuild && aicx index on a cadence"
+note "HTTP service: one process, dashboard on / and MCP on /mcp."
+note "Embedded refresh is disabled; this long-lived service is reader-only."

@@ -13,6 +13,10 @@ fn is_gemini_session_file(path: &Path) -> bool {
         .is_some_and(|ext| matches!(ext, "json" | "jsonl"))
 }
 
+fn is_copilot_session_file(path: &Path) -> bool {
+    crate::session_catalog::is_copilot_source_file(path)
+}
+
 fn source_root_for_protection(path: &Path) -> PathBuf {
     if path.is_file() {
         path.parent()
@@ -343,6 +347,138 @@ pub fn list_available_sources() -> Result<Vec<SourceInfo>> {
         }
     }
 
+    // Copilot CLI: usage telemetry at ~/.copilot/events.jsonl is excluded.
+    let copilot_sessions = crate::session_catalog::copilot_session_root(&home);
+    if copilot_sessions.try_exists()? {
+        anyhow::ensure!(
+            copilot_sessions.is_dir(),
+            "copilot session root is not a directory: {}",
+            copilot_sessions.display()
+        );
+        // Admission is deliberately direct: nested checkpoints, rewind data
+        // and tool-created events files are not additional conversations.
+        let mut count = 0usize;
+        let mut size = 0u64;
+        for entry in fs::read_dir(&copilot_sessions)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let events = entry.path().join("events.jsonl");
+            if !is_copilot_session_file(&events) {
+                continue;
+            }
+            match fs::symlink_metadata(&events) {
+                Ok(metadata) if metadata.is_file() => {
+                    count += 1;
+                    size += metadata.len();
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("cannot inspect copilot source {}", events.display())
+                    });
+                }
+            }
+        }
+        if count > 0 {
+            sources.push(source_info(&home, "copilot", copilot_sessions, count, size));
+        }
+    }
+
+    // oh-my-pi and upstream pi share one agent. Nested tool-log directories
+    // are not sessions; catalog admission is the only filter.
+    for root in crate::session_catalog::omp_session_roots(&home) {
+        let present = match root.try_exists() {
+            Ok(value) => value,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("cannot inspect omp session root {}", root.display())
+                });
+            }
+        };
+        if !present {
+            continue;
+        }
+        anyhow::ensure!(
+            root.is_dir(),
+            "omp session root is not a directory: {}",
+            root.display()
+        );
+        let catalog = crate::session_catalog::SessionCatalog::new(
+            crate::session_catalog::AgentKind::Omp,
+            &root,
+        )
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+        let scanned = catalog
+            .scan_with_stats()
+            .result
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        if scanned.is_empty() {
+            continue;
+        }
+        let mut size = 0u64;
+        for source in &scanned {
+            match fs::symlink_metadata(&source.path) {
+                Ok(metadata) if metadata.is_file() => size += metadata.len(),
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("cannot inspect omp source {}", source.path.display())
+                    });
+                }
+            }
+        }
+        sources.push(source_info(&home, "omp", root, scanned.len(), size));
+    }
+
+    for root in crate::session_catalog::agy_session_roots(&home) {
+        let present = match root.try_exists() {
+            Ok(value) => value,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("cannot inspect agy session root {}", root.display())
+                });
+            }
+        };
+        if !present {
+            continue;
+        }
+        anyhow::ensure!(
+            root.is_dir(),
+            "agy session root is not a directory: {}",
+            root.display()
+        );
+        let catalog = crate::session_catalog::SessionCatalog::new(
+            crate::session_catalog::AgentKind::Agy,
+            &root,
+        )
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+        let scanned = catalog
+            .scan_with_stats()
+            .result
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        if scanned.is_empty() {
+            continue;
+        }
+        let mut size = 0u64;
+        for source in &scanned {
+            match fs::symlink_metadata(&source.path) {
+                Ok(metadata) if metadata.is_file() => size += metadata.len(),
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("cannot inspect agy source {}", source.path.display())
+                    });
+                }
+            }
+        }
+        sources.push(source_info(&home, "agy", root, scanned.len(), size));
+    }
+
     // Codescribe transcripts: ~/.codescribe/transcriptions/YYYY-MM-DD/*.{txt,md,json}
     let codescribe_transcripts = discover_codescribe_transcripts(&home);
     if !codescribe_transcripts.is_empty() {
@@ -378,4 +514,56 @@ pub fn list_available_sources() -> Result<Vec<SourceInfo>> {
     }
 
     Ok(sources)
+}
+
+#[cfg(test)]
+mod copilot_tests {
+    use super::*;
+
+    #[test]
+    fn copilot_source_listing_shape_excludes_metrics_and_nested_artifacts() {
+        let root = Path::new("/home/user/.copilot/session-state");
+        let id = "12345678-1234-1234-1234-123456789abc";
+        assert!(is_copilot_session_file(&root.join(id).join("events.jsonl")));
+        assert!(!is_copilot_session_file(Path::new(
+            "/home/user/.copilot/events.jsonl"
+        )));
+        assert!(!is_copilot_session_file(
+            &root
+                .join(id)
+                .join("checkpoints")
+                .join(id)
+                .join("events.jsonl")
+        ));
+        assert!(!is_copilot_session_file(&root.join(id).join("tool.jsonl")));
+        assert!(!is_copilot_session_file(
+            &root.join(".metadata").join("events.jsonl")
+        ));
+        assert!(is_copilot_session_file(
+            &root.join("user-123-task-456").join("events.jsonl")
+        ));
+    }
+}
+
+#[cfg(test)]
+mod omp_tests {
+    use super::*;
+
+    #[test]
+    fn omp_and_pi_session_files_are_listed_and_nested_tool_logs_are_not() {
+        let id = "01999999-aaaa-7666-8666-111111111111";
+        let stem = format!("2026-10-21T12-00-00-000Z_{id}");
+        let omp =
+            Path::new("/home/user/.omp/agent/sessions/--fixture--").join(format!("{stem}.jsonl"));
+        assert!(crate::session_catalog::is_omp_source_file(&omp));
+        let nested = Path::new("/home/user/.omp/agent/sessions/--fixture--")
+            .join(&stem)
+            .join("1.bash.log");
+        assert!(!crate::session_catalog::is_omp_source_file(&nested));
+        let pi =
+            Path::new("/home/user/.pi/agent/sessions/--fixture--").join(format!("{stem}.jsonl"));
+        assert!(crate::session_catalog::is_omp_source_file(&pi));
+        let loose = Path::new("/home/user/.omp/agent/sessions").join(format!("{stem}.jsonl"));
+        assert!(!crate::session_catalog::is_omp_source_file(&loose));
+    }
 }

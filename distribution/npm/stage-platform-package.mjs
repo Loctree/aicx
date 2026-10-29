@@ -5,7 +5,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
@@ -100,6 +100,18 @@ function gpgPath(candidate) {
   return execFileSync("cygpath", ["-u", candidate], { encoding: "utf8" }).trim();
 }
 
+// Rust linker signatures (adhoc,linker-signed) are rejected by macOS 27
+// taskgated. Re-sign only those; a Developer ID signature must survive
+// into the npm tarball. This is pack-time tooling, not an npm lifecycle script.
+function resignLinkerSignedDarwinBinary(binaryPath) {
+  if (process.platform !== "darwin" || platformKey !== "darwin-arm64") return;
+  const inspected = spawnSync("codesign", ["-dvvv", binaryPath], { encoding: "utf8" });
+  const details = `${inspected.stdout ?? ""}\n${inspected.stderr ?? ""}`;
+  if (!details.includes("linker-signed")) return;
+  execFileSync("codesign", ["--force", "--sign", "-", binaryPath], { stdio: "inherit" });
+  execFileSync("codesign", ["--verify", "--verbose=2", binaryPath], { stdio: "ignore" });
+}
+
 // The same `shell: bash` step puts Git for Windows' GNU tar first on PATH. It
 // cannot read zip archives and parses `D:\...` as a remote host ("Cannot
 // connect to D: resolve failed"). Windows ships bsdtar in System32, which
@@ -142,6 +154,7 @@ try {
     const destination = path.join(packageBin, binary);
     fs.copyFileSync(matches[0], destination);
     if (process.platform !== "win32") fs.chmodSync(destination, 0o755);
+    resignLinkerSignedDarwinBinary(destination);
   }
 } finally {
   fs.rmSync(tempRoot, { recursive: true, force: true });

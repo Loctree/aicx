@@ -179,11 +179,50 @@ function execBinary(binaryName, args = [], options = {}) {
   try {
     return execFileSync(binaryPath, args, execOptions);
   } catch (error) {
-    if (error.status !== undefined) {
-      process.exit(error.status);
+    const failure = childFailureExit(error);
+    if (failure) {
+      if (failure.line) process.stderr.write(failure.line);
+      process.exit(failure.code);
     }
     throw error;
   }
+}
+
+// Node sets status to null when the child dies by signal, and process.exit(null)
+// is exit 0. macOS 27 reports a rejected Mach-O as SIGKILL with no stdio.
+function childFailureExit(error) {
+  if (!error || typeof error !== "object") return null;
+  if (error.signal) {
+    const signalNumber = require("os").constants.signals[error.signal];
+    const code = Number.isInteger(signalNumber) ? 128 + signalNumber : 1;
+    const signatureNote = error.signal === "SIGKILL" ? " (code signature invalid)" : "";
+    return {
+      code,
+      line: `[aicx] native binary died from signal ${error.signal}${signatureNote}\n`,
+    };
+  }
+  if (typeof error.status === "number") {
+    return { code: error.status, line: "" };
+  }
+  return null;
+}
+
+function plistHost(plist) {
+  const match = String(plist).match(/<string>--host<\/string>\s*<string>([^<]*)<\/string>/);
+  return match ? match[1] : "";
+}
+
+// A migrated LaunchAgent is the loopback reader: host is loopback, auth is
+// not required, and the embedded writer is not enabled. The deprecated reader
+// flag is optional because current binaries are reader-only by default.
+function plistMatchesLoopbackContract(plist) {
+  const host = plistHost(plist);
+  const loopback = host === "127.0.0.1" || host === "localhost" || host === "::1";
+  return (
+    loopback &&
+    plist.includes("--no-require-auth") &&
+    !plist.includes("--experimental-auto-refresh")
+  );
 }
 
 function execBinarySync(binaryName, args = []) {
@@ -217,7 +256,7 @@ function maybePrintRuntimeMigrationHint(args = []) {
     return;
   }
   try {
-    if (!readFileSync(plistPath, "utf8").includes("--no-auto-refresh")) {
+    if (!plistMatchesLoopbackContract(readFileSync(plistPath, "utf8"))) {
       process.stderr.write(
         "[aicx] Background runtime needs a one-time migration: aicx doctor --repair-runtime\n"
       );
@@ -248,6 +287,8 @@ module.exports = {
   getBinaryPath,
   getPlatformPackageName,
   maybePrintRuntimeMigrationHint,
+  plistMatchesLoopbackContract,
+  childFailureExit,
   resolvePlatformBinaryPath,
   resolvePlatformPackageRoot,
 };

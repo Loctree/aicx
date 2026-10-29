@@ -52,6 +52,13 @@ struct FuzzySearchResult {
     signal_density: f32,
     matched_lines: Vec<String>,
     excerpt: String,
+    session_id: String,
+    header: String,
+    preview: String,
+    body: String,
+    body_chars_total: usize,
+    body_truncated: bool,
+    detail_text: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -101,6 +108,7 @@ struct SteerSearchResult {
     completed_at: Option<String>,
     token_usage: Option<u64>,
     findings_count: Option<u32>,
+    header: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -290,7 +298,19 @@ pub(super) async fn get_semantic_search(
                 .filter(|r| project_matches_any_filter(&r.project, &request_projects))
                 .filter(|r| score_filter.is_none_or(|min| r.score >= min))
                 .map(|result| {
-                    let excerpt = result.matched_lines.join(" ... ");
+                    let detail_text = result.matched_lines.join(" ... ");
+                    let cut = crate::result_format::cut_result_body(
+                        &detail_text,
+                        crate::result_format::RESULT_BODY_PREVIEW_CHARS,
+                    );
+                    let header = crate::result_format::result_header(
+                        &result.project,
+                        &result.agent,
+                        &result.kind,
+                        &result.date,
+                        Some(f64::from(result.score)),
+                        "",
+                    );
                     FuzzySearchResult {
                         file: result.file,
                         path: result.path,
@@ -303,7 +323,14 @@ pub(super) async fn get_semantic_search(
                         label: result.label,
                         signal_density: result.density,
                         matched_lines: result.matched_lines,
-                        excerpt,
+                        excerpt: cut.body.clone(),
+                        session_id: String::new(),
+                        header,
+                        preview: cut.body.clone(),
+                        body: cut.body,
+                        body_chars_total: cut.body_chars_total,
+                        body_truncated: cut.body_truncated,
+                        detail_text,
                     }
                 })
                 .collect();
@@ -515,6 +542,8 @@ fn run_steer_search(params: SteerSearchParams, limit: usize) -> Result<SteerSear
             .and_then(|v| v.as_u64())
             .map(|v| v as u32);
 
+        let header =
+            crate::result_format::result_header(&project, &agent, &kind, &date, None, &session_id);
         items.push(SteerSearchResult {
             path,
             project,
@@ -533,6 +562,7 @@ fn run_steer_search(params: SteerSearchParams, limit: usize) -> Result<SteerSear
             completed_at,
             token_usage,
             findings_count,
+            header,
         });
     }
 

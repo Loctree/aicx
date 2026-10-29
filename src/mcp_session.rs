@@ -179,12 +179,15 @@ pub struct ShowSessionRequest<'a> {
 }
 
 pub struct ContinuityRequest<'a> {
+    pub until: Option<chrono::DateTime<chrono::Utc>>,
     pub aicx_home: &'a Path,
     pub project: Option<&'a str>,
     pub projects: &'a [String],
     pub project_match: ProjectMatchMode,
     pub hours: u64,
     pub for_inject: bool,
+    /// Operator override: distill mixed-workstream sessions into the pack.
+    pub distill_mixed: bool,
 }
 
 pub fn default_list_hours() -> u64 {
@@ -289,6 +292,15 @@ pub fn show_session(
 pub fn continuity_pack(
     req: ContinuityRequest<'_>,
 ) -> Result<ContinuityPayload, SessionSurfaceError> {
+    continuity_pack_as(req, None)
+}
+
+/// The addressed variant preserves the unaddressed request API used by
+/// in-process consumers while adding the CLI's cross-project bus view.
+pub fn continuity_pack_as(
+    req: ContinuityRequest<'_>,
+    addressee: Option<&str>,
+) -> Result<ContinuityPayload, SessionSurfaceError> {
     let filters = collect_project_filters(req.project, req.projects);
     if filters.is_empty() {
         return Err(SessionSurfaceError::invalid(
@@ -301,12 +313,21 @@ pub fn continuity_pack(
     }
     let selected =
         resolve_session_project_filters(&filters, &[], req.aicx_home, req.project_match)?;
-    let pack = crate::continuity::build(req.aicx_home, &selected, req.hours).map_err(|error| {
+    let pack = crate::continuity::build_with_scope_at(
+        req.aicx_home,
+        &selected,
+        req.hours,
+        req.distill_mixed,
+        req.until.unwrap_or_else(chrono::Utc::now),
+    )
+    .map_err(|error| SessionSurfaceError::Internal {
+        message: format!("continuity pack: {error}"),
+    })?;
+    let mut markdown = crate::continuity::render_as(&pack, false, addressee).map_err(|error| {
         SessionSurfaceError::Internal {
-            message: format!("continuity pack: {error}"),
+            message: format!("addressed speech: {error}"),
         }
     })?;
-    let mut markdown = crate::continuity::render(&pack, req.for_inject);
     if let Some(idx) = markdown.find('\n') {
         markdown.insert(idx + 1, '\n');
         markdown.insert_str(idx + 2, CONTINUITY_BANNER);
@@ -314,7 +335,42 @@ pub fn continuity_pack(
         markdown.push('\n');
         markdown.push_str(CONTINUITY_BANNER);
     }
+    if req.for_inject {
+        markdown = crate::continuity::bounded_inject(markdown);
+    }
     let mut warnings = Vec::new();
+    if pack.source_errors > 0 {
+        warnings.push(format!("coverage: {} source errors", pack.source_errors));
+    }
+    if pack.dropped_candidates > 0 || pack.dropped_task_events > 0 {
+        warnings.push(format!(
+            "coverage: candidate budget dropped {} candidates and {} task events",
+            pack.dropped_candidates, pack.dropped_task_events
+        ));
+    }
+    if (!pack.mixed_scope.is_empty() && !pack.distilled_mixed) || !pack.unplaced_scope.is_empty() {
+        warnings.push("coverage: mixed or unplaced scope was withheld; index readiness does not prove complete coverage".into());
+    }
+    if pack.distilled_mixed && !pack.mixed_scope.is_empty() {
+        warnings.push(format!(
+            "scope: {} mixed-workstream session(s) distilled on explicit request; their history may braid workstreams",
+            pack.mixed_scope.len()
+        ));
+    }
+    if pack
+        .selection
+        .iter()
+        .any(|source| source.unknown_time_frames > 0)
+    {
+        warnings.push(
+            if pack.hours == 0 {
+                "coverage: undated history is retained only as unknown-time candidates"
+            } else {
+                "coverage: unknown conversation timestamps withheld"
+            }
+            .into(),
+        );
+    }
     if pack.live_sessions == 0 {
         warnings.push(format!(
             "continuity window {}h for {} produced 0 live sessions; empty NOW/PEERS is not proof of a quiet window",
@@ -365,11 +421,11 @@ fn parse_optional_agent(agent: Option<&str>) -> Result<Option<AgentKind>, Sessio
             SessionSurfaceError::invalid(
                 "invalid_agent",
                 format!(
-                    "unknown agent `{value}`; expected claude, codex, gemini, junie, grok, kimi, or cursor"
+                    "unknown agent `{value}`; expected claude, codex, gemini, junie, grok, kimi, cursor, copilot, omp, or agy"
                 ),
                 json!({
                     "agent": value,
-                    "expected": ["claude", "codex", "gemini", "junie", "grok", "kimi", "cursor"],
+                    "expected": ["claude", "codex", "gemini", "junie", "grok", "kimi", "cursor", "copilot", "omp", "pi", "oh-my-pi", "agy", "antigravity", "antigravity-cli"],
                 }),
             )
         }),
@@ -636,40 +692,63 @@ fn resolve_session_across_agents(
     let mut scanned = 0usize;
     let mut last_missing: Option<(AgentKind, CatalogError)> = None;
     for agent in agents {
-        let root = agent.session_root(user_home);
-        if !root.is_dir() {
-            continue;
-        }
-        let catalog = session_catalog::SessionCatalog::new(agent, &root)
-            .map_err(|error| catalog_error(agent, error, 0))?;
-        let lookup = catalog.resolve_with_stats(query);
-        scanned += lookup.stats.metadata_candidates;
-        match lookup.result {
-            Ok(resolved) => hits.push((agent, resolved, lookup.stats)),
-            Err(CatalogError::Missing { .. }) => {
-                last_missing = Some((
-                    agent,
-                    CatalogError::Missing {
-                        query: query.to_string(),
+        let mut agent_hit = None;
+        for root in agent.session_roots(user_home) {
+            if matches!(agent, AgentKind::Copilot | AgentKind::Omp | AgentKind::Agy) {
+                match root.try_exists() {
+                    Ok(false) => continue,
+                    Ok(true) => {}
+                    Err(error) => {
+                        return Err(catalog_error(
+                            agent,
+                            CatalogError::Io {
+                                path: root,
+                                message: error.to_string(),
+                            },
+                            scanned,
+                        ));
+                    }
+                }
+            } else if !root.is_dir() {
+                continue;
+            }
+            let catalog = session_catalog::SessionCatalog::new(agent, &root)
+                .map_err(|error| catalog_error(agent, error, scanned))?;
+            let lookup = catalog.resolve_with_stats(query);
+            scanned += lookup.stats.metadata_candidates;
+            match lookup.result {
+                Ok(resolved) => {
+                    agent_hit = Some((agent, resolved, lookup.stats));
+                    break;
+                }
+                Err(CatalogError::Missing { .. }) => {
+                    last_missing = Some((
                         agent,
-                        candidates_scanned: lookup.stats.metadata_candidates,
-                    },
-                ));
+                        CatalogError::Missing {
+                            query: query.to_string(),
+                            agent,
+                            candidates_scanned: lookup.stats.metadata_candidates,
+                        },
+                    ));
+                }
+                Err(CatalogError::Ambiguous { query, candidates }) => {
+                    return Err(catalog_error(
+                        agent,
+                        CatalogError::Ambiguous { query, candidates },
+                        lookup.stats.metadata_candidates,
+                    ));
+                }
+                Err(error) => {
+                    return Err(catalog_error(
+                        agent,
+                        error,
+                        lookup.stats.metadata_candidates,
+                    ));
+                }
             }
-            Err(CatalogError::Ambiguous { query, candidates }) => {
-                return Err(catalog_error(
-                    agent,
-                    CatalogError::Ambiguous { query, candidates },
-                    lookup.stats.metadata_candidates,
-                ));
-            }
-            Err(error) => {
-                return Err(catalog_error(
-                    agent,
-                    error,
-                    lookup.stats.metadata_candidates,
-                ));
-            }
+        }
+        if let Some(hit) = agent_hit {
+            hits.push(hit);
         }
     }
     match hits.len() {
@@ -783,18 +862,25 @@ fn session_info_for_resolved(agent: AgentKind, resolved: &ResolvedSource) -> Ses
 }
 
 fn guess_user_home(source: &Path, agent: AgentKind) -> PathBuf {
-    let marker = match agent {
-        AgentKind::Claude => ".claude",
-        AgentKind::Codex => ".codex",
-        AgentKind::Cursor => ".cursor",
-        AgentKind::Gemini => ".gemini",
-        AgentKind::Grok => ".grok",
-        AgentKind::Junie => ".junie",
-        AgentKind::Kimi => ".kimi-code",
+    let markers: &[&str] = match agent {
+        AgentKind::Claude => &[".claude"],
+        AgentKind::Codex => &[".codex"],
+        AgentKind::Cursor => &[".cursor"],
+        AgentKind::Gemini => &[".gemini"],
+        AgentKind::Grok => &[".grok"],
+        AgentKind::Junie => &[".junie"],
+        AgentKind::Kimi => &[".kimi-code"],
+        AgentKind::Copilot => &[".copilot"],
+        AgentKind::Omp => &[".omp", ".pi"],
+        AgentKind::Agy => &[".gemini"],
     };
     let mut current = source;
     while let Some(parent) = current.parent() {
-        if current.file_name().and_then(|name| name.to_str()) == Some(marker) {
+        if current
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| markers.contains(&name))
+        {
             return parent.to_path_buf();
         }
         current = parent;
@@ -1212,12 +1298,14 @@ mod tests {
         let aicx_home = home.join(".aicx");
         fs::create_dir_all(&aicx_home).expect("aicx home");
         let pack = continuity_pack(ContinuityRequest {
+            until: None,
             aicx_home: &aicx_home,
             project: Some("Loctree/aicx"),
             projects: &[],
             project_match: ProjectMatchMode::Exact,
             hours: 24,
             for_inject: false,
+            distill_mixed: false,
         })
         .expect("continuity");
         assert!(pack.ok);
@@ -1236,12 +1324,14 @@ mod tests {
         assert!(!lower.contains("claude --resume"));
 
         let missing_project = continuity_pack(ContinuityRequest {
+            until: None,
             aicx_home: &aicx_home,
             project: None,
             projects: &[],
             project_match: ProjectMatchMode::Exact,
             hours: 24,
             for_inject: false,
+            distill_mixed: false,
         });
         let err = missing_project.expect_err("project required");
         match err {
@@ -1250,6 +1340,154 @@ mod tests {
             }
             other => panic!("expected project_required, got {other:?}"),
         }
+        let _ = fs::remove_dir_all(home);
+    }
+
+    /// One Codex rollout launched in repository `alpha` whose second turn ran
+    /// its tool calls in repository `beta`, and whose third carried
+    /// conflicting workdirs from `beta` and `gamma`: a single session proving
+    /// more than one scope, and the only work in its window.
+    fn write_mixed_only_continuity_home(label: &str) -> (PathBuf, PathBuf) {
+        let home = temp_home(label);
+        let repo = |name: &str| {
+            let repo = home.join("workspaces").join(name);
+            fs::create_dir_all(repo.join(".git")).expect("repo .git");
+            serde_json::Value::String(repo.display().to_string())
+        };
+        let (alpha, beta, gamma) = (repo("alpha"), repo("beta"), repo("gamma"));
+        let session_id = "11111111-2222-3333-4444-555555555555";
+        let lines = [
+            json!({"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":session_id,"cwd":alpha}}),
+            json!({"timestamp":"2026-01-01T00:01:00Z","type":"turn_context","payload":{"cwd":alpha}}),
+            json!({"timestamp":"2026-01-01T00:01:10Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Decision: keep the alpha opening decision"}]}}),
+            json!({"timestamp":"2026-01-01T00:02:00Z","type":"turn_context","payload":{"cwd":alpha}}),
+            json!({"timestamp":"2026-01-01T00:02:05Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Decision: keep the beta bus decision"}]}}),
+            json!({"timestamp":"2026-01-01T00:02:10Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"c1","input":format!("const r = await tools.exec_command({{cmd:\"npm test\",\"workdir\":{beta}}});")}}),
+            json!({"timestamp":"2026-01-01T00:03:00Z","type":"turn_context","payload":{"cwd":alpha}}),
+            json!({"timestamp":"2026-01-01T00:03:05Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"c2","input":format!("const a = await tools.exec_command({{cmd:\"ls\",\"workdir\":{beta}}});")}}),
+            json!({"timestamp":"2026-01-01T00:03:10Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"c3","input":format!("const b = await tools.exec_command({{cmd:\"ls\",\"workdir\":{gamma}}});")}}),
+        ];
+        // The reader serves sources under the AICX home, never a stray
+        // temp path, so the rollout lives there and the catalog names it.
+        let aicx_home = home.join(".aicx");
+        let source = aicx_home.join(format!("synthetic/rollout-{session_id}.jsonl"));
+        fs::create_dir_all(source.parent().expect("source parent")).expect("source dir");
+        let body: String = lines.iter().map(|line| format!("{line}\n")).collect();
+        fs::write(&source, body).expect("write rollout");
+        let entry = crate::catalog::CatalogEntry {
+            schema: crate::catalog::CATALOG_SCHEMA.to_string(),
+            session_id: session_id.to_string(),
+            agent: "codex".to_string(),
+            project: Some("workspaces/alpha".to_string()),
+            date: Some("2026-01-01".to_string()),
+            cwd: alpha.as_str().map(Into::into),
+            source_path: source.display().to_string(),
+            source_len: None,
+            source_mtime_ns: None,
+            source_bundle_fingerprint: None,
+            title: None,
+            machine: None,
+            logical_session_id: None,
+            session_kind: None,
+        };
+        let catalog_path = crate::catalog::sessions_path_for(&aicx_home);
+        fs::create_dir_all(catalog_path.parent().expect("catalog parent")).expect("catalog dir");
+        fs::write(
+            &catalog_path,
+            format!("{}\n", serde_json::to_string(&entry).expect("catalog row")),
+        )
+        .expect("write catalog");
+        (home, aicx_home)
+    }
+
+    /// Finding (Issue #88, round 8): the refusal told the operator to pass
+    /// `distill_mixed`, and no surface forwarded it — MCP hardcoded `false`.
+    #[test]
+    fn continuity_pack_distills_a_mixed_only_window_on_request() {
+        let (home, aicx_home) = write_mixed_only_continuity_home("continuity-mixed");
+        let until: DateTime<Utc> = "2026-01-01T12:00:00Z".parse().expect("until");
+        let hours = 24;
+        let cutoff_ns = crate::intents::window_cutoff(until, hours)
+            .timestamp_nanos_opt()
+            .map(|nanos| nanos.max(0) as u128)
+            .unwrap_or(0);
+        crate::catalog::prime_live_delta_cache_for_tests(
+            &aicx_home,
+            &home,
+            cutoff_ns,
+            crate::catalog::LiveDelta::default(),
+        );
+        let request = |distill_mixed| ContinuityRequest {
+            until: Some(until),
+            aicx_home: &aicx_home,
+            project: Some("workspaces/alpha"),
+            projects: &[],
+            project_match: ProjectMatchMode::Exact,
+            hours,
+            for_inject: false,
+            distill_mixed,
+        };
+
+        // Default: the only work in the window is mixed, so the pack refuses
+        // and names the switch that overrides it.
+        match continuity_pack(request(false)) {
+            Err(SessionSurfaceError::Internal { message }) => {
+                assert!(
+                    message.contains("1 mixed-workstream session(s)"),
+                    "{message}"
+                );
+                assert!(
+                    message.contains(
+                        "pass --distill-mixed (MCP: distill_mixed) to distill their 1 record(s)"
+                    ),
+                    "{message}"
+                );
+            }
+            other => panic!("a mixed-only window must refuse by default, got {other:?}"),
+        }
+
+        // Override: the session is distilled, the pack says so, and its
+        // records are cited like any other source.
+        let pack = continuity_pack(request(true)).expect("distill_mixed overrides the refusal");
+        assert!(pack.ok);
+        for line in [
+            "keep the alpha opening decision",
+            "mixed-workstream candidates: 1 session(s) distilled on request; 1 with retained records",
+            "mixed_distilled=true (explicit request)",
+            "rollout-11111111-2222-3333-4444-555555555555.jsonl",
+        ] {
+            assert!(
+                pack.markdown.contains(line),
+                "missing {line}:\n{}",
+                pack.markdown
+            );
+        }
+        let sources = pack.markdown.split("## SOURCES").nth(1).unwrap_or_default();
+        assert!(
+            sources.contains("rollout-11111111-2222-3333-4444-555555555555.jsonl"),
+            "a distilled session keeps its source receipt:\n{sources}"
+        );
+        // The override admits the session, not frames its scope gate withheld.
+        assert!(
+            !pack.markdown.contains("beta bus decision"),
+            "{}",
+            pack.markdown
+        );
+        assert!(
+            pack.warnings
+                .iter()
+                .any(|warning| warning.contains("distilled on explicit request")),
+            "{:?}",
+            pack.warnings
+        );
+        assert!(
+            !pack
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("was withheld")),
+            "nothing was withheld: {:?}",
+            pack.warnings
+        );
         let _ = fs::remove_dir_all(home);
     }
 }

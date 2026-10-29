@@ -43,6 +43,9 @@ production command.
 - `src/vector_index.rs` and `crates/aicx-retrieve/` — hybrid generation and
   dense mmap support.
 - `src/mcp.rs` — CLI-parity MCP tools.
+- Hybrid MCP startup constructs an unscanned dashboard shell before binding.
+  Authorized data requests perform the optional scan; MCP health and tool
+  readiness never wait for a provider-root walk or dashboard rebuild.
 - `src/mcp_session.rs` — MCP session chain (`aicx_sessions` / `aicx_session` /
   `aicx_continuity`): live list, one-session extract, continuity pack.
 - `src/doctor/` — bounded health plus explicit deep recovery.

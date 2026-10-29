@@ -1,103 +1,926 @@
 #!/usr/bin/env python3
-"""Darwin integration check for the in-place MCP runtime migration."""
+"""Mocked Darwin regression checks for the in-place MCP runtime migration."""
 
 import os
 import plistlib
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
 
 ROOT = Path(__file__).parents[1]
-SCRIPT = ROOT / "tools/repair-mcp-runtime.sh"
+SCRIPT = Path(sys.argv[1]) if len(sys.argv) == 2 else ROOT / "tools/repair-mcp-runtime.sh"
 SCHEDULER_SCRIPT = ROOT / "tools/install-reindex-schedule.sh"
 
 
-def main() -> None:
+def write_plist(path: Path, label: str, args: list[str]) -> None:
+    path.write_bytes(
+        plistlib.dumps(
+            {
+                "Label": label,
+                "ProgramArguments": args,
+                "EnvironmentVariables": {
+                    "PATH": "/fixture/bin:/usr/bin:/bin",
+                    "RUST_LOG": "mcp.audit=info,rmcp=info",
+                },
+                "KeepAlive": True,
+                "StandardOutPath": "/fixture/log/aicx.log",
+                "StandardErrorPath": "/fixture/log/aicx.log",
+            },
+            sort_keys=False,
+        )
+    )
+
+
+def fixture(tmp: Path) -> tuple[Path, Path, dict[str, str], Path, Path]:
+    home = tmp / "home"
+    agents = home / "Library/LaunchAgents"
+    fake_bin = tmp / "fake bin"
+    agents.mkdir(parents=True)
+    fake_bin.mkdir()
+
     if os.uname().sysname != "Darwin":
-        print("repair MCP runtime self-test skipped (Darwin only)")
+        # Exercise the real shell control flow on Linux too; only OS APIs are mocked.
+        uname = fake_bin / "uname"
+        uname.write_text("#!/bin/sh\necho Darwin\n")
+        uname.chmod(0o755)
+        plutil = fake_bin / "plutil"
+        plutil.write_text(
+            f"#!{sys.executable}\n"
+            "import json, plistlib, sys\n"
+            "from pathlib import Path\n"
+            "args = sys.argv[1:]\n"
+            "path = Path(args[-1])\n"
+            "data = plistlib.loads(path.read_bytes())\n"
+            "if args[0] == '-extract': print(json.dumps(data[args[1]]))\n"
+            "elif args[0] == '-replace':\n"
+            " data[args[1]] = json.loads(args[3]) if args[2] == '-json' else args[3]\n"
+            " path.write_bytes(plistlib.dumps(data, sort_keys=False))\n"
+        )
+        plutil.chmod(0o755)
+
+    launcher = fake_bin / "aicx"
+    calls = tmp / "aicx-calls.log"
+    launcher.write_text(
+        "#!/bin/sh\n"
+        "printf '%s\\n' \"$*\" >> \"$AICX_SELFTEST_CALLS\"\n"
+        "if [ \"$*\" = 'catalog refresh --json' ]; then\n"
+        "  printf '{\"catalog_present\": %s}\\n' \"${AICX_SELFTEST_CATALOG_PRESENT:-false}\"\n"
+        "fi\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    launcher.chmod(0o755)
+
+    launchctl_log = tmp / "launchctl.log"
+    launchctl_marker = tmp / "bootstrap-failed-once"
+    launchctl_state = tmp / "launchctl-state"
+    launchctl_state.mkdir()
+    launchctl = fake_bin / "launchctl"
+    launchctl.write_text(
+        "#!/bin/sh\n"
+        "printf '%s\\n' \"$*\" >> \"$AICX_SELFTEST_LAUNCHCTL_LOG\"\n"
+        "if [ \"${1:-}\" = managername ]; then echo \"${AICX_SELFTEST_MANAGER:-Aqua}\"; exit 0; fi\n"
+        "if [ \"${1:-}\" = print ]; then\n"
+        "  label=${2##*/}\n"
+        "  if [ ! -e \"$AICX_SELFTEST_LAUNCHCTL_STATE/$label\" ]; then\n"
+        "    printf 'Could not find service \"%s\" in domain for user gui: %s\\n' \"$label\" \"$(id -u)\" >&2\n"
+        "    exit 113\n"
+        "  fi\n"
+        "  printf '\\tstate = running\\n\\tpid = %s\\n\\tlast exit code = %s\\n' \\\n"
+        "    \"${AICX_SELFTEST_JOB_PID:-4242}\" \"${AICX_SELFTEST_LAST_EXIT:-(never exited)}\"\n"
+        "  exit 0\n"
+        "fi\n"
+        "if [ \"${1:-}\" = print-disabled ]; then\n"
+        "  printf 'disabled services = {\\n'\n"
+        "  if [ -n \"${AICX_SELFTEST_DISABLED_LABEL:-}\" ]; then\n"
+        "    printf '\\t\"%s\" => disabled\\n' \"$AICX_SELFTEST_DISABLED_LABEL\"\n"
+        "  fi\n"
+        "  printf '}\\n'\n"
+        "  exit 0\n"
+        "fi\n"
+        "if [ \"${1:-}\" = bootout ]; then\n"
+        "  label=${2##*/}\n"
+        "  rm -f \"$AICX_SELFTEST_LAUNCHCTL_STATE/$label\"\n"
+        "  exit 0\n"
+        "fi\n"
+        "if [ \"${1:-}\" = bootstrap ]; then\n"
+        "  target=${3:-}\n"
+        "  label=${target##*/}\n"
+        "  label=${label%.plist}\n"
+        "  if [ -n \"${AICX_SELFTEST_EXPECT_FILE_AT_BOOTSTRAP:-}\" ]; then\n"
+        "    if [ -e \"$AICX_SELFTEST_EXPECT_FILE_AT_BOOTSTRAP\" ]; then\n"
+        "      printf 'bootstrap-presence=present\\n' >> \"$AICX_SELFTEST_LAUNCHCTL_LOG\"\n"
+        "    else\n"
+        "      printf 'bootstrap-presence=missing\\n' >> \"$AICX_SELFTEST_LAUNCHCTL_LOG\"\n"
+        "    fi\n"
+        "  fi\n"
+        "  fail=0\n"
+        "  [ \"${AICX_SELFTEST_FAIL_BOOTSTRAP_ONCE:-0}\" = 1 ] && fail=1\n"
+        "  [ \"${AICX_SELFTEST_FAIL_BOOTSTRAP_LABEL:-}\" = \"$label\" ] && fail=1\n"
+        "  if [ \"$fail\" = 1 ]; then\n"
+        "    count=0\n"
+        "    [ -f \"$AICX_SELFTEST_BOOTSTRAP_MARKER\" ] && count=\"$(cat \"$AICX_SELFTEST_BOOTSTRAP_MARKER\")\"\n"
+        "    if [ \"$count\" -lt \"${AICX_SELFTEST_FAIL_BOOTSTRAP_COUNT:-1}\" ]; then\n"
+        "      echo $((count + 1)) > \"$AICX_SELFTEST_BOOTSTRAP_MARKER\"\n"
+        "      echo 'Bootstrap failed: 5: Input/output error' >&2\n"
+        "      exit 1\n"
+        "    fi\n"
+        "  fi\n"
+        "  [ \"${AICX_SELFTEST_BOOTSTRAP_DROPS_JOB:-0}\" = 1 ] && exit 0\n"
+        "  : > \"$AICX_SELFTEST_LAUNCHCTL_STATE/$label\"\n"
+        "  exit 0\n"
+        "fi\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    launchctl.chmod(0o755)
+
+    lsof_log = tmp / "lsof.log"
+    lsof = fake_bin / "lsof"
+    lsof.write_text(
+        "#!/bin/sh\n"
+        "printf '%s\\n' \"$*\" >> \"$AICX_SELFTEST_LSOF_LOG\"\n"
+        "printf 'p%s\\n' \"${AICX_SELFTEST_LISTENER_PID:-${AICX_SELFTEST_JOB_PID:-4242}}\"\n",
+        encoding="utf-8",
+    )
+    lsof.chmod(0o755)
+
+    ps = fake_bin / "ps"
+    ps.write_text(
+        "#!/bin/sh\n"
+        "pid=\n"
+        "while [ \"$#\" -gt 0 ]; do\n"
+        "  if [ \"$1\" = -p ]; then shift; pid=${1:-}; fi\n"
+        "  shift\n"
+        "done\n"
+        "if [ \"$pid\" = \"${AICX_SELFTEST_LISTENER_PID:-}\" ]; then\n"
+        "  printf '%s\\n' \"${AICX_SELFTEST_LISTENER_PARENT_PID:-1}\"\n"
+        "else\n"
+        "  printf '1\\n'\n"
+        "fi\n",
+        encoding="utf-8",
+    )
+    ps.chmod(0o755)
+
+    curl_log = tmp / "curl.log"
+    curl = fake_bin / "curl"
+    curl.write_text(
+        "#!/bin/sh\n"
+        "printf '%s\\n' \"$*\" >> \"$AICX_SELFTEST_CURL_LOG\"\n"
+        "[ \"${AICX_SELFTEST_FAIL_HEALTH:-0}\" = 1 ] && exit 22\n"
+        "printf '200'\n",
+        encoding="utf-8",
+    )
+    curl.chmod(0o755)
+
+    env = os.environ | {
+        "HOME": str(home),
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "AICX_BIN": str(launcher),
+        "AICX_RUNTIME_HEALTH_ATTEMPTS": "1",
+        "AICX_SELFTEST_CALLS": str(calls),
+        "AICX_SELFTEST_LAUNCHCTL_LOG": str(launchctl_log),
+        "AICX_SELFTEST_BOOTSTRAP_MARKER": str(launchctl_marker),
+        "AICX_SELFTEST_LAUNCHCTL_STATE": str(launchctl_state),
+        "AICX_SELFTEST_CURL_LOG": str(curl_log),
+        "AICX_SELFTEST_LSOF_LOG": str(lsof_log),
+    }
+    return agents, launcher, env, launchctl_log, curl_log
+
+
+def run_repair(env: dict[str, str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
+    command = ["bash", str(SCRIPT)]
+    if os.uname().sysname != "Darwin":
+        # Mock the absolute macOS API and scratch allocation; all test artifacts
+        # stay under the repository fixture, never the host's temporary directory.
+        source = SCRIPT.read_text().replace(
+            '/usr/libexec/PlistBuddy -c "Set :Label $LABEL" "$CANONICAL_PLIST"',
+            'plutil -replace Label -string "$LABEL" "$CANONICAL_PLIST"',
+        ).replace(
+            'BACKUP_PLIST="$(mktemp "${TMPDIR:-/tmp}/aicx-mcp-plist.XXXXXX")"',
+            'BACKUP_PLIST="$CANONICAL_PLIST.repair-backup.$$"\n'
+            '(umask 077; set -o noclobber; : > "$BACKUP_PLIST")',
+        ).replace(
+            'LEGACY_ARCHIVE="$(mktemp "${LEGACY_PLIST}.migrated.$(date -u +%Y%m%dT%H%M%SZ).XXXXXX")"',
+            'LEGACY_ARCHIVE="${LEGACY_PLIST}.migrated.fixture.$$"\n'
+            '  (umask 077; set -o noclobber; : > "$LEGACY_ARCHIVE")',
+        )
+        command = ["bash", "-c", source]
+    return subprocess.run(
+        command,
+        env=env,
+        check=check,
+        capture_output=True,
+        text=True,
+    )
+
+
+def assert_common_plist_preserved(before: dict, after: dict) -> None:
+    for key in (
+        "EnvironmentVariables",
+        "KeepAlive",
+        "StandardOutPath",
+        "StandardErrorPath",
+    ):
+        assert after[key] == before[key], f"repair changed operator-owned plist key {key}"
+
+
+def launchctl_state(env: dict[str, str], label: str) -> Path:
+    return Path(env["AICX_SELFTEST_LAUNCHCTL_STATE"]) / label
+
+
+def mcp_down_error(plist_path: Path) -> str:
+    domain = f"gui/{os.getuid()}"
+    return (
+        f"Error: previous MCP plist restored at {plist_path}, but launchd could not "
+        f"reload the service — MCP is DOWN until you run: launchctl bootstrap "
+        f"{domain} {plist_path}"
+    )
+
+
+def test_clean_reader_and_scheduler(tmp: Path) -> None:
+    agents, launcher, env, _, curl_log = fixture(tmp)
+    plist_path = agents / "com.loctree.aicx.mcp.plist"
+    original_args = [
+        "/stale/aicx",
+        "serve",
+        "--transport",
+        "http",
+        "--host",
+        "192.0.2.44",
+        "--port",
+        "9044",
+        "--require-auth",
+        "--auth-token",
+        "fixture-token",
+        "--allowed-host",
+        "localhost",
+        "--allowed-host",
+        "tailnet.example",
+        "--verbose",
+        "--no-auto-refresh",
+    ]
+    write_plist(plist_path, "com.loctree.aicx.mcp", original_args)
+    before = plistlib.loads(plist_path.read_bytes())
+
+    result = run_repair(env)
+    repaired = plistlib.loads(plist_path.read_bytes())
+    assert repaired["ProgramArguments"] == [str(launcher), *original_args[1:]]
+    assert repaired["ProgramArguments"].count("--no-auto-refresh") == 1
+    assert "--experimental-auto-refresh" not in repaired["ProgramArguments"]
+    assert_common_plist_preserved(before, repaired)
+    assert "is ready at http://192.0.2.44:9044/health" in result.stdout
+    assert "--no-auto-refresh" in result.stdout
+    assert "http://192.0.2.44:9044/health" in curl_log.read_text(encoding="utf-8")
+    assert "-iTCP@192.0.2.44:9044" in Path(
+        env["AICX_SELFTEST_LSOF_LOG"]
+    ).read_text(encoding="utf-8")
+
+    # A current reader is already the fixed point: another repair may reload it,
+    # but it must not change its plist contract or duplicate the reader flag.
+    run_repair(env)
+    assert plistlib.loads(plist_path.read_bytes()) == repaired
+
+    if os.uname().sysname != "Darwin":
+        return  # The scheduler's macOS-specific contract is tested on Darwin.
+
+    subprocess.run(
+        ["bash", str(SCHEDULER_SCRIPT)],
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    scheduler_path = agents / "com.loctree.aicx.reindex.plist"
+    scheduler = plistlib.loads(scheduler_path.read_bytes())
+    scheduled_command = scheduler["ProgramArguments"][2]
+    assert "catalog refresh --json" in scheduled_command
+    assert '"catalog_present": false' in scheduled_command
+    assert "catalog rebuild" in scheduled_command
+
+    calls = Path(env["AICX_SELFTEST_CALLS"])
+    subprocess.run(scheduler["ProgramArguments"], env=env, check=True, capture_output=True)
+    assert calls.read_text(encoding="utf-8").splitlines() == [
+        "catalog refresh --json",
+        "catalog rebuild",
+        "index",
+    ]
+
+    calls.unlink()
+    current_env = env | {"AICX_SELFTEST_CATALOG_PRESENT": "true"}
+    subprocess.run(
+        scheduler["ProgramArguments"], env=current_env, check=True, capture_output=True
+    )
+    assert calls.read_text(encoding="utf-8").splitlines() == [
+        "catalog refresh --json",
+        "index",
+    ]
+
+
+def test_experimental_writer_becomes_reader(tmp: Path) -> None:
+    agents, launcher, env, _, _ = fixture(tmp)
+    plist_path = agents / "com.loctree.aicx.mcp.plist"
+    original_args = [
+        "/stale/aicx",
+        "serve",
+        "--transport",
+        "http",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "8044",
+        "--allowed-host",
+        "localhost",
+        "--no-require-auth",
+        "--experimental-auto-refresh",
+        "--refresh-interval-seconds",
+        "17",
+        "--experimental-auto-refresh",
+    ]
+    write_plist(plist_path, "com.loctree.aicx.mcp", original_args)
+
+    run_repair(env)
+    args = plistlib.loads(plist_path.read_bytes())["ProgramArguments"]
+    assert args == [
+        str(launcher),
+        "serve",
+        "--transport",
+        "http",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "8044",
+        "--allowed-host",
+        "localhost",
+        "--no-require-auth",
+        "--refresh-interval-seconds",
+        "17",
+        "--no-auto-refresh",
+    ]
+
+
+def test_existing_hybrid_launcher_is_preserved(tmp: Path) -> None:
+    agents, launcher, env, _, _ = fixture(tmp)
+    custom = launcher.parent / "custom-aicx"
+    custom.write_bytes(launcher.read_bytes())
+    custom.chmod(0o755)
+    plist_path = agents / "com.loctree.aicx.mcp.plist"
+    write_plist(plist_path, "com.loctree.aicx.mcp", [str(custom), "serve", "--port", "8044"])
+    env.pop("AICX_BIN")
+    run_repair(env)
+    assert plistlib.loads(plist_path.read_bytes())["ProgramArguments"][:2] == [str(custom), "serve"]
+
+
+def test_explicit_standalone_launcher_migrates_to_hybrid(tmp: Path) -> None:
+    agents, launcher, env, _, _ = fixture(tmp)
+    standalone = launcher.parent / "aicx-mcp"
+    standalone.write_bytes(launcher.read_bytes())
+    standalone.chmod(0o755)
+    plist_path = agents / "com.loctree.aicx.mcp.plist"
+    write_plist(plist_path, "com.loctree.aicx.mcp", [str(standalone), "--port", "8044"])
+    run_repair(env | {"AICX_BIN": str(standalone)})
+    assert plistlib.loads(plist_path.read_bytes())["ProgramArguments"][:2] == [str(launcher), "serve"]
+    original = plist_path.read_bytes()
+    launcher.unlink()
+    result = run_repair(env | {"AICX_BIN": str(standalone)}, check=False)
+    assert result.returncode != 0
+    assert plist_path.read_bytes() == original
+
+
+def test_legacy_missing_serve_uses_native_subcommand(tmp: Path) -> None:
+    agents, launcher, env, _, _ = fixture(tmp)
+    legacy_path = agents / "io.vetcoders.aicx.mcp.plist"
+    canonical_path = agents / "com.loctree.aicx.mcp.plist"
+    original_args = [
+        "/stale/aicx-mcp",
+        "--transport",
+        "http",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "8044",
+        "--no-require-auth",
+        "--experimental-auto-refresh",
+    ]
+    write_plist(legacy_path, "io.vetcoders.aicx.mcp", original_args)
+    legacy_original = legacy_path.read_bytes()
+    prior_archive = agents / "io.vetcoders.aicx.mcp.plist.migrated.prior"
+    prior_archive.write_bytes(b"prior archive sentinel\n")
+
+    result = run_repair(env)
+    repaired = plistlib.loads(canonical_path.read_bytes())
+    assert repaired["Label"] == "com.loctree.aicx.mcp"
+    assert repaired["ProgramArguments"] == [
+        str(launcher),
+        "serve",
+        "--transport",
+        "http",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "8044",
+        "--no-require-auth",
+        "--no-auto-refresh",
+    ]
+    assert not legacy_path.exists()
+    assert prior_archive.read_bytes() == b"prior archive sentinel\n"
+    archives = list(agents.glob("io.vetcoders.aicx.mcp.plist.migrated.*"))
+    migrated = [path for path in archives if path != prior_archive]
+    assert len(migrated) == 1
+    assert migrated[0].read_bytes() == legacy_original
+    assert f"legacy MCP plist archived: {migrated[0]}" in result.stdout
+    assert not launchctl_state(env, "io.vetcoders.aicx.mcp").exists()
+
+
+def test_transient_bootstrap_failure_recovers(tmp: Path) -> None:
+    # launchd's asynchronous bootout makes the first bootstrap of a just-removed
+    # label fail with EIO; the retry must absorb exactly that race.
+    agents, launcher, env, launchctl_log, _ = fixture(tmp)
+    plist_path = agents / "com.loctree.aicx.mcp.plist"
+    write_plist(
+        plist_path,
+        "com.loctree.aicx.mcp",
+        ["/stale/aicx", "serve", "--transport", "http", "--port", "8044"],
+    )
+    launchctl_state(env, "com.loctree.aicx.mcp").touch()
+
+    result = run_repair(env | {"AICX_SELFTEST_FAIL_BOOTSTRAP_ONCE": "1"})
+    assert "is ready at http://127.0.0.1:8044/health" in result.stdout
+    args = plistlib.loads(plist_path.read_bytes())["ProgramArguments"]
+    assert args[0] == str(launcher)
+    assert launchctl_log.read_text(encoding="utf-8").count("bootstrap ") == 2
+
+
+def test_exhausted_bootstrap_retries_restore_loaded_state(tmp: Path) -> None:
+    agents, _, env, launchctl_log, curl_log = fixture(tmp)
+    plist_path = agents / "com.loctree.aicx.mcp.plist"
+    write_plist(
+        plist_path,
+        "com.loctree.aicx.mcp",
+        ["/stale/aicx", "serve", "--transport", "http", "--port", "8044"],
+    )
+    original = plist_path.read_bytes()
+    launchctl_state(env, "com.loctree.aicx.mcp").touch()
+
+    result = run_repair(
+        env
+        | {
+            "AICX_SELFTEST_FAIL_BOOTSTRAP_ONCE": "1",
+            "AICX_SELFTEST_FAIL_BOOTSTRAP_COUNT": "2",
+            "AICX_RUNTIME_BOOTSTRAP_ATTEMPTS": "2",
+        },
+        check=False,
+    )
+    assert result.returncode != 0
+    assert plist_path.read_bytes() == original
+    assert "did not load; rolling back" in result.stderr
+    domain = f"gui/{os.getuid()}"
+    # The failed repair bootstrap carries launchd context, not a bare EIO.
+    assert f"launchd diagnostics for {domain}/com.loctree.aicx.mcp:" in result.stderr
+    assert "launchctl print: service is not loaded" in result.stderr
+    assert "job not listed after 2 attempt(s)" in result.stderr
+    # Rollback claims loaded state only after launchd lists the job again.
+    assert "previous MCP plist and loaded state restored" in result.stdout
+    assert "verified via launchctl print" in result.stdout
+    assert launchctl_state(env, "com.loctree.aicx.mcp").exists()
+    log_lines = launchctl_log.read_text(encoding="utf-8").splitlines()
+    assert log_lines[-1] == f"print {domain}/com.loctree.aicx.mcp"
+    assert "Error: previous MCP plist restored" not in result.stderr
+    assert launchctl_log.read_text(encoding="utf-8").count("bootstrap ") == 3
+    assert not curl_log.exists()
+
+
+def test_persistent_bootstrap_failure_names_manual_recovery(tmp: Path) -> None:
+    agents, _, env, launchctl_log, curl_log = fixture(tmp)
+    plist_path = agents / "com.loctree.aicx.mcp.plist"
+    write_plist(
+        plist_path,
+        "com.loctree.aicx.mcp",
+        ["/stale/aicx", "serve", "--transport", "http", "--port", "8044"],
+    )
+    original = plist_path.read_bytes()
+    launchctl_state(env, "com.loctree.aicx.mcp").touch()
+
+    result = run_repair(
+        env
+        | {
+            "AICX_SELFTEST_FAIL_BOOTSTRAP_ONCE": "1",
+            "AICX_SELFTEST_FAIL_BOOTSTRAP_COUNT": "99",
+            "AICX_RUNTIME_BOOTSTRAP_ATTEMPTS": "2",
+        },
+        check=False,
+    )
+    assert result.returncode != 0
+    assert plist_path.read_bytes() == original
+    assert "did not load; rolling back" in result.stderr
+    assert "Bootstrap failed: 5: Input/output error" in result.stderr
+    assert (
+        f"launchd diagnostics for gui/{os.getuid()}/com.loctree.aicx.mcp:"
+        in result.stderr
+    )
+    # Restored file + dead service is an outage: a hard error whose last word
+    # is the exact one-line recovery, never a soft warning.
+    assert result.stderr.rstrip().splitlines()[-1] == mcp_down_error(plist_path)
+    assert "Warning:" not in result.stderr
+    assert "loaded state restored" not in result.stdout
+    assert not launchctl_state(env, "com.loctree.aicx.mcp").exists()
+    assert launchctl_log.read_text(encoding="utf-8").count("bootstrap ") == 4
+    assert not curl_log.exists()
+
+
+def test_disabled_label_is_named_in_bootstrap_diagnostics(tmp: Path) -> None:
+    agents, _, env, _, _ = fixture(tmp)
+    plist_path = agents / "com.loctree.aicx.mcp.plist"
+    write_plist(
+        plist_path,
+        "com.loctree.aicx.mcp",
+        ["/stale/aicx", "serve", "--transport", "http", "--port", "8044"],
+    )
+    launchctl_state(env, "com.loctree.aicx.mcp").touch()
+
+    result = run_repair(
+        env
+        | {
+            "AICX_SELFTEST_FAIL_BOOTSTRAP_ONCE": "1",
+            "AICX_SELFTEST_FAIL_BOOTSTRAP_COUNT": "99",
+            "AICX_RUNTIME_BOOTSTRAP_ATTEMPTS": "1",
+            "AICX_SELFTEST_DISABLED_LABEL": "com.loctree.aicx.mcp",
+        },
+        check=False,
+    )
+    assert result.returncode != 0
+    assert (
+        'launchctl print-disabled: "com.loctree.aicx.mcp" => disabled' in result.stderr
+    )
+    assert result.stderr.rstrip().splitlines()[-1] == mcp_down_error(plist_path)
+
+
+def test_silent_bootstrap_drop_is_reported_as_down(tmp: Path) -> None:
+    # launchctl may exit 0 without the job ever being listed. Loaded state is
+    # launchd's listing, so both the repair and the rollback must see the
+    # outage and name the recovery even though launchctl printed no error.
+    agents, _, env, launchctl_log, curl_log = fixture(tmp)
+    plist_path = agents / "com.loctree.aicx.mcp.plist"
+    write_plist(
+        plist_path,
+        "com.loctree.aicx.mcp",
+        ["/stale/aicx", "serve", "--transport", "http", "--port", "8044"],
+    )
+    original = plist_path.read_bytes()
+    launchctl_state(env, "com.loctree.aicx.mcp").touch()
+
+    result = run_repair(
+        env
+        | {
+            "AICX_SELFTEST_BOOTSTRAP_DROPS_JOB": "1",
+            "AICX_RUNTIME_BOOTSTRAP_ATTEMPTS": "2",
+        },
+        check=False,
+    )
+    assert result.returncode != 0
+    assert plist_path.read_bytes() == original
+    assert "Bootstrap failed" not in result.stderr
+    assert "did not load; rolling back" in result.stderr
+    assert result.stderr.count("launchctl print: service is not loaded") == 2
+    assert result.stderr.rstrip().splitlines()[-1] == mcp_down_error(plist_path)
+    assert "loaded state restored" not in result.stdout
+    assert not launchctl_state(env, "com.loctree.aicx.mcp").exists()
+    assert launchctl_log.read_text(encoding="utf-8").count("bootstrap ") == 4
+    assert not curl_log.exists()
+
+
+def test_rollback_reload_failure_names_each_down_label(tmp: Path) -> None:
+    agents, _, env, _, _ = fixture(tmp)
+    canonical = agents / "com.loctree.aicx.mcp.plist"
+    legacy = agents / "io.vetcoders.aicx.mcp.plist"
+    write_plist(
+        canonical,
+        "com.loctree.aicx.mcp",
+        ["/old/canonical", "serve", "--transport", "http", "--port", "8044"],
+    )
+    write_plist(
+        legacy,
+        "io.vetcoders.aicx.mcp",
+        ["/old/legacy", "--transport", "http", "--port", "8044"],
+    )
+    launchctl_state(env, "com.loctree.aicx.mcp").touch()
+    launchctl_state(env, "io.vetcoders.aicx.mcp").touch()
+
+    result = run_repair(
+        env
+        | {
+            "AICX_SELFTEST_BOOTSTRAP_DROPS_JOB": "1",
+            "AICX_RUNTIME_BOOTSTRAP_ATTEMPTS": "1",
+        },
+        check=False,
+    )
+    assert result.returncode != 0
+    stderr_lines = result.stderr.rstrip().splitlines()
+    assert stderr_lines[-2:] == [mcp_down_error(canonical), mcp_down_error(legacy)]
+    assert "loaded state restored" not in result.stdout
+
+
+def test_health_failure_restores_previous_plist(tmp: Path) -> None:
+    agents, _, env, launchctl_log, curl_log = fixture(tmp)
+    plist_path = agents / "com.loctree.aicx.mcp.plist"
+    write_plist(
+        plist_path,
+        "com.loctree.aicx.mcp",
+        ["/stale/aicx", "serve", "--transport", "http", "--port", "8044"],
+    )
+    original = plist_path.read_bytes()
+    assert not launchctl_state(env, "com.loctree.aicx.mcp").exists()
+
+    result = run_repair(
+        env
+        | {
+            "AICX_SELFTEST_FAIL_HEALTH": "1",
+            "AICX_SELFTEST_LAST_EXIT": "78: EX_CONFIG",
+        },
+        check=False,
+    )
+    assert result.returncode != 0
+    assert plist_path.read_bytes() == original
+    # The repaired job is still listed when health fails, so its launchd
+    # state and exit code reach the operator before rollback boots it out.
+    assert "  state = running" in result.stderr
+    assert "  last exit code = 78: EX_CONFIG" in result.stderr
+    assert "did not own the listening socket and return HTTP 200" in result.stderr
+    assert "previous MCP plist restored; previous services remained unloaded" in result.stdout
+    assert "loaded state restored" not in result.stdout
+    assert not launchctl_state(env, "com.loctree.aicx.mcp").exists()
+    assert launchctl_log.read_text(encoding="utf-8").count("bootstrap ") == 1
+    assert "http://127.0.0.1:8044/health" in curl_log.read_text(encoding="utf-8")
+
+
+def test_foreign_http_listener_cannot_mask_bind_failure(tmp: Path) -> None:
+    agents, _, env, launchctl_log, curl_log = fixture(tmp)
+    plist_path = agents / "com.loctree.aicx.mcp.plist"
+    write_plist(
+        plist_path,
+        "com.loctree.aicx.mcp",
+        ["/stale/aicx", "serve", "--transport", "http", "--port", "8044"],
+    )
+    original = plist_path.read_bytes()
+    foreign_env = env | {
+        "AICX_SELFTEST_JOB_PID": "4242",
+        "AICX_SELFTEST_LISTENER_PID": "9001",
+        "AICX_SELFTEST_LISTENER_PARENT_PID": "1",
+    }
+
+    result = run_repair(foreign_env, check=False)
+    assert result.returncode != 0
+    assert plist_path.read_bytes() == original
+    assert "did not own the listening socket and return HTTP 200" in result.stderr
+    assert "previous MCP plist restored; previous services remained unloaded" in result.stdout
+    assert not launchctl_state(env, "com.loctree.aicx.mcp").exists()
+    assert "http://127.0.0.1:8044/health" in curl_log.read_text(encoding="utf-8")
+    assert "-iTCP@127.0.0.1:8044" in Path(
+        env["AICX_SELFTEST_LSOF_LOG"]
+    ).read_text(encoding="utf-8")
+    assert launchctl_log.read_text(encoding="utf-8").count("bootstrap ") == 1
+
+
+def test_health_failure_restores_both_labels_and_registrations(tmp: Path) -> None:
+    agents, _, env, launchctl_log, _ = fixture(tmp)
+    canonical = agents / "com.loctree.aicx.mcp.plist"
+    legacy = agents / "io.vetcoders.aicx.mcp.plist"
+    write_plist(
+        canonical,
+        "com.loctree.aicx.mcp",
+        ["/old/canonical", "serve", "--transport", "http", "--port", "8044"],
+    )
+    write_plist(
+        legacy,
+        "io.vetcoders.aicx.mcp",
+        ["/old/legacy", "--transport", "http", "--port", "8044"],
+    )
+    canonical_original = canonical.read_bytes()
+    legacy_original = legacy.read_bytes()
+    launchctl_state(env, "io.vetcoders.aicx.mcp").touch()
+
+    result = run_repair(env | {"AICX_SELFTEST_FAIL_HEALTH": "1"}, check=False)
+    assert result.returncode != 0
+    assert canonical.read_bytes() == canonical_original
+    assert legacy.read_bytes() == legacy_original
+    assert not launchctl_state(env, "com.loctree.aicx.mcp").exists()
+    assert launchctl_state(env, "io.vetcoders.aicx.mcp").exists()
+    assert "previous MCP plist and loaded state restored" in result.stdout
+    log = launchctl_log.read_text(encoding="utf-8")
+    assert log.count("bootstrap ") == 2
+    assert str(canonical) in log
+    assert str(legacy) in log
+
+
+def test_descendant_listener_is_owned_by_launchd_job(tmp: Path) -> None:
+    agents, _, env, _, _ = fixture(tmp)
+    plist_path = agents / "com.loctree.aicx.mcp.plist"
+    write_plist(
+        plist_path,
+        "com.loctree.aicx.mcp",
+        ["/stale/aicx", "serve", "--transport", "http", "--port", "8044"],
+    )
+    descendant_env = env | {
+        "AICX_SELFTEST_JOB_PID": "4242",
+        "AICX_SELFTEST_LISTENER_PID": "4343",
+        "AICX_SELFTEST_LISTENER_PARENT_PID": "4242",
+    }
+
+    result = run_repair(descendant_env)
+    assert "is ready at http://127.0.0.1:8044/health" in result.stdout
+
+
+def test_ipv6_wildcard_uses_port_only_socket_ownership(tmp: Path) -> None:
+    agents, _, env, _, curl_log = fixture(tmp)
+    plist_path = agents / "com.loctree.aicx.mcp.plist"
+    write_plist(
+        plist_path,
+        "com.loctree.aicx.mcp",
+        [
+            "/stale/aicx",
+            "serve",
+            "--transport",
+            "http",
+            "--host",
+            "::",
+            "--port",
+            "8044",
+            "--require-auth",
+        ],
+    )
+
+    result = run_repair(env)
+    assert "is ready at http://127.0.0.1:8044/health" in result.stdout
+    assert "http://127.0.0.1:8044/health" in curl_log.read_text(encoding="utf-8")
+    lsof_call = Path(env["AICX_SELFTEST_LSOF_LOG"]).read_text(encoding="utf-8")
+    assert "-iTCP:8044" in lsof_call
+    assert "-iTCP@[::]:8044" not in lsof_call
+
+
+def test_scheduler_failure_restores_canonical_file_and_loaded_state(tmp: Path) -> None:
+    agents, _, env, launchctl_log, _ = fixture(tmp)
+    canonical = agents / "com.loctree.aicx.reindex.plist"
+    write_plist(canonical, "com.loctree.aicx.reindex", ["/old/aicx", "index"])
+    original = canonical.read_bytes()
+    launchctl_state(env, "com.loctree.aicx.reindex").touch()
+
+    result = subprocess.run(
+        ["bash", str(SCHEDULER_SCRIPT)],
+        env=env
+        | {
+            "AICX_SELFTEST_FAIL_BOOTSTRAP_LABEL": "com.loctree.aicx.reindex",
+            "AICX_RUNTIME_BOOTSTRAP_ATTEMPTS": "1",
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+    assert canonical.read_bytes() == original
+    assert launchctl_state(env, "com.loctree.aicx.reindex").exists()
+    assert "failed to register; rolling back" in result.stderr
+    assert "previous plist files and loaded state restored" in result.stdout
+    assert launchctl_log.read_text(encoding="utf-8").count("bootstrap ") == 2
+
+
+def test_scheduler_failure_restores_legacy_file_and_loaded_state(tmp: Path) -> None:
+    agents, _, env, launchctl_log, _ = fixture(tmp)
+    canonical = agents / "com.loctree.aicx.reindex.plist"
+    legacy = agents / "io.vetcoders.aicx.reindex.plist"
+    write_plist(legacy, "io.vetcoders.aicx.reindex", ["/old/aicx", "index"])
+    original = legacy.read_bytes()
+    launchctl_state(env, "io.vetcoders.aicx.reindex").touch()
+
+    result = subprocess.run(
+        ["bash", str(SCHEDULER_SCRIPT)],
+        env=env
+        | {
+            "AICX_SELFTEST_FAIL_BOOTSTRAP_LABEL": "com.loctree.aicx.reindex",
+            "AICX_SELFTEST_EXPECT_FILE_AT_BOOTSTRAP": str(legacy),
+            "AICX_RUNTIME_BOOTSTRAP_ATTEMPTS": "1",
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+    assert not canonical.exists()
+    assert legacy.read_bytes() == original
+    assert not launchctl_state(env, "com.loctree.aicx.reindex").exists()
+    assert launchctl_state(env, "io.vetcoders.aicx.reindex").exists()
+    assert "failed to register; rolling back" in result.stderr
+    assert "previous plist files and loaded state restored" in result.stdout
+    log = launchctl_log.read_text(encoding="utf-8")
+    assert log.count("bootstrap ") == 2
+    assert str(legacy) in log
+    assert "bootstrap-presence=missing" not in log
+    assert not list(agents.glob("io.vetcoders.aicx.reindex.plist.migrated.*"))
+
+
+def test_scheduler_failure_preserves_both_unloaded_jobs(tmp: Path) -> None:
+    agents, _, env, launchctl_log, _ = fixture(tmp)
+    canonical = agents / "com.loctree.aicx.reindex.plist"
+    legacy = agents / "io.vetcoders.aicx.reindex.plist"
+    write_plist(canonical, "com.loctree.aicx.reindex", ["/old/canonical", "index"])
+    write_plist(legacy, "io.vetcoders.aicx.reindex", ["/old/legacy", "index"])
+    canonical_original = canonical.read_bytes()
+    legacy_original = legacy.read_bytes()
+
+    result = subprocess.run(
+        ["bash", str(SCHEDULER_SCRIPT)],
+        env=env
+        | {
+            "AICX_SELFTEST_FAIL_BOOTSTRAP_LABEL": "com.loctree.aicx.reindex",
+            "AICX_RUNTIME_BOOTSTRAP_ATTEMPTS": "1",
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+    assert canonical.read_bytes() == canonical_original
+    assert legacy.read_bytes() == legacy_original
+    assert not launchctl_state(env, "com.loctree.aicx.reindex").exists()
+    assert not launchctl_state(env, "io.vetcoders.aicx.reindex").exists()
+    assert launchctl_log.read_text(encoding="utf-8").count("bootstrap ") == 1
+
+
+def test_scheduler_success_retires_legacy_after_canonical_load(tmp: Path) -> None:
+    agents, _, env, launchctl_log, _ = fixture(tmp)
+    canonical = agents / "com.loctree.aicx.reindex.plist"
+    legacy = agents / "io.vetcoders.aicx.reindex.plist"
+    write_plist(legacy, "io.vetcoders.aicx.reindex", ["/old/aicx", "index"])
+    legacy_original = legacy.read_bytes()
+    launchctl_state(env, "io.vetcoders.aicx.reindex").touch()
+
+    result = subprocess.run(
+        ["bash", str(SCHEDULER_SCRIPT)],
+        env=env | {"AICX_SELFTEST_EXPECT_FILE_AT_BOOTSTRAP": str(legacy)},
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert canonical.exists()
+    assert not legacy.exists()
+    archives = list(agents.glob("io.vetcoders.aicx.reindex.plist.migrated.*"))
+    assert len(archives) == 1
+    assert archives[0].read_bytes() == legacy_original
+    assert launchctl_state(env, "com.loctree.aicx.reindex").exists()
+    assert not launchctl_state(env, "io.vetcoders.aicx.reindex").exists()
+    assert "reindex schedule: loaded every" in result.stdout
+    assert f"legacy schedule archived: {archives[0]}" in result.stdout
+    assert "bootstrap-presence=present" in launchctl_log.read_text(encoding="utf-8")
+
+
+def main() -> None:
+    if len(sys.argv) > 2:
+        raise SystemExit(f"usage: {Path(sys.argv[0]).name} [repair-script]")
+    if os.name == "nt":
+        print("repair MCP runtime shell mocks skipped on Windows; covered by Linux/macOS CI")
         return
-    with tempfile.TemporaryDirectory(prefix="aicx-runtime-repair-") as raw_tmp:
-        tmp = Path(raw_tmp)
-        home = tmp / "home"
-        agents = home / "Library/LaunchAgents"
-        fake_bin = tmp / "fake bin"
-        agents.mkdir(parents=True)
-        fake_bin.mkdir()
-        launcher = fake_bin / "aicx"
-        calls = tmp / "aicx-calls.log"
-        launcher.write_text(
-            "#!/bin/sh\n"
-            "printf '%s\\n' \"$*\" >> \"$AICX_SELFTEST_CALLS\"\n"
-            "if [ \"$*\" = 'catalog refresh --json' ]; then\n"
-            "  printf '{\"catalog_present\": %s}\\n' \"${AICX_SELFTEST_CATALOG_PRESENT:-false}\"\n"
-            "fi\n"
-            "exit 0\n",
-            encoding="utf-8",
+    assert SCRIPT.is_file(), f"repair script not found: {SCRIPT}"
+    with tempfile.TemporaryDirectory(prefix=".aicx-runtime-repair-", dir=ROOT) as raw_tmp:
+        base = Path(raw_tmp)
+        test_clean_reader_and_scheduler(base / "clean")
+        test_experimental_writer_becomes_reader(base / "writer")
+        test_legacy_missing_serve_uses_native_subcommand(base / "legacy")
+        test_existing_hybrid_launcher_is_preserved(base / "preserve-hybrid")
+        test_explicit_standalone_launcher_migrates_to_hybrid(base / "standalone-to-hybrid")
+        test_transient_bootstrap_failure_recovers(base / "bootstrap-transient")
+        test_exhausted_bootstrap_retries_restore_loaded_state(
+            base / "bootstrap-exhausted"
         )
-        launcher.chmod(0o755)
-        launchctl = fake_bin / "launchctl"
-        launchctl.write_text(
-            "#!/bin/sh\n[ \"${1:-}\" = managername ] && echo Aqua\nexit 0\n",
-            encoding="utf-8",
+        test_persistent_bootstrap_failure_names_manual_recovery(
+            base / "bootstrap-persistent"
         )
-        launchctl.chmod(0o755)
-
-        plist_path = agents / "com.loctree.aicx.mcp.plist"
-        original_args = [
-            "/stale/aicx", "serve", "--transport", "http",
-            "--host", "192.0.2.44", "--port", "9044",
-            "--allowed-host", "localhost", "--allowed-host", "tailnet.example",
-        ]
-        plist_path.write_bytes(plistlib.dumps({
-            "Label": "com.loctree.aicx.mcp",
-            "ProgramArguments": original_args,
-            "KeepAlive": True,
-        }))
-        env = os.environ | {
-            "HOME": str(home),
-            "PATH": f"{fake_bin}:{os.environ['PATH']}",
-            "AICX_BIN": str(launcher),
-            "AICX_SELFTEST_CALLS": str(calls),
-        }
-        subprocess.run(["bash", str(SCRIPT)], env=env, check=True, capture_output=True, text=True)
-        repaired = plistlib.loads(plist_path.read_bytes())
-        args = repaired["ProgramArguments"]
-        assert args[0] == str(launcher)
-        assert args[1:-1] == original_args[1:]
-        assert args[-1] == "--no-auto-refresh"
-        assert args.count("--no-auto-refresh") == 1
-        subprocess.run(
-            ["bash", str(SCHEDULER_SCRIPT)],
-            env=env,
-            check=True,
-            capture_output=True,
-            text=True,
+        test_disabled_label_is_named_in_bootstrap_diagnostics(base / "bootstrap-disabled")
+        test_silent_bootstrap_drop_is_reported_as_down(base / "bootstrap-silent-drop")
+        test_rollback_reload_failure_names_each_down_label(base / "two-label-down")
+        test_health_failure_restores_previous_plist(base / "health-failure")
+        test_foreign_http_listener_cannot_mask_bind_failure(base / "foreign-listener")
+        test_health_failure_restores_both_labels_and_registrations(
+            base / "two-label-rollback"
         )
-        scheduler_path = agents / "com.loctree.aicx.reindex.plist"
-        scheduler = plistlib.loads(scheduler_path.read_bytes())
-        scheduled_command = scheduler["ProgramArguments"][2]
-        assert "catalog refresh --json" in scheduled_command
-        assert '"catalog_present": false' in scheduled_command
-        assert "catalog rebuild" in scheduled_command
-
-        subprocess.run(scheduler["ProgramArguments"], env=env, check=True, capture_output=True)
-        assert calls.read_text(encoding="utf-8").splitlines() == [
-            "catalog refresh --json",
-            "catalog rebuild",
-            "index",
-        ]
-
-        calls.unlink()
-        current_env = env | {"AICX_SELFTEST_CATALOG_PRESENT": "true"}
-        subprocess.run(
-            scheduler["ProgramArguments"], env=current_env, check=True, capture_output=True
+        test_descendant_listener_is_owned_by_launchd_job(base / "descendant-listener")
+        test_ipv6_wildcard_uses_port_only_socket_ownership(base / "ipv6-wildcard")
+        if os.uname().sysname != "Darwin":
+            print("repair MCP runtime migration and rollback: passed (mocked macOS APIs)")
+            return
+        test_scheduler_failure_restores_canonical_file_and_loaded_state(
+            base / "scheduler-canonical-failure"
         )
-        assert calls.read_text(encoding="utf-8").splitlines() == [
-            "catalog refresh --json",
-            "index",
-        ]
-        print("repair MCP runtime preserves network configuration: passed")
+        test_scheduler_failure_restores_legacy_file_and_loaded_state(
+            base / "scheduler-legacy-failure"
+        )
+        test_scheduler_failure_preserves_both_unloaded_jobs(
+            base / "scheduler-unloaded-failure"
+        )
+        test_scheduler_success_retires_legacy_after_canonical_load(
+            base / "scheduler-legacy-success"
+        )
+    print("repair MCP runtime reader-only migration and rollback: passed")
 
 
 if __name__ == "__main__":

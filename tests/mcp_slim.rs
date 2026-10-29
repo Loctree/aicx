@@ -149,6 +149,7 @@ fn test_mcp_slim_defaults() {
     assert!(params.projects.is_none());
     assert!(params.slim);
     assert!(!params.verbose);
+    assert!(!params.full_rescan);
 
     let params: SteerParams = serde_json::from_str(r#"{"projects":["aicx","loctree"]}"#).unwrap();
     assert_eq!(
@@ -161,6 +162,8 @@ fn test_mcp_slim_defaults() {
         params.projects.as_deref(),
         Some(&["aicx".to_string(), "loctree".to_string()][..])
     );
+    let params: IntentsParams = serde_json::from_str(r#"{"full_rescan":true}"#).unwrap();
+    assert!(params.full_rescan);
 
     let params: ReadParams =
         serde_json::from_str(r#"{"reference":"store/vetcoders/aicx/chunk.md"}"#).unwrap();

@@ -15,7 +15,7 @@ W środowiskach wieloagentowych (flota 10–50 agentów Codex, Claude, Gemini, A
 | **Liczba procesów** | 1 proces per agent (50 agentów = 50 procesów w `ps aux`) | **1 centralny demon na maszynie** |
 | **Zużycie RAM** | Duplikacja pamięci per proces (50 × 50MB+) | **Współdzielona pamięć RAM (~30–60MB na proces)** |
 | **Zarządzanie cache** | Wyścigi dyskowe o pliki `.cache` | **Jedno in-memory `Arc<Snapshot>` w pamięci RAM** |
-| **Szybkość zapytań** | Start binarki + cold read per wywołanie | **< 1–5 ms (natychmiastowy odczyt grafu z RAM)** |
+| **Koszt zapytań** | Start binarki i odczyt przy każdym wywołaniu | Bez startu procesu; koszt zależy od narzędzia, korpusu i walidacji |
 | **Dostęp zdalny** | Tylko lokalnie na maszynie roboczej | **Dostęp po sieci / Tailscale (`host-a`, `host-b`)** |
 | **Skalowalność** | Dławi CPU i wyczerpuje limity deskryptorów plików | **Tokio + Axum bez problemu obsługuje tysiące zapytań** |
 
@@ -38,7 +38,14 @@ pliku tokena albo mechanizmu zmiennej/nagłówka danego klienta.
 
 ### 2.1. Odświeżanie na Żywo (Live Refresh)
 * **Czy `aicx serve` odświeża się na żywo?** **Tak.** `aicx serve` nie zamraża stanu indeksu w RAM na stałe. Każde zapytanie narzędzia (`aicx_search`, `aicx_steer`, `aicx_intents`) odpytuje bezpośrednio bieżący stan bazy Tantivy oraz wektorów z dysku (`~/.aicx/`).
-* **Cykl indeksowania:** długo żyjący serwer HTTP jest **czytelnikiem**, nie writerem indeksu. Domyślnie nie ma własnej pętli odświeżania — świeżość należy do osobnego właściciela maintenance (`tools/install-reindex-schedule.sh`, czyli `aicx catalog rebuild && aicx index`). Wbudowany writer nadal istnieje, ale wyłącznie za jawnym, eksperymentalnym opt-inem (`--experimental-auto-refresh`, kadencja przez `--refresh-interval-seconds`); samo `--refresh-interval-seconds` nigdy nie nadaje własności writera. `--no-auto-refresh` zostaje wyłącznie jako przestarzała flaga kompatybilności — domyślnie i tak jest wyłączone. Instalator nadal przekazuje ją celowo i defensywnie, żeby LaunchAgent pozostał czytelnikiem nawet wtedy, gdy trafiłby na starszą wersję binarki z domyślnie włączonym writerem; nowe wywołania nie powinny jej używać.
+* **Cykl indeksowania:** długo żyjący serwer HTTP jest **czytelnikiem**, nie writerem indeksu. Domyślnie nie ma własnej pętli odświeżania — świeżość należy do osobnego właściciela maintenance (`tools/install-reindex-schedule.sh`, czyli `aicx catalog refresh && aicx index`). Wbudowany writer nadal istnieje, ale wyłącznie za jawnym, eksperymentalnym opt-inem (`--experimental-auto-refresh`, kadencja przez `--refresh-interval-seconds`); samo `--refresh-interval-seconds` nigdy nie nadaje własności writera. `--no-auto-refresh` zostaje wyłącznie jako przestarzała flaga kompatybilności — domyślnie i tak jest wyłączone. Instalator nadal przekazuje ją celowo i defensywnie, żeby LaunchAgent pozostał czytelnikiem nawet wtedy, gdy trafiłby na starszą wersję binarki z domyślnie włączonym writerem; nowe wywołania nie powinny jej używać.
+
+Hybrydowy listener otwiera port bez przeszukiwania katalogów agentów ani budowy
+danych dashboardu. `/api/status` i `/api/context` początkowo zwracają
+`scan_status: "not_scanned"`, `build_count: 0` oraz null w `generated_at`/`stats`.
+Autoryzowane żądanie browse lub regenerate ładuje dane dashboardu.
+Gotowość tych danych jest niezależna od `/health`, inicjalizacji MCP i gotowości
+indeksu.
 
 ### 2.2. Instalacja i Cele w Makefile
 * **Standardowa instalacja (z kreatorem):**

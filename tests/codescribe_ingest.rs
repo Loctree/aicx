@@ -105,3 +105,63 @@ fn codescribe_ingest_discovers_and_parses_txt_md_json_transcripts() {
 
     let _ = fs::remove_dir_all(&root);
 }
+
+#[test]
+fn catalog_takes_keep_one_text_per_recording_and_never_admit_failed_or_rewrites() {
+    let root = unique_test_dir("catalog-takes");
+    let home = root.join("home");
+    let day = home
+        .join(".codescribe")
+        .join("transcriptions")
+        .join("2026-04-30");
+    for (name, content) in [
+        // One recording, three text exports: the unnumbered raw wins.
+        ("100000_alpha_raw.m4a", ""),
+        ("100000_alpha_raw.txt", "alpha raw words"),
+        ("100000_alpha_raw_1.txt", "alpha colliding raw export"),
+        ("100000_alpha_cloud_1.txt", "alpha cloud export"),
+        // Failed takes, numbered or not, are never speech.
+        ("110000_beta_failed.txt", "No reliable speech detected"),
+        ("110000_beta_failed_1.txt", "beta failed retry"),
+        // Formatter rewrites alone are never attributed verbatim.
+        ("120000_gamma_ai_1.txt", "gamma rewrite"),
+        ("120000_gamma_formatted_1.txt", "gamma formatted rewrite"),
+        // A numbered file with audio of its own is a distinct recording.
+        ("130000_delta_raw.m4a", ""),
+        ("130000_delta_raw.txt", "delta first recording"),
+        ("130000_delta_raw_2.m4a", ""),
+        ("130000_delta_raw_2.txt", "delta second recording"),
+        // The only text of a take is kept whatever its export number.
+        ("140000_epsilon_cloud_1.txt", "epsilon cloud only"),
+        ("150000_zeta_raw_1.txt", "zeta numbered raw only"),
+        // A slug ending in digits is not a collision suffix.
+        ("160000_build_2115.md", "build notes"),
+    ] {
+        write_file(&day.join(name), content);
+    }
+
+    let mut kept: Vec<String> = aicx::importers::catalog_takes(&home)
+        .into_iter()
+        .map(|take| {
+            take.path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    kept.sort();
+    assert_eq!(
+        kept,
+        vec![
+            "100000_alpha_raw.txt",
+            "130000_delta_raw.txt",
+            "130000_delta_raw_2.txt",
+            "140000_epsilon_cloud_1.txt",
+            "150000_zeta_raw_1.txt",
+            "160000_build_2115.md",
+        ]
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
