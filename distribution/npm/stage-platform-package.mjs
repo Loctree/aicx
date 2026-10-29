@@ -15,6 +15,14 @@ const PLATFORMS = {
     asset: `aicx-v${version}-aarch64-apple-darwin-slim.zip`,
     binaries: ["aicx", "aicx-mcp"],
   },
+  "darwin-x64": {
+    asset: `aicx-v${version}-x86_64-apple-darwin-slim.zip`,
+    binaries: ["aicx", "aicx-mcp"],
+  },
+  "linux-arm64-gnu": {
+    asset: `aicx-v${version}-aarch64-linux-gnu-slim.tar.gz`,
+    binaries: ["aicx", "aicx-mcp"],
+  },
   "linux-x64-gnu": {
     asset: `aicx-v${version}-x86_64-linux-gnu-slim.tar.gz`,
     binaries: ["aicx", "aicx-mcp"],
@@ -34,10 +42,13 @@ const releaseDir = path.resolve(releaseDirArg);
 let assetName = platform.asset;
 if (
   verificationMode === "local-unsigned-ci" &&
-  platformKey === "darwin-arm64" &&
+  platformKey.startsWith("darwin-") &&
+  assetName.endsWith(".zip") &&
   !fs.existsSync(path.join(releaseDir, assetName))
 ) {
-  assetName = `aicx-v${version}-aarch64-apple-darwin-slim.tar.gz`;
+  // The merge-queue gate bundles binaries-only (tar.gz) on macOS instead of
+  // the notarized zip that release.yml publishes.
+  assetName = assetName.replace(/[.]zip$/, ".tar.gz");
 }
 const archivePath = path.join(releaseDir, assetName);
 const checksumPath = `${archivePath}.sha256`;

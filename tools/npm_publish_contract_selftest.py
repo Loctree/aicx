@@ -11,7 +11,7 @@ WORKFLOW = ROOT / ".github/workflows/npm-publish.yml"
 RELEASE_WORKFLOW = ROOT / ".github/workflows/release.yml"
 WRAPPER = ROOT / "distribution/npm/aicx/package.json"
 PLATFORM_ROOT = ROOT / "distribution/npm/aicx/platform-packages"
-PLATFORMS = ("darwin-arm64", "linux-x64-gnu", "win32-x64-gnu")
+PLATFORMS = ("darwin-arm64", "darwin-x64", "linux-arm64-gnu", "linux-x64-gnu", "win32-x64-gnu")
 FORBIDDEN = ("preinstall", "install", "postinstall", "prepare")
 SERVICE_INSTALLERS = (
     ROOT / "tools/install-mcp-service.sh",
@@ -33,6 +33,19 @@ def main() -> None:
     for platform in PLATFORMS:
         assert_script_free(PLATFORM_ROOT / platform / "package.json")
 
+    on_disk = tuple(sorted(path.name for path in PLATFORM_ROOT.iterdir() if path.is_dir()))
+    if on_disk != tuple(sorted(PLATFORMS)):
+        raise SystemExit(f"platform package directories {on_disk} drifted from the contract {PLATFORMS}")
+    for module in ("sync-version.mjs", "verify-metadata.mjs", "stage-platform-package.mjs"):
+        module_source = (ROOT / "distribution/npm" / module).read_text(encoding="utf-8")
+        for platform in PLATFORMS:
+            if f'"{platform}"' not in module_source:
+                raise SystemExit(f"distribution/npm/{module} does not know platform {platform}")
+    wrapper_package = json.loads(WRAPPER.read_text(encoding="utf-8"))
+    expected_optional = {f"@loctree/aicx-{platform}" for platform in PLATFORMS}
+    if set(wrapper_package.get("optionalDependencies", {})) != expected_optional:
+        raise SystemExit("wrapper optionalDependencies drifted from the platform package set")
+
     wrapper_source = (WRAPPER.parent / "index.js").read_text(encoding="utf-8")
     wrapper_readme = (WRAPPER.parent / "README.md").read_text(encoding="utf-8")
     if "aicx doctor --repair-runtime" not in wrapper_source:
@@ -43,6 +56,14 @@ def main() -> None:
         raise SystemExit("npm wrapper lost the loopback-contract migration check")
     if "childFailureExit" not in wrapper_source:
         raise SystemExit("npm wrapper lost the signal-death exit")
+    for platform in PLATFORMS:
+        if f'"@loctree/aicx-{platform}"' not in wrapper_source:
+            raise SystemExit(f"npm wrapper platform map lost @loctree/aicx-{platform}")
+    if "AicxPlatformError" not in wrapper_source or "runCli" not in wrapper_source:
+        raise SystemExit("npm wrapper lost the loud unsupported-platform exit")
+    for shim in ("aicx", "aicx-mcp"):
+        if "runCli" not in (WRAPPER.parent / "bin" / shim).read_text(encoding="utf-8"):
+            raise SystemExit(f"npm bin shim {shim} bypasses runCli (platform errors would be stack traces)")
     if "process.exit(error.status)" in wrapper_source:
         raise SystemExit("npm wrapper still treats a null child status as an exit code")
 
@@ -106,8 +127,12 @@ if (!exited || exited.code !== 2 || exited.line) process.exit(8);
         "npm publish ./npm-package/*.tgz",
         'npm view "${package}@${RELEASE_VERSION}" version',
         "@loctree/aicx-darwin-arm64",
+        "@loctree/aicx-darwin-x64",
+        "@loctree/aicx-linux-arm64-gnu",
         "@loctree/aicx-linux-x64-gnu",
         "@loctree/aicx-win32-x64-gnu",
+        "runs_on: macos-15-intel",
+        "runs_on: ubuntu-24.04-arm",
         "npm@11.17.0",
         "install_mode: [normal, ignore-scripts]",
         'grep -qi "allow-scripts"',
@@ -138,6 +163,15 @@ if (!exited || exited.code !== 2 || exited.line) process.exit(8);
     if "workflow_call:" not in workflow:
         raise SystemExit("npm publish workflow must be callable from release.yml (workflow_call)")
     release_workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+    for contract in (
+        "runner: ubuntu-24.04-arm",
+        "target: aarch64-unknown-linux-gnu",
+        "runner: macos-15-intel",
+        "target: x86_64-apple-darwin",
+        "AICX_BUILD_TARGET: aarch64-unknown-linux-gnu.2.28",
+    ):
+        if contract not in release_workflow:
+            raise SystemExit(f"release.yml lost contract: {contract}")
     if "uses: ./.github/workflows/npm-publish.yml" not in release_workflow:
         raise SystemExit("release.yml lost the npm-publish chain job")
     if "needs: [verify, github-release]" not in release_workflow:
