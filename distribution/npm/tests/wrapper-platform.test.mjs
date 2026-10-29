@@ -22,7 +22,9 @@ const require = createRequire(import.meta.url);
 const wrapper = require(path.join(WRAPPER_ROOT, "index.js"));
 const manifest = JSON.parse(fs.readFileSync(path.join(WRAPPER_ROOT, "package.json"), "utf8"));
 const SUPPORTED_KEYS = Object.keys(wrapper.PLATFORM_PACKAGES);
-const ISSUES_URL = "https://github.com/Loctree/aicx/issues";
+// Whole-line match: CodeQL js/incomplete-url-substring-sanitization flags a bare
+// `includes(url)`; anchoring the shipped line also pins the wording.
+const ISSUES_LINE = /^Need this platform\? Open an issue: https:\/\/github\.com\/Loctree\/aicx\/issues$/m;
 
 function makeWrapperCopy() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "aicx-wrapper-test-"));
@@ -105,7 +107,7 @@ test("unsupported hosts raise a platform error naming the host and the supported
       assert.match(error.message, /libc: {5}musl/);
       assert.match(error.message, /key: {6}linux-arm64-musl/);
       for (const key of SUPPORTED_KEYS) assert.ok(error.message.includes(key), key);
-      assert.ok(error.message.includes(ISSUES_URL));
+      assert.match(error.message, ISSUES_LINE);
       return true;
     },
   );
@@ -134,7 +136,7 @@ for (const host of [
       assert.ok(result.stderr.includes(`arch:     ${host.arch}`), result.stderr);
       assert.ok(result.stderr.includes(`libc:     ${host.libc || "n/a"}`), result.stderr);
       for (const key of SUPPORTED_KEYS) assert.ok(result.stderr.includes(key), `${key} in ${result.stderr}`);
-      assert.ok(result.stderr.includes(ISSUES_URL));
+      assert.match(result.stderr, ISSUES_LINE);
       assert.doesNotMatch(result.stderr, /^\s+at /m, "refusal must not print a stack trace");
     }
   });
