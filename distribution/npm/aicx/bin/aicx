@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-const { execAicx } = require("../index.js");
+const { runCli } = require("../index.js");
 
 process.env.AICX_RUNTIME_BIN ||= process.argv[1];
-execAicx(process.argv.slice(2));
+runCli("aicx", process.argv.slice(2));

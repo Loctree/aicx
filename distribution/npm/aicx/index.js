@@ -5,15 +5,32 @@ const { existsSync, readFileSync, realpathSync } = require("fs");
 const { homedir } = require("os");
 const { dirname, isAbsolute, relative, sep } = require("path");
 
+const ISSUES_URL = "https://github.com/Loctree/aicx/issues";
+const RELEASES_URL = "https://github.com/Loctree/aicx/releases";
+
+// One entry per published platform package. Keep in sync with
+// distribution/npm/verify-metadata.mjs; tools/npm_publish_contract_selftest.py
+// fails when a platform directory and this map drift apart.
 const PLATFORM_PACKAGES = Object.freeze({
   "darwin-arm64": Object.freeze({
     name: "@loctree/aicx-darwin-arm64",
+    label: "macOS, Apple Silicon",
+  }),
+  "darwin-x64": Object.freeze({
+    name: "@loctree/aicx-darwin-x64",
+    label: "macOS, Intel",
+  }),
+  "linux-arm64-gnu": Object.freeze({
+    name: "@loctree/aicx-linux-arm64-gnu",
+    label: "Linux arm64, glibc",
   }),
   "linux-x64-gnu": Object.freeze({
     name: "@loctree/aicx-linux-x64-gnu",
+    label: "Linux x64, glibc",
   }),
   "win32-x64-gnu": Object.freeze({
     name: "@loctree/aicx-win32-x64-gnu",
+    label: "Windows x64",
   }),
 });
 
@@ -21,6 +38,17 @@ const BINARY_FILENAMES = Object.freeze({
   aicx: process.platform === "win32" ? "aicx.exe" : "aicx",
   "aicx-mcp": process.platform === "win32" ? "aicx-mcp.exe" : "aicx-mcp",
 });
+
+// A failure the wrapper can explain to the person at the terminal: no binary
+// exists for this host, or the platform package did not land on disk. runCli
+// prints message and exits non-zero instead of dumping a Node stack trace.
+class AicxPlatformError extends Error {
+  constructor(message, options) {
+    super(message, options);
+    this.name = "AicxPlatformError";
+    this.exitCode = 1;
+  }
+}
 
 function isMuslLibc() {
   try {
@@ -32,60 +60,89 @@ function isMuslLibc() {
   }
 }
 
-function getPlatformKey() {
-  const platform = process.platform;
-  const arch = process.arch;
-
-  const archMap = {
-    x64: "x64",
-    arm64: "arm64",
-    aarch64: "arm64",
+function detectHost() {
+  const host = {
+    platform: process.platform,
+    arch: process.arch,
+    libc: null,
   };
-
-  const normalizedArch = archMap[arch] || arch;
-
-  if (platform === "linux") {
-    if (isMuslLibc()) {
-      throw new Error("AICX npm binaries are not published for Linux musl yet.");
-    }
-    const libc = "gnu";
-    return `${platform}-${normalizedArch}-${libc}`;
+  if (host.platform === "linux") {
+    host.libc = isMuslLibc() ? "musl" : "glibc";
   }
+  return host;
+}
 
-  if (platform === "darwin") {
-    return `${platform}-${normalizedArch}`;
+function platformKeyFor(host) {
+  const { platform, arch, libc } = host;
+  const knownArch = arch === "x64" || arch === "arm64";
+
+  if (platform === "linux" && knownArch && libc === "glibc") {
+    return `linux-${arch}-gnu`;
   }
-
-  if (platform === "win32") {
+  if (platform === "darwin" && knownArch) {
+    return `darwin-${arch}`;
+  }
+  if (platform === "win32" && arch === "x64") {
     // The legacy npm package key ends in gnu, but its payload is the MSVC build.
-    return `${platform}-${normalizedArch}-gnu`;
+    return "win32-x64-gnu";
   }
-
   return null;
+}
+
+function describeHost(host) {
+  const lines = [
+    `  process.platform: ${host.platform}`,
+    `  process.arch:     ${host.arch}`,
+  ];
+  if (host.libc) lines.push(`  libc:             ${host.libc}`);
+  return lines.join("\n");
+}
+
+function supportedPlatformsList() {
+  return Object.entries(PLATFORM_PACKAGES)
+    .map(([key, { label }]) => `  ${key.padEnd(16)} ${label}`)
+    .join("\n");
+}
+
+function unsupportedPlatformError(host) {
+  return new AicxPlatformError(
+    `[aicx] No prebuilt aicx binary for this platform.\n` +
+    `${describeHost(host)}\n` +
+    `Supported platforms:\n${supportedPlatformsList()}\n` +
+    `Prebuilt downloads: ${RELEASES_URL}\n` +
+    `Missing your platform? Open an issue: ${ISSUES_URL}`
+  );
+}
+
+function missingPlatformPackageError(host, packageName, detail, options) {
+  return new AicxPlatformError(
+    `[aicx] ${detail}\n` +
+    `${describeHost(host)}\n` +
+    `Expected platform package: ${packageName}\n` +
+    `Usual causes: npm skipped optionalDependencies (--omit=optional, --no-optional),\n` +
+    `or node_modules was installed on a different OS/CPU than the one running it\n` +
+    `(for example a macOS node_modules copied into a Linux container).\n` +
+    `Reinstall on this machine: npm install @loctree/aicx\n` +
+    `Prebuilt downloads: ${RELEASES_URL}\n` +
+    `Still failing? Open an issue: ${ISSUES_URL}`,
+    options
+  );
+}
+
+function getPlatformKey() {
+  return platformKeyFor(detectHost());
 }
 
 function getPlatformPackageName() {
   return getPlatformPackage().name;
 }
 
-function getPlatformPackage() {
-  const platformKey = getPlatformKey();
-  if (!platformKey) {
-    throw new Error(
-      `Unsupported platform: ${process.platform}-${process.arch}.\n` +
-      `AICX currently supports macOS (arm64), Linux (x64 gnu), and Windows (x64 gnu).\n` +
-      `Please build from source or download manually from: https://github.com/Loctree/aicx/releases`
-    );
-  }
-
-  const platformPackage = PLATFORM_PACKAGES[platformKey];
+function getPlatformPackage(host = detectHost()) {
+  const platformKey = platformKeyFor(host);
+  const platformPackage = platformKey && PLATFORM_PACKAGES[platformKey];
   if (!platformPackage) {
-    throw new Error(
-      `No package available for platform: ${platformKey}.\n` +
-      `Please build from source or download manually from: https://github.com/Loctree/aicx/releases`
-    );
+    throw unsupportedPlatformError(host);
   }
-
   return platformPackage;
 }
 
@@ -135,7 +192,8 @@ function resolvePlatformBinaryPath(packageRoot, binaryFileName) {
 }
 
 function getBinaryPath(binaryName) {
-  const platformPackage = getPlatformPackage();
+  const host = detectHost();
+  const platformPackage = getPlatformPackage(host);
   const packageName = platformPackage.name;
   const resolvedBinaryName = getBinaryFileName(binaryName);
   let packageRoot;
@@ -143,10 +201,10 @@ function getBinaryPath(binaryName) {
   try {
     packageRoot = resolvePlatformPackageRoot(packageName);
   } catch (error) {
-    throw new Error(
-      `${packageName} is not installed or cannot be resolved.\n` +
-      `This typically happens if npm optionalDependencies failed to install or were skipped.\n` +
-      `Download the binary manually from: https://github.com/Loctree/aicx/releases`,
+    throw missingPlatformPackageError(
+      host,
+      packageName,
+      `${packageName} is not installed or cannot be resolved.`,
       { cause: error }
     );
   }
@@ -154,11 +212,10 @@ function getBinaryPath(binaryName) {
   const binaryPath = resolvePlatformBinaryPath(packageRoot, resolvedBinaryName);
 
   if (!existsSync(binaryPath)) {
-    throw new Error(
-      `${binaryName} binary not found at ${binaryPath}.\n` +
-      `This typically happens if npm optionalDependencies failed to install or were skipped.\n` +
-      `Please ensure "${packageName}" is installed, or download the binary manually from:\n` +
-      `https://github.com/Loctree/aicx/releases`
+    throw missingPlatformPackageError(
+      host,
+      packageName,
+      `${binaryName} binary not found at ${binaryPath}.`
     );
   }
 
@@ -279,13 +336,33 @@ function execAicxMcpSync(args = []) {
   return execBinarySync("aicx-mcp", args);
 }
 
+// Entry point for the bin/ shims. Platform problems end as a plain message on
+// stderr and a non-zero exit; anything else keeps its original stack trace.
+function runCli(binaryName, args = []) {
+  const run = binaryName === "aicx-mcp" ? execAicxMcp : execAicx;
+  try {
+    run(args);
+  } catch (error) {
+    if (error instanceof AicxPlatformError) {
+      process.stderr.write(`${error.message}\n`);
+      process.exit(error.exitCode);
+    }
+    throw error;
+  }
+}
+
 module.exports = {
   execAicx,
   execAicxSync,
   execAicxMcp,
   execAicxMcpSync,
+  AicxPlatformError,
+  PLATFORM_PACKAGES,
+  detectHost,
   getBinaryPath,
   getPlatformPackageName,
+  platformKeyFor,
+  runCli,
   maybePrintRuntimeMigrationHint,
   plistMatchesLoopbackContract,
   childFailureExit,
@@ -295,5 +372,5 @@ module.exports = {
 
 if (require.main === module) {
   process.env.AICX_RUNTIME_BIN ||= process.argv[1];
-  execAicx(process.argv.slice(2));
+  runCli("aicx", process.argv.slice(2));
 }
