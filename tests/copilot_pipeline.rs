@@ -575,10 +575,19 @@ fn copilot_public_pipeline_and_incremental_append() {
                 .any(|item| item.to_string().contains(TOOL_TOKEN)),
             "tool output is not human intent: {mcp_intents}"
         );
+        // EVENT_TIME is a fixed instant, so a fixed 720h window silently
+        // dropped the fixture once the wall clock passed EVENT_TIME + 30 days
+        // (outside_window=1, qualified_sources=0). Size the window from the
+        // fixture's real age instead; 720h stays the floor.
+        let continuity_hours = {
+            let event = chrono::DateTime::parse_from_rfc3339(EVENT_TIME).unwrap();
+            let age_hours = chrono::Utc::now().signed_duration_since(event).num_hours();
+            (age_hours + 24).max(720)
+        };
         let continuity = mcp.tool(
             "aicx_continuity",
             json!({
-                "project": resolved["project"], "hours": 720
+                "project": resolved["project"], "hours": continuity_hours
             }),
         );
         assert_eq!(continuity["ok"], true, "{continuity}");
