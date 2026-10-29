@@ -59,6 +59,11 @@ jobs:
         working-directory: aicx
         run: python tools/npm_publish_contract_selftest.py
 
+      - name: npm wrapper platform contract
+        if: runner.os == 'Linux'
+        working-directory: aicx
+        run: node --test distribution/npm/aicx/test/wrapper.test.js
+
       - name: MCP service installer and repair contracts
         if: runner.os == 'Linux'
         working-directory: aicx
