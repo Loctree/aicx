@@ -1,0 +1,31 @@
+{
+  "name": "@loctree/aicx-linux-arm64-gnu",
+  "version": "0.15.0",
+  "description": "aicx + aicx-mcp binaries for Linux arm64 (glibc)",
+  "keywords": [
+    "aicx",
+    "mcp",
+    "linux",
+    "arm64",
+    "gnu"
+  ],
+  "license": "BUSL-1.1",
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "libc": [
+    "glibc"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Loctree/aicx.git",
+    "directory": "distribution/npm/aicx/platform-packages/linux-arm64-gnu"
+  },
+  "files": [
+    "bin/aicx",
+    "bin/aicx-mcp"
+  ]
+}
