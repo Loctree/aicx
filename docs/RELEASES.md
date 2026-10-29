@@ -20,6 +20,7 @@ the tag/version contract and release gates, then publishes:
 | Linux x64 GNU | `aicx-vX.Y.Z-x86_64-linux-gnu-slim.tar.gz` | GPG detached signature |
 | Windows x64 | `aicx-vX.Y.Z-x86_64-pc-windows-msvc-slim.zip` | GPG detached signature |
 | Debian x64 | `aicx_X.Y.Z-1_amd64.deb` | GPG detached signature |
+| Debian arm64 | `aicx_X.Y.Z-1_arm64.deb` | GPG detached signature |
 
 Every archive and Debian package has an adjacent `.sha256` and `.asc`.
 `loctree-release-pubkey.asc` is published with the release. The macOS job also
