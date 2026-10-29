@@ -9,32 +9,40 @@ create a competing unsigned release lane.
 | Target | Support | Artifact |
 | --- | --- | --- |
 | `x86_64-unknown-linux-gnu` | First-class | `aicx-vX.Y.Z-x86_64-linux-gnu-slim.tar.gz` |
+| `aarch64-unknown-linux-gnu` | First-class | `aicx-vX.Y.Z-aarch64-linux-gnu-slim.tar.gz` |
 
 The archive includes `aicx`, `aicx-mcp`, the installer, license, release
 manifest, and command/release documentation. It is published with adjacent
 `.sha256` and `.asc` files. The release also publishes
 `loctree-release-pubkey.asc`.
 
-Linux arm64 and musl are not in the current public matrix. They must not be
-advertised until the build workflow, installer, npm mapping, checksums,
-signatures, and cold-install smoke all support them.
+Both targets ship the same feature set (default features, GGUF included) and
+the same glibc 2.28 floor, so the arm64 archive runs in the Debian/Ubuntu arm64
+containers Docker starts by default on Apple Silicon. Debian packages ship as
+`aicx_X.Y.Z-1_amd64.deb` and `aicx_X.Y.Z-1_arm64.deb`.
+
+musl is not in the public matrix. It must not be advertised until the build
+workflow, installer, npm mapping, checksums, signatures, and cold-install smoke
+all support it.
 
 ## Production Build
 
-Pushing a valid `vX.Y.Z` tag runs `.github/workflows/release.yml`. Its Linux
-leg executes the repository bundle contract on the `ops-linux` runner:
+Pushing a valid `vX.Y.Z` tag runs `.github/workflows/release.yml`. Each Linux
+leg executes the repository bundle contract natively on a GitHub-hosted runner
+of its architecture (`ubuntu-latest` for x64, `ubuntu-24.04-arm` for arm64):
 
 ```bash
-TARGET=x86_64-unknown-linux-gnu \
+TARGET=aarch64-unknown-linux-gnu \
   AICX_RELEASE_BUNDLE_ONLY_BINARIES=1 \
   AICX_BUNDLE_FLAVOR=slim \
   AICX_CARGO_BUILD_CMD="cargo zigbuild" \
-  AICX_BUILD_TARGET=x86_64-unknown-linux-gnu.2.28 \
+  AICX_BUILD_TARGET=aarch64-unknown-linux-gnu.2.28 \
   ./tools/release_bundle.sh
 ```
 
-The script normalizes the target name in the public asset to
-`x86_64-linux-gnu`, writes SHA-256 and GPG detached signatures, and refuses to
+(x64: the same with `x86_64-unknown-linux-gnu`.) The script normalizes the
+target name in the public asset to `x86_64-linux-gnu` / `aarch64-linux-gnu`,
+writes SHA-256 and GPG detached signatures, and refuses to
 publish when the signing key or passphrase material is unavailable.
 `cargo zigbuild` links against the declared glibc 2.28 floor; before upload,
 the workflow extracts both binaries, runs their version commands, and rejects
@@ -44,10 +52,12 @@ The same workflow produces a Debian package and signs it independently.
 
 ## Local Verification
 
-Build the supported Linux target on a compatible host:
+Build a supported Linux target on a host of the same architecture (for arm64
+on Apple Silicon: `docker run --platform linux/arm64 rust:1.95.0-bookworm`,
+plus `cmake clang libclang-dev` from apt for the GGUF backend):
 
 ```bash
-cargo zigbuild --locked --release --target x86_64-unknown-linux-gnu.2.28 \
+cargo zigbuild --locked --release --target aarch64-unknown-linux-gnu.2.28 \
   --bin aicx --bin aicx-mcp
 ```
 

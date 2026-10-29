@@ -15,9 +15,12 @@ the tag/version contract and release gates, then publishes:
 | Platform | Release asset | Platform proof |
 | --- | --- | --- |
 | macOS arm64 | `aicx-vX.Y.Z-aarch64-apple-darwin-slim.zip` | Developer ID codesign + Apple notarization |
+| macOS x64 (Intel) | `aicx-vX.Y.Z-x86_64-apple-darwin-slim.zip` | Developer ID codesign + Apple notarization |
 | Linux x64 GNU | `aicx-vX.Y.Z-x86_64-linux-gnu-slim.tar.gz` | GPG detached signature |
+| Linux arm64 GNU | `aicx-vX.Y.Z-aarch64-linux-gnu-slim.tar.gz` | GPG detached signature |
 | Windows x64 | `aicx-vX.Y.Z-x86_64-pc-windows-msvc-slim.zip` | GPG detached signature |
 | Debian x64 | `aicx_X.Y.Z-1_amd64.deb` | GPG detached signature |
+| Debian arm64 | `aicx_X.Y.Z-1_arm64.deb` | GPG detached signature |
 
 Every archive and Debian package has an adjacent `.sha256` and `.asc`.
 `loctree-release-pubkey.asc` is published with the release. The macOS job also
@@ -37,11 +40,21 @@ Each bundle contains:
 The Windows zip is portable and intentionally omits the Unix-only
 `install.sh`; users invoke `aicx.exe` and `aicx-mcp.exe` directly.
 
-The release workflow builds exactly three binary targets:
+The release workflow builds exactly five binary targets, each natively on a
+GitHub-hosted runner of its own architecture (no `cross`):
 
-- `aarch64-apple-darwin`
-- `x86_64-unknown-linux-gnu`
-- `x86_64-pc-windows-msvc`
+| Target | Runner label |
+| --- | --- |
+| `aarch64-apple-darwin` | `macos-15` |
+| `x86_64-apple-darwin` | `macos-15-intel` |
+| `x86_64-unknown-linux-gnu` | `ubuntu-latest` |
+| `aarch64-unknown-linux-gnu` | `ubuntu-24.04-arm` |
+| `x86_64-pc-windows-msvc` | `windows-latest` |
+
+Both macOS targets and both Linux targets build with default features, so
+in-process GGUF embeddings (`native-embedder` → `llama-cpp-2`) ship on all four.
+Both Linux legs use `cargo zigbuild` against the glibc 2.28 floor. Windows
+alone drops `native-embedder` (see below).
 
 The signed Windows leg runs on the operator-owned `windows-pc` runner because
 that host owns the release GPG key. Cargo is serialized there with
@@ -210,15 +223,21 @@ first on `PATH`, and GNU tar does not extract the release ZIP. The installer
 validates the system extractor path and invokes it directly without a shell;
 PowerShell and CI therefore exercise the same native Windows path.
 
-`distribution/npm/` contains one wrapper plus three platform packages:
+`distribution/npm/` contains one wrapper plus five platform packages:
 
 - `@loctree/aicx-darwin-arm64`
+- `@loctree/aicx-darwin-x64`
+- `@loctree/aicx-linux-arm64-gnu`
 - `@loctree/aicx-linux-x64-gnu`
 - `@loctree/aicx-win32-x64-gnu` (legacy npm suffix; MSVC binary)
 - `@loctree/aicx`
 
+On any other host (Linux musl/Alpine, Windows arm64, BSDs) the wrapper exits
+non-zero with a stderr message naming `platform`, `arch`, `libc`, the
+supported set, and the issues link; it never fails silently.
+
 Use `.github/workflows/npm-publish.yml` after the matching GitHub Release is
-complete. The workflow checks the three release archive names and their
+complete. The workflow checks the five release archive names and their
 checksums, validates package metadata, publishes platform packages first, then
 the wrapper. See `distribution/npm/PUBLISHING.md`.
 
