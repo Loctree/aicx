@@ -14,6 +14,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Prebuilt `aicx` + `aicx-mcp` for Linux arm64 (glibc) and macOS x64 (Intel).
+  New release assets `aicx-vX.Y.Z-aarch64-linux-gnu-slim.tar.gz`,
+  `aicx_X.Y.Z-1_arm64.deb`, and the Developer ID-signed, notarized
+  `aicx-vX.Y.Z-x86_64-apple-darwin-slim.zip` are built natively on the
+  GitHub-hosted `ubuntu-24.04-arm` and `macos-15-intel` runners. Release
+  features match the other Unix targets, so in-process GGUF embeddings ship
+  on all four. The Linux arm64 build keeps the glibc 2.28 floor, so it runs in
+  the Debian/Ubuntu `linux/arm64` containers Docker starts on Apple Silicon.
+  npm gains `@loctree/aicx-linux-arm64-gnu` and `@loctree/aicx-darwin-x64`,
+  and `install.sh` release mode resolves both hosts.
+- The npm wrapper refuses hosts without a published binary (Linux musl/Alpine,
+  Windows arm64, BSDs) out loud. `aicx` and `aicx-mcp` exit `1` with
+  `platform`, `arch`, `libc`, the supported platform list, and the issues link
+  on stderr, with no Node stack trace. A skipped optional platform package
+  gets the same exit code and the `npm install --include=optional` remedy.
+
 - Native Antigravity CLI conversations (`agy`, aliases `antigravity` and
   `antigravity-cli`) across discovery/catalog, readable extracts, bulk
   exports, conversation JSON, intents, handoff briefs, source indexing/search,
