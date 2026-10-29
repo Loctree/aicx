@@ -11,7 +11,7 @@ WORKFLOW = ROOT / ".github/workflows/npm-publish.yml"
 RELEASE_WORKFLOW = ROOT / ".github/workflows/release.yml"
 WRAPPER = ROOT / "distribution/npm/aicx/package.json"
 PLATFORM_ROOT = ROOT / "distribution/npm/aicx/platform-packages"
-PLATFORMS = ("darwin-arm64", "linux-x64-gnu", "win32-x64-gnu")
+PLATFORMS = ("darwin-arm64", "darwin-x64", "linux-x64-gnu", "linux-arm64-gnu", "win32-x64-gnu")
 FORBIDDEN = ("preinstall", "install", "postinstall", "prepare")
 SERVICE_INSTALLERS = (
     ROOT / "tools/install-mcp-service.sh",
@@ -29,6 +29,7 @@ def assert_script_free(path: Path) -> None:
 
 
 def main() -> None:
+    subprocess.run(["node", "--test", str(WRAPPER.parent / "test/platform.test.js")], cwd=ROOT, check=True)
     assert_script_free(WRAPPER)
     for platform in PLATFORMS:
         assert_script_free(PLATFORM_ROOT / platform / "package.json")
@@ -106,6 +107,8 @@ if (!exited || exited.code !== 2 || exited.line) process.exit(8);
         "npm publish ./npm-package/*.tgz",
         'npm view "${package}@${RELEASE_VERSION}" version',
         "@loctree/aicx-darwin-arm64",
+        "@loctree/aicx-darwin-x64",
+        "@loctree/aicx-linux-arm64-gnu",
         "@loctree/aicx-linux-x64-gnu",
         "@loctree/aicx-win32-x64-gnu",
         "npm@11.17.0",

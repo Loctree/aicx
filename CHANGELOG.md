@@ -14,6 +14,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Release and npm platform packages for glibc Linux arm64 and Intel macOS; the npm wrapper reports unsupported platforms and missing binaries explicitly.
+
 - Native Antigravity CLI conversations (`agy`, aliases `antigravity` and
   `antigravity-cli`) across discovery/catalog, readable extracts, bulk
   exports, conversation JSON, intents, handoff briefs, source indexing/search,

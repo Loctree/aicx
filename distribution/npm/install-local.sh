@@ -87,12 +87,14 @@ detect_platform_key() {
     Darwin)
       case "$arch" in
         arm64)  printf 'darwin-arm64' ;;
+        x86_64|amd64) printf 'darwin-x64' ;;
         x86_64) printf 'darwin-x64' ;;
         *)      return 1 ;;
       esac ;;
     Linux)
       case "$arch" in
         x86_64|amd64)  printf 'linux-x64-gnu' ;;
+        aarch64|arm64) printf 'linux-arm64-gnu' ;;
         aarch64|arm64) printf 'linux-arm64-gnu' ;;
         *)             return 1 ;;
       esac ;;

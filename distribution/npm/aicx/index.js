@@ -9,6 +9,12 @@ const PLATFORM_PACKAGES = Object.freeze({
   "darwin-arm64": Object.freeze({
     name: "@loctree/aicx-darwin-arm64",
   }),
+  "darwin-x64": Object.freeze({
+    name: "@loctree/aicx-darwin-x64",
+  }),
+  "linux-arm64-gnu": Object.freeze({
+    name: "@loctree/aicx-linux-arm64-gnu",
+  }),
   "linux-x64-gnu": Object.freeze({
     name: "@loctree/aicx-linux-x64-gnu",
   }),
@@ -45,10 +51,7 @@ function getPlatformKey() {
   const normalizedArch = archMap[arch] || arch;
 
   if (platform === "linux") {
-    if (isMuslLibc()) {
-      throw new Error("AICX npm binaries are not published for Linux musl yet.");
-    }
-    const libc = "gnu";
+    const libc = isMuslLibc() ? "musl" : "gnu";
     return `${platform}-${normalizedArch}-${libc}`;
   }
 
@@ -68,24 +71,20 @@ function getPlatformPackageName() {
   return getPlatformPackage().name;
 }
 
+function platformDiagnostic() {
+  const libc = process.platform === "linux" ? (isMuslLibc() ? "musl" : "gnu") : "n/a";
+  return `platform=${process.platform}, arch=${process.arch}, libc=${libc}.\n` +
+    `Supported platforms: ${Object.keys(PLATFORM_PACKAGES).join(", ")}.\n` +
+    `Report issues: https://github.com/Loctree/aicx/issues`;
+}
+
 function getPlatformPackage() {
   const platformKey = getPlatformKey();
-  if (!platformKey) {
-    throw new Error(
-      `Unsupported platform: ${process.platform}-${process.arch}.\n` +
-      `AICX currently supports macOS (arm64), Linux (x64 gnu), and Windows (x64 gnu).\n` +
-      `Please build from source or download manually from: https://github.com/Loctree/aicx/releases`
-    );
-  }
-
   const platformPackage = PLATFORM_PACKAGES[platformKey];
   if (!platformPackage) {
-    throw new Error(
-      `No package available for platform: ${platformKey}.\n` +
-      `Please build from source or download manually from: https://github.com/Loctree/aicx/releases`
-    );
+    throw new Error(`No AICX npm binary is available for ${platformKey || "this platform"}.\n` +
+      platformDiagnostic());
   }
-
   return platformPackage;
 }
 
@@ -146,7 +145,8 @@ function getBinaryPath(binaryName) {
     throw new Error(
       `${packageName} is not installed or cannot be resolved.\n` +
       `This typically happens if npm optionalDependencies failed to install or were skipped.\n` +
-      `Download the binary manually from: https://github.com/Loctree/aicx/releases`,
+      `Download the binary manually from: https://github.com/Loctree/aicx/releases\n` +
+      platformDiagnostic(),
       { cause: error }
     );
   }
@@ -158,7 +158,8 @@ function getBinaryPath(binaryName) {
       `${binaryName} binary not found at ${binaryPath}.\n` +
       `This typically happens if npm optionalDependencies failed to install or were skipped.\n` +
       `Please ensure "${packageName}" is installed, or download the binary manually from:\n` +
-      `https://github.com/Loctree/aicx/releases`
+      `https://github.com/Loctree/aicx/releases\n` +
+      platformDiagnostic()
     );
   }
 

@@ -15,6 +15,14 @@ const PLATFORMS = {
     asset: `aicx-v${version}-aarch64-apple-darwin-slim.zip`,
     binaries: ["aicx", "aicx-mcp"],
   },
+  "darwin-x64": {
+    asset: `aicx-v${version}-x86_64-apple-darwin-slim.zip`,
+    binaries: ["aicx", "aicx-mcp"],
+  },
+  "linux-arm64-gnu": {
+    asset: `aicx-v${version}-aarch64-linux-gnu-slim.tar.gz`,
+    binaries: ["aicx", "aicx-mcp"],
+  },
   "linux-x64-gnu": {
     asset: `aicx-v${version}-x86_64-linux-gnu-slim.tar.gz`,
     binaries: ["aicx", "aicx-mcp"],
@@ -104,7 +112,7 @@ function gpgPath(candidate) {
 // taskgated. Re-sign only those; a Developer ID signature must survive
 // into the npm tarball. This is pack-time tooling, not an npm lifecycle script.
 function resignLinkerSignedDarwinBinary(binaryPath) {
-  if (process.platform !== "darwin" || platformKey !== "darwin-arm64") return;
+  if (process.platform !== "darwin" || !platformKey.startsWith("darwin-")) return;
   const inspected = spawnSync("codesign", ["-dvvv", binaryPath], { encoding: "utf8" });
   const details = `${inspected.stdout ?? ""}\n${inspected.stderr ?? ""}`;
   if (!details.includes("linker-signed")) return;

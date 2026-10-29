@@ -81,6 +81,14 @@ jobs:
             runs_on: macos-15
             asset_triple: aarch64-apple-darwin
             asset_ext: zip
+          - platform: darwin-x64
+            runs_on: macos-15-intel
+            asset_triple: x86_64-apple-darwin
+            asset_ext: zip
+          - platform: linux-arm64-gnu
+            runs_on: ubuntu-24.04-arm
+            asset_triple: aarch64-linux-gnu
+            asset_ext: tar.gz
           - platform: linux-x64-gnu
             runs_on: ubuntu-latest
             asset_triple: x86_64-linux-gnu
@@ -195,7 +203,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        platform: [darwin-arm64, linux-x64-gnu, win32-x64-gnu]
+        platform: [darwin-arm64, darwin-x64, linux-x64-gnu, linux-arm64-gnu, win32-x64-gnu]
     steps:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
@@ -247,6 +255,8 @@ jobs:
         run: |
           packages=(
             "@loctree/aicx-darwin-arm64"
+            "@loctree/aicx-darwin-x64"
+            "@loctree/aicx-linux-arm64-gnu"
             "@loctree/aicx-linux-x64-gnu"
             "@loctree/aicx-win32-x64-gnu"
           )
@@ -287,7 +297,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-15, windows-latest]
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-15, macos-15-intel, windows-latest]
         install_mode: [normal, ignore-scripts]
     steps:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
@@ -302,10 +312,12 @@ jobs:
           RELEASE_VERSION: ${{ needs.verify.outputs.version }}
           INSTALL_MODE: ${{ matrix.install_mode }}
         run: |
-          case "${RUNNER_OS}" in
-            Linux) platform_package="@loctree/aicx-linux-x64-gnu" ;;
-            macOS) platform_package="@loctree/aicx-darwin-arm64" ;;
-            Windows) platform_package="@loctree/aicx-win32-x64-gnu" ;;
+          case "${RUNNER_OS}-${RUNNER_ARCH}" in
+            Linux-X64) platform_package="@loctree/aicx-linux-x64-gnu" ;;
+            Linux-ARM64) platform_package="@loctree/aicx-linux-arm64-gnu" ;;
+            macOS-ARM64) platform_package="@loctree/aicx-darwin-arm64" ;;
+            macOS-X64) platform_package="@loctree/aicx-darwin-x64" ;;
+            Windows-X64) platform_package="@loctree/aicx-win32-x64-gnu" ;;
           esac
           packages=("@loctree/aicx" "${platform_package}")
           for attempt in {1..60}; do

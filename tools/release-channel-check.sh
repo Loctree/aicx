@@ -47,6 +47,8 @@ check_version() {
 check_version "workspace" "$workspace_version"
 check_version "npm-main" "$(read_version distribution/npm/aicx/package.json)"
 check_version "npm-darwin" "$(read_version distribution/npm/aicx/platform-packages/darwin-arm64/package.json)"
+check_version "npm-darwin-x64" "$(read_version distribution/npm/aicx/platform-packages/darwin-x64/package.json)"
+check_version "npm-linux-arm64" "$(read_version distribution/npm/aicx/platform-packages/linux-arm64-gnu/package.json)"
 check_version "npm-linux" "$(read_version distribution/npm/aicx/platform-packages/linux-x64-gnu/package.json)"
 check_version "npm-win" "$(read_version distribution/npm/aicx/platform-packages/win32-x64-gnu/package.json)"
 
