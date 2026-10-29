@@ -10,8 +10,9 @@ ROOT = Path(__file__).parents[1]
 WORKFLOW = ROOT / ".github/workflows/npm-publish.yml"
 RELEASE_WORKFLOW = ROOT / ".github/workflows/release.yml"
 WRAPPER = ROOT / "distribution/npm/aicx/package.json"
+WRAPPER_TESTS = ROOT / "distribution/npm/tests/wrapper-platform.test.mjs"
 PLATFORM_ROOT = ROOT / "distribution/npm/aicx/platform-packages"
-PLATFORMS = ("darwin-arm64", "linux-x64-gnu", "win32-x64-gnu")
+PLATFORMS = ("darwin-arm64", "darwin-x64", "linux-arm64-gnu", "linux-x64-gnu", "win32-x64-gnu")
 FORBIDDEN = ("preinstall", "install", "postinstall", "prepare")
 SERVICE_INSTALLERS = (
     ROOT / "tools/install-mcp-service.sh",
@@ -80,6 +81,12 @@ if (!exited || exited.code !== 2 || exited.line) process.exit(8);
     if hint.returncode != 0:
         raise SystemExit(f"npm wrapper migration/signal contract failed ({hint.returncode})")
 
+    # Platform map, manifest fences, and the loud stderr refusal on hosts
+    # without a published binary (musl, win32-arm64, ...).
+    platform_tests = subprocess.run(["node", "--test", str(WRAPPER_TESTS)], cwd=ROOT, check=False, text=True)
+    if platform_tests.returncode != 0:
+        raise SystemExit(f"npm wrapper platform tests failed ({platform_tests.returncode})")
+
     install_local = (ROOT / "distribution/npm/install-local.sh").read_text(encoding="utf-8")
     if "resign_linker_signed_macho" not in install_local or "codesign --force --sign -" not in install_local:
         raise SystemExit("install-local lost the linker-signed Mach-O re-sign")
@@ -99,13 +106,17 @@ if (!exited || exited.code !== 2 || exited.line) process.exit(8);
         "publish-platform-packages:",
         "publish-wrapper:",
         "runs_on: macos-15",
+        "runs_on: macos-15-intel",
         "runs_on: ubuntu-latest",
+        "runs_on: ubuntu-24.04-arm",
         "runs_on: windows-latest",
         "stage-platform-package.mjs",
         "verify-metadata.mjs",
         "npm publish ./npm-package/*.tgz",
         'npm view "${package}@${RELEASE_VERSION}" version',
         "@loctree/aicx-darwin-arm64",
+        "@loctree/aicx-darwin-x64",
+        "@loctree/aicx-linux-arm64-gnu",
         "@loctree/aicx-linux-x64-gnu",
         "@loctree/aicx-win32-x64-gnu",
         "npm@11.17.0",
@@ -142,6 +153,19 @@ if (!exited || exited.code !== 2 || exited.line) process.exit(8);
         raise SystemExit("release.yml lost the npm-publish chain job")
     if "needs: [verify, github-release]" not in release_workflow:
         raise SystemExit("npm publish must run after the signed GitHub Release exists")
+    # Every npm platform package needs a release asset built on its native
+    # hosted runner; a missing leg would make the publish job 404 on download.
+    for runner, target in (
+        ("ubuntu-latest", "x86_64-unknown-linux-gnu"),
+        ("ubuntu-24.04-arm", "aarch64-unknown-linux-gnu"),
+        ("macos-15", "aarch64-apple-darwin"),
+        ("macos-15-intel", "x86_64-apple-darwin"),
+        ("windows-latest", "x86_64-pc-windows-msvc"),
+    ):
+        if f"runner: {runner}\n            target: {target}\n" not in release_workflow:
+            raise SystemExit(f"release.yml lost the {target} build on {runner}")
+    if "AICX_BUILD_TARGET: ${{ matrix.target }}.2.28" not in release_workflow:
+        raise SystemExit("release.yml Linux legs lost the zigbuild glibc 2.28 floor")
 
     # npm trusted publishing (OIDC): the run authenticates itself, so no long-lived
     # token may appear, and both the publish jobs and the caller job must be able
