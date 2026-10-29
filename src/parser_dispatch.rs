@@ -22,7 +22,10 @@ pub fn source_handle_for_file(
     path: &Path,
 ) -> Result<SourceHandle> {
     if agent == AgentKind::Agy {
-        let bytes = crate::agy_store::materialize_agy_db(path)
+        // Materialize opens SQLite itself, so it never reaches
+        // `SourceArtifact::validated_file`. Apply that same path gate first.
+        let path = crate::agy_store::validated_db_path(path)?;
+        let bytes = crate::agy_store::materialize_agy_db(&path)
             .map_err(|error| anyhow!("agy trajectory could not be read: {error}"))?;
         let artifact = SourceArtifact::memory(
             format!("{}.jsonl", safe_source_id(source_id)),
@@ -260,6 +263,8 @@ fn safe_source_id(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
 
     fn fatal(consumed: u64, skipped: &[(SkippedReason, u64)]) -> ParseRefusal {
@@ -347,5 +352,56 @@ mod tests {
     fn source_ids_are_validated_before_the_parser_boundary() {
         assert_eq!(safe_source_id("rollout/a b"), "rollout_a_b");
         assert_eq!(safe_source_id("../"), "session");
+    }
+
+    fn path_outside_allowlist() -> &'static Path {
+        #[cfg(windows)]
+        {
+            Path::new(r"C:\Windows\System32\drivers\etc\hosts")
+        }
+        #[cfg(not(windows))]
+        {
+            Path::new("/etc/passwd")
+        }
+    }
+
+    #[test]
+    fn agy_direct_file_outside_the_allowlist_never_reaches_sqlite() {
+        let error =
+            source_handle_for_file(AgentKind::Agy, "outside", None, path_outside_allowlist())
+                .expect_err("a file outside the operator allowlist is not a source");
+        let text = error.to_string();
+        assert!(
+            text.contains("outside allowed directories"),
+            "expected the shared read gate, got {text}"
+        );
+        assert!(
+            !text.to_ascii_lowercase().contains("sqlite"),
+            "sqlite must not open before the path gate: {text}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agy_symlink_cannot_escape_the_allowlist() {
+        let dir = std::env::temp_dir().join(format!(
+            "aicx-agy-escape-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let link = dir.join("escape.db");
+        std::os::unix::fs::symlink(path_outside_allowlist(), &link).expect("symlink");
+        let error = source_handle_for_file(AgentKind::Agy, "escape", None, &link)
+            .expect_err("symlink target outside the allowlist is not a source");
+        let text = error.to_string();
+        assert!(
+            text.contains("outside allowed directories"),
+            "canonicalize must reject the symlink target, got {text}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

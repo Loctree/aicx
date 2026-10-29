@@ -540,7 +540,13 @@ fn cursor_exact_id_prefers_complete_older_transcript_over_newer_partial_copy() {
         SessionCatalog::new(AgentKind::Cursor, root.path().join(".cursor/projects")).unwrap();
     let lookup = catalog.resolve_with_stats(UUID_A);
     let resolved = lookup.result.unwrap();
-    assert_eq!(resolved.source.path, complete);
+    // Catalog paths are canonical. macOS prefixes `/var` with `/private`, and
+    // Windows uses `\\?\` plus the long name, so compare the same file.
+    assert_eq!(
+        std::fs::canonicalize(&resolved.source.path).expect("canonicalize resolved copy"),
+        std::fs::canonicalize(&complete).expect("canonicalize complete copy"),
+        "kept copy must be the older complete transcript"
+    );
     assert!(
         resolved
             .substitution_notice

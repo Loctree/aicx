@@ -1369,17 +1369,22 @@ mod tests {
 
     #[test]
     fn windows_installer_without_override_keeps_configured_storage_home() {
-        let root = std::env::current_dir()
-            .unwrap()
-            .join(format!(".aicx-service-home-test-{}", std::process::id()));
+        // Stay outside the checkout. A repo-local config is outside the
+        // Windows user allowlist (D:\ runner vs C:\Users) and dirties git status
+        // for the provenance test.
+        let root = std::env::temp_dir().join(format!(
+            "aicx-service-home-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
         let configured = root.join("configured-corpus");
         std::fs::create_dir_all(root.join(".aicx")).unwrap();
         std::fs::write(
             root.join(".aicx/config.toml"),
-            format!(
-                "[storage]\nhome = {}\n",
-                toml::Value::String(configured.to_string_lossy().into_owned())
-            ),
+            format!("[storage]\nhome = '{}'\n", configured.display()),
         )
         .unwrap();
         assert_eq!(
@@ -1418,8 +1423,8 @@ mod tests {
         );
         assert!(
             script
-                .to_string_lossy()
-                .contains("tools/install-mcp-service"),
+                .components()
+                .any(|component| component.as_os_str() == "tools"),
             "installer path must stay under tools/, got {}",
             script.display()
         );

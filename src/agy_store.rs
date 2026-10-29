@@ -62,6 +62,17 @@ struct StepRow {
     payload: Option<Vec<u8>>,
 }
 
+/// Same read gate as `SourceArtifact::validated_file`: traversal rejection,
+/// canonicalize (so a symlink cannot escape), allowlist, then a regular file.
+pub(crate) fn validated_db_path(path: &Path) -> anyhow::Result<std::path::PathBuf> {
+    let path = aicx_parser::sanitize::validate_read_path(path)
+        .map_err(|error| anyhow::anyhow!("invalid source artifact: {error}"))?;
+    if !path.is_file() {
+        anyhow::bail!("invalid source artifact: selected artifact is not a regular file");
+    }
+    Ok(path)
+}
+
 pub fn materialize_agy_db(path: &Path) -> anyhow::Result<Vec<u8>> {
     let conn = open_ro(path)?;
     let mut budget = ReadBudget::default();
@@ -227,7 +238,8 @@ fn json_i64(value: Option<i64>) -> String {
 }
 
 fn open_ro(path: &Path) -> anyhow::Result<Connection> {
-    let uri = sqlite_ro_uri(path);
+    let path = validated_db_path(path)?;
+    let uri = sqlite_ro_uri(&path);
     let conn = Connection::open_with_flags(
         uri,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
@@ -387,6 +399,21 @@ mod tests {
 
     fn uri_for(path: &str) -> String {
         sqlite_ro_uri_from(&strip_verbatim_prefix(Path::new(path)).to_string_lossy())
+    }
+
+    #[test]
+    fn materialize_rejects_a_database_outside_the_read_allowlist() {
+        let outside = if cfg!(windows) {
+            Path::new(r"C:\Windows\System32\drivers\etc\hosts")
+        } else {
+            Path::new("/etc/passwd")
+        };
+        let error = materialize_agy_db(outside).expect_err("outside path");
+        let text = error.to_string();
+        assert!(
+            text.contains("outside allowed directories"),
+            "listing and materialize share open_ro, got {text}"
+        );
     }
 
     #[test]
