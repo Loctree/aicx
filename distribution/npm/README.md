@@ -7,7 +7,7 @@ thin JS wrapper and platform-package manifests that ship to the `@loctree` npm
 scope.
 
 > Status: aligned to the signed GitHub Release asset shape for macOS arm64,
-> Linux x64 GNU, and Windows x64 MSVC. Do not publish npm packages until the
+> macOS x64, Linux x64 GNU, Linux arm64 GNU, and Windows x64 MSVC. Do not publish npm packages until the
 > matching signed release assets exist for the target version.
 
 ## Wrapper package
@@ -22,10 +22,18 @@ The wrapper declares active platform sub-packages as `optionalDependencies`
 Current platform matrix:
 
 - `darwin-arm64`
+- `darwin-x64`
+- `linux-arm64-gnu`
 - `linux-x64-gnu`
 - `win32-x64-gnu` (legacy npm package suffix; contains the MSVC build)
 
-Total: **1 wrapper + 3 active platform packages = 4 npm packages.**
+Total: **1 wrapper + 5 active platform packages = 6 npm packages.**
+
+Any other host (Linux musl such as Alpine, Windows arm64, BSDs) gets no binary.
+`aicx` and `aicx-mcp` then exit `1` and print the detected `platform`, `arch`,
+and `libc`, the supported list above, and the issues link to stderr. A
+supported host whose platform package was skipped (`--omit=optional`) gets the
+same exit code and the reinstall command.
 
 ## Install
 
@@ -57,6 +65,9 @@ distribution/npm/
 ├── stage-platform-package.mjs
 ├── sync-version.mjs
 ├── verify-metadata.mjs
+├── tests/
+│   ├── fake-host.cjs
+│   └── wrapper-platform.test.mjs
 └── aicx/
     ├── package.json
     ├── README.md
@@ -67,6 +78,8 @@ distribution/npm/
     │   └── aicx-mcp
     └── platform-packages/
         ├── darwin-arm64/bin/{aicx,aicx-mcp}
+        ├── darwin-x64/bin/{aicx,aicx-mcp}
+        ├── linux-arm64-gnu/bin/{aicx,aicx-mcp}
         ├── linux-x64-gnu/bin/{aicx,aicx-mcp}
         └── win32-x64-gnu/bin/{aicx.exe,aicx-mcp.exe}
 ```

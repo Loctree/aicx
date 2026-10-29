@@ -1,5 +1,5 @@
 #!/usr/bin/env node
 
-const { execAicxMcp } = require("../index.js");
+const { runCli } = require("../index.js");
 
-execAicxMcp(process.argv.slice(2));
+runCli("aicx-mcp", process.argv.slice(2));
