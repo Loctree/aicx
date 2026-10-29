@@ -14,6 +14,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- `aicx` and `aicx-mcp` ship for Linux arm64 (glibc) and macOS Intel. The
+  release workflow builds `aarch64-unknown-linux-gnu` natively on
+  `ubuntu-24.04-arm` (default Cargo features, glibc 2.28 floor via
+  `cargo zigbuild`) and `x86_64-apple-darwin` on `macos-15-intel` (signed and
+  notarized), and `npm-publish.yml` publishes `@loctree/aicx-linux-arm64-gnu`
+  and `@loctree/aicx-darwin-x64`. `linux/arm64` containers, the Docker default
+  on Apple Silicon, now install through `npm install -g @loctree/aicx`.
+  `install.sh` still refuses these two targets until a release carries their
+  assets.
+- The npm wrapper no longer fails quietly on a host without a prebuilt binary.
+  On Linux musl (Alpine), Windows arm64 or any other unlisted platform, and when
+  the platform package is absent (skipped optional dependencies, `node_modules`
+  copied across OS/CPU), it prints `process.platform`, `process.arch`, the libc,
+  the supported platforms and the issues link to stderr and exits with code 1,
+  without a stack trace. `distribution/npm/aicx/test/wrapper.test.js` covers it
+  and runs in CI.
 - Native Antigravity CLI conversations (`agy`, aliases `antigravity` and
   `antigravity-cli`) across discovery/catalog, readable extracts, bulk
   exports, conversation JSON, intents, handoff briefs, source indexing/search,

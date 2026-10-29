@@ -1,6 +1,6 @@
 # Publishing Guide - aicx npm packages
 
-The npm surface is one script-free wrapper plus three script-free platform
+The npm surface is one script-free wrapper plus five script-free platform
 packages. Every platform tgz contains `aicx` and `aicx-mcp` (`.exe` on
 Windows); installation never downloads or extracts a GitHub Release asset.
 
@@ -9,6 +9,8 @@ Windows); installation never downloads or extracts a GitHub Release asset.
 | Platform package | Source release asset | Payload |
 | --- | --- | --- |
 | `@loctree/aicx-darwin-arm64` | `aicx-v{V}-aarch64-apple-darwin-slim.zip` | `bin/aicx`, `bin/aicx-mcp` |
+| `@loctree/aicx-darwin-x64` | `aicx-v{V}-x86_64-apple-darwin-slim.zip` | `bin/aicx`, `bin/aicx-mcp` |
+| `@loctree/aicx-linux-arm64-gnu` | `aicx-v{V}-aarch64-linux-gnu-slim.tar.gz` | `bin/aicx`, `bin/aicx-mcp` |
 | `@loctree/aicx-linux-x64-gnu` | `aicx-v{V}-x86_64-linux-gnu-slim.tar.gz` | `bin/aicx`, `bin/aicx-mcp` |
 | `@loctree/aicx-win32-x64-gnu` | `aicx-v{V}-x86_64-pc-windows-msvc-slim.zip` | `bin/aicx.exe`, `bin/aicx-mcp.exe` |
 
@@ -60,11 +62,18 @@ and no environment name:
 | `Loctree` / `aicx` | `npm-publish.yml` | manual `workflow_dispatch` re-runs |
 
 Repeat for `@loctree/aicx`, `@loctree/aicx-darwin-arm64`,
-`@loctree/aicx-linux-x64-gnu`, and `@loctree/aicx-win32-x64-gnu` (eight
-entries). From a web-authenticated npm login (`npm login`, 2FA):
+`@loctree/aicx-darwin-x64`, `@loctree/aicx-linux-arm64-gnu`,
+`@loctree/aicx-linux-x64-gnu`, and `@loctree/aicx-win32-x64-gnu` (twelve
+entries). `@loctree/aicx-darwin-x64` and `@loctree/aicx-linux-arm64-gnu` have
+never been published: configure their trusted publishers (or bootstrap the
+first version by hand if the registry refuses a publisher for a package that
+does not exist yet) before tagging the first release that carries them,
+otherwise their `publish-platform-packages` legs fail and the wrapper waits for
+a package that never appears. From a web-authenticated npm login
+(`npm login`, 2FA):
 
 ```bash
-for p in @loctree/aicx @loctree/aicx-darwin-arm64 @loctree/aicx-linux-x64-gnu @loctree/aicx-win32-x64-gnu; do
+for p in @loctree/aicx @loctree/aicx-darwin-arm64 @loctree/aicx-darwin-x64 @loctree/aicx-linux-arm64-gnu @loctree/aicx-linux-x64-gnu @loctree/aicx-win32-x64-gnu; do
   npm trust github "$p" --file release.yml     --repo Loctree/aicx --allow-publish --yes
   npm trust github "$p" --file npm-publish.yml --repo Loctree/aicx --allow-publish --yes
 done
@@ -91,8 +100,10 @@ checks the exact pack list, and refuses cross-platform version attestation.
 
 ## Cold-install acceptance
 
-After publication, the workflow runs six isolated npm 11.17.0 jobs: normal and
-`--ignore-scripts` installs on macOS arm64, Linux x64 GNU, and real Windows x64.
+After publication, the workflow runs ten isolated npm 11.17.0 jobs: normal and
+`--ignore-scripts` installs on macOS arm64 (`macos-15`), macOS x64
+(`macos-15-intel`), Linux arm64 GNU (`ubuntu-24.04-arm`), Linux x64 GNU, and
+real Windows x64.
 Each job uses a fresh prefix and cache, rejects any `allow-scripts` text in the
 verbose log, runs both version commands, and executes `aicx config inspect --json`.
 

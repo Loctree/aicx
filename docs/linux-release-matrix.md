@@ -9,15 +9,23 @@ create a competing unsigned release lane.
 | Target | Support | Artifact |
 | --- | --- | --- |
 | `x86_64-unknown-linux-gnu` | First-class | `aicx-vX.Y.Z-x86_64-linux-gnu-slim.tar.gz` |
+| `aarch64-unknown-linux-gnu` | First-class | `aicx-vX.Y.Z-aarch64-linux-gnu-slim.tar.gz` |
 
 The archive includes `aicx`, `aicx-mcp`, the installer, license, release
 manifest, and command/release documentation. It is published with adjacent
 `.sha256` and `.asc` files. The release also publishes
 `loctree-release-pubkey.asc`.
 
-Linux arm64 and musl are not in the current public matrix. They must not be
-advertised until the build workflow, installer, npm mapping, checksums,
-signatures, and cold-install smoke all support them.
+Linux musl is not in the current public matrix. It must not be advertised until
+the build workflow, installer, npm mapping, checksums, signatures, and
+cold-install smoke all support it. The npm wrapper refuses a musl host with a
+message and exit code 1 instead of resolving a glibc binary.
+
+Linux arm64 (the default `linux/arm64` Docker platform on Apple Silicon) is built
+natively on `ubuntu-24.04-arm` with the same contract as x64: default Cargo
+features and the glibc 2.28 floor through `cargo zigbuild`. `install.sh` does not
+resolve this asset yet; use the npm package or download the archive until the
+first release that carries it is published.
 
 ## Production Build
 

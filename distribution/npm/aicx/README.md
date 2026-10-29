@@ -36,5 +36,12 @@ The wrapper resolves both binaries from the matching platform package. That
 package already contains the verified release binaries; npm installation does
 not run lifecycle scripts, download release assets, or unpack archives.
 
+Supported platforms: macOS arm64 and x64, Linux arm64 and x64 (glibc), Windows
+x64. On any other host (Alpine/musl, Windows arm64, FreeBSD, ...) or when the
+platform package is missing, `aicx` prints the detected platform, arch and libc
+plus the supported list to stderr and exits with code 1. A `node_modules`
+installed on one OS or CPU does not run on another: reinstall inside the
+container or machine that runs it.
+
 The npm package installs the product binaries only. Local embedder models remain
 an explicit operator choice.
