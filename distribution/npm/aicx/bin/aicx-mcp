@@ -2,4 +2,9 @@
 
 const { execAicxMcp } = require("../index.js");
 
-execAicxMcp(process.argv.slice(2));
+try {
+  execAicxMcp(process.argv.slice(2));
+} catch (error) {
+  process.stderr.write(`[aicx] ${error.message}\n`);
+  process.exitCode = 1;
+}

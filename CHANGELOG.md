@@ -14,6 +14,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Prebuilt Linux arm64 glibc and Intel macOS binaries and script-free npm platform packages, with native GitHub Actions build and npm smoke lanes.
+- npm wrapper failures identify the OS, architecture and libc, list supported platforms, and link to release downloads and issues.
+
 - Native Antigravity CLI conversations (`agy`, aliases `antigravity` and
   `antigravity-cli`) across discovery/catalog, readable extracts, bulk
   exports, conversation JSON, intents, handoff briefs, source indexing/search,

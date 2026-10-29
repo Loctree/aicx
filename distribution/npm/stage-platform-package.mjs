@@ -15,6 +15,14 @@ const PLATFORMS = {
     asset: `aicx-v${version}-aarch64-apple-darwin-slim.zip`,
     binaries: ["aicx", "aicx-mcp"],
   },
+  "darwin-x64": {
+    asset: `aicx-v${version}-x86_64-apple-darwin-slim.zip`,
+    binaries: ["aicx", "aicx-mcp"],
+  },
+  "linux-arm64-gnu": {
+    asset: `aicx-v${version}-aarch64-linux-gnu-slim.tar.gz`,
+    binaries: ["aicx", "aicx-mcp"],
+  },
   "linux-x64-gnu": {
     asset: `aicx-v${version}-x86_64-linux-gnu-slim.tar.gz`,
     binaries: ["aicx", "aicx-mcp"],

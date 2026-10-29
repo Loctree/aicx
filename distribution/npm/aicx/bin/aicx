@@ -3,4 +3,9 @@
 const { execAicx } = require("../index.js");
 
 process.env.AICX_RUNTIME_BIN ||= process.argv[1];
-execAicx(process.argv.slice(2));
+try {
+  execAicx(process.argv.slice(2));
+} catch (error) {
+  process.stderr.write(`[aicx] ${error.message}\n`);
+  process.exitCode = 1;
+}

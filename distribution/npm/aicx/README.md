@@ -38,3 +38,8 @@ not run lifecycle scripts, download release assets, or unpack archives.
 
 The npm package installs the product binaries only. Local embedder models remain
 an explicit operator choice.
+
+Supported prebuilt platforms: macOS arm64 and Intel x64, Linux glibc arm64 and
+x64, and Windows x64. Linux musl (including Alpine) is unsupported. Missing
+platform packages fail on stderr with the detected platform, architecture, libc,
+supported targets, and a link to report issues.

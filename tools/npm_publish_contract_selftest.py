@@ -11,7 +11,7 @@ WORKFLOW = ROOT / ".github/workflows/npm-publish.yml"
 RELEASE_WORKFLOW = ROOT / ".github/workflows/release.yml"
 WRAPPER = ROOT / "distribution/npm/aicx/package.json"
 PLATFORM_ROOT = ROOT / "distribution/npm/aicx/platform-packages"
-PLATFORMS = ("darwin-arm64", "linux-x64-gnu", "win32-x64-gnu")
+PLATFORMS = ("darwin-arm64", "darwin-x64", "linux-x64-gnu", "linux-arm64-gnu", "win32-x64-gnu")
 FORBIDDEN = ("preinstall", "install", "postinstall", "prepare")
 SERVICE_INSTALLERS = (
     ROOT / "tools/install-mcp-service.sh",
@@ -99,6 +99,8 @@ if (!exited || exited.code !== 2 || exited.line) process.exit(8);
         "publish-platform-packages:",
         "publish-wrapper:",
         "runs_on: macos-15",
+        "runs_on: macos-15-intel",
+        "runs_on: ubuntu-24.04-arm",
         "runs_on: ubuntu-latest",
         "runs_on: windows-latest",
         "stage-platform-package.mjs",
@@ -106,6 +108,8 @@ if (!exited || exited.code !== 2 || exited.line) process.exit(8);
         "npm publish ./npm-package/*.tgz",
         'npm view "${package}@${RELEASE_VERSION}" version',
         "@loctree/aicx-darwin-arm64",
+        "@loctree/aicx-darwin-x64",
+        "@loctree/aicx-linux-arm64-gnu",
         "@loctree/aicx-linux-x64-gnu",
         "@loctree/aicx-win32-x64-gnu",
         "npm@11.17.0",
@@ -119,6 +123,8 @@ if (!exited || exited.code !== 2 || exited.line) process.exit(8);
 
     pack_platform = workflow.split("pack-platform-packages:", 1)[1].split("pack-wrapper:", 1)[0]
     pack_wrapper = workflow.split("pack-wrapper:", 1)[1].split("publish-platform-packages:", 1)[0]
+    if "node --test wrapper.test.cjs" not in pack_wrapper:
+        raise SystemExit("wrapper tests must run from dispatched tooling in pack-wrapper")
     for job_name, job_source in (
         ("pack-platform-packages", pack_platform),
         ("pack-wrapper", pack_wrapper),
@@ -155,6 +161,9 @@ if (!exited || exited.code !== 2 || exited.line) process.exit(8);
     chain_job = release_workflow.split("npm-publish:", 1)[1]
     if "id-token: write" not in chain_job:
         raise SystemExit("release.yml npm-publish job must grant id-token: write to the reusable workflow")
+    subprocess.run(
+        ["node", "--test", "distribution/npm/aicx/wrapper.test.cjs"], cwd=ROOT, check=True
+    )
     print("npm zero-lifecycle publish contract passed")
 
 

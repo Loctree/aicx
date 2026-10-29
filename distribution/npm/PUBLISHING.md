@@ -1,6 +1,6 @@
 # Publishing Guide - aicx npm packages
 
-The npm surface is one script-free wrapper plus three script-free platform
+The npm surface is one script-free wrapper plus five script-free platform
 packages. Every platform tgz contains `aicx` and `aicx-mcp` (`.exe` on
 Windows); installation never downloads or extracts a GitHub Release asset.
 
@@ -9,6 +9,8 @@ Windows); installation never downloads or extracts a GitHub Release asset.
 | Platform package | Source release asset | Payload |
 | --- | --- | --- |
 | `@loctree/aicx-darwin-arm64` | `aicx-v{V}-aarch64-apple-darwin-slim.zip` | `bin/aicx`, `bin/aicx-mcp` |
+| `@loctree/aicx-darwin-x64` | `aicx-v{V}-x86_64-apple-darwin-slim.zip` | `bin/aicx`, `bin/aicx-mcp` |
+| `@loctree/aicx-linux-arm64-gnu` | `aicx-v{V}-aarch64-linux-gnu-slim.tar.gz` | `bin/aicx`, `bin/aicx-mcp` |
 | `@loctree/aicx-linux-x64-gnu` | `aicx-v{V}-x86_64-linux-gnu-slim.tar.gz` | `bin/aicx`, `bin/aicx-mcp` |
 | `@loctree/aicx-win32-x64-gnu` | `aicx-v{V}-x86_64-pc-windows-msvc-slim.zip` | `bin/aicx.exe`, `bin/aicx-mcp.exe` |
 
@@ -60,11 +62,12 @@ and no environment name:
 | `Loctree` / `aicx` | `npm-publish.yml` | manual `workflow_dispatch` re-runs |
 
 Repeat for `@loctree/aicx`, `@loctree/aicx-darwin-arm64`,
-`@loctree/aicx-linux-x64-gnu`, and `@loctree/aicx-win32-x64-gnu` (eight
+`@loctree/aicx-darwin-x64`, `@loctree/aicx-linux-arm64-gnu`,
+`@loctree/aicx-linux-x64-gnu`, and `@loctree/aicx-win32-x64-gnu` (twelve
 entries). From a web-authenticated npm login (`npm login`, 2FA):
 
 ```bash
-for p in @loctree/aicx @loctree/aicx-darwin-arm64 @loctree/aicx-linux-x64-gnu @loctree/aicx-win32-x64-gnu; do
+for p in @loctree/aicx @loctree/aicx-darwin-arm64 @loctree/aicx-darwin-x64 @loctree/aicx-linux-arm64-gnu @loctree/aicx-linux-x64-gnu @loctree/aicx-win32-x64-gnu; do
   npm trust github "$p" --file release.yml     --repo Loctree/aicx --allow-publish --yes
   npm trust github "$p" --file npm-publish.yml --repo Loctree/aicx --allow-publish --yes
 done
@@ -80,9 +83,9 @@ bypass 2fa tokens" — that retires the old `NPM_TOKEN` path for good.
 After staging the current host's signed release asset:
 
 ```bash
-node distribution/npm/sync-version.mjs 0.14.0
-node distribution/npm/stage-platform-package.mjs 0.14.0 darwin-arm64 /path/to/release-input
-node distribution/npm/verify-metadata.mjs 0.14.0 --platform=darwin-arm64
+node distribution/npm/sync-version.mjs 0.15.0
+node distribution/npm/stage-platform-package.mjs 0.15.0 darwin-arm64 /path/to/release-input
+node distribution/npm/verify-metadata.mjs 0.15.0 --platform=darwin-arm64
 ```
 
 Use the matching platform key on Linux or Windows. The verifier requires zero
@@ -91,8 +94,8 @@ checks the exact pack list, and refuses cross-platform version attestation.
 
 ## Cold-install acceptance
 
-After publication, the workflow runs six isolated npm 11.17.0 jobs: normal and
-`--ignore-scripts` installs on macOS arm64, Linux x64 GNU, and real Windows x64.
+After publication, the workflow runs ten isolated npm 11.17.0 jobs: normal and
+`--ignore-scripts` installs on macOS arm64 and Intel x64, Linux arm64 and x64 GNU, and real Windows x64.
 Each job uses a fresh prefix and cache, rejects any `allow-scripts` text in the
 verbose log, runs both version commands, and executes `aicx config inspect --json`.
 

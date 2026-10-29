@@ -9,6 +9,12 @@ const PLATFORM_PACKAGES = Object.freeze({
   "darwin-arm64": Object.freeze({
     name: "@loctree/aicx-darwin-arm64",
   }),
+  "darwin-x64": Object.freeze({
+    name: "@loctree/aicx-darwin-x64",
+  }),
+  "linux-arm64-gnu": Object.freeze({
+    name: "@loctree/aicx-linux-arm64-gnu",
+  }),
   "linux-x64-gnu": Object.freeze({
     name: "@loctree/aicx-linux-x64-gnu",
   }),
@@ -22,14 +28,22 @@ const BINARY_FILENAMES = Object.freeze({
   "aicx-mcp": process.platform === "win32" ? "aicx-mcp.exe" : "aicx-mcp",
 });
 
-function isMuslLibc() {
+function getLibc() {
+  if (process.platform !== "linux") return "n/a";
+  try {
+    if (process.report?.getReport().header.glibcVersionRuntime) return "glibc";
+  } catch (error) {
+    // Fall back to ldd when Node's diagnostic report is unavailable.
+  }
   try {
     const lddVersion = spawnSync("ldd", ["--version"], { encoding: "utf8" });
     const output = `${lddVersion.stdout || ""}\n${lddVersion.stderr || ""}`;
-    return output.includes("musl");
+    if (/musl/i.test(output)) return "musl";
+    if (/glibc|gnu libc|gnu c library/i.test(output)) return "glibc";
   } catch (error) {
-    return false;
+    // Unknown libc must be reported rather than guessed to be glibc.
   }
+  return "unknown";
 }
 
 function getPlatformKey() {
@@ -45,8 +59,9 @@ function getPlatformKey() {
   const normalizedArch = archMap[arch] || arch;
 
   if (platform === "linux") {
-    if (isMuslLibc()) {
-      throw new Error("AICX npm binaries are not published for Linux musl yet.");
+    const detectedLibc = getLibc();
+    if (detectedLibc !== "glibc") {
+      throw platformError(`AICX npm binaries are not published for Linux ${detectedLibc} libc.`, detectedLibc);
     }
     const libc = "gnu";
     return `${platform}-${normalizedArch}-${libc}`;
@@ -64,26 +79,25 @@ function getPlatformKey() {
   return null;
 }
 
+function platformError(reason, libc = getLibc()) {
+  return new Error(
+    `${reason}\n` +
+    `Detected platform=${process.platform} arch=${process.arch} libc=${libc}.\n` +
+    `Supported platforms: ${Object.keys(PLATFORM_PACKAGES).join(", ")}.\n` +
+    `Prebuilt downloads: https://github.com/Loctree/aicx/releases\n` +
+    `Report an issue: https://github.com/Loctree/aicx/issues`
+  );
+}
+
 function getPlatformPackageName() {
   return getPlatformPackage().name;
 }
 
 function getPlatformPackage() {
   const platformKey = getPlatformKey();
-  if (!platformKey) {
-    throw new Error(
-      `Unsupported platform: ${process.platform}-${process.arch}.\n` +
-      `AICX currently supports macOS (arm64), Linux (x64 gnu), and Windows (x64 gnu).\n` +
-      `Please build from source or download manually from: https://github.com/Loctree/aicx/releases`
-    );
-  }
-
   const platformPackage = PLATFORM_PACKAGES[platformKey];
   if (!platformPackage) {
-    throw new Error(
-      `No package available for platform: ${platformKey}.\n` +
-      `Please build from source or download manually from: https://github.com/Loctree/aicx/releases`
-    );
+    throw platformError(`No package available for platform: ${platformKey || process.platform + "-" + process.arch}.`);
   }
 
   return platformPackage;
@@ -143,18 +157,17 @@ function getBinaryPath(binaryName) {
   try {
     packageRoot = resolvePlatformPackageRoot(packageName);
   } catch (error) {
-    throw new Error(
+    throw platformError(
       `${packageName} is not installed or cannot be resolved.\n` +
       `This typically happens if npm optionalDependencies failed to install or were skipped.\n` +
-      `Download the binary manually from: https://github.com/Loctree/aicx/releases`,
-      { cause: error }
+      `Reinstall with optional dependencies enabled.`
     );
   }
 
   const binaryPath = resolvePlatformBinaryPath(packageRoot, resolvedBinaryName);
 
   if (!existsSync(binaryPath)) {
-    throw new Error(
+    throw platformError(
       `${binaryName} binary not found at ${binaryPath}.\n` +
       `This typically happens if npm optionalDependencies failed to install or were skipped.\n` +
       `Please ensure "${packageName}" is installed, or download the binary manually from:\n` +
@@ -295,5 +308,10 @@ module.exports = {
 
 if (require.main === module) {
   process.env.AICX_RUNTIME_BIN ||= process.argv[1];
-  execAicx(process.argv.slice(2));
+  try {
+    execAicx(process.argv.slice(2));
+  } catch (error) {
+    process.stderr.write(`[aicx] ${error.message}\n`);
+    process.exitCode = 1;
+  }
 }
