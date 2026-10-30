@@ -136,7 +136,17 @@ fn refresh_catalog_and_index(hours: u64) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let _lock = crate::locks::acquire_exclusive(crate::locks::lance_lock_path()?)?;
+    let _lock = match crate::locks::acquire_exclusive_with_timeout(
+        crate::locks::index_lock_path()?,
+        Duration::from_millis(500),
+    ) {
+        Ok(handle) => handle,
+        Err(err) if err.to_string().contains("timed out") => {
+            tracing::debug!(target: "mcp.refresh", "MCP auto-refresh skipped: indexing already in progress");
+            return Ok(());
+        }
+        Err(err) => return Err(err),
+    };
     let report = crate::source_index::build(&aicx_home, &[], false, false, false)?;
     tracing::info!(
         target: "mcp.refresh",

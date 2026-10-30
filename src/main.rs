@@ -10550,7 +10550,7 @@ fn run_index(
         None
     } else {
         Some(aicx::locks::acquire_exclusive(
-            aicx::locks::lance_lock_path()?,
+            aicx::locks::index_lock_path()?,
         )?)
     };
     let report = aicx::source_index::build_with_reporter(
