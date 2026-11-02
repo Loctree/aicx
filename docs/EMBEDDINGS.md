@@ -67,7 +67,8 @@ Runtime details:
 | `base` | `F2LLM-v2-0.6B.Q4_K_M.gguf` | 1024 | ~397 MB | portable default |
 | `dev` | `F2LLM-v2-1.7B.Q4_K_M.gguf` | 2048 | ~1.1 GB | workstation tier |
 | `premium` | `F2LLM-v2-1.7B.Q6_K.gguf` | 2048 | ~1.4 GB | stronger local tier |
-| `max` (`4b`) | `F2LLM-v2-4B.Q4_K_M.gguf` | 2560 | ~2.5 GB | largest local model |
+| `large` (`4b`) | `F2LLM-v2-4B.Q4_K_M.gguf` | 2560 | ~2.5 GB | large local model |
+| `max` (`8b`) | `F2LLM-v2-8B.Q4_K_M.gguf` | 4096 | ~4.9 GB | maximum local model |
 
 Default repos:
 
@@ -75,12 +76,13 @@ Default repos:
 base:    mradermacher/F2LLM-v2-0.6B-GGUF
 dev:     mradermacher/F2LLM-v2-1.7B-GGUF
 premium: mradermacher/F2LLM-v2-1.7B-GGUF
-max:     Codefuse-AI/F2LLM-v2-4B-GGUF
+large:   Codefuse-AI/F2LLM-v2-4B-GGUF
+max:     Codefuse-AI/F2LLM-v2-8B-GGUF
 ```
 
-`max`, `4b`, `4B`, and `f2llm-4b` select `EmbeddingProfile::Max`.
-Its preset model ID is `F2LLM-v2-4B-Q4_K_M`; the loaded runtime identity
-continues to name the actual repository/file or explicit local path.
+`large`, `pro`, `4b`, `4B`, and `f2llm-4b` select `EmbeddingProfile::Large` (`F2LLM-v2-4B-Q4_K_M`, 2560d).
+`max`, `ultra`, `8b`, `8B`, and `f2llm-8b` select `EmbeddingProfile::Max` (`F2LLM-v2-8B-Q4_K_M`, 4096d).
+The loaded runtime identity continues to name the actual repository/file or explicit local path.
 
 The old MiniLM/Harrier/fp16 config values are treated as legacy. If a stale
 `~/.aicx/embedder.toml` still points at one of those repos without an explicit

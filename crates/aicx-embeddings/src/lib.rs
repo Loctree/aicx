@@ -52,9 +52,9 @@ pub fn enforce_embed_input_budget(text: &str) -> Result<&str> {
 }
 pub use config::{
     ConfigSource, DEFAULT_BASE_FILENAME, DEFAULT_BASE_REPO, DEFAULT_DEV_FILENAME, DEFAULT_DEV_REPO,
-    DEFAULT_MAX_FILENAME, DEFAULT_MAX_REPO, DEFAULT_PREMIUM_FILENAME, DEFAULT_PREMIUM_REPO,
-    config_search_paths, config_search_paths_with_source, effective_config_source,
-    find_cached_model_file, profile_spec,
+    DEFAULT_LARGE_FILENAME, DEFAULT_LARGE_REPO, DEFAULT_MAX_FILENAME, DEFAULT_MAX_REPO,
+    DEFAULT_PREMIUM_FILENAME, DEFAULT_PREMIUM_REPO, config_search_paths,
+    config_search_paths_with_source, effective_config_source, find_cached_model_file, profile_spec,
 };
 
 /// Backend preference from config/env.
@@ -108,14 +108,20 @@ impl fmt::Display for BackendPreference {
 pub enum EmbeddingProfile {
     /// Portable F2LLM 0.6B Q4_K_M, roughly 397 MB.
     #[default]
+    #[serde(alias = "0.6b", alias = "0.6B", alias = "f2llm-0.6b")]
     Base,
     /// Workstation F2LLM 1.7B Q4_K_M, roughly 1.1 GB.
+    #[serde(alias = "1.7b", alias = "1.7B", alias = "f2llm-1.7b")]
     Dev,
     /// Stronger 1.7B Q6_K, roughly 1.4 GB. Heavy retrieval should still live
     /// in rust-memex/Roost when operators need the full retrieval plane.
+    #[serde(alias = "1.7b-q6", alias = "1.7B-Q6")]
     Premium,
     /// F2LLM 4B Q4_K_M, 2560 dimensions, roughly 2.5 GB.
-    #[serde(alias = "4b", alias = "4B", alias = "f2llm-4b")]
+    #[serde(alias = "4b", alias = "4B", alias = "pro", alias = "f2llm-4b")]
+    Large,
+    /// F2LLM 8B Q4_K_M, 4096 dimensions, roughly 4.9 GB.
+    #[serde(alias = "8b", alias = "8B", alias = "ultra", alias = "f2llm-8b")]
     Max,
 }
 
@@ -123,10 +129,11 @@ impl EmbeddingProfile {
     pub fn parse(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
             "" => None,
-            "base" | "default" | "portable" => Some(Self::Base),
-            "dev" | "workstation" => Some(Self::Dev),
-            "premium" | "strong" | "heavy" => Some(Self::Premium),
-            "max" | "4b" | "f2llm-4b" => Some(Self::Max),
+            "base" | "default" | "portable" | "0.6b" | "f2llm-0.6b" => Some(Self::Base),
+            "dev" | "workstation" | "1.7b" | "f2llm-1.7b" => Some(Self::Dev),
+            "premium" | "strong" | "heavy" | "1.7b-q6" => Some(Self::Premium),
+            "large" | "pro" | "4b" | "f2llm-4b" => Some(Self::Large),
+            "max" | "ultra" | "8b" | "f2llm-8b" => Some(Self::Max),
             _ => None,
         }
     }
@@ -136,6 +143,7 @@ impl EmbeddingProfile {
             Self::Base => "base",
             Self::Dev => "dev",
             Self::Premium => "premium",
+            Self::Large => "large",
             Self::Max => "max",
         }
     }
@@ -602,8 +610,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn max_profile_aliases_resolve_to_the_4b_preset() {
-        for alias in ["max", "4b", "4B", "f2llm-4b", " MAX "] {
+    fn large_and_max_profile_aliases_resolve_to_4b_and_8b_presets() {
+        for alias in ["large", "pro", "4b", "4B", "f2llm-4b", " LARGE "] {
+            assert_eq!(EmbeddingProfile::parse(alias), Some(EmbeddingProfile::Large));
+            assert_eq!(
+                alias.parse::<EmbeddingProfile>().unwrap(),
+                EmbeddingProfile::Large
+            );
+        }
+        assert_eq!(EmbeddingProfile::Large.to_string(), "large");
+        let cfg_4b = EmbeddingConfig::default().with_profile(EmbeddingProfile::Large);
+        let resolved_4b = cfg_4b.resolved_model();
+        assert_eq!(resolved_4b.profile, EmbeddingProfile::Large);
+        assert_eq!(resolved_4b.repo, "Codefuse-AI/F2LLM-v2-4B-GGUF");
+        assert_eq!(resolved_4b.filename, "F2LLM-v2-4B.Q4_K_M.gguf");
+        assert_eq!(resolved_4b.dimension_hint, 2560);
+        assert_eq!(resolved_4b.approx_size, "~2.5 GB");
+        assert_eq!(
+            profile_spec(EmbeddingProfile::Large).model_id,
+            "F2LLM-v2-4B-Q4_K_M"
+        );
+
+        for alias in ["max", "ultra", "8b", "8B", "f2llm-8b", " MAX "] {
             assert_eq!(EmbeddingProfile::parse(alias), Some(EmbeddingProfile::Max));
             assert_eq!(
                 alias.parse::<EmbeddingProfile>().unwrap(),
@@ -615,23 +643,36 @@ mod tests {
         let cfg = EmbeddingConfig::default().with_profile(EmbeddingProfile::Max);
         let resolved = cfg.resolved_model();
         assert_eq!(resolved.profile, EmbeddingProfile::Max);
-        assert_eq!(resolved.repo, "Codefuse-AI/F2LLM-v2-4B-GGUF");
-        assert_eq!(resolved.filename, "F2LLM-v2-4B.Q4_K_M.gguf");
-        assert_eq!(resolved.dimension_hint, 2560);
-        assert_eq!(resolved.approx_size, "~2.5 GB");
+        assert_eq!(resolved.repo, "Codefuse-AI/F2LLM-v2-8B-GGUF");
+        assert_eq!(resolved.filename, "F2LLM-v2-8B.Q4_K_M.gguf");
+        assert_eq!(resolved.dimension_hint, 4096);
+        assert_eq!(resolved.approx_size, "~4.9 GB");
         assert_eq!(
             profile_spec(EmbeddingProfile::Max).model_id,
-            "F2LLM-v2-4B-Q4_K_M"
+            "F2LLM-v2-8B-Q4_K_M"
         );
     }
 
     #[test]
-    fn max_profile_deserializes_from_serde_and_native_config() {
+    fn large_and_max_profiles_deserialize_from_serde_and_native_config() {
         #[derive(Deserialize)]
         struct ProfileConfig {
             profile: EmbeddingProfile,
         }
-        for alias in ["max", "4b", "4B", "f2llm-4b"] {
+        for alias in ["large", "pro", "4b", "4B", "f2llm-4b"] {
+            let text = format!("profile = {alias:?}");
+            let typed: ProfileConfig = toml::from_str(&text).unwrap();
+            assert_eq!(typed.profile, EmbeddingProfile::Large);
+            let file: NativeEmbedderConfigFile = toml::from_str(&text).unwrap();
+            assert_eq!(
+                file.top_level
+                    .profile
+                    .as_deref()
+                    .and_then(EmbeddingProfile::parse),
+                Some(EmbeddingProfile::Large)
+            );
+        }
+        for alias in ["max", "ultra", "8b", "8B", "f2llm-8b"] {
             let text = format!("profile = {alias:?}");
             let typed: ProfileConfig = toml::from_str(&text).unwrap();
             assert_eq!(typed.profile, EmbeddingProfile::Max);
