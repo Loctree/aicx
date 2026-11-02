@@ -1978,7 +1978,7 @@ fn collect_recent_sessions(
         if next.is_empty() {
             return;
         }
-        next.sort_by(|left, right| right.0.cmp(&left.0));
+        next.sort_by_key(|right| std::cmp::Reverse(right.0));
         next.truncate(RECENT_DIR_FANOUT);
         frontier = next.into_iter().map(|(_, path)| path).collect();
     }
@@ -1995,7 +1995,7 @@ fn recent_sessions(user_home: &Path, deadline: Instant) -> Vec<RecentSession> {
             collect_recent_sessions(&root, kind, deadline, &mut found);
         }
     }
-    found.sort_by(|left, right| right.modified.cmp(&left.modified));
+    found.sort_by_key(|right| std::cmp::Reverse(right.modified));
     found.truncate(SUGGESTION_SESSION_CAP);
     found
 }
