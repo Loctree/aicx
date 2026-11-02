@@ -612,7 +612,10 @@ mod tests {
     #[test]
     fn large_and_max_profile_aliases_resolve_to_4b_and_8b_presets() {
         for alias in ["large", "pro", "4b", "4B", "f2llm-4b", " LARGE "] {
-            assert_eq!(EmbeddingProfile::parse(alias), Some(EmbeddingProfile::Large));
+            assert_eq!(
+                EmbeddingProfile::parse(alias),
+                Some(EmbeddingProfile::Large)
+            );
             assert_eq!(
                 alias.parse::<EmbeddingProfile>().unwrap(),
                 EmbeddingProfile::Large

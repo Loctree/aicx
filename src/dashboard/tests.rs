@@ -253,7 +253,10 @@ fn server_shell_exposes_full_stage_setup_for_first_run_and_configured_homes() {
             "value=\"large\"",
             "value=\"max\"",
         ] {
-            assert!(html.contains(profile_opt), "missing profile option {profile_opt}");
+            assert!(
+                html.contains(profile_opt),
+                "missing profile option {profile_opt}"
+            );
         }
         assert_eq!(html.contains("id=\"ctx-onboarding\""), survey_required);
         assert_eq!(
