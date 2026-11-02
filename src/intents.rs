@@ -4588,21 +4588,27 @@ pub fn classify_line_entry_type(line: &str, is_user: bool) -> Option<(EntryType,
     if trimmed.starts_with("result:") || trimmed.starts_with("wynik:") {
         return Some((EntryType::Result, 0.95));
     }
-    if is_result_line(line)
-        || crate::parser::intent_phrases::phrases()
-            .result_strict
+    let user_has_intent_keyword = is_user
+        && intent_keywords()
+            .iter()
+            .any(|kw| matches_keyword_word_boundary(line, kw));
+    if !user_has_intent_keyword {
+        if is_result_line(line)
+            || crate::parser::intent_phrases::phrases()
+                .result_strict
+                .iter()
+                .any(|m| lower.contains(m))
+        {
+            return Some((EntryType::Result, 0.75));
+        }
+        if crate::parser::intent_phrases::phrases()
+            .result_soft
             .iter()
             .any(|m| lower.contains(m))
-    {
-        return Some((EntryType::Result, 0.75));
-    }
-    if crate::parser::intent_phrases::phrases()
-        .result_soft
-        .iter()
-        .any(|m| lower.contains(m))
-        && line_has_result_shape(&lower)
-    {
-        return Some((EntryType::Result, 0.6));
+            && line_has_result_shape(&lower)
+        {
+            return Some((EntryType::Result, 0.6));
+        }
     }
 
     if crate::parser::intent_phrases::phrases()
@@ -4624,11 +4630,7 @@ pub fn classify_line_entry_type(line: &str, is_user: bool) -> Option<(EntryType,
     if modality == IntentLineModality::TypedDirective {
         return Some((EntryType::Intent, 0.8));
     }
-    if is_user
-        && intent_keywords()
-            .iter()
-            .any(|kw| matches_keyword_word_boundary(line, kw))
-    {
+    if user_has_intent_keyword {
         return Some((EntryType::Intent, 0.7));
     }
     if is_decision_tag(line) {
