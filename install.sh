@@ -202,20 +202,22 @@ normalise_bool() {
 
 embedder_repo_for_profile() {
   case "${1:-}" in
-    base) echo "mradermacher/F2LLM-v2-0.6B-GGUF" ;;
-    dev) echo "mradermacher/F2LLM-v2-1.7B-GGUF" ;;
-    premium) echo "mradermacher/F2LLM-v2-1.7B-GGUF" ;;
-    max|4b|4B|f2llm-4b) echo "Codefuse-AI/F2LLM-v2-4B-GGUF" ;;
+    base|0.6b|0.6B) echo "mradermacher/F2LLM-v2-0.6B-GGUF" ;;
+    dev|1.7b|1.7B) echo "mradermacher/F2LLM-v2-1.7B-GGUF" ;;
+    premium|1.7b-q6|1.7B-Q6) echo "mradermacher/F2LLM-v2-1.7B-GGUF" ;;
+    large|pro|4b|4B|f2llm-4b) echo "Codefuse-AI/F2LLM-v2-4B-GGUF" ;;
+    max|ultra|8b|8B|f2llm-8b) echo "Codefuse-AI/F2LLM-v2-8B-GGUF" ;;
     *) return 1 ;;
   esac
 }
 
 embedder_file_for_profile() {
   case "${1:-}" in
-    base) echo "F2LLM-v2-0.6B.Q4_K_M.gguf" ;;
-    dev) echo "F2LLM-v2-1.7B.Q4_K_M.gguf" ;;
-    premium) echo "F2LLM-v2-1.7B.Q6_K.gguf" ;;
-    max|4b|4B|f2llm-4b) echo "F2LLM-v2-4B.Q4_K_M.gguf" ;;
+    base|0.6b|0.6B) echo "F2LLM-v2-0.6B.Q4_K_M.gguf" ;;
+    dev|1.7b|1.7B) echo "F2LLM-v2-1.7B.Q4_K_M.gguf" ;;
+    premium|1.7b-q6|1.7B-Q6) echo "F2LLM-v2-1.7B.Q6_K.gguf" ;;
+    large|pro|4b|4B|f2llm-4b) echo "F2LLM-v2-4B.Q4_K_M.gguf" ;;
+    max|ultra|8b|8B|f2llm-8b) echo "F2LLM-v2-8B.Q4_K_M.gguf" ;;
     *) return 1 ;;
   esac
 }
@@ -436,14 +438,23 @@ maybe_configure_native_embedder() {
         AICX_EMBEDDER_SETUP_DETAIL="You skipped native embedder setup."
         return 0
         ;;
-      base|dev|premium)
-        selected_profile="$explicit_profile"
+      base|0.6b|0.6B)
+        selected_profile="base"
         ;;
-      max|4b|4B|f2llm-4b)
+      dev|1.7b|1.7B)
+        selected_profile="dev"
+        ;;
+      premium|1.7b-q6|1.7B-Q6)
+        selected_profile="premium"
+        ;;
+      large|pro|4b|4B|f2llm-4b)
+        selected_profile="large"
+        ;;
+      max|ultra|8b|8B|f2llm-8b)
         selected_profile="max"
         ;;
       *)
-        echo "Error: unsupported embedder profile='$explicit_profile' (expected base, dev, premium, max/4b, or none)." >&2
+        echo "Error: unsupported embedder profile='$explicit_profile' (expected base/0.6b, dev/1.7b, premium, large/4b, max/8b, or none)." >&2
         exit 1
         ;;
     esac
@@ -471,12 +482,17 @@ maybe_configure_native_embedder() {
     echo "     Approx. 1.4 GB"
     echo "     Higher precision than Dev."
     echo ""
-    echo "  5) Max (4B)"
+    echo "  5) Large (4B)"
     echo "     F2LLM 4B Q4_K_M GGUF, 2560 dimensions"
     echo "     Approx. 2.5 GB"
-    echo "     Largest local model; requires more memory."
+    echo "     High-capacity local model."
     echo ""
-    printf "Select profile [1-5]: "
+    echo "  6) Max (8B)"
+    echo "     F2LLM 8B Q4_K_M GGUF, 4096 dimensions"
+    echo "     Approx. 4.9 GB"
+    echo "     Maximum local model; requires more memory."
+    echo ""
+    printf "Select profile [1-6]: "
     read -r reply || true
     case "${reply:-1}" in
       1|"")
@@ -487,7 +503,8 @@ maybe_configure_native_embedder() {
       2) selected_profile="base" ;;
       3) selected_profile="dev" ;;
       4) selected_profile="premium" ;;
-      5) selected_profile="max" ;;
+      5) selected_profile="large" ;;
+      6) selected_profile="max" ;;
       *)
         echo "  native embedder picker: invalid choice, skipping"
         AICX_EMBEDDER_SETUP_DETAIL="No local embedder profile was configured; invalid picker choice was ignored."

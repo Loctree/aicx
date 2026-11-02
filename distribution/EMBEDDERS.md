@@ -61,9 +61,10 @@ Available native profiles:
 | `base` | `mradermacher/F2LLM-v2-0.6B-GGUF` | `F2LLM-v2-0.6B.Q4_K_M.gguf` | 1024 | ~397 MB |
 | `dev` | `mradermacher/F2LLM-v2-1.7B-GGUF` | `F2LLM-v2-1.7B.Q4_K_M.gguf` | 2048 | ~1.1 GB |
 | `premium` | `mradermacher/F2LLM-v2-1.7B-GGUF` | `F2LLM-v2-1.7B.Q6_K.gguf` | 2048 | ~1.4 GB |
-| `max` (`4b`) | `Codefuse-AI/F2LLM-v2-4B-GGUF` | `F2LLM-v2-4B.Q4_K_M.gguf` | 2560 | ~2.5 GB |
+| `large` (`4b`) | `Codefuse-AI/F2LLM-v2-4B-GGUF` | `F2LLM-v2-4B.Q4_K_M.gguf` | 2560 | ~2.5 GB |
+| `max` (`8b`) | `Codefuse-AI/F2LLM-v2-8B-GGUF` | `F2LLM-v2-8B.Q4_K_M.gguf` | 4096 | ~4.9 GB |
 
-Max's preset model ID is `F2LLM-v2-4B-Q4_K_M`. The runtime resolves weights
+Large's preset model ID is `F2LLM-v2-4B-Q4_K_M` (`large` / `4b`). Max's preset model ID is `F2LLM-v2-8B-Q4_K_M` (`max` / `8b`). The runtime resolves weights
 from the same explicit path/cache contract as the other profiles.
 
 Select it with `AICX_INSTALL_MODE=release bash install.sh --with-embeddings=max`
