@@ -352,6 +352,15 @@ fn assemble_router(state: Arc<DashboardServerState>, mount_health: bool) -> Rout
             get(operator::get_phrases).put(operator::put_phrases),
         )
         .route("/api/onboarding", post(operator::post_onboarding))
+        .route("/api/onboarding/state", get(operator::get_onboarding_state))
+        .route(
+            "/api/onboarding/phrase-suggestions",
+            get(operator::get_phrase_suggestions),
+        )
+        .route(
+            "/api/onboarding/preview-phrases",
+            post(operator::post_preview_phrases),
+        )
         .route("/api/index", post(operator::post_index));
 
     let api_router = auth::require_auth_layer(api_router, state.config.auth.clone());
@@ -386,8 +395,16 @@ fn empty_build(config: &DashboardServerConfig) -> BuildOutput {
 
 #[cfg(test)]
 fn test_server_state(host: std::net::IpAddr) -> Arc<DashboardServerState> {
+    test_server_state_at(host, std::env::temp_dir())
+}
+
+#[cfg(test)]
+fn test_server_state_at(
+    host: std::net::IpAddr,
+    aicx_home: std::path::PathBuf,
+) -> Arc<DashboardServerState> {
     let config = DashboardServerConfig {
-        aicx_home: std::env::temp_dir(),
+        aicx_home,
         scope: DashboardScope::default(),
         title: "test".to_string(),
         preview_chars: 320,
