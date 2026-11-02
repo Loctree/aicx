@@ -325,7 +325,8 @@ pub fn render_server_shell_html_for(title: &str, local_open: bool, show_survey: 
             <label class="meta" for="ctx-onboarding-phrases">Phrases you type, one per line</label>
             <textarea id="ctx-onboarding-phrases" rows="4" spellcheck="false" placeholder="I want this&#10;do not ship that"></textarea>
             <button id="ctx-onboarding-save" type="button">Save</button>
-            <p id="ctx-onboarding-status" class="meta"></p>
+            <button id="ctx-open-onboarding-studio" type="button">Open Full Onboarding Studio</button>
+            <p id="ctx-onboarding-status" class="meta" role="status" aria-live="polite"></p>
           </details>
 "#
         )
@@ -388,7 +389,7 @@ pub fn render_server_shell_html_for(title: &str, local_open: bool, show_survey: 
       <nav class="rail-nav" aria-label="Dashboard">
         <button type="button" class="rail-nav-item active" id="ctx-nav-sessions">Sessions</button>
         <button type="button" class="rail-nav-item" id="ctx-nav-intents">Intents</button>
-        <button type="button" class="rail-nav-item" id="ctx-nav-setup">Setup</button>
+        <button type="button" class="rail-nav-item" id="ctx-nav-setup" data-view="setup">Setup <span class="ob-status" id="ctx-ob-readiness">Checking</span></button>
       </nav>
       <div class="rail-scroll">
         <div class="rail-filters">
@@ -458,6 +459,98 @@ pub fn render_server_shell_html_for(title: &str, local_open: bool, show_survey: 
         </article>
       </section>
       <div class="main-body">
+        <section class="onboarding-studio" id="ctx-onboarding-studio" aria-labelledby="ctx-ob-title" hidden>
+          <header class="ob-welcome">
+            <p class="eyebrow">Your sessions, made searchable</p>
+            <h1 id="ctx-ob-title" tabindex="-1">AICX First-Run Onboarding Studio</h1>
+            <p>Find your agent history, see the intentions it already contains, and build your searchable corpus.</p>
+            <p id="ctx-ob-status" class="meta" role="status" aria-live="polite">Loading setup from this machine…</p>
+            <button id="ctx-ob-retry" type="button">Refresh setup status</button>
+          </header>
+          <div class="ob-grid">
+            <article class="ob-pillar-card" id="ctx-ob-sources" aria-labelledby="ctx-ob-sources-title">
+              <p class="eyebrow">Pillar 1</p>
+              <h2 id="ctx-ob-sources-title">Detected Agent Sources &amp; Corpus</h2>
+              <p>Directories and session file counts discovered on this machine. Missing sources stay visible so you can see what AICX looked for.</p>
+              <p class="meta">AICX_HOME: <code id="ctx-ob-home">Checking…</code></p>
+              <ul id="ctx-ob-source-list" class="ob-source-list"></ul>
+            </article>
+            <article class="ob-pillar-card ob-wide" id="ctx-ob-phrases" aria-labelledby="ctx-ob-phrases-title">
+              <p class="eyebrow">Pillar 2</p>
+              <h2 id="ctx-ob-phrases-title">Intent Phrases &amp; Will Declarations</h2>
+              <p>The universal Polish + English dictionary is active out of the box. These matches come from your own sessions on disk.</p>
+              <p id="ctx-ob-discovery-status" class="meta" role="status" aria-live="polite">Reading real session samples…</p>
+              <ul id="ctx-ob-matched-samples" class="ob-sample-list"></ul>
+              <button id="ctx-ob-discover-phrases" type="button">Discover from my sessions</button>
+              <p class="meta">Click a discovered opener to add it to the suggested category below, then save your personal phrases.</p>
+              <div id="ctx-ob-candidates" class="ob-chips" aria-label="Discovered phrase openers"></div>
+              <p class="meta">Personal phrase file: <code id="ctx-ob-phrases-path">Checking…</code>. Add one phrase per line; built-in phrases remain active.</p>
+              <div class="ob-fields">
+                <label for="ctx-ob-intent-keywords">Intent keywords<textarea id="ctx-ob-intent-keywords" rows="3" spellcheck="false"></textarea></label>
+                <label for="ctx-ob-task-heads">Task action heads<textarea id="ctx-ob-task-heads" rows="3" spellcheck="false"></textarea></label>
+                <label for="ctx-ob-decision-policy">Decisions &amp; policy<textarea id="ctx-ob-decision-policy" rows="3" spellcheck="false"></textarea></label>
+                <label for="ctx-ob-requirement-markers">Requirement markers<textarea id="ctx-ob-requirement-markers" rows="3" spellcheck="false"></textarea></label>
+                <label for="ctx-ob-question-markers">Question markers<textarea id="ctx-ob-question-markers" rows="3" spellcheck="false"></textarea></label>
+              </div>
+              <button id="ctx-ob-save-phrases" type="button" disabled>Save personal phrases</button>
+              <p id="ctx-ob-phrase-status" class="meta" role="status" aria-live="polite"></p>
+              <label for="ctx-ob-preview-input">Test phrases on sample lines<textarea id="ctx-ob-preview-input" rows="3" placeholder="Paste your own sample lines here"></textarea></label>
+              <p class="meta">Preview uses the active dictionary. Save personal phrases first to test your additions.</p>
+              <button id="ctx-ob-preview-btn" type="button">Test phrases on sample lines</button>
+              <ul id="ctx-ob-preview-results" class="ob-sample-list" aria-live="polite"></ul>
+            </article>
+            <article class="ob-pillar-card" id="ctx-ob-embedder" aria-labelledby="ctx-ob-embedder-title">
+              <p class="eyebrow">Pillar 3</p>
+              <h2 id="ctx-ob-embedder-title">Search &amp; Embedder Configuration</h2>
+              <p>Tantivy BM25 lexical search works immediately after indexing, with zero model downloads. Dense embeddings add semantic search.</p>
+              <label for="ctx-ob-backend">Dense embedding mode<select id="ctx-ob-backend">
+                <option value="auto">Auto — try local GGUF, fallback to lexical</option>
+                <option value="gguf">Local GGUF via llama.cpp — on this machine</option>
+                <option value="cloud">Cloud / HTTP — OpenAI-compatible endpoint</option>
+              </select></label>
+              <div id="ctx-ob-local-fields">
+                <label for="ctx-ob-profile">Local profile<select id="ctx-ob-profile">
+                  <option value="base">0.6B · 1024d · ~397 MB — fast daily default</option>
+                  <option value="dev">1.7B Q4_K_M · 2048d · ~1.1 GB</option>
+                  <option value="premium">1.7B Q6_K · 2048d · ~1.4 GB</option>
+                  <option value="max">4B Q4_K_M · 2560d · ~2.5 GB</option>
+                </select></label>
+                <p id="ctx-ob-model-status" class="meta"></p>
+              </div>
+              <div id="ctx-ob-cloud-fields" hidden>
+                <p class="meta">OpenAI / Voyage / Ollama / LM Studio. HTTP mode sends text to your configured endpoint.</p>
+                <label for="ctx-ob-cloud-url">Endpoint URL<input id="ctx-ob-cloud-url" type="url" placeholder="https://api.openai.com/v1/embeddings" /></label>
+                <label for="ctx-ob-cloud-model">Model<input id="ctx-ob-cloud-model" type="text" placeholder="text-embedding-3-small" /></label>
+                <label for="ctx-ob-cloud-key-env">API key environment variable name<input id="ctx-ob-cloud-key-env" type="text" placeholder="OPENAI_API_KEY" autocomplete="off" /></label>
+                <p id="ctx-ob-key-status" class="ob-status">Checking environment</p>
+                <p class="meta">Enter the variable name only. AICX reads the key from its server environment.</p>
+              </div>
+              <p class="meta">Config: <code id="ctx-ob-config-path">Checking…</code></p>
+            </article>
+            <article class="ob-pillar-card" id="ctx-ob-services" aria-labelledby="ctx-ob-services-title">
+              <p class="eyebrow">Pillar 4</p>
+              <h2 id="ctx-ob-services-title">Runtime Services &amp; MCP Client Wiring</h2>
+              <p><code>com.loctree.aicx.mcp</code> · <code id="ctx-ob-mcp-address">127.0.0.1:8044</code> <span id="ctx-ob-mcp-status" class="ob-status">Checking</span></p>
+              <p><code>com.loctree.aicx.reindex</code> <span id="ctx-ob-reindex-status" class="ob-status">Checking</span></p>
+              <label class="ob-check"><input id="ctx-ob-install-services" type="checkbox" checked />Ensure MCP background service is installed</label>
+              <label class="ob-check"><input id="ctx-ob-install-reindex" type="checkbox" checked />Install the background reindex schedule</label>
+              <p class="meta">Select detected clients to wire AICX in their MCP configuration.</p>
+              <div id="ctx-ob-mcp-clients" class="ob-client-list"></div>
+            </article>
+            <article class="ob-pillar-card ob-wide" id="ctx-ob-finish" aria-labelledby="ctx-ob-finish-title">
+              <p class="eyebrow">Pillar 5</p>
+              <h2 id="ctx-ob-finish-title">Materialize Catalog &amp; Index</h2>
+              <div class="ob-counts">
+                <p><strong id="ctx-ob-catalog-count">—</strong> catalog sessions</p>
+                <p><strong id="ctx-ob-index-count">—</strong> indexed documents</p>
+              </div>
+              <p>Save your choices and build the initial index from your discovered sessions.</p>
+              <button id="ctx-ob-complete-btn" class="ob-primary" type="button" disabled>Complete Setup &amp; Build Index</button>
+              <progress id="ctx-ob-progress" aria-label="Building catalog and index" hidden></progress>
+              <p id="ctx-ob-finish-status" class="meta" role="status" aria-live="polite">Load setup status before continuing.</p>
+            </article>
+          </div>
+        </section>
         <section class="layout" id="ctx-layout">
           <aside class="list-pane">
             <div id="ctx-summary" class="summary"></div>
