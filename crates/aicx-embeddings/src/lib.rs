@@ -52,8 +52,9 @@ pub fn enforce_embed_input_budget(text: &str) -> Result<&str> {
 }
 pub use config::{
     ConfigSource, DEFAULT_BASE_FILENAME, DEFAULT_BASE_REPO, DEFAULT_DEV_FILENAME, DEFAULT_DEV_REPO,
-    DEFAULT_PREMIUM_FILENAME, DEFAULT_PREMIUM_REPO, config_search_paths,
-    config_search_paths_with_source, effective_config_source, find_cached_model_file, profile_spec,
+    DEFAULT_MAX_FILENAME, DEFAULT_MAX_REPO, DEFAULT_PREMIUM_FILENAME, DEFAULT_PREMIUM_REPO,
+    config_search_paths, config_search_paths_with_source, effective_config_source,
+    find_cached_model_file, profile_spec,
 };
 
 /// Backend preference from config/env.
@@ -102,7 +103,8 @@ impl fmt::Display for BackendPreference {
 }
 
 /// Operator-facing profile for the local embedder.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum EmbeddingProfile {
     /// Portable F2LLM 0.6B Q4_K_M, roughly 397 MB.
     #[default]
@@ -112,6 +114,9 @@ pub enum EmbeddingProfile {
     /// Stronger 1.7B Q6_K, roughly 1.4 GB. Heavy retrieval should still live
     /// in rust-memex/Roost when operators need the full retrieval plane.
     Premium,
+    /// F2LLM 4B Q4_K_M, 2560 dimensions, roughly 2.5 GB.
+    #[serde(alias = "4b", alias = "4B", alias = "f2llm-4b")]
+    Max,
 }
 
 impl EmbeddingProfile {
@@ -121,6 +126,7 @@ impl EmbeddingProfile {
             "base" | "default" | "portable" => Some(Self::Base),
             "dev" | "workstation" => Some(Self::Dev),
             "premium" | "strong" | "heavy" => Some(Self::Premium),
+            "max" | "4b" | "f2llm-4b" => Some(Self::Max),
             _ => None,
         }
     }
@@ -130,6 +136,7 @@ impl EmbeddingProfile {
             Self::Base => "base",
             Self::Dev => "dev",
             Self::Premium => "premium",
+            Self::Max => "max",
         }
     }
 }
@@ -140,12 +147,22 @@ impl fmt::Display for EmbeddingProfile {
     }
 }
 
+impl std::str::FromStr for EmbeddingProfile {
+    type Err = anyhow::Error;
+
+    fn from_str(raw: &str) -> Result<Self> {
+        Self::parse(raw).ok_or_else(|| anyhow!("unknown embedding profile: {raw}"))
+    }
+}
+
 /// Resolved model preset metadata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EmbeddingProfileSpec {
     pub profile: EmbeddingProfile,
     pub repo: &'static str,
     pub filename: &'static str,
+    /// Preset name. Runtime model identity also includes the actual source path.
+    pub model_id: &'static str,
     pub dimension_hint: usize,
     pub approx_size: &'static str,
     pub description: &'static str,
@@ -583,6 +600,51 @@ impl NativeEmbedderConfigSection {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn max_profile_aliases_resolve_to_the_4b_preset() {
+        for alias in ["max", "4b", "4B", "f2llm-4b", " MAX "] {
+            assert_eq!(EmbeddingProfile::parse(alias), Some(EmbeddingProfile::Max));
+            assert_eq!(
+                alias.parse::<EmbeddingProfile>().unwrap(),
+                EmbeddingProfile::Max
+            );
+        }
+        assert!("unknown".parse::<EmbeddingProfile>().is_err());
+        assert_eq!(EmbeddingProfile::Max.to_string(), "max");
+        let cfg = EmbeddingConfig::default().with_profile(EmbeddingProfile::Max);
+        let resolved = cfg.resolved_model();
+        assert_eq!(resolved.profile, EmbeddingProfile::Max);
+        assert_eq!(resolved.repo, "Codefuse-AI/F2LLM-v2-4B-GGUF");
+        assert_eq!(resolved.filename, "F2LLM-v2-4B.Q4_K_M.gguf");
+        assert_eq!(resolved.dimension_hint, 2560);
+        assert_eq!(resolved.approx_size, "~2.5 GB");
+        assert_eq!(
+            profile_spec(EmbeddingProfile::Max).model_id,
+            "F2LLM-v2-4B-Q4_K_M"
+        );
+    }
+
+    #[test]
+    fn max_profile_deserializes_from_serde_and_native_config() {
+        #[derive(Deserialize)]
+        struct ProfileConfig {
+            profile: EmbeddingProfile,
+        }
+        for alias in ["max", "4b", "4B", "f2llm-4b"] {
+            let text = format!("profile = {alias:?}");
+            let typed: ProfileConfig = toml::from_str(&text).unwrap();
+            assert_eq!(typed.profile, EmbeddingProfile::Max);
+            let file: NativeEmbedderConfigFile = toml::from_str(&text).unwrap();
+            assert_eq!(
+                file.top_level
+                    .profile
+                    .as_deref()
+                    .and_then(EmbeddingProfile::parse),
+                Some(EmbeddingProfile::Max)
+            );
+        }
+    }
 
     #[test]
     fn malformed_provider_output_never_reaches_generation_or_query() {

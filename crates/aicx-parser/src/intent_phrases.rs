@@ -12,7 +12,7 @@ struct Raw {
     decision: Decision,
     requirement: List,
     outcome: Outcome,
-    question: List,
+    question: Question,
     assumption: List,
     why: List,
     argue: List,
@@ -24,6 +24,14 @@ struct Raw {
 struct List {
     keywords: Option<Vec<String>>,
     markers: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Question {
+    markers: Vec<String>,
+    // Existing personal phrase files need not opt into dictated questions.
+    #[serde(default)]
+    dictated_prefixes: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -78,6 +86,7 @@ pub struct Phrases {
     pub result_shape: &'static [&'static str],
     pub completion: &'static [&'static str],
     pub question: &'static [&'static str],
+    pub question_dictated_prefixes: &'static [&'static str],
     pub assumption: &'static [&'static str],
     pub why: &'static [&'static str],
     pub argue: &'static [&'static str],
@@ -154,7 +163,8 @@ fn parse_phrases(text: &str) -> Result<Phrases, String> {
         result_soft: leak(&raw.outcome.result_soft),
         result_shape: leak(&raw.outcome.result_shape),
         completion: leak(&raw.outcome.completion),
-        question: leak(&raw.question.markers.ok_or("question.markers")?),
+        question: leak(&raw.question.markers),
+        question_dictated_prefixes: leak(&raw.question.dictated_prefixes),
         assumption: leak(&raw.assumption.markers.ok_or("assumption.markers")?),
         why: leak(&raw.why.markers.ok_or("why.markers")?),
         argue: leak(&raw.argue.markers.ok_or("argue.markers")?),
@@ -177,6 +187,62 @@ fn leak(items: &[String]) -> &'static [&'static str] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn embedded_polish_phrases_have_ascii_pairs_without_duplicates() {
+        let raw: toml::Value = toml::from_str(embedded_source()).unwrap();
+        for (section, table) in raw.as_table().unwrap() {
+            for (name, values) in table.as_table().unwrap() {
+                let values: Vec<_> = values
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|value| value.as_str().unwrap())
+                    .collect();
+                let unique: std::collections::HashSet<_> = values.iter().copied().collect();
+                assert_eq!(unique.len(), values.len(), "duplicates in {section}.{name}");
+                for phrase in &values {
+                    let ascii: String = phrase
+                        .chars()
+                        .map(|c| match c {
+                            'ą' => 'a',
+                            'ć' => 'c',
+                            'ę' => 'e',
+                            'ł' => 'l',
+                            'ń' => 'n',
+                            'ó' => 'o',
+                            'ś' => 's',
+                            'ź' | 'ż' => 'z',
+                            'Ż' => 'Z',
+                            other => other,
+                        })
+                        .collect();
+                    assert!(
+                        unique.contains(ascii.as_str()),
+                        "missing ASCII phrase {ascii:?} in {section}.{name}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn embedded_question_prefixes_are_optional_in_personal_phrase_files() {
+        let embedded = parse_phrases(embedded_source()).unwrap();
+        assert!(
+            embedded
+                .question_dictated_prefixes
+                .contains(&"co to ma być")
+        );
+        let mut personal: toml::Value = toml::from_str(embedded_source()).unwrap();
+        personal["question"]
+            .as_table_mut()
+            .unwrap()
+            .remove("dictated_prefixes");
+        let personal = parse_phrases(&toml::to_string(&personal).unwrap()).unwrap();
+        assert!(personal.question_dictated_prefixes.is_empty());
+        assert_eq!(personal.question, embedded.question);
+    }
 
     #[test]
     fn operator_phrases_are_validated_before_becoming_live() {

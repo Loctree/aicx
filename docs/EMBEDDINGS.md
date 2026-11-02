@@ -67,6 +67,7 @@ Runtime details:
 | `base` | `F2LLM-v2-0.6B.Q4_K_M.gguf` | 1024 | ~397 MB | portable default |
 | `dev` | `F2LLM-v2-1.7B.Q4_K_M.gguf` | 2048 | ~1.1 GB | workstation tier |
 | `premium` | `F2LLM-v2-1.7B.Q6_K.gguf` | 2048 | ~1.4 GB | stronger local tier |
+| `max` (`4b`) | `F2LLM-v2-4B.Q4_K_M.gguf` | 2560 | ~2.5 GB | largest local model |
 
 Default repos:
 
@@ -74,7 +75,12 @@ Default repos:
 base:    mradermacher/F2LLM-v2-0.6B-GGUF
 dev:     mradermacher/F2LLM-v2-1.7B-GGUF
 premium: mradermacher/F2LLM-v2-1.7B-GGUF
+max:     Codefuse-AI/F2LLM-v2-4B-GGUF
 ```
+
+`max`, `4b`, `4B`, and `f2llm-4b` select `EmbeddingProfile::Max`.
+Its preset model ID is `F2LLM-v2-4B-Q4_K_M`; the loaded runtime identity
+continues to name the actual repository/file or explicit local path.
 
 The old MiniLM/Harrier/fp16 config values are treated as legacy. If a stale
 `~/.aicx/embedder.toml` still points at one of those repos without an explicit
@@ -168,7 +174,7 @@ Useful env vars:
 | Variable | Effect |
 |---|---|
 | `AICX_EMBEDDER_CONFIG` | explicit config file |
-| `AICX_EMBEDDER_PROFILE` | `base`, `dev`, or `premium` |
+| `AICX_EMBEDDER_PROFILE` | `base`, `dev`, `premium`, or `max` (`4b`) |
 | `AICX_EMBEDDER_PATH` | explicit `.gguf` file or directory |
 | `AICX_EMBEDDER_REPO` | HF repo override |
 | `AICX_EMBEDDER_FILENAME` | exact GGUF file in the repo |
@@ -188,6 +194,9 @@ Interactive picker:
 
 ```bash
 bash install.sh --pick-embedder
+# Non-interactive profile selection (model download remains explicit):
+AICX_INSTALL_MODE=release bash install.sh --with-embeddings=max
+# Equivalent: --with-embeddings=4b or --embedder-profile=max
 ```
 
 Manual hydration:
@@ -196,7 +205,12 @@ Manual hydration:
 hf download mradermacher/F2LLM-v2-0.6B-GGUF F2LLM-v2-0.6B.Q4_K_M.gguf
 hf download mradermacher/F2LLM-v2-1.7B-GGUF F2LLM-v2-1.7B.Q4_K_M.gguf
 hf download mradermacher/F2LLM-v2-1.7B-GGUF F2LLM-v2-1.7B.Q6_K.gguf
+hf download Codefuse-AI/F2LLM-v2-4B-GGUF F2LLM-v2-4B.Q4_K_M.gguf
 ```
+
+Changing from a 1024/2048-dimensional profile to Max requires rebuilding the
+semantic index with the selected model. Existing vectors cannot be mixed with
+2560-dimensional vectors.
 
 Lookup paths:
 
