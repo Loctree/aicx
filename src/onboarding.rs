@@ -1077,10 +1077,11 @@ pub struct EmbedderOnboardingSelection {
 /// One spelling reaches `config.toml`, whichever name the page sent.
 fn canonical_embedder_profile(raw: &str) -> Option<&'static str> {
     match raw.trim().to_ascii_lowercase().as_str() {
-        "base" | "0.6b" => Some("base"),
-        "dev" | "1.7b" => Some("dev"),
+        "base" | "0.6b" | "f2llm-0.6b" => Some("base"),
+        "dev" | "1.7b" | "f2llm-1.7b" => Some("dev"),
         "premium" | "1.7b-q6" => Some("premium"),
-        "max" | "4b" => Some("max"),
+        "large" | "pro" | "4b" | "f2llm-4b" => Some("large"),
+        "max" | "ultra" | "8b" | "f2llm-8b" => Some("max"),
         _ => None,
     }
 }
@@ -1119,7 +1120,7 @@ fn render_embedder_config(home: &Path, selection: &EmbedderOnboardingSelection) 
     let profile = match selection.profile.trim() {
         "" => None,
         raw => Some(canonical_embedder_profile(raw).context(
-            "embedder profile must be base, dev, premium, max, 0.6b, 1.7b, 1.7b-q6, or 4b",
+            "embedder profile must be base, dev, premium, large, max, 0.6b, 1.7b, 1.7b-q6, 4b, or 8b",
         )?),
     };
     let cloud_url = selection.cloud_url.trim();
@@ -3374,8 +3375,14 @@ mod tests {
             ("1.7b", "dev"),
             ("premium", "premium"),
             ("1.7b-q6", "premium"),
+            ("large", "large"),
+            ("pro", "large"),
+            ("4b", "large"),
+            ("f2llm-4b", "large"),
             ("max", "max"),
-            ("4b", "max"),
+            ("ultra", "max"),
+            ("8b", "max"),
+            ("f2llm-8b", "max"),
             (" 1.7B ", "dev"),
         ] {
             assert_eq!(canonical_embedder_profile(sent), Some(stored), "{sent}");

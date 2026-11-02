@@ -1317,7 +1317,7 @@ mod tests {
         let config: toml::Value =
             toml::from_str(&std::fs::read_to_string(home.join("config.toml")).unwrap()).unwrap();
         assert_eq!(config["embedder"]["backend"].as_str(), Some("gguf"));
-        assert_eq!(config["embedder"]["profile"].as_str(), Some("max"));
+        assert_eq!(config["embedder"]["profile"].as_str(), Some("large"));
         assert!(home.join(crate::onboarding::MARKER_REL).is_file());
         restore_embedded_phrases();
         let _ = std::fs::remove_dir_all(&home);
