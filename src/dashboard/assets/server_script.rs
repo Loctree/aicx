@@ -28,8 +28,15 @@ pub(crate) const DASHBOARD_SERVER_SCRIPT: &str = r#"
   };
 
   const applyStatus = (data) => {
-    if (!data || !data.scan_status) return;
-    state.scanStatus = data.scan_status;
+    if (!data) return;
+    if (data.scan_status) state.scanStatus = data.scan_status;
+    if (typeof data.survey_required === 'boolean') {
+      setOnboardingReadiness(data.survey_required);
+      if (data.survey_required === true && !onboarding.autoOpened) {
+        onboarding.autoOpened = true;
+        showSetup();
+      }
+    }
     if (data.scan_status === 'not_scanned') {
       ui.statFiles.textContent = '\u2014';
       ui.statProjects.textContent = '\u2014';
@@ -138,10 +145,11 @@ pub(crate) const DASHBOARD_SERVER_SCRIPT: &str = r#"
         })
         .then(function(data) {
           if (!data) return;
-          applyStatus(data);
           saveToken(tok);
           hideLogin();
-          loadBrowseData();
+          applyStatus(data);
+          if (state.view === 'setup') showSetup();
+          else loadBrowseData();
         })
         .catch(function(ex) {
           if (err) {
@@ -444,6 +452,7 @@ pub(crate) const DASHBOARD_SERVER_SCRIPT: &str = r#"
   };
 
   const refresh = () => {
+    if (state.view === 'setup' || state.view === 'continuity') return;
     state.query = (ui.search.value || '').trim().toLowerCase();
     state.project = ui.project.value;
     state.agent = ui.agent.value;
@@ -642,30 +651,313 @@ pub(crate) const DASHBOARD_SERVER_SCRIPT: &str = r#"
     } catch (_) {}
   };
 
+  /* --- full-stage first-run onboarding ----------------------------------- */
+  const onboarding = {
+    data: null, hydrated: false, autoOpened: false, busy: false,
+    building: false, finishing: false, pollTimer: null, loading: null,
+    suggestions: null, discovering: null, editedFields: new Set(),
+  };
+  const phraseFields = {
+    intent_keywords: 'ctx-ob-intent-keywords', task_action_heads: 'ctx-ob-task-heads',
+    decision_policy: 'ctx-ob-decision-policy', requirement_markers: 'ctx-ob-requirement-markers',
+    question_markers: 'ctx-ob-question-markers',
+  };
+  const obText = (id, value) => { const node = $(id); if (node) node.textContent = value; };
+  const obBadge = (id, label, tone) => {
+    const node = $(id);
+    if (node) { node.textContent = label; node.dataset.tone = tone || ''; }
+  };
+  const setOnboardingReadiness = (required) => {
+    obBadge('ctx-ob-readiness', required ? 'Setup needed' : 'Configured', required ? 'attention' : 'ready');
+  };
+  const onboardingJson = async (url, payload) => {
+    const opts = payload === undefined ? {} : {
+      method: 'POST', body: JSON.stringify(payload),
+      headers: { 'content-type': 'application/json', 'x-ai-contexters-action': 'regenerate' },
+    };
+    const response = await apiFetch(url, opts);
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok || body.ok === false) throw new Error(body.detail || body.error || ('HTTP ' + response.status));
+    if (url === '/api/onboarding' && body.ok !== true) throw new Error('Setup save was not confirmed by the server');
+    return body;
+  };
+  // Some markers deliberately end in a space. Preserve the saved dictionary.
+  const phraseLines = (id) => ($(id).value || '').split(/\r?\n/).filter((line) => line.trim());
+  const personalPhrases = () => {
+    const payload = {};
+    Object.keys(phraseFields).forEach((key) => { payload[key] = phraseLines(phraseFields[key]); });
+    const quick = $('ctx-onboarding-phrases');
+    payload.phrases = quick ? phraseLines('ctx-onboarding-phrases') : [];
+    return payload;
+  };
+  const updateOnboardingButtons = () => {
+    ['ctx-ob-complete-btn', 'ctx-ob-save-phrases'].forEach((id) => {
+      const button = $(id);
+      if (button) button.disabled = !onboarding.data || onboarding.busy || onboarding.building;
+    });
+    const quick = $('ctx-onboarding-save');
+    if (quick) quick.disabled = onboarding.busy || onboarding.building;
+    const index = $('ctx-index');
+    if (index) index.disabled = onboarding.busy || onboarding.building;
+    $('ctx-ob-progress').hidden = !onboarding.building;
+    $('ctx-ob-finish').setAttribute('aria-busy', String(onboarding.busy || onboarding.building));
+  };
+  const updateEmbedderFields = () => {
+    const backend = $('ctx-ob-backend').value;
+    $('ctx-ob-cloud-fields').hidden = backend !== 'cloud';
+    $('ctx-ob-local-fields').hidden = backend === 'cloud';
+    const saved = (onboarding.data || {}).embedder || {};
+    const sameEnv = $('ctx-ob-cloud-key-env').value === (saved.cloud_api_key_env || '');
+    obBadge('ctx-ob-key-status', !sameEnv ? 'Save setup to check this environment name'
+      : (saved.cloud_api_key_present ? 'Key present in server environment' : 'Key not present in server environment'),
+    sameEnv && saved.cloud_api_key_present ? 'ready' : 'attention');
+    const sameProfile = $('ctx-ob-profile').value === saved.profile;
+    obText('ctx-ob-model-status', sameProfile && saved.model_cached
+      ? 'Selected model is cached on this machine.' : 'Model may need a download when dense indexing starts. Lexical search needs no model.');
+  };
+  const renderOnboardingState = (data) => {
+    onboarding.data = data;
+    onboarding.building = data.rebuilding === true;
+    setOnboardingReadiness(data.survey_required);
+    obText('ctx-ob-home', data.home_dir || 'Not reported');
+    obText('ctx-ob-phrases-path', data.phrases_path || 'Not reported');
+    obText('ctx-ob-config-path', data.config_path || 'Not reported');
+    const sources = $('ctx-ob-source-list');
+    sources.replaceChildren();
+    (data.sources || []).forEach((source) => {
+      const item = document.createElement('li');
+      const name = document.createElement('strong'); name.textContent = source.label || source.agent;
+      const status = document.createElement('span'); status.className = 'ob-status';
+      status.textContent = source.detected ? String(source.session_files || 0) + ' session files on disk' : 'Not detected';
+      status.dataset.tone = source.detected ? 'ready' : '';
+      const path = document.createElement('code'); path.textContent = source.root_path || 'No directory reported';
+      item.append(name, status, path); sources.appendChild(item);
+    });
+    if (!sources.children.length) {
+      const item = document.createElement('li'); item.textContent = 'No agent source directories were reported on this machine.'; sources.appendChild(item);
+    }
+    const services = data.services || {};
+    obText('ctx-ob-mcp-address', '127.0.0.1:' + (services.mcp_port || 8044));
+    obBadge('ctx-ob-mcp-status', services.mcp_service_healthy ? 'Healthy' : (services.mcp_service_installed ? 'Installed · not healthy' : 'Not installed'), services.mcp_service_healthy ? 'ready' : 'attention');
+    obBadge('ctx-ob-reindex-status', services.reindex_schedule_installed ? 'Scheduled' : 'Not installed', services.reindex_schedule_installed ? 'ready' : 'attention');
+    const index = data.index || {};
+    obText('ctx-ob-catalog-count', String(index.catalog_sessions || 0));
+    obText('ctx-ob-index-count', String(index.indexed_documents || 0));
+    // Polling refreshes facts, never edits-in-progress or client selections.
+    if (!onboarding.hydrated) {
+      const fill = (id, value) => { if (!onboarding.editedFields.has(id)) $(id).value = value; };
+      const phrases = data.phrases || {};
+      Object.keys(phraseFields).forEach((key) => { fill(phraseFields[key], (phrases[key] || []).join('\n')); });
+      const embedder = data.embedder || {};
+      fill('ctx-ob-backend', embedder.backend || 'auto');
+      fill('ctx-ob-profile', embedder.profile || 'base');
+      fill('ctx-ob-cloud-url', embedder.cloud_url || '');
+      fill('ctx-ob-cloud-model', embedder.cloud_model || '');
+      fill('ctx-ob-cloud-key-env', embedder.cloud_api_key_env || '');
+      const clients = $('ctx-ob-mcp-clients'); clients.replaceChildren();
+      (data.mcp_clients || []).forEach((client) => {
+        const label = document.createElement('label'); label.className = 'ob-check';
+        const checkbox = document.createElement('input'); checkbox.type = 'checkbox'; checkbox.value = client.id;
+        checkbox.checked = !!client.detected; checkbox.disabled = !client.detected;
+        const description = document.createElement('span');
+        description.textContent = (client.label || client.id) + (client.detected ? (client.wired ? ' · wired' : ' · available to wire') : ' · not detected');
+        const path = document.createElement('small'); path.className = 'meta'; path.textContent = client.config_path || '';
+        description.appendChild(path); label.append(checkbox, description); clients.appendChild(label);
+      });
+      if (!clients.children.length) clients.textContent = 'No supported MCP clients detected.';
+      onboarding.hydrated = true;
+    }
+    updateEmbedderFields();
+    updateOnboardingButtons();
+    obText('ctx-ob-status', data.rebuilding ? 'Building your corpus. You can keep reading setup while it runs.'
+      : (data.ready ? 'This machine is configured. Review or update your setup below.' : 'Review the five pillars, then complete setup.'));
+    if (data.rebuilding) {
+      obText('ctx-ob-finish-status', 'Building catalog and index… ' + (index.catalog_sessions || 0) + ' sessions · ' + (index.indexed_documents || 0) + ' indexed documents.');
+    } else if (onboarding.finishing) {
+      onboarding.finishing = false;
+      if (data.ready && !data.survey_required) {
+        obText('ctx-ob-finish-status', 'Setup complete. Your corpus is ready.');
+        if (state.view === 'setup') showSessions();
+        else if (state.view === 'sessions') loadBrowseData();
+      } else {
+        obText('ctx-ob-finish-status', 'The build stopped, but setup is not ready. Review the service and index status, then retry.');
+      }
+    } else if (!onboarding.busy) {
+      obText('ctx-ob-finish-status', data.ready ? 'Ready to update settings and rebuild your corpus.' : 'Ready to save settings and build your first index.');
+    }
+  };
+  const loadOnboardingState = () => {
+    if (onboarding.loading) return onboarding.loading;
+    onboarding.loading = onboardingJson('/api/onboarding/state').then((data) => {
+      if (typeof data.ready !== 'boolean' || typeof data.survey_required !== 'boolean') throw new Error('Unrecognized onboarding state response');
+      renderOnboardingState(data);
+      return data;
+    }).finally(() => { onboarding.loading = null; });
+    return onboarding.loading;
+  };
+  const scheduleOnboardingPoll = () => {
+    clearTimeout(onboarding.pollTimer);
+    if (!onboarding.building) return;
+    onboarding.pollTimer = setTimeout(async () => {
+      try { await loadOnboardingState(); }
+      catch (error) { obText('ctx-ob-finish-status', 'Could not refresh build status: ' + error.message + '. Retrying…'); }
+      scheduleOnboardingPoll();
+    }, 1500);
+  };
+  const showPhraseSuggestions = (data) => {
+    obText('ctx-ob-discovery-status', String(data.scanned_sessions || 0) + ' sessions · ' + String(data.scanned_utterances || 0) + ' utterances scanned on disk.');
+    const samples = $('ctx-ob-matched-samples'); samples.replaceChildren();
+    data.matched_samples.forEach((sample) => {
+      const item = document.createElement('li'); item.textContent = sample.text;
+      const meta = document.createElement('small'); meta.textContent = sample.entry_type + ' · confidence ' + sample.confidence;
+      item.appendChild(meta); samples.appendChild(item);
+    });
+    if (!samples.children.length) {
+      const item = document.createElement('li'); item.textContent = 'No matched utterances in the scanned sessions. Paste your own lines into the preview below.'; samples.appendChild(item);
+    }
+    const chips = $('ctx-ob-candidates'); chips.replaceChildren();
+    data.candidate_openers.forEach((candidate) => {
+      const bucket = Object.hasOwn(phraseFields, candidate.suggested_bucket) ? candidate.suggested_bucket : 'intent_keywords';
+      const chip = document.createElement('button'); chip.type = 'button'; chip.className = 'ob-chip';
+      chip.textContent = candidate.phrase + ' · ' + candidate.count + ' · ' + bucket.replace(/_/g, ' ');
+      chip.title = candidate.sample_line || candidate.phrase;
+      chip.addEventListener('click', () => {
+        const input = $(phraseFields[bucket]);
+        const lines = phraseLines(phraseFields[bucket]);
+        if (!lines.includes(candidate.phrase)) input.value = lines.concat([candidate.phrase]).join('\n');
+        onboarding.editedFields.add(input.id);
+        chip.disabled = true; chip.textContent = 'Added · ' + candidate.phrase;
+        obText('ctx-ob-phrase-status', 'Added to ' + bucket.replace(/_/g, ' ') + '. Save personal phrases to activate it.');
+      });
+      chips.appendChild(chip);
+    });
+    if (!chips.children.length) chips.textContent = 'No candidate openers found in this sample.';
+  };
+  const loadPhraseSuggestions = (force) => {
+    if (onboarding.discovering) return onboarding.discovering;
+    if (!force && onboarding.suggestions) return Promise.resolve();
+    $('ctx-ob-discover-phrases').disabled = true;
+    obText('ctx-ob-discovery-status', 'Scanning real session utterances on disk…');
+    onboarding.discovering = onboardingJson('/api/onboarding/phrase-suggestions').then((data) => {
+      if (!Array.isArray(data.matched_samples) || !Array.isArray(data.candidate_openers)) throw new Error('Unrecognized phrase discovery response');
+      onboarding.suggestions = data; showPhraseSuggestions(data);
+    }).catch((error) => {
+      obText('ctx-ob-discovery-status', 'Discovery unavailable: ' + error.message + '. Use Discover to retry.');
+    }).finally(() => { onboarding.discovering = null; $('ctx-ob-discover-phrases').disabled = false; });
+    return onboarding.discovering;
+  };
+  const showSetup = () => {
+    state.view = 'setup';
+    markNav($('ctx-nav-setup'));
+    showContinuity(false);
+    $('ctx-layout').hidden = true;
+    $('ctx-onboarding-studio').hidden = false;
+    document.body.classList.add('setup-view');
+    $('ctx-ob-title').focus();
+    loadOnboardingState().then(scheduleOnboardingPoll).catch((error) => {
+      obText('ctx-ob-status', 'Setup status unavailable: ' + error.message + '. Refresh setup status to retry.');
+    });
+    loadPhraseSuggestions(false);
+  };
+  const savePersonalPhrases = async () => {
+    if (!onboarding.data || onboarding.busy || onboarding.building) return;
+    onboarding.busy = true; updateOnboardingButtons();
+    obText('ctx-ob-phrase-status', 'Saving personal phrases…');
+    try {
+      await onboardingJson('/api/onboarding', Object.assign(personalPhrases(), {
+        install_services: false, install_reindex_schedule: false, wire_mcp_clients: false,
+        selected_mcp_clients: [], build_initial_index: false,
+      }));
+      obText('ctx-ob-phrase-status', 'Personal phrases saved. Preview now uses your additions.');
+      await loadOnboardingState();
+    } catch (error) { obText('ctx-ob-phrase-status', 'Could not save phrases: ' + error.message); }
+    finally { onboarding.busy = false; updateOnboardingButtons(); }
+  };
+  const completeOnboarding = async () => {
+    if (!onboarding.data || onboarding.busy || onboarding.building) return;
+    const clients = Array.from($('ctx-ob-mcp-clients').querySelectorAll('input:checked')).map((input) => input.value);
+    const payload = Object.assign(personalPhrases(), {
+      embedder: {
+        backend: $('ctx-ob-backend').value, profile: $('ctx-ob-profile').value,
+        cloud_url: $('ctx-ob-cloud-url').value.trim(), cloud_model: $('ctx-ob-cloud-model').value.trim(),
+        cloud_api_key_env: $('ctx-ob-cloud-key-env').value.trim(),
+      },
+      install_services: $('ctx-ob-install-services').checked,
+      install_reindex_schedule: $('ctx-ob-install-reindex').checked,
+      wire_mcp_clients: clients.length > 0, selected_mcp_clients: clients, build_initial_index: true,
+    });
+    if (payload.embedder.backend === 'cloud' && (!payload.embedder.cloud_url || !payload.embedder.cloud_model)) {
+      obText('ctx-ob-finish-status', 'Enter the HTTP endpoint URL and model before completing setup.'); return;
+    }
+    onboarding.busy = true; updateOnboardingButtons();
+    obText('ctx-ob-finish-status', 'Saving settings and starting the initial index build…');
+    try {
+      // Drain any earlier status read so it cannot settle this new build.
+      if (onboarding.loading) await onboarding.loading;
+      const result = await onboardingJson('/api/onboarding', payload);
+      if (!result.index_started && !result.rebuilding) throw new Error('Settings saved, but the index build was not started');
+      onboarding.finishing = true; onboarding.building = true; updateOnboardingButtons();
+      obText('ctx-ob-finish-status', 'Index build started. Waiting for catalog and index status…');
+      try { await loadOnboardingState(); }
+      catch (error) { obText('ctx-ob-finish-status', 'Build accepted; status unavailable: ' + error.message + '. Retrying…'); }
+      scheduleOnboardingPoll();
+    } catch (error) { obText('ctx-ob-finish-status', 'Setup could not complete: ' + error.message); }
+    finally { onboarding.busy = false; updateOnboardingButtons(); }
+  };
+  const previewOnboardingPhrases = async () => {
+    const lines = phraseLines('ctx-ob-preview-input');
+    const results = $('ctx-ob-preview-results'); results.replaceChildren();
+    const message = (text) => { const item = document.createElement('li'); item.textContent = text; results.appendChild(item); };
+    if (!lines.length) { message('Paste at least one sample line to test.'); return; }
+    $('ctx-ob-preview-btn').disabled = true; message('Testing against the active dictionary…');
+    try {
+      const data = await onboardingJson('/api/onboarding/preview-phrases', { lines: lines });
+      if (!Array.isArray(data.results)) throw new Error('Unrecognized preview response');
+      results.replaceChildren();
+      data.results.forEach((result) => {
+        const item = document.createElement('li'); item.textContent = result.line;
+        const meta = document.createElement('small');
+        meta.textContent = result.matched ? (result.entry_types || []).join(', ') + ' · confidence ' + result.max_confidence : 'No match';
+        item.appendChild(meta); results.appendChild(item);
+      });
+    } catch (error) { results.replaceChildren(); message('Preview unavailable: ' + error.message); }
+    finally { $('ctx-ob-preview-btn').disabled = false; }
+  };
+
   const studio = () => {
+    $('ctx-onboarding-studio').querySelectorAll('textarea, input, select').forEach((input) => {
+      ['input', 'change'].forEach((event) => input.addEventListener(event, () => onboarding.editedFields.add(input.id)));
+    });
+    const openStudio = $('ctx-open-onboarding-studio');
+    if (openStudio) openStudio.addEventListener('click', showSetup);
+    $('ctx-ob-discover-phrases').addEventListener('click', () => loadPhraseSuggestions(true));
+    $('ctx-ob-save-phrases').addEventListener('click', savePersonalPhrases);
+    $('ctx-ob-preview-btn').addEventListener('click', previewOnboardingPhrases);
+    $('ctx-ob-complete-btn').addEventListener('click', completeOnboarding);
+    $('ctx-ob-backend').addEventListener('change', updateEmbedderFields);
+    $('ctx-ob-profile').addEventListener('change', updateEmbedderFields);
+    $('ctx-ob-cloud-key-env').addEventListener('input', updateEmbedderFields);
+    $('ctx-ob-retry').addEventListener('click', () => {
+      loadOnboardingState().then(scheduleOnboardingPoll).catch((error) => {
+        obText('ctx-ob-status', 'Setup status unavailable: ' + error.message);
+      });
+    });
     const onboard = $('ctx-onboarding');
     const survey = $('ctx-onboarding-phrases');
     const surveySave = $('ctx-onboarding-save');
     const surveyStatus = $('ctx-onboarding-status');
-    if (surveySave && survey) surveySave.addEventListener('click', () => {
+    if (surveySave && survey) surveySave.addEventListener('click', async () => {
+      if (onboarding.busy || onboarding.building) return;
       const phrases = survey.value.split(/\n/).map((line) => line.trim()).filter(Boolean);
-      apiFetch('/api/onboarding', {
-        method: 'POST',
-        body: JSON.stringify({ phrases: phrases }),
-        headers: { 'content-type': 'application/json', 'x-ai-contexters-action': 'regenerate' }
-      })
-        .then((r) => r.json())
-        .then((body) => {
-          if (!surveyStatus) return;
-          if (!body.ok) {
-            surveyStatus.textContent = body.detail || 'Not saved.';
-            return;
-          }
-          const service = body.service ? ' Background service: ' + body.service + '.' : '';
-          surveyStatus.textContent = 'Saved on this machine.' + service;
-          if (onboard) onboard.open = false;
-        })
-        .catch(() => { if (surveyStatus) surveyStatus.textContent = 'Not saved.'; });
+      onboarding.busy = true; updateOnboardingButtons();
+      try {
+        const body = await onboardingJson('/api/onboarding', { phrases: phrases });
+        const service = body.service ? ' Background service: ' + body.service + '.' : '';
+        if (surveyStatus) surveyStatus.textContent = 'Saved on this machine.' + service;
+        if (onboard) onboard.open = false;
+        loadOnboardingState().then(scheduleOnboardingPoll).catch(() => {});
+      } catch (error) { if (surveyStatus) surveyStatus.textContent = 'Not saved: ' + error.message; }
+      finally { onboarding.busy = false; updateOnboardingButtons(); }
     });
     const phrases = $('ctx-phrases');
     const phraseStatus = $('ctx-phrases-status');
@@ -726,6 +1018,9 @@ pub(crate) const DASHBOARD_SERVER_SCRIPT: &str = r#"
   const railNav = document.querySelector('.rail-nav');
   if (railNav) railNav.appendChild(navContinuity);
   const showContinuity = (visible) => {
+    $('ctx-onboarding-studio').hidden = true;
+    document.body.classList.remove('setup-view');
+    if (visible) state.view = 'continuity';
     continuityPanel.hidden = !visible;
     const layout = $('ctx-layout');
     if (layout) layout.hidden = visible;
@@ -815,9 +1110,13 @@ pub(crate) const DASHBOARD_SERVER_SCRIPT: &str = r#"
   const navIntents = $('ctx-nav-intents');
   const navSetup = $('ctx-nav-setup');
   const markNav = (active) => {
-    document.querySelectorAll('.rail-nav-item').forEach(function(btn) { btn.classList.toggle('active', btn === active); });
+    document.querySelectorAll('.rail-nav-item').forEach(function(btn) {
+      btn.classList.toggle('active', btn === active);
+      if (btn === active) btn.setAttribute('aria-current', 'page');
+      else btn.removeAttribute('aria-current');
+    });
   };
-  if (navSessions) navSessions.addEventListener('click', function() {
+  const showSessions = () => {
     markNav(navSessions);
     state.view = 'sessions';
     showContinuity(false);
@@ -825,19 +1124,15 @@ pub(crate) const DASHBOARD_SERVER_SCRIPT: &str = r#"
     if (ui.list) ui.list.scrollTop = 0;
     if (ui.search) ui.search.focus();
     loadBrowseData();
-  });
+  };
+  if (navSessions) navSessions.addEventListener('click', showSessions);
   if (navIntents) navIntents.addEventListener('click', function() {
     markNav(navIntents);
     showContinuity(false);
     setTimeBtnActive(state.intentHours === 0 ? '' : (state.intentHours === 720 ? '30d' : ''));
     loadIntents();
   });
-  if (navSetup) navSetup.addEventListener('click', function() {
-    markNav(navSetup);
-    showContinuity(false);
-    const onboard = $('ctx-onboarding');
-    if (onboard) onboard.open = true;
-  });
+  if (navSetup) navSetup.addEventListener('click', showSetup);
 
   const boot = () => {
     readUrlState();
@@ -866,7 +1161,7 @@ pub(crate) const DASHBOARD_SERVER_SCRIPT: &str = r#"
         const onboard = $('ctx-onboarding');
         if (onboard && data.survey_required) onboard.open = true;
         if (data.rebuilding) showCorpusBusy();
-        loadBrowseData();
+        if (state.view !== 'setup') loadBrowseData();
       })
       .catch(function() { loadBrowseData(); });
   };
