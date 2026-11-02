@@ -68,7 +68,7 @@ for arg in "$@"; do
     --no-extract) AICX_INSTALL_EXTRACT="0" ;;
     --pick-embedder) AICX_EMBEDDER_PICKER="1" ;;
     --no-embedder-prompt) AICX_EMBEDDER_PICKER="0" ;;
-    --embedder-profile=*) AICX_EMBEDDER_PROFILE="${arg#*=}" ;;
+    --embedder-profile=*|--with-embeddings=*) AICX_EMBEDDER_PROFILE="${arg#*=}" ;;
     --help|-h)
       echo "Usage: install.sh [--skip-install] [--dry-run] [--force]"
       echo "  Install aicx + aicx-mcp and configure MCP for Claude Code, Codex, and Gemini."
@@ -98,11 +98,13 @@ for arg in "$@"; do
       echo "  default: AICX_EMBEDDER_PROFILE=base    # F2LLM 0.6B Q4_K_M GGUF"
       echo "  dev:     AICX_EMBEDDER_PROFILE=dev     # F2LLM 1.7B Q4_K_M GGUF"
       echo "  premium: AICX_EMBEDDER_PROFILE=premium # F2LLM 1.7B Q6_K GGUF"
+      echo "  max:     AICX_EMBEDDER_PROFILE=max     # F2LLM 4B Q4_K_M GGUF (~2.5 GB)"
       echo "  build:   cargo build --release --features native-embedder"
       echo ""
       echo "Native embedder picker:"
       echo "  --pick-embedder                    # interactive config for ~/.aicx/embedder.toml"
-      echo "  --embedder-profile=base|dev|premium"
+      echo "  --embedder-profile=base|dev|premium|max|4b"
+      echo "  --with-embeddings=max|4b           # alias; saves profile, download remains opt-in"
       echo "  --no-embedder-prompt               # suppress interactive picker"
       echo "  note: writes only AICX local embedder preferences"
       echo ""
@@ -203,6 +205,7 @@ embedder_repo_for_profile() {
     base) echo "mradermacher/F2LLM-v2-0.6B-GGUF" ;;
     dev) echo "mradermacher/F2LLM-v2-1.7B-GGUF" ;;
     premium) echo "mradermacher/F2LLM-v2-1.7B-GGUF" ;;
+    max|4b|4B|f2llm-4b) echo "Codefuse-AI/F2LLM-v2-4B-GGUF" ;;
     *) return 1 ;;
   esac
 }
@@ -212,6 +215,7 @@ embedder_file_for_profile() {
     base) echo "F2LLM-v2-0.6B.Q4_K_M.gguf" ;;
     dev) echo "F2LLM-v2-1.7B.Q4_K_M.gguf" ;;
     premium) echo "F2LLM-v2-1.7B.Q6_K.gguf" ;;
+    max|4b|4B|f2llm-4b) echo "F2LLM-v2-4B.Q4_K_M.gguf" ;;
     *) return 1 ;;
   esac
 }
@@ -435,8 +439,11 @@ maybe_configure_native_embedder() {
       base|dev|premium)
         selected_profile="$explicit_profile"
         ;;
+      max|4b|4B|f2llm-4b)
+        selected_profile="max"
+        ;;
       *)
-        echo "Error: unsupported --embedder-profile='$explicit_profile' (expected base, dev, premium, or none)." >&2
+        echo "Error: unsupported embedder profile='$explicit_profile' (expected base, dev, premium, max/4b, or none)." >&2
         exit 1
         ;;
     esac
@@ -462,9 +469,14 @@ maybe_configure_native_embedder() {
     echo "  4) Premium"
     echo "     F2LLM 1.7B Q6_K GGUF"
     echo "     Approx. 1.4 GB"
-    echo "     Highest local quality, largest download."
+    echo "     Higher precision than Dev."
     echo ""
-    printf "Select profile [1-4]: "
+    echo "  5) Max (4B)"
+    echo "     F2LLM 4B Q4_K_M GGUF, 2560 dimensions"
+    echo "     Approx. 2.5 GB"
+    echo "     Largest local model; requires more memory."
+    echo ""
+    printf "Select profile [1-5]: "
     read -r reply || true
     case "${reply:-1}" in
       1|"")
@@ -475,6 +487,7 @@ maybe_configure_native_embedder() {
       2) selected_profile="base" ;;
       3) selected_profile="dev" ;;
       4) selected_profile="premium" ;;
+      5) selected_profile="max" ;;
       *)
         echo "  native embedder picker: invalid choice, skipping"
         AICX_EMBEDDER_SETUP_DETAIL="No local embedder profile was configured; invalid picker choice was ignored."

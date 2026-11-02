@@ -17,6 +17,8 @@ pub const DEFAULT_DEV_REPO: &str = "mradermacher/F2LLM-v2-1.7B-GGUF";
 pub const DEFAULT_DEV_FILENAME: &str = "F2LLM-v2-1.7B.Q4_K_M.gguf";
 pub const DEFAULT_PREMIUM_REPO: &str = "mradermacher/F2LLM-v2-1.7B-GGUF";
 pub const DEFAULT_PREMIUM_FILENAME: &str = "F2LLM-v2-1.7B.Q6_K.gguf";
+pub const DEFAULT_MAX_REPO: &str = "Codefuse-AI/F2LLM-v2-4B-GGUF";
+pub const DEFAULT_MAX_FILENAME: &str = "F2LLM-v2-4B.Q4_K_M.gguf";
 
 const LEGACY_MINILM_REPO: &str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2";
 const LEGACY_HARRIER_REPO: &str = "microsoft/harrier-oss-v1-0.6b";
@@ -28,6 +30,7 @@ pub fn profile_spec(profile: EmbeddingProfile) -> EmbeddingProfileSpec {
             profile,
             repo: DEFAULT_BASE_REPO,
             filename: DEFAULT_BASE_FILENAME,
+            model_id: "F2LLM-v2-0.6B-Q4_K_M",
             dimension_hint: 1024,
             approx_size: "~397 MB",
             description: "portable F2LLM 0.6B Q4_K_M",
@@ -36,6 +39,7 @@ pub fn profile_spec(profile: EmbeddingProfile) -> EmbeddingProfileSpec {
             profile,
             repo: DEFAULT_DEV_REPO,
             filename: DEFAULT_DEV_FILENAME,
+            model_id: "F2LLM-v2-1.7B-Q4_K_M",
             dimension_hint: 2048,
             approx_size: "~1.1 GB",
             description: "workstation F2LLM 1.7B Q4_K_M",
@@ -44,9 +48,19 @@ pub fn profile_spec(profile: EmbeddingProfile) -> EmbeddingProfileSpec {
             profile,
             repo: DEFAULT_PREMIUM_REPO,
             filename: DEFAULT_PREMIUM_FILENAME,
+            model_id: "F2LLM-v2-1.7B-Q6_K",
             dimension_hint: 2048,
             approx_size: "~1.4 GB",
             description: "stronger F2LLM 1.7B Q6_K",
+        },
+        EmbeddingProfile::Max => EmbeddingProfileSpec {
+            profile,
+            repo: DEFAULT_MAX_REPO,
+            filename: DEFAULT_MAX_FILENAME,
+            model_id: "F2LLM-v2-4B-Q4_K_M",
+            dimension_hint: 2560,
+            approx_size: "~2.5 GB",
+            description: "large F2LLM 4B Q4_K_M",
         },
     }
 }
@@ -506,6 +520,21 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static UNIQ: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn native_max_config_selects_the_4b_model() {
+        for alias in ["max", "4b", "4B", "f2llm-4b"] {
+            let text = format!("[native_embedder]\nbackend = \"gguf\"\nprofile = {alias:?}\n");
+            let file: NativeEmbedderConfigFile = toml::from_str(&text).unwrap();
+            let mut config = EmbeddingConfig::default();
+            apply_section(&mut config, file.native_embedder.unwrap());
+            let resolved = resolve_model(&config);
+            assert_eq!(resolved.profile, EmbeddingProfile::Max);
+            assert_eq!(resolved.repo, DEFAULT_MAX_REPO);
+            assert_eq!(resolved.filename, DEFAULT_MAX_FILENAME);
+            assert_eq!(resolved.dimension_hint, 2560);
+        }
+    }
 
     fn tmp_dir(label: &str) -> PathBuf {
         let pid = std::process::id();
