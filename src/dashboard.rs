@@ -513,7 +513,8 @@ pub fn render_server_shell_html_for(title: &str, local_open: bool, show_survey: 
                   <option value="base">0.6B · 1024d · ~397 MB — fast daily default</option>
                   <option value="dev">1.7B Q4_K_M · 2048d · ~1.1 GB</option>
                   <option value="premium">1.7B Q6_K · 2048d · ~1.4 GB</option>
-                  <option value="max">4B Q4_K_M · 2560d · ~2.5 GB</option>
+                  <option value="large">4B Q4_K_M · 2560d · ~2.5 GB</option>
+                  <option value="max">8B Q4_K_M · 4096d · ~4.9 GB — max local</option>
                 </select></label>
                 <p id="ctx-ob-model-status" class="meta"></p>
               </div>
