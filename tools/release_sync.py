@@ -5,8 +5,13 @@ This script keeps the release-visible version honest across:
 
 - Cargo.toml
 - distribution/npm package manifests
-- versioned install / publish examples in docs
+- maintainer tag / publish examples in docs
 - CHANGELOG-derived release notes extraction
+
+Stranger install blocks in README.md and docs/RELEASES.md stay unpinned.
+They follow the `@loctree/aicx` dist-tag and the latest GitHub Release.
+`check` rejects a tag-pinned install.sh URL and the unscoped `aicx` npm/PyPI
+install commands in those blocks.
 
 Usage:
     python3 tools/release_sync.py bump patch
@@ -86,19 +91,63 @@ def replace_once(
     return new_text
 
 
+PINNED_INSTALL_SH_RE = re.compile(
+    r"https://raw\.githubusercontent\.com/Loctree/aicx/v\d+\.\d+\.\d+/install\.sh"
+)
+UNSCOPED_NPM_RE = re.compile(r"npm\s+(?:i|install)\s+(?:-g\s+)?aicx\b")
+UNSCOPED_PIP_RE = re.compile(r"pip\s+install\s+aicx\b")
+PUBLIC_INSTALL_SNIPPETS = (
+    "npm install -g @loctree/aicx",
+    "https://raw.githubusercontent.com/Loctree/aicx/main/install.sh",
+    "AICX_INSTALL_MODE=release",
+)
+
+
+def section_until_next_heading(text: str, heading: str) -> str:
+    start = text.find(heading)
+    if start < 0:
+        return ""
+    rest = text[start + len(heading) :]
+    next_heading = re.search(r"^## ", rest, flags=re.MULTILINE)
+    if next_heading is None:
+        return text[start:]
+    return text[start : start + len(heading) + next_heading.start()]
+
+
+def public_install_errors(path: pathlib.Path, text: str) -> list[str]:
+    label = root_relative(path)
+    errors: list[str] = []
+    for snippet in PUBLIC_INSTALL_SNIPPETS:
+        if snippet not in text:
+            errors.append(f"{label} install block is missing {snippet!r}")
+    if PINNED_INSTALL_SH_RE.search(text):
+        errors.append(
+            f"{label} pins install.sh to a release tag; bootstrap it from main"
+        )
+    if UNSCOPED_NPM_RE.search(text):
+        errors.append(f"{label} suggests the unscoped npm package aicx")
+    if UNSCOPED_PIP_RE.search(text):
+        errors.append(f"{label} suggests the unscoped PyPI package aicx")
+    return errors
+
+
+def validate_public_install_docs() -> list[str]:
+    errors: list[str] = []
+    readme = ROOT / "README.md"
+    errors.extend(public_install_errors(readme, readme.read_text(encoding="utf-8")))
+
+    releases = ROOT / "docs" / "RELEASES.md"
+    releases_text = releases.read_text(encoding="utf-8")
+    user_install = section_until_next_heading(releases_text, "## User Install")
+    if not user_install:
+        errors.append("docs/RELEASES.md is missing a '## User Install' section")
+    else:
+        errors.extend(public_install_errors(releases, user_install))
+    return errors
+
+
 def make_text_surfaces(version: str) -> tuple[TextSurface, ...]:
     return (
-        TextSurface(
-            path=ROOT / "README.md",
-            transforms=(
-                (
-                    r"(AICX_RELEASE_TAG=v)\d+\.\d+\.\d+",
-                    rf"\g<1>{version}",
-                    0,
-                    "README install example",
-                ),
-            ),
-        ),
         TextSurface(
             path=ROOT / "docs" / "RELEASES.md",
             transforms=(
@@ -106,7 +155,7 @@ def make_text_surfaces(version: str) -> tuple[TextSurface, ...]:
                     r"(AICX_RELEASE_TAG=v)\d+\.\d+\.\d+",
                     rf"\g<1>{version}",
                     0,
-                    "docs/RELEASES install example",
+                    "docs/RELEASES smoke tag",
                 ),
                 (
                     r'git tag -as? v\d+\.\d+\.\d+ -m "(?:(?:ai-contexters|aicx) v|Release v)\d+\.\d+\.\d+"',
@@ -353,6 +402,8 @@ def command_check(args: argparse.Namespace) -> int:
             "Release surfaces are out of sync for "
             f"{expected}: {', '.join(changed)}"
         )
+
+    errors.extend(validate_public_install_docs())
 
     if errors:
         for error in errors:

@@ -5,7 +5,10 @@ registry, npm wrapper, and Homebrew are secondary distribution surfaces; none
 of them replaces the signed GitHub asset set.
 
 `Cargo.toml` owns the semantic version. `CHANGELOG.md` owns release notes.
-`tools/release_sync.py` keeps versioned install and npm examples aligned.
+`tools/release_sync.py` keeps maintainer tag examples and npm manifests aligned
+with that version. The stranger install blocks in `README.md` and below stay
+unpinned, so they keep installing the current published release instead of the
+workspace version, which can be ahead of GitHub and npm.
 
 ## Canonical Asset Set
 
@@ -58,16 +61,27 @@ cold-install smoke as one release-contract change.
 
 ## User Install
 
-Download the installer from the same immutable tag as the desired release:
+Strangers install the current published build. Leave the release tag unset so
+the installer resolves the latest GitHub Release. The `install.sh` URL below
+is only the bootstrap script; the binaries come from that release.
 
 ```bash
-curl -fsSLO https://raw.githubusercontent.com/Loctree/aicx/v0.12.0/install.sh
-AICX_INSTALL_MODE=release AICX_RELEASE_TAG=v0.14.0 bash install.sh
+npm install -g @loctree/aicx
 ```
 
-Release mode selects the platform archive, downloads its adjacent `.sha256`,
+The npm package is `@loctree/aicx`. The unscoped name `aicx` on npm and on
+PyPI belongs to other projects.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Loctree/aicx/main/install.sh -o install.sh
+AICX_INSTALL_MODE=release bash install.sh
+```
+
+Release mode selects the platform archive from the latest GitHub Release
+(`AICX_RELEASE_TAG` defaults to `latest`), downloads its adjacent `.sha256`,
 verifies the digest, and delegates to the installer inside the verified
-bundle. It installs `aicx` and `aicx-mcp` into `~/.local/bin`.
+bundle. It installs `aicx` and `aicx-mcp` into `~/.local/bin`. Set
+`AICX_RELEASE_TAG=vX.Y.Z` only when a smoke or rollback must hit one tag.
 
 For an unreleased checkout, use the local source path:
 
@@ -159,7 +173,9 @@ runtime acceptance is operator-deferred.
 
 ## Verification
 
-Verify a downloaded asset without trusting its filename:
+Verify a downloaded asset without trusting its filename. The curls below are a
+worked example of the asset names. A machine install uses the User Install
+section, which tracks the latest GitHub Release.
 
 ```bash
 curl -fsSLO https://github.com/Loctree/aicx/releases/download/v0.12.0/loctree-release-pubkey.asc
@@ -222,9 +238,31 @@ complete. The workflow checks the three release archive names and their
 checksums, validates package metadata, publishes platform packages first, then
 the wrapper. See `distribution/npm/PUBLISHING.md`.
 
-The crates.io lane is source/library distribution, not the primary user-facing
-binary release. `make publish-crates-dry` validates the leaf crates; the full
-topological upload is an explicit maintainer action.
+The crates.io lane is source/library distribution for library consumers.
+`cargo install aicx` follows that registry. A GitHub Release does not move it.
+
+That lag is not a manifest defect. Workspace crates version-track `Cargo.toml`,
+none set `publish = false`, and none use git-only dependencies.
+`.github/workflows/release.yml` publishes the signed GitHub Release and then
+calls `npm-publish.yml`. It never runs `cargo publish`. Nothing in CI will
+move the registry forward.
+
+Catching crates.io up to the version in `Cargo.toml` is a maintainer action
+from that commit, with a crates.io API token for an owner:
+
+```bash
+make publish-crates-dry
+make publish-crates
+```
+
+`make publish-crates` uploads the current workspace version in dependency
+order (`aicx-parser`, `aicx-embeddings`, `aicx-monitor`,
+`aicx-progress-contracts`, `aicx-retrieve`, then `aicx`). It does not backfill
+versions that were never uploaded, and it is not part of tagging a release.
+The crates.io index can take a minute to show a crate just uploaded; if a
+later crate in that list cannot resolve its sibling, rerun the same target
+after the index updates. `AICX_INSTALL_MODE=crates` stays unsupported in
+`install.sh`.
 
 ## Deployment Surface
 

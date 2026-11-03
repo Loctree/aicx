@@ -10,6 +10,54 @@ owns session identity and topical project attribution.
 
 There is no per-frame card mill and no `aicx store` command.
 
+## Install
+
+Install the current published build. The commands below follow the
+`@loctree/aicx` dist-tag and the latest GitHub Release. Unreleased `main` stays
+on the contributor path.
+
+```bash
+npm install -g @loctree/aicx
+```
+
+The package name is `@loctree/aicx`. The unscoped name `aicx` on npm and on
+PyPI belongs to other projects.
+
+On macOS and Linux, the same published build can be installed from the latest
+GitHub Release:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Loctree/aicx/main/install.sh -o install.sh
+AICX_INSTALL_MODE=release bash install.sh
+```
+
+That script is only the installer. It selects this machine's archive from
+the latest GitHub Release (`AICX_RELEASE_TAG` defaults to `latest`), verifies
+the adjacent SHA-256, and installs `aicx` and `aicx-mcp` into `~/.local/bin`.
+Add `~/.local/bin` to `PATH` when it is not already there. Set
+`AICX_RELEASE_TAG=vX.Y.Z` when you need one specific release.
+
+Windows: use the npm command above, or take the `x86_64-pc-windows-msvc` zip
+from the [latest release](https://github.com/Loctree/aicx/releases/latest) and
+run `aicx.exe`.
+
+`cargo install aicx` follows crates.io. That registry is the library lane. The
+release workflow leaves it for a maintainer to publish with
+`make publish-crates`; a GitHub Release does not move it. See
+[Releases](docs/RELEASES.md).
+
+Contributors, from a checkout:
+
+```bash
+cargo install --path . --locked --force --bin aicx --bin aicx-mcp
+
+# Native GGUF embedder support:
+cargo install --path . --locked --force --features native-embedder \
+  --bin aicx --bin aicx-mcp
+```
+
+Channel order and shadow checks: [install-paths.md](docs/install-paths.md).
+
 ## Runtime model
 
 1. **Catalog** — `~/.aicx/catalog/sessions.jsonl` maps a session to project,
@@ -140,31 +188,6 @@ See [ORACLE_CORPUS.md](docs/ORACLE_CORPUS.md).
 
 Use `aicx --help` and `aicx <command> --help` for the authoritative grammar.
 The maintained overview is [COMMANDS.md](docs/COMMANDS.md).
-
-## Installation
-
-GitHub Release bundles are the supported user-facing path:
-
-```bash
-curl -fsSLO https://raw.githubusercontent.com/Loctree/aicx/v0.12.0/install.sh
-AICX_INSTALL_MODE=release AICX_RELEASE_TAG=v0.14.0 bash install.sh
-```
-
-The installer selects the published bundle for the current platform, verifies
-its adjacent SHA-256 sidecar, and installs both `aicx` and `aicx-mcp`.
-
-For contributors working from a checkout:
-
-```bash
-cargo install --path . --locked --force --bin aicx --bin aicx-mcp
-
-# Native GGUF embedder support:
-cargo install --path . --locked --force --features native-embedder \
-  --bin aicx --bin aicx-mcp
-```
-
-See [install-paths.md](docs/install-paths.md) and
-[RELEASES.md](docs/RELEASES.md).
 
 ## Development
 
