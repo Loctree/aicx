@@ -10,6 +10,7 @@
 //! structured recipient/audience metadata. Dictation has no addressee and is
 //! excluded. Names use AICX's Unicode/diacritic-folded, case-insensitive match.
 use std::collections::BTreeMap;
+use std::fs;
 use std::path::Path;
 
 use anyhow::Result;
@@ -2059,17 +2060,25 @@ pub fn write_continuity_file(
     targets: &[String],
     written_at: DateTime<Utc>,
 ) -> Result<ContinuityWriteReport> {
-    let existing = match std::fs::read_to_string(path) {
-        Ok(content) if !content.trim().is_empty() => Some(content),
-        _ => None,
+    use std::io::Read;
+    let existing = match fs::OpenOptions::new().read(true).open(path) {
+        Ok(mut file) => {
+            let mut content = String::new();
+            if file.read_to_string(&mut content).is_ok() && !content.trim().is_empty() {
+                Some(content)
+            } else {
+                None
+            }
+        }
+        Err(_) => None,
     };
 
     let Some(existing_content) = existing else {
         let rendered = render_for_targets(pack, mode, for_inject, targets, written_at)?;
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            std::fs::create_dir_all(parent)?;
+            fs::create_dir_all(parent)?;
         }
-        std::fs::write(path, &rendered)?;
+        fs::write(path, &rendered)?;
         return Ok(ContinuityWriteReport {
             content: rendered,
             appended: false,
@@ -2222,7 +2231,7 @@ pub fn write_continuity_file(
 
     let mut combined = existing_content;
     combined.push_str(&append_block);
-    std::fs::write(path, &combined)?;
+    fs::write(path, &combined)?;
 
     Ok(ContinuityWriteReport {
         content: combined,

@@ -1218,7 +1218,9 @@ fn load_source_dense_checkpoint(
     if !path.is_file() {
         return Ok(HashMap::new());
     }
-    let file = std::fs::File::open(path)
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .open(path)
         .with_context(|| format!("open dense checkpoint: {}", path.display()))?;
     let mut reader = BufReader::new(file);
     let mut header_line = String::new();
@@ -1328,7 +1330,7 @@ fn embed_chunks_for_semantic(
 
         let hybrid_root = crate::vector_index::hybrid_root_dir(None)?;
         let checkpoint_dir = hybrid_root.join(SOURCE_DENSE_CHECKPOINT_DIR);
-        std::fs::create_dir_all(&checkpoint_dir)?;
+        fs::create_dir_all(&checkpoint_dir)?;
         let expected_header = SourceDenseCheckpointHeader {
             schema: SOURCE_DENSE_CHECKPOINT_SCHEMA.to_string(),
             source_fingerprint: source_fingerprint.to_string(),
@@ -1344,7 +1346,11 @@ fn embed_chunks_for_semantic(
 
         if !checkpoint_path.is_file() {
             use std::io::Write;
-            let mut file = std::fs::File::create(&checkpoint_path)?;
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&checkpoint_path)?;
             serde_json::to_writer(&mut file, &expected_header)?;
             file.write_all(b"\n")?;
             file.sync_all()?;
