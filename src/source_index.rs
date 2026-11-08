@@ -1353,10 +1353,11 @@ fn embed_chunks_for_semantic(
         let mut valid_reused: HashMap<String, Vec<f32>> = HashMap::new();
         for chunk in chunks {
             let hash = source_chunk_content_hash(chunk);
-            if let Some((stored_hash, emb)) = reusable.remove(&chunk.id) {
-                if stored_hash == hash && emb.len() == fingerprint.dim {
-                    valid_reused.insert(chunk.id.clone(), emb);
-                }
+            if let Some((stored_hash, emb)) = reusable.remove(&chunk.id)
+                && stored_hash == hash
+                && emb.len() == fingerprint.dim
+            {
+                valid_reused.insert(chunk.id.clone(), emb);
             }
         }
         let reused_count = valid_reused.len();

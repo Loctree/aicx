@@ -2150,12 +2150,12 @@ impl AicxMcpServer {
 
 #[rmcp::tool_handler]
 impl rmcp::handler::server::ServerHandler for AicxMcpServer {
-    fn get_info(&self) -> ServerInfo {
+    fn get_info(&self) -> ServerConfig {
         // `tool_router` is read by the `#[tool_handler]`-expanded `call_tool`,
         // `list_tools`, and `get_tool` methods; rust 1.95 dead_code analysis
         // doesn't traverse macro expansions, so anchor the read here.
         let _ = &self.tool_router;
-        ServerInfo::new(
+        ServerConfig::new(
             ServerCapabilities::builder()
                 .enable_tools()
                 .enable_tool_list_changed()

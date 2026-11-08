@@ -601,7 +601,7 @@ fn copilot_public_pipeline_and_incremental_append() {
         // (outside_window=1, qualified_sources=0). Size the window from the
         // fixture's real age instead; 720h stays the floor.
         let continuity_hours = {
-            let event = chrono::DateTime::parse_from_rfc3339(EVENT_TIME).unwrap();
+            let event = chrono::DateTime::parse_from_rfc3339(event_time()).unwrap();
             let age_hours = chrono::Utc::now().signed_duration_since(event).num_hours();
             (age_hours + 24).max(720)
         };
