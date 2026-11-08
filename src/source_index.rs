@@ -2150,7 +2150,11 @@ fn parse_catalog_source_checked(
     if entry.agent == "codex" && source_bytes > MAX_FULL_PARSE_BYTES {
         return parse_large_codex_signal_checked(entry, &path, allow, session_kind.as_deref());
     }
-    if source_bytes > MAX_FULL_PARSE_BYTES {
+    let is_agy = matches!(
+        entry.agent.as_str(),
+        "agy" | "antigravity" | "antigravity-cli"
+    );
+    if !is_agy && source_bytes > MAX_FULL_PARSE_BYTES {
         anyhow::bail!(
             "source is {} bytes (bounded full-parser limit is {} bytes)",
             source_bytes,
