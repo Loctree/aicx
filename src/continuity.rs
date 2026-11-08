@@ -1495,6 +1495,7 @@ fn render_addressed_section_for_targets(
     pack: &ContinuityPack,
     targets: &[String],
     seen_bus_lines: Option<&std::collections::BTreeSet<String>>,
+    prior_watermark: Option<DateTime<Utc>>,
 ) -> Result<(String, usize)> {
     if targets.is_empty() {
         return Ok((String::new(), 0));
@@ -1567,10 +1568,12 @@ fn render_addressed_section_for_targets(
             .then_with(|| a.recipients.cmp(&b.recipients))
     });
     let mut deduped_bus = 0usize;
-    if let Some(seen) = seen_bus_lines {
+    if seen_bus_lines.is_some() || prior_watermark.is_some() {
         messages.retain(|(_, msg)| {
             let fingerprint = bus_message_fingerprint(&msg.text, &msg.at.to_rfc3339());
-            if seen.contains(&fingerprint) {
+            let in_seen = seen_bus_lines.is_some_and(|seen| seen.contains(&fingerprint));
+            let in_watermark = prior_watermark.is_some_and(|wm| msg.at <= wm);
+            if in_seen || in_watermark {
                 deduped_bus += 1;
                 false
             } else {
@@ -1951,7 +1954,8 @@ pub fn render_for_targets(
         } else {
             prioritize_pack_for_targets(pack, &[])
         };
-        let (addressed, _) = render_addressed_section_for_targets(&effective_pack, &cleaned, None)?;
+        let (addressed, _) =
+            render_addressed_section_for_targets(&effective_pack, &cleaned, None, None)?;
         return Ok(render_with_addressed(
             &effective_pack,
             effective_inject,
@@ -1964,7 +1968,8 @@ pub fn render_for_targets(
     } else {
         prioritize_pack_for_targets(pack, &[])
     };
-    let (addressed, _) = render_addressed_section_for_targets(&effective_pack, &cleaned, None)?;
+    let (addressed, _) =
+        render_addressed_section_for_targets(&effective_pack, &cleaned, None, None)?;
     Ok(render_handoff_or_summary(
         &effective_pack,
         mode,
@@ -2003,11 +2008,19 @@ fn extract_existing_fingerprints(
 ) -> (
     std::collections::BTreeSet<String>,
     std::collections::BTreeSet<String>,
+    Option<DateTime<Utc>>,
 ) {
     let mut claim_keys = std::collections::BTreeSet::new();
     let mut bus_keys = std::collections::BTreeSet::new();
+    let mut latest_written_at: Option<DateTime<Utc>> = None;
     for raw_line in existing.lines() {
         let line = raw_line.trim();
+        if let Some(ts_str) = line.strip_prefix("- written_at: ")
+            && let Ok(parsed) = DateTime::parse_from_rfc3339(ts_str.trim())
+        {
+            let utc = parsed.with_timezone(&Utc);
+            latest_written_at = Some(latest_written_at.map_or(utc, |prev| prev.max(utc)));
+        }
         if let (Some(open_bracket), Some(close_bracket), Some(loc_pos)) =
             (line.find('['), line.find(']'), line.find("· locator="))
             && open_bracket < close_bracket
@@ -2039,7 +2052,7 @@ fn extract_existing_fingerprints(
             }
         }
     }
-    (claim_keys, bus_keys)
+    (claim_keys, bus_keys, latest_written_at)
 }
 
 /// Write or append a continuity pack/handoff/summary to `path`.
@@ -2089,12 +2102,21 @@ pub fn write_continuity_file(
     };
 
     let cleaned = normalize_targets(targets)?;
-    let (seen_claims, seen_bus) = extract_existing_fingerprints(&existing_content);
+    let (seen_claims, seen_bus, latest_written_at) =
+        extract_existing_fingerprints(&existing_content);
+    let prior_watermark = latest_written_at.filter(|wm| written_at > *wm);
     let mut new_records = Vec::new();
     let mut deduplicated_claims = 0usize;
     for record in &pack.records {
         let key = record_dedup_fingerprint(record);
-        if seen_claims.contains(&key) {
+        let covered_by_watermark = prior_watermark.is_some_and(|wm| {
+            record
+                .timestamp
+                .as_deref()
+                .and_then(|ts| DateTime::parse_from_rfc3339(ts).ok())
+                .is_some_and(|ts| ts.with_timezone(&Utc) <= wm)
+        });
+        if seen_claims.contains(&key) || covered_by_watermark {
             deduplicated_claims += 1;
         } else {
             new_records.push(record.clone());
@@ -2139,8 +2161,12 @@ pub fn write_continuity_file(
         ContinuityMode::Summary => "SUMMARY",
     };
 
-    let (addressed_delta, deduped_bus) =
-        render_addressed_section_for_targets(&delta_pack, &cleaned, Some(&seen_bus))?;
+    let (addressed_delta, deduped_bus) = render_addressed_section_for_targets(
+        &delta_pack,
+        &cleaned,
+        Some(&seen_bus),
+        prior_watermark,
+    )?;
 
     let mut append_block = String::new();
     if !existing_content.ends_with('\n') {
