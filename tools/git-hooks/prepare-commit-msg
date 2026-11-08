@@ -115,7 +115,9 @@ else
         value="$(printf '%s' "$value" | tr -d '[:space:]')"
         [ -n "$value" ] || continue
         if [ -n "$key_agent" ] && [ "$key_agent" != "$session_agent" ]; then
-            continue
+            if ! { [ "$key_agent" = "agy" ] && [ "$session_agent" = "gemini" ]; }; then
+                continue
+            fi
         fi
         session_raw="$value"
         session_source="$key"
@@ -128,6 +130,9 @@ CLAUDE_SESSION_ID claude
 CLAUDE_CODE_SESSION_ID claude
 CURSOR_CONVERSATION_ID cursor
 GEMINI_SESSION_ID gemini
+AGY_SESSION_ID agy
+ANTIGRAVITY_SESSION_ID agy
+ANTIGRAVITY_CONVERSATION_ID agy
 JUNIE_SESSION_ID junie
 KIMI_SESSION_ID kimi
 COPILOT_SESSION_ID copilot
@@ -148,7 +153,9 @@ EOF
         while read -r key key_agent; do
             [ -n "$key" ] || continue
             if [ -n "$key_agent" ] && [ "$key_agent" != "$session_agent" ]; then
-                aicx_cmd+=("-u" "$key")
+                if ! { [ "$key_agent" = "agy" ] && [ "$session_agent" = "gemini" ]; }; then
+                    aicx_cmd+=("-u" "$key")
+                fi
             fi
         done <<'EOF'
 AICX_SESSION_ID
@@ -158,6 +165,9 @@ CLAUDE_SESSION_ID claude
 CLAUDE_CODE_SESSION_ID claude
 CURSOR_CONVERSATION_ID cursor
 GEMINI_SESSION_ID gemini
+AGY_SESSION_ID agy
+ANTIGRAVITY_SESSION_ID agy
+ANTIGRAVITY_CONVERSATION_ID agy
 JUNIE_SESSION_ID junie
 KIMI_SESSION_ID kimi
 COPILOT_SESSION_ID copilot
@@ -166,10 +176,13 @@ PI_SESSION_ID omp
 GROK_SESSION_ID grok
 GROK_THREAD_ID grok
 EOF
+        if [ "$session_agent" != "agy" ] && [ "$session_agent" != "gemini" ]; then
+            aicx_cmd+=("-u" "ANTIGRAVITY_SOURCE_METADATA" "-u" "ANTIGRAVITY_AGENT" "-u" "ANTIGRAVITY_APP_DATA_DIR" "-u" "ANTIGRAVITY_CLI_ALIAS")
+        fi
         session_json="$("${aicx_cmd[@]}" aicx sessions current --json 2>/dev/null || true)"
         session_candidate="$(printf '%s\n' "$session_json" | sed -n 's/.*"session_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
         json_agent="$(printf '%s\n' "$session_json" | sed -n 's/.*"agent"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
-        if [ -n "$session_candidate" ] && [ "$json_agent" = "$session_agent" ]; then
+        if [ -n "$session_candidate" ] && { [ "$json_agent" = "$session_agent" ] || { [ "$json_agent" = "agy" ] && [ "$session_agent" = "gemini" ]; }; }; then
             session_raw="$session_candidate"
             session_source="aicx sessions current"
         elif [ -n "$session_candidate" ]; then
@@ -199,7 +212,7 @@ if [ -z "$session_rejected" ] && printf '%s' "$session_raw" | grep -Eq '^[0-9a-f
 elif [ -z "$session_rejected" ] && printf '%s' "$session_raw" \
     | grep -Eq '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'; then
     session_id="$(printf '%s' "$session_raw" | tr 'A-F' 'a-f')"
-elif [ -z "$session_rejected" ] && { [ "$session_agent" = "codex" ] || [ "$session_agent" = "claude" ] || [ "$session_agent" = "copilot" ] || [ "$session_agent" = "omp" ]; } \
+elif [ -z "$session_rejected" ] && { [ "$session_agent" = "codex" ] || [ "$session_agent" = "claude" ] || [ "$session_agent" = "copilot" ] || [ "$session_agent" = "omp" ] || [ "$session_agent" = "agy" ]; } \
     && printf '%s' "$session_raw" | grep -Eq "$codex_session_re"; then
     session_id="$session_raw"
 elif [ -z "$session_rejected" ] && [ "$session_agent" = "junie" ] \
