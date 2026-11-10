@@ -7,8 +7,8 @@ use llama_cpp_2::{
     context::params::{LlamaAttentionType, LlamaContextParams, LlamaPoolingType},
     llama_backend::LlamaBackend,
     llama_batch::LlamaBatch,
+    model::LlamaModel,
     model::params::LlamaModelParams,
-    model::{AddBos, LlamaModel},
 };
 use tracing::{info, warn};
 
@@ -102,10 +102,11 @@ impl LocalEmbeddingProvider for GgufEmbeddingProvider {
             // allocate a multi-million token vector before any token
             // truncation kicks in.
             crate::enforce_embed_input_budget(text).context("GGUF embed input rejected")?;
-            let mut tokens = self
-                .model
-                .str_to_token(text, AddBos::Always)
-                .context("failed to tokenize text for GGUF embeddings")?;
+            if text.contains('\0') {
+                return Err(anyhow!("text contains a NUL byte"))
+                    .context("failed to tokenize text for GGUF embeddings");
+            }
+            let mut tokens = self.model.vocab().tokenize(text.as_bytes(), true, true);
             if tokens.len() > self.max_length {
                 tokens.truncate(self.max_length);
             }
@@ -119,8 +120,15 @@ impl LocalEmbeddingProvider for GgufEmbeddingProvider {
 
         let n_ctx = NonZeroU32::new(u32::try_from(max_seq_len)?)
             .ok_or_else(|| anyhow!("GGUF context length must be non-zero"))?;
-        let n_batch = u32::try_from(total_tokens)?;
         let n_seq_max = u32::try_from(texts.len())?;
+        // llama.cpp 0.1.161 `graph_reserve` rounds `n_tokens` up to a multiple
+        // of `n_seqs` without rounding `n_outputs_pp`, which triggers
+        // `GGML_ASSERT(ggml_can_mul_mat(a, b))` in `build_pooling` for mean
+        // pooling unless `n_batch`/`n_ubatch` is already a multiple of `n_seq_max`.
+        let padded_batch_tokens = total_tokens
+            .checked_next_multiple_of(texts.len())
+            .ok_or_else(|| anyhow!("GGUF batch token count overflow"))?;
+        let n_batch = u32::try_from(padded_batch_tokens)?;
         let n_seq_batch = i32::try_from(texts.len())?;
 
         let mut params = LlamaContextParams::default()
