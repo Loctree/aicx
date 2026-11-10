@@ -3,17 +3,15 @@
 All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
-## [0.15.0] - 2026-09-28
+
+## [Unreleased]
+
+## [0.15.0] - 2026-11-10
 
 ### Added
 
 - A bare first start opens the dashboard onboarding survey. Intent phrases are written to `intent_phrases.toml`. On macOS the same path installs the LaunchAgent through `tools/install-mcp-service.sh`.
 - `aicx serve --transport http` is one listener: humans open `/`, agents use `/mcp`. Non-loopback binds keep bearer auth. The passphrase form stays off non-loopback binds, including `0.0.0.0`.
-
-## [Unreleased]
-
-### Added
-
 - Prebuilt `aicx` + `aicx-mcp` for Linux arm64 (glibc) and macOS x64 (Intel).
   New release assets `aicx-vX.Y.Z-aarch64-linux-gnu-slim.tar.gz`,
   `aicx_X.Y.Z-1_arm64.deb`, and the Developer ID-signed, notarized
@@ -72,6 +70,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- The native GGUF embedder builds against OpenSSL 4 (`llama-cpp-2` 0.1.161);
+  `llama.cpp`/`ggml` output, including Metal device initialization, stays off
+  stderr unless `AICX_LLAMA_LOGS` is set; text containing a NUL byte returns a
+  clear `failed to tokenize text for GGUF embeddings` error instead of reaching
+  the tokenizer. `make test-native-live` (`AICX_REQUIRE_NATIVE_MODEL=1`) fails
+  instead of skipping when the local GGUF model is missing.
+
 - Claude compaction summaries (`isCompactSummary` rows) are epoch context, not
   operator speech: they no longer surface in `aicx intents` as fresh decisions
   and intents stamped with the compaction time. `SIGNAL_FILTER_VERSION` moves to
@@ -109,6 +114,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   Protect persistent identity registries from malformed-cache replacement,
   serialize custom-root ownership, refuse time-dependent Grok projections, and
   redact source/session identifiers from cache diagnostics.
+
+### Security
+
+- Bump `rustls` from `0.23.40` to `0.23.46` in `Cargo.lock`.
 
 ### Turn-level project scope, decided by repository identity
 

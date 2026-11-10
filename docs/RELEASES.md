@@ -177,8 +177,8 @@ After review, runtime acceptance, and merge to `main`:
 The equivalent explicit tag commands are:
 
 ```bash
-git tag -as v0.14.0 -m "Release v0.14.0"
-git push origin v0.14.0
+git tag -as v0.15.0 -m "Release v0.15.0"
+git push origin v0.15.0
 ```
 
 Do not tag or push from a dirty tree, an unmerged branch, or a commit whose
@@ -215,7 +215,7 @@ URL, not the working tree or an existing `PATH` binary:
 
 ```bash
 smoke_home="$(mktemp -d)"
-HOME="$smoke_home" AICX_INSTALL_MODE=release AICX_RELEASE_TAG=v0.12.0 bash install.sh
+HOME="$smoke_home" AICX_INSTALL_MODE=release AICX_RELEASE_TAG=v0.15.0 bash install.sh
 HOME="$smoke_home" "$smoke_home/.local/bin/aicx" --version
 HOME="$smoke_home" "$smoke_home/.local/bin/aicx-mcp" --version
 ```

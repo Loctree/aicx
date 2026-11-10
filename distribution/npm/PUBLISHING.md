@@ -93,9 +93,9 @@ bypass 2fa tokens" — that retires the old `NPM_TOKEN` path for good.
 After staging the current host's signed release asset:
 
 ```bash
-node distribution/npm/sync-version.mjs 0.14.0
-node distribution/npm/stage-platform-package.mjs 0.14.0 darwin-arm64 /path/to/release-input
-node distribution/npm/verify-metadata.mjs 0.14.0 --platform=darwin-arm64
+node distribution/npm/sync-version.mjs 0.15.0
+node distribution/npm/stage-platform-package.mjs 0.15.0 darwin-arm64 /path/to/release-input
+node distribution/npm/verify-metadata.mjs 0.15.0 --platform=darwin-arm64
 ```
 
 Use the matching platform key on Linux or Windows. The verifier requires zero
