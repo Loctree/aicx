@@ -26,6 +26,12 @@ fn unique_home(tag: &str) -> PathBuf {
     root
 }
 
+fn plain_cli(cmd: &mut Command) -> &mut Command {
+    cmd.env_remove("CLICOLOR_FORCE")
+        .env_remove("FORCE_COLOR")
+        .env("NO_COLOR", "1")
+}
+
 fn run_bare(home: &Path, extra_env: &[(&str, &str)]) -> (String, String, bool) {
     static ENV_LOCK: Mutex<()> = Mutex::new(());
     let _guard = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
@@ -38,6 +44,7 @@ fn run_bare(home: &Path, extra_env: &[(&str, &str)]) -> (String, String, bool) {
     for (key, value) in extra_env {
         cmd.env(key, value);
     }
+    plain_cli(&mut cmd);
     let output = cmd.output().expect("run bare aicx");
     (
         String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -151,10 +158,9 @@ fn configured_home_prints_short_help_without_hidden_commands() {
 fn help_full_still_lists_power_user_commands() {
     static BIN: OnceLock<PathBuf> = OnceLock::new();
     let bin = BIN.get_or_init(aicx_bin);
-    let output = Command::new(bin)
-        .args(["--help-full"])
-        .output()
-        .expect("run --help-full");
+    let mut cmd = Command::new(bin);
+    plain_cli(&mut cmd).args(["--help-full"]);
+    let output = cmd.output().expect("run --help-full");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(output.status.success(), "aicx --help-full failed");
     for shown in ["catalog", "dashboard", "intents", "migrate"] {

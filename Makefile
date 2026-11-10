@@ -12,7 +12,7 @@ ifeq (,$(shell command -v cargo 2>/dev/null))
 endif
 
 .PHONY: all build build-native completions release-binaries install install-npm npm-install install-bin install-config install-cargo git-hooks install-schedule uninstall-schedule install-service uninstall-service
-.PHONY: hooks-test precheck precheck-native loctree-consumer-check test test-mcp-services test-native check fmt fmt-check clippy clippy-native semgrep ci clean help manifest-check
+.PHONY: hooks-test precheck precheck-native loctree-consumer-check test test-mcp-services test-native test-native-live check fmt fmt-check clippy clippy-native semgrep ci clean help manifest-check
 .PHONY: embeddings-check embeddings-test embeddings-clippy embeddings-hydrate embeddings-info
 .PHONY: version version-show version-check version-check-selftest version-bump version-patch bump-patch changelog-close release-notes release-plan release-prepare release-check release-tag release-push package-check release-bundle release-bundle-only-binaries test-e2e
 .PHONY: publish-crates publish-crates-dry
@@ -193,6 +193,12 @@ test-mcp-services:
 test-native:
 	cargo test --locked -p aicx-embeddings --features gguf
 	cargo test --locked -p aicx --features native-embedder --test native_embedder
+
+# Same commands as test-native. A missing GGUF model fails instead of skipping.
+# CI calls the cargo lines itself and does not use this target.
+test-native-live:
+	AICX_REQUIRE_NATIVE_MODEL=1 cargo test --locked -p aicx-embeddings --features gguf
+	AICX_REQUIRE_NATIVE_MODEL=1 cargo test --locked -p aicx --features native-embedder --test native_embedder -- --nocapture
 
 # End-to-end pipeline test against operator's canonical ~/.aicx/config.toml.
 # Fail-fast when preconditions missing (no config, empty corpus, embedder
@@ -493,6 +499,7 @@ help:
 	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'check' '- Full local gate (fmt, check, clippy, test, build, semgrep)'
 	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'test' '- Run all tests'
 	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'test-native' '- Run native GGUF embedder tests'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'test-native-live' '- Native GGUF tests; missing model fails'
 	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'fmt' '- Format all Rust code'
 	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'clean' '- Clean build artifacts'
 	@printf '\n'
