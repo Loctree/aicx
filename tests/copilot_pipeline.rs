@@ -8,6 +8,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Output, Stdio};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -16,8 +17,23 @@ const SESSION_ID: &str = "11111111-2222-4333-8444-555555555555";
 const FIRST_TOKEN: &str = "copilotpipelineinitial91dbea";
 const APPEND_TOKEN: &str = "copilotpipelineappended47fdae";
 const TOOL_TOKEN: &str = "copilottoolexclusive893fed";
-const EVENT_TIME: &str = "2026-09-29T12:00:00Z";
 static FIXTURE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn event_time() -> &'static str {
+    static EVENT_TIME: OnceLock<String> = OnceLock::new();
+    EVENT_TIME.get_or_init(|| {
+        (chrono::Utc::now() - chrono::Duration::days(1))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    })
+}
+
+fn incumbent_watermark_time() -> &'static str {
+    static WATERMARK_TIME: OnceLock<String> = OnceLock::new();
+    WATERMARK_TIME.get_or_init(|| {
+        (chrono::Utc::now() - chrono::Duration::hours(12))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    })
+}
 
 /// Git hooks export repository-local variables. Fixtures must never inherit
 /// those coordinates, even for the git processes spawned by the CLI itself.
@@ -81,12 +97,13 @@ impl CopilotFixture {
         let dir = copilot_home.join("session-state").join(SESSION_ID);
         fs::create_dir_all(&dir).unwrap();
         let events = dir.join("events.jsonl");
+        let timestamp = event_time();
         let records = [
             event(
                 "start",
                 "session.start",
                 json!({
-                    "sessionId": SESSION_ID, "startTime": EVENT_TIME,
+                    "sessionId": SESSION_ID, "startTime": timestamp,
                     "context": {"cwd": cwd, "gitRoot": cwd, "branch": "main"},
                     "copilotVersion": "synthetic", "selectedModel": "copilot-test"
                 }),
@@ -144,10 +161,14 @@ impl CopilotFixture {
                 + "\n",
         )
         .unwrap();
-        fs::write(dir.join("workspace.yaml"), format!(
-            "id: {SESSION_ID}\ncwd: {}\nname: Synthetic Copilot pipeline\ncreated_at: {EVENT_TIME}\nupdated_at: {EVENT_TIME}\n",
-            cwd.display()
-        )).unwrap();
+        fs::write(
+            dir.join("workspace.yaml"),
+            format!(
+                "id: {SESSION_ID}\ncwd: {}\nname: Synthetic Copilot pipeline\ncreated_at: {timestamp}\nupdated_at: {timestamp}\n",
+                cwd.display()
+            ),
+        )
+        .unwrap();
         // Global telemetry and checkpoint copies are not independent sessions.
         fs::write(copilot_home.join("events.jsonl"), records[0].to_string()).unwrap();
         fs::create_dir_all(dir.join("checkpoints")).unwrap();
@@ -221,7 +242,7 @@ impl Drop for CopilotFixture {
 }
 
 fn event(id: &str, kind: &str, data: Value) -> Value {
-    json!({"id": id, "type": kind, "timestamp": EVENT_TIME, "parentId": null, "data": data})
+    json!({"id": id, "type": kind, "timestamp": event_time(), "parentId": null, "data": data})
 }
 
 fn assert_success(output: &Output) {
@@ -575,10 +596,19 @@ fn copilot_public_pipeline_and_incremental_append() {
                 .any(|item| item.to_string().contains(TOOL_TOKEN)),
             "tool output is not human intent: {mcp_intents}"
         );
+        // EVENT_TIME is a fixed instant, so a fixed 720h window silently
+        // dropped the fixture once the wall clock passed EVENT_TIME + 30 days
+        // (outside_window=1, qualified_sources=0). Size the window from the
+        // fixture's real age instead; 720h stays the floor.
+        let continuity_hours = {
+            let event = chrono::DateTime::parse_from_rfc3339(event_time()).unwrap();
+            let age_hours = chrono::Utc::now().signed_duration_since(event).num_hours();
+            (age_hours + 24).max(720)
+        };
         let continuity = mcp.tool(
             "aicx_continuity",
             json!({
-                "project": resolved["project"], "hours": 720
+                "project": resolved["project"], "hours": continuity_hours
             }),
         );
         assert_eq!(continuity["ok"], true, "{continuity}");
@@ -761,7 +791,8 @@ fn legacy_all_watermark_does_not_skip_the_new_copilot_provider() {
     let aicx_home = fixture.home.join(".aicx");
     fs::create_dir_all(&aicx_home).unwrap();
     let older_provider_key = "claude+codescribe+codex+cursor+gemini+grok+junie+kimi:all";
-    let old_watermark = chrono::DateTime::parse_from_rfc3339("2026-09-30T00:00:00Z")
+    let watermark_rfc3339 = incumbent_watermark_time();
+    let old_watermark = chrono::DateTime::parse_from_rfc3339(watermark_rfc3339)
         .unwrap()
         .with_timezone(&chrono::Utc);
     let mut state = aicx::state::StateManager::default();
@@ -792,7 +823,7 @@ fn legacy_all_watermark_does_not_skip_the_new_copilot_provider() {
         serde_json::from_slice(&fs::read(aicx_home.join("state.json")).unwrap()).unwrap();
     assert_eq!(
         migrated["last_processed"]["agy+claude+codescribe+codex+copilot+cursor+gemini+grok+junie+kimi+omp:all"],
-        "2026-09-30T00:00:00Z",
+        watermark_rfc3339,
         "incumbent watermark does not move backwards: {migrated}"
     );
     assert!(

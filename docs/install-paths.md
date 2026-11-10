@@ -11,7 +11,9 @@ resort — never a default, never a silent fallback:
 
 1. **npm** — `npm install -g @loctree/aicx` (prebuilt platform packages)
 2. **Release download (curl)** — `AICX_INSTALL_MODE=release bash install.sh`
-   (downloads + SHA256-verifies a prebuilt bundle)
+   (downloads + SHA256-verifies a prebuilt bundle). Bootstrap `install.sh`
+   from `main`. The script defaults `AICX_RELEASE_TAG` to the latest GitHub
+   Release, and the script URL stays on `main`.
 3. **Release bundle** — `bash install.sh` from an unpacked release archive
 4. _developer only_ — **Local source** / `make install-bin` → `cargo install`
 5. _developer only_ — **git** — `AICX_INSTALL_MODE=git`

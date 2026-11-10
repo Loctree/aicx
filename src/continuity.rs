@@ -10,6 +10,7 @@
 //! structured recipient/audience metadata. Dictation has no addressee and is
 //! excluded. Names use AICX's Unicode/diacritic-folded, case-insensitive match.
 use std::collections::BTreeMap;
+use std::fs;
 use std::path::Path;
 
 use anyhow::Result;
@@ -36,6 +37,29 @@ const PEER_CLAIM_CAP: usize = 3;
 const DECISION_CAP: usize = 15;
 const TASK_CAP: usize = 15;
 const SOURCE_CAP: usize = 20;
+
+/// Output mode for `aicx continuity show|write --for <MODE>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum ContinuityMode {
+    /// Full continuity pack (default).
+    #[default]
+    Pack,
+    /// Prompt-inject bounded continuity pack (~6k tokens).
+    Inject,
+    /// Structured handoff document with explicit pack-write and event timestamps.
+    Handoff,
+    /// Condensed executive continuity summary with explicit timestamps.
+    Summary,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContinuityWriteReport {
+    pub content: String,
+    pub appended: bool,
+    pub new_claims: usize,
+    pub deduplicated_claims: usize,
+    pub written_at: String,
+}
 
 pub struct ContinuityPack {
     pub selection: Vec<intents::SourceSelection>,
@@ -1355,6 +1379,895 @@ fn unresolved_intents(records: &[IntentRecord]) -> Vec<&IntentRecord> {
     });
     unresolved
 }
+
+fn normalize_targets(targets: &[String]) -> Result<Vec<String>> {
+    let mut cleaned = Vec::new();
+    for raw in targets {
+        for piece in raw.split(',') {
+            let trimmed = piece.trim();
+            anyhow::ensure!(!trimmed.is_empty(), "addressed target must not be empty");
+            let normalized = crate::sanitize::normalize_query(trimmed);
+            anyhow::ensure!(
+                !normalized.is_empty(),
+                "addressed target must contain an identifier or name"
+            );
+            if !cleaned
+                .iter()
+                .any(|existing: &String| existing.eq_ignore_ascii_case(trimmed))
+            {
+                cleaned.push(trimmed.to_string());
+            }
+        }
+    }
+    Ok(cleaned)
+}
+
+/// Match a session `(agent, session_id)` against a `--as <target>` selector:
+/// - `<agent>/<session_id_or_prefix>` (e.g. `agy/79c9a5ab`)
+/// - `<session_id>` or prefix of length >= 4 (e.g. `79c9a5ab` or full UUID)
+/// - `<agent>` provider name (e.g. `agy`, `antigravity`, `claude`, `codex`, `gemini`)
+pub fn session_matches_target(agent: &str, session_id: &str, raw_target: &str) -> bool {
+    let target = raw_target.trim().to_ascii_lowercase();
+    if target.is_empty() {
+        return false;
+    }
+    let agent_lc = agent.trim().to_ascii_lowercase();
+    let sid_lc = session_id.trim().to_ascii_lowercase();
+    let provider_matches = |candidate: &str| {
+        candidate == agent_lc
+            || (matches!(candidate, "antigravity" | "antigravity-cli" | "agy")
+                && matches!(agent_lc.as_str(), "agy" | "antigravity" | "antigravity-cli"))
+    };
+    if provider_matches(&target) {
+        return true;
+    }
+    if let Some((provider, sid_prefix)) = target.split_once('/') {
+        let provider = provider.trim();
+        let sid_prefix = sid_prefix.trim();
+        if (provider == "*" || provider_matches(provider))
+            && !sid_prefix.is_empty()
+            && (sid_lc == sid_prefix || (sid_prefix.len() >= 4 && sid_lc.starts_with(sid_prefix)))
+        {
+            return true;
+        }
+    }
+    sid_lc == target || (target.len() >= 4 && sid_lc.starts_with(&target))
+}
+
+pub fn session_matches_any_target(agent: &str, session_id: &str, targets: &[String]) -> bool {
+    targets
+        .iter()
+        .any(|target| session_matches_target(agent, session_id, target))
+}
+
+fn pack_has_matching_session(pack: &ContinuityPack, targets: &[String]) -> bool {
+    if targets.is_empty() {
+        return false;
+    }
+    pack.selection
+        .iter()
+        .any(|source| session_matches_any_target(&source.agent, &source.session_id, targets))
+        || pack
+            .records
+            .iter()
+            .any(|record| session_matches_any_target(&record.agent, &record.session_id, targets))
+}
+
+fn bus_message_matches_target(
+    message: &crate::importers::codescribe_bus::BusMessage,
+    raw_target: &str,
+) -> bool {
+    let normalized = crate::sanitize::normalize_query(raw_target);
+    if normalized.is_empty() {
+        return false;
+    }
+    let target_lc = raw_target.trim().to_ascii_lowercase();
+    if message.recipients.iter().any(|party| {
+        if party
+            .name
+            .as_deref()
+            .is_some_and(|name| crate::sanitize::normalize_query(name) == normalized)
+        {
+            return true;
+        }
+        if party.session != "*"
+            && session_matches_target(&party.provider, &party.session, raw_target)
+        {
+            return true;
+        }
+        party.provider != "broadcast"
+            && (party.provider.eq_ignore_ascii_case(&target_lc)
+                || (matches!(target_lc.as_str(), "agy" | "antigravity")
+                    && matches!(
+                        party.provider.to_ascii_lowercase().as_str(),
+                        "agy" | "antigravity" | "gemini"
+                    )))
+    }) {
+        return true;
+    }
+    message
+        .audience
+        .as_deref()
+        .is_some_and(|audience| crate::sanitize::normalize_query(audience) == normalized)
+}
+
+fn render_addressed_section_for_targets(
+    pack: &ContinuityPack,
+    targets: &[String],
+    seen_bus_lines: Option<&std::collections::BTreeSet<String>>,
+    prior_watermark: Option<DateTime<Utc>>,
+) -> Result<(String, usize)> {
+    if targets.is_empty() {
+        return Ok((String::new(), 0));
+    }
+    let user_home = crate::os_user_home()
+        .ok_or_else(|| anyhow::anyhow!("cannot resolve operator home for addressed speech"))?;
+    let now = DateTime::parse_from_rfc3339(&pack.window_end)?.with_timezone(&Utc);
+    let cutoff = intents::window_cutoff(now, pack.hours);
+    let mut messages: BTreeMap<
+        AddressedTakeKey,
+        (
+            Vec<std::path::PathBuf>,
+            crate::importers::codescribe_bus::BusMessage,
+        ),
+    > = BTreeMap::new();
+    let mut skipped = 0;
+    let mut open = 0;
+    let ledgers = crate::importers::codescribe_bus::discover_bus_ledgers(&user_home);
+    for ledger in &ledgers {
+        let replay = crate::importers::codescribe_bus::read_bus_ledger(ledger)?;
+        skipped += replay.skipped_records();
+        open += replay.open_takes;
+        for message in replay.messages {
+            if message.kind.is_human()
+                && message.at >= cutoff
+                && message.at <= now
+                && targets
+                    .iter()
+                    .any(|target| bus_message_matches_target(&message, target))
+            {
+                use crate::importers::codescribe_bus::BusMessageKind;
+                let key = message.take_id.as_ref().map_or_else(
+                    || AddressedTakeKey::Legacy {
+                        spoken: matches!(message.kind, BusMessageKind::Spoken { .. }),
+                        at: message.at,
+                        text: message
+                            .text
+                            .split_whitespace()
+                            .collect::<Vec<_>>()
+                            .join(" "),
+                    },
+                    |id| AddressedTakeKey::Take(id.clone()),
+                );
+                match messages.entry(key) {
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert((vec![ledger.clone()], message));
+                    }
+                    std::collections::btree_map::Entry::Occupied(mut entry) => {
+                        let (paths, kept) = entry.get_mut();
+                        if !paths.contains(ledger) {
+                            paths.push(ledger.clone());
+                        }
+                        kept.at = kept.at.min(message.at);
+                        kept.recipients.extend(message.recipients);
+                        kept.recipients.sort();
+                        kept.recipients.dedup();
+                        if matches!(message.kind, BusMessageKind::Spoken { certified: false }) {
+                            kept.kind = message.kind;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut messages: Vec<_> = messages.into_values().collect();
+    messages.sort_by(|(path_a, a), (path_b, b)| {
+        b.at.cmp(&a.at)
+            .then_with(|| path_a.cmp(path_b))
+            .then_with(|| a.text.cmp(&b.text))
+            .then_with(|| a.recipients.cmp(&b.recipients))
+    });
+    let mut deduped_bus = 0usize;
+    if seen_bus_lines.is_some() || prior_watermark.is_some() {
+        messages.retain(|(_, msg)| {
+            let fingerprint = bus_message_fingerprint(&msg.text, &msg.at.to_rfc3339());
+            let in_seen = seen_bus_lines.is_some_and(|seen| seen.contains(&fingerprint));
+            let in_watermark = prior_watermark.is_some_and(|wm| msg.at <= wm);
+            if in_seen || in_watermark {
+                deduped_bus += 1;
+                false
+            } else {
+                true
+            }
+        });
+    }
+    let heading_label = targets
+        .iter()
+        .map(|target| target.to_uppercase().replace(['\r', '\n'], " "))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut section = format!("## ADDRESSED TO {heading_label}\n\n");
+    section.push_str("- cross-project bus speech; structured recipients/audience/session targets; dictation has no addressee and is excluded\n");
+    if skipped > 0 || open > 0 {
+        section.push_str(&format!(
+            "- bus coverage: {skipped} skipped records; {open} open takes withheld (all ledgers, not window-scoped)\n"
+        ));
+    }
+    if deduped_bus > 0 {
+        section.push_str(&format!(
+            "- deduplicated_prior_bus_messages: {deduped_bus}\n"
+        ));
+    }
+    if messages.is_empty() {
+        section.push_str("- no addressed bus messages inside the window; absence is not proof of no assignment\n");
+    }
+    for (ledgers, message) in messages.iter().take(SOURCE_CAP) {
+        use crate::importers::codescribe_bus::BusMessageKind;
+        let kind = match message.kind {
+            BusMessageKind::Spoken { certified: true } => "voice",
+            BusMessageKind::Spoken { certified: false } => "voice, coverage refused",
+            BusMessageKind::Typed => "typed",
+            BusMessageKind::AgentReply => unreachable!("human messages only"),
+        };
+        let recipients = message
+            .recipients
+            .iter()
+            .map(|party| format!("{}/{}", party.provider, party.session))
+            .collect::<Vec<_>>()
+            .join(", ");
+        section.push_str(&format!(
+            "- [{}] {} · {} · recipients={} · source={}\n",
+            kind,
+            message.text.replace('\r', "\\r").replace('\n', "\\n"),
+            message.at.to_rfc3339(),
+            recipients,
+            ledgers
+                .iter()
+                .map(|ledger| printed_path(&ledger.to_string_lossy()))
+                .collect::<Vec<_>>()
+                .join(", "),
+        ));
+    }
+    if messages.len() > SOURCE_CAP {
+        section.push_str(&format!(
+            "- {} addressed messages omitted at section cap\n",
+            messages.len() - SOURCE_CAP
+        ));
+    }
+    section.push('\n');
+    Ok((section, deduped_bus))
+}
+
+/// Build a pack copy whose `selection`, `records`, and `sources` prioritize
+/// sessions matching `targets` when session targets (`--as <session_id|agent>`)
+/// are specified.
+fn prioritize_pack_for_targets(pack: &ContinuityPack, targets: &[String]) -> ContinuityPack {
+    let max_weight = pack
+        .selection
+        .iter()
+        .map(|s| s.human_messages)
+        .max()
+        .unwrap_or(0)
+        .saturating_add(10_000);
+    let selection = pack
+        .selection
+        .iter()
+        .map(|s| {
+            let mut cloned = s.clone();
+            if session_matches_any_target(&s.agent, &s.session_id, targets) {
+                cloned.human_messages = cloned.human_messages.saturating_add(max_weight);
+            }
+            cloned
+        })
+        .collect();
+    let mut sources: Vec<SourceLine> = pack
+        .sources
+        .iter()
+        .map(|s| SourceLine {
+            agent: s.agent.clone(),
+            path: s.path.clone(),
+            latest_activity: s.latest_activity.clone(),
+            live: s.live,
+            human_messages: s.human_messages,
+        })
+        .collect();
+    sources.sort_by(|a, b| {
+        let a_match = pack.selection.iter().any(|sel| {
+            sel.path == a.path && session_matches_any_target(&sel.agent, &sel.session_id, targets)
+        });
+        let b_match = pack.selection.iter().any(|sel| {
+            sel.path == b.path && session_matches_any_target(&sel.agent, &sel.session_id, targets)
+        });
+        b_match
+            .cmp(&a_match)
+            .then_with(|| b.human_messages.cmp(&a.human_messages))
+            .then_with(|| b.latest_activity.cmp(&a.latest_activity))
+            .then_with(|| a.path.cmp(&b.path))
+    });
+    ContinuityPack {
+        selection,
+        source_errors: pack.source_errors,
+        dropped_task_events: pack.dropped_task_events,
+        window_end: pack.window_end.clone(),
+        project_label: pack.project_label.clone(),
+        hours: pack.hours,
+        live_sessions: pack.live_sessions,
+        records: pack.records.clone(),
+        sources,
+        index_health: IndexHealthLine {
+            newest_session_updated_at: pack.index_health.newest_session_updated_at.clone(),
+            committed_at: pack.index_health.committed_at.clone(),
+            pending: pack.index_health.pending,
+            sessions_newer_than_chunks: pack.index_health.sessions_newer_than_chunks,
+            readiness: pack.index_health.readiness.clone(),
+            mode: pack.index_health.mode,
+        },
+        mixed_scope: pack.mixed_scope.clone(),
+        distilled_mixed: pack.distilled_mixed,
+        candidate_cap: pack.candidate_cap,
+        dropped_candidates: pack.dropped_candidates,
+        unplaced_scope: pack.unplaced_scope.clone(),
+        open_work: pack.open_work.clone(),
+    }
+}
+
+fn render_handoff_or_summary(
+    pack: &ContinuityPack,
+    mode: ContinuityMode,
+    for_inject: bool,
+    targets: &[String],
+    written_at: DateTime<Utc>,
+    addressed_section: &str,
+) -> String {
+    let is_summary = mode == ContinuityMode::Summary;
+    let heading_kind = if is_summary { "SUMMARY" } else { "HANDOFF" };
+    let end = DateTime::parse_from_rfc3339(&pack.window_end)
+        .ok()
+        .map(|time| time.with_timezone(&Utc));
+    let cutoff = end.map(|time| intents::window_cutoff(time, pack.hours));
+    let mut out = String::new();
+    out.push_str(&format!(
+        "# CONTINUITY {heading_kind} · {} · {}h\n\n",
+        pack.project_label, pack.hours
+    ));
+    out.push_str("## METADATA & TIMESTAMPS\n\n");
+    out.push_str(&format!("- written_at: {}\n", written_at.to_rfc3339()));
+    out.push_str(&format!(
+        "- event_window: [{}, {}] UTC\n",
+        cutoff
+            .map(|time| time.to_rfc3339())
+            .as_deref()
+            .unwrap_or("unknown"),
+        end.map(|time| time.to_rfc3339())
+            .as_deref()
+            .unwrap_or("unknown")
+    ));
+    out.push_str(&format!(
+        "- mode: {}\n",
+        if is_summary { "summary" } else { "handoff" }
+    ));
+    out.push_str(&format!(
+        "- targets: {}\n",
+        if targets.is_empty() {
+            "all project sessions".to_string()
+        } else {
+            targets.join(", ")
+        }
+    ));
+    let qualified = pack
+        .selection
+        .iter()
+        .filter(|source| source.status == "qualified")
+        .count();
+    out.push_str(&format!(
+        "- coverage: considered_sources={} · qualified_sources={qualified} · live_sessions={} · retained_records={} · source_errors={}\n\n",
+        pack.selection.len(),
+        pack.live_sessions,
+        pack.records.len(),
+        pack.source_errors
+    ));
+
+    let weights = session_human_weights(&pack.selection);
+    out.push_str("## FOCUS SESSIONS & ACTIVE STATE\n\n");
+    let mut session_groups: BTreeMap<(&str, &str), Vec<&IntentRecord>> = BTreeMap::new();
+    for record in &pack.records {
+        session_groups
+            .entry((record.agent.as_str(), record.session_id.as_str()))
+            .or_default()
+            .push(record);
+    }
+    for source in &pack.selection {
+        if source.status == "qualified" && source.human_messages > 0 {
+            session_groups
+                .entry((source.agent.as_str(), source.session_id.as_str()))
+                .or_default();
+        }
+    }
+    let mut ordered_sessions: Vec<_> = session_groups.into_iter().collect();
+    ordered_sessions.sort_by(|((agent_a, sid_a), recs_a), ((agent_b, sid_b), recs_b)| {
+        let target_a = session_matches_any_target(agent_a, sid_a, targets);
+        let target_b = session_matches_any_target(agent_b, sid_b, targets);
+        target_b
+            .cmp(&target_a)
+            .then_with(|| newest_record_time(recs_b).cmp(&newest_record_time(recs_a)))
+            .then_with(|| {
+                weight_of(&weights, agent_b, sid_b).cmp(&weight_of(&weights, agent_a, sid_a))
+            })
+            .then_with(|| agent_a.cmp(agent_b))
+            .then_with(|| sid_a.cmp(sid_b))
+    });
+    let session_cap = if is_summary { 5 } else { 10 };
+    if ordered_sessions.is_empty() {
+        out.push_str("- no active sessions with retained records inside the window\n");
+    }
+    for ((agent, session_id), records) in ordered_sessions.iter().take(session_cap) {
+        let is_target = session_matches_any_target(agent, session_id, targets);
+        let is_open = records.iter().any(|record| record.honesty.is_live_open());
+        let latest_event = newest_record_time(records)
+            .map(|time| time.to_rfc3339())
+            .unwrap_or_else(|| "unknown".to_string());
+        let mut tags = Vec::new();
+        if is_target {
+            tags.push("target");
+        }
+        if is_open {
+            tags.push("open");
+        }
+        let tag_suffix = if tags.is_empty() {
+            String::new()
+        } else {
+            format!(" [{}]", tags.join(", "))
+        };
+        out.push_str(&format!(
+            "- {agent} · {session_id}{tag_suffix} · human={} · latest_event_time={latest_event} · records={}\n",
+            weight_of(&weights, agent, session_id),
+            records.len()
+        ));
+    }
+    out.push('\n');
+
+    out.push_str("## LATEST HUMAN INTENTIONS & DECISIONS\n\n");
+    let mut human_claims: Vec<&IntentRecord> = pack
+        .records
+        .iter()
+        .filter(|record| {
+            human_record(record) && matches!(record.kind, IntentKind::Intent | IntentKind::Decision)
+        })
+        .collect();
+    human_claims.sort_by(|a, b| {
+        let target_a = session_matches_any_target(&a.agent, &a.session_id, targets);
+        let target_b = session_matches_any_target(&b.agent, &b.session_id, targets);
+        target_b
+            .cmp(&target_a)
+            .then_with(|| record_time(b).cmp(&record_time(a)))
+            .then_with(|| {
+                weight_of(&weights, b.agent.as_str(), b.session_id.as_str()).cmp(&weight_of(
+                    &weights,
+                    a.agent.as_str(),
+                    a.session_id.as_str(),
+                ))
+            })
+            .then_with(|| a.source_chunk.cmp(&b.source_chunk))
+    });
+    let human_cap = if is_summary { 6 } else { 15 };
+    if human_claims.is_empty() {
+        out.push_str("- no human intention or decision candidates retained inside the window\n");
+    }
+    for record in human_claims.into_iter().take(human_cap) {
+        let label = if record.kind == IntentKind::Intent {
+            "human intent candidate"
+        } else {
+            "human decision candidate"
+        };
+        out.push_str(&claim_line(record, label, ""));
+    }
+    out.push('\n');
+
+    out.push_str("## PEER & SESSION OUTCOMES\n\n");
+    let per_session_claim_cap = if is_summary { 2 } else { 5 };
+    if ordered_sessions.is_empty() {
+        out.push_str("- no session outcomes retained inside the window\n");
+    }
+    for ((agent, session_id), records) in ordered_sessions.into_iter().take(session_cap) {
+        if records.is_empty() {
+            continue;
+        }
+        let is_target = session_matches_any_target(agent, session_id, targets);
+        let latest_event = newest_record_time(&records)
+            .map(|time| time.to_rfc3339())
+            .unwrap_or_else(|| "unknown".to_string());
+        out.push_str(&format!(
+            "### {agent} · {session_id}{} · latest_event_time={latest_event}\n",
+            if is_target { " [target]" } else { "" }
+        ));
+        let mut sorted = records;
+        sorted.sort_by(|a, b| {
+            record_time(b)
+                .cmp(&record_time(a))
+                .then_with(|| human_record(b).cmp(&human_record(a)))
+                .then_with(|| a.source_chunk.cmp(&b.source_chunk))
+        });
+        for record in sorted.into_iter().take(per_session_claim_cap) {
+            out.push_str(&claim_line(
+                record,
+                &format!("{} candidate", record.kind.heading().to_lowercase()),
+                "  ",
+            ));
+        }
+    }
+    out.push('\n');
+
+    if !is_summary && let Some(open_work) = &pack.open_work {
+        let inject_not_before = if for_inject {
+            open_work_window_start(pack)
+        } else {
+            None
+        };
+        out.push_str(&crate::open_work::render_section(
+            open_work,
+            inject_not_before,
+        ));
+    }
+    out.push_str(addressed_section);
+
+    out.push_str("## SOURCES\n\n");
+    let source_cap = if is_summary { 8 } else { SOURCE_CAP };
+    if pack.sources.is_empty() {
+        out.push_str("- no source paths represented by retained records; see coverage above\n");
+    }
+    for source in pack.sources.iter().take(source_cap) {
+        out.push_str(&format!(
+            "- {} · human={} · latest_retained_claim_activity={} · {}{}\n",
+            source.agent,
+            source.human_messages,
+            source.latest_activity.as_deref().unwrap_or("unknown"),
+            printed_path(&source.path),
+            if source.live { " [unadmitted]" } else { "" }
+        ));
+    }
+    if for_inject { bounded_inject(out) } else { out }
+}
+
+/// Render a continuity pack according to `mode` (`pack`, `inject`, `handoff`,
+/// `summary`) and optional multi-target `--as` selectors (bus addressee names,
+/// `<session_id>` prefixes, `<agent>/<session_id>`, or agent names).
+pub fn render_for_targets(
+    pack: &ContinuityPack,
+    mode: ContinuityMode,
+    for_inject: bool,
+    targets: &[String],
+    written_at: DateTime<Utc>,
+) -> Result<String> {
+    let cleaned = normalize_targets(targets)?;
+    let effective_inject = for_inject || mode == ContinuityMode::Inject;
+    let has_session_match = pack_has_matching_session(pack, &cleaned);
+
+    if matches!(mode, ContinuityMode::Pack | ContinuityMode::Inject) {
+        if cleaned.is_empty() {
+            return Ok(render(pack, effective_inject));
+        }
+        if cleaned.len() == 1 && !has_session_match {
+            return render_as(pack, effective_inject, Some(&cleaned[0]));
+        }
+        let effective_pack = if has_session_match {
+            prioritize_pack_for_targets(pack, &cleaned)
+        } else {
+            prioritize_pack_for_targets(pack, &[])
+        };
+        let (addressed, _) =
+            render_addressed_section_for_targets(&effective_pack, &cleaned, None, None)?;
+        return Ok(render_with_addressed(
+            &effective_pack,
+            effective_inject,
+            &addressed,
+        ));
+    }
+
+    let effective_pack = if has_session_match {
+        prioritize_pack_for_targets(pack, &cleaned)
+    } else {
+        prioritize_pack_for_targets(pack, &[])
+    };
+    let (addressed, _) =
+        render_addressed_section_for_targets(&effective_pack, &cleaned, None, None)?;
+    Ok(render_handoff_or_summary(
+        &effective_pack,
+        mode,
+        effective_inject,
+        &cleaned,
+        written_at,
+        &addressed,
+    ))
+}
+
+fn record_dedup_fingerprint(record: &IntentRecord) -> String {
+    let locator = record
+        .provenance
+        .as_ref()
+        .map(|p| p.locator.as_str())
+        .unwrap_or(record.source_chunk.as_str());
+    let summary = record
+        .summary
+        .replace('\r', "\\r")
+        .replace('\n', "\\n")
+        .trim()
+        .to_string();
+    format!(
+        "[{} · {}]|locator={}|{}",
+        record.agent, record.session_id, locator, summary
+    )
+}
+
+fn bus_message_fingerprint(text: &str, timestamp_rfc3339: &str) -> String {
+    let clean_text = text.replace('\r', "\\r").replace('\n', "\\n");
+    format!("{clean_text} · {timestamp_rfc3339}")
+}
+
+fn extract_existing_fingerprints(
+    existing: &str,
+) -> (
+    std::collections::BTreeSet<String>,
+    std::collections::BTreeSet<String>,
+    Option<DateTime<Utc>>,
+) {
+    let mut claim_keys = std::collections::BTreeSet::new();
+    let mut bus_keys = std::collections::BTreeSet::new();
+    let mut latest_written_at: Option<DateTime<Utc>> = None;
+    for raw_line in existing.lines() {
+        let line = raw_line.trim();
+        if let Some(ts_str) = line.strip_prefix("- written_at: ")
+            && let Ok(parsed) = DateTime::parse_from_rfc3339(ts_str.trim())
+        {
+            let utc = parsed.with_timezone(&Utc);
+            latest_written_at = Some(latest_written_at.map_or(utc, |prev| prev.max(utc)));
+        }
+        if let (Some(open_bracket), Some(close_bracket), Some(loc_pos)) =
+            (line.find('['), line.find(']'), line.find("· locator="))
+            && open_bracket < close_bracket
+            && close_bracket < loc_pos
+        {
+            let bracket_part = &line[open_bracket..=close_bracket];
+            let after_loc = &line[loc_pos + "· locator=".len()..];
+            if let Some(loc_end) = after_loc.find(" · ") {
+                let locator = &after_loc[..loc_end];
+                if let Some(source_pos) = after_loc.find(" · source=") {
+                    let after_source = &after_loc[source_pos + " · source=".len()..];
+                    if let Some((_, summary)) = after_source.split_once(": ") {
+                        claim_keys.insert(format!(
+                            "{bracket_part}|locator={locator}|{}",
+                            summary.trim()
+                        ));
+                    }
+                }
+            }
+        }
+        if (line.starts_with("- [voice]")
+            || line.starts_with("- [voice, coverage refused]")
+            || line.starts_with("- [typed]"))
+            && let Some(close_kind) = line.find("] ")
+        {
+            let rest = &line[close_kind + 2..];
+            if let Some(rec_pos) = rest.find(" · recipients=") {
+                bus_keys.insert(rest[..rec_pos].to_string());
+            }
+        }
+    }
+    (claim_keys, bus_keys, latest_written_at)
+}
+
+/// Write or append a continuity pack/handoff/summary to `path`.
+///
+/// Doctrine:
+/// - `CONTINUITY.md` is NEVER overwritten when it already exists and is non-empty:
+///   prior entries are preserved and a new timestamped block is appended.
+/// - Every appended block carries explicit `written_at` (pack write timestamp)
+///   and `event_window` + per-event `timestamp` metadata.
+/// - `CONTINUITY.md` is NEVER a duplicate factory: when appending to an existing
+///   file, claims and addressed bus messages already recorded in earlier blocks
+///   are deduplicated so only new delta items are emitted.
+pub fn write_continuity_file(
+    path: &Path,
+    pack: &ContinuityPack,
+    mode: ContinuityMode,
+    for_inject: bool,
+    targets: &[String],
+    written_at: DateTime<Utc>,
+) -> Result<ContinuityWriteReport> {
+    use std::io::Read;
+    let existing = match fs::OpenOptions::new().read(true).open(path) {
+        Ok(mut file) => {
+            let mut content = String::new();
+            if file.read_to_string(&mut content).is_ok() && !content.trim().is_empty() {
+                Some(content)
+            } else {
+                None
+            }
+        }
+        Err(_) => None,
+    };
+
+    let Some(existing_content) = existing else {
+        let rendered = render_for_targets(pack, mode, for_inject, targets, written_at)?;
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(path, &rendered)?;
+        return Ok(ContinuityWriteReport {
+            content: rendered,
+            appended: false,
+            new_claims: pack.records.len(),
+            deduplicated_claims: 0,
+            written_at: written_at.to_rfc3339(),
+        });
+    };
+
+    let cleaned = normalize_targets(targets)?;
+    let (seen_claims, seen_bus, latest_written_at) =
+        extract_existing_fingerprints(&existing_content);
+    let prior_watermark = latest_written_at.filter(|wm| written_at > *wm);
+    let mut new_records = Vec::new();
+    let mut deduplicated_claims = 0usize;
+    for record in &pack.records {
+        let key = record_dedup_fingerprint(record);
+        let covered_by_watermark = prior_watermark.is_some_and(|wm| {
+            record
+                .timestamp
+                .as_deref()
+                .and_then(|ts| DateTime::parse_from_rfc3339(ts).ok())
+                .is_some_and(|ts| ts.with_timezone(&Utc) <= wm)
+        });
+        if seen_claims.contains(&key) || covered_by_watermark {
+            deduplicated_claims += 1;
+        } else {
+            new_records.push(record.clone());
+        }
+    }
+
+    let delta_sources = collect_sources(&pack.selection, &new_records, &pack.mixed_scope);
+    let delta_pack = ContinuityPack {
+        selection: pack.selection.clone(),
+        source_errors: pack.source_errors,
+        dropped_task_events: pack.dropped_task_events,
+        window_end: pack.window_end.clone(),
+        project_label: pack.project_label.clone(),
+        hours: pack.hours,
+        live_sessions: pack.live_sessions,
+        records: new_records,
+        sources: delta_sources,
+        index_health: IndexHealthLine {
+            newest_session_updated_at: pack.index_health.newest_session_updated_at.clone(),
+            committed_at: pack.index_health.committed_at.clone(),
+            pending: pack.index_health.pending,
+            sessions_newer_than_chunks: pack.index_health.sessions_newer_than_chunks,
+            readiness: pack.index_health.readiness.clone(),
+            mode: pack.index_health.mode,
+        },
+        mixed_scope: pack.mixed_scope.clone(),
+        distilled_mixed: pack.distilled_mixed,
+        candidate_cap: pack.candidate_cap,
+        dropped_candidates: pack.dropped_candidates,
+        unplaced_scope: pack.unplaced_scope.clone(),
+        open_work: pack.open_work.clone(),
+    };
+
+    let end = DateTime::parse_from_rfc3339(&pack.window_end)
+        .ok()
+        .map(|time| time.with_timezone(&Utc));
+    let cutoff = end.map(|time| intents::window_cutoff(time, pack.hours));
+    let mode_label = match mode {
+        ContinuityMode::Pack => "PACK",
+        ContinuityMode::Inject => "INJECT",
+        ContinuityMode::Handoff => "HANDOFF",
+        ContinuityMode::Summary => "SUMMARY",
+    };
+
+    let (addressed_delta, deduped_bus) = render_addressed_section_for_targets(
+        &delta_pack,
+        &cleaned,
+        Some(&seen_bus),
+        prior_watermark,
+    )?;
+
+    let mut append_block = String::new();
+    if !existing_content.ends_with('\n') {
+        append_block.push('\n');
+    }
+    append_block.push_str("\n---\n\n");
+    append_block.push_str(&format!(
+        "<!-- continuity-append mode={} written_at={} window_start={} window_end={} new_claims={} deduplicated_prior_claims={} deduplicated_prior_bus={} -->\n",
+        mode_label.to_ascii_lowercase(),
+        written_at.to_rfc3339(),
+        cutoff
+            .map(|time| time.to_rfc3339())
+            .as_deref()
+            .unwrap_or("unknown"),
+        end.map(|time| time.to_rfc3339())
+            .as_deref()
+            .unwrap_or("unknown"),
+        delta_pack.records.len(),
+        deduplicated_claims,
+        deduped_bus
+    ));
+
+    if delta_pack.records.is_empty()
+        && (cleaned.is_empty()
+            || addressed_delta.contains("- no addressed bus messages inside the window"))
+    {
+        append_block.push_str(&format!(
+            "# CONTINUITY DELTA ({mode_label}) · {} · {}h\n\n",
+            pack.project_label, pack.hours
+        ));
+        append_block.push_str(&format!("- written_at: {}\n", written_at.to_rfc3339()));
+        append_block.push_str(&format!(
+            "- event_window: [{}, {}] UTC\n",
+            cutoff
+                .map(|time| time.to_rfc3339())
+                .as_deref()
+                .unwrap_or("unknown"),
+            end.map(|time| time.to_rfc3339())
+                .as_deref()
+                .unwrap_or("unknown")
+        ));
+        append_block.push_str(&format!(
+            "- delta_status: no new claims or addressed bus takes since prior append (deduplicated_prior_claims={deduplicated_claims}, deduplicated_prior_bus={deduped_bus})\n"
+        ));
+    } else if matches!(mode, ContinuityMode::Handoff | ContinuityMode::Summary) {
+        let effective_pack = if pack_has_matching_session(&delta_pack, &cleaned) {
+            prioritize_pack_for_targets(&delta_pack, &cleaned)
+        } else {
+            prioritize_pack_for_targets(&delta_pack, &[])
+        };
+        append_block.push_str(&format!(
+            "- append_metadata: written_at={} · new_claims={} · deduplicated_prior_claims={deduplicated_claims}\n\n",
+            written_at.to_rfc3339(),
+            delta_pack.records.len()
+        ));
+        append_block.push_str(&render_handoff_or_summary(
+            &effective_pack,
+            mode,
+            for_inject,
+            &cleaned,
+            written_at,
+            &addressed_delta,
+        ));
+    } else {
+        let effective_pack = if pack_has_matching_session(&delta_pack, &cleaned) {
+            prioritize_pack_for_targets(&delta_pack, &cleaned)
+        } else {
+            prioritize_pack_for_targets(&delta_pack, &[])
+        };
+        append_block.push_str(&format!(
+            "- append_metadata: written_at={} · event_window=[{}, {}] UTC · new_claims={} · deduplicated_prior_claims={deduplicated_claims}\n\n",
+            written_at.to_rfc3339(),
+            cutoff
+                .map(|time| time.to_rfc3339())
+                .as_deref()
+                .unwrap_or("unknown"),
+            end.map(|time| time.to_rfc3339())
+                .as_deref()
+                .unwrap_or("unknown"),
+            delta_pack.records.len()
+        ));
+        append_block.push_str(&render_with_addressed(
+            &effective_pack,
+            for_inject || mode == ContinuityMode::Inject,
+            &addressed_delta,
+        ));
+    }
+
+    let mut combined = existing_content;
+    combined.push_str(&append_block);
+    fs::write(path, &combined)?;
+
+    Ok(ContinuityWriteReport {
+        content: combined,
+        appended: true,
+        new_claims: delta_pack.records.len(),
+        deduplicated_claims,
+        written_at: written_at.to_rfc3339(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2374,5 +3287,190 @@ mod tests {
         let pack = render_pack_with_census(5_000, 0);
         assert!(pack.chars().count() <= INJECT_CHAR_BUDGET);
         assert_eq!(bounded_inject(pack.clone()), pack);
+    }
+
+    #[test]
+    fn session_matches_target_supports_prefix_full_id_agent_and_pair() {
+        assert!(session_matches_target(
+            "agy",
+            "79c9a5ab-f30e-4a23-9c03-ff1a1e178b7c",
+            "79c9a5ab"
+        ));
+        assert!(session_matches_target(
+            "agy",
+            "79c9a5ab-f30e-4a23-9c03-ff1a1e178b7c",
+            "agy/79c9a5ab"
+        ));
+        assert!(session_matches_target(
+            "agy",
+            "79c9a5ab-f30e-4a23-9c03-ff1a1e178b7c",
+            "antigravity/79c9a5ab"
+        ));
+        assert!(session_matches_target(
+            "agy",
+            "79c9a5ab-f30e-4a23-9c03-ff1a1e178b7c",
+            "agy"
+        ));
+        assert!(!session_matches_target(
+            "claude",
+            "11112222-3333-4444-5555-666677778888",
+            "79c9a5ab"
+        ));
+    }
+
+    #[test]
+    fn write_continuity_file_appends_with_timestamps_and_deduplicates_prior_claims() {
+        let dir = std::env::temp_dir().join(format!(
+            "aicx-continuity-append-dedup-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("CONTINUITY.md");
+
+        let make_record = |session_id: &str, locator: &str, ts: &str, summary: &str| IntentRecord {
+            provenance: Some(crate::intents::IntentProvenance {
+                role: "user".to_string(),
+                locator: locator.to_string(),
+                scope: Some("/repo".to_string()),
+                timestamp_basis: "frame".to_string(),
+                attribution: "transcript_role".to_string(),
+            }),
+            kind: IntentKind::Decision,
+            summary: summary.to_string(),
+            context: None,
+            evidence: Vec::new(),
+            project: "div0-space/andrzej-dad".to_string(),
+            agent: "agy".to_string(),
+            date: "2026-11-08".to_string(),
+            timestamp: Some(ts.to_string()),
+            session_id: session_id.to_string(),
+            count: None,
+            first_chunk: None,
+            last_chunk: None,
+            source_chunk: "/tmp/79c9a5ab.db".to_string(),
+            source: None,
+            honesty: Default::default(),
+        };
+
+        let mut pack = ContinuityPack {
+            selection: vec![intents::SourceSelection {
+                agent: "agy".to_string(),
+                session_id: "79c9a5ab-f30e-4a23-9c03-ff1a1e178b7c".to_string(),
+                path: "/tmp/79c9a5ab.db".to_string(),
+                status: "qualified".to_string(),
+                admitted: true,
+                qualified_frames: 2,
+                outside_window_frames: 0,
+                scope_withheld_frames: 0,
+                unknown_time_frames: 0,
+                human_messages: 2,
+                ..Default::default()
+            }],
+            source_errors: 0,
+            dropped_task_events: 0,
+            window_end: "2026-11-08T10:00:00Z".to_string(),
+            project_label: "div0-space/andrzej-dad".to_string(),
+            hours: 24,
+            live_sessions: 1,
+            records: vec![make_record(
+                "79c9a5ab-f30e-4a23-9c03-ff1a1e178b7c",
+                "seg:0:msg:1",
+                "2026-11-08T09:30:00Z",
+                "Keep CONTINUITY.md append-only and never overwrite history",
+            )],
+            sources: Vec::new(),
+            index_health: IndexHealthLine {
+                newest_session_updated_at: None,
+                committed_at: None,
+                pending: 0,
+                sessions_newer_than_chunks: 0,
+                readiness: "ready".to_string(),
+                mode: "live",
+            },
+            mixed_scope: Vec::new(),
+            distilled_mixed: false,
+            candidate_cap: 5000,
+            dropped_candidates: 0,
+            unplaced_scope: Vec::new(),
+            open_work: None,
+        };
+
+        let t1 = DateTime::parse_from_rfc3339("2026-11-08T10:01:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let first = write_continuity_file(
+            &path,
+            &pack,
+            ContinuityMode::Handoff,
+            false,
+            &["79c9a5ab".to_string()],
+            t1,
+        )
+        .expect("first write");
+        assert!(!first.appended);
+        assert_eq!(first.new_claims, 1);
+        assert_eq!(first.deduplicated_claims, 0);
+        assert!(
+            first
+                .content
+                .contains("# CONTINUITY HANDOFF · div0-space/andrzej-dad · 24h")
+        );
+        assert!(
+            first
+                .content
+                .contains("- written_at: 2026-11-08T10:01:00+00:00")
+        );
+        assert!(
+            first
+                .content
+                .contains("timestamp=2026-11-08T09:30:00+00:00")
+        );
+
+        // Second write with the exact same record: must append a delta marker and NOT duplicate the claim!
+        let t2 = DateTime::parse_from_rfc3339("2026-11-08T10:05:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let second = write_continuity_file(&path, &pack, ContinuityMode::Handoff, false, &[], t2)
+            .expect("second write");
+        assert!(second.appended);
+        assert_eq!(second.new_claims, 0);
+        assert_eq!(second.deduplicated_claims, 1);
+        assert!(second.content.contains("deduplicated_prior_claims=1"));
+        assert_eq!(
+            second
+                .content
+                .matches("Keep CONTINUITY.md append-only and never overwrite history")
+                .count(),
+            2, // Once in LATEST HUMAN INTENTIONS & DECISIONS and once in PEER & SESSION OUTCOMES of the first write; 0 in the second write!
+        );
+
+        // Third write adds one new record: must append only the new record and deduplicate the first!
+        pack.records.push(make_record(
+            "79c9a5ab-f30e-4a23-9c03-ff1a1e178b7c",
+            "seg:1:msg:3",
+            "2026-11-08T10:08:00Z",
+            "Deduplicate prior claims on every append",
+        ));
+        let t3 = DateTime::parse_from_rfc3339("2026-11-08T10:10:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let third = write_continuity_file(&path, &pack, ContinuityMode::Summary, false, &[], t3)
+            .expect("third write");
+        assert!(third.appended);
+        assert_eq!(third.new_claims, 1);
+        assert_eq!(third.deduplicated_claims, 1);
+        assert!(
+            third
+                .content
+                .contains("# CONTINUITY SUMMARY · div0-space/andrzej-dad · 24h")
+        );
+        assert!(
+            third
+                .content
+                .contains("Deduplicate prior claims on every append")
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

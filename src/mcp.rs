@@ -136,7 +136,17 @@ fn refresh_catalog_and_index(hours: u64) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let _lock = crate::locks::acquire_exclusive(crate::locks::lance_lock_path()?)?;
+    let _lock = match crate::locks::acquire_exclusive_with_timeout(
+        crate::locks::index_lock_path()?,
+        Duration::from_millis(500),
+    ) {
+        Ok(handle) => handle,
+        Err(err) if err.to_string().contains("timed out") => {
+            tracing::debug!(target: "mcp.refresh", "MCP auto-refresh skipped: indexing already in progress");
+            return Ok(());
+        }
+        Err(err) => return Err(err),
+    };
     let report = crate::source_index::build(&aicx_home, &[], false, false, false)?;
     tracing::info!(
         target: "mcp.refresh",
@@ -2140,12 +2150,12 @@ impl AicxMcpServer {
 
 #[rmcp::tool_handler]
 impl rmcp::handler::server::ServerHandler for AicxMcpServer {
-    fn get_info(&self) -> ServerInfo {
+    fn get_info(&self) -> ServerConfig {
         // `tool_router` is read by the `#[tool_handler]`-expanded `call_tool`,
         // `list_tools`, and `get_tool` methods; rust 1.95 dead_code analysis
         // doesn't traverse macro expansions, so anchor the read here.
         let _ = &self.tool_router;
-        ServerInfo::new(
+        ServerConfig::new(
             ServerCapabilities::builder()
                 .enable_tools()
                 .enable_tool_list_changed()

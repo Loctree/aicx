@@ -4515,20 +4515,23 @@ pub fn classify_line_entry_type(line: &str, is_user: bool) -> Option<(EntryType,
         return Some((EntryType::Commitment, 0.72));
     }
 
-    if trimmed.starts_with("question:") || trimmed.ends_with('?') && trimmed.len() > 15 {
-        let conf = if trimmed.starts_with("question:") {
-            0.95
-        } else {
-            0.7
-        };
-        if crate::parser::intent_phrases::phrases()
+    if trimmed.starts_with("question:") {
+        return Some((EntryType::Question, 0.95));
+    }
+    let phrases = crate::parser::intent_phrases::phrases();
+    let punctuated_question = trimmed.ends_with('?')
+        && trimmed.len() >= 4
+        && phrases
             .question
             .iter()
-            .any(|m| lower.contains(m))
-            || trimmed.ends_with('?')
-        {
-            return Some((EntryType::Question, conf));
-        }
+            .any(|marker| matches_keyword_word_boundary(trimmed, marker.trim_end()));
+    let dictated_question = !trimmed.ends_with('?')
+        && trimmed.len() <= 240
+        && phrases.question_dictated_prefixes.iter().any(|marker| {
+            trimmed.starts_with(marker) && matches_keyword_word_boundary(trimmed, marker.trim_end())
+        });
+    if punctuated_question || dictated_question {
+        return Some((EntryType::Question, 0.7));
     }
 
     if is_user && looks_like_operator_decision_line(line) {
@@ -4585,21 +4588,27 @@ pub fn classify_line_entry_type(line: &str, is_user: bool) -> Option<(EntryType,
     if trimmed.starts_with("result:") || trimmed.starts_with("wynik:") {
         return Some((EntryType::Result, 0.95));
     }
-    if is_result_line(line)
-        || crate::parser::intent_phrases::phrases()
-            .result_strict
+    let user_has_intent_keyword = is_user
+        && intent_keywords()
+            .iter()
+            .any(|kw| matches_keyword_word_boundary(line, kw));
+    if !user_has_intent_keyword {
+        if is_result_line(line)
+            || crate::parser::intent_phrases::phrases()
+                .result_strict
+                .iter()
+                .any(|m| lower.contains(m))
+        {
+            return Some((EntryType::Result, 0.75));
+        }
+        if crate::parser::intent_phrases::phrases()
+            .result_soft
             .iter()
             .any(|m| lower.contains(m))
-    {
-        return Some((EntryType::Result, 0.75));
-    }
-    if crate::parser::intent_phrases::phrases()
-        .result_soft
-        .iter()
-        .any(|m| lower.contains(m))
-        && line_has_result_shape(&lower)
-    {
-        return Some((EntryType::Result, 0.6));
+            && line_has_result_shape(&lower)
+        {
+            return Some((EntryType::Result, 0.6));
+        }
     }
 
     if crate::parser::intent_phrases::phrases()
@@ -4621,11 +4630,7 @@ pub fn classify_line_entry_type(line: &str, is_user: bool) -> Option<(EntryType,
     if modality == IntentLineModality::TypedDirective {
         return Some((EntryType::Intent, 0.8));
     }
-    if is_user
-        && intent_keywords()
-            .iter()
-            .any(|kw| matches_keyword_word_boundary(line, kw))
-    {
+    if user_has_intent_keyword {
         return Some((EntryType::Intent, 0.7));
     }
     if is_decision_tag(line) {
@@ -5222,6 +5227,171 @@ fn normalize_migration_project_label(project: &str) -> String {
         .strip_prefix("local/")
         .unwrap_or(project)
         .to_string()
+}
+
+#[cfg(test)]
+mod universal_phrases_tests {
+    use super::*;
+
+    #[test]
+    fn universal_declarations_preserve_their_intent_or_task_kind() {
+        for (line, expected) in [
+            ("Zaproponuj nowe rozwiązanie", EntryType::Task),
+            ("Myślałem o tym, żeby wydzielić moduł", EntryType::Intent),
+            ("Myślałem o tym żeby wydzielić moduł", EntryType::Intent),
+            ("Myslalem o tym zeby wydzielic modul", EntryType::Intent),
+            ("Myślałam żeby wydzielić moduł", EntryType::Intent),
+            ("Myslalam zeby wydzielic modul", EntryType::Intent),
+            ("Chciałbym zrobić tak żeby to działało", EntryType::Intent),
+            ("Chcialabym uproscic ten modul", EntryType::Intent),
+            ("Chcielibyśmy uprościć ten moduł", EntryType::Intent),
+            ("Zróbmy nowy endpoint", EntryType::Task),
+            ("A zróbmy to inaczej", EntryType::Intent),
+            ("Zrobilibyśmy refaktor", EntryType::Intent),
+            ("To wymaga przebudowy", EntryType::Intent),
+            ("Co to ma być", EntryType::Question),
+            ("I was thinking we should refactor this", EntryType::Intent),
+        ] {
+            assert_eq!(
+                classify_line_entry_type(line, true).map(|r| r.0),
+                Some(expected),
+                "{line}"
+            );
+            assert!(
+                infer_kind_from_line(line, true).is_some(),
+                "timeline dropped {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn universal_actions_policies_and_commitments_are_classified() {
+        for (line, expected) in [
+            ("Sprawdźcie nowy endpoint", EntryType::Task),
+            ("Sprawdzmy nowy endpoint", EntryType::Task),
+            ("Wyjaśnijcie nowy przepływ", EntryType::Task),
+            ("Uporzadkujmy nowy modul", EntryType::Task),
+            ("Investigate the new endpoint", EntryType::Task),
+            ("Zrobimy nowy endpoint", EntryType::Commitment),
+            ("Zajmiemy się nowym modułem", EntryType::Commitment),
+            ("We will document the endpoint", EntryType::Commitment),
+            ("We'll document the endpoint", EntryType::Commitment),
+            ("Nie używamy tego formatu", EntryType::Decision),
+            ("Regula jest taka: jeden format", EntryType::Decision),
+            ("Do not use the old format", EntryType::Decision),
+            ("The endpoint must not return secrets", EntryType::Intent),
+        ] {
+            assert_eq!(
+                classify_line_entry_type(line, true).map(|r| r.0),
+                Some(expected),
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn universal_negations_do_not_become_positive_intents() {
+        for line in [
+            "Nie chcę tego robić",
+            "Nie chce tego robic",
+            "Nie chciałabym tego zmieniać",
+            "Nie proponuję tego rozwiązania",
+            "Let's not refactor this module",
+            "We should not refactor this module",
+        ] {
+            assert!(!looks_like_intent_line(line), "{line}");
+            assert_eq!(classify_line_entry_type(line, true), None, "{line}");
+            assert_eq!(infer_kind_from_line(line, true), None, "{line}");
+        }
+    }
+
+    #[test]
+    fn short_and_dictated_questions_use_markers_and_word_boundaries() {
+        for line in [
+            "Co to ma być?",
+            "Co to ma być",
+            "Co to ma byc",
+            "Jak to działa?",
+            "Jak to działa",
+            "Jak to dziala",
+            "Jak to ma działać",
+            "Jak to ma dzialac",
+            "W jaki sposób to działa",
+            "W jaki sposob to dziala",
+            "Dlaczego to znika",
+            "Po co ten moduł",
+            "How does this work",
+            "How do we proceed",
+            "Why does this fail",
+            "Why is this empty",
+            "What is this",
+            "What are these",
+            "Ile?",
+            "Jak?",
+            "Czy?",
+        ] {
+            assert_eq!(
+                classify_line_entry_type(line, true).map(|r| r.0),
+                Some(EntryType::Question),
+                "{line}"
+            );
+        }
+        for line in [
+            "what?",
+            "ok?",
+            "??",
+            "Czy ten modul",
+            "Jak dziala modul",
+            "The guide explains how does this work",
+            "what island is nearby",
+            "jak to dzialanie wyglada",
+            "A completely unrelated sentence?",
+        ] {
+            assert_ne!(
+                classify_line_entry_type(line, true).map(|r| r.0),
+                Some(EntryType::Question),
+                "{line}"
+            );
+        }
+        let prefix = "Jak to działa ";
+        let at_limit = format!("{prefix}{}ą", "a".repeat(240 - prefix.len() - "ą".len()));
+        assert_eq!(at_limit.len(), 240);
+        assert_eq!(
+            classify_line_entry_type(&at_limit, true).map(|r| r.0),
+            Some(EntryType::Question)
+        );
+        assert_ne!(
+            classify_line_entry_type(&format!("{at_limit}ą"), true).map(|r| r.0),
+            Some(EntryType::Question)
+        );
+        assert_eq!(
+            classify_line_entry_type(&format!("{at_limit}ą?"), true).map(|r| r.0),
+            Some(EntryType::Question)
+        );
+    }
+
+    #[test]
+    fn dictated_question_survives_chunk_and_timeline_projection() {
+        let line = "Co to ma być";
+        let content = format!(
+            "[project: demo | agent: codex | date: 2026-11-02 | frame_kind: user_msg]\n\n[12:00:00] user: {line}\n"
+        );
+        let entries = classify_chunk_entries(
+            &content,
+            "phrases-fixture",
+            Some("demo"),
+            Some("codex"),
+            Some("fixture"),
+            "2026-11-02",
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.entry_type == EntryType::Question && entry.title == line),
+            "{entries:?}"
+        );
+        assert_eq!(infer_kind_from_line(line, true), Some(IntentKind::Intent));
+    }
 }
 
 #[cfg(test)]

@@ -27,6 +27,21 @@ const PLATFORMS = [
     binaries: ["bin/aicx", "bin/aicx-mcp"],
   },
   {
+    key: "darwin-x64",
+    packageName: "@loctree/aicx-darwin-x64",
+    os: "darwin",
+    cpu: "x64",
+    binaries: ["bin/aicx", "bin/aicx-mcp"],
+  },
+  {
+    key: "linux-arm64-gnu",
+    packageName: "@loctree/aicx-linux-arm64-gnu",
+    os: "linux",
+    cpu: "arm64",
+    libc: "glibc",
+    binaries: ["bin/aicx", "bin/aicx-mcp"],
+  },
+  {
     key: "linux-x64-gnu",
     packageName: "@loctree/aicx-linux-x64-gnu",
     os: "linux",

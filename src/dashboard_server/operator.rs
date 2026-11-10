@@ -77,7 +77,6 @@ pub(super) async fn put_phrases(
         Json(JsonOk {
             ok: true,
             path: path.display().to_string(),
-            service: None,
         }),
     )
         .into_response()
@@ -115,7 +114,6 @@ pub(super) async fn post_index(
         Json(JsonOk {
             ok: true,
             path: "index".to_string(),
-            service: None,
         }),
     )
         .into_response()
@@ -163,33 +161,113 @@ pub(super) async fn get_auth_page(
     Html(page.replace("<!--passphrase-->", passphrase))
 }
 
+/// The six onboarding pillars, read from this machine.
+pub(super) async fn get_onboarding_state(
+    State(state): State<Arc<DashboardServerState>>,
+) -> Response {
+    let home = state.config.aicx_home.clone();
+    let port = state.config.port;
+    let rebuilding = state.rebuilding.load(Ordering::SeqCst);
+    match tokio::task::spawn_blocking(move || {
+        crate::onboarding::inspect_onboarding_readiness(&home, port, rebuilding)
+    })
+    .await
+    {
+        Ok(readiness) => (StatusCode::OK, Json(readiness)).into_response(),
+        Err(err) => inspection_failed(err),
+    }
+}
+
+/// What the dictionary finds in this person's recent sessions, and what it misses.
+pub(super) async fn get_phrase_suggestions(
+    State(state): State<Arc<DashboardServerState>>,
+) -> Response {
+    let home = state.config.aicx_home.clone();
+    match tokio::task::spawn_blocking(move || crate::onboarding::discover_phrase_suggestions(&home))
+        .await
+    {
+        Ok(suggestions) => (StatusCode::OK, Json(suggestions)).into_response(),
+        Err(err) => inspection_failed(err),
+    }
+}
+
+fn inspection_failed(err: tokio::task::JoinError) -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(JsonError {
+            error: "inspection_failed",
+            detail: err.to_string(),
+        }),
+    )
+        .into_response()
+}
+
 #[derive(Deserialize)]
-pub(super) struct OnboardingSurvey {
-    phrases: Vec<String>,
+pub(super) struct PreviewPhrasesRequest {
+    #[serde(default)]
+    lines: Vec<String>,
+}
+
+/// Classification only: it changes nothing on disk or in memory, so it takes no
+/// mutation header.
+pub(super) async fn post_preview_phrases(Json(request): Json<PreviewPhrasesRequest>) -> Response {
+    (
+        StatusCode::OK,
+        Json(crate::onboarding::preview_phrases_on_lines(&request.lines)),
+    )
+        .into_response()
+}
+
+#[derive(Serialize)]
+struct OnboardingResponse {
+    ok: bool,
+    added: usize,
+    total: usize,
+    path: String,
+    config_path: String,
+    service: String,
+    services_installed: bool,
+    reindex_installed: bool,
+    wired_clients: Vec<String>,
+    index_started: bool,
+    rebuilding: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<String>,
 }
 
 pub(super) async fn post_onboarding(
     State(state): State<Arc<DashboardServerState>>,
     headers: HeaderMap,
-    Json(survey): Json<OnboardingSurvey>,
+    Json(request): Json<crate::onboarding::OnboardingRequest>,
 ) -> Response {
     if let Some(response) = reject_mutation(&state, &headers) {
         return response;
     }
     let home = state.config.aicx_home.clone();
-    let current = intent_phrases::read_operator_or_embedded(&phrases_path(&state));
-    let phrases = survey.phrases;
+    let wants_index = request.build_initial_index == Some(true);
+    // The dashboard and the MCP service share one port. A first start that moved
+    // off a taken 8044 runs here, and the service has to land on that same port.
+    let serving_port = state.config.host.is_loopback().then_some(state.config.port);
     let applied = match tokio::task::spawn_blocking(move || {
-        crate::onboarding::apply_onboarding_survey(
-            &home,
-            &current,
-            &phrases,
-            &crate::onboarding::InstallOptions::from_env(),
-        )
+        let mut options = crate::onboarding::InstallOptions::from_env();
+        if let Some(port) = serving_port {
+            options.port = port;
+        }
+        crate::onboarding::apply_onboarding_request(&home, &request, &options)
     })
     .await
     {
         Ok(Ok(applied)) => applied,
+        Ok(Err(err)) if err.starts_with("embedder:") => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(JsonError {
+                    error: "invalid_embedder",
+                    detail: err.trim_start_matches("embedder:").to_string(),
+                }),
+            )
+                .into_response();
+        }
         Ok(Err(err)) if err.starts_with("write:") => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -231,12 +309,37 @@ pub(super) async fn post_onboarding(
                 .into_response();
         }
     };
+    let mut warnings = applied.warnings;
+    let mut index_started = false;
+    if wants_index {
+        if !applied.session_files_found {
+            warnings.push("index not started: no session files on this machine yet".to_string());
+        } else {
+            let home = state.config.aicx_home.clone();
+            index_started = spawn_index_operation(state.clone(), move || {
+                crate::onboarding::run_onboarding_index_job(&home);
+            })
+            .is_some();
+            if !index_started {
+                warnings.push("index not started: a build is already running".to_string());
+            }
+        }
+    }
     (
         StatusCode::OK,
-        Json(JsonOk {
+        Json(OnboardingResponse {
             ok: true,
+            added: applied.added,
+            total: applied.total,
             path: applied.phrases_path.display().to_string(),
-            service: Some(applied.service.summary()),
+            config_path: applied.config_path.display().to_string(),
+            service: applied.service.summary(),
+            services_installed: applied.services_installed,
+            reindex_installed: applied.reindex_installed,
+            wired_clients: applied.wired_clients,
+            index_started,
+            rebuilding: state.rebuilding.load(Ordering::SeqCst),
+            warnings,
         }),
     )
         .into_response()
@@ -692,8 +795,6 @@ struct JsonError {
 struct JsonOk {
     ok: bool,
     path: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    service: Option<String>,
 }
 
 const AUTH_HTML: &str = r#"<!doctype html>
@@ -866,6 +967,412 @@ mod tests {
             assert_eq!(response.status(), StatusCode::FORBIDDEN);
             assert!(!state.rebuilding.load(Ordering::SeqCst));
         });
+    }
+
+    fn onboarding_home(label: &str) -> std::path::PathBuf {
+        let home = std::env::temp_dir().join(format!(
+            "aicx-onboarding-route-{label}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        home
+    }
+
+    fn onboarding_app(state: Arc<DashboardServerState>) -> Router {
+        super::super::assemble_router(state, false)
+    }
+
+    fn onboarding_state(home: &std::path::Path) -> Arc<DashboardServerState> {
+        super::super::test_server_state_at("127.0.0.1".parse().unwrap(), home.to_path_buf())
+    }
+
+    fn get_request(uri: &str) -> axum::http::Request<Body> {
+        axum::http::Request::builder()
+            .uri(uri)
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    fn json_post(uri: &str, body: &serde_json::Value) -> axum::http::Request<Body> {
+        axum::http::Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    fn mutating_post(uri: &str, body: &serde_json::Value) -> axum::http::Request<Body> {
+        axum::http::Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(REGENERATE_HEADER_NAME, REGENERATE_HEADER_VALUE)
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    async fn json_of(response: Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("body");
+        serde_json::from_slice(&bytes).expect("json body")
+    }
+
+    /// Set one variable for one test, and put it back even on panic. Hold
+    /// `SERVICE_UNIT_ENV_LOCK` for as long as this lives.
+    struct EnvOverride {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvOverride {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let previous = std::env::var_os(key);
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvOverride {
+        fn drop(&mut self) {
+            unsafe {
+                match self.previous.take() {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
+    fn restore_embedded_phrases() {
+        intent_phrases::reload_from_str(intent_phrases::embedded_source())
+            .expect("restore embedded phrases");
+    }
+
+    #[test]
+    fn onboarding_state_route_serves_every_contract_field() {
+        let home = onboarding_home("state");
+        runtime().block_on(async {
+            let response = onboarding_app(onboarding_state(&home))
+                .oneshot(get_request("/api/onboarding/state"))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = json_of(response).await;
+
+            for key in [
+                "survey_required",
+                "ready",
+                "home_dir",
+                "phrases_path",
+                "config_path",
+                "rebuilding",
+                "sources",
+                "phrases",
+                "embedder",
+                "services",
+                "mcp_clients",
+                "index",
+            ] {
+                assert!(body.get(key).is_some(), "state is missing {key}");
+            }
+            for (pillar, keys) in [
+                (
+                    "phrases",
+                    &[
+                        "custom_file_exists",
+                        "intent_keywords",
+                        "task_action_heads",
+                        "decision_policy",
+                        "requirement_markers",
+                        "question_markers",
+                    ][..],
+                ),
+                (
+                    "embedder",
+                    &[
+                        "backend",
+                        "profile",
+                        "model_cached",
+                        "cloud_url",
+                        "cloud_model",
+                        "cloud_api_key_env",
+                        "cloud_api_key_present",
+                    ][..],
+                ),
+                (
+                    "services",
+                    &[
+                        "mcp_service_installed",
+                        "mcp_service_healthy",
+                        "mcp_port",
+                        "reindex_schedule_installed",
+                    ][..],
+                ),
+                (
+                    "index",
+                    &[
+                        "catalog_exists",
+                        "catalog_sessions",
+                        "index_exists",
+                        "indexed_documents",
+                    ][..],
+                ),
+            ] {
+                for key in keys {
+                    assert!(
+                        body[pillar].get(*key).is_some(),
+                        "{pillar} is missing {key}"
+                    );
+                }
+            }
+
+            let agents: Vec<&str> = body["sources"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| row["agent"].as_str().unwrap())
+                .collect();
+            assert_eq!(
+                agents,
+                [
+                    "claude",
+                    "codex",
+                    "codescribe",
+                    "cursor",
+                    "gemini",
+                    "agy",
+                    "grok",
+                    "junie",
+                    "kimi",
+                    "copilot",
+                    "omp"
+                ]
+            );
+            for key in ["label", "detected", "session_files", "root_path"] {
+                assert!(body["sources"][0].get(key).is_some(), "source lacks {key}");
+            }
+            let clients: Vec<&str> = body["mcp_clients"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| row["id"].as_str().unwrap())
+                .collect();
+            assert_eq!(clients, ["claude", "codex", "gemini", "agy"]);
+            for key in ["label", "config_path", "detected", "wired"] {
+                assert!(
+                    body["mcp_clients"][0].get(key).is_some(),
+                    "client lacks {key}"
+                );
+            }
+            assert_eq!(body["home_dir"], home.display().to_string());
+            assert_eq!(body["survey_required"], true);
+            assert_eq!(body["ready"], false);
+            assert_eq!(body["rebuilding"], false);
+        });
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn phrase_suggestions_route_reports_what_it_scanned() {
+        let home = onboarding_home("suggestions");
+        runtime().block_on(async {
+            let response = onboarding_app(onboarding_state(&home))
+                .oneshot(get_request("/api/onboarding/phrase-suggestions"))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = json_of(response).await;
+            assert!(body["scanned_sessions"].is_u64());
+            assert!(body["scanned_utterances"].is_u64());
+            assert!(body["matched_samples"].is_array());
+            assert!(body["candidate_openers"].is_array());
+        });
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn preview_route_classifies_without_the_mutation_header_and_writes_nothing() {
+        let home = onboarding_home("preview");
+        runtime().block_on(async {
+            let response = onboarding_app(onboarding_state(&home))
+                .oneshot(json_post(
+                    "/api/onboarding/preview-phrases",
+                    &serde_json::json!({ "lines": ["decision: ship it", "qwerty asdf"] }),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = json_of(response).await;
+            let matched = &body["results"][0];
+            assert_eq!(matched["line"], "decision: ship it");
+            assert_eq!(matched["matched"], true);
+            assert_eq!(matched["entry_types"], serde_json::json!(["decision"]));
+            assert!((matched["max_confidence"].as_f64().unwrap() - 0.95).abs() < 1e-6);
+            let missed = &body["results"][1];
+            assert_eq!(missed["matched"], false);
+            assert_eq!(missed["entry_types"], serde_json::json!([]));
+        });
+        assert!(!home.join("intent_phrases.toml").exists());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn onboarding_save_does_not_bypass_the_mutation_gate() {
+        let home = onboarding_home("gate");
+        runtime().block_on(async {
+            let response = onboarding_app(onboarding_state(&home))
+                .oneshot(json_post(
+                    "/api/onboarding",
+                    &serde_json::json!({ "phrases": ["blocked before any write"] }),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        });
+        assert!(!home.join("intent_phrases.toml").exists());
+        assert!(!home.join(crate::onboarding::MARKER_REL).exists());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn phrases_only_post_keeps_the_survey_contract_and_finishes_onboarding() {
+        let _unit_guard = crate::onboarding::SERVICE_UNIT_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let home = onboarding_home("legacy");
+        let _unit = EnvOverride::set("AICX_SERVICE_UNIT", home.join("missing-unit"));
+        let _dry_run = EnvOverride::set("AICX_ONBOARDING_DRY_RUN", "1");
+        let survey = serde_json::json!({ "phrases": ["phrases only route opener"] });
+        runtime().block_on(async {
+            let state = onboarding_state(&home);
+            let response = onboarding_app(state.clone())
+                .oneshot(mutating_post("/api/onboarding", &survey))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = json_of(response).await;
+            assert_eq!(body["ok"], true);
+            assert_eq!(body["added"], 1);
+            assert!(body["total"].as_u64().unwrap() > 1);
+            assert!(
+                body["path"]
+                    .as_str()
+                    .unwrap()
+                    .ends_with("intent_phrases.toml")
+            );
+            assert!(
+                body["config_path"]
+                    .as_str()
+                    .unwrap()
+                    .ends_with("config.toml")
+            );
+            // The shipped page reads `ok`, `detail`, and `service`.
+            assert!(body["service"].as_str().unwrap().contains("dry-run"));
+            assert_eq!(body["services_installed"], false);
+            // Read from this machine's LaunchAgents, so only its shape is the contract.
+            assert!(body["reindex_installed"].is_boolean());
+            assert_eq!(body["wired_clients"], serde_json::json!([]));
+            assert_eq!(body["index_started"], false);
+            assert_eq!(body["rebuilding"], false);
+            assert!(home.join(crate::onboarding::MARKER_REL).is_file());
+
+            let repeated = onboarding_app(state)
+                .oneshot(mutating_post("/api/onboarding", &survey))
+                .await
+                .unwrap();
+            assert_eq!(repeated.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(json_of(repeated).await["error"], "invalid_phrases");
+        });
+        restore_embedded_phrases();
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn full_save_writes_what_was_asked_and_nothing_else() {
+        let home = onboarding_home("full");
+        runtime().block_on(async {
+            let response = onboarding_app(onboarding_state(&home))
+                .oneshot(mutating_post(
+                    "/api/onboarding",
+                    &serde_json::json!({
+                        "intent_keywords": ["full route opener"],
+                        "embedder": { "backend": "gguf", "profile": "4b" },
+                        "install_services": false,
+                    }),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = json_of(response).await;
+            assert_eq!(body["ok"], true);
+            assert_eq!(body["added"], 1);
+            assert_eq!(body["wired_clients"], serde_json::json!([]));
+            assert_eq!(body["index_started"], false);
+        });
+        let config: toml::Value =
+            toml::from_str(&std::fs::read_to_string(home.join("config.toml")).unwrap()).unwrap();
+        assert_eq!(config["embedder"]["backend"].as_str(), Some("gguf"));
+        assert_eq!(config["embedder"]["profile"].as_str(), Some("large"));
+        assert!(home.join(crate::onboarding::MARKER_REL).is_file());
+        restore_embedded_phrases();
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn bad_embedder_is_refused_before_any_store_changes() {
+        let home = onboarding_home("bad-embedder");
+        runtime().block_on(async {
+            let response = onboarding_app(onboarding_state(&home))
+                .oneshot(mutating_post(
+                    "/api/onboarding",
+                    &serde_json::json!({
+                        "intent_keywords": ["never written opener"],
+                        "embedder": { "backend": "mystery" },
+                        "install_services": false,
+                    }),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(json_of(response).await["error"], "invalid_embedder");
+        });
+        assert!(!home.join("intent_phrases.toml").exists());
+        assert!(!home.join("config.toml").exists());
+        assert!(!home.join(crate::onboarding::MARKER_REL).exists());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn save_does_not_start_a_second_index_build() {
+        let home = onboarding_home("single-flight");
+        runtime().block_on(async {
+            let state = onboarding_state(&home);
+            // The build this test must not start would read this machine's
+            // sessions. The occupied guard is what keeps it from running.
+            state.rebuilding.store(true, Ordering::SeqCst);
+            let response = onboarding_app(state.clone())
+                .oneshot(mutating_post(
+                    "/api/onboarding",
+                    &serde_json::json!({
+                        "install_services": false,
+                        "build_initial_index": true,
+                    }),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = json_of(response).await;
+            assert_eq!(body["index_started"], false);
+            assert_eq!(body["rebuilding"], true);
+            assert!(body["warnings"].as_array().is_some_and(|w| !w.is_empty()));
+            assert!(state.rebuilding.load(Ordering::SeqCst));
+        });
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     fn session_cookie(response: &Response) -> Option<String> {

@@ -68,7 +68,7 @@ for arg in "$@"; do
     --no-extract) AICX_INSTALL_EXTRACT="0" ;;
     --pick-embedder) AICX_EMBEDDER_PICKER="1" ;;
     --no-embedder-prompt) AICX_EMBEDDER_PICKER="0" ;;
-    --embedder-profile=*) AICX_EMBEDDER_PROFILE="${arg#*=}" ;;
+    --embedder-profile=*|--with-embeddings=*) AICX_EMBEDDER_PROFILE="${arg#*=}" ;;
     --help|-h)
       echo "Usage: install.sh [--skip-install] [--dry-run] [--force]"
       echo "  Install aicx + aicx-mcp and configure MCP for Claude Code, Codex, and Gemini."
@@ -98,11 +98,13 @@ for arg in "$@"; do
       echo "  default: AICX_EMBEDDER_PROFILE=base    # F2LLM 0.6B Q4_K_M GGUF"
       echo "  dev:     AICX_EMBEDDER_PROFILE=dev     # F2LLM 1.7B Q4_K_M GGUF"
       echo "  premium: AICX_EMBEDDER_PROFILE=premium # F2LLM 1.7B Q6_K GGUF"
+      echo "  max:     AICX_EMBEDDER_PROFILE=max     # F2LLM 4B Q4_K_M GGUF (~2.5 GB)"
       echo "  build:   cargo build --release --features native-embedder"
       echo ""
       echo "Native embedder picker:"
       echo "  --pick-embedder                    # interactive config for ~/.aicx/embedder.toml"
-      echo "  --embedder-profile=base|dev|premium"
+      echo "  --embedder-profile=base|dev|premium|max|4b"
+      echo "  --with-embeddings=max|4b           # alias; saves profile, download remains opt-in"
       echo "  --no-embedder-prompt               # suppress interactive picker"
       echo "  note: writes only AICX local embedder preferences"
       echo ""
@@ -200,18 +202,22 @@ normalise_bool() {
 
 embedder_repo_for_profile() {
   case "${1:-}" in
-    base) echo "mradermacher/F2LLM-v2-0.6B-GGUF" ;;
-    dev) echo "mradermacher/F2LLM-v2-1.7B-GGUF" ;;
-    premium) echo "mradermacher/F2LLM-v2-1.7B-GGUF" ;;
+    base|0.6b|0.6B) echo "mradermacher/F2LLM-v2-0.6B-GGUF" ;;
+    dev|1.7b|1.7B) echo "mradermacher/F2LLM-v2-1.7B-GGUF" ;;
+    premium|1.7b-q6|1.7B-Q6) echo "mradermacher/F2LLM-v2-1.7B-GGUF" ;;
+    large|pro|4b|4B|f2llm-4b) echo "Codefuse-AI/F2LLM-v2-4B-GGUF" ;;
+    max|ultra|8b|8B|f2llm-8b) echo "Codefuse-AI/F2LLM-v2-8B-GGUF" ;;
     *) return 1 ;;
   esac
 }
 
 embedder_file_for_profile() {
   case "${1:-}" in
-    base) echo "F2LLM-v2-0.6B.Q4_K_M.gguf" ;;
-    dev) echo "F2LLM-v2-1.7B.Q4_K_M.gguf" ;;
-    premium) echo "F2LLM-v2-1.7B.Q6_K.gguf" ;;
+    base|0.6b|0.6B) echo "F2LLM-v2-0.6B.Q4_K_M.gguf" ;;
+    dev|1.7b|1.7B) echo "F2LLM-v2-1.7B.Q4_K_M.gguf" ;;
+    premium|1.7b-q6|1.7B-Q6) echo "F2LLM-v2-1.7B.Q6_K.gguf" ;;
+    large|pro|4b|4B|f2llm-4b) echo "F2LLM-v2-4B.Q4_K_M.gguf" ;;
+    max|ultra|8b|8B|f2llm-8b) echo "F2LLM-v2-8B.Q4_K_M.gguf" ;;
     *) return 1 ;;
   esac
 }
@@ -432,11 +438,23 @@ maybe_configure_native_embedder() {
         AICX_EMBEDDER_SETUP_DETAIL="You skipped native embedder setup."
         return 0
         ;;
-      base|dev|premium)
-        selected_profile="$explicit_profile"
+      base|0.6b|0.6B)
+        selected_profile="base"
+        ;;
+      dev|1.7b|1.7B)
+        selected_profile="dev"
+        ;;
+      premium|1.7b-q6|1.7B-Q6)
+        selected_profile="premium"
+        ;;
+      large|pro|4b|4B|f2llm-4b)
+        selected_profile="large"
+        ;;
+      max|ultra|8b|8B|f2llm-8b)
+        selected_profile="max"
         ;;
       *)
-        echo "Error: unsupported --embedder-profile='$explicit_profile' (expected base, dev, premium, or none)." >&2
+        echo "Error: unsupported embedder profile='$explicit_profile' (expected base/0.6b, dev/1.7b, premium, large/4b, max/8b, or none)." >&2
         exit 1
         ;;
     esac
@@ -462,9 +480,19 @@ maybe_configure_native_embedder() {
     echo "  4) Premium"
     echo "     F2LLM 1.7B Q6_K GGUF"
     echo "     Approx. 1.4 GB"
-    echo "     Highest local quality, largest download."
+    echo "     Higher precision than Dev."
     echo ""
-    printf "Select profile [1-4]: "
+    echo "  5) Large (4B)"
+    echo "     F2LLM 4B Q4_K_M GGUF, 2560 dimensions"
+    echo "     Approx. 2.5 GB"
+    echo "     High-capacity local model."
+    echo ""
+    echo "  6) Max (8B)"
+    echo "     F2LLM 8B Q4_K_M GGUF, 4096 dimensions"
+    echo "     Approx. 4.9 GB"
+    echo "     Maximum local model; requires more memory."
+    echo ""
+    printf "Select profile [1-6]: "
     read -r reply || true
     case "${reply:-1}" in
       1|"")
@@ -475,6 +503,8 @@ maybe_configure_native_embedder() {
       2) selected_profile="base" ;;
       3) selected_profile="dev" ;;
       4) selected_profile="premium" ;;
+      5) selected_profile="large" ;;
+      6) selected_profile="max" ;;
       *)
         echo "  native embedder picker: invalid choice, skipping"
         AICX_EMBEDDER_SETUP_DETAIL="No local embedder profile was configured; invalid picker choice was ignored."
@@ -799,17 +829,9 @@ detect_release_target() {
   arch=$(uname -m)
   case "${os}:${arch}" in
     Darwin:arm64) echo "aarch64-apple-darwin" ;;
-    Darwin:x86_64)
-      echo "Error: x86_64-apple-darwin release assets are not published in the current AICX release asset set." >&2
-      echo "  Use a local bundle install instead, or install from source with cargo." >&2
-      exit 1
-      ;;
+    Darwin:x86_64) echo "x86_64-apple-darwin" ;;
     Linux:x86_64) echo "x86_64-linux-gnu" ;;
-    Linux:aarch64|Linux:arm64)
-      echo "Error: aarch64 Linux release assets are not published in the current AICX release asset set." >&2
-      echo "  Use a local bundle install instead, or install from source with cargo." >&2
-      exit 1
-      ;;
+    Linux:aarch64|Linux:arm64) echo "aarch64-linux-gnu" ;;
     *)
       echo "Error: unsupported platform for release installer: ${os}/${arch}" >&2
       echo "  Use a local bundle install instead, or install from source with cargo." >&2

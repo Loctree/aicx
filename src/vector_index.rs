@@ -888,6 +888,16 @@ pub fn current_lexical_doc_count() -> Result<Option<usize>> {
     ))
 }
 
+/// Read all committed lexical chunks directly from the CURRENT generation.
+pub fn current_lexical_chunks() -> Result<Vec<aicx_retrieve::ChunkRef>> {
+    let path = hybrid_manifest_path(None)?;
+    let Some(generation_dir) = path.parent() else {
+        anyhow::bail!("no generation dir for manifest at {}", path.display());
+    };
+    let lexical = aicx_retrieve::TantivyAdapter::new(generation_dir.to_path_buf())?;
+    lexical.read_all_chunks()
+}
+
 /// Publish one lexical-only CURRENT generation directly from source extracts.
 ///
 /// Matching validated dense vectors are carried forward. Otherwise `--deep`

@@ -19,9 +19,18 @@ hook_env() {
         CLAUDE_CODE_SESSION_ID= \
         CURSOR_CONVERSATION_ID= \
         GEMINI_SESSION_ID= \
+        AGY_SESSION_ID= \
+        ANTIGRAVITY_SESSION_ID= \
+        ANTIGRAVITY_CONVERSATION_ID= \
+        ANTIGRAVITY_SOURCE_METADATA= \
+        ANTIGRAVITY_AGENT= \
+        ANTIGRAVITY_APP_DATA_DIR= \
+        ANTIGRAVITY_CLI_ALIAS= \
         JUNIE_SESSION_ID= \
         KIMI_SESSION_ID= \
         COPILOT_SESSION_ID= \
+        OMP_SESSION_ID= \
+        PI_SESSION_ID= \
         GROK_SESSION_ID= \
         GROK_THREAD_ID= \
         ATUIN_SESSION= \
@@ -1456,3 +1465,21 @@ out="$(gen '[codex/interactive] fix: do not steal an omp session
 
 Keep the owning lane.' PI_SESSION_ID="$omp_id" VC_SESSION_PID=0)"
 expect_absent codex-does-not-record-omp "$out" "session_id:"
+
+agy_id="79c9a5ab-f30e-4a23-9c03-ff1a1e178b7c"
+out="$(gen '[agy/interactive] feat: resolve native Antigravity session id
+
+Keep the agy transcript.' ANTIGRAVITY_CONVERSATION_ID="$agy_id" VC_SESSION_PID=0)"
+expect_line agy-conversation-id-session "$out" "session_id: $agy_id"
+expect_line agy-conversation-id-author "$out" "Authored-By: agy <agents@vetcoders.io>"
+
+out="$(gen '[gemini/implement] feat: resolve Antigravity conversation id under gemini subject
+
+Keep the agy transcript when committing as gemini.' ANTIGRAVITY_CONVERSATION_ID="$agy_id" VC_SESSION_PID=0)"
+expect_line agy-gemini-subject-session "$out" "session_id: $agy_id"
+expect_line agy-gemini-subject-author "$out" "Authored-By: gemini <agents@vetcoders.io>"
+
+out="$(gen '[codex/interactive] fix: do not steal an agy session
+
+Keep the owning lane.' ANTIGRAVITY_CONVERSATION_ID="$agy_id" VC_SESSION_PID=0)"
+expect_absent codex-does-not-record-agy "$out" "session_id:"

@@ -11,8 +11,8 @@ use std::time::Duration;
 use aicx_parser::adapters::agy::{self, AgyHeaderPreview};
 use rusqlite::{Connection, OpenFlags};
 
-const MAX_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
-const MAX_TOTAL_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
+const MAX_PAYLOAD_BYTES: usize = 32 * 1024 * 1024;
+const MAX_TOTAL_PAYLOAD_BYTES: usize = 128 * 1024 * 1024;
 const MAX_STEP_ROWS: usize = 100_000;
 
 #[derive(Default)]

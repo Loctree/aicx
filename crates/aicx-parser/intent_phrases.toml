@@ -1,41 +1,95 @@
-# Founder-corpus phrases that classify a line. One file on purpose.
-# Add a survey answer here. Do not grow a second list in Rust.
+# Universal Polish and English phrases. One source for all classifiers.
+# Keep personal vocabulary in ~/.aicx/intent_phrases.toml.
+# Polish phrases include diacritics and ASCII variants; stems need no comma.
 
 [intent]
 keywords = [
-  "mam pomysl", "mam pomysł", "mam taki pomysl", "mam taki pomysł",
-  "pomysl", "pomysł", "proponuje", "proponuję", "zrobmy", "zróbmy",
-  "ustalmy", "chce", "chcę", "chcialbym", "chciałbym",
-  "potrzebuje", "potrzebuję", "prosze", "proszę", "odpal", "uruchom",
-  "usun", "usuń", "następny krok", "nastepny krok", "kolejny krok",
-  "i want", "i'd like", "let's", "next step",
+  "mam pomysł", "mam pomysl", "mam taki pomysł", "mam taki pomysl",
+  "pomysł", "pomysl", "proponuję", "proponuje", "proponujemy",
+  "zaproponuj", "zaproponujcie", "zaproponujmy",
+  "mam propozycję", "mam propozycje",
+  "myślałem o tym", "myslalem o tym", "myślałam o tym", "myslalam o tym",
+  "myślałem żeby", "myslalem zeby", "myślałam żeby", "myslalam zeby",
+  "myśleliśmy o tym", "myslelismy o tym", "myślałyśmy o tym", "myslalysmy o tym",
+  "pomyślałem", "pomyslalem", "pomyślałam", "pomyslalam",
+  "zastanawiam się czy nie", "zastanawiam sie czy nie",
+  "chcę", "chce", "chcemy", "chciałbym", "chcialbym", "chciałabym", "chcialabym",
+  "chcielibyśmy", "chcielibysmy", "chciałybyśmy", "chcialybysmy",
+  "wolałbym", "wolalbym", "wolałabym", "wolalabym", "wolelibyśmy", "wolelibysmy",
+  "zróbmy", "zrobmy", "a zróbmy", "a zrobmy", "zróbcie", "zrobcie",
+  "zrobilibyśmy", "zrobilibysmy", "zrobiłybyśmy", "zrobilybysmy",
+  "ustalmy", "przyjmijmy", "załóżmy", "zalozmy",
+  "zacznijmy od", "zaczynamy od", "przejdźmy do", "przejdzmy do",
+  "wróćmy do", "wrocmy do", "skupmy się na", "skupmy sie na",
+  "potrzebuję", "potrzebuje", "potrzebujemy", "zależy mi", "zalezy mi",
+  "zależy nam", "zalezy nam", "chodzi mi o", "chodzi nam o",
+  "plan jest taki", "cel jest taki", "intencja jest taka", "to powinno", "wymaga",
+  "proszę", "prosze", "uruchom", "usuń", "usun", "usuńcie", "usuncie", "usuńmy", "usunmy",
+  "następny krok", "nastepny krok", "kolejny krok",
+  "co to ma być", "co to ma byc", "jak to ma działać", "jak to ma dzialac",
+  "i want", "i'd like", "i would like", "we want", "we would like", "we need", "i need",
+  "let's", "lets", "let us", "we should", "i was thinking", "i thought about",
+  "propose", "suggest", "the goal is", "the plan is", "start with", "focus on", "next step",
 ]
 
 [task]
 directive = ["task:", "todo:", "zadanie:"]
+# Singular, second-person plural, and inclusive plural imperatives.
 action_heads = [
-  "stworz", "stwórz", "utworz", "utwórz", "dodaj", "napraw", "popraw",
-  "zbuduj", "przygotuj", "zapisz", "spisz", "wypisz", "zaimplementuj",
-  "podlacz", "podłącz", "skopiuj", "przekopiuj", "uruchom", "odpal",
+  "zaproponuj", "zaproponujcie", "zaproponujmy",
+  "stwórz", "stworz", "stwórzcie", "stworzcie", "stwórzmy", "stworzmy",
+  "utwórz", "utworz", "utwórzcie", "utworzcie", "utwórzmy", "utworzmy",
+  "dodaj", "dodajcie", "dodajmy", "napraw", "naprawcie", "naprawmy",
+  "popraw", "poprawcie", "poprawmy", "zbuduj", "zbudujcie", "zbudujmy",
+  "przygotuj", "przygotujcie", "przygotujmy", "zapisz", "zapiszcie", "zapiszmy",
+  "spisz", "spiszcie", "spiszmy", "wypisz", "wypiszcie", "wypiszmy",
+  "zaimplementuj", "zaimplementujcie", "zaimplementujmy",
+  "podłącz", "podlacz", "podłączcie", "podlaczcie", "podłączmy", "podlaczmy",
+  "skopiuj", "skopiujcie", "skopiujmy", "przekopiuj", "przekopiujcie", "przekopiujmy",
+  "uruchom", "uruchomcie", "uruchommy", "zrób", "zrob", "zróbcie", "zrobcie", "zróbmy", "zrobmy",
+  "sprawdź", "sprawdz", "sprawdźcie", "sprawdzcie", "sprawdźmy", "sprawdzmy",
+  "zbadaj", "zbadajcie", "zbadajmy", "przeanalizuj", "przeanalizujcie", "przeanalizujmy",
+  "zweryfikuj", "zweryfikujcie", "zweryfikujmy",
+  "pokaż", "pokaz", "pokażcie", "pokazcie", "pokażmy", "pokazmy",
+  "wyjaśnij", "wyjasnij", "wyjaśnijcie", "wyjasnijcie", "wyjaśnijmy", "wyjasnijmy",
+  "opisz", "opiszcie", "opiszmy", "podsumuj", "podsumujcie", "podsumujmy",
+  "zmień", "zmien", "zmieńcie", "zmiencie", "zmieńmy", "zmienmy",
+  "przenieś", "przenies", "przenieście", "przeniescie", "przenieśmy", "przeniesmy",
+  "wydziel", "wydzielcie", "wydzielmy", "rozdziel", "rozdzielcie", "rozdzielmy",
+  "połącz", "polacz", "połączcie", "polaczcie", "połączmy", "polaczmy",
+  "uporządkuj", "uporzadkuj", "uporządkujcie", "uporzadkujcie", "uporządkujmy", "uporzadkujmy",
+  "wyczyść", "wyczysc", "wyczyśćcie", "wyczysccie", "wyczyśćmy", "wyczyscmy",
+  "przetestuj", "przetestujcie", "przetestujmy", "wdroż", "wdroz", "wdrożcie", "wdrozcie", "wdrożmy", "wdrozmy",
+  "wypchnij", "wypchnijcie", "wypchnijmy", "zacommituj", "zacommitujcie", "zacommitujmy",
+  "zmerguj", "zmergujcie", "zmergujmy",
   "create", "add", "fix", "update", "implement", "write", "run", "copy",
+  "remove", "delete", "refactor", "check", "verify", "inspect", "investigate", "analyze", "analyse",
+  "propose", "suggest", "design", "build", "test", "deploy", "document", "summarize", "summarise", "explain", "show",
 ]
-commitment_heads = ["zrobie", "zrobię", "zajme sie", "zajmę się", "i will ", "i'll "]
+commitment_heads = [
+  "zrobię", "zrobie", "zrobimy", "zajmę się", "zajme sie", "zajmiemy się", "zajmiemy sie",
+  "biorę", "biore", "bierzemy", "i will ", "i'll ", "we will ", "we'll ",
+]
 
 [decision]
 policy = [
-  "nie fixujemy", "nie robimy", "nie ruszamy", "out of scope", "poza scope",
+  "nie fixujemy", "nie robimy", "nie ruszamy", "out of scope", "poza zakresem",
   "od teraz", "from now on", "canonical", "kanonicz", "default",
   "domysln", "domyśln", "tylko przez", "bez zgadywania", "bez fallback",
   "no fallback", "musi mieć", "musi miec", "ma byc dodatkiem", "ma być dodatkiem",
+  "nie używamy", "nie uzywamy", "zasada jest taka", "reguła jest taka", "regula jest taka",
+  "decyzja jest taka", "we don't use", "do not use", "never use", "always use", "by default",
 ]
 output = ["decision:", "plan:", "architecture", "BREAKING", "TODO:", "FIXME:"]
-output_case_sensitive = ["WAŻNE", "KEY"]
+output_case_sensitive = ["WAŻNE", "WAZNE", "KEY"]
 
 [requirement]
 markers = [
   "nie może być", "nie moze byc", "ma być", "ma byc", "musi ", "musimy ",
-  "trzeba ", "zrób to testowalne", "zrob to testowalne", "pełny ownership",
-  "pelny ownership", "teraz wypuszuj",
+  "trzeba ", "zrób to testowalne", "zrob to testowalne",
+  "wymaga", "wymagane", "wymagam", "wymagamy", "nie wolno", "mają być", "maja byc",
+  "muszą ", "musza ", "należy ", "nalezy ", "powinno ", "powinien ", "powinna ",
+  "must ", "must be", "must not", "shall ", "required", "requires ", "needs to ",
 ]
 
 [outcome]
@@ -58,9 +112,18 @@ completion = [
 
 [question]
 markers = [
-  "how do", "how does", "how to", "what is", "what are", "why does", "why is",
+  "how do", "how does", "how to", "what is", "what are", "why does", "why is", "why ",
   "can we", "should we", "is it possible", "does it", "do we",
-  "jak ", "dlaczego ", "czy ", "co to ", "co jest", "w jaki sposób",
+  "jak ", "dlaczego ", "czy ", "co to ", "co jest", "w jaki sposób", "w jaki sposob",
+  "co to ma być", "co to ma byc", "jak to", "po co", "skąd ", "skad ", "kiedy ", "gdzie ",
+  "który ", "ktory ", "ile ", "what the", "how come", "where is", "when should", "which one",
+]
+# Strong starts alone can identify short dictated questions without punctuation.
+# Keep broad single-word markers (jak/czy/where/etc.) in markers, requiring '?'.
+dictated_prefixes = [
+  "co to ma być", "co to ma byc", "jak to działa", "jak to dziala", "jak to ma",
+  "w jaki sposób", "w jaki sposob", "dlaczego ", "po co ",
+  "how does ", "how do ", "why does ", "why is ", "what is ", "what are ",
 ]
 
 [assumption]
@@ -72,14 +135,14 @@ markers = [
 [why]
 markers = [
   "why:", "because", "the reason", "this is needed", "motivated by", "driven by",
-  "root cause", "underlying issue", "bo ", "ponieważ", "dlatego że", "przyczyna:", "powód:",
+  "root cause", "underlying issue", "bo ", "ponieważ", "poniewaz", "dlatego że", "dlatego ze", "przyczyna:", "powód:", "powod:",
 ]
 
 [argue]
 markers = [
   "on the other hand", "alternatively", "disagree", "counterpoint", "trade-off",
   "tradeoff", "but if we", "however,", "z drugiej strony", "alternatywnie",
-  "spór:", "kontrargument",
+  "spór:", "spor:", "kontrargument",
 ]
 
 [insight]

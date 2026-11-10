@@ -5,7 +5,10 @@ registry, npm wrapper, and Homebrew are secondary distribution surfaces; none
 of them replaces the signed GitHub asset set.
 
 `Cargo.toml` owns the semantic version. `CHANGELOG.md` owns release notes.
-`tools/release_sync.py` keeps versioned install and npm examples aligned.
+`tools/release_sync.py` keeps maintainer tag examples and npm manifests aligned
+with that version. The stranger install blocks in `README.md` and below stay
+unpinned, so they keep installing the current published release instead of the
+workspace version, which can be ahead of GitHub and npm.
 
 ## Canonical Asset Set
 
@@ -15,9 +18,12 @@ the tag/version contract and release gates, then publishes:
 | Platform | Release asset | Platform proof |
 | --- | --- | --- |
 | macOS arm64 | `aicx-vX.Y.Z-aarch64-apple-darwin-slim.zip` | Developer ID codesign + Apple notarization |
+| macOS x64 (Intel) | `aicx-vX.Y.Z-x86_64-apple-darwin-slim.zip` | Developer ID codesign + Apple notarization |
 | Linux x64 GNU | `aicx-vX.Y.Z-x86_64-linux-gnu-slim.tar.gz` | GPG detached signature |
+| Linux arm64 GNU | `aicx-vX.Y.Z-aarch64-linux-gnu-slim.tar.gz` | GPG detached signature |
 | Windows x64 | `aicx-vX.Y.Z-x86_64-pc-windows-msvc-slim.zip` | GPG detached signature |
 | Debian x64 | `aicx_X.Y.Z-1_amd64.deb` | GPG detached signature |
+| Debian arm64 | `aicx_X.Y.Z-1_arm64.deb` | GPG detached signature |
 
 Every archive and Debian package has an adjacent `.sha256` and `.asc`.
 `loctree-release-pubkey.asc` is published with the release. The macOS job also
@@ -37,11 +43,21 @@ Each bundle contains:
 The Windows zip is portable and intentionally omits the Unix-only
 `install.sh`; users invoke `aicx.exe` and `aicx-mcp.exe` directly.
 
-The release workflow builds exactly three binary targets:
+The release workflow builds exactly five binary targets, each natively on a
+GitHub-hosted runner of its own architecture (no `cross`):
 
-- `aarch64-apple-darwin`
-- `x86_64-unknown-linux-gnu`
-- `x86_64-pc-windows-msvc`
+| Target | Runner label |
+| --- | --- |
+| `aarch64-apple-darwin` | `macos-15` |
+| `x86_64-apple-darwin` | `macos-15-intel` |
+| `x86_64-unknown-linux-gnu` | `ubuntu-latest` |
+| `aarch64-unknown-linux-gnu` | `ubuntu-24.04-arm` |
+| `x86_64-pc-windows-msvc` | `windows-latest` |
+
+Both macOS targets and both Linux targets build with default features, so
+in-process GGUF embeddings (`native-embedder` → `llama-cpp-2`) ship on all four.
+Both Linux legs use `cargo zigbuild` against the glibc 2.28 floor. Windows
+alone drops `native-embedder` (see below).
 
 The signed Windows leg runs on the operator-owned `windows-pc` runner because
 that host owns the release GPG key. Cargo is serialized there with
@@ -58,16 +74,27 @@ cold-install smoke as one release-contract change.
 
 ## User Install
 
-Download the installer from the same immutable tag as the desired release:
+Strangers install the current published build. Leave the release tag unset so
+the installer resolves the latest GitHub Release. The `install.sh` URL below
+is only the bootstrap script; the binaries come from that release.
 
 ```bash
-curl -fsSLO https://raw.githubusercontent.com/Loctree/aicx/v0.12.0/install.sh
-AICX_INSTALL_MODE=release AICX_RELEASE_TAG=v0.14.0 bash install.sh
+npm install -g @loctree/aicx
 ```
 
-Release mode selects the platform archive, downloads its adjacent `.sha256`,
+The npm package is `@loctree/aicx`. The unscoped name `aicx` on npm and on
+PyPI belongs to other projects.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Loctree/aicx/main/install.sh -o install.sh
+AICX_INSTALL_MODE=release bash install.sh
+```
+
+Release mode selects the platform archive from the latest GitHub Release
+(`AICX_RELEASE_TAG` defaults to `latest`), downloads its adjacent `.sha256`,
 verifies the digest, and delegates to the installer inside the verified
-bundle. It installs `aicx` and `aicx-mcp` into `~/.local/bin`.
+bundle. It installs `aicx` and `aicx-mcp` into `~/.local/bin`. Set
+`AICX_RELEASE_TAG=vX.Y.Z` only when a smoke or rollback must hit one tag.
 
 For an unreleased checkout, use the local source path:
 
@@ -150,8 +177,8 @@ After review, runtime acceptance, and merge to `main`:
 The equivalent explicit tag commands are:
 
 ```bash
-git tag -as v0.14.0 -m "Release v0.14.0"
-git push origin v0.14.0
+git tag -as v0.15.0 -m "Release v0.15.0"
+git push origin v0.15.0
 ```
 
 Do not tag or push from a dirty tree, an unmerged branch, or a commit whose
@@ -159,7 +186,9 @@ runtime acceptance is operator-deferred.
 
 ## Verification
 
-Verify a downloaded asset without trusting its filename:
+Verify a downloaded asset without trusting its filename. The curls below are a
+worked example of the asset names. A machine install uses the User Install
+section, which tracks the latest GitHub Release.
 
 ```bash
 curl -fsSLO https://github.com/Loctree/aicx/releases/download/v0.12.0/loctree-release-pubkey.asc
@@ -186,7 +215,7 @@ URL, not the working tree or an existing `PATH` binary:
 
 ```bash
 smoke_home="$(mktemp -d)"
-HOME="$smoke_home" AICX_INSTALL_MODE=release AICX_RELEASE_TAG=v0.12.0 bash install.sh
+HOME="$smoke_home" AICX_INSTALL_MODE=release AICX_RELEASE_TAG=v0.15.0 bash install.sh
 HOME="$smoke_home" "$smoke_home/.local/bin/aicx" --version
 HOME="$smoke_home" "$smoke_home/.local/bin/aicx-mcp" --version
 ```
@@ -210,21 +239,49 @@ first on `PATH`, and GNU tar does not extract the release ZIP. The installer
 validates the system extractor path and invokes it directly without a shell;
 PowerShell and CI therefore exercise the same native Windows path.
 
-`distribution/npm/` contains one wrapper plus three platform packages:
+`distribution/npm/` contains one wrapper plus five platform packages:
 
 - `@loctree/aicx-darwin-arm64`
+- `@loctree/aicx-darwin-x64`
+- `@loctree/aicx-linux-arm64-gnu`
 - `@loctree/aicx-linux-x64-gnu`
 - `@loctree/aicx-win32-x64-gnu` (legacy npm suffix; MSVC binary)
 - `@loctree/aicx`
 
+On any other host (Linux musl/Alpine, Windows arm64, BSDs) the wrapper exits
+non-zero with a stderr message naming `platform`, `arch`, `libc`, the
+supported set, and the issues link; it never fails silently.
+
 Use `.github/workflows/npm-publish.yml` after the matching GitHub Release is
-complete. The workflow checks the three release archive names and their
+complete. The workflow checks the five release archive names and their
 checksums, validates package metadata, publishes platform packages first, then
 the wrapper. See `distribution/npm/PUBLISHING.md`.
 
-The crates.io lane is source/library distribution, not the primary user-facing
-binary release. `make publish-crates-dry` validates the leaf crates; the full
-topological upload is an explicit maintainer action.
+The crates.io lane is source/library distribution for library consumers.
+`cargo install aicx` follows that registry. A GitHub Release does not move it.
+
+That lag is not a manifest defect. Workspace crates version-track `Cargo.toml`,
+none set `publish = false`, and none use git-only dependencies.
+`.github/workflows/release.yml` publishes the signed GitHub Release and then
+calls `npm-publish.yml`. It never runs `cargo publish`. Nothing in CI will
+move the registry forward.
+
+Catching crates.io up to the version in `Cargo.toml` is a maintainer action
+from that commit, with a crates.io API token for an owner:
+
+```bash
+make publish-crates-dry
+make publish-crates
+```
+
+`make publish-crates` uploads the current workspace version in dependency
+order (`aicx-parser`, `aicx-embeddings`, `aicx-monitor`,
+`aicx-progress-contracts`, `aicx-retrieve`, then `aicx`). It does not backfill
+versions that were never uploaded, and it is not part of tagging a release.
+The crates.io index can take a minute to show a crate just uploaded; if a
+later crate in that list cannot resolve its sibling, rerun the same target
+after the index updates. `AICX_INSTALL_MODE=crates` stays unsupported in
+`install.sh`.
 
 ## Deployment Surface
 

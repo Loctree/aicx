@@ -31,6 +31,12 @@ manual rummaging.
 
 ### Recommended daily order:
 
+At the start of every repository session, run
+`git fetch --all --verbose --no-prune-tags` before assessing remote branches
+or planning work. Preserve local tags even when global tag pruning is enabled.
+Record any remote failure; an incomplete fetch leaves that remote's state
+unverified.
+
 1. Loctree MCP
 2. Loct CLI
 3. Local tools (`rg`, `grep`, `awk`, `sed`, `cat`)

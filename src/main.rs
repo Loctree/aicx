@@ -1100,6 +1100,9 @@ enum ContinuityAction {
         /// Inclusive UTC window end (RFC3339); defaults to the current time.
         #[arg(long)]
         until: Option<chrono::DateTime<chrono::Utc>>,
+        /// Output mode (`pack`, `inject`, `handoff`, `summary`).
+        #[arg(long = "for", value_enum, value_name = "MODE")]
+        r#for: Option<aicx::continuity::ContinuityMode>,
         /// Bound the output to a prompt-inject budget (~6k tokens).
         #[arg(long)]
         for_inject: bool,
@@ -1111,12 +1114,14 @@ enum ContinuityAction {
         /// pack states that it did.
         #[arg(long, visible_alias = "distill_mixed")]
         distill_mixed: bool,
-        /// Include cross-project Codescribe bus speech addressed to this name
-        /// (case/diacritic-insensitive). Dictation has no addressee and is excluded.
-        #[arg(long = "as", value_name = "NAME")]
-        addressee: Option<String>,
+        /// Target agent/session/addressee selectors (repeatable or comma-separated):
+        /// Codescribe bus addressee names (`--as Andrzej`), session IDs or prefixes
+        /// (`--as 79c9a5ab`), `<agent>/<session_id>` (`--as agy/79c9a5ab`), or
+        /// provider names (`--as agy`).
+        #[arg(long = "as", value_name = "NAME", value_delimiter = ',')]
+        addressees: Vec<String>,
     },
-    /// Write the continuity pack to a file.
+    /// Write or append the continuity pack/handoff/summary to a file (append-only, deduplicated).
     Write {
         /// Catalog project filters (union).
         #[arg(short, long, value_delimiter = ',')]
@@ -1127,6 +1132,12 @@ enum ContinuityAction {
         /// Inclusive UTC window end (RFC3339); defaults to the current time.
         #[arg(long)]
         until: Option<chrono::DateTime<chrono::Utc>>,
+        /// Output mode (`pack`, `inject`, `handoff`, `summary`).
+        #[arg(long = "for", value_enum, value_name = "MODE")]
+        r#for: Option<aicx::continuity::ContinuityMode>,
+        /// Bound the output to a prompt-inject budget (~6k tokens).
+        #[arg(long)]
+        for_inject: bool,
         /// Output path.
         #[arg(short, long, default_value = "CONTINUITY.md")]
         output: PathBuf,
@@ -1138,10 +1149,12 @@ enum ContinuityAction {
         /// pack states that it did.
         #[arg(long, visible_alias = "distill_mixed")]
         distill_mixed: bool,
-        /// Include cross-project Codescribe bus speech addressed to this name
-        /// (case/diacritic-insensitive). Dictation has no addressee and is excluded.
-        #[arg(long = "as", value_name = "NAME")]
-        addressee: Option<String>,
+        /// Target agent/session/addressee selectors (repeatable or comma-separated):
+        /// Codescribe bus addressee names (`--as Andrzej`), session IDs or prefixes
+        /// (`--as 79c9a5ab`), `<agent>/<session_id>` (`--as agy/79c9a5ab`), or
+        /// provider names (`--as agy`).
+        #[arg(long = "as", value_name = "NAME", value_delimiter = ',')]
+        addressees: Vec<String>,
     },
 }
 
@@ -3305,45 +3318,59 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
             )?;
         }
         Some(Commands::Continuity { action }) => {
-            let (projects, hours, until, for_inject, output, no_refresh, distill_mixed, addressee) =
-                match action {
-                    ContinuityAction::Show {
-                        project,
-                        hours,
-                        until,
-                        for_inject,
-                        no_refresh,
-                        distill_mixed,
-                        addressee,
-                    } => (
-                        project,
-                        hours,
-                        until,
-                        for_inject,
-                        None,
-                        no_refresh,
-                        distill_mixed,
-                        addressee,
-                    ),
-                    ContinuityAction::Write {
-                        project,
-                        hours,
-                        until,
-                        output,
-                        no_refresh,
-                        distill_mixed,
-                        addressee,
-                    } => (
-                        project,
-                        hours,
-                        until,
-                        false,
-                        Some(output),
-                        no_refresh,
-                        distill_mixed,
-                        addressee,
-                    ),
-                };
+            let (
+                projects,
+                hours,
+                until,
+                mode,
+                for_inject,
+                output,
+                no_refresh,
+                distill_mixed,
+                addressees,
+            ) = match action {
+                ContinuityAction::Show {
+                    project,
+                    hours,
+                    until,
+                    r#for,
+                    for_inject,
+                    no_refresh,
+                    distill_mixed,
+                    addressees,
+                } => (
+                    project,
+                    hours,
+                    until,
+                    r#for.unwrap_or_default(),
+                    for_inject,
+                    None,
+                    no_refresh,
+                    distill_mixed,
+                    addressees,
+                ),
+                ContinuityAction::Write {
+                    project,
+                    hours,
+                    until,
+                    r#for,
+                    for_inject,
+                    output,
+                    no_refresh,
+                    distill_mixed,
+                    addressees,
+                } => (
+                    project,
+                    hours,
+                    until,
+                    r#for.unwrap_or_default(),
+                    for_inject,
+                    Some(output),
+                    no_refresh,
+                    distill_mixed,
+                    addressees,
+                ),
+            };
             let projects = if projects.is_empty() {
                 vec![current_checkout_project()?]
             } else {
@@ -3354,26 +3381,56 @@ fn run_command(command: Option<Commands>, project_fuzzy: bool) -> Result<()> {
             }
             let resolution = resolve_intents_project_filters(&projects, project_match)?;
             let aicx_home = aicx::aicx_home::ensure()?;
+            let written_at = chrono::Utc::now();
             let pack = aicx::continuity::build_with_scope_at(
                 &aicx_home,
                 &resolution.selected,
                 hours,
                 distill_mixed,
-                until.unwrap_or_else(chrono::Utc::now),
+                until.unwrap_or(written_at),
             )?;
-            let rendered = aicx::continuity::render_as(&pack, for_inject, addressee.as_deref())?;
             match output {
                 Some(path) => {
-                    std::fs::write(&path, &rendered)
-                        .with_context(|| format!("write continuity pack {}", path.display()))?;
+                    let report = aicx::continuity::write_continuity_file(
+                        &path,
+                        &pack,
+                        mode,
+                        for_inject,
+                        &addressees,
+                        written_at,
+                    )
+                    .with_context(|| format!("write continuity pack {}", path.display()))?;
                     eprintln!(
-                        "continuity pack written: {} ({} bytes, {} live session(s))",
+                        "continuity {} {}: {} ({} bytes, {} live session(s), {} new claim(s), {} deduplicated prior claim(s), written_at={})",
+                        match mode {
+                            aicx::continuity::ContinuityMode::Pack => "pack",
+                            aicx::continuity::ContinuityMode::Inject => "inject pack",
+                            aicx::continuity::ContinuityMode::Handoff => "handoff",
+                            aicx::continuity::ContinuityMode::Summary => "summary",
+                        },
+                        if report.appended {
+                            "appended"
+                        } else {
+                            "written"
+                        },
                         path.display(),
-                        rendered.len(),
-                        pack.live_sessions
+                        report.content.len(),
+                        pack.live_sessions,
+                        report.new_claims,
+                        report.deduplicated_claims,
+                        report.written_at
                     );
                 }
-                None => print!("{rendered}"),
+                None => {
+                    let rendered = aicx::continuity::render_for_targets(
+                        &pack,
+                        mode,
+                        for_inject,
+                        &addressees,
+                        written_at,
+                    )?;
+                    print!("{rendered}");
+                }
             }
         }
         Some(Commands::Tail {
@@ -4466,6 +4523,9 @@ const CURRENT_SESSION_ENV_KEYS: &[(&str, Option<&str>)] = &[
     ("CLAUDE_CODE_SESSION_ID", Some("claude")),
     ("CURSOR_CONVERSATION_ID", Some("cursor")),
     ("GEMINI_SESSION_ID", Some("gemini")),
+    ("AGY_SESSION_ID", Some("agy")),
+    ("ANTIGRAVITY_SESSION_ID", Some("agy")),
+    ("ANTIGRAVITY_CONVERSATION_ID", Some("agy")),
     ("JUNIE_SESSION_ID", Some("junie")),
     ("KIMI_SESSION_ID", Some("kimi")),
     ("COPILOT_SESSION_ID", Some("copilot")),
@@ -4477,6 +4537,7 @@ const CURRENT_SESSION_ENV_KEYS: &[(&str, Option<&str>)] = &[
 
 fn run_sessions_current(json: bool) -> Result<()> {
     let current = current_session_from_env()
+        .or_else(current_session_from_agy_active)
         .or_else(current_session_from_grok_active)
         .or_else(|| current_session_from_disk().ok().flatten());
     let Some(current) = current else {
@@ -4495,6 +4556,58 @@ fn run_sessions_current(json: bool) -> Result<()> {
 
 fn current_session_from_env() -> Option<CurrentSessionPayload> {
     current_session_from_env_lookup(|key| std::env::var(key).ok())
+}
+
+/// When running inside Antigravity (`ANTIGRAVITY_AGENT`, `ANTIGRAVITY_APP_DATA_DIR`,
+/// or `ANTIGRAVITY_CLI_ALIAS` set in env), prefer the newest `agy` conversation DB
+/// for the current checkout before falling back to the cross-agent disk scan.
+fn current_session_from_agy_active() -> Option<CurrentSessionPayload> {
+    let agy_env_present = [
+        "ANTIGRAVITY_AGENT",
+        "ANTIGRAVITY_APP_DATA_DIR",
+        "ANTIGRAVITY_CLI_ALIAS",
+    ]
+    .iter()
+    .any(|key| {
+        std::env::var(key)
+            .ok()
+            .is_some_and(|val| !val.trim().is_empty())
+    });
+    if !agy_env_present {
+        return None;
+    }
+    let home = aicx::os_user_home()?;
+    let here = std::env::current_dir().ok()?.to_string_lossy().into_owned();
+    let since_dt = Utc::now() - chrono::Duration::days(7);
+    let modified_after = std::time::SystemTime::UNIX_EPOCH
+        + std::time::Duration::from_secs(since_dt.timestamp().max(0) as u64);
+    let mut roots = aicx::session_catalog::agy_session_roots(&home);
+    if let Ok(app_data) = std::env::var("ANTIGRAVITY_APP_DATA_DIR") {
+        let trimmed = app_data.trim();
+        if !trimmed.is_empty() {
+            let conv_root = PathBuf::from(trimmed).join("conversations");
+            if !roots.contains(&conv_root) {
+                roots.insert(0, conv_root);
+            }
+        }
+    }
+    let mut discovered = Vec::new();
+    for root in roots {
+        discovered.extend(sessions::discover_agy_sessions(
+            &root,
+            Some(modified_after),
+            Some(&here),
+        ));
+    }
+    let mut selected =
+        sessions::select_sessions(discovered, Some(&here), Some("agy"), Some(since_dt), 1);
+    let info = selected.pop()?;
+    Some(CurrentSessionPayload {
+        session_id: info.session_id,
+        source: "agy:active-conversations".to_string(),
+        agent: Some("agy".to_string()),
+        repo_path: info.repo_path,
+    })
 }
 
 /// Grok explicitly tracks the live session (with cwd) in ~/.grok/active_sessions.json.
@@ -4532,13 +4645,32 @@ fn current_session_from_env_lookup(
         };
         if value.is_empty() {
             continue;
-        }
+        };
         return Some(CurrentSessionPayload {
             session_id: value,
             source: format!("env:{key}"),
             agent: agent.map(str::to_string),
             repo_path: None,
         });
+    }
+    if let Some(raw) = get("ANTIGRAVITY_SOURCE_METADATA")
+        && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&raw)
+    {
+        let conv_id = parsed
+            .pointer("/tool/conversationId")
+            .or_else(|| parsed.pointer("/conversationId"))
+            .or_else(|| parsed.pointer("/sessionId"))
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        if let Some(id) = conv_id {
+            return Some(CurrentSessionPayload {
+                session_id: id.to_string(),
+                source: "env:ANTIGRAVITY_SOURCE_METADATA".to_string(),
+                agent: Some("agy".to_string()),
+                repo_path: None,
+            });
+        }
     }
     None
 }
@@ -10550,7 +10682,7 @@ fn run_index(
         None
     } else {
         Some(aicx::locks::acquire_exclusive(
-            aicx::locks::lance_lock_path()?,
+            aicx::locks::index_lock_path()?,
         )?)
     };
     let report = aicx::source_index::build_with_reporter(

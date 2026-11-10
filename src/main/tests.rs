@@ -791,6 +791,35 @@ fn current_session_prefers_codex_thread_id_env() {
 }
 
 #[test]
+fn current_session_resolves_agy_env_keys_and_source_metadata() {
+    for key in [
+        "AGY_SESSION_ID",
+        "ANTIGRAVITY_SESSION_ID",
+        "ANTIGRAVITY_CONVERSATION_ID",
+    ] {
+        let current = current_session_from_env_lookup(|k| {
+            (k == key).then(|| "79c9a5ab-f30e-4a23-9c03-ff1a1e178b7c".to_string())
+        })
+        .expect("agy session from env");
+        assert_eq!(current.session_id, "79c9a5ab-f30e-4a23-9c03-ff1a1e178b7c");
+        assert_eq!(current.source, format!("env:{key}"));
+        assert_eq!(current.agent.as_deref(), Some("agy"));
+    }
+
+    let from_meta = current_session_from_env_lookup(|k| match k {
+        "ANTIGRAVITY_SOURCE_METADATA" => Some(
+            r#"{"tool":{"conversationId":"79c9a5ab-f30e-4a23-9c03-ff1a1e178b7c","stepIndex":42}}"#
+                .to_string(),
+        ),
+        _ => None,
+    })
+    .expect("agy session from ANTIGRAVITY_SOURCE_METADATA");
+    assert_eq!(from_meta.session_id, "79c9a5ab-f30e-4a23-9c03-ff1a1e178b7c");
+    assert_eq!(from_meta.source, "env:ANTIGRAVITY_SOURCE_METADATA");
+    assert_eq!(from_meta.agent.as_deref(), Some("agy"));
+}
+
+#[test]
 fn sessions_current_command_parses_json_flag() {
     let cli = Cli::try_parse_from(["aicx", "sessions", "current", "--json"])
         .expect("sessions current should parse");

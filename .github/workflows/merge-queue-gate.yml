@@ -6,8 +6,9 @@ name: Merge Queue Gate
 # status contexts on this gate to pass before merging the queued PR into
 # main.
 #
-# Per platform (macos-15 | ubuntu-latest | windows-latest) on hosted
-# runners, keeping operator-owned signing credentials out of pre-merge jobs:
+# Per platform (macos-15 | macos-15-intel | ubuntu-latest | ubuntu-24.04-arm |
+# windows-latest) on hosted runners, keeping operator-owned signing
+# credentials out of pre-merge jobs:
 #   1. Build the release bundle (real artifacts, single platform per job)
 #   2. Dry-run npm publish for the matching platform-package
 #
@@ -54,6 +55,12 @@ jobs:
           - platform: darwin-arm64
             runs_on: macos-15
             npm_package_dir: distribution/npm/aicx/platform-packages/darwin-arm64
+          - platform: darwin-x64
+            runs_on: macos-15-intel
+            npm_package_dir: distribution/npm/aicx/platform-packages/darwin-x64
+          - platform: linux-arm64-gnu
+            runs_on: ubuntu-24.04-arm
+            npm_package_dir: distribution/npm/aicx/platform-packages/linux-arm64-gnu
           - platform: linux-x64-gnu
             runs_on: ubuntu-latest
             npm_package_dir: distribution/npm/aicx/platform-packages/linux-x64-gnu

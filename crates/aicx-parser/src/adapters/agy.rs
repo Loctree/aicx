@@ -241,6 +241,7 @@ struct StreamRow {
 struct Draft {
     segment: Segment,
     workdirs: Vec<WorkdirEvidence>,
+    closed: bool,
 }
 
 struct Call {
@@ -543,6 +544,7 @@ fn project_row(state: &mut Analysis, evidence: RawUnitRef, project: &Project) {
                         if is_dispatch(&text) {
                             state.inject("dispatch_brief", text, stamp, evidence);
                         } else {
+                            state.new_window(&stamp);
                             state.speech(TransportRole::User, text, stamp, evidence);
                         }
                     }
@@ -792,6 +794,9 @@ impl Analysis {
     }
 
     fn observe_workdirs(&mut self, name: &str, arguments: &Value, root: &Node) {
+        if !SHELL_TOOLS.contains(&name) {
+            return;
+        }
         let mut args = arguments.clone();
         if let Some(object) = args.as_object_mut()
             && !object.contains_key("workdir")
@@ -845,11 +850,32 @@ impl Analysis {
         }
     }
 
+    fn new_window(&mut self, stamp: &Known<String>) {
+        let has_user_msg = self.drafts.last().is_some_and(|draft| {
+            let start = draft.segment.turn_range.start as usize;
+            start < self.turns.len()
+                && self.turns[start..]
+                    .iter()
+                    .any(|turn| turn.kind == TurnKind::UserMsg)
+        });
+        if has_user_msg {
+            self.finalize_window();
+            if let Some(draft) = self.drafts.last_mut() {
+                draft.segment.ended_at = stamp.clone();
+                draft.closed = true;
+            }
+            if matches!(stamp, Known::Value(_)) {
+                self.segment_started = stamp.clone();
+            }
+        }
+    }
+
     fn ensure_segment(&mut self) {
-        if self.drafts.is_empty() {
+        let need_new = self.drafts.last().is_none_or(|draft| draft.closed);
+        if need_new {
             self.drafts.push(Draft {
                 segment: Segment {
-                    segment_id: 0,
+                    segment_id: self.drafts.len() as u32,
                     cwd: self.current_cwd.clone(),
                     branch: Known::unknown(),
                     started_at: self.segment_started.clone(),
@@ -867,6 +893,7 @@ impl Analysis {
                     scope_workdirs: Vec::new(),
                 },
                 workdirs: Vec::new(),
+                closed: false,
             });
         }
     }

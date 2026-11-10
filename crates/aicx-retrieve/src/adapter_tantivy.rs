@@ -231,6 +231,37 @@ impl TantivyAdapter {
         Ok(matches)
     }
 
+    /// Read all committed chunks directly from the index segments without scoring or sorting.
+    pub fn read_all_chunks(&self) -> Result<Vec<ChunkRef>> {
+        if self.doc_count == 0 {
+            return Ok(Vec::new());
+        }
+        let reader = self.index.reader().context("open tantivy reader")?;
+        let searcher = reader.searcher();
+        let mut chunks = Vec::with_capacity(self.doc_count);
+        for (seg_ord, segment) in searcher.segment_readers().iter().enumerate() {
+            for doc_id in 0..segment.max_doc() {
+                if segment.is_deleted(doc_id) {
+                    continue;
+                }
+                let address = DocAddress::new(seg_ord as u32, doc_id);
+                let hit = self.hit_from_doc(&searcher, 0.0, 0, address)?;
+                let document: TantivyDocument = searcher
+                    .doc(address)
+                    .context("load tantivy chunk document")?;
+                let text = text_or_empty(&document, self.fields.body);
+                let source_path = text_or_empty(&document, self.fields.source_path);
+                chunks.push(ChunkRef {
+                    id: hit.chunk_id,
+                    source_path,
+                    text,
+                    metadata: hit.metadata,
+                });
+            }
+        }
+        Ok(chunks)
+    }
+
     /// Enumerate the exact committed chunk ids without decoding stored bodies.
     ///
     /// `id` is a unique STRING term, so the term dictionary is the cheapest

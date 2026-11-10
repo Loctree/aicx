@@ -222,15 +222,25 @@ fn load_source_conversation_inner(
     }
     let (read_path, frames, scope, coverage, scope_receipt) =
         crate::source_index::read_catalog_conversation_checked_with_scope_receipt_at(home, entry)?;
-    unchanged()?;
+    validate_reader_root(&root, &canonical_home, &root_identity)?;
+    if source_policy(home, "aicx/reader")? != policy {
+        bail!(
+            "intent source or ignore policy changed during its read; retry after the writer settles"
+        );
+    }
     if read_path != *path {
         bail!("intent source changed resolved path during its read");
     }
     if !crate::source_index::conversation_scope_receipt_is_current(entry, &scope_receipt) {
         bail!("intent source repository layout changed during its read");
     }
-    if coverage.cacheable() {
-        unchanged()?;
+    let after_state = source_state(&allow, &entry.source_path);
+    if !matches!(&after_state, SourceState::Ready { path: after_path, .. } if after_path == path) {
+        bail!(
+            "intent source or ignore policy changed during its read; retry after the writer settles"
+        );
+    }
+    if coverage.cacheable() && after_state == state {
         atomic_write_json(
             &slot,
             &ConversationCache {
@@ -243,8 +253,18 @@ fn load_source_conversation_inner(
                 scope_receipt: scope_receipt.clone(),
             },
         )?;
-        unchanged()?;
-        if !crate::source_index::conversation_scope_receipt_is_current(entry, &scope_receipt) {
+        validate_reader_root(&root, &canonical_home, &root_identity)?;
+        if source_policy(home, "aicx/reader")? != policy {
+            let _ = fs::remove_file(&slot);
+            bail!(
+                "intent source or ignore policy changed during its read; retry after the writer settles"
+            );
+        }
+        if source_state(&allow, &entry.source_path) != state {
+            let _ = fs::remove_file(&slot);
+        } else if !crate::source_index::conversation_scope_receipt_is_current(entry, &scope_receipt)
+        {
+            let _ = fs::remove_file(&slot);
             bail!("intent source repository layout changed while publishing its cache");
         }
     }

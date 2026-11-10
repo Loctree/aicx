@@ -77,7 +77,7 @@ fn cached_alternative_hint(requested: Option<crate::EmbeddingProfile>) -> String
 }
 
 /// Probe the HF cache for every known embedding profile and return the
-/// subset that has a usable snapshot. Order is `Base, Dev, Premium`.
+/// subset that has a usable snapshot. Order is `Base, Dev, Premium, Large, Max`.
 ///
 /// Used by the operator UX surface: when the configured profile is not
 /// hydrated, we can suggest an alternative that already lives on disk
@@ -95,6 +95,8 @@ pub fn detect_cached_profiles_in(bases: &[PathBuf]) -> Vec<crate::EmbeddingProfi
         EmbeddingProfile::Base,
         EmbeddingProfile::Dev,
         EmbeddingProfile::Premium,
+        EmbeddingProfile::Large,
+        EmbeddingProfile::Max,
     ]
     .into_iter()
     .filter(|profile| {

@@ -221,6 +221,92 @@ fn server_shell_includes_highlight_styles_and_wiring() {
 }
 
 #[test]
+fn server_shell_exposes_full_stage_setup_for_first_run_and_configured_homes() {
+    for survey_required in [true, false] {
+        let html = render_server_shell_html_for("AICX Dashboard", true, survey_required);
+        for id in [
+            "ctx-nav-setup",
+            "ctx-onboarding-studio",
+            "ctx-ob-sources",
+            "ctx-ob-phrases",
+            "ctx-ob-embedder",
+            "ctx-ob-services",
+            "ctx-ob-finish",
+            "ctx-ob-complete-btn",
+            "ctx-ob-discover-phrases",
+            "ctx-ob-preview-input",
+            "ctx-ob-preview-btn",
+            "ctx-ob-preview-results",
+        ] {
+            assert_eq!(html.matches(&format!("id=\"{id}\"")).count(), 1, "{id}");
+        }
+        assert!(html.contains("id=\"ctx-nav-setup\" data-view=\"setup\""));
+        assert!(
+            html.contains("id=\"ctx-onboarding-studio\" aria-labelledby=\"ctx-ob-title\" hidden")
+        );
+        assert!(html.contains("Complete Setup &amp; Build Index"));
+        assert!(html.contains("Tantivy BM25"));
+        for profile_opt in [
+            "value=\"base\"",
+            "value=\"dev\"",
+            "value=\"premium\"",
+            "value=\"large\"",
+            "value=\"max\"",
+        ] {
+            assert!(
+                html.contains(profile_opt),
+                "missing profile option {profile_opt}"
+            );
+        }
+        assert_eq!(html.contains("id=\"ctx-onboarding\""), survey_required);
+        assert_eq!(
+            html.contains("id=\"ctx-open-onboarding-studio\""),
+            survey_required
+        );
+    }
+}
+
+#[test]
+fn server_onboarding_uses_frozen_api_contract_and_waits_for_readiness() {
+    let html = render_server_shell_html("AICX Dashboard");
+    for endpoint in [
+        "/api/onboarding/state",
+        "/api/onboarding/phrase-suggestions",
+        "/api/onboarding/preview-phrases",
+    ] {
+        assert!(html.contains(&format!("onboardingJson('{endpoint}'")));
+    }
+    assert!(html.contains("data.survey_required === true && !onboarding.autoOpened"));
+    assert!(html.contains("data.matched_samples.forEach"));
+    assert!(html.contains("data.candidate_openers.forEach"));
+    assert!(html.contains("build_initial_index: true"));
+    assert!(html.contains("selected_mcp_clients: clients"));
+    assert!(html.contains("onboarding.building = data.rebuilding === true"));
+    assert!(html.contains("if (data.ready && !data.survey_required)"));
+    assert!(html.contains("if (state.view === 'setup') showSessions()"));
+    assert!(html.contains("Preview uses the active dictionary"));
+    // Discovery payloads are private user text: render as text, never markup.
+    assert!(html.contains("item.textContent = sample.text"));
+    assert!(html.contains("chip.title = candidate.sample_line"));
+    assert!(!html.contains("innerHTML = sample.text"));
+}
+
+#[test]
+fn server_onboarding_dom_references_resolve_in_both_shell_variants() {
+    let ids = Regex::new(r#"\$\('(ctx-ob-[a-z-]+)'\)"#).unwrap();
+    for survey_required in [true, false] {
+        let html = render_server_shell_html_for("AICX Dashboard", true, survey_required);
+        for captures in ids.captures_iter(assets::DASHBOARD_SERVER_SCRIPT) {
+            let id = &captures[1];
+            assert!(
+                html.contains(&format!("id=\"{id}\"")),
+                "missing DOM target {id}"
+            );
+        }
+    }
+}
+
+#[test]
 fn server_shell_includes_browser_bearer_auth_wiring() {
     let html = render_server_shell_html("AI Context Browser");
 
