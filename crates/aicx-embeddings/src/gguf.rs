@@ -4,11 +4,13 @@ use std::sync::OnceLock;
 
 use anyhow::{Context, Result, anyhow};
 use llama_cpp_2::{
+    LogOptions,
     context::params::{LlamaAttentionType, LlamaContextParams, LlamaPoolingType},
     llama_backend::LlamaBackend,
     llama_batch::LlamaBatch,
     model::LlamaModel,
     model::params::LlamaModelParams,
+    send_logs_to_tracing,
 };
 use tracing::{info, warn};
 
@@ -175,16 +177,15 @@ impl LocalEmbeddingProvider for GgufEmbeddingProvider {
 
 fn global_backend() -> Result<&'static LlamaBackend> {
     let result = LLAMA_BACKEND.get_or_init(|| {
-        let mut backend = LlamaBackend::init().map_err(|err| err.to_string())?;
         if std::env::var("AICX_LLAMA_LOGS")
             .map(|value| value != "0")
             .unwrap_or(false)
         {
             // Keep llama.cpp logs visible only when explicitly requested.
         } else {
-            backend.void_logs();
+            send_logs_to_tracing(LogOptions::default().with_logs_enabled(false));
         }
-        Ok(backend)
+        LlamaBackend::init().map_err(|err| err.to_string())
     });
     result
         .as_ref()
