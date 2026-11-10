@@ -20,9 +20,7 @@ use aicx::embedder::{EmbedderConfig, EmbedderEngine, NativeEmbeddingSource};
 
 const REQUIRE_NATIVE_MODEL: &str = "AICX_REQUIRE_NATIVE_MODEL";
 const LOG_CHILD_ENV: &str = "AICX_NATIVE_LOG_CHILD";
-/// Probe entry. It is not its own `#[test]`: the C1b verifier matches the
-/// literal `test result: ok. 2 passed`, so this file must keep exactly two tests.
-const LOG_CHILD_TEST: &str = "source_describes_runtime_provenance";
+const LOG_CHILD_TEST: &str = "native_log_child_probe";
 const SKIP_MODEL: &str = "skip: no GGUF embedder model available in local HF cache";
 const TOKENIZE_CONTEXT: &str = "failed to tokenize text for GGUF embeddings";
 
@@ -74,8 +72,17 @@ fn engine_embeds_and_returns_unit_norm_vectors() {
         .expect("embed_batch should succeed");
 
     assert_eq!(vectors.len(), 3);
-    for (idx, vector) in vectors.iter().enumerate() {
-        assert_unit_norm(vector, engine.dimension(), &format!("vector {idx}"));
+    for (idx, v) in vectors.iter().enumerate() {
+        assert_eq!(
+            v.len(),
+            engine.dimension(),
+            "vector {idx} has unexpected dimension"
+        );
+        let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!(
+            (norm - 1.0).abs() < 1e-2,
+            "vector {idx} should be L2-normalised (got norm={norm})"
+        );
     }
 
     // Semantic sanity: identical text embeds to the same vector.
@@ -84,27 +91,10 @@ fn engine_embeds_and_returns_unit_norm_vectors() {
         .expect("single embed should succeed");
     let sim = EmbedderEngine::similarity(&repeat, &vectors[0]);
     assert!(sim > 0.999, "self-similarity should be ~1.0 (got {sim})");
-
-    assert_gguf_tokenization(&mut engine);
-    drop(engine);
-    assert_llama_logs_silent_unless_requested();
 }
 
 #[test]
 fn source_describes_runtime_provenance() {
-    // Selected by AICX_NATIVE_LOG_CHILD=1 from the log probe. Normal runs do
-    // not take this path, so the probe does not replace the source check.
-    if std::env::var(LOG_CHILD_ENV).ok().as_deref() == Some("1") {
-        let _guard = native_guard();
-        let Some(mut engine) = open_native_engine(SKIP_MODEL) else {
-            return;
-        };
-        engine
-            .embed("log silence probe")
-            .expect("child embed should succeed");
-        return;
-    }
-
     let _guard = native_guard();
     let Some(engine) =
         open_native_engine("skip: no GGUF embedder model available for source check")
@@ -125,14 +115,19 @@ fn source_describes_runtime_provenance() {
                 "HF cache model file should point at a real file"
             );
         }
-        NativeEmbeddingSource::ExplicitPath(path) => assert!(path.exists()),
+        NativeEmbeddingSource::ExplicitPath(p) => assert!(p.exists()),
         NativeEmbeddingSource::CloudEndpoint(_) => {
             panic!("native embedder source check should not use a cloud endpoint")
         }
     }
 }
 
-fn assert_gguf_tokenization(engine: &mut EmbedderEngine) {
+#[test]
+fn gguf_tokenization_guards() {
+    let _guard = native_guard();
+    let Some(mut engine) = open_native_engine(SKIP_MODEL) else {
+        return;
+    };
     let dimension = engine.dimension();
 
     let nul_err = engine
@@ -171,7 +166,8 @@ fn assert_gguf_tokenization(engine: &mut EmbedderEngine) {
     assert_unit_norm(&first, dimension, "repeated text");
 }
 
-fn assert_llama_logs_silent_unless_requested() {
+#[test]
+fn llama_logs_stay_silent_unless_requested() {
     let silent = run_log_child(None);
     if child_skipped(&silent) {
         if native_model_required() {
@@ -197,6 +193,22 @@ fn assert_llama_logs_silent_unless_requested() {
         loud_stderr.contains("ggml_") || loud_stderr.contains("llama_model_load"),
         "AICX_LLAMA_LOGS=1 stderr must contain ggml_ or llama_model_load:\n{loud_stderr}"
     );
+}
+
+/// Opens the engine and embeds once when `AICX_NATIVE_LOG_CHILD=1`.
+/// Otherwise returns without loading a model.
+#[test]
+fn native_log_child_probe() {
+    if std::env::var(LOG_CHILD_ENV).ok().as_deref() != Some("1") {
+        return;
+    }
+    let _guard = native_guard();
+    let Some(mut engine) = open_native_engine(SKIP_MODEL) else {
+        return;
+    };
+    engine
+        .embed("log silence probe")
+        .expect("child embed should succeed");
 }
 
 fn run_log_child(llama_logs: Option<&str>) -> Output {

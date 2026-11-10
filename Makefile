@@ -194,10 +194,11 @@ test-native:
 	cargo test --locked -p aicx-embeddings --features gguf
 	cargo test --locked -p aicx --features native-embedder --test native_embedder
 
-# Same commands as test-native. A missing GGUF model fails instead of skipping.
+# native_embedder tests fail instead of skipping when the GGUF model is missing.
+# aicx-embeddings does not read AICX_REQUIRE_NATIVE_MODEL.
 # CI calls the cargo lines itself and does not use this target.
 test-native-live:
-	AICX_REQUIRE_NATIVE_MODEL=1 cargo test --locked -p aicx-embeddings --features gguf
+	cargo test --locked -p aicx-embeddings --features gguf
 	AICX_REQUIRE_NATIVE_MODEL=1 cargo test --locked -p aicx --features native-embedder --test native_embedder -- --nocapture
 
 # End-to-end pipeline test against operator's canonical ~/.aicx/config.toml.
@@ -499,7 +500,7 @@ help:
 	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'check' '- Full local gate (fmt, check, clippy, test, build, semgrep)'
 	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'test' '- Run all tests'
 	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'test-native' '- Run native GGUF embedder tests'
-	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'test-native-live' '- Native GGUF tests; missing model fails'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'test-native-live' '- native_embedder fails if the GGUF model is missing'
 	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'fmt' '- Format all Rust code'
 	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'clean' '- Clean build artifacts'
 	@printf '\n'
