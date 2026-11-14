@@ -1281,7 +1281,7 @@ fn install_reindex_schedule_in(
     }
     // launchd starts the job without AICX_HOME, so it indexes the home a bare
     // `aicx` resolves. A schedule that updates a different home is worse than none.
-    let scheduled_home = crate::aicx_home::resolve_from(None, user_home).ok();
+    let scheduled_home = crate::aicx_home::resolve_from(None, Some(user_home)).ok();
     if !scheduled_home.is_some_and(|scheduled| same_path(&scheduled, home)) {
         return ServiceInstall::Skipped {
             reason: format!(
@@ -2987,11 +2987,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            crate::aicx_home::resolve_from(None, &root).unwrap(),
+            crate::aicx_home::resolve_from(None, Some(&root)).unwrap(),
             configured
         );
         assert_eq!(
-            crate::aicx_home::resolve_from(Some(std::ffi::OsString::new()), &root).unwrap(),
+            crate::aicx_home::resolve_from(Some(std::ffi::OsString::new()), Some(&root)).unwrap(),
             configured
         );
         assert!(

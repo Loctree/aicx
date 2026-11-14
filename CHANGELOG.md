@@ -3,8 +3,28 @@
 All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
-
 ## [Unreleased]
+
+## [0.15.1] - 2026-11-14
+
+### Fixed
+
+- Runtime root resolution honors a non-empty `AICX_HOME` even when the OS home
+  is unavailable. Explicitly permitted temporary paths also remain readable
+  without a user/home entry; other paths retain the existing allowlist checks.
+- `aicx search --deep` now opens the published `CURRENT` manifest and mmap
+  generation directly. Source-driven semantic builds are searchable without
+  the retired `embeddings.ndjson` file, both globally and with a project filter.
+- Primary NDJSON is used only by explicit `--legacy-dense` recovery. A corrupt
+  published generation remains a typed error instead of silently reading stale
+  vectors. Real CLI regression coverage publishes an index, queries it without
+  NDJSON, and verifies fail-closed handling of a corrupt manifest.
+
+### Distribution
+
+- Synchronize all five prebuilt npm platform packages and the wrapper at 0.15.1
+  for a coordinated release following the partially published 0.15.0 artifacts.
+  User installs remain script-free and require no Rust toolchain.
 
 ## [0.15.0] - 2026-11-10
 

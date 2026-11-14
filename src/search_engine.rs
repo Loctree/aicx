@@ -618,12 +618,9 @@ struct SemanticRetrievalFilters<'a> {
 fn index_not_built_error(path: std::path::PathBuf, project_filter: Option<&str>) -> SemanticError {
     let recommendation = match project_filter {
         Some(p) => format!(
-            "run `aicx index` to build the global index used by `search -p {p}`; \
-             optionally run `aicx index --project {p}` to materialize a local project cache"
+            "run `aicx index --semantic` to publish the global semantic generation used by `search -p {p} --deep`"
         ),
-        None => {
-            "run `aicx index` (one-off; subsequent runs query the index in-process)".to_string()
-        }
+        None => "run `aicx index --semantic` to publish a semantic generation".to_string(),
     };
     let legacy_hint = legacy_index_hint(project_filter, &path)
         .map(|hint| format!(" {hint}"))
@@ -1424,20 +1421,29 @@ fn try_semantic_search_native(
     // not pay a model/config bootstrap (the most expensive step) on every
     // call. Functionally identical to checking after; the order is what saves
     // the CPU.
-    let project_index_path = crate::vector_index::index_path(project_filter).map_err(|err| {
-        SemanticError::IndexNotBuilt {
+    let legacy_dense = candidate_filters.is_some_and(|filters| filters.legacy_dense);
+    // The source publisher commits a manifest + mmap generation, without a
+    // primary NDJSON. Only explicit legacy recovery may require that old file.
+    let resolve_path = if legacy_dense {
+        crate::vector_index::index_path
+    } else {
+        crate::vector_index::hybrid_manifest_path
+    };
+    let project_index_path =
+        resolve_path(project_filter).map_err(|err| SemanticError::IndexNotBuilt {
             path: std::path::PathBuf::new(),
             reason: format!("could not resolve index path: {err}"),
-            recommendation: "ensure $AICX_HOME (or $HOME) is writable, then run `aicx index`"
-                .to_string(),
-        }
-    })?;
+            recommendation:
+                "ensure $AICX_HOME (or $HOME) is writable, then run `aicx index --semantic`"
+                    .to_string(),
+        })?;
     let all_index_path = if project_filter.is_some() {
-        crate::vector_index::index_path(None).map_err(|err| SemanticError::IndexNotBuilt {
+        resolve_path(None).map_err(|err| SemanticError::IndexNotBuilt {
             path: std::path::PathBuf::new(),
             reason: format!("could not resolve _all index path: {err}"),
-            recommendation: "ensure $AICX_HOME (or $HOME) is writable, then run `aicx index`"
-                .to_string(),
+            recommendation:
+                "ensure $AICX_HOME (or $HOME) is writable, then run `aicx index --semantic`"
+                    .to_string(),
         })?
     } else {
         project_index_path.clone()
@@ -1451,10 +1457,9 @@ fn try_semantic_search_native(
         return Err(SemanticError::IndexCorrupt {
             path: path.clone(),
             reason: format!("cannot stat index file: {err}"),
-            recommendation: format!(
-                "delete and rebuild: `rm -f {} && aicx index`",
-                path.display()
-            ),
+            recommendation:
+                "verify index file permissions and inspect `aicx index status` before retrying"
+                    .to_string(),
         });
     }
 
@@ -1488,7 +1493,7 @@ fn try_semantic_search_native(
 
     // Read header line first so we can detect dimension mismatch BEFORE
     // touching any vectors.
-    if let Some(header) = read_index_header(&path) {
+    if legacy_dense && let Some(header) = read_index_header(&path) {
         if header.dimension != embedder_dim {
             return Err(SemanticError::DimensionMismatch {
                 path: path.clone(),
@@ -1549,15 +1554,6 @@ fn try_semantic_search_native(
         });
     }
 
-    let manifest_path =
-        crate::vector_index::hybrid_manifest_path(scope.index_project).map_err(|err| {
-            SemanticError::IndexCorrupt {
-                path: path.clone(),
-                reason: format!("could not resolve hybrid manifest path: {err}"),
-                recommendation: "ensure $AICX_HOME (or $HOME) is writable, then run `aicx index`"
-                    .to_string(),
-            }
-        })?;
     // Embed the query once — both the hybrid path and the dense-only
     // fallback need the query vector.
     let query_embedding = match engine.embed(query) {
@@ -1572,8 +1568,6 @@ fn try_semantic_search_native(
             });
         }
     };
-
-    let legacy_dense = candidate_filters.map(|f| f.legacy_dense).unwrap_or(false);
 
     let retrieval_filters = SemanticRetrievalFilters {
         kind: kind_filter,
@@ -1605,35 +1599,9 @@ fn try_semantic_search_native(
         .map(|outcome| (outcome, CandidateBoundary::default()));
     }
 
-    // A missing manifest means no hybrid generation was ever published, so
-    // the committed primary index may serve an explicit dense-only fallback.
-    // Once a manifest exists it is authoritative: stale/corrupt generation
-    // state fails closed and never activates the old reader implicitly.
-    let hybrid = if manifest_path.exists() {
-        // A published manifest is authoritative. Any parse, binding, lexical,
-        // or mmap failure is corruption/staleness and must escape as a typed
-        // error; reading the old primary NDJSON here would hide a broken
-        // generation behind stale data.
-        load_hybrid_index(scope.index_project, &path, &info, &manifest_path)?
-    } else {
-        // Manifest was never committed — serve dense-only directly from the
-        // primary committed index (already validated above: exists, correct
-        // dimension, non-empty).
-        return query_dense_only_from_primary_filtered(
-            &path,
-            &query_embedding,
-            embedder_dim,
-            limit,
-            retrieval_filters,
-            &info.model_id,
-            if scope.used_global_project_scope {
-                BACKEND_SEMANTIC_DENSE_ONLY_GLOBAL_SCOPED
-            } else {
-                BACKEND_SEMANTIC_DENSE_ONLY
-            },
-        )
-        .map(|outcome| (outcome, CandidateBoundary::default()));
-    };
+    // The selected published manifest is authoritative. Never silently query
+    // an old NDJSON when the generation is absent, stale, or corrupt.
+    let hybrid = load_hybrid_index(scope.index_project, &path, &info, &path)?;
     let manifest = hybrid.manifest().cloned();
     let filters = hybrid_filters(retrieval_filters);
     let extra_filter_active = candidate_filters.is_some_and(supported_candidate_filter_active);
@@ -1854,9 +1822,9 @@ fn load_hybrid_index(
 /// (`index_path` = `vector_index::index_path`, i.e. `indexed/<bucket>/embeddings.ndjson`)
 /// directly, bypassing the hybrid manifest + tantivy lexical layer entirely.
 ///
-/// Engaged only when no hybrid manifest has been published, or when the
-/// operator explicitly selects `--legacy-dense`. A present but invalid
-/// generation fails closed instead of reading stale primary vectors.
+/// Production retrieval uses this reader only when the operator explicitly
+/// selects `--legacy-dense`. Normal deep retrieval requires a published
+/// generation and fails closed instead of reading stale primary vectors.
 ///
 /// This is NOT the doctrinal "silent fuzzy fallback" (see module docs): it is
 /// explicit semantic search over real embeddings, surfaced via
@@ -4224,7 +4192,7 @@ mod tests {
 
     /// A published but corrupt manifest is a typed stale-generation error.
     /// The caller propagates this error and may only use the primary NDJSON
-    /// path when the manifest is absent or the operator chose --legacy-dense.
+    /// path when the operator explicitly chose --legacy-dense.
     #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
     #[test]
     fn corrupt_published_manifest_fails_before_any_adapter_is_opened() {

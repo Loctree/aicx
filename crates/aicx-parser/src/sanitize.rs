@@ -257,16 +257,17 @@ fn is_under_allowed_base(path: &Path) -> Result<bool> {
     // reads under the user dirs (incl. %TEMP%, which lives under the local cache
     // dir) are not wrongly rejected on Windows. No-op on Unix.
     let path = strip_verbatim_prefix(path);
+    // Explicit tempfile permission does not depend on the process having an
+    // OS user/home entry (for example in a container running under a bare UID).
+    if path_is_temp_allowlisted(&path) {
+        return Ok(true);
+    }
     for base in current_user_allowed_bases()? {
         let base = base.canonicalize().unwrap_or(base);
         let base = strip_verbatim_prefix(&base);
         if path.starts_with(&base) {
             return Ok(true);
         }
-    }
-
-    if is_temp_allowlist_path(&path) {
-        return Ok(temp_allowlist_enabled());
     }
 
     Ok(false)
@@ -480,18 +481,15 @@ pub fn read_dir_validated(path: &Path) -> Result<std::fs::ReadDir> {
 
 fn matching_allowed_base(canonical: &Path) -> Result<PathBuf> {
     let path = strip_verbatim_prefix(canonical);
+    if path_is_temp_allowlisted(&path) {
+        return Ok(path.parent().unwrap_or(&path).to_path_buf());
+    }
     for base in current_user_allowed_bases()? {
         let base = base.canonicalize().unwrap_or(base);
         let base = strip_verbatim_prefix(&base);
         if path.starts_with(&base) {
             return Ok(base);
         }
-    }
-    if is_temp_allowlist_path(&path) && temp_allowlist_enabled() {
-        if let Some(parent) = path.parent() {
-            return Ok(parent.to_path_buf());
-        }
-        return Ok(path);
     }
     Err(anyhow!(
         "Cannot read dir outside allowed bases: {}",
