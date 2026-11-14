@@ -9,6 +9,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Refuse publication that replaces a usable semantic generation with one
+  without valid vectors. A lexical refresh of a changed corpus keeps `CURRENT`
+  and reports that additions, edits, deletions and privacy changes were not
+  published; `aicx index --semantic` is required for the replacement.
 - Runtime root resolution honors a non-empty `AICX_HOME` even when the OS home
   is unavailable. Explicitly permitted temporary paths also remain readable
   without a user/home entry; other paths retain the existing allowlist checks.

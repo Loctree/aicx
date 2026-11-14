@@ -640,6 +640,9 @@ fn generation_dir_name(generation_id: &str) -> String {
 /// binary writes) is refused with a typed conflict naming the incoming
 /// writer. A mis-synced machine-local index dir thus surfaces as an explicit
 /// error instead of silently corrupting search.
+/// A usable semantic generation may likewise never be replaced by an incoming
+/// generation without a valid dense payload. Reject the entire publication;
+/// retaining an old generation must not claim the new corpus was admitted.
 fn publish_hybrid_generation(hybrid_root: &Path, generation_dir: &Path) -> Result<()> {
     use std::io::Write;
 
@@ -658,6 +661,16 @@ fn publish_hybrid_generation(hybrid_root: &Path, generation_dir: &Path) -> Resul
 
     let published_dir = resolve_hybrid_generation_dir(hybrid_root);
     if published_dir != *generation_dir {
+        if generation_has_dense(&published_dir) && !generation_has_dense(generation_dir) {
+            let published =
+                aicx_retrieve::Manifest::read_from_path(&published_dir.join("manifest.json"))?;
+            return Err(aicx_retrieve::RetrieveError::SemanticGenerationDowngrade {
+                current: published.generation_id,
+                incoming: incoming.generation_id.clone(),
+                writer: incoming.writer_label(),
+            }
+            .into());
+        }
         let published_manifest_path = published_dir.join("manifest.json");
         if let Ok(published) = aicx_retrieve::Manifest::read_from_path(&published_manifest_path)
             && let (Some(incoming_generation), Some(published_generation)) = (
@@ -726,8 +739,8 @@ fn generation_has_dense(dir: &Path) -> bool {
 }
 
 /// Carry a validated dense mmap into a lexical generation of the same corpus.
-/// Retention separately protects the last usable dense generation when the
-/// corpus changes and CURRENT must truthfully become lexical-only.
+/// A changed corpus must be rebuilt semantically before it can replace a
+/// usable semantic generation. Never relabel old vectors as the new corpus.
 fn carry_forward_dense_artifacts(
     previous_dir: &Path,
     dest_dir: &Path,
@@ -900,8 +913,9 @@ pub fn current_lexical_chunks() -> Result<Vec<aicx_retrieve::ChunkRef>> {
 
 /// Publish one lexical-only CURRENT generation directly from source extracts.
 ///
-/// Matching validated dense vectors are carried forward. Otherwise `--deep`
-/// fails honestly until `aicx index --semantic` materializes the new corpus.
+/// Matching validated dense vectors are carried forward. When a usable dense
+/// generation already exists, source drift refuses the whole refresh until
+/// `aicx index --semantic` can publish both lanes for the new corpus.
 /// No embeddings NDJSON or brute-force twin is emitted.
 pub fn publish_source_lexical_generation(
     chunks: &[aicx_retrieve::ChunkRef],
@@ -914,6 +928,21 @@ pub fn publish_source_lexical_generation(
     }
     let hybrid_root = hybrid_root_dir(None)?;
     let previous_dir = resolve_hybrid_generation_dir(&hybrid_root);
+    if let Ok(previous) = Manifest::read_from_path(&previous_dir.join("manifest.json"))
+        && previous.open_dense_payload(&previous_dir).is_ok()
+        && (previous.source_hash_blake3 != aicx_retrieve::source_hash_blake3(source_fingerprint)
+            || previous.source_chunk_count != chunks.len()
+            || previous.lexical_doc_count != chunks.len())
+    {
+        // Refuse before building a quarantined lexical index. The final pointer
+        // gate independently protects every writer and failed dense copies.
+        return Err(aicx_retrieve::RetrieveError::SemanticGenerationDowngrade {
+            current: previous.generation_id,
+            incoming: "lexical-only source refresh".to_string(),
+            writer: crate::BUILD_VERSION.to_string(),
+        }
+        .into());
+    }
     let generation_dir = hybrid_root
         .join(HYBRID_GENERATIONS_DIR_NAME)
         .join(generation_dir_name(&Manifest::fresh_generation_id()));
@@ -3469,7 +3498,7 @@ mod source_hybrid_publish_tests {
     }
 
     #[test]
-    fn lexical_publish_only_carries_matching_dense_and_retains_old_generation() {
+    fn lexical_publish_carries_matching_dense_but_refuses_downgrade() {
         let root = std::env::temp_dir().join(format!(
             "aicx-lexical-keep-dense-{}-{}",
             std::process::id(),
@@ -3518,19 +3547,31 @@ mod source_hybrid_publish_tests {
         );
 
         for i in 2..=5 {
-            let published = publish_source_lexical_generation(
+            let error = publish_source_lexical_generation(
                 std::slice::from_ref(&chunk),
                 &format!("fp-keep-dense-{i}"),
             )
-            .unwrap();
+            .unwrap_err();
             assert!(
-                published.dense_count == 0,
-                "changed corpus {i} must not claim old dense is current"
+                matches!(
+                    error.downcast_ref::<aicx_retrieve::RetrieveError>(),
+                    Some(aicx_retrieve::RetrieveError::SemanticGenerationDowngrade { .. })
+                ),
+                "changed corpus {i} must fail with an explicit admission error: {error:#}"
             );
-            assert!(current_dense_not_built().unwrap());
+            assert_eq!(hybrid_index_dir(None).unwrap(), current);
+            assert!(!current_dense_not_built().unwrap());
         }
 
         let hybrid_root = hybrid_root_dir(None).unwrap();
+        let rejected = hybrid_root.join("generations/g-rejected-lexical");
+        write_stub_generation(&hybrid_root, "g-rejected-lexical", false);
+        let error = publish_hybrid_generation(&hybrid_root, &rejected).unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<aicx_retrieve::RetrieveError>(),
+            Some(aicx_retrieve::RetrieveError::SemanticGenerationDowngrade { .. })
+        ));
+        assert_eq!(hybrid_index_dir(None).unwrap(), current);
         let dense_left = remaining_dense_generations(&hybrid_root);
         assert!(
             !dense_left.is_empty(),
@@ -3541,8 +3582,12 @@ mod source_hybrid_publish_tests {
         )
         .unwrap();
         assert!(
-            current_manifest.dense_count == 0,
-            "CURRENT after source drift must report dense as absent"
+            current_manifest.dense_count > 0,
+            "a refused source refresh must leave the semantic generation active"
+        );
+        assert_eq!(
+            current_manifest.source_hash_blake3,
+            lexical.source_hash_blake3
         );
 
         drop(_home);

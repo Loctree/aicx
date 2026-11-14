@@ -561,7 +561,7 @@ fn test_deep_search_cli_uses_published_source_generation_without_ndjson() {
             "source_path":path,"project":"loctree/aicx","cwd":cwd,"date":"2026-10-01"})
         ));
     }
-    std::fs::write(root.join("catalog/sessions.jsonl"), catalog).unwrap();
+    std::fs::write(root.join("catalog/sessions.jsonl"), &catalog).unwrap();
     let embedder = MockEmbedder::new(0);
     std::fs::write(
         &config,
@@ -623,8 +623,66 @@ fn test_deep_search_cli_uses_published_source_generation_without_ndjson() {
         assert_eq!(embedder.calls.load(Ordering::SeqCst), calls_before + 1);
     }
 
-    // An authoritative but corrupt CURRENT must not activate old NDJSON.
     let hybrid = root.join("indexed/_all/hybrid");
+    let before = std::fs::read(hybrid.join("CURRENT")).unwrap();
+    let old_dir = hybrid
+        .join("generations")
+        .join(std::str::from_utf8(&before).unwrap().trim());
+    let old_manifest = std::fs::read(old_dir.join("manifest.json")).unwrap();
+    let old_dense =
+        std::fs::read(old_dir.join(aicx_retrieve::MMAP_DENSE_PAYLOAD_FILE_NAME)).unwrap();
+    let (sid, path) = create_test_session(&root, 3);
+    catalog.push_str(&format!(
+        "{}\n",
+        json!({
+            "schema":"aicx.catalog.session.v1", "agent":"codex", "session_id":sid,
+            "source_path":path, "project":"loctree/aicx", "cwd":cwd, "date":"2026-10-01"
+        })
+    ));
+    std::fs::write(root.join("catalog/sessions.jsonl"), &catalog).unwrap();
+    let refused = run_cli(&["index", "--json"]);
+    assert!(
+        !refused.status.success(),
+        "a lexical refresh must not demote semantic CURRENT"
+    );
+    let refusal = String::from_utf8_lossy(&refused.stderr);
+    assert!(refusal.contains("semantic downgrade rejected"), "{refusal}");
+    assert!(
+        refusal.contains("NOT published"),
+        "source freshness must not be falsely claimed: {refusal}"
+    );
+    assert_eq!(std::fs::read(hybrid.join("CURRENT")).unwrap(), before);
+    assert_eq!(
+        std::fs::read(old_dir.join("manifest.json")).unwrap(),
+        old_manifest
+    );
+    assert_eq!(
+        std::fs::read(old_dir.join(aicx_retrieve::MMAP_DENSE_PAYLOAD_FILE_NAME)).unwrap(),
+        old_dense
+    );
+    let query = run_cli(&["search", "checkpoint durability", "--deep", "--json"]);
+    assert!(
+        query.status.success(),
+        "retained semantic generation must remain queryable"
+    );
+    let result: serde_json::Value = serde_json::from_slice(&query.stdout).unwrap();
+    assert_eq!(
+        result["oracle_status"]["retrieval"]["executed_path"],
+        "hybrid_fusion"
+    );
+    assert_eq!(result["results"], 2, "the refused corpus was not admitted");
+
+    let publish = run_cli(&["index", "--semantic", "--json"]);
+    assert!(
+        publish.status.success(),
+        "a complete semantic replacement must publish: {}",
+        String::from_utf8_lossy(&publish.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&publish.stdout).unwrap();
+    assert_eq!(report["dense_docs"], 3);
+    assert_ne!(std::fs::read(hybrid.join("CURRENT")).unwrap(), before);
+
+    // An authoritative but corrupt CURRENT must not activate old NDJSON.
     let generation = std::fs::read_to_string(hybrid.join("CURRENT")).unwrap();
     let manifest = hybrid
         .join("generations")
