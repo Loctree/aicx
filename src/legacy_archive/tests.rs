@@ -112,7 +112,7 @@ fn test_aicx_home_resolve_honors_explicit_env_var() {
 #[test]
 fn test_aicx_home_resolve_falls_back_to_dot_aicx_when_env_unset_and_no_bootstrap_config() {
     let home = std::env::temp_dir().join(format!("aicx-home-default-test-{}", std::process::id()));
-    let resolved = crate::aicx_home::resolve_from(None, &home)
+    let resolved = crate::aicx_home::resolve_from(None, Some(&home))
         .expect("aicx_home::resolve_from should succeed");
     assert_eq!(resolved, home.join(".aicx"));
     let _ = fs::remove_dir_all(home);
@@ -122,7 +122,7 @@ fn test_aicx_home_resolve_falls_back_to_dot_aicx_when_env_unset_and_no_bootstrap
 fn test_aicx_home_resolve_treats_empty_env_var_as_unset_without_bootstrap_config() {
     let home =
         std::env::temp_dir().join(format!("aicx-home-empty-env-test-{}", std::process::id()));
-    let resolved = crate::aicx_home::resolve_from(Some("".into()), &home)
+    let resolved = crate::aicx_home::resolve_from(Some("".into()), Some(&home))
         .expect("aicx_home::resolve_from should succeed");
     assert_eq!(resolved, home.join(".aicx"));
     let _ = fs::remove_dir_all(home);
@@ -143,7 +143,7 @@ fn test_aicx_home_resolve_uses_bootstrap_storage_home_when_env_unset() {
     )
     .unwrap();
 
-    let resolved = crate::aicx_home::resolve_from(None, &home)
+    let resolved = crate::aicx_home::resolve_from(None, Some(&home))
         .expect("bootstrap [storage].home should resolve");
     assert_eq!(resolved, configured);
     let _ = fs::remove_dir_all(home);
@@ -166,8 +166,9 @@ fn test_aicx_home_resolve_env_wins_over_bootstrap_storage_home() {
     )
     .unwrap();
 
-    let resolved = crate::aicx_home::resolve_from(Some(pinned.clone().into_os_string()), &home)
-        .expect("env-pinned home should resolve");
+    let resolved =
+        crate::aicx_home::resolve_from(Some(pinned.clone().into_os_string()), Some(&home))
+            .expect("env-pinned home should resolve");
     assert_eq!(resolved, pinned);
     let _ = fs::remove_dir_all(home);
 }
@@ -184,7 +185,7 @@ fn test_aicx_home_resolve_rejects_relative_bootstrap_storage_home() {
     )
     .unwrap();
 
-    let err = crate::aicx_home::resolve_from(None, &home)
+    let err = crate::aicx_home::resolve_from(None, Some(&home))
         .expect_err("relative [storage].home should fail");
     assert!(
         err.to_string().contains("expected an absolute path"),
@@ -207,7 +208,7 @@ fn test_aicx_home_resolve_rejects_traversal_in_bootstrap_storage_home() {
     )
     .unwrap();
 
-    let err = crate::aicx_home::resolve_from(None, &home)
+    let err = crate::aicx_home::resolve_from(None, Some(&home))
         .expect_err("[storage].home with `..` traversal should fail");
     assert!(
         err.to_string().contains("parent-directory traversal"),
@@ -230,7 +231,7 @@ fn test_aicx_home_resolve_rejects_control_chars_in_bootstrap_storage_home() {
     )
     .unwrap();
 
-    let err = crate::aicx_home::resolve_from(None, &home)
+    let err = crate::aicx_home::resolve_from(None, Some(&home))
         .expect_err("[storage].home with control characters should fail");
     assert!(
         err.to_string().contains("control characters"),

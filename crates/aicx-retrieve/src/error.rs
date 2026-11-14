@@ -46,6 +46,18 @@ pub enum RetrieveError {
     },
 
     #[error(
+        "semantic downgrade rejected: published={current}, incoming={incoming}, \
+         incoming writer={writer}; CURRENT retained with its existing corpus; \
+         additions, edits, deletions and privacy changes are NOT published; \
+         run `aicx index --semantic` to publish the new corpus with vectors"
+    )]
+    SemanticGenerationDowngrade {
+        current: String,
+        incoming: String,
+        writer: String,
+    },
+
+    #[error(
         "lexical schema {index_schema} is newer than this binary's {binary_schema} \
          (index writer={writer}); upgrade aicx instead of rebuilding"
     )]

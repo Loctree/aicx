@@ -177,8 +177,8 @@ After review, runtime acceptance, and merge to `main`:
 The equivalent explicit tag commands are:
 
 ```bash
-git tag -as v0.15.0 -m "Release v0.15.0"
-git push origin v0.15.0
+git tag -as v0.15.1 -m "Release v0.15.1"
+git push origin v0.15.1
 ```
 
 Do not tag or push from a dirty tree, an unmerged branch, or a commit whose
@@ -215,7 +215,7 @@ URL, not the working tree or an existing `PATH` binary:
 
 ```bash
 smoke_home="$(mktemp -d)"
-HOME="$smoke_home" AICX_INSTALL_MODE=release AICX_RELEASE_TAG=v0.15.0 bash install.sh
+HOME="$smoke_home" AICX_INSTALL_MODE=release AICX_RELEASE_TAG=v0.15.1 bash install.sh
 HOME="$smoke_home" "$smoke_home/.local/bin/aicx" --version
 HOME="$smoke_home" "$smoke_home/.local/bin/aicx-mcp" --version
 ```
@@ -275,13 +275,24 @@ make publish-crates
 ```
 
 `make publish-crates` uploads the current workspace version in dependency
-order (`aicx-parser`, `aicx-embeddings`, `aicx-monitor`,
-`aicx-progress-contracts`, `aicx-retrieve`, then `aicx`). It does not backfill
+order (`aicx-parser`, `aicx-embeddings`, `aicx-progress-contracts`,
+`aicx-monitor`, `aicx-retrieve`, then `aicx`). It does not backfill
 versions that were never uploaded, and it is not part of tagging a release.
-The crates.io index can take a minute to show a crate just uploaded; if a
-later crate in that list cannot resolve its sibling, rerun the same target
-after the index updates. `AICX_INSTALL_MODE=crates` stays unsupported in
-`install.sh`.
+The dry run covers only independent leaves. `aicx-monitor` needs
+`aicx-progress-contracts`; the remaining dependent crates can be verified only
+after their siblings are available on crates.io.
+
+The crates.io index can take a minute to show a crate just uploaded. If a later
+crate cannot resolve its sibling, wait for the index to update and publish
+only the remaining crates individually, in the order above:
+
+```bash
+cargo publish -p <remaining-crate> --locked
+```
+
+The aggregate target does not resume partial publication: rerunning it starts
+at the first immutable version already uploaded and fails there.
+`AICX_INSTALL_MODE=crates` stays unsupported in `install.sh`.
 
 ## Deployment Surface
 

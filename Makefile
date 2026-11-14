@@ -432,13 +432,13 @@ package-check:
 # This target exists so aicx is consumable as a LIBRARY crate (Loctree depends on it)
 # and `cargo install aicx` works from source. crates.io is PERMANENT (yank, never delete).
 # Order is topological: leaves first, then aicx-retrieve (needs aicx-parser), then aicx.
-CRATE_LEAVES := aicx-parser aicx-embeddings aicx-monitor aicx-progress-contracts
-CRATE_PUBLISH_ORDER := aicx-parser aicx-embeddings aicx-monitor aicx-progress-contracts aicx-retrieve aicx
+CRATE_LEAVES := aicx-parser aicx-embeddings aicx-progress-contracts
+CRATE_PUBLISH_ORDER := aicx-parser aicx-embeddings aicx-progress-contracts aicx-monitor aicx-retrieve aicx
 
 publish-crates-dry:
 	@echo "crates.io DRY-RUN (no upload). SOURCE registry — NOT the real release (= GitHub Releases)."
 	@for c in $(CRATE_LEAVES); do echo "==> dry-run $$c"; cargo publish --dry-run -p $$c --locked --allow-dirty || exit $$?; done
-	@echo "OK: leaves dry-run clean. aicx-retrieve + aicx verify only AFTER their deps are live on crates.io."
+	@echo "OK: leaves dry-run clean. aicx-monitor, aicx-retrieve + aicx verify only AFTER their deps are live on crates.io."
 
 publish-crates:
 	@echo "crates.io publish (SOURCE registry, PERMANENT). The user-facing release is GitHub Releases — see 'make release-push'."

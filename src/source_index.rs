@@ -905,10 +905,15 @@ pub fn build_with_reporter(
     let (manifest_path, dense_docs, dense_kind) = match publication {
         Ok(published) => published,
         Err(error) => {
-            publish_phase.finish_err(
-                &error,
-                Some("retry aicx index after checking the generation artifacts"),
-            );
+            let recovery = if matches!(
+                error.downcast_ref::<aicx_retrieve::RetrieveError>(),
+                Some(aicx_retrieve::RetrieveError::SemanticGenerationDowngrade { .. })
+            ) {
+                "run aicx index --semantic; the new source corpus has not been published"
+            } else {
+                "retry aicx index after checking the generation artifacts"
+            };
+            publish_phase.finish_err(&error, Some(recovery));
             return Err(error);
         }
     };

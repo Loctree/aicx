@@ -625,7 +625,7 @@ global catalog metadata.
 
 | Command | What it publishes |
 |---|---|
-| `aicx index` | Tantivy lexical only (`dense_kind=optional_not_built`) |
+| `aicx index` | Tantivy lexical; retains matching vectors, refuses to demote an existing semantic generation |
 | `aicx index --semantic` | Lexical + `dense.exact_mmap_v1.bin` via configured embedder |
 
 Default search is lexical-first. Dense rerank needs `--semantic` once on the
@@ -635,6 +635,14 @@ Incremental reuse is gated by the live source fingerprint. A changed existing
 session reparses on the next run even when no catalog rebuild happened.
 `--semantic` will rebuild when dense is missing even if lexical CURRENT
 already matches.
+
+After a semantic generation exists, a changed corpus requires
+`aicx index --semantic`. A lexical-only refresh fails with `semantic downgrade
+rejected` and retains `CURRENT`; it does not publish additions, edits,
+deletions or privacy changes. The retained generation still describes its old
+corpus, not the attempted refresh. This admission guard preserves search while
+the full semantic replacement is built; it does not provide vector reuse across
+changed corpora.
 
 Signal filtering keeps user messages, agent replies, plans, and reports while
 dropping tool-call noise, internal thought, system reminders, and image/base64

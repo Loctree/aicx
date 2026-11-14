@@ -18,14 +18,18 @@ const DEFAULT_AICX_DIRNAME: &str = ".aicx";
 /// 2. `[storage].home` in `$HOME/.aicx/config.toml`;
 /// 3. `$HOME/.aicx`.
 pub fn resolve() -> Result<PathBuf> {
-    let home = crate::os_user_home().context("No home directory")?;
-    resolve_from(std::env::var_os("AICX_HOME"), &home)
+    let home = crate::os_user_home();
+    resolve_from(std::env::var_os("AICX_HOME"), home.as_deref())
 }
 
-pub(crate) fn resolve_from(env_value: Option<OsString>, home_dir: &Path) -> Result<PathBuf> {
+pub(crate) fn resolve_from(
+    env_value: Option<OsString>,
+    home_dir: Option<&Path>,
+) -> Result<PathBuf> {
     if let Some(value) = env_value.filter(|value| !value.is_empty()) {
         return Ok(PathBuf::from(value));
     }
+    let home_dir = home_dir.context("No home directory")?;
     let default_home = home_dir.join(DEFAULT_AICX_DIRNAME);
     if let Some(configured) = configured_home_from_bootstrap_config(home_dir, &default_home)? {
         return Ok(configured);
@@ -101,4 +105,20 @@ pub fn ensure() -> Result<PathBuf> {
     fs::create_dir_all(&dir)
         .with_context(|| format!("Failed to create AICX home: {}", dir.display()))?;
     Ok(dir)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_aicx_home_works_without_os_home() {
+        let explicit = std::env::temp_dir().join("aicx-explicit-runtime-root");
+        assert_eq!(
+            resolve_from(Some(explicit.clone().into_os_string()), None).unwrap(),
+            explicit
+        );
+        assert!(resolve_from(None, None).is_err());
+        assert!(resolve_from(Some(OsString::new()), None).is_err());
+    }
 }
