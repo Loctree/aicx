@@ -228,3 +228,15 @@ fn passage_schema_requires_input_policy_and_payload_receipts() {
     m.dense_payload_blake3 = Some("payload-digest".into());
     assert!(m.validate_against(&m).is_ok());
 }
+
+#[test]
+fn dense_checksum_rejects_parent_traversal_before_opening_payload() {
+    let error = aicx_retrieve::Manifest::dense_payload_checksum(std::path::Path::new(
+        "generations/../outside",
+    ))
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("traversal components"),
+        "{error:#}"
+    );
+}

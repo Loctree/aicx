@@ -165,7 +165,9 @@ impl Manifest {
     }
 
     pub fn dense_payload_checksum(generation_dir: &Path) -> Result<String> {
-        let mut file = File::open(generation_dir.join(MMAP_DENSE_PAYLOAD_FILE_NAME))?;
+        let payload = generation_dir.join(MMAP_DENSE_PAYLOAD_FILE_NAME);
+        let payload = validate_manifest_path(&payload)?;
+        let mut file = fs::OpenOptions::new().read(true).open(payload)?;
         let mut hasher = blake3::Hasher::new();
         let mut buffer = vec![0; 1024 * 1024];
         loop {

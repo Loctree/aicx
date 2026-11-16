@@ -731,7 +731,13 @@ fn publish_hybrid_generation(hybrid_root: &Path, generation_dir: &Path) -> Resul
         )
     })?;
     #[cfg(unix)]
-    std::fs::File::open(hybrid_root)?.sync_all()?;
+    {
+        let root = crate::sanitize::validate_dir_path(hybrid_root)?;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .open(root)?
+            .sync_all()?;
+    }
     // Pointer is durable. Prune is best-effort: a leftover dir is disk waste,
     // not a search-correctness failure.
     if let Err(error) =
