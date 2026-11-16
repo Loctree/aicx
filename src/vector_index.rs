@@ -669,6 +669,16 @@ fn publish_hybrid_generation(hybrid_root: &Path, generation_dir: &Path) -> Resul
         {
             published.validate_against(&published)
                 .context("CURRENT uses an unsupported generation contract; upgrade the writer instead of replacing it")?;
+            if published.semantic_input_contract.is_some()
+                && incoming.semantic_input_contract.is_none()
+            {
+                return Err(aicx_retrieve::RetrieveError::SemanticGenerationDowngrade {
+                    current: published.generation_id,
+                    incoming: incoming.generation_id.clone(),
+                    writer: incoming.writer_label(),
+                }
+                .into());
+            }
         }
         if generation_has_dense(&published_dir) && !generation_has_dense(generation_dir) {
             let published =
@@ -2202,6 +2212,12 @@ fn incremental_materialize_hybrid(
     let manifest_path = generation_dir.join("manifest.json");
     let dense_path = generation_dir.join(aicx_retrieve::MMAP_DENSE_PAYLOAD_FILE_NAME);
     let manifest = Manifest::read_from_path(&manifest_path)?;
+    manifest.validate_against(&manifest)?;
+    anyhow::ensure!(
+        manifest.semantic_input_contract.is_none(),
+        "source passage generations cannot be refreshed from legacy NDJSON; run aicx index --semantic"
+    );
+    manifest.verify_dense_payload_checksum(manifest_path.parent().expect("manifest parent"))?;
     if manifest.dense_kind != aicx_retrieve::MMAP_DENSE_KIND {
         // Legacy dual-file generations are migration read input only; the
         // caller's fallback path performs a full rebuild that materializes
@@ -2270,9 +2286,11 @@ fn incremental_materialize_hybrid(
         writer_version: env!("CARGO_PKG_VERSION").to_string(),
         build_id: crate::BUILD_VERSION.to_string(),
         source_chunk_count,
-        semantic_input_contract: None,
-        source_policy_fingerprint: None,
-        dense_payload_blake3: None,
+        semantic_input_contract: manifest.semantic_input_contract,
+        source_policy_fingerprint: manifest.source_policy_fingerprint,
+        dense_payload_blake3: Some(Manifest::dense_payload_checksum(
+            manifest_path.parent().expect("manifest parent"),
+        )?),
         source_hash_blake3: aicx_retrieve::source_hash_blake3(source_hash),
         embedder_model: fingerprint.model,
         embedder_url_hash: fingerprint.url_hash,

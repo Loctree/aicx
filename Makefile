@@ -169,6 +169,7 @@ precheck-native:
 
 loctree-consumer-check:
 	cargo check --locked -p aicx --no-default-features --features loctree-consumer
+	cargo test --locked -p aicx --no-default-features --features loctree-consumer --no-run
 	cargo test --locked -p aicx --lib --no-default-features --features loctree-consumer slim_profile_exposes_read_core_contract
 	@hits=$$(cargo tree --locked --no-default-features --features loctree-consumer -p aicx | grep -ciE 'lancedb|llama' || true); \
 	if [ "$$hits" != "0" ]; then \

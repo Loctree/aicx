@@ -1276,6 +1276,12 @@ impl AicxMcpServer {
 
     /// D-6: arm the negative cache for `ttl` from `now`. Called after a
     /// real embedder failure so subsequent requests fail-fast.
+    fn note_semantic_failure(&self, error: &crate::search_engine::SemanticError) {
+        if error.kind() == "embedder_unavailable" {
+            self.mark_embedder_unavailable(Instant::now(), MCP_EMBEDDER_NEGATIVE_TTL);
+        }
+    }
+
     fn mark_embedder_unavailable(&self, now: Instant, ttl: Duration) {
         *self.embedder_unavailable_guard() = Some(now + ttl);
     }
@@ -1430,9 +1436,7 @@ impl AicxMcpServer {
                 // instead of re-running the same broken bootstrap. Other
                 // kinds (index missing, dim mismatch, ...) remain
                 // synchronously retryable.
-                if err.kind() == "embedder_unavailable" {
-                    self.mark_embedder_unavailable(Instant::now(), MCP_EMBEDDER_NEGATIVE_TTL);
-                }
+                self.note_semantic_failure(&err);
                 let fallback = McpSemanticFallbackNotice::from_error(&err);
                 // Filesystem-fuzzy ONLY for IndexNotBuilt (audit recovery).
                 // strict_semantic remains fail-fast for every kind; non-strict
@@ -3163,6 +3167,50 @@ mod tests {
         // 30s value would let a flapping endpoint retry-storm an unhealthy
         // embedder six times faster than intended.
         assert_eq!(MCP_EMBEDDER_NEGATIVE_TTL, Duration::from_secs(5 * 60));
+    }
+
+    #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+    #[test]
+    fn invalid_embedding_input_does_not_poison_mcp_backend_health() {
+        use aicx_embeddings::EmbeddingInputError;
+        let server = AicxMcpServer::new();
+        for input in [
+            EmbeddingInputError::TokenLimit {
+                actual: 513,
+                limit: 512,
+            },
+            EmbeddingInputError::ByteLimit {
+                actual: 32769,
+                limit: 32768,
+            },
+            EmbeddingInputError::Empty,
+            EmbeddingInputError::Nul,
+            EmbeddingInputError::NoTokens,
+        ] {
+            let error = crate::search_engine::query_embedding_failure(
+                anyhow::Error::new(input).context("GGUF embed input rejected"),
+            );
+            assert_eq!(error.kind(), "invalid_query");
+            server.note_semantic_failure(&error);
+            assert!(
+                server
+                    .embedder_negative_cache_remaining(Instant::now())
+                    .is_none()
+            );
+            let response = super::mcp_semantic_unavailable_error(
+                &McpSemanticFallbackNotice::from_error(&error),
+            );
+            assert_eq!(response.code.0, -32602);
+            assert_eq!(response.data.unwrap()["kind"], "invalid_query");
+        }
+        let outage =
+            crate::search_engine::query_embedding_failure(anyhow::anyhow!("endpoint disconnected"));
+        server.note_semantic_failure(&outage);
+        assert!(
+            server
+                .embedder_negative_cache_remaining(Instant::now())
+                .is_some()
+        );
     }
 
     #[test]

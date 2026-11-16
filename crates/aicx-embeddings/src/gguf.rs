@@ -111,19 +111,19 @@ impl LocalEmbeddingProvider for GgufEmbeddingProvider {
             // truncation kicks in.
             crate::enforce_embed_input_budget(text).context("GGUF embed input rejected")?;
             if text.contains('\0') {
-                return Err(anyhow!("text contains a NUL byte"))
+                return Err(anyhow::Error::new(crate::EmbeddingInputError::Nul))
                     .context("failed to tokenize text for GGUF embeddings");
             }
             let tokens = self.model.vocab().tokenize(text.as_bytes(), true, true);
             if tokens.len() > self.max_length {
-                return Err(anyhow!(
-                    "GGUF input has {} tokens, limit {}; split the document into smaller passages or shorten the query",
-                    tokens.len(),
-                    self.max_length
-                ));
+                return Err(crate::EmbeddingInputError::TokenLimit {
+                    actual: tokens.len(),
+                    limit: self.max_length,
+                }
+                .into());
             }
             if tokens.is_empty() {
-                return Err(anyhow!("tokenizer returned an empty sequence"));
+                return Err(crate::EmbeddingInputError::NoTokens.into());
             }
             max_seq_len = max_seq_len.max(tokens.len());
             total_tokens += tokens.len();

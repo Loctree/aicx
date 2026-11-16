@@ -60,6 +60,7 @@ expected_snippet = "bounded coverage"
 tail_fixture = false
 
 [[queries]]
+context_fixture = true
 id = "admission"
 query = "Why must CURRENT flip only after a complete generation?"
 answer = "CURRENT must flip only after a complete generation has valid lexical and dense artifacts. The manifest is written last and binds their source digest. Atomic pointer replacement keeps readers on the previous usable generation while the next build is incomplete."

@@ -442,6 +442,10 @@ fn display_search_matches(result: &FuzzyResult) -> Vec<String> {
         || result.label.starts_with("hybrid_rrf_global_scoped:")
     {
         4096
+    } else if result.label.starts_with("lexical_tantivy:")
+        || result.label.starts_with("lexical_tantivy_global_scoped:")
+    {
+        800
     } else {
         SEARCH_MATCH_MAX_CHARS
     };

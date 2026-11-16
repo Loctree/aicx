@@ -6,7 +6,7 @@
 )]
 
 use super::*;
-use std::io::{BufRead, Read, Seek, Write};
+use std::io::{BufRead, Seek, Write};
 
 pub const SOURCE_DENSE_CHECKPOINT_SCHEMA: &str = "aicx.source_dense_checkpoint.v2";
 pub const SOURCE_DENSE_CHECKPOINT_DIR: &str = "dense-checkpoints";
@@ -251,10 +251,13 @@ pub(super) fn semantic_passages(
                 if !passage.trim().is_empty() {
                     let hash = blake3::hash(passage.as_bytes()).to_hex().to_string();
                     let ordinal = seen.entry(hash.clone()).or_default();
-                    let mut chunk = parent.clone();
-                    chunk.id = format!("{}:passage:{hash}:{}", parent.id, *ordinal);
+                    let mut chunk = aicx_retrieve::ChunkRef {
+                        id: format!("{}:passage:{hash}:{}", parent.id, *ordinal),
+                        source_path: parent.source_path.clone(),
+                        text: passage.to_string(),
+                        metadata: parent.metadata.clone(),
+                    };
                     *ordinal += 1;
-                    chunk.text = passage.to_string();
                     chunk.metadata["parent_chunk_id"] = parent.id.clone().into();
                     chunk.metadata["semantic_passage_lines"] = serde_json::json!([passage]);
                     chunk.metadata["passage_start_line"] = start_line.into();
@@ -280,15 +283,8 @@ pub(super) fn input_contract(engine: &crate::embedder::EmbeddingEngine) -> Resul
         crate::embedder::NativeEmbeddingSource::CloudEndpoint(_) => None,
     };
     if let Some(path) = path {
-        let mut file = fs::File::open(path)?;
-        let mut buf = vec![0; 1024 * 1024];
-        loop {
-            let n = file.read(&mut buf)?;
-            if n == 0 {
-                break;
-            }
-            h.update(&buf[..n]);
-        }
+        h.update(b"native-weights-blake3");
+        h.update(&aicx_retrieve::verified_file_digest(path)?);
     }
     Ok(format!("{PASSAGE_INPUT_VERSION}:{}", h.finalize().to_hex()))
 }

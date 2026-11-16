@@ -8,6 +8,7 @@ pub mod adapter_brute_force;
 pub mod adapter_mmap;
 pub mod adapter_tantivy;
 pub mod error;
+mod file_integrity;
 pub mod fusion_rrf;
 pub mod manifest;
 pub mod orchestrator;
@@ -25,6 +26,7 @@ pub use trait_fusion::*;
 pub use manifest::*;
 
 pub use error::*;
+pub use file_integrity::verified_file_digest;
 
 pub use types::*;
 

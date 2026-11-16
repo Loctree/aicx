@@ -61,6 +61,11 @@ unsupported future contract. The existing source generation remains intact
 until the first new generation is atomically admitted.
 
 New dense payloads carry a BLAKE3 digest and readers reject modified bytes.
+Payload and native-weight digests are cached against file identity, length,
+write time and metadata change time. Unchanged warm queries reuse only the
+small digest receipt; modified or replaced files are hashed again. Filesystems
+without a reliable identity/change stamp are hashed on every verification.
+The cache retains no open handles, mappings or model buffers.
 Legacy payloads remain readable with unknown freshness/integrity evidence;
 upgrading a reader does not manufacture a new receipt for an old artifact.
 

@@ -884,11 +884,31 @@ fn privacy_change_refuses_old_evidence_then_publishes_only_visible_sessions() {
     let private = root.join("private-repo");
     std::fs::create_dir_all(private.join(".git")).unwrap();
     let source = root.join("00000000-0000-4000-8000-000000000001.jsonl");
-    let old = env!("CARGO_MANIFEST_DIR");
-    let body = std::fs::read_to_string(&source)
+    // Edit JSON values, not the escaped path spelling (Windows uses `\\`).
+    let mut source_rows: Vec<serde_json::Value> = std::fs::read_to_string(&source)
         .unwrap()
-        .replace(old, private.to_str().unwrap());
-    std::fs::write(&source, body).unwrap();
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let mut changed_cwds = 0;
+    for row in &mut source_rows {
+        if row["payload"].get("cwd").is_some() {
+            row["payload"]["cwd"] = json!(private);
+            changed_cwds += 1;
+        }
+    }
+    assert!(
+        changed_cwds > 0,
+        "privacy fixture must actually move the source cwd"
+    );
+    std::fs::write(
+        &source,
+        source_rows
+            .iter()
+            .map(|row| format!("{row}\n"))
+            .collect::<String>(),
+    )
+    .unwrap();
     let catalog_path = root.join("catalog/sessions.jsonl");
     let mut rows: Vec<serde_json::Value> = std::fs::read_to_string(&catalog_path)
         .unwrap()
@@ -1082,4 +1102,53 @@ fn lexical_admission_cannot_stamp_a_new_policy_over_old_content() {
         "{error:#}"
     );
     assert_eq!(std::fs::read(&pointer).unwrap(), before);
+}
+
+#[test]
+fn malformed_or_future_manifest_cannot_serve_lexical_text() {
+    let _guard = SERIAL.lock().unwrap();
+    let (fixture, _server) = contract_fixture();
+    let root = &fixture.root;
+    catalog_members(root, &[1]);
+    aicx::source_index::build(root, &[], false, false, true).unwrap();
+    let path = aicx::vector_index::hybrid_manifest_path(None).unwrap();
+    let original = aicx_retrieve::Manifest::read_from_path(&path).unwrap();
+    for schema in ["3.0", "99.0"] {
+        let mut malformed = original.clone();
+        malformed.schema_version = schema.into();
+        malformed.source_policy_fingerprint = None;
+        malformed.write_to_path(&path).unwrap();
+        let error = aicx::search_engine::try_semantic_search_filtered(
+            root,
+            "checkpoint",
+            5,
+            &[None],
+            None,
+            None,
+            &Default::default(),
+        )
+        .unwrap_err();
+        assert!(
+            error.reason().contains("invalid generation contract"),
+            "{error}"
+        );
+        assert!(!error.allows_filesystem_fallback());
+    }
+    let mut legacy = original;
+    legacy.schema_version = "2.0".into();
+    legacy.source_policy_fingerprint = None;
+    legacy.semantic_input_contract = None;
+    legacy.dense_payload_blake3 = None;
+    legacy.write_to_path(&path).unwrap();
+    let result = aicx::search_engine::try_semantic_search_filtered(
+        root,
+        "checkpoint",
+        5,
+        &[None],
+        None,
+        None,
+        &Default::default(),
+    )
+    .expect("legacy lexical generation remains readable");
+    assert!(!result.outcome.results.is_empty());
 }

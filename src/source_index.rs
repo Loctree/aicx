@@ -3074,6 +3074,9 @@ pub(crate) fn generation_freshness(manifest: &aicx_retrieve::Manifest) -> &'stat
 }
 
 pub(crate) fn verify_generation_policy(manifest: &aicx_retrieve::Manifest) -> Result<()> {
+    manifest
+        .validate_against(manifest)
+        .context("invalid generation contract; stored text cannot be served")?;
     if let Some(expected) = &manifest.source_policy_fingerprint {
         anyhow::ensure!(
             *expected == current_policy_fingerprint()?,

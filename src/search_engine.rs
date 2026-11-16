@@ -231,6 +231,11 @@ pub struct HybridRetrievalStatus {
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SemanticError {
+    /// This query cannot be encoded; other queries remain retryable immediately.
+    InvalidQuery {
+        reason: String,
+        recommendation: String,
+    },
     /// The current index stores conversations, not independently searchable frames.
     UnsupportedFrameKind {
         requested_frame_kind: String,
@@ -314,7 +319,8 @@ impl SemanticError {
     /// One-line reason for terse logs / oracle_status.
     pub fn reason(&self) -> &str {
         match self {
-            Self::UnsupportedFrameKind { reason, .. }
+            Self::InvalidQuery { reason, .. }
+            | Self::UnsupportedFrameKind { reason, .. }
             | Self::EmbedderFeatureMissing { reason, .. }
             | Self::EmbedderUnavailable { reason, .. }
             | Self::IndexNotBuilt { reason, .. }
@@ -331,7 +337,8 @@ impl SemanticError {
     /// Actionable recommendation the operator can paste into their shell.
     pub fn recommendation(&self) -> &str {
         match self {
-            Self::UnsupportedFrameKind { recommendation, .. }
+            Self::InvalidQuery { recommendation, .. }
+            | Self::UnsupportedFrameKind { recommendation, .. }
             | Self::EmbedderFeatureMissing { recommendation, .. }
             | Self::EmbedderUnavailable { recommendation, .. }
             | Self::IndexNotBuilt { recommendation, .. }
@@ -348,6 +355,7 @@ impl SemanticError {
     /// Stable kind label for `oracle_status: backend=fail_fast kind=...`.
     pub fn kind(&self) -> &'static str {
         match self {
+            Self::InvalidQuery { .. } => "invalid_query",
             Self::UnsupportedFrameKind { .. } => "unsupported_frame_kind",
             Self::EmbedderFeatureMissing { .. } => "embedder_feature_missing",
             Self::EmbedderUnavailable { .. } => "embedder_unavailable",
@@ -370,6 +378,25 @@ impl SemanticError {
     /// surface as typed errors — not get swallowed into letter-soup ranking.
     pub fn allows_filesystem_fallback(&self) -> bool {
         matches!(self, Self::IndexNotBuilt { .. })
+    }
+}
+
+/// Preserve typed input rejections through backend context wrappers.
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+pub(crate) fn query_embedding_failure(error: anyhow::Error) -> SemanticError {
+    if error
+        .downcast_ref::<aicx_embeddings::EmbeddingInputError>()
+        .is_some()
+    {
+        SemanticError::InvalidQuery {
+            reason: format!("semantic embedder rejected query: {error:#}"),
+            recommendation: "shorten or rephrase the query; remove any NUL bytes and retry".into(),
+        }
+    } else {
+        SemanticError::EmbedderUnavailable {
+            reason: format!("semantic embedder could not encode query: {error:#}"),
+            recommendation: "check `aicx config show` for resolved backend; if unhealthy run `aicx doctor` then retry".into(),
+        }
     }
 }
 
@@ -1531,51 +1558,9 @@ fn try_semantic_search_native(
         }
     }
 
-    // Probe the query string itself — empty / whitespace-only queries
-    // cannot produce a meaningful embedding.
-    if query.trim().is_empty() {
-        return Err(SemanticError::NoResults {
-            path: path.clone(),
-            scanned: 0,
-            reason: "query is empty or whitespace-only — embedder needs at least one token"
-                .to_string(),
-            recommendation:
-                "pass a non-empty query, e.g. `aicx search 'how does the noise filter work'`"
-                    .to_string(),
-        });
-    }
-
-    // D-9: cap query length BEFORE the embedder is touched so a runaway
-    // caller (CLI or MCP) cannot pin the tokenizer or POST a multi-MB
-    // body to a remote endpoint. Mirrors the byte budget enforced inside
-    // every embedder backend; surfaced here for a clean structured error.
-    if query.len() > aicx_embeddings::MAX_EMBED_INPUT_BYTES {
-        return Err(SemanticError::NoResults {
-            path: path.clone(),
-            scanned: 0,
-            reason: format!(
-                "query is {} bytes; semantic embedder rejects inputs over {} bytes",
-                query.len(),
-                aicx_embeddings::MAX_EMBED_INPUT_BYTES
-            ),
-            recommendation: "trim the query to a sentence or two; embeddings only need a short focus phrase to retrieve similar chunks".to_string(),
-        });
-    }
-
-    // Embed the query once — both the hybrid path and the dense-only
-    // fallback need the query vector.
-    let query_embedding = match engine.embed(query) {
-        Ok(embedding) => embedding,
-        Err(err) => {
-            return Err(SemanticError::EmbedderUnavailable {
-                reason: format!("semantic embedder could not encode query: {err}"),
-                recommendation:
-                    "check `aicx config show` for resolved backend; if unhealthy run `aicx doctor` \
-                     then retry"
-                        .to_string(),
-            });
-        }
-    };
+    // Reject caller input without poisoning the backend health cache.
+    aicx_embeddings::enforce_embed_input_budget(query).map_err(query_embedding_failure)?;
+    let query_embedding = engine.embed(query).map_err(query_embedding_failure)?;
 
     let retrieval_filters = SemanticRetrievalFilters {
         kind: kind_filter,

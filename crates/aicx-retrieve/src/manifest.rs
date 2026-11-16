@@ -167,17 +167,7 @@ impl Manifest {
     pub fn dense_payload_checksum(generation_dir: &Path) -> Result<String> {
         let payload = generation_dir.join(MMAP_DENSE_PAYLOAD_FILE_NAME);
         let payload = validate_manifest_path(&payload)?;
-        let mut file = fs::OpenOptions::new().read(true).open(payload)?;
-        let mut hasher = blake3::Hasher::new();
-        let mut buffer = vec![0; 1024 * 1024];
-        loop {
-            let bytes = file.read(&mut buffer)?;
-            if bytes == 0 {
-                break;
-            }
-            hasher.update(&buffer[..bytes]);
-        }
-        Ok(hasher.finalize().to_hex().to_string())
+        Ok(hex::encode(crate::verified_file_digest(payload)?))
     }
 
     pub fn verify_dense_payload_checksum(&self, generation_dir: &Path) -> Result<()> {

@@ -1,6 +1,7 @@
 //! Real source -> published index -> query acceptance on a public fixture.
 //! Portable runs measure lexical retrieval. `e2e-aicx` runs the same questions
 //! through the explicitly configured real embedder and hybrid fusion.
+#![cfg(feature = "app")]
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
@@ -23,6 +24,8 @@ struct Case {
     expected_snippet: String,
     #[serde(default)]
     tail_fixture: bool,
+    #[serde(default)]
+    context_fixture: bool,
 }
 
 #[derive(Serialize)]
@@ -100,6 +103,13 @@ fn reproducible_retrieval_acceptance() {
             format!(
                 "{}\n\n{}",
                 "Rozmowa robocza o kolorach interfejsu i układzie przycisków.\n".repeat(240),
+                case.answer
+            )
+        } else if case.context_fixture {
+            // Keep the answer in one paragraph but beyond the former 200-char renderer cap.
+            format!(
+                "{}{}",
+                "Neutral context preceding the recorded decision, ".repeat(9),
                 case.answer
             )
         } else {
@@ -231,11 +241,17 @@ fn reproducible_retrieval_acceptance() {
         &aicx::vector_index::hybrid_manifest_path(None).unwrap(),
     )
     .unwrap();
-    let transports = verify_cli_and_mcp(
+    let tail = verify_cli_and_mcp(
         &root,
         config.queries.iter().find(|q| q.tail_fixture).unwrap(),
         real_model,
     );
+    let lexical_context = verify_cli_and_mcp(
+        &root,
+        config.queries.iter().find(|q| q.context_fixture).unwrap(),
+        false,
+    );
+    let transports = serde_json::json!({"tail": tail, "lexical_context": lexical_context});
     let receipt = serde_json::json!({"schema":"aicx.retrieval_fixture_result.v1","mode":if real_model {"real_model_hybrid"} else {"portable_lexical"},
         "model":manifest.embedder_model,"manifest_schema":manifest.schema_version,"transports":transports,
         "semantic_challenges":measures.iter().filter(|m| m.semantic_challenge).count(),
@@ -276,7 +292,7 @@ fn verify_cli_and_mcp(root: &std::path::Path, case: &Case, deep: bool) -> serde_
     let cli_result: serde_json::Value = serde_json::from_slice(&output.stdout).expect("CLI JSON");
     assert!(
         cli_result.to_string().contains(&case.expected_snippet),
-        "CLI must return tail evidence: {cli_result}"
+        "CLI must return expected evidence: {cli_result}"
     );
     assert_eq!(cli_result["index_snapshot"]["freshness"], "current");
 
@@ -374,8 +390,8 @@ fn verify_cli_and_mcp(root: &std::path::Path, case: &Case, deep: bool) -> serde_
             .expect("MCP search JSON");
     assert!(
         payload.to_string().contains(&case.expected_snippet),
-        "MCP must return tail evidence: {payload}"
+        "MCP must return expected evidence: {payload}"
     );
     assert_eq!(payload["index_snapshot"]["freshness"], "current");
-    serde_json::json!({"cli":"passed","mcp_stdio":"passed","mcp_deep_property":true,"tail_evidence":true})
+    serde_json::json!({"cli":"passed","mcp_stdio":"passed","mcp_deep_property":true,"expected_evidence":true})
 }
