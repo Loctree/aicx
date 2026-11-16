@@ -216,7 +216,8 @@ test-retrieval-eval-live:
 	cargo test --test retrieval_eval_harness --features e2e-aicx -- --nocapture
 
 test-retrieval-eval-rebaseline:
-	AICX_RETRIEVAL_EVAL_WRITE_BASELINE=1 cargo test --test retrieval_eval_harness --features e2e-aicx -- --nocapture
+	@echo "Acceptance floors are fixed; use AICX_RETRIEVAL_EVAL_REPORT=/path/result.json make test-retrieval-eval-live to record measurements."
+	@exit 2
 
 check:
 	@echo "=== AICX Quality Gate ==="

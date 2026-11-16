@@ -434,9 +434,20 @@ fn display_search_matches(result: &FuzzyResult) -> Vec<String> {
     if lines.is_empty() {
         lines = result.matched_lines.iter().collect();
     }
+    // Hybrid search carries its best admitted passage as evidence, bounded
+    // by the indexer's 4096-byte input contract. A second 200-character cut
+    // can hide the answer inside that passage. Retain the complete bounded
+    // passage in both CLI text and JSON (also used by MCP).
+    let limit = if result.label.starts_with("hybrid_rrf:")
+        || result.label.starts_with("hybrid_rrf_global_scoped:")
+    {
+        4096
+    } else {
+        SEARCH_MATCH_MAX_CHARS
+    };
     lines
         .into_iter()
-        .map(|line| truncate_search_match(line, SEARCH_MATCH_MAX_CHARS))
+        .map(|line| truncate_search_match(line, limit))
         .collect()
 }
 

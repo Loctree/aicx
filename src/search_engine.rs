@@ -222,6 +222,7 @@ pub struct HybridRetrievalStatus {
     pub lexical_doc_count: usize,
     pub fusion_algorithm: String,
     pub dense_kind: String,
+    pub corpus_freshness: String,
 }
 
 /// Fail-fast typed error for semantic-search preconditions. Each variant
@@ -772,6 +773,13 @@ fn try_lexical_search_native(
         }
     })?;
 
+    crate::source_index::verify_generation_policy(&manifest).map_err(|error| {
+        SemanticError::RetrievalManifestStale {
+            path: manifest_path.clone(),
+            reason: format!("{error:#}"),
+            recommendation: "run aicx index --semantic to admit the current privacy policy".into(),
+        }
+    })?;
     manifest
         .ensure_lexical_schema_supported(aicx_retrieve::TANTIVY_SCHEMA_VERSION)
         .map_err(|err| lexical_schema_conflict_error(&manifest_path, &err))?;
@@ -1603,6 +1611,32 @@ fn try_semantic_search_native(
     // an old NDJSON when the generation is absent, stale, or corrupt.
     let hybrid = load_hybrid_index(scope.index_project, &path, &info, &path)?;
     let manifest = hybrid.manifest().cloned();
+    if let Some(ref manifest) = manifest {
+        crate::source_index::verify_generation_policy(manifest).map_err(|error| {
+            SemanticError::RetrievalManifestStale {
+                path: path.clone(),
+                reason: format!("{error:#}"),
+                recommendation: "run aicx index --semantic to admit the current privacy policy"
+                    .into(),
+            }
+        })?;
+        if let Some(expected) = &manifest.semantic_input_contract {
+            let current =
+                crate::source_index::semantic_input_contract(&engine).map_err(|error| {
+                    SemanticError::EmbedderUnavailable {
+                        reason: format!("cannot verify embedding input contract: {error:#}"),
+                        recommendation: "inspect the configured model and retry".into(),
+                    }
+                })?;
+            if *expected != current {
+                return Err(SemanticError::RetrievalManifestStale {
+                    path: path.clone(),
+                    reason: "embedding weights or input contract changed".into(),
+                    recommendation: "run aicx index --semantic with the intended model".into(),
+                });
+            }
+        }
+    }
     let filters = hybrid_filters(retrieval_filters);
     let extra_filter_active = candidate_filters.is_some_and(supported_candidate_filter_active);
     let query_result = match hybrid.query_hybrid_with_budget_and_filter(
@@ -1636,7 +1670,12 @@ fn try_semantic_search_native(
         .map(|h| {
             let path = hit_path(&h);
             let score_pct = hybrid_score_pct(h.score);
-            let matched_lines = semantic_preview_lines(&path);
+            let passage = hit_metadata_lines(&h, "semantic_passage_lines");
+            let matched_lines = if passage.is_empty() {
+                hit_metadata_lines(&h, "preview_lines")
+            } else {
+                passage
+            };
             let label_backend = if scope.used_global_project_scope {
                 BACKEND_HYBRID_RRF_GLOBAL_SCOPED
             } else {
@@ -2115,6 +2154,7 @@ impl From<&aicx_retrieve::Manifest> for HybridRetrievalStatus {
             lexical_doc_count: manifest.lexical_doc_count,
             fusion_algorithm: manifest.fusion_algorithm.clone(),
             dense_kind: manifest.dense_kind.clone(),
+            corpus_freshness: crate::source_index::generation_freshness(manifest).into(),
         }
     }
 }
@@ -2181,7 +2221,8 @@ pub fn semantic_retrieval_outcome(
             examined_count: Some(examined_count),
             matched_count,
             fallback_reason,
-            stale_evidence,
+            stale_evidence: stale_evidence
+                || retrieval_status.is_some_and(|s| s.corpus_freshness != "current"),
         },
     )
 }
@@ -2312,6 +2353,12 @@ fn merge_hybrid_statuses(statuses: &[HybridRetrievalStatus]) -> Option<HybridRet
         [status] => Some(status.clone()),
         many => Some(HybridRetrievalStatus {
             generation_id: "multiple".to_string(),
+            corpus_freshness: if many.iter().all(|s| s.corpus_freshness == "current") {
+                "current"
+            } else {
+                "unknown"
+            }
+            .into(),
             source_chunk_count: many.iter().map(|status| status.source_chunk_count).sum(),
             dense_count: many.iter().map(|status| status.dense_count).sum(),
             lexical_doc_count: many.iter().map(|status| status.lexical_doc_count).sum(),
@@ -3114,13 +3161,14 @@ pub fn render_semantic_status_line(
     let manifest = retrieval_status
         .map(|status| {
             format!(
-                " manifest_generation={} source_chunks={} dense_count={} dense_kind={} lexical_doc_count={} fusion={}",
+                " manifest_generation={} source_chunks={} dense_count={} dense_kind={} lexical_doc_count={} fusion={} corpus_freshness={}",
                 status.generation_id,
                 status.source_chunk_count,
                 status.dense_count,
                 status.dense_kind,
                 status.lexical_doc_count,
-                status.fusion_algorithm
+                status.fusion_algorithm,
+                status.corpus_freshness
             )
         })
         .unwrap_or_default();
@@ -3293,7 +3341,11 @@ pub fn finalize_fuzzy_results(
 /// surface honest by pointing callers at `aicx index status` to confirm there
 /// are no pending (un-embedded) chunks. Shared by CLI and MCP so both surfaces
 /// emit the identical honesty signal.
-pub fn inject_index_snapshot_hint(rendered: &str, source_chunks: usize) -> anyhow::Result<String> {
+pub fn inject_index_snapshot_hint(
+    rendered: &str,
+    source_chunks: usize,
+    freshness: &str,
+) -> anyhow::Result<String> {
     let mut value: serde_json::Value = serde_json::from_str(rendered).map_err(|e| {
         anyhow::anyhow!("parse rendered search payload for index_snapshot hint: {e}")
     })?;
@@ -3302,7 +3354,8 @@ pub fn inject_index_snapshot_hint(rendered: &str, source_chunks: usize) -> anyho
             "index_snapshot".to_string(),
             serde_json::json!({
                 "source_chunks": source_chunks,
-                "freshness_verified": false,
+                "freshness_verified": freshness == "current",
+                "freshness": freshness,
                 "note": "results reflect the committed index snapshot; run `aicx index status` to confirm there are no pending (un-embedded) chunks",
             }),
         );
@@ -3804,6 +3857,7 @@ mod tests {
         let payload = inject_index_snapshot_hint(
             r#"{"oracle_status":{"backend":"hybrid_rrf"},"results":2,"items":[]}"#,
             11906,
+            "unknown",
         )
         .expect("index_snapshot hint should inject");
         let json: serde_json::Value =
@@ -4053,6 +4107,7 @@ mod tests {
     #[test]
     fn semantic_status_line_marks_hybrid_global_project_scope() {
         let status = HybridRetrievalStatus {
+            corpus_freshness: "current".into(),
             generation_id: "g-global".to_string(),
             source_chunk_count: 259_007,
             dense_count: 259_007,
@@ -4106,6 +4161,7 @@ mod tests {
         );
 
         let status = HybridRetrievalStatus {
+            corpus_freshness: "current".into(),
             generation_id: "g".to_string(),
             source_chunk_count: 10,
             dense_count: 10,
@@ -5213,6 +5269,7 @@ mod tests {
     #[test]
     fn semantic_status_line_surfaces_hybrid_manifest_counts() {
         let status = HybridRetrievalStatus {
+            corpus_freshness: "current".into(),
             generation_id: "g-test".to_string(),
             source_chunk_count: 123,
             dense_count: 123,

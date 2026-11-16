@@ -641,8 +641,16 @@ After a semantic generation exists, a changed corpus requires
 rejected` and retains `CURRENT`; it does not publish additions, edits,
 deletions or privacy changes. The retained generation still describes its old
 corpus, not the attempted refresh. This admission guard preserves search while
-the full semantic replacement is built; it does not provide vector reuse across
-changed corpora.
+the semantic replacement is built. Completed passage vectors are retained by
+content and model/input contract across corpus changes and successful
+publication, so only missing or changed passages are embedded. The first
+migration from legacy session-prefix vectors requires a new passage build.
+
+Upgrade all writers before the first schema 3.0 generation; keep old schedules
+paused until verified. New generations bind privacy policy and payload integrity,
+and searches expose `index_snapshot.freshness` as `current`, `stale` or `unknown`.
+See [Durable semantic memory](semantic-memory.md) for migration and retention.
+MCP callers opt in with `aicx_search` and `{"query":"question","deep":true}`.
 
 Signal filtering keeps user messages, agent replies, plans, and reports while
 dropping tool-call noise, internal thought, system reminders, and image/base64

@@ -302,6 +302,10 @@ pub struct EmbeddingModelInfo {
 pub trait LocalEmbeddingProvider: Send {
     fn info(&self) -> &EmbeddingModelInfo;
 
+    fn input_byte_budget(&self) -> usize {
+        MAX_EMBED_INPUT_BYTES
+    }
+
     fn embed_batch(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>>;
 
     fn embed(&mut self, text: &str) -> Result<Vec<f32>> {
@@ -367,6 +371,13 @@ impl EmbeddingEngine {
     /// cloud config that pins it); higher collapses per-request latency.
     pub fn embed_batch_size(&self) -> usize {
         self.batch_size
+    }
+
+    /// Conservative UTF-8 byte budget for complete document passages. Native
+    /// providers reserve room for special tokens; no backend may silently
+    /// discard the end of a passage supplied by the indexer.
+    pub fn input_byte_budget(&self) -> usize {
+        self.inner.input_byte_budget().min(4_096)
     }
 
     fn build_backend(config: EmbeddingConfig) -> Result<Self> {

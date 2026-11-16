@@ -10517,7 +10517,11 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
         // Hybrid results reflect the committed index snapshot, not a live
         // freshness check; attach the honesty hint pointing at `index status`.
         if let Some(source_chunks) = hybrid_source_chunks {
-            payload = aicx::search_engine::inject_index_snapshot_hint(&payload, source_chunks)?;
+            payload = aicx::search_engine::inject_index_snapshot_hint(
+                &payload,
+                source_chunks,
+                hybrid_status.map_or("unknown", |s| s.corpus_freshness.as_str()),
+            )?;
         }
         if let Some(ref fallback) = semantic_fallback {
             let mut value: serde_json::Value = serde_json::from_str(&payload)?;
@@ -10730,8 +10734,8 @@ fn run_index(
             report.distill_docs
         );
         eprintln!(
-            "  dense: kind={} docs={}",
-            report.dense_kind, report.dense_docs
+            "  dense: kind={} passages={} reused={} embedded={}",
+            report.dense_kind, report.dense_docs, report.dense_reused, report.dense_embedded
         );
         if let Some(path) = &report.manifest_path {
             eprintln!("  manifest: {path}");

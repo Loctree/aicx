@@ -651,13 +651,58 @@ fn query_context_lines(body: &str, query: &str) -> Vec<String> {
                 },
             );
             if replace {
+                // A matching sentence often states the problem while its
+                // neighbour states the decision. Keep bounded paragraph
+                // context around the actual match instead of returning an
+                // isolated question or a file prefix.
+                // Do not reintroduce a rejected command from a neighbouring
+                // sentence when this session contains benchmark echoes.
+                let context_source = if benchmark_context { candidate } else { line };
+                let candidate_offset =
+                    candidate.as_ptr() as usize - context_source.as_ptr() as usize;
+                // A single sentence can itself be many kilobytes. Anchor on
+                // an actual matched word, preferring exact and longer terms.
+                let match_offset = candidate
+                    .split_inclusive(char::is_whitespace)
+                    .filter_map(|word| {
+                        let folded = normalize_query(word);
+                        terms
+                            .iter()
+                            .zip(&prefixes)
+                            .filter_map(|(term, prefix)| {
+                                let exact = folded.contains(term.as_str());
+                                (exact || prefix.as_deref().is_some_and(|p| folded.contains(p)))
+                                    .then_some((
+                                        (exact, term.len()),
+                                        word.as_ptr() as usize - candidate.as_ptr() as usize,
+                                    ))
+                            })
+                            .max_by_key(|(score, offset)| (*score, std::cmp::Reverse(*offset)))
+                    })
+                    .max_by_key(|(score, offset)| (*score, std::cmp::Reverse(*offset)))
+                    .map_or(0, |(_, offset)| offset);
+                let anchor = candidate_offset + match_offset;
+                let start = if context_source.chars().count() <= MAX_CONTEXT_CHARS {
+                    0
+                } else {
+                    context_source[..anchor]
+                        .char_indices()
+                        .rev()
+                        .take(160)
+                        .last()
+                        .map_or(0, |(n, _)| n)
+                };
+                let context: String = context_source[start..]
+                    .chars()
+                    .take(MAX_CONTEXT_CHARS)
+                    .collect();
                 best = Some((
                     class,
                     term_score,
                     phrase_score,
                     quote_score,
                     discovery_order,
-                    candidate.to_string(),
+                    context,
                 ));
             }
             discovery_order += 1;
@@ -1899,6 +1944,25 @@ mod swap_tests {
             lines.is_empty(),
             "silence must beat benchmark echo: {lines:?}"
         );
+    }
+
+    #[test]
+    fn query_context_centres_a_match_in_a_long_single_sentence() {
+        let body = format!(
+            "{}Decision: migration-tail-identifier must remain discoverable",
+            "neutral text ".repeat(1200)
+        );
+        let lines = query_context_lines(&body, "migration-tail-identifier");
+        assert!(lines.join("\n").contains("migration-tail-identifier"));
+        assert!(lines[0].chars().count() <= 800);
+    }
+
+    #[test]
+    fn query_context_does_not_expand_into_a_rejected_search_echo() {
+        let body = "Decision: arrows vc-frame must use the chosen routing contract. Run aicx search 'arrows vc-frame' for acceptance.";
+        let lines = query_context_lines(body, "arrows vc-frame");
+        assert!(lines.join("\n").contains("routing contract"));
+        assert!(!lines.join("\n").contains("aicx search"));
     }
 
     #[test]

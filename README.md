@@ -88,6 +88,12 @@ see [docs/MULTI_MACHINE.md](./docs/MULTI_MACHINE.md).
 Project selection is metadata filtering over `_all`, not a requirement to build
 parallel project indexes.
 
+Semantic indexing now covers the complete admitted extract with bounded
+passages. Completed vectors survive interruption and publication, and corpus
+changes reuse unchanged passage/model inputs. Search reports snapshot freshness
+and returns its matched passage. The first migration requires new vectors;
+upgrade all writers first. See [semantic memory](docs/semantic-memory.md).
+
 ## Why this shape
 
 - One catalog row replaces thousands of duplicated frame cards.

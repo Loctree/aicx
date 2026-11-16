@@ -655,12 +655,21 @@ fn publish_hybrid_generation(hybrid_root: &Path, generation_dir: &Path) -> Resul
             )
         })?;
     incoming
+        .validate_against(&incoming)
+        .context("refusing an unsupported or incomplete incoming generation contract")?;
+    incoming
         .ensure_lexical_schema_supported(aicx_retrieve::TANTIVY_SCHEMA_VERSION)
         .map_err(|err| anyhow::anyhow!(err))
         .context("refusing to publish a generation with drifted lexical schema")?;
 
     let published_dir = resolve_hybrid_generation_dir(hybrid_root);
     if published_dir != *generation_dir {
+        if let Ok(published) =
+            aicx_retrieve::Manifest::read_from_path(&published_dir.join("manifest.json"))
+        {
+            published.validate_against(&published)
+                .context("CURRENT uses an unsupported generation contract; upgrade the writer instead of replacing it")?;
+        }
         if generation_has_dense(&published_dir) && !generation_has_dense(generation_dir) {
             let published =
                 aicx_retrieve::Manifest::read_from_path(&published_dir.join("manifest.json"))?;
@@ -721,6 +730,8 @@ fn publish_hybrid_generation(hybrid_root: &Path, generation_dir: &Path) -> Resul
             pointer.display()
         )
     })?;
+    #[cfg(unix)]
+    std::fs::File::open(hybrid_root)?.sync_all()?;
     // Pointer is durable. Prune is best-effort: a leftover dir is disk waste,
     // not a search-correctness failure.
     if let Err(error) =
@@ -768,6 +779,10 @@ fn carry_forward_dense_artifacts(
         return;
     }
     manifest.dense_count = previous.dense_count;
+    manifest.schema_version.clone_from(&previous.schema_version);
+    manifest.dense_payload_blake3 = previous.dense_payload_blake3.clone();
+    manifest.semantic_input_contract = previous.semantic_input_contract.clone();
+    manifest.source_policy_fingerprint = previous.source_policy_fingerprint.clone();
     manifest.dense_kind = previous.dense_kind;
     manifest.embedder_model = previous.embedder_model;
     manifest.embedder_url_hash = previous.embedder_url_hash;
@@ -921,6 +936,16 @@ pub fn publish_source_lexical_generation(
     chunks: &[aicx_retrieve::ChunkRef],
     source_fingerprint: &str,
 ) -> Result<aicx_retrieve::Manifest> {
+    publish_source_lexical_generation_with_policy(chunks, source_fingerprint, None)
+}
+
+/// Source builders supply the policy used to project their input; legacy
+/// callers may omit it, but cannot claim source-snapshot admission evidence.
+pub fn publish_source_lexical_generation_with_policy(
+    chunks: &[aicx_retrieve::ChunkRef],
+    source_fingerprint: &str,
+    policy_fingerprint: Option<&str>,
+) -> Result<aicx_retrieve::Manifest> {
     use aicx_retrieve::{LexicalIndex, Manifest, TantivyAdapter};
 
     if chunks.is_empty() {
@@ -959,6 +984,9 @@ pub fn publish_source_lexical_generation(
         writer_version: env!("CARGO_PKG_VERSION").to_string(),
         build_id: crate::BUILD_VERSION.to_string(),
         source_chunk_count: chunks.len(),
+        semantic_input_contract: None,
+        source_policy_fingerprint: policy_fingerprint.map(str::to_string),
+        dense_payload_blake3: None,
         source_hash_blake3: aicx_retrieve::source_hash_blake3(source_fingerprint),
         embedder_model: "optional".to_string(),
         embedder_url_hash: "not_built".to_string(),
@@ -979,6 +1007,12 @@ pub fn publish_source_lexical_generation(
     };
     carry_forward_dense_artifacts(&previous_dir, &generation_dir, &mut manifest);
     manifest.write_to_path(&generation_dir.join("manifest.json"))?;
+    if policy_fingerprint.is_some() {
+        anyhow::ensure!(
+            crate::source_index::generation_freshness(&manifest) == "current",
+            "source corpus or privacy policy changed before lexical generation admission; CURRENT retained; retry index"
+        );
+    }
     publish_hybrid_generation(&hybrid_root, &generation_dir)?;
     Ok(manifest)
 }
@@ -993,6 +1027,24 @@ pub fn publish_source_hybrid_generation(
     source_fingerprint: &str,
     fingerprint: &aicx_retrieve::EmbedderFingerprint,
 ) -> Result<aicx_retrieve::Manifest> {
+    publish_source_hybrid_generation_with_contract(
+        chunks,
+        dense_chunks,
+        source_fingerprint,
+        fingerprint,
+        None,
+        None,
+    )
+}
+
+pub fn publish_source_hybrid_generation_with_contract(
+    chunks: &[aicx_retrieve::ChunkRef],
+    dense_chunks: &[aicx_retrieve::DenseChunkRef],
+    source_fingerprint: &str,
+    fingerprint: &aicx_retrieve::EmbedderFingerprint,
+    input_contract: Option<&str>,
+    policy_fingerprint: Option<&str>,
+) -> Result<aicx_retrieve::Manifest> {
     use aicx_retrieve::{
         HybridIndex, Manifest, MmapDenseAdapter, ReciprocalRankFusion, TantivyAdapter,
     };
@@ -1000,13 +1052,30 @@ pub fn publish_source_hybrid_generation(
     if chunks.is_empty() {
         anyhow::bail!("cannot publish an empty source hybrid generation");
     }
-    if dense_chunks.len() != chunks.len() {
-        anyhow::bail!(
-            "hybrid publish requires one dense vector per lexical chunk (lexical={}, dense={})",
-            chunks.len(),
-            dense_chunks.len()
+    let lexical_ids: std::collections::HashSet<_> = chunks.iter().map(|c| c.id.as_str()).collect();
+    let mut covered = std::collections::HashSet::new();
+    let mut dense_ids = std::collections::HashSet::new();
+    for dense in dense_chunks {
+        let parent = dense
+            .chunk
+            .metadata
+            .get("parent_chunk_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or(&dense.chunk.id);
+        anyhow::ensure!(
+            lexical_ids.contains(parent),
+            "dense passage refers to an absent lexical session"
         );
+        anyhow::ensure!(
+            dense_ids.insert(&dense.chunk.id),
+            "duplicate dense passage identity"
+        );
+        covered.insert(parent);
     }
+    anyhow::ensure!(
+        covered == lexical_ids,
+        "hybrid publish requires dense coverage of every lexical session"
+    );
     if fingerprint.dim == 0 {
         anyhow::bail!("embedder dimension must be non-zero for --semantic publish");
     }
@@ -1018,6 +1087,11 @@ pub fn publish_source_hybrid_generation(
                 fingerprint.dim
             );
         }
+        anyhow::ensure!(
+            dense.embedding.iter().all(|v| v.is_finite())
+                && dense.embedding.iter().any(|v| *v != 0.0),
+            "invalid dense vector at passage {idx}"
+        );
     }
 
     let hybrid_root = hybrid_root_dir(None)?;
@@ -1045,7 +1119,19 @@ pub fn publish_source_hybrid_generation(
     );
     hybrid.set_writer_identity(env!("CARGO_PKG_VERSION"), crate::BUILD_VERSION);
     hybrid.build_hybrid(chunks, dense_chunks, source_fingerprint)?;
-    let manifest = hybrid.commit()?.clone();
+    let mut manifest = hybrid.commit()?.clone();
+    manifest.semantic_input_contract = input_contract.map(str::to_string);
+    manifest.source_policy_fingerprint = policy_fingerprint.map(str::to_string);
+    if input_contract.is_some() {
+        manifest.schema_version = "3.0".into();
+    }
+    manifest.write_to_path(&generation_dir.join("manifest.json"))?;
+    if input_contract.is_some() {
+        anyhow::ensure!(
+            crate::source_index::generation_freshness(&manifest) == "current",
+            "source corpus or privacy policy changed before generation admission; CURRENT retained; retry aicx index --semantic"
+        );
+    }
     publish_hybrid_generation(&hybrid_root, &generation_dir)?;
     Ok(manifest)
 }
@@ -2178,6 +2264,9 @@ fn incremental_materialize_hybrid(
         writer_version: env!("CARGO_PKG_VERSION").to_string(),
         build_id: crate::BUILD_VERSION.to_string(),
         source_chunk_count,
+        semantic_input_contract: None,
+        source_policy_fingerprint: None,
+        dense_payload_blake3: None,
         source_hash_blake3: aicx_retrieve::source_hash_blake3(source_hash),
         embedder_model: fingerprint.model,
         embedder_url_hash: fingerprint.url_hash,
@@ -3643,6 +3732,9 @@ mod source_hybrid_publish_tests {
             writer_version: env!("CARGO_PKG_VERSION").to_string(),
             build_id: "test".to_string(),
             source_chunk_count: 1,
+            semantic_input_contract: None,
+            source_policy_fingerprint: None,
+            dense_payload_blake3: None,
             source_hash_blake3: "ab".repeat(32),
             embedder_model: if dense {
                 "test-model".to_string()

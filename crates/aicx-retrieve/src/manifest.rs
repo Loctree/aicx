@@ -106,6 +106,14 @@ pub struct Manifest {
     pub build_id: String,
     pub source_chunk_count: usize,
     pub source_hash_blake3: String,
+    /// Complete embedding-input contract, absent on older generations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_input_contract: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_policy_fingerprint: Option<String>,
+    /// Integrity of the actual immutable dense payload, not just its header.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dense_payload_blake3: Option<String>,
     pub embedder_model: String,
     pub embedder_url_hash: String,
     pub embedder_dim: usize,
@@ -152,7 +160,36 @@ impl Manifest {
             }
             .into());
         }
+        self.verify_dense_payload_checksum(generation_dir)?;
         Ok(dense)
+    }
+
+    pub fn dense_payload_checksum(generation_dir: &Path) -> Result<String> {
+        let mut file = File::open(generation_dir.join(MMAP_DENSE_PAYLOAD_FILE_NAME))?;
+        let mut hasher = blake3::Hasher::new();
+        let mut buffer = vec![0; 1024 * 1024];
+        loop {
+            let bytes = file.read(&mut buffer)?;
+            if bytes == 0 {
+                break;
+            }
+            hasher.update(&buffer[..bytes]);
+        }
+        Ok(hasher.finalize().to_hex().to_string())
+    }
+
+    pub fn verify_dense_payload_checksum(&self, generation_dir: &Path) -> Result<()> {
+        if let Some(expected) = &self.dense_payload_blake3 {
+            let actual = Self::dense_payload_checksum(generation_dir)?;
+            if *expected != actual {
+                return Err(crate::RetrieveError::DensePayloadModified {
+                    expected: expected.clone(),
+                    actual,
+                }
+                .into());
+            }
+        }
+        Ok(())
     }
 
     pub fn write_to_path(&self, path: &Path) -> Result<()> {
@@ -184,6 +221,10 @@ impl Manifest {
                 path.display()
             )
         })?;
+        #[cfg(unix)]
+        if let Some(parent) = path.parent() {
+            fs::File::open(parent)?.sync_all()?;
+        }
         Ok(())
     }
 
@@ -255,18 +296,30 @@ impl Manifest {
 
     /// Validate that two retrieval artifacts belong to the same generation.
     pub fn validate_against(&self, other: &Manifest) -> Result<(), ManifestError> {
-        const SUPPORTED_SCHEMA_VERSION: &str = "2.0";
+        const SUPPORTED_SCHEMA_VERSIONS: &[&str] = &["2.0", "3.0"];
 
-        if self.schema_version != SUPPORTED_SCHEMA_VERSION {
+        if !SUPPORTED_SCHEMA_VERSIONS.contains(&self.schema_version.as_str()) {
             return Err(ManifestError::SchemaVersionUnsupported(
                 self.schema_version.clone(),
             ));
         }
 
-        if other.schema_version != SUPPORTED_SCHEMA_VERSION {
+        if !SUPPORTED_SCHEMA_VERSIONS.contains(&other.schema_version.as_str()) {
             return Err(ManifestError::SchemaVersionUnsupported(
                 other.schema_version.clone(),
             ));
+        }
+        for manifest in [self, other] {
+            if manifest.schema_version == "3.0"
+                && (manifest.semantic_input_contract.is_none()
+                    || manifest.source_policy_fingerprint.is_none()
+                    || manifest.dense_payload_blake3.is_none())
+            {
+                return Err(ManifestError::SchemaVersionUnsupported(
+                    "3.0 requires complete semantic input, policy and payload integrity receipts"
+                        .into(),
+                ));
+            }
         }
 
         if self.generation_id != other.generation_id {

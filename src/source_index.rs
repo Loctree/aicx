@@ -27,6 +27,13 @@ use crate::catalog::CatalogEntry;
 use crate::progress::{Heartbeat, NoopReporter, Phase, Reporter};
 use crate::timeline::{FrameKind, TimelineEntry};
 
+mod semantic;
+use semantic::embed_chunks_for_semantic;
+pub use semantic::{
+    SOURCE_DENSE_CHECKPOINT_DIR, SOURCE_DENSE_CHECKPOINT_SCHEMA, SourceDenseCheckpointHeader,
+    SourceDenseCheckpointRow, source_chunk_content_hash, source_dense_checkpoint_path,
+};
+
 const MAX_MESSAGE_CHARS: usize = 256 * 1024;
 const MAX_EXTRACT_CHARS: usize = 4 * 1024 * 1024;
 const MAX_UNBROKEN_TOKEN_CHARS: usize = 4096;
@@ -112,6 +119,9 @@ pub struct SourceIndexReport {
     /// Dense vectors published when `semantic` was requested; 0 for lexical-only.
     #[serde(default)]
     pub dense_docs: usize,
+    /// Durable embeddings used without a provider call, including after corpus changes.
+    pub dense_reused: usize,
+    pub dense_embedded: usize,
     /// `optional_not_built` | `exact_mmap_v1` | …
     #[serde(default)]
     pub dense_kind: String,
@@ -607,7 +617,13 @@ pub fn build_with_reporter(
                 if semantic {
                     let engine = crate::embedder::EmbeddingEngine::new()?;
                     let matches =
-                        crate::vector_index::hybrid_manifest_matches_embedder(None, engine.info());
+                        crate::vector_index::hybrid_manifest_matches_embedder(None, engine.info())
+                            && crate::vector_index::hybrid_manifest_path(None)
+                                .ok()
+                                .and_then(|p| aicx_retrieve::Manifest::read_from_path(&p).ok())
+                                .and_then(|m| m.semantic_input_contract)
+                                .as_deref()
+                                == Some(semantic::input_contract(&engine)?.as_str());
                     prepared_engine = Some(engine);
                     matches
                 } else {
@@ -634,6 +650,8 @@ pub fn build_with_reporter(
             distill_docs: 0,
             lexical_docs: crate::vector_index::current_lexical_doc_count()?.unwrap_or(0),
             dense_docs,
+            dense_reused: dense_docs,
+            dense_embedded: 0,
             dense_kind,
             semantic_requested: semantic,
             unchanged: true,
@@ -846,6 +864,26 @@ pub fn build_with_reporter(
                 crate::locks::lance_lock_path()?,
             )?)
         };
+        if !dry_run {
+            // Embedding may take hours. Never admit a snapshot whose sources
+            // or privacy policy changed while the provider was running.
+            let live_ignore = crate::legacy_archive::load_repo_path_ignore(aicx_home, &user_home)?;
+            anyhow::ensure!(
+                source_fingerprint
+                    == self::source_fingerprint(
+                        aicx_home,
+                        &catalog_path,
+                        &selected,
+                        &source_allow,
+                        &live_ignore.fingerprint()
+                    )?,
+                "source corpus or privacy policy changed during embedding; CURRENT retained; retry aicx index --semantic to reuse completed passages"
+            );
+            anyhow::ensure!(
+                ScopeLayoutProbe::default().ledger_is_current(&next_state),
+                "repository scope layout changed during indexing; CURRENT retained; retry index"
+            );
+        }
         Ok(if dry_run {
             (
                 None,
@@ -857,19 +895,18 @@ pub fn build_with_reporter(
                 },
             )
         } else if semantic {
-            let (dense_chunks, fingerprint) = semantic_payload
+            let payload = semantic_payload
                 .as_ref()
                 .expect("semantic payload prepared");
-            let manifest = crate::vector_index::publish_source_hybrid_generation(
+            payload.compact()?;
+            let manifest = crate::vector_index::publish_source_hybrid_generation_with_contract(
                 &chunks,
-                dense_chunks,
+                &payload.chunks,
                 &source_fingerprint,
-                fingerprint,
+                &payload.fingerprint,
+                Some(&payload.contract),
+                Some(&repo_path_ignore_fingerprint),
             )?;
-            let hybrid_root = crate::vector_index::hybrid_root_dir(None)?;
-            let checkpoint_path =
-                source_dense_checkpoint_path(&hybrid_root, &source_fingerprint, fingerprint);
-            let _ = std::fs::remove_file(&checkpoint_path);
             if project_filters.is_empty() {
                 write_parse_state(aicx_home, &next_state)?;
             }
@@ -882,9 +919,10 @@ pub fn build_with_reporter(
                 manifest.dense_kind,
             )
         } else {
-            let manifest = crate::vector_index::publish_source_lexical_generation(
+            let manifest = crate::vector_index::publish_source_lexical_generation_with_policy(
                 &chunks,
                 &source_fingerprint,
+                Some(&repo_path_ignore_fingerprint),
             )?;
             // Persist parse state only after a successful publish so a killed build
             // cannot claim sessions are current when CURRENT never flipped.
@@ -936,6 +974,8 @@ pub fn build_with_reporter(
         distill_docs,
         lexical_docs: chunks.len(),
         dense_docs,
+        dense_reused: semantic_payload.as_ref().map_or(0, |p| p.reused),
+        dense_embedded: semantic_payload.as_ref().map_or(0, |p| p.embedded),
         dense_kind,
         semantic_requested: semantic,
         unchanged: false,
@@ -1164,389 +1204,6 @@ fn current_dense_stats() -> (String, usize) {
         Ok(m) => (m.dense_kind, m.dense_count),
         Err(_) => ("unreadable".to_string(), 0),
     }
-}
-
-pub const SOURCE_DENSE_CHECKPOINT_SCHEMA: &str = "aicx.source_dense_checkpoint.v1";
-pub const SOURCE_DENSE_CHECKPOINT_DIR: &str = "dense-checkpoints";
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SourceDenseCheckpointHeader {
-    pub schema: String,
-    pub source_fingerprint: String,
-    pub embedder_model: String,
-    pub embedder_url_hash: String,
-    pub dimension: usize,
-    pub distance: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SourceDenseCheckpointRow {
-    pub chunk_id: String,
-    pub content_hash_blake3: String,
-    pub embedding: Vec<f32>,
-}
-
-pub fn source_chunk_content_hash(chunk: &aicx_retrieve::ChunkRef) -> String {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(chunk.id.as_bytes());
-    hasher.update(&[0]);
-    hasher.update(chunk.source_path.as_bytes());
-    hasher.update(&[0]);
-    hasher.update(chunk.text.as_bytes());
-    hasher.finalize().to_hex().to_string()
-}
-
-pub fn source_dense_checkpoint_path(
-    hybrid_root: &Path,
-    source_fingerprint: &str,
-    fingerprint: &aicx_retrieve::EmbedderFingerprint,
-) -> PathBuf {
-    let header = SourceDenseCheckpointHeader {
-        schema: SOURCE_DENSE_CHECKPOINT_SCHEMA.to_string(),
-        source_fingerprint: source_fingerprint.to_string(),
-        embedder_model: fingerprint.model.clone(),
-        embedder_url_hash: fingerprint.url_hash.clone(),
-        dimension: fingerprint.dim,
-        distance: fingerprint.distance.clone(),
-    };
-    let identity =
-        serde_json::to_vec(&header).expect("checkpoint header serialization is infallible");
-    let name = format!("{}.ndjson", blake3::hash(&identity).to_hex());
-    hybrid_root.join(SOURCE_DENSE_CHECKPOINT_DIR).join(name)
-}
-
-fn load_source_dense_checkpoint(
-    path: &Path,
-    expected_header: &SourceDenseCheckpointHeader,
-) -> Result<HashMap<String, (String, Vec<f32>)>> {
-    use std::io::{BufRead, Seek};
-    if !path.is_file() {
-        return Ok(HashMap::new());
-    }
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .open(path)
-        .with_context(|| format!("open dense checkpoint: {}", path.display()))?;
-    let mut reader = BufReader::new(file);
-    let mut header_line = String::new();
-    if reader.read_line(&mut header_line)? == 0 {
-        return Ok(HashMap::new());
-    }
-    let observed: SourceDenseCheckpointHeader = match serde_json::from_str(header_line.trim_end()) {
-        Ok(h) => h,
-        Err(_) => {
-            return Ok(HashMap::new());
-        }
-    };
-    if &observed != expected_header {
-        crate::diagnostics::log_describe(&format!(
-            "dense checkpoint identity mismatch in {}; starting fresh",
-            path.display()
-        ));
-        return Ok(HashMap::new());
-    }
-
-    let mut reusable = HashMap::new();
-    let mut durable_offset = reader.stream_position()?;
-    let mut line = String::new();
-    loop {
-        line.clear();
-        let bytes_read = reader.read_line(&mut line)?;
-        if bytes_read == 0 {
-            break;
-        }
-        let complete = line.ends_with('\n');
-        let parsed: Result<SourceDenseCheckpointRow, _> = serde_json::from_str(line.trim_end());
-        match parsed {
-            Ok(row) => {
-                if row.embedding.len() == expected_header.dimension
-                    && row.embedding.iter().all(|v| v.is_finite())
-                {
-                    reusable.insert(row.chunk_id, (row.content_hash_blake3, row.embedding));
-                }
-                durable_offset = reader.stream_position()?;
-            }
-            Err(_) => {
-                if !complete {
-                    drop(reader);
-                    if let Ok(file) = std::fs::OpenOptions::new().write(true).open(path) {
-                        let _ = file.set_len(durable_offset);
-                        let _ = file.sync_all();
-                    }
-                    break;
-                }
-            }
-        }
-    }
-    Ok(reusable)
-}
-
-fn append_dense_checkpoint_rows(path: &Path, rows: &[SourceDenseCheckpointRow]) -> Result<()> {
-    use std::io::Write;
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .with_context(|| format!("append dense checkpoint: {}", path.display()))?;
-    for row in rows {
-        serde_json::to_writer(&mut file, row)?;
-        file.write_all(b"\n")?;
-    }
-    file.flush()?;
-    file.sync_all()?;
-    Ok(())
-}
-
-/// Embed session extracts for `--semantic` using the configured cloud/native engine.
-#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
-fn embed_chunks_for_semantic(
-    _aicx_home: &Path,
-    source_fingerprint: &str,
-    chunks: &[aicx_retrieve::ChunkRef],
-    reporter: Arc<dyn Reporter>,
-    prepared_engine: Option<crate::embedder::EmbeddingEngine>,
-) -> Result<(
-    Vec<aicx_retrieve::DenseChunkRef>,
-    aicx_retrieve::EmbedderFingerprint,
-)> {
-    use aicx_progress_contracts::{EventSink, IndexEvent};
-    let phase = Phase::start(reporter, "index_embed", Some(chunks.len() as u64));
-    let progress = aicx_monitor::IndexProgressMonitor::default();
-    progress.on_event(&IndexEvent::RunStarted {
-        total_items: chunks.len(),
-        namespace: "index_embed".into(),
-        source_label: "source extracts".into(),
-        parallelism: 1,
-        started_at: chrono::Utc::now(),
-    });
-    let result: Result<_> = (|| {
-        let mut engine = match prepared_engine {
-            Some(engine) => Ok(engine),
-            None => crate::embedder::EmbeddingEngine::new(),
-        }
-        .with_context(|| {
-            "initialize embedder for `aicx index --semantic` (configure ~/.aicx/config.toml \
-         [embedder.cloud] or native GGUF, then `aicx warmup`)"
-                .to_string()
-        })?;
-        let info = engine.info().clone();
-        let fingerprint = crate::vector_index::hybrid_embedder_fingerprint(&info);
-        let batch_size = engine.embed_batch_size().max(1);
-
-        let hybrid_root = crate::vector_index::hybrid_root_dir(None)?;
-        let checkpoint_dir = hybrid_root.join(SOURCE_DENSE_CHECKPOINT_DIR);
-        fs::create_dir_all(&checkpoint_dir)?;
-        let expected_header = SourceDenseCheckpointHeader {
-            schema: SOURCE_DENSE_CHECKPOINT_SCHEMA.to_string(),
-            source_fingerprint: source_fingerprint.to_string(),
-            embedder_model: fingerprint.model.clone(),
-            embedder_url_hash: fingerprint.url_hash.clone(),
-            dimension: fingerprint.dim,
-            distance: fingerprint.distance.clone(),
-        };
-        let checkpoint_path =
-            source_dense_checkpoint_path(&hybrid_root, source_fingerprint, &fingerprint);
-        let mut reusable =
-            load_source_dense_checkpoint(&checkpoint_path, &expected_header).unwrap_or_default();
-
-        if !checkpoint_path.is_file() {
-            use std::io::Write;
-            let mut file = fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&checkpoint_path)?;
-            serde_json::to_writer(&mut file, &expected_header)?;
-            file.write_all(b"\n")?;
-            file.sync_all()?;
-        }
-
-        let mut valid_reused: HashMap<String, Vec<f32>> = HashMap::new();
-        for chunk in chunks {
-            let hash = source_chunk_content_hash(chunk);
-            if let Some((stored_hash, emb)) = reusable.remove(&chunk.id)
-                && stored_hash == hash
-                && emb.len() == fingerprint.dim
-            {
-                valid_reused.insert(chunk.id.clone(), emb);
-            }
-        }
-        let reused_count = valid_reused.len();
-        if reused_count > 0 {
-            crate::diagnostics::log_describe(&format!(
-                "dense checkpoint resumed {reused_count}/{} chunks from {}",
-                chunks.len(),
-                checkpoint_path.display()
-            ));
-            eprintln!(
-                "aicx index --semantic · resumed {}/{} document(s) from checkpoint",
-                reused_count,
-                chunks.len()
-            );
-        }
-
-        for (item_index, chunk) in chunks.iter().enumerate() {
-            if valid_reused.contains_key(&chunk.id) {
-                progress.on_event(&IndexEvent::ItemStarted {
-                    item_index,
-                    label: chunk.id.clone(),
-                    size_bytes: None,
-                });
-                progress.on_event(&IndexEvent::ItemIndexed {
-                    item_index,
-                    label: chunk.id.clone(),
-                    chunks_indexed: 1,
-                    duration_ms: 0,
-                    embedder_ms: None,
-                    tokens_estimated: None,
-                    content_hash: None,
-                });
-            }
-        }
-        if reused_count > 0 {
-            phase.tick(reused_count as u64);
-        }
-
-        let missing_chunks: Vec<(usize, &aicx_retrieve::ChunkRef)> = chunks
-            .iter()
-            .enumerate()
-            .filter(|(_, chunk)| !valid_reused.contains_key(&chunk.id))
-            .collect();
-
-        let total_missing = missing_chunks.len();
-        let mut newly_embedded = 0usize;
-        for (batch_idx, batch) in missing_chunks.chunks(batch_size).enumerate() {
-            for (item_index, chunk) in batch {
-                progress.on_event(&IndexEvent::ItemStarted {
-                    item_index: *item_index,
-                    label: chunk.id.clone(),
-                    size_bytes: None,
-                });
-            }
-            let batch_started = Instant::now();
-            let texts: Vec<String> = batch
-                .iter()
-                .map(|(_, chunk)| {
-                    // Bound embed payload: first ~8k chars keeps signal, avoids multi-MB HTTP.
-                    let text = chunk.text.as_str();
-                    if text.len() > 8_192 {
-                        text.chars().take(8_192).collect()
-                    } else {
-                        text.to_string()
-                    }
-                })
-                .collect();
-            let vectors = engine.embed_batch(&texts).with_context(|| {
-                format!(
-                    "embed batch {}/{} ({} texts) for index --semantic",
-                    batch_idx + 1,
-                    total_missing.div_ceil(batch_size),
-                    texts.len()
-                )
-            })?;
-            if vectors.len() != batch.len() {
-                anyhow::bail!(
-                    "embedder returned {} vectors for {} texts in batch {}",
-                    vectors.len(),
-                    batch.len(),
-                    batch_idx + 1
-                );
-            }
-            let mut checkpoint_rows = Vec::with_capacity(batch.len());
-            for ((item_index, chunk), embedding) in batch.iter().zip(vectors) {
-                if embedding.len() != fingerprint.dim {
-                    anyhow::bail!(
-                        "embedder returned dim {} for chunk {}; config expects {}",
-                        embedding.len(),
-                        chunk.id,
-                        fingerprint.dim
-                    );
-                }
-                let content_hash = source_chunk_content_hash(chunk);
-                checkpoint_rows.push(SourceDenseCheckpointRow {
-                    chunk_id: chunk.id.clone(),
-                    content_hash_blake3: content_hash,
-                    embedding: embedding.clone(),
-                });
-                valid_reused.insert(chunk.id.clone(), embedding);
-                newly_embedded += 1;
-                progress.on_event(&IndexEvent::ItemIndexed {
-                    item_index: *item_index,
-                    label: chunk.id.clone(),
-                    chunks_indexed: 1,
-                    duration_ms: batch_started.elapsed().as_millis() as u64,
-                    embedder_ms: None,
-                    tokens_estimated: None,
-                    content_hash: None,
-                });
-            }
-            append_dense_checkpoint_rows(&checkpoint_path, &checkpoint_rows)?;
-            phase.tick((reused_count + newly_embedded) as u64);
-            let snapshot = progress.snapshot();
-            let eta = snapshot
-                .eta_secs
-                .map(|s| format!("{:.0}s", s))
-                .unwrap_or_else(|| "unknown".into());
-            eprintln!(
-                "aicx index --semantic · embedded {}/{} document(s) · {:.2} docs/s · ETA {}",
-                snapshot.processed, snapshot.total, snapshot.items_per_sec, eta
-            );
-        }
-
-        let mut dense_chunks = Vec::with_capacity(chunks.len());
-        for chunk in chunks {
-            let embedding = valid_reused
-                .remove(&chunk.id)
-                .ok_or_else(|| anyhow::anyhow!("missing embedding for chunk {}", chunk.id))?;
-            dense_chunks.push(aicx_retrieve::DenseChunkRef {
-                chunk: chunk.clone(),
-                embedding,
-            });
-        }
-        Ok((dense_chunks, fingerprint))
-    })();
-    match &result {
-        Ok(_) => {
-            let snapshot = progress.snapshot();
-            progress.on_event(&IndexEvent::RunCompleted {
-                processed: snapshot.processed,
-                indexed: snapshot.indexed,
-                skipped: snapshot.skipped,
-                failed: snapshot.failed,
-                total_chunks: snapshot.total_chunks,
-                elapsed: phase.started_at.elapsed(),
-                stopped_early: false,
-            });
-            phase.finish_ok(format!("embedded={}", snapshot.indexed));
-        }
-        Err(error) => {
-            progress.on_event(&IndexEvent::RunFailed {
-                error: format!("{error:#}"),
-                processed_before_failure: progress.snapshot().processed,
-            });
-            phase.finish_err(
-                error,
-                Some("check embedder configuration and retry aicx index --semantic"),
-            );
-        }
-    }
-    result
-}
-
-#[cfg(not(any(feature = "native-embedder", feature = "cloud-embedder")))]
-fn embed_chunks_for_semantic(
-    _aicx_home: &Path,
-    _source_fingerprint: &str,
-    _chunks: &[aicx_retrieve::ChunkRef],
-    _reporter: Arc<dyn Reporter>,
-) -> Result<(
-    Vec<aicx_retrieve::DenseChunkRef>,
-    aicx_retrieve::EmbedderFingerprint,
-)> {
-    anyhow::bail!(
-        "`aicx index --semantic` requires a build with `cloud-embedder` and/or `native-embedder` \
-         features (default release builds include both)"
-    )
 }
 
 /// Compare the durable catalog with the document identities actually committed
@@ -3342,6 +2999,7 @@ fn source_fingerprint(
     // Filter generation first so a catalog-identical CURRENT cannot hide a
     // pre-filter corpus after signal-body rules change.
     hasher.update(SIGNAL_FILTER_VERSION.as_bytes());
+    hasher.update(semantic::PASSAGE_INPUT_VERSION.as_bytes());
     hasher.update([0]);
     // Privacy rules are part of corpus identity. A rule edit must invalidate
     // CURRENT even when the catalog and every source file are unchanged.
@@ -3364,6 +3022,13 @@ fn source_fingerprint(
         hasher.update([0]);
         hasher.update(entry.source_path.as_bytes());
         hasher.update([0]);
+        // A disappeared source must differ even when catalog fallback stats
+        // happen to equal its last live fingerprint.
+        hasher.update([u8::from(
+            source_allow
+                .resolve_file(entry.source_path.as_str())
+                .is_ok(),
+        )]);
         let fingerprint = live_or_catalog_fingerprint(entry, source_allow);
         hasher.update(fingerprint.len.to_le_bytes());
         hasher.update((fingerprint.modified_unix_nanos as u64).to_le_bytes());
@@ -3377,6 +3042,56 @@ fn source_fingerprint(
         }
     }
     Ok(hex::encode(hasher.finalize()))
+}
+
+/// Snapshot freshness is distinct from successful index execution and valid
+/// vector bytes. Unknown is explicit for legacy manifests and unreadable state.
+pub(crate) fn generation_freshness(manifest: &aicx_retrieve::Manifest) -> &'static str {
+    if manifest.source_policy_fingerprint.is_none() {
+        return "unknown";
+    }
+    let observed: Result<String> = (|| {
+        let home = crate::aicx_home::resolve()?;
+        let user_home = crate::os_user_home().unwrap_or_else(|| home.clone());
+        let entries = crate::catalog::read_entries_at(&home)?;
+        let allow = crate::source_path::SourceAllowlist::for_operator(&user_home, &home);
+        let ignore = crate::legacy_archive::load_repo_path_ignore(&home, &user_home)?;
+        source_fingerprint(
+            &home,
+            &crate::catalog::sessions_path_for(&home),
+            &entries,
+            &allow,
+            &ignore.fingerprint(),
+        )
+    })();
+    match observed {
+        Ok(hash) if aicx_retrieve::source_hash_blake3(&hash) == manifest.source_hash_blake3 => {
+            "current"
+        }
+        Ok(_) => "stale",
+        Err(_) => "unknown",
+    }
+}
+
+pub(crate) fn verify_generation_policy(manifest: &aicx_retrieve::Manifest) -> Result<()> {
+    if let Some(expected) = &manifest.source_policy_fingerprint {
+        anyhow::ensure!(
+            *expected == current_policy_fingerprint()?,
+            "privacy policy changed since this generation; rebuild with aicx index --semantic before serving its stored text"
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn current_policy_fingerprint() -> Result<String> {
+    let home = crate::aicx_home::resolve()?;
+    let user_home = crate::os_user_home().unwrap_or_else(|| home.clone());
+    Ok(crate::legacy_archive::load_repo_path_ignore(&home, &user_home)?.fingerprint())
+}
+
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+pub(crate) fn semantic_input_contract(engine: &crate::embedder::EmbeddingEngine) -> Result<String> {
+    semantic::input_contract(engine)
 }
 
 /// Prefer live size+mtime; fall back to catalog-admitted values when the file

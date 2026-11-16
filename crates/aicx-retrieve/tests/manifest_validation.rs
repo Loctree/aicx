@@ -12,6 +12,9 @@ fn manifest() -> Manifest {
         writer_version: "0.12.1".to_string(),
         build_id: "0.12.1+gtestbead".to_string(),
         source_chunk_count: 3,
+        semantic_input_contract: None,
+        source_policy_fingerprint: None,
+        dense_payload_blake3: None,
         source_hash_blake3: "blake3-source".to_string(),
         embedder_model: "text-embedding-3-small".to_string(),
         embedder_url_hash: "sha256-endpoint".to_string(),
@@ -126,11 +129,11 @@ fn lexical_commit_mismatch_is_typed() {
 fn forward_schema_version_is_rejected() {
     let left = manifest();
     let mut right = manifest();
-    right.schema_version = "3.0".to_string();
+    right.schema_version = "4.0".to_string();
 
     assert_eq!(
         left.validate_against(&right),
-        Err(RetrieveError::SchemaVersionUnsupported("3.0".to_string()))
+        Err(RetrieveError::SchemaVersionUnsupported("4.0".to_string()))
     );
 }
 
@@ -213,4 +216,15 @@ fn ensure_lexical_schema_supported_passes_matching_and_unversioned_ids() {
         m.ensure_lexical_schema_supported("tantivy_lexical_v3_folded_dictation"),
         Ok(())
     );
+}
+
+#[test]
+fn passage_schema_requires_input_policy_and_payload_receipts() {
+    let mut m = manifest();
+    m.schema_version = "3.0".into();
+    assert!(m.validate_against(&m).is_err());
+    m.semantic_input_contract = Some("passages-v1".into());
+    m.source_policy_fingerprint = Some("policy-v1".into());
+    m.dense_payload_blake3 = Some("payload-digest".into());
+    assert!(m.validate_against(&m).is_ok());
 }
