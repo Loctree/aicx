@@ -5,6 +5,42 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
+## [0.16.0] - 2026-11-16
+
+### Added
+
+- Retained semantic passage cache keyed by exact content and model/input contract.
+  Resume completed batches across interruption, corpus additions, edits and
+  removals, including after successful publication. Reports distinguish reused
+  and newly embedded passages with progress, throughput and ETA.
+- Complete admitted extracts are embedded as bounded UTF-8 passages instead of
+  one 8192-character session prefix. Fusion ranks sessions once through their
+  best passage and returns that bounded evidence through CLI and MCP.
+- MCP `aicx_search` now explicitly supports `deep=true`; ordinary search stays
+  lexical. Results expose current/stale/unknown source snapshot freshness.
+
+### Fixed
+
+- Recheck source, privacy and scope state before atomic admission. Bind new
+  generations to privacy policy; refuse serving their text after a policy edit.
+- Checksum cached vectors and published dense payloads. Reject modified payloads
+  and unsupported future generation contracts; retain completed reusable work.
+- Reject native tokenizer overflow instead of silently truncating supplied text.
+- Preserve answer context in lexical snippets and complete bounded hybrid
+  passages in CLI/MCP output, including answers at the end of long sessions.
+- Replace the host-dependent zero-recall retrieval floor with twelve public
+  fixed-query fixtures requiring known answers and evidence through the source
+  index, CLI and MCP, with an explicit real-model mode and a semantic-only
+  cross-language control that must rank first after lexical recall fails.
+
+### Migration
+
+- Passage generations use schema 3.0. Upgrade every writer before building the
+  first new generation; older readers reject this schema. The first passage
+  migration needs new vectors, while the old CURRENT remains available until
+  admission. Legacy preserved checkpoints are not altered. Historical retained
+  generations and model caches are not an automatic secure-erasure service.
+
 ## [0.15.1] - 2026-11-14
 
 ### Fixed

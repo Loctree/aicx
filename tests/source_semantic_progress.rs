@@ -226,6 +226,9 @@ fn semantic_progress_model_drift_and_failed_rebuild_preserve_current() {
     let status = aicx::api::index_status_at(&root, None).unwrap();
     assert_eq!(status.dense_status, "invalid");
     let pointer = std::fs::read(hybrid.join("CURRENT")).unwrap();
+    // The retained cache can repair a damaged payload without calling the
+    // provider. Select a new model to actually exercise invalid provider output.
+    write_config("fixture-v3");
     embedder.bad.store(true, Ordering::SeqCst);
     assert!(
         build().is_err(),

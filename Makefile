@@ -169,6 +169,7 @@ precheck-native:
 
 loctree-consumer-check:
 	cargo check --locked -p aicx --no-default-features --features loctree-consumer
+	cargo test --locked -p aicx --no-default-features --features loctree-consumer --no-run
 	cargo test --locked -p aicx --lib --no-default-features --features loctree-consumer slim_profile_exposes_read_core_contract
 	@hits=$$(cargo tree --locked --no-default-features --features loctree-consumer -p aicx | grep -ciE 'lancedb|llama' || true); \
 	if [ "$$hits" != "0" ]; then \
@@ -216,7 +217,8 @@ test-retrieval-eval-live:
 	cargo test --test retrieval_eval_harness --features e2e-aicx -- --nocapture
 
 test-retrieval-eval-rebaseline:
-	AICX_RETRIEVAL_EVAL_WRITE_BASELINE=1 cargo test --test retrieval_eval_harness --features e2e-aicx -- --nocapture
+	@echo "Acceptance floors are fixed; use AICX_RETRIEVAL_EVAL_REPORT=/path/result.json make test-retrieval-eval-live to record measurements."
+	@exit 2
 
 check:
 	@echo "=== AICX Quality Gate ==="

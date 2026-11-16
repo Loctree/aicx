@@ -144,13 +144,13 @@ fn gguf_tokenization_guards() {
         .expect("special-token syntax should embed");
     assert_unit_norm(&special, dimension, "special-token text");
 
-    // 400 repetitions are far past the 512-token `max_length` and still under
-    // the embed input byte budget, so truncation must succeed rather than fail.
+    // Token overflow must be visible. Silently retaining only a prefix made
+    // the index claim an embedding for text the model never saw in full.
     let long_text = "The quick brown fox jumps over the lazy dog. ".repeat(400);
-    let long_vector = engine
+    let overflow = engine
         .embed(&long_text)
-        .expect("long text should embed after token truncation");
-    assert_unit_norm(&long_vector, dimension, "long text");
+        .expect_err("long text must fail instead of silently truncating");
+    assert!(format!("{overflow:#}").contains("split the document into smaller passages"));
 
     let first = engine
         .embed("determinism probe")

@@ -143,6 +143,9 @@ impl HybridIndex {
             writer_version: self.writer_version.clone(),
             build_id: self.build_id.clone(),
             source_chunk_count: lexical_chunks.len(),
+            semantic_input_contract: None,
+            source_policy_fingerprint: None,
+            dense_payload_blake3: None,
             source_hash_blake3: source_hash_blake3(source_hash),
             embedder_model: self.embedder_fingerprint.model.clone(),
             embedder_url_hash: self.embedder_fingerprint.url_hash.clone(),
@@ -178,6 +181,9 @@ impl HybridIndex {
             writer_version: self.writer_version.clone(),
             build_id: self.build_id.clone(),
             source_chunk_count: prior.source_chunk_count,
+            semantic_input_contract: prior.semantic_input_contract,
+            source_policy_fingerprint: prior.source_policy_fingerprint,
+            dense_payload_blake3: None,
             source_hash_blake3: prior.source_hash_blake3,
             embedder_model: self.embedder_fingerprint.model.clone(),
             embedder_url_hash: self.embedder_fingerprint.url_hash.clone(),
@@ -193,6 +199,12 @@ impl HybridIndex {
             fusion_algorithm: self.fusion.name().to_string(),
             fusion_k: fusion_k(self.fusion.name()),
         });
+        if self.dense.kind() == crate::MMAP_DENSE_KIND {
+            self.manifest
+                .as_mut()
+                .expect("built manifest")
+                .dense_payload_blake3 = Some(Manifest::dense_payload_checksum(&self.manifest_dir)?);
+        }
         let manifest = self
             .manifest
             .as_ref()
@@ -219,6 +231,7 @@ impl HybridIndex {
     ) -> Result<Self> {
         let manifest_dir = manifest_dir.into();
         let manifest = Manifest::read_from_path(&manifest_dir.join("manifest.json"))?;
+        manifest.verify_dense_payload_checksum(&manifest_dir)?;
         validate_bindings(
             &manifest,
             lexical.as_ref(),
@@ -362,6 +375,17 @@ impl HybridIndex {
             } else {
                 raw
             };
+            // Passage vectors rank independently, but session recall must
+            // refill on unique parents, not count the same session repeatedly.
+            let mut parents = std::collections::HashSet::new();
+            dense_hits.retain(|hit| {
+                let parent = hit
+                    .metadata
+                    .get("parent_chunk_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&hit.chunk_id);
+                parents.insert(parent.to_string())
+            });
             if dense_hits.len() >= limit {
                 dense_examined = raw_len;
                 dense_exhausted = false;
@@ -508,6 +532,9 @@ fn validate_bindings(
         writer_version: manifest.writer_version.clone(),
         build_id: manifest.build_id.clone(),
         source_chunk_count: manifest.source_chunk_count,
+        semantic_input_contract: manifest.semantic_input_contract.clone(),
+        source_policy_fingerprint: manifest.source_policy_fingerprint.clone(),
+        dense_payload_blake3: manifest.dense_payload_blake3.clone(),
         source_hash_blake3: observed_source_hash
             .map(source_hash_blake3)
             .unwrap_or_else(|| manifest.source_hash_blake3.clone()),

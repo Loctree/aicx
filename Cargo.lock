@@ -25,7 +25,7 @@ dependencies = [
 
 [[package]]
 name = "aicx"
-version = "0.15.1"
+version = "0.16.0"
 dependencies = [
  "aicx-embeddings",
  "aicx-monitor",
@@ -72,7 +72,7 @@ dependencies = [
 
 [[package]]
 name = "aicx-embeddings"
-version = "0.15.1"
+version = "0.16.0"
 dependencies = [
  "anyhow",
  "dirs",
@@ -86,7 +86,7 @@ dependencies = [
 
 [[package]]
 name = "aicx-monitor"
-version = "0.15.1"
+version = "0.16.0"
 dependencies = [
  "aicx-progress-contracts",
  "sysinfo",
@@ -95,7 +95,7 @@ dependencies = [
 
 [[package]]
 name = "aicx-parser"
-version = "0.15.1"
+version = "0.16.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -113,7 +113,7 @@ dependencies = [
 
 [[package]]
 name = "aicx-progress-contracts"
-version = "0.15.1"
+version = "0.16.0"
 dependencies = [
  "chrono",
  "serde",
@@ -122,12 +122,13 @@ dependencies = [
 
 [[package]]
 name = "aicx-retrieve"
-version = "0.15.1"
+version = "0.16.0"
 dependencies = [
  "aicx-parser",
  "anyhow",
  "blake3",
  "chrono",
+ "filetime",
  "hex",
  "rand 0.8.6",
  "serde",
@@ -138,6 +139,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tracing",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

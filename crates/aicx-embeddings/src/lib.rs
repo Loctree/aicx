@@ -32,21 +32,49 @@ pub use cloud::{
 /// snappy and prevent runaway local tokenization.
 pub const MAX_EMBED_INPUT_BYTES: usize = 32 * 1024;
 
-/// Trim `text` to `MAX_EMBED_INPUT_BYTES` and reject empty / whitespace-only
-/// payloads. Centralized so cloud + gguf backends apply the same budget and
-/// rejection message. Returns the (possibly-truncated) input on success.
+/// Caller input rejected before backend execution; this is not a backend outage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EmbeddingInputError {
+    Empty,
+    ByteLimit { actual: usize, limit: usize },
+    TokenLimit { actual: usize, limit: usize },
+    Nul,
+    NoTokens,
+}
+
+impl fmt::Display for EmbeddingInputError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => {
+                f.write_str("embedder input is empty or whitespace-only; supply a non-empty query")
+            }
+            Self::ByteLimit { actual, limit } => write!(
+                f,
+                "embedder input {actual} bytes exceeds {limit} byte budget; shorten the input"
+            ),
+            Self::TokenLimit { actual, limit } => write!(
+                f,
+                "GGUF input has {actual} tokens, limit {limit}; split the document into smaller passages or shorten the query"
+            ),
+            Self::Nul => f.write_str("text contains a NUL byte"),
+            Self::NoTokens => f.write_str("tokenizer returned an empty sequence"),
+        }
+    }
+}
+impl std::error::Error for EmbeddingInputError {}
+
+/// Reject empty / whitespace-only or oversized input without truncation.
+/// Cloud and GGUF backends preserve this typed error through their context.
 pub fn enforce_embed_input_budget(text: &str) -> Result<&str> {
     if text.trim().is_empty() {
-        return Err(anyhow!(
-            "embedder input is empty or whitespace-only; supply a non-empty query"
-        ));
+        return Err(EmbeddingInputError::Empty.into());
     }
     if text.len() > MAX_EMBED_INPUT_BYTES {
-        return Err(anyhow!(
-            "embedder input {} bytes exceeds {} byte budget; truncate or rephrase before embedding",
-            text.len(),
-            MAX_EMBED_INPUT_BYTES
-        ));
+        return Err(EmbeddingInputError::ByteLimit {
+            actual: text.len(),
+            limit: MAX_EMBED_INPUT_BYTES,
+        }
+        .into());
     }
     Ok(text)
 }
@@ -302,6 +330,10 @@ pub struct EmbeddingModelInfo {
 pub trait LocalEmbeddingProvider: Send {
     fn info(&self) -> &EmbeddingModelInfo;
 
+    fn input_byte_budget(&self) -> usize {
+        MAX_EMBED_INPUT_BYTES
+    }
+
     fn embed_batch(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>>;
 
     fn embed(&mut self, text: &str) -> Result<Vec<f32>> {
@@ -367,6 +399,13 @@ impl EmbeddingEngine {
     /// cloud config that pins it); higher collapses per-request latency.
     pub fn embed_batch_size(&self) -> usize {
         self.batch_size
+    }
+
+    /// Conservative UTF-8 byte budget for complete document passages. Native
+    /// providers reserve room for special tokens; no backend may silently
+    /// discard the end of a passage supplied by the indexer.
+    pub fn input_byte_budget(&self) -> usize {
+        self.inner.input_byte_budget().min(4_096)
     }
 
     fn build_backend(config: EmbeddingConfig) -> Result<Self> {
@@ -722,6 +761,9 @@ mod tests {
         let big = "x".repeat(MAX_EMBED_INPUT_BYTES + 1);
         let err = enforce_embed_input_budget(&big)
             .expect_err("input above the 32 KiB cap must be rejected");
+        assert!(matches!(err.downcast_ref::<EmbeddingInputError>(),
+            Some(EmbeddingInputError::ByteLimit { actual, limit })
+            if *actual == MAX_EMBED_INPUT_BYTES + 1 && *limit == MAX_EMBED_INPUT_BYTES));
         let msg = err.to_string();
         assert!(
             msg.contains("exceeds"),

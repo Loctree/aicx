@@ -89,6 +89,12 @@ impl LocalEmbeddingProvider for GgufEmbeddingProvider {
         &self.info
     }
 
+    fn input_byte_budget(&self) -> usize {
+        // Byte-fallback tokenizers need at most one token per input byte,
+        // plus special tokens. Actual overflow is still checked below.
+        self.max_length.saturating_sub(8).max(4)
+    }
+
     fn embed_batch(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         if texts.is_empty() {
             return Ok(Vec::new());
@@ -105,15 +111,19 @@ impl LocalEmbeddingProvider for GgufEmbeddingProvider {
             // truncation kicks in.
             crate::enforce_embed_input_budget(text).context("GGUF embed input rejected")?;
             if text.contains('\0') {
-                return Err(anyhow!("text contains a NUL byte"))
+                return Err(anyhow::Error::new(crate::EmbeddingInputError::Nul))
                     .context("failed to tokenize text for GGUF embeddings");
             }
-            let mut tokens = self.model.vocab().tokenize(text.as_bytes(), true, true);
+            let tokens = self.model.vocab().tokenize(text.as_bytes(), true, true);
             if tokens.len() > self.max_length {
-                tokens.truncate(self.max_length);
+                return Err(crate::EmbeddingInputError::TokenLimit {
+                    actual: tokens.len(),
+                    limit: self.max_length,
+                }
+                .into());
             }
             if tokens.is_empty() {
-                return Err(anyhow!("tokenizer returned an empty sequence"));
+                return Err(crate::EmbeddingInputError::NoTokens.into());
             }
             max_seq_len = max_seq_len.max(tokens.len());
             total_tokens += tokens.len();

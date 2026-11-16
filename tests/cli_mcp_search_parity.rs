@@ -252,6 +252,7 @@ fn retrieval_outcome_scenarios_serialize_distinctly_across_surfaces() {
 
     let aicx_home = Path::new("/tmp/aicx");
     let hybrid_status = HybridRetrievalStatus {
+        corpus_freshness: "current".into(),
         generation_id: "g-parity".to_string(),
         source_chunk_count: 123,
         dense_count: 123,

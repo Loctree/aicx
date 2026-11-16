@@ -1033,7 +1033,7 @@ fn incremental_materialize_hybrid_refreshes_persisted_artifacts() {
     let refreshed = incremental_materialize_hybrid(
         Some(project),
         &info,
-        &[delta],
+        std::slice::from_ref(&delta),
         3,
         &source_hash,
         &semantic_index,
@@ -1085,7 +1085,72 @@ fn incremental_materialize_hybrid_refreshes_persisted_artifacts() {
     assert_eq!(manifest.source_chunk_count, 3);
     assert_eq!(manifest.dense_count, 3);
     assert_eq!(manifest.lexical_doc_count, 3);
+    assert!(manifest.dense_payload_blake3.is_some());
+    let generation_dir = hybrid_index_dir(Some(project)).unwrap();
+    persisted
+        .verify_dense_payload_checksum(&generation_dir)
+        .unwrap();
+    drop(reloaded);
 
+    // A legacy writer must never mutate or replace an admitted passage generation.
+    let manifest_path = hybrid_manifest_path(Some(project)).unwrap();
+    let payload_path = hybrid_dense_mmap_path(Some(project)).unwrap();
+    let pointer_path = hybrid_root_dir(Some(project)).unwrap().join("CURRENT");
+    let pointer_before = std::fs::read(&pointer_path).unwrap();
+    let payload_before = std::fs::read(&payload_path).unwrap();
+    let mut passages = persisted.clone();
+    passages.schema_version = "3.0".into();
+    passages.semantic_input_contract = Some("test-source-passages-v1".into());
+    passages.source_policy_fingerprint = Some("test-policy-v1".into());
+    passages.write_to_path(&manifest_path).unwrap();
+    let error = incremental_materialize_hybrid(
+        Some(project),
+        &info,
+        std::slice::from_ref(&delta),
+        3,
+        &source_hash,
+        &semantic_index,
+    )
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("source passage generations"),
+        "{error:#}"
+    );
+    assert_eq!(std::fs::read(&payload_path).unwrap(), payload_before);
+    let error = materialize_hybrid_index(&semantic_index, Some(project), &info).unwrap_err();
+    assert!(
+        error
+            .downcast_ref::<aicx_retrieve::RetrieveError>()
+            .is_some()
+    );
+    assert_eq!(std::fs::read(&pointer_path).unwrap(), pointer_before);
+    assert_eq!(
+        aicx_retrieve::Manifest::read_from_path(&manifest_path).unwrap(),
+        passages
+    );
+
+    // Refresh cannot bless an already-corrupt payload with a new checksum.
+    persisted.write_to_path(&manifest_path).unwrap();
+    let mut changed = payload_before;
+    let last = changed.len() - 1;
+    changed[last] ^= 1;
+    std::fs::write(&payload_path, &changed).unwrap();
+    assert!(persisted.open_dense_payload(&generation_dir).is_err());
+    let error = incremental_materialize_hybrid(
+        Some(project),
+        &info,
+        std::slice::from_ref(&delta),
+        3,
+        &source_hash,
+        &semantic_index,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("checksum mismatch"), "{error:#}");
+    assert_eq!(std::fs::read(&payload_path).unwrap(), changed);
+    assert_eq!(
+        aicx_retrieve::Manifest::read_from_path(&manifest_path).unwrap(),
+        persisted
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -1604,6 +1669,9 @@ mod publish_downgrade_gate {
             writer_version: writer.to_string(),
             build_id: writer.to_string(),
             source_chunk_count: 1,
+            semantic_input_contract: None,
+            source_policy_fingerprint: None,
+            dense_payload_blake3: None,
             source_hash_blake3: "test-hash".to_string(),
             embedder_model: "optional".to_string(),
             embedder_url_hash: "not_built".to_string(),

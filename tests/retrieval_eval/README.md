@@ -1,40 +1,53 @@
-# AICX Retrieval Evaluation Harness
+# Reproducible retrieval acceptance
 
-Operator-grade evaluation harness that gates retrieval PRs (tracks B/C/D/G/H/I).
-The default target is portable and CI-safe: it validates the 50-query gold set
-and committed baseline shape without requiring an operator-local semantic index.
-The live target exercises production `hybrid_rrf` retrieval and compares it
-against the committed baseline.
+The canonical harness builds an isolated source catalog from the public fixtures
+in `queries.toml`, publishes through the actual index builder and searches the
+result. It also exercises the built CLI and MCP stdio server on the tail fixture.
+It never enumerates provider homes or writes the production index.
 
-For operator-side runtime smoke checks, use:
+Every fixed question must retrieve its known session in the top five **and**
+return the expected answer in its evidence snippet. The corpus includes Polish
+and English decisions, privacy, model identity and a decision placed beyond the
+first 8192 characters of a long conversation. Queries themselves are not copied
+into the indexed conversations. Acceptance floors are authored requirements;
+they cannot be lowered by recording another run.
+
+Portable lexical gate:
 
 ```sh
-aicx eval search-quality --run
+make test-retrieval-eval
 ```
 
-That command exercises the active `AICX_HOME` via real `aicx search --evidence
---json` calls. Its default curated matrix is tracked in
-`search_quality_seed.toml`; pass `--seed path/to/seed.toml` for local experiments.
-It is intentionally separate from this backend gold-set harness: this file gates
-stable retrieval metrics, while `eval search-quality` catches human-facing
-evidence drift on a small curated seed matrix.
+Bounded real-model hybrid evaluation (explicit model configuration is required):
 
-## Workflow
+```sh
+AICX_EMBEDDER_CONFIG=/absolute/path/embedder.toml \
+AICX_RETRIEVAL_EVAL_REPORT=/absolute/path/hybrid-result.json \
+make test-retrieval-eval-live
+```
 
-### Adding a new gold query
-1. Add a new `[[queries]]` entry in `queries.toml`.
-2. Determine `expected_top_3_paths` by finding real, canonical paths in `~/.aicx/store/`. These paths must exist!
-3. Re-run `make test-retrieval-eval`.
-4. On an operator host with a committed hybrid index, run `make test-retrieval-eval-live`.
+For a cloud-only developer build, select the same real-model mode without
+building the native backend:
 
-### Re-baselining
-You should only re-baseline after an intentional retrieval upgrade.
-1. Delete `baseline.json`.
-2. Ensure the live production hybrid index is committed and queryable.
-3. Run `make test-retrieval-eval-rebaseline`. This establishes the new floor metrics based on the current implementation.
-4. Commit the new `baseline.json`.
+```sh
+AICX_EMBEDDER_CONFIG=/absolute/path/embedder.toml \
+AICX_RETRIEVAL_EVAL_REAL_MODEL=1 \
+cargo test --no-default-features --features app,cloud-embedder \
+  --test retrieval_eval_harness -- --nocapture
+```
 
-### Interpreting regression failures
-The harness will fail if the recall drops by more than 0.05 (5 percentage points) compared to `baseline.json`. 
-- Check the log for which queries regressed. 
-- A drop in recall could indicate that the embedding pipeline or index search is failing to return expected chunks. Ensure that any new retrieval logic preserves the behavior expected by the gold set.
+Real-model mode also uses an English paraphrase of a Polish TLS decision. A
+lexical control must miss that target across the entire fixture corpus, and
+hybrid retrieval must put it at rank1 with the expected evidence. Constant or
+unrelated vectors cannot pass just by inheriting the lexical ranking.
+
+The receipt reports each question's rank, recall, snippet acceptance and latency,
+plus aggregate recall, MRR, model identity, manifest schema and transport acceptance. A passing lexical run is not real-model evidence.
+The small public fixture proves a bounded acceptance set, not general quality on
+all historical sessions. `history/pre-passages-zero-recall.json` preserves the
+former host-dependent zero-recall measurement; it is not an acceptance floor.
+
+`search_quality_seed.toml` and `aicx eval search-quality` retain the separate
+human-facing historical evidence matrix. Transcript Builder/Memex comparisons
+need matching source fixtures and actual donor output; this fixture does not
+claim a measured win against either.

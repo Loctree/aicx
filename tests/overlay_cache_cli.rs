@@ -1,6 +1,6 @@
 //! Black-box overlay cache contracts. Every child owns an isolated AICX home;
 //! unresolved fixture claims deliberately require no embedding provider.
-#![cfg(unix)]
+#![cfg(all(unix, feature = "app"))]
 
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};

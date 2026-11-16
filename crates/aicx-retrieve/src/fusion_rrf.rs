@@ -1,5 +1,5 @@
 // Vibecrafted with AI Agents by Vetcoders (c)2024-2026 LibraxisAI
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use crate::{FusionStrategy, Hit};
 
@@ -35,7 +35,19 @@ impl FusionStrategy for ReciprocalRankFusion {
 
         let mut fused: BTreeMap<String, FusedHit> = BTreeMap::new();
 
-        for hit in dense {
+        let mut dense_parents = HashSet::new();
+        let mut parent_rank = 0;
+        for mut hit in dense {
+            if let Some(parent) = hit.metadata.get("parent_chunk_id").and_then(|v| v.as_str()) {
+                hit.chunk_id = parent.to_string();
+            }
+            // A long session contributes once, through its best passage.
+            // Rank unique parents so extra passages cannot crowd out others.
+            if !dense_parents.insert(hit.chunk_id.clone()) {
+                continue;
+            }
+            hit.rank = parent_rank;
+            parent_rank += 1;
             add_hit(&mut fused, hit, self.k, false);
         }
         for hit in lex {

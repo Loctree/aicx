@@ -650,6 +650,9 @@ pub struct SearchParams {
     /// semantic preconditions are missing.
     #[serde(default)]
     pub strict_semantic: bool,
+    /// Opt in to semantic passages plus lexical fusion. The default stays lexical.
+    #[serde(default)]
+    pub deep: bool,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -1085,7 +1088,7 @@ fn build_mcp_semantic_filters(
             date_hi,
             hours_cutoff,
             legacy_dense: false,
-            deep: false,
+            deep: params.deep,
         },
     }
 }
@@ -1273,13 +1276,19 @@ impl AicxMcpServer {
 
     /// D-6: arm the negative cache for `ttl` from `now`. Called after a
     /// real embedder failure so subsequent requests fail-fast.
+    fn note_semantic_failure(&self, error: &crate::search_engine::SemanticError) {
+        if error.kind() == "embedder_unavailable" {
+            self.mark_embedder_unavailable(Instant::now(), MCP_EMBEDDER_NEGATIVE_TTL);
+        }
+    }
+
     fn mark_embedder_unavailable(&self, now: Instant, ttl: Duration) {
         *self.embedder_unavailable_guard() = Some(now + ttl);
     }
 
     #[tool(
         name = "aicx_search",
-        description = "Semantic-first search over the canonical corpus. Filesystem-fuzzy fallback applies only when the hybrid index is missing (IndexNotBuilt), with an explicit `semantic_fallback` payload. Corrupt, stale, busy, empty, dimension-mismatch, and embedder failures return a typed fail-fast error (use strict_semantic=true for the same fail-fast on IndexNotBuilt). Filter pushdown (agent/score/date/hours) iterates a bounded semantic retrieval pool (up to 10x the requested limit) so a corpus whose top-N raw hits all sit outside the filter window still surfaces inside-window matches further down the ranking instead of returning silent-empty. When the cap is examined without satisfying the limit, the response carries a `filter_pushdown` payload with `kind=\"filter_yielded_partial\"` so callers can distinguish bounded under-delivery from a genuinely empty corpus."
+        description = "Search the CURRENT source/extract index. Lexical by default; deep=true explicitly enables lexical plus semantic passage fusion. Filesystem-fuzzy fallback applies only when the hybrid index is missing (IndexNotBuilt), with an explicit `semantic_fallback` payload. Corrupt, stale, busy, empty, dimension-mismatch, and embedder failures return a typed fail-fast error (use strict_semantic=true for the same fail-fast on IndexNotBuilt). Filter pushdown (agent/score/date/hours) iterates a bounded semantic retrieval pool (up to 10x the requested limit) so a corpus whose top-N raw hits all sit outside the filter window still surfaces inside-window matches further down the ranking instead of returning silent-empty. When the cap is examined without satisfying the limit, the response carries a `filter_pushdown` payload with `kind=\"filter_yielded_partial\"` so callers can distinguish bounded under-delivery from a genuinely empty corpus."
     )]
     async fn search(
         &self,
@@ -1374,7 +1383,9 @@ impl AicxMcpServer {
         // filesystem fuzzy (audit recovery 2026-07-23). Surface the typed
         // error so callers rebuild/heal the embedder instead of ranking noise.
         let now = Instant::now();
-        if let Some(remaining) = self.embedder_negative_cache_remaining(now) {
+        if params.deep
+            && let Some(remaining) = self.embedder_negative_cache_remaining(now)
+        {
             let fallback = McpSemanticFallbackNotice {
                 kind: "embedder_unavailable".to_string(),
                 reason: format!(
@@ -1393,15 +1404,31 @@ impl AicxMcpServer {
         // (`FILTER_EXAMINED_CAP_RATIO` x `limit`) so the canonical
         // pathology — top-N raw hits sit outside the filter window while
         // valid hits exist below — does not surface as silent-empty.
-        let filtered = match crate::search_engine::try_semantic_search_filtered(
-            &aicx_home,
-            &query,
-            limit,
-            &project_scopes,
-            frame_kind,
-            kind_filter_dir,
-            &post_filters,
-        ) {
+        // Retrieval performs blocking disk/model/HTTP work. In particular,
+        // reqwest's blocking cloud client must live outside the async runtime
+        // task, or an opted-in deep call can panic without a protocol response.
+        let search_home = aicx_home.clone();
+        let search_query = query.clone();
+        let search_scopes = project_scopes_owned.clone();
+        let search_filters = post_filters.clone();
+        let retrieval = tokio::task::spawn_blocking(move || {
+            let scopes = search_scopes
+                .iter()
+                .map(|s| s.as_deref())
+                .collect::<Vec<_>>();
+            crate::search_engine::try_semantic_search_filtered(
+                &search_home,
+                &search_query,
+                limit,
+                &scopes,
+                frame_kind,
+                kind_filter_dir,
+                &search_filters,
+            )
+        })
+        .await
+        .map_err(|e| McpError::internal_error(format!("Search worker failed: {e}"), None))?;
+        let filtered = match retrieval {
             Ok(filtered) => filtered,
             Err(err) => {
                 // D-6: arm the negative cache on real embedder failures so
@@ -1409,9 +1436,7 @@ impl AicxMcpServer {
                 // instead of re-running the same broken bootstrap. Other
                 // kinds (index missing, dim mismatch, ...) remain
                 // synchronously retryable.
-                if err.kind() == "embedder_unavailable" {
-                    self.mark_embedder_unavailable(Instant::now(), MCP_EMBEDDER_NEGATIVE_TTL);
-                }
+                self.note_semantic_failure(&err);
                 let fallback = McpSemanticFallbackNotice::from_error(&err);
                 // Filesystem-fuzzy ONLY for IndexNotBuilt (audit recovery).
                 // strict_semantic remains fail-fast for every kind; non-strict
@@ -1515,13 +1540,13 @@ impl AicxMcpServer {
                     McpError::internal_error(format!("Serialize search JSON: {e}"), None)
                 })?;
         let payload = inject_mcp_filter_pushdown_payload(&rendered, pushdown_diagnostic.as_ref())?;
-        // Hybrid results reflect the committed index snapshot, not a live
-        // freshness check; attach the honesty hint so callers verify pending
-        // chunks via `aicx index status` instead of assuming full freshness.
+        // Report the source/policy fingerprint observation separately from
+        // successful retrieval; legacy artifacts cannot prove freshness.
         let payload = if let Some(ref retrieval_status) = retrieval_status {
             crate::search_engine::inject_index_snapshot_hint(
                 &payload,
                 retrieval_status.source_chunk_count,
+                &retrieval_status.corpus_freshness,
             )
             .map_err(|e| {
                 McpError::internal_error(format!("Inject index_snapshot hint: {e}"), None)
@@ -2631,6 +2656,7 @@ mod tests {
             slim: true,
             verbose: false,
             strict_semantic: false,
+            deep: false,
         }
     }
 
@@ -2833,6 +2859,23 @@ mod tests {
             serde_json::from_str(r#"{"query":"dashboard","strict_semantic":true}"#)
                 .expect("search params should parse");
         assert!(params.strict_semantic);
+    }
+
+    #[test]
+    fn mcp_deep_is_explicit_and_reaches_retrieval_filters() {
+        let ordinary: SearchParams = serde_json::from_str(r#"{"query":"checkpoint"}"#).unwrap();
+        assert!(
+            !build_mcp_semantic_filters(&ordinary, None, fixed_utc_now())
+                .post_filters
+                .deep
+        );
+        let deep: SearchParams =
+            serde_json::from_str(r#"{"query":"checkpoint","deep":true}"#).unwrap();
+        assert!(
+            build_mcp_semantic_filters(&deep, None, fixed_utc_now())
+                .post_filters
+                .deep
+        );
     }
 
     #[test]
@@ -3124,6 +3167,50 @@ mod tests {
         // 30s value would let a flapping endpoint retry-storm an unhealthy
         // embedder six times faster than intended.
         assert_eq!(MCP_EMBEDDER_NEGATIVE_TTL, Duration::from_secs(5 * 60));
+    }
+
+    #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+    #[test]
+    fn invalid_embedding_input_does_not_poison_mcp_backend_health() {
+        use aicx_embeddings::EmbeddingInputError;
+        let server = AicxMcpServer::new();
+        for input in [
+            EmbeddingInputError::TokenLimit {
+                actual: 513,
+                limit: 512,
+            },
+            EmbeddingInputError::ByteLimit {
+                actual: 32769,
+                limit: 32768,
+            },
+            EmbeddingInputError::Empty,
+            EmbeddingInputError::Nul,
+            EmbeddingInputError::NoTokens,
+        ] {
+            let error = crate::search_engine::query_embedding_failure(
+                anyhow::Error::new(input).context("GGUF embed input rejected"),
+            );
+            assert_eq!(error.kind(), "invalid_query");
+            server.note_semantic_failure(&error);
+            assert!(
+                server
+                    .embedder_negative_cache_remaining(Instant::now())
+                    .is_none()
+            );
+            let response = super::mcp_semantic_unavailable_error(
+                &McpSemanticFallbackNotice::from_error(&error),
+            );
+            assert_eq!(response.code.0, -32602);
+            assert_eq!(response.data.unwrap()["kind"], "invalid_query");
+        }
+        let outage =
+            crate::search_engine::query_embedding_failure(anyhow::anyhow!("endpoint disconnected"));
+        server.note_semantic_failure(&outage);
+        assert!(
+            server
+                .embedder_negative_cache_remaining(Instant::now())
+                .is_some()
+        );
     }
 
     #[test]

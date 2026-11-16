@@ -79,3 +79,29 @@ fn rrf_disjoint_inputs() {
         vec![0, 1, 2, 3, 4, 5]
     );
 }
+
+#[test]
+fn dense_passages_vote_once_per_session_and_keep_best_evidence() {
+    let mut first = hit("p1", 0, "dense");
+    first.metadata =
+        json!({"parent_chunk_id":"session-a","semantic_passage_lines":["best passage"]});
+    let mut duplicate = first.clone();
+    duplicate.chunk_id = "p2".into();
+    duplicate.rank = 1;
+    duplicate.metadata["semantic_passage_lines"] = json!(["worse passage"]);
+    let mut other = hit("p3", 2, "dense");
+    other.metadata["parent_chunk_id"] = json!("session-b");
+    let fused = ReciprocalRankFusion::default().fuse(
+        vec![hit("session-a", 0, "lex")],
+        vec![first, duplicate, other],
+        10,
+    );
+    assert_eq!(fused.len(), 2);
+    assert_eq!(fused[0].chunk_id, "session-a");
+    assert!((fused[0].score - 2.0 * rrf(RRF_K_DEFAULT, 0)).abs() < 1e-7);
+    assert!((fused[1].score - rrf(RRF_K_DEFAULT, 1)).abs() < 1e-7);
+    assert_eq!(
+        fused[0].metadata["semantic_passage_lines"],
+        json!(["best passage"])
+    );
+}

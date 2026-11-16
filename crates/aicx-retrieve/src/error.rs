@@ -16,6 +16,11 @@ pub enum RetrieveError {
     #[error("dense count mismatch: expected {expected}, got {actual}")]
     DenseCountMismatch { expected: usize, actual: usize },
 
+    #[error(
+        "dense payload checksum mismatch: manifest={expected}, observed={actual}; generation was modified"
+    )]
+    DensePayloadModified { expected: String, actual: String },
+
     #[error("source chunk count mismatch: expected {expected}, got {actual}")]
     SourceChunkCountMismatch { expected: usize, actual: usize },
 
