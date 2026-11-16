@@ -19,6 +19,7 @@ tail_fixture = false
 [[queries]]
 id = "tls"
 query = "Co automatycznie odnawia certyfikaty TLS?"
+semantic_only_query = "Who renews HTTPS credentials?"
 answer = "Certyfikaty TLS odnawia automatycznie klient ACME w reverse proxy. Odnowienie certyfikatu jest niezależne od aktualizacji aplikacji. Endpoint aplikacji pozostaje na loopback, a reverse proxy kończy połączenie TLS."
 expected_snippet = "ACME"
 tail_fixture = false

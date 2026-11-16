@@ -30,7 +30,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   passages in CLI/MCP output, including answers at the end of long sessions.
 - Replace the host-dependent zero-recall retrieval floor with twelve public
   fixed-query fixtures requiring known answers and evidence through the source
-  index, CLI and MCP, with an explicit real-model mode.
+  index, CLI and MCP, with an explicit real-model mode and a semantic-only
+  cross-language control that must rank first after lexical recall fails.
 
 ### Migration
 

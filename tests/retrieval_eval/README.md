@@ -36,6 +36,11 @@ cargo test --no-default-features --features app,cloud-embedder \
   --test retrieval_eval_harness -- --nocapture
 ```
 
+Real-model mode also uses an English paraphrase of a Polish TLS decision. A
+lexical control must miss that target across the entire fixture corpus, and
+hybrid retrieval must put it at rank1 with the expected evidence. Constant or
+unrelated vectors cannot pass just by inheriting the lexical ranking.
+
 The receipt reports each question's rank, recall, snippet acceptance and latency,
 plus aggregate recall, MRR, model identity, manifest schema and transport acceptance. A passing lexical run is not real-model evidence.
 The small public fixture proves a bounded acceptance set, not general quality on

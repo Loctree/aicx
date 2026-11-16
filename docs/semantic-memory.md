@@ -75,15 +75,20 @@ passage in CLI text/JSON and MCP rather than truncating it a second time to 200
 characters. Lexical snippets include bounded neighbouring context around the actual match.
 
 `index_snapshot.freshness` is `current`, `stale` or `unknown`, separately from
-successful query execution. A current result is a fingerprint observation at
-query time, not a claim about future writes or the truth of historical claims.
+successful query execution. Freshness covers the durable catalog and its known
+live sources. New provider files enter that observation after catalog refresh;
+`aicx index --semantic` performs the census before indexing. A current result is
+a fingerprint observation at query time, with historical conversation coverage
+still defined by the parser/extract receipts.
 
 ## Acceptance evidence
 
 The canonical `make test-retrieval-eval` now executes source indexing and lexical
 queries on twelve public fixtures; each known answer must appear in the top
 five and in its evidence snippet. `make test-retrieval-eval-live` runs the same
-questions against an explicitly configured real model and isolated index.
+questions against an explicitly configured real model and isolated index. A
+cross-language control must miss the target lexically and rank it first through
+hybrid retrieval, with the expected answer evidence.
 The former zero-recall baseline is preserved as historical evidence and no
 longer provides a passing floor. Full instructions live in
 `tests/retrieval_eval/README.md`.

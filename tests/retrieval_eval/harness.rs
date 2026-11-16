@@ -17,6 +17,8 @@ struct FixtureConfig {
 struct Case {
     id: String,
     query: String,
+    #[serde(default)]
+    semantic_only_query: Option<String>,
     answer: String,
     expected_snippet: String,
     #[serde(default)]
@@ -30,6 +32,8 @@ struct Measurement {
     recall_at_5: f64,
     latency_ms: u128,
     evidence_matches: bool,
+    semantic_challenge: bool,
+    lexical_control_found_target: Option<bool>,
 }
 
 struct IsolatedHome {
@@ -58,6 +62,13 @@ fn reproducible_retrieval_acceptance() {
     let real_model =
         cfg!(feature = "e2e-aicx") || std::env::var_os("AICX_RETRIEVAL_EVAL_REAL_MODEL").is_some();
     if real_model {
+        assert!(
+            config
+                .queries
+                .iter()
+                .any(|q| q.semantic_only_query.is_some()),
+            "real-model acceptance needs a semantic-only control"
+        );
         let config = std::env::var_os("AICX_EMBEDDER_CONFIG").expect(
             "live eval requires explicit AICX_EMBEDDER_CONFIG; no implicit production index",
         );
@@ -128,10 +139,42 @@ fn reproducible_retrieval_acceptance() {
     let mut measures = Vec::new();
     let mut failures = Vec::new();
     for (n, case) in config.queries.iter().enumerate() {
+        let expected = format!("00000000-0000-4000-8000-{:012}", n + 1);
+        let semantic_challenge = real_model && case.semantic_only_query.is_some();
+        let query = if real_model {
+            case.semantic_only_query.as_deref().unwrap_or(&case.query)
+        } else {
+            &case.query
+        };
+        // A lexical-only control must fail to recall the target anywhere in
+        // this small corpus. Rank1 in hybrid mode must then come from dense
+        // evidence, rather than accidentally passing with a useless model.
+        let lexical_control_found_target = semantic_challenge.then(|| {
+            let lexical = aicx::search_engine::try_semantic_search_filtered(
+                &root,
+                query,
+                config.queries.len(),
+                &[None],
+                None,
+                None,
+                &aicx::search_engine::SemanticSearchFilters::default(),
+            )
+            .unwrap()
+            .outcome;
+            let found = lexical
+                .results
+                .iter()
+                .any(|r| r.session_id.as_deref() == Some(expected.as_str()));
+            assert!(
+                !found,
+                "semantic-only fixture unexpectedly has lexical recall"
+            );
+            found
+        });
         let at = Instant::now();
         let outcome = aicx::search_engine::try_semantic_search_filtered(
             &root,
-            &case.query,
+            query,
             5,
             &[None],
             None,
@@ -153,7 +196,6 @@ fn reproducible_retrieval_acceptance() {
             .as_ref()
             .expect("published manifest");
         assert_eq!(status.corpus_freshness, "current");
-        let expected = format!("00000000-0000-4000-8000-{:012}", n + 1);
         let hit = outcome
             .results
             .iter()
@@ -169,8 +211,13 @@ fn reproducible_retrieval_acceptance() {
             recall_at_5: recall,
             latency_ms: at.elapsed().as_millis(),
             evidence_matches,
+            semantic_challenge,
+            lexical_control_found_target,
         });
-        if recall < config.minimum_recall_at_5 || !evidence_matches {
+        if recall < config.minimum_recall_at_5
+            || !evidence_matches
+            || (semantic_challenge && hit.is_none_or(|(rank, _)| rank != 0))
+        {
             failures.push(case.id.clone());
         }
     }
@@ -191,6 +238,7 @@ fn reproducible_retrieval_acceptance() {
     );
     let receipt = serde_json::json!({"schema":"aicx.retrieval_fixture_result.v1","mode":if real_model {"real_model_hybrid"} else {"portable_lexical"},
         "model":manifest.embedder_model,"manifest_schema":manifest.schema_version,"transports":transports,
+        "semantic_challenges":measures.iter().filter(|m| m.semantic_challenge).count(),
         "queries":measures,"recall_at_5":recall,"mrr":mrr,"failures":failures,"lexical_docs":report.lexical_docs,"dense_passages":report.dense_docs});
     println!("{receipt}");
     if let Some(path) = std::env::var_os("AICX_RETRIEVAL_EVAL_REPORT") {
