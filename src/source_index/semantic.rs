@@ -213,6 +213,21 @@ pub(super) fn semantic_passages(
     let budget = budget.max(4);
     let mut out = Vec::new();
     for parent in chunks {
+        // Older parse caches kept whole preview lines. Normalize once per
+        // parent before cloning metadata, including already admitted lexical
+        // documents reused without reparsing. Passage text remains complete.
+        let mut metadata = parent.metadata.clone();
+        if let Some(preview) = metadata.get_mut("preview_lines") {
+            let lines: Vec<String> = preview
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_str)
+                .take(6)
+                .map(|line| line.chars().take(240).collect())
+                .collect();
+            *preview = serde_json::json!(lines);
+        }
         let text = parent.text.as_str();
         // The extract preamble is provenance, not conversational evidence.
         let start = if text.starts_with("# AICX session extract\n") {
@@ -255,7 +270,7 @@ pub(super) fn semantic_passages(
                         id: format!("{}:passage:{hash}:{}", parent.id, *ordinal),
                         source_path: parent.source_path.clone(),
                         text: passage.to_string(),
-                        metadata: parent.metadata.clone(),
+                        metadata: metadata.clone(),
                     };
                     *ordinal += 1;
                     chunk.metadata["parent_chunk_id"] = parent.id.clone().into();
@@ -482,6 +497,37 @@ pub(super) fn embed_chunks_for_semantic(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn semantic_passages_bound_legacy_preview_lines() {
+        // Warm parse caches predating bounded previews can retain an entire
+        // single-line message here. Repeating it in every passage is quadratic.
+        let text = "ż".repeat(32 * 1024);
+        let parent = aicx_retrieve::ChunkRef {
+            id: "codex:legacy-preview".into(),
+            source_path: "extract.md".into(),
+            text: text.clone(),
+            metadata: serde_json::json!({"preview_lines": [text]}),
+        };
+        let passages = semantic_passages(std::slice::from_ref(&parent), 504);
+        assert!(passages.len() > 100);
+        assert_eq!(
+            passages.iter().map(|c| c.text.as_str()).collect::<String>(),
+            parent.text
+        );
+        for passage in &passages {
+            let preview = passage.metadata["preview_lines"].as_array().unwrap();
+            assert!(preview.len() <= 6);
+            assert!(
+                preview
+                    .iter()
+                    .all(|line| line.as_str().unwrap().chars().count() <= 240),
+                "passage inherited an unbounded legacy preview"
+            );
+            assert!(serde_json::to_vec(&passage.metadata).unwrap().len() < 2_000);
+        }
+        assert!(parent.metadata["preview_lines"][0].as_str().unwrap().len() > 60_000);
+    }
+
     #[test]
     fn passage_partition_keeps_every_utf8_byte_and_final_message() {
         let text = format!(

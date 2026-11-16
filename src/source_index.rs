@@ -2961,7 +2961,7 @@ fn cached_chunk(
         .lines()
         .filter(|line| !line.trim().is_empty() && !line.starts_with('#'))
         .take(6)
-        .map(str::to_string)
+        .map(|line| line.chars().take(240).collect())
         .collect();
     let metadata = serde_json::json!({
         "source_path": extract_path.to_string_lossy(),
