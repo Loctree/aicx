@@ -962,6 +962,28 @@ pub fn publish_source_lexical_generation_with_policy(
     source_fingerprint: &str,
     policy_fingerprint: Option<&str>,
 ) -> Result<aicx_retrieve::Manifest> {
+    publish_source_lexical_generation_checked(
+        chunks,
+        source_fingerprint,
+        policy_fingerprint,
+        |manifest| {
+            if policy_fingerprint.is_some() {
+                anyhow::ensure!(
+                    crate::source_index::generation_freshness(manifest) == "current",
+                    "source corpus or privacy policy changed before lexical generation admission; CURRENT retained; retry index"
+                );
+            }
+            Ok(())
+        },
+    )
+}
+
+pub(crate) fn publish_source_lexical_generation_checked(
+    chunks: &[aicx_retrieve::ChunkRef],
+    source_fingerprint: &str,
+    policy_fingerprint: Option<&str>,
+    validate: impl FnOnce(&aicx_retrieve::Manifest) -> Result<()>,
+) -> Result<aicx_retrieve::Manifest> {
     use aicx_retrieve::{LexicalIndex, Manifest, TantivyAdapter};
 
     if chunks.is_empty() {
@@ -1023,12 +1045,7 @@ pub fn publish_source_lexical_generation_with_policy(
     };
     carry_forward_dense_artifacts(&previous_dir, &generation_dir, &mut manifest);
     manifest.write_to_path(&generation_dir.join("manifest.json"))?;
-    if policy_fingerprint.is_some() {
-        anyhow::ensure!(
-            crate::source_index::generation_freshness(&manifest) == "current",
-            "source corpus or privacy policy changed before lexical generation admission; CURRENT retained; retry index"
-        );
-    }
+    validate(&manifest)?;
     publish_hybrid_generation(&hybrid_root, &generation_dir)?;
     Ok(manifest)
 }
@@ -1060,6 +1077,34 @@ pub fn publish_source_hybrid_generation_with_contract(
     fingerprint: &aicx_retrieve::EmbedderFingerprint,
     input_contract: Option<&str>,
     policy_fingerprint: Option<&str>,
+) -> Result<aicx_retrieve::Manifest> {
+    publish_source_hybrid_generation_checked(
+        chunks,
+        dense_chunks,
+        source_fingerprint,
+        fingerprint,
+        input_contract,
+        policy_fingerprint,
+        |manifest| {
+            if input_contract.is_some() {
+                anyhow::ensure!(
+                    crate::source_index::generation_freshness(manifest) == "current",
+                    "source corpus or privacy policy changed before generation admission; CURRENT retained; retry aicx index --semantic"
+                );
+            }
+            Ok(())
+        },
+    )
+}
+
+pub(crate) fn publish_source_hybrid_generation_checked(
+    chunks: &[aicx_retrieve::ChunkRef],
+    dense_chunks: &[aicx_retrieve::DenseChunkRef],
+    source_fingerprint: &str,
+    fingerprint: &aicx_retrieve::EmbedderFingerprint,
+    input_contract: Option<&str>,
+    policy_fingerprint: Option<&str>,
+    validate: impl FnOnce(&aicx_retrieve::Manifest) -> Result<()>,
 ) -> Result<aicx_retrieve::Manifest> {
     use aicx_retrieve::{
         HybridIndex, Manifest, MmapDenseAdapter, ReciprocalRankFusion, TantivyAdapter,
@@ -1142,12 +1187,7 @@ pub fn publish_source_hybrid_generation_with_contract(
         manifest.schema_version = "3.0".into();
     }
     manifest.write_to_path(&generation_dir.join("manifest.json"))?;
-    if input_contract.is_some() {
-        anyhow::ensure!(
-            crate::source_index::generation_freshness(&manifest) == "current",
-            "source corpus or privacy policy changed before generation admission; CURRENT retained; retry aicx index --semantic"
-        );
-    }
+    validate(&manifest)?;
     publish_hybrid_generation(&hybrid_root, &generation_dir)?;
     Ok(manifest)
 }

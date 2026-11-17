@@ -10718,11 +10718,12 @@ fn run_index(
             }
         );
         eprintln!(
-            "  sources: total={} parsed={} reused={} skipped={}",
+            "  sources: total={} parsed={} reused={} skipped={} deferred={}",
             report.sources_total,
             report.sources_parsed,
             report.sources_reused,
-            report.sources_skipped
+            report.sources_skipped,
+            report.sources_deferred
         );
         eprintln!(
             "  frames: raw={} signal={} filtered={}",
