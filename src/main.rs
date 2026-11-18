@@ -2022,8 +2022,8 @@ enum Commands {
         no_gitignore: bool,
     },
 
-    /// Search the CURRENT source/extract index. Lexical-first by default;
-    /// optional dense rerank with --deep. When no index exists, the only
+    /// Search the CURRENT source/extract index. Automatically combine lexical and semantic matches
+    /// when the published index contains vectors. When no index exists, the only
     /// fallback is a bounded recency-ranked filesystem search.
     #[command(display_order = 12)]
     Search {
@@ -2092,10 +2092,7 @@ enum Commands {
         #[arg(long)]
         legacy_dense: bool,
 
-        /// Dense re-rank (hybrid RRF over tantivy + mmap). Default is
-        /// lexical-first with a recency prior against the published `_all`
-        /// CURRENT generation — sub-second answers without loading the
-        /// embedder or dense vectors.
+        /// Explicitly request dense re-ranking. Ordinary search selects it automatically when available.
         #[arg(long)]
         deep: bool,
 
@@ -10221,6 +10218,9 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
     let scopes = project_scopes(&project_resolution.selected);
 
     let mut index_filters = post_filters.clone();
+    if !no_semantic && !index_filters.deep {
+        index_filters.deep = aicx::vector_index::current_has_semantic_index();
+    }
     if no_semantic {
         index_filters.deep = false;
         index_filters.legacy_dense = false;

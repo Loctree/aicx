@@ -593,6 +593,13 @@ fn test_deep_search_cli_uses_published_source_generation_without_ndjson() {
             .output()
             .unwrap()
     };
+    let lexical_publish = run_cli(&["index", "--json"]);
+    assert!(lexical_publish.status.success());
+    let lexical = run_cli(&["search", "checkpoint durability", "--json"]);
+    assert!(lexical.status.success());
+    let lexical: serde_json::Value = serde_json::from_slice(&lexical.stdout).unwrap();
+    assert_eq!(lexical["results"], 2);
+    assert_eq!(embedder.calls.load(Ordering::SeqCst), 0);
     let publish = run_cli(&["index", "--semantic", "--json"]);
     assert!(
         publish.status.success(),
@@ -606,7 +613,7 @@ fn test_deep_search_cli_uses_published_source_generation_without_ndjson() {
 
     for project in [None, Some("loctree/aicx")] {
         let calls_before = embedder.calls.load(Ordering::SeqCst);
-        let mut args = vec!["search", "checkpoint durability", "--deep", "--json"];
+        let mut args = vec!["search", "checkpoint durability", "--json"];
         if let Some(project) = project {
             args.extend(["-p", project]);
         }

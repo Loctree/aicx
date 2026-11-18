@@ -18,9 +18,7 @@ those sources plus the compact catalog.
 
 ## Operator Surfaces
 
-- `aicx search --json` and MCP `aicx_search` are lexical-first against the
-  published `_all` CURRENT generation, with a recency prior. `--deep` opts into
-  dense mmap RRF. Results carry an `index_snapshot`; run `aicx index status`
+- `aicx search --json` and MCP `aicx_search` query the published `_all` CURRENT generation, combining lexical and dense matches when vectors are available. Results carry an `index_snapshot`; run `aicx index status`
   when a fresh pending-corpus census is required.
 - Only typed `IndexNotBuilt` may use the bounded recency-ranked filesystem
   fallback. Corrupt, stale, and busy indexes propagate their error. Treat

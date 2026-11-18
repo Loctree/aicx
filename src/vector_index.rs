@@ -1175,6 +1175,16 @@ pub fn hybrid_manifest_path(project: Option<&str>) -> Result<PathBuf> {
     Ok(hybrid_index_dir(project)?.join("manifest.json"))
 }
 
+/// Select fusion for ordinary searches when the published manifest advertises vectors.
+pub fn current_has_semantic_index() -> bool {
+    hybrid_manifest_path(None)
+        .ok()
+        .and_then(|path| aicx_retrieve::Manifest::read_from_path(&path).ok())
+        .is_some_and(|manifest| {
+            manifest.dense_kind == aicx_retrieve::MMAP_DENSE_KIND && manifest.dense_count > 0
+        })
+}
+
 /// Legacy NDJSON dense twin location inside the resolved generation dir.
 /// Migration read input only — new builds never write it; the single dense
 /// payload is [`hybrid_dense_mmap_path`].

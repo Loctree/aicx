@@ -71,9 +71,9 @@ upgrading a reader does not manufacture a new receipt for an old artifact.
 
 ## Query surfaces
 
-CLI: `aicx search --deep 'question' --json`.
-MCP: `aicx_search` with `{"query":"question","deep":true}`.
-Both opt in to lexical plus semantic fusion. The ordinary default stays lexical.
+CLI: `aicx search 'question' --json`.
+MCP: `aicx_search` with `{"query":"question"}`.
+Both automatically combine lexical and semantic matches when the published generation contains vectors.
 A session votes once through its best semantic passage, so a long session does
 not win by contributing more vectors. Evidence uses that complete bounded
 passage in CLI text/JSON and MCP rather than truncating it a second time to 200

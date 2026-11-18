@@ -280,8 +280,8 @@ fn verify_cli_and_mcp(root: &std::path::Path, case: &Case, deep: bool) -> serde_
         "--limit",
         "5",
     ]);
-    if deep {
-        cli.arg("--deep");
+    if case.context_fixture {
+        cli.arg("--no-semantic");
     }
     let output = cli.output().expect("run fixture CLI search");
     assert!(
@@ -293,6 +293,15 @@ fn verify_cli_and_mcp(root: &std::path::Path, case: &Case, deep: bool) -> serde_
     assert!(
         cli_result.to_string().contains(&case.expected_snippet),
         "CLI must return expected evidence: {cli_result}"
+    );
+    let expected_path = if deep {
+        "hybrid_fusion"
+    } else {
+        "lexical_only"
+    };
+    assert_eq!(
+        cli_result["oracle_status"]["retrieval"]["executed_path"],
+        expected_path
     );
     assert_eq!(cli_result["index_snapshot"]["freshness"], "current");
 
@@ -378,11 +387,15 @@ fn verify_cli_and_mcp(root: &std::path::Path, case: &Case, deep: bool) -> serde_
         search["inputSchema"]["properties"]["deep"]["type"],
         "boolean"
     );
+    let mut args = serde_json::json!({"query":case.query,"strict_semantic":true,"slim":false,"verbose":true,"limit":5});
+    if case.context_fixture {
+        args["deep"] = false.into();
+    }
     let result = request(
         &mut stdin,
         3,
         "tools/call",
-        serde_json::json!({"name":"aicx_search","arguments":{"query":case.query,"deep":deep,"strict_semantic":true,"slim":false,"verbose":true,"limit":5}}),
+        serde_json::json!({"name":"aicx_search","arguments":args}),
     );
     assert_ne!(result["isError"], true, "MCP tool failure: {result}");
     let payload: serde_json::Value =
@@ -391,6 +404,10 @@ fn verify_cli_and_mcp(root: &std::path::Path, case: &Case, deep: bool) -> serde_
     assert!(
         payload.to_string().contains(&case.expected_snippet),
         "MCP must return expected evidence: {payload}"
+    );
+    assert_eq!(
+        payload["oracle_status"]["retrieval"]["executed_path"],
+        expected_path
     );
     assert_eq!(payload["index_snapshot"]["freshness"], "current");
     serde_json::json!({"cli":"passed","mcp_stdio":"passed","mcp_deep_property":true,"expected_evidence":true})
