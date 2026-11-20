@@ -1007,6 +1007,44 @@ impl Reporter for MutateAfterEmbedding {
 }
 
 #[test]
+fn maintenance_cannot_overwrite_a_model_switch_during_embedding() {
+    let _guard = SERIAL.lock().unwrap();
+    let (fixture, _server) = contract_fixture();
+    let root = &fixture.root;
+    catalog_members(root, &[1]);
+    aicx::source_index::build(root, &[], false, false, true).unwrap();
+    let pointer = root.join("indexed/_all/hybrid/CURRENT");
+    let first = std::fs::read_to_string(&pointer).unwrap();
+    let config = root.join("embedder.toml");
+    let model_a = std::fs::read_to_string(&config).unwrap();
+    std::fs::write(&config, model_a.replace("test-model", "second-model")).unwrap();
+    aicx::source_index::build(root, &[], false, false, true).unwrap();
+    let second = std::fs::read_to_string(&pointer).unwrap();
+    assert_ne!(first, second);
+    std::fs::write(config, model_a).unwrap();
+    std::fs::write(&pointer, first).unwrap();
+    catalog_members(root, &[1, 2]);
+    let result = aicx::source_index::build_with_mode(
+        root,
+        &[],
+        false,
+        false,
+        aicx::source_index::SourceIndexMode::Maintain,
+        Arc::new(MutateAfterEmbedding {
+            path: pointer.clone(),
+            text: second.clone(),
+        }),
+    );
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("CURRENT changed during maintenance")
+    );
+    assert_eq!(std::fs::read_to_string(pointer).unwrap(), second);
+}
+
+#[test]
 fn source_drift_during_embedding_defers_changed_session_and_retries_it() {
     let _guard = SERIAL.lock().unwrap();
     let (fixture, _server) = contract_fixture();

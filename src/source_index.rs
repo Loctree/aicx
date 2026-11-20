@@ -574,6 +574,16 @@ pub enum SourceIndexMode {
     Maintain,
 }
 
+fn current_source_manifest() -> Result<Option<aicx_retrieve::Manifest>> {
+    let path = crate::vector_index::hybrid_manifest_path(None)?;
+    if !path.try_exists()? {
+        return Ok(None);
+    }
+    let manifest = aicx_retrieve::Manifest::read_from_path(&path)?;
+    manifest.validate_against(&manifest)?;
+    Ok(Some(manifest))
+}
+
 pub fn build_with_mode(
     aicx_home: &Path,
     project_filters: &[String],
@@ -659,18 +669,11 @@ pub fn build_with_mode(
     #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
     let mut prepared_engine = None;
     let manifest = if mode == SourceIndexMode::Maintain && !dry_run {
-        let path = crate::vector_index::hybrid_manifest_path(None)?;
-        if path.try_exists()? {
-            let manifest = aicx_retrieve::Manifest::read_from_path(&path)?;
-            manifest.validate_against(&manifest)?;
-            Some(manifest)
-        } else {
-            None
-        }
+        current_source_manifest()?
     } else {
         None
     };
-    let maintain_passages = manifest.filter(|m| m.schema_version == "3.0");
+    let maintain_passages = manifest.as_ref().filter(|m| m.schema_version == "3.0");
     let semantic = mode == SourceIndexMode::Semantic || maintain_passages.is_some();
     if !full_rescan
         && project_filters.is_empty()
@@ -968,6 +971,16 @@ pub fn build_with_mode(
                 crate::locks::lance_lock_path()?,
             )?)
         };
+        if !dry_run && mode == SourceIndexMode::Maintain {
+            // Dashboard and repair writers can publish while maintenance embeds.
+            // Compare under the common publication lock before any pointer flip.
+            let current = current_source_manifest()?;
+            anyhow::ensure!(
+                manifest.as_ref().map(|m| &m.generation_id)
+                    == current.as_ref().map(|m| &m.generation_id),
+                "CURRENT changed during maintenance; retaining the newer generation; retry index"
+            );
+        }
         if !dry_run {
             // Privacy and catalog are global contracts; unlike a live append,
             // changing either invalidates every parsed scope decision.
