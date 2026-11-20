@@ -2304,9 +2304,7 @@ fn serve_help_prefers_http_name_and_stays_compact() {
 }
 
 #[test]
-fn search_help_explains_lexical_first_with_bounded_fallback() {
-    // `aicx search` is lexical-first over CURRENT. Filesystem search is a
-    // bounded recovery path only when no index exists.
+fn search_help_explains_automatic_fusion_with_bounded_fallback() {
     let mut cmd = Cli::command();
     let search = cmd
         .find_subcommand_mut("search")
@@ -2314,8 +2312,8 @@ fn search_help_explains_lexical_first_with_bounded_fallback() {
     let rendered = search.render_long_help().to_string();
 
     assert!(
-        rendered.to_lowercase().contains("lexical-first"),
-        "search --help must name lexical retrieval as the default"
+        rendered.contains("Automatically combine lexical and semantic matches"),
+        "search --help must explain automatic fusion"
     );
     assert!(
         rendered.to_lowercase().contains("filesystem"),

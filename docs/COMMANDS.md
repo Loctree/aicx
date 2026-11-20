@@ -628,8 +628,7 @@ global catalog metadata.
 | `aicx index` | Tantivy lexical; retains matching vectors, refuses to demote an existing semantic generation |
 | `aicx index --semantic` | Lexical + `dense.exact_mmap_v1.bin` via configured embedder |
 
-Default search is lexical-first. Dense rerank needs `--semantic` once on the
-owner host, then `aicx search --deep`.
+Default search uses the published semantic vectors automatically when available.
 
 Incremental reuse is gated by the live source fingerprint. A changed existing
 session reparses on the next run even when no catalog rebuild happened.
@@ -670,8 +669,7 @@ aicx search --session <session-id> --literal --context 4 <query>
 aicx search --json <query>
 ```
 
-The default route is Tantivy lexical search with a recency prior. `--deep`
-adds dense mmap re-ranking. A bounded, recency-ranked filesystem fallback is
+Search combines Tantivy with dense mmap retrieval when CURRENT has vectors and uses Tantivy alone on a lexical generation. A bounded, recency-ranked filesystem fallback is
 used only when the typed failure is `IndexNotBuilt`; corrupt, stale, or busy
 indexes fail honestly. `--no-semantic` is stricter: it reads the published
 CURRENT lexical generation or returns a typed error, and never falls through

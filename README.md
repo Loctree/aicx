@@ -69,8 +69,8 @@ Channel order and shadow checks: [install-paths.md](docs/install-paths.md).
 3. **Index** — `aicx index` incrementally parses changed sources, removes
    tool/internal/system noise, and atomically publishes the global `_all`
    Tantivy generation.
-4. **Search** — `aicx search` queries CURRENT with lexical ranking plus a
-   recency prior. `--deep` explicitly adds dense mmap re-ranking.
+4. **Search** — `aicx search` uses lexical and semantic matches when CURRENT contains vectors,
+   and lexical ranking when only the text index is available.
 
 ```bash
 aicx index                   # the one rebuild command: census + incremental parse + publish

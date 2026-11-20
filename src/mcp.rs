@@ -650,9 +650,10 @@ pub struct SearchParams {
     /// semantic preconditions are missing.
     #[serde(default)]
     pub strict_semantic: bool,
-    /// Opt in to semantic passages plus lexical fusion. The default stays lexical.
+    /// Omit to select fusion when CURRENT contains vectors. Set false for lexical search.
     #[serde(default)]
-    pub deep: bool,
+    #[schemars(with = "bool")]
+    pub deep: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -1088,7 +1089,9 @@ fn build_mcp_semantic_filters(
             date_hi,
             hours_cutoff,
             legacy_dense: false,
-            deep: params.deep,
+            deep: params
+                .deep
+                .unwrap_or_else(crate::vector_index::current_has_semantic_index),
         },
     }
 }
@@ -1288,7 +1291,7 @@ impl AicxMcpServer {
 
     #[tool(
         name = "aicx_search",
-        description = "Search the CURRENT source/extract index. Lexical by default; deep=true explicitly enables lexical plus semantic passage fusion. Filesystem-fuzzy fallback applies only when the hybrid index is missing (IndexNotBuilt), with an explicit `semantic_fallback` payload. Corrupt, stale, busy, empty, dimension-mismatch, and embedder failures return a typed fail-fast error (use strict_semantic=true for the same fail-fast on IndexNotBuilt). Filter pushdown (agent/score/date/hours) iterates a bounded semantic retrieval pool (up to 10x the requested limit) so a corpus whose top-N raw hits all sit outside the filter window still surfaces inside-window matches further down the ranking instead of returning silent-empty. When the cap is examined without satisfying the limit, the response carries a `filter_pushdown` payload with `kind=\"filter_yielded_partial\"` so callers can distinguish bounded under-delivery from a genuinely empty corpus."
+        description = "Search the CURRENT source/extract index. Automatically uses lexical plus semantic passage fusion when CURRENT contains vectors. Set deep=false for lexical search. Filesystem-fuzzy fallback applies only when the hybrid index is missing (IndexNotBuilt), with an explicit `semantic_fallback` payload. Corrupt, stale, busy, empty, dimension-mismatch, and embedder failures return a typed fail-fast error (use strict_semantic=true for the same fail-fast on IndexNotBuilt). Filter pushdown (agent/score/date/hours) iterates a bounded semantic retrieval pool (up to 10x the requested limit) so a corpus whose top-N raw hits all sit outside the filter window still surfaces inside-window matches further down the ranking instead of returning silent-empty. When the cap is examined without satisfying the limit, the response carries a `filter_pushdown` payload with `kind=\"filter_yielded_partial\"` so callers can distinguish bounded under-delivery from a genuinely empty corpus."
     )]
     async fn search(
         &self,
@@ -1383,7 +1386,7 @@ impl AicxMcpServer {
         // filesystem fuzzy (audit recovery 2026-07-23). Surface the typed
         // error so callers rebuild/heal the embedder instead of ranking noise.
         let now = Instant::now();
-        if params.deep
+        if post_filters.deep
             && let Some(remaining) = self.embedder_negative_cache_remaining(now)
         {
             let fallback = McpSemanticFallbackNotice {
@@ -2656,7 +2659,7 @@ mod tests {
             slim: true,
             verbose: false,
             strict_semantic: false,
-            deep: false,
+            deep: Some(false),
         }
     }
 
@@ -2863,7 +2866,8 @@ mod tests {
 
     #[test]
     fn mcp_deep_is_explicit_and_reaches_retrieval_filters() {
-        let ordinary: SearchParams = serde_json::from_str(r#"{"query":"checkpoint"}"#).unwrap();
+        let ordinary: SearchParams =
+            serde_json::from_str(r#"{"query":"checkpoint","deep":false}"#).unwrap();
         assert!(
             !build_mcp_semantic_filters(&ordinary, None, fixed_utc_now())
                 .post_filters
