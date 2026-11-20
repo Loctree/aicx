@@ -1495,6 +1495,11 @@ impl AicxMcpServer {
             let payload =
                 inject_mcp_filter_pushdown_payload(&rendered, pushdown_diagnostic.as_ref())?;
 
+            let payload =
+                crate::search_engine::attach_index_snapshot(payload, retrieval_status.as_ref())
+                    .map_err(|e| {
+                        McpError::internal_error(format!("Attach index snapshot: {e}"), None)
+                    })?;
             return Ok(CallToolResult::success(vec![ContentBlock::text(payload)]));
         }
 
@@ -1543,20 +1548,11 @@ impl AicxMcpServer {
                     McpError::internal_error(format!("Serialize search JSON: {e}"), None)
                 })?;
         let payload = inject_mcp_filter_pushdown_payload(&rendered, pushdown_diagnostic.as_ref())?;
-        // Report the source/policy fingerprint observation separately from
-        // successful retrieval; legacy artifacts cannot prove freshness.
-        let payload = if let Some(ref retrieval_status) = retrieval_status {
-            crate::search_engine::inject_index_snapshot_hint(
-                &payload,
-                retrieval_status.source_chunk_count,
-                &retrieval_status.corpus_freshness,
-            )
-            .map_err(|e| {
-                McpError::internal_error(format!("Inject index_snapshot hint: {e}"), None)
-            })?
-        } else {
-            payload
-        };
+        let payload =
+            crate::search_engine::attach_index_snapshot(payload, retrieval_status.as_ref())
+                .map_err(|e| {
+                    McpError::internal_error(format!("Attach index snapshot: {e}"), None)
+                })?;
 
         Ok(CallToolResult::success(vec![ContentBlock::text(payload)]))
     }
