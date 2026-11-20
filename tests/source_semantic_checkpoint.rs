@@ -990,6 +990,49 @@ fn privacy_change_refuses_old_evidence_then_publishes_only_visible_sessions() {
             .iter()
             .all(|r| r.session_id.as_deref() == Some("00000000-0000-4000-8000-000000000002"))
     );
+    // Restore the policy without touching a session or its catalog timestamp.
+    // The experimental HTTP writer ticks on startup and must notice this edit.
+    let pointer = root.join("indexed/_all/hybrid/CURRENT");
+    let before = std::fs::read(&pointer).unwrap();
+    std::fs::write(root.join(".aicxignore"), "").unwrap();
+    let mut writer = std::process::Command::new(env!("CARGO_BIN_EXE_aicx"))
+        .args([
+            "serve",
+            "--transport",
+            "http",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "0",
+            "--no-require-auth",
+            "--experimental-auto-refresh",
+        ])
+        .env("HOME", root)
+        .env("USERPROFILE", root)
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while std::time::Instant::now() < deadline
+        && std::fs::read(&pointer).ok().as_deref() == Some(before.as_slice())
+    {
+        if writer.try_wait().unwrap().is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let _ = writer.kill();
+    writer.wait().unwrap();
+    assert_ne!(
+        std::fs::read(&pointer).unwrap(),
+        before,
+        "HTTP maintenance must detect a policy-only change"
+    );
+    let manifest = aicx_retrieve::Manifest::read_from_path(
+        &aicx::vector_index::hybrid_manifest_path(None).unwrap(),
+    )
+    .unwrap();
+    assert_eq!((manifest.lexical_doc_count, manifest.dense_count), (2, 2));
 }
 
 struct MutateAfterEmbedding {

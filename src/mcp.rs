@@ -117,25 +117,8 @@ fn refresh_catalog_and_index(hours: u64) -> anyhow::Result<()> {
         .map(|value| value.max(0) as u128)
         .unwrap_or(0);
     let refresh = crate::catalog::refresh_hot(&aicx_home, &user_home, cutoff_ns)?;
-    let status = crate::api::index_status_at(&aicx_home, None).ok();
-    let pending = status
-        .as_ref()
-        .map(|status| status.pending_chunks)
-        .unwrap_or(0);
-    let index_current = status.as_ref().is_some_and(|status| {
-        status.readiness == crate::api::IndexReadiness::Ready && status.lexical_status == "ready"
-    });
-
-    if refresh.changed_sessions == 0
-        && refresh.admitted_sessions == 0
-        && refresh.reattributed_sessions == 0
-        && pending == 0
-        && index_current
-    {
-        tracing::debug!(target: "mcp.refresh", "MCP auto-refresh: catalog and index already current");
-        return Ok(());
-    }
-
+    // A policy edit moves the source fingerprint even without catalog changes.
+    // The builder checks that fingerprint before loading an embedder.
     let _lock = match crate::locks::acquire_exclusive_with_timeout(
         crate::locks::index_lock_path()?,
         Duration::from_millis(500),
@@ -160,7 +143,6 @@ fn refresh_catalog_and_index(hours: u64) -> anyhow::Result<()> {
         changed_sessions = refresh.changed_sessions,
         admitted_sessions = refresh.admitted_sessions,
         reattributed_sessions = refresh.reattributed_sessions,
-        pending_chunks_before = pending,
         lexical_docs = report.lexical_docs,
         unchanged = report.unchanged,
         wall_ms = report.wall_ms,
