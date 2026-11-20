@@ -625,7 +625,7 @@ global catalog metadata.
 
 | Command | What it publishes |
 |---|---|
-| `aicx index` | Tantivy lexical; retains matching vectors, refuses to demote an existing semantic generation |
+| `aicx index` | Tantivy on first use. After passage indexing is enabled, refreshes lexical and semantic data together with the same embedder |
 | `aicx index --semantic` | Lexical + `dense.exact_mmap_v1.bin` via configured embedder |
 
 Default search uses the published semantic vectors automatically when available.
@@ -635,21 +635,18 @@ session reparses on the next run even when no catalog rebuild happened.
 `--semantic` will rebuild when dense is missing even if lexical CURRENT
 already matches.
 
-After a semantic generation exists, a changed corpus requires
-`aicx index --semantic`. A lexical-only refresh fails with `semantic downgrade
-rejected` and retains `CURRENT`; it does not publish additions, edits,
-deletions or privacy changes. The retained generation still describes its old
-corpus, not the attempted refresh. This admission guard preserves search while
-the semantic replacement is built. Completed passage vectors are retained by
-content and model/input contract across corpus changes and successful
-publication, so only missing or changed passages are embedded. The first
-migration from legacy session-prefix vectors requires a new passage build.
+Once passage indexing is enabled, ordinary and scheduled index runs reuse
+vectors by content and model/input contract. They embed only missing or changed
+passages and publish additions, edits, removals and privacy changes together.
+Switching models or migrating legacy session-prefix vectors requires an
+explicit `aicx index --semantic`. On a failed refresh, `CURRENT` keeps its
+previous generation and its reported freshness reflects that generation.
 
 Upgrade all writers before the first schema 3.0 generation; keep old schedules
 paused until verified. New generations bind privacy policy and payload integrity,
 and searches expose `index_snapshot.freshness` as `current`, `stale` or `unknown`.
 See [Durable semantic memory](semantic-memory.md) for migration and retention.
-MCP callers opt in with `aicx_search` and `{"query":"question","deep":true}`.
+MCP callers can use `aicx_search` with `{"query":"question"}` for automatic retrieval.
 
 Signal filtering keeps user messages, agent replies, plans, and reports while
 dropping tool-call noise, internal thought, system reminders, and image/base64

@@ -657,17 +657,12 @@ fn test_deep_search_cli_uses_published_source_generation_without_ndjson() {
         })
     ));
     std::fs::write(root.join("catalog/sessions.jsonl"), &catalog).unwrap();
+    let configured = std::fs::read_to_string(&config).unwrap();
+    std::fs::write(&config, configured.replace("test-model", "different-model")).unwrap();
     let refused = run_cli(&["index", "--json"]);
-    assert!(
-        !refused.status.success(),
-        "a lexical refresh must not demote semantic CURRENT"
-    );
-    let refusal = String::from_utf8_lossy(&refused.stderr);
-    assert!(refusal.contains("semantic downgrade rejected"), "{refusal}");
-    assert!(
-        refusal.contains("NOT published"),
-        "source freshness must not be falsely claimed: {refusal}"
-    );
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("configured embedder"));
+    std::fs::write(&config, configured).unwrap();
     assert_eq!(std::fs::read(hybrid.join("CURRENT")).unwrap(), before);
     assert_eq!(
         std::fs::read(old_dir.join("manifest.json")).unwrap(),
@@ -689,7 +684,7 @@ fn test_deep_search_cli_uses_published_source_generation_without_ndjson() {
     );
     assert_eq!(result["results"], 2, "the refused corpus was not admitted");
 
-    let publish = run_cli(&["index", "--semantic", "--json"]);
+    let publish = run_cli(&["index", "--json"]);
     assert!(
         publish.status.success(),
         "a complete semantic replacement must publish: {}",
@@ -697,6 +692,16 @@ fn test_deep_search_cli_uses_published_source_generation_without_ndjson() {
     );
     let report: serde_json::Value = serde_json::from_slice(&publish.stdout).unwrap();
     assert_eq!(report["dense_docs"], 3);
+    assert_eq!(report["dense_embedded"], 1);
+    assert_eq!(report["dense_reused"], 2);
+    let query = run_cli(&["search", "checkpoint durability", "--json"]);
+    assert!(query.status.success());
+    let result: serde_json::Value = serde_json::from_slice(&query.stdout).unwrap();
+    assert_eq!(result["results"], 3);
+    assert_eq!(
+        result["oracle_status"]["retrieval"]["executed_path"],
+        "hybrid_fusion"
+    );
     assert_ne!(std::fs::read(hybrid.join("CURRENT")).unwrap(), before);
 
     // An authoritative but corrupt CURRENT must not activate old NDJSON.
@@ -774,7 +779,17 @@ fn semantic_reuses_after_publish_add_edit_delete_and_model_change() {
     let first = aicx::source_index::build(root, &[], false, false, true).unwrap();
     assert_eq!((first.dense_embedded, first.dense_reused), (2, 0));
     catalog_members(root, &[1, 2, 3]);
-    let added = aicx::source_index::build(root, &[], false, false, true).unwrap();
+    let maintain = || {
+        aicx::source_index::build_with_mode(
+            root,
+            &[],
+            false,
+            false,
+            aicx::source_index::SourceIndexMode::Maintain,
+            std::sync::Arc::new(aicx::progress::NoopReporter),
+        )
+    };
+    let added = maintain().unwrap();
     assert_eq!((added.dense_embedded, added.dense_reused), (1, 2));
     let source = root.join("00000000-0000-4000-8000-000000000001.jsonl");
     let changed = std::fs::read_to_string(&source)
@@ -815,6 +830,15 @@ fn semantic_reuses_after_publish_add_edit_delete_and_model_change() {
         .unwrap()
         .replace("test-model", "different-model");
     std::fs::write(config, cfg).unwrap();
+    let pointer = root.join("indexed/_all/hybrid/CURRENT");
+    let before = std::fs::read(&pointer).unwrap();
+    assert!(
+        maintain()
+            .unwrap_err()
+            .to_string()
+            .contains("configured embedder")
+    );
+    assert_eq!(before, std::fs::read(&pointer).unwrap());
     let model = aicx::source_index::build(root, &[], false, false, true).unwrap();
     assert_eq!((model.dense_embedded, model.dense_reused), (2, 0));
     assert_eq!(server.calls.load(Ordering::SeqCst), 6);

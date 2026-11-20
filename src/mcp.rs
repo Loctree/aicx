@@ -147,7 +147,14 @@ fn refresh_catalog_and_index(hours: u64) -> anyhow::Result<()> {
         }
         Err(err) => return Err(err),
     };
-    let report = crate::source_index::build(&aicx_home, &[], false, false, false)?;
+    let report = crate::source_index::build_with_mode(
+        &aicx_home,
+        &[],
+        false,
+        false,
+        crate::source_index::SourceIndexMode::Maintain,
+        std::sync::Arc::new(crate::progress::NoopReporter),
+    )?;
     tracing::info!(
         target: "mcp.refresh",
         changed_sessions = refresh.changed_sessions,
@@ -157,7 +164,8 @@ fn refresh_catalog_and_index(hours: u64) -> anyhow::Result<()> {
         lexical_docs = report.lexical_docs,
         unchanged = report.unchanged,
         wall_ms = report.wall_ms,
-        "MCP auto-refresh published the current lexical index"
+        dense_docs = report.dense_docs,
+        "MCP auto-refresh completed"
     );
     Ok(())
 }
