@@ -32,6 +32,22 @@ aicx search --deep 'routing strzałek taby'
 file per session under `~/.aicx/extracts/`. Without that flag, source logs and
 the published index remain the content owners.
 
+During indexing, agent logs may continue to grow. Sources that change while
+being read or prepared for publication are reported as `deferred` and omitted
+from that generation; stable sessions can still publish. Deferred sources have
+no successful parse receipt and are retried by the next `aicx index`. A partial
+generation remains stale rather than claiming that the entire live corpus is
+current. Completed dense passage checkpoints remain reusable on retry. If
+another source changes while a generation is being built, admission retries
+with that source deferred, up to three attempts without repeating parsing or
+embedding. If no stable signal sources remain, CURRENT is preserved.
+
+Changes to the catalog, checkout privacy rules, or repository scope layout
+still refuse publication and preserve the previous CURRENT. Repeated late
+source changes may also prevent publication; the error identifies source drift
+separately from policy changes. Switching to `--semantic` does not repair either
+condition.
+
 ## Human utterances
 
 `aicx intents` classifies stored text and can exit 0 after it has dropped

@@ -34,6 +34,19 @@ pub use semantic::{
     SourceDenseCheckpointRow, source_chunk_content_hash, source_dense_checkpoint_path,
 };
 
+#[derive(Debug)]
+struct AdmissionSourceDrift(Vec<String>);
+
+impl std::fmt::Display for AdmissionSourceDrift {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "sources changed before generation admission; CURRENT retained"
+        )
+    }
+}
+impl std::error::Error for AdmissionSourceDrift {}
+
 const MAX_MESSAGE_CHARS: usize = 256 * 1024;
 const MAX_EXTRACT_CHARS: usize = 4 * 1024 * 1024;
 const MAX_UNBROKEN_TOKEN_CHARS: usize = 4096;
@@ -106,6 +119,8 @@ pub struct SourceIndexReport {
     /// Sessions whose extract was reused without re-parsing the live source.
     pub sources_reused: usize,
     pub sources_skipped: usize,
+    /// Sources changed during this build and were excluded from publication.
+    pub sources_deferred: usize,
     pub raw_frames: usize,
     pub signal_frames: usize,
     pub filtered_frames: usize,
@@ -550,6 +565,8 @@ pub fn build_with_reporter(
         );
     }
     let catalog_path = crate::catalog::sessions_path_for(aicx_home);
+    let catalog_before_read =
+        crate::source_path::read_bytes_under_aicx_home(aicx_home, &catalog_path)?;
     let entries = crate::catalog::read_entries_at(aicx_home)?;
     if entries.is_empty() {
         anyhow::bail!(
@@ -569,13 +586,22 @@ pub fn build_with_reporter(
     let source_allow = crate::source_path::SourceAllowlist::for_operator(&user_home, aicx_home);
     // Digest includes LIVE size+mtime so appends without catalog rebuild still
     // move the generation fingerprint (source-change incremental).
-    let source_fingerprint = source_fingerprint(
-        aicx_home,
-        &catalog_path,
+    let catalog_snapshot =
+        crate::source_path::read_bytes_under_aicx_home(aicx_home, &catalog_path)?;
+    anyhow::ensure!(
+        catalog_snapshot == catalog_before_read,
+        "source catalog changed during indexing setup; retry index"
+    );
+    let source_snapshot: Vec<_> = selected
+        .iter()
+        .map(|entry| source_observation(entry, &source_allow))
+        .collect();
+    let source_fingerprint = fingerprint_snapshot(
+        &catalog_snapshot,
         &selected,
-        &source_allow,
+        &source_snapshot,
         &repo_path_ignore_fingerprint,
-    )?;
+    );
     // Incremental short-circuit applies to both publish and dry-run. A matching
     // live+catalog digest means CURRENT already reflects this snapshot —
     // re-parsing ~10k sources on every `index --dry-run` recreated the mill
@@ -643,6 +669,7 @@ pub fn build_with_reporter(
             sources_parsed: 0,
             sources_reused: 0,
             sources_skipped: 0,
+            sources_deferred: 0,
             raw_frames: 0,
             signal_frames: 0,
             filtered_frames: 0,
@@ -663,6 +690,7 @@ pub fn build_with_reporter(
         });
     }
 
+    let mut deferred = BTreeSet::new();
     let mut chunks = Vec::with_capacity(selected.len());
     let mut sources_parsed = 0usize;
     let mut sources_reused = 0usize;
@@ -720,9 +748,14 @@ pub fn build_with_reporter(
             "parsed=0 reused={sources_reused} skipped=0 (reused matching lexical generation)"
         ));
     } else {
-        for entry in &selected {
-            parse_phase.tick((sources_parsed + sources_reused + sources_skipped) as u64);
+        for (entry, observed) in selected.iter().zip(&source_snapshot) {
+            parse_phase
+                .tick((sources_parsed + sources_reused + sources_skipped + deferred.len()) as u64);
             let session_key = session_state_key(&entry.agent, &entry.session_id);
+            if source_observation(entry, &source_allow) != *observed {
+                deferred.insert(session_key);
+                continue;
+            }
 
             // True incremental: reuse a prior extract only when the source
             // fingerprint (path + size + mtime) still matches and extract bytes
@@ -805,6 +838,10 @@ pub fn build_with_reporter(
                         continue;
                     }
                 };
+            if source_observation(entry, &source_allow) != *observed {
+                deferred.insert(session_key);
+                continue;
+            }
             sources_parsed += 1;
             let indexed = index_parsed_session(
                 aicx_home,
@@ -827,7 +864,8 @@ pub fn build_with_reporter(
         }
         parse_hb.stop();
         parse_phase.finish_ok(format!(
-            "parsed={sources_parsed} reused={sources_reused} skipped={sources_skipped}"
+            "parsed={sources_parsed} reused={sources_reused} skipped={sources_skipped} deferred={}",
+            deferred.len()
         ));
     }
 
@@ -838,7 +876,7 @@ pub fn build_with_reporter(
         );
     }
 
-    let semantic_payload = if semantic && !dry_run {
+    let mut semantic_payload = if semantic && !dry_run {
         Some(embed_chunks_for_semantic(
             aicx_home,
             &source_fingerprint,
@@ -865,27 +903,48 @@ pub fn build_with_reporter(
             )?)
         };
         if !dry_run {
-            // Embedding may take hours. Never admit a snapshot whose sources
-            // or privacy policy changed while the provider was running.
+            // Privacy and catalog are global contracts; unlike a live append,
+            // changing either invalidates every parsed scope decision.
             let live_ignore = crate::legacy_archive::load_repo_path_ignore(aicx_home, &user_home)?;
             anyhow::ensure!(
-                source_fingerprint
-                    == self::source_fingerprint(
-                        aicx_home,
-                        &catalog_path,
-                        &selected,
-                        &source_allow,
-                        &live_ignore.fingerprint()
-                    )?,
-                "source corpus or privacy policy changed during embedding; CURRENT retained; retry aicx index --semantic to reuse completed passages"
+                live_ignore.fingerprint() == repo_path_ignore_fingerprint,
+                "privacy policy changed during indexing; CURRENT retained; retry index"
+            );
+            anyhow::ensure!(
+                crate::source_path::read_bytes_under_aicx_home(aicx_home, &catalog_path)?
+                    == catalog_snapshot,
+                "source catalog changed during indexing; CURRENT retained; retry index"
+            );
+            for (entry, observed) in selected.iter().zip(&source_snapshot) {
+                if source_observation(entry, &source_allow) != *observed {
+                    deferred.insert(session_state_key(&entry.agent, &entry.session_id));
+                }
+            }
+            // Drop both retrieval lanes and the ledger receipt for every source
+            // whose identity or bytes may have moved. A later run retries it.
+            chunks.retain(|chunk| !deferred.contains(&chunk.id));
+            next_state.sessions.retain(|key, _| !deferred.contains(key));
+            if let Some(payload) = semantic_payload.as_mut() {
+                payload.chunks.retain(|dense| {
+                    dense
+                        .chunk
+                        .metadata
+                        .get("parent_chunk_id")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|id| !deferred.contains(id))
+                });
+            }
+            anyhow::ensure!(
+                !chunks.is_empty(),
+                "all signal sources changed during indexing; CURRENT retained; retry index"
             );
             anyhow::ensure!(
                 ScopeLayoutProbe::default().ledger_is_current(&next_state),
                 "repository scope layout changed during indexing; CURRENT retained; retry index"
             );
         }
-        Ok(if dry_run {
-            (
+        if dry_run {
+            return Ok((
                 None,
                 0usize,
                 if semantic {
@@ -893,51 +952,139 @@ pub fn build_with_reporter(
                 } else {
                     "optional_not_built".to_string()
                 },
-            )
-        } else if semantic {
-            let payload = semantic_payload
-                .as_ref()
-                .expect("semantic payload prepared");
-            payload.compact()?;
-            let manifest = crate::vector_index::publish_source_hybrid_generation_with_contract(
-                &chunks,
-                &payload.chunks,
-                &source_fingerprint,
-                &payload.fingerprint,
-                Some(&payload.contract),
-                Some(&repo_path_ignore_fingerprint),
-            )?;
+            ));
+        }
+        // Each attempt builds a new immutable generation. If further sources
+        // change while it is being built, discard that candidate and retry
+        // with their sessions removed; never repeat parsing or embedding.
+        for attempt in 0..3 {
+            chunks.retain(|chunk| !deferred.contains(&chunk.id));
+            next_state.sessions.retain(|key, _| !deferred.contains(key));
+            if let Some(payload) = semantic_payload.as_mut() {
+                payload.chunks.retain(|dense| {
+                    dense
+                        .chunk
+                        .metadata
+                        .get("parent_chunk_id")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|id| !deferred.contains(id))
+                });
+            }
+            anyhow::ensure!(
+                !chunks.is_empty(),
+                "all signal sources changed during indexing; CURRENT retained; retry index"
+            );
+            let published_fingerprint = if deferred.is_empty() {
+                source_fingerprint.clone()
+            } else {
+                // A partial generation must not match the live corpus digest.
+                format!("deferred:{}", source_fingerprint)
+            };
+            let validate_admission = |_: &aicx_retrieve::Manifest| -> Result<()> {
+                // Also exposes this final boundary to progress consumers.
+                let phase = Phase::start(reporter.clone(), "index_admission", None);
+                let checked = (|| -> Result<()> {
+                    let live_ignore =
+                        crate::legacy_archive::load_repo_path_ignore(aicx_home, &user_home)?;
+                    anyhow::ensure!(
+                        live_ignore.fingerprint() == repo_path_ignore_fingerprint,
+                        "privacy policy changed before generation admission; CURRENT retained; retry index"
+                    );
+                    anyhow::ensure!(
+                        crate::source_path::read_bytes_under_aicx_home(aicx_home, &catalog_path)?
+                            == catalog_snapshot,
+                        "source catalog changed before generation admission; CURRENT retained; retry index"
+                    );
+                    anyhow::ensure!(
+                        ScopeLayoutProbe::default().ledger_is_current(&next_state),
+                        "repository scope layout changed before generation admission; CURRENT retained; retry index"
+                    );
+                    let changed: Vec<_> = selected
+                        .iter()
+                        .zip(&source_snapshot)
+                        .filter_map(|(entry, observed)| {
+                            let key = session_state_key(&entry.agent, &entry.session_id);
+                            (!deferred.contains(&key)
+                                && source_observation(entry, &source_allow) != *observed)
+                                .then_some(key)
+                        })
+                        .collect();
+                    if !changed.is_empty() {
+                        return Err(AdmissionSourceDrift(changed).into());
+                    }
+                    Ok(())
+                })();
+                match &checked {
+                    Ok(()) => {
+                        phase.finish_ok("source snapshot validated");
+                    }
+                    Err(error) if error.downcast_ref::<AdmissionSourceDrift>().is_some() => {
+                        phase.finish_ok("source changes deferred; retrying admission");
+                    }
+                    Err(error) => {
+                        phase.finish_err(error, None);
+                    }
+                }
+                checked
+            };
+            let candidate = if semantic {
+                let payload = semantic_payload
+                    .as_ref()
+                    .expect("semantic payload prepared");
+                crate::vector_index::publish_source_hybrid_generation_checked(
+                    &chunks,
+                    &payload.chunks,
+                    &published_fingerprint,
+                    &payload.fingerprint,
+                    Some(&payload.contract),
+                    Some(&repo_path_ignore_fingerprint),
+                    validate_admission,
+                )
+            } else {
+                crate::vector_index::publish_source_lexical_generation_checked(
+                    &chunks,
+                    &published_fingerprint,
+                    Some(&repo_path_ignore_fingerprint),
+                    validate_admission,
+                )
+            };
+            let manifest = match candidate {
+                Ok(manifest) => manifest,
+                Err(error) => {
+                    if let Some(changed) = error.downcast_ref::<AdmissionSourceDrift>() {
+                        deferred.extend(changed.0.iter().cloned());
+                        if attempt < 2 {
+                            continue;
+                        }
+                    }
+                    return Err(error);
+                }
+            };
+            // Compaction is an optimization. Only an admitted complete run
+            // can prove that omitted checkpoint rows are obsolete; a partial
+            // run retains both previous and newly appended embedding work.
+            if deferred.is_empty()
+                && let Some(payload) = semantic_payload.as_ref()
+                && let Err(error) = payload.compact()
+            {
+                crate::diagnostics::log_describe(&format!(
+                    "source_index_checkpoint_compaction_failed error={error:#}"
+                ));
+            }
+            // A ledger never leads CURRENT: failed candidates do not update it.
             if project_filters.is_empty() {
                 write_parse_state(aicx_home, &next_state)?;
             }
             let path = crate::vector_index::hybrid_manifest_path(None)?
                 .display()
                 .to_string();
-            (
+            return Ok((
                 Some(path).filter(|_| manifest.lexical_doc_count == chunks.len()),
                 manifest.dense_count,
                 manifest.dense_kind,
-            )
-        } else {
-            let manifest = crate::vector_index::publish_source_lexical_generation_with_policy(
-                &chunks,
-                &source_fingerprint,
-                Some(&repo_path_ignore_fingerprint),
-            )?;
-            // Persist parse state only after a successful publish so a killed build
-            // cannot claim sessions are current when CURRENT never flipped.
-            if project_filters.is_empty() {
-                write_parse_state(aicx_home, &next_state)?;
-            }
-            let path = crate::vector_index::hybrid_manifest_path(None)?
-                .display()
-                .to_string();
-            (
-                Some(path).filter(|_| manifest.lexical_doc_count == chunks.len()),
-                manifest.dense_count,
-                manifest.dense_kind,
-            )
-        })
+            ));
+        }
+        unreachable!("the final admission attempt returns its result")
     })();
     publish_hb.stop();
     let (manifest_path, dense_docs, dense_kind) = match publication {
@@ -956,8 +1103,9 @@ pub fn build_with_reporter(
         }
     };
     publish_phase.finish_ok(format!(
-        "lexical_docs={} dense_docs={dense_docs}{}",
+        "lexical_docs={} dense_docs={dense_docs} deferred={}{}",
         chunks.len(),
+        deferred.len(),
         if dry_run { " (dry run)" } else { "" }
     ));
 
@@ -967,6 +1115,7 @@ pub fn build_with_reporter(
         sources_parsed,
         sources_reused,
         sources_skipped,
+        sources_deferred: deferred.len(),
         raw_frames,
         signal_frames,
         filtered_frames,
@@ -2995,6 +3144,36 @@ fn source_fingerprint(
     source_allow: &crate::source_path::SourceAllowlist,
     repo_path_ignore_fingerprint: &str,
 ) -> Result<String> {
+    let catalog = crate::source_path::read_bytes_under_aicx_home(aicx_home, catalog_path)
+        .with_context(|| format!("read catalog {}", catalog_path.display()))?;
+    let observations: Vec<_> = entries
+        .iter()
+        .map(|entry| source_observation(entry, source_allow))
+        .collect();
+    Ok(fingerprint_snapshot(
+        &catalog,
+        entries,
+        &observations,
+        repo_path_ignore_fingerprint,
+    ))
+}
+
+fn source_observation(
+    entry: &CatalogEntry,
+    allow: &crate::source_path::SourceAllowlist,
+) -> (bool, crate::session_catalog::SourceFingerprint) {
+    (
+        allow.resolve_file(entry.source_path.as_str()).is_ok(),
+        live_or_catalog_fingerprint(entry, allow),
+    )
+}
+
+fn fingerprint_snapshot(
+    catalog: &[u8],
+    entries: &[CatalogEntry],
+    observations: &[(bool, crate::session_catalog::SourceFingerprint)],
+    repo_path_ignore_fingerprint: &str,
+) -> String {
     let mut hasher = Sha256::new();
     // Filter generation first so a catalog-identical CURRENT cannot hide a
     // pre-filter corpus after signal-body rules change.
@@ -3007,15 +3186,12 @@ fn source_fingerprint(
     hasher.update([0]);
     // Catalog membership (session ids + project attribution) is part of the
     // digest so new rows always admit a rebuild even when live stats match.
-    hasher.update(
-        crate::source_path::read_bytes_under_aicx_home(aicx_home, catalog_path)
-            .with_context(|| format!("read catalog {}", catalog_path.display()))?,
-    );
+    hasher.update(catalog);
     // Per-source live size+mtime is the change detector. Catalog-embedded
     // fingerprints lag until rebuild; hashing LIVE stats means an append to
     // an existing JSONL moves the generation digest without inventing a new
     // session id (audit P0: source-CHANGE incremental, not only session-ADD).
-    for entry in entries {
+    for (entry, (resolved, fingerprint)) in entries.iter().zip(observations) {
         hasher.update(entry.agent.as_bytes());
         hasher.update([0]);
         hasher.update(entry.session_id.as_bytes());
@@ -3024,24 +3200,19 @@ fn source_fingerprint(
         hasher.update([0]);
         // A disappeared source must differ even when catalog fallback stats
         // happen to equal its last live fingerprint.
-        hasher.update([u8::from(
-            source_allow
-                .resolve_file(entry.source_path.as_str())
-                .is_ok(),
-        )]);
-        let fingerprint = live_or_catalog_fingerprint(entry, source_allow);
+        hasher.update([u8::from(*resolved)]);
         hasher.update(fingerprint.len.to_le_bytes());
         hasher.update((fingerprint.modified_unix_nanos as u64).to_le_bytes());
-        for value in fingerprint.physical_identity {
+        for value in &fingerprint.physical_identity {
             hasher.update(value.to_le_bytes());
         }
-        if let Some(bundle) = fingerprint.bundle_fingerprint {
+        if let Some(bundle) = &fingerprint.bundle_fingerprint {
             hasher.update(b"source_bundle\0");
             hasher.update(bundle.as_bytes());
             hasher.update([0]);
         }
     }
-    Ok(hex::encode(hasher.finalize()))
+    hex::encode(hasher.finalize())
 }
 
 /// Snapshot freshness is distinct from successful index execution and valid

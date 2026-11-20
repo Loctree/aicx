@@ -974,7 +974,7 @@ impl Reporter for MutateAfterEmbedding {
 }
 
 #[test]
-fn source_drift_during_embedding_retains_current_and_completed_work() {
+fn source_drift_during_embedding_defers_changed_session_and_retries_it() {
     let _guard = SERIAL.lock().unwrap();
     let (fixture, _server) = contract_fixture();
     let root = &fixture.root;
@@ -988,7 +988,7 @@ fn source_drift_during_embedding_retains_current_and_completed_work() {
         "Query for session 1",
         "Changed while provider was running in session 1",
     );
-    let error = aicx::source_index::build_with_reporter(
+    let partial = aicx::source_index::build_with_reporter(
         root,
         &[],
         false,
@@ -996,11 +996,30 @@ fn source_drift_during_embedding_retains_current_and_completed_work() {
         true,
         Arc::new(MutateAfterEmbedding { path, text }),
     )
-    .unwrap_err();
-    assert!(format!("{error:#}").contains("changed during embedding"));
-    assert_eq!(std::fs::read(pointer).unwrap(), before);
+    .unwrap();
+    assert_eq!(partial.sources_deferred, 1);
+    assert_eq!((partial.lexical_docs, partial.dense_docs), (2, 2));
+    assert_ne!(std::fs::read(pointer).unwrap(), before);
+    let partial_chunks = aicx::vector_index::current_lexical_chunks().unwrap();
+    assert_eq!(partial_chunks.len(), 2);
+    assert!(
+        partial_chunks
+            .iter()
+            .all(|chunk| !chunk.id.ends_with("000000000001"))
+    );
     let resumed = aicx::source_index::build(root, &[], false, false, true).unwrap();
+    assert!(!resumed.unchanged);
+    assert_eq!(resumed.sources_deferred, 0);
+    assert_eq!((resumed.lexical_docs, resumed.dense_docs), (3, 3));
     assert_eq!((resumed.dense_reused, resumed.dense_embedded), (2, 1));
+    assert!(
+        aicx::vector_index::current_lexical_chunks()
+            .unwrap()
+            .iter()
+            .any(|chunk| chunk
+                .text
+                .contains("Changed while provider was running in session 1"))
+    );
 }
 
 #[test]
@@ -1158,4 +1177,71 @@ fn malformed_or_future_manifest_cannot_serve_lexical_text() {
     )
     .expect("legacy lexical generation remains readable");
     assert!(!result.outcome.results.is_empty());
+}
+
+struct AppendBeforeParse(PathBuf);
+impl Reporter for AppendBeforeParse {
+    fn phase_start(&self, phase: &Phase) {
+        if phase.name == "index_parse" {
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&self.0)
+                .unwrap()
+                .write_all(b"\n")
+                .unwrap();
+        }
+    }
+    fn phase_tick(&self, _: &Phase, _: u64) {}
+    fn phase_finish(&self, _: &Phase, _: &PhaseOutcome) {}
+}
+
+#[test]
+fn deferred_session_keeps_cached_passages_across_runs_and_append() {
+    let _guard = SERIAL.lock().unwrap();
+    let (fixture, _server) = contract_fixture();
+    let root = &fixture.root;
+    catalog_members(root, &[1, 2]);
+    let path = root.join("00000000-0000-4000-8000-000000000001.jsonl");
+    let mut rows = std::fs::read_to_string(&path).unwrap();
+    for n in 0..90 {
+        rows.push_str(&format!("{}\n", json!({"timestamp":"2026-10-01T10:10:00Z","type":"event_msg",
+            "payload":{"type":"user_message","message":format!("Discussion {n}: complete coverage of our conversation and the chosen implementation. {}", "Signal text. ".repeat(12))}})));
+    }
+    std::fs::write(&path, rows).unwrap();
+    let first = aicx::source_index::build(root, &[], false, false, true).unwrap();
+    assert!(first.dense_docs > 2, "fixture must span multiple passages");
+    let partial = aicx::source_index::build_with_reporter(
+        root,
+        &[],
+        false,
+        true,
+        true,
+        Arc::new(AppendBeforeParse(path.clone())),
+    )
+    .unwrap();
+    assert_eq!(partial.sources_deferred, 1);
+    assert_eq!(partial.lexical_docs, 1);
+    let resumed = aicx::source_index::build(root, &[], false, false, true).unwrap();
+    assert_eq!(resumed.dense_docs, first.dense_docs);
+    assert_eq!(resumed.dense_reused, first.dense_docs);
+    assert_eq!(
+        resumed.dense_embedded, 0,
+        "deferred source passages must survive compaction"
+    );
+    let extra = json!({"timestamp":"2026-10-01T10:20:00Z","type":"event_msg","payload":{"type":"user_message","message":"new distinct appended message"}});
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(format!("{extra}\n").as_bytes())
+        .unwrap();
+    let appended = aicx::source_index::build(root, &[], false, false, true).unwrap();
+    assert!(
+        appended.dense_reused >= first.dense_docs - 1,
+        "unchanged passages must be reused (the final boundary may change)"
+    );
+    assert!(
+        appended.dense_embedded >= 1,
+        "new message must produce new embedding work"
+    );
 }
