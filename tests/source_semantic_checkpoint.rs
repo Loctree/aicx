@@ -833,6 +833,15 @@ fn semantic_reuses_after_publish_add_edit_delete_and_model_change() {
     let pointer = root.join("indexed/_all/hybrid/CURRENT");
     let before = std::fs::read(&pointer).unwrap();
     assert!(
+        maintain().unwrap().unchanged,
+        "no-op must not initialize or switch embedders"
+    );
+    let source = root.join("00000000-0000-4000-8000-000000000001.jsonl");
+    let edited = std::fs::read_to_string(&source)
+        .unwrap()
+        .replace("Changed text", "New revision");
+    std::fs::write(source, edited).unwrap();
+    assert!(
         maintain()
             .unwrap_err()
             .to_string()

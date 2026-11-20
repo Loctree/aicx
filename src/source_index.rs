@@ -646,25 +646,6 @@ pub fn build_with_mode(
     };
     let maintain_passages = manifest.filter(|m| m.schema_version == "3.0");
     let semantic = mode == SourceIndexMode::Semantic || maintain_passages.is_some();
-    if let Some(_published) = maintain_passages {
-        anyhow::ensure!(
-            !dense_missing,
-            "published semantic payload failed validation; inspect CURRENT before refreshing"
-        );
-        #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
-        {
-            let engine = crate::embedder::EmbeddingEngine::new()?;
-            anyhow::ensure!(
-                crate::vector_index::hybrid_manifest_matches_embedder(None, engine.info())
-                    && _published.semantic_input_contract.as_deref()
-                        == Some(semantic::input_contract(&engine)?.as_str()),
-                "configured embedder or passage contract changed; run aicx index --semantic to select it explicitly; CURRENT retained"
-            );
-            prepared_engine = Some(engine);
-        }
-        #[cfg(not(any(feature = "native-embedder", feature = "cloud-embedder")))]
-        anyhow::bail!("refreshing the published semantic index requires an embedder-enabled build");
-    }
     if !full_rescan
         && project_filters.is_empty()
         && crate::vector_index::source_lexical_generation_matches(&source_fingerprint)?
@@ -675,13 +656,11 @@ pub fn build_with_mode(
             .values()
             .all(maintenance_record_settled)
         && {
-            // Same corpus is insufficient after the configured model/endpoint
-            // changes. Keep this initialized engine for the rebuild if needed.
+            // An explicit semantic request can migrate models on unchanged input.
+            // A maintenance no-op neither embeds nor selects a new model.
             #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
             {
-                if prepared_engine.is_some() {
-                    true
-                } else if semantic {
+                if mode == SourceIndexMode::Semantic {
                     let engine = crate::embedder::EmbeddingEngine::new()?;
                     let matches =
                         crate::vector_index::hybrid_manifest_matches_embedder(None, engine.info())
@@ -699,7 +678,7 @@ pub fn build_with_mode(
             }
             #[cfg(not(any(feature = "native-embedder", feature = "cloud-embedder")))]
             {
-                !semantic
+                mode != SourceIndexMode::Semantic
             }
         }
     {
@@ -728,6 +707,26 @@ pub fn build_with_mode(
                 .map(|path| path.display().to_string()),
             skipped_by_agent: BTreeMap::new(),
         });
+    }
+
+    if let Some(_published) = maintain_passages {
+        anyhow::ensure!(
+            !dense_missing,
+            "published semantic payload failed validation; inspect CURRENT before refreshing"
+        );
+        #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+        {
+            let engine = crate::embedder::EmbeddingEngine::new()?;
+            anyhow::ensure!(
+                crate::vector_index::hybrid_manifest_matches_embedder(None, engine.info())
+                    && _published.semantic_input_contract.as_deref()
+                        == Some(semantic::input_contract(&engine)?.as_str()),
+                "configured embedder or passage contract changed; run aicx index --semantic to select it explicitly; CURRENT retained"
+            );
+            prepared_engine = Some(engine);
+        }
+        #[cfg(not(any(feature = "native-embedder", feature = "cloud-embedder")))]
+        anyhow::bail!("refreshing the published semantic index requires an embedder-enabled build");
     }
 
     let mut chunks = Vec::with_capacity(selected.len());
