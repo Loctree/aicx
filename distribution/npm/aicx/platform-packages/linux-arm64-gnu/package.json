@@ -1,6 +1,6 @@
 {
   "name": "@loctree/aicx-linux-arm64-gnu",
-  "version": "0.16.0",
+  "version": "0.16.1",
   "description": "aicx + aicx-mcp binaries for Linux arm64 (glibc)",
   "keywords": [
     "aicx",

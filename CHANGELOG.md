@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
+## [0.16.1] - 2026-11-20
+
+### Changed
+
+- Ordinary CLI and MCP searches automatically combine lexical matches with
+  semantic passages when the published index contains vectors. First-time
+  installations can search without building a semantic index.
+- Search results and evidence responses explain how snapshot freshness was
+  determined. Legacy indexes without a policy fingerprint report unknown
+  freshness. Empty results also surface a stale or unverified snapshot.
+- After passage indexing is enabled, ordinary and scheduled index runs maintain
+  both retrieval modes with the same embedder and reuse unchanged passages.
+  Starting passage indexing, migrating a session-prefix index, or switching
+  the model still requires an explicit `aicx index --semantic`.
+
+### Fixed
+
+- Active sessions can keep growing during indexing. The publisher defers those
+  sessions, admits stable ones together, and retries the deferred work on the
+  next run. If every session changes, the existing generation stays available.
+
 ## [0.16.0] - 2026-11-16
 
 ### Added
