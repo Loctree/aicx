@@ -223,6 +223,24 @@ pub struct HybridRetrievalStatus {
     pub fusion_algorithm: String,
     pub dense_kind: String,
     pub corpus_freshness: String,
+    pub freshness_reason: &'static str,
+}
+
+impl HybridRetrievalStatus {
+    pub fn freshness_warning(&self) -> Option<&'static str> {
+        match self.freshness_reason {
+            "missing_policy_fingerprint" => {
+                Some("This index predates privacy fingerprints. Its freshness cannot be verified.")
+            }
+            "source_fingerprint_changed" => {
+                Some("Catalog or source data changed after this index was published.")
+            }
+            "source_observation_unavailable" => Some(
+                "AICX could not read the current catalog, sources or policy to verify freshness.",
+            ),
+            _ => None,
+        }
+    }
 }
 
 /// Fail-fast typed error for semantic-search preconditions. Each variant
@@ -2132,6 +2150,8 @@ fn hybrid_score_pct(score: f32) -> u8 {
 
 impl From<&aicx_retrieve::Manifest> for HybridRetrievalStatus {
     fn from(manifest: &aicx_retrieve::Manifest) -> Self {
+        let (freshness, freshness_reason) =
+            crate::source_index::generation_freshness_observation(manifest);
         Self {
             generation_id: manifest.generation_id.clone(),
             source_chunk_count: manifest.source_chunk_count,
@@ -2139,7 +2159,8 @@ impl From<&aicx_retrieve::Manifest> for HybridRetrievalStatus {
             lexical_doc_count: manifest.lexical_doc_count,
             fusion_algorithm: manifest.fusion_algorithm.clone(),
             dense_kind: manifest.dense_kind.clone(),
-            corpus_freshness: crate::source_index::generation_freshness(manifest).into(),
+            corpus_freshness: freshness.into(),
+            freshness_reason,
         }
     }
 }
@@ -2336,30 +2357,35 @@ fn merge_hybrid_statuses(statuses: &[HybridRetrievalStatus]) -> Option<HybridRet
     match statuses {
         [] => None,
         [status] => Some(status.clone()),
-        many => Some(HybridRetrievalStatus {
-            generation_id: "multiple".to_string(),
-            corpus_freshness: if many.iter().all(|s| s.corpus_freshness == "current") {
-                "current"
-            } else {
-                "unknown"
-            }
-            .into(),
-            source_chunk_count: many.iter().map(|status| status.source_chunk_count).sum(),
-            dense_count: many.iter().map(|status| status.dense_count).sum(),
-            lexical_doc_count: many.iter().map(|status| status.lexical_doc_count).sum(),
-            fusion_algorithm: many
-                .first()
-                .map(|status| status.fusion_algorithm.clone())
-                .unwrap_or_else(|| "rrf".to_string()),
-            dense_kind: if many
+        many => {
+            // One known stale generation makes a combined result stale, even
+            // when another generation cannot prove its own freshness.
+            let observation = many
                 .iter()
-                .all(|status| status.dense_kind == many[0].dense_kind)
-            {
-                many[0].dense_kind.clone()
-            } else {
-                "mixed".to_string()
-            },
-        }),
+                .find(|s| s.corpus_freshness == "stale")
+                .or_else(|| many.iter().find(|s| s.corpus_freshness != "current"))
+                .unwrap_or(&many[0]);
+            Some(HybridRetrievalStatus {
+                generation_id: "multiple".to_string(),
+                corpus_freshness: observation.corpus_freshness.clone(),
+                freshness_reason: observation.freshness_reason,
+                source_chunk_count: many.iter().map(|status| status.source_chunk_count).sum(),
+                dense_count: many.iter().map(|status| status.dense_count).sum(),
+                lexical_doc_count: many.iter().map(|status| status.lexical_doc_count).sum(),
+                fusion_algorithm: many
+                    .first()
+                    .map(|status| status.fusion_algorithm.clone())
+                    .unwrap_or_else(|| "rrf".to_string()),
+                dense_kind: if many
+                    .iter()
+                    .all(|status| status.dense_kind == many[0].dense_kind)
+                {
+                    many[0].dense_kind.clone()
+                } else {
+                    "mixed".to_string()
+                },
+            })
+        }
     }
 }
 
@@ -3146,14 +3172,14 @@ pub fn render_semantic_status_line(
     let manifest = retrieval_status
         .map(|status| {
             format!(
-                " manifest_generation={} source_chunks={} dense_count={} dense_kind={} lexical_doc_count={} fusion={} corpus_freshness={}",
+                " manifest_generation={} source_chunks={} dense_count={} dense_kind={} lexical_doc_count={} fusion={} corpus_freshness={} freshness_reason={}",
                 status.generation_id,
                 status.source_chunk_count,
                 status.dense_count,
                 status.dense_kind,
                 status.lexical_doc_count,
                 status.fusion_algorithm,
-                status.corpus_freshness
+                status.corpus_freshness, status.freshness_reason
             )
         })
         .unwrap_or_default();
@@ -3317,19 +3343,35 @@ pub fn finalize_fuzzy_results(
     results.into_iter().take(limit).collect()
 }
 
-/// Append an `index_snapshot` honesty hint to a rendered hybrid search payload.
-///
-/// Hybrid results reflect the committed index *manifest* (a snapshot of the
-/// corpus at index-build time), not a live freshness check — that check scans
-/// canonical chunks and is intentionally kept off the search hot path. Without
-/// this hint a `hybrid_rrf` result reads as "fully fresh"; the hint keeps the
-/// surface honest by pointing callers at `aicx index status` to confirm there
-/// are no pending (un-embedded) chunks. Shared by CLI and MCP so both surfaces
-/// emit the identical honesty signal.
+/// Attach the committed snapshot size and its independent freshness observation.
 pub fn inject_index_snapshot_hint(
     rendered: &str,
     source_chunks: usize,
     freshness: &str,
+) -> anyhow::Result<String> {
+    inject_index_snapshot_observation(rendered, source_chunks, freshness, None)
+}
+
+pub fn attach_index_snapshot(
+    payload: String,
+    status: Option<&HybridRetrievalStatus>,
+) -> anyhow::Result<String> {
+    match status {
+        Some(status) => inject_index_snapshot_observation(
+            &payload,
+            status.source_chunk_count,
+            &status.corpus_freshness,
+            Some(status.freshness_reason),
+        ),
+        None => Ok(payload),
+    }
+}
+
+fn inject_index_snapshot_observation(
+    rendered: &str,
+    source_chunks: usize,
+    freshness: &str,
+    reason: Option<&str>,
 ) -> anyhow::Result<String> {
     let mut value: serde_json::Value = serde_json::from_str(rendered).map_err(|e| {
         anyhow::anyhow!("parse rendered search payload for index_snapshot hint: {e}")
@@ -3341,7 +3383,8 @@ pub fn inject_index_snapshot_hint(
                 "source_chunks": source_chunks,
                 "freshness_verified": freshness == "current",
                 "freshness": freshness,
-                "note": "results reflect the committed index snapshot; run `aicx index status` to confirm there are no pending (un-embedded) chunks",
+                "freshness_reason": reason,
+                "note": "Results reflect the published index. Run `aicx index status` for pending catalog sessions.",
             }),
         );
     }
@@ -4089,10 +4132,36 @@ mod tests {
         assert!(line.contains("completeness=degraded"), "line was: {line}");
     }
 
+    #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+    #[test]
+    fn known_stale_scope_survives_combination_with_an_unknown_scope() {
+        let unknown = HybridRetrievalStatus {
+            generation_id: "legacy".into(),
+            corpus_freshness: "unknown".into(),
+            freshness_reason: "missing_policy_fingerprint",
+            source_chunk_count: 1,
+            dense_count: 1,
+            lexical_doc_count: 1,
+            fusion_algorithm: "rrf".into(),
+            dense_kind: aicx_retrieve::MMAP_DENSE_KIND.into(),
+        };
+        let stale = HybridRetrievalStatus {
+            generation_id: "modified".into(),
+            corpus_freshness: "stale".into(),
+            freshness_reason: "source_fingerprint_changed",
+            ..unknown.clone()
+        };
+        let combined = merge_hybrid_statuses(&[unknown, stale]).unwrap();
+        assert_eq!(combined.corpus_freshness, "stale");
+        assert_eq!(combined.freshness_reason, "source_fingerprint_changed");
+        assert_eq!(combined.source_chunk_count, 2);
+    }
+
     #[test]
     fn semantic_status_line_marks_hybrid_global_project_scope() {
         let status = HybridRetrievalStatus {
             corpus_freshness: "current".into(),
+            freshness_reason: "source_fingerprint_matches",
             generation_id: "g-global".to_string(),
             source_chunk_count: 259_007,
             dense_count: 259_007,
@@ -4147,6 +4216,7 @@ mod tests {
 
         let status = HybridRetrievalStatus {
             corpus_freshness: "current".into(),
+            freshness_reason: "source_fingerprint_matches",
             generation_id: "g".to_string(),
             source_chunk_count: 10,
             dense_count: 10,
@@ -5255,6 +5325,7 @@ mod tests {
     fn semantic_status_line_surfaces_hybrid_manifest_counts() {
         let status = HybridRetrievalStatus {
             corpus_freshness: "current".into(),
+            freshness_reason: "source_fingerprint_matches",
             generation_id: "g-test".to_string(),
             source_chunk_count: 123,
             dense_count: 123,

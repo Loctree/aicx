@@ -1157,5 +1157,8 @@ fn malformed_or_future_manifest_cannot_serve_lexical_text() {
         &Default::default(),
     )
     .expect("legacy lexical generation remains readable");
+    let status = result.outcome.retrieval_status.as_ref().unwrap();
+    assert_eq!(status.corpus_freshness, "unknown");
+    assert_eq!(status.freshness_reason, "missing_policy_fingerprint");
     assert!(!result.outcome.results.is_empty());
 }

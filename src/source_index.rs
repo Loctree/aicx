@@ -3047,8 +3047,14 @@ fn source_fingerprint(
 /// Snapshot freshness is distinct from successful index execution and valid
 /// vector bytes. Unknown is explicit for legacy manifests and unreadable state.
 pub(crate) fn generation_freshness(manifest: &aicx_retrieve::Manifest) -> &'static str {
+    generation_freshness_observation(manifest).0
+}
+
+pub(crate) fn generation_freshness_observation(
+    manifest: &aicx_retrieve::Manifest,
+) -> (&'static str, &'static str) {
     if manifest.source_policy_fingerprint.is_none() {
-        return "unknown";
+        return ("unknown", "missing_policy_fingerprint");
     }
     let observed: Result<String> = (|| {
         let home = crate::aicx_home::resolve()?;
@@ -3066,10 +3072,10 @@ pub(crate) fn generation_freshness(manifest: &aicx_retrieve::Manifest) -> &'stat
     })();
     match observed {
         Ok(hash) if aicx_retrieve::source_hash_blake3(&hash) == manifest.source_hash_blake3 => {
-            "current"
+            ("current", "source_fingerprint_matches")
         }
-        Ok(_) => "stale",
-        Err(_) => "unknown",
+        Ok(_) => ("stale", "source_fingerprint_changed"),
+        Err(_) => ("unknown", "source_observation_unavailable"),
     }
 }
 

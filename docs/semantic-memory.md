@@ -80,7 +80,7 @@ passage in CLI text/JSON and MCP rather than truncating it a second time to 200
 characters. Lexical snippets include bounded neighbouring context around the actual match.
 
 `index_snapshot.freshness` is `current`, `stale` or `unknown`, separately from
-successful query execution. Freshness covers the durable catalog and its known
+successful query execution. CLI and MCP JSON, including evidence searches, explain the observation in `index_snapshot.freshness_reason`. A legacy generation without a policy fingerprint reports `missing_policy_fingerprint`. An unreadable live source observation reports `source_observation_unavailable`. Compare the catalog separately using `aicx index status`. Freshness covers the durable catalog and its known
 live sources. New provider files enter that observation after catalog refresh;
 `aicx index --semantic` performs the census before indexing. A current result is
 a fingerprint observation at query time, with historical conversation coverage

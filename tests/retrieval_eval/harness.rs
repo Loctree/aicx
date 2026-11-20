@@ -304,6 +304,21 @@ fn verify_cli_and_mcp(root: &std::path::Path, case: &Case, deep: bool) -> serde_
         expected_path
     );
     assert_eq!(cli_result["index_snapshot"]["freshness"], "current");
+    assert_eq!(
+        cli_result["index_snapshot"]["freshness_reason"],
+        "source_fingerprint_matches"
+    );
+
+    if !case.context_fixture {
+        let evidence = cli.arg("--evidence").output().expect("run evidence search");
+        assert!(
+            evidence.status.success(),
+            "{}",
+            String::from_utf8_lossy(&evidence.stderr)
+        );
+        let evidence: serde_json::Value = serde_json::from_slice(&evidence.stdout).unwrap();
+        assert_eq!(evidence["index_snapshot"], cli_result["index_snapshot"]);
+    }
 
     struct Server(std::process::Child);
     impl Drop for Server {
@@ -409,6 +424,19 @@ fn verify_cli_and_mcp(root: &std::path::Path, case: &Case, deep: bool) -> serde_
         payload["oracle_status"]["retrieval"]["executed_path"],
         expected_path
     );
-    assert_eq!(payload["index_snapshot"]["freshness"], "current");
+    assert_eq!(payload["index_snapshot"], cli_result["index_snapshot"]);
+    if !case.context_fixture {
+        args["evidence"] = true.into();
+        let evidence = request(
+            &mut stdin,
+            4,
+            "tools/call",
+            serde_json::json!({"name":"aicx_search","arguments":args}),
+        );
+        assert_ne!(evidence["isError"], true, "MCP evidence error: {evidence}");
+        let evidence: serde_json::Value =
+            serde_json::from_str(evidence["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(evidence["index_snapshot"], payload["index_snapshot"]);
+    }
     serde_json::json!({"cli":"passed","mcp_stdio":"passed","mcp_deep_property":true,"expected_evidence":true})
 }

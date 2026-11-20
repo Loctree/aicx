@@ -10365,6 +10365,7 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
                 &rendered,
                 pushdown_diagnostic.as_ref(),
             )?;
+            payload = aicx::search_engine::attach_index_snapshot(payload, hybrid_status)?;
             if let Some(ref fallback) = semantic_fallback {
                 let mut value: serde_json::Value = serde_json::from_str(&payload)?;
                 if let Some(obj) = value.as_object_mut() {
@@ -10388,6 +10389,9 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
         }
 
         if report.items.is_empty() {
+            if let Some(warning) = hybrid_status.and_then(|s| s.freshness_warning()) {
+                eprintln!("{warning} Run `aicx index status` for pending sessions.");
+            }
             eprintln!(
                 "No evidence for {:?} (examined {} candidates).",
                 query, report.candidates_examined
@@ -10456,13 +10460,6 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
         eprintln!("{note}");
     }
 
-    // Source-chunk count from the hybrid manifest (if this was a hybrid run);
-    // borrow so the by-value `match semantic_status` below still owns it.
-    let hybrid_source_chunks = match &semantic_status {
-        Some((_, _, _, Some(retrieval_status))) => Some(retrieval_status.source_chunk_count),
-        _ => None,
-    };
-
     // One typed retrieval outcome (W1-01); CLI JSON oracle_status and the
     // stderr status line both render from this same value.
     let source_paths_verified = aicx::oracle::verify_paths(
@@ -10514,15 +10511,7 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
             &rendered,
             pushdown_diagnostic.as_ref(),
         )?;
-        // Hybrid results reflect the committed index snapshot, not a live
-        // freshness check; attach the honesty hint pointing at `index status`.
-        if let Some(source_chunks) = hybrid_source_chunks {
-            payload = aicx::search_engine::inject_index_snapshot_hint(
-                &payload,
-                source_chunks,
-                hybrid_status.map_or("unknown", |s| s.corpus_freshness.as_str()),
-            )?;
-        }
+        payload = aicx::search_engine::attach_index_snapshot(payload, hybrid_status)?;
         if let Some(ref fallback) = semantic_fallback {
             let mut value: serde_json::Value = serde_json::from_str(&payload)?;
             if let Some(obj) = value.as_object_mut() {
@@ -10546,6 +10535,9 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
     }
 
     if results.is_empty() {
+        if let Some(warning) = hybrid_status.and_then(|s| s.freshness_warning()) {
+            eprintln!("{warning} Run `aicx index status` for pending sessions.");
+        }
         eprintln!("No matches for {:?} (scanned {} chunks).", query, scanned);
         if let Some(ref diag) = pushdown_diagnostic {
             eprintln!(
