@@ -550,6 +550,48 @@ pub fn build_with_reporter(
     semantic: bool,
     reporter: Arc<dyn Reporter>,
 ) -> Result<SourceIndexReport> {
+    let mode = if semantic {
+        SourceIndexMode::Semantic
+    } else {
+        SourceIndexMode::Lexical
+    };
+    build_with_mode(
+        aicx_home,
+        project_filters,
+        dry_run,
+        full_rescan,
+        mode,
+        reporter,
+    )
+}
+
+/// Ordinary writers maintain the mode of the published index. Starting a new
+/// semantic index or changing its model or input contract requires explicit opt-in.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SourceIndexMode {
+    Lexical,
+    Semantic,
+    Maintain,
+}
+
+fn current_source_manifest() -> Result<Option<aicx_retrieve::Manifest>> {
+    let path = crate::vector_index::hybrid_manifest_path(None)?;
+    if !path.try_exists()? {
+        return Ok(None);
+    }
+    let manifest = aicx_retrieve::Manifest::read_from_path(&path)?;
+    manifest.validate_against(&manifest)?;
+    Ok(Some(manifest))
+}
+
+pub fn build_with_mode(
+    aicx_home: &Path,
+    project_filters: &[String],
+    dry_run: bool,
+    full_rescan: bool,
+    mode: SourceIndexMode,
+    reporter: Arc<dyn Reporter>,
+) -> Result<SourceIndexReport> {
     let started = Instant::now();
     if !dry_run && !project_filters.is_empty() {
         anyhow::bail!(
@@ -558,7 +600,7 @@ pub fn build_with_reporter(
              <project> --dry-run` only to inspect a project slice)"
         );
     }
-    if semantic && dry_run {
+    if mode == SourceIndexMode::Semantic && dry_run {
         anyhow::bail!(
             "`aicx index --semantic --dry-run` cannot preview dense embedding without writing; \
              drop --dry-run to embed, or run lexical `aicx index --dry-run` alone"
@@ -626,6 +668,13 @@ pub fn build_with_reporter(
     let dense_missing = crate::vector_index::current_dense_not_built().unwrap_or(true);
     #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
     let mut prepared_engine = None;
+    let manifest = if mode == SourceIndexMode::Maintain && !dry_run {
+        current_source_manifest()?
+    } else {
+        None
+    };
+    let maintain_passages = manifest.as_ref().filter(|m| m.schema_version == "3.0");
+    let semantic = mode == SourceIndexMode::Semantic || maintain_passages.is_some();
     if !full_rescan
         && project_filters.is_empty()
         && crate::vector_index::source_lexical_generation_matches(&source_fingerprint)?
@@ -636,11 +685,11 @@ pub fn build_with_reporter(
             .values()
             .all(maintenance_record_settled)
         && {
-            // Same corpus is insufficient after the configured model/endpoint
-            // changes. Keep this initialized engine for the rebuild if needed.
+            // An explicit semantic request can migrate models on unchanged input.
+            // A maintenance no-op neither embeds nor selects a new model.
             #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
             {
-                if semantic {
+                if mode == SourceIndexMode::Semantic {
                     let engine = crate::embedder::EmbeddingEngine::new()?;
                     let matches =
                         crate::vector_index::hybrid_manifest_matches_embedder(None, engine.info())
@@ -658,7 +707,7 @@ pub fn build_with_reporter(
             }
             #[cfg(not(any(feature = "native-embedder", feature = "cloud-embedder")))]
             {
-                !semantic
+                mode != SourceIndexMode::Semantic
             }
         }
     {
@@ -688,6 +737,26 @@ pub fn build_with_reporter(
                 .map(|path| path.display().to_string()),
             skipped_by_agent: BTreeMap::new(),
         });
+    }
+
+    if let Some(_published) = maintain_passages {
+        anyhow::ensure!(
+            !dense_missing,
+            "published semantic payload failed validation; inspect CURRENT before refreshing"
+        );
+        #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+        {
+            let engine = crate::embedder::EmbeddingEngine::new()?;
+            anyhow::ensure!(
+                crate::vector_index::hybrid_manifest_matches_embedder(None, engine.info())
+                    && _published.semantic_input_contract.as_deref()
+                        == Some(semantic::input_contract(&engine)?.as_str()),
+                "configured embedder or passage contract changed; run aicx index --semantic to select it explicitly; CURRENT retained"
+            );
+            prepared_engine = Some(engine);
+        }
+        #[cfg(not(any(feature = "native-embedder", feature = "cloud-embedder")))]
+        anyhow::bail!("refreshing the published semantic index requires an embedder-enabled build");
     }
 
     let mut deferred = BTreeSet::new();
@@ -902,6 +971,16 @@ pub fn build_with_reporter(
                 crate::locks::lance_lock_path()?,
             )?)
         };
+        if !dry_run && mode == SourceIndexMode::Maintain {
+            // Dashboard and repair writers can publish while maintenance embeds.
+            // Compare under the common publication lock before any pointer flip.
+            let current = current_source_manifest()?;
+            anyhow::ensure!(
+                manifest.as_ref().map(|m| &m.generation_id)
+                    == current.as_ref().map(|m| &m.generation_id),
+                "CURRENT changed during maintenance; retaining the newer generation; retry index"
+            );
+        }
         if !dry_run {
             // Privacy and catalog are global contracts; unlike a live append,
             // changing either invalidates every parsed scope decision.

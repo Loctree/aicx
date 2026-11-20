@@ -15,8 +15,8 @@ Acceptance contract:
   the existing atomic generation gate. Recheck source/privacy state before
   admission. Deleted and withheld material cannot enter the new generation.
 - Fuse at session identity without rewarding sessions for having more passages;
-  return the matching passage as evidence. Expose deep retrieval explicitly in
-  MCP while keeping its current default.
+  return the matching passage as evidence. Ordinary CLI and MCP search use
+  the published semantic generation when available.
 - Verify interruption plus corpus drift, edits, removals, model changes,
   malformed vectors, tail retrieval, snippets, CLI/MCP behavior and fixed-query
   retrieval quality. Distinguish mock pipeline contracts from real-model quality.
@@ -27,7 +27,7 @@ production rebuild or an installed service restart.
 
 ## Incremental operation
 
-Run `aicx index --semantic` for corpus changes. The report distinguishes parsed
+Start passage indexing with `aicx index --semantic`. Subsequent `aicx index` runs and MCP auto-refresh maintain the published passage index with the same configured embedder. A model or passage-contract change requires explicit `--semantic` again. The report distinguishes parsed
 and reused sources from reused and newly embedded passages. Successful admission
 keeps the vector cache; interrupting the next run does not remove completed
 batches. A model, endpoint, native weight digest or input-contract change selects

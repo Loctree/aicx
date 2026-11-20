@@ -657,17 +657,12 @@ fn test_deep_search_cli_uses_published_source_generation_without_ndjson() {
         })
     ));
     std::fs::write(root.join("catalog/sessions.jsonl"), &catalog).unwrap();
+    let configured = std::fs::read_to_string(&config).unwrap();
+    std::fs::write(&config, configured.replace("test-model", "different-model")).unwrap();
     let refused = run_cli(&["index", "--json"]);
-    assert!(
-        !refused.status.success(),
-        "a lexical refresh must not demote semantic CURRENT"
-    );
-    let refusal = String::from_utf8_lossy(&refused.stderr);
-    assert!(refusal.contains("semantic downgrade rejected"), "{refusal}");
-    assert!(
-        refusal.contains("NOT published"),
-        "source freshness must not be falsely claimed: {refusal}"
-    );
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("configured embedder"));
+    std::fs::write(&config, configured).unwrap();
     assert_eq!(std::fs::read(hybrid.join("CURRENT")).unwrap(), before);
     assert_eq!(
         std::fs::read(old_dir.join("manifest.json")).unwrap(),
@@ -689,7 +684,7 @@ fn test_deep_search_cli_uses_published_source_generation_without_ndjson() {
     );
     assert_eq!(result["results"], 2, "the refused corpus was not admitted");
 
-    let publish = run_cli(&["index", "--semantic", "--json"]);
+    let publish = run_cli(&["index", "--json"]);
     assert!(
         publish.status.success(),
         "a complete semantic replacement must publish: {}",
@@ -697,6 +692,16 @@ fn test_deep_search_cli_uses_published_source_generation_without_ndjson() {
     );
     let report: serde_json::Value = serde_json::from_slice(&publish.stdout).unwrap();
     assert_eq!(report["dense_docs"], 3);
+    assert_eq!(report["dense_embedded"], 1);
+    assert_eq!(report["dense_reused"], 2);
+    let query = run_cli(&["search", "checkpoint durability", "--json"]);
+    assert!(query.status.success());
+    let result: serde_json::Value = serde_json::from_slice(&query.stdout).unwrap();
+    assert_eq!(result["results"], 3);
+    assert_eq!(
+        result["oracle_status"]["retrieval"]["executed_path"],
+        "hybrid_fusion"
+    );
     assert_ne!(std::fs::read(hybrid.join("CURRENT")).unwrap(), before);
 
     // An authoritative but corrupt CURRENT must not activate old NDJSON.
@@ -774,7 +779,17 @@ fn semantic_reuses_after_publish_add_edit_delete_and_model_change() {
     let first = aicx::source_index::build(root, &[], false, false, true).unwrap();
     assert_eq!((first.dense_embedded, first.dense_reused), (2, 0));
     catalog_members(root, &[1, 2, 3]);
-    let added = aicx::source_index::build(root, &[], false, false, true).unwrap();
+    let maintain = || {
+        aicx::source_index::build_with_mode(
+            root,
+            &[],
+            false,
+            false,
+            aicx::source_index::SourceIndexMode::Maintain,
+            std::sync::Arc::new(aicx::progress::NoopReporter),
+        )
+    };
+    let added = maintain().unwrap();
     assert_eq!((added.dense_embedded, added.dense_reused), (1, 2));
     let source = root.join("00000000-0000-4000-8000-000000000001.jsonl");
     let changed = std::fs::read_to_string(&source)
@@ -815,6 +830,24 @@ fn semantic_reuses_after_publish_add_edit_delete_and_model_change() {
         .unwrap()
         .replace("test-model", "different-model");
     std::fs::write(config, cfg).unwrap();
+    let pointer = root.join("indexed/_all/hybrid/CURRENT");
+    let before = std::fs::read(&pointer).unwrap();
+    assert!(
+        maintain().unwrap().unchanged,
+        "no-op must not initialize or switch embedders"
+    );
+    let source = root.join("00000000-0000-4000-8000-000000000001.jsonl");
+    let edited = std::fs::read_to_string(&source)
+        .unwrap()
+        .replace("Changed text", "New revision");
+    std::fs::write(source, edited).unwrap();
+    assert!(
+        maintain()
+            .unwrap_err()
+            .to_string()
+            .contains("configured embedder")
+    );
+    assert_eq!(before, std::fs::read(&pointer).unwrap());
     let model = aicx::source_index::build(root, &[], false, false, true).unwrap();
     assert_eq!((model.dense_embedded, model.dense_reused), (2, 0));
     assert_eq!(server.calls.load(Ordering::SeqCst), 6);
@@ -957,6 +990,49 @@ fn privacy_change_refuses_old_evidence_then_publishes_only_visible_sessions() {
             .iter()
             .all(|r| r.session_id.as_deref() == Some("00000000-0000-4000-8000-000000000002"))
     );
+    // Restore the policy without touching a session or its catalog timestamp.
+    // The experimental HTTP writer ticks on startup and must notice this edit.
+    let pointer = root.join("indexed/_all/hybrid/CURRENT");
+    let before = std::fs::read(&pointer).unwrap();
+    std::fs::write(root.join(".aicxignore"), "").unwrap();
+    let mut writer = std::process::Command::new(env!("CARGO_BIN_EXE_aicx"))
+        .args([
+            "serve",
+            "--transport",
+            "http",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "0",
+            "--no-require-auth",
+            "--experimental-auto-refresh",
+        ])
+        .env("HOME", root)
+        .env("USERPROFILE", root)
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while std::time::Instant::now() < deadline
+        && std::fs::read(&pointer).ok().as_deref() == Some(before.as_slice())
+    {
+        if writer.try_wait().unwrap().is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let _ = writer.kill();
+    writer.wait().unwrap();
+    assert_ne!(
+        std::fs::read(&pointer).unwrap(),
+        before,
+        "HTTP maintenance must detect a policy-only change"
+    );
+    let manifest = aicx_retrieve::Manifest::read_from_path(
+        &aicx::vector_index::hybrid_manifest_path(None).unwrap(),
+    )
+    .unwrap();
+    assert_eq!((manifest.lexical_doc_count, manifest.dense_count), (2, 2));
 }
 
 struct MutateAfterEmbedding {
@@ -971,6 +1047,44 @@ impl Reporter for MutateAfterEmbedding {
             std::fs::write(&self.path, &self.text).unwrap();
         }
     }
+}
+
+#[test]
+fn maintenance_cannot_overwrite_a_model_switch_during_embedding() {
+    let _guard = SERIAL.lock().unwrap();
+    let (fixture, _server) = contract_fixture();
+    let root = &fixture.root;
+    catalog_members(root, &[1]);
+    aicx::source_index::build(root, &[], false, false, true).unwrap();
+    let pointer = root.join("indexed/_all/hybrid/CURRENT");
+    let first = std::fs::read_to_string(&pointer).unwrap();
+    let config = root.join("embedder.toml");
+    let model_a = std::fs::read_to_string(&config).unwrap();
+    std::fs::write(&config, model_a.replace("test-model", "second-model")).unwrap();
+    aicx::source_index::build(root, &[], false, false, true).unwrap();
+    let second = std::fs::read_to_string(&pointer).unwrap();
+    assert_ne!(first, second);
+    std::fs::write(config, model_a).unwrap();
+    std::fs::write(&pointer, first).unwrap();
+    catalog_members(root, &[1, 2]);
+    let result = aicx::source_index::build_with_mode(
+        root,
+        &[],
+        false,
+        false,
+        aicx::source_index::SourceIndexMode::Maintain,
+        Arc::new(MutateAfterEmbedding {
+            path: pointer.clone(),
+            text: second.clone(),
+        }),
+    );
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("CURRENT changed during maintenance")
+    );
+    assert_eq!(std::fs::read_to_string(pointer).unwrap(), second);
 }
 
 #[test]

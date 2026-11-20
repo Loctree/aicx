@@ -2179,9 +2179,8 @@ enum Commands {
         #[arg(long, hide = true)]
         cache_extracts: bool,
 
-        /// Opt-in dense semantic generation: embed session extracts and publish
-        /// `dense.exact_mmap_v1.bin` beside Tantivy in CURRENT. Prefer one
-        /// workstation owner; laptops stay on plain `aicx index`.
+        /// Start semantic passage indexing or change its embedder. Later ordinary
+        /// index runs maintain the published passages with the same embedder.
         #[arg(long)]
         semantic: bool,
     },
@@ -10681,12 +10680,16 @@ fn run_index(
             aicx::locks::index_lock_path()?,
         )?)
     };
-    let report = aicx::source_index::build_with_reporter(
+    let report = aicx::source_index::build_with_mode(
         &aicx_home,
         &filters,
         dry_run,
         full_rescan,
-        semantic,
+        if semantic {
+            aicx::source_index::SourceIndexMode::Semantic
+        } else {
+            aicx::source_index::SourceIndexMode::Maintain
+        },
         reporter,
     )?;
     if json {
@@ -10734,7 +10737,7 @@ fn run_index(
             eprintln!("  manifest: {path}");
         }
         if report.semantic_requested && report.dense_docs > 0 {
-            eprintln!("  next: aicx search --deep '<query>' uses dense RRF on this CURRENT");
+            eprintln!("  next: aicx search '<query>' combines lexical and semantic results");
         } else if !report.semantic_requested {
             eprintln!(
                 "  lexical index ready for `aicx search`. Dense rerank is opt-in: `aicx index --semantic`."
