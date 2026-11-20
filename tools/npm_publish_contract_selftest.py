@@ -113,7 +113,7 @@ if (!exited || exited.code !== 2 || exited.line) process.exit(8);
         "stage-platform-package.mjs",
         "verify-metadata.mjs",
         "npm publish ./npm-package/*.tgz",
-        'npm view "${package}@${RELEASE_VERSION}" version',
+        "smoke-cold-install:",
         "@loctree/aicx-darwin-arm64",
         "@loctree/aicx-darwin-x64",
         "@loctree/aicx-linux-arm64-gnu",
@@ -127,6 +127,12 @@ if (!exited || exited.code !== 2 || exited.line) process.exit(8);
     for contract in required:
         if contract not in workflow:
             raise SystemExit(f"npm publish workflow lost contract: {contract}")
+
+    wrapper_job, cold_install_job = workflow.split("publish-wrapper:", 1)[1].split("smoke-cold-install:", 1)
+    for job_name, job in (("publish-wrapper", wrapper_job), ("smoke-cold-install", cold_install_job)):
+        for check in ('npm view "${package}@${RELEASE_VERSION}" dist.tarball', '--range 0-0 --output /dev/null "${tarball}"'):
+            if check not in job:
+                raise SystemExit(f"{job_name} lost the npm archive availability check: {check}")
 
     pack_platform = workflow.split("pack-platform-packages:", 1)[1].split("pack-wrapper:", 1)[0]
     pack_wrapper = workflow.split("pack-wrapper:", 1)[1].split("publish-platform-packages:", 1)[0]
