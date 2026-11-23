@@ -483,7 +483,7 @@ fn index_query_error(path: &std::path::Path, err: anyhow::Error) -> SemanticErro
 ///
 /// This function never panics and never spawns external processes.
 pub fn try_semantic_search(
-    _store_root: &Path,
+    store_root: &Path,
     query: &str,
     limit: usize,
     project_filters: &[Option<&str>],
@@ -491,7 +491,7 @@ pub fn try_semantic_search(
     kind_filter: Option<&str>,
 ) -> std::result::Result<SemanticOutcome, SemanticError> {
     try_semantic_search_with_boundary(
-        _store_root,
+        store_root,
         query,
         limit,
         project_filters,
@@ -503,7 +503,7 @@ pub fn try_semantic_search(
 }
 
 fn try_semantic_search_with_boundary(
-    _store_root: &Path,
+    store_root: &Path,
     query: &str,
     limit: usize,
     project_filters: &[Option<&str>],
@@ -512,132 +512,110 @@ fn try_semantic_search_with_boundary(
     candidate_filters: Option<&SemanticSearchFilters>,
 ) -> std::result::Result<(SemanticOutcome, CandidateBoundary), SemanticError> {
     validate_search_frame_kind(frame_kind_filter)?;
-    #[cfg(not(any(feature = "native-embedder", feature = "cloud-embedder")))]
-    {
-        let _ = (
-            query,
-            limit,
-            project_filters,
-            frame_kind_filter,
-            kind_filter,
-            candidate_filters,
-        );
-        Err(SemanticError::EmbedderFeatureMissing {
-            reason: "this aicx binary was compiled without any embedder feature".to_string(),
-            recommendation:
-                "install a pre-built release from GitHub (e.g., `npm install -g @loctree/aicx`), \
-                 or rebuild from source with `cargo install --path . --features native-embedder` \
-                 (offline GGUF) or `cargo install --path . --features cloud-embedder` (HTTP /v1/embeddings)"
-                    .to_string(),
-        })
-    }
-
-    #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
-    {
-        // Doctrine (2026-07-23): always query the published `_all` hybrid
-        // CURRENT generation once. Project is a metadata filter, never a
-        // separate index precondition and never a fan-out over project shards
-        // (that path hung multi-second / multi-GB).
-        let global_query = project_filters.is_empty()
-            || (project_filters.len() == 1 && project_filters[0].is_none());
-        let scopes: Vec<Option<&str>> = if global_query {
-            vec![None]
+    // Doctrine (2026-07-23): always query the published `_all` hybrid
+    // CURRENT generation once. Project is a metadata filter, never a
+    // separate index precondition and never a fan-out over project shards
+    // (that path hung multi-second / multi-GB).
+    let global_query = project_filters.is_empty()
+        || (project_filters.len() == 1 && project_filters[0].is_none());
+    let scopes: Vec<Option<&str>> = if global_query {
+        vec![None]
+    } else {
+        project_filters.to_vec()
+    };
+    let per_scope_limit = limit.max(1);
+    let deep = candidate_filters.map(|f| f.deep).unwrap_or(false);
+    let legacy_dense = candidate_filters.map(|f| f.legacy_dense).unwrap_or(false);
+    let mut merged_results = Vec::new();
+    let mut scanned = 0usize;
+    let mut model_id = None;
+    let mut hybrid_statuses = Vec::new();
+    let mut any_dense_only = false;
+    let mut any_legacy_dense = false;
+    let mut any_lexical = false;
+    let mut any_global_project_scope = false;
+    let mut boundary = CandidateBoundary::default();
+    for scope in scopes {
+        let (mut outcome, scope_boundary) = if deep || legacy_dense {
+            try_semantic_search_native(
+                query,
+                per_scope_limit,
+                scope,
+                frame_kind_filter,
+                kind_filter,
+                candidate_filters,
+            )?
         } else {
-            project_filters.to_vec()
+            try_lexical_search_native(
+                store_root,
+                query,
+                per_scope_limit,
+                scope,
+                frame_kind_filter,
+                kind_filter,
+                candidate_filters,
+            )?
         };
-        let per_scope_limit = limit.max(1);
-        let deep = candidate_filters.map(|f| f.deep).unwrap_or(false);
-        let legacy_dense = candidate_filters.map(|f| f.legacy_dense).unwrap_or(false);
-        let mut merged_results = Vec::new();
-        let mut scanned = 0usize;
-        let mut model_id = None;
-        let mut hybrid_statuses = Vec::new();
-        let mut any_dense_only = false;
-        let mut any_legacy_dense = false;
-        let mut any_lexical = false;
-        let mut any_global_project_scope = false;
-        let mut boundary = CandidateBoundary::default();
-        for scope in scopes {
-            let (mut outcome, scope_boundary) = if deep || legacy_dense {
-                try_semantic_search_native(
-                    query,
-                    per_scope_limit,
-                    scope,
-                    frame_kind_filter,
-                    kind_filter,
-                    candidate_filters,
-                )?
-            } else {
-                try_lexical_search_native(
-                    query,
-                    per_scope_limit,
-                    scope,
-                    frame_kind_filter,
-                    kind_filter,
-                    candidate_filters,
-                )?
-            };
-            boundary.examined = boundary.examined.saturating_add(scope_boundary.examined);
-            boundary.saturated |= scope_boundary.saturated;
-            if outcome
-                .backend_label
-                .starts_with(BACKEND_SEMANTIC_DENSE_ONLY)
-                || outcome
-                    .backend_label
-                    .starts_with(BACKEND_SEMANTIC_LEGACY_DENSE)
-            {
-                any_dense_only = true;
-            }
-            if outcome
+        boundary.examined = boundary.examined.saturating_add(scope_boundary.examined);
+        boundary.saturated |= scope_boundary.saturated;
+        if outcome
+            .backend_label
+            .starts_with(BACKEND_SEMANTIC_DENSE_ONLY)
+            || outcome
                 .backend_label
                 .starts_with(BACKEND_SEMANTIC_LEGACY_DENSE)
-            {
-                any_legacy_dense = true;
-            }
-            if outcome.backend_label.starts_with(BACKEND_LEXICAL) {
-                any_lexical = true;
-            }
-            if outcome.backend_label.ends_with("_global_scoped") {
-                any_global_project_scope = true;
-            }
-            scanned += outcome.scanned;
-            model_id.get_or_insert(outcome.model_id.clone());
-            if let Some(status) = outcome.retrieval_status.clone() {
-                hybrid_statuses.push(status);
-            }
-            merged_results.append(&mut outcome.results);
+        {
+            any_dense_only = true;
         }
-        apply_recency_prior(&mut merged_results);
-        merged_results.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| b.date.cmp(&a.date)));
-        let mut merged_results = dedupe_semantic_results(merged_results);
-        merged_results.truncate(limit);
-        Ok((
-            SemanticOutcome {
-                results: merged_results,
-                scanned,
-                backend_label: if any_legacy_dense && any_global_project_scope {
-                    BACKEND_SEMANTIC_LEGACY_DENSE_GLOBAL_SCOPED
-                } else if any_legacy_dense {
-                    BACKEND_SEMANTIC_LEGACY_DENSE
-                } else if any_dense_only && any_global_project_scope {
-                    BACKEND_SEMANTIC_DENSE_ONLY_GLOBAL_SCOPED
-                } else if any_dense_only {
-                    BACKEND_SEMANTIC_DENSE_ONLY
-                } else if any_lexical && any_global_project_scope {
-                    BACKEND_LEXICAL_GLOBAL_SCOPED
-                } else if any_lexical {
-                    BACKEND_LEXICAL
-                } else if any_global_project_scope {
-                    BACKEND_HYBRID_RRF_GLOBAL_SCOPED
-                } else {
-                    BACKEND_HYBRID_RRF
-                },
-                model_id: model_id.unwrap_or_else(|| "unknown".to_string()),
-                retrieval_status: merge_hybrid_statuses(&hybrid_statuses),
-            },
-            boundary,
-        ))
+        if outcome
+            .backend_label
+            .starts_with(BACKEND_SEMANTIC_LEGACY_DENSE)
+        {
+            any_legacy_dense = true;
+        }
+        if outcome.backend_label.starts_with(BACKEND_LEXICAL) {
+            any_lexical = true;
+        }
+        if outcome.backend_label.ends_with("_global_scoped") {
+            any_global_project_scope = true;
+        }
+        scanned += outcome.scanned;
+        model_id.get_or_insert(outcome.model_id.clone());
+        if let Some(status) = outcome.retrieval_status.clone() {
+            hybrid_statuses.push(status);
+        }
+        merged_results.append(&mut outcome.results);
     }
+    apply_recency_prior(&mut merged_results);
+    merged_results.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| b.date.cmp(&a.date)));
+    let mut merged_results = dedupe_semantic_results(merged_results);
+    merged_results.truncate(limit);
+    Ok((
+        SemanticOutcome {
+            results: merged_results,
+            scanned,
+            backend_label: if any_legacy_dense && any_global_project_scope {
+                BACKEND_SEMANTIC_LEGACY_DENSE_GLOBAL_SCOPED
+            } else if any_legacy_dense {
+                BACKEND_SEMANTIC_LEGACY_DENSE
+            } else if any_dense_only && any_global_project_scope {
+                BACKEND_SEMANTIC_DENSE_ONLY_GLOBAL_SCOPED
+            } else if any_dense_only {
+                BACKEND_SEMANTIC_DENSE_ONLY
+            } else if any_lexical && any_global_project_scope {
+                BACKEND_LEXICAL_GLOBAL_SCOPED
+            } else if any_lexical {
+                BACKEND_LEXICAL
+            } else if any_global_project_scope {
+                BACKEND_HYBRID_RRF_GLOBAL_SCOPED
+            } else {
+                BACKEND_HYBRID_RRF
+            },
+            model_id: model_id.unwrap_or_else(|| "unknown".to_string()),
+            retrieval_status: merge_hybrid_statuses(&hybrid_statuses),
+        },
+        boundary,
+    ))
 }
 
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
@@ -649,7 +627,6 @@ struct SemanticBucketScope<'a> {
     used_global_project_scope: bool,
 }
 
-#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
 #[derive(Clone, Copy)]
 struct SemanticRetrievalFilters<'a> {
     kind: Option<&'a str>,
@@ -741,7 +718,6 @@ fn select_semantic_bucket_scope<'a>(
 /// from this binary. The classic cause is a file-sync tool (e.g. MEGA)
 /// replicating the machine-local `indexed/` directory between hosts running
 /// different aicx builds — name it instead of reporting mystery corruption.
-#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
 fn lexical_schema_conflict_error(
     manifest_path: &Path,
     err: &aicx_retrieve::RetrieveError,
@@ -764,12 +740,35 @@ fn lexical_schema_conflict_error(
     }
 }
 
+fn open_published_lexical(
+    directory: &Path,
+    manifest: &aicx_retrieve::Manifest,
+) -> Result<aicx_retrieve::TantivyAdapter, SemanticError> {
+    use aicx_retrieve::LexicalIndex;
+    let meta = directory.join(aicx_retrieve::TANTIVY_INDEX_DIR).join("meta.json");
+    let invalid = || SemanticError::IndexCorrupt {
+        path: meta.clone(),
+        reason: "published Tantivy index is missing, unreadable or does not match its lexical commit".into(),
+        recommendation: "inspect the CURRENT generation and its lexical artifact".into(),
+    };
+    // The adapter also serves writers and would initialize an absent directory.
+    // A reader must only open an already committed generation.
+    if !meta.is_file() {
+        return Err(invalid());
+    }
+    let lexical = aicx_retrieve::TantivyAdapter::new(directory.to_owned()).map_err(|_| invalid())?;
+    if lexical.commit_id().0 != manifest.lexical_commit_id || lexical.doc_count() != manifest.lexical_doc_count {
+        return Err(invalid());
+    }
+    Ok(lexical)
+}
+
 /// Lexical-first retrieval against the published `_all` hybrid CURRENT
 /// generation (Tantivy only). No embedder bootstrap, no dense mmap, no
 /// primary-NDJSON rehash. Project/kind/frame/agent filters are metadata
 /// pushdown. Dense re-rank lives behind `--deep` / `SemanticSearchFilters::deep`.
-#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
 fn try_lexical_search_native(
+    store_root: &Path,
     query: &str,
     limit: usize,
     project_filter: Option<&str>,
@@ -790,15 +789,32 @@ fn try_lexical_search_native(
 
     // Always the global `_all` hybrid root — project is a filter, not a bucket.
     let hybrid_root =
-        crate::vector_index::hybrid_root_dir(None).map_err(|err| SemanticError::IndexNotBuilt {
+        crate::vector_index::hybrid_root_dir_at(store_root, None).map_err(|err| SemanticError::IndexNotBuilt {
             path: std::path::PathBuf::new(),
             reason: format!("could not resolve hybrid root: {err}"),
             recommendation: "ensure $AICX_HOME (or $HOME) is writable, then run `aicx index`"
                 .to_string(),
         })?;
+    let current = hybrid_root.join("CURRENT");
+    let corrupt = || SemanticError::IndexCorrupt {
+        path: hybrid_root.clone(),
+        reason: "published lexical generation or its manifest is unreadable".into(),
+        recommendation: "inspect CURRENT and the generation's manifest and Tantivy artifacts".into(),
+    };
+    let published = match std::fs::symlink_metadata(&current) {
+        Ok(_) => true,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => return Err(corrupt()),
+    };
     let gen_dir = crate::vector_index::resolve_hybrid_generation_dir(&hybrid_root);
+    if published && gen_dir == hybrid_root {
+        return Err(corrupt());
+    }
     let manifest_path = gen_dir.join("manifest.json");
-    if !manifest_path.exists() {
+    if !manifest_path.try_exists().map_err(|_| corrupt())? {
+        if published || gen_dir.join(aicx_retrieve::TANTIVY_INDEX_DIR).try_exists().map_err(|_| corrupt())? {
+            return Err(corrupt());
+        }
         return Err(SemanticError::IndexNotBuilt {
             path: manifest_path.clone(),
             reason: format!(
@@ -818,19 +834,27 @@ fn try_lexical_search_native(
         }
     })?;
 
-    crate::source_index::verify_generation_policy(&manifest).map_err(|error| {
-        SemanticError::RetrievalManifestStale {
-            path: manifest_path.clone(),
-            reason: format!("{error:#}"),
-            recommendation: "run aicx index --semantic to admit the current privacy policy".into(),
+    // The published lexical schema and admission policy govern stored text.
+    // Dense integrity receipts only govern use of the optional vector payload.
+    let policy_error = || SemanticError::RetrievalManifestStale {
+        path: manifest_path.clone(),
+        reason: "cannot verify the published lexical generation's schema or privacy policy".into(),
+        recommendation: "inspect the published generation and current source policy".into(),
+    };
+    match (manifest.schema_version.as_str(), &manifest.source_policy_fingerprint) {
+        ("2.0" | "3.0", Some(expected)) => {
+            if crate::source_index::current_policy_fingerprint().map_err(|_| policy_error())? != *expected {
+                return Err(policy_error());
+            }
         }
-    })?;
+        ("2.0", None) => {} // Historical policy-less snapshots report unknown freshness.
+        _ => return Err(policy_error()),
+    }
     manifest
         .ensure_lexical_schema_supported(aicx_retrieve::TANTIVY_SCHEMA_VERSION)
         .map_err(|err| lexical_schema_conflict_error(&manifest_path, &err))?;
 
-    // Fail closed when CURRENT did not resolve and the root still names the
-    // retired brute-force NDJSON dense adapter (would otherwise hang).
+    // Preserve the refusal for a legacy dense root without a committed CURRENT pointer.
     if gen_dir == hybrid_root && manifest.dense_kind == aicx_retrieve::BRUTE_FORCE_KIND {
         return Err(SemanticError::RetrievalManifestStale {
             path: manifest_path.clone(),
@@ -843,14 +867,7 @@ fn try_lexical_search_native(
         });
     }
 
-    let lexical = aicx_retrieve::TantivyAdapter::new(gen_dir.clone()).map_err(|err| {
-        SemanticError::RetrievalManifestStale {
-            path: manifest_path.clone(),
-            reason: format!("could not open hybrid lexical artifact: {err:#}"),
-            recommendation: "run `aicx index` to rebuild the committed hybrid artifacts"
-                .to_string(),
-        }
-    })?;
+    let lexical = open_published_lexical(&gen_dir, &manifest)?;
 
     let retrieval_filters = SemanticRetrievalFilters {
         kind: kind_filter,
@@ -1044,7 +1061,6 @@ fn try_lexical_search_native(
     ))
 }
 
-#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
 fn metadata_matches_filters(
     metadata: &serde_json::Value,
     filters: &aicx_retrieve::FilterSet,
@@ -1059,7 +1075,6 @@ fn metadata_matches_filters(
 }
 
 /// Map raw BM25 onto a monotonic display score without a saturation ceiling.
-#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
 fn lexical_score_pct(score: f32) -> u8 {
     let score = score.max(0.0);
     if score == 0.0 {
@@ -1070,10 +1085,8 @@ fn lexical_score_pct(score: f32) -> u8 {
     ((score / (score + 12.0) * 95.0).round() as i32).clamp(1, 94) as u8
 }
 
-#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
 const LEXICAL_SNIPPET_RERANK_LIMIT: usize = 24;
 
-#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
 fn rank_lexical_candidates(query: &str, results: &mut [FuzzyResult]) {
     for result in results.iter_mut() {
         // Rebuild from the raw Tantivy score on every pass. The first pass
@@ -1143,7 +1156,6 @@ fn lexical_result_evidence_class(query: &str, result: &FuzzyResult) -> LexicalEv
         .unwrap_or(LexicalEvidenceClass::Noise)
 }
 
-#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
 fn lexical_rerank_window(limit: usize, project_scoped: bool) -> usize {
     // Project equality is pushed into Tantivy when the filter is exact
     // `owner/repo`, so a modest window is enough. Global search needs a wider
@@ -1456,6 +1468,21 @@ fn thought_token_preview_ratio(result: &FuzzyResult) -> f32 {
     noisy as f32 / result.matched_lines.len() as f32
 }
 
+#[cfg(not(any(feature = "native-embedder", feature = "cloud-embedder")))]
+fn try_semantic_search_native(
+    _query: &str,
+    _limit: usize,
+    _project: Option<&str>,
+    _frame: Option<FrameKind>,
+    _kind: Option<&str>,
+    _filters: Option<&SemanticSearchFilters>,
+) -> Result<(SemanticOutcome, CandidateBoundary), SemanticError> {
+    Err(SemanticError::EmbedderFeatureMissing {
+        reason: "no embedder feature in this binary".into(),
+        recommendation: "use lexical retrieval or install a release with an embedder".into(),
+    })
+}
+
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
 fn try_semantic_search_native(
     query: &str,
@@ -1765,16 +1792,7 @@ fn load_hybrid_index(
     // bindings (lexical commit, dense count/kind, embedder fingerprint)
     // still validate the published CURRENT generation.
     let _ = source_index_path;
-    let lexical = Box::new(
-        aicx_retrieve::TantivyAdapter::new(manifest_dir.clone()).map_err(|err| {
-            SemanticError::RetrievalManifestStale {
-                path: manifest_path.to_path_buf(),
-                reason: format!("could not open hybrid lexical artifact: {err:#}"),
-                recommendation: "run `aicx index` to rebuild the committed hybrid artifacts"
-                    .to_string(),
-            }
-        })?,
-    );
+    let lexical = Box::new(open_published_lexical(&manifest_dir, &manifest)?);
 
     let dense: Box<dyn aicx_retrieve::DenseIndex> = match manifest.dense_kind.as_str() {
         aicx_retrieve::MMAP_DENSE_KIND => {
@@ -2072,7 +2090,6 @@ fn dense_score_pct(cosine_similarity: f32) -> u8 {
     (((clamped + 1.0) * 0.5 * 100.0).round() as i32).clamp(0, 100) as u8
 }
 
-#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
 fn hybrid_filters(filters: SemanticRetrievalFilters<'_>) -> aicx_retrieve::FilterSet {
     let mut set = aicx_retrieve::FilterSet::default();
     if let Some(project) = filters.project {
@@ -2119,7 +2136,6 @@ fn hybrid_filters(filters: SemanticRetrievalFilters<'_>) -> aicx_retrieve::Filte
     set
 }
 
-#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
 fn hit_path(hit: &aicx_retrieve::Hit) -> std::path::PathBuf {
     hit.metadata
         .get("source_path")
@@ -2128,12 +2144,10 @@ fn hit_path(hit: &aicx_retrieve::Hit) -> std::path::PathBuf {
         .unwrap_or_else(|| std::path::PathBuf::from(&hit.chunk_id))
 }
 
-#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
 fn hit_metadata_string(hit: &aicx_retrieve::Hit, key: &str) -> String {
     hit_metadata_optional_string(hit, key).unwrap_or_else(|| "-".to_string())
 }
 
-#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
 fn hit_metadata_optional_string(hit: &aicx_retrieve::Hit, key: &str) -> Option<String> {
     match hit.metadata.get(key)? {
         serde_json::Value::String(value) if !value.is_empty() => Some(value.clone()),
@@ -2143,7 +2157,6 @@ fn hit_metadata_optional_string(hit: &aicx_retrieve::Hit, key: &str) -> Option<S
     }
 }
 
-#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
 fn hit_metadata_lines(hit: &aicx_retrieve::Hit, key: &str) -> Vec<String> {
     hit.metadata
         .get(key)
@@ -2365,7 +2378,6 @@ pub fn search_oracle_status_from_retrieval(
     status.with_retrieval(retrieval.clone())
 }
 
-#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
 fn merge_hybrid_statuses(statuses: &[HybridRetrievalStatus]) -> Option<HybridRetrievalStatus> {
     match statuses {
         [] => None,
@@ -2440,7 +2452,6 @@ fn index_appears_empty(path: &std::path::Path) -> bool {
     }
 }
 
-#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
 fn semantic_preview_lines(path: &std::path::Path) -> Vec<String> {
     const MAX_LINES: usize = 6;
     let Ok(content) = crate::sanitize::read_to_string_validated(path) else {
@@ -2581,6 +2592,65 @@ pub struct FilterPushdownDiagnostic {
 pub struct FilteredSemanticOutcome {
     pub outcome: SemanticSearchOutcome,
     pub diagnostic: Option<FilterPushdownDiagnostic>,
+}
+
+/// Frozen, resolved request scope shared by the first pass and any refinement.
+#[derive(Clone)]
+pub struct PublishedSearch {
+    pub home: std::path::PathBuf,
+    pub projects: Vec<Option<String>>,
+    pub limit: usize,
+    pub kind: Option<&'static str>,
+    pub frame: Option<FrameKind>,
+    pub filters: SemanticSearchFilters,
+    pub embedder_cached_unavailable: bool,
+}
+
+pub struct PublishedHits {
+    pub filtered: FilteredSemanticOutcome,
+    pub dense_failure: Option<&'static str>,
+}
+
+impl PublishedSearch {
+    pub fn retrieve(&self, query: &str) -> Result<PublishedHits, SemanticError> {
+        validate_search_frame_kind(self.frame)?;
+        if query.trim().is_empty() || query.contains('\0') {
+            return Err(SemanticError::InvalidQuery {
+                reason: "empty query or embedded NUL".into(),
+                recommendation: "provide a nonempty search phrase without NUL bytes".into(),
+            });
+        }
+        let scopes = self.projects.iter().map(Option::as_deref).collect::<Vec<_>>();
+        let retrieve = |filters: &SemanticSearchFilters| {
+            let mut result = try_semantic_search_filtered(
+                &self.home, query, self.limit, &scopes, self.frame, self.kind, filters,
+            )?;
+            // The distill axis is an indexed scalar, already enforced by retrieval.
+            if let Some(kind) = self.kind.filter(|kind| *kind != "distill:decision") {
+                result.outcome.results.retain(|hit| hit.kind == kind);
+            }
+            Ok::<_, SemanticError>(result)
+        };
+        let dense_requested = self.filters.deep || self.filters.legacy_dense;
+        let failure = if self.embedder_cached_unavailable && dense_requested {
+            "embedder_negative_cache"
+        } else {
+            match retrieve(&self.filters) {
+                Ok(filtered) => return Ok(PublishedHits { filtered, dense_failure: None }),
+                Err(err) if dense_requested => err.kind(),
+                Err(err) => return Err(err),
+            }
+        };
+        let lexical = SemanticSearchFilters {
+            deep: false,
+            legacy_dense: false,
+            ..self.filters.clone()
+        };
+        // This read independently validates the lexical commit, schema, and privacy policy.
+        // Propagate its own error if the base itself cannot satisfy the request.
+        let filtered = retrieve(&lexical)?;
+        Ok(PublishedHits { filtered, dense_failure: Some(failure) })
+    }
 }
 
 /// Merge an optional `filter_pushdown` diagnostic into a JSON payload

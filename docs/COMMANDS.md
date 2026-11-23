@@ -682,11 +682,31 @@ aicx search --session <session-id> --literal --context 4 <query>
 aicx search --json <query>
 ```
 
-Search combines Tantivy with dense mmap retrieval when CURRENT has vectors and uses Tantivy alone on a lexical generation. A bounded, recency-ranked filesystem fallback is
-used only when the typed failure is `IndexNotBuilt`; corrupt, stale, or busy
-indexes fail honestly. `--no-semantic` is stricter: it reads the published
-CURRENT lexical generation or returns a typed error, and never falls through
-to filesystem fuzzy search.
+Search uses the published Tantivy index and adds dense retrieval when CURRENT
+advertises vectors. If dense retrieval fails, CLI and MCP retry Tantivy with
+the same filters. JSON identifies the failed layer in `dense_fallback` and
+reports the actual backend in `oracle_status`. Base read and privacy errors
+fail the request. A missing index permits the existing filesystem fallback.
+CLI `--no-semantic` requires a published lexical generation.
+
+`aicx search --rerank --decide --json "which migration did we choose?"` requests
+both optional stages. Each flag also works independently. In MCP, pass
+`rerank: true` or `decide: true` to `aicx_search`. An omitted flag uses the
+configured default. MCP accepts `false` to disable a stage for one request.
+
+Configure the full endpoint URL and model in `[retrieval.reranker]` or
+`[retrieval.decision]` in the same TOML used by AICX. Both default to
+`enabled = false`. The commented examples in `aicx config init` show the
+limits and optional `api_key_env` name. `aicx config show` and
+`aicx config inspect` display each stage's status. Decision protocols are
+`responses` (default) and `chat_completions`. Set `max_refinements = 0`
+to receive the assessment without running a second search.
+
+Opted-in JSON responses include `retrieval_quality`. A missing configuration,
+unavailable endpoint, or malformed reply is reported alongside usable hits.
+The text view prints a stage summary to stderr. These flags apply to published
+search results, including `--evidence`. Passage lookup with `--session` rejects
+explicit quality flags. Filesystem fallback reports requested stages as skipped.
 
 `--session` is the last-mile passage route after a session-level hit. It reads
 the cached whole-session extract when present; otherwise it parses the live

@@ -81,12 +81,27 @@ $AICX_HOME/indexed/_all/hybrid/
     manifest.json
 ```
 
-The manifest is written before the pointer flip. Search reads CURRENT and uses
-Tantivy plus a recency prior by default. `--deep` adds dense mmap RRF.
+The manifest is written before the pointer flip. CLI and MCP resolve projects
+and time filters once. `search_engine::PublishedSearch` supplies that scope to
+every read. If dense fusion fails, the reader retries the published Tantivy
+generation with the same scope. This path checks lexical schema, commit,
+document count, and source policy independently of dense payload integrity.
+A healthy lexical result carries its observed freshness and the dense failure.
+Ambiguous project filters and base validation errors fail the request.
 
-Project filters resolve against catalog/index identities and filter `_all`.
-Ambiguous exact filters fail closed. Filesystem fallback is legal only for the
-typed `IndexNotBuilt` state and is bounded.
+The app-only `retrieval_quality` module owns optional inference. It sends at
+most 50 filtered candidates of up to 4096 UTF-8 bytes to the cross-encoder.
+A complete permutation of finite scores orders that prefix. The original hit
+scores and remaining candidates survive. Explicit date sorts still apply.
+Evidence packets score and deduplicate the selected cross-encoder hits.
+
+The decision endpoint receives a bounded JSON document list and local evidence
+IDs. CLI and MCP accept a strict sufficiency verdict only for the served IDs.
+A distinct refinement can trigger one more retrieval using the original
+filters, followed by optional reranking. The first decision remains attached
+to its evidence. An empty or failed refinement leaves the original hits in
+the response. Optional stage failures appear alongside the results, and the
+published index supplies the oracle's coverage and freshness evidence.
 
 ## Source security
 

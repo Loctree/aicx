@@ -105,6 +105,8 @@ pub mod redact;
 pub mod reports_extractor;
 pub mod result_format;
 #[cfg(feature = "app")]
+pub mod retrieval_quality;
+#[cfg(feature = "app")]
 pub mod search_engine;
 #[cfg(feature = "app")]
 pub mod search_eval;
