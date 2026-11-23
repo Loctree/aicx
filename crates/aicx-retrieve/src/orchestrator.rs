@@ -68,6 +68,18 @@ impl EmbedderFingerprint {
             distance: distance.into(),
         }
     }
+
+    /// Deployment names may differ while the base embedding space remains
+    /// query-compatible. Unknown models keep exact fingerprint validation;
+    /// equal dimensions alone never establish compatibility.
+    pub fn shares_embedding_space(&self, other: &Self) -> bool {
+        self.dim == 4096
+            && other.dim == self.dim
+            && self.distance == "cosine"
+            && other.distance == self.distance
+            && qwen3_8b_model(&self.model)
+            && qwen3_8b_model(&other.model)
+    }
 }
 
 pub struct HybridQueryInput<'a> {
@@ -232,12 +244,13 @@ impl HybridIndex {
         let manifest_dir = manifest_dir.into();
         let manifest = Manifest::read_from_path(&manifest_dir.join("manifest.json"))?;
         manifest.verify_dense_payload_checksum(&manifest_dir)?;
+        let query_fingerprint = query_compatible_fingerprint(&manifest, &embedder_fingerprint);
         validate_bindings(
             &manifest,
             lexical.as_ref(),
             dense.as_ref(),
             fusion.as_ref(),
-            &embedder_fingerprint,
+            &query_fingerprint,
             observed_source_hash,
         )?;
         Ok(Self {
@@ -449,6 +462,81 @@ impl HybridIndex {
 
     fn manifest_path(&self) -> PathBuf {
         self.manifest_dir.join("manifest.json")
+    }
+}
+
+/// Recognize base-model deployment aliases, including the GGUF model ids
+/// emitted by the native provider (HF repo/file or an explicit local path).
+/// Only known quantization suffixes are stripped; arbitrary fine-tunes do
+/// not become the base model merely by sharing a name prefix.
+fn qwen3_8b_model(model: &str) -> bool {
+    let leaf = model.rsplit(['/', '\\']).next().unwrap_or(model);
+    let lower = leaf.to_ascii_lowercase();
+    let name = lower.strip_suffix(".gguf").unwrap_or(&lower);
+    let Some(suffix) = name
+        .strip_prefix("qwen3-embedding-8b")
+        .or_else(|| name.strip_prefix("qwen3-embedding:8b"))
+    else {
+        return false;
+    };
+    if suffix.is_empty() {
+        return true;
+    }
+    let Some(quant) = suffix.strip_prefix(['-', '.', ':']) else {
+        return false;
+    };
+    matches!(
+        quant,
+        "4bit"
+            | "4bit-dwq"
+            | "8bit"
+            | "8bit-dwq"
+            | "f32"
+            | "f16"
+            | "bf16"
+            | "q2_k"
+            | "q3_k_s"
+            | "q3_k_m"
+            | "q3_k_l"
+            | "q4_0"
+            | "q4_1"
+            | "q4_k_s"
+            | "q4_k_m"
+            | "q5_0"
+            | "q5_1"
+            | "q5_k_s"
+            | "q5_k_m"
+            | "q6_k"
+            | "q8_0"
+            | "q8_1"
+            | "iq2_xxs"
+            | "iq2_xs"
+            | "iq2_s"
+            | "iq3_xxs"
+            | "iq3_xs"
+            | "iq3_s"
+            | "iq4_xs"
+            | "iq4_nl"
+    )
+}
+
+/// Compare a compatible query deployment against the recorded generation
+/// binding without rewriting either the manifest or the vectors. Write/refresh
+/// admission and artifact-to-artifact validation retain exact fingerprints.
+fn query_compatible_fingerprint(
+    manifest: &Manifest,
+    fingerprint: &EmbedderFingerprint,
+) -> EmbedderFingerprint {
+    let recorded = EmbedderFingerprint::from_hash(
+        &manifest.embedder_model,
+        &manifest.embedder_url_hash,
+        manifest.embedder_dim,
+        &manifest.embedder_distance,
+    );
+    if fingerprint.shares_embedding_space(&recorded) {
+        recorded
+    } else {
+        fingerprint.clone()
     }
 }
 

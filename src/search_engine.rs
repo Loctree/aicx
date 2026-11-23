@@ -1624,6 +1624,12 @@ fn try_semantic_search_native(
             }
         })?;
         if let Some(expected) = &manifest.semantic_input_contract {
+            let recorded = aicx_retrieve::EmbedderFingerprint::from_hash(
+                &manifest.embedder_model,
+                &manifest.embedder_url_hash,
+                manifest.embedder_dim,
+                &manifest.embedder_distance,
+            );
             let current =
                 crate::source_index::semantic_input_contract(&engine).map_err(|error| {
                     SemanticError::EmbedderUnavailable {
@@ -1631,7 +1637,14 @@ fn try_semantic_search_native(
                         recommendation: "inspect the configured model and retry".into(),
                     }
                 })?;
-            if *expected != current {
+            // The document build contract includes provider-specific input
+            // limits and quantized weight bytes. A query need not rebuild the
+            // document passages when it moves within a known embedding space.
+            // Exact input/weight receipts still govern cache reuse and writes.
+            if *expected != current
+                && !crate::vector_index::hybrid_embedder_fingerprint(&info)
+                    .shares_embedding_space(&recorded)
+            {
                 return Err(SemanticError::RetrievalManifestStale {
                     path: path.clone(),
                     reason: "embedding weights or input contract changed".into(),
