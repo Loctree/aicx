@@ -863,7 +863,14 @@ fn try_lexical_search_native(
             if crate::source_index::current_policy_fingerprint().map_err(|_| policy_error())?
                 != *expected
             {
-                return Err(policy_error());
+                return Err(SemanticError::RetrievalManifestStale {
+                    path: manifest_path.clone(),
+                    reason:
+                        "privacy policy changed since this generation; stored text cannot be served"
+                            .into(),
+                    recommendation: "run aicx index --semantic to admit the current privacy policy"
+                        .into(),
+                });
             }
         }
         ("2.0", None) => {} // Historical policy-less snapshots report unknown freshness.
