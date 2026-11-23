@@ -33,7 +33,9 @@ pub(super) async fn reorder(
         endpoint,
         &json!({
             "model": endpoint.model, "query": bounded(query, super::QUERY_BYTES),
-            "documents": documents, "top_n": pool.len(),
+            // Reranker servers use both names for the same requested limit.
+            // MLX ignores top_n and otherwise silently returns only ten rows.
+            "documents": documents, "top_n": pool.len(), "top_k": pool.len(),
         }),
     )
     .await?;

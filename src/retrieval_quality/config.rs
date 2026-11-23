@@ -167,10 +167,10 @@ fn endpoint(
         bail!("{label}.api_key_env must name an environment variable");
     }
     let decision = name == "decision";
-    let (timeout, ceiling, candidates, bytes) = if decision {
-        (30, 180, 12, 2048)
+    let (timeout, ceiling, candidates, candidate_cap, bytes) = if decision {
+        (30, 180, 12, 12, 2048)
     } else {
-        (15, 120, 50, 4096)
+        (15, 120, 12, 50, 4096)
     };
     Ok(Some(Endpoint {
         url,
@@ -180,7 +180,7 @@ fn endpoint(
         max_candidates: cfg
             .max_candidates
             .unwrap_or(candidates)
-            .clamp(1, candidates),
+            .clamp(1, candidate_cap),
         max_doc_bytes: cfg.max_doc_bytes.unwrap_or(bytes).clamp(1, bytes),
         protocol: cfg.protocol,
         max_output_tokens: cfg.max_output_tokens.unwrap_or(512).clamp(1, 2048),

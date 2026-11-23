@@ -138,7 +138,7 @@ timeout_secs = 30
 # url = "http://127.0.0.1:12346/v1/rerank"
 # model = "galaxycore/Qwen3-Reranker-8B-MLX-4bit"
 # timeout_secs = 15
-# max_candidates = 50
+# max_candidates = 12
 # max_doc_bytes = 4096
 # api_key_env = "AICX_RERANK_API_KEY"
 #

@@ -683,8 +683,8 @@ aicx search --json <query>
 ```
 
 Search uses the published Tantivy index and adds dense retrieval when CURRENT
-advertises vectors. If dense retrieval fails, CLI and MCP retry Tantivy with
-the same filters. JSON identifies the failed layer in `dense_fallback` and
+advertises vectors. CLI and MCP first capture validated Tantivy results with
+the same filters and retain them if dense retrieval fails. JSON identifies the failed layer in `dense_fallback` and
 reports the actual backend in `oracle_status`. Base read and privacy errors
 fail the request. A missing index permits the existing filesystem fallback.
 CLI `--no-semantic` requires a published lexical generation.
@@ -701,6 +701,11 @@ limits and optional `api_key_env` name. `aicx config show` and
 `aicx config inspect` display each stage's status. Decision protocols are
 `responses` (default) and `chat_completions`. Set `max_refinements = 0`
 to receive the assessment without running a second search.
+
+Reranking defaults to 12 candidates, with a configurable cap of 50. Requests
+send both `top_n` and `top_k` for servers using either limit name. The response
+must cover every submitted candidate; incomplete or invalid rankings preserve
+the earlier results and report a failed stage.
 
 Opted-in JSON responses include `retrieval_quality`. A missing configuration,
 unavailable endpoint, or malformed reply is reported alongside usable hits.

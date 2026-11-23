@@ -20,6 +20,10 @@ struct RetrievalQualityFixture {
 
 impl RetrievalQualityFixture {
     fn new() -> Self {
+        Self::with_project_documents(2)
+    }
+
+    fn with_project_documents(project_documents: usize) -> Self {
         static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
         let root = std::env::temp_dir().join(format!(
             "aicx-quality-{}-{}-{}",
@@ -34,10 +38,10 @@ impl RetrievalQualityFixture {
         fs::create_dir_all(home.join("catalog")).unwrap();
         fs::create_dir_all(home.join("sources")).unwrap();
         let mut catalog = String::new();
-        for n in 1..=3 {
+        for n in 1..=project_documents + 1 {
             let id = format!("11111111-1111-4111-8111-{n:012}");
             let source = home.join("sources").join(format!("{id}.jsonl"));
-            let project = if n == 3 {
+            let project = if n == project_documents + 1 {
                 "fixture/foreign"
             } else {
                 "fixture/quality"
@@ -363,6 +367,40 @@ fn rerank_validates_permutation_and_preserves_original_scores_on_both_surfaces()
         assert_eq!(ranked["retrieval_quality"]["rerank"]["status"], "applied");
     }
     assert_eq!(server.requests.lock().unwrap().len(), 2);
+}
+
+#[test]
+fn mlx_top_k_contract_ranks_more_than_ten_documents() {
+    let fixture = RetrievalQualityFixture::with_project_documents(15);
+    let server = ModelServer::new(Arc::new(|request| {
+        let count = request["documents"].as_array().unwrap().len();
+        assert_eq!(count, 15);
+        // The actual MLX server ignores top_n and defaults top_k to ten.
+        // Returning only that prefix must fail the client's full-map check.
+        let returned = request["top_k"].as_u64().unwrap_or(10) as usize;
+        let returned = returned.min(count);
+        (
+            200,
+            json!({"results": (0..returned).map(|index| json!({"index":index,"score":1.0-index as f64/100.0})).collect::<Vec<_>>()}),
+        )
+    }));
+    fixture.config(&server.config("reranker", "max_candidates = 50"));
+    for mcp in [false, true] {
+        let payload = fixture.search(mcp, true, false, false);
+        assert_base(&payload);
+        assert_eq!(payload["retrieval_quality"]["rerank"]["status"], "applied");
+        assert_eq!(
+            payload["retrieval_quality"]["rerank"]["candidate_count"],
+            15
+        );
+    }
+    let requests = server.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests
+            .iter()
+            .all(|request| request["top_n"] == 15 && request["top_k"] == 15)
+    );
 }
 
 #[test]
