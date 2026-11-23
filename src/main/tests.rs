@@ -709,6 +709,8 @@ fn run_search_rejects_limit_over_hard_cap_before_store_access() {
         no_semantic: true,
         evidence: false,
         deep: false,
+        rerank: false,
+        decide: false,
         project_match: legacy_archive::ProjectMatchMode::Exact,
         projection: ProjectionSpec::default(),
     })

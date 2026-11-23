@@ -756,7 +756,7 @@ fn open_published_lexical(
     if !meta.is_file() {
         return Err(invalid());
     }
-    let lexical = aicx_retrieve::TantivyAdapter::new(directory.to_owned()).map_err(|_| invalid())?;
+    let lexical = aicx_retrieve::TantivyAdapter::open_existing(directory.to_owned()).map_err(|_| invalid())?;
     if lexical.commit_id().0 != manifest.lexical_commit_id || lexical.doc_count() != manifest.lexical_doc_count {
         return Err(invalid());
     }
@@ -2632,24 +2632,27 @@ impl PublishedSearch {
             Ok::<_, SemanticError>(result)
         };
         let dense_requested = self.filters.deep || self.filters.legacy_dense;
-        let failure = if self.embedder_cached_unavailable && dense_requested {
-            "embedder_negative_cache"
-        } else {
-            match retrieve(&self.filters) {
-                Ok(filtered) => return Ok(PublishedHits { filtered, dense_failure: None }),
-                Err(err) if dense_requested => err.kind(),
-                Err(err) => return Err(err),
-            }
-        };
         let lexical = SemanticSearchFilters {
             deep: false,
             legacy_dense: false,
             ..self.filters.clone()
         };
-        // This read independently validates the lexical commit, schema, and privacy policy.
-        // Propagate its own error if the base itself cannot satisfy the request.
-        let filtered = retrieve(&lexical)?;
-        Ok(PublishedHits { filtered, dense_failure: Some(failure) })
+        // Capture a validated, usable floor before attempting any optional
+        // model work. A failed enhancement must not require another read of a
+        // generation that might have changed in the meantime.
+        let base = retrieve(&lexical)?;
+        if !dense_requested {
+            return Ok(PublishedHits { filtered: base, dense_failure: None });
+        }
+        let failure = if self.embedder_cached_unavailable && dense_requested {
+            "embedder_negative_cache"
+        } else {
+            match retrieve(&self.filters) {
+                Ok(filtered) => return Ok(PublishedHits { filtered, dense_failure: None }),
+                Err(err) => err.kind(),
+            }
+        };
+        Ok(PublishedHits { filtered: base, dense_failure: Some(failure) })
     }
 }
 

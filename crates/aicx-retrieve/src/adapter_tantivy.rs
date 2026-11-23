@@ -123,6 +123,19 @@ impl TantivyAdapter {
             Index::create_in_dir(&dir, schema.clone())
                 .with_context(|| format!("create tantivy index {}", dir.display()))?
         };
+        Self::from_index(dir, index)
+    }
+
+    /// Open a committed lexical index without initializing a missing artifact.
+    /// Search readers must use this rather than the writer's create-or-open path.
+    pub fn open_existing(base_dir: PathBuf) -> Result<Self> {
+        let dir = base_dir.join(TANTIVY_INDEX_DIR);
+        let index = Index::open_in_dir(&dir)
+            .with_context(|| format!("open existing tantivy index {}", dir.display()))?;
+        Self::from_index(dir, index)
+    }
+
+    fn from_index(dir: PathBuf, index: Index) -> Result<Self> {
         register_tokenizers(&index);
 
         let schema = index.schema();

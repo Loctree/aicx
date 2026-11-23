@@ -32,9 +32,6 @@ pub(super) struct Assessment {
 fn assistant_text(response: &Value, protocol: Protocol) -> Option<String> {
     match protocol {
         Protocol::Responses => {
-            if let Some(text) = response.get("output_text").and_then(Value::as_str) {
-                return Some(text.to_owned());
-            }
             let mut text = String::new();
             for item in response.get("output")?.as_array()? {
                 if item["type"] == "message" && item["role"] == "assistant" {

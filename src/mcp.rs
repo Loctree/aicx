@@ -2624,6 +2624,8 @@ mod tests {
             verbose: false,
             strict_semantic: false,
             deep: Some(false),
+            rerank: None,
+            decide: None,
         }
     }
 
